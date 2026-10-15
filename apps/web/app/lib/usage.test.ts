@@ -121,8 +121,9 @@ describe('summarizeUsage', () => {
 })
 
 describe('cacheReadRatio', () => {
-  it('is the cache-read share of the prompt tokens', () => {
-    expect(cacheReadRatio(30, 60)).toBeCloseTo(0.5)
+  it('is the cache-read share of all input: uncached plus reads plus writes', () => {
+    expect(cacheReadRatio(90, 10)).toBeCloseTo(0.9)
+    expect(cacheReadRatio(30, 60, 10)).toBeCloseTo(0.3)
   })
 
   it('is null, not zero, when nothing was prompted', () => {
@@ -130,6 +131,6 @@ describe('cacheReadRatio', () => {
   })
 
   it('never exceeds one', () => {
-    expect(cacheReadRatio(80, 60)).toBe(1)
+    expect(cacheReadRatio(80, 0)).toBe(1)
   })
 })

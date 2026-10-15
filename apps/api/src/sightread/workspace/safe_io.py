@@ -14,6 +14,7 @@ import stat
 from pathlib import Path
 
 _DIR_FLAGS = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+_OPEN_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 READ_CHUNK = 1 << 20
 
 
@@ -198,5 +199,111 @@ def remove_file(root: Path, path: Path) -> bool:
         except IsADirectoryError as exc:
             raise UnsafeEntry(f"{path} is a directory") from exc
         return True
+    finally:
+        os.close(fd)
+
+
+def _open_dir(root: Path, path: Path) -> int:
+    """A descriptor on the plain directory at `path`, opened beneath `root`."""
+    if path == root:
+        return os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    fd, name = _descend(root, path)
+    try:
+        return os.open(name, _OPEN_DIR_FLAGS, dir_fd=fd)
+    except OSError as exc:
+        raise UnsafeEntry(f"{path} is not a plain directory") from exc
+    finally:
+        os.close(fd)
+
+
+def list_dir(root: Path, path: Path) -> list[tuple[str, bool]]:
+    """`(name, is_dir)` for each entry of the directory at `path`, looked at without
+    following anything: a link is listed as a file."""
+    fd = _open_dir(root, path)
+    try:
+        entries: list[tuple[str, bool]] = []
+        for name in os.listdir(fd):
+            try:
+                mode = os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode
+            except OSError:
+                continue
+            entries.append((name, stat.S_ISDIR(mode)))
+        return entries
+    finally:
+        os.close(fd)
+
+
+def _remove_contents(fd: int) -> None:
+    for name in os.listdir(fd):
+        mode = os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode
+        if stat.S_ISDIR(mode):
+            child = os.open(
+                name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd
+            )
+            try:
+                _remove_contents(child)
+            finally:
+                os.close(child)
+            os.rmdir(name, dir_fd=fd)
+        else:
+            os.unlink(name, dir_fd=fd)
+
+
+def remove_tree(root: Path, path: Path) -> bool:
+    """Delete the directory at `path` and everything under it, every step through a
+    descriptor opened without following: a link is unlinked, never descended into.
+    False when there was nothing there — a parent included."""
+    try:
+        fd, name = _descend(root, path)
+    except FileNotFoundError:
+        return False
+    try:
+        try:
+            mode = os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISDIR(mode):
+            os.unlink(name, dir_fd=fd)
+            return True
+        child = os.open(
+            name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd
+        )
+        try:
+            _remove_contents(child)
+        finally:
+            os.close(child)
+        os.rmdir(name, dir_fd=fd)
+        return True
+    finally:
+        os.close(fd)
+
+
+def rename(root: Path, source: Path, target: Path) -> None:
+    """Move `source` to `target`, both beneath `root`, resolving neither through a link."""
+    src_fd, src_name = _descend(root, source)
+    try:
+        kind = entry_kind(root, target.parent)
+        if kind == "none":
+            target.parent.mkdir(parents=True, exist_ok=True)
+        elif kind != "dir":
+            raise UnsafeEntry(f"{target.parent} is not a plain directory")
+        dst_fd, dst_name = _descend(root, target)
+        try:
+            os.rename(src_name, dst_name, src_dir_fd=src_fd, dst_dir_fd=dst_fd)
+        finally:
+            os.close(dst_fd)
+    finally:
+        os.close(src_fd)
+
+
+def remove_empty_dir(root: Path, path: Path) -> bool:
+    """`rmdir` the directory at `path` through its parent's descriptor; False when it is
+    not empty or not there."""
+    fd, name = _descend(root, path)
+    try:
+        os.rmdir(name, dir_fd=fd)
+        return True
+    except OSError:
+        return False
     finally:
         os.close(fd)

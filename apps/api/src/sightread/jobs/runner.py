@@ -520,6 +520,8 @@ async def _retain_source(
     by moving it (docs/jobs.md § Retention). Each copy is checked against the quota and
     taken under the workspace lock, where the document is at that moment."""
     async with sessionmaker() as db:
+        job = await db.get(Job, job_id)
+        kind = job.kind if job is not None else "pdf"
         for index, document in enumerate(documents):
             root = user_root(settings.workspaces_dir, document.user_id)
             async with workspace_lock(root):
@@ -543,7 +545,12 @@ async def _retain_source(
                     )
                     continue
                 await asyncio.to_thread(
-                    keep_source, root, relative, source, copy=index < len(documents) - 1
+                    keep_source,
+                    root,
+                    relative,
+                    source,
+                    kind=kind,
+                    copy=index < len(documents) - 1,
                 )
         # Not kept anywhere (none with room): deleted, as for a parse outside the library.
         source.unlink(missing_ok=True)

@@ -542,14 +542,24 @@ async def test_view_page_and_view_figure_read_the_documents_own_files(tmp_path, 
     Image.new("RGB", (40, 30), "white").save(paths.figures / "p1_100_100_400_600.png")
 
     page = await chat_tools.view_page(
-        paths, {"page": 1}, page_count=3, render_slots=asyncio.Semaphore(1), max_bytes=10_000_000
+        paths,
+        {"page": 1},
+        page_count=3,
+        render_slots=asyncio.Semaphore(1),
+        max_bytes=10_000_000,
+        kind="pdf",
     )
     assert not page.is_error
     assert page.content[0]["type"] == "image"
     assert page.content[0]["source"]["media_type"] == "image/png"
     assert page.content[1]["text"] == "Page 1."
     too_far = await chat_tools.view_page(
-        paths, {"page": 9}, page_count=3, render_slots=asyncio.Semaphore(1), max_bytes=10_000_000
+        paths,
+        {"page": 9},
+        page_count=3,
+        render_slots=asyncio.Semaphore(1),
+        max_bytes=10_000_000,
+        kind="pdf",
     )
     assert too_far.is_error
 
@@ -681,8 +691,10 @@ async def test_a_cancel_drops_a_silent_stream(chatting, monkeypatch) -> None:
     )
     turn_id = uuid.UUID(sent.json()["turn_id"])
     closed = asyncio.Event()
+    started = asyncio.Event()
 
     async def silent(*_args, **_kwargs):
+        started.set()
         try:
             await asyncio.sleep(30)
         finally:
@@ -692,7 +704,10 @@ async def test_a_cancel_drops_a_silent_stream(chatting, monkeypatch) -> None:
     monkeypatch.setattr(chat_runner, "stream_messages", silent)
 
     async def cancel_soon() -> None:
-        await asyncio.sleep(0.2)
+        # Once the upstream call is open and silent — not before, or the loop's own
+        # pre-call check would stop the turn without ever opening the stream.
+        await started.wait()
+        await asyncio.sleep(0.1)
         async with chatting.app.state.sessionmaker() as db:
             turn = await db.get(ChatTurn, turn_id)
             turn.status = "cancelled"
@@ -983,3 +998,85 @@ async def test_the_body_cap_ignores_a_multipart_label_off_the_upload_routes(
         headers={**CSRF_HEADERS, "Content-Type": "multipart/form-data; boundary=abc"},
     )
     assert spoofed.status_code == 413
+
+
+async def test_the_agent_page_lists_only_the_tools_the_deployment_has(
+    make_client, tmp_path
+) -> None:
+    with_runner = make_client(
+        workspaces_dir=str(tmp_path / "ws1"),
+        sandbox_url="http://sandbox:8100",
+        sandbox_token="runner-token-not-a-real-one",
+    )
+    await with_runner.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    with_sandbox = next(
+        agent
+        for agent in (await with_runner.get("/api/agents")).json()["agents"]
+        if agent["name"] == "chat"
+    )
+    assert with_sandbox["tools"] == [
+        "bash",
+        "str_replace_based_edit_tool",
+        "view_page",
+        "view_figure",
+    ]
+    bare = make_client(workspaces_dir=str(tmp_path / "ws2"), sandbox_url="")
+    await bare.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    without = next(
+        agent
+        for agent in (await bare.get("/api/agents")).json()["agents"]
+        if agent["name"] == "chat"
+    )
+    assert without["tools"] == ["str_replace_based_edit_tool", "view_page", "view_figure"]
+
+
+async def test_a_file_with_a_live_conversation_cannot_be_renamed(chatting) -> None:
+    document_id = chatting.document_id
+    conversation_id = (
+        await chatting.post(
+            f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    await chatting.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
+    )
+    refused = await chatting.put(
+        f"/api/library/documents/{document_id}", json={"name": "other.pdf"}, headers=CSRF_HEADERS
+    )
+    assert refused.status_code == 409
+
+
+async def test_a_stop_during_backoff_and_a_running_read_are_both_cut(monkeypatch) -> None:
+    flags = {"cancelled": False}
+
+    async def fake_cancelled(ctx):
+        return flags["cancelled"]
+
+    monkeypatch.setattr(chat_runner, "_cancelled", fake_cancelled)
+    monkeypatch.setattr(chat_runner, "CANCEL_POLL_SECONDS", 0.02)
+    flags["cancelled"] = True
+    with pytest.raises(chat_runner.TurnCancelled):
+        await chat_runner._backoff(None, 30)
+
+    flags["cancelled"] = False
+    read_cancelled = asyncio.Event()
+
+    async def fake_run_tool(ctx, block, malformed):
+        if block["name"] == "view_page":
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                read_cancelled.set()
+                raise
+        flags["cancelled"] = True
+        return {"type": "tool_result", "tool_use_id": block["id"], "content": "ok"}
+
+    monkeypatch.setattr(chat_runner, "_run_tool", fake_run_tool)
+    tool_uses = [
+        {"type": "tool_use", "id": "r", "name": "view_page", "input": {}},
+        {"type": "tool_use", "id": "a", "name": "bash", "input": {}},
+        {"type": "tool_use", "id": "b", "name": "bash", "input": {}},
+    ]
+    with pytest.raises(chat_runner.TurnCancelled):
+        await chat_runner._run_tools(None, tool_uses, set())
+    assert read_cancelled.is_set()

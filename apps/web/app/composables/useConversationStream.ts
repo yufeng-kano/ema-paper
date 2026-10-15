@@ -138,6 +138,17 @@ export function useConversationStream(
     connect()
   }
 
+  /** Come back from the last seen sequence after the stream gave up and the record said
+   *  the turn is still going: the retry budget starts over. */
+  function resume() {
+    if (conversationId === null) {
+      return
+    }
+    active.value = true
+    silentRetries = 0
+    connect()
+  }
+
   /** A turn was just queued: the stream must be up, and a close now is a drop, not idleness. */
   function expectTurn() {
     active.value = true
@@ -155,5 +166,5 @@ export function useConversationStream(
 
   onBeforeUnmount(close)
 
-  return { lastSeq, connected, active, open, expectTurn, close }
+  return { lastSeq, connected, active, open, expectTurn, resume, close }
 }

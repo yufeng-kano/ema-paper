@@ -113,6 +113,7 @@ const conversationTotals = computed(() => {
     rows.reduce((total, row) => total + pick(row), 0)
   const promptTokens = sum((row) => row.prompt_tokens)
   const cacheReadTokens = sum((row) => row.cache_read_tokens)
+  const cacheWriteTokens = sum((row) => row.cache_write_tokens)
   return {
     count: rows.length,
     turns: sum((row) => row.turns),
@@ -120,7 +121,7 @@ const conversationTotals = computed(() => {
     unpricedCalls: sum((row) => row.unpriced_calls),
     promptTokens,
     cacheReadTokens,
-    cacheRatio: cacheReadRatio(cacheReadTokens, promptTokens),
+    cacheRatio: cacheReadRatio(cacheReadTokens, promptTokens, cacheWriteTokens),
   }
 })
 
@@ -354,7 +355,7 @@ async function runSandboxAction(action: () => Promise<void>) {
                       })
                     }}
                     <template v-if="row.cacheReadTokens">
-                      · {{ t('dashboard.modelCache', { ratio: percent(cacheReadRatio(row.cacheReadTokens, row.promptTokens)) }) }}
+                      · {{ t('dashboard.modelCache', { ratio: percent(cacheReadRatio(row.cacheReadTokens, row.promptTokens, row.cacheWriteTokens)) }) }}
                     </template>
                   </p>
                   <p v-if="row.estimatedCalls" class="model-tokens tabular">
@@ -442,7 +443,7 @@ async function runSandboxAction(action: () => Promise<void>) {
                 <template #cell-turns="{ row }">{{ formatCount(row.turns, locale) }}</template>
                 <template #cell-prompt="{ row }">{{ formatCount(row.prompt_tokens, locale) }}</template>
                 <template #cell-cache="{ row }">
-                  {{ percent(cacheReadRatio(row.cache_read_tokens, row.prompt_tokens)) }}
+                  {{ percent(cacheReadRatio(row.cache_read_tokens, row.prompt_tokens, row.cache_write_tokens)) }}
                 </template>
                 <template #cell-completion="{ row }">{{ formatCount(row.completion_tokens, locale) }}</template>
                 <template #cell-estimated="{ row }">

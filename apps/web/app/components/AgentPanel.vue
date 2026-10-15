@@ -21,11 +21,6 @@ import {
   type SavedAgentSettings,
 } from '~/lib/api'
 
-/**
- * The `chat` agent's tools — always these four, always in this order (docs/chat.md §
- * Tools). A fact about the agent, shown as read-only chips; nothing here is chosen.
- */
-const CHAT_TOOLS = ['bash', 'str_replace_based_edit_tool', 'view_page', 'view_figure'] as const
 const CHAT_AGENT = 'chat'
 const DEFAULT_EFFORT: AgentEffort = 'medium'
 
@@ -389,7 +384,7 @@ async function removePrompt() {
     <div v-if="isChat" class="row">
       <p class="tools-label">{{ t('agents.toolsLabel') }}</p>
       <ul class="tools" :aria-label="t('agents.toolsLabel')">
-        <li v-for="tool in CHAT_TOOLS" :key="tool" class="chip mono">{{ tool }}</li>
+        <li v-for="tool in agent.tools" :key="tool" class="chip mono">{{ tool }}</li>
       </ul>
     </div>
 

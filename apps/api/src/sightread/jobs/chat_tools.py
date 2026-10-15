@@ -120,12 +120,15 @@ def _writable(root: Path, path: Path) -> bool:
     return not any(part in READ_ONLY_NAMES for part in relative.parts)
 
 
-def _listing(path: Path) -> str:
-    rows = []
-    for entry in sorted(path.iterdir(), key=lambda item: item.name):
-        if entry.name in (".git",):
-            continue
-        rows.append(f"{entry.name}/" if entry.is_dir() else entry.name)
+def _listing(root: Path, path: Path) -> str:
+    """The directory's entries, read through a descriptor opened beneath the root with
+    nothing followed — a path listing could be swapped for a link in between."""
+    entries = safe_io.list_dir(root, path)
+    rows = [
+        f"{name}/" if is_dir else name
+        for name, is_dir in sorted(entries, key=lambda item: item[0])
+        if name != ".git"
+    ]
     return "\n".join(rows) or "(empty directory)"
 
 
@@ -167,7 +170,10 @@ def _edit_sync(
     if command == "view":
         kind = safe_io.entry_kind(root, path)
         if kind == "dir":
-            return ToolOutcome(_listing(path))
+            try:
+                return ToolOutcome(_listing(root, path))
+            except (safe_io.UnsafeEntry, OSError):
+                return ToolOutcome(f"{vm_path} is not a plain directory", is_error=True)
         if kind == "none":
             return ToolOutcome(f"{vm_path} does not exist", is_error=True)
         try:
@@ -352,6 +358,7 @@ async def view_page(
     page_count: int | None,
     render_slots: asyncio.Semaphore,
     max_bytes: int,
+    kind: str,
 ) -> ToolOutcome:
     source = paths.source()
     if source is None:
@@ -366,7 +373,7 @@ async def view_page(
     if page < 1 or (page_count and page > page_count):
         return ToolOutcome(f"page must be between 1 and {page_count or 1}", is_error=True)
 
-    if source.suffix.lower() == ".pdf":
+    if kind == "pdf":
         # Poppler gets the file as a descriptor opened without following anything, not
         # as a path it would resolve again (docs/workspace.md § Revisions).
         try:

@@ -34,6 +34,8 @@ ANTHROPIC_VERSION = "2023-06-01"
 STREAM_TIMEOUT_SECONDS = 600.0
 # One SSE line past this is a broken upstream, not a long answer.
 MAX_SSE_LINE_BYTES = 4 * 1024 * 1024
+# More content blocks than any response holds; a larger index is refused outright.
+MAX_CONTENT_BLOCKS = 4096
 # The error types the Messages API documents; anything else is reported as "error".
 KNOWN_ERROR_TYPES = frozenset(
     {
@@ -238,6 +240,10 @@ async def stream_messages(
                     start_usage = message.get("usage") or {}
                 elif kind == "content_block_start":
                     index = _int(data.get("index"))
+                    # Blocks arrive in order; an index that is negative, skips ahead or
+                    # exceeds any sane count is a broken upstream, not a reason to allocate.
+                    if index < 0 or index > len(blocks) or index >= MAX_CONTENT_BLOCKS:
+                        raise UpstreamError("The upstream sent an out-of-order content block")
                     block = dict(data.get("content_block") or {})
                     if block.get("type") == "tool_use":
                         partial_json[index] = []

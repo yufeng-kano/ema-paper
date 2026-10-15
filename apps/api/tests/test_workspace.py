@@ -518,3 +518,52 @@ async def test_a_cached_library_upload_keeps_its_fresh_file(sessionmaker, tmp_pa
         paths = await documents.document_paths(db, settings, document)
         assert (paths.directory / "source.pdf").read_bytes() == b"%PDF-1.4 fresh"
         assert not fresh.exists()
+
+
+async def test_a_revert_that_cannot_complete_touches_nothing(sessionmaker, tmp_path) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        _, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+        root = paths.root
+        big = paths.directory / "big.txt"
+        big.write_text("x" * 5000)
+        git.commit_all(root, "agent:1", "bash: seed")
+        paths.doc.write_text("# Title\n\nShelled\n")
+        big.write_text("y" * 5000)
+        commit = git.commit_all(root, "agent:1", "bash: change both")
+        settings.content_max_bytes = 1000
+        with pytest.raises(ApiError) as refused:
+            await documents.revert(db, settings, document, commit)
+        assert refused.value.status_code == 409
+        # Neither path moved: the document still reads as the shell left it.
+        assert paths.doc.read_text() == "# Title\n\nShelled\n"
+        assert big.read_text() == "y" * 5000
+        assert git.log(root)[0].commit == commit
+
+
+async def test_deleting_through_a_linked_ancestor_is_refused(sessionmaker, tmp_path) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+        elsewhere = tmp_path / "elsewhere"
+        shutil.copytree(paths.directory.parent, elsewhere)
+        shutil.rmtree(paths.directory.parent)
+        paths.directory.parent.symlink_to(elsewhere)
+        with pytest.raises(ApiError) as refused:
+            await documents.remove_path(settings, user.id, paths.relative)
+        assert refused.value.status_code == 409
+        assert (elsewhere / "paper.pdf" / "doc.md").exists()
+
+
+def test_the_kept_source_is_named_by_the_parse_kind(tmp_path) -> None:
+    root = tmp_path / "ws" / "8"
+    upload = tmp_path / "upload.bin"
+    upload.write_bytes(b"%PDF-1.4")
+    kept = documents.keep_source(root, Path("files/paper"), upload, kind="pdf")
+    assert kept.name == "source.pdf"
+    image = tmp_path / "photo.jpeg"
+    image.write_bytes(b"\xff\xd8")
+    kept = documents.keep_source(root, Path("files/photo"), image, kind="image")
+    assert kept.name == "source.jpeg"

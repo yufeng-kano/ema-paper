@@ -84,6 +84,8 @@ export interface AgentEntry {
   output: string
   /** What "default" means for this agent's prompt picker. */
   default_prompt: string
+  /** The tools this deployment really gives the agent (empty for agents without any). */
+  tools: string[]
   settings: AgentSettings
   bbox: BboxConvention
 }
@@ -198,6 +200,7 @@ export interface UsageConversation {
   turns: number
   prompt_tokens: number
   cache_read_tokens: number
+  cache_write_tokens: number
   completion_tokens: number
   estimated_cost: number
   unpriced_calls: number

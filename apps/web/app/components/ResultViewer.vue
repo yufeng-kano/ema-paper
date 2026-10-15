@@ -333,8 +333,10 @@ const statusWord = computed<SaveState>(() => {
   return 'saved'
 })
 
-/** Closing with an edit still in the debounce sends it now rather than losing it. */
+/** Closing with an edit still in the debounce — or still in an open block — sends it now
+ *  rather than losing it. */
 onBeforeUnmount(() => {
+  commitEdit()
   if (saveTimer !== null) {
     clearTimeout(saveTimer)
     void saveContent()

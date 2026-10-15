@@ -427,6 +427,19 @@ async def _stream_once(ctx: TurnContext, body: dict) -> CompletedMessage:
     return completed
 
 
+async def _backoff(ctx: TurnContext, seconds: float) -> None:
+    """Wait before a retry, looking for a cancel every poll interval: a long
+    `Retry-After` must not hold a stopped turn open."""
+    deadline = time.monotonic() + seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        await asyncio.sleep(min(remaining, CANCEL_POLL_SECONDS))
+        if await _cancelled(ctx):
+            raise TurnCancelled()
+
+
 async def _call_model(ctx: TurnContext, body: dict) -> CompletedMessage:
     for attempt in range(MAX_ATTEMPTS):
         try:
@@ -434,14 +447,14 @@ async def _call_model(ctx: TurnContext, body: dict) -> CompletedMessage:
         except RateLimited as exc:
             if attempt == MAX_ATTEMPTS - 1:
                 raise
-            await asyncio.sleep(exc.retry_after or BACKOFF_BASE_SECONDS * (2**attempt))
+            await _backoff(ctx, exc.retry_after or BACKOFF_BASE_SECONDS * (2**attempt))
             # What the failed attempt streamed is already out: the thread starts over
             # from here (docs/chat.md § Conversations, turns, events).
             await _emit(ctx, chat_events.RETRY, {"attempt": attempt + 2})
         except UpstreamError as exc:
             if attempt == MAX_ATTEMPTS - 1 or not exc.transient:
                 raise
-            await asyncio.sleep(BACKOFF_BASE_SECONDS * (2**attempt))
+            await _backoff(ctx, BACKOFF_BASE_SECONDS * (2**attempt))
             await _emit(ctx, chat_events.RETRY, {"attempt": attempt + 2})
     raise RateLimited()
 
@@ -517,6 +530,7 @@ async def _run_tool_unguarded(ctx: TurnContext, block: dict, malformed: set[str]
             page_count=ctx.job.page_count,
             render_slots=ctx.render_slots,
             max_bytes=ctx.settings.upload_max_bytes,
+            kind=ctx.job.kind,
         )
     elif name == "view_figure":
         outcome = await chat_tools.view_figure(
@@ -575,7 +589,14 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
                 started = True
                 results[index] = await _run_tool(ctx, block, malformed)
 
-    await asyncio.gather(reads(), writes())
+    # A task group: when the writes stop on a cancel, the reads still running are
+    # cancelled with them rather than left to finish a turn that is over.
+    try:
+        async with asyncio.TaskGroup() as group:
+            group.create_task(reads())
+            group.create_task(writes())
+    except* TurnCancelled:
+        raise TurnCancelled() from None
     return [results[index] for index in range(len(tool_uses))]
 
 

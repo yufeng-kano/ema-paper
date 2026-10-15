@@ -17,7 +17,8 @@ from sqlalchemy import case, func, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
 
-from ..agents import AGENTS, AgentDefinition, get_agent
+from ..agents import AGENTS, CHAT, AgentDefinition, get_agent
+from ..agents import chat as chat_agent
 from ..agents.bbox import convention_for_model
 from ..agents.chat import is_claude_model
 from ..auth.api_keys import create_api_key
@@ -617,8 +618,15 @@ def _bbox_payload(row: AgentSetting | None) -> dict:
     return {"family": convention.family, "format": convention.format}
 
 
+def _agent_tools(name: str, settings: AppSettings) -> list[str]:
+    if name != CHAT.name:
+        return []
+    tools = chat_agent.TOOLS if settings.sandbox_configured else chat_agent.TOOLS_WITHOUT_BASH
+    return [str(tool["name"]) for tool in tools]
+
+
 @router.get("/agents")
-async def list_agents(user: SessionUser, db: DbSession):
+async def list_agents(user: SessionUser, db: DbSession, settings: AppSettings):
     """The registry with the caller's settings for each agent (docs/agents.md)."""
     rows = {
         row.agent: row
@@ -635,6 +643,9 @@ async def list_agents(user: SessionUser, db: DbSession):
                 "output": agent.output,
                 # What "default" means for this agent's prompt picker.
                 "default_prompt": agent.default_prompt_template,
+                # The tools this deployment really gives the agent: `bash` only with a
+                # sandbox runner configured (docs/chat.md § Tools).
+                "tools": _agent_tools(agent.name, settings),
                 "settings": _agent_settings_payload(rows.get(agent.name)),
                 # A fact about the saved model, not a setting: the coordinate convention
                 # the pipeline will ask it for (docs/parsing.md § Coordinate conventions).
@@ -825,6 +836,7 @@ async def usage_per_conversation(
                 func.sum(UsageLog.completion_tokens),
                 func.sum(case((UsageLog.cost_source == COST_SOURCE_ESTIMATED, UsageLog.cost))),
                 func.count(case((UsageLog.cost_source == COST_SOURCE_UNKNOWN, 1))),
+                func.sum(UsageLog.cache_write_tokens),
             )
             .select_from(UsageLog)
             .join(ChatTurn, ChatTurn.id == UsageLog.turn_id)
@@ -848,6 +860,7 @@ async def usage_per_conversation(
                 "completion_tokens": int(row[7] or 0),
                 "estimated_cost": float(row[8] or 0),
                 "unpriced_calls": int(row[9]),
+                "cache_write_tokens": int(row[10] or 0),
             }
             for row in rows
         ]

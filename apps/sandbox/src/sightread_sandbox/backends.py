@@ -133,12 +133,20 @@ class Backend:
     async def stop(self, user_id: int) -> None:
         sandbox = self._user(user_id)
         async with sandbox.lock:
-            for shell in sandbox.sessions.values():
-                await shell.close()
-            sandbox.sessions.clear()
-            sandbox.session_used.clear()
-            await self.stop_vm(sandbox)
-            sandbox.started_at = None
+            await self._stop_locked(sandbox)
+
+    async def _stop_locked(self, sandbox: UserSandbox) -> None:
+        for shell in sandbox.sessions.values():
+            await shell.close()
+        sandbox.sessions.clear()
+        sandbox.session_used.clear()
+        await self.stop_vm(sandbox)
+        sandbox.started_at = None
+
+    def _idle(self, sandbox: UserSandbox) -> bool:
+        if any(shell.busy for shell in sandbox.sessions.values()):
+            return False  # a command is running: not idle, whatever the clock says
+        return time.monotonic() - sandbox.last_used >= self.settings.sandbox_idle_seconds
 
     async def reset(self, user_id: int) -> None:
         """Stop, and forget what was installed. Documents are untouched."""
@@ -150,12 +158,16 @@ class Backend:
         """Stop every VM idle past the configured window; returns how many."""
         stopped = 0
         for user_id, sandbox in list(self._users.items()):
-            idle = time.monotonic() - sandbox.last_used
-            if idle < self.settings.sandbox_idle_seconds or not await self.is_running(user_id):
+            if not self._idle(sandbox) or sandbox.lock.locked():
                 continue
-            if sandbox.lock.locked() or any(shell.busy for shell in sandbox.sessions.values()):
-                continue  # a command is running: not idle, whatever the clock says
-            await self.stop(user_id)
+            if not await self.is_running(user_id):
+                continue
+            async with sandbox.lock:
+                # Decided again under the lock: an exec that slipped in since the look
+                # above has marked its shell busy, and must not have its VM pulled away.
+                if not self._idle(sandbox):
+                    continue
+                await self._stop_locked(sandbox)
             stopped += 1
         return stopped
 

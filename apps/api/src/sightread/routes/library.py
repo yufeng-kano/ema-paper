@@ -393,6 +393,12 @@ async def update_folder(
     # The row and its directory move together, under the user's workspace lock, so no
     # content read can materialize at the new path in between (docs/workspace.md).
     async with workspace_lock(user_root(settings.workspaces_dir, user.id)):
+        doomed = await subtree_ids(db, user.id, folder_id)
+        await refuse_while_answering(
+            db,
+            user.id,
+            select(Document.id).where(Document.user_id == user.id, Document.folder_id.in_(doomed)),
+        )
         return await _update_folder_locked(
             folder_id, body, user, db, settings, provided, renaming, clash
         )
@@ -635,6 +641,10 @@ async def update_document(
     clash = "A file with this name already exists here"
 
     async with workspace_lock(user_root(settings.workspaces_dir, user.id)):
+        # A turn holds the document's path for its whole run (docs/chat.md § Tools).
+        await refuse_while_answering(
+            db, user.id, select(Document.id).where(Document.id == document_id)
+        )
         return await _update_document_locked(
             document_id, body, user, db, settings, provided, renaming, clash
         )

@@ -29,7 +29,7 @@ Two backends implement the same interface: `docker` (production: `docker run` wi
 ## Lifecycle
 
 - **Start on first use.** The first `exec` of a user whose VM is stopped boots it (Kata boots in about a second; the UI shows a starting state meanwhile).
-- **Stop when idle.** `SANDBOX_IDLE_SECONDS` after the last command the runner stops the VM; a VM with a command still running is never idle, whatever the clock says. Nothing is deleted, ever, by the runner.
+- **Stop when idle.** `SANDBOX_IDLE_SECONDS` after the last command the runner stops the VM; a VM with a command still running is never idle, whatever the clock says — decided twice, once to pick candidates and again under the user's lock, so a command that started in between keeps its VM. Nothing is deleted, ever, by the runner.
 - **A restarted runner adopts what is running.** At start the docker backend lists the `sightread-sandbox-*` containers Docker still has and takes them into its table as running and last used now, so the idle sweep stops them on schedule; their shells are gone with the old process, and a conversation opens a new one on its next command.
 - **Reset is the user's.** The Usage page's reset deletes `/workspace/.cache` (uv's cache and installed environments) and shell state; documents, notes and history stay.
 

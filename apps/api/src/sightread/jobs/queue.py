@@ -276,7 +276,8 @@ CLAIM_TURN_SQL = text(
       WHERE t.status = 'queued'
         AND (
           SELECT count(*) FROM chat_turns running
-          WHERE running.user_id = t.user_id AND running.status = 'running'
+          WHERE running.user_id = t.user_id
+            AND running.status <> 'queued' AND running.finished_at IS NULL
         ) < :max_turns_per_user
       ORDER BY t.created_at
       FOR UPDATE SKIP LOCKED LIMIT 1
@@ -291,7 +292,8 @@ CLAIM_TURN_SQL_SQLITE_SELECT = text(
     WHERE t.status = 'queued'
       AND (
         SELECT count(*) FROM chat_turns running
-        WHERE running.user_id = t.user_id AND running.status = 'running'
+        WHERE running.user_id = t.user_id
+          AND running.status <> 'queued' AND running.finished_at IS NULL
       ) < :max_turns_per_user
     ORDER BY t.created_at LIMIT 1
     """
@@ -299,12 +301,13 @@ CLAIM_TURN_SQL_SQLITE_SELECT = text(
 
 
 async def count_active_turns(db: AsyncSession, user_id: int) -> int:
-    """Queued or running turns for one user — the cap `POST …/messages` enforces."""
+    """Unfinished turns for one user — queued, running, or cancelled but not yet wound
+    down — the cap `POST …/messages` enforces."""
     return (
         await db.execute(
             select(func.count())
             .select_from(ChatTurn)
-            .where(ChatTurn.user_id == user_id, ChatTurn.status.in_(("queued", "running")))
+            .where(ChatTurn.user_id == user_id, ChatTurn.finished_at.is_(None))
         )
     ).scalar_one()
 

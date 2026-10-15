@@ -241,3 +241,20 @@ async def test_an_overlong_stream_line_is_refused_before_it_is_held(key, monkeyp
         async for _ in stream_messages(key, {"messages": []}, betas=(), max_bytes=10_000_000):
             pass
     assert "overlong" in str(refused.value)
+
+
+@respx.mock
+async def test_a_wild_content_block_index_is_refused(key) -> None:
+    wild = sse(
+        {"type": "message_start", "message": {"usage": {}}},
+        {
+            "type": "content_block_start",
+            "index": 1_000_000_000,
+            "content_block": {"type": "text", "text": ""},
+        },
+    )
+    respx.post(MESSAGES_URL).mock(return_value=httpx.Response(200, content=wild))
+    with pytest.raises(UpstreamError) as refused:
+        async for _ in stream_messages(key, {"messages": []}, betas=(), max_bytes=10_000_000):
+            pass
+    assert "out-of-order" in str(refused.value)

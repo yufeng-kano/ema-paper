@@ -18,7 +18,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from ..db.models import ChatEvent, ChatTurn
+from ..db.models import ChatEvent, ChatTurn, Conversation
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +53,11 @@ def render(row: ChatEvent) -> str:
 async def append(db: AsyncSession, conversation_id: int, turn_id, event: str, data: dict) -> int:
     """Add one event to the session and queue the wake-up, without committing: for a
     caller that must publish the event in the same transaction as a status change."""
+    # The conversation's row, held until the caller commits: two tools finishing at once
+    # must not both take `max(seq) + 1` (PostgreSQL; SQLite writes one at a time).
+    await db.execute(
+        select(Conversation.id).where(Conversation.id == conversation_id).with_for_update()
+    )
     last = (
         await db.execute(
             select(func.max(ChatEvent.seq)).where(ChatEvent.conversation_id == conversation_id)

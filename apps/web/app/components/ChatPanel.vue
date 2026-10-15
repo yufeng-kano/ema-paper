@@ -53,6 +53,8 @@ interface EditCard {
 const EDITOR_TOOL = 'str_replace_based_edit_tool'
 const EDITOR_WRITES = new Set(['str_replace', 'insert', 'create'])
 const LIVE_STATUSES = new Set(['queued', 'running'])
+/** How long to wait before following a still-live turn again after the stream gave up. */
+const RESUME_AFTER_MS = 10_000
 /** A tool line is one line: longer command text is cut, the full one rides on `title`. */
 const SUMMARY_MAX = 72
 
@@ -379,10 +381,21 @@ const stream = useConversationStream(
     }
   },
   () => {
-    // Six silent drops: whatever the turn did is in the record by now, or never will be.
-    if (currentId.value !== null) {
-      void loadDetail(currentId.value)
+    // Six silent drops: the record decides. A turn it still lists as live is waited on
+    // again — a fresh retry budget after a pause, until the record says it ended.
+    const id = currentId.value
+    if (id === null) {
+      return
     }
+    void loadDetail(id).then(() => {
+      if (currentId.value === id && turns.value.some((turn) => LIVE_STATUSES.has(turn.status))) {
+        setTimeout(() => {
+          if (currentId.value === id) {
+            stream.resume()
+          }
+        }, RESUME_AFTER_MS)
+      }
+    })
   },
 )
 

@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from . import safe_io
 from .layout import EXCLUDE_RULES, git_dir
 
 GIT = "git"
@@ -132,13 +133,15 @@ def head(root: Path) -> str | None:
 
 
 def move(root: Path, source: Path, target: Path) -> None:
-    """`git mv`, falling back to a plain rename for a path git does not track yet."""
-    target.parent.mkdir(parents=True, exist_ok=True)
+    """`git mv`, falling back to a rename for a path git does not track yet. Neither
+    follows a link: git refuses a path beyond a symbolic link, and the fallback renames
+    through directory descriptors opened without following (`safe_io.rename`)."""
     tracked = _git(root, "ls-files", "--error-unmatch", str(source), check=False)
     if tracked.returncode == 0:
+        target.parent.mkdir(parents=True, exist_ok=True)
         _git(root, "mv", "-k", str(source), str(target))
     else:
-        source.rename(target)
+        safe_io.rename(root, source, target)
 
 
 def log(root: Path, relative: Path | None = None, limit: int = 100) -> list[Revision]:
