@@ -153,7 +153,7 @@ class Backend:
             idle = time.monotonic() - sandbox.last_used
             if idle < self.settings.sandbox_idle_seconds or not await self.is_running(user_id):
                 continue
-            if sandbox.lock.locked():
+            if sandbox.lock.locked() or any(shell.busy for shell in sandbox.sessions.values()):
                 continue  # a command is running: not idle, whatever the clock says
             await self.stop(user_id)
             stopped += 1

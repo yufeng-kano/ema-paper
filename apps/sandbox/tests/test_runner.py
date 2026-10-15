@@ -151,3 +151,22 @@ async def test_the_shell_cap_closes_the_longest_idle_shell(tmp_path) -> None:
 def test_running_sandboxes_are_recognised_by_name() -> None:
     listing = "sightread-sandbox-12\nsightread-sandbox-runner\nother\nsightread-sandbox-7\n"
     assert adopted_user_ids(listing) == [12, 7]
+
+async def test_the_idle_sweep_spares_a_running_command(tmp_path) -> None:
+    import asyncio
+
+    settings = Settings(
+        app_env="local",
+        sandbox_token=TOKEN,
+        sandbox_backend="local",
+        sandbox_workspaces_dir=str(tmp_path / "ws"),
+        sandbox_workspaces_mount=str(tmp_path / "ws"),
+        sandbox_idle_seconds=0,
+    )
+    backend = LocalBackend(settings)
+    running = asyncio.create_task(backend.exec(8, "s", "sleep 1; echo done", timeout=10))
+    await asyncio.sleep(0.2)
+    assert await backend.stop_idle() == 0
+    outcome = await running
+    assert outcome.output == "done"
+    assert await backend.stop_idle() == 1

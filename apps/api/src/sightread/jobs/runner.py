@@ -479,45 +479,21 @@ async def _finish(
                     )
                 ).scalars()
             )
-        if job.source_path:
-            source = Path(job.source_path)
-            if documents and source.is_file():
-                # One parse filed in several places: every copy keeps the original, the
-                # last one by moving it (docs/jobs.md § Retention).
-                for index, document in enumerate(documents):
-                    root = user_root(settings.workspaces_dir, document.user_id)
-                    async with workspace_lock(root):
-                        # Where the document is *now*: a rename holds this lock across
-                        # its database write and its move (docs/workspace.md).
-                        await db.refresh(document)
-                        relative = document_relative_dir(
-                            await folder_names(db, document.user_id, document.folder_id),
-                            document.name,
-                        )
-                        try:
-                            # Every copy counts: a full workspace keeps no more of them.
-                            await ensure_within_quota(settings, root)
-                        except ApiError:
-                            logger.warning(
-                                "workspace of user %d is at its quota; "
-                                "the source of document %d is not kept",
-                                document.user_id,
-                                document.id,
-                            )
-                            continue
-                        await asyncio.to_thread(
-                            keep_source,
-                            root,
-                            relative,
-                            source,
-                            copy=index < len(documents) - 1,
-                        )
-            # Not kept anywhere (no document, or none with room): deleted, as for a parse
-            # outside the library.
+        source = Path(job.source_path) if job.source_path else None
+        if source is not None and not (documents and source.is_file()):
+            # Nothing keeps it: deleted now, with the terminal state.
             source.unlink(missing_ok=True)
             job.source_deleted_at = utcnow()
         await events.notify(db, job.id)
         await db.commit()
+    if source is not None and documents and source.is_file():
+        # The terminal state is committed and billed; keeping the original is best effort
+        # from here (docs/jobs.md § Retention): a copy that fails is logged, never a
+        # reason to leave the job `running`.
+        try:
+            await _retain_source(sessionmaker, settings, job_id, documents, source)
+        except Exception:  # noqa: BLE001 - retention must not undo a finished parse
+            logger.exception("could not keep the source of job %s", job_id)
     if settings is not None and documents:
         # The result is committed: the document directories can take their copies now.
         async with sessionmaker() as db:
@@ -526,6 +502,48 @@ async def _finish(
                     await materialize_document(db, settings, document)
                 except Exception:  # noqa: BLE001 - the parse succeeded; the copy can wait
                     logger.exception("could not materialize document %d", document.id)
+
+
+async def _retain_source(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    job_id: uuid.UUID,
+    documents: list[Document],
+    source: Path,
+) -> None:
+    """One parse filed in several places: every copy keeps the original, the last one
+    by moving it (docs/jobs.md § Retention). Each copy is checked against the quota and
+    taken under the workspace lock, where the document is at that moment."""
+    async with sessionmaker() as db:
+        for index, document in enumerate(documents):
+            root = user_root(settings.workspaces_dir, document.user_id)
+            async with workspace_lock(root):
+                # Where the document is *now*: a rename holds this lock across its
+                # database write and its move (docs/workspace.md).
+                row = await db.get(Document, document.id)
+                if row is None:
+                    continue
+                relative = document_relative_dir(
+                    await folder_names(db, row.user_id, row.folder_id), row.name
+                )
+                try:
+                    # Every copy counts: a full workspace keeps no more of them.
+                    await ensure_within_quota(settings, root)
+                except ApiError:
+                    logger.warning(
+                        "workspace of user %d is at its quota; "
+                        "the source of document %d is not kept",
+                        row.user_id,
+                        row.id,
+                    )
+                    continue
+                await asyncio.to_thread(
+                    keep_source, root, relative, source, copy=index < len(documents) - 1
+                )
+        # Not kept anywhere (none with room): deleted, as for a parse outside the library.
+        source.unlink(missing_ok=True)
+        await db.execute(update(Job).where(Job.id == job_id).values(source_deleted_at=utcnow()))
+        await db.commit()
 
 
 async def run_job(

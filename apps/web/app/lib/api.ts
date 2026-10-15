@@ -301,6 +301,7 @@ type ChatEventData =
       diff: string
       tool_use_id: string
     }
+  | { event: 'retry'; attempt: number }
   | { event: 'turn_done' }
   | { event: 'turn_error'; status: string; error: string }
 
@@ -311,6 +312,7 @@ export const CHAT_EVENT_NAMES: readonly ChatEvent['event'][] = [
   'tool_use',
   'tool_result',
   'edit',
+  'retry',
   'turn_done',
   'turn_error',
 ]

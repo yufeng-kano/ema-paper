@@ -155,16 +155,59 @@ def log(root: Path, relative: Path | None = None, limit: int = 100) -> list[Revi
     return revisions
 
 
-def show(root: Path, commit: str, relative: Path) -> str | None:
-    """The file's text at `commit`, or None when it did not exist there."""
-    proc = _git(root, "show", f"{commit}:{relative.as_posix()}", check=False)
-    return proc.stdout if proc.returncode == 0 else None
+def _git_bounded(root: Path, *args: str, max_bytes: int) -> tuple[int, bytes, bool]:
+    """Like `_git`, reading at most `max_bytes` of stdout: a shell can commit a file of
+    any size, and the host must not hold a whole diff of it to show a few lines."""
+    with subprocess.Popen(  # noqa: S603 - fixed argv, no shell
+        [GIT, "-C", str(root), "--git-dir", str(git_dir(root)), "--work-tree", str(root), *args],
+        env=_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    ) as proc:
+        assert proc.stdout is not None
+        chunks: list[bytes] = []
+        total = 0
+        truncated = False
+        while True:
+            chunk = proc.stdout.read(65_536)
+            if not chunk:
+                break
+            room = max_bytes - total
+            if len(chunk) > room:
+                chunks.append(chunk[:room])
+                truncated = True
+                proc.kill()
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        try:
+            code = proc.wait(timeout=GIT_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            code = proc.wait()
+    return code, b"".join(chunks), truncated
 
 
-def show_commit(root: Path, commit: str) -> str:
-    """The commit's unified diff for text files; binaries appear as a summary line."""
-    proc = _git(root, "show", "--format=", "--unified=3", commit, check=False)
-    return proc.stdout if proc.returncode == 0 else ""
+def show(root: Path, commit: str, relative: Path, max_bytes: int) -> str | None:
+    """The file's text at `commit`, or None when it did not exist there. Raises when it
+    is larger than `max_bytes`: a revision that size is not restored into memory."""
+    code, out, truncated = _git_bounded(
+        root, "show", f"{commit}:{relative.as_posix()}", max_bytes=max_bytes
+    )
+    if truncated:
+        raise GitError(f"{relative} at {commit[:12]} exceeds {max_bytes} bytes")
+    return out.decode(errors="replace") if code == 0 else None
+
+
+def show_commit(root: Path, commit: str, max_bytes: int) -> str:
+    """The commit's unified diff for text files, cut at `max_bytes`; binaries appear as
+    a summary line."""
+    code, out, truncated = _git_bounded(
+        root, "show", "--format=", "--unified=3", commit, max_bytes=max_bytes
+    )
+    if truncated:
+        return out.decode(errors="replace") + "\n[... diff cut by the workspace ...]\n"
+    return out.decode(errors="replace") if code == 0 else ""
 
 
 def parent_of(root: Path, commit: str) -> str | None:

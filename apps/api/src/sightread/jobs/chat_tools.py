@@ -219,6 +219,8 @@ def _edit_sync(
         inserted = text_to_insert.split("\n")
         after = "\n".join(lines[:line] + inserted + lines[line:])
 
+    if len(after.encode()) > max_bytes:
+        return ToolOutcome(f"the result would make {vm_path} too large; use bash", is_error=True)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(after)
     git.ensure_repo(root)
@@ -266,7 +268,7 @@ def _commit_shell_sync(root: Path, command: str, author: str, *, max_chars: int)
     commit = git.commit_all(root, author, f"bash: {label}")
     if commit is None:
         return None
-    diff = git.show_commit(root, commit)
+    diff = git.show_commit(root, commit, max_chars * 4)
     return {"path": "", "command": "bash", "commit": commit, "diff": truncate(diff, max_chars)}
 
 

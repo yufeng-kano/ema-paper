@@ -187,8 +187,10 @@ const PROMPT_TOKENS = ['{page}', '{bbox_instructions}', '{bbox_format}'] as cons
 
 function openPromptCreate() {
   promptName.value = ''
-  // The agent's shipped default is the honest starting point for a custom prompt.
-  promptText.value = props.agent.default_prompt
+  // The agent's shipped default is the honest starting point for a custom prompt — except
+  // for the chat agent, whose preset is *added* to its system prompt (docs/chat.md § System
+  // prompt): starting from the whole prompt would send it twice.
+  promptText.value = props.agent.name === 'chat' ? '' : props.agent.default_prompt
   promptModalError.value = null
   promptModal.value = { mode: 'create' }
 }
@@ -428,6 +430,7 @@ async function removePrompt() {
         </UiField>
         <div class="prompt-foot">
           <button
+            v-if="agent.name !== 'chat'"
             type="button"
             class="text-link"
             :disabled="promptModalPending"

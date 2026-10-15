@@ -16,7 +16,16 @@ import respx
 from httpx import AsyncClient
 from sqlalchemy import select
 
-from sightread.db.models import ChatTurn, Document, Folder, Job, Message, Result, UsageLog
+from sightread.db.models import (
+    ChatEvent,
+    ChatTurn,
+    Document,
+    Folder,
+    Job,
+    Message,
+    Result,
+    UsageLog,
+)
 from sightread.jobs import chat_runner, chat_tools
 from sightread.jobs.queue import claim_next_turn
 from sightread.sandbox.client import ExecResult, SandboxClient
@@ -760,3 +769,54 @@ async def test_writing_tools_run_in_order_while_reads_run_together(monkeypatch) 
     assert not writer_overlap
     assert reads_overlapped
     assert started.index("b") < started.index("c")
+
+
+async def test_a_cancelled_queued_turn_ends_its_stream_and_a_winding_down_turn_blocks_sends(
+    chatting,
+) -> None:
+    document_id = chatting.document_id
+    conversation_id = (
+        await chatting.post(
+            f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    sent = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
+    )
+    turn_id = uuid.UUID(sent.json()["turn_id"])
+    await chatting.post(f"/api/conversations/{conversation_id}/cancel", headers=CSRF_HEADERS)
+    async with chatting.app.state.sessionmaker() as db:
+        turn = await db.get(ChatTurn, turn_id)
+        assert turn.status == "cancelled" and turn.finished_at is not None
+        events = (
+            (
+                await db.execute(
+                    select(ChatEvent).where(ChatEvent.turn_id == turn_id).order_by(ChatEvent.seq)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert [event.event for event in events] == ["turn_error"]
+    assert events[0].data["status"] == "cancelled"
+    # Finished: a new message is accepted.
+    again = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"text": "more"},
+        headers=CSRF_HEADERS,
+    )
+    assert again.status_code == 202
+    second = uuid.UUID(again.json()["turn_id"])
+    # The worker took it, the user cancelled mid-tool: until the worker winds it down, no
+    # further message may be queued behind it.
+    async with chatting.app.state.sessionmaker() as db:
+        turn = await db.get(ChatTurn, second)
+        turn.status = "running"
+        await db.commit()
+    await chatting.post(f"/api/conversations/{conversation_id}/cancel", headers=CSRF_HEADERS)
+    blocked = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"text": "wait"},
+        headers=CSRF_HEADERS,
+    )
+    assert blocked.status_code == 409

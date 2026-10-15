@@ -33,6 +33,7 @@ from .layout import (
     files_root,
     git_dir,
     no_symlinks,
+    plain_entry,
     results_root,
     user_root,
 )
@@ -72,13 +73,12 @@ class DocumentPaths:
         return None
 
     def check(self) -> None:
-        """Refuse the directory when the shell turned it, or any fixed file in it, into a
-        symlink: the host reads these as itself (docs/workspace.md § Revisions)."""
+        """Refuse the directory when the shell turned it, or any fixed file in it, into
+        something the host must not open as itself — a symlink, a FIFO, a device
+        (docs/workspace.md § Revisions)."""
         for path in (self.directory, self.doc, self.notes, self.meta, self.figures):
-            if not no_symlinks(self.root, path):
-                raise ApiError(
-                    409, "invalid_request", "The document's files are not regular files"
-                )
+            if not no_symlinks(self.root, path) or not plain_entry(path):
+                raise ApiError(409, "invalid_request", "The document's files are not regular files")
 
     @property
     def doc_relative(self) -> Path:
@@ -226,7 +226,7 @@ def keep_source(root: Path, relative: Path, source: Path, *, copy: bool = False)
     directory.mkdir(parents=True, exist_ok=True)
     suffix = source.suffix.lower()[:16] or ".bin"
     target = directory / f"{SOURCE_STEM}{suffix}"
-    if target.is_symlink():
+    if target.is_symlink() or (target.exists() and not plain_entry(target)):
         target.unlink()
     if copy:
         shutil.copy2(str(source), str(target))
@@ -277,6 +277,8 @@ def _write_file(
     max_bytes: int,
 ) -> str:
     paths.check()
+    if len(text.encode()) > max_bytes:
+        raise ApiError(409, "invalid_request", "The content is too large to save")
     current = _text_of(path, max_bytes)
     if revision_of(current) != base_revision:
         raise ApiError(409, "invalid_request", "The file changed since it was loaded")
@@ -340,7 +342,7 @@ async def revisions(db: AsyncSession, settings: Settings, document: Document) ->
     return await asyncio.to_thread(git.log, paths.root, paths.relative)
 
 
-def _revert(paths: DocumentPaths, commit: str) -> str:
+def _revert(paths: DocumentPaths, commit: str, max_bytes: int) -> str:
     paths.check()
     if not git.is_commit(paths.root, commit):
         raise ApiError(404, "invalid_request", "No such revision")
@@ -350,8 +352,13 @@ def _revert(paths: DocumentPaths, commit: str) -> str:
         # The file may have lived elsewhere when the commit was made: a renamed or moved
         # document keeps its history, and a revert must read it where it was then.
         at_commit, at_parent = git.paths_at(paths.root, commit, relative)
-        after = git.show(paths.root, commit, at_commit) if at_commit else None
-        before = git.show(paths.root, parent, at_parent) if parent and at_parent else None
+        try:
+            after = git.show(paths.root, commit, at_commit, max_bytes) if at_commit else None
+            before = (
+                git.show(paths.root, parent, at_parent, max_bytes) if parent and at_parent else None
+            )
+        except git.GitError as exc:
+            raise ApiError(409, "invalid_request", "That revision is too large to restore") from exc
         if before == after:
             continue
         if before is None:
@@ -369,7 +376,7 @@ def _revert(paths: DocumentPaths, commit: str) -> str:
 async def revert(db: AsyncSession, settings: Settings, document: Document, commit: str) -> str:
     paths = await materialize_document(db, settings, document)
     async with workspace_lock(paths.root):
-        return await asyncio.to_thread(_revert, paths, commit)
+        return await asyncio.to_thread(_revert, paths, commit, settings.content_max_bytes)
 
 
 # --- the tree -----------------------------------------------------------------------------
@@ -380,8 +387,11 @@ def _move_tree(root: Path, source: Path, target: Path, message: str) -> None:
     if not (root / source).exists() or source == target:
         return
     if (root / target).exists():
-        # Two names that clean to the same segment: keep both, the second disambiguated.
-        target = target.with_name(f"{target.name} ({uuid.uuid4().hex[:6]})")
+        # Something else sits where the row now points — a directory the shell made under
+        # that name. It moves aside, so the document lands where the database says and
+        # the squatter keeps what it holds (docs/workspace.md § Layout).
+        aside = target.with_name(f"{target.name} ({uuid.uuid4().hex[:6]})")
+        git.move(root, root / target, root / aside)
     git.move(root, root / source, root / target)
     git.commit_all(root, git.USER_AUTHOR, message)
 

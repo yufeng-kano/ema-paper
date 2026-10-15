@@ -162,14 +162,7 @@ async def delete_conversation(conversation_id: int, user: SessionUser, db: DbSes
     # rows vanish under it (docs/chat.md § Conversations, turns, events). A cancelled turn
     # counts until the worker has wound it down — only `finished_at` says it has.
     await db.execute(select(Conversation.id).where(Conversation.id == row.id).with_for_update())
-    unfinished = (
-        await db.execute(
-            select(ChatTurn.id).where(
-                ChatTurn.conversation_id == row.id, ChatTurn.finished_at.is_(None)
-            )
-        )
-    ).first()
-    if unfinished is not None:
+    if await _active_turn(db, row.id) is not None:
         raise ApiError(
             409,
             "invalid_request",
@@ -190,14 +183,19 @@ class MessageCreate(BaseModel):
 
 
 async def _active_turn(db: AsyncSession, conversation_id: int) -> uuid.UUID | None:
+    """A turn the worker may still be driving: queued, running, or cancelled but not
+    yet wound down — anything without `finished_at` (docs/chat.md)."""
     return (
-        await db.execute(
-            select(ChatTurn.id).where(
-                ChatTurn.conversation_id == conversation_id,
-                ChatTurn.status.in_(("queued", "running")),
+        (
+            await db.execute(
+                select(ChatTurn.id).where(
+                    ChatTurn.conversation_id == conversation_id, ChatTurn.finished_at.is_(None)
+                )
             )
         )
-    ).scalar_one_or_none()
+        .scalars()
+        .first()
+    )
 
 
 async def _ready_to_chat(db: AsyncSession, settings: AppSettings, user_id: int) -> None:
@@ -289,11 +287,32 @@ async def cancel_turn(conversation_id: int, user: SessionUser, db: DbSession) ->
     sets `finished_at`; a queued one is never claimed, so it is finished here and now."""
     row = await owned_conversation(db, user.id, conversation_id)
     await db.execute(select(Conversation.id).where(Conversation.id == row.id).with_for_update())
-    await db.execute(
-        update(ChatTurn)
-        .where(ChatTurn.conversation_id == row.id, ChatTurn.status == "queued")
-        .values(status="cancelled", error="cancelled", finished_at=utcnow())
+    queued = (
+        (
+            await db.execute(
+                select(ChatTurn.id).where(
+                    ChatTurn.conversation_id == row.id, ChatTurn.status == "queued"
+                )
+            )
+        )
+        .scalars()
+        .all()
     )
+    for turn_id in queued:
+        # Finished here, with the event a worker would have written: the stream sees the
+        # turn end instead of waiting for a start that never comes.
+        await db.execute(
+            update(ChatTurn)
+            .where(ChatTurn.id == turn_id)
+            .values(status="cancelled", error="cancelled", finished_at=utcnow())
+        )
+        await chat_events.append(
+            db,
+            row.id,
+            turn_id,
+            chat_events.TURN_ERROR,
+            {"status": "cancelled", "error": "cancelled"},
+        )
     await db.execute(
         update(ChatTurn)
         .where(ChatTurn.conversation_id == row.id, ChatTurn.status == "running")

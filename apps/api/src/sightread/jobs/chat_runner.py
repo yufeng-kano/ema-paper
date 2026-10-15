@@ -434,10 +434,14 @@ async def _call_model(ctx: TurnContext, body: dict) -> CompletedMessage:
             if attempt == MAX_ATTEMPTS - 1:
                 raise
             await asyncio.sleep(exc.retry_after or BACKOFF_BASE_SECONDS * (2**attempt))
+            # What the failed attempt streamed is already out: the thread starts over
+            # from here (docs/chat.md § Conversations, turns, events).
+            await _emit(ctx, chat_events.RETRY, {"attempt": attempt + 2})
         except UpstreamError as exc:
             if attempt == MAX_ATTEMPTS - 1 or not exc.transient:
                 raise
             await asyncio.sleep(BACKOFF_BASE_SECONDS * (2**attempt))
+            await _emit(ctx, chat_events.RETRY, {"attempt": attempt + 2})
     raise RateLimited()
 
 
@@ -488,6 +492,11 @@ async def _run_tool_unguarded(ctx: TurnContext, block: dict, malformed: set[str]
             outcome = await chat_tools.commit_shell_changes(
                 ctx.paths.root, outcome, tool_input, author, max_chars=max_chars
             )
+            if outcome.edit is not None:
+                # The library follows the tree before the viewer is told to reload, so
+                # the reload finds the document where the shell left it.
+                async with ctx.sessionmaker() as db:
+                    await reconcile_user(db, ctx.settings, ctx.turn.user_id)
     elif name == "str_replace_based_edit_tool":
         outcome = await chat_tools.run_editor(
             ctx.paths.root,

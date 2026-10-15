@@ -440,7 +440,7 @@ class Conversation(Base):
     session: Mapped[str] = mapped_column(String(64))
     # Set by the first turn and kept: the stored thinking blocks belong to this model
     # (docs/chat.md § History is append-only).
-    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
 

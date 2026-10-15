@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,6 +35,9 @@ from .layout import (
 from .locks import workspace_lock
 
 logger = logging.getLogger(__name__)
+
+# A document's metadata is a few hundred bytes; anything larger is not ours.
+META_MAX_BYTES = 65_536
 
 
 @dataclass(frozen=True)
@@ -90,7 +94,12 @@ def _scan(root: Path) -> list[Found]:
         if META_FILE not in files:
             continue
         meta = Path(current) / META_FILE
-        if meta.is_symlink():
+        try:
+            # A plain, small file or nothing: the shell can put anything under that name.
+            info = os.lstat(meta)
+        except OSError:
+            continue
+        if not stat.S_ISREG(info.st_mode) or info.st_size > META_MAX_BYTES:
             continue
         try:
             payload = json.loads(meta.read_text())

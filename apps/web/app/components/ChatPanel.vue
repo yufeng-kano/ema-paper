@@ -253,7 +253,7 @@ async function removeConversation() {
     currentId.value = null
     messages.value = []
     turns.value = []
-    events.value = []
+    discardFrames()
     const next = conversations.value[0]
     if (next) {
       await select(next.id)
@@ -306,7 +306,7 @@ async function select(id: number) {
   currentId.value = id
   messages.value = []
   turns.value = []
-  events.value = []
+  discardFrames()
   cards.clear()
   stream.open(id, 0)
   await loadDetail(id)
@@ -335,6 +335,16 @@ onMounted(loadConversations)
 const events = shallowRef<StreamedEvent[]>([])
 let pendingFrames: StreamedEvent[] = []
 let flushTimer: ReturnType<typeof setTimeout> | null = null
+
+/** Forget every frame, shown or still queued: the thread they belong to is gone. */
+function discardFrames() {
+  if (flushTimer !== null) {
+    clearTimeout(flushTimer)
+    flushTimer = null
+  }
+  pendingFrames = []
+  events.value = []
+}
 
 /** Frames land in bursts — a replay is thousands of them — so they are folded into the
  *  thread once per tick rather than once per frame. */
@@ -515,9 +525,10 @@ const thread = computed<ThreadItem[]>(() => {
             items.push({ kind: 'thinking', key: `${prefix}-think-${at}`, text: block.thinking.trim() })
           } else if (block.type === 'tool_use') {
             items.push(toolItem(block.id, block.name, block.input))
-            // An editor write, or any tool whose `edit` event is on record — a shell
-            // command that changed the tree has a revision to show and revert too.
-            if (block.name === EDITOR_TOOL || edits.has(block.id)) {
+            // Any tool whose `edit` event is on record — a shell command that changed the
+            // tree has a revision to show and revert too — or an editor write the record
+            // says succeeded; a failed one has nothing to show.
+            if (edits.has(block.id) || (block.name === EDITOR_TOOL && results.get(block.id) === false)) {
               const card = editItem(block.id, block.input)
               if (card) {
                 items.push(card)
@@ -527,6 +538,9 @@ const thread = computed<ThreadItem[]>(() => {
         })
       })
     } else if (group) {
+      // A retried model call starts over: what the abandoned attempt streamed is noise.
+      const restart = group.map((event) => event.event).lastIndexOf('retry')
+      const live = restart === -1 ? group : group.slice(restart + 1)
       let text = ''
       let textKey = 0
       const flushText = () => {
@@ -536,7 +550,7 @@ const thread = computed<ThreadItem[]>(() => {
         text = ''
         textKey += 1
       }
-      for (const event of group) {
+      for (const event of live) {
         switch (event.event) {
           case 'text_delta':
             text += event.text

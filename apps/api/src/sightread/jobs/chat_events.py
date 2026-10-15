@@ -31,6 +31,7 @@ THINKING = "thinking"
 TOOL_USE = "tool_use"
 TOOL_RESULT = "tool_result"
 EDIT = "edit"
+RETRY = "retry"
 TURN_DONE = "turn_done"
 TURN_ERROR = "turn_error"
 

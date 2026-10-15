@@ -6,6 +6,7 @@ Real git in a temporary directory; no database beyond the SQLite fallback.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import uuid
 from pathlib import Path
@@ -312,3 +313,75 @@ async def test_an_inflated_document_file_is_refused(sessionmaker, tmp_path) -> N
             await documents.write_content(
                 db, settings, document, markdown="y", base_revision=content.revision
             )
+
+
+async def test_a_fifo_or_oversized_save_is_refused(sessionmaker, tmp_path) -> None:
+    settings = _settings(tmp_path)
+    settings.content_max_bytes = 64
+    async with sessionmaker() as db:
+        _, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+        content = await documents.read_content(db, settings, document)
+        with pytest.raises(ApiError) as too_big:
+            await documents.write_content(
+                db, settings, document, markdown="x" * 65, base_revision=content.revision
+            )
+        assert too_big.value.status_code == 409
+        assert paths.doc.read_text() == content.markdown
+        paths.notes.unlink()
+        os.mkfifo(paths.notes)
+        with pytest.raises(ApiError) as fifo:
+            await documents.read_content(db, settings, document)
+        assert fifo.value.status_code == 409
+
+
+async def test_a_move_puts_the_document_where_the_row_says(sessionmaker, tmp_path) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        before = await documents.materialize_document(db, settings, document)
+        content = await documents.read_content(db, settings, document)
+        await documents.write_content(
+            db, settings, document, markdown="# Title\n\nEdited\n", base_revision=content.revision
+        )
+        # The shell left an unrelated directory under the name the user now picks.
+        squatter = before.directory.with_name("renamed.pdf")
+        squatter.mkdir()
+        (squatter / "stray.txt").write_text("from bash")
+        document.name = "renamed.pdf"
+        await db.commit()
+        after = await documents.document_paths(db, settings, document)
+        await documents.move_path(settings, user.id, before.relative, after.relative)
+        assert after.doc.read_text() == "# Title\n\nEdited\n"
+        assert (await documents.read_content(db, settings, document)).markdown.endswith("Edited\n")
+        moved_aside = [
+            p for p in after.directory.parent.iterdir() if p.name.startswith("renamed.pdf (")
+        ]
+        assert len(moved_aside) == 1 and (moved_aside[0] / "stray.txt").read_text() == "from bash"
+
+
+def test_shell_diffs_and_revisions_are_read_within_a_bound(tmp_path) -> None:
+    root = tmp_path / "ws" / "9"
+    (root / "files").mkdir(parents=True)
+    git.ensure_repo(root)
+    (root / "files" / "big.txt").write_text("line\n" * 20_000)
+    commit = git.commit_all(root, "agent:1", "big")
+    assert commit is not None
+    diff = git.show_commit(root, commit, 2_000)
+    assert len(diff) < 2_100 and diff.rstrip().endswith("[... diff cut by the workspace ...]")
+    with pytest.raises(git.GitError):
+        git.show(root, commit, Path("files/big.txt"), 1_000)
+    assert git.show(root, commit, Path("files/big.txt"), 1_000_000) == "line\n" * 20_000
+
+
+async def test_reconcile_ignores_oversized_metadata(sessionmaker, tmp_path) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+        moved = paths.directory.with_name("moved.pdf")
+        paths.directory.rename(moved)
+        (moved / ".meta.json").write_text(json.dumps({"document_id": document.id}) + " " * 70_000)
+        assert await reconcile.reconcile_user(db, settings, user.id) == 0
+        row = (await db.execute(select(Document).where(Document.id == document.id))).scalar_one()
+        assert row.name == "paper.pdf"

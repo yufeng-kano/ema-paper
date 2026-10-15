@@ -35,7 +35,7 @@ def upgrade() -> None:
         sa.Column("document_id", sa.Integer(), nullable=False),
         sa.Column("title", sa.String(length=255), nullable=False),
         sa.Column("session", sa.String(length=64), nullable=False),
-        sa.Column("model", sa.String(length=128), nullable=True),
+        sa.Column("model", sa.String(length=255), nullable=True),
         sa.Column("created_at", TIMESTAMPTZ, nullable=False),
         sa.Column("updated_at", TIMESTAMPTZ, nullable=False),
         sa.ForeignKeyConstraint(["document_id"], ["documents.id"], ondelete="CASCADE"),
