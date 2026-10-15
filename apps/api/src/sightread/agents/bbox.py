@@ -16,6 +16,7 @@ from pathlib import Path
 
 from PIL import Image
 
+from ..parsing.images import JPEG_QUALITY
 from ..parsing.markdown import BBOX_MAX, PLACEHOLDER_RE
 
 CANONICAL_FORMAT = "yxyx_norm1000"
@@ -63,7 +64,8 @@ CLAUDE = BboxConvention(family="claude", format=PIXEL_FORMAT)
 GPT = BboxConvention(family="gpt", format=PIXEL_FORMAT)
 DEFAULT = BboxConvention(family="default", format=CANONICAL_FORMAT)
 
-# Kano Proxy lists models as `vendor/model`; the bare names cover a connection that does not.
+# A vendor namespace, or the model's own name after any namespace: Kano Proxy lists
+# `anthropic/claude-…`, a connection may list `claude-code/claude-…` or a bare `claude-…`.
 _FAMILIES: tuple[tuple[str, str, BboxConvention], ...] = (
     ("google/", "gemini-", GEMINI),
     ("anthropic/", "claude-", CLAUDE),
@@ -73,13 +75,27 @@ _FAMILIES: tuple[tuple[str, str, BboxConvention], ...] = (
 
 def convention_for_model(model: str | None) -> BboxConvention:
     name = (model or "").strip().lower()
+    own = name.rsplit("/", 1)[-1]
     for vendor, bare, convention in _FAMILIES:
-        if name.startswith(vendor) or name.startswith(bare):
+        if name.startswith(vendor) or own.startswith(bare):
             return convention
     return DEFAULT
 
 
 # --- the image the convention needs ------------------------------------------------------
+
+# Jobs snapshotted before this pipeline version carry a prompt that asks every model for the
+# stored contract; converting their answers as pixels would corrupt them (docs/parsing.md).
+PIXEL_CONVENTIONS_SINCE_PIPELINE = 6
+
+
+def convention_for_job(model: str | None, pipeline_version: int) -> BboxConvention:
+    """The convention a queued job runs under: its model's, unless the job was enqueued
+    under a pipeline whose prompt still asked for the stored contract."""
+    if pipeline_version < PIXEL_CONVENTIONS_SINCE_PIPELINE:
+        return DEFAULT
+    return convention_for_model(model)
+
 
 # Claude's standard resolution tier (its vision-coordinates docs): no edge over this many
 # pixels, and no more than this many 28x28 visual tokens. Sending the image at exactly the
@@ -148,7 +164,12 @@ def prepare_image(image: Path, convention: BboxConvention) -> PreparedImage:
             return PreparedImage(image, width, height, derived=False)
         resized = opened.convert("RGB").resize((target_w, target_h), Image.LANCZOS)
         target = image.with_name(f"{image.stem}-sent{image.suffix}")
-        resized.save(target, format="PNG" if image.suffix.lower() == ".png" else "JPEG")
+        if image.suffix.lower() == ".png":
+            resized.save(target, format="PNG")
+        else:
+            # The same quality the normalizer chose: a second, default-quality JPEG pass
+            # would ring around exactly the fine text the call is meant to read.
+            resized.save(target, format="JPEG", quality=JPEG_QUALITY)
     return PreparedImage(target, target_w, target_h, derived=True)
 
 

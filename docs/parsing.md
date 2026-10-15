@@ -33,7 +33,7 @@ Markers are how a caller maps any passage back to its page (citations, cross-che
 ## Coordinate contract
 
 - Figures: `bbox` = `[ymin, xmin, ymax, xmax]`, normalized 0–1000, origin top-left (`yxyx_norm1000`, Gemini-native). This is what every result declares; what a model is *asked* for depends on its family and is converted into this space before storage (§ Coordinate conventions).
-- The service **never converts coordinates**; the response declares `meta.bbox_format` and the receiver does the one and only conversion at crop time.
+- The service never converts coordinates **on the way out**: the response declares `meta.bbox_format` and the receiver does the one conversion into its own pixel space at crop time. The one conversion the service does make is on the way in — a model's native convention into the stored contract, before anything is stored (§ Coordinate conventions).
 - Placeholder: `![fig{n}](sightread://p{page}/{ymin},{xmin},{ymax},{xmax})`, caption verbatim on the next line.
 - The box bounds the graphic itself — the plotted area, drawing or photograph — and **excludes the caption line and surrounding body text**. The caption already travels on the placeholder's next line, so a box that included it would print it twice: once baked into the crop, once as text. The prompt states this explicitly.
 - Figure ids are document-wide (`fig1`, `fig2`, …) and the page number is **ours**, not the model's: the model emits the placeholder in place and the assembler renumbers it. Boxes are clamped to 0–1000; a box that is still degenerate (zero or negative area) is dropped, never guessed at.
@@ -79,7 +79,7 @@ Conversion (`canonicalize` in `agents/bbox.py`): a pixel box `[x1, y1, x2, y2]` 
 
 The prompt carries the convention through the `{bbox_instructions}` token: it expands to the convention's own paragraph — the placeholder shape to emit and what its four integers mean, including the sent image's pixel size for the pixel conventions — and `{bbox_format}` expands to the convention's id. A custom prompt that keeps `{bbox_instructions}` therefore works on every family. A custom prompt that spells out a convention of its own is still converted as if it followed the model's — that is the user's responsibility, as with every custom prompt.
 
-The convention is a function of the model, which is already part of the dedup key. The default template changed to carry the token, so `PIPELINE_VERSION` moved.
+The convention is a function of the model, which is already part of the dedup key. The default template changed to carry the token, so `PIPELINE_VERSION` moved to 6 — and a job snapshotted under an earlier version keeps the stored contract as its convention (`convention_for_job`): its prompt still asks every model for `yxyx_norm1000`, and reading that answer as pixels would corrupt it after a paid call.
 
 ## Models
 

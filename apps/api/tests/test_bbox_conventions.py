@@ -12,16 +12,18 @@ import json
 import httpx
 import pytest
 import respx
+from PIL import Image
 
 from sightread.agents import bbox
 from sightread.agents.bbox import (
     canonicalize,
     claude_input_size,
+    convention_for_job,
     convention_for_model,
     prepare_image,
 )
 from sightread.auth.crypto import encrypt_kano_proxy_key
-from sightread.parsing.images import image_size
+from sightread.parsing.images import JPEG_QUALITY, image_size
 from sightread.upstream.client import Connection, transcribe_page
 from tests.conftest import CSRF_HEADERS, KANO_BASE, KANO_CHAT_URL
 
@@ -35,6 +37,8 @@ SECRET = "test-secret-key-not-a-real-one"
         ("gemini-2.5-flash", bbox.GEMINI),
         ("anthropic/claude-sonnet-4-5", bbox.CLAUDE),
         ("Claude-Opus", bbox.CLAUDE),
+        ("claude-code/claude-opus-5", bbox.CLAUDE),
+        ("some-proxy/gpt-6", bbox.GPT),
         ("openai/gpt-6", bbox.GPT),
         ("gpt-6-astra", bbox.GPT),
         ("qwen/qwen3-vl", bbox.DEFAULT),
@@ -43,6 +47,14 @@ SECRET = "test-secret-key-not-a-real-one"
 )
 def test_the_convention_follows_the_model_family(model, expected) -> None:
     assert convention_for_model(model) is expected
+
+
+def test_a_job_queued_under_the_old_pipeline_keeps_the_stored_contract() -> None:
+    # Its snapshotted prompt still asks for yxyx 0-1000; reading that as pixels would
+    # corrupt the boxes after a paid call.
+    assert convention_for_job("anthropic/claude-sonnet-4-5", 5) is bbox.DEFAULT
+    assert convention_for_job("anthropic/claude-sonnet-4-5", 6) is bbox.CLAUDE
+    assert convention_for_job("google/gemini-2.5-pro", 6) is bbox.GEMINI
 
 
 def test_only_the_pixel_families_are_asked_in_pixels() -> None:
@@ -93,6 +105,17 @@ def test_only_claude_gets_a_pre_resized_image(documents) -> None:
 
     small = prepare_image(documents["png"], bbox.CLAUDE)
     assert not small.derived
+
+    # A JPEG is re-encoded at the normalizer's quality, not Pillow's default.
+    wide_jpg = wide.with_name("wide.jpg")
+    Image.open(wide).convert("RGB").save(wide_jpg, format="JPEG", quality=JPEG_QUALITY)
+    sent_jpg = prepare_image(wide_jpg, bbox.CLAUDE)
+    with Image.open(sent_jpg.path) as reencoded:
+        assert reencoded.format == "JPEG"
+        # Pillow's quality-75 tables start at 8; the quality-92 ones start at 3.
+        assert reencoded.quantization[0][0] <= 3
+    sent_jpg.cleanup()
+    wide_jpg.unlink()
 
 
 def _key() -> Connection:

@@ -25,7 +25,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ..agents import get_agent
-from ..agents.bbox import convention_for_model, prepare_image
+from ..agents.bbox import convention_for_job, prepare_image
 from ..config import Settings
 from ..db.models import Job, JobPage, Result, UsageLog, utcnow
 from ..parsing import poppler
@@ -279,7 +279,7 @@ async def _process_pdf_page(
         await _record_page(sessionmaker, job, outcome)
         return outcome
 
-    convention = convention_for_model(job.model)
+    convention = convention_for_job(job.model, job.pipeline_version)
     sent = prepare_image(image, convention)
     try:
         transcription = await _guarded_call(
@@ -333,7 +333,7 @@ async def _process_image(
         height_pt=float(normalized.height_px),
         method=VISION,
     )
-    convention = convention_for_model(job.model)
+    convention = convention_for_job(job.model, job.pipeline_version)
     sent = prepare_image(normalized.path, convention)
     try:
         transcription = await _guarded_call(
