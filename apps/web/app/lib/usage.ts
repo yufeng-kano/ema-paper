@@ -3,9 +3,10 @@ import type { UsageResponse, UsageTotals } from './api'
 export interface UsageRow {
   /** A date (`YYYY-MM-DD`) for the per-day table, a model id for the per-model table. */
   label: string
-  /** OpenRouter's billing only — estimates and unpriced calls are never folded in. */
+  /** Billing only (the historical OpenRouter rows) — estimates and unpriced calls are never
+   *  folded in. */
   cost: number
-  /** Calls OpenRouter billed. 0 means "nothing here was billed", so `cost` is no figure. */
+  /** Billed calls. 0 means "nothing here was billed", so `cost` is no figure. */
   billedCalls: number
   estimatedCost: number
   estimatedCalls: number

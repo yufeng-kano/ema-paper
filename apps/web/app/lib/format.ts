@@ -34,7 +34,7 @@ export function formatDay(day: string, locale: string): string {
   )
 }
 
-/** Costs are OpenRouter's USD amounts and are often fractions of a cent. */
+/** Costs are USD amounts, billed or estimated, and are often fractions of a cent. */
 export function formatCost(value: number, locale: string): string {
   return new Intl.NumberFormat(locale, {
     style: 'currency',

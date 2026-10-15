@@ -34,7 +34,7 @@ const dayColumns = computed<TableColumn<UsageRow>[]>(() => [
   { key: 'completion', header: t('dashboard.columnCompletion'), numeric: true },
 ])
 
-/** Billed cost, or a dash where nothing was billed: $0 would claim OpenRouter billed it. */
+/** Billed cost, or a dash where nothing was billed: $0 would claim a bill that never existed. */
 function billedCost(row: UsageRow): string {
   return row.billedCalls > 0 ? formatCost(row.cost, locale.value) : t('dashboard.none')
 }

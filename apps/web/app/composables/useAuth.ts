@@ -38,7 +38,7 @@ export function useAuth() {
     return inFlight
   }
 
-  /** Re-reads the session after a mutation that changes settings or the OpenRouter key. */
+  /** Re-reads the session after a mutation that changes what `/api/me` reports. */
   function refresh(): Promise<void> {
     return load()
   }

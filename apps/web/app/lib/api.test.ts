@@ -4,8 +4,9 @@ import {
   createKey,
   getMe,
   isDevLoginAvailable,
+  kanoConnectUrl,
   listJobs,
-  putSettings,
+  putAgentSettings,
   revokeKey,
 } from './api'
 
@@ -62,19 +63,17 @@ describe('request', () => {
   it('raises the error envelope type and message', async () => {
     stubFetch(
       Response.json(
-        { error: { type: 'invalid_request', message: "Unknown profile 'nope'" } },
-        { status: 400 },
+        { error: { type: 'invalid_request', message: "No such agent 'nope'" } },
+        { status: 404 },
       ),
     )
 
-    const error = await putSettings({ default_model: null, default_profile: 'nope' }).catch(
-      (thrown: unknown) => thrown,
-    )
+    const error = await putAgentSettings('nope', { model: null }).catch((thrown: unknown) => thrown)
 
     expect(error).toBeInstanceOf(ApiRequestError)
-    expect((error as ApiRequestError).status).toBe(400)
+    expect((error as ApiRequestError).status).toBe(404)
     expect((error as ApiRequestError).type).toBe('invalid_request')
-    expect((error as ApiRequestError).message).toBe("Unknown profile 'nope'")
+    expect((error as ApiRequestError).message).toBe("No such agent 'nope'")
   })
 
   it('flags a 401 as unauthorized', async () => {
@@ -127,5 +126,22 @@ describe('isDevLoginAvailable', () => {
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockRejectedValue(new TypeError('offline')))
 
     await expect(isDevLoginAvailable()).resolves.toBe(false)
+  })
+})
+
+describe('kanoConnectUrl', () => {
+  it('carries the locale so the callback returns to the same language', () => {
+    expect(kanoConnectUrl('zh-TW')).toBe('/api/kano/connect?locale=zh-TW')
+  })
+
+  it('cannot be steered by a crafted locale', () => {
+    // The value is a query parameter, never a path: the server allowlists it.
+    expect(kanoConnectUrl('../../evil?x=1&y')).toBe(
+      '/api/kano/connect?locale=..%2F..%2Fevil%3Fx%3D1%26y',
+    )
+  })
+
+  it('omits the parameter when there is no locale', () => {
+    expect(kanoConnectUrl('')).toBe('/api/kano/connect')
   })
 })

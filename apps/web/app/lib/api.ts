@@ -1,7 +1,7 @@
 /**
  * The single typed client for the backend (docs/project-structure.md § Boundaries).
  *
- * Every URL is relative: production routes `/api/*` and `/v1/*` to FastAPI through Caddy,
+ * Every URL is relative: production routes `/api/*` to FastAPI through Caddy,
  * development through the nitro dev proxy, so the session cookie is always same-origin.
  * Mutations carry `X-Requested-With` — the CSRF pairing the control plane enforces
  * (docs/api.md).
@@ -49,26 +49,45 @@ export interface User {
   created_at: string
 }
 
-export interface UserSettings {
-  default_model: string | null
-  default_profile: string | null
-  /** Active upstream; null means the built-in OpenRouter (docs/api.md § Upstreams). */
-  default_connection_id: number | null
-  /** Selected prompt preset; null means the shipped default prompt. */
+/** One agent's settings (docs/agents.md); every null is that field's default. */
+export interface AgentSettings {
+  /** The agent's upstream; null means Kano Proxy, the built-in one (docs/api.md § Upstreams). */
+  connection_id: number | null
+  /** Model id on that upstream's catalog; null means none chosen yet. */
+  model: string | null
+  /** Selected prompt preset; null means the agent's shipped default prompt. */
   prompt_preset_id: number | null
 }
 
+/** An entry of the code-defined agent registry, with the caller's settings for it. */
+export interface AgentEntry {
+  name: string
+  /** Declared, not enforced yet: the model picker lists the whole catalog. */
+  capabilities: string[]
+  input: string
+  output: string
+  /** What "default" means for this agent's prompt picker. */
+  default_prompt: string
+  settings: AgentSettings
+}
+
+/** Kano Proxy as this user sees it; the key itself only ever comes back masked. */
+export interface KanoState {
+  /** False when this deployment has no Kano Proxy configured. */
+  available: boolean
+  connected: boolean
+  masked: string | null
+}
+
 /**
- * A user-defined OpenAI-compatible endpoint; the API key only ever returns masked.
- * A connection is a complete profile — endpoint, key and model travel together; `model`
- * is null only on rows created before the column existed (docs/api.md § Upstreams).
+ * A user-defined OpenAI-compatible endpoint; the API key only ever returns masked. The
+ * model is not part of it — each agent picks its own (docs/agents.md).
  */
 export interface ProviderConnection {
   id: number
   name: string
   base_url: string
   masked: string
-  model: string | null
   /** Record the `usage.cost` this endpoint reports, as an estimate; off by default. */
   report_cost: boolean
   created_at: string
@@ -82,16 +101,12 @@ export interface ConnectionModel {
 
 export interface PromptPreset {
   id: number
+  /** The agent this prompt is for; fixed once created. */
+  agent: string
   name: string
   text: string
   created_at: string
   updated_at: string
-}
-
-export interface OpenRouterKeyState {
-  present: boolean
-  masked: string | null
-  updated_at: string | null
 }
 
 /** The server's own upload limits, so the file picker enforces one set of numbers. */
@@ -105,10 +120,6 @@ export interface UploadLimits {
 
 export interface MeResponse {
   user: User
-  settings: UserSettings
-  /** What "default" means right now — the shipped prompt the backend runs without a custom one. */
-  defaults: { system_prompt: string }
-  openrouter_key: OpenRouterKeyState
   limits: UploadLimits
 }
 
@@ -131,14 +142,15 @@ export interface CreatedApiKey {
 
 /**
  * One bucket of `GET /api/usage`. Billed, estimated and unpriced cost never share a field
- * (docs/api.md § Usage aggregates): `cost` is OpenRouter's billing only.
+ * (docs/api.md § Usage aggregates): `cost` is billing only, which today means the
+ * historical OpenRouter rows — nothing new is ever billed.
  */
 export interface UsageTotals {
   calls: number
   prompt_tokens: number
   completion_tokens: number
   cost: number
-  /** What provider connections with `report_cost` reported — an estimate, not a bill. */
+  /** What Kano Proxy and connections with `report_cost` reported — an estimate, not a bill. */
   estimated_cost: number
   estimated_calls: number
   /** Calls whose cost nobody reported; counted, never priced as 0. */
@@ -166,8 +178,8 @@ export interface JobSummary {
   status: JobStatus
   filename: string
   kind: string
+  agent: string
   model: string
-  profile: string | null
   page_count: number | null
   pages_done: number
   error: string | null
@@ -199,8 +211,10 @@ export interface ResultPageError {
 export interface ResultMeta {
   /** Absent on results stored before the pipeline started writing it. */
   job_id?: string
+  /** Absent on results stored before agents existed; those carry `profile` instead. */
+  agent?: string
+  profile?: string | null
   model: string
-  profile: string | null
   bbox_format: string
   pipeline_version: number
   sha256: string
@@ -251,25 +265,6 @@ export interface LibraryDocument {
 export interface LibraryResponse {
   folders: LibraryFolder[]
   documents: LibraryDocument[]
-}
-
-export interface ModelEntry {
-  id: string
-  name: string | null
-  context_length: number | null
-  pricing: Record<string, string> | null
-  /** True when a preset profile currently resolves to this model. */
-  recommended: boolean
-}
-
-export interface ProfileEntry {
-  id: string
-  name: string
-  description: string
-  model: string | null
-  bbox_format: string
-  profile_version: number
-  available: boolean
 }
 
 // --- transport -------------------------------------------------------------
@@ -372,21 +367,46 @@ export function revokeKey(id: number): Promise<void> {
   return request<undefined>('DELETE', `/api/keys/${id}`)
 }
 
-export function getOpenRouterKey(): Promise<OpenRouterKeyState> {
-  return request('GET', '/api/openrouter-key')
+// --- Kano Proxy (docs/auth.md § 6) --------------------------------------------
+
+export function getKano(): Promise<KanoState> {
+  return request('GET', '/api/kano')
 }
 
-export function putOpenRouterKey(key: string): Promise<OpenRouterKeyState> {
-  return request('PUT', '/api/openrouter-key', { key })
+/** Forgets the key here only; it stays listed on Kano Proxy's Access page. */
+export function deleteKano(): Promise<void> {
+  return request<undefined>('DELETE', '/api/kano')
 }
 
-export function deleteOpenRouterKey(): Promise<void> {
-  return request<undefined>('DELETE', '/api/openrouter-key')
+/**
+ * Where Connect / Reconnect send the browser: a full-page navigation into the server's
+ * redirect flow, like sign-in — never a fetch. `locale` brings the user back to the same
+ * language.
+ */
+export function kanoConnectUrl(locale: string): string {
+  return locale ? `/api/kano/connect?locale=${encodeURIComponent(locale)}` : '/api/kano/connect'
 }
 
-/** Partial update: only the fields present in the body change (docs/api.md). */
-export function putSettings(settings: Partial<UserSettings>): Promise<UserSettings> {
-  return request('PUT', '/api/settings', settings)
+// --- agents (docs/agents.md) ---------------------------------------------------
+
+export function listAgents(): Promise<{ agents: AgentEntry[] }> {
+  return request('GET', '/api/agents')
+}
+
+/**
+ * Partial update: only the fields present change. Changing `connection_id` without
+ * `model` clears the model on the server — it belonged to the other upstream's catalog.
+ */
+export function putAgentSettings(
+  agent: string,
+  settings: Partial<AgentSettings>,
+): Promise<AgentSettings> {
+  return request('PUT', `/api/agents/${encodeURIComponent(agent)}/settings`, settings)
+}
+
+/** The live catalog of the agent's saved upstream — what its model picker lists. */
+export function listAgentModels(agent: string): Promise<{ data: ConnectionModel[] }> {
+  return request('GET', `/api/agents/${encodeURIComponent(agent)}/models`)
 }
 
 // --- provider connections ---------------------------------------------------
@@ -399,7 +419,6 @@ export function createConnection(body: {
   name: string
   base_url: string
   api_key: string
-  model: string
   report_cost: boolean
 }): Promise<ProviderConnection> {
   return request('POST', '/api/connections', body)
@@ -407,7 +426,7 @@ export function createConnection(body: {
 
 export function updateConnection(
   id: number,
-  body: Partial<{ name: string; base_url: string; api_key: string; model: string; report_cost: boolean }>,
+  body: Partial<{ name: string; base_url: string; api_key: string; report_cost: boolean }>,
 ): Promise<ProviderConnection> {
   return request('PUT', `/api/connections/${id}`, body)
 }
@@ -417,8 +436,8 @@ export function deleteConnection(id: number): Promise<void> {
 }
 
 /**
- * The live model catalog the connection dialog picks from — with a candidate key before
- * the connection exists, or with the stored key (`connection_id`) while editing one.
+ * An endpoint's live model catalog — with a candidate key before the connection exists,
+ * or with the stored key (`connection_id`) for a saved one.
  */
 export function previewConnectionModels(body: {
   base_url: string
@@ -434,7 +453,11 @@ export function listPrompts(): Promise<{ prompts: PromptPreset[] }> {
   return request('GET', '/api/prompts')
 }
 
-export function createPrompt(body: { name: string; text: string }): Promise<PromptPreset> {
+export function createPrompt(body: {
+  agent: string
+  name: string
+  text: string
+}): Promise<PromptPreset> {
   return request('POST', '/api/prompts', body)
 }
 
@@ -524,14 +547,4 @@ export function deleteDocument(id: number): Promise<void> {
 
 export function getDocumentResult(id: number): Promise<JobResult> {
   return request('GET', `/api/library/documents/${id}/result`)
-}
-
-// --- data plane reads the web app is allowed to make (docs/web.md) ---------
-
-export function listModels(): Promise<{ data: ModelEntry[] }> {
-  return request('GET', '/v1/models')
-}
-
-export function listProfiles(): Promise<{ data: ProfileEntry[] }> {
-  return request('GET', '/v1/profiles')
 }
