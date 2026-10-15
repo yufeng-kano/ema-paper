@@ -133,6 +133,19 @@ def commit_paths(root: Path, author: str, message: str, paths: list[Path]) -> st
     return _commit_staged(root, author, message)
 
 
+def reset_index(root: Path) -> None:
+    """Unstage everything, the tree untouched: what a failed commit left staged must not
+    ride into the next path-scoped commit, which commits the whole index."""
+    _git(root, "reset", "-q", check=False)
+
+
+def restore_from(root: Path, commit: str, author: str, message: str, relative: Path) -> str | None:
+    """Write `relative` back as it was at `commit` and commit that: how a removal is undone
+    when the rows it was made for did not go (docs/workspace.md § Revisions)."""
+    _git(root, "checkout", "-q", commit, "--", relative.as_posix())
+    return commit_paths(root, author, message, [relative])
+
+
 def head(root: Path) -> str | None:
     proc = _git(root, "rev-parse", "--verify", "-q", "HEAD", check=False)
     return proc.stdout.strip() or None
@@ -251,8 +264,9 @@ def show(root: Path, commit: str, relative: Path, max_bytes: int) -> str | None:
 
 def renames_since(root: Path, commit: str) -> dict[Path, Path]:
     """Where each path renamed after `commit` lives now: old path → current path, with
-    chains of renames followed in order."""
-    proc = _git(
+    chains of renames followed in order. Read under `LOG_MAX_BYTES` like the log: a
+    history of renames past it raises rather than being held whole."""
+    code, raw, truncated = _git_bounded(
         root,
         "log",
         "--reverse",
@@ -262,11 +276,13 @@ def renames_since(root: Path, commit: str) -> dict[Path, Path]:
         "--diff-filter=R",
         "-z",
         f"{commit}..HEAD",
-        check=False,
+        max_bytes=LOG_MAX_BYTES,
     )
-    if proc.returncode != 0:
+    if truncated:
+        raise GitError(f"the renames since {commit[:12]} exceed {LOG_MAX_BYTES} bytes")
+    if code != 0:
         return {}
-    fields = [field for field in proc.stdout.split("\0") if field]
+    fields = [field for field in raw.decode(errors="replace").split("\0") if field]
     forward: dict[Path, Path] = {}
     index = 0
     while index < len(fields):
@@ -287,8 +303,9 @@ def renames_since(root: Path, commit: str) -> dict[Path, Path]:
 
 def changed_paths(root: Path, commit: str) -> list[tuple[str, Path, Path | None]]:
     """What the commit did to each path: `A`dded, `M`odified, `D`eleted, `T`ype-changed
-    or `R`enamed — for a rename, the old path and the new one."""
-    proc = _git(
+    or `R`enamed — for a rename, the old path and the new one. Read under
+    `LOG_MAX_BYTES`: a commit whose path list is larger raises."""
+    code, raw, truncated = _git_bounded(
         root,
         "diff-tree",
         "--no-commit-id",
@@ -298,11 +315,13 @@ def changed_paths(root: Path, commit: str) -> list[tuple[str, Path, Path | None]
         "--find-renames",
         "-z",
         commit,
-        check=False,
+        max_bytes=LOG_MAX_BYTES,
     )
-    if proc.returncode != 0:
+    if truncated:
+        raise GitError(f"the paths of {commit[:12]} exceed {LOG_MAX_BYTES} bytes")
+    if code != 0:
         return []
-    fields = proc.stdout.split("\0")
+    fields = raw.decode(errors="replace").split("\0")
     changes: list[tuple[str, Path, Path | None]] = []
     index = 0
     while index + 1 < len(fields):

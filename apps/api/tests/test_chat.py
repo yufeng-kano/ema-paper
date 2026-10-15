@@ -21,6 +21,7 @@ from sqlalchemy import select
 from sightread.db.models import (
     ChatEvent,
     ChatTurn,
+    Conversation,
     Document,
     Folder,
     Job,
@@ -1249,9 +1250,31 @@ async def test_a_worker_starting_finishes_the_turns_a_dead_one_left(chatting) ->
         turn = await db.get(ChatTurn, turn_id)
         turn.status = "running"  # claimed by a worker that then died
         await db.commit()
+    from sightread.sandbox.client import SandboxUnavailable
+
+    class Runner:
+        configured = True
+        restarted: list[tuple[int, str]] = []
+        away = True
+
+        async def restart(self, user_id: int, session: str) -> None:
+            if self.away:
+                raise SandboxUnavailable("down")
+            self.restarted.append((user_id, session))
+
+    runner = Runner()
     async with chatting.app.state.sessionmaker() as db:
-        assert await fail_orphaned_turns(db) == 1
+        # The runner does not answer: the turn is left for the next pass, since the
+        # command the dead worker had running may still be writing.
+        assert await fail_orphaned_turns(db, runner) == (0, 1)
+        await db.commit()
+    async with chatting.app.state.sessionmaker() as db:
+        assert (await db.get(ChatTurn, turn_id)).finished_at is None
+        runner.away = False
+        assert await fail_orphaned_turns(db, runner) == (1, 0)
         turn = await db.get(ChatTurn, turn_id)
+        session = (await db.get(Conversation, turn.conversation_id)).session
+        assert runner.restarted == [(chatting.user_id, session)]
         assert turn.status == "failed" and turn.error == "worker restarted"
         assert turn.finished_at is not None
         events = (
@@ -1260,7 +1283,7 @@ async def test_a_worker_starting_finishes_the_turns_a_dead_one_left(chatting) ->
             .all()
         )
         assert [event.event for event in events] == ["turn_error"]
-        assert await fail_orphaned_turns(db) == 0
+        assert await fail_orphaned_turns(db) == (0, 0)
     # The conversation takes messages again.
     again = await chatting.post(
         f"/api/conversations/{conversation_id}/messages",
@@ -1338,3 +1361,152 @@ async def test_the_deadline_waits_for_the_write_in_flight(monkeypatch) -> None:
     # so its commit precedes the terminal event.
     await chat_runner._settle_writer(ctx)
     assert done == ["w"]
+
+
+async def test_a_shell_commit_that_fails_is_an_error_and_leaves_the_index_clean(
+    tmp_path, monkeypatch
+) -> None:
+    root = tmp_path / "ws" / "1"
+    root.mkdir(parents=True)
+    git.ensure_repo(root)
+    (root / "made.txt").write_text("by the shell")
+
+    def refuse(*_args, **_kwargs):
+        raise git.GitError("disk full")
+
+    monkeypatch.setattr(git, "_commit_staged", refuse)
+    outcome = await chat_tools.commit_shell_changes(
+        root,
+        chat_tools.ToolOutcome("done"),
+        {"command": "touch made.txt"},
+        "agent:1",
+        max_chars=500,
+    )
+    assert outcome.is_error is True
+    assert outcome.content.startswith("done") and "disk full" in outcome.content
+    assert outcome.edit is None
+    # On disk still, staged no longer: a later path-scoped commit will not carry it.
+    assert (root / "made.txt").exists()
+    assert git._git(root, "diff", "--cached", "--quiet", check=False).returncode == 0
+
+
+async def test_the_event_replay_is_read_in_batches(chatting, monkeypatch) -> None:
+    from sightread.jobs import chat_events
+
+    conversation_id = (
+        await chatting.post(
+            f"/api/library/documents/{chatting.document_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    sent = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
+    )
+    turn_id = uuid.UUID(sent.json()["turn_id"])
+    async with chatting.app.state.sessionmaker() as db:
+        for index in range(7):
+            await chat_events.emit(db, conversation_id, turn_id, "text_delta", {"text": str(index)})
+        await fail_turn(db, turn_id, "over")
+        await db.commit()
+    monkeypatch.setattr(chat_events, "REPLAY_BATCH_SIZE", 3)
+    async with chatting.stream(
+        "GET", f"/api/conversations/{conversation_id}/events?after=0"
+    ) as stream:
+        body = (await stream.aread()).decode()
+    ids = [int(line.split(": ", 1)[1]) for line in body.splitlines() if line.startswith("id: ")]
+    assert ids == list(range(1, 9))
+    names = [line.split(": ", 1)[1] for line in body.splitlines() if line.startswith("event: ")]
+    assert names == ["text_delta"] * 7 + ["turn_error"]
+
+
+async def test_a_delete_whose_commit_fails_keeps_the_edited_files(chatting, monkeypatch) -> None:
+    import contextlib
+
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    document_id = chatting.document_id
+    content = (await chatting.get(f"/api/library/documents/{document_id}/content")).json()
+    saved = await chatting.put(
+        f"/api/library/documents/{document_id}/content",
+        json={"markdown": "# Edited\n", "base_revision": content["revision"]},
+        headers=CSRF_HEADERS,
+    )
+    assert saved.status_code == 200, saved.text
+
+    original = AsyncSession.commit
+    failing = {"on": True}
+
+    async def commit(self):
+        if failing["on"]:
+            failing["on"] = False
+            raise OperationalError("COMMIT", {}, Exception("the database went away"))
+        await original(self)
+
+    monkeypatch.setattr(AsyncSession, "commit", commit)
+    with contextlib.suppress(Exception):
+        await chatting.delete(f"/api/library/documents/{document_id}", headers=CSRF_HEADERS)
+    assert failing["on"] is False  # the commit was attempted
+    monkeypatch.setattr(AsyncSession, "commit", original)
+
+    # The row stayed, and so did the edit: not a fresh copy of the parse.
+    listed = (await chatting.get("/api/library")).json()["documents"]
+    assert [row["id"] for row in listed] == [document_id]
+    after = (await chatting.get(f"/api/library/documents/{document_id}/content")).json()
+    assert after["markdown"] == "# Edited\n"
+    history = (await chatting.get(f"/api/library/documents/{document_id}/revisions")).json()
+    assert history["revisions"][0]["message"].startswith("restore ")
+
+
+async def test_a_shell_revision_beyond_the_document_waits_for_every_turn(chatting) -> None:
+    first_id = chatting.document_id
+    settings = chatting.app.state.settings
+    async with chatting.app.state.sessionmaker() as db:
+        first = await db.get(Document, first_id)
+        job_id = first.job_id
+    second = await chatting.post(
+        "/api/library/documents/from-job", json={"job_id": str(job_id)}, headers=CSRF_HEADERS
+    )
+    assert second.status_code == 201, second.text
+    second_id = second.json()["id"]
+    async with chatting.app.state.sessionmaker() as db:
+        paths_a = await workspace_documents.materialize_document(
+            db, settings, await db.get(Document, first_id)
+        )
+        paths_b = await workspace_documents.materialize_document(
+            db, settings, await db.get(Document, second_id)
+        )
+    root = paths_a.root
+    # A shell revision over both documents, then one of the first document's own.
+    paths_a.doc.write_text("a by the shell\n")
+    paths_b.doc.write_text("b by the shell\n")
+    both = git.commit_all(root, "agent:1", "bash: sed both")
+    paths_a.doc.write_text("a by the user\n")
+    own = git.commit_paths(root, git.USER_AUTHOR, "save", [paths_a.doc_relative])
+
+    # A turn on the second document is unfinished.
+    conversation_id = (
+        await chatting.post(
+            f"/api/library/documents/{second_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    await chatting.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
+    )
+    refused = await chatting.post(
+        f"/api/library/documents/{first_id}/revisions/{both}/revert", headers=CSRF_HEADERS
+    )
+    assert refused.status_code == 409, refused.text
+    assert paths_b.doc.read_text() == "b by the shell\n"
+    # The first document's own revision is its own business.
+    allowed = await chatting.post(
+        f"/api/library/documents/{first_id}/revisions/{own}/revert", headers=CSRF_HEADERS
+    )
+    assert allowed.status_code == 200, allowed.text
+    assert paths_a.doc.read_text() == "a by the shell\n"
+    # Once that turn is finished, the shell revision can go.
+    await chatting.post(f"/api/conversations/{conversation_id}/cancel", headers=CSRF_HEADERS)
+    reverted = await chatting.post(
+        f"/api/library/documents/{first_id}/revisions/{both}/revert", headers=CSRF_HEADERS
+    )
+    assert reverted.status_code == 200, reverted.text
+    assert paths_b.doc.read_text() != "b by the shell\n"

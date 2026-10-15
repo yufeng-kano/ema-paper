@@ -705,12 +705,30 @@ const sending = ref(false)
 const selection = ref<string | null>(null)
 
 /** Before the composer takes focus — on the pointer's way in, and on keyboard focus — the
- *  document's selection is still the reader's, so this is when it is read. */
+ *  document's selection is still the reader's, so this is when it is read. Every reading
+ *  replaces the last, none included: a passage selected and then deselected is not sent.
+ *  The focus that follows a pointer capture is skipped, since by then the click has
+ *  collapsed what the pointer already read. */
+let capturedByPointer = false
+
 function captureSelection() {
-  const text = props.documentSelection()
-  if (text) {
-    selection.value = text
+  selection.value = props.documentSelection() || null
+}
+
+function captureOnPointer() {
+  captureSelection()
+  capturedByPointer = true
+  // Cleared once the focus this press causes (if any) has been handled.
+  setTimeout(() => {
+    capturedByPointer = false
+  }, 0)
+}
+
+function captureOnFocus() {
+  if (capturedByPointer) {
+    return
   }
+  captureSelection()
 }
 
 async function send() {
@@ -890,7 +908,7 @@ async function stop() {
     </div>
 
     <!-- One rounded field: the text, the attach control and the send control. -->
-    <form class="composer" @submit.prevent="send" @mousedown.capture="captureSelection">
+    <form class="composer" @submit.prevent="send" @mousedown.capture="captureOnPointer">
       <div class="field" :class="{ disabled: running }">
         <p v-if="selection" class="selection">
           <span class="selection-text">{{ t('chat.selection', { count: selection.length }) }}</span>
@@ -907,7 +925,7 @@ async function stop() {
           rows="2"
           :placeholder="t('chat.placeholder')"
           :disabled="running"
-          @focus="captureSelection"
+          @focus="captureOnFocus"
           @keydown="onComposerKey"
         />
         <div class="field-foot">

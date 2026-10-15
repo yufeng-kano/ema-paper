@@ -616,3 +616,9 @@ async def test_a_move_the_tree_refuses_leaves_the_row_where_the_files_are(
         assert row.folder_id is None
     assert (root / "files" / "tiny (2).png" / "source.png").is_file()
     assert not list(elsewhere.iterdir())
+
+
+async def test_an_upload_named_only_by_separators_is_filed_as_upload(library, documents) -> None:
+    created = await _upload(library, documents, name="///")
+    assert created.status_code == 201, created.text
+    assert created.json()["name"] == "upload"

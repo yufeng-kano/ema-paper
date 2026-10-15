@@ -97,18 +97,39 @@ async def _open_listener(database_url: str, conversation_id: int, wakeup: asynci
     return connection
 
 
+# Rows read per query when replaying a conversation's events: a long thread is streamed
+# batch by batch, never held whole in the API process (docs/api.md).
+REPLAY_BATCH_SIZE = 200
+
+
 async def _events_after(
     sessionmaker: async_sessionmaker[AsyncSession], conversation_id: int, after: int
 ) -> list[ChatEvent]:
+    """One batch of events after `after`; a batch shorter than the size is the last."""
     async with sessionmaker() as db:
         rows = (
             await db.execute(
                 select(ChatEvent)
                 .where(ChatEvent.conversation_id == conversation_id, ChatEvent.seq > after)
                 .order_by(ChatEvent.seq)
+                .limit(REPLAY_BATCH_SIZE)
             )
         ).scalars()
         return list(rows)
+
+
+async def _replay(
+    sessionmaker: async_sessionmaker[AsyncSession], conversation_id: int, after: int
+) -> AsyncIterator[ChatEvent]:
+    """Every event after `after`, batch by batch, each yielded before the next is read."""
+    cursor = after
+    while True:
+        rows = await _events_after(sessionmaker, conversation_id, cursor)
+        for row in rows:
+            cursor = row.seq
+            yield row
+        if len(rows) < REPLAY_BATCH_SIZE:
+            return
 
 
 async def _turn_running(
@@ -144,13 +165,13 @@ async def stream_conversation_events(
     silent_for = 0.0
     try:
         while True:
-            for row in await _events_after(sessionmaker, conversation_id, cursor):
+            async for row in _replay(sessionmaker, conversation_id, cursor):
                 cursor = row.seq
                 silent_for = 0.0
                 yield render(row)
             if not await _turn_running(sessionmaker, conversation_id):
                 # One more read: a turn can finish between the replay and this check.
-                for row in await _events_after(sessionmaker, conversation_id, cursor):
+                async for row in _replay(sessionmaker, conversation_id, cursor):
                     cursor = row.seq
                     yield render(row)
                 return

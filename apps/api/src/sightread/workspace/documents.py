@@ -470,7 +470,33 @@ def _prune_empty(root: Path, directory: Path) -> None:
         directory = directory.parent
 
 
-def _revert(paths: DocumentPaths, commit: str, max_bytes: int, total_max_bytes: int) -> str:
+def _under(path: Path, directory: Path) -> bool:
+    return path == directory or directory in path.parents
+
+
+def reaches_beyond(paths: DocumentPaths, commit: str) -> bool:
+    """Whether the commit touched a path outside this document's directory — where it is
+    now, or where it was at that commit, since a rename may have moved the whole directory
+    since. Such a revision is a shell's, and reverting it is refused while any turn of the
+    user is unfinished (docs/workspace.md § Revisions). An unknown commit reaches nothing:
+    the revert answers 404 for it."""
+    root = paths.root
+    if not git.is_commit(root, commit):
+        return False
+    directories = {paths.relative}
+    for then in git.paths_at(root, commit, paths.doc_relative):
+        if then is not None:
+            directories.add(then.parent)
+    for _status, then, renamed_to in git.changed_paths(root, commit):
+        for path in (then, renamed_to):
+            if path is not None and not any(_under(path, here) for here in directories):
+                return True
+    return False
+
+
+def _revert(
+    paths: DocumentPaths, commit: str, max_bytes: int, total_max_bytes: int, max_paths: int
+) -> str:
     """Undo every path the commit touched — a shell revision may have changed files
     beyond this document — writing each one as it was in the commit's parent, where it
     lives now if it was moved since; a rename is moved back (docs/workspace.md
@@ -482,7 +508,15 @@ def _revert(paths: DocumentPaths, commit: str, max_bytes: int, total_max_bytes: 
     if not git.is_commit(root, commit):
         raise ApiError(404, "invalid_request", "No such revision")
     parent = git.parent_of(root, commit)
-    moved = git.renames_since(root, commit)
+    try:
+        moved = git.renames_since(root, commit)
+        changes = git.changed_paths(root, commit)
+    except git.GitError as exc:
+        # The metadata alone is past the log bound: a shell revision over a workspace's
+        # worth of files is not restored by the host (docs/workspace.md § Revisions).
+        raise ApiError(409, "invalid_request", "That revision is too large to restore") from exc
+    if len(changes) > max_paths:
+        raise ApiError(409, "invalid_request", "That revision is too large to restore")
 
     # Phase one: what to do, with every byte to write already in hand.
     moves: list[tuple[Path, Path]] = []
@@ -499,7 +533,7 @@ def _revert(paths: DocumentPaths, commit: str, max_bytes: int, total_max_bytes: 
             raise ApiError(409, "invalid_request", "That revision is too large to restore")
         return data
 
-    for status, then, renamed_to in git.changed_paths(root, commit):
+    for status, then, renamed_to in changes:
         now = moved.get(then, then)
         if status == "R" and renamed_to is not None:
             current = moved.get(renamed_to, renamed_to)
@@ -588,7 +622,12 @@ async def revert(
     async with contextlib.nullcontext() if locked else workspace_lock(root):
         paths = await materialize_document(db, settings, document, locked=True)
         made = await asyncio.to_thread(
-            _revert, paths, commit, settings.content_max_bytes, settings.revert_max_bytes
+            _revert,
+            paths,
+            commit,
+            settings.content_max_bytes,
+            settings.revert_max_bytes,
+            settings.revert_max_paths,
         )
         await reconcile_locked(db, settings, document.user_id)
         content = await read_content(db, settings, document, locked=True)
@@ -627,7 +666,7 @@ async def move_path(settings: Settings, user_id: int, source: Path, target: Path
     await asyncio.to_thread(_move_tree, root, source, target, f"move {source} -> {target}")
 
 
-def _remove_tree(root: Path, relative: Path, message: str) -> None:
+def _remove_tree(root: Path, relative: Path, message: str) -> str | None:
     git.ensure_repo(root)
     try:
         # Through descriptors that follow nothing: an ancestor the shell swapped for a
@@ -636,14 +675,31 @@ def _remove_tree(root: Path, relative: Path, message: str) -> None:
     except safe_io.UnsafeEntry as exc:
         raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
     if not removed:
-        return
-    git.commit_paths(root, git.USER_AUTHOR, message, [relative])
+        return None
+    return git.commit_paths(root, git.USER_AUTHOR, message, [relative])
 
 
-async def remove_path(settings: Settings, user_id: int, relative: Path) -> None:
-    """Delete a directory after the database did; the caller holds the workspace lock."""
+async def remove_path(settings: Settings, user_id: int, relative: Path) -> str | None:
+    """Delete a directory after the database did; the caller holds the workspace lock.
+    Returns the revision the removal made, for `restore_removed` should the rows stay."""
     root = user_root(settings.workspaces_dir, user_id)
-    await asyncio.to_thread(_remove_tree, root, relative, f"delete {relative}")
+    return await asyncio.to_thread(_remove_tree, root, relative, f"delete {relative}")
+
+
+def _restore_removed(root: Path, relative: Path, removal: str) -> None:
+    parent = git.parent_of(root, removal)
+    if parent is None:
+        return
+    git.restore_from(root, parent, git.USER_AUTHOR, f"restore {relative}", relative)
+
+
+async def restore_removed(settings: Settings, user_id: int, relative: Path, removal: str) -> None:
+    """The rows a removal was made for did not go (their commit failed): the files come
+    back from the revision the removal made, as a revision of their own, so the row that
+    stayed keeps its edits rather than being re-materialized from the parse
+    (docs/workspace.md § Revisions). The caller holds the workspace lock."""
+    root = user_root(settings.workspaces_dir, user_id)
+    await asyncio.to_thread(_restore_removed, root, relative, removal)
 
 
 def directory_size(root: Path, path: Path | None = None) -> int:

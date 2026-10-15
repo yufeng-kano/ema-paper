@@ -12,6 +12,7 @@ import contextlib
 import logging
 import os
 import signal
+import time
 from pathlib import Path
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -29,11 +30,14 @@ from .jobs.queue import (
 from .jobs.runner import run_job
 from .jobs.sweeper import sweep_forever
 from .parsing.figures import discard_job_figures
+from .sandbox.client import SandboxClient
 
 logger = logging.getLogger(__name__)
 
 # How long an idle worker waits before asking the queue again.
 IDLE_POLL_SECONDS = 2.0
+# How long after a cleanup of orphaned turns that did not go through the next try waits.
+ORPHAN_RETRY_SECONDS = 30.0
 
 
 def render_worker_count(configured: int) -> int:
@@ -51,18 +55,34 @@ async def run_worker(stop: asyncio.Event) -> None:
     upload_dir.mkdir(parents=True, exist_ok=True)
 
     sweeper = asyncio.create_task(sweep_forever(upload_dir, stop))
-    try:
-        async with sessionmaker() as db:
-            orphans = await fail_orphaned_turns(db)
-        if orphans:
-            logger.warning("finished %d chat turn(s) a previous worker left running", orphans)
-    except SQLAlchemyError:
-        logger.exception("could not finish orphaned chat turns")
+    sandbox = SandboxClient(settings) if settings.sandbox_configured else None
+    # Retried until it goes through: a database or runner blip at start must not leave
+    # the turns a dead worker held unfinished until the next restart (docs/jobs.md).
+    orphans_pending = True
+    orphans_tried_at = -ORPHAN_RETRY_SECONDS
     logger.info("worker started; %d render slots", render_count)
     prefer_turns = False
 
     try:
         while not stop.is_set():
+            if orphans_pending and time.monotonic() - orphans_tried_at >= ORPHAN_RETRY_SECONDS:
+                orphans_tried_at = time.monotonic()
+                try:
+                    async with sessionmaker() as db:
+                        finished, left = await fail_orphaned_turns(db, sandbox)
+                except SQLAlchemyError:
+                    logger.exception("could not finish orphaned chat turns; will retry")
+                else:
+                    if finished:
+                        logger.warning(
+                            "finished %d chat turn(s) a previous worker left running", finished
+                        )
+                    if left:
+                        logger.warning(
+                            "%d orphaned chat turn(s) wait for the sandbox runner; will retry",
+                            left,
+                        )
+                    orphans_pending = left > 0
             job_id = None
             turn_id = None
             try:

@@ -107,6 +107,15 @@ class ShellSession:
         with contextlib.suppress(asyncio.TimeoutError, ProcessLookupError):
             await asyncio.wait_for(process.wait(), timeout=5)
 
+    async def kill(self) -> None:
+        """End the shell and whatever it is running, where it runs: the backend's kill
+        inside the VM first (closing the host-side client ends nothing there), then the
+        client. What `restart` and a dropped `exec` request do (docs/sandbox.md)."""
+        if self.alive and self._on_timeout is not None:
+            with contextlib.suppress(Exception):
+                await self._on_timeout()
+        await self.close()
+
     async def run(self, command: str, *, timeout: float) -> ExecOutcome:
         """One command, serialized per session. A timeout kills the shell: whatever it was
         doing cannot be trusted to have stopped, so the next command gets a fresh one."""
@@ -179,11 +188,13 @@ class ShellSession:
                         if len(pending) > self._max_bytes:
                             collected.add(pending[: -len(marker_bytes)])
                             pending = pending[-len(marker_bytes) :]
+            except asyncio.CancelledError:
+                # The request was dropped mid-command (the worker died): nothing will
+                # commit what the command goes on to write, so it goes with the shell.
+                await asyncio.shield(self.kill())
+                raise
             except TimeoutError:
-                if self._on_timeout is not None:
-                    with contextlib.suppress(Exception):
-                        await self._on_timeout()
-                await self.close()
+                await self.kill()
                 if pending:
                     collected.add(pending)
                 output, truncated = collected.render()

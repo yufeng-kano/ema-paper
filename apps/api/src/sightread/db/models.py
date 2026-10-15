@@ -452,7 +452,12 @@ class ChatTurn(Base):
     """The chat agent's queue: one row per user message (docs/jobs.md § Chat turns)."""
 
     __tablename__ = "chat_turns"
-    __table_args__ = (Index("ix_chat_turns_status_created_at", "status", "created_at"),)
+    __table_args__ = (
+        Index("ix_chat_turns_status_created_at", "status", "created_at"),
+        # The stream's "is a turn unfinished" poll, sends, cancels and deletes all ask by
+        # conversation (docs/database.md).
+        Index("ix_chat_turns_conversation_finished", "conversation_id", "finished_at"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)

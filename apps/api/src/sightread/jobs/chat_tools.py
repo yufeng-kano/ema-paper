@@ -328,8 +328,18 @@ async def commit_shell_changes(
             edit = await asyncio.to_thread(
                 _commit_shell_sync, root, command, author, max_chars=max_chars
             )
-        except git.GitError:
-            return outcome
+        except git.GitError as exc:
+            # Not a success: the changes are on disk and unrecorded. The index is reset
+            # so nothing half-staged rides into a later path-scoped commit, and the
+            # model is told (docs/chat.md § Tools).
+            await asyncio.to_thread(git.reset_index, root)
+            reason = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+            return ToolOutcome(
+                f"{outcome.content}\n\n"
+                f"[The changes this command made could not be recorded as a revision: "
+                f"{reason}]",
+                is_error=True,
+            )
     if edit is None:
         return outcome
     return ToolOutcome(outcome.content, is_error=outcome.is_error, edit=edit)

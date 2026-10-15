@@ -12,6 +12,8 @@ the job and its output stay in the parse history that billed for them (docs/data
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
 import unicodedata
 import uuid
@@ -49,6 +51,8 @@ from ..parsing.figures import crop_path, parse_bbox_path
 from ..workspace import documents as workspace_documents
 from ..workspace.layout import document_relative_dir, path_segment, user_root
 from ..workspace.locks import backup_shared, workspace_lock
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/library", tags=["library"])
 
@@ -503,14 +507,24 @@ async def delete_folder(
 
 async def remove_then_commit(db: DbSession, settings, user_id: int, relative) -> None:
     """The rows are deleted in the transaction; the directory goes before it commits. A
-    removal the tree refuses keeps the rows, and the next read restores what is missing
+    removal the tree refuses keeps the rows, and the next read restores what is missing;
+    a commit that fails after the removal keeps the rows too, and the files come back
+    from the removal's own revision, so the edits they held are not lost to a fresh copy
     (docs/workspace.md § Revisions)."""
     try:
-        await workspace_documents.remove_path(settings, user_id, relative)
+        removal = await workspace_documents.remove_path(settings, user_id, relative)
     except BaseException:
         await db.rollback()
         raise
-    await db.commit()
+    try:
+        await db.commit()
+    except BaseException:
+        if removal is not None:
+            try:
+                await workspace_documents.restore_removed(settings, user_id, relative, removal)
+            except Exception:  # noqa: BLE001 - the delete revision stays revertible
+                logger.exception("could not restore %s after a failed delete", relative)
+        raise
 
 
 # --- documents ----------------------------------------------------------------------------
@@ -577,6 +591,13 @@ async def upload_document(
         await owned_folder(db, user.id, folder_id)
 
     filename = upload.filename or "upload"
+    # The library name is decided before the parse is queued: a name that cleans to
+    # nothing is filed as `upload`, like a parse filed from the history, never a 400
+    # after a billed parse is already on its way (docs/api.md).
+    try:
+        wanted = clean_name(filename, DOCUMENT_NAME_MAX)
+    except ApiError:
+        wanted = "upload"
     submission = await submit_parse(
         db,
         settings,
@@ -613,7 +634,7 @@ async def upload_document(
             user_id=user.id,
             build=lambda name: Document(user_id=user.id, folder_id=place, job_id=job_id, name=name),
             taken=taken,
-            wanted=clean_name(filename, DOCUMENT_NAME_MAX),
+            wanted=wanted,
             limit=DOCUMENT_NAME_MAX,
             message="A file with this name already exists here",
         )
@@ -927,6 +948,16 @@ async def revert_document_revision(
     # revision may have moved the document; undoing that under a running turn would pull
     # the path out from under it (docs/chat.md § Conversations).
     async with workspace_lock(user_root(settings.workspaces_dir, user.id)):
-        await refuse_while_answering(db, user.id, select(Document.id).where(Document.id == row.id))
+        # A revision that reached beyond this document (a shell's) may be what another
+        # conversation's turn is working on right now: refused while any turn of the
+        # user is unfinished (docs/workspace.md § Revisions).
+        paths = await workspace_documents.materialize_document(db, settings, row, locked=True)
+        beyond = await asyncio.to_thread(workspace_documents.reaches_beyond, paths, commit)
+        guarded = (
+            select(Document.id).where(Document.user_id == user.id)
+            if beyond
+            else select(Document.id).where(Document.id == row.id)
+        )
+        await refuse_while_answering(db, user.id, guarded)
         reverted = await workspace_documents.revert(db, settings, row, commit, locked=True)
     return {"revision": reverted.revision, "commit": reverted.commit}

@@ -294,3 +294,48 @@ async def test_a_vm_that_cannot_be_removed_refuses_commands_and_keeps_its_cache(
         again = await http.post("/sandboxes/11/exec", json={"session": "s", "command": "echo ok"})
         assert again.status_code == 200, again.text
         assert again.json()["output"] == "ok"
+
+
+async def test_a_restart_ends_the_command_the_shell_is_running(tmp_path) -> None:
+    import asyncio
+    import time
+
+    settings = Settings(
+        app_env="local",
+        sandbox_token=TOKEN,
+        sandbox_backend="local",
+        sandbox_workspaces_dir=str(tmp_path / "ws"),
+        sandbox_workspaces_mount=str(tmp_path / "ws"),
+        sandbox_idle_seconds=0,
+    )
+    backend = LocalBackend(settings)
+    running = asyncio.create_task(backend.exec(12, "s", "sleep 30; echo late", timeout=60))
+    await asyncio.sleep(0.3)
+    started = time.monotonic()
+    await backend.restart(12, "s")
+    outcome = await running
+    assert time.monotonic() - started < 5
+    assert outcome.exit_code is None and "late" not in outcome.output
+    fresh = await backend.exec(12, "s", "echo fresh", timeout=10)
+    assert fresh.output == "fresh"
+    await backend.stop(12)
+
+
+async def test_a_dropped_request_kills_its_command_where_it_runs() -> None:
+    import asyncio
+
+    from sightread_sandbox.shell import ShellSession
+
+    killed = []
+
+    async def kill_inside() -> None:
+        killed.append(True)
+
+    shell = ShellSession(["bash", "--norc", "--noprofile"], max_bytes=1000, on_timeout=kill_inside)
+    running = asyncio.create_task(shell.run("sleep 30", timeout=60))
+    await asyncio.sleep(0.3)
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    assert killed == [True]
+    assert not shell.alive

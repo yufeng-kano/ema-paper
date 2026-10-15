@@ -130,6 +130,10 @@ chat_turns       id UUID PK, user_id FK, conversation_id FK, message_id FK messa
                  status queued|running|succeeded|failed|cancelled, error NULL,
                  locale, created_at, started_at NULL, finished_at NULL
                  INDEX (status, created_at)
+                 INDEX (conversation_id, finished_at)
+                                                  -- the stream's "is a turn unfinished"
+                                                  -- poll, sends, cancels and deletes all
+                                                  -- ask by conversation
                  -- the chat agent's queue, one row per user message, claimed like jobs
 chat_events      id PK, conversation_id FK, turn_id FK, seq, event, data JSONB,
                  created_at

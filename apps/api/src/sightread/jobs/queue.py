@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..agents import get_agent
 from ..db.models import ChatTurn, Conversation, Job, JobPage, utcnow
+from ..sandbox.client import SandboxClient, SandboxUnavailable
 from . import chat_events
 
 # PostgreSQL claim (docs/jobs.md). The correlated count applies the per-user running cap
@@ -359,25 +360,37 @@ async def claim_next_turn(db: AsyncSession, max_turns_per_user: int) -> uuid.UUI
     return turn_id if updated.rowcount == 1 else None
 
 
-async def fail_orphaned_turns(db: AsyncSession) -> int:
+async def fail_orphaned_turns(
+    db: AsyncSession, sandbox: SandboxClient | None = None
+) -> tuple[int, int]:
     """Finish every turn a worker that died left behind: `running`, or cancelled and not
-    yet wound down. Run once when a worker starts — the deployment has one worker, so a
-    turn nobody is driving is exactly one a dead worker held (docs/jobs.md § Chat turns)."""
+    yet wound down. Run when a worker starts, and again until it goes through — the
+    deployment has one worker, so a turn nobody is driving is exactly one a dead worker
+    held (docs/jobs.md § Chat turns). Each turn's shell is restarted on the runner first,
+    which kills the command the dead worker may have left running inside the VM; a
+    runner that does not answer leaves that turn for the next pass rather than finishing
+    it over a command that may still write. Returns (finished, left for later)."""
     orphans = (
-        (
-            await db.execute(
-                select(ChatTurn.id).where(
-                    ChatTurn.status.in_(("running", "cancelled")),
-                    ChatTurn.finished_at.is_(None),
-                )
+        await db.execute(
+            select(ChatTurn.id, ChatTurn.user_id, Conversation.session)
+            .join(Conversation, Conversation.id == ChatTurn.conversation_id)
+            .where(
+                ChatTurn.status.in_(("running", "cancelled")),
+                ChatTurn.finished_at.is_(None),
             )
         )
-        .scalars()
-        .all()
-    )
-    for turn_id in orphans:
+    ).all()
+    finished = left = 0
+    for turn_id, user_id, session in orphans:
+        if sandbox is not None and sandbox.configured:
+            try:
+                await sandbox.restart(user_id, session)
+            except SandboxUnavailable:
+                left += 1
+                continue
         await fail_turn(db, turn_id, "worker restarted")
-    return len(orphans)
+        finished += 1
+    return finished, left
 
 
 async def fail_turn(db: AsyncSession, turn_id: uuid.UUID, error: str) -> None:

@@ -833,11 +833,11 @@ def test_a_revert_past_the_total_bound_is_refused_before_anything_moves(tmp_path
     (shell,) = [git.commit_all(root, "agent:1", "edit all four")]
     paths = documents.DocumentPaths(root=root, relative=Path("files/d"))
     with pytest.raises(ApiError) as refused:
-        documents._revert(paths, shell, max_bytes=10_000, total_max_bytes=2_500)
+        documents._revert(paths, shell, max_bytes=10_000, total_max_bytes=2_500, max_paths=100)
     assert refused.value.status_code == 409
     assert (root / "files" / "d" / "f0.txt").read_text() == "y" * 1000
     # Within the bound, the same revert goes through.
-    documents._revert(paths, shell, max_bytes=10_000, total_max_bytes=10_000)
+    documents._revert(paths, shell, max_bytes=10_000, total_max_bytes=10_000, max_paths=100)
     assert (root / "files" / "d" / "f0.txt").read_text() == "x" * 1000
 
 
@@ -952,3 +952,68 @@ def test_the_backup_hold_waits_for_the_backup_lock(tmp_path) -> None:
     fcntl.flock(holder, fcntl.LOCK_UN)
     assert entered.wait(5)
     thread.join()
+
+
+def test_a_revert_over_too_many_paths_or_too_much_metadata_is_refused(
+    tmp_path, monkeypatch
+) -> None:
+    root = tmp_path / "ws" / "12"
+    root.mkdir(parents=True)
+    git.ensure_repo(root)
+    safe_io.write_text(root, root / "files" / "d" / ".meta.json", "{}")
+    git.commit_all(root, "user", "the document")
+    for index in range(20):
+        safe_io.write_text(root, root / "files" / "d" / f"f{index:02d}.txt", "x")
+    shell = git.commit_all(root, "agent:1", "twenty files")
+    paths = documents.DocumentPaths(root=root, relative=Path("files/d"))
+    with pytest.raises(ApiError) as refused:
+        documents._revert(paths, shell, max_bytes=1_000, total_max_bytes=10_000, max_paths=10)
+    assert refused.value.status_code == 409
+    assert (root / "files" / "d" / "f00.txt").exists()
+    # The path list alone past the log bound is refused too, before anything is read.
+    monkeypatch.setattr(git, "LOG_MAX_BYTES", 200)
+    with pytest.raises(ApiError) as cut:
+        documents._revert(paths, shell, max_bytes=1_000, total_max_bytes=10_000, max_paths=100)
+    assert cut.value.status_code == 409
+    monkeypatch.setattr(git, "LOG_MAX_BYTES", 4 * 1024 * 1024)
+    documents._revert(paths, shell, max_bytes=1_000, total_max_bytes=10_000, max_paths=100)
+    assert not (root / "files" / "d" / "f00.txt").exists()
+
+
+def test_reaches_beyond_tells_a_documents_own_revision_from_a_shells(tmp_path) -> None:
+    root = tmp_path / "ws" / "13"
+    root.mkdir(parents=True)
+    git.ensure_repo(root)
+    safe_io.write_text(root, root / "files" / "a" / "doc.md", "a")
+    safe_io.write_text(root, root / "files" / "b" / "doc.md", "b")
+    git.commit_all(root, "user", "two documents")
+    safe_io.write_text(root, root / "files" / "a" / "doc.md", "a2")
+    own = git.commit_all(root, "user", "edit a")
+    safe_io.write_text(root, root / "files" / "a" / "doc.md", "a3")
+    safe_io.write_text(root, root / "files" / "b" / "doc.md", "b3")
+    both = git.commit_all(root, "agent:1", "bash: edit both")
+    paths = documents.DocumentPaths(root=root, relative=Path("files/a"))
+    assert documents.reaches_beyond(paths, own) is False
+    assert documents.reaches_beyond(paths, both) is True
+    # The document moved since: its own older revision is still its own.
+    git.move(root, root / "files" / "a", root / "files" / "moved")
+    git.commit_paths(root, "user", "rename a", [Path("files/a"), Path("files/moved")])
+    moved = documents.DocumentPaths(root=root, relative=Path("files/moved"))
+    assert documents.reaches_beyond(moved, own) is False
+    assert documents.reaches_beyond(moved, "0" * 40) is False
+
+
+async def test_a_removal_whose_rows_stay_is_put_back(sessionmaker, tmp_path) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+    root = paths.root
+    paths.doc.write_text("# Title\n\nEdited\n")
+    git.commit_paths(root, git.USER_AUTHOR, "save", [paths.doc_relative])
+    removal = await documents.remove_path(settings, user.id, paths.relative)
+    assert removal is not None and not paths.directory.exists()
+    await documents.restore_removed(settings, user.id, paths.relative, removal)
+    assert paths.doc.read_text() == "# Title\n\nEdited\n"
+    (newest,) = git.log(root, paths.relative, 1)
+    assert newest.message == f"restore {paths.relative}"

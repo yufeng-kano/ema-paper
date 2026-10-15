@@ -135,11 +135,13 @@ class Backend:
             await shell.close()
 
     async def restart(self, user_id: int, session: str) -> None:
+        """Kill that shell — the command inside the VM first — and forget it; the next
+        command of the session opens a fresh one (docs/sandbox.md § The runner)."""
         sandbox = self._user(user_id)
         shell = sandbox.sessions.pop(session, None)
         sandbox.session_used.pop(session, None)
         if shell is not None:
-            await shell.close()
+            await shell.kill()
 
     async def status(self, user_id: int) -> dict:
         sandbox = self._users.get(user_id)
