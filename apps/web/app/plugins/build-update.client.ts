@@ -22,7 +22,10 @@ export default defineNuxtPlugin((nuxtApp) => {
       return latest.id ?? null
     },
     reload(path) {
-      reloadNuxtApp({ path, persistState: false })
+      // `force`: without it Nuxt skips a reload of a path it reloaded in the last 10 s (a
+      // chunk-error recovery, say) — and `createBuildUpdate` has already latched, so the
+      // tab would stay on the old build until refreshed by hand.
+      reloadNuxtApp({ path, force: true, persistState: false })
     },
   })
 
