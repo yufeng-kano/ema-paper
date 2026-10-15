@@ -489,6 +489,15 @@ export function uploadDocument(file: File, folderId: number | null): Promise<Lib
   return request('POST', '/api/library/documents', body)
 }
 
+/** File a parse that is already in the history — no upload, no second parse
+ *  (docs/web.md § History). */
+export function fileJob(jobId: string, folderId: number | null): Promise<LibraryDocument> {
+  return request('POST', '/api/library/documents/from-job', {
+    job_id: jobId,
+    folder_id: folderId,
+  })
+}
+
 export function updateDocument(
   id: number,
   body: Partial<{ name: string; folder_id: number | null }>,

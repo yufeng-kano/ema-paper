@@ -25,6 +25,7 @@ export type IconName =
   | 'folder'
   | 'folder-open'
   | 'folder-input'
+  | 'folder-plus'
   | 'file-text'
   | 'image'
   | 'upload'

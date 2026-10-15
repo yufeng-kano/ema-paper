@@ -409,6 +409,11 @@ class DocumentUpdate(BaseModel):
     folder_id: int | None = None
 
 
+class DocumentFromJob(BaseModel):
+    job_id: uuid.UUID
+    folder_id: int | None = None
+
+
 def form_folder_id(form: FormData) -> int | None:
     """`folder_id` as a multipart field: absent or empty means the root."""
     raw = form.get("folder_id")
@@ -500,6 +505,54 @@ async def upload_document(
             raise
         row = await land(None)
 
+    return document_payload(row, await job_of(db, job_id))
+
+
+@router.post(
+    "/documents/from-job", dependencies=[CsrfGuard], status_code=status.HTTP_201_CREATED
+)
+async def file_job(body: DocumentFromJob, user: SessionUser, db: DbSession):
+    """File a parse that is already in the history — no upload, no second parse.
+
+    How a result that came in over the API or the connector becomes a file
+    (docs/web.md § History). A failed job is refused: it has no result to open.
+    """
+    job = (
+        await db.execute(select(Job).where(Job.id == body.job_id, Job.user_id == user.id))
+    ).scalar_one_or_none()
+    if job is None:
+        raise ApiError(404, "invalid_request", "No such job")
+    if job.status == "failed":
+        raise ApiError(400, "invalid_request", "A failed parse has no result to file")
+    if body.folder_id is not None:
+        await owned_folder(db, user.id, body.folder_id)
+
+    # Plain values, not attributes: a lost name race rolls back, which expires `job` and
+    # `user`, and an expired attribute cannot be lazily reloaded inside an async session.
+    user_id, folder_id, job_id = user.id, body.folder_id, job.id
+    # A filename made only of separators cleans to nothing; it is still a parse worth
+    # filing, under the same fallback an upload without a name gets.
+    try:
+        wanted = clean_name(job.filename, DOCUMENT_NAME_MAX)
+    except ApiError:
+        wanted = "upload"
+    try:
+        row = await insert_named(
+            db,
+            build=lambda name: Document(
+                user_id=user_id, folder_id=folder_id, job_id=job_id, name=name
+            ),
+            taken=lambda: document_names(db, user_id, folder_id),
+            wanted=wanted,
+            limit=DOCUMENT_NAME_MAX,
+            message="A file with this name already exists here",
+        )
+    except ApiError:
+        # Same race as creating a folder: a destination deleted after the check above fails
+        # the foreign key, and that is a missing folder, not a name conflict.
+        if folder_id is None or await folder_exists(db, user_id, folder_id):
+            raise
+        raise ApiError(404, "invalid_request", "No such folder") from None
     return document_payload(row, await job_of(db, job_id))
 
 
