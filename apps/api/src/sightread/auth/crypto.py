@@ -3,9 +3,9 @@
 Two rules, strictly separated:
 
 - Anything we only ever *verify* (session tokens, API keys) is stored as a SHA-256 hash.
-- The credentials we must *replay* upstream (the user's OpenRouter key and each provider
-  connection's key) are stored as AES-256-GCM ciphertext, keyed by HKDF-SHA256 over
-  ``SECRET_KEY`` with a per-purpose context string.
+- The secrets we must *replay* (the user's Kano Proxy key, each provider connection's key,
+  and a pending Kano Proxy connect's PKCE verifier) are stored as AES-256-GCM ciphertext,
+  keyed by HKDF-SHA256 over ``SECRET_KEY`` with a per-purpose context string.
 
 Nothing here ever logs or returns plaintext.
 """
@@ -19,8 +19,9 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-OPENROUTER_KEY_CONTEXT = b"openrouter-key-v1"
+KANO_PROXY_KEY_CONTEXT = b"kano-proxy-key-v1"
 CONNECTION_KEY_CONTEXT = b"provider-connection-key-v1"
+KANO_CONNECT_VERIFIER_CONTEXT = b"kano-connect-verifier-v1"
 NONCE_BYTES = 12
 
 
@@ -50,12 +51,12 @@ def decrypt_secret(secret_key: str, blob: bytes, context: bytes) -> str:
     return _aead(secret_key, context).decrypt(nonce, ciphertext, None).decode("utf-8")
 
 
-def encrypt_openrouter_key(secret_key: str, plaintext: str) -> bytes:
-    return encrypt_secret(secret_key, plaintext, OPENROUTER_KEY_CONTEXT)
+def encrypt_kano_proxy_key(secret_key: str, plaintext: str) -> bytes:
+    return encrypt_secret(secret_key, plaintext, KANO_PROXY_KEY_CONTEXT)
 
 
-def decrypt_openrouter_key(secret_key: str, blob: bytes) -> str:
-    return decrypt_secret(secret_key, blob, OPENROUTER_KEY_CONTEXT)
+def decrypt_kano_proxy_key(secret_key: str, blob: bytes) -> str:
+    return decrypt_secret(secret_key, blob, KANO_PROXY_KEY_CONTEXT)
 
 
 def encrypt_connection_key(secret_key: str, plaintext: str) -> bytes:
@@ -66,7 +67,7 @@ def decrypt_connection_key(secret_key: str, blob: bytes) -> str:
     return decrypt_secret(secret_key, blob, CONNECTION_KEY_CONTEXT)
 
 
-def mask_openrouter_key(plaintext: str) -> str:
+def mask_secret(plaintext: str) -> str:
     """Display form: leading provider prefix, elision, last four characters."""
     if len(plaintext) <= 12:
         return "..." + plaintext[-2:]

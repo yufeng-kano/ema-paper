@@ -1,8 +1,9 @@
 """Job execution: one document, page by page (docs/jobs.md, docs/parsing.md).
 
-Shape of a run: read the job, resolve the user's key, work out the pages, then fan the
-pages out. Poppler work is bounded by the worker-wide render semaphore; upstream calls are
-bounded by this job's own vision budget, which halves itself when OpenRouter says 429.
+This is the `parse` agent's runner (docs/agents.md). Shape of a run: read the job, resolve
+the user's key, work out the pages, then fan the pages out. Poppler work is bounded by the
+worker-wide render semaphore; upstream calls are bounded by this job's own vision budget,
+which halves itself when the upstream says 429.
 
 Page failures are page-scoped by design: an unreadable page becomes an entry in `errors`
 and the rest of the document still parses. Only a document where no page survived, a dead
@@ -23,14 +24,14 @@ from pathlib import Path
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from ..agents import get_agent
 from ..config import Settings
 from ..db.models import Job, JobPage, Result, UsageLog, utcnow
 from ..parsing import poppler
 from ..parsing.figures import discard_job_figures, save_page_figures
 from ..parsing.images import ImageError, normalize_image
 from ..parsing.markdown import PageMarkdown, assemble
-from ..parsing.profiles import transcription_prompt_template
-from ..upstream.openrouter import (
+from ..upstream.client import (
     Connection,
     EmptyCompletion,
     PageTranscription,
@@ -165,8 +166,8 @@ def partial_result_payload(job: Job, rows: list[JobPage]) -> dict:
         "errors": [{"page": row.page_no, "reason": row.error} for row in rows if row.error],
         "meta": {
             "job_id": str(job.id),
+            "agent": job.agent,
             "model": job.model,
-            "profile": job.profile,
             "bbox_format": job.bbox_format,
             "pipeline_version": job.pipeline_version,
             "sha256": job.sha256,
@@ -182,9 +183,9 @@ def job_prompt(job: Job) -> str:
     """The transcription prompt template this job runs.
 
     The effective template is stored on the row at enqueue time (docs/parsing.md §
-    Prompts); jobs from before that column exist resolve their profile's template again.
+    Prompts); jobs from before that column exist fall back to the agent's default.
     """
-    return job.prompt or transcription_prompt_template(job.profile)
+    return job.prompt or get_agent(job.agent).default_prompt_template
 
 
 async def _call_upstream(state: RunState, call):
@@ -469,23 +470,19 @@ async def run_job(
         job = (await db.execute(select(Job).where(Job.id == job_id))).scalar_one_or_none()
         if job is None or job.status != "running":
             return
-        connection = await load_connection(db, settings.secret_key, job.user_id, job.connection_id)
-        if (
-            connection is not None
-            and job.connection_id is not None
-            and job.connection_base_url != connection.base_url
-        ):
-            # The connection's URL changed while the job sat queued. The dedup key must
-            # name the endpoint that actually produced the result, not the one selected
-            # at submission (docs/jobs.md § Dedup).
-            job.connection_base_url = connection.base_url
+        connection = await load_connection(db, settings, job.user_id, job.connection_id)
+        if connection is not None and job.connection_base_url != connection.snapshot:
+            # The connection's URL (or KANO_PROXY_BASE_URL) changed while the job sat
+            # queued. The dedup key must name the endpoint that actually produced the
+            # result, not the one selected at submission (docs/jobs.md § Dedup).
+            job.connection_base_url = connection.snapshot
             await db.commit()
 
     figures_root = Path(settings.figures_dir)
 
     if connection is None:
         error = (
-            "no OpenRouter key stored"
+            "Kano Proxy is not connected"
             if job.connection_id is None
             else "the provider connection for this job no longer exists"
         )
@@ -585,8 +582,8 @@ async def run_job(
                 ],
                 "meta": {
                     "job_id": str(job.id),
+                    "agent": job.agent,
                     "model": job.model,
-                    "profile": job.profile,
                     "bbox_format": job.bbox_format,
                     "pipeline_version": job.pipeline_version,
                     "sha256": job.sha256,

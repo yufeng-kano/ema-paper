@@ -14,6 +14,7 @@ from datetime import timedelta
 
 import pytest
 
+from sightread.agents import PARSE
 from sightread.db.models import Job, User, utcnow
 from sightread.jobs.queue import (
     claim_next_job,
@@ -38,11 +39,11 @@ JOB_DEFAULTS = {
     "media_type": "application/pdf",
     "size_bytes": 2048,
     "pages_spec": "",
+    "agent": "parse",
     "model": "vendor/model",
     "connection_id": None,
-    "connection_base_url": None,
-    "profile": None,
-    "profile_version": 0,
+    # The built-in upstream's snapshot is the Kano Proxy origin (docs/jobs.md § Dedup).
+    "connection_base_url": "https://kano.test",
     "bbox_format": "yxyx_norm1000",
     "prompt": "Transcribe page {page} in {bbox_format}.",
     "prompt_sha256": "p" * 64,
@@ -79,12 +80,11 @@ async def test_dedup_lookup_matches_the_full_key(sessionmaker) -> None:
 
         key = {
             "user_id": user.id,
+            "agent": "parse",
             "sha256": "a" * 64,
             "model": "vendor/model",
             "connection_id": None,
-            "connection_base_url": None,
-            "profile": None,
-            "profile_version": 0,
+            "connection_base_url": "https://kano.test",
             "pages_spec": "",
             "prompt_sha256": "p" * 64,
         }
@@ -92,7 +92,6 @@ async def test_dedup_lookup_matches_the_full_key(sessionmaker) -> None:
         assert await find_cached_job(db, **{**key, "sha256": "b" * 64}) is None
         assert await find_cached_job(db, **{**key, "model": "other/model"}) is None
         assert await find_cached_job(db, **{**key, "pages_spec": "1-2"}) is None
-        assert await find_cached_job(db, **{**key, "profile": "gemini-yxyx"}) is None
         assert await find_cached_job(db, **{**key, "prompt_sha256": "q" * 64}) is None
         # A different upstream is a different parse, even for the same model id — and an
         # edited endpoint URL repoints what a connection id means, so it misses too.
@@ -107,6 +106,45 @@ async def test_dedup_lookup_matches_the_full_key(sessionmaker) -> None:
         assert await find_cached_job(db, **{**key, "user_id": other.id}) is None
 
 
+async def test_dedup_never_crosses_agents_or_answers_from_openrouter_history(
+    sessionmaker,
+) -> None:
+    """Two succeeded results for the same bytes, model and prompt that must never answer
+    a new parse upload: another agent's, and one OpenRouter produced before the Kano Proxy
+    migration (connection_id and connection_base_url both NULL, docs/jobs.md § Dedup)."""
+    async with sessionmaker() as db:
+        user = await _user(db)
+        shared = {
+            **JOB_DEFAULTS,
+            "user_id": user.id,
+            "sha256": "d" * 64,
+            "source_path": None,
+            "status": "succeeded",
+            "pipeline_version": PARSE.pipeline_version,
+            "pages_done": 2,
+            "created_at": utcnow(),
+        }
+        db.add(Job(**{**shared, "agent": "summarize"}))
+        db.add(Job(**{**shared, "connection_base_url": None}))
+        await db.commit()
+
+        key = {
+            "user_id": user.id,
+            "agent": "parse",
+            "sha256": "d" * 64,
+            "model": "vendor/model",
+            "connection_id": None,
+            "connection_base_url": "https://kano.test",
+            "pages_spec": "",
+            "prompt_sha256": "p" * 64,
+        }
+        assert await find_cached_job(db, **key) is None
+        # The historical row is there and would match an OpenRouter-era key: the snapshot
+        # is exactly what keeps it out.
+        historical = await find_cached_job(db, **{**key, "connection_base_url": None})
+        assert historical is not None and historical.agent == "parse"
+
+
 async def test_dedup_ignores_unfinished_jobs(sessionmaker) -> None:
     async with sessionmaker() as db:
         user = await _user(db)
@@ -119,12 +157,11 @@ async def test_dedup_ignores_unfinished_jobs(sessionmaker) -> None:
             await find_cached_job(
                 db,
                 user_id=user.id,
+                agent="parse",
                 sha256="c" * 64,
                 model="vendor/model",
                 connection_id=None,
-                connection_base_url=None,
-                profile=None,
-                profile_version=0,
+                connection_base_url="https://kano.test",
                 pages_spec="",
                 prompt_sha256="p" * 64,
             )

@@ -79,11 +79,6 @@ class User(Base):
     picture: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
 
-    settings: Mapped[UserSettings | None] = relationship(back_populates="user", lazy="selectin")
-    openrouter_key: Mapped[OpenRouterKey | None] = relationship(
-        back_populates="user", lazy="selectin"
-    )
-
 
 class UserSession(Base):
     """A web session row; `token_hash` is the SHA-256 of the cookie value."""
@@ -110,10 +105,13 @@ class ApiKey(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
 
 
-class OpenRouterKey(Base):
-    """One per user. AES-256-GCM ciphertext only — never a plaintext key (docs/auth.md)."""
+class KanoProxyKey(Base):
+    """One per user: the key the Kano Proxy connect flow obtained (docs/auth.md § 6).
 
-    __tablename__ = "openrouter_keys"
+    AES-256-GCM ciphertext only — never a plaintext key (docs/auth.md § 3).
+    """
+
+    __tablename__ = "kano_proxy_keys"
 
     user_id: Mapped[int] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
@@ -122,18 +120,33 @@ class OpenRouterKey(Base):
     masked: Mapped[str] = mapped_column(String(64))
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
 
-    user: Mapped[User] = relationship(back_populates="openrouter_key")
+
+class KanoConnectState(Base):
+    """A pending Kano Proxy connect, bound to the user who started it (docs/auth.md § 6).
+
+    `state_hash` is the SHA-256 of the `state` sent to Kano Proxy; the PKCE verifier is
+    replayed at the token step, so it is encrypted rather than hashed. Single use:
+    consuming a state deletes its row.
+    """
+
+    __tablename__ = "kano_connect_states"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    state_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    verifier_ciphertext: Mapped[bytes] = mapped_column(LargeBinary)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ)
 
 
 class ProviderConnection(Base):
     """A user-defined OpenAI-compatible upstream (docs/api.md § Upstreams).
 
-    The connection's API key follows the OpenRouter key's rules exactly: AES-256-GCM
+    The connection's API key follows the Kano Proxy key's rules exactly: AES-256-GCM
     ciphertext only, masked form for display, plaintext never stored (docs/auth.md § 3).
 
-    A connection is a complete profile: endpoint, key and model travel together. `model`
-    is required on creation and NULL only on rows that predate the column
-    (docs/database.md).
+    A connection is an endpoint, a key and the cost flag; which model runs on it is each
+    agent's own setting (`AgentSetting.model`).
     """
 
     __tablename__ = "provider_connections"
@@ -147,7 +160,6 @@ class ProviderConnection(Base):
     base_url: Mapped[str] = mapped_column(String(1024))
     ciphertext: Mapped[bytes] = mapped_column(LargeBinary)
     masked: Mapped[str] = mapped_column(String(64))
-    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # Record the `usage.cost` this endpoint reports, as an estimate; opt-in, never inferred
     # from the URL (docs/parsing.md § Upstream usage).
     report_cost: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
@@ -156,7 +168,7 @@ class ProviderConnection(Base):
 
 
 class PromptPreset(Base):
-    """A named transcription prompt; selecting one replaces the template entirely
+    """A named prompt for one agent; selecting one replaces that agent's template entirely
     (docs/parsing.md § Prompts)."""
 
     __tablename__ = "prompt_presets"
@@ -164,32 +176,38 @@ class PromptPreset(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    agent: Mapped[str] = mapped_column(String(32))
     name: Mapped[str] = mapped_column(String(255))
     text: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
 
 
-class UserSettings(Base):
-    __tablename__ = "user_settings"
+class AgentSetting(Base):
+    """What one user picked for one agent (docs/agents.md § Per-agent settings).
+
+    No row means every default: Kano Proxy, no model chosen, the agent's default prompt.
+    """
+
+    __tablename__ = "agent_settings"
 
     user_id: Mapped[int] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
     )
-    default_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    default_profile: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    # The active upstream; NULL means the built-in OpenRouter (docs/api.md § Upstreams).
-    default_connection_id: Mapped[int | None] = mapped_column(
+    agent: Mapped[str] = mapped_column(String(32), primary_key=True)
+    # The upstream; NULL means the built-in Kano Proxy (docs/api.md § Upstreams).
+    connection_id: Mapped[int | None] = mapped_column(
         ForeignKey("provider_connections.id", ondelete="SET NULL"), nullable=True
     )
-    # The selected prompt preset; NULL means the shipped default (docs/parsing.md § Prompts).
+    # A model id on that upstream; NULL means not chosen yet.
+    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # The selected prompt preset; NULL means the agent's default (docs/parsing.md § Prompts).
     prompt_preset_id: Mapped[int | None] = mapped_column(
         ForeignKey("prompt_presets.id", ondelete="SET NULL"), nullable=True
     )
 
-    user: Mapped[User] = relationship(back_populates="settings")
-    default_connection: Mapped[ProviderConnection | None] = relationship(
-        foreign_keys=[default_connection_id], lazy="selectin"
+    connection: Mapped[ProviderConnection | None] = relationship(
+        foreign_keys=[connection_id], lazy="selectin"
     )
     prompt_preset: Mapped[PromptPreset | None] = relationship(
         foreign_keys=[prompt_preset_id], lazy="selectin"
@@ -205,11 +223,10 @@ class Job(Base):
         Index(
             "ix_jobs_dedup",
             "user_id",
+            "agent",
             "sha256",
             "model",
             "connection_id",
-            "profile",
-            "profile_version",
             "pages_spec",
             "prompt_sha256",
             "pipeline_version",
@@ -220,6 +237,8 @@ class Job(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    # The agent that ran this job (docs/agents.md).
+    agent: Mapped[str] = mapped_column(String(32))
     kind: Mapped[str] = mapped_column(String(16))  # pdf | image
     filename: Mapped[str] = mapped_column(String(512))
     media_type: Mapped[str] = mapped_column(String(128))
@@ -227,18 +246,22 @@ class Job(Base):
     sha256: Mapped[str] = mapped_column(String(64))
     pages_spec: Mapped[str] = mapped_column(String(255), default="")  # "" means all pages
     model: Mapped[str] = mapped_column(String(255))
-    profile: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    profile_version: Mapped[int] = mapped_column(Integer, default=0)
     pipeline_version: Mapped[int] = mapped_column(Integer, default=0)
     bbox_format: Mapped[str] = mapped_column(String(32))
-    # The upstream this job ran on; NULL means OpenRouter (docs/api.md § Upstreams).
-    # Deliberately NOT a foreign key: provider identity is immutable job history. A FK
-    # with SET NULL would relabel a deleted connection's jobs as OpenRouter jobs — a
-    # queued one would then bill the wrong key, and a succeeded one would satisfy
-    # OpenRouter dedup lookups with another upstream's output (docs/database.md).
+    # The job whose output this job took as input; NULL when the input was an upload.
+    # No foreign key, for the same reason as `connection_id` (docs/database.md).
+    source_job_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
+    # The upstream this job ran on; NULL means the built-in upstream — Kano Proxy, or
+    # OpenRouter on historical rows (docs/api.md § Upstreams). Deliberately NOT a foreign
+    # key: provider identity is immutable job history. A FK with SET NULL would relabel a
+    # deleted connection's jobs as Kano Proxy jobs — a queued one would then run on the
+    # wrong key, and a succeeded one would satisfy Kano Proxy dedup lookups with another
+    # upstream's output (docs/database.md).
     connection_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    # Endpoint snapshot at enqueue; part of the dedup key so editing a connection's URL
-    # invalidates results parsed through the old endpoint (docs/jobs.md § Dedup).
+    # Endpoint snapshot at enqueue — the connection's base_url, or KANO_PROXY_BASE_URL for
+    # the built-in upstream; part of the dedup key so editing a connection's URL
+    # invalidates results parsed through the old endpoint, and historical OpenRouter rows
+    # (NULL) never answer a new upload (docs/jobs.md § Dedup).
     connection_base_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     # The effective prompt template, verbatim; its hash is part of the dedup key.
     prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -353,7 +376,8 @@ class Document(Base):
 
 
 # Where a usage row's cost came from (docs/parsing.md § Upstream usage): OpenRouter's own
-# billing, an estimate a provider connection reported, or nobody — cost NULL.
+# billing (historical rows only — never written any more), an estimate Kano Proxy or a
+# provider connection reported, or nobody — cost NULL.
 COST_SOURCE_OPENROUTER = "openrouter"
 COST_SOURCE_ESTIMATED = "estimated"
 COST_SOURCE_UNKNOWN = "unknown"

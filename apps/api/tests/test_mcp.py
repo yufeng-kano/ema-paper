@@ -29,7 +29,7 @@ BASE_URL = "https://testserver"
 
 @pytest.fixture
 async def api_client(make_client, sessionmaker) -> AsyncClient:
-    """A client holding an API key and a stored OpenRouter key, exactly like REST tests."""
+    """A client holding an API key and a connected Kano Proxy, exactly like REST tests."""
     return await _authorize(make_client(), sessionmaker)
 
 
@@ -126,7 +126,6 @@ async def test_parse_mints_a_ticket_and_ready_to_run_commands(api_client, sessio
     # recovery.
     for fragment in (
         "model=",
-        "profile=",
         "pages=1-5,8",
         "force=true",
         "jpg/png/webp/heic",
@@ -136,6 +135,8 @@ async def test_parse_mints_a_ticket_and_ready_to_run_commands(api_client, sessio
     ):
         assert fragment in payload["notes"]
     assert "cached result comes back instantly" in payload["notes"]
+    # Profiles are gone; an agent told to send one would get a silently ignored field.
+    assert "profile" not in payload["notes"]
 
     # Stored hashed, never in plaintext, and unspent until an upload uses it.
     async with sessionmaker() as db:

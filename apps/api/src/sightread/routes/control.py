@@ -13,12 +13,13 @@ from authlib.integrations.starlette_client import OAuthError
 from fastapi import APIRouter, Query, Request, Response, status
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import case, delete, func, select
+from sqlalchemy import case, func, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
 
+from ..agents import AGENTS, AgentDefinition, get_agent
 from ..auth.api_keys import create_api_key
-from ..auth.crypto import encrypt_connection_key, encrypt_openrouter_key, mask_openrouter_key
+from ..auth.crypto import encrypt_connection_key, mask_secret
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
 from ..auth.oidc import (
     DEV_USER_EMAIL,
@@ -32,26 +33,24 @@ from ..db.models import (
     COST_SOURCE_ESTIMATED,
     COST_SOURCE_OPENROUTER,
     COST_SOURCE_UNKNOWN,
+    AgentSetting,
     ApiKey,
     Job,
-    OpenRouterKey,
     PromptPreset,
     ProviderConnection,
     Result,
     UsageLog,
-    UserSettings,
     utcnow,
 )
 from ..errors import ApiError
 from ..jobs.intake import PDF_MEDIA_TYPE
 from ..jobs.runner import result_payload
 from ..parsing.images import ACCEPTED_IMAGE_TYPES
-from ..parsing.profiles import DEFAULT_PROMPT_TEMPLATE, get_profile
-from ..upstream.openrouter import (
+from ..upstream.client import (
+    agent_models,
     fetch_connection_models,
     normalize_base_url,
     stored_connection_models,
-    validate_api_key,
 )
 from .library import figure_crop_response, partial_result
 
@@ -152,13 +151,7 @@ async def dev_login(db: DbSession):
 
 
 @router.get("/me")
-async def me(user: SessionUser, db: DbSession, settings: AppSettings):
-    settings_row = (
-        await db.execute(select(UserSettings).where(UserSettings.user_id == user.id))
-    ).scalar_one_or_none()
-    key_row = (
-        await db.execute(select(OpenRouterKey).where(OpenRouterKey.user_id == user.id))
-    ).scalar_one_or_none()
+async def me(user: SessionUser, settings: AppSettings):
     return {
         "user": {
             "id": user.id,
@@ -166,19 +159,6 @@ async def me(user: SessionUser, db: DbSession, settings: AppSettings):
             "name": user.name,
             "picture": user.picture,
             "created_at": user.created_at,
-        },
-        "settings": {
-            "default_model": settings_row.default_model if settings_row else None,
-            "default_profile": settings_row.default_profile if settings_row else None,
-            "default_connection_id": settings_row.default_connection_id if settings_row else None,
-            "prompt_preset_id": settings_row.prompt_preset_id if settings_row else None,
-        },
-        # The shipped prompt, so the settings page can show what "default" means.
-        "defaults": {"system_prompt": DEFAULT_PROMPT_TEMPLATE},
-        "openrouter_key": {
-            "present": key_row is not None,
-            "masked": key_row.masked if key_row else None,
-            "updated_at": key_row.updated_at if key_row else None,
         },
         # What the upload UI is allowed to send, from the server's own configuration —
         # a limit written twice is a limit that drifts (docs/api.md § Limits).
@@ -253,66 +233,16 @@ async def revoke_key(key_id: int, user: SessionUser, db: DbSession) -> Response:
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-# --- OpenRouter key -------------------------------------------------------------------
-
-
-class OpenRouterKeyPut(BaseModel):
-    key: str = Field(min_length=8, max_length=512)
-
-
-@router.get("/openrouter-key")
-async def get_openrouter_key(user: SessionUser, db: DbSession):
-    row = (
-        await db.execute(select(OpenRouterKey).where(OpenRouterKey.user_id == user.id))
-    ).scalar_one_or_none()
-    return {
-        "present": row is not None,
-        "masked": row.masked if row else None,
-        "updated_at": row.updated_at if row else None,
-    }
-
-
-@router.put("/openrouter-key", dependencies=[CsrfGuard])
-async def put_openrouter_key(
-    body: OpenRouterKeyPut, user: SessionUser, db: DbSession, settings: AppSettings
-):
-    candidate = body.key.strip()
-    if not await validate_api_key(candidate):
-        raise ApiError(400, "invalid_request", "OpenRouter rejected this key")
-
-    row = (
-        await db.execute(select(OpenRouterKey).where(OpenRouterKey.user_id == user.id))
-    ).scalar_one_or_none()
-    ciphertext = encrypt_openrouter_key(settings.secret_key, candidate)
-    masked = mask_openrouter_key(candidate)
-    if row is None:
-        row = OpenRouterKey(user_id=user.id, ciphertext=ciphertext, masked=masked)
-        db.add(row)
-    else:
-        row.ciphertext = ciphertext
-        row.masked = masked
-        row.updated_at = utcnow()
-    await db.commit()
-    return {"present": True, "masked": masked, "updated_at": row.updated_at}
-
-
-@router.delete("/openrouter-key", dependencies=[CsrfGuard], status_code=status.HTTP_204_NO_CONTENT)
-async def delete_openrouter_key(user: SessionUser, db: DbSession) -> Response:
-    await db.execute(delete(OpenRouterKey).where(OpenRouterKey.user_id == user.id))
-    await db.commit()
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-
 # --- provider connections -------------------------------------------------------------
 
 
 class ConnectionCreate(BaseModel):
-    """A connection is a complete profile — the model is fixed at creation (docs/api.md)."""
+    """An endpoint, its key and the cost flag; the model is each agent's choice
+    (docs/agents.md)."""
 
     name: str = Field(min_length=1, max_length=255)
     base_url: str = Field(min_length=1, max_length=1024)
     api_key: str = Field(min_length=8, max_length=512)
-    model: str = Field(min_length=1, max_length=255)
     # Record the endpoint's reported `usage.cost` as an estimate (docs/parsing.md).
     report_cost: bool = False
 
@@ -323,7 +253,6 @@ class ConnectionUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=255)
     base_url: str | None = Field(default=None, min_length=1, max_length=1024)
     api_key: str | None = Field(default=None, min_length=8, max_length=512)
-    model: str | None = Field(default=None, min_length=1, max_length=255)
     report_cost: bool | None = None
 
 
@@ -346,7 +275,6 @@ def _connection_payload(row: ProviderConnection) -> dict:
         "name": row.name,
         "base_url": row.base_url,
         "masked": row.masked,
-        "model": row.model,
         "report_cost": row.report_cost,
         "created_at": row.created_at,
         "updated_at": row.updated_at,
@@ -405,9 +333,6 @@ async def create_connection(
     name = body.name.strip()
     if not name:
         raise ApiError(400, "invalid_request", "The connection needs a name")
-    model = body.model.strip()
-    if not model:
-        raise ApiError(400, "invalid_request", "The connection needs a model")
     base_url = await normalize_base_url(body.base_url, settings.app_env)
     candidate = body.api_key.strip()
     await _refuse_duplicate_connection_name(db, user.id, name)
@@ -419,8 +344,7 @@ async def create_connection(
         name=name,
         base_url=base_url,
         ciphertext=encrypt_connection_key(settings.secret_key, candidate),
-        masked=mask_openrouter_key(candidate),
-        model=model,
+        masked=mask_secret(candidate),
         report_cost=body.report_cost,
     )
     db.add(row)
@@ -455,18 +379,12 @@ async def update_connection(
     if candidate is not None:
         await fetch_connection_models(base_url, candidate, settings.upstream_response_max_bytes)
         row.ciphertext = encrypt_connection_key(settings.secret_key, candidate)
-        row.masked = mask_openrouter_key(candidate)
+        row.masked = mask_secret(candidate)
     elif base_url != row.base_url:
         # A moved endpoint must still accept the stored key before we point jobs at it.
         await stored_connection_models(
             base_url, settings.secret_key, row.ciphertext, settings.upstream_response_max_bytes
         )
-
-    if "model" in provided and body.model:
-        model = body.model.strip()
-        if not model:
-            raise ApiError(400, "invalid_request", "The connection needs a model")
-        row.model = model
 
     if body.report_cost is not None:
         row.report_cost = body.report_cost
@@ -487,12 +405,13 @@ async def delete_connection(
     connection_id: int, user: SessionUser, db: DbSession
 ) -> Response:
     row = await _owned_connection(db, user.id, connection_id)
-    # Explicit fallback (not just the FK's SET NULL): a default model belongs to the
-    # deleted endpoint's catalog, so it goes too — back to "not set" on OpenRouter.
+    # Explicit fallback (not just the FK's SET NULL): every agent on this connection goes
+    # back to Kano Proxy, and its model goes too — it belonged to the deleted endpoint's
+    # catalog (docs/agents.md).
     await db.execute(
-        sa_update(UserSettings)
-        .where(UserSettings.user_id == user.id, UserSettings.default_connection_id == row.id)
-        .values(default_connection_id=None, default_model=None)
+        sa_update(AgentSetting)
+        .where(AgentSetting.user_id == user.id, AgentSetting.connection_id == row.id)
+        .values(connection_id=None, model=None)
     )
     await db.delete(row)
     await db.commit()
@@ -538,6 +457,8 @@ async def preview_connection_models(
 
 
 class PromptCreate(BaseModel):
+    # The agent this prompt is for; fixed once created (docs/agents.md).
+    agent: str = Field(default="parse", max_length=32)
     name: str = Field(min_length=1, max_length=255)
     text: str = Field(min_length=1)
 
@@ -550,6 +471,7 @@ class PromptUpdate(BaseModel):
 def _prompt_payload(row: PromptPreset) -> dict:
     return {
         "id": row.id,
+        "agent": row.agent,
         "name": row.name,
         "text": row.text,
         "created_at": row.created_at,
@@ -615,12 +537,15 @@ async def list_prompts(user: SessionUser, db: DbSession):
 async def create_prompt(
     body: PromptCreate, user: SessionUser, db: DbSession, settings: AppSettings
 ):
+    agent = get_agent(body.agent)
+    if agent is None:
+        raise ApiError(400, "invalid_request", f"No such agent '{body.agent}'")
     name = body.name.strip()
     if not name:
         raise ApiError(400, "invalid_request", "The prompt needs a name")
     text = _checked_prompt_text(body.text, settings)
     await _refuse_duplicate_prompt_name(db, user.id, name)
-    row = PromptPreset(user_id=user.id, name=name, text=text)
+    row = PromptPreset(user_id=user.id, agent=agent.name, name=name, text=text)
     db.add(row)
     await _commit_or_name_conflict(db, "A prompt with this name already exists")
     return _prompt_payload(row)
@@ -650,10 +575,10 @@ async def update_prompt(
 )
 async def delete_prompt(prompt_id: int, user: SessionUser, db: DbSession) -> Response:
     row = await _owned_prompt(db, user.id, prompt_id)
-    # Explicit fallback to the default prompt, not just the FK's SET NULL.
+    # Explicit fallback to the agent's default prompt, not just the FK's SET NULL.
     await db.execute(
-        sa_update(UserSettings)
-        .where(UserSettings.user_id == user.id, UserSettings.prompt_preset_id == row.id)
+        sa_update(AgentSetting)
+        .where(AgentSetting.user_id == user.id, AgentSetting.prompt_preset_id == row.id)
         .values(prompt_preset_id=None)
     )
     await db.delete(row)
@@ -661,47 +586,89 @@ async def delete_prompt(prompt_id: int, user: SessionUser, db: DbSession) -> Res
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-# --- settings -------------------------------------------------------------------------
+# --- agents ---------------------------------------------------------------------------
 
 
-class SettingsPut(BaseModel):
+def _known_agent(name: str) -> AgentDefinition:
+    agent = get_agent(name)
+    if agent is None:
+        raise ApiError(404, "invalid_request", f"No such agent '{name}'")
+    return agent
+
+
+def _agent_settings_payload(row: AgentSetting | None) -> dict:
+    return {
+        "connection_id": row.connection_id if row else None,
+        "model": row.model if row else None,
+        "prompt_preset_id": row.prompt_preset_id if row else None,
+    }
+
+
+@router.get("/agents")
+async def list_agents(user: SessionUser, db: DbSession):
+    """The registry with the caller's settings for each agent (docs/agents.md)."""
+    rows = {
+        row.agent: row
+        for row in (
+            await db.execute(select(AgentSetting).where(AgentSetting.user_id == user.id))
+        ).scalars()
+    }
+    return {
+        "agents": [
+            {
+                "name": agent.name,
+                "capabilities": list(agent.capabilities),
+                "input": agent.input,
+                "output": agent.output,
+                # What "default" means for this agent's prompt picker.
+                "default_prompt": agent.default_prompt_template,
+                "settings": _agent_settings_payload(rows.get(agent.name)),
+            }
+            for agent in AGENTS.values()
+        ]
+    }
+
+
+class AgentSettingsPut(BaseModel):
     """Partial update: only the fields present in the body change (docs/api.md)."""
 
-    default_model: str | None = Field(default=None, max_length=255)
-    default_profile: str | None = Field(default=None, max_length=64)
-    default_connection_id: int | None = None
+    connection_id: int | None = None
+    model: str | None = Field(default=None, max_length=255)
     prompt_preset_id: int | None = None
 
 
-@router.put("/settings", dependencies=[CsrfGuard])
-async def put_settings(body: SettingsPut, user: SessionUser, db: DbSession):
-    if body.default_profile is not None and get_profile(body.default_profile) is None:
-        raise ApiError(400, "invalid_request", f"Unknown profile '{body.default_profile}'")
-    if body.default_connection_id is not None:
-        await _owned_connection(db, user.id, body.default_connection_id)
+@router.put("/agents/{agent_name}/settings", dependencies=[CsrfGuard])
+async def put_agent_settings(
+    agent_name: str, body: AgentSettingsPut, user: SessionUser, db: DbSession
+):
+    agent = _known_agent(agent_name)
+    provided = body.model_fields_set
+    if body.connection_id is not None:
+        await _owned_connection(db, user.id, body.connection_id)
     if body.prompt_preset_id is not None:
-        await _owned_prompt(db, user.id, body.prompt_preset_id)
+        preset = await _owned_prompt(db, user.id, body.prompt_preset_id)
+        if preset.agent != agent.name:
+            raise ApiError(400, "invalid_request", f"That prompt is for the {preset.agent} agent")
 
     row = (
-        await db.execute(select(UserSettings).where(UserSettings.user_id == user.id))
+        await db.execute(
+            select(AgentSetting).where(
+                AgentSetting.user_id == user.id, AgentSetting.agent == agent.name
+            )
+        )
     ).scalar_one_or_none()
     if row is None:
-        row = UserSettings(user_id=user.id)
+        row = AgentSetting(user_id=user.id, agent=agent.name)
         db.add(row)
-    provided = body.model_fields_set
-    # The model/profile pair travels together: the web app always sends both.
-    if "default_model" in provided or "default_profile" in provided:
-        row.default_model = body.default_model
-        row.default_profile = body.default_profile
-    if "default_connection_id" in provided:
-        row.default_connection_id = body.default_connection_id
+    if "connection_id" in provided and body.connection_id != row.connection_id:
+        row.connection_id = body.connection_id
+        # The stored model belonged to the other upstream's catalog (docs/agents.md).
+        if "model" not in provided:
+            row.model = None
+    if "model" in provided:
+        row.model = (body.model or "").strip() or None
     if "prompt_preset_id" in provided:
         row.prompt_preset_id = body.prompt_preset_id
-    if row.default_connection_id is not None and row.default_profile is not None:
-        # Profiles resolve against the OpenRouter catalog only (docs/api.md).
-        raise ApiError(
-            400, "invalid_request", "Profiles run on OpenRouter only; clear one of the two"
-        )
     try:
         await db.commit()
     except IntegrityError as exc:
@@ -711,12 +678,16 @@ async def put_settings(body: SettingsPut, user: SessionUser, db: DbSession):
         raise ApiError(
             409, "invalid_request", "The selected connection or prompt was just deleted"
         ) from exc
-    return {
-        "default_model": row.default_model,
-        "default_profile": row.default_profile,
-        "default_connection_id": row.default_connection_id,
-        "prompt_preset_id": row.prompt_preset_id,
-    }
+    return _agent_settings_payload(row)
+
+
+@router.get("/agents/{agent_name}/models")
+async def list_agent_models(
+    agent_name: str, user: SessionUser, db: DbSession, settings: AppSettings
+):
+    """The live catalog of the agent's saved upstream — the settings page's model picker."""
+    agent = _known_agent(agent_name)
+    return {"data": await agent_models(db, settings, user.id, agent.name)}
 
 
 # --- usage ----------------------------------------------------------------------------
@@ -795,11 +766,11 @@ async def list_jobs(user: SessionUser, db: DbSession, limit: int = Query(default
         "jobs": [
             {
                 "job_id": str(row.id),
+                "agent": row.agent,
                 "status": row.status,
                 "filename": row.filename,
                 "kind": row.kind,
                 "model": row.model,
-                "profile": row.profile,
                 "page_count": row.page_count,
                 "pages_done": row.pages_done,
                 "error": row.error,

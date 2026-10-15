@@ -168,9 +168,8 @@ async def test_job_history_and_result_serving(signed_in: AsyncClient, sessionmak
                 size_bytes=1024,
                 sha256="a" * 64,
                 pages_spec="",
+                agent="parse",
                 model="google/gemini-2.5-flash",
-                profile="gemini-yxyx",
-                profile_version=1,
                 pipeline_version=1,
                 bbox_format="yxyx_norm1000",
                 status="succeeded",
@@ -196,6 +195,7 @@ async def test_job_history_and_result_serving(signed_in: AsyncClient, sessionmak
     assert len(listed) == 1
     assert listed[0]["job_id"] == str(job_id)
     assert listed[0]["status"] == "succeeded"
+    assert listed[0]["agent"] == "parse"
 
     result = await signed_in.get(f"/api/jobs/{job_id}/result")
     assert result.status_code == 200

@@ -13,8 +13,8 @@ import uuid
 from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..agents import get_agent
 from ..db.models import Job, JobPage, utcnow
-from ..parsing.profiles import PIPELINE_VERSION
 
 # PostgreSQL claim (docs/jobs.md). The correlated count applies the per-user running cap
 # to the same scan that picks the oldest queued job.
@@ -91,24 +91,25 @@ async def count_running_jobs(db: AsyncSession, user_id: int) -> int:
 def dedup_key(
     *,
     user_id: int,
+    agent: str,
     sha256: str,
     model: str,
     connection_id: int | None,
     connection_base_url: str | None,
-    profile: str | None,
-    profile_version: int,
     pages_spec: str,
     prompt_sha256: str,
 ) -> list:
     """Everything that has to match for two uploads to be the same parse.
 
-    Same user, bytes, model, upstream (id *and* endpoint snapshot — editing a connection's
-    URL repoints what its id means), profile, pages, prompt, pipeline
-    (docs/jobs.md § Dedup). Status is the caller's: a finished parse answers the cache, an
-    unfinished one answers a retry.
+    Same user, agent, bytes, model, upstream (id *and* endpoint snapshot — editing a
+    connection's URL repoints what its id means, and the built-in upstream's snapshot is
+    KANO_PROXY_BASE_URL, which no historical OpenRouter row has), pages, prompt, and the
+    agent's pipeline version (docs/jobs.md § Dedup). Status is the caller's: a finished
+    parse answers the cache, an unfinished one answers a retry.
     """
     return [
         Job.user_id == user_id,
+        Job.agent == agent,
         Job.sha256 == sha256,
         Job.model == model,
         Job.connection_id.is_(None)
@@ -117,11 +118,9 @@ def dedup_key(
         Job.connection_base_url.is_(None)
         if connection_base_url is None
         else Job.connection_base_url == connection_base_url,
-        Job.profile.is_(profile) if profile is None else Job.profile == profile,
-        Job.profile_version == profile_version,
         Job.pages_spec == pages_spec,
         Job.prompt_sha256 == prompt_sha256,
-        Job.pipeline_version == PIPELINE_VERSION,
+        Job.pipeline_version == get_agent(agent).pipeline_version,
     ]
 
 
@@ -180,6 +179,7 @@ async def enqueue_job(
     db: AsyncSession,
     *,
     user_id: int,
+    agent: str,
     kind: str,
     filename: str,
     media_type: str,
@@ -189,8 +189,6 @@ async def enqueue_job(
     model: str,
     connection_id: int | None,
     connection_base_url: str | None,
-    profile: str | None,
-    profile_version: int,
     bbox_format: str,
     prompt: str,
     prompt_sha256: str,
@@ -201,6 +199,7 @@ async def enqueue_job(
     job = Job(
         id=uuid.uuid4(),
         user_id=user_id,
+        agent=agent,
         kind=kind,
         filename=filename,
         media_type=media_type,
@@ -210,9 +209,7 @@ async def enqueue_job(
         model=model,
         connection_id=connection_id,
         connection_base_url=connection_base_url,
-        profile=profile,
-        profile_version=profile_version,
-        pipeline_version=PIPELINE_VERSION,
+        pipeline_version=get_agent(agent).pipeline_version,
         bbox_format=bbox_format,
         prompt=prompt,
         prompt_sha256=prompt_sha256,

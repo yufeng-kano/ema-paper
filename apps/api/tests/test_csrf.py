@@ -9,14 +9,11 @@ from __future__ import annotations
 import pytest
 from httpx import AsyncClient
 
-from .conftest import CSRF_HEADERS
-
 MUTATIONS = [
     ("post", "/api/keys", {"name": "x"}),
     ("delete", "/api/keys/1", None),
-    ("put", "/api/openrouter-key", {"key": "sk-or-v1-something"}),
-    ("delete", "/api/openrouter-key", None),
-    ("put", "/api/settings", {"default_model": None, "default_profile": None}),
+    ("put", "/api/agents/parse/settings", {"model": None}),
+    ("delete", "/api/kano", None),
     ("post", "/api/auth/logout", None),
     ("post", "/api/auth/dev-login", None),
 ]
@@ -37,24 +34,3 @@ async def test_reads_do_not_require_the_custom_header(signed_in: AsyncClient) ->
     assert (await signed_in.get("/api/me")).status_code == 200
     assert (await signed_in.get("/api/keys")).status_code == 200
     assert (await signed_in.get("/api/jobs")).status_code == 200
-
-
-async def test_settings_accept_a_known_profile_only(signed_in: AsyncClient) -> None:
-    ok = await signed_in.put(
-        "/api/settings",
-        json={"default_model": "google/gemini-2.5-flash", "default_profile": "gemini-yxyx"},
-        headers=CSRF_HEADERS,
-    )
-    assert ok.status_code == 200
-    assert ok.json() == {
-        "default_model": "google/gemini-2.5-flash",
-        "default_profile": "gemini-yxyx",
-        "default_connection_id": None,
-        "prompt_preset_id": None,
-    }
-
-    bad = await signed_in.put(
-        "/api/settings", json={"default_profile": "does-not-exist"}, headers=CSRF_HEADERS
-    )
-    assert bad.status_code == 400
-    assert bad.json()["error"]["type"] == "invalid_request"

@@ -1,6 +1,6 @@
 """Upload tickets end to end (docs/auth.md § 5): one upload, then reads of that one job.
 
-No upstream traffic here either — the worker runs against the stubbed OpenRouter from
+No upstream traffic here either — the worker runs against the stubbed Kano Proxy from
 `test_parse_end_to_end` (docs/testing.md § Cost safety).
 """
 
@@ -16,9 +16,8 @@ from sqlalchemy import select
 
 from sightread.auth import upload_tickets
 from sightread.db.models import UploadTicket, User
-from sightread.upstream.openrouter import CHAT_URL
-from tests.conftest import mcp_running
-from tests.test_parse_end_to_end import MODEL, _authorize, _drain_queue, _openrouter_stub
+from tests.conftest import KANO_CHAT_URL, mcp_running
+from tests.test_parse_end_to_end import MODEL, _authorize, _drain_queue, _vision_stub
 
 # The copy is part of the contract: it is the agent's only recovery hint (docs/auth.md § 5).
 EXPECTED_REJECTION = (
@@ -79,7 +78,7 @@ async def test_last_resolves_a_spent_ticket_to_its_own_job(
     api_client, sessionmaker, documents
 ) -> None:
     """The `last` aliases behind the MCP curl commands (docs/api.md § GET /v1/jobs/last*)."""
-    respx.post(CHAT_URL).mock(side_effect=_openrouter_stub)
+    respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
     token = await _mint(api_client, sessionmaker)
     job_id = (await _upload(api_client, token, documents["text_pdf"])).json()["job_id"]
     await _drain_queue(api_client, sessionmaker)
@@ -127,7 +126,7 @@ async def test_a_spent_ticket_cannot_upload_again(api_client, sessionmaker, docu
 async def test_a_spent_ticket_reads_its_own_job_and_nothing_else(
     api_client, sessionmaker, documents
 ) -> None:
-    respx.post(CHAT_URL).mock(side_effect=_openrouter_stub)
+    respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
     token = await _mint(api_client, sessionmaker)
     job_id = (await _upload(api_client, token, documents["text_pdf"])).json()["job_id"]
     await _drain_queue(api_client, sessionmaker)
@@ -238,7 +237,7 @@ async def test_an_upload_that_fails_before_a_job_exists_keeps_the_ticket(
 async def test_a_dedup_hit_binds_the_ticket_to_the_cached_job(
     api_client, sessionmaker, documents
 ) -> None:
-    respx.post(CHAT_URL).mock(side_effect=_openrouter_stub)
+    respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
     first = await api_client.post(
         "/v1/parse",
         files={"file": ("text.pdf", documents["text_pdf"].read_bytes(), "application/pdf")},

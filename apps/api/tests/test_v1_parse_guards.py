@@ -7,19 +7,22 @@ import uuid
 from pathlib import Path
 
 import httpx
-import respx
 from httpx import AsyncClient
+from sqlalchemy import select
 
 from sightread.db.models import Job, utcnow
-from sightread.upstream.openrouter import MODELS_URL, reset_models_cache
 from tests.conftest import CSRF_HEADERS
+from tests.test_parse_end_to_end import _connect_kano
 
 MODEL = "vendor/vision-model"
 
 
 async def _keyed_client(client: AsyncClient) -> AsyncClient:
+    """An API key and a connected Kano Proxy, so the guards below are what answers."""
     await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
     created = await client.post("/api/keys", json={"name": "test"}, headers=CSRF_HEADERS)
+    user_id = (await client.get("/api/me")).json()["user"]["id"]
+    await _connect_kano(client.app.state.sessionmaker, user_id)
     client.headers["Authorization"] = f"Bearer {created.json()['key']}"
     return client
 
@@ -118,8 +121,7 @@ async def test_the_per_user_running_cap_returns_429(
                     sha256=str(index) * 64,
                     pages_spec="",
                     model=MODEL,
-                    profile=None,
-                    profile_version=0,
+                    agent="parse",
                     pipeline_version=1,
                     bbox_format="yxyx_norm1000",
                     status="running",
@@ -168,7 +170,9 @@ async def test_broken_base64_is_rejected(client: AsyncClient, documents) -> None
     assert response.status_code == 400
 
 
-async def test_a_job_needs_a_model_or_a_profile(client: AsyncClient, documents) -> None:
+async def test_a_job_needs_a_model(client: AsyncClient, sessionmaker, documents) -> None:
+    """No model in the request and none chosen in Settings: refused before any file is
+    stored, with a message that says where to choose one (docs/agents.md)."""
     await _keyed_client(client)
     response = await client.post(
         "/v1/parse",
@@ -176,53 +180,58 @@ async def test_a_job_needs_a_model_or_a_profile(client: AsyncClient, documents) 
     )
 
     assert response.status_code == 400
-    assert "No model configured" in response.json()["error"]["message"]
+    assert response.json()["error"]["message"] == (
+        "No model chosen for the parse agent: pick one in Settings or pass 'model'"
+    )
+    async with sessionmaker() as db:
+        assert (await db.execute(select(Job))).scalars().all() == []
 
 
-@respx.mock
-async def test_a_preset_profile_resolves_its_model_from_the_catalog(
+async def test_the_model_chosen_in_settings_runs_and_a_request_model_overrides_it(
     client: AsyncClient, sessionmaker, documents
 ) -> None:
-    reset_models_cache()
-    respx.get(MODELS_URL).mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "data": [
-                    {
-                        "id": "google/gemini-3.5-flash",
-                        "created": 200,
-                        "architecture": {"input_modalities": ["text", "image"]},
-                    }
-                ]
-            },
-        )
-    )
     await _keyed_client(client)
+    chosen = await client.put(
+        "/api/agents/parse/settings", json={"model": "vendor/chosen"}, headers=CSRF_HEADERS
+    )
+    assert chosen.status_code == 200
 
-    response = await client.post(
+    from_settings = await client.post(
         "/v1/parse",
         files={"file": ("text.pdf", documents["text_pdf"].read_bytes(), "application/pdf")},
-        data={"profile": "gemini-yxyx"},
     )
+    overridden = await _upload(client, documents["mixed_pdf"])
 
-    assert response.status_code == 202
     async with sessionmaker() as db:
-        job = await db.get(Job, uuid.UUID(response.json()["job_id"]))
-    assert job.model == "google/gemini-3.5-flash"
-    assert job.profile == "gemini-yxyx"
-    assert job.bbox_format == "yxyx_norm1000"
-    reset_models_cache()
+        first = await db.get(Job, uuid.UUID(from_settings.json()["job_id"]))
+        second = await db.get(Job, uuid.UUID(overridden.json()["job_id"]))
+    assert (first.model, first.agent) == ("vendor/chosen", "parse")
+    assert second.model == MODEL
 
 
-async def test_an_unknown_profile_is_rejected(client: AsyncClient, documents) -> None:
-    await _keyed_client(client)
-    response = await client.post(
-        "/v1/parse",
-        files={"file": ("text.pdf", documents["text_pdf"].read_bytes(), "application/pdf")},
-        data={"profile": "not-a-profile"},
-    )
+async def test_kano_proxy_must_be_connected_to_parse_on_it(
+    client: AsyncClient, documents
+) -> None:
+    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    created = await client.post("/api/keys", json={"name": "test"}, headers=CSRF_HEADERS)
+    client.headers["Authorization"] = f"Bearer {created.json()['key']}"
+
+    response = await _upload(client, documents["text_pdf"])
+
     assert response.status_code == 400
+    assert response.json()["error"]["message"].startswith("Kano Proxy is not connected")
+    upload_dir = Path(client.app.state.settings.upload_dir)
+    assert not upload_dir.exists() or list(upload_dir.iterdir()) == []
+
+
+async def test_a_deployment_without_kano_proxy_refuses_the_built_in_upstream(
+    make_client, documents
+) -> None:
+    client = await _keyed_client(make_client(kano_proxy_base_url=""))
+    response = await _upload(client, documents["text_pdf"])
+
+    assert response.status_code == 503
+    assert "not configured" in response.json()["error"]["message"]
 
 
 async def test_jobs_of_other_users_are_invisible(make_client, sessionmaker, documents) -> None:

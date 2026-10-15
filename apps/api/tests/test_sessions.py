@@ -33,7 +33,7 @@ async def test_dev_login_round_trip(client: AsyncClient) -> None:
     assert me.status_code == 200
     body = me.json()
     assert body["user"]["email"] == "dev@localhost"
-    assert body["openrouter_key"] == {"present": False, "masked": None, "updated_at": None}
+    assert set(body) == {"user", "limits"}
 
     logout = await client.post("/api/auth/logout", headers=CSRF_HEADERS)
     assert logout.status_code == 204

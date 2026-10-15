@@ -42,6 +42,15 @@ from tests.fixtures.documents import (
 TEST_SECRET_KEY = "test-secret-key-not-a-real-one"
 CSRF_HEADERS = {"X-Requested-With": "XMLHttpRequest"}
 
+# A Kano Proxy that only exists inside respx: no test ever reaches a real one
+# (docs/testing.md § Cost safety).
+KANO_BASE = "https://kano.test"
+KANO_CHAT_URL = f"{KANO_BASE}/openai/v1/chat/completions"
+KANO_MODELS_URL = f"{KANO_BASE}/openai/v1/models"
+KANO_TOKEN_URL = f"{KANO_BASE}/api/connect/token"
+KANO_CLIENT_ID = "sightread-test"
+KANO_CLIENT_SECRET = "kano-client-secret-not-a-real-one"
+
 DATABASE_URL = os.environ.get("TEST_DATABASE_URL") or os.environ.get("DATABASE_URL")
 
 
@@ -76,6 +85,9 @@ async def make_client(sessionmaker, tmp_path) -> AsyncIterator[Callable[..., Asy
                 "database_url": "sqlite+aiosqlite://",
                 "upload_dir": str(tmp_path / "uploads"),
                 "figures_dir": str(tmp_path / "figures"),
+                "kano_proxy_base_url": KANO_BASE,
+                "kano_proxy_client_id": KANO_CLIENT_ID,
+                "kano_proxy_client_secret": KANO_CLIENT_SECRET,
                 **overrides,
             }
         )

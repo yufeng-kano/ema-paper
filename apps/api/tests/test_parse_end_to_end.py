@@ -1,4 +1,4 @@
-"""`POST /v1/parse` through the worker to the result, with OpenRouter stubbed.
+"""`POST /v1/parse` through the worker to the result, with Kano Proxy stubbed.
 
 This is the phase's integration test: a real PDF, real Poppler subprocesses, a real claim
 cycle, and not one byte of live upstream traffic (docs/testing.md § Cost safety).
@@ -17,16 +17,16 @@ import respx
 from httpx import AsyncClient
 from sqlalchemy import select
 
-from sightread.auth.crypto import encrypt_openrouter_key
-from sightread.db.models import Job, OpenRouterKey, UsageLog
+from sightread.agents.parse import PIPELINE_VERSION
+from sightread.auth.crypto import encrypt_kano_proxy_key
+from sightread.db.models import Job, KanoProxyKey, UsageLog
 from sightread.jobs.queue import claim_next_job
 from sightread.jobs.runner import run_job
-from sightread.parsing.profiles import PIPELINE_VERSION
-from sightread.upstream.openrouter import CHAT_URL
-from tests.conftest import CSRF_HEADERS, DATABASE_URL, TEST_SECRET_KEY
+from tests.conftest import CSRF_HEADERS, DATABASE_URL, KANO_CHAT_URL, TEST_SECRET_KEY
 from tests.test_jobs_queue import postgres_only
 
 MODEL = "vendor/vision-model"
+KANO_KEY = "sk-kano-proxy-test-key"
 VISION_MARKDOWN = (
     "## Scanned page\n\n"
     "![fig](sightread://p9/200,100,600,900)\n"
@@ -40,32 +40,35 @@ def _completion(content: str) -> httpx.Response:
         200,
         json={
             "choices": [{"message": {"content": content}}],
-            "usage": {"prompt_tokens": 900, "completion_tokens": 120, "cost": "0.001500"},
+            "usage": {"prompt_tokens": 900, "completion_tokens": 120, "cost": 0.0015},
         },
     )
 
 
-def _openrouter_stub(request: httpx.Request) -> httpx.Response:
+def _vision_stub(request: httpx.Request) -> httpx.Response:
     """Every page is a vision transcription (docs/parsing.md § Vision-only conversion)."""
     return _completion(VISION_MARKDOWN)
 
 
-async def _authorize(client: AsyncClient, sessionmaker) -> AsyncClient:
-    """Give a client an API key and a stored OpenRouter key."""
-    assert (await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)).status_code == 200
-    created = await client.post("/api/keys", json={"name": "test"}, headers=CSRF_HEADERS)
-    user_id = (await client.get("/api/me")).json()["user"]["id"]
-
+async def _connect_kano(sessionmaker, user_id: int) -> None:
+    """What a finished connect flow leaves behind: the user's Kano Proxy key, stored."""
     async with sessionmaker() as db:
         db.add(
-            OpenRouterKey(
+            KanoProxyKey(
                 user_id=user_id,
-                ciphertext=encrypt_openrouter_key(TEST_SECRET_KEY, "sk-or-v1-test"),
-                masked="sk-or-v1...test",
+                ciphertext=encrypt_kano_proxy_key(TEST_SECRET_KEY, KANO_KEY),
+                masked="sk-kano-...-key",
             )
         )
         await db.commit()
 
+
+async def _authorize(client: AsyncClient, sessionmaker) -> AsyncClient:
+    """Give a client an API key and a connected Kano Proxy."""
+    assert (await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)).status_code == 200
+    created = await client.post("/api/keys", json={"name": "test"}, headers=CSRF_HEADERS)
+    user_id = (await client.get("/api/me")).json()["user"]["id"]
+    await _connect_kano(sessionmaker, user_id)
     client.headers["Authorization"] = f"Bearer {created.json()['key']}"
     return client
 
@@ -95,7 +98,7 @@ async def _upload(client: AsyncClient, path: Path, **fields) -> httpx.Response:
 
 @respx.mock
 async def test_parse_a_mixed_pdf_end_to_end(api_client, sessionmaker, documents) -> None:
-    respx.post(CHAT_URL).mock(side_effect=_openrouter_stub)
+    route = respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
 
     accepted = await _upload(api_client, documents["mixed_pdf"])
     assert accepted.status_code == 202, accepted.text
@@ -130,8 +133,8 @@ async def test_parse_a_mixed_pdf_end_to_end(api_client, sessionmaker, documents)
 
     assert result["meta"] == {
         "job_id": job_id,
+        "agent": "parse",
         "model": MODEL,
-        "profile": None,
         "bbox_format": "yxyx_norm1000",
         "pipeline_version": PIPELINE_VERSION,
         "sha256": result["meta"]["sha256"],
@@ -150,7 +153,14 @@ async def test_parse_a_mixed_pdf_end_to_end(api_client, sessionmaker, documents)
     assert len(usage) == 3
     assert {row.model for row in usage} == {MODEL}
     assert sum(row.prompt_tokens for row in usage) == 2700
+    # Kano Proxy's reported cost is a list-price estimate, never billing.
+    assert {row.cost_source for row in usage} == {"estimated"}
     assert float(sum(row.cost for row in usage)) == pytest.approx(0.0045)
+    # The built-in upstream is Kano Proxy's OpenAI base, called with the user's own key,
+    # and the job's dedup snapshot is the Kano Proxy origin (docs/jobs.md § Dedup).
+    assert route.calls[0].request.headers["authorization"] == f"Bearer {KANO_KEY}"
+    assert (job.connection_id, job.connection_base_url) == (None, "https://kano.test")
+    assert job.agent == "parse"
 
     # Each page's figure crop was persisted before its render was deleted, addressed by
     # our page number and the cleaned bbox (docs/parsing.md § Figure crops).
@@ -161,7 +171,7 @@ async def test_parse_a_mixed_pdf_end_to_end(api_client, sessionmaker, documents)
 
 @respx.mock
 async def test_parse_an_image(api_client, sessionmaker, documents) -> None:
-    respx.post(CHAT_URL).mock(side_effect=_openrouter_stub)
+    respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
 
     accepted = await api_client.post(
         "/v1/parse",
@@ -195,7 +205,7 @@ async def test_parse_an_image(api_client, sessionmaker, documents) -> None:
 async def test_second_identical_upload_is_served_from_the_cache(
     api_client, sessionmaker, documents
 ) -> None:
-    respx.post(CHAT_URL).mock(side_effect=_openrouter_stub)
+    respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
     await _upload(api_client, documents["text_pdf"])
     await _drain_queue(api_client, sessionmaker)
     calls_after_first = respx.calls.call_count
@@ -221,7 +231,7 @@ async def test_a_page_that_cannot_be_transcribed_fails_alone(
 ) -> None:
     # A 400 is not retried, so the second response is the second page's.
     responses = [httpx.Response(400), _completion(VISION_MARKDOWN)]
-    respx.post(CHAT_URL).mock(side_effect=responses)
+    respx.post(KANO_CHAT_URL).mock(side_effect=responses)
 
     accepted = await _upload(api_client, documents["mixed_pdf"], pages="1,2")
     job_id = accepted.json()["job_id"]
@@ -238,12 +248,12 @@ async def test_a_page_that_cannot_be_transcribed_fails_alone(
 async def test_a_degraded_result_is_never_served_from_the_cache(
     api_client, sessionmaker, documents
 ) -> None:
-    respx.post(CHAT_URL).mock(side_effect=[httpx.Response(400), _completion(VISION_MARKDOWN)])
+    respx.post(KANO_CHAT_URL).mock(side_effect=[httpx.Response(400), _completion(VISION_MARKDOWN)])
     await _upload(api_client, documents["mixed_pdf"], pages="1,2")
     await _drain_queue(api_client, sessionmaker)
 
     # The same upload again: the stored result carries a failed page, so no cache hit.
-    respx.post(CHAT_URL).mock(side_effect=_openrouter_stub)
+    respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
     retried = await _upload(api_client, documents["mixed_pdf"], pages="1,2")
     assert retried.status_code == 202
     await _drain_queue(api_client, sessionmaker)
@@ -261,7 +271,7 @@ async def test_a_degraded_result_is_never_served_from_the_cache(
 async def test_a_wholly_failed_job_names_the_page_reasons(
     api_client, sessionmaker, documents
 ) -> None:
-    respx.post(CHAT_URL).mock(return_value=httpx.Response(400))
+    respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(400))
 
     accepted = await _upload(api_client, documents["text_pdf"])
     job_id = accepted.json()["job_id"]
@@ -276,7 +286,7 @@ async def test_a_wholly_failed_job_names_the_page_reasons(
 async def test_result_md_serves_the_markdown_as_a_file(
     api_client, sessionmaker, documents
 ) -> None:
-    respx.post(CHAT_URL).mock(side_effect=_openrouter_stub)
+    respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
     accepted = await _upload(api_client, documents["text_pdf"])
     job_id = accepted.json()["job_id"]
     await _drain_queue(api_client, sessionmaker)
@@ -291,7 +301,7 @@ async def test_result_md_serves_the_markdown_as_a_file(
 async def test_a_selected_prompt_preset_is_sent_and_keyed_into_the_cache(
     api_client, sessionmaker, documents
 ) -> None:
-    route = respx.post(CHAT_URL).mock(side_effect=_openrouter_stub)
+    route = respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
     created = await api_client.post(
         "/api/prompts",
         json={"name": "Tables only", "text": "Only tables from page {page}."},
@@ -300,7 +310,7 @@ async def test_a_selected_prompt_preset_is_sent_and_keyed_into_the_cache(
     assert created.status_code == 201
     preset_id = created.json()["id"]
     selected = await api_client.put(
-        "/api/settings", json={"prompt_preset_id": preset_id}, headers=CSRF_HEADERS
+        "/api/agents/parse/settings", json={"prompt_preset_id": preset_id}, headers=CSRF_HEADERS
     )
     assert selected.json()["prompt_preset_id"] == preset_id
 
@@ -321,7 +331,7 @@ async def test_a_selected_prompt_preset_is_sent_and_keyed_into_the_cache(
 
 @respx.mock
 async def test_a_second_402_aborts_the_job(api_client, sessionmaker, documents) -> None:
-    respx.post(CHAT_URL).mock(return_value=httpx.Response(402))
+    respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(402))
 
     accepted = await _upload(api_client, documents["mixed_pdf"])
     job_id = accepted.json()["job_id"]
@@ -341,7 +351,7 @@ async def test_rate_limits_back_off_and_shrink_the_job_budget(
     api_client, sessionmaker, documents, monkeypatch
 ) -> None:
     monkeypatch.setattr("sightread.jobs.runner.VISION_BACKOFF_BASE_SECONDS", 0.001)
-    respx.post(CHAT_URL).mock(
+    respx.post(KANO_CHAT_URL).mock(
         side_effect=[
             httpx.Response(429, headers={"Retry-After": "0"}),
             _completion(VISION_MARKDOWN),
@@ -362,7 +372,7 @@ async def test_a_transient_failure_is_retried_before_the_page_is_given_up(
     api_client, sessionmaker, documents, monkeypatch
 ) -> None:
     monkeypatch.setattr("sightread.jobs.runner.VISION_BACKOFF_BASE_SECONDS", 0.001)
-    respx.post(CHAT_URL).mock(
+    respx.post(KANO_CHAT_URL).mock(
         side_effect=[
             httpx.Response(503),
             httpx.ConnectError("reset"),
@@ -385,7 +395,7 @@ async def test_a_failure_that_stays_transient_fails_the_page_after_the_last_atte
     api_client, sessionmaker, documents, monkeypatch
 ) -> None:
     monkeypatch.setattr("sightread.jobs.runner.VISION_BACKOFF_BASE_SECONDS", 0.001)
-    respx.post(CHAT_URL).mock(return_value=httpx.Response(500))
+    respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(500))
 
     accepted = await _upload(api_client, documents["text_pdf"])
     job_id = accepted.json()["job_id"]
@@ -401,7 +411,7 @@ async def test_a_failure_that_stays_transient_fails_the_page_after_the_last_atte
 async def test_a_failure_that_would_repeat_is_not_retried(
     api_client, sessionmaker, documents
 ) -> None:
-    respx.post(CHAT_URL).mock(return_value=httpx.Response(400))
+    respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(400))
 
     await _upload(api_client, documents["text_pdf"])
     await _drain_queue(api_client, sessionmaker)
@@ -419,7 +429,7 @@ async def test_a_page_the_model_has_nothing_to_say_about_is_blank_not_failed(
     blank = httpx.Response(
         200, json={"choices": [{"message": {"content": None}, "finish_reason": "stop"}]}
     )
-    respx.post(CHAT_URL).mock(side_effect=[blank, _completion(VISION_MARKDOWN)])
+    respx.post(KANO_CHAT_URL).mock(side_effect=[blank, _completion(VISION_MARKDOWN)])
 
     accepted = await _upload(api_client, documents["mixed_pdf"], pages="1,2")
     job_id = accepted.json()["job_id"]
@@ -437,7 +447,7 @@ async def test_an_ambiguous_empty_completion_is_blank_only_after_every_attempt(
     api_client, sessionmaker, documents, monkeypatch
 ) -> None:
     monkeypatch.setattr("sightread.jobs.runner.VISION_BACKOFF_BASE_SECONDS", 0.001)
-    respx.post(CHAT_URL).mock(return_value=httpx.Response(200, json={"choices": []}))
+    respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(200, json={"choices": []}))
 
     accepted = await _upload(api_client, documents["mixed_pdf"], pages="1")
     job_id = accepted.json()["job_id"]
@@ -454,7 +464,7 @@ async def test_an_ambiguous_empty_completion_is_blank_only_after_every_attempt(
 async def test_events_replay_the_final_state_of_a_terminal_job(
     api_client, sessionmaker, documents
 ) -> None:
-    respx.post(CHAT_URL).mock(side_effect=_openrouter_stub)
+    respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
     accepted = await _upload(api_client, documents["text_pdf"])
     job_id = accepted.json()["job_id"]
     await _drain_queue(api_client, sessionmaker)
@@ -479,7 +489,7 @@ async def test_the_event_stream_follows_a_job_it_is_already_watching(
     make_client, sessionmaker, documents
 ) -> None:
     """The LISTEN/NOTIFY wakeup path, which only exists on PostgreSQL."""
-    respx.post(CHAT_URL).mock(side_effect=_openrouter_stub)
+    respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
     client = await _authorize(make_client(database_url=DATABASE_URL), sessionmaker)
     job_id = (await _upload(client, documents["text_pdf"])).json()["job_id"]
 
@@ -499,17 +509,16 @@ async def test_the_event_stream_follows_a_job_it_is_already_watching(
     assert "event: done" in body
 
 
-async def test_a_job_without_a_stored_key_fails_cleanly(
-    make_client, sessionmaker, documents
+async def test_a_queued_job_whose_kano_key_was_disconnected_fails_cleanly(
+    api_client, sessionmaker, documents
 ) -> None:
-    client = make_client()
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    created = await client.post("/api/keys", json={"name": "test"}, headers=CSRF_HEADERS)
-    client.headers["Authorization"] = f"Bearer {created.json()['key']}"
+    accepted = await _upload(api_client, documents["text_pdf"])
+    assert accepted.status_code == 202
+    disconnected = await api_client.delete("/api/kano", headers=CSRF_HEADERS)
+    assert disconnected.status_code == 204
 
-    accepted = await _upload(client, documents["text_pdf"])
-    await _drain_queue(client, sessionmaker)
+    await _drain_queue(api_client, sessionmaker)
 
-    status = (await client.get(f"/v1/jobs/{accepted.json()['job_id']}")).json()
+    status = (await api_client.get(f"/v1/jobs/{accepted.json()['job_id']}")).json()
     assert status["status"] == "failed"
-    assert status["error"] == "no OpenRouter key stored"
+    assert status["error"] == "Kano Proxy is not connected"

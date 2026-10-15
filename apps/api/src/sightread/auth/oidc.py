@@ -12,7 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings
-from ..db.models import User, UserSettings
+from ..db.models import User
 
 GOOGLE_METADATA_URL = "https://accounts.google.com/.well-known/openid-configuration"
 DEV_USER_EMAIL = "dev@localhost"
@@ -55,8 +55,6 @@ async def upsert_user(
     if user is None:
         user = User(google_sub=google_sub, email=email, name=name, picture=picture)
         db.add(user)
-        await db.flush()
-        db.add(UserSettings(user_id=user.id))
         await db.flush()
         return user
     user.email = email

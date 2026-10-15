@@ -1,6 +1,6 @@
-"""Upstream vision client — the only module that talks to a vision upstream (OpenRouter
-or a user-defined OpenAI-compatible connection) and the only one that ever holds a
-decrypted user key (docs/project-structure.md).
+"""Upstream client — the module that calls a model upstream (the built-in Kano Proxy or a
+user-defined OpenAI-compatible connection) and the only one that ever decrypts a stored
+user key (docs/project-structure.md).
 
 Key material is never logged and never appears in raised messages.
 """
@@ -13,9 +13,8 @@ import ipaddress
 import json
 import re
 import socket
-import time
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -23,27 +22,17 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..auth.crypto import decrypt_connection_key, decrypt_openrouter_key
+from ..auth.crypto import decrypt_connection_key, decrypt_kano_proxy_key
+from ..config import Settings
 from ..db.models import (
     COST_SOURCE_ESTIMATED,
-    COST_SOURCE_OPENROUTER,
     COST_SOURCE_UNKNOWN,
-    OpenRouterKey,
+    AgentSetting,
+    KanoProxyKey,
     ProviderConnection,
 )
 from ..errors import ApiError
 
-BASE_URL = "https://openrouter.ai/api/v1"
-MODELS_URL = f"{BASE_URL}/models"
-KEY_URL = f"{BASE_URL}/key"
-CHAT_URL = f"{BASE_URL}/chat/completions"
-
-# The two upstream wire flavours (docs/api.md § Upstreams). Both speak OpenAI Chat
-# Completions; only OpenRouter takes its `usage: {include}` extension field.
-KIND_OPENROUTER = "openrouter"
-KIND_OPENAI = "openai"
-
-MODELS_CACHE_TTL_SECONDS = 3600
 REQUEST_TIMEOUT_SECONDS = 20.0
 # A page of dense text can take a vision model a while; this is the whole-request ceiling.
 CHAT_TIMEOUT_SECONDS = 180.0
@@ -60,59 +49,6 @@ MAX_REPORTED_COST = Decimal("999999.999999")
 
 # Model answers sometimes arrive wrapped in a fence despite the prompt.
 _CODE_FENCE_RE = re.compile(r"^\s*```[a-zA-Z]*\s*|\s*```\s*$")
-
-# In-process catalog cache: (fetched_at, models). One hour per docs/api.md § GET /v1/models.
-_models_cache: tuple[float, list[dict]] | None = None
-
-
-def reset_models_cache() -> None:
-    global _models_cache
-    _models_cache = None
-
-
-async def validate_api_key(candidate: str) -> bool:
-    """Check a user-supplied OpenRouter key before storing it (docs/auth.md § 3).
-
-    Returns False for a rejected key; raises `ApiError(upstream)` when OpenRouter itself
-    is unhealthy, so a provider outage is never reported as a bad key.
-    """
-    try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-            response = await client.get(KEY_URL, headers={"Authorization": f"Bearer {candidate}"})
-    except httpx.HTTPError as exc:
-        raise ApiError(502, "upstream", "Could not reach OpenRouter to validate the key") from exc
-    if response.status_code == 200:
-        return True
-    if response.status_code in (401, 403):
-        return False
-    raise ApiError(502, "upstream", f"OpenRouter returned {response.status_code} for key check")
-
-
-async def fetch_image_models(now: float | None = None) -> list[dict]:
-    """The model catalog filtered to image-input models, cached in process for an hour.
-
-    The upstream catalog endpoint needs no credentials, so this never touches a user key.
-    """
-    global _models_cache
-    now = time.monotonic() if now is None else now
-    if _models_cache is not None and now - _models_cache[0] < MODELS_CACHE_TTL_SECONDS:
-        return _models_cache[1]
-
-    try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-            response = await client.get(MODELS_URL)
-            response.raise_for_status()
-            payload = response.json()
-    except httpx.HTTPError as exc:
-        raise ApiError(502, "upstream", "Could not reach the OpenRouter model catalog") from exc
-
-    models = [
-        model
-        for model in payload.get("data", [])
-        if "image" in (model.get("architecture") or {}).get("input_modalities", [])
-    ]
-    _models_cache = (now, models)
-    return models
 
 
 # --- provider connections (user-defined OpenAI-compatible endpoints) ------------------
@@ -231,13 +167,41 @@ async def stored_connection_models(
     )
 
 
+async def agent_models(
+    db: AsyncSession, settings: Settings, user_id: int, agent: str
+) -> list[dict]:
+    """The live catalog of the upstream an agent is set to — Kano Proxy or a connection —
+    fetched with the stored key (docs/api.md § GET /v1/models). No capability filtering
+    yet (docs/agents.md), and no cache: the picker shows what the upstream says now."""
+    connection_id = (
+        await db.execute(
+            select(AgentSetting.connection_id).where(
+                AgentSetting.user_id == user_id, AgentSetting.agent == agent
+            )
+        )
+    ).scalar_one_or_none()
+    connection = await load_connection(db, settings, user_id, connection_id)
+    if connection is None:
+        if connection_id is not None:
+            raise ApiError(400, "invalid_request", "The selected connection no longer exists")
+        if not settings.kano_proxy_configured:
+            raise ApiError(503, "upstream", "Kano Proxy is not configured on this deployment")
+        raise ApiError(400, "invalid_request", "Kano Proxy is not connected")
+    return await fetch_connection_models(
+        connection.base_url,
+        connection.api_key(),
+        max_bytes=settings.upstream_response_max_bytes,
+    )
+
+
 async def fetch_connection_models(
     base_url: str, api_key: str, max_bytes: int = DEFAULT_RESPONSE_MAX_BYTES
 ) -> list[dict]:
     """The model catalog of an OpenAI-compatible endpoint — also the save-time key check.
 
-    `GET {base_url}/models` is free on every OpenAI-format server we care about, so it
-    doubles as validation without spending the user's money (docs/auth.md § 3).
+    `GET {base_url}/models` is free on every OpenAI-format server we care about (Kano
+    Proxy's `/openai/v1` included), so it doubles as validation without spending the
+    user's money (docs/auth.md § 3).
     """
     try:
         async with (
@@ -324,23 +288,25 @@ class Connection:
     """A resolved upstream: where to call, and the still-encrypted key to call it with.
 
     Only this module ever opens the ciphertext, and the plaintext never leaves the request
-    it authorises (docs/project-structure.md). The default field values are the built-in
-    OpenRouter upstream; a provider connection carries its own base URL and kind, and
-    whether its reported cost is recorded (`report_cost`, docs/parsing.md § Upstream usage).
+    it authorises (docs/project-structure.md). `builtin` is the Kano Proxy upstream, whose
+    reported cost is always recorded as an estimate; a provider connection records its
+    cost only when the user opted in (`report_cost`, docs/parsing.md § Upstream usage).
+    `snapshot` is what the job's dedup key stores for this upstream (docs/jobs.md § Dedup).
     """
 
     ciphertext: bytes
     secret_key: str
-    base_url: str = BASE_URL
-    kind: str = KIND_OPENROUTER
+    base_url: str
+    snapshot: str
+    builtin: bool = False
     report_cost: bool = False
 
     def __repr__(self) -> str:  # never let key material reach a log line
         return "Connection(...)"
 
-    def authorization(self) -> str:
-        decrypt = decrypt_openrouter_key if self.kind == KIND_OPENROUTER else decrypt_connection_key
-        return f"Bearer {decrypt(self.secret_key, self.ciphertext)}"
+    def api_key(self) -> str:
+        decrypt = decrypt_kano_proxy_key if self.builtin else decrypt_connection_key
+        return decrypt(self.secret_key, self.ciphertext)
 
 
 @dataclass(frozen=True)
@@ -359,16 +325,26 @@ class PageTranscription:
 
 
 async def load_connection(
-    db: AsyncSession, secret_key: str, user_id: int, connection_id: int | None
+    db: AsyncSession, settings: Settings, user_id: int, connection_id: int | None
 ) -> Connection | None:
-    """The upstream a job calls: OpenRouter when `connection_id` is NULL, else that
-    provider connection (docs/api.md § Upstreams). None when the credential is gone."""
+    """The upstream to call: Kano Proxy when `connection_id` is NULL, else that provider
+    connection (docs/api.md § Upstreams). None when the credential is gone — no Kano Proxy
+    key stored, Kano Proxy not configured, or the connection deleted."""
     if connection_id is None:
+        if not settings.kano_proxy_configured:
+            return None
         row = (
-            await db.execute(select(OpenRouterKey).where(OpenRouterKey.user_id == user_id))
+            await db.execute(select(KanoProxyKey).where(KanoProxyKey.user_id == user_id))
         ).scalar_one_or_none()
-        return (
-            None if row is None else Connection(ciphertext=row.ciphertext, secret_key=secret_key)
+        if row is None:
+            return None
+        return Connection(
+            ciphertext=row.ciphertext,
+            secret_key=settings.secret_key,
+            base_url=settings.kano_proxy_api_base,
+            snapshot=settings.kano_proxy_base_url,
+            builtin=True,
+            report_cost=True,
         )
     connection = (
         await db.execute(
@@ -381,9 +357,9 @@ async def load_connection(
         return None
     return Connection(
         ciphertext=connection.ciphertext,
-        secret_key=secret_key,
+        secret_key=settings.secret_key,
         base_url=connection.base_url,
-        kind=KIND_OPENAI,
+        snapshot=connection.base_url,
         report_cost=connection.report_cost,
     )
 
@@ -404,25 +380,18 @@ def _int(value: object) -> int:
 def _usage(payload: dict, connection: Connection) -> Usage:
     """Token counts from any upstream, and the cost tagged with where it came from.
 
-    OpenRouter's cost is its billing. A provider connection's cost is recorded only when
-    the user opted in (`report_cost`), and then only as an estimate; otherwise, or when the
-    reported value is not a usable number, the cost is unknown — never 0, and never mixed
-    into billed totals (docs/parsing.md § Upstream usage).
+    A reported cost is recorded only as an estimate — always for Kano Proxy (list prices),
+    and for a provider connection only when the user opted in (`report_cost`). Otherwise,
+    or when the reported value is not a usable number, the cost is unknown — never 0
+    (docs/parsing.md § Upstream usage).
     """
     raw = payload.get("usage") or {}
     prompt_tokens = _int(raw.get("prompt_tokens"))
     completion_tokens = _int(raw.get("completion_tokens"))
 
-    if connection.kind == KIND_OPENROUTER:
-        try:
-            cost = Decimal(str(raw.get("cost", "0"))).quantize(COST_QUANTUM)
-        except (InvalidOperation, ValueError):
-            cost = Decimal("0")
-        return Usage(prompt_tokens, completion_tokens, cost, COST_SOURCE_OPENROUTER)
-
     reported = raw.get("cost")
     # A JSON number only: `bool` is an `int` to Python, and a string is not what an
-    # OpenRouter-compatible `usage.cost` is. `json` also parses NaN and Infinity.
+    # OpenAI-compatible `usage.cost` is. `json` also parses NaN and Infinity.
     if (
         connection.report_cost
         and isinstance(reported, int | float)
@@ -468,7 +437,7 @@ def _is_transient(status: int) -> bool:
 
 
 def _raise_for_error_payload(payload: dict) -> None:
-    """OpenRouter-style servers can report a provider failure inside a 200 response."""
+    """Some OpenAI-compatible servers report a provider failure inside a 200 response."""
     error = payload.get("error")
     if not isinstance(error, dict):
         return
@@ -497,17 +466,13 @@ async def _chat_with_image(
             }
         ],
     }
-    if connection.kind == KIND_OPENROUTER:
-        # Ask for token counts and the actual cost; never price locally (docs/parsing.md).
-        # OpenRouter-only: a generic OpenAI server would reject the unknown field.
-        body["usage"] = {"include": True}
     try:
         async with (
             httpx.AsyncClient(timeout=CHAT_TIMEOUT_SECONDS) as client,
             client.stream(
                 "POST",
                 f"{connection.base_url}/chat/completions",
-                headers={"Authorization": connection.authorization()},
+                headers={"Authorization": f"Bearer {connection.api_key()}"},
                 json=body,
             ) as response,
         ):

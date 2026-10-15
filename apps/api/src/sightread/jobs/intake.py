@@ -21,14 +21,13 @@ from typing import Protocol
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..agents import PARSE, AgentDefinition
 from ..auth import upload_tickets
 from ..config import Settings
-from ..db.models import Job, Result, UploadTicket, User
+from ..db.models import AgentSetting, Job, KanoProxyKey, Result, UploadTicket, User
 from ..errors import ApiError
 from ..parsing import poppler
 from ..parsing.images import ACCEPTED_IMAGE_TYPES, ImageError, probe_image
-from ..parsing.profiles import BBOX_FORMAT_YXYX, get_profile, transcription_prompt_template
-from ..upstream.openrouter import fetch_image_models
 from .queue import (
     count_running_jobs,
     enqueue_job,
@@ -118,82 +117,74 @@ def resolve_kind(filename: str, media_type: str) -> tuple[str, str]:
 
 @dataclass(frozen=True)
 class Target:
-    """What a job will run: model, profile facts, prompt and the upstream it calls.
+    """What a job will run: agent, model, prompt and the upstream it calls.
 
     `connection_base_url` snapshots the endpoint at enqueue time — part of the dedup key,
-    so editing a connection's URL invalidates the old endpoint's cached results.
+    so editing a connection's URL invalidates the old endpoint's cached results, and the
+    built-in upstream's snapshot (KANO_PROXY_BASE_URL) keeps historical OpenRouter results
+    from ever answering (docs/jobs.md § Dedup).
     """
 
+    agent: str
     model: str
-    profile: str | None
-    profile_version: int
     bbox_format: str
     prompt: str
     connection_id: int | None
-    connection_base_url: str | None
+    connection_base_url: str
 
 
-async def resolve_target(user: User, model: str | None, profile_id: str | None) -> Target:
-    """Model, profile, bbox format, prompt template and upstream for this job.
+async def resolve_target(
+    db: AsyncSession,
+    settings: Settings,
+    user: User,
+    agent: AgentDefinition,
+    model: str | None,
+) -> Target:
+    """Upstream, model and prompt for a job of `agent`, from that agent's settings
+    (docs/agents.md § Enqueue rules). A per-request `model` overrides the stored one; the
+    selected prompt preset replaces the agent's default template (docs/parsing.md §
+    Prompts)."""
+    row = (
+        await db.execute(
+            select(AgentSetting).where(
+                AgentSetting.user_id == user.id, AgentSetting.agent == agent.name
+            )
+        )
+    ).scalar_one_or_none()
+    connection = row.connection if row else None
 
-    A preset profile resolves its model from the live OpenRouter catalog. A raw model id
-    runs the default prompt and is untested by us. The user's selected prompt preset, when
-    one is set, replaces the template in every case (docs/parsing.md § Prompts). When the
-    user's default connection is a custom OpenAI-compatible endpoint, profiles do not
-    apply and the model comes from the connection itself — a connection is a complete
-    profile, so `user_settings.default_model` never applies to it (docs/api.md §
-    Upstreams).
-    """
-    settings_row = user.settings
-    preset = settings_row.prompt_preset if settings_row else None
-    custom_prompt = preset.text if preset else None
-    connection = settings_row.default_connection if settings_row else None
-    if not model and not profile_id and connection is None:
-        profile_id = settings_row.default_profile if settings_row else None
-        model = settings_row.default_model if settings_row else None
-    if model and profile_id:
-        raise ApiError(400, "invalid_request", "Pass either 'model' or 'profile', not both")
-
-    if connection is not None:
-        if profile_id:
+    if connection is None:
+        if not settings.kano_proxy_configured:
+            raise ApiError(
+                503,
+                "upstream",
+                f"Kano Proxy is not configured on this deployment: choose a provider "
+                f"connection for the {agent.name} agent in Settings",
+            )
+        connected = (
+            await db.execute(select(KanoProxyKey.user_id).where(KanoProxyKey.user_id == user.id))
+        ).first()
+        if connected is None:
             raise ApiError(
                 400,
                 "invalid_request",
-                "Profiles run on OpenRouter only; pass 'model' or switch back to OpenRouter",
+                f"Kano Proxy is not connected: connect it in Settings or choose a provider "
+                f"connection for the {agent.name} agent",
             )
-        # An explicit request model still overrides; the connection's own model is the
-        # default. NULL only on rows that predate the model column (docs/database.md).
-        model = model or connection.model
-        if not model:
-            raise ApiError(
-                400,
-                "invalid_request",
-                "No model configured: pass 'model' or set one on the connection",
-            )
-        prompt = custom_prompt or transcription_prompt_template(None)
-        return Target(
-            model, None, 0, BBOX_FORMAT_YXYX, prompt, connection.id, connection.base_url
+        connection_id, snapshot = None, settings.kano_proxy_base_url
+    else:
+        connection_id, snapshot = connection.id, connection.base_url
+
+    model = model or (row.model if row else None)
+    if not model:
+        raise ApiError(
+            400,
+            "invalid_request",
+            f"No model chosen for the {agent.name} agent: pick one in Settings or pass 'model'",
         )
-
-    if profile_id:
-        profile = get_profile(profile_id)
-        if profile is None:
-            raise ApiError(400, "invalid_request", f"Unknown profile '{profile_id}'")
-        resolved = profile.resolve_model(await fetch_image_models())
-        if resolved is None:
-            raise ApiError(503, "upstream", f"Profile '{profile_id}' has no available model")
-        prompt = custom_prompt or profile.prompt_template
-        return Target(
-            resolved, profile.id, profile.profile_version, profile.bbox_format, prompt, None, None
-        )
-
-    if model:
-        prompt = custom_prompt or transcription_prompt_template(None)
-        return Target(model, None, 0, BBOX_FORMAT_YXYX, prompt, None, None)
-
-    raise ApiError(
-        400, "invalid_request", "No model configured: pass 'model' or 'profile', or set a default"
-    )
+    preset = row.prompt_preset if row else None
+    prompt = preset.text if preset else agent.default_prompt_template
+    return Target(agent.name, model, agent.bbox_format, prompt, connection_id, snapshot)
 
 
 async def store_upload(
@@ -246,7 +237,6 @@ async def submit_parse(
     media_type: str,
     filename: str,
     model: str | None = None,
-    profile_id: str | None = None,
     pages: str | None = None,
     force: bool = False,
     ticket: UploadTicket | None = None,
@@ -263,7 +253,8 @@ async def submit_parse(
     buy the user a second parse of a document they already paid for (docs/jobs.md § Dedup).
     """
     kind, media_type = resolve_kind(filename, media_type)
-    target = await resolve_target(user, model, profile_id)
+    # An upload is always the parse agent's input (docs/agents.md).
+    target = await resolve_target(db, settings, user, PARSE, model)
     prompt_sha256 = hashlib.sha256(target.prompt.encode()).hexdigest()
 
     if await count_running_jobs(db, user.id) >= settings.max_jobs_per_user:
@@ -290,12 +281,11 @@ async def submit_parse(
 
     key = {
         "user_id": user.id,
+        "agent": target.agent,
         "sha256": sha256,
         "model": target.model,
         "connection_id": target.connection_id,
         "connection_base_url": target.connection_base_url,
-        "profile": target.profile,
-        "profile_version": target.profile_version,
         "pages_spec": pages_spec,
         "prompt_sha256": prompt_sha256,
     }
@@ -338,6 +328,7 @@ async def submit_parse(
     job = await enqueue_job(
         db,
         user_id=user.id,
+        agent=target.agent,
         kind=kind,
         filename=filename,
         media_type=media_type,
@@ -347,8 +338,6 @@ async def submit_parse(
         model=target.model,
         connection_id=target.connection_id,
         connection_base_url=target.connection_base_url,
-        profile=target.profile,
-        profile_version=target.profile_version,
         bbox_format=target.bbox_format,
         prompt=target.prompt,
         prompt_sha256=prompt_sha256,

@@ -19,20 +19,26 @@ from sightread.auth.sessions import SESSION_COOKIE, create_session
 from sightread.db.models import Document, Job, JobPage, Result, User
 from sightread.routes.library import DOCUMENT_NAME_MAX, free_name
 from tests.conftest import CSRF_HEADERS
+from tests.test_parse_end_to_end import _connect_kano
 
 MODEL = "vendor/vision-model"
 
 
+async def _ready_to_parse(client: AsyncClient) -> None:
+    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    user_id = (await client.get("/api/me")).json()["user"]["id"]
+    await _connect_kano(client.app.state.sessionmaker, user_id)
+    chosen = await client.put(
+        "/api/agents/parse/settings", json={"model": MODEL}, headers=CSRF_HEADERS
+    )
+    assert chosen.status_code == 200
+
+
 @pytest.fixture
 async def library(client: AsyncClient) -> AsyncClient:
-    """A signed-in client whose account can enqueue a parse (a default model is set)."""
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    settings = await client.put(
-        "/api/settings",
-        json={"default_model": MODEL, "default_profile": None},
-        headers=CSRF_HEADERS,
-    )
-    assert settings.status_code == 200
+    """A signed-in client whose account can enqueue a parse (Kano Proxy connected, a
+    model chosen for the parse agent)."""
+    await _ready_to_parse(client)
     return client
 
 
@@ -232,12 +238,7 @@ async def test_a_body_past_the_cap_is_refused_while_it_streams(make_client, docu
     # No `Content-Length` to reject up front: the parser spools file parts to disk as they
     # arrive, so the cap has to bite on the stream itself.
     client = make_client(upload_max_bytes=1024)
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    await client.put(
-        "/api/settings",
-        json={"default_model": MODEL, "default_profile": None},
-        headers=CSRF_HEADERS,
-    )
+    await _ready_to_parse(client)
 
     boundary = "sightreadtestboundary"
 

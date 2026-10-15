@@ -37,6 +37,15 @@ class Settings(BaseSettings):
 
     auth_dev_mode: bool = False
 
+    # Kano Proxy, the built-in upstream (docs/auth.md § 6). The origin only: vision calls
+    # go to `{origin}/openai/v1`, consent to `{origin}/connect/authorize`, the token
+    # exchange to `{origin}/api/connect/token`. Any of the three empty = unavailable.
+    kano_proxy_base_url: str = ""
+    kano_proxy_client_id: str = ""
+    kano_proxy_client_secret: str = ""
+    # Lifetime of a pending connect state (state + PKCE verifier).
+    kano_connect_ttl_seconds: int = 600
+
     upload_max_bytes: int = 134_217_728
     page_cap: int = 500
     max_jobs_per_user: int = 2
@@ -67,6 +76,9 @@ class Settings(BaseSettings):
             if self.app_env != "local":
                 raise ValueError("SECRET_KEY is required when APP_ENV is not 'local'")
             self.secret_key = LOCAL_FALLBACK_SECRET_KEY
+        # One spelling of the origin everywhere it is joined or compared — the dedup
+        # snapshot included (docs/jobs.md § Dedup).
+        self.kano_proxy_base_url = self.kano_proxy_base_url.strip().rstrip("/")
         return self
 
     @property
@@ -77,6 +89,22 @@ class Settings(BaseSettings):
     @property
     def google_oidc_configured(self) -> bool:
         return bool(self.google_client_id and self.google_client_secret)
+
+    @property
+    def kano_proxy_configured(self) -> bool:
+        return bool(
+            self.kano_proxy_base_url and self.kano_proxy_client_id and self.kano_proxy_client_secret
+        )
+
+    @property
+    def kano_proxy_api_base(self) -> str:
+        """The OpenAI-compatible base vision calls and the model catalog use."""
+        return f"{self.kano_proxy_base_url}/openai/v1"
+
+    @property
+    def kano_redirect_uri(self) -> str:
+        """Exactly what the authorize request and the token exchange both send."""
+        return f"{self.app_url.rstrip('/')}/api/kano/callback"
 
     def web_url_for_locale(self, prefix: str) -> str:
         """`WEB_URL`, prefixed when the visitor picked a non-default locale.

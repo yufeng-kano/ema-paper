@@ -16,6 +16,7 @@ from sqlalchemy import select
 from starlette.datastructures import UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser
 
+from ..agents import PARSE
 from ..auth.deps import (
     AppSettings,
     DbSession,
@@ -37,8 +38,7 @@ from ..jobs.intake import (
     upload_chunks,
 )
 from ..jobs.runner import result_payload
-from ..parsing.profiles import PRESET_PROFILES
-from ..upstream.openrouter import fetch_image_models
+from ..upstream.client import agent_models
 
 router = APIRouter(prefix="/v1", tags=["data"])
 
@@ -52,56 +52,14 @@ class ParseJson(BaseModel):
     filename: str = Field(default="upload", max_length=512)
     media_type: str = Field(default=PDF_MEDIA_TYPE, max_length=128)
     model: str | None = Field(default=None, max_length=255)
-    profile: str | None = Field(default=None, max_length=64)
     pages: str | None = Field(default=None, max_length=255)
     force: bool = False
 
 
 @router.get("/models")
-async def list_models(user: ReaderUser):
-    """Image-input models from the live OpenRouter catalog, cached in process for ~1 h.
-
-    `recommended` marks the models the preset profiles currently resolve to.
-    """
-    catalog = await fetch_image_models()
-    recommended = {
-        model_id
-        for model_id in (profile.resolve_model(catalog) for profile in PRESET_PROFILES)
-        if model_id
-    }
-    return {
-        "data": [
-            {
-                "id": model["id"],
-                "name": model.get("name"),
-                "context_length": model.get("context_length"),
-                "pricing": model.get("pricing"),
-                "recommended": model["id"] in recommended,
-            }
-            for model in catalog
-        ]
-    }
-
-
-@router.get("/profiles")
-async def list_profiles(user: ReaderUser):
-    """Preset profiles with the model each currently resolves to from the live catalog."""
-    catalog = await fetch_image_models()
-    profiles = []
-    for profile in PRESET_PROFILES:
-        model_id = profile.resolve_model(catalog)
-        profiles.append(
-            {
-                "id": profile.id,
-                "name": profile.name,
-                "description": profile.description,
-                "model": model_id,
-                "bbox_format": profile.bbox_format,
-                "profile_version": profile.profile_version,
-                "available": model_id is not None,
-            }
-        )
-    return {"data": profiles}
+async def list_models(user: ReaderUser, db: DbSession, settings: AppSettings):
+    """The live catalog of the caller's parse upstream (docs/api.md § GET /v1/models)."""
+    return {"data": await agent_models(db, settings, user.id, PARSE.name)}
 
 
 # --- parse ----------------------------------------------------------------------------
@@ -157,9 +115,8 @@ async def parse(request: Request, caller: UploaderCaller, db: DbSession, setting
             raise ApiError(400, "invalid_request", "Multipart requests need a 'file' part")
         filename = upload.filename or "upload"
         media_type = upload.content_type or ""
-        model, profile_id, pages, force = (
+        model, pages, force = (
             _form_value(form, "model"),
-            _form_value(form, "profile"),
             _form_value(form, "pages"),
             _form_value(form, "force") in ("1", "true", "yes"),
         )
@@ -172,7 +129,7 @@ async def parse(request: Request, caller: UploaderCaller, db: DbSession, setting
                 400, "invalid_request", "Body must be multipart/form-data or JSON with 'source'"
             ) from exc
         filename, media_type = body.filename, body.media_type
-        model, profile_id, pages, force = body.model, body.profile, body.pages, body.force
+        model, pages, force = body.model, body.pages, body.force
         chunks = base64_chunks(body.source)
 
     submission = await submit_parse(
@@ -183,7 +140,6 @@ async def parse(request: Request, caller: UploaderCaller, db: DbSession, setting
         media_type=media_type,
         filename=filename,
         model=model,
-        profile_id=profile_id,
         pages=pages,
         force=force,
         ticket=caller.ticket,

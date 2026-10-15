@@ -7,21 +7,19 @@ session, exchange the code, then use the token where a project API key would go.
 from __future__ import annotations
 
 import re
+import uuid
 from datetime import timedelta
 from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
-import respx
 from authlib.oauth2.rfc7636 import create_s256_code_challenge
 from httpx import AsyncClient
 from sqlalchemy import select
 
 from sightread.auth.crypto import hash_token
 from sightread.db.models import OAuthGrant, utcnow
-from sightread.upstream.openrouter import MODELS_URL, reset_models_cache
 from tests.conftest import CSRF_HEADERS, mcp_running
-from tests.test_models_and_profiles import CATALOG
 
 REDIRECT_URI = "https://claude.ai/api/mcp/auth_callback"
 VERIFIER = "verifier-that-is-long-enough-for-pkce-1234567890"
@@ -29,13 +27,6 @@ CHALLENGE = create_s256_code_challenge(VERIFIER)
 STATE = "opaque-client-state"
 
 CONSENT_TOKEN_RE = re.compile(r"name='consent_token' value='([^']+)'")
-
-
-@pytest.fixture(autouse=True)
-def clear_catalog_cache():
-    reset_models_cache()
-    yield
-    reset_models_cache()
 
 
 async def _register(client: AsyncClient, redirect_uri: str = REDIRECT_URI) -> httpx.Response:
@@ -119,9 +110,7 @@ async def test_discovery_documents_point_at_this_deployment(client: AsyncClient)
         assert resource["authorization_servers"] == ["http://localhost:8000"]
 
 
-@respx.mock
 async def test_the_connector_flow_ends_in_a_working_bearer(client: AsyncClient) -> None:
-    respx.get(MODELS_URL).mock(return_value=httpx.Response(200, json=CATALOG))
     _, tokens = await _connected(client)
 
     assert tokens["token_type"] == "Bearer"
@@ -129,11 +118,11 @@ async def test_the_connector_flow_ends_in_a_working_bearer(client: AsyncClient) 
     assert tokens["scope"] == "parse"
 
     # Same rights as a project API key: the data plane accepts either (docs/auth.md).
-    models = await client.get(
-        "/v1/models", headers={"Authorization": f"Bearer {tokens['access_token']}"}
+    # An unknown job is a 404 to an authenticated caller and a 401 to anyone else.
+    job = await client.get(
+        f"/v1/jobs/{uuid.uuid4()}", headers={"Authorization": f"Bearer {tokens['access_token']}"}
     )
-    assert models.status_code == 200
-    assert models.json()["data"]
+    assert job.status_code == 404
 
     async with mcp_running(client):
         mcp = await client.post(
@@ -247,13 +236,12 @@ async def test_a_code_cannot_be_exchanged_twice(client: AsyncClient) -> None:
     assert replayed.json()["error"] == "invalid_grant"
 
 
-@respx.mock
 @pytest.mark.parametrize("kill", ["expire", "revoke"])
 async def test_a_dead_access_token_is_a_401(client: AsyncClient, sessionmaker, kill: str) -> None:
-    respx.get(MODELS_URL).mock(return_value=httpx.Response(200, json=CATALOG))
     _, tokens = await _connected(client)
     headers = {"Authorization": f"Bearer {tokens['access_token']}"}
-    assert (await client.get("/v1/models", headers=headers)).status_code == 200
+    probe = f"/v1/jobs/{uuid.uuid4()}"
+    assert (await client.get(probe, headers=headers)).status_code == 404
 
     async with sessionmaker() as db:
         grant = (
@@ -269,7 +257,7 @@ async def test_a_dead_access_token_is_a_401(client: AsyncClient, sessionmaker, k
             grant.revoked_at = utcnow()
         await db.commit()
 
-    assert (await client.get("/v1/models", headers=headers)).status_code == 401
+    assert (await client.get(probe, headers=headers)).status_code == 401
 
 
 async def test_consent_needs_the_form_token_from_this_session(client: AsyncClient) -> None:

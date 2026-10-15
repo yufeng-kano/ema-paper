@@ -158,8 +158,8 @@ TicketJobId = Annotated[uuid.UUID, Depends(require_ticket_job)]
 
 
 async def require_reader_user(request: Request, db: DbSession) -> User:
-    """`GET /v1/models` and `/v1/profiles` are safe reads the web app also calls, so they
-    accept either a session cookie or an API key (docs/web.md)."""
+    """`GET /v1/models` is a safe read, so it accepts either a session cookie or a bearer
+    credential (docs/api.md)."""
     if request.headers.get("authorization"):
         return await require_bearer_user(request, db)
     return await require_session_user(request, db)

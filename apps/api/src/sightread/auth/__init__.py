@@ -1,1 +1,1 @@
-"""Credential handling: sessions, API keys, OpenRouter key encryption, OIDC."""
+"""Credential handling: sessions, API keys, upstream key encryption, OIDC."""
