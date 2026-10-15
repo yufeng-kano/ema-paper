@@ -311,6 +311,7 @@ async function showResult(job: JobSummary) {
           :row-key="(job) => job.job_id"
           :caption="t('history.listTitle')"
           :row-attrs="rowAttrs"
+          :class="{ holding: press.holding.value }"
         >
           <!-- The filename is the affordance: it is the row's identity and the thing worth
                opening, so it carries the underline rather than a separate icon button at the
@@ -490,14 +491,15 @@ async function showResult(job: JobSummary) {
   border-color: var(--danger-edge);
 }
 
-/* On touch, a row is held, not selected: a long press that starts a text selection cannot
-   become a menu. Only there — with a mouse the menu is a right-click, and a filename, model
-   id or error stays copyable. */
-@media (hover: none) {
-  :deep(tbody tr) {
-    user-select: none;
-    -webkit-touch-callout: none;
-  }
+/* A held row is not selected: a long press that starts a text selection cannot become a
+   menu. Only while a touch is down — with a mouse the menu is a right-click, and a filename,
+   model id or error stays copyable. The callout is touch-only anyway, so it is off always. */
+:deep(tbody tr) {
+  -webkit-touch-callout: none;
+}
+
+.holding :deep(tbody tr) {
+  user-select: none;
 }
 
 .file-cell {

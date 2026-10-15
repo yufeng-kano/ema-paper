@@ -118,8 +118,9 @@ function choose() {
 
 async function createHere() {
   const name = newName.value.trim()
-  // Re-checked here: the tree stays clickable while the field is open.
-  if (!name || creating.value || !canCreateHere.value) {
+  // Re-checked here: the tree stays clickable while the field is open. And never beside a
+  // move or add in flight — that one closes the dialog, taking this one's outcome with it.
+  if (!name || busy.value || !canCreateHere.value) {
     return
   }
   creating.value = true
@@ -183,17 +184,21 @@ const canChoose = computed(
             :id="id"
             v-model="newName"
             :maxlength="FOLDER_NAME_MAX"
-            :disabled="creating"
+            :disabled="busy"
             required
           />
-          <UiButton type="submit" :disabled="!newName.trim() || !canCreateHere" :loading="creating">
+          <UiButton
+            type="submit"
+            :disabled="!newName.trim() || !canCreateHere || pending"
+            :loading="creating"
+          >
             {{ t('files.create') }}
           </UiButton>
           <UiButton
             variant="ghost"
             icon-only
             :label="t('common.cancel')"
-            :disabled="creating"
+            :disabled="busy"
             @click="stopNaming()"
           >
             <template #icon><UiIcon name="close" /></template>

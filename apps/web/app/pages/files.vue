@@ -484,6 +484,16 @@ async function commit(action: () => Promise<unknown>): Promise<boolean> {
   }
 }
 
+/**
+ * A folder the move picker made, added locally rather than by a re-read: an unawaited read
+ * started here could land after the move that follows and put the moved item back.
+ */
+function addFolder(folder: LibraryFolder) {
+  if (data.value) {
+    data.value = { ...data.value, folders: [...data.value.folders, folder] }
+  }
+}
+
 async function submitNewFolder() {
   const name = newFolderName.value.trim()
   if (!name) {
@@ -1217,7 +1227,7 @@ function rowAttrs(row: Row): Record<string, unknown> {
       :pending="busy"
       :error="mutationError"
       @choose="submitMove"
-      @created="refresh()"
+      @created="addFolder"
       @cancel="moving = null"
     />
 
