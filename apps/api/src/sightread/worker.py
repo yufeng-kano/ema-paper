@@ -19,7 +19,13 @@ from sqlalchemy.exc import SQLAlchemyError
 from .config import get_settings
 from .db.session import create_engine, create_sessionmaker
 from .jobs.chat_runner import run_turn
-from .jobs.queue import claim_next_job, claim_next_turn, fail_turn, requeue_job
+from .jobs.queue import (
+    claim_next_job,
+    claim_next_turn,
+    fail_orphaned_turns,
+    fail_turn,
+    requeue_job,
+)
 from .jobs.runner import run_job
 from .jobs.sweeper import sweep_forever
 from .parsing.figures import discard_job_figures
@@ -45,6 +51,13 @@ async def run_worker(stop: asyncio.Event) -> None:
     upload_dir.mkdir(parents=True, exist_ok=True)
 
     sweeper = asyncio.create_task(sweep_forever(upload_dir, stop))
+    try:
+        async with sessionmaker() as db:
+            orphans = await fail_orphaned_turns(db)
+        if orphans:
+            logger.warning("finished %d chat turn(s) a previous worker left running", orphans)
+    except SQLAlchemyError:
+        logger.exception("could not finish orphaned chat turns")
     logger.info("worker started; %d render slots", render_count)
     prefer_turns = False
 

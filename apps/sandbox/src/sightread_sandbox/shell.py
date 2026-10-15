@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import os
 import secrets
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 READ_CHUNK_BYTES = 65_536
@@ -59,10 +60,20 @@ class BoundedOutput:
 
 
 class ShellSession:
-    def __init__(self, argv: list[str], *, cwd: str | None = None, max_bytes: int) -> None:
+    def __init__(
+        self,
+        argv: list[str],
+        *,
+        cwd: str | None = None,
+        max_bytes: int,
+        on_timeout: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         self._argv = argv
         self._cwd = cwd
         self._max_bytes = max_bytes
+        # What ends the command where it really runs: ending the host-side client does
+        # not end a process inside the VM (docs/sandbox.md § The runner).
+        self._on_timeout = on_timeout
         self._process: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
 
@@ -156,6 +167,9 @@ class ShellSession:
                             collected.add(pending[: -len(marker_bytes)])
                             pending = pending[-len(marker_bytes) :]
             except TimeoutError:
+                if self._on_timeout is not None:
+                    with contextlib.suppress(Exception):
+                        await self._on_timeout()
                 await self.close()
                 if pending:
                     collected.add(pending)

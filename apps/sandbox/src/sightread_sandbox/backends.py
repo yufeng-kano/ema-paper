@@ -10,8 +10,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import secrets
 import shutil
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -63,8 +65,14 @@ class Backend:
     async def is_running(self, user_id: int) -> bool:
         raise NotImplementedError
 
-    def shell_argv(self, user_id: int) -> tuple[list[str], str | None]:
+    def shell_argv(self, user_id: int, token: str) -> tuple[list[str], str | None]:
+        """The shell's argv and working directory; `token` names this shell to the VM."""
         raise NotImplementedError
+
+    def on_timeout(self, user_id: int, token: str) -> Callable[[], Awaitable[None]] | None:
+        """What kills a timed-out command where it runs; None when closing the host-side
+        process is enough (the local backend)."""
+        return None
 
     async def stop_vm(self, sandbox: UserSandbox) -> None:
         raise NotImplementedError
@@ -80,9 +88,13 @@ class Backend:
             shell = sandbox.sessions.get(session)
             if shell is None:
                 await self._make_room(sandbox)
-                argv, cwd = self.shell_argv(user_id)
+                token = secrets.token_hex(8)
+                argv, cwd = self.shell_argv(user_id, token)
                 shell = ShellSession(
-                    argv, cwd=cwd, max_bytes=self.settings.sandbox_output_max_bytes
+                    argv,
+                    cwd=cwd,
+                    max_bytes=self.settings.sandbox_output_max_bytes,
+                    on_timeout=self.on_timeout(user_id, token),
                 )
                 sandbox.sessions[session] = shell
             sandbox.session_used[session] = time.monotonic()
@@ -200,6 +212,22 @@ async def _docker(*args: str, timeout: float = 120.0) -> tuple[int, str]:
 CONTAINER_PREFIX = "sightread-sandbox-"
 
 
+def _pid_file(token: str) -> str:
+    return f"/tmp/.sr-shell-{token}.pid"  # noqa: S108 - the VM's tmpfs, not the host's
+
+
+# Kills the shell named by the pid file and everything under it, children first, inside
+# the VM — `pgrep` from procps, which the image installs (docs/sandbox.md § The runner).
+KILL_TREE = """
+kill_tree() {
+    for child in $(pgrep -P "$1"); do kill_tree "$child"; done
+    kill -KILL "$1" 2>/dev/null
+}
+pid=$(cat "$1" 2>/dev/null) && [ -n "$pid" ] && kill_tree "$pid"
+exit 0
+"""
+
+
 def adopted_user_ids(names: str) -> list[int]:
     """The user ids of the runner's containers in a `docker ps --format {{.Names}}` listing."""
     ids: list[int] = []
@@ -289,7 +317,9 @@ class DockerBackend(Backend):
             raise RuntimeError("the sandbox VM could not be started")
         sandbox.started_at = time.monotonic()
 
-    def shell_argv(self, user_id: int) -> tuple[list[str], str | None]:
+    def shell_argv(self, user_id: int, token: str) -> tuple[list[str], str | None]:
+        # The shell writes its pid to the VM's tmpfs first, so a timeout can be ended
+        # inside the VM (`on_timeout`), where ending the client here would not reach.
         return (
             [
                 DOCKER,
@@ -298,12 +328,24 @@ class DockerBackend(Backend):
                 "-w",
                 "/workspace",
                 self.container(user_id),
-                "bash",
-                "--norc",
-                "--noprofile",
+                "sh",
+                "-c",
+                f'echo "$$" > {_pid_file(token)} && exec bash --norc --noprofile',
             ],
             None,
         )
+
+    def on_timeout(self, user_id: int, token: str) -> Callable[[], Awaitable[None]]:
+        container = self.container(user_id)
+
+        async def kill_inside() -> None:
+            code, out = await _docker(
+                "exec", container, "sh", "-c", KILL_TREE, "sh", _pid_file(token), timeout=30
+            )
+            if code != 0:
+                logger.warning("could not kill a timed-out command in %s: %s", container, out)
+
+        return kill_inside
 
     async def stop_vm(self, sandbox: UserSandbox) -> None:
         await _docker("rm", "-f", self.container(sandbox.user_id), timeout=120)
@@ -329,7 +371,7 @@ class LocalBackend(Backend):
             self._running.add(sandbox.user_id)
             sandbox.started_at = time.monotonic()
 
-    def shell_argv(self, user_id: int) -> tuple[list[str], str | None]:
+    def shell_argv(self, user_id: int, token: str) -> tuple[list[str], str | None]:
         return ["bash", "--norc", "--noprofile"], str(self.workspace(user_id))
 
     async def stop_vm(self, sandbox: UserSandbox) -> None:

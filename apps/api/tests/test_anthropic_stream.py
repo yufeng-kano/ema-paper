@@ -272,3 +272,25 @@ async def test_a_negative_delta_index_is_refused(key) -> None:
         async for _ in stream_messages(key, {"messages": []}, betas=(), max_bytes=10_000_000):
             pass
     assert "out-of-order" in str(refused.value)
+
+
+@respx.mock
+async def test_a_repeated_or_missing_block_index_is_refused(key) -> None:
+    for second in (
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "x"}},
+    ):
+        wild = sse(
+            {"type": "message_start", "message": {"usage": {}}},
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            },
+            second,
+        )
+        respx.post(MESSAGES_URL).mock(return_value=httpx.Response(200, content=wild))
+        with pytest.raises(UpstreamError) as refused:
+            async for _ in stream_messages(key, {"messages": []}, betas=(), max_bytes=10_000_000):
+                pass
+        assert "out-of-order" in str(refused.value)

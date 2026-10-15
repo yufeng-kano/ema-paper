@@ -120,10 +120,13 @@ def commit_paths(root: Path, author: str, message: str, paths: list[Path]) -> st
     the tree never ride along (docs/workspace.md § Revisions)."""
     if not paths:
         return None
-    # One `add` per path, unchecked: a pathspec that matches nothing (a moved-away
-    # directory that was never tracked) must not stop the others from being staged.
+    # One `add` per path: a pathspec that matches nothing (a moved-away directory that
+    # was never tracked) is skipped; any other failure to stage is an error, never a
+    # write reported done without its revision (docs/workspace.md § Revisions).
     for path in paths:
-        _git(root, "add", "-A", "--", str(path), check=False)
+        proc = _git(root, "add", "-A", "--", str(path), check=False)
+        if proc.returncode != 0 and "did not match any files" not in proc.stderr:
+            raise GitError(f"git add failed for {path}: {proc.stderr.strip()}")
     return _commit_staged(root, author, message)
 
 

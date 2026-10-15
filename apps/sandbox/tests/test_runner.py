@@ -152,6 +152,7 @@ def test_running_sandboxes_are_recognised_by_name() -> None:
     listing = "sightread-sandbox-12\nsightread-sandbox-runner\nother\nsightread-sandbox-7\n"
     assert adopted_user_ids(listing) == [12, 7]
 
+
 async def test_the_idle_sweep_spares_a_running_command(tmp_path) -> None:
     import asyncio
 
@@ -182,3 +183,18 @@ async def test_an_underscore_flood_is_bounded_too(client) -> None:
     assert body["truncated"] is True
     assert body["output"].rstrip().endswith("end")
     assert len(body["output"]) < 2000
+
+
+async def test_a_timeout_runs_the_backends_kill_before_closing_the_shell() -> None:
+    from sightread_sandbox.shell import ShellSession
+
+    killed = []
+
+    async def kill_inside() -> None:
+        killed.append(True)
+
+    shell = ShellSession(["bash", "--norc", "--noprofile"], max_bytes=1000, on_timeout=kill_inside)
+    outcome = await shell.run("sleep 30", timeout=0.2)
+    assert outcome.timed_out is True
+    assert killed == [True]
+    assert not shell.alive

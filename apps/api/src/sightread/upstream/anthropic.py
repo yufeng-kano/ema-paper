@@ -94,6 +94,14 @@ def _int(value: object) -> int:
         return 0
 
 
+def _index(data: dict) -> int:
+    """A content block event's index: a genuine integer, or the stream is broken."""
+    value = data.get("index")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise UpstreamError("The upstream sent an out-of-order content block")
+    return value
+
+
 def _usage(raw: dict, connection: Connection, *, output_tokens: int) -> ChatUsage:
     reported = raw.get("cost")
     cost: Decimal | None = None
@@ -239,10 +247,11 @@ async def stream_messages(
                     model = message.get("model") if isinstance(message.get("model"), str) else None
                     start_usage = message.get("usage") or {}
                 elif kind == "content_block_start":
-                    index = _int(data.get("index"))
-                    # Blocks arrive in order; an index that is negative, skips ahead or
-                    # exceeds any sane count is a broken upstream, not a reason to allocate.
-                    if index < 0 or index > len(blocks) or index >= MAX_CONTENT_BLOCKS:
+                    index = _index(data)
+                    # Blocks arrive in order, each exactly the next one; an index that
+                    # repeats, skips ahead or exceeds any sane count is a broken upstream,
+                    # not a reason to allocate or to overwrite.
+                    if index != len(blocks) or index >= MAX_CONTENT_BLOCKS:
                         raise UpstreamError("The upstream sent an out-of-order content block")
                     block = dict(data.get("content_block") or {})
                     if block.get("type") == "tool_use":
@@ -257,9 +266,7 @@ async def stream_messages(
                     blocks[index] = block
                     yield StreamEvent("block_start", index, block=block)
                 elif kind == "content_block_delta":
-                    index = _int(data.get("index"))
-                    if index < 0:
-                        raise UpstreamError("The upstream sent an out-of-order content block")
+                    index = _index(data)
                     if index >= len(blocks):
                         continue
                     delta = data.get("delta") or {}
@@ -283,9 +290,7 @@ async def stream_messages(
                             str(delta.get("partial_json") or "")
                         )
                 elif kind == "content_block_stop":
-                    index = _int(data.get("index"))
-                    if index < 0:
-                        raise UpstreamError("The upstream sent an out-of-order content block")
+                    index = _index(data)
                     if index >= len(blocks):
                         continue
                     block = blocks[index]

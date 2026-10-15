@@ -9,6 +9,7 @@ every file is opened through `safe_io`, which follows nothing the shell could ha
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -225,11 +226,12 @@ def _materialize_files(
 
 
 async def materialize_document(
-    db: AsyncSession, settings: Settings, document: Document
+    db: AsyncSession, settings: Settings, document: Document, *, locked: bool = False
 ) -> DocumentPaths:
     """Make sure the document's directory exists with its files; idempotent. The path is
     resolved under the workspace lock, after the row is re-read: a rename on the Files
-    page holds the same lock across its row write and its move (docs/workspace.md)."""
+    page holds the same lock across its row write and its move (docs/workspace.md).
+    `locked`: the caller already holds that lock (it is not reentrant)."""
     job = (await db.execute(select(Job).where(Job.id == document.job_id))).scalar_one_or_none()
     if job is None:
         raise ApiError(404, "invalid_request", "No such job")
@@ -241,7 +243,7 @@ async def materialize_document(
         # (materialization writes only what is missing), so there is nothing to edit yet.
         raise ApiError(409, "invalid_request", "The document has no parse result to edit yet")
     root = user_root(settings.workspaces_dir, document.user_id)
-    async with workspace_lock(root):
+    async with contextlib.nullcontext() if locked else workspace_lock(root):
         try:
             await db.refresh(document)
         except InvalidRequestError as exc:
@@ -355,8 +357,10 @@ def _read(paths: DocumentPaths, max_bytes: int) -> Content:
     )
 
 
-async def read_content(db: AsyncSession, settings: Settings, document: Document) -> Content:
-    paths = await materialize_document(db, settings, document)
+async def read_content(
+    db: AsyncSession, settings: Settings, document: Document, *, locked: bool = False
+) -> Content:
+    paths = await materialize_document(db, settings, document, locked=locked)
     return await asyncio.to_thread(_read, paths, settings.content_max_bytes)
 
 
@@ -390,8 +394,10 @@ async def write_content(
     base_revision: str,
     author: str = git.USER_AUTHOR,
 ) -> str:
-    paths = await materialize_document(db, settings, document)
-    async with workspace_lock(paths.root):
+    # The path is resolved under the same lock as the write: a rename landing in between
+    # must not send the text to a place the document has left (docs/workspace.md).
+    async with workspace_lock(user_root(settings.workspaces_dir, document.user_id)):
+        paths = await materialize_document(db, settings, document, locked=True)
         return await asyncio.to_thread(
             _write_file,
             paths,
@@ -413,8 +419,8 @@ async def write_notes(
     base_revision: str,
     author: str = git.USER_AUTHOR,
 ) -> str:
-    paths = await materialize_document(db, settings, document)
-    async with workspace_lock(paths.root):
+    async with workspace_lock(user_root(settings.workspaces_dir, document.user_id)):
+        paths = await materialize_document(db, settings, document, locked=True)
         return await asyncio.to_thread(
             _write_file,
             paths,
@@ -495,6 +501,17 @@ def _revert(paths: DocumentPaths, commit: str, max_bytes: int) -> str:
                     # what is there (docs/workspace.md § Revisions).
                     raise ApiError(409, "invalid_request", "That revision's old path is in use now")
                 moves.append((current, then))
+                # A rename that also edited the file: the bytes go back too, after the
+                # move, as they were in the commit's parent.
+                if parent is not None:
+                    try:
+                        before = git.show_bytes(root, parent, then, max_bytes)
+                    except git.GitError as exc:
+                        raise ApiError(
+                            409, "invalid_request", "That revision is too large to restore"
+                        ) from exc
+                    if before is not None:
+                        writes.append((then, before))
             continue
         if status == "A":
             # The commit created the file; a document's own fixed files are emptied
@@ -528,6 +545,7 @@ def _revert(paths: DocumentPaths, commit: str, max_bytes: int) -> str:
         for now in removals:
             if safe_io.remove_file(root, root / now):
                 restored.append(now)
+                _prune_empty(root, (root / now).parent)
         for now, data in writes:
             safe_io.write_bytes(root, root / now, data)
             restored.append(now)
@@ -545,16 +563,25 @@ class Reverted:
     revision: str
 
 
-async def revert(db: AsyncSession, settings: Settings, document: Document, commit: str) -> Reverted:
+async def revert(
+    db: AsyncSession,
+    settings: Settings,
+    document: Document,
+    commit: str,
+    *,
+    locked: bool = False,
+) -> Reverted:
     """Undo a commit, then bring the library in line with the tree — a reverted rename
-    moves the directory, and the row follows — and report the document's revision now."""
-    from .reconcile import reconcile_user
+    moves the directory, and the row follows — and report the document's revision now.
+    All under the workspace lock, which the caller may already hold (`locked`)."""
+    from .reconcile import reconcile_locked
 
-    paths = await materialize_document(db, settings, document)
-    async with workspace_lock(paths.root):
+    root = user_root(settings.workspaces_dir, document.user_id)
+    async with contextlib.nullcontext() if locked else workspace_lock(root):
+        paths = await materialize_document(db, settings, document, locked=True)
         made = await asyncio.to_thread(_revert, paths, commit, settings.content_max_bytes)
-    await reconcile_user(db, settings, document.user_id)
-    content = await read_content(db, settings, document)
+        await reconcile_locked(db, settings, document.user_id)
+        content = await read_content(db, settings, document, locked=True)
     return Reverted(commit=made, revision=content.revision)
 
 

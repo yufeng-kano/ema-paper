@@ -765,13 +765,13 @@ def _round_ctx(image_budget: int = 32 << 20) -> SimpleNamespace:
     return SimpleNamespace(settings=SimpleNamespace(chat_image_round_max_bytes=image_budget))
 
 
-async def test_a_rounds_images_stop_at_the_budget(monkeypatch) -> None:
+async def test_a_rounds_images_never_exceed_the_budget(monkeypatch) -> None:
     rendered: list[str] = []
 
-    async def fake_run_tool(ctx, block, malformed):
-        rendered.append(block["id"])
+    async def fake_view_page(paths, tool_input, **kwargs):
+        rendered.append(str(tool_input["page"]))
         image = {"type": "image", "source": {"type": "base64", "data": "x" * 100}}
-        return {"type": "tool_result", "tool_use_id": block["id"], "content": [image]}
+        return chat_tools.ToolOutcome([image, {"type": "text", "text": "Page."}])
 
     async def no_events(ctx, event, data):
         return None
@@ -779,29 +779,44 @@ async def test_a_rounds_images_stop_at_the_budget(monkeypatch) -> None:
     async def never_cancelled(ctx):
         return False
 
-    monkeypatch.setattr(chat_runner, "_run_tool", fake_run_tool)
+    monkeypatch.setattr(chat_tools, "view_page", fake_view_page)
     monkeypatch.setattr(chat_runner, "_emit", no_events)
     monkeypatch.setattr(chat_runner, "_cancelled", never_cancelled)
+    ctx = SimpleNamespace(
+        settings=SimpleNamespace(
+            chat_image_round_max_bytes=250,
+            chat_tool_result_max_chars=1000,
+            upload_max_bytes=1,
+            content_max_bytes=1,
+            chat_bash_timeout_seconds=1,
+        ),
+        conversation=SimpleNamespace(id=1, session="s"),
+        paths=None,
+        job=SimpleNamespace(page_count=12, kind="pdf"),
+        render_slots=None,
+        sandbox=None,
+        turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
+    )
     tool_uses = [
-        {"type": "tool_use", "id": str(index), "name": "view_page", "input": {}}
+        {"type": "tool_use", "id": str(index), "name": "view_page", "input": {"page": index + 1}}
         for index in range(12)
     ]
-    results = await chat_runner._run_tools(_round_ctx(image_budget=250), tool_uses, set())
+    results = await chat_runner._run_tools(ctx, tool_uses, set())
     assert [result["tool_use_id"] for result in results] == [str(i) for i in range(12)]
     kept = [result for result in results if not result.get("is_error")]
     refused = [result for result in results if result.get("is_error")]
-    # Three images fill the budget (the one that crosses it is kept); only a few more
-    # could have started alongside them before the budget was seen spent.
-    assert len(kept) <= 3 + chat_runner.READ_CONCURRENCY - 1
-    assert len(refused) >= 12 - len(kept)
+    # Admitted one at a time as each completes: two images fit, the third would cross
+    # the budget and is replaced, however many rendered together.
+    assert len(kept) == 2
+    assert sum(chat_runner._image_bytes(result) for result in kept) <= 250
+    assert len(refused) == 10
     assert all(result["content"] == chat_runner.IMAGE_BUDGET_SPENT for result in refused)
-    assert len(rendered) == len(kept)
 
 
 async def test_a_stop_drops_a_round_of_reads(monkeypatch) -> None:
     rendered: list[str] = []
 
-    async def fake_run_tool(ctx, block, malformed):
+    async def fake_run_tool(ctx, block, malformed, admit=None):
         rendered.append(block["id"])
         return {"type": "tool_result", "tool_use_id": block["id"], "content": "ok"}
 
@@ -827,7 +842,7 @@ async def test_writing_tools_run_in_order_while_reads_run_together(monkeypatch) 
     reads_overlapped = False
     reads_running: set[str] = set()
 
-    async def fake_run_tool(ctx, block, malformed):
+    async def fake_run_tool(ctx, block, malformed, admit=None):
         nonlocal writer_overlap, reads_overlapped
         tool_id = block["id"]
         started.append(tool_id)
@@ -1028,7 +1043,7 @@ async def test_a_stop_ends_the_round_before_the_next_write(monkeypatch) -> None:
     calls: list[str] = []
     cancelled = {"value": False}
 
-    async def fake_run_tool(ctx, block, malformed):
+    async def fake_run_tool(ctx, block, malformed, admit=None):
         calls.append(block["id"])
         cancelled["value"] = True  # the user pressed Stop while the first write ran
         return {"type": "tool_result", "tool_use_id": block["id"], "content": "ok"}
@@ -1116,7 +1131,7 @@ async def test_a_file_with_a_live_conversation_cannot_be_renamed(chatting) -> No
 async def test_a_stop_seen_by_the_reads_lets_the_running_write_finish(monkeypatch) -> None:
     finished: list[str] = []
 
-    async def fake_run_tool(ctx, block, malformed):
+    async def fake_run_tool(ctx, block, malformed, admit=None):
         if block["name"] == "bash":
             await asyncio.sleep(0.05)  # the shell command is still running
         finished.append(block["id"])
@@ -1152,7 +1167,7 @@ async def test_a_stop_during_backoff_and_a_running_read_are_both_cut(monkeypatch
     flags["cancelled"] = False
     read_cancelled = asyncio.Event()
 
-    async def fake_run_tool(ctx, block, malformed):
+    async def fake_run_tool(ctx, block, malformed, admit=None):
         if block["name"] == "view_page":
             try:
                 await asyncio.sleep(30)
@@ -1187,3 +1202,41 @@ def test_an_image_past_the_pixel_cap_is_refused_before_it_is_decoded() -> None:
     small = io.BytesIO()
     Image.new("RGB", (20, 10), (255, 0, 0)).save(small, format="PNG")
     assert chat_tools._as_png(small.getvalue()).startswith(b"\x89PNG")
+
+
+async def test_a_worker_starting_finishes_the_turns_a_dead_one_left(chatting) -> None:
+    from sightread.jobs.queue import fail_orphaned_turns
+
+    document_id = chatting.document_id
+    conversation_id = (
+        await chatting.post(
+            f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    sent = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
+    )
+    turn_id = uuid.UUID(sent.json()["turn_id"])
+    async with chatting.app.state.sessionmaker() as db:
+        turn = await db.get(ChatTurn, turn_id)
+        turn.status = "running"  # claimed by a worker that then died
+        await db.commit()
+    async with chatting.app.state.sessionmaker() as db:
+        assert await fail_orphaned_turns(db) == 1
+        turn = await db.get(ChatTurn, turn_id)
+        assert turn.status == "failed" and turn.error == "worker restarted"
+        assert turn.finished_at is not None
+        events = (
+            (await db.execute(select(ChatEvent).where(ChatEvent.turn_id == turn_id)))
+            .scalars()
+            .all()
+        )
+        assert [event.event for event in events] == ["turn_error"]
+        assert await fail_orphaned_turns(db) == 0
+    # The conversation takes messages again.
+    again = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"text": "more"},
+        headers=CSRF_HEADERS,
+    )
+    assert again.status_code == 202

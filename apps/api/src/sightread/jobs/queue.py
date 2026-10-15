@@ -359,6 +359,27 @@ async def claim_next_turn(db: AsyncSession, max_turns_per_user: int) -> uuid.UUI
     return turn_id if updated.rowcount == 1 else None
 
 
+async def fail_orphaned_turns(db: AsyncSession) -> int:
+    """Finish every turn a worker that died left behind: `running`, or cancelled and not
+    yet wound down. Run once when a worker starts — the deployment has one worker, so a
+    turn nobody is driving is exactly one a dead worker held (docs/jobs.md § Chat turns)."""
+    orphans = (
+        (
+            await db.execute(
+                select(ChatTurn.id).where(
+                    ChatTurn.status.in_(("running", "cancelled")),
+                    ChatTurn.finished_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for turn_id in orphans:
+        await fail_turn(db, turn_id, "worker restarted")
+    return len(orphans)
+
+
 async def fail_turn(db: AsyncSession, turn_id: uuid.UUID, error: str) -> None:
     """A turn the worker could not finish. Never requeued: its tool calls may have run.
     A turn the user had cancelled keeps `cancelled`; either way it is finished now, with

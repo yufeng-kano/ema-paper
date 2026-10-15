@@ -919,8 +919,10 @@ async def revert_document_revision(
     row = await owned_document(db, user.id, document_id)
     if not re.fullmatch(r"[0-9a-f]{7,40}", commit):
         raise ApiError(404, "invalid_request", "No such revision")
-    # A shell revision may have moved the document; undoing that under a running turn
-    # would pull the path out from under it (docs/chat.md § Conversations).
-    await refuse_while_answering(db, user.id, select(Document.id).where(Document.id == row.id))
-    reverted = await workspace_documents.revert(db, settings, row, commit)
+    # The workspace lock first, then the rows — the order every mutation takes. A shell
+    # revision may have moved the document; undoing that under a running turn would pull
+    # the path out from under it (docs/chat.md § Conversations).
+    async with workspace_lock(user_root(settings.workspaces_dir, user.id)):
+        await refuse_while_answering(db, user.id, select(Document.id).where(Document.id == row.id))
+        reverted = await workspace_documents.revert(db, settings, row, commit, locked=True)
     return {"revision": reverted.revision, "commit": reverted.commit}

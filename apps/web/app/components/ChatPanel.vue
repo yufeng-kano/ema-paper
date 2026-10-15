@@ -720,6 +720,11 @@ async function send() {
       ...(picked ? { selection: picked } : {}),
       locale: locale.value,
     })
+    if (currentId.value !== id) {
+      // The reader switched threads while the send was in flight: the turn belongs to
+      // the thread it was sent to, which shows it when it is opened again.
+      return
+    }
     messages.value = [
       ...messages.value,
       {

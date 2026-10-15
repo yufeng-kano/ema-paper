@@ -734,3 +734,41 @@ async def test_reconcile_records_no_folder_under_a_documents_name(sessionmaker, 
         assert "paper.pdf" not in names
         row = (await db.execute(select(Document).where(Document.id == other.id))).scalar_one()
         assert row.folder_id == document.folder_id
+
+
+async def test_a_revert_of_a_rename_that_also_edited_restores_the_bytes(
+    sessionmaker, tmp_path
+) -> None:
+    settings = _settings(tmp_path)
+    # Long enough that git still sees the edited file as the renamed one (R, not D + A).
+    original = "# Title\n\n" + "".join(f"Paragraph {index}.\n\n" for index in range(30))
+    async with sessionmaker() as db:
+        user, document = await _seed(db, markdown=original)
+        before = await documents.materialize_document(db, settings, document)
+        # One shell revision: the directory moved and the document edited.
+        after_dir = before.directory.with_name("renamed.pdf")
+        before.directory.rename(after_dir)
+        (after_dir / "doc.md").write_text(original + "And a line the shell added\n")
+        git.commit_all(before.root, "agent:1", "mv and edit from the shell")
+        await reconcile.reconcile_user(db, settings, user.id)
+        shell = (await documents.revisions(db, settings, document))[0]
+        assert any(status == "R" for status, _, _ in git.changed_paths(before.root, shell.commit))
+        await documents.revert(db, settings, document, shell.commit)
+        # Back at the old path, with the bytes from before the commit.
+        assert before.doc.read_text() == original
+        assert not after_dir.exists()
+
+
+def test_a_staging_failure_is_an_error_not_a_silent_save(tmp_path) -> None:
+    root = tmp_path / "ws" / "3"
+    root.mkdir(parents=True)
+    git.ensure_repo(root)
+    safe_io.write_text(root, root / "files" / "doc.md", "one")
+    assert git.commit_paths(root, "user", "first", [Path("files/doc.md")]) is not None
+    # A pathspec that matches nothing is skipped...
+    assert git.commit_paths(root, "user", "none", [Path("files/gone")]) is None
+    # ...a stale index lock is not.
+    (git_dir(root) / "index.lock").write_text("")
+    safe_io.write_text(root, root / "files" / "doc.md", "two")
+    with pytest.raises(git.GitError):
+        git.commit_paths(root, "user", "second", [Path("files/doc.md")])

@@ -12,6 +12,7 @@ import asyncio
 import logging
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -462,11 +463,17 @@ async def _call_model(ctx: TurnContext, body: dict) -> CompletedMessage:
 # --- tools -------------------------------------------------------------------------------------
 
 
-async def _run_tool(ctx: TurnContext, block: dict, malformed: set[str]) -> dict:
+Admit = Callable[[chat_tools.ToolOutcome], chat_tools.ToolOutcome]
+
+
+async def _run_tool(
+    ctx: TurnContext, block: dict, malformed: set[str], admit: Admit | None = None
+) -> dict:
     """One tool_use block → its tool_result block (plus the events along the way). A tool
-    that raises answers an error result: the model corrects itself, the turn goes on."""
+    that raises answers an error result: the model corrects itself, the turn goes on.
+    `admit` sees the outcome before it is reported and may replace it."""
     try:
-        return await _run_tool_unguarded(ctx, block, malformed)
+        return await _run_tool_unguarded(ctx, block, malformed, admit)
     except asyncio.CancelledError:
         raise
     except Exception:  # noqa: BLE001 - any failure is this tool's, never the turn's
@@ -479,7 +486,9 @@ async def _run_tool(ctx: TurnContext, block: dict, malformed: set[str]) -> dict:
         )
 
 
-async def _run_tool_unguarded(ctx: TurnContext, block: dict, malformed: set[str]) -> dict:
+async def _run_tool_unguarded(
+    ctx: TurnContext, block: dict, malformed: set[str], admit: Admit | None = None
+) -> dict:
     name = block.get("name")
     tool_use_id = str(block.get("id"))
     tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
@@ -538,6 +547,8 @@ async def _run_tool_unguarded(ctx: TurnContext, block: dict, malformed: set[str]
         )
     else:
         outcome = chat_tools.ToolOutcome(f"unknown tool {name!r}", is_error=True)
+    if admit is not None:
+        outcome = admit(outcome)
     return await _report_tool(ctx, tool_use_id, name, outcome)
 
 
@@ -591,8 +602,18 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
         budget = ctx.settings.chat_image_round_max_bytes
         spent = 0
 
-        async def one(index: int, block: dict) -> None:
+        def admit(outcome: chat_tools.ToolOutcome) -> chat_tools.ToolOutcome:
+            # One result at a time, as each completes (no await in between): an image
+            # that would cross the budget is replaced before it is reported or stored,
+            # so the round never exceeds it however many reads ran together.
             nonlocal spent
+            size = _image_bytes({"content": outcome.content})
+            if size and spent + size > budget:
+                return chat_tools.ToolOutcome(IMAGE_BUDGET_SPENT, is_error=True)
+            spent += size
+            return outcome
+
+        async def one(index: int, block: dict) -> None:
             async with slots:
                 # A round of reads has no write to notice the Stop: each read looks for
                 # it before it starts, so at most the few in flight finish. Noted, not
@@ -607,9 +628,7 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
                         ctx, str(block.get("id")), block.get("name"), outcome
                     )
                     return
-                result = await _run_tool(ctx, block, malformed)
-                spent += _image_bytes(result)
-                results[index] = result
+                results[index] = await _run_tool(ctx, block, malformed, admit)
 
         await asyncio.gather(
             *(

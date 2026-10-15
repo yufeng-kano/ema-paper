@@ -21,7 +21,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings
-from ..db.models import Document, Folder
+from ..db.models import Document, Folder, User
 from . import git, safe_io
 from .layout import (
     META_FILE,
@@ -181,18 +181,28 @@ async def _folder_for(
 async def reconcile_user(db: AsyncSession, settings: Settings, user_id: int) -> int:
     """Bring the user's rows in line with their tree. Returns how many rows changed."""
     root = user_root(settings.workspaces_dir, user_id)
-    if not files_root(root).is_dir():
-        return 0
     # Held through the commit: a rename on the Files page holds the same lock across its
     # row write and its move, so neither can apply a path the other just changed.
     async with workspace_lock(root):
-        return await _reconcile_locked(db, user_id, root)
+        return await reconcile_locked(db, settings, user_id)
+
+
+async def reconcile_locked(db: AsyncSession, settings: Settings, user_id: int) -> int:
+    """`reconcile_user` for a caller that already holds the workspace lock."""
+    root = user_root(settings.workspaces_dir, user_id)
+    if not files_root(root).is_dir():
+        return 0
+    return await _reconcile_locked(db, user_id, root)
 
 
 async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
     found = await asyncio.to_thread(_canonicalize_and_scan, root)
     if not found:
         return 0
+    # The user's row, under the workspace lock — the order every mutation takes: a
+    # folder row added here shares the namespace the Files page's name decisions lock
+    # (docs/workspace.md § Revisions).
+    await db.execute(select(User.id).where(User.id == user_id).with_for_update())
     documents = {
         row.id: row
         for row in (await db.execute(select(Document).where(Document.user_id == user_id))).scalars()
