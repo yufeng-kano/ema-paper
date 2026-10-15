@@ -504,7 +504,11 @@ async def _finish(
         async with sessionmaker() as db:
             for document in documents:
                 try:
-                    await materialize_document(db, settings, document)
+                    # The rows again, in this session: the ones above belong to the one
+                    # that committed the result, and a detached row cannot be refreshed.
+                    row = await db.get(Document, document.id)
+                    if row is not None:
+                        await materialize_document(db, settings, row)
                 except Exception:  # noqa: BLE001 - the parse succeeded; the copy can wait
                     logger.exception("could not materialize document %d", document.id)
 
@@ -516,29 +520,28 @@ async def _retain_source(
     source: Path,
 ) -> None:
     """One parse filed in several places: every copy keeps the original, the last one
-    by moving it (docs/jobs.md § Retention). The recipients are read under a lock on
-    the job's row — filing takes the same lock before it inserts, so a row filed while
-    this runs is either here or filed afterwards, as a finished parse. Each copy is
-    checked against the quota and taken under the workspace lock, where the document
-    is at that moment."""
+    by moving it (docs/jobs.md § Retention). The user's workspace lock first, then the
+    job's row — the one order every holder of both takes — and the recipients are read
+    under that row lock: filing takes it before it inserts, so a row filed while this
+    runs is either here or filed afterwards, as a finished parse. Each copy is checked
+    against the quota and taken where the document is at that moment."""
     async with sessionmaker() as db:
-        job = await db.get(Job, job_id, with_for_update=True)
-        kind = job.kind if job is not None else "pdf"
-        documents = list(
-            (
-                await db.execute(
-                    select(Document).where(Document.job_id == job_id).order_by(Document.id)
-                )
-            ).scalars()
-        )
-        for index, document in enumerate(documents):
-            root = user_root(settings.workspaces_dir, document.user_id)
-            async with workspace_lock(root):
-                # Where the document is *now*: a rename holds this lock across its
-                # database write and its move (docs/workspace.md).
-                row = await db.get(Document, document.id)
-                if row is None:
-                    continue
+        job = await db.get(Job, job_id)
+        if job is None:
+            return
+        root = user_root(settings.workspaces_dir, job.user_id)
+        async with workspace_lock(root):
+            await db.refresh(job, with_for_update=True)
+            documents = list(
+                (
+                    await db.execute(
+                        select(Document)
+                        .where(Document.job_id == job_id, Document.user_id == job.user_id)
+                        .order_by(Document.id)
+                    )
+                ).scalars()
+            )
+            for index, row in enumerate(documents):
                 relative = document_relative_dir(
                     await folder_names(db, row.user_id, row.folder_id), row.name
                 )
@@ -558,13 +561,14 @@ async def _retain_source(
                     root,
                     relative,
                     source,
-                    kind=kind,
+                    kind=job.kind,
                     copy=index < len(documents) - 1,
                 )
-        # Not kept anywhere (none with room): deleted, as for a parse outside the library.
-        source.unlink(missing_ok=True)
-        await db.execute(update(Job).where(Job.id == job_id).values(source_deleted_at=utcnow()))
-        await db.commit()
+            # Not kept anywhere (none with room): deleted, as for a parse outside the
+            # library.
+            source.unlink(missing_ok=True)
+            await db.execute(update(Job).where(Job.id == job_id).values(source_deleted_at=utcnow()))
+            await db.commit()
 
 
 async def run_job(

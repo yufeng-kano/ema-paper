@@ -232,10 +232,24 @@ async function saveContent() {
     } else {
       saveState.value = 'failed'
       saveError.value = await resolve(error)
+      retryAfterClose(() => saveContent())
     }
   } finally {
     saving = false
   }
+}
+
+let closed = false
+let retriedAfterClose = false
+
+/** A save that fails once the viewer is gone has no reader to retry it: it gets one more
+ *  try on its own, after the failed request has settled. */
+function retryAfterClose(save: () => Promise<void>) {
+  if (!closed || retriedAfterClose) {
+    return
+  }
+  retriedAfterClose = true
+  setTimeout(() => void save(), 0)
 }
 
 // --- notes ---------------------------------------------------------------------------
@@ -282,6 +296,7 @@ async function saveNotes() {
     } else {
       notesState.value = 'failed'
       notesError.value = await resolve(error)
+      retryAfterClose(() => saveNotes())
     }
   } finally {
     savingNotes = false
@@ -338,6 +353,7 @@ const statusWord = computed<SaveState>(() => {
 /** Closing with an edit still in the debounce — or still in an open block — sends it now
  *  rather than losing it. */
 onBeforeUnmount(() => {
+  closed = true
   commitEdit()
   // A failed save left its text unsaved with no timer: it gets one more try too.
   if (saveTimer !== null || saveState.value === 'failed') {

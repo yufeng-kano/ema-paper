@@ -343,7 +343,16 @@ class DockerBackend(Backend):
                 "exec", container, "sh", "-c", KILL_TREE, "sh", _pid_file(token), timeout=30
             )
             if code != 0:
-                logger.warning("could not kill a timed-out command in %s: %s", container, out)
+                # Fail closed: a command that cannot be confirmed dead must not go on
+                # writing the workspace after the timeout is reported, so the VM goes.
+                logger.warning(
+                    "could not kill a timed-out command in %s (%s); stopping the VM",
+                    container,
+                    out.strip(),
+                )
+                sandbox = self._user(user_id)
+                async with sandbox.lock:
+                    await self._stop_locked(sandbox)
 
         return kill_inside
 

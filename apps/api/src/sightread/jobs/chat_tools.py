@@ -25,7 +25,14 @@ from ..parsing.figures import parse_bbox_path
 from ..sandbox.client import SandboxClient, SandboxUnavailable
 from ..workspace import git, safe_io
 from ..workspace.documents import DocumentPaths
-from ..workspace.layout import CACHE_DIR, META_FILE, SIGHTREAD_DIR, inside
+from ..workspace.layout import (
+    CACHE_DIR,
+    FIGURES_DIR,
+    META_FILE,
+    SIGHTREAD_DIR,
+    SOURCE_STEM,
+    inside,
+)
 from ..workspace.locks import workspace_lock
 
 VM_ROOT = PurePosixPath("/workspace")
@@ -123,8 +130,13 @@ def resolve_workspace_path(root: Path, raw: object) -> Path:
 
 
 def _writable(root: Path, path: Path) -> bool:
+    """Not the workspace's own files, and nothing history excludes — a write there would
+    have no revision to show or revert (docs/chat.md § Tools)."""
     relative = path.relative_to(root)
-    return not any(part in READ_ONLY_NAMES for part in relative.parts)
+    if any(part in READ_ONLY_NAMES or part == FIGURES_DIR for part in relative.parts):
+        return False
+    name = relative.name
+    return not (name.startswith((f"{SOURCE_STEM}.", safe_io.TEMP_PREFIX)))
 
 
 def _listing(root: Path, path: Path) -> str:

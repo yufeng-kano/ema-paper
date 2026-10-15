@@ -272,6 +272,8 @@ async def test_a_turn_edits_the_document_and_streams_its_events(chatting, monkey
     assert first["output_config"] == {"effort": "medium"}
     assert first["fallbacks"] == "default"
     assert "selected in the document" in first["messages"][0]["content"][1]["text"]
+    # The marker the stored row carries for the web app never goes upstream.
+    assert "context" not in first["messages"][0]["content"][1]
     assert "files/Papers/paper.pdf" in first["system"][0]["text"]
     # The second request replays the first answer and the tool result verbatim.
     second = requests[1]
@@ -1131,14 +1133,17 @@ async def test_a_file_with_a_live_conversation_cannot_be_renamed(chatting) -> No
 async def test_a_stop_seen_by_the_reads_lets_the_running_write_finish(monkeypatch) -> None:
     finished: list[str] = []
 
+    stopped = {"value": False}
+
     async def fake_run_tool(ctx, block, malformed, admit=None):
         if block["name"] == "bash":
-            await asyncio.sleep(0.05)  # the shell command is still running
+            stopped["value"] = True  # the Stop lands while the shell command runs
+            await asyncio.sleep(0.05)
         finished.append(block["id"])
         return {"type": "tool_result", "tool_use_id": block["id"], "content": "ok"}
 
     async def cancelled(ctx):
-        return True
+        return stopped["value"]
 
     monkeypatch.setattr(chat_runner, "_run_tool", fake_run_tool)
     monkeypatch.setattr(chat_runner, "_cancelled", cancelled)
@@ -1240,3 +1245,55 @@ async def test_a_worker_starting_finishes_the_turns_a_dead_one_left(chatting) ->
         headers=CSRF_HEADERS,
     )
     assert again.status_code == 202
+
+
+async def test_a_stop_before_the_first_write_starts_none(monkeypatch) -> None:
+    calls: list[str] = []
+
+    async def fake_run_tool(ctx, block, malformed, admit=None):
+        calls.append(block["id"])
+        return {"type": "tool_result", "tool_use_id": block["id"], "content": "ok"}
+
+    async def cancelled(ctx):
+        return True
+
+    monkeypatch.setattr(chat_runner, "_run_tool", fake_run_tool)
+    monkeypatch.setattr(chat_runner, "_cancelled", cancelled)
+    tool_uses = [{"type": "tool_use", "id": "a", "name": "bash", "input": {}}]
+    # The Stop came after the round's pre-check and before the first write began.
+    with pytest.raises(chat_runner.TurnCancelled):
+        await chat_runner._run_tools(_round_ctx(), tool_uses, set())
+    assert calls == []
+
+
+def test_the_selection_block_is_marked_for_the_web_and_stripped_for_the_api() -> None:
+    stored = [
+        {"type": "text", "text": "Fix the Greedy row"},
+        {
+            "type": "text",
+            "text": "The passage selected in the document:\n\n| Greedy |",
+            "context": "selection",
+        },
+    ]
+    sent = chat_runner._api_blocks(stored)
+    assert sent == [
+        {"type": "text", "text": "Fix the Greedy row"},
+        {"type": "text", "text": "The passage selected in the document:\n\n| Greedy |"},
+    ]
+    assert stored[1]["context"] == "selection"  # the stored row keeps its marker
+
+
+async def test_the_editor_refuses_what_history_excludes(tmp_path) -> None:
+    root = tmp_path / "ws" / "9"
+    root.mkdir(parents=True)
+    git.ensure_repo(root)
+    for path in ("files/paper/figures/p1.png", "files/paper/source.pdf", "files/paper/.sr-tmp-abc"):
+        refused = await chat_tools.run_editor(
+            root,
+            {"command": "create", "path": f"/workspace/{path}", "file_text": "x"},
+            "agent:1",
+            max_chars=1000,
+            max_bytes=10_000,
+        )
+        assert refused.is_error, path
+        assert not (root / path).exists()

@@ -18,7 +18,7 @@ import type { StreamedEvent } from '~/composables/useConversationStream'
 
 /** What the thread draws, in order (docs/web.md § The agent panel). */
 type ThreadItem =
-  | { kind: 'user'; key: string; text: string }
+  | { kind: 'user'; key: string; text: string; selection: number }
   | { kind: 'text'; key: string; text: string }
   | { kind: 'thinking'; key: string; text: string }
   | {
@@ -118,12 +118,21 @@ function diffFromInput(input: Record<string, unknown>): DiffLine[] {
   ]
 }
 
+/** The user's own words: a text block the backend marked as context (the selected
+ *  passage it appended) is scaffolding for the model, not something the reader typed. */
 function textOf(blocks: ContentBlock[]): string {
   return blocks
-    .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+    .filter((block): block is { type: 'text'; text: string } => block.type === 'text' && !block.context)
     .map((block) => block.text)
     .join('\n')
     .trim()
+}
+
+/** How many characters of the document went with the message as its selection, or 0. */
+function selectionOf(blocks: ContentBlock[]): number {
+  return blocks
+    .filter((block): block is { type: 'text'; text: string; context: string } => block.type === 'text' && block.context === 'selection')
+    .reduce((total, block) => total + block.text.length, 0)
 }
 
 function isToolResultOnly(blocks: ContentBlock[]): boolean {
@@ -479,13 +488,18 @@ const thread = computed<ThreadItem[]>(() => {
     const assistants = own.filter((message) => message.role === 'assistant')
     const prefix = `t${turnId}`
 
-    const userText = own
-      .filter((message) => message.role === 'user' && !isToolResultOnly(message.content))
+    const typed = own.filter((message) => message.role === 'user' && !isToolResultOnly(message.content))
+    const userText = typed
       .map((message) => textOf(message.content))
       .filter(Boolean)
       .join('\n')
     if (userText) {
-      items.push({ kind: 'user', key: `${prefix}-user`, text: userText })
+      items.push({
+        kind: 'user',
+        key: `${prefix}-user`,
+        text: userText,
+        selection: typed.reduce((total, message) => total + selectionOf(message.content), 0),
+      })
     }
 
     // Tool outcomes, from the record and from the stream — whichever has them.
@@ -812,6 +826,7 @@ async function stop() {
         <!-- The reader's turn: right-aligned on the sunken surface. -->
         <div v-if="item.kind === 'user'" class="user-row">
           <p class="user">{{ item.text }}</p>
+          <p v-if="item.selection" class="user-selection">{{ t('chat.selection', { count: item.selection }) }}</p>
         </div>
 
         <p v-else-if="item.kind === 'text'" class="assistant">{{ item.text }}</p>
@@ -1219,6 +1234,13 @@ async function stop() {
 
 .field.disabled {
   background: var(--paper-sunken);
+}
+
+.user-selection {
+  margin: 2px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+  text-align: right;
 }
 
 .selection {

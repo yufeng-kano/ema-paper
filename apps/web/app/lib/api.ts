@@ -245,7 +245,9 @@ export interface ConversationDetail extends Conversation {
 
 /** Anthropic-shaped content blocks, stored verbatim (docs/chat.md § History). */
 export type ContentBlock =
-  | { type: 'text'; text: string }
+  /** `context` marks a text block the backend appended (the selected passage), not the
+   *  reader's own words (docs/chat.md § Prompt caching). */
+  | { type: 'text'; text: string; context?: string }
   | { type: 'thinking'; thinking: string }
   | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
   | {

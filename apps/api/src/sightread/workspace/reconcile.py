@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,6 +23,7 @@ from ..config import Settings
 from ..db.models import Document, Folder, User
 from . import git, safe_io
 from .layout import (
+    FILES_DIR,
     META_FILE,
     files_root,
     is_canonical_segment,
@@ -46,30 +46,46 @@ class Found:
     name: str
 
 
+def _walk(root: Path, relative: Path):
+    """Every directory under `relative`, top down, as `(relative dir, subdir names,
+    file names)` — read through descriptors opened beneath the user root with nothing
+    followed (`safe_io.list_dir`): a `files/` the shell replaced with a link, or any
+    directory under it, is an empty tree to this walk, never another user's. A caller
+    may trim the subdirectory list in place to prune the walk."""
+    try:
+        entries = safe_io.list_dir(root, root / relative)
+    except (safe_io.UnsafeEntry, OSError):
+        return
+    subdirs = sorted(name for name, is_dir in entries if is_dir)
+    files = [name for name, is_dir in entries if not is_dir]
+    yield relative, subdirs, files
+    for name in subdirs:
+        yield from _walk(root, relative / name)
+
+
 def _canonicalize(root: Path) -> int:
     """Move every directory under files/ whose name is not what `path_segment` would make
     of it — `.report`, `_report` — to the segment that name encodes to, so the row the
     scan records finds its directory again (docs/workspace.md § The tree is the truth).
     One commit for all of them; returns how many moved."""
-    base = files_root(root)
-    if not base.is_dir():
-        return 0
     moved: list[Path] = []
-    for current, dirs, _files in os.walk(base, topdown=True, followlinks=False):
+    for current, dirs, _files in _walk(root, Path(FILES_DIR)):
         kept: list[str] = []
         for name in dirs:
-            source = Path(current) / name
-            if source.is_symlink():
-                continue  # never descended into, never recorded
+            source = current / name
             if is_canonical_segment(name):
                 kept.append(name)
                 continue
-            target = Path(current) / path_segment(name)
-            if target.exists():
+            target = current / path_segment(name)
+            if safe_io.entry_kind(root, root / target) != "none":
                 logger.warning("reconcile: %s stays, %s is taken", source, target)
                 continue  # left alone, and not descended into: its rows stay as they were
-            git.move(root, source, target)
-            moved += [source.relative_to(root), target.relative_to(root)]
+            try:
+                git.move(root, root / source, root / target)
+            except safe_io.UnsafeEntry:
+                logger.warning("reconcile: %s could not be moved; left alone", source)
+                continue
+            moved += [source, target]
             kept.append(target.name)
         dirs[:] = kept
     if moved:
@@ -81,19 +97,12 @@ def _canonicalize(root: Path) -> int:
 def _scan(root: Path) -> list[Found]:
     """Every document directory under files/, by the id its `.meta.json` carries. Symlinks
     are not followed and not read: the tree the host trusts is made of directories."""
-    base = files_root(root)
     found: list[Found] = []
-    if not base.is_dir():
-        return found
-    for current, dirs, files in os.walk(base, topdown=True, followlinks=False):
-        dirs[:] = [
-            name
-            for name in dirs
-            if not (Path(current) / name).is_symlink() and is_canonical_segment(name)
-        ]
+    for current, dirs, files in _walk(root, Path(FILES_DIR)):
+        dirs[:] = [name for name in dirs if is_canonical_segment(name)]
         if META_FILE not in files:
             continue
-        meta = Path(current) / META_FILE
+        meta = root / current / META_FILE
         try:
             # A plain, small file or nothing: the shell can put anything under that name,
             # and the open follows nothing (docs/workspace.md § Revisions).
@@ -109,7 +118,7 @@ def _scan(root: Path) -> list[Found]:
             TypeError,
         ):
             continue
-        parts = meta.parent.relative_to(base).parts
+        parts = current.relative_to(FILES_DIR).parts
         if not parts:
             continue
         found.append(Found(document_id, tuple(parts[:-1]), parts[-1]))

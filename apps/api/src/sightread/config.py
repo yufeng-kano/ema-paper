@@ -79,6 +79,7 @@ class Settings(BaseSettings):
     chat_max_output_tokens: int = 64_000
     chat_max_tool_calls_per_turn: int = 50
     chat_turn_timeout_seconds: int = 900
+    chat_stream_timeout_seconds: int = 900
     chat_tool_result_max_chars: int = 20_000
     chat_bash_timeout_seconds: int = 120
     chat_image_round_max_bytes: int = 32 * 1024 * 1024

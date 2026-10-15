@@ -772,3 +772,21 @@ def test_a_staging_failure_is_an_error_not_a_silent_save(tmp_path) -> None:
     safe_io.write_text(root, root / "files" / "doc.md", "two")
     with pytest.raises(git.GitError):
         git.commit_paths(root, "user", "second", [Path("files/doc.md")])
+
+
+async def test_reconcile_never_walks_through_a_linked_files_directory(
+    sessionmaker, tmp_path
+) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+        # The shell swapped files/ for a link to another tree holding a document of its
+        # own: the walk sees an empty tree, reads nothing there, records nothing.
+        elsewhere = tmp_path / "elsewhere"
+        shutil.copytree(paths.root / "files", elsewhere)
+        shutil.rmtree(paths.root / "files")
+        (paths.root / "files").symlink_to(elsewhere)
+        assert await reconcile.reconcile_user(db, settings, user.id) == 0
+        row = (await db.execute(select(Document).where(Document.id == document.id))).scalar_one()
+        assert row.name == "paper.pdf"

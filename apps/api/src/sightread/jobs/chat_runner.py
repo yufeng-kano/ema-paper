@@ -250,7 +250,20 @@ async def _history(ctx: TurnContext) -> list[dict]:
                 .order_by(Message.id)
             )
         ).scalars()
-        return repaired([{"role": row.role, "content": row.content} for row in rows])
+        return repaired([{"role": row.role, "content": _api_blocks(row.content)} for row in rows])
+
+
+def _api_blocks(content: object) -> object:
+    """The stored content as the API takes it: the `context` marker a stored block
+    carries for the web app (docs/chat.md § Prompt caching) is ours, not the API's."""
+    if not isinstance(content, list):
+        return content
+    return [
+        {key: value for key, value in block.items() if key != "context"}
+        if isinstance(block, dict)
+        else block
+        for block in content
+    ]
 
 
 def build_request(ctx: TurnContext, messages: list[dict], *, since_marker: int) -> dict:
@@ -356,6 +369,7 @@ async def _stream_once(ctx: TurnContext, body: dict) -> CompletedMessage:
         body,
         betas=chat_agent.BETAS,
         max_bytes=ctx.settings.upstream_response_max_bytes,
+        timeout=ctx.settings.chat_stream_timeout_seconds,
     )
     # The stream is read by its own task into a queue, so a cancel is noticed on a timer
     # whether or not the upstream is sending anything: a silent generation is dropped as
@@ -639,14 +653,12 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
         )
 
     async def writes() -> None:
-        started = False
         for index, block in enumerate(tool_uses):
             if block.get("name") in MUTATING_TOOLS:
-                # Stop means after the *current* call: the next write of the round is
-                # not started once the user has cancelled.
-                if started and await _cancelled(ctx):
+                # Stop means after the *current* call: a write not yet started — the
+                # first of the round included — is not started once the user cancelled.
+                if await _cancelled(ctx):
                     raise TurnCancelled()
-                started = True
                 results[index] = await _run_tool(ctx, block, malformed)
 
     # A task group: when the writes stop on a cancel, the reads still running are

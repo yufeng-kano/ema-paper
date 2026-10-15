@@ -255,8 +255,14 @@ async def post_message(
     content: list[dict] = [{"type": "text", "text": body.text}]
     selection = (body.selection or "").strip()
     if selection:
+        # Marked as ours: the runner strips the marker before the block goes upstream,
+        # and the thread shows a note rather than the scaffolding (docs/chat.md).
         content.append(
-            {"type": "text", "text": f"The passage selected in the document:\n\n{selection}"}
+            {
+                "type": "text",
+                "text": f"The passage selected in the document:\n\n{selection}",
+                "context": "selection",
+            }
         )
     message = Message(conversation_id=row.id, role="user", content=content)
     db.add(message)
