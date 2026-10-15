@@ -1,7 +1,7 @@
 """`/api/kano` — connecting Kano Proxy, the built-in upstream (docs/auth.md § 6).
 
 Connect and callback are browser navigations in a redirect chain, so every outcome is a
-302 back to the web settings page with a non-secret `?kano=` status, never a JSON error.
+302 back to the web Agent page with a non-secret `?kano=` status, never a JSON error.
 Logs carry the user id and the outcome only — never a code, state, verifier, the client
 secret or a key (docs/auth.md § Logging rule).
 """
@@ -36,14 +36,14 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/kano", tags=["control"])
 
 # Parked in the short-lived signed cookie sign-in uses, so the callback returns the user
-# to the settings page in the locale they started from (docs/auth.md § 6).
+# to the Agent page in the locale they started from (docs/auth.md § 6).
 CONNECT_LOCALE_KEY = "kano_connect_locale"
 
 
-def _back_to_settings(request: Request, settings: Settings, outcome: str) -> RedirectResponse:
+def _back_to_agents(request: Request, settings: Settings, outcome: str) -> RedirectResponse:
     locale = str(request.session.pop(CONNECT_LOCALE_KEY, ""))
     return RedirectResponse(
-        f"{settings.web_url_for_locale(locale)}/settings?kano={outcome}",
+        f"{settings.web_url_for_locale(locale)}/agents?kano={outcome}",
         status_code=status.HTTP_302_FOUND,
     )
 
@@ -68,7 +68,7 @@ async def connect(
     request.session[CONNECT_LOCALE_KEY] = locale
     if not settings.kano_proxy_configured:
         logger.warning("kano connect user=%s: Kano Proxy is not configured", user.id)
-        return _back_to_settings(request, settings, "error")
+        return _back_to_agents(request, settings, "error")
 
     now = utcnow()
     # Opportunistic cleanup: every connect tidies up this user's abandoned attempts.
@@ -112,7 +112,7 @@ async def callback(
     user = await resolve_session(db, session_token) if session_token else None
     if user is None:
         logger.warning("kano callback: no session")
-        return _back_to_settings(request, settings, "error")
+        return _back_to_agents(request, settings, "error")
 
     # Consumed by the statement that finds it: a replay, or a second concurrent callback,
     # finds nothing. A state bound to another user does not match and is left alone.
@@ -132,13 +132,13 @@ async def callback(
     if error:
         outcome = "denied" if error == "access_denied" else "error"
         logger.info("kano callback user=%s: %s", user.id, outcome)
-        return _back_to_settings(request, settings, outcome)
+        return _back_to_agents(request, settings, outcome)
     if verifier_ciphertext is None or not state:
         logger.warning("kano callback user=%s: state rejected", user.id)
-        return _back_to_settings(request, settings, "error")
+        return _back_to_agents(request, settings, "error")
     if not code or not settings.kano_proxy_configured:
         logger.warning("kano callback user=%s: no code or not configured", user.id)
-        return _back_to_settings(request, settings, "error")
+        return _back_to_agents(request, settings, "error")
 
     verifier = decrypt_secret(
         settings.secret_key, verifier_ciphertext, KANO_CONNECT_VERIFIER_CONTEXT
@@ -147,7 +147,7 @@ async def callback(
         key = await exchange_code(settings, code, verifier)
     except KanoConnectError as exc:
         logger.warning("kano callback user=%s: exchange failed: %s", user.id, exc.reason)
-        return _back_to_settings(request, settings, "error")
+        return _back_to_agents(request, settings, "error")
 
     # Reconnecting replaces the stored key; Kano Proxy has already revoked the old one.
     row = (
@@ -166,9 +166,9 @@ async def callback(
         # Two connects of one user finishing at once; the other one stored its key.
         await db.rollback()
         logger.warning("kano callback user=%s: concurrent connect", user.id)
-        return _back_to_settings(request, settings, "error")
+        return _back_to_agents(request, settings, "error")
     logger.info("kano callback user=%s: connected", user.id)
-    return _back_to_settings(request, settings, "connected")
+    return _back_to_agents(request, settings, "connected")
 
 
 @router.delete("", dependencies=[CsrfGuard], status_code=status.HTTP_204_NO_CONTENT)

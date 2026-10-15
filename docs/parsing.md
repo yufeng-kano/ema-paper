@@ -32,8 +32,8 @@ Markers are how a caller maps any passage back to its page (citations, cross-che
 
 ## Coordinate contract
 
-- Figures: `bbox` = `[ymin, xmin, ymax, xmax]`, normalized 0–1000, origin top-left (`yxyx_norm1000`, Gemini-native — prompt the model for this format explicitly).
-- The service **never converts coordinates**; the response declares `meta.bbox_format` and the receiver does the one and only conversion at crop time.
+- Figures: `bbox` = `[ymin, xmin, ymax, xmax]`, normalized 0–1000, origin top-left (`yxyx_norm1000`, Gemini-native). This is what every result declares; what a model is *asked* for depends on its family and is converted into this space before storage (§ Coordinate conventions).
+- The service never converts coordinates **on the way out**: the response declares `meta.bbox_format` and the receiver does the one conversion into its own pixel space at crop time. The one conversion the service does make is on the way in — a model's native convention into the stored contract, before anything is stored (§ Coordinate conventions).
 - Placeholder: `![fig{n}](sightread://p{page}/{ymin},{xmin},{ymax},{xmax})`, caption verbatim on the next line.
 - The box bounds the graphic itself — the plotted area, drawing or photograph — and **excludes the caption line and surrounding body text**. The caption already travels on the placeholder's next line, so a box that included it would print it twice: once baked into the crop, once as text. The prompt states this explicitly.
 - Figure ids are document-wide (`fig1`, `fig2`, …) and the page number is **ours**, not the model's: the model emits the placeholder in place and the assembler renumbers it. Boxes are clamped to 0–1000; a box that is still degenerate (zero or negative area) is dropped, never guessed at.
@@ -53,20 +53,37 @@ The page image a vision call already rendered is also where figures are cropped 
 
 ## Prompts
 
-The transcription prompt is a template with two tokens, `{page}` and `{bbox_format}`, substituted per call (plain string replacement — a template with stray braces must not break a job).
+The transcription prompt is a template with three tokens, substituted per call by plain string replacement (a template with stray braces must not break a job): `{page}` (the real page number), `{bbox_instructions}` (the coordinate paragraph for the model's family — the placeholder to emit and what its integers mean, § Coordinate conventions) and `{bbox_format}` (that convention's id).
 
 Resolution order for a job's prompt, decided at enqueue time and stored on the job row:
 
-1. **The user's selected prompt preset for the agent** (`agent_settings.prompt_preset_id` → `prompt_presets.text`, managed in the agent's section of the web settings page) when one is selected. It replaces the template entirely, and figure/bbox quality is then the user's own responsibility.
-2. The agent's default template — for `parse`, `DEFAULT_PROMPT_TEMPLATE`, part of the agent's definition in code and shown on the settings page as the default ([agents.md](./agents.md)).
+1. **The user's selected prompt preset for the agent** (`agent_settings.prompt_preset_id` → `prompt_presets.text`, managed on the web Agent page) when one is selected. It replaces the template entirely, and figure/bbox quality is then the user's own responsibility.
+2. The agent's default template — for `parse`, `DEFAULT_PROMPT_TEMPLATE`, part of the agent's definition in code and the starting text of a new preset on the Agent page ([agents.md](./agents.md)).
 
 What the default template asks for beyond the markdown itself: the page's **furniture is left out** — a page or slide number, and a running header or footer that repeats across pages. A deck numbers every slide and a paper numbers every page; neither is what a reader of a transcription came for, and the viewer already knows which page a passage came from (web.md § Result viewer). The instruction then says, explicitly, that a number inside a sentence, a figure or table label, a citation marker, a numbered heading or a table **is** content: a model told to drop numbers will otherwise drop the ones that carry meaning. Changing the template changes results, so `PIPELINE_VERSION` moves with it and cached results parsed under the old wording stop answering new uploads.
 
 `jobs.prompt` holds the effective template verbatim (reproducibility); `jobs.prompt_sha256` is part of the dedup cache key ([jobs.md](./jobs.md)), so editing a preset's text invalidates cached results parsed with the old one.
 
+## Coordinate conventions
+
+The stored contract never changes: every result declares `yxyx_norm1000`, and every figure crop, the viewer and every API caller read that one space. What changes per model is the convention the model is **asked** for. Vision models are trained on different coordinate conventions, and asking for the wrong one costs box accuracy, so the pipeline picks the convention from the model id's family, converts the model's answer into the stored contract before anything downstream sees it, and the Agent page only shows the choice ([web.md](./web.md)). Nothing here is a user setting.
+
+| Family (model id) | Asked for | Image sent | Basis |
+|---|---|---|---|
+| `google/…`, `gemini-…` | `[ymin, xmin, ymax, xmax]`, 0–1000 — `yxyx_norm1000`, the native convention; no conversion | the render as rendered (long edge ≤ 2000 px) | Gemini docs |
+| `anthropic/…`, `claude-…` | `[x1, y1, x2, y2]` in pixels of the image sent — `xyxy_px` | the render **pre-resized to the size Claude would resize it to** (standard tier: no edge over 1568 px and `⌈w/28⌉ × ⌈h/28⌉ ≤ 1568` visual tokens; `agents/bbox.py` carries the published formula), so the pixel answer maps one-to-one onto the image we hold | Claude's vision-coordinates docs: pixels, never 0–1000 |
+| `openai/…`, `gpt-…` | `[x1, y1, x2, y2]` in pixels of the image sent — `xyxy_px` | the render as rendered | **Third-party only** (Roboflow's GPT-6 tests report pixel boxes on the image sent, inputs kept ≤ 2048 px). Not confirmed against OpenAI's own docs |
+| anything else | `yxyx_norm1000` | as rendered | the default, and the convention most open models share |
+
+Conversion (`canonicalize` in `agents/bbox.py`): a pixel box `[x1, y1, x2, y2]` on a `W × H` image becomes `[round(y1 / H × 1000), round(x1 / W × 1000), round(y2 / H × 1000), round(x2 / W × 1000)]`, then the usual clamp-or-reject of `clean_bbox`. The rewrite happens on the page's markdown right after the model answers, so crops, assembly and dedup never meet a pixel box.
+
+The prompt carries the convention through the `{bbox_instructions}` token: it expands to the convention's own paragraph — the placeholder shape to emit and what its four integers mean, including the sent image's pixel size for the pixel conventions — and `{bbox_format}` expands to the convention's id. A custom prompt that keeps `{bbox_instructions}` therefore works on every family. A custom prompt that spells out a convention of its own is still converted as if it followed the model's — that is the user's responsibility, as with every custom prompt.
+
+The convention is a function of the model, which is already part of the dedup key. The default template changed to carry the token, so `PIPELINE_VERSION` moved to 6 — and a job snapshotted under an earlier version keeps the stored contract as its convention (`convention_for_job`): its prompt still asks every model for `yxyx_norm1000`, and reading that answer as pixels would corrupt it after a paid call.
+
 ## Models
 
-There are no preset profiles. The user picks any model from the live catalog of the agent's upstream (`GET /api/agents/parse/models`, [api.md](./api.md)); nothing is recommended or hard-coded, and nothing filters the catalog to vision models yet ([agents.md](./agents.md) — `parse` declares `vision` but the declaration is not enforced). Every model runs the same prompt contract (`yxyx_norm1000`), and bbox quality depends on the model the user chose.
+There are no preset profiles. The user picks any model from the live catalog of the agent's upstream (`GET /api/agents/parse/models`, [api.md](./api.md)); nothing is recommended or hard-coded, and nothing filters the catalog to vision models yet ([agents.md](./agents.md) — `parse` declares `vision` but the declaration is not enforced). Every model's result declares the same contract (`yxyx_norm1000`); the convention the model is asked for follows its family (§ Coordinate conventions), and bbox quality depends on the model the user chose.
 
 `PIPELINE_VERSION` (part of `parse`'s definition) and the prompt hash are part of the dedup cache key ([jobs.md](./jobs.md)), so prompt/pipeline improvements invalidate old cached results.
 

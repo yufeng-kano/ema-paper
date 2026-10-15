@@ -159,7 +159,7 @@ async def resolve_target(
                 503,
                 "upstream",
                 f"Kano Proxy is not configured on this deployment: choose a provider "
-                f"connection for the {agent.name} agent in Settings",
+                f"connection for the {agent.name} agent through the API",
             )
         connected = (
             await db.execute(select(KanoProxyKey.user_id).where(KanoProxyKey.user_id == user.id))
@@ -168,7 +168,7 @@ async def resolve_target(
             raise ApiError(
                 400,
                 "invalid_request",
-                f"Kano Proxy is not connected: connect it in Settings or choose a provider "
+                f"Kano Proxy is not connected: connect it on the Agent page or choose a provider "
                 f"connection for the {agent.name} agent",
             )
         connection_id, snapshot = None, settings.kano_proxy_base_url
@@ -180,7 +180,8 @@ async def resolve_target(
         raise ApiError(
             400,
             "invalid_request",
-            f"No model chosen for the {agent.name} agent: pick one in Settings or pass 'model'",
+            f"No model chosen for the {agent.name} agent: pick one on the Agent page or "
+            f"pass 'model'",
         )
     preset = row.prompt_preset if row else None
     prompt = preset.text if preset else agent.default_prompt_template

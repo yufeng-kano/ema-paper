@@ -76,12 +76,12 @@ defineProps<{ name: IconName }>()
       <path d="M12 3a15 15 0 0 1 0 18a15 15 0 0 1 0-18z" />
     </template>
 
-    <!-- sliders-horizontal (Settings): a gear's teeth turn to mush at this size. -->
-    <template v-else-if="name === 'settings'">
-      <path d="M3 6h11M18 6h3" />
-      <circle cx="16" cy="6" r="2" />
-      <path d="M3 18h5M12 18h9" />
-      <circle cx="10" cy="18" r="2" />
+    <!-- bot (Agent): the one glyph every product uses for an agent that works for you. -->
+    <template v-else-if="name === 'agent'">
+      <path d="M12 8V4H8" />
+      <rect width="16" height="12" x="4" y="8" rx="2" />
+      <path d="M2 14h2M20 14h2" />
+      <path d="M15 13v2M9 13v2" />
     </template>
 
     <!-- plus: create. -->

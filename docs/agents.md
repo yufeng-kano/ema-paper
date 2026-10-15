@@ -21,7 +21,7 @@ The definition says nothing about *how* the agent calls a model. `parse` happens
 
 `agent_settings (user_id, agent)` holds what a user picked for one agent ([database.md](./database.md)):
 
-- **Upstream** — `connection_id`: NULL is the built-in Kano Proxy, otherwise one of the user's provider connections ([api.md](./api.md) § Upstreams). Connections are shared by every agent; the choice of which one is per agent.
+- **Upstream** — `connection_id`: NULL is the built-in Kano Proxy, otherwise one of the user's provider connections ([api.md](./api.md) § Upstreams). Connections are shared by every agent; the choice of which one is per agent, and only an API caller makes it — the web Agent page leaves every agent on Kano Proxy.
 - **Model** — `model`: an id from that upstream's live catalog. NULL means not chosen, and a job cannot be enqueued without a model (below). Changing the upstream clears the model, since it belonged to the other catalog.
 - **Prompt** — `prompt_preset_id`: one of the user's presets **for this agent** (`prompt_presets.agent`), or NULL for the agent's default template.
 
@@ -36,6 +36,6 @@ Every job names its agent (`jobs.agent`, NOT NULL) and, when its input was anoth
 Resolved at enqueue from the agent's settings, then snapshotted on the job like every other parameter:
 
 1. A per-request `model` overrides the stored one.
-2. No model in the request and none stored → **400** `No model chosen for the parse agent: pick one in Settings or pass 'model'`.
-3. Kano Proxy selected but no key stored → **400** `Kano Proxy is not connected: connect it in Settings or choose a provider connection for the parse agent`. Kano Proxy not configured on this deployment → **503** saying so.
+2. No model in the request and none stored → **400** `No model chosen for the parse agent: pick one on the Agent page or pass 'model'`.
+3. Kano Proxy selected but no key stored → **400** `Kano Proxy is not connected: connect it on the Agent page or choose a provider connection for the parse agent`. Kano Proxy not configured on this deployment → **503** saying so.
 4. The prompt is the selected preset's text, else the agent's default template.

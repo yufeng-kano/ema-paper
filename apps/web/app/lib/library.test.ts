@@ -152,6 +152,7 @@ describe('acceptsUpload', () => {
     page_cap: 500,
     accepted_media_types: ['application/pdf', 'image/jpeg', 'image/heic'],
     accepted_extensions: ['.pdf', '.jpg', '.heic'],
+    prompt_max_chars: 8000,
   }
 
   it('takes a file the browser typed for us', () => {
