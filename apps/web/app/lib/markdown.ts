@@ -24,18 +24,24 @@
 /** `[ymin, xmin, ymax, xmax]`, 0–1000 normalized — the `bbox_format` the result declares. */
 export type Bbox = [number, number, number, number]
 
+/**
+ * Every block keeps `src`: the exact source lines it was read from, joined by `\n`, with
+ * nothing trimmed or normalised. It is what the viewer's block editor opens, and what
+ * `serializeDocument` writes back — so a document that is parsed and serialized again is
+ * the same bytes, and editing one block touches nothing around it (docs/web.md § Editing).
+ */
 export type ResultBlock =
   /** `level` is the source depth (`#…` count) — the viewer draws two heading sizes, but a
    *  copy must hand the original level back (docs/web.md § Result viewer). */
-  | { kind: 'h2'; text: string; level: number }
-  | { kind: 'h3'; text: string; level: number }
-  | { kind: 'p'; text: string }
-  | { kind: 'list'; ordered: boolean; items: string[]; start?: number }
-  | { kind: 'math'; text: string }
-  | { kind: 'code'; text: string; lang: string | null }
-  | { kind: 'table'; header: string[]; rows: string[][] }
-  | { kind: 'fig'; id: string; bbox: Bbox; caption: string | null }
-  | { kind: 'toc'; entries: TocEntry[] }
+  | { kind: 'h2'; text: string; level: number; src: string }
+  | { kind: 'h3'; text: string; level: number; src: string }
+  | { kind: 'p'; text: string; src: string }
+  | { kind: 'list'; ordered: boolean; items: string[]; start?: number; src: string }
+  | { kind: 'math'; text: string; src: string }
+  | { kind: 'code'; text: string; lang: string | null; src: string }
+  | { kind: 'table'; header: string[]; rows: string[][]; src: string }
+  | { kind: 'fig'; id: string; bbox: Bbox; caption: string | null; src: string }
+  | { kind: 'toc'; entries: TocEntry[]; src: string }
 
 /**
  * One line of a contents page. `title + leader + page` is the source line exactly — the
@@ -173,8 +179,14 @@ export function parseResultMarkdown(markdown: string): ResultPageBlocks[] {
     return current
   }
 
+  /** The raw source of lines `from` through `to`, inclusive — a block's `src`. */
+  function source(from: number, to: number): string {
+    return lines.slice(from, to + 1).join('\n')
+  }
+
   for (let index = 0; index < lines.length; index += 1) {
     const line = (lines[index] ?? '').trim()
+    const first = index
 
     const marker = PAGE_MARKER.exec(line)
     if (marker) {
@@ -207,6 +219,7 @@ export function parseResultMarkdown(markdown: string): ResultPageBlocks[] {
         id: figure[1] || `fig${target.blocks.filter((block) => block.kind === 'fig').length + 1}`,
         bbox: [Number(figure[3]), Number(figure[4]), Number(figure[5]), Number(figure[6])],
         caption: captioned ? next : null,
+        src: source(first, index),
       })
       continue
     }
@@ -227,7 +240,12 @@ export function parseResultMarkdown(markdown: string): ResultPageBlocks[] {
         cursor += 1
       }
       index = CODE_FENCE.test((lines[cursor] ?? '').trim()) ? cursor : cursor - 1
-      page().blocks.push({ kind: 'code', text: rows.join('\n'), lang: codeFence[1] || null })
+      page().blocks.push({
+        kind: 'code',
+        text: rows.join('\n'),
+        lang: codeFence[1] || null,
+        src: source(first, index),
+      })
       continue
     }
 
@@ -239,7 +257,11 @@ export function parseResultMarkdown(markdown: string): ResultPageBlocks[] {
       // opener and what precedes the closer are rows like any other.
       const opening = line.slice(MATH_FENCE.length)
       if (opening.endsWith(MATH_FENCE)) {
-        page().blocks.push({ kind: 'math', text: opening.slice(0, -MATH_FENCE.length).trim() })
+        page().blocks.push({
+          kind: 'math',
+          text: opening.slice(0, -MATH_FENCE.length).trim(),
+          src: source(first, index),
+        })
         continue
       }
       const rows: string[] = opening.trim() ? [opening.trim()] : []
@@ -262,7 +284,7 @@ export function parseResultMarkdown(markdown: string): ResultPageBlocks[] {
       }
       // Past the closing fence, or back onto the page marker so the next pass sees it.
       index = closed ? cursor : cursor - 1
-      page().blocks.push({ kind: 'math', text: rows.join('\n') })
+      page().blocks.push({ kind: 'math', text: rows.join('\n'), src: source(first, index) })
       continue
     }
 
@@ -273,6 +295,7 @@ export function parseResultMarkdown(markdown: string): ResultPageBlocks[] {
         kind: level >= 3 ? 'h3' : 'h2',
         text: (heading[2] ?? '').trim(),
         level,
+        src: source(first, index),
       })
       continue
     }
@@ -323,6 +346,7 @@ export function parseResultMarkdown(markdown: string): ResultPageBlocks[] {
         ordered,
         items,
         ...(Number.isFinite(start) && start !== 1 ? { start } : {}),
+        src: source(first, index),
       })
       continue
     }
@@ -346,7 +370,12 @@ export function parseResultMarkdown(markdown: string): ResultPageBlocks[] {
       }
       index = cursor - 1
       const [header, ...body] = rows
-      page().blocks.push({ kind: 'table', header: header ?? [], rows: body })
+      page().blocks.push({
+        kind: 'table',
+        header: header ?? [],
+        rows: body,
+        src: source(first, index),
+      })
       continue
     }
 
@@ -365,10 +394,65 @@ export function parseResultMarkdown(markdown: string): ResultPageBlocks[] {
     // A contents page keeps its lines: joined, a book's `1.1 Title . . . . 13` rows read
     // as one run-on paragraph of dots (docs/web.md § Result viewer).
     const entries = tocEntries(paragraph)
-    page().blocks.push(entries ? { kind: 'toc', entries } : { kind: 'p', text: paragraph.join(' ') })
+    const src = source(first, index)
+    page().blocks.push(
+      entries ? { kind: 'toc', entries, src } : { kind: 'p', text: paragraph.join(' '), src },
+    )
   }
 
   return pages
+}
+
+// --- back to markdown --------------------------------------------------------------------
+//
+// The viewer edits one block at a time and the API stores one markdown string, so the
+// blocks have to become that string again. They do so from their `src`, never from their
+// parsed fields: a block the parser only half understood (a nested list, a `~~~` fence
+// holding a ``` line — docs/web.md § Known limitation) still serializes as the bytes it
+// came from rather than as a flattened reading of them.
+
+/** How the pipeline writes a page's marker (docs/parsing.md § Page markers). */
+function pageMarker(page: number): string {
+  return `<!-- page: ${page} -->`
+}
+
+/**
+ * The document as the one markdown string the API stores: each page as its marker over
+ * its blocks, blocks separated by one blank line, pages by one blank line — the shape
+ * `parsing/markdown.py` assembles. A block whose source is blank is no block: emptying a
+ * block in the editor deletes it rather than leaving a hole of blank lines.
+ *
+ * Byte-stable through `parseResultMarkdown` for a document in that shape; a document with
+ * extra blank lines between blocks, or content ahead of its first marker, comes back in
+ * it, which is the one normalisation this round trip makes.
+ */
+export function serializeDocument(pages: ResultPageBlocks[]): string {
+  return pages
+    .map((page) => {
+      const blocks = page.blocks.map((block) => block.src).filter((src) => src.trim() !== '')
+      const marker = pageMarker(page.page)
+      return blocks.length ? `${marker}\n${blocks.join('\n\n')}` : marker
+    })
+    .join('\n\n')
+}
+
+/**
+ * `markdown` with one block's source replaced — the viewer's edit, as the string to save.
+ * The new source need not stay one block: a paragraph edited into two is two on the next
+ * parse, and an emptied one disappears (see `serializeDocument`).
+ */
+export function replaceBlockSource(
+  markdown: string,
+  pageIndex: number,
+  blockIndex: number,
+  src: string,
+): string {
+  const pages = parseResultMarkdown(markdown)
+  const block = pages[pageIndex]?.blocks[blockIndex]
+  if (block) {
+    block.src = src
+  }
+  return serializeDocument(pages)
 }
 
 // --- inline content --------------------------------------------------------------------

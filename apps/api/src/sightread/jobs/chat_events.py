@@ -43,6 +43,12 @@ def sse(event: str, seq: int, data: dict) -> str:
     return f"id: {seq}\nevent: {event}\ndata: {json.dumps(data, default=str)}\n\n"
 
 
+def render(row: ChatEvent) -> str:
+    """One stored event as an SSE frame; the turn rides along so a client can pair the
+    stream with the turns it lists."""
+    return sse(row.event, row.seq, {**row.data, "turn_id": str(row.turn_id)})
+
+
 async def emit(db: AsyncSession, conversation_id: int, turn_id, event: str, data: dict) -> int:
     """Append one event and wake the streams. The turn is the only writer of its
     conversation, so `max(seq) + 1` cannot race itself. Commits."""
@@ -126,12 +132,12 @@ async def stream_conversation_events(
             for row in await _events_after(sessionmaker, conversation_id, cursor):
                 cursor = row.seq
                 silent_for = 0.0
-                yield sse(row.event, row.seq, row.data)
+                yield render(row)
             if not await _turn_running(sessionmaker, conversation_id):
                 # One more read: a turn can finish between the replay and this check.
                 for row in await _events_after(sessionmaker, conversation_id, cursor):
                     cursor = row.seq
-                    yield sse(row.event, row.seq, row.data)
+                    yield render(row)
                 return
             wakeup.clear()
             try:

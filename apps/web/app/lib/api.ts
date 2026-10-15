@@ -49,6 +49,11 @@ export interface User {
   created_at: string
 }
 
+/** The `chat` agent's reasoning effort — `output_config.effort` upstream (docs/chat.md). */
+export type AgentEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+
+export const AGENT_EFFORTS: readonly AgentEffort[] = ['low', 'medium', 'high', 'xhigh', 'max']
+
 /** One agent's settings (docs/agents.md); every null is that field's default. */
 export interface AgentSettings {
   /** The agent's upstream; null means Kano Proxy, the built-in one (docs/api.md § Upstreams). */
@@ -57,6 +62,8 @@ export interface AgentSettings {
   model: string | null
   /** Selected prompt preset; null means the agent's shipped default prompt. */
   prompt_preset_id: number | null
+  /** Reasoning effort; meaningful for the `chat` agent, `medium` when unset. */
+  effort: AgentEffort | null
 }
 
 /**
@@ -156,20 +163,165 @@ export interface UsageTotals {
   estimated_calls: number
   /** Calls whose cost nobody reported; counted, never priced as 0. */
   unpriced_calls: number
+  /** Prompt-cache reads and writes — chat rows only (docs/chat.md § Prompt caching). */
+  cache_read_tokens: number
+  cache_write_tokens: number
 }
 
 export interface UsageDay extends UsageTotals {
   date: string
+  /** The agents that ran that day (`parse`, `chat`). */
+  agents: string[]
 }
 
 export interface UsageModel extends UsageTotals {
   model: string
 }
 
+export interface UsageAgent extends UsageTotals {
+  agent: string
+}
+
 export interface UsageResponse {
   days: number
   per_day: UsageDay[]
   per_model: UsageModel[]
+  per_agent: UsageAgent[]
+}
+
+/** One conversation's totals over the period (`GET /api/usage/conversations`). */
+export interface UsageConversation {
+  id: number
+  title: string | null
+  document_id: number | null
+  document_name: string | null
+  turns: number
+  prompt_tokens: number
+  cache_read_tokens: number
+  completion_tokens: number
+  estimated_cost: number
+  unpriced_calls: number
+}
+
+export interface UsageConversationsResponse {
+  conversations: UsageConversation[]
+}
+
+// --- workspace: content, notes, revisions (docs/workspace.md) ------------------
+
+/** The document's editable copy. `revision` is a content hash, not a commit id. */
+export interface DocumentContent {
+  markdown: string
+  revision: string
+  notes: string
+  notes_revision: string
+  /** Whether the original upload is kept beside it — what `view_page` needs. */
+  has_source: boolean
+}
+
+export interface Revision {
+  commit: string
+  author: string
+  message: string
+  created_at: string
+  files: string[]
+}
+
+// --- chat (docs/chat.md) -------------------------------------------------------
+
+export interface Conversation {
+  id: number
+  title: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface ConversationDetail extends Conversation {
+  document_id: number
+}
+
+/** Anthropic-shaped content blocks, stored verbatim (docs/chat.md § History). */
+export type ContentBlock =
+  | { type: 'text'; text: string }
+  | { type: 'thinking'; thinking: string }
+  | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
+  | {
+      type: 'tool_result'
+      tool_use_id: string
+      content: string | ContentBlock[]
+      is_error?: boolean
+    }
+  /** Any other block the API stores (an image a tool returned, say): kept, not drawn. */
+  | { type: 'image' | 'document'; source?: unknown }
+
+export interface ChatMessage {
+  id: number
+  role: 'user' | 'assistant'
+  content: ContentBlock[]
+  turn_id: number
+  created_at: string
+}
+
+export type TurnStatus = 'queued' | 'running' | 'done' | 'failed' | 'cancelled' | string
+
+export interface ChatTurn {
+  id: number
+  status: TurnStatus
+  error: string | null
+}
+
+export interface ConversationResponse {
+  conversation: ConversationDetail
+  messages: ChatMessage[]
+  turns: ChatTurn[]
+}
+
+/**
+ * The `chat_events` stream, one row per SSE frame: `event` is the frame's event name, the
+ * rest its JSON data (docs/chat.md § Conversations, turns, events).
+ */
+export type ChatEvent =
+  | { event: 'turn_start'; model: string }
+  | { event: 'text_delta'; text: string }
+  | { event: 'thinking'; text: string }
+  | { event: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
+  | { event: 'tool_result'; id: string; name: string; is_error: boolean; output: string }
+  | {
+      event: 'edit'
+      path: string
+      command: string
+      commit: string
+      diff: string
+      tool_use_id: string
+    }
+  | { event: 'turn_done' }
+  | { event: 'turn_error'; status: string; error: string }
+
+export const CHAT_EVENT_NAMES: readonly ChatEvent['event'][] = [
+  'turn_start',
+  'text_delta',
+  'thinking',
+  'tool_use',
+  'tool_result',
+  'edit',
+  'turn_done',
+  'turn_error',
+]
+
+// --- sandbox (docs/sandbox.md) --------------------------------------------------
+
+export type SandboxState = 'stopped' | 'starting' | 'running' | 'unavailable'
+
+export interface SandboxStatus {
+  state: SandboxState
+  last_used_at: string | null
+  shells: number
+  uptime_seconds: number
+  workspace: {
+    bytes: number
+    quota_bytes: number
+    breakdown: { path: string; bytes: number }[]
+  }
 }
 
 export type JobStatus = 'queued' | 'running' | 'succeeded' | 'failed'
@@ -439,6 +591,26 @@ export function getUsage(days: number): Promise<UsageResponse> {
   return request('GET', `/api/usage?days=${days}`)
 }
 
+export function getUsageConversations(days: number): Promise<UsageConversationsResponse> {
+  return request('GET', `/api/usage/conversations?days=${days}`)
+}
+
+// --- sandbox (docs/sandbox.md) --------------------------------------------------
+
+export function getSandbox(): Promise<SandboxStatus> {
+  return request('GET', '/api/sandbox')
+}
+
+/** Stops the VM; everything on disk stays. */
+export function stopSandbox(): Promise<void> {
+  return request<undefined>('POST', '/api/sandbox/stop')
+}
+
+/** Stops the VM and clears the package cache and shell state; documents are untouched. */
+export function resetSandbox(): Promise<void> {
+  return request<undefined>('POST', '/api/sandbox/reset')
+}
+
 export function listJobs(limit: number): Promise<{ jobs: JobSummary[] }> {
   return request('GET', `/api/jobs?limit=${limit}`)
 }
@@ -510,4 +682,72 @@ export function deleteDocument(id: number): Promise<void> {
 
 export function getDocumentResult(id: number): Promise<JobResult> {
   return request('GET', `/api/library/documents/${id}/result`)
+}
+
+// --- workspace: content, notes, revisions (docs/web.md § Editing) -------------------
+
+/** The editable copy, materialized on first read (docs/workspace.md). */
+export function getDocumentContent(id: number): Promise<DocumentContent> {
+  return request('GET', `/api/library/documents/${id}/content`)
+}
+
+/** A save carries the revision it was made from; a stale one answers 409. */
+export function putDocumentContent(
+  id: number,
+  body: { markdown: string; base_revision: string },
+): Promise<{ revision: string }> {
+  return request('PUT', `/api/library/documents/${id}/content`, body)
+}
+
+export function putDocumentNotes(
+  id: number,
+  body: { text: string; base_revision: string },
+): Promise<{ revision: string }> {
+  return request('PUT', `/api/library/documents/${id}/notes`, body)
+}
+
+export function listRevisions(id: number): Promise<{ revisions: Revision[] }> {
+  return request('GET', `/api/library/documents/${id}/revisions`)
+}
+
+/** Writes the files as they were before `commit`, as a new revision — undo is itself a
+ *  revision, nothing is rewritten (docs/workspace.md § Revisions). */
+export function revertRevision(id: number, commit: string): Promise<{ revision: string }> {
+  return request('POST', `/api/library/documents/${id}/revisions/${encodeURIComponent(commit)}/revert`)
+}
+
+// --- chat (docs/chat.md) ----------------------------------------------------------
+
+export function listConversations(documentId: number): Promise<{ conversations: Conversation[] }> {
+  return request('GET', `/api/library/documents/${documentId}/conversations`)
+}
+
+export function createConversation(documentId: number): Promise<Conversation> {
+  return request('POST', `/api/library/documents/${documentId}/conversations`, {})
+}
+
+export function getConversation(id: number): Promise<ConversationResponse> {
+  return request('GET', `/api/conversations/${id}`)
+}
+
+/** Stores the user message and queues a turn: 202 with the turn's id. 429 when too many
+ *  turns are already running, 400 when the chat agent has no model. */
+export function sendMessage(
+  id: number,
+  body: { text: string; selection?: string },
+): Promise<{ turn_id: number }> {
+  return request('POST', `/api/conversations/${id}/messages`, body)
+}
+
+/** The stream's URL — `EventSource` opens it, not `fetch` (docs/chat.md). */
+export function conversationEventsUrl(id: number, after: number): string {
+  return `/api/conversations/${id}/events?after=${after}`
+}
+
+export function cancelTurn(id: number): Promise<void> {
+  return request<undefined>('POST', `/api/conversations/${id}/cancel`)
+}
+
+export function deleteConversation(id: number): Promise<void> {
+  return request<undefined>('DELETE', `/api/conversations/${id}`)
 }

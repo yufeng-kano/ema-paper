@@ -72,6 +72,13 @@
   --find-current: #17607d;
   --find-current-fg: #fcfcfd;
 
+  /* --- Color: diff ---------------------------------------------------------
+     The agent panel's edit cards: a removed line sits on the danger wash, an added one on
+     the accent wash — the same two hues the rest of the app already gives to "gone" and
+     "data", at a strength text stays readable on (docs/web.md § The agent panel). */
+  --diff-removed: rgb(163 52 31 / 9%);
+  --diff-added: rgb(23 96 125 / 9%);
+
   /* --- Color: interaction -------------------------------------------------- */
   --overlay: rgb(21 24 28 / 42%);
   /* The only shadow in the system: dialogs, and the sidebar when it is a drawer. */
@@ -114,6 +121,9 @@
      surface is rounded, and its highlighted row is rounded inside it. */
   --radius-menu: 10px;
   --radius-menu-item: 6px;
+  /* The agent panel's composer: the one rounded control besides the menu — a field a
+     message is typed into reads as a message, not as a form row. */
+  --radius-composer: 18px;
 
   /* --- Type ---------------------------------------------------------------
      Two scales that do different jobs. The UI scale is dense — 10px is the smallest thing
@@ -240,6 +250,8 @@
     --find: rgb(106 169 196 / 26%);
     --find-current: #6aa9c4;
     --find-current-fg: #10161a;
+    --diff-removed: rgb(224 139 118 / 14%);
+    --diff-added: rgb(106 169 196 / 14%);
     --overlay: rgb(6 8 10 / 62%);
     --shadow-dialog: 0 24px 60px rgb(0 0 0 / 55%);
     --menu-surface: rgb(38 43 50 / 98%);

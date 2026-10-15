@@ -1264,6 +1264,7 @@ function rowAttrs(row: Row): Record<string, unknown> {
       "
       :error-message="resultErrors.get(openDocument.id) ?? null"
       :figure-base="`/api/library/documents/${openDocument.id}/figures`"
+      :document-id="openDocument.id"
       @close="openDocument = null"
     />
   </UiScreen>

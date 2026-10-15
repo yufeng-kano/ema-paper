@@ -8,16 +8,26 @@
  * Nothing on this panel explains itself: labels, states and errors only (docs/web.md).
  */
 import {
+  AGENT_EFFORTS,
   createPrompt,
   deletePrompt,
   listAgentModels,
   putAgentSettings,
   updatePrompt,
+  type AgentEffort,
   type AgentEntry,
   type ConnectionModel,
   type PromptPreset,
   type SavedAgentSettings,
 } from '~/lib/api'
+
+/**
+ * The `chat` agent's tools — always these four, always in this order (docs/chat.md §
+ * Tools). A fact about the agent, shown as read-only chips; nothing here is chosen.
+ */
+const CHAT_TOOLS = ['bash', 'str_replace_based_edit_tool', 'view_page', 'view_figure'] as const
+const CHAT_AGENT = 'chat'
+const DEFAULT_EFFORT: AgentEffort = 'medium'
 
 const props = defineProps<{
   agent: AgentEntry
@@ -112,11 +122,33 @@ async function applyModel(value: string) {
   }
 }
 
+/** The chat agent has the effort and tools rows; parse has the coordinate convention. */
+const isChat = computed(() => props.agent.name === CHAT_AGENT)
+
 /** The convention the pipeline will ask the saved model for — a fact about the model
-    (docs/parsing.md § Coordinate conventions), shown beside it and never a control. */
+    (docs/parsing.md § Coordinate conventions), shown beside it and never a control. Only
+    the parse agent has one: the chat agent reads pages, it does not transcribe them. */
 const convention = computed(() =>
-  settings.value.model ? t(`agents.bbox.${props.agent.bbox.family}`) : null,
+  settings.value.model && !isChat.value ? t(`agents.bbox.${props.agent.bbox.family}`) : null,
 )
+
+// --- effort (chat only) ---------------------------------------------------------
+
+const effortPending = ref(false)
+const effortError = ref<string | null>(null)
+const effortChoice = computed(() => settings.value.effort ?? DEFAULT_EFFORT)
+
+async function applyEffort(value: string) {
+  effortPending.value = true
+  effortError.value = null
+  try {
+    emit('saved', await putAgentSettings(props.agent.name, { effort: value as AgentEffort }))
+  } catch (error) {
+    effortError.value = await resolve(error)
+  } finally {
+    effortPending.value = false
+  }
+}
 
 // --- prompt ---------------------------------------------------------------------
 
@@ -281,6 +313,24 @@ async function removePrompt() {
       <UiBanner v-if="modelsError" class="row-banner" tone="error">{{ modelsError }}</UiBanner>
     </div>
 
+    <!-- Effort (chat) ------------------------------------------------------- -->
+    <div v-if="isChat" class="row">
+      <div class="controls">
+        <UiField v-slot="{ id }" class="grow effort" :label="t('agents.effortLabel')">
+          <UiSelect
+            :id="id"
+            :model-value="effortChoice"
+            :disabled="effortPending"
+            @update:model-value="applyEffort"
+          >
+            <option v-for="effort in AGENT_EFFORTS" :key="effort" :value="effort">{{ effort }}</option>
+          </UiSelect>
+        </UiField>
+      </div>
+      <p class="note">{{ t('agents.effortNote') }}</p>
+      <UiBanner v-if="effortError" class="row-banner" tone="error">{{ effortError }}</UiBanner>
+    </div>
+
     <!-- Prompt -------------------------------------------------------------- -->
     <div class="row">
       <div class="controls">
@@ -331,6 +381,14 @@ async function removePrompt() {
         </div>
       </div>
       <UiBanner v-if="promptError" class="row-banner" tone="error">{{ promptError }}</UiBanner>
+    </div>
+
+    <!-- Tools (chat): read-only facts. The sandbox's state is on the Usage page. ---- -->
+    <div v-if="isChat" class="row">
+      <p class="tools-label">{{ t('agents.toolsLabel') }}</p>
+      <ul class="tools" :aria-label="t('agents.toolsLabel')">
+        <li v-for="tool in CHAT_TOOLS" :key="tool" class="chip mono">{{ tool }}</li>
+      </ul>
     </div>
 
     <UiModal
@@ -479,6 +537,52 @@ async function removePrompt() {
 
 .row-banner {
   max-width: 72ch;
+}
+
+/* The one line under the effort picker: a consequence of changing it, not an explanation
+   of what it is. */
+.note {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--text-xs);
+}
+
+/* An effort picker is five short words; it does not need the model picker's width. */
+.effort {
+  flex-basis: 12rem;
+  max-width: 20rem;
+}
+
+/* The tools row has the field label's treatment with no control under it. */
+.tools-label {
+  margin: 0;
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* A chip that is a fact: paper, a hairline, the mono of the name it carries — and no
+   hover, because it does nothing. */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  height: var(--control-height-xs);
+  padding: 0 var(--space-2);
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
+  color: var(--ink-soft);
+  font-size: var(--text-2xs);
 }
 
 /* --- the prompt dialog ------------------------------------------------------ */

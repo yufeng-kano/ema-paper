@@ -2,22 +2,36 @@
 // Both script blocks compile into one module, so the imports belong to the block that comes
 // first — the whole component reads them, `<script setup>` included.
 import type { ComponentPublicInstance } from 'vue'
-import type { JobResult } from '~/lib/api'
+import {
+  ApiRequestError,
+  getDocumentContent,
+  putDocumentContent,
+  putDocumentNotes,
+  type JobResult,
+} from '~/lib/api'
 import { cellGroupsToMarkdown, nodesToMarkdown, type OrphanListContext } from '~/lib/copy'
-import { parseResultMarkdown, type Bbox, type ResultBlock } from '~/lib/markdown'
+import { parseResultMarkdown, replaceBlockSource, type Bbox, type ResultBlock } from '~/lib/markdown'
 
 /**
- * Module scope, not component state: the rail is a reading preference, so opening the next
- * document keeps the choice you just made instead of asking for it again. Deliberately not
- * persisted — it lasts as long as the page is loaded and no longer, which is the lifetime a
- * preference this small earns.
+ * Module scope, not component state: the rail, the notes column and the agent panel are
+ * reading preferences, so opening the next document keeps the choice you just made instead
+ * of asking for it again. Deliberately not persisted — they last as long as the page is
+ * loaded and no longer, which is the lifetime a preference this small earns.
  */
 const railOpen = ref(false)
+const notesOpen = ref(false)
+const agentOpen = ref(false)
+
+/** How long after the last change a save is sent (docs/web.md § Editing). */
+const SAVE_DEBOUNCE_MS = 1200
+
+type SaveState = 'saved' | 'editing' | 'saving' | 'failed'
 </script>
 
 <script setup lang="ts">
 /**
- * A finished parse, as a document rather than as a blob of JSON.
+ * A finished parse, as a document rather than as a blob of JSON — and, on Files, the
+ * document's editable copy with its notes and the agent's thread beside it.
  *
  * The dialog is the reason a filename is a link on both screens that list parses — Files
  * and History: what a reader actually wants to check is whether the markdown came back
@@ -26,7 +40,12 @@ const railOpen = ref(false)
  *
  * It takes a title and a job error rather than a job row, because the two callers hold
  * different shapes of the same thing: a `JobSummary` on History, a `LibraryDocument` on
- * Files. Neither is this component's business — it renders a result.
+ * Files. Neither is this component's business — it renders a result. Files also hands it
+ * the document's id, which is what turns the viewer into an editor: the markdown tab then
+ * shows the workspace copy (`GET …/content`, docs/web.md § Editing) rather than the parse
+ * result, every block opens as its source on a click, saves are automatic, and the notes
+ * and agent columns become available. History, with no document, keeps the read-only
+ * viewer exactly as it was.
  *
  * The markdown tab is one continuous scroll, and **the document itself carries no page
  * labels**: what a reader checks is the transcription, and which page a passage came from is
@@ -36,9 +55,9 @@ const railOpen = ref(false)
  * through the prose is a thing you cannot decline (docs/web.md § Result viewer).
  *
  * The rail and the find bar **float over** the document rather than sitting beside or above
- * it: opening either leaves every line of text where it was, and a reader who opens a search
- * to find the paragraph they are looking at must not have that paragraph move first. The
- * centered column is what gives them the room.
+ * it: opening either leaves every line of text where it was. The notes and agent columns
+ * are the opposite — they sit beside the pane and take their width from it, because they
+ * are read alongside the document, not over it.
  *
  * Two mechanics keep the rail and the document from fighting each other while both scroll:
  *
@@ -66,19 +85,345 @@ const props = withDefaults(
     errorMessage?: string | null
     /** Where this caller's figure crops live (`…/figures`); null hides images entirely. */
     figureBase?: string | null
+    /** The library document, when there is one: what makes the viewer editable. */
+    documentId?: number | null
   }>(),
-  { error: null, errorMessage: null, figureBase: null },
+  { error: null, errorMessage: null, figureBase: null, documentId: null },
 )
 
 const emit = defineEmits<{ close: [] }>()
 
 const { t } = useI18n()
+const { resolve } = useApiError()
 
 const tab = ref<'markdown' | 'json'>('markdown')
-const pages = computed(() => (props.result ? parseResultMarkdown(props.result.markdown) : []))
 
 /** A running job's snapshot: pages keep arriving under this one (docs/api.md § Partial). */
 const partial = computed(() => props.result?.meta.partial === true)
+
+// --- the editable copy -------------------------------------------------------------
+
+/** The working markdown — the workspace copy once it has loaded, edited in place. */
+const markdown = ref('')
+const revision = ref('')
+const notes = ref('')
+const notesRevision = ref('')
+const contentLoaded = ref(false)
+const contentPending = ref(false)
+const contentError = ref<string | null>(null)
+/** The one-line notice a 409 leaves: the document moved under the reader. */
+const notice = ref<string | null>(null)
+
+/** The viewer edits when it has a document and that document's copy has been read. */
+const editable = computed(() => props.documentId !== null && contentLoaded.value)
+
+/** The copy exists only once the parse is final: a running job has nothing to edit yet. */
+const contentWanted = computed(
+  () => props.documentId !== null && props.result !== null && !partial.value && !props.error,
+)
+
+let contentSeq = 0
+
+/**
+ * Reads the copy. A reload (a 409, an agent edit) replaces the working text wholesale —
+ * what is on disk is the truth, and the reader is told. A load while an edit is still
+ * unsaved keeps the edit: its save will 409 and that reload will take over.
+ */
+async function loadContent(replaceDirty = false) {
+  const id = props.documentId
+  if (id === null) {
+    return
+  }
+  const seq = ++contentSeq
+  contentPending.value = true
+  contentError.value = null
+  try {
+    const content = await getDocumentContent(id)
+    if (seq !== contentSeq) {
+      return
+    }
+    if (replaceDirty || saveState.value === 'saved' || saveState.value === 'failed') {
+      markdown.value = content.markdown
+      revision.value = content.revision
+      saveState.value = 'saved'
+    }
+    if (replaceDirty || notesState.value === 'saved' || notesState.value === 'failed') {
+      notes.value = content.notes
+      notesRevision.value = content.notes_revision
+      notesState.value = 'saved'
+    }
+    contentLoaded.value = true
+  } catch (error) {
+    if (seq === contentSeq) {
+      contentError.value = await resolve(error)
+    }
+  } finally {
+    if (seq === contentSeq) {
+      contentPending.value = false
+    }
+  }
+}
+
+const pages = computed(() => {
+  if (editable.value) {
+    return parseResultMarkdown(markdown.value)
+  }
+  return props.result ? parseResultMarkdown(props.result.markdown) : []
+})
+
+// --- saving ------------------------------------------------------------------------
+
+const saveState = ref<SaveState>('saved')
+const saveError = ref<string | null>(null)
+let saveTimer: ReturnType<typeof setTimeout> | null = null
+let saving = false
+
+function scheduleSave() {
+  saveState.value = 'editing'
+  if (saveTimer !== null) {
+    clearTimeout(saveTimer)
+  }
+  saveTimer = setTimeout(() => void saveContent(), SAVE_DEBOUNCE_MS)
+}
+
+/**
+ * One save at a time. A change made while one is in flight is sent after it, from the
+ * revision that save produced — never from the one it was made against, which is stale
+ * the moment the first save lands.
+ */
+async function saveContent() {
+  const id = props.documentId
+  if (id === null || saving) {
+    return
+  }
+  if (saveTimer !== null) {
+    clearTimeout(saveTimer)
+    saveTimer = null
+  }
+  saving = true
+  saveState.value = 'saving'
+  saveError.value = null
+  const snapshot = markdown.value
+  try {
+    const saved = await putDocumentContent(id, { markdown: snapshot, base_revision: revision.value })
+    revision.value = saved.revision
+    if (markdown.value === snapshot) {
+      saveState.value = 'saved'
+    } else {
+      scheduleSave()
+    }
+  } catch (error) {
+    if (error instanceof ApiRequestError && error.status === 409) {
+      // Another tab, or the agent: what is on disk wins, and the reader is told.
+      saveState.value = 'saved'
+      notice.value = t('viewer.changedUnderneath')
+      await loadContent(true)
+    } else {
+      saveState.value = 'failed'
+      saveError.value = await resolve(error)
+    }
+  } finally {
+    saving = false
+  }
+}
+
+// --- notes ---------------------------------------------------------------------------
+
+const notesState = ref<SaveState>('saved')
+const notesError = ref<string | null>(null)
+let notesTimer: ReturnType<typeof setTimeout> | null = null
+let savingNotes = false
+
+function scheduleNotesSave() {
+  notesState.value = 'editing'
+  if (notesTimer !== null) {
+    clearTimeout(notesTimer)
+  }
+  notesTimer = setTimeout(() => void saveNotes(), SAVE_DEBOUNCE_MS)
+}
+
+async function saveNotes() {
+  const id = props.documentId
+  if (id === null || savingNotes) {
+    return
+  }
+  if (notesTimer !== null) {
+    clearTimeout(notesTimer)
+    notesTimer = null
+  }
+  savingNotes = true
+  notesState.value = 'saving'
+  notesError.value = null
+  const snapshot = notes.value
+  try {
+    const saved = await putDocumentNotes(id, { text: snapshot, base_revision: notesRevision.value })
+    notesRevision.value = saved.revision
+    if (notes.value === snapshot) {
+      notesState.value = 'saved'
+    } else {
+      scheduleNotesSave()
+    }
+  } catch (error) {
+    if (error instanceof ApiRequestError && error.status === 409) {
+      notesState.value = 'saved'
+      notice.value = t('viewer.notesChanged')
+      await loadContent(true)
+    } else {
+      notesState.value = 'failed'
+      notesError.value = await resolve(error)
+    }
+  } finally {
+    savingNotes = false
+  }
+}
+
+const notesEditing = ref(false)
+const notesEditor = ref<HTMLTextAreaElement | null>(null)
+const notesPages = computed(() => (notesEditing.value ? [] : parseResultMarkdown(notes.value)))
+
+async function startNotes() {
+  if (!editable.value) {
+    return
+  }
+  notesEditing.value = true
+  await nextTick()
+  notesEditor.value?.focus()
+}
+
+function onNotesInput() {
+  scheduleNotesSave()
+}
+
+function onNotesKey(event: KeyboardEvent) {
+  if (event.key === 'Escape' || (event.key === 'Enter' && (event.ctrlKey || event.metaKey))) {
+    // The dialog closes on Escape too; this one is the editor's.
+    event.stopPropagation()
+    event.preventDefault()
+    notesEditing.value = false
+  }
+}
+
+watch(
+  contentWanted,
+  (wanted) => {
+    if (wanted && !contentLoaded.value) {
+      void loadContent()
+    }
+  },
+  { immediate: true },
+)
+
+/** The header's one word: the busier of the two files' states. */
+const statusWord = computed<SaveState>(() => {
+  const states = [saveState.value, notesState.value]
+  for (const state of ['saving', 'editing', 'failed'] as const) {
+    if (states.includes(state)) {
+      return state
+    }
+  }
+  return 'saved'
+})
+
+/** Closing with an edit still in the debounce sends it now rather than losing it. */
+onBeforeUnmount(() => {
+  if (saveTimer !== null) {
+    clearTimeout(saveTimer)
+    void saveContent()
+  }
+  if (notesTimer !== null) {
+    clearTimeout(notesTimer)
+    void saveNotes()
+  }
+})
+
+// --- block editing -------------------------------------------------------------------
+
+/** The block whose source is open, by position; null while every block is rendered. */
+const editing = ref<{ page: number; index: number } | null>(null)
+const draft = ref('')
+/** The open block's textarea. A plain variable set through a function ref: a `ref`
+ *  attribute inside `v-for` collects an array, and there is only ever one of these. */
+let editor: HTMLTextAreaElement | null = null
+
+function setEditor(el: Element | ComponentPublicInstance | null) {
+  editor = el instanceof HTMLTextAreaElement ? el : null
+}
+
+function isEditing(pageIndex: number, blockIndex: number): boolean {
+  return editing.value?.page === pageIndex && editing.value.index === blockIndex
+}
+
+async function startEdit(pageIndex: number, blockIndex: number) {
+  if (!editable.value || isEditing(pageIndex, blockIndex)) {
+    return
+  }
+  // Removing a focused textarea does not reliably blur it, so the open block is closed
+  // by hand before the next one opens.
+  commitEdit()
+  const block = pages.value[pageIndex]?.blocks[blockIndex]
+  if (!block) {
+    return
+  }
+  editing.value = { page: pageIndex, index: blockIndex }
+  draft.value = block.src
+  await nextTick()
+  editor?.focus()
+}
+
+/** A click that ends a text selection is a selection, not a request to edit. */
+function onBlockClick(pageIndex: number, blockIndex: number) {
+  const selection = window.getSelection()
+  if (selection && !selection.isCollapsed) {
+    return
+  }
+  void startEdit(pageIndex, blockIndex)
+}
+
+/** Renders the block again, and if its source changed, writes it into the document. */
+function commitEdit() {
+  const open = editing.value
+  if (!open) {
+    return
+  }
+  editing.value = null
+  const block = pages.value[open.page]?.blocks[open.index]
+  if (!block || draft.value === block.src) {
+    return
+  }
+  markdown.value = replaceBlockSource(markdown.value, open.page, open.index, draft.value)
+  scheduleSave()
+}
+
+function onEditorKey(event: KeyboardEvent) {
+  if (event.key === 'Escape' || (event.key === 'Enter' && (event.ctrlKey || event.metaKey))) {
+    event.stopPropagation()
+    event.preventDefault()
+    commitEdit()
+  }
+}
+
+/** Enough rows for the source plus one to type into — the textarea does not scroll. */
+const editorRows = computed(() => {
+  const lines = draft.value.split('\n')
+  const wrapped = lines.reduce((total, line) => total + Math.max(1, Math.ceil(line.length / 90)), 0)
+  return Math.max(2, wrapped + 1)
+})
+
+/** The document's current selection as text, for the agent — null when there is none or
+ *  it lies outside the document pane. */
+function documentSelection(): string | null {
+  const selection = window.getSelection()
+  const box = scroller.value
+  if (!selection || selection.isCollapsed || !box || selection.rangeCount === 0) {
+    return null
+  }
+  const range = selection.getRangeAt(0)
+  if (!box.contains(range.commonAncestorContainer)) {
+    return null
+  }
+  const text = selection.toString().trim()
+  return text || null
+}
 
 // --- the page rail ---------------------------------------------------------
 
@@ -189,6 +534,7 @@ onBeforeUnmount(() => document.removeEventListener('keydown', onFindKey, true))
 watch(tab, async (view) => {
   if (view === 'json') {
     findOpen.value = false
+    commitEdit()
     return
   }
   if (!activePage.value) {
@@ -242,14 +588,16 @@ function figureKey(page: number, bbox: Bbox): string {
   return `${page}/${bbox.join(',')}`
 }
 
-function figureUrl(page: number, bbox: Bbox): string {
-  return `${props.figureBase}/${figureKey(page, bbox)}`
+/** The crop to load for a figure block, or null for the placeholder. */
+function figureUrl(page: number, block: ResultBlock): string | null {
+  if (block.kind !== 'fig' || !props.figureBase || failedCrops.has(figureKey(page, block.bbox))) {
+    return null
+  }
+  return `${props.figureBase}/${figureKey(page, block.bbox)}`
 }
 
-/** The placeholder + caption this figure was rendered from — what a copy hands back. */
-function figureSource(page: number, block: ResultBlock & { kind: 'fig' }): string {
-  const placeholder = `![${block.id}](sightread://p${page}/${block.bbox.join(',')})`
-  return block.caption ? `${placeholder}\n${block.caption}` : placeholder
+function onFigureError(page: number, bbox: Bbox) {
+  failedCrops.add(figureKey(page, bbox))
 }
 
 // --- copy as markdown ------------------------------------------------------
@@ -342,8 +690,12 @@ function partialMathBlocks(selection: Selection): Set<string> {
   return partial
 }
 
-/** Ctrl+C inside the document copies markdown, tables included (docs/web.md). */
+/** Ctrl+C inside the document copies markdown, tables included (docs/web.md). A copy
+ *  from inside an open block editor is the textarea's own, and is left to it. */
 function onCopy(event: ClipboardEvent) {
+  if (event.target instanceof HTMLTextAreaElement) {
+    return
+  }
   const selection = window.getSelection()
   if (!selection || selection.isCollapsed || !event.clipboardData) {
     return
@@ -403,19 +755,36 @@ const json = computed(() => (props.result ? JSON.stringify(props.result, null, 2
  * document reads as complete and the only evidence is in the JSON tab.
  */
 const failedPages = computed(() => props.result?.errors ?? [])
+
+/** The skeleton while the editable copy is being read for the first time. */
+const awaitingContent = computed(
+  () => contentWanted.value && !contentLoaded.value && !contentError.value,
+)
 </script>
 
 <template>
   <UiModal :title="title" size="full" tall flush @close="emit('close')">
     <template #title>
-      <h2 class="doc-title">{{ title }}</h2>
+      <div class="doc-head">
+        <h2 class="doc-title">{{ title }}</h2>
+        <!-- The one word that says where the edits are (docs/web.md § Editing). -->
+        <span
+          v-if="editable"
+          class="save-state"
+          :class="statusWord"
+          role="status"
+          aria-live="polite"
+        >
+          {{ t(`viewer.status.${statusWord}`) }}
+        </span>
+      </div>
       <p v-if="meta" class="doc-meta mono">{{ meta }}</p>
     </template>
 
     <!-- A segmented pair, not two loose buttons: they are two views of one thing, and the
          shared border is what says so. -->
     <template #actions>
-      <!-- Two switches for the markdown view. Neither means anything over the JSON tab. -->
+      <!-- The switches for the markdown view. None means anything over the JSON tab. -->
       <template v-if="tab === 'markdown'">
         <UiButton
           variant="ghost"
@@ -438,6 +807,32 @@ const failedPages = computed(() => props.result?.errors ?? [])
         >
           <template #icon><UiIcon name="search" /></template>
         </UiButton>
+        <template v-if="editable">
+          <UiButton
+            variant="ghost"
+            size="sm"
+            icon-only
+            class="column-toggle"
+            :class="{ on: notesOpen }"
+            :label="t(notesOpen ? 'viewer.notesHide' : 'viewer.notesShow')"
+            :aria-pressed="notesOpen ? 'true' : 'false'"
+            @click="notesOpen = !notesOpen"
+          >
+            <template #icon><UiIcon name="notebook" /></template>
+          </UiButton>
+          <UiButton
+            variant="ghost"
+            size="sm"
+            icon-only
+            class="column-toggle"
+            :class="{ on: agentOpen }"
+            :label="t(agentOpen ? 'viewer.agentHide' : 'viewer.agentShow')"
+            :aria-pressed="agentOpen ? 'true' : 'false'"
+            @click="agentOpen = !agentOpen"
+          >
+            <template #icon><UiIcon name="message-circle" /></template>
+          </UiButton>
+        </template>
       </template>
 
       <div class="tabs" role="tablist" :aria-label="t('viewer.views')">
@@ -461,7 +856,10 @@ const failedPages = computed(() => props.result?.errors ?? [])
       <UiBanner v-else-if="errorMessage" class="state" tone="error">{{ errorMessage }}</UiBanner>
       <UiSkeleton v-else-if="pending" class="state" :rows="5" />
 
+      <!-- The parse result, always: the contract, whatever the copy has become. -->
       <pre v-else-if="tab === 'json'" class="json mono">{{ json }}</pre>
+
+      <UiSkeleton v-else-if="awaitingContent" class="state" :rows="5" />
 
       <UiEmptyState
         v-else-if="!pages.length && !partial"
@@ -484,6 +882,17 @@ const failedPages = computed(() => props.result?.errors ?? [])
               })
             }}
           </UiBanner>
+          <UiBanner v-if="contentError" class="degraded-note" tone="error">{{ contentError }}</UiBanner>
+          <UiBanner v-if="saveError" class="degraded-note" tone="error">{{ saveError }}</UiBanner>
+          <UiBanner v-if="notesError" class="degraded-note" tone="error">{{ notesError }}</UiBanner>
+          <UiBanner v-if="notice" class="degraded-note" tone="warn">
+            {{ notice }}
+            <template #actions>
+              <UiButton variant="ghost" size="xs" icon-only :label="t('common.close')" @click="notice = null">
+                <template #icon><UiIcon name="close" /></template>
+              </UiButton>
+            </template>
+          </UiBanner>
           <!-- The parse is still running; pages below are what exists so far
                (docs/api.md § Partial results). -->
           <div v-if="partial" class="parsing-note">
@@ -492,141 +901,129 @@ const failedPages = computed(() => props.result?.errors ?? [])
           </div>
         </div>
 
-        <!-- The rail and the find bar are positioned against this, not laid out in it. -->
-        <div class="pane">
-          <nav v-if="railOpen" class="page-rail" :aria-label="t('viewer.pagesLabel')">
-            <p class="eyebrow sm page-rail-label">{{ t('viewer.pagesLabel') }}</p>
-            <button
-              v-for="entry in rail"
-              :key="entry.page"
-              type="button"
-              class="page-button"
-              :class="{ active: entry.page === activePage }"
-              :aria-current="entry.page === activePage ? 'true' : undefined"
-              @click="goToPage(entry.page)"
-            >
-              <span>{{ t('viewer.pageN', { page: entry.page }) }}</span>
-              <span v-if="entry.figures" class="page-figures">
-                {{ t('viewer.figureCount', { count: entry.figures }) }}
-              </span>
-            </button>
-          </nav>
+        <!-- The document pane and, beside it, the columns the header toggles. -->
+        <div class="columns">
+          <!-- The rail and the find bar are positioned against this, not laid out in it. -->
+          <div class="pane">
+            <nav v-if="railOpen" class="page-rail" :aria-label="t('viewer.pagesLabel')">
+              <p class="eyebrow sm page-rail-label">{{ t('viewer.pagesLabel') }}</p>
+              <button
+                v-for="entry in rail"
+                :key="entry.page"
+                type="button"
+                class="page-button"
+                :class="{ active: entry.page === activePage }"
+                :aria-current="entry.page === activePage ? 'true' : undefined"
+                @click="goToPage(entry.page)"
+              >
+                <span>{{ t('viewer.pageN', { page: entry.page }) }}</span>
+                <span v-if="entry.figures" class="page-figures">
+                  {{ t('viewer.figureCount', { count: entry.figures }) }}
+                </span>
+              </button>
+            </nav>
 
-          <MdFind
-            v-if="findOpen"
-            ref="find"
-            class="doc-find"
-            :scroller="scroller"
-            @close="findOpen = false"
-          />
+            <MdFind
+              v-if="findOpen"
+              ref="find"
+              class="doc-find"
+              :scroller="scroller"
+              @close="findOpen = false"
+            />
 
-          <div ref="scroller" class="document" @scroll="onScroll" @copy="onCopy">
-            <section
-              v-for="page in pages"
-              :key="page.page"
-              :ref="(el) => registerSection(page.page, el)"
-              class="page"
-            >
-              <article class="prose">
-                <template v-for="(block, index) in page.blocks" :key="index">
-                  <h3 v-if="block.kind === 'h2'" class="md-h2" :data-level="block.level">
-                    <MdInline :text="block.text" />
-                  </h3>
-                  <h4 v-else-if="block.kind === 'h3'" class="md-h3" :data-level="block.level">
-                    <MdInline :text="block.text" />
-                  </h4>
-                  <p v-else-if="block.kind === 'p'" class="md-p"><MdInline :text="block.text" /></p>
-
-                  <!-- KaTeX-typeset, falling back to the verbatim source when it cannot
-                       parse (docs/web.md § Result viewer). -->
-                  <MdMath v-else-if="block.kind === 'math'" :tex="block.text" />
-
-                  <pre
-                    v-else-if="block.kind === 'code'"
-                    class="md-math"
-                  ><code :class="block.lang ? `language-${block.lang}` : undefined">{{ block.text }}</code></pre>
-
-                  <component
-                    :is="block.ordered ? 'ol' : 'ul'"
-                    v-else-if="block.kind === 'list'"
-                    class="md-list"
-                    :start="block.start"
+            <div ref="scroller" class="document" @scroll="onScroll" @copy="onCopy">
+              <section
+                v-for="(page, pageIndex) in pages"
+                :key="page.page"
+                :ref="(el) => registerSection(page.page, el)"
+                class="page"
+              >
+                <article class="prose">
+                  <!-- Every block is markdown: clicked, it opens as its source; left, it
+                       renders again (docs/web.md § Editing). Read-only without a document. -->
+                  <div
+                    v-for="(block, index) in page.blocks"
+                    :key="index"
+                    class="block"
+                    :class="{ editable, open: isEditing(pageIndex, index) }"
+                    :tabindex="editable && !isEditing(pageIndex, index) ? 0 : undefined"
+                    @click="editable && onBlockClick(pageIndex, index)"
+                    @keydown.enter.self.prevent="startEdit(pageIndex, index)"
                   >
-                    <li v-for="(item, itemIndex) in block.items" :key="itemIndex">
-                      <MdInline :text="item" />
-                    </li>
-                  </component>
-
-                  <!-- Its own scroll axis: a table wider than the reading measure slides in
-                       place instead of stretching the page (docs/web.md § Result viewer). -->
-                  <div v-else-if="block.kind === 'table'" class="md-table-wrap">
-                    <table class="md-table">
-                      <thead>
-                        <tr>
-                          <th v-for="(cell, column) in block.header" :key="column" scope="col">
-                            <MdInline :text="cell" />
-                          </th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        <tr v-for="(row, rowIndex) in block.rows" :key="rowIndex">
-                          <td v-for="(cell, column) in row" :key="column">
-                            <MdInline :text="cell" />
-                          </td>
-                        </tr>
-                      </tbody>
-                    </table>
+                    <textarea
+                      v-if="isEditing(pageIndex, index)"
+                      :ref="setEditor"
+                      v-model="draft"
+                      class="block-editor mono"
+                      :rows="editorRows"
+                      :aria-label="t('viewer.blockSource')"
+                      spellcheck="false"
+                      @blur="commitEdit"
+                      @keydown="onEditorKey"
+                    />
+                    <MdBlock
+                      v-else
+                      :block="block"
+                      :page="page.page"
+                      :figure-url="figureUrl(page.page, block)"
+                      @figure-error="onFigureError"
+                    />
                   </div>
+                </article>
+              </section>
 
-                  <!-- A contents page, one row per source line. The leader is drawn, so it
-                       fills the column instead of wrapping; its `data-src` is the dots the
-                       line carried, which copy hands back (docs/web.md § Result viewer). -->
-                  <div v-else-if="block.kind === 'toc'" class="md-toc">
-                    <p v-for="(entry, entryIndex) in block.entries" :key="entryIndex" class="md-toc-row">
-                      <span class="md-toc-title"><MdInline :text="entry.title" /></span>
-                      <template v-if="entry.page !== null">
-                        <span
-                          class="md-toc-leader"
-                          :class="{ dotted: entry.leader.includes('.') }"
-                          :data-src="entry.leader"
-                          aria-hidden="true"
-                        />
-                        <span class="md-toc-page"><MdInline :text="entry.page" /></span>
-                      </template>
-                    </p>
-                  </div>
-
-                  <!-- The stored crop when one exists; the dashed frame when it does not
-                       (old results, failed crop). `data-md` is what a copy hands back. -->
-                  <figure v-else class="md-figure" :data-md="figureSource(page.page, block)">
-                    <img
-                      v-if="figureBase && !failedCrops.has(figureKey(page.page, block.bbox))"
-                      class="figure-image"
-                      :src="figureUrl(page.page, block.bbox)"
-                      :alt="block.caption || block.id"
-                      loading="lazy"
-                      @error="failedCrops.add(figureKey(page.page, block.bbox))"
-                    >
-                    <div v-else class="figure-frame">
-                      <UiIcon name="scan-text" />
-                      <span>{{ t('viewer.figurePending') }}</span>
-                    </div>
-                    <!-- Only the caption the page carried: the generated `figN` name and
-                         the bbox are how a crop is addressed, not something a reader was
-                         asked to read. Copy still hands both back, from `data-md` above. -->
-                    <figcaption v-if="block.caption" class="figure-caption">
-                      <MdInline :text="block.caption" />
-                    </figcaption>
-                  </figure>
-                </template>
-              </article>
-            </section>
-
-            <!-- Where the next page will land, while the parse is still running. -->
-            <section v-if="partial" class="page" aria-hidden="true">
-              <UiSkeleton class="page-skeleton" :rows="4" />
-            </section>
+              <!-- Where the next page will land, while the parse is still running. -->
+              <section v-if="partial" class="page" aria-hidden="true">
+                <UiSkeleton class="page-skeleton" :rows="4" />
+              </section>
+            </div>
           </div>
+
+          <!-- Notes: markdown too. Rendered until clicked, source while editing
+               (docs/web.md § Notes). No title row, no toolbar — the column is the notes. -->
+          <aside v-if="editable && notesOpen" class="notes" :aria-label="t('viewer.notesLabel')">
+            <textarea
+              v-if="notesEditing"
+              ref="notesEditor"
+              v-model="notes"
+              class="notes-editor mono"
+              :aria-label="t('viewer.notesSource')"
+              :placeholder="t('viewer.notesPlaceholder')"
+              spellcheck="false"
+              @input="onNotesInput"
+              @blur="notesEditing = false"
+              @keydown="onNotesKey"
+            />
+            <div
+              v-else
+              class="notes-view"
+              tabindex="0"
+              :title="t('viewer.notesEdit')"
+              @click="startNotes"
+              @keydown.enter.self.prevent="startNotes"
+            >
+              <template v-if="notesPages.some((page) => page.blocks.length)">
+                <template v-for="page in notesPages" :key="page.page">
+                  <MdBlock
+                    v-for="(block, index) in page.blocks"
+                    :key="index"
+                    :block="block"
+                    :page="page.page"
+                  />
+                </template>
+              </template>
+              <span v-else class="notes-empty">{{ t('viewer.notesPlaceholder') }}</span>
+            </div>
+          </aside>
+
+          <!-- The agent's thread about this document (docs/web.md § The agent panel). -->
+          <aside v-if="editable && agentOpen && documentId !== null" class="agent" :aria-label="t('chat.panel')">
+            <ChatPanel
+              :document-id="documentId"
+              :document-selection="documentSelection"
+              @changed="loadContent()"
+            />
+          </aside>
         </div>
       </div>
     </div>
@@ -646,12 +1043,39 @@ const failedPages = computed(() => props.result?.errors ?? [])
   margin: var(--space-6);
 }
 
+.doc-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
 .doc-title {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: var(--display-sm);
   letter-spacing: normal;
+}
+
+/* Quiet while saved; the accent while something is in motion, because then it is a fact
+   about data that has not landed yet. */
+.save-state {
+  flex-shrink: 0;
+  color: var(--faint);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+  transition: color var(--duration-fast) var(--ease);
+}
+
+.save-state.editing,
+.save-state.saving {
+  color: var(--accent);
+}
+
+.save-state.failed {
+  color: var(--danger);
 }
 
 .doc-meta {
@@ -661,6 +1085,12 @@ const failedPages = computed(() => props.result?.errors ?? [])
   white-space: nowrap;
   color: var(--faint);
   font-size: var(--text-2xs);
+}
+
+/* A column toggle that is on sits on the rail-active surface, as a pressed nav row does. */
+.column-toggle.on {
+  background: var(--rail-active);
+  color: var(--ink);
 }
 
 /* --- Tabs ----------------------------------------------------------------- */
@@ -729,10 +1159,19 @@ const failedPages = computed(() => props.result?.errors ?? [])
   height: 100%;
 }
 
+/* The pane and the two columns, side by side. The columns take their width from the pane
+   and never float over it; closing one gives the width back (docs/web.md § Notes). */
+.columns {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+}
+
 /* The positioning context for everything that floats over the document. */
 .pane {
   position: relative;
   display: grid;
+  flex: 1 1 auto;
   min-height: 0;
   min-width: 0;
 }
@@ -828,13 +1267,24 @@ const failedPages = computed(() => props.result?.errors ?? [])
 }
 
 /* One continuous scroll of the whole document — the rail selects, it does not filter. A
-   reader comparing two pages should not have to click between them. */
+   reader comparing two pages should not have to click between them. The scrollbar is
+   hidden on this region, as on the two columns beside it; it still scrolls. */
 .document {
+  --block-heading: var(--display-lg);
+  --block-subheading: var(--display-sm);
+  --block-text: var(--text-read);
+  --block-text-sm: var(--text-read-sm);
+
   min-width: 0;
   min-height: 0;
   overflow: auto;
   overscroll-behavior: contain;
   padding: var(--space-7) var(--space-10) var(--space-12);
+  scrollbar-width: none;
+}
+
+.document::-webkit-scrollbar {
+  display: none;
 }
 
 /* The column, centered in the pane. The page boundary carries no rule and no label: it is
@@ -855,176 +1305,38 @@ const failedPages = computed(() => props.result?.errors ?? [])
   gap: 20px;
 }
 
-.md-h2 {
-  font-size: var(--display-lg);
-  letter-spacing: var(--tracking-heading);
+/* A block is a click target only when there is a document to write to; the cursor says
+   so, and nothing else does — a hover fill on every paragraph would make reading noisy. */
+.block {
+  min-width: 0;
 }
 
-.md-h3 {
-  margin: 0;
-  font-family: var(--font-display);
-  font-size: var(--display-sm);
-  font-weight: var(--weight-semibold);
-  line-height: 1.3;
+.block.editable {
+  cursor: text;
 }
 
-.md-p {
-  color: var(--ink-soft);
-  font-size: var(--text-read);
-  line-height: 1.75;
-  text-wrap: pretty;
+.block.editable:focus-visible {
+  outline-offset: 6px;
 }
 
-/* A formula is read, not scanned, so it keeps the body's colour and size — but it scrolls
-   sideways rather than wrapping, because a re-wrapped equation is a different equation.
-   Sideways only: `overflow-y` is stated because CSS computes a `visible` axis to `auto` the
-   moment the other one is not, and an equation behind a vertical scrollbar is half an
-   equation. Height is whatever the content needs. */
-.md-math {
-  margin: 0;
-  overflow-x: auto;
-  overflow-y: hidden;
-  color: var(--ink-soft);
-  font-family: var(--mono);
-  font-size: var(--text-read-sm);
-  line-height: 1.7;
-  white-space: pre;
-}
-
-/* Markers stay outside the measure, so the text edge lines up with the paragraphs above
-   and below it rather than being indented away from them. */
-/* A contents row: title left, page right, the leader stretched between them on the text's
-   baseline. A long title wraps inside its own span and the number stays on the last line. */
-.md-toc {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  color: var(--ink-soft);
-  font-size: var(--text-read);
-  line-height: 1.75;
-}
-
-.md-toc-row {
-  display: flex;
-  align-items: last baseline;
-  margin: 0;
-}
-
-.md-toc-leader {
-  flex: 1;
-  min-width: var(--space-5);
-  margin-inline: var(--space-2);
-}
-
-.md-toc-leader.dotted {
-  border-bottom: 1px dotted var(--faint);
-}
-
-.md-toc-page {
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-
-.md-list {
-  margin: 0;
-  padding-left: var(--space-5);
-  color: var(--ink-soft);
-  font-size: var(--text-read);
-  line-height: 1.75;
-}
-
-.md-list li + li {
-  margin-top: var(--space-2);
-}
-
-/* The table's own scroll axis: wider than the reading measure, it slides in place rather
-   than stretching the page — the prose column's width is fixed (docs/web.md). */
-.md-table-wrap {
-  max-width: 100%;
-  overflow-x: auto;
-  overscroll-behavior-x: contain;
-}
-
-.md-table {
-  width: max-content;
-  min-width: 100%;
-  border-collapse: separate;
-  border-spacing: 0;
-  font-size: var(--text-read-sm);
-  font-variant-numeric: tabular-nums;
-}
-
-/* Long prose cells still wrap; the cap is what keeps one wordy cell from dragging the
-   whole table out to a single unreadable line. */
-.md-table th,
-.md-table td {
-  max-width: 36ch;
-}
-
-.md-table th {
-  padding: var(--cell-y-tight) var(--space-4) var(--cell-y-tight) 0;
-  text-align: left;
-  font-size: var(--text-2xs);
-  font-weight: var(--weight-semibold);
-  letter-spacing: var(--tracking-label);
-  text-transform: uppercase;
-  color: var(--faint);
-  border-bottom: 1px solid var(--line-soft);
-}
-
-.md-table td {
-  padding: var(--cell-y-tight) var(--space-4) var(--cell-y-tight) 0;
-  border-bottom: 1px solid var(--line-soft);
-  color: var(--ink-soft);
-}
-
-.md-table tbody tr:last-child td {
-  border-bottom: none;
-}
-
-/* A figure is centered in the column, caption and all: a crop is narrower than the measure
-   far more often than not, and left-aligning it hangs it off an edge the text does not
-   share. */
-.md-figure {
-  margin: 0;
-  text-align: center;
-}
-
-/* The stored crop, at the width the prose gives it and never more. */
-.figure-image {
+/* The source of one block, in the measure the rendered block had, in the mono face. It
+   grows with its lines rather than scrolling: the block is being read as much as typed. */
+.block-editor {
   display: block;
-  margin-inline: auto;
-  max-width: 100%;
-  border: 1px solid var(--line-soft);
+  width: 100%;
+  min-width: 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
   background: var(--paper);
-}
-
-/* Dashed, because it is a frame around something that is not there yet. */
-.figure-frame {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: var(--space-2);
-  height: 210px;
-  border: 1px dashed var(--edge);
-  background: var(--rail);
-  color: var(--faint);
-  font-size: var(--text-xs);
-}
-
-.figure-frame :deep(svg) {
-  width: 22px;
-  height: 22px;
-}
-
-/* Prose now that the coordinates have gone from beside it: it wraps to as many lines as
-   the caption needs instead of being truncated to fit next to a readout. */
-.figure-caption {
-  margin-top: var(--space-2);
-  font-size: var(--text-xs);
+  color: var(--ink-soft);
+  font-size: var(--text-read-sm);
   line-height: 1.6;
-  color: var(--faint);
+  resize: vertical;
+}
+
+.block-editor:focus-visible {
+  outline: none;
 }
 
 /* Where the next page will land while the parse runs. */
@@ -1039,13 +1351,101 @@ const failedPages = computed(() => props.result?.errors ?? [])
 
 /* An inline code span: the mono face on the sunken surface, sized to sit in the line.
    `pre-wrap`, because its spaces are content — `a  b` must read as it copies. */
-.prose :deep(.md-inline-code) {
+.prose :deep(.md-inline-code),
+.notes-view :deep(.md-inline-code) {
   padding: 1px var(--space-1);
   border-radius: var(--radius);
   background: var(--paper-sunken);
   font-family: var(--mono);
   font-size: 0.9em;
   white-space: pre-wrap;
+}
+
+/* --- Notes column --------------------------------------------------------- */
+
+/* The notes at the UI scale on the sunken surface: a margin beside the document, not a
+   second document. */
+.notes {
+  --block-heading: var(--display-2xs);
+  --block-subheading: var(--text-base);
+  --block-text: var(--text-sm);
+  --block-text-sm: var(--text-xs);
+
+  display: flex;
+  flex: 0 0 320px;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  border-left: 1px solid var(--line);
+  background: var(--paper-sunken);
+}
+
+.notes-view,
+.notes-editor {
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  margin: 0;
+  padding: var(--space-5) var(--space-5) var(--space-8);
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
+}
+
+.notes-view::-webkit-scrollbar,
+.notes-editor::-webkit-scrollbar {
+  display: none;
+}
+
+.notes-view {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  cursor: text;
+}
+
+.notes-view:focus-visible {
+  outline-offset: -2px;
+}
+
+.notes-view :deep(.md-p),
+.notes-view :deep(.md-list),
+.notes-view :deep(.md-toc) {
+  line-height: 1.65;
+}
+
+.notes-empty {
+  color: var(--faint);
+  font-size: var(--text-sm);
+}
+
+.notes-editor {
+  border: 0;
+  background: transparent;
+  color: var(--ink-soft);
+  font-size: var(--text-xs);
+  line-height: 1.7;
+  resize: none;
+}
+
+.notes-editor:focus-visible {
+  outline: none;
+}
+
+.notes-editor::placeholder {
+  color: var(--faint);
+}
+
+/* --- Agent column --------------------------------------------------------- */
+
+.agent {
+  display: flex;
+  flex: 0 0 360px;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  border-left: 1px solid var(--line);
+  background: var(--paper);
 }
 
 /* --- JSON view ------------------------------------------------------------ */
@@ -1064,11 +1464,27 @@ const failedPages = computed(() => props.result?.errors ?? [])
 }
 
 /* A percentage column needs a floor: below the shell breakpoint 70% of the pane is a
-   gutter wider than the text it frames. */
+   gutter wider than the text it frames. The side columns stack under the document there,
+   each keeping its own scroll. */
 @media (max-width: 900px) {
   .page,
   .page-skeleton {
     width: 100%;
+  }
+
+  .columns {
+    flex-direction: column;
+  }
+
+  .pane {
+    flex: 1 1 50%;
+  }
+
+  .notes,
+  .agent {
+    flex: 0 0 45%;
+    border-left: none;
+    border-top: 1px solid var(--line);
   }
 }
 

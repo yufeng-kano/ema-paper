@@ -1,5 +1,20 @@
 import { describe, expect, it } from 'vitest'
-import { parseInline, parseResultMarkdown } from './markdown'
+import {
+  parseInline,
+  parseResultMarkdown,
+  replaceBlockSource,
+  serializeDocument,
+  type ResultBlock,
+} from './markdown'
+
+/** The parsed shape without each block's `src` — what the structural tests below are about;
+ *  the source round trip has tests of its own at the end of this file. */
+function bare(blocks: ResultBlock[] | undefined): Omit<ResultBlock, 'src'>[] | undefined {
+  return blocks?.map((block) => {
+    const { src: _src, ...rest } = block
+    return rest
+  })
+}
 
 describe('parseResultMarkdown', () => {
   it('splits on page markers and keeps block order', () => {
@@ -21,11 +36,11 @@ describe('parseResultMarkdown', () => {
     )
 
     expect(pages.map((page) => page.page)).toEqual([1, 2])
-    expect(pages[0]!.blocks).toEqual([
+    expect(bare(pages[0]!.blocks)).toEqual([
       { kind: 'h2', text: 'Quarterly results', level: 2 },
       { kind: 'p', text: 'Revenue grew across every region, led by APAC.' },
     ])
-    expect(pages[1]!.blocks).toEqual([
+    expect(bare(pages[1]!.blocks)).toEqual([
       { kind: 'h3', text: 'Notes', level: 3 },
       {
         kind: 'table',
@@ -43,7 +58,7 @@ describe('parseResultMarkdown', () => {
       ['<!-- page: 3 -->', '![fig1](sightread://p3/120,60,480,940)', 'Figure 1: revenue by region'].join('\n'),
     )
 
-    expect(pages[0]!.blocks).toEqual([
+    expect(bare(pages[0]!.blocks)).toEqual([
       {
         kind: 'fig',
         id: 'fig1',
@@ -58,7 +73,7 @@ describe('parseResultMarkdown', () => {
       ['<!-- page: 1 -->', '![fig1](sightread://p1/0,0,10,10)', '## Next section'].join('\n'),
     )
 
-    expect(pages[0]!.blocks).toEqual([
+    expect(bare(pages[0]!.blocks)).toEqual([
       { kind: 'fig', id: 'fig1', bbox: [0, 0, 10, 10], caption: null },
       { kind: 'h2', text: 'Next section', level: 2 },
     ])
@@ -69,7 +84,7 @@ describe('parseResultMarkdown', () => {
 
     expect(pages).toHaveLength(1)
     expect(pages[0]!.page).toBe(1)
-    expect(pages[0]!.blocks).toEqual([
+    expect(bare(pages[0]!.blocks)).toEqual([
       { kind: 'h2', text: 'Title', level: 1 },
       { kind: 'p', text: 'Body.' },
     ])
@@ -78,7 +93,7 @@ describe('parseResultMarkdown', () => {
   it('keeps the source heading depth on the two rendered kinds', () => {
     const pages = parseResultMarkdown(['<!-- page: 1 -->', '# Top', '#### Deep'].join('\n'))
 
-    expect(pages[0]!.blocks).toEqual([
+    expect(bare(pages[0]!.blocks)).toEqual([
       { kind: 'h2', text: 'Top', level: 1 },
       { kind: 'h3', text: 'Deep', level: 4 },
     ])
@@ -95,7 +110,7 @@ describe('parseResultMarkdown lists', () => {
       ['<!-- page: 1 -->', 'Findings:', '', '- First', '- Second', '- Third'].join('\n'),
     )
 
-    expect(pages[0]!.blocks).toEqual([
+    expect(bare(pages[0]!.blocks)).toEqual([
       { kind: 'p', text: 'Findings:' },
       { kind: 'list', ordered: false, items: ['First', 'Second', 'Third'] },
     ])
@@ -104,13 +119,13 @@ describe('parseResultMarkdown lists', () => {
   it('reads an ordered list and its markers', () => {
     const pages = parseResultMarkdown(['<!-- page: 1 -->', '1. Alpha', '2) Beta'].join('\n'))
 
-    expect(pages[0]!.blocks).toEqual([{ kind: 'list', ordered: true, items: ['Alpha', 'Beta'] }])
+    expect(bare(pages[0]!.blocks)).toEqual([{ kind: 'list', ordered: true, items: ['Alpha', 'Beta'] }])
   })
 
   it('splits a bulleted list that follows a numbered one into two blocks', () => {
     const pages = parseResultMarkdown(['<!-- page: 1 -->', '1. Alpha', '- Beta'].join('\n'))
 
-    expect(pages[0]!.blocks).toEqual([
+    expect(bare(pages[0]!.blocks)).toEqual([
       { kind: 'list', ordered: true, items: ['Alpha'] },
       { kind: 'list', ordered: false, items: ['Beta'] },
     ])
@@ -121,7 +136,7 @@ describe('parseResultMarkdown lists', () => {
       ['<!-- page: 1 -->', 'The regions were:', '- APAC', 'Totals follow.'].join('\n'),
     )
 
-    expect(pages[0]!.blocks).toEqual([
+    expect(bare(pages[0]!.blocks)).toEqual([
       { kind: 'p', text: 'The regions were:' },
       { kind: 'list', ordered: false, items: ['APAC'] },
       { kind: 'p', text: 'Totals follow.' },
@@ -135,7 +150,7 @@ describe('parseResultMarkdown tables', () => {
       ['<!-- page: 1 -->', 'Region | Revenue', '--- | ---', 'APAC | 1,204'].join('\n'),
     )
 
-    expect(pages[0]!.blocks).toEqual([
+    expect(bare(pages[0]!.blocks)).toEqual([
       { kind: 'table', header: ['Region', 'Revenue'], rows: [['APAC', '1,204']] },
     ])
   })
@@ -145,7 +160,7 @@ describe('parseResultMarkdown tables', () => {
       ['<!-- page: 1 -->', 'By region:', 'Region | Revenue', '--- | ---', 'APAC | 1,204'].join('\n'),
     )
 
-    expect(pages[0]!.blocks).toEqual([
+    expect(bare(pages[0]!.blocks)).toEqual([
       { kind: 'p', text: 'By region:' },
       { kind: 'table', header: ['Region', 'Revenue'], rows: [['APAC', '1,204']] },
     ])
@@ -156,7 +171,7 @@ describe('parseResultMarkdown tables', () => {
       ['<!-- page: 1 -->', 'Run `a | b` to pipe the output.', 'It prints nothing.'].join('\n'),
     )
 
-    expect(pages[0]!.blocks).toEqual([
+    expect(bare(pages[0]!.blocks)).toEqual([
       { kind: 'p', text: 'Run `a | b` to pipe the output. It prints nothing.' },
     ])
   })
@@ -166,7 +181,7 @@ describe('parseResultMarkdown tables', () => {
       ['<!-- page: 1 -->', '| A | B |', '| --- | --- |', '| 1 | 2 |', 'Totals are provisional.'].join('\n'),
     )
 
-    expect(pages[0]!.blocks).toEqual([
+    expect(bare(pages[0]!.blocks)).toEqual([
       { kind: 'table', header: ['A', 'B'], rows: [['1', '2']] },
       { kind: 'p', text: 'Totals are provisional.' },
     ])
@@ -179,7 +194,7 @@ describe('parseResultMarkdown table edge cases', () => {
       ['<!-- page: 1 -->', '|x| = 3', '|y| = 4', 'Both hold for every n.'].join('\n'),
     )
 
-    expect(pages[0]!.blocks).toEqual([{ kind: 'p', text: '|x| = 3 |y| = 4 Both hold for every n.' }])
+    expect(bare(pages[0]!.blocks)).toEqual([{ kind: 'p', text: '|x| = 3 |y| = 4 Both hold for every n.' }])
   })
 
   it('keeps an escaped pipe inside a cell instead of splitting on it', () => {
@@ -192,7 +207,7 @@ describe('parseResultMarkdown table edge cases', () => {
       ].join('\n'),
     )
 
-    expect(pages[0]!.blocks).toEqual([
+    expect(bare(pages[0]!.blocks)).toEqual([
       {
         kind: 'table',
         header: ['Vendor', 'Region'],
@@ -208,7 +223,7 @@ describe('parseResultMarkdown formulas and wrapped items', () => {
       ['<!-- page: 1 -->', 'Then:', '$$', '\\begin{aligned}', 'E &= mc^2', '\\end{aligned}', '$$', 'as shown.'].join('\n'),
     )
 
-    expect(pages[0]!.blocks).toEqual([
+    expect(bare(pages[0]!.blocks)).toEqual([
       { kind: 'p', text: 'Then:' },
       { kind: 'math', text: '\\begin{aligned}\nE &= mc^2\n\\end{aligned}' },
       { kind: 'p', text: 'as shown.' },
@@ -221,7 +236,7 @@ describe('parseResultMarkdown formulas and wrapped items', () => {
     )
 
     expect(pages).toHaveLength(2)
-    expect(pages[1]!.blocks).toEqual([{ kind: 'p', text: 'Next page.' }])
+    expect(bare(pages[1]!.blocks)).toEqual([{ kind: 'p', text: 'Next page.' }])
   })
 
   it('folds an indented continuation into the item above it', () => {
@@ -229,7 +244,7 @@ describe('parseResultMarkdown formulas and wrapped items', () => {
       ['<!-- page: 1 -->', '- First line', '  wrapped onto a second', '- Second'].join('\n'),
     )
 
-    expect(pages[0]!.blocks).toEqual([
+    expect(bare(pages[0]!.blocks)).toEqual([
       { kind: 'list', ordered: false, items: ['First line wrapped onto a second', 'Second'] },
     ])
   })
@@ -239,7 +254,7 @@ describe('parseResultMarkdown formulas and wrapped items', () => {
       ['<!-- page: 1 -->', '- Only item', 'A new paragraph.'].join('\n'),
     )
 
-    expect(pages[0]!.blocks).toEqual([
+    expect(bare(pages[0]!.blocks)).toEqual([
       { kind: 'list', ordered: false, items: ['Only item'] },
       { kind: 'p', text: 'A new paragraph.' },
     ])
@@ -252,7 +267,7 @@ describe('parseResultMarkdown code and numbering', () => {
       ['<!-- page: 1 -->', 'Example:', '```python', 'def f(x):', '    return x + 1', '```', 'Done.'].join('\n'),
     )
 
-    expect(pages[0]!.blocks).toEqual([
+    expect(bare(pages[0]!.blocks)).toEqual([
       { kind: 'p', text: 'Example:' },
       { kind: 'code', text: 'def f(x):\n    return x + 1', lang: 'python' },
       { kind: 'p', text: 'Done.' },
@@ -265,13 +280,13 @@ describe('parseResultMarkdown code and numbering', () => {
     )
 
     expect(pages).toHaveLength(2)
-    expect(pages[1]!.blocks).toEqual([{ kind: 'p', text: 'Next page.' }])
+    expect(bare(pages[1]!.blocks)).toEqual([{ kind: 'p', text: 'Next page.' }])
   })
 
   it('keeps the number an ordered list starts at', () => {
     const pages = parseResultMarkdown(['<!-- page: 2 -->', '5. Fifth', '6. Sixth'].join('\n'))
 
-    expect(pages[0]!.blocks).toEqual([
+    expect(bare(pages[0]!.blocks)).toEqual([
       { kind: 'list', ordered: true, items: ['Fifth', 'Sixth'], start: 5 },
     ])
   })
@@ -279,7 +294,7 @@ describe('parseResultMarkdown code and numbering', () => {
   it('leaves a list starting at one without a start attribute', () => {
     const pages = parseResultMarkdown(['<!-- page: 1 -->', '1. First'].join('\n'))
 
-    expect(pages[0]!.blocks).toEqual([{ kind: 'list', ordered: true, items: ['First'] }])
+    expect(bare(pages[0]!.blocks)).toEqual([{ kind: 'list', ordered: true, items: ['First'] }])
   })
 })
 
@@ -555,7 +570,7 @@ describe('display math with the dollars on the formula’s own line', () => {
     const [page] = parseResultMarkdown(
       ['Before:', '', '$$G_t \\triangleq r_t + \\gamma r_{t+1} \\tag{1.6}$$', '', 'After.'].join('\n'),
     )
-    expect(page?.blocks).toEqual([
+    expect(bare(page?.blocks)).toEqual([
       { kind: 'p', text: 'Before:' },
       { kind: 'math', text: 'G_t \\triangleq r_t + \\gamma r_{t+1} \\tag{1.6}' },
       { kind: 'p', text: 'After.' },
@@ -564,7 +579,7 @@ describe('display math with the dollars on the formula’s own line', () => {
 
   it('ends the paragraph above it without a blank line between', () => {
     const [page] = parseResultMarkdown(['where:', '$$x = 1$$'].join('\n'))
-    expect(page?.blocks).toEqual([
+    expect(bare(page?.blocks)).toEqual([
       { kind: 'p', text: 'where:' },
       { kind: 'math', text: 'x = 1' },
     ])
@@ -572,7 +587,7 @@ describe('display math with the dollars on the formula’s own line', () => {
 
   it('reads dollars that open and close on content lines', () => {
     const [page] = parseResultMarkdown(['$$\\begin{aligned}', 'a &= b \\\\', 'c &= d', '\\end{aligned}$$', 'Next.'].join('\n'))
-    expect(page?.blocks).toEqual([
+    expect(bare(page?.blocks)).toEqual([
       { kind: 'math', text: '\\begin{aligned}\na &= b \\\\\nc &= d\n\\end{aligned}' },
       { kind: 'p', text: 'Next.' },
     ])
@@ -594,7 +609,7 @@ describe('a table of contents', () => {
         'Preface . . . . . iv',
       ].join('\n'),
     )
-    expect(page?.blocks).toEqual([
+    expect(bare(page?.blocks)).toEqual([
       {
         kind: 'toc',
         entries: [
@@ -620,7 +635,133 @@ describe('a table of contents', () => {
 
   it('leaves wrapped prose a paragraph, trailing numbers and ellipses included', () => {
     const [page] = parseResultMarkdown(['The year was', '1984 and so on... and then', 'chapter 7'].join('\n'))
-    expect(page?.blocks).toEqual([{ kind: 'p', text: 'The year was 1984 and so on... and then chapter 7' }])
+    expect(bare(page?.blocks)).toEqual([{ kind: 'p', text: 'The year was 1984 and so on... and then chapter 7' }])
   })
 })
 
+
+describe('serializeDocument', () => {
+  /** One of every shape the parser knows, in the layout the pipeline assembles. */
+  const document = [
+    '<!-- page: 1 -->',
+    '## 1.1 Sequential decision making',
+    '',
+    'An agent interacts with an environment over a sequence of discrete',
+    'time steps, observing a **state** and a reward $r_t$.',
+    '',
+    '- First item',
+    '  wrapped onto a second line',
+    '- Second item',
+    '',
+    '1. Alpha',
+    '2) Beta',
+    '',
+    '| Policy | Return |',
+    '| --- | --- |',
+    '| Random \\| noise | 1.2 |',
+    '',
+    'Region | Revenue',
+    '--- | ---',
+    'APAC | 1,204',
+    '',
+    '$$',
+    '\\begin{aligned}',
+    'E &= mc^2',
+    '\\end{aligned}',
+    '$$',
+    '',
+    '$$G_t = r_t + \\gamma r_{t+1} \\tag{1.6}$$',
+    '',
+    '```python',
+    'def f(x):',
+    '    return x + 1',
+    '```',
+    '',
+    '![fig1](sightread://p1/120,60,480,940)',
+    'Figure 1. The agent-environment loop.',
+    '',
+    '<!-- page: 2 -->',
+    '### Contents',
+    '',
+    '**1 Introduction** **13**',
+    '1.1 Sequential decision making . . . . . . . 13',
+    '1.2 Canonical models.....17',
+    '',
+    '<!-- page: 3 -->',
+  ].join('\n')
+
+  it('keeps every block source byte for byte', () => {
+    const pages = parseResultMarkdown(document)
+    expect(pages.map((page) => page.blocks.map((block) => block.kind))).toEqual([
+      ['h2', 'p', 'list', 'list', 'table', 'table', 'math', 'math', 'code', 'fig'],
+      ['h3', 'toc'],
+      [],
+    ])
+    expect(pages[0]!.blocks[2]!.src).toBe('- First item\n  wrapped onto a second line\n- Second item')
+    expect(pages[0]!.blocks[6]!.src).toBe('$$\n\\begin{aligned}\nE &= mc^2\n\\end{aligned}\n$$')
+    expect(pages[0]!.blocks[8]!.src).toBe('```python\ndef f(x):\n    return x + 1\n```')
+    expect(pages[0]!.blocks[9]!.src).toBe(
+      '![fig1](sightread://p1/120,60,480,940)\nFigure 1. The agent-environment loop.',
+    )
+  })
+
+  it('is byte-stable through parse and serialize', () => {
+    expect(serializeDocument(parseResultMarkdown(document))).toBe(document)
+  })
+
+  it('is stable again on a second round trip', () => {
+    const once = serializeDocument(parseResultMarkdown(document))
+    expect(serializeDocument(parseResultMarkdown(once))).toBe(once)
+  })
+
+  it('writes an empty page as its marker alone', () => {
+    expect(serializeDocument([{ page: 4, blocks: [] }])).toBe('<!-- page: 4 -->')
+  })
+
+  it('gives content ahead of the first marker a page 1 marker', () => {
+    const pages = parseResultMarkdown(['# Title', '', 'Body.'].join('\n'))
+    expect(serializeDocument(pages)).toBe('<!-- page: 1 -->\n# Title\n\nBody.')
+  })
+})
+
+describe('replaceBlockSource', () => {
+  const document = [
+    '<!-- page: 1 -->',
+    '## Heading',
+    '',
+    'First paragraph.',
+    '',
+    '| A | B |',
+    '| --- | --- |',
+    '| 1 | 2 |',
+    '',
+    '<!-- page: 2 -->',
+    'Second page.',
+  ].join('\n')
+
+  it('changes only the block that was edited', () => {
+    const edited = replaceBlockSource(document, 0, 1, 'First paragraph, revised.')
+    expect(edited).toBe(document.replace('First paragraph.', 'First paragraph, revised.'))
+  })
+
+  it('lets one block become two', () => {
+    const edited = replaceBlockSource(document, 1, 0, 'Second page.\n\nAnd a third paragraph.')
+    const pages = parseResultMarkdown(edited)
+    expect(bare(pages[1]!.blocks)).toEqual([
+      { kind: 'p', text: 'Second page.' },
+      { kind: 'p', text: 'And a third paragraph.' },
+    ])
+    expect(serializeDocument(pages)).toBe(edited)
+  })
+
+  it('drops a block whose source was emptied', () => {
+    const edited = replaceBlockSource(document, 0, 2, '   ')
+    expect(edited).toBe(
+      ['<!-- page: 1 -->', '## Heading', '', 'First paragraph.', '', '<!-- page: 2 -->', 'Second page.'].join('\n'),
+    )
+  })
+
+  it('leaves the document alone for a block that does not exist', () => {
+    expect(replaceBlockSource(document, 5, 0, 'x')).toBe(document)
+  })
+})

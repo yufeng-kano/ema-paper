@@ -1,8 +1,16 @@
 import { describe, expect, it } from 'vitest'
 import type { UsageResponse } from './api'
-import { summarizeUsage } from './usage'
+import { cacheReadRatio, summarizeUsage } from './usage'
 
-const billedOnly = { calls: 1, estimated_cost: 0, estimated_calls: 0, unpriced_calls: 0 }
+const billedOnly = {
+  calls: 1,
+  estimated_cost: 0,
+  estimated_calls: 0,
+  unpriced_calls: 0,
+  cache_read_tokens: 0,
+  cache_write_tokens: 0,
+  agents: ['parse'],
+}
 
 const usage: UsageResponse = {
   days: 30,
@@ -15,6 +23,7 @@ const usage: UsageResponse = {
     { model: 'vendor/cheap', prompt_tokens: 500, completion_tokens: 100, cost: 0.01, ...billedOnly },
     { model: 'vendor/pricey', prompt_tokens: 4000, completion_tokens: 600, cost: 0.1, ...billedOnly },
   ],
+  per_agent: [],
 }
 
 describe('summarizeUsage', () => {
@@ -48,6 +57,7 @@ describe('summarizeUsage', () => {
       days: 7,
       per_day: [{ date: '2026-08-20', prompt_tokens: 10, completion_tokens: 0, cost: 0, ...billedOnly }],
       per_model: [],
+      per_agent: [],
     })
 
     expect(summary.days[0]?.costShare).toBe(0)
@@ -55,7 +65,7 @@ describe('summarizeUsage', () => {
   })
 
   it('is empty when the account has no usage at all', () => {
-    const summary = summarizeUsage({ days: 30, per_day: [], per_model: [] })
+    const summary = summarizeUsage({ days: 30, per_day: [], per_model: [], per_agent: [] })
 
     expect(summary.isEmpty).toBe(true)
     expect(summary.totalCost).toBe(0)
@@ -67,6 +77,7 @@ describe('summarizeUsage', () => {
       per_day: [
         {
           date: '2026-10-14',
+          agents: ['chat', 'parse'],
           calls: 6,
           prompt_tokens: 60,
           completion_tokens: 6,
@@ -74,6 +85,8 @@ describe('summarizeUsage', () => {
           estimated_cost: 0.5,
           estimated_calls: 3,
           unpriced_calls: 2,
+          cache_read_tokens: 30,
+          cache_write_tokens: 0,
         },
       ],
       per_model: [
@@ -86,8 +99,11 @@ describe('summarizeUsage', () => {
           estimated_cost: 0.5,
           estimated_calls: 3,
           unpriced_calls: 2,
+          cache_read_tokens: 30,
+          cache_write_tokens: 0,
         },
       ],
+      per_agent: [],
     })
 
     expect(summary.totalCost).toBe(0.01)
@@ -99,5 +115,21 @@ describe('summarizeUsage', () => {
     // A model nothing billed reads as "no bill", not as a $0 one — and ranks no bar.
     expect(summary.models[0]?.billedCalls).toBe(0)
     expect(summary.models[0]?.costShare).toBe(0)
+    expect(summary.days[0]?.agents).toEqual(['chat', 'parse'])
+    expect(summary.days[0]?.cacheReadTokens).toBe(30)
+  })
+})
+
+describe('cacheReadRatio', () => {
+  it('is the cache-read share of the prompt tokens', () => {
+    expect(cacheReadRatio(30, 60)).toBeCloseTo(0.5)
+  })
+
+  it('is null, not zero, when nothing was prompted', () => {
+    expect(cacheReadRatio(0, 0)).toBeNull()
+  })
+
+  it('never exceeds one', () => {
+    expect(cacheReadRatio(80, 60)).toBe(1)
   })
 })

@@ -7,7 +7,11 @@ import {
   kanoConnectUrl,
   listJobs,
   putAgentSettings,
+  putDocumentContent,
+  revertRevision,
   revokeKey,
+  sendMessage,
+  conversationEventsUrl,
 } from './api'
 
 function stubFetch(...responses: Response[]) {
@@ -102,6 +106,55 @@ describe('request', () => {
 
     expect(error.isOffline).toBe(true)
     expect(error.message).toBe('Failed to fetch')
+  })
+})
+
+describe('workspace and chat routes', () => {
+  it('sends a save with the revision it was made from', async () => {
+    const fetchMock = stubFetch(Response.json({ revision: 'b' }))
+
+    await expect(putDocumentContent(7, { markdown: '# x', base_revision: 'a' })).resolves.toEqual({
+      revision: 'b',
+    })
+    expect(fetchMock).toHaveBeenCalledWith('/api/library/documents/7/content', expect.anything())
+    expect(lastInit(fetchMock).method).toBe('PUT')
+    expect(lastInit(fetchMock).body).toBe(JSON.stringify({ markdown: '# x', base_revision: 'a' }))
+  })
+
+  it('surfaces a stale save as a 409', async () => {
+    stubFetch(Response.json({ error: { type: 'invalid_request', message: 'Stale' } }, { status: 409 }))
+
+    const error = (await putDocumentContent(7, { markdown: '', base_revision: 'old' }).catch(
+      (thrown: unknown) => thrown,
+    )) as ApiRequestError
+
+    expect(error.status).toBe(409)
+  })
+
+  it('posts a message with its selection and reads the queued turn', async () => {
+    const fetchMock = stubFetch(Response.json({ turn_id: 12 }, { status: 202 }))
+
+    await expect(sendMessage(3, { text: 'Fix table 1', selection: '| 3450 |' })).resolves.toEqual({
+      turn_id: 12,
+    })
+    expect(fetchMock).toHaveBeenCalledWith('/api/conversations/3/messages', expect.anything())
+    expect(headersOf(fetchMock)['X-Requested-With']).toBe('fetch')
+  })
+
+  it('addresses a revert by its commit, escaped into the path', async () => {
+    const fetchMock = stubFetch(Response.json({ revision: 'c' }))
+
+    await revertRevision(7, 'abc/def')
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/library/documents/7/revisions/abc%2Fdef/revert',
+      expect.anything(),
+    )
+    expect(lastInit(fetchMock).method).toBe('POST')
+  })
+
+  it('builds the event stream URL from the last seen sequence', () => {
+    expect(conversationEventsUrl(3, 41)).toBe('/api/conversations/3/events?after=41')
   })
 })
 
