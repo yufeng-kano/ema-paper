@@ -13,7 +13,7 @@ Hosted, multi-user **vision document parsing** service. Users sign in with Googl
 | [jobs.md](./jobs.md) | PG job queue (SKIP LOCKED), concurrency caps, SSE progress, dedup cache, file retention |
 | [database.md](./database.md) | PostgreSQL schema, Alembic migrations, secrets handling |
 | [mcp.md](./mcp.md) | One `parse` tool minting upload tickets + curl commands, streamable HTTP, Claude Connectors flow |
-| [web.md](./web.md) | Nuxt control plane: pages, the file library, the Graphite design system, the result viewer, i18n |
+| [web.md](./web.md) | Nuxt control plane: pages, the file library, filing parses from History, the Graphite design system, the result viewer, i18n |
 | [project-structure.md](./project-structure.md) | Monorepo layout and module boundaries |
 | [deployment.md](./deployment.md) | docker-compose (local, production, and an overlay for hosts with a front proxy), Caddy, TLS, env vars |
 | [testing.md](./testing.md) | Test strategy, cost-safety rules, commands |

@@ -50,6 +50,8 @@ import {
   acceptsUpload,
   canMoveFolder,
   childFolders,
+  DOCUMENT_NAME_MAX,
+  FOLDER_NAME_MAX,
   documentsIn,
   folderPath,
   isPending,
@@ -61,15 +63,12 @@ import type { TableColumn } from '~/lib/table'
 
 definePageMeta({ middleware: 'authed' })
 
-/** What the API accepts, so a field cannot present as valid what the server will refuse
- *  (`folders.name` and `documents.name`, docs/database.md). */
-const FOLDER_NAME_MAX = 255
-const DOCUMENT_NAME_MAX = 512
-
 /** How often the list re-reads itself while a parse is in flight. */
 const POLL_MS = 2000
 /** How long a file refused by the per-user job cap waits before trying again. */
 const BACKOFF_MS = 3000
+/** How long a row reached through `?document=` stays lit. */
+const REVEAL_MS = 2400
 
 const { t, locale } = useI18n()
 const auth = useAuth()
@@ -87,6 +86,41 @@ const crumbs = computed(() => folderPath(folders.value, currentFolder.value))
 function openFolder(id: FolderId) {
   currentFolder.value = id
 }
+
+/**
+ * `/files?document=<id>` — History's *Show in Files* (docs/web.md § Files). Read once and
+ * replaced away, so a refresh or a later visit opens at the top level as usual.
+ */
+const route = useRoute()
+const router = useRouter()
+const revealId = Number(route.query.document) || null
+const revealed = ref<number | null>(null)
+let revealTimer: ReturnType<typeof setTimeout> | undefined
+if (route.query.document !== undefined) {
+  void router.replace({ query: {} })
+}
+
+if (revealId !== null) {
+  // `once`: the first change of `data` is the first load; later polls must not pull the
+  // reader back to this folder.
+  watch(
+    data,
+    async (library) => {
+      const target = library?.documents.find((row) => row.id === revealId)
+      if (!target) {
+        return
+      }
+      currentFolder.value = target.folder_id
+      revealed.value = target.id
+      await nextTick()
+      document.querySelector('.contents tr.revealed')?.scrollIntoView({ block: 'center' })
+      revealTimer = setTimeout(() => (revealed.value = null), REVEAL_MS)
+    },
+    { once: true },
+  )
+}
+
+onBeforeUnmount(() => clearTimeout(revealTimer))
 
 /** A folder deleted in another tab would otherwise leave this screen looking at nothing. */
 watch(folders, (list) => {
@@ -888,8 +922,8 @@ function rowAttrs(row: Row): Record<string, unknown> {
     onKeydown: (event: KeyboardEvent) => openMenuFromKey(event, on),
     ...press.on((at) => openMenu(on, at)),
   }
-  if (row.kind !== 'folder') {
-    return base
+  if (row.kind === 'file') {
+    return { ...base, class: { file: true, revealed: revealed.value === row.document.id } }
   }
   return {
     ...base,
@@ -1182,7 +1216,8 @@ function rowAttrs(row: Row): Record<string, unknown> {
       :forbidden="forbiddenTargets"
       :pending="busy"
       :error="mutationError"
-      @move="submitMove"
+      @choose="submitMove"
+      @created="refresh()"
       @cancel="moving = null"
     />
 
@@ -1375,6 +1410,15 @@ function rowAttrs(row: Row): Record<string, unknown> {
 .contents :deep(tbody tr) {
   user-select: none;
   -webkit-touch-callout: none;
+}
+
+/* The row `?document=` pointed at: lit on arrival, then fading back to an ordinary row. */
+.contents :deep(tr.file) td {
+  transition: background var(--duration-slow) var(--ease);
+}
+
+.contents :deep(tr.revealed) td {
+  background: var(--rail-active);
 }
 
 /* A folder row lit up as a drop target. Inset, so accepting a drop does not move the row. */

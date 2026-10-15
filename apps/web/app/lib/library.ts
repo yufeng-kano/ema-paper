@@ -14,6 +14,11 @@ import type { LibraryDocument, LibraryFolder, UploadLimits } from '~/lib/api'
 
 export type FolderId = number | null
 
+/** What the API accepts, so a field cannot present as valid what the server will refuse
+ *  (`folders.name` and `documents.name`, docs/database.md). */
+export const FOLDER_NAME_MAX = 255
+export const DOCUMENT_NAME_MAX = 512
+
 /** One line of the rail's tree: the folder, how deep it sits, and whether it opens. */
 export interface TreeRow {
   folder: LibraryFolder

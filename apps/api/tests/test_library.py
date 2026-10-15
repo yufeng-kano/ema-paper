@@ -414,6 +414,76 @@ async def test_a_documents_stored_figure_crop_is_served(library, tmp_path, docum
     assert invalid.status_code == 404
 
 
+# --- filing a parse from the history ----------------------------------------------------
+
+
+async def _file_job(client: AsyncClient, job_id: str, folder_id: int | None = None):
+    return await client.post(
+        "/api/library/documents/from-job",
+        json={"job_id": job_id, "folder_id": folder_id},
+        headers=CSRF_HEADERS,
+    )
+
+
+async def test_a_parse_in_the_history_can_be_filed_without_a_second_parse(
+    library, sessionmaker, documents
+) -> None:
+    uploaded = (await _upload(library, documents)).json()
+    folder = await _folder(library, "Papers")
+
+    filed = await _file_job(library, uploaded["job_id"], folder["id"])
+    assert filed.status_code == 201, filed.text
+    body = filed.json()
+    assert body["job_id"] == uploaded["job_id"]
+    assert body["folder_id"] == folder["id"]
+    assert body["name"] == "tiny.png"
+    assert body["status"] == "queued"
+
+    async with sessionmaker() as db:
+        assert len((await db.execute(select(Job))).scalars().all()) == 1
+
+
+async def test_filing_a_parse_twice_into_one_folder_suffixes_the_name(library, documents) -> None:
+    uploaded = (await _upload(library, documents)).json()
+    filed = await _file_job(library, uploaded["job_id"])
+    assert filed.status_code == 201, filed.text
+    assert filed.json()["name"] == "tiny (2).png"
+
+
+async def test_a_failed_parse_cannot_be_filed(library, sessionmaker, documents) -> None:
+    uploaded = (await _upload(library, documents)).json()
+    async with sessionmaker() as db:
+        await db.execute(
+            update(Job).where(Job.id == uuid.UUID(uploaded["job_id"])).values(status="failed")
+        )
+        await db.commit()
+
+    refused = await _file_job(library, uploaded["job_id"])
+    assert refused.status_code == 400
+    assert len((await _read(library))["documents"]) == 1
+
+
+async def test_a_parse_whose_filename_cleans_to_nothing_is_still_filed(
+    library, sessionmaker, documents
+) -> None:
+    uploaded = (await _upload(library, documents)).json()
+    async with sessionmaker() as db:
+        await db.execute(
+            update(Job).where(Job.id == uuid.UUID(uploaded["job_id"])).values(filename="//")
+        )
+        await db.commit()
+
+    filed = await _file_job(library, uploaded["job_id"])
+    assert filed.status_code == 201, filed.text
+    assert filed.json()["name"] == "upload"
+
+
+async def test_filing_needs_a_known_job_and_a_known_folder(library, documents) -> None:
+    assert (await _file_job(library, str(uuid.uuid4()))).status_code == 404
+    uploaded = (await _upload(library, documents)).json()
+    assert (await _file_job(library, uploaded["job_id"], 999_999)).status_code == 404
+
+
 # --- ownership and CSRF ---------------------------------------------------------------
 
 
@@ -449,6 +519,7 @@ async def test_another_accounts_library_is_invisible(
     assert (
         await stranger.delete(f"/api/library/documents/{document['id']}", headers=CSRF_HEADERS)
     ).status_code == 404
+    assert (await _file_job(stranger, document["job_id"])).status_code == 404
     # Nothing the stranger tried removed anything.
     assert len((await _read(library))["folders"]) == 1
 
@@ -461,6 +532,11 @@ async def test_library_mutations_need_the_csrf_header(library, documents) -> Non
         await library.post(
             "/api/library/documents",
             files={"file": ("tiny.png", documents["png"].read_bytes(), "image/png")},
+        )
+    ).status_code == 403
+    assert (
+        await library.post(
+            "/api/library/documents/from-job", json={"job_id": str(uuid.uuid4())}
         )
     ).status_code == 403
 
