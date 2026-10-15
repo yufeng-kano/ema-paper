@@ -7,7 +7,7 @@ This assumes the MCP client can run shell commands with network access to this h
 ## Transport & auth
 
 - Endpoint: `POST /mcp` (streamable HTTP, official `mcp` Python SDK, mounted inside the same FastAPI app).
-- Auth: `Authorization: Bearer` with either an OAuth access token (Claude Connectors path — see [auth.md](./auth.md) § 4) or a project API key (scripts/self-hosted agents). Both resolve to a user; the user's stored OpenRouter key and defaults apply.
+- Auth: `Authorization: Bearer` with either an OAuth access token (Claude Connectors path — see [auth.md](./auth.md) § 4) or a project API key (scripts/self-hosted agents). Both resolve to a user; that user's `parse` agent settings apply — its upstream (Kano Proxy or a provider connection), model and prompt ([agents.md](./agents.md)).
 - Never accept tokens in query strings.
 
 ## The one tool: `parse`
@@ -34,7 +34,7 @@ Output (JSON): a fresh single-use upload ticket ([auth.md](./auth.md) § 5) plus
 - Crop coordinates ship inline: each `![figN](sightread://pPAGE/YMIN,XMIN,YMAX,XMAX)` placeholder in `result.md` carries its own 0-1000-normalized box, so cropping needs only that file plus a render of the page. The notes say so, or agents assume a second fetch is required.
 - `last` resolves to the job this ticket's upload created ([api.md](./api.md) § GET /v1/jobs/last*), so no command needs a job id filled in. The explicit `/v1/jobs/<job_id>` routes still exist for durable credentials; `job_id` is in every SSE `progress` event and in `meta.job_id`.
 - **markdown** re-fetches the `.md` alone (a dropped chain, a second look). **metadata** lands `<name>.meta.json` — the structured remainder: `figures` with captions, `pages`, `errors`, `meta`. **status** answers "is it done / what failed".
-- `notes` must spell out: optional form fields (`model`, `profile`, `pages` e.g. `1-5,8`, `force`), PDF or image (jpg/png/webp/heic) both go to the same endpoint, the page markers, and the recovery rule — if the ticket is spent or expired, call `parse` again; re-uploading the same file returns the cached result instantly ([jobs.md](./jobs.md) § Dedup).
+- `notes` must spell out: optional form fields (`model`, `pages` e.g. `1-5,8`, `force`), PDF or image (jpg/png/webp/heic) both go to the same endpoint, the page markers, and the recovery rule — if the ticket is spent or expired, call `parse` again; re-uploading the same file returns the cached result instantly ([jobs.md](./jobs.md) § Dedup).
 
 Tool description stays short and explicit about the coordinate contract (`bbox_format`, `sightread://` placeholders, "you crop, we don't").
 

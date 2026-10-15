@@ -7,9 +7,9 @@ Canonical project rules (`.rule`; AGENTS.md / CLAUDE.md symlink here). This file
 - Read the docs matching the task before non-trivial work. Feature/schema/behavior changes: update `docs/` first, then implement; keep `docs/index.md` in sync.
 - If a request conflicts with docs, state the conflict and wait for an explicit override.
 
-## Cost safety — user OpenRouter keys are real money
+## Cost safety — users' upstream keys are real money
 
-- Never debug, reproduce, or benchmark against OpenRouter or any paid upstream. Verification is tests with stubbed HTTP (`docs/testing.md`). A live smoke test needs explicit per-instance approval: one tiny document, one cheap model, never a loop.
+- Never debug, reproduce, or benchmark against Kano Proxy, a user's provider connection, or any paid upstream. Verification is tests with stubbed HTTP (`docs/testing.md`). A live smoke test needs explicit per-instance approval: one tiny document, one cheap model, never a loop.
 
 ## Secrets
 
@@ -33,4 +33,4 @@ Canonical project rules (`.rule`; AGENTS.md / CLAUDE.md symlink here). This file
 
 ## Real data only
 
-- Frontend renders only what the backend returns; empty is a real state. Models come from OpenRouter's live catalog, usage from `usage_log` — never hard-coded as if live. Exceptions: test fixtures, docs examples with placeholders.
+- Frontend renders only what the backend returns; empty is a real state. Models come from the live catalog of the agent's upstream (Kano Proxy or a provider connection), usage from `usage_log` — never hard-coded as if live. Exceptions: test fixtures, docs examples with placeholders.

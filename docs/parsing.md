@@ -14,7 +14,7 @@ Why subprocess, not a linked library: crash isolation (a malicious PDF kills the
 Every page is converted the same way — **one path, no routing**:
 
 1. Render the page (`pdftoppm`).
-2. Send the rendered image to the user's chosen model via OpenRouter with the transcription prompt. The model returns the page's markdown with figure placeholders inline. `method: "vision"` on every page.
+2. Send the rendered image to the model chosen for the `parse` agent ([agents.md](./agents.md)), on its upstream (Kano Proxy or a provider connection), with the transcription prompt. The model returns the page's markdown with figure placeholders inline. `method: "vision"` on every page.
 
 There is no PDF-text-layer conversion path: the product converts what the page *looks like*, and a single pipeline means every page obeys the same prompt, the same figure contract and the same failure rules. The PDF text layer is never extracted — `pdfinfo` and `pdftoppm` are the only Poppler calls.
 
@@ -57,19 +57,18 @@ The transcription prompt is a template with two tokens, `{page}` and `{bbox_form
 
 Resolution order for a job's prompt, decided at enqueue time and stored on the job row:
 
-1. **The user's selected prompt preset** (`user_settings.prompt_preset_id` → `prompt_presets.text`, managed on the web settings page) when one is selected. It replaces the template entirely — including for preset profiles — and figure/bbox quality is then the user's own responsibility.
-2. The preset profile's template, for a job running a profile.
-3. `DEFAULT_PROMPT_TEMPLATE` (shipped in code, shown on the settings page as the default).
+1. **The user's selected prompt preset for the agent** (`agent_settings.prompt_preset_id` → `prompt_presets.text`, managed in the agent's section of the web settings page) when one is selected. It replaces the template entirely, and figure/bbox quality is then the user's own responsibility.
+2. The agent's default template — for `parse`, `DEFAULT_PROMPT_TEMPLATE`, part of the agent's definition in code and shown on the settings page as the default ([agents.md](./agents.md)).
 
 What the default template asks for beyond the markdown itself: the page's **furniture is left out** — a page or slide number, and a running header or footer that repeats across pages. A deck numbers every slide and a paper numbers every page; neither is what a reader of a transcription came for, and the viewer already knows which page a passage came from (web.md § Result viewer). The instruction then says, explicitly, that a number inside a sentence, a figure or table label, a citation marker, a numbered heading or a table **is** content: a model told to drop numbers will otherwise drop the ones that carry meaning. Changing the template changes results, so `PIPELINE_VERSION` moves with it and cached results parsed under the old wording stop answering new uploads.
 
 `jobs.prompt` holds the effective template verbatim (reproducibility); `jobs.prompt_sha256` is part of the dedup cache key ([jobs.md](./jobs.md)), so editing a preset's text invalidates cached results parsed with the old one.
 
-## Profiles
+## Models
 
-A profile = model id + prompt template + response parser + `bbox_format` + profile version. Presets ship in code (`gemini-yxyx` targeting current Gemini flash-tier vision models, `qwen-yxyx` targeting current Qwen VL models; both prompt the same `yxyx_norm1000` contract — resolve actual ids from the live `/v1/models` catalog at startup, never hard-code a dead id). Users may instead pick **any** image-input model: it runs with the default prompt template, is labeled untested, and bbox quality is explicitly their responsibility. Such a job stores `profile: null` and `profile_version: 0`, so a change to the default template is covered by `PIPELINE_VERSION` instead.
+There are no preset profiles. The user picks any model from the live catalog of the agent's upstream (`GET /api/agents/parse/models`, [api.md](./api.md)); nothing is recommended or hard-coded, and nothing filters the catalog to vision models yet ([agents.md](./agents.md) — `parse` declares `vision` but the declaration is not enforced). Every model runs the same prompt contract (`yxyx_norm1000`), and bbox quality depends on the model the user chose.
 
-`profile_version` and global `PIPELINE_VERSION` are part of the dedup cache key ([jobs.md](./jobs.md)) so prompt/pipeline improvements invalidate old cached results.
+`PIPELINE_VERSION` (part of `parse`'s definition) and the prompt hash are part of the dedup cache key ([jobs.md](./jobs.md)), so prompt/pipeline improvements invalidate old cached results.
 
 ## Image input
 
@@ -81,18 +80,18 @@ Accepted: jpg, png, webp, heic. Normalization before the vision call, in this or
 
 Single page; `width_pt`/`height_pt` are the pixel dimensions of the (original) input image; bbox space is still 0–1000 normalized.
 
-## Upstream usage (OpenRouter or an OpenAI-compatible connection)
+## Upstream usage (Kano Proxy or an OpenAI-compatible connection)
 
-Vision calls run against the job's upstream ([api.md](./api.md) § Upstreams): OpenRouter when `jobs.connection_id` is NULL, otherwise that provider connection's `{base_url}/chat/completions` with the connection's key. One wire format everywhere — OpenAI Chat Completions with an `image_url` data-URI part; only OpenRouter gets the extra `usage: {include: true}` body field (unknown to other servers).
+Vision calls run against the job's upstream ([api.md](./api.md) § Upstreams): Kano Proxy's `{KANO_PROXY_BASE_URL}/openai/v1/chat/completions` with the user's Kano Proxy key when `jobs.connection_id` is NULL, otherwise that provider connection's `{base_url}/chat/completions` with the connection's key. One wire format everywhere — OpenAI Chat Completions with an `image_url` data-URI part, no extension fields.
 
 - One request per page, fanned out with an asyncio semaphore (`VISION_CONCURRENCY_PER_JOB`, default 8); 429 → exponential backoff + reduced concurrency for that job.
 - **A transient failure is retried before the page is given up.** One upstream call gets up to `VISION_MAX_ATTEMPTS` (4) tries with exponential backoff. Transient means the same request may well succeed a moment later: the endpoint was unreachable or timed out, it answered 408 or 5xx (as a status or as an error payload inside a 200), its body was not JSON, or the completion came back empty. Unlike a 429 these do not shrink the job's concurrency — the upstream is flaky, not throttling. What is **not** retried is what will fail the same way again: any other 4xx, a response over the size cap, 402 and a rejected key. A page that still fails after the last attempt is recorded as failed with the same reasons as before, and the worker logs the upstream's own failure message (a status code or a fixed phrase, never credential material or document content) so a failed page can be diagnosed afterwards.
 - **A blank page is a page, not a failure.** The prompt tells the model to leave out page furniture, so a page that carries nothing but its number — the blank verso before a book chapter — honestly transcribes to nothing, and some servers say "nothing" as `content: null` or as no choice at all rather than as an empty string. A `null` content on a choice that finished with `stop` is the model's complete answer and is an empty page at once. An empty completion in any other shape is ambiguous, so it is retried as transient first; if every attempt comes back empty, the page is recorded as succeeded and empty rather than failed. A completion cut short (`finish_reason` `length`, `content_filter`, …) is never read as blank. Empty pages are dropped from the assembled markdown as they always were, and do not appear in `errors`.
 - Every response's `usage` object is written to `usage_log` per call, and every row says where its cost came from (`usage_log.cost_source`, [database.md](./database.md)):
-  - **`openrouter`** — the built-in upstream. `usage.cost` is OpenRouter's own billing for the call, recorded as it arrives (a missing or unreadable value is recorded as 0, as it always was). This is the only cost Sightread calls *billed*.
-  - **`estimated`** — a provider connection with **Use the cost this endpoint reports** turned on (`provider_connections.report_cost`, off by default) answered with a numeric `usage.cost`. Recorded as reported, and only ever shown as an estimate: the endpoint priced the call, not a bill — kano-proxy, for instance, reports what the call would have cost at list prices, including for subscription traffic nobody is charged per call for. A JSON number only, finite, not negative, and within the column's range; anything else is `unknown`.
-  - **`unknown`** — a connection without the flag, or one with it whose response carried no usable cost (missing, `null`, a string, negative, out of range). The tokens are recorded and the cost is NULL, never 0: a call nobody priced must not read as a free one.
+  - **`estimated`** — the built-in Kano Proxy answered with a numeric `usage.cost`, or a provider connection with **Use the cost this endpoint reports** turned on (`provider_connections.report_cost`, off by default) did. Recorded as reported, and only ever shown as an estimate: Kano Proxy reports what the call would have cost at list prices, including for subscription traffic nobody is charged per call for — the endpoint priced the call, it is not a bill. A JSON number only, finite, not negative, and within the column's range; anything else is `unknown`.
+  - **`unknown`** — a connection without the flag, or an upstream whose response carried no usable cost (missing, `null`, a string, negative, out of range). The tokens are recorded and the cost is NULL, never 0: a call nobody priced must not read as a free one.
+  - **`openrouter`** — historical rows only, from when OpenRouter was the built-in upstream: its own billing for the call. No new row is written with it; the old ones stay readable and are what Usage calls *billed*.
 
-  Usage totals keep the three apart ([api.md](./api.md) § `GET /api/usage`): billed cost is never summed with estimates, and unpriced calls are counted, not priced. The flag is opt-in per connection and never inferred from the URL — Sightread does not know which endpoints price honestly, the user does. It is read from the connection when the job runs, like its URL and key ([database.md](./database.md) § Rules). Never maintain a local price table and never price a call locally.
+  Usage totals keep the three apart ([api.md](./api.md) § `GET /api/usage`): billed cost is never summed with estimates, and unpriced calls are counted, not priced. Kano Proxy's cost is always recorded (sightread knows what it reports); for a connection the flag is opt-in and never inferred from the URL — Sightread does not know which other endpoints price honestly, the user does. It is read from the connection when the job runs, like its URL and key ([database.md](./database.md) § Rules). Never maintain a local price table and never price a call locally.
 - Upstream response bodies are read with a size cap (`UPSTREAM_RESPONSE_MAX_BYTES`, default 32 MB) — a user-controlled endpoint must not be able to exhaust worker/API memory with an unbounded body; over the cap the call fails as an upstream error.
-- 402 → mark the page failed with reason `payment`, continue remaining pages only if the error is page-scoped; abort the job when the key is clearly dead.
+- 402 → mark the page failed with reason `payment`, continue remaining pages only if the error is page-scoped; abort the job when the key is clearly dead. 401/403 (a rejected key — e.g. a Kano Proxy key revoked on its Access page) aborts the job at once.

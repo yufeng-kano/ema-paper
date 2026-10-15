@@ -2,7 +2,7 @@
 
 Two planes, one FastAPI app.
 
-**Upstreams.** Vision calls go to OpenRouter (the built-in default, billed to the user's own OpenRouter key) or to one of the user's **provider connections** — a complete profile: a named OpenAI-compatible Chat Completions endpoint (`base_url` + API key + a fixed `model` from that endpoint's catalog), e.g. a kano-proxy `/openai/v1` base. The active upstream is the user's `default_connection_id` setting (`NULL` = OpenRouter) and is resolved at enqueue time onto the job; `/v1/parse` has no per-request connection override yet. Preset profiles and the `/v1/models` catalog are OpenRouter-only; a custom connection runs its own stored model (a per-request `model` still overrides it) with the default (or preset) prompt. `default_model`/`default_profile` in user settings apply to the OpenRouter path only.
+**Upstreams.** Vision calls go to **Kano Proxy** (the built-in default, with the key the user obtained through the connect flow, [auth.md](./auth.md) § 6) or to one of the user's **provider connections** — a named OpenAI-compatible Chat Completions endpoint: `name`, `base_url`, API key and the `report_cost` flag, nothing else. Kano Proxy is called at `{KANO_PROXY_BASE_URL}/openai/v1` (`/chat/completions`, `/models`) with `Authorization: Bearer <the user's Kano Proxy key>`; a connection at its own `base_url`. Which upstream and which model an agent runs is a per-agent setting ([agents.md](./agents.md)), resolved at enqueue time onto the job; `/v1/parse` has no per-request upstream override, and a per-request `model` overrides the stored one.
 
 - **Data plane `/v1/*`** — authenticated by API key (`Authorization: Bearer sr_...`) or an OAuth access token ([auth.md](./auth.md)). This is the product. `POST /v1/parse` and the three `GET /v1/jobs/{id}*` routes additionally accept a single-use upload ticket (`srt_...`, [auth.md](./auth.md) § 5): one upload, then reads of the job that upload created, nothing else.
 - **Control plane `/api/*`** — session cookie (Google OIDC), consumed only by the Nuxt web app.
@@ -22,8 +22,7 @@ Multipart form (preferred) or JSON with base64 `source`.
 | Field | Notes |
 |-------|-------|
 | `file` | required; PDF or image (jpg/png/webp/heic). Max **128 MB** (`UPLOAD_MAX_BYTES`), PDFs max **500 pages** (`PAGE_CAP`) |
-| `model` | optional model id on the active upstream (OpenRouter, or the default connection's catalog); default from user settings on OpenRouter, or the connection's own stored model |
-| `profile` | optional preset profile id; mutually exclusive with raw `model` + `bbox_prompt` overrides ([parsing.md](./parsing.md)); refused (400) when the user's default connection is a custom one |
+| `model` | optional model id on the parse agent's upstream (Kano Proxy's or the selected connection's catalog); default: the model stored in the parse agent's settings. Neither → 400 ([agents.md](./agents.md) § Enqueue rules) |
 | `pages` | optional selection, e.g. `"1-5,8"`; default all |
 | `force` | optional bool; bypass dedup cache |
 
@@ -51,8 +50,8 @@ The multipart body is read through a **bounded stream** rather than Starlette's 
   "errors":  [ { "page": 7, "reason": "render failed" } ],
   "meta": {
     "job_id": "…",
-    "model": "google/gemini-…",
-    "profile": "gemini-yxyx",
+    "agent": "parse",
+    "model": "provider/model",
     "bbox_format": "yxyx_norm1000",
     "pipeline_version": 2,
     "sha256": "…",
@@ -62,6 +61,8 @@ The multipart body is read through a **bounded stream** rather than Starlette's 
 ```
 
 `markdown` carries a `<!-- page: N -->` marker line before each page's content ([parsing.md](./parsing.md) § Page markers). Figure placeholders in markdown: `![fig1](sightread://p3/120,60,480,940)` with the caption verbatim on the next line. Cropping is the caller's job (add ~2% margin; denormalize `x_px = x/1000 * page_width_px`).
+
+Results stored before the Kano Proxy migration still carry `meta.profile` (the OpenRouter preset profile they ran); new results carry `meta.agent` instead.
 
 ### GET /v1/jobs/{id}/result.md — markdown only
 
@@ -77,26 +78,26 @@ Events: `progress` (`{job_id, pages_done, page_count, page, method}` per finishe
 
 ### GET /v1/models
 
-Also accepts a web session cookie (with `GET /v1/profiles`, the two read-only routes the web app may call on the data plane). OpenRouter model catalog filtered to `architecture.input_modalities` containing `"image"`, cached server-side ~1 h. Each entry carries `recommended: true` when a preset profile targets it. Never hard-code model ids.
-
-### GET /v1/profiles
-
-Preset profiles (id, name, model, bbox_format, description).
+The live model catalog of the caller's **parse** upstream — `GET {KANO_PROXY_BASE_URL}/openai/v1/models` with the user's Kano Proxy key, or `GET {base_url}/models` of the selected connection — as `{data: [{id, name}]}`. No capability filtering (deferred, [agents.md](./agents.md)) and no server cache. 400 when Kano Proxy is selected but not connected. Also accepts a web session cookie. Never hard-code model ids.
 
 ## Control plane (session cookie, CSRF-safe: SameSite=Lax + custom header check on mutations)
 
 | Route | Purpose |
 |-------|---------|
 | `GET /api/auth/login` → Google, `GET /api/auth/callback`, `POST /api/auth/logout` | OIDC flow ([auth.md](./auth.md)) |
-| `GET /api/me` | current user (incl. `picture`, the Google avatar URL) + settings (`default_model`, `default_profile`, `default_connection_id`, `prompt_preset_id`) + the shipped default prompt (`defaults.system_prompt`) + whether an OpenRouter key is stored (masked, never the value) + `limits` (`upload_max_bytes`, `page_cap`, `accepted_media_types`, `accepted_extensions`) so the upload UI enforces the server's numbers rather than its own — the extensions matter because intake accepts a file by extension when the browser reports a generic media type for it |
+| `GET /api/me` | current user (incl. `picture`, the Google avatar URL) + `limits` (`upload_max_bytes`, `page_cap`, `accepted_media_types`, `accepted_extensions`) so the upload UI enforces the server's numbers rather than its own — the extensions matter because intake accepts a file by extension when the browser reports a generic media type for it |
 | `GET/POST /api/keys`, `DELETE /api/keys/{id}` | API keys; `POST` returns the created key (with plaintext) exactly once, unwrapped; `GET` wraps as `{keys: []}` |
-| `GET/PUT/DELETE /api/openrouter-key` | read masked form / store (validated against `GET https://openrouter.ai/api/v1/key` before save) / remove |
-| `GET/POST /api/connections`, `PUT/DELETE /api/connections/{id}` | provider connections (a profile: `name`, `base_url`, API key, `model`, `report_cost`); key returned masked only; `POST` requires `model` and `POST`/`PUT` validate the endpoint + key with `GET {base_url}/models` before storing. `report_cost` (bool, default `false`; optional on `POST`, partial on `PUT`) records the `usage.cost` the endpoint reports as an **estimate** ([parsing.md](./parsing.md) § Upstream usage); changing it alone does not re-validate the endpoint |
+| `GET /api/kano` | Kano Proxy state: `{available, connected, masked}` — `available` is false when the deployment has no Kano Proxy configured; the key is masked only ([auth.md](./auth.md) § 6) |
+| `GET /api/kano/connect`, `GET /api/kano/callback` | the connect flow: a browser navigation to Kano Proxy's consent and back, ending in a 302 to `/settings?kano=connected\|denied\|error` ([auth.md](./auth.md) § 6) |
+| `DELETE /api/kano` | forget the stored Kano Proxy key (local only; it stays listed on Kano Proxy's Access page) |
+| `GET /api/agents` | the agent registry with the caller's settings: `{agents: [{name, capabilities, input, output, default_prompt, settings: {connection_id, model, prompt_preset_id}}]}` ([agents.md](./agents.md)) |
+| `PUT /api/agents/{agent}/settings` | partial update of one agent's `connection_id` (`null` = Kano Proxy), `model`, `prompt_preset_id` (only the fields present change; `null` restores the default). Changing `connection_id` without sending `model` clears the model — it belonged to the other upstream's catalog. The connection and the preset must be the caller's, and the preset must be for this agent. 404 for an unknown agent |
+| `GET /api/agents/{agent}/models` | the live model catalog of that agent's saved upstream, `{data: [{id, name}]}` — what the settings page's model picker lists. 400 when Kano Proxy is selected but not connected |
+| `GET/POST /api/connections`, `PUT/DELETE /api/connections/{id}` | provider connections (`name`, `base_url`, API key, `report_cost`); key returned masked only; `POST`/`PUT` validate the endpoint + key with `GET {base_url}/models` before storing. Deleting a connection points every agent that used it back at Kano Proxy with no model. `report_cost` (bool, default `false`; optional on `POST`, partial on `PUT`) records the `usage.cost` the endpoint reports as an **estimate** ([parsing.md](./parsing.md) § Upstream usage); changing it alone does not re-validate the endpoint |
 | `POST /api/connections/preview-models` | live model catalog (`{data: [{id, name}]}`) for the connection dialog, before or while a connection exists: `{base_url, api_key}` fetches with the candidate key, `{base_url, connection_id}` with that connection's stored key; the URL passes the same rules as saving ([auth.md](./auth.md) § 3); no server cache |
-| `GET/POST /api/prompts`, `PUT/DELETE /api/prompts/{id}` | prompt presets (`{id, name, text}`); text capped at `SYSTEM_PROMPT_MAX_CHARS`; deleting the selected preset falls back to the default prompt |
-| `PUT /api/settings` | default model / profile (OpenRouter-only defaults) / `default_connection_id` / `prompt_preset_id` (partial update: only the fields present in the body change; `null` restores the respective default). `default_profile` is refused when a custom connection is selected — profiles run on OpenRouter only; a connection's model lives on the connection itself |
+| `GET/POST /api/prompts`, `PUT/DELETE /api/prompts/{id}` | prompt presets (`{id, agent, name, text}`); `POST` takes `agent` (default `parse`, must be a registered agent; fixed afterwards); text capped at `SYSTEM_PROMPT_MAX_CHARS`; deleting a selected preset falls back to the agent's default prompt |
 | `GET /api/usage?days=30` | per-day and per-model aggregates of tokens + cost from `usage_log`, billed and estimated cost kept apart (§ Usage aggregates) |
-| `GET /api/jobs?limit=50` | recent jobs (history): `job_id`, `kind`, `filename`, `status`, `model`, `profile`, `page_count`, `pages_done`, `error`, timestamps — no per-job cost (usage is aggregated per day/model only); `GET /api/jobs/{id}/result` same payload as data plane, plus partial results (below) |
+| `GET /api/jobs?limit=50` | recent jobs (history): `job_id`, `agent`, `kind`, `filename`, `status`, `model`, `page_count`, `pages_done`, `error`, timestamps — no per-job cost (usage is aggregated per day/model only); `GET /api/jobs/{id}/result` same payload as data plane, plus partial results (below) |
 | `GET /api/jobs/{id}/figures/{page}/{ymin},{xmin},{ymax},{xmax}` | one stored figure crop as `image/png`, addressed exactly as its `sightread://` placeholder addresses it; 404 when no crop was stored (old results, failed crop). Control plane only — the data plane ships coordinates, not image bytes ([parsing.md](./parsing.md) § Figure crops) |
 | `GET /api/library` | the whole file library in one read: `{folders: [...], documents: [...]}`. A document carries its own fields (`id`, `folder_id`, `name`, `job_id`) plus the parse's live state (`status`, `kind`, `model`, `page_count`, `pages_done`, `size_bytes`, `error`, `created_at`, `finished_at`) — the browser needs no second request to render a row or its progress |
 | `POST /api/library/folders`, `PUT/DELETE /api/library/folders/{id}` | create (`name`, optional `parent_id`) / rename **and** move (partial: only the fields present change) / delete. Deleting cascades to the subtree; a `parent_id` inside the folder's own subtree is refused (a directory cannot contain itself). A name that is already taken is suffixed ` (2)` on create and on move, and answers 409 on a rename |
@@ -118,11 +119,11 @@ While a job is still `queued` or `running`, the two control-plane result routes 
 |-------|---------|
 | `calls` | `usage_log` rows (one per upstream call) |
 | `prompt_tokens`, `completion_tokens` | summed over every call, priced or not |
-| `cost` | **billed**: the sum of OpenRouter's own cost (`cost_source = openrouter`) — the same number this field always carried, since connection calls used to record 0 |
-| `estimated_cost`, `estimated_calls` | the sum and count of costs a connection reported with `report_cost` on (`cost_source = estimated`) — an estimate, never added into `cost` |
+| `cost` | **billed**: the sum of OpenRouter's own cost (`cost_source = openrouter`). Only historical rows carry it — OpenRouter was removed and no new call is billed — so for recent periods this is 0 with no billed calls behind it |
+| `estimated_cost`, `estimated_calls` | the sum and count of costs Kano Proxy reported (always recorded) or a connection reported with `report_cost` on (`cost_source = estimated`) — an estimate, never added into `cost` |
 | `unpriced_calls` | calls whose cost is unknown (`cost_source = unknown`); counted, never priced as 0 |
 
-`calls - estimated_calls - unpriced_calls` is the number of billed calls, so a client can tell "OpenRouter billed $0" from "nothing here went through OpenRouter". The per-model grouping is by model id alone, as before; one id used on both OpenRouter and a connection lands in one entry with its figures still separated by source.
+`calls - estimated_calls - unpriced_calls` is the number of billed calls, so a client can tell "OpenRouter billed $0" from "nothing here went through OpenRouter". The per-model grouping is by model id alone, as before; one id used on two upstreams lands in one entry with its figures still separated by source.
 
 ### Why the web upload is a control-plane route
 
@@ -135,4 +136,4 @@ While a job is still `queued` or `running`, the two control-plane result routes 
 - `SYSTEM_PROMPT_MAX_CHARS` = 8000 — cap on a prompt preset's text.
 - `FIGURES_PER_PAGE_MAX` = 40 — cap on stored figure crops per page ([parsing.md](./parsing.md) § Figure crops).
 - `UPSTREAM_RESPONSE_MAX_BYTES` = 33554432 (32 MB) — cap on any upstream response body (model catalogs and vision completions); beyond it the call fails as `upstream` ([parsing.md](./parsing.md) § Upstream usage).
-- 429 with `Retry-After` when the per-user job cap is hit; upstream 402 (OpenRouter credits exhausted) maps to `payment` and fails only the affected pages.
+- 429 with `Retry-After` when the per-user job cap is hit; upstream 402 (the upstream's credits or allowance exhausted) maps to `payment` and fails only the affected pages.

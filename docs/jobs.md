@@ -22,7 +22,7 @@ One worker process runs one job at a time — concurrency inside a job is the pa
 ## Concurrency caps (defaults)
 
 - `MAX_JOBS_PER_USER` = 2 running jobs; excess `POST /v1/parse` gets 429 + `Retry-After` (fail closed, never crash). The web library's upload runs the same intake and hits the same cap, so a multi-file drop is a client-side queue that treats the 429 as back-pressure and retries ([web.md](./web.md) § Files) — the cap is not relaxed for a browser.
-- `VISION_CONCURRENCY_PER_JOB` = 8 concurrent OpenRouter calls.
+- `VISION_CONCURRENCY_PER_JOB` = 8 concurrent upstream calls.
 - `RENDER_WORKERS` = CPU count (env-overridable) concurrent Poppler subprocesses per worker.
 
 Fairness: the claim query above is FIFO; per-user cap is enforced at claim time too (skip a queued job whose user already has `MAX_JOBS_PER_USER` running).
@@ -35,12 +35,14 @@ Each finished page's markdown is stored on its `job_pages` row (`markdown`, NULL
 
 ## Dedup cache
 
-Key: `(user_id, sha256, model, connection_id, connection_base_url, profile, profile_version, pages_spec, prompt_sha256, PIPELINE_VERSION)` — `connection_id` because the same model id on two different endpoints is not the same model, and `connection_base_url` (the endpoint snapshot) because *editing* a connection's URL repoints what that id means: results parsed through the old endpoint must not answer uploads aimed at the new one. The snapshot is taken at enqueue and **reconciled at claim time**: if the connection's URL changed while the job sat queued, the worker updates the job's snapshot to the endpoint it actually calls, so the cached result is keyed by the URL that truly produced it. A key rotation alone does not invalidate the cache — same endpoint, same model, same output.
+Key: `(user_id, agent, sha256, model, connection_id, connection_base_url, pages_spec, prompt_sha256, pipeline_version)` — `agent` because one agent's output never answers another's request ([agents.md](./agents.md)), `connection_id` because the same model id on two different endpoints is not the same model, and `connection_base_url` (the endpoint snapshot) because *editing* a connection's URL repoints what that id means: results parsed through the old endpoint must not answer uploads aimed at the new one. `pipeline_version` is the agent's own (`parse`: `PIPELINE_VERSION`).
+
+The built-in upstream snapshots `KANO_PROXY_BASE_URL` as its `connection_base_url` (with `connection_id` NULL). Historical OpenRouter jobs have both NULL, which no new job ever has, so a result OpenRouter produced can never answer a new upload; and moving the deployment to another Kano Proxy origin likewise stops old results answering. The snapshot is taken at enqueue and **reconciled at claim time**: if the connection's URL (or `KANO_PROXY_BASE_URL`) changed while the job sat queued, the worker updates the job's snapshot to the endpoint it actually calls, so the cached result is keyed by the URL that truly produced it. A key rotation alone — editing a connection's key, or reconnecting Kano Proxy — does not invalidate the cache: same endpoint, same model, same output.
 
 - On `POST /v1/parse`, hash while streaming to disk; if a **succeeded** job matches the full key and `force` is not set → return its result immediately (200, `meta.cached: true`), delete the fresh upload, create no job.
 - **Only complete results are cache hits.** A result carrying page errors (a transient upstream failure, an unreadable page) is returned to its own job but never reused — the same upload reparses instead of replaying a degraded result forever.
 - **A cache hit records no usage.** No upstream call runs, so no `usage_log` row is written — the original job's rows are the only record of what that result cost, with the `cost_source` they were recorded under. `report_cost` is not part of the key: it changes what gets recorded about a call, never the output.
-- **Per-user only.** Never dedup across users: it would spend one user's OpenRouter output on another and leak that a document was parsed before.
+- **Per-user only.** Never dedup across users: it would hand one user's paid output to another and leak that a document was parsed before.
 - `force: true` always reparses (result row is replaced).
 - **A retry must not buy a second parse.** The cache answers with *finished* work only, which leaves one gap: a browser cannot tell a lost response from a lost request, so it retries an upload that may already have landed, and the same bytes become a second job that bills the user's key twice for one document. `submit_parse(reuse_in_flight=True)` — asked for by the web library and by nothing else — answers such a retry with the job already queued or running for that exact key instead of starting another. The lookup is serialized by a transaction-level advisory lock on the dedup key (`hold_dedup_key`, PostgreSQL only), because reading before inserting protects a retry that arrives *after* the first upload committed but not two that overlap: both would find nothing and both would enqueue. `/v1/parse` does not do this: an API client that posts the same file twice means it, and has `force` besides.
 

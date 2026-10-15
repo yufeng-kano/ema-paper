@@ -9,12 +9,17 @@ agent-sightread/
         config.py             # env settings (pydantic-settings)
         db/                   # engine, models, session helpers
         auth/                 # oidc.py, sessions.py, api_keys.py, oauth_as.py, crypto.py
-        routes/               # v1.py (data plane), control.py (/api),
+        routes/               # v1.py (data plane), control.py (/api, incl. /api/agents),
+                              # kano.py (/api/kano — the Kano Proxy connect flow),
                               # library.py (/api/library — the web file library), oauth.py
+        agents/               # the agent registry (docs/agents.md); parse.py holds the
+                              # parse agent's definition: default prompt, pipeline version
         parsing/              # poppler.py (subprocess wrappers),
-                              # images.py (heic/exif/downscale), profiles.py, markdown.py
-        upstream/             # openrouter.py (httpx client for OpenRouter and user-defined
-                              # OpenAI-compatible connections; usage capture, backoff)
+                              # images.py (heic/exif/downscale), markdown.py, figures.py
+        upstream/             # client.py (httpx client for Kano Proxy and user-defined
+                              # OpenAI-compatible connections: vision calls, model
+                              # catalogs, usage capture, backoff); kano.py (the connect
+                              # flow's authorize URL and token exchange)
         jobs/                 # queue.py (claim/enqueue), intake.py (store/dedup/enqueue),
                               # runner.py, sweeper.py, events.py (SSE + event pairs)
         mcp/                  # server.py: thin shell over the service layer (docs/mcp.md)
@@ -41,6 +46,7 @@ agent-sightread/
 
 - `routes/*` and `mcp/*` are thin: validation + auth + calls into `jobs`/`parsing` services. MCP owns zero business logic. `jobs/intake.py` is the shared sequence **all three** entry points run (store → hash → probe → dedup → enqueue), so REST, MCP and the web library's upload cannot drift apart — `routes/library.py` adds a name and a folder to the job that sequence returns, nothing more.
 - `parsing/poppler.py` is the **only** place that spawns Poppler; everything else consumes its typed results. No PDF library imports anywhere (AGPL ban, [parsing.md](./parsing.md)).
-- `upstream/openrouter.py` is the only module that talks to a vision upstream (OpenRouter or a user-defined OpenAI-compatible connection) and the only one that ever holds a decrypted user key.
+- `upstream/` is the only package that talks to an upstream (Kano Proxy or a user-defined OpenAI-compatible connection): `client.py` for model calls and catalogs — the only module that ever decrypts a stored user key — and `kano.py` for the connect flow, which receives a Kano Proxy key in plaintext and hands it straight to encryption.
+- `agents/` defines agents and nothing else: no HTTP, no database. Runners and settings consume its definitions ([agents.md](./agents.md)).
 - `jobs/queue.py` is the only module that knows the queue is Postgres.
 - Web: pages thin, logic in composables; API access through one typed client module.

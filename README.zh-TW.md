@@ -21,7 +21,7 @@
 
 **Sightread** 是一套專為開發者與 AI Agent 設計的自託管、多租戶視覺文件解析服務。它能將非結構化的 PDF、掃描件與各類圖片轉換為保留完整版面結構的 Markdown，並自動提取圖表與插圖的精準邊界座標。
 
-支援自備 OpenRouter API 金鑰或串接任何相容 OpenAI 的視覺端點。所有模型費用直接由您的供應商帳戶計費，零中介抽成。
+一鍵連結您的 Kano Proxy 帳戶，或串接任何相容 OpenAI 的視覺端點。所有模型呼叫都使用您自己的帳戶，零中介抽成。
 
 ---
 
@@ -29,7 +29,7 @@
 
 - **視覺優先的高精度解析** — 完美處理傳統 OCR 工具容易跑版的多欄排版、複雜表格、數學公式與各類圖表。
 - **標準化圖表座標提取** — 自動輸出圖表邊界座標（`sightread://p{頁數}/{ymin},{xmin},{ymax},{xmax}`），便於下游 RAG 管道或應用程式精準裁切。
-- **自備金鑰（BYOK）零加價** — 綁定自己的 OpenRouter 金鑰或相容 OpenAI 的視覺端點，無訂閱加價或 Token 抽成。
+- **使用自己的帳戶，零加價** — 透過 Kano Proxy 的授權畫面連結帳戶，或用自己的金鑰串接相容 OpenAI 的視覺端點，無訂閱加價或 Token 抽成。
 - **原生支援 AI Agent 與 MCP** — 內建支援 OAuth 2.1 的 Model Context Protocol (MCP) 伺服器，可無縫串接 Claude Desktop、Claude Code 與自動化 Agent。
 - **現代化檔案工作區** — 極簡石墨風格（Graphite）UI，支援多層資料夾、拖曳上傳、即時 SSE 進度串流與雙欄即時對照預覽。
 - **隱私安全優先** — 上傳的原始文件在隔離子程序中處理，任務完成後立即自磁碟永久清除。
@@ -75,7 +75,7 @@ docker compose up --build
 curl -X POST http://localhost:8000/v1/parse \
   -H "Authorization: Bearer <YOUR_API_KEY>" \
   -F "file=@financial-report.pdf" \
-  -F "model=google/gemini-2.5-flash"
+  -F "model=<您目錄中的模型 ID>"
 ```
 
 ### Claude Desktop / MCP 連線設定

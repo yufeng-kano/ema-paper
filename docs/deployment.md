@@ -83,7 +83,10 @@ Certificates are always this stack's own: the site block carries an explicit `tl
 | `APP_ENV` | `local` / `production` |
 | `APP_URL` | public origin, used in OAuth metadata + OIDC redirect |
 | `DATABASE_URL` | `postgresql+asyncpg://...` |
-| `SECRET_KEY` | sessions + HKDF root for OpenRouter-key encryption; generate long random |
+| `SECRET_KEY` | sessions + HKDF root for upstream-key encryption (Kano Proxy keys, connection keys, connect verifiers); generate long random |
+| `KANO_PROXY_BASE_URL` | Kano Proxy's origin (e.g. `https://kano-proxy.example.com`, no path). Vision calls go to `{origin}/openai/v1`, consent to `{origin}/connect/authorize`, the token exchange to `{origin}/api/connect/token` ([auth.md](./auth.md) § 6). Empty = Kano Proxy unavailable |
+| `KANO_PROXY_CLIENT_ID` / `KANO_PROXY_CLIENT_SECRET` | sightread's client registration on Kano Proxy. The redirect URI registered there is `<APP_URL>/api/kano/callback`. The secret lives only in `.env` |
+| `KANO_CONNECT_TTL_SECONDS` | lifetime of a pending connect state (default 600) |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | OIDC |
 | `AUTH_DEV_MODE` | local only; absent from `.env.production.example` |
 | `UPLOAD_MAX_BYTES`, `PAGE_CAP`, `MAX_JOBS_PER_USER`, `VISION_CONCURRENCY_PER_JOB`, `RENDER_WORKERS` | defaults in [api.md](./api.md) / [jobs.md](./jobs.md) |
@@ -100,6 +103,8 @@ copying the production one and filling it in — never carrying the local `.env`
 Secrets live in `.env` (gitignored) on the server; tracked files carry placeholders only. Never print secret values — only whether one exists.
 
 Google OAuth client (production): the authorized redirect URI is `https://<domain>/api/auth/callback`, and the authorized origin is `https://<domain>`. Nothing else in the app needs registering with Google — the connector flow uses this app's own authorization server.
+
+Kano Proxy client (production): sightread is registered on Kano Proxy as an app with the exact redirect URI `https://<domain>/api/kano/callback`; the client id and secret it was issued go into `KANO_PROXY_CLIENT_ID` / `KANO_PROXY_CLIENT_SECRET`. The compose files pass `.env` through whole (`env_file`), so nothing else changes there.
 
 ## Release flow (initial)
 

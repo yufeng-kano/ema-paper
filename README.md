@@ -21,7 +21,7 @@
 
 **Sightread** is a self-hosted, multi-user document parsing service designed for developers and AI agents. It transforms unstructured PDFs, scans, and images into clean, layout-preserving Markdown, extracting exact bounding box coordinates for figures and charts.
 
-Bring your own OpenRouter key or connect custom OpenAI-compatible vision endpoints. Every vision call bills directly to your provider account with zero markup.
+Connect your Kano Proxy account in one click, or bring your own OpenAI-compatible vision endpoint. Every vision call runs on your own account with zero markup.
 
 ---
 
@@ -29,7 +29,7 @@ Bring your own OpenRouter key or connect custom OpenAI-compatible vision endpoin
 
 - **Vision-First Precision** — Accurately extracts multi-column text, dense tables, mathematical formulas, and diagrams that break traditional OCR engines.
 - **Normalized Figure Coordinates** — Returns visual figure boundaries as normalized `[ymin, xmin, ymax, xmax]` coordinates (`sightread://p{page}/{coords}`) for precise downstream cropping in RAG pipelines.
-- **Zero Markup / BYO Keys** — Connect your personal OpenRouter key or custom OpenAI-compatible vision endpoints. No middleman subscription fees or token markups.
+- **Zero Markup / Your Own Account** — Connect Kano Proxy through its consent screen, or add any OpenAI-compatible vision endpoint with your own key. No middleman subscription fees or token markups.
 - **Built for AI Agents & MCP** — Native Model Context Protocol (MCP) server with OAuth 2.1 support for Claude Desktop, Claude Code, and autonomous agents.
 - **Modern Web Workspace** — Graphite-themed UI featuring nested folders, drag-and-drop uploads, live SSE progress streaming, and instant side-by-side previews.
 - **Privacy by Default** — Uploaded source documents are processed in isolated subprocesses and purged from disk immediately once parsing completes.
@@ -75,7 +75,7 @@ docker compose up --build
 curl -X POST http://localhost:8000/v1/parse \
   -H "Authorization: Bearer <YOUR_API_KEY>" \
   -F "file=@financial-report.pdf" \
-  -F "model=google/gemini-2.5-flash"
+  -F "model=<model-id-from-your-catalog>"
 ```
 
 ### Claude Desktop / MCP Configuration

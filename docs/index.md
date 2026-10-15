@@ -1,6 +1,6 @@
 # agent-sightread documentation
 
-Hosted, multi-user **vision document parsing** service. Users sign in with Google, store their own OpenRouter API key (BYO — every vision call bills the user's key, never the operator's), and parse PDFs/images into markdown with figure bounding boxes via REST or a hosted MCP endpoint (Claude Connectors compatible).
+Hosted, multi-user **vision document parsing** service. Users sign in with Google, connect their own Kano Proxy account (or an OpenAI-compatible endpoint of their own — every vision call runs on the user's account, never the operator's), and parse PDFs/images into markdown with figure bounding boxes via REST or a hosted MCP endpoint (Claude Connectors compatible).
 
 ## Docs map
 
@@ -8,8 +8,9 @@ Hosted, multi-user **vision document parsing** service. Users sign in with Googl
 |-----|---------|
 | [product.md](./product.md) | Goals, non-goals, origin spec deviations, tenants |
 | [api.md](./api.md) | REST data plane (`/v1/*`), control plane (`/api/*`), partial results, figure crop routes, SSE, limits, errors |
-| [auth.md](./auth.md) | Google OIDC sessions, hashed API keys, encrypted OpenRouter keys, OAuth 2.1 AS for Claude Connectors, single-use upload tickets |
-| [parsing.md](./parsing.md) | Poppler rendering, vision-only conversion, page markers, bbox contract, figure crop persistence, prompts, profiles, image normalization |
+| [auth.md](./auth.md) | Google OIDC sessions, hashed API keys, encrypted upstream keys, OAuth 2.1 AS for Claude Connectors, single-use upload tickets, the Kano Proxy connect flow |
+| [agents.md](./agents.md) | The agent registry (`parse` is the only agent), per-agent upstream/model/prompt settings, enqueue rules |
+| [parsing.md](./parsing.md) | Poppler rendering, vision-only conversion, page markers, bbox contract, figure crop persistence, prompts, models, image normalization |
 | [jobs.md](./jobs.md) | PG job queue (SKIP LOCKED), concurrency caps, SSE progress, dedup cache, file retention |
 | [database.md](./database.md) | PostgreSQL schema, Alembic migrations, secrets handling |
 | [mcp.md](./mcp.md) | One `parse` tool minting upload tickets + curl commands, streamable HTTP, Claude Connectors flow |
@@ -24,9 +25,9 @@ Hosted, multi-user **vision document parsing** service. Users sign in with Googl
 - **PDF engine:** Poppler CLI (`pdftoppm`, `pdfinfo`) via subprocess — never a linked PDF library. See [parsing.md](./parsing.md).
 - **Web:** Nuxt (latest stable) + TypeScript + `@nuxtjs/i18n` (en, zh-TW), pnpm.
 - **Data:** PostgreSQL only — relational state **and** job queue (`FOR UPDATE SKIP LOCKED`). No Redis, no message broker.
-- **Upstream:** OpenRouter by default, with each user's own key; model list fetched live from `/api/v1/models` filtered to image-input models — never hard-coded. Users may instead route vision calls through a **provider connection**: their own OpenAI-compatible Chat Completions endpoint (base URL + key, e.g. a kano-proxy `/openai/v1` base), models listed live from that endpoint's `/models` ([api.md](./api.md) § Upstreams).
+- **Upstream:** Kano Proxy by default (`KANO_PROXY_BASE_URL`), with the key each user obtains through Kano Proxy's connect flow ([auth.md](./auth.md) § 6); model list fetched live from `{KANO_PROXY_BASE_URL}/openai/v1/models` with that key — never hard-coded. Users may instead route an agent's calls through a **provider connection**: their own OpenAI-compatible Chat Completions endpoint (base URL + key), models listed live from that endpoint's `/models` ([api.md](./api.md) § Upstreams).
 - **Deploy:** docker-compose on a single server, Caddy for TLS + routing. Environments: local + production only.
 
 ## Product one-liner
 
-Sign in with Google, save your OpenRouter key, get an API key (or connect Claude via the MCP connector), then `POST /v1/parse` a PDF or image — back comes markdown with `<!-- page: N -->` markers, `sightread://` figure placeholders, and the exact model/bbox-format used, billed to your own OpenRouter account.
+Sign in with Google, connect Kano Proxy and pick a model, get an API key (or connect Claude via the MCP connector), then `POST /v1/parse` a PDF or image — back comes markdown with `<!-- page: N -->` markers, `sightread://` figure placeholders, and the exact model/bbox-format used, run on your own Kano Proxy account.
