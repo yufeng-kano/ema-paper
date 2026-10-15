@@ -101,12 +101,18 @@ def create_app(settings: Settings | None = None, backend: Backend | None = None)
 
     @app.post("/sandboxes/{user_id}/stop", dependencies=guard)
     async def sandbox_stop(user_id: int) -> Response:
-        await backend.stop(user_id)
+        try:
+            await backend.stop(user_id)
+        except RuntimeError as exc:
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.post("/sandboxes/{user_id}/reset", dependencies=guard)
     async def sandbox_reset(user_id: int) -> Response:
-        await backend.reset(user_id)
+        try:
+            await backend.reset(user_id)
+        except RuntimeError as exc:
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     return app

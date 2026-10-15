@@ -228,3 +228,69 @@ async def test_a_command_returns_only_once_its_background_jobs_are_done(client, 
     assert done.json()["exit_code"] == 0
     # The job the command left behind finished before the command returned.
     assert (tmp_path / "ws" / "3" / "late.txt").read_text().strip() == "late"
+
+
+async def test_nothing_a_command_started_outlives_it(client) -> None:
+    import time
+
+    started = time.monotonic()
+    disowned = await client.post(
+        "/sandboxes/10/exec",
+        json={
+            "session": "s",
+            "command": "nohup sleep 30 >/dev/null 2>&1 & disown; echo $!",
+            "timeout_seconds": 10,
+        },
+    )
+    assert disowned.status_code == 200, disowned.text
+    assert time.monotonic() - started < 5  # not waited for: killed
+    pid = int(disowned.json()["output"].strip())
+    after = await client.post(
+        "/sandboxes/10/exec",
+        json={"session": "s", "command": f"kill -0 {pid} 2>/dev/null && echo alive || echo dead"},
+    )
+    assert after.json()["output"] == "dead"
+
+
+async def test_a_vm_that_cannot_be_removed_refuses_commands_and_keeps_its_cache(tmp_path) -> None:
+    from sightread_sandbox.backends import CACHE_DIR, UserSandbox
+
+    class Stuck(LocalBackend):
+        gone = False
+
+        async def stop_vm(self, sandbox: UserSandbox) -> bool:
+            return False  # `docker rm -f` failed or timed out
+
+        async def is_gone(self, user_id: int) -> bool:
+            return self.gone
+
+    settings = Settings(
+        app_env="local",
+        sandbox_token=TOKEN,
+        sandbox_backend="local",
+        sandbox_workspaces_dir=str(tmp_path / "ws"),
+        sandbox_workspaces_mount=str(tmp_path / "ws"),
+        sandbox_idle_seconds=0,
+    )
+    backend = Stuck(settings)
+    app = create_app(settings, backend)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://runner") as http:
+        http.headers["Authorization"] = f"Bearer {TOKEN}"
+        assert (
+            await http.post("/sandboxes/11/exec", json={"session": "s", "command": "true"})
+        ).status_code == 200
+        cache = tmp_path / "ws" / "11" / CACHE_DIR
+        assert cache.is_dir()
+        assert (await http.post("/sandboxes/11/stop")).status_code == 503
+        # No command runs in a VM that may still be alive, and no reset deletes under it.
+        refused = await http.post("/sandboxes/11/exec", json={"session": "s", "command": "true"})
+        assert refused.status_code == 503
+        assert (await http.post("/sandboxes/11/reset")).status_code == 503
+        assert cache.is_dir()
+        # The idle sweep neither counts it nor dies on it.
+        assert await backend.stop_idle() == 0
+        # Once Docker positively reports it gone, commands run again.
+        backend.gone = True
+        again = await http.post("/sandboxes/11/exec", json={"session": "s", "command": "echo ok"})
+        assert again.status_code == 200, again.text
+        assert again.json()["output"] == "ok"

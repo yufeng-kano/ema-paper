@@ -51,7 +51,7 @@ from ..workspace.documents import (
     materialize_document,
 )
 from ..workspace.layout import document_relative_dir, user_root
-from ..workspace.locks import workspace_lock
+from ..workspace.locks import backup_shared, workspace_lock
 from . import events
 from .queue import parse_pages_spec
 
@@ -452,6 +452,33 @@ async def _finish(
     directory goes too — `run_job`'s outermost finally discards it (through the crop
     guard), so a late crop thread cannot write it back.
     """
+    async with sessionmaker() as db:
+        job = await db.get(Job, job_id)
+        if job is None:
+            return
+        user_id = job.user_id
+    if settings is None:
+        await _finish_held(sessionmaker, job_id, status=status, error=error, result=result)
+        return
+    # The rows that say the parse is done, and the original and copies they describe,
+    # land in one backup snapshot: the backup lock is held shared from before the commit
+    # until the files are in place, since the upload directory they come from is not
+    # backed up (docs/workspace.md § Backups).
+    async with backup_shared(user_root(settings.workspaces_dir, user_id)):
+        await _finish_held(
+            sessionmaker, job_id, status=status, error=error, result=result, settings=settings
+        )
+
+
+async def _finish_held(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    job_id: uuid.UUID,
+    *,
+    status: str,
+    error: str | None = None,
+    result: dict | None = None,
+    settings: Settings | None = None,
+) -> None:
     async with sessionmaker() as db:
         job = await db.get(Job, job_id)
         if job is None:

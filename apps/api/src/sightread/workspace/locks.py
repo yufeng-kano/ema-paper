@@ -71,6 +71,30 @@ async def _hold(root: Path, suffix: str) -> AsyncIterator[None]:
                     held.close()  # type: ignore[attr-defined]
 
 
+def _acquire_shared(backup: Path) -> object:
+    shared = backup.open("a+")
+    fcntl.flock(shared, fcntl.LOCK_SH)
+    return shared
+
+
+@contextlib.asynccontextmanager
+async def backup_shared(root: Path) -> AsyncIterator[None]:
+    """The backup lock shared, and nothing else: for a writer whose database commit comes
+    before its workspace write, so the two land in one snapshot without the workspace
+    lock held across the commit (docs/workspace.md § Backups). A workspace or shell lock
+    taken inside takes the backup lock shared again, which a shared hold never refuses."""
+    path = _backup_lock_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    shared = await asyncio.to_thread(_acquire_shared, path)
+    try:
+        yield
+    finally:
+        try:
+            fcntl.flock(shared, fcntl.LOCK_UN)  # type: ignore[arg-type]
+        finally:
+            shared.close()  # type: ignore[attr-defined]
+
+
 @contextlib.asynccontextmanager
 async def workspace_lock(root: Path) -> AsyncIterator[None]:
     """Hold the user's workspace for writing. Re-entrancy is not supported on purpose."""

@@ -119,10 +119,18 @@ class ShellSession:
             # The command runs in the shell itself (not a subshell), so `cd` and exports
             # persist; the marker line follows with the status of the last command.
             # The status is the command's; `wait` then holds the line until every job it
-            # left in the background has finished, so nothing it started writes the tree
-            # after the command's revision (a disowned job is the shell's own).
+            # left in the background has finished, and whatever is still running after
+            # that — a disowned job, a daemon — is killed: the shell leads its own process
+            # group (the backend starts it so), and everything in the group but the shell
+            # goes, so nothing a command started writes the tree after its revision
+            # (docs/sandbox.md § The runner).
             script = (
-                f"{command}\n__sr_status=$?\nwait\nprintf '\\n{marker} %s\\n' \"$__sr_status\"\n"
+                f"{command}\n"
+                "__sr_status=$?\n"
+                "wait\n"
+                "for __sr_pid in $(pgrep -g $$); do"
+                ' [ "$__sr_pid" != "$$" ] && kill -KILL "$__sr_pid" 2>/dev/null; done\n'
+                f"printf '\\n{marker} %s\\n' \"$__sr_status\"\n"
             )
             try:
                 process.stdin.write(script.encode())

@@ -153,6 +153,7 @@ async function loadContent(replaceDirty: Replace = false) {
     // `failed` is unsaved work too: the text is still the reader's and its next save
     // retries it, so only an explicit replacement may overwrite it.
     if (takeMarkdown || (saveState.value === 'saved' && !dirtyEditor)) {
+      reloadAfterSave = false
       // A block editor open across a forced replacement is closed, its draft dropped:
       // the block it was editing may no longer sit at those indices, and a commit
       // against the fresh text would land on whatever does now.
@@ -163,11 +164,19 @@ async function loadContent(replaceDirty: Replace = false) {
       markdown.value = content.markdown
       revision.value = content.revision
       saveState.value = 'saved'
+    } else if (saveState.value === 'saving') {
+      // The save in flight was made against an older revision than what was just read:
+      // its answer settles the viewer on a revision the disk has moved past, and nothing
+      // after it reloads. So this reload is repeated once the save has settled.
+      reloadAfterSave = true
     }
     if (takeNotes || notesState.value === 'saved') {
+      reloadNotesAfterSave = false
       notes.value = content.notes
       notesRevision.value = content.notes_revision
       notesState.value = 'saved'
+    } else if (notesState.value === 'saving') {
+      reloadNotesAfterSave = true
     }
     contentLoaded.value = true
   } catch (error) {
@@ -194,6 +203,8 @@ const saveState = ref<SaveState>('saved')
 const saveError = ref<string | null>(null)
 let saveTimer: ReturnType<typeof setTimeout> | null = null
 let saving = false
+/** A reload that arrived while a save was in flight, to be made again after it. */
+let reloadAfterSave = false
 
 function scheduleSave() {
   saveState.value = 'editing'
@@ -243,6 +254,10 @@ async function saveContent() {
     }
   } finally {
     saving = false
+    if (reloadAfterSave) {
+      reloadAfterSave = false
+      void loadContent()
+    }
   }
 }
 
@@ -266,6 +281,7 @@ const notesState = ref<SaveState>('saved')
 const notesError = ref<string | null>(null)
 let notesTimer: ReturnType<typeof setTimeout> | null = null
 let savingNotes = false
+let reloadNotesAfterSave = false
 
 function scheduleNotesSave() {
   notesState.value = 'editing'
@@ -308,6 +324,10 @@ async function saveNotes() {
     }
   } finally {
     savingNotes = false
+    if (reloadNotesAfterSave) {
+      reloadNotesAfterSave = false
+      void loadContent()
+    }
   }
 }
 

@@ -379,36 +379,47 @@ def remove_empty_dir(root: Path, path: Path) -> bool:
 
 def _dir_size(fd: int) -> int:
     """An explicit stack, not recursion: a shell can nest directories deeper than the
-    interpreter's recursion limit. `fd` is closed by the caller; children here."""
+    interpreter's recursion limit. One open descriptor per level of depth, never one per
+    sibling: a directory's entries are taken one at a time, and a child is opened only
+    when its turn comes, so a wide tree costs no more descriptors than a deep one.
+    `fd` is closed by the caller; children here."""
     total = 0
-    stack = [fd]
+    # (directory, the names still to look at in it)
+    stack: list[tuple[int, list[str]]] = [(fd, _names(fd))]
     try:
         while stack:
-            current = stack.pop()
+            current, names = stack[-1]
+            if not names:
+                stack.pop()
+                if current != fd:
+                    os.close(current)
+                continue
+            name = names.pop()
             try:
-                names = os.listdir(current)
+                info = os.stat(name, dir_fd=current, follow_symlinks=False)
             except OSError:
-                names = []
-            for name in names:
-                try:
-                    info = os.stat(name, dir_fd=current, follow_symlinks=False)
-                except OSError:
-                    continue
-                if stat.S_ISDIR(info.st_mode):
-                    try:
-                        stack.append(os.open(name, _OPEN_DIR_FLAGS, dir_fd=current))
-                    except OSError:
-                        continue
-                else:
-                    total += info.st_size  # a link counts as itself, never its target
-            if current != fd:
-                os.close(current)
+                continue
+            if not stat.S_ISDIR(info.st_mode):
+                total += info.st_size  # a link counts as itself, never its target
+                continue
+            try:
+                child = os.open(name, _OPEN_DIR_FLAGS, dir_fd=current)
+            except OSError:
+                continue
+            stack.append((child, _names(child)))
     except BaseException:
-        for pending in stack:
+        for pending, _names_left in stack:
             if pending != fd:
                 os.close(pending)
         raise
     return total
+
+
+def _names(fd: int) -> list[str]:
+    try:
+        return os.listdir(fd)
+    except OSError:
+        return []
 
 
 def tree_size(root: Path, path: Path) -> int:

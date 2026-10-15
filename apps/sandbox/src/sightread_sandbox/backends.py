@@ -82,7 +82,8 @@ class Backend:
         process is enough (the local backend)."""
         return None
 
-    async def stop_vm(self, sandbox: UserSandbox) -> None:
+    async def stop_vm(self, sandbox: UserSandbox) -> bool:
+        """Remove the VM; True when the removal itself succeeded."""
         raise NotImplementedError
 
     # --- the shared behaviour -----------------------------------------------------------
@@ -160,11 +161,19 @@ class Backend:
             await self._stop_locked(sandbox)
 
     async def _stop_locked(self, sandbox: UserSandbox) -> None:
+        """Close the shells and remove the VM — and confirm the removal: closing the
+        host-side clients ends nothing inside, so a removal that failed or timed out
+        leaves a VM that may still be writing the workspace. Such a sandbox is marked
+        unstoppable and takes no command until Docker positively reports it gone
+        (docs/sandbox.md § The runner)."""
         for shell in sandbox.sessions.values():
             await shell.close()
         sandbox.sessions.clear()
         sandbox.session_used.clear()
-        await self.stop_vm(sandbox)
+        if not await self.stop_vm(sandbox) and not await self.is_gone(sandbox.user_id):
+            sandbox.unstoppable = True
+            logger.error("sandbox of user %d cannot be stopped; refusing commands", sandbox.user_id)
+            raise RuntimeError("the sandbox VM could not be stopped")
         sandbox.started_at = None
 
     def _idle(self, sandbox: UserSandbox) -> bool:
@@ -195,7 +204,10 @@ class Backend:
                 # above has marked its shell busy, and must not have its VM pulled away.
                 if not self._idle(sandbox):
                     continue
-                await self._stop_locked(sandbox)
+                try:
+                    await self._stop_locked(sandbox)
+                except RuntimeError:
+                    continue  # logged and marked by the stop; the sweep goes on
             stopped += 1
         return stopped
 
@@ -242,6 +254,9 @@ kill_tree() {
 pid=$(cat "$1" 2>/dev/null) || exit 3
 [ -n "$pid" ] || exit 3
 kill_tree "$pid"
+# The shell leads its own process group: whatever left the tree (a disowned job that
+# was reparented) is still in the group, and goes with it.
+kill -KILL -- "-$pid" 2>/dev/null
 kill -0 "$pid" 2>/dev/null && exit 4
 exit 0
 """
@@ -349,6 +364,9 @@ class DockerBackend(Backend):
     def shell_argv(self, user_id: int, token: str) -> tuple[list[str], str | None]:
         # The shell writes its pid to the VM's tmpfs first, so a timeout can be ended
         # inside the VM (`on_timeout`), where ending the client here would not reach.
+        # `setsid` makes it a session and process-group leader, so everything a command
+        # starts is in its group and can be killed as one (docs/sandbox.md § The runner);
+        # `-w` keeps the exec's own process alive when setsid has to fork.
         return (
             [
                 DOCKER,
@@ -357,6 +375,8 @@ class DockerBackend(Backend):
                 "-w",
                 "/workspace",
                 self.container(user_id),
+                "setsid",
+                "-w",
                 "sh",
                 "-c",
                 f'echo "$$" > {_pid_file(token)} && exec bash --norc --noprofile',
@@ -381,15 +401,17 @@ class DockerBackend(Backend):
                 )
                 sandbox = self._user(user_id)
                 async with sandbox.lock:
-                    await self._stop_locked(sandbox)
-                    if not await self.is_gone(user_id):
-                        logger.error("sandbox %s cannot be stopped; refusing commands", container)
-                        sandbox.unstoppable = True
+                    # A stop that fails marks the sandbox unstoppable itself.
+                    with contextlib.suppress(RuntimeError):
+                        await self._stop_locked(sandbox)
 
         return kill_inside
 
-    async def stop_vm(self, sandbox: UserSandbox) -> None:
-        await _docker("rm", "-f", self.container(sandbox.user_id), timeout=120)
+    async def stop_vm(self, sandbox: UserSandbox) -> bool:
+        code, out = await _docker("rm", "-f", self.container(sandbox.user_id), timeout=120)
+        if code != 0:
+            logger.warning("could not remove sandbox of user %d: %s", sandbox.user_id, out.strip())
+        return code == 0
 
 
 # --- local (tests only) ---------------------------------------------------------------------
@@ -415,8 +437,9 @@ class LocalBackend(Backend):
     def shell_argv(self, user_id: int, token: str) -> tuple[list[str], str | None]:
         return ["bash", "--norc", "--noprofile"], str(self.workspace(user_id))
 
-    async def stop_vm(self, sandbox: UserSandbox) -> None:
+    async def stop_vm(self, sandbox: UserSandbox) -> bool:
         self._running.discard(sandbox.user_id)
+        return True
 
 
 def build_backend(settings: Settings) -> Backend:

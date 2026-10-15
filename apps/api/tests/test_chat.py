@@ -512,9 +512,28 @@ async def test_a_finished_library_parse_keeps_its_source(chatting, tmp_path) -> 
         job.status = "running"
         await db.commit()
         job_id = job.id
-    from sightread.jobs import runner
+    import fcntl
 
-    await runner._finish(sessionmaker, job_id, status="succeeded", settings=settings)
+    from sightread.jobs import runner
+    from sightread.workspace import locks
+
+    # The terminal rows and the kept original land in one backup snapshot: a backup
+    # holding the lock keeps the finish — commit included — out until it is done.
+    root = user_root(settings.workspaces_dir, chatting.user_id)
+    backup_path = locks._backup_lock_path(root)
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    backup = backup_path.open("a+")
+    fcntl.flock(backup, fcntl.LOCK_EX)
+    finishing = asyncio.create_task(
+        runner._finish(sessionmaker, job_id, status="succeeded", settings=settings)
+    )
+    await asyncio.sleep(0.3)
+    assert not finishing.done()
+    async with sessionmaker() as db:
+        assert (await db.get(Job, job_id)).status == "running"
+    fcntl.flock(backup, fcntl.LOCK_UN)
+    backup.close()
+    await asyncio.wait_for(finishing, 10)
     kept = (
         user_root(settings.workspaces_dir, chatting.user_id)
         / "files"

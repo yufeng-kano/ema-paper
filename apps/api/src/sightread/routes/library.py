@@ -48,7 +48,7 @@ from ..jobs.runner import partial_result_payload, result_payload
 from ..parsing.figures import crop_path, parse_bbox_path
 from ..workspace import documents as workspace_documents
 from ..workspace.layout import document_relative_dir, path_segment, user_root
-from ..workspace.locks import workspace_lock
+from ..workspace.locks import backup_shared, workspace_lock
 
 router = APIRouter(prefix="/api/library", tags=["library"])
 
@@ -618,19 +618,23 @@ async def upload_document(
             message="A file with this name already exists here",
         )
 
-    try:
-        row = await land(folder_id)
-    except ApiError:
-        # The remaining sliver of that same race: deleted between the check above and this
-        # insert, which arrives as a foreign-key failure rather than a name one.
-        if folder_id is None or await folder_exists(db, user.id, folder_id):
-            raise
-        row = await land(None)
+    # The row's commit and the upload it takes into the directory land in one backup
+    # snapshot: the upload directory is not backed up (docs/workspace.md § Backups).
+    async with backup_shared(user_root(settings.workspaces_dir, user.id)):
+        try:
+            row = await land(folder_id)
+        except ApiError:
+            # The remaining sliver of that same race: deleted between the check above and
+            # this insert, which arrives as a foreign-key failure rather than a name one.
+            if folder_id is None or await folder_exists(db, user.id, folder_id):
+                raise
+            row = await land(None)
 
-    job = await job_of(db, job_id)
-    # The parse may already be done (the worker then left the upload for this row), or
-    # answered from the cache or joined in flight (the fresh upload is this row's to keep).
-    await workspace_documents.adopt_source(db, settings, row, job, upload=submission.upload)
+        job = await job_of(db, job_id)
+        # The parse may already be done (the worker then left the upload for this row),
+        # or answered from the cache or joined in flight (the fresh upload is this row's
+        # to keep).
+        await workspace_documents.adopt_source(db, settings, row, job, upload=submission.upload)
     return document_payload(row, job)
 
 

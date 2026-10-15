@@ -903,3 +903,52 @@ def test_workspace_writes_wait_for_the_backup_lock(tmp_path) -> None:
     fcntl.flock(holder, fcntl.LOCK_UN)
     assert entered.wait(5)
     thread.join()
+
+
+def test_tree_sizes_survive_a_wide_tree_under_a_descriptor_limit(tmp_path) -> None:
+    import resource
+
+    root = tmp_path / "ws" / "10"
+    (root / "files").mkdir(parents=True)
+    for index in range(200):
+        (root / "files" / f"d{index:03d}").mkdir()
+        (root / "files" / f"d{index:03d}" / "f").write_bytes(b"x")
+    # A limit a walk that opens every sibling at once cannot fit in, but one that holds
+    # a descriptor per level can: just above what the process has open now.
+    highest = max(int(name) for name in os.listdir("/proc/self/fd"))
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (min(highest + 12, hard), hard))
+    try:
+        assert documents.directory_size(root) == 200
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+
+def test_the_backup_hold_waits_for_the_backup_lock(tmp_path) -> None:
+    import fcntl
+    import threading
+
+    from sightread.workspace import locks
+
+    root = tmp_path / "ws" / "11"
+    git.ensure_repo(root)
+    backup = locks._backup_lock_path(root)
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    holder = backup.open("a+")
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    entered = threading.Event()
+
+    def writer() -> None:
+        shared = locks._acquire_shared(backup)
+        # The workspace lock inside the hold takes the backup lock shared again.
+        handle, inner = locks._acquire(locks._lock_path(root, locks.WORKSPACE_SUFFIX), backup)
+        entered.set()
+        for held in (handle, inner, shared):
+            fcntl.flock(held, fcntl.LOCK_UN)
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    assert not entered.wait(0.3)
+    fcntl.flock(holder, fcntl.LOCK_UN)
+    assert entered.wait(5)
+    thread.join()
