@@ -9,13 +9,17 @@ before it is read or written: a plain file of a bounded size, or nothing.
 
 from __future__ import annotations
 
+import contextlib
 import os
+import secrets
 import stat
 from pathlib import Path
 
 _DIR_FLAGS = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _OPEN_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 READ_CHUNK = 1 << 20
+# A write in progress, beside its destination; the git exclude rules keep it out of history.
+TEMP_PREFIX = ".sr-tmp-"
 
 
 class UnsafeEntry(Exception):
@@ -143,24 +147,61 @@ def read_text(root: Path, path: Path, max_bytes: int) -> str | None:
     return None if data is None else data.decode()
 
 
-def write_bytes(root: Path, path: Path, data: bytes, *, exist_ok: bool = True) -> None:
-    """Write `data` to the plain file at `path`, created if missing (parents too)."""
+def _write_atomic(root: Path, path: Path, fill, *, exist_ok: bool) -> None:
+    """Fill a temporary file beside `path` and rename it into place once every byte is
+    there, so a write that fails halfway — the disk full, the process gone — never leaves
+    the destination empty or cut short (docs/workspace.md § Revisions). `fill(fd)` writes
+    the content. Without `exist_ok` the file is linked into place instead, which fails
+    when anything already sits at the destination."""
     kind = entry_kind(root, path.parent)
     if kind == "none":
         path.parent.mkdir(parents=True, exist_ok=True)
     elif kind != "dir":
         raise UnsafeEntry(f"{path.parent} is not a plain directory")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    if not exist_ok:
-        flags |= os.O_EXCL
-    entry = _open_file(root, path, flags)
+    fd, name = _descend(root, path)
     try:
+        temp = f"{TEMP_PREFIX}{secrets.token_hex(8)}"
+        entry = os.open(
+            temp,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o644,
+            dir_fd=fd,
+        )
+        try:
+            try:
+                fill(entry)
+            finally:
+                os.close(entry)
+            if exist_ok:
+                try:
+                    os.rename(temp, name, src_dir_fd=fd, dst_dir_fd=fd)
+                except IsADirectoryError as exc:
+                    raise UnsafeEntry(f"{path} is a directory") from exc
+                return
+            try:
+                os.link(temp, name, src_dir_fd=fd, dst_dir_fd=fd)
+            except FileExistsError:
+                raise
+            except OSError as exc:
+                raise UnsafeEntry(f"{path} could not be created as a plain file") from exc
+        finally:
+            # After a rename the temporary name is gone; after a link, or a failure, it
+            # is still there and must not stay.
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temp, dir_fd=fd)
+    finally:
+        os.close(fd)
+
+
+def write_bytes(root: Path, path: Path, data: bytes, *, exist_ok: bool = True) -> None:
+    """Write `data` to the plain file at `path`, created if missing (parents too)."""
+
+    def fill(entry: int) -> None:
         view = memoryview(data)
         while view:
-            written = os.write(entry, view)
-            view = view[written:]
-    finally:
-        os.close(entry)
+            view = view[os.write(entry, view) :]
+
+    _write_atomic(root, path, fill, exist_ok=exist_ok)
 
 
 def write_text(root: Path, path: Path, text: str, *, exist_ok: bool = True) -> None:
@@ -169,13 +210,8 @@ def write_text(root: Path, path: Path, text: str, *, exist_ok: bool = True) -> N
 
 def write_from(root: Path, path: Path, reader, *, chunk: int = READ_CHUNK) -> None:
     """Stream `reader` (any object with `read(n)`) into the plain file at `path`."""
-    kind = entry_kind(root, path.parent)
-    if kind == "none":
-        path.parent.mkdir(parents=True, exist_ok=True)
-    elif kind != "dir":
-        raise UnsafeEntry(f"{path.parent} is not a plain directory")
-    entry = _open_file(root, path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
-    try:
+
+    def fill(entry: int) -> None:
         while True:
             data = reader.read(chunk)
             if not data:
@@ -183,8 +219,8 @@ def write_from(root: Path, path: Path, reader, *, chunk: int = READ_CHUNK) -> No
             view = memoryview(data)
             while view:
                 view = view[os.write(entry, view) :]
-    finally:
-        os.close(entry)
+
+    _write_atomic(root, path, fill, exist_ok=True)
 
 
 def remove_file(root: Path, path: Path) -> bool:

@@ -9,6 +9,7 @@ import json
 import shutil
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -758,6 +759,40 @@ async def test_a_cancelled_turn_blocks_deletion_until_the_worker_is_done(chattin
     assert gone.status_code == 204
 
 
+def _round_ctx(image_budget: int = 32 << 20) -> SimpleNamespace:
+    """What `_run_tools` reads from its context: the round's image budget."""
+    return SimpleNamespace(settings=SimpleNamespace(chat_image_round_max_bytes=image_budget))
+
+
+async def test_a_rounds_images_stop_at_the_budget(monkeypatch) -> None:
+    rendered: list[str] = []
+
+    async def fake_run_tool(ctx, block, malformed):
+        rendered.append(block["id"])
+        image = {"type": "image", "source": {"type": "base64", "data": "x" * 100}}
+        return {"type": "tool_result", "tool_use_id": block["id"], "content": [image]}
+
+    async def no_events(ctx, event, data):
+        return None
+
+    monkeypatch.setattr(chat_runner, "_run_tool", fake_run_tool)
+    monkeypatch.setattr(chat_runner, "_emit", no_events)
+    tool_uses = [
+        {"type": "tool_use", "id": str(index), "name": "view_page", "input": {}}
+        for index in range(12)
+    ]
+    results = await chat_runner._run_tools(_round_ctx(image_budget=250), tool_uses, set())
+    assert [result["tool_use_id"] for result in results] == [str(i) for i in range(12)]
+    kept = [result for result in results if not result.get("is_error")]
+    refused = [result for result in results if result.get("is_error")]
+    # Three images fill the budget (the one that crosses it is kept); only a few more
+    # could have started alongside them before the budget was seen spent.
+    assert len(kept) <= 3 + chat_runner.READ_CONCURRENCY - 1
+    assert len(refused) >= 12 - len(kept)
+    assert all(result["content"] == chat_runner.IMAGE_BUDGET_SPENT for result in refused)
+    assert len(rendered) == len(kept)
+
+
 async def test_writing_tools_run_in_order_while_reads_run_together(monkeypatch) -> None:
     started: list[str] = []
     writers_running: set[str] = set()
@@ -793,7 +828,7 @@ async def test_writing_tools_run_in_order_while_reads_run_together(monkeypatch) 
         {"type": "tool_use", "id": "c", "name": "str_replace_based_edit_tool", "input": {}},
         {"type": "tool_use", "id": "d", "name": "view_figure", "input": {}},
     ]
-    results = await chat_runner._run_tools(None, tool_uses, set())
+    results = await chat_runner._run_tools(_round_ctx(), tool_uses, set())
     assert [result["tool_use_id"] for result in results] == ["a", "b", "c", "d"]
     assert not writer_overlap
     assert reads_overlapped
@@ -981,7 +1016,7 @@ async def test_a_stop_ends_the_round_before_the_next_write(monkeypatch) -> None:
         {"type": "tool_use", "id": "b", "name": "bash", "input": {}},
     ]
     with pytest.raises(chat_runner.TurnCancelled):
-        await chat_runner._run_tools(None, tool_uses, set())
+        await chat_runner._run_tools(_round_ctx(), tool_uses, set())
     assert calls == ["a"]
 
 
@@ -1078,5 +1113,5 @@ async def test_a_stop_during_backoff_and_a_running_read_are_both_cut(monkeypatch
         {"type": "tool_use", "id": "b", "name": "bash", "input": {}},
     ]
     with pytest.raises(chat_runner.TurnCancelled):
-        await chat_runner._run_tools(None, tool_uses, set())
+        await chat_runner._run_tools(_round_ctx(), tool_uses, set())
     assert read_cancelled.is_set()

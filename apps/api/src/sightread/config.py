@@ -81,6 +81,7 @@ class Settings(BaseSettings):
     chat_turn_timeout_seconds: int = 900
     chat_tool_result_max_chars: int = 20_000
     chat_bash_timeout_seconds: int = 120
+    chat_image_round_max_bytes: int = 32 * 1024 * 1024
 
     # The sandbox runner (docs/sandbox.md). Empty URL = no sandbox: the chat agent runs
     # without its bash tool. The token is what api and worker present to the runner.

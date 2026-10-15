@@ -17,7 +17,8 @@ from sqlalchemy import select, update
 
 from sightread.auth.sessions import SESSION_COOKIE, create_session
 from sightread.db.models import Document, Job, JobPage, Result, User
-from sightread.routes.library import DOCUMENT_NAME_MAX, free_name
+from sightread.routes.library import DOCUMENT_NAME_MAX, clean_name, free_name
+from sightread.workspace.layout import user_root
 from tests.conftest import CSRF_HEADERS
 from tests.test_parse_end_to_end import _connect_kano
 
@@ -231,7 +232,12 @@ async def test_a_retried_upload_does_not_buy_a_second_parse(
     assert second["job_id"] == first["job_id"]
     assert second["id"] != first["id"]
     async with sessionmaker() as db:
-        assert len((await db.execute(select(Job))).scalars().all()) == 1
+        (job,) = (await db.execute(select(Job))).scalars().all()
+        # The second row keeps its own fresh upload: the worker may hand the job's to the
+        # rows that existed when it finished, and this one was not among them.
+        root = user_root(library.app.state.settings.workspaces_dir, job.user_id)
+        assert list((root / "files" / "tiny (2).png").glob("source.*"))
+        assert Path(job.source_path).is_file()
 
 
 async def test_a_body_past_the_cap_is_refused_while_it_streams(make_client, documents) -> None:
@@ -364,9 +370,7 @@ async def test_a_running_document_serves_its_finished_pages(
 
     async with sessionmaker() as db:
         await db.execute(
-            update(Job)
-            .where(Job.id == job_id)
-            .values(status="running", page_count=3, pages_done=2)
+            update(Job).where(Job.id == job_id).values(status="running", page_count=3, pages_done=2)
         )
         db.add(
             JobPage(
@@ -536,9 +540,7 @@ async def test_library_mutations_need_the_csrf_header(library, documents) -> Non
         )
     ).status_code == 403
     assert (
-        await library.post(
-            "/api/library/documents/from-job", json={"job_id": str(uuid.uuid4())}
-        )
+        await library.post("/api/library/documents/from-job", json={"job_id": str(uuid.uuid4())})
     ).status_code == 403
 
 
@@ -552,3 +554,13 @@ async def test_me_carries_the_upload_limits(library) -> None:
     assert limits["page_cap"] > 0
     assert "application/pdf" in limits["accepted_media_types"]
     assert "image/png" in limits["accepted_media_types"]
+
+
+def test_names_are_normalized_before_uniqueness_is_decided() -> None:
+    # e + combining acute and the precomposed e-acute are one name — and one directory.
+    decomposed = "caf\u0065\u0301.pdf"
+    composed = "caf\u00e9.pdf"
+    assert clean_name(decomposed, DOCUMENT_NAME_MAX) == composed
+    assert free_name({composed}, clean_name(decomposed, DOCUMENT_NAME_MAX), DOCUMENT_NAME_MAX) == (
+        "caf\u00e9 (2).pdf"
+    )

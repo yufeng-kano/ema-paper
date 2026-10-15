@@ -12,6 +12,8 @@ import re
 import unicodedata
 from pathlib import Path
 
+from .safe_io import TEMP_PREFIX
+
 # What one path component may hold on the filesystems the workspace runs on.
 SEGMENT_MAX_BYTES = 255
 SEGMENT_HASH_CHARS = 12
@@ -45,6 +47,7 @@ EXCLUDE_RULES = "\n".join(
         "/.git/",
         f"**/{SOURCE_STEM}.*",
         f"**/{FIGURES_DIR}/",
+        f"**/{TEMP_PREFIX}*",
         "",
     )
 )

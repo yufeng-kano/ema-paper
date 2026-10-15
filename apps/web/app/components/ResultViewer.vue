@@ -150,12 +150,14 @@ async function loadContent(replaceDirty: Replace = false) {
     const dirtyEditor = editing.value !== null && draft.value !== openBlockSource()
     const takeMarkdown = replaceDirty === true || replaceDirty === 'markdown'
     const takeNotes = replaceDirty === true || replaceDirty === 'notes'
-    if (takeMarkdown || ((saveState.value === 'saved' || saveState.value === 'failed') && !dirtyEditor)) {
+    // `failed` is unsaved work too: the text is still the reader's and its next save
+    // retries it, so only an explicit replacement may overwrite it.
+    if (takeMarkdown || (saveState.value === 'saved' && !dirtyEditor)) {
       markdown.value = content.markdown
       revision.value = content.revision
       saveState.value = 'saved'
     }
-    if (takeNotes || notesState.value === 'saved' || notesState.value === 'failed') {
+    if (takeNotes || notesState.value === 'saved') {
       notes.value = content.notes
       notesRevision.value = content.notes_revision
       notesState.value = 'saved'

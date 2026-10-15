@@ -12,7 +12,6 @@ import asyncio
 import hashlib
 import json
 import os
-import shutil
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -212,7 +211,12 @@ def _materialize_files(
     _write_if_missing(paths.root, original, result.markdown)  # excluded from history
     crops = figures_dir / str(job.id)
     if crops.is_dir() and safe_io.entry_kind(paths.root, paths.figures) == "none":
-        shutil.copytree(crops, paths.figures)
+        # The crops directory is the service's own; the document directory is shared with
+        # the shell, so each crop lands through a descriptor like every workspace file.
+        for crop in crops.iterdir():
+            if crop.is_file():
+                with crop.open("rb") as reader:
+                    safe_io.write_from(paths.root, paths.figures / crop.name, reader)
     return changed
 
 
@@ -285,7 +289,7 @@ def keep_source(
     suffix = ".pdf" if kind == "pdf" else (source.suffix.lower()[:16] or ".img")
     target = directory / f"{SOURCE_STEM}{suffix}"
     if safe_io.entry_kind(root, target) == "dir":
-        shutil.rmtree(target)
+        safe_io.remove_tree(root, target)
     with source.open("rb") as reader:
         safe_io.write_from(root, target, reader)
     if not copy:
@@ -303,7 +307,8 @@ async def adopt_source(
 ) -> None:
     """The library row arrived after its parse finished, so the worker found no document
     to keep the upload for and left it in place — or the parse was answered from the
-    cache and `upload` is the fresh file (docs/jobs.md § Retention): take it now."""
+    cache, or joined one already on its way, and `upload` is the fresh file this row keeps
+    for itself (docs/jobs.md § Retention): take it now."""
     if upload is not None:
         source = upload
     else:

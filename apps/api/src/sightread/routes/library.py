@@ -13,6 +13,7 @@ the job and its output stay in the parse history that billed for them (docs/data
 from __future__ import annotations
 
 import re
+import unicodedata
 import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -67,8 +68,10 @@ UNSAFE_IN_NAME = re.compile(r"[\x00-\x1f\x7f/\\]")
 
 
 def clean_name(raw: str, limit: int) -> str:
-    """A display name: no separators, no control characters, trimmed and capped."""
-    name = UNSAFE_IN_NAME.sub(" ", raw).strip()
+    """A display name: NFC, no separators, no control characters, trimmed and capped.
+    Normalized here, before uniqueness is decided, so two spellings of one name are one
+    name in the library as they are one directory in the workspace (docs/workspace.md)."""
+    name = UNSAFE_IN_NAME.sub(" ", unicodedata.normalize("NFC", raw)).strip()
     if not name:
         raise ApiError(400, "invalid_request", "A name is required")
     return name[:limit].strip()
@@ -576,7 +579,7 @@ async def upload_document(
 
     job = await job_of(db, job_id)
     # The parse may already be done (the worker then left the upload for this row), or
-    # answered from the cache (the fresh upload is this row's to keep).
+    # answered from the cache or joined in flight (the fresh upload is this row's to keep).
     await workspace_documents.adopt_source(db, settings, row, job, upload=submission.upload)
     return document_payload(row, job)
 

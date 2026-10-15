@@ -96,7 +96,7 @@ Certificates are always this stack's own: the site block carries an explicit `tl
 | `WORKSPACE_QUOTA_BYTES` | per-user workspace size the UI shows and the API refuses past (default 10 GiB) |
 | `SANDBOX_URL` / `SANDBOX_TOKEN` | the runner's address on the compose network and the shared token api and worker present to it; empty `SANDBOX_URL` = no sandbox, the chat agent runs without `bash` |
 | `SANDBOX_RUNTIME`, `SANDBOX_IMAGE`, `SANDBOX_NETWORK`, `SANDBOX_INDEX_URL`, `SANDBOX_CPUS`, `SANDBOX_MEMORY`, `SANDBOX_PIDS`, `SANDBOX_IDLE_SECONDS`, `SANDBOX_OUTPUT_MAX_BYTES` | the runner's own settings ([sandbox.md](./sandbox.md)) |
-| `MAX_CHAT_TURNS_PER_USER`, `CHAT_MAX_OUTPUT_TOKENS`, `CHAT_MAX_TOOL_CALLS_PER_TURN`, `CHAT_TURN_TIMEOUT_SECONDS`, `CHAT_TOOL_RESULT_MAX_CHARS` | the chat agent's limits ([chat.md](./chat.md)) |
+| `MAX_CHAT_TURNS_PER_USER`, `CHAT_MAX_OUTPUT_TOKENS`, `CHAT_MAX_TOOL_CALLS_PER_TURN`, `CHAT_TURN_TIMEOUT_SECONDS`, `CHAT_TOOL_RESULT_MAX_CHARS`, `CHAT_IMAGE_ROUND_MAX_BYTES` | the chat agent's limits ([chat.md](./chat.md)) |
 | `PG_PORT` | local compose only: host port for `pg` (default 5432); change it when that port is taken |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | the `pg` container's credentials; the password is required in production |
 | `DOMAIN` / `ACME_EMAIL` | production only: the host Caddy serves, and the Let's Encrypt contact address |

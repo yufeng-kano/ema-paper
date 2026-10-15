@@ -336,6 +336,10 @@ onMounted(loadConversations)
 const events = shallowRef<StreamedEvent[]>([])
 let pendingFrames: StreamedEvent[] = []
 let flushTimer: ReturnType<typeof setTimeout> | null = null
+/** An `edit` of a turn the record still lists as unfinished arrived since the last flush:
+ *  the viewer must reload. Decided as the frame arrives — an `edit` and the `turn_done`
+ *  behind it can share a batch, by which time the stream no longer counts as active. */
+let liveEdit = false
 
 /** Forget every frame, shown or still queued: the thread they belong to is gone. */
 function discardFrames() {
@@ -344,6 +348,7 @@ function discardFrames() {
     flushTimer = null
   }
   pendingFrames = []
+  liveEdit = false
   events.value = []
 }
 
@@ -357,10 +362,10 @@ function flushFrames() {
   const batch = pendingFrames
   pendingFrames = []
   events.value = events.value.concat(batch)
-  // A replayed edit changed nothing since the viewer loaded; a live one did. The stream
-  // knows which it is seeing — `active` follows turn_start and turn_done as they arrive —
-  // and one reload covers however many edits landed in this batch.
-  if (stream.active.value && batch.some((frame) => frame.event.event === 'edit')) {
+  // A replayed edit of a finished turn changed nothing since the viewer loaded; one of a
+  // turn still in flight did. One reload covers however many landed in this batch.
+  if (liveEdit) {
+    liveEdit = false
     emit('changed')
   }
   const ended = batch.some(
@@ -375,6 +380,12 @@ function flushFrames() {
 
 const stream = useConversationStream(
   (frame) => {
+    if (frame.event.event === 'edit') {
+      const turn = turns.value.find((row) => row.id === frame.event.turn_id)
+      if (!turn || LIVE_STATUSES.has(turn.status)) {
+        liveEdit = true
+      }
+    }
     pendingFrames.push(frame)
     if (flushTimer === null) {
       flushTimer = setTimeout(flushFrames, 16)
@@ -595,12 +606,14 @@ const thread = computed<ThreadItem[]>(() => {
     const streamError = group?.find(
       (event): event is Extract<ChatEvent, { event: 'turn_error' }> => event.event === 'turn_error',
     )
-    if (streamError) {
+    // A cancelled turn ends in a `turn_error` whose status says so: a cancellation, not an
+    // error with the backend's word in it.
+    if (streamError?.status === 'cancelled' || turn?.status === 'cancelled') {
+      items.push({ kind: 'cancelled', key: `${prefix}-cancelled` })
+    } else if (streamError) {
       items.push({ kind: 'error', key: `${prefix}-error`, text: streamError.error })
     } else if (turn?.error) {
       items.push({ kind: 'error', key: `${prefix}-error`, text: turn.error })
-    } else if (turn?.status === 'cancelled') {
-      items.push({ kind: 'cancelled', key: `${prefix}-cancelled` })
     }
 
     if (!done) {

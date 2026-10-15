@@ -17,7 +17,7 @@ from sqlalchemy import select
 from sightread.config import Settings
 from sightread.db.models import Document, Folder, Job, Result, User
 from sightread.errors import ApiError
-from sightread.workspace import documents, git, reconcile
+from sightread.workspace import documents, git, reconcile, safe_io
 from sightread.workspace.layout import (
     git_dir,
     inside,
@@ -567,3 +567,67 @@ def test_the_kept_source_is_named_by_the_parse_kind(tmp_path) -> None:
     image.write_bytes(b"\xff\xd8")
     kept = documents.keep_source(root, Path("files/photo"), image, kind="image")
     assert kept.name == "source.jpeg"
+
+
+def test_a_failed_write_leaves_the_file_as_it_was(tmp_path) -> None:
+    root = tmp_path / "ws" / "1"
+    target = root / "files" / "doc.md"
+    safe_io.write_text(root, target, "before")
+
+    class Breaks:
+        calls = 0
+
+        def read(self, size: int) -> bytes:
+            self.calls += 1
+            if self.calls == 1:
+                return b"half"
+            raise OSError("disk full")
+
+    with pytest.raises(OSError):
+        safe_io.write_from(root, target, Breaks())
+    # Neither truncated nor half-written: the replacement never reached the name.
+    assert target.read_text() == "before"
+    assert not list(target.parent.glob(f"{safe_io.TEMP_PREFIX}*"))
+    # Creating refuses what exists, and leaves nothing behind either.
+    with pytest.raises(FileExistsError):
+        safe_io.write_text(root, target, "again", exist_ok=False)
+    assert target.read_text() == "before"
+    assert not list(target.parent.glob(f"{safe_io.TEMP_PREFIX}*"))
+    safe_io.write_text(root, target, "after")
+    assert target.read_text() == "after"
+    # The in-progress name never enters history.
+    git.ensure_repo(root)
+    (target.parent / f"{safe_io.TEMP_PREFIX}abc").write_text("x")
+    commit = git.commit_all(root, "user", "x")
+    assert commit is not None
+    assert all(safe_io.TEMP_PREFIX not in path for path in git.log(root)[0].files)
+
+
+async def test_figure_crops_are_copied_file_by_file_and_never_through_a_link(
+    sessionmaker, tmp_path
+) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        _, document = await _seed(db)
+        crops = tmp_path / "figures" / str(document.job_id)
+        crops.mkdir(parents=True)
+        (crops / "p1_0_0_10_10.png").write_bytes(b"\x89PNG crop")
+        paths = await documents.materialize_document(db, settings, document)
+        assert (paths.figures / "p1_0_0_10_10.png").read_bytes() == b"\x89PNG crop"
+
+        # A second document of the same parse whose `figures` the shell made a link: the
+        # directory is refused as a whole, and nothing is written through the link.
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        other = Document(
+            user_id=document.user_id, folder_id=None, job_id=document.job_id, name="twin.pdf"
+        )
+        db.add(other)
+        await db.commit()
+        twin_dir = user_root(settings.workspaces_dir, document.user_id) / "files" / "twin.pdf"
+        twin_dir.mkdir(parents=True)
+        (twin_dir / "figures").symlink_to(elsewhere)
+        with pytest.raises(ApiError) as refused:
+            await documents.materialize_document(db, settings, other)
+        assert refused.value.status_code == 409
+        assert not list(elsewhere.iterdir())

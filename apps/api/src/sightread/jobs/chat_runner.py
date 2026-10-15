@@ -560,6 +560,21 @@ async def _report_tool(
 
 
 MUTATING_TOOLS = frozenset({"bash", "str_replace_based_edit_tool"})
+# Read-only tools of one round in flight together.
+READ_CONCURRENCY = 4
+IMAGE_BUDGET_SPENT = "This round's image budget is spent; ask for fewer pages or figures at a time."
+
+
+def _image_bytes(result: dict) -> int:
+    """The encoded image bytes a tool_result carries — what it costs to hold and to store."""
+    content = result.get("content")
+    if not isinstance(content, list):
+        return 0
+    return sum(
+        len(block.get("source", {}).get("data", ""))
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "image"
+    )
 
 
 async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str]) -> list[dict]:
@@ -569,14 +584,32 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
     results: dict[int, dict] = {}
 
     async def reads() -> None:
-        reading = [
-            (index, block)
-            for index, block in enumerate(tool_uses)
-            if block.get("name") not in MUTATING_TOOLS
-        ]
-        done = await asyncio.gather(*(_run_tool(ctx, block, malformed) for _, block in reading))
-        for (index, _), result in zip(reading, done, strict=True):
-            results[index] = result
+        # A few at a time, against one image budget for the round: fifty page renders at
+        # once would hold their PNGs in memory together and store them all in the history.
+        slots = asyncio.Semaphore(READ_CONCURRENCY)
+        budget = ctx.settings.chat_image_round_max_bytes
+        spent = 0
+
+        async def one(index: int, block: dict) -> None:
+            nonlocal spent
+            async with slots:
+                if spent >= budget:
+                    outcome = chat_tools.ToolOutcome(IMAGE_BUDGET_SPENT, is_error=True)
+                    results[index] = await _report_tool(
+                        ctx, str(block.get("id")), block.get("name"), outcome
+                    )
+                    return
+                result = await _run_tool(ctx, block, malformed)
+                spent += _image_bytes(result)
+                results[index] = result
+
+        await asyncio.gather(
+            *(
+                one(index, block)
+                for index, block in enumerate(tool_uses)
+                if block.get("name") not in MUTATING_TOOLS
+            )
+        )
 
     async def writes() -> None:
         started = False

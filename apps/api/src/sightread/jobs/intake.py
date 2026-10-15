@@ -325,14 +325,18 @@ async def submit_parse(
             active = await find_active_job(db, **key)
             if active is not None:
                 # The same parse is already on its way. Starting another would spend the
-                # user's key twice over for one document.
-                stored.unlink(missing_ok=True)
-                if retain_source and not active.retain_source:
-                    active.retain_source = True
+                # user's key twice over for one document. A caller that keeps originals
+                # keeps this fresh copy for its own row: the worker may finish and hand
+                # the job's upload to the rows that exist before this one does.
+                if retain_source:
+                    if not active.retain_source:
+                        active.retain_source = True
+                else:
+                    stored.unlink(missing_ok=True)
                 if ticket is not None:
                     upload_tickets.spend(ticket, active.id)
                     await db.commit()
-                return Submission(job=active)
+                return Submission(job=active, upload=stored if retain_source else None)
 
     job = await enqueue_job(
         db,
