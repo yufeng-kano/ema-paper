@@ -209,9 +209,7 @@ async def test_the_model_chosen_in_settings_runs_and_a_request_model_overrides_i
     assert second.model == MODEL
 
 
-async def test_kano_proxy_must_be_connected_to_parse_on_it(
-    client: AsyncClient, documents
-) -> None:
+async def test_kano_proxy_must_be_connected_to_parse_on_it(client: AsyncClient, documents) -> None:
     await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
     created = await client.post("/api/keys", json={"name": "test"}, headers=CSRF_HEADERS)
     client.headers["Authorization"] = f"Bearer {created.json()['key']}"

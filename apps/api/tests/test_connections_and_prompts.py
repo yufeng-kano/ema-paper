@@ -389,7 +389,11 @@ async def test_base_url_hostnames_are_resolved_and_checked(monkeypatch) -> None:
 
 async def test_a_malformed_host_or_port_is_a_400_not_a_500() -> None:
     for env in ("local", "production"):
-        for bad in ("https://[bad/v1", "https://proxy.example:bad/v1", "https://proxy.example:99999/v1"):
+        for bad in (
+            "https://[bad/v1",
+            "https://proxy.example:bad/v1",
+            "https://proxy.example:99999/v1",
+        ):
             with pytest.raises(ApiError) as raised:
                 await normalize_base_url(bad, env)
             assert raised.value.status_code == 400
@@ -482,9 +486,7 @@ async def test_a_foreign_preset_or_connection_cannot_be_selected(signed_in) -> N
 
 
 @respx.mock
-async def test_parse_runs_on_the_selected_connection(
-    make_client, sessionmaker, documents
-) -> None:
+async def test_parse_runs_on_the_selected_connection(make_client, sessionmaker, documents) -> None:
     """The whole path: settings pick a connection, the worker calls its endpoint, and the
     usage row records tokens with an unknown cost — the connection did not opt in to its
     reported one (docs/parsing.md § Upstream usage)."""

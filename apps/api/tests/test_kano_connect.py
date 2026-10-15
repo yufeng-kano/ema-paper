@@ -146,9 +146,7 @@ async def test_a_state_works_once(client, sessionmaker) -> None:
 
 
 @respx.mock
-async def test_a_state_bound_to_another_user_is_rejected(
-    make_client, sessionmaker
-) -> None:
+async def test_a_state_bound_to_another_user_is_rejected(make_client, sessionmaker) -> None:
     """A state is not a bearer: a callback in someone else's session cannot use it, and
     the owner's pending connect survives the attempt."""
     token = respx.post(KANO_TOKEN_URL).mock(return_value=_issued())
@@ -164,16 +162,12 @@ async def test_a_state_bound_to_another_user_is_rejected(
         await db.commit()
     stranger.cookies.set(SESSION_COOKIE, session_token)
 
-    assert await _finish(stranger, code="c", state=query["state"]) == (
-        f"{AGENTS_URL}?kano=error"
-    )
+    assert await _finish(stranger, code="c", state=query["state"]) == (f"{AGENTS_URL}?kano=error")
     assert not token.called
     assert await _stored_keys(sessionmaker) == []
 
     # Still the owner's to finish.
-    assert await _finish(owner, code="c", state=query["state"]) == (
-        f"{AGENTS_URL}?kano=connected"
-    )
+    assert await _finish(owner, code="c", state=query["state"]) == (f"{AGENTS_URL}?kano=connected")
     [stored] = await _stored_keys(sessionmaker)
     assert stored.user_id != other.id
 
@@ -194,9 +188,7 @@ async def test_a_callback_without_a_session_stores_nothing(make_client, sessionm
     query = await _start(await _signed_in(make_client()))
 
     anonymous = make_client()
-    assert await _finish(anonymous, code="c", state=query["state"]) == (
-        f"{AGENTS_URL}?kano=error"
-    )
+    assert await _finish(anonymous, code="c", state=query["state"]) == (f"{AGENTS_URL}?kano=error")
     assert not token.called
 
 
@@ -255,9 +247,7 @@ async def test_a_rejected_exchange_stores_nothing(client, sessionmaker) -> None:
 
     for _ in range(5):
         query = await _start(client)
-        assert await _finish(client, code="c", state=query["state"]) == (
-            f"{AGENTS_URL}?kano=error"
-        )
+        assert await _finish(client, code="c", state=query["state"]) == (f"{AGENTS_URL}?kano=error")
 
     assert await _stored_keys(sessionmaker) == []
     assert (await client.get("/api/kano")).json()["connected"] is False

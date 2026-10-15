@@ -91,9 +91,7 @@ def test_discard_removes_only_that_jobs_crops(tmp_path) -> None:
 
 def test_the_per_page_cap_keeps_the_first_boxes_in_reading_order(tmp_path) -> None:
     image = _page_image(tmp_path / "page.png")
-    markdown = "\n".join(
-        f"![fig](sightread://p1/{y},0,{y + 50},100)" for y in range(0, 500, 50)
-    )
+    markdown = "\n".join(f"![fig](sightread://p1/{y},0,{y + 50},100)" for y in range(0, 500, 50))
 
     saved = save_page_figures(markdown, image, 1, tmp_path / "job", limit=3)
 
