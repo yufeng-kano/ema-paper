@@ -258,9 +258,9 @@ def renames_since(root: Path, commit: str) -> dict[Path, Path]:
     return forward
 
 
-def changed_paths(root: Path, commit: str) -> list[tuple[str, Path]]:
-    """What the commit did to each path: `A`dded, `M`odified, `D`eleted or `T`ype-changed,
-    with renames reported as a delete and an add."""
+def changed_paths(root: Path, commit: str) -> list[tuple[str, Path, Path | None]]:
+    """What the commit did to each path: `A`dded, `M`odified, `D`eleted, `T`ype-changed
+    or `R`enamed — for a rename, the old path and the new one."""
     proc = _git(
         root,
         "diff-tree",
@@ -268,7 +268,7 @@ def changed_paths(root: Path, commit: str) -> list[tuple[str, Path]]:
         "--root",
         "-r",
         "--name-status",
-        "--no-renames",
+        "--find-renames",
         "-z",
         commit,
         check=False,
@@ -276,10 +276,19 @@ def changed_paths(root: Path, commit: str) -> list[tuple[str, Path]]:
     if proc.returncode != 0:
         return []
     fields = proc.stdout.split("\0")
-    changes: list[tuple[str, Path]] = []
-    for status, name in zip(fields[0::2], fields[1::2], strict=False):
-        if status and name:
-            changes.append((status[0], Path(name)))
+    changes: list[tuple[str, Path, Path | None]] = []
+    index = 0
+    while index + 1 < len(fields):
+        status = fields[index]
+        if not status:
+            index += 1
+            continue
+        if status.startswith("R") and index + 2 < len(fields):
+            changes.append(("R", Path(fields[index + 1]), Path(fields[index + 2])))
+            index += 3
+        else:
+            changes.append((status[0], Path(fields[index + 1]), None))
+            index += 2
     return changes
 
 

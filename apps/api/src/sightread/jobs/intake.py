@@ -52,10 +52,13 @@ BASE64_CHUNK_CHARS = 4 * 256 * 1024
 
 @dataclass
 class Submission:
-    """The outcome of an intake: either a queued job or a cached result, never both."""
+    """The outcome of an intake: either a queued job or a cached result, never both.
+    `upload` is the fresh file, kept for a caller that retains sources when the answer
+    came from the cache (docs/jobs.md § Retention)."""
 
     job: Job | None = None
     cached: Result | None = None
+    upload: Path | None = None
 
 
 class ChunkReader(Protocol):
@@ -306,12 +309,14 @@ async def submit_parse(
             # a transient upstream failure must not be replayed forever (docs/jobs.md).
             result = None
         if result is not None:
-            # The cache already holds this exact parse; the fresh copy is dead weight.
-            stored.unlink(missing_ok=True)
+            # The cache already holds this exact parse; the fresh copy is dead weight —
+            # unless the caller keeps originals, whose row has nothing else to keep.
+            if not retain_source:
+                stored.unlink(missing_ok=True)
             if ticket is not None:
                 upload_tickets.spend(ticket, result.job_id)
                 await db.commit()
-            return Submission(cached=result)
+            return Submission(cached=result, upload=stored if retain_source else None)
 
         if reuse_in_flight:
             # Held until this transaction commits, so a second upload of the same bytes

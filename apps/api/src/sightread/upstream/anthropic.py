@@ -129,16 +129,41 @@ def _raise_for_status(response: httpx.Response) -> None:
         )
 
 
+async def _bounded_lines(response: httpx.Response, max_bytes: int) -> AsyncIterator[str]:
+    """The body's lines, decoded, from fixed-size chunks; a line that outgrows
+    `MAX_SSE_LINE_BYTES` or a body that outgrows `max_bytes` ends the read."""
+    pending = bytearray()
+    seen = 0
+    async for chunk in response.aiter_bytes(65_536):
+        seen += len(chunk)
+        if seen > max_bytes:
+            raise ResponseTooLarge()
+        pending += chunk
+        while True:
+            newline = pending.find(b"\n")
+            if newline == -1:
+                break
+            line = bytes(pending[:newline])
+            del pending[: newline + 1]
+            yield line.decode("utf-8", errors="replace").rstrip("\r")
+        if len(pending) > MAX_SSE_LINE_BYTES:
+            raise UpstreamError("The upstream sent an overlong stream line")
+    if pending:
+        yield bytes(pending).decode("utf-8", errors="replace").rstrip("\r")
+
+
 async def _sse_events(response: httpx.Response, max_bytes: int) -> AsyncIterator[tuple[str, dict]]:
     """`(event, data)` pairs from an SSE body, bounded in total size."""
     total = 0
     event_name = ""
     data_lines: list[str] = []
-    async for raw_line in response.aiter_lines():
-        total += len(raw_line) + 1
+    # Bytes, not `aiter_lines()`: that would hold a whole line before any check could
+    # run. Lines are split as the chunks come, and a line past `MAX_SSE_LINE_BYTES` or a
+    # body past `max_bytes` is refused before it is held.
+    async for line in _bounded_lines(response, max_bytes):
+        total += len(line) + 1
         if total > max_bytes:
             raise ResponseTooLarge()
-        line = raw_line.rstrip("\r")
         if not line:
             if data_lines:
                 try:

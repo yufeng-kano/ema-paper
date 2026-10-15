@@ -131,6 +131,8 @@ def _read_text(root: Path, path: Path, max_bytes: int) -> str:
         return safe_io.read_text(root, path, max_bytes) or ""
     except safe_io.EntryTooLarge as exc:
         raise ApiError(409, "invalid_request", TOO_LARGE) from exc
+    except UnicodeDecodeError as exc:
+        raise ApiError(409, "invalid_request", "The document file is not UTF-8 text") from exc
     except (safe_io.UnsafeEntry, OSError) as exc:
         raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
 
@@ -288,12 +290,23 @@ def keep_source(root: Path, relative: Path, source: Path, *, copy: bool = False)
     return target
 
 
-async def adopt_source(db: AsyncSession, settings: Settings, document: Document, job: Job) -> None:
+async def adopt_source(
+    db: AsyncSession,
+    settings: Settings,
+    document: Document,
+    job: Job,
+    *,
+    upload: Path | None = None,
+) -> None:
     """The library row arrived after its parse finished, so the worker found no document
-    to keep the upload for and left it in place (docs/jobs.md § Retention): take it now."""
-    if job.status != "succeeded" or not job.source_path or job.source_deleted_at is not None:
-        return
-    source = Path(job.source_path)
+    to keep the upload for and left it in place — or the parse was answered from the
+    cache and `upload` is the fresh file (docs/jobs.md § Retention): take it now."""
+    if upload is not None:
+        source = upload
+    else:
+        if job.status != "succeeded" or not job.source_path or job.source_deleted_at is not None:
+            return
+        source = Path(job.source_path)
     if not source.is_file():
         return
     root = user_root(settings.workspaces_dir, document.user_id)
@@ -308,8 +321,9 @@ async def adopt_source(db: AsyncSession, settings: Settings, document: Document,
             source.unlink(missing_ok=True)
         else:
             await asyncio.to_thread(keep_source, root, relative, source)
-    job.source_deleted_at = utcnow()
-    await db.commit()
+    if upload is None:
+        job.source_deleted_at = utcnow()
+        await db.commit()
 
 
 # --- content ------------------------------------------------------------------------------
@@ -408,10 +422,23 @@ async def revisions(db: AsyncSession, settings: Settings, document: Document) ->
     return await asyncio.to_thread(git.log, paths.root, paths.relative)
 
 
+def _prune_empty(root: Path, directory: Path) -> None:
+    """Remove the directories a moved-back file left empty, up to `files/`: git tracks
+    files, not directories, so a reverted rename would otherwise leave its shell."""
+    base = files_root(root)
+    while directory != base and base in directory.parents:
+        try:
+            directory.rmdir()
+        except OSError:
+            return
+        directory = directory.parent
+
+
 def _revert(paths: DocumentPaths, commit: str, max_bytes: int) -> str:
     """Undo every path the commit touched — a shell revision may have changed files
     beyond this document — writing each one as it was in the commit's parent, where it
-    lives now if it was moved since (docs/workspace.md § Revisions)."""
+    lives now if it was moved since; a rename is moved back (docs/workspace.md
+    § Revisions). Returns the commit the revert made."""
     paths.check()
     root = paths.root
     if not git.is_commit(root, commit):
@@ -419,9 +446,16 @@ def _revert(paths: DocumentPaths, commit: str, max_bytes: int) -> str:
     parent = git.parent_of(root, commit)
     moved = git.renames_since(root, commit)
     restored: list[Path] = []
-    for status, then in git.changed_paths(root, commit):
+    for status, then, renamed_to in git.changed_paths(root, commit):
         now = moved.get(then, then)
         try:
+            if status == "R" and renamed_to is not None:
+                current = moved.get(renamed_to, renamed_to)
+                if (root / current).exists():
+                    git.move(root, root / current, root / then)
+                    _prune_empty(root, (root / current).parent)
+                    restored += [current, then]
+                continue
             if status == "A":
                 # The commit created the file; the fixed files of a document are emptied
                 # rather than removed, so the directory keeps its shape.
@@ -441,14 +475,29 @@ def _revert(paths: DocumentPaths, commit: str, max_bytes: int) -> str:
         restored.append(now)
     if not restored:
         raise ApiError(400, "invalid_request", "That revision changed nothing")
-    git.commit_paths(root, git.USER_AUTHOR, f"revert {commit[:12]}", restored)
-    return revision_of(_read_text(root, paths.doc, max_bytes))
+    made = git.commit_paths(root, git.USER_AUTHOR, f"revert {commit[:12]}", restored)
+    if made is None:
+        raise ApiError(400, "invalid_request", "That revision changed nothing")
+    return made
 
 
-async def revert(db: AsyncSession, settings: Settings, document: Document, commit: str) -> str:
+@dataclass(frozen=True)
+class Reverted:
+    commit: str
+    revision: str
+
+
+async def revert(db: AsyncSession, settings: Settings, document: Document, commit: str) -> Reverted:
+    """Undo a commit, then bring the library in line with the tree — a reverted rename
+    moves the directory, and the row follows — and report the document's revision now."""
+    from .reconcile import reconcile_user
+
     paths = await materialize_document(db, settings, document)
     async with workspace_lock(paths.root):
-        return await asyncio.to_thread(_revert, paths, commit, settings.content_max_bytes)
+        made = await asyncio.to_thread(_revert, paths, commit, settings.content_max_bytes)
+    await reconcile_user(db, settings, document.user_id)
+    content = await read_content(db, settings, document)
+    return Reverted(commit=made, revision=content.revision)
 
 
 # --- the tree -----------------------------------------------------------------------------

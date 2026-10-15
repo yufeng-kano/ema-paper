@@ -16,6 +16,10 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 TOO_LARGE = {"error": {"type": "invalid_request", "message": "The request body is too large"}}
 
 
+# The routes that stream their body to disk under UPLOAD_MAX_BYTES themselves.
+STREAMING_UPLOADS = frozenset({("POST", "/v1/parse"), ("POST", "/api/library/documents")})
+
+
 class BodyTooLarge(Exception):
     """Raised from the request's own `receive`, inside the route, so the app's error
     handlers answer it (413) like any other request failure."""
@@ -31,7 +35,9 @@ class BodyLimitMiddleware:
             await self.app(scope, receive, send)
             return
         headers = {key.lower(): value for key, value in scope.get("headers", [])}
-        if headers.get(b"content-type", b"").lower().startswith(b"multipart/form-data"):
+        if (scope.get("method"), scope.get("path")) in STREAMING_UPLOADS:
+            # The only routes that read a body without holding it (docs/api.md § POST
+            # /v1/parse); a multipart label on any other route buys no exemption.
             await self.app(scope, receive, send)
             return
         declared = headers.get(b"content-length", b"")

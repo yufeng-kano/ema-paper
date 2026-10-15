@@ -34,6 +34,7 @@ from ..db.models import (
     Job,
     JobPage,
     Result,
+    User,
 )
 from ..errors import ApiError
 from ..jobs.intake import (
@@ -128,9 +129,15 @@ async def document_names(
     return set((await db.execute(query)).scalars().all())
 
 
-async def refuse_while_answering(db: DbSession, document_ids) -> None:
+async def refuse_while_answering(db: DbSession, user_id: int, document_ids) -> None:
     """A document whose conversation has an unfinished turn cannot go: the worker would
-    carry on against rows and a directory that no longer exist (docs/chat.md)."""
+    carry on against rows and a directory that no longer exist (docs/chat.md). Decided
+    under the locks a send takes, in the same order — the user's row, then the
+    conversations' — so no turn can be queued between this check and the delete."""
+    await db.execute(select(User.id).where(User.id == user_id).with_for_update())
+    await db.execute(
+        select(Conversation.id).where(Conversation.document_id.in_(document_ids)).with_for_update()
+    )
     busy = (
         await db.execute(
             select(ChatTurn.id)
@@ -440,6 +447,7 @@ async def delete_folder(
         doomed = await subtree_ids(db, user.id, row.id)
         await refuse_while_answering(
             db,
+            user.id,
             select(Document.id).where(Document.user_id == user.id, Document.folder_id.in_(doomed)),
         )
         await db.execute(
@@ -561,8 +569,9 @@ async def upload_document(
         row = await land(None)
 
     job = await job_of(db, job_id)
-    # The parse may already be done: the worker then left the upload for this row.
-    await workspace_documents.adopt_source(db, settings, row, job)
+    # The parse may already be done (the worker then left the upload for this row), or
+    # answered from the cache (the fresh upload is this row's to keep).
+    await workspace_documents.adopt_source(db, settings, row, job, upload=submission.upload)
     return document_payload(row, job)
 
 
@@ -668,7 +677,7 @@ async def delete_document(
     async with workspace_lock(user_root(settings.workspaces_dir, user.id)):
         row = await owned_document(db, user.id, document_id)
         relative = await document_relative(db, row)
-        await refuse_while_answering(db, select(Document.id).where(Document.id == row.id))
+        await refuse_while_answering(db, user.id, select(Document.id).where(Document.id == row.id))
         await db.delete(row)
         await db.commit()
         await workspace_documents.remove_path(settings, user.id, relative)
@@ -840,4 +849,5 @@ async def revert_document_revision(
     row = await owned_document(db, user.id, document_id)
     if not re.fullmatch(r"[0-9a-f]{7,40}", commit):
         raise ApiError(404, "invalid_request", "No such revision")
-    return {"revision": await workspace_documents.revert(db, settings, row, commit)}
+    reverted = await workspace_documents.revert(db, settings, row, commit)
+    return {"revision": reverted.revision, "commit": reverted.commit}

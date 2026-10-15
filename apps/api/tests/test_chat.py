@@ -767,7 +767,11 @@ async def test_writing_tools_run_in_order_while_reads_run_together(monkeypatch) 
         reads_running.discard(tool_id)
         return {"type": "tool_result", "tool_use_id": tool_id, "content": block["name"]}
 
+    async def never_cancelled(ctx):
+        return False
+
     monkeypatch.setattr(chat_runner, "_run_tool", fake_run_tool)
+    monkeypatch.setattr(chat_runner, "_cancelled", never_cancelled)
     tool_uses = [
         {"type": "tool_use", "id": "a", "name": "view_page", "input": {}},
         {"type": "tool_use", "id": "b", "name": "bash", "input": {}},
@@ -911,3 +915,71 @@ async def test_an_oversized_json_body_is_refused_before_it_is_read(make_client, 
     assert chunked.status_code == 413
     small = await client.get(f"/api/library/documents/{document_id}/content")
     assert small.status_code == 200
+
+
+async def test_the_editor_never_follows_a_link_planted_in_the_tree(tmp_path) -> None:
+    root = tmp_path / "ws" / "1"
+    (root / "files" / "d").mkdir(parents=True)
+    secret = tmp_path / "secret.txt"
+    secret.write_text("sk-not-for-you")
+    (root / "files" / "d" / "link.md").symlink_to(secret)
+    viewed = await chat_tools.run_editor(
+        root,
+        {"command": "view", "path": "/workspace/files/d/link.md"},
+        "agent:1",
+        max_chars=1000,
+        max_bytes=1_000_000,
+    )
+    assert viewed.is_error and "sk-not-for-you" not in str(viewed.content)
+    written = await chat_tools.run_editor(
+        root,
+        {
+            "command": "str_replace",
+            "path": "/workspace/files/d/link.md",
+            "old_str": "x",
+            "new_str": "y",
+        },
+        "agent:1",
+        max_chars=1000,
+        max_bytes=1_000_000,
+    )
+    assert written.is_error
+    assert secret.read_text() == "sk-not-for-you"
+
+
+async def test_a_stop_ends_the_round_before_the_next_write(monkeypatch) -> None:
+    calls: list[str] = []
+    cancelled = {"value": False}
+
+    async def fake_run_tool(ctx, block, malformed):
+        calls.append(block["id"])
+        cancelled["value"] = True  # the user pressed Stop while the first write ran
+        return {"type": "tool_result", "tool_use_id": block["id"], "content": "ok"}
+
+    async def fake_cancelled(ctx):
+        return cancelled["value"]
+
+    monkeypatch.setattr(chat_runner, "_run_tool", fake_run_tool)
+    monkeypatch.setattr(chat_runner, "_cancelled", fake_cancelled)
+    tool_uses = [
+        {"type": "tool_use", "id": "a", "name": "bash", "input": {}},
+        {"type": "tool_use", "id": "b", "name": "bash", "input": {}},
+    ]
+    with pytest.raises(chat_runner.TurnCancelled):
+        await chat_runner._run_tools(None, tool_uses, set())
+    assert calls == ["a"]
+
+
+async def test_the_body_cap_ignores_a_multipart_label_off_the_upload_routes(
+    make_client, tmp_path
+) -> None:
+    client = make_client(workspaces_dir=str(tmp_path / "ws"), content_max_bytes=1_000)
+    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    user_id = (await client.get("/api/me")).json()["user"]["id"]
+    document_id = await _seed_document(client, user_id)
+    spoofed = await client.put(
+        f"/api/library/documents/{document_id}/content",
+        content=b"x" * 200_000,
+        headers={**CSRF_HEADERS, "Content-Type": "multipart/form-data; boundary=abc"},
+    )
+    assert spoofed.status_code == 413

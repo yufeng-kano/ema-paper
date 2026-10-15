@@ -116,7 +116,9 @@ async def _turn_running(
                 .select_from(ChatTurn)
                 .where(
                     ChatTurn.conversation_id == conversation_id,
-                    ChatTurn.status.in_(("queued", "running")),
+                    # A cancelled turn is still the worker's until it winds down and
+                    # writes the terminal event; the stream waits for that.
+                    ChatTurn.finished_at.is_(None),
                 )
             )
         ).scalar_one()

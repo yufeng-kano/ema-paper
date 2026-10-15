@@ -97,7 +97,7 @@ The live model catalog of the caller's **parse** upstream — `GET {KANO_PROXY_B
 | `PUT /api/library/documents/{id}/content` | `{markdown, base_revision}` → `{revision}`; **409** when `base_revision` is not the file's current revision |
 | `PUT /api/library/documents/{id}/notes` | `{text, base_revision}` → `{revision}`, same rule |
 | `GET /api/library/documents/{id}/revisions` | `{revisions: [{commit, author, message, created_at, files}]}`, newest first |
-| `POST /api/library/documents/{id}/revisions/{commit}/revert` | write every path that commit touched as it was before it (where it lives now), as a new revision → `{revision}` of this document |
+| `POST /api/library/documents/{id}/revisions/{commit}/revert` | write every path that commit touched as it was before it (where it lives now; a rename moved back, the library reconciled), as a new revision → `{revision}` of this document and the `{commit}` the revert made |
 | `GET /api/library/documents/{id}/conversations`, `POST` | the document's chat threads (`{conversations: [{id, title, created_at, updated_at}]}`); `POST` creates an empty one |
 | `GET /api/conversations/{id}` | `{conversation, messages: [{id, role, content, turn_id, created_at}], turns: [{id, status, error}]}` |
 | `POST /api/conversations/{id}/messages` | `{text, selection?, locale?}` → **202** `{turn_id, message_id}`: stores the user message (with the turn's id) and queues a turn that answers in `locale` (`en` or `zh-TW`, default `en`). 429 when the caller already has `MAX_CHAT_TURNS_PER_USER` turns running; 409 while this conversation is still answering; 400 when the chat agent has no model or Kano Proxy is not connected |
@@ -150,7 +150,7 @@ While a job is still `queued` or `running`, the two control-plane result routes 
 - `PAGE_CAP` = 500, `MAX_JOBS_PER_USER` = 2 concurrent, `VISION_CONCURRENCY_PER_JOB` = 8.
 - `SYSTEM_PROMPT_MAX_CHARS` = 8000 — cap on a prompt preset's text.
 - `FIGURES_PER_PAGE_MAX` = 40 — cap on stored figure crops per page ([parsing.md](./parsing.md) § Figure crops).
-- JSON request bodies are capped at twice `CONTENT_MAX_BYTES` plus 64 KiB (**413** past it, by declared length or as the bytes arrive); multipart uploads stream under `UPLOAD_MAX_BYTES` instead.
+- Request bodies are capped at twice `CONTENT_MAX_BYTES` plus 64 KiB (**413** past it, by declared length or as the bytes arrive) on every route but the two that stream an upload to disk under `UPLOAD_MAX_BYTES` (`POST /v1/parse`, `POST /api/library/documents`); a multipart label on any other route buys no exemption.
 - `UPSTREAM_RESPONSE_MAX_BYTES` = 33554432 (32 MB) — cap on any upstream response body (model catalogs and vision completions); beyond it the call fails as `upstream` ([parsing.md](./parsing.md) § Upstream usage).
 - 429 with `Retry-After` when the per-user job cap is hit; upstream 402 (the upstream's credits or allowance exhausted) maps to `payment` and fails only the affected pages.
 - `MAX_CHAT_TURNS_PER_USER` = 4 concurrent chat turns (and shells); `CHAT_MAX_OUTPUT_TOKENS` = 64000; `CHAT_MAX_TOOL_CALLS_PER_TURN` = 50; `CHAT_TURN_TIMEOUT_SECONDS` = 900; `CHAT_TOOL_RESULT_MAX_CHARS` = 20000 ([chat.md](./chat.md)).

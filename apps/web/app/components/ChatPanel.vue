@@ -5,7 +5,6 @@ import {
   deleteConversation,
   getConversation,
   listConversations,
-  listRevisions,
   revertRevision,
   sendMessage,
   type ChatEvent,
@@ -640,12 +639,13 @@ async function toggleEdit(card: EditCard) {
   cards.set(card.toolUseId, { ...state, pending: true })
   cardError.value = null
   try {
-    await revertRevision(props.documentId, target)
-    const newest = (await listRevisions(props.documentId)).revisions[0]?.commit ?? null
+    // The commit the revert made, from the response: the newest revision could by now
+    // be someone else's.
+    const { commit: made } = await revertRevision(props.documentId, target)
     cards.set(card.toolUseId, {
       reverted: !state.reverted,
-      undoCommit: state.reverted ? state.undoCommit : newest,
-      redoCommit: state.reverted ? newest : state.redoCommit,
+      undoCommit: state.reverted ? state.undoCommit : made,
+      redoCommit: state.reverted ? made : state.redoCommit,
       pending: false,
     })
     emit('changed')

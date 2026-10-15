@@ -116,7 +116,7 @@ def resolve_workspace_path(root: Path, raw: object) -> Path:
 
 
 def _writable(root: Path, path: Path) -> bool:
-    relative = path.resolve().relative_to(root.resolve())
+    relative = path.relative_to(root)
     return not any(part in READ_ONLY_NAMES for part in relative.parts)
 
 
@@ -160,19 +160,26 @@ def _edit_sync(
         path = resolve_workspace_path(root, tool_input.get("path"))
     except PathRefused as exc:
         return ToolOutcome(str(exc), is_error=True)
-    vm_path = str(VM_ROOT / path.resolve().relative_to(root.resolve()).as_posix())
+    vm_path = str(VM_ROOT / path.relative_to(root).as_posix())
 
+    # Every open goes through `safe_io`: nothing is followed, and what was opened is
+    # checked through its descriptor (docs/workspace.md § Revisions).
     if command == "view":
-        if path.is_dir():
+        kind = safe_io.entry_kind(root, path)
+        if kind == "dir":
             return ToolOutcome(_listing(path))
-        if not path.is_file():
+        if kind == "none":
             return ToolOutcome(f"{vm_path} does not exist", is_error=True)
-        if path.stat().st_size > max_bytes:
-            return ToolOutcome(f"{vm_path} is too large to view; use bash", is_error=True)
         try:
-            text = path.read_text()
+            text = safe_io.read_text(root, path, max_bytes)
+        except safe_io.EntryTooLarge:
+            return ToolOutcome(f"{vm_path} is too large to view; use bash", is_error=True)
+        except (safe_io.UnsafeEntry, OSError):
+            return ToolOutcome(f"{vm_path} is not a plain file", is_error=True)
         except UnicodeDecodeError:
             return ToolOutcome(f"{vm_path} is not a text file", is_error=True)
+        if text is None:
+            return ToolOutcome(f"{vm_path} does not exist", is_error=True)
         return ToolOutcome(truncate(_numbered(text, tool_input.get("view_range")), max_chars))
 
     if command not in ("str_replace", "insert", "create"):
@@ -180,9 +187,14 @@ def _edit_sync(
     if not _writable(root, path):
         return ToolOutcome(f"{vm_path} is read-only", is_error=True)
 
-    if path.is_file() and path.stat().st_size > max_bytes:
+    try:
+        before = safe_io.read_text(root, path, max_bytes)
+    except safe_io.EntryTooLarge:
         return ToolOutcome(f"{vm_path} is too large to edit here; use bash", is_error=True)
-    before = path.read_text() if path.is_file() else None
+    except (safe_io.UnsafeEntry, OSError):
+        return ToolOutcome(f"{vm_path} is not a plain file", is_error=True)
+    except UnicodeDecodeError:
+        return ToolOutcome(f"{vm_path} is not a text file", is_error=True)
     if command == "create":
         new_text = tool_input.get("file_text")
         if not isinstance(new_text, str):
@@ -222,12 +234,14 @@ def _edit_sync(
 
     if len(after.encode()) > max_bytes:
         return ToolOutcome(f"the result would make {vm_path} too large; use bash", is_error=True)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(after)
+    try:
+        safe_io.write_text(root, path, after, exist_ok=command != "create")
+    except FileExistsError:
+        return ToolOutcome(f"{vm_path} already exists; use str_replace", is_error=True)
+    except safe_io.UnsafeEntry:
+        return ToolOutcome(f"{vm_path} is not a plain file", is_error=True)
     git.ensure_repo(root)
-    commit = git.commit_paths(
-        root, author, f"{command} {vm_path}", [path.resolve().relative_to(root.resolve())]
-    )
+    commit = git.commit_paths(root, author, f"{command} {vm_path}", [path.relative_to(root)])
     diff = _diff(before or "", after, vm_path)
     return ToolOutcome(
         f"{command} applied to {vm_path}",

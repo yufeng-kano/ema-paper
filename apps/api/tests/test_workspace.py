@@ -122,7 +122,7 @@ async def test_materialize_writes_once_and_edits_commit_revisions(sessionmaker, 
         ]
 
         # Revert the edit: a new revision that restores the earlier text.
-        restored = await documents.revert(db, settings, document, history[0].commit)
+        restored = (await documents.revert(db, settings, document, history[0].commit)).revision
         assert restored == content.revision
         assert paths.doc.read_text() == "# Title\n\nBody\n"
         assert (await documents.revisions(db, settings, document))[0].message.startswith("revert")
@@ -179,7 +179,7 @@ async def test_revert_follows_a_rename(sessionmaker, tmp_path) -> None:
         await documents.move_path(settings, user.id, before.relative, after.relative)
         assert after.doc.read_text() == "# Title\n\nEdited\n"
 
-        restored = await documents.revert(db, settings, document, edit.commit)
+        restored = (await documents.revert(db, settings, document, edit.commit)).revision
         assert restored == content.revision
         assert after.doc.read_text() == "# Title\n\nBody\n"
 
@@ -433,7 +433,7 @@ async def test_revert_undoes_every_path_of_a_shell_commit(sessionmaker, tmp_path
         (paths.directory / "helper.py").write_text("print(1)\n")
         commit = git.commit_all(root, "agent:1", "bash: python fix.py")
         assert commit is not None
-        restored = await documents.revert(db, settings, document, commit)
+        restored = (await documents.revert(db, settings, document, commit)).revision
         assert paths.doc.read_text() == "# Title\n\nBody\n"
         assert not (paths.directory / "helper.py").exists()
         assert restored == documents.revision_of("# Title\n\nBody\n")
@@ -467,3 +467,54 @@ async def test_a_late_library_row_adopts_the_finished_upload(sessionmaker, tmp_p
         assert (paths.directory / "source.pdf").read_bytes() == b"%PDF-1.4"
         assert not upload.exists()
         assert job.source_deleted_at is not None
+
+
+async def test_reverting_a_rename_moves_the_directory_back_and_the_row_follows(
+    sessionmaker, tmp_path
+) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        before = await documents.materialize_document(db, settings, document)
+        content = await documents.read_content(db, settings, document)
+        await documents.write_content(
+            db, settings, document, markdown="# Title\n\nEdited\n", base_revision=content.revision
+        )
+        document.name = "renamed.pdf"
+        await db.commit()
+        after = await documents.document_paths(db, settings, document)
+        await documents.move_path(settings, user.id, before.relative, after.relative)
+        rename = git.log(after.root)[0]
+        assert rename.message.startswith("move ")
+
+        reverted = await documents.revert(db, settings, document, rename.commit)
+        row = (await db.execute(select(Document).where(Document.id == document.id))).scalar_one()
+        assert row.name == "paper.pdf"
+        assert before.doc.read_text() == "# Title\n\nEdited\n"
+        assert not after.directory.exists()
+        assert reverted.revision == documents.revision_of("# Title\n\nEdited\n")
+        assert git.log(after.root)[0].commit == reverted.commit
+
+
+async def test_non_utf8_content_is_refused_not_a_crash(sessionmaker, tmp_path) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        _, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+        paths.doc.write_bytes(b"\xff\xfe not text")
+        with pytest.raises(ApiError) as refused:
+            await documents.read_content(db, settings, document)
+        assert refused.value.status_code == 409
+
+
+async def test_a_cached_library_upload_keeps_its_fresh_file(sessionmaker, tmp_path) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        _, document = await _seed(db)
+        job = (await db.execute(select(Job).where(Job.id == document.job_id))).scalar_one()
+        fresh = tmp_path / "fresh.pdf"
+        fresh.write_bytes(b"%PDF-1.4 fresh")
+        await documents.adopt_source(db, settings, document, job, upload=fresh)
+        paths = await documents.document_paths(db, settings, document)
+        assert (paths.directory / "source.pdf").read_bytes() == b"%PDF-1.4 fresh"
+        assert not fresh.exists()

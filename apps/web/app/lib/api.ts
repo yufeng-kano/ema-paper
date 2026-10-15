@@ -721,7 +721,7 @@ export function listRevisions(id: number): Promise<{ revisions: Revision[] }> {
 
 /** Writes the files as they were before `commit`, as a new revision — undo is itself a
  *  revision, nothing is rewritten (docs/workspace.md § Revisions). */
-export function revertRevision(id: number, commit: string): Promise<{ revision: string }> {
+export function revertRevision(id: number, commit: string): Promise<{ revision: string; commit: string }> {
   return request('POST', `/api/library/documents/${id}/revisions/${encodeURIComponent(commit)}/revert`)
 }
 

@@ -129,7 +129,10 @@ let contentSeq = 0
  * what is on disk is the truth, and the reader is told. A load while an edit is still
  * unsaved keeps the edit: its save will 409 and that reload will take over.
  */
-async function loadContent(replaceDirty = false) {
+/** Which unsaved work a reload may overwrite: nothing, one file, or both. */
+type Replace = false | 'markdown' | 'notes' | true
+
+async function loadContent(replaceDirty: Replace = false) {
   const id = props.documentId
   if (id === null) {
     return
@@ -145,12 +148,14 @@ async function loadContent(replaceDirty = false) {
     // An open block editor whose text differs from its block is unsaved work too: it
     // keeps the revision it was opened against, so its save meets the 409 that reloads.
     const dirtyEditor = editing.value !== null && draft.value !== openBlockSource()
-    if (replaceDirty || ((saveState.value === 'saved' || saveState.value === 'failed') && !dirtyEditor)) {
+    const takeMarkdown = replaceDirty === true || replaceDirty === 'markdown'
+    const takeNotes = replaceDirty === true || replaceDirty === 'notes'
+    if (takeMarkdown || ((saveState.value === 'saved' || saveState.value === 'failed') && !dirtyEditor)) {
       markdown.value = content.markdown
       revision.value = content.revision
       saveState.value = 'saved'
     }
-    if (replaceDirty || notesState.value === 'saved' || notesState.value === 'failed') {
+    if (takeNotes || notesState.value === 'saved' || notesState.value === 'failed') {
       notes.value = content.notes
       notesRevision.value = content.notes_revision
       notesState.value = 'saved'
@@ -220,7 +225,8 @@ async function saveContent() {
       // Another tab, or the agent: what is on disk wins, and the reader is told.
       saveState.value = 'saved'
       notice.value = t('viewer.changedUnderneath')
-      await loadContent(true)
+      // Only the file that conflicted; an unsaved notes draft is still the reader's.
+      await loadContent('markdown')
     } else {
       saveState.value = 'failed'
       saveError.value = await resolve(error)
@@ -270,7 +276,7 @@ async function saveNotes() {
     if (error instanceof ApiRequestError && error.status === 409) {
       notesState.value = 'saved'
       notice.value = t('viewer.notesChanged')
-      await loadContent(true)
+      await loadContent('notes')
     } else {
       notesState.value = 'failed'
       notesError.value = await resolve(error)

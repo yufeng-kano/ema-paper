@@ -565,8 +565,14 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
             results[index] = result
 
     async def writes() -> None:
+        started = False
         for index, block in enumerate(tool_uses):
             if block.get("name") in MUTATING_TOOLS:
+                # Stop means after the *current* call: the next write of the round is
+                # not started once the user has cancelled.
+                if started and await _cancelled(ctx):
+                    raise TurnCancelled()
+                started = True
                 results[index] = await _run_tool(ctx, block, malformed)
 
     await asyncio.gather(reads(), writes())
