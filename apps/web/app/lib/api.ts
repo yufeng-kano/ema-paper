@@ -281,7 +281,13 @@ export interface ConversationResponse {
  * The `chat_events` stream, one row per SSE frame: `event` is the frame's event name, the
  * rest its JSON data (docs/chat.md § Conversations, turns, events).
  */
-export type ChatEvent =
+export type ChatEvent = ChatEventData & {
+  /** The turn the frame belongs to: every frame carries it, so a turn that never
+   *  started (its load failed) still owns its `turn_error`. */
+  turn_id: string
+}
+
+type ChatEventData =
   | { event: 'turn_start'; model: string }
   | { event: 'text_delta'; text: string }
   | { event: 'thinking'; text: string }

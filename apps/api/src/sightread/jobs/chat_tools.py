@@ -32,7 +32,6 @@ READ_ONLY_NAMES = frozenset({".git", ".gitignore", SIGHTREAD_DIR, META_FILE, CAC
 VIEW_MAX_CHARS = 60_000
 # The long edge a page image is sent at: what Claude would resize to anyway.
 PAGE_IMAGE_LONG_EDGE_PX = 1568
-BASH_DEFAULT_TIMEOUT_SECONDS = 120
 
 
 @dataclass
@@ -62,6 +61,7 @@ async def run_bash(
     tool_input: dict,
     *,
     max_chars: int,
+    timeout_seconds: int,
 ) -> ToolOutcome:
     if tool_input.get("restart"):
         try:
@@ -73,15 +73,13 @@ async def run_bash(
     if not isinstance(command, str) or not command.strip():
         return ToolOutcome("bash needs a `command`", is_error=True)
     try:
-        result = await client.exec(
-            user_id, session, command, timeout_seconds=BASH_DEFAULT_TIMEOUT_SECONDS
-        )
+        result = await client.exec(user_id, session, command, timeout_seconds=timeout_seconds)
     except SandboxUnavailable as exc:
         return ToolOutcome(f"The sandbox is unavailable: {exc}", is_error=True)
     output = truncate(result.output, max_chars)
     notes = []
     if result.timed_out:
-        notes.append(f"[command timed out after {BASH_DEFAULT_TIMEOUT_SECONDS}s and was killed]")
+        notes.append(f"[command timed out after {timeout_seconds}s and was killed]")
     if result.truncated:
         notes.append("[output was cut by the sandbox]")
     if result.exit_code not in (None, 0):
@@ -153,7 +151,9 @@ def _diff(before: str, after: str, label: str) -> str:
     )
 
 
-def _edit_sync(root: Path, tool_input: dict, author: str, *, max_chars: int) -> ToolOutcome:
+def _edit_sync(
+    root: Path, tool_input: dict, author: str, *, max_chars: int, max_bytes: int
+) -> ToolOutcome:
     command = tool_input.get("command")
     try:
         path = resolve_workspace_path(root, tool_input.get("path"))
@@ -166,6 +166,8 @@ def _edit_sync(root: Path, tool_input: dict, author: str, *, max_chars: int) -> 
             return ToolOutcome(_listing(path))
         if not path.is_file():
             return ToolOutcome(f"{vm_path} does not exist", is_error=True)
+        if path.stat().st_size > max_bytes:
+            return ToolOutcome(f"{vm_path} is too large to view; use bash", is_error=True)
         try:
             text = path.read_text()
         except UnicodeDecodeError:
@@ -177,6 +179,8 @@ def _edit_sync(root: Path, tool_input: dict, author: str, *, max_chars: int) -> 
     if not _writable(root, path):
         return ToolOutcome(f"{vm_path} is read-only", is_error=True)
 
+    if path.is_file() and path.stat().st_size > max_bytes:
+        return ToolOutcome(f"{vm_path} is too large to edit here; use bash", is_error=True)
     before = path.read_text() if path.is_file() else None
     if command == "create":
         new_text = tool_input.get("file_text")
@@ -231,21 +235,29 @@ def _edit_sync(root: Path, tool_input: dict, author: str, *, max_chars: int) -> 
     )
 
 
-def _edit_guarded(root: Path, tool_input: dict, author: str, *, max_chars: int) -> ToolOutcome:
+def _edit_guarded(
+    root: Path, tool_input: dict, author: str, *, max_chars: int, max_bytes: int
+) -> ToolOutcome:
     """A path that is well-formed but unusable — a directory where a file was expected, a
     parent that is a file, a vanished file — is the model's mistake to correct, not the
     turn's end."""
     try:
-        return _edit_sync(root, tool_input, author, max_chars=max_chars)
+        return _edit_sync(root, tool_input, author, max_chars=max_chars, max_bytes=max_bytes)
     except (OSError, git.GitError) as exc:
         return ToolOutcome(f"The file operation failed: {type(exc).__name__}", is_error=True)
 
 
-async def run_editor(root: Path, tool_input: dict, author: str, *, max_chars: int) -> ToolOutcome:
+async def run_editor(
+    root: Path, tool_input: dict, author: str, *, max_chars: int, max_bytes: int
+) -> ToolOutcome:
     if tool_input.get("command") == "view":
-        return await asyncio.to_thread(_edit_guarded, root, tool_input, author, max_chars=max_chars)
+        return await asyncio.to_thread(
+            _edit_guarded, root, tool_input, author, max_chars=max_chars, max_bytes=max_bytes
+        )
     async with workspace_lock(root):
-        return await asyncio.to_thread(_edit_guarded, root, tool_input, author, max_chars=max_chars)
+        return await asyncio.to_thread(
+            _edit_guarded, root, tool_input, author, max_chars=max_chars, max_bytes=max_bytes
+        )
 
 
 def _commit_shell_sync(root: Path, command: str, author: str, *, max_chars: int) -> dict | None:

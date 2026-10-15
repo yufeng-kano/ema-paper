@@ -21,7 +21,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..agents import CHAT
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
-from ..db.models import AgentSetting, ChatTurn, Conversation, Document, KanoProxyKey, Message
+from ..db.models import (
+    AgentSetting,
+    ChatTurn,
+    Conversation,
+    Document,
+    KanoProxyKey,
+    Message,
+    User,
+    utcnow,
+)
 from ..errors import ApiError
 from ..jobs import chat_events
 from ..jobs.queue import count_active_turns, enqueue_turn
@@ -150,11 +159,21 @@ async def read_conversation(conversation_id: int, user: SessionUser, db: DbSessi
 async def delete_conversation(conversation_id: int, user: SessionUser, db: DbSession) -> Response:
     row = await owned_conversation(db, user.id, conversation_id)
     # Under the same row lock a send takes: the worker must not be driving a turn whose
-    # rows vanish under it (docs/chat.md § Conversations, turns, events).
+    # rows vanish under it (docs/chat.md § Conversations, turns, events). A cancelled turn
+    # counts until the worker has wound it down — only `finished_at` says it has.
     await db.execute(select(Conversation.id).where(Conversation.id == row.id).with_for_update())
-    if await _active_turn(db, row.id) is not None:
+    unfinished = (
+        await db.execute(
+            select(ChatTurn.id).where(
+                ChatTurn.conversation_id == row.id, ChatTurn.finished_at.is_(None)
+            )
+        )
+    ).first()
+    if unfinished is not None:
         raise ApiError(
-            409, "invalid_request", "This conversation is still answering; cancel it first"
+            409,
+            "invalid_request",
+            "This conversation is still answering; cancel it and wait for it to stop",
         )
     await db.delete(row)
     await db.commit()
@@ -218,9 +237,11 @@ async def post_message(
     settings: AppSettings,
 ):
     row = await owned_conversation(db, user.id, conversation_id)
-    # One turn at a time per conversation, enforced where the decision is made: the row is
-    # locked until this transaction commits (PostgreSQL; the SQLite fallback runs one
-    # request at a time), so two concurrent sends cannot both find no active turn.
+    # Enforced where the decisions are made, under row locks held until this transaction
+    # commits (PostgreSQL; the SQLite fallback runs one request at a time): the user's row
+    # for the per-user cap, so two sends to different conversations cannot both slip under
+    # it, then the conversation's for one turn at a time — always in that order.
+    await db.execute(select(User.id).where(User.id == user.id).with_for_update())
     await db.execute(select(Conversation.id).where(Conversation.id == row.id).with_for_update())
     await _ready_to_chat(db, settings, user.id)
     if await count_active_turns(db, user.id) >= settings.max_chat_turns_per_user:
@@ -264,11 +285,18 @@ async def post_message(
     status_code=status.HTTP_204_NO_CONTENT,
 )
 async def cancel_turn(conversation_id: int, user: SessionUser, db: DbSession) -> Response:
-    """Mark the running turn cancelled; the worker stops after its current tool call."""
+    """Mark the active turn cancelled. A running one is wound down by the worker, which
+    sets `finished_at`; a queued one is never claimed, so it is finished here and now."""
     row = await owned_conversation(db, user.id, conversation_id)
+    await db.execute(select(Conversation.id).where(Conversation.id == row.id).with_for_update())
     await db.execute(
         update(ChatTurn)
-        .where(ChatTurn.conversation_id == row.id, ChatTurn.status.in_(("queued", "running")))
+        .where(ChatTurn.conversation_id == row.id, ChatTurn.status == "queued")
+        .values(status="cancelled", error="cancelled", finished_at=utcnow())
+    )
+    await db.execute(
+        update(ChatTurn)
+        .where(ChatTurn.conversation_id == row.id, ChatTurn.status == "running")
         .values(status="cancelled")
     )
     await db.commit()

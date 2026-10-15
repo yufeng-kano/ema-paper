@@ -29,7 +29,11 @@ const RETRY_CAP_MS = 10000
  * is reopened rather than left idle. A turn the server never starts is not waited on
  * forever: a run of drops with no event between them gives up.
  */
-export function useConversationStream(onEvent: (frame: StreamedEvent) => void) {
+export function useConversationStream(
+  onEvent: (frame: StreamedEvent) => void,
+  /** The stream gave up on a turn it never heard from again: the record decides now. */
+  onGaveUp?: () => void,
+) {
   /** The last sequence seen — the `after` of the next open. */
   const lastSeq = ref(0)
   const connected = ref(false)
@@ -111,6 +115,7 @@ export function useConversationStream(onEvent: (frame: StreamedEvent) => void) {
       }
       if (silentRetries >= MAX_SILENT_RETRIES) {
         active.value = false
+        onGaveUp?.()
         return
       }
       const delay = Math.min(RETRY_CAP_MS, RETRY_BASE_MS * 2 ** silentRetries)

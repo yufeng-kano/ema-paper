@@ -238,10 +238,21 @@ def keep_source(root: Path, relative: Path, source: Path, *, copy: bool = False)
 # --- content ------------------------------------------------------------------------------
 
 
-def _read(paths: DocumentPaths) -> Content:
+def _text_of(path: Path, max_bytes: int) -> str:
+    """The file's text, or a refusal when the shell inflated it past what the API opens
+    (docs/workspace.md § Revisions): the whole file is read into memory, so its size is
+    checked first."""
+    if not path.exists():
+        return ""
+    if path.stat().st_size > max_bytes:
+        raise ApiError(409, "invalid_request", "The document file is too large to open")
+    return path.read_text()
+
+
+def _read(paths: DocumentPaths, max_bytes: int) -> Content:
     paths.check()
-    markdown = paths.doc.read_text() if paths.doc.exists() else ""
-    notes = paths.notes.read_text() if paths.notes.exists() else ""
+    markdown = _text_of(paths.doc, max_bytes)
+    notes = _text_of(paths.notes, max_bytes)
     return Content(
         markdown=markdown,
         revision=revision_of(markdown),
@@ -253,14 +264,20 @@ def _read(paths: DocumentPaths) -> Content:
 
 async def read_content(db: AsyncSession, settings: Settings, document: Document) -> Content:
     paths = await materialize_document(db, settings, document)
-    return await asyncio.to_thread(_read, paths)
+    return await asyncio.to_thread(_read, paths, settings.content_max_bytes)
 
 
 def _write_file(
-    paths: DocumentPaths, path: Path, text: str, base_revision: str, author: str, message: str
+    paths: DocumentPaths,
+    path: Path,
+    text: str,
+    base_revision: str,
+    author: str,
+    message: str,
+    max_bytes: int,
 ) -> str:
     paths.check()
-    current = path.read_text() if path.exists() else ""
+    current = _text_of(path, max_bytes)
     if revision_of(current) != base_revision:
         raise ApiError(409, "invalid_request", "The file changed since it was loaded")
     if text != current:
@@ -288,6 +305,7 @@ async def write_content(
             base_revision,
             author,
             f"edit {paths.doc_relative}",
+            settings.content_max_bytes,
         )
 
 
@@ -310,6 +328,7 @@ async def write_notes(
             base_revision,
             author,
             f"notes {paths.notes_relative}",
+            settings.content_max_bytes,
         )
 
 

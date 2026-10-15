@@ -284,3 +284,31 @@ async def test_reconcile_canonicalizes_a_directory_the_shell_named(sessionmaker,
             await documents.read_content(db, settings, document)
         ).markdown == "# Title\n\nBody\n"
         assert git.log(root)[0].message.startswith("canonicalize")
+
+
+def test_long_names_become_bounded_distinct_segments() -> None:
+    long_a = "é" * 300
+    long_b = "é" * 299 + "x"
+    seg_a, seg_b = path_segment(long_a), path_segment(long_b)
+    assert len(seg_a.encode()) <= 255 and len(seg_b.encode()) <= 255
+    assert seg_a != seg_b
+    assert "~" in seg_a and seg_a.startswith("ééé")
+    assert path_segment(long_a) == seg_a  # stable
+    assert len(path_segment("_" + "a" * 254).encode()) <= 255
+
+
+async def test_an_inflated_document_file_is_refused(sessionmaker, tmp_path) -> None:
+    settings = _settings(tmp_path)
+    settings.content_max_bytes = 64
+    async with sessionmaker() as db:
+        _, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+        content = await documents.read_content(db, settings, document)
+        paths.doc.write_text("x" * 65)
+        with pytest.raises(ApiError) as refused:
+            await documents.read_content(db, settings, document)
+        assert refused.value.status_code == 409
+        with pytest.raises(ApiError):
+            await documents.write_content(
+                db, settings, document, markdown="y", base_revision=content.revision
+            )

@@ -149,8 +149,14 @@ async def reconcile_user(db: AsyncSession, settings: Settings, user_id: int) -> 
     root = user_root(settings.workspaces_dir, user_id)
     if not files_root(root).is_dir():
         return 0
+    # Held through the commit: a rename on the Files page holds the same lock across its
+    # row write and its move, so neither can apply a path the other just changed.
     async with workspace_lock(root):
-        found = await asyncio.to_thread(_canonicalize_and_scan, root)
+        return await _reconcile_locked(db, user_id, root)
+
+
+async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
+    found = await asyncio.to_thread(_canonicalize_and_scan, root)
     if not found:
         return 0
     documents = {

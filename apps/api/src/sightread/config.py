@@ -71,6 +71,8 @@ class Settings(BaseSettings):
     # into api, worker and the sandbox runner (docs/workspace.md).
     workspaces_dir: str = "/data/workspaces"
     workspace_quota_bytes: int = 10_737_418_240
+    # The largest document file the API opens; the shell can write anything.
+    content_max_bytes: int = 8_388_608
 
     # The chat agent's limits (docs/chat.md).
     max_chat_turns_per_user: int = 4
@@ -78,6 +80,7 @@ class Settings(BaseSettings):
     chat_max_tool_calls_per_turn: int = 50
     chat_turn_timeout_seconds: int = 900
     chat_tool_result_max_chars: int = 20_000
+    chat_bash_timeout_seconds: int = 120
 
     # The sandbox runner (docs/sandbox.md). Empty URL = no sandbox: the chat agent runs
     # without its bash tool. The token is what api and worker present to the runner.

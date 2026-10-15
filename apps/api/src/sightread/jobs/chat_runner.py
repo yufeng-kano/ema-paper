@@ -290,7 +290,8 @@ async def _cancelled(ctx: TurnContext) -> bool:
         status = (
             await db.execute(select(ChatTurn.status).where(ChatTurn.id == ctx.turn.id))
         ).scalar_one_or_none()
-        return status == "cancelled"
+        # A row that is gone (the conversation was deleted under us) is a stop as well.
+        return status is None or status == "cancelled"
 
 
 async def _store(ctx: TurnContext, role: str, content: list[dict]) -> int:
@@ -481,6 +482,7 @@ async def _run_tool_unguarded(ctx: TurnContext, block: dict, malformed: set[str]
                 ctx.conversation.session,
                 tool_input,
                 max_chars=max_chars,
+                timeout_seconds=ctx.settings.chat_bash_timeout_seconds,
             )
             # What the shell changed is a revision of its own (docs/workspace.md).
             outcome = await chat_tools.commit_shell_changes(
@@ -488,7 +490,11 @@ async def _run_tool_unguarded(ctx: TurnContext, block: dict, malformed: set[str]
             )
     elif name == "str_replace_based_edit_tool":
         outcome = await chat_tools.run_editor(
-            ctx.paths.root, tool_input, author, max_chars=max_chars
+            ctx.paths.root,
+            tool_input,
+            author,
+            max_chars=max_chars,
+            max_bytes=ctx.settings.content_max_bytes,
         )
     elif name == "view_page":
         outcome = await chat_tools.view_page(
@@ -517,6 +523,34 @@ async def _report_tool(
     if outcome.is_error:
         result["is_error"] = True
     return result
+
+
+MUTATING_TOOLS = frozenset({"bash", "str_replace_based_edit_tool"})
+
+
+async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str]) -> list[dict]:
+    """The results of one round, in the order the calls were made. Reads run together;
+    the tools that write the tree run one after another, because each commits whatever is
+    dirty and two in flight would file one's changes under the other (docs/chat.md § Tools)."""
+    results: dict[int, dict] = {}
+
+    async def reads() -> None:
+        reading = [
+            (index, block)
+            for index, block in enumerate(tool_uses)
+            if block.get("name") not in MUTATING_TOOLS
+        ]
+        done = await asyncio.gather(*(_run_tool(ctx, block, malformed) for _, block in reading))
+        for (index, _), result in zip(reading, done, strict=True):
+            results[index] = result
+
+    async def writes() -> None:
+        for index, block in enumerate(tool_uses):
+            if block.get("name") in MUTATING_TOOLS:
+                results[index] = await _run_tool(ctx, block, malformed)
+
+    await asyncio.gather(reads(), writes())
+    return [results[index] for index in range(len(tool_uses))]
 
 
 # --- the loop ---------------------------------------------------------------------------------
@@ -555,9 +589,7 @@ async def _loop(ctx: TurnContext) -> None:
             raise TurnFailed(
                 f"The turn made more than {ctx.settings.chat_max_tool_calls_per_turn} tool calls"
             )
-        results = await asyncio.gather(
-            *(_run_tool(ctx, block, completed.malformed_tool_uses) for block in tool_uses)
-        )
+        results = await _run_tools(ctx, tool_uses, completed.malformed_tool_uses)
         # Every result in one user message, in the order the calls were made
         # (docs/chat.md § Tools).
         await _store(ctx, "user", list(results))

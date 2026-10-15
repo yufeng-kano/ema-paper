@@ -394,11 +394,19 @@ async def test_the_editor_tool_stays_inside_the_workspace(tmp_path) -> None:
     outside.write_text("no")
 
     escape = await chat_tools.run_editor(
-        root, {"command": "view", "path": "/workspace/../secret.txt"}, "agent:1", max_chars=1000
+        root,
+        {"command": "view", "path": "/workspace/../secret.txt"},
+        "agent:1",
+        max_chars=1000,
+        max_bytes=1_000_000,
     )
     assert escape.is_error
     absolute = await chat_tools.run_editor(
-        root, {"command": "view", "path": str(outside)}, "agent:1", max_chars=1000
+        root,
+        {"command": "view", "path": str(outside)},
+        "agent:1",
+        max_chars=1000,
+        max_bytes=1_000_000,
     )
     assert absolute.is_error
     meta = await chat_tools.run_editor(
@@ -406,6 +414,7 @@ async def test_the_editor_tool_stays_inside_the_workspace(tmp_path) -> None:
         {"command": "str_replace", "path": "files/d/.meta.json", "old_str": "{}", "new_str": "x"},
         "agent:1",
         max_chars=1000,
+        max_bytes=1_000_000,
     )
     assert meta.is_error and "read-only" in meta.content
 
@@ -419,6 +428,7 @@ async def test_the_editor_tool_stays_inside_the_workspace(tmp_path) -> None:
         },
         "agent:1",
         max_chars=1000,
+        max_bytes=1_000_000,
     )
     assert twice.is_error and "times" in twice.content
     inserted = await chat_tools.run_editor(
@@ -431,12 +441,17 @@ async def test_the_editor_tool_stays_inside_the_workspace(tmp_path) -> None:
         },
         "agent:1",
         max_chars=1000,
+        max_bytes=1_000_000,
     )
     assert not inserted.is_error
     assert (root / "files" / "d" / "doc.md").read_text() == "alpha\ngamma\nbeta\n"
     assert inserted.edit is not None and inserted.edit["commit"]
     listing = await chat_tools.run_editor(
-        root, {"command": "view", "path": "/workspace/files"}, "agent:1", max_chars=1000
+        root,
+        {"command": "view", "path": "/workspace/files"},
+        "agent:1",
+        max_chars=1000,
+        max_bytes=1_000_000,
     )
     assert listing.content == "d/"
 
@@ -454,7 +469,9 @@ async def test_the_bash_tool_goes_through_the_runner_and_truncates(monkeypatch) 
     client = SandboxClient(
         Settings(app_env="local", sandbox_url="http://sandbox:8100", sandbox_token="t")
     )
-    outcome = await chat_tools.run_bash(client, 7, "sess", {"command": "ls"}, max_chars=400)
+    outcome = await chat_tools.run_bash(
+        client, 7, "sess", {"command": "ls"}, max_chars=400, timeout_seconds=120
+    )
     assert calls == [(7, "sess", "ls")]
     assert "characters omitted" in outcome.content
     assert outcome.content.endswith("[exit code 1]")
@@ -565,6 +582,7 @@ async def test_an_editor_filesystem_failure_is_a_tool_result(tmp_path) -> None:
         {"command": "create", "path": "/workspace/files/d", "file_text": "x"},
         "agent:1",
         max_chars=1000,
+        max_bytes=1_000_000,
     )
     assert outcome.is_error
 
@@ -675,3 +693,70 @@ async def test_a_cancel_drops_a_silent_stream(chatting, monkeypatch) -> None:
             .all()
         )
     assert [row.role for row in stored] == ["user"]
+
+
+async def test_a_cancelled_turn_blocks_deletion_until_the_worker_is_done(chatting) -> None:
+    document_id = chatting.document_id
+    conversation_id = (
+        await chatting.post(
+            f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    sent = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
+    )
+    turn_id = uuid.UUID(sent.json()["turn_id"])
+    # The worker claimed it and is mid-stream.
+    async with chatting.app.state.sessionmaker() as db:
+        turn = await db.get(ChatTurn, turn_id)
+        turn.status = "running"
+        await db.commit()
+    await chatting.post(f"/api/conversations/{conversation_id}/cancel", headers=CSRF_HEADERS)
+    still_running = await chatting.delete(
+        f"/api/conversations/{conversation_id}", headers=CSRF_HEADERS
+    )
+    assert still_running.status_code == 409
+    # The worker wound it down.
+    await chat_runner._finish(
+        chatting.app.state.sessionmaker, turn_id, status="cancelled", error="cancelled"
+    )
+    gone = await chatting.delete(f"/api/conversations/{conversation_id}", headers=CSRF_HEADERS)
+    assert gone.status_code == 204
+
+
+async def test_writing_tools_run_in_order_while_reads_run_together(monkeypatch) -> None:
+    started: list[str] = []
+    writers_running: set[str] = set()
+    writer_overlap = False
+    reads_overlapped = False
+    reads_running: set[str] = set()
+
+    async def fake_run_tool(ctx, block, malformed):
+        nonlocal writer_overlap, reads_overlapped
+        tool_id = block["id"]
+        started.append(tool_id)
+        if block["name"] in chat_runner.MUTATING_TOOLS:
+            if writers_running:
+                writer_overlap = True
+            writers_running.add(tool_id)
+        else:
+            if reads_running:
+                reads_overlapped = True
+            reads_running.add(tool_id)
+        await asyncio.sleep(0.01)
+        writers_running.discard(tool_id)
+        reads_running.discard(tool_id)
+        return {"type": "tool_result", "tool_use_id": tool_id, "content": block["name"]}
+
+    monkeypatch.setattr(chat_runner, "_run_tool", fake_run_tool)
+    tool_uses = [
+        {"type": "tool_use", "id": "a", "name": "view_page", "input": {}},
+        {"type": "tool_use", "id": "b", "name": "bash", "input": {}},
+        {"type": "tool_use", "id": "c", "name": "str_replace_based_edit_tool", "input": {}},
+        {"type": "tool_use", "id": "d", "name": "view_figure", "input": {}},
+    ]
+    results = await chat_runner._run_tools(None, tool_uses, set())
+    assert [result["tool_use_id"] for result in results] == ["a", "b", "c", "d"]
+    assert not writer_overlap
+    assert reads_overlapped
+    assert started.index("b") < started.index("c")

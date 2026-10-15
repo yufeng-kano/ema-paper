@@ -7,9 +7,14 @@ escape the tree or collide with the names the workspace reserves for itself.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import unicodedata
 from pathlib import Path
+
+# What one path component may hold on the filesystems the workspace runs on.
+SEGMENT_MAX_BYTES = 255
+SEGMENT_HASH_CHARS = 12
 
 FILES_DIR = "files"
 # Beside the user directories, never inside one: the git directories the VMs cannot see.
@@ -95,6 +100,13 @@ def path_segment(name: str) -> str:
     segment = _UNSAFE.sub(" ", segment).strip()
     if not segment or segment.startswith((".", "_")) or segment in RESERVED_SEGMENTS:
         segment = f"_{segment}"
+    if len(segment.encode()) > SEGMENT_MAX_BYTES:
+        # A library name may be longer than a path component: keep a prefix the reader
+        # recognizes and a hash of the whole name that keeps distinct names distinct.
+        digest = hashlib.sha256(name.encode()).hexdigest()[:SEGMENT_HASH_CHARS]
+        room = SEGMENT_MAX_BYTES - SEGMENT_HASH_CHARS - 1
+        prefix = segment.encode()[:room].decode(errors="ignore").rstrip()
+        segment = f"{prefix}~{digest}"
     return segment
 
 

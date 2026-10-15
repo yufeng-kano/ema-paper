@@ -28,6 +28,7 @@ from ..agents import get_agent
 from ..agents.bbox import convention_for_job, prepare_image
 from ..config import Settings
 from ..db.models import Document, Job, JobPage, Result, UsageLog, utcnow
+from ..errors import ApiError
 from ..parsing import poppler
 from ..parsing.figures import discard_job_figures, save_page_figures
 from ..parsing.images import ImageError, normalize_image
@@ -43,7 +44,12 @@ from ..upstream.client import (
     load_connection,
     transcribe_page,
 )
-from ..workspace.documents import folder_names, keep_source, materialize_document
+from ..workspace.documents import (
+    ensure_within_quota,
+    folder_names,
+    keep_source,
+    materialize_document,
+)
 from ..workspace.layout import document_relative_dir, user_root
 from ..workspace.locks import workspace_lock
 from . import events
@@ -488,6 +494,17 @@ async def _finish(
                             await folder_names(db, document.user_id, document.folder_id),
                             document.name,
                         )
+                        try:
+                            # Every copy counts: a full workspace keeps no more of them.
+                            await ensure_within_quota(settings, root)
+                        except ApiError:
+                            logger.warning(
+                                "workspace of user %d is at its quota; "
+                                "the source of document %d is not kept",
+                                document.user_id,
+                                document.id,
+                            )
+                            continue
                         await asyncio.to_thread(
                             keep_source,
                             root,
@@ -495,8 +512,9 @@ async def _finish(
                             source,
                             copy=index < len(documents) - 1,
                         )
-            else:
-                source.unlink(missing_ok=True)
+            # Not kept anywhere (no document, or none with room): deleted, as for a parse
+            # outside the library.
+            source.unlink(missing_ok=True)
             job.source_deleted_at = utcnow()
         await events.notify(db, job.id)
         await db.commit()

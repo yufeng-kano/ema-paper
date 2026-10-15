@@ -362,12 +362,20 @@ function flushFrames() {
   }
 }
 
-const stream = useConversationStream((frame) => {
-  pendingFrames.push(frame)
-  if (flushTimer === null) {
-    flushTimer = setTimeout(flushFrames, 16)
-  }
-})
+const stream = useConversationStream(
+  (frame) => {
+    pendingFrames.push(frame)
+    if (flushTimer === null) {
+      flushTimer = setTimeout(flushFrames, 16)
+    }
+  },
+  () => {
+    // Six silent drops: whatever the turn did is in the record by now, or never will be.
+    if (currentId.value !== null) {
+      void loadDetail(currentId.value)
+    }
+  },
+)
 
 onBeforeUnmount(() => {
   if (flushTimer !== null) {
@@ -375,14 +383,16 @@ onBeforeUnmount(() => {
   }
 })
 
-/** The frames split at each `turn_start`: group k is turn k's. */
+/** The frames of each turn, by the id every frame carries — never by position, since a
+ *  turn whose load failed emits only its `turn_error`. */
 const groups = computed(() => {
-  const out: ChatEvent[][] = []
+  const out = new Map<string, ChatEvent[]>()
   for (const frame of events.value) {
-    if (frame.event.event === 'turn_start') {
-      out.push([frame.event])
+    const list = out.get(frame.event.turn_id)
+    if (list) {
+      list.push(frame.event)
     } else {
-      out[out.length - 1]?.push(frame.event)
+      out.set(frame.event.turn_id, [frame.event])
     }
   }
   return out
@@ -397,12 +407,17 @@ const cards = reactive(
 )
 
 /** The turns in order — those the record lists (oldest first, as the API sends them), then
- *  any a message names that it does not, in message order. */
+ *  any a message or a frame names that it does not, in the order they were seen. */
 const turnOrder = computed(() => {
   const ids: string[] = turns.value.map((turn) => turn.id)
   for (const message of messages.value) {
     if (message.turn_id !== null && !ids.includes(message.turn_id)) {
       ids.push(message.turn_id)
+    }
+  }
+  for (const turnId of groups.value.keys()) {
+    if (!ids.includes(turnId)) {
+      ids.push(turnId)
     }
   }
   return ids
@@ -422,9 +437,9 @@ const thread = computed<ThreadItem[]>(() => {
   const items: ThreadItem[] = []
   const turnById = new Map(turns.value.map((turn) => [turn.id, turn]))
 
-  turnOrder.value.forEach((turnId, index) => {
+  turnOrder.value.forEach((turnId) => {
     const turn = turnById.get(turnId)
-    const group = groups.value[index]
+    const group = groups.value.get(turnId)
     const own = messages.value.filter((message) => message.turn_id === turnId)
     // One assistant message per model round: a tool-using turn has several, and the
     // final answer is the last of them.
@@ -500,7 +515,9 @@ const thread = computed<ThreadItem[]>(() => {
             items.push({ kind: 'thinking', key: `${prefix}-think-${at}`, text: block.thinking.trim() })
           } else if (block.type === 'tool_use') {
             items.push(toolItem(block.id, block.name, block.input))
-            if (block.name === EDITOR_TOOL) {
+            // An editor write, or any tool whose `edit` event is on record — a shell
+            // command that changed the tree has a revision to show and revert too.
+            if (block.name === EDITOR_TOOL || edits.has(block.id)) {
               const card = editItem(block.id, block.input)
               if (card) {
                 items.push(card)
