@@ -19,6 +19,9 @@ from .layout import EXCLUDE_RULES, git_dir
 
 GIT = "git"
 GIT_TIMEOUT_SECONDS = 60.0
+# The most of a log the API reads to list revisions, and the paths it keeps per revision.
+LOG_MAX_BYTES = 4 * 1024 * 1024
+LOG_FILES_MAX = 200
 
 # The identities commits carry. An agent commit names its conversation in the author.
 USER_AUTHOR = "user"
@@ -159,14 +162,25 @@ def log(
         args.append("--follow")
     if relative is not None:
         args += ["--", str(relative)]
-    out = _git(root, *args).stdout
+    # Read up to a bound, never buffered whole: a shell revision can name any number of
+    # files, and the API must not hold them all to list a few commits. A cut-off record
+    # is dropped; the ones before it are complete.
+    code, raw, truncated = _git_bounded(root, *args, max_bytes=LOG_MAX_BYTES)
+    if code != 0 and not truncated:
+        raise GitError("git log failed")
+    records = raw.decode(errors="replace").split("\x1e")
+    if truncated:
+        records = records[:-1]
     revisions: list[Revision] = []
-    for record in out.split("\x1e"):
+    for record in records:
         if not record.strip():
             continue
         header, _, body = record.partition("\n")
         commit, author, when, subject = (header.split("\x1f") + ["", "", "", ""])[:4]
-        files = tuple(line for line in body.splitlines() if line.strip())
+        names = [line for line in body.splitlines() if line.strip()]
+        if len(names) > LOG_FILES_MAX:
+            names = names[:LOG_FILES_MAX] + [f"... and {len(names) - LOG_FILES_MAX} more"]
+        files = tuple(names)
         revisions.append(
             Revision(
                 commit=commit,

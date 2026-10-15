@@ -356,7 +356,7 @@ async def conversation_events(
 def _workspace_usage(root: Path, quota: int) -> dict:
     breakdown = []
     for name in (FILES_DIR, f"{SIGHTREAD_DIR}/results", CACHE_DIR):
-        size = directory_size(root / name)
+        size = directory_size(root, root / name)
         if size:
             breakdown.append({"path": f"{name}/", "bytes": size})
     history = directory_size(git_dir(root))

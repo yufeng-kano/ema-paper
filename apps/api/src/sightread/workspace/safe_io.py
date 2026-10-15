@@ -361,3 +361,38 @@ def remove_empty_dir(root: Path, path: Path) -> bool:
         return False
     finally:
         os.close(fd)
+
+
+def _dir_size(fd: int) -> int:
+    total = 0
+    for name in os.listdir(fd):
+        try:
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except OSError:
+            continue
+        if stat.S_ISDIR(info.st_mode):
+            try:
+                child = os.open(name, _OPEN_DIR_FLAGS, dir_fd=fd)
+            except OSError:
+                continue
+            try:
+                total += _dir_size(child)
+            finally:
+                os.close(child)
+        else:
+            total += info.st_size  # a link counts as itself, never its target
+    return total
+
+
+def tree_size(root: Path, path: Path) -> int:
+    """Bytes under the directory at `path`, every step through a descriptor opened
+    without following: a link the shell plants is one entry, never a tree elsewhere.
+    Zero when there is no plain directory there."""
+    try:
+        fd = _open_dir(root, path)
+    except (UnsafeEntry, OSError):
+        return 0
+    try:
+        return _dir_size(fd)
+    finally:
+        os.close(fd)

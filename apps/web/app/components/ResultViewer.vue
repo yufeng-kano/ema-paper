@@ -153,6 +153,13 @@ async function loadContent(replaceDirty: Replace = false) {
     // `failed` is unsaved work too: the text is still the reader's and its next save
     // retries it, so only an explicit replacement may overwrite it.
     if (takeMarkdown || (saveState.value === 'saved' && !dirtyEditor)) {
+      // A block editor open across a forced replacement is closed, its draft dropped:
+      // the block it was editing may no longer sit at those indices, and a commit
+      // against the fresh text would land on whatever does now.
+      if (editing.value !== null) {
+        editing.value = null
+        draft.value = ''
+      }
       markdown.value = content.markdown
       revision.value = content.revision
       saveState.value = 'saved'

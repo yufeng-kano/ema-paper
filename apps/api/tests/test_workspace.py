@@ -790,3 +790,31 @@ async def test_reconcile_never_walks_through_a_linked_files_directory(
         assert await reconcile.reconcile_user(db, settings, user.id) == 0
         row = (await db.execute(select(Document).where(Document.id == document.id))).scalar_one()
         assert row.name == "paper.pdf"
+
+
+def test_tree_sizes_never_follow_a_link(tmp_path) -> None:
+    root = tmp_path / "ws" / "4"
+    (root / "files").mkdir(parents=True)
+    (root / "files" / "doc.md").write_bytes(b"x" * 100)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "big.bin").write_bytes(b"y" * 100_000)
+    (root / "files" / "link").symlink_to(elsewhere)
+    (root / "link-dir").symlink_to(elsewhere)
+    assert documents.directory_size(root, root / "files") < 1_000
+    assert documents.directory_size(root) < 1_000
+    # The linked directory itself is nothing to a walk, not a tree.
+    assert documents.directory_size(root, root / "link-dir") == 0
+
+
+def test_the_revision_log_is_bounded(tmp_path) -> None:
+    root = tmp_path / "ws" / "5"
+    root.mkdir(parents=True)
+    git.ensure_repo(root)
+    for index in range(git.LOG_FILES_MAX + 50):
+        safe_io.write_text(root, root / "files" / f"f{index:04d}.txt", "x")
+    git.commit_all(root, "agent:1", "a flood of files")
+    (revision,) = git.log(root)
+    # The first LOG_FILES_MAX paths and a count of the rest, never the whole list.
+    assert len(revision.files) == git.LOG_FILES_MAX + 1
+    assert revision.files[-1] == "... and 50 more"

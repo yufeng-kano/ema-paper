@@ -198,3 +198,19 @@ async def test_a_timeout_runs_the_backends_kill_before_closing_the_shell() -> No
     assert outcome.timed_out is True
     assert killed == [True]
     assert not shell.alive
+
+
+def test_production_accepts_only_a_vm_runtime(tmp_path) -> None:
+    base = {
+        "app_env": "production",
+        "sandbox_token": TOKEN,
+        "sandbox_backend": "docker",
+        "sandbox_workspaces_dir": str(tmp_path / "ws"),
+        "sandbox_workspaces_mount": str(tmp_path / "ws"),
+    }
+    assert Settings(**base, sandbox_runtime="kata").sandbox_runtime == "kata"
+    for runtime in ("runc", "crun", "kata2"):
+        with pytest.raises(ValueError):
+            Settings(**base, sandbox_runtime=runtime)
+    # The operator names their own VM runtime.
+    assert Settings(**base, sandbox_runtime="kata2", sandbox_vm_runtimes="kata2").sandbox_runtime

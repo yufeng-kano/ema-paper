@@ -1139,6 +1139,8 @@ async def test_a_stop_seen_by_the_reads_lets_the_running_write_finish(monkeypatc
         if block["name"] == "bash":
             stopped["value"] = True  # the Stop lands while the shell command runs
             await asyncio.sleep(0.05)
+        else:
+            await asyncio.sleep(0.01)  # a render takes a moment; the rest queue behind
         finished.append(block["id"])
         return {"type": "tool_result", "tool_use_id": block["id"], "content": "ok"}
 
@@ -1153,8 +1155,10 @@ async def test_a_stop_seen_by_the_reads_lets_the_running_write_finish(monkeypatc
     ]
     with pytest.raises(chat_runner.TurnCancelled):
         await chat_runner._run_tools(_round_ctx(), tool_uses, set())
-    # The reads saw the Stop and ended quietly; the command in flight was not cancelled.
-    assert finished == ["w"]
+    # The reads still queued saw the Stop and ended quietly; the command in flight was
+    # not cancelled and finished.
+    assert "w" in finished
+    assert len([name for name in finished if name != "w"]) <= chat_runner.READ_CONCURRENCY
 
 
 async def test_a_stop_during_backoff_and_a_running_read_are_both_cut(monkeypatch) -> None:
@@ -1297,3 +1301,21 @@ async def test_the_editor_refuses_what_history_excludes(tmp_path) -> None:
         )
         assert refused.is_error, path
         assert not (root / path).exists()
+
+
+async def test_the_deadline_waits_for_the_write_in_flight(monkeypatch) -> None:
+    done: list[str] = []
+
+    async def slow_write() -> dict:
+        await asyncio.sleep(0.05)
+        done.append("w")
+        return {"type": "tool_result", "tool_use_id": "w", "content": "ok"}
+
+    ctx = SimpleNamespace(
+        settings=SimpleNamespace(chat_bash_timeout_seconds=1),
+        writer=asyncio.ensure_future(slow_write()),
+    )
+    # The turn's deadline interrupted the loop while this write ran: it is waited for,
+    # so its commit precedes the terminal event.
+    await chat_runner._settle_writer(ctx)
+    assert done == ["w"]

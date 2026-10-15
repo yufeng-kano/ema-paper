@@ -12,7 +12,6 @@ import asyncio
 import contextlib
 import hashlib
 import json
-import os
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -70,11 +69,9 @@ class DocumentPaths:
 
     def source(self) -> Path | None:
         """`source.<ext>` when the original upload was kept, as a plain file."""
-        if safe_io.entry_kind(self.root, self.directory) != "dir":
-            return None
         try:
-            names = sorted(os.listdir(self.directory))
-        except OSError:
+            names = sorted(name for name, is_dir in safe_io.list_dir(self.root, self.directory))
+        except (safe_io.UnsafeEntry, OSError):
             return None
         for name in names:
             candidate = self.directory / name
@@ -636,20 +633,13 @@ async def remove_path(settings: Settings, user_id: int, relative: Path) -> None:
     await asyncio.to_thread(_remove_tree, root, relative, f"delete {relative}")
 
 
-def directory_size(path: Path) -> int:
-    """Bytes under `path`, following nothing: a symlink counts as itself, never its target."""
-    total = 0
-    if not path.is_dir() or path.is_symlink():
-        return 0
-    for current, _dirs, files in os.walk(path, followlinks=False):
-        for name in files:
-            try:
-                total += os.lstat(os.path.join(current, name)).st_size
-            except OSError:
-                continue
-    return total
+def directory_size(root: Path, path: Path | None = None) -> int:
+    """Bytes under `path` (the whole user directory when None), walked through
+    descriptors that follow nothing (docs/workspace.md § Quota)."""
+    return safe_io.tree_size(root, root if path is None else path)
 
 
 def workspace_size(root: Path) -> int:
-    """What the user holds: the tree and the history beside it."""
+    """What the user holds: the tree and the history beside it (the git directory is the
+    service's own, outside the mount, walked the same way from its own root)."""
     return directory_size(root) + directory_size(git_dir(root))

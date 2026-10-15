@@ -38,15 +38,22 @@ class Settings(BaseSettings):
     # The longest a single command may run, whatever the caller asked for.
     sandbox_command_timeout_max: int = 600
     sandbox_port: int = 8100
+    # The runtime names production accepts: VM runtimes, so a shared-kernel runtime
+    # under another name cannot pass for a VM boundary (docs/sandbox.md § Isolation).
+    sandbox_vm_runtimes: str = "kata,kata-runtime,io.containerd.kata.v2,kata-qemu,kata-clh,kata-fc"
 
     @model_validator(mode="after")
     def _check(self) -> Settings:
         if self.app_env == "production":
             if not self.sandbox_token:
                 raise ValueError("SANDBOX_TOKEN is required in production")
-            if self.sandbox_backend != "docker" or self.sandbox_runtime == "runc":
+            allowed = {name.strip() for name in self.sandbox_vm_runtimes.split(",") if name.strip()}
+            if self.sandbox_backend != "docker" or self.sandbox_runtime not in allowed:
                 # No VM boundary is no sandbox (docs/sandbox.md § Isolation).
-                raise ValueError("production needs the docker backend with a VM runtime")
+                raise ValueError(
+                    "production needs the docker backend with a VM runtime "
+                    f"(SANDBOX_RUNTIME must be one of SANDBOX_VM_RUNTIMES: {sorted(allowed)})"
+                )
         return self
 
 

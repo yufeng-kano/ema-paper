@@ -9,6 +9,7 @@ is stored as it came, because the next turn replays it (docs/chat.md § History)
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 import uuid
@@ -87,6 +88,9 @@ class TurnContext:
     sandbox: SandboxClient | None
     render_slots: asyncio.Semaphore
     tool_calls: int = 0
+    # The mutating tool call in flight, if any: finished before the turn is, whatever
+    # ended the turn.
+    writer: asyncio.Future | None = None
 
 
 # --- loading -------------------------------------------------------------------------------
@@ -587,6 +591,9 @@ async def _report_tool(
 MUTATING_TOOLS = frozenset({"bash", "str_replace_based_edit_tool"})
 # Read-only tools of one round in flight together.
 READ_CONCURRENCY = 4
+# Past the command timeout, how long a turn that hit its deadline waits for the write in
+# flight (its commit, its reconcile) before it is finished.
+WRITER_GRACE_SECONDS = 60
 IMAGE_BUDGET_SPENT = "This round's image budget is spent; ask for fewer pages or figures at a time."
 
 
@@ -659,7 +666,15 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
                 # first of the round included — is not started once the user cancelled.
                 if await _cancelled(ctx):
                     raise TurnCancelled()
-                results[index] = await _run_tool(ctx, block, malformed)
+                # Shielded: the turn's deadline cancels the loop, not a shell command
+                # or editor write in flight, which run_turn waits for before the
+                # terminal event (docs/chat.md § Tools).
+                writer = asyncio.ensure_future(_run_tool(ctx, block, malformed))
+                ctx.writer = writer
+                try:
+                    results[index] = await asyncio.shield(writer)
+                finally:
+                    ctx.writer = None
 
     # A task group: when the writes stop on a cancel, the reads still running are
     # cancelled with them rather than left to finish a turn that is over.
@@ -761,6 +776,18 @@ async def _finish(
         await db.commit()
 
 
+async def _settle_writer(ctx: TurnContext) -> None:
+    """Wait for the mutating tool call the deadline interrupted: cancelling the loop does
+    not stop a shell command in the VM or an editor thread, and the terminal event must
+    not precede their commit. Bounded by the command timeout plus a margin."""
+    writer = ctx.writer
+    if writer is None or writer.done():
+        return
+    grace = ctx.settings.chat_bash_timeout_seconds + WRITER_GRACE_SECONDS
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(asyncio.shield(writer), timeout=grace)
+
+
 async def run_turn(
     sessionmaker: async_sessionmaker[AsyncSession],
     settings: Settings,
@@ -783,6 +810,7 @@ async def run_turn(
     except TurnFailed as exc:
         await _finish(sessionmaker, turn_id, status="failed", error=str(exc))
     except TimeoutError:
+        await _settle_writer(ctx)
         await _finish(sessionmaker, turn_id, status="failed", error="the turn timed out")
     except PaymentRequired:
         await _finish(

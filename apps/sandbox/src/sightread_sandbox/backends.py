@@ -36,6 +36,9 @@ class UserSandbox:
     last_used_at: str | None = None
     started_at: float | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # A VM the runner could not stop after a timeout it could not end inside: no command
+    # runs there until Docker reports it gone (docs/sandbox.md § The runner).
+    unstoppable: bool = False
 
 
 class Backend:
@@ -84,6 +87,10 @@ class Backend:
     ) -> ExecOutcome:
         sandbox = self._user(user_id)
         async with sandbox.lock:
+            if sandbox.unstoppable:
+                if await self.is_running(user_id):
+                    raise RuntimeError("the sandbox VM could not be stopped; no command runs there")
+                sandbox.unstoppable = False
             await self.ensure_running(sandbox)
             shell = sandbox.sessions.get(session)
             if shell is None:
@@ -223,7 +230,10 @@ kill_tree() {
     for child in $(pgrep -P "$1"); do kill_tree "$child"; done
     kill -KILL "$1" 2>/dev/null
 }
-pid=$(cat "$1" 2>/dev/null) && [ -n "$pid" ] && kill_tree "$pid"
+pid=$(cat "$1" 2>/dev/null) || exit 3
+[ -n "$pid" ] || exit 3
+kill_tree "$pid"
+kill -0 "$pid" 2>/dev/null && exit 4
 exit 0
 """
 
@@ -353,6 +363,9 @@ class DockerBackend(Backend):
                 sandbox = self._user(user_id)
                 async with sandbox.lock:
                     await self._stop_locked(sandbox)
+                    if await self.is_running(user_id):
+                        logger.error("sandbox %s cannot be stopped; refusing commands", container)
+                        sandbox.unstoppable = True
 
         return kill_inside
 
