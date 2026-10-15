@@ -208,6 +208,10 @@ function addFolder(folder: LibraryFolder) {
   }
 }
 
+// A reload onto a new build would lose the reader's place or close a dialog mid-choice, so
+// it waits for both to be over (docs/web.md § Rules).
+useBuildHold(() => openJob.value !== null || filing.value !== null)
+
 /** The dialog closes on success; the row's folder mark appearing is the confirmation. */
 async function submitFile(destination: FolderId) {
   const job = filing.value

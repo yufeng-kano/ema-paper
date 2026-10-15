@@ -335,6 +335,10 @@ onBeforeUnmount(() => {
 // --- the result viewer -----------------------------------------------------
 
 const openDocument = ref<LibraryDocument | null>(null)
+
+// A reload onto a new build would drop files still waiting to upload, or lose a reader's
+// place — so it waits for both to be over (docs/web.md § Rules).
+useBuildHold(() => queue.value.length > 0 || openDocument.value !== null)
 const results = reactive(new Map<number, JobResult>())
 const resultErrors = reactive(new Map<number, string>())
 /** Ids with a result request in flight — a set, since the viewer can be reopened on
