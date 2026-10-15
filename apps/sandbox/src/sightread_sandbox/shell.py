@@ -118,7 +118,12 @@ class ShellSession:
             marker = f"__SR_DONE_{secrets.token_hex(8)}__"
             # The command runs in the shell itself (not a subshell), so `cd` and exports
             # persist; the marker line follows with the status of the last command.
-            script = f"{command}\nprintf '\\n{marker} %s\\n' \"$?\"\n"
+            # The status is the command's; `wait` then holds the line until every job it
+            # left in the background has finished, so nothing it started writes the tree
+            # after the command's revision (a disowned job is the shell's own).
+            script = (
+                f"{command}\n__sr_status=$?\nwait\nprintf '\\n{marker} %s\\n' \"$__sr_status\"\n"
+            )
             try:
                 process.stdin.write(script.encode())
                 await process.stdin.drain()

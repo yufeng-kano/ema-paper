@@ -239,7 +239,7 @@ async function saveContent() {
     } else {
       saveState.value = 'failed'
       saveError.value = await resolve(error)
-      retryAfterClose(() => saveContent())
+      retryAfterClose('markdown', () => saveContent())
     }
   } finally {
     saving = false
@@ -247,15 +247,16 @@ async function saveContent() {
 }
 
 let closed = false
-let retriedAfterClose = false
+const retriedAfterClose = { markdown: false, notes: false }
 
 /** A save that fails once the viewer is gone has no reader to retry it: it gets one more
- *  try on its own, after the failed request has settled. */
-function retryAfterClose(save: () => Promise<void>) {
-  if (!closed || retriedAfterClose) {
+ *  try on its own, after the failed request has settled — one per file, so the document
+ *  and the notes each get theirs. */
+function retryAfterClose(file: 'markdown' | 'notes', save: () => Promise<void>) {
+  if (!closed || retriedAfterClose[file]) {
     return
   }
-  retriedAfterClose = true
+  retriedAfterClose[file] = true
   setTimeout(() => void save(), 0)
 }
 
@@ -303,7 +304,7 @@ async function saveNotes() {
     } else {
       notesState.value = 'failed'
       notesError.value = await resolve(error)
-      retryAfterClose(() => saveNotes())
+      retryAfterClose('notes', () => saveNotes())
     }
   } finally {
     savingNotes = false

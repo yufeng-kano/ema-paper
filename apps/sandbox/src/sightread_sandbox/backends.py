@@ -68,6 +68,11 @@ class Backend:
     async def is_running(self, user_id: int) -> bool:
         raise NotImplementedError
 
+    async def is_gone(self, user_id: int) -> bool:
+        """Whether the VM is positively known to be absent or stopped. An inspection that
+        fails is not "gone": it is unknown, and unknown keeps a closed sandbox closed."""
+        return not await self.is_running(user_id)
+
     def shell_argv(self, user_id: int, token: str) -> tuple[list[str], str | None]:
         """The shell's argv and working directory; `token` names this shell to the VM."""
         raise NotImplementedError
@@ -88,7 +93,7 @@ class Backend:
         sandbox = self._user(user_id)
         async with sandbox.lock:
             if sandbox.unstoppable:
-                if await self.is_running(user_id):
+                if not await self.is_gone(user_id):
                     raise RuntimeError("the sandbox VM could not be stopped; no command runs there")
                 sandbox.unstoppable = False
             await self.ensure_running(sandbox)
@@ -168,10 +173,14 @@ class Backend:
         return time.monotonic() - sandbox.last_used >= self.settings.sandbox_idle_seconds
 
     async def reset(self, user_id: int) -> None:
-        """Stop, and forget what was installed. Documents are untouched."""
-        await self.stop(user_id)
-        cache = self.workspace(user_id) / CACHE_DIR
-        await asyncio.to_thread(shutil.rmtree, cache, True)
+        """Stop, and forget what was installed. Documents are untouched. One hold of the
+        sandbox lock across the stop and the deletion: no command starts into a cache
+        that is being removed."""
+        sandbox = self._user(user_id)
+        async with sandbox.lock:
+            await self._stop_locked(sandbox)
+            cache = self.workspace(user_id) / CACHE_DIR
+            await asyncio.to_thread(shutil.rmtree, cache, True)
 
     async def stop_idle(self) -> int:
         """Stop every VM idle past the configured window; returns how many."""
@@ -274,6 +283,16 @@ class DockerBackend(Backend):
         )
         return code == 0 and out.strip() == "true"
 
+    async def is_gone(self, user_id: int) -> bool:
+        code, out = await _docker(
+            "inspect", "-f", "{{.State.Running}}", self.container(user_id), timeout=20
+        )
+        if code == 0:
+            return out.strip() != "true"
+        # Docker's own "no such object" is a positive absence; anything else (the daemon
+        # away, a timeout) is unknown.
+        return "No such object" in out or "No such container" in out
+
     async def ensure_running(self, sandbox: UserSandbox) -> None:
         if await self.is_running(sandbox.user_id):
             if sandbox.started_at is None:
@@ -363,7 +382,7 @@ class DockerBackend(Backend):
                 sandbox = self._user(user_id)
                 async with sandbox.lock:
                     await self._stop_locked(sandbox)
-                    if await self.is_running(user_id):
+                    if not await self.is_gone(user_id):
                         logger.error("sandbox %s cannot be stopped; refusing commands", container)
                         sandbox.unstoppable = True
 

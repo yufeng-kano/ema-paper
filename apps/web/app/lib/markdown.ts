@@ -42,6 +42,8 @@ export type ResultBlock =
   | { kind: 'table'; header: string[]; rows: string[][]; src: string }
   | { kind: 'fig'; id: string; bbox: Bbox; caption: string | null; src: string }
   | { kind: 'toc'; entries: TocEntry[]; src: string }
+  /** An HTML comment that is not a page marker: kept in the source, drawn as nothing. */
+  | { kind: 'comment'; src: string }
 
 /**
  * One line of a contents page. `title + leader + page` is the source line exactly — the
@@ -200,7 +202,13 @@ export function parseResultMarkdown(markdown: string): ResultPageBlocks[] {
       continue
     }
 
-    if (!line || COMMENT.test(line)) {
+    if (!line) {
+      continue
+    }
+    if (COMMENT.test(line)) {
+      // Not a page marker, but the file's: a block of its own so an edit elsewhere
+      // leaves it in the source (docs/web.md § Editing).
+      page().blocks.push({ kind: 'comment', src: source(first, index) })
       continue
     }
 

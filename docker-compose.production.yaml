@@ -156,7 +156,10 @@ services:
     volumes:
       - ./backups:/backups
       - figures:/data/figures:ro
+      # The tree read-only; `.repos` writable for the backup lock alone, which every
+      # workspace write takes shared (docs/workspace.md § Backups).
       - ${WORKSPACES_HOST_DIR:?WORKSPACES_HOST_DIR is required}:/data/workspaces:ro
+      - ${WORKSPACES_HOST_DIR:?WORKSPACES_HOST_DIR is required}/.repos:/data/workspaces/.repos
     depends_on:
       pg:
         condition: service_healthy
@@ -171,9 +174,15 @@ services:
           # dump always has a same-stamp figures archive to restore beside it.
           # The workspaces (every user's edits, notes and originals) are primary data
           # from the chat agent on (docs/workspace.md § Backups) and ride the same stamp.
-          if pg_dump --format=custom --file="/backups/sightread-$$stamp.dump.tmp" &&
-            tar -czf "/backups/figures-$$stamp.tar.gz.tmp" -C /data figures &&
-            tar -czf "/backups/workspaces-$$stamp.tar.gz.tmp" -C /data workspaces; then
+          # One snapshot: the workspace backup lock is held exclusively from the dump to
+          # the end of the archive, and every workspace write takes it shared, so no
+          # rename, save or shell commit lands between the rows and the tree.
+          mkdir -p /data/workspaces/.repos
+          if flock -x /data/workspaces/.repos/backup.lock sh -c '
+            pg_dump --format=custom --file="/backups/sightread-'"$$stamp"'.dump.tmp" &&
+            tar -czf "/backups/figures-'"$$stamp"'.tar.gz.tmp" -C /data figures &&
+            tar -czf "/backups/workspaces-'"$$stamp"'.tar.gz.tmp" -C /data \
+              --exclude="workspaces/.repos/*.lock" workspaces'; then
             mv "/backups/sightread-$$stamp.dump.tmp" "/backups/sightread-$$stamp.dump"
             mv "/backups/figures-$$stamp.tar.gz.tmp" "/backups/figures-$$stamp.tar.gz"
             mv "/backups/workspaces-$$stamp.tar.gz.tmp" "/backups/workspaces-$$stamp.tar.gz"

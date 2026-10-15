@@ -488,7 +488,7 @@ async def test_the_bash_tool_goes_through_the_runner_and_truncates(monkeypatch) 
     assert calls == [(7, "sess", "ls")]
     assert "characters omitted" in outcome.content
     assert outcome.content.endswith("[exit code 1]")
-    assert not outcome.is_error
+    assert outcome.is_error  # a nonzero exit is the model's error signal
 
 
 def test_truncate_keeps_head_and_tail() -> None:
@@ -1312,7 +1312,7 @@ async def test_the_deadline_waits_for_the_write_in_flight(monkeypatch) -> None:
         return {"type": "tool_result", "tool_use_id": "w", "content": "ok"}
 
     ctx = SimpleNamespace(
-        settings=SimpleNamespace(chat_bash_timeout_seconds=1),
+        settings=SimpleNamespace(chat_bash_timeout_seconds=1, chat_writer_grace_seconds=1),
         writer=asyncio.ensure_future(slow_write()),
     )
     # The turn's deadline interrupted the loop while this write ran: it is waited for,

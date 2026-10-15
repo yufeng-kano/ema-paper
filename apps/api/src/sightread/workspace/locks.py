@@ -33,24 +33,42 @@ def _lock_path(root: Path, suffix: str) -> Path:
     return repo.parent / f"{repo.name}{suffix}"
 
 
-def _acquire(path: Path) -> int:
-    fd = path.open("a+")
-    fcntl.flock(fd, fcntl.LOCK_EX)
-    return fd  # type: ignore[return-value]
+BACKUP_LOCK = "backup.lock"
+
+
+def _backup_lock_path(root: Path) -> Path:
+    return git_dir(root).parent / BACKUP_LOCK
+
+
+def _acquire(path: Path, backup: Path) -> tuple[object, object]:
+    """The backup lock shared first, then the user's lock exclusive: the backup holds the
+    former exclusively while it captures the rows and the tree, so no write lands between
+    the two (docs/workspace.md § Backups)."""
+    shared = backup.open("a+")
+    fcntl.flock(shared, fcntl.LOCK_SH)
+    try:
+        fd = path.open("a+")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except BaseException:
+        fcntl.flock(shared, fcntl.LOCK_UN)
+        shared.close()
+        raise
+    return fd, shared
 
 
 @contextlib.asynccontextmanager
 async def _hold(root: Path, suffix: str) -> AsyncIterator[None]:
     path = _lock_path(root, suffix)
     async with _process_locks[path]:
-        handle = await asyncio.to_thread(_acquire, path)
+        handle, shared = await asyncio.to_thread(_acquire, path, _backup_lock_path(root))
         try:
             yield
         finally:
-            try:
-                fcntl.flock(handle, fcntl.LOCK_UN)
-            finally:
-                handle.close()
+            for held in (handle, shared):
+                try:
+                    fcntl.flock(held, fcntl.LOCK_UN)  # type: ignore[arg-type]
+                finally:
+                    held.close()  # type: ignore[attr-defined]
 
 
 @contextlib.asynccontextmanager

@@ -101,7 +101,8 @@ async def run_bash(
         notes.append(f"[exit code {result.exit_code}]")
     if notes:
         output = (output + "\n" if output else "") + "\n".join(notes)
-    return ToolOutcome(output or "(no output)", is_error=result.timed_out)
+    failed = result.timed_out or result.exit_code not in (None, 0)
+    return ToolOutcome(output or "(no output)", is_error=failed)
 
 
 # --- the editor ---------------------------------------------------------------------------

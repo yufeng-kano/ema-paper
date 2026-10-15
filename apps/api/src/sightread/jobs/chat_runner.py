@@ -591,9 +591,6 @@ async def _report_tool(
 MUTATING_TOOLS = frozenset({"bash", "str_replace_based_edit_tool"})
 # Read-only tools of one round in flight together.
 READ_CONCURRENCY = 4
-# Past the command timeout, how long a turn that hit its deadline waits for the write in
-# flight (its commit, its reconcile) before it is finished.
-WRITER_GRACE_SECONDS = 60
 IMAGE_BUDGET_SPENT = "This round's image budget is spent; ask for fewer pages or figures at a time."
 
 
@@ -671,10 +668,14 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
                 # terminal event (docs/chat.md § Tools).
                 writer = asyncio.ensure_future(_run_tool(ctx, block, malformed))
                 ctx.writer = writer
-                try:
-                    results[index] = await asyncio.shield(writer)
-                finally:
-                    ctx.writer = None
+                # Cleared when the writer is done, not when this await ends: a cancelled
+                # await leaves the writer running, and run_turn must still find it.
+                writer.add_done_callback(
+                    lambda done, ctx=ctx: (
+                        setattr(ctx, "writer", None) if ctx.writer is done else None
+                    )
+                )
+                results[index] = await asyncio.shield(writer)
 
     # A task group: when the writes stop on a cancel, the reads still running are
     # cancelled with them rather than left to finish a turn that is over.
@@ -783,7 +784,7 @@ async def _settle_writer(ctx: TurnContext) -> None:
     writer = ctx.writer
     if writer is None or writer.done():
         return
-    grace = ctx.settings.chat_bash_timeout_seconds + WRITER_GRACE_SECONDS
+    grace = ctx.settings.chat_bash_timeout_seconds + ctx.settings.chat_writer_grace_seconds
     with contextlib.suppress(Exception):
         await asyncio.wait_for(asyncio.shield(writer), timeout=grace)
 
@@ -821,6 +822,8 @@ async def run_turn(
     except UpstreamError as exc:
         await _finish(sessionmaker, turn_id, status="failed", error=str(exc))
     except asyncio.CancelledError:
+        # A worker shutting down: the write in flight finishes and commits first.
+        await _settle_writer(ctx)
         raise
     except Exception:
         logger.exception("turn %s failed unexpectedly", turn_id)

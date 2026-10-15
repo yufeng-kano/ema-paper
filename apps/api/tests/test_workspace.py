@@ -818,3 +818,88 @@ def test_the_revision_log_is_bounded(tmp_path) -> None:
     # The first LOG_FILES_MAX paths and a count of the rest, never the whole list.
     assert len(revision.files) == git.LOG_FILES_MAX + 1
     assert revision.files[-1] == "... and 50 more"
+
+
+def test_a_revert_past_the_total_bound_is_refused_before_anything_moves(tmp_path) -> None:
+    root = tmp_path / "ws" / "6"
+    root.mkdir(parents=True)
+    git.ensure_repo(root)
+    for index in range(4):
+        safe_io.write_text(root, root / "files" / "d" / f"f{index}.txt", "x" * 1000)
+    safe_io.write_text(root, root / "files" / "d" / ".meta.json", "{}")
+    git.commit_all(root, "user", "four files")
+    for index in range(4):
+        safe_io.write_text(root, root / "files" / "d" / f"f{index}.txt", "y" * 1000)
+    (shell,) = [git.commit_all(root, "agent:1", "edit all four")]
+    paths = documents.DocumentPaths(root=root, relative=Path("files/d"))
+    with pytest.raises(ApiError) as refused:
+        documents._revert(paths, shell, max_bytes=10_000, total_max_bytes=2_500)
+    assert refused.value.status_code == 409
+    assert (root / "files" / "d" / "f0.txt").read_text() == "y" * 1000
+    # Within the bound, the same revert goes through.
+    documents._revert(paths, shell, max_bytes=10_000, total_max_bytes=10_000)
+    assert (root / "files" / "d" / "f0.txt").read_text() == "x" * 1000
+
+
+def test_a_revision_whose_list_reaches_the_bound_is_still_listed(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "ws" / "7"
+    root.mkdir(parents=True)
+    git.ensure_repo(root)
+    for index in range(60):
+        safe_io.write_text(root, root / "files" / f"a-rather-long-file-name-{index:04d}.txt", "x")
+    git.commit_all(root, "agent:1", "many names")
+    monkeypatch.setattr(git, "LOG_MAX_BYTES", 600)
+    (revision,) = git.log(root)
+    assert revision.message == "many names"
+    assert revision.files[-1] == "... (list cut)"
+    assert 0 < len(revision.files) < 60
+
+
+def test_tree_sizes_survive_a_very_deep_tree(tmp_path) -> None:
+    # Deeper than the interpreter's recursion limit and longer than PATH_MAX: made the
+    # way a shell can make it, one descriptor-relative step at a time.
+    root = tmp_path / "ws" / "8"
+    (root / "files").mkdir(parents=True)
+    fd = os.open(root / "files", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for _ in range(1500):
+            os.mkdir("d", dir_fd=fd)
+            child = os.open("d", os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        leaf = os.open("leaf.txt", os.O_WRONLY | os.O_CREAT, 0o644, dir_fd=fd)
+        os.write(leaf, b"z" * 10)
+        os.close(leaf)
+    finally:
+        os.close(fd)
+    assert documents.directory_size(root) == 10
+    assert safe_io.remove_tree(root, root / "files")
+    assert not (root / "files").exists()
+
+
+def test_workspace_writes_wait_for_the_backup_lock(tmp_path) -> None:
+    import fcntl
+    import threading
+
+    from sightread.workspace import locks
+
+    root = tmp_path / "ws" / "9"
+    git.ensure_repo(root)
+    backup = locks._backup_lock_path(root)
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    holder = backup.open("a+")
+    fcntl.flock(holder, fcntl.LOCK_EX)  # the backup pass is running
+    entered = threading.Event()
+
+    def writer() -> None:
+        handle, shared = locks._acquire(locks._lock_path(root, locks.WORKSPACE_SUFFIX), backup)
+        entered.set()
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        fcntl.flock(shared, fcntl.LOCK_UN)
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    assert not entered.wait(0.3)  # held out while the backup captures rows and tree
+    fcntl.flock(holder, fcntl.LOCK_UN)
+    assert entered.wait(5)
+    thread.join()

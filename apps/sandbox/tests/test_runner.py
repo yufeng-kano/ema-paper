@@ -214,3 +214,17 @@ def test_production_accepts_only_a_vm_runtime(tmp_path) -> None:
             Settings(**base, sandbox_runtime=runtime)
     # The operator names their own VM runtime.
     assert Settings(**base, sandbox_runtime="kata2", sandbox_vm_runtimes="kata2").sandbox_runtime
+
+
+async def test_a_command_returns_only_once_its_background_jobs_are_done(client, tmp_path) -> None:
+    done = await client.post(
+        "/sandboxes/3/exec",
+        json={
+            "session": "s",
+            "command": "(sleep 0.3; echo late > late.txt) &",
+            "timeout_seconds": 5,
+        },
+    )
+    assert done.json()["exit_code"] == 0
+    # The job the command left behind finished before the command returned.
+    assert (tmp_path / "ws" / "3" / "late.txt").read_text().strip() == "late"

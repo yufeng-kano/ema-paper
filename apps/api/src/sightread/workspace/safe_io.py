@@ -293,19 +293,33 @@ def list_dir(root: Path, path: Path) -> list[tuple[str, bool]]:
 
 
 def _remove_contents(fd: int) -> None:
-    for name in os.listdir(fd):
-        mode = os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode
-        if stat.S_ISDIR(mode):
-            child = os.open(
-                name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd
-            )
-            try:
-                _remove_contents(child)
-            finally:
-                os.close(child)
-            os.rmdir(name, dir_fd=fd)
-        else:
-            os.unlink(name, dir_fd=fd)
+    """Empty the directory `fd` through descriptors, children first, with an explicit
+    stack rather than recursion (a shell can nest past the interpreter's limit)."""
+    # (parent fd, name, child fd): a directory is removed once its own entries are gone.
+    stack: list[tuple[int | None, str | None, int]] = [(None, None, fd)]
+    try:
+        while stack:
+            parent, name, current = stack[-1]
+            removed_children = False
+            for entry in os.listdir(current):
+                mode = os.stat(entry, dir_fd=current, follow_symlinks=False).st_mode
+                if stat.S_ISDIR(mode):
+                    child = os.open(entry, _OPEN_DIR_FLAGS, dir_fd=current)
+                    stack.append((current, entry, child))
+                    removed_children = True
+                    break
+                os.unlink(entry, dir_fd=current)
+            if removed_children:
+                continue  # descend first; this directory comes back once the child is gone
+            stack.pop()
+            if parent is not None and name is not None:
+                os.close(current)
+                os.rmdir(name, dir_fd=parent)
+    except BaseException:
+        for parent, _name, current in stack:
+            if parent is not None:
+                os.close(current)
+        raise
 
 
 def remove_tree(root: Path, path: Path) -> bool:
@@ -364,23 +378,36 @@ def remove_empty_dir(root: Path, path: Path) -> bool:
 
 
 def _dir_size(fd: int) -> int:
+    """An explicit stack, not recursion: a shell can nest directories deeper than the
+    interpreter's recursion limit. `fd` is closed by the caller; children here."""
     total = 0
-    for name in os.listdir(fd):
-        try:
-            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
-        except OSError:
-            continue
-        if stat.S_ISDIR(info.st_mode):
+    stack = [fd]
+    try:
+        while stack:
+            current = stack.pop()
             try:
-                child = os.open(name, _OPEN_DIR_FLAGS, dir_fd=fd)
+                names = os.listdir(current)
             except OSError:
-                continue
-            try:
-                total += _dir_size(child)
-            finally:
-                os.close(child)
-        else:
-            total += info.st_size  # a link counts as itself, never its target
+                names = []
+            for name in names:
+                try:
+                    info = os.stat(name, dir_fd=current, follow_symlinks=False)
+                except OSError:
+                    continue
+                if stat.S_ISDIR(info.st_mode):
+                    try:
+                        stack.append(os.open(name, _OPEN_DIR_FLAGS, dir_fd=current))
+                    except OSError:
+                        continue
+                else:
+                    total += info.st_size  # a link counts as itself, never its target
+            if current != fd:
+                os.close(current)
+    except BaseException:
+        for pending in stack:
+            if pending != fd:
+                os.close(pending)
+        raise
     return total
 
 

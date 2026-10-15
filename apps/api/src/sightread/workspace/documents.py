@@ -470,7 +470,7 @@ def _prune_empty(root: Path, directory: Path) -> None:
         directory = directory.parent
 
 
-def _revert(paths: DocumentPaths, commit: str, max_bytes: int) -> str:
+def _revert(paths: DocumentPaths, commit: str, max_bytes: int, total_max_bytes: int) -> str:
     """Undo every path the commit touched — a shell revision may have changed files
     beyond this document — writing each one as it was in the commit's parent, where it
     lives now if it was moved since; a rename is moved back (docs/workspace.md
@@ -488,6 +488,17 @@ def _revert(paths: DocumentPaths, commit: str, max_bytes: int) -> str:
     moves: list[tuple[Path, Path]] = []
     writes: list[tuple[Path, bytes]] = []
     removals: list[Path] = []
+    held = 0
+
+    def hold(data: bytes) -> bytes:
+        # Every byte to restore is in hand before the first write; the sum is bounded,
+        # or a shell revision over a workspace's worth of files would be held in memory.
+        nonlocal held
+        held += len(data)
+        if held > total_max_bytes:
+            raise ApiError(409, "invalid_request", "That revision is too large to restore")
+        return data
+
     for status, then, renamed_to in git.changed_paths(root, commit):
         now = moved.get(then, then)
         if status == "R" and renamed_to is not None:
@@ -508,7 +519,7 @@ def _revert(paths: DocumentPaths, commit: str, max_bytes: int) -> str:
                             409, "invalid_request", "That revision is too large to restore"
                         ) from exc
                     if before is not None:
-                        writes.append((then, before))
+                        writes.append((then, hold(before)))
             continue
         if status == "A":
             # The commit created the file; a document's own fixed files are emptied
@@ -528,7 +539,7 @@ def _revert(paths: DocumentPaths, commit: str, max_bytes: int) -> str:
             continue
         if safe_io.entry_kind(root, root / now) not in ("file", "none"):
             raise ApiError(409, "invalid_request", NOT_PLAIN)
-        writes.append((now, before))
+        writes.append((now, hold(before)))
     if not moves and not writes and not removals:
         raise ApiError(400, "invalid_request", "That revision changed nothing")
 
@@ -576,7 +587,9 @@ async def revert(
     root = user_root(settings.workspaces_dir, document.user_id)
     async with contextlib.nullcontext() if locked else workspace_lock(root):
         paths = await materialize_document(db, settings, document, locked=True)
-        made = await asyncio.to_thread(_revert, paths, commit, settings.content_max_bytes)
+        made = await asyncio.to_thread(
+            _revert, paths, commit, settings.content_max_bytes, settings.revert_max_bytes
+        )
         await reconcile_locked(db, settings, document.user_id)
         content = await read_content(db, settings, document, locked=True)
     return Reverted(commit=made, revision=content.revision)

@@ -765,3 +765,13 @@ describe('replaceBlockSource', () => {
     expect(replaceBlockSource(document, 5, 0, 'x')).toBe(document)
   })
 })
+
+describe('comments', () => {
+  it('keeps an HTML comment that is not a page marker through a block edit', () => {
+    const source = '<!-- page: 1 -->\n\nFirst.\n\n<!-- reviewer: check this -->\n\nSecond.'
+    const pages = parseResultMarkdown(source)
+    expect(pages[0]?.blocks.map((block) => block.kind)).toEqual(['p', 'comment', 'p'])
+    const edited = replaceBlockSource(source, 0, 0, 'First, edited.')
+    expect(edited).toBe('<!-- page: 1 -->\nFirst, edited.\n\n<!-- reviewer: check this -->\n\nSecond.')
+  })
+})

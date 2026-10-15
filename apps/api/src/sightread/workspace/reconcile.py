@@ -52,15 +52,18 @@ def _walk(root: Path, relative: Path):
     followed (`safe_io.list_dir`): a `files/` the shell replaced with a link, or any
     directory under it, is an empty tree to this walk, never another user's. A caller
     may trim the subdirectory list in place to prune the walk."""
-    try:
-        entries = safe_io.list_dir(root, root / relative)
-    except (safe_io.UnsafeEntry, OSError):
-        return
-    subdirs = sorted(name for name, is_dir in entries if is_dir)
-    files = [name for name, is_dir in entries if not is_dir]
-    yield relative, subdirs, files
-    for name in subdirs:
-        yield from _walk(root, relative / name)
+    # An explicit stack: a shell can nest directories past the interpreter's limit.
+    stack = [relative]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = safe_io.list_dir(root, root / current)
+        except (safe_io.UnsafeEntry, OSError):
+            continue
+        subdirs = sorted(name for name, is_dir in entries if is_dir)
+        files = [name for name, is_dir in entries if not is_dir]
+        yield current, subdirs, files
+        stack.extend(current / name for name in reversed(subdirs))
 
 
 def _canonicalize(root: Path) -> int:

@@ -169,15 +169,22 @@ def log(
     if code != 0 and not truncated:
         raise GitError("git log failed")
     records = raw.decode(errors="replace").split("\x1e")
+    cut = records[-1] if truncated else None
     if truncated:
         records = records[:-1]
     revisions: list[Revision] = []
-    for record in records:
+    for record in records + ([cut] if cut and "\n" in cut else []):
         if not record.strip():
             continue
         header, _, body = record.partition("\n")
         commit, author, when, subject = (header.split("\x1f") + ["", "", "", ""])[:4]
+        if len(commit) != 40:
+            continue  # the cut fell inside the header: nothing reliable to list
         names = [line for line in body.splitlines() if line.strip()]
+        if record is cut:
+            # The bound fell inside this revision's list: what fit, and a marker, rather
+            # than no revision at all (its last line may be half a name).
+            names = names[:-1] + ["... (list cut)"]
         if len(names) > LOG_FILES_MAX:
             names = names[:LOG_FILES_MAX] + [f"... and {len(names) - LOG_FILES_MAX} more"]
         files = tuple(names)
