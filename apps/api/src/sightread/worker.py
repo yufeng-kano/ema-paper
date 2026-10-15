@@ -18,7 +18,8 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from .config import get_settings
 from .db.session import create_engine, create_sessionmaker
-from .jobs.queue import claim_next_job, requeue_job
+from .jobs.chat_runner import run_turn
+from .jobs.queue import claim_next_job, claim_next_turn, fail_turn, requeue_job
 from .jobs.runner import run_job
 from .jobs.sweeper import sweep_forever
 from .parsing.figures import discard_job_figures
@@ -45,20 +46,50 @@ async def run_worker(stop: asyncio.Event) -> None:
 
     sweeper = asyncio.create_task(sweep_forever(upload_dir, stop))
     logger.info("worker started; %d render slots", render_count)
+    prefer_turns = False
 
     try:
         while not stop.is_set():
+            job_id = None
+            turn_id = None
             try:
                 async with sessionmaker() as db:
-                    job_id = await claim_next_job(db, settings.max_jobs_per_user)
+                    # Two queues, one worker: a parse never starves a conversation and the
+                    # reverse (docs/jobs.md § Chat turns).
+                    if prefer_turns:
+                        turn_id = await claim_next_turn(db, settings.max_chat_turns_per_user)
+                    if turn_id is None:
+                        job_id = await claim_next_job(db, settings.max_jobs_per_user)
+                    if job_id is None and turn_id is None and not prefer_turns:
+                        turn_id = await claim_next_turn(db, settings.max_chat_turns_per_user)
             except SQLAlchemyError:
                 # A database blip must not end the worker; wait and ask again.
-                logger.exception("could not claim a job")
-                job_id = None
+                logger.exception("could not claim work")
+            prefer_turns = not prefer_turns
 
-            if job_id is None:
+            if job_id is None and turn_id is None:
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(stop.wait(), timeout=IDLE_POLL_SECONDS)
+                continue
+
+            if turn_id is not None:
+                logger.info("running chat turn %s", turn_id)
+                running = asyncio.create_task(
+                    run_turn(sessionmaker, settings, turn_id, render_slots)
+                )
+                shutdown = asyncio.create_task(stop.wait())
+                done, _ = await asyncio.wait(
+                    {running, shutdown}, return_when=asyncio.FIRST_COMPLETED
+                )
+                shutdown.cancel()
+                if running not in done:
+                    # A turn is never requeued: its tool calls may already have run
+                    # (docs/jobs.md § Chat turns).
+                    running.cancel()
+                    await asyncio.gather(running, return_exceptions=True)
+                    async with sessionmaker() as db:
+                        await fail_turn(db, turn_id, "worker stopped")
+                    logger.info("failed turn %s on shutdown", turn_id)
                 continue
 
             logger.info("running job %s", job_id)

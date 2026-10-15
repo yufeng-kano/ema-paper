@@ -269,8 +269,10 @@ async def test_kano_proxy_migration_moves_settings_to_the_parse_agent(scratch_ur
             ).scalars()
         )
         job = (
-            await db.execute(text("SELECT * FROM jobs WHERE id = :id"), {"id": historical_job})
-        ).mappings().one()
+            (await db.execute(text("SELECT * FROM jobs WHERE id = :id"), {"id": historical_job}))
+            .mappings()
+            .one()
+        )
         preset_agent = (await db.execute(text("SELECT agent FROM prompt_presets"))).scalar_one()
         usage = (await db.execute(text("SELECT cost_source, cost FROM usage_log"))).one()
         dedup = (
@@ -332,4 +334,76 @@ async def test_kano_proxy_migration_moves_settings_to_the_parse_agent(scratch_ur
         ).all()
     assert [tuple(row) for row in restored] == [(connection_user, None)]
     _alembic(scratch_url, "upgrade", "head")
+    await engine.dispose()
+
+
+BEFORE_CHAT = "837c0e9a9a4f"
+CHAT = "f74c75c0416e"
+
+
+async def test_chat_migration_backfills_the_agent_of_every_usage_row(scratch_url) -> None:
+    """`usage_log.agent` comes from the row's job; a row without one stays `parse`
+    (docs/database.md § Rules)."""
+    _alembic(scratch_url, "upgrade", BEFORE_CHAT)
+
+    engine = create_async_engine(scratch_url)
+    job_id = uuid.uuid4()
+    async with engine.begin() as db:
+        user_id = (
+            await db.execute(
+                text(
+                    "INSERT INTO users (google_sub, email, created_at) "
+                    "VALUES ('sub', 'c@example.com', now()) RETURNING id"
+                )
+            )
+        ).scalar_one()
+        await db.execute(
+            text(
+                "INSERT INTO jobs (id, user_id, agent, kind, filename, media_type, size_bytes, "
+                "sha256, pages_spec, model, pipeline_version, bbox_format, status, pages_done, "
+                "prompt_sha256, created_at) VALUES (:id, :user, 'parse', 'image', 'a.png', "
+                "'image/png', 1, 'h', '', 'm', 1, 'yxyx_norm1000', 'succeeded', 1, '', now())"
+            ),
+            {"id": job_id, "user": user_id},
+        )
+        for job in (job_id, None):
+            await db.execute(
+                text(
+                    "INSERT INTO usage_log (user_id, job_id, model, prompt_tokens, "
+                    "completion_tokens, cost, cost_source, created_at) "
+                    "VALUES (:user, :job, 'm', 1, 1, NULL, 'unknown', now())"
+                ),
+                {"user": user_id, "job": job},
+            )
+        await db.execute(
+            text("INSERT INTO agent_settings (user_id, agent, model) VALUES (:user, 'parse', 'm')"),
+            {"user": user_id},
+        )
+
+    _alembic(scratch_url, "upgrade", CHAT)
+
+    async with engine.connect() as db:
+        rows = (
+            await db.execute(
+                text(
+                    "SELECT agent, turn_id, cache_read_tokens, cache_write_tokens "
+                    "FROM usage_log ORDER BY id"
+                )
+            )
+        ).all()
+        effort = (await db.execute(text("SELECT effort FROM agent_settings"))).scalar_one()
+        tables = {
+            row[0]
+            for row in (
+                await db.execute(
+                    text(
+                        "SELECT table_name FROM information_schema.tables "
+                        "WHERE table_schema = 'public'"
+                    )
+                )
+            ).all()
+        }
+    assert [tuple(row) for row in rows] == [("parse", None, 0, 0), ("parse", None, 0, 0)]
+    assert effort == "medium"
+    assert {"conversations", "messages", "chat_turns", "chat_events"} <= tables
     await engine.dispose()

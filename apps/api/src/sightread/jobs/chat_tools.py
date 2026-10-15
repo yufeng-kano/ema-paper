@@ -1,0 +1,335 @@
+"""What the chat agent's tools do on the host (docs/chat.md § Tools).
+
+Every tool takes the model's input as untrusted data: a path is resolved and must stay
+inside the user's workspace, a page number is bounded by the document, a command goes to
+the runner and nowhere else. A tool that fails answers an error result; it never raises
+into the loop.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import difflib
+import io
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
+
+from PIL import Image, ImageOps
+
+from ..parsing import poppler
+from ..parsing.figures import parse_bbox_path
+from ..sandbox.client import SandboxClient, SandboxUnavailable
+from ..workspace import git
+from ..workspace.documents import DocumentPaths
+from ..workspace.layout import CACHE_DIR, META_FILE, SIGHTREAD_DIR, inside
+from ..workspace.locks import workspace_lock
+
+VM_ROOT = PurePosixPath("/workspace")
+# Where the editor tool may not write: history, the workspace's own records, the cache.
+READ_ONLY_NAMES = frozenset({".git", ".gitignore", SIGHTREAD_DIR, META_FILE, CACHE_DIR})
+VIEW_MAX_CHARS = 60_000
+# The long edge a page image is sent at: what Claude would resize to anyway.
+PAGE_IMAGE_LONG_EDGE_PX = 1568
+BASH_DEFAULT_TIMEOUT_SECONDS = 120
+
+
+@dataclass
+class ToolOutcome:
+    content: str | list[dict]
+    is_error: bool = False
+    # An edit the tool made: what the `edit` event carries.
+    edit: dict | None = field(default=None)
+
+
+def truncate(text: str, max_chars: int) -> str:
+    """Keep the head and the tail; say how much went missing between them."""
+    if len(text) <= max_chars:
+        return text
+    keep = max(max_chars // 2 - 40, 0)
+    omitted = len(text) - 2 * keep
+    return f"{text[:keep]}\n\n[... {omitted} characters omitted ...]\n\n{text[-keep:]}"
+
+
+# --- bash ---------------------------------------------------------------------------------
+
+
+async def run_bash(
+    client: SandboxClient,
+    user_id: int,
+    session: str,
+    tool_input: dict,
+    *,
+    max_chars: int,
+) -> ToolOutcome:
+    if tool_input.get("restart"):
+        try:
+            await client.restart(user_id, session)
+        except SandboxUnavailable as exc:
+            return ToolOutcome(f"The sandbox is unavailable: {exc}", is_error=True)
+        return ToolOutcome("The shell was restarted.")
+    command = tool_input.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return ToolOutcome("bash needs a `command`", is_error=True)
+    try:
+        result = await client.exec(
+            user_id, session, command, timeout_seconds=BASH_DEFAULT_TIMEOUT_SECONDS
+        )
+    except SandboxUnavailable as exc:
+        return ToolOutcome(f"The sandbox is unavailable: {exc}", is_error=True)
+    output = truncate(result.output, max_chars)
+    notes = []
+    if result.timed_out:
+        notes.append(f"[command timed out after {BASH_DEFAULT_TIMEOUT_SECONDS}s and was killed]")
+    if result.truncated:
+        notes.append("[output was cut by the sandbox]")
+    if result.exit_code not in (None, 0):
+        notes.append(f"[exit code {result.exit_code}]")
+    if notes:
+        output = (output + "\n" if output else "") + "\n".join(notes)
+    return ToolOutcome(output or "(no output)", is_error=result.timed_out)
+
+
+# --- the editor ---------------------------------------------------------------------------
+
+
+class PathRefused(Exception):
+    pass
+
+
+def resolve_workspace_path(root: Path, raw: object) -> Path:
+    """`/workspace/files/x/doc.md` (or `files/x/doc.md`) → the host path, inside `root`."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise PathRefused("a `path` is required")
+    posix = PurePosixPath(raw.strip())
+    if posix.is_absolute():
+        try:
+            relative = posix.relative_to(VM_ROOT)
+        except ValueError as exc:
+            raise PathRefused("paths must be under /workspace") from exc
+    else:
+        relative = posix
+    candidate = root / Path(*relative.parts) if relative.parts else root
+    if not inside(root, candidate):
+        raise PathRefused("paths must stay inside /workspace")
+    return candidate
+
+
+def _writable(root: Path, path: Path) -> bool:
+    relative = path.resolve().relative_to(root.resolve())
+    return not any(part in READ_ONLY_NAMES for part in relative.parts)
+
+
+def _listing(path: Path) -> str:
+    rows = []
+    for entry in sorted(path.iterdir(), key=lambda item: item.name):
+        if entry.name in (".git",):
+            continue
+        rows.append(f"{entry.name}/" if entry.is_dir() else entry.name)
+    return "\n".join(rows) or "(empty directory)"
+
+
+def _numbered(text: str, view_range: object) -> str:
+    lines = text.split("\n")
+    start, end = 1, len(lines)
+    if isinstance(view_range, list) and len(view_range) == 2:
+        try:
+            start = max(1, int(view_range[0]))
+            end = len(lines) if int(view_range[1]) == -1 else min(len(lines), int(view_range[1]))
+        except (TypeError, ValueError):
+            pass
+    return "\n".join(f"{number:6d}\t{lines[number - 1]}" for number in range(start, end + 1))
+
+
+def _diff(before: str, after: str, label: str) -> str:
+    return "".join(
+        difflib.unified_diff(
+            before.splitlines(keepends=True),
+            after.splitlines(keepends=True),
+            fromfile=f"a/{label}",
+            tofile=f"b/{label}",
+        )
+    )
+
+
+def _edit_sync(root: Path, tool_input: dict, author: str, *, max_chars: int) -> ToolOutcome:
+    command = tool_input.get("command")
+    try:
+        path = resolve_workspace_path(root, tool_input.get("path"))
+    except PathRefused as exc:
+        return ToolOutcome(str(exc), is_error=True)
+    vm_path = str(VM_ROOT / path.resolve().relative_to(root.resolve()).as_posix())
+
+    if command == "view":
+        if path.is_dir():
+            return ToolOutcome(_listing(path))
+        if not path.is_file():
+            return ToolOutcome(f"{vm_path} does not exist", is_error=True)
+        try:
+            text = path.read_text()
+        except UnicodeDecodeError:
+            return ToolOutcome(f"{vm_path} is not a text file", is_error=True)
+        return ToolOutcome(truncate(_numbered(text, tool_input.get("view_range")), max_chars))
+
+    if command not in ("str_replace", "insert", "create"):
+        return ToolOutcome(f"unknown editor command {command!r}", is_error=True)
+    if not _writable(root, path):
+        return ToolOutcome(f"{vm_path} is read-only", is_error=True)
+
+    before = path.read_text() if path.is_file() else None
+    if command == "create":
+        new_text = tool_input.get("file_text")
+        if not isinstance(new_text, str):
+            return ToolOutcome("create needs `file_text`", is_error=True)
+        if before is not None:
+            return ToolOutcome(f"{vm_path} already exists; use str_replace", is_error=True)
+        after = new_text
+    elif command == "str_replace":
+        if before is None:
+            return ToolOutcome(f"{vm_path} does not exist", is_error=True)
+        old, new = tool_input.get("old_str"), tool_input.get("new_str", "")
+        if not isinstance(old, str) or not old or not isinstance(new, str):
+            return ToolOutcome("str_replace needs `old_str` and `new_str`", is_error=True)
+        count = before.count(old)
+        if count == 0:
+            return ToolOutcome("old_str was not found in the file", is_error=True)
+        if count > 1:
+            return ToolOutcome(
+                f"old_str occurs {count} times; include more context so it is unique",
+                is_error=True,
+            )
+        after = before.replace(old, new, 1)
+    else:  # insert
+        if before is None:
+            return ToolOutcome(f"{vm_path} does not exist", is_error=True)
+        text_to_insert = tool_input.get("insert_text")
+        try:
+            line = int(tool_input.get("insert_line"))
+        except (TypeError, ValueError):
+            return ToolOutcome("insert needs an integer `insert_line`", is_error=True)
+        if not isinstance(text_to_insert, str):
+            return ToolOutcome("insert needs `insert_text`", is_error=True)
+        lines = before.split("\n")
+        line = max(0, min(line, len(lines)))
+        inserted = text_to_insert.split("\n")
+        after = "\n".join(lines[:line] + inserted + lines[line:])
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(after)
+    git.ensure_repo(root)
+    commit = git.commit_all(root, author, f"{command} {vm_path}")
+    diff = _diff(before or "", after, vm_path)
+    return ToolOutcome(
+        f"{command} applied to {vm_path}",
+        edit={
+            "path": vm_path,
+            "command": command,
+            "commit": commit,
+            "diff": truncate(diff, max_chars),
+        },
+    )
+
+
+async def run_editor(root: Path, tool_input: dict, author: str, *, max_chars: int) -> ToolOutcome:
+    if tool_input.get("command") == "view":
+        return await asyncio.to_thread(_edit_sync, root, tool_input, author, max_chars=max_chars)
+    async with workspace_lock(root):
+        return await asyncio.to_thread(_edit_sync, root, tool_input, author, max_chars=max_chars)
+
+
+# --- pages and figures --------------------------------------------------------------------
+
+
+def _png_block(data: bytes) -> dict:
+    return {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": base64.b64encode(data).decode("ascii"),
+        },
+    }
+
+
+def _as_png(path: Path) -> bytes:
+    """A PNG no larger than the model would keep, oriented, flattened onto white."""
+    with Image.open(path) as opened:
+        image = ImageOps.exif_transpose(opened) or opened
+        if image.mode in ("RGBA", "LA", "P"):
+            image = image.convert("RGBA")
+            background = Image.new("RGBA", image.size, (255, 255, 255, 255))
+            image = Image.alpha_composite(background, image).convert("RGB")
+        elif image.mode != "RGB":
+            image = image.convert("RGB")
+        long_edge = max(image.width, image.height)
+        if long_edge > PAGE_IMAGE_LONG_EDGE_PX:
+            scale = PAGE_IMAGE_LONG_EDGE_PX / long_edge
+            image = image.resize(
+                (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
+                Image.LANCZOS,
+            )
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG", optimize=True)
+        return buffer.getvalue()
+
+
+async def view_page(
+    paths: DocumentPaths,
+    tool_input: dict,
+    *,
+    page_count: int | None,
+    render_slots: asyncio.Semaphore,
+) -> ToolOutcome:
+    source = paths.source()
+    if source is None:
+        return ToolOutcome(
+            "This document kept no original file, so its pages cannot be rendered.",
+            is_error=True,
+        )
+    try:
+        page = int(tool_input.get("page"))
+    except (TypeError, ValueError):
+        return ToolOutcome("view_page needs an integer `page`", is_error=True)
+    if page < 1 or (page_count and page > page_count):
+        return ToolOutcome(f"page must be between 1 and {page_count or 1}", is_error=True)
+
+    if source.suffix.lower() == ".pdf":
+        with tempfile.TemporaryDirectory(prefix="sr-view-") as work:
+            work_dir = Path(work)
+            try:
+                async with render_slots:
+                    info = await poppler.pdf_info(source, cwd=work_dir)
+                    rendered = await poppler.render_page(
+                        source, page, info.page_size(page), cwd=work_dir
+                    )
+                data = await asyncio.to_thread(_as_png, rendered)
+            except poppler.PopplerError:
+                return ToolOutcome(f"page {page} could not be rendered", is_error=True)
+    else:
+        if page != 1:
+            return ToolOutcome("an image document has one page", is_error=True)
+        try:
+            data = await asyncio.to_thread(_as_png, source)
+        except OSError:
+            return ToolOutcome("the original image could not be read", is_error=True)
+    return ToolOutcome([_png_block(data), {"type": "text", "text": f"Page {page}."}])
+
+
+async def view_figure(paths: DocumentPaths, tool_input: dict) -> ToolOutcome:
+    try:
+        page = int(tool_input.get("page"))
+        raw_bbox = tool_input.get("bbox")
+        bbox = parse_bbox_path(",".join(str(int(value)) for value in raw_bbox))
+    except (TypeError, ValueError):
+        return ToolOutcome("view_figure needs `page` and a 4-integer `bbox`", is_error=True)
+    if bbox is None or page < 1:
+        return ToolOutcome("that bbox is not a usable box", is_error=True)
+    # The crops live in the document directory under the same name the figures dir uses
+    # (docs/parsing.md § Figure crops): the page and the cleaned box.
+    y_min, x_min, y_max, x_max = bbox
+    crop = paths.figures / f"p{page}_{y_min}_{x_min}_{y_max}_{x_max}.png"
+    if not crop.is_file():
+        return ToolOutcome("no crop is stored for that figure", is_error=True)
+    data = await asyncio.to_thread(crop.read_bytes)
+    return ToolOutcome([_png_block(data), {"type": "text", "text": f"Figure at p{page}."}])

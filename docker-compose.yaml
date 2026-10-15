@@ -34,6 +34,8 @@ services:
     environment:
       UPLOAD_DIR: /data/uploads
       FIGURES_DIR: /data/figures
+      WORKSPACES_DIR: /data/workspaces
+      SANDBOX_URL: http://sandbox:8100
     depends_on:
       pg:
         condition: service_healthy
@@ -42,6 +44,9 @@ services:
     volumes:
       - uploads:/data/uploads
       - figures:/data/figures
+      # A bind mount, not a named volume: the sandbox runner hands the same host path to
+      # `docker run` (docs/workspace.md, docs/sandbox.md).
+      - ${WORKSPACES_HOST_DIR:-./workspaces}:/data/workspaces
     command: >
       sh -c "alembic upgrade head &&
       uvicorn sightread.main:app --host 0.0.0.0 --port 8000"
@@ -65,6 +70,8 @@ services:
     environment:
       UPLOAD_DIR: /data/uploads
       FIGURES_DIR: /data/figures
+      WORKSPACES_DIR: /data/workspaces
+      SANDBOX_URL: http://sandbox:8100
     depends_on:
       pg:
         condition: service_healthy
@@ -73,7 +80,32 @@ services:
     volumes:
       - uploads:/data/uploads
       - figures:/data/figures
+      - ${WORKSPACES_HOST_DIR:-./workspaces}:/data/workspaces
     command: ["python", "-m", "sightread.worker"]
+
+  # The sandbox runner (docs/sandbox.md): the one container with the Docker socket. It
+  # starts a container per user from the sandbox image, so build that image first:
+  # `docker build -t sightread-sandbox deploy/sandbox-image`. SANDBOX_RUNTIME=runc works
+  # on a laptop without KVM and isolates nothing; production requires a VM runtime.
+  sandbox:
+    build:
+      context: ./apps/sandbox
+    container_name: sightread-sandbox
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      SANDBOX_BACKEND: docker
+      # The workspaces as the Docker daemon sees them: an absolute host path.
+      SANDBOX_WORKSPACES_DIR: ${SANDBOX_WORKSPACES_DIR:-${PWD}/workspaces}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${WORKSPACES_HOST_DIR:-./workspaces}:/data/workspaces
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8100/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   web:
     build:

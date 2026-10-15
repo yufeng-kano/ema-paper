@@ -36,6 +36,8 @@ from ..jobs.intake import (
 )
 from ..jobs.runner import partial_result_payload, result_payload
 from ..parsing.figures import crop_path, parse_bbox_path
+from ..workspace import documents as workspace_documents
+from ..workspace.layout import document_relative_dir, path_segment
 
 router = APIRouter(prefix="/api/library", tags=["library"])
 
@@ -344,7 +346,9 @@ async def create_folder(body: FolderCreate, user: SessionUser, db: DbSession):
 
 
 @router.put("/folders/{folder_id}", dependencies=[CsrfGuard])
-async def update_folder(folder_id: int, body: FolderUpdate, user: SessionUser, db: DbSession):
+async def update_folder(
+    folder_id: int, body: FolderUpdate, user: SessionUser, db: DbSession, settings: AppSettings
+):
     """Rename, move, or both.
 
     A rename that collides is refused: the name is what the user just typed, and quietly
@@ -371,18 +375,24 @@ async def update_folder(folder_id: int, body: FolderUpdate, user: SessionUser, d
         if renaming and wanted in taken:
             raise ApiError(409, "invalid_request", clash)
 
+        before = await folder_relative_dir(db, user.id, row.id)
         row.parent_id = parent_id
         row.name = free_name(taken, wanted, FOLDER_NAME_MAX)
         retries = 0 if renaming else INSERT_ATTEMPTS - 1 - attempt
         if await commit_or_retry(db, retries, clash):
             break
+    # The tree follows the rows (docs/workspace.md): the directory moves after the commit.
+    after = await folder_relative_dir(db, user.id, row.id)
+    await workspace_documents.move_path(settings, user.id, before, after)
     return folder_payload(row)
 
 
 @router.delete(
     "/folders/{folder_id}", dependencies=[CsrfGuard], status_code=status.HTTP_204_NO_CONTENT
 )
-async def delete_folder(folder_id: int, user: SessionUser, db: DbSession) -> Response:
+async def delete_folder(
+    folder_id: int, user: SessionUser, db: DbSession, settings: AppSettings
+) -> Response:
     """Delete a folder and its subtree — the documents in it are entries, so they go too.
 
     The subtree is deleted explicitly rather than left to `ON DELETE CASCADE`: the same
@@ -390,12 +400,14 @@ async def delete_folder(folder_id: int, user: SessionUser, db: DbSession) -> Res
     foreign keys unless asked to.
     """
     row = await owned_folder(db, user.id, folder_id)
+    relative = await folder_relative_dir(db, user.id, row.id)
     doomed = await subtree_ids(db, user.id, row.id)
     await db.execute(
         delete(Document).where(Document.user_id == user.id, Document.folder_id.in_(doomed))
     )
     await db.execute(delete(Folder).where(Folder.user_id == user.id, Folder.id.in_(doomed)))
     await db.commit()
+    await workspace_documents.remove_path(settings, user.id, relative)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -508,9 +520,7 @@ async def upload_document(
     return document_payload(row, await job_of(db, job_id))
 
 
-@router.post(
-    "/documents/from-job", dependencies=[CsrfGuard], status_code=status.HTTP_201_CREATED
-)
+@router.post("/documents/from-job", dependencies=[CsrfGuard], status_code=status.HTTP_201_CREATED)
 async def file_job(body: DocumentFromJob, user: SessionUser, db: DbSession):
     """File a parse that is already in the history — no upload, no second parse.
 
@@ -557,7 +567,13 @@ async def file_job(body: DocumentFromJob, user: SessionUser, db: DbSession):
 
 
 @router.put("/documents/{document_id}", dependencies=[CsrfGuard])
-async def update_document(document_id: int, body: DocumentUpdate, user: SessionUser, db: DbSession):
+async def update_document(
+    document_id: int,
+    body: DocumentUpdate,
+    user: SessionUser,
+    db: DbSession,
+    settings: AppSettings,
+):
     """Rename and/or move a file. Same rule as a folder: rename refuses, move suffixes."""
     provided = body.model_fields_set
     renaming = "name" in provided and body.name is not None
@@ -574,6 +590,7 @@ async def update_document(document_id: int, body: DocumentUpdate, user: SessionU
         if renaming and wanted in taken:
             raise ApiError(409, "invalid_request", clash)
 
+        before = await document_relative(db, row)
         row.folder_id = folder_id
         row.name = free_name(taken, wanted, DOCUMENT_NAME_MAX)
         # Two tabs moving same-named files into one folder is the same race a create
@@ -581,17 +598,23 @@ async def update_document(document_id: int, body: DocumentUpdate, user: SessionU
         retries = 0 if renaming else INSERT_ATTEMPTS - 1 - attempt
         if await commit_or_retry(db, retries, clash):
             break
+    after = await document_relative(db, row)
+    await workspace_documents.move_path(settings, user.id, before, after)
     return document_payload(row, await job_of(db, row.job_id))
 
 
 @router.delete(
     "/documents/{document_id}", dependencies=[CsrfGuard], status_code=status.HTTP_204_NO_CONTENT
 )
-async def delete_document(document_id: int, user: SessionUser, db: DbSession) -> Response:
+async def delete_document(
+    document_id: int, user: SessionUser, db: DbSession, settings: AppSettings
+) -> Response:
     """Remove the file from the library. The parse itself stays in the history."""
     row = await owned_document(db, user.id, document_id)
+    relative = await document_relative(db, row)
     await db.delete(row)
     await db.commit()
+    await workspace_documents.remove_path(settings, user.id, relative)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -661,3 +684,103 @@ async def document_figure(
 ):
     row = await owned_document(db, user.id, document_id)
     return figure_crop_response(settings, await job_of(db, row.job_id), page, bbox)
+
+
+# --- the workspace: where a row's directory is ----------------------------------------------
+
+
+async def folder_relative_dir(db: DbSession, user_id: int, folder_id: int) -> Path:
+    names = await workspace_documents.folder_names(db, user_id, folder_id)
+    path = Path("files")
+    for name in names:
+        path /= path_segment(name)
+    return path
+
+
+async def document_relative(db: DbSession, row: Document) -> Path:
+    names = await workspace_documents.folder_names(db, row.user_id, row.folder_id)
+    return document_relative_dir(names, row.name)
+
+
+# --- content, notes, revisions (docs/workspace.md) -----------------------------------------
+
+
+class ContentPut(BaseModel):
+    markdown: str
+    base_revision: str = Field(min_length=1, max_length=64)
+
+
+class NotesPut(BaseModel):
+    text: str
+    base_revision: str = Field(min_length=1, max_length=64)
+
+
+@router.get("/documents/{document_id}/content")
+async def document_content(
+    document_id: int, user: SessionUser, db: DbSession, settings: AppSettings
+):
+    row = await owned_document(db, user.id, document_id)
+    content = await workspace_documents.read_content(db, settings, row)
+    return {
+        "markdown": content.markdown,
+        "revision": content.revision,
+        "notes": content.notes,
+        "notes_revision": content.notes_revision,
+        "has_source": content.has_source,
+    }
+
+
+@router.put("/documents/{document_id}/content", dependencies=[CsrfGuard])
+async def put_document_content(
+    document_id: int, body: ContentPut, user: SessionUser, db: DbSession, settings: AppSettings
+):
+    row = await owned_document(db, user.id, document_id)
+    revision = await workspace_documents.write_content(
+        db, settings, row, markdown=body.markdown, base_revision=body.base_revision
+    )
+    return {"revision": revision}
+
+
+@router.put("/documents/{document_id}/notes", dependencies=[CsrfGuard])
+async def put_document_notes(
+    document_id: int, body: NotesPut, user: SessionUser, db: DbSession, settings: AppSettings
+):
+    row = await owned_document(db, user.id, document_id)
+    revision = await workspace_documents.write_notes(
+        db, settings, row, text=body.text, base_revision=body.base_revision
+    )
+    return {"revision": revision}
+
+
+@router.get("/documents/{document_id}/revisions")
+async def document_revisions(
+    document_id: int, user: SessionUser, db: DbSession, settings: AppSettings
+):
+    row = await owned_document(db, user.id, document_id)
+    history = await workspace_documents.revisions(db, settings, row)
+    return {
+        "revisions": [
+            {
+                "commit": entry.commit,
+                "author": entry.author,
+                "message": entry.message,
+                "created_at": entry.created_at,
+                "files": list(entry.files),
+            }
+            for entry in history
+        ]
+    }
+
+
+@router.post("/documents/{document_id}/revisions/{commit}/revert", dependencies=[CsrfGuard])
+async def revert_document_revision(
+    document_id: int,
+    commit: str,
+    user: SessionUser,
+    db: DbSession,
+    settings: AppSettings,
+):
+    row = await owned_document(db, user.id, document_id)
+    if not re.fullmatch(r"[0-9a-f]{7,40}", commit):
+        raise ApiError(404, "invalid_request", "No such revision")
+    return {"revision": await workspace_documents.revert(db, settings, row, commit)}

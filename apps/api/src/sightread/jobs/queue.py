@@ -14,7 +14,7 @@ from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..agents import get_agent
-from ..db.models import Job, JobPage, utcnow
+from ..db.models import ChatTurn, Job, JobPage, utcnow
 
 # PostgreSQL claim (docs/jobs.md). The correlated count applies the per-user running cap
 # to the same scan that picks the oldest queued job.
@@ -259,5 +259,99 @@ async def requeue_job(db: AsyncSession, job_id: uuid.UUID) -> None:
         update(Job)
         .where(Job.id == job_id, Job.status == "running")
         .values(status="queued", started_at=None, pages_done=0)
+    )
+    await db.commit()
+
+
+# --- chat turns (docs/jobs.md § Chat turns) ----------------------------------------------
+
+CLAIM_TURN_SQL = text(
+    """
+    UPDATE chat_turns SET status = 'running', started_at = now()
+    WHERE id = (
+      SELECT t.id FROM chat_turns t
+      WHERE t.status = 'queued'
+        AND (
+          SELECT count(*) FROM chat_turns running
+          WHERE running.user_id = t.user_id AND running.status = 'running'
+        ) < :max_turns_per_user
+      ORDER BY t.created_at
+      FOR UPDATE SKIP LOCKED LIMIT 1
+    )
+    RETURNING id
+    """
+)
+
+CLAIM_TURN_SQL_SQLITE_SELECT = text(
+    """
+    SELECT t.id FROM chat_turns t
+    WHERE t.status = 'queued'
+      AND (
+        SELECT count(*) FROM chat_turns running
+        WHERE running.user_id = t.user_id AND running.status = 'running'
+      ) < :max_turns_per_user
+    ORDER BY t.created_at LIMIT 1
+    """
+)
+
+
+async def count_active_turns(db: AsyncSession, user_id: int) -> int:
+    """Queued or running turns for one user — the cap `POST …/messages` enforces."""
+    return (
+        await db.execute(
+            select(func.count())
+            .select_from(ChatTurn)
+            .where(ChatTurn.user_id == user_id, ChatTurn.status.in_(("queued", "running")))
+        )
+    ).scalar_one()
+
+
+async def enqueue_turn(
+    db: AsyncSession, *, user_id: int, conversation_id: int, message_id: int
+) -> ChatTurn:
+    """Create the queued turn row. The caller commits, with the user message it answers."""
+    turn = ChatTurn(
+        id=uuid.uuid4(),
+        user_id=user_id,
+        conversation_id=conversation_id,
+        message_id=message_id,
+        status="queued",
+        created_at=utcnow(),
+    )
+    db.add(turn)
+    await db.flush()
+    return turn
+
+
+async def claim_next_turn(db: AsyncSession, max_turns_per_user: int) -> uuid.UUID | None:
+    """Claim the oldest queued turn whose user is under the running cap, or None."""
+    if db.get_bind().dialect.name == "postgresql":
+        claimed = (
+            await db.execute(CLAIM_TURN_SQL, {"max_turns_per_user": max_turns_per_user})
+        ).scalar_one_or_none()
+        await db.commit()
+        return claimed
+
+    candidate = (
+        await db.execute(CLAIM_TURN_SQL_SQLITE_SELECT, {"max_turns_per_user": max_turns_per_user})
+    ).scalar_one_or_none()
+    if candidate is None:
+        return None
+    turn_id = uuid.UUID(str(candidate))
+    updated = await db.execute(
+        update(ChatTurn)
+        .where(ChatTurn.id == turn_id, ChatTurn.status == "queued")
+        .values(status="running", started_at=utcnow())
+    )
+    await db.commit()
+    return turn_id if updated.rowcount == 1 else None
+
+
+async def fail_turn(db: AsyncSession, turn_id: uuid.UUID, error: str) -> None:
+    """A turn the worker could not finish. Never requeued: its tool calls may have run."""
+    await db.execute(
+        update(ChatTurn)
+        .where(ChatTurn.id == turn_id, ChatTurn.status.in_(("queued", "running")))
+        .values(status="failed", error=error, finished_at=utcnow())
     )
     await db.commit()

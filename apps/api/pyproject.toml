@@ -58,6 +58,8 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S105", "S106"]
 "migrations/*" = ["E501"]
+# The chat agent's system prompt is prose; a wrapped prompt reads worse to the model.
+"src/sightread/agents/chat.py" = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -53,12 +53,16 @@ services:
       APP_ENV: production
       UPLOAD_DIR: /data/uploads
       FIGURES_DIR: /data/figures
+      WORKSPACES_DIR: /data/workspaces
     depends_on:
       pg:
         condition: service_healthy
     volumes:
       - uploads:/data/uploads
       - figures:/data/figures
+      # Every user's files and revisions — primary data, bind-mounted at the same host
+      # path the sandbox runner hands to `docker run` (docs/workspace.md).
+      - ${WORKSPACES_HOST_DIR:?WORKSPACES_HOST_DIR is required}:/data/workspaces
     # Migrations run once, from the api container, before it serves (docs/database.md).
     command: >
       sh -c "alembic upgrade head &&
@@ -84,6 +88,7 @@ services:
       APP_ENV: production
       UPLOAD_DIR: /data/uploads
       FIGURES_DIR: /data/figures
+      WORKSPACES_DIR: /data/workspaces
     depends_on:
       pg:
         condition: service_healthy
@@ -95,7 +100,32 @@ services:
     volumes:
       - uploads:/data/uploads
       - figures:/data/figures
+      - ${WORKSPACES_HOST_DIR:?WORKSPACES_HOST_DIR is required}:/data/workspaces
     command: ["python", "-m", "sightread.worker"]
+
+  # The sandbox runner (docs/sandbox.md): alone in holding the Docker socket, it starts
+  # one Kata microVM per user from the sandbox image (`docker build -t sightread-sandbox
+  # deploy/sandbox-image`). The host needs /dev/kvm and the `kata` runtime registered with
+  # Docker; the runner refuses to start in production with `runc`.
+  sandbox:
+    build:
+      context: ./apps/sandbox
+    container_name: sightread-sandbox
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      APP_ENV: production
+      SANDBOX_BACKEND: docker
+      SANDBOX_WORKSPACES_DIR: ${WORKSPACES_HOST_DIR:?WORKSPACES_HOST_DIR is required}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${WORKSPACES_HOST_DIR:?WORKSPACES_HOST_DIR is required}:/data/workspaces
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8100/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   web:
     build:
@@ -122,6 +152,7 @@ services:
     volumes:
       - ./backups:/backups
       - figures:/data/figures:ro
+      - ${WORKSPACES_HOST_DIR:?WORKSPACES_HOST_DIR is required}:/data/workspaces:ro
     depends_on:
       pg:
         condition: service_healthy
@@ -134,13 +165,18 @@ services:
           # The dump and the crops behind its results are one backup: both are written as
           # temporaries and published together only when both succeeded, so the newest
           # dump always has a same-stamp figures archive to restore beside it.
+          # The workspaces (every user's edits, notes and originals) are primary data
+          # from the chat agent on (docs/workspace.md § Backups) and ride the same stamp.
           if pg_dump --format=custom --file="/backups/sightread-$$stamp.dump.tmp" &&
-            tar -czf "/backups/figures-$$stamp.tar.gz.tmp" -C /data figures; then
+            tar -czf "/backups/figures-$$stamp.tar.gz.tmp" -C /data figures &&
+            tar -czf "/backups/workspaces-$$stamp.tar.gz.tmp" -C /data workspaces; then
             mv "/backups/sightread-$$stamp.dump.tmp" "/backups/sightread-$$stamp.dump"
             mv "/backups/figures-$$stamp.tar.gz.tmp" "/backups/figures-$$stamp.tar.gz"
-            echo "backup: wrote sightread-$$stamp.dump + figures-$$stamp.tar.gz"
+            mv "/backups/workspaces-$$stamp.tar.gz.tmp" "/backups/workspaces-$$stamp.tar.gz"
+            echo "backup: wrote sightread-$$stamp.dump + figures + workspaces $$stamp"
           else
-            rm -f "/backups/sightread-$$stamp.dump.tmp" "/backups/figures-$$stamp.tar.gz.tmp"
+            rm -f "/backups/sightread-$$stamp.dump.tmp" "/backups/figures-$$stamp.tar.gz.tmp" \
+              "/backups/workspaces-$$stamp.tar.gz.tmp"
             echo "backup: failed at $$stamp, nothing published" >&2
           fi
           # Keep the newest seven of each; anything older is deleted.
@@ -149,6 +185,10 @@ services:
             echo "backup: rotated out $$old"
           done
           ls -1t /backups/figures-*.tar.gz 2>/dev/null | tail -n +8 | while read -r old; do
+            rm -f "$$old"
+            echo "backup: rotated out $$old"
+          done
+          ls -1t /backups/workspaces-*.tar.gz 2>/dev/null | tail -n +8 | while read -r old; do
             rm -f "$$old"
             echo "backup: rotated out $$old"
           done

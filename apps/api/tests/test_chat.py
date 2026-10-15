@@ -1,0 +1,532 @@
+"""The chat agent end to end against a stubbed Messages stream (docs/chat.md): the routes,
+the turn queue, the tool loop with the editor and page tools, the event stream, usage.
+No test reaches the network or a sandbox (docs/testing.md § Cost safety)."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import shutil
+import uuid
+from pathlib import Path
+
+import httpx
+import pytest
+import respx
+from httpx import AsyncClient
+from sqlalchemy import select
+
+from sightread.db.models import ChatTurn, Document, Folder, Job, Message, Result, UsageLog
+from sightread.jobs import chat_runner, chat_tools
+from sightread.jobs.queue import claim_next_turn
+from sightread.sandbox.client import ExecResult, SandboxClient
+from sightread.workspace import documents as workspace_documents
+from sightread.workspace.layout import user_root
+from tests.conftest import CSRF_HEADERS, KANO_BASE
+from tests.test_parse_end_to_end import _connect_kano
+
+MESSAGES_URL = f"{KANO_BASE}/anthropic/v1/messages"
+MODELS_URL = f"{KANO_BASE}/openai/v1/models"
+MARKDOWN = "<!-- page: 1 -->\n\n# Title\n\n| Policy | Return |\n| --- | --- |\n| Greedy | 3450 |\n"
+
+
+def sse(*events: dict) -> bytes:
+    return "".join(
+        f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events
+    ).encode()
+
+
+def assistant_turn(blocks: list[dict], stop_reason: str, *, output_tokens: int = 10) -> bytes:
+    events: list[dict] = [
+        {
+            "type": "message_start",
+            "message": {
+                "model": "claude-opus-5-5",
+                "usage": {"input_tokens": 300, "cache_read_input_tokens": 200},
+            },
+        }
+    ]
+    for index, block in enumerate(blocks):
+        if block["type"] == "text":
+            events += [
+                {
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {"type": "text", "text": ""},
+                },
+                {
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {"type": "text_delta", "text": block["text"]},
+                },
+                {"type": "content_block_stop", "index": index},
+            ]
+        elif block["type"] == "tool_use":
+            events += [
+                {
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": block["id"],
+                        "name": block["name"],
+                        "input": {},
+                    },
+                },
+                {
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": json.dumps(block["input"]),
+                    },
+                },
+                {"type": "content_block_stop", "index": index},
+            ]
+    events += [
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason},
+            "usage": {"output_tokens": output_tokens},
+        },
+        {"type": "message_stop"},
+    ]
+    return sse(*events)
+
+
+async def _seed_document(client: AsyncClient, user_id: int) -> int:
+    """A finished parse filed in the library, with a result to materialize."""
+    async with client.app.state.sessionmaker() as db:
+        folder = Folder(user_id=user_id, parent_id=None, name="Papers")
+        db.add(folder)
+        await db.flush()
+        job = Job(
+            id=uuid.uuid4(),
+            user_id=user_id,
+            agent="parse",
+            kind="pdf",
+            filename="paper.pdf",
+            media_type="application/pdf",
+            size_bytes=10,
+            sha256="b" * 64,
+            model="claude-x",
+            bbox_format="yxyx_norm1000",
+            status="succeeded",
+            page_count=1,
+        )
+        db.add(job)
+        await db.flush()
+        db.add(Result(job_id=job.id, markdown=MARKDOWN, pages=[], figures=[], errors=[], meta={}))
+        document = Document(user_id=user_id, folder_id=folder.id, job_id=job.id, name="paper.pdf")
+        db.add(document)
+        await db.commit()
+        return document.id
+
+
+@pytest.fixture
+async def chatting(make_client, tmp_path) -> AsyncClient:
+    """Signed in, Kano Proxy connected, a model chosen for the chat agent, one document."""
+    client = make_client(workspaces_dir=str(tmp_path / "workspaces"))
+    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    user_id = (await client.get("/api/me")).json()["user"]["id"]
+    await _connect_kano(client.app.state.sessionmaker, user_id)
+    chosen = await client.put(
+        "/api/agents/chat/settings", json={"model": "claude-opus-5-5"}, headers=CSRF_HEADERS
+    )
+    assert chosen.status_code == 200, chosen.text
+    client.document_id = await _seed_document(client, user_id)
+    client.user_id = user_id
+    return client
+
+
+async def _run_queued_turn(client: AsyncClient) -> None:
+    settings = client.app.state.settings
+    async with client.app.state.sessionmaker() as db:
+        turn_id = await claim_next_turn(db, settings.max_chat_turns_per_user)
+    assert turn_id is not None
+    await chat_runner.run_turn(
+        client.app.state.sessionmaker, settings, turn_id, asyncio.Semaphore(2)
+    )
+
+
+async def test_chat_settings_refuse_connections_and_validate_effort(chatting) -> None:
+    refused = await chatting.put(
+        "/api/agents/chat/settings", json={"connection_id": 1}, headers=CSRF_HEADERS
+    )
+    assert refused.status_code == 400
+    bad = await chatting.put(
+        "/api/agents/chat/settings", json={"effort": "ultra"}, headers=CSRF_HEADERS
+    )
+    assert bad.status_code == 400
+    ok = await chatting.put(
+        "/api/agents/chat/settings", json={"effort": "high"}, headers=CSRF_HEADERS
+    )
+    assert ok.json()["effort"] == "high"
+    agents = (await chatting.get("/api/agents")).json()["agents"]
+    chat = next(agent for agent in agents if agent["name"] == "chat")
+    assert chat["settings"]["effort"] == "high"
+    assert chat["output"] == "edits"
+
+
+@respx.mock
+async def test_the_chat_catalog_lists_claude_models_only(chatting) -> None:
+    respx.get(MODELS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": [{"id": "claude-opus-5-5"}, {"id": "gpt-x"}, {"id": "anthropic/claude-3"}]
+            },
+        )
+    )
+    listed = await chatting.get("/api/agents/chat/models")
+    assert [model["id"] for model in listed.json()["data"]] == [
+        "claude-opus-5-5",
+        "anthropic/claude-3",
+    ]
+
+
+@respx.mock
+async def test_a_turn_edits_the_document_and_streams_its_events(chatting, monkeypatch) -> None:
+    document_id = chatting.document_id
+    created = await chatting.post(
+        f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+    )
+    assert created.status_code == 201, created.text
+    conversation_id = created.json()["id"]
+
+    # The model views the page, edits the table, then finishes.
+    turns = iter(
+        [
+            assistant_turn(
+                [
+                    {"type": "text", "text": "Checking the table."},
+                    {"type": "tool_use", "id": "t1", "name": "view_page", "input": {"page": 1}},
+                ],
+                "tool_use",
+            ),
+            assistant_turn(
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "t2",
+                        "name": "str_replace_based_edit_tool",
+                        "input": {
+                            "command": "str_replace",
+                            "path": "/workspace/files/Papers/paper.pdf/doc.md",
+                            "old_str": "| Greedy | 3450 |",
+                            "new_str": "| Greedy | 3.45 |",
+                        },
+                    }
+                ],
+                "tool_use",
+            ),
+            assistant_turn([{"type": "text", "text": "Done: Greedy is now 3.45."}], "end_turn"),
+        ]
+    )
+    requests: list[dict] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, content=next(turns))
+
+    respx.post(MESSAGES_URL).mock(side_effect=answer)
+
+    sent = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"text": "Fix the Greedy row", "selection": "| Greedy | 3450 |"},
+        headers=CSRF_HEADERS,
+    )
+    assert sent.status_code == 202, sent.text
+    # A second message while the first is unanswered is refused, not queued twice.
+    again = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"text": "and?"},
+        headers=CSRF_HEADERS,
+    )
+    assert again.status_code == 409
+
+    await _run_queued_turn(chatting)
+
+    # The request shape: tools in their fixed order, system cached, the guard off.
+    first = requests[0]
+    assert [tool["name"] for tool in first["tools"]] == [
+        "str_replace_based_edit_tool",
+        "view_page",
+        "view_figure",
+    ]  # no sandbox configured → no bash
+    assert first["system"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert first["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert first["thinking"] == {"type": "adaptive", "display": "updates"}
+    assert first["output_config"] == {"effort": "medium"}
+    assert first["fallbacks"] == "default"
+    assert "selected in the document" in first["messages"][0]["content"][1]["text"]
+    assert "files/Papers/paper.pdf" in first["system"][0]["text"]
+    # The second request replays the first answer and the tool result verbatim.
+    second = requests[1]
+    assert second["messages"][1]["role"] == "assistant"
+    assert second["messages"][1]["content"][1]["name"] == "view_page"
+    result = second["messages"][2]["content"][0]
+    assert result["type"] == "tool_result" and result["tool_use_id"] == "t1"
+    # No source was kept for this document, so view_page answered an error result.
+    assert result.get("is_error") is True
+
+    # The document changed on disk, as a revision.
+    content = (await chatting.get(f"/api/library/documents/{document_id}/content")).json()
+    assert "| Greedy | 3.45 |" in content["markdown"]
+    history = (await chatting.get(f"/api/library/documents/{document_id}/revisions")).json()
+    assert history["revisions"][0]["author"] == f"agent:{conversation_id}"
+
+    # The thread: user, assistant, tool results, assistant, tool results, assistant.
+    thread = (await chatting.get(f"/api/conversations/{conversation_id}")).json()
+    assert [message["role"] for message in thread["messages"]] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert thread["turns"][0]["status"] == "succeeded"
+    assert thread["conversation"]["title"] == "Fix the Greedy row"
+
+    # The event stream replays everything from 0 and ends, since no turn is running.
+    async with chatting.stream(
+        "GET", f"/api/conversations/{conversation_id}/events?after=0"
+    ) as stream:
+        body = (await stream.aread()).decode()
+    names = [line.split(": ", 1)[1] for line in body.splitlines() if line.startswith("event: ")]
+    assert names[0] == "turn_start"
+    assert names[-1] == "turn_done"
+    assert "edit" in names and "tool_use" in names and "tool_result" in names
+    edit = next(
+        json.loads(line[len("data: ") :])
+        for line in body.splitlines()
+        if line.startswith("data: ") and '"diff"' in line
+    )
+    assert "-| Greedy | 3450 |" in edit["diff"] and "+| Greedy | 3.45 |" in edit["diff"]
+
+    # Usage: three calls billed to the chat agent with their cache reads.
+    async with chatting.app.state.sessionmaker() as db:
+        rows = (await db.execute(select(UsageLog).where(UsageLog.agent == "chat"))).scalars().all()
+    assert len(rows) == 3
+    assert all(row.turn_id is not None and row.cache_read_tokens == 200 for row in rows)
+    usage = (await chatting.get("/api/usage")).json()
+    assert usage["per_agent"][0]["agent"] == "chat"
+    assert usage["per_day"][0]["agents"] == ["chat"]
+    per_conversation = (await chatting.get("/api/usage/conversations")).json()["conversations"]
+    assert per_conversation[0]["turns"] == 1 and per_conversation[0]["cache_read_tokens"] == 600
+
+    # Revert the agent's edit from the thread.
+    reverted = await chatting.post(
+        f"/api/library/documents/{document_id}/revisions/{history['revisions'][0]['commit']}/revert",
+        headers=CSRF_HEADERS,
+    )
+    assert reverted.status_code == 200
+    content = (await chatting.get(f"/api/library/documents/{document_id}/content")).json()
+    assert "| Greedy | 3450 |" in content["markdown"]
+
+
+@respx.mock
+async def test_a_refusal_fails_the_turn_and_a_cancel_stops_it(chatting) -> None:
+    document_id = chatting.document_id
+    conversation_id = (
+        await chatting.post(
+            f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    respx.post(MESSAGES_URL).mock(
+        return_value=httpx.Response(200, content=assistant_turn([], "refusal"))
+    )
+    await chatting.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
+    )
+    await _run_queued_turn(chatting)
+    thread = (await chatting.get(f"/api/conversations/{conversation_id}")).json()
+    assert thread["turns"][-1]["status"] == "failed"
+    assert "declined" in thread["turns"][-1]["error"]
+
+    await chatting.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"text": "again"},
+        headers=CSRF_HEADERS,
+    )
+    cancelled = await chatting.post(
+        f"/api/conversations/{conversation_id}/cancel", headers=CSRF_HEADERS
+    )
+    assert cancelled.status_code == 204
+    async with chatting.app.state.sessionmaker() as db:
+        statuses = (
+            (
+                await db.execute(
+                    select(ChatTurn.status).where(ChatTurn.conversation_id == conversation_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert "cancelled" in statuses
+
+
+async def test_messages_need_a_model_and_a_connected_kano_proxy(make_client, tmp_path) -> None:
+    client = make_client(workspaces_dir=str(tmp_path / "ws"))
+    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    user_id = (await client.get("/api/me")).json()["user"]["id"]
+    document_id = await _seed_document(client, user_id)
+    conversation_id = (
+        await client.post(
+            f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    no_model = await client.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
+    )
+    assert no_model.status_code == 400
+    assert "No model chosen" in no_model.json()["error"]["message"]
+
+
+async def test_the_editor_tool_stays_inside_the_workspace(tmp_path) -> None:
+    root = tmp_path / "ws" / "1"
+    (root / "files" / "d").mkdir(parents=True)
+    (root / "files" / "d" / "doc.md").write_text("alpha\nbeta\n")
+    (root / "files" / "d" / ".meta.json").write_text("{}")
+    outside = tmp_path / "secret.txt"
+    outside.write_text("no")
+
+    escape = await chat_tools.run_editor(
+        root, {"command": "view", "path": "/workspace/../secret.txt"}, "agent:1", max_chars=1000
+    )
+    assert escape.is_error
+    absolute = await chat_tools.run_editor(
+        root, {"command": "view", "path": str(outside)}, "agent:1", max_chars=1000
+    )
+    assert absolute.is_error
+    meta = await chat_tools.run_editor(
+        root,
+        {"command": "str_replace", "path": "files/d/.meta.json", "old_str": "{}", "new_str": "x"},
+        "agent:1",
+        max_chars=1000,
+    )
+    assert meta.is_error and "read-only" in meta.content
+
+    twice = await chat_tools.run_editor(
+        root,
+        {
+            "command": "str_replace",
+            "path": "/workspace/files/d/doc.md",
+            "old_str": "a",
+            "new_str": "A",
+        },
+        "agent:1",
+        max_chars=1000,
+    )
+    assert twice.is_error and "times" in twice.content
+    inserted = await chat_tools.run_editor(
+        root,
+        {
+            "command": "insert",
+            "path": "/workspace/files/d/doc.md",
+            "insert_line": 1,
+            "insert_text": "gamma",
+        },
+        "agent:1",
+        max_chars=1000,
+    )
+    assert not inserted.is_error
+    assert (root / "files" / "d" / "doc.md").read_text() == "alpha\ngamma\nbeta\n"
+    assert inserted.edit is not None and inserted.edit["commit"]
+    listing = await chat_tools.run_editor(
+        root, {"command": "view", "path": "/workspace/files"}, "agent:1", max_chars=1000
+    )
+    assert listing.content == "d/"
+
+
+async def test_the_bash_tool_goes_through_the_runner_and_truncates(monkeypatch) -> None:
+    calls: list[tuple] = []
+
+    async def fake_exec(self, user_id, session, command, *, timeout_seconds):
+        calls.append((user_id, session, command))
+        return ExecResult(output="x" * 5000, exit_code=1, timed_out=False, truncated=False)
+
+    monkeypatch.setattr(SandboxClient, "exec", fake_exec)
+    from sightread.config import Settings
+
+    client = SandboxClient(
+        Settings(app_env="local", sandbox_url="http://sandbox:8100", sandbox_token="t")
+    )
+    outcome = await chat_tools.run_bash(client, 7, "sess", {"command": "ls"}, max_chars=400)
+    assert calls == [(7, "sess", "ls")]
+    assert "characters omitted" in outcome.content
+    assert outcome.content.endswith("[exit code 1]")
+    assert not outcome.is_error
+
+
+def test_truncate_keeps_head_and_tail() -> None:
+    text = "".join(f"line {index}\n" for index in range(200))
+    cut = chat_tools.truncate(text, 300)
+    assert cut.startswith("line 0\n") and cut.rstrip().endswith("line 199")
+    assert "omitted" in cut
+
+
+async def test_a_finished_library_parse_keeps_its_source(chatting, tmp_path) -> None:
+    """The retention exception (docs/jobs.md): the upload moves into the document dir."""
+    settings = chatting.app.state.settings
+    sessionmaker = chatting.app.state.sessionmaker
+    async with sessionmaker() as db:
+        document = await db.get(Document, chatting.document_id)
+        job = await db.get(Job, document.job_id)
+        upload = Path(settings.upload_dir) / f"{job.id}.pdf"
+        upload.parent.mkdir(parents=True, exist_ok=True)
+        upload.write_bytes(b"%PDF-1.4 test")
+        job.source_path = str(upload)
+        job.status = "running"
+        await db.commit()
+        job_id = job.id
+    from sightread.jobs import runner
+
+    await runner._finish(sessionmaker, job_id, status="succeeded", settings=settings)
+    kept = (
+        user_root(settings.workspaces_dir, chatting.user_id)
+        / "files"
+        / "Papers"
+        / "paper.pdf"
+        / "source.pdf"
+    )
+    assert kept.read_bytes() == b"%PDF-1.4 test"
+    assert not upload.exists()
+    async with sessionmaker() as db:
+        content = await workspace_documents.read_content(
+            db, settings, await db.get(Document, chatting.document_id)
+        )
+    assert content.has_source
+    async with sessionmaker() as db:
+        assert (await db.execute(select(Message))).scalars().all() == []
+
+
+async def test_view_page_and_view_figure_read_the_documents_own_files(tmp_path, documents) -> None:
+    from PIL import Image
+
+    from sightread.workspace.documents import DocumentPaths
+
+    root = tmp_path / "ws" / "1"
+    paths = DocumentPaths(root=root, relative=Path("files/paper"))
+    paths.directory.mkdir(parents=True)
+    shutil.copy(documents["text_pdf"], paths.directory / "source.pdf")
+    paths.figures.mkdir()
+    Image.new("RGB", (40, 30), "white").save(paths.figures / "p1_100_100_400_600.png")
+
+    page = await chat_tools.view_page(
+        paths, {"page": 1}, page_count=3, render_slots=asyncio.Semaphore(1)
+    )
+    assert not page.is_error
+    assert page.content[0]["type"] == "image"
+    assert page.content[0]["source"]["media_type"] == "image/png"
+    assert page.content[1]["text"] == "Page 1."
+    too_far = await chat_tools.view_page(
+        paths, {"page": 9}, page_count=3, render_slots=asyncio.Semaphore(1)
+    )
+    assert too_far.is_error
+
+    figure = await chat_tools.view_figure(paths, {"page": 1, "bbox": [100, 100, 400, 600]})
+    assert not figure.is_error and figure.content[0]["type"] == "image"
+    missing = await chat_tools.view_figure(paths, {"page": 2, "bbox": [0, 0, 10, 10]})
+    assert missing.is_error

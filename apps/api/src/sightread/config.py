@@ -67,6 +67,23 @@ class Settings(BaseSettings):
     upload_ticket_ttl_seconds: int = 3600
     upload_ticket_rate_per_hour: int = 30
 
+    # Per-user workspaces: every user's files and revisions, bind-mounted at the same path
+    # into api, worker and the sandbox runner (docs/workspace.md).
+    workspaces_dir: str = "/data/workspaces"
+    workspace_quota_bytes: int = 10_737_418_240
+
+    # The chat agent's limits (docs/chat.md).
+    max_chat_turns_per_user: int = 4
+    chat_max_output_tokens: int = 64_000
+    chat_max_tool_calls_per_turn: int = 50
+    chat_turn_timeout_seconds: int = 900
+    chat_tool_result_max_chars: int = 20_000
+
+    # The sandbox runner (docs/sandbox.md). Empty URL = no sandbox: the chat agent runs
+    # without its bash tool. The token is what api and worker present to the runner.
+    sandbox_url: str = ""
+    sandbox_token: str = ""
+
     domain: str = ""
     acme_email: str = ""
 
@@ -100,6 +117,15 @@ class Settings(BaseSettings):
     def kano_proxy_api_base(self) -> str:
         """The OpenAI-compatible base vision calls and the model catalog use."""
         return f"{self.kano_proxy_base_url}/openai/v1"
+
+    @property
+    def kano_proxy_anthropic_base(self) -> str:
+        """The Anthropic-format base the chat agent calls (docs/chat.md § Upstream)."""
+        return f"{self.kano_proxy_base_url}/anthropic/v1"
+
+    @property
+    def sandbox_configured(self) -> bool:
+        return bool(self.sandbox_url and self.sandbox_token)
 
     @property
     def kano_redirect_uri(self) -> str:

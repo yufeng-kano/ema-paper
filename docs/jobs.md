@@ -48,9 +48,13 @@ The built-in upstream snapshots `KANO_PROXY_BASE_URL` as its `connection_base_ur
 
 ## Retention — two layers, sweeper is the guarantee
 
-1. **Immediate:** source file (and rendered page images) deleted the moment a job reaches `succeeded`/`failed` — figure crops are taken from the rendered page *before* it is deleted ([parsing.md](./parsing.md) § Figure crops). After that, reparsing requires re-upload — accepted trade-off, documented here on purpose.
+1. **Immediate:** source file (and rendered page images) deleted the moment a job reaches `succeeded`/`failed` — figure crops are taken from the rendered page *before* it is deleted ([parsing.md](./parsing.md) § Figure crops). After that, reparsing requires re-upload — accepted trade-off, documented here on purpose. **Exception: a library document keeps its original.** When the finished job is the parse behind a `documents` row, the worker moves the source into that document's workspace directory as `source.<ext>` instead of deleting it, so the chat agent can re-render a page ([workspace.md](./workspace.md)); `source_deleted_at` is still set, since the upload directory no longer holds it.
 2. **Sweeper:** periodic task inside the worker (every 15 min) trashes anything under the upload dir older than 24 h — catches crashed jobs, abandoned uploads, bugs. The sweeper is the guarantee; immediate deletion is an optimization. `FIGURES_DIR` is outside the upload dir precisely so the sweeper cannot eat stored crops.
 
 Crops live exactly as long as something references them: a job that ends `failed` has its crop directory removed with the result it never wrote, and a shutdown requeue removes it with the rest of the partial progress — the reparse writes fresh crops, so nothing stale from the first attempt can answer a figure route.
 
-Results (markdown + metadata in PG) and figure crops (`FIGURES_DIR`) are kept **indefinitely** for now (low traffic); revisit when storage says otherwise. Usage rows are permanent — they are the billing history.
+Results (markdown + metadata in PG) and figure crops (`FIGURES_DIR`) are kept **indefinitely** for now (low traffic); revisit when storage says otherwise. Usage rows are permanent — they are the billing history. Workspaces are never swept ([workspace.md](./workspace.md)).
+
+## Chat turns
+
+The `chat` agent has its own queue, `chat_turns` ([chat.md](./chat.md)): one row per user message, claimed by the same worker loop with the same `FOR UPDATE SKIP LOCKED` query shape and a per-user cap of `MAX_CHAT_TURNS_PER_USER` running turns. The worker alternates between the two queues — a parse never starves a conversation and the reverse — and runs one claimed item at a time per process, exactly as for jobs; a turn interrupted by shutdown is marked `failed` with `worker stopped`, never requeued: its tool calls may have run, and replaying them is not safe. The sweeper does not touch turns.

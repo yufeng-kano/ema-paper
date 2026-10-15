@@ -18,6 +18,7 @@ dist/
 
 # data / artifacts
 uploads/
+workspaces/
 backups/
 *.dump
 .DS_Store

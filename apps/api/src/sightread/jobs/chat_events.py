@@ -1,0 +1,147 @@
+"""The conversation's event stream (docs/chat.md § Conversations, turns, events).
+
+The worker appends `chat_events` rows while a turn runs; the SSE route replays what a
+client missed and tails what comes next. Same shape as `events.py`: the database is the
+truth, `NOTIFY` only wakes a stream up, and a stream that never hears one still progresses
+by polling.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from collections.abc import AsyncIterator
+
+import asyncpg
+from sqlalchemy import func, select, text
+from sqlalchemy.engine import make_url
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from ..db.models import ChatEvent, ChatTurn
+
+logger = logging.getLogger(__name__)
+
+KEEPALIVE_SECONDS = 10.0
+POLL_INTERVAL_SECONDS = 1.0
+
+TURN_START = "turn_start"
+TEXT_DELTA = "text_delta"
+THINKING = "thinking"
+TOOL_USE = "tool_use"
+TOOL_RESULT = "tool_result"
+EDIT = "edit"
+TURN_DONE = "turn_done"
+TURN_ERROR = "turn_error"
+
+
+def channel_for(conversation_id: int) -> str:
+    return f"sr_conv_{conversation_id}"
+
+
+def sse(event: str, seq: int, data: dict) -> str:
+    return f"id: {seq}\nevent: {event}\ndata: {json.dumps(data, default=str)}\n\n"
+
+
+async def emit(db: AsyncSession, conversation_id: int, turn_id, event: str, data: dict) -> int:
+    """Append one event and wake the streams. The turn is the only writer of its
+    conversation, so `max(seq) + 1` cannot race itself. Commits."""
+    last = (
+        await db.execute(
+            select(func.max(ChatEvent.seq)).where(ChatEvent.conversation_id == conversation_id)
+        )
+    ).scalar_one()
+    seq = int(last or 0) + 1
+    db.add(
+        ChatEvent(conversation_id=conversation_id, turn_id=turn_id, seq=seq, event=event, data=data)
+    )
+    if db.get_bind().dialect.name == "postgresql":
+        await db.execute(
+            text("SELECT pg_notify(:channel, '')"), {"channel": channel_for(conversation_id)}
+        )
+    await db.commit()
+    return seq
+
+
+async def _open_listener(database_url: str, conversation_id: int, wakeup: asyncio.Event):
+    url = make_url(database_url)
+    if url.get_backend_name() != "postgresql":
+        return None
+    try:
+        connection = await asyncpg.connect(
+            url.set(drivername="postgresql").render_as_string(hide_password=False)
+        )
+        await connection.add_listener(channel_for(conversation_id), lambda *_: wakeup.set())
+    except (OSError, asyncpg.PostgresError):
+        logger.warning("conversation event listener unavailable; falling back to polling")
+        return None
+    return connection
+
+
+async def _events_after(
+    sessionmaker: async_sessionmaker[AsyncSession], conversation_id: int, after: int
+) -> list[ChatEvent]:
+    async with sessionmaker() as db:
+        rows = (
+            await db.execute(
+                select(ChatEvent)
+                .where(ChatEvent.conversation_id == conversation_id, ChatEvent.seq > after)
+                .order_by(ChatEvent.seq)
+            )
+        ).scalars()
+        return list(rows)
+
+
+async def _turn_running(
+    sessionmaker: async_sessionmaker[AsyncSession], conversation_id: int
+) -> bool:
+    async with sessionmaker() as db:
+        count = (
+            await db.execute(
+                select(func.count())
+                .select_from(ChatTurn)
+                .where(
+                    ChatTurn.conversation_id == conversation_id,
+                    ChatTurn.status.in_(("queued", "running")),
+                )
+            )
+        ).scalar_one()
+        return int(count) > 0
+
+
+async def stream_conversation_events(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    database_url: str,
+    conversation_id: int,
+    after: int,
+) -> AsyncIterator[str]:
+    """Replay everything after `after`, then tail. Ends once no turn is queued or running
+    and the replay is complete — the client reopens the stream when it sends again."""
+    wakeup = asyncio.Event()
+    listener = await _open_listener(database_url, conversation_id, wakeup)
+    cursor = after
+    silent_for = 0.0
+    try:
+        while True:
+            for row in await _events_after(sessionmaker, conversation_id, cursor):
+                cursor = row.seq
+                silent_for = 0.0
+                yield sse(row.event, row.seq, row.data)
+            if not await _turn_running(sessionmaker, conversation_id):
+                # One more read: a turn can finish between the replay and this check.
+                for row in await _events_after(sessionmaker, conversation_id, cursor):
+                    cursor = row.seq
+                    yield sse(row.event, row.seq, row.data)
+                return
+            wakeup.clear()
+            try:
+                await asyncio.wait_for(wakeup.wait(), timeout=POLL_INTERVAL_SECONDS)
+                silent_for = 0.0
+            except TimeoutError:
+                silent_for += POLL_INTERVAL_SECONDS
+                if silent_for >= KEEPALIVE_SECONDS:
+                    silent_for = 0.0
+                    yield ": keepalive\n\n"
+    finally:
+        if listener is not None:
+            await listener.close()

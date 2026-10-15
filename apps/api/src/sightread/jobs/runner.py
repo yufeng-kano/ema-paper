@@ -27,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from ..agents import get_agent
 from ..agents.bbox import convention_for_job, prepare_image
 from ..config import Settings
-from ..db.models import Job, JobPage, Result, UsageLog, utcnow
+from ..db.models import Document, Job, JobPage, Result, UsageLog, utcnow
 from ..parsing import poppler
 from ..parsing.figures import discard_job_figures, save_page_figures
 from ..parsing.images import ImageError, normalize_image
@@ -43,6 +43,9 @@ from ..upstream.client import (
     load_connection,
     transcribe_page,
 )
+from ..workspace.documents import folder_names, keep_source, materialize_document
+from ..workspace.layout import document_relative_dir, user_root
+from ..workspace.locks import workspace_lock
 from . import events
 from .queue import parse_pages_spec
 
@@ -160,9 +163,7 @@ def partial_result_payload(job: Job, rows: list[JobPage]) -> dict:
     )
     return {
         "markdown": document.markdown,
-        "pages": [
-            {"page": row.page_no, "method": row.method, "error": row.error} for row in rows
-        ],
+        "pages": [{"page": row.page_no, "method": row.method, "error": row.error} for row in rows],
         "figures": document.figures,
         "errors": [{"page": row.page_no, "reason": row.error} for row in rows if row.error],
         "meta": {
@@ -436,11 +437,14 @@ async def _finish(
     status: str,
     error: str | None = None,
     result: dict | None = None,
+    settings: Settings | None = None,
 ) -> None:
     """Write the terminal state and delete the source document (docs/jobs.md § Retention).
 
-    A failed job's crop directory goes too — `run_job`'s outermost finally discards it
-    (through the crop guard), so a late crop thread cannot write it back.
+    A succeeded parse behind a library document keeps its original instead: the source
+    moves into the document's workspace directory (docs/workspace.md). A failed job's crop
+    directory goes too — `run_job`'s outermost finally discards it (through the crop
+    guard), so a late crop thread cannot write it back.
     """
     async with sessionmaker() as db:
         job = await db.get(Job, job_id)
@@ -460,11 +464,38 @@ async def _finish(
         job.status = status
         job.error = error
         job.finished_at = utcnow()
+        documents: list[Document] = []
+        if settings is not None and status == "succeeded":
+            documents = list(
+                (
+                    await db.execute(
+                        select(Document).where(Document.job_id == job.id).order_by(Document.id)
+                    )
+                ).scalars()
+            )
         if job.source_path:
-            Path(job.source_path).unlink(missing_ok=True)
+            source = Path(job.source_path)
+            if documents and source.is_file():
+                first = documents[0]
+                root = user_root(settings.workspaces_dir, first.user_id)
+                relative = document_relative_dir(
+                    await folder_names(db, first.user_id, first.folder_id), first.name
+                )
+                async with workspace_lock(root):
+                    await asyncio.to_thread(keep_source, root, relative, source)
+            else:
+                source.unlink(missing_ok=True)
             job.source_deleted_at = utcnow()
         await events.notify(db, job.id)
         await db.commit()
+    if settings is not None and documents:
+        # The result is committed: the document directories can take their copies now.
+        async with sessionmaker() as db:
+            for document in documents:
+                try:
+                    await materialize_document(db, settings, document)
+                except Exception:  # noqa: BLE001 - the parse succeeded; the copy can wait
+                    logger.exception("could not materialize document %d", document.id)
 
 
 async def run_job(
@@ -520,9 +551,7 @@ async def run_job(
             await _finish(sessionmaker, job_id, status="failed", error=str(exc))
             return
         except (poppler.PopplerError, ImageError, ValueError):
-            await _finish(
-                sessionmaker, job_id, status="failed", error="the document is unreadable"
-            )
+            await _finish(sessionmaker, job_id, status="failed", error="the document is unreadable")
             return
         except Exception:
             # A worker must not die on one job. The traceback goes to the log; the job row
@@ -557,9 +586,7 @@ async def run_job(
         if document.dropped_figures:
             # A count only: how badly the chosen model follows the coordinate contract is
             # worth knowing, what it said about the document is not.
-            logger.info(
-                "job %s dropped %d unusable figure boxes", job_id, document.dropped_figures
-            )
+            logger.info("job %s dropped %d unusable figure boxes", job_id, document.dropped_figures)
         # Set before the commit below, deliberately: a SIGTERM can land after PostgreSQL
         # has durably committed the result but before this coroutine resumes, and a
         # committed result must keep its crops. The trade is the right way round — if the
@@ -570,6 +597,7 @@ async def run_job(
             sessionmaker,
             job_id,
             status="succeeded",
+            settings=settings,
             result={
                 "markdown": document.markdown,
                 "pages": [

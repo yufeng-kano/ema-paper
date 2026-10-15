@@ -20,16 +20,17 @@ one server, one instance of each service.
 
 ### `docker-compose.yaml` — local
 
-- Services: `pg`, `api`, `worker`, `web`, `caddy` (plain HTTP on `8080` via `deploy/caddy/Caddyfile.local`, mirroring the production routing so the built web image reaches the API on one origin). Direct ports stay exposed too: web `3000`, api `8000`, pg `${PG_PORT:-5432}` (all localhost only). **Use http://localhost:8080 for the full experience.**
+- Services: `pg`, `api`, `worker`, `web`, `caddy` (plain HTTP on `8080` via `deploy/caddy/Caddyfile.local`, mirroring the production routing so the built web image reaches the API on one origin), and `sandbox` — the runner that owns the Docker socket and starts the per-user VMs ([sandbox.md](./sandbox.md)). Locally `SANDBOX_RUNTIME=runc` works without KVM and gives no VM isolation; production refuses it. Direct ports stay exposed too: web `3000`, api `8000`, pg `${PG_PORT:-5432}` (all localhost only). **Use http://localhost:8080 for the full experience.**
 - `env_file: .env` (copy from `.env.example`); `APP_ENV=local`, `AUTH_DEV_MODE=true` works here so the stack is demoable without Google credentials. Set `APP_URL`/`WEB_URL` to `http://localhost:8080` so OAuth discovery documents point at the joined origin.
-- Volumes: `pgdata`, `uploads` (shared by api + worker).
+- Volumes: `pgdata`, `uploads` (shared by api + worker), `figures`, and the bind mount `${WORKSPACES_DIR}` (shared by api, worker and sandbox — a bind mount rather than a named volume because the runner passes the same host path to `docker run`).
 - Day-to-day dev still runs `uv run uvicorn` / `pnpm dev` natively for hot reload; the compose file is for integration runs.
 
 ### `docker-compose.production.yaml` — used as `docker compose -f docker-compose.production.yaml up -d`
 
 - Adds `caddy` (ports 80/443, automatic TLS via ACME); `api`/`web` not published on the host, reachable only on the compose network.
 - `APP_ENV=production` (dev login hard-disabled), `AUTH_DEV_MODE` absent.
-- Volumes: `pgdata`, `uploads`, `figures` (stored figure crops — durable result data, [parsing.md](./parsing.md) § Figure crops), `caddy_data` (certs), `caddy_config`.
+- Volumes: `pgdata`, `uploads`, `figures` (stored figure crops — durable result data, [parsing.md](./parsing.md) § Figure crops), `caddy_data` (certs), `caddy_config`, and the `${WORKSPACES_DIR}` bind mount (every user's files and revisions — primary data, [workspace.md](./workspace.md)).
+- The `sandbox` service needs `/var/run/docker.sock` and a host with `/dev/kvm` and the Kata runtime installed and registered with Docker as `kata` ([sandbox.md](./sandbox.md) § Operations). Build the sandbox image once (`docker build -t sightread-sandbox deploy/sandbox-image`) and name it in `SANDBOX_IMAGE`.
 - Backups: a `backup` service (the `postgres:16` image) loops once a day into `./backups` (mounted, gitignored), keeping the newest seven of each: `pg_dump --format=custom` for the database, and a `tar.gz` of the `figures` volume (mounted read-only) — a restored database with the crops gone would keep every figure's metadata while losing its image, and the sources that produced them are long deleted. The two are **published as a same-stamp pair, or not at all**: both are written as temporaries and moved into place only when both succeeded, so the newest dump always has its matching figures archive. The schedule and the rotation are a visible shell loop in the compose file on purpose. Restore is `pg_restore -d sightread <dump>` plus untarring the same-stamp figures archive back into the volume (`tar -xzf figures-<stamp>.tar.gz -C /data` inside a container mounting it); test both before launch. Leaving managed platforms means backups are ours now.
 - `POSTGRES_PASSWORD` has no default here: the stack refuses to start without one. Migrations run from the `api` container's start command (`alembic upgrade head`), and the worker gates on the api's **healthcheck** (`/healthz`), not merely on its container starting — healthy means migrations finished and the server is up, so a worker can never claim a queued job against a half-migrated schema, bill the user's key, and then fail on a missing column.
 
@@ -91,6 +92,11 @@ Certificates are always this stack's own: the site block carries an explicit `tl
 | `AUTH_DEV_MODE` | local only; absent from `.env.production.example` |
 | `UPLOAD_MAX_BYTES`, `PAGE_CAP`, `MAX_JOBS_PER_USER`, `VISION_CONCURRENCY_PER_JOB`, `RENDER_WORKERS` | defaults in [api.md](./api.md) / [jobs.md](./jobs.md) |
 | `UPLOAD_DIR` | `/data/uploads` in containers |
+| `WORKSPACES_HOST_DIR` / `WORKSPACES_DIR` | the per-user workspaces: the host directory compose bind-mounts, and where the containers see it (`/data/workspaces`). The runner is given the host path (`SANDBOX_WORKSPACES_DIR`) because it hands it to `docker run` ([workspace.md](./workspace.md), [sandbox.md](./sandbox.md)) |
+| `WORKSPACE_QUOTA_BYTES` | per-user workspace size the UI shows and the API refuses past (default 10 GiB) |
+| `SANDBOX_URL` / `SANDBOX_TOKEN` | the runner's address on the compose network and the shared token api and worker present to it; empty `SANDBOX_URL` = no sandbox, the chat agent runs without `bash` |
+| `SANDBOX_RUNTIME`, `SANDBOX_IMAGE`, `SANDBOX_NETWORK`, `SANDBOX_INDEX_URL`, `SANDBOX_CPUS`, `SANDBOX_MEMORY`, `SANDBOX_PIDS`, `SANDBOX_IDLE_SECONDS`, `SANDBOX_OUTPUT_MAX_BYTES` | the runner's own settings ([sandbox.md](./sandbox.md)) |
+| `MAX_CHAT_TURNS_PER_USER`, `CHAT_MAX_OUTPUT_TOKENS`, `CHAT_MAX_TOOL_CALLS_PER_TURN`, `CHAT_TURN_TIMEOUT_SECONDS`, `CHAT_TOOL_RESULT_MAX_CHARS` | the chat agent's limits ([chat.md](./chat.md)) |
 | `PG_PORT` | local compose only: host port for `pg` (default 5432); change it when that port is taken |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | the `pg` container's credentials; the password is required in production |
 | `DOMAIN` / `ACME_EMAIL` | production only: the host Caddy serves, and the Let's Encrypt contact address |
