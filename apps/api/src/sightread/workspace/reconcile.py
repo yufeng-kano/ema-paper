@@ -122,16 +122,38 @@ def _canonicalize_and_scan(root: Path) -> list[Found]:
     return _scan(root)
 
 
+class NestedInDocument(Exception):
+    """The path runs through a document's directory: no folder row may share it."""
+
+
 async def _folder_for(
     db: AsyncSession, user_id: int, segments: tuple[str, ...], cache: dict
 ) -> int | None:
-    """The folder row at this path, created when the shell made the directory."""
+    """The folder row at this path, created when the shell made the directory — unless
+    a segment is a document's: a folder under a document's name would share its
+    directory (docs/workspace.md § The tree is the truth)."""
     parent: int | None = None
     for segment in segments:
         key = (parent, segment)
         if key in cache:
             parent = cache[key]
             continue
+        taken = (
+            (
+                await db.execute(
+                    select(Document.name).where(
+                        Document.user_id == user_id,
+                        Document.folder_id.is_(None)
+                        if parent is None
+                        else Document.folder_id == parent,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if any(path_segment(name) == segment for name in taken):
+            raise NestedInDocument(segment)
         rows = (
             (
                 await db.execute(
@@ -194,7 +216,17 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
                 seen[entry.document_id],
             )
             continue
-        folder_id = await _folder_for(db, user_id, entry.folder_segments, cache)
+        try:
+            folder_id = await _folder_for(db, user_id, entry.folder_segments, cache)
+        except NestedInDocument as nested:
+            logger.warning(
+                "reconcile for user %d: document %d sits under document directory %s; "
+                "row unchanged",
+                user_id,
+                entry.document_id,
+                nested,
+            )
+            continue
         # The row's name when the segment is still its encoding; otherwise the name the
         # (now canonical) segment decodes to — what the shell typed.
         name = row.name if path_segment(row.name) == entry.name else segment_name(entry.name)

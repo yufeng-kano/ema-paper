@@ -212,13 +212,15 @@ def _materialize_files(
     original = results_root(paths.root) / str(job.id) / "result.md"
     _write_if_missing(paths.root, original, result.markdown)  # excluded from history
     crops = figures_dir / str(job.id)
-    if crops.is_dir() and safe_io.entry_kind(paths.root, paths.figures) == "none":
+    if crops.is_dir():
         # The crops directory is the service's own; the document directory is shared with
         # the shell, so each crop lands through a descriptor like every workspace file.
+        # Each missing one, every time: a copy that failed halfway is finished later.
         for crop in crops.iterdir():
-            if crop.is_file():
+            target = paths.figures / crop.name
+            if crop.is_file() and safe_io.entry_kind(paths.root, target) == "none":
                 with crop.open("rb") as reader:
-                    safe_io.write_from(paths.root, paths.figures / crop.name, reader)
+                    safe_io.write_from(paths.root, target, reader)
     return changed
 
 
@@ -488,6 +490,10 @@ def _revert(paths: DocumentPaths, commit: str, max_bytes: int) -> str:
         if status == "R" and renamed_to is not None:
             current = moved.get(renamed_to, renamed_to)
             if safe_io.entry_kind(root, root / current) != "none":
+                if safe_io.entry_kind(root, root / then) != "none":
+                    # Something sits at the old place now; a revert never writes over
+                    # what is there (docs/workspace.md § Revisions).
+                    raise ApiError(409, "invalid_request", "That revision's old path is in use now")
                 moves.append((current, then))
             continue
         if status == "A":

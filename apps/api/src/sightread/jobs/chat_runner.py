@@ -582,6 +582,7 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
     the tools that write the tree run one after another, because each commits whatever is
     dirty and two in flight would file one's changes under the other (docs/chat.md § Tools)."""
     results: dict[int, dict] = {}
+    stopped = asyncio.Event()
 
     async def reads() -> None:
         # A few at a time, against one image budget for the round: fifty page renders at
@@ -594,9 +595,12 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
             nonlocal spent
             async with slots:
                 # A round of reads has no write to notice the Stop: each read looks for
-                # it before it starts, so at most the few in flight finish.
-                if await _cancelled(ctx):
-                    raise TurnCancelled()
+                # it before it starts, so at most the few in flight finish. Noted, not
+                # raised: raising here would cancel a shell command or editor write
+                # still running, which must finish and commit (docs/chat.md § Tools).
+                if stopped.is_set() or await _cancelled(ctx):
+                    stopped.set()
+                    return
                 if spent >= budget:
                     outcome = chat_tools.ToolOutcome(IMAGE_BUDGET_SPENT, is_error=True)
                     results[index] = await _report_tool(
@@ -634,6 +638,8 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
             group.create_task(writes())
     except* TurnCancelled:
         raise TurnCancelled() from None
+    if stopped.is_set():
+        raise TurnCancelled()
     return [results[index] for index in range(len(tool_uses))]
 
 

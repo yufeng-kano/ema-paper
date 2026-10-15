@@ -1106,6 +1106,35 @@ async def test_a_file_with_a_live_conversation_cannot_be_renamed(chatting) -> No
         f"/api/library/documents/{document_id}", json={"name": "other.pdf"}, headers=CSRF_HEADERS
     )
     assert refused.status_code == 409
+    # Nor reverted: a shell revision may have moved it, and the turn holds its path.
+    refused = await chatting.post(
+        f"/api/library/documents/{document_id}/revisions/abcdef1/revert", headers=CSRF_HEADERS
+    )
+    assert refused.status_code == 409
+
+
+async def test_a_stop_seen_by_the_reads_lets_the_running_write_finish(monkeypatch) -> None:
+    finished: list[str] = []
+
+    async def fake_run_tool(ctx, block, malformed):
+        if block["name"] == "bash":
+            await asyncio.sleep(0.05)  # the shell command is still running
+        finished.append(block["id"])
+        return {"type": "tool_result", "tool_use_id": block["id"], "content": "ok"}
+
+    async def cancelled(ctx):
+        return True
+
+    monkeypatch.setattr(chat_runner, "_run_tool", fake_run_tool)
+    monkeypatch.setattr(chat_runner, "_cancelled", cancelled)
+    tool_uses = [{"type": "tool_use", "id": "w", "name": "bash", "input": {}}] + [
+        {"type": "tool_use", "id": str(index), "name": "view_page", "input": {}}
+        for index in range(8)
+    ]
+    with pytest.raises(chat_runner.TurnCancelled):
+        await chat_runner._run_tools(_round_ctx(), tool_uses, set())
+    # The reads saw the Stop and ended quietly; the command in flight was not cancelled.
+    assert finished == ["w"]
 
 
 async def test_a_stop_during_backoff_and_a_running_read_are_both_cut(monkeypatch) -> None:

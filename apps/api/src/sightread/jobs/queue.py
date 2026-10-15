@@ -14,7 +14,7 @@ from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..agents import get_agent
-from ..db.models import ChatTurn, Job, JobPage, utcnow
+from ..db.models import ChatTurn, Conversation, Job, JobPage, utcnow
 from . import chat_events
 
 # PostgreSQL claim (docs/jobs.md). The correlated count applies the per-user running cap
@@ -364,7 +364,16 @@ async def fail_turn(db: AsyncSession, turn_id: uuid.UUID, error: str) -> None:
     A turn the user had cancelled keeps `cancelled`; either way it is finished now, with
     the terminal event a stream waits for (docs/jobs.md § Chat turns)."""
     turn = await db.get(ChatTurn, turn_id)
-    if turn is None or turn.finished_at is not None:
+    if turn is None:
+        return
+    # The conversation's lock before the turn is touched, the order the cancel route
+    # takes (docs/chat.md § Conversations): no deadlock, and a cancel just committed
+    # is seen on the refresh.
+    await db.execute(
+        select(Conversation.id).where(Conversation.id == turn.conversation_id).with_for_update()
+    )
+    await db.refresh(turn)
+    if turn.finished_at is not None:
         return
     if turn.status == "cancelled":
         turn.error = "cancelled"

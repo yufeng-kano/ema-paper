@@ -850,7 +850,7 @@ async function stop() {
               v-if="item.card.commit"
               type="button"
               class="text-link"
-              :disabled="cardState(item.card).pending"
+              :disabled="cardState(item.card).pending || running"
               @click="toggleEdit(item.card)"
             >
               {{ cardState(item.card).reverted ? t('chat.applyAgain') : t('chat.revert') }}

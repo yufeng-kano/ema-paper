@@ -258,6 +258,8 @@ async def stream_messages(
                     yield StreamEvent("block_start", index, block=block)
                 elif kind == "content_block_delta":
                     index = _int(data.get("index"))
+                    if index < 0:
+                        raise UpstreamError("The upstream sent an out-of-order content block")
                     if index >= len(blocks):
                         continue
                     delta = data.get("delta") or {}
@@ -282,6 +284,8 @@ async def stream_messages(
                         )
                 elif kind == "content_block_stop":
                     index = _int(data.get("index"))
+                    if index < 0:
+                        raise UpstreamError("The upstream sent an out-of-order content block")
                     if index >= len(blocks):
                         continue
                     block = blocks[index]

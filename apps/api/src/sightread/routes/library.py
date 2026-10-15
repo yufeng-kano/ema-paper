@@ -136,6 +136,12 @@ async def sibling_names(
     return taken
 
 
+async def lock_job(db: DbSession, job_id: uuid.UUID) -> None:
+    """Order filing against the worker's finalization of the parse: the worker reads the
+    rows that keep the original under this lock (docs/jobs.md § Retention)."""
+    await db.execute(select(Job.id).where(Job.id == job_id).with_for_update())
+
+
 async def lock_user(db: DbSession, user_id: int) -> None:
     """Serialize this user's name decisions: the unique indexes cannot see across the
     two tables, so two requests choosing a name for a folder and a file at once are
@@ -598,11 +604,15 @@ async def upload_document(
     # The job is committed and running by now, so the file has to land: `insert_named`
     # re-reads and retries rather than answering a conflict.
     async def land(place: int | None) -> Document:
+        async def taken() -> set[str]:
+            await lock_job(db, job_id)
+            return await sibling_names(db, user.id, place)
+
         return await insert_named(
             db,
             user_id=user.id,
             build=lambda name: Document(user_id=user.id, folder_id=place, job_id=job_id, name=name),
-            taken=lambda: sibling_names(db, user.id, place),
+            taken=taken,
             wanted=clean_name(filename, DOCUMENT_NAME_MAX),
             limit=DOCUMENT_NAME_MAX,
             message="A file with this name already exists here",
@@ -650,6 +660,11 @@ async def file_job(body: DocumentFromJob, user: SessionUser, db: DbSession):
         wanted = clean_name(job.filename, DOCUMENT_NAME_MAX)
     except ApiError:
         wanted = "upload"
+
+    async def taken() -> set[str]:
+        await lock_job(db, job_id)
+        return await sibling_names(db, user_id, folder_id)
+
     try:
         row = await insert_named(
             db,
@@ -657,7 +672,7 @@ async def file_job(body: DocumentFromJob, user: SessionUser, db: DbSession):
             build=lambda name: Document(
                 user_id=user_id, folder_id=folder_id, job_id=job_id, name=name
             ),
-            taken=lambda: sibling_names(db, user_id, folder_id),
+            taken=taken,
             wanted=wanted,
             limit=DOCUMENT_NAME_MAX,
             message="A file with this name already exists here",
@@ -904,5 +919,8 @@ async def revert_document_revision(
     row = await owned_document(db, user.id, document_id)
     if not re.fullmatch(r"[0-9a-f]{7,40}", commit):
         raise ApiError(404, "invalid_request", "No such revision")
+    # A shell revision may have moved the document; undoing that under a running turn
+    # would pull the path out from under it (docs/chat.md § Conversations).
+    await refuse_while_answering(db, user.id, select(Document.id).where(Document.id == row.id))
     reverted = await workspace_documents.revert(db, settings, row, commit)
     return {"revision": reverted.revision, "commit": reverted.commit}

@@ -496,7 +496,7 @@ async def _finish(
         # from here (docs/jobs.md § Retention): a copy that fails is logged, never a
         # reason to leave the job `running`.
         try:
-            await _retain_source(sessionmaker, settings, job_id, documents, source)
+            await _retain_source(sessionmaker, settings, job_id, source)
         except Exception:  # noqa: BLE001 - retention must not undo a finished parse
             logger.exception("could not keep the source of job %s", job_id)
     if settings is not None and documents:
@@ -513,15 +513,24 @@ async def _retain_source(
     sessionmaker: async_sessionmaker[AsyncSession],
     settings: Settings,
     job_id: uuid.UUID,
-    documents: list[Document],
     source: Path,
 ) -> None:
     """One parse filed in several places: every copy keeps the original, the last one
-    by moving it (docs/jobs.md § Retention). Each copy is checked against the quota and
-    taken under the workspace lock, where the document is at that moment."""
+    by moving it (docs/jobs.md § Retention). The recipients are read under a lock on
+    the job's row — filing takes the same lock before it inserts, so a row filed while
+    this runs is either here or filed afterwards, as a finished parse. Each copy is
+    checked against the quota and taken under the workspace lock, where the document
+    is at that moment."""
     async with sessionmaker() as db:
-        job = await db.get(Job, job_id)
+        job = await db.get(Job, job_id, with_for_update=True)
         kind = job.kind if job is not None else "pdf"
+        documents = list(
+            (
+                await db.execute(
+                    select(Document).where(Document.job_id == job_id).order_by(Document.id)
+                )
+            ).scalars()
+        )
         for index, document in enumerate(documents):
             root = user_root(settings.workspaces_dir, document.user_id)
             async with workspace_lock(root):

@@ -674,3 +674,63 @@ def test_missing_parents_are_made_through_descriptors(tmp_path) -> None:
         safe_io.rename(root, root / "files" / "a", root / "files" / "link" / "moved")
     assert not list(elsewhere.iterdir())
     assert (root / "files" / "a" / "b" / "doc.md").exists()
+
+
+async def test_a_revert_never_writes_over_what_sits_at_the_old_place(
+    sessionmaker, tmp_path
+) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        before = await documents.materialize_document(db, settings, document)
+        document.name = "renamed.pdf"
+        await db.commit()
+        after = await documents.document_paths(db, settings, document)
+        await documents.move_path(settings, user.id, before.relative, after.relative)
+        rename = (await documents.revisions(db, settings, document))[0]
+        # The shell wrote a new file where the document's used to be.
+        before.directory.mkdir()
+        before.doc.write_text("newer")
+        with pytest.raises(ApiError) as refused:
+            await documents.revert(db, settings, document, rename.commit)
+        assert refused.value.status_code == 409
+        assert before.doc.read_text() == "newer"
+        assert after.doc.exists()
+
+
+async def test_missing_crops_are_copied_on_a_later_materialization(sessionmaker, tmp_path) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        _, document = await _seed(db)
+        crops = tmp_path / "figures" / str(document.job_id)
+        crops.mkdir(parents=True)
+        (crops / "p1_0_0_10_10.png").write_bytes(b"one")
+        (crops / "p2_0_0_10_10.png").write_bytes(b"two")
+        paths = await documents.materialize_document(db, settings, document)
+        # A copy that failed halfway left the directory with one crop missing.
+        (paths.figures / "p2_0_0_10_10.png").unlink()
+        await documents.materialize_document(db, settings, document)
+        assert (paths.figures / "p2_0_0_10_10.png").read_bytes() == b"two"
+
+
+async def test_reconcile_records_no_folder_under_a_documents_name(sessionmaker, tmp_path) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+        other = Document(
+            user_id=user.id, folder_id=document.folder_id, job_id=document.job_id, name="twin.pdf"
+        )
+        db.add(other)
+        await db.commit()
+        twin = await documents.materialize_document(db, settings, other)
+        # The shell nested the twin inside the first document's directory.
+        shutil.move(str(twin.directory), str(paths.directory / "twin.pdf"))
+        git.commit_all(paths.root, "agent:1", "mv from the shell")
+        assert await reconcile.reconcile_user(db, settings, user.id) == 0
+        names = set(
+            (await db.execute(select(Folder.name).where(Folder.user_id == user.id))).scalars()
+        )
+        assert "paper.pdf" not in names
+        row = (await db.execute(select(Document).where(Document.id == other.id))).scalar_one()
+        assert row.folder_id == document.folder_id
