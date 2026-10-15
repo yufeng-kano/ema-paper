@@ -59,6 +59,15 @@ export interface AgentSettings {
   prompt_preset_id: number | null
 }
 
+/**
+ * The coordinate convention the pipeline asks the saved model for — a fact about the model's
+ * family, never a setting (docs/parsing.md § Coordinate conventions).
+ */
+export interface BboxConvention {
+  family: 'gemini' | 'claude' | 'gpt' | 'default'
+  format: string
+}
+
 /** An entry of the code-defined agent registry, with the caller's settings for it. */
 export interface AgentEntry {
   name: string
@@ -69,7 +78,11 @@ export interface AgentEntry {
   /** What "default" means for this agent's prompt picker. */
   default_prompt: string
   settings: AgentSettings
+  bbox: BboxConvention
 }
+
+/** What a settings write answers: the row as stored, and the convention it now implies. */
+export type SavedAgentSettings = AgentSettings & { bbox: BboxConvention }
 
 /** Kano Proxy as this user sees it; the key itself only ever comes back masked. */
 export interface KanoState {
@@ -79,21 +92,7 @@ export interface KanoState {
   masked: string | null
 }
 
-/**
- * A user-defined OpenAI-compatible endpoint; the API key only ever returns masked. The
- * model is not part of it — each agent picks its own (docs/agents.md).
- */
-export interface ProviderConnection {
-  id: number
-  name: string
-  base_url: string
-  masked: string
-  /** Record the `usage.cost` this endpoint reports, as an estimate; off by default. */
-  report_cost: boolean
-  created_at: string
-  updated_at: string
-}
-
+/** One row of a live model catalog (docs/api.md § Upstreams). */
 export interface ConnectionModel {
   id: string
   name: string | null
@@ -109,13 +108,15 @@ export interface PromptPreset {
   updated_at: string
 }
 
-/** The server's own upload limits, so the file picker enforces one set of numbers. */
+/** The server's own limits, so the file picker and the prompt dialog enforce one set of numbers. */
 export interface UploadLimits {
   upload_max_bytes: number
   page_cap: number
   accepted_media_types: string[]
   /** What intake accepts by extension when the browser reports a generic media type. */
   accepted_extensions: string[]
+  /** The cap `POST /api/prompts` enforces on a preset's text. */
+  prompt_max_chars: number
 }
 
 export interface MeResponse {
@@ -400,51 +401,13 @@ export function listAgents(): Promise<{ agents: AgentEntry[] }> {
 export function putAgentSettings(
   agent: string,
   settings: Partial<AgentSettings>,
-): Promise<AgentSettings> {
+): Promise<SavedAgentSettings> {
   return request('PUT', `/api/agents/${encodeURIComponent(agent)}/settings`, settings)
 }
 
 /** The live catalog of the agent's saved upstream — what its model picker lists. */
 export function listAgentModels(agent: string): Promise<{ data: ConnectionModel[] }> {
   return request('GET', `/api/agents/${encodeURIComponent(agent)}/models`)
-}
-
-// --- provider connections ---------------------------------------------------
-
-export function listConnections(): Promise<{ connections: ProviderConnection[] }> {
-  return request('GET', '/api/connections')
-}
-
-export function createConnection(body: {
-  name: string
-  base_url: string
-  api_key: string
-  report_cost: boolean
-}): Promise<ProviderConnection> {
-  return request('POST', '/api/connections', body)
-}
-
-export function updateConnection(
-  id: number,
-  body: Partial<{ name: string; base_url: string; api_key: string; report_cost: boolean }>,
-): Promise<ProviderConnection> {
-  return request('PUT', `/api/connections/${id}`, body)
-}
-
-export function deleteConnection(id: number): Promise<void> {
-  return request<undefined>('DELETE', `/api/connections/${id}`)
-}
-
-/**
- * An endpoint's live model catalog — with a candidate key before the connection exists,
- * or with the stored key (`connection_id`) for a saved one.
- */
-export function previewConnectionModels(body: {
-  base_url: string
-  api_key?: string
-  connection_id?: number
-}): Promise<{ data: ConnectionModel[] }> {
-  return request('POST', '/api/connections/preview-models', body)
 }
 
 // --- prompt presets ---------------------------------------------------------

@@ -52,6 +52,12 @@ def probe_image(source: Path) -> tuple[int, int]:
         raise ImageError("the image could not be decoded") from exc
 
 
+def image_size(path: Path) -> tuple[int, int]:
+    """Pixel dimensions of an image we rendered or normalized ourselves (already oriented)."""
+    with Image.open(path) as image:
+        return image.width, image.height
+
+
 def normalize_image(source: Path, out_dir: Path) -> NormalizedImage:
     """Write a model-ready copy of `source` into `out_dir`."""
     try:

@@ -22,6 +22,8 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..agents import bbox
+from ..agents.bbox import BboxConvention
 from ..auth.crypto import decrypt_connection_key, decrypt_kano_proxy_key
 from ..config import Settings
 from ..db.models import (
@@ -32,6 +34,7 @@ from ..db.models import (
     ProviderConnection,
 )
 from ..errors import ApiError
+from ..parsing.images import image_size
 
 REQUEST_TIMEOUT_SECONDS = 20.0
 # A page of dense text can take a vision model a while; this is the whole-request ceiling.
@@ -515,16 +518,27 @@ async def transcribe_page(
     connection: Connection,
     model: str,
     prompt_template: str,
-    bbox_format: str,
     image: Path,
     page_no: int,
+    *,
+    convention: BboxConvention = bbox.DEFAULT,
     max_response_bytes: int = DEFAULT_RESPONSE_MAX_BYTES,
 ) -> PageTranscription:
-    """Transcribe one rendered page; the answer carries its own figure placeholders.
+    """Transcribe one rendered page. The answer's figure placeholders come back in the
+    stored contract, whatever convention the model was asked for (agents/bbox.py).
 
     Token substitution is plain replacement, not `str.format`: a user-supplied template
-    with stray braces must never break the call (docs/parsing.md § Prompts).
+    with stray braces must never break the call (docs/parsing.md § Prompts). The
+    instructions go in first, because they carry a `{page}` of their own.
     """
-    prompt = prompt_template.replace("{page}", str(page_no)).replace("{bbox_format}", bbox_format)
+    width_px, height_px = image_size(image)
+    prompt = (
+        prompt_template.replace("{bbox_instructions}", convention.instructions(width_px, height_px))
+        .replace("{page}", str(page_no))
+        .replace("{bbox_format}", convention.format)
+    )
     text, usage = await _chat_with_image(connection, model, prompt, image, max_response_bytes)
-    return PageTranscription(markdown=_CODE_FENCE_RE.sub("", text.strip()), usage=usage)
+    markdown = bbox.canonicalize(
+        _CODE_FENCE_RE.sub("", text.strip()), convention, width_px, height_px
+    )
+    return PageTranscription(markdown=markdown, usage=usage)

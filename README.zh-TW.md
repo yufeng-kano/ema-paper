@@ -60,7 +60,7 @@ docker compose up --build
 
 | 服務 | 網址 | 說明 |
 |---|---|---|
-| **Web 工作區** | `http://localhost:3000` | 完整檔案庫、設定面板與解析預覽器 |
+| **Web 工作區** | `http://localhost:3000` | 完整檔案庫、Agent 頁與解析預覽器 |
 | **REST API** | `http://localhost:8000` | 資料平面 API (`/v1/*`) 與 MCP 端點 (`/mcp`) |
 
 > 提示：在 `.env` 中設定 `AUTH_DEV_MODE=true` 即可略過 Google OAuth 設定，直接在本機以開發者模式登入。

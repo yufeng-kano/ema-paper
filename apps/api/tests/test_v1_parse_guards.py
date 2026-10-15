@@ -171,7 +171,7 @@ async def test_broken_base64_is_rejected(client: AsyncClient, documents) -> None
 
 
 async def test_a_job_needs_a_model(client: AsyncClient, sessionmaker, documents) -> None:
-    """No model in the request and none chosen in Settings: refused before any file is
+    """No model in the request and none chosen on the Agent page: refused before any file is
     stored, with a message that says where to choose one (docs/agents.md)."""
     await _keyed_client(client)
     response = await client.post(
@@ -181,7 +181,7 @@ async def test_a_job_needs_a_model(client: AsyncClient, sessionmaker, documents)
 
     assert response.status_code == 400
     assert response.json()["error"]["message"] == (
-        "No model chosen for the parse agent: pick one in Settings or pass 'model'"
+        "No model chosen for the parse agent: pick one on the Agent page or pass 'model'"
     )
     async with sessionmaker() as db:
         assert (await db.execute(select(Job))).scalars().all() == []

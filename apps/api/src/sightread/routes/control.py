@@ -18,6 +18,7 @@ from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
 
 from ..agents import AGENTS, AgentDefinition, get_agent
+from ..agents.bbox import convention_for_model
 from ..auth.api_keys import create_api_key
 from ..auth.crypto import encrypt_connection_key, mask_secret
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
@@ -169,6 +170,8 @@ async def me(user: SessionUser, settings: AppSettings):
             # The extensions intake falls back to when a browser reports a generic type
             # for a file it has no association for (docs/api.md § Limits).
             "accepted_extensions": [".pdf", *sorted(set(ACCEPTED_IMAGE_TYPES.values()))],
+            # The prompt dialog counts against the same cap `POST /api/prompts` enforces.
+            "prompt_max_chars": settings.system_prompt_max_chars,
         },
     }
 
@@ -604,6 +607,11 @@ def _agent_settings_payload(row: AgentSetting | None) -> dict:
     }
 
 
+def _bbox_payload(row: AgentSetting | None) -> dict:
+    convention = convention_for_model(row.model if row else None)
+    return {"family": convention.family, "format": convention.format}
+
+
 @router.get("/agents")
 async def list_agents(user: SessionUser, db: DbSession):
     """The registry with the caller's settings for each agent (docs/agents.md)."""
@@ -623,6 +631,9 @@ async def list_agents(user: SessionUser, db: DbSession):
                 # What "default" means for this agent's prompt picker.
                 "default_prompt": agent.default_prompt_template,
                 "settings": _agent_settings_payload(rows.get(agent.name)),
+                # A fact about the saved model, not a setting: the coordinate convention
+                # the pipeline will ask it for (docs/parsing.md § Coordinate conventions).
+                "bbox": _bbox_payload(rows.get(agent.name)),
             }
             for agent in AGENTS.values()
         ]
@@ -678,14 +689,15 @@ async def put_agent_settings(
         raise ApiError(
             409, "invalid_request", "The selected connection or prompt was just deleted"
         ) from exc
-    return _agent_settings_payload(row)
+    # The convention follows the model, so a write answers the new one along with the row.
+    return {**_agent_settings_payload(row), "bbox": _bbox_payload(row)}
 
 
 @router.get("/agents/{agent_name}/models")
 async def list_agent_models(
     agent_name: str, user: SessionUser, db: DbSession, settings: AppSettings
 ):
-    """The live catalog of the agent's saved upstream — the settings page's model picker."""
+    """The live catalog of the agent's saved upstream — the Agent page's model picker."""
     agent = _known_agent(agent_name)
     return {"data": await agent_models(db, settings, user.id, agent.name)}
 

@@ -60,7 +60,7 @@ docker compose up --build
 
 | Service | URL | Notes |
 |---|---|---|
-| **Web Workspace** | `http://localhost:3000` | Full file library, settings, and result viewer |
+| **Web Workspace** | `http://localhost:3000` | Full file library, the Agent page, and result viewer |
 | **REST API** | `http://localhost:8000` | Data plane (`/v1/*`) and MCP endpoint (`/mcp`) |
 
 > Set `AUTH_DEV_MODE=true` in `.env` to sign in locally without Google OAuth credentials.

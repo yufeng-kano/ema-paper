@@ -19,7 +19,7 @@ export type IconName =
   | 'files'
   | 'history'
   | 'connect'
-  | 'settings'
+  | 'agent'
   | 'globe'
   | 'scan-text'
   | 'folder'

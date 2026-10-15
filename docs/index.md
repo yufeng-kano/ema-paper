@@ -10,7 +10,7 @@ Hosted, multi-user **vision document parsing** service. Users sign in with Googl
 | [api.md](./api.md) | REST data plane (`/v1/*`), control plane (`/api/*`), partial results, figure crop routes, SSE, limits, errors |
 | [auth.md](./auth.md) | Google OIDC sessions, hashed API keys, encrypted upstream keys, OAuth 2.1 AS for Claude Connectors, single-use upload tickets, the Kano Proxy connect flow |
 | [agents.md](./agents.md) | The agent registry (`parse` is the only agent), per-agent upstream/model/prompt settings, enqueue rules |
-| [parsing.md](./parsing.md) | Poppler rendering, vision-only conversion, page markers, bbox contract, figure crop persistence, prompts, models, image normalization |
+| [parsing.md](./parsing.md) | Poppler rendering, vision-only conversion, page markers, bbox contract, figure crop persistence, prompts, coordinate conventions per model family, models, image normalization |
 | [jobs.md](./jobs.md) | PG job queue (SKIP LOCKED), concurrency caps, SSE progress, dedup cache, file retention |
 | [database.md](./database.md) | PostgreSQL schema, Alembic migrations, secrets handling |
 | [mcp.md](./mcp.md) | One `parse` tool minting upload tickets + curl commands, streamable HTTP, Claude Connectors flow |

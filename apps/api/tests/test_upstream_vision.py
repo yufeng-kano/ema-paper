@@ -60,7 +60,7 @@ async def test_transcribe_page_sends_the_image_and_records_usage(key, documents)
     )
 
     result = await transcribe_page(
-        key, "vendor/model", PROMPT, "yxyx_norm1000", documents["png"], 7
+        key, "vendor/model", PROMPT, documents["png"], 7
     )
 
     assert result.markdown == "# Page\n\ntext"
@@ -85,7 +85,7 @@ async def test_transcribe_page_strips_a_code_fence(key, documents) -> None:
     respx.post(KANO_CHAT_URL).mock(
         return_value=httpx.Response(200, json=completion("```markdown\n# Page\n```"))
     )
-    result = await transcribe_page(key, "m", PROMPT, "yxyx_norm1000", documents["png"], 1)
+    result = await transcribe_page(key, "m", PROMPT, documents["png"], 1)
     assert result.markdown == "# Page"
 
 
@@ -95,7 +95,7 @@ async def test_a_prompt_with_stray_braces_still_substitutes_its_tokens(key, docu
     route = respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(200, json=completion("ok")))
 
     await transcribe_page(
-        key, "m", "Emit {json} like {\"a\": 1} for page {page}.", "yxyx_norm1000",
+        key, "m", "Emit {json} like {\"a\": 1} for page {page}.",
         documents["png"], 3,
     )
 
@@ -108,7 +108,7 @@ async def test_rate_limit_carries_retry_after(key, documents) -> None:
     respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(429, headers={"Retry-After": "12"}))
 
     with pytest.raises(RateLimited) as raised:
-        await transcribe_page(key, "m", PROMPT, "yxyx_norm1000", documents["png"], 1)
+        await transcribe_page(key, "m", PROMPT, documents["png"], 1)
     assert raised.value.retry_after == 12
 
 
@@ -117,7 +117,7 @@ async def test_payment_required(key, documents) -> None:
     respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(402, json={"error": {"code": 402}}))
 
     with pytest.raises(PaymentRequired):
-        await transcribe_page(key, "m", PROMPT, "yxyx_norm1000", documents["png"], 1)
+        await transcribe_page(key, "m", PROMPT, documents["png"], 1)
 
 
 @respx.mock
@@ -125,7 +125,7 @@ async def test_a_rejected_key_is_fatal(key, documents) -> None:
     respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(401))
 
     with pytest.raises(UpstreamError) as raised:
-        await transcribe_page(key, "m", PROMPT, "yxyx_norm1000", documents["png"], 1)
+        await transcribe_page(key, "m", PROMPT, documents["png"], 1)
     assert raised.value.fatal is True
 
 
@@ -136,7 +136,7 @@ async def test_provider_error_inside_a_200(key, documents) -> None:
     )
 
     with pytest.raises(PaymentRequired):
-        await transcribe_page(key, "m", PROMPT, "yxyx_norm1000", documents["png"], 1)
+        await transcribe_page(key, "m", PROMPT, documents["png"], 1)
 
 
 @respx.mock
@@ -157,7 +157,7 @@ async def test_only_failures_that_may_not_repeat_are_transient(
     respx.post(KANO_CHAT_URL).mock(return_value=response)
 
     with pytest.raises(UpstreamError) as raised:
-        await transcribe_page(key, "m", PROMPT, "yxyx_norm1000", documents["png"], 1)
+        await transcribe_page(key, "m", PROMPT, documents["png"], 1)
     assert raised.value.transient is transient
     assert raised.value.fatal is False
 
@@ -167,7 +167,7 @@ async def test_an_unreachable_upstream_is_transient(key, documents) -> None:
     respx.post(KANO_CHAT_URL).mock(side_effect=httpx.ReadTimeout("slow"))
 
     with pytest.raises(UpstreamError) as raised:
-        await transcribe_page(key, "m", PROMPT, "yxyx_norm1000", documents["png"], 1)
+        await transcribe_page(key, "m", PROMPT, documents["png"], 1)
     assert raised.value.transient is True
 
 
@@ -177,7 +177,7 @@ async def test_a_finished_null_completion_is_an_empty_page(key, documents) -> No
     body["choices"] = [{"message": {"content": None}, "finish_reason": "stop"}]
     respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(200, json=body))
 
-    page = await transcribe_page(key, "m", PROMPT, "yxyx_norm1000", documents["png"], 1)
+    page = await transcribe_page(key, "m", PROMPT, documents["png"], 1)
     assert page.markdown == ""
     assert page.usage.prompt_tokens == 1200
 
@@ -192,7 +192,7 @@ async def test_an_ambiguous_empty_completion_carries_its_usage(key, documents, c
     respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(200, json=body))
 
     with pytest.raises(EmptyCompletion) as raised:
-        await transcribe_page(key, "m", PROMPT, "yxyx_norm1000", documents["png"], 1)
+        await transcribe_page(key, "m", PROMPT, documents["png"], 1)
     assert raised.value.transient is True
     assert raised.value.usage.prompt_tokens == 1200
 
@@ -204,7 +204,7 @@ async def test_a_completion_cut_short_is_never_read_as_blank(key, documents) -> 
     respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(200, json=body))
 
     with pytest.raises(UpstreamError) as raised:
-        await transcribe_page(key, "m", PROMPT, "yxyx_norm1000", documents["png"], 1)
+        await transcribe_page(key, "m", PROMPT, documents["png"], 1)
     assert not isinstance(raised.value, EmptyCompletion)
 
 
@@ -238,7 +238,7 @@ async def test_a_connection_calls_its_own_endpoint_and_prices_nothing_by_default
     )
 
     result = await transcribe_page(
-        connection, "gpt-vision", PROMPT, "yxyx_norm1000", documents["png"], 2
+        connection, "vendor/vision", PROMPT, documents["png"], 2
     )
 
     assert result.markdown == "# Page"
@@ -258,7 +258,7 @@ async def test_a_non_object_completion_is_a_page_failure_not_a_crash(key, docume
     respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(200, json=[]))
 
     with pytest.raises(UpstreamError):
-        await transcribe_page(key, "m", PROMPT, "yxyx_norm1000", documents["png"], 1)
+        await transcribe_page(key, "m", PROMPT, documents["png"], 1)
 
 
 @respx.mock
@@ -272,7 +272,7 @@ async def test_an_oversized_completion_fails_the_call(key, documents) -> None:
 
     with pytest.raises(UpstreamError):
         await transcribe_page(
-            key, "m", PROMPT, "yxyx_norm1000", documents["png"], 1, max_response_bytes=64
+            key, "m", PROMPT, documents["png"], 1, max_response_bytes=64
         )
 
 
@@ -296,7 +296,7 @@ async def _usage_for(connection: Connection, usage: dict, documents):
     # httpx's own `json=` refuses to.
     body = json.dumps({"choices": [{"message": {"content": "# Page"}}], "usage": usage})
     respx.post(PROXY_CHAT).mock(return_value=httpx.Response(200, content=body.encode()))
-    result = await transcribe_page(connection, "m", PROMPT, "yxyx_norm1000", documents["png"], 1)
+    result = await transcribe_page(connection, "m", PROMPT, documents["png"], 1)
     return result.usage
 
 
@@ -353,7 +353,7 @@ async def test_kano_proxy_without_a_reported_cost_is_unpriced_not_free(key, docu
         )
     )
 
-    result = await transcribe_page(key, "m", PROMPT, "yxyx_norm1000", documents["png"], 1)
+    result = await transcribe_page(key, "m", PROMPT, documents["png"], 1)
 
     assert result.usage.cost_source == "unknown"
     assert result.usage.cost is None

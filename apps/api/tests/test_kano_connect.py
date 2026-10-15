@@ -35,7 +35,7 @@ from tests.conftest import (
 )
 
 REDIRECT_URI = "http://localhost:8000/api/kano/callback"
-SETTINGS_URL = "http://localhost:3000/settings"
+AGENTS_URL = "http://localhost:3000/agents"
 KEY = "sk-kano-proxy-first-key-0001"
 NEW_KEY = "sk-kano-proxy-second-key-0002"
 
@@ -111,7 +111,7 @@ async def test_callback_exchanges_the_code_and_stores_the_key(client, sessionmak
 
     location = await _finish(client, code="the-code", state=query["state"])
 
-    assert location == f"{SETTINGS_URL}?kano=connected"
+    assert location == f"{AGENTS_URL}?kano=connected"
     sent = parse_qs(token.calls[0].request.content.decode())
     assert {name: values[0] for name, values in sent.items()} == {
         "grant_type": "authorization_code",
@@ -137,11 +137,11 @@ async def test_a_state_works_once(client, sessionmaker) -> None:
     token = respx.post(KANO_TOKEN_URL).mock(return_value=_issued())
     await _signed_in(client)
     query = await _start(client)
-    assert await _finish(client, code="c", state=query["state"]) == f"{SETTINGS_URL}?kano=connected"
+    assert await _finish(client, code="c", state=query["state"]) == f"{AGENTS_URL}?kano=connected"
 
     replay = await _finish(client, code="c", state=query["state"])
 
-    assert replay == f"{SETTINGS_URL}?kano=error"
+    assert replay == f"{AGENTS_URL}?kano=error"
     assert token.call_count == 1
 
 
@@ -165,14 +165,14 @@ async def test_a_state_bound_to_another_user_is_rejected(
     stranger.cookies.set(SESSION_COOKIE, session_token)
 
     assert await _finish(stranger, code="c", state=query["state"]) == (
-        f"{SETTINGS_URL}?kano=error"
+        f"{AGENTS_URL}?kano=error"
     )
     assert not token.called
     assert await _stored_keys(sessionmaker) == []
 
     # Still the owner's to finish.
     assert await _finish(owner, code="c", state=query["state"]) == (
-        f"{SETTINGS_URL}?kano=connected"
+        f"{AGENTS_URL}?kano=connected"
     )
     [stored] = await _stored_keys(sessionmaker)
     assert stored.user_id != other.id
@@ -184,7 +184,7 @@ async def test_an_expired_state_is_rejected(make_client, sessionmaker) -> None:
     client = await _signed_in(make_client(kano_connect_ttl_seconds=0))
     query = await _start(client)
 
-    assert await _finish(client, code="c", state=query["state"]) == f"{SETTINGS_URL}?kano=error"
+    assert await _finish(client, code="c", state=query["state"]) == f"{AGENTS_URL}?kano=error"
     assert not token.called
 
 
@@ -195,7 +195,7 @@ async def test_a_callback_without_a_session_stores_nothing(make_client, sessionm
 
     anonymous = make_client()
     assert await _finish(anonymous, code="c", state=query["state"]) == (
-        f"{SETTINGS_URL}?kano=error"
+        f"{AGENTS_URL}?kano=error"
     )
     assert not token.called
 
@@ -208,7 +208,7 @@ async def test_denied_consent_consumes_the_state(client, sessionmaker) -> None:
 
     denied = await _finish(client, error="access_denied", state=query["state"])
 
-    assert denied == f"{SETTINGS_URL}?kano=denied"
+    assert denied == f"{AGENTS_URL}?kano=denied"
     assert not token.called
     async with sessionmaker() as db:
         assert (await db.execute(select(KanoConnectState))).scalars().all() == []
@@ -227,7 +227,7 @@ async def test_reconnecting_replaces_the_stored_key(client, sessionmaker) -> Non
 
     second = await _start(client)
     assert await _finish(client, code="c2", state=second["state"]) == (
-        f"{SETTINGS_URL}?kano=connected"
+        f"{AGENTS_URL}?kano=connected"
     )
 
     [stored] = await _stored_keys(sessionmaker)
@@ -256,7 +256,7 @@ async def test_a_rejected_exchange_stores_nothing(client, sessionmaker) -> None:
     for _ in range(5):
         query = await _start(client)
         assert await _finish(client, code="c", state=query["state"]) == (
-            f"{SETTINGS_URL}?kano=error"
+            f"{AGENTS_URL}?kano=error"
         )
 
     assert await _stored_keys(sessionmaker) == []
@@ -269,7 +269,7 @@ async def test_an_unreachable_kano_proxy_is_an_error_outcome(client, sessionmake
     await _signed_in(client)
     query = await _start(client)
 
-    assert await _finish(client, code="c", state=query["state"]) == f"{SETTINGS_URL}?kano=error"
+    assert await _finish(client, code="c", state=query["state"]) == f"{AGENTS_URL}?kano=error"
 
 
 @respx.mock
@@ -279,7 +279,7 @@ async def test_the_callback_returns_to_the_locale_the_connect_started_in(client)
     query = await _start(client, locale="zh-TW")
 
     assert await _finish(client, code="c", state=query["state"]) == (
-        "http://localhost:3000/zh-TW/settings?kano=connected"
+        "http://localhost:3000/zh-TW/agents?kano=connected"
     )
 
 
@@ -307,4 +307,4 @@ async def test_an_unconfigured_deployment_reports_kano_proxy_unavailable(make_cl
     assert (await client.get("/api/kano")).json()["available"] is False
     response = await client.get("/api/kano/connect")
     assert response.status_code == 302
-    assert response.headers["location"] == f"{SETTINGS_URL}?kano=error"
+    assert response.headers["location"] == f"{AGENTS_URL}?kano=error"

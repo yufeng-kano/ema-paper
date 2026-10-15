@@ -15,7 +15,7 @@ BBOX_MAX = 1000
 
 # A placeholder as emitted by the model or by us: ![anything](sightread://p3/10,20,30,40).
 PLACEHOLDER_RE = re.compile(
-    r"!\[[^\]\n]*\]\(\s*sightread://p(?P<page>\d+)/"
+    r"!\[(?P<alt>[^\]\n]*)\]\(\s*sightread://p(?P<page>\d+)/"
     r"(?P<ymin>-?\d+)\s*,\s*(?P<xmin>-?\d+)\s*,\s*(?P<ymax>-?\d+)\s*,\s*(?P<xmax>-?\d+)\s*\)"
 )
 
