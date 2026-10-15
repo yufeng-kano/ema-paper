@@ -135,6 +135,12 @@ class Settings(BaseSettings):
         """Exactly what the authorize request and the token exchange both send."""
         return f"{self.app_url.rstrip('/')}/api/kano/callback"
 
+    @property
+    def json_body_max_bytes(self) -> int:
+        """The largest JSON request body the API reads: a document's content, escaped,
+        plus room for the envelope (docs/api.md). Uploads stream under their own cap."""
+        return self.content_max_bytes * 2 + 65_536
+
     def web_url_for_locale(self, prefix: str) -> str:
         """`WEB_URL`, prefixed when the visitor picked a non-default locale.
 

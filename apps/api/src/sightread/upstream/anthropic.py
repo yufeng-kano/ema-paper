@@ -34,6 +34,20 @@ ANTHROPIC_VERSION = "2023-06-01"
 STREAM_TIMEOUT_SECONDS = 600.0
 # One SSE line past this is a broken upstream, not a long answer.
 MAX_SSE_LINE_BYTES = 4 * 1024 * 1024
+# The error types the Messages API documents; anything else is reported as "error".
+KNOWN_ERROR_TYPES = frozenset(
+    {
+        "invalid_request_error",
+        "authentication_error",
+        "permission_error",
+        "not_found_error",
+        "request_too_large",
+        "rate_limit_error",
+        "api_error",
+        "overloaded_error",
+        "billing_error",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -273,10 +287,13 @@ async def stream_messages(
                     finished = True
                 elif kind == "error":
                     error = data.get("error") or {}
-                    message = str(error.get("message") or "stream error")
-                    if error.get("type") == "overloaded_error":
+                    kind_name = str(error.get("type") or "")
+                    if kind_name == "overloaded_error":
                         raise UpstreamError("The upstream is overloaded", transient=True)
-                    raise UpstreamError(f"The upstream reported an error: {message[:120]}")
+                    # The type is a fixed token; the message is the provider's prose and
+                    # is never stored or shown (docs/chat.md).
+                    label = kind_name if kind_name in KNOWN_ERROR_TYPES else "error"
+                    raise UpstreamError(f"The upstream reported an error ({label})")
     except httpx.HTTPError as exc:
         raise UpstreamError("The upstream was unreachable", transient=True) from exc
     except ResponseTooLarge as exc:

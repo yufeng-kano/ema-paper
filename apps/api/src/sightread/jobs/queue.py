@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..agents import get_agent
 from ..db.models import ChatTurn, Job, JobPage, utcnow
+from . import chat_events
 
 # PostgreSQL claim (docs/jobs.md). The correlated count applies the per-user running cap
 # to the same scan that picks the oldest queued job.
@@ -194,6 +195,7 @@ async def enqueue_job(
     prompt_sha256: str,
     page_count: int,
     source_path: str,
+    retain_source: bool = False,
 ) -> Job:
     """Create the queued job row. The caller commits — creation and enqueue are one act."""
     job = Job(
@@ -217,6 +219,7 @@ async def enqueue_job(
         page_count=page_count,
         pages_done=0,
         source_path=source_path,
+        retain_source=retain_source,
         created_at=utcnow(),
     )
     db.add(job)
@@ -354,10 +357,23 @@ async def claim_next_turn(db: AsyncSession, max_turns_per_user: int) -> uuid.UUI
 
 
 async def fail_turn(db: AsyncSession, turn_id: uuid.UUID, error: str) -> None:
-    """A turn the worker could not finish. Never requeued: its tool calls may have run."""
-    await db.execute(
-        update(ChatTurn)
-        .where(ChatTurn.id == turn_id, ChatTurn.status.in_(("queued", "running")))
-        .values(status="failed", error=error, finished_at=utcnow())
+    """A turn the worker could not finish. Never requeued: its tool calls may have run.
+    A turn the user had cancelled keeps `cancelled`; either way it is finished now, with
+    the terminal event a stream waits for (docs/jobs.md § Chat turns)."""
+    turn = await db.get(ChatTurn, turn_id)
+    if turn is None or turn.finished_at is not None:
+        return
+    if turn.status == "cancelled":
+        turn.error = "cancelled"
+    else:
+        turn.status = "failed"
+        turn.error = error
+    turn.finished_at = utcnow()
+    await chat_events.append(
+        db,
+        turn.conversation_id,
+        turn.id,
+        chat_events.TURN_ERROR,
+        {"status": turn.status, "error": turn.error or ""},
     )
     await db.commit()

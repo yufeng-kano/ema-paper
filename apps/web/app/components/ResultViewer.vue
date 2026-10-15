@@ -142,7 +142,10 @@ async function loadContent(replaceDirty = false) {
     if (seq !== contentSeq) {
       return
     }
-    if (replaceDirty || saveState.value === 'saved' || saveState.value === 'failed') {
+    // An open block editor whose text differs from its block is unsaved work too: it
+    // keeps the revision it was opened against, so its save meets the 409 that reloads.
+    const dirtyEditor = editing.value !== null && draft.value !== openBlockSource()
+    if (replaceDirty || ((saveState.value === 'saved' || saveState.value === 'failed') && !dirtyEditor)) {
       markdown.value = content.markdown
       revision.value = content.revision
       saveState.value = 'saved'
@@ -377,6 +380,15 @@ function onBlockClick(pageIndex: number, blockIndex: number) {
     return
   }
   void startEdit(pageIndex, blockIndex)
+}
+
+/** The source of the block under the open editor, or null when none is open. */
+function openBlockSource(): string | null {
+  const open = editing.value
+  if (!open) {
+    return null
+  }
+  return pages.value[open.page]?.blocks[open.index]?.src ?? null
 }
 
 /** Renders the block again, and if its source changed, writes it into the document. */

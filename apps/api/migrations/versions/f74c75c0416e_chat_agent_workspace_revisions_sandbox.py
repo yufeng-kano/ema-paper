@@ -102,6 +102,10 @@ def upgrade() -> None:
         ),
     )
 
+    op.add_column(
+        "jobs",
+        sa.Column("retain_source", sa.Boolean(), server_default="false", nullable=False),
+    )
     op.add_column("usage_log", sa.Column("turn_id", sa.Uuid(), nullable=True))
     op.add_column(
         "usage_log",
@@ -134,6 +138,7 @@ def downgrade() -> None:
     op.drop_column("usage_log", "cache_read_tokens")
     op.drop_column("usage_log", "agent")
     op.drop_column("usage_log", "turn_id")
+    op.drop_column("jobs", "retain_source")
     op.drop_column("agent_settings", "effort")
     op.drop_index("ix_messages_conversation_id", table_name="messages")
     op.drop_table("messages")

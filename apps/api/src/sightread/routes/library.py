@@ -26,7 +26,15 @@ from starlette.datastructures import FormData, UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser
 
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
-from ..db.models import Document, Folder, Job, JobPage, Result
+from ..db.models import (
+    ChatTurn,
+    Conversation,
+    Document,
+    Folder,
+    Job,
+    JobPage,
+    Result,
+)
 from ..errors import ApiError
 from ..jobs.intake import (
     MULTIPART_ENVELOPE_BYTES,
@@ -118,6 +126,21 @@ async def document_names(
     if exclude_id is not None:
         query = query.where(Document.id != exclude_id)
     return set((await db.execute(query)).scalars().all())
+
+
+async def refuse_while_answering(db: DbSession, document_ids) -> None:
+    """A document whose conversation has an unfinished turn cannot go: the worker would
+    carry on against rows and a directory that no longer exist (docs/chat.md)."""
+    busy = (
+        await db.execute(
+            select(ChatTurn.id)
+            .join(Conversation, Conversation.id == ChatTurn.conversation_id)
+            .where(Conversation.document_id.in_(document_ids), ChatTurn.finished_at.is_(None))
+            .limit(1)
+        )
+    ).first()
+    if busy is not None:
+        raise ApiError(409, "invalid_request", "A conversation about this file is still answering")
 
 
 async def owned_folder(db: DbSession, user_id: int, folder_id: int) -> Folder:
@@ -415,6 +438,10 @@ async def delete_folder(
         row = await owned_folder(db, user.id, folder_id)
         relative = await folder_relative_dir(db, user.id, row.id)
         doomed = await subtree_ids(db, user.id, row.id)
+        await refuse_while_answering(
+            db,
+            select(Document.id).where(Document.user_id == user.id, Document.folder_id.in_(doomed)),
+        )
         await db.execute(
             delete(Document).where(Document.user_id == user.id, Document.folder_id.in_(doomed))
         )
@@ -498,6 +525,9 @@ async def upload_document(
         # The browser cannot tell a lost response from a lost request, so its retry of an
         # upload that in fact landed must not buy a second parse (docs/jobs.md § Dedup).
         reuse_in_flight=True,
+        # A library upload keeps its original even if the worker finishes before the
+        # document row below exists (docs/jobs.md § Retention).
+        retain_source=True,
     )
     # A dedup hit is a finished parse rather than a new one, so the file points at the job
     # that already produced it (docs/jobs.md § Dedup).
@@ -530,7 +560,10 @@ async def upload_document(
             raise
         row = await land(None)
 
-    return document_payload(row, await job_of(db, job_id))
+    job = await job_of(db, job_id)
+    # The parse may already be done: the worker then left the upload for this row.
+    await workspace_documents.adopt_source(db, settings, row, job)
+    return document_payload(row, job)
 
 
 @router.post("/documents/from-job", dependencies=[CsrfGuard], status_code=status.HTTP_201_CREATED)
@@ -635,6 +668,7 @@ async def delete_document(
     async with workspace_lock(user_root(settings.workspaces_dir, user.id)):
         row = await owned_document(db, user.id, document_id)
         relative = await document_relative(db, row)
+        await refuse_while_answering(db, select(Document.id).where(Document.id == row.id))
         await db.delete(row)
         await db.commit()
         await workspace_documents.remove_path(settings, user.id, relative)

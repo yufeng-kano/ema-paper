@@ -70,6 +70,8 @@ jobs             id UUID PK, user_id FK, agent, kind pdf|image, filename, media_
                  prompt_sha256,                   -- its hash; part of the dedup key
                  status queued|running|succeeded|failed, error,
                  page_count, pages_done, source_path NULL, source_deleted_at NULL,
+                 retain_source,                   -- a library upload keeps its original
+                                                  -- (jobs.md § Retention)
                  created_at, started_at, finished_at
                  INDEX (status, created_at)                                  -- queue claim
                  INDEX (user_id, agent, sha256, model, connection_id, pages_spec,

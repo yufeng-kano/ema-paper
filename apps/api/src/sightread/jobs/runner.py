@@ -481,9 +481,14 @@ async def _finish(
             )
         source = Path(job.source_path) if job.source_path else None
         if source is not None and not (documents and source.is_file()):
-            # Nothing keeps it: deleted now, with the terminal state.
-            source.unlink(missing_ok=True)
-            job.source_deleted_at = utcnow()
+            if status == "succeeded" and job.retain_source and source.is_file():
+                # A library upload whose row has not landed yet: the upload stays where
+                # it is for that row to take (docs/jobs.md § Retention).
+                pass
+            else:
+                # Nothing keeps it: deleted now, with the terminal state.
+                source.unlink(missing_ok=True)
+                job.source_deleted_at = utcnow()
         await events.notify(db, job.id)
         await db.commit()
     if source is not None and documents and source.is_file():

@@ -88,9 +88,7 @@ def ensure_repo(root: Path) -> None:
         exclude.write_text(EXCLUDE_RULES)
 
 
-def commit_all(root: Path, author: str, message: str) -> str | None:
-    """Stage everything and commit; None when the tree was clean."""
-    _git(root, "add", "-A")
+def _commit_staged(root: Path, author: str, message: str) -> str | None:
     staged = _git(root, "diff", "--cached", "--quiet", check=False)
     if staged.returncode == 0:
         return None
@@ -106,6 +104,26 @@ def commit_all(root: Path, author: str, message: str) -> str | None:
         message,
     )
     return head(root)
+
+
+def commit_all(root: Path, author: str, message: str) -> str | None:
+    """Stage everything and commit; None when the tree was clean. For the shell, whose
+    changes nobody can name in advance — under the shell lock, so the dirt is all its."""
+    _git(root, "add", "-A")
+    return _commit_staged(root, author, message)
+
+
+def commit_paths(root: Path, author: str, message: str, paths: list[Path]) -> str | None:
+    """Stage only `paths` (relative; files or directories) and commit; None when none of
+    them changed. What a host write commits, so a shell's half-written files elsewhere in
+    the tree never ride along (docs/workspace.md § Revisions)."""
+    if not paths:
+        return None
+    # One `add` per path, unchecked: a pathspec that matches nothing (a moved-away
+    # directory that was never tracked) must not stop the others from being staged.
+    for path in paths:
+        _git(root, "add", "-A", "--", str(path), check=False)
+    return _commit_staged(root, author, message)
 
 
 def head(root: Path) -> str | None:
@@ -188,15 +206,81 @@ def _git_bounded(root: Path, *args: str, max_bytes: int) -> tuple[int, bytes, bo
     return code, b"".join(chunks), truncated
 
 
-def show(root: Path, commit: str, relative: Path, max_bytes: int) -> str | None:
-    """The file's text at `commit`, or None when it did not exist there. Raises when it
-    is larger than `max_bytes`: a revision that size is not restored into memory."""
+def show_bytes(root: Path, commit: str, relative: Path, max_bytes: int) -> bytes | None:
+    """The file's content at `commit`, or None when it did not exist there. Raises when
+    it is larger than `max_bytes`: a revision that size is not restored into memory."""
     code, out, truncated = _git_bounded(
         root, "show", f"{commit}:{relative.as_posix()}", max_bytes=max_bytes
     )
     if truncated:
         raise GitError(f"{relative} at {commit[:12]} exceeds {max_bytes} bytes")
-    return out.decode(errors="replace") if code == 0 else None
+    return out if code == 0 else None
+
+
+def show(root: Path, commit: str, relative: Path, max_bytes: int) -> str | None:
+    data = show_bytes(root, commit, relative, max_bytes)
+    return None if data is None else data.decode(errors="replace")
+
+
+def renames_since(root: Path, commit: str) -> dict[Path, Path]:
+    """Where each path renamed after `commit` lives now: old path → current path, with
+    chains of renames followed in order."""
+    proc = _git(
+        root,
+        "log",
+        "--reverse",
+        "--format=",
+        "--name-status",
+        "--find-renames",
+        "--diff-filter=R",
+        "-z",
+        f"{commit}..HEAD",
+        check=False,
+    )
+    if proc.returncode != 0:
+        return {}
+    fields = [field for field in proc.stdout.split("\0") if field]
+    forward: dict[Path, Path] = {}
+    index = 0
+    while index < len(fields):
+        status = fields[index]
+        if status.startswith("R") and index + 2 < len(fields):
+            old, new = Path(fields[index + 1]), Path(fields[index + 2])
+            # A path that had already moved once moves on from where it was.
+            origins = [origin for origin, current in forward.items() if current == old]
+            for origin in origins:
+                forward[origin] = new
+            if old not in forward and not origins:
+                forward[old] = new
+            index += 3
+        else:
+            index += 2
+    return forward
+
+
+def changed_paths(root: Path, commit: str) -> list[tuple[str, Path]]:
+    """What the commit did to each path: `A`dded, `M`odified, `D`eleted or `T`ype-changed,
+    with renames reported as a delete and an add."""
+    proc = _git(
+        root,
+        "diff-tree",
+        "--no-commit-id",
+        "--root",
+        "-r",
+        "--name-status",
+        "--no-renames",
+        "-z",
+        commit,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return []
+    fields = proc.stdout.split("\0")
+    changes: list[tuple[str, Path]] = []
+    for status, name in zip(fields[0::2], fields[1::2], strict=False):
+        if status and name:
+            changes.append((status[0], Path(name)))
+    return changes
 
 
 def show_commit(root: Path, commit: str, max_bytes: int) -> str:

@@ -170,3 +170,15 @@ async def test_the_idle_sweep_spares_a_running_command(tmp_path) -> None:
     outcome = await running
     assert outcome.output == "done"
     assert await backend.stop_idle() == 1
+
+
+async def test_an_underscore_flood_is_bounded_too(client) -> None:
+    flood = await client.post(
+        "/sandboxes/9/exec",
+        json={"session": "s", "command": "head -c 300000 /dev/zero | tr '\\0' '_'; echo; echo end"},
+    )
+    assert flood.status_code == 200, flood.text
+    body = flood.json()
+    assert body["truncated"] is True
+    assert body["output"].rstrip().endswith("end")
+    assert len(body["output"]) < 2000

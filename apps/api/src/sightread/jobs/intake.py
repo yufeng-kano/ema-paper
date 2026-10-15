@@ -242,6 +242,7 @@ async def submit_parse(
     force: bool = False,
     ticket: UploadTicket | None = None,
     reuse_in_flight: bool = False,
+    retain_source: bool = False,
 ) -> Submission:
     """Store the document, dedup it and queue the parse. Commits before it returns.
 
@@ -321,6 +322,8 @@ async def submit_parse(
                 # The same parse is already on its way. Starting another would spend the
                 # user's key twice over for one document.
                 stored.unlink(missing_ok=True)
+                if retain_source and not active.retain_source:
+                    active.retain_source = True
                 if ticket is not None:
                     upload_tickets.spend(ticket, active.id)
                     await db.commit()
@@ -344,6 +347,7 @@ async def submit_parse(
         prompt_sha256=prompt_sha256,
         page_count=page_count,
         source_path=str(stored),
+        retain_source=retain_source,
     )
     if ticket is not None:
         upload_tickets.spend(ticket, job.id)

@@ -385,3 +385,85 @@ async def test_reconcile_ignores_oversized_metadata(sessionmaker, tmp_path) -> N
         assert await reconcile.reconcile_user(db, settings, user.id) == 0
         row = (await db.execute(select(Document).where(Document.id == document.id))).scalar_one()
         assert row.name == "paper.pdf"
+
+
+async def test_a_directory_where_a_file_belongs_is_refused(sessionmaker, tmp_path) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        _, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+        paths.notes.unlink()
+        paths.notes.mkdir()
+        with pytest.raises(ApiError) as refused:
+            await documents.read_content(db, settings, document)
+        assert refused.value.status_code == 409
+
+
+async def test_the_lock_lives_outside_the_mount_and_saves_commit_only_their_file(
+    sessionmaker, tmp_path
+) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        _, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+        root = paths.root
+        assert not (root / ".sightread" / "lock").exists()
+        assert (git_dir(root).parent / f"{root.name}.lock").exists()
+        # What a shell would leave half-written while the viewer saves.
+        stray = root / "files" / "stray.txt"
+        stray.write_text("from a running command")
+        content = await documents.read_content(db, settings, document)
+        await documents.write_content(
+            db, settings, document, markdown="# Title\n\nEdited\n", base_revision=content.revision
+        )
+        latest = git.log(root)[0]
+        assert latest.files == (paths.doc_relative.as_posix(),)
+        assert stray.read_text() == "from a running command"
+        assert "files/stray.txt" not in {f for rev in git.log(root) for f in rev.files}
+
+
+async def test_revert_undoes_every_path_of_a_shell_commit(sessionmaker, tmp_path) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        _, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+        root = paths.root
+        # A shell command edited the document and left a helper file next to it.
+        paths.doc.write_text("# Title\n\nShelled\n")
+        (paths.directory / "helper.py").write_text("print(1)\n")
+        commit = git.commit_all(root, "agent:1", "bash: python fix.py")
+        assert commit is not None
+        restored = await documents.revert(db, settings, document, commit)
+        assert paths.doc.read_text() == "# Title\n\nBody\n"
+        assert not (paths.directory / "helper.py").exists()
+        assert restored == documents.revision_of("# Title\n\nBody\n")
+
+
+async def test_reconcile_leaves_a_row_alone_when_its_id_is_in_two_places(
+    sessionmaker, tmp_path
+) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+        shutil.copytree(paths.directory, paths.directory.with_name("copy.pdf"))
+        assert await reconcile.reconcile_user(db, settings, user.id) == 0
+        row = (await db.execute(select(Document).where(Document.id == document.id))).scalar_one()
+        assert row.name == "paper.pdf"
+
+
+async def test_a_late_library_row_adopts_the_finished_upload(sessionmaker, tmp_path) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        _, document = await _seed(db)
+        job = (await db.execute(select(Job).where(Job.id == document.job_id))).scalar_one()
+        upload = tmp_path / "upload.pdf"
+        upload.write_bytes(b"%PDF-1.4")
+        job.source_path = str(upload)
+        job.retain_source = True
+        await db.commit()
+        await documents.adopt_source(db, settings, document, job)
+        paths = await documents.document_paths(db, settings, document)
+        assert (paths.directory / "source.pdf").read_bytes() == b"%PDF-1.4"
+        assert not upload.exists()
+        assert job.source_deleted_at is not None

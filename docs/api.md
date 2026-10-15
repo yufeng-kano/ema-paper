@@ -97,7 +97,7 @@ The live model catalog of the caller's **parse** upstream — `GET {KANO_PROXY_B
 | `PUT /api/library/documents/{id}/content` | `{markdown, base_revision}` → `{revision}`; **409** when `base_revision` is not the file's current revision |
 | `PUT /api/library/documents/{id}/notes` | `{text, base_revision}` → `{revision}`, same rule |
 | `GET /api/library/documents/{id}/revisions` | `{revisions: [{commit, author, message, created_at, files}]}`, newest first |
-| `POST /api/library/documents/{id}/revisions/{commit}/revert` | write the document's files as they were before that commit, as a new revision → `{revision}` |
+| `POST /api/library/documents/{id}/revisions/{commit}/revert` | write every path that commit touched as it was before it (where it lives now), as a new revision → `{revision}` of this document |
 | `GET /api/library/documents/{id}/conversations`, `POST` | the document's chat threads (`{conversations: [{id, title, created_at, updated_at}]}`); `POST` creates an empty one |
 | `GET /api/conversations/{id}` | `{conversation, messages: [{id, role, content, turn_id, created_at}], turns: [{id, status, error}]}` |
 | `POST /api/conversations/{id}/messages` | `{text, selection?, locale?}` → **202** `{turn_id, message_id}`: stores the user message (with the turn's id) and queues a turn that answers in `locale` (`en` or `zh-TW`, default `en`). 429 when the caller already has `MAX_CHAT_TURNS_PER_USER` turns running; 409 while this conversation is still answering; 400 when the chat agent has no model or Kano Proxy is not connected |
@@ -117,7 +117,7 @@ The live model catalog of the caller's **parse** upstream — `GET {KANO_PROXY_B
 | `POST /api/library/folders`, `PUT/DELETE /api/library/folders/{id}` | create (`name`, optional `parent_id`) / rename **and** move (partial: only the fields present change) / delete. Deleting cascades to the subtree; a `parent_id` inside the folder's own subtree is refused (a directory cannot contain itself). A name that is already taken is suffixed ` (2)` on create and on move, and answers 409 on a rename |
 | `POST /api/library/documents` | **the web upload.** Multipart `file` + optional `folder_id`, streamed to disk by the same `jobs.intake` sequence `/v1/parse` runs, then a document row naming the job. 201 with the document; a dedup hit points at the cached job and is already `succeeded`, and a retry of an upload that already landed points at the job still running for it rather than starting a second parse ([jobs.md](./jobs.md) § Dedup) |
 | `POST /api/library/documents/from-job` | **file an existing parse** — JSON `{job_id, folder_id?}`. A document row naming one of the caller's own jobs, named after the job's `filename` (` (2)` on a collision), with no upload and no new parse. 201 with the document. 404 for a job or folder that is not the caller's; 400 for a `failed` job, which has no result to file. A queued or running job is accepted — the document tracks it like an upload's ([web.md](./web.md) § History) |
-| `PUT/DELETE /api/library/documents/{id}` | rename / move (`name`, `folder_id`) / delete the library entry. Deleting removes the entry, never the job or its result ([database.md](./database.md) § Rules) |
+| `PUT/DELETE /api/library/documents/{id}` | rename / move (`name`, `folder_id`) / delete the library entry. Deleting removes the entry, never the job or its result ([database.md](./database.md) § Rules); it answers 409 while a conversation about the file is still answering, as does deleting a folder that holds such a file |
 | `GET /api/library/documents/{id}/result` | the document's result, same payload as the data plane's `/result`, plus partial results (below) |
 | `GET /api/library/documents/{id}/figures/{page}/{ymin},{xmin},{ymax},{xmax}` | the document's stored figure crop, same contract as the jobs route above |
 
@@ -150,6 +150,7 @@ While a job is still `queued` or `running`, the two control-plane result routes 
 - `PAGE_CAP` = 500, `MAX_JOBS_PER_USER` = 2 concurrent, `VISION_CONCURRENCY_PER_JOB` = 8.
 - `SYSTEM_PROMPT_MAX_CHARS` = 8000 — cap on a prompt preset's text.
 - `FIGURES_PER_PAGE_MAX` = 40 — cap on stored figure crops per page ([parsing.md](./parsing.md) § Figure crops).
+- JSON request bodies are capped at twice `CONTENT_MAX_BYTES` plus 64 KiB (**413** past it, by declared length or as the bytes arrive); multipart uploads stream under `UPLOAD_MAX_BYTES` instead.
 - `UPSTREAM_RESPONSE_MAX_BYTES` = 33554432 (32 MB) — cap on any upstream response body (model catalogs and vision completions); beyond it the call fails as `upstream` ([parsing.md](./parsing.md) § Upstream usage).
 - 429 with `Retry-After` when the per-user job cap is hit; upstream 402 (the upstream's credits or allowance exhausted) maps to `payment` and fails only the affected pages.
 - `MAX_CHAT_TURNS_PER_USER` = 4 concurrent chat turns (and shells); `CHAT_MAX_OUTPUT_TOKENS` = 64000; `CHAT_MAX_TOOL_CALLS_PER_TURN` = 50; `CHAT_TURN_TIMEOUT_SECONDS` = 900; `CHAT_TOOL_RESULT_MAX_CHARS` = 20000 ([chat.md](./chat.md)).

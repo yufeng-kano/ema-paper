@@ -12,6 +12,7 @@ import asyncio
 import base64
 import difflib
 import io
+import os
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -21,9 +22,9 @@ from PIL import Image, ImageOps
 from ..parsing import poppler
 from ..parsing.figures import parse_bbox_path
 from ..sandbox.client import SandboxClient, SandboxUnavailable
-from ..workspace import git
+from ..workspace import git, safe_io
 from ..workspace.documents import DocumentPaths
-from ..workspace.layout import CACHE_DIR, META_FILE, SIGHTREAD_DIR, inside, no_symlinks
+from ..workspace.layout import CACHE_DIR, META_FILE, SIGHTREAD_DIR, inside
 from ..workspace.locks import workspace_lock
 
 VM_ROOT = PurePosixPath("/workspace")
@@ -224,7 +225,9 @@ def _edit_sync(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(after)
     git.ensure_repo(root)
-    commit = git.commit_all(root, author, f"{command} {vm_path}")
+    commit = git.commit_paths(
+        root, author, f"{command} {vm_path}", [path.resolve().relative_to(root.resolve())]
+    )
     diff = _diff(before or "", after, vm_path)
     return ToolOutcome(
         f"{command} applied to {vm_path}",
@@ -306,9 +309,9 @@ def _png_block(data: bytes) -> dict:
     }
 
 
-def _as_png(path: Path) -> bytes:
+def _as_png(source: Path | bytes) -> bytes:
     """A PNG no larger than the model would keep, oriented, flattened onto white."""
-    with Image.open(path) as opened:
+    with Image.open(io.BytesIO(source) if isinstance(source, bytes) else source) as opened:
         image = ImageOps.exif_transpose(opened) or opened
         if image.mode in ("RGBA", "LA", "P"):
             image = image.convert("RGBA")
@@ -334,6 +337,7 @@ async def view_page(
     *,
     page_count: int | None,
     render_slots: asyncio.Semaphore,
+    max_bytes: int,
 ) -> ToolOutcome:
     source = paths.source()
     if source is None:
@@ -349,28 +353,41 @@ async def view_page(
         return ToolOutcome(f"page must be between 1 and {page_count or 1}", is_error=True)
 
     if source.suffix.lower() == ".pdf":
-        with tempfile.TemporaryDirectory(prefix="sr-view-") as work:
-            work_dir = Path(work)
-            try:
-                async with render_slots:
-                    info = await poppler.pdf_info(source, cwd=work_dir)
-                    rendered = await poppler.render_page(
-                        source, page, info.page_size(page), cwd=work_dir
-                    )
-                data = await asyncio.to_thread(_as_png, rendered)
-            except poppler.PopplerError:
-                return ToolOutcome(f"page {page} could not be rendered", is_error=True)
+        # Poppler gets the file as a descriptor opened without following anything, not
+        # as a path it would resolve again (docs/workspace.md § Revisions).
+        try:
+            fd = safe_io.open_for_read(paths.root, source, max_bytes)
+        except (safe_io.UnsafeEntry, safe_io.EntryTooLarge, OSError):
+            return ToolOutcome("the original file could not be opened", is_error=True)
+        if fd is None:
+            return ToolOutcome("the original file is gone", is_error=True)
+        try:
+            handle = Path(f"/proc/self/fd/{fd}")
+            with tempfile.TemporaryDirectory(prefix="sr-view-") as work:
+                work_dir = Path(work)
+                try:
+                    async with render_slots:
+                        info = await poppler.pdf_info(handle, cwd=work_dir, pass_fds=(fd,))
+                        rendered = await poppler.render_page(
+                            handle, page, info.page_size(page), cwd=work_dir, pass_fds=(fd,)
+                        )
+                    data = await asyncio.to_thread(_as_png, rendered)
+                except poppler.PopplerError:
+                    return ToolOutcome(f"page {page} could not be rendered", is_error=True)
+        finally:
+            os.close(fd)
     else:
         if page != 1:
             return ToolOutcome("an image document has one page", is_error=True)
         try:
-            data = await asyncio.to_thread(_as_png, source)
-        except OSError:
+            raw = await asyncio.to_thread(safe_io.read_bytes, paths.root, source, max_bytes)
+            data = await asyncio.to_thread(_as_png, raw or b"")
+        except (safe_io.UnsafeEntry, safe_io.EntryTooLarge, OSError):
             return ToolOutcome("the original image could not be read", is_error=True)
     return ToolOutcome([_png_block(data), {"type": "text", "text": f"Page {page}."}])
 
 
-async def view_figure(paths: DocumentPaths, tool_input: dict) -> ToolOutcome:
+async def view_figure(paths: DocumentPaths, tool_input: dict, *, max_bytes: int) -> ToolOutcome:
     try:
         page = int(tool_input.get("page"))
         raw_bbox = tool_input.get("bbox")
@@ -383,7 +400,10 @@ async def view_figure(paths: DocumentPaths, tool_input: dict) -> ToolOutcome:
     # (docs/parsing.md § Figure crops): the page and the cleaned box.
     y_min, x_min, y_max, x_max = bbox
     crop = paths.figures / f"p{page}_{y_min}_{x_min}_{y_max}_{x_max}.png"
-    if not crop.is_file() or not no_symlinks(paths.root, crop):
+    try:
+        data = await asyncio.to_thread(safe_io.read_bytes, paths.root, crop, max_bytes)
+    except (safe_io.UnsafeEntry, safe_io.EntryTooLarge, OSError):
+        data = None
+    if data is None:
         return ToolOutcome("no crop is stored for that figure", is_error=True)
-    data = await asyncio.to_thread(crop.read_bytes)
     return ToolOutcome([_png_block(data), {"type": "text", "text": f"Figure at p{page}."}])

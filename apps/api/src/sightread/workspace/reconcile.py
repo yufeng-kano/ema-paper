@@ -13,7 +13,6 @@ import asyncio
 import json
 import logging
 import os
-import stat
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings
 from ..db.models import Document, Folder
-from . import git
+from . import git, safe_io
 from .layout import (
     META_FILE,
     files_root,
@@ -55,7 +54,7 @@ def _canonicalize(root: Path) -> int:
     base = files_root(root)
     if not base.is_dir():
         return 0
-    moved = 0
+    moved: list[Path] = []
     for current, dirs, _files in os.walk(base, topdown=True, followlinks=False):
         kept: list[str] = []
         for name in dirs:
@@ -70,12 +69,13 @@ def _canonicalize(root: Path) -> int:
                 logger.warning("reconcile: %s stays, %s is taken", source, target)
                 continue  # left alone, and not descended into: its rows stay as they were
             git.move(root, source, target)
-            moved += 1
+            moved += [source.relative_to(root), target.relative_to(root)]
             kept.append(target.name)
         dirs[:] = kept
     if moved:
-        git.commit_all(root, git.USER_AUTHOR, "canonicalize names from the shell")
-    return moved
+        # Only the moved paths: a shell may be running, with its own dirt in the tree.
+        git.commit_paths(root, git.USER_AUTHOR, "canonicalize names from the shell", moved)
+    return len(moved) // 2
 
 
 def _scan(root: Path) -> list[Found]:
@@ -95,16 +95,19 @@ def _scan(root: Path) -> list[Found]:
             continue
         meta = Path(current) / META_FILE
         try:
-            # A plain, small file or nothing: the shell can put anything under that name.
-            info = os.lstat(meta)
-        except OSError:
-            continue
-        if not stat.S_ISREG(info.st_mode) or info.st_size > META_MAX_BYTES:
-            continue
-        try:
-            payload = json.loads(meta.read_text())
+            # A plain, small file or nothing: the shell can put anything under that name,
+            # and the open follows nothing (docs/workspace.md § Revisions).
+            data = safe_io.read_bytes(root, meta, META_MAX_BYTES)
+            payload = json.loads(data or b"")
             document_id = int(payload["document_id"])
-        except (OSError, ValueError, KeyError, TypeError):
+        except (
+            safe_io.UnsafeEntry,
+            safe_io.EntryTooLarge,
+            OSError,
+            ValueError,
+            KeyError,
+            TypeError,
+        ):
             continue
         parts = meta.parent.relative_to(base).parts
         if not parts:
@@ -172,11 +175,24 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
         row.id: row
         for row in (await db.execute(select(Document).where(Document.user_id == user_id))).scalars()
     }
+    # One id in two places — `cp -r` carries `.meta.json` along — names no winner: the
+    # row stays where it is, and the copies are the shell's to sort out.
+    seen: dict[int, int] = {}
+    for entry in found:
+        seen[entry.document_id] = seen.get(entry.document_id, 0) + 1
     cache: dict = {}
     changed = 0
     for entry in found:
         row = documents.get(entry.document_id)
         if row is None:
+            continue
+        if seen[entry.document_id] > 1:
+            logger.warning(
+                "reconcile for user %d: document %d is in %d places; row unchanged",
+                user_id,
+                entry.document_id,
+                seen[entry.document_id],
+            )
             continue
         folder_id = await _folder_for(db, user_id, entry.folder_segments, cache)
         # The row's name when the segment is still its encoding; otherwise the name the

@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from starlette.middleware.sessions import SessionMiddleware
 
 from .auth.oidc import build_oauth
+from .body_limit import BodyLimitMiddleware
 from .config import Settings, get_settings
 from .db.session import create_engine, create_sessionmaker
 from .errors import install_error_handlers
@@ -44,6 +45,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
     app.state.oauth = build_oauth(settings)
 
+    # Before the session layer, so an oversized body is refused before anything reads it.
+    app.add_middleware(BodyLimitMiddleware, max_bytes=settings.json_body_max_bytes)
     app.add_middleware(
         SessionMiddleware,
         secret_key=settings.secret_key,

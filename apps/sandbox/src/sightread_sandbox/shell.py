@@ -148,11 +148,11 @@ class ShellSession:
                             collected.add(line)
                         if found:
                             break
-                        # A partial line past the cap is output too; keep the tail where
-                        # the marker could still begin.
-                        if len(pending) > self._max_bytes and not pending.startswith(
-                            marker_bytes[:1]
-                        ):
+                        # A partial line past the cap is output too; keep only the tail
+                        # where a marker could still begin. The marker always starts a
+                        # line, and a line this long is not the marker's, whatever its
+                        # first byte — so the head goes, every time.
+                        if len(pending) > self._max_bytes:
                             collected.add(pending[: -len(marker_bytes)])
                             pending = pending[-len(marker_bytes) :]
             except TimeoutError:

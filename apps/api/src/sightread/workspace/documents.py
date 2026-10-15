@@ -1,8 +1,9 @@
 """A document's files in the user's workspace (docs/workspace.md).
 
 Materialization writes what is missing and never what exists; every write commits a
-revision; every write happens under the user's workspace lock. Paths come from the
-library's names through `layout.py`, never from request text.
+revision of the paths it wrote; every write happens under the user's workspace lock.
+Paths come from the library's names through `layout.py`, never from request text, and
+every file is opened through `safe_io`, which follows nothing the shell could have planted.
 """
 
 from __future__ import annotations
@@ -17,12 +18,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from sqlalchemy import select
+from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings
-from ..db.models import Document, Folder, Job, Result
+from ..db.models import Document, Folder, Job, Result, utcnow
 from ..errors import ApiError
-from . import git
+from . import git, safe_io
 from .layout import (
     DOC_FILE,
     FIGURES_DIR,
@@ -32,12 +34,13 @@ from .layout import (
     document_relative_dir,
     files_root,
     git_dir,
-    no_symlinks,
-    plain_entry,
     results_root,
     user_root,
 )
 from .locks import workspace_lock
+
+NOT_PLAIN = "The document's files are not regular files"
+TOO_LARGE = "The document file is too large to open"
 
 
 @dataclass(frozen=True)
@@ -66,19 +69,37 @@ class DocumentPaths:
         return self.directory / FIGURES_DIR
 
     def source(self) -> Path | None:
-        """`source.<ext>` when the original upload was kept."""
-        for candidate in sorted(self.directory.glob(f"{SOURCE_STEM}.*")):
-            if candidate.is_file() and no_symlinks(self.root, candidate):
+        """`source.<ext>` when the original upload was kept, as a plain file."""
+        if safe_io.entry_kind(self.root, self.directory) != "dir":
+            return None
+        try:
+            names = sorted(os.listdir(self.directory))
+        except OSError:
+            return None
+        for name in names:
+            candidate = self.directory / name
+            if (
+                name.startswith(f"{SOURCE_STEM}.")
+                and safe_io.entry_kind(self.root, candidate) == "file"
+            ):
                 return candidate
         return None
 
     def check(self) -> None:
         """Refuse the directory when the shell turned it, or any fixed file in it, into
-        something the host must not open as itself — a symlink, a FIFO, a device
-        (docs/workspace.md § Revisions)."""
-        for path in (self.directory, self.doc, self.notes, self.meta, self.figures):
-            if not no_symlinks(self.root, path) or not plain_entry(path):
-                raise ApiError(409, "invalid_request", "The document's files are not regular files")
+        something the host must not open as itself — a symlink, a FIFO, a device, a file
+        where a directory belongs or the reverse (docs/workspace.md § Revisions). What
+        is checked here is checked again at the open, through the descriptor."""
+        expected = (
+            (self.directory, "dir"),
+            (self.figures, "dir"),
+            (self.doc, "file"),
+            (self.notes, "file"),
+            (self.meta, "file"),
+        )
+        for path, kind in expected:
+            if safe_io.entry_kind(self.root, path) not in (kind, "none"):
+                raise ApiError(409, "invalid_request", NOT_PLAIN)
 
     @property
     def doc_relative(self) -> Path:
@@ -101,6 +122,24 @@ class Content:
 def revision_of(text: str) -> str:
     """The revision a client saves against: a hash of the content, not a commit id."""
     return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _read_text(root: Path, path: Path, max_bytes: int) -> str:
+    """The file's text, "" when there is none; 409 when it is not a plain file or is
+    larger than the API opens (docs/workspace.md § Revisions)."""
+    try:
+        return safe_io.read_text(root, path, max_bytes) or ""
+    except safe_io.EntryTooLarge as exc:
+        raise ApiError(409, "invalid_request", TOO_LARGE) from exc
+    except (safe_io.UnsafeEntry, OSError) as exc:
+        raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
+
+
+def _write_text(root: Path, path: Path, text: str) -> None:
+    try:
+        safe_io.write_text(root, path, text)
+    except (safe_io.UnsafeEntry, OSError) as exc:
+        raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
 
 
 # --- where a document lives ---------------------------------------------------------------
@@ -132,11 +171,13 @@ async def document_paths(db: AsyncSession, settings: Settings, document: Documen
 # --- materialization ----------------------------------------------------------------------
 
 
-def _write_if_missing(path: Path, text: str) -> bool:
-    if path.exists():
+def _write_if_missing(root: Path, path: Path, text: str) -> bool:
+    if safe_io.entry_kind(root, path) != "none":
         return False
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text)
+    try:
+        safe_io.write_text(root, path, text, exist_ok=False)
+    except FileExistsError:
+        return False
     return True
 
 
@@ -154,8 +195,8 @@ def _materialize_files(
     paths.check()
     paths.directory.mkdir(parents=True, exist_ok=True)
     changed = False
-    changed |= _write_if_missing(paths.doc, result.markdown)
-    changed |= _write_if_missing(paths.notes, "")
+    changed |= _write_if_missing(paths.root, paths.doc, result.markdown)
+    changed |= _write_if_missing(paths.root, paths.notes, "")
     meta = {
         "document_id": document_id,
         "job_id": str(job.id),
@@ -164,11 +205,11 @@ def _materialize_files(
         "page_count": job.page_count,
         "kind": job.kind,
     }
-    changed |= _write_if_missing(paths.meta, json.dumps(meta, indent=2) + "\n")
+    changed |= _write_if_missing(paths.root, paths.meta, json.dumps(meta, indent=2) + "\n")
     original = results_root(paths.root) / str(job.id) / "result.md"
-    _write_if_missing(original, result.markdown)  # ignored by git, no commit needed
+    _write_if_missing(paths.root, original, result.markdown)  # excluded from history
     crops = figures_dir / str(job.id)
-    if crops.is_dir() and not paths.figures.exists():
+    if crops.is_dir() and safe_io.entry_kind(paths.root, paths.figures) == "none":
         shutil.copytree(crops, paths.figures)
     return changed
 
@@ -176,8 +217,9 @@ def _materialize_files(
 async def materialize_document(
     db: AsyncSession, settings: Settings, document: Document
 ) -> DocumentPaths:
-    """Make sure the document's directory exists with its files; idempotent."""
-    paths = await document_paths(db, settings, document)
+    """Make sure the document's directory exists with its files; idempotent. The path is
+    resolved under the workspace lock, after the row is re-read: a rename on the Files
+    page holds the same lock across its row write and its move (docs/workspace.md)."""
     job = (await db.execute(select(Job).where(Job.id == document.job_id))).scalar_one_or_none()
     if job is None:
         raise ApiError(404, "invalid_request", "No such job")
@@ -188,9 +230,15 @@ async def materialize_document(
         # An empty doc.md written now would never be replaced by the parse result
         # (materialization writes only what is missing), so there is nothing to edit yet.
         raise ApiError(409, "invalid_request", "The document has no parse result to edit yet")
-    async with workspace_lock(paths.root):
-        if not paths.directory.exists():
-            await ensure_within_quota(settings, paths.root)
+    root = user_root(settings.workspaces_dir, document.user_id)
+    async with workspace_lock(root):
+        try:
+            await db.refresh(document)
+        except InvalidRequestError as exc:
+            raise ApiError(404, "invalid_request", "No such document") from exc
+        paths = await document_paths(db, settings, document)
+        if safe_io.entry_kind(root, paths.directory) == "none":
+            await ensure_within_quota(settings, root)
         changed = await asyncio.to_thread(
             _materialize_files,
             paths,
@@ -201,7 +249,11 @@ async def materialize_document(
         )
         if changed:
             await asyncio.to_thread(
-                git.commit_all, paths.root, git.USER_AUTHOR, f"materialize {paths.relative}"
+                git.commit_paths,
+                paths.root,
+                git.USER_AUTHOR,
+                f"materialize {paths.relative}",
+                [paths.relative],
             )
     return paths
 
@@ -217,42 +269,56 @@ async def ensure_within_quota(settings: Settings, root: Path) -> None:
 
 
 def keep_source(root: Path, relative: Path, source: Path, *, copy: bool = False) -> Path:
-    """Move a finished parse's upload into its document directory (docs/jobs.md
-    § Retention). Synchronous: called by the worker at terminal state."""
+    """Copy a finished parse's upload into its document directory as `source.<ext>`, and
+    unless `copy`, remove the upload (docs/jobs.md § Retention). Written through a
+    descriptor opened without following anything, like every workspace file."""
     git.ensure_repo(root)
     directory = root / relative
-    if not no_symlinks(root, directory):
-        raise ApiError(409, "invalid_request", "The document's directory is not a directory")
+    if safe_io.entry_kind(root, directory) not in ("dir", "none"):
+        raise ApiError(409, "invalid_request", NOT_PLAIN)
     directory.mkdir(parents=True, exist_ok=True)
     suffix = source.suffix.lower()[:16] or ".bin"
     target = directory / f"{SOURCE_STEM}{suffix}"
-    if target.is_symlink() or (target.exists() and not plain_entry(target)):
-        target.unlink()
-    if copy:
-        shutil.copy2(str(source), str(target))
-    else:
-        shutil.move(str(source), str(target))
+    if safe_io.entry_kind(root, target) == "dir":
+        shutil.rmtree(target)
+    with source.open("rb") as reader:
+        safe_io.write_from(root, target, reader)
+    if not copy:
+        source.unlink(missing_ok=True)
     return target
+
+
+async def adopt_source(db: AsyncSession, settings: Settings, document: Document, job: Job) -> None:
+    """The library row arrived after its parse finished, so the worker found no document
+    to keep the upload for and left it in place (docs/jobs.md § Retention): take it now."""
+    if job.status != "succeeded" or not job.source_path or job.source_deleted_at is not None:
+        return
+    source = Path(job.source_path)
+    if not source.is_file():
+        return
+    root = user_root(settings.workspaces_dir, document.user_id)
+    async with workspace_lock(root):
+        await db.refresh(document)
+        relative = document_relative_dir(
+            await folder_names(db, document.user_id, document.folder_id), document.name
+        )
+        try:
+            await ensure_within_quota(settings, root)
+        except ApiError:
+            source.unlink(missing_ok=True)
+        else:
+            await asyncio.to_thread(keep_source, root, relative, source)
+    job.source_deleted_at = utcnow()
+    await db.commit()
 
 
 # --- content ------------------------------------------------------------------------------
 
 
-def _text_of(path: Path, max_bytes: int) -> str:
-    """The file's text, or a refusal when the shell inflated it past what the API opens
-    (docs/workspace.md § Revisions): the whole file is read into memory, so its size is
-    checked first."""
-    if not path.exists():
-        return ""
-    if path.stat().st_size > max_bytes:
-        raise ApiError(409, "invalid_request", "The document file is too large to open")
-    return path.read_text()
-
-
 def _read(paths: DocumentPaths, max_bytes: int) -> Content:
     paths.check()
-    markdown = _text_of(paths.doc, max_bytes)
-    notes = _text_of(paths.notes, max_bytes)
+    markdown = _read_text(paths.root, paths.doc, max_bytes)
+    notes = _read_text(paths.root, paths.notes, max_bytes)
     return Content(
         markdown=markdown,
         revision=revision_of(markdown),
@@ -279,12 +345,12 @@ def _write_file(
     paths.check()
     if len(text.encode()) > max_bytes:
         raise ApiError(409, "invalid_request", "The content is too large to save")
-    current = _text_of(path, max_bytes)
+    current = _read_text(paths.root, path, max_bytes)
     if revision_of(current) != base_revision:
         raise ApiError(409, "invalid_request", "The file changed since it was loaded")
     if text != current:
-        path.write_text(text)
-        git.commit_all(paths.root, author, message)
+        _write_text(paths.root, path, text)
+        git.commit_paths(paths.root, author, message, [path.relative_to(paths.root)])
     return revision_of(text)
 
 
@@ -343,34 +409,40 @@ async def revisions(db: AsyncSession, settings: Settings, document: Document) ->
 
 
 def _revert(paths: DocumentPaths, commit: str, max_bytes: int) -> str:
+    """Undo every path the commit touched — a shell revision may have changed files
+    beyond this document — writing each one as it was in the commit's parent, where it
+    lives now if it was moved since (docs/workspace.md § Revisions)."""
     paths.check()
-    if not git.is_commit(paths.root, commit):
+    root = paths.root
+    if not git.is_commit(root, commit):
         raise ApiError(404, "invalid_request", "No such revision")
-    parent = git.parent_of(paths.root, commit)
-    restored = 0
-    for relative, path in ((paths.doc_relative, paths.doc), (paths.notes_relative, paths.notes)):
-        # The file may have lived elsewhere when the commit was made: a renamed or moved
-        # document keeps its history, and a revert must read it where it was then.
-        at_commit, at_parent = git.paths_at(paths.root, commit, relative)
+    parent = git.parent_of(root, commit)
+    moved = git.renames_since(root, commit)
+    restored: list[Path] = []
+    for status, then in git.changed_paths(root, commit):
+        now = moved.get(then, then)
         try:
-            after = git.show(paths.root, commit, at_commit, max_bytes) if at_commit else None
-            before = (
-                git.show(paths.root, parent, at_parent, max_bytes) if parent and at_parent else None
-            )
+            if status == "A":
+                # The commit created the file; the fixed files of a document are emptied
+                # rather than removed, so the directory keeps its shape.
+                if now.name in (DOC_FILE, NOTES_FILE):
+                    safe_io.write_text(root, root / now, "")
+                elif not safe_io.remove_file(root, root / now):
+                    continue
+            else:
+                before = git.show_bytes(root, parent, then, max_bytes) if parent else None
+                if before is None:
+                    continue
+                safe_io.write_bytes(root, root / now, before)
         except git.GitError as exc:
             raise ApiError(409, "invalid_request", "That revision is too large to restore") from exc
-        if before == after:
-            continue
-        if before is None:
-            # The commit created the file; reverting it makes it empty, never deletes it —
-            # the document directory keeps its shape.
-            before = ""
-        path.write_text(before)
-        restored += 1
-    if restored == 0:
-        raise ApiError(400, "invalid_request", "That revision changed nothing in this document")
-    git.commit_all(paths.root, git.USER_AUTHOR, f"revert {commit[:12]} in {paths.relative}")
-    return revision_of(paths.doc.read_text())
+        except (safe_io.UnsafeEntry, OSError) as exc:
+            raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
+        restored.append(now)
+    if not restored:
+        raise ApiError(400, "invalid_request", "That revision changed nothing")
+    git.commit_paths(root, git.USER_AUTHOR, f"revert {commit[:12]}", restored)
+    return revision_of(_read_text(root, paths.doc, max_bytes))
 
 
 async def revert(db: AsyncSession, settings: Settings, document: Document, commit: str) -> str:
@@ -386,14 +458,16 @@ def _move_tree(root: Path, source: Path, target: Path, message: str) -> None:
     git.ensure_repo(root)
     if not (root / source).exists() or source == target:
         return
+    touched = [source, target]
     if (root / target).exists():
         # Something else sits where the row now points — a directory the shell made under
         # that name. It moves aside, so the document lands where the database says and
         # the squatter keeps what it holds (docs/workspace.md § Layout).
         aside = target.with_name(f"{target.name} ({uuid.uuid4().hex[:6]})")
         git.move(root, root / target, root / aside)
+        touched.append(aside)
     git.move(root, root / source, root / target)
-    git.commit_all(root, git.USER_AUTHOR, message)
+    git.commit_paths(root, git.USER_AUTHOR, message, touched)
 
 
 async def move_path(settings: Settings, user_id: int, source: Path, target: Path) -> None:
@@ -410,7 +484,7 @@ def _remove_tree(root: Path, relative: Path, message: str) -> None:
     if not target.exists():
         return
     shutil.rmtree(target, ignore_errors=True)
-    git.commit_all(root, git.USER_AUTHOR, message)
+    git.commit_paths(root, git.USER_AUTHOR, message, [relative])
 
 
 async def remove_path(settings: Settings, user_id: int, relative: Path) -> None:

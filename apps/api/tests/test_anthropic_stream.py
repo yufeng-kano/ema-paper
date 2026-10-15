@@ -212,3 +212,19 @@ async def test_upstream_failures_map_onto_the_shared_error_classes(key) -> None:
     with pytest.raises(UpstreamError) as overloaded:
         await collect(key, body)
     assert overloaded.value.transient
+
+
+@respx.mock
+async def test_an_upstream_error_is_stored_by_type_never_by_its_text(key) -> None:
+    leaky = sse(
+        {
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": "key sk-ant-SECRET rejected"},
+        }
+    )
+    respx.post(MESSAGES_URL).mock(return_value=httpx.Response(200, content=leaky))
+    with pytest.raises(UpstreamError) as raised:
+        async for _ in stream_messages(key, {"messages": []}, betas=(), max_bytes=1_000_000):
+            pass
+    assert "SECRET" not in str(raised.value)
+    assert "invalid_request_error" in str(raised.value)

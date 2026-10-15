@@ -280,6 +280,9 @@ class Job(Base):
     pages_done: Mapped[int] = mapped_column(Integer, default=0)
     source_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     source_deleted_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
+    # A library upload: the original is kept for its document (docs/jobs.md § Retention),
+    # even when the document row lands after the parse has finished.
+    retain_source: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     started_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)

@@ -57,14 +57,18 @@ class PdfInfo:
         return self.page_sizes[0]
 
 
-async def _run(args: list[str], *, cwd: Path, timeout: float) -> bytes:
-    """Run a Poppler tool and return stdout; kill the child if it overruns the timeout."""
+async def _run(
+    args: list[str], *, cwd: Path, timeout: float, pass_fds: tuple[int, ...] = ()
+) -> bytes:
+    """Run a Poppler tool and return stdout; kill the child if it overruns the timeout.
+    `pass_fds` lets a caller hand the tool an already-open file as `/proc/self/fd/N`."""
     try:
         process = await asyncio.create_subprocess_exec(
             *args,
             cwd=str(cwd),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            pass_fds=pass_fds,
         )
     except OSError as exc:  # Poppler not installed on this host.
         raise PopplerError(f"could not start {args[0]}") from exc
@@ -89,13 +93,18 @@ async def _run(args: list[str], *, cwd: Path, timeout: float) -> bytes:
 
 
 async def pdf_info(
-    pdf_path: Path, *, cwd: Path, timeout: float = DEFAULT_TIMEOUT_SECONDS
+    pdf_path: Path,
+    *,
+    cwd: Path,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    pass_fds: tuple[int, ...] = (),
 ) -> PdfInfo:
     """Page count and per-page dimensions. Raises `PopplerError` for unreadable files."""
     stdout = await _run(
         [PDFINFO, "-f", "1", "-l", str(PAGE_SIZE_LIST_LIMIT), str(pdf_path)],
         cwd=cwd,
         timeout=timeout,
+        pass_fds=pass_fds,
     )
     text = stdout.decode("utf-8", "replace")
 
@@ -129,6 +138,7 @@ async def render_page(
     *,
     cwd: Path,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    pass_fds: tuple[int, ...] = (),
 ) -> Path:
     """Render one page to PNG inside `cwd` and return the file path."""
     target = cwd / f"page-{page_no}"
@@ -149,6 +159,7 @@ async def render_page(
         ],
         cwd=cwd,
         timeout=timeout,
+        pass_fds=pass_fds,
     )
     rendered = target.with_suffix(".png")
     if not rendered.exists():

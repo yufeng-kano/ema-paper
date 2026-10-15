@@ -8,9 +8,7 @@ escape the tree or collide with the names the workspace reserves for itself.
 from __future__ import annotations
 
 import hashlib
-import os
 import re
-import stat
 import unicodedata
 from pathlib import Path
 
@@ -71,18 +69,6 @@ def segment_name(segment: str) -> str:
 def is_canonical_segment(segment: str) -> bool:
     """Whether a directory name is what `path_segment` makes of the name it encodes."""
     return path_segment(segment_name(segment)) == segment
-
-
-def plain_entry(path: Path) -> bool:
-    """Whether `path` is nothing, a regular file or a directory — never a FIFO, a device
-    or a socket, which a host read would block on or worse. Looked at without following."""
-    try:
-        mode = os.lstat(path).st_mode
-    except FileNotFoundError:
-        return True
-    except OSError:
-        return False
-    return stat.S_ISREG(mode) or stat.S_ISDIR(mode)
 
 
 def no_symlinks(root: Path, path: Path) -> bool:

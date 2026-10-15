@@ -44,6 +44,7 @@ from ..upstream.client import (
 )
 from ..workspace import git
 from ..workspace.documents import DocumentPaths, ensure_within_quota, materialize_document
+from ..workspace.locks import shell_lock
 from ..workspace.reconcile import reconcile_user
 from . import chat_events, chat_tools
 
@@ -480,18 +481,22 @@ async def _run_tool_unguarded(ctx: TurnContext, block: dict, malformed: set[str]
         if ctx.sandbox is None:
             outcome = chat_tools.ToolOutcome("No sandbox on this deployment.", is_error=True)
         else:
-            outcome = await chat_tools.run_bash(
-                ctx.sandbox,
-                ctx.turn.user_id,
-                ctx.conversation.session,
-                tool_input,
-                max_chars=max_chars,
-                timeout_seconds=ctx.settings.chat_bash_timeout_seconds,
-            )
-            # What the shell changed is a revision of its own (docs/workspace.md).
-            outcome = await chat_tools.commit_shell_changes(
-                ctx.paths.root, outcome, tool_input, author, max_chars=max_chars
-            )
+            # One shell at a time per user, through the command *and* its commit: two
+            # conversations' shells must never have the tree dirty together, or one's
+            # revision would carry the other's half-written files (docs/chat.md § Tools).
+            async with shell_lock(ctx.paths.root):
+                outcome = await chat_tools.run_bash(
+                    ctx.sandbox,
+                    ctx.turn.user_id,
+                    ctx.conversation.session,
+                    tool_input,
+                    max_chars=max_chars,
+                    timeout_seconds=ctx.settings.chat_bash_timeout_seconds,
+                )
+                # What the shell changed is a revision of its own (docs/workspace.md).
+                outcome = await chat_tools.commit_shell_changes(
+                    ctx.paths.root, outcome, tool_input, author, max_chars=max_chars
+                )
             if outcome.edit is not None:
                 # The library follows the tree before the viewer is told to reload, so
                 # the reload finds the document where the shell left it.
@@ -507,10 +512,16 @@ async def _run_tool_unguarded(ctx: TurnContext, block: dict, malformed: set[str]
         )
     elif name == "view_page":
         outcome = await chat_tools.view_page(
-            ctx.paths, tool_input, page_count=ctx.job.page_count, render_slots=ctx.render_slots
+            ctx.paths,
+            tool_input,
+            page_count=ctx.job.page_count,
+            render_slots=ctx.render_slots,
+            max_bytes=ctx.settings.upload_max_bytes,
         )
     elif name == "view_figure":
-        outcome = await chat_tools.view_figure(ctx.paths, tool_input)
+        outcome = await chat_tools.view_figure(
+            ctx.paths, tool_input, max_bytes=ctx.settings.content_max_bytes
+        )
     else:
         outcome = chat_tools.ToolOutcome(f"unknown tool {name!r}", is_error=True)
     return await _report_tool(ctx, tool_use_id, name, outcome)

@@ -27,7 +27,7 @@ from sightread.db.models import (
     UsageLog,
 )
 from sightread.jobs import chat_runner, chat_tools
-from sightread.jobs.queue import claim_next_turn
+from sightread.jobs.queue import claim_next_turn, fail_turn
 from sightread.sandbox.client import ExecResult, SandboxClient
 from sightread.workspace import documents as workspace_documents
 from sightread.workspace import git
@@ -542,20 +542,30 @@ async def test_view_page_and_view_figure_read_the_documents_own_files(tmp_path, 
     Image.new("RGB", (40, 30), "white").save(paths.figures / "p1_100_100_400_600.png")
 
     page = await chat_tools.view_page(
-        paths, {"page": 1}, page_count=3, render_slots=asyncio.Semaphore(1)
+        paths, {"page": 1}, page_count=3, render_slots=asyncio.Semaphore(1), max_bytes=10_000_000
     )
     assert not page.is_error
     assert page.content[0]["type"] == "image"
     assert page.content[0]["source"]["media_type"] == "image/png"
     assert page.content[1]["text"] == "Page 1."
     too_far = await chat_tools.view_page(
-        paths, {"page": 9}, page_count=3, render_slots=asyncio.Semaphore(1)
+        paths, {"page": 9}, page_count=3, render_slots=asyncio.Semaphore(1), max_bytes=10_000_000
     )
     assert too_far.is_error
 
-    figure = await chat_tools.view_figure(paths, {"page": 1, "bbox": [100, 100, 400, 600]})
+    figure = await chat_tools.view_figure(
+        paths, {"page": 1, "bbox": [100, 100, 400, 600]}, max_bytes=1_000_000
+    )
     assert not figure.is_error and figure.content[0]["type"] == "image"
-    missing = await chat_tools.view_figure(paths, {"page": 2, "bbox": [0, 0, 10, 10]})
+    missing = await chat_tools.view_figure(
+        paths, {"page": 2, "bbox": [0, 0, 10, 10]}, max_bytes=1_000_000
+    )
+    # A crop the shell inflated is refused before it is read.
+    (paths.figures / "p1_100_100_400_600.png").write_bytes(b"x" * 2_000_000)
+    huge = await chat_tools.view_figure(
+        paths, {"page": 1, "bbox": [100, 100, 400, 600]}, max_bytes=1_000_000
+    )
+    assert huge.is_error
     assert missing.is_error
 
 
@@ -820,3 +830,84 @@ async def test_a_cancelled_queued_turn_ends_its_stream_and_a_winding_down_turn_b
         headers=CSRF_HEADERS,
     )
     assert blocked.status_code == 409
+
+
+async def test_a_file_with_a_live_conversation_cannot_be_deleted(chatting) -> None:
+    document_id = chatting.document_id
+    conversation_id = (
+        await chatting.post(
+            f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    await chatting.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
+    )
+    refused = await chatting.delete(f"/api/library/documents/{document_id}", headers=CSRF_HEADERS)
+    assert refused.status_code == 409
+    folders = (await chatting.get("/api/library")).json()["folders"]
+    folder_id = folders[0]["id"]
+    refused_folder = await chatting.delete(
+        f"/api/library/folders/{folder_id}", headers=CSRF_HEADERS
+    )
+    assert refused_folder.status_code == 409
+    await chatting.post(f"/api/conversations/{conversation_id}/cancel", headers=CSRF_HEADERS)
+    deleted = await chatting.delete(f"/api/library/documents/{document_id}", headers=CSRF_HEADERS)
+    assert deleted.status_code == 204
+
+
+async def test_a_worker_stopping_finishes_a_cancelled_turn(chatting) -> None:
+    document_id = chatting.document_id
+    conversation_id = (
+        await chatting.post(
+            f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    sent = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
+    )
+    turn_id = uuid.UUID(sent.json()["turn_id"])
+    async with chatting.app.state.sessionmaker() as db:
+        turn = await db.get(ChatTurn, turn_id)
+        turn.status = "running"
+        await db.commit()
+    await chatting.post(f"/api/conversations/{conversation_id}/cancel", headers=CSRF_HEADERS)
+    async with chatting.app.state.sessionmaker() as db:
+        await fail_turn(db, turn_id, "worker stopped")
+        turn = await db.get(ChatTurn, turn_id)
+        assert turn.status == "cancelled" and turn.finished_at is not None
+        events = (
+            (await db.execute(select(ChatEvent).where(ChatEvent.turn_id == turn_id)))
+            .scalars()
+            .all()
+        )
+    assert [event.event for event in events] == ["turn_error"]
+    again = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"text": "more"},
+        headers=CSRF_HEADERS,
+    )
+    assert again.status_code == 202
+
+
+async def test_an_oversized_json_body_is_refused_before_it_is_read(make_client, tmp_path) -> None:
+    client = make_client(workspaces_dir=str(tmp_path / "ws"), content_max_bytes=1_000)
+    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    user_id = (await client.get("/api/me")).json()["user"]["id"]
+    document_id = await _seed_document(client, user_id)
+    huge = {"markdown": "x" * 200_000, "base_revision": "0" * 64}
+    declared = await client.put(
+        f"/api/library/documents/{document_id}/content", json=huge, headers=CSRF_HEADERS
+    )
+    assert declared.status_code == 413
+
+    async def chunks():
+        yield json.dumps(huge).encode()
+
+    chunked = await client.put(
+        f"/api/library/documents/{document_id}/content",
+        content=chunks(),
+        headers={**CSRF_HEADERS, "Content-Type": "application/json"},
+    )
+    assert chunked.status_code == 413
+    small = await client.get(f"/api/library/documents/{document_id}/content")
+    assert small.status_code == 200
