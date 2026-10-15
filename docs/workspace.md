@@ -5,9 +5,8 @@ Every user owns one directory on the server, `{WORKSPACES_DIR}/{user_id}/`. It i
 ## Layout
 
 ```text
+{WORKSPACES_DIR}/.repos/{user_id}/     the user's git directory: outside the VM's mount
 {WORKSPACES_DIR}/{user_id}/            host side; the VM mounts it as /workspace
-├── .git/                              revision history, one repo per user
-├── .gitignore                         source files and the uv cache stay out of history
 ├── .sightread/
 │   └── results/{job_id}/result.md     the untouched parse output, written once, never edited
 └── files/                             one-to-one with the Files page's folder tree
@@ -28,13 +27,15 @@ Every user owns one directory on the server, `{WORKSPACES_DIR}/{user_id}/`. It i
 
 ## Revisions
 
-The user directory is one git repository; `sightread.workspace.git` is the only module that runs git (as a subprocess, with `GIT_DIR`/`GIT_WORK_TREE` set, never the user's global config).
+The user directory is the work tree of one git repository whose git directory lives **outside it**, at `{WORKSPACES_DIR}/.repos/{user_id}`; `sightread.workspace.git` is the only module that runs git (as a subprocess with `--git-dir` and `--work-tree` named explicitly, never the user's global config). The VM mounts only the user directory, so nothing a shell command does can reach the repository's configuration or hooks: git runs on the host, in the worker and the API, and a hook planted from the sandbox would run there with their credentials. The ignore rules live in the git directory too (`info/exclude`), not in a `.gitignore` the shell could edit. A `.git` directory the shell creates inside the tree is just a directory to the host's git (ignored at the root, a gitlink below it); it never becomes the repository.
+
+- **Fixed files are regular files.** `doc.md`, `notes.md`, `.meta.json`, `source.*` and the crops are read and written by the host, so before any of them is touched the workspace module checks that neither the file nor any directory between the user root and it is a symlink. A shell command that replaced `doc.md` with a link to `/proc/self/environ` or to another user's tree gets **409** from the content routes and an error result from the tools, never the target's bytes.
 
 - Every write through the API or a tool commits: `doc.md` saves from the viewer, `notes.md` saves, every edit the agent's editor tool makes, and whatever a shell command changed — after each tool call the runner commits a dirty tree. The commit author names who did it (`user` or `agent` with the conversation id), the message names the file and the tool.
 - **Writes are serialized per user** by a lock in the workspace module: the user editing in the viewer, two conversations editing in parallel and a `git mv` from a rename must not interleave their index operations. A rename, move or delete on the Files page holds that lock across its database write *and* the directory move, so no read can materialize a fresh copy at the new path in between.
 - **Revisions follow renames.** A revert reads the file where it lived at that commit (`git log --follow`), so the history of a document that was renamed or moved stays revertible.
 - `revision` in the API is the SHA-256 of the file's current content, not a commit id: a save carries the `base_revision` it was made from, and a save whose base no longer matches the file is refused with **409** — the client reloads and the reader sees what changed in between. The git log is the history the UI lists; `revert` writes the file as it was before a given commit and commits that, so undoing is itself a revision and nothing is ever rewritten.
-- `source.*`, `.sightread/` and the sandbox's package cache are gitignored: history records text, not binaries.
+- `source.*`, `.sightread/` and the sandbox's package cache are excluded from history: it records text, not binaries.
 
 ## The tree is the truth
 
@@ -42,9 +43,11 @@ A shell command in the sandbox can `mkdir`, `mv` and `rm` under `/workspace/file
 
 Reconciliation runs after turns and when the API itself moved something; it is not a watcher. A change made from the shell between turns shows on the Files page after the next turn.
 
+A directory the shell named in a way `path_segment()` would not — `.report`, `_report` — is first moved to the segment that name encodes to (`_.report`, `__report`, one commit under the workspace lock) and then recorded under the name as typed, so the row's name and its directory agree and the next read finds the shell's edits instead of materializing a fresh copy beside them. A directory whose canonical path is already taken is left where it is and logged, never recorded.
+
 ## Quota
 
-`WORKSPACE_QUOTA_BYTES` (default 10 GiB) is the size the Usage page shows the workspace against and the point past which the API refuses to materialize another document (**409**) and a chat turn fails before it starts — no shell runs in a full workspace. Hard enforcement is the operator's: mount `{WORKSPACES_DIR}` on a filesystem with per-directory quotas, or back each user directory with a fixed-size image ([sandbox.md](./sandbox.md) § Operations). Usage is measured by walking the tree (`du`), cached per user for the status route.
+`WORKSPACE_QUOTA_BYTES` (default 10 GiB) is the size the Usage page shows the workspace against and the point past which the API refuses to materialize another document (**409**) and a chat turn fails before it starts — no shell runs in a full workspace. Hard enforcement is the operator's: mount `{WORKSPACES_DIR}` on a filesystem with per-directory quotas, or back each user directory with a fixed-size image ([sandbox.md](./sandbox.md) § Operations). Usage is measured by walking the tree (`du`) plus the git directory beside it, which the status route lists as its own line.
 
 ## Backups
 

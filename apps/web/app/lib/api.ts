@@ -258,14 +258,15 @@ export interface ChatMessage {
   id: number
   role: 'user' | 'assistant'
   content: ContentBlock[]
-  turn_id: number
+  /** The turn that stored it (a UUID); null only for rows older than the turn link. */
+  turn_id: string | null
   created_at: string
 }
 
 export type TurnStatus = 'queued' | 'running' | 'done' | 'failed' | 'cancelled' | string
 
 export interface ChatTurn {
-  id: number
+  id: string
   status: TurnStatus
   error: string | null
 }
@@ -734,8 +735,8 @@ export function getConversation(id: number): Promise<ConversationResponse> {
  *  turns are already running, 400 when the chat agent has no model. */
 export function sendMessage(
   id: number,
-  body: { text: string; selection?: string },
-): Promise<{ turn_id: number }> {
+  body: { text: string; selection?: string; locale: string },
+): Promise<{ turn_id: string; message_id: number }> {
   return request('POST', `/api/conversations/${id}/messages`, body)
 }
 

@@ -567,3 +567,111 @@ async def test_an_editor_filesystem_failure_is_a_tool_result(tmp_path) -> None:
         max_chars=1000,
     )
     assert outcome.is_error
+
+
+def test_an_interrupted_tool_call_is_answered_on_replay() -> None:
+    history = [
+        {"role": "user", "content": [{"type": "text", "text": "go"}]},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "running"},
+                {"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "ls"}},
+                {"type": "tool_use", "id": "t2", "name": "bash", "input": {"command": "pwd"}},
+            ],
+        },
+        {"role": "user", "content": [{"type": "text", "text": "and now?"}]},
+    ]
+    repaired = chat_runner.repaired(history)
+    assert [message["role"] for message in repaired] == ["user", "assistant", "user", "user"]
+    results = repaired[2]["content"]
+    assert [block["tool_use_id"] for block in results] == ["t1", "t2"]
+    assert all(block["is_error"] for block in results)
+    assert chat_runner.repaired(repaired) == repaired
+    # A history with every call answered is returned as it is.
+    answered = history[:2] + [
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "a"},
+                {"type": "tool_result", "tool_use_id": "t2", "content": "b"},
+            ],
+        }
+    ]
+    assert chat_runner.repaired(answered) == answered
+
+
+async def test_a_message_belongs_to_its_turn_and_a_live_thread_cannot_be_deleted(
+    chatting,
+) -> None:
+    document_id = chatting.document_id
+    conversation_id = (
+        await chatting.post(
+            f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    sent = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"text": "hi", "locale": "zh-TW"},
+        headers=CSRF_HEADERS,
+    )
+    assert sent.status_code == 202, sent.text
+    turn_id = sent.json()["turn_id"]
+    thread = (await chatting.get(f"/api/conversations/{conversation_id}")).json()
+    assert thread["messages"][0]["turn_id"] == turn_id
+    async with chatting.app.state.sessionmaker() as db:
+        turn = await db.get(ChatTurn, uuid.UUID(turn_id))
+        assert turn.locale == "zh-TW"
+
+    refused = await chatting.delete(f"/api/conversations/{conversation_id}", headers=CSRF_HEADERS)
+    assert refused.status_code == 409
+    await chatting.post(f"/api/conversations/{conversation_id}/cancel", headers=CSRF_HEADERS)
+    deleted = await chatting.delete(f"/api/conversations/{conversation_id}", headers=CSRF_HEADERS)
+    assert deleted.status_code == 204
+
+
+async def test_a_cancel_drops_a_silent_stream(chatting, monkeypatch) -> None:
+    """The upstream has sent nothing for a while; the cancel must not wait for it."""
+    monkeypatch.setattr(chat_runner, "CANCEL_POLL_SECONDS", 0.05)
+    document_id = chatting.document_id
+    conversation_id = (
+        await chatting.post(
+            f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    sent = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
+    )
+    turn_id = uuid.UUID(sent.json()["turn_id"])
+    closed = asyncio.Event()
+
+    async def silent(*_args, **_kwargs):
+        try:
+            await asyncio.sleep(30)
+        finally:
+            closed.set()
+        yield  # pragma: no cover - never reached
+
+    monkeypatch.setattr(chat_runner, "stream_messages", silent)
+
+    async def cancel_soon() -> None:
+        await asyncio.sleep(0.2)
+        async with chatting.app.state.sessionmaker() as db:
+            turn = await db.get(ChatTurn, turn_id)
+            turn.status = "cancelled"
+            await db.commit()
+
+    canceller = asyncio.create_task(cancel_soon())
+    async with asyncio.timeout(5):
+        await _run_queued_turn(chatting)
+    await canceller
+    assert closed.is_set()
+    async with chatting.app.state.sessionmaker() as db:
+        turn = await db.get(ChatTurn, turn_id)
+        assert turn.status == "cancelled"
+        stored = (
+            (await db.execute(select(Message).where(Message.conversation_id == conversation_id)))
+            .scalars()
+            .all()
+        )
+    assert [row.role for row in stored] == ["user"]

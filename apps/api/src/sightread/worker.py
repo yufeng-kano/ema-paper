@@ -90,6 +90,14 @@ async def run_worker(stop: asyncio.Event) -> None:
                     async with sessionmaker() as db:
                         await fail_turn(db, turn_id, "worker stopped")
                     logger.info("failed turn %s on shutdown", turn_id)
+                elif running.exception() is not None:
+                    # The runner answers for the turn's own faults; what escaped it is
+                    # ours, and the row must not stay `running` with nobody driving it.
+                    logger.error(
+                        "turn %s raised past its runner", turn_id, exc_info=running.exception()
+                    )
+                    async with sessionmaker() as db:
+                        await fail_turn(db, turn_id, "internal error")
                 continue
 
             logger.info("running job %s", job_id)

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import shutil
 import uuid
 from dataclasses import dataclass
@@ -30,6 +31,8 @@ from .layout import (
     SOURCE_STEM,
     document_relative_dir,
     files_root,
+    git_dir,
+    no_symlinks,
     results_root,
     user_root,
 )
@@ -64,9 +67,18 @@ class DocumentPaths:
     def source(self) -> Path | None:
         """`source.<ext>` when the original upload was kept."""
         for candidate in sorted(self.directory.glob(f"{SOURCE_STEM}.*")):
-            if candidate.is_file():
+            if candidate.is_file() and no_symlinks(self.root, candidate):
                 return candidate
         return None
+
+    def check(self) -> None:
+        """Refuse the directory when the shell turned it, or any fixed file in it, into a
+        symlink: the host reads these as itself (docs/workspace.md § Revisions)."""
+        for path in (self.directory, self.doc, self.notes, self.meta, self.figures):
+            if not no_symlinks(self.root, path):
+                raise ApiError(
+                    409, "invalid_request", "The document's files are not regular files"
+                )
 
     @property
     def doc_relative(self) -> Path:
@@ -139,6 +151,7 @@ def _materialize_files(
     """Write what is missing. Returns whether anything was written (needs a commit)."""
     git.ensure_repo(paths.root)
     files_root(paths.root).mkdir(parents=True, exist_ok=True)
+    paths.check()
     paths.directory.mkdir(parents=True, exist_ok=True)
     changed = False
     changed |= _write_if_missing(paths.doc, result.markdown)
@@ -196,7 +209,7 @@ async def materialize_document(
 async def ensure_within_quota(settings: Settings, root: Path) -> None:
     """Refuse new material once the workspace is at its quota (docs/workspace.md § Quota).
     A walk of the tree: cheap at the sizes a quota allows, and only on growth."""
-    used = await asyncio.to_thread(directory_size, root)
+    used = await asyncio.to_thread(workspace_size, root)
     if used >= settings.workspace_quota_bytes:
         raise ApiError(
             409, "invalid_request", "The workspace is at its quota; free some space first"
@@ -208,9 +221,13 @@ def keep_source(root: Path, relative: Path, source: Path, *, copy: bool = False)
     § Retention). Synchronous: called by the worker at terminal state."""
     git.ensure_repo(root)
     directory = root / relative
+    if not no_symlinks(root, directory):
+        raise ApiError(409, "invalid_request", "The document's directory is not a directory")
     directory.mkdir(parents=True, exist_ok=True)
     suffix = source.suffix.lower()[:16] or ".bin"
     target = directory / f"{SOURCE_STEM}{suffix}"
+    if target.is_symlink():
+        target.unlink()
     if copy:
         shutil.copy2(str(source), str(target))
     else:
@@ -222,6 +239,7 @@ def keep_source(root: Path, relative: Path, source: Path, *, copy: bool = False)
 
 
 def _read(paths: DocumentPaths) -> Content:
+    paths.check()
     markdown = paths.doc.read_text() if paths.doc.exists() else ""
     notes = paths.notes.read_text() if paths.notes.exists() else ""
     return Content(
@@ -241,6 +259,7 @@ async def read_content(db: AsyncSession, settings: Settings, document: Document)
 def _write_file(
     paths: DocumentPaths, path: Path, text: str, base_revision: str, author: str, message: str
 ) -> str:
+    paths.check()
     current = path.read_text() if path.exists() else ""
     if revision_of(current) != base_revision:
         raise ApiError(409, "invalid_request", "The file changed since it was loaded")
@@ -303,6 +322,7 @@ async def revisions(db: AsyncSession, settings: Settings, document: Document) ->
 
 
 def _revert(paths: DocumentPaths, commit: str) -> str:
+    paths.check()
     if not git.is_commit(paths.root, commit):
         raise ApiError(404, "invalid_request", "No such revision")
     parent = git.parent_of(paths.root, commit)
@@ -371,14 +391,19 @@ async def remove_path(settings: Settings, user_id: int, relative: Path) -> None:
 
 
 def directory_size(path: Path) -> int:
-    """Bytes under `path`, following nothing."""
+    """Bytes under `path`, following nothing: a symlink counts as itself, never its target."""
     total = 0
-    if not path.exists():
+    if not path.is_dir() or path.is_symlink():
         return 0
-    for entry in path.rglob("*"):
-        try:
-            if entry.is_file() and not entry.is_symlink():
-                total += entry.stat().st_size
-        except OSError:
-            continue
+    for current, _dirs, files in os.walk(path, followlinks=False):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(current, name)).st_size
+            except OSError:
+                continue
     return total
+
+
+def workspace_size(root: Path) -> int:
+    """What the user holds: the tree and the history beside it."""
+    return directory_size(root) + directory_size(git_dir(root))

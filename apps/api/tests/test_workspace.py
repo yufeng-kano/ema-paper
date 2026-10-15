@@ -6,6 +6,7 @@ Real git in a temporary directory; no database beyond the SQLite fallback.
 from __future__ import annotations
 
 import json
+import shutil
 import uuid
 from pathlib import Path
 
@@ -16,7 +17,14 @@ from sightread.config import Settings
 from sightread.db.models import Document, Folder, Job, Result, User
 from sightread.errors import ApiError
 from sightread.workspace import documents, git, reconcile
-from sightread.workspace.layout import inside, path_segment, user_root
+from sightread.workspace.layout import (
+    git_dir,
+    inside,
+    is_canonical_segment,
+    path_segment,
+    segment_name,
+    user_root,
+)
 from tests.conftest import KANO_BASE, TEST_SECRET_KEY
 
 
@@ -186,3 +194,93 @@ async def test_materialize_refuses_a_full_workspace(sessionmaker, tmp_path) -> N
         with pytest.raises(ApiError) as refused:
             await documents.materialize_document(db, settings, document)
         assert refused.value.status_code == 409
+
+
+async def test_the_git_directory_is_outside_the_tree_and_a_planted_hook_never_runs(
+    sessionmaker, tmp_path
+) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        _, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+        root = paths.root
+        assert not (root / ".git").exists()
+        assert (git_dir(root) / "HEAD").is_file()
+        assert "source.*" in (git_dir(root) / "info" / "exclude").read_text()
+
+        # What a shell command could do: a `.git` of its own with a hook in it.
+        hook_dir = root / ".git" / "hooks"
+        hook_dir.mkdir(parents=True)
+        hook = hook_dir / "pre-commit"
+        hook.write_text(f"#!/bin/sh\ntouch {tmp_path / 'hook-ran'}\n")
+        hook.chmod(0o755)
+        content = await documents.read_content(db, settings, document)
+        await documents.write_content(
+            db, settings, document, markdown="# Title\n\nEdited\n", base_revision=content.revision
+        )
+        assert not (tmp_path / "hook-ran").exists()
+        assert git.log(root)[0].message.startswith("edit ")
+        assert not any(name.startswith(".git/") for name in git.log(root)[0].files)
+
+
+async def test_a_symlinked_document_file_is_refused(sessionmaker, tmp_path) -> None:
+    settings = _settings(tmp_path)
+    outside = tmp_path / "secret.txt"
+    outside.write_text("not yours")
+    async with sessionmaker() as db:
+        _, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+        content = await documents.read_content(db, settings, document)
+        paths.doc.unlink()
+        paths.doc.symlink_to(outside)
+        with pytest.raises(ApiError) as refused:
+            await documents.read_content(db, settings, document)
+        assert refused.value.status_code == 409
+        with pytest.raises(ApiError):
+            await documents.write_content(
+                db, settings, document, markdown="x", base_revision=content.revision
+            )
+        assert outside.read_text() == "not yours"
+        # The directory itself as a link is no better.
+        paths.doc.unlink()
+        paths.doc.write_text(content.markdown)
+        elsewhere = tmp_path / "elsewhere"
+        shutil.copytree(paths.directory, elsewhere)
+        shutil.rmtree(paths.directory)
+        paths.directory.symlink_to(elsewhere)
+        with pytest.raises(ApiError):
+            await documents.read_content(db, settings, document)
+
+
+def test_segments_decode_and_know_whether_they_are_canonical() -> None:
+    assert segment_name("_.report") == ".report"
+    assert segment_name("report") == "report"
+    assert is_canonical_segment("report")
+    assert is_canonical_segment("_.report")
+    assert is_canonical_segment("__report")
+    assert not is_canonical_segment(".report")
+    assert not is_canonical_segment("_report")
+
+
+async def test_reconcile_canonicalizes_a_directory_the_shell_named(sessionmaker, tmp_path) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+        root = paths.root
+        shell_named = paths.directory.with_name(".report")
+        paths.directory.rename(shell_named)
+
+        changed = await reconcile.reconcile_user(db, settings, user.id)
+        assert changed == 1
+        row = (await db.execute(select(Document).where(Document.id == document.id))).scalar_one()
+        assert row.name == ".report"
+        assert not shell_named.exists()
+        canonical = await documents.document_paths(db, settings, document)
+        assert canonical.directory == paths.directory.with_name("_.report")
+        assert canonical.doc.is_file()
+        # The next read finds the moved files, not a fresh copy beside them.
+        assert (
+            await documents.read_content(db, settings, document)
+        ).markdown == "# Title\n\nBody\n"
+        assert git.log(root)[0].message.startswith("canonicalize")

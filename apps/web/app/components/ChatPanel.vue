@@ -156,7 +156,7 @@ const props = defineProps<{
 /** The document's files changed on disk — an edit landed, or a revert — so reload them. */
 const emit = defineEmits<{ changed: [] }>()
 
-const { t } = useI18n()
+const { t, locale } = useI18n()
 const { resolve } = useApiError()
 
 // --- conversations --------------------------------------------------------------
@@ -284,7 +284,7 @@ async function loadDetail(id: number) {
       return
     }
     messages.value = [...detail.messages].sort((left, right) => left.id - right.id)
-    turns.value = [...detail.turns].sort((left, right) => left.id - right.id)
+    turns.value = [...detail.turns]
     conversations.value = conversations.value.map((row) =>
       row.id === id ? { ...row, title: detail.conversation.title, updated_at: detail.conversation.updated_at } : row,
     )
@@ -396,13 +396,16 @@ const cards = reactive(
   new Map<string, { reverted: boolean; undoCommit: string | null; redoCommit: string | null; pending: boolean }>(),
 )
 
-/** The turns in order — those the record lists, plus any a message names that it does not. */
+/** The turns in order — those the record lists (oldest first, as the API sends them), then
+ *  any a message names that it does not, in message order. */
 const turnOrder = computed(() => {
-  const ids = new Set<number>(turns.value.map((turn) => turn.id))
+  const ids: string[] = turns.value.map((turn) => turn.id)
   for (const message of messages.value) {
-    ids.add(message.turn_id)
+    if (message.turn_id !== null && !ids.includes(message.turn_id)) {
+      ids.push(message.turn_id)
+    }
   }
-  return [...ids].sort((left, right) => left - right)
+  return ids
 })
 
 function isTerminal(turn: ChatTurn | undefined, group: ChatEvent[] | undefined, stored: boolean): boolean {
@@ -423,7 +426,9 @@ const thread = computed<ThreadItem[]>(() => {
     const turn = turnById.get(turnId)
     const group = groups.value[index]
     const own = messages.value.filter((message) => message.turn_id === turnId)
-    const assistant = own.find((message) => message.role === 'assistant')
+    // One assistant message per model round: a tool-using turn has several, and the
+    // final answer is the last of them.
+    const assistants = own.filter((message) => message.role === 'assistant')
     const prefix = `t${turnId}`
 
     const userText = own
@@ -453,7 +458,7 @@ const thread = computed<ThreadItem[]>(() => {
       }
     }
 
-    const done = isTerminal(turn, group, assistant !== undefined)
+    const done = isTerminal(turn, group, assistants.length > 0)
 
     const toolItem = (id: string, name: string, input: Record<string, unknown>): ThreadItem => {
       const outcome = results.get(id)
@@ -485,21 +490,24 @@ const thread = computed<ThreadItem[]>(() => {
       }
     }
 
-    if (assistant) {
-      assistant.content.forEach((block, position) => {
-        if (block.type === 'text' && block.text.trim()) {
-          items.push({ kind: 'text', key: `${prefix}-text-${position}`, text: block.text.trim() })
-        } else if (block.type === 'thinking' && block.thinking.trim()) {
-          items.push({ kind: 'thinking', key: `${prefix}-think-${position}`, text: block.thinking.trim() })
-        } else if (block.type === 'tool_use') {
-          items.push(toolItem(block.id, block.name, block.input))
-          if (block.name === EDITOR_TOOL) {
-            const card = editItem(block.id, block.input)
-            if (card) {
-              items.push(card)
+    if (assistants.length > 0) {
+      assistants.forEach((message, round) => {
+        message.content.forEach((block, position) => {
+          const at = `${round}-${position}`
+          if (block.type === 'text' && block.text.trim()) {
+            items.push({ kind: 'text', key: `${prefix}-text-${at}`, text: block.text.trim() })
+          } else if (block.type === 'thinking' && block.thinking.trim()) {
+            items.push({ kind: 'thinking', key: `${prefix}-think-${at}`, text: block.thinking.trim() })
+          } else if (block.type === 'tool_use') {
+            items.push(toolItem(block.id, block.name, block.input))
+            if (block.name === EDITOR_TOOL) {
+              const card = editItem(block.id, block.input)
+              if (card) {
+                items.push(card)
+              }
             }
           }
-        }
+        })
       })
     } else if (group) {
       let text = ''
@@ -650,11 +658,16 @@ async function send() {
       }
     }
     const picked = selection.value
-    const { turn_id } = await sendMessage(id, picked ? { text, selection: picked } : { text })
+    const { turn_id } = await sendMessage(id, {
+      text,
+      ...(picked ? { selection: picked } : {}),
+      locale: locale.value,
+    })
     messages.value = [
       ...messages.value,
       {
-        id: -turn_id,
+        // Shown until the record is reloaded; negative so it never meets a stored id.
+        id: -(messages.value.length + 1),
         role: 'user',
         content: [{ type: 'text', text }],
         turn_id,

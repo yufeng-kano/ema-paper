@@ -438,6 +438,9 @@ class Conversation(Base):
     title: Mapped[str] = mapped_column(String(255), default="")
     # The shell this thread holds in the user's sandbox (docs/sandbox.md).
     session: Mapped[str] = mapped_column(String(64))
+    # Set by the first turn and kept: the stored thinking blocks belong to this model
+    # (docs/chat.md § History is append-only).
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
 
@@ -456,6 +459,8 @@ class ChatTurn(Base):
     message_id: Mapped[int] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(16))  # queued|running|succeeded|failed|cancelled
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The web app's locale when the message was sent: the language the turn answers in.
+    locale: Mapped[str] = mapped_column(String(16), default="en", server_default="en")
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     started_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)

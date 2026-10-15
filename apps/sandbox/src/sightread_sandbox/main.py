@@ -49,6 +49,7 @@ def create_app(settings: Settings | None = None, backend: Backend | None = None)
                 except Exception:  # noqa: BLE001 - the sweep must outlive one failure
                     logger.exception("idle sweep failed")
 
+        await backend.startup()
         task = asyncio.create_task(sweep())
         try:
             yield

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .layout import GITIGNORE
+from .layout import EXCLUDE_RULES, git_dir
 
 GIT = "git"
 GIT_TIMEOUT_SECONDS = 60.0
@@ -48,8 +48,19 @@ def _env() -> dict[str, str]:
 
 
 def _git(root: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    # The git directory is named on every call: a `.git` the shell plants in the work tree
+    # is never consulted, and no hook or config of the shell's runs here.
     proc = subprocess.run(  # noqa: S603 - fixed argv, no shell
-        [GIT, "-C", str(root), *args],
+        [
+            GIT,
+            "-C",
+            str(root),
+            "--git-dir",
+            str(git_dir(root)),
+            "--work-tree",
+            str(root),
+            *args,
+        ],
         env=_env(),
         capture_output=True,
         text=True,
@@ -64,14 +75,17 @@ def _git(root: Path, *args: str, check: bool = True) -> subprocess.CompletedProc
 def ensure_repo(root: Path) -> None:
     """Make `root` a repository with the workspace's ignore rules. Idempotent."""
     root.mkdir(parents=True, exist_ok=True)
-    if not (root / ".git").is_dir():
+    repo = git_dir(root)
+    if not (repo / "HEAD").is_file():
+        repo.mkdir(parents=True, exist_ok=True)
         _git(root, "init", "-q", "-b", "main")
         _git(root, "config", "user.name", "sightread")
         _git(root, "config", "user.email", "sightread@localhost")
         _git(root, "config", "core.quotePath", "false")
-    ignore = root / ".gitignore"
-    if not ignore.exists() or ignore.read_text() != GITIGNORE:
-        ignore.write_text(GITIGNORE)
+    exclude = repo / "info" / "exclude"
+    if not exclude.exists() or exclude.read_text() != EXCLUDE_RULES:
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        exclude.write_text(EXCLUDE_RULES)
 
 
 def commit_all(root: Path, author: str, message: str) -> str | None:

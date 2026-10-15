@@ -12,6 +12,8 @@ import unicodedata
 from pathlib import Path
 
 FILES_DIR = "files"
+# Beside the user directories, never inside one: the git directories the VMs cannot see.
+REPOS_DIR = ".repos"
 SIGHTREAD_DIR = ".sightread"
 RESULTS_DIR = "results"
 CACHE_DIR = ".cache"
@@ -29,11 +31,13 @@ RESERVED_SEGMENTS = frozenset({SIGHTREAD_DIR, META_FILE, CACHE_DIR, ".git", ".gi
 # separators (routes/library.py), this is the belt to that brace.
 _UNSAFE = re.compile(r"[\x00-\x1f\x7f/\\]")
 
-GITIGNORE = "\n".join(
+# The repository's `info/exclude`: kept in the git directory, out of the shell's reach.
+EXCLUDE_RULES = "\n".join(
     (
         "# Kept out of history: binaries and the sandbox's package cache (docs/workspace.md)",
-        f"{SIGHTREAD_DIR}/",
-        f"{CACHE_DIR}/",
+        f"/{SIGHTREAD_DIR}/",
+        f"/{CACHE_DIR}/",
+        "/.git/",
         f"**/{SOURCE_STEM}.*",
         f"**/{FIGURES_DIR}/",
         "",
@@ -44,6 +48,37 @@ GITIGNORE = "\n".join(
 def user_root(workspaces_dir: str | Path, user_id: int) -> Path:
     """`{WORKSPACES_DIR}/{user_id}` — what the user's VM mounts as /workspace."""
     return Path(workspaces_dir) / str(user_id)
+
+
+def git_dir(root: Path) -> Path:
+    """The user's git directory, `{WORKSPACES_DIR}/.repos/{user_id}`: beside the work tree,
+    outside anything the VM mounts (docs/workspace.md § Revisions)."""
+    return root.parent / REPOS_DIR / root.name
+
+
+def segment_name(segment: str) -> str:
+    """The name a canonical segment encodes: `path_segment`'s inverse."""
+    return segment[1:] if segment.startswith("_") else segment
+
+
+def is_canonical_segment(segment: str) -> bool:
+    """Whether a directory name is what `path_segment` makes of the name it encodes."""
+    return path_segment(segment_name(segment)) == segment
+
+
+def no_symlinks(root: Path, path: Path) -> bool:
+    """Whether no component of `path` below `root` is a symlink — the check every fixed
+    workspace file passes before the host reads or writes it (docs/workspace.md)."""
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return False
+    cursor = root
+    for part in relative.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            return False
+    return True
 
 
 def path_segment(name: str) -> str:

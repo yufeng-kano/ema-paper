@@ -70,6 +70,11 @@ class ShellSession:
     def alive(self) -> bool:
         return self._process is not None and self._process.returncode is None
 
+    @property
+    def busy(self) -> bool:
+        """Whether a command is running in this shell right now."""
+        return self._lock.locked()
+
     async def start(self) -> None:
         await self.close()
         self._process = await asyncio.create_subprocess_exec(

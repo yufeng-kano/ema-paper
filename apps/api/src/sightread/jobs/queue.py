@@ -307,7 +307,12 @@ async def count_active_turns(db: AsyncSession, user_id: int) -> int:
 
 
 async def enqueue_turn(
-    db: AsyncSession, *, user_id: int, conversation_id: int, message_id: int
+    db: AsyncSession,
+    *,
+    user_id: int,
+    conversation_id: int,
+    message_id: int,
+    locale: str = "en",
 ) -> ChatTurn:
     """Create the queued turn row. The caller commits, with the user message it answers."""
     turn = ChatTurn(
@@ -316,6 +321,7 @@ async def enqueue_turn(
         conversation_id=conversation_id,
         message_id=message_id,
         status="queued",
+        locale=locale,
         created_at=utcnow(),
     )
     db.add(turn)

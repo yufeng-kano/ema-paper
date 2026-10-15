@@ -95,7 +95,6 @@ async def _load(
     settings: Settings,
     turn_id: uuid.UUID,
     render_slots: asyncio.Semaphore,
-    locale: str,
 ) -> TurnContext:
     async with sessionmaker() as db:
         turn = await db.get(ChatTurn, turn_id)
@@ -115,11 +114,16 @@ async def _load(
                 )
             )
         ).scalar_one_or_none()
-        model = setting.model if setting else None
+        # The conversation's model is the model of its first turn, whatever the Agent page
+        # says now: the stored thinking blocks carry its signatures (docs/chat.md).
+        model = conversation.model or (setting.model if setting else None)
         if not model:
             raise TurnFailed("No model chosen for the chat agent: pick one on the Agent page")
         if setting and setting.connection_id is not None:
             raise TurnFailed("The chat agent runs on Kano Proxy only")
+        if conversation.model is None:
+            conversation.model = model
+            await db.commit()
         connection = await load_connection(db, settings, turn.user_id, None)
         if connection is None:
             raise TurnFailed("Kano Proxy is not connected: connect it on the Agent page")
@@ -146,7 +150,7 @@ async def _load(
         "page_count": str(job.page_count or 1),
         "bbox_format": job.bbox_format,
         "parse_model": job.model,
-        "locale": locale,
+        "locale": turn.locale or "en",
     }
     system = [
         {
@@ -178,6 +182,63 @@ async def _load(
     )
 
 
+INTERRUPTED_TOOL_RESULT = "The turn was interrupted before this tool call finished."
+
+
+def unanswered_tool_uses(messages: list[dict]) -> list[tuple[int, list[str]]]:
+    """Where the history has tool calls without results: the index of each assistant
+    message whose tool_use ids the next message does not all answer, with those ids."""
+    gaps: list[tuple[int, list[str]]] = []
+    for index, message in enumerate(messages):
+        if message["role"] != "assistant" or not isinstance(message["content"], list):
+            continue
+        ids = [
+            str(block.get("id"))
+            for block in message["content"]
+            if isinstance(block, dict) and block.get("type") == "tool_use"
+        ]
+        if not ids:
+            continue
+        answered: set[str] = set()
+        if index + 1 < len(messages) and messages[index + 1]["role"] == "user":
+            following = messages[index + 1]["content"]
+            if isinstance(following, list):
+                answered = {
+                    str(block.get("tool_use_id"))
+                    for block in following
+                    if isinstance(block, dict) and block.get("type") == "tool_result"
+                }
+        missing = [tool_id for tool_id in ids if tool_id not in answered]
+        if missing:
+            gaps.append((index, missing))
+    return gaps
+
+
+def _interrupted_results(ids: list[str]) -> list[dict]:
+    return [
+        {
+            "type": "tool_result",
+            "tool_use_id": tool_id,
+            "content": INTERRUPTED_TOOL_RESULT,
+            "is_error": True,
+        }
+        for tool_id in ids
+    ]
+
+
+def repaired(messages: list[dict]) -> list[dict]:
+    """The history with every gap an interrupted turn left — a tool call without its
+    result — closed by a user message of error results right after it. Computed on every
+    replay rather than stored, so it lands where the API needs it whatever was stored
+    after the gap; the same input gives the same output, and the cache prefix holds."""
+    repaired_messages = list(messages)
+    for index, missing in reversed(unanswered_tool_uses(messages)):
+        repaired_messages.insert(
+            index + 1, {"role": "user", "content": _interrupted_results(missing)}
+        )
+    return repaired_messages
+
+
 async def _history(ctx: TurnContext) -> list[dict]:
     async with ctx.sessionmaker() as db:
         rows = (
@@ -187,7 +248,7 @@ async def _history(ctx: TurnContext) -> list[dict]:
                 .order_by(Message.id)
             )
         ).scalars()
-        return [{"role": row.role, "content": row.content} for row in rows]
+        return repaired([{"role": row.role, "content": row.content} for row in rows])
 
 
 def build_request(ctx: TurnContext, messages: list[dict], *, since_marker: int) -> dict:
@@ -293,38 +354,70 @@ async def _stream_once(ctx: TurnContext, body: dict) -> CompletedMessage:
         betas=chat_agent.BETAS,
         max_bytes=ctx.settings.upstream_response_max_bytes,
     )
-    async for item in stream:
-        if isinstance(item, CompletedMessage):
-            completed = item
-            break
-        # A cancel must not wait out a ten-minute generation: the stream is dropped
-        # (closing the connection ends the generation), and nothing of it is stored.
-        if time.monotonic() - last_cancel_check >= CANCEL_POLL_SECONDS:
-            last_cancel_check = time.monotonic()
-            if await _cancelled(ctx):
-                await stream.aclose()
-                raise TurnCancelled()
-        event: StreamEvent = item
-        if event.kind == "text_delta":
-            text_buffer.append(event.text)
-            if sum(len(part) for part in text_buffer) >= TEXT_FLUSH_CHARS:
+    # The stream is read by its own task into a queue, so a cancel is noticed on a timer
+    # whether or not the upstream is sending anything: a silent generation is dropped as
+    # promptly as a chatty one (docs/chat.md § Conversations, turns, events).
+    queue: asyncio.Queue[StreamEvent | CompletedMessage | Exception | None] = asyncio.Queue()
+
+    async def pump() -> None:
+        try:
+            async for item in stream:
+                await queue.put(item)
+                if isinstance(item, CompletedMessage):
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - relayed to the consumer as is
+            await queue.put(exc)
+            return
+        await queue.put(None)
+
+    reader = asyncio.create_task(pump())
+    try:
+        while True:
+            if time.monotonic() - last_cancel_check >= CANCEL_POLL_SECONDS:
+                last_cancel_check = time.monotonic()
+                if await _cancelled(ctx):
+                    # A cancel must not wait out a ten-minute generation: the stream is
+                    # dropped (closing the connection ends it), nothing of it is stored.
+                    raise TurnCancelled()
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=CANCEL_POLL_SECONDS)
+            except TimeoutError:
+                continue
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                raise item
+            if isinstance(item, CompletedMessage):
+                completed = item
+                break
+            event: StreamEvent = item
+            if event.kind == "text_delta":
+                text_buffer.append(event.text)
+                if sum(len(part) for part in text_buffer) >= TEXT_FLUSH_CHARS:
+                    await flush_text()
+            elif event.kind == "thinking_delta":
+                thinking_buffer.append(event.text)
+            elif event.kind == "block_stop":
                 await flush_text()
-        elif event.kind == "thinking_delta":
-            thinking_buffer.append(event.text)
-        elif event.kind == "block_stop":
-            await flush_text()
-            await flush_thinking()
-            block = event.block or {}
-            if block.get("type") == "tool_use":
-                await _emit(
-                    ctx,
-                    chat_events.TOOL_USE,
-                    {
-                        "id": block.get("id"),
-                        "name": block.get("name"),
-                        "input": block.get("input", {}),
-                    },
-                )
+                await flush_thinking()
+                block = event.block or {}
+                if block.get("type") == "tool_use":
+                    await _emit(
+                        ctx,
+                        chat_events.TOOL_USE,
+                        {
+                            "id": block.get("id"),
+                            "name": block.get("name"),
+                            "input": block.get("input", {}),
+                        },
+                    )
+    finally:
+        if not reader.done():
+            reader.cancel()
+        await asyncio.gather(reader, return_exceptions=True)
+        await stream.aclose()
     await flush_text()
     await flush_thinking()
     if completed is None:
@@ -514,12 +607,10 @@ async def run_turn(
     settings: Settings,
     turn_id: uuid.UUID,
     render_slots: asyncio.Semaphore,
-    *,
-    locale: str = "en",
 ) -> None:
     """Drive one claimed turn to a terminal state. Never raises for the turn's own faults."""
     try:
-        ctx = await _load(sessionmaker, settings, turn_id, render_slots, locale)
+        ctx = await _load(sessionmaker, settings, turn_id, render_slots)
     except TurnFailed as exc:
         await _finish(sessionmaker, turn_id, status="failed", error=str(exc))
         return

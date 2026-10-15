@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     sandbox_memory: str = "4g"
     sandbox_pids: int = 512
     sandbox_idle_seconds: int = 1200
+    # Shells one user's VM keeps open at once; the longest idle one makes room for a new one.
+    sandbox_max_shells: int = 8
     sandbox_output_max_bytes: int = 262_144
     # The longest a single command may run, whatever the caller asked for.
     sandbox_command_timeout_max: int = 600

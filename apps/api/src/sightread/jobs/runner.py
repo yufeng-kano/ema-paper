@@ -480,11 +480,14 @@ async def _finish(
                 # last one by moving it (docs/jobs.md § Retention).
                 for index, document in enumerate(documents):
                     root = user_root(settings.workspaces_dir, document.user_id)
-                    relative = document_relative_dir(
-                        await folder_names(db, document.user_id, document.folder_id),
-                        document.name,
-                    )
                     async with workspace_lock(root):
+                        # Where the document is *now*: a rename holds this lock across
+                        # its database write and its move (docs/workspace.md).
+                        await db.refresh(document)
+                        relative = document_relative_dir(
+                            await folder_names(db, document.user_id, document.folder_id),
+                            document.name,
+                        )
                         await asyncio.to_thread(
                             keep_source,
                             root,

@@ -132,12 +132,15 @@ describe('workspace and chat routes', () => {
   })
 
   it('posts a message with its selection and reads the queued turn', async () => {
-    const fetchMock = stubFetch(Response.json({ turn_id: 12 }, { status: 202 }))
+    const fetchMock = stubFetch(
+      Response.json({ turn_id: 'a3f1c2d4-0000-4000-8000-000000000012', message_id: 5 }, { status: 202 }),
+    )
 
-    await expect(sendMessage(3, { text: 'Fix table 1', selection: '| 3450 |' })).resolves.toEqual({
-      turn_id: 12,
-    })
+    await expect(
+      sendMessage(3, { text: 'Fix table 1', selection: '| 3450 |', locale: 'zh-TW' }),
+    ).resolves.toEqual({ turn_id: 'a3f1c2d4-0000-4000-8000-000000000012', message_id: 5 })
     expect(fetchMock).toHaveBeenCalledWith('/api/conversations/3/messages', expect.anything())
+    expect(JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string).locale).toBe('zh-TW')
     expect(headersOf(fetchMock)['X-Requested-With']).toBe('fetch')
   })
 

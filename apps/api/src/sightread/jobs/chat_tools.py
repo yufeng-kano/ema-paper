@@ -23,7 +23,7 @@ from ..parsing.figures import parse_bbox_path
 from ..sandbox.client import SandboxClient, SandboxUnavailable
 from ..workspace import git
 from ..workspace.documents import DocumentPaths
-from ..workspace.layout import CACHE_DIR, META_FILE, SIGHTREAD_DIR, inside
+from ..workspace.layout import CACHE_DIR, META_FILE, SIGHTREAD_DIR, inside, no_symlinks
 from ..workspace.locks import workspace_lock
 
 VM_ROOT = PurePosixPath("/workspace")
@@ -369,7 +369,7 @@ async def view_figure(paths: DocumentPaths, tool_input: dict) -> ToolOutcome:
     # (docs/parsing.md § Figure crops): the page and the cleaned box.
     y_min, x_min, y_max, x_max = bbox
     crop = paths.figures / f"p{page}_{y_min}_{x_min}_{y_max}_{x_max}.png"
-    if not crop.is_file():
+    if not crop.is_file() or not no_symlinks(paths.root, crop):
         return ToolOutcome("no crop is stored for that figure", is_error=True)
     data = await asyncio.to_thread(crop.read_bytes)
     return ToolOutcome([_png_block(data), {"type": "text", "text": f"Figure at p{page}."}])

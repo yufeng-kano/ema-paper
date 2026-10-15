@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from sightread_sandbox.backends import LocalBackend
+from sightread_sandbox.backends import LocalBackend, adopted_user_ids
 from sightread_sandbox.config import Settings
 from sightread_sandbox.main import create_app
 
@@ -120,3 +120,34 @@ async def test_a_newline_free_flood_is_cut_like_any_other(client) -> None:
     assert body["exit_code"] == 0
     assert body["output"].rstrip().endswith("done")
     assert len(body["output"]) < 2000
+
+
+async def test_the_shell_cap_closes_the_longest_idle_shell(tmp_path) -> None:
+    settings = Settings(
+        app_env="local",
+        sandbox_token=TOKEN,
+        sandbox_backend="local",
+        sandbox_workspaces_dir=str(tmp_path / "ws"),
+        sandbox_workspaces_mount=str(tmp_path / "ws"),
+        sandbox_max_shells=2,
+    )
+    app = create_app(settings, LocalBackend(settings))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://runner") as http:
+        http.headers["Authorization"] = f"Bearer {TOKEN}"
+        await http.post("/sandboxes/6/exec", json={"session": "a", "command": "export A=1"})
+        await http.post("/sandboxes/6/exec", json={"session": "b", "command": "export B=1"})
+        assert (await http.get("/sandboxes/6")).json()["shells"] == 2
+        third = await http.post("/sandboxes/6/exec", json={"session": "c", "command": "echo c"})
+        assert third.status_code == 200, third.text
+        assert (await http.get("/sandboxes/6")).json()["shells"] == 2
+        # `a` was idle longest: its state is gone, `b` kept its own.
+        kept = await http.post("/sandboxes/6/exec", json={"session": "b", "command": "echo [$B]"})
+        assert kept.json()["output"] == "[1]"
+        assert (await http.get("/sandboxes/6")).json()["shells"] == 2
+        fresh = await http.post("/sandboxes/6/exec", json={"session": "a", "command": "echo [$A]"})
+        assert fresh.json()["output"] == "[]"
+
+
+def test_running_sandboxes_are_recognised_by_name() -> None:
+    listing = "sightread-sandbox-12\nsightread-sandbox-runner\nother\nsightread-sandbox-7\n"
+    assert adopted_user_ids(listing) == [12, 7]

@@ -113,10 +113,12 @@ usage_log        id PK, user_id FK, job_id FK NULL, turn_id FK chat_turns NULL,
                  INDEX (user_id, created_at)
                  CHECK (cost_source IN (...) AND (cost_source = 'unknown') = (cost IS NULL))
 conversations    id PK, user_id FK, document_id FK documents, title, session,
-                 created_at, updated_at
+                 model NULL, created_at, updated_at
                  INDEX (document_id, updated_at)
                  -- one thread of the chat agent about one document (chat.md);
-                 -- `session` names its shell in the user's sandbox
+                 -- `session` names its shell in the user's sandbox; `model` is
+                 -- set by the first turn and kept: the stored thinking blocks
+                 -- belong to it (chat.md § History)
 messages         id PK, conversation_id FK, role user|assistant, content JSONB,
                  turn_id FK chat_turns NULL, created_at
                  INDEX (conversation_id, id)
@@ -124,7 +126,7 @@ messages         id PK, conversation_id FK, role user|assistant, content JSONB,
                  -- replayed verbatim on every later request (chat.md § History)
 chat_turns       id UUID PK, user_id FK, conversation_id FK, message_id FK messages,
                  status queued|running|succeeded|failed|cancelled, error NULL,
-                 created_at, started_at NULL, finished_at NULL
+                 locale, created_at, started_at NULL, finished_at NULL
                  INDEX (status, created_at)
                  -- the chat agent's queue, one row per user message, claimed like jobs
 chat_events      id PK, conversation_id FK, turn_id FK, seq, event, data JSONB,

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,7 +22,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings
 from ..db.models import Document, Folder
-from .layout import META_FILE, files_root, path_segment, user_root
+from . import git
+from .layout import (
+    META_FILE,
+    files_root,
+    is_canonical_segment,
+    path_segment,
+    segment_name,
+    user_root,
+)
+from .locks import workspace_lock
 
 logger = logging.getLogger(__name__)
 
@@ -33,24 +43,71 @@ class Found:
     name: str
 
 
+def _canonicalize(root: Path) -> int:
+    """Move every directory under files/ whose name is not what `path_segment` would make
+    of it — `.report`, `_report` — to the segment that name encodes to, so the row the
+    scan records finds its directory again (docs/workspace.md § The tree is the truth).
+    One commit for all of them; returns how many moved."""
+    base = files_root(root)
+    if not base.is_dir():
+        return 0
+    moved = 0
+    for current, dirs, _files in os.walk(base, topdown=True, followlinks=False):
+        kept: list[str] = []
+        for name in dirs:
+            source = Path(current) / name
+            if source.is_symlink():
+                continue  # never descended into, never recorded
+            if is_canonical_segment(name):
+                kept.append(name)
+                continue
+            target = Path(current) / path_segment(name)
+            if target.exists():
+                logger.warning("reconcile: %s stays, %s is taken", source, target)
+                continue  # left alone, and not descended into: its rows stay as they were
+            git.move(root, source, target)
+            moved += 1
+            kept.append(target.name)
+        dirs[:] = kept
+    if moved:
+        git.commit_all(root, git.USER_AUTHOR, "canonicalize names from the shell")
+    return moved
+
+
 def _scan(root: Path) -> list[Found]:
-    """Every document directory under files/, by the id its `.meta.json` carries."""
+    """Every document directory under files/, by the id its `.meta.json` carries. Symlinks
+    are not followed and not read: the tree the host trusts is made of directories."""
     base = files_root(root)
     found: list[Found] = []
     if not base.is_dir():
         return found
-    for meta in base.rglob(META_FILE):
+    for current, dirs, files in os.walk(base, topdown=True, followlinks=False):
+        dirs[:] = [
+            name
+            for name in dirs
+            if not (Path(current) / name).is_symlink() and is_canonical_segment(name)
+        ]
+        if META_FILE not in files:
+            continue
+        meta = Path(current) / META_FILE
+        if meta.is_symlink():
+            continue
         try:
             payload = json.loads(meta.read_text())
             document_id = int(payload["document_id"])
         except (OSError, ValueError, KeyError, TypeError):
             continue
-        relative = meta.parent.relative_to(base)
-        parts = relative.parts
+        parts = meta.parent.relative_to(base).parts
         if not parts:
             continue
         found.append(Found(document_id, tuple(parts[:-1]), parts[-1]))
     return found
+
+
+def _canonicalize_and_scan(root: Path) -> list[Found]:
+    git.ensure_repo(root)
+    _canonicalize(root)
+    return _scan(root)
 
 
 async def _folder_for(
@@ -79,7 +136,7 @@ async def _folder_for(
         )
         match = next((row for row in rows if path_segment(row.name) == segment), None)
         if match is None:
-            match = Folder(user_id=user_id, parent_id=parent, name=segment)
+            match = Folder(user_id=user_id, parent_id=parent, name=segment_name(segment))
             db.add(match)
             await db.flush()
         cache[key] = match.id
@@ -90,7 +147,10 @@ async def _folder_for(
 async def reconcile_user(db: AsyncSession, settings: Settings, user_id: int) -> int:
     """Bring the user's rows in line with their tree. Returns how many rows changed."""
     root = user_root(settings.workspaces_dir, user_id)
-    found = await asyncio.to_thread(_scan, root)
+    if not files_root(root).is_dir():
+        return 0
+    async with workspace_lock(root):
+        found = await asyncio.to_thread(_canonicalize_and_scan, root)
     if not found:
         return 0
     documents = {
@@ -104,9 +164,9 @@ async def reconcile_user(db: AsyncSession, settings: Settings, user_id: int) -> 
         if row is None:
             continue
         folder_id = await _folder_for(db, user_id, entry.folder_segments, cache)
-        # The segment is the name unless the name needed cleaning; a directory the shell
-        # renamed carries the new name verbatim.
-        name = entry.name if path_segment(row.name) != entry.name else row.name
+        # The row's name when the segment is still its encoding; otherwise the name the
+        # (now canonical) segment decodes to — what the shell typed.
+        name = row.name if path_segment(row.name) == entry.name else segment_name(entry.name)
         if row.folder_id != folder_id or row.name != name:
             row.folder_id = folder_id
             row.name = name[:512]

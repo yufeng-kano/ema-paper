@@ -28,6 +28,8 @@ CACHE_DIR = ".cache"
 class UserSandbox:
     user_id: int
     sessions: dict[str, ShellSession] = field(default_factory=dict)
+    # When each shell last ran a command: the longest idle one is evicted at the cap.
+    session_used: dict[str, float] = field(default_factory=dict)
     last_used: float = field(default_factory=time.monotonic)
     last_used_at: str | None = None
     started_at: float | None = None
@@ -41,6 +43,9 @@ class Backend:
 
     def _user(self, user_id: int) -> UserSandbox:
         return self._users.setdefault(user_id, UserSandbox(user_id))
+
+    async def startup(self) -> None:
+        """What a backend does once when the runner starts; nothing, by default."""
 
     # --- what a backend decides ---------------------------------------------------------
 
@@ -74,20 +79,40 @@ class Backend:
             await self.ensure_running(sandbox)
             shell = sandbox.sessions.get(session)
             if shell is None:
+                await self._make_room(sandbox)
                 argv, cwd = self.shell_argv(user_id)
                 shell = ShellSession(
                     argv, cwd=cwd, max_bytes=self.settings.sandbox_output_max_bytes
                 )
                 sandbox.sessions[session] = shell
+            sandbox.session_used[session] = time.monotonic()
         sandbox.last_used = time.monotonic()
         sandbox.last_used_at = _now()
         outcome = await shell.run(command, timeout=timeout)
         sandbox.last_used = time.monotonic()
+        sandbox.session_used[session] = sandbox.last_used
         return outcome
+
+    async def _make_room(self, sandbox: UserSandbox) -> None:
+        """Close the longest idle shell when the user is at the cap (docs/sandbox.md
+        § Isolation). A shell running a command is not idle; with every shell busy the
+        new one is refused."""
+        while len(sandbox.sessions) >= self.settings.sandbox_max_shells:
+            idle = sorted(
+                (name for name, shell in sandbox.sessions.items() if not shell.busy),
+                key=lambda name: sandbox.session_used.get(name, 0.0),
+            )
+            if not idle:
+                raise RuntimeError("every shell of this sandbox is running a command")
+            victim = idle[0]
+            shell = sandbox.sessions.pop(victim)
+            sandbox.session_used.pop(victim, None)
+            await shell.close()
 
     async def restart(self, user_id: int, session: str) -> None:
         sandbox = self._user(user_id)
         shell = sandbox.sessions.pop(session, None)
+        sandbox.session_used.pop(session, None)
         if shell is not None:
             await shell.close()
 
@@ -111,6 +136,7 @@ class Backend:
             for shell in sandbox.sessions.values():
                 await shell.close()
             sandbox.sessions.clear()
+            sandbox.session_used.clear()
             await self.stop_vm(sandbox)
             sandbox.started_at = None
 
@@ -159,9 +185,38 @@ async def _docker(*args: str, timeout: float = 120.0) -> tuple[int, str]:
     return process.returncode or 0, out.decode("utf-8", errors="replace")
 
 
+CONTAINER_PREFIX = "sightread-sandbox-"
+
+
+def adopted_user_ids(names: str) -> list[int]:
+    """The user ids of the runner's containers in a `docker ps --format {{.Names}}` listing."""
+    ids: list[int] = []
+    for line in names.splitlines():
+        name = line.strip()
+        if name.startswith(CONTAINER_PREFIX) and name[len(CONTAINER_PREFIX) :].isdigit():
+            ids.append(int(name[len(CONTAINER_PREFIX) :]))
+    return ids
+
+
 class DockerBackend(Backend):
     def container(self, user_id: int) -> str:
-        return f"sightread-sandbox-{user_id}"
+        return f"{CONTAINER_PREFIX}{user_id}"
+
+    async def startup(self) -> None:
+        """Take the VMs a previous runner left running into the table, last used now, so
+        the idle sweep stops them on schedule (docs/sandbox.md § Lifecycle)."""
+        code, out = await _docker(
+            "ps", "--filter", f"name=^{CONTAINER_PREFIX}", "--format", "{{.Names}}", timeout=30
+        )
+        if code != 0:
+            logger.warning("could not list running sandboxes: %s", out.strip())
+            return
+        for user_id in adopted_user_ids(out):
+            sandbox = self._user(user_id)
+            sandbox.started_at = time.monotonic()
+            sandbox.last_used = time.monotonic()
+        if self._users:
+            logger.info("adopted %d running sandboxes", len(self._users))
 
     async def is_running(self, user_id: int) -> bool:
         code, out = await _docker(

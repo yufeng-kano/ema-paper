@@ -26,8 +26,8 @@ from ..errors import ApiError
 from ..jobs import chat_events
 from ..jobs.queue import count_active_turns, enqueue_turn
 from ..sandbox.client import SandboxClient, SandboxUnavailable
-from ..workspace.documents import directory_size, materialize_document
-from ..workspace.layout import CACHE_DIR, FILES_DIR, SIGHTREAD_DIR, user_root
+from ..workspace.documents import directory_size, materialize_document, workspace_size
+from ..workspace.layout import CACHE_DIR, FILES_DIR, SIGHTREAD_DIR, git_dir, user_root
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
@@ -149,6 +149,13 @@ async def read_conversation(conversation_id: int, user: SessionUser, db: DbSessi
 )
 async def delete_conversation(conversation_id: int, user: SessionUser, db: DbSession) -> Response:
     row = await owned_conversation(db, user.id, conversation_id)
+    # Under the same row lock a send takes: the worker must not be driving a turn whose
+    # rows vanish under it (docs/chat.md § Conversations, turns, events).
+    await db.execute(select(Conversation.id).where(Conversation.id == row.id).with_for_update())
+    if await _active_turn(db, row.id) is not None:
+        raise ApiError(
+            409, "invalid_request", "This conversation is still answering; cancel it first"
+        )
     await db.delete(row)
     await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -159,6 +166,19 @@ class MessageCreate(BaseModel):
     # The passage the reader had selected when they sent — context, appended as its own
     # block of the user message (docs/chat.md § Prompt caching).
     selection: str | None = Field(default=None, max_length=SELECTION_MAX_CHARS)
+    # The web app's locale: the language the turn answers in (docs/chat.md § System prompt).
+    locale: str = Field(default="en", max_length=16, pattern=r"^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$")
+
+
+async def _active_turn(db: AsyncSession, conversation_id: int) -> uuid.UUID | None:
+    return (
+        await db.execute(
+            select(ChatTurn.id).where(
+                ChatTurn.conversation_id == conversation_id,
+                ChatTurn.status.in_(("queued", "running")),
+            )
+        )
+    ).scalar_one_or_none()
 
 
 async def _ready_to_chat(db: AsyncSession, settings: AppSettings, user_id: int) -> None:
@@ -210,14 +230,7 @@ async def post_message(
             "Too many running conversations; wait for one to finish",
             headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
         )
-    running_here = (
-        await db.execute(
-            select(ChatTurn.id).where(
-                ChatTurn.conversation_id == row.id, ChatTurn.status.in_(("queued", "running"))
-            )
-        )
-    ).first()
-    if running_here is not None:
+    if await _active_turn(db, row.id) is not None:
         raise ApiError(409, "invalid_request", "This conversation is still answering")
 
     content: list[dict] = [{"type": "text", "text": body.text}]
@@ -232,7 +245,15 @@ async def post_message(
     if not row.title:
         first_line = body.text.strip().splitlines()[0] if body.text.strip() else ""
         row.title = first_line[:TITLE_MAX_CHARS]
-    turn = await enqueue_turn(db, user_id=user.id, conversation_id=row.id, message_id=message.id)
+    turn = await enqueue_turn(
+        db,
+        user_id=user.id,
+        conversation_id=row.id,
+        message_id=message.id,
+        locale=body.locale,
+    )
+    # The message belongs to the turn that answers it: a reloaded thread groups by turn.
+    message.turn_id = turn.id
     await db.commit()
     return {"turn_id": str(turn.id), "message_id": message.id}
 
@@ -264,6 +285,9 @@ async def conversation_events(
     after: int = Query(default=0, ge=0),
 ):
     row = await owned_conversation(db, user.id, conversation_id)
+    # The request's session is done: the stream opens its own, and a tab holding this
+    # response for a whole turn must not hold a pool connection with it (docs/chat.md).
+    await db.close()
     return StreamingResponse(
         chat_events.stream_conversation_events(
             request.app.state.sessionmaker, settings.database_url, row.id, after
@@ -278,12 +302,15 @@ async def conversation_events(
 
 def _workspace_usage(root: Path, quota: int) -> dict:
     breakdown = []
-    for name in (FILES_DIR, f"{SIGHTREAD_DIR}/results", ".git", CACHE_DIR):
+    for name in (FILES_DIR, f"{SIGHTREAD_DIR}/results", CACHE_DIR):
         size = directory_size(root / name)
         if size:
             breakdown.append({"path": f"{name}/", "bytes": size})
+    history = directory_size(git_dir(root))
+    if history:
+        breakdown.append({"path": "history/", "bytes": history})
     return {
-        "bytes": directory_size(root),
+        "bytes": workspace_size(root),
         "quota_bytes": quota,
         "breakdown": breakdown,
     }
