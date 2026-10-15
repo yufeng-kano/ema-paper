@@ -27,8 +27,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = '837c0e9a9a4f'
-down_revision: str | None = '5f1845730aa0'
+revision: str = "837c0e9a9a4f"
+down_revision: str | None = "5f1845730aa0"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -168,9 +168,7 @@ def downgrade() -> None:
         sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("user_id"),
     )
-    op.add_column(
-        "provider_connections", sa.Column("model", sa.String(length=255), nullable=True)
-    )
+    op.add_column("provider_connections", sa.Column("model", sa.String(length=255), nullable=True))
     op.execute(
         sa.text(
             "UPDATE provider_connections SET model = agent_settings.model "

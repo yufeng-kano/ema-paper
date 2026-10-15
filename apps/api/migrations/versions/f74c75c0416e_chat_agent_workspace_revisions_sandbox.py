@@ -126,8 +126,7 @@ def upgrade() -> None:
     # a row whose job is gone is historical and keeps the default, `parse`.
     op.execute(
         sa.text(
-            "UPDATE usage_log SET agent = jobs.agent "
-            "FROM jobs WHERE usage_log.job_id = jobs.id"
+            "UPDATE usage_log SET agent = jobs.agent FROM jobs WHERE usage_log.job_id = jobs.id"
         )
     )
 

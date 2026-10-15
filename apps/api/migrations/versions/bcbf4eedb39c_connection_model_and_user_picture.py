@@ -20,9 +20,7 @@ depends_on: str | Sequence[str] | None = None
 
 def upgrade() -> None:
     op.add_column("users", sa.Column("picture", sa.String(length=1024), nullable=True))
-    op.add_column(
-        "provider_connections", sa.Column("model", sa.String(length=255), nullable=True)
-    )
+    op.add_column("provider_connections", sa.Column("model", sa.String(length=255), nullable=True))
     # A connection is now a profile carrying its own model. The active connection's model
     # used to live in user_settings.default_model — move it onto the connection, then
     # clear the setting: default_model is an OpenRouter-only default from here on
@@ -37,8 +35,7 @@ def upgrade() -> None:
     )
     op.execute(
         sa.text(
-            "UPDATE user_settings SET default_model = NULL "
-            "WHERE default_connection_id IS NOT NULL"
+            "UPDATE user_settings SET default_model = NULL WHERE default_connection_id IS NOT NULL"
         )
     )
 
