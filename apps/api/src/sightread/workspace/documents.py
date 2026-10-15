@@ -13,7 +13,7 @@ import hashlib
 import json
 import os
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from sqlalchemy import select
@@ -192,9 +192,11 @@ def _materialize_files(
 ) -> bool:
     """Write what is missing. Returns whether anything was written (needs a commit)."""
     git.ensure_repo(paths.root)
-    files_root(paths.root).mkdir(parents=True, exist_ok=True)
     paths.check()
-    paths.directory.mkdir(parents=True, exist_ok=True)
+    try:
+        safe_io.ensure_dir(paths.root, paths.directory)
+    except safe_io.UnsafeEntry as exc:
+        raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
     changed = False
     changed |= _write_if_missing(paths.root, paths.doc, result.markdown)
     changed |= _write_if_missing(paths.root, paths.notes, "")
@@ -283,9 +285,10 @@ def keep_source(
     descriptor opened without following anything, like every workspace file."""
     git.ensure_repo(root)
     directory = root / relative
-    if safe_io.entry_kind(root, directory) not in ("dir", "none"):
-        raise ApiError(409, "invalid_request", NOT_PLAIN)
-    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        safe_io.ensure_dir(root, directory)
+    except safe_io.UnsafeEntry as exc:
+        raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
     suffix = ".pdf" if kind == "pdf" else (source.suffix.lower()[:16] or ".img")
     target = directory / f"{SOURCE_STEM}{suffix}"
     if safe_io.entry_kind(root, target) == "dir":
@@ -425,9 +428,31 @@ async def write_notes(
 # --- revisions ----------------------------------------------------------------------------
 
 
+def _history(paths: DocumentPaths, limit: int = 100) -> list[git.Revision]:
+    """The directory's own log, merged with each fixed file's log followed through the
+    renames git detects: a document moved since keeps the revisions made before the move
+    (docs/workspace.md § Revisions). Newest first, one entry per commit."""
+    seen: dict[str, git.Revision] = {}
+    for relative, follow in (
+        (paths.relative, False),
+        (paths.doc_relative, True),
+        (paths.notes_relative, True),
+    ):
+        for revision in git.log(paths.root, relative, limit, follow=follow):
+            known = seen.get(revision.commit)
+            if known is None:
+                seen[revision.commit] = revision
+            elif set(revision.files) - set(known.files):
+                seen[revision.commit] = replace(
+                    known, files=known.files + tuple(set(revision.files) - set(known.files))
+                )
+    merged = sorted(seen.values(), key=lambda revision: revision.created_at, reverse=True)
+    return merged[:limit]
+
+
 async def revisions(db: AsyncSession, settings: Settings, document: Document) -> list[git.Revision]:
     paths = await materialize_document(db, settings, document)
-    return await asyncio.to_thread(git.log, paths.root, paths.relative)
+    return await asyncio.to_thread(_history, paths)
 
 
 def _prune_empty(root: Path, directory: Path) -> None:
@@ -535,14 +560,19 @@ def _move_tree(root: Path, source: Path, target: Path, message: str) -> None:
     if safe_io.entry_kind(root, root / source) == "none" or source == target:
         return
     touched = [source, target]
-    if safe_io.entry_kind(root, root / target) != "none":
-        # Something else sits where the row now points — a directory the shell made under
-        # that name. It moves aside, so the document lands where the database says and
-        # the squatter keeps what it holds (docs/workspace.md § Layout).
-        aside = target.with_name(f"{target.name} ({uuid.uuid4().hex[:6]})")
-        git.move(root, root / target, root / aside)
-        touched.append(aside)
-    git.move(root, root / source, root / target)
+    try:
+        if safe_io.entry_kind(root, root / target) != "none":
+            # Something else sits where the row now points — a directory the shell made
+            # under that name. It moves aside, so the document lands where the database
+            # says and the squatter keeps what it holds (docs/workspace.md § Layout).
+            aside = target.with_name(f"{target.name} ({uuid.uuid4().hex[:6]})")
+            git.move(root, root / target, root / aside)
+            touched.append(aside)
+        git.move(root, root / source, root / target)
+    except safe_io.UnsafeEntry as exc:
+        # An ancestor the shell swapped for a link: refused, and the caller's row rolls
+        # back to where the files still are.
+        raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
     git.commit_paths(root, git.USER_AUTHOR, message, touched)
 
 

@@ -564,3 +564,55 @@ def test_names_are_normalized_before_uniqueness_is_decided() -> None:
     assert free_name({composed}, clean_name(decomposed, DOCUMENT_NAME_MAX), DOCUMENT_NAME_MAX) == (
         "caf\u00e9 (2).pdf"
     )
+
+
+async def test_folders_and_files_share_one_namespace(library, documents) -> None:
+    # A folder and a file in one parent would be one directory in the workspace, so the
+    # names are taken from one set: the folder gets the suffix, the rename is refused.
+    uploaded = (await _upload(library, documents)).json()
+    folder = await _folder(library, "tiny.png")
+    assert folder["name"] == "tiny (2).png"
+    other = await _folder(library, "Receipts")
+    clash = await library.put(
+        f"/api/library/folders/{other['id']}", json={"name": "tiny.png"}, headers=CSRF_HEADERS
+    )
+    assert clash.status_code == 409
+    clash = await library.put(
+        f"/api/library/documents/{uploaded['id']}",
+        json={"name": "Receipts"},
+        headers=CSRF_HEADERS,
+    )
+    assert clash.status_code == 409
+
+
+async def test_a_move_the_tree_refuses_leaves_the_row_where_the_files_are(
+    make_client, sessionmaker, documents, tmp_path
+) -> None:
+    library = make_client(workspaces_dir=str(tmp_path / "ws"))
+    await _ready_to_parse(library)
+    folder = await _folder(library, "Invoices")
+    await _upload(library, documents)
+    # The second upload of the same bytes keeps its own copy, so this row has files on
+    # disk before its parse has run (docs/workspace.md § Layout).
+    uploaded = (await _upload(library, documents)).json()
+    async with sessionmaker() as db:
+        row = await db.get(Document, uploaded["id"])
+        root = user_root(library.app.state.settings.workspaces_dir, row.user_id)
+    assert (root / "files" / "tiny (2).png" / "source.png").is_file()
+    # The destination folder's directory is a link the shell planted: the move is refused
+    # and the row must not point at a place the files never reached.
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (root / "files").mkdir(parents=True, exist_ok=True)
+    (root / "files" / "Invoices").symlink_to(elsewhere)
+    moved = await library.put(
+        f"/api/library/documents/{uploaded['id']}",
+        json={"folder_id": folder["id"]},
+        headers=CSRF_HEADERS,
+    )
+    assert moved.status_code == 409
+    async with sessionmaker() as db:
+        row = await db.get(Document, uploaded["id"])
+        assert row.folder_id is None
+    assert (root / "files" / "tiny (2).png" / "source.png").is_file()
+    assert not list(elsewhere.iterdir())

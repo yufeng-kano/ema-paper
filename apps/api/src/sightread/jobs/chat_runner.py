@@ -593,6 +593,10 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
         async def one(index: int, block: dict) -> None:
             nonlocal spent
             async with slots:
+                # A round of reads has no write to notice the Stop: each read looks for
+                # it before it starts, so at most the few in flight finish.
+                if await _cancelled(ctx):
+                    raise TurnCancelled()
                 if spent >= budget:
                     outcome = chat_tools.ToolOutcome(IMAGE_BUDGET_SPENT, is_error=True)
                     results[index] = await _report_tool(
@@ -691,6 +695,12 @@ async def _finish(
         turn = await db.get(ChatTurn, turn_id)
         if turn is None:
             return
+        # The conversation's lock first, then the turn — the order the cancel route takes
+        # — so the two cannot deadlock, and a cancel committed a moment ago is seen.
+        await db.execute(
+            select(Conversation.id).where(Conversation.id == turn.conversation_id).with_for_update()
+        )
+        await db.refresh(turn)
         if turn.status == "cancelled" or status == "cancelled":
             status, error = "cancelled", "cancelled"
         turn.status = status

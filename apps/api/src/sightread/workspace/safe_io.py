@@ -30,8 +30,11 @@ class EntryTooLarge(Exception):
     """The file exists but is larger than the caller will hold in memory."""
 
 
-def _descend(root: Path, path: Path) -> tuple[int, str]:
-    """Open `path`'s parent directory beneath `root`; returns (dir fd, final name)."""
+def _descend(root: Path, path: Path, *, create: bool = False) -> tuple[int, str]:
+    """Open `path`'s parent directory beneath `root`; returns (dir fd, final name). With
+    `create`, a directory missing on the way is made relative to the one above it and
+    then opened without following — a link that lands under the name in between is
+    refused, never entered."""
     try:
         parts = path.relative_to(root).parts
     except ValueError as exc:
@@ -42,10 +45,10 @@ def _descend(root: Path, path: Path) -> tuple[int, str]:
     try:
         for part in parts[:-1]:
             try:
-                next_fd = os.open(part, _DIR_FLAGS, dir_fd=fd)
-            except FileNotFoundError:
-                raise
+                next_fd = _open_child_dir(fd, part, create=create)
             except OSError as exc:
+                if isinstance(exc, FileNotFoundError):
+                    raise
                 raise UnsafeEntry(f"{path}: {part} is not a plain directory") from exc
             os.close(fd)
             fd = next_fd
@@ -53,6 +56,31 @@ def _descend(root: Path, path: Path) -> tuple[int, str]:
         os.close(fd)
         raise
     return fd, parts[-1]
+
+
+def _open_child_dir(fd: int, name: str, *, create: bool) -> int:
+    try:
+        return os.open(name, _DIR_FLAGS, dir_fd=fd)
+    except FileNotFoundError:
+        if not create:
+            raise
+    with contextlib.suppress(FileExistsError):
+        os.mkdir(name, 0o755, dir_fd=fd)
+    return os.open(name, _DIR_FLAGS, dir_fd=fd)
+
+
+def ensure_dir(root: Path, path: Path) -> None:
+    """Make the directory at `path` and whatever is missing above it, each component
+    through the descriptor of the one above; a link anywhere on the way is a refusal."""
+    if path == root:
+        return
+    fd, name = _descend(root, path, create=True)
+    try:
+        os.close(_open_child_dir(fd, name, create=True))
+    except OSError as exc:
+        raise UnsafeEntry(f"{path} is not a plain directory") from exc
+    finally:
+        os.close(fd)
 
 
 def entry_kind(root: Path, path: Path) -> str:
@@ -153,12 +181,7 @@ def _write_atomic(root: Path, path: Path, fill, *, exist_ok: bool) -> None:
     the destination empty or cut short (docs/workspace.md § Revisions). `fill(fd)` writes
     the content. Without `exist_ok` the file is linked into place instead, which fails
     when anything already sits at the destination."""
-    kind = entry_kind(root, path.parent)
-    if kind == "none":
-        path.parent.mkdir(parents=True, exist_ok=True)
-    elif kind != "dir":
-        raise UnsafeEntry(f"{path.parent} is not a plain directory")
-    fd, name = _descend(root, path)
+    fd, name = _descend(root, path, create=True)
     try:
         temp = f"{TEMP_PREFIX}{secrets.token_hex(8)}"
         entry = os.open(
@@ -318,12 +341,7 @@ def rename(root: Path, source: Path, target: Path) -> None:
     """Move `source` to `target`, both beneath `root`, resolving neither through a link."""
     src_fd, src_name = _descend(root, source)
     try:
-        kind = entry_kind(root, target.parent)
-        if kind == "none":
-            target.parent.mkdir(parents=True, exist_ok=True)
-        elif kind != "dir":
-            raise UnsafeEntry(f"{target.parent} is not a plain directory")
-        dst_fd, dst_name = _descend(root, target)
+        dst_fd, dst_name = _descend(root, target, create=True)
         try:
             os.rename(src_name, dst_name, src_dir_fd=src_fd, dst_dir_fd=dst_fd)
         finally:

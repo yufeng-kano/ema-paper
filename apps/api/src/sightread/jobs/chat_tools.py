@@ -14,6 +14,7 @@ import difflib
 import io
 import os
 import tempfile
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -33,6 +34,12 @@ READ_ONLY_NAMES = frozenset({".git", ".gitignore", SIGHTREAD_DIR, META_FILE, CAC
 VIEW_MAX_CHARS = 60_000
 # The long edge a page image is sent at: what Claude would resize to anyway.
 PAGE_IMAGE_LONG_EDGE_PX = 1568
+# The most an image document may decode to: read from the header, before any decoding.
+PAGE_IMAGE_MAX_PIXELS = 40_000_000
+
+
+class ImageTooLarge(Exception):
+    """The file would decode to more pixels than the worker will hold."""
 
 
 @dataclass
@@ -330,8 +337,15 @@ def _png_block(data: bytes) -> dict:
 
 
 def _as_png(source: Path | bytes) -> bytes:
-    """A PNG no larger than the model would keep, oriented, flattened onto white."""
-    with Image.open(io.BytesIO(source) if isinstance(source, bytes) else source) as opened:
+    """A PNG no larger than the model would keep, oriented, flattened onto white. The
+    size comes from the header: a file that would decode past the pixel cap is refused
+    before a raster exists, and Pillow's own bomb check is an error, never a warning."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", Image.DecompressionBombWarning)
+        opened = Image.open(io.BytesIO(source) if isinstance(source, bytes) else source)
+    with opened:
+        if opened.width * opened.height > PAGE_IMAGE_MAX_PIXELS:
+            raise ImageTooLarge(f"{opened.width}x{opened.height} exceeds the pixel cap")
         image = ImageOps.exif_transpose(opened) or opened
         if image.mode in ("RGBA", "LA", "P"):
             image = image.convert("RGBA")
@@ -405,6 +419,8 @@ async def view_page(
             data = await asyncio.to_thread(_as_png, raw or b"")
         except (safe_io.UnsafeEntry, safe_io.EntryTooLarge, OSError):
             return ToolOutcome("the original image could not be read", is_error=True)
+        except (ImageTooLarge, Image.DecompressionBombError, Image.DecompressionBombWarning):
+            return ToolOutcome("the original image is too large to render", is_error=True)
     return ToolOutcome([_png_block(data), {"type": "text", "text": f"Page {page}."}])
 
 

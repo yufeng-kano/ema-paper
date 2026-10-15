@@ -110,26 +110,37 @@ def placed_in(column: ColumnElement, place: int | None) -> ColumnElement[bool]:
     return column.is_(None) if place is None else column == place
 
 
-async def folder_names(
-    db: DbSession, user_id: int, parent_id: int | None, exclude_id: int | None = None
+async def sibling_names(
+    db: DbSession,
+    user_id: int,
+    place: int | None,
+    *,
+    exclude_folder: int | None = None,
+    exclude_document: int | None = None,
 ) -> set[str]:
-    query = select(Folder.name).where(
-        Folder.user_id == user_id, placed_in(Folder.parent_id, parent_id)
+    """Every name taken in one folder — the folders and the documents in it alike. The
+    workspace gives each name one directory, so a folder and a file cannot share one
+    (docs/workspace.md § Layout); the caller holds the user's row so the set is current."""
+    folders = select(Folder.name).where(
+        Folder.user_id == user_id, placed_in(Folder.parent_id, place)
     )
-    if exclude_id is not None:
-        query = query.where(Folder.id != exclude_id)
-    return set((await db.execute(query)).scalars().all())
+    if exclude_folder is not None:
+        folders = folders.where(Folder.id != exclude_folder)
+    documents = select(Document.name).where(
+        Document.user_id == user_id, placed_in(Document.folder_id, place)
+    )
+    if exclude_document is not None:
+        documents = documents.where(Document.id != exclude_document)
+    taken = set((await db.execute(folders)).scalars().all())
+    taken.update((await db.execute(documents)).scalars().all())
+    return taken
 
 
-async def document_names(
-    db: DbSession, user_id: int, folder_id: int | None, exclude_id: int | None = None
-) -> set[str]:
-    query = select(Document.name).where(
-        Document.user_id == user_id, placed_in(Document.folder_id, folder_id)
-    )
-    if exclude_id is not None:
-        query = query.where(Document.id != exclude_id)
-    return set((await db.execute(query)).scalars().all())
+async def lock_user(db: DbSession, user_id: int) -> None:
+    """Serialize this user's name decisions: the unique indexes cannot see across the
+    two tables, so two requests choosing a name for a folder and a file at once are
+    ordered here (docs/database.md)."""
+    await db.execute(select(User.id).where(User.id == user_id).with_for_update())
 
 
 async def refuse_while_answering(db: DbSession, user_id: int, document_ids) -> None:
@@ -210,6 +221,7 @@ async def subtree_ids(
 async def insert_named[RowT: (Folder, Document)](
     db: DbSession,
     *,
+    user_id: int,
     build: Callable[[str], RowT],
     taken: Callable[[], Awaitable[set[str]]],
     wanted: str,
@@ -226,6 +238,7 @@ async def insert_named[RowT: (Folder, Document)](
     attempts = INSERT_ATTEMPTS
     while True:
         attempts -= 1
+        await lock_user(db, user_id)
         row = build(free_name(await taken(), wanted, limit))
         db.add(row)
         try:
@@ -237,21 +250,34 @@ async def insert_named[RowT: (Folder, Document)](
                 raise ApiError(409, "invalid_request", message) from exc
 
 
-async def commit_or_retry(db: DbSession, retries_left: int, message: str) -> bool:
-    """Commit; answer False when a lost name race means the caller should choose again.
+async def flush_or_retry(db: DbSession, retries_left: int, message: str) -> bool:
+    """Flush; answer False when a lost name race means the caller should choose again.
 
     A rename passes `0`: the name is what the user just typed, so a collision is theirs to
     resolve. A move passes what is left of its attempts, because a collision there is
-    resolved with a suffix rather than refused (docs/web.md § Files).
+    resolved with a suffix rather than refused (docs/web.md § Files). The flush, not a
+    commit: the directory moves before the transaction ends, so a move the tree refuses
+    rolls the row back (docs/workspace.md § Revisions).
     """
     try:
-        await db.commit()
+        await db.flush()
         return True
     except IntegrityError as exc:
         await db.rollback()
         if retries_left <= 0:
             raise ApiError(409, "invalid_request", message) from exc
         return False
+
+
+async def move_then_commit(db: DbSession, settings, user_id: int, before, after) -> None:
+    """The row is flushed; now the directory, then the commit. A refusal from the tree
+    rolls the row back to where the files still are."""
+    try:
+        await workspace_documents.move_path(settings, user_id, before, after)
+    except BaseException:
+        await db.rollback()
+        raise
+    await db.commit()
 
 
 async def folder_exists(db: DbSession, user_id: int, folder_id: int) -> bool:
@@ -363,8 +389,9 @@ async def create_folder(body: FolderCreate, user: SessionUser, db: DbSession):
     try:
         row = await insert_named(
             db,
+            user_id=user.id,
             build=lambda name: Folder(user_id=user.id, parent_id=parent_id, name=name),
-            taken=lambda: folder_names(db, user.id, parent_id),
+            taken=lambda: sibling_names(db, user.id, parent_id),
             wanted=clean_name(body.name, FOLDER_NAME_MAX),
             limit=FOLDER_NAME_MAX,
             message="A folder with this name already exists here",
@@ -422,7 +449,8 @@ async def _update_folder_locked(
                 raise ApiError(400, "invalid_request", "A folder cannot be moved inside itself")
 
         wanted = clean_name(body.name, FOLDER_NAME_MAX) if renaming else row.name
-        taken = await folder_names(db, user.id, parent_id, exclude_id=row.id)
+        await lock_user(db, user.id)
+        taken = await sibling_names(db, user.id, parent_id, exclude_folder=row.id)
         if renaming and wanted in taken:
             raise ApiError(409, "invalid_request", clash)
 
@@ -430,11 +458,11 @@ async def _update_folder_locked(
         row.parent_id = parent_id
         row.name = free_name(taken, wanted, FOLDER_NAME_MAX)
         retries = 0 if renaming else INSERT_ATTEMPTS - 1 - attempt
-        if await commit_or_retry(db, retries, clash):
+        if await flush_or_retry(db, retries, clash):
             break
-    # The tree follows the rows (docs/workspace.md): the directory moves after the commit.
+    # The tree follows the rows (docs/workspace.md): the directory moves, then the commit.
     after = await folder_relative_dir(db, user.id, row.id)
-    await workspace_documents.move_path(settings, user.id, before, after)
+    await move_then_commit(db, settings, user.id, before, after)
     return folder_payload(row)
 
 
@@ -463,9 +491,20 @@ async def delete_folder(
             delete(Document).where(Document.user_id == user.id, Document.folder_id.in_(doomed))
         )
         await db.execute(delete(Folder).where(Folder.user_id == user.id, Folder.id.in_(doomed)))
-        await db.commit()
-        await workspace_documents.remove_path(settings, user.id, relative)
+        await remove_then_commit(db, settings, user.id, relative)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+async def remove_then_commit(db: DbSession, settings, user_id: int, relative) -> None:
+    """The rows are deleted in the transaction; the directory goes before it commits. A
+    removal the tree refuses keeps the rows, and the next read restores what is missing
+    (docs/workspace.md § Revisions)."""
+    try:
+        await workspace_documents.remove_path(settings, user_id, relative)
+    except BaseException:
+        await db.rollback()
+        raise
+    await db.commit()
 
 
 # --- documents ----------------------------------------------------------------------------
@@ -561,8 +600,9 @@ async def upload_document(
     async def land(place: int | None) -> Document:
         return await insert_named(
             db,
+            user_id=user.id,
             build=lambda name: Document(user_id=user.id, folder_id=place, job_id=job_id, name=name),
-            taken=lambda: document_names(db, user.id, place),
+            taken=lambda: sibling_names(db, user.id, place),
             wanted=clean_name(filename, DOCUMENT_NAME_MAX),
             limit=DOCUMENT_NAME_MAX,
             message="A file with this name already exists here",
@@ -613,10 +653,11 @@ async def file_job(body: DocumentFromJob, user: SessionUser, db: DbSession):
     try:
         row = await insert_named(
             db,
+            user_id=user_id,
             build=lambda name: Document(
                 user_id=user_id, folder_id=folder_id, job_id=job_id, name=name
             ),
-            taken=lambda: document_names(db, user_id, folder_id),
+            taken=lambda: sibling_names(db, user_id, folder_id),
             wanted=wanted,
             limit=DOCUMENT_NAME_MAX,
             message="A file with this name already exists here",
@@ -663,7 +704,8 @@ async def _update_document_locked(
             await owned_folder(db, user.id, folder_id)
 
         wanted = clean_name(body.name, DOCUMENT_NAME_MAX) if renaming else row.name
-        taken = await document_names(db, user.id, folder_id, exclude_id=row.id)
+        await lock_user(db, user.id)
+        taken = await sibling_names(db, user.id, folder_id, exclude_document=row.id)
         if renaming and wanted in taken:
             raise ApiError(409, "invalid_request", clash)
 
@@ -673,10 +715,10 @@ async def _update_document_locked(
         # Two tabs moving same-named files into one folder is the same race a create
         # loses, and it has the same answer: take the next name, not a conflict.
         retries = 0 if renaming else INSERT_ATTEMPTS - 1 - attempt
-        if await commit_or_retry(db, retries, clash):
+        if await flush_or_retry(db, retries, clash):
             break
     after = await document_relative(db, row)
-    await workspace_documents.move_path(settings, user.id, before, after)
+    await move_then_commit(db, settings, user.id, before, after)
     return document_payload(row, await job_of(db, row.job_id))
 
 
@@ -692,8 +734,8 @@ async def delete_document(
         relative = await document_relative(db, row)
         await refuse_while_answering(db, user.id, select(Document.id).where(Document.id == row.id))
         await db.delete(row)
-        await db.commit()
-        await workspace_documents.remove_path(settings, user.id, relative)
+        await db.flush()
+        await remove_then_commit(db, settings, user.id, relative)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

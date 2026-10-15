@@ -339,12 +339,17 @@ const statusWord = computed<SaveState>(() => {
  *  rather than losing it. */
 onBeforeUnmount(() => {
   commitEdit()
-  if (saveTimer !== null) {
-    clearTimeout(saveTimer)
+  // A failed save left its text unsaved with no timer: it gets one more try too.
+  if (saveTimer !== null || saveState.value === 'failed') {
+    if (saveTimer !== null) {
+      clearTimeout(saveTimer)
+    }
     void saveContent()
   }
-  if (notesTimer !== null) {
-    clearTimeout(notesTimer)
+  if (notesTimer !== null || notesState.value === 'failed') {
+    if (notesTimer !== null) {
+      clearTimeout(notesTimer)
+    }
     void saveNotes()
   }
 })

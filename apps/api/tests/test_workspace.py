@@ -571,6 +571,7 @@ def test_the_kept_source_is_named_by_the_parse_kind(tmp_path) -> None:
 
 def test_a_failed_write_leaves_the_file_as_it_was(tmp_path) -> None:
     root = tmp_path / "ws" / "1"
+    root.mkdir(parents=True)  # the service's own directory; everything below is the user's
     target = root / "files" / "doc.md"
     safe_io.write_text(root, target, "before")
 
@@ -631,3 +632,45 @@ async def test_figure_crops_are_copied_file_by_file_and_never_through_a_link(
             await documents.materialize_document(db, settings, other)
         assert refused.value.status_code == 409
         assert not list(elsewhere.iterdir())
+
+
+async def test_the_history_follows_a_rename(sessionmaker, tmp_path) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        content = await documents.read_content(db, settings, document)
+        await documents.write_content(
+            db, settings, document, markdown="# Title\n\nEdited\n", base_revision=content.revision
+        )
+        edit = (await documents.revisions(db, settings, document))[0]
+        before = await documents.document_paths(db, settings, document)
+        document.name = "renamed.pdf"
+        await db.commit()
+        after = await documents.document_paths(db, settings, document)
+        await documents.move_path(settings, user.id, before.relative, after.relative)
+        history = await documents.revisions(db, settings, document)
+        # The move is the newest; the edit made under the old name is still listed.
+        assert history[0].commit != edit.commit
+        assert edit.commit in {revision.commit for revision in history}
+        assert "doc.md" in "".join(
+            next(revision for revision in history if revision.commit == edit.commit).files
+        )
+
+
+def test_missing_parents_are_made_through_descriptors(tmp_path) -> None:
+    root = tmp_path / "ws" / "2"
+    root.mkdir(parents=True)
+    safe_io.write_text(root, root / "files" / "a" / "b" / "doc.md", "deep")
+    assert (root / "files" / "a" / "b" / "doc.md").read_text() == "deep"
+    # A link where a parent should be: nothing is made or written beyond it.
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (root / "files" / "link").symlink_to(elsewhere)
+    with pytest.raises(safe_io.UnsafeEntry):
+        safe_io.write_text(root, root / "files" / "link" / "sub" / "doc.md", "x")
+    with pytest.raises(safe_io.UnsafeEntry):
+        safe_io.ensure_dir(root, root / "files" / "link" / "sub")
+    with pytest.raises(safe_io.UnsafeEntry):
+        safe_io.rename(root, root / "files" / "a", root / "files" / "link" / "moved")
+    assert not list(elsewhere.iterdir())
+    assert (root / "files" / "a" / "b" / "doc.md").exists()

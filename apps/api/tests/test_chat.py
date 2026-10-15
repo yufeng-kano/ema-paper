@@ -5,6 +5,7 @@ No test reaches the network or a sandbox (docs/testing.md § Cost safety)."""
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import shutil
 import uuid
@@ -775,8 +776,12 @@ async def test_a_rounds_images_stop_at_the_budget(monkeypatch) -> None:
     async def no_events(ctx, event, data):
         return None
 
+    async def never_cancelled(ctx):
+        return False
+
     monkeypatch.setattr(chat_runner, "_run_tool", fake_run_tool)
     monkeypatch.setattr(chat_runner, "_emit", no_events)
+    monkeypatch.setattr(chat_runner, "_cancelled", never_cancelled)
     tool_uses = [
         {"type": "tool_use", "id": str(index), "name": "view_page", "input": {}}
         for index in range(12)
@@ -791,6 +796,28 @@ async def test_a_rounds_images_stop_at_the_budget(monkeypatch) -> None:
     assert len(refused) >= 12 - len(kept)
     assert all(result["content"] == chat_runner.IMAGE_BUDGET_SPENT for result in refused)
     assert len(rendered) == len(kept)
+
+
+async def test_a_stop_drops_a_round_of_reads(monkeypatch) -> None:
+    rendered: list[str] = []
+
+    async def fake_run_tool(ctx, block, malformed):
+        rendered.append(block["id"])
+        return {"type": "tool_result", "tool_use_id": block["id"], "content": "ok"}
+
+    async def cancelled(ctx):
+        return True
+
+    monkeypatch.setattr(chat_runner, "_run_tool", fake_run_tool)
+    monkeypatch.setattr(chat_runner, "_cancelled", cancelled)
+    tool_uses = [
+        {"type": "tool_use", "id": str(index), "name": "view_page", "input": {}}
+        for index in range(8)
+    ]
+    # No write in the round to notice the Stop: the reads look for it themselves.
+    with pytest.raises(chat_runner.TurnCancelled):
+        await chat_runner._run_tools(_round_ctx(), tool_uses, set())
+    assert rendered == []
 
 
 async def test_writing_tools_run_in_order_while_reads_run_together(monkeypatch) -> None:
@@ -1103,6 +1130,8 @@ async def test_a_stop_during_backoff_and_a_running_read_are_both_cut(monkeypatch
             except asyncio.CancelledError:
                 read_cancelled.set()
                 raise
+        # The Stop lands while the read is already running, not before it starts.
+        await asyncio.sleep(0.01)
         flags["cancelled"] = True
         return {"type": "tool_result", "tool_use_id": block["id"], "content": "ok"}
 
@@ -1115,3 +1144,17 @@ async def test_a_stop_during_backoff_and_a_running_read_are_both_cut(monkeypatch
     with pytest.raises(chat_runner.TurnCancelled):
         await chat_runner._run_tools(_round_ctx(), tool_uses, set())
     assert read_cancelled.is_set()
+
+
+def test_an_image_past_the_pixel_cap_is_refused_before_it_is_decoded() -> None:
+    from PIL import Image
+
+    # A 1-bit image compresses to a few kilobytes; its pixels would not.
+    buffer = io.BytesIO()
+    Image.new("1", (7000, 7000)).save(buffer, format="PNG")
+    assert len(buffer.getvalue()) < 100_000
+    with pytest.raises(chat_tools.ImageTooLarge):
+        chat_tools._as_png(buffer.getvalue())
+    small = io.BytesIO()
+    Image.new("RGB", (20, 10), (255, 0, 0)).save(small, format="PNG")
+    assert chat_tools._as_png(small.getvalue()).startswith(b"\x89PNG")

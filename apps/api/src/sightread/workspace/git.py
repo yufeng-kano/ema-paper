@@ -133,19 +133,17 @@ def head(root: Path) -> str | None:
 
 
 def move(root: Path, source: Path, target: Path) -> None:
-    """`git mv`, falling back to a rename for a path git does not track yet. Neither
-    follows a link: git refuses a path beyond a symbolic link, and the fallback renames
-    through directory descriptors opened without following (`safe_io.rename`)."""
-    tracked = _git(root, "ls-files", "--error-unmatch", str(source), check=False)
-    if tracked.returncode == 0:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        _git(root, "mv", "-k", str(source), str(target))
-    else:
-        safe_io.rename(root, source, target)
+    """Rename through directory descriptors opened without following (`safe_io.rename`);
+    the caller's commit stages the old path and the new. Never `git mv`: it follows a
+    link in an ancestor of either path (docs/workspace.md § Revisions)."""
+    safe_io.rename(root, source, target)
 
 
-def log(root: Path, relative: Path | None = None, limit: int = 100) -> list[Revision]:
-    """Newest first. `relative` narrows to commits touching that path."""
+def log(
+    root: Path, relative: Path | None = None, limit: int = 100, *, follow: bool = False
+) -> list[Revision]:
+    """Newest first. `relative` narrows to commits touching that path; `follow` (one file
+    only) keeps going through the renames git detects."""
     if head(root) is None:
         return []
     args = [
@@ -154,6 +152,8 @@ def log(root: Path, relative: Path | None = None, limit: int = 100) -> list[Revi
         "--name-only",
         "--format=%x1e%H%x1f%an%x1f%aI%x1f%s",
     ]
+    if follow:
+        args.append("--follow")
     if relative is not None:
         args += ["--", str(relative)]
     out = _git(root, *args).stdout
