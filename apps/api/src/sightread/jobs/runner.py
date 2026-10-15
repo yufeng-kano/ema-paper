@@ -280,7 +280,8 @@ async def _process_pdf_page(
         return outcome
 
     convention = convention_for_job(job.model, job.pipeline_version)
-    sent = prepare_image(image, convention)
+    # Pillow work, so it runs beside the in-flight HTTP calls rather than under them.
+    sent = await asyncio.to_thread(prepare_image, image, convention)
     try:
         transcription = await _guarded_call(
             state,
@@ -334,7 +335,7 @@ async def _process_image(
         method=VISION,
     )
     convention = convention_for_job(job.model, job.pipeline_version)
-    sent = prepare_image(normalized.path, convention)
+    sent = await asyncio.to_thread(prepare_image, normalized.path, convention)
     try:
         transcription = await _guarded_call(
             state,

@@ -71,7 +71,24 @@ async function loadModels() {
   }
 }
 
-watch(() => props.agent.name, () => void loadModels(), { immediate: true })
+/**
+ * An agent still pointing at a provider connection — set on the former Settings page —
+ * is moved back to Kano Proxy before its catalog loads. The picker would otherwise list
+ * one upstream's models while parses ran, and were charged, on another.
+ */
+async function resolveUpstream() {
+  if (settings.value.connection_id !== null) {
+    try {
+      emit('saved', await putAgentSettings(props.agent.name, { connection_id: null }))
+    } catch (error) {
+      modelsError.value = await resolve(error)
+      return
+    }
+  }
+  await loadModels()
+}
+
+watch(() => props.agent.name, () => void resolveUpstream(), { immediate: true })
 
 /** A stored model the catalog does not list (delisted, or not loaded) is still the
     current choice, so the picker shows it rather than silently blanking it. */
@@ -170,7 +187,8 @@ async function insertToken(token: string) {
   el.setSelectionRange(start + token.length, start + token.length)
 }
 
-const promptLength = computed(() => promptText.value.length)
+/** Counted as the server counts: the trimmed text, in code points rather than UTF-16 units. */
+const promptLength = computed(() => [...promptText.value.trim()].length)
 const promptOverCap = computed(
   () => props.promptMaxChars !== null && promptLength.value > props.promptMaxChars,
 )
