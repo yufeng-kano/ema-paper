@@ -21,6 +21,7 @@ from sightread.jobs import chat_runner, chat_tools
 from sightread.jobs.queue import claim_next_turn
 from sightread.sandbox.client import ExecResult, SandboxClient
 from sightread.workspace import documents as workspace_documents
+from sightread.workspace import git
 from sightread.workspace.layout import user_root
 from tests.conftest import CSRF_HEADERS, KANO_BASE
 from tests.test_parse_end_to_end import _connect_kano
@@ -530,3 +531,39 @@ async def test_view_page_and_view_figure_read_the_documents_own_files(tmp_path, 
     assert not figure.is_error and figure.content[0]["type"] == "image"
     missing = await chat_tools.view_figure(paths, {"page": 2, "bbox": [0, 0, 10, 10]})
     assert missing.is_error
+
+
+async def test_a_shell_change_becomes_its_own_revision(tmp_path) -> None:
+    root = tmp_path / "ws" / "1"
+    (root / "files").mkdir(parents=True)
+    git.ensure_repo(root)
+    (root / "files" / "made-by-bash.md").write_text("from the shell\n")
+    outcome = chat_tools.ToolOutcome("ok")
+    committed = await chat_tools.commit_shell_changes(
+        root,
+        outcome,
+        {"command": "echo 'from the shell' > files/made-by-bash.md"},
+        "agent:1",
+        max_chars=2000,
+    )
+    assert committed.edit is not None
+    assert committed.edit["command"] == "bash"
+    assert "+from the shell" in committed.edit["diff"]
+    assert git.log(root)[0].message == "bash: echo 'from the shell' > files/made-by-bash.md"
+    # A command that changed nothing adds no revision.
+    again = await chat_tools.commit_shell_changes(
+        root, outcome, {"command": "ls"}, "agent:1", max_chars=2000
+    )
+    assert again.edit is None
+
+
+async def test_an_editor_filesystem_failure_is_a_tool_result(tmp_path) -> None:
+    root = tmp_path / "ws" / "1"
+    (root / "files" / "d").mkdir(parents=True)
+    outcome = await chat_tools.run_editor(
+        root,
+        {"command": "create", "path": "/workspace/files/d", "file_text": "x"},
+        "agent:1",
+        max_chars=1000,
+    )
+    assert outcome.is_error

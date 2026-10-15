@@ -476,13 +476,22 @@ async def _finish(
         if job.source_path:
             source = Path(job.source_path)
             if documents and source.is_file():
-                first = documents[0]
-                root = user_root(settings.workspaces_dir, first.user_id)
-                relative = document_relative_dir(
-                    await folder_names(db, first.user_id, first.folder_id), first.name
-                )
-                async with workspace_lock(root):
-                    await asyncio.to_thread(keep_source, root, relative, source)
+                # One parse filed in several places: every copy keeps the original, the
+                # last one by moving it (docs/jobs.md § Retention).
+                for index, document in enumerate(documents):
+                    root = user_root(settings.workspaces_dir, document.user_id)
+                    relative = document_relative_dir(
+                        await folder_names(db, document.user_id, document.folder_id),
+                        document.name,
+                    )
+                    async with workspace_lock(root):
+                        await asyncio.to_thread(
+                            keep_source,
+                            root,
+                            relative,
+                            source,
+                            copy=index < len(documents) - 1,
+                        )
             else:
                 source.unlink(missing_ok=True)
             job.source_deleted_at = utcnow()

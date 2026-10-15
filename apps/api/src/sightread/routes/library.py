@@ -37,7 +37,8 @@ from ..jobs.intake import (
 from ..jobs.runner import partial_result_payload, result_payload
 from ..parsing.figures import crop_path, parse_bbox_path
 from ..workspace import documents as workspace_documents
-from ..workspace.layout import document_relative_dir, path_segment
+from ..workspace.layout import document_relative_dir, path_segment, user_root
+from ..workspace.locks import workspace_lock
 
 router = APIRouter(prefix="/api/library", tags=["library"])
 
@@ -359,6 +360,17 @@ async def update_folder(
     renaming = "name" in provided and body.name is not None
     clash = "A folder with this name already exists here"
 
+    # The row and its directory move together, under the user's workspace lock, so no
+    # content read can materialize at the new path in between (docs/workspace.md).
+    async with workspace_lock(user_root(settings.workspaces_dir, user.id)):
+        return await _update_folder_locked(
+            folder_id, body, user, db, settings, provided, renaming, clash
+        )
+
+
+async def _update_folder_locked(
+    folder_id, body, user, db, settings, provided, renaming: bool, clash: str
+):
     # The whole decision sits inside the retry: a rollback releases the lock the move was
     # validated under, so a second attempt has to establish both facts again.
     for attempt in range(INSERT_ATTEMPTS):
@@ -399,15 +411,16 @@ async def delete_folder(
     rows disappear on PostgreSQL and on the SQLite test fallback, which does not enforce
     foreign keys unless asked to.
     """
-    row = await owned_folder(db, user.id, folder_id)
-    relative = await folder_relative_dir(db, user.id, row.id)
-    doomed = await subtree_ids(db, user.id, row.id)
-    await db.execute(
-        delete(Document).where(Document.user_id == user.id, Document.folder_id.in_(doomed))
-    )
-    await db.execute(delete(Folder).where(Folder.user_id == user.id, Folder.id.in_(doomed)))
-    await db.commit()
-    await workspace_documents.remove_path(settings, user.id, relative)
+    async with workspace_lock(user_root(settings.workspaces_dir, user.id)):
+        row = await owned_folder(db, user.id, folder_id)
+        relative = await folder_relative_dir(db, user.id, row.id)
+        doomed = await subtree_ids(db, user.id, row.id)
+        await db.execute(
+            delete(Document).where(Document.user_id == user.id, Document.folder_id.in_(doomed))
+        )
+        await db.execute(delete(Folder).where(Folder.user_id == user.id, Folder.id.in_(doomed)))
+        await db.commit()
+        await workspace_documents.remove_path(settings, user.id, relative)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -579,6 +592,15 @@ async def update_document(
     renaming = "name" in provided and body.name is not None
     clash = "A file with this name already exists here"
 
+    async with workspace_lock(user_root(settings.workspaces_dir, user.id)):
+        return await _update_document_locked(
+            document_id, body, user, db, settings, provided, renaming, clash
+        )
+
+
+async def _update_document_locked(
+    document_id, body, user, db, settings, provided, renaming: bool, clash: str
+):
     for attempt in range(INSERT_ATTEMPTS):
         row = await owned_document(db, user.id, document_id)
         folder_id = body.folder_id if "folder_id" in provided else row.folder_id
@@ -610,11 +632,12 @@ async def delete_document(
     document_id: int, user: SessionUser, db: DbSession, settings: AppSettings
 ) -> Response:
     """Remove the file from the library. The parse itself stays in the history."""
-    row = await owned_document(db, user.id, document_id)
-    relative = await document_relative(db, row)
-    await db.delete(row)
-    await db.commit()
-    await workspace_documents.remove_path(settings, user.id, relative)
+    async with workspace_lock(user_root(settings.workspaces_dir, user.id)):
+        row = await owned_document(db, user.id, document_id)
+        relative = await document_relative(db, row)
+        await db.delete(row)
+        await db.commit()
+        await workspace_documents.remove_path(settings, user.id, relative)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

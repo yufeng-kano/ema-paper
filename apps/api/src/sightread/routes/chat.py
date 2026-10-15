@@ -198,6 +198,10 @@ async def post_message(
     settings: AppSettings,
 ):
     row = await owned_conversation(db, user.id, conversation_id)
+    # One turn at a time per conversation, enforced where the decision is made: the row is
+    # locked until this transaction commits (PostgreSQL; the SQLite fallback runs one
+    # request at a time), so two concurrent sends cannot both find no active turn.
+    await db.execute(select(Conversation.id).where(Conversation.id == row.id).with_for_update())
     await _ready_to_chat(db, settings, user.id)
     if await count_active_turns(db, user.id) >= settings.max_chat_turns_per_user:
         raise ApiError(

@@ -176,6 +176,8 @@ async def materialize_document(
         # (materialization writes only what is missing), so there is nothing to edit yet.
         raise ApiError(409, "invalid_request", "The document has no parse result to edit yet")
     async with workspace_lock(paths.root):
+        if not paths.directory.exists():
+            await ensure_within_quota(settings, paths.root)
         changed = await asyncio.to_thread(
             _materialize_files,
             paths,
@@ -191,7 +193,17 @@ async def materialize_document(
     return paths
 
 
-def keep_source(root: Path, relative: Path, source: Path) -> Path:
+async def ensure_within_quota(settings: Settings, root: Path) -> None:
+    """Refuse new material once the workspace is at its quota (docs/workspace.md § Quota).
+    A walk of the tree: cheap at the sizes a quota allows, and only on growth."""
+    used = await asyncio.to_thread(directory_size, root)
+    if used >= settings.workspace_quota_bytes:
+        raise ApiError(
+            409, "invalid_request", "The workspace is at its quota; free some space first"
+        )
+
+
+def keep_source(root: Path, relative: Path, source: Path, *, copy: bool = False) -> Path:
     """Move a finished parse's upload into its document directory (docs/jobs.md
     § Retention). Synchronous: called by the worker at terminal state."""
     git.ensure_repo(root)
@@ -199,7 +211,10 @@ def keep_source(root: Path, relative: Path, source: Path) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     suffix = source.suffix.lower()[:16] or ".bin"
     target = directory / f"{SOURCE_STEM}{suffix}"
-    shutil.move(str(source), str(target))
+    if copy:
+        shutil.copy2(str(source), str(target))
+    else:
+        shutil.move(str(source), str(target))
     return target
 
 
@@ -293,8 +308,11 @@ def _revert(paths: DocumentPaths, commit: str) -> str:
     parent = git.parent_of(paths.root, commit)
     restored = 0
     for relative, path in ((paths.doc_relative, paths.doc), (paths.notes_relative, paths.notes)):
-        before = git.show(paths.root, parent, relative) if parent else None
-        after = git.show(paths.root, commit, relative)
+        # The file may have lived elsewhere when the commit was made: a renamed or moved
+        # document keeps its history, and a revert must read it where it was then.
+        at_commit, at_parent = git.paths_at(paths.root, commit, relative)
+        after = git.show(paths.root, commit, at_commit) if at_commit else None
+        before = git.show(paths.root, parent, at_parent) if parent and at_parent else None
         if before == after:
             continue
         if before is None:
@@ -330,10 +348,11 @@ def _move_tree(root: Path, source: Path, target: Path, message: str) -> None:
 
 
 async def move_path(settings: Settings, user_id: int, source: Path, target: Path) -> None:
-    """Rename or move a document or folder directory after the database did."""
+    """Rename or move a document or folder directory after the database did. The caller
+    holds the user's workspace lock across its database write and this move, so nothing
+    can materialize at the new path in between (docs/workspace.md § Revisions)."""
     root = user_root(settings.workspaces_dir, user_id)
-    async with workspace_lock(root):
-        await asyncio.to_thread(_move_tree, root, source, target, f"move {source} -> {target}")
+    await asyncio.to_thread(_move_tree, root, source, target, f"move {source} -> {target}")
 
 
 def _remove_tree(root: Path, relative: Path, message: str) -> None:
@@ -346,9 +365,9 @@ def _remove_tree(root: Path, relative: Path, message: str) -> None:
 
 
 async def remove_path(settings: Settings, user_id: int, relative: Path) -> None:
+    """Delete a directory after the database did; the caller holds the workspace lock."""
     root = user_root(settings.workspaces_dir, user_id)
-    async with workspace_lock(root):
-        await asyncio.to_thread(_remove_tree, root, relative, f"delete {relative}")
+    await asyncio.to_thread(_remove_tree, root, relative, f"delete {relative}")
 
 
 def directory_size(path: Path) -> int:

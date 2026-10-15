@@ -19,6 +19,7 @@ async def client(tmp_path):
         sandbox_token=TOKEN,
         sandbox_backend="local",
         sandbox_workspaces_dir=str(tmp_path / "ws"),
+        sandbox_workspaces_mount=str(tmp_path / "ws"),
         sandbox_output_max_bytes=400,
         sandbox_idle_seconds=0,
     )
@@ -103,3 +104,19 @@ async def test_restart_stop_and_reset(client, tmp_path) -> None:
     assert reset.status_code == 204
     assert not cache.exists()
     assert (tmp_path / "ws" / "4" / "files" / "keep.md").read_text() == "keep"
+
+
+async def test_a_newline_free_flood_is_cut_like_any_other(client) -> None:
+    flood = await client.post(
+        "/sandboxes/5/exec",
+        json={
+            "session": "s",
+            "command": "head -c 200000 /dev/zero | tr '\\0' 'a'; echo; echo done",
+        },
+    )
+    assert flood.status_code == 200, flood.text
+    body = flood.json()
+    assert body["truncated"] is True
+    assert body["exit_code"] == 0
+    assert body["output"].rstrip().endswith("done")
+    assert len(body["output"]) < 2000

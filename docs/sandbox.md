@@ -14,7 +14,7 @@ A separate service, `apps/sandbox` (`sightread-sandbox` in compose), is the only
 | `POST /sandboxes/{user_id}/stop` | stop the VM, keep everything on disk |
 | `POST /sandboxes/{user_id}/reset` | stop, and delete the package cache and shell state under `/workspace/.cache`; documents are untouched |
 
-Output is captured as combined stdout and stderr, cut at `SANDBOX_OUTPUT_MAX_BYTES` with the head and the tail kept, so a command that prints a file cannot flood the conversation. A command past `timeout_seconds` is killed with its process group and reported as timed out; the shell survives.
+Output is captured as combined stdout and stderr in fixed-size reads (never line by line, so one newline-free value of any length is cut like any other flood), kept at `SANDBOX_OUTPUT_MAX_BYTES` with the head and the tail, so a command that prints a file cannot flood the conversation. A command past `timeout_seconds` is killed with its process group and reported as timed out; the shell survives.
 
 Two backends implement the same interface: `docker` (production: `docker run` with `--runtime {SANDBOX_RUNTIME}`, the user directory bind-mounted at `/workspace`, `--network {SANDBOX_NETWORK}`, cpu/memory/pids limits, a read-only root filesystem and a tmpfs `/tmp`) and `local` (tests only: a bash process in a temporary directory, no isolation — never deployed).
 
@@ -34,10 +34,10 @@ Two backends implement the same interface: `docker` (production: `docker run` wi
 
 ## The image
 
-`deploy/sandbox-image/Dockerfile`: Debian with `uv` and Python, `poppler-utils`, `ripgrep`, `jq`, `pandoc`, `imagemagick` and `git`, a non-root `agent` user, `/workspace` as the working directory, `UV_CACHE_DIR=/workspace/.cache/uv` and `UV_INDEX_URL` from `SANDBOX_INDEX_URL`. Built and tagged by the operator like the service images; `SANDBOX_IMAGE` names it.
+`deploy/sandbox-image/Dockerfile`: Debian with `uv` and Python, `poppler-utils`, `ripgrep`, `jq`, `pandoc`, `imagemagick` and `git`, `/workspace` as the working directory, `UV_CACHE_DIR=/workspace/.cache/uv` and `UV_INDEX_URL` from `SANDBOX_INDEX_URL`. Commands run as root **inside the VM**: `/workspace` is a bind mount the api and worker write as root, and one identity on both sides is what keeps the files writable from the shell; the isolation is the VM boundary, with every capability dropped and a read-only root filesystem, not a guest UID. Built and tagged by the operator like the service images; `SANDBOX_IMAGE` names it (`sightread-sandbox`), and compose names the runner's own image `sightread-sandbox-runner` so the two never share a tag.
 
 ## Operations
 
 - Install the Kata runtime and register it with Docker as `kata` (the runtime binary, the guest kernel and the rootfs image are Kata's packages; Docker's `daemon.json` gets `"runtimes": {"kata": {"path": "/usr/bin/containerd-shim-kata-v2"...}}` per Kata's Docker guide). Verify with `docker run --runtime kata --rm hello-world` before enabling the sandbox.
-- `{WORKSPACES_DIR}` is a host directory bind-mounted into `api`, `worker` and `sandbox`; `SANDBOX_WORKSPACES_DIR` is the same directory as the Docker daemon sees it (the runner passes host paths to `docker run`). A per-user quota is a filesystem concern — XFS project quotas or one fixed-size image per user mounted under the directory — see [workspace.md](./workspace.md) § Quota.
+- `{WORKSPACES_DIR}` is a host directory bind-mounted into `api`, `worker` and `sandbox`. The runner holds it twice: `SANDBOX_WORKSPACES_DIR` is the host path it hands to `docker run -v`, `SANDBOX_WORKSPACES_MOUNT` is where compose mounted it inside the runner, which is what the runner reads and clears itself (the `.cache` it creates and `reset` removes). A per-user quota is a filesystem concern — XFS project quotas or one fixed-size image per user mounted under the directory — see [workspace.md](./workspace.md) § Quota.
 - Logs: every command is recorded in the conversation (`chat_events`), never only in the runner's log.

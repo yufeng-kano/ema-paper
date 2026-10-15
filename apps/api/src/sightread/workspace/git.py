@@ -147,6 +147,12 @@ def show(root: Path, commit: str, relative: Path) -> str | None:
     return proc.stdout if proc.returncode == 0 else None
 
 
+def show_commit(root: Path, commit: str) -> str:
+    """The commit's unified diff for text files; binaries appear as a summary line."""
+    proc = _git(root, "show", "--format=", "--unified=3", commit, check=False)
+    return proc.stdout if proc.returncode == 0 else ""
+
+
 def parent_of(root: Path, commit: str) -> str | None:
     proc = _git(root, "rev-parse", "--verify", "-q", f"{commit}^", check=False)
     return proc.stdout.strip() or None
@@ -156,3 +162,42 @@ def is_commit(root: Path, commit: str) -> bool:
     if not commit or not all(c in "0123456789abcdef" for c in commit.lower()):
         return False
     return _git(root, "cat-file", "-e", f"{commit}^{{commit}}", check=False).returncode == 0
+
+
+def paths_at(root: Path, commit: str, current: Path) -> tuple[Path | None, Path | None]:
+    """Where a file that is now at `current` lived at `commit`, and at that commit's parent.
+
+    `git log --follow` walks renames: each entry names the path the file had in that
+    commit. The parent's path is the next older entry's, which is the old name when the
+    commit itself was the rename. None when the file did not exist at that point.
+    """
+    proc = _git(
+        root,
+        "log",
+        "--follow",
+        "--name-only",
+        "--format=%x1e%H",
+        "--",
+        str(current),
+        check=False,
+    )
+    if proc.returncode != 0:
+        return None, None
+    entries: list[tuple[str, Path]] = []
+    for record in proc.stdout.split("\x1e"):
+        if not record.strip():
+            continue
+        sha, _, body = record.partition("\n")
+        names = [line for line in body.splitlines() if line.strip()]
+        if names:
+            entries.append((sha.strip(), Path(names[0])))
+    for index, (sha, path) in enumerate(entries):
+        if sha == commit:
+            older = entries[index + 1][1] if index + 1 < len(entries) else path
+            return path, older
+    # The commit did not touch this file: it sat at the path of the newest entry at or
+    # before it. Without that entry the file did not exist yet.
+    for sha, path in entries:
+        if _git(root, "merge-base", "--is-ancestor", sha, commit, check=False).returncode == 0:
+            return path, path
+    return None, None

@@ -61,11 +61,15 @@ async def _seed(db, *, markdown: str = "# Title\n\nBody\n") -> tuple[User, Docum
 
 
 def test_path_segments_cannot_escape_or_shadow_the_workspace() -> None:
-    assert path_segment("..") == "_"
-    assert path_segment(".hidden") == "hidden"
-    assert path_segment(".sightread") == "sightread"
+    assert path_segment("..") == "_.."
+    assert path_segment(".hidden") == "_.hidden"
+    assert path_segment(".sightread") == "_.sightread"
     assert path_segment("a/b\\c") == "a b c"
-    assert path_segment(".meta.json") == "meta.json"
+    assert path_segment(".meta.json") == "_.meta.json"
+    assert path_segment("") == "_"
+    # Distinct names stay distinct directories (a leading `_` is escaped by another).
+    names = ["report", ".report", "_report", "_", ".", "..", ".git"]
+    assert len({path_segment(name) for name in names}) == len(names)
     root = Path("/w/1")
     assert inside(root, root / "files" / "x")
     assert not inside(root, root / ".." / "2")
@@ -148,3 +152,37 @@ async def test_keep_source_moves_the_upload_into_the_document_directory(tmp_path
     assert not upload.exists()
     # Ignored by git: the binary never enters history.
     assert git.commit_all(root, "user", "x") is None or "source" not in git.log(root)[0].files
+
+
+async def test_revert_follows_a_rename(sessionmaker, tmp_path) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        content = await documents.read_content(db, settings, document)
+        await documents.write_content(
+            db, settings, document, markdown="# Title\n\nEdited\n", base_revision=content.revision
+        )
+        edit = (await documents.revisions(db, settings, document))[0]
+        before = await documents.document_paths(db, settings, document)
+        document.name = "renamed.pdf"
+        await db.commit()
+        after = await documents.document_paths(db, settings, document)
+        await documents.move_path(settings, user.id, before.relative, after.relative)
+        assert after.doc.read_text() == "# Title\n\nEdited\n"
+
+        restored = await documents.revert(db, settings, document, edit.commit)
+        assert restored == content.revision
+        assert after.doc.read_text() == "# Title\n\nBody\n"
+
+
+async def test_materialize_refuses_a_full_workspace(sessionmaker, tmp_path) -> None:
+    settings = _settings(tmp_path)
+    settings.workspace_quota_bytes = 1
+    async with sessionmaker() as db:
+        _, document = await _seed(db)
+        root = user_root(settings.workspaces_dir, document.user_id)
+        root.mkdir(parents=True)
+        (root / "big.bin").write_bytes(b"x" * 10)
+        with pytest.raises(ApiError) as refused:
+            await documents.materialize_document(db, settings, document)
+        assert refused.value.status_code == 409

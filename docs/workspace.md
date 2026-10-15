@@ -21,17 +21,18 @@ Every user owns one directory on the server, `{WORKSPACES_DIR}/{user_id}/`. It i
 ```
 
 - **A document is a directory, not a file.** Content, notes, crops, the original and the metadata travel together; a rename or a move is one `git mv`.
-- **The directory name is the document's name**, the folder path is its folders' names. The library already keeps names unique per level ([database.md](./database.md)); `path_segment()` additionally refuses what a name can be but a path cannot: it strips leading dots, control characters and separators, and the two reserved names `.sightread` and `.meta.json`.
+- **The directory name is the document's name**, the folder path is its folders' names. The library already keeps names unique per level ([database.md](./database.md)); `path_segment()` keeps them unique as directories too: separators and control characters are replaced, and a name that starts with `.` or `_`, is empty, or is one of the workspace's own names (`.sightread`, `.meta.json`, `.cache`, `.git`) is kept whole behind a `_` prefix — `.report` becomes `_.report`, never `report`, so two distinct names are two directories.
 - **The parse output stays immutable.** `results` in PostgreSQL remains the record of what the model produced; `.sightread/results/{job_id}/result.md` is a read-only copy for the agent to compare against. A document filed twice from one parse gets two independent `doc.md`, both copied from that one result.
 - **Materialization is lazy and idempotent.** A document directory is written the first time anything needs it — the viewer asking for content, a conversation starting — and at the moment a library upload's parse finishes. `materialize_document()` writes what is missing and touches nothing that exists, so an edited `doc.md` is never overwritten by the parse result — which is also why a document whose parse has no result yet cannot be materialized at all (**409**): an empty `doc.md` written early would never be replaced.
-- **The original upload is kept** for library documents: at terminal state the worker moves the source file into the document directory instead of deleting it ([jobs.md](./jobs.md) § Retention), so the agent can re-render a page with Poppler. Parses submitted through the API or the connector are not in the library and keep today's rule — their source is deleted.
+- **The original upload is kept** for library documents: at terminal state the worker moves the source file into the document directory (a copy into each, when one parse was filed in several places) instead of deleting it ([jobs.md](./jobs.md) § Retention), so the agent can re-render a page with Poppler. Parses submitted through the API or the connector are not in the library and keep today's rule — their source is deleted.
 
 ## Revisions
 
 The user directory is one git repository; `sightread.workspace.git` is the only module that runs git (as a subprocess, with `GIT_DIR`/`GIT_WORK_TREE` set, never the user's global config).
 
 - Every write through the API or a tool commits: `doc.md` saves from the viewer, `notes.md` saves, every edit the agent's editor tool makes, and whatever a shell command changed — after each tool call the runner commits a dirty tree. The commit author names who did it (`user` or `agent` with the conversation id), the message names the file and the tool.
-- **Writes are serialized per user** by a lock in the workspace module: the user editing in the viewer, two conversations editing in parallel and a `git mv` from a rename must not interleave their index operations.
+- **Writes are serialized per user** by a lock in the workspace module: the user editing in the viewer, two conversations editing in parallel and a `git mv` from a rename must not interleave their index operations. A rename, move or delete on the Files page holds that lock across its database write *and* the directory move, so no read can materialize a fresh copy at the new path in between.
+- **Revisions follow renames.** A revert reads the file where it lived at that commit (`git log --follow`), so the history of a document that was renamed or moved stays revertible.
 - `revision` in the API is the SHA-256 of the file's current content, not a commit id: a save carries the `base_revision` it was made from, and a save whose base no longer matches the file is refused with **409** — the client reloads and the reader sees what changed in between. The git log is the history the UI lists; `revert` writes the file as it was before a given commit and commits that, so undoing is itself a revision and nothing is ever rewritten.
 - `source.*`, `.sightread/` and the sandbox's package cache are gitignored: history records text, not binaries.
 
@@ -43,7 +44,7 @@ Reconciliation runs after turns and when the API itself moved something; it is n
 
 ## Quota
 
-`WORKSPACE_QUOTA_BYTES` (default 10 GiB) is the size the Usage page shows the workspace against and the point past which the API refuses a materialization and the sandbox runner refuses to start a VM. Hard enforcement is the operator's: mount `{WORKSPACES_DIR}` on a filesystem with per-directory quotas, or back each user directory with a fixed-size image ([sandbox.md](./sandbox.md) § Operations). Usage is measured by walking the tree (`du`), cached per user for the status route.
+`WORKSPACE_QUOTA_BYTES` (default 10 GiB) is the size the Usage page shows the workspace against and the point past which the API refuses to materialize another document (**409**) and a chat turn fails before it starts — no shell runs in a full workspace. Hard enforcement is the operator's: mount `{WORKSPACES_DIR}` on a filesystem with per-directory quotas, or back each user directory with a fixed-size image ([sandbox.md](./sandbox.md) § Operations). Usage is measured by walking the tree (`du`), cached per user for the status route.
 
 ## Backups
 

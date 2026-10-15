@@ -16,6 +16,8 @@ import os
 import secrets
 from dataclasses import dataclass
 
+READ_CHUNK_BYTES = 65_536
+
 
 @dataclass(frozen=True)
 class ExecOutcome:
@@ -26,31 +28,31 @@ class ExecOutcome:
 
 
 class BoundedOutput:
-    """Collects a command's output keeping its head and its tail within `max_bytes`."""
+    """Collects a command's output keeping its head and its tail within `max_bytes`,
+    whatever shape the output has — one endless line is cut the same as a flood of them."""
 
     def __init__(self, max_bytes: int) -> None:
         self._keep = max(max_bytes // 2 - 64, 1)
-        self._head: list[bytes] = []
-        self._head_size = 0
-        self._tail: list[bytes] = []
-        self._tail_size = 0
+        self._head = bytearray()
+        self._tail = bytearray()
         self.omitted = 0
 
-    def add(self, line: bytes) -> None:
-        if self._head_size < self._keep:
-            self._head.append(line)
-            self._head_size += len(line)
+    def add(self, data: bytes) -> None:
+        room = self._keep - len(self._head)
+        if room > 0:
+            self._head += data[:room]
+            data = data[room:]
+        if not data:
             return
-        self._tail.append(line)
-        self._tail_size += len(line)
-        while self._tail and self._tail_size > self._keep:
-            dropped = self._tail.pop(0)
-            self._tail_size -= len(dropped)
-            self.omitted += len(dropped)
+        self._tail += data
+        excess = len(self._tail) - self._keep
+        if excess > 0:
+            del self._tail[:excess]
+            self.omitted += excess
 
     def render(self) -> tuple[str, bool]:
-        head = b"".join(self._head).decode("utf-8", errors="replace")
-        tail = b"".join(self._tail).decode("utf-8", errors="replace")
+        head = self._head.decode("utf-8", errors="replace")
+        tail = self._tail.decode("utf-8", errors="replace")
         if not self.omitted:
             return head + tail, False
         return f"{head}\n[... {self.omitted} bytes omitted by the sandbox ...]\n{tail}", True
@@ -111,23 +113,47 @@ class ShellSession:
             collected = BoundedOutput(self._max_bytes)
             exit_code: int | None = None
             marker_bytes = marker.encode()
+            pending = b""
             try:
                 async with asyncio.timeout(timeout):
                     while True:
-                        line = await process.stdout.readline()
-                        if not line:
+                        # Fixed-size reads, never `readline`: a command that prints one
+                        # newline-free value longer than the stream's line limit would
+                        # otherwise fail the exec instead of being cut like any other
+                        # flood (docs/sandbox.md § The runner).
+                        chunk = await process.stdout.read(READ_CHUNK_BYTES)
+                        if not chunk:
                             # The shell exited (the command ran `exit`, or it died).
                             await self.close()
                             break
-                        if line.startswith(marker_bytes):
-                            try:
-                                exit_code = int(line[len(marker_bytes) :].strip() or 0)
-                            except ValueError:
-                                exit_code = None
+                        pending += chunk
+                        found = False
+                        while True:
+                            newline = pending.find(b"\n")
+                            if newline == -1:
+                                break
+                            line, pending = pending[: newline + 1], pending[newline + 1 :]
+                            if line.startswith(marker_bytes):
+                                try:
+                                    exit_code = int(line[len(marker_bytes) :].strip() or 0)
+                                except ValueError:
+                                    exit_code = None
+                                found = True
+                                break
+                            collected.add(line)
+                        if found:
                             break
-                        collected.add(line)
+                        # A partial line past the cap is output too; keep the tail where
+                        # the marker could still begin.
+                        if len(pending) > self._max_bytes and not pending.startswith(
+                            marker_bytes[:1]
+                        ):
+                            collected.add(pending[: -len(marker_bytes)])
+                            pending = pending[-len(marker_bytes) :]
             except TimeoutError:
                 await self.close()
+                if pending:
+                    collected.add(pending)
                 output, truncated = collected.render()
                 return ExecOutcome(output.rstrip("\n"), None, True, truncated)
 

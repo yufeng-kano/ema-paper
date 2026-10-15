@@ -28,7 +28,6 @@ RESERVED_SEGMENTS = frozenset({SIGHTREAD_DIR, META_FILE, CACHE_DIR, ".git", ".gi
 # Separators and control characters never reach a path; the library already strips the
 # separators (routes/library.py), this is the belt to that brace.
 _UNSAFE = re.compile(r"[\x00-\x1f\x7f/\\]")
-_LEADING_DOTS = re.compile(r"^\.+")
 
 GITIGNORE = "\n".join(
     (
@@ -50,15 +49,17 @@ def user_root(workspaces_dir: str | Path, user_id: int) -> Path:
 def path_segment(name: str) -> str:
     """A library name as one path component.
 
-    NFC-normalized so the same name typed two ways is one directory; separators and
-    control characters replaced; leading dots removed so a name cannot hide the entry or
-    collide with the reserved dotfiles; a reserved or empty result is prefixed.
+    NFC-normalized so the same name typed two ways is one directory, with separators and
+    control characters replaced. A name that would hide the entry or collide with the
+    workspace's own dotfiles — a leading dot, a reserved name, `.`/`..`, nothing — is kept
+    whole behind a `_` prefix, and a name that itself starts with `_` gets the prefix too:
+    that is what keeps distinct names in one folder distinct directories (`.report` and
+    `report` are `_.report` and `report`, never both `report`).
     """
     segment = unicodedata.normalize("NFC", name)
-    segment = _UNSAFE.sub(" ", segment)
-    segment = _LEADING_DOTS.sub("", segment).strip()
-    if not segment or segment in RESERVED_SEGMENTS or segment in (".", ".."):
-        segment = f"_{segment}" if segment else "_"
+    segment = _UNSAFE.sub(" ", segment).strip()
+    if not segment or segment.startswith((".", "_")) or segment in RESERVED_SEGMENTS:
+        segment = f"_{segment}"
     return segment
 
 

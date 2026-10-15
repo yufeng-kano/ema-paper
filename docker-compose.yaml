@@ -90,12 +90,16 @@ services:
   sandbox:
     build:
       context: ./apps/sandbox
+    # Named explicitly: compose would otherwise tag this build `sightread-sandbox`, the
+    # tag the VM image (deploy/sandbox-image, SANDBOX_IMAGE) is documented to carry.
+    image: sightread-sandbox-runner
     container_name: sightread-sandbox
     env_file:
       - path: .env
         required: false
     environment:
       SANDBOX_BACKEND: docker
+      SANDBOX_WORKSPACES_MOUNT: /data/workspaces
       # The workspaces as the Docker daemon sees them: an absolute host path.
       SANDBOX_WORKSPACES_DIR: ${SANDBOX_WORKSPACES_DIR:-${PWD}/workspaces}
     volumes:

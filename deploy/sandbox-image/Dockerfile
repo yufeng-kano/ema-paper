@@ -13,10 +13,13 @@ RUN apt-get update \
 # package installed once is there on the next boot (docs/sandbox.md § Lifecycle).
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
-RUN useradd --create-home --uid 1000 --shell /bin/bash agent \
-    && mkdir -p /workspace && chown agent:agent /workspace
+# Commands run as root *inside the VM*, deliberately: /workspace is a bind mount the api
+# and worker containers write as root, so the same identity is what makes the user's
+# files writable from the shell. The boundary is the VM (docs/sandbox.md § Isolation),
+# not a guest UID; the container also starts with every capability dropped and a
+# read-only root filesystem (apps/sandbox).
+RUN mkdir -p /workspace
 
-USER agent
 WORKDIR /workspace
 ENV UV_CACHE_DIR=/workspace/.cache/uv \
     UV_PYTHON_INSTALL_DIR=/workspace/.cache/python \

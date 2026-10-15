@@ -49,9 +49,9 @@ def render(row: ChatEvent) -> str:
     return sse(row.event, row.seq, {**row.data, "turn_id": str(row.turn_id)})
 
 
-async def emit(db: AsyncSession, conversation_id: int, turn_id, event: str, data: dict) -> int:
-    """Append one event and wake the streams. The turn is the only writer of its
-    conversation, so `max(seq) + 1` cannot race itself. Commits."""
+async def append(db: AsyncSession, conversation_id: int, turn_id, event: str, data: dict) -> int:
+    """Add one event to the session and queue the wake-up, without committing: for a
+    caller that must publish the event in the same transaction as a status change."""
     last = (
         await db.execute(
             select(func.max(ChatEvent.seq)).where(ChatEvent.conversation_id == conversation_id)
@@ -65,6 +65,13 @@ async def emit(db: AsyncSession, conversation_id: int, turn_id, event: str, data
         await db.execute(
             text("SELECT pg_notify(:channel, '')"), {"channel": channel_for(conversation_id)}
         )
+    return seq
+
+
+async def emit(db: AsyncSession, conversation_id: int, turn_id, event: str, data: dict) -> int:
+    """Append one event and wake the streams. The turn is the only writer of its
+    conversation, so `max(seq) + 1` cannot race itself. Commits."""
+    seq = await append(db, conversation_id, turn_id, event, data)
     await db.commit()
     return seq
 

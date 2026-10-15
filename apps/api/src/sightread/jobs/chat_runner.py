@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,7 +43,7 @@ from ..upstream.client import (
     load_connection,
 )
 from ..workspace import git
-from ..workspace.documents import DocumentPaths, materialize_document
+from ..workspace.documents import DocumentPaths, ensure_within_quota, materialize_document
 from ..workspace.reconcile import reconcile_user
 from . import chat_events, chat_tools
 
@@ -52,6 +53,8 @@ logger = logging.getLogger(__name__)
 TEXT_FLUSH_CHARS = 160
 # An explicit cache marker every this many messages inside a turn (docs/chat.md).
 CACHE_GUARD_EVERY = 15
+# How often a streaming turn looks for a cancel.
+CANCEL_POLL_SECONDS = 2.0
 # Retries of one upstream call on 429 / transient failures.
 MAX_ATTEMPTS = 3
 BACKOFF_BASE_SECONDS = 2.0
@@ -132,6 +135,9 @@ async def _load(
         effort = setting.effort if setting and setting.effort else EFFORT_DEFAULT
         try:
             paths = await materialize_document(db, settings, document)
+            # A full workspace runs no shell: what the turn writes has nowhere to go
+            # (docs/workspace.md § Quota).
+            await ensure_within_quota(settings, paths.root)
         except ApiError as exc:
             raise TurnFailed(exc.message) from exc
 
@@ -280,15 +286,24 @@ async def _stream_once(ctx: TurnContext, body: dict) -> CompletedMessage:
             thinking_buffer.clear()
 
     completed: CompletedMessage | None = None
-    async for item in stream_messages(
+    last_cancel_check = time.monotonic()
+    stream = stream_messages(
         ctx.connection,
         body,
         betas=chat_agent.BETAS,
         max_bytes=ctx.settings.upstream_response_max_bytes,
-    ):
+    )
+    async for item in stream:
         if isinstance(item, CompletedMessage):
             completed = item
             break
+        # A cancel must not wait out a ten-minute generation: the stream is dropped
+        # (closing the connection ends the generation), and nothing of it is stored.
+        if time.monotonic() - last_cancel_check >= CANCEL_POLL_SECONDS:
+            last_cancel_check = time.monotonic()
+            if await _cancelled(ctx):
+                await stream.aclose()
+                raise TurnCancelled()
         event: StreamEvent = item
         if event.kind == "text_delta":
             text_buffer.append(event.text)
@@ -336,7 +351,23 @@ async def _call_model(ctx: TurnContext, body: dict) -> CompletedMessage:
 
 
 async def _run_tool(ctx: TurnContext, block: dict, malformed: set[str]) -> dict:
-    """One tool_use block → its tool_result block (plus the events along the way)."""
+    """One tool_use block → its tool_result block (plus the events along the way). A tool
+    that raises answers an error result: the model corrects itself, the turn goes on."""
+    try:
+        return await _run_tool_unguarded(ctx, block, malformed)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - any failure is this tool's, never the turn's
+        logger.exception("tool %s failed in turn %s", block.get("name"), ctx.turn.id)
+        return await _report_tool(
+            ctx,
+            str(block.get("id")),
+            block.get("name"),
+            chat_tools.ToolOutcome("The tool failed unexpectedly; try another way.", is_error=True),
+        )
+
+
+async def _run_tool_unguarded(ctx: TurnContext, block: dict, malformed: set[str]) -> dict:
     name = block.get("name")
     tool_use_id = str(block.get("id"))
     tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
@@ -358,6 +389,10 @@ async def _run_tool(ctx: TurnContext, block: dict, malformed: set[str]) -> dict:
                 tool_input,
                 max_chars=max_chars,
             )
+            # What the shell changed is a revision of its own (docs/workspace.md).
+            outcome = await chat_tools.commit_shell_changes(
+                ctx.paths.root, outcome, tool_input, author, max_chars=max_chars
+            )
     elif name == "str_replace_based_edit_tool":
         outcome = await chat_tools.run_editor(
             ctx.paths.root, tool_input, author, max_chars=max_chars
@@ -370,6 +405,12 @@ async def _run_tool(ctx: TurnContext, block: dict, malformed: set[str]) -> dict:
         outcome = await chat_tools.view_figure(ctx.paths, tool_input)
     else:
         outcome = chat_tools.ToolOutcome(f"unknown tool {name!r}", is_error=True)
+    return await _report_tool(ctx, tool_use_id, name, outcome)
+
+
+async def _report_tool(
+    ctx: TurnContext, tool_use_id: str, name: object, outcome: chat_tools.ToolOutcome
+) -> dict:
 
     summary = outcome.content if isinstance(outcome.content, str) else "(image)"
     await _emit(
@@ -399,10 +440,14 @@ async def _loop(ctx: TurnContext) -> None:
             since_marker = 0
         completed = await _call_model(ctx, body)
         await _record_usage(ctx, completed)
+        if await _cancelled(ctx):
+            # Billed, but not kept: a cancelled turn leaves the history as it was.
+            raise TurnCancelled()
         if completed.content:
             await _store(ctx, "assistant", completed.content)
             messages.append({"role": "assistant", "content": completed.content})
-            since_marker += 1
+            # Positions are content blocks, not messages (docs/chat.md § Prompt caching).
+            since_marker += len(completed.content)
 
         if completed.stop_reason == "refusal":
             raise TurnFailed("The model declined this request")
@@ -424,7 +469,7 @@ async def _loop(ctx: TurnContext) -> None:
         # (docs/chat.md § Tools).
         await _store(ctx, "user", list(results))
         messages.append({"role": "user", "content": list(results)})
-        since_marker += 1
+        since_marker += len(results)
 
 
 async def _finish(
@@ -434,10 +479,15 @@ async def _finish(
     status: str,
     error: str | None = None,
 ) -> None:
+    """The terminal state and its event in one commit, so a stream that sees the turn
+    stop always finds the event that says how. A turn the user cancelled stays
+    cancelled whatever the loop concluded."""
     async with sessionmaker() as db:
         turn = await db.get(ChatTurn, turn_id)
         if turn is None:
             return
+        if turn.status == "cancelled" or status == "cancelled":
+            status, error = "cancelled", "cancelled"
         turn.status = status
         turn.error = error
         turn.finished_at = utcnow()
@@ -446,17 +496,17 @@ async def _finish(
             .where(Conversation.id == turn.conversation_id)
             .values(updated_at=utcnow())
         )
-        await db.commit()
         if status == "succeeded":
-            await chat_events.emit(db, turn.conversation_id, turn.id, chat_events.TURN_DONE, {})
+            await chat_events.append(db, turn.conversation_id, turn.id, chat_events.TURN_DONE, {})
         else:
-            await chat_events.emit(
+            await chat_events.append(
                 db,
                 turn.conversation_id,
                 turn.id,
                 chat_events.TURN_ERROR,
                 {"status": status, "error": error or ""},
             )
+        await db.commit()
 
 
 async def run_turn(

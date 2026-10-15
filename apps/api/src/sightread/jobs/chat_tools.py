@@ -231,11 +231,51 @@ def _edit_sync(root: Path, tool_input: dict, author: str, *, max_chars: int) -> 
     )
 
 
+def _edit_guarded(root: Path, tool_input: dict, author: str, *, max_chars: int) -> ToolOutcome:
+    """A path that is well-formed but unusable — a directory where a file was expected, a
+    parent that is a file, a vanished file — is the model's mistake to correct, not the
+    turn's end."""
+    try:
+        return _edit_sync(root, tool_input, author, max_chars=max_chars)
+    except (OSError, git.GitError) as exc:
+        return ToolOutcome(f"The file operation failed: {type(exc).__name__}", is_error=True)
+
+
 async def run_editor(root: Path, tool_input: dict, author: str, *, max_chars: int) -> ToolOutcome:
     if tool_input.get("command") == "view":
-        return await asyncio.to_thread(_edit_sync, root, tool_input, author, max_chars=max_chars)
+        return await asyncio.to_thread(_edit_guarded, root, tool_input, author, max_chars=max_chars)
     async with workspace_lock(root):
-        return await asyncio.to_thread(_edit_sync, root, tool_input, author, max_chars=max_chars)
+        return await asyncio.to_thread(_edit_guarded, root, tool_input, author, max_chars=max_chars)
+
+
+def _commit_shell_sync(root: Path, command: str, author: str, *, max_chars: int) -> dict | None:
+    git.ensure_repo(root)
+    label = command.strip().splitlines()[0][:72] if command.strip() else "bash"
+    commit = git.commit_all(root, author, f"bash: {label}")
+    if commit is None:
+        return None
+    diff = git.show_commit(root, commit)
+    return {"path": "", "command": "bash", "commit": commit, "diff": truncate(diff, max_chars)}
+
+
+async def commit_shell_changes(
+    root: Path, outcome: ToolOutcome, tool_input: dict, author: str, *, max_chars: int
+) -> ToolOutcome:
+    """After a shell command: whatever it changed under the workspace becomes one
+    revision, under the user's lock like every other write (docs/workspace.md)."""
+    command = tool_input.get("command")
+    if not isinstance(command, str):
+        return outcome
+    async with workspace_lock(root):
+        try:
+            edit = await asyncio.to_thread(
+                _commit_shell_sync, root, command, author, max_chars=max_chars
+            )
+        except git.GitError:
+            return outcome
+    if edit is None:
+        return outcome
+    return ToolOutcome(outcome.content, is_error=outcome.is_error, edit=edit)
 
 
 # --- pages and figures --------------------------------------------------------------------

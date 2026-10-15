@@ -45,6 +45,11 @@ class Backend:
     # --- what a backend decides ---------------------------------------------------------
 
     def workspace(self, user_id: int) -> Path:
+        """The user's directory as this process sees it (docs/sandbox.md § Operations)."""
+        return Path(self.settings.sandbox_workspaces_mount) / str(user_id)
+
+    def host_workspace(self, user_id: int) -> Path:
+        """The same directory as the Docker daemon sees it — what `-v` is given."""
         return Path(self.settings.sandbox_workspaces_dir) / str(user_id)
 
     async def ensure_running(self, sandbox: UserSandbox) -> None:
@@ -176,6 +181,7 @@ class DockerBackend(Backend):
         workspace = self.workspace(sandbox.user_id)
         await asyncio.to_thread(lambda: (workspace / CACHE_DIR).mkdir(parents=True, exist_ok=True))
         settings = self.settings
+        host_workspace = self.host_workspace(sandbox.user_id)
         args = [
             "run",
             "-d",
@@ -199,7 +205,7 @@ class DockerBackend(Backend):
             "--cap-drop",
             "ALL",
             "-v",
-            f"{workspace}:/workspace",
+            f"{host_workspace}:/workspace",
             "-w",
             "/workspace",
             "-e",

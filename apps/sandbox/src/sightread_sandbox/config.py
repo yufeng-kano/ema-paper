@@ -20,8 +20,12 @@ class Settings(BaseSettings):
     # The Docker runtime: `kata` is a VM per container; `runc` is for local development.
     sandbox_runtime: str = "kata"
     sandbox_image: str = "sightread-sandbox"
-    # Host path of the per-user workspaces as the Docker daemon sees it.
+    # Host path of the per-user workspaces as the Docker daemon sees it: what `docker run`
+    # bind-mounts into a user's VM.
     sandbox_workspaces_dir: str = "/data/workspaces"
+    # The same directory as this runner sees it (compose mounts the host path here): what
+    # the runner itself reads and clears.
+    sandbox_workspaces_mount: str = "/data/workspaces"
     sandbox_network: str = "none"
     sandbox_index_url: str = ""
     sandbox_cpus: str = "2"
