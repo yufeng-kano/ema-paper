@@ -22,9 +22,22 @@ const dayColumns = computed<TableColumn<UsageRow>[]>(() => [
   { key: 'label', header: t('dashboard.columnDate') },
   { key: 'share', header: '', srHeader: t('dashboard.columnShare'), width: '120px' },
   { key: 'cost', header: t('dashboard.columnCost'), numeric: true },
+  // Estimates and unpriced calls get columns of their own, and only in a period that has
+  // any: they are never summed into the billed cost beside them (docs/web.md § Pages).
+  ...(summary.value?.totalEstimatedCalls
+    ? [{ key: 'estimated', header: t('dashboard.columnEstimated'), numeric: true }]
+    : []),
+  ...(summary.value?.totalUnpricedCalls
+    ? [{ key: 'unpriced', header: t('dashboard.columnUnpriced'), numeric: true }]
+    : []),
   { key: 'prompt', header: t('dashboard.columnPrompt'), numeric: true },
   { key: 'completion', header: t('dashboard.columnCompletion'), numeric: true },
 ])
+
+/** Billed cost, or a dash where nothing was billed: $0 would claim OpenRouter billed it. */
+function billedCost(row: UsageRow): string {
+  return row.billedCalls > 0 ? formatCost(row.cost, locale.value) : t('dashboard.none')
+}
 </script>
 
 <template>
@@ -32,18 +45,39 @@ const dayColumns = computed<TableColumn<UsageRow>[]>(() => [
     <UiRail>
       <UiPageHeader :eyebrow="t('dashboard.period', { days: USAGE_DAYS })" :title="t('dashboard.headTitle')" />
 
-      <!-- Three figures on rules, not in boxes. Cost is the accent and the largest of them:
-           it is the number this page exists to answer. -->
+      <!-- Figures on rules, not in boxes. Cost is the accent and the largest of them: it is
+           the number this page exists to answer. -->
       <dl v-if="summary" class="totals">
         <div class="total">
           <dt class="eyebrow">{{ t('dashboard.totalCost') }}</dt>
-          <dd class="figure cost tabular">{{ formatCost(summary.totalCost, locale) }}</dd>
+          <!-- A period with calls but none billed has no billed figure, not a $0 one. -->
+          <dd class="figure cost tabular">
+            {{
+              summary.totalBilledCalls || summary.isEmpty
+                ? formatCost(summary.totalCost, locale)
+                : t('dashboard.none')
+            }}
+          </dd>
+        </div>
+        <!-- An estimate is a figure of its own, never added to the billed one above, and
+             not in the accent: it is what an endpoint said, not what anyone was charged. -->
+        <div v-if="summary.totalEstimatedCalls" class="total">
+          <dt class="eyebrow">{{ t('dashboard.totalEstimatedCost') }}</dt>
+          <dd class="figure tabular">
+            {{ t('dashboard.estimatedValue', { cost: formatCost(summary.totalEstimatedCost, locale) }) }}
+          </dd>
+          <dd class="total-note">{{ t('dashboard.totalEstimatedNote') }}</dd>
+        </div>
+        <div v-if="summary.totalUnpricedCalls" class="total">
+          <dt class="eyebrow">{{ t('dashboard.totalUnpriced') }}</dt>
+          <dd class="figure tabular">{{ formatCount(summary.totalUnpricedCalls, locale) }}</dd>
+          <dd class="total-note">{{ t('dashboard.totalUnpricedNote') }}</dd>
         </div>
         <div class="total">
           <dt class="eyebrow">{{ t('dashboard.totalPromptTokens') }}</dt>
           <dd class="figure tabular">{{ formatCount(summary.totalPromptTokens, locale) }}</dd>
         </div>
-        <div class="total last">
+        <div class="total">
           <dt class="eyebrow">{{ t('dashboard.totalCompletionTokens') }}</dt>
           <dd class="figure tabular">{{ formatCount(summary.totalCompletionTokens, locale) }}</dd>
         </div>
@@ -97,7 +131,17 @@ const dayColumns = computed<TableColumn<UsageRow>[]>(() => [
           <template #cell-share="{ row }">
             <UiUsageBar :share="row.costShare" :label="formatDay(row.label, locale)" />
           </template>
-          <template #cell-cost="{ row }">{{ formatCost(row.cost, locale) }}</template>
+          <template #cell-cost="{ row }">{{ billedCost(row) }}</template>
+          <template #cell-estimated="{ row }">
+            {{
+              row.estimatedCalls
+                ? t('dashboard.estimatedValue', { cost: formatCost(row.estimatedCost, locale) })
+                : t('dashboard.none')
+            }}
+          </template>
+          <template #cell-unpriced="{ row }">
+            {{ row.unpricedCalls ? formatCount(row.unpricedCalls, locale) : t('dashboard.none') }}
+          </template>
           <template #cell-prompt="{ row }">{{ formatCount(row.promptTokens, locale) }}</template>
           <template #cell-completion="{ row }">
             {{ formatCount(row.completionTokens, locale) }}
@@ -129,8 +173,14 @@ const dayColumns = computed<TableColumn<UsageRow>[]>(() => [
                   })
                 }}
               </p>
+              <p v-if="row.estimatedCalls" class="model-tokens tabular">
+                {{ t('dashboard.modelEstimated', { cost: formatCost(row.estimatedCost, locale) }) }}
+              </p>
+              <p v-if="row.unpricedCalls" class="model-tokens tabular">
+                {{ t('dashboard.modelUnpriced', { count: formatCount(row.unpricedCalls, locale) }) }}
+              </p>
             </div>
-            <p class="model-cost tabular">{{ formatCost(row.cost, locale) }}</p>
+            <p class="model-cost tabular">{{ billedCost(row) }}</p>
           </li>
         </ul>
       </UiPanel>
@@ -139,12 +189,13 @@ const dayColumns = computed<TableColumn<UsageRow>[]>(() => [
 </template>
 
 <style scoped>
-/* Each figure is a band between rules — the last one closes the stack so it does not trail
-   off into the rail's whitespace. */
+/* Each figure is a band between rules — the stack's own bottom rule closes it so it does
+   not trail off into the rail's whitespace, however many figures the period shows. */
 .totals {
   display: flex;
   flex-direction: column;
   margin: 0;
+  border-bottom: 1px solid var(--line);
 }
 
 .total {
@@ -152,8 +203,11 @@ const dayColumns = computed<TableColumn<UsageRow>[]>(() => [
   border-top: 1px solid var(--line);
 }
 
-.total.last {
-  border-bottom: 1px solid var(--line);
+.total-note {
+  margin: var(--space-2) 0 0;
+  font-size: var(--text-xs);
+  line-height: 1.6;
+  color: var(--muted);
 }
 
 .figure {

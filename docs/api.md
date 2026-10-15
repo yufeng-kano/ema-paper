@@ -91,11 +91,11 @@ Preset profiles (id, name, model, bbox_format, description).
 | `GET /api/me` | current user (incl. `picture`, the Google avatar URL) + settings (`default_model`, `default_profile`, `default_connection_id`, `prompt_preset_id`) + the shipped default prompt (`defaults.system_prompt`) + whether an OpenRouter key is stored (masked, never the value) + `limits` (`upload_max_bytes`, `page_cap`, `accepted_media_types`, `accepted_extensions`) so the upload UI enforces the server's numbers rather than its own — the extensions matter because intake accepts a file by extension when the browser reports a generic media type for it |
 | `GET/POST /api/keys`, `DELETE /api/keys/{id}` | API keys; `POST` returns the created key (with plaintext) exactly once, unwrapped; `GET` wraps as `{keys: []}` |
 | `GET/PUT/DELETE /api/openrouter-key` | read masked form / store (validated against `GET https://openrouter.ai/api/v1/key` before save) / remove |
-| `GET/POST /api/connections`, `PUT/DELETE /api/connections/{id}` | provider connections (a profile: `name`, `base_url`, API key, `model`); key returned masked only; `POST` requires `model` and `POST`/`PUT` validate the endpoint + key with `GET {base_url}/models` before storing |
+| `GET/POST /api/connections`, `PUT/DELETE /api/connections/{id}` | provider connections (a profile: `name`, `base_url`, API key, `model`, `report_cost`); key returned masked only; `POST` requires `model` and `POST`/`PUT` validate the endpoint + key with `GET {base_url}/models` before storing. `report_cost` (bool, default `false`; optional on `POST`, partial on `PUT`) records the `usage.cost` the endpoint reports as an **estimate** ([parsing.md](./parsing.md) § Upstream usage); changing it alone does not re-validate the endpoint |
 | `POST /api/connections/preview-models` | live model catalog (`{data: [{id, name}]}`) for the connection dialog, before or while a connection exists: `{base_url, api_key}` fetches with the candidate key, `{base_url, connection_id}` with that connection's stored key; the URL passes the same rules as saving ([auth.md](./auth.md) § 3); no server cache |
 | `GET/POST /api/prompts`, `PUT/DELETE /api/prompts/{id}` | prompt presets (`{id, name, text}`); text capped at `SYSTEM_PROMPT_MAX_CHARS`; deleting the selected preset falls back to the default prompt |
 | `PUT /api/settings` | default model / profile (OpenRouter-only defaults) / `default_connection_id` / `prompt_preset_id` (partial update: only the fields present in the body change; `null` restores the respective default). `default_profile` is refused when a custom connection is selected — profiles run on OpenRouter only; a connection's model lives on the connection itself |
-| `GET /api/usage?days=30` | per-day and per-model aggregates of tokens + cost from `usage_log` |
+| `GET /api/usage?days=30` | per-day and per-model aggregates of tokens + cost from `usage_log`, billed and estimated cost kept apart (§ Usage aggregates) |
 | `GET /api/jobs?limit=50` | recent jobs (history): `job_id`, `kind`, `filename`, `status`, `model`, `profile`, `page_count`, `pages_done`, `error`, timestamps — no per-job cost (usage is aggregated per day/model only); `GET /api/jobs/{id}/result` same payload as data plane, plus partial results (below) |
 | `GET /api/jobs/{id}/figures/{page}/{ymin},{xmin},{ymax},{xmax}` | one stored figure crop as `image/png`, addressed exactly as its `sightread://` placeholder addresses it; 404 when no crop was stored (old results, failed crop). Control plane only — the data plane ships coordinates, not image bytes ([parsing.md](./parsing.md) § Figure crops) |
 | `GET /api/library` | the whole file library in one read: `{folders: [...], documents: [...]}`. A document carries its own fields (`id`, `folder_id`, `name`, `job_id`) plus the parse's live state (`status`, `kind`, `model`, `page_count`, `pages_done`, `size_bytes`, `error`, `created_at`, `finished_at`) — the browser needs no second request to render a row or its progress |
@@ -109,6 +109,20 @@ Preset profiles (id, name, model, bbox_format, description).
 ### Partial results (control plane only)
 
 While a job is still `queued` or `running`, the two control-plane result routes answer **200 with a partial result** instead of 404: the finished pages' stored markdown ([jobs.md](./jobs.md) § Progress) assembled exactly like the final document — page markers, renumbered figure placeholders — with `meta.partial: true`, `pages` listing only the finished pages, and `meta.page_count`/`meta.pages_done` carrying live progress. Figure ids are per-snapshot (a page finishing out of order renumbers them), so nothing may cache a partial result; the viewer re-reads until `partial` disappears. The data plane is unchanged: `/v1/jobs/{id}/result` stays 404 until the job finishes, and SSE remains its progressive interface.
+
+### Usage aggregates
+
+`GET /api/usage` answers `{days, per_day: [...], per_model: [...]}`; a `per_day` entry carries `date`, a `per_model` entry `model`, and both carry the same figures:
+
+| Field | Meaning |
+|-------|---------|
+| `calls` | `usage_log` rows (one per upstream call) |
+| `prompt_tokens`, `completion_tokens` | summed over every call, priced or not |
+| `cost` | **billed**: the sum of OpenRouter's own cost (`cost_source = openrouter`) — the same number this field always carried, since connection calls used to record 0 |
+| `estimated_cost`, `estimated_calls` | the sum and count of costs a connection reported with `report_cost` on (`cost_source = estimated`) — an estimate, never added into `cost` |
+| `unpriced_calls` | calls whose cost is unknown (`cost_source = unknown`); counted, never priced as 0 |
+
+`calls - estimated_calls - unpriced_calls` is the number of billed calls, so a client can tell "OpenRouter billed $0" from "nothing here went through OpenRouter". The per-model grouping is by model id alone, as before; one id used on both OpenRouter and a connection lands in one entry with its figures still separated by source.
 
 ### Why the web upload is a control-plane route
 

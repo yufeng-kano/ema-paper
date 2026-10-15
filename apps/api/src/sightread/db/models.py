@@ -13,6 +13,8 @@ from decimal import Decimal
 
 from sqlalchemy import (
     JSON,
+    Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -146,6 +148,9 @@ class ProviderConnection(Base):
     ciphertext: Mapped[bytes] = mapped_column(LargeBinary)
     masked: Mapped[str] = mapped_column(String(64))
     model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Record the `usage.cost` this endpoint reports, as an estimate; opt-in, never inferred
+    # from the URL (docs/parsing.md § Upstream usage).
+    report_cost: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
 
@@ -347,9 +352,25 @@ class Document(Base):
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
 
 
+# Where a usage row's cost came from (docs/parsing.md § Upstream usage): OpenRouter's own
+# billing, an estimate a provider connection reported, or nobody — cost NULL.
+COST_SOURCE_OPENROUTER = "openrouter"
+COST_SOURCE_ESTIMATED = "estimated"
+COST_SOURCE_UNKNOWN = "unknown"
+
+
 class UsageLog(Base):
     __tablename__ = "usage_log"
-    __table_args__ = (Index("ix_usage_log_user_created", "user_id", "created_at"),)
+    __table_args__ = (
+        Index("ix_usage_log_user_created", "user_id", "created_at"),
+        # An unknown cost is NULL and only an unknown cost is: a call nobody priced must
+        # never be summed as a free one (docs/database.md).
+        CheckConstraint(
+            "cost_source IN ('openrouter', 'estimated', 'unknown') "
+            "AND (cost_source = 'unknown') = (cost IS NULL)",
+            name="ck_usage_log_cost_source",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
@@ -359,7 +380,8 @@ class UsageLog(Base):
     model: Mapped[str] = mapped_column(String(255))
     prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
     completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
-    cost: Mapped[Decimal] = mapped_column(Numeric(12, 6), default=Decimal("0"))
+    cost: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    cost_source: Mapped[str] = mapped_column(String(16))
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
 
 

@@ -24,7 +24,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..auth.crypto import decrypt_connection_key, decrypt_openrouter_key
-from ..db.models import OpenRouterKey, ProviderConnection
+from ..db.models import (
+    COST_SOURCE_ESTIMATED,
+    COST_SOURCE_OPENROUTER,
+    COST_SOURCE_UNKNOWN,
+    OpenRouterKey,
+    ProviderConnection,
+)
 from ..errors import ApiError
 
 BASE_URL = "https://openrouter.ai/api/v1"
@@ -46,6 +52,11 @@ CHAT_TIMEOUT_SECONDS = 180.0
 DEFAULT_RESPONSE_MAX_BYTES = 33_554_432
 
 DATA_URL_MEDIA_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}
+
+# usage_log.cost is NUMERIC(12,6): a reported cost beyond it cannot be stored, and is no
+# price anyway (docs/parsing.md § Upstream usage).
+COST_QUANTUM = Decimal("0.000001")
+MAX_REPORTED_COST = Decimal("999999.999999")
 
 # Model answers sometimes arrive wrapped in a fence despite the prompt.
 _CODE_FENCE_RE = re.compile(r"^\s*```[a-zA-Z]*\s*|\s*```\s*$")
@@ -296,7 +307,9 @@ class EmptyCompletion(UpstreamError):
     def __init__(self) -> None:
         super().__init__("The upstream returned an empty completion", transient=True)
         # What the empty answer was billed, for the caller that accepts it as a blank page.
-        self.usage = Usage(prompt_tokens=0, completion_tokens=0, cost=Decimal("0"))
+        self.usage = Usage(
+            prompt_tokens=0, completion_tokens=0, cost=None, cost_source=COST_SOURCE_UNKNOWN
+        )
 
 
 class PaymentRequired(UpstreamError):
@@ -312,13 +325,15 @@ class Connection:
 
     Only this module ever opens the ciphertext, and the plaintext never leaves the request
     it authorises (docs/project-structure.md). The default field values are the built-in
-    OpenRouter upstream; a provider connection carries its own base URL and kind.
+    OpenRouter upstream; a provider connection carries its own base URL and kind, and
+    whether its reported cost is recorded (`report_cost`, docs/parsing.md § Upstream usage).
     """
 
     ciphertext: bytes
     secret_key: str
     base_url: str = BASE_URL
     kind: str = KIND_OPENROUTER
+    report_cost: bool = False
 
     def __repr__(self) -> str:  # never let key material reach a log line
         return "Connection(...)"
@@ -332,7 +347,9 @@ class Connection:
 class Usage:
     prompt_tokens: int
     completion_tokens: int
-    cost: Decimal
+    # None exactly when `cost_source` is unknown: an unpriced call is not a free one.
+    cost: Decimal | None
+    cost_source: str
 
 
 @dataclass(frozen=True)
@@ -367,6 +384,7 @@ async def load_connection(
         secret_key=secret_key,
         base_url=connection.base_url,
         kind=KIND_OPENAI,
+        report_cost=connection.report_cost,
     )
 
 
@@ -383,25 +401,42 @@ def _int(value: object) -> int:
         return 0
 
 
-def _usage(payload: dict, kind: str) -> Usage:
-    """Token counts from any upstream; cost trusted from OpenRouter only.
+def _usage(payload: dict, connection: Connection) -> Usage:
+    """Token counts from any upstream, and the cost tagged with where it came from.
 
-    A custom endpoint's claimed `cost` is ignored and recorded as 0 — usage totals must
-    never mix OpenRouter's real billing with numbers an arbitrary proxy invents
-    (docs/parsing.md § Upstream usage).
+    OpenRouter's cost is its billing. A provider connection's cost is recorded only when
+    the user opted in (`report_cost`), and then only as an estimate; otherwise, or when the
+    reported value is not a usable number, the cost is unknown — never 0, and never mixed
+    into billed totals (docs/parsing.md § Upstream usage).
     """
     raw = payload.get("usage") or {}
-    cost = Decimal("0")
-    if kind == KIND_OPENROUTER:
+    prompt_tokens = _int(raw.get("prompt_tokens"))
+    completion_tokens = _int(raw.get("completion_tokens"))
+
+    if connection.kind == KIND_OPENROUTER:
         try:
-            cost = Decimal(str(raw.get("cost", "0"))).quantize(Decimal("0.000001"))
+            cost = Decimal(str(raw.get("cost", "0"))).quantize(COST_QUANTUM)
         except (InvalidOperation, ValueError):
             cost = Decimal("0")
-    return Usage(
-        prompt_tokens=_int(raw.get("prompt_tokens")),
-        completion_tokens=_int(raw.get("completion_tokens")),
-        cost=cost,
-    )
+        return Usage(prompt_tokens, completion_tokens, cost, COST_SOURCE_OPENROUTER)
+
+    reported = raw.get("cost")
+    # A JSON number only: `bool` is an `int` to Python, and a string is not what an
+    # OpenRouter-compatible `usage.cost` is. `json` also parses NaN and Infinity.
+    if (
+        connection.report_cost
+        and isinstance(reported, int | float)
+        and not isinstance(reported, bool)
+    ):
+        cost = Decimal(str(reported))
+        if cost.is_finite() and 0 <= cost <= MAX_REPORTED_COST:
+            return Usage(
+                prompt_tokens,
+                completion_tokens,
+                cost.quantize(COST_QUANTUM),
+                COST_SOURCE_ESTIMATED,
+            )
+    return Usage(prompt_tokens, completion_tokens, None, COST_SOURCE_UNKNOWN)
 
 
 def _message_text(payload: dict) -> str:
@@ -506,9 +541,9 @@ async def _chat_with_image(
     try:
         text = _message_text(payload)
     except EmptyCompletion as exc:
-        exc.usage = _usage(payload, connection.kind)
+        exc.usage = _usage(payload, connection)
         raise
-    return text, _usage(payload, connection.kind)
+    return text, _usage(payload, connection)
 
 
 async def transcribe_page(

@@ -110,6 +110,7 @@ const connName = ref('')
 const connUrl = ref('')
 const connKey = ref('')
 const connModel = ref('')
+const connReportCost = ref(false)
 const connPending = ref(false)
 const connError = ref<string | null>(null)
 const confirmingConnectionDelete = ref(false)
@@ -182,6 +183,7 @@ function openConnectionCreate() {
   connUrl.value = ''
   connKey.value = ''
   connModel.value = ''
+  connReportCost.value = false
   connError.value = null
   dialogModels.value = null
   dialogModelsError.value = null
@@ -198,6 +200,7 @@ function openProviderEdit() {
   connUrl.value = ''
   connKey.value = ''
   connModel.value = ''
+  connReportCost.value = false
   connError.value = null
   dialogModels.value = null
   dialogModelsError.value = null
@@ -215,6 +218,7 @@ function openProviderEdit() {
   connName.value = row.name
   connUrl.value = row.base_url
   connModel.value = row.model ?? ''
+  connReportCost.value = row.report_cost
   connectionModal.value = { mode: 'edit', id: row.id }
   // The stored key serves the fetch, so editing starts with the catalog already coming.
   loadDialogModels()
@@ -232,6 +236,7 @@ function closeConnectionModal() {
   connUrl.value = ''
   connKey.value = ''
   connModel.value = ''
+  connReportCost.value = false
   connError.value = null
   dialogModels.value = null
   dialogModelsError.value = null
@@ -287,6 +292,7 @@ async function submitConnection() {
         base_url: connUrl.value.trim(),
         api_key: connKey.value.trim(),
         model: connModel.value,
+        report_cost: connReportCost.value,
       })
       closeConnectionModal()
       await refreshConnections()
@@ -298,6 +304,7 @@ async function submitConnection() {
         base_url: connUrl.value.trim(),
         ...(connKey.value.trim() ? { api_key: connKey.value.trim() } : {}),
         ...(connModel.value ? { model: connModel.value } : {}),
+        report_cost: connReportCost.value,
       })
       closeConnectionModal()
       await refreshConnections()
@@ -818,6 +825,14 @@ async function removePrompt() {
           </UiField>
           <UiBanner v-if="dialogModelsError" tone="error">{{ dialogModelsError }}</UiBanner>
 
+          <!-- Opt-in, never guessed from the URL: only the user knows whether this
+               endpoint's usage.cost means anything (docs/parsing.md § Upstream usage). -->
+          <label class="check">
+            <input v-model="connReportCost" type="checkbox">
+            <span>{{ t('settings.connectionReportCostLabel') }}</span>
+          </label>
+          <p class="note">{{ t('settings.connectionReportCostNote') }}</p>
+
           <p class="note">{{ t('settings.connectionUrlNote') }}</p>
         </template>
 
@@ -1063,6 +1078,22 @@ async function removePrompt() {
 .modal-form {
   display: grid;
   gap: var(--space-4);
+}
+
+/* A native checkbox beside its label; the whole line is the click target. Ink, not the
+   accent: a setting being on is not data. */
+.check {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.check input {
+  margin: 0;
+  accent-color: var(--ink);
 }
 
 /* The model picker and its fetch button share the field's one row. */

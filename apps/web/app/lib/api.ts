@@ -69,6 +69,8 @@ export interface ProviderConnection {
   base_url: string
   masked: string
   model: string | null
+  /** Record the `usage.cost` this endpoint reports, as an estimate; off by default. */
+  report_cost: boolean
   created_at: string
   updated_at: string
 }
@@ -127,10 +129,20 @@ export interface CreatedApiKey {
   key: string
 }
 
+/**
+ * One bucket of `GET /api/usage`. Billed, estimated and unpriced cost never share a field
+ * (docs/api.md § Usage aggregates): `cost` is OpenRouter's billing only.
+ */
 export interface UsageTotals {
+  calls: number
   prompt_tokens: number
   completion_tokens: number
   cost: number
+  /** What provider connections with `report_cost` reported — an estimate, not a bill. */
+  estimated_cost: number
+  estimated_calls: number
+  /** Calls whose cost nobody reported; counted, never priced as 0. */
+  unpriced_calls: number
 }
 
 export interface UsageDay extends UsageTotals {
@@ -388,13 +400,14 @@ export function createConnection(body: {
   base_url: string
   api_key: string
   model: string
+  report_cost: boolean
 }): Promise<ProviderConnection> {
   return request('POST', '/api/connections', body)
 }
 
 export function updateConnection(
   id: number,
-  body: Partial<{ name: string; base_url: string; api_key: string; model: string }>,
+  body: Partial<{ name: string; base_url: string; api_key: string; model: string; report_cost: boolean }>,
 ): Promise<ProviderConnection> {
   return request('PUT', `/api/connections/${id}`, body)
 }

@@ -412,6 +412,7 @@ async def _record_page(
                     prompt_tokens=usage.prompt_tokens,
                     completion_tokens=usage.completion_tokens,
                     cost=usage.cost,
+                    cost_source=usage.cost_source,
                 )
             )
         await db.execute(update(Job).where(Job.id == job.id).values(pages_done=Job.pages_done + 1))

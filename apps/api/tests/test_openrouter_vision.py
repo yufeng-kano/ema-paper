@@ -58,6 +58,7 @@ async def test_transcribe_page_sends_the_image_and_records_usage(key, documents)
 
     assert result.markdown == "# Page\n\ntext"
     assert result.usage.prompt_tokens == 1200
+    assert result.usage.cost_source == "openrouter"
     assert result.usage.cost == Decimal("0.000420")
 
     sent = json.loads(route.calls[0].request.content)
@@ -220,8 +221,8 @@ async def test_an_openai_connection_calls_its_own_endpoint_without_the_usage_fla
             200,
             json={
                 "choices": [{"message": {"content": "# Page"}}],
-                # A claimed cost from an arbitrary proxy must be ignored, not billed.
-                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "cost": "9.990000"},
+                # Without `report_cost` a claimed cost is not recorded at all.
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "cost": 9.99},
             },
         )
     )
@@ -232,7 +233,9 @@ async def test_an_openai_connection_calls_its_own_endpoint_without_the_usage_fla
 
     assert result.markdown == "# Page"
     assert result.usage.prompt_tokens == 10
-    assert result.usage.cost == Decimal("0")
+    # Unknown, not $0: nobody priced this call (docs/parsing.md § Upstream usage).
+    assert result.usage.cost is None
+    assert result.usage.cost_source == "unknown"
     sent = json.loads(route.calls[0].request.content)
     assert "usage" not in sent
     assert route.calls[0].request.headers["authorization"] == "Bearer sk-kano-proxy-test"
@@ -261,3 +264,85 @@ async def test_an_oversized_completion_fails_the_call(key, documents) -> None:
         await transcribe_page(
             key, "m", PROMPT, "yxyx_norm1000", documents["png"], 1, max_response_bytes=64
         )
+
+
+# --- reported cost on a connection (docs/parsing.md § Upstream usage) ------------------
+
+PROXY_CHAT = "https://proxy.example/openai/v1/chat/completions"
+
+
+def _proxy(report_cost: bool) -> Connection:
+    return Connection(
+        ciphertext=encrypt_connection_key(SECRET, "sk-kano-proxy-test"),
+        secret_key=SECRET,
+        base_url="https://proxy.example/openai/v1",
+        kind=KIND_OPENAI,
+        report_cost=report_cost,
+    )
+
+
+async def _usage_for(connection: Connection, usage: dict, documents):
+    # Serialized by hand: `json.dumps` writes NaN the way a sloppy server would, and
+    # httpx's own `json=` refuses to.
+    body = json.dumps({"choices": [{"message": {"content": "# Page"}}], "usage": usage})
+    respx.post(PROXY_CHAT).mock(return_value=httpx.Response(200, content=body.encode()))
+    result = await transcribe_page(connection, "m", PROMPT, "yxyx_norm1000", documents["png"], 1)
+    return result.usage
+
+
+@respx.mock
+async def test_an_opted_in_connection_records_its_reported_cost_as_an_estimate(documents) -> None:
+    usage = await _usage_for(
+        _proxy(report_cost=True),
+        {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.0123456789},
+        documents,
+    )
+
+    assert usage.cost_source == "estimated"
+    assert usage.cost == Decimal("0.012346")
+    assert usage.prompt_tokens == 10
+
+
+@respx.mock
+async def test_a_reported_zero_is_a_real_estimate(documents) -> None:
+    """An endpoint that prices a call at 0 said so; that is not the same as not saying."""
+    usage = await _usage_for(_proxy(report_cost=True), {"cost": 0}, documents)
+
+    assert usage.cost_source == "estimated"
+    assert usage.cost == Decimal("0")
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "usage_body",
+    [
+        {"prompt_tokens": 10},  # no cost at all
+        {"cost": None},  # kano-proxy's "cannot price this model"
+        {"cost": "0.01"},  # a string is not a JSON number
+        {"cost": True},
+        {"cost": -0.5},
+        {"cost": float("nan")},
+        {"cost": 1e12},  # beyond NUMERIC(12,6)
+        {"cost": {"total": 0.01}},
+    ],
+)
+async def test_an_unusable_reported_cost_is_unknown_not_zero(documents, usage_body) -> None:
+    usage = await _usage_for(_proxy(report_cost=True), usage_body, documents)
+
+    assert usage.cost_source == "unknown"
+    assert usage.cost is None
+
+
+@respx.mock
+async def test_openrouter_cost_is_billing_whatever_a_connection_flag_says(key, documents) -> None:
+    """The OpenRouter path is unchanged: its cost is billing, a missing one records 0."""
+    respx.post(CHAT_URL).mock(
+        return_value=httpx.Response(
+            200, json={"choices": [{"message": {"content": "x"}}], "usage": {"prompt_tokens": 1}}
+        )
+    )
+
+    result = await transcribe_page(key, "m", PROMPT, "yxyx_norm1000", documents["png"], 1)
+
+    assert result.usage.cost_source == "openrouter"
+    assert result.usage.cost == Decimal("0")

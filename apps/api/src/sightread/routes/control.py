@@ -13,7 +13,7 @@ from authlib.integrations.starlette_client import OAuthError
 from fastapi import APIRouter, Query, Request, Response, status
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, select
+from sqlalchemy import case, delete, func, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
 
@@ -29,6 +29,9 @@ from ..auth.oidc import (
 )
 from ..auth.sessions import SESSION_COOKIE, SESSION_TTL, create_session, delete_session
 from ..db.models import (
+    COST_SOURCE_ESTIMATED,
+    COST_SOURCE_OPENROUTER,
+    COST_SOURCE_UNKNOWN,
     ApiKey,
     Job,
     OpenRouterKey,
@@ -310,6 +313,8 @@ class ConnectionCreate(BaseModel):
     base_url: str = Field(min_length=1, max_length=1024)
     api_key: str = Field(min_length=8, max_length=512)
     model: str = Field(min_length=1, max_length=255)
+    # Record the endpoint's reported `usage.cost` as an estimate (docs/parsing.md).
+    report_cost: bool = False
 
 
 class ConnectionUpdate(BaseModel):
@@ -319,6 +324,7 @@ class ConnectionUpdate(BaseModel):
     base_url: str | None = Field(default=None, min_length=1, max_length=1024)
     api_key: str | None = Field(default=None, min_length=8, max_length=512)
     model: str | None = Field(default=None, min_length=1, max_length=255)
+    report_cost: bool | None = None
 
 
 async def _commit_or_name_conflict(db: DbSession, message: str) -> None:
@@ -341,6 +347,7 @@ def _connection_payload(row: ProviderConnection) -> dict:
         "base_url": row.base_url,
         "masked": row.masked,
         "model": row.model,
+        "report_cost": row.report_cost,
         "created_at": row.created_at,
         "updated_at": row.updated_at,
     }
@@ -414,6 +421,7 @@ async def create_connection(
         ciphertext=encrypt_connection_key(settings.secret_key, candidate),
         masked=mask_openrouter_key(candidate),
         model=model,
+        report_cost=body.report_cost,
     )
     db.add(row)
     await _commit_or_name_conflict(db, "A connection with this name already exists")
@@ -459,6 +467,9 @@ async def update_connection(
         if not model:
             raise ApiError(400, "invalid_request", "The connection needs a model")
         row.model = model
+
+    if body.report_cost is not None:
+        row.report_cost = body.report_cost
 
     row.name = name
     row.base_url = base_url
@@ -713,56 +724,53 @@ async def put_settings(body: SettingsPut, user: SessionUser, db: DbSession):
 
 @router.get("/usage")
 async def usage(user: SessionUser, db: DbSession, days: int = Query(default=30, ge=1, le=365)):
+    """Usage aggregates with billed, estimated and unpriced cost kept apart (docs/api.md
+    § Usage aggregates): an estimate is never summed into billing, and a call nobody
+    priced is counted rather than priced at 0."""
     since = utcnow() - timedelta(days=days)
     day = func.date(UsageLog.created_at)  # UTC day bucket on both PostgreSQL and SQLite
 
+    def of_source(source: str, value):
+        return case((UsageLog.cost_source == source, value))
+
+    figures = (
+        func.count(),
+        func.sum(UsageLog.prompt_tokens),
+        func.sum(UsageLog.completion_tokens),
+        func.sum(of_source(COST_SOURCE_OPENROUTER, UsageLog.cost)),
+        func.sum(of_source(COST_SOURCE_ESTIMATED, UsageLog.cost)),
+        func.count(of_source(COST_SOURCE_ESTIMATED, 1)),
+        func.count(of_source(COST_SOURCE_UNKNOWN, 1)),
+    )
+    in_window = (UsageLog.user_id == user.id, UsageLog.created_at >= since)
     per_day = (
-        await db.execute(
-            select(
-                day.label("day"),
-                func.sum(UsageLog.prompt_tokens),
-                func.sum(UsageLog.completion_tokens),
-                func.sum(UsageLog.cost),
-            )
-            .where(UsageLog.user_id == user.id, UsageLog.created_at >= since)
-            .group_by(day)
-            .order_by(day)
-        )
+        await db.execute(select(day, *figures).where(*in_window).group_by(day).order_by(day))
     ).all()
     per_model = (
         await db.execute(
-            select(
-                UsageLog.model,
-                func.sum(UsageLog.prompt_tokens),
-                func.sum(UsageLog.completion_tokens),
-                func.sum(UsageLog.cost),
-            )
-            .where(UsageLog.user_id == user.id, UsageLog.created_at >= since)
+            select(UsageLog.model, *figures)
+            .where(*in_window)
             .group_by(UsageLog.model)
             .order_by(UsageLog.model)
         )
     ).all()
 
+    def totals(row) -> dict:
+        calls, prompt, completion, cost, estimated, estimated_calls, unpriced = row
+        return {
+            "calls": int(calls),
+            "prompt_tokens": int(prompt or 0),
+            "completion_tokens": int(completion or 0),
+            "cost": float(cost or 0),
+            "estimated_cost": float(estimated or 0),
+            "estimated_calls": int(estimated_calls),
+            "unpriced_calls": int(unpriced),
+        }
+
     return {
         "days": days,
-        "per_day": [
-            {
-                "date": str(bucket)[:10],
-                "prompt_tokens": int(prompt or 0),
-                "completion_tokens": int(completion or 0),
-                "cost": float(cost or 0),
-            }
-            for bucket, prompt, completion, cost in per_day
-        ],
-        "per_model": [
-            {
-                "model": model,
-                "prompt_tokens": int(prompt or 0),
-                "completion_tokens": int(completion or 0),
-                "cost": float(cost or 0),
-            }
-            for model, prompt, completion, cost in per_model
-        ],
+        "per_day": [{"date": str(row[0])[:10], **totals(row[1:])} for row in per_day],
+        "per_model": [{"model": row[0], **totals(row[1:])} for row in per_model],
     }
 
 

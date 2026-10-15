@@ -76,6 +76,17 @@ export default {
     columnPrompt: 'Prompt',
     columnCompletion: 'Completion',
     columnShare: 'Share of the highest cost in this table',
+    columnEstimated: 'Estimated',
+    columnUnpriced: 'Unpriced',
+    totalEstimatedCost: 'Estimated cost',
+    totalEstimatedNote:
+      'Reported by provider connections that opted in. An estimate, not a bill, and not included in Cost.',
+    totalUnpriced: 'Unpriced calls',
+    totalUnpricedNote: "Calls with no reported cost. Counted here, never shown as {'$'}0.",
+    estimatedValue: '≈ {cost}',
+    modelEstimated: 'Estimated ≈ {cost}',
+    modelUnpriced: 'Unpriced calls: {count}',
+    none: '—',
     empty: 'No usage recorded yet.',
     emptyBody: 'Parse a document and its cost and tokens appear here, per day and per model.',
   },
@@ -134,6 +145,9 @@ export default {
     connectionDeleteConfirm:
       'Delete this connection? Parsing falls back to OpenRouter until another provider is picked.',
     connectionModelLabel: 'Model',
+    connectionReportCostLabel: 'Use the cost this endpoint reports',
+    connectionReportCostNote:
+      'For endpoints that return usage.cost, such as kano-proxy. That figure is the endpoint’s own estimate: Usage shows it as estimated and never adds it to billed cost. Without this, calls on this connection are counted as unpriced.',
     loadModels: 'Load models',
     keyDialogTitle: 'OpenRouter settings',
     openrouterStored: 'Stored key {masked}, updated {updated}.',

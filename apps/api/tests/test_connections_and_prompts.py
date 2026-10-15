@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from decimal import Decimal
 
 import httpx
 import pytest
@@ -37,11 +38,17 @@ def _models_ok(request: httpx.Request) -> httpx.Response:
 
 
 async def _create_connection(
-    client: AsyncClient, name: str = "kano", model: str = "grok/grok-4.5"
+    client: AsyncClient, name: str = "kano", model: str = "grok/grok-4.5", **extra
 ) -> dict:
     response = await client.post(
         "/api/connections",
-        json={"name": name, "base_url": BASE, "api_key": "sk-kano-proxy-secret", "model": model},
+        json={
+            "name": name,
+            "base_url": BASE,
+            "api_key": "sk-kano-proxy-secret",
+            "model": model,
+            **extra,
+        },
         headers=CSRF_HEADERS,
     )
     assert response.status_code == 201, response.text
@@ -65,6 +72,8 @@ async def test_create_connection_validates_and_never_returns_the_key(signed_in) 
     assert created["model"] == "grok/grok-4.5"
     assert "sk-kano-proxy-secret" not in json.dumps(created)
     assert created["masked"].endswith("cret")
+    # Reported cost is opt-in (docs/parsing.md § Upstream usage).
+    assert created["report_cost"] is False
 
     listed = (await signed_in.get("/api/connections")).json()["connections"]
     assert [row["id"] for row in listed] == [created["id"]]
@@ -443,14 +452,15 @@ async def test_a_profile_cannot_pair_with_a_custom_connection(signed_in) -> None
 @respx.mock
 async def test_parse_runs_on_the_default_connection(make_client, sessionmaker, documents) -> None:
     """The whole path: settings pick a connection, the worker calls its endpoint, and the
-    usage row records tokens with cost 0 (docs/parsing.md § Upstream usage)."""
+    usage row records tokens with an unknown cost — the connection did not opt in to its
+    reported one (docs/parsing.md § Upstream usage)."""
     respx.get(MODELS_URL).mock(side_effect=_models_ok)
     chat = respx.post(CHAT).mock(
         return_value=httpx.Response(
             200,
             json={
                 "choices": [{"message": {"content": "# Page one"}}],
-                "usage": {"prompt_tokens": 800, "completion_tokens": 90},
+                "usage": {"prompt_tokens": 800, "completion_tokens": 90, "cost": 0.42},
             },
         )
     )
@@ -494,7 +504,81 @@ async def test_parse_runs_on_the_default_connection(make_client, sessionmaker, d
         )
     assert len(usage) == 1
     assert usage[0].prompt_tokens == 800
-    assert usage[0].cost == 0
+    assert usage[0].cost is None
+    assert usage[0].cost_source == "unknown"
+
+
+@respx.mock
+async def test_report_cost_is_read_when_the_job_runs(make_client, sessionmaker, documents) -> None:
+    """Turning the flag on while a job is queued applies to that job's calls, like a URL
+    or key edit does (docs/database.md § Rules), and the estimate lands on the usage row."""
+    models = respx.get(MODELS_URL).mock(side_effect=_models_ok)
+    respx.post(CHAT).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "# Page one"}}],
+                "usage": {"prompt_tokens": 800, "completion_tokens": 90, "cost": 0.0125},
+            },
+        )
+    )
+
+    client = make_client()
+    assert (await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)).status_code == 200
+    created = await _create_connection(client)
+    await client.put(
+        "/api/settings", json={"default_connection_id": created["id"]}, headers=CSRF_HEADERS
+    )
+    key = await client.post("/api/keys", json={"name": "test"}, headers=CSRF_HEADERS)
+    accepted = await client.post(
+        "/v1/parse",
+        files={"file": ("tiny.png", documents["png"].read_bytes(), "image/png")},
+        headers={"Authorization": f"Bearer {key.json()['key']}"},
+    )
+    assert accepted.status_code == 202, accepted.text
+    job_id = accepted.json()["job_id"]
+
+    validations = models.call_count
+    toggled = await client.put(
+        f"/api/connections/{created['id']}", json={"report_cost": True}, headers=CSRF_HEADERS
+    )
+    assert toggled.status_code == 200
+    assert toggled.json()["report_cost"] is True
+    # The flag changes what is recorded, not where calls go: nothing to re-validate.
+    assert models.call_count == validations
+
+    settings = client.app.state.settings
+    async with sessionmaker() as db:
+        claimed = await claim_next_job(db, settings.max_jobs_per_user)
+    await run_job(sessionmaker, settings, claimed, asyncio.Semaphore(2))
+
+    async with sessionmaker() as db:
+        usage = (
+            (await db.execute(select(UsageLog).where(UsageLog.job_id == uuid.UUID(job_id))))
+            .scalars()
+            .all()
+        )
+    assert [(row.cost_source, row.cost) for row in usage] == [("estimated", Decimal("0.0125"))]
+
+
+@respx.mock
+async def test_report_cost_can_be_set_at_creation_and_turned_off(signed_in) -> None:
+    respx.get(MODELS_URL).mock(side_effect=_models_ok)
+    created = await _create_connection(signed_in, report_cost=True)
+    assert created["report_cost"] is True
+
+    # A partial update that does not mention the flag leaves it alone.
+    renamed = await signed_in.put(
+        f"/api/connections/{created['id']}", json={"name": "kano 2"}, headers=CSRF_HEADERS
+    )
+    assert renamed.json()["report_cost"] is True
+
+    off = await signed_in.put(
+        f"/api/connections/{created['id']}", json={"report_cost": False}, headers=CSRF_HEADERS
+    )
+    assert off.json()["report_cost"] is False
+    listed = (await signed_in.get("/api/connections")).json()["connections"]
+    assert listed[0]["report_cost"] is False
 
 
 @respx.mock
