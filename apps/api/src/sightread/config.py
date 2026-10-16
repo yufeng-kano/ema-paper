@@ -85,6 +85,7 @@ class Settings(BaseSettings):
     chat_writer_grace_seconds: int = 60
     revert_max_bytes: int = 64 * 1024 * 1024
     revert_max_paths: int = 2000
+    workspace_git_timeout_seconds: int = 60
     chat_image_round_max_bytes: int = 32 * 1024 * 1024
     chat_image_turn_max_bytes: int = 128 * 1024 * 1024
 

@@ -583,10 +583,22 @@ def _revert(
     # Phase two: apply, every step through descriptors that follow nothing.
     restored: list[Path] = []
     try:
+        # (directory vacated, directory restored): once the tracked files are back, what
+        # the vacated directory still holds — `source.*`, `figures/`, which history does
+        # not record — goes the same way (docs/workspace.md § Revisions).
+        vacated: dict[Path, Path] = {}
         for current, then in moves:
             git.move(root, root / current, root / then)
-            _prune_empty(root, (root / current).parent)
+            if current.parent != then.parent:
+                vacated.setdefault(current.parent, then.parent)
             restored += [current, then]
+        for source_dir, target_dir in vacated.items():
+            if safe_io.entry_kind(root, root / source_dir) != "dir":
+                continue
+            for name, _is_dir in safe_io.list_dir(root, root / source_dir):
+                if safe_io.entry_kind(root, root / target_dir / name) == "none":
+                    safe_io.rename(root, root / source_dir / name, root / target_dir / name)
+            _prune_empty(root, root / source_dir)
         for now in removals:
             if safe_io.remove_file(root, root / now):
                 restored.append(now)

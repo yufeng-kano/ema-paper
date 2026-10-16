@@ -9,16 +9,25 @@ worker and the API behave identically wherever they run. Async callers wrap thes
 from __future__ import annotations
 
 import os
+import select
 import subprocess
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from ..config import get_settings
 from . import safe_io
 from .layout import EXCLUDE_RULES, git_dir
 
 GIT = "git"
-GIT_TIMEOUT_SECONDS = 60.0
+
+
+def _timeout() -> float:
+    """How long any one git call may take (`WORKSPACE_GIT_TIMEOUT_SECONDS`)."""
+    return float(get_settings().workspace_git_timeout_seconds)
+
+
 # The most of a log the API reads to list revisions, and the paths it keeps per revision.
 LOG_MAX_BYTES = 4 * 1024 * 1024
 LOG_FILES_MAX = 200
@@ -68,7 +77,7 @@ def _git(root: Path, *args: str, check: bool = True) -> subprocess.CompletedProc
         env=_env(),
         capture_output=True,
         text=True,
-        timeout=GIT_TIMEOUT_SECONDS,
+        timeout=_timeout(),
         check=False,
     )
     if check and proc.returncode != 0:
@@ -215,7 +224,10 @@ def log(
 
 def _git_bounded(root: Path, *args: str, max_bytes: int) -> tuple[int, bytes, bool]:
     """Like `_git`, reading at most `max_bytes` of stdout: a shell can commit a file of
-    any size, and the host must not hold a whole diff of it to show a few lines."""
+    any size, and the host must not hold a whole diff of it to show a few lines. The
+    timeout is watched while reading, so a git that stalls after a few bytes fails rather
+    than holding a worker thread and the workspace lock (docs/workspace.md)."""
+    deadline = time.monotonic() + _timeout()
     with subprocess.Popen(  # noqa: S603 - fixed argv, no shell
         [GIT, "-C", str(root), "--git-dir", str(git_dir(root)), "--work-tree", str(root), *args],
         env=_env(),
@@ -227,7 +239,12 @@ def _git_bounded(root: Path, *args: str, max_bytes: int) -> tuple[int, bytes, bo
         total = 0
         truncated = False
         while True:
-            chunk = proc.stdout.read(65_536)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([proc.stdout], [], [], remaining)[0]:
+                proc.kill()
+                proc.wait()
+                raise GitError(f"git {args[0]} timed out")
+            chunk = os.read(proc.stdout.fileno(), 65_536)
             if not chunk:
                 break
             room = max_bytes - total
@@ -239,7 +256,7 @@ def _git_bounded(root: Path, *args: str, max_bytes: int) -> tuple[int, bytes, bo
             chunks.append(chunk)
             total += len(chunk)
         try:
-            code = proc.wait(timeout=GIT_TIMEOUT_SECONDS)
+            code = proc.wait(timeout=max(deadline - time.monotonic(), 0.0))
         except subprocess.TimeoutExpired:
             proc.kill()
             code = proc.wait()

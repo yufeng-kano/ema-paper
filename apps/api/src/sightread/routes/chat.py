@@ -240,7 +240,13 @@ async def post_message(
     # for the per-user cap, so two sends to different conversations cannot both slip under
     # it, then the conversation's for one turn at a time — always in that order.
     await db.execute(select(User.id).where(User.id == user.id).with_for_update())
-    await db.execute(select(Conversation.id).where(Conversation.id == row.id).with_for_update())
+    locked = (
+        await db.execute(select(Conversation.id).where(Conversation.id == row.id).with_for_update())
+    ).first()
+    if locked is None:
+        # Deleted while this send waited for the lock: a clean 404, not rows inserted
+        # for a conversation that is gone (docs/chat.md § Conversations).
+        raise ApiError(404, "invalid_request", "No such conversation")
     await _ready_to_chat(db, settings, user.id)
     if await count_active_turns(db, user.id) >= settings.max_chat_turns_per_user:
         raise ApiError(

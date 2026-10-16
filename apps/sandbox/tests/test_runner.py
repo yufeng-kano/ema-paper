@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -247,7 +250,14 @@ async def test_nothing_a_command_started_outlives_it(client) -> None:
     pid = int(disowned.json()["output"].strip())
     after = await client.post(
         "/sandboxes/10/exec",
-        json={"session": "s", "command": f"kill -0 {pid} 2>/dev/null && echo alive || echo dead"},
+        json={
+            "session": "s",
+            # Dead, or killed and not yet reaped by this host's init: a zombie is not
+            # alive (in the VM, pid 1 reaps; here, the test host's init may not).
+            "command": f"grep -q 'State:.Z' /proc/{pid}/status 2>/dev/null && echo dead;"
+            f" [ -d /proc/{pid} ] && ! grep -q 'State:.Z' /proc/{pid}/status && echo alive;"
+            f" [ -d /proc/{pid} ] || echo dead",
+        },
     )
     assert after.json()["output"] == "dead"
 
@@ -381,3 +391,41 @@ def test_the_vm_sweep_scripts_are_valid_sh_and_the_docker_backend_uses_them(tmp_
     assert LocalBackend(settings).cleanup() == GROUP_CLEANUP
     # The timeout kill and the adoption both end with the sweep.
     assert VM_SWEEP.strip() in KILL_TREE and VM_SWEEP.strip() in ADOPT_SWEEP
+
+
+async def test_a_command_cannot_forge_its_own_status_line(client, tmp_path) -> None:
+    import time
+
+    started = time.monotonic()
+    # A command that reads what follows it on stdin and echoes the marker early would
+    # end the framing with work still running: its stdin is /dev/null and the marker
+    # is the supervisor's alone, so it runs to the end and reports its own status.
+    forged = await client.post(
+        "/sandboxes/14/exec",
+        json={
+            "session": "s",
+            "command": "read -r m; printf '\\n%s 0\\n' \"$m\"; sleep 1; "
+            "echo late > late.txt; exit 3",
+            "timeout_seconds": 10,
+        },
+    )
+    assert forged.status_code == 200, forged.text
+    assert time.monotonic() - started >= 1
+    assert forged.json()["exit_code"] == 3
+    assert (tmp_path / "ws" / "14" / "late.txt").read_text() == "late\n"
+    # `exit` ended the command, not the session: the next command runs in the same one.
+    after = await client.post(
+        "/sandboxes/14/exec", json={"session": "s", "command": "cd /; echo $PWD; export Q=1"}
+    )
+    assert after.json()["output"] == "/" and after.json()["exit_code"] == 0
+    kept = await client.post("/sandboxes/14/exec", json={"session": "s", "command": "echo $PWD $Q"})
+    assert kept.json()["output"] == "/ 1"
+    assert (await client.get("/sandboxes/14")).json()["shells"] == 1
+
+
+def test_the_reaper_is_the_images_cmd() -> None:
+    from sightread_sandbox.backends import REAPER
+
+    compile(REAPER, "reaper", "exec")
+    dockerfile = Path(__file__).resolve().parents[3] / "deploy" / "sandbox-image" / "Dockerfile"
+    assert json.dumps(REAPER) in dockerfile.read_text()

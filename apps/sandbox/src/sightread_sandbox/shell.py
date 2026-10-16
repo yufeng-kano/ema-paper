@@ -67,6 +67,51 @@ GROUP_CLEANUP = (
     ' [ "$__sr_pid" != "$$" ] && kill -KILL "$__sr_pid" 2>/dev/null; done'
 )
 
+# What the child bash runs for each command: the session's saved working directory and
+# exported variables restored, the command sourced (so its `cd` and `export` land in
+# this shell), its background jobs waited for, the state saved back. `$1` is the state
+# directory. A command that `exit`s ends this shell with its status and saves nothing.
+_RUN = """\
+cd "$(cat "$1/cwd" 2>/dev/null || pwd)" 2>/dev/null || cd /
+[ -f "$1/env" ] && . "$1/env"
+. "$1/cmd.sh"
+__sr_status=$?
+wait
+pwd > "$1/cwd"
+export -p > "$1/env"
+exit $__sr_status
+"""
+
+
+def supervisor(cleanup: str, pid_file: str | None = None) -> str:
+    """The persistent shell: a POSIX sh that owns each command's lifecycle, so the
+    command can neither read the framing that follows it nor forge the status line
+    (docs/sandbox.md § The runner). It reads one command at a time from stdin, framed by
+    the per-command marker the host chose, runs it in a fresh bash child with stdin at
+    /dev/null, and only once that child is gone runs `cleanup` and prints the marker
+    with the status. `pid_file`, when given, is where it records its pid for a kill
+    inside the VM."""
+    record = f'echo "$$" > {pid_file}' if pid_file else ":"
+    return f"""\
+__sr_state=$(mktemp -d "${{TMPDIR:-/tmp}}/.sr-state-XXXXXX") || exit 1
+trap 'rm -rf "$__sr_state"' EXIT
+{record}
+cat > "$__sr_state/run.sh" <<'__SR_RUN__'
+{_RUN}__SR_RUN__
+while IFS= read -r __sr_marker; do
+    [ -n "$__sr_marker" ] || continue
+    : > "$__sr_state/cmd.sh"
+    while IFS= read -r __sr_line; do
+        [ "$__sr_line" = "$__sr_marker" ] && break
+        printf '%s\\n' "$__sr_line" >> "$__sr_state/cmd.sh"
+    done
+    bash --norc --noprofile "$__sr_state/run.sh" "$__sr_state" </dev/null
+    __sr_status=$?
+    {cleanup}
+    printf '\\n%s %s\\n' "$__sr_marker" "$__sr_status"
+done
+"""
+
 
 class ShellSession:
     def __init__(
@@ -76,14 +121,10 @@ class ShellSession:
         cwd: str | None = None,
         max_bytes: int,
         on_timeout: Callable[[], Awaitable[None]] | None = None,
-        cleanup: str = GROUP_CLEANUP,
     ) -> None:
         self._argv = argv
         self._cwd = cwd
         self._max_bytes = max_bytes
-        # What runs in the shell after a command and its `wait`, before the status line:
-        # it ends whatever the command left running (docs/sandbox.md § The runner).
-        self._cleanup = cleanup
         # What ends the command where it really runs: ending the host-side client does
         # not end a process inside the VM (docs/sandbox.md § The runner).
         self._on_timeout = on_timeout
@@ -137,21 +178,18 @@ class ShellSession:
                 await self.start()
             process = self._process
             assert process is not None and process.stdin is not None and process.stdout is not None
-            marker = f"__SR_DONE_{secrets.token_hex(8)}__"
-            # The command runs in the shell itself (not a subshell), so `cd` and exports
-            # persist; the marker line follows with the status of the last command.
-            # The status is the command's; `wait` then holds the line until every job it
-            # left in the background has finished, and whatever is still running after
-            # that — a disowned job, a daemon, a process that left the session — is
-            # killed by the backend's cleanup, so nothing a command started writes the
-            # tree after its revision (docs/sandbox.md § The runner).
-            script = (
-                f"{command}\n"
-                "__sr_status=$?\n"
-                "wait\n"
-                f"{self._cleanup}\n"
-                f"printf '\\n{marker} %s\\n' \"$__sr_status\"\n"
-            )
+            if "\0" in command:
+                return ExecOutcome("the command contains a NUL byte", None, False, False)
+            # The command goes to the supervisor framed by a marker it alone knows — the
+            # command's own stdin is /dev/null, and the marker is read before the command
+            # starts — so the status line that follows is the supervisor's, never the
+            # command's (docs/sandbox.md § The runner). A marker that happens to appear
+            # in the command (it cannot, at this length, but still) is drawn again.
+            while True:
+                marker = f"__SR_DONE_{secrets.token_hex(8)}__"
+                if marker not in command:
+                    break
+            script = f"{marker}\n{command}\n{marker}\n"
             try:
                 process.stdin.write(script.encode())
                 await process.stdin.drain()

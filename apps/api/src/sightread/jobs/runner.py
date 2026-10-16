@@ -497,6 +497,10 @@ async def _finish_held(
         job.status = status
         job.error = error
         job.finished_at = utcnow()
+        # The job's row lock before the recipients are read: filing takes it before it
+        # inserts, so a row filed meanwhile is either here or filed after, as a finished
+        # parse — never filed in the gap and left without its original (docs/jobs.md).
+        await db.execute(select(Job.id).where(Job.id == job.id).with_for_update())
         documents: list[Document] = []
         if settings is not None and status == "succeeded":
             documents = list(

@@ -26,4 +26,7 @@ ENV UV_CACHE_DIR=/workspace/.cache/uv \
     HOME=/workspace/.cache/home \
     PATH=/workspace/.cache/home/.local/bin:/usr/local/bin:/usr/bin:/bin
 
-CMD ["sleep", "infinity"]
+# pid 1 reaps: what a command left running is killed after the command and reparented
+# here, and must not stay a zombie against the pid limit (docs/sandbox.md § The image).
+# The runner passes this same program on `docker run`.
+CMD ["python3", "-c", "import os, time\nwhile True:\n    try:\n        os.wait()\n    except ChildProcessError:\n        time.sleep(1)\n"]

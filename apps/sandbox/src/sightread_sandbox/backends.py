@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import Settings
-from .shell import GROUP_CLEANUP, ExecOutcome, ShellSession
+from .shell import GROUP_CLEANUP, ExecOutcome, ShellSession, supervisor
 
 logger = logging.getLogger(__name__)
 
@@ -84,8 +84,8 @@ class Backend:
         return None
 
     def cleanup(self) -> str:
-        """What the shell runs after every command to end what the command left running
-        (docs/sandbox.md § The runner): the shell's process group, by default."""
+        """What the supervisor runs after every command to end what the command left
+        running (docs/sandbox.md § The runner): the shell's process group, by default."""
         return GROUP_CLEANUP
 
     async def stop_vm(self, sandbox: UserSandbox) -> bool:
@@ -114,7 +114,6 @@ class Backend:
                     cwd=cwd,
                     max_bytes=self.settings.sandbox_output_max_bytes,
                     on_timeout=self.on_timeout(user_id, token),
-                    cleanup=self.cleanup(),
                 )
                 sandbox.sessions[session] = shell
             sandbox.session_used[session] = time.monotonic()
@@ -248,6 +247,19 @@ async def _docker(*args: str, timeout: float = 120.0) -> tuple[int, str]:
 
 
 CONTAINER_PREFIX = "sightread-sandbox-"
+
+# What runs as pid 1 in the VM: an init that reaps. A command's leftovers the sweep kills
+# are reparented to pid 1 and would sit there as zombies, against the VM's pid limit, if
+# pid 1 were `sleep infinity` (docs/sandbox.md § The image). The same text is the image's
+# CMD; the runner passes it so the two cannot drift.
+REAPER = (
+    "import os, time\n"
+    "while True:\n"
+    "    try:\n"
+    "        os.wait()\n"
+    "    except ChildProcessError:\n"
+    "        time.sleep(1)\n"
+)
 
 
 def _pid_file(token: str) -> str:
@@ -424,7 +436,7 @@ class DockerBackend(Backend):
         ]
         if settings.sandbox_index_url:
             args += ["-e", f"UV_INDEX_URL={settings.sandbox_index_url}"]
-        args += [settings.sandbox_image, "sleep", "infinity"]
+        args += [settings.sandbox_image, "python3", "-c", REAPER]
         code, out = await _docker(*args, timeout=180)
         if code != 0:
             logger.error("could not start sandbox for user %d: %s", sandbox.user_id, out.strip())
@@ -449,7 +461,7 @@ class DockerBackend(Backend):
                 "-w",
                 "sh",
                 "-c",
-                f'echo "$$" > {_pid_file(token)} && exec bash --norc --noprofile',
+                supervisor(self.cleanup(), _pid_file(token)),
             ],
             None,
         )
@@ -513,7 +525,7 @@ class LocalBackend(Backend):
             sandbox.started_at = time.monotonic()
 
     def shell_argv(self, user_id: int, token: str) -> tuple[list[str], str | None]:
-        return ["bash", "--norc", "--noprofile"], str(self.workspace(user_id))
+        return ["sh", "-c", supervisor(self.cleanup())], str(self.workspace(user_id))
 
     async def stop_vm(self, sandbox: UserSandbox) -> bool:
         self._running.discard(sandbox.user_id)

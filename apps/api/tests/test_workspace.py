@@ -1091,3 +1091,42 @@ def test_the_name_migration_brings_legacy_names_into_one_namespace() -> None:
     # spelling becomes the composed one, and the second of the two is suffixed; a
     # separator is cleaned as a fresh name would be.
     assert names == [(1, "Report (2)"), (2, "\u00e9.pdf"), (3, "\u00e9 (2).pdf"), (4, "a b")]
+
+
+async def test_a_reverted_rename_takes_the_untracked_assets_along(sessionmaker, tmp_path) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        before = await documents.materialize_document(db, settings, document)
+        # The original and a crop: in the directory, outside history.
+        (before.directory / "source.pdf").write_bytes(b"%PDF-1.4 original")
+        (before.directory / "figures").mkdir()
+        (before.directory / "figures" / "p1_0_0_10_10.png").write_bytes(b"png")
+        document.name = "renamed.pdf"
+        await db.commit()
+        after = await documents.document_paths(db, settings, document)
+        await documents.move_path(settings, user.id, before.relative, after.relative)
+        assert (after.directory / "source.pdf").exists()
+        rename = git.log(after.root)[0]
+
+        await documents.revert(db, settings, document, rename.commit)
+        assert (before.directory / "source.pdf").read_bytes() == b"%PDF-1.4 original"
+        assert (before.directory / "figures" / "p1_0_0_10_10.png").exists()
+        assert not after.directory.exists()
+
+
+def test_a_git_that_stalls_is_ended_at_the_deadline(tmp_path, monkeypatch) -> None:
+    import stat as stat_module
+
+    root = tmp_path / "ws" / "14"
+    root.mkdir(parents=True)
+    git.ensure_repo(root)
+    # A git that answers a few bytes and then hangs, instead of the real one.
+    fake = tmp_path / "git"
+    fake.write_text("#!/bin/sh\nprintf 'abc'\nsleep 30\n")
+    fake.chmod(fake.stat().st_mode | stat_module.S_IEXEC)
+    monkeypatch.setattr(git, "GIT", str(fake))
+    monkeypatch.setattr(git, "_timeout", lambda: 0.3)
+    with pytest.raises(git.GitError) as timed_out:
+        git._git_bounded(root, "log", max_bytes=1000)
+    assert "timed out" in str(timed_out.value)

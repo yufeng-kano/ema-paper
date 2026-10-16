@@ -518,6 +518,34 @@ async def test_a_finished_library_parse_keeps_its_source(chatting, tmp_path) -> 
     from sightread.jobs import runner
     from sightread.workspace import locks
 
+    # Filing takes the job's row lock before it inserts: a finish that waits for it reads
+    # the row it filed as a recipient rather than deleting the upload under it.
+    async with sessionmaker() as holder:
+        await holder.execute(select(Job.id).where(Job.id == job_id).with_for_update())
+        held = asyncio.create_task(
+            runner._finish(sessionmaker, job_id, status="succeeded", settings=settings)
+        )
+        await asyncio.sleep(0.3)
+        assert not held.done()
+        await holder.rollback()
+    await asyncio.wait_for(held, 10)
+    # Done once: the rest of the test re-stages the upload for the backup-lock check.
+    async with sessionmaker() as db:
+        job = await db.get(Job, job_id)
+        job.status = "running"
+        job.source_deleted_at = None
+        await db.commit()
+    kept_once = (
+        user_root(settings.workspaces_dir, chatting.user_id)
+        / "files"
+        / "Papers"
+        / "paper.pdf"
+        / "source.pdf"
+    )
+    assert kept_once.read_bytes() == b"%PDF-1.4 test"
+    upload.write_bytes(b"%PDF-1.4 test")
+    kept_once.unlink()
+
     # The terminal rows and the kept original land in one backup snapshot: a backup
     # holding the lock keeps the finish — commit included — out until it is done.
     root = user_root(settings.workspaces_dir, chatting.user_id)
@@ -1680,3 +1708,32 @@ async def test_a_rename_whose_commit_fails_moves_the_directory_back(chatting, mo
     assert not after.exists()
     read = (await chatting.get(f"/api/library/documents/{document_id}/content")).json()
     assert read["markdown"] == "# Edited\n"
+
+
+async def test_a_send_that_waited_for_a_deleted_conversation_is_a_404(
+    chatting, monkeypatch
+) -> None:
+    from sightread.routes import chat as chat_routes
+
+    document_id = chatting.document_id
+    conversation_id = (
+        await chatting.post(
+            f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    original = chat_routes.owned_conversation
+
+    async def deleted_underneath(db, user_id, cid):
+        row = await original(db, user_id, cid)
+        # The delete commits between the read and the lock: what a send that waited for
+        # the lock behind a delete sees.
+        async with chatting.app.state.sessionmaker() as other:
+            await other.delete(await other.get(Conversation, cid))
+            await other.commit()
+        return row
+
+    monkeypatch.setattr(chat_routes, "owned_conversation", deleted_underneath)
+    sent = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
+    )
+    assert sent.status_code == 404, sent.text
