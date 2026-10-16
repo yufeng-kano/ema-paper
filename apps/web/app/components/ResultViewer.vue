@@ -247,8 +247,10 @@ async function saveContent() {
       scheduleSave()
     }
   } catch (error) {
-    if (error instanceof ApiRequestError && error.status === 409) {
-      // Another tab, or the agent: what is on disk wins, and the reader is told.
+    if (error instanceof ApiRequestError && error.type === 'revision_conflict') {
+      // Another tab, or the agent: what is on disk wins, and the reader is told. Only
+      // this 409: one for a workspace that is recovering, or a revision that could not
+      // be recorded, left the draft unsaved, and it stays the reader's to retry.
       saveState.value = 'saved'
       notice.value = t('viewer.changedUnderneath')
       // Only the file that conflicted; an unsaved notes draft is still the reader's.
@@ -319,7 +321,7 @@ async function saveNotes() {
       scheduleNotesSave()
     }
   } catch (error) {
-    if (error instanceof ApiRequestError && error.status === 409) {
+    if (error instanceof ApiRequestError && error.type === 'revision_conflict') {
       notesState.value = 'saved'
       notice.value = t('viewer.notesChanged')
       await loadContent('notes')

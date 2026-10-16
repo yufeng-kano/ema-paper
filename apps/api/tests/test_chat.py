@@ -2585,7 +2585,11 @@ async def test_a_command_the_runner_could_not_confirm_over_keeps_the_marker_unti
         configured = True
         restart_ok = False
         restarted: list[str] = []
+        stopped: list[int] = []
         runs = 0
+
+        async def stop(self, user_id):
+            self.stopped.append(user_id)
 
         async def exec(self, user_id, session, command, *, timeout_seconds):
             self.runs += 1
@@ -2639,6 +2643,19 @@ async def test_a_command_the_runner_could_not_confirm_over_keeps_the_marker_unti
     assert result["is_error"] and "restarted" in result["content"]
     assert not writing_marker(paths.root).exists()
     assert git.log(paths.root)[0].message == "bash: python write.py"
+
+    # A marker that stands but names no shell is not a clean tree: the VM is stopped
+    # whole before the tree is recorded, and without a runner the workspace stays closed.
+    writing_marker(paths.root).write_text("")
+    (paths.directory / "late.txt").write_text("from a shell unknown\n")
+    assert await recover_unsettled_commands(settings, None) == {user.id}
+    assert writing_marker(paths.root).exists()
+    assert await recover_unsettled_commands(settings, shell) == set()
+    assert shell.stopped == [user.id]
+    assert not writing_marker(paths.root).exists()
+    head = git.log(paths.root)[0]
+    assert head.message == UNSETTLED_REVISION_MESSAGE and head.author == "user"
+    assert "files/Papers/paper.pdf/late.txt" in head.files
 
 
 async def test_a_figure_read_is_bounded_by_the_image_budget_not_the_text_cap(

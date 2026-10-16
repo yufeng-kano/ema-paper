@@ -12,7 +12,11 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .body_limit import BodyTooLarge
 
-ErrorType = Literal["invalid_request", "auth", "rate_limit", "payment", "upstream", "internal"]
+# `revision_conflict`: a save whose `base_revision` is not the file's current one — the
+# one 409 a client answers by reloading, apart from every other 409 (docs/api.md).
+ErrorType = Literal[
+    "invalid_request", "revision_conflict", "auth", "rate_limit", "payment", "upstream", "internal"
+]
 
 _STATUS_TO_TYPE: dict[int, ErrorType] = {
     400: "invalid_request",

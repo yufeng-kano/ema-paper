@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import Settings
 from ..db.models import Document, Folder, User
 from . import git, safe_io
-from .documents import aside_origin, folder_names, sweep_aside
+from .documents import aside_origin, folder_names, sweep_aside, sweep_orphaned_originals
 from .layout import (
     FILES_DIR,
     META_FILE,
@@ -326,6 +326,18 @@ async def reconcile_locked(db: AsyncSession, settings: Settings, user_id: int) -
 
 
 async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
+    # The originals of rows a committed delete removed before its cleanup ran go first:
+    # every writer of an original holds this lock (docs/workspace.md § Revisions).
+    live_ids = set(
+        (await db.execute(select(Document.id).where(Document.user_id == user_id))).scalars()
+    )
+    swept_originals = await asyncio.to_thread(sweep_orphaned_originals, root, live_ids)
+    if swept_originals:
+        logger.warning(
+            "reconcile for user %d: removed %d original(s) whose document rows are gone",
+            user_id,
+            swept_originals,
+        )
     found, folders = await asyncio.to_thread(_canonicalize_and_scan, root)
     asides = await asyncio.to_thread(_aside_documents, root)
     if not found and not folders and not asides:

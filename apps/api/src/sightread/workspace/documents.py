@@ -598,7 +598,7 @@ def _write_file(
         raise ApiError(409, "invalid_request", "The content is too large to save")
     current = _read_text(paths.root, path, max_bytes)
     if revision_of(current) != base_revision:
-        raise ApiError(409, "invalid_request", "The file changed since it was loaded")
+        raise ApiError(409, "revision_conflict", "The file changed since it was loaded")
     if text != current:
         _write_text(paths.root, path, text)
         try:
@@ -722,14 +722,34 @@ def reaches_beyond(paths: DocumentPaths, commit: str) -> bool:
     except git.GitError:
         return True
     for _status, then, renamed_to in changes:
-        if renamed_to is not None and _under(moved.get(renamed_to, renamed_to), paths.relative):
-            # The commit's own rename of this document's files: where they came from is
-            # this document's too — the revision that renamed the document, above all.
+        if renamed_to is not None and _is_own_rename(
+            root, paths.relative, then, moved.get(renamed_to, renamed_to)
+        ):
+            # The revision that renamed the document itself: where its files came from
+            # is this document's too. A file moved in from elsewhere is not that.
             continue
         for path in (then, renamed_to):
             if path is not None and not _under(moved.get(path, path), paths.relative):
                 return True
     return False
+
+
+def _is_own_rename(root: Path, document: Path, then: Path, now: Path) -> bool:
+    """Whether a rename pair (`then` → `now`, the new side where it lives today) is the
+    document's own directory being renamed: the new side is under the document, the old
+    side ends with the same path inside it, and the directory it came from is gone —
+    renamed away. A file a command moved in from another document fails the last two:
+    its old side is that document's, and that document still stands
+    (docs/workspace.md § Revisions)."""
+    if not _under(now, document) or now == document:
+        return False
+    inner = now.relative_to(document)
+    if len(then.parts) <= len(inner.parts) or then.parts[-len(inner.parts) :] != inner.parts:
+        return False
+    came_from = Path(*then.parts[: len(then.parts) - len(inner.parts)])
+    if came_from == document or came_from.parts[:1] != (FILES_DIR,):
+        return False
+    return safe_io.entry_kind(root, root / came_from) == "none"
 
 
 def _revert(
@@ -948,7 +968,16 @@ async def revert(
 # --- the tree -----------------------------------------------------------------------------
 
 
-def _move_tree(root: Path, source: Path, target: Path, message: str) -> str | None:
+@dataclass(frozen=True)
+class Move:
+    """A directory move: the revision it made, and where a squatter that sat at the
+    destination was moved to, so a rollback can put it back (docs/workspace.md § Layout)."""
+
+    commit: str | None
+    displaced: Path | None
+
+
+def _move_tree(root: Path, source: Path, target: Path, message: str) -> Move | None:
     git.ensure_repo(root)
     if safe_io.entry_kind(root, root / source) == "none" or source == target:
         return None
@@ -974,7 +1003,7 @@ def _move_tree(root: Path, source: Path, target: Path, message: str) -> str | No
         message = NOT_PLAIN if plain else "The move failed; nothing was changed"
         raise ApiError(409, "invalid_request", message) from exc
     try:
-        return git.commit_paths(root, git.USER_AUTHOR, message, touched)
+        return Move(git.commit_paths(root, git.USER_AUTHOR, message, touched), aside)
     except git.GitError as exc:
         # Back where the row will point once the caller rolls back: the directory to its
         # old place, the squatter to the place it had. Plain renames, no git — the index
@@ -987,13 +1016,34 @@ def _move_tree(root: Path, source: Path, target: Path, message: str) -> str | No
         ) from exc
 
 
-async def move_path(settings: Settings, user_id: int, source: Path, target: Path) -> str | None:
+async def move_path(settings: Settings, user_id: int, source: Path, target: Path) -> Move | None:
     """Rename or move a document or folder directory after the database did. The caller
     holds the user's workspace lock across its database write and this move, so nothing
     can materialize at the new path in between (docs/workspace.md § Revisions). Returns
-    the revision the move made, None when there was nothing to move."""
+    the move — its revision, and the squatter it displaced — or None when there was
+    nothing to move."""
     root = user_root(settings.workspaces_dir, user_id)
     return await asyncio.to_thread(_move_tree, root, source, target, f"move {source} -> {target}")
+
+
+def _undo_move(root: Path, source: Path, target: Path, displaced: Path | None) -> None:
+    touched = [target, source]
+    git.move(root, root / target, root / source)
+    if displaced is not None and safe_io.entry_kind(root, root / displaced) != "none":
+        # The squatter back under the name it had, not left at its suffixed one.
+        git.move(root, root / displaced, root / target)
+        touched.append(displaced)
+    git.commit_paths(root, git.USER_AUTHOR, f"restore {source}", touched)
+
+
+async def undo_move(
+    settings: Settings, user_id: int, source: Path, target: Path, displaced: Path | None
+) -> None:
+    """A move whose row did not commit: the whole of it undone — the directory back to
+    `source`, and the squatter the move displaced back to `target` — as one revision, so
+    a failed request renames nothing (docs/workspace.md § Layout)."""
+    root = user_root(settings.workspaces_dir, user_id)
+    await asyncio.to_thread(_undo_move, root, source, target, displaced)
 
 
 @dataclass(frozen=True)
@@ -1099,6 +1149,27 @@ async def restore_removed(
     § Revisions). The caller holds the workspace lock."""
     root = user_root(settings.workspaces_dir, user_id)
     await asyncio.to_thread(_restore_removed, root, relative, removal)
+
+
+def sweep_orphaned_originals(root: Path, live_ids: Collection[int]) -> int:
+    """Remove the originals beside the git directory whose document row is gone: what a
+    delete the process died in, after its rows' commit and before its cleanup, leaves
+    behind (docs/workspace.md § Revisions). Under the workspace lock, which every writer
+    of an original holds, so none on its way to a row about to commit is taken."""
+    directory = sources_dir(root)
+    if not directory.is_dir():
+        return 0
+    swept = 0
+    for original in directory.iterdir():
+        try:
+            document_id = int(original.stem)
+        except ValueError:
+            continue  # a staging file, named so `original_of` never picks it
+        if document_id in live_ids:
+            continue
+        original.unlink(missing_ok=True)
+        swept += 1
+    return swept
 
 
 def sweep_aside(root: Path, keep: Collection[str] = ()) -> int:

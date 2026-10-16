@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import fcntl
+import os
 from collections import defaultdict
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -51,8 +52,13 @@ def writing_marker(root: Path) -> Path:
 
 def mark_writing(root: Path, conversation_id: int, session: str) -> None:
     """The marker names the shell that may be writing, so a recovery that finds it can
-    restart that shell and record the tree in that conversation's name."""
-    writing_marker(root).write_text(f"{conversation_id} {session}\n")
+    restart that shell and record the tree in that conversation's name. Written whole
+    and renamed into place: a worker killed mid-write leaves the old marker or the new
+    one, never a half one that names no shell."""
+    marker = writing_marker(root)
+    staging = marker.with_name(f"{marker.name}.tmp")
+    staging.write_text(f"{conversation_id} {session}\n")
+    os.replace(staging, marker)
 
 
 def read_writing(root: Path) -> tuple[int, str] | None:

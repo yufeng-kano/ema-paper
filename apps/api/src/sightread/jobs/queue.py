@@ -30,6 +30,7 @@ from ..workspace.locks import (
     read_writing,
     shell_lock,
     workspace_lock,
+    writing_marker,
 )
 from ..workspace.reconcile import reconcile_locked
 from . import chat_events
@@ -548,10 +549,14 @@ async def fail_orphaned_turns(
             except SandboxUnavailable:
                 left.add(user_id)
                 continue
-        elif settings is not None and read_writing(user_root(settings.workspaces_dir, user_id)):
+        elif (
+            settings is not None
+            and writing_marker(user_root(settings.workspaces_dir, user_id)).exists()
+        ):
             # A shell command was writing when the worker died, and this worker has no
             # runner to stop it with (SANDBOX_URL gone from its environment): the VM may
-            # still be running the command, so the tree is not declared safe here.
+            # still be running the command, so the tree is not declared safe here. The
+            # marker standing is what counts, readable or not.
             logger.warning(
                 "an orphaned shell command of user %d cannot be stopped: no sandbox runner "
                 "is configured; the workspace stays closed",
@@ -585,21 +590,31 @@ async def recover_unsettled_commands(settings: Settings, sandbox: SandboxClient 
             continue
         root = user_root(settings.workspaces_dir, user_id)
         named = read_writing(root)
-        if named is not None:
-            if sandbox is None or not sandbox.configured:
-                # Nothing to stop the shell with: unconfirmed, as a restart that failed.
+        if sandbox is None or not sandbox.configured:
+            # Nothing to stop the shell with: unconfirmed, as a restart that failed.
+            logger.warning(
+                "an unconfirmed shell command of user %d cannot be stopped: no sandbox "
+                "runner is configured; the workspace stays closed",
+                user_id,
+            )
+            left.add(user_id)
+            continue
+        try:
+            if named is not None:
+                await sandbox.restart(user_id, named[1])
+            else:
+                # The marker stands but names no shell (a hand on it, a worker killed
+                # before the rename that writes it whole): the command it stood for may
+                # still run, in a shell unknown — so every shell of the user goes, the
+                # VM stopped, before the tree is declared the command's and recorded.
                 logger.warning(
-                    "an unconfirmed shell command of user %d cannot be stopped: no sandbox "
-                    "runner is configured; the workspace stays closed",
+                    "the writing marker of user %d names no shell; stopping the sandbox",
                     user_id,
                 )
-                left.add(user_id)
-                continue
-            try:
-                await sandbox.restart(user_id, named[1])
-            except SandboxUnavailable:
-                left.add(user_id)
-                continue
+                await sandbox.stop(user_id)
+        except SandboxUnavailable:
+            left.add(user_id)
+            continue
         author = f"{git.AGENT_AUTHOR_PREFIX}{named[0]}" if named else git.USER_AUTHOR
         async with shell_lock(root), workspace_lock(root, recovering=True):
             try:

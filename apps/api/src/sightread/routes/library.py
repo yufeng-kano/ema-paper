@@ -327,7 +327,11 @@ async def move_then_commit(
                 )
             else:
                 try:
-                    await workspace_documents.move_path(settings, user_id, after, before)
+                    # The whole move undone: the directory back, and the squatter the
+                    # move displaced back under its name (docs/workspace.md § Layout).
+                    await workspace_documents.undo_move(
+                        settings, user_id, before, after, moved.displaced
+                    )
                 except Exception:  # noqa: BLE001 - the move revision stays revertible
                     logger.exception("could not move %s back after a failed commit", after)
         raise

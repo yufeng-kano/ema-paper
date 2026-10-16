@@ -10,6 +10,7 @@
 // --- error envelope --------------------------------------------------------
 
 export type ApiErrorType =
+  | 'revision_conflict'
   | 'invalid_request'
   | 'auth'
   | 'rate_limit'

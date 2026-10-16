@@ -111,6 +111,8 @@ async def test_materialize_writes_once_and_edits_commit_revisions(sessionmaker, 
                 db, settings, document, markdown="changed", base_revision="nope"
             )
         assert refused.value.status_code == 409
+        # The one 409 a client answers by reloading, apart from every other.
+        assert refused.value.error_type == "revision_conflict"
         revision = await documents.write_content(
             db, settings, document, markdown="# Title\n\nEdited\n", base_revision=content.revision
         )
@@ -1683,11 +1685,11 @@ async def test_the_documents_own_rename_revision_does_not_reach_beyond_it(
         document.name = "renamed.pdf"
         await db.commit()
         after = await documents.document_paths(db, settings, document)
-        commit = await documents.move_path(settings, user.id, before.relative, after.relative)
-        assert commit is not None
+        moved = await documents.move_path(settings, user.id, before.relative, after.relative)
+        assert moved is not None and moved.commit is not None
         # The rename's old side is this document's: reverting it waits for this
         # document's conversations only, not for every turn of the user.
-        assert documents.reaches_beyond(after, commit) is False
+        assert documents.reaches_beyond(after, moved.commit) is False
         # A shell revision that moved another document's file in still reaches beyond.
         other = Document(
             user_id=user.id, folder_id=document.folder_id, job_id=document.job_id, name="other.pdf"
@@ -1700,7 +1702,9 @@ async def test_the_documents_own_rename_revision_does_not_reach_beyond_it(
         (other_paths.directory / "extra.md").rename(after.directory / "extra.md")
         git.commit_all(before.root, "agent:1", "mv from the shell")
         shell = git.log(before.root)[0].commit
-        assert documents.reaches_beyond(after, shell) is False  # its new place is here
+        # Its new place is here, but its old side is the other document's, which still
+        # stands: not this document's own rename, so the revision reaches beyond.
+        assert documents.reaches_beyond(after, shell) is True
 
 
 async def test_a_delete_the_process_died_in_is_restored_by_reconciliation(
@@ -1891,3 +1895,74 @@ async def test_a_removal_whose_origin_cannot_be_written_is_refused_whole(
     assert refused.value.status_code == 409
     assert (root / "files" / "Drafts" / "notes.txt").read_text() == "from bash\n"
     assert not [name for name in os.listdir(root) if name.startswith(safe_io.TEMP_PREFIX)]
+
+
+async def test_undoing_a_move_puts_the_displaced_squatter_back_too(sessionmaker, tmp_path) -> None:
+    """A move whose row did not commit is undone whole: the document back where it was,
+    and the directory the move displaced back under the name it had (docs/workspace.md
+    § Layout)."""
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        before = await documents.materialize_document(db, settings, document)
+    root = before.root
+    target = before.relative.with_name("renamed.pdf")
+    (root / target).mkdir()
+    (root / target / "scratch.txt").write_text("the shell's")
+    git.commit_all(root, "agent:1", "bash: scratch")
+    moved = await documents.move_path(settings, user.id, before.relative, target)
+    assert moved is not None and moved.displaced is not None
+    assert (root / moved.displaced / "scratch.txt").is_file()
+    await documents.undo_move(settings, user.id, before.relative, target, moved.displaced)
+    assert before.doc.is_file()
+    assert (root / target / "scratch.txt").read_text() == "the shell's"
+    assert not (root / moved.displaced).exists()
+    assert git.log(root)[0].message == f"restore {before.relative}"
+
+
+async def test_a_file_moved_in_from_another_document_reaches_beyond(sessionmaker, tmp_path) -> None:
+    """The exemption for the old side of a rename is the document's own rename only: a
+    shell revision that moved a file in from another document is that document's too,
+    so its revert waits for every turn of the user (docs/workspace.md § Revisions)."""
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        other = Document(
+            user_id=user.id, folder_id=document.folder_id, job_id=document.job_id, name="other.pdf"
+        )
+        db.add(other)
+        await db.commit()
+        paths = await documents.materialize_document(db, settings, document)
+        other_paths = await documents.materialize_document(db, settings, other)
+    root = paths.root
+    git.move(root, other_paths.notes, paths.directory / "extra.md")
+    moved_in = git.commit_all(root, "agent:1", "bash: mv")
+    assert moved_in is not None
+    assert documents.reaches_beyond(paths, moved_in) is True
+    # The document's own rename, by contrast, stays its own.
+    renamed = paths.relative.with_name("renamed.pdf")
+    own = await documents.move_path(settings, user.id, paths.relative, renamed)
+    assert own is not None and own.commit is not None
+    renamed_paths = documents.DocumentPaths(root=root, relative=renamed)
+    assert documents.reaches_beyond(renamed_paths, own.commit) is False
+
+
+async def test_reconciliation_removes_the_originals_of_rows_that_are_gone(
+    sessionmaker, tmp_path
+) -> None:
+    """A delete the process died in after its rows' commit leaves the originals beside the
+    git directory; the next reconciliation takes them, and only them."""
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+        root = paths.root
+        originals = documents.sources_dir(root)
+        originals.mkdir(parents=True, exist_ok=True)
+        (originals / f"{document.id}.pdf").write_bytes(b"%PDF live")
+        (originals / "999.pdf").write_bytes(b"%PDF orphan")
+        (originals / ".tmp-1000.pdf").write_bytes(b"staging")
+        await reconcile.reconcile_user(db, settings, user.id)
+    assert (originals / f"{document.id}.pdf").is_file()
+    assert not (originals / "999.pdf").exists()
+    assert (originals / ".tmp-1000.pdf").is_file()
