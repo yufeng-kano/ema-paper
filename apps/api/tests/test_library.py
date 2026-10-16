@@ -688,3 +688,35 @@ async def test_a_parse_filed_again_takes_a_copy_of_its_original(
     assert deleted.status_code == 204
     assert original_of(root, filed["id"]) is None
     assert original_of(root, uploaded["id"]) == original
+
+
+async def test_filing_again_at_the_quota_keeps_no_copy_and_a_failed_copy_files_nothing(
+    make_client, sessionmaker, documents, tmp_path, monkeypatch
+) -> None:
+    from sightread.workspace import documents as workspace_documents
+    from sightread.workspace.documents import original_of
+
+    library = make_client(workspaces_dir=str(tmp_path / "ws"))
+    await _ready_to_parse(library)
+    await _upload(library, documents)
+    uploaded = (await _upload(library, documents)).json()
+    async with sessionmaker() as db:
+        row = await db.get(Document, uploaded["id"])
+        root = user_root(library.app.state.settings.workspaces_dir, row.user_id)
+    assert original_of(root, uploaded["id"]) is not None
+
+    # At the quota: filed, but no further copy of the original is made.
+    library.app.state.settings.workspace_quota_bytes = 1
+    filed = (await _file_job(library, uploaded["job_id"])).json()
+    assert original_of(root, filed["id"]) is None
+    library.app.state.settings.workspace_quota_bytes = 10 * 1024 * 1024 * 1024
+
+    # A copy that fails takes the row with it.
+    def failing(*args, **kwargs):
+        raise OSError("disk unwell")
+
+    monkeypatch.setattr(workspace_documents, "_copy_original", failing)
+    refused = await _file_job(library, uploaded["job_id"])
+    assert refused.status_code == 409
+    names = [row["name"] for row in (await _read(library))["documents"]]
+    assert sorted(names) == ["tiny (2).png", "tiny (3).png", "tiny.png"]

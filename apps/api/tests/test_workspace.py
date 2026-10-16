@@ -1342,3 +1342,53 @@ async def test_reconcile_refuses_a_document_that_took_a_folders_name(
         assert row.name == "paper.pdf" and row.folder_id == document.folder_id
         folder = (await db.execute(select(Folder).where(Folder.id == reports.id))).scalar_one()
         assert folder.name == "Reports"
+
+
+async def test_a_save_whose_commit_fails_leaves_the_file_as_it_was(
+    sessionmaker, tmp_path, monkeypatch
+) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+        content = await documents.read_content(db, settings, document)
+
+        def failing(*args, **kwargs):
+            raise git.GitError("git is unwell")
+
+        monkeypatch.setattr(git, "commit_paths", failing)
+        with pytest.raises(ApiError) as refused:
+            await documents.write_content(
+                db, settings, document, markdown="# Changed\n", base_revision=content.revision
+            )
+        assert refused.value.status_code == 409
+        assert paths.doc.read_text() == "# Title\n\nBody\n"
+        with pytest.raises(ApiError):
+            await documents.write_notes(
+                db, settings, document, text="a note", base_revision=content.notes_revision
+            )
+        assert paths.notes.read_text() == ""
+
+
+async def test_a_materialization_whose_commit_fails_is_written_again(
+    sessionmaker, tmp_path, monkeypatch
+) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        real = git.commit_paths
+
+        def failing(*args, **kwargs):
+            raise git.GitError("git is unwell")
+
+        monkeypatch.setattr(git, "commit_paths", failing)
+        with pytest.raises(ApiError) as refused:
+            await documents.materialize_document(db, settings, document)
+        assert refused.value.status_code == 409
+        paths = await documents.document_paths(db, settings, document)
+        # Nothing tracked was left behind for a later commit to absorb.
+        assert not paths.doc.exists() and not paths.meta.exists()
+        monkeypatch.setattr(git, "commit_paths", real)
+        await documents.materialize_document(db, settings, document)
+        assert paths.doc.read_text() == "# Title\n\nBody\n"
+        assert git.log(paths.root)[0].message.startswith("materialize")

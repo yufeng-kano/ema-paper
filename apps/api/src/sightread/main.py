@@ -46,7 +46,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.oauth = build_oauth(settings)
 
     # Before the session layer, so an oversized body is refused before anything reads it.
-    app.add_middleware(BodyLimitMiddleware, max_bytes=settings.json_body_max_bytes)
+    app.add_middleware(
+        BodyLimitMiddleware,
+        max_bytes=settings.json_body_max_bytes,
+        parse_json_max_bytes=settings.parse_json_body_max_bytes,
+    )
     app.add_middleware(
         SessionMiddleware,
         secret_key=settings.secret_key,

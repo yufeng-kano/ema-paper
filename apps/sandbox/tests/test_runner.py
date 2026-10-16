@@ -582,3 +582,36 @@ def test_kill_tree_refuses_anything_but_a_pid() -> None:
     for bad in ("", "abc", "shell.pid", "12 13"):
         done = subprocess.run(["sh", "-c", KILL_TREE, "sh", bad, ""], capture_output=True)  # noqa: S603, S607
         assert done.returncode == 3, bad
+
+
+async def test_a_stop_kills_a_running_command_inside_the_vm_first(tmp_path) -> None:
+    import asyncio
+
+    calls: list[tuple[int, bool]] = []
+
+    class Recording(LocalBackend):
+        def on_timeout(self, user_id):
+            async def kill_inside(*, pid: int, locked: bool = False) -> None:
+                calls.append((pid, locked))
+
+            return kill_inside
+
+    settings = Settings(
+        app_env="local",
+        sandbox_token=TOKEN,
+        sandbox_backend="local",
+        sandbox_workspaces_dir=str(tmp_path / "ws"),
+        sandbox_workspaces_mount=str(tmp_path / "ws"),
+    )
+    backend = Recording(settings)
+    await backend.exec(31, "idle", "true", timeout=10)
+    running = asyncio.create_task(backend.exec(31, "busy", "sleep 30", timeout=60))
+    await asyncio.sleep(0.3)
+    busy_pid = backend._user(31).sessions["busy"].pid
+    assert busy_pid is not None
+    await asyncio.wait_for(backend.stop(31), 10)
+    # The busy shell was killed where it runs, by its pid; the idle one merely closed.
+    assert calls == [(busy_pid, True)]
+    outcome = await asyncio.wait_for(running, 10)
+    assert outcome.exit_code is None and not outcome.timed_out
+    assert backend._user(31).sessions == {}

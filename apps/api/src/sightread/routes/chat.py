@@ -155,7 +155,15 @@ async def read_conversation(conversation_id: int, user: SessionUser, db: DbSessi
             for message in messages
         ],
         "turns": [
-            {"id": str(turn.id), "status": turn.status, "error": turn.error} for turn in turns
+            {
+                "id": str(turn.id),
+                "status": turn.status,
+                "error": turn.error,
+                # Null while the turn is unfinished, whatever its status says: a cancel
+                # marks the status first and the writer winds down after (docs/chat.md).
+                "finished_at": turn.finished_at,
+            }
+            for turn in turns
         ],
     }
 
@@ -209,8 +217,12 @@ async def _active_turn(db: AsyncSession, conversation_id: int) -> uuid.UUID | No
     )
 
 
-async def _ready_to_chat(db: AsyncSession, settings: AppSettings, user_id: int) -> None:
-    """The enqueue rules of docs/agents.md, applied to the chat agent."""
+async def _ready_to_chat(
+    db: AsyncSession, settings: AppSettings, user_id: int, *, needs_model: bool
+) -> None:
+    """The enqueue rules of docs/agents.md, applied to the chat agent. A conversation
+    that has its model already needs none chosen on the Agent page: later turns use
+    the stored one, whatever the page says now (docs/chat.md § Conversations)."""
     if not settings.kano_proxy_configured:
         raise ApiError(503, "upstream", "Kano Proxy is not configured on this deployment")
     setting = (
@@ -220,7 +232,7 @@ async def _ready_to_chat(db: AsyncSession, settings: AppSettings, user_id: int) 
             )
         )
     ).scalar_one_or_none()
-    if setting is None or not setting.model:
+    if needs_model and (setting is None or not setting.model):
         raise ApiError(
             400, "invalid_request", "No model chosen for the chat agent: pick one on the Agent page"
         )
@@ -262,7 +274,7 @@ async def post_message(
         # Deleted while this send waited for the lock: a clean 404, not rows inserted
         # for a conversation that is gone (docs/chat.md § Conversations).
         raise ApiError(404, "invalid_request", "No such conversation")
-    await _ready_to_chat(db, settings, user.id)
+    await _ready_to_chat(db, settings, user.id, needs_model=row.model is None)
     if await count_active_turns(db, user.id) >= settings.max_chat_turns_per_user:
         raise ApiError(
             429,

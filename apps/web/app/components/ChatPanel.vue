@@ -52,7 +52,9 @@ interface EditCard {
 /** The chat agent's editor tool and the commands of it that write (docs/chat.md § Tools). */
 const EDITOR_TOOL = 'str_replace_based_edit_tool'
 const EDITOR_WRITES = new Set(['str_replace', 'insert', 'create'])
-const LIVE_STATUSES = new Set(['queued', 'running'])
+/** A turn the backend has not finished: queued, running, or cancelled and still winding
+ *  down a tool call — `finished_at` says, not the status (docs/chat.md § Conversations). */
+const isLive = (turn: ChatTurn): boolean => turn.finished_at === null
 /** How long to wait before following a still-live turn again after the stream gave up. */
 const RESUME_AFTER_MS = 10_000
 /** A tool line is one line: longer command text is cut, the full one rides on `title`. */
@@ -295,8 +297,8 @@ async function loadDetail(id: number) {
     }
     messages.value = [...detail.messages].sort((left, right) => left.id - right.id)
     turns.value = [...detail.turns]
-    if (turns.value.some((turn) => LIVE_STATUSES.has(turn.status))) {
-      // A turn still queued or running is followed from here: a stream dropped before
+    if (turns.value.some(isLive)) {
+      // A turn still unfinished is followed from here: a stream dropped before
       // its turn_start would otherwise never be reopened (docs/web.md).
       stream.expectTurn()
     }
@@ -395,10 +397,9 @@ function flushFrames() {
 const stream = useConversationStream(
   (frame) => {
     if (frame.event.event === 'edit') {
-      const turn = turns.value.find((row) => row.id === frame.event.turn_id)
-      if (!turn || LIVE_STATUSES.has(turn.status)) {
-        liveEdit = true
-      }
+      // Every edit frame reloads the document, replayed ones included: the content was
+      // fetched on its own, and nothing says the edit came before it (docs/web.md).
+      liveEdit = true
     }
     pendingFrames.push(frame)
     if (flushTimer === null) {
@@ -413,7 +414,7 @@ const stream = useConversationStream(
       return
     }
     void loadDetail(id).then(() => {
-      if (currentId.value === id && turns.value.some((turn) => LIVE_STATUSES.has(turn.status))) {
+      if (currentId.value === id && turns.value.some(isLive)) {
         setTimeout(() => {
           if (currentId.value === id) {
             stream.resume()
@@ -475,7 +476,7 @@ function isTerminal(turn: ChatTurn | undefined, group: ChatEvent[] | undefined, 
     return true
   }
   if (turn) {
-    return !LIVE_STATUSES.has(turn.status)
+    return !isLive(turn)
   }
   return stored
 }
@@ -557,32 +558,13 @@ const thread = computed<ThreadItem[]>(() => {
       }
     }
 
-    if (assistants.length > 0) {
-      assistants.forEach((message, round) => {
-        message.content.forEach((block, position) => {
-          const at = `${round}-${position}`
-          if (block.type === 'text' && block.text.trim()) {
-            items.push({ kind: 'text', key: `${prefix}-text-${at}`, text: block.text.trim() })
-          } else if (block.type === 'thinking' && block.thinking.trim()) {
-            items.push({ kind: 'thinking', key: `${prefix}-think-${at}`, text: block.thinking.trim() })
-          } else if (block.type === 'tool_use') {
-            items.push(toolItem(block.id, block.name, block.input))
-            // Any tool whose `edit` event is on record — a shell command that changed the
-            // tree has a revision to show and revert too — or an editor write the record
-            // says succeeded; a failed one has nothing to show.
-            if (edits.has(block.id) || (block.name === EDITOR_TOOL && results.get(block.id) === false)) {
-              const card = editItem(block.id, block.input)
-              if (card) {
-                items.push(card)
-              }
-            }
-          }
-        })
-      })
-    } else if (group) {
-      // A retried model call starts over: what the abandoned attempt streamed is noise.
-      const restart = group.map((event) => event.event).lastIndexOf('retry')
-      const live = restart === -1 ? group : group.slice(restart + 1)
+    // The live events a persisted round does not cover: what streamed after the last
+    // tool call the record holds (its results and the next round), or the whole group
+    // when nothing of the turn is stored yet. A retried model call starts over, so what
+    // the abandoned attempt streamed is noise.
+    const renderLive = (events: ChatEvent[], coveredEdits: Set<string>) => {
+      const restart = events.map((event) => event.event).lastIndexOf('retry')
+      const live = restart === -1 ? events : events.slice(restart + 1)
       let text = ''
       let textKey = 0
       const flushText = () => {
@@ -608,6 +590,9 @@ const thread = computed<ThreadItem[]>(() => {
             items.push(toolItem(event.id, event.name, event.input))
             break
           case 'edit': {
+            if (coveredEdits.has(event.tool_use_id)) {
+              break // drawn with the stored round's tool call
+            }
             flushText()
             const card = editItem(event.tool_use_id, {})
             if (card) {
@@ -620,6 +605,43 @@ const thread = computed<ThreadItem[]>(() => {
         }
       }
       flushText()
+    }
+
+    if (assistants.length > 0) {
+      const storedTools = new Set<string>()
+      assistants.forEach((message, round) => {
+        message.content.forEach((block, position) => {
+          const at = `${round}-${position}`
+          if (block.type === 'text' && block.text.trim()) {
+            items.push({ kind: 'text', key: `${prefix}-text-${at}`, text: block.text.trim() })
+          } else if (block.type === 'thinking' && block.thinking.trim()) {
+            items.push({ kind: 'thinking', key: `${prefix}-think-${at}`, text: block.thinking.trim() })
+          } else if (block.type === 'tool_use') {
+            storedTools.add(block.id)
+            items.push(toolItem(block.id, block.name, block.input))
+            // Any tool whose `edit` event is on record — a shell command that changed the
+            // tree has a revision to show and revert too — or an editor write the record
+            // says succeeded; a failed one has nothing to show.
+            if (edits.has(block.id) || (block.name === EDITOR_TOOL && results.get(block.id) === false)) {
+              const card = editItem(block.id, block.input)
+              if (card) {
+                items.push(card)
+              }
+            }
+          }
+        })
+      })
+      if (group && !done) {
+        // The stream past the last stored round: a tool-using turn goes on after the
+        // panel opened or the record was reloaded, and its later rounds show live
+        // until the next reload stores them (docs/web.md § The agent panel).
+        const cut = group.map((event) => event.event === 'tool_use' && storedTools.has(event.id)).lastIndexOf(true)
+        if (cut !== -1) {
+          renderLive(group.slice(cut + 1), storedTools)
+        }
+      }
+    } else if (group) {
+      renderLive(group, new Set())
     }
 
     const streamError = group?.find(
@@ -773,7 +795,7 @@ async function send() {
         created_at: new Date().toISOString(),
       },
     ]
-    turns.value = [...turns.value, { id: turn_id, status: 'queued', error: null }]
+    turns.value = [...turns.value, { id: turn_id, status: 'queued', error: null, finished_at: null }]
     draft.value = ''
     selection.value = null
     stream.expectTurn()

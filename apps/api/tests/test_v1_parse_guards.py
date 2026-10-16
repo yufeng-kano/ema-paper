@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import uuid
 from pathlib import Path
 
@@ -253,3 +254,31 @@ async def test_jobs_of_other_users_are_invisible(make_client, sessionmaker, docu
     stranger.headers["Authorization"] = f"Bearer {plaintext}"
     assert (await stranger.get(f"/v1/jobs/{job_id}")).status_code == 404
     assert (await stranger.get(f"/v1/jobs/{job_id}/result")).status_code == 404
+
+
+async def test_a_chunked_json_body_is_counted_against_the_parse_cap(make_client) -> None:
+    client = await _keyed_client(make_client(upload_max_bytes=64))
+    cap = client.app.state.settings.parse_json_body_max_bytes
+    # No Content-Length: the bytes are counted as they arrive, and a base64 source past the
+    # cap is refused before the route can buffer it whole.
+    payload = json.dumps({"source": "A" * (cap + 1024), "filename": "big.pdf"}).encode()
+
+    async def chunks():
+        for start in range(0, len(payload), 4096):
+            yield payload[start : start + 4096]
+
+    response = await client.post(
+        "/v1/parse", content=chunks(), headers={"Content-Type": "application/json"}
+    )
+    assert response.status_code == 413
+    # A declared length past the cap is refused before a byte is read.
+    declared = await client.post(
+        "/v1/parse",
+        content=payload,
+        headers={"Content-Type": "application/json", "Content-Length": str(len(payload))},
+    )
+    assert declared.status_code == 413
+    # Under the ceiling, the route's own checks answer: 64 bytes of upload is the cap here.
+    small = base64.b64encode(b"%PDF-1.4 " + b"x" * 200).decode()
+    over = await client.post("/v1/parse", json={"source": small, "filename": "a.pdf"})
+    assert over.status_code == 413

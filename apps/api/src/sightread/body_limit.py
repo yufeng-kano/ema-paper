@@ -1,10 +1,11 @@
 """A ceiling on request bodies the API would otherwise buffer whole (docs/api.md).
 
 Uploads stream to disk under `UPLOAD_MAX_BYTES` and are not touched here: a multipart
-body is theirs. Everything else — JSON a route parses in memory, a document save above
-all — is refused past `JSON_BODY_MAX_BYTES`, by the declared length when there is one
-and by counting the bytes as they arrive when there is not, before any of it reaches
-the route.
+body on an upload route is theirs. Everything else — JSON a route parses in memory, a
+document save above all — is refused past `JSON_BODY_MAX_BYTES`, by the declared length
+when there is one and by counting the bytes as they arrive when there is not, before
+any of it reaches the route. The JSON form of `/v1/parse`, which `request.json()` holds
+whole, gets its own ceiling: the upload cap in base64 plus the envelope.
 """
 
 from __future__ import annotations
@@ -16,8 +17,10 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 TOO_LARGE = {"error": {"type": "invalid_request", "message": "The request body is too large"}}
 
 
-# The routes that stream their body to disk under UPLOAD_MAX_BYTES themselves.
-STREAMING_UPLOADS = frozenset({("POST", "/v1/parse"), ("POST", "/api/library/documents")})
+# The routes that stream a multipart body to disk under UPLOAD_MAX_BYTES themselves.
+PARSE_ROUTE = ("POST", "/v1/parse")
+STREAMING_UPLOADS = frozenset({PARSE_ROUTE, ("POST", "/api/library/documents")})
+MULTIPART = b"multipart/form-data"
 
 
 class BodyTooLarge(Exception):
@@ -26,22 +29,27 @@ class BodyTooLarge(Exception):
 
 
 class BodyLimitMiddleware:
-    def __init__(self, app: ASGIApp, *, max_bytes: int) -> None:
+    def __init__(self, app: ASGIApp, *, max_bytes: int, parse_json_max_bytes: int) -> None:
         self.app = app
         self.max_bytes = max_bytes
+        self.parse_json_max_bytes = parse_json_max_bytes
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
         headers = {key.lower(): value for key, value in scope.get("headers", [])}
-        if (scope.get("method"), scope.get("path")) in STREAMING_UPLOADS:
-            # The only routes that read a body without holding it (docs/api.md § POST
-            # /v1/parse); a multipart label on any other route buys no exemption.
+        route = (scope.get("method"), scope.get("path"))
+        content_type = headers.get(b"content-type", b"").lower()
+        if route in STREAMING_UPLOADS and content_type.startswith(MULTIPART):
+            # The only routes that read a body without holding it, and only their
+            # multipart form (docs/api.md § POST /v1/parse); a multipart label on any
+            # other route buys no exemption, and a JSON body on these is counted.
             await self.app(scope, receive, send)
             return
+        limit = self.parse_json_max_bytes if route == PARSE_ROUTE else self.max_bytes
         declared = headers.get(b"content-length", b"")
-        if declared.isdigit() and int(declared) > self.max_bytes:
+        if declared.isdigit() and int(declared) > limit:
             await _refuse(send)
             return
 
@@ -54,7 +62,7 @@ class BodyLimitMiddleware:
             message = await receive()
             if message["type"] == "http.request":
                 received += len(message.get("body", b""))
-                if received > self.max_bytes:
+                if received > limit:
                     overflowed = True
                     raise BodyTooLarge()
             return message

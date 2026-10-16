@@ -153,6 +153,12 @@ class Settings(BaseSettings):
         plus room for the envelope (docs/api.md). Uploads stream under their own cap."""
         return self.content_max_bytes * 2 + 65_536
 
+    @property
+    def parse_json_body_max_bytes(self) -> int:
+        """The largest JSON `/v1/parse` body: the upload cap in base64 (four bytes per
+        three, rounded up) plus room for the envelope (docs/api.md § POST /v1/parse)."""
+        return (self.upload_max_bytes + 2) // 3 * 4 + 65_536
+
     def web_url_for_locale(self, prefix: str) -> str:
         """`WEB_URL`, prefixed when the visitor picked a non-default locale.
 

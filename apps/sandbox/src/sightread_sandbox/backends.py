@@ -39,6 +39,9 @@ class UserSandbox:
     # A VM the runner could not stop after a timeout it could not end inside: no command
     # runs there until Docker reports it gone (docs/sandbox.md § The runner).
     unstoppable: bool = False
+    # A stop in progress: a kill inside the VM that fails then leaves the removal to it
+    # rather than starting a second one (docs/sandbox.md § The runner).
+    stopping: bool = False
 
 
 class Backend:
@@ -182,13 +185,21 @@ class Backend:
             await self._stop_locked(sandbox)
 
     async def _stop_locked(self, sandbox: UserSandbox) -> None:
-        """Close the shells and remove the VM — and confirm the removal: closing the
-        host-side clients ends nothing inside, so a removal that failed or timed out
-        leaves a VM that may still be writing the workspace. Such a sandbox is marked
-        unstoppable and takes no command until Docker positively reports it gone
-        (docs/sandbox.md § The runner)."""
-        for shell in sandbox.sessions.values():
-            await shell.close()
+        """End the shells and remove the VM — and confirm the removal: closing the
+        host-side clients ends nothing inside, so a shell running a command is killed
+        inside the VM first, by the pid the runner holds, and a removal that failed or
+        timed out still leaves a VM that may be writing the workspace. Such a sandbox
+        is marked unstoppable and takes no command until Docker positively reports it
+        gone (docs/sandbox.md § The runner)."""
+        sandbox.stopping = True
+        try:
+            for shell in sandbox.sessions.values():
+                if shell.busy:
+                    await shell.kill(locked=True)
+                else:
+                    await shell.close()
+        finally:
+            sandbox.stopping = False
         sandbox.sessions.clear()
         sandbox.session_used.clear()
         if not await self.stop_vm(sandbox) and not await self.is_gone(sandbox.user_id):
@@ -499,6 +510,8 @@ class DockerBackend(Backend):
                     out.strip(),
                 )
                 sandbox = self._user(user_id)
+                if sandbox.stopping:
+                    return  # the stop under way removes the VM, or marks it unstoppable
                 # The sandbox lock is not reentrant: a caller that holds it (restart)
                 # says so, and the stop runs under its hold rather than waiting forever.
                 async with sandbox.lock if not locked else contextlib.nullcontext():

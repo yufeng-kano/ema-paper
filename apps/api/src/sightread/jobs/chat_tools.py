@@ -278,7 +278,16 @@ def _edit_sync(
     except safe_io.UnsafeEntry:
         return ToolOutcome(f"{vm_path} is not a plain file", is_error=True)
     git.ensure_repo(root)
-    commit = git.commit_paths(root, author, f"{command} {vm_path}", [path.relative_to(root)])
+    try:
+        commit = git.commit_paths(root, author, f"{command} {vm_path}", [path.relative_to(root)])
+    except git.GitError:
+        # The file as it was: an edit with no revision would ride into a shell's next
+        # commit as someone else's change (docs/workspace.md § Revisions).
+        if before is None:
+            safe_io.remove_file(root, path)
+        else:
+            safe_io.write_text(root, path, before)
+        raise
     diff = _diff(before or "", after, vm_path)
     return ToolOutcome(
         f"{command} applied to {vm_path}",

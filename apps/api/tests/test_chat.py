@@ -19,6 +19,7 @@ from httpx import AsyncClient
 from sqlalchemy import select
 
 from sightread.db.models import (
+    AgentSetting,
     ChatEvent,
     ChatTurn,
     Conversation,
@@ -2004,3 +2005,72 @@ async def test_the_sandbox_client_takes_an_empty_success_answer(monkeypatch) -> 
     answers.append(httpx.Response(200, content=b"<html>"))
     with pytest.raises(sandbox_client.SandboxUnavailable):
         await client.stop(7)
+
+
+async def test_a_conversation_with_a_stored_model_needs_none_on_the_agent_page(chatting) -> None:
+    document_id = chatting.document_id
+    conversation_id = (
+        await chatting.post(
+            f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    async with chatting.app.state.sessionmaker() as db:
+        conversation = await db.get(Conversation, conversation_id)
+        conversation.model = "claude-stored"
+        setting = (
+            await db.execute(select(AgentSetting).where(AgentSetting.agent == "chat"))
+        ).scalar_one()
+        setting.model = None  # "Not set" on the Agent page
+        await db.commit()
+    accepted = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
+    )
+    assert accepted.status_code == 202, accepted.text
+    # A fresh conversation still needs one chosen.
+    fresh = (
+        await chatting.post(
+            f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    refused = await chatting.post(
+        f"/api/conversations/{fresh}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
+    )
+    assert refused.status_code == 400
+    thread = (await chatting.get(f"/api/conversations/{conversation_id}")).json()
+    assert thread["turns"][-1]["finished_at"] is None
+
+
+async def test_an_editor_write_whose_commit_fails_is_undone(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "ws" / "1"
+    (root / "files" / "d").mkdir(parents=True)
+    (root / "files" / "d" / "doc.md").write_text("alpha\nbeta\n")
+    git.ensure_repo(root)
+    git.commit_all(root, "user", "seed")
+
+    def failing(*args, **kwargs):
+        raise git.GitError("git is unwell")
+
+    monkeypatch.setattr(git, "commit_paths", failing)
+    replaced = await chat_tools.run_editor(
+        root,
+        {
+            "command": "str_replace",
+            "path": "/workspace/files/d/doc.md",
+            "old_str": "beta",
+            "new_str": "gamma",
+        },
+        "agent:1",
+        max_chars=1000,
+        max_bytes=1_000_000,
+    )
+    assert replaced.is_error
+    assert (root / "files" / "d" / "doc.md").read_text() == "alpha\nbeta\n"
+    created = await chat_tools.run_editor(
+        root,
+        {"command": "create", "path": "/workspace/files/d/new.md", "file_text": "x"},
+        "agent:1",
+        max_chars=1000,
+        max_bytes=1_000_000,
+    )
+    assert created.is_error
+    assert not (root / "files" / "d" / "new.md").exists()

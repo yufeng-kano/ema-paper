@@ -274,6 +274,9 @@ export interface ChatTurn {
   id: string
   status: TurnStatus
   error: string | null
+  /** Null while the turn is unfinished, whatever its status: a cancel marks the status
+   *  first and the writer winds down after (docs/chat.md § Conversations). */
+  finished_at: string | null
 }
 
 export interface ConversationResponse {

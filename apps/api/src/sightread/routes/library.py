@@ -724,28 +724,40 @@ async def file_job(body: DocumentFromJob, user: SessionUser, db: DbSession, sett
         await lock_job(db, job_id)
         return await sibling_names(db, user_id, folder_id)
 
-    try:
-        row = await insert_named(
-            db,
-            user_id=user_id,
-            build=lambda name: Document(
-                user_id=user_id, folder_id=folder_id, job_id=job_id, name=name
-            ),
-            taken=taken,
-            wanted=wanted,
-            limit=DOCUMENT_NAME_MAX,
-            message="A file with this name already exists here",
-        )
-    except ApiError:
-        # Same race as creating a folder: a destination deleted after the check above fails
-        # the foreign key, and that is a missing folder, not a name conflict.
-        if folder_id is None or await folder_exists(db, user_id, folder_id):
-            raise
-        raise ApiError(404, "invalid_request", "No such folder") from None
-    job = await job_of(db, job_id)
-    # The original went with the first document filed from this parse: this one takes
-    # a copy, so its pages render too (docs/workspace.md § Layout).
-    await workspace_documents.inherit_original(db, settings, row, job)
+    # One backup hold from before the row commits until its original is in place, as
+    # for an upload: a snapshot never carries the row without it (docs/workspace.md).
+    async with backup_shared(user_root(settings.workspaces_dir, user_id)):
+        try:
+            row = await insert_named(
+                db,
+                user_id=user_id,
+                build=lambda name: Document(
+                    user_id=user_id, folder_id=folder_id, job_id=job_id, name=name
+                ),
+                taken=taken,
+                wanted=wanted,
+                limit=DOCUMENT_NAME_MAX,
+                message="A file with this name already exists here",
+            )
+        except ApiError:
+            # Same race as creating a folder: a destination deleted after the check above
+            # fails the foreign key, and that is a missing folder, not a name conflict.
+            if folder_id is None or await folder_exists(db, user_id, folder_id):
+                raise
+            raise ApiError(404, "invalid_request", "No such folder") from None
+        job = await job_of(db, job_id)
+        # The original went with the first document filed from this parse: this one
+        # takes a copy, so its pages render too (docs/workspace.md § Layout). A copy that
+        # fails takes the row with it: no entry without the original it was promised.
+        try:
+            await workspace_documents.inherit_original(db, settings, row, job)
+        except Exception as exc:
+            logger.exception("could not copy the original for document %d", row.id)
+            await db.delete(row)
+            await db.commit()
+            raise ApiError(
+                409, "invalid_request", "The original could not be copied; nothing was filed"
+            ) from exc
     return document_payload(row, job)
 
 

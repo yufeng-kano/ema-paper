@@ -193,17 +193,19 @@ def _materialize_files(
     job: Job,
     result: Result,
     figures_dir: Path,
-) -> bool:
-    """Write what is missing. Returns whether anything was written (needs a commit)."""
+) -> list[Path]:
+    """Write what is missing. Returns the tracked files written (they need a commit)."""
     git.ensure_repo(paths.root)
     paths.check()
     try:
         safe_io.ensure_dir(paths.root, paths.directory)
     except safe_io.UnsafeEntry as exc:
         raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
-    changed = False
-    changed |= _write_if_missing(paths.root, paths.doc, result.markdown)
-    changed |= _write_if_missing(paths.root, paths.notes, "")
+    written: list[Path] = []
+    if _write_if_missing(paths.root, paths.doc, result.markdown):
+        written.append(paths.doc)
+    if _write_if_missing(paths.root, paths.notes, ""):
+        written.append(paths.notes)
     meta = {
         "document_id": document_id,
         "job_id": str(job.id),
@@ -212,7 +214,8 @@ def _materialize_files(
         "page_count": job.page_count,
         "kind": job.kind,
     }
-    changed |= _write_if_missing(paths.root, paths.meta, json.dumps(meta, indent=2) + "\n")
+    if _write_if_missing(paths.root, paths.meta, json.dumps(meta, indent=2) + "\n"):
+        written.append(paths.meta)
     parse = results_root(paths.root) / str(job.id) / "result.md"
     _write_if_missing(paths.root, parse, result.markdown)  # excluded from history
     original = original_of(paths.root, document_id)
@@ -229,7 +232,7 @@ def _materialize_files(
             if crop.is_file() and safe_io.entry_kind(paths.root, target) == "none":
                 with crop.open("rb") as reader:
                     safe_io.write_from(paths.root, target, reader)
-    return changed
+    return written
 
 
 async def materialize_document(
@@ -258,7 +261,7 @@ async def materialize_document(
         paths = await document_paths(db, settings, document)
         if safe_io.entry_kind(root, paths.directory) == "none":
             await ensure_within_quota(settings, root)
-        changed = await asyncio.to_thread(
+        written = await asyncio.to_thread(
             _materialize_files,
             paths,
             document_id=document.id,
@@ -266,14 +269,25 @@ async def materialize_document(
             result=result,
             figures_dir=Path(settings.figures_dir),
         )
-        if changed:
-            await asyncio.to_thread(
-                git.commit_paths,
-                paths.root,
-                git.USER_AUTHOR,
-                f"materialize {paths.relative}",
-                [paths.relative],
-            )
+        if written:
+            try:
+                await asyncio.to_thread(
+                    git.commit_paths,
+                    paths.root,
+                    git.USER_AUTHOR,
+                    f"materialize {paths.relative}",
+                    [paths.relative],
+                )
+            except git.GitError as exc:
+                # What was written goes again: files left in place would never be
+                # committed, since materialization writes only what is missing, and a
+                # shell's next commit would absorb them (docs/workspace.md § Revisions).
+                for path in written:
+                    with contextlib.suppress(OSError, safe_io.UnsafeEntry):
+                        safe_io.remove_file(paths.root, path)
+                raise ApiError(
+                    409, "invalid_request", "The document could not be recorded; try again"
+                ) from exc
     return paths
 
 
@@ -372,13 +386,26 @@ async def inherit_original(
     worker left it for a row that had not landed), takes the upload as `adopt_source`
     does (docs/workspace.md § Layout)."""
     root = user_root(settings.workspaces_dir, document.user_id)
-    siblings = (
-        await db.execute(
-            select(Document.id)
-            .where(Document.job_id == job.id, Document.id != document.id)
-            .order_by(Document.id)
-        )
-    ).scalars()
+    siblings = list(
+        (
+            await db.execute(
+                select(Document.id)
+                .where(Document.job_id == job.id, Document.id != document.id)
+                .order_by(Document.id)
+            )
+        ).scalars()
+    )
+    if siblings:
+        # Every copy counts: a full workspace keeps no further one (§ Quota).
+        try:
+            await ensure_within_quota(settings, root)
+        except ApiError:
+            logger.warning(
+                "workspace of user %d is at its quota; document %d keeps no original",
+                document.user_id,
+                document.id,
+            )
+            return
     for sibling_id in siblings:
         if await asyncio.to_thread(_copy_original, root, sibling_id, document.id):
             return
@@ -456,10 +483,15 @@ def _read(paths: DocumentPaths, max_bytes: int, *, document_id: int) -> Content:
 async def read_content(
     db: AsyncSession, settings: Settings, document: Document, *, locked: bool = False
 ) -> Content:
-    paths = await materialize_document(db, settings, document, locked=locked)
-    return await asyncio.to_thread(
-        _read, paths, settings.content_max_bytes, document_id=document.id
-    )
+    """The lock is held from the materialization through the read: a shell command
+    taking it in between could move the directory or rewrite `doc.md` under the read
+    (docs/workspace.md § Revisions)."""
+    root = user_root(settings.workspaces_dir, document.user_id)
+    async with contextlib.nullcontext() if locked else workspace_lock(root):
+        paths = await materialize_document(db, settings, document, locked=True)
+        return await asyncio.to_thread(
+            _read, paths, settings.content_max_bytes, document_id=document.id
+        )
 
 
 def _write_file(
@@ -479,7 +511,15 @@ def _write_file(
         raise ApiError(409, "invalid_request", "The file changed since it was loaded")
     if text != current:
         _write_text(paths.root, path, text)
-        git.commit_paths(paths.root, author, message, [path.relative_to(paths.root)])
+        try:
+            git.commit_paths(paths.root, author, message, [path.relative_to(paths.root)])
+        except git.GitError as exc:
+            # The file as it was: a save with no revision is not a save
+            # (docs/workspace.md § Revisions).
+            _write_text(paths.root, path, current)
+            raise ApiError(
+                409, "invalid_request", "The save could not be recorded; the file is as it was"
+            ) from exc
     return revision_of(text)
 
 
