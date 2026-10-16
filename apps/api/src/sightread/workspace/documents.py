@@ -456,7 +456,9 @@ async def adopt_source(
     """The library row arrived after its parse finished, so the worker found no document
     to keep the upload for and left it in place — or the parse was answered from the
     cache, or joined one already on its way, and `upload` is the fresh file this row keeps
-    for itself (docs/jobs.md § Retention): take it now."""
+    for itself (docs/jobs.md § Retention): take it now. A copy that fails leaves nothing
+    behind — the original and the shell's copy go — since the caller deletes the row
+    and no file may stay for a row that is gone (docs/workspace.md § Layout)."""
     if upload is not None:
         source = upload
     else:
@@ -479,12 +481,30 @@ async def adopt_source(
         except ApiError:
             source.unlink(missing_ok=True)
         else:
-            await asyncio.to_thread(
-                keep_source, root, relative, source, document_id=document.id, kind=job.kind
-            )
+            try:
+                await asyncio.to_thread(
+                    keep_source, root, relative, source, document_id=document.id, kind=job.kind
+                )
+            except Exception:
+                await asyncio.to_thread(
+                    _undo_adoption,
+                    root,
+                    document.id,
+                    root / relative,
+                    _source_suffix(source, job.kind),
+                )
+                raise
     if upload is None:
         job.source_deleted_at = utcnow()
         await db.commit()
+
+
+def _undo_adoption(root: Path, document_id: int, directory: Path, suffix: str) -> None:
+    _discard_originals(root, [document_id])
+    with contextlib.suppress(OSError, safe_io.UnsafeEntry):
+        safe_io.remove_file(root, directory / f"{SOURCE_STEM}{suffix}")
+    with contextlib.suppress(OSError):
+        directory.rmdir()  # only when the copy was all it held
 
 
 # --- content ------------------------------------------------------------------------------

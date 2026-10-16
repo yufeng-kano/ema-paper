@@ -271,19 +271,25 @@ async def claim_next_job(
     return job_id if updated.rowcount == 1 else None
 
 
-async def requeue_job(db: AsyncSession, job_id: uuid.UUID) -> None:
+async def requeue_job(db: AsyncSession, job_id: uuid.UUID) -> bool:
     """Put an interrupted job back on the queue and forget its partial progress.
 
     Shutdown mid-run reparses from scratch: pages are not individually resumable, and a
-    reparse is cheaper to reason about than a half-written result.
+    reparse is cheaper to reason about than a half-written result. False when the job
+    was no longer `running` — its result committed before the cancel landed — and so
+    stays as it is, its pages and crops with it.
     """
-    await db.execute(delete(JobPage).where(JobPage.job_id == job_id))
-    await db.execute(
-        update(Job)
-        .where(Job.id == job_id, Job.status == "running")
-        .values(status="queued", started_at=None, pages_done=0)
-    )
+    requeued = (
+        await db.execute(
+            update(Job)
+            .where(Job.id == job_id, Job.status == "running")
+            .values(status="queued", started_at=None, pages_done=0)
+        )
+    ).rowcount > 0
+    if requeued:
+        await db.execute(delete(JobPage).where(JobPage.job_id == job_id))
     await db.commit()
+    return requeued
 
 
 # --- chat turns (docs/jobs.md § Chat turns) ----------------------------------------------

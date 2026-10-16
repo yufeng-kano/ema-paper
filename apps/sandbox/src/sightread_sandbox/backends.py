@@ -232,8 +232,11 @@ class Backend:
         for user_id, sandbox in list(self._users.items()):
             if not self._idle(sandbox) or sandbox.lock.locked():
                 continue
-            if not await self.is_running(user_id):
-                continue
+            try:
+                if not await self.is_running(user_id):
+                    continue
+            except RuntimeError:
+                continue  # Docker cannot be asked now; the sweep goes on
             async with sandbox.lock:
                 # Decided again under the lock: an exec that slipped in since the look
                 # above has marked its shell busy, and must not have its VM pulled away.
@@ -427,10 +430,17 @@ class DockerBackend(Backend):
             logger.info("adopted %d running sandboxes", len(self._users))
 
     async def is_running(self, user_id: int) -> bool:
+        """Whether the VM is up, from Docker itself; an inspection that fails for any
+        reason but the VM's absence (the daemon away, a timeout) raises rather than
+        answering stopped, so a status is never a usable sandbox nothing can start."""
         code, out = await _docker(
             "inspect", "-f", "{{.State.Running}}", self.container(user_id), timeout=20
         )
-        return code == 0 and out.strip() == "true"
+        if code == 0:
+            return out.strip() == "true"
+        if "No such object" in out or "No such container" in out:
+            return False
+        raise RuntimeError(f"could not inspect the sandbox VM: {out.strip()}")
 
     async def is_gone(self, user_id: int) -> bool:
         code, out = await _docker(

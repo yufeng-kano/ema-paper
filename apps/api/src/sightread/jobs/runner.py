@@ -438,6 +438,22 @@ async def _record_page(
         await db.commit()
 
 
+async def _to_the_end(coro) -> None:
+    """Await `coro` so that a cancel of the caller waits for it instead of interrupting
+    it; the cancel is raised once it is done. For the finalization of a committed result
+    (docs/jobs.md § Retention): the row is `succeeded`, so a shutdown's requeue would
+    not take it back, and what is half-copied under a lock that a cancel released would
+    be nobody's to finish."""
+    task = asyncio.ensure_future(coro)
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await asyncio.wait({task})
+        if not task.cancelled() and task.exception() is not None:
+            logger.error("finalization failed during shutdown", exc_info=task.exception())
+        raise
+
+
 async def _finish(
     sessionmaker: async_sessionmaker[AsyncSession],
     job_id: uuid.UUID,
@@ -725,39 +741,44 @@ async def run_job(
         # commit itself failed, the crops leak (bounded, harmless) instead of a succeeded
         # job losing its images.
         succeeded = True
-        await _finish(
-            sessionmaker,
-            job_id,
-            status="succeeded",
-            settings=settings,
-            result={
-                "markdown": document.markdown,
-                "pages": [
-                    {
-                        "page": outcome.page,
-                        "width_pt": round(outcome.width_pt, 2),
-                        "height_pt": round(outcome.height_pt, 2),
-                        "method": outcome.method,
-                        "error": outcome.error,
-                    }
-                    for outcome in outcomes
-                ],
-                "figures": document.figures,
-                "errors": [
-                    {"page": outcome.page, "reason": outcome.error}
-                    for outcome in outcomes
-                    if outcome.error
-                ],
-                "meta": {
-                    "job_id": str(job.id),
-                    "agent": job.agent,
-                    "model": job.model,
-                    "bbox_format": job.bbox_format,
-                    "pipeline_version": job.pipeline_version,
-                    "sha256": job.sha256,
-                    "cached": False,
+        # And run to its end whatever the worker does: a cancel landing after the commit
+        # would otherwise drop the workspace and backup locks under a copy still being
+        # made, and hand the worker a job to requeue that is already done.
+        await _to_the_end(
+            _finish(
+                sessionmaker,
+                job_id,
+                status="succeeded",
+                settings=settings,
+                result={
+                    "markdown": document.markdown,
+                    "pages": [
+                        {
+                            "page": outcome.page,
+                            "width_pt": round(outcome.width_pt, 2),
+                            "height_pt": round(outcome.height_pt, 2),
+                            "method": outcome.method,
+                            "error": outcome.error,
+                        }
+                        for outcome in outcomes
+                    ],
+                    "figures": document.figures,
+                    "errors": [
+                        {"page": outcome.page, "reason": outcome.error}
+                        for outcome in outcomes
+                        if outcome.error
+                    ],
+                    "meta": {
+                        "job_id": str(job.id),
+                        "agent": job.agent,
+                        "model": job.model,
+                        "bbox_format": job.bbox_format,
+                        "pipeline_version": job.pipeline_version,
+                        "sha256": job.sha256,
+                        "cached": False,
+                    },
                 },
-            },
+            )
         )
     finally:
         if not succeeded:

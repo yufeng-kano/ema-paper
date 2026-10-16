@@ -28,6 +28,25 @@ pytestmark = pytest.mark.skipif(
 )
 
 API_DIR = Path(__file__).resolve().parents[1]
+
+
+def test_the_name_migration_suffix_keeps_counting_past_a_column_long_extension() -> None:
+    """A legacy extension nearly as long as the column leaves no room for a stem; the
+    candidates must still change with the counter, or the upgrade never ends."""
+    import importlib.util
+
+    path = API_DIR / "migrations" / "versions" / "c8f28f7cd45e_normalize_library_names.py"
+    spec = importlib.util.spec_from_file_location("normalize_library_names", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    extension = "x" * 253
+    name = f"a.{extension}"
+    taken = {name, f" (2).{extension}"[:255]}
+    chosen = module._free(taken, name, 255)
+    assert chosen not in taken and len(chosen) <= 255 and chosen.startswith(" (3).")
+
+
 BEFORE_COST_SOURCE = "cd77f4fe600f"
 COST_SOURCE = "5f1845730aa0"
 

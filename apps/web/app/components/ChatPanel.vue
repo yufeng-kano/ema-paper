@@ -297,10 +297,12 @@ async function loadDetail(id: number) {
     }
     messages.value = [...detail.messages].sort((left, right) => left.id - right.id)
     turns.value = [...detail.turns]
-    if (turns.value.some(isLive)) {
-      // A turn still unfinished is followed from here: a stream dropped before
-      // its turn_start would otherwise never be reopened (docs/web.md).
-      stream.expectTurn()
+    const live = turns.value.find(isLive)
+    if (live) {
+      // A turn still unfinished is followed from here, by its id: a stream dropped
+      // before its turn_start would otherwise never be reopened, and the replayed
+      // terminal events of earlier turns must not end the wait (docs/web.md).
+      stream.expectTurn(live.id)
     }
     conversations.value = conversations.value.map((row) =>
       row.id === id ? { ...row, title: detail.conversation.title, updated_at: detail.conversation.updated_at } : row,
@@ -798,7 +800,7 @@ async function send() {
     turns.value = [...turns.value, { id: turn_id, status: 'queued', error: null, finished_at: null }]
     draft.value = ''
     selection.value = null
-    stream.expectTurn()
+    stream.expectTurn(turn_id)
   } catch (error) {
     composerError.value = await resolve(error)
   } finally {

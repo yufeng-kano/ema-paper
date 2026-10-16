@@ -153,12 +153,17 @@ async def run_worker(stop: asyncio.Event) -> None:
                 running.cancel()
                 await asyncio.gather(running, return_exceptions=True)
                 async with sessionmaker() as db:
-                    await requeue_job(db, job_id)
-                # Backstop only: `run_job`'s own finally already discarded this attempt's
-                # crops, waiting out any crop thread under the guard — by the time the
-                # cancelled task has been gathered above, nothing can write them back.
-                discard_job_figures(Path(settings.figures_dir), job_id)
-                logger.info("requeued job %s on shutdown", job_id)
+                    requeued = await requeue_job(db, job_id)
+                if requeued:
+                    # Backstop only: `run_job`'s own finally already discarded this
+                    # attempt's crops, waiting out any crop thread under the guard — by
+                    # the time the cancelled task has been gathered above, nothing can
+                    # write them back. A job whose result was committed before the cancel
+                    # landed is not requeued, and keeps its crops (docs/jobs.md).
+                    discard_job_figures(Path(settings.figures_dir), job_id)
+                    logger.info("requeued job %s on shutdown", job_id)
+                else:
+                    logger.info("job %s finished before the shutdown reached it", job_id)
     finally:
         sweeper.cancel()
         await asyncio.gather(sweeper, return_exceptions=True)

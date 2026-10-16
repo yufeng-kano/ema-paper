@@ -104,7 +104,7 @@ doc.md keeps these shapes; never remove or reorder them unless asked:
 
 # Tools
 
-- bash: a persistent shell in the VM — the working directory and exported variables carry over between commands; shell functions and unexported variables do not, and stdin is /dev/null. uv, python, poppler (pdftoppm, pdftotext), ripgrep, jq, pandoc and imagemagick are installed. There is no network except the package index, so `uv add` works and nothing else does. A command returns when it and any background jobs it started have finished, and anything still running at that point is killed — nothing survives from one command to the next. A server you need to talk to must be started, used and stopped within one command.
+- bash: a persistent shell in the VM — the working directory and exported variables carry over between commands; shell functions and unexported variables do not, and stdin is /dev/null. uv, python, poppler (pdftoppm, pdftotext), ripgrep, jq, pandoc and imagemagick are installed. {network} A command returns when it and any background jobs it started have finished, and anything still running at that point is killed — nothing survives from one command to the next. A server you need to talk to must be started, used and stopped within one command.
 - str_replace_based_edit_tool: view, str_replace, insert and create on files under /workspace. Use it for every change to doc.md and notes.md: the user sees each edit as a diff and can revert it. Do not rewrite a whole file to change one line.
 - view_page: the rendered image of one page of the original. Use it before changing any number, formula, table cell or name, and whenever the transcription reads oddly. The page is the truth; doc.md is a transcription of it.
 - view_figure: one figure crop at full resolution.
@@ -128,6 +128,7 @@ PROMPT_TOKENS: tuple[str, ...] = (
     "{page_count}",
     "{bbox_format}",
     "{parse_model}",
+    "{network}",
     "{locale}",
 )
 
@@ -138,6 +139,22 @@ _TOKEN_RE = re.compile("|".join(re.escape(token) for token in PROMPT_TOKENS))
 # A tool's line in the prompt's tool list: dropped when the tool is not enabled for the
 # turn (no sandbox runner, no `bash`), so the model is never told of a shell it lacks.
 _TOOL_LINE_RE = re.compile(r"^- (bash|str_replace_based_edit_tool|view_page|view_figure):")
+
+
+# What the VM can reach, by the runner's `SANDBOX_NETWORK` (docs/sandbox.md § Isolation):
+# the prompt never promises `uv add` on a deployment whose VM has no route to an index.
+NETWORK_WITH_INDEX = (
+    "There is no network except the package index, so `uv add` works and nothing else does."
+)
+NETWORK_NONE = (
+    "There is no network at all: `uv add` and anything else that reaches out fails, "
+    "so work with what is installed."
+)
+
+
+def network_note(sandbox_network: str) -> str:
+    """The `{network}` fact: what the shell can reach, from the runner's own setting."""
+    return NETWORK_NONE if sandbox_network == "none" else NETWORK_WITH_INDEX
 
 
 def render_system_prompt(

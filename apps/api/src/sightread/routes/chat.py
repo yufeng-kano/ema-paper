@@ -129,10 +129,16 @@ async def create_conversation(
     return conversation_payload(row)
 
 
+# What the stored selection block says before the passage (docs/chat.md § Prompt caching).
+SELECTION_PREFIX = "The passage selected in the document:\n\n"
+
+
 def display_content(content: list) -> list:
     """The blocks as the panel draws them: an image — a page or a figure a tool returned,
     stored for the model's replay — is sent without its bytes, which the panel never
-    renders and a long thread would otherwise carry by the hundred megabytes
+    renders and a long thread would otherwise carry by the hundred megabytes; the
+    selection block is sent as the passage alone, without the line that introduces it
+    to the model, so the note the panel shows counts the selection and nothing else
     (docs/api.md § Chat)."""
     shown = []
     for block in content:
@@ -142,6 +148,8 @@ def display_content(content: list) -> list:
             shown.append({"type": "image"})
         elif block.get("type") == "tool_result" and isinstance(block.get("content"), list):
             shown.append({**block, "content": display_content(block["content"])})
+        elif block.get("context") == "selection" and isinstance(block.get("text"), str):
+            shown.append({**block, "text": block["text"].removeprefix(SELECTION_PREFIX)})
         else:
             shown.append(block)
     return shown
@@ -316,7 +324,7 @@ async def post_message(
         content.append(
             {
                 "type": "text",
-                "text": f"The passage selected in the document:\n\n{selection}",
+                "text": f"{SELECTION_PREFIX}{selection}",
                 "context": "selection",
             }
         )

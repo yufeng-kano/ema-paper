@@ -691,6 +691,41 @@ async def test_a_parse_filed_again_takes_a_copy_of_its_original(
     assert original_of(root, uploaded["id"]) == original
 
 
+async def test_an_upload_whose_original_cannot_be_kept_files_nothing(
+    make_client, sessionmaker, documents, tmp_path, monkeypatch
+) -> None:
+    from sightread.workspace import documents as workspace_documents
+    from sightread.workspace.documents import original_of
+    from sightread.workspace.layout import sources_dir
+
+    library = make_client(workspaces_dir=str(tmp_path / "ws"))
+    await _ready_to_parse(library)
+    first = (await _upload(library, documents)).json()
+    async with sessionmaker() as db:
+        row = await db.get(Document, first["id"])
+        root = user_root(library.app.state.settings.workspaces_dir, row.user_id)
+
+    def failing(*args, **kwargs):
+        raise OSError("disk unwell")
+
+    # The second upload of the same bytes is a dedup hit that keeps its own fresh copy;
+    # the copy fails, and the row it was for goes with it — no entry without its original,
+    # and nothing of the copy left on disk.
+    monkeypatch.setattr(workspace_documents, "keep_source", failing)
+    refused = await _upload(library, documents)
+    assert refused.status_code == 409, refused.text
+    assert [row["name"] for row in (await _read(library))["documents"]] == ["tiny.png"]
+    assert not (root / "files" / "tiny (2).png").exists()
+    # The first upload's own original comes with its parse, which no worker ran here:
+    # nothing at all is kept, least of all under the id of the row that is gone.
+    assert not sources_dir(root).exists() or os.listdir(sources_dir(root)) == []
+    # A retry files it, under the same name — no suffixed twin of a failed request.
+    monkeypatch.undo()
+    again = (await _upload(library, documents)).json()
+    assert again["name"] == "tiny (2).png"
+    assert original_of(root, again["id"]) is not None
+
+
 async def test_filing_again_at_the_quota_keeps_no_copy_and_a_failed_copy_files_nothing(
     make_client, sessionmaker, documents, tmp_path, monkeypatch
 ) -> None:

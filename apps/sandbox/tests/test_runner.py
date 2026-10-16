@@ -833,3 +833,41 @@ async def test_a_stale_vm_is_removed_within_the_configured_timeout(tmp_path, mon
     backend = backends.DockerBackend(settings)
     await backend.ensure_running(backend._user(81))
     assert timeouts["rm"] == 444
+
+
+async def test_a_vm_docker_cannot_inspect_is_unavailable_not_stopped(tmp_path, monkeypatch) -> None:
+    from sightread_sandbox import backends
+
+    answer = {"out": (1, "Cannot connect to the Docker daemon")}
+
+    async def fake_docker(*args, timeout=120.0):
+        if args[0] == "inspect":
+            return answer["out"]
+        return 0, ""
+
+    monkeypatch.setattr(backends, "_docker", fake_docker)
+    settings = Settings(
+        app_env="local",
+        sandbox_token=TOKEN,
+        sandbox_backend="docker",
+        sandbox_runtime="runc",
+        sandbox_idle_seconds=0,
+        sandbox_workspaces_dir=str(tmp_path / "ws"),
+        sandbox_workspaces_mount=str(tmp_path / "ws"),
+    )
+    backend = backends.DockerBackend(settings)
+    # The daemon away, or an inspection that timed out: unknown, never a stopped VM the
+    # dashboard would offer to start.
+    with pytest.raises(RuntimeError):
+        await backend.is_running(7)
+    app = create_app(settings, backend)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://runner") as http:
+        http.headers["Authorization"] = f"Bearer {TOKEN}"
+        assert (await http.get("/sandboxes/7")).status_code == 503
+        # Docker's own "no such" is a positive absence: stopped.
+        answer["out"] = (1, "Error: No such object: sightread-sandbox-7")
+        assert (await http.get("/sandboxes/7")).json()["state"] == "stopped"
+    # The idle sweep skips what it cannot ask about and goes on.
+    answer["out"] = (1, "docker timed out")
+    backend._user(7).last_used = 0
+    assert await backend.stop_idle() == 0

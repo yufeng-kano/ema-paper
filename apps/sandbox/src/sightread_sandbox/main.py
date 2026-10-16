@@ -78,7 +78,11 @@ def create_app(settings: Settings | None = None, backend: Backend | None = None)
 
     @app.get("/sandboxes/{user_id}", dependencies=guard)
     async def sandbox_status(user_id: int) -> dict:
-        return await backend.status(user_id)
+        try:
+            return await backend.status(user_id)
+        except RuntimeError as exc:
+            # Docker could not say: unavailable, never a stopped VM nothing can start.
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
 
     @app.post("/sandboxes/{user_id}/exec", dependencies=guard)
     async def sandbox_exec(user_id: int, body: ExecBody) -> dict:

@@ -24,7 +24,7 @@ from fastapi import APIRouter, Request, Response, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import ColumnElement, delete, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.datastructures import FormData, UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser
@@ -749,8 +749,22 @@ async def upload_document(
         job = await job_of(db, job_id)
         # The parse may already be done (the worker then left the upload for this row),
         # or answered from the cache or joined in flight (the fresh upload is this row's
-        # to keep).
-        await workspace_documents.adopt_source(db, settings, row, job, upload=submission.upload)
+        # to keep). A copy that fails takes the row with it, as filing from the history
+        # does: no entry without the original it was promised, and no suffixed twin
+        # from the browser's retry of a request that in fact failed.
+        try:
+            await workspace_documents.adopt_source(db, settings, row, job, upload=submission.upload)
+        except InvalidRequestError:
+            raise ApiError(
+                404, "invalid_request", "The file was deleted while it was being filed"
+            ) from None
+        except Exception as exc:
+            logger.exception("could not keep the upload for document %d", row.id)
+            await db.delete(row)
+            await db.commit()
+            raise ApiError(
+                409, "invalid_request", "The upload could not be kept; nothing was filed"
+            ) from exc
     return document_payload(row, job)
 
 

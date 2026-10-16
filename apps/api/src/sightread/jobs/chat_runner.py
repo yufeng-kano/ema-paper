@@ -164,6 +164,7 @@ async def _load(
         "page_count": str(job.page_count or 1),
         "bbox_format": job.bbox_format,
         "parse_model": job.model,
+        "network": chat_agent.network_note(settings.sandbox_network),
         "locale": turn.locale or "en",
     }
     sandbox = SandboxClient(settings) if settings.sandbox_configured else None

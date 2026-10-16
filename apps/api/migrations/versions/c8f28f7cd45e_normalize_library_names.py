@@ -44,7 +44,10 @@ def _free(taken: set[str], name: str, limit: int) -> str:
     while True:
         suffix = f" ({index}){dot}{extension}"
         room = limit - len(suffix)
-        candidate = f"{stem[:room]}{suffix}" if room > 0 else suffix[-limit:]
+        # No room for a stem (a legacy extension nearly as long as the column): the
+        # extension gives way, never the counter, so each try is a new candidate and
+        # the loop ends.
+        candidate = f"{stem[:room]}{suffix}" if room > 0 else suffix[:limit]
         if candidate not in taken:
             return candidate
         index += 1

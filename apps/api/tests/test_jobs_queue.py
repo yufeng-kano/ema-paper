@@ -221,10 +221,19 @@ async def test_requeue_forgets_partial_progress(sessionmaker) -> None:
         job_id = job.id
 
     async with sessionmaker() as db:
-        await requeue_job(db, job_id)
+        assert await requeue_job(db, job_id) is True
     async with sessionmaker() as db:
         requeued = await db.get(Job, job_id)
         assert (requeued.status, requeued.pages_done, requeued.started_at) == ("queued", 0, None)
+        # A job whose result was committed before the shutdown's cancel landed is not
+        # requeued, and the worker leaves its crops alone (docs/jobs.md § Retention).
+        requeued.status = "succeeded"
+        requeued.pages_done = 3
+        await db.commit()
+    async with sessionmaker() as db:
+        assert await requeue_job(db, job_id) is False
+        done = await db.get(Job, job_id)
+        assert (done.status, done.pages_done) == ("succeeded", 3)
 
 
 @postgres_only

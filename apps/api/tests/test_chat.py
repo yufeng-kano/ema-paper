@@ -2204,6 +2204,43 @@ def test_the_prompt_lists_only_the_tools_the_turn_has() -> None:
     assert "- bash:" in chat_agent.render_system_prompt(chat_agent.DEFAULT_SYSTEM_PROMPT, facts)
 
 
+def test_the_prompt_promises_uv_add_only_where_the_vm_has_an_index() -> None:
+    from sightread.agents import chat as chat_agent
+
+    # The runner's own setting decides: `none` is the shipped default on both examples.
+    assert "no network at all" in chat_agent.network_note("none")
+    assert "`uv add` works" not in chat_agent.network_note("none")
+    assert "`uv add` works" in chat_agent.network_note("pypi-proxy")
+    rendered = chat_agent.render_system_prompt(
+        chat_agent.DEFAULT_SYSTEM_PROMPT, {"network": chat_agent.network_note("none")}
+    )
+    assert "no network at all" in rendered and "{network}" not in rendered
+
+
+async def test_the_panel_gets_the_selection_without_its_scaffolding(chatting) -> None:
+    document_id = chatting.document_id
+    conversation_id = (
+        await chatting.post(
+            f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    sent = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"text": "Fix the Greedy row", "selection": "| Greedy | 3450 |"},
+        headers=CSRF_HEADERS,
+    )
+    assert sent.status_code == 202, sent.text
+    detail = (await chatting.get(f"/api/conversations/{conversation_id}")).json()
+    blocks = detail["messages"][0]["content"]
+    assert blocks[0] == {"type": "text", "text": "Fix the Greedy row"}
+    # The passage alone: the panel's note counts the selection, not the line that
+    # introduces it to the model, which the stored row keeps.
+    assert blocks[1] == {"type": "text", "text": "| Greedy | 3450 |", "context": "selection"}
+    async with chatting.app.state.sessionmaker() as db:
+        stored = (await db.execute(select(Message))).scalars().one()
+        assert stored.content[1]["text"].startswith("The passage selected in the document:")
+
+
 async def test_a_revert_is_refused_before_it_materializes(chatting) -> None:
     document_id = chatting.document_id
     settings = chatting.app.state.settings

@@ -24,10 +24,13 @@ const RETRY_CAP_MS = 10000
  * reconnect from the last seen sequence while a turn is in flight (a real drop, mid-turn).
  *
  * "In flight" is what the stream has seen — `turn_start` opens it, `turn_done` and
- * `turn_error` close it — plus `expectTurn()`, which the panel calls the moment it has
- * posted a message, so a stream that the server closed a beat before the turn was queued
- * is reopened rather than left idle. A turn the server never starts is not waited on
- * forever: a run of drops with no event between them gives up.
+ * `turn_error` close it — plus `expectTurn(id)`, which the panel calls the moment it has
+ * posted a message (and on load, for a turn the record lists as unfinished), so a stream
+ * that the server closed a beat before the turn was queued is reopened rather than left
+ * idle. The turn in flight is known by id: a replay from 0 hands back the terminal events
+ * of every earlier turn first, and those must not end the wait for the one still going.
+ * A turn the server never starts is not waited on forever: a run of drops with no event
+ * between them gives up.
  */
 export function useConversationStream(
   onEvent: (frame: StreamedEvent) => void,
@@ -39,6 +42,9 @@ export function useConversationStream(
   const connected = ref(false)
   /** A turn is in flight as far as the stream knows. */
   const active = ref(false)
+  /** Which one: the id `turn_start` or `expectTurn` named, so a replayed older turn's
+   *  `turn_done` does not close the wait for it. */
+  let expected: string | null = null
 
   let conversationId: number | null = null
   let source: EventSource | null = null
@@ -95,10 +101,13 @@ export function useConversationStream(
           lastSeq.value = seq
         }
         silentRetries = 0
+        const turnId = typeof data.turn_id === 'string' ? data.turn_id : null
         if (name === 'turn_start') {
           active.value = true
-        } else if (name === 'turn_done' || name === 'turn_error') {
+          expected = turnId
+        } else if ((name === 'turn_done' || name === 'turn_error') && (expected === null || turnId === expected)) {
           active.value = false
+          expected = null
         }
         onEvent({ seq: lastSeq.value, event: { ...data, event: name } as ChatEvent })
       })
@@ -134,6 +143,7 @@ export function useConversationStream(
     conversationId = id
     lastSeq.value = after
     active.value = false
+    expected = null
     silentRetries = 0
     connect()
   }
@@ -149,9 +159,11 @@ export function useConversationStream(
     connect()
   }
 
-  /** A turn was just queued: the stream must be up, and a close now is a drop, not idleness. */
-  function expectTurn() {
+  /** A turn was just queued, or the record lists one unfinished: the stream must be up,
+   *  and a close now is a drop, not idleness, until that turn's own terminal event. */
+  function expectTurn(turnId: string) {
     active.value = true
+    expected = turnId
     silentRetries = 0
     if (!source && retryTimer === null) {
       connect()
@@ -162,6 +174,7 @@ export function useConversationStream(
     disconnect()
     conversationId = null
     active.value = false
+    expected = null
   }
 
   onBeforeUnmount(close)
