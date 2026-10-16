@@ -662,3 +662,53 @@ async def test_the_vm_scratch_size_comes_from_settings(tmp_path, monkeypatch) ->
     run = next(args for args in calls if args[0] == "run")
     assert "/tmp:rw,exec,size=256m" in run  # noqa: S108 - the VM scratch, not the host
     assert "size=1g" not in " ".join(run)
+
+
+def test_the_vm_sweep_repeats_until_nothing_but_the_shells_is_left(tmp_path) -> None:
+    """The sweep against a fake process table: `ps` and `kill` on PATH read and change a
+    file, and killing the forker spawns a child the first snapshot never saw."""
+    import os
+    import subprocess
+
+    from sightread_sandbox.backends import VM_SWEEP
+
+    state = tmp_path / "procs"
+    # pid ppid stat: init, the exec root (ppid 0), the live supervisor, a leftover that
+    # forks on death, a detached job, and a zombie waiting for pid 1.
+    state.write_text("1 0 S\n10 0 S\n20 10 S\n30 20 S\n40 1 S\n50 1 Z\n")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "ps").write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = -o ]; then grep "^$4 " "$FAKE_PROCS" | cut -d" " -f2; exit 0; fi\n'
+        'cut -d" " -f1,3 "$FAKE_PROCS"\n'
+    )
+    (bin_dir / "kill").write_text(
+        "#!/bin/sh\n"
+        'pid="$2"\n'
+        'grep -q "^$pid " "$FAKE_PROCS" || exit 1\n'
+        'grep -v "^$pid " "$FAKE_PROCS" > "$FAKE_PROCS.new"; mv "$FAKE_PROCS.new" "$FAKE_PROCS"\n'
+        '[ "$pid" = 30 ] && echo "31 1 S" >> "$FAKE_PROCS"\n'
+        'echo "$pid" >> "$FAKE_PROCS.killed"\n'
+        "exit 0\n"
+    )
+    for script in ("ps", "kill"):
+        os.chmod(bin_dir / script, 0o700)
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "FAKE_PROCS": str(state)}
+    # `kill` is the shell's builtin: the sweep takes the fake through `$__sr_kill`.
+    script = (
+        f'__sr_keep_in="20"\n__sr_kill="{bin_dir / "kill"}"\n{VM_SWEEP}\n'
+        'echo "LEFT=$__sr_left PASS=$__sr_pass"'
+    )
+    done = subprocess.run(  # noqa: S603
+        ["sh", "-c", script],  # noqa: S607
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+    assert "LEFT=0" in done.stdout
+    assert int(done.stdout.split("PASS=")[1]) >= 2  # the late child took a second pass
+    killed = sorted(int(pid) for pid in (tmp_path / "procs.killed").read_text().split())
+    assert killed == [30, 31, 40]
+    assert sorted(state.read_text().split("\n")[:-1]) == ["1 0 S", "10 0 S", "20 10 S", "50 1 Z"]

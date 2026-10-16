@@ -161,18 +161,21 @@ async def _load(
         "parse_model": job.model,
         "locale": turn.locale or "en",
     }
+    sandbox = SandboxClient(settings) if settings.sandbox_configured else None
+    tools = list(chat_agent.TOOLS if sandbox is not None else chat_agent.TOOLS_WITHOUT_BASH)
     system = [
         {
             "type": "text",
-            "text": chat_agent.render_system_prompt(CHAT.default_prompt_template, facts),
+            # The tool list as the turn has it: no `bash` line without a runner.
+            "text": chat_agent.render_system_prompt(
+                CHAT.default_prompt_template, facts, tools=[tool["name"] for tool in tools]
+            ),
         }
     ]
     if preset is not None and preset.text.strip():
         system.append({"type": "text", "text": preset.text})
     system[-1]["cache_control"] = {"type": "ephemeral", "ttl": chat_agent.CACHE_TTL}
 
-    sandbox = SandboxClient(settings) if settings.sandbox_configured else None
-    tools = list(chat_agent.TOOLS if sandbox is not None else chat_agent.TOOLS_WITHOUT_BASH)
     return TurnContext(
         settings=settings,
         sessionmaker=sessionmaker,
@@ -853,8 +856,10 @@ async def run_turn(
         async with asyncio.timeout(settings.chat_turn_timeout_seconds):
             await _loop(ctx)
     except TurnCancelled:
+        await _settle_writer(ctx)
         await _finish(sessionmaker, turn_id, status="cancelled", error="cancelled")
     except TurnFailed as exc:
+        await _settle_writer(ctx)
         await _finish(sessionmaker, turn_id, status="failed", error=str(exc))
     except TimeoutError:
         await _settle_writer(ctx)
@@ -872,7 +877,11 @@ async def run_turn(
         await _settle_writer(ctx)
         raise
     except Exception:
+        # A read's own failure (its cancel check lost the database) cancels the round
+        # around a shielded writer: that write finishes and commits before the terminal
+        # event, like a timeout's (docs/chat.md § Tools).
         logger.exception("turn %s failed unexpectedly", turn_id)
+        await _settle_writer(ctx)
         await _finish(sessionmaker, turn_id, status="failed", error="internal error")
     else:
         await _finish(sessionmaker, turn_id, status="succeeded")

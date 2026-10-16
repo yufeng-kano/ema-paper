@@ -63,7 +63,10 @@ def truncate(text: str, max_chars: int) -> str:
     """Keep the head and the tail; say how much went missing between them."""
     if len(text) <= max_chars:
         return text
-    keep = max(max_chars // 2 - 40, 0)
+    keep = max_chars // 2 - 40
+    if keep <= 0:
+        # No room for the marker: a plain cut, never `text[-0:]`, which is the whole text.
+        return text[: max(max_chars, 0)]
     omitted = len(text) - 2 * keep
     return f"{text[:keep]}\n\n[... {omitted} characters omitted ...]\n\n{text[-keep:]}"
 

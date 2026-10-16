@@ -114,6 +114,7 @@ while IFS= read -r __sr_marker; do
     bash --norc --noprofile "$__sr_state/run.sh" "$__sr_state" </dev/null
     __sr_status=$?
     {cleanup}
+    [ "${{__sr_left:-0}}" = 0 ] || exit 5
     printf '\\n%s %s\\n' "$__sr_marker" "$__sr_status"
 done
 """

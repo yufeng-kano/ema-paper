@@ -7,6 +7,7 @@ headers the request needs, and which models can run it. The loop is `jobs/chat_r
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 
 from .parse import BBOX_FORMAT_YXYX
 
@@ -134,10 +135,27 @@ PROMPT_TOKENS: tuple[str, ...] = (
 _TOKEN_RE = re.compile("|".join(re.escape(token) for token in PROMPT_TOKENS))
 
 
-def render_system_prompt(template: str, facts: dict[str, str]) -> str:
+# A tool's line in the prompt's tool list: dropped when the tool is not enabled for the
+# turn (no sandbox runner, no `bash`), so the model is never told of a shell it lacks.
+_TOOL_LINE_RE = re.compile(r"^- (bash|str_replace_based_edit_tool|view_page|view_figure):")
+
+
+def render_system_prompt(
+    template: str, facts: dict[str, str], *, tools: Iterable[str] | None = None
+) -> str:
     """One pass over the template: a fact's value is never read as a token in turn (a
-    document named `{locale}` stays that document's path)."""
-    return _TOKEN_RE.sub(lambda match: facts.get(match.group(0).strip("{}"), ""), template)
+    document named `{locale}` stays that document's path). With `tools`, the lines that
+    describe tools not among them are left out."""
+    rendered = _TOKEN_RE.sub(lambda match: facts.get(match.group(0).strip("{}"), ""), template)
+    if tools is None:
+        return rendered
+    enabled = set(tools)
+    kept = [
+        line
+        for line in rendered.split("\n")
+        if not ((match := _TOOL_LINE_RE.match(line)) and match.group(1) not in enabled)
+    ]
+    return "\n".join(kept)
 
 
 BBOX_FORMAT = BBOX_FORMAT_YXYX

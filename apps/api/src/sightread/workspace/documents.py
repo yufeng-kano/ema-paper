@@ -379,12 +379,13 @@ def _copy_original(root: Path, source_id: int, target_id: int) -> bool:
 
 async def inherit_original(
     db: AsyncSession, settings: Settings, document: Document, job: Job
-) -> None:
+) -> bool:
     """A parse filed again from the History page: its upload went to the first document
     filed from it, so the new one takes a copy of that original — from any document of
     the parse that holds one — and, when none does but the upload is still there (the
     worker left it for a row that had not landed), takes the upload as `adopt_source`
-    does (docs/workspace.md § Layout)."""
+    does (docs/workspace.md § Layout). False when the row is gone by the time the lock
+    is held: another tab deleted it, and no original is kept under an id with no row."""
     root = user_root(settings.workspaces_dir, document.user_id)
     siblings = list(
         (
@@ -400,6 +401,10 @@ async def inherit_original(
         # filings at once must not both measure the room and both take it (§ Quota).
         async with workspace_lock(root):
             try:
+                await db.refresh(document)
+            except InvalidRequestError:
+                return False  # deleted since it was filed; a delete holds this lock
+            try:
                 await ensure_within_quota(settings, root)
             except ApiError:
                 logger.warning(
@@ -407,11 +412,15 @@ async def inherit_original(
                     document.user_id,
                     document.id,
                 )
-                return
+                return True
             for sibling_id in siblings:
                 if await asyncio.to_thread(_copy_original, root, sibling_id, document.id):
-                    return
-    await adopt_source(db, settings, document, job)
+                    return True
+    try:
+        await adopt_source(db, settings, document, job)
+    except InvalidRequestError:
+        return False
+    return True
 
 
 def _discard_originals(root: Path, document_ids: list[int]) -> None:

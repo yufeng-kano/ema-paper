@@ -7,6 +7,7 @@ safety).
 
 from __future__ import annotations
 
+import os
 import uuid
 from pathlib import Path
 
@@ -766,3 +767,44 @@ async def test_a_move_whose_commit_landed_despite_the_error_is_not_undone(
     # path the row no longer names, where a fresh copy would have shadowed them.
     assert (root / "files" / "renamed.png" / "notes.md").read_text() == "kept edit"
     assert not (root / "files" / "tiny (2).png").exists()
+
+
+async def test_a_delete_whose_commit_landed_despite_the_error_is_finished(
+    make_client, sessionmaker, documents, tmp_path, monkeypatch
+) -> None:
+    import contextlib
+
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from sightread.workspace.documents import original_of
+
+    library = make_client(workspaces_dir=str(tmp_path / "ws"))
+    await _ready_to_parse(library)
+    await _upload(library, documents)
+    uploaded = (await _upload(library, documents)).json()
+    async with sessionmaker() as db:
+        row = await db.get(Document, uploaded["id"])
+        root = user_root(library.app.state.settings.workspaces_dir, row.user_id)
+    assert original_of(root, uploaded["id"]) is not None
+
+    original = AsyncSession.commit
+    failing = {"on": True}
+
+    async def commit(self):
+        await original(self)
+        if failing["on"]:
+            failing["on"] = False
+            raise OperationalError("COMMIT", {}, Exception("the connection dropped"))
+
+    monkeypatch.setattr(AsyncSession, "commit", commit)
+    with contextlib.suppress(Exception):
+        await library.delete(f"/api/library/documents/{uploaded['id']}", headers=CSRF_HEADERS)
+    monkeypatch.setattr(AsyncSession, "commit", original)
+    assert failing["on"] is False
+    # The row is gone for good, so the delete finished: nothing restored, nothing aside,
+    # the original discarded.
+    assert [row["name"] for row in (await _read(library))["documents"]] == ["tiny.png"]
+    assert not (root / "files" / "tiny (2).png").exists()
+    assert not [name for name in os.listdir(root) if name.startswith(".sr-tmp-")]
+    assert original_of(root, uploaded["id"]) is None

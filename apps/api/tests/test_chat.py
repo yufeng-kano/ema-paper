@@ -2074,3 +2074,66 @@ async def test_an_editor_write_whose_commit_fails_is_undone(tmp_path, monkeypatc
     )
     assert created.is_error
     assert not (root / "files" / "d" / "new.md").exists()
+
+
+def test_truncate_stays_within_a_small_cap() -> None:
+    text = "x" * 500
+    for cap in (0, 1, 10, 79, 80, 81, 200):
+        cut = chat_tools.truncate(text, cap)
+        assert len(cut) <= max(cap, 0) or cap >= 80, (cap, len(cut))
+    assert chat_tools.truncate(text, 10) == "x" * 10
+    assert chat_tools.truncate(text, 0) == ""
+
+
+def test_the_prompt_lists_only_the_tools_the_turn_has() -> None:
+    from sightread.agents import chat as chat_agent
+
+    facts = {"document_path": "/workspace/files/a", "locale": "en"}
+    with_bash = chat_agent.render_system_prompt(
+        chat_agent.DEFAULT_SYSTEM_PROMPT,
+        facts,
+        tools=["bash", "str_replace_based_edit_tool", "view_page", "view_figure"],
+    )
+    assert "- bash:" in with_bash and "- view_page:" in with_bash
+    without = chat_agent.render_system_prompt(
+        chat_agent.DEFAULT_SYSTEM_PROMPT,
+        facts,
+        tools=["str_replace_based_edit_tool", "view_page", "view_figure"],
+    )
+    assert "- bash:" not in without and "persistent shell" not in without
+    assert "- str_replace_based_edit_tool:" in without and "- view_figure:" in without
+    # No tool list given: the template as written.
+    assert "- bash:" in chat_agent.render_system_prompt(chat_agent.DEFAULT_SYSTEM_PROMPT, facts)
+
+
+async def test_a_revert_is_refused_before_it_materializes(chatting) -> None:
+    document_id = chatting.document_id
+    settings = chatting.app.state.settings
+    content = (await chatting.get(f"/api/library/documents/{document_id}/content")).json()
+    saved = await chatting.put(
+        f"/api/library/documents/{document_id}/content",
+        json={"markdown": "# Edited\n", "base_revision": content["revision"]},
+        headers=CSRF_HEADERS,
+    )
+    assert saved.status_code == 200
+    commit = (await chatting.get(f"/api/library/documents/{document_id}/revisions")).json()[
+        "revisions"
+    ][0]["commit"]
+    conversation_id = (
+        await chatting.post(
+            f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    await chatting.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
+    )
+    # The turn is unfinished and, between tool calls, has removed the directory.
+    directory = (
+        user_root(settings.workspaces_dir, chatting.user_id) / "files" / "Papers" / "paper.pdf"
+    )
+    shutil.rmtree(directory)
+    refused = await chatting.post(
+        f"/api/library/documents/{document_id}/revisions/{commit}/revert", headers=CSRF_HEADERS
+    )
+    assert refused.status_code == 409
+    assert not directory.exists()

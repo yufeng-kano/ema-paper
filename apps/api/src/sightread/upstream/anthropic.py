@@ -339,7 +339,9 @@ async def stream_messages(
     except ResponseTooLarge as exc:
         raise UpstreamError("The upstream response exceeded the size cap") from exc
 
-    if not finished and stop_reason is None:
+    if not finished:
+        # A stop reason without the message_stop that completes the message is a stream
+        # cut short, not an answer: never stored, never acted on (docs/chat.md).
         raise UpstreamError("The upstream closed the stream early", transient=True)
 
     yield CompletedMessage(

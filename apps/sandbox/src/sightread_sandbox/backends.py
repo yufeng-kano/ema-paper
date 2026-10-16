@@ -291,19 +291,35 @@ REAPER = (
 # is the scope a process cannot leave: a job that `setsid`s out of its shell's session is
 # still here, and goes (docs/sandbox.md § The runner). Plain sh, no bashisms: it runs in
 # the shell at the end of every command and in a separate `docker exec` after a timeout.
+# Repeated until a pass finds nothing to kill: a process forking while the list is
+# walked has children the snapshot missed, reparented to pid 1 once their parent is
+# gone, and they go on the next pass. `$__sr_left` is what the last pass still had to
+# kill — zero when the VM is verified clean; a VM not clean after fifty passes makes the
+# caller fail closed. `$__sr_kill` names the kill command for the tests' fake process
+# table; unset, it is the shell's own.
 VM_SWEEP = """
-__sr_keep=" 1 "
-for __sr_p in $$ $__sr_keep_in; do
-    case "$__sr_p" in *[!0-9]*) continue;; esac
-    while [ -n "$__sr_p" ] && [ "$__sr_p" != 0 ] && [ "$__sr_p" != 1 ]; do
-        case "$__sr_keep" in *" $__sr_p "*) break;; esac
-        __sr_keep="$__sr_keep$__sr_p "
-        __sr_p=$(ps -o ppid= -p "$__sr_p" 2>/dev/null | tr -d ' ')
+__sr_pass=0
+__sr_left=0
+while [ "$__sr_pass" -lt 50 ]; do
+    __sr_pass=$((__sr_pass + 1))
+    __sr_keep=" 1 "
+    for __sr_p in $$ $__sr_keep_in; do
+        case "$__sr_p" in *[!0-9]*) continue;; esac
+        while [ -n "$__sr_p" ] && [ "$__sr_p" != 0 ] && [ "$__sr_p" != 1 ]; do
+            case "$__sr_keep" in *" $__sr_p "*) break;; esac
+            __sr_keep="$__sr_keep$__sr_p "
+            __sr_p=$(ps -o ppid= -p "$__sr_p" 2>/dev/null | tr -d ' ')
+        done
     done
-done
-for __sr_p in $(ps -eo pid=); do
-    case "$__sr_keep" in *" $__sr_p "*) continue;; esac
-    kill -KILL "$__sr_p" 2>/dev/null
+    __sr_left=0
+    # Live processes only: a zombie waits for pid 1 to reap it and cannot be killed.
+    __sr_live=$(ps -eo pid=,stat= 2>/dev/null | sed -n 's/^ *\\([0-9][0-9]*\\)  *[^Z ].*$/\\1/p')
+    for __sr_p in $__sr_live; do
+        case "$__sr_keep" in *" $__sr_p "*) continue;; esac
+        ${__sr_kill:-kill} -KILL "$__sr_p" 2>/dev/null
+        __sr_left=$((__sr_left + 1))
+    done
+    [ "$__sr_left" = 0 ] && break
 done
 """
 
@@ -324,6 +340,7 @@ kill_tree "$pid"
 kill -KILL -- "-$pid" 2>/dev/null
 {VM_SWEEP}
 kill -0 "$pid" 2>/dev/null && exit 4
+[ "$__sr_left" = 0 ] || exit 5
 exit 0
 """
 
@@ -332,6 +349,7 @@ exit 0
 ADOPT_SWEEP = f"""
 __sr_keep_in=""
 {VM_SWEEP}
+[ "$__sr_left" = 0 ] || exit 5
 exit 0
 """
 

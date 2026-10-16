@@ -298,7 +298,20 @@ async def move_then_commit(
         await db.commit()
     except BaseException:
         if moved is not None:
-            if await _committed_after_all(db, landed):
+            model, row_id, expected = landed
+            readable, row = await _read_row(db, model, row_id)
+            if not readable:
+                # Indeterminate is not a rollback: the files stay where they are rather
+                # than being moved away from a row that may now name them; the next
+                # reconciliation follows the directory (docs/workspace.md § Revisions).
+                logger.error(
+                    "the move of %s to %s raised and cannot be verified; the files stay",
+                    before,
+                    after,
+                )
+            elif row is not None and all(
+                getattr(row, key) == value for key, value in expected.items()
+            ):
                 logger.warning(
                     "the move of %s to %s was committed despite the error; the files stay",
                     before,
@@ -312,18 +325,16 @@ async def move_then_commit(
         raise
 
 
-async def _committed_after_all(db: DbSession, landed: tuple[type, int, dict]) -> bool:
-    """Whether the row holds the values a commit that raised was to leave — read on a
-    connection of its own, since the request's may be the one that dropped. Unreadable
-    counts as not committed: a rollback is the common outcome of a failed commit."""
-    model, row_id, expected = landed
+async def _read_row(db: DbSession, model: type, row_id: int) -> tuple[bool, object | None]:
+    """The row as the database holds it after a commit that raised — read on a connection
+    of its own, since the request's may be the one that dropped. `(readable, row)`: a
+    read that fails says nothing about the commit, and the caller treats it so."""
     try:
         async with AsyncSession(bind=db.bind, expire_on_commit=False) as fresh:
-            row = await fresh.get(model, row_id)
-    except Exception:  # noqa: BLE001 - the database is away; the files go back
-        logger.exception("could not check whether the move of row %s landed", row_id)
-        return False
-    return row is not None and all(getattr(row, key) == value for key, value in expected.items())
+            return True, await fresh.get(model, row_id)
+    except Exception:  # noqa: BLE001 - the database is away
+        logger.exception("could not read row %s of %s after a failed commit", row_id, model)
+        return False, None
 
 
 async def folder_exists(db: DbSession, user_id: int, folder_id: int) -> bool:
@@ -551,19 +562,29 @@ async def delete_folder(
             delete(Document).where(Document.user_id == user.id, Document.folder_id.in_(doomed))
         )
         await db.execute(delete(Folder).where(Folder.user_id == user.id, Folder.id.in_(doomed)))
-        await remove_then_commit(db, settings, user.id, relative, document_ids)
+        await remove_then_commit(
+            db, settings, user.id, relative, document_ids, gone=(Folder, row.id)
+        )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 async def remove_then_commit(
-    db: DbSession, settings, user_id: int, relative, document_ids: list[int]
+    db: DbSession,
+    settings,
+    user_id: int,
+    relative,
+    document_ids: list[int],
+    *,
+    gone: tuple[type, int],
 ) -> None:
     """The rows are deleted in the transaction; the directory goes before it commits. A
     removal the tree refuses keeps the rows, and the next read restores what is missing;
     a commit that fails after the removal keeps the rows too, and the files come back
     from the removal's own revision, so the edits they held are not lost to a fresh copy
-    (docs/workspace.md § Revisions). The originals kept outside the mount go last, once
-    the rows are gone for good."""
+    (docs/workspace.md § Revisions) — unless the row `gone` names is found deleted on a
+    fresh connection, the commit having landed after all: then the delete finishes as
+    if it had been acknowledged. The originals kept outside the mount go last, once the
+    rows are gone for good."""
     try:
         removal = await workspace_documents.remove_path(settings, user_id, relative)
     except BaseException:
@@ -572,12 +593,24 @@ async def remove_then_commit(
     try:
         await db.commit()
     except BaseException:
-        if removal is not None:
+        readable, row = await _read_row(db, *gone)
+        if readable and row is None:
+            logger.warning("the delete of %s was committed despite the error", relative)
+            await _finish_delete(settings, user_id, relative, removal, document_ids)
+        elif removal is not None:
+            # Rolled back, or unknown: the files come back — an orphaned directory
+            # beside no row is a nuisance, files gone with a row that stayed is a loss.
             try:
                 await workspace_documents.restore_removed(settings, user_id, relative, removal)
             except Exception:  # noqa: BLE001 - the directory waits aside, whole
                 logger.exception("could not restore %s after a failed delete", relative)
         raise
+    await _finish_delete(settings, user_id, relative, removal, document_ids)
+
+
+async def _finish_delete(
+    settings, user_id: int, relative, removal, document_ids: list[int]
+) -> None:
     if removal is not None:
         try:
             await workspace_documents.discard_removed(settings, user_id, removal)
@@ -778,7 +811,7 @@ async def file_job(body: DocumentFromJob, user: SessionUser, db: DbSession, sett
         # takes a copy, so its pages render too (docs/workspace.md § Layout). A copy that
         # fails takes the row with it: no entry without the original it was promised.
         try:
-            await workspace_documents.inherit_original(db, settings, row, job)
+            filed = await workspace_documents.inherit_original(db, settings, row, job)
         except Exception as exc:
             logger.exception("could not copy the original for document %d", row.id)
             await db.delete(row)
@@ -786,6 +819,8 @@ async def file_job(body: DocumentFromJob, user: SessionUser, db: DbSession, sett
             raise ApiError(
                 409, "invalid_request", "The original could not be copied; nothing was filed"
             ) from exc
+        if not filed:
+            raise ApiError(404, "invalid_request", "The file was deleted while it was being filed")
     return document_payload(row, job)
 
 
@@ -854,7 +889,7 @@ async def delete_document(
         await refuse_while_answering(db, user.id, select(Document.id).where(Document.id == row.id))
         await db.delete(row)
         await db.flush()
-        await remove_then_commit(db, settings, user.id, relative, [row.id])
+        await remove_then_commit(db, settings, user.id, relative, [row.id], gone=(Document, row.id))
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -1030,7 +1065,9 @@ async def revert_document_revision(
         # A revision that reached beyond this document (a shell's) may be what another
         # conversation's turn is working on right now: refused while any turn of the
         # user is unfinished (docs/workspace.md § Revisions).
-        paths = await workspace_documents.materialize_document(db, settings, row, locked=True)
+        # Decided before anything is written: materializing first would hand a turn
+        # that is between tool calls a fresh copy of the document it just removed.
+        paths = await workspace_documents.document_paths(db, settings, row)
         beyond = await asyncio.to_thread(workspace_documents.reaches_beyond, paths, commit)
         guarded = (
             select(Document.id).where(Document.user_id == user.id)
@@ -1038,5 +1075,6 @@ async def revert_document_revision(
             else select(Document.id).where(Document.id == row.id)
         )
         await refuse_while_answering(db, user.id, guarded)
+        await workspace_documents.materialize_document(db, settings, row, locked=True)
         reverted = await workspace_documents.revert(db, settings, row, commit, locked=True)
     return {"revision": reverted.revision, "commit": reverted.commit}
