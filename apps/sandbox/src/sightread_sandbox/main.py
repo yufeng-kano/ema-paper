@@ -100,7 +100,10 @@ def create_app(settings: Settings | None = None, backend: Backend | None = None)
 
     @app.post("/sandboxes/{user_id}/restart", dependencies=guard)
     async def sandbox_restart(user_id: int, body: SessionBody) -> dict:
-        await backend.restart(user_id, body.session)
+        try:
+            await backend.restart(user_id, body.session)
+        except RuntimeError as exc:
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         return {"ok": True}
 
     @app.post("/sandboxes/{user_id}/stop", dependencies=guard)

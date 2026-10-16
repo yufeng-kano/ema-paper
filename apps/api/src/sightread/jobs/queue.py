@@ -11,6 +11,7 @@ import asyncio
 import logging
 import re
 import uuid
+from pathlib import Path
 
 from sqlalchemy import bindparam, delete, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,8 +21,14 @@ from ..config import Settings
 from ..db.models import ChatTurn, Conversation, Job, JobPage, utcnow
 from ..sandbox.client import SandboxClient, SandboxUnavailable
 from ..workspace import git
-from ..workspace.layout import git_dir, user_root
-from ..workspace.locks import clear_writing, shell_lock, workspace_lock
+from ..workspace.layout import REPOS_DIR, git_dir, user_root
+from ..workspace.locks import (
+    WRITING_SUFFIX,
+    clear_writing,
+    read_writing,
+    shell_lock,
+    workspace_lock,
+)
 from ..workspace.reconcile import reconcile_locked
 from . import chat_events
 
@@ -29,6 +36,8 @@ logger = logging.getLogger(__name__)
 
 # The revision an orphaned turn's unrecorded changes become (docs/jobs.md § Chat turns).
 ORPHAN_REVISION_MESSAGE = "bash: interrupted by a worker restart"
+# The revision a command the runner could not confirm over leaves, once a restart has.
+UNSETTLED_REVISION_MESSAGE = "bash: recovered after an unconfirmed command"
 
 # PostgreSQL claim (docs/jobs.md). The correlated count applies the per-user running cap
 # to the same scan that picks the oldest queued job.
@@ -439,6 +448,46 @@ async def fail_orphaned_turns(
         await fail_turn(db, turn_id, "worker restarted")
         finished += 1
     return finished, left
+
+
+async def recover_unsettled_commands(settings: Settings, sandbox: SandboxClient | None) -> set[int]:
+    """Every writing marker still standing after the orphaned turns are finished names a
+    shell command nobody could confirm over — one the runner could not vouch for in a
+    turn that then ended. Its shell is restarted on the runner, which answers only once
+    the command is dead, and the tree is recorded in the conversation's name; a runner
+    that does not answer leaves the marker, and the user's host writes refused, for the
+    next pass. Returns the users left for later (docs/workspace.md § Revisions)."""
+    left: set[int] = set()
+    repos = Path(settings.workspaces_dir) / REPOS_DIR
+    for marker in sorted(repos.glob(f"*{WRITING_SUFFIX}")) if repos.is_dir() else []:
+        try:
+            user_id = int(marker.name.removesuffix(WRITING_SUFFIX))
+        except ValueError:
+            continue
+        root = user_root(settings.workspaces_dir, user_id)
+        named = read_writing(root)
+        if named is not None and sandbox is not None and sandbox.configured:
+            try:
+                await sandbox.restart(user_id, named[1])
+            except SandboxUnavailable:
+                left.add(user_id)
+                continue
+        author = f"{git.AGENT_AUTHOR_PREFIX}{named[0]}" if named else git.USER_AUTHOR
+        async with shell_lock(root), workspace_lock(root, recovering=True):
+            try:
+                if git_dir(root).is_dir():
+                    await asyncio.to_thread(
+                        git.commit_all, root, author, UNSETTLED_REVISION_MESSAGE
+                    )
+            except git.GitError:
+                logger.exception("could not record an unconfirmed command of user %d", user_id)
+                left.add(user_id)
+                continue
+            clear_writing(root)
+            logger.warning(
+                "recovered the workspace of user %d after an unconfirmed command", user_id
+            )
+    return left
 
 
 async def _record_orphaned_changes(

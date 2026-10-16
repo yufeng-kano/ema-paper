@@ -79,6 +79,13 @@ async def _run(
         process.kill()
         await process.wait()
         raise PopplerTimeout(f"{args[0]} timed out after {timeout:.0f}s") from exc
+    except asyncio.CancelledError:
+        # The caller gave up (a turn cancelled, a request dropped): the child is killed
+        # and reaped before the cancel goes on, never left rendering outside whatever
+        # slot the caller held (docs/chat.md § Tools).
+        process.kill()
+        await process.wait()
+        raise
     finally:
         # Close the child's pipes here rather than leaving them to garbage collection,
         # which can run after the event loop that owns them is already gone.

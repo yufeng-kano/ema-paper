@@ -34,7 +34,9 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  saved: [SavedAgentSettings]
+  /** Named for the agent the request was made for: the reader may have switched
+   *  agents while it was in flight, and the answer is not the new agent's. */
+  saved: [agent: string, settings: SavedAgentSettings]
   'prompts-changed': []
 }>()
 
@@ -84,7 +86,7 @@ async function loadModels() {
 async function resolveUpstream() {
   if (settings.value.connection_id !== null) {
     try {
-      emit('saved', await putAgentSettings(props.agent.name, { connection_id: null }))
+      emit('saved', props.agent.name, await putAgentSettings(props.agent.name, { connection_id: null }))
     } catch (error) {
       modelsError.value = await resolve(error)
       return
@@ -109,7 +111,7 @@ async function applyModel(value: string) {
   modelPending.value = true
   modelsError.value = null
   try {
-    emit('saved', await putAgentSettings(props.agent.name, { model: value || null }))
+    emit('saved', props.agent.name, await putAgentSettings(props.agent.name, { model: value || null }))
   } catch (error) {
     modelsError.value = await resolve(error)
   } finally {
@@ -137,7 +139,7 @@ async function applyEffort(value: string) {
   effortPending.value = true
   effortError.value = null
   try {
-    emit('saved', await putAgentSettings(props.agent.name, { effort: value as AgentEffort }))
+    emit('saved', props.agent.name, await putAgentSettings(props.agent.name, { effort: value as AgentEffort }))
   } catch (error) {
     effortError.value = await resolve(error)
   } finally {
@@ -162,7 +164,7 @@ async function applyPromptChoice(value: string) {
   promptPending.value = true
   promptError.value = null
   try {
-    emit('saved', await putAgentSettings(props.agent.name, { prompt_preset_id: value ? Number(value) : null }))
+    emit('saved', props.agent.name, await putAgentSettings(props.agent.name, { prompt_preset_id: value ? Number(value) : null }))
   } catch (error) {
     promptError.value = await resolve(error)
   } finally {
@@ -265,7 +267,7 @@ async function removePrompt() {
     await deletePrompt(row.id)
     confirmingPromptDelete.value = false
     // The server already points this agent back at its default prompt.
-    emit('saved', { ...settings.value, prompt_preset_id: null, bbox: props.agent.bbox })
+    emit('saved', props.agent.name, { ...settings.value, prompt_preset_id: null, bbox: props.agent.bbox })
     emit('prompts-changed')
   } catch (error) {
     promptError.value = await resolve(error)

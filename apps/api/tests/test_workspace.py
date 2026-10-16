@@ -497,13 +497,13 @@ async def test_a_tree_a_dead_workers_command_may_write_takes_no_host_write(
         paths = await documents.materialize_document(db, settings, document)
         content = await documents.read_content(db, settings, document)
         # A shell command was writing when its worker died: the marker it set stands.
-        mark_writing(paths.root)
+        mark_writing(paths.root, 1, "s")
         with pytest.raises(ApiError) as refused:
             await documents.write_content(
                 db, settings, document, markdown="# T\n\nx\n", base_revision=content.revision
             )
         assert refused.value.status_code == 409
-        assert "recovered" in refused.value.message
+        assert "recovering" in refused.value.message
         with pytest.raises(ApiError):
             await documents.read_content(db, settings, document)
         # The recovery itself goes through, and once it has cleared the marker so does

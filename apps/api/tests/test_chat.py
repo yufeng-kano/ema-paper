@@ -30,6 +30,7 @@ from sightread.db.models import (
     Result,
     UsageLog,
 )
+from sightread.errors import ApiError
 from sightread.jobs import chat_runner, chat_tools
 from sightread.jobs.queue import claim_next_turn, fail_turn
 from sightread.sandbox.client import ExecResult, SandboxClient
@@ -50,12 +51,14 @@ def sse(*events: dict) -> bytes:
     ).encode()
 
 
-def assistant_turn(blocks: list[dict], stop_reason: str, *, output_tokens: int = 10) -> bytes:
+def assistant_turn(
+    blocks: list[dict], stop_reason: str, *, output_tokens: int = 10, model: str = "claude-opus-5-5"
+) -> bytes:
     events: list[dict] = [
         {
             "type": "message_start",
             "message": {
-                "model": "claude-opus-5-5",
+                "model": model,
                 "usage": {"input_tokens": 300, "cache_read_input_tokens": 200},
             },
         }
@@ -1291,6 +1294,74 @@ def test_an_image_past_the_pixel_cap_is_refused_before_it_is_decoded() -> None:
     assert chat_tools._as_png(small.getvalue()).startswith(b"\x89PNG")
 
 
+@respx.mock
+async def test_a_fallback_answer_moves_the_conversation_to_its_model(chatting) -> None:
+    document_id = chatting.document_id
+    conversation_id = (
+        await chatting.post(
+            f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    requests: list[dict] = []
+    turns = iter(
+        [
+            assistant_turn(
+                [{"type": "text", "text": "Hi."}], "end_turn", model="claude-fallback-9"
+            ),
+            assistant_turn(
+                [{"type": "text", "text": "Again."}], "end_turn", model="claude-fallback-9"
+            ),
+        ]
+    )
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, content=next(turns))
+
+    respx.post(MESSAGES_URL).mock(side_effect=answer)
+    sent = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
+    )
+    assert sent.status_code == 202, sent.text
+    await _run_queued_turn(chatting)
+    assert requests[0]["model"] == "claude-opus-5-5"
+    async with chatting.app.state.sessionmaker() as db:
+        # The safety fallback answered from another model: its thinking blocks are that
+        # model's, so the conversation follows it before the answer is stored.
+        assert (await db.get(Conversation, conversation_id)).model == "claude-fallback-9"
+    again = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"text": "more"},
+        headers=CSRF_HEADERS,
+    )
+    assert again.status_code == 202, again.text
+    await _run_queued_turn(chatting)
+    assert requests[1]["model"] == "claude-fallback-9"
+
+
+async def test_the_history_cap_counts_bytes_not_characters(chatting) -> None:
+    settings = chatting.app.state.settings
+    document_id = chatting.document_id
+    conversation_id = (
+        await chatting.post(
+            f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    # 2000 two-byte characters: about 2040 characters stored, about 4040 bytes.
+    sent = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"text": "é" * 2000},
+        headers=CSRF_HEADERS,
+    )
+    turn_id = uuid.UUID(sent.json()["turn_id"])
+    settings.chat_history_max_bytes = 3000
+    await _run_queued_turn(chatting)
+    async with chatting.app.state.sessionmaker() as db:
+        turn = await db.get(ChatTurn, turn_id)
+        assert turn.status == "failed" and "start a new conversation" in turn.error
+    settings.chat_history_max_bytes = 256 * 1024 * 1024
+
+
 async def test_a_conversation_past_the_history_cap_is_refused(chatting) -> None:
     settings = chatting.app.state.settings
     document_id = chatting.document_id
@@ -1388,13 +1459,13 @@ async def test_a_worker_starting_records_what_an_orphaned_turn_left_unrecorded(
     (paths.directory / "doc.md").write_text("# Title\n\nHalf done\n")
     from sightread.workspace.locks import mark_writing, writing_marker
 
-    mark_writing(paths.root)
+    mark_writing(paths.root, conversation_id, "s")
     refused = await chatting.put(
         f"/api/library/documents/{document_id}/content",
         json={"markdown": "# Mine\n", "base_revision": "x"},
         headers=CSRF_HEADERS,
     )
-    assert refused.status_code == 409 and "recovered" in refused.json()["error"]["message"]
+    assert refused.status_code == 409 and "recovering" in refused.json()["error"]["message"]
 
     real = git.commit_all
 
@@ -2430,6 +2501,87 @@ def test_the_exec_deadline_covers_a_cold_start() -> None:
         )
     )
     assert client.exec_timeout(120) == 350
+
+
+async def test_a_command_the_runner_could_not_confirm_over_keeps_the_marker_until_a_restart_does(
+    sessionmaker, tmp_path, monkeypatch
+) -> None:
+    from sightread.config import Settings
+    from sightread.jobs.queue import UNSETTLED_REVISION_MESSAGE, recover_unsettled_commands
+    from sightread.sandbox.client import SandboxUnavailable
+    from sightread.workspace.locks import read_writing, writing_marker
+    from tests.conftest import KANO_BASE, TEST_SECRET_KEY
+    from tests.test_workspace import _seed
+
+    settings = Settings(
+        app_env="local",
+        secret_key=TEST_SECRET_KEY,
+        workspaces_dir=str(tmp_path / "workspaces"),
+        figures_dir=str(tmp_path / "figures"),
+        kano_proxy_base_url=KANO_BASE,
+        sandbox_url="http://sandbox:8100",
+        sandbox_token="t",
+    )
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        paths = await workspace_documents.materialize_document(db, settings, document)
+
+    class Shell:
+        configured = True
+        restart_ok = False
+        restarted: list[str] = []
+        runs = 0
+
+        async def exec(self, user_id, session, command, *, timeout_seconds):
+            self.runs += 1
+            (paths.directory / "half.txt").write_text(f"being written, run {self.runs}\n")
+            raise SandboxUnavailable("the sandbox VM could not be stopped")
+
+        async def restart(self, user_id, session):
+            self.restarted.append(session)
+            if not self.restart_ok:
+                raise SandboxUnavailable("the sandbox VM could not be stopped")
+
+    async def no_events(ctx, event, data):
+        return None
+
+    monkeypatch.setattr(chat_runner, "_emit", no_events)
+    shell = Shell()
+    ctx = SimpleNamespace(
+        settings=settings,
+        sessionmaker=sessionmaker,
+        sandbox=shell,
+        paths=paths,
+        turn=SimpleNamespace(id=uuid.uuid4(), user_id=user.id),
+        conversation=SimpleNamespace(id=3, session="s"),
+    )
+    block = {"id": "t1", "name": "bash", "input": {"command": "python write.py"}}
+    # Neither the command nor the restart could be confirmed over: nothing is committed
+    # and the marker stays, naming the shell, so host writes are refused.
+    result = await chat_runner._run_tool_unguarded(ctx, block, set(), None)
+    assert result["is_error"] and "takes no other write" in result["content"]
+    assert shell.restarted == ["s"]
+    assert read_writing(paths.root) == (3, "s")
+    assert git.log(paths.root)[0].message.startswith("materialize")
+    async with sessionmaker() as db:
+        with pytest.raises(ApiError):
+            await workspace_documents.read_content(db, settings, document)
+
+    # The recovery a worker runs at start: the restart confirms the command dead, the
+    # tree is recorded in the conversation's name, the marker goes.
+    assert await recover_unsettled_commands(settings, shell) == {user.id}  # runner still away
+    shell.restart_ok = True
+    assert await recover_unsettled_commands(settings, shell) == set()
+    assert not writing_marker(paths.root).exists()
+    head = git.log(paths.root)[0]
+    assert head.message == UNSETTLED_REVISION_MESSAGE and head.author == "agent:3"
+    assert "files/Papers/paper.pdf/half.txt" in head.files
+
+    # Within a turn, a restart that confirms the kill records the tree right away.
+    result = await chat_runner._run_tool_unguarded(ctx, block, set(), None)
+    assert result["is_error"] and "restarted" in result["content"]
+    assert not writing_marker(paths.root).exists()
+    assert git.log(paths.root)[0].message == "bash: python write.py"
 
 
 async def test_a_shell_command_stands_marked_as_writing_for_its_whole_run(

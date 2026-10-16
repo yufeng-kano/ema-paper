@@ -25,6 +25,7 @@ from .jobs.queue import (
     claim_next_turn,
     fail_orphaned_turns,
     fail_turn,
+    recover_unsettled_commands,
     requeue_job,
     requeue_orphaned_jobs,
 )
@@ -80,6 +81,9 @@ async def run_worker(stop: asyncio.Event) -> None:
                             discard_job_figures(Path(settings.figures_dir), orphan)
                             logger.warning("requeued job %s a previous worker left running", orphan)
                         finished, left = await fail_orphaned_turns(db, sandbox, settings)
+                    # Then the markers that still stand: commands the runner could not
+                    # confirm over in turns that ended (docs/workspace.md § Revisions).
+                    left |= await recover_unsettled_commands(settings, sandbox)
                 except SQLAlchemyError:
                     logger.exception("could not finish orphaned chat turns; will retry")
                 else:

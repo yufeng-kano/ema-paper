@@ -908,3 +908,46 @@ async def test_a_command_whose_vm_became_unstoppable_is_not_reported_done(tmp_pa
     outcome = await backend.exec(81, "s", "true", timeout=5)
     assert outcome.exit_code == 0 and backend._user(81).unstoppable is False
     await backend.stop(81)
+
+
+async def test_a_restart_that_cannot_confirm_the_kill_is_not_done(tmp_path) -> None:
+    import asyncio
+
+    class Stuck(LocalBackend):
+        gone = False
+
+        def on_timeout(self, user_id):
+            async def kill_inside(*, pid: int, locked: bool = False) -> None:
+                self._user(user_id).unstoppable = True  # neither killed nor removed
+
+            return kill_inside
+
+        async def is_gone(self, user_id: int) -> bool:
+            return self.gone
+
+    settings = Settings(
+        app_env="local",
+        sandbox_token=TOKEN,
+        sandbox_backend="local",
+        sandbox_docker_timeout_seconds=1,
+        sandbox_workspaces_dir=str(tmp_path / "ws"),
+        sandbox_workspaces_mount=str(tmp_path / "ws"),
+    )
+    backend = Stuck(settings)
+    running = asyncio.ensure_future(backend.exec(91, "s", "sleep 30", timeout=60))
+    await asyncio.sleep(0.3)
+    # The worker asks for the shell to be restarted to settle an unconfirmed command:
+    # a restart that could not end it answers 503, never a done the tree is recorded on.
+    with pytest.raises(RuntimeError):
+        await backend.restart(91, "s")
+    running.cancel()
+    with pytest.raises((asyncio.CancelledError, RuntimeError)):
+        await running
+    backend.gone = True
+    app = create_app(settings, backend)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://runner") as http:
+        http.headers["Authorization"] = f"Bearer {TOKEN}"
+        assert (await http.post("/sandboxes/91/restart", json={"session": "s"})).json() == {
+            "ok": True
+        }
+    await backend.stop(91)

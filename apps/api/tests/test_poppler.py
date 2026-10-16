@@ -45,6 +45,29 @@ async def test_a_child_that_overruns_its_timeout_is_killed(documents, tmp_path) 
         )
 
 
+async def test_a_cancelled_render_kills_and_reaps_its_child(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    children = []
+    started = asyncio.Event()
+    real = asyncio.create_subprocess_exec
+
+    async def spying(*args, **kwargs):
+        process = await real(*args, **kwargs)
+        children.append(process)
+        started.set()
+        return process
+
+    monkeypatch.setattr(poppler.asyncio, "create_subprocess_exec", spying)
+    running = asyncio.ensure_future(poppler._run(["sleep", "30"], cwd=tmp_path, timeout=60))
+    await started.wait()
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    # Killed and reaped before the cancel went on: not left rendering outside the slot.
+    assert children[0].returncode is not None
+
+
 def test_render_dpi_scales_with_page_size() -> None:
     letter_dpi = poppler.render_dpi(poppler.PageSize(612, 792))
     poster_dpi = poppler.render_dpi(poppler.PageSize(1728, 2592))

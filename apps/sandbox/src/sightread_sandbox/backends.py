@@ -188,6 +188,14 @@ class Backend:
             sandbox.session_used.pop(session, None)
             if shell is not None:
                 await shell.kill(locked=True)
+            # A kill that could end the command neither inside the VM nor by removing
+            # the VM marked the sandbox unstoppable: the restart is not done, and says
+            # so, rather than letting a caller record a tree the command may still
+            # write (docs/sandbox.md § The runner).
+            if sandbox.unstoppable and not await self._wait_gone(sandbox):
+                raise RuntimeError(
+                    "the sandbox VM could not be stopped; the command may still be running"
+                )
 
     async def status(self, user_id: int) -> dict:
         sandbox = self._users.get(user_id)

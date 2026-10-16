@@ -17,7 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from sqlalchemy import Text, cast, func, select, update
+from sqlalchemy import LargeBinary, Text, cast, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ..agents import CHAT
@@ -35,7 +35,7 @@ from ..db.models import (
     utcnow,
 )
 from ..errors import ApiError
-from ..sandbox.client import SandboxClient
+from ..sandbox.client import SandboxClient, SandboxUnavailable
 from ..upstream.anthropic import CompletedMessage, StreamEvent, stream_messages
 from ..upstream.client import (
     Connection,
@@ -141,9 +141,17 @@ async def _load(
         # The history is replayed whole on every call, images included: past the cap
         # a turn would load and serialize hundreds of megabytes in the worker before
         # the upstream could refuse the context (docs/chat.md § History).
+        # In bytes, as the cap is: PostgreSQL's `length` counts characters, and a
+        # history of non-ASCII text would reach four times the cap before refusal.
+        as_text = cast(Message.content, Text)
+        size = (
+            func.octet_length(as_text)
+            if db.get_bind().dialect.name == "postgresql"
+            else func.length(cast(as_text, LargeBinary))
+        )
         stored = (
             await db.execute(
-                select(func.coalesce(func.sum(func.length(cast(Message.content, Text))), 0)).where(
+                select(func.coalesce(func.sum(size), 0)).where(
                     Message.conversation_id == conversation.id
                 )
             )
@@ -355,6 +363,23 @@ async def _store(ctx: TurnContext, role: str, content: list[dict]) -> int:
         return message_id
 
 
+async def _follow_model(ctx: TurnContext, model: str) -> None:
+    logger.info(
+        "conversation %d moves from %s to %s, which answered its turn %s",
+        ctx.conversation.id,
+        ctx.model,
+        model,
+        ctx.turn.id,
+    )
+    async with ctx.sessionmaker() as db:
+        await db.execute(
+            update(Conversation).where(Conversation.id == ctx.conversation.id).values(model=model)
+        )
+        await db.commit()
+    ctx.model = model
+    ctx.conversation.model = model
+
+
 async def _record_usage(ctx: TurnContext, completed: CompletedMessage) -> None:
     usage = completed.usage
     async with ctx.sessionmaker() as db:
@@ -559,15 +584,19 @@ async def _run_tool_unguarded(
                 workspace_lock(ctx.paths.root, recovering=True),
             ):
                 # Marked for as long as the command may write: a worker that dies here
-                # leaves the mark, and every host write is refused until the next
-                # worker has stopped the shell and recorded the tree (docs/workspace.md
-                # § Revisions). `recovering`: a mark a dead worker left is cleared by
-                # the recovery the next worker runs at start, before any turn.
-                mark_writing(ctx.paths.root)
+                # leaves the mark, and so does a command the runner could not confirm
+                # over, and every host write is refused until a shell restart has
+                # confirmed the command dead and the tree is recorded — here, or by
+                # the recovery the next worker runs at start (docs/workspace.md
+                # § Revisions). `recovering`: this path is that recovery's peer.
+                mark_writing(ctx.paths.root, ctx.conversation.id, ctx.conversation.session)
+                unsettled = False
                 try:
                     outcome = await _run_shell_command(ctx, tool_input, author, max_chars)
+                    unsettled = not outcome.settled
                 finally:
-                    clear_writing(ctx.paths.root)
+                    if not unsettled:
+                        clear_writing(ctx.paths.root)
     elif name == "str_replace_based_edit_tool":
         outcome = await chat_tools.run_editor(
             ctx.paths.root,
@@ -611,18 +640,35 @@ async def _run_shell_command(
         max_chars=max_chars,
         timeout_seconds=ctx.settings.chat_bash_timeout_seconds,
     )
-    # What the shell changed is a revision of its own (docs/workspace.md) — unless the
-    # runner could not say the command is over: a tree a process may still write is
-    # not committed under this command's name.
-    if outcome.settled:
-        outcome = await chat_tools.commit_shell_changes(
-            ctx.paths.root,
-            outcome,
-            tool_input,
-            author,
-            max_chars=max_chars,
-            locked=True,
+    if not outcome.settled:
+        # The runner could not say the command is over. A restart of its shell kills
+        # the command inside the VM, and answers only when that is confirmed: then the
+        # tree is the command's to record. Otherwise nothing is committed — a process
+        # may still write — and the writing marker stays for the recovery that
+        # confirms it later (docs/chat.md § Tools).
+        try:
+            await ctx.sandbox.restart(ctx.turn.user_id, ctx.conversation.session)
+        except SandboxUnavailable:
+            return chat_tools.ToolOutcome(
+                f"{outcome.content}\n[The shell could not be confirmed stopped; the workspace "
+                "takes no other write until a later command confirms it.]",
+                is_error=True,
+                settled=False,
+            )
+        outcome = chat_tools.ToolOutcome(
+            f"{outcome.content}\n[The shell was restarted; whatever the command changed "
+            "is recorded as its revision.]",
+            is_error=True,
         )
+    # What the shell changed is a revision of its own (docs/workspace.md).
+    outcome = await chat_tools.commit_shell_changes(
+        ctx.paths.root,
+        outcome,
+        tool_input,
+        author,
+        max_chars=max_chars,
+        locked=True,
+    )
     if outcome.edit is not None:
         # The library follows the tree before the viewer is told to reload, and before
         # the lock is released: a read waiting on it must not materialize a fresh copy
@@ -795,6 +841,12 @@ async def _loop(ctx: TurnContext) -> None:
         if await _cancelled(ctx):
             # Billed, but not kept: a cancelled turn leaves the history as it was.
             raise TurnCancelled()
+        if completed.model and completed.model != ctx.model:
+            # A safety fallback answered from another model: its thinking blocks are
+            # that model's, so the conversation follows it from here — before the
+            # answer is stored, so no request ever replays them to the model that did
+            # not make them (docs/chat.md § History is append-only).
+            await _follow_model(ctx, completed.model)
         tool_uses = [block for block in completed.content if block.get("type") == "tool_use"]
         content = completed.content
         if completed.stop_reason == "max_tokens":

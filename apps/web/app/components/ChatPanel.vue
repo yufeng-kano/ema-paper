@@ -784,9 +784,14 @@ async function send() {
     if (currentId.value !== id) {
       // The reader switched threads while the send was in flight: the turn belongs to
       // the thread it was sent to, which shows it when it is opened again. The text and
-      // the selection were accepted there, so they are not a draft of this thread.
-      draft.value = ''
-      selection.value = null
+      // the selection were accepted there, so they are not a draft of this thread —
+      // unless the reader has typed since, which is this thread's draft and stays.
+      if (draft.value.trim() === text) {
+        draft.value = ''
+      }
+      if (selection.value === picked) {
+        selection.value = null
+      }
       return
     }
     messages.value = [

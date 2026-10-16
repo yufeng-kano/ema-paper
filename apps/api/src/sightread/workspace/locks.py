@@ -33,13 +33,15 @@ WRITING_SUFFIX = ".writing"
 
 
 class WorkspaceRecovering(ApiError):
-    """A host write refused while a dead worker's shell command may still be writing."""
+    """A host write refused while a shell command nobody could confirm over — a dead
+    worker's, or one the runner could not vouch for — may still be writing."""
 
     def __init__(self) -> None:
         super().__init__(
             409,
             "invalid_request",
-            "The workspace is being recovered after a worker restart; try again shortly",
+            "The workspace is recovering from a shell command that could not be confirmed "
+            "finished; try again shortly",
         )
 
 
@@ -47,8 +49,20 @@ def writing_marker(root: Path) -> Path:
     return _lock_path(root, WRITING_SUFFIX)
 
 
-def mark_writing(root: Path) -> None:
-    writing_marker(root).touch()
+def mark_writing(root: Path, conversation_id: int, session: str) -> None:
+    """The marker names the shell that may be writing, so a recovery that finds it can
+    restart that shell and record the tree in that conversation's name."""
+    writing_marker(root).write_text(f"{conversation_id} {session}\n")
+
+
+def read_writing(root: Path) -> tuple[int, str] | None:
+    """(conversation id, session) of the shell a standing marker names; None without
+    a marker, or for one whose content is not what `mark_writing` wrote."""
+    try:
+        conversation, _, session = writing_marker(root).read_text().strip().partition(" ")
+        return (int(conversation), session) if session else None
+    except (OSError, ValueError):
+        return None
 
 
 def clear_writing(root: Path) -> None:
