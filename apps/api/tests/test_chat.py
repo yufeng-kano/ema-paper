@@ -1412,7 +1412,12 @@ async def test_the_deadline_waits_for_the_write_in_flight(monkeypatch) -> None:
         return {"type": "tool_result", "tool_use_id": "w", "content": "ok"}
 
     ctx = SimpleNamespace(
-        settings=SimpleNamespace(chat_bash_timeout_seconds=1, chat_writer_grace_seconds=1),
+        settings=SimpleNamespace(
+            chat_bash_timeout_seconds=1,
+            chat_writer_grace_seconds=1,
+            sandbox_start_timeout_seconds=0,
+            sandbox_exec_grace_seconds=0,
+        ),
         writer=asyncio.ensure_future(slow_write()),
     )
     # The turn's deadline interrupted the loop while this write ran: it is waited for,
@@ -1916,19 +1921,54 @@ async def test_a_thread_for_a_document_deleted_underneath_is_a_404(chatting, mon
     assert created.status_code == 404, created.text
 
 
-async def test_the_writer_is_waited_for_through_the_runner_clients_grace(monkeypatch) -> None:
-    monkeypatch.setattr(chat_runner, "EXEC_GRACE_SECONDS", 0.5)
-
+async def test_the_writer_is_waited_for_through_the_runner_clients_grace() -> None:
     async def slow_write() -> str:
         await asyncio.sleep(0.3)
         return "committed"
 
     writer = asyncio.ensure_future(slow_write())
     ctx = SimpleNamespace(
-        settings=SimpleNamespace(chat_bash_timeout_seconds=0, chat_writer_grace_seconds=0),
+        settings=SimpleNamespace(
+            chat_bash_timeout_seconds=0,
+            chat_writer_grace_seconds=0,
+            sandbox_start_timeout_seconds=0,
+            sandbox_exec_grace_seconds=0.5,
+        ),
         writer=writer,
     )
     await chat_runner._settle_writer(ctx)
+    assert writer.done() and writer.result() == "committed"
+
+
+async def test_a_writer_past_its_grace_is_killed_in_the_vm_and_waited_to_its_end() -> None:
+    restarted: list[tuple[int, str]] = []
+
+    class FakeSandbox:
+        async def restart(self, user_id: int, session: str) -> None:
+            restarted.append((user_id, session))
+
+    async def long_write() -> str:
+        await asyncio.sleep(0.4)
+        return "committed"
+
+    writer = asyncio.ensure_future(long_write())
+    ctx = SimpleNamespace(
+        settings=SimpleNamespace(
+            chat_bash_timeout_seconds=0,
+            chat_writer_grace_seconds=0,
+            sandbox_start_timeout_seconds=0,
+            sandbox_exec_grace_seconds=0.1,
+        ),
+        writer=writer,
+        writer_tool="bash",
+        sandbox=FakeSandbox(),
+        turn=SimpleNamespace(id="t", user_id=7),
+        conversation=SimpleNamespace(session="s"),
+    )
+    # Past the grace: the command is killed where it runs, and the writer is still
+    # waited for to its end — the turn is never finished over a write in flight.
+    await chat_runner._settle_writer(ctx)
+    assert restarted == [(7, "s")]
     assert writer.done() and writer.result() == "committed"
 
 
