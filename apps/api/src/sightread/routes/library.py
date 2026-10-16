@@ -694,7 +694,7 @@ async def upload_document(
 
 
 @router.post("/documents/from-job", dependencies=[CsrfGuard], status_code=status.HTTP_201_CREATED)
-async def file_job(body: DocumentFromJob, user: SessionUser, db: DbSession):
+async def file_job(body: DocumentFromJob, user: SessionUser, db: DbSession, settings: AppSettings):
     """File a parse that is already in the history — no upload, no second parse.
 
     How a result that came in over the API or the connector becomes a file
@@ -742,7 +742,11 @@ async def file_job(body: DocumentFromJob, user: SessionUser, db: DbSession):
         if folder_id is None or await folder_exists(db, user_id, folder_id):
             raise
         raise ApiError(404, "invalid_request", "No such folder") from None
-    return document_payload(row, await job_of(db, job_id))
+    job = await job_of(db, job_id)
+    # The original went with the first document filed from this parse: this one takes
+    # a copy, so its pages render too (docs/workspace.md § Layout).
+    await workspace_documents.inherit_original(db, settings, row, job)
+    return document_payload(row, job)
 
 
 @router.put("/documents/{document_id}", dependencies=[CsrfGuard])

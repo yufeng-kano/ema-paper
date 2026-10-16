@@ -352,6 +352,39 @@ def keep_source(
     return canonical
 
 
+def _copy_original(root: Path, source_id: int, target_id: int) -> bool:
+    original = original_of(root, source_id)
+    if original is None:
+        return False
+    canonical = original.with_name(f"{target_id}{original.suffix}")
+    staging = canonical.with_name(f".tmp-{canonical.name}")
+    shutil.copyfile(original, staging)
+    os.replace(staging, canonical)
+    return True
+
+
+async def inherit_original(
+    db: AsyncSession, settings: Settings, document: Document, job: Job
+) -> None:
+    """A parse filed again from the History page: its upload went to the first document
+    filed from it, so the new one takes a copy of that original — from any document of
+    the parse that holds one — and, when none does but the upload is still there (the
+    worker left it for a row that had not landed), takes the upload as `adopt_source`
+    does (docs/workspace.md § Layout)."""
+    root = user_root(settings.workspaces_dir, document.user_id)
+    siblings = (
+        await db.execute(
+            select(Document.id)
+            .where(Document.job_id == job.id, Document.id != document.id)
+            .order_by(Document.id)
+        )
+    ).scalars()
+    for sibling_id in siblings:
+        if await asyncio.to_thread(_copy_original, root, sibling_id, document.id):
+            return
+    await adopt_source(db, settings, document, job)
+
+
 def _discard_originals(root: Path, document_ids: list[int]) -> None:
     for document_id in document_ids:
         while (original := original_of(root, document_id)) is not None:

@@ -1286,3 +1286,59 @@ async def test_reconcile_leaves_what_a_command_made_inside_a_document(
         git.commit_all(paths.root, "agent:1", "mkdir from the shell")
         await reconcile.reconcile_user(db, settings, user.id)
         assert (paths.root / "files" / "_.drafts").is_dir()
+
+
+async def test_reconcile_follows_two_documents_that_traded_places(sessionmaker, tmp_path) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, first = await _seed(db, markdown="# First\n")
+        second = Document(
+            user_id=user.id, folder_id=first.folder_id, job_id=first.job_id, name="second.pdf"
+        )
+        db.add(second)
+        await db.commit()
+        a = await documents.materialize_document(db, settings, first)
+        b = await documents.materialize_document(db, settings, second)
+        (b.doc).write_text("# Second\n")
+        # One command: the two directories swapped.
+        scratch = a.directory.with_name("swap-tmp")
+        a.directory.rename(scratch)
+        b.directory.rename(a.directory)
+        scratch.rename(b.directory)
+        git.commit_all(a.root, "agent:1", "swap from the shell")
+
+        assert await reconcile.reconcile_user(db, settings, user.id) == 2
+        rows = {
+            row.id: row
+            for row in (await db.execute(select(Document).where(Document.user_id == user.id)))
+            .scalars()
+            .all()
+        }
+        assert rows[first.id].name == "second.pdf"
+        assert rows[second.id].name == "paper.pdf"
+        # Each row opens its own content where it now lives.
+        assert (await documents.read_content(db, settings, rows[first.id])).markdown == "# First\n"
+        assert (
+            await documents.read_content(db, settings, rows[second.id])
+        ).markdown == "# Second\n"
+
+
+async def test_reconcile_refuses_a_document_that_took_a_folders_name(
+    sessionmaker, tmp_path
+) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+        reports = Folder(user_id=user.id, parent_id=None, name="Reports")
+        db.add(reports)
+        await db.commit()
+        # The shell took the folder's place with the document.
+        paths.directory.rename(paths.root / "files" / "Reports")
+        git.commit_all(paths.root, "agent:1", "mv from the shell")
+
+        assert await reconcile.reconcile_user(db, settings, user.id) == 0
+        row = (await db.execute(select(Document).where(Document.id == document.id))).scalar_one()
+        assert row.name == "paper.pdf" and row.folder_id == document.folder_id
+        folder = (await db.execute(select(Folder).where(Folder.id == reports.id))).scalar_one()
+        assert folder.name == "Reports"

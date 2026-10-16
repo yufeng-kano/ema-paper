@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -235,7 +236,22 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
     for entry in found:
         seen[entry.document_id] = seen.get(entry.document_id, 0) + 1
     cache: dict = {}
-    changed = 0
+    # The names the folder rows hold at each parent, as segments: a document may not
+    # take a sibling folder's name, as on disk the two would be one directory.
+    folder_segments: dict[int | None, set[str]] = {}
+
+    async def taken_by_folders(parent: int | None) -> set[str]:
+        if parent not in folder_segments:
+            rows = await db.execute(
+                select(Folder.name).where(
+                    Folder.user_id == user_id,
+                    Folder.parent_id.is_(None) if parent is None else Folder.parent_id == parent,
+                )
+            )
+            folder_segments[parent] = {path_segment(name) for name in rows.scalars()}
+        return folder_segments[parent]
+
+    updates: list[tuple[Document, int | None, str]] = []
     for entry in found:
         row = documents.get(entry.document_id)
         if row is None:
@@ -262,16 +278,33 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
         # The row's name when the segment is still its encoding; otherwise the name the
         # (now canonical) segment decodes to — what the shell typed.
         name = row.name if path_segment(row.name) == entry.name else segment_name(entry.name)
-        if row.folder_id != folder_id or row.name != name:
+        if row.folder_id == folder_id and row.name == name:
+            continue
+        if entry.name in await taken_by_folders(folder_id):
+            logger.warning(
+                "reconcile for user %d: document %d took a folder's name %s; row unchanged",
+                user_id,
+                entry.document_id,
+                entry.name,
+            )
+            continue
+        updates.append((row, folder_id, name[:512]))
+    if not updates:
+        return 0
+    # Two phases, so rows that trade places (a shell swapped two directories) never
+    # meet the unique constraint on their way: every changing row first takes a name
+    # nothing else holds, then its own (docs/workspace.md § The tree is the truth).
+    for row, _folder_id, _name in updates:
+        row.name = f"~{uuid.uuid4().hex}"
+    try:
+        await db.flush()
+        for row, folder_id, name in updates:
             row.folder_id = folder_id
-            row.name = name[:512]
-            changed += 1
-    if changed:
-        try:
-            await db.commit()
-        except IntegrityError:
-            # A unique clash from the shell is reported, never fatal.
-            await db.rollback()
-            logger.warning("reconcile for user %d hit a name conflict; rows unchanged", user_id)
-            return 0
-    return changed
+            row.name = name
+        await db.commit()
+    except IntegrityError:
+        # A unique clash from the shell is reported, never fatal.
+        await db.rollback()
+        logger.warning("reconcile for user %d hit a name conflict; rows unchanged", user_id)
+        return 0
+    return len(updates)

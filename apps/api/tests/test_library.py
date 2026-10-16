@@ -661,3 +661,30 @@ async def test_deleting_a_document_discards_its_original(
     assert deleted.status_code == 204
     assert original_of(root, uploaded["id"]) is None
     assert not (root / "files" / "tiny (2).png").exists()
+
+
+async def test_a_parse_filed_again_takes_a_copy_of_its_original(
+    make_client, sessionmaker, documents, tmp_path
+) -> None:
+    from sightread.workspace.documents import original_of
+
+    library = make_client(workspaces_dir=str(tmp_path / "ws"))
+    await _ready_to_parse(library)
+    await _upload(library, documents)
+    # The second upload of the same bytes keeps its own original (docs/workspace.md).
+    uploaded = (await _upload(library, documents)).json()
+    async with sessionmaker() as db:
+        row = await db.get(Document, uploaded["id"])
+        root = user_root(library.app.state.settings.workspaces_dir, row.user_id)
+    original = original_of(root, uploaded["id"])
+    assert original is not None
+    # The upload itself is gone: the job's source went to its first document.
+    filed = (await _file_job(library, uploaded["job_id"])).json()
+    copy = original_of(root, filed["id"])
+    assert copy is not None and copy != original
+    assert copy.read_bytes() == original.read_bytes()
+    # Deleting the copy's row discards only its own original.
+    deleted = await library.delete(f"/api/library/documents/{filed['id']}", headers=CSRF_HEADERS)
+    assert deleted.status_code == 204
+    assert original_of(root, filed["id"]) is None
+    assert original_of(root, uploaded["id"]) == original
