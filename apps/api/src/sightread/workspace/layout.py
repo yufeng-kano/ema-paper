@@ -57,6 +57,22 @@ EXCLUDE_RULES = "\n".join(
     )
 )
 
+# The same exclusions as pathspecs for `git reset -- …`: what staging takes back out of
+# the index after `add --force`, which it uses so that a `.gitignore` the shell writes
+# hides nothing from history (git.py). Default pathspec matching, where `*` crosses `/`:
+# each exclusion is named once at the root and once at any depth.
+EXCLUDE_PATHSPECS = (
+    f":(top){SIGHTREAD_DIR}",
+    f":(top){CACHE_DIR}",
+    ":(top).git",
+    f"{SOURCE_STEM}.*",
+    f"*/{SOURCE_STEM}.*",
+    f"{FIGURES_DIR}/*",
+    f"*/{FIGURES_DIR}/*",
+    f"{TEMP_PREFIX}*",
+    f"*/{TEMP_PREFIX}*",
+)
+
 
 def user_root(workspaces_dir: str | Path, user_id: int) -> Path:
     """`{WORKSPACES_DIR}/{user_id}` — what the user's VM mounts as /workspace."""

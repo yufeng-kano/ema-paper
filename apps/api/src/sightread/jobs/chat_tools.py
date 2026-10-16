@@ -24,7 +24,7 @@ from PIL import Image, ImageOps
 
 from ..parsing import poppler
 from ..parsing.figures import parse_bbox_path
-from ..sandbox.client import SandboxClient, SandboxUnavailable
+from ..sandbox.client import SandboxClient, SandboxRejected, SandboxUnavailable
 from ..workspace import git, safe_io
 from ..workspace.documents import DocumentPaths, original_of
 from ..workspace.layout import (
@@ -43,8 +43,6 @@ READ_ONLY_NAMES = frozenset({".git", ".gitignore", SIGHTREAD_DIR, META_FILE, CAC
 VIEW_MAX_CHARS = 60_000
 # The long edge a page image is sent at: what Claude would resize to anyway.
 PAGE_IMAGE_LONG_EDGE_PX = 1568
-# The most an image document may decode to: read from the header, before any decoding.
-PAGE_IMAGE_MAX_PIXELS = 40_000_000
 
 
 class ImageTooLarge(Exception):
@@ -99,6 +97,10 @@ async def run_bash(
         return ToolOutcome("bash needs a `command`", is_error=True)
     try:
         result = await client.exec(user_id, session, command, timeout_seconds=timeout_seconds)
+    except SandboxRejected as exc:
+        # Definitive: the runner refused the request before anything ran (the token, a
+        # command past its validation cap), so nothing is unconfirmed about it.
+        return ToolOutcome(f"The sandbox runner rejected the command: {exc}", is_error=True)
     except SandboxUnavailable as exc:
         return ToolOutcome(
             f"The sandbox is unavailable: {exc}\n"
@@ -402,15 +404,16 @@ def _png_block(data: bytes) -> dict:
     }
 
 
-def _as_png(source: Path | bytes) -> bytes:
+def _as_png(source: Path | bytes, max_pixels: int) -> bytes:
     """A PNG no larger than the model would keep, oriented, flattened onto white. The
-    size comes from the header: a file that would decode past the pixel cap is refused
-    before a raster exists, and Pillow's own bomb check is an error, never a warning."""
+    size comes from the header: a file that would decode past `max_pixels`
+    (`CHAT_PAGE_IMAGE_MAX_PIXELS`) is refused before a raster exists, and Pillow's own
+    bomb check is an error, never a warning."""
     with warnings.catch_warnings():
         warnings.simplefilter("error", Image.DecompressionBombWarning)
         opened = Image.open(io.BytesIO(source) if isinstance(source, bytes) else source)
     with opened:
-        if opened.width * opened.height > PAGE_IMAGE_MAX_PIXELS:
+        if opened.width * opened.height > max_pixels:
             raise ImageTooLarge(f"{opened.width}x{opened.height} exceeds the pixel cap")
         image = ImageOps.exif_transpose(opened) or opened
         if image.mode in ("RGBA", "LA", "P"):
@@ -477,6 +480,7 @@ async def view_page(
     render_slots: asyncio.Semaphore,
     decode_slot: asyncio.Semaphore,
     max_bytes: int,
+    max_pixels: int,
     kind: str,
 ) -> ToolOutcome:
     # The original kept outside the mount first; the shell's copy only when there is
@@ -518,7 +522,7 @@ async def view_page(
                     # The raster, one at a time per turn: a round of four reads must
                     # not hold four decoded pages before the budget sees any of them.
                     async with decode_slot:
-                        data = await _settled(asyncio.to_thread(_as_png, rendered))
+                        data = await _settled(asyncio.to_thread(_as_png, rendered, max_pixels))
                 except poppler.PopplerError:
                     return ToolOutcome(f"page {page} could not be rendered", is_error=True)
         else:
@@ -526,7 +530,7 @@ async def view_page(
                 with os.fdopen(os.dup(fd), "rb") as reader:
                     raw = await asyncio.to_thread(reader.read, max_bytes + 1)
                 async with decode_slot:
-                    data = await _settled(asyncio.to_thread(_as_png, raw))
+                    data = await _settled(asyncio.to_thread(_as_png, raw, max_pixels))
             except OSError:
                 return ToolOutcome("the original image could not be read", is_error=True)
             except (ImageTooLarge, Image.DecompressionBombError, Image.DecompressionBombWarning):

@@ -341,11 +341,15 @@ async def _emit(ctx: TurnContext, event: str, data: dict) -> None:
 
 async def _cancelled(ctx: TurnContext) -> bool:
     async with ctx.sessionmaker() as db:
-        status = (
-            await db.execute(select(ChatTurn.status).where(ChatTurn.id == ctx.turn.id))
-        ).scalar_one_or_none()
-        # A row that is gone (the conversation was deleted under us) is a stop as well.
-        return status is None or status == "cancelled"
+        row = (
+            await db.execute(
+                select(ChatTurn.status, ChatTurn.finished_at).where(ChatTurn.id == ctx.turn.id)
+            )
+        ).one_or_none()
+        # A row that is gone (the conversation was deleted under us) is a stop as well,
+        # and so is a turn already finished: the worker that took the lock this one lost
+        # has finished it as an orphan (docs/jobs.md § Queue).
+        return row is None or row.status == "cancelled" or row.finished_at is not None
 
 
 async def _store(ctx: TurnContext, role: str, content: list[dict]) -> int:
@@ -614,6 +618,7 @@ async def _run_tool_unguarded(
             render_slots=ctx.render_slots,
             decode_slot=ctx.decode_slot,
             max_bytes=ctx.settings.upload_max_bytes,
+            max_pixels=ctx.settings.chat_page_image_max_pixels,
             kind=ctx.job.kind,
         )
     elif name == "view_figure":
@@ -905,6 +910,10 @@ async def _finish(
             select(Conversation.id).where(Conversation.id == turn.conversation_id).with_for_update()
         )
         await db.refresh(turn)
+        if turn.finished_at is not None:
+            # Finished by another worker — the one that took the lock this one lost and
+            # found the turn orphaned: its terminal state and event stand (docs/jobs.md).
+            return
         if turn.status == "cancelled" or status == "cancelled":
             status, error = "cancelled", "cancelled"
         turn.status = status

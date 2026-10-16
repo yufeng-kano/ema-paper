@@ -90,6 +90,9 @@ class Settings(BaseSettings):
     workspace_git_timeout_seconds: int = 60
     chat_image_round_max_bytes: int = 32 * 1024 * 1024
     chat_image_turn_max_bytes: int = 128 * 1024 * 1024
+    # The most an image document may decode to for `view_page`, read from its header
+    # before any decoding (docs/chat.md § Tools).
+    chat_page_image_max_pixels: int = 40_000_000
     # The stored history a conversation may replay, every message together: a turn past
     # it is refused with a pointer to a new conversation (docs/chat.md § History).
     chat_history_max_bytes: int = 256 * 1024 * 1024

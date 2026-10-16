@@ -1767,3 +1767,35 @@ async def test_a_move_that_fails_after_displacing_a_squatter_puts_it_back(
         "paper.pdf",
         "renamed.pdf",
     ]
+
+
+def test_a_gitignore_from_the_shell_hides_nothing_from_history(tmp_path) -> None:
+    root = tmp_path / "ws" / "1"
+    git.ensure_repo(root)
+    directory = root / "files" / "paper.pdf"
+    directory.mkdir(parents=True)
+    (directory / "doc.md").write_text("# A\n")
+    assert git.commit_all(root, "user", "seed") is not None
+    # A command writes an ignore file that would hide its own changes, and the files
+    # the workspace keeps out of history on its own account.
+    (root / ".gitignore").write_text("*.md\nfiles/\n")
+    (directory / "notes.md").write_text("not hidden\n")
+    (directory / "source.pdf").write_bytes(b"%PDF-1.4")
+    (directory / "figures").mkdir()
+    (directory / "figures" / "p1.png").write_bytes(b"png")
+    (root / f"{safe_io.TEMP_PREFIX}x").mkdir()
+    (root / f"{safe_io.TEMP_PREFIX}x" / "half.md").write_text("half\n")
+    (root / ".cache").mkdir()
+    (root / ".cache" / "pip").write_text("x")
+    (root / ".sightread").mkdir()
+    (root / ".sightread" / "r.json").write_text("{}")
+    assert git.commit_all(root, "agent:1", "bash: hide") is not None
+    assert set(git.log(root)[0].files) == {".gitignore", "files/paper.pdf/notes.md"}
+    # A host write's path-scoped commit is as blind to the ignore file.
+    (directory / "doc.md").write_text("# B\n")
+    assert git.commit_paths(root, "user", "save", [Path("files/paper.pdf/doc.md")]) is not None
+    assert git.log(root)[0].files == ("files/paper.pdf/doc.md",)
+    (directory / "doc.md").write_text("# C\n")
+    (directory / "source.pdf").write_bytes(b"%PDF-1.5")
+    assert git.commit_paths(root, "user", "save", [Path("files/paper.pdf")]) is not None
+    assert git.log(root)[0].files == ("files/paper.pdf/doc.md",)

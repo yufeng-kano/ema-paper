@@ -18,7 +18,7 @@ from pathlib import Path
 
 from ..config import get_settings
 from . import safe_io
-from .layout import EXCLUDE_RULES, git_dir
+from .layout import EXCLUDE_PATHSPECS, EXCLUDE_RULES, git_dir
 
 GIT = "git"
 
@@ -119,12 +119,27 @@ def _commit_staged(root: Path, author: str, message: str) -> str | None:
     return head(root)
 
 
+def _stage(root: Path, pathspec: str) -> subprocess.CompletedProcess[str]:
+    """Stage what `pathspec` matches, ignore rules notwithstanding: `--force`, since a
+    `.gitignore` a shell command writes into the tree must hide nothing from history.
+    The workspace's own exclusions are then taken back out of the index, to what the
+    head holds of them — nothing, they were never committed — so they alone stay out.
+    Two calls: git stages nothing for a `:(literal)` pathspec given beside exclusion
+    pathspecs (docs/workspace.md § Revisions)."""
+    proc = _git(root, "add", "-A", "--force", "--", pathspec, check=False)
+    if proc.returncode == 0:
+        _git(root, "reset", "-q", "--", *EXCLUDE_PATHSPECS)
+    return proc
+
+
 def commit_all(root: Path, author: str, message: str) -> str | None:
     """Stage everything and commit; None when the tree was clean. For the shell, whose
     changes nobody can name in advance — under the shell lock, so the dirt is all its.
     A failure anywhere leaves the index reset, never half-staged."""
     try:
-        _git(root, "add", "-A")
+        staged = _stage(root, ".")
+        if staged.returncode != 0:
+            raise GitError(staged.stderr.strip() or "git add failed")
         return _commit_staged(root, author, message)
     except GitError:
         reset_index(root)
@@ -144,7 +159,7 @@ def commit_paths(root: Path, author: str, message: str, paths: list[Path]) -> st
     # which commits the whole index.
     try:
         for path in paths:
-            proc = _git(root, "add", "-A", "--", _literal(path), check=False)
+            proc = _stage(root, _literal(path))
             if proc.returncode != 0 and "did not match any files" not in proc.stderr:
                 raise GitError(f"git add failed for {path}: {proc.stderr.strip()}")
         return _commit_staged(root, author, message)

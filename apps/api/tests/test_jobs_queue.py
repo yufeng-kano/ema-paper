@@ -418,3 +418,77 @@ async def test_a_job_of_a_user_with_an_orphaned_turn_is_not_claimed(sessionmaker
         assert await claim_next_job(db, 2, {user.id}) is None
     async with sessionmaker() as db:
         assert await claim_next_job(db, 2, {user.id + 1000}) == job.id
+
+
+async def test_a_stale_workers_writes_are_fenced_by_its_generation(sessionmaker, tmp_path) -> None:
+    """A worker that lost the worker lock goes on for seconds; the replacement has
+    requeued and claimed its job by then, and nothing the stale one writes may land —
+    except the usage its calls billed (docs/jobs.md § Queue)."""
+    from sqlalchemy import func, select
+
+    from sightread.config import Settings
+    from sightread.db.models import JobPage, UsageLog
+    from sightread.jobs.queue import next_worker_generation, requeue_orphaned_jobs
+    from sightread.jobs.runner import PageOutcome, _record_page, fail_job
+    from sightread.upstream.client import Usage
+    from tests.conftest import KANO_BASE, TEST_SECRET_KEY
+
+    async with sessionmaker() as db:
+        user = await _user(db)
+        job = await enqueue_job(
+            db, user_id=user.id, sha256="c" * 64, source_path="unused-c.pdf", **JOB_DEFAULTS
+        )
+        await db.commit()
+        job_id = job.id
+    async with sessionmaker() as db:
+        stale = await next_worker_generation(db)
+        assert await claim_next_job(db, 2, None, stale) == job_id
+        assert (await db.get(Job, job_id)).worker_generation == stale
+    # The replacement starts: every running row is a dead worker's to it.
+    async with sessionmaker() as db:
+        assert await requeue_orphaned_jobs(db) == [job_id]
+        assert (await db.get(Job, job_id)).worker_generation is None
+        fresh = await next_worker_generation(db)
+        assert fresh > stale
+        assert await claim_next_job(db, 2, None, fresh) == job_id
+
+    async with sessionmaker() as db:
+        job = await db.get(Job, job_id)
+    outcome = PageOutcome(
+        page=1,
+        width_pt=1.0,
+        height_pt=1.0,
+        method="vision",
+        markdown="x",
+        usage=[Usage(prompt_tokens=1, completion_tokens=1, cost=None, cost_source="unknown")],
+    )
+    settings = Settings(
+        app_env="local",
+        secret_key=TEST_SECRET_KEY,
+        workspaces_dir=str(tmp_path / "workspaces"),
+        figures_dir=str(tmp_path / "figures"),
+        kano_proxy_base_url=KANO_BASE,
+    )
+
+    async def counts(db) -> tuple[int, int]:
+        pages = select(func.count()).select_from(JobPage).where(JobPage.job_id == job_id)
+        usage = select(func.count()).select_from(UsageLog).where(UsageLog.job_id == job_id)
+        return (await db.execute(pages)).scalar_one(), (await db.execute(usage)).scalar_one()
+
+    # The stale worker finishes a page, is cancelled, fails: none of it lands but the bill.
+    await _record_page(sessionmaker, job, outcome, stale)
+    async with sessionmaker() as db:
+        row = await db.get(Job, job_id)
+        assert (row.pages_done, row.status, row.worker_generation) == (0, "running", fresh)
+        assert await counts(db) == (0, 1)
+        assert await requeue_job(db, job_id, stale) is False
+    await fail_job(sessionmaker, settings, job_id, "internal error", stale)
+    async with sessionmaker() as db:
+        assert (await db.get(Job, job_id)).status == "running"
+    # The owner's writes land.
+    await _record_page(sessionmaker, job, outcome, fresh)
+    await fail_job(sessionmaker, settings, job_id, "internal error", fresh)
+    async with sessionmaker() as db:
+        row = await db.get(Job, job_id)
+        assert (row.pages_done, row.status, row.error) == (1, "failed", "internal error")
+        assert await counts(db) == (1, 2)

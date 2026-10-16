@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 
 from ..agents import get_agent
 from ..config import Settings
-from ..db.models import ChatTurn, Conversation, Job, JobPage, utcnow
+from ..db.models import WORKER_GENERATION_SEQ, ChatTurn, Conversation, Job, JobPage, utcnow
 from ..sandbox.client import SandboxClient, SandboxUnavailable
 from ..workspace import git
 from ..workspace.layout import REPOS_DIR, git_dir, user_root
@@ -41,10 +41,11 @@ ORPHAN_REVISION_MESSAGE = "bash: interrupted by a worker restart"
 UNSETTLED_REVISION_MESSAGE = "bash: recovered after an unconfirmed command"
 
 # PostgreSQL claim (docs/jobs.md). The correlated count applies the per-user running cap
-# to the same scan that picks the oldest queued job.
+# to the same scan that picks the oldest queued job; the generation is the claimer's
+# fence on every later write to the row.
 CLAIM_SQL = text(
     """
-    UPDATE jobs SET status = 'running', started_at = now()
+    UPDATE jobs SET status = 'running', started_at = now(), worker_generation = :generation
     WHERE id = (
       SELECT j.id FROM jobs j
       WHERE j.status = 'queued'
@@ -253,15 +254,22 @@ async def enqueue_job(
 
 
 async def claim_next_job(
-    db: AsyncSession, max_jobs_per_user: int, excluded_users: set[int] | None = None
+    db: AsyncSession,
+    max_jobs_per_user: int,
+    excluded_users: set[int] | None = None,
+    generation: int | None = None,
 ) -> uuid.UUID | None:
     """Claim the oldest queued job whose user is under the running cap, or None. A user
     in `excluded_users` — one whose orphaned turn the worker could not stop yet — gets
-    no parse run, since its finish writes that user's tree (docs/jobs.md § Chat turns)."""
+    no parse run, since its finish writes that user's tree (docs/jobs.md § Chat turns).
+    `generation` is the claimer's (`next_worker_generation`), written on the row: the
+    fence every write it makes to the job carries, so a worker that lost the worker
+    lock cannot write over the one that took the job (docs/jobs.md § Queue)."""
     # No user id is 0: the sentinel keeps the clause well-formed when nobody is excluded.
     params = {
         "max_jobs_per_user": max_jobs_per_user,
         "excluded_users": sorted(excluded_users or ()) or [0],
+        "generation": generation,
     }
     if db.get_bind().dialect.name == "postgresql":
         claimed = (await db.execute(CLAIM_SQL, params)).scalar_one_or_none()
@@ -275,10 +283,23 @@ async def claim_next_job(
     updated = await db.execute(
         update(Job)
         .where(Job.id == job_id, Job.status == "queued")
-        .values(status="running", started_at=utcnow())
+        .values(status="running", started_at=utcnow(), worker_generation=generation)
     )
     await db.commit()
     return job_id if updated.rowcount == 1 else None
+
+
+async def next_worker_generation(db: AsyncSession) -> int:
+    """The generation a worker takes with the worker lock and writes on every job it
+    claims (docs/jobs.md § Queue). PostgreSQL: the next value of a sequence, so no two
+    workers ever hold one generation — the stale one keeps making paid calls for the
+    seconds before it notices its lock is gone, and the replacement has requeued and
+    claimed its job by then. The SQLite fallback runs one worker: past the highest on
+    record."""
+    if db.get_bind().dialect.name == "postgresql":
+        return int((await db.execute(select(WORKER_GENERATION_SEQ.next_value()))).scalar_one())
+    highest = (await db.execute(select(func.max(Job.worker_generation)))).scalar_one()
+    return int(highest or 0) + 1
 
 
 # The advisory lock one worker holds for its lifetime: any fixed bigint (docs/jobs.md).
@@ -351,19 +372,23 @@ async def requeue_orphaned_jobs(db: AsyncSession) -> list[uuid.UUID]:
     return orphans
 
 
-async def requeue_job(db: AsyncSession, job_id: uuid.UUID) -> bool:
+async def requeue_job(db: AsyncSession, job_id: uuid.UUID, generation: int | None = None) -> bool:
     """Put an interrupted job back on the queue and forget its partial progress.
 
     Shutdown mid-run reparses from scratch: pages are not individually resumable, and a
     reparse is cheaper to reason about than a half-written result. False when the job
     was no longer `running` — its result committed before the cancel landed — and so
-    stays as it is, its pages and crops with it.
+    stays as it is, its pages and crops with it; or, with `generation`, when the row no
+    longer holds the caller's: a worker that lost the lock must not put back a job the
+    replacement has taken (docs/jobs.md § Queue). A worker starting requeues without
+    one, since every `running` row is then a dead worker's.
     """
+    owned = [Job.worker_generation == generation] if generation is not None else []
     requeued = (
         await db.execute(
             update(Job)
-            .where(Job.id == job_id, Job.status == "running")
-            .values(status="queued", started_at=None, pages_done=0)
+            .where(Job.id == job_id, Job.status == "running", *owned)
+            .values(status="queued", started_at=None, pages_done=0, worker_generation=None)
         )
     ).rowcount > 0
     if requeued:

@@ -50,6 +50,7 @@ from ..jobs.intake import (
 from ..jobs.runner import partial_result_payload, result_payload
 from ..parsing.figures import crop_path, parse_bbox_path
 from ..workspace import documents as workspace_documents
+from ..workspace import safe_io
 from ..workspace.layout import document_relative_dir, path_segment, user_root
 from ..workspace.locks import backup_shared, workspace_lock
 
@@ -444,27 +445,43 @@ class FolderUpdate(BaseModel):
 
 
 @router.post("/folders", dependencies=[CsrfGuard], status_code=status.HTTP_201_CREATED)
-async def create_folder(body: FolderCreate, user: SessionUser, db: DbSession):
+async def create_folder(
+    body: FolderCreate, user: SessionUser, db: DbSession, settings: AppSettings
+):
     if body.parent_id is not None:
         await owned_folder(db, user.id, body.parent_id)
     parent_id = body.parent_id
-    try:
-        row = await insert_named(
-            db,
-            user_id=user.id,
-            build=lambda name: Folder(user_id=user.id, parent_id=parent_id, name=name),
-            taken=lambda: sibling_names(db, user.id, parent_id),
-            wanted=clean_name(body.name, FOLDER_NAME_MAX),
-            limit=FOLDER_NAME_MAX,
-            message="A folder with this name already exists here",
-        )
-    except ApiError:
-        # A parent deleted between the check above and the insert fails the foreign key,
-        # which arrives as the same IntegrityError a taken name does — and retrying with a
-        # destination that no longer exists only ever produces a 409 about the wrong thing.
-        if parent_id is None or await folder_exists(db, user.id, parent_id):
-            raise
-        raise ApiError(404, "invalid_request", "No such folder") from None
+    # The row and its directory under one hold of the workspace lock, as a move or a
+    # delete: the shell sees the folder as soon as the row exists, and a workspace that
+    # takes no host write (recovering) refuses it up front (docs/workspace.md § Layout).
+    async with workspace_lock(user_root(settings.workspaces_dir, user.id)):
+        try:
+            row = await insert_named(
+                db,
+                user_id=user.id,
+                build=lambda name: Folder(user_id=user.id, parent_id=parent_id, name=name),
+                taken=lambda: sibling_names(db, user.id, parent_id),
+                wanted=clean_name(body.name, FOLDER_NAME_MAX),
+                limit=FOLDER_NAME_MAX,
+                message="A folder with this name already exists here",
+            )
+        except ApiError:
+            # A parent deleted between the check above and the insert fails the foreign
+            # key, which arrives as the same IntegrityError a taken name does — and
+            # retrying with a destination that no longer exists only ever produces a 409
+            # about the wrong thing.
+            if parent_id is None or await folder_exists(db, user.id, parent_id):
+                raise
+            raise ApiError(404, "invalid_request", "No such folder") from None
+        relative = await folder_relative_dir(db, user.id, row.id)
+        try:
+            await workspace_documents.make_folder_dir(settings, user.id, relative)
+        except (safe_io.UnsafeEntry, OSError):
+            # An entry the shell planted where the directory belongs: the row stands,
+            # the tree is the shell's, and the next materialization under it says so.
+            logger.warning(
+                "the directory of folder %d of user %d could not be made", row.id, user.id
+            )
     return folder_payload(row)
 
 

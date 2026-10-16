@@ -611,7 +611,8 @@ async def test_a_move_the_tree_refuses_leaves_the_row_where_the_files_are(
     # and the row must not point at a place the files never reached.
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
-    (root / "files").mkdir(parents=True, exist_ok=True)
+    # The folder's directory, made with its row, replaced by a link the shell planted.
+    (root / "files" / "Invoices").rmdir()
     (root / "files" / "Invoices").symlink_to(elsewhere)
     moved = await library.put(
         f"/api/library/documents/{uploaded['id']}",
@@ -889,3 +890,29 @@ async def test_filing_a_running_parse_marks_it_for_retention(
         # Under the job's row lock, before the row was inserted: a worker finishing the
         # parse at that moment leaves the upload for the new row.
         assert job.retain_source is True
+
+
+async def test_a_created_folder_is_a_directory_at_once(make_client, tmp_path) -> None:
+    from sightread.workspace import git
+    from sightread.workspace.locks import mark_writing
+
+    library = make_client(workspaces_dir=str(tmp_path / "ws"))
+    await _ready_to_parse(library)
+    user_id = (await library.get("/api/me")).json()["user"]["id"]
+    papers = await _folder(library, "Papers")
+    await _folder(library, "2024", papers["id"])
+    root = user_root(library.app.state.settings.workspaces_dir, user_id)
+    # The shell sees the folder before any document lands in it; git records no empty
+    # directory, so nothing was committed (docs/workspace.md § Layout).
+    assert (root / "files" / "Papers" / "2024").is_dir()
+    assert git.log(root) == []
+    # A workspace that takes no host write refuses the folder up front.
+    mark_writing(root, 1, "s")
+    refused = await library.post(
+        "/api/library/folders", json={"name": "Later", "parent_id": None}, headers=CSRF_HEADERS
+    )
+    assert refused.status_code == 409
+    assert {row["name"] for row in (await library.get("/api/library")).json()["folders"]} == {
+        "Papers",
+        "2024",
+    }

@@ -13,6 +13,7 @@ from decimal import Decimal
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -21,6 +22,7 @@ from sqlalchemy import (
     Integer,
     LargeBinary,
     Numeric,
+    Sequence,
     String,
     Text,
     UniqueConstraint,
@@ -283,9 +285,19 @@ class Job(Base):
     # A library upload: the original is kept for its document (docs/jobs.md § Retention),
     # even when the document row lands after the parse has finished.
     retain_source: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    # The generation of the worker that claimed it, NULL while queued: every write a
+    # worker makes to a running job is fenced on it, so a worker that lost the worker
+    # lock cannot write over the one that took the job (docs/jobs.md § Queue).
+    worker_generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     started_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
+
+
+# One value per worker start, taken with the worker lock (docs/jobs.md § Queue). On the
+# metadata so `create_all` makes it where the dialect has sequences; the SQLite fallback
+# counts from the highest generation on record instead.
+WORKER_GENERATION_SEQ = Sequence("worker_generation_seq", metadata=Base.metadata)
 
 
 class JobPage(Base):

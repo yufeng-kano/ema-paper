@@ -605,6 +605,7 @@ async def test_view_page_and_view_figure_read_the_documents_own_files(tmp_path, 
         render_slots=asyncio.Semaphore(1),
         decode_slot=asyncio.Semaphore(1),
         max_bytes=10_000_000,
+        max_pixels=40_000_000,
         kind="pdf",
     )
     assert not page.is_error
@@ -624,6 +625,7 @@ async def test_view_page_and_view_figure_read_the_documents_own_files(tmp_path, 
         render_slots=asyncio.Semaphore(1),
         decode_slot=asyncio.Semaphore(1),
         max_bytes=10_000_000,
+        max_pixels=40_000_000,
         kind="pdf",
     )
     assert not from_original.is_error and from_original.content[1]["text"] == "Page 1."
@@ -635,6 +637,7 @@ async def test_view_page_and_view_figure_read_the_documents_own_files(tmp_path, 
         render_slots=asyncio.Semaphore(1),
         decode_slot=asyncio.Semaphore(1),
         max_bytes=10_000_000,
+        max_pixels=40_000_000,
         kind="pdf",
     )
     assert too_far.is_error
@@ -838,7 +841,9 @@ def _round_ctx(image_budget: int = 32 << 20) -> SimpleNamespace:
     """What `_run_tools` reads from its context: the round's and the turn's image budgets."""
     return SimpleNamespace(
         settings=SimpleNamespace(
-            chat_image_round_max_bytes=image_budget, chat_image_turn_max_bytes=image_budget * 4
+            chat_image_round_max_bytes=image_budget,
+            chat_image_turn_max_bytes=image_budget * 4,
+            chat_page_image_max_pixels=1,
         ),
         image_spent=0,
     )
@@ -865,6 +870,7 @@ async def test_a_rounds_images_never_exceed_the_budget(monkeypatch) -> None:
         settings=SimpleNamespace(
             chat_image_round_max_bytes=250,
             chat_image_turn_max_bytes=1 << 30,
+            chat_page_image_max_pixels=1,
             chat_tool_result_max_chars=1000,
             upload_max_bytes=1,
             content_max_bytes=1,
@@ -1288,10 +1294,13 @@ def test_an_image_past_the_pixel_cap_is_refused_before_it_is_decoded() -> None:
     Image.new("1", (7000, 7000)).save(buffer, format="PNG")
     assert len(buffer.getvalue()) < 100_000
     with pytest.raises(chat_tools.ImageTooLarge):
-        chat_tools._as_png(buffer.getvalue())
+        chat_tools._as_png(buffer.getvalue(), 40_000_000)
     small = io.BytesIO()
     Image.new("RGB", (20, 10), (255, 0, 0)).save(small, format="PNG")
-    assert chat_tools._as_png(small.getvalue()).startswith(b"\x89PNG")
+    assert chat_tools._as_png(small.getvalue(), 40_000_000).startswith(b"\x89PNG")
+    # The cap is the deployment's (`CHAT_PAGE_IMAGE_MAX_PIXELS`), not a constant.
+    with pytest.raises(chat_tools.ImageTooLarge):
+        chat_tools._as_png(small.getvalue(), 100)
 
 
 @respx.mock
@@ -1837,6 +1846,7 @@ async def test_a_turns_images_never_exceed_the_turn_budget(monkeypatch) -> None:
         settings=SimpleNamespace(
             chat_image_round_max_bytes=1000,
             chat_image_turn_max_bytes=250,
+            chat_page_image_max_pixels=1,
             chat_tool_result_max_chars=1000,
             upload_max_bytes=1,
             content_max_bytes=1,
@@ -1910,6 +1920,7 @@ async def test_a_shell_command_holds_the_workspace_lock(tmp_path, monkeypatch) -
         settings=SimpleNamespace(
             chat_image_round_max_bytes=1000,
             chat_image_turn_max_bytes=1000,
+            chat_page_image_max_pixels=1,
             chat_tool_result_max_chars=1000,
             chat_bash_timeout_seconds=1,
         ),
@@ -2080,6 +2091,7 @@ async def test_a_shell_move_is_reconciled_before_the_lock_is_released(
         settings=SimpleNamespace(
             chat_image_round_max_bytes=1000,
             chat_image_turn_max_bytes=1000,
+            chat_page_image_max_pixels=1,
             chat_tool_result_max_chars=1000,
             chat_bash_timeout_seconds=1,
         ),
@@ -2700,3 +2712,69 @@ async def test_a_shell_command_stands_marked_as_writing_for_its_whole_run(
     assert not writing_marker(paths.root).exists()  # the command is over and recorded
     assert result["content"] == "ok" and "is_error" not in result
     assert git.log(paths.root)[0].message == "bash: touch made.txt"
+
+
+@respx.mock
+async def test_a_request_the_runner_refuses_is_settled_not_unconfirmed() -> None:
+    from sightread.config import Settings
+    from sightread.sandbox.client import SandboxRejected, SandboxUnavailable
+
+    client = SandboxClient(
+        Settings(app_env="local", sandbox_url="http://sandbox:8100", sandbox_token="t")
+    )
+    route = respx.post("http://sandbox:8100/sandboxes/7/exec")
+    # A 4xx is the runner's own refusal, before anything ran: the token, a command past
+    # its validation cap (docs/chat.md § Tools).
+    route.mock(return_value=httpx.Response(422, json={"detail": "command too long"}))
+    with pytest.raises(SandboxRejected):
+        await client.exec(7, "s", "x" * 10, timeout_seconds=5)
+    # A 5xx leaves it unknown whether the command ran.
+    route.mock(return_value=httpx.Response(503, json={"detail": "unstoppable"}))
+    with pytest.raises(SandboxUnavailable) as caught:
+        await client.exec(7, "s", "x", timeout_seconds=5)
+    assert not isinstance(caught.value, SandboxRejected)
+
+    class Client:
+        async def exec(self, *args, **kwargs):
+            raise SandboxRejected("the sandbox runner refused the request (422)")
+
+    outcome = await chat_tools.run_bash(
+        Client(), 1, "s", {"command": "x"}, max_chars=200, timeout_seconds=5
+    )
+    # Settled: no marker stays, no later host write is refused over a command that never ran.
+    assert outcome.is_error and outcome.settled is True
+    assert "rejected the command" in outcome.content
+
+
+async def test_a_turn_another_worker_finished_is_left_as_it_is(chatting) -> None:
+    """The worker that lost the lock finds its turn finished by the one that took it
+    (docs/jobs.md § Queue): its loop stops, and its own terminal write changes nothing."""
+    conversation_id = (
+        await chatting.post(
+            f"/api/library/documents/{chatting.document_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    sent = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
+    )
+    turn_id = uuid.UUID(sent.json()["turn_id"])
+    sessionmaker = chatting.app.state.sessionmaker
+    async with sessionmaker() as db:
+        turn = await db.get(ChatTurn, turn_id)
+        turn.status = "running"
+        await db.commit()
+    stale = SimpleNamespace(sessionmaker=sessionmaker, turn=SimpleNamespace(id=turn_id))
+    assert await chat_runner._cancelled(stale) is False
+    async with sessionmaker() as db:
+        await fail_turn(db, turn_id, "worker restarted")
+    assert await chat_runner._cancelled(stale) is True
+    await chat_runner._finish(sessionmaker, turn_id, status="succeeded")
+    async with sessionmaker() as db:
+        turn = await db.get(ChatTurn, turn_id)
+        assert (turn.status, turn.error) == ("failed", "worker restarted")
+        events = (
+            (await db.execute(select(ChatEvent).where(ChatEvent.turn_id == turn_id)))
+            .scalars()
+            .all()
+        )
+    assert [event.event for event in events] == ["turn_error"]

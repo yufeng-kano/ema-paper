@@ -133,6 +133,9 @@ class RunState:
     # This job's own directory under FIGURES_DIR; None turns crop persistence off
     # (docs/parsing.md § Figure crops).
     figures_dir: Path | None = None
+    # The worker's generation, the fence on every write to the job's row; None when the
+    # caller claimed without one (docs/jobs.md § Queue).
+    generation: int | None = None
     # FIGURES_PER_PAGE_MAX — the crop cap one page may spend (docs/parsing.md).
     figures_per_page: int = 40
     # Crop threads cannot be cancelled from the event loop, so writing and discarding
@@ -285,7 +288,7 @@ async def _process_pdf_page(
         # The Poppler detail is diagnostic (its stderr), never document content.
         logger.warning("job %s page %d render failed: %s", job.id, page_no, exc)
         outcome.error = "render failed"
-        await _record_page(sessionmaker, job, outcome)
+        await _record_page(sessionmaker, job, outcome, state.generation)
         return outcome
 
     convention = convention_for_job(job.model, job.pipeline_version)
@@ -312,7 +315,7 @@ async def _process_pdf_page(
         # Billing before the optional raster work: a SIGTERM landing mid-crop cancels this
         # task, and the requeued reparse bills the page again — the call that already ran
         # must be in `usage_log` first.
-        await _record_page(sessionmaker, job, outcome)
+        await _record_page(sessionmaker, job, outcome, state.generation)
         if transcription is not None:
             await _save_figures(state, outcome.markdown, image, page_no)
     finally:
@@ -336,7 +339,7 @@ async def _process_image(
         outcome = PageOutcome(
             page=1, width_pt=0, height_pt=0, error="the image could not be decoded"
         )
-        await _record_page(sessionmaker, job, outcome)
+        await _record_page(sessionmaker, job, outcome, state.generation)
         return outcome
 
     outcome = PageOutcome(
@@ -364,7 +367,7 @@ async def _process_image(
         if transcription is not None:
             outcome.markdown = transcription.markdown
         # Same ordering as the PDF path: the billed call is persisted before crop work.
-        await _record_page(sessionmaker, job, outcome)
+        await _record_page(sessionmaker, job, outcome, state.generation)
         if transcription is not None:
             await _save_figures(state, outcome.markdown, normalized.path, 1)
     finally:
@@ -407,22 +410,46 @@ def _discard_figures(state: RunState) -> None:
         shutil.rmtree(state.figures_dir, ignore_errors=True)
 
 
+def _owned(generation: int | None) -> list:
+    """The fence: the row still holds the caller's generation (docs/jobs.md § Queue)."""
+    return [Job.worker_generation == generation] if generation is not None else []
+
+
 async def _record_page(
-    sessionmaker: async_sessionmaker[AsyncSession], job: Job, outcome: PageOutcome
+    sessionmaker: async_sessionmaker[AsyncSession],
+    job: Job,
+    outcome: PageOutcome,
+    generation: int | None = None,
 ) -> None:
-    """Persist one finished page: its row, the job's progress and the calls it billed."""
+    """Persist one finished page: its row, the job's progress and the calls it billed.
+    The progress goes first, fenced on the generation: a row another worker has taken
+    (this one lost the worker lock) gets no page from here — the other's pages are its
+    own — but the calls are logged whatever happened, since the user's key paid for
+    them (docs/jobs.md § Queue)."""
     async with sessionmaker() as db:
-        db.add(
-            JobPage(
-                job_id=job.id,
-                page_no=outcome.page,
-                method=outcome.method,
-                status="failed" if outcome.error else "succeeded",
-                error=outcome.error,
-                # What the partial result reads while the job runs (docs/jobs.md).
-                markdown=outcome.markdown if not outcome.error else None,
+        owned = (
+            await db.execute(
+                update(Job)
+                .where(Job.id == job.id, *_owned(generation))
+                .values(pages_done=Job.pages_done + 1)
             )
-        )
+        ).rowcount == 1
+        if owned:
+            db.add(
+                JobPage(
+                    job_id=job.id,
+                    page_no=outcome.page,
+                    method=outcome.method,
+                    status="failed" if outcome.error else "succeeded",
+                    error=outcome.error,
+                    # What the partial result reads while the job runs (docs/jobs.md).
+                    markdown=outcome.markdown if not outcome.error else None,
+                )
+            )
+        else:
+            logger.warning(
+                "job %s is no longer this worker's; page %d is not recorded", job.id, outcome.page
+            )
         for usage in outcome.usage:
             db.add(
                 UsageLog(
@@ -435,8 +462,8 @@ async def _record_page(
                     cost_source=usage.cost_source,
                 )
             )
-        await db.execute(update(Job).where(Job.id == job.id).values(pages_done=Job.pages_done + 1))
-        await events.notify(db, job.id)
+        if owned:
+            await events.notify(db, job.id)
         await db.commit()
 
 
@@ -445,17 +472,28 @@ async def fail_job(
     settings: Settings,
     job_id: uuid.UUID,
     error: str,
+    generation: int | None = None,
 ) -> None:
     """A job whose task raised past `run_job` (a database error while the terminal state
     was being written, say): failed, never requeued — the parse ran and billed the user's
     key, and a fault of ours is no reason to run it again. A job no longer `running` (its
-    result committed before what raised) is left as it is (docs/jobs.md). With settings,
-    like every other terminal path: a library row keeps its original here too."""
+    result committed before what raised), or no longer this worker's (docs/jobs.md
+    § Queue), is left as it is. With settings, like every other terminal path: a library
+    row keeps its original here too."""
     async with sessionmaker() as db:
         job = await db.get(Job, job_id)
         if job is None or job.status != "running":
             return
-    await _finish(sessionmaker, job_id, status="failed", error=error, settings=settings)
+        if generation is not None and job.worker_generation != generation:
+            return
+    await _finish(
+        sessionmaker,
+        job_id,
+        status="failed",
+        error=error,
+        settings=settings,
+        generation=generation,
+    )
 
 
 async def _to_the_end(coro):
@@ -484,6 +522,7 @@ async def _finish(
     error: str | None = None,
     result: dict | None = None,
     settings: Settings | None = None,
+    generation: int | None = None,
 ) -> None:
     """Write the terminal state and delete the source document (docs/jobs.md § Retention).
 
@@ -498,7 +537,9 @@ async def _finish(
             return
         user_id = job.user_id
     if settings is None:
-        await _finish_held(sessionmaker, job_id, status=status, error=error, result=result)
+        await _finish_held(
+            sessionmaker, job_id, status=status, error=error, result=result, generation=generation
+        )
         return
     # The rows that say the parse is done, and the original and copies they describe,
     # land in one backup snapshot: the backup lock is held shared from before the commit
@@ -506,7 +547,13 @@ async def _finish(
     # backed up (docs/workspace.md § Backups).
     async with backup_shared(user_root(settings.workspaces_dir, user_id)):
         await _finish_held(
-            sessionmaker, job_id, status=status, error=error, result=result, settings=settings
+            sessionmaker,
+            job_id,
+            status=status,
+            error=error,
+            result=result,
+            settings=settings,
+            generation=generation,
         )
 
 
@@ -518,10 +565,23 @@ async def _finish_held(
     error: str | None = None,
     result: dict | None = None,
     settings: Settings | None = None,
+    generation: int | None = None,
 ) -> None:
     async with sessionmaker() as db:
         job = await db.get(Job, job_id)
         if job is None:
+            return
+        # The job's row lock before anything is written or the recipients are read:
+        # filing takes it before it inserts, so a row filed meanwhile is either here or
+        # filed after, as a finished parse — never filed in the gap and left without its
+        # original (docs/jobs.md). And the fence under it: a row another worker has
+        # taken gets neither this result nor this failure (docs/jobs.md § Queue).
+        await db.execute(select(Job.id).where(Job.id == job.id).with_for_update())
+        await db.refresh(job)
+        if generation is not None and job.worker_generation != generation:
+            logger.warning(
+                "job %s is no longer this worker's; its terminal state is not written", job_id
+            )
             return
         if result is not None:
             db.add(
@@ -537,10 +597,6 @@ async def _finish_held(
         job.status = status
         job.error = error
         job.finished_at = utcnow()
-        # The job's row lock before the recipients are read: filing takes it before it
-        # inserts, so a row filed meanwhile is either here or filed after, as a finished
-        # parse — never filed in the gap and left without its original (docs/jobs.md).
-        await db.execute(select(Job.id).where(Job.id == job.id).with_for_update())
         documents: list[Document] = []
         if settings is not None:
             # Whatever the terminal state: a failed parse's row keeps its original as a
@@ -675,11 +731,16 @@ async def run_job(
     settings: Settings,
     job_id: uuid.UUID,
     render_slots: asyncio.Semaphore,
+    generation: int | None = None,
 ) -> None:
-    """Drive one claimed job to a terminal state. Never raises for a document's own faults."""
+    """Drive one claimed job to a terminal state. Never raises for a document's own faults.
+    `generation` is the one the job was claimed with: every write to its row is fenced
+    on it (docs/jobs.md § Queue)."""
     async with sessionmaker() as db:
         job = (await db.execute(select(Job).where(Job.id == job_id))).scalar_one_or_none()
         if job is None or job.status != "running":
+            return
+        if generation is not None and job.worker_generation != generation:
             return
         connection = await load_connection(db, settings, job.user_id, job.connection_id)
         if connection is not None and job.connection_base_url != connection.snapshot:
@@ -699,7 +760,14 @@ async def run_job(
         )
         # No crop thread ever started for this run; a plain discard covers leftovers.
         discard_job_figures(figures_root, job_id)
-        await _finish(sessionmaker, job_id, status="failed", error=error, settings=settings)
+        await _finish(
+            sessionmaker,
+            job_id,
+            status="failed",
+            error=error,
+            settings=settings,
+            generation=generation,
+        )
         return
 
     source = Path(job.source_path or "")
@@ -711,6 +779,7 @@ async def run_job(
         max_response_bytes=settings.upstream_response_max_bytes,
         figures_dir=figures_root / str(job.id),
         figures_per_page=settings.figures_per_page_max,
+        generation=generation,
     )
 
     succeeded = False
@@ -720,7 +789,14 @@ async def run_job(
                 job, state, connection, source, work_dir, render_slots, sessionmaker
             )
         except JobAborted as exc:
-            await _finish(sessionmaker, job_id, status="failed", error=str(exc), settings=settings)
+            await _finish(
+                sessionmaker,
+                job_id,
+                status="failed",
+                error=str(exc),
+                settings=settings,
+                generation=generation,
+            )
             return
         except (poppler.PopplerError, ImageError, ValueError):
             await _finish(
@@ -729,6 +805,7 @@ async def run_job(
                 status="failed",
                 error="the document is unreadable",
                 settings=settings,
+                generation=generation,
             )
             return
         except Exception:
@@ -736,7 +813,12 @@ async def run_job(
             # carries no internals and no document content.
             logger.exception("job %s failed unexpectedly", job_id)
             await _finish(
-                sessionmaker, job_id, status="failed", error="internal error", settings=settings
+                sessionmaker,
+                job_id,
+                status="failed",
+                error="internal error",
+                settings=settings,
+                generation=generation,
             )
             return
         finally:
@@ -754,6 +836,7 @@ async def run_job(
                 status="failed",
                 error=f"no page could be parsed ({reasons})",
                 settings=settings,
+                generation=generation,
             )
             return
 
@@ -783,6 +866,7 @@ async def run_job(
                 job_id,
                 status="succeeded",
                 settings=settings,
+                generation=generation,
                 result={
                     "markdown": document.markdown,
                     "pages": [

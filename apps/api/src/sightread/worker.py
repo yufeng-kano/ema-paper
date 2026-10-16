@@ -25,6 +25,7 @@ from .jobs.queue import (
     claim_next_turn,
     fail_orphaned_turns,
     fail_turn,
+    next_worker_generation,
     recover_unsettled_commands,
     release_worker_lock,
     requeue_job,
@@ -83,6 +84,11 @@ async def run_worker(stop: asyncio.Event) -> None:
         else None
     )
     sessionmaker = create_sessionmaker(engine)
+    # This worker's generation, written on every job it claims and carried on every
+    # write to one: the seconds between losing the lock and noticing are the
+    # replacement's already, and nothing written in them may land (docs/jobs.md).
+    async with sessionmaker() as db:
+        generation = await next_worker_generation(db)
     render_count = render_worker_count(settings.render_workers)
     render_slots = asyncio.Semaphore(render_count)
     upload_dir = Path(settings.upload_dir)
@@ -141,7 +147,7 @@ async def run_worker(stop: asyncio.Event) -> None:
                         turn_id = await claim_next_turn(db, settings.max_chat_turns_per_user)
                     if turn_id is None:
                         job_id = await claim_next_job(
-                            db, settings.max_jobs_per_user, orphaned_users
+                            db, settings.max_jobs_per_user, orphaned_users, generation
                         )
                     if job_id is None and turn_id is None and not (prefer_turns or orphans_pending):
                         turn_id = await claim_next_turn(db, settings.max_chat_turns_per_user)
@@ -184,7 +190,9 @@ async def run_worker(stop: asyncio.Event) -> None:
                 continue
 
             logger.info("running job %s", job_id)
-            running = asyncio.create_task(run_job(sessionmaker, settings, job_id, render_slots))
+            running = asyncio.create_task(
+                run_job(sessionmaker, settings, job_id, render_slots, generation)
+            )
             shutdown = asyncio.create_task(stop.wait())
             done, _ = await asyncio.wait({running, shutdown}, return_when=asyncio.FIRST_COMPLETED)
             shutdown.cancel()
@@ -195,7 +203,7 @@ async def run_worker(stop: asyncio.Event) -> None:
                 running.cancel()
                 await asyncio.gather(running, return_exceptions=True)
                 async with sessionmaker() as db:
-                    requeued = await requeue_job(db, job_id)
+                    requeued = await requeue_job(db, job_id, generation)
                 if requeued:
                     # Backstop only: `run_job`'s own finally already discarded this
                     # attempt's crops, waiting out any crop thread under the guard — by
@@ -205,14 +213,16 @@ async def run_worker(stop: asyncio.Event) -> None:
                     discard_job_figures(Path(settings.figures_dir), job_id)
                     logger.info("requeued job %s on shutdown", job_id)
                 else:
-                    logger.info("job %s finished before the shutdown reached it", job_id)
+                    # Finished before the cancel landed, or another worker's since this
+                    # one lost the lock — its pages and crops are not this one's to take.
+                    logger.info("job %s is finished or another worker's; not requeued", job_id)
             elif running.exception() is not None:
                 # The runner answers for the document's faults; what escaped it is ours,
                 # and the row must not stay `running` with nobody driving it, against
                 # its user's cap. Failed, not requeued: the parse ran and billed.
                 logger.error("job %s raised past its runner", job_id, exc_info=running.exception())
                 try:
-                    await fail_job(sessionmaker, settings, job_id, "internal error")
+                    await fail_job(sessionmaker, settings, job_id, "internal error", generation)
                 except Exception:  # noqa: BLE001 - the next start requeues what stays running
                     logger.exception("could not fail job %s", job_id)
     finally:

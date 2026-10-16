@@ -72,11 +72,18 @@ jobs             id UUID PK, user_id FK, agent, kind pdf|image, filename, media_
                  page_count, pages_done, source_path NULL, source_deleted_at NULL,
                  retain_source,                   -- a library upload keeps its original
                                                   -- (jobs.md § Retention)
+                 worker_generation BIGINT NULL,   -- the generation of the worker that
+                                                  -- claimed it, NULL while queued: the
+                                                  -- fence every write to a running job
+                                                  -- carries (jobs.md § Queue)
                  created_at, started_at, finished_at
                  INDEX (status, created_at)                                  -- queue claim
                  INDEX (user_id, agent, sha256, model, connection_id, pages_spec,
                         prompt_sha256, pipeline_version)
                         WHERE status='succeeded'                             -- dedup
+                 SEQUENCE worker_generation_seq   -- PostgreSQL; one value per worker start
+                                                  -- (jobs.md § Queue). The SQLite fallback
+                                                  -- takes the highest on record plus one
 job_pages        (job_id FK, page_no) PK, method NULL, status, error NULL,
                  markdown TEXT NULL               -- the page's transcription, written as
                                                   -- the page finishes; what the partial

@@ -292,6 +292,19 @@ async def materialize_document(
     return paths
 
 
+async def make_folder_dir(settings: Settings, user_id: int, relative: Path) -> None:
+    """The directory of a folder the library just created, so the shell sees it before
+    any document lands in it. Nothing to commit: git records no empty directory. The
+    caller holds the workspace lock (docs/workspace.md § Layout)."""
+    root = user_root(settings.workspaces_dir, user_id)
+
+    def _make() -> None:
+        git.ensure_repo(root)
+        safe_io.ensure_dir(root, root / relative)
+
+    await asyncio.to_thread(_make)
+
+
 async def ensure_within_quota(settings: Settings, root: Path) -> None:
     """Refuse new material once the workspace is at its quota (docs/workspace.md § Quota).
     A walk of the tree: cheap at the sizes a quota allows, and only on growth."""

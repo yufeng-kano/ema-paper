@@ -24,6 +24,12 @@ class SandboxUnavailable(Exception):
     """No runner, or the runner did not answer. Never carries command output."""
 
 
+class SandboxRejected(SandboxUnavailable):
+    """The runner answered 4xx: it refused the request before anything ran — the token,
+    a body past its validation cap — so, unlike an unreachable runner or a 5xx, there
+    is nothing unconfirmed about the command (docs/chat.md § Tools)."""
+
+
 @dataclass(frozen=True)
 class ExecResult:
     output: str
@@ -62,6 +68,10 @@ class SandboxClient:
                 )
         except httpx.HTTPError as exc:
             raise SandboxUnavailable("the sandbox runner was unreachable") from exc
+        if 400 <= response.status_code < 500:
+            raise SandboxRejected(
+                f"the sandbox runner refused the request ({response.status_code})"
+            )
         if response.status_code >= 400:
             raise SandboxUnavailable(f"the sandbox runner returned {response.status_code}")
         if response.status_code == 204 or not response.content:
