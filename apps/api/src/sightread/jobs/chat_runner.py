@@ -528,6 +528,12 @@ async def _stream_once(ctx: TurnContext, body: dict) -> CompletedMessage:
     await flush_thinking()
     if completed is None:
         raise UpstreamError("The upstream closed the stream early", transient=True)
+    # Kano Proxy names a model `provider/model`; the upstream answers with the bare id. Read
+    # with the requested provider, the same model is not a fallback, and a real fallback is
+    # followed under a name Kano Proxy can route (docs/chat.md § Request).
+    provider = str(body["model"]).rpartition("/")[0]
+    if provider and completed.model and "/" not in completed.model:
+        completed.model = f"{provider}/{completed.model}"
     return completed
 
 

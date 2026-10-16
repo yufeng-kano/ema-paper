@@ -1350,6 +1350,55 @@ def test_an_image_past_the_pixel_cap_is_refused_before_it_is_decoded() -> None:
 
 
 @respx.mock
+async def test_a_kano_proxy_model_answered_under_its_bare_id_is_not_a_fallback(chatting) -> None:
+    """Kano Proxy routes `provider/model`; the upstream answers with the bare id. That is
+    the same model, and a real fallback is followed under the provider's name."""
+    conversation_id = (
+        await chatting.post(
+            f"/api/library/documents/{chatting.document_id}/conversations",
+            headers=CSRF_HEADERS,
+        )
+    ).json()["id"]
+    async with chatting.app.state.sessionmaker() as db:
+        (await db.get(Conversation, conversation_id)).model = "claude-code/claude-opus-5-5"
+        await db.commit()
+    requests: list[dict] = []
+    turns = iter(
+        [
+            assistant_turn([{"type": "text", "text": "Hi."}], "end_turn", model="claude-opus-5-5"),
+            assistant_turn([{"type": "text", "text": "Again."}], "end_turn", model="claude-opus-5"),
+            assistant_turn([{"type": "text", "text": "More."}], "end_turn", model="claude-opus-5"),
+        ]
+    )
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, content=next(turns))
+
+    respx.post(MESSAGES_URL).mock(side_effect=answer)
+
+    async def send(text: str) -> str:
+        sent = await chatting.post(
+            f"/api/conversations/{conversation_id}/messages",
+            json={"text": text},
+            headers=CSRF_HEADERS,
+        )
+        assert sent.status_code == 202, sent.text
+        await _run_queued_turn(chatting)
+        async with chatting.app.state.sessionmaker() as db:
+            return (await db.get(Conversation, conversation_id)).model
+
+    assert await send("hi") == "claude-code/claude-opus-5-5"
+    assert await send("again") == "claude-code/claude-opus-5"
+    assert await send("more") == "claude-code/claude-opus-5"
+    assert [request["model"] for request in requests] == [
+        "claude-code/claude-opus-5-5",
+        "claude-code/claude-opus-5-5",
+        "claude-code/claude-opus-5",
+    ]
+
+
+@respx.mock
 async def test_a_fallback_answer_moves_the_conversation_to_its_model(chatting) -> None:
     document_id = chatting.document_id
     conversation_id = (
