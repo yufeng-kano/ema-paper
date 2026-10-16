@@ -159,10 +159,14 @@ def _writable(root: Path, path: Path) -> bool:
     """Not the workspace's own files, and nothing history excludes — a write there would
     have no revision to show or revert (docs/chat.md § Tools)."""
     relative = path.relative_to(root)
-    if any(part in READ_ONLY_NAMES or part == FIGURES_DIR for part in relative.parts):
-        return False
-    name = relative.name
-    return not (name.startswith((f"{SOURCE_STEM}.", safe_io.TEMP_PREFIX)))
+    # Every component, not the last alone: git ignores `source.*` and `.sr-tmp-*` at any
+    # depth, so a file beneath one would be written and never recorded.
+    return not any(
+        part in READ_ONLY_NAMES
+        or part == FIGURES_DIR
+        or part.startswith((f"{SOURCE_STEM}.", safe_io.TEMP_PREFIX))
+        for part in relative.parts
+    )
 
 
 def _listing(root: Path, path: Path) -> str:

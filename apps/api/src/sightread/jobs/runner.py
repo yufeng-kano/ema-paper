@@ -439,17 +439,21 @@ async def _record_page(
 
 
 async def fail_job(
-    sessionmaker: async_sessionmaker[AsyncSession], job_id: uuid.UUID, error: str
+    sessionmaker: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    job_id: uuid.UUID,
+    error: str,
 ) -> None:
     """A job whose task raised past `run_job` (a database error while the terminal state
     was being written, say): failed, never requeued — the parse ran and billed the user's
     key, and a fault of ours is no reason to run it again. A job no longer `running` (its
-    result committed before what raised) is left as it is (docs/jobs.md)."""
+    result committed before what raised) is left as it is (docs/jobs.md). With settings,
+    like every other terminal path: a library row keeps its original here too."""
     async with sessionmaker() as db:
         job = await db.get(Job, job_id)
         if job is None or job.status != "running":
             return
-    await _finish(sessionmaker, job_id, status="failed", error=error)
+    await _finish(sessionmaker, job_id, status="failed", error=error, settings=settings)
 
 
 async def _to_the_end(coro) -> None:

@@ -237,6 +237,21 @@ async def test_requeue_forgets_partial_progress(sessionmaker) -> None:
 
 
 @postgres_only
+async def test_one_worker_holds_the_worker_lock_at_a_time(sessionmaker) -> None:
+    from sightread.jobs.queue import release_worker_lock, try_worker_lock
+
+    engine = sessionmaker.kw["bind"]
+    first = await try_worker_lock(engine)
+    assert first is not None
+    # A second worker finds the lock held and must not take the first one's jobs back.
+    assert await try_worker_lock(engine) is None
+    await release_worker_lock(first)
+    second = await try_worker_lock(engine)
+    assert second is not None
+    await release_worker_lock(second)
+
+
+@postgres_only
 async def test_a_worker_starting_requeues_the_jobs_a_dead_one_left(sessionmaker) -> None:
     from sightread.jobs.queue import requeue_orphaned_jobs
 
@@ -262,7 +277,9 @@ async def test_a_worker_starting_requeues_the_jobs_a_dead_one_left(sessionmaker)
         assert await requeue_orphaned_jobs(db) == []
 
 
-async def test_a_job_whose_task_raised_is_failed_unless_already_done(sessionmaker) -> None:
+async def test_a_job_whose_task_raised_is_failed_unless_already_done(
+    sessionmaker, tmp_path
+) -> None:
     from sightread.jobs.runner import fail_job
 
     async with sessionmaker() as db:
@@ -277,8 +294,18 @@ async def test_a_job_whose_task_raised_is_failed_unless_already_done(sessionmake
         done.status = "succeeded"
         await db.commit()
         job_id, done_id = job.id, done.id
-    await fail_job(sessionmaker, job_id, "internal error")
-    await fail_job(sessionmaker, done_id, "internal error")
+    from sightread.config import Settings
+    from tests.conftest import KANO_BASE, TEST_SECRET_KEY
+
+    settings = Settings(
+        app_env="local",
+        secret_key=TEST_SECRET_KEY,
+        workspaces_dir=str(tmp_path / "workspaces"),
+        figures_dir=str(tmp_path / "figures"),
+        kano_proxy_base_url=KANO_BASE,
+    )
+    await fail_job(sessionmaker, settings, job_id, "internal error")
+    await fail_job(sessionmaker, settings, done_id, "internal error")
     async with sessionmaker() as db:
         failed = await db.get(Job, job_id)
         assert (failed.status, failed.error) == ("failed", "internal error")

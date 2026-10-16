@@ -1610,6 +1610,20 @@ def test_the_selection_block_is_marked_for_the_web_and_stripped_for_the_api() ->
 async def test_the_editor_refuses_what_history_excludes(tmp_path) -> None:
     root = tmp_path / "ws" / "9"
     root.mkdir(parents=True)
+    # Beneath an excluded name as well as at it: git ignores these at any depth.
+    for nested in (
+        "/workspace/files/x/source.pdf/child.txt",
+        "/workspace/files/.sr-tmp-abc/doc.md",
+        "/workspace/files/x/figures/deep/note.md",
+    ):
+        refused = await chat_tools.run_editor(
+            root,
+            {"command": "create", "path": nested, "file_text": "x"},
+            "agent:1",
+            max_chars=1000,
+            max_bytes=10_000,
+        )
+        assert refused.is_error, nested
     git.ensure_repo(root)
     for path in ("files/paper/figures/p1.png", "files/paper/source.pdf", "files/paper/.sr-tmp-abc"):
         refused = await chat_tools.run_editor(

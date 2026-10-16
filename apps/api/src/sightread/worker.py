@@ -26,8 +26,10 @@ from .jobs.queue import (
     fail_orphaned_turns,
     fail_turn,
     recover_unsettled_commands,
+    release_worker_lock,
     requeue_job,
     requeue_orphaned_jobs,
+    try_worker_lock,
 )
 from .jobs.runner import fail_job, run_job
 from .jobs.sweeper import sweep_forever
@@ -40,6 +42,8 @@ logger = logging.getLogger(__name__)
 IDLE_POLL_SECONDS = 2.0
 # How long after a cleanup of orphaned turns that did not go through the next try waits.
 ORPHAN_RETRY_SECONDS = 30.0
+# How often a worker that found the worker lock held asks again (a rolling restart).
+WORKER_LOCK_RETRY_SECONDS = 5.0
 
 
 def render_worker_count(configured: int) -> int:
@@ -50,6 +54,24 @@ def render_worker_count(configured: int) -> int:
 async def run_worker(stop: asyncio.Event) -> None:
     settings = get_settings()
     engine = create_engine(settings.database_url)
+    # One worker per deployment, enforced before anything is claimed or recovered: the
+    # recovery below treats every `running` row as a dead worker's, which only holds
+    # when no other worker runs (docs/jobs.md). A second worker waits for the lock —
+    # the one being replaced in a rolling restart releases it as it stops.
+    lock = None
+    while lock is None and not stop.is_set():
+        if engine.dialect.name != "postgresql":
+            break
+        lock = await try_worker_lock(engine)
+        if lock is None:
+            logger.warning("another worker holds the worker lock; waiting for it")
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(), timeout=WORKER_LOCK_RETRY_SECONDS)
+    if stop.is_set():
+        if lock is not None:
+            await release_worker_lock(lock)
+        await engine.dispose()
+        return
     sessionmaker = create_sessionmaker(engine)
     render_count = render_worker_count(settings.render_workers)
     render_slots = asyncio.Semaphore(render_count)
@@ -180,12 +202,14 @@ async def run_worker(stop: asyncio.Event) -> None:
                 # its user's cap. Failed, not requeued: the parse ran and billed.
                 logger.error("job %s raised past its runner", job_id, exc_info=running.exception())
                 try:
-                    await fail_job(sessionmaker, job_id, "internal error")
+                    await fail_job(sessionmaker, settings, job_id, "internal error")
                 except Exception:  # noqa: BLE001 - the next start requeues what stays running
                     logger.exception("could not fail job %s", job_id)
     finally:
         sweeper.cancel()
         await asyncio.gather(sweeper, return_exceptions=True)
+        if lock is not None:
+            await release_worker_lock(lock)
         await engine.dispose()
 
 

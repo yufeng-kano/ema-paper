@@ -553,6 +553,31 @@ def test_path_scoped_commits_name_their_paths_literally(tmp_path) -> None:
     assert git.commit_paths(root, "user", "nothing", [Path("files/zzz")]) is None
 
 
+async def test_a_folder_set_aside_by_a_crashed_delete_comes_back_whole(
+    sessionmaker, tmp_path
+) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+        root = paths.root
+        # What the shell left in the folder beside the document: no row names it.
+        (root / "files" / "Papers" / "scratch.txt").write_text("notes\n")
+        (root / "files" / "Papers" / "drafts").mkdir()
+        git.commit_all(root, "agent:1", "bash: scratch")
+        # The folder's delete set the directory aside and recorded the removal, then the
+        # process died before the rows went.
+        removal = await documents.remove_path(settings, user.id, Path("files/Papers"))
+        assert removal is not None and not (root / "files" / "Papers").exists()
+        assert await reconcile.reconcile_user(db, settings, user.id) >= 1
+        # Back whole: the document, and the shell's files with it.
+        assert paths.doc.read_text() == "# Title\n\nBody\n"
+        assert (root / "files" / "Papers" / "scratch.txt").read_text() == "notes\n"
+        assert (root / "files" / "Papers" / "drafts").is_dir()
+        assert not [name for name in os.listdir(root) if name.startswith(safe_io.TEMP_PREFIX)]
+        assert git.log(root)[0].message == "restore files/Papers"
+
+
 async def test_a_failed_library_parse_keeps_its_original(sessionmaker, tmp_path) -> None:
     from sightread.jobs import runner
 

@@ -200,6 +200,21 @@ def _restore_aside(root: Path, aside_dir: Path, target: Path) -> bool:
     return True
 
 
+def _aside_origin(aside: Path, targets: dict[Path, Path]) -> Path | None:
+    """Where an aside directory stood, as its surviving documents place it: each one sat
+    `inner` below the aside and belongs at `target`, so the aside stood where `target`
+    minus `inner` says; None unless every document agrees and that is under `files/`."""
+    origins: set[Path] = set()
+    for aside_dir, target in targets.items():
+        inner = aside_dir.relative_to(aside)
+        depth = len(target.parts) - len(inner.parts)
+        if depth < 2:
+            return None
+        origins.add(Path(*target.parts[:depth]))
+    origin = origins.pop() if len(origins) == 1 else None
+    return origin if origin is not None and origin.parts[0] == FILES_DIR else None
+
+
 def _canonicalize_and_scan(root: Path) -> tuple[list[Found], list[tuple[str, ...]]]:
     git.ensure_repo(root)
     _canonicalize(root)
@@ -303,11 +318,24 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
     keep: set[str] = set()
     restored = 0
     for name, inside in asides.items():
+        targets = {}
         for aside_dir, document_id in inside:
             row = documents.get(document_id)
-            if row is None:
-                continue
-            target = document_relative_dir(await folder_names(db, user_id, row.folder_id), row.name)
+            if row is not None:
+                targets[aside_dir] = document_relative_dir(
+                    await folder_names(db, user_id, row.folder_id), row.name
+                )
+        if not targets:
+            continue
+        # The aside is a folder's directory whole when its surviving rows all place it at
+        # one path: it goes back whole, with whatever else the folder held — files and
+        # directories the shell made, which no row names — rather than document by
+        # document with the rest swept (docs/workspace.md § Revisions).
+        whole = _aside_origin(Path(name), targets)
+        if whole is not None and await asyncio.to_thread(_restore_aside, root, Path(name), whole):
+            restored += 1
+            continue
+        for aside_dir, target in targets.items():
             if await asyncio.to_thread(_restore_aside, root, aside_dir, target):
                 restored += 1
             else:

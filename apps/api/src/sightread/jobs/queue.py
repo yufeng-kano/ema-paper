@@ -8,13 +8,14 @@ per-user cap applied at claim time so one user cannot monopolise the workers.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 import uuid
 from pathlib import Path
 
 from sqlalchemy import bindparam, delete, func, select, text, update
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 
 from ..agents import get_agent
 from ..config import Settings
@@ -278,6 +279,43 @@ async def claim_next_job(
     )
     await db.commit()
     return job_id if updated.rowcount == 1 else None
+
+
+# The advisory lock one worker holds for its lifetime: any fixed bigint (docs/jobs.md).
+WORKER_LOCK_KEY = 7_312_024_001
+
+
+async def try_worker_lock(engine: AsyncEngine) -> AsyncConnection | None:
+    """One worker per deployment, enforced: the connection that holds the session-level
+    advisory lock, or None while another worker holds it. The recovery at start treats
+    every `running` row as a dead worker's, which is only true of a singleton; a second
+    worker process waits for the lock rather than taking the first one's jobs back
+    (docs/jobs.md). Not PostgreSQL (the SQLite fallback): no lock, one worker assumed."""
+    if engine.dialect.name != "postgresql":
+        return None
+    connection = await engine.connect()
+    try:
+        # Autocommit: a session-level lock outlives transactions, and a connection
+        # left idle in one would hold a snapshot for the worker's whole life.
+        connection = await connection.execution_options(isolation_level="AUTOCOMMIT")
+        held = (
+            await connection.execute(
+                text("SELECT pg_try_advisory_lock(:key)"), {"key": WORKER_LOCK_KEY}
+            )
+        ).scalar_one()
+    except BaseException:
+        await connection.close()
+        raise
+    if held:
+        return connection
+    await connection.close()
+    return None
+
+
+async def release_worker_lock(connection: AsyncConnection) -> None:
+    with contextlib.suppress(Exception):
+        await connection.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": WORKER_LOCK_KEY})
+    await connection.close()
 
 
 async def requeue_orphaned_jobs(db: AsyncSession) -> list[uuid.UUID]:
