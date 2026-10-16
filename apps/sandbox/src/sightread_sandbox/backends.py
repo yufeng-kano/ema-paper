@@ -360,7 +360,10 @@ while [ "$__sr_pass" -lt 50 ]; do
     __sr_live=$(ps -eo pid=,stat= 2>/dev/null | sed -n 's/^ *\\([0-9][0-9]*\\)  *[^Z ].*$/\\1/p')
     for __sr_p in $__sr_live; do
         case "$__sr_keep" in *" $__sr_p "*) continue;; esac
-        ${__sr_kill:-kill} -KILL "$__sr_p" 2>/dev/null
+        # A pid gone before its kill (this sweep's own `ps` and the pipeline around it,
+        # a command that just ended) is not left over; one that refused and stands is.
+        ${__sr_kill:-kill} -KILL "$__sr_p" 2>/dev/null ||
+            [ -n "$(ps -o pid= -p "$__sr_p" 2>/dev/null)" ] || continue
         __sr_left=$((__sr_left + 1))
     done
     [ "$__sr_left" = 0 ] && break

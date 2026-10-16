@@ -732,6 +732,68 @@ def test_the_vm_sweep_repeats_until_nothing_but_the_shells_is_left(tmp_path) -> 
     assert sorted(state.read_text().split("\n")[:-1]) == ["1 0 S", "10 0 S", "20 10 S", "50 1 Z"]
 
 
+def test_the_vm_sweep_does_not_count_its_own_ps_as_left_over(tmp_path) -> None:
+    """Every snapshot holds the pipeline that took it, gone by the time its kill comes:
+    those pids are not left over, or no sweep would ever finish. A process that refuses
+    the kill and still stands is, and the sweep fails closed."""
+    import os
+    import subprocess
+
+    from sightread_sandbox.backends import VM_SWEEP
+
+    state = tmp_path / "procs"
+    state.write_text("1 0 S\n10 0 S\n20 10 S\n30 20 S\n")
+    calls = tmp_path / "calls"
+    calls.write_text("0")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    # Each full listing also shows a fresh pid of its own, absent from the table.
+    (bin_dir / "ps").write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = -o ]; then grep "^$4 " "$FAKE_PROCS" | cut -d" " -f2; exit 0; fi\n'
+        'n=$(($(cat "$FAKE_CALLS") + 1)); echo "$n" > "$FAKE_CALLS"\n'
+        'cut -d" " -f1,3 "$FAKE_PROCS"\n'
+        'echo "$((900 + n)) R"\n'
+    )
+    # Pid 60 refuses the kill and stays.
+    (bin_dir / "kill").write_text(
+        "#!/bin/sh\n"
+        'pid="$2"\n'
+        '[ "$pid" = 60 ] && exit 1\n'
+        'grep -q "^$pid " "$FAKE_PROCS" || exit 1\n'
+        'grep -v "^$pid " "$FAKE_PROCS" > "$FAKE_PROCS.new"; mv "$FAKE_PROCS.new" "$FAKE_PROCS"\n'
+        "exit 0\n"
+    )
+    for script in ("ps", "kill"):
+        os.chmod(bin_dir / script, 0o700)
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "FAKE_PROCS": str(state),
+        "FAKE_CALLS": str(calls),
+    }
+    script = (
+        f'__sr_keep_in="20"\n__sr_kill="{bin_dir / "kill"}"\n{VM_SWEEP}\n'
+        'echo "LEFT=$__sr_left PASS=$__sr_pass"'
+    )
+
+    def sweep() -> str:
+        return subprocess.run(  # noqa: S603
+            ["sh", "-c", script],  # noqa: S607
+            capture_output=True,
+            text=True,
+            env=env,
+            check=True,
+        ).stdout
+
+    assert "LEFT=0 PASS=2" in sweep()  # the leftover goes, the next pass finds only ps
+    assert sorted(state.read_text().split("\n")[:-1]) == ["1 0 S", "10 0 S", "20 10 S"]
+
+    with state.open("a") as table:
+        table.write("60 1 S\n")
+    assert "LEFT=1 PASS=50" in sweep()
+
+
 async def test_a_reset_whose_cache_cannot_be_removed_reports_it(
     client, tmp_path, monkeypatch
 ) -> None:
