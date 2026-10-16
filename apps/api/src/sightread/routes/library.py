@@ -531,9 +531,14 @@ async def remove_then_commit(db: DbSession, settings, user_id: int, relative) ->
         if removal is not None:
             try:
                 await workspace_documents.restore_removed(settings, user_id, relative, removal)
-            except Exception:  # noqa: BLE001 - the delete revision stays revertible
+            except Exception:  # noqa: BLE001 - the directory waits aside, whole
                 logger.exception("could not restore %s after a failed delete", relative)
         raise
+    if removal is not None:
+        try:
+            await workspace_documents.discard_removed(settings, user_id, removal)
+        except Exception:  # noqa: BLE001 - the next reconciliation sweeps it
+            logger.exception("could not discard %s set aside by a delete", relative)
 
 
 # --- documents ----------------------------------------------------------------------------

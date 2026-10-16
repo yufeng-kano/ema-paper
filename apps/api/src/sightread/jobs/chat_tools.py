@@ -129,6 +129,11 @@ def resolve_workspace_path(root: Path, raw: object) -> Path:
             raise PathRefused("paths must be under /workspace") from exc
     else:
         relative = posix
+    # Lexically, before anything is opened: a `create` makes missing parents one by one,
+    # and `..` would have it make directories wherever the path led before it came back
+    # inside (docs/chat.md § Tools).
+    if any(part in (".", "..") for part in relative.parts):
+        raise PathRefused("paths must not contain . or .. components")
     candidate = root / Path(*relative.parts) if relative.parts else root
     if not inside(root, candidate):
         raise PathRefused("paths must stay inside /workspace")

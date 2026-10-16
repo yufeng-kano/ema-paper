@@ -47,7 +47,7 @@ from ..upstream.client import (
 from ..workspace import git
 from ..workspace.documents import DocumentPaths, ensure_within_quota, materialize_document
 from ..workspace.locks import shell_lock, workspace_lock
-from ..workspace.reconcile import reconcile_user
+from ..workspace.reconcile import reconcile_locked, reconcile_user
 from . import chat_events, chat_tools
 
 logger = logging.getLogger(__name__)
@@ -548,11 +548,12 @@ async def _run_tool_unguarded(
                     max_chars=max_chars,
                     locked=True,
                 )
-            if outcome.edit is not None:
-                # The library follows the tree before the viewer is told to reload, so
-                # the reload finds the document where the shell left it.
-                async with ctx.sessionmaker() as db:
-                    await reconcile_user(db, ctx.settings, ctx.turn.user_id)
+                if outcome.edit is not None:
+                    # The library follows the tree before the viewer is told to reload,
+                    # and before the lock is released: a read waiting on it must not
+                    # materialize a fresh copy at the old path in between.
+                    async with ctx.sessionmaker() as db:
+                        await reconcile_locked(db, ctx.settings, ctx.turn.user_id)
     elif name == "str_replace_based_edit_tool":
         outcome = await chat_tools.run_editor(
             ctx.paths.root,

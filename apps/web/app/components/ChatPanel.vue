@@ -295,6 +295,11 @@ async function loadDetail(id: number) {
     }
     messages.value = [...detail.messages].sort((left, right) => left.id - right.id)
     turns.value = [...detail.turns]
+    if (turns.value.some((turn) => LIVE_STATUSES.has(turn.status))) {
+      // A turn still queued or running is followed from here: a stream dropped before
+      // its turn_start would otherwise never be reopened (docs/web.md).
+      stream.expectTurn()
+    }
     conversations.value = conversations.value.map((row) =>
       row.id === id ? { ...row, title: detail.conversation.title, updated_at: detail.conversation.updated_at } : row,
     )

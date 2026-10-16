@@ -206,6 +206,7 @@ export default {
     promptReset: 'Reset to default',
     promptCount: '{count} / {max}',
     effortLabel: 'Effort',
+    effort: { low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Very high', max: 'Max' },
     effortNote: 'A change rebuilds the next turn’s prompt cache.',
     toolsLabel: 'Tools',
   },

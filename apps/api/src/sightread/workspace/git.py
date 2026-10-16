@@ -148,6 +148,18 @@ def reset_index(root: Path) -> None:
     _git(root, "reset", "-q", check=False)
 
 
+def reset_hard(root: Path) -> None:
+    """Every tracked file back as the head revision has it, the index with it; untracked
+    and ignored files are left alone. The rollback of a revert that could not be recorded
+    (docs/workspace.md § Revisions)."""
+    _git(root, "reset", "-q", "--hard", "HEAD")
+
+
+def tracked_at_head(root: Path, relative: Path) -> bool:
+    proc = _git(root, "cat-file", "-e", f"HEAD:{relative.as_posix()}", check=False)
+    return proc.returncode == 0
+
+
 def restore_from(root: Path, commit: str, author: str, message: str, relative: Path) -> str | None:
     """Write `relative` back as it was at `commit` and commit that: how a removal is undone
     when the rows it was made for did not go (docs/workspace.md § Revisions)."""

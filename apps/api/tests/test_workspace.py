@@ -1130,3 +1130,48 @@ def test_a_git_that_stalls_is_ended_at_the_deadline(tmp_path, monkeypatch) -> No
     with pytest.raises(git.GitError) as timed_out:
         git._git_bounded(root, "log", max_bytes=1000)
     assert "timed out" in str(timed_out.value)
+
+
+async def test_a_revert_whose_revision_cannot_be_recorded_is_rolled_back(
+    sessionmaker, tmp_path, monkeypatch
+) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        _, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+        root = paths.root
+        paths.doc.write_text("# Title\n\nShelled\n")
+        (paths.directory / "helper.py").write_text("print(1)\n")
+        shell = git.commit_all(root, "agent:1", "bash: python fix.py")
+        assert shell is not None
+        real = git.commit_paths
+
+        def refuse(root_, author, message, paths_):
+            if message.startswith("revert "):
+                raise git.GitError("disk full")
+            return real(root_, author, message, paths_)
+
+        monkeypatch.setattr(git, "commit_paths", refuse)
+        with pytest.raises(ApiError) as refused:
+            await documents.revert(db, settings, document, shell)
+        assert refused.value.status_code == 409
+        # The tree as it was, the index clean, the head unchanged.
+        assert paths.doc.read_text() == "# Title\n\nShelled\n"
+        assert (paths.directory / "helper.py").read_text() == "print(1)\n"
+        assert git._git(root, "status", "--porcelain", check=False).stdout.strip() == ""
+        assert git.log(root)[0].commit == shell
+        monkeypatch.setattr(git, "commit_paths", real)
+        await documents.revert(db, settings, document, shell)
+        assert paths.doc.read_text() == "# Title\n\nBody\n"
+
+
+def test_reconciliation_sweeps_what_a_delete_left_aside(tmp_path) -> None:
+    root = tmp_path / "ws" / "15"
+    (root / "files").mkdir(parents=True)
+    git.ensure_repo(root)
+    aside = root / f"{safe_io.TEMP_PREFIX}abc"
+    (aside / "deep").mkdir(parents=True)
+    (aside / "deep" / "source.pdf").write_bytes(b"x")
+    assert documents.sweep_aside(root) == 1
+    assert not aside.exists()
+    assert documents.sweep_aside(root) == 0

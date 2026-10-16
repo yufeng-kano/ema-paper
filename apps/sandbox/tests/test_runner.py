@@ -193,7 +193,7 @@ async def test_a_timeout_runs_the_backends_kill_before_closing_the_shell() -> No
 
     killed = []
 
-    async def kill_inside() -> None:
+    async def kill_inside(*, locked: bool = False) -> None:
         killed.append(True)
 
     shell = ShellSession(["bash", "--norc", "--noprofile"], max_bytes=1000, on_timeout=kill_inside)
@@ -338,7 +338,7 @@ async def test_a_dropped_request_kills_its_command_where_it_runs() -> None:
 
     killed = []
 
-    async def kill_inside() -> None:
+    async def kill_inside(*, locked: bool = False) -> None:
         killed.append(True)
 
     shell = ShellSession(["bash", "--norc", "--noprofile"], max_bytes=1000, on_timeout=kill_inside)
@@ -429,3 +429,61 @@ def test_the_reaper_is_the_images_cmd() -> None:
     compile(REAPER, "reaper", "exec")
     dockerfile = Path(__file__).resolve().parents[3] / "deploy" / "sandbox-image" / "Dockerfile"
     assert json.dumps(REAPER) in dockerfile.read_text()
+
+
+async def test_a_restart_whose_in_vm_kill_fails_does_not_deadlock(tmp_path) -> None:
+    import asyncio
+
+    from sightread_sandbox.backends import UserSandbox
+
+    calls: list[bool] = []
+
+    class Stubborn(LocalBackend):
+        def on_timeout(self, user_id, token):
+            async def kill_inside(*, locked: bool = False) -> None:
+                calls.append(locked)
+                sandbox = self._user(user_id)
+                # The fallback stop, under the lock the caller already holds.
+                async with sandbox.lock if not locked else _nothing():
+                    await self._stop_locked(sandbox)
+
+            return kill_inside
+
+        async def _stop_locked(self, sandbox: UserSandbox) -> None:
+            sandbox.sessions.clear()
+            sandbox.session_used.clear()
+            self._running.discard(sandbox.user_id)
+
+    import contextlib
+
+    _nothing = contextlib.nullcontext
+    settings = Settings(
+        app_env="local",
+        sandbox_token=TOKEN,
+        sandbox_backend="local",
+        sandbox_workspaces_dir=str(tmp_path / "ws"),
+        sandbox_workspaces_mount=str(tmp_path / "ws"),
+        sandbox_idle_seconds=0,
+    )
+    backend = Stubborn(settings)
+    await backend.exec(15, "s", "true", timeout=10)
+    await asyncio.wait_for(backend.restart(15, "s"), 5)
+    assert calls == [True]
+    assert not backend._user(15).lock.locked()
+
+
+async def test_a_supervisor_killed_by_its_command_is_swept(tmp_path) -> None:
+    from sightread_sandbox.shell import ShellSession, supervisor
+
+    swept: list[bool] = []
+
+    async def kill_inside(*, locked: bool = False) -> None:
+        swept.append(True)
+
+    shell = ShellSession(
+        ["sh", "-c", supervisor(":")], cwd=str(tmp_path), max_bytes=1000, on_timeout=kill_inside
+    )
+    outcome = await shell.run("kill -KILL $PPID; sleep 1", timeout=10)
+    assert outcome.exit_code is None and not outcome.timed_out
+    assert swept == [True]
+    assert not shell.alive

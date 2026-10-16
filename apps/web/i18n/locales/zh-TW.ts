@@ -200,6 +200,7 @@ export default {
     promptReset: '還原預設',
     promptCount: '{count} / {max}',
     effortLabel: '推理強度',
+    effort: { low: '低', medium: '中', high: '高', xhigh: '很高', max: '最高' },
     effortNote: '改變這個值會讓下一輪對話的快取重建。',
     toolsLabel: '工具',
   },

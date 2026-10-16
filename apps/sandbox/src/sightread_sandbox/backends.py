@@ -78,9 +78,10 @@ class Backend:
         """The shell's argv and working directory; `token` names this shell to the VM."""
         raise NotImplementedError
 
-    def on_timeout(self, user_id: int, token: str) -> Callable[[], Awaitable[None]] | None:
+    def on_timeout(self, user_id: int, token: str) -> Callable[..., Awaitable[None]] | None:
         """What kills a timed-out command where it runs; None when closing the host-side
-        process is enough (the local backend)."""
+        process is enough (the local backend). Called with `locked=True` when the caller
+        already holds the sandbox lock."""
         return None
 
     def cleanup(self) -> str:
@@ -149,7 +150,7 @@ class Backend:
             shell = sandbox.sessions.pop(session, None)
             sandbox.session_used.pop(session, None)
             if shell is not None:
-                await shell.kill()
+                await shell.kill(locked=True)
 
     async def status(self, user_id: int) -> dict:
         sandbox = self._users.get(user_id)
@@ -466,10 +467,10 @@ class DockerBackend(Backend):
             None,
         )
 
-    def on_timeout(self, user_id: int, token: str) -> Callable[[], Awaitable[None]]:
+    def on_timeout(self, user_id: int, token: str) -> Callable[..., Awaitable[None]]:
         container = self.container(user_id)
 
-        async def kill_inside() -> None:
+        async def kill_inside(*, locked: bool = False) -> None:
             code, out = await _docker(
                 "exec", container, "sh", "-c", KILL_TREE, "sh", _pid_file(token), timeout=30
             )
@@ -482,7 +483,9 @@ class DockerBackend(Backend):
                     out.strip(),
                 )
                 sandbox = self._user(user_id)
-                async with sandbox.lock:
+                # The sandbox lock is not reentrant: a caller that holds it (restart)
+                # says so, and the stop runs under its hold rather than waiting forever.
+                async with sandbox.lock if not locked else contextlib.nullcontext():
                     # A stop that fails marks the sandbox unstoppable itself.
                     with contextlib.suppress(RuntimeError):
                         await self._stop_locked(sandbox)

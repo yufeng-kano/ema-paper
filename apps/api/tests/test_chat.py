@@ -1467,6 +1467,15 @@ async def test_a_delete_whose_commit_fails_keeps_the_edited_files(chatting, monk
         headers=CSRF_HEADERS,
     )
     assert saved.status_code == 200, saved.text
+    # The original, outside history: it must come back with the rest.
+    source = (
+        user_root(chatting.app.state.settings.workspaces_dir, chatting.user_id)
+        / "files"
+        / "Papers"
+        / "paper.pdf"
+        / "source.pdf"
+    )
+    source.write_bytes(b"%PDF-1.4 kept")
 
     original = AsyncSession.commit
     failing = {"on": True}
@@ -1480,6 +1489,7 @@ async def test_a_delete_whose_commit_fails_keeps_the_edited_files(chatting, monk
     monkeypatch.setattr(AsyncSession, "commit", commit)
     with contextlib.suppress(Exception):
         await chatting.delete(f"/api/library/documents/{document_id}", headers=CSRF_HEADERS)
+    assert source.read_bytes() == b"%PDF-1.4 kept"
     assert failing["on"] is False  # the commit was attempted
     monkeypatch.setattr(AsyncSession, "commit", original)
 
@@ -1737,3 +1747,86 @@ async def test_a_send_that_waited_for_a_deleted_conversation_is_a_404(
         f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
     )
     assert sent.status_code == 404, sent.text
+
+
+def test_editor_paths_with_dot_components_are_refused(tmp_path) -> None:
+    root = tmp_path / "ws" / "1"
+    (root / "files").mkdir(parents=True)
+    for raw in ("/workspace/files/../../other/x", "files/../x", "/workspace/files/a/../b"):
+        with pytest.raises(chat_tools.PathRefused):
+            chat_tools.resolve_workspace_path(root, raw)
+    # A `.` component is collapsed by the path itself; nothing to refuse.
+    assert chat_tools.resolve_workspace_path(root, "files/./doc.md") == root / "files" / "doc.md"
+    assert chat_tools.resolve_workspace_path(root, "/workspace/files/a/doc.md") == (
+        root / "files" / "a" / "doc.md"
+    )
+
+
+async def test_a_shell_move_is_reconciled_before_the_lock_is_released(
+    tmp_path, monkeypatch
+) -> None:
+    from sightread.workspace.locks import workspace_lock
+
+    root = tmp_path / "ws" / "1"
+    root.mkdir(parents=True)
+    git.ensure_repo(root)
+    seen: list[bool] = []
+
+    async def fake_run_bash(client, user_id, session, tool_input, *, max_chars, timeout_seconds):
+        return chat_tools.ToolOutcome("moved")
+
+    async def fake_commit(root_, outcome, tool_input, author, *, max_chars, locked=False):
+        return chat_tools.ToolOutcome(outcome.content, edit={"path": "", "commit": "c", "diff": ""})
+
+    async def fake_reconcile(db, settings, user_id):
+        # Still held by the command: a waiter cannot materialize the old path meanwhile.
+        async def take() -> None:
+            async with workspace_lock(root):
+                pass
+
+        try:
+            await asyncio.wait_for(take(), 0.2)
+            seen.append(False)
+        except TimeoutError:
+            seen.append(True)
+        return 0
+
+    async def no_events(ctx, event, data):
+        return None
+
+    async def never_cancelled(ctx):
+        return False
+
+    class Sessions:
+        def __call__(self):
+            return self
+
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(chat_tools, "run_bash", fake_run_bash)
+    monkeypatch.setattr(chat_tools, "commit_shell_changes", fake_commit)
+    monkeypatch.setattr(chat_runner, "reconcile_locked", fake_reconcile)
+    monkeypatch.setattr(chat_runner, "_emit", no_events)
+    monkeypatch.setattr(chat_runner, "_cancelled", never_cancelled)
+    ctx = SimpleNamespace(
+        settings=SimpleNamespace(
+            chat_image_round_max_bytes=1000,
+            chat_image_turn_max_bytes=1000,
+            chat_tool_result_max_chars=1000,
+            chat_bash_timeout_seconds=1,
+        ),
+        conversation=SimpleNamespace(id=1, session="s"),
+        paths=SimpleNamespace(root=root),
+        sandbox=object(),
+        sessionmaker=Sessions(),
+        turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
+        image_spent=0,
+        writer=None,
+    )
+    tool_uses = [{"type": "tool_use", "id": "b1", "name": "bash", "input": {"command": "mv a b"}}]
+    await chat_runner._run_tools(ctx, tool_uses, set())
+    assert seen == [True]

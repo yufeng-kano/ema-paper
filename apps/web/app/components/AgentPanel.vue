@@ -320,7 +320,7 @@ async function removePrompt() {
             :disabled="effortPending"
             @update:model-value="applyEffort"
           >
-            <option v-for="effort in AGENT_EFFORTS" :key="effort" :value="effort">{{ effort }}</option>
+            <option v-for="effort in AGENT_EFFORTS" :key="effort" :value="effort">{{ t(`agents.effort.${effort}`) }}</option>
           </UiSelect>
         </UiField>
       </div>

@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import Settings
 from ..db.models import Document, Folder, User
 from . import git, safe_io
+from .documents import sweep_aside
 from .layout import (
     FILES_DIR,
     META_FILE,
@@ -131,6 +132,9 @@ def _scan(root: Path) -> list[Found]:
 def _canonicalize_and_scan(root: Path) -> list[Found]:
     git.ensure_repo(root)
     _canonicalize(root)
+    # What a delete set aside and a crash left: removed here, under the same lock a
+    # delete holds, so none in flight is touched (docs/workspace.md § Revisions).
+    sweep_aside(root)
     return _scan(root)
 
 

@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import logging
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -37,6 +38,8 @@ from .layout import (
     user_root,
 )
 from .locks import workspace_lock
+
+logger = logging.getLogger(__name__)
 
 NOT_PLAIN = "The document's files are not regular files"
 TOO_LARGE = "The document file is too large to open"
@@ -580,8 +583,30 @@ def _revert(
     if not moves and not writes and not removals:
         raise ApiError(400, "invalid_request", "That revision changed nothing")
 
-    # Phase two: apply, every step through descriptors that follow nothing.
+    # Phase two: apply, every step through descriptors that follow nothing. What was
+    # done is kept so that a failure anywhere — the tree, or the revision that records
+    # it — rolls the tree back to as it was (docs/workspace.md § Revisions).
     restored: list[Path] = []
+    done_moves: list[tuple[Path, Path]] = []
+    moved_aside: list[tuple[Path, Path]] = []
+
+    def rollback() -> None:
+        git.reset_index(root)
+        for source, target in reversed(moved_aside):
+            with contextlib.suppress(OSError, safe_io.UnsafeEntry):
+                safe_io.rename(root, root / target, root / source)
+        for current, then in reversed(done_moves):
+            with contextlib.suppress(OSError, safe_io.UnsafeEntry):
+                safe_io.rename(root, root / then, root / current)
+        git.reset_hard(root)
+        for now, _data in writes:
+            if not git.tracked_at_head(root, now):
+                with contextlib.suppress(OSError, safe_io.UnsafeEntry):
+                    safe_io.remove_file(root, root / now)
+                    _prune_empty(root, (root / now).parent)
+        for _current, then in done_moves:
+            _prune_empty(root, (root / then).parent)
+
     try:
         # (directory vacated, directory restored): once the tracked files are back, what
         # the vacated directory still holds — `source.*`, `figures/`, which history does
@@ -589,6 +614,7 @@ def _revert(
         vacated: dict[Path, Path] = {}
         for current, then in moves:
             git.move(root, root / current, root / then)
+            done_moves.append((current, then))
             if current.parent != then.parent:
                 vacated.setdefault(current.parent, then.parent)
             restored += [current, then]
@@ -598,6 +624,7 @@ def _revert(
             for name, _is_dir in safe_io.list_dir(root, root / source_dir):
                 if safe_io.entry_kind(root, root / target_dir / name) == "none":
                     safe_io.rename(root, root / source_dir / name, root / target_dir / name)
+                    moved_aside.append((source_dir / name, target_dir / name))
             _prune_empty(root, root / source_dir)
         for now in removals:
             if safe_io.remove_file(root, root / now):
@@ -606,12 +633,25 @@ def _revert(
         for now, data in writes:
             safe_io.write_bytes(root, root / now, data)
             restored.append(now)
+        made = git.commit_paths(root, git.USER_AUTHOR, f"revert {commit[:12]}", restored)
     except (safe_io.UnsafeEntry, OSError) as exc:
+        _rollback_quietly(rollback, root)
         raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
-    made = git.commit_paths(root, git.USER_AUTHOR, f"revert {commit[:12]}", restored)
+    except git.GitError as exc:
+        _rollback_quietly(rollback, root)
+        raise ApiError(
+            409, "invalid_request", "That revision could not be recorded; nothing was changed"
+        ) from exc
     if made is None:
         raise ApiError(400, "invalid_request", "That revision changed nothing")
     return made
+
+
+def _rollback_quietly(rollback, root: Path) -> None:
+    try:
+        rollback()
+    except Exception:  # noqa: BLE001 - the refusal stands; the state is logged
+        logger.exception("could not roll back a failed revert in %s", root)
 
 
 @dataclass(frozen=True)
@@ -682,40 +722,72 @@ async def move_path(settings: Settings, user_id: int, source: Path, target: Path
     return await asyncio.to_thread(_move_tree, root, source, target, f"move {source} -> {target}")
 
 
-def _remove_tree(root: Path, relative: Path, message: str) -> str | None:
+@dataclass(frozen=True)
+class Removal:
+    """A directory moved aside for a delete: the revision that records the removal and
+    where the directory waits, whole, until the rows are gone (docs/workspace.md)."""
+
+    commit: str | None
+    aside: Path
+
+
+def _remove_tree(root: Path, relative: Path, message: str) -> Removal | None:
     git.ensure_repo(root)
+    if safe_io.entry_kind(root, root / relative) == "none":
+        return None
+    aside = Path(f"{safe_io.TEMP_PREFIX}{uuid.uuid4().hex}")
     try:
-        # Through descriptors that follow nothing: an ancestor the shell swapped for a
-        # link to another tree is a refusal, never a deletion there.
-        removed = safe_io.remove_tree(root, root / relative)
+        # Aside rather than gone: outside `files/` and outside history, the directory
+        # waits whole — originals and crops included — until the rows are gone, and comes
+        # back whole if they are not. Through descriptors that follow nothing: an
+        # ancestor the shell swapped for a link to another tree is a refusal.
+        safe_io.rename(root, root / relative, root / aside)
     except safe_io.UnsafeEntry as exc:
         raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
-    if not removed:
-        return None
-    return git.commit_paths(root, git.USER_AUTHOR, message, [relative])
+    return Removal(git.commit_paths(root, git.USER_AUTHOR, message, [relative]), aside)
 
 
-async def remove_path(settings: Settings, user_id: int, relative: Path) -> str | None:
-    """Delete a directory after the database did; the caller holds the workspace lock.
-    Returns the revision the removal made, for `restore_removed` should the rows stay."""
+async def remove_path(settings: Settings, user_id: int, relative: Path) -> Removal | None:
+    """Move a directory aside for a delete after the database did; the caller holds the
+    workspace lock. `discard_removed` deletes it once the rows are gone, `restore_removed`
+    brings it back should they stay."""
     root = user_root(settings.workspaces_dir, user_id)
     return await asyncio.to_thread(_remove_tree, root, relative, f"delete {relative}")
 
 
-def _restore_removed(root: Path, relative: Path, removal: str) -> None:
-    parent = git.parent_of(root, removal)
-    if parent is None:
-        return
-    git.restore_from(root, parent, git.USER_AUTHOR, f"restore {relative}", relative)
+async def discard_removed(settings: Settings, user_id: int, removal: Removal) -> None:
+    """The rows are gone: so is the directory set aside, with a bounded set of
+    descriptors however deep it is."""
+    root = user_root(settings.workspaces_dir, user_id)
+    await asyncio.to_thread(safe_io.remove_tree, root, root / removal.aside)
 
 
-async def restore_removed(settings: Settings, user_id: int, relative: Path, removal: str) -> None:
-    """The rows a removal was made for did not go (their commit failed): the files come
-    back from the revision the removal made, as a revision of their own, so the row that
-    stayed keeps its edits rather than being re-materialized from the parse
-    (docs/workspace.md § Revisions). The caller holds the workspace lock."""
+def _restore_removed(root: Path, relative: Path, removal: Removal) -> None:
+    safe_io.rename(root, root / removal.aside, root / relative)
+    git.commit_paths(root, git.USER_AUTHOR, f"restore {relative}", [relative])
+
+
+async def restore_removed(
+    settings: Settings, user_id: int, relative: Path, removal: Removal
+) -> None:
+    """The rows a removal was made for did not go (their commit failed): the directory
+    comes back whole from where it was set aside, as a revision of its own, so the row
+    that stayed keeps its edits, notes, original and crops (docs/workspace.md
+    § Revisions). The caller holds the workspace lock."""
     root = user_root(settings.workspaces_dir, user_id)
     await asyncio.to_thread(_restore_removed, root, relative, removal)
+
+
+def sweep_aside(root: Path) -> int:
+    """Remove what a delete left aside and never discarded (a crash between its commit
+    and the discard); run under the workspace lock, where no delete is in flight."""
+    swept = 0
+    for name, is_dir in safe_io.list_dir(root, root):
+        if is_dir and name.startswith(safe_io.TEMP_PREFIX):
+            with contextlib.suppress(OSError, safe_io.UnsafeEntry):
+                safe_io.remove_tree(root, root / name)
+                swept += 1
+    return swept
 
 
 def directory_size(root: Path, path: Path | None = None) -> int:

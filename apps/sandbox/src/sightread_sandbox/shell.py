@@ -120,7 +120,7 @@ class ShellSession:
         *,
         cwd: str | None = None,
         max_bytes: int,
-        on_timeout: Callable[[], Awaitable[None]] | None = None,
+        on_timeout: Callable[..., Awaitable[None]] | None = None,
     ) -> None:
         self._argv = argv
         self._cwd = cwd
@@ -161,13 +161,16 @@ class ShellSession:
         with contextlib.suppress(asyncio.TimeoutError, ProcessLookupError):
             await asyncio.wait_for(process.wait(), timeout=5)
 
-    async def kill(self) -> None:
+    async def kill(self, *, locked: bool = False) -> None:
         """End the shell and whatever it is running, where it runs: the backend's kill
-        inside the VM first (closing the host-side client ends nothing there), then the
-        client. What `restart` and a dropped `exec` request do (docs/sandbox.md)."""
-        if self.alive and self._on_timeout is not None:
+        inside the VM first (closing the host-side client ends nothing there — and a
+        client already gone says nothing about what runs inside), then the client. What
+        `restart`, a dropped `exec` request and a status line that never came do
+        (docs/sandbox.md). `locked` says the caller holds the sandbox lock, which the
+        backend's fallback stop must then not take again."""
+        if self._on_timeout is not None:
             with contextlib.suppress(Exception):
-                await self._on_timeout()
+                await self._on_timeout(locked=locked)
         await self.close()
 
     async def run(self, command: str, *, timeout: float) -> ExecOutcome:
@@ -194,7 +197,7 @@ class ShellSession:
                 process.stdin.write(script.encode())
                 await process.stdin.drain()
             except (BrokenPipeError, ConnectionResetError):
-                await self.close()
+                await self.kill()
                 return ExecOutcome("the shell is gone; it will be restarted", None, False, False)
 
             collected = BoundedOutput(self._max_bytes)
@@ -210,8 +213,10 @@ class ShellSession:
                         # flood (docs/sandbox.md § The runner).
                         chunk = await process.stdout.read(READ_CHUNK_BYTES)
                         if not chunk:
-                            # The shell exited (the command ran `exit`, or it died).
-                            await self.close()
+                            # The supervisor ended without its status line (a command
+                            # killed it): what it left running is ended where it runs
+                            # before the lost status is reported, like a timeout.
+                            await self.kill()
                             break
                         pending += chunk
                         found = False
