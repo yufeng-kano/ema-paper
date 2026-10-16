@@ -1799,3 +1799,47 @@ def test_a_gitignore_from_the_shell_hides_nothing_from_history(tmp_path) -> None
     (directory / "source.pdf").write_bytes(b"%PDF-1.5")
     assert git.commit_paths(root, "user", "save", [Path("files/paper.pdf")]) is not None
     assert git.log(root)[0].files == ("files/paper.pdf/doc.md",)
+
+
+async def test_an_aside_without_document_metadata_comes_back_to_its_origin(
+    sessionmaker, tmp_path
+) -> None:
+    """A delete the process died in, of a folder holding only what the shell made, or of
+    a document whose `.meta.json` a command removed: nothing inside names a row, so the
+    origin written beside the aside is what brings it back while a row still names that
+    path (docs/workspace.md § Revisions)."""
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        drafts = Folder(user_id=user.id, parent_id=None, name="Drafts")
+        db.add(drafts)
+        await db.commit()
+        paths = await documents.materialize_document(db, settings, document)
+        root = paths.root
+        (root / "files" / "Drafts").mkdir()
+        (root / "files" / "Drafts" / "notes.txt").write_text("from bash\n")
+        git.commit_all(root, "agent:1", "bash: drafts")
+        removal = await documents.remove_path(settings, user.id, Path("files/Drafts"))
+        assert removal is not None
+        assert documents.aside_origin(root, removal.aside) == Path("files/Drafts")
+        assert await reconcile.reconcile_user(db, settings, user.id) >= 1
+        assert (root / "files" / "Drafts" / "notes.txt").read_text() == "from bash\n"
+        assert git.log(root)[0].message == "restore files/Drafts"
+        assert not [name for name in os.listdir(root) if name.startswith(safe_io.TEMP_PREFIX)]
+        # A document stripped of its metadata by a command comes back the same way.
+        paths.meta.unlink()
+        paths.doc.write_text("# Edited\n")
+        git.commit_all(root, "agent:1", "bash: strip")
+        removal = await documents.remove_path(settings, user.id, paths.relative)
+        assert removal is not None
+        assert await reconcile.reconcile_user(db, settings, user.id) >= 1
+        assert paths.doc.read_text() == "# Edited\n"
+        assert not [name for name in os.listdir(root) if name.startswith(safe_io.TEMP_PREFIX)]
+        # Once the rows are gone for good, an aside and its origin are swept together.
+        await db.delete(drafts)
+        await db.commit()
+        removal = await documents.remove_path(settings, user.id, Path("files/Drafts"))
+        assert removal is not None
+        await reconcile.reconcile_user(db, settings, user.id)
+        assert not (root / "files" / "Drafts").exists()
+        assert not [name for name in os.listdir(root) if name.startswith(safe_io.TEMP_PREFIX)]

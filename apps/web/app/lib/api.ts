@@ -203,6 +203,7 @@ export interface UsageConversation {
   cache_write_tokens: number
   completion_tokens: number
   estimated_cost: number
+  estimated_calls: number
   unpriced_calls: number
 }
 

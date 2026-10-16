@@ -164,9 +164,12 @@ class Settings(BaseSettings):
 
     @property
     def json_body_max_bytes(self) -> int:
-        """The largest JSON request body the API reads: a document's content, escaped,
-        plus room for the envelope (docs/api.md). Uploads stream under their own cap."""
-        return self.content_max_bytes * 2 + 65_536
+        """The largest JSON request body the API reads: a document's content at its worst
+        JSON escaping — a one-byte control character is a six-byte `\\uXXXX`, an emoji's
+        four bytes a twelve-byte surrogate pair — plus room for the envelope, so no
+        content under the cap is refused for its encoding (docs/api.md). Uploads stream
+        under their own cap."""
+        return self.content_max_bytes * 6 + 65_536
 
     @property
     def parse_json_body_max_bytes(self) -> int:

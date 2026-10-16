@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import Settings
 from ..db.models import Document, Folder, User
 from . import git, safe_io
-from .documents import folder_names, sweep_aside
+from .documents import aside_origin, folder_names, sweep_aside
 from .layout import (
     FILES_DIR,
     META_FILE,
@@ -200,6 +200,35 @@ def _restore_aside(root: Path, aside_dir: Path, target: Path) -> bool:
     return True
 
 
+async def _row_names(db: AsyncSession, user_id: int, origin: Path) -> bool:
+    """Whether a folder or document row still places itself at `origin` (`files/…`): what
+    decides that an aside holding no document metadata goes back there rather than
+    being swept (docs/workspace.md § Revisions)."""
+    segments = origin.parts[1:]
+    if origin.parts[:1] != (FILES_DIR,) or not segments:
+        return False
+    parent: int | None = None
+    for index, segment in enumerate(segments):
+        at_parent = Folder.parent_id.is_(None) if parent is None else Folder.parent_id == parent
+        folders = (
+            await db.execute(
+                select(Folder.id, Folder.name).where(Folder.user_id == user_id, at_parent)
+            )
+        ).all()
+        match = next((row.id for row in folders if path_segment(row.name) == segment), None)
+        if match is not None:
+            parent = match
+            continue
+        if index != len(segments) - 1:
+            return False
+        in_folder = Document.folder_id.is_(None) if parent is None else Document.folder_id == parent
+        names = (
+            await db.execute(select(Document.name).where(Document.user_id == user_id, in_folder))
+        ).scalars()
+        return any(path_segment(name) == segment for name in names)
+    return True
+
+
 def _aside_origin(aside: Path, targets: dict[Path, Path]) -> Path | None:
     """Where an aside directory stood, as its surviving documents place it: each one sat
     `inner` below the aside and belongs at `target`, so the aside stood where `target`
@@ -299,9 +328,9 @@ async def reconcile_locked(db: AsyncSession, settings: Settings, user_id: int) -
 async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
     found, folders = await asyncio.to_thread(_canonicalize_and_scan, root)
     asides = await asyncio.to_thread(_aside_documents, root)
-    if not found and not folders and not any(asides.values()):
-        # Nothing to record and nothing aside worth a look: what a delete left is swept,
-        # under the same lock a delete holds, so none in flight is touched.
+    if not found and not folders and not asides:
+        # Nothing to record and nothing aside: nothing to do, under the same lock a
+        # delete holds, so none in flight is touched.
         await asyncio.to_thread(sweep_aside, root)
         return 0
     # The user's row, under the workspace lock — the order every mutation takes: a
@@ -326,6 +355,16 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
                     await folder_names(db, user_id, row.folder_id), row.name
                 )
         if not targets:
+            # No document metadata inside — a folder of shell-made files, a document whose
+            # `.meta.json` a command removed: the origin written beside the aside says
+            # where it stood, and a row that still names that path brings it back whole
+            # (docs/workspace.md § Revisions). Without one, the sweep takes it.
+            origin = await asyncio.to_thread(aside_origin, root, name)
+            if origin is not None and await _row_names(db, user_id, origin):
+                if await asyncio.to_thread(_restore_aside, root, Path(name), origin):
+                    restored += 1
+                else:
+                    keep.add(name)
             continue
         # The aside is a folder's directory whole when its surviving rows all place it at
         # one path: it goes back whole, with whatever else the folder held — files and

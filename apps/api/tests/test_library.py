@@ -20,7 +20,7 @@ from sightread.auth.sessions import SESSION_COOKIE, create_session
 from sightread.db.models import Document, Job, JobPage, Result, User
 from sightread.routes.library import DOCUMENT_NAME_MAX, clean_name, free_name
 from sightread.workspace.layout import user_root
-from tests.conftest import CSRF_HEADERS
+from tests.conftest import CSRF_HEADERS, DATABASE_URL
 from tests.test_parse_end_to_end import _connect_kano
 
 MODEL = "vendor/vision-model"
@@ -916,3 +916,41 @@ async def test_a_created_folder_is_a_directory_at_once(make_client, tmp_path) ->
         "Papers",
         "2024",
     }
+
+
+@pytest.mark.skipif(
+    not (DATABASE_URL or "").startswith("postgresql"),
+    reason="the foreign key only fails on PostgreSQL",
+)
+async def test_a_parent_deleted_during_the_insert_is_a_404_not_a_500(
+    library, sessionmaker, monkeypatch
+) -> None:
+    """The documented race: the parent goes between the ownership check and the insert.
+    The insert's retries follow a rollback that expires the row behind `user`, so the
+    route reads its id once, as a primitive, before the loop (docs/api.md)."""
+    from sqlalchemy import delete
+
+    from sightread.db.models import Folder
+    from sightread.routes import library as routes
+
+    parent = await _folder(library, "Doomed")
+    real = routes.sibling_names
+    pulled = False
+
+    async def pulling(db, user_id, parent_id, **kwargs):
+        nonlocal pulled
+        if parent_id == parent["id"] and not pulled:
+            pulled = True
+            async with sessionmaker() as other:
+                await other.execute(delete(Folder).where(Folder.id == parent_id))
+                await other.commit()
+        return await real(db, user_id, parent_id, **kwargs)
+
+    monkeypatch.setattr(routes, "sibling_names", pulling)
+    response = await library.post(
+        "/api/library/folders",
+        json={"name": "Inside", "parent_id": parent["id"]},
+        headers=CSRF_HEADERS,
+    )
+    assert response.status_code == 404, response.text
+    assert pulled

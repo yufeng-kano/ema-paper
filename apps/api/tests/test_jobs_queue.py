@@ -565,3 +565,57 @@ async def test_a_run_whose_snapshot_update_is_fenced_out_ends_there(
         row = await db.get(Job, job_id)
     assert (row.status, row.connection_base_url) == ("running", JOB_DEFAULTS["connection_base_url"])
     assert not (tmp_path / "uploads").exists()
+
+
+async def test_the_crops_are_published_under_the_backup_lock(
+    sessionmaker, tmp_path, monkeypatch
+) -> None:
+    """The result's commit and the move of its crops under the job's name are one hold of
+    the backup lock, so a snapshot never carries one without the other (docs/jobs.md
+    § Queue, docs/workspace.md § Backups)."""
+    import contextlib
+
+    from sightread.config import Settings
+    from sightread.jobs import runner
+    from tests.conftest import KANO_BASE, TEST_SECRET_KEY
+
+    async with sessionmaker() as db:
+        user = await _user(db)
+        job = await enqueue_job(
+            db, user_id=user.id, sha256="e" * 64, source_path="unused-e.pdf", **JOB_DEFAULTS
+        )
+        job.status = "running"
+        await db.commit()
+        job_id = job.id
+    held = False
+    published_while_held: list[bool] = []
+
+    @contextlib.asynccontextmanager
+    async def recording(root):
+        nonlocal held
+        held = True
+        try:
+            yield
+        finally:
+            held = False
+
+    async def publish() -> None:
+        published_while_held.append(held)
+
+    monkeypatch.setattr(runner, "backup_shared", recording)
+    settings = Settings(
+        app_env="local",
+        secret_key=TEST_SECRET_KEY,
+        workspaces_dir=str(tmp_path / "workspaces"),
+        figures_dir=str(tmp_path / "figures"),
+        kano_proxy_base_url=KANO_BASE,
+    )
+    assert await runner._finish(
+        sessionmaker, job_id, status="succeeded", settings=settings, publish=publish
+    )
+    assert published_while_held == [True]
+    # A finish that wrote nothing publishes nothing.
+    assert not await runner._finish(
+        sessionmaker, job_id, status="succeeded", settings=settings, generation=99, publish=publish
+    )
+    assert published_while_held == [True]

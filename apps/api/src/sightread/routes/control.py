@@ -837,6 +837,8 @@ async def usage_per_conversation(
                 func.sum(case((UsageLog.cost_source == COST_SOURCE_ESTIMATED, UsageLog.cost))),
                 func.count(case((UsageLog.cost_source == COST_SOURCE_UNKNOWN, 1))),
                 func.sum(UsageLog.cache_write_tokens),
+                # What tells an estimate of exactly $0 from no estimate (docs/api.md).
+                func.count(case((UsageLog.cost_source == COST_SOURCE_ESTIMATED, 1))),
             )
             .select_from(UsageLog)
             .join(ChatTurn, ChatTurn.id == UsageLog.turn_id)
@@ -861,6 +863,7 @@ async def usage_per_conversation(
                 "estimated_cost": float(row[8] or 0),
                 "unpriced_calls": int(row[9]),
                 "cache_write_tokens": int(row[10] or 0),
+                "estimated_calls": int(row[11]),
             }
             for row in rows
         ]

@@ -82,14 +82,6 @@ function estimate(cost: number, calls: number): string {
     : t('dashboard.none')
 }
 
-/** A conversation's estimate: it carries no billed/estimated call split, so a cost of
- *  nothing reads "—" rather than "≈ $0". */
-function conversationEstimate(cost: number): string {
-  return cost > 0
-    ? t('dashboard.estimatedValue', { cost: formatCost(cost, locale.value) })
-    : t('dashboard.none')
-}
-
 function percent(ratio: number | null): string {
   return ratio === null
     ? t('dashboard.none')
@@ -118,6 +110,7 @@ const conversationTotals = computed(() => {
     count: rows.length,
     turns: sum((row) => row.turns),
     estimatedCost: sum((row) => row.estimated_cost),
+    estimatedCalls: sum((row) => row.estimated_calls),
     unpricedCalls: sum((row) => row.unpriced_calls),
     promptTokens,
     cacheReadTokens,
@@ -224,7 +217,7 @@ async function runSandboxAction(action: () => Promise<void>) {
         >
           <span class="tab-label">{{ t('dashboard.tabConversations') }}</span>
           <span v-if="conversationsData" class="tab-figure mono tabular">
-            {{ conversationEstimate(conversationTotals.estimatedCost) }}
+            {{ estimate(conversationTotals.estimatedCost, conversationTotals.estimatedCalls) }}
           </span>
         </button>
         <button
@@ -403,7 +396,7 @@ async function runSandboxAction(action: () => Promise<void>) {
               <div class="metric">
                 <dt class="eyebrow">{{ t('dashboard.totalEstimatedCost') }}</dt>
                 <dd class="figure cost tabular">
-                  {{ conversationEstimate(conversationTotals.estimatedCost) }}
+                  {{ estimate(conversationTotals.estimatedCost, conversationTotals.estimatedCalls) }}
                 </dd>
               </div>
               <div class="metric">
@@ -447,7 +440,7 @@ async function runSandboxAction(action: () => Promise<void>) {
                 </template>
                 <template #cell-completion="{ row }">{{ formatCount(row.completion_tokens, locale) }}</template>
                 <template #cell-estimated="{ row }">
-                  <span class="estimate">{{ conversationEstimate(row.estimated_cost) }}</span>
+                  <span class="estimate">{{ estimate(row.estimated_cost, row.estimated_calls) }}</span>
                 </template>
               </UiDataTable>
             </div>

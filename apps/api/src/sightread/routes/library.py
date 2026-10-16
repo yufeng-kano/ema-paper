@@ -448,19 +448,22 @@ class FolderUpdate(BaseModel):
 async def create_folder(
     body: FolderCreate, user: SessionUser, db: DbSession, settings: AppSettings
 ):
+    # A primitive copy: a retry inside `insert_named` follows a rollback, which expires
+    # the row behind `user`, and an expired attribute cannot be loaded here.
+    user_id = user.id
     if body.parent_id is not None:
-        await owned_folder(db, user.id, body.parent_id)
+        await owned_folder(db, user_id, body.parent_id)
     parent_id = body.parent_id
     # The row and its directory under one hold of the workspace lock, as a move or a
     # delete: the shell sees the folder as soon as the row exists, and a workspace that
     # takes no host write (recovering) refuses it up front (docs/workspace.md § Layout).
-    async with workspace_lock(user_root(settings.workspaces_dir, user.id)):
+    async with workspace_lock(user_root(settings.workspaces_dir, user_id)):
         try:
             row = await insert_named(
                 db,
-                user_id=user.id,
-                build=lambda name: Folder(user_id=user.id, parent_id=parent_id, name=name),
-                taken=lambda: sibling_names(db, user.id, parent_id),
+                user_id=user_id,
+                build=lambda name: Folder(user_id=user_id, parent_id=parent_id, name=name),
+                taken=lambda: sibling_names(db, user_id, parent_id),
                 wanted=clean_name(body.name, FOLDER_NAME_MAX),
                 limit=FOLDER_NAME_MAX,
                 message="A folder with this name already exists here",
@@ -470,17 +473,17 @@ async def create_folder(
             # key, which arrives as the same IntegrityError a taken name does — and
             # retrying with a destination that no longer exists only ever produces a 409
             # about the wrong thing.
-            if parent_id is None or await folder_exists(db, user.id, parent_id):
+            if parent_id is None or await folder_exists(db, user_id, parent_id):
                 raise
             raise ApiError(404, "invalid_request", "No such folder") from None
-        relative = await folder_relative_dir(db, user.id, row.id)
+        relative = await folder_relative_dir(db, user_id, row.id)
         try:
-            await workspace_documents.make_folder_dir(settings, user.id, relative)
+            await workspace_documents.make_folder_dir(settings, user_id, relative)
         except (safe_io.UnsafeEntry, OSError):
             # An entry the shell planted where the directory belongs: the row stands,
             # the tree is the shell's, and the next materialization under it says so.
             logger.warning(
-                "the directory of folder %d of user %d could not be made", row.id, user.id
+                "the directory of folder %d of user %d could not be made", row.id, user_id
             )
     return folder_payload(row)
 
@@ -681,6 +684,9 @@ async def upload_document(
     `POST /v1/parse`; what this route adds is the name and the place (docs/api.md § Why the
     web upload is a control-plane route).
     """
+    # A primitive copy: a retry inside `insert_named` follows a rollback, which expires
+    # the row behind `user`, and an expired attribute cannot be loaded here.
+    user_id = user.id
     if not request.headers.get("content-type", "").startswith("multipart/form-data"):
         raise ApiError(400, "invalid_request", "The upload must be multipart/form-data")
     # Cheap rejection before a byte is read; the capped stream below is what stops a
@@ -706,7 +712,7 @@ async def upload_document(
         raise ApiError(400, "invalid_request", "Multipart requests need a 'file' part")
     folder_id = form_folder_id(form)
     if folder_id is not None:
-        await owned_folder(db, user.id, folder_id)
+        await owned_folder(db, user_id, folder_id)
 
     filename = upload.filename or "upload"
     # The library name is decided before the parse is queued: a name that cleans to
@@ -737,7 +743,7 @@ async def upload_document(
     # The folder can be deleted while the document is being stored and probed. The parse is
     # committed and will bill by now, so the file lands at the root rather than being lost
     # behind a foreign-key failure dressed up as a name conflict.
-    if folder_id is not None and not await folder_exists(db, user.id, folder_id):
+    if folder_id is not None and not await folder_exists(db, user_id, folder_id):
         folder_id = None
 
     # The job is committed and running by now, so the file has to land: `insert_named`
@@ -745,12 +751,12 @@ async def upload_document(
     async def land(place: int | None) -> Document:
         async def taken() -> set[str]:
             await lock_job(db, job_id)
-            return await sibling_names(db, user.id, place)
+            return await sibling_names(db, user_id, place)
 
         return await insert_named(
             db,
-            user_id=user.id,
-            build=lambda name: Document(user_id=user.id, folder_id=place, job_id=job_id, name=name),
+            user_id=user_id,
+            build=lambda name: Document(user_id=user_id, folder_id=place, job_id=job_id, name=name),
             taken=taken,
             wanted=wanted,
             limit=DOCUMENT_NAME_MAX,
@@ -759,13 +765,13 @@ async def upload_document(
 
     # The row's commit and the upload it takes into the directory land in one backup
     # snapshot: the upload directory is not backed up (docs/workspace.md § Backups).
-    async with backup_shared(user_root(settings.workspaces_dir, user.id)):
+    async with backup_shared(user_root(settings.workspaces_dir, user_id)):
         try:
             row = await land(folder_id)
         except ApiError:
             # The remaining sliver of that same race: deleted between the check above and
             # this insert, which arrives as a foreign-key failure rather than a name one.
-            if folder_id is None or await folder_exists(db, user.id, folder_id):
+            if folder_id is None or await folder_exists(db, user_id, folder_id):
                 raise
             row = await land(None)
 

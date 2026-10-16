@@ -31,6 +31,7 @@ from . import git, safe_io
 from .layout import (
     DOC_FILE,
     FIGURES_DIR,
+    FILES_DIR,
     META_FILE,
     NOTES_FILE,
     SOURCE_STEM,
@@ -976,6 +977,29 @@ class Removal:
     aside: Path
 
 
+# Beside each aside directory, the path it was removed from: what lets reconciliation
+# bring back an aside that holds no document metadata (docs/workspace.md § Revisions).
+ORIGIN_SUFFIX = ".origin"
+
+
+def origin_marker(root: Path, aside: str | Path) -> Path:
+    return root / f"{Path(aside).name}{ORIGIN_SUFFIX}"
+
+
+def aside_origin(root: Path, aside: str | Path) -> Path | None:
+    """The path an aside directory was removed from, or None when nothing says."""
+    try:
+        text = safe_io.read_text(root, origin_marker(root, aside), 4096)
+    except (safe_io.UnsafeEntry, safe_io.EntryTooLarge, OSError, UnicodeDecodeError):
+        return None
+    if text is None:
+        return None
+    origin = Path(text.strip())
+    if not origin.parts or origin.parts[0] != FILES_DIR or ".." in origin.parts:
+        return None
+    return origin
+
+
 def _remove_tree(root: Path, relative: Path, message: str) -> Removal | None:
     git.ensure_repo(root)
     if safe_io.entry_kind(root, root / relative) == "none":
@@ -987,6 +1011,9 @@ def _remove_tree(root: Path, relative: Path, message: str) -> Removal | None:
         # back whole if they are not. Through descriptors that follow nothing: an
         # ancestor the shell swapped for a link to another tree is a refusal.
         safe_io.rename(root, root / relative, root / aside)
+        # Where it stood, beside it: what brings it back should the rows survive and
+        # nothing inside it name a document (docs/workspace.md § Revisions).
+        safe_io.write_text(root, origin_marker(root, aside), relative.as_posix() + "\n")
     except safe_io.UnsafeEntry as exc:
         raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
     try:
@@ -994,6 +1021,7 @@ def _remove_tree(root: Path, relative: Path, message: str) -> Removal | None:
     except git.GitError as exc:
         # Back where it was before the refusal: nothing waits aside for a sweep to take.
         safe_io.rename(root, root / aside, root / relative)
+        safe_io.remove_file(root, origin_marker(root, aside))
         raise ApiError(
             409, "invalid_request", "The removal could not be recorded; nothing was changed"
         ) from exc
@@ -1012,11 +1040,17 @@ async def discard_removed(settings: Settings, user_id: int, removal: Removal) ->
     """The rows are gone: so is the directory set aside, with a bounded set of
     descriptors however deep it is."""
     root = user_root(settings.workspaces_dir, user_id)
-    await asyncio.to_thread(safe_io.remove_tree, root, root / removal.aside)
+
+    def _discard() -> None:
+        safe_io.remove_tree(root, root / removal.aside)
+        safe_io.remove_file(root, origin_marker(root, removal.aside))
+
+    await asyncio.to_thread(_discard)
 
 
 def _restore_removed(root: Path, relative: Path, removal: Removal) -> None:
     safe_io.rename(root, root / removal.aside, root / relative)
+    safe_io.remove_file(root, origin_marker(root, removal.aside))
     git.commit_paths(root, git.USER_AUTHOR, f"restore {relative}", [relative])
 
 
@@ -1037,11 +1071,22 @@ def sweep_aside(root: Path, keep: Collection[str] = ()) -> int:
     names the aside directories that still hold a document whose row survived, which
     reconciliation restores instead (docs/workspace.md § Revisions)."""
     swept = 0
-    for name, is_dir in safe_io.list_dir(root, root):
-        if is_dir and name.startswith(safe_io.TEMP_PREFIX) and name not in keep:
+    entries = safe_io.list_dir(root, root)
+    present = {name for name, is_dir in entries if is_dir}
+    for name, is_dir in entries:
+        if not name.startswith(safe_io.TEMP_PREFIX):
+            continue
+        if is_dir and name not in keep:
             with contextlib.suppress(OSError, safe_io.UnsafeEntry):
                 safe_io.remove_tree(root, root / name)
+                safe_io.remove_file(root, origin_marker(root, name))
                 swept += 1
+        elif not is_dir and name.endswith(ORIGIN_SUFFIX):
+            # An origin whose aside is gone, or goes with this sweep.
+            aside = name.removesuffix(ORIGIN_SUFFIX)
+            if aside not in present or aside not in keep:
+                with contextlib.suppress(OSError, safe_io.UnsafeEntry):
+                    safe_io.remove_file(root, root / name)
     return swept
 
 

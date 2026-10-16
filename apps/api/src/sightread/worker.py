@@ -100,6 +100,10 @@ async def run_worker(stop: asyncio.Event) -> None:
     # the turns a dead worker held unfinished until the next restart (docs/jobs.md).
     orphans_pending = True
     orphans_tried_at = -ORPHAN_RETRY_SECONDS
+    # Nothing is claimed before the first pass has completed: a database blip there
+    # leaves the users whose orphaned turns wait unknown, and a parse of theirs would
+    # write a tree a dead worker's command may still be writing (docs/jobs.md).
+    recovered_once = False
     # The users whose orphaned turn could not be stopped yet: no turn runs at all until
     # the cleanup has gone through, and no parse of theirs, since a parse finishing
     # writes their tree too (docs/jobs.md § Chat turns).
@@ -137,6 +141,11 @@ async def run_worker(stop: asyncio.Event) -> None:
                         )
                     orphaned_users = left
                     orphans_pending = bool(left)
+                    recovered_once = True
+            if not recovered_once:
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(stop.wait(), timeout=IDLE_POLL_SECONDS)
+                continue
             job_id = None
             turn_id = None
             try:
