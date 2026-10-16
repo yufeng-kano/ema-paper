@@ -126,7 +126,9 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${WORKSPACES_HOST_DIR:?WORKSPACES_HOST_DIR is required}:/data/workspaces
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8100/healthz', timeout=3)"]
+      # Probes the port the runner listens on (SANDBOX_PORT, read from the container's
+      # own environment), never a fixed one (docs/deployment.md).
+      test: ["CMD", "python", "-c", "import os, urllib.request; urllib.request.urlopen('http://localhost:' + os.environ.get('SANDBOX_PORT', '8100') + '/healthz', timeout=3)"]
       interval: 10s
       timeout: 5s
       retries: 10

@@ -35,7 +35,8 @@ services:
       UPLOAD_DIR: /data/uploads
       FIGURES_DIR: /data/figures
       WORKSPACES_DIR: /data/workspaces
-      SANDBOX_URL: http://sandbox:8100
+      # The runner's address, from the port it listens on (SANDBOX_PORT, docs/deployment.md).
+      SANDBOX_URL: http://sandbox:${SANDBOX_PORT:-8100}
     depends_on:
       pg:
         condition: service_healthy
@@ -71,7 +72,8 @@ services:
       UPLOAD_DIR: /data/uploads
       FIGURES_DIR: /data/figures
       WORKSPACES_DIR: /data/workspaces
-      SANDBOX_URL: http://sandbox:8100
+      # The runner's address, from the port it listens on (SANDBOX_PORT, docs/deployment.md).
+      SANDBOX_URL: http://sandbox:${SANDBOX_PORT:-8100}
     depends_on:
       pg:
         condition: service_healthy
@@ -108,7 +110,9 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${WORKSPACES_HOST_DIR:-./workspaces}:/data/workspaces
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8100/healthz', timeout=3)"]
+      # Probes the port the runner listens on (SANDBOX_PORT, read from the container's
+      # own environment), never a fixed one (docs/deployment.md).
+      test: ["CMD", "python", "-c", "import os, urllib.request; urllib.request.urlopen('http://localhost:' + os.environ.get('SANDBOX_PORT', '8100') + '/healthz', timeout=3)"]
       interval: 10s
       timeout: 5s
       retries: 10
