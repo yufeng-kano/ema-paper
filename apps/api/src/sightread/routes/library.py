@@ -352,14 +352,22 @@ async def _read_row(db: DbSession, model: type, row_id: int) -> tuple[bool, obje
         return False, None
 
 
-async def commit_filing(db: DbSession, row: Document, *, what: str) -> Document:
+async def commit_filing(
+    db: DbSession,
+    row: Document,
+    *,
+    what: str,
+    undo: Callable[[], Awaitable[None]] | None = None,
+) -> Document:
     """Commit a filing — its row inserted and its original in place. A commit that raises
     is verified on a connection of its own, as a move's is: the row present means
     PostgreSQL made it durable and the connection dropped after, so the filing stands
     and is answered as made — reported as nothing filed, the browser's retry would file
     a suffixed twin of the same parse; the row absent means it rolled back, and nothing
-    was filed; a read that fails says nothing either way, and is answered as unconfirmed
-    rather than as a filing that did not happen (docs/workspace.md § Revisions)."""
+    was filed — `undo` then takes back what the filing put on disk for the row, so no
+    file stands for a row that is gone; a read that fails says nothing either way, and
+    is answered as unconfirmed rather than as a filing that did not happen
+    (docs/workspace.md § Revisions)."""
     try:
         await db.commit()
         return row
@@ -372,6 +380,11 @@ async def commit_filing(db: DbSession, row: Document, *, what: str) -> Document:
             await db.rollback()
         if readable:
             logger.exception("the filing of document %d did not commit", row.id)
+            if undo is not None:
+                try:
+                    await undo()
+                except Exception:  # noqa: BLE001 - the refusal stands; the leftovers are logged
+                    logger.exception("could not take back the files of document %d", row.id)
             raise ApiError(
                 409, "invalid_request", f"{what} could not be filed; nothing was filed"
             ) from exc
@@ -844,8 +857,17 @@ async def upload_document(
             raise ApiError(
                 409, "invalid_request", "The upload could not be kept; nothing was filed"
             ) from exc
-        # A commit that raises is verified before it is reported (docs/workspace.md).
-        row = await commit_filing(db, row, what="The upload")
+        # A commit that raises is verified before it is reported, and a rollback takes
+        # the original and the shell's copy back with it (docs/workspace.md).
+        relative = document_relative_dir(
+            await workspace_documents.folder_names(db, user_id, row.folder_id), row.name
+        )
+        row = await commit_filing(
+            db,
+            row,
+            what="The upload",
+            undo=lambda: workspace_documents.discard_adopted(settings, user_id, row_id, relative),
+        )
     return document_payload(row, job)
 
 
@@ -932,8 +954,17 @@ async def file_job(body: DocumentFromJob, user: SessionUser, db: DbSession, sett
             raise ApiError(
                 409, "invalid_request", "The original could not be copied; nothing was filed"
             ) from exc
-        # A commit that raises is verified before it is reported (docs/workspace.md).
-        row = await commit_filing(db, row, what="The parse")
+        # A commit that raises is verified before it is reported, and a rollback takes
+        # the copy of the original back with it (docs/workspace.md).
+        relative = document_relative_dir(
+            await workspace_documents.folder_names(db, user_id, row.folder_id), row.name
+        )
+        row = await commit_filing(
+            db,
+            row,
+            what="The parse",
+            undo=lambda: workspace_documents.discard_adopted(settings, user_id, row_id, relative),
+        )
         if not filed:
             raise ApiError(404, "invalid_request", "The file was deleted while it was being filed")
     return document_payload(row, job)

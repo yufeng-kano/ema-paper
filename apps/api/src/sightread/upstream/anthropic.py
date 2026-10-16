@@ -156,6 +156,10 @@ async def _bounded_lines(
             newline = pending.find(b"\n")
             if newline == -1:
                 break
+            if newline > line_max_bytes:
+                # Complete, but past the cap: refused before it is built or handed on,
+                # like a line that outgrows the cap with no end in sight.
+                raise UpstreamError("The upstream sent an overlong stream line")
             line = bytes(pending[:newline])
             del pending[: newline + 1]
             yield line.decode("utf-8", errors="replace").rstrip("\r")

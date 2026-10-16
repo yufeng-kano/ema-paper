@@ -1050,3 +1050,46 @@ async def test_a_filing_whose_commit_landed_despite_the_error_is_answered_as_mad
     assert filed.json()["name"] == "tiny (2).png"
     names = sorted(row["name"] for row in (await _read(library))["documents"])
     assert names == ["tiny (2).png", "tiny.png"]
+
+
+async def test_a_filing_whose_commit_rolled_back_leaves_no_file_behind(
+    make_client, sessionmaker, documents, tmp_path, monkeypatch
+) -> None:
+    """The commit failed and the fresh read says the row is gone: the copy of the original
+    taken for it goes too, so nothing stands for a row that is not there and the retry
+    lands under the same name (docs/workspace.md § Revisions)."""
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from sightread.workspace.layout import sources_dir
+
+    library = make_client(workspaces_dir=str(tmp_path / "ws"))
+    await _ready_to_parse(library)
+    # The second upload is a dedup hit on a finished parse: its original is kept at once.
+    await _upload(library, documents)
+    uploaded = (await _upload(library, documents)).json()
+    async with sessionmaker() as db:
+        row = await db.get(Document, uploaded["id"])
+        root = user_root(library.app.state.settings.workspaces_dir, row.user_id)
+    assert len(list(sources_dir(root).iterdir())) == 1
+
+    original = AsyncSession.commit
+    failing = {"on": True}
+
+    async def commit(self):
+        if failing["on"]:
+            failing["on"] = False
+            await self.rollback()
+            raise OperationalError("COMMIT", {}, Exception("the server went away"))
+        await original(self)
+
+    monkeypatch.setattr(AsyncSession, "commit", commit)
+    refused = await _file_job(library, uploaded["job_id"])
+    monkeypatch.setattr(AsyncSession, "commit", original)
+    assert refused.status_code == 409 and "nothing was filed" in refused.json()["error"]["message"]
+    # Only the uploaded document's original stands; the copy taken for the lost row is gone.
+    assert len(list(sources_dir(root).iterdir())) == 1
+    assert not (root / "files" / "tiny (3).png").exists()
+    # The retry lands under the name the lost row would have had.
+    filed = await _file_job(library, uploaded["job_id"])
+    assert filed.status_code == 201 and filed.json()["name"] == "tiny (3).png"

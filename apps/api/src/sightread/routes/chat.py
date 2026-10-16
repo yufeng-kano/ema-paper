@@ -46,7 +46,6 @@ from ..workspace.layout import CACHE_DIR, FILES_DIR, SIGHTREAD_DIR, git_dir, sou
 router = APIRouter(prefix="/api", tags=["chat"])
 
 SSE_MEDIA_TYPE = "text/event-stream"
-RETRY_AFTER_SECONDS = 15
 TITLE_MAX_CHARS = 80
 
 
@@ -328,7 +327,7 @@ async def post_message(
             429,
             "rate_limit",
             "Too many running conversations; wait for one to finish",
-            headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
+            headers={"Retry-After": str(settings.chat_retry_after_seconds)},
         )
     if await _active_turn(db, row.id) is not None:
         raise ApiError(409, "invalid_request", "This conversation is still answering")

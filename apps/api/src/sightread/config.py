@@ -49,6 +49,8 @@ class Settings(BaseSettings):
     upload_max_bytes: int = 134_217_728
     page_cap: int = 500
     max_jobs_per_user: int = 2
+    # The `Retry-After` a refused parse (429, the per-user job cap) tells the client.
+    parse_retry_after_seconds: int = 30
     # A library upload retried after the first request's answer was lost is answered with
     # the job that answered the first, even one already finished, when it finished this
     # recently (docs/jobs.md § Dedup).
@@ -85,6 +87,8 @@ class Settings(BaseSettings):
 
     # The chat agent's limits (docs/chat.md).
     max_chat_turns_per_user: int = 4
+    # The `Retry-After` a refused send (429, the per-user turn cap) tells the client.
+    chat_retry_after_seconds: int = 15
     chat_max_output_tokens: int = 64_000
     chat_max_tool_calls_per_turn: int = 50
     chat_turn_timeout_seconds: int = 900

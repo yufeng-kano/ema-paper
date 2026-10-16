@@ -539,9 +539,11 @@ async def _finish(
 ) -> bool:
     """Write the terminal state and delete the source document (docs/jobs.md § Retention).
     False when nothing was written: the job is gone, or no longer this worker's.
-    `publish` runs after a terminal state that was written, under the same shared hold
-    of the backup lock: the crops of a succeeded parse land under the job's name before
-    a backup can see the result, so no snapshot carries one without them.
+    `publish` runs right after a terminal state that was written, under the same shared
+    hold of the backup lock and before the documents behind the job are materialized:
+    the crops of a succeeded parse land under the job's name before a backup can see the
+    result, so no snapshot carries one without them, and before the document copies are
+    made, which take their crops from there (docs/workspace.md § Layout).
 
     A succeeded parse behind a library document keeps its original instead: the source
     moves into the document's workspace directory (docs/workspace.md). A failed job's crop
@@ -554,18 +556,21 @@ async def _finish(
             return False
         user_id = job.user_id
     if settings is None:
-        written = await _finish_held(
-            sessionmaker, job_id, status=status, error=error, result=result, generation=generation
+        return await _finish_held(
+            sessionmaker,
+            job_id,
+            status=status,
+            error=error,
+            result=result,
+            generation=generation,
+            publish=publish,
         )
-        if written and publish is not None:
-            await publish()
-        return written
     # The rows that say the parse is done, and the original and copies they describe,
     # land in one backup snapshot: the backup lock is held shared from before the commit
     # until the files are in place, since the upload directory they come from is not
     # backed up (docs/workspace.md § Backups).
     async with backup_shared(user_root(settings.workspaces_dir, user_id)):
-        written = await _finish_held(
+        return await _finish_held(
             sessionmaker,
             job_id,
             status=status,
@@ -573,10 +578,8 @@ async def _finish(
             result=result,
             settings=settings,
             generation=generation,
+            publish=publish,
         )
-        if written and publish is not None:
-            await publish()
-        return written
 
 
 async def _finish_held(
@@ -588,6 +591,7 @@ async def _finish_held(
     result: dict | None = None,
     settings: Settings | None = None,
     generation: int | None = None,
+    publish: Callable[[], Awaitable[None]] | None = None,
 ) -> bool:
     async with sessionmaker() as db:
         job = await db.get(Job, job_id)
@@ -642,6 +646,9 @@ async def _finish_held(
                 job.source_deleted_at = utcnow()
         await events.notify(db, job.id)
         await db.commit()
+    if publish is not None:
+        # The crops under the job's name now, before the copies below are made from them.
+        await publish()
     if source is not None and documents:
         # The terminal state is committed and billed; keeping the original is best effort
         # from here (docs/jobs.md § Retention): a copy that fails is logged, never a

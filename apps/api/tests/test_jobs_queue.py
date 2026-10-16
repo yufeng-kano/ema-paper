@@ -15,7 +15,7 @@ from datetime import timedelta
 import pytest
 
 from sightread.agents import PARSE
-from sightread.db.models import Job, User, utcnow
+from sightread.db.models import Document, Job, User, utcnow
 from sightread.jobs.queue import (
     claim_next_job,
     count_running_jobs,
@@ -599,10 +599,21 @@ async def test_the_crops_are_published_under_the_backup_lock(
         finally:
             held = False
 
+    order: list[str] = []
+
     async def publish() -> None:
         published_while_held.append(held)
+        order.append("publish")
+
+    async def materialize(db, settings_, row, **kwargs):
+        # The copies take their crops from under the job's name: published first.
+        order.append("materialize")
 
     monkeypatch.setattr(runner, "backup_shared", recording)
+    monkeypatch.setattr(runner, "materialize_document", materialize)
+    async with sessionmaker() as db:
+        db.add(Document(user_id=user.id, folder_id=None, job_id=job_id, name="e.pdf"))
+        await db.commit()
     settings = Settings(
         app_env="local",
         secret_key=TEST_SECRET_KEY,
@@ -614,6 +625,7 @@ async def test_the_crops_are_published_under_the_backup_lock(
         sessionmaker, job_id, status="succeeded", settings=settings, publish=publish
     )
     assert published_while_held == [True]
+    assert order == ["publish", "materialize"]
     # A finish that wrote nothing publishes nothing.
     assert not await runner._finish(
         sessionmaker, job_id, status="succeeded", settings=settings, generation=99, publish=publish

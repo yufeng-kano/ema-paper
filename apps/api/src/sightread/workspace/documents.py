@@ -490,7 +490,9 @@ async def inherit_original(
                 if await asyncio.to_thread(copy_original, root, sibling_id, document.id):
                     return True
     try:
-        await adopt_source(db, settings, document, job, locked=locked)
+        # No commit of its own: the filing commits the row and the job together, through
+        # the verified commit every filing takes (docs/workspace.md § Revisions).
+        await adopt_source(db, settings, document, job, locked=locked, commit=False)
     except InvalidRequestError:
         return False
     return True
@@ -517,6 +519,7 @@ async def adopt_source(
     *,
     upload: Path | None = None,
     locked: bool = False,
+    commit: bool = True,
 ) -> None:
     """The library row arrived after its parse finished, so the worker found no document
     to keep the upload for and left it in place — or the parse was answered from the
@@ -524,7 +527,9 @@ async def adopt_source(
     for itself (docs/jobs.md § Retention): take it now. A copy that fails, or that the
     quota refuses (`ApiError`, 409), leaves nothing behind — the original and the shell's
     copy go — since the caller rolls the row back and no file may stay for a row that is
-    gone (docs/workspace.md § Layout). `locked`: the caller holds the workspace lock."""
+    gone (docs/workspace.md § Layout). `locked`: the caller holds the workspace lock.
+    `commit`: whether the job's `source_deleted_at` is committed here; a filing passes
+    False and commits the row and the job together, through its own verified commit."""
     if upload is not None:
         source = upload
     else:
@@ -571,7 +576,8 @@ async def adopt_source(
             raise
     if upload is None:
         job.source_deleted_at = utcnow()
-        await db.commit()
+        if commit:
+            await db.commit()
 
 
 def _undo_adoption(root: Path, document_id: int, directory: Path, suffix: str) -> None:
@@ -580,6 +586,32 @@ def _undo_adoption(root: Path, document_id: int, directory: Path, suffix: str) -
         safe_io.remove_file(root, directory / f"{SOURCE_STEM}{suffix}")
     with contextlib.suppress(OSError):
         directory.rmdir()  # only when the copy was all it held
+
+
+def _discard_adopted(root: Path, document_id: int, directory: Path) -> None:
+    _discard_originals(root, [document_id])
+    try:
+        entries = safe_io.list_dir(root, directory)
+    except (OSError, safe_io.UnsafeEntry):
+        return
+    for name, is_dir in entries:
+        if not is_dir and name.startswith(f"{SOURCE_STEM}."):
+            with contextlib.suppress(OSError, safe_io.UnsafeEntry):
+                safe_io.remove_file(root, directory / name)
+    with contextlib.suppress(OSError):
+        directory.rmdir()  # only when the copy was all it held
+
+
+async def discard_adopted(
+    settings: Settings, user_id: int, document_id: int, relative: Path
+) -> None:
+    """What a filing took for a row that did not commit — the original under the row's
+    id and the shell's `source.*` copy, with the directory if the copy was all it held —
+    goes with the rollback: no file stands for a row that is gone, and the retry lands
+    under the same name rather than a suffixed one (docs/workspace.md § Revisions). The
+    caller holds the workspace lock."""
+    root = user_root(settings.workspaces_dir, user_id)
+    await asyncio.to_thread(_discard_adopted, root, document_id, root / relative)
 
 
 # --- content ------------------------------------------------------------------------------

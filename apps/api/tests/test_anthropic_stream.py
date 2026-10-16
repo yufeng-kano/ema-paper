@@ -351,3 +351,18 @@ async def test_a_delta_or_stop_for_a_block_that_never_started_is_refused(key) ->
             async for _ in stream_messages(key, {"messages": []}, betas=(), max_bytes=10_000_000):
                 pass
         assert "has not started" in str(refused.value)
+
+
+@respx.mock
+async def test_a_complete_overlong_line_is_refused_before_it_is_yielded(key) -> None:
+    """A line past the cap that ends within the chunk is refused as one that never ends:
+    the bound holds whichever way the line arrives (docs/chat.md § Conversations, turns,
+    events)."""
+    ended = b"data: " + b"x" * 5_000 + b"\n\n"
+    respx.post(MESSAGES_URL).mock(return_value=httpx.Response(200, content=ended))
+    with pytest.raises(UpstreamError) as refused:
+        async for _ in stream_messages(
+            key, {"messages": []}, betas=(), max_bytes=10_000_000, line_max_bytes=1_000
+        ):
+            pass
+    assert "overlong" in str(refused.value)

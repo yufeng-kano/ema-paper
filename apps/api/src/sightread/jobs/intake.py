@@ -42,7 +42,6 @@ from .queue import (
 from .runner import result_payload
 
 PDF_MEDIA_TYPE = "application/pdf"
-RETRY_AFTER_SECONDS = 30
 UPLOAD_CHUNK_BYTES = 1024 * 1024
 # Room for the multipart envelope around a file at the cap: boundaries, part headers and
 # the other fields. The exact cap on the document itself stays in `store_upload`; this is
@@ -269,7 +268,7 @@ async def submit_parse(
             429,
             "rate_limit",
             "Too many running jobs; retry when one finishes",
-            headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
+            headers={"Retry-After": str(settings.parse_retry_after_seconds)},
         )
 
     upload_dir = Path(settings.upload_dir)
