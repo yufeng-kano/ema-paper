@@ -387,23 +387,25 @@ async def inherit_original(
     does (docs/workspace.md § Layout). False when the row is gone by the time the lock
     is held: another tab deleted it, and no original is kept under an id with no row."""
     root = user_root(settings.workspaces_dir, document.user_id)
-    siblings = list(
-        (
-            await db.execute(
-                select(Document.id)
-                .where(Document.job_id == job.id, Document.id != document.id)
-                .order_by(Document.id)
-            )
-        ).scalars()
-    )
-    if siblings:
-        # The quota and the copy under the workspace lock, as retention takes them: two
-        # filings at once must not both measure the room and both take it (§ Quota).
-        async with workspace_lock(root):
-            try:
-                await db.refresh(document)
-            except InvalidRequestError:
-                return False  # deleted since it was filed; a delete holds this lock
+    # The siblings, the quota and the copy under the workspace lock, as retention takes
+    # them: a delete of the last sibling holds the same lock, so it cannot take the
+    # original away between the look and the copy, and two filings at once cannot both
+    # measure the room and both take it (§ Quota).
+    async with workspace_lock(root):
+        try:
+            await db.refresh(document)
+        except InvalidRequestError:
+            return False  # deleted since it was filed; a delete holds this lock
+        siblings = list(
+            (
+                await db.execute(
+                    select(Document.id)
+                    .where(Document.job_id == job.id, Document.id != document.id)
+                    .order_by(Document.id)
+                )
+            ).scalars()
+        )
+        if siblings:
             try:
                 await ensure_within_quota(settings, root)
             except ApiError:
@@ -643,6 +645,10 @@ def reaches_beyond(paths: DocumentPaths, commit: str) -> bool:
     except git.GitError:
         return True
     for _status, then, renamed_to in changes:
+        if renamed_to is not None and _under(moved.get(renamed_to, renamed_to), paths.relative):
+            # The commit's own rename of this document's files: where they came from is
+            # this document's too — the revision that renamed the document, above all.
+            continue
         for path in (then, renamed_to):
             if path is not None and not _under(moved.get(path, path), paths.relative):
                 return True

@@ -10,6 +10,7 @@ page, where it is deliberate.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import uuid
@@ -100,17 +101,33 @@ def _canonicalize(root: Path) -> int:
         dirs[:] = kept
     if moved:
         # Only the moved paths: a shell may be running, with its own dirt in the tree.
-        git.commit_paths(root, git.USER_AUTHOR, "canonicalize names from the shell", moved)
+        try:
+            git.commit_paths(root, git.USER_AUTHOR, "canonicalize names from the shell", moved)
+        except git.GitError:
+            # Back under the names the shell gave: a move without its revision would
+            # strand the directory beside a row that still names the old path. The
+            # rows stay as they were; the next reconciliation tries again.
+            logger.exception("reconcile: canonicalization could not be recorded; undone")
+            for source, target in reversed(list(zip(moved[::2], moved[1::2], strict=True))):
+                with contextlib.suppress(OSError, safe_io.UnsafeEntry):
+                    safe_io.rename(root, root / target, root / source)
+            return 0
     return len(moved) // 2
 
 
-def _scan(root: Path) -> list[Found]:
-    """Every document directory under files/, by the id its `.meta.json` carries. Symlinks
-    are not followed and not read: the tree the host trusts is made of directories."""
+def _scan(root: Path) -> tuple[list[Found], list[tuple[str, ...]]]:
+    """Every document directory under files/, by the id its `.meta.json` carries, and
+    every other directory — a folder, empty or not, which gets a row of its own whether
+    or not a document sits in it. Symlinks are not followed and not read: the tree the
+    host trusts is made of directories."""
     found: list[Found] = []
+    folders: list[tuple[str, ...]] = []
     for current, dirs, files in _walk(root, Path(FILES_DIR)):
         dirs[:] = [name for name in dirs if is_canonical_segment(name)]
         if META_FILE not in files:
+            parts = current.relative_to(FILES_DIR).parts
+            if parts:
+                folders.append(parts)
             continue
         dirs[:] = []  # nothing beneath a document is a folder or a document
         meta = root / current / META_FILE
@@ -133,10 +150,10 @@ def _scan(root: Path) -> list[Found]:
         if not parts:
             continue
         found.append(Found(document_id, tuple(parts[:-1]), parts[-1]))
-    return found
+    return found, folders
 
 
-def _canonicalize_and_scan(root: Path) -> list[Found]:
+def _canonicalize_and_scan(root: Path) -> tuple[list[Found], list[tuple[str, ...]]]:
     git.ensure_repo(root)
     _canonicalize(root)
     # What a delete set aside and a crash left: removed here, under the same lock a
@@ -150,11 +167,12 @@ class NestedInDocument(Exception):
 
 
 async def _folder_for(
-    db: AsyncSession, user_id: int, segments: tuple[str, ...], cache: dict
+    db: AsyncSession, user_id: int, segments: tuple[str, ...], cache: dict, created: list[int]
 ) -> int | None:
     """The folder row at this path, created when the shell made the directory — unless
     a segment is a document's: a folder under a document's name would share its
-    directory (docs/workspace.md § The tree is the truth)."""
+    directory (docs/workspace.md § The tree is the truth). `created` collects the ids
+    of the rows made here."""
     parent: int | None = None
     for segment in segments:
         key = (parent, segment)
@@ -196,6 +214,7 @@ async def _folder_for(
             match = Folder(user_id=user_id, parent_id=parent, name=segment_name(segment))
             db.add(match)
             await db.flush()
+            created.append(match.id)
         cache[key] = match.id
         parent = match.id
     return parent
@@ -219,8 +238,8 @@ async def reconcile_locked(db: AsyncSession, settings: Settings, user_id: int) -
 
 
 async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
-    found = await asyncio.to_thread(_canonicalize_and_scan, root)
-    if not found:
+    found, folders = await asyncio.to_thread(_canonicalize_and_scan, root)
+    if not found and not folders:
         return 0
     # The user's row, under the workspace lock — the order every mutation takes: a
     # folder row added here shares the namespace the Files page's name decisions lock
@@ -236,6 +255,7 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
     for entry in found:
         seen[entry.document_id] = seen.get(entry.document_id, 0) + 1
     cache: dict = {}
+    created: list[int] = []
     # The names the folder rows hold at each parent, as segments: a document may not
     # take a sibling folder's name, as on disk the two would be one directory.
     folder_segments: dict[int | None, set[str]] = {}
@@ -251,6 +271,19 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
             folder_segments[parent] = {path_segment(name) for name in rows.scalars()}
         return folder_segments[parent]
 
+    # Every directory that is not a document gets its row, a document in it or not: a
+    # `mkdir` from the shell shows on the Files page (docs/workspace.md).
+    for segments in folders:
+        try:
+            await _folder_for(db, user_id, segments, cache, created)
+        except NestedInDocument as nested:
+            logger.warning(
+                "reconcile for user %d: directory %s sits under document directory %s; "
+                "not recorded",
+                user_id,
+                "/".join(segments),
+                nested,
+            )
     updates: list[tuple[Document, int | None, str]] = []
     for entry in found:
         row = documents.get(entry.document_id)
@@ -265,7 +298,7 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
             )
             continue
         try:
-            folder_id = await _folder_for(db, user_id, entry.folder_segments, cache)
+            folder_id = await _folder_for(db, user_id, entry.folder_segments, cache, created)
         except NestedInDocument as nested:
             logger.warning(
                 "reconcile for user %d: document %d sits under document directory %s; "
@@ -290,7 +323,9 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
             continue
         updates.append((row, folder_id, name[:512]))
     if not updates:
-        return 0
+        if created:
+            await db.commit()
+        return len(created)
     # Two phases, so rows that trade places (a shell swapped two directories) never
     # meet the unique constraint on their way: every changing row first takes a name
     # nothing else holds, then its own (docs/workspace.md § The tree is the truth).
@@ -307,4 +342,4 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
         await db.rollback()
         logger.warning("reconcile for user %d hit a name conflict; rows unchanged", user_id)
         return 0
-    return len(updates)
+    return len(updates) + len(created)

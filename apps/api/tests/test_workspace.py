@@ -140,7 +140,7 @@ async def test_reconcile_follows_a_directory_the_shell_moved(sessionmaker, tmp_p
         git.commit_all(root, "agent:1", "mv from the shell")
 
         changed = await reconcile.reconcile_user(db, settings, user.id)
-        assert changed == 1
+        assert changed == 3  # two folder rows made for the shell's directories, one move
         row = (await db.execute(select(Document).where(Document.id == document.id))).scalar_one()
         assert row.name == "renamed.pdf"
         folders = {
@@ -1418,3 +1418,79 @@ async def test_inheriting_an_original_notices_a_row_deleted_meanwhile(
         assert await documents.inherit_original(db, settings, second, job) is False
         assert documents.original_of(root, second_id) is None
         assert documents.original_of(root, first.id) is not None
+
+
+async def test_reconcile_records_an_empty_folder_the_shell_made(sessionmaker, tmp_path) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+        (paths.root / "files" / "Research" / "2026").mkdir(parents=True)
+        git.commit_all(paths.root, "agent:1", "mkdir from the shell")
+        assert await reconcile.reconcile_user(db, settings, user.id) == 2
+        rows = {
+            row.name: row
+            for row in (await db.execute(select(Folder).where(Folder.user_id == user.id)))
+            .scalars()
+            .all()
+        }
+        assert set(rows) == {"Papers", "Research", "2026"}
+        assert rows["2026"].parent_id == rows["Research"].id
+        assert rows["Research"].parent_id is None
+        # Idempotent: the rows exist, nothing changes on the next run.
+        assert await reconcile.reconcile_user(db, settings, user.id) == 0
+
+
+async def test_a_canonicalization_whose_commit_fails_is_undone(
+    sessionmaker, tmp_path, monkeypatch
+) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+        shell_named = paths.directory.with_name(".report")
+        paths.directory.rename(shell_named)
+        real = git.commit_paths
+
+        def failing(*args, **kwargs):
+            raise git.GitError("git is unwell")
+
+        monkeypatch.setattr(git, "commit_paths", failing)
+        assert await reconcile.reconcile_user(db, settings, user.id) == 0
+        # Where the shell left it, under the name it gave; the row untouched.
+        assert shell_named.is_dir() and not shell_named.with_name("_.report").exists()
+        row = (await db.execute(select(Document).where(Document.id == document.id))).scalar_one()
+        assert row.name == "paper.pdf"
+        monkeypatch.setattr(git, "commit_paths", real)
+        assert await reconcile.reconcile_user(db, settings, user.id) == 1
+        assert shell_named.with_name("_.report").is_dir()
+
+
+async def test_the_documents_own_rename_revision_does_not_reach_beyond_it(
+    sessionmaker, tmp_path
+) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        before = await documents.materialize_document(db, settings, document)
+        document.name = "renamed.pdf"
+        await db.commit()
+        after = await documents.document_paths(db, settings, document)
+        commit = await documents.move_path(settings, user.id, before.relative, after.relative)
+        assert commit is not None
+        # The rename's old side is this document's: reverting it waits for this
+        # document's conversations only, not for every turn of the user.
+        assert documents.reaches_beyond(after, commit) is False
+        # A shell revision that moved another document's file in still reaches beyond.
+        other = Document(
+            user_id=user.id, folder_id=document.folder_id, job_id=document.job_id, name="other.pdf"
+        )
+        db.add(other)
+        await db.commit()
+        other_paths = await documents.materialize_document(db, settings, other)
+        (other_paths.directory / "extra.md").write_text("x")
+        git.commit_all(before.root, "agent:1", "an extra file")
+        (other_paths.directory / "extra.md").rename(after.directory / "extra.md")
+        git.commit_all(before.root, "agent:1", "mv from the shell")
+        shell = git.log(before.root)[0].commit
+        assert documents.reaches_beyond(after, shell) is False  # its new place is here

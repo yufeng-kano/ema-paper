@@ -2137,3 +2137,38 @@ async def test_a_revert_is_refused_before_it_materializes(chatting) -> None:
     )
     assert refused.status_code == 409
     assert not directory.exists()
+
+
+async def test_the_conversation_detail_carries_no_image_bytes(chatting) -> None:
+    document_id = chatting.document_id
+    conversation_id = (
+        await chatting.post(
+            f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    image = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "x" * 4000},
+    }
+    async with chatting.app.state.sessionmaker() as db:
+        db.add(
+            Message(
+                conversation_id=conversation_id,
+                role="user",
+                content=[
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "t1",
+                        "content": [image, {"type": "text", "text": "Page 1."}],
+                    },
+                    image,
+                ],
+            )
+        )
+        await db.commit()
+    detail = (await chatting.get(f"/api/conversations/{conversation_id}")).json()
+    content = detail["messages"][-1]["content"]
+    assert content[0]["content"][0] == {"type": "image"}
+    assert content[0]["content"][1]["text"] == "Page 1."
+    assert content[1] == {"type": "image"}
+    assert "x" * 100 not in json.dumps(detail)

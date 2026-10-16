@@ -129,6 +129,24 @@ async def create_conversation(
     return conversation_payload(row)
 
 
+def display_content(content: list) -> list:
+    """The blocks as the panel draws them: an image — a page or a figure a tool returned,
+    stored for the model's replay — is sent without its bytes, which the panel never
+    renders and a long thread would otherwise carry by the hundred megabytes
+    (docs/api.md § Chat)."""
+    shown = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "image":
+            shown.append({"type": "image"})
+        elif block.get("type") == "tool_result" and isinstance(block.get("content"), list):
+            shown.append({**block, "content": display_content(block["content"])})
+        else:
+            shown.append(block)
+    return shown
+
+
 @router.get("/conversations/{conversation_id}")
 async def read_conversation(conversation_id: int, user: SessionUser, db: DbSession):
     row = await owned_conversation(db, user.id, conversation_id)
@@ -148,7 +166,7 @@ async def read_conversation(conversation_id: int, user: SessionUser, db: DbSessi
             {
                 "id": message.id,
                 "role": message.role,
-                "content": message.content,
+                "content": display_content(message.content),
                 "turn_id": str(message.turn_id) if message.turn_id else None,
                 "created_at": message.created_at,
             }
