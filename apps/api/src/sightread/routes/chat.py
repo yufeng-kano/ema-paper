@@ -35,7 +35,12 @@ from ..errors import ApiError
 from ..jobs import chat_events
 from ..jobs.queue import count_active_turns, enqueue_turn
 from ..sandbox.client import SandboxClient, SandboxUnavailable
-from ..workspace.documents import directory_size, materialize_document, workspace_size
+from ..workspace.documents import (
+    current_revision,
+    directory_size,
+    materialize_document,
+    workspace_size,
+)
 from ..workspace.layout import CACHE_DIR, FILES_DIR, SIGHTREAD_DIR, git_dir, sources_dir, user_root
 
 router = APIRouter(prefix="/api", tags=["chat"])
@@ -131,6 +136,16 @@ async def create_conversation(
 
 # What the stored selection block says before the passage (docs/chat.md § Prompt caching).
 SELECTION_PREFIX = "The passage selected in the document:\n\n"
+# The per-turn context block (docs/chat.md § Prompt caching): what the model must know
+# about this message and may not learn from the cached prefix.
+TURN_CONTEXT = "turn"
+
+
+def turn_note(revision: str | None, locale: str) -> str:
+    return (
+        f"Context for this message:\n- document revision: {revision or 'unknown'}\n"
+        f"- reader locale: {locale}"
+    )
 
 
 def display_content(content: list) -> list:
@@ -150,6 +165,8 @@ def display_content(content: list) -> list:
             shown.append({**block, "content": display_content(block["content"])})
         elif block.get("context") == "selection" and isinstance(block.get("text"), str):
             shown.append({**block, "text": block["text"].removeprefix(SELECTION_PREFIX)})
+        elif block.get("context") == TURN_CONTEXT:
+            continue  # the model's context, nothing the thread shows
         else:
             shown.append(block)
     return shown
@@ -328,6 +345,14 @@ async def post_message(
                 "context": "selection",
             }
         )
+    # The document's revision as the message is accepted, and the reader's locale: with
+    # the message rather than in the system prompt, so an edit made meanwhile reaches the
+    # model and a change of language costs no cache (docs/chat.md § Prompt caching).
+    document = await db.get(Document, row.document_id)
+    revision = None if document is None else await current_revision(db, settings, document)
+    content.append(
+        {"type": "text", "text": turn_note(revision, body.locale), "context": TURN_CONTEXT}
+    )
     message = Message(conversation_id=row.id, role="user", content=content)
     db.add(message)
     await db.flush()

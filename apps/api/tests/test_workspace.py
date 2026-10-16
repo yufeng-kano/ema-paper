@@ -1843,3 +1843,24 @@ async def test_an_aside_without_document_metadata_comes_back_to_its_origin(
         await reconcile.reconcile_user(db, settings, user.id)
         assert not (root / "files" / "Drafts").exists()
         assert not [name for name in os.listdir(root) if name.startswith(safe_io.TEMP_PREFIX)]
+
+
+def test_a_git_that_times_out_is_a_git_error_and_leaves_no_lock(tmp_path, monkeypatch) -> None:
+    """A regular git call past `WORKSPACE_GIT_TIMEOUT_SECONDS` raises the module's own
+    error, so every caller's rollback runs, and the lock the killed git left is removed
+    rather than refusing every command after it."""
+    import stat as stat_module
+
+    root = tmp_path / "ws" / "15"
+    root.mkdir(parents=True)
+    git.ensure_repo(root)
+    fake = tmp_path / "git"
+    fake.write_text("#!/bin/sh\nsleep 30\n")
+    fake.chmod(fake.stat().st_mode | stat_module.S_IEXEC)
+    (git_dir(root) / "index.lock").write_text("")
+    monkeypatch.setattr(git, "GIT", str(fake))
+    monkeypatch.setattr(git, "_timeout", lambda: 0.3)
+    with pytest.raises(git.GitError) as timed_out:
+        git._git(root, "status")
+    assert "timed out" in str(timed_out.value)
+    assert not (git_dir(root) / "index.lock").exists()

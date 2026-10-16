@@ -231,14 +231,17 @@ async def test_an_upstream_error_is_stored_by_type_never_by_its_text(key) -> Non
 
 
 @respx.mock
-async def test_an_overlong_stream_line_is_refused_before_it_is_held(key, monkeypatch) -> None:
+async def test_an_overlong_stream_line_is_refused_before_it_is_held(key) -> None:
     from sightread.upstream import anthropic
 
-    monkeypatch.setattr(anthropic, "MAX_SSE_LINE_BYTES", 1_000)
+    # The bound is the deployment's (`UPSTREAM_SSE_LINE_MAX_BYTES`), passed per call.
+    assert anthropic.DEFAULT_SSE_LINE_MAX_BYTES == 4 * 1024 * 1024
     endless = b"data: " + b"x" * 5_000
     respx.post(MESSAGES_URL).mock(return_value=httpx.Response(200, content=endless))
     with pytest.raises(UpstreamError) as refused:
-        async for _ in stream_messages(key, {"messages": []}, betas=(), max_bytes=10_000_000):
+        async for _ in stream_messages(
+            key, {"messages": []}, betas=(), max_bytes=10_000_000, line_max_bytes=1_000
+        ):
             pass
     assert "overlong" in str(refused.value)
 

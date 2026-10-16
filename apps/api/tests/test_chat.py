@@ -2120,10 +2120,10 @@ def test_prompt_facts_are_substituted_in_one_pass() -> None:
     from sightread.agents.chat import render_system_prompt
 
     rendered = render_system_prompt(
-        "Edit {document_path}; answer in {locale}.",
-        {"document_path": "files/{locale}/doc.md", "locale": "zh-TW"},
+        "Edit {document_path}; network: {network}.",
+        {"document_path": "files/{network}/doc.md", "network": "none"},
     )
-    assert rendered == "Edit files/{locale}/doc.md; answer in zh-TW."
+    assert rendered == "Edit files/{network}/doc.md; network: none."
 
 
 async def test_a_message_or_selection_past_the_deployments_cap_is_refused(chatting) -> None:
@@ -2827,3 +2827,74 @@ async def test_a_failed_create_leaves_no_directory_behind(tmp_path, monkeypatch)
     assert outcome.is_error
     assert not (root / "files" / "kept" / "New").exists()
     assert (root / "files" / "kept").is_dir()
+
+
+async def test_a_message_carries_the_documents_revision_and_the_locale(chatting) -> None:
+    """The per-turn context rides in the user message, marked, so the model learns of an
+    edit made meanwhile and of the reader's language without the system prompt — the
+    cached prefix — changing (docs/chat.md § Prompt caching); the thread never shows it."""
+    from sightread.routes.chat import TURN_CONTEXT
+    from sightread.workspace.documents import revision_of
+
+    document_id = chatting.document_id
+    conversation_id = (
+        await chatting.post(
+            f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    content = (await chatting.get(f"/api/library/documents/{document_id}/content")).json()
+    sent = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"text": "hi", "locale": "zh-TW"},
+        headers=CSRF_HEADERS,
+    )
+    assert sent.status_code == 202, sent.text
+    async with chatting.app.state.sessionmaker() as db:
+        stored = (
+            await db.execute(
+                select(Message).where(
+                    Message.conversation_id == conversation_id, Message.role == "user"
+                )
+            )
+        ).scalar_one()
+    turn_blocks = [block for block in stored.content if block.get("context") == TURN_CONTEXT]
+    assert len(turn_blocks) == 1
+    assert f"document revision: {content['revision']}" in turn_blocks[0]["text"]
+    assert "reader locale: zh-TW" in turn_blocks[0]["text"]
+    assert content["revision"] == revision_of(content["markdown"])
+    # Nothing of it reaches the thread.
+    detail = (await chatting.get(f"/api/conversations/{conversation_id}")).json()
+    user_blocks = detail["messages"][0]["content"]
+    assert all(block.get("context") != TURN_CONTEXT for block in user_blocks)
+    # The system prompt carries no locale: a switch of language leaves the prefix alone.
+    from sightread.agents import CHAT
+    from sightread.agents import chat as chat_agent
+
+    assert "{locale}" not in CHAT.default_prompt_template
+    assert "{locale}" not in chat_agent.PROMPT_TOKENS
+
+
+async def test_a_listener_refused_listen_is_closed(monkeypatch) -> None:
+    """A connection that opened but could not LISTEN (a proxy in between) is closed on the
+    way to polling, or every stream opened under that condition would leak one."""
+    import asyncpg
+
+    from sightread.jobs import chat_events
+
+    closed: list[bool] = []
+
+    class Refusing:
+        async def add_listener(self, channel, callback):
+            raise asyncpg.PostgresError("LISTEN is not supported here")
+
+        async def close(self):
+            closed.append(True)
+
+    async def connect(dsn):
+        return Refusing()
+
+    monkeypatch.setattr(chat_events.asyncpg, "connect", connect)
+    listener = await chat_events._open_listener(
+        "postgresql+asyncpg://u:p@db/sightread", 7, asyncio.Event()
+    )
+    assert listener is None and closed == [True]

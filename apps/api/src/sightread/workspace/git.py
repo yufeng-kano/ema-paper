@@ -8,6 +8,7 @@ worker and the API behave identically wherever they run. Async callers wrap thes
 
 from __future__ import annotations
 
+import contextlib
 import os
 import select
 import subprocess
@@ -63,23 +64,31 @@ def _env() -> dict[str, str]:
 def _git(root: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     # The git directory is named on every call: a `.git` the shell plants in the work tree
     # is never consulted, and no hook or config of the shell's runs here.
-    proc = subprocess.run(  # noqa: S603 - fixed argv, no shell
-        [
-            GIT,
-            "-C",
-            str(root),
-            "--git-dir",
-            str(git_dir(root)),
-            "--work-tree",
-            str(root),
-            *args,
-        ],
-        env=_env(),
-        capture_output=True,
-        text=True,
-        timeout=_timeout(),
-        check=False,
-    )
+    try:
+        proc = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            [
+                GIT,
+                "-C",
+                str(root),
+                "--git-dir",
+                str(git_dir(root)),
+                "--work-tree",
+                str(root),
+                *args,
+            ],
+            env=_env(),
+            capture_output=True,
+            text=True,
+            timeout=_timeout(),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # `run` has killed the child. The error is the module's own, so every caller's
+        # rollback runs (a written file put back, the index reset); and the lock the
+        # killed git may have left would refuse every command after it, so it goes.
+        with contextlib.suppress(OSError):
+            (git_dir(root) / "index.lock").unlink()
+        raise GitError(f"git {args[0]} timed out") from exc
     if check and proc.returncode != 0:
         raise GitError(proc.stderr.strip() or f"git {args[0]} failed")
     return proc

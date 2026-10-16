@@ -326,7 +326,9 @@ async function select(id: number) {
   messages.value = []
   turns.value = []
   discardFrames()
-  cards.clear()
+  // The cards' state stays: keyed by tool-call id, it belongs to the card, not to the
+  // conversation now open, and a thread switched away from and back must not offer to
+  // revert a commit the reader already reverted (docs/web.md § Agent panel).
   stream.open(id, 0)
   await loadDetail(id)
 }

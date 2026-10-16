@@ -954,3 +954,28 @@ async def test_a_parent_deleted_during_the_insert_is_a_404_not_a_500(
     )
     assert response.status_code == 404, response.text
     assert pulled
+
+
+async def test_an_upload_the_quota_refuses_files_nothing(make_client, documents, tmp_path) -> None:
+    """A cached parse's upload is the row's only original: at the quota the filing is
+    refused whole rather than a document filed that could never render a page
+    (docs/workspace.md § Layout)."""
+    library = make_client(workspaces_dir=str(tmp_path / "ws"))
+    await _ready_to_parse(library)
+    assert (await _upload(library, documents)).status_code == 201
+    # The second upload of the same bytes keeps its own copy, so the workspace holds
+    # something the quota can be measured against.
+    assert (await _upload(library, documents)).status_code == 201
+    uploads = Path(library.app.state.settings.upload_dir)
+    kept = sorted(path.name for path in uploads.iterdir())
+    library.app.state.settings.workspace_quota_bytes = 1
+    try:
+        refused = await _upload(library, documents)
+    finally:
+        library.app.state.settings.workspace_quota_bytes = 10 * 1024 * 1024 * 1024
+    assert refused.status_code == 409, refused.text
+    names = [row["name"] for row in (await _read(library))["documents"]]
+    assert sorted(names) == ["tiny (2).png", "tiny.png"]
+    # The refused upload is gone from the upload directory; the parse's own stays for
+    # the worker.
+    assert sorted(path.name for path in uploads.iterdir()) == kept

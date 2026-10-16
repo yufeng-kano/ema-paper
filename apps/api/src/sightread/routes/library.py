@@ -787,6 +787,11 @@ async def upload_document(
             raise ApiError(
                 404, "invalid_request", "The file was deleted while it was being filed"
             ) from None
+        except ApiError:
+            # The quota refused the copy: nothing is filed, and the refusal is the answer.
+            await db.delete(row)
+            await db.commit()
+            raise
         except Exception as exc:
             logger.exception("could not keep the upload for document %d", row.id)
             await db.delete(row)

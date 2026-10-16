@@ -9,6 +9,7 @@ by polling.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -86,6 +87,7 @@ async def _open_listener(database_url: str, conversation_id: int, wakeup: asynci
     url = make_url(database_url)
     if url.get_backend_name() != "postgresql":
         return None
+    connection = None
     try:
         connection = await asyncpg.connect(
             url.set(drivername="postgresql").render_as_string(hide_password=False)
@@ -93,6 +95,11 @@ async def _open_listener(database_url: str, conversation_id: int, wakeup: asynci
         await connection.add_listener(channel_for(conversation_id), lambda *_: wakeup.set())
     except (OSError, asyncpg.PostgresError):
         logger.warning("conversation event listener unavailable; falling back to polling")
+        if connection is not None:
+            # Opened, then refused LISTEN (a proxy in between): closed, or every stream
+            # opened under that condition would hold one connection for nothing.
+            with contextlib.suppress(Exception):
+                await connection.close()
         return None
     return connection
 

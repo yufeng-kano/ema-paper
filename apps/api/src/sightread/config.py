@@ -63,6 +63,11 @@ class Settings(BaseSettings):
     # Cap on any upstream response body — a user-controlled endpoint must not be able to
     # exhaust memory with an unbounded reply (docs/parsing.md § Upstream usage).
     upstream_response_max_bytes: int = 33_554_432
+    # The chat agent's event stream: one SSE line past this is a broken upstream, not a
+    # long answer, and more content blocks than this is refused rather than allocated
+    # for (docs/chat.md § Upstream).
+    upstream_sse_line_max_bytes: int = 4 * 1024 * 1024
+    upstream_content_blocks_max: int = 4096
     # Upload tickets minted by the MCP `parse` tool (docs/auth.md § 5).
     upload_ticket_ttl_seconds: int = 3600
     upload_ticket_rate_per_hour: int = 30

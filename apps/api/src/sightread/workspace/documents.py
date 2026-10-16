@@ -306,6 +306,28 @@ async def make_folder_dir(settings: Settings, user_id: int, relative: Path) -> N
     await asyncio.to_thread(_make)
 
 
+async def current_revision(db: AsyncSession, settings: Settings, document: Document) -> str | None:
+    """The revision the viewer would save against right now: the hash of `doc.md` as it
+    is on disk, or of the parse result when the document is not materialized yet; None
+    when neither can be read. The per-turn context of a chat message (docs/chat.md
+    § Prompt caching), read without the workspace lock: a hint, not a write."""
+    paths = await document_paths(db, settings, document)
+    try:
+        text = await asyncio.to_thread(
+            safe_io.read_text, paths.root, paths.doc, settings.content_max_bytes
+        )
+    except FileNotFoundError:
+        text = None
+    except (safe_io.UnsafeEntry, safe_io.EntryTooLarge, OSError, UnicodeDecodeError):
+        return None
+    if text is not None:
+        return revision_of(text)
+    markdown = (
+        await db.execute(select(Result.markdown).where(Result.job_id == document.job_id))
+    ).scalar_one_or_none()
+    return None if markdown is None else revision_of(markdown)
+
+
 async def ensure_within_quota(settings: Settings, root: Path) -> None:
     """Refuse new material once the workspace is at its quota (docs/workspace.md § Quota).
     A walk of the tree: cheap at the sizes a quota allows, and only on growth."""
@@ -470,9 +492,10 @@ async def adopt_source(
     """The library row arrived after its parse finished, so the worker found no document
     to keep the upload for and left it in place — or the parse was answered from the
     cache, or joined one already on its way, and `upload` is the fresh file this row keeps
-    for itself (docs/jobs.md § Retention): take it now. A copy that fails leaves nothing
-    behind — the original and the shell's copy go — since the caller deletes the row
-    and no file may stay for a row that is gone (docs/workspace.md § Layout)."""
+    for itself (docs/jobs.md § Retention): take it now. A copy that fails, or that the
+    quota refuses (`ApiError`, 409), leaves nothing behind — the original and the shell's
+    copy go — since the caller deletes the row and no file may stay for a row that is
+    gone (docs/workspace.md § Layout)."""
     if upload is not None:
         source = upload
     else:
@@ -498,21 +521,28 @@ async def adopt_source(
         try:
             await ensure_within_quota(settings, root)
         except ApiError:
+            # No room for the one file nothing can recreate: the filing is refused whole
+            # (the caller deletes the row), never a row that could not render a page.
+            # The upload goes either way — a parse outside the library would have lost
+            # it too (docs/workspace.md § Layout).
             source.unlink(missing_ok=True)
-        else:
-            try:
-                await asyncio.to_thread(
-                    keep_source, root, relative, source, document_id=document.id, kind=job.kind
-                )
-            except Exception:
-                await asyncio.to_thread(
-                    _undo_adoption,
-                    root,
-                    document.id,
-                    root / relative,
-                    _source_suffix(source, job.kind),
-                )
-                raise
+            if upload is None:
+                job.source_deleted_at = utcnow()
+                await db.commit()
+            raise
+        try:
+            await asyncio.to_thread(
+                keep_source, root, relative, source, document_id=document.id, kind=job.kind
+            )
+        except Exception:
+            await asyncio.to_thread(
+                _undo_adoption,
+                root,
+                document.id,
+                root / relative,
+                _source_suffix(source, job.kind),
+            )
+            raise
     if upload is None:
         job.source_deleted_at = utcnow()
         await db.commit()

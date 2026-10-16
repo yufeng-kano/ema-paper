@@ -120,7 +120,7 @@ Edits apply as you make them; there is no approval step. So:
 
 Before the first tool call of a turn, state in one line what you are about to do. When you finish, summarize in plain language: what changed, where, and anything you could not verify. The user already sees the diffs; do not repeat them. Ask a question only when two readings of the request would lead to different edits.
 
-Reply in the user's language. The user writes in {locale}.
+Reply in the user's language: each message ends with a context block naming the reader's locale and the document's current revision — a revision that changed since your last look at the file means it was edited meanwhile; read it again before you rely on what you saw.
 """
 
 PROMPT_TOKENS: tuple[str, ...] = (
@@ -129,7 +129,6 @@ PROMPT_TOKENS: tuple[str, ...] = (
     "{bbox_format}",
     "{parse_model}",
     "{network}",
-    "{locale}",
 )
 
 
@@ -165,7 +164,7 @@ def render_system_prompt(
     template: str, facts: dict[str, str], *, tools: Iterable[str] | None = None
 ) -> str:
     """One pass over the template: a fact's value is never read as a token in turn (a
-    document named `{locale}` stays that document's path). With `tools`, the lines that
+    document named `{network}` stays that document's path). With `tools`, the lines that
     describe tools not among them are left out."""
     rendered = _TOKEN_RE.sub(lambda match: facts.get(match.group(0).strip("{}"), ""), template)
     if tools is None:

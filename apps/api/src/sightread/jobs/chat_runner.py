@@ -188,7 +188,6 @@ async def _load(
         "bbox_format": job.bbox_format,
         "parse_model": job.model,
         "network": chat_agent.network_note(settings.sandbox_network, settings.sandbox_index_url),
-        "locale": turn.locale or "en",
     }
     sandbox = SandboxClient(settings) if settings.sandbox_configured else None
     tools = list(chat_agent.TOOLS if sandbox is not None else chat_agent.TOOLS_WITHOUT_BASH)
@@ -459,6 +458,8 @@ async def _stream_once(ctx: TurnContext, body: dict) -> CompletedMessage:
         body,
         betas=chat_agent.BETAS,
         max_bytes=ctx.settings.upstream_response_max_bytes,
+        line_max_bytes=ctx.settings.upstream_sse_line_max_bytes,
+        blocks_max=ctx.settings.upstream_content_blocks_max,
         timeout=ctx.settings.chat_stream_timeout_seconds,
     )
     # The stream is read by its own task into a queue, so a cancel is noticed on a timer

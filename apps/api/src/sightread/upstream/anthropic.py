@@ -32,10 +32,11 @@ from .client import (
 ANTHROPIC_VERSION = "2023-06-01"
 # A turn can think and call tools for a long time; the stream keeps the connection alive.
 STREAM_TIMEOUT_SECONDS = 600.0
-# One SSE line past this is a broken upstream, not a long answer.
-MAX_SSE_LINE_BYTES = 4 * 1024 * 1024
-# More content blocks than any response holds; a larger index is refused outright.
-MAX_CONTENT_BLOCKS = 4096
+# The defaults of `UPSTREAM_SSE_LINE_MAX_BYTES` and `UPSTREAM_CONTENT_BLOCKS_MAX`: one
+# SSE line past the first is a broken upstream, not a long answer, and a block index past
+# the second is refused outright. The runner passes the deployment's values.
+DEFAULT_SSE_LINE_MAX_BYTES = 4 * 1024 * 1024
+DEFAULT_CONTENT_BLOCKS_MAX = 4096
 # The error types the Messages API documents; anything else is reported as "error".
 KNOWN_ERROR_TYPES = frozenset(
     {
@@ -139,9 +140,11 @@ def _raise_for_status(response: httpx.Response) -> None:
         )
 
 
-async def _bounded_lines(response: httpx.Response, max_bytes: int) -> AsyncIterator[str]:
+async def _bounded_lines(
+    response: httpx.Response, max_bytes: int, line_max_bytes: int
+) -> AsyncIterator[str]:
     """The body's lines, decoded, from fixed-size chunks; a line that outgrows
-    `MAX_SSE_LINE_BYTES` or a body that outgrows `max_bytes` ends the read."""
+    `line_max_bytes` or a body that outgrows `max_bytes` ends the read."""
     pending = bytearray()
     seen = 0
     async for chunk in response.aiter_bytes(65_536):
@@ -156,21 +159,23 @@ async def _bounded_lines(response: httpx.Response, max_bytes: int) -> AsyncItera
             line = bytes(pending[:newline])
             del pending[: newline + 1]
             yield line.decode("utf-8", errors="replace").rstrip("\r")
-        if len(pending) > MAX_SSE_LINE_BYTES:
+        if len(pending) > line_max_bytes:
             raise UpstreamError("The upstream sent an overlong stream line")
     if pending:
         yield bytes(pending).decode("utf-8", errors="replace").rstrip("\r")
 
 
-async def _sse_events(response: httpx.Response, max_bytes: int) -> AsyncIterator[tuple[str, dict]]:
-    """`(event, data)` pairs from an SSE body, bounded in total size."""
+async def _sse_events(
+    response: httpx.Response, max_bytes: int, line_max_bytes: int
+) -> AsyncIterator[tuple[str, dict]]:
+    """`(event, data)` pairs from an SSE body, bounded in total size and per line."""
     total = 0
     event_name = ""
     data_lines: list[str] = []
     # Bytes, not `aiter_lines()`: that would hold a whole line before any check could
-    # run. Lines are split as the chunks come, and a line past `MAX_SSE_LINE_BYTES` or a
+    # run. Lines are split as the chunks come, and a line past `line_max_bytes` or a
     # body past `max_bytes` is refused before it is held.
-    async for line in _bounded_lines(response, max_bytes):
+    async for line in _bounded_lines(response, max_bytes, line_max_bytes):
         total += len(line) + 1
         if total > max_bytes:
             raise ResponseTooLarge()
@@ -193,7 +198,7 @@ async def _sse_events(response: httpx.Response, max_bytes: int) -> AsyncIterator
         if key == "event":
             event_name = value
         elif key == "data":
-            if len(value) > MAX_SSE_LINE_BYTES:
+            if len(value) > line_max_bytes:
                 raise ResponseTooLarge()
             data_lines.append(value)
 
@@ -204,10 +209,13 @@ async def stream_messages(
     *,
     betas: tuple[str, ...] = (),
     max_bytes: int = DEFAULT_RESPONSE_MAX_BYTES,
+    line_max_bytes: int = DEFAULT_SSE_LINE_MAX_BYTES,
+    blocks_max: int = DEFAULT_CONTENT_BLOCKS_MAX,
     timeout: float = STREAM_TIMEOUT_SECONDS,
 ) -> AsyncIterator[StreamEvent | CompletedMessage]:
     """Stream one Messages request. Yields `StreamEvent`s, then exactly one
-    `CompletedMessage` last — unless the upstream fails, in which case it raises."""
+    `CompletedMessage` last — unless the upstream fails, in which case it raises. The
+    bounds are the deployment's (`UPSTREAM_*`, docs/chat.md § Upstream)."""
     headers = {
         "Authorization": f"Bearer {connection.api_key()}",
         "x-api-key": connection.api_key(),
@@ -240,7 +248,7 @@ async def stream_messages(
                 # Drain nothing: the status alone decides, and a body may carry content.
                 _raise_for_status(response)
 
-            async for event, data in _sse_events(response, max_bytes):
+            async for event, data in _sse_events(response, max_bytes, line_max_bytes):
                 kind = data.get("type") or event
                 if kind == "message_start":
                     message = data.get("message") or {}
@@ -251,7 +259,7 @@ async def stream_messages(
                     # Blocks arrive in order, each exactly the next one; an index that
                     # repeats, skips ahead or exceeds any sane count is a broken upstream,
                     # not a reason to allocate or to overwrite.
-                    if index != len(blocks) or index >= MAX_CONTENT_BLOCKS:
+                    if index != len(blocks) or index >= blocks_max:
                         raise UpstreamError("The upstream sent an out-of-order content block")
                     block = dict(data.get("content_block") or {})
                     if block.get("type") == "tool_use":
