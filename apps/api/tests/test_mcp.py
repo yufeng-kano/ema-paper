@@ -107,7 +107,7 @@ async def test_parse_mints_a_ticket_and_ready_to_run_commands(api_client, sessio
 
     assert payload["upload"] == (
         f"f=doc.pdf; curl -sN -H 'Authorization: Bearer {token}' "
-        f'-H \'Accept: text/event-stream\' -F file=@"$f" {base}/v1/parse -o progress.sse '
+        f"-H 'Accept: text/event-stream' -F file=@\"$f\" {base}/v1/parse -o progress.sse "
         f"&& curl -s -H 'Authorization: Bearer {token}' {base}/v1/jobs/last/result.md "
         f'-o "${{f%.*}}.md"'
     )
@@ -119,9 +119,7 @@ async def test_parse_mints_a_ticket_and_ready_to_run_commands(api_client, sessio
         f"f=doc.pdf; curl -s -H 'Authorization: Bearer {token}' {base}/v1/jobs/last/result "
         f'-o "${{f%.*}}.meta.json"'
     )
-    assert payload["status"] == (
-        f"curl -s -H 'Authorization: Bearer {token}' {base}/v1/jobs/last"
-    )
+    assert payload["status"] == (f"curl -s -H 'Authorization: Bearer {token}' {base}/v1/jobs/last")
     # The notes are the agent's whole manual: form fields, both input kinds, markers,
     # recovery.
     for fragment in (

@@ -15,6 +15,7 @@ import hashlib
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Protocol
 
@@ -24,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..agents import PARSE, AgentDefinition
 from ..auth import upload_tickets
 from ..config import Settings
-from ..db.models import AgentSetting, Job, KanoProxyKey, Result, UploadTicket, User
+from ..db.models import AgentSetting, Job, KanoProxyKey, Result, UploadTicket, User, utcnow
 from ..errors import ApiError
 from ..parsing import poppler
 from ..parsing.images import ACCEPTED_IMAGE_TYPES, ImageError, probe_image
@@ -33,6 +34,7 @@ from .queue import (
     enqueue_job,
     find_active_job,
     find_cached_job,
+    find_recent_terminal_job,
     hold_dedup_key,
     normalize_pages_spec,
     parse_pages_spec,
@@ -40,7 +42,6 @@ from .queue import (
 from .runner import result_payload
 
 PDF_MEDIA_TYPE = "application/pdf"
-RETRY_AFTER_SECONDS = 30
 UPLOAD_CHUNK_BYTES = 1024 * 1024
 # Room for the multipart envelope around a file at the cap: boundaries, part headers and
 # the other fields. The exact cap on the document itself stays in `store_upload`; this is
@@ -52,10 +53,13 @@ BASE64_CHUNK_CHARS = 4 * 256 * 1024
 
 @dataclass
 class Submission:
-    """The outcome of an intake: either a queued job or a cached result, never both."""
+    """The outcome of an intake: either a queued job or a cached result, never both.
+    `upload` is the fresh file, kept for a caller that retains sources when the answer
+    came from the cache (docs/jobs.md § Retention)."""
 
     job: Job | None = None
     cached: Result | None = None
+    upload: Path | None = None
 
 
 class ChunkReader(Protocol):
@@ -242,6 +246,7 @@ async def submit_parse(
     force: bool = False,
     ticket: UploadTicket | None = None,
     reuse_in_flight: bool = False,
+    retain_source: bool = False,
 ) -> Submission:
     """Store the document, dedup it and queue the parse. Commits before it returns.
 
@@ -263,7 +268,7 @@ async def submit_parse(
             429,
             "rate_limit",
             "Too many running jobs; retry when one finishes",
-            headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
+            headers={"Retry-After": str(settings.parse_retry_after_seconds)},
         )
 
     upload_dir = Path(settings.upload_dir)
@@ -305,26 +310,45 @@ async def submit_parse(
             # a transient upstream failure must not be replayed forever (docs/jobs.md).
             result = None
         if result is not None:
-            # The cache already holds this exact parse; the fresh copy is dead weight.
-            stored.unlink(missing_ok=True)
+            # The cache already holds this exact parse; the fresh copy is dead weight —
+            # unless the caller keeps originals, whose row has nothing else to keep.
+            if not retain_source:
+                stored.unlink(missing_ok=True)
             if ticket is not None:
                 upload_tickets.spend(ticket, result.job_id)
                 await db.commit()
-            return Submission(cached=result)
+            return Submission(cached=result, upload=stored if retain_source else None)
 
         if reuse_in_flight:
             # Held until this transaction commits, so a second upload of the same bytes
             # waits here rather than racing past the check below into its own parse.
             await hold_dedup_key(db, **key)
             active = await find_active_job(db, **key)
+            if active is None:
+                # The first request's job may have finished already — with page errors,
+                # which the cache never answers, or failed: within the retry window the
+                # same bytes are still one upload, not a second parse to bill.
+                active = await find_recent_terminal_job(
+                    db,
+                    finished_since=utcnow()
+                    - timedelta(seconds=settings.upload_retry_window_seconds),
+                    **key,
+                )
             if active is not None:
-                # The same parse is already on its way. Starting another would spend the
-                # user's key twice over for one document.
-                stored.unlink(missing_ok=True)
+                # The same parse is already on its way, or just finished. Starting
+                # another would spend the user's key twice over for one document. A
+                # caller that keeps originals keeps this fresh copy for its own row: the
+                # worker may finish and hand the job's upload to the rows that exist
+                # before this one does.
+                if retain_source:
+                    if not active.retain_source:
+                        active.retain_source = True
+                else:
+                    stored.unlink(missing_ok=True)
                 if ticket is not None:
                     upload_tickets.spend(ticket, active.id)
                     await db.commit()
-                return Submission(job=active)
+                return Submission(job=active, upload=stored if retain_source else None)
 
     job = await enqueue_job(
         db,
@@ -344,6 +368,7 @@ async def submit_parse(
         prompt_sha256=prompt_sha256,
         page_count=page_count,
         source_path=str(stored),
+        retain_source=retain_source,
     )
     if ticket is not None:
         upload_tickets.spend(ticket, job.id)

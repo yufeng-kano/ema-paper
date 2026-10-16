@@ -13,6 +13,7 @@ from decimal import Decimal
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -21,6 +22,7 @@ from sqlalchemy import (
     Integer,
     LargeBinary,
     Numeric,
+    Sequence,
     String,
     Text,
     UniqueConstraint,
@@ -183,6 +185,10 @@ class PromptPreset(Base):
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
 
 
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+EFFORT_DEFAULT = "medium"
+
+
 class AgentSetting(Base):
     """What one user picked for one agent (docs/agents.md § Per-agent settings).
 
@@ -204,6 +210,10 @@ class AgentSetting(Base):
     # The selected prompt preset; NULL means the agent's default (docs/parsing.md § Prompts).
     prompt_preset_id: Mapped[int | None] = mapped_column(
         ForeignKey("prompt_presets.id", ondelete="SET NULL"), nullable=True
+    )
+    # The chat agent's reasoning depth (docs/chat.md); parse ignores it.
+    effort: Mapped[str] = mapped_column(
+        String(8), default=EFFORT_DEFAULT, server_default=text("'medium'")
     )
 
     connection: Mapped[ProviderConnection | None] = relationship(
@@ -272,9 +282,22 @@ class Job(Base):
     pages_done: Mapped[int] = mapped_column(Integer, default=0)
     source_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     source_deleted_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
+    # A library upload: the original is kept for its document (docs/jobs.md § Retention),
+    # even when the document row lands after the parse has finished.
+    retain_source: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    # The generation of the worker that claimed it, NULL while queued: every write a
+    # worker makes to a running job is fenced on it, so a worker that lost the worker
+    # lock cannot write over the one that took the job (docs/jobs.md § Queue).
+    worker_generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     started_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
+
+
+# One value per worker start, taken with the worker lock (docs/jobs.md § Queue). On the
+# metadata so `create_all` makes it where the dialect has sequences; the SQLite fallback
+# counts from the highest generation on record instead.
+WORKER_GENERATION_SEQ = Sequence("worker_generation_seq", metadata=Base.metadata)
 
 
 class JobPage(Base):
@@ -401,11 +424,99 @@ class UsageLog(Base):
     job_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True
     )
+    # The chat turn that made the call; NULL on parse rows (docs/chat.md).
+    turn_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("chat_turns.id", ondelete="SET NULL"), nullable=True
+    )
+    # Which agent billed the call, written with the row (docs/database.md § Rules).
+    agent: Mapped[str] = mapped_column(String(32), default="parse", server_default="parse")
     model: Mapped[str] = mapped_column(String(255))
     prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
     completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    # Prompt-cache reads and writes; 0 on parse rows (docs/chat.md § Prompt caching).
+    cache_read_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    cache_write_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     cost: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
     cost_source: Mapped[str] = mapped_column(String(16))
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
+
+
+class Conversation(Base):
+    """One thread of the chat agent about one document (docs/chat.md)."""
+
+    __tablename__ = "conversations"
+    __table_args__ = (Index("ix_conversations_document_updated", "document_id", "updated_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    document_id: Mapped[int] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"))
+    title: Mapped[str] = mapped_column(String(255), default="")
+    # The shell this thread holds in the user's sandbox (docs/sandbox.md).
+    session: Mapped[str] = mapped_column(String(64))
+    # Set by the first turn and kept: the stored thinking blocks belong to this model
+    # (docs/chat.md § History is append-only).
+    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
+
+
+class ChatTurn(Base):
+    """The chat agent's queue: one row per user message (docs/jobs.md § Chat turns)."""
+
+    __tablename__ = "chat_turns"
+    __table_args__ = (
+        Index("ix_chat_turns_status_created_at", "status", "created_at"),
+        # The stream's "is a turn unfinished" poll, sends, cancels and deletes all ask by
+        # conversation (docs/database.md).
+        Index("ix_chat_turns_conversation_finished", "conversation_id", "finished_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    conversation_id: Mapped[int] = mapped_column(ForeignKey("conversations.id", ondelete="CASCADE"))
+    # The user message this turn answers. No FK the other way: messages.turn_id names the
+    # turn that produced an assistant message.
+    message_id: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(16))  # queued|running|succeeded|failed|cancelled
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The web app's locale when the message was sent: the language the turn answers in.
+    locale: Mapped[str] = mapped_column(String(16), default="en", server_default="en")
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
+
+
+class Message(Base):
+    """A turn of a conversation: content blocks exactly as exchanged with the model, so
+    every later request replays them verbatim (docs/chat.md § History is append-only)."""
+
+    __tablename__ = "messages"
+    __table_args__ = (Index("ix_messages_conversation_id", "conversation_id", "id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    conversation_id: Mapped[int] = mapped_column(ForeignKey("conversations.id", ondelete="CASCADE"))
+    role: Mapped[str] = mapped_column(String(16))  # user | assistant
+    content: Mapped[list] = mapped_column(JSON_COLUMN, default=list)
+    turn_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("chat_turns.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
+
+
+class ChatEvent(Base):
+    """What the worker streamed while a turn ran; the SSE route replays and tails it."""
+
+    __tablename__ = "chat_events"
+    __table_args__ = (
+        UniqueConstraint("conversation_id", "seq", name="uq_chat_events_conversation_seq"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    conversation_id: Mapped[int] = mapped_column(ForeignKey("conversations.id", ondelete="CASCADE"))
+    turn_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("chat_turns.id", ondelete="CASCADE"))
+    seq: Mapped[int] = mapped_column(Integer)
+    event: Mapped[str] = mapped_column(String(32))
+    data: Mapped[dict] = mapped_column(JSON_COLUMN, default=dict)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
 
 

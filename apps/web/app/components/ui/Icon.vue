@@ -214,6 +214,39 @@ defineProps<{ name: IconName }>()
       <path d="M9 3v18" />
     </template>
 
+    <!-- notebook-text: the result viewer's notes column — a bound pad with lines on it. -->
+    <template v-else-if="name === 'notebook'">
+      <path d="M2 6h4M2 10h4M2 14h4M2 18h4" />
+      <rect x="4" y="2" width="16" height="20" rx="2" />
+      <path d="M9.5 8h5M9.5 12H16M9.5 16H14" />
+    </template>
+
+    <!-- message-circle: the result viewer's agent panel — a conversation. -->
+    <template v-else-if="name === 'message-circle'">
+      <path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z" />
+    </template>
+
+    <!-- arrow-up: send, in the composer's round accent button. -->
+    <template v-else-if="name === 'arrow-up'">
+      <path d="m5 12 7-7 7 7" />
+      <path d="M12 19V5" />
+    </template>
+
+    <!-- paperclip: the composer's attach control. -->
+    <template v-else-if="name === 'paperclip'">
+      <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+    </template>
+
+    <!-- square: stop the running turn. -->
+    <template v-else-if="name === 'square'">
+      <rect x="4" y="4" width="16" height="16" rx="1.5" />
+    </template>
+
+    <!-- x, small: a tool call that failed, beside check for one that succeeded. -->
+    <template v-else-if="name === 'x'">
+      <path d="M18 6 6 18M6 6l12 12" />
+    </template>
+
     <!-- check: the confirmation a copy swaps to. -->
     <template v-else>
       <path d="M20 6 9 17l-5-5" />

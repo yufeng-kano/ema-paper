@@ -1,9 +1,10 @@
 # API and worker share this image (docs/project-structure.md).
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 
-# Poppler is the PDF engine, invoked only as a subprocess (docs/parsing.md).
+# Poppler is the PDF engine, invoked only as a subprocess (docs/parsing.md); git keeps
+# every workspace's revisions, invoked the same way (docs/workspace.md § Revisions).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends poppler-utils \
+    && apt-get install -y --no-install-recommends poppler-utils git \
     && rm -rf /var/lib/apt/lists/*
 
 ENV UV_COMPILE_BYTECODE=1 \

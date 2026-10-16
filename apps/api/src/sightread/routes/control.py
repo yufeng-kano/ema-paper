@@ -17,8 +17,10 @@ from sqlalchemy import case, func, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
 
-from ..agents import AGENTS, AgentDefinition, get_agent
+from ..agents import AGENTS, CHAT, AgentDefinition, get_agent
+from ..agents import chat as chat_agent
 from ..agents.bbox import convention_for_model
+from ..agents.chat import is_claude_model
 from ..auth.api_keys import create_api_key
 from ..auth.crypto import encrypt_connection_key, mask_secret
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
@@ -34,8 +36,13 @@ from ..db.models import (
     COST_SOURCE_ESTIMATED,
     COST_SOURCE_OPENROUTER,
     COST_SOURCE_UNKNOWN,
+    EFFORT_DEFAULT,
+    EFFORT_LEVELS,
     AgentSetting,
     ApiKey,
+    ChatTurn,
+    Conversation,
+    Document,
     Job,
     PromptPreset,
     ProviderConnection,
@@ -404,9 +411,7 @@ async def update_connection(
     dependencies=[CsrfGuard],
     status_code=status.HTTP_204_NO_CONTENT,
 )
-async def delete_connection(
-    connection_id: int, user: SessionUser, db: DbSession
-) -> Response:
+async def delete_connection(connection_id: int, user: SessionUser, db: DbSession) -> Response:
     row = await _owned_connection(db, user.id, connection_id)
     # Explicit fallback (not just the FK's SET NULL): every agent on this connection goes
     # back to Kano Proxy, and its model goes too — it belonged to the deleted endpoint's
@@ -604,6 +609,7 @@ def _agent_settings_payload(row: AgentSetting | None) -> dict:
         "connection_id": row.connection_id if row else None,
         "model": row.model if row else None,
         "prompt_preset_id": row.prompt_preset_id if row else None,
+        "effort": (row.effort if row and row.effort else EFFORT_DEFAULT),
     }
 
 
@@ -612,8 +618,15 @@ def _bbox_payload(row: AgentSetting | None) -> dict:
     return {"family": convention.family, "format": convention.format}
 
 
+def _agent_tools(name: str, settings: AppSettings) -> list[str]:
+    if name != CHAT.name:
+        return []
+    tools = chat_agent.TOOLS if settings.sandbox_configured else chat_agent.TOOLS_WITHOUT_BASH
+    return [str(tool["name"]) for tool in tools]
+
+
 @router.get("/agents")
-async def list_agents(user: SessionUser, db: DbSession):
+async def list_agents(user: SessionUser, db: DbSession, settings: AppSettings):
     """The registry with the caller's settings for each agent (docs/agents.md)."""
     rows = {
         row.agent: row
@@ -630,6 +643,9 @@ async def list_agents(user: SessionUser, db: DbSession):
                 "output": agent.output,
                 # What "default" means for this agent's prompt picker.
                 "default_prompt": agent.default_prompt_template,
+                # The tools this deployment really gives the agent: `bash` only with a
+                # sandbox runner configured (docs/chat.md § Tools).
+                "tools": _agent_tools(agent.name, settings),
                 "settings": _agent_settings_payload(rows.get(agent.name)),
                 # A fact about the saved model, not a setting: the coordinate convention
                 # the pipeline will ask it for (docs/parsing.md § Coordinate conventions).
@@ -646,6 +662,7 @@ class AgentSettingsPut(BaseModel):
     connection_id: int | None = None
     model: str | None = Field(default=None, max_length=255)
     prompt_preset_id: int | None = None
+    effort: str | None = Field(default=None, max_length=8)
 
 
 @router.put("/agents/{agent_name}/settings", dependencies=[CsrfGuard])
@@ -655,7 +672,18 @@ async def put_agent_settings(
     agent = _known_agent(agent_name)
     provided = body.model_fields_set
     if body.connection_id is not None:
+        if "anthropic" in agent.capabilities:
+            # The chat agent speaks the Messages API through Kano Proxy only (docs/chat.md).
+            raise ApiError(
+                400, "invalid_request", f"The {agent.name} agent runs on Kano Proxy only"
+            )
         await _owned_connection(db, user.id, body.connection_id)
+    if body.model and "anthropic" in agent.capabilities and not is_claude_model(body.model):
+        # The same filter the catalog applies, at the write: a model the Messages route
+        # cannot run would otherwise be fixed onto the next turn and fail it upstream.
+        raise ApiError(400, "invalid_request", f"The {agent.name} agent runs Claude models only")
+    if body.effort is not None and body.effort not in EFFORT_LEVELS:
+        raise ApiError(400, "invalid_request", "effort must be one of " + ", ".join(EFFORT_LEVELS))
     if body.prompt_preset_id is not None:
         preset = await _owned_prompt(db, user.id, body.prompt_preset_id)
         if preset.agent != agent.name:
@@ -680,6 +708,8 @@ async def put_agent_settings(
         row.model = (body.model or "").strip() or None
     if "prompt_preset_id" in provided:
         row.prompt_preset_id = body.prompt_preset_id
+    if "effort" in provided:
+        row.effort = body.effort or EFFORT_DEFAULT
     try:
         await db.commit()
     except IntegrityError as exc:
@@ -699,7 +729,11 @@ async def list_agent_models(
 ):
     """The live catalog of the agent's saved upstream — the Agent page's model picker."""
     agent = _known_agent(agent_name)
-    return {"data": await agent_models(db, settings, user.id, agent.name)}
+    models = await agent_models(db, settings, user.id, agent.name)
+    if "anthropic" in agent.capabilities:
+        # Only what the Messages API can run (docs/agents.md § The registry).
+        models = [model for model in models if is_claude_model(model["id"])]
+    return {"data": models}
 
 
 # --- usage ----------------------------------------------------------------------------
@@ -724,6 +758,8 @@ async def usage(user: SessionUser, db: DbSession, days: int = Query(default=30, 
         func.sum(of_source(COST_SOURCE_ESTIMATED, UsageLog.cost)),
         func.count(of_source(COST_SOURCE_ESTIMATED, 1)),
         func.count(of_source(COST_SOURCE_UNKNOWN, 1)),
+        func.sum(UsageLog.cache_read_tokens),
+        func.sum(UsageLog.cache_write_tokens),
     )
     in_window = (UsageLog.user_id == user.id, UsageLog.created_at >= since)
     per_day = (
@@ -737,23 +773,104 @@ async def usage(user: SessionUser, db: DbSession, days: int = Query(default=30, 
             .order_by(UsageLog.model)
         )
     ).all()
-
-    def totals(row) -> dict:
-        calls, prompt, completion, cost, estimated, estimated_calls, unpriced = row
-        return {
-            "calls": int(calls),
-            "prompt_tokens": int(prompt or 0),
-            "completion_tokens": int(completion or 0),
-            "cost": float(cost or 0),
-            "estimated_cost": float(estimated or 0),
-            "estimated_calls": int(estimated_calls),
-            "unpriced_calls": int(unpriced),
-        }
+    per_agent = (
+        await db.execute(
+            select(UsageLog.agent, *figures)
+            .where(*in_window)
+            .group_by(UsageLog.agent)
+            .order_by(UsageLog.agent)
+        )
+    ).all()
+    agents_by_day = (
+        await db.execute(
+            select(day, UsageLog.agent).where(*in_window).group_by(day, UsageLog.agent)
+        )
+    ).all()
+    day_agents: dict[str, list[str]] = {}
+    for bucket, agent in agents_by_day:
+        day_agents.setdefault(str(bucket)[:10], []).append(agent)
 
     return {
         "days": days,
-        "per_day": [{"date": str(row[0])[:10], **totals(row[1:])} for row in per_day],
-        "per_model": [{"model": row[0], **totals(row[1:])} for row in per_model],
+        "per_day": [
+            {
+                "date": str(row[0])[:10],
+                "agents": sorted(day_agents.get(str(row[0])[:10], [])),
+                **usage_totals(row[1:]),
+            }
+            for row in per_day
+        ],
+        "per_model": [{"model": row[0], **usage_totals(row[1:])} for row in per_model],
+        "per_agent": [{"agent": row[0], **usage_totals(row[1:])} for row in per_agent],
+    }
+
+
+def usage_totals(row) -> dict:
+    calls, prompt, completion, cost, estimated, estimated_calls, unpriced, cached, written = row
+    return {
+        "calls": int(calls),
+        "prompt_tokens": int(prompt or 0),
+        "completion_tokens": int(completion or 0),
+        "cost": float(cost or 0),
+        "estimated_cost": float(estimated or 0),
+        "estimated_calls": int(estimated_calls),
+        "unpriced_calls": int(unpriced),
+        "cache_read_tokens": int(cached or 0),
+        "cache_write_tokens": int(written or 0),
+    }
+
+
+@router.get("/usage/conversations")
+async def usage_per_conversation(
+    user: SessionUser, db: DbSession, days: int = Query(default=30, ge=1, le=365)
+):
+    """What each conversation cost over the period, through its turns
+    (docs/api.md § Usage aggregates)."""
+    since = utcnow() - timedelta(days=days)
+    rows = (
+        await db.execute(
+            select(
+                Conversation.id,
+                Conversation.title,
+                Conversation.document_id,
+                Document.name,
+                func.count(func.distinct(ChatTurn.id)),
+                func.sum(UsageLog.prompt_tokens),
+                func.sum(UsageLog.cache_read_tokens),
+                func.sum(UsageLog.completion_tokens),
+                func.sum(case((UsageLog.cost_source == COST_SOURCE_ESTIMATED, UsageLog.cost))),
+                func.count(case((UsageLog.cost_source == COST_SOURCE_UNKNOWN, 1))),
+                func.sum(UsageLog.cache_write_tokens),
+                # What tells an estimate of exactly $0 from no estimate (docs/api.md).
+                func.count(case((UsageLog.cost_source == COST_SOURCE_ESTIMATED, 1))),
+            )
+            .select_from(UsageLog)
+            .join(ChatTurn, ChatTurn.id == UsageLog.turn_id)
+            .join(Conversation, Conversation.id == ChatTurn.conversation_id)
+            .outerjoin(Document, Document.id == Conversation.document_id)
+            .where(UsageLog.user_id == user.id, UsageLog.created_at >= since)
+            .group_by(Conversation.id, Conversation.title, Conversation.document_id, Document.name)
+            .order_by(func.sum(UsageLog.prompt_tokens).desc())
+        )
+    ).all()
+    return {
+        "conversations": [
+            {
+                "id": row[0],
+                "title": row[1],
+                "document_id": row[2],
+                "document_name": row[3],
+                "turns": int(row[4]),
+                "prompt_tokens": int(row[5] or 0),
+                "cache_read_tokens": int(row[6] or 0),
+                "completion_tokens": int(row[7] or 0),
+                "estimated_cost": float(row[8] or 0),
+                "unpriced_calls": int(row[9]),
+                "cache_write_tokens": int(row[10] or 0),
+                "estimated_calls": int(row[11]),
+            }
+            for row in rows
+        ]
     }
 
 
@@ -822,4 +939,4 @@ async def job_figure(
     db: DbSession,
     settings: AppSettings,
 ):
-    return figure_crop_response(settings, await owned_job(db, user.id, job_id), page, bbox)
+    return await figure_crop_response(settings, await owned_job(db, user.id, job_id), page, bbox)

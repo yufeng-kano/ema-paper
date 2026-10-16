@@ -8,16 +8,21 @@
  * Nothing on this panel explains itself: labels, states and errors only (docs/web.md).
  */
 import {
+  AGENT_EFFORTS,
   createPrompt,
   deletePrompt,
   listAgentModels,
   putAgentSettings,
   updatePrompt,
+  type AgentEffort,
   type AgentEntry,
   type ConnectionModel,
   type PromptPreset,
   type SavedAgentSettings,
 } from '~/lib/api'
+
+const CHAT_AGENT = 'chat'
+const DEFAULT_EFFORT: AgentEffort = 'medium'
 
 const props = defineProps<{
   agent: AgentEntry
@@ -29,7 +34,9 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  saved: [SavedAgentSettings]
+  /** Named for the agent the request was made for: the reader may have switched
+   *  agents while it was in flight, and the answer is not the new agent's. */
+  saved: [agent: string, settings: SavedAgentSettings]
   'prompts-changed': []
 }>()
 
@@ -79,7 +86,7 @@ async function loadModels() {
 async function resolveUpstream() {
   if (settings.value.connection_id !== null) {
     try {
-      emit('saved', await putAgentSettings(props.agent.name, { connection_id: null }))
+      emit('saved', props.agent.name, await putAgentSettings(props.agent.name, { connection_id: null }))
     } catch (error) {
       modelsError.value = await resolve(error)
       return
@@ -104,7 +111,7 @@ async function applyModel(value: string) {
   modelPending.value = true
   modelsError.value = null
   try {
-    emit('saved', await putAgentSettings(props.agent.name, { model: value || null }))
+    emit('saved', props.agent.name, await putAgentSettings(props.agent.name, { model: value || null }))
   } catch (error) {
     modelsError.value = await resolve(error)
   } finally {
@@ -112,11 +119,33 @@ async function applyModel(value: string) {
   }
 }
 
+/** The chat agent has the effort and tools rows; parse has the coordinate convention. */
+const isChat = computed(() => props.agent.name === CHAT_AGENT)
+
 /** The convention the pipeline will ask the saved model for — a fact about the model
-    (docs/parsing.md § Coordinate conventions), shown beside it and never a control. */
+    (docs/parsing.md § Coordinate conventions), shown beside it and never a control. Only
+    the parse agent has one: the chat agent reads pages, it does not transcribe them. */
 const convention = computed(() =>
-  settings.value.model ? t(`agents.bbox.${props.agent.bbox.family}`) : null,
+  settings.value.model && !isChat.value ? t(`agents.bbox.${props.agent.bbox.family}`) : null,
 )
+
+// --- effort (chat only) ---------------------------------------------------------
+
+const effortPending = ref(false)
+const effortError = ref<string | null>(null)
+const effortChoice = computed(() => settings.value.effort ?? DEFAULT_EFFORT)
+
+async function applyEffort(value: string) {
+  effortPending.value = true
+  effortError.value = null
+  try {
+    emit('saved', props.agent.name, await putAgentSettings(props.agent.name, { effort: value as AgentEffort }))
+  } catch (error) {
+    effortError.value = await resolve(error)
+  } finally {
+    effortPending.value = false
+  }
+}
 
 // --- prompt ---------------------------------------------------------------------
 
@@ -135,7 +164,7 @@ async function applyPromptChoice(value: string) {
   promptPending.value = true
   promptError.value = null
   try {
-    emit('saved', await putAgentSettings(props.agent.name, { prompt_preset_id: value ? Number(value) : null }))
+    emit('saved', props.agent.name, await putAgentSettings(props.agent.name, { prompt_preset_id: value ? Number(value) : null }))
   } catch (error) {
     promptError.value = await resolve(error)
   } finally {
@@ -155,8 +184,10 @@ const PROMPT_TOKENS = ['{page}', '{bbox_instructions}', '{bbox_format}'] as cons
 
 function openPromptCreate() {
   promptName.value = ''
-  // The agent's shipped default is the honest starting point for a custom prompt.
-  promptText.value = props.agent.default_prompt
+  // The agent's shipped default is the honest starting point for a custom prompt — except
+  // for the chat agent, whose preset is *added* to its system prompt (docs/chat.md § System
+  // prompt): starting from the whole prompt would send it twice.
+  promptText.value = props.agent.name === 'chat' ? '' : props.agent.default_prompt
   promptModalError.value = null
   promptModal.value = { mode: 'create' }
 }
@@ -236,7 +267,7 @@ async function removePrompt() {
     await deletePrompt(row.id)
     confirmingPromptDelete.value = false
     // The server already points this agent back at its default prompt.
-    emit('saved', { ...settings.value, prompt_preset_id: null, bbox: props.agent.bbox })
+    emit('saved', props.agent.name, { ...settings.value, prompt_preset_id: null, bbox: props.agent.bbox })
     emit('prompts-changed')
   } catch (error) {
     promptError.value = await resolve(error)
@@ -279,6 +310,24 @@ async function removePrompt() {
       </div>
       <p v-if="convention" class="convention mono reveal">{{ convention }}</p>
       <UiBanner v-if="modelsError" class="row-banner" tone="error">{{ modelsError }}</UiBanner>
+    </div>
+
+    <!-- Effort (chat) ------------------------------------------------------- -->
+    <div v-if="isChat" class="row">
+      <div class="controls">
+        <UiField v-slot="{ id }" class="grow effort" :label="t('agents.effortLabel')">
+          <UiSelect
+            :id="id"
+            :model-value="effortChoice"
+            :disabled="effortPending"
+            @update:model-value="applyEffort"
+          >
+            <option v-for="effort in AGENT_EFFORTS" :key="effort" :value="effort">{{ t(`agents.effort.${effort}`) }}</option>
+          </UiSelect>
+        </UiField>
+      </div>
+      <p class="note">{{ t('agents.effortNote') }}</p>
+      <UiBanner v-if="effortError" class="row-banner" tone="error">{{ effortError }}</UiBanner>
     </div>
 
     <!-- Prompt -------------------------------------------------------------- -->
@@ -333,6 +382,14 @@ async function removePrompt() {
       <UiBanner v-if="promptError" class="row-banner" tone="error">{{ promptError }}</UiBanner>
     </div>
 
+    <!-- Tools (chat): read-only facts. The sandbox's state is on the Usage page. ---- -->
+    <div v-if="isChat" class="row">
+      <p class="tools-label">{{ t('agents.toolsLabel') }}</p>
+      <ul class="tools" :aria-label="t('agents.toolsLabel')">
+        <li v-for="tool in agent.tools" :key="tool" class="chip mono">{{ tool }}</li>
+      </ul>
+    </div>
+
     <UiModal
       v-if="promptModal"
       size="md"
@@ -345,7 +402,9 @@ async function removePrompt() {
           <UiTextInput :id="id" v-model="promptName" required :disabled="promptModalPending" />
         </UiField>
         <UiField v-slot="{ id }" :label="t('agents.promptTextLabel')">
-          <div class="tokens">
+          <!-- The parse template's tokens: a chat preset is appended verbatim, so a token
+               in it would reach the model as a literal placeholder (docs/chat.md). -->
+          <div v-if="agent.name !== 'chat'" class="tokens">
             <button
               v-for="token in PROMPT_TOKENS"
               :key="token"
@@ -370,6 +429,7 @@ async function removePrompt() {
         </UiField>
         <div class="prompt-foot">
           <button
+            v-if="agent.name !== 'chat'"
             type="button"
             class="text-link"
             :disabled="promptModalPending"
@@ -479,6 +539,52 @@ async function removePrompt() {
 
 .row-banner {
   max-width: 72ch;
+}
+
+/* The one line under the effort picker: a consequence of changing it, not an explanation
+   of what it is. */
+.note {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--text-xs);
+}
+
+/* An effort picker is five short words; it does not need the model picker's width. */
+.effort {
+  flex-basis: 12rem;
+  max-width: 20rem;
+}
+
+/* The tools row has the field label's treatment with no control under it. */
+.tools-label {
+  margin: 0;
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* A chip that is a fact: paper, a hairline, the mono of the name it carries — and no
+   hover, because it does nothing. */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  height: var(--control-height-xs);
+  padding: 0 var(--space-2);
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
+  color: var(--ink-soft);
+  font-size: var(--text-2xs);
 }
 
 /* --- the prompt dialog ------------------------------------------------------ */

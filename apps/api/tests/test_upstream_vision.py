@@ -59,9 +59,7 @@ async def test_transcribe_page_sends_the_image_and_records_usage(key, documents)
         return_value=httpx.Response(200, json=completion("# Page\n\ntext"))
     )
 
-    result = await transcribe_page(
-        key, "vendor/model", PROMPT, documents["png"], 7
-    )
+    result = await transcribe_page(key, "vendor/model", PROMPT, documents["png"], 7)
 
     assert result.markdown == "# Page\n\ntext"
     assert result.usage.prompt_tokens == 1200
@@ -95,8 +93,11 @@ async def test_a_prompt_with_stray_braces_still_substitutes_its_tokens(key, docu
     route = respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(200, json=completion("ok")))
 
     await transcribe_page(
-        key, "m", "Emit {json} like {\"a\": 1} for page {page}.",
-        documents["png"], 3,
+        key,
+        "m",
+        'Emit {json} like {"a": 1} for page {page}.',
+        documents["png"],
+        3,
     )
 
     sent = json.loads(route.calls[0].request.content)
@@ -183,9 +184,7 @@ async def test_a_finished_null_completion_is_an_empty_page(key, documents) -> No
 
 
 @respx.mock
-@pytest.mark.parametrize(
-    "choices", [[], [{"message": {"content": None}}], [{"message": {}}]]
-)
+@pytest.mark.parametrize("choices", [[], [{"message": {"content": None}}], [{"message": {}}]])
 async def test_an_ambiguous_empty_completion_carries_its_usage(key, documents, choices) -> None:
     body = completion("x")
     body["choices"] = choices
@@ -237,9 +236,7 @@ async def test_a_connection_calls_its_own_endpoint_and_prices_nothing_by_default
         )
     )
 
-    result = await transcribe_page(
-        connection, "vendor/vision", PROMPT, documents["png"], 2
-    )
+    result = await transcribe_page(connection, "vendor/vision", PROMPT, documents["png"], 2)
 
     assert result.markdown == "# Page"
     assert result.usage.prompt_tokens == 10
@@ -271,9 +268,7 @@ async def test_an_oversized_completion_fails_the_call(key, documents) -> None:
     )
 
     with pytest.raises(UpstreamError):
-        await transcribe_page(
-            key, "m", PROMPT, documents["png"], 1, max_response_bytes=64
-        )
+        await transcribe_page(key, "m", PROMPT, documents["png"], 1, max_response_bytes=64)
 
 
 # --- reported cost on a connection (docs/parsing.md § Upstream usage) ------------------

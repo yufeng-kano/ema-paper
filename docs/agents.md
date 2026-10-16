@@ -1,6 +1,6 @@
 # Agents
 
-Sightread hosts **agents**: named pieces of work a user runs against a document, each with its own upstream, model and prompt. There is exactly one today, `parse` — the vision pipeline of [parsing.md](./parsing.md), unchanged. The framework exists so a second agent is a registry entry, a runner and a settings row, not a schema change.
+Sightread hosts **agents**: named pieces of work a user runs against a document, each with its own upstream, model and prompt. There are two: `parse` — the vision pipeline of [parsing.md](./parsing.md) — and `chat`, a tool-using conversation about one parsed document ([chat.md](./chat.md)). The framework exists so an agent is a registry entry, a runner and a settings row.
 
 ## The registry
 
@@ -8,14 +8,14 @@ Agents are defined in code (`apps/api/src/sightread/agents/`), never in the data
 
 | Field | Meaning |
 |-------|---------|
-| `name` | Stable id stored on `jobs.agent`, `prompt_presets.agent` and `agent_settings.agent` (e.g. `parse`) |
-| `capabilities` | Model capabilities the agent needs (`parse`: `vision`). **Declared metadata only** — nothing filters the catalog or refuses a model by it yet; the model picker lists the whole live catalog |
-| `input` / `output` | What the agent consumes and produces (`parse`: `document` → `markdown`) |
-| `default_prompt_template` | The prompt the agent runs when the user selected no preset (`parse`: `DEFAULT_PROMPT_TEMPLATE`, [parsing.md](./parsing.md) § Prompts) |
+| `name` | Stable id stored on `jobs.agent`, `prompt_presets.agent`, `agent_settings.agent` and `usage_log.agent` (`parse`, `chat`) |
+| `capabilities` | Model capabilities the agent needs (`parse`: `vision`; `chat`: `vision`, `tools`, `anthropic`). `anthropic` is the one that filters: the `chat` agent's catalog route lists only Claude models, because it speaks the Messages API and nothing else ([chat.md](./chat.md)). The others are declared metadata only |
+| `input` / `output` | What the agent consumes and produces (`parse`: `document` → `markdown`; `chat`: `document` → `edits`) |
+| `default_prompt_template` | The prompt the agent runs when the user selected no preset (`parse`: `DEFAULT_PROMPT_TEMPLATE`, [parsing.md](./parsing.md) § Prompts). For `chat` it is the system prompt, and a preset is **appended** to it rather than replacing it ([chat.md](./chat.md) § System prompt) |
 | `pipeline_version` | Part of the dedup key; moves when the agent's output for the same input would change (`parse`: `PIPELINE_VERSION`) |
 | `bbox_format` | The coordinate contract the agent's output declares (`parse`: `yxyx_norm1000`) |
 
-The definition says nothing about *how* the agent calls a model. `parse` happens to make one vision call per page; a future agent may run a tool loop, several calls per step, or none at all. The run loop belongs to the agent's runner (`jobs/runner.py` is `parse`'s), not to the registry. The worker runs `parse`'s runner today; a second agent brings its own and the worker picks it by `jobs.agent`.
+The definition says nothing about *how* the agent calls a model. `parse` makes one vision call per page; `chat` runs a tool loop over the Messages API. The run loop belongs to the agent's runner (`jobs/runner.py` is `parse`'s, `jobs/chat_runner.py` is `chat`'s), not to the registry. The worker drains two queues: `jobs` for `parse` and `chat_turns` for `chat` ([jobs.md](./jobs.md) § Chat turns).
 
 ## Per-agent settings
 
@@ -24,8 +24,9 @@ The definition says nothing about *how* the agent calls a model. `parse` happens
 - **Upstream** — `connection_id`: NULL is the built-in Kano Proxy, otherwise one of the user's provider connections ([api.md](./api.md) § Upstreams). Connections are shared by every agent; the choice of which one is per agent, and only an API caller makes it — the web Agent page leaves every agent on Kano Proxy.
 - **Model** — `model`: an id from that upstream's live catalog. NULL means not chosen, and a job cannot be enqueued without a model (below). Changing the upstream clears the model, since it belonged to the other catalog.
 - **Prompt** — `prompt_preset_id`: one of the user's presets **for this agent** (`prompt_presets.agent`), or NULL for the agent's default template.
+- **Effort** — `effort`: `low` / `medium` / `high` / `xhigh` / `max`, the reasoning depth the `chat` agent asks for (`output_config.effort`, [chat.md](./chat.md)); default `medium`. Ignored by `parse`.
 
-No row means all three defaults. The rows are written by `PUT /api/agents/{agent}/settings` and read by `GET /api/agents` ([api.md](./api.md)).
+No row means all three defaults. The rows are written by `PUT /api/agents/{agent}/settings` and read by `GET /api/agents` ([api.md](./api.md)). The `chat` agent runs on Kano Proxy only: a `connection_id` on its row is refused.
 
 ## Jobs
 

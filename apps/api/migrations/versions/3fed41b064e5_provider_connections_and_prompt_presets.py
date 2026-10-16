@@ -43,9 +43,7 @@ def upgrade() -> None:
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.UniqueConstraint("user_id", "name", name="uq_provider_connections_user_name"),
     )
-    op.create_index(
-        "ix_provider_connections_user_id", "provider_connections", ["user_id"]
-    )
+    op.create_index("ix_provider_connections_user_id", "provider_connections", ["user_id"])
 
     op.create_table(
         "prompt_presets",

@@ -13,6 +13,11 @@ export interface UsageRow {
   unpricedCalls: number
   promptTokens: number
   completionTokens: number
+  /** Prompt-cache reads — chat rows only; 0 for a parse-only row. */
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  /** The agents that ran in this bucket (`parse`, `chat`); empty for a model row. */
+  agents: string[]
   /** 0..1 — this row's billed cost against the largest in the same table, for the inline bar. */
   costShare: number
 }
@@ -37,7 +42,9 @@ export interface UsageSummary {
  * (docs/api.md § Usage aggregates).
  */
 export function summarizeUsage(usage: UsageResponse): UsageSummary {
-  const days = withCostShares(usage.per_day.map((entry) => toRow(entry.date, entry))).reverse()
+  const days = withCostShares(
+    usage.per_day.map((entry) => toRow(entry.date, entry, entry.agents)),
+  ).reverse()
   const models = withCostShares(usage.per_model.map((entry) => toRow(entry.model, entry))).sort(
     (left, right) => right.cost - left.cost,
   )
@@ -56,7 +63,7 @@ export function summarizeUsage(usage: UsageResponse): UsageSummary {
   }
 }
 
-function toRow(label: string, entry: UsageTotals): UsageRow {
+function toRow(label: string, entry: UsageTotals, agents: string[] = []): UsageRow {
   return {
     label,
     cost: entry.cost,
@@ -66,8 +73,30 @@ function toRow(label: string, entry: UsageTotals): UsageRow {
     unpricedCalls: entry.unpriced_calls,
     promptTokens: entry.prompt_tokens,
     completionTokens: entry.completion_tokens,
+    cacheReadTokens: entry.cache_read_tokens ?? 0,
+    cacheWriteTokens: entry.cache_write_tokens ?? 0,
+    agents: [...agents].sort(),
     costShare: 0,
   }
+}
+
+/**
+ * Cache-read tokens over prompt tokens, 0..1 — the figure that says whether the prompt
+ * cache is working (docs/chat.md § Prompt caching). Null when nothing was prompted: a
+ * ratio of nothing is not 0%.
+ */
+/**
+ * Cache reads over all input: the uncached input tokens the call reported plus what it
+ * read from and wrote to the cache — the three are disjoint, and their sum is the prompt
+ * (docs/chat.md § Prompt caching).
+ */
+export function cacheReadRatio(
+  cacheReadTokens: number,
+  promptTokens: number,
+  cacheWriteTokens = 0,
+): number | null {
+  const input = promptTokens + cacheReadTokens + cacheWriteTokens
+  return input > 0 ? Math.max(0, Math.min(1, cacheReadTokens / input)) : null
 }
 
 function sum(values: number[]): number {

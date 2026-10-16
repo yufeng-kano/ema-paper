@@ -11,11 +11,12 @@ from fastapi import FastAPI
 from starlette.middleware.sessions import SessionMiddleware
 
 from .auth.oidc import build_oauth
+from .body_limit import BodyLimitMiddleware
 from .config import Settings, get_settings
 from .db.session import create_engine, create_sessionmaker
 from .errors import install_error_handlers
 from .mcp import mcp_session_manager, mount_mcp
-from .routes import control, kano, library, oauth, v1
+from .routes import chat, control, kano, library, oauth, v1
 
 # Signed cookie holding only the transient OIDC state/PKCE verifier during a login
 # round trip. The durable credential is the server-side session row.
@@ -44,6 +45,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
     app.state.oauth = build_oauth(settings)
 
+    # Before the session layer, so an oversized body is refused before anything reads it.
+    app.add_middleware(
+        BodyLimitMiddleware,
+        max_bytes=settings.json_body_max_bytes,
+        parse_json_max_bytes=settings.parse_json_body_max_bytes,
+    )
     app.add_middleware(
         SessionMiddleware,
         secret_key=settings.secret_key,
@@ -60,6 +67,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.include_router(control.dev_router)
     app.include_router(kano.router)
     app.include_router(library.router)
+    app.include_router(chat.router)
     app.include_router(v1.router)
     app.include_router(oauth.router)
     mount_mcp(app)

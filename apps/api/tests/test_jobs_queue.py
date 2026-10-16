@@ -15,7 +15,7 @@ from datetime import timedelta
 import pytest
 
 from sightread.agents import PARSE
-from sightread.db.models import Job, User, utcnow
+from sightread.db.models import Document, Job, User, utcnow
 from sightread.jobs.queue import (
     claim_next_job,
     count_running_jobs,
@@ -221,10 +221,125 @@ async def test_requeue_forgets_partial_progress(sessionmaker) -> None:
         job_id = job.id
 
     async with sessionmaker() as db:
-        await requeue_job(db, job_id)
+        assert await requeue_job(db, job_id) is True
     async with sessionmaker() as db:
         requeued = await db.get(Job, job_id)
         assert (requeued.status, requeued.pages_done, requeued.started_at) == ("queued", 0, None)
+        # A job whose result was committed before the shutdown's cancel landed is not
+        # requeued, and the worker leaves its crops alone (docs/jobs.md § Retention).
+        requeued.status = "succeeded"
+        requeued.pages_done = 3
+        await db.commit()
+    async with sessionmaker() as db:
+        assert await requeue_job(db, job_id) is False
+        done = await db.get(Job, job_id)
+        assert (done.status, done.pages_done) == ("succeeded", 3)
+
+
+@postgres_only
+async def test_one_worker_holds_the_worker_lock_at_a_time(sessionmaker) -> None:
+    from sightread.jobs.queue import release_worker_lock, try_worker_lock
+
+    engine = sessionmaker.kw["bind"]
+    first = await try_worker_lock(engine)
+    assert first is not None
+    # A second worker finds the lock held and must not take the first one's jobs back.
+    assert await try_worker_lock(engine) is None
+    await release_worker_lock(first)
+    second = await try_worker_lock(engine)
+    assert second is not None
+    await release_worker_lock(second)
+
+
+async def test_a_worker_stops_when_its_lock_session_is_gone() -> None:
+    from sightread.jobs.queue import watch_worker_lock
+
+    class Session:
+        alive = True
+
+        async def execute(self, statement):
+            if not self.alive:
+                raise RuntimeError("connection is closed")
+
+            class Result:
+                def scalar_one(self):
+                    return 1
+
+            return Result()
+
+    stop = asyncio.Event()
+    session = Session()
+    watching = asyncio.ensure_future(watch_worker_lock(session, stop, 0.02))
+    await asyncio.sleep(0.08)
+    assert not stop.is_set() and not watching.done()
+    # The session is lost: PostgreSQL has released the lock with it, and a waiting worker
+    # may hold it now, so this one stops and its loop cancels the work in flight.
+    session.alive = False
+    await asyncio.wait_for(watching, 2)
+    assert stop.is_set()
+
+
+@postgres_only
+async def test_a_worker_starting_requeues_the_jobs_a_dead_one_left(sessionmaker) -> None:
+    from sightread.jobs.queue import requeue_orphaned_jobs
+
+    async with sessionmaker() as db:
+        user = await _user(db)
+        held = await enqueue_job(
+            db, user_id=user.id, sha256="6" * 64, source_path="unused-6.pdf", **JOB_DEFAULTS
+        )
+        held.status = "running"
+        held.started_at = utcnow()
+        queued = await enqueue_job(
+            db, user_id=user.id, sha256="7" * 64, source_path="unused-7.pdf", **JOB_DEFAULTS
+        )
+        await db.commit()
+        held_id, queued_id = held.id, queued.id
+    async with sessionmaker() as db:
+        # One worker per deployment: a job still running when it starts is a dead
+        # worker's, and goes back to the queue rather than counting against its user
+        # for good (docs/jobs.md).
+        assert await requeue_orphaned_jobs(db) == [held_id]
+        assert (await db.get(Job, held_id)).status == "queued"
+        assert (await db.get(Job, queued_id)).status == "queued"
+        assert await requeue_orphaned_jobs(db) == []
+
+
+async def test_a_job_whose_task_raised_is_failed_unless_already_done(
+    sessionmaker, tmp_path
+) -> None:
+    from sightread.jobs.runner import fail_job
+
+    async with sessionmaker() as db:
+        user = await _user(db)
+        job = await enqueue_job(
+            db, user_id=user.id, sha256="8" * 64, source_path="unused-8.pdf", **JOB_DEFAULTS
+        )
+        job.status = "running"
+        done = await enqueue_job(
+            db, user_id=user.id, sha256="9" * 64, source_path="unused-9.pdf", **JOB_DEFAULTS
+        )
+        done.status = "succeeded"
+        await db.commit()
+        job_id, done_id = job.id, done.id
+    from sightread.config import Settings
+    from tests.conftest import KANO_BASE, TEST_SECRET_KEY
+
+    settings = Settings(
+        app_env="local",
+        secret_key=TEST_SECRET_KEY,
+        workspaces_dir=str(tmp_path / "workspaces"),
+        figures_dir=str(tmp_path / "figures"),
+        kano_proxy_base_url=KANO_BASE,
+    )
+    await fail_job(sessionmaker, settings, job_id, "internal error")
+    await fail_job(sessionmaker, settings, done_id, "internal error")
+    async with sessionmaker() as db:
+        failed = await db.get(Job, job_id)
+        assert (failed.status, failed.error) == ("failed", "internal error")
+        assert failed.finished_at is not None
+        # A result committed before what raised stays a result.
+        assert (await db.get(Job, done_id)).status == "succeeded"
 
 
 @postgres_only
@@ -289,3 +404,230 @@ def test_a_discarded_jobs_figures_cannot_be_written_back(tmp_path) -> None:
 
     _locked_save_figures(state, "![fig](sightread://p1/0,0,500,500)", image, 1)
     assert not (tmp_path / "job").exists()
+
+
+async def test_a_job_of_a_user_with_an_orphaned_turn_is_not_claimed(sessionmaker) -> None:
+    async with sessionmaker() as db:
+        user = await _user(db)
+        job = await enqueue_job(
+            db, user_id=user.id, sha256="3" * 64, source_path="unused-3.pdf", **JOB_DEFAULTS
+        )
+        await db.commit()
+    async with sessionmaker() as db:
+        # A command of theirs the worker could not stop yet may still write their tree.
+        assert await claim_next_job(db, 2, {user.id}) is None
+    async with sessionmaker() as db:
+        assert await claim_next_job(db, 2, {user.id + 1000}) == job.id
+
+
+async def test_a_stale_workers_writes_are_fenced_by_its_generation(sessionmaker, tmp_path) -> None:
+    """A worker that lost the worker lock goes on for seconds; the replacement has
+    requeued and claimed its job by then, and nothing the stale one writes may land —
+    except the usage its calls billed (docs/jobs.md § Queue)."""
+    from sqlalchemy import func, select
+
+    from sightread.config import Settings
+    from sightread.db.models import JobPage, UsageLog
+    from sightread.jobs.queue import next_worker_generation, requeue_orphaned_jobs
+    from sightread.jobs.runner import PageOutcome, _record_page, fail_job
+    from sightread.upstream.client import Usage
+    from tests.conftest import KANO_BASE, TEST_SECRET_KEY
+
+    async with sessionmaker() as db:
+        user = await _user(db)
+        job = await enqueue_job(
+            db, user_id=user.id, sha256="c" * 64, source_path="unused-c.pdf", **JOB_DEFAULTS
+        )
+        await db.commit()
+        job_id = job.id
+    async with sessionmaker() as db:
+        stale = await next_worker_generation(db)
+        assert await claim_next_job(db, 2, None, stale) == job_id
+        assert (await db.get(Job, job_id)).worker_generation == stale
+    # The replacement starts: every running row is a dead worker's to it.
+    async with sessionmaker() as db:
+        assert await requeue_orphaned_jobs(db) == [job_id]
+        assert (await db.get(Job, job_id)).worker_generation is None
+        fresh = await next_worker_generation(db)
+        assert fresh > stale
+        assert await claim_next_job(db, 2, None, fresh) == job_id
+
+    async with sessionmaker() as db:
+        job = await db.get(Job, job_id)
+    outcome = PageOutcome(
+        page=1,
+        width_pt=1.0,
+        height_pt=1.0,
+        method="vision",
+        markdown="x",
+        usage=[Usage(prompt_tokens=1, completion_tokens=1, cost=None, cost_source="unknown")],
+    )
+    settings = Settings(
+        app_env="local",
+        secret_key=TEST_SECRET_KEY,
+        workspaces_dir=str(tmp_path / "workspaces"),
+        figures_dir=str(tmp_path / "figures"),
+        kano_proxy_base_url=KANO_BASE,
+    )
+
+    async def counts(db) -> tuple[int, int]:
+        pages = select(func.count()).select_from(JobPage).where(JobPage.job_id == job_id)
+        usage = select(func.count()).select_from(UsageLog).where(UsageLog.job_id == job_id)
+        return (await db.execute(pages)).scalar_one(), (await db.execute(usage)).scalar_one()
+
+    # The stale worker finishes a page, is cancelled, fails: none of it lands but the bill.
+    await _record_page(sessionmaker, job, outcome, stale)
+    async with sessionmaker() as db:
+        row = await db.get(Job, job_id)
+        assert (row.pages_done, row.status, row.worker_generation) == (0, "running", fresh)
+        assert await counts(db) == (0, 1)
+        assert await requeue_job(db, job_id, stale) is False
+    await fail_job(sessionmaker, settings, job_id, "internal error", stale)
+    async with sessionmaker() as db:
+        assert (await db.get(Job, job_id)).status == "running"
+    # The owner's writes land.
+    await _record_page(sessionmaker, job, outcome, fresh)
+    await fail_job(sessionmaker, settings, job_id, "internal error", fresh)
+    async with sessionmaker() as db:
+        row = await db.get(Job, job_id)
+        assert (row.pages_done, row.status, row.error) == (1, "failed", "internal error")
+        assert await counts(db) == (1, 2)
+
+
+def test_an_attempts_crops_are_its_own_until_published(tmp_path) -> None:
+    """Two attempts of one job — a stale worker's and the replacement's — crop into
+    directories of their own; a discard takes only its own, and the publish of the one
+    whose result committed puts it under the job's name (docs/jobs.md § Queue)."""
+    from sightread.jobs.runner import RunState, VisionBudget, _discard_figures, _publish_figures
+    from sightread.parsing.figures import discard_job_figures
+
+    job_id = uuid.uuid4()
+    figures = tmp_path / "figures"
+    stale = RunState(budget=VisionBudget(1), figures_dir=figures / f"{job_id}.stale")
+    fresh = RunState(budget=VisionBudget(1), figures_dir=figures / f"{job_id}.fresh")
+    for state in (stale, fresh):
+        state.figures_dir.mkdir(parents=True)
+        (state.figures_dir / "p1_0_0_10_10.png").write_bytes(b"png")
+    _discard_figures(stale)
+    assert not stale.figures_dir.exists() and fresh.figures_dir.is_dir()
+    _publish_figures(fresh, figures, job_id)
+    assert (figures / str(job_id) / "p1_0_0_10_10.png").read_bytes() == b"png"
+    assert not fresh.figures_dir.exists()
+    # A requeue at a worker's start removes the published crops and any attempt left.
+    (figures / f"{job_id}.dead").mkdir()
+    discard_job_figures(figures, job_id)
+    assert list(figures.iterdir()) == []
+
+
+async def test_a_run_whose_snapshot_update_is_fenced_out_ends_there(
+    sessionmaker, tmp_path, monkeypatch
+) -> None:
+    """The endpoint snapshot a run writes at its start is fenced like every other write:
+    a replacement that claimed the job between the read and the update keeps its own,
+    and the stale run starts nothing (docs/jobs.md § Queue)."""
+    from types import SimpleNamespace
+
+    from sightread.config import Settings
+    from sightread.jobs import runner
+    from sightread.jobs.queue import next_worker_generation
+    from tests.conftest import KANO_BASE, TEST_SECRET_KEY
+
+    async with sessionmaker() as db:
+        user = await _user(db)
+        job = await enqueue_job(
+            db, user_id=user.id, sha256="d" * 64, source_path="unused-d.pdf", **JOB_DEFAULTS
+        )
+        await db.commit()
+        job_id = job.id
+    async with sessionmaker() as db:
+        stale = await next_worker_generation(db)
+        assert await claim_next_job(db, 2, None, stale) == job_id
+
+    async def taken_over(db, settings, user_id, connection_id):
+        # The replacement requeues and claims the job while this run loads its upstream.
+        async with sessionmaker() as other:
+            fresh = await next_worker_generation(other)
+            assert await requeue_job(other, job_id) is True
+            assert await claim_next_job(other, 2, None, fresh) == job_id
+        return SimpleNamespace(snapshot="https://moved.test")
+
+    monkeypatch.setattr(runner, "load_connection", taken_over)
+    settings = Settings(
+        app_env="local",
+        secret_key=TEST_SECRET_KEY,
+        upload_dir=str(tmp_path / "uploads"),
+        workspaces_dir=str(tmp_path / "workspaces"),
+        figures_dir=str(tmp_path / "figures"),
+        kano_proxy_base_url=KANO_BASE,
+    )
+    await runner.run_job(sessionmaker, settings, job_id, asyncio.Semaphore(1), stale)
+    async with sessionmaker() as db:
+        row = await db.get(Job, job_id)
+    assert (row.status, row.connection_base_url) == ("running", JOB_DEFAULTS["connection_base_url"])
+    assert not (tmp_path / "uploads").exists()
+
+
+async def test_the_crops_are_published_under_the_backup_lock(
+    sessionmaker, tmp_path, monkeypatch
+) -> None:
+    """The result's commit and the move of its crops under the job's name are one hold of
+    the backup lock, so a snapshot never carries one without the other (docs/jobs.md
+    § Queue, docs/workspace.md § Backups)."""
+    import contextlib
+
+    from sightread.config import Settings
+    from sightread.jobs import runner
+    from tests.conftest import KANO_BASE, TEST_SECRET_KEY
+
+    async with sessionmaker() as db:
+        user = await _user(db)
+        job = await enqueue_job(
+            db, user_id=user.id, sha256="e" * 64, source_path="unused-e.pdf", **JOB_DEFAULTS
+        )
+        job.status = "running"
+        await db.commit()
+        job_id = job.id
+    held = False
+    published_while_held: list[bool] = []
+
+    @contextlib.asynccontextmanager
+    async def recording(root):
+        nonlocal held
+        held = True
+        try:
+            yield
+        finally:
+            held = False
+
+    order: list[str] = []
+
+    async def publish() -> None:
+        published_while_held.append(held)
+        order.append("publish")
+
+    async def materialize(db, settings_, row, **kwargs):
+        # The copies take their crops from under the job's name: published first.
+        order.append("materialize")
+
+    monkeypatch.setattr(runner, "backup_shared", recording)
+    monkeypatch.setattr(runner, "materialize_document", materialize)
+    async with sessionmaker() as db:
+        db.add(Document(user_id=user.id, folder_id=None, job_id=job_id, name="e.pdf"))
+        await db.commit()
+    settings = Settings(
+        app_env="local",
+        secret_key=TEST_SECRET_KEY,
+        workspaces_dir=str(tmp_path / "workspaces"),
+        figures_dir=str(tmp_path / "figures"),
+        kano_proxy_base_url=KANO_BASE,
+    )
+    assert await runner._finish(
+        sessionmaker, job_id, status="succeeded", settings=settings, publish=publish
+    )
+    assert published_while_held == [True]
+    assert order == ["publish", "materialize"]
+    # A finish that wrote nothing publishes nothing.
+    assert not await runner._finish(
+        sessionmaker, job_id, status="succeeded", settings=settings, generation=99, publish=publish
+    )
+    assert published_while_held == [True]

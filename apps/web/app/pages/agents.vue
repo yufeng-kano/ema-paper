@@ -213,7 +213,7 @@ function onTabKeydown(event: KeyboardEvent, index: number) {
           :prompts="prompts"
           :prompts-loaded="promptsData !== null"
           :prompt-max-chars="promptMaxChars"
-          @saved="(saved) => setAgentSettings(selected!.name, saved)"
+          @saved="setAgentSettings"
           @prompts-changed="refreshPrompts"
         />
       </UiPanel>

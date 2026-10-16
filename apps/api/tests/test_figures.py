@@ -91,9 +91,7 @@ def test_discard_removes_only_that_jobs_crops(tmp_path) -> None:
 
 def test_the_per_page_cap_keeps_the_first_boxes_in_reading_order(tmp_path) -> None:
     image = _page_image(tmp_path / "page.png")
-    markdown = "\n".join(
-        f"![fig](sightread://p1/{y},0,{y + 50},100)" for y in range(0, 500, 50)
-    )
+    markdown = "\n".join(f"![fig](sightread://p1/{y},0,{y + 50},100)" for y in range(0, 500, 50))
 
     saved = save_page_figures(markdown, image, 1, tmp_path / "job", limit=3)
 
@@ -101,3 +99,51 @@ def test_the_per_page_cap_keeps_the_first_boxes_in_reading_order(tmp_path) -> No
     assert (tmp_path / "job" / "p1_0_0_50_100.png").is_file()
     assert (tmp_path / "job" / "p1_100_0_150_100.png").is_file()
     assert not (tmp_path / "job" / "p1_150_0_200_100.png").exists()
+
+
+def test_a_running_jobs_crop_is_found_in_its_attempt_directory(tmp_path) -> None:
+    from sightread.parsing.figures import find_crop
+
+    job_id = uuid.uuid4()
+    bbox = (10, 20, 30, 40)
+    assert find_crop(tmp_path, job_id, 1, bbox) is None
+    attempt = tmp_path / f"{job_id}.abc123"
+    attempt.mkdir()
+    (attempt / "p1_10_20_30_40.png").write_bytes(b"attempt")
+    assert find_crop(tmp_path, job_id, 1, bbox) == attempt / "p1_10_20_30_40.png"
+    # Published, the job's own directory answers first.
+    (tmp_path / str(job_id)).mkdir()
+    (tmp_path / str(job_id) / "p1_10_20_30_40.png").write_bytes(b"published")
+    assert find_crop(tmp_path, job_id, 1, bbox) == crop_path(tmp_path, job_id, 1, bbox)
+
+
+def test_a_crop_published_under_the_open_is_opened_where_it_landed(tmp_path, monkeypatch) -> None:
+    """The publication can rename the attempt directory between the lookup and the open:
+    the open is tried again where the crop landed, and the route streams from that
+    descriptor rather than from a path the rename may have moved (docs/parsing.md
+    § Figure crops)."""
+    from sightread.parsing import figures
+
+    job_id = uuid.uuid4()
+    bbox = (10, 20, 30, 40)
+    attempt = tmp_path / f"{job_id}.abc123"
+    attempt.mkdir()
+    (attempt / "p1_10_20_30_40.png").write_bytes(b"crop")
+    real = figures.find_crop
+    looks = 0
+
+    def racing(figures_dir, job, page, box):
+        nonlocal looks
+        looks += 1
+        path = real(figures_dir, job, page, box)
+        if looks == 1:
+            # The result commits between the look and the read.
+            figures.publish_job_figures(figures_dir, job, attempt)
+        return path
+
+    monkeypatch.setattr(figures, "find_crop", racing)
+    handle = figures.open_crop(tmp_path, job_id, 1, bbox)
+    assert handle is not None and looks == 2
+    assert b"".join(figures.crop_chunks(handle)) == b"crop"
+    assert handle.closed
+    assert figures.open_crop(tmp_path, uuid.uuid4(), 1, bbox) is None

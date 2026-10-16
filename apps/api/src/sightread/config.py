@@ -49,6 +49,12 @@ class Settings(BaseSettings):
     upload_max_bytes: int = 134_217_728
     page_cap: int = 500
     max_jobs_per_user: int = 2
+    # The `Retry-After` a refused parse (429, the per-user job cap) tells the client.
+    parse_retry_after_seconds: int = 30
+    # A library upload retried after the first request's answer was lost is answered with
+    # the job that answered the first, even one already finished, when it finished this
+    # recently (docs/jobs.md § Dedup).
+    upload_retry_window_seconds: int = 60
     vision_concurrency_per_job: int = 8
     render_workers: int = 0  # 0 means "CPU count", resolved by the worker
     upload_dir: str = "/data/uploads"
@@ -63,9 +69,68 @@ class Settings(BaseSettings):
     # Cap on any upstream response body — a user-controlled endpoint must not be able to
     # exhaust memory with an unbounded reply (docs/parsing.md § Upstream usage).
     upstream_response_max_bytes: int = 33_554_432
+    # The chat agent's event stream: one SSE line past this is a broken upstream, not a
+    # long answer, and more content blocks than this is refused rather than allocated
+    # for (docs/chat.md § Upstream).
+    upstream_sse_line_max_bytes: int = 4 * 1024 * 1024
+    upstream_content_blocks_max: int = 4096
     # Upload tickets minted by the MCP `parse` tool (docs/auth.md § 5).
     upload_ticket_ttl_seconds: int = 3600
     upload_ticket_rate_per_hour: int = 30
+
+    # Per-user workspaces: every user's files and revisions, bind-mounted at the same path
+    # into api, worker and the sandbox runner (docs/workspace.md).
+    workspaces_dir: str = "/data/workspaces"
+    workspace_quota_bytes: int = 10_737_418_240
+    # The largest document file the API opens; the shell can write anything.
+    content_max_bytes: int = 8_388_608
+
+    # The chat agent's limits (docs/chat.md).
+    max_chat_turns_per_user: int = 4
+    # The `Retry-After` a refused send (429, the per-user turn cap) tells the client.
+    chat_retry_after_seconds: int = 15
+    chat_max_output_tokens: int = 64_000
+    chat_max_tool_calls_per_turn: int = 50
+    chat_turn_timeout_seconds: int = 900
+    chat_stream_timeout_seconds: int = 900
+    chat_tool_result_max_chars: int = 20_000
+    chat_message_max_chars: int = 32_000
+    chat_selection_max_chars: int = 16_000
+    chat_bash_timeout_seconds: int = 120
+    chat_writer_grace_seconds: int = 60
+    revert_max_bytes: int = 64 * 1024 * 1024
+    revert_max_paths: int = 2000
+    workspace_git_timeout_seconds: int = 60
+    # The most of a git log the API reads to list revisions, and the paths it keeps per
+    # revision; the rename and path lists a revert reads share the byte bound
+    # (docs/workspace.md § Revisions).
+    workspace_log_max_bytes: int = 4 * 1024 * 1024
+    workspace_log_files_max: int = 200
+    chat_image_round_max_bytes: int = 32 * 1024 * 1024
+    chat_image_turn_max_bytes: int = 128 * 1024 * 1024
+    # The most an image document may decode to for `view_page`, read from its header
+    # before any decoding (docs/chat.md § Tools).
+    chat_page_image_max_pixels: int = 40_000_000
+    # The stored history a conversation may replay, every message together: a turn past
+    # it is refused with a pointer to a new conversation (docs/chat.md § History).
+    chat_history_max_bytes: int = 256 * 1024 * 1024
+
+    # The sandbox runner (docs/sandbox.md). Empty URL = no sandbox: the chat agent runs
+    # without its bash tool. The token is what api and worker present to the runner.
+    sandbox_url: str = ""
+    sandbox_token: str = ""
+    # What the runner's stop, reset, restart and status calls are given: it must cover
+    # the runner's own Docker timeout, the inspection after it and a reset's deletion.
+    sandbox_control_timeout_seconds: int = 180
+    # What a command may take beyond its own timeout before the runner client gives up:
+    # the VM's cold start on a stopped sandbox (the runner's own SANDBOX_START_TIMEOUT_SECONDS)
+    # and the reply's grace past the command's deadline (docs/sandbox.md § The runner).
+    sandbox_start_timeout_seconds: int = 180
+    # The runner's own `--network` and index URL; read here too, so the prompt tells the
+    # model whether the VM can reach a package index (docs/chat.md § System prompt).
+    sandbox_network: str = "none"
+    sandbox_index_url: str = ""
+    sandbox_exec_grace_seconds: int = 60
 
     domain: str = ""
     acme_email: str = ""
@@ -102,9 +167,33 @@ class Settings(BaseSettings):
         return f"{self.kano_proxy_base_url}/openai/v1"
 
     @property
+    def kano_proxy_anthropic_base(self) -> str:
+        """The Anthropic-format base the chat agent calls (docs/chat.md § Upstream)."""
+        return f"{self.kano_proxy_base_url}/anthropic/v1"
+
+    @property
+    def sandbox_configured(self) -> bool:
+        return bool(self.sandbox_url and self.sandbox_token)
+
+    @property
     def kano_redirect_uri(self) -> str:
         """Exactly what the authorize request and the token exchange both send."""
         return f"{self.app_url.rstrip('/')}/api/kano/callback"
+
+    @property
+    def json_body_max_bytes(self) -> int:
+        """The largest JSON request body the API reads: a document's content at its worst
+        JSON escaping — a one-byte control character is a six-byte `\\uXXXX`, an emoji's
+        four bytes a twelve-byte surrogate pair — plus room for the envelope, so no
+        content under the cap is refused for its encoding (docs/api.md). Uploads stream
+        under their own cap."""
+        return self.content_max_bytes * 6 + 65_536
+
+    @property
+    def parse_json_body_max_bytes(self) -> int:
+        """The largest JSON `/v1/parse` body: the upload cap in base64 (four bytes per
+        three, rounded up) plus room for the envelope (docs/api.md § POST /v1/parse)."""
+        return (self.upload_max_bytes + 2) // 3 * 4 + 65_536
 
     def web_url_for_locale(self, prefix: str) -> str:
         """`WEB_URL`, prefixed when the visitor picked a non-default locale.

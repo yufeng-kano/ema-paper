@@ -1,0 +1,40 @@
+[project]
+name = "sightread-sandbox"
+version = "0.1.0"
+description = "The sandbox runner: one microVM per user, started on demand (docs/sandbox.md)"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.121.2",
+    "pydantic-settings>=2.13.1",
+    "uvicorn[standard]>=0.38.1",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.0.1",
+    "pytest-asyncio>=1.3.0",
+    "ruff>=0.14.6",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.9,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "sightread_sandbox"
+module-root = "src"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "S", "C4", "SIM"]
+ignore = ["S101", "ASYNC109", "ASYNC240"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S106"]

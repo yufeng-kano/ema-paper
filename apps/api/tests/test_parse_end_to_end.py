@@ -283,9 +283,7 @@ async def test_a_wholly_failed_job_names_the_page_reasons(
 
 
 @respx.mock
-async def test_result_md_serves_the_markdown_as_a_file(
-    api_client, sessionmaker, documents
-) -> None:
+async def test_result_md_serves_the_markdown_as_a_file(api_client, sessionmaker, documents) -> None:
     respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
     accepted = await _upload(api_client, documents["text_pdf"])
     job_id = accepted.json()["job_id"]

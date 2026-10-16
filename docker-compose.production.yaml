@@ -53,12 +53,16 @@ services:
       APP_ENV: production
       UPLOAD_DIR: /data/uploads
       FIGURES_DIR: /data/figures
+      WORKSPACES_DIR: /data/workspaces
     depends_on:
       pg:
         condition: service_healthy
     volumes:
       - uploads:/data/uploads
       - figures:/data/figures
+      # Every user's files and revisions — primary data, bind-mounted at the same host
+      # path the sandbox runner hands to `docker run` (docs/workspace.md).
+      - ${WORKSPACES_HOST_DIR:?WORKSPACES_HOST_DIR is required}:/data/workspaces
     # Migrations run once, from the api container, before it serves (docs/database.md).
     command: >
       sh -c "alembic upgrade head &&
@@ -84,6 +88,7 @@ services:
       APP_ENV: production
       UPLOAD_DIR: /data/uploads
       FIGURES_DIR: /data/figures
+      WORKSPACES_DIR: /data/workspaces
     depends_on:
       pg:
         condition: service_healthy
@@ -95,7 +100,38 @@ services:
     volumes:
       - uploads:/data/uploads
       - figures:/data/figures
+      - ${WORKSPACES_HOST_DIR:?WORKSPACES_HOST_DIR is required}:/data/workspaces
     command: ["python", "-m", "sightread.worker"]
+
+  # The sandbox runner (docs/sandbox.md): alone in holding the Docker socket, it starts
+  # one Kata microVM per user from the sandbox image (`docker build -t sightread-sandbox
+  # deploy/sandbox-image`). The host needs /dev/kvm and the `kata` runtime registered with
+  # Docker; the runner refuses to start in production with `runc`.
+  sandbox:
+    build:
+      context: ./apps/sandbox
+    # Named explicitly: compose would otherwise tag this build `sightread-sandbox`, the
+    # tag the VM image (deploy/sandbox-image, SANDBOX_IMAGE) is documented to carry.
+    image: sightread-sandbox-runner
+    container_name: sightread-sandbox
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      APP_ENV: production
+      SANDBOX_BACKEND: docker
+      SANDBOX_WORKSPACES_MOUNT: /data/workspaces
+      SANDBOX_WORKSPACES_DIR: ${WORKSPACES_HOST_DIR:?WORKSPACES_HOST_DIR is required}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${WORKSPACES_HOST_DIR:?WORKSPACES_HOST_DIR is required}:/data/workspaces
+    healthcheck:
+      # Probes the port the runner listens on (SANDBOX_PORT, read from the container's
+      # own environment), never a fixed one (docs/deployment.md).
+      test: ["CMD", "python", "-c", "import os, urllib.request; urllib.request.urlopen('http://localhost:' + os.environ.get('SANDBOX_PORT', '8100') + '/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   web:
     build:
@@ -119,9 +155,16 @@ services:
       PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
       PGDATABASE: ${POSTGRES_DB:-sightread}
       PGHOST: pg
+      # How long a pass waits for unconfirmed shell commands to clear before archiving
+      # regardless (docs/workspace.md § Backups).
+      BACKUP_WRITING_WAIT_SECONDS: ${BACKUP_WRITING_WAIT_SECONDS:-3600}
     volumes:
       - ./backups:/backups
       - figures:/data/figures:ro
+      # The tree read-only; `.repos` writable for the backup lock alone, which every
+      # workspace write takes shared (docs/workspace.md § Backups).
+      - ${WORKSPACES_HOST_DIR:?WORKSPACES_HOST_DIR is required}:/data/workspaces:ro
+      - ${WORKSPACES_HOST_DIR:?WORKSPACES_HOST_DIR is required}/.repos:/data/workspaces/.repos
     depends_on:
       pg:
         condition: service_healthy
@@ -134,22 +177,45 @@ services:
           # The dump and the crops behind its results are one backup: both are written as
           # temporaries and published together only when both succeeded, so the newest
           # dump always has a same-stamp figures archive to restore beside it.
-          if pg_dump --format=custom --file="/backups/sightread-$$stamp.dump.tmp" &&
-            tar -czf "/backups/figures-$$stamp.tar.gz.tmp" -C /data figures; then
-            mv "/backups/sightread-$$stamp.dump.tmp" "/backups/sightread-$$stamp.dump"
-            mv "/backups/figures-$$stamp.tar.gz.tmp" "/backups/figures-$$stamp.tar.gz"
-            echo "backup: wrote sightread-$$stamp.dump + figures-$$stamp.tar.gz"
+          # The workspaces (every user's edits, notes and originals) are primary data
+          # from the chat agent on (docs/workspace.md § Backups) and ride the same stamp.
+          # One snapshot: the workspace backup lock is held exclusively from the dump to
+          # the end of the archive, and every workspace write takes it shared, so no
+          # rename, save or shell commit lands between the rows and the tree.
+          mkdir -p /data/workspaces/.repos
+          # A `.repos/<user>.writing` marker names a shell command nobody could confirm
+          # over: that VM may still be writing into its tree, and an archive taken now
+          # would hold files mid-write. The pass waits for the markers to clear, up to
+          # BACKUP_WRITING_WAIT_SECONDS, then archives regardless — a late backup beats
+          # none — and names the users it could not quiesce in the stamp's
+          # unconfirmed-writes.txt (docs/workspace.md § Backups).
+          waited=0
+          while ls /data/workspaces/.repos/*.writing >/dev/null 2>&1 && [ "$$waited" -lt "$$BACKUP_WRITING_WAIT_SECONDS" ]; do
+            echo "backup: an unconfirmed shell command stands; waiting ($$waited s so far)"
+            sleep 60
+            waited=$$((waited + 60))
+          done
+          # Written into a staging directory and published by one rename: a stamp
+          # directory under /backups is complete by construction, never a dump without
+          # its figures or workspaces archive, whatever stops the host in between.
+          staging="/backups/.tmp-$$stamp"
+          rm -rf "$$staging" && mkdir -p "$$staging"
+          if flock -x /data/workspaces/.repos/backup.lock sh -c '
+            pg_dump --format=custom --file="'"$$staging"'/sightread.dump" &&
+            tar -czf "'"$$staging"'/figures.tar.gz" -C /data figures &&
+            tar -czf "'"$$staging"'/workspaces.tar.gz" -C /data \
+              --exclude="workspaces/.repos/*.lock" workspaces &&
+            { ls /data/workspaces/.repos/*.writing 2>/dev/null | sed "s#.*/##" > "'"$$staging"'/unconfirmed-writes.txt";
+              [ -s "'"$$staging"'/unconfirmed-writes.txt" ] || rm -f "'"$$staging"'/unconfirmed-writes.txt"; }'; then
+            mv "$$staging" "/backups/$$stamp"
+            echo "backup: published /backups/$$stamp (dump + figures + workspaces)"
           else
-            rm -f "/backups/sightread-$$stamp.dump.tmp" "/backups/figures-$$stamp.tar.gz.tmp"
+            rm -rf "$$staging"
             echo "backup: failed at $$stamp, nothing published" >&2
           fi
-          # Keep the newest seven of each; anything older is deleted.
-          ls -1t /backups/sightread-*.dump 2>/dev/null | tail -n +8 | while read -r old; do
-            rm -f "$$old"
-            echo "backup: rotated out $$old"
-          done
-          ls -1t /backups/figures-*.tar.gz 2>/dev/null | tail -n +8 | while read -r old; do
-            rm -f "$$old"
+          # Keep the newest seven stamps; anything older is deleted whole.
+          ls -1dt /backups/[0-9]*/ 2>/dev/null | tail -n +8 | while read -r old; do
+            rm -rf "$$old"
             echo "backup: rotated out $$old"
           done
           sleep 86400

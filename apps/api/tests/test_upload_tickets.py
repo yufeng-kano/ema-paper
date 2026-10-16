@@ -101,9 +101,7 @@ async def test_last_resolves_a_spent_ticket_to_its_own_job(
     assert refused.status_code == 400
 
 
-async def test_last_with_an_unspent_ticket_is_the_documented_401(
-    api_client, sessionmaker
-) -> None:
+async def test_last_with_an_unspent_ticket_is_the_documented_401(api_client, sessionmaker) -> None:
     token = await _mint(api_client, sessionmaker)
     response = await api_client.get("/v1/jobs/last", headers=_bearer(token))
     assert response.status_code == 401
