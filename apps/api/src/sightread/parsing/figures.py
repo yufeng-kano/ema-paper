@@ -50,7 +50,7 @@ def crop_path(figures_dir: Path, job_id: uuid.UUID, page: int, bbox: Bbox) -> Pa
 
 
 def discard_job_figures(figures_dir: Path, job_id: uuid.UUID) -> None:
-    """Remove one job's crop directory.
+    """Remove one job's crop directory, and every attempt directory of it still standing.
 
     Crops live exactly as long as something references them (docs/jobs.md § Retention): a
     job that fails wrote no result, and a requeued job reparses from scratch — either way
@@ -58,6 +58,18 @@ def discard_job_figures(figures_dir: Path, job_id: uuid.UUID) -> None:
     emits different boxes would leave the first attempt's files answering figure routes.
     """
     shutil.rmtree(figures_dir / str(job_id), ignore_errors=True)
+    for attempt in figures_dir.glob(f"{job_id}.*"):
+        shutil.rmtree(attempt, ignore_errors=True)
+
+
+def publish_job_figures(figures_dir: Path, job_id: uuid.UUID, attempt: Path) -> None:
+    """The attempt's crops under the job's name: what the figure routes and the document
+    copies read, once the result is committed as this attempt's (docs/jobs.md § Queue).
+    Whatever stood there before — nothing, or a dead attempt's leftovers — goes first."""
+    final = figures_dir / str(job_id)
+    shutil.rmtree(final, ignore_errors=True)
+    if attempt.is_dir():
+        attempt.rename(final)
 
 
 DEFAULT_FIGURES_PER_PAGE = 40

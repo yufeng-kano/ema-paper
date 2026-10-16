@@ -2768,13 +2768,54 @@ async def test_a_turn_another_worker_finished_is_left_as_it_is(chatting) -> None
     async with sessionmaker() as db:
         await fail_turn(db, turn_id, "worker restarted")
     assert await chat_runner._cancelled(stale) is True
+    # Nor does it store an answer, or move the conversation to a fallback model: the
+    # check and the write are one transaction (docs/jobs.md § Queue).
+    stale.conversation = SimpleNamespace(id=conversation_id, model="m")
+    stale.model = "m"
+    with pytest.raises(chat_runner.TurnCancelled):
+        await chat_runner._store(
+            stale, "assistant", [{"type": "text", "text": "late"}], model="fallback"
+        )
+    with pytest.raises(chat_runner.TurnCancelled):
+        await chat_runner._follow_model(stale, "fallback")
     await chat_runner._finish(sessionmaker, turn_id, status="succeeded")
     async with sessionmaker() as db:
         turn = await db.get(ChatTurn, turn_id)
         assert (turn.status, turn.error) == ("failed", "worker restarted")
+        stored = (
+            await db.execute(
+                select(Message.id).where(Message.turn_id == turn_id, Message.role == "assistant")
+            )
+        ).all()
+        assert stored == []
+        assert (await db.get(Conversation, conversation_id)).model != "fallback"
         events = (
             (await db.execute(select(ChatEvent).where(ChatEvent.turn_id == turn_id)))
             .scalars()
             .all()
         )
     assert [event.event for event in events] == ["turn_error"]
+
+
+async def test_a_failed_create_leaves_no_directory_behind(tmp_path, monkeypatch) -> None:
+    """A create whose revision cannot be recorded is undone whole: the file and the
+    directories made for it, so reconciliation finds no folder the tool reported it
+    could not make (docs/workspace.md § Revisions)."""
+    root = tmp_path / "ws" / "1"
+    (root / "files" / "kept").mkdir(parents=True)
+    git.ensure_repo(root)
+
+    def refusing(*args, **kwargs):
+        raise git.GitError("disk full")
+
+    monkeypatch.setattr(chat_tools.git, "commit_paths", refusing)
+    outcome = await chat_tools.run_editor(
+        root,
+        {"command": "create", "path": "/workspace/files/kept/New/deeper/a.md", "file_text": "x"},
+        "agent:1",
+        max_chars=1000,
+        max_bytes=1_000_000,
+    )
+    assert outcome.is_error
+    assert not (root / "files" / "kept" / "New").exists()
+    assert (root / "files" / "kept").is_dir()

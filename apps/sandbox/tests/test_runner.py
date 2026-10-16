@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -570,6 +571,16 @@ async def test_the_runner_names_the_other_live_shells_to_each_cleanup(tmp_path) 
     assert pid_a != pid_b
     kept = second.output.split("KEEP=[")[1].split("]")[0].split()
     assert sorted(kept) == sorted([str(pid_a), str(pid_b)])
+    # A shell whose supervisor died while idle keeps the pid it reported until it is
+    # restarted or closed, and the VM may give that number to a command's process: the
+    # cleanup is told to keep the live shells only (docs/sandbox.md § The runner).
+    dead = backend._user(21).sessions["b"]
+    process = dead._process
+    os.killpg(process.pid, 9)
+    await process.wait()
+    assert not dead.alive and dead.pid == pid_b
+    third = await backend.exec(21, "a", "true", timeout=10)
+    assert third.output.split("KEEP=[")[1].split("]")[0].split() == [str(pid_a)]
     await backend.restart(21, "a")
     await backend.restart(21, "b")
 
@@ -662,6 +673,13 @@ async def test_the_vm_scratch_size_comes_from_settings(tmp_path, monkeypatch) ->
     run = next(args for args in calls if args[0] == "run")
     assert "/tmp:rw,exec,size=256m" in run  # noqa: S108 - the VM scratch, not the host
     assert "size=1g" not in " ".join(run)
+    # The parse baseline is a nested read-only mount over the workspace mount, its target
+    # made before the start (docs/sandbox.md § Backends).
+    host = tmp_path / "ws" / "41"
+    baseline = f"{host}/.sightread:/workspace/.sightread:ro"
+    assert baseline in run
+    assert run.index(f"{host}:/workspace") < run.index(baseline)
+    assert (host / ".sightread").is_dir()
 
 
 def test_the_vm_sweep_repeats_until_nothing_but_the_shells_is_left(tmp_path) -> None:

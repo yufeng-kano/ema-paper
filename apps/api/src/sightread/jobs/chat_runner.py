@@ -352,8 +352,39 @@ async def _cancelled(ctx: TurnContext) -> bool:
         return row is None or row.status == "cancelled" or row.finished_at is not None
 
 
-async def _store(ctx: TurnContext, role: str, content: list[dict]) -> int:
+async def _still_ours(db: AsyncSession, ctx: TurnContext) -> None:
+    """Lock the conversation — the order the cancel route and the orphan recovery take —
+    and check, in the transaction about to write history, that the turn is still this
+    worker's to write: not cancelled, and not finished by the worker that took the lock
+    this one lost (docs/jobs.md § Queue). Raises `TurnCancelled` otherwise, so nothing
+    is written and the loop stops."""
+    await db.execute(
+        select(Conversation.id).where(Conversation.id == ctx.conversation.id).with_for_update()
+    )
+    turn = (
+        await db.execute(
+            select(ChatTurn.status, ChatTurn.finished_at).where(ChatTurn.id == ctx.turn.id)
+        )
+    ).one_or_none()
+    if turn is None or turn.status == "cancelled" or turn.finished_at is not None:
+        raise TurnCancelled()
+
+
+async def _store(
+    ctx: TurnContext, role: str, content: list[dict], *, model: str | None = None
+) -> int:
+    """Append a message to the history — and, with `model`, move the conversation to the
+    model that answered first — in one transaction with the check that the turn may
+    still take history, so a finished or cancelled turn gets none (docs/chat.md
+    § History is append-only)."""
     async with ctx.sessionmaker() as db:
+        await _still_ours(db, ctx)
+        if model is not None:
+            await db.execute(
+                update(Conversation)
+                .where(Conversation.id == ctx.conversation.id)
+                .values(model=model)
+            )
         row = Message(
             conversation_id=ctx.conversation.id,
             role=role,
@@ -364,18 +395,17 @@ async def _store(ctx: TurnContext, role: str, content: list[dict]) -> int:
         await db.flush()
         message_id = row.id
         await db.commit()
-        return message_id
+    if model is not None:
+        ctx.model = model
+        ctx.conversation.model = model
+    return message_id
 
 
 async def _follow_model(ctx: TurnContext, model: str) -> None:
-    logger.info(
-        "conversation %d moves from %s to %s, which answered its turn %s",
-        ctx.conversation.id,
-        ctx.model,
-        model,
-        ctx.turn.id,
-    )
+    """The conversation follows the model that answered, with no message to store it
+    with (an answer cut to nothing): fenced like a stored message."""
     async with ctx.sessionmaker() as db:
+        await _still_ours(db, ctx)
         await db.execute(
             update(Conversation).where(Conversation.id == ctx.conversation.id).values(model=model)
         )
@@ -848,12 +878,21 @@ async def _loop(ctx: TurnContext) -> None:
         if await _cancelled(ctx):
             # Billed, but not kept: a cancelled turn leaves the history as it was.
             raise TurnCancelled()
+        followed: str | None = None
         if completed.model and completed.model != ctx.model:
             # A safety fallback answered from another model: its thinking blocks are
-            # that model's, so the conversation follows it from here — before the
-            # answer is stored, so no request ever replays them to the model that did
-            # not make them (docs/chat.md § History is append-only).
-            await _follow_model(ctx, completed.model)
+            # that model's, so the conversation follows it from here — in the same
+            # transaction as the answer is stored, so no request ever replays them to
+            # the model that did not make them, and no finished turn moves the
+            # conversation (docs/chat.md § History is append-only).
+            logger.info(
+                "conversation %d moves from %s to %s, which answered its turn %s",
+                ctx.conversation.id,
+                ctx.model,
+                completed.model,
+                ctx.turn.id,
+            )
+            followed = completed.model
         tool_uses = [block for block in completed.content if block.get("type") == "tool_use"]
         content = completed.content
         if completed.stop_reason == "max_tokens":
@@ -861,10 +900,12 @@ async def _loop(ctx: TurnContext) -> None:
             # never run, and a tool_use with no result would make the history unsendable.
             content = [block for block in content if block.get("type") != "tool_use"]
         if content:
-            await _store(ctx, "assistant", content)
+            await _store(ctx, "assistant", content, model=followed)
             messages.append({"role": "assistant", "content": content})
             # Positions are content blocks, not messages (docs/chat.md § Prompt caching).
             since_marker += len(content)
+        elif followed is not None:
+            await _follow_model(ctx, followed)
 
         if completed.stop_reason == "refusal":
             raise TurnFailed("The model declined this request")

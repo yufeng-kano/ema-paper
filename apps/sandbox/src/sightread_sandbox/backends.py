@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 
 DOCKER = "docker"
 CACHE_DIR = ".cache"
+# The parse baseline the host writes once: in the VM read-only (docs/sandbox.md).
+SIGHTREAD_DIR = ".sightread"
 
 
 @dataclass
@@ -129,8 +131,15 @@ class Backend:
                 await shell.start()
             # The user's live shells, by the pids they reported: what the cleanup after
             # this command must not end. The API runs one command per user at a time, so
-            # a shell this list misses is one opened while nothing was running.
-            keep = [other.pid for other in sandbox.sessions.values() if other.pid is not None]
+            # a shell this list misses is one opened while nothing was running. Live
+            # only: a supervisor that exited while idle keeps its pid until it is
+            # restarted or closed, and the VM may have given that number to a command's
+            # process, which the sweep must not keep (docs/sandbox.md § The runner).
+            keep = [
+                other.pid
+                for other in sandbox.sessions.values()
+                if other.alive and other.pid is not None
+            ]
             sandbox.session_used[session] = time.monotonic()
         sandbox.last_used = time.monotonic()
         sandbox.last_used_at = _now()
@@ -491,7 +500,13 @@ class DockerBackend(Backend):
         settings = self.settings
         await _docker("rm", "-f", name, timeout=settings.sandbox_docker_timeout_seconds)
         workspace = self.workspace(sandbox.user_id)
-        await asyncio.to_thread(lambda: (workspace / CACHE_DIR).mkdir(parents=True, exist_ok=True))
+
+        def make_dirs() -> None:
+            (workspace / CACHE_DIR).mkdir(parents=True, exist_ok=True)
+            # The nested read-only mount needs its target before the start.
+            (workspace / SIGHTREAD_DIR).mkdir(parents=True, exist_ok=True)
+
+        await asyncio.to_thread(make_dirs)
         host_workspace = self.host_workspace(sandbox.user_id)
         args = [
             "run",
@@ -517,6 +532,10 @@ class DockerBackend(Backend):
             "ALL",
             "-v",
             f"{host_workspace}:/workspace",
+            # Over it, the parse baseline read-only: presented to the agent as untouched,
+            # and the root shell must not be able to edit or delete it (docs/sandbox.md).
+            "-v",
+            f"{host_workspace}/{SIGHTREAD_DIR}:/workspace/{SIGHTREAD_DIR}:ro",
             "-w",
             "/workspace",
             "-e",
@@ -560,11 +579,12 @@ class DockerBackend(Backend):
         container = self.container(user_id)
 
         async def kill_inside(*, pid: int, locked: bool = False) -> None:
-            # The user's other live shells, which the sweep after the kill must keep.
+            # The user's other live shells, which the sweep after the kill must keep;
+            # a dead one's pid may be a command's by now.
             keep = " ".join(
                 str(other.pid)
                 for other in self._user(user_id).sessions.values()
-                if other.pid is not None and other.pid != pid
+                if other.alive and other.pid is not None and other.pid != pid
             )
             code, out = await _docker(
                 "exec", container, "sh", "-c", KILL_TREE, "sh", str(pid), keep, timeout=30

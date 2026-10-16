@@ -291,6 +291,15 @@ def _edit_sync(
 
     if len(after.encode()) > max_bytes:
         return ToolOutcome(f"the result would make {vm_path} too large; use bash", is_error=True)
+    # The directories a create makes for its file, deepest first: removed with the file
+    # when its revision cannot be recorded, so a failed create leaves no empty folder
+    # for the next reconciliation to record as a row (docs/workspace.md § Revisions).
+    made: list[Path] = []
+    if before is None:
+        parent = path.parent
+        while parent != root and safe_io.entry_kind(root, parent) == "none":
+            made.append(parent)
+            parent = parent.parent
     try:
         safe_io.write_text(root, path, after, exist_ok=command != "create")
     except FileExistsError:
@@ -305,6 +314,8 @@ def _edit_sync(
         # commit as someone else's change (docs/workspace.md § Revisions).
         if before is None:
             safe_io.remove_file(root, path)
+            for directory in made:
+                safe_io.remove_empty_dir(root, directory)
         else:
             safe_io.write_text(root, path, before)
         raise

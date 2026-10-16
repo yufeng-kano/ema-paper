@@ -492,3 +492,76 @@ async def test_a_stale_workers_writes_are_fenced_by_its_generation(sessionmaker,
         row = await db.get(Job, job_id)
         assert (row.pages_done, row.status, row.error) == (1, "failed", "internal error")
         assert await counts(db) == (1, 2)
+
+
+def test_an_attempts_crops_are_its_own_until_published(tmp_path) -> None:
+    """Two attempts of one job — a stale worker's and the replacement's — crop into
+    directories of their own; a discard takes only its own, and the publish of the one
+    whose result committed puts it under the job's name (docs/jobs.md § Queue)."""
+    from sightread.jobs.runner import RunState, VisionBudget, _discard_figures, _publish_figures
+    from sightread.parsing.figures import discard_job_figures
+
+    job_id = uuid.uuid4()
+    figures = tmp_path / "figures"
+    stale = RunState(budget=VisionBudget(1), figures_dir=figures / f"{job_id}.stale")
+    fresh = RunState(budget=VisionBudget(1), figures_dir=figures / f"{job_id}.fresh")
+    for state in (stale, fresh):
+        state.figures_dir.mkdir(parents=True)
+        (state.figures_dir / "p1_0_0_10_10.png").write_bytes(b"png")
+    _discard_figures(stale)
+    assert not stale.figures_dir.exists() and fresh.figures_dir.is_dir()
+    _publish_figures(fresh, figures, job_id)
+    assert (figures / str(job_id) / "p1_0_0_10_10.png").read_bytes() == b"png"
+    assert not fresh.figures_dir.exists()
+    # A requeue at a worker's start removes the published crops and any attempt left.
+    (figures / f"{job_id}.dead").mkdir()
+    discard_job_figures(figures, job_id)
+    assert list(figures.iterdir()) == []
+
+
+async def test_a_run_whose_snapshot_update_is_fenced_out_ends_there(
+    sessionmaker, tmp_path, monkeypatch
+) -> None:
+    """The endpoint snapshot a run writes at its start is fenced like every other write:
+    a replacement that claimed the job between the read and the update keeps its own,
+    and the stale run starts nothing (docs/jobs.md § Queue)."""
+    from types import SimpleNamespace
+
+    from sightread.config import Settings
+    from sightread.jobs import runner
+    from sightread.jobs.queue import next_worker_generation
+    from tests.conftest import KANO_BASE, TEST_SECRET_KEY
+
+    async with sessionmaker() as db:
+        user = await _user(db)
+        job = await enqueue_job(
+            db, user_id=user.id, sha256="d" * 64, source_path="unused-d.pdf", **JOB_DEFAULTS
+        )
+        await db.commit()
+        job_id = job.id
+    async with sessionmaker() as db:
+        stale = await next_worker_generation(db)
+        assert await claim_next_job(db, 2, None, stale) == job_id
+
+    async def taken_over(db, settings, user_id, connection_id):
+        # The replacement requeues and claims the job while this run loads its upstream.
+        async with sessionmaker() as other:
+            fresh = await next_worker_generation(other)
+            assert await requeue_job(other, job_id) is True
+            assert await claim_next_job(other, 2, None, fresh) == job_id
+        return SimpleNamespace(snapshot="https://moved.test")
+
+    monkeypatch.setattr(runner, "load_connection", taken_over)
+    settings = Settings(
+        app_env="local",
+        secret_key=TEST_SECRET_KEY,
+        upload_dir=str(tmp_path / "uploads"),
+        workspaces_dir=str(tmp_path / "workspaces"),
+        figures_dir=str(tmp_path / "figures"),
+        kano_proxy_base_url=KANO_BASE,
+    )
+    await runner.run_job(sessionmaker, settings, job_id, asyncio.Semaphore(1), stale)
+    async with sessionmaker() as db:
+        row = await db.get(Job, job_id)
+    assert (row.status, row.connection_base_url) == ("running", JOB_DEFAULTS["connection_base_url"])
+    assert not (tmp_path / "uploads").exists()
