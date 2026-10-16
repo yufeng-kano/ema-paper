@@ -744,7 +744,15 @@ def _remove_tree(root: Path, relative: Path, message: str) -> Removal | None:
         safe_io.rename(root, root / relative, root / aside)
     except safe_io.UnsafeEntry as exc:
         raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
-    return Removal(git.commit_paths(root, git.USER_AUTHOR, message, [relative]), aside)
+    try:
+        commit = git.commit_paths(root, git.USER_AUTHOR, message, [relative])
+    except git.GitError as exc:
+        # Back where it was before the refusal: nothing waits aside for a sweep to take.
+        safe_io.rename(root, root / aside, root / relative)
+        raise ApiError(
+            409, "invalid_request", "The removal could not be recorded; nothing was changed"
+        ) from exc
+    return Removal(commit, aside)
 
 
 async def remove_path(settings: Settings, user_id: int, relative: Path) -> Removal | None:

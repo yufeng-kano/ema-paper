@@ -60,6 +60,10 @@ async def run_worker(stop: asyncio.Event) -> None:
     # the turns a dead worker held unfinished until the next restart (docs/jobs.md).
     orphans_pending = True
     orphans_tried_at = -ORPHAN_RETRY_SECONDS
+    # The users whose orphaned turn could not be stopped yet: no turn runs at all until
+    # the cleanup has gone through, and no parse of theirs, since a parse finishing
+    # writes their tree too (docs/jobs.md § Chat turns).
+    orphaned_users: set[int] = set()
     logger.info("worker started; %d render slots", render_count)
     prefer_turns = False
 
@@ -79,21 +83,25 @@ async def run_worker(stop: asyncio.Event) -> None:
                         )
                     if left:
                         logger.warning(
-                            "%d orphaned chat turn(s) wait for the sandbox runner; will retry",
-                            left,
+                            "orphaned chat turn(s) of %d user(s) wait for the sandbox runner; "
+                            "no turn runs until they are stopped",
+                            len(left),
                         )
-                    orphans_pending = left > 0
+                    orphaned_users = left
+                    orphans_pending = bool(left)
             job_id = None
             turn_id = None
             try:
                 async with sessionmaker() as db:
                     # Two queues, one worker: a parse never starves a conversation and the
                     # reverse (docs/jobs.md § Chat turns).
-                    if prefer_turns:
+                    if prefer_turns and not orphans_pending:
                         turn_id = await claim_next_turn(db, settings.max_chat_turns_per_user)
                     if turn_id is None:
-                        job_id = await claim_next_job(db, settings.max_jobs_per_user)
-                    if job_id is None and turn_id is None and not prefer_turns:
+                        job_id = await claim_next_job(
+                            db, settings.max_jobs_per_user, orphaned_users
+                        )
+                    if job_id is None and turn_id is None and not (prefer_turns or orphans_pending):
                         turn_id = await claim_next_turn(db, settings.max_chat_turns_per_user)
             except SQLAlchemyError:
                 # A database blip must not end the worker; wait and ask again.

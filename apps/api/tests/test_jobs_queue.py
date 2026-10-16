@@ -289,3 +289,17 @@ def test_a_discarded_jobs_figures_cannot_be_written_back(tmp_path) -> None:
 
     _locked_save_figures(state, "![fig](sightread://p1/0,0,500,500)", image, 1)
     assert not (tmp_path / "job").exists()
+
+
+async def test_a_job_of_a_user_with_an_orphaned_turn_is_not_claimed(sessionmaker) -> None:
+    async with sessionmaker() as db:
+        user = await _user(db)
+        job = await enqueue_job(
+            db, user_id=user.id, sha256="3" * 64, source_path="unused-3.pdf", **JOB_DEFAULTS
+        )
+        await db.commit()
+    async with sessionmaker() as db:
+        # A command of theirs the worker could not stop yet may still write their tree.
+        assert await claim_next_job(db, 2, {user.id}) is None
+    async with sessionmaker() as db:
+        assert await claim_next_job(db, 2, {user.id + 1000}) == job.id

@@ -35,7 +35,7 @@ from ..db.models import (
     utcnow,
 )
 from ..errors import ApiError
-from ..sandbox.client import SandboxClient
+from ..sandbox.client import EXEC_GRACE_SECONDS, SandboxClient
 from ..upstream.anthropic import CompletedMessage, StreamEvent, stream_messages
 from ..upstream.client import (
     Connection,
@@ -814,7 +814,13 @@ async def _settle_writer(ctx: TurnContext) -> None:
     writer = ctx.writer
     if writer is None or writer.done():
         return
-    grace = ctx.settings.chat_bash_timeout_seconds + ctx.settings.chat_writer_grace_seconds
+    # The command's own timeout, the time the runner client allows a reply past it, and
+    # the margin for the commit and reconciliation that follow (docs/chat.md § Tools).
+    grace = (
+        ctx.settings.chat_bash_timeout_seconds
+        + EXEC_GRACE_SECONDS
+        + ctx.settings.chat_writer_grace_seconds
+    )
     with contextlib.suppress(Exception):
         await asyncio.wait_for(asyncio.shield(writer), timeout=grace)
 

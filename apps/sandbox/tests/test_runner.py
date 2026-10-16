@@ -487,3 +487,29 @@ async def test_a_supervisor_killed_by_its_command_is_swept(tmp_path) -> None:
     assert outcome.exit_code is None and not outcome.timed_out
     assert swept == [True]
     assert not shell.alive
+
+
+async def test_an_evicted_shell_is_killed_inside_the_vm(tmp_path) -> None:
+    calls: list[bool] = []
+
+    class Recording(LocalBackend):
+        def on_timeout(self, user_id, token):
+            async def kill_inside(*, locked: bool = False) -> None:
+                calls.append(locked)
+
+            return kill_inside
+
+    settings = Settings(
+        app_env="local",
+        sandbox_token=TOKEN,
+        sandbox_backend="local",
+        sandbox_workspaces_dir=str(tmp_path / "ws"),
+        sandbox_workspaces_mount=str(tmp_path / "ws"),
+        sandbox_max_shells=1,
+    )
+    backend = Recording(settings)
+    await backend.exec(16, "a", "true", timeout=10)
+    await backend.exec(16, "b", "true", timeout=10)
+    # `a` made room for `b`: killed where it runs, under the lock exec holds.
+    assert calls == [True]
+    await backend.stop(16)

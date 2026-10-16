@@ -356,28 +356,30 @@ async def read_folders(db: DbSession, user_id: int):
 
 
 @router.get("")
-async def read_library(user: SessionUser, db: DbSession):
+async def read_library(request: Request, user: SessionUser):
     """The whole library in one read — navigation between folders is then local.
 
     Both collections come from one snapshot. Under READ COMMITTED the two statements would
     see two, and the client would hold either documents whose folder it has never heard of
     (drawn nowhere) or a folder that has already been deleted (drawn empty) until something
     refreshed. `REPEATABLE READ` is the cheap way to make one response internally
-    consistent; the SQLite test fallback has no such isolation level and one writer, so it
-    is asked for only where it exists.
+    consistent — asked for on a session opened here for this read alone, since an
+    isolation level applies to a connection's first transaction only and the request's
+    own session has already authenticated on its own; the SQLite test fallback has no such
+    isolation level and one writer, so it is asked for only where it exists (docs/api.md).
     """
-    if db.get_bind().dialect.name == "postgresql":
-        await db.connection(execution_options={"isolation_level": "REPEATABLE READ"})
-
-    folders = await read_folders(db, user.id)
-    documents = (
-        await db.execute(
-            select(Document, Job)
-            .join(Job, Job.id == Document.job_id)
-            .where(Document.user_id == user.id)
-            .order_by(Document.created_at.desc())
-        )
-    ).all()
+    async with request.app.state.sessionmaker() as reader:
+        if reader.get_bind().dialect.name == "postgresql":
+            await reader.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+        folders = await read_folders(reader, user.id)
+        documents = (
+            await reader.execute(
+                select(Document, Job)
+                .join(Job, Job.id == Document.job_id)
+                .where(Document.user_id == user.id)
+                .order_by(Document.created_at.desc())
+            )
+        ).all()
 
     return {
         "folders": [folder_payload(row) for row in folders],

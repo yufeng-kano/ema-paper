@@ -1301,12 +1301,12 @@ async def test_a_worker_starting_finishes_the_turns_a_dead_one_left(chatting) ->
     async with chatting.app.state.sessionmaker() as db:
         # The runner does not answer: the turn is left for the next pass, since the
         # command the dead worker had running may still be writing.
-        assert await fail_orphaned_turns(db, runner) == (0, 1)
+        assert await fail_orphaned_turns(db, runner) == (0, {chatting.user_id})
         await db.commit()
     async with chatting.app.state.sessionmaker() as db:
         assert (await db.get(ChatTurn, turn_id)).finished_at is None
         runner.away = False
-        assert await fail_orphaned_turns(db, runner) == (1, 0)
+        assert await fail_orphaned_turns(db, runner) == (1, set())
         turn = await db.get(ChatTurn, turn_id)
         session = (await db.get(Conversation, turn.conversation_id)).session
         assert runner.restarted == [(chatting.user_id, session)]
@@ -1318,7 +1318,7 @@ async def test_a_worker_starting_finishes_the_turns_a_dead_one_left(chatting) ->
             .all()
         )
         assert [event.event for event in events] == ["turn_error"]
-        assert await fail_orphaned_turns(db) == (0, 0)
+        assert await fail_orphaned_turns(db) == (0, set())
     # The conversation takes messages again.
     again = await chatting.post(
         f"/api/conversations/{conversation_id}/messages",
@@ -1830,3 +1830,78 @@ async def test_a_shell_move_is_reconciled_before_the_lock_is_released(
     tool_uses = [{"type": "tool_use", "id": "b1", "name": "bash", "input": {"command": "mv a b"}}]
     await chat_runner._run_tools(ctx, tool_uses, set())
     assert seen == [True]
+
+
+def test_prompt_facts_are_substituted_in_one_pass() -> None:
+    from sightread.agents.chat import render_system_prompt
+
+    rendered = render_system_prompt(
+        "Edit {document_path}; answer in {locale}.",
+        {"document_path": "files/{locale}/doc.md", "locale": "zh-TW"},
+    )
+    assert rendered == "Edit files/{locale}/doc.md; answer in zh-TW."
+
+
+async def test_a_message_or_selection_past_the_deployments_cap_is_refused(chatting) -> None:
+    settings = chatting.app.state.settings
+    settings.chat_message_max_chars = 10
+    settings.chat_selection_max_chars = 5
+    conversation_id = (
+        await chatting.post(
+            f"/api/library/documents/{chatting.document_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    long = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"text": "x" * 11},
+        headers=CSRF_HEADERS,
+    )
+    assert long.status_code == 400
+    wide = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"text": "hi", "selection": "y" * 6},
+        headers=CSRF_HEADERS,
+    )
+    assert wide.status_code == 400
+    fits = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"text": "hi", "selection": "yyy"},
+        headers=CSRF_HEADERS,
+    )
+    assert fits.status_code == 202, fits.text
+
+
+async def test_a_thread_for_a_document_deleted_underneath_is_a_404(chatting, monkeypatch) -> None:
+    from sightread.routes import chat as chat_routes
+
+    document_id = chatting.document_id
+    original = chat_routes.owned_document
+
+    async def deleted_underneath(db, user_id, did):
+        row = await original(db, user_id, did)
+        async with chatting.app.state.sessionmaker() as other:
+            await other.delete(await other.get(Document, did))
+            await other.commit()
+        return row
+
+    monkeypatch.setattr(chat_routes, "owned_document", deleted_underneath)
+    created = await chatting.post(
+        f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+    )
+    assert created.status_code == 404, created.text
+
+
+async def test_the_writer_is_waited_for_through_the_runner_clients_grace(monkeypatch) -> None:
+    monkeypatch.setattr(chat_runner, "EXEC_GRACE_SECONDS", 0.5)
+
+    async def slow_write() -> str:
+        await asyncio.sleep(0.3)
+        return "committed"
+
+    writer = asyncio.ensure_future(slow_write())
+    ctx = SimpleNamespace(
+        settings=SimpleNamespace(chat_bash_timeout_seconds=0, chat_writer_grace_seconds=0),
+        writer=writer,
+    )
+    await chat_runner._settle_writer(ctx)
+    assert writer.done() and writer.result() == "committed"

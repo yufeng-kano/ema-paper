@@ -139,7 +139,10 @@ class Backend:
             victim = idle[0]
             shell = sandbox.sessions.pop(victim)
             sandbox.session_used.pop(victim, None)
-            await shell.close()
+            # Killed inside the VM as `restart` does, under the lock `exec` holds: a
+            # supervisor merely closed from the host would linger as a live shell the
+            # sweep preserves, until the pid limit (docs/sandbox.md § Isolation).
+            await shell.kill(locked=True)
 
     async def restart(self, user_id: int, session: str) -> None:
         """Kill that shell — the command inside the VM first — and forget it; the next

@@ -1175,3 +1175,44 @@ def test_reconciliation_sweeps_what_a_delete_left_aside(tmp_path) -> None:
     assert documents.sweep_aside(root) == 1
     assert not aside.exists()
     assert documents.sweep_aside(root) == 0
+
+
+def test_a_failed_path_commit_leaves_the_index_clean(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "ws" / "16"
+    root.mkdir(parents=True)
+    git.ensure_repo(root)
+    safe_io.write_text(root, root / "files" / "a.txt", "a")
+
+    def refuse(*_args, **_kwargs):
+        raise git.GitError("disk full")
+
+    monkeypatch.setattr(git, "_commit_staged", refuse)
+    with pytest.raises(git.GitError):
+        git.commit_paths(root, "user", "save", [Path("files/a.txt")])
+    with pytest.raises(git.GitError):
+        git.commit_all(root, "agent:1", "bash: x")
+    assert git._git(root, "diff", "--cached", "--quiet", check=False).returncode == 0
+
+
+def test_a_removal_whose_revision_cannot_be_recorded_moves_back(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "ws" / "17"
+    root.mkdir(parents=True)
+    git.ensure_repo(root)
+    safe_io.write_text(root, root / "files" / "d" / "doc.md", "x")
+    (root / "files" / "d" / "source.pdf").write_bytes(b"%PDF")
+    git.commit_all(root, "user", "seed")
+    real = git.commit_paths
+
+    def refuse(root_, author, message, paths_):
+        if message.startswith("delete "):
+            raise git.GitError("disk full")
+        return real(root_, author, message, paths_)
+
+    monkeypatch.setattr(git, "commit_paths", refuse)
+    with pytest.raises(ApiError) as refused:
+        documents._remove_tree(root, Path("files/d"), "delete files/d")
+    assert refused.value.status_code == 409
+    assert (root / "files" / "d" / "source.pdf").read_bytes() == b"%PDF"
+    assert not [
+        name for name, _ in safe_io.list_dir(root, root) if name.startswith(safe_io.TEMP_PREFIX)
+    ]

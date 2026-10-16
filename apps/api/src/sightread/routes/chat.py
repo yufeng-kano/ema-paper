@@ -42,8 +42,6 @@ router = APIRouter(prefix="/api", tags=["chat"])
 
 SSE_MEDIA_TYPE = "text/event-stream"
 RETRY_AFTER_SECONDS = 15
-MESSAGE_MAX_CHARS = 32_000
-SELECTION_MAX_CHARS = 16_000
 TITLE_MAX_CHARS = 80
 
 
@@ -108,6 +106,17 @@ async def create_conversation(
     document = await owned_document(db, user.id, document_id)
     # The document's directory exists from here on: the thread is about its files.
     await materialize_document(db, settings, document)
+    # The user's row, the lock a delete takes before it decides, then the document
+    # again under it: a delete racing this ends with a clean 404 here, or with a thread
+    # the delete then takes along with the document — never a 500 (docs/api.md).
+    await db.execute(select(User.id).where(User.id == user.id).with_for_update())
+    still = (
+        await db.execute(
+            select(Document.id).where(Document.id == document.id, Document.user_id == user.id)
+        )
+    ).first()
+    if still is None:
+        raise ApiError(404, "invalid_request", "No such document")
     row = Conversation(
         user_id=user.id,
         document_id=document.id,
@@ -174,10 +183,12 @@ async def delete_conversation(conversation_id: int, user: SessionUser, db: DbSes
 
 
 class MessageCreate(BaseModel):
-    text: str = Field(min_length=1, max_length=MESSAGE_MAX_CHARS)
+    # The caps are the deployment's (`CHAT_MESSAGE_MAX_CHARS`, `CHAT_SELECTION_MAX_CHARS`),
+    # checked in the route where the settings are.
+    text: str = Field(min_length=1)
     # The passage the reader had selected when they sent — context, appended as its own
     # block of the user message (docs/chat.md § Prompt caching).
-    selection: str | None = Field(default=None, max_length=SELECTION_MAX_CHARS)
+    selection: str | None = None
     # The web app's locale: the language the turn answers in (docs/chat.md § System prompt).
     locale: str = Field(default="en", max_length=16, pattern=r"^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$")
 
@@ -234,6 +245,10 @@ async def post_message(
     db: DbSession,
     settings: AppSettings,
 ):
+    if len(body.text) > settings.chat_message_max_chars:
+        raise ApiError(400, "invalid_request", "The message is too long")
+    if body.selection is not None and len(body.selection) > settings.chat_selection_max_chars:
+        raise ApiError(400, "invalid_request", "The selection is too long")
     row = await owned_conversation(db, user.id, conversation_id)
     # Enforced where the decisions are made, under row locks held until this transaction
     # commits (PostgreSQL; the SQLite fallback runs one request at a time): the user's row
@@ -299,12 +314,15 @@ async def cancel_turn(conversation_id: int, user: SessionUser, db: DbSession) ->
     sets `finished_at`; a queued one is never claimed, so it is finished here and now."""
     row = await owned_conversation(db, user.id, conversation_id)
     await db.execute(select(Conversation.id).where(Conversation.id == row.id).with_for_update())
+    # Locked, and still queued once held: a worker claiming the turn at this moment
+    # (FOR UPDATE SKIP LOCKED) either took it already — then it is a running
+    # cancellation below, wound down by the worker — or skips it (docs/chat.md).
     queued = (
         (
             await db.execute(
-                select(ChatTurn.id).where(
-                    ChatTurn.conversation_id == row.id, ChatTurn.status == "queued"
-                )
+                select(ChatTurn.id)
+                .where(ChatTurn.conversation_id == row.id, ChatTurn.status == "queued")
+                .with_for_update()
             )
         )
         .scalars()

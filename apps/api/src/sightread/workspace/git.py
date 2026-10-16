@@ -121,9 +121,14 @@ def _commit_staged(root: Path, author: str, message: str) -> str | None:
 
 def commit_all(root: Path, author: str, message: str) -> str | None:
     """Stage everything and commit; None when the tree was clean. For the shell, whose
-    changes nobody can name in advance — under the shell lock, so the dirt is all its."""
-    _git(root, "add", "-A")
-    return _commit_staged(root, author, message)
+    changes nobody can name in advance — under the shell lock, so the dirt is all its.
+    A failure anywhere leaves the index reset, never half-staged."""
+    try:
+        _git(root, "add", "-A")
+        return _commit_staged(root, author, message)
+    except GitError:
+        reset_index(root)
+        raise
 
 
 def commit_paths(root: Path, author: str, message: str, paths: list[Path]) -> str | None:
@@ -134,12 +139,18 @@ def commit_paths(root: Path, author: str, message: str, paths: list[Path]) -> st
         return None
     # One `add` per path: a pathspec that matches nothing (a moved-away directory that
     # was never tracked) is skipped; any other failure to stage is an error, never a
-    # write reported done without its revision (docs/workspace.md § Revisions).
-    for path in paths:
-        proc = _git(root, "add", "-A", "--", str(path), check=False)
-        if proc.returncode != 0 and "did not match any files" not in proc.stderr:
-            raise GitError(f"git add failed for {path}: {proc.stderr.strip()}")
-    return _commit_staged(root, author, message)
+    # write reported done without its revision (docs/workspace.md § Revisions). On any
+    # failure the index is reset, so what was staged does not ride into the next commit,
+    # which commits the whole index.
+    try:
+        for path in paths:
+            proc = _git(root, "add", "-A", "--", str(path), check=False)
+            if proc.returncode != 0 and "did not match any files" not in proc.stderr:
+                raise GitError(f"git add failed for {path}: {proc.stderr.strip()}")
+        return _commit_staged(root, author, message)
+    except GitError:
+        reset_index(root)
+        raise
 
 
 def reset_index(root: Path) -> None:

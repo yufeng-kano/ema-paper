@@ -6,6 +6,8 @@ headers the request needs, and which models can run it. The loop is `jobs/chat_r
 
 from __future__ import annotations
 
+import re
+
 from .parse import BBOX_FORMAT_YXYX
 
 # Bumped when the prompt or the tool contract changes what a conversation does. Chat has
@@ -129,11 +131,13 @@ PROMPT_TOKENS: tuple[str, ...] = (
 )
 
 
+_TOKEN_RE = re.compile("|".join(re.escape(token) for token in PROMPT_TOKENS))
+
+
 def render_system_prompt(template: str, facts: dict[str, str]) -> str:
-    rendered = template
-    for token in PROMPT_TOKENS:
-        rendered = rendered.replace(token, facts.get(token.strip("{}"), ""))
-    return rendered
+    """One pass over the template: a fact's value is never read as a token in turn (a
+    document named `{locale}` stays that document's path)."""
+    return _TOKEN_RE.sub(lambda match: facts.get(match.group(0).strip("{}"), ""), template)
 
 
 BBOX_FORMAT = BBOX_FORMAT_YXYX

@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 import uuid
 
-from sqlalchemy import delete, func, select, text, update
+from sqlalchemy import bindparam, delete, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..agents import get_agent
@@ -26,6 +26,7 @@ CLAIM_SQL = text(
     WHERE id = (
       SELECT j.id FROM jobs j
       WHERE j.status = 'queued'
+        AND j.user_id NOT IN :excluded_users
         AND (
           SELECT count(*) FROM jobs running
           WHERE running.user_id = j.user_id AND running.status = 'running'
@@ -35,7 +36,7 @@ CLAIM_SQL = text(
     )
     RETURNING id
     """
-)
+).bindparams(bindparam("excluded_users", expanding=True))
 
 # SQLite has neither SKIP LOCKED nor row locks. The fallback keeps the whole test suite
 # runnable with no services; the guarded UPDATE still makes a double claim impossible.
@@ -43,13 +44,14 @@ CLAIM_SQL_SQLITE_SELECT = text(
     """
     SELECT j.id FROM jobs j
     WHERE j.status = 'queued'
+      AND j.user_id NOT IN :excluded_users
       AND (
         SELECT count(*) FROM jobs running
         WHERE running.user_id = j.user_id AND running.status = 'running'
       ) < :max_jobs_per_user
     ORDER BY j.created_at LIMIT 1
     """
-)
+).bindparams(bindparam("excluded_users", expanding=True))
 
 _PAGES_SPEC_RE = re.compile(r"^\d+(-\d+)?(,\d+(-\d+)?)*$")
 
@@ -228,18 +230,23 @@ async def enqueue_job(
     return job
 
 
-async def claim_next_job(db: AsyncSession, max_jobs_per_user: int) -> uuid.UUID | None:
-    """Claim the oldest queued job whose user is under the running cap, or None."""
+async def claim_next_job(
+    db: AsyncSession, max_jobs_per_user: int, excluded_users: set[int] | None = None
+) -> uuid.UUID | None:
+    """Claim the oldest queued job whose user is under the running cap, or None. A user
+    in `excluded_users` — one whose orphaned turn the worker could not stop yet — gets
+    no parse run, since its finish writes that user's tree (docs/jobs.md § Chat turns)."""
+    # No user id is 0: the sentinel keeps the clause well-formed when nobody is excluded.
+    params = {
+        "max_jobs_per_user": max_jobs_per_user,
+        "excluded_users": sorted(excluded_users or ()) or [0],
+    }
     if db.get_bind().dialect.name == "postgresql":
-        claimed = (
-            await db.execute(CLAIM_SQL, {"max_jobs_per_user": max_jobs_per_user})
-        ).scalar_one_or_none()
+        claimed = (await db.execute(CLAIM_SQL, params)).scalar_one_or_none()
         await db.commit()
         return claimed
 
-    candidate = (
-        await db.execute(CLAIM_SQL_SQLITE_SELECT, {"max_jobs_per_user": max_jobs_per_user})
-    ).scalar_one_or_none()
+    candidate = (await db.execute(CLAIM_SQL_SQLITE_SELECT, params)).scalar_one_or_none()
     if candidate is None:
         return None
     job_id = uuid.UUID(str(candidate))
@@ -362,14 +369,15 @@ async def claim_next_turn(db: AsyncSession, max_turns_per_user: int) -> uuid.UUI
 
 async def fail_orphaned_turns(
     db: AsyncSession, sandbox: SandboxClient | None = None
-) -> tuple[int, int]:
+) -> tuple[int, set[int]]:
     """Finish every turn a worker that died left behind: `running`, or cancelled and not
     yet wound down. Run when a worker starts, and again until it goes through — the
     deployment has one worker, so a turn nobody is driving is exactly one a dead worker
     held (docs/jobs.md § Chat turns). Each turn's shell is restarted on the runner first,
     which kills the command the dead worker may have left running inside the VM; a
     runner that does not answer leaves that turn for the next pass rather than finishing
-    it over a command that may still write. Returns (finished, left for later)."""
+    it over a command that may still write. Returns (finished, the users whose turns are
+    left for later)."""
     orphans = (
         await db.execute(
             select(ChatTurn.id, ChatTurn.user_id, Conversation.session)
@@ -380,13 +388,14 @@ async def fail_orphaned_turns(
             )
         )
     ).all()
-    finished = left = 0
+    finished = 0
+    left: set[int] = set()
     for turn_id, user_id, session in orphans:
         if sandbox is not None and sandbox.configured:
             try:
                 await sandbox.restart(user_id, session)
             except SandboxUnavailable:
-                left += 1
+                left.add(user_id)
                 continue
         await fail_turn(db, turn_id, "worker restarted")
         finished += 1

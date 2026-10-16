@@ -81,6 +81,8 @@ class Settings(BaseSettings):
     chat_turn_timeout_seconds: int = 900
     chat_stream_timeout_seconds: int = 900
     chat_tool_result_max_chars: int = 20_000
+    chat_message_max_chars: int = 32_000
+    chat_selection_max_chars: int = 16_000
     chat_bash_timeout_seconds: int = 120
     chat_writer_grace_seconds: int = 60
     revert_max_bytes: int = 64 * 1024 * 1024
