@@ -13,7 +13,7 @@ Request shape, fixed by the runner:
 | `model` | the agent's saved model |
 | `max_tokens` | `CHAT_MAX_OUTPUT_TOKENS` (64 000) |
 | `system` | the agent's system prompt, then the user's prompt preset when one is selected, as two text blocks; the last block carries `cache_control: {type: ephemeral, ttl: 1h}` |
-| `tools` | `bash_20250124`, `text_editor_20250728` (`str_replace_based_edit_tool`), `view_page`, `view_figure` — always all four, always in this order (a changed tool list invalidates the prompt cache and earlier thinking blocks) |
+| `tools` | `bash_20250124`, `text_editor_20250728` (`str_replace_based_edit_tool`), `view_page`, `view_figure` — always all four, always in this order (a changed tool list invalidates the prompt cache and earlier thinking blocks). The two custom tools are `strict`, so their schemas hold only what a strict schema accepts — no numeric bounds (`minimum`), no array lengths (`minItems`/`maxItems`), which the upstream refuses with a 400; the bounds are in the descriptions, and the tools check the page and the box themselves |
 | `thinking` | `{type: adaptive, display: updates}` with beta `thinking-display-updates-2026-08-18`, so the model's notes between tool calls arrive as short thinking summaries the UI shows |
 | `output_config.effort` | the agent's `effort` setting (`low` … `max`, default `medium`) |
 | `fallbacks` | `"default"` with beta `server-side-fallback-2026-07-01`: a safety classifier refusal retries on the model Anthropic recommends instead of failing the turn. An answer from another model moves the conversation to it (§ History is append-only) |

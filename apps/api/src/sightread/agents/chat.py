@@ -16,7 +16,8 @@ from .parse import BBOX_FORMAT_YXYX
 PIPELINE_VERSION = 1
 
 # Anthropic-defined tools carry no schema of their own (docs/chat.md § Tools). The order
-# is part of the cache prefix and never changes.
+# is part of the cache prefix and never changes. The custom tools are strict: their schemas
+# hold no numeric bounds or array lengths, which the upstream refuses; the tools check them.
 BASH_TOOL = {"type": "bash_20250124", "name": "bash"}
 EDITOR_TOOL = {"type": "text_editor_20250728", "name": "str_replace_based_edit_tool"}
 VIEW_PAGE_TOOL = {
@@ -28,7 +29,7 @@ VIEW_PAGE_TOOL = {
     ),
     "input_schema": {
         "type": "object",
-        "properties": {"page": {"type": "integer", "minimum": 1, "description": "1-based page"}},
+        "properties": {"page": {"type": "integer", "description": "1-based page"}},
         "required": ["page"],
         "additionalProperties": False,
     },
@@ -43,12 +44,11 @@ VIEW_FIGURE_TOOL = {
     "input_schema": {
         "type": "object",
         "properties": {
-            "page": {"type": "integer", "minimum": 1},
+            "page": {"type": "integer", "description": "1-based page"},
             "bbox": {
                 "type": "array",
                 "items": {"type": "integer"},
-                "minItems": 4,
-                "maxItems": 4,
+                "description": "Exactly four integers: [y1, x1, y2, x2]",
             },
         },
         "required": ["page", "bbox"],

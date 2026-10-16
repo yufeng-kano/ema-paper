@@ -166,6 +166,38 @@ async def _run_queued_turn(client: AsyncClient) -> None:
     )
 
 
+def test_strict_tool_schemas_hold_only_what_strict_accepts() -> None:
+    """A strict schema with a numeric bound or an array length is a 400 on every request
+    (docs/chat.md § Tools): the tools check those themselves."""
+    from sightread.agents import chat as chat_agent
+
+    refused = {
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+    }
+
+    def walk(node: object, where: str) -> list[str]:
+        if isinstance(node, list):
+            return [hit for i, item in enumerate(node) for hit in walk(item, f"{where}[{i}]")]
+        if not isinstance(node, dict):
+            return []
+        hits = [f"{where}.{key}" for key in node if key in refused]
+        if node.get("type") == "object" and node.get("additionalProperties") is not False:
+            hits.append(f"{where}: additionalProperties must be false")
+        return hits + [hit for key, value in node.items() for hit in walk(value, f"{where}.{key}")]
+
+    strict = [tool for tool in chat_agent.TOOLS if tool.get("strict")]
+    assert strict
+    assert [hit for tool in strict for hit in walk(tool["input_schema"], tool["name"])] == []
+
+
 async def test_chat_settings_refuse_connections_and_validate_effort(chatting) -> None:
     refused = await chatting.put(
         "/api/agents/chat/settings", json={"connection_id": 1}, headers=CSRF_HEADERS
