@@ -314,3 +314,12 @@ async def test_a_stop_reason_without_message_stop_is_an_early_close(key) -> None
     with pytest.raises(UpstreamError) as early:
         await collect(key, body)
     assert early.value.transient
+
+
+@respx.mock
+async def test_a_silent_stream_is_not_retried(key) -> None:
+    body = {"model": "m", "messages": []}
+    respx.post(MESSAGES_URL).mock(side_effect=httpx.ReadTimeout("silent"))
+    with pytest.raises(UpstreamError) as silent:
+        await collect(key, body)
+    assert not silent.value.transient

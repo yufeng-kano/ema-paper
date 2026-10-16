@@ -110,6 +110,10 @@ class Backend:
             shell = sandbox.sessions.get(session)
             if shell is None:
                 await self._make_room(sandbox)
+                if sandbox.unstoppable:
+                    # An eviction that could end its command neither inside the VM nor
+                    # by removing the VM: no new shell beside what still runs there.
+                    raise RuntimeError("the sandbox VM could not be stopped; no command runs there")
                 argv, cwd = self.shell_argv(user_id)
                 shell = ShellSession(
                     argv,
@@ -446,10 +450,10 @@ class DockerBackend(Backend):
         name = self.container(sandbox.user_id)
         # A stopped container of a previous run is removed rather than restarted: the
         # image may have moved on, and nothing of value lives outside /workspace.
-        await _docker("rm", "-f", name, timeout=60)
+        settings = self.settings
+        await _docker("rm", "-f", name, timeout=settings.sandbox_docker_timeout_seconds)
         workspace = self.workspace(sandbox.user_id)
         await asyncio.to_thread(lambda: (workspace / CACHE_DIR).mkdir(parents=True, exist_ok=True))
-        settings = self.settings
         host_workspace = self.host_workspace(sandbox.user_id)
         args = [
             "run",

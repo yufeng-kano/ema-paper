@@ -334,6 +334,10 @@ async def stream_messages(
                     # is never stored or shown (docs/chat.md).
                     label = kind_name if kind_name in KNOWN_ERROR_TYPES else "error"
                     raise UpstreamError(f"The upstream reported an error ({label})")
+    except httpx.ReadTimeout as exc:
+        # Silence past the stream timeout is the turn's end, not a retry: the attempt
+        # may have generated — and billed — tokens that never arrived (docs/chat.md).
+        raise UpstreamError("The upstream went silent for too long", transient=False) from exc
     except httpx.HTTPError as exc:
         raise UpstreamError("The upstream was unreachable", transient=True) from exc
     except ResponseTooLarge as exc:

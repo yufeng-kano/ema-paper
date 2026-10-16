@@ -23,7 +23,7 @@ from pathlib import Path
 from fastapi import APIRouter, Request, Response, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import ColumnElement, delete, select
+from sqlalchemy import ColumnElement, delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.datastructures import FormData, UploadFile
@@ -783,6 +783,15 @@ async def file_job(body: DocumentFromJob, user: SessionUser, db: DbSession, sett
 
     async def taken() -> set[str]:
         await lock_job(db, job_id)
+        # A parse still running keeps its upload for this row: the worker, which reads
+        # its recipients under this same row lock, either sees the row or finds the
+        # job marked for retention and leaves the upload for `inherit_original` to
+        # take — never a row filed between its look and its commit with nothing kept.
+        await db.execute(
+            update(Job)
+            .where(Job.id == job_id, Job.status.in_(("queued", "running")))
+            .values(retain_source=True)
+        )
         return await sibling_names(db, user_id, folder_id)
 
     # One backup hold from before the row commits until its original is in place, as

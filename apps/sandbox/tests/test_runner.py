@@ -784,3 +784,52 @@ async def test_the_vm_start_waits_as_long_as_configured(tmp_path, monkeypatch) -
     backend = backends.DockerBackend(settings)
     await backend.ensure_running(backend._user(61))
     assert timeouts == [333]
+
+
+async def test_an_eviction_that_left_the_vm_unstoppable_starts_no_shell(tmp_path) -> None:
+    class Stuck(LocalBackend):
+        async def _make_room(self, sandbox):
+            evicting = len(sandbox.sessions) >= self.settings.sandbox_max_shells
+            await super()._make_room(sandbox)
+            if evicting:
+                sandbox.unstoppable = True  # the evicted shell's command could not be ended
+
+    settings = Settings(
+        app_env="local",
+        sandbox_token=TOKEN,
+        sandbox_backend="local",
+        sandbox_max_shells=1,
+        sandbox_workspaces_dir=str(tmp_path / "ws"),
+        sandbox_workspaces_mount=str(tmp_path / "ws"),
+    )
+    backend = Stuck(settings)
+    await backend.exec(71, "a", "true", timeout=10)
+    with pytest.raises(RuntimeError):
+        await backend.exec(71, "b", "true", timeout=10)
+    assert "b" not in backend._user(71).sessions
+
+
+async def test_a_stale_vm_is_removed_within_the_configured_timeout(tmp_path, monkeypatch) -> None:
+    from sightread_sandbox import backends
+
+    timeouts: dict[str, float] = {}
+
+    async def fake_docker(*args, timeout=120.0):
+        timeouts[args[0]] = timeout
+        if args[0] == "inspect":
+            return 1, "Error: No such object"
+        return 0, ""
+
+    monkeypatch.setattr(backends, "_docker", fake_docker)
+    settings = Settings(
+        app_env="local",
+        sandbox_token=TOKEN,
+        sandbox_backend="docker",
+        sandbox_runtime="runc",
+        sandbox_docker_timeout_seconds=444,
+        sandbox_workspaces_dir=str(tmp_path / "ws"),
+        sandbox_workspaces_mount=str(tmp_path / "ws"),
+    )
+    backend = backends.DockerBackend(settings)
+    await backend.ensure_running(backend._user(81))
+    assert timeouts["rm"] == 444

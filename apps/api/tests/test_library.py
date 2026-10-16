@@ -808,3 +808,21 @@ async def test_a_delete_whose_commit_landed_despite_the_error_is_finished(
     assert not (root / "files" / "tiny (2).png").exists()
     assert not [name for name in os.listdir(root) if name.startswith(".sr-tmp-")]
     assert original_of(root, uploaded["id"]) is None
+
+
+async def test_filing_a_running_parse_marks_it_for_retention(
+    library, sessionmaker, documents
+) -> None:
+    uploaded = (await _upload(library, documents)).json()
+    async with sessionmaker() as db:
+        job = await db.get(Job, uuid.UUID(uploaded["job_id"]))
+        assert job.status == "queued"
+        job.retain_source = False
+        await db.commit()
+    filed = await _file_job(library, uploaded["job_id"])
+    assert filed.status_code == 201, filed.text
+    async with sessionmaker() as db:
+        job = await db.get(Job, uuid.UUID(uploaded["job_id"]))
+        # Under the job's row lock, before the row was inserted: a worker finishing the
+        # parse at that moment leaves the upload for the new row.
+        assert job.retain_source is True
