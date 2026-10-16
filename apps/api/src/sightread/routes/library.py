@@ -356,30 +356,32 @@ async def read_folders(db: DbSession, user_id: int):
 
 
 @router.get("")
-async def read_library(request: Request, user: SessionUser):
+async def read_library(user: SessionUser, db: DbSession):
     """The whole library in one read — navigation between folders is then local.
 
     Both collections come from one snapshot. Under READ COMMITTED the two statements would
     see two, and the client would hold either documents whose folder it has never heard of
     (drawn nowhere) or a folder that has already been deleted (drawn empty) until something
     refreshed. `REPEATABLE READ` is the cheap way to make one response internally
-    consistent — asked for on a session opened here for this read alone, since an
-    isolation level applies to a connection's first transaction only and the request's
-    own session has already authenticated on its own; the SQLite test fallback has no such
-    isolation level and one writer, so it is asked for only where it exists (docs/api.md).
+    consistent. An isolation level applies to a transaction's first statement, and the
+    request's session has already spent one on authentication, so that transaction is
+    ended first and the snapshot asked for on the next one — on the same session, so a
+    request holds one connection, never two (docs/api.md). The SQLite test fallback has no
+    such isolation level and one writer, so it is asked for only where it exists.
     """
-    async with request.app.state.sessionmaker() as reader:
-        if reader.get_bind().dialect.name == "postgresql":
-            await reader.connection(execution_options={"isolation_level": "REPEATABLE READ"})
-        folders = await read_folders(reader, user.id)
-        documents = (
-            await reader.execute(
-                select(Document, Job)
-                .join(Job, Job.id == Document.job_id)
-                .where(Document.user_id == user.id)
-                .order_by(Document.created_at.desc())
-            )
-        ).all()
+    user_id = user.id  # read before the rollback expires the row
+    await db.rollback()
+    if db.get_bind().dialect.name == "postgresql":
+        await db.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+    folders = await read_folders(db, user_id)
+    documents = (
+        await db.execute(
+            select(Document, Job)
+            .join(Job, Job.id == Document.job_id)
+            .where(Document.user_id == user_id)
+            .order_by(Document.created_at.desc())
+        )
+    ).all()
 
     return {
         "folders": [folder_payload(row) for row in folders],
@@ -508,20 +510,32 @@ async def delete_folder(
             user.id,
             select(Document.id).where(Document.user_id == user.id, Document.folder_id.in_(doomed)),
         )
+        document_ids = list(
+            (
+                await db.execute(
+                    select(Document.id).where(
+                        Document.user_id == user.id, Document.folder_id.in_(doomed)
+                    )
+                )
+            ).scalars()
+        )
         await db.execute(
             delete(Document).where(Document.user_id == user.id, Document.folder_id.in_(doomed))
         )
         await db.execute(delete(Folder).where(Folder.user_id == user.id, Folder.id.in_(doomed)))
-        await remove_then_commit(db, settings, user.id, relative)
+        await remove_then_commit(db, settings, user.id, relative, document_ids)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-async def remove_then_commit(db: DbSession, settings, user_id: int, relative) -> None:
+async def remove_then_commit(
+    db: DbSession, settings, user_id: int, relative, document_ids: list[int]
+) -> None:
     """The rows are deleted in the transaction; the directory goes before it commits. A
     removal the tree refuses keeps the rows, and the next read restores what is missing;
     a commit that fails after the removal keeps the rows too, and the files come back
     from the removal's own revision, so the edits they held are not lost to a fresh copy
-    (docs/workspace.md § Revisions)."""
+    (docs/workspace.md § Revisions). The originals kept outside the mount go last, once
+    the rows are gone for good."""
     try:
         removal = await workspace_documents.remove_path(settings, user_id, relative)
     except BaseException:
@@ -541,6 +555,10 @@ async def remove_then_commit(db: DbSession, settings, user_id: int, relative) ->
             await workspace_documents.discard_removed(settings, user_id, removal)
         except Exception:  # noqa: BLE001 - the next reconciliation sweeps it
             logger.exception("could not discard %s set aside by a delete", relative)
+    try:
+        await workspace_documents.discard_originals(settings, user_id, document_ids)
+    except Exception:  # noqa: BLE001 - an original with no row is dead weight, not a leak
+        logger.exception("could not discard the originals of %s", relative)
 
 
 # --- documents ----------------------------------------------------------------------------
@@ -791,7 +809,7 @@ async def delete_document(
         await refuse_while_answering(db, user.id, select(Document.id).where(Document.id == row.id))
         await db.delete(row)
         await db.flush()
-        await remove_then_commit(db, settings, user.id, relative)
+        await remove_then_commit(db, settings, user.id, relative, [row.id])
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

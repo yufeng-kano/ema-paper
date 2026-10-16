@@ -189,14 +189,16 @@ async def test_an_underscore_flood_is_bounded_too(client) -> None:
 
 
 async def test_a_timeout_runs_the_backends_kill_before_closing_the_shell() -> None:
-    from sightread_sandbox.shell import ShellSession
+    from sightread_sandbox.shell import GROUP_CLEANUP, ShellSession, supervisor
 
     killed = []
 
-    async def kill_inside(*, locked: bool = False) -> None:
-        killed.append(True)
+    async def kill_inside(*, pid: int, locked: bool = False) -> None:
+        killed.append(pid == shell.pid)
 
-    shell = ShellSession(["bash", "--norc", "--noprofile"], max_bytes=1000, on_timeout=kill_inside)
+    shell = ShellSession(
+        ["sh", "-c", supervisor(GROUP_CLEANUP)], max_bytes=1000, on_timeout=kill_inside
+    )
     outcome = await shell.run("sleep 30", timeout=0.2)
     assert outcome.timed_out is True
     assert killed == [True]
@@ -334,14 +336,16 @@ async def test_a_restart_ends_the_command_the_shell_is_running(tmp_path) -> None
 async def test_a_dropped_request_kills_its_command_where_it_runs() -> None:
     import asyncio
 
-    from sightread_sandbox.shell import ShellSession
+    from sightread_sandbox.shell import GROUP_CLEANUP, ShellSession, supervisor
 
     killed = []
 
-    async def kill_inside(*, locked: bool = False) -> None:
+    async def kill_inside(*, pid: int, locked: bool = False) -> None:
         killed.append(True)
 
-    shell = ShellSession(["bash", "--norc", "--noprofile"], max_bytes=1000, on_timeout=kill_inside)
+    shell = ShellSession(
+        ["sh", "-c", supervisor(GROUP_CLEANUP)], max_bytes=1000, on_timeout=kill_inside
+    )
     running = asyncio.create_task(shell.run("sleep 30", timeout=60))
     await asyncio.sleep(0.3)
     running.cancel()
@@ -439,8 +443,8 @@ async def test_a_restart_whose_in_vm_kill_fails_does_not_deadlock(tmp_path) -> N
     calls: list[bool] = []
 
     class Stubborn(LocalBackend):
-        def on_timeout(self, user_id, token):
-            async def kill_inside(*, locked: bool = False) -> None:
+        def on_timeout(self, user_id):
+            async def kill_inside(*, pid: int, locked: bool = False) -> None:
                 calls.append(locked)
                 sandbox = self._user(user_id)
                 # The fallback stop, under the lock the caller already holds.
@@ -477,12 +481,14 @@ async def test_a_supervisor_killed_by_its_command_is_swept(tmp_path) -> None:
 
     swept: list[bool] = []
 
-    async def kill_inside(*, locked: bool = False) -> None:
-        swept.append(True)
+    async def kill_inside(*, pid: int, locked: bool = False) -> None:
+        swept.append(pid == reported)
 
     shell = ShellSession(
         ["sh", "-c", supervisor(":")], cwd=str(tmp_path), max_bytes=1000, on_timeout=kill_inside
     )
+    await shell.start()
+    reported = shell.pid
     outcome = await shell.run("kill -KILL $PPID; sleep 1", timeout=10)
     assert outcome.exit_code is None and not outcome.timed_out
     assert swept == [True]
@@ -493,8 +499,8 @@ async def test_an_evicted_shell_is_killed_inside_the_vm(tmp_path) -> None:
     calls: list[bool] = []
 
     class Recording(LocalBackend):
-        def on_timeout(self, user_id, token):
-            async def kill_inside(*, locked: bool = False) -> None:
+        def on_timeout(self, user_id):
+            async def kill_inside(*, pid: int, locked: bool = False) -> None:
                 calls.append(locked)
 
             return kill_inside
@@ -513,3 +519,66 @@ async def test_an_evicted_shell_is_killed_inside_the_vm(tmp_path) -> None:
     # `a` made room for `b`: killed where it runs, under the lock exec holds.
     assert calls == [True]
     await backend.stop(16)
+
+
+async def test_the_supervisor_reports_its_pid_before_any_command(tmp_path) -> None:
+    from sightread_sandbox.shell import ShellSession, supervisor
+
+    # The cleanup sees the keep line the runner sent with the command, never a file.
+    shell = ShellSession(
+        ["sh", "-c", supervisor('printf "KEEP=[%s]\\n" "$__sr_keep_in"')],
+        cwd=str(tmp_path),
+        max_bytes=1000,
+    )
+    await shell.start()
+    assert shell.pid is not None
+    outcome = await shell.run("echo $PPID", timeout=10, keep=[shell.pid, 4242])
+    # The command's parent is the supervisor, whose pid is the one it reported.
+    assert outcome.output.splitlines()[0] == str(shell.pid)
+    assert f"KEEP=[{shell.pid} 4242]" in outcome.output
+    assert outcome.exit_code == 0
+    # No pid line, no shell: a plain bash is not a supervisor.
+    plain = ShellSession(["bash", "--norc", "--noprofile"], max_bytes=1000, start_timeout=1)
+    with pytest.raises(RuntimeError):
+        await plain.start()
+    assert not plain.alive and plain.pid is None
+    await shell.close()
+
+
+async def test_the_runner_names_the_other_live_shells_to_each_cleanup(tmp_path) -> None:
+    from sightread_sandbox.shell import supervisor
+
+    class Recording(LocalBackend):
+        def shell_argv(self, user_id):
+            return ["sh", "-c", supervisor('printf "KEEP=[%s]\\n" "$__sr_keep_in"')], str(
+                self.workspace(user_id)
+            )
+
+    settings = Settings(
+        app_env="local",
+        sandbox_token=TOKEN,
+        sandbox_backend="local",
+        sandbox_workspaces_dir=str(tmp_path / "ws"),
+        sandbox_workspaces_mount=str(tmp_path / "ws"),
+    )
+    backend = Recording(settings)
+    first = await backend.exec(21, "a", "true", timeout=10)
+    pid_a = backend._user(21).sessions["a"].pid
+    assert f"KEEP=[{pid_a}]" in first.output
+    second = await backend.exec(21, "b", "true", timeout=10)
+    pid_b = backend._user(21).sessions["b"].pid
+    assert pid_a != pid_b
+    kept = second.output.split("KEEP=[")[1].split("]")[0].split()
+    assert sorted(kept) == sorted([str(pid_a), str(pid_b)])
+    await backend.restart(21, "a")
+    await backend.restart(21, "b")
+
+
+def test_kill_tree_refuses_anything_but_a_pid() -> None:
+    import subprocess
+
+    from sightread_sandbox.backends import KILL_TREE
+
+    for bad in ("", "abc", "shell.pid", "12 13"):
+        done = subprocess.run(["sh", "-c", KILL_TREE, "sh", bad, ""], capture_output=True)  # noqa: S603, S607
+        assert done.returncode == 3, bad

@@ -592,6 +592,7 @@ async def _retain_source(
                     root,
                     relative,
                     source,
+                    document_id=row.id,
                     kind=job.kind,
                     copy=index < len(documents) - 1,
                 )

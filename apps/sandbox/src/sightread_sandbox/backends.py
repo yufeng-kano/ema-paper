@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import secrets
 import shutil
 import stat
 import time
@@ -74,14 +73,14 @@ class Backend:
         fails is not "gone": it is unknown, and unknown keeps a closed sandbox closed."""
         return not await self.is_running(user_id)
 
-    def shell_argv(self, user_id: int, token: str) -> tuple[list[str], str | None]:
-        """The shell's argv and working directory; `token` names this shell to the VM."""
+    def shell_argv(self, user_id: int) -> tuple[list[str], str | None]:
+        """The shell's argv and working directory."""
         raise NotImplementedError
 
-    def on_timeout(self, user_id: int, token: str) -> Callable[..., Awaitable[None]] | None:
+    def on_timeout(self, user_id: int) -> Callable[..., Awaitable[None]] | None:
         """What kills a timed-out command where it runs; None when closing the host-side
-        process is enough (the local backend). Called with `locked=True` when the caller
-        already holds the sandbox lock."""
+        process is enough (the local backend). Called with the supervisor's `pid` as the
+        VM numbers it, and `locked=True` when the caller already holds the sandbox lock."""
         return None
 
     def cleanup(self) -> str:
@@ -108,19 +107,27 @@ class Backend:
             shell = sandbox.sessions.get(session)
             if shell is None:
                 await self._make_room(sandbox)
-                token = secrets.token_hex(8)
-                argv, cwd = self.shell_argv(user_id, token)
+                argv, cwd = self.shell_argv(user_id)
                 shell = ShellSession(
                     argv,
                     cwd=cwd,
                     max_bytes=self.settings.sandbox_output_max_bytes,
-                    on_timeout=self.on_timeout(user_id, token),
+                    on_timeout=self.on_timeout(user_id),
+                    start_timeout=self.settings.sandbox_docker_timeout_seconds,
                 )
                 sandbox.sessions[session] = shell
+            if not shell.alive:
+                # Under the lock, so the pid it reports is in the table before any other
+                # shell's cleanup is told what to keep (docs/sandbox.md § The runner).
+                await shell.start()
+            # The user's live shells, by the pids they reported: what the cleanup after
+            # this command must not end. The API runs one command per user at a time, so
+            # a shell this list misses is one opened while nothing was running.
+            keep = [other.pid for other in sandbox.sessions.values() if other.pid is not None]
             sandbox.session_used[session] = time.monotonic()
         sandbox.last_used = time.monotonic()
         sandbox.last_used_at = _now()
-        outcome = await shell.run(command, timeout=timeout)
+        outcome = await shell.run(command, timeout=timeout, keep=keep)
         sandbox.last_used = time.monotonic()
         sandbox.session_used[session] = sandbox.last_used
         return outcome
@@ -266,20 +273,17 @@ REAPER = (
 )
 
 
-def _pid_file(token: str) -> str:
-    return f"/tmp/.sr-shell-{token}.pid"  # noqa: S108 - the VM's tmpfs, not the host's
-
-
-# Kills the shell named by the pid file and everything under it, children first, inside
-# the VM — `pgrep` from procps, which the image installs (docs/sandbox.md § The runner).
-# Kill every process in the VM but pid 1, the live shells (their pid files) and the
-# exec wrappers they hang from (their ancestors) — and the caller's own chain. The VM is
-# the scope a process cannot leave: a job that `setsid`s out of its shell's session is
+# Kill every process in the VM but pid 1, the live shells and the exec wrappers they hang
+# from (their ancestors) — and the caller's own chain. The live shells are the pids in
+# `$__sr_keep_in`, which the runner sends: each supervisor reported its own pid before
+# any command ran in it, so nothing a command can write names a process to keep. The VM
+# is the scope a process cannot leave: a job that `setsid`s out of its shell's session is
 # still here, and goes (docs/sandbox.md § The runner). Plain sh, no bashisms: it runs in
 # the shell at the end of every command and in a separate `docker exec` after a timeout.
 VM_SWEEP = """
 __sr_keep=" 1 "
-for __sr_p in $$ $(cat /tmp/.sr-shell-*.pid 2>/dev/null); do
+for __sr_p in $$ $__sr_keep_in; do
+    case "$__sr_p" in *[!0-9]*) continue;; esac
     while [ -n "$__sr_p" ] && [ "$__sr_p" != 0 ] && [ "$__sr_p" != 1 ]; do
         case "$__sr_keep" in *" $__sr_p "*) break;; esac
         __sr_keep="$__sr_keep$__sr_p "
@@ -292,27 +296,30 @@ for __sr_p in $(ps -eo pid=); do
 done
 """
 
+# Kills the shell `$1` names and everything under it, children first, inside the VM —
+# `pgrep` from procps, which the image installs — then sweeps, keeping the shells `$2`
+# names (docs/sandbox.md § The runner).
 KILL_TREE = f"""
 kill_tree() {{
     for child in $(pgrep -P "$1"); do kill_tree "$child"; done
     kill -KILL "$1" 2>/dev/null
 }}
-pid=$(cat "$1" 2>/dev/null) || exit 3
-[ -n "$pid" ] || exit 3
+pid="$1"
+case "$pid" in ''|*[!0-9]*) exit 3;; esac
+__sr_keep_in="$2"
 kill_tree "$pid"
 # The shell leads its own process group: whatever left the tree (a disowned job that
 # was reparented) is still in the group, and goes with it; the sweep takes the rest.
 kill -KILL -- "-$pid" 2>/dev/null
-rm -f "$1"
 {VM_SWEEP}
 kill -0 "$pid" 2>/dev/null && exit 4
 exit 0
 """
 
-# A VM a previous runner left running: its shells are gone with that process, so no pid
-# file means anything, and whatever still runs is a command nobody will commit.
+# A VM a previous runner left running: its shells are gone with that process, so there is
+# nothing to keep, and whatever still runs is a command nobody will commit.
 ADOPT_SWEEP = f"""
-rm -f /tmp/.sr-shell-*.pid
+__sr_keep_in=""
 {VM_SWEEP}
 exit 0
 """
@@ -447,9 +454,9 @@ class DockerBackend(Backend):
             raise RuntimeError("the sandbox VM could not be started")
         sandbox.started_at = time.monotonic()
 
-    def shell_argv(self, user_id: int, token: str) -> tuple[list[str], str | None]:
-        # The shell writes its pid to the VM's tmpfs first, so a timeout can be ended
-        # inside the VM (`on_timeout`), where ending the client here would not reach.
+    def shell_argv(self, user_id: int) -> tuple[list[str], str | None]:
+        # The shell reports its pid first, so a timeout can be ended inside the VM
+        # (`on_timeout`), where ending the client here would not reach.
         # `setsid` makes it a session and process-group leader, so everything a command
         # starts is in its group and can be killed as one (docs/sandbox.md § The runner);
         # `-w` keeps the exec's own process alive when setsid has to fork.
@@ -465,17 +472,23 @@ class DockerBackend(Backend):
                 "-w",
                 "sh",
                 "-c",
-                supervisor(self.cleanup(), _pid_file(token)),
+                supervisor(self.cleanup()),
             ],
             None,
         )
 
-    def on_timeout(self, user_id: int, token: str) -> Callable[..., Awaitable[None]]:
+    def on_timeout(self, user_id: int) -> Callable[..., Awaitable[None]]:
         container = self.container(user_id)
 
-        async def kill_inside(*, locked: bool = False) -> None:
+        async def kill_inside(*, pid: int, locked: bool = False) -> None:
+            # The user's other live shells, which the sweep after the kill must keep.
+            keep = " ".join(
+                str(other.pid)
+                for other in self._user(user_id).sessions.values()
+                if other.pid is not None and other.pid != pid
+            )
             code, out = await _docker(
-                "exec", container, "sh", "-c", KILL_TREE, "sh", _pid_file(token), timeout=30
+                "exec", container, "sh", "-c", KILL_TREE, "sh", str(pid), keep, timeout=30
             )
             if code != 0:
                 # Fail closed: a command that cannot be confirmed dead must not go on
@@ -530,7 +543,7 @@ class LocalBackend(Backend):
             self._running.add(sandbox.user_id)
             sandbox.started_at = time.monotonic()
 
-    def shell_argv(self, user_id: int, token: str) -> tuple[list[str], str | None]:
+    def shell_argv(self, user_id: int) -> tuple[list[str], str | None]:
         return ["sh", "-c", supervisor(self.cleanup())], str(self.workspace(user_id))
 
     async def stop_vm(self, sandbox: UserSandbox) -> bool:

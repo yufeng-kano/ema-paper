@@ -596,6 +596,7 @@ async def test_view_page_and_view_figure_read_the_documents_own_files(tmp_path, 
     page = await chat_tools.view_page(
         paths,
         {"page": 1},
+        document_id=5,
         page_count=3,
         render_slots=asyncio.Semaphore(1),
         max_bytes=10_000_000,
@@ -605,9 +606,25 @@ async def test_view_page_and_view_figure_read_the_documents_own_files(tmp_path, 
     assert page.content[0]["type"] == "image"
     assert page.content[0]["source"]["media_type"] == "image/png"
     assert page.content[1]["text"] == "Page 1."
+    # The original kept outside the mount is what renders, even with the shell's copy gone.
+    (paths.directory / "source.pdf").unlink()
+    outside = tmp_path / "ws" / ".repos" / "1.sources"
+    outside.mkdir(parents=True)
+    shutil.copy(documents["text_pdf"], outside / "5.pdf")
+    from_original = await chat_tools.view_page(
+        paths,
+        {"page": 1},
+        document_id=5,
+        page_count=3,
+        render_slots=asyncio.Semaphore(1),
+        max_bytes=10_000_000,
+        kind="pdf",
+    )
+    assert not from_original.is_error and from_original.content[1]["text"] == "Page 1."
     too_far = await chat_tools.view_page(
         paths,
         {"page": 9},
+        document_id=5,
         page_count=3,
         render_slots=asyncio.Semaphore(1),
         max_bytes=10_000_000,
@@ -848,6 +865,7 @@ async def test_a_rounds_images_never_exceed_the_budget(monkeypatch) -> None:
         ),
         conversation=SimpleNamespace(id=1, session="s"),
         paths=None,
+        document=SimpleNamespace(id=1),
         job=SimpleNamespace(page_count=12, kind="pdf"),
         render_slots=None,
         sandbox=None,
@@ -1582,6 +1600,7 @@ async def test_a_turns_images_never_exceed_the_turn_budget(monkeypatch) -> None:
         ),
         conversation=SimpleNamespace(id=1, session="s"),
         paths=None,
+        document=SimpleNamespace(id=1),
         job=SimpleNamespace(page_count=12, kind="pdf"),
         render_slots=None,
         sandbox=None,
@@ -1905,3 +1924,83 @@ async def test_the_writer_is_waited_for_through_the_runner_clients_grace(monkeyp
     )
     await chat_runner._settle_writer(ctx)
     assert writer.done() and writer.result() == "committed"
+
+
+@respx.mock
+async def test_an_answer_cut_at_the_output_limit_fails_the_turn(chatting) -> None:
+    document_id = chatting.document_id
+    conversation_id = (
+        await chatting.post(
+            f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    respx.post(MESSAGES_URL).mock(
+        return_value=httpx.Response(
+            200,
+            content=assistant_turn(
+                [
+                    {"type": "text", "text": "Half an answer"},
+                    {"type": "tool_use", "id": "cut", "name": "bash", "input": {}},
+                ],
+                "max_tokens",
+            ),
+        )
+    )
+    await chatting.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
+    )
+    await _run_queued_turn(chatting)
+    thread = (await chatting.get(f"/api/conversations/{conversation_id}")).json()
+    assert thread["turns"][-1]["status"] == "failed"
+    assert "output limit" in thread["turns"][-1]["error"]
+    # What came through is kept; the tool call cut with the limit is not, and never ran.
+    async with chatting.app.state.sessionmaker() as db:
+        stored = (await db.execute(select(Message).order_by(Message.id))).scalars().all()
+    assistant = [row for row in stored if row.role == "assistant"]
+    assert len(assistant) == 1
+    assert [block["type"] for block in assistant[0].content] == ["text"]
+    assert all(block.get("type") != "tool_result" for row in stored for block in row.content)
+
+    # Any other stop the loop does not know fails the turn too, rather than passing as done.
+    respx.post(MESSAGES_URL).mock(
+        return_value=httpx.Response(
+            200, content=assistant_turn([{"type": "text", "text": "..."}], "pause_turn")
+        )
+    )
+    await chatting.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"text": "again"},
+        headers=CSRF_HEADERS,
+    )
+    await _run_queued_turn(chatting)
+    thread = (await chatting.get(f"/api/conversations/{conversation_id}")).json()
+    assert thread["turns"][-1]["status"] == "failed"
+    assert "pause_turn" in thread["turns"][-1]["error"]
+
+
+async def test_the_sandbox_client_takes_an_empty_success_answer(monkeypatch) -> None:
+    from sightread.config import Settings
+    from sightread.sandbox import client as sandbox_client
+
+    answers: list[httpx.Response] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return answers.pop(0)
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        sandbox_client.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=transport, **kwargs),
+    )
+    client = sandbox_client.SandboxClient(
+        Settings(app_env="local", sandbox_url="http://sandbox:8100", sandbox_token="t")
+    )
+    # Stop and reset answer 204 with no body: done, not unreadable.
+    answers += [httpx.Response(204), httpx.Response(200, content=b"")]
+    await client.stop(7)
+    await client.reset(7)
+    answers.append(httpx.Response(200, content=b"<html>"))
+    with pytest.raises(sandbox_client.SandboxUnavailable):
+        await client.stop(7)

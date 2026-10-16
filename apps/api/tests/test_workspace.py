@@ -155,9 +155,13 @@ async def test_keep_source_moves_the_upload_into_the_document_directory(tmp_path
     root = tmp_path / "ws" / "7"
     upload = tmp_path / "upload.pdf"
     upload.write_bytes(b"%PDF-1.4")
-    kept = documents.keep_source(root, Path("files/paper.pdf"), upload)
-    assert kept == root / "files" / "paper.pdf" / "source.pdf"
+    kept = documents.keep_source(root, Path("files/paper.pdf"), upload, document_id=31)
+    # The original outside the mount, named by the document; the shell's copy in the tree.
+    assert kept == tmp_path / "ws" / ".repos" / "7.sources" / "31.pdf"
     assert kept.read_bytes() == b"%PDF-1.4"
+    assert (root / "files" / "paper.pdf" / "source.pdf").read_bytes() == b"%PDF-1.4"
+    assert documents.original_of(root, 31) == kept
+    assert documents.original_of(root, 32) is None
     assert not upload.exists()
     # Ignored by git: the binary never enters history.
     assert git.commit_all(root, "user", "x") is None or "source" not in git.log(root)[0].files
@@ -465,8 +469,15 @@ async def test_a_late_library_row_adopts_the_finished_upload(sessionmaker, tmp_p
         await documents.adopt_source(db, settings, document, job)
         paths = await documents.document_paths(db, settings, document)
         assert (paths.directory / "source.pdf").read_bytes() == b"%PDF-1.4"
+        original = documents.original_of(paths.root, document.id)
+        assert original is not None and original.read_bytes() == b"%PDF-1.4"
         assert not upload.exists()
         assert job.source_deleted_at is not None
+        # The shell's copy removed: the next materialization makes it again from the
+        # original, which no command can reach.
+        (paths.directory / "source.pdf").unlink()
+        await documents.materialize_document(db, settings, document)
+        assert (paths.directory / "source.pdf").read_bytes() == b"%PDF-1.4"
 
 
 async def test_reverting_a_rename_moves_the_directory_back_and_the_row_follows(
@@ -561,12 +572,14 @@ def test_the_kept_source_is_named_by_the_parse_kind(tmp_path) -> None:
     root = tmp_path / "ws" / "8"
     upload = tmp_path / "upload.bin"
     upload.write_bytes(b"%PDF-1.4")
-    kept = documents.keep_source(root, Path("files/paper"), upload, kind="pdf")
-    assert kept.name == "source.pdf"
+    kept = documents.keep_source(root, Path("files/paper"), upload, document_id=1, kind="pdf")
+    assert kept.name == "1.pdf"
+    assert (root / "files" / "paper" / "source.pdf").exists()
     image = tmp_path / "photo.jpeg"
     image.write_bytes(b"\xff\xd8")
-    kept = documents.keep_source(root, Path("files/photo"), image, kind="image")
-    assert kept.name == "source.jpeg"
+    kept = documents.keep_source(root, Path("files/photo"), image, document_id=2, kind="image")
+    assert kept.name == "2.jpeg"
+    assert (root / "files" / "photo" / "source.jpeg").exists()
 
 
 def test_a_failed_write_leaves_the_file_as_it_was(tmp_path) -> None:
@@ -1216,3 +1229,60 @@ def test_a_removal_whose_revision_cannot_be_recorded_moves_back(tmp_path, monkey
     assert not [
         name for name, _ in safe_io.list_dir(root, root) if name.startswith(safe_io.TEMP_PREFIX)
     ]
+
+
+async def test_a_move_whose_commit_fails_is_undone(sessionmaker, tmp_path, monkeypatch) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        before = await documents.materialize_document(db, settings, document)
+        root = before.root
+        (before.doc).write_text("# Edited by hand\n")
+        target = before.relative.with_name("renamed.pdf")
+        # A squatter at the destination: it moves aside, and must come back too.
+        (root / target).mkdir()
+        (root / target / "scratch.txt").write_text("the shell's")
+
+        def failing(*args, **kwargs):
+            raise git.GitError("git is unwell")
+
+        monkeypatch.setattr(git, "commit_paths", failing)
+        with pytest.raises(ApiError) as refused:
+            await documents.move_path(settings, user.id, before.relative, target)
+        assert refused.value.status_code == 409
+        assert "could not be recorded" in refused.value.message
+    # The document where it was, with its edit; the squatter where it was; nothing aside.
+    assert before.doc.read_text() == "# Edited by hand\n"
+    assert (root / target / "scratch.txt").read_text() == "the shell's"
+    assert sorted(name for name, _ in safe_io.list_dir(root, root / "files" / "Papers")) == [
+        "paper.pdf",
+        "renamed.pdf",
+    ]
+
+
+async def test_reconcile_leaves_what_a_command_made_inside_a_document(
+    sessionmaker, tmp_path
+) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+        # Names the library would encode (`_.venv`, `__assets`), inside the document: the
+        # command's own, left under the names it chose, never recorded as folders.
+        (paths.directory / ".venv" / "bin").mkdir(parents=True)
+        (paths.directory / "_assets").mkdir()
+        (paths.directory / "_assets" / "a.txt").write_text("a")
+        git.commit_all(paths.root, "agent:1", "from the shell")
+        assert await reconcile.reconcile_user(db, settings, user.id) == 0
+        assert (paths.directory / ".venv" / "bin").is_dir()
+        assert (paths.directory / "_assets" / "a.txt").read_text() == "a"
+        assert not (paths.directory / "_.venv").exists()
+        names = set(
+            (await db.execute(select(Folder.name).where(Folder.user_id == user.id))).scalars()
+        )
+        assert names == {"Papers"}
+        # A folder the shell named outside any document is still canonicalized.
+        (paths.root / "files" / ".drafts").mkdir()
+        git.commit_all(paths.root, "agent:1", "mkdir from the shell")
+        await reconcile.reconcile_user(db, settings, user.id)
+        assert (paths.root / "files" / "_.drafts").is_dir()

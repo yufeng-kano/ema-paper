@@ -63,6 +63,9 @@ class SandboxClient:
             raise SandboxUnavailable("the sandbox runner was unreachable") from exc
         if response.status_code >= 400:
             raise SandboxUnavailable(f"the sandbox runner returned {response.status_code}")
+        if response.status_code == 204 or not response.content:
+            # Stop and reset answer with no body: done, and nothing to say about it.
+            return {}
         try:
             payload = response.json()
         except ValueError as exc:

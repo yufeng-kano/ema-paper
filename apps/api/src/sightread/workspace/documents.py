@@ -13,6 +13,8 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
+import shutil
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -35,6 +37,7 @@ from .layout import (
     files_root,
     git_dir,
     results_root,
+    sources_dir,
     user_root,
 )
 from .locks import workspace_lock
@@ -210,8 +213,12 @@ def _materialize_files(
         "kind": job.kind,
     }
     changed |= _write_if_missing(paths.root, paths.meta, json.dumps(meta, indent=2) + "\n")
-    original = results_root(paths.root) / str(job.id) / "result.md"
-    _write_if_missing(paths.root, original, result.markdown)  # excluded from history
+    parse = results_root(paths.root) / str(job.id) / "result.md"
+    _write_if_missing(paths.root, parse, result.markdown)  # excluded from history
+    original = original_of(paths.root, document_id)
+    if original is not None and paths.source() is None:
+        # The shell's copy, made again from the original when a command removed it.
+        _copy_source(paths.root, paths.directory, original)  # excluded from history
     crops = figures_dir / str(job.id)
     if crops.is_dir():
         # The crops directory is the service's own; the document directory is shared with
@@ -280,28 +287,82 @@ async def ensure_within_quota(settings: Settings, root: Path) -> None:
         )
 
 
-def keep_source(
-    root: Path, relative: Path, source: Path, *, kind: str = "pdf", copy: bool = False
-) -> Path:
-    """Copy a finished parse's upload into its document directory as `source.pdf` (or
-    `source.<ext>` for an image — the parse's kind decides, never the upload's name),
-    and unless `copy`, remove the upload (docs/jobs.md § Retention). Written through a
-    descriptor opened without following anything, like every workspace file."""
-    git.ensure_repo(root)
-    directory = root / relative
+def _source_suffix(source: Path, kind: str) -> str:
+    return ".pdf" if kind == "pdf" else (source.suffix.lower()[:16] or ".img")
+
+
+def original_of(root: Path, document_id: int) -> Path | None:
+    """The document's original upload, kept outside the mount, as a plain file; None when
+    none was kept (docs/workspace.md § Layout)."""
+    directory = sources_dir(root)
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return None
+    for name in names:
+        stem, dot, _ext = name.partition(".")
+        if stem == str(document_id) and dot:
+            candidate = directory / name
+            if candidate.is_file() and not candidate.is_symlink():
+                return candidate
+    return None
+
+
+def _copy_source(root: Path, directory: Path, original: Path) -> Path:
+    """The shell's copy of the original, `source.<ext>` in the document directory —
+    written through a descriptor opened without following anything, like every
+    workspace file; excluded from history."""
     try:
         safe_io.ensure_dir(root, directory)
     except safe_io.UnsafeEntry as exc:
         raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
-    suffix = ".pdf" if kind == "pdf" else (source.suffix.lower()[:16] or ".img")
-    target = directory / f"{SOURCE_STEM}{suffix}"
+    target = directory / f"{SOURCE_STEM}{original.suffix}"
     if safe_io.entry_kind(root, target) == "dir":
         safe_io.remove_tree(root, target)
-    with source.open("rb") as reader:
+    with original.open("rb") as reader:
         safe_io.write_from(root, target, reader)
+    return target
+
+
+def keep_source(
+    root: Path,
+    relative: Path,
+    source: Path,
+    *,
+    document_id: int,
+    kind: str = "pdf",
+    copy: bool = False,
+) -> Path:
+    """File a finished parse's upload as the document's original — `{document_id}.pdf`
+    (or `.<ext>` for an image: the parse's kind decides, never the upload's name) beside
+    the git directory, outside the mount — then make the shell's copy of it in the
+    document directory, and unless `copy`, remove the upload (docs/jobs.md § Retention).
+    The original lands first and whole: a copy the tree refuses is made again on the
+    next materialization. Returns the original's path."""
+    git.ensure_repo(root)
+    canonical = sources_dir(root) / f"{document_id}{_source_suffix(source, kind)}"
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    # A name `original_of` never picks: its stem is not the id.
+    staging = canonical.with_name(f".tmp-{canonical.name}")
+    shutil.copyfile(source, staging)
+    os.replace(staging, canonical)
+    _copy_source(root, root / relative, canonical)
     if not copy:
         source.unlink(missing_ok=True)
-    return target
+    return canonical
+
+
+def _discard_originals(root: Path, document_ids: list[int]) -> None:
+    for document_id in document_ids:
+        while (original := original_of(root, document_id)) is not None:
+            original.unlink(missing_ok=True)
+
+
+async def discard_originals(settings: Settings, user_id: int, document_ids: list[int]) -> None:
+    """The originals of documents whose rows are gone (docs/workspace.md § Layout)."""
+    if document_ids:
+        root = user_root(settings.workspaces_dir, user_id)
+        await asyncio.to_thread(_discard_originals, root, list(document_ids))
 
 
 async def adopt_source(
@@ -335,7 +396,9 @@ async def adopt_source(
         except ApiError:
             source.unlink(missing_ok=True)
         else:
-            await asyncio.to_thread(keep_source, root, relative, source, kind=job.kind)
+            await asyncio.to_thread(
+                keep_source, root, relative, source, document_id=document.id, kind=job.kind
+            )
     if upload is None:
         job.source_deleted_at = utcnow()
         await db.commit()
@@ -344,7 +407,7 @@ async def adopt_source(
 # --- content ------------------------------------------------------------------------------
 
 
-def _read(paths: DocumentPaths, max_bytes: int) -> Content:
+def _read(paths: DocumentPaths, max_bytes: int, *, document_id: int) -> Content:
     paths.check()
     markdown = _read_text(paths.root, paths.doc, max_bytes)
     notes = _read_text(paths.root, paths.notes, max_bytes)
@@ -353,7 +416,7 @@ def _read(paths: DocumentPaths, max_bytes: int) -> Content:
         revision=revision_of(markdown),
         notes=notes,
         notes_revision=revision_of(notes),
-        has_source=paths.source() is not None,
+        has_source=original_of(paths.root, document_id) is not None or paths.source() is not None,
     )
 
 
@@ -361,7 +424,9 @@ async def read_content(
     db: AsyncSession, settings: Settings, document: Document, *, locked: bool = False
 ) -> Content:
     paths = await materialize_document(db, settings, document, locked=locked)
-    return await asyncio.to_thread(_read, paths, settings.content_max_bytes)
+    return await asyncio.to_thread(
+        _read, paths, settings.content_max_bytes, document_id=document.id
+    )
 
 
 def _write_file(
@@ -710,7 +775,18 @@ def _move_tree(root: Path, source: Path, target: Path, message: str) -> str | No
         # An ancestor the shell swapped for a link: refused, and the caller's row rolls
         # back to where the files still are.
         raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
-    return git.commit_paths(root, git.USER_AUTHOR, message, touched)
+    try:
+        return git.commit_paths(root, git.USER_AUTHOR, message, touched)
+    except git.GitError as exc:
+        # Back where the row will point once the caller rolls back: the directory to its
+        # old place, the squatter to the place it had. Plain renames, no git — the index
+        # was reset by the failed commit and the next commit sees the tree as it is.
+        safe_io.rename(root, root / target, root / source)
+        if len(touched) == 3:
+            safe_io.rename(root, root / touched[2], root / target)
+        raise ApiError(
+            409, "invalid_request", "The move could not be recorded; nothing was changed"
+        ) from exc
 
 
 async def move_path(settings: Settings, user_id: int, source: Path, target: Path) -> str | None:
@@ -813,6 +889,7 @@ def directory_size(root: Path, path: Path | None = None) -> int:
 
 
 def workspace_size(root: Path) -> int:
-    """What the user holds: the tree and the history beside it (the git directory is the
-    service's own, outside the mount, walked the same way from its own root)."""
-    return directory_size(root) + directory_size(git_dir(root))
+    """What the user holds: the tree, the history and the originals beside it (the git
+    and sources directories are the service's own, outside the mount, walked the same
+    way from their own roots)."""
+    return directory_size(root) + directory_size(git_dir(root)) + directory_size(sources_dir(root))

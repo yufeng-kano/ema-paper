@@ -29,6 +29,7 @@ NOTES_FILE = "notes.md"
 META_FILE = ".meta.json"
 FIGURES_DIR = "figures"
 SOURCE_STEM = "source"
+SOURCES_SUFFIX = ".sources"
 LOCK_FILE = "lock"
 
 # What a document directory may not be called: the workspace's own names, and git's.
@@ -62,6 +63,13 @@ def git_dir(root: Path) -> Path:
     """The user's git directory, `{WORKSPACES_DIR}/.repos/{user_id}`: beside the work tree,
     outside anything the VM mounts (docs/workspace.md § Revisions)."""
     return root.parent / REPOS_DIR / root.name
+
+
+def sources_dir(root: Path) -> Path:
+    """Where the originals live, `{WORKSPACES_DIR}/.repos/{user_id}.sources`: beside the git
+    directory and like it outside the mount, so no command can touch the one file nothing
+    can recreate (docs/workspace.md § Layout). One file per document, named by its id."""
+    return root.parent / REPOS_DIR / f"{root.name}{SOURCES_SUFFIX}"
 
 
 def segment_name(segment: str) -> str:

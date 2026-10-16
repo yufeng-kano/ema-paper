@@ -14,6 +14,7 @@ import contextlib
 import difflib
 import io
 import os
+import stat
 import tempfile
 import warnings
 from dataclasses import dataclass, field
@@ -25,7 +26,7 @@ from ..parsing import poppler
 from ..parsing.figures import parse_bbox_path
 from ..sandbox.client import SandboxClient, SandboxUnavailable
 from ..workspace import git, safe_io
-from ..workspace.documents import DocumentPaths
+from ..workspace.documents import DocumentPaths, original_of
 from ..workspace.layout import (
     CACHE_DIR,
     FIGURES_DIR,
@@ -405,16 +406,42 @@ def _as_png(source: Path | bytes) -> bytes:
         return buffer.getvalue()
 
 
+def _open_source(root: Path, source: Path, max_bytes: int) -> int | None:
+    """A descriptor on the original: through the workspace's own open when the file is
+    the shell's copy in the tree, a plain open that follows nothing when it is the
+    original kept outside the mount — the service's own directory, which no command
+    reaches (docs/workspace.md § Layout). None when it is gone."""
+    if source.is_relative_to(root):
+        return safe_io.open_for_read(root, source, max_bytes)
+    try:
+        fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise safe_io.UnsafeEntry(f"{source} is not a plain file")
+        if info.st_size > max_bytes:
+            raise safe_io.EntryTooLarge(f"{source} is larger than {max_bytes} bytes")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 async def view_page(
     paths: DocumentPaths,
     tool_input: dict,
     *,
+    document_id: int,
     page_count: int | None,
     render_slots: asyncio.Semaphore,
     max_bytes: int,
     kind: str,
 ) -> ToolOutcome:
-    source = paths.source()
+    # The original kept outside the mount first; the shell's copy only when there is
+    # none (a document filed before originals were kept there).
+    source = original_of(paths.root, document_id) or paths.source()
     if source is None:
         return ToolOutcome(
             "This document kept no original file, so its pages cannot be rendered.",
@@ -426,17 +453,19 @@ async def view_page(
         return ToolOutcome("view_page needs an integer `page`", is_error=True)
     if page < 1 or (page_count and page > page_count):
         return ToolOutcome(f"page must be between 1 and {page_count or 1}", is_error=True)
+    if kind != "pdf" and page != 1:
+        return ToolOutcome("an image document has one page", is_error=True)
 
-    if kind == "pdf":
-        # Poppler gets the file as a descriptor opened without following anything, not
-        # as a path it would resolve again (docs/workspace.md § Revisions).
-        try:
-            fd = safe_io.open_for_read(paths.root, source, max_bytes)
-        except (safe_io.UnsafeEntry, safe_io.EntryTooLarge, OSError):
-            return ToolOutcome("the original file could not be opened", is_error=True)
-        if fd is None:
-            return ToolOutcome("the original file is gone", is_error=True)
-        try:
+    # Poppler gets the file as a descriptor opened without following anything, not as a
+    # path it would resolve again (docs/workspace.md § Revisions).
+    try:
+        fd = _open_source(paths.root, source, max_bytes)
+    except (safe_io.UnsafeEntry, safe_io.EntryTooLarge, OSError):
+        return ToolOutcome("the original file could not be opened", is_error=True)
+    if fd is None:
+        return ToolOutcome("the original file is gone", is_error=True)
+    try:
+        if kind == "pdf":
             handle = Path(f"/proc/self/fd/{fd}")
             with tempfile.TemporaryDirectory(prefix="sr-view-") as work:
                 work_dir = Path(work)
@@ -449,18 +478,17 @@ async def view_page(
                     data = await asyncio.to_thread(_as_png, rendered)
                 except poppler.PopplerError:
                     return ToolOutcome(f"page {page} could not be rendered", is_error=True)
-        finally:
-            os.close(fd)
-    else:
-        if page != 1:
-            return ToolOutcome("an image document has one page", is_error=True)
-        try:
-            raw = await asyncio.to_thread(safe_io.read_bytes, paths.root, source, max_bytes)
-            data = await asyncio.to_thread(_as_png, raw or b"")
-        except (safe_io.UnsafeEntry, safe_io.EntryTooLarge, OSError):
-            return ToolOutcome("the original image could not be read", is_error=True)
-        except (ImageTooLarge, Image.DecompressionBombError, Image.DecompressionBombWarning):
-            return ToolOutcome("the original image is too large to render", is_error=True)
+        else:
+            try:
+                with os.fdopen(os.dup(fd), "rb") as reader:
+                    raw = await asyncio.to_thread(reader.read, max_bytes + 1)
+                data = await asyncio.to_thread(_as_png, raw)
+            except OSError:
+                return ToolOutcome("the original image could not be read", is_error=True)
+            except (ImageTooLarge, Image.DecompressionBombError, Image.DecompressionBombWarning):
+                return ToolOutcome("the original image is too large to render", is_error=True)
+    finally:
+        os.close(fd)
     return ToolOutcome([_png_block(data), {"type": "text", "text": f"Page {page}."}])
 
 

@@ -36,7 +36,7 @@ from ..jobs import chat_events
 from ..jobs.queue import count_active_turns, enqueue_turn
 from ..sandbox.client import SandboxClient, SandboxUnavailable
 from ..workspace.documents import directory_size, materialize_document, workspace_size
-from ..workspace.layout import CACHE_DIR, FILES_DIR, SIGHTREAD_DIR, git_dir, user_root
+from ..workspace.layout import CACHE_DIR, FILES_DIR, SIGHTREAD_DIR, git_dir, sources_dir, user_root
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
@@ -386,6 +386,9 @@ def _workspace_usage(root: Path, quota: int) -> dict:
     history = directory_size(git_dir(root))
     if history:
         breakdown.append({"path": "history/", "bytes": history})
+    originals = directory_size(sources_dir(root))
+    if originals:
+        breakdown.append({"path": "originals/", "bytes": originals})
     return {
         "bytes": workspace_size(root),
         "quota_bytes": quota,

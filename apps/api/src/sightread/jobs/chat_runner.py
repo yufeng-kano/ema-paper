@@ -566,6 +566,7 @@ async def _run_tool_unguarded(
         outcome = await chat_tools.view_page(
             ctx.paths,
             tool_input,
+            document_id=ctx.document.id,
             page_count=ctx.job.page_count,
             render_slots=ctx.render_slots,
             max_bytes=ctx.settings.upload_max_bytes,
@@ -737,17 +738,26 @@ async def _loop(ctx: TurnContext) -> None:
         if await _cancelled(ctx):
             # Billed, but not kept: a cancelled turn leaves the history as it was.
             raise TurnCancelled()
-        if completed.content:
-            await _store(ctx, "assistant", completed.content)
-            messages.append({"role": "assistant", "content": completed.content})
+        tool_uses = [block for block in completed.content if block.get("type") == "tool_use"]
+        content = completed.content
+        if completed.stop_reason == "max_tokens":
+            # What came through is kept; a tool call cut off with the limit is not — it is
+            # never run, and a tool_use with no result would make the history unsendable.
+            content = [block for block in content if block.get("type") != "tool_use"]
+        if content:
+            await _store(ctx, "assistant", content)
+            messages.append({"role": "assistant", "content": content})
             # Positions are content blocks, not messages (docs/chat.md § Prompt caching).
-            since_marker += len(completed.content)
+            since_marker += len(content)
 
         if completed.stop_reason == "refusal":
             raise TurnFailed("The model declined this request")
-        tool_uses = [block for block in completed.content if block.get("type") == "tool_use"]
-        if completed.stop_reason != "tool_use" or not tool_uses:
+        if completed.stop_reason == "max_tokens":
+            raise TurnFailed("The answer reached the output limit before it was complete")
+        if completed.stop_reason in ("end_turn", "stop_sequence"):
             return
+        if completed.stop_reason != "tool_use" or not tool_uses:
+            raise TurnFailed(f"The model stopped unexpectedly ({completed.stop_reason})")
         if await _cancelled(ctx):
             raise TurnCancelled()
 

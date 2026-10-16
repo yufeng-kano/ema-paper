@@ -14,10 +14,16 @@ import asyncio
 import contextlib
 import os
 import secrets
-from collections.abc import Awaitable, Callable
+from asyncio import LimitOverrunError
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 
 READ_CHUNK_BYTES = 65_536
+# The one line a supervisor prints before it reads anything: its own pid, as the VM
+# numbers it, which the runner holds for the kill inside the VM and names to the other
+# shells' sweeps (docs/sandbox.md § The runner). Read before any command is sent, so no
+# command can forge it.
+PID_PREFIX = "__SR_PID "
 
 
 @dataclass(frozen=True)
@@ -83,23 +89,23 @@ exit $__sr_status
 """
 
 
-def supervisor(cleanup: str, pid_file: str | None = None) -> str:
+def supervisor(cleanup: str) -> str:
     """The persistent shell: a POSIX sh that owns each command's lifecycle, so the
     command can neither read the framing that follows it nor forge the status line
-    (docs/sandbox.md § The runner). It reads one command at a time from stdin, framed by
-    the per-command marker the host chose, runs it in a fresh bash child with stdin at
-    /dev/null, and only once that child is gone runs `cleanup` and prints the marker
-    with the status. `pid_file`, when given, is where it records its pid for a kill
-    inside the VM."""
-    record = f'echo "$$" > {pid_file}' if pid_file else ":"
+    (docs/sandbox.md § The runner). It reports its pid first, then reads one command at
+    a time from stdin — the per-command marker the host chose, the pids of the shells
+    the cleanup must keep (`$__sr_keep_in`), the command, the marker again — runs the
+    command in a fresh bash child with stdin at /dev/null, and only once that child is
+    gone runs `cleanup` and prints the marker with the status."""
     return f"""\
 __sr_state=$(mktemp -d "${{TMPDIR:-/tmp}}/.sr-state-XXXXXX") || exit 1
 trap 'rm -rf "$__sr_state"' EXIT
-{record}
+printf '{PID_PREFIX}%s\\n' "$$"
 cat > "$__sr_state/run.sh" <<'__SR_RUN__'
 {_RUN}__SR_RUN__
 while IFS= read -r __sr_marker; do
     [ -n "$__sr_marker" ] || continue
+    IFS= read -r __sr_keep_in || break
     : > "$__sr_state/cmd.sh"
     while IFS= read -r __sr_line; do
         [ "$__sr_line" = "$__sr_marker" ] && break
@@ -121,15 +127,20 @@ class ShellSession:
         cwd: str | None = None,
         max_bytes: int,
         on_timeout: Callable[..., Awaitable[None]] | None = None,
+        start_timeout: float = 30.0,
     ) -> None:
         self._argv = argv
         self._cwd = cwd
         self._max_bytes = max_bytes
         # What ends the command where it really runs: ending the host-side client does
-        # not end a process inside the VM (docs/sandbox.md § The runner).
+        # not end a process inside the VM (docs/sandbox.md § The runner). Called with
+        # the supervisor's pid, as the VM numbers it.
         self._on_timeout = on_timeout
+        self._start_timeout = start_timeout
         self._process: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
+        # The supervisor's pid where it runs, reported on its first line.
+        self.pid: int | None = None
 
     @property
     def alive(self) -> bool:
@@ -151,8 +162,21 @@ class ShellSession:
             # Its own process group, so a timeout can kill the whole tree.
             start_new_session=True,
         )
+        assert self._process.stdout is not None
+        # The pid line, before anything else is sent: a shell that does not report one
+        # is not a supervisor, and no command runs in it.
+        try:
+            line = await asyncio.wait_for(self._process.stdout.readline(), self._start_timeout)
+            text = line.decode("utf-8", errors="replace").strip()
+            if not text.startswith(PID_PREFIX):
+                raise ValueError(text)
+            self.pid = int(text[len(PID_PREFIX) :])
+        except (TimeoutError, ValueError, LimitOverrunError) as exc:
+            await self.close()
+            raise RuntimeError("the shell did not report its pid") from exc
 
     async def close(self) -> None:
+        self.pid = None
         process, self._process = self._process, None
         if process is None or process.returncode is not None:
             return
@@ -168,14 +192,16 @@ class ShellSession:
         `restart`, a dropped `exec` request and a status line that never came do
         (docs/sandbox.md). `locked` says the caller holds the sandbox lock, which the
         backend's fallback stop must then not take again."""
-        if self._on_timeout is not None:
+        if self._on_timeout is not None and self.pid is not None:
             with contextlib.suppress(Exception):
-                await self._on_timeout(locked=locked)
+                await self._on_timeout(pid=self.pid, locked=locked)
         await self.close()
 
-    async def run(self, command: str, *, timeout: float) -> ExecOutcome:
+    async def run(self, command: str, *, timeout: float, keep: Iterable[int] = ()) -> ExecOutcome:
         """One command, serialized per session. A timeout kills the shell: whatever it was
-        doing cannot be trusted to have stopped, so the next command gets a fresh one."""
+        doing cannot be trusted to have stopped, so the next command gets a fresh one.
+        `keep` names the user's other live shells, by the pids they reported, to the
+        cleanup that follows the command (docs/sandbox.md § The runner)."""
         async with self._lock:
             if not self.alive:
                 await self.start()
@@ -192,7 +218,8 @@ class ShellSession:
                 marker = f"__SR_DONE_{secrets.token_hex(8)}__"
                 if marker not in command:
                     break
-            script = f"{marker}\n{command}\n{marker}\n"
+            keep_line = " ".join(str(pid) for pid in keep)
+            script = f"{marker}\n{keep_line}\n{command}\n{marker}\n"
             try:
                 process.stdin.write(script.encode())
                 await process.stdin.drain()

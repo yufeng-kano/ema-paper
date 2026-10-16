@@ -73,7 +73,12 @@ def _canonicalize(root: Path) -> int:
     scan records finds its directory again (docs/workspace.md § The tree is the truth).
     One commit for all of them; returns how many moved."""
     moved: list[Path] = []
-    for current, dirs, _files in _walk(root, Path(FILES_DIR)):
+    for current, dirs, files in _walk(root, Path(FILES_DIR)):
+        if META_FILE in files:
+            # A document's directory: what a command made inside it is the document's
+            # own, under the names the command chose (docs/workspace.md).
+            dirs[:] = []
+            continue
         kept: list[str] = []
         for name in dirs:
             source = current / name
@@ -106,6 +111,7 @@ def _scan(root: Path) -> list[Found]:
         dirs[:] = [name for name in dirs if is_canonical_segment(name)]
         if META_FILE not in files:
             continue
+        dirs[:] = []  # nothing beneath a document is a folder or a document
         meta = root / current / META_FILE
         try:
             # A plain, small file or nothing: the shell can put anything under that name,

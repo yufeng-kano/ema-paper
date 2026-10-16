@@ -622,3 +622,42 @@ async def test_an_upload_named_only_by_separators_is_filed_as_upload(library, do
     created = await _upload(library, documents, name="///")
     assert created.status_code == 201, created.text
     assert created.json()["name"] == "upload"
+
+
+async def test_the_library_read_reuses_the_request_session_for_its_snapshot(library) -> None:
+    import warnings
+
+    from sqlalchemy.exc import SAWarning
+
+    await _folder(library, "Invoices")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        body = await _read(library)
+    assert [row["name"] for row in body["folders"]] == ["Invoices"]
+    # The isolation level landed on a fresh transaction, not on one already begun by the
+    # authentication query (docs/api.md): SQLAlchemy would warn it had been ignored.
+    assert not [w for w in caught if issubclass(w.category, SAWarning)]
+    # A mutation after the read, on the same client: the session serves both.
+    again = await _folder(library, "2026")
+    assert again["name"] == "2026"
+
+
+async def test_deleting_a_document_discards_its_original(
+    make_client, sessionmaker, documents, tmp_path
+) -> None:
+    from sightread.workspace.documents import original_of
+
+    library = make_client(workspaces_dir=str(tmp_path / "ws"))
+    await _ready_to_parse(library)
+    await _upload(library, documents)
+    uploaded = (await _upload(library, documents)).json()
+    async with sessionmaker() as db:
+        row = await db.get(Document, uploaded["id"])
+        root = user_root(library.app.state.settings.workspaces_dir, row.user_id)
+    original = original_of(root, uploaded["id"])
+    assert original is not None and original.is_file()
+    assert (root / "files" / "tiny (2).png" / "source.png").is_file()
+    deleted = await library.delete(f"/api/library/documents/{uploaded['id']}", headers=CSRF_HEADERS)
+    assert deleted.status_code == 204
+    assert original_of(root, uploaded["id"]) is None
+    assert not (root / "files" / "tiny (2).png").exists()
