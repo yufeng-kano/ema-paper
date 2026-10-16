@@ -76,6 +76,12 @@ def test_path_segments_cannot_escape_or_shadow_the_workspace() -> None:
     assert path_segment("a/b\\c") == "a b c"
     assert path_segment(".meta.json") == "_.meta.json"
     assert path_segment("") == "_"
+    # The names history excludes wherever they appear: a document so named would be a
+    # directory git ignores whole.
+    assert path_segment("figures") == "_figures"
+    assert path_segment("source.pdf") == "_source.pdf"
+    assert path_segment("source.PDF") == "_source.PDF"
+    assert path_segment("sources") == "sources" and path_segment("source") == "source"
     # Distinct names stay distinct directories (a leading `_` is escaped by another).
     names = ["report", ".report", "_report", "_", ".", "..", ".git"]
     assert len({path_segment(name) for name in names}) == len(names)
@@ -478,6 +484,44 @@ async def test_a_late_library_row_adopts_the_finished_upload(sessionmaker, tmp_p
         (paths.directory / "source.pdf").unlink()
         await documents.materialize_document(db, settings, document)
         assert (paths.directory / "source.pdf").read_bytes() == b"%PDF-1.4"
+
+
+async def test_a_document_named_like_an_excluded_artifact_keeps_its_revisions(
+    sessionmaker, tmp_path
+) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        _, document = await _seed(db)
+        document.name = "source.pdf"
+        await db.commit()
+        paths = await documents.materialize_document(db, settings, document)
+        assert paths.directory.name == "_source.pdf"
+        content = await documents.read_content(db, settings, document)
+        revision = await documents.write_content(
+            db, settings, document, markdown="# Title\n\nEdited\n", base_revision=content.revision
+        )
+        assert revision == documents.revision_of("# Title\n\nEdited\n")
+        # Both the materialization and the save are revisions: nothing git ignored.
+        head, materialized = git.log(paths.root)[:2]
+        assert head.files == ("files/Papers/_source.pdf/doc.md",)
+        assert "files/Papers/_source.pdf/doc.md" in materialized.files
+
+
+def test_path_scoped_commits_name_their_paths_literally(tmp_path) -> None:
+    root = tmp_path / "ws" / "1"
+    (root / "files" / "a*").mkdir(parents=True)
+    (root / "files" / "abc").mkdir(parents=True)
+    git.ensure_repo(root)
+    (root / "files" / "a*" / "doc.md").write_text("star\n")
+    (root / "files" / "abc" / "doc.md").write_text("other\n")
+    # A name with a glob character names exactly its own directory, never a sibling's.
+    commit = git.commit_paths(root, "user", "save a*", [Path("files/a*")])
+    assert commit is not None
+    assert git.log(root)[0].files == ("files/a*/doc.md",)
+    assert git.commit_paths(root, "user", "the rest", [Path("files/abc")]) is not None
+    assert [entry.message for entry in git.log(root, Path("files/a*"))] == ["save a*"]
+    # A pathspec that matches nothing is still skipped, not an error.
+    assert git.commit_paths(root, "user", "nothing", [Path("files/zzz")]) is None
 
 
 async def test_retention_copies_for_its_recipients_when_a_late_row_took_the_upload(

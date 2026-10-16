@@ -32,8 +32,12 @@ SOURCE_STEM = "source"
 SOURCES_SUFFIX = ".sources"
 LOCK_FILE = "lock"
 
-# What a document directory may not be called: the workspace's own names, and git's.
-RESERVED_SEGMENTS = frozenset({SIGHTREAD_DIR, META_FILE, CACHE_DIR, ".git", ".gitignore"})
+# What a document directory may not be called: the workspace's own names, git's, and
+# the names history excludes wherever they appear (`figures`, `source.*`) — a document
+# or folder so named would be a directory git ignores whole, its revisions never made.
+RESERVED_SEGMENTS = frozenset(
+    {SIGHTREAD_DIR, META_FILE, CACHE_DIR, FIGURES_DIR, ".git", ".gitignore"}
+)
 
 # Separators and control characters never reach a path; the library already strips the
 # separators (routes/library.py), this is the belt to that brace.
@@ -109,7 +113,11 @@ def path_segment(name: str) -> str:
     """
     segment = unicodedata.normalize("NFC", name)
     segment = _UNSAFE.sub(" ", segment).strip()
-    if not segment or segment.startswith((".", "_")) or segment in RESERVED_SEGMENTS:
+    if (
+        not segment
+        or segment.startswith((".", "_", f"{SOURCE_STEM}."))
+        or segment in RESERVED_SEGMENTS
+    ):
         segment = f"_{segment}"
     if len(segment.encode()) > SEGMENT_MAX_BYTES:
         # A library name may be longer than a path component: keep a prefix the reader

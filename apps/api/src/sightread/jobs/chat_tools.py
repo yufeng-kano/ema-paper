@@ -57,6 +57,11 @@ class ToolOutcome:
     is_error: bool = False
     # An edit the tool made: what the `edit` event carries.
     edit: dict | None = field(default=None)
+    # False for a shell command whose end the runner could not vouch for (it was
+    # unreachable, or the VM could not be stopped): a process may still be writing, so
+    # the tree is not committed now — the next command's revision carries it, once the
+    # runner has confirmed the VM gone (docs/chat.md § Tools).
+    settled: bool = True
 
 
 def truncate(text: str, max_chars: int) -> str:
@@ -95,7 +100,13 @@ async def run_bash(
     try:
         result = await client.exec(user_id, session, command, timeout_seconds=timeout_seconds)
     except SandboxUnavailable as exc:
-        return ToolOutcome(f"The sandbox is unavailable: {exc}", is_error=True)
+        return ToolOutcome(
+            f"The sandbox is unavailable: {exc}\n"
+            "[Whether the command ran is unknown; what it changed is recorded with the "
+            "next command.]",
+            is_error=True,
+            settled=False,
+        )
     output = truncate(result.output, max_chars)
     notes = []
     if result.timed_out:

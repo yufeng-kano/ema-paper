@@ -144,13 +144,20 @@ def commit_paths(root: Path, author: str, message: str, paths: list[Path]) -> st
     # which commits the whole index.
     try:
         for path in paths:
-            proc = _git(root, "add", "-A", "--", str(path), check=False)
+            proc = _git(root, "add", "-A", "--", _literal(path), check=False)
             if proc.returncode != 0 and "did not match any files" not in proc.stderr:
                 raise GitError(f"git add failed for {path}: {proc.stderr.strip()}")
         return _commit_staged(root, author, message)
     except GitError:
         reset_index(root)
         raise
+
+
+def _literal(path: Path) -> str:
+    """A workspace path as a pathspec that names exactly it: a library name may hold
+    `*`, `?` or brackets, which git would otherwise read as a pattern and match a
+    sibling with (docs/workspace.md § Revisions)."""
+    return f":(literal){path.as_posix()}"
 
 
 def reset_index(root: Path) -> None:
@@ -174,7 +181,7 @@ def tracked_at_head(root: Path, relative: Path) -> bool:
 def restore_from(root: Path, commit: str, author: str, message: str, relative: Path) -> str | None:
     """Write `relative` back as it was at `commit` and commit that: how a removal is undone
     when the rows it was made for did not go (docs/workspace.md § Revisions)."""
-    _git(root, "checkout", "-q", commit, "--", relative.as_posix())
+    _git(root, "checkout", "-q", commit, "--", _literal(relative))
     return commit_paths(root, author, message, [relative])
 
 
@@ -206,7 +213,7 @@ def log(
     if follow:
         args.append("--follow")
     if relative is not None:
-        args += ["--", str(relative)]
+        args += ["--", _literal(relative)]
     # Read up to a bound, never buffered whole: a shell revision can name any number of
     # files, and the API must not hold them all to list a few commits. A cut-off record
     # is dropped; the ones before it are complete.

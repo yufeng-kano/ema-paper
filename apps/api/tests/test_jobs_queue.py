@@ -237,6 +237,57 @@ async def test_requeue_forgets_partial_progress(sessionmaker) -> None:
 
 
 @postgres_only
+async def test_a_worker_starting_requeues_the_jobs_a_dead_one_left(sessionmaker) -> None:
+    from sightread.jobs.queue import requeue_orphaned_jobs
+
+    async with sessionmaker() as db:
+        user = await _user(db)
+        held = await enqueue_job(
+            db, user_id=user.id, sha256="6" * 64, source_path="unused-6.pdf", **JOB_DEFAULTS
+        )
+        held.status = "running"
+        held.started_at = utcnow()
+        queued = await enqueue_job(
+            db, user_id=user.id, sha256="7" * 64, source_path="unused-7.pdf", **JOB_DEFAULTS
+        )
+        await db.commit()
+        held_id, queued_id = held.id, queued.id
+    async with sessionmaker() as db:
+        # One worker per deployment: a job still running when it starts is a dead
+        # worker's, and goes back to the queue rather than counting against its user
+        # for good (docs/jobs.md).
+        assert await requeue_orphaned_jobs(db) == [held_id]
+        assert (await db.get(Job, held_id)).status == "queued"
+        assert (await db.get(Job, queued_id)).status == "queued"
+        assert await requeue_orphaned_jobs(db) == []
+
+
+async def test_a_job_whose_task_raised_is_failed_unless_already_done(sessionmaker) -> None:
+    from sightread.jobs.runner import fail_job
+
+    async with sessionmaker() as db:
+        user = await _user(db)
+        job = await enqueue_job(
+            db, user_id=user.id, sha256="8" * 64, source_path="unused-8.pdf", **JOB_DEFAULTS
+        )
+        job.status = "running"
+        done = await enqueue_job(
+            db, user_id=user.id, sha256="9" * 64, source_path="unused-9.pdf", **JOB_DEFAULTS
+        )
+        done.status = "succeeded"
+        await db.commit()
+        job_id, done_id = job.id, done.id
+    await fail_job(sessionmaker, job_id, "internal error")
+    await fail_job(sessionmaker, done_id, "internal error")
+    async with sessionmaker() as db:
+        failed = await db.get(Job, job_id)
+        assert (failed.status, failed.error) == ("failed", "internal error")
+        assert failed.finished_at is not None
+        # A result committed before what raised stays a result.
+        assert (await db.get(Job, done_id)).status == "succeeded"
+
+
+@postgres_only
 async def test_two_claimers_never_take_the_same_job(sessionmaker) -> None:
     async with sessionmaker() as db:
         user = await _user(db)

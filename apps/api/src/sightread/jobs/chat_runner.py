@@ -164,7 +164,7 @@ async def _load(
         "page_count": str(job.page_count or 1),
         "bbox_format": job.bbox_format,
         "parse_model": job.model,
-        "network": chat_agent.network_note(settings.sandbox_network),
+        "network": chat_agent.network_note(settings.sandbox_network, settings.sandbox_index_url),
         "locale": turn.locale or "en",
     }
     sandbox = SandboxClient(settings) if settings.sandbox_configured else None
@@ -548,15 +548,18 @@ async def _run_tool_unguarded(
                     max_chars=max_chars,
                     timeout_seconds=ctx.settings.chat_bash_timeout_seconds,
                 )
-                # What the shell changed is a revision of its own (docs/workspace.md).
-                outcome = await chat_tools.commit_shell_changes(
-                    ctx.paths.root,
-                    outcome,
-                    tool_input,
-                    author,
-                    max_chars=max_chars,
-                    locked=True,
-                )
+                # What the shell changed is a revision of its own (docs/workspace.md) —
+                # unless the runner could not say the command is over: a tree a process
+                # may still write is not committed under this command's name.
+                if outcome.settled:
+                    outcome = await chat_tools.commit_shell_changes(
+                        ctx.paths.root,
+                        outcome,
+                        tool_input,
+                        author,
+                        max_chars=max_chars,
+                        locked=True,
+                    )
                 if outcome.edit is not None:
                     # The library follows the tree before the viewer is told to reload,
                     # and before the lock is released: a read waiting on it must not

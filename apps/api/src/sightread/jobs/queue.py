@@ -271,6 +271,17 @@ async def claim_next_job(
     return job_id if updated.rowcount == 1 else None
 
 
+async def requeue_orphaned_jobs(db: AsyncSession) -> list[uuid.UUID]:
+    """Every job still `running` when a worker starts goes back to the queue: the
+    deployment has one worker, so a job nobody is driving is one a dead worker held,
+    and it would otherwise stay `running` for good, against its user's cap (docs/jobs.md).
+    Returns the ids, whose crops the caller discards with the partial progress."""
+    orphans = list((await db.execute(select(Job.id).where(Job.status == "running"))).scalars())
+    for job_id in orphans:
+        await requeue_job(db, job_id)
+    return orphans
+
+
 async def requeue_job(db: AsyncSession, job_id: uuid.UUID) -> bool:
     """Put an interrupted job back on the queue and forget its partial progress.
 

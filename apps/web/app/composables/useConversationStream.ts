@@ -104,7 +104,11 @@ export function useConversationStream(
         const turnId = typeof data.turn_id === 'string' ? data.turn_id : null
         if (name === 'turn_start') {
           active.value = true
-          expected = turnId
+          // A replayed start of an earlier turn must not displace the turn the panel
+          // named: only an unnamed wait takes the id from the stream.
+          if (expected === null) {
+            expected = turnId
+          }
         } else if ((name === 'turn_done' || name === 'turn_error') && (expected === null || turnId === expected)) {
           active.value = false
           expected = null

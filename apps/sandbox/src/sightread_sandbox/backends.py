@@ -137,7 +137,27 @@ class Backend:
         outcome = await shell.run(command, timeout=timeout, keep=keep)
         sandbox.last_used = time.monotonic()
         sandbox.session_used[session] = sandbox.last_used
+        # The command's kill failed and so did the VM's removal: a process may still be
+        # writing the workspace, so this is no outcome to commit a tree over. The VM is
+        # given the removal timeout to go; only Docker's word that it is gone makes the
+        # outcome one that can be returned (docs/sandbox.md § The runner).
+        if sandbox.unstoppable and not await self._wait_gone(sandbox):
+            raise RuntimeError(
+                "the sandbox VM could not be stopped; the command may still be running"
+            )
         return outcome
+
+    async def _wait_gone(self, sandbox: UserSandbox) -> bool:
+        """Poll until Docker positively reports the VM gone, within the removal timeout;
+        True clears the unstoppable mark."""
+        deadline = time.monotonic() + self.settings.sandbox_docker_timeout_seconds
+        while True:
+            if await self.is_gone(sandbox.user_id):
+                sandbox.unstoppable = False
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
 
     async def _make_room(self, sandbox: UserSandbox) -> None:
         """Close the longest idle shell when the user is at the cap (docs/sandbox.md

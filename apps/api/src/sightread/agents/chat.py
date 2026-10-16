@@ -152,9 +152,13 @@ NETWORK_NONE = (
 )
 
 
-def network_note(sandbox_network: str) -> str:
-    """The `{network}` fact: what the shell can reach, from the runner's own setting."""
-    return NETWORK_NONE if sandbox_network == "none" else NETWORK_WITH_INDEX
+def network_note(sandbox_network: str, sandbox_index_url: str) -> str:
+    """The `{network}` fact: what the shell can reach, from the runner's own settings. A
+    network alone is not an index: the VM finds a proxy only through the URL the runner
+    exports as `UV_INDEX_URL`, so both must be set for `uv add` to be promised."""
+    if sandbox_network == "none" or not sandbox_index_url.strip():
+        return NETWORK_NONE
+    return NETWORK_WITH_INDEX
 
 
 def render_system_prompt(

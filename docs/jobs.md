@@ -17,7 +17,7 @@ Enqueue happens in the **same transaction** as job-row creation — no dual-writ
 
 The worker is the same codebase as the API, launched as its own process/container (`python -m sightread.worker`). Rendering runs in Poppler subprocesses (multi-core comes free); vision calls fan out per page with an asyncio semaphore.
 
-One worker process runs one job at a time — concurrency inside a job is the page fan-out, concurrency across jobs is more worker processes. On `SIGTERM` the worker stops claiming; a job caught mid-run goes back to `queued` with its partial progress deleted, so a restart reparses it cleanly rather than resuming half a result.
+One worker process runs one job at a time — concurrency inside a job is the page fan-out, concurrency across jobs is more worker processes. On `SIGTERM` the worker stops claiming; a job caught mid-run goes back to `queued` with its partial progress deleted, so a restart reparses it cleanly rather than resuming half a result. A job whose task raised past the runner's own handling (a database error while the terminal state was being written) is marked `failed` with `internal error` by the worker loop, as a chat turn is — never requeued, since the parse ran and billed — so no row stays `running` with nobody driving it, against its user's cap; and a worker that starts puts every job still `running` back on the queue, its crops discarded with its partial progress: there is one worker per deployment, so a job nobody is driving is one a worker that was killed outright held.
 
 ## Concurrency caps (defaults)
 

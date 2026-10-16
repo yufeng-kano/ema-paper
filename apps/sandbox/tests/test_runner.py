@@ -871,3 +871,40 @@ async def test_a_vm_docker_cannot_inspect_is_unavailable_not_stopped(tmp_path, m
     answer["out"] = (1, "docker timed out")
     backend._user(7).last_used = 0
     assert await backend.stop_idle() == 0
+
+
+async def test_a_command_whose_vm_became_unstoppable_is_not_reported_done(tmp_path) -> None:
+    class Stuck(LocalBackend):
+        gone = False
+
+        def on_timeout(self, user_id):
+            async def kill_inside(*, pid: int, locked: bool = False) -> None:
+                # The in-VM kill failed and so did the removal: the process may live on.
+                self._user(user_id).unstoppable = True
+
+            return kill_inside
+
+        async def is_gone(self, user_id: int) -> bool:
+            return self.gone
+
+    settings = Settings(
+        app_env="local",
+        sandbox_token=TOKEN,
+        sandbox_backend="local",
+        sandbox_docker_timeout_seconds=1,
+        sandbox_workspaces_dir=str(tmp_path / "ws"),
+        sandbox_workspaces_mount=str(tmp_path / "ws"),
+    )
+    backend = Stuck(settings)
+    # Not an outcome the worker may commit a tree over: 503, after the removal timeout
+    # passed without Docker reporting the VM gone.
+    with pytest.raises(RuntimeError):
+        await backend.exec(81, "s", "sleep 30", timeout=0.2)
+    assert backend._user(81).unstoppable is True
+    # Still unstoppable: no command runs until Docker says the VM is gone.
+    with pytest.raises(RuntimeError):
+        await backend.exec(81, "s", "true", timeout=5)
+    backend.gone = True
+    outcome = await backend.exec(81, "s", "true", timeout=5)
+    assert outcome.exit_code == 0 and backend._user(81).unstoppable is False
+    await backend.stop(81)

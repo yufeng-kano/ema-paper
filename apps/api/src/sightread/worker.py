@@ -26,8 +26,9 @@ from .jobs.queue import (
     fail_orphaned_turns,
     fail_turn,
     requeue_job,
+    requeue_orphaned_jobs,
 )
-from .jobs.runner import run_job
+from .jobs.runner import fail_job, run_job
 from .jobs.sweeper import sweep_forever
 from .parsing.figures import discard_job_figures
 from .sandbox.client import SandboxClient
@@ -73,6 +74,11 @@ async def run_worker(stop: asyncio.Event) -> None:
                 orphans_tried_at = time.monotonic()
                 try:
                     async with sessionmaker() as db:
+                        # The parses a dead worker held go back to the queue first, their
+                        # crops with their partial progress (docs/jobs.md).
+                        for orphan in await requeue_orphaned_jobs(db):
+                            discard_job_figures(Path(settings.figures_dir), orphan)
+                            logger.warning("requeued job %s a previous worker left running", orphan)
                         finished, left = await fail_orphaned_turns(db, sandbox, settings)
                 except SQLAlchemyError:
                     logger.exception("could not finish orphaned chat turns; will retry")
@@ -164,6 +170,15 @@ async def run_worker(stop: asyncio.Event) -> None:
                     logger.info("requeued job %s on shutdown", job_id)
                 else:
                     logger.info("job %s finished before the shutdown reached it", job_id)
+            elif running.exception() is not None:
+                # The runner answers for the document's faults; what escaped it is ours,
+                # and the row must not stay `running` with nobody driving it, against
+                # its user's cap. Failed, not requeued: the parse ran and billed.
+                logger.error("job %s raised past its runner", job_id, exc_info=running.exception())
+                try:
+                    await fail_job(sessionmaker, job_id, "internal error")
+                except Exception:  # noqa: BLE001 - the next start requeues what stays running
+                    logger.exception("could not fail job %s", job_id)
     finally:
         sweeper.cancel()
         await asyncio.gather(sweeper, return_exceptions=True)

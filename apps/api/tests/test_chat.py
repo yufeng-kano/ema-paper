@@ -1291,6 +1291,22 @@ def test_an_image_past_the_pixel_cap_is_refused_before_it_is_decoded() -> None:
     assert chat_tools._as_png(small.getvalue()).startswith(b"\x89PNG")
 
 
+async def test_a_command_the_runner_could_not_settle_commits_no_tree(tmp_path) -> None:
+    from sightread.sandbox.client import SandboxUnavailable
+
+    class Client:
+        async def exec(self, *args, **kwargs):
+            raise SandboxUnavailable("the sandbox VM could not be stopped")
+
+    outcome = await chat_tools.run_bash(
+        Client(), 1, "s", {"command": "python write.py"}, max_chars=1000, timeout_seconds=5
+    )
+    assert outcome.is_error and outcome.settled is False
+    assert "recorded with the next command" in outcome.content
+    # An ordinary failure is settled: the command is over, its changes are its own.
+    assert chat_tools.ToolOutcome("x", is_error=True).settled is True
+
+
 async def test_a_worker_starting_records_what_an_orphaned_turn_left_unrecorded(
     chatting, monkeypatch
 ) -> None:
@@ -2207,12 +2223,14 @@ def test_the_prompt_lists_only_the_tools_the_turn_has() -> None:
 def test_the_prompt_promises_uv_add_only_where_the_vm_has_an_index() -> None:
     from sightread.agents import chat as chat_agent
 
-    # The runner's own setting decides: `none` is the shipped default on both examples.
-    assert "no network at all" in chat_agent.network_note("none")
-    assert "`uv add` works" not in chat_agent.network_note("none")
-    assert "`uv add` works" in chat_agent.network_note("pypi-proxy")
+    # The runner's own settings decide: `none` is the shipped default on both examples,
+    # and a network without an index URL reaches no index either.
+    assert "no network at all" in chat_agent.network_note("none", "http://proxy/simple")
+    assert "no network at all" in chat_agent.network_note("pypi-proxy", "")
+    assert "`uv add` works" not in chat_agent.network_note("none", "")
+    assert "`uv add` works" in chat_agent.network_note("pypi-proxy", "http://proxy/simple")
     rendered = chat_agent.render_system_prompt(
-        chat_agent.DEFAULT_SYSTEM_PROMPT, {"network": chat_agent.network_note("none")}
+        chat_agent.DEFAULT_SYSTEM_PROMPT, {"network": chat_agent.network_note("none", "")}
     )
     assert "no network at all" in rendered and "{network}" not in rendered
 

@@ -102,9 +102,10 @@ class Settings(BaseSettings):
     # the VM's cold start on a stopped sandbox (the runner's own SANDBOX_START_TIMEOUT_SECONDS)
     # and the reply's grace past the command's deadline (docs/sandbox.md § The runner).
     sandbox_start_timeout_seconds: int = 180
-    # The runner's own `--network`; read here too, so the prompt tells the model whether
-    # the VM can reach a package index (docs/chat.md § The system prompt).
+    # The runner's own `--network` and index URL; read here too, so the prompt tells the
+    # model whether the VM can reach a package index (docs/chat.md § System prompt).
     sandbox_network: str = "none"
+    sandbox_index_url: str = ""
     sandbox_exec_grace_seconds: int = 60
 
     domain: str = ""
