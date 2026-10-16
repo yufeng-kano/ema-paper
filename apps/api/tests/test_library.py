@@ -1019,3 +1019,34 @@ async def test_a_retry_after_a_degraded_finish_does_not_buy_a_second_parse(
         await db.commit()
     third = (await _upload(library, documents)).json()
     assert third["job_id"] != first["job_id"]
+
+
+async def test_a_filing_whose_commit_landed_despite_the_error_is_answered_as_made(
+    make_client, sessionmaker, documents, tmp_path, monkeypatch
+) -> None:
+    """The commit went through and the acknowledgement was lost: the row is read on a
+    fresh connection and the filing is answered as made — reported as nothing filed, the
+    browser's retry would file a suffixed twin (docs/workspace.md § Revisions)."""
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    library = make_client(workspaces_dir=str(tmp_path / "ws"))
+    await _ready_to_parse(library)
+    uploaded = (await _upload(library, documents)).json()
+
+    original = AsyncSession.commit
+    failing = {"on": True}
+
+    async def commit(self):
+        await original(self)
+        if failing["on"]:
+            failing["on"] = False
+            raise OperationalError("COMMIT", {}, Exception("the connection dropped"))
+
+    monkeypatch.setattr(AsyncSession, "commit", commit)
+    filed = await _file_job(library, uploaded["job_id"])
+    monkeypatch.setattr(AsyncSession, "commit", original)
+    assert filed.status_code == 201, filed.text
+    assert filed.json()["name"] == "tiny (2).png"
+    names = sorted(row["name"] for row in (await _read(library))["documents"])
+    assert names == ["tiny (2).png", "tiny.png"]

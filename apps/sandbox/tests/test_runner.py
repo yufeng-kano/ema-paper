@@ -969,3 +969,25 @@ async def test_a_restart_that_cannot_confirm_the_kill_is_not_done(tmp_path) -> N
             "ok": True
         }
     await backend.stop(91)
+
+
+async def test_a_command_past_the_cap_is_refused(tmp_path) -> None:
+    """The cap is the runner's setting, not a constant in the request model
+    (docs/sandbox.md § The runner)."""
+    settings = Settings(
+        app_env="local",
+        sandbox_token=TOKEN,
+        sandbox_backend="local",
+        sandbox_workspaces_dir=str(tmp_path / "ws"),
+        sandbox_workspaces_mount=str(tmp_path / "ws"),
+        sandbox_command_max_chars=16,
+    )
+    app = create_app(settings, LocalBackend(settings))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://runner") as http:
+        http.headers["Authorization"] = f"Bearer {TOKEN}"
+        refused = await http.post(
+            "/sandboxes/9/exec", json={"session": "s", "command": "echo " + "x" * 20}
+        )
+        assert refused.status_code == 422
+        allowed = await http.post("/sandboxes/9/exec", json={"session": "s", "command": "echo ok"})
+        assert allowed.status_code == 200 and allowed.json()["output"].strip() == "ok"

@@ -326,3 +326,28 @@ async def test_a_silent_stream_is_not_retried(key) -> None:
     with pytest.raises(UpstreamError) as silent:
         await collect(key, body)
     assert not silent.value.transient
+
+
+@respx.mock
+async def test_a_delta_or_stop_for_a_block_that_never_started_is_refused(key) -> None:
+    """A truncated or reordered stream must not be stored as a complete answer with pieces
+    missing (docs/chat.md § Conversations, turns, events)."""
+    for stray in (
+        {"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "x"}},
+        {"type": "content_block_stop", "index": 1},
+    ):
+        wild = sse(
+            {"type": "message_start", "message": {"usage": {}}},
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            },
+            stray,
+            {"type": "message_stop"},
+        )
+        respx.post(MESSAGES_URL).mock(return_value=httpx.Response(200, content=wild))
+        with pytest.raises(UpstreamError) as refused:
+            async for _ in stream_messages(key, {"messages": []}, betas=(), max_bytes=10_000_000):
+                pass
+        assert "has not started" in str(refused.value)

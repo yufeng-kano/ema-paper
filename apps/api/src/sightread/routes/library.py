@@ -13,7 +13,9 @@ the job and its output stay in the parse history that billed for them (docs/data
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import os
 import re
 import unicodedata
 import uuid
@@ -21,10 +23,12 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from fastapi import APIRouter, Request, Response, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import ColumnElement, delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.concurrency import iterate_in_threadpool
 from starlette.datastructures import FormData, UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser
 
@@ -47,7 +51,7 @@ from ..jobs.intake import (
     upload_chunks,
 )
 from ..jobs.runner import partial_result_payload, result_payload
-from ..parsing.figures import parse_bbox_path, read_crop
+from ..parsing.figures import crop_chunks, open_crop, parse_bbox_path
 from ..workspace import documents as workspace_documents
 from ..workspace import safe_io
 from ..workspace.layout import document_relative_dir, path_segment, user_root
@@ -346,6 +350,37 @@ async def _read_row(db: DbSession, model: type, row_id: int) -> tuple[bool, obje
     except Exception:  # noqa: BLE001 - the database is away
         logger.exception("could not read row %s of %s after a failed commit", row_id, model)
         return False, None
+
+
+async def commit_filing(db: DbSession, row: Document, *, what: str) -> Document:
+    """Commit a filing — its row inserted and its original in place. A commit that raises
+    is verified on a connection of its own, as a move's is: the row present means
+    PostgreSQL made it durable and the connection dropped after, so the filing stands
+    and is answered as made — reported as nothing filed, the browser's retry would file
+    a suffixed twin of the same parse; the row absent means it rolled back, and nothing
+    was filed; a read that fails says nothing either way, and is answered as unconfirmed
+    rather than as a filing that did not happen (docs/workspace.md § Revisions)."""
+    try:
+        await db.commit()
+        return row
+    except Exception as exc:  # noqa: BLE001 - verified below, whatever raised
+        readable, landed = await _read_row(db, Document, row.id)
+        if readable and isinstance(landed, Document):
+            logger.warning("the filing of document %d was committed despite the error", row.id)
+            return landed
+        with contextlib.suppress(Exception):
+            await db.rollback()
+        if readable:
+            logger.exception("the filing of document %d did not commit", row.id)
+            raise ApiError(
+                409, "invalid_request", f"{what} could not be filed; nothing was filed"
+            ) from exc
+        raise ApiError(
+            409,
+            "invalid_request",
+            f"{what} may have been filed, but the database could not confirm it; "
+            "reload the library before trying again",
+        ) from exc
 
 
 async def folder_exists(db: DbSession, user_id: int, folder_id: int) -> bool:
@@ -800,7 +835,6 @@ async def upload_document(
             await workspace_documents.adopt_source(
                 db, settings, row, job, upload=submission.upload, locked=True
             )
-            await db.commit()
         except ApiError:
             await db.rollback()
             raise
@@ -810,6 +844,8 @@ async def upload_document(
             raise ApiError(
                 409, "invalid_request", "The upload could not be kept; nothing was filed"
             ) from exc
+        # A commit that raises is verified before it is reported (docs/workspace.md).
+        row = await commit_filing(db, row, what="The upload")
     return document_payload(row, job)
 
 
@@ -890,13 +926,14 @@ async def file_job(body: DocumentFromJob, user: SessionUser, db: DbSession, sett
         # fails takes the row with it: the transaction rolls back.
         try:
             filed = await workspace_documents.inherit_original(db, settings, row, job, locked=True)
-            await db.commit()
         except Exception as exc:
             logger.exception("could not copy the original for document %d", row_id)
             await db.rollback()
             raise ApiError(
                 409, "invalid_request", "The original could not be copied; nothing was filed"
             ) from exc
+        # A commit that raises is verified before it is reported (docs/workspace.md).
+        row = await commit_filing(db, row, what="The parse")
         if not filed:
             raise ApiError(404, "invalid_request", "The file was deleted while it was being filed")
     return document_payload(row, job)
@@ -1007,7 +1044,7 @@ async def partial_result(db: DbSession, job: Job) -> dict:
     return partial_result_payload(job, list(rows))
 
 
-def figure_crop_response(settings: AppSettings, job: Job, page: int, bbox: str) -> Response:
+async def figure_crop_response(settings: AppSettings, job: Job, page: int, bbox: str) -> Response:
     """One stored crop, addressed the way its placeholder addresses it, or 404.
 
     The bbox is parsed and re-cleaned into the canonical filename, so the path on disk is
@@ -1017,15 +1054,20 @@ def figure_crop_response(settings: AppSettings, job: Job, page: int, bbox: str) 
     if cleaned is None or page < 1:
         raise ApiError(404, "invalid_request", "No such figure")
     # Where it is now: published under the job's name, or still in a running attempt's
-    # directory — read there and then, since the publication can move it before a
-    # response would open the path (docs/parsing.md § Figure crops).
-    data = read_crop(Path(settings.figures_dir), job.id, page, cleaned)
-    if data is None:
+    # directory — opened there and then, since the publication can move it before a
+    # response would open the path, and streamed from that descriptor in a thread, so a
+    # figure-heavy result holds no crop in memory and blocks no other request
+    # (docs/parsing.md § Figure crops).
+    handle = await asyncio.to_thread(open_crop, Path(settings.figures_dir), job.id, page, cleaned)
+    if handle is None:
         raise ApiError(404, "invalid_request", "No crop is stored for this figure")
+    size = os.fstat(handle.fileno()).st_size
     # Never cached: browser caches key on the URL, not the session, so a cached crop
     # would outlive a sign-out and answer the next account in the same browser profile.
-    return Response(
-        content=data, media_type="image/png", headers={"Cache-Control": "private, no-store"}
+    return StreamingResponse(
+        iterate_in_threadpool(crop_chunks(handle)),
+        media_type="image/png",
+        headers={"Cache-Control": "private, no-store", "Content-Length": str(size)},
     )
 
 
@@ -1039,7 +1081,7 @@ async def document_figure(
     settings: AppSettings,
 ):
     row = await owned_document(db, user.id, document_id)
-    return figure_crop_response(settings, await job_of(db, row.job_id), page, bbox)
+    return await figure_crop_response(settings, await job_of(db, row.job_id), page, bbox)
 
 
 # --- the workspace: where a row's directory is ----------------------------------------------

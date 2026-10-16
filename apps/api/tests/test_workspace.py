@@ -2030,3 +2030,43 @@ async def test_the_origin_is_written_before_the_directory_moves_aside(
         await reconcile.reconcile_user(db, settings, user.id)
         assert not stale.exists()
         assert paths.doc.is_file()
+
+
+async def test_a_revert_whose_reconciliation_fails_is_reported_as_reverted_and_followed_later(
+    sessionmaker, tmp_path, monkeypatch
+) -> None:
+    """The revert is a revision before the rows follow it: a reconciliation that fails
+    after its commit is reported as such, and the next read of the document brings the
+    row in line rather than writing a fresh copy at the path it still names
+    (docs/workspace.md § Revisions)."""
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        before = await documents.materialize_document(db, settings, document)
+        document.name = "renamed.pdf"
+        await db.commit()
+        after = await documents.document_paths(db, settings, document)
+        await documents.move_path(settings, user.id, before.relative, after.relative)
+        rename = git.log(after.root)[0]
+
+        real = reconcile.reconcile_locked
+
+        async def failing(*args, **kwargs):
+            raise RuntimeError("the database went away")
+
+        monkeypatch.setattr(reconcile, "reconcile_locked", failing)
+        with pytest.raises(ApiError) as refused:
+            await documents.revert(db, settings, document, rename.commit)
+        monkeypatch.setattr(reconcile, "reconcile_locked", real)
+        assert refused.value.status_code == 409
+        assert "reverted" in refused.value.message
+        # The tree is reverted; the row still names the vacated path.
+        assert before.doc.is_file() and not after.directory.exists()
+        assert git.log(after.root)[0].message == f"revert {rename.commit[:12]}"
+        await db.refresh(document)
+        assert document.name == "renamed.pdf"
+        # The next read follows the tree instead of materializing at the row's path.
+        paths = await documents.materialize_document(db, settings, document)
+        assert paths.relative == before.relative
+        assert document.name == "paper.pdf"
+        assert not after.directory.exists()

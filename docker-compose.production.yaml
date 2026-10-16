@@ -155,6 +155,9 @@ services:
       PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
       PGDATABASE: ${POSTGRES_DB:-sightread}
       PGHOST: pg
+      # How long a pass waits for unconfirmed shell commands to clear before archiving
+      # regardless (docs/workspace.md § Backups).
+      BACKUP_WRITING_WAIT_SECONDS: ${BACKUP_WRITING_WAIT_SECONDS:-3600}
     volumes:
       - ./backups:/backups
       - figures:/data/figures:ro
@@ -180,6 +183,18 @@ services:
           # the end of the archive, and every workspace write takes it shared, so no
           # rename, save or shell commit lands between the rows and the tree.
           mkdir -p /data/workspaces/.repos
+          # A `.repos/<user>.writing` marker names a shell command nobody could confirm
+          # over: that VM may still be writing into its tree, and an archive taken now
+          # would hold files mid-write. The pass waits for the markers to clear, up to
+          # BACKUP_WRITING_WAIT_SECONDS, then archives regardless — a late backup beats
+          # none — and names the users it could not quiesce in the stamp's
+          # unconfirmed-writes.txt (docs/workspace.md § Backups).
+          waited=0
+          while ls /data/workspaces/.repos/*.writing >/dev/null 2>&1 && [ "$$waited" -lt "$$BACKUP_WRITING_WAIT_SECONDS" ]; do
+            echo "backup: an unconfirmed shell command stands; waiting ($$waited s so far)"
+            sleep 60
+            waited=$$((waited + 60))
+          done
           # Written into a staging directory and published by one rename: a stamp
           # directory under /backups is complete by construction, never a dump without
           # its figures or workspaces archive, whatever stops the host in between.
@@ -189,7 +204,9 @@ services:
             pg_dump --format=custom --file="'"$$staging"'/sightread.dump" &&
             tar -czf "'"$$staging"'/figures.tar.gz" -C /data figures &&
             tar -czf "'"$$staging"'/workspaces.tar.gz" -C /data \
-              --exclude="workspaces/.repos/*.lock" workspaces'; then
+              --exclude="workspaces/.repos/*.lock" workspaces &&
+            { ls /data/workspaces/.repos/*.writing 2>/dev/null | sed "s#.*/##" > "'"$$staging"'/unconfirmed-writes.txt";
+              [ -s "'"$$staging"'/unconfirmed-writes.txt" ] || rm -f "'"$$staging"'/unconfirmed-writes.txt"; }'; then
             mv "$$staging" "/backups/$$stamp"
             echo "backup: published /backups/$$stamp (dump + figures + workspaces)"
           else

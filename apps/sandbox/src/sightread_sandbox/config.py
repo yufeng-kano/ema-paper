@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     # Shells one user's VM keeps open at once; the longest idle one makes room for a new one.
     sandbox_max_shells: int = 8
     sandbox_output_max_bytes: int = 262_144
+    # The longest command the runner accepts, in characters; a longer one answers 422.
+    sandbox_command_max_chars: int = 65_536
     # The longest a single command may run, whatever the caller asked for.
     sandbox_command_timeout_max: int = 600
     # How long Docker is given to remove a VM on stop.

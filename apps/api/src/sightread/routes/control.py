@@ -939,4 +939,4 @@ async def job_figure(
     db: DbSession,
     settings: AppSettings,
 ):
-    return figure_crop_response(settings, await owned_job(db, user.id, job_id), page, bbox)
+    return await figure_crop_response(settings, await owned_job(db, user.id, job_id), page, bbox)

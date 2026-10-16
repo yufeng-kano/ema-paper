@@ -262,6 +262,24 @@ async def materialize_document(
             raise ApiError(404, "invalid_request", "No such document") from exc
         paths = await document_paths(db, settings, document)
         if safe_io.entry_kind(root, paths.directory) == "none":
+            # Missing where the row points while HEAD holds this document's metadata
+            # elsewhere: the tree moved it (a reverted rename whose reconciliation
+            # failed after the revert's commit) and the row has not followed. Reconcile
+            # first, or a fresh copy would be written beside the real one
+            # (docs/workspace.md § Revisions).
+            elsewhere = await asyncio.to_thread(
+                git.path_at_head_containing,
+                root,
+                f'"document_id": {document.id},',
+                f"*/{META_FILE}",
+            )
+            if elsewhere is not None and elsewhere != paths.relative / META_FILE:
+                from .reconcile import reconcile_locked
+
+                await reconcile_locked(db, settings, document.user_id)
+                await db.refresh(document)
+                paths = await document_paths(db, settings, document)
+        if safe_io.entry_kind(root, paths.directory) == "none":
             await ensure_within_quota(settings, root)
         written = await asyncio.to_thread(
             _materialize_files,
@@ -970,8 +988,30 @@ async def revert(
             settings.revert_max_bytes,
             settings.revert_max_paths,
         )
-        await reconcile_locked(db, settings, document.user_id)
-        content = await read_content(db, settings, document, locked=True)
+        try:
+            await reconcile_locked(db, settings, document.user_id)
+            content = await read_content(db, settings, document, locked=True)
+        except ApiError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the revert stands; what failed is reported
+            # The revert is a revision now; what failed is bringing the rows in line with
+            # it (the database away at that moment). Said so, rather than reported as a
+            # revert that did not happen: the rows follow at the next read of the
+            # document, which reconciles first when HEAD holds the document elsewhere
+            # than the row says, or at the next turn's reconciliation
+            # (docs/workspace.md § Revisions).
+            logger.exception(
+                "revision %s of user %d was reverted as %s, but the library could not follow",
+                commit,
+                document.user_id,
+                made,
+            )
+            raise ApiError(
+                409,
+                "invalid_request",
+                "The revision was reverted, but the library could not be brought in line "
+                "with it; reload the document",
+            ) from exc
     return Reverted(commit=made, revision=content.revision)
 
 

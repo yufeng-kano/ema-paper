@@ -25,7 +25,8 @@ IDLE_SWEEP_SECONDS = 60.0
 
 class ExecBody(BaseModel):
     session: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
-    command: str = Field(min_length=1, max_length=65_536)
+    # The length cap is the runner's setting, checked in the handler (docs/sandbox.md).
+    command: str = Field(min_length=1)
     timeout_seconds: int = Field(default=120, ge=1)
 
 
@@ -86,6 +87,11 @@ def create_app(settings: Settings | None = None, backend: Backend | None = None)
 
     @app.post("/sandboxes/{user_id}/exec", dependencies=guard)
     async def sandbox_exec(user_id: int, body: ExecBody) -> dict:
+        if len(body.command) > settings.sandbox_command_max_chars:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                f"the command is longer than {settings.sandbox_command_max_chars} characters",
+            )
         timeout = min(body.timeout_seconds, settings.sandbox_command_timeout_max)
         try:
             outcome = await backend.exec(user_id, body.session, body.command, timeout=timeout)

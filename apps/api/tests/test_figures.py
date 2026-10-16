@@ -117,10 +117,11 @@ def test_a_running_jobs_crop_is_found_in_its_attempt_directory(tmp_path) -> None
     assert find_crop(tmp_path, job_id, 1, bbox) == crop_path(tmp_path, job_id, 1, bbox)
 
 
-def test_a_crop_published_under_the_read_is_read_where_it_landed(tmp_path, monkeypatch) -> None:
-    """The publication can rename the attempt directory between the lookup and the read:
-    the read is tried again where the crop landed, and the route answers bytes rather
-    than a path the rename may have moved (docs/parsing.md § Figure crops)."""
+def test_a_crop_published_under_the_open_is_opened_where_it_landed(tmp_path, monkeypatch) -> None:
+    """The publication can rename the attempt directory between the lookup and the open:
+    the open is tried again where the crop landed, and the route streams from that
+    descriptor rather than from a path the rename may have moved (docs/parsing.md
+    § Figure crops)."""
     from sightread.parsing import figures
 
     job_id = uuid.uuid4()
@@ -141,6 +142,8 @@ def test_a_crop_published_under_the_read_is_read_where_it_landed(tmp_path, monke
         return path
 
     monkeypatch.setattr(figures, "find_crop", racing)
-    assert figures.read_crop(tmp_path, job_id, 1, bbox) == b"crop"
-    assert looks == 2
-    assert figures.read_crop(tmp_path, uuid.uuid4(), 1, bbox) is None
+    handle = figures.open_crop(tmp_path, job_id, 1, bbox)
+    assert handle is not None and looks == 2
+    assert b"".join(figures.crop_chunks(handle)) == b"crop"
+    assert handle.closed
+    assert figures.open_crop(tmp_path, uuid.uuid4(), 1, bbox) is None

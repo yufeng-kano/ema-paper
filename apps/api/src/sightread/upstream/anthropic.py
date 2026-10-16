@@ -276,7 +276,13 @@ async def stream_messages(
                 elif kind == "content_block_delta":
                     index = _index(data)
                     if index >= len(blocks):
-                        continue
+                        # A delta for a block that never started: a truncated or reordered
+                        # stream, whose answer would be stored with pieces missing — or a
+                        # tool call with no input — were the delta dropped and the stop
+                        # accepted (docs/chat.md § Conversations, turns, events).
+                        raise UpstreamError(
+                            "The upstream sent a delta for a content block that has not started"
+                        )
                     delta = data.get("delta") or {}
                     delta_type = delta.get("type")
                     block = blocks[index]
@@ -300,7 +306,9 @@ async def stream_messages(
                 elif kind == "content_block_stop":
                     index = _index(data)
                     if index >= len(blocks):
-                        continue
+                        raise UpstreamError(
+                            "The upstream sent a stop for a content block that has not started"
+                        )
                     block = blocks[index]
                     if block.get("type") == "tool_use":
                         raw = "".join(partial_json.pop(index, []))

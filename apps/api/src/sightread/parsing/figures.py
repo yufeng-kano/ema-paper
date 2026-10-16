@@ -16,7 +16,9 @@ import logging
 import re
 import shutil
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
+from typing import BinaryIO
 
 from PIL import Image
 
@@ -72,21 +74,32 @@ def find_crop(figures_dir: Path, job_id: uuid.UUID, page: int, bbox: Bbox) -> Pa
     return final if final.is_file() else None
 
 
-def read_crop(figures_dir: Path, job_id: uuid.UUID, page: int, bbox: Bbox) -> bytes | None:
-    """The crop's bytes, wherever it is now: read where `find_crop` finds it, and looked up
-    once more when the path vanished under the read — the attempt directory published
-    while it was open. Bytes rather than a path, since a path can be moved before a
-    response opens it (docs/parsing.md § Figure crops). None when no attempt has written
-    it."""
+def open_crop(figures_dir: Path, job_id: uuid.UUID, page: int, bbox: Bbox) -> BinaryIO | None:
+    """The crop open for reading, wherever it is now: opened where `find_crop` finds it,
+    and looked up once more when the path vanished under the open — the attempt
+    directory published in between. A descriptor rather than a path, since a path can
+    be moved before a response opens it, and a descriptor rather than the bytes, since
+    the response streams from it off the event loop (docs/parsing.md § Figure crops).
+    None when no attempt has written it."""
     for _ in range(2):
         path = find_crop(figures_dir, job_id, page, bbox)
         if path is None:
             return None
         try:
-            return path.read_bytes()
+            return path.open("rb")
         except FileNotFoundError:
             continue
     return None
+
+
+CROP_CHUNK_BYTES = 65_536
+
+
+def crop_chunks(handle: BinaryIO) -> Iterator[bytes]:
+    """The open crop in chunks, closed at the end or when the reader stops."""
+    with handle:
+        while chunk := handle.read(CROP_CHUNK_BYTES):
+            yield chunk
 
 
 def discard_job_figures(figures_dir: Path, job_id: uuid.UUID) -> None:

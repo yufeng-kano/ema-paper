@@ -210,6 +210,30 @@ def tracked_at_head(root: Path, relative: Path) -> bool:
     return proc.returncode == 0
 
 
+def path_at_head_containing(root: Path, needle: str, pathspec: str) -> Path | None:
+    """The first path under `pathspec` whose content at `HEAD` holds `needle` as a fixed
+    string, or None: one `git grep` over the committed tree, so a row whose directory is
+    missing can tell a document never materialized from one the tree moved
+    (docs/workspace.md § Revisions)."""
+    proc = _git(
+        root,
+        "grep",
+        "-l",
+        "--fixed-strings",
+        "-e",
+        needle,
+        "HEAD",
+        "--",
+        pathspec,
+        check=False,
+    )
+    if proc.returncode != 0:  # 1: no match; 128: no HEAD yet
+        return None
+    first = proc.stdout.splitlines()[0] if proc.stdout else ""
+    _tree, _colon, path = first.partition(":")
+    return Path(path) if path else None
+
+
 def missing_at_head(root: Path, relatives: list[Path]) -> list[Path]:
     """Those of `relatives` that `HEAD` does not hold — all of them when there is no
     `HEAD` yet. One `ls-tree` for the lot: what a materialization asks of every
