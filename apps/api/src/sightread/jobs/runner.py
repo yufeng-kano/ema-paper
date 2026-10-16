@@ -289,8 +289,10 @@ async def _process_pdf_page(
         return outcome
 
     convention = convention_for_job(job.model, job.pipeline_version)
-    # Pillow work, so it runs beside the in-flight HTTP calls rather than under them.
-    sent = await asyncio.to_thread(prepare_image, image, convention)
+    # Pillow work, so it runs beside the in-flight HTTP calls rather than under them —
+    # and settled under a cancel, so no thread writes the work directory after the
+    # requeue has removed it.
+    sent = await _to_the_end(asyncio.to_thread(prepare_image, image, convention))
     try:
         transcription = await _guarded_call(
             state,
@@ -344,7 +346,7 @@ async def _process_image(
         method=VISION,
     )
     convention = convention_for_job(job.model, job.pipeline_version)
-    sent = await asyncio.to_thread(prepare_image, normalized.path, convention)
+    sent = await _to_the_end(asyncio.to_thread(prepare_image, normalized.path, convention))
     try:
         transcription = await _guarded_call(
             state,
@@ -456,19 +458,21 @@ async def fail_job(
     await _finish(sessionmaker, job_id, status="failed", error=error, settings=settings)
 
 
-async def _to_the_end(coro) -> None:
+async def _to_the_end(coro):
     """Await `coro` so that a cancel of the caller waits for it instead of interrupting
     it; the cancel is raised once it is done. For the finalization of a committed result
     (docs/jobs.md § Retention): the row is `succeeded`, so a shutdown's requeue would
     not take it back, and what is half-copied under a lock that a cancel released would
-    be nobody's to finish."""
+    be nobody's to finish. And for a page's image preparation in a thread, which a
+    cancelled await does not stop: the work directory is removed and the job requeued
+    only once nothing writes into it any more."""
     task = asyncio.ensure_future(coro)
     try:
-        await asyncio.shield(task)
+        return await asyncio.shield(task)
     except asyncio.CancelledError:
         await asyncio.wait({task})
         if not task.cancelled() and task.exception() is not None:
-            logger.error("finalization failed during shutdown", exc_info=task.exception())
+            logger.error("work interrupted by a cancel failed", exc_info=task.exception())
         raise
 
 

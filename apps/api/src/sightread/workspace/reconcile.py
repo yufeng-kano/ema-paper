@@ -330,8 +330,10 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
         # The aside is a folder's directory whole when its surviving rows all place it at
         # one path: it goes back whole, with whatever else the folder held — files and
         # directories the shell made, which no row names — rather than document by
-        # document with the rest swept (docs/workspace.md § Revisions).
-        whole = _aside_origin(Path(name), targets)
+        # document with the rest swept (docs/workspace.md § Revisions). Only when every
+        # document in it still has its row: a document deleted since must not come back
+        # under `files/` with the folder, readable from the shell and named by nothing.
+        whole = _aside_origin(Path(name), targets) if len(targets) == len(inside) else None
         if whole is not None and await asyncio.to_thread(_restore_aside, root, Path(name), whole):
             restored += 1
             continue

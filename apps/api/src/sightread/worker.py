@@ -30,6 +30,7 @@ from .jobs.queue import (
     requeue_job,
     requeue_orphaned_jobs,
     try_worker_lock,
+    watch_worker_lock,
 )
 from .jobs.runner import fail_job, run_job
 from .jobs.sweeper import sweep_forever
@@ -44,6 +45,8 @@ IDLE_POLL_SECONDS = 2.0
 ORPHAN_RETRY_SECONDS = 30.0
 # How often a worker that found the worker lock held asks again (a rolling restart).
 WORKER_LOCK_RETRY_SECONDS = 5.0
+# How often the worker checks that its lock's session is still alive.
+WORKER_LOCK_PING_SECONDS = 5.0
 
 
 def render_worker_count(configured: int) -> int:
@@ -72,6 +75,13 @@ async def run_worker(stop: asyncio.Event) -> None:
             await release_worker_lock(lock)
         await engine.dispose()
         return
+    # The lock is the session's: lost with it, so the worker stops — and the loop below
+    # cancels the job or turn in flight — rather than run on beside a replacement.
+    lock_watch = (
+        asyncio.create_task(watch_worker_lock(lock, stop, WORKER_LOCK_PING_SECONDS))
+        if lock is not None
+        else None
+    )
     sessionmaker = create_sessionmaker(engine)
     render_count = render_worker_count(settings.render_workers)
     render_slots = asyncio.Semaphore(render_count)
@@ -208,6 +218,9 @@ async def run_worker(stop: asyncio.Event) -> None:
     finally:
         sweeper.cancel()
         await asyncio.gather(sweeper, return_exceptions=True)
+        if lock_watch is not None:
+            lock_watch.cancel()
+            await asyncio.gather(lock_watch, return_exceptions=True)
         if lock is not None:
             await release_worker_lock(lock)
         await engine.dispose()

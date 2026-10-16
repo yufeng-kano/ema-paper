@@ -312,10 +312,32 @@ async def try_worker_lock(engine: AsyncEngine) -> AsyncConnection | None:
     return None
 
 
+async def watch_worker_lock(
+    connection: AsyncConnection, stop: asyncio.Event, interval_seconds: float
+) -> None:
+    """Keep asking the lock's session whether it is alive, until `stop`. PostgreSQL
+    releases a session-level advisory lock with the session: a restart or a dropped
+    connection hands it to a waiting worker, which then requeues every `running` job,
+    so this one must stop and cancel its work the moment its session is gone, rather
+    than finish a parse beside the worker that took it (docs/jobs.md)."""
+    while not stop.is_set():
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stop.wait(), timeout=interval_seconds)
+        if stop.is_set():
+            return
+        try:
+            (await connection.execute(text("SELECT 1"))).scalar_one()
+        except Exception:  # noqa: BLE001 - any failure means the session is not ours to trust
+            logger.error("the worker lock's session is gone; stopping, the lock may be another's")
+            stop.set()
+            return
+
+
 async def release_worker_lock(connection: AsyncConnection) -> None:
     with contextlib.suppress(Exception):
         await connection.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": WORKER_LOCK_KEY})
-    await connection.close()
+    with contextlib.suppress(Exception):
+        await connection.close()
 
 
 async def requeue_orphaned_jobs(db: AsyncSession) -> list[uuid.UUID]:

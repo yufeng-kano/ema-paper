@@ -251,6 +251,34 @@ async def test_one_worker_holds_the_worker_lock_at_a_time(sessionmaker) -> None:
     await release_worker_lock(second)
 
 
+async def test_a_worker_stops_when_its_lock_session_is_gone() -> None:
+    from sightread.jobs.queue import watch_worker_lock
+
+    class Session:
+        alive = True
+
+        async def execute(self, statement):
+            if not self.alive:
+                raise RuntimeError("connection is closed")
+
+            class Result:
+                def scalar_one(self):
+                    return 1
+
+            return Result()
+
+    stop = asyncio.Event()
+    session = Session()
+    watching = asyncio.ensure_future(watch_worker_lock(session, stop, 0.02))
+    await asyncio.sleep(0.08)
+    assert not stop.is_set() and not watching.done()
+    # The session is lost: PostgreSQL has released the lock with it, and a waiting worker
+    # may hold it now, so this one stops and its loop cancels the work in flight.
+    session.alive = False
+    await asyncio.wait_for(watching, 2)
+    assert stop.is_set()
+
+
 @postgres_only
 async def test_a_worker_starting_requeues_the_jobs_a_dead_one_left(sessionmaker) -> None:
     from sightread.jobs.queue import requeue_orphaned_jobs

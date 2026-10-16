@@ -578,6 +578,35 @@ async def test_a_folder_set_aside_by_a_crashed_delete_comes_back_whole(
         assert git.log(root)[0].message == "restore files/Papers"
 
 
+async def test_an_aside_holding_a_deleted_document_does_not_come_back_whole(
+    sessionmaker, tmp_path
+) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        other = Document(
+            user_id=user.id, folder_id=document.folder_id, job_id=document.job_id, name="other.pdf"
+        )
+        db.add(other)
+        await db.commit()
+        paths = await documents.materialize_document(db, settings, document)
+        other_paths = await documents.materialize_document(db, settings, other)
+        root = paths.root
+        (root / "files" / "Papers" / "scratch.txt").write_text("notes\n")
+        git.commit_all(root, "agent:1", "bash: scratch")
+        removal = await documents.remove_path(settings, user.id, Path("files/Papers"))
+        assert removal is not None
+        # One of the folder's documents was deleted for good before the recovery ran:
+        # the folder does not come back whole around it.
+        await db.delete(other)
+        await db.commit()
+        assert await reconcile.reconcile_user(db, settings, user.id) >= 1
+        assert paths.doc.read_text() == "# Title\n\nBody\n"
+        assert not other_paths.directory.exists()
+        assert not (root / "files" / "Papers" / "scratch.txt").exists()
+        assert not [name for name in os.listdir(root) if name.startswith(safe_io.TEMP_PREFIX)]
+
+
 async def test_a_failed_library_parse_keeps_its_original(sessionmaker, tmp_path) -> None:
     from sightread.jobs import runner
 
@@ -1325,28 +1354,31 @@ async def test_a_revert_whose_revision_cannot_be_recorded_is_rolled_back(
                 raise git.GitError("disk full")
             return real(root_, author, message, paths_)
 
-        # Edits a failed shell commit left unrecorded elsewhere in the tree: not this
-        # revert's to discard when it rolls back.
+        # Edits a failed shell commit left unrecorded — elsewhere in the tree, and in the
+        # very file the revert rewrites: not this revert's to discard when it rolls back.
         paths.notes.write_text("unrecorded notes\n")
         (paths.directory / "scratch.txt").write_text("untracked\n")
+        paths.doc.write_text("# Title\n\nShelled, then edited\n")
 
         monkeypatch.setattr(git, "commit_paths", refuse)
         with pytest.raises(ApiError) as refused:
             await documents.revert(db, settings, document, shell)
         assert refused.value.status_code == 409
-        # The tree as it was, the head unchanged; the revert's own paths clean, the
-        # unrecorded edits still there.
-        assert paths.doc.read_text() == "# Title\n\nShelled\n"
+        # The tree as it was before the revert began, the head unchanged: the paths the
+        # revert touched hold what they held, the unrecorded edits still there.
+        assert paths.doc.read_text() == "# Title\n\nShelled, then edited\n"
         assert (paths.directory / "helper.py").read_text() == "print(1)\n"
         assert paths.notes.read_text() == "unrecorded notes\n"
         assert (paths.directory / "scratch.txt").read_text() == "untracked\n"
         dirty = git._git(root, "status", "--porcelain", check=False).stdout.strip().splitlines()
         assert sorted(line.split()[-1] for line in dirty) == [
+            "files/Papers/paper.pdf/doc.md",
             "files/Papers/paper.pdf/notes.md",
             "files/Papers/paper.pdf/scratch.txt",
         ]
         assert git.log(root)[0].commit == shell
         paths.notes.write_text("")
+        paths.doc.write_text("# Title\n\nShelled\n")
         (paths.directory / "scratch.txt").unlink()
         monkeypatch.setattr(git, "commit_paths", real)
         await documents.revert(db, settings, document, shell)

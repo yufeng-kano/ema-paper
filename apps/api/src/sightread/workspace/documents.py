@@ -773,6 +773,18 @@ def _revert(
     if not moves and not writes and not removals:
         raise ApiError(400, "invalid_request", "That revision changed nothing")
 
+    # What the files the revert will write or remove hold *now* — which may be an edit a
+    # failed shell commit left unrecorded, not what the head revision has — so a rollback
+    # puts back exactly that. A file too large to hold is restored from the head instead.
+    before_revert: dict[Path, bytes | None] = {}
+    unheld: set[Path] = set()
+    for now in [now for now, _data in writes] + removals:
+        try:
+            before_revert[now] = safe_io.read_bytes(root, root / now, max_bytes)
+        except (safe_io.EntryTooLarge, safe_io.UnsafeEntry, OSError):
+            # Present but not readable whole: the head revision is the best it can get.
+            unheld.add(now)
+
     # Phase two: apply, every step through descriptors that follow nothing. What was
     # done is kept so that a failure anywhere — the tree, or the revision that records
     # it — rolls the tree back to as it was (docs/workspace.md § Revisions).
@@ -781,9 +793,10 @@ def _revert(
     moved_aside: list[tuple[Path, Path]] = []
 
     def rollback() -> None:
-        # Only what this revert touched goes back to the head revision: the tree may
-        # hold edits a failed shell commit left unrecorded, and those are not this
-        # revert's to discard (docs/workspace.md § Revisions).
+        # Only what this revert touched goes back, and to what it held before the revert
+        # began: the tree may hold edits a failed shell commit left unrecorded, in these
+        # files or elsewhere, and those are not this revert's to discard
+        # (docs/workspace.md § Revisions).
         git.reset_index(root)
         for source, target in reversed(moved_aside):
             with contextlib.suppress(OSError, safe_io.UnsafeEntry):
@@ -791,11 +804,17 @@ def _revert(
         for current, then in reversed(done_moves):
             with contextlib.suppress(OSError, safe_io.UnsafeEntry):
                 safe_io.rename(root, root / then, root / current)
-        touched = {now for now, _data in writes} | set(removals) | set(restored)
-        tracked = [now for now in touched if git.tracked_at_head(root, now)]
+        for now, data in before_revert.items():
+            with contextlib.suppress(OSError, safe_io.UnsafeEntry):
+                if data is None:
+                    if safe_io.remove_file(root, root / now):
+                        _prune_empty(root, (root / now).parent)
+                else:
+                    safe_io.write_bytes(root, root / now, data)
+        tracked = [now for now in unheld if git.tracked_at_head(root, now)]
         if tracked:
             git.restore_paths(root, tracked)
-        for now in touched - set(tracked):
+        for now in unheld - set(tracked):
             with contextlib.suppress(OSError, safe_io.UnsafeEntry):
                 safe_io.remove_file(root, root / now)
                 _prune_empty(root, (root / now).parent)
