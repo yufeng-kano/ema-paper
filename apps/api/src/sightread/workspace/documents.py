@@ -271,7 +271,17 @@ async def materialize_document(
             result=result,
             figures_dir=Path(settings.figures_dir),
         )
-        if written:
+        # What was written needs a commit — and so does what an earlier materialization
+        # wrote and never committed (the process died between the two): left in place
+        # untracked, the first edit would commit `doc.md` as a new file rather than a
+        # change against the parse baseline, and its revert would empty the document
+        # (docs/workspace.md § Layout).
+        uncommitted = written or await asyncio.to_thread(
+            git.missing_at_head,
+            paths.root,
+            [paths.relative / name for name in (DOC_FILE, NOTES_FILE, META_FILE)],
+        )
+        if uncommitted:
             try:
                 await asyncio.to_thread(
                     git.commit_paths,
@@ -1084,24 +1094,27 @@ def _remove_tree(root: Path, relative: Path, message: str) -> Removal | None:
         return None
     aside = Path(f"{safe_io.TEMP_PREFIX}{uuid.uuid4().hex}")
     try:
+        # Where it stood, written first: what brings the directory back should the rows
+        # survive and nothing inside it name a document. First, so a process that dies
+        # between the two steps leaves a marker beside no aside — swept by the next
+        # reconciliation, the directory standing where it was — and never an aside that
+        # no marker names, which that sweep would take whole (docs/workspace.md
+        # § Revisions).
+        safe_io.write_text(root, origin_marker(root, aside), relative.as_posix() + "\n")
+    except (OSError, safe_io.UnsafeEntry) as exc:
+        raise ApiError(
+            409, "invalid_request", "The removal could not be recorded; nothing was changed"
+        ) from exc
+    try:
         # Aside rather than gone: outside `files/` and outside history, the directory
         # waits whole — originals and crops included — until the rows are gone, and comes
         # back whole if they are not. Through descriptors that follow nothing: an
         # ancestor the shell swapped for a link to another tree is a refusal.
         safe_io.rename(root, root / relative, root / aside)
     except safe_io.UnsafeEntry as exc:
+        with contextlib.suppress(OSError, safe_io.UnsafeEntry):
+            safe_io.remove_file(root, origin_marker(root, aside))
         raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
-    try:
-        # Where it stood, beside it: what brings it back should the rows survive and
-        # nothing inside it name a document (docs/workspace.md § Revisions).
-        safe_io.write_text(root, origin_marker(root, aside), relative.as_posix() + "\n")
-    except (OSError, safe_io.UnsafeEntry) as exc:
-        # Without the origin, an aside holding no document metadata would be swept: back
-        # where it was, and the delete refused, rather than data lost to a full disk.
-        safe_io.rename(root, root / aside, root / relative)
-        raise ApiError(
-            409, "invalid_request", "The removal could not be recorded; nothing was changed"
-        ) from exc
     try:
         commit = git.commit_paths(root, git.USER_AUTHOR, message, [relative])
     except git.GitError as exc:

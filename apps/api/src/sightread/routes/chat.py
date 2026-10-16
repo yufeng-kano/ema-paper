@@ -33,7 +33,7 @@ from ..db.models import (
 )
 from ..errors import ApiError
 from ..jobs import chat_events
-from ..jobs.queue import count_active_turns, enqueue_turn
+from ..jobs.queue import HISTORY_FULL, count_active_turns, enqueue_turn, history_bytes
 from ..sandbox.client import SandboxClient, SandboxUnavailable
 from ..workspace.documents import (
     current_revision,
@@ -332,6 +332,11 @@ async def post_message(
         )
     if await _active_turn(db, row.id) is not None:
         raise ApiError(409, "invalid_request", "This conversation is still answering")
+    # Under the conversation's lock: a history past the cap takes no further message, or
+    # capped-size sends would grow it without end while every turn on it failed
+    # (docs/chat.md § History is append-only).
+    if await history_bytes(db, row.id) > settings.chat_history_max_bytes:
+        raise ApiError(409, "invalid_request", HISTORY_FULL)
 
     content: list[dict] = [{"type": "text", "text": body.text}]
     selection = (body.selection or "").strip()

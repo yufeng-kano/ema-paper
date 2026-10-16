@@ -21,7 +21,6 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from fastapi import APIRouter, Request, Response, status
-from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import ColumnElement, delete, select, update
 from sqlalchemy.exc import IntegrityError
@@ -48,7 +47,7 @@ from ..jobs.intake import (
     upload_chunks,
 )
 from ..jobs.runner import partial_result_payload, result_payload
-from ..parsing.figures import find_crop, parse_bbox_path
+from ..parsing.figures import parse_bbox_path, read_crop
 from ..workspace import documents as workspace_documents
 from ..workspace import safe_io
 from ..workspace.layout import document_relative_dir, path_segment, user_root
@@ -1008,7 +1007,7 @@ async def partial_result(db: DbSession, job: Job) -> dict:
     return partial_result_payload(job, list(rows))
 
 
-def figure_crop_response(settings: AppSettings, job: Job, page: int, bbox: str) -> FileResponse:
+def figure_crop_response(settings: AppSettings, job: Job, page: int, bbox: str) -> Response:
     """One stored crop, addressed the way its placeholder addresses it, or 404.
 
     The bbox is parsed and re-cleaned into the canonical filename, so the path on disk is
@@ -1018,14 +1017,15 @@ def figure_crop_response(settings: AppSettings, job: Job, page: int, bbox: str) 
     if cleaned is None or page < 1:
         raise ApiError(404, "invalid_request", "No such figure")
     # Where it is now: published under the job's name, or still in a running attempt's
-    # directory (docs/parsing.md § Figure crops).
-    path = find_crop(Path(settings.figures_dir), job.id, page, cleaned)
-    if path is None:
+    # directory — read there and then, since the publication can move it before a
+    # response would open the path (docs/parsing.md § Figure crops).
+    data = read_crop(Path(settings.figures_dir), job.id, page, cleaned)
+    if data is None:
         raise ApiError(404, "invalid_request", "No crop is stored for this figure")
     # Never cached: browser caches key on the URL, not the session, so a cached crop
     # would outlive a sign-out and answer the next account in the same browser profile.
-    return FileResponse(
-        path, media_type="image/png", headers={"Cache-Control": "private, no-store"}
+    return Response(
+        content=data, media_type="image/png", headers={"Cache-Control": "private, no-store"}
     )
 
 

@@ -115,3 +115,32 @@ def test_a_running_jobs_crop_is_found_in_its_attempt_directory(tmp_path) -> None
     (tmp_path / str(job_id)).mkdir()
     (tmp_path / str(job_id) / "p1_10_20_30_40.png").write_bytes(b"published")
     assert find_crop(tmp_path, job_id, 1, bbox) == crop_path(tmp_path, job_id, 1, bbox)
+
+
+def test_a_crop_published_under_the_read_is_read_where_it_landed(tmp_path, monkeypatch) -> None:
+    """The publication can rename the attempt directory between the lookup and the read:
+    the read is tried again where the crop landed, and the route answers bytes rather
+    than a path the rename may have moved (docs/parsing.md § Figure crops)."""
+    from sightread.parsing import figures
+
+    job_id = uuid.uuid4()
+    bbox = (10, 20, 30, 40)
+    attempt = tmp_path / f"{job_id}.abc123"
+    attempt.mkdir()
+    (attempt / "p1_10_20_30_40.png").write_bytes(b"crop")
+    real = figures.find_crop
+    looks = 0
+
+    def racing(figures_dir, job, page, box):
+        nonlocal looks
+        looks += 1
+        path = real(figures_dir, job, page, box)
+        if looks == 1:
+            # The result commits between the look and the read.
+            figures.publish_job_figures(figures_dir, job, attempt)
+        return path
+
+    monkeypatch.setattr(figures, "find_crop", racing)
+    assert figures.read_crop(tmp_path, job_id, 1, bbox) == b"crop"
+    assert looks == 2
+    assert figures.read_crop(tmp_path, uuid.uuid4(), 1, bbox) is None

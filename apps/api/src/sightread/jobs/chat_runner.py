@@ -17,7 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from sqlalchemy import LargeBinary, Text, cast, func, select, update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ..agents import CHAT
@@ -49,6 +49,7 @@ from ..workspace.documents import DocumentPaths, ensure_within_quota, materializ
 from ..workspace.locks import clear_writing, mark_writing, shell_lock, workspace_lock
 from ..workspace.reconcile import reconcile_locked, reconcile_user
 from . import chat_events, chat_tools
+from .queue import HISTORY_FULL, history_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -140,27 +141,10 @@ async def _load(
             await db.commit()
         # The history is replayed whole on every call, images included: past the cap
         # a turn would load and serialize hundreds of megabytes in the worker before
-        # the upstream could refuse the context (docs/chat.md § History).
-        # In bytes, as the cap is: PostgreSQL's `length` counts characters, and a
-        # history of non-ASCII text would reach four times the cap before refusal.
-        as_text = cast(Message.content, Text)
-        size = (
-            func.octet_length(as_text)
-            if db.get_bind().dialect.name == "postgresql"
-            else func.length(cast(as_text, LargeBinary))
-        )
-        stored = (
-            await db.execute(
-                select(func.coalesce(func.sum(size), 0)).where(
-                    Message.conversation_id == conversation.id
-                )
-            )
-        ).scalar_one()
-        if stored > settings.chat_history_max_bytes:
-            raise TurnFailed(
-                "This conversation's history is too large to continue; start a new "
-                "conversation about this document"
-            )
+        # the upstream could refuse the context (docs/chat.md § History). The send is
+        # refused past it too; this catches a turn queued before the history crossed it.
+        if await history_bytes(db, conversation.id) > settings.chat_history_max_bytes:
+            raise TurnFailed(HISTORY_FULL)
         connection = await load_connection(db, settings, turn.user_id, None)
         if connection is None:
             raise TurnFailed("Kano Proxy is not connected: connect it on the Agent page")
@@ -431,6 +415,20 @@ async def _record_usage(ctx: TurnContext, completed: CompletedMessage) -> None:
             )
         )
         await db.commit()
+
+
+async def _record_usage_settled(ctx: TurnContext, completed: CompletedMessage) -> None:
+    """The paid call reaches `usage_log` whether or not the turn is cancelled meanwhile:
+    the write runs as a task of its own, and a cancel that lands during it waits for it
+    to settle before it goes on — a cancelled or timed-out turn is billed all the same
+    (docs/chat.md § Conversations, turns, events)."""
+    recording = asyncio.ensure_future(_record_usage(ctx, completed))
+    try:
+        await asyncio.shield(recording)
+    except asyncio.CancelledError:
+        with contextlib.suppress(Exception):
+            await asyncio.shield(recording)
+        raise
 
 
 # --- one model call ----------------------------------------------------------------------------
@@ -875,7 +873,7 @@ async def _loop(ctx: TurnContext) -> None:
         if since_marker >= CACHE_GUARD_EVERY:
             since_marker = 0
         completed = await _call_model(ctx, body)
-        await _record_usage(ctx, completed)
+        await _record_usage_settled(ctx, completed)
         if await _cancelled(ctx):
             # Billed, but not kept: a cancelled turn leaves the history as it was.
             raise TurnCancelled()

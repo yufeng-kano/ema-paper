@@ -210,6 +210,26 @@ def tracked_at_head(root: Path, relative: Path) -> bool:
     return proc.returncode == 0
 
 
+def missing_at_head(root: Path, relatives: list[Path]) -> list[Path]:
+    """Those of `relatives` that `HEAD` does not hold — all of them when there is no
+    `HEAD` yet. One `ls-tree` for the lot: what a materialization asks of every
+    document it is asked for (docs/workspace.md § Layout)."""
+    proc = _git(
+        root,
+        "ls-tree",
+        "--name-only",
+        "-z",
+        "HEAD",
+        "--",
+        *(relative.as_posix() for relative in relatives),
+        check=False,
+    )
+    if proc.returncode != 0:
+        return list(relatives)
+    held = set(proc.stdout.split("\0"))
+    return [relative for relative in relatives if relative.as_posix() not in held]
+
+
 def restore_from(root: Path, commit: str, author: str, message: str, relative: Path) -> str | None:
     """Write `relative` back as it was at `commit` and commit that: how a removal is undone
     when the rows it was made for did not go (docs/workspace.md § Revisions)."""

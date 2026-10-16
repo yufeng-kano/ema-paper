@@ -1966,3 +1966,67 @@ async def test_reconciliation_removes_the_originals_of_rows_that_are_gone(
     assert (originals / f"{document.id}.pdf").is_file()
     assert not (originals / "999.pdf").exists()
     assert (originals / ".tmp-1000.pdf").is_file()
+
+
+async def test_materialized_files_left_uncommitted_are_committed_next_time(
+    sessionmaker, tmp_path, monkeypatch
+) -> None:
+    """The process died between the write and the commit: the files are in place and
+    untracked, and the next materialization — which writes nothing — commits them, so
+    the first edit is a change against the parse baseline (docs/workspace.md § Layout)."""
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        real = git.commit_paths
+        # The write landed and the commit never ran, as a kill in between leaves it.
+        monkeypatch.setattr(git, "commit_paths", lambda *args, **kwargs: None)
+        paths = await documents.materialize_document(db, settings, document)
+        monkeypatch.setattr(git, "commit_paths", real)
+        assert paths.doc.is_file()
+        assert not git.tracked_at_head(paths.root, paths.relative / "doc.md")
+        await documents.materialize_document(db, settings, document)
+        assert git.tracked_at_head(paths.root, paths.relative / "doc.md")
+        assert git.tracked_at_head(paths.root, paths.relative / ".meta.json")
+        head = git.log(paths.root)[0]
+        assert head.message == f"materialize {paths.relative}"
+        # Committed, nothing is asked of the next one.
+        await documents.materialize_document(db, settings, document)
+        assert git.log(paths.root)[0].commit == head.commit
+
+
+async def test_the_origin_is_written_before_the_directory_moves_aside(
+    sessionmaker, tmp_path, monkeypatch
+) -> None:
+    """The marker stands before the rename is tried, so a process that dies between the
+    two leaves a marker beside no aside — swept, the directory where it was — and never
+    an aside no marker names; a rename that is refused takes its marker with it
+    (docs/workspace.md § Revisions)."""
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+        root = paths.root
+        real = safe_io.rename
+        markers_at_rename: list[list[str]] = []
+
+        def refusing(root_, source, target):
+            markers_at_rename.append(
+                [name for name in os.listdir(root) if name.endswith(documents.ORIGIN_SUFFIX)]
+            )
+            raise safe_io.UnsafeEntry("planted")
+
+        monkeypatch.setattr(safe_io, "rename", refusing)
+        with pytest.raises(ApiError) as refused:
+            await documents.remove_path(settings, user.id, paths.relative)
+        monkeypatch.setattr(safe_io, "rename", real)
+        assert refused.value.status_code == 409
+        assert len(markers_at_rename[0]) == 1
+        assert not [name for name in os.listdir(root) if name.startswith(safe_io.TEMP_PREFIX)]
+        assert paths.doc.is_file()
+        # A marker whose rename never came: the next reconciliation sweeps the marker and
+        # leaves the directory, which still stands where the marker says.
+        stale = root / f"{safe_io.TEMP_PREFIX}{'0' * 32}{documents.ORIGIN_SUFFIX}"
+        stale.write_text(paths.relative.as_posix() + "\n")
+        await reconcile.reconcile_user(db, settings, user.id)
+        assert not stale.exists()
+        assert paths.doc.is_file()

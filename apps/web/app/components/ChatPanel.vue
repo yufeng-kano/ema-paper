@@ -796,6 +796,11 @@ async function send() {
       }
       return
     }
+    // A record reload still in flight (a terminal event's, a dropped stream's) fetched the
+    // thread before this message was accepted: dropped, or it would replace the message
+    // and the turn below with a record that lacks them (docs/web.md).
+    detailSeq++
+    detailPending.value = false
     messages.value = [
       ...messages.value,
       {

@@ -171,16 +171,21 @@ def _writable(root: Path, path: Path) -> bool:
     )
 
 
-def _listing(root: Path, path: Path) -> str:
+def _listing(root: Path, path: Path, max_chars: int) -> str:
     """The directory's entries, read through a descriptor opened beneath the root with
-    nothing followed — a path listing could be swapped for a link in between."""
-    entries = safe_io.list_dir(root, path)
+    nothing followed — a path listing could be swapped for a link in between. Bounded
+    like every tool result: every entry takes at least two characters of the result, so
+    `max_chars` entries fill it, and no more are read (docs/chat.md § Tools)."""
+    entries = safe_io.list_dir(root, path, limit=max_chars + 1)
+    more = len(entries) > max_chars
     rows = [
         f"{name}/" if is_dir else name
-        for name, is_dir in sorted(entries, key=lambda item: item[0])
+        for name, is_dir in sorted(entries[:max_chars], key=lambda item: item[0])
         if name != ".git"
     ]
-    return "\n".join(rows) or "(empty directory)"
+    if more:
+        rows.append("[... more entries than this view can list; use bash ...]")
+    return truncate("\n".join(rows) or "(empty directory)", max_chars)
 
 
 def _numbered(text: str, view_range: object) -> str:
@@ -222,7 +227,7 @@ def _edit_sync(
         kind = safe_io.entry_kind(root, path)
         if kind == "dir":
             try:
-                return ToolOutcome(_listing(root, path))
+                return ToolOutcome(_listing(root, path, max_chars))
             except (safe_io.UnsafeEntry, OSError):
                 return ToolOutcome(f"{vm_path} is not a plain directory", is_error=True)
         if kind == "none":

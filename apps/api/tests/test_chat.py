@@ -1405,6 +1405,17 @@ async def test_a_conversation_past_the_history_cap_is_refused(chatting) -> None:
         turn = await db.get(ChatTurn, turn_id)
         assert turn.status == "failed"
         assert "start a new conversation" in turn.error
+    # Past the cap, the conversation takes no further message: the overflow is not grown
+    # by capped-size sends that each fail a turn (docs/chat.md § History is append-only).
+    refused = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"text": "once more"},
+        headers=CSRF_HEADERS,
+    )
+    assert refused.status_code == 409
+    assert "start a new conversation" in refused.json()["error"]["message"]
+    detail = (await chatting.get(f"/api/conversations/{conversation_id}")).json()
+    assert len(detail["messages"]) == 1 and len(detail["turns"]) == 1
     settings.chat_history_max_bytes = 256 * 1024 * 1024
 
 
@@ -2947,3 +2958,51 @@ async def test_an_accepted_message_moves_the_conversation_up_the_list(chatting) 
     ]
     # The second message changed neither title nor model; the timestamp moves all the same.
     assert after > before
+
+
+async def test_a_usage_row_is_written_through_a_cancel(monkeypatch) -> None:
+    """A cancel that lands while a call's usage row is being written waits for the write:
+    the paid call reaches usage_log whether or not the turn survives it (docs/chat.md
+    § Conversations, turns, events)."""
+    from sightread.jobs import chat_runner
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    recorded: list[str] = []
+
+    async def slow_record(ctx, completed):
+        started.set()
+        await release.wait()
+        recorded.append(completed)
+
+    monkeypatch.setattr(chat_runner, "_record_usage", slow_record)
+    task = asyncio.create_task(chat_runner._record_usage_settled(None, "the call"))
+    await started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    # The cancel is in, the write is not: the task waits rather than ending over it.
+    assert not task.done() and not recorded
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert recorded == ["the call"]
+
+
+def test_a_directory_view_is_bounded_like_every_tool_result(tmp_path) -> None:
+    """A directory a command filled with many entries is read no further than the result
+    can carry, and cut like a long file view (docs/chat.md § Tools)."""
+    from sightread.workspace import safe_io
+
+    root = tmp_path / "ws" / "1"
+    crowded = root / "files" / "crowded"
+    crowded.mkdir(parents=True)
+    for index in range(250):
+        (crowded / f"entry-{index:03d}.txt").write_text("")
+    assert len(safe_io.list_dir(root, crowded, limit=5)) == 5
+    full = chat_tools._listing(root, crowded, 20_000)
+    assert full.count("\n") == 249 and "entry-249.txt" in full and "more entries" not in full
+    # Past the cap: fewer entries read than the directory holds, the listing says so, and
+    # the result is cut like a long file view.
+    cut = chat_tools._listing(root, crowded, 200)
+    assert len(cut) <= 200 and "omitted" in cut and "more entries" in cut
+    assert cut.startswith("entry-000.txt")

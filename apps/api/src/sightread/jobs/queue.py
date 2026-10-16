@@ -15,12 +15,20 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy import bindparam, delete, func, select, text, update
+from sqlalchemy import LargeBinary, Text, bindparam, cast, delete, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 
 from ..agents import get_agent
 from ..config import Settings
-from ..db.models import WORKER_GENERATION_SEQ, ChatTurn, Conversation, Job, JobPage, utcnow
+from ..db.models import (
+    WORKER_GENERATION_SEQ,
+    ChatTurn,
+    Conversation,
+    Job,
+    JobPage,
+    Message,
+    utcnow,
+)
 from ..sandbox.client import SandboxClient, SandboxUnavailable
 from ..workspace import git
 from ..workspace.layout import REPOS_DIR, git_dir, user_root
@@ -453,6 +461,33 @@ CLAIM_TURN_SQL_SQLITE_SELECT = text(
     ORDER BY t.created_at LIMIT 1
     """
 )
+
+
+# What the reader is told, at the send and in the turn alike, once a conversation's
+# stored history is past `CHAT_HISTORY_MAX_BYTES` (docs/chat.md § History is append-only).
+HISTORY_FULL = (
+    "This conversation's history is too large to continue; start a new conversation about "
+    "this document"
+)
+
+
+async def history_bytes(db: AsyncSession, conversation_id: int) -> int:
+    """The stored size of a conversation's messages, in bytes as the cap is: PostgreSQL's
+    `length` counts characters, and a history of non-ASCII text would reach four times
+    the cap before refusal (docs/chat.md § History is append-only)."""
+    as_text = cast(Message.content, Text)
+    size = (
+        func.octet_length(as_text)
+        if db.get_bind().dialect.name == "postgresql"
+        else func.length(cast(as_text, LargeBinary))
+    )
+    return (
+        await db.execute(
+            select(func.coalesce(func.sum(size), 0)).where(
+                Message.conversation_id == conversation_id
+            )
+        )
+    ).scalar_one()
 
 
 async def count_active_turns(db: AsyncSession, user_id: int) -> int:

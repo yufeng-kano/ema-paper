@@ -285,18 +285,23 @@ def _open_dir(root: Path, path: Path) -> int:
         os.close(fd)
 
 
-def list_dir(root: Path, path: Path) -> list[tuple[str, bool]]:
+def list_dir(root: Path, path: Path, *, limit: int | None = None) -> list[tuple[str, bool]]:
     """`(name, is_dir)` for each entry of the directory at `path`, looked at without
-    following anything: a link is listed as a file."""
+    following anything: a link is listed as a file. Read lazily, and no further than
+    `limit` entries when one is given: a directory a shell filled with millions of
+    files is not held whole in memory for a listing that shows a page of it."""
     fd = _open_dir(root, path)
     try:
         entries: list[tuple[str, bool]] = []
-        for name in os.listdir(fd):
-            try:
-                mode = os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode
-            except OSError:
-                continue
-            entries.append((name, stat.S_ISDIR(mode)))
+        with os.scandir(fd) as scan:
+            for entry in scan:
+                if limit is not None and len(entries) >= limit:
+                    break
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                except OSError:
+                    continue
+                entries.append((entry.name, is_dir))
         return entries
     finally:
         os.close(fd)
