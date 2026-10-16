@@ -98,6 +98,11 @@ class Settings(BaseSettings):
     # What the runner's stop, reset, restart and status calls are given: it must cover
     # the runner's own Docker timeout, the inspection after it and a reset's deletion.
     sandbox_control_timeout_seconds: int = 180
+    # What a command may take beyond its own timeout before the runner client gives up:
+    # the VM's cold start on a stopped sandbox (the runner's own SANDBOX_START_TIMEOUT_SECONDS)
+    # and the reply's grace past the command's deadline (docs/sandbox.md § The runner).
+    sandbox_start_timeout_seconds: int = 180
+    sandbox_exec_grace_seconds: int = 60
 
     domain: str = ""
     acme_email: str = ""

@@ -237,7 +237,7 @@ async def _active_turn(db: AsyncSession, conversation_id: int) -> uuid.UUID | No
 
 async def _ready_to_chat(
     db: AsyncSession, settings: AppSettings, user_id: int, *, needs_model: bool
-) -> None:
+) -> AgentSetting | None:
     """The enqueue rules of docs/agents.md, applied to the chat agent. A conversation
     that has its model already needs none chosen on the Agent page: later turns use
     the stored one, whatever the page says now (docs/chat.md § Conversations)."""
@@ -261,6 +261,7 @@ async def _ready_to_chat(
         raise ApiError(
             400, "invalid_request", "Kano Proxy is not connected: connect it on the Agent page"
         )
+    return setting
 
 
 @router.post(
@@ -292,7 +293,11 @@ async def post_message(
         # Deleted while this send waited for the lock: a clean 404, not rows inserted
         # for a conversation that is gone (docs/chat.md § Conversations).
         raise ApiError(404, "invalid_request", "No such conversation")
-    await _ready_to_chat(db, settings, user.id, needs_model=row.model is None)
+    setting = await _ready_to_chat(db, settings, user.id, needs_model=row.model is None)
+    if row.model is None and setting is not None and setting.model:
+        # The model the message was sent under, fixed as it is accepted: a change on the
+        # Agent page while the turn waits in the queue does not reach it (docs/chat.md).
+        row.model = setting.model
     if await count_active_turns(db, user.id) >= settings.max_chat_turns_per_user:
         raise ApiError(
             429,

@@ -318,10 +318,8 @@ def _edit_guarded(
 async def run_editor(
     root: Path, tool_input: dict, author: str, *, max_chars: int, max_bytes: int
 ) -> ToolOutcome:
-    if tool_input.get("command") == "view":
-        return await asyncio.to_thread(
-            _edit_guarded, root, tool_input, author, max_chars=max_chars, max_bytes=max_bytes
-        )
+    # A view under the lock too: a shell command of another conversation may be
+    # rewriting the file, and a read of it half-written would feed the model a mix.
     async with workspace_lock(root):
         return await asyncio.to_thread(
             _edit_guarded, root, tool_input, author, max_chars=max_chars, max_bytes=max_bytes
@@ -448,6 +446,7 @@ async def view_page(
     document_id: int,
     page_count: int | None,
     render_slots: asyncio.Semaphore,
+    decode_slot: asyncio.Semaphore,
     max_bytes: int,
     kind: str,
 ) -> ToolOutcome:
@@ -487,14 +486,18 @@ async def view_page(
                         rendered = await poppler.render_page(
                             handle, page, info.page_size(page), cwd=work_dir, pass_fds=(fd,)
                         )
-                    data = await asyncio.to_thread(_as_png, rendered)
+                    # The raster, one at a time per turn: a round of four reads must
+                    # not hold four decoded pages before the budget sees any of them.
+                    async with decode_slot:
+                        data = await asyncio.to_thread(_as_png, rendered)
                 except poppler.PopplerError:
                     return ToolOutcome(f"page {page} could not be rendered", is_error=True)
         else:
             try:
                 with os.fdopen(os.dup(fd), "rb") as reader:
                     raw = await asyncio.to_thread(reader.read, max_bytes + 1)
-                data = await asyncio.to_thread(_as_png, raw)
+                async with decode_slot:
+                    data = await asyncio.to_thread(_as_png, raw)
             except OSError:
                 return ToolOutcome("the original image could not be read", is_error=True)
             except (ImageTooLarge, Image.DecompressionBombError, Image.DecompressionBombWarning):

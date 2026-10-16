@@ -24,10 +24,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import Settings
 from ..db.models import Document, Folder, User
 from . import git, safe_io
-from .documents import sweep_aside
+from .documents import folder_names, sweep_aside
 from .layout import (
     FILES_DIR,
     META_FILE,
+    document_relative_dir,
     files_root,
     is_canonical_segment,
     path_segment,
@@ -130,21 +131,8 @@ def _scan(root: Path) -> tuple[list[Found], list[tuple[str, ...]]]:
                 folders.append(parts)
             continue
         dirs[:] = []  # nothing beneath a document is a folder or a document
-        meta = root / current / META_FILE
-        try:
-            # A plain, small file or nothing: the shell can put anything under that name,
-            # and the open follows nothing (docs/workspace.md § Revisions).
-            data = safe_io.read_bytes(root, meta, META_MAX_BYTES)
-            payload = json.loads(data or b"")
-            document_id = int(payload["document_id"])
-        except (
-            safe_io.UnsafeEntry,
-            safe_io.EntryTooLarge,
-            OSError,
-            ValueError,
-            KeyError,
-            TypeError,
-        ):
+        document_id = _meta_id(root, current)
+        if document_id is None:
             continue
         parts = current.relative_to(FILES_DIR).parts
         if not parts:
@@ -153,12 +141,68 @@ def _scan(root: Path) -> tuple[list[Found], list[tuple[str, ...]]]:
     return found, folders
 
 
+def _meta_id(root: Path, directory: Path) -> int | None:
+    """The document id a directory's `.meta.json` names, or None: a plain, small file or
+    nothing — the shell can put anything under that name — and the open follows nothing
+    (docs/workspace.md § Revisions)."""
+    try:
+        data = safe_io.read_bytes(root, root / directory / META_FILE, META_MAX_BYTES)
+        return int(json.loads(data or b"")["document_id"])
+    except (safe_io.UnsafeEntry, safe_io.EntryTooLarge, OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _aside_documents(root: Path) -> dict[str, list[tuple[Path, int]]]:
+    """What a delete set aside and a crash left: each aside directory with the document
+    directories inside it and their ids. A document whose row survived the crash (the
+    removal was committed to git, the rows' delete was not) is restored by
+    reconciliation rather than swept (docs/workspace.md § Revisions)."""
+    asides: dict[str, list[tuple[Path, int]]] = {}
+    try:
+        entries = safe_io.list_dir(root, root)
+    except (safe_io.UnsafeEntry, OSError):
+        return asides
+    for name, is_dir in entries:
+        if not (is_dir and name.startswith(safe_io.TEMP_PREFIX)):
+            continue
+        inside: list[tuple[Path, int]] = []
+        for current, dirs, files in _walk(root, Path(name)):
+            if META_FILE not in files:
+                continue
+            dirs[:] = []
+            document_id = _meta_id(root, current)
+            if document_id is not None:
+                inside.append((current, document_id))
+        asides[name] = inside
+    return asides
+
+
+def _restore_aside(root: Path, aside_dir: Path, target: Path) -> bool:
+    """Move a document a delete set aside back to where its surviving row says, as a
+    revision; False when that place is taken (a fresh copy was materialized there) or
+    the move cannot be recorded, in which case the directory stays aside."""
+    if safe_io.entry_kind(root, root / target) != "none":
+        logger.warning("reconcile: %s stays aside, %s is taken", aside_dir, target)
+        return False
+    try:
+        safe_io.ensure_dir(root, root / target.parent)
+        safe_io.rename(root, root / aside_dir, root / target)
+    except (safe_io.UnsafeEntry, OSError):
+        logger.exception("reconcile: %s could not be restored to %s", aside_dir, target)
+        return False
+    try:
+        git.commit_paths(root, git.USER_AUTHOR, f"restore {target}", [target])
+    except git.GitError:
+        logger.exception("reconcile: the restore of %s could not be recorded; undone", target)
+        with contextlib.suppress(OSError, safe_io.UnsafeEntry):
+            safe_io.rename(root, root / target, root / aside_dir)
+        return False
+    return True
+
+
 def _canonicalize_and_scan(root: Path) -> tuple[list[Found], list[tuple[str, ...]]]:
     git.ensure_repo(root)
     _canonicalize(root)
-    # What a delete set aside and a crash left: removed here, under the same lock a
-    # delete holds, so none in flight is touched (docs/workspace.md § Revisions).
-    sweep_aside(root)
     return _scan(root)
 
 
@@ -239,7 +283,11 @@ async def reconcile_locked(db: AsyncSession, settings: Settings, user_id: int) -
 
 async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
     found, folders = await asyncio.to_thread(_canonicalize_and_scan, root)
-    if not found and not folders:
+    asides = await asyncio.to_thread(_aside_documents, root)
+    if not found and not folders and not any(asides.values()):
+        # Nothing to record and nothing aside worth a look: what a delete left is swept,
+        # under the same lock a delete holds, so none in flight is touched.
+        await asyncio.to_thread(sweep_aside, root)
         return 0
     # The user's row, under the workspace lock — the order every mutation takes: a
     # folder row added here shares the namespace the Files page's name decisions lock
@@ -249,6 +297,22 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
         row.id: row
         for row in (await db.execute(select(Document).where(Document.user_id == user_id))).scalars()
     }
+    # A document set aside by a delete whose rows survived (the process died between the
+    # removal's revision and the rows' commit) goes back where its row says; an aside
+    # that still holds one that could not go back is kept, the rest are swept.
+    keep: set[str] = set()
+    restored = 0
+    for name, inside in asides.items():
+        for aside_dir, document_id in inside:
+            row = documents.get(document_id)
+            if row is None:
+                continue
+            target = document_relative_dir(await folder_names(db, user_id, row.folder_id), row.name)
+            if await asyncio.to_thread(_restore_aside, root, aside_dir, target):
+                restored += 1
+            else:
+                keep.add(name)
+    await asyncio.to_thread(sweep_aside, root, keep)
     # One id in two places — `cp -r` carries `.meta.json` along — names no winner: the
     # row stays where it is, and the copies are the shell's to sort out.
     seen: dict[int, int] = {}
@@ -325,7 +389,7 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
     if not updates:
         if created:
             await db.commit()
-        return len(created)
+        return len(created) + restored
     # Two phases, so rows that trade places (a shell swapped two directories) never
     # meet the unique constraint on their way: every changing row first takes a name
     # nothing else holds, then its own (docs/workspace.md § The tree is the truth).
@@ -341,5 +405,5 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
         # A unique clash from the shell is reported, never fatal.
         await db.rollback()
         logger.warning("reconcile for user %d hit a name conflict; rows unchanged", user_id)
-        return 0
-    return len(updates) + len(created)
+        return restored
+    return len(updates) + len(created) + restored

@@ -712,3 +712,75 @@ def test_the_vm_sweep_repeats_until_nothing_but_the_shells_is_left(tmp_path) -> 
     killed = sorted(int(pid) for pid in (tmp_path / "procs.killed").read_text().split())
     assert killed == [30, 31, 40]
     assert sorted(state.read_text().split("\n")[:-1]) == ["1 0 S", "10 0 S", "20 10 S", "50 1 Z"]
+
+
+async def test_a_reset_whose_cache_cannot_be_removed_reports_it(
+    client, tmp_path, monkeypatch
+) -> None:
+    import shutil
+
+    from sightread_sandbox import backends
+
+    await client.post("/sandboxes/51/exec", json={"session": "s", "command": "true"})
+    cache = tmp_path / "ws" / "51" / ".cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    (cache / "state").write_text("x")
+
+    real = shutil.rmtree
+
+    def refusing(path, *args, **kwargs):
+        raise OSError(30, "Read-only file system")
+
+    monkeypatch.setattr(backends.shutil, "rmtree", refusing)
+    assert (await client.post("/sandboxes/51/reset")).status_code == 503
+    assert (cache / "state").exists()
+    monkeypatch.setattr(backends.shutil, "rmtree", real)
+    assert (await client.post("/sandboxes/51/reset")).status_code == 204
+    assert not cache.exists()
+
+
+def test_the_runner_refuses_a_relative_workspace_host_path(tmp_path) -> None:
+    with pytest.raises(ValueError, match="absolute"):
+        Settings(
+            app_env="local",
+            sandbox_token=TOKEN,
+            sandbox_backend="docker",
+            sandbox_runtime="runc",
+            sandbox_workspaces_dir="./workspaces",
+            sandbox_workspaces_mount=str(tmp_path / "ws"),
+        )
+    # The local backend runs no `docker run` and takes any path.
+    Settings(
+        app_env="local",
+        sandbox_token=TOKEN,
+        sandbox_backend="local",
+        sandbox_workspaces_dir="./workspaces",
+        sandbox_workspaces_mount=str(tmp_path / "ws"),
+    )
+
+
+async def test_the_vm_start_waits_as_long_as_configured(tmp_path, monkeypatch) -> None:
+    from sightread_sandbox import backends
+
+    timeouts: list[float] = []
+
+    async def fake_docker(*args, timeout=120.0):
+        if args[0] == "run":
+            timeouts.append(timeout)
+        if args[0] == "inspect":
+            return 1, "Error: No such object"
+        return 0, ""
+
+    monkeypatch.setattr(backends, "_docker", fake_docker)
+    settings = Settings(
+        app_env="local",
+        sandbox_token=TOKEN,
+        sandbox_backend="docker",
+        sandbox_runtime="runc",
+        sandbox_start_timeout_seconds=333,
+        sandbox_workspaces_dir=str(tmp_path / "ws"),
+        sandbox_workspaces_mount=str(tmp_path / "ws"),
+    )
+    backend = backends.DockerBackend(settings)
+    await backend.ensure_running(backend._user(61))
+    assert timeouts == [333]

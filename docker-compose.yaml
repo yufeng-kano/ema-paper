@@ -100,8 +100,10 @@ services:
     environment:
       SANDBOX_BACKEND: docker
       SANDBOX_WORKSPACES_MOUNT: /data/workspaces
-      # The workspaces as the Docker daemon sees them: an absolute host path.
-      SANDBOX_WORKSPACES_DIR: ${SANDBOX_WORKSPACES_DIR:-${PWD}/workspaces}
+      # The workspaces as the Docker daemon sees them: the same host path api and worker
+      # mount, which must then be absolute (the runner refuses a relative one), or the
+      # compose project's ./workspaces when nothing names one.
+      SANDBOX_WORKSPACES_DIR: ${SANDBOX_WORKSPACES_DIR:-${WORKSPACES_HOST_DIR:-${PWD}/workspaces}}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${WORKSPACES_HOST_DIR:-./workspaces}:/data/workspaces

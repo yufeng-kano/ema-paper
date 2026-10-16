@@ -1494,3 +1494,69 @@ async def test_the_documents_own_rename_revision_does_not_reach_beyond_it(
         git.commit_all(before.root, "agent:1", "mv from the shell")
         shell = git.log(before.root)[0].commit
         assert documents.reaches_beyond(after, shell) is False  # its new place is here
+
+
+async def test_a_delete_the_process_died_in_is_restored_by_reconciliation(
+    sessionmaker, tmp_path
+) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+        paths.doc.write_text("# Edited\n")
+        git.commit_all(paths.root, "user", "edit")
+        # The removal's revision was made and the directory set aside; the process died
+        # before the row's delete committed, so the row survives.
+        removal = await documents.remove_path(settings, user.id, paths.relative)
+        assert removal is not None and not paths.directory.exists()
+        assert await reconcile.reconcile_user(db, settings, user.id) == 1
+        assert paths.doc.read_text() == "# Edited\n"
+        assert git.log(paths.root)[0].message.startswith("restore ")
+        assert not [name for name in os.listdir(paths.root) if name.startswith(".sr-tmp-")]
+        # An aside whose rows are gone for good is swept, as before.
+        other = Document(
+            user_id=user.id, folder_id=document.folder_id, job_id=document.job_id, name="gone.pdf"
+        )
+        db.add(other)
+        await db.commit()
+        other_paths = await documents.materialize_document(db, settings, other)
+        gone = await documents.remove_path(settings, user.id, other_paths.relative)
+        assert gone is not None
+        await db.delete(other)
+        await db.commit()
+        await reconcile.reconcile_user(db, settings, user.id)
+        assert not [name for name in os.listdir(paths.root) if name.startswith(".sr-tmp-")]
+        assert not other_paths.directory.exists()
+
+
+async def test_a_move_that_fails_after_displacing_a_squatter_puts_it_back(
+    sessionmaker, tmp_path, monkeypatch
+) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        before = await documents.materialize_document(db, settings, document)
+        root = before.root
+        target = before.relative.with_name("renamed.pdf")
+        (root / target).mkdir()
+        (root / target / "scratch.txt").write_text("the shell's")
+        real = git.move
+        calls = {"n": 0}
+
+        def flaky(root_, source, dest):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise OSError(5, "Input/output error")
+            return real(root_, source, dest)
+
+        monkeypatch.setattr(git, "move", flaky)
+        with pytest.raises(ApiError) as refused:
+            await documents.move_path(settings, user.id, before.relative, target)
+        assert refused.value.status_code == 409
+    # The squatter back under its name, the document where it was, nothing aside.
+    assert (root / target / "scratch.txt").read_text() == "the shell's"
+    assert before.doc.is_file()
+    assert sorted(name for name, _ in safe_io.list_dir(root, root / "files" / "Papers")) == [
+        "paper.pdf",
+        "renamed.pdf",
+    ]

@@ -600,6 +600,7 @@ async def test_view_page_and_view_figure_read_the_documents_own_files(tmp_path, 
         document_id=5,
         page_count=3,
         render_slots=asyncio.Semaphore(1),
+        decode_slot=asyncio.Semaphore(1),
         max_bytes=10_000_000,
         kind="pdf",
     )
@@ -618,6 +619,7 @@ async def test_view_page_and_view_figure_read_the_documents_own_files(tmp_path, 
         document_id=5,
         page_count=3,
         render_slots=asyncio.Semaphore(1),
+        decode_slot=asyncio.Semaphore(1),
         max_bytes=10_000_000,
         kind="pdf",
     )
@@ -628,6 +630,7 @@ async def test_view_page_and_view_figure_read_the_documents_own_files(tmp_path, 
         document_id=5,
         page_count=3,
         render_slots=asyncio.Semaphore(1),
+        decode_slot=asyncio.Semaphore(1),
         max_bytes=10_000_000,
         kind="pdf",
     )
@@ -867,6 +870,7 @@ async def test_a_rounds_images_never_exceed_the_budget(monkeypatch) -> None:
         conversation=SimpleNamespace(id=1, session="s"),
         paths=None,
         document=SimpleNamespace(id=1),
+        decode_slot=asyncio.Semaphore(1),
         job=SimpleNamespace(page_count=12, kind="pdf"),
         render_slots=None,
         sandbox=None,
@@ -1602,6 +1606,7 @@ async def test_a_turns_images_never_exceed_the_turn_budget(monkeypatch) -> None:
         conversation=SimpleNamespace(id=1, session="s"),
         paths=None,
         document=SimpleNamespace(id=1),
+        decode_slot=asyncio.Semaphore(1),
         job=SimpleNamespace(page_count=12, kind="pdf"),
         render_slots=None,
         sandbox=None,
@@ -2172,3 +2177,43 @@ async def test_the_conversation_detail_carries_no_image_bytes(chatting) -> None:
     assert content[0]["content"][1]["text"] == "Page 1."
     assert content[1] == {"type": "image"}
     assert "x" * 100 not in json.dumps(detail)
+
+
+async def test_the_model_is_fixed_when_the_message_is_accepted(chatting) -> None:
+    document_id = chatting.document_id
+    conversation_id = (
+        await chatting.post(
+            f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    accepted = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
+    )
+    assert accepted.status_code == 202, accepted.text
+    async with chatting.app.state.sessionmaker() as db:
+        conversation = await db.get(Conversation, conversation_id)
+        setting = (
+            await db.execute(select(AgentSetting).where(AgentSetting.agent == "chat"))
+        ).scalar_one()
+        # Snapshotted at the send, before any turn ran: a change on the Agent page while
+        # the turn waits in the queue does not reach it.
+        assert conversation.model == setting.model
+        setting.model = "claude-other"
+        await db.commit()
+    async with chatting.app.state.sessionmaker() as db:
+        assert (await db.get(Conversation, conversation_id)).model != "claude-other"
+
+
+def test_the_exec_deadline_covers_a_cold_start() -> None:
+    from sightread.config import Settings
+
+    client = SandboxClient(
+        Settings(
+            app_env="local",
+            sandbox_url="http://sandbox:8100",
+            sandbox_token="t",
+            sandbox_start_timeout_seconds=200,
+            sandbox_exec_grace_seconds=30,
+        )
+    )
+    assert client.exec_timeout(120) == 350

@@ -14,7 +14,7 @@ import logging
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from sqlalchemy import select, update
@@ -35,7 +35,7 @@ from ..db.models import (
     utcnow,
 )
 from ..errors import ApiError
-from ..sandbox.client import EXEC_GRACE_SECONDS, SandboxClient
+from ..sandbox.client import SandboxClient
 from ..upstream.anthropic import CompletedMessage, StreamEvent, stream_messages
 from ..upstream.client import (
     Connection,
@@ -94,6 +94,11 @@ class TurnContext:
     # The mutating tool call in flight, if any: finished before the turn is, whatever
     # ended the turn.
     writer: asyncio.Future | None = None
+    # Which tool the writer runs: a shell command past its grace is killed in the VM.
+    writer_tool: str | None = None
+    # One image decoded at a time per turn: a round of page reads never holds a raster
+    # per read (docs/chat.md § Tools).
+    decode_slot: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(1))
 
 
 # --- loading -------------------------------------------------------------------------------
@@ -572,6 +577,7 @@ async def _run_tool_unguarded(
             document_id=ctx.document.id,
             page_count=ctx.job.page_count,
             render_slots=ctx.render_slots,
+            decode_slot=ctx.decode_slot,
             max_bytes=ctx.settings.upload_max_bytes,
             kind=ctx.job.kind,
         )
@@ -702,6 +708,7 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
                 # terminal event (docs/chat.md § Tools).
                 writer = asyncio.ensure_future(_run_tool(ctx, block, malformed))
                 ctx.writer = writer
+                ctx.writer_tool = block.get("name")
                 # Cleared when the writer is done, not when this await ends: a cancelled
                 # await leaves the writer running, and run_turn must still find it.
                 writer.add_done_callback(
@@ -823,7 +830,10 @@ async def _finish(
 async def _settle_writer(ctx: TurnContext) -> None:
     """Wait for the mutating tool call the deadline interrupted: cancelling the loop does
     not stop a shell command in the VM or an editor thread, and the terminal event must
-    not precede their commit. Bounded by the command timeout plus a margin."""
+    not precede their commit. Past the grace a shell command is killed in the VM (its
+    shell restarted) and the writer is then waited for to its end — every step of it is
+    bounded on its own (the runner client's deadline, git's timeouts), so the wait is
+    too — rather than the turn being finished over a write still in flight."""
     writer = ctx.writer
     if writer is None or writer.done():
         return
@@ -831,11 +841,23 @@ async def _settle_writer(ctx: TurnContext) -> None:
     # the margin for the commit and reconciliation that follow (docs/chat.md § Tools).
     grace = (
         ctx.settings.chat_bash_timeout_seconds
-        + EXEC_GRACE_SECONDS
+        + ctx.settings.sandbox_start_timeout_seconds
+        + ctx.settings.sandbox_exec_grace_seconds
         + ctx.settings.chat_writer_grace_seconds
     )
-    with contextlib.suppress(Exception):
+    try:
         await asyncio.wait_for(asyncio.shield(writer), timeout=grace)
+        return
+    except TimeoutError:
+        logger.warning("turn %s: the writer outlived its grace; waiting it out", ctx.turn.id)
+    except Exception:  # noqa: BLE001 - the writer's own failure is its result
+        return
+    if ctx.writer_tool == "bash" and ctx.sandbox is not None:
+        # The command, if it is what runs on: ended where it runs, and the exec returns.
+        with contextlib.suppress(Exception):
+            await ctx.sandbox.restart(ctx.turn.user_id, ctx.conversation.session)
+    with contextlib.suppress(Exception):
+        await asyncio.shield(writer)
 
 
 async def run_turn(

@@ -16,6 +16,7 @@ import logging
 import os
 import shutil
 import uuid
+from collections.abc import Collection
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -852,6 +853,7 @@ def _move_tree(root: Path, source: Path, target: Path, message: str) -> str | No
     if safe_io.entry_kind(root, root / source) == "none" or source == target:
         return None
     touched = [source, target]
+    aside: Path | None = None
     try:
         if safe_io.entry_kind(root, root / target) != "none":
             # Something else sits where the row now points — a directory the shell made
@@ -861,10 +863,16 @@ def _move_tree(root: Path, source: Path, target: Path, message: str) -> str | No
             git.move(root, root / target, root / aside)
             touched.append(aside)
         git.move(root, root / source, root / target)
-    except safe_io.UnsafeEntry as exc:
-        # An ancestor the shell swapped for a link: refused, and the caller's row rolls
-        # back to where the files still are.
-        raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
+    except (safe_io.UnsafeEntry, OSError, git.GitError) as exc:
+        # An ancestor the shell swapped for a link, or the disk refusing: refused, the
+        # squatter back where it sat, and the caller's row rolls back to where the
+        # files still are.
+        if aside is not None:
+            with contextlib.suppress(OSError, safe_io.UnsafeEntry):
+                safe_io.rename(root, root / aside, root / target)
+        plain = isinstance(exc, safe_io.UnsafeEntry)
+        message = NOT_PLAIN if plain else "The move failed; nothing was changed"
+        raise ApiError(409, "invalid_request", message) from exc
     try:
         return git.commit_paths(root, git.USER_AUTHOR, message, touched)
     except git.GitError as exc:
@@ -952,12 +960,14 @@ async def restore_removed(
     await asyncio.to_thread(_restore_removed, root, relative, removal)
 
 
-def sweep_aside(root: Path) -> int:
+def sweep_aside(root: Path, keep: Collection[str] = ()) -> int:
     """Remove what a delete left aside and never discarded (a crash between its commit
-    and the discard); run under the workspace lock, where no delete is in flight."""
+    and the discard); run under the workspace lock, where no delete is in flight. `keep`
+    names the aside directories that still hold a document whose row survived, which
+    reconciliation restores instead (docs/workspace.md § Revisions)."""
     swept = 0
     for name, is_dir in safe_io.list_dir(root, root):
-        if is_dir and name.startswith(safe_io.TEMP_PREFIX):
+        if is_dir and name.startswith(safe_io.TEMP_PREFIX) and name not in keep:
             with contextlib.suppress(OSError, safe_io.UnsafeEntry):
                 safe_io.remove_tree(root, root / name)
                 swept += 1

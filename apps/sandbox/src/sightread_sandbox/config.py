@@ -41,6 +41,9 @@ class Settings(BaseSettings):
     sandbox_command_timeout_max: int = 600
     # How long Docker is given to remove a VM on stop.
     sandbox_docker_timeout_seconds: int = 120
+    # How long `docker run` may take to start a VM; api and worker allow the same on top
+    # of a command's timeout, so a cold start never looks like a lost command.
+    sandbox_start_timeout_seconds: int = 180
     sandbox_port: int = 8100
     # The runtime names production accepts: VM runtimes, so a shared-kernel runtime
     # under another name cannot pass for a VM boundary (docs/sandbox.md § Isolation).
@@ -48,6 +51,10 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _check(self) -> Settings:
+        if self.sandbox_backend == "docker" and not self.sandbox_workspaces_dir.startswith("/"):
+            # `docker run -v` takes the host path as the daemon sees it: relative to
+            # nothing this runner knows (docs/sandbox.md § Operations).
+            raise ValueError("SANDBOX_WORKSPACES_DIR must be an absolute host path")
         if self.app_env == "production":
             if not self.sandbox_token:
                 raise ValueError("SANDBOX_TOKEN is required in production")

@@ -357,16 +357,23 @@ exit 0
 def _remove_cache(cache: Path) -> None:
     """Whatever sits at `.cache` goes: the directory, or the file or link a command put
     there in its place, removed without following it, so the next start can make the
-    directory again (docs/sandbox.md § The runner)."""
+    directory again (docs/sandbox.md § The runner). A removal that fails is reported,
+    never swallowed: a reset that answers done must have left nothing behind."""
     try:
         mode = cache.lstat().st_mode
     except FileNotFoundError:
         return
-    if stat.S_ISDIR(mode):
-        shutil.rmtree(cache, ignore_errors=True)
-    else:
-        with contextlib.suppress(FileNotFoundError):
+    try:
+        if stat.S_ISDIR(mode):
+            shutil.rmtree(cache)
+        else:
             cache.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise RuntimeError(f"the sandbox cache could not be removed: {exc.strerror}") from exc
+    if cache.exists() or cache.is_symlink():
+        raise RuntimeError("the sandbox cache could not be removed")
 
 
 def adopted_user_ids(names: str) -> list[int]:
@@ -478,7 +485,7 @@ class DockerBackend(Backend):
         if settings.sandbox_index_url:
             args += ["-e", f"UV_INDEX_URL={settings.sandbox_index_url}"]
         args += [settings.sandbox_image, "python3", "-c", REAPER]
-        code, out = await _docker(*args, timeout=180)
+        code, out = await _docker(*args, timeout=settings.sandbox_start_timeout_seconds)
         if code != 0:
             logger.error("could not start sandbox for user %d: %s", sandbox.user_id, out.strip())
             raise RuntimeError("the sandbox VM could not be started")

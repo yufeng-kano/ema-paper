@@ -18,7 +18,6 @@ from ..config import Settings
 # command's own timeout and answers within it. The control calls (stop, reset, restart,
 # status) get `SANDBOX_CONTROL_TIMEOUT_SECONDS`, which covers the runner's own Docker
 # timeout, the inspection after it and a reset's deletion (docs/sandbox.md).
-EXEC_GRACE_SECONDS = 60.0
 
 
 class SandboxUnavailable(Exception):
@@ -46,6 +45,8 @@ class SandboxClient:
         self._base = settings.sandbox_url.rstrip("/")
         self._token = settings.sandbox_token
         self._control_timeout = float(settings.sandbox_control_timeout_seconds)
+        self._start_timeout = float(settings.sandbox_start_timeout_seconds)
+        self._exec_grace = float(settings.sandbox_exec_grace_seconds)
         self.configured = settings.sandbox_configured
 
     def _headers(self) -> dict[str, str]:
@@ -72,6 +73,11 @@ class SandboxClient:
             raise SandboxUnavailable("the sandbox runner answered unreadably") from exc
         return payload if isinstance(payload, dict) else {}
 
+    def exec_timeout(self, timeout_seconds: int) -> float:
+        """How long an exec call may take: the command's own timeout, the VM's cold start
+        when the sandbox was stopped, and the grace for the reply (docs/sandbox.md)."""
+        return timeout_seconds + self._start_timeout + self._exec_grace
+
     async def exec(
         self, user_id: int, session: str, command: str, *, timeout_seconds: int
     ) -> ExecResult:
@@ -79,7 +85,7 @@ class SandboxClient:
             "POST",
             f"/sandboxes/{user_id}/exec",
             json={"session": session, "command": command, "timeout_seconds": timeout_seconds},
-            timeout=timeout_seconds + EXEC_GRACE_SECONDS,
+            timeout=self.exec_timeout(timeout_seconds),
         )
         return ExecResult(
             output=str(payload.get("output") or ""),
