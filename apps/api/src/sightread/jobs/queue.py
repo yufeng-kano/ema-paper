@@ -21,7 +21,7 @@ from ..db.models import ChatTurn, Conversation, Job, JobPage, utcnow
 from ..sandbox.client import SandboxClient, SandboxUnavailable
 from ..workspace import git
 from ..workspace.layout import git_dir, user_root
-from ..workspace.locks import shell_lock, workspace_lock
+from ..workspace.locks import clear_writing, shell_lock, workspace_lock
 from ..workspace.reconcile import reconcile_locked
 from . import chat_events
 
@@ -452,7 +452,9 @@ async def _record_orphaned_changes(
     if not git_dir(root).is_dir():
         return True
     author = f"{git.AGENT_AUTHOR_PREFIX}{conversation_id}"
-    async with shell_lock(root), workspace_lock(root):
+    # `recovering`: the mark a command the dead worker was running left stands until
+    # the tree is recorded here, and this is the one write allowed under it.
+    async with shell_lock(root), workspace_lock(root, recovering=True):
         try:
             commit = await asyncio.to_thread(git.commit_all, root, author, ORPHAN_REVISION_MESSAGE)
         except git.GitError:
@@ -465,6 +467,8 @@ async def _record_orphaned_changes(
                 "recorded the changes an orphaned turn of user %d left as %s", user_id, commit
             )
             await reconcile_locked(db, settings, user_id)
+        # The shell is stopped and the tree recorded: host writes may resume.
+        clear_writing(root)
     return True
 
 

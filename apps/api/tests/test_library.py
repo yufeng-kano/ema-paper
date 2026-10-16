@@ -201,6 +201,13 @@ def test_a_collision_suffix_never_pushes_a_name_past_its_column() -> None:
     assert suffixed != at_limit
     assert len(suffixed) <= DOCUMENT_NAME_MAX
     assert suffixed.endswith(" (2).pdf")
+    # No room for a stem at all (an extension nearly as long as the column): the counter
+    # stays and the candidates keep changing, so a free one is found.
+    extension = "x" * (DOCUMENT_NAME_MAX - 2)
+    name = f"a.{extension}"
+    taken = {name, f" (2).{extension}"[:DOCUMENT_NAME_MAX]}
+    chosen = free_name(taken, name, DOCUMENT_NAME_MAX)
+    assert chosen not in taken and len(chosen) <= DOCUMENT_NAME_MAX and chosen.startswith(" (3).")
 
 
 async def test_an_upload_at_the_name_limit_still_lands(library, documents) -> None:
@@ -843,6 +850,27 @@ async def test_a_delete_whose_commit_landed_despite_the_error_is_finished(
     assert not (root / "files" / "tiny (2).png").exists()
     assert not [name for name in os.listdir(root) if name.startswith(".sr-tmp-")]
     assert original_of(root, uploaded["id"]) is None
+
+
+async def test_filing_a_parse_that_failed_under_the_lock_is_refused(
+    library, sessionmaker, documents, monkeypatch
+) -> None:
+    from sightread.routes import library as library_routes
+
+    uploaded = (await _upload(library, documents)).json()
+    real = library_routes.lock_job
+
+    async def failing_meanwhile(db, job_id):
+        # The parse fails between the route's first look and its row lock.
+        await real(db, job_id)
+        await db.execute(
+            update(Job).where(Job.id == job_id).values(status="failed", error="unreadable")
+        )
+
+    monkeypatch.setattr(library_routes, "lock_job", failing_meanwhile)
+    refused = await _file_job(library, uploaded["job_id"])
+    assert refused.status_code == 400, refused.text
+    assert [row["name"] for row in (await _read(library))["documents"]] == ["tiny.png"]
 
 
 async def test_filing_a_running_parse_marks_it_for_retention(

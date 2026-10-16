@@ -1291,6 +1291,59 @@ def test_an_image_past_the_pixel_cap_is_refused_before_it_is_decoded() -> None:
     assert chat_tools._as_png(small.getvalue()).startswith(b"\x89PNG")
 
 
+async def test_a_conversation_past_the_history_cap_is_refused(chatting) -> None:
+    settings = chatting.app.state.settings
+    document_id = chatting.document_id
+    conversation_id = (
+        await chatting.post(
+            f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    sent = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"text": "hello " * 20},
+        headers=CSRF_HEADERS,
+    )
+    turn_id = uuid.UUID(sent.json()["turn_id"])
+    settings.chat_history_max_bytes = 50
+    await _run_queued_turn(chatting)
+    async with chatting.app.state.sessionmaker() as db:
+        turn = await db.get(ChatTurn, turn_id)
+        assert turn.status == "failed"
+        assert "start a new conversation" in turn.error
+    settings.chat_history_max_bytes = 256 * 1024 * 1024
+
+
+async def test_a_cancelled_decode_is_waited_for_before_the_slot_is_released(monkeypatch) -> None:
+    import threading
+
+    started = threading.Event()
+    release = threading.Event()
+    finished: list[bool] = []
+
+    def slow_decode(raw):
+        started.set()
+        release.wait(5)
+        finished.append(True)
+        return b"\x89PNG"
+
+    monkeypatch.setattr(chat_tools, "_as_png", slow_decode)
+    slot = asyncio.Semaphore(1)
+    decoding = asyncio.ensure_future(
+        chat_tools._settled(asyncio.to_thread(chat_tools._as_png, b"raw"))
+    )
+    await asyncio.to_thread(started.wait, 5)
+    decoding.cancel()
+    # The cancel is not acknowledged while the thread still holds the raster.
+    await asyncio.sleep(0.1)
+    assert not decoding.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await decoding
+    assert finished == [True]
+    assert slot._value == 1
+
+
 async def test_a_command_the_runner_could_not_settle_commits_no_tree(tmp_path) -> None:
     from sightread.sandbox.client import SandboxUnavailable
 
@@ -1329,9 +1382,19 @@ async def test_a_worker_starting_records_what_an_orphaned_turn_left_unrecorded(
         await db.commit()
         document = await db.get(Document, document_id)
         paths = await workspace_documents.materialize_document(db, settings, document)
-    # The dead worker's shell wrote a file, and the worker died before the commit.
+    # The dead worker's shell wrote a file, and the worker died before the commit — its
+    # writing marker still standing, so no host write lands on the moving tree.
     (paths.directory / "helper.py").write_text("print(1)\n")
     (paths.directory / "doc.md").write_text("# Title\n\nHalf done\n")
+    from sightread.workspace.locks import mark_writing, writing_marker
+
+    mark_writing(paths.root)
+    refused = await chatting.put(
+        f"/api/library/documents/{document_id}/content",
+        json={"markdown": "# Mine\n", "base_revision": "x"},
+        headers=CSRF_HEADERS,
+    )
+    assert refused.status_code == 409 and "recovered" in refused.json()["error"]["message"]
 
     real = git.commit_all
 
@@ -1344,12 +1407,14 @@ async def test_a_worker_starting_records_what_an_orphaned_turn_left_unrecorded(
     async with chatting.app.state.sessionmaker() as db:
         assert await fail_orphaned_turns(db, None, settings) == (0, {chatting.user_id})
         assert (await db.get(ChatTurn, turn_id)).finished_at is None
+    assert writing_marker(paths.root).exists()  # still recovering: host writes wait
     monkeypatch.setattr(git, "commit_all", real)
 
     async with chatting.app.state.sessionmaker() as db:
         assert await fail_orphaned_turns(db, None, settings) == (1, set())
         turn = await db.get(ChatTurn, turn_id)
         assert turn.status == "failed" and turn.finished_at is not None
+    assert not writing_marker(paths.root).exists()  # recorded: host writes resume
     head = git.log(paths.root)[0]
     assert head.message == ORPHAN_REVISION_MESSAGE
     assert head.author == f"agent:{conversation_id}"
@@ -2365,3 +2430,51 @@ def test_the_exec_deadline_covers_a_cold_start() -> None:
         )
     )
     assert client.exec_timeout(120) == 350
+
+
+async def test_a_shell_command_stands_marked_as_writing_for_its_whole_run(
+    sessionmaker, tmp_path, monkeypatch
+) -> None:
+    from sightread.config import Settings
+    from sightread.workspace.locks import writing_marker
+    from tests.conftest import KANO_BASE, TEST_SECRET_KEY
+    from tests.test_workspace import _seed
+
+    settings = Settings(
+        app_env="local",
+        secret_key=TEST_SECRET_KEY,
+        workspaces_dir=str(tmp_path / "workspaces"),
+        figures_dir=str(tmp_path / "figures"),
+        kano_proxy_base_url=KANO_BASE,
+    )
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        paths = await workspace_documents.materialize_document(db, settings, document)
+    seen: list[bool] = []
+
+    class Shell:
+        async def exec(self, user_id, session, command, *, timeout_seconds):
+            # While the command runs, the marker stands: a worker dying now leaves it.
+            seen.append(writing_marker(paths.root).exists())
+            (paths.directory / "made.txt").write_text("by the shell\n")
+            return ExecResult(output="ok", exit_code=0, timed_out=False, truncated=False)
+
+    async def no_events(ctx, event, data):
+        return None
+
+    monkeypatch.setattr(chat_runner, "_emit", no_events)
+    ctx = SimpleNamespace(
+        settings=settings,
+        sessionmaker=sessionmaker,
+        sandbox=Shell(),
+        paths=paths,
+        turn=SimpleNamespace(id=uuid.uuid4(), user_id=user.id),
+        conversation=SimpleNamespace(id=3, session="s"),
+    )
+    result = await chat_runner._run_tool_unguarded(
+        ctx, {"id": "t1", "name": "bash", "input": {"command": "touch made.txt"}}, set(), None
+    )
+    assert seen == [True]
+    assert not writing_marker(paths.root).exists()  # the command is over and recorded
+    assert result["content"] == "ok" and "is_error" not in result
+    assert git.log(paths.root)[0].message == "bash: touch made.txt"

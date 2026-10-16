@@ -17,7 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from sqlalchemy import select, update
+from sqlalchemy import Text, cast, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ..agents import CHAT
@@ -46,7 +46,7 @@ from ..upstream.client import (
 )
 from ..workspace import git
 from ..workspace.documents import DocumentPaths, ensure_within_quota, materialize_document
-from ..workspace.locks import shell_lock, workspace_lock
+from ..workspace.locks import clear_writing, mark_writing, shell_lock, workspace_lock
 from ..workspace.reconcile import reconcile_locked, reconcile_user
 from . import chat_events, chat_tools
 
@@ -138,6 +138,21 @@ async def _load(
         if conversation.model is None:
             conversation.model = model
             await db.commit()
+        # The history is replayed whole on every call, images included: past the cap
+        # a turn would load and serialize hundreds of megabytes in the worker before
+        # the upstream could refuse the context (docs/chat.md § History).
+        stored = (
+            await db.execute(
+                select(func.coalesce(func.sum(func.length(cast(Message.content, Text))), 0)).where(
+                    Message.conversation_id == conversation.id
+                )
+            )
+        ).scalar_one()
+        if stored > settings.chat_history_max_bytes:
+            raise TurnFailed(
+                "This conversation's history is too large to continue; start a new "
+                "conversation about this document"
+            )
         connection = await load_connection(db, settings, turn.user_id, None)
         if connection is None:
             raise TurnFailed("Kano Proxy is not connected: connect it on the Agent page")
@@ -539,33 +554,20 @@ async def _run_tool_unguarded(
             # is held across the command as well: a save or another conversation's
             # editor landing on a file the command is writing would otherwise read and
             # commit a half-written file (docs/chat.md § Tools).
-            async with shell_lock(ctx.paths.root), workspace_lock(ctx.paths.root):
-                outcome = await chat_tools.run_bash(
-                    ctx.sandbox,
-                    ctx.turn.user_id,
-                    ctx.conversation.session,
-                    tool_input,
-                    max_chars=max_chars,
-                    timeout_seconds=ctx.settings.chat_bash_timeout_seconds,
-                )
-                # What the shell changed is a revision of its own (docs/workspace.md) —
-                # unless the runner could not say the command is over: a tree a process
-                # may still write is not committed under this command's name.
-                if outcome.settled:
-                    outcome = await chat_tools.commit_shell_changes(
-                        ctx.paths.root,
-                        outcome,
-                        tool_input,
-                        author,
-                        max_chars=max_chars,
-                        locked=True,
-                    )
-                if outcome.edit is not None:
-                    # The library follows the tree before the viewer is told to reload,
-                    # and before the lock is released: a read waiting on it must not
-                    # materialize a fresh copy at the old path in between.
-                    async with ctx.sessionmaker() as db:
-                        await reconcile_locked(db, ctx.settings, ctx.turn.user_id)
+            async with (
+                shell_lock(ctx.paths.root),
+                workspace_lock(ctx.paths.root, recovering=True),
+            ):
+                # Marked for as long as the command may write: a worker that dies here
+                # leaves the mark, and every host write is refused until the next
+                # worker has stopped the shell and recorded the tree (docs/workspace.md
+                # § Revisions). `recovering`: a mark a dead worker left is cleared by
+                # the recovery the next worker runs at start, before any turn.
+                mark_writing(ctx.paths.root)
+                try:
+                    outcome = await _run_shell_command(ctx, tool_input, author, max_chars)
+                finally:
+                    clear_writing(ctx.paths.root)
     elif name == "str_replace_based_edit_tool":
         outcome = await chat_tools.run_editor(
             ctx.paths.root,
@@ -594,6 +596,47 @@ async def _run_tool_unguarded(
     if admit is not None:
         outcome = admit(outcome)
     return await _report_tool(ctx, tool_use_id, name, outcome)
+
+
+async def _run_shell_command(
+    ctx: TurnContext, tool_input: dict, author: str, max_chars: int
+) -> chat_tools.ToolOutcome:
+    """One shell command under the shell and workspace locks the caller holds: the
+    command, its revision, and the library following the tree (docs/chat.md § Tools)."""
+    outcome = await chat_tools.run_bash(
+        ctx.sandbox,
+        ctx.turn.user_id,
+        ctx.conversation.session,
+        tool_input,
+        max_chars=max_chars,
+        timeout_seconds=ctx.settings.chat_bash_timeout_seconds,
+    )
+    # What the shell changed is a revision of its own (docs/workspace.md) — unless the
+    # runner could not say the command is over: a tree a process may still write is
+    # not committed under this command's name.
+    if outcome.settled:
+        outcome = await chat_tools.commit_shell_changes(
+            ctx.paths.root,
+            outcome,
+            tool_input,
+            author,
+            max_chars=max_chars,
+            locked=True,
+        )
+    if outcome.edit is not None:
+        # The library follows the tree before the viewer is told to reload, and before
+        # the lock is released: a read waiting on it must not materialize a fresh copy
+        # at the old path in between. A reconciliation that fails does not unsay the
+        # commit: the outcome stands, with its edit, rather than an error the model
+        # would answer by running the command again (the next read reconciles).
+        try:
+            async with ctx.sessionmaker() as db:
+                await reconcile_locked(db, ctx.settings, ctx.turn.user_id)
+        except Exception:  # noqa: BLE001 - the revision is made; this can wait
+            logger.exception(
+                "could not reconcile the library after a command in turn %s", ctx.turn.id
+            )
+    return outcome
 
 
 async def _report_tool(

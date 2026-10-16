@@ -486,6 +486,35 @@ async def test_a_late_library_row_adopts_the_finished_upload(sessionmaker, tmp_p
         assert (paths.directory / "source.pdf").read_bytes() == b"%PDF-1.4"
 
 
+async def test_a_tree_a_dead_workers_command_may_write_takes_no_host_write(
+    sessionmaker, tmp_path
+) -> None:
+    from sightread.workspace.locks import clear_writing, mark_writing, workspace_lock
+
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        _, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+        content = await documents.read_content(db, settings, document)
+        # A shell command was writing when its worker died: the marker it set stands.
+        mark_writing(paths.root)
+        with pytest.raises(ApiError) as refused:
+            await documents.write_content(
+                db, settings, document, markdown="# T\n\nx\n", base_revision=content.revision
+            )
+        assert refused.value.status_code == 409
+        assert "recovered" in refused.value.message
+        with pytest.raises(ApiError):
+            await documents.read_content(db, settings, document)
+        # The recovery itself goes through, and once it has cleared the marker so does
+        # everything else.
+        async with workspace_lock(paths.root, recovering=True):
+            clear_writing(paths.root)
+        await documents.write_content(
+            db, settings, document, markdown="# T\n\nx\n", base_revision=content.revision
+        )
+
+
 async def test_a_document_named_like_an_excluded_artifact_keeps_its_revisions(
     sessionmaker, tmp_path
 ) -> None:

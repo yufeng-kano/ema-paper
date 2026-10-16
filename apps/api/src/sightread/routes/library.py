@@ -103,8 +103,9 @@ def free_name(taken: set[str], name: str, limit: int) -> str:
         suffix = f" ({index}){dot}{extension}"
         room = limit - len(suffix)
         # `room <= 0` needs an extension longer than the whole column, which `clean_name`
-        # already makes impossible; keeping the tail is still the safe answer.
-        candidate = f"{stem[:room]}{suffix}" if room > 0 else suffix[-limit:]
+        # already makes impossible; should it happen, the extension gives way and the
+        # counter stays, so every try is a new candidate (as the name migration does).
+        candidate = f"{stem[:room]}{suffix}" if room > 0 else suffix[:limit]
         if candidate not in taken:
             return candidate
     raise ApiError(400, "invalid_request", "Too many items with this name in one folder")
@@ -541,6 +542,11 @@ async def delete_folder(
     foreign keys unless asked to.
     """
     async with workspace_lock(user_root(settings.workspaces_dir, user.id)):
+        # The user's row first — the lock every folder creation takes before it inserts
+        # — so the subtree read here is the subtree deleted below: a folder created
+        # under it meanwhile would otherwise go by cascade, its documents' originals
+        # kept and its conversations unchecked (docs/workspace.md § Layout).
+        await lock_user(db, user.id)
         row = await owned_folder(db, user.id, folder_id)
         relative = await folder_relative_dir(db, user.id, row.id)
         doomed = await subtree_ids(db, user.id, row.id)
@@ -797,6 +803,12 @@ async def file_job(body: DocumentFromJob, user: SessionUser, db: DbSession, sett
 
     async def taken() -> set[str]:
         await lock_job(db, job_id)
+        # Decided again under the lock: a parse that failed since the check above has
+        # no result to file, and a row for it would stand against the 400 the route
+        # promises (docs/api.md).
+        current = (await db.execute(select(Job.status).where(Job.id == job_id))).scalar_one()
+        if current == "failed":
+            raise ApiError(400, "invalid_request", "A failed parse has no result to file")
         # A parse still running keeps its upload for this row: the worker, which reads
         # its recipients under this same row lock, either sees the row or finds the
         # job marked for retention and leaves the upload for `inherit_original` to

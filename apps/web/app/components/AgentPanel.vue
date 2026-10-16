@@ -400,7 +400,9 @@ async function removePrompt() {
           <UiTextInput :id="id" v-model="promptName" required :disabled="promptModalPending" />
         </UiField>
         <UiField v-slot="{ id }" :label="t('agents.promptTextLabel')">
-          <div class="tokens">
+          <!-- The parse template's tokens: a chat preset is appended verbatim, so a token
+               in it would reach the model as a literal placeholder (docs/chat.md). -->
+          <div v-if="agent.name !== 'chat'" class="tokens">
             <button
               v-for="token in PROMPT_TOKENS"
               :key="token"

@@ -90,6 +90,9 @@ class Settings(BaseSettings):
     workspace_git_timeout_seconds: int = 60
     chat_image_round_max_bytes: int = 32 * 1024 * 1024
     chat_image_turn_max_bytes: int = 128 * 1024 * 1024
+    # The stored history a conversation may replay, every message together: a turn past
+    # it is refused with a pointer to a new conversation (docs/chat.md § History).
+    chat_history_max_bytes: int = 256 * 1024 * 1024
 
     # The sandbox runner (docs/sandbox.md). Empty URL = no sandbox: the chat agent runs
     # without its bash tool. The token is what api and worker present to the runner.

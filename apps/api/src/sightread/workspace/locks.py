@@ -19,12 +19,40 @@ from collections import defaultdict
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+from ..errors import ApiError
 from .layout import git_dir
 
 _process_locks: dict[Path, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 WORKSPACE_SUFFIX = ".lock"
 SHELL_SUFFIX = ".shell.lock"
+# Set while a shell command may be writing the tree, beside the locks: a worker that dies
+# mid-command leaves it, and the tree is a command's until the next worker has stopped the
+# shell and recorded what it changed (docs/workspace.md § Revisions).
+WRITING_SUFFIX = ".writing"
+
+
+class WorkspaceRecovering(ApiError):
+    """A host write refused while a dead worker's shell command may still be writing."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            409,
+            "invalid_request",
+            "The workspace is being recovered after a worker restart; try again shortly",
+        )
+
+
+def writing_marker(root: Path) -> Path:
+    return _lock_path(root, WRITING_SUFFIX)
+
+
+def mark_writing(root: Path) -> None:
+    writing_marker(root).touch()
+
+
+def clear_writing(root: Path) -> None:
+    writing_marker(root).unlink(missing_ok=True)
 
 
 def _lock_path(root: Path, suffix: str) -> Path:
@@ -96,9 +124,15 @@ async def backup_shared(root: Path) -> AsyncIterator[None]:
 
 
 @contextlib.asynccontextmanager
-async def workspace_lock(root: Path) -> AsyncIterator[None]:
-    """Hold the user's workspace for writing. Re-entrancy is not supported on purpose."""
+async def workspace_lock(root: Path, *, recovering: bool = False) -> AsyncIterator[None]:
+    """Hold the user's workspace for writing. Re-entrancy is not supported on purpose.
+    A lock acquired while the writing marker stands belongs to a shell command whose
+    worker died without clearing it — a live one holds this lock for the command's whole
+    run — and is refused (409) unless the holder is the recovery itself (`recovering`):
+    the worker's cleanup of the turn, or the shell path that sets the mark."""
     async with _hold(root, WORKSPACE_SUFFIX):
+        if not recovering and writing_marker(root).exists():
+            raise WorkspaceRecovering()
         yield
 
 

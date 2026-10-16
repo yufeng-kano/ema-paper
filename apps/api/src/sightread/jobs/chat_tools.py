@@ -427,6 +427,20 @@ def _as_png(source: Path | bytes) -> bytes:
         return buffer.getvalue()
 
 
+async def _settled(coro):
+    """Await `coro` so that a cancel waits for it rather than leaving it running: a
+    decode in a thread is not stopped by cancelling its await, and the slot it holds
+    would be released under a raster still in memory (docs/chat.md § Tools)."""
+    task = asyncio.ensure_future(coro)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await asyncio.wait({task})
+        if not task.cancelled():
+            task.exception()  # retrieved: a decode that failed under a cancel is the cancel's
+        raise
+
+
 def _open_source(root: Path, source: Path, max_bytes: int) -> int | None:
     """A descriptor on the original: through the workspace's own open when the file is
     the shell's copy in the tree, a plain open that follows nothing when it is the
@@ -500,7 +514,7 @@ async def view_page(
                     # The raster, one at a time per turn: a round of four reads must
                     # not hold four decoded pages before the budget sees any of them.
                     async with decode_slot:
-                        data = await asyncio.to_thread(_as_png, rendered)
+                        data = await _settled(asyncio.to_thread(_as_png, rendered))
                 except poppler.PopplerError:
                     return ToolOutcome(f"page {page} could not be rendered", is_error=True)
         else:
@@ -508,7 +522,7 @@ async def view_page(
                 with os.fdopen(os.dup(fd), "rb") as reader:
                     raw = await asyncio.to_thread(reader.read, max_bytes + 1)
                 async with decode_slot:
-                    data = await asyncio.to_thread(_as_png, raw)
+                    data = await _settled(asyncio.to_thread(_as_png, raw))
             except OSError:
                 return ToolOutcome("the original image could not be read", is_error=True)
             except (ImageTooLarge, Image.DecompressionBombError, Image.DecompressionBombWarning):
