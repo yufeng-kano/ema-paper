@@ -35,8 +35,10 @@ services:
       UPLOAD_DIR: /data/uploads
       FIGURES_DIR: /data/figures
       WORKSPACES_DIR: /data/workspaces
-      # The runner's address, from the port it listens on (SANDBOX_PORT, docs/deployment.md).
-      SANDBOX_URL: http://sandbox:${SANDBOX_PORT:-8100}
+      # The runner's address, from the port it listens on (SANDBOX_PORT) — unless .env sets
+      # SANDBOX_URL itself, an empty one included, which disables the sandbox
+      # (docs/deployment.md): `-`, not `:-`, so only an unset variable takes the default.
+      SANDBOX_URL: ${SANDBOX_URL-http://sandbox:${SANDBOX_PORT:-8100}}
     depends_on:
       pg:
         condition: service_healthy
@@ -72,8 +74,10 @@ services:
       UPLOAD_DIR: /data/uploads
       FIGURES_DIR: /data/figures
       WORKSPACES_DIR: /data/workspaces
-      # The runner's address, from the port it listens on (SANDBOX_PORT, docs/deployment.md).
-      SANDBOX_URL: http://sandbox:${SANDBOX_PORT:-8100}
+      # The runner's address, from the port it listens on (SANDBOX_PORT) — unless .env sets
+      # SANDBOX_URL itself, an empty one included, which disables the sandbox
+      # (docs/deployment.md): `-`, not `:-`, so only an unset variable takes the default.
+      SANDBOX_URL: ${SANDBOX_URL-http://sandbox:${SANDBOX_PORT:-8100}}
     depends_on:
       pg:
         condition: service_healthy

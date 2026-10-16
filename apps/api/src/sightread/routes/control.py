@@ -678,6 +678,10 @@ async def put_agent_settings(
                 400, "invalid_request", f"The {agent.name} agent runs on Kano Proxy only"
             )
         await _owned_connection(db, user.id, body.connection_id)
+    if body.model and "anthropic" in agent.capabilities and not is_claude_model(body.model):
+        # The same filter the catalog applies, at the write: a model the Messages route
+        # cannot run would otherwise be fixed onto the next turn and fail it upstream.
+        raise ApiError(400, "invalid_request", f"The {agent.name} agent runs Claude models only")
     if body.effort is not None and body.effort not in EFFORT_LEVELS:
         raise ApiError(400, "invalid_request", "effort must be one of " + ", ".join(EFFORT_LEVELS))
     if body.prompt_preset_id is not None:

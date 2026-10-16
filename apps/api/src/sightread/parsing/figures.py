@@ -49,6 +49,27 @@ def crop_path(figures_dir: Path, job_id: uuid.UUID, page: int, bbox: Bbox) -> Pa
     return figures_dir / str(job_id) / f"p{page}_{y_min}_{x_min}_{y_max}_{x_max}.png"
 
 
+def find_crop(figures_dir: Path, job_id: uuid.UUID, page: int, bbox: Bbox) -> Path | None:
+    """The crop where it is now: under the job's name once published, else in the newest
+    attempt directory of a job still running — the same page render and box give the
+    same crop, so a stale attempt beside the replacement's is no different answer
+    (docs/parsing.md § Figure crops). None when no attempt has written it."""
+    final = crop_path(figures_dir, job_id, page, bbox)
+    if final.is_file():
+        return final
+    attempts: list[tuple[float, Path]] = []
+    for attempt in figures_dir.glob(f"{job_id}.*"):
+        try:
+            attempts.append((attempt.stat().st_mtime, attempt))
+        except OSError:
+            continue  # discarded between the listing and the look
+    for _, attempt in sorted(attempts, reverse=True):
+        candidate = attempt / final.name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def discard_job_figures(figures_dir: Path, job_id: uuid.UUID) -> None:
     """Remove one job's crop directory, and every attempt directory of it still standing.
 

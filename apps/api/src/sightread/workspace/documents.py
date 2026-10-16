@@ -418,7 +418,7 @@ def copy_original(root: Path, source_id: int, target_id: int) -> bool:
 
 
 async def inherit_original(
-    db: AsyncSession, settings: Settings, document: Document, job: Job
+    db: AsyncSession, settings: Settings, document: Document, job: Job, *, locked: bool = False
 ) -> bool:
     """A parse filed again from the History page: its upload went to the first document
     filed from it, so the new one takes a copy of that original — from any document of
@@ -430,8 +430,8 @@ async def inherit_original(
     # The siblings, the quota and the copy under the workspace lock, as retention takes
     # them: a delete of the last sibling holds the same lock, so it cannot take the
     # original away between the look and the copy, and two filings at once cannot both
-    # measure the room and both take it (§ Quota).
-    async with workspace_lock(root):
+    # measure the room and both take it (§ Quota). `locked`: the caller holds it.
+    async with contextlib.nullcontext() if locked else workspace_lock(root):
         try:
             await db.refresh(document)
         except InvalidRequestError:
@@ -462,7 +462,7 @@ async def inherit_original(
                 if await asyncio.to_thread(copy_original, root, sibling_id, document.id):
                     return True
     try:
-        await adopt_source(db, settings, document, job)
+        await adopt_source(db, settings, document, job, locked=locked)
     except InvalidRequestError:
         return False
     return True
@@ -488,14 +488,15 @@ async def adopt_source(
     job: Job,
     *,
     upload: Path | None = None,
+    locked: bool = False,
 ) -> None:
     """The library row arrived after its parse finished, so the worker found no document
     to keep the upload for and left it in place — or the parse was answered from the
     cache, or joined one already on its way, and `upload` is the fresh file this row keeps
     for itself (docs/jobs.md § Retention): take it now. A copy that fails, or that the
     quota refuses (`ApiError`, 409), leaves nothing behind — the original and the shell's
-    copy go — since the caller deletes the row and no file may stay for a row that is
-    gone (docs/workspace.md § Layout)."""
+    copy go — since the caller rolls the row back and no file may stay for a row that is
+    gone (docs/workspace.md § Layout). `locked`: the caller holds the workspace lock."""
     if upload is not None:
         source = upload
     else:
@@ -508,7 +509,7 @@ async def adopt_source(
             return
         source = Path(job.source_path)
     root = user_root(settings.workspaces_dir, document.user_id)
-    async with workspace_lock(root):
+    async with contextlib.nullcontext() if locked else workspace_lock(root):
         if not source.is_file():
             # Taken already — by retention, which read this row as a recipient under the
             # job's row lock — or never there; looked at under the lock retention holds,
@@ -522,13 +523,10 @@ async def adopt_source(
             await ensure_within_quota(settings, root)
         except ApiError:
             # No room for the one file nothing can recreate: the filing is refused whole
-            # (the caller deletes the row), never a row that could not render a page.
+            # (the caller rolls the row back), never a row that could not render a page.
             # The upload goes either way — a parse outside the library would have lost
             # it too (docs/workspace.md § Layout).
             source.unlink(missing_ok=True)
-            if upload is None:
-                job.source_deleted_at = utcnow()
-                await db.commit()
             raise
         try:
             await asyncio.to_thread(
@@ -1041,11 +1039,19 @@ def _remove_tree(root: Path, relative: Path, message: str) -> Removal | None:
         # back whole if they are not. Through descriptors that follow nothing: an
         # ancestor the shell swapped for a link to another tree is a refusal.
         safe_io.rename(root, root / relative, root / aside)
+    except safe_io.UnsafeEntry as exc:
+        raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
+    try:
         # Where it stood, beside it: what brings it back should the rows survive and
         # nothing inside it name a document (docs/workspace.md § Revisions).
         safe_io.write_text(root, origin_marker(root, aside), relative.as_posix() + "\n")
-    except safe_io.UnsafeEntry as exc:
-        raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
+    except (OSError, safe_io.UnsafeEntry) as exc:
+        # Without the origin, an aside holding no document metadata would be swept: back
+        # where it was, and the delete refused, rather than data lost to a full disk.
+        safe_io.rename(root, root / aside, root / relative)
+        raise ApiError(
+            409, "invalid_request", "The removal could not be recorded; nothing was changed"
+        ) from exc
     try:
         commit = git.commit_paths(root, git.USER_AUTHOR, message, [relative])
     except git.GitError as exc:

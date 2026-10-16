@@ -175,6 +175,12 @@ async def test_chat_settings_refuse_connections_and_validate_effort(chatting) ->
         "/api/agents/chat/settings", json={"effort": "ultra"}, headers=CSRF_HEADERS
     )
     assert bad.status_code == 400
+    # The catalog's filter, at the write: a model the Messages route cannot run is refused
+    # rather than fixed onto the next turn (docs/api.md).
+    wrong = await chatting.put(
+        "/api/agents/chat/settings", json={"model": "vendor/gpt-9"}, headers=CSRF_HEADERS
+    )
+    assert wrong.status_code == 400
     ok = await chatting.put(
         "/api/agents/chat/settings", json={"effort": "high"}, headers=CSRF_HEADERS
     )
@@ -2898,3 +2904,29 @@ async def test_a_listener_refused_listen_is_closed(monkeypatch) -> None:
         "postgresql+asyncpg://u:p@db/sightread", 7, asyncio.Event()
     )
     assert listener is None and closed == [True]
+
+
+async def test_an_accepted_message_moves_the_conversation_up_the_list(chatting) -> None:
+    document_id = chatting.document_id
+    conversation_id = (
+        await chatting.post(
+            f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    sent = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "one"}, headers=CSRF_HEADERS
+    )
+    before = (await chatting.get(f"/api/conversations/{conversation_id}")).json()["conversation"][
+        "updated_at"
+    ]
+    async with chatting.app.state.sessionmaker() as db:
+        await fail_turn(db, uuid.UUID(sent.json()["turn_id"]), "worker stopped")
+    again = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "two"}, headers=CSRF_HEADERS
+    )
+    assert again.status_code == 202, again.text
+    after = (await chatting.get(f"/api/conversations/{conversation_id}")).json()["conversation"][
+        "updated_at"
+    ]
+    # The second message changed neither title nor model; the timestamp moves all the same.
+    assert after > before

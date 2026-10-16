@@ -99,3 +99,19 @@ def test_the_per_page_cap_keeps_the_first_boxes_in_reading_order(tmp_path) -> No
     assert (tmp_path / "job" / "p1_0_0_50_100.png").is_file()
     assert (tmp_path / "job" / "p1_100_0_150_100.png").is_file()
     assert not (tmp_path / "job" / "p1_150_0_200_100.png").exists()
+
+
+def test_a_running_jobs_crop_is_found_in_its_attempt_directory(tmp_path) -> None:
+    from sightread.parsing.figures import find_crop
+
+    job_id = uuid.uuid4()
+    bbox = (10, 20, 30, 40)
+    assert find_crop(tmp_path, job_id, 1, bbox) is None
+    attempt = tmp_path / f"{job_id}.abc123"
+    attempt.mkdir()
+    (attempt / "p1_10_20_30_40.png").write_bytes(b"attempt")
+    assert find_crop(tmp_path, job_id, 1, bbox) == attempt / "p1_10_20_30_40.png"
+    # Published, the job's own directory answers first.
+    (tmp_path / str(job_id)).mkdir()
+    (tmp_path / str(job_id) / "p1_10_20_30_40.png").write_bytes(b"published")
+    assert find_crop(tmp_path, job_id, 1, bbox) == crop_path(tmp_path, job_id, 1, bbox)

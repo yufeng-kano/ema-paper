@@ -366,6 +366,8 @@ async def post_message(
         message_id=message.id,
         locale=body.locale,
     )
+    # The conversation list orders by it: the thread continued last is listed first.
+    row.updated_at = utcnow()
     # The message belongs to the turn that answers it: a reloaded thread groups by turn.
     message.turn_id = turn.id
     await db.commit()

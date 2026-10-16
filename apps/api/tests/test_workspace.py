@@ -1014,12 +1014,12 @@ def test_the_revision_log_is_bounded(tmp_path) -> None:
     root = tmp_path / "ws" / "5"
     root.mkdir(parents=True)
     git.ensure_repo(root)
-    for index in range(git.LOG_FILES_MAX + 50):
+    for index in range(git._log_files_max() + 50):
         safe_io.write_text(root, root / "files" / f"f{index:04d}.txt", "x")
     git.commit_all(root, "agent:1", "a flood of files")
     (revision,) = git.log(root)
     # The first LOG_FILES_MAX paths and a count of the rest, never the whole list.
-    assert len(revision.files) == git.LOG_FILES_MAX + 1
+    assert len(revision.files) == git._log_files_max() + 1
     assert revision.files[-1] == "... and 50 more"
 
 
@@ -1051,7 +1051,7 @@ def test_a_revision_whose_list_reaches_the_bound_is_still_listed(tmp_path, monke
     for index in range(60):
         safe_io.write_text(root, root / "files" / f"a-rather-long-file-name-{index:04d}.txt", "x")
     git.commit_all(root, "agent:1", "many names")
-    monkeypatch.setattr(git, "LOG_MAX_BYTES", 600)
+    monkeypatch.setattr(git, "_log_max_bytes", lambda: 600)
     (revision,) = git.log(root)
     assert revision.message == "many names"
     assert revision.files[-1] == "... (list cut)"
@@ -1205,11 +1205,11 @@ def test_a_revert_over_too_many_paths_or_too_much_metadata_is_refused(
     assert refused.value.status_code == 409
     assert (root / "files" / "d" / "f00.txt").exists()
     # The path list alone past the log bound is refused too, before anything is read.
-    monkeypatch.setattr(git, "LOG_MAX_BYTES", 200)
+    monkeypatch.setattr(git, "_log_max_bytes", lambda: 200)
     with pytest.raises(ApiError) as cut:
         documents._revert(paths, shell, max_bytes=1_000, total_max_bytes=10_000, max_paths=100)
     assert cut.value.status_code == 409
-    monkeypatch.setattr(git, "LOG_MAX_BYTES", 4 * 1024 * 1024)
+    monkeypatch.setattr(git, "_log_max_bytes", lambda: 4 * 1024 * 1024)
     documents._revert(paths, shell, max_bytes=1_000, total_max_bytes=10_000, max_paths=100)
     assert not (root / "files" / "d" / "f00.txt").exists()
 
@@ -1864,3 +1864,30 @@ def test_a_git_that_times_out_is_a_git_error_and_leaves_no_lock(tmp_path, monkey
         git._git(root, "status")
     assert "timed out" in str(timed_out.value)
     assert not (git_dir(root) / "index.lock").exists()
+
+
+async def test_a_removal_whose_origin_cannot_be_written_is_refused_whole(
+    sessionmaker, tmp_path, monkeypatch
+) -> None:
+    """A full disk at the origin marker must not leave the directory aside with nothing
+    to bring it back: it goes back where it was, and the delete is refused."""
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+    root = paths.root
+    (root / "files" / "Drafts").mkdir()
+    (root / "files" / "Drafts" / "notes.txt").write_text("from bash\n")
+    real = safe_io.write_text
+
+    def failing(root_, path, text, **kwargs):
+        if path.name.endswith(documents.ORIGIN_SUFFIX):
+            raise OSError(28, "No space left on device")
+        return real(root_, path, text, **kwargs)
+
+    monkeypatch.setattr(documents.safe_io, "write_text", failing)
+    with pytest.raises(ApiError) as refused:
+        await documents.remove_path(settings, user.id, Path("files/Drafts"))
+    assert refused.value.status_code == 409
+    assert (root / "files" / "Drafts" / "notes.txt").read_text() == "from bash\n"
+    assert not [name for name in os.listdir(root) if name.startswith(safe_io.TEMP_PREFIX)]

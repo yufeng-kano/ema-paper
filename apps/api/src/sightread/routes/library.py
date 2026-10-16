@@ -24,7 +24,7 @@ from fastapi import APIRouter, Request, Response, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import ColumnElement, delete, select, update
-from sqlalchemy.exc import IntegrityError, InvalidRequestError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.datastructures import FormData, UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser
@@ -48,7 +48,7 @@ from ..jobs.intake import (
     upload_chunks,
 )
 from ..jobs.runner import partial_result_payload, result_payload
-from ..parsing.figures import crop_path, parse_bbox_path
+from ..parsing.figures import find_crop, parse_bbox_path
 from ..workspace import documents as workspace_documents
 from ..workspace import safe_io
 from ..workspace.layout import document_relative_dir, path_segment, user_root
@@ -240,13 +240,16 @@ async def insert_named[RowT: (Folder, Document)](
     wanted: str,
     limit: int,
     message: str,
+    commit: bool = True,
 ) -> RowT:
     """Insert a row whose name has to be free where it lands, re-reading if it was taken.
 
     Two tabs can both read the same free name before either commits. The loser is not a
     conflict to report: a collision on create is resolved rather than refused
     (docs/web.md § Files), so it re-reads the folder and takes the next name. Only a
-    request that keeps losing gives up.
+    request that keeps losing gives up. Without `commit` the row is flushed and left in
+    the open transaction, for a caller that has more to make true before it commits
+    (a filing, whose original lands first — docs/workspace.md § Backups).
     """
     attempts = INSERT_ATTEMPTS
     while True:
@@ -255,7 +258,10 @@ async def insert_named[RowT: (Folder, Document)](
         row = build(free_name(await taken(), wanted, limit))
         db.add(row)
         try:
-            await db.commit()
+            if commit:
+                await db.commit()
+            else:
+                await db.flush()
             return row
         except IntegrityError as exc:
             await db.rollback()
@@ -761,11 +767,16 @@ async def upload_document(
             wanted=wanted,
             limit=DOCUMENT_NAME_MAX,
             message="A file with this name already exists here",
+            commit=False,
         )
 
-    # The row's commit and the upload it takes into the directory land in one backup
-    # snapshot: the upload directory is not backed up (docs/workspace.md § Backups).
-    async with backup_shared(user_root(settings.workspaces_dir, user_id)):
+    # The row, its original and their commit under one hold of the workspace lock (then
+    # the user's row and the job's: the one order every holder takes): a process that
+    # dies between the insert and the copy leaves no row without the original it was
+    # promised, and the backup lock held shared around it keeps a snapshot from seeing
+    # one without the other (docs/workspace.md § Revisions, § Backups).
+    root = user_root(settings.workspaces_dir, user_id)
+    async with backup_shared(root), workspace_lock(root):
         try:
             row = await land(folder_id)
         except ApiError:
@@ -774,28 +785,25 @@ async def upload_document(
             if folder_id is None or await folder_exists(db, user_id, folder_id):
                 raise
             row = await land(None)
+        row_id = row.id
 
         job = await job_of(db, job_id)
         # The parse may already be done (the worker then left the upload for this row),
         # or answered from the cache or joined in flight (the fresh upload is this row's
-        # to keep). A copy that fails takes the row with it, as filing from the history
-        # does: no entry without the original it was promised, and no suffixed twin
-        # from the browser's retry of a request that in fact failed.
+        # to keep). A copy that fails, or that the quota refuses, takes the row with it:
+        # the transaction rolls back, so no entry stands without the original it was
+        # promised, and no suffixed twin comes of the browser's retry.
         try:
-            await workspace_documents.adopt_source(db, settings, row, job, upload=submission.upload)
-        except InvalidRequestError:
-            raise ApiError(
-                404, "invalid_request", "The file was deleted while it was being filed"
-            ) from None
-        except ApiError:
-            # The quota refused the copy: nothing is filed, and the refusal is the answer.
-            await db.delete(row)
+            await workspace_documents.adopt_source(
+                db, settings, row, job, upload=submission.upload, locked=True
+            )
             await db.commit()
+        except ApiError:
+            await db.rollback()
             raise
         except Exception as exc:
-            logger.exception("could not keep the upload for document %d", row.id)
-            await db.delete(row)
-            await db.commit()
+            logger.exception("could not keep the upload for document %d", row_id)
+            await db.rollback()
             raise ApiError(
                 409, "invalid_request", "The upload could not be kept; nothing was filed"
             ) from exc
@@ -848,9 +856,11 @@ async def file_job(body: DocumentFromJob, user: SessionUser, db: DbSession, sett
         )
         return await sibling_names(db, user_id, folder_id)
 
-    # One backup hold from before the row commits until its original is in place, as
-    # for an upload: a snapshot never carries the row without it (docs/workspace.md).
-    async with backup_shared(user_root(settings.workspaces_dir, user_id)):
+    # The row, its copy of the original and their commit under one hold of the workspace
+    # lock, the backup lock shared around it, as for an upload: no row without its
+    # original, in the database or in a snapshot (docs/workspace.md § Backups).
+    root = user_root(settings.workspaces_dir, user_id)
+    async with backup_shared(root), workspace_lock(root):
         try:
             row = await insert_named(
                 db,
@@ -862,6 +872,7 @@ async def file_job(body: DocumentFromJob, user: SessionUser, db: DbSession, sett
                 wanted=wanted,
                 limit=DOCUMENT_NAME_MAX,
                 message="A file with this name already exists here",
+                commit=False,
             )
         except ApiError:
             # Same race as creating a folder: a destination deleted after the check above
@@ -869,16 +880,17 @@ async def file_job(body: DocumentFromJob, user: SessionUser, db: DbSession, sett
             if folder_id is None or await folder_exists(db, user_id, folder_id):
                 raise
             raise ApiError(404, "invalid_request", "No such folder") from None
+        row_id = row.id
         job = await job_of(db, job_id)
         # The original went with the first document filed from this parse: this one
         # takes a copy, so its pages render too (docs/workspace.md § Layout). A copy that
-        # fails takes the row with it: no entry without the original it was promised.
+        # fails takes the row with it: the transaction rolls back.
         try:
-            filed = await workspace_documents.inherit_original(db, settings, row, job)
-        except Exception as exc:
-            logger.exception("could not copy the original for document %d", row.id)
-            await db.delete(row)
+            filed = await workspace_documents.inherit_original(db, settings, row, job, locked=True)
             await db.commit()
+        except Exception as exc:
+            logger.exception("could not copy the original for document %d", row_id)
+            await db.rollback()
             raise ApiError(
                 409, "invalid_request", "The original could not be copied; nothing was filed"
             ) from exc
@@ -1001,8 +1013,10 @@ def figure_crop_response(settings: AppSettings, job: Job, page: int, bbox: str) 
     cleaned = parse_bbox_path(bbox)
     if cleaned is None or page < 1:
         raise ApiError(404, "invalid_request", "No such figure")
-    path = crop_path(Path(settings.figures_dir), job.id, page, cleaned)
-    if not path.is_file():
+    # Where it is now: published under the job's name, or still in a running attempt's
+    # directory (docs/parsing.md § Figure crops).
+    path = find_crop(Path(settings.figures_dir), job.id, page, cleaned)
+    if path is None:
         raise ApiError(404, "invalid_request", "No crop is stored for this figure")
     # Never cached: browser caches key on the URL, not the session, so a cached crop
     # would outlive a sign-out and answer the next account in the same browser profile.

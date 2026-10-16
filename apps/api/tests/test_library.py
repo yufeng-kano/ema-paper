@@ -979,3 +979,43 @@ async def test_an_upload_the_quota_refuses_files_nothing(make_client, documents,
     # The refused upload is gone from the upload directory; the parse's own stays for
     # the worker.
     assert sorted(path.name for path in uploads.iterdir()) == kept
+
+
+async def test_a_retry_after_a_degraded_finish_does_not_buy_a_second_parse(
+    library, sessionmaker, documents
+) -> None:
+    """The browser's retry can arrive after the first job finished with page errors — a
+    result the cache never answers — or failed: within the retry window it is still the
+    same upload, not a second parse to bill (docs/jobs.md § Dedup)."""
+    from datetime import timedelta
+
+    from sightread.db.models import utcnow
+
+    first = (await _upload(library, documents)).json()
+    async with sessionmaker() as db:
+        job = await db.get(Job, uuid.UUID(first["job_id"]))
+        job.status = "succeeded"
+        job.finished_at = utcnow()
+        db.add(
+            Result(
+                job_id=job.id,
+                markdown="",
+                pages=[],
+                figures=[],
+                errors=[{"page": 1, "reason": "render failed"}],
+                meta={},
+            )
+        )
+        await db.commit()
+    second = (await _upload(library, documents)).json()
+    assert second["job_id"] == first["job_id"]
+    async with sessionmaker() as db:
+        assert len((await db.execute(select(Job))).scalars().all()) == 1
+        # Past the window the normal rule holds: a degraded result reparses.
+        job = await db.get(Job, uuid.UUID(first["job_id"]))
+        job.finished_at = utcnow() - timedelta(
+            seconds=library.app.state.settings.upload_retry_window_seconds * 2
+        )
+        await db.commit()
+    third = (await _upload(library, documents)).json()
+    assert third["job_id"] != first["job_id"]

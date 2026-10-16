@@ -49,6 +49,10 @@ class Settings(BaseSettings):
     upload_max_bytes: int = 134_217_728
     page_cap: int = 500
     max_jobs_per_user: int = 2
+    # A library upload retried after the first request's answer was lost is answered with
+    # the job that answered the first, even one already finished, when it finished this
+    # recently (docs/jobs.md § Dedup).
+    upload_retry_window_seconds: int = 60
     vision_concurrency_per_job: int = 8
     render_workers: int = 0  # 0 means "CPU count", resolved by the worker
     upload_dir: str = "/data/uploads"
@@ -93,6 +97,11 @@ class Settings(BaseSettings):
     revert_max_bytes: int = 64 * 1024 * 1024
     revert_max_paths: int = 2000
     workspace_git_timeout_seconds: int = 60
+    # The most of a git log the API reads to list revisions, and the paths it keeps per
+    # revision; the rename and path lists a revert reads share the byte bound
+    # (docs/workspace.md § Revisions).
+    workspace_log_max_bytes: int = 4 * 1024 * 1024
+    workspace_log_files_max: int = 200
     chat_image_round_max_bytes: int = 32 * 1024 * 1024
     chat_image_turn_max_bytes: int = 128 * 1024 * 1024
     # The most an image document may decode to for `view_page`, read from its header

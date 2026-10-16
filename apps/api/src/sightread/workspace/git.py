@@ -29,9 +29,16 @@ def _timeout() -> float:
     return float(get_settings().workspace_git_timeout_seconds)
 
 
-# The most of a log the API reads to list revisions, and the paths it keeps per revision.
-LOG_MAX_BYTES = 4 * 1024 * 1024
-LOG_FILES_MAX = 200
+def _log_max_bytes() -> int:
+    """The most of a log, a rename list or a path list read into memory
+    (`WORKSPACE__log_max_bytes()`)."""
+    return int(get_settings().workspace_log_max_bytes)
+
+
+def _log_files_max() -> int:
+    """The paths a listed revision keeps (`WORKSPACE__log_files_max()`)."""
+    return int(get_settings().workspace_log_files_max)
+
 
 # The identities commits carry. An agent commit names its conversation in the author.
 USER_AUTHOR = "user"
@@ -242,7 +249,7 @@ def log(
     # Read up to a bound, never buffered whole: a shell revision can name any number of
     # files, and the API must not hold them all to list a few commits. A cut-off record
     # is dropped; the ones before it are complete.
-    code, raw, truncated = _git_bounded(root, *args, max_bytes=LOG_MAX_BYTES)
+    code, raw, truncated = _git_bounded(root, *args, max_bytes=_log_max_bytes())
     if code != 0 and not truncated:
         raise GitError("git log failed")
     records = raw.decode(errors="replace").split("\x1e")
@@ -262,8 +269,8 @@ def log(
             # The bound fell inside this revision's list: what fit, and a marker, rather
             # than no revision at all (its last line may be half a name).
             names = names[:-1] + ["... (list cut)"]
-        if len(names) > LOG_FILES_MAX:
-            names = names[:LOG_FILES_MAX] + [f"... and {len(names) - LOG_FILES_MAX} more"]
+        if len(names) > _log_files_max():
+            names = names[: _log_files_max()] + [f"... and {len(names) - _log_files_max()} more"]
         files = tuple(names)
         revisions.append(
             Revision(
@@ -336,7 +343,7 @@ def show(root: Path, commit: str, relative: Path, max_bytes: int) -> str | None:
 
 def renames_since(root: Path, commit: str) -> dict[Path, Path]:
     """Where each path renamed after `commit` lives now: old path → current path, with
-    chains of renames followed in order. Read under `LOG_MAX_BYTES` like the log: a
+    chains of renames followed in order. Read under `WORKSPACE__log_max_bytes()` like the log: a
     history of renames past it raises rather than being held whole."""
     code, raw, truncated = _git_bounded(
         root,
@@ -348,10 +355,10 @@ def renames_since(root: Path, commit: str) -> dict[Path, Path]:
         "--diff-filter=R",
         "-z",
         f"{commit}..HEAD",
-        max_bytes=LOG_MAX_BYTES,
+        max_bytes=_log_max_bytes(),
     )
     if truncated:
-        raise GitError(f"the renames since {commit[:12]} exceed {LOG_MAX_BYTES} bytes")
+        raise GitError(f"the renames since {commit[:12]} exceed {_log_max_bytes()} bytes")
     if code != 0:
         return {}
     fields = [field for field in raw.decode(errors="replace").split("\0") if field]
@@ -376,7 +383,7 @@ def renames_since(root: Path, commit: str) -> dict[Path, Path]:
 def changed_paths(root: Path, commit: str) -> list[tuple[str, Path, Path | None]]:
     """What the commit did to each path: `A`dded, `M`odified, `D`eleted, `T`ype-changed
     or `R`enamed — for a rename, the old path and the new one. Read under
-    `LOG_MAX_BYTES`: a commit whose path list is larger raises."""
+    `WORKSPACE__log_max_bytes()`: a commit whose path list is larger raises."""
     code, raw, truncated = _git_bounded(
         root,
         "diff-tree",
@@ -387,10 +394,10 @@ def changed_paths(root: Path, commit: str) -> list[tuple[str, Path, Path | None]
         "--find-renames",
         "-z",
         commit,
-        max_bytes=LOG_MAX_BYTES,
+        max_bytes=_log_max_bytes(),
     )
     if truncated:
-        raise GitError(f"the paths of {commit[:12]} exceed {LOG_MAX_BYTES} bytes")
+        raise GitError(f"the paths of {commit[:12]} exceed {_log_max_bytes()} bytes")
     if code != 0:
         return []
     fields = raw.decode(errors="replace").split("\0")

@@ -15,6 +15,7 @@ import hashlib
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Protocol
 
@@ -24,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..agents import PARSE, AgentDefinition
 from ..auth import upload_tickets
 from ..config import Settings
-from ..db.models import AgentSetting, Job, KanoProxyKey, Result, UploadTicket, User
+from ..db.models import AgentSetting, Job, KanoProxyKey, Result, UploadTicket, User, utcnow
 from ..errors import ApiError
 from ..parsing import poppler
 from ..parsing.images import ACCEPTED_IMAGE_TYPES, ImageError, probe_image
@@ -33,6 +34,7 @@ from .queue import (
     enqueue_job,
     find_active_job,
     find_cached_job,
+    find_recent_terminal_job,
     hold_dedup_key,
     normalize_pages_spec,
     parse_pages_spec,
@@ -323,11 +325,22 @@ async def submit_parse(
             # waits here rather than racing past the check below into its own parse.
             await hold_dedup_key(db, **key)
             active = await find_active_job(db, **key)
+            if active is None:
+                # The first request's job may have finished already — with page errors,
+                # which the cache never answers, or failed: within the retry window the
+                # same bytes are still one upload, not a second parse to bill.
+                active = await find_recent_terminal_job(
+                    db,
+                    finished_since=utcnow()
+                    - timedelta(seconds=settings.upload_retry_window_seconds),
+                    **key,
+                )
             if active is not None:
-                # The same parse is already on its way. Starting another would spend the
-                # user's key twice over for one document. A caller that keeps originals
-                # keeps this fresh copy for its own row: the worker may finish and hand
-                # the job's upload to the rows that exist before this one does.
+                # The same parse is already on its way, or just finished. Starting
+                # another would spend the user's key twice over for one document. A
+                # caller that keeps originals keeps this fresh copy for its own row: the
+                # worker may finish and hand the job's upload to the rows that exist
+                # before this one does.
                 if retain_source:
                     if not active.retain_source:
                         active.retain_source = True
