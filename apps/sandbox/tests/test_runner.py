@@ -615,3 +615,50 @@ async def test_a_stop_kills_a_running_command_inside_the_vm_first(tmp_path) -> N
     outcome = await asyncio.wait_for(running, 10)
     assert outcome.exit_code is None and not outcome.timed_out
     assert backend._user(31).sessions == {}
+
+
+async def test_a_runner_that_cannot_list_sandboxes_does_not_start(tmp_path, monkeypatch) -> None:
+    from sightread_sandbox import backends
+
+    async def daemon_away(*args, timeout=120.0):
+        return 1, "Cannot connect to the Docker daemon"
+
+    monkeypatch.setattr(backends, "_docker", daemon_away)
+    settings = Settings(
+        app_env="local",
+        sandbox_token=TOKEN,
+        sandbox_backend="docker",
+        sandbox_runtime="runc",
+        sandbox_workspaces_dir=str(tmp_path / "ws"),
+        sandbox_workspaces_mount=str(tmp_path / "ws"),
+    )
+    with pytest.raises(RuntimeError):
+        await backends.DockerBackend(settings).startup()
+
+
+async def test_the_vm_scratch_size_comes_from_settings(tmp_path, monkeypatch) -> None:
+    from sightread_sandbox import backends
+
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_docker(*args, timeout=120.0):
+        calls.append(args)
+        if args[0] == "inspect":
+            return 1, "Error: No such object"
+        return 0, ""
+
+    monkeypatch.setattr(backends, "_docker", fake_docker)
+    settings = Settings(
+        app_env="local",
+        sandbox_token=TOKEN,
+        sandbox_backend="docker",
+        sandbox_runtime="runc",
+        sandbox_tmp_size="256m",
+        sandbox_workspaces_dir=str(tmp_path / "ws"),
+        sandbox_workspaces_mount=str(tmp_path / "ws"),
+    )
+    backend = backends.DockerBackend(settings)
+    await backend.ensure_running(backend._user(41))
+    run = next(args for args in calls if args[0] == "run")
+    assert "/tmp:rw,exec,size=256m" in run  # noqa: S108 - the VM scratch, not the host
+    assert "size=1g" not in " ".join(run)

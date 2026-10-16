@@ -25,6 +25,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import ColumnElement, delete, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.datastructures import FormData, UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser
 
@@ -279,10 +280,15 @@ async def flush_or_retry(db: DbSession, retries_left: int, message: str) -> bool
         return False
 
 
-async def move_then_commit(db: DbSession, settings, user_id: int, before, after) -> None:
+async def move_then_commit(
+    db: DbSession, settings, user_id: int, before, after, *, landed: tuple[type, int, dict]
+) -> None:
     """The row is flushed; now the directory, then the commit. A refusal from the tree
     rolls the row back to where the files still are; a commit that fails after the move
-    puts the directory back where the row stayed (docs/workspace.md § Revisions)."""
+    puts the directory back where the row stayed — unless the row shows the commit
+    landed after all (the connection dropped after PostgreSQL made it durable), which
+    `landed` (the model, the id, the values the committed row holds) is read for on a
+    fresh connection: then the files stay where the row points (docs/workspace.md)."""
     try:
         moved = await workspace_documents.move_path(settings, user_id, before, after)
     except BaseException:
@@ -292,11 +298,32 @@ async def move_then_commit(db: DbSession, settings, user_id: int, before, after)
         await db.commit()
     except BaseException:
         if moved is not None:
-            try:
-                await workspace_documents.move_path(settings, user_id, after, before)
-            except Exception:  # noqa: BLE001 - the move revision stays revertible
-                logger.exception("could not move %s back after a failed commit", after)
+            if await _committed_after_all(db, landed):
+                logger.warning(
+                    "the move of %s to %s was committed despite the error; the files stay",
+                    before,
+                    after,
+                )
+            else:
+                try:
+                    await workspace_documents.move_path(settings, user_id, after, before)
+                except Exception:  # noqa: BLE001 - the move revision stays revertible
+                    logger.exception("could not move %s back after a failed commit", after)
         raise
+
+
+async def _committed_after_all(db: DbSession, landed: tuple[type, int, dict]) -> bool:
+    """Whether the row holds the values a commit that raised was to leave — read on a
+    connection of its own, since the request's may be the one that dropped. Unreadable
+    counts as not committed: a rollback is the common outcome of a failed commit."""
+    model, row_id, expected = landed
+    try:
+        async with AsyncSession(bind=db.bind, expire_on_commit=False) as fresh:
+            row = await fresh.get(model, row_id)
+    except Exception:  # noqa: BLE001 - the database is away; the files go back
+        logger.exception("could not check whether the move of row %s landed", row_id)
+        return False
+    return row is not None and all(getattr(row, key) == value for key, value in expected.items())
 
 
 async def folder_exists(db: DbSession, user_id: int, folder_id: int) -> bool:
@@ -485,7 +512,8 @@ async def _update_folder_locked(
             break
     # The tree follows the rows (docs/workspace.md): the directory moves, then the commit.
     after = await folder_relative_dir(db, user.id, row.id)
-    await move_then_commit(db, settings, user.id, before, after)
+    landed = (Folder, row.id, {"parent_id": row.parent_id, "name": row.name})
+    await move_then_commit(db, settings, user.id, before, after, landed=landed)
     return folder_payload(row)
 
 
@@ -808,7 +836,8 @@ async def _update_document_locked(
         if await flush_or_retry(db, retries, clash):
             break
     after = await document_relative(db, row)
-    await move_then_commit(db, settings, user.id, before, after)
+    landed = (Document, row.id, {"folder_id": row.folder_id, "name": row.name})
+    await move_then_commit(db, settings, user.id, before, after, landed=landed)
     return document_payload(row, await job_of(db, row.job_id))
 
 

@@ -396,19 +396,21 @@ async def inherit_original(
         ).scalars()
     )
     if siblings:
-        # Every copy counts: a full workspace keeps no further one (§ Quota).
-        try:
-            await ensure_within_quota(settings, root)
-        except ApiError:
-            logger.warning(
-                "workspace of user %d is at its quota; document %d keeps no original",
-                document.user_id,
-                document.id,
-            )
-            return
-    for sibling_id in siblings:
-        if await asyncio.to_thread(_copy_original, root, sibling_id, document.id):
-            return
+        # The quota and the copy under the workspace lock, as retention takes them: two
+        # filings at once must not both measure the room and both take it (§ Quota).
+        async with workspace_lock(root):
+            try:
+                await ensure_within_quota(settings, root)
+            except ApiError:
+                logger.warning(
+                    "workspace of user %d is at its quota; document %d keeps no original",
+                    document.user_id,
+                    document.id,
+                )
+                return
+            for sibling_id in siblings:
+                if await asyncio.to_thread(_copy_original, root, sibling_id, document.id):
+                    return
     await adopt_source(db, settings, document, job)
 
 

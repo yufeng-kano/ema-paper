@@ -720,3 +720,49 @@ async def test_filing_again_at_the_quota_keeps_no_copy_and_a_failed_copy_files_n
     assert refused.status_code == 409
     names = [row["name"] for row in (await _read(library))["documents"]]
     assert sorted(names) == ["tiny (2).png", "tiny (3).png", "tiny.png"]
+
+
+async def test_a_move_whose_commit_landed_despite_the_error_is_not_undone(
+    make_client, sessionmaker, documents, tmp_path, monkeypatch
+) -> None:
+    import contextlib
+
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    library = make_client(workspaces_dir=str(tmp_path / "ws"))
+    await _ready_to_parse(library)
+    await _upload(library, documents)
+    uploaded = (await _upload(library, documents)).json()
+    async with sessionmaker() as db:
+        row = await db.get(Document, uploaded["id"])
+        root = user_root(library.app.state.settings.workspaces_dir, row.user_id)
+    (root / "files" / "tiny (2).png" / "notes.md").write_text("kept edit")
+
+    # The commit goes through, and then the acknowledgement is lost: the error reaches
+    # the route, but the row already names the new path.
+    original = AsyncSession.commit
+    failing = {"on": True}
+
+    async def commit(self):
+        await original(self)
+        if failing["on"]:
+            failing["on"] = False
+            raise OperationalError("COMMIT", {}, Exception("the connection dropped"))
+
+    monkeypatch.setattr(AsyncSession, "commit", commit)
+    with contextlib.suppress(Exception):
+        await library.put(
+            f"/api/library/documents/{uploaded['id']}",
+            json={"name": "renamed.png"},
+            headers=CSRF_HEADERS,
+        )
+    monkeypatch.setattr(AsyncSession, "commit", original)
+    assert failing["on"] is False
+    async with sessionmaker() as db:
+        row = await db.get(Document, uploaded["id"])
+        assert row.name == "renamed.png"
+    # The files stayed where the row points — the edit with them — not moved back to a
+    # path the row no longer names, where a fresh copy would have shadowed them.
+    assert (root / "files" / "renamed.png" / "notes.md").read_text() == "kept edit"
+    assert not (root / "files" / "tiny (2).png").exists()

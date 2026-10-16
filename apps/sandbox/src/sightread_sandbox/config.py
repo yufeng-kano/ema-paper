@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     sandbox_cpus: str = "2"
     sandbox_memory: str = "4g"
     sandbox_pids: int = 512
+    # The VM's writable scratch space at /tmp (a tmpfs, so it counts against memory).
+    sandbox_tmp_size: str = "1g"
     sandbox_idle_seconds: int = 1200
     # Shells one user's VM keeps open at once; the longest idle one makes room for a new one.
     sandbox_max_shells: int = 8

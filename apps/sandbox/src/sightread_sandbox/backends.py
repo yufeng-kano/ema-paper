@@ -372,8 +372,9 @@ class DockerBackend(Backend):
             "ps", "--filter", f"name=^{CONTAINER_PREFIX}", "--format", "{{.Names}}", timeout=30
         )
         if code != 0:
-            logger.warning("could not list running sandboxes: %s", out.strip())
-            return
+            # Fail closed: a VM this runner does not know of would take commands beside
+            # whatever a previous runner's shell left running in it, unswept.
+            raise RuntimeError(f"could not list running sandboxes: {out.strip()}")
         for user_id in adopted_user_ids(out):
             sandbox = self._user(user_id)
             sandbox.started_at = time.monotonic()
@@ -442,7 +443,7 @@ class DockerBackend(Backend):
             str(settings.sandbox_pids),
             "--read-only",
             "--tmpfs",
-            "/tmp:rw,exec,size=1g",  # noqa: S108 - the VM's own scratch space
+            f"/tmp:rw,exec,size={settings.sandbox_tmp_size}",  # noqa: S108 - the VM's scratch
             "--security-opt",
             "no-new-privileges",
             "--cap-drop",
