@@ -45,10 +45,12 @@ from ..upstream.client import (
     transcribe_page,
 )
 from ..workspace.documents import (
+    copy_original,
     ensure_within_quota,
     folder_names,
     keep_source,
     materialize_document,
+    original_of,
 )
 from ..workspace.layout import document_relative_dir, user_root
 from ..workspace.locks import backup_shared, workspace_lock
@@ -511,7 +513,7 @@ async def _finish_held(
                 ).scalars()
             )
         source = Path(job.source_path) if job.source_path else None
-        if source is not None and not (documents and source.is_file()):
+        if source is not None and not documents:
             if status == "succeeded" and job.retain_source and source.is_file():
                 # A library upload whose row has not landed yet: the upload stays where
                 # it is for that row to take (docs/jobs.md § Retention).
@@ -522,10 +524,12 @@ async def _finish_held(
                 job.source_deleted_at = utcnow()
         await events.notify(db, job.id)
         await db.commit()
-    if source is not None and documents and source.is_file():
+    if source is not None and documents:
         # The terminal state is committed and billed; keeping the original is best effort
         # from here (docs/jobs.md § Retention): a copy that fails is logged, never a
-        # reason to leave the job `running`.
+        # reason to leave the job `running`. Whether the upload is still there is not
+        # checked here: a row filed meanwhile may have taken it as its own original, and
+        # retention then copies from that one for the recipients found above.
         try:
             await _retain_source(sessionmaker, settings, job_id, source)
         except Exception:  # noqa: BLE001 - retention must not undo a finished parse
@@ -555,7 +559,10 @@ async def _retain_source(
     job's row — the one order every holder of both takes — and the recipients are read
     under that row lock: filing takes it before it inserts, so a row filed while this
     runs is either here or filed afterwards, as a finished parse. Each copy is checked
-    against the quota and taken where the document is at that moment."""
+    against the quota and taken where the document is at that moment. A recipient that
+    holds an original already is left alone, and when the upload is gone — a row filed
+    between the terminal commit and this lock found no original yet and took the upload
+    as its own — the rest are copied from the original any recipient holds."""
     async with sessionmaker() as db:
         job = await db.get(Job, job_id)
         if job is None:
@@ -572,7 +579,22 @@ async def _retain_source(
                     )
                 ).scalars()
             )
-            for index, row in enumerate(documents):
+            donor: int | None = None
+            pending: list[Document] = []
+            for row in documents:
+                if original_of(root, row.id) is None:
+                    pending.append(row)
+                elif donor is None:
+                    donor = row.id
+            if not source.is_file() and donor is None and pending:
+                logger.warning(
+                    "the source of job %s is gone and no document of it holds an original; "
+                    "%d document(s) keep none",
+                    job_id,
+                    len(pending),
+                )
+                pending = []
+            for index, row in enumerate(pending):
                 relative = document_relative_dir(
                     await folder_names(db, row.user_id, row.folder_id), row.name
                 )
@@ -587,15 +609,20 @@ async def _retain_source(
                         row.id,
                     )
                     continue
-                await asyncio.to_thread(
-                    keep_source,
-                    root,
-                    relative,
-                    source,
-                    document_id=row.id,
-                    kind=job.kind,
-                    copy=index < len(documents) - 1,
-                )
+                if source.is_file():
+                    await asyncio.to_thread(
+                        keep_source,
+                        root,
+                        relative,
+                        source,
+                        document_id=row.id,
+                        kind=job.kind,
+                        copy=index < len(pending) - 1,
+                    )
+                else:
+                    # The shell's copy comes with the next materialization, which
+                    # `_finish_held` runs right after this.
+                    await asyncio.to_thread(copy_original, root, donor, row.id)
             # Not kept anywhere (none with room): deleted, as for a parse outside the
             # library.
             source.unlink(missing_ok=True)

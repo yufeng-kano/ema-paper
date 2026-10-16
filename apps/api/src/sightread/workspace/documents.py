@@ -367,7 +367,10 @@ def keep_source(
     return canonical
 
 
-def _copy_original(root: Path, source_id: int, target_id: int) -> bool:
+def copy_original(root: Path, source_id: int, target_id: int) -> bool:
+    """A copy of one document's original as another's, whole or not at all; False when
+    the first holds none. The shell's copy is not made here: the next materialization
+    makes it from the original (docs/workspace.md § Layout)."""
     original = original_of(root, source_id)
     if original is None:
         return False
@@ -397,6 +400,9 @@ async def inherit_original(
             await db.refresh(document)
         except InvalidRequestError:
             return False  # deleted since it was filed; a delete holds this lock
+        if original_of(root, document.id) is not None:
+            # Retention got here first: the row was among the recipients it read.
+            return True
         siblings = list(
             (
                 await db.execute(
@@ -417,7 +423,7 @@ async def inherit_original(
                 )
                 return True
             for sibling_id in siblings:
-                if await asyncio.to_thread(_copy_original, root, sibling_id, document.id):
+                if await asyncio.to_thread(copy_original, root, sibling_id, document.id):
                     return True
     try:
         await adopt_source(db, settings, document, job)
@@ -457,10 +463,13 @@ async def adopt_source(
         if job.status != "succeeded" or not job.source_path or job.source_deleted_at is not None:
             return
         source = Path(job.source_path)
-    if not source.is_file():
-        return
     root = user_root(settings.workspaces_dir, document.user_id)
     async with workspace_lock(root):
+        if not source.is_file():
+            # Taken already — by retention, which read this row as a recipient under the
+            # job's row lock — or never there; looked at under the lock retention holds,
+            # so a copy is never started from a file it is moving away.
+            return
         await db.refresh(document)
         relative = document_relative_dir(
             await folder_names(db, document.user_id, document.folder_id), document.name

@@ -73,7 +73,7 @@ async def run_worker(stop: asyncio.Event) -> None:
                 orphans_tried_at = time.monotonic()
                 try:
                     async with sessionmaker() as db:
-                        finished, left = await fail_orphaned_turns(db, sandbox)
+                        finished, left = await fail_orphaned_turns(db, sandbox, settings)
                 except SQLAlchemyError:
                     logger.exception("could not finish orphaned chat turns; will retry")
                 else:

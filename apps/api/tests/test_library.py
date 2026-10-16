@@ -716,7 +716,7 @@ async def test_filing_again_at_the_quota_keeps_no_copy_and_a_failed_copy_files_n
     def failing(*args, **kwargs):
         raise OSError("disk unwell")
 
-    monkeypatch.setattr(workspace_documents, "_copy_original", failing)
+    monkeypatch.setattr(workspace_documents, "copy_original", failing)
     refused = await _file_job(library, uploaded["job_id"])
     assert refused.status_code == 409
     names = [row["name"] for row in (await _read(library))["documents"]]

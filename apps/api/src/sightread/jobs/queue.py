@@ -7,6 +7,8 @@ per-user cap applied at claim time so one user cannot monopolise the workers.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
 import uuid
 
@@ -14,9 +16,19 @@ from sqlalchemy import bindparam, delete, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..agents import get_agent
+from ..config import Settings
 from ..db.models import ChatTurn, Conversation, Job, JobPage, utcnow
 from ..sandbox.client import SandboxClient, SandboxUnavailable
+from ..workspace import git
+from ..workspace.layout import git_dir, user_root
+from ..workspace.locks import shell_lock, workspace_lock
+from ..workspace.reconcile import reconcile_locked
 from . import chat_events
+
+logger = logging.getLogger(__name__)
+
+# The revision an orphaned turn's unrecorded changes become (docs/jobs.md § Chat turns).
+ORPHAN_REVISION_MESSAGE = "bash: interrupted by a worker restart"
 
 # PostgreSQL claim (docs/jobs.md). The correlated count applies the per-user running cap
 # to the same scan that picks the oldest queued job.
@@ -368,7 +380,7 @@ async def claim_next_turn(db: AsyncSession, max_turns_per_user: int) -> uuid.UUI
 
 
 async def fail_orphaned_turns(
-    db: AsyncSession, sandbox: SandboxClient | None = None
+    db: AsyncSession, sandbox: SandboxClient | None = None, settings: Settings | None = None
 ) -> tuple[int, set[int]]:
     """Finish every turn a worker that died left behind: `running`, or cancelled and not
     yet wound down. Run when a worker starts, and again until it goes through — the
@@ -376,11 +388,14 @@ async def fail_orphaned_turns(
     held (docs/jobs.md § Chat turns). Each turn's shell is restarted on the runner first,
     which kills the command the dead worker may have left running inside the VM; a
     runner that does not answer leaves that turn for the next pass rather than finishing
-    it over a command that may still write. Returns (finished, the users whose turns are
-    left for later)."""
+    it over a command that may still write. Then whatever the turn changed and never
+    recorded — the worker died between a tool's write and its commit — becomes a revision
+    of its own, under the same locks the tool held, so the next revision carries only
+    its own changes; a tree that cannot be committed leaves the turn for the next pass
+    too. Returns (finished, the users whose turns are left for later)."""
     orphans = (
         await db.execute(
-            select(ChatTurn.id, ChatTurn.user_id, Conversation.session)
+            select(ChatTurn.id, ChatTurn.user_id, Conversation.id, Conversation.session)
             .join(Conversation, Conversation.id == ChatTurn.conversation_id)
             .where(
                 ChatTurn.status.in_(("running", "cancelled")),
@@ -390,16 +405,50 @@ async def fail_orphaned_turns(
     ).all()
     finished = 0
     left: set[int] = set()
-    for turn_id, user_id, session in orphans:
+    for turn_id, user_id, conversation_id, session in orphans:
+        if user_id in left:
+            continue
         if sandbox is not None and sandbox.configured:
             try:
                 await sandbox.restart(user_id, session)
             except SandboxUnavailable:
                 left.add(user_id)
                 continue
+        if settings is not None and not await _record_orphaned_changes(
+            db, settings, user_id, conversation_id
+        ):
+            left.add(user_id)
+            continue
         await fail_turn(db, turn_id, "worker restarted")
         finished += 1
     return finished, left
+
+
+async def _record_orphaned_changes(
+    db: AsyncSession, settings: Settings, user_id: int, conversation_id: int
+) -> bool:
+    """The dirty tree an orphaned turn left, as one revision in the turn's name; True
+    when the tree is clean or recorded. The shell lock before the workspace lock, as
+    the bash tool takes them; the library follows the tree when something was recorded,
+    as after a command (docs/workspace.md § Revisions)."""
+    root = user_root(settings.workspaces_dir, user_id)
+    if not git_dir(root).is_dir():
+        return True
+    author = f"{git.AGENT_AUTHOR_PREFIX}{conversation_id}"
+    async with shell_lock(root), workspace_lock(root):
+        try:
+            commit = await asyncio.to_thread(git.commit_all, root, author, ORPHAN_REVISION_MESSAGE)
+        except git.GitError:
+            logger.exception(
+                "could not record the changes an orphaned turn of user %d left", user_id
+            )
+            return False
+        if commit is not None:
+            logger.warning(
+                "recorded the changes an orphaned turn of user %d left as %s", user_id, commit
+            )
+            await reconcile_locked(db, settings, user_id)
+    return True
 
 
 async def fail_turn(db: AsyncSession, turn_id: uuid.UUID, error: str) -> None:

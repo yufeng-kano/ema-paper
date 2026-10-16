@@ -480,6 +480,42 @@ async def test_a_late_library_row_adopts_the_finished_upload(sessionmaker, tmp_p
         assert (paths.directory / "source.pdf").read_bytes() == b"%PDF-1.4"
 
 
+async def test_retention_copies_for_its_recipients_when_a_late_row_took_the_upload(
+    sessionmaker, tmp_path
+) -> None:
+    from sightread.jobs import runner
+
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, first = await _seed(db)
+        job = (await db.execute(select(Job).where(Job.id == first.job_id))).scalar_one()
+        upload = tmp_path / "upload.pdf"
+        upload.write_bytes(b"%PDF-1.4")
+        job.source_path = str(upload)
+        job.status = "running"
+        late = Document(user_id=user.id, folder_id=first.folder_id, job_id=job.id, name="again.pdf")
+        db.add(late)
+        await db.commit()
+        # Filed again in the moment between the worker's terminal commit and its
+        # retention: no original to copy yet, so the row takes the upload outright.
+        await documents.adopt_source(db, settings, late, job, upload=upload)
+        root = user_root(settings.workspaces_dir, user.id)
+        assert not upload.exists()
+        assert documents.original_of(root, late.id) is not None
+        first_id, late_id, job_id = first.id, late.id, job.id
+
+    # The worker's retention finds the upload gone, and still keeps an original for the
+    # recipient it found at the terminal commit: a copy of the late row's.
+    await runner._finish(sessionmaker, job_id, status="succeeded", settings=settings)
+    original = documents.original_of(root, first_id)
+    assert original is not None and original.read_bytes() == b"%PDF-1.4"
+    assert documents.original_of(root, late_id).read_bytes() == b"%PDF-1.4"
+    assert (root / "files" / "Papers" / "paper.pdf" / "source.pdf").read_bytes() == b"%PDF-1.4"
+    async with sessionmaker() as db:
+        job = await db.get(Job, job_id)
+        assert job.status == "succeeded" and job.source_deleted_at is not None
+
+
 async def test_reverting_a_rename_moves_the_directory_back_and_the_row_follows(
     sessionmaker, tmp_path
 ) -> None:

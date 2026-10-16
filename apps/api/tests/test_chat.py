@@ -1291,6 +1291,59 @@ def test_an_image_past_the_pixel_cap_is_refused_before_it_is_decoded() -> None:
     assert chat_tools._as_png(small.getvalue()).startswith(b"\x89PNG")
 
 
+async def test_a_worker_starting_records_what_an_orphaned_turn_left_unrecorded(
+    chatting, monkeypatch
+) -> None:
+    from sightread.jobs.queue import ORPHAN_REVISION_MESSAGE, fail_orphaned_turns
+
+    settings = chatting.app.state.settings
+    document_id = chatting.document_id
+    conversation_id = (
+        await chatting.post(
+            f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    sent = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
+    )
+    turn_id = uuid.UUID(sent.json()["turn_id"])
+    async with chatting.app.state.sessionmaker() as db:
+        turn = await db.get(ChatTurn, turn_id)
+        turn.status = "running"
+        await db.commit()
+        document = await db.get(Document, document_id)
+        paths = await workspace_documents.materialize_document(db, settings, document)
+    # The dead worker's shell wrote a file, and the worker died before the commit.
+    (paths.directory / "helper.py").write_text("print(1)\n")
+    (paths.directory / "doc.md").write_text("# Title\n\nHalf done\n")
+
+    real = git.commit_all
+
+    def failing(*args, **kwargs):
+        raise git.GitError("index.lock exists")
+
+    # A tree that cannot be committed leaves the turn for the next pass: finishing it
+    # would let the next revision carry these changes as its own.
+    monkeypatch.setattr(git, "commit_all", failing)
+    async with chatting.app.state.sessionmaker() as db:
+        assert await fail_orphaned_turns(db, None, settings) == (0, {chatting.user_id})
+        assert (await db.get(ChatTurn, turn_id)).finished_at is None
+    monkeypatch.setattr(git, "commit_all", real)
+
+    async with chatting.app.state.sessionmaker() as db:
+        assert await fail_orphaned_turns(db, None, settings) == (1, set())
+        turn = await db.get(ChatTurn, turn_id)
+        assert turn.status == "failed" and turn.finished_at is not None
+    head = git.log(paths.root)[0]
+    assert head.message == ORPHAN_REVISION_MESSAGE
+    assert head.author == f"agent:{conversation_id}"
+    assert set(head.files) == {"files/Papers/paper.pdf/helper.py", "files/Papers/paper.pdf/doc.md"}
+    # The tree is clean: a later tool's revision carries only its own changes.
+    assert git.commit_all(paths.root, "user", "anything left?") is None
+    revisions = (await chatting.get(f"/api/library/documents/{document_id}/revisions")).json()
+    assert revisions["revisions"][0]["message"] == ORPHAN_REVISION_MESSAGE
+
+
 async def test_a_worker_starting_finishes_the_turns_a_dead_one_left(chatting) -> None:
     from sightread.jobs.queue import fail_orphaned_turns
 
