@@ -339,3 +339,45 @@ async def test_a_dropped_request_kills_its_command_where_it_runs() -> None:
         await running
     assert killed == [True]
     assert not shell.alive
+
+
+async def test_reset_removes_whatever_sits_at_the_cache(client, tmp_path) -> None:
+    from sightread_sandbox.backends import CACHE_DIR
+
+    assert (
+        await client.post("/sandboxes/13/exec", json={"session": "s", "command": "true"})
+    ).status_code == 200
+    assert (await client.post("/sandboxes/13/stop")).status_code == 204
+    cache = tmp_path / "ws" / "13" / CACHE_DIR
+    import shutil
+
+    shutil.rmtree(cache)
+    cache.write_text("not a directory")  # what a command left in its place
+    assert (await client.post("/sandboxes/13/reset")).status_code == 204
+    assert not cache.exists()
+    again = await client.post("/sandboxes/13/exec", json={"session": "s", "command": "echo ok"})
+    assert again.status_code == 200, again.text
+    assert again.json()["output"] == "ok"
+    assert cache.is_dir()
+
+
+def test_the_vm_sweep_scripts_are_valid_sh_and_the_docker_backend_uses_them(tmp_path) -> None:
+    import subprocess
+
+    from sightread_sandbox.backends import ADOPT_SWEEP, KILL_TREE, VM_SWEEP, DockerBackend
+    from sightread_sandbox.shell import GROUP_CLEANUP
+
+    for script in (VM_SWEEP, KILL_TREE, ADOPT_SWEEP, GROUP_CLEANUP):
+        subprocess.run(["sh", "-n"], input=script, text=True, check=True)  # noqa: S603, S607
+    settings = Settings(
+        app_env="local",
+        sandbox_token=TOKEN,
+        sandbox_backend="docker",
+        sandbox_runtime="runc",
+        sandbox_workspaces_dir=str(tmp_path / "ws"),
+        sandbox_workspaces_mount=str(tmp_path / "ws"),
+    )
+    assert DockerBackend(settings).cleanup() == VM_SWEEP
+    assert LocalBackend(settings).cleanup() == GROUP_CLEANUP
+    # The timeout kill and the adoption both end with the sweep.
+    assert VM_SWEEP.strip() in KILL_TREE and VM_SWEEP.strip() in ADOPT_SWEEP

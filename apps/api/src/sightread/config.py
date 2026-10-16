@@ -86,11 +86,15 @@ class Settings(BaseSettings):
     revert_max_bytes: int = 64 * 1024 * 1024
     revert_max_paths: int = 2000
     chat_image_round_max_bytes: int = 32 * 1024 * 1024
+    chat_image_turn_max_bytes: int = 128 * 1024 * 1024
 
     # The sandbox runner (docs/sandbox.md). Empty URL = no sandbox: the chat agent runs
     # without its bash tool. The token is what api and worker present to the runner.
     sandbox_url: str = ""
     sandbox_token: str = ""
+    # What the runner's stop, reset, restart and status calls are given: it must cover
+    # the runner's own Docker timeout, the inspection after it and a reset's deletion.
+    sandbox_control_timeout_seconds: int = 180
 
     domain: str = ""
     acme_email: str = ""

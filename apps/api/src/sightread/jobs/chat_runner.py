@@ -46,7 +46,7 @@ from ..upstream.client import (
 )
 from ..workspace import git
 from ..workspace.documents import DocumentPaths, ensure_within_quota, materialize_document
-from ..workspace.locks import shell_lock
+from ..workspace.locks import shell_lock, workspace_lock
 from ..workspace.reconcile import reconcile_user
 from . import chat_events, chat_tools
 
@@ -88,6 +88,9 @@ class TurnContext:
     sandbox: SandboxClient | None
     render_slots: asyncio.Semaphore
     tool_calls: int = 0
+    # Encoded image bytes the turn's reads have returned so far, every round together
+    # (docs/chat.md § Tools).
+    image_spent: int = 0
     # The mutating tool call in flight, if any: finished before the turn is, whatever
     # ended the turn.
     writer: asyncio.Future | None = None
@@ -523,8 +526,11 @@ async def _run_tool_unguarded(
         else:
             # One shell at a time per user, through the command *and* its commit: two
             # conversations' shells must never have the tree dirty together, or one's
-            # revision would carry the other's half-written files (docs/chat.md § Tools).
-            async with shell_lock(ctx.paths.root):
+            # revision would carry the other's half-written files. The workspace lock
+            # is held across the command as well: a save or another conversation's
+            # editor landing on a file the command is writing would otherwise read and
+            # commit a half-written file (docs/chat.md § Tools).
+            async with shell_lock(ctx.paths.root), workspace_lock(ctx.paths.root):
                 outcome = await chat_tools.run_bash(
                     ctx.sandbox,
                     ctx.turn.user_id,
@@ -535,7 +541,12 @@ async def _run_tool_unguarded(
                 )
                 # What the shell changed is a revision of its own (docs/workspace.md).
                 outcome = await chat_tools.commit_shell_changes(
-                    ctx.paths.root, outcome, tool_input, author, max_chars=max_chars
+                    ctx.paths.root,
+                    outcome,
+                    tool_input,
+                    author,
+                    max_chars=max_chars,
+                    locked=True,
                 )
             if outcome.edit is not None:
                 # The library follows the tree before the viewer is told to reload, so
@@ -592,6 +603,10 @@ MUTATING_TOOLS = frozenset({"bash", "str_replace_based_edit_tool"})
 # Read-only tools of one round in flight together.
 READ_CONCURRENCY = 4
 IMAGE_BUDGET_SPENT = "This round's image budget is spent; ask for fewer pages or figures at a time."
+IMAGE_TURN_BUDGET_SPENT = (
+    "This turn's image budget is spent; finish with what you have seen, or answer and let "
+    "the user ask again."
+)
 
 
 def _image_bytes(result: dict) -> int:
@@ -618,17 +633,31 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
         # once would hold their PNGs in memory together and store them all in the history.
         slots = asyncio.Semaphore(READ_CONCURRENCY)
         budget = ctx.settings.chat_image_round_max_bytes
+        # The turn's budget too: the round's alone would let fifty rounds store fifty
+        # rounds' worth of pages in the history every later request replays.
+        turn_budget = ctx.settings.chat_image_turn_max_bytes
         spent = 0
+
+        def exhausted() -> chat_tools.ToolOutcome | None:
+            if ctx.image_spent >= turn_budget:
+                return chat_tools.ToolOutcome(IMAGE_TURN_BUDGET_SPENT, is_error=True)
+            if spent >= budget:
+                return chat_tools.ToolOutcome(IMAGE_BUDGET_SPENT, is_error=True)
+            return None
 
         def admit(outcome: chat_tools.ToolOutcome) -> chat_tools.ToolOutcome:
             # One result at a time, as each completes (no await in between): an image
-            # that would cross the budget is replaced before it is reported or stored,
-            # so the round never exceeds it however many reads ran together.
+            # that would cross a budget is replaced before it is reported or stored,
+            # so neither the round nor the turn exceeds it however many reads ran
+            # together.
             nonlocal spent
             size = _image_bytes({"content": outcome.content})
+            if size and ctx.image_spent + size > turn_budget:
+                return chat_tools.ToolOutcome(IMAGE_TURN_BUDGET_SPENT, is_error=True)
             if size and spent + size > budget:
                 return chat_tools.ToolOutcome(IMAGE_BUDGET_SPENT, is_error=True)
             spent += size
+            ctx.image_spent += size
             return outcome
 
         async def one(index: int, block: dict) -> None:
@@ -640,10 +669,10 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
                 if stopped.is_set() or await _cancelled(ctx):
                     stopped.set()
                     return
-                if spent >= budget:
-                    outcome = chat_tools.ToolOutcome(IMAGE_BUDGET_SPENT, is_error=True)
+                refusal = exhausted()
+                if refusal is not None:
                     results[index] = await _report_tool(
-                        ctx, str(block.get("id")), block.get("name"), outcome
+                        ctx, str(block.get("id")), block.get("name"), refusal
                     )
                     return
                 results[index] = await _run_tool(ctx, block, malformed, admit)

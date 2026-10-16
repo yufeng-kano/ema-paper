@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     sandbox_output_max_bytes: int = 262_144
     # The longest a single command may run, whatever the caller asked for.
     sandbox_command_timeout_max: int = 600
+    # How long Docker is given to remove a VM on stop.
+    sandbox_docker_timeout_seconds: int = 120
     sandbox_port: int = 8100
     # The runtime names production accepts: VM runtimes, so a shared-kernel runtime
     # under another name cannot pass for a VM boundary (docs/sandbox.md § Isolation).

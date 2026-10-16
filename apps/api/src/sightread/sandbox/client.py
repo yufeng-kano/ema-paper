@@ -14,9 +14,10 @@ import httpx
 
 from ..config import Settings
 
-REQUEST_TIMEOUT_SECONDS = 30.0
 # `exec` waits for the command itself plus the VM's boot; the runner enforces the
-# command's own timeout and answers within it.
+# command's own timeout and answers within it. The control calls (stop, reset, restart,
+# status) get `SANDBOX_CONTROL_TIMEOUT_SECONDS`, which covers the runner's own Docker
+# timeout, the inspection after it and a reset's deletion (docs/sandbox.md).
 EXEC_GRACE_SECONDS = 60.0
 
 
@@ -44,6 +45,7 @@ class SandboxClient:
     def __init__(self, settings: Settings) -> None:
         self._base = settings.sandbox_url.rstrip("/")
         self._token = settings.sandbox_token
+        self._control_timeout = float(settings.sandbox_control_timeout_seconds)
         self.configured = settings.sandbox_configured
 
     def _headers(self) -> dict[str, str]:
@@ -88,12 +90,12 @@ class SandboxClient:
             "POST",
             f"/sandboxes/{user_id}/restart",
             json={"session": session},
-            timeout=REQUEST_TIMEOUT_SECONDS,
+            timeout=self._control_timeout,
         )
 
     async def status(self, user_id: int) -> SandboxStatus:
         payload = await self._call(
-            "GET", f"/sandboxes/{user_id}", json=None, timeout=REQUEST_TIMEOUT_SECONDS
+            "GET", f"/sandboxes/{user_id}", json=None, timeout=self._control_timeout
         )
         return SandboxStatus(
             state=str(payload.get("state") or "stopped"),
@@ -106,10 +108,10 @@ class SandboxClient:
 
     async def stop(self, user_id: int) -> None:
         await self._call(
-            "POST", f"/sandboxes/{user_id}/stop", json=None, timeout=REQUEST_TIMEOUT_SECONDS
+            "POST", f"/sandboxes/{user_id}/stop", json=None, timeout=self._control_timeout
         )
 
     async def reset(self, user_id: int) -> None:
         await self._call(
-            "POST", f"/sandboxes/{user_id}/reset", json=None, timeout=REQUEST_TIMEOUT_SECONDS
+            "POST", f"/sandboxes/{user_id}/reset", json=None, timeout=self._control_timeout
         )

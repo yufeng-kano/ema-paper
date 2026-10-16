@@ -483,13 +483,16 @@ def reaches_beyond(paths: DocumentPaths, commit: str) -> bool:
     root = paths.root
     if not git.is_commit(root, commit):
         return False
-    directories = {paths.relative}
-    for then in git.paths_at(root, commit, paths.doc_relative):
-        if then is not None:
-            directories.add(then.parent)
-    for _status, then, renamed_to in git.changed_paths(root, commit):
+    try:
+        # Each path where it lives now: a document moved since still owns its older
+        # revisions. Both reads are bounded; past the bound the answer is the safe one.
+        moved = git.renames_since(root, commit)
+        changes = git.changed_paths(root, commit)
+    except git.GitError:
+        return True
+    for _status, then, renamed_to in changes:
         for path in (then, renamed_to):
-            if path is not None and not any(_under(path, here) for here in directories):
+            if path is not None and not _under(moved.get(path, path), paths.relative):
                 return True
     return False
 
@@ -637,10 +640,10 @@ async def revert(
 # --- the tree -----------------------------------------------------------------------------
 
 
-def _move_tree(root: Path, source: Path, target: Path, message: str) -> None:
+def _move_tree(root: Path, source: Path, target: Path, message: str) -> str | None:
     git.ensure_repo(root)
     if safe_io.entry_kind(root, root / source) == "none" or source == target:
-        return
+        return None
     touched = [source, target]
     try:
         if safe_io.entry_kind(root, root / target) != "none":
@@ -655,15 +658,16 @@ def _move_tree(root: Path, source: Path, target: Path, message: str) -> None:
         # An ancestor the shell swapped for a link: refused, and the caller's row rolls
         # back to where the files still are.
         raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
-    git.commit_paths(root, git.USER_AUTHOR, message, touched)
+    return git.commit_paths(root, git.USER_AUTHOR, message, touched)
 
 
-async def move_path(settings: Settings, user_id: int, source: Path, target: Path) -> None:
+async def move_path(settings: Settings, user_id: int, source: Path, target: Path) -> str | None:
     """Rename or move a document or folder directory after the database did. The caller
     holds the user's workspace lock across its database write and this move, so nothing
-    can materialize at the new path in between (docs/workspace.md § Revisions)."""
+    can materialize at the new path in between (docs/workspace.md § Revisions). Returns
+    the revision the move made, None when there was nothing to move."""
     root = user_root(settings.workspaces_dir, user_id)
-    await asyncio.to_thread(_move_tree, root, source, target, f"move {source} -> {target}")
+    return await asyncio.to_thread(_move_tree, root, source, target, f"move {source} -> {target}")
 
 
 def _remove_tree(root: Path, relative: Path, message: str) -> str | None:
@@ -704,8 +708,16 @@ async def restore_removed(settings: Settings, user_id: int, relative: Path, remo
 
 def directory_size(root: Path, path: Path | None = None) -> int:
     """Bytes under `path` (the whole user directory when None), walked through
-    descriptors that follow nothing (docs/workspace.md § Quota)."""
-    return safe_io.tree_size(root, root if path is None else path)
+    descriptors that follow nothing, and no deeper than the walk's depth bound
+    (docs/workspace.md § Quota): a tree nested past it cannot be measured."""
+    try:
+        return safe_io.tree_size(root, root if path is None else path)
+    except safe_io.TreeTooDeep as exc:
+        raise ApiError(
+            409,
+            "invalid_request",
+            "The workspace has a directory nested too deep to measure; delete it first",
+        ) from exc
 
 
 def workspace_size(root: Path) -> int:

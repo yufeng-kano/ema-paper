@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import difflib
 import io
 import os
@@ -99,9 +100,13 @@ async def run_bash(
         notes.append("[output was cut by the sandbox]")
     if result.exit_code not in (None, 0):
         notes.append(f"[exit code {result.exit_code}]")
+    elif result.exit_code is None and not result.timed_out:
+        notes.append("[the shell ended without reporting a status]")
     if notes:
         output = (output + "\n" if output else "") + "\n".join(notes)
-    failed = result.timed_out or result.exit_code not in (None, 0)
+    # Only a status of zero is success: a lost status (the shell died, `exit` was
+    # called) is not a command that completed (docs/chat.md § Tools).
+    failed = result.timed_out or result.exit_code != 0
     return ToolOutcome(output or "(no output)", is_error=failed)
 
 
@@ -316,14 +321,21 @@ def _commit_shell_sync(root: Path, command: str, author: str, *, max_chars: int)
 
 
 async def commit_shell_changes(
-    root: Path, outcome: ToolOutcome, tool_input: dict, author: str, *, max_chars: int
+    root: Path,
+    outcome: ToolOutcome,
+    tool_input: dict,
+    author: str,
+    *,
+    max_chars: int,
+    locked: bool = False,
 ) -> ToolOutcome:
     """After a shell command: whatever it changed under the workspace becomes one
-    revision, under the user's lock like every other write (docs/workspace.md)."""
+    revision, under the user's lock like every other write (docs/workspace.md) — a lock
+    the caller may already hold across the command itself (`locked`)."""
     command = tool_input.get("command")
     if not isinstance(command, str):
         return outcome
-    async with workspace_lock(root):
+    async with contextlib.nullcontext() if locked else workspace_lock(root):
         try:
             edit = await asyncio.to_thread(
                 _commit_shell_sync, root, command, author, max_chars=max_chars

@@ -12,13 +12,14 @@ import contextlib
 import logging
 import secrets
 import shutil
+import stat
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import Settings
-from .shell import ExecOutcome, ShellSession
+from .shell import GROUP_CLEANUP, ExecOutcome, ShellSession
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,11 @@ class Backend:
         process is enough (the local backend)."""
         return None
 
+    def cleanup(self) -> str:
+        """What the shell runs after every command to end what the command left running
+        (docs/sandbox.md § The runner): the shell's process group, by default."""
+        return GROUP_CLEANUP
+
     async def stop_vm(self, sandbox: UserSandbox) -> bool:
         """Remove the VM; True when the removal itself succeeded."""
         raise NotImplementedError
@@ -108,6 +114,7 @@ class Backend:
                     cwd=cwd,
                     max_bytes=self.settings.sandbox_output_max_bytes,
                     on_timeout=self.on_timeout(user_id, token),
+                    cleanup=self.cleanup(),
                 )
                 sandbox.sessions[session] = shell
             sandbox.session_used[session] = time.monotonic()
@@ -136,12 +143,14 @@ class Backend:
 
     async def restart(self, user_id: int, session: str) -> None:
         """Kill that shell — the command inside the VM first — and forget it; the next
-        command of the session opens a fresh one (docs/sandbox.md § The runner)."""
+        command of the session opens a fresh one (docs/sandbox.md § The runner). Under
+        the sandbox lock, so the shell table never changes under a stop walking it."""
         sandbox = self._user(user_id)
-        shell = sandbox.sessions.pop(session, None)
-        sandbox.session_used.pop(session, None)
-        if shell is not None:
-            await shell.kill()
+        async with sandbox.lock:
+            shell = sandbox.sessions.pop(session, None)
+            sandbox.session_used.pop(session, None)
+            if shell is not None:
+                await shell.kill()
 
     async def status(self, user_id: int) -> dict:
         sandbox = self._users.get(user_id)
@@ -190,8 +199,7 @@ class Backend:
         sandbox = self._user(user_id)
         async with sandbox.lock:
             await self._stop_locked(sandbox)
-            cache = self.workspace(user_id) / CACHE_DIR
-            await asyncio.to_thread(shutil.rmtree, cache, True)
+            await asyncio.to_thread(_remove_cache, self.workspace(user_id) / CACHE_DIR)
 
     async def stop_idle(self) -> int:
         """Stop every VM idle past the configured window; returns how many."""
@@ -248,20 +256,65 @@ def _pid_file(token: str) -> str:
 
 # Kills the shell named by the pid file and everything under it, children first, inside
 # the VM — `pgrep` from procps, which the image installs (docs/sandbox.md § The runner).
-KILL_TREE = """
-kill_tree() {
+# Kill every process in the VM but pid 1, the live shells (their pid files) and the
+# exec wrappers they hang from (their ancestors) — and the caller's own chain. The VM is
+# the scope a process cannot leave: a job that `setsid`s out of its shell's session is
+# still here, and goes (docs/sandbox.md § The runner). Plain sh, no bashisms: it runs in
+# the shell at the end of every command and in a separate `docker exec` after a timeout.
+VM_SWEEP = """
+__sr_keep=" 1 "
+for __sr_p in $$ $(cat /tmp/.sr-shell-*.pid 2>/dev/null); do
+    while [ -n "$__sr_p" ] && [ "$__sr_p" != 0 ] && [ "$__sr_p" != 1 ]; do
+        case "$__sr_keep" in *" $__sr_p "*) break;; esac
+        __sr_keep="$__sr_keep$__sr_p "
+        __sr_p=$(ps -o ppid= -p "$__sr_p" 2>/dev/null | tr -d ' ')
+    done
+done
+for __sr_p in $(ps -eo pid=); do
+    case "$__sr_keep" in *" $__sr_p "*) continue;; esac
+    kill -KILL "$__sr_p" 2>/dev/null
+done
+"""
+
+KILL_TREE = f"""
+kill_tree() {{
     for child in $(pgrep -P "$1"); do kill_tree "$child"; done
     kill -KILL "$1" 2>/dev/null
-}
+}}
 pid=$(cat "$1" 2>/dev/null) || exit 3
 [ -n "$pid" ] || exit 3
 kill_tree "$pid"
 # The shell leads its own process group: whatever left the tree (a disowned job that
-# was reparented) is still in the group, and goes with it.
+# was reparented) is still in the group, and goes with it; the sweep takes the rest.
 kill -KILL -- "-$pid" 2>/dev/null
+rm -f "$1"
+{VM_SWEEP}
 kill -0 "$pid" 2>/dev/null && exit 4
 exit 0
 """
+
+# A VM a previous runner left running: its shells are gone with that process, so no pid
+# file means anything, and whatever still runs is a command nobody will commit.
+ADOPT_SWEEP = f"""
+rm -f /tmp/.sr-shell-*.pid
+{VM_SWEEP}
+exit 0
+"""
+
+
+def _remove_cache(cache: Path) -> None:
+    """Whatever sits at `.cache` goes: the directory, or the file or link a command put
+    there in its place, removed without following it, so the next start can make the
+    directory again (docs/sandbox.md § The runner)."""
+    try:
+        mode = cache.lstat().st_mode
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(mode):
+        shutil.rmtree(cache, ignore_errors=True)
+    else:
+        with contextlib.suppress(FileNotFoundError):
+            cache.unlink()
 
 
 def adopted_user_ids(names: str) -> list[int]:
@@ -291,6 +344,21 @@ class DockerBackend(Backend):
             sandbox = self._user(user_id)
             sandbox.started_at = time.monotonic()
             sandbox.last_used = time.monotonic()
+            # The old runner's shells are gone; a command one was running is not, and
+            # nobody will commit what it writes. Everything in the VM but pid 1 goes
+            # before the VM is taken in; a VM where that cannot be confirmed is stopped.
+            code, out = await _docker(
+                "exec", self.container(user_id), "sh", "-c", ADOPT_SWEEP, timeout=30
+            )
+            if code != 0:
+                logger.warning(
+                    "could not end what runs in adopted sandbox %s (%s); stopping it",
+                    self.container(user_id),
+                    out.strip(),
+                )
+                async with sandbox.lock:
+                    with contextlib.suppress(RuntimeError):
+                        await self._stop_locked(sandbox)
         if self._users:
             logger.info("adopted %d running sandboxes", len(self._users))
 
@@ -409,8 +477,16 @@ class DockerBackend(Backend):
 
         return kill_inside
 
+    def cleanup(self) -> str:
+        return VM_SWEEP
+
     async def stop_vm(self, sandbox: UserSandbox) -> bool:
-        code, out = await _docker("rm", "-f", self.container(sandbox.user_id), timeout=120)
+        code, out = await _docker(
+            "rm",
+            "-f",
+            self.container(sandbox.user_id),
+            timeout=self.settings.sandbox_docker_timeout_seconds,
+        )
         if code != 0:
             logger.warning("could not remove sandbox of user %d: %s", sandbox.user_id, out.strip())
         return code == 0

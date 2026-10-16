@@ -872,9 +872,40 @@ def test_tree_sizes_survive_a_very_deep_tree(tmp_path) -> None:
         os.close(leaf)
     finally:
         os.close(fd)
-    assert documents.directory_size(root) == 10
-    assert safe_io.remove_tree(root, root / "files")
+    # Past the walk's depth bound, a size is refused rather than undercounted
+    # (docs/workspace.md § Quota)...
+    with pytest.raises(ApiError) as refused:
+        documents.directory_size(root)
+    assert refused.value.status_code == 409
+    # ...and a removal goes through with a bounded set of descriptors however deep.
+    import resource
+
+    highest = max(int(name) for name in os.listdir("/proc/self/fd"))
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (min(highest + 100, hard), hard))
+    try:
+        assert safe_io.remove_tree(root, root / "files")
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
     assert not (root / "files").exists()
+
+
+def test_a_tree_within_the_depth_bound_is_measured(tmp_path) -> None:
+    root = tmp_path / "ws" / "8b"
+    (root / "files").mkdir(parents=True)
+    fd = os.open(root / "files", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for _ in range(safe_io.DEPTH_MAX - 10):
+            os.mkdir("d", dir_fd=fd)
+            child = os.open("d", os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        leaf = os.open("leaf.txt", os.O_WRONLY | os.O_CREAT, 0o644, dir_fd=fd)
+        os.write(leaf, b"z" * 10)
+        os.close(leaf)
+    finally:
+        os.close(fd)
+    assert documents.directory_size(root) == 10
 
 
 def test_workspace_writes_wait_for_the_backup_lock(tmp_path) -> None:
@@ -1017,3 +1048,46 @@ async def test_a_removal_whose_rows_stay_is_put_back(sessionmaker, tmp_path) -> 
     assert paths.doc.read_text() == "# Title\n\nEdited\n"
     (newest,) = git.log(root, paths.relative, 1)
     assert newest.message == f"restore {paths.relative}"
+
+
+def test_the_name_migration_brings_legacy_names_into_one_namespace() -> None:
+    import importlib.util
+
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    from sqlalchemy import create_engine, insert, text
+
+    from sightread.db.models import Base
+
+    spec = importlib.util.spec_from_file_location(
+        "normalize_library_names",
+        Path(__file__).resolve().parents[1]
+        / "migrations"
+        / "versions"
+        / "c8f28f7cd45e_normalize_library_names.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    engine = create_engine("sqlite://")
+    # The two tables the migration reads; SQLite enforces no foreign key here, and the
+    # core inserts fill the timestamps the models default.
+    Base.metadata.create_all(engine, tables=[Folder.__table__, Document.__table__])
+    with engine.begin() as connection:
+        connection.execute(
+            insert(Folder.__table__).values(id=1, user_id=1, parent_id=None, name="Report")
+        )
+        for row_id, name in ((1, "Report"), (2, "e\u0301.pdf"), (3, "\u00e9.pdf"), (4, "a/b")):
+            connection.execute(
+                insert(Document.__table__).values(
+                    id=row_id, user_id=1, folder_id=None, job_id=uuid.uuid4(), name=name
+                )
+            )
+        with Operations.context(MigrationContext.configure(connection)):
+            module.upgrade()
+        names = connection.execute(text("SELECT id, name FROM documents ORDER BY id")).all()
+    # The folder keeps `Report`; the document that shared it is suffixed; the decomposed
+    # spelling becomes the composed one, and the second of the two is suffixed; a
+    # separator is cleaned as a fresh name would be.
+    assert names == [(1, "Report (2)"), (2, "\u00e9.pdf"), (3, "\u00e9 (2).pdf"), (4, "a b")]

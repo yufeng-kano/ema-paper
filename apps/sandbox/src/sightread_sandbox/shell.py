@@ -59,6 +59,15 @@ class BoundedOutput:
         return f"{head}\n[... {self.omitted} bytes omitted by the sandbox ...]\n{tail}", True
 
 
+# The default end-of-command cleanup: everything in the shell's process group but the
+# shell. What the local backend uses — on a host, nothing wider would be safe. The VM
+# backend sweeps the whole VM instead (backends.VM_SWEEP).
+GROUP_CLEANUP = (
+    "for __sr_pid in $(pgrep -g $$); do"
+    ' [ "$__sr_pid" != "$$" ] && kill -KILL "$__sr_pid" 2>/dev/null; done'
+)
+
+
 class ShellSession:
     def __init__(
         self,
@@ -67,10 +76,14 @@ class ShellSession:
         cwd: str | None = None,
         max_bytes: int,
         on_timeout: Callable[[], Awaitable[None]] | None = None,
+        cleanup: str = GROUP_CLEANUP,
     ) -> None:
         self._argv = argv
         self._cwd = cwd
         self._max_bytes = max_bytes
+        # What runs in the shell after a command and its `wait`, before the status line:
+        # it ends whatever the command left running (docs/sandbox.md § The runner).
+        self._cleanup = cleanup
         # What ends the command where it really runs: ending the host-side client does
         # not end a process inside the VM (docs/sandbox.md § The runner).
         self._on_timeout = on_timeout
@@ -129,16 +142,14 @@ class ShellSession:
             # persist; the marker line follows with the status of the last command.
             # The status is the command's; `wait` then holds the line until every job it
             # left in the background has finished, and whatever is still running after
-            # that — a disowned job, a daemon — is killed: the shell leads its own process
-            # group (the backend starts it so), and everything in the group but the shell
-            # goes, so nothing a command started writes the tree after its revision
-            # (docs/sandbox.md § The runner).
+            # that — a disowned job, a daemon, a process that left the session — is
+            # killed by the backend's cleanup, so nothing a command started writes the
+            # tree after its revision (docs/sandbox.md § The runner).
             script = (
                 f"{command}\n"
                 "__sr_status=$?\n"
                 "wait\n"
-                "for __sr_pid in $(pgrep -g $$); do"
-                ' [ "$__sr_pid" != "$$" ] && kill -KILL "$__sr_pid" 2>/dev/null; done\n'
+                f"{self._cleanup}\n"
                 f"printf '\\n{marker} %s\\n' \"$__sr_status\"\n"
             )
             try:

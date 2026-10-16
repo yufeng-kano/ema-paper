@@ -20,6 +20,16 @@ _OPEN_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 READ_CHUNK = 1 << 20
 # A write in progress, beside its destination; the git exclude rules keep it out of history.
 TEMP_PREFIX = ".sr-tmp-"
+# A walk that measures keeps one descriptor per level and goes no deeper than this: a
+# tree nested past it cannot be measured (docs/workspace.md § Quota). A removal has no
+# such bound — it folds the deepest levels up as it goes (`_remove_contents`).
+DEPTH_MAX = 512
+# How many levels a removal keeps open before it folds the deepest one up to the top.
+REMOVE_DEPTH_WINDOW = 64
+
+
+class TreeTooDeep(OSError):
+    """A directory nested past `DEPTH_MAX`: not measured, never silently undercounted."""
 
 
 class UnsafeEntry(Exception):
@@ -294,12 +304,22 @@ def list_dir(root: Path, path: Path) -> list[tuple[str, bool]]:
 
 def _remove_contents(fd: int) -> None:
     """Empty the directory `fd` through descriptors, children first, with an explicit
-    stack rather than recursion (a shell can nest past the interpreter's limit)."""
+    stack rather than recursion (a shell can nest past the interpreter's limit) — and
+    with a bounded set of open descriptors however deep the tree: at the window, the
+    deepest directory is renamed up into `fd` itself under a temporary name, where the
+    walk meets it again at depth one, so a chain of any depth is removed with a handful
+    of descriptors."""
     # (parent fd, name, child fd): a directory is removed once its own entries are gone.
     stack: list[tuple[int | None, str | None, int]] = [(None, None, fd)]
     try:
         while stack:
             parent, name, current = stack[-1]
+            if len(stack) > REMOVE_DEPTH_WINDOW and parent is not None and name is not None:
+                folded = f"{TEMP_PREFIX}{secrets.token_hex(8)}"
+                os.rename(name, folded, src_dir_fd=parent, dst_dir_fd=fd)
+                stack.pop()
+                os.close(current)
+                continue
             removed_children = False
             for entry in os.listdir(current):
                 mode = os.stat(entry, dir_fd=current, follow_symlinks=False).st_mode
@@ -402,6 +422,9 @@ def _dir_size(fd: int) -> int:
             if not stat.S_ISDIR(info.st_mode):
                 total += info.st_size  # a link counts as itself, never its target
                 continue
+            if len(stack) >= DEPTH_MAX:
+                # Bounded descriptors, and never a silent undercount past the bound.
+                raise TreeTooDeep(f"a directory is nested deeper than {DEPTH_MAX} levels")
             try:
                 child = os.open(name, _OPEN_DIR_FLAGS, dir_fd=current)
             except OSError:

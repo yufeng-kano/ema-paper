@@ -126,6 +126,11 @@ messages         id PK, conversation_id FK, role user|assistant, content JSONB,
                  INDEX (conversation_id, id)
                  -- content blocks exactly as sent to / received from the model;
                  -- replayed verbatim on every later request (chat.md § History)
+                 -- `normalize library names` (c8f28f7cd45e): a data migration that NFC-normalizes
+                 -- every folder and document name and suffixes the later of two entries
+                 -- of one parent that then share a name, folders before documents, by
+                 -- id — the library and the workspace keep one namespace per level
+                 -- (workspace.md § Layout)
 chat_turns       id UUID PK, user_id FK, conversation_id FK, message_id FK messages,
                  status queued|running|succeeded|failed|cancelled, error NULL,
                  locale, created_at, started_at NULL, finished_at NULL

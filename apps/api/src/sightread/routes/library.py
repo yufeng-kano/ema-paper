@@ -281,13 +281,22 @@ async def flush_or_retry(db: DbSession, retries_left: int, message: str) -> bool
 
 async def move_then_commit(db: DbSession, settings, user_id: int, before, after) -> None:
     """The row is flushed; now the directory, then the commit. A refusal from the tree
-    rolls the row back to where the files still are."""
+    rolls the row back to where the files still are; a commit that fails after the move
+    puts the directory back where the row stayed (docs/workspace.md § Revisions)."""
     try:
-        await workspace_documents.move_path(settings, user_id, before, after)
+        moved = await workspace_documents.move_path(settings, user_id, before, after)
     except BaseException:
         await db.rollback()
         raise
-    await db.commit()
+    try:
+        await db.commit()
+    except BaseException:
+        if moved is not None:
+            try:
+                await workspace_documents.move_path(settings, user_id, after, before)
+            except Exception:  # noqa: BLE001 - the move revision stays revertible
+                logger.exception("could not move %s back after a failed commit", after)
+        raise
 
 
 async def folder_exists(db: DbSession, user_id: int, folder_id: int) -> bool:

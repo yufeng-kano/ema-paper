@@ -783,8 +783,13 @@ async def test_a_cancelled_turn_blocks_deletion_until_the_worker_is_done(chattin
 
 
 def _round_ctx(image_budget: int = 32 << 20) -> SimpleNamespace:
-    """What `_run_tools` reads from its context: the round's image budget."""
-    return SimpleNamespace(settings=SimpleNamespace(chat_image_round_max_bytes=image_budget))
+    """What `_run_tools` reads from its context: the round's and the turn's image budgets."""
+    return SimpleNamespace(
+        settings=SimpleNamespace(
+            chat_image_round_max_bytes=image_budget, chat_image_turn_max_bytes=image_budget * 4
+        ),
+        image_spent=0,
+    )
 
 
 async def test_a_rounds_images_never_exceed_the_budget(monkeypatch) -> None:
@@ -807,6 +812,7 @@ async def test_a_rounds_images_never_exceed_the_budget(monkeypatch) -> None:
     ctx = SimpleNamespace(
         settings=SimpleNamespace(
             chat_image_round_max_bytes=250,
+            chat_image_turn_max_bytes=1 << 30,
             chat_tool_result_max_chars=1000,
             upload_max_bytes=1,
             content_max_bytes=1,
@@ -818,6 +824,7 @@ async def test_a_rounds_images_never_exceed_the_budget(monkeypatch) -> None:
         render_slots=None,
         sandbox=None,
         turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
+        image_spent=0,
     )
     tool_uses = [
         {"type": "tool_use", "id": str(index), "name": "view_page", "input": {"page": index + 1}}
@@ -1510,3 +1517,166 @@ async def test_a_shell_revision_beyond_the_document_waits_for_every_turn(chattin
     )
     assert reverted.status_code == 200, reverted.text
     assert paths_b.doc.read_text() != "b by the shell\n"
+
+
+async def test_a_turns_images_never_exceed_the_turn_budget(monkeypatch) -> None:
+    async def fake_view_page(paths, tool_input, **kwargs):
+        image = {"type": "image", "source": {"type": "base64", "data": "x" * 100}}
+        return chat_tools.ToolOutcome([image, {"type": "text", "text": "Page."}])
+
+    async def no_events(ctx, event, data):
+        return None
+
+    async def never_cancelled(ctx):
+        return False
+
+    monkeypatch.setattr(chat_tools, "view_page", fake_view_page)
+    monkeypatch.setattr(chat_runner, "_emit", no_events)
+    monkeypatch.setattr(chat_runner, "_cancelled", never_cancelled)
+    ctx = SimpleNamespace(
+        settings=SimpleNamespace(
+            chat_image_round_max_bytes=1000,
+            chat_image_turn_max_bytes=250,
+            chat_tool_result_max_chars=1000,
+            upload_max_bytes=1,
+            content_max_bytes=1,
+            chat_bash_timeout_seconds=1,
+        ),
+        conversation=SimpleNamespace(id=1, session="s"),
+        paths=None,
+        job=SimpleNamespace(page_count=12, kind="pdf"),
+        render_slots=None,
+        sandbox=None,
+        turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
+        image_spent=0,
+    )
+    one_round = [
+        {"type": "tool_use", "id": str(index), "name": "view_page", "input": {"page": index + 1}}
+        for index in range(3)
+    ]
+    # The round's budget would take all three; the turn's takes two across every round.
+    first = await chat_runner._run_tools(ctx, one_round, set())
+    assert len([r for r in first if not r.get("is_error")]) == 2
+    assert ctx.image_spent == 200
+    second = await chat_runner._run_tools(ctx, one_round, set())
+    assert all(r.get("is_error") for r in second)
+    assert all(r["content"] == chat_runner.IMAGE_TURN_BUDGET_SPENT for r in second)
+    assert ctx.image_spent == 200
+
+
+async def test_a_lost_shell_status_is_an_error(monkeypatch) -> None:
+    async def fake_exec(self, user_id, session, command, *, timeout_seconds):
+        return ExecResult(output="half", exit_code=None, timed_out=False, truncated=False)
+
+    monkeypatch.setattr(SandboxClient, "exec", fake_exec)
+    from sightread.config import Settings
+
+    client = SandboxClient(
+        Settings(app_env="local", sandbox_url="http://sandbox:8100", sandbox_token="t")
+    )
+    outcome = await chat_tools.run_bash(
+        client, 7, "sess", {"command": "exit 1"}, max_chars=400, timeout_seconds=120
+    )
+    assert outcome.is_error
+    assert "without reporting a status" in outcome.content
+
+
+async def test_a_shell_command_holds_the_workspace_lock(tmp_path, monkeypatch) -> None:
+    from sightread.workspace.locks import workspace_lock
+
+    root = tmp_path / "ws" / "1"
+    root.mkdir(parents=True)
+    git.ensure_repo(root)
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    async def fake_run_bash(client, user_id, session, tool_input, *, max_chars, timeout_seconds):
+        started.set()
+        await release.wait()
+        return chat_tools.ToolOutcome("done")
+
+    async def no_events(ctx, event, data):
+        return None
+
+    async def never_cancelled(ctx):
+        return False
+
+    monkeypatch.setattr(chat_tools, "run_bash", fake_run_bash)
+    monkeypatch.setattr(chat_runner, "_emit", no_events)
+    monkeypatch.setattr(chat_runner, "_cancelled", never_cancelled)
+    ctx = SimpleNamespace(
+        settings=SimpleNamespace(
+            chat_image_round_max_bytes=1000,
+            chat_image_turn_max_bytes=1000,
+            chat_tool_result_max_chars=1000,
+            chat_bash_timeout_seconds=1,
+        ),
+        conversation=SimpleNamespace(id=1, session="s"),
+        paths=SimpleNamespace(root=root),
+        sandbox=object(),
+        turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
+        image_spent=0,
+        writer=None,
+    )
+    tool_uses = [{"type": "tool_use", "id": "b1", "name": "bash", "input": {"command": "sleep"}}]
+    running = asyncio.create_task(chat_runner._run_tools(ctx, tool_uses, set()))
+    await started.wait()
+
+    async def take_lock() -> None:
+        async with workspace_lock(root):
+            pass
+
+    # A host write waits for the running command, not for its commit alone.
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(take_lock(), 0.3)
+    release.set()
+    (result,) = await running
+    assert result["content"] == "done"
+    await asyncio.wait_for(take_lock(), 5)
+
+
+async def test_a_rename_whose_commit_fails_moves_the_directory_back(chatting, monkeypatch) -> None:
+    import contextlib
+
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    document_id = chatting.document_id
+    settings = chatting.app.state.settings
+    content = (await chatting.get(f"/api/library/documents/{document_id}/content")).json()
+    saved = await chatting.put(
+        f"/api/library/documents/{document_id}/content",
+        json={"markdown": "# Edited\n", "base_revision": content["revision"]},
+        headers=CSRF_HEADERS,
+    )
+    assert saved.status_code == 200, saved.text
+    root = user_root(settings.workspaces_dir, chatting.user_id)
+    before = root / "files" / "Papers" / "paper.pdf"
+    after = root / "files" / "Papers" / "renamed.pdf"
+
+    original = AsyncSession.commit
+    failing = {"on": True}
+
+    async def commit(self):
+        if failing["on"]:
+            failing["on"] = False
+            raise OperationalError("COMMIT", {}, Exception("the database went away"))
+        await original(self)
+
+    monkeypatch.setattr(AsyncSession, "commit", commit)
+    with contextlib.suppress(Exception):
+        await chatting.put(
+            f"/api/library/documents/{document_id}",
+            json={"name": "renamed.pdf"},
+            headers=CSRF_HEADERS,
+        )
+    assert failing["on"] is False
+    monkeypatch.setattr(AsyncSession, "commit", original)
+
+    # The row kept its name, and the directory is back where the row says, edits and all.
+    listed = (await chatting.get("/api/library")).json()["documents"]
+    assert [row["name"] for row in listed] == ["paper.pdf"]
+    assert (before / "doc.md").read_text() == "# Edited\n"
+    assert not after.exists()
+    read = (await chatting.get(f"/api/library/documents/{document_id}/content")).json()
+    assert read["markdown"] == "# Edited\n"
