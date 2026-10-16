@@ -534,7 +534,9 @@ async def _finish_held(
         # parse — never filed in the gap and left without its original (docs/jobs.md).
         await db.execute(select(Job.id).where(Job.id == job.id).with_for_update())
         documents: list[Document] = []
-        if settings is not None and status == "succeeded":
+        if settings is not None:
+            # Whatever the terminal state: a failed parse's row keeps its original as a
+            # finished one does, so the upload is not lost with the error (docs/jobs.md).
             documents = list(
                 (
                     await db.execute(
@@ -544,7 +546,7 @@ async def _finish_held(
             )
         source = Path(job.source_path) if job.source_path else None
         if source is not None and not documents:
-            if status == "succeeded" and job.retain_source and source.is_file():
+            if job.retain_source and source.is_file():
                 # A library upload whose row has not landed yet: the upload stays where
                 # it is for that row to take (docs/jobs.md § Retention).
                 pass
@@ -564,7 +566,7 @@ async def _finish_held(
             await _retain_source(sessionmaker, settings, job_id, source)
         except Exception:  # noqa: BLE001 - retention must not undo a finished parse
             logger.exception("could not keep the source of job %s", job_id)
-    if settings is not None and documents:
+    if settings is not None and documents and status == "succeeded":
         # The result is committed: the document directories can take their copies now.
         async with sessionmaker() as db:
             for document in documents:
@@ -689,7 +691,7 @@ async def run_job(
         )
         # No crop thread ever started for this run; a plain discard covers leftovers.
         discard_job_figures(figures_root, job_id)
-        await _finish(sessionmaker, job_id, status="failed", error=error)
+        await _finish(sessionmaker, job_id, status="failed", error=error, settings=settings)
         return
 
     source = Path(job.source_path or "")
@@ -710,16 +712,24 @@ async def run_job(
                 job, state, connection, source, work_dir, render_slots, sessionmaker
             )
         except JobAborted as exc:
-            await _finish(sessionmaker, job_id, status="failed", error=str(exc))
+            await _finish(sessionmaker, job_id, status="failed", error=str(exc), settings=settings)
             return
         except (poppler.PopplerError, ImageError, ValueError):
-            await _finish(sessionmaker, job_id, status="failed", error="the document is unreadable")
+            await _finish(
+                sessionmaker,
+                job_id,
+                status="failed",
+                error="the document is unreadable",
+                settings=settings,
+            )
             return
         except Exception:
             # A worker must not die on one job. The traceback goes to the log; the job row
             # carries no internals and no document content.
             logger.exception("job %s failed unexpectedly", job_id)
-            await _finish(sessionmaker, job_id, status="failed", error="internal error")
+            await _finish(
+                sessionmaker, job_id, status="failed", error="internal error", settings=settings
+            )
             return
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
@@ -735,6 +745,7 @@ async def run_job(
                 job_id,
                 status="failed",
                 error=f"no page could be parsed ({reasons})",
+                settings=settings,
             )
             return
 

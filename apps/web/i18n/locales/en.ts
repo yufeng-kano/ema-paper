@@ -290,6 +290,7 @@ export default {
       failed: 'Not saved',
     },
     blockEdit: 'Edit this block',
+    blockAdd: 'Add text',
     blockSource: 'Block markdown',
     changedUnderneath: 'The document changed underneath you — another tab or the agent. Reloaded.',
     notesShow: 'Show notes',

@@ -10,7 +10,13 @@ import {
   type JobResult,
 } from '~/lib/api'
 import { cellGroupsToMarkdown, nodesToMarkdown, type OrphanListContext } from '~/lib/copy'
-import { parseResultMarkdown, replaceBlockSource, type Bbox, type ResultBlock } from '~/lib/markdown'
+import {
+  appendBlockSource,
+  parseResultMarkdown,
+  replaceBlockSource,
+  type Bbox,
+  type ResultBlock,
+} from '~/lib/markdown'
 
 /**
  * Module scope, not component state: the rail, the notes column and the agent panel are
@@ -432,6 +438,19 @@ async function startEdit(pageIndex: number, blockIndex: number) {
   editor?.focus()
 }
 
+/** A page emptied of its blocks, or a document with none: text comes back through an
+ *  editor opened past the last block — index `blocks.length`, which no block holds. */
+async function startNewBlock(pageIndex: number) {
+  if (!editable.value) {
+    return
+  }
+  commitEdit()
+  editing.value = { page: pageIndex, index: pages.value[pageIndex]?.blocks.length ?? 0 }
+  draft.value = ''
+  await nextTick()
+  editor?.focus()
+}
+
 /** A click that ends a text selection is a selection, not a request to edit. */
 function onBlockClick(pageIndex: number, blockIndex: number) {
   const selection = window.getSelection()
@@ -458,7 +477,16 @@ function commitEdit() {
   }
   editing.value = null
   const block = pages.value[open.page]?.blocks[open.index]
-  if (!block || draft.value === block.src) {
+  if (!block) {
+    // The editor past the last block (`startNewBlock`): text typed there is a new block,
+    // nothing typed is nothing.
+    if (draft.value.trim() !== '') {
+      markdown.value = appendBlockSource(markdown.value, open.page, draft.value)
+      scheduleSave()
+    }
+    return
+  }
+  if (draft.value === block.src) {
     return
   }
   markdown.value = replaceBlockSource(markdown.value, open.page, open.index, draft.value)
@@ -932,8 +960,10 @@ const awaitingContent = computed(
 
       <UiSkeleton v-else-if="awaitingContent" class="state" :rows="5" />
 
+      <!-- A result with no markdown has nothing to show; a document emptied by its reader
+           has an editor to type into (docs/web.md § Editing). -->
       <UiEmptyState
-        v-else-if="!pages.length && !partial"
+        v-else-if="!pages.length && !partial && !editable"
         class="state"
         :title="t('viewer.empty')"
         :body="t('viewer.emptyBody')"
@@ -1003,6 +1033,25 @@ const awaitingContent = computed(
             />
 
             <div ref="scroller" class="document" @scroll="onScroll" @copy="onCopy">
+              <!-- A document with no page at all: one editor, which makes page 1. -->
+              <section v-if="editable && !pages.length" class="page">
+                <article class="prose">
+                  <textarea
+                    v-if="isEditing(0, 0)"
+                    :ref="setEditor"
+                    v-model="draft"
+                    class="block-editor mono"
+                    :rows="editorRows"
+                    :aria-label="t('viewer.blockSource')"
+                    spellcheck="false"
+                    @blur="commitEdit"
+                    @keydown="onEditorKey"
+                  />
+                  <button v-else type="button" class="block-add" @click="startNewBlock(0)">
+                    {{ t('viewer.blockAdd') }}
+                  </button>
+                </article>
+              </section>
               <section
                 v-for="(page, pageIndex) in pages"
                 :key="page.page"
@@ -1040,6 +1089,30 @@ const awaitingContent = computed(
                       @figure-error="onFigureError"
                     />
                   </div>
+                  <!-- A page emptied of its blocks keeps a way back in (docs/web.md
+                       § Editing): an editor past the last block, or the control that
+                       opens one. -->
+                  <template v-if="editable && !page.blocks.length">
+                    <textarea
+                      v-if="isEditing(pageIndex, 0)"
+                      :ref="setEditor"
+                      v-model="draft"
+                      class="block-editor mono"
+                      :rows="editorRows"
+                      :aria-label="t('viewer.blockSource')"
+                      spellcheck="false"
+                      @blur="commitEdit"
+                      @keydown="onEditorKey"
+                    />
+                    <button
+                      v-else
+                      type="button"
+                      class="block-add"
+                      @click="startNewBlock(pageIndex)"
+                    >
+                      {{ t('viewer.blockAdd') }}
+                    </button>
+                  </template>
                 </article>
               </section>
 
@@ -1388,6 +1461,26 @@ const awaitingContent = computed(
 
 .block.editable:focus-visible {
   outline-offset: 6px;
+}
+
+/* The way back into an emptied page: a quiet text control in the measure a block had. */
+.block-add {
+  display: block;
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: 1px dashed var(--rule);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  text-align: left;
+  cursor: text;
+}
+
+.block-add:hover,
+.block-add:focus-visible {
+  color: var(--ink);
+  border-color: var(--accent);
 }
 
 /* The source of one block, in the measure the rendered block had, in the mono face. It

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   parseInline,
   parseResultMarkdown,
+  appendBlockSource,
   replaceBlockSource,
   serializeDocument,
   type ResultBlock,
@@ -721,6 +722,20 @@ describe('serializeDocument', () => {
   it('gives content ahead of the first marker a page 1 marker', () => {
     const pages = parseResultMarkdown(['# Title', '', 'Body.'].join('\n'))
     expect(serializeDocument(pages)).toBe('<!-- page: 1 -->\n# Title\n\nBody.')
+  })
+})
+
+describe('appendBlockSource', () => {
+  it('gives an emptied page its text back as a new block', () => {
+    const emptied = ['<!-- page: 1 -->', '', '<!-- page: 2 -->', 'Second page.'].join('\n')
+    expect(appendBlockSource(emptied, 0, 'Back again.')).toBe(
+      ['<!-- page: 1 -->', 'Back again.', '', '<!-- page: 2 -->', 'Second page.'].join('\n'),
+    )
+  })
+
+  it('makes page 1 for a document with no page at all', () => {
+    expect(appendBlockSource('', 0, 'First words.')).toBe('<!-- page: 1 -->\nFirst words.')
+    expect(parseResultMarkdown(appendBlockSource('', 0, 'First words.'))[0]?.blocks[0]?.kind).toBe('p')
   })
 })
 

@@ -463,6 +463,23 @@ export function replaceBlockSource(
   return serializeDocument(pages)
 }
 
+/**
+ * `markdown` with a new block appended to one page — how text comes back to a page whose
+ * last block was emptied, and to a document with no block at all: a document without a
+ * page gets page 1. Only the source matters to the stored string; the block parses into
+ * its kind on the next render.
+ */
+export function appendBlockSource(markdown: string, pageIndex: number, src: string): string {
+  const pages = parseResultMarkdown(markdown)
+  const page = pages[pageIndex] ?? pages[pages.length - 1]
+  if (page) {
+    page.blocks.push({ kind: 'p', text: src, src })
+  } else {
+    pages.push({ page: 1, blocks: [{ kind: 'p', text: src, src }] })
+  }
+  return serializeDocument(pages)
+}
+
 // --- inline content --------------------------------------------------------------------
 //
 // Transcriptions carry inline TeX the way papers do — `Qingwen Bu$^{1,2}$`, `H$_2$O` — and

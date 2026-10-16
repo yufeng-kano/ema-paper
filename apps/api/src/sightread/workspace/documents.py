@@ -462,7 +462,12 @@ async def adopt_source(
     if upload is not None:
         source = upload
     else:
-        if job.status != "succeeded" or not job.source_path or job.source_deleted_at is not None:
+        # Any terminal state: a failed parse's upload is kept for its row too (docs/jobs.md).
+        if (
+            job.status not in ("succeeded", "failed")
+            or not job.source_path
+            or job.source_deleted_at is not None
+        ):
             return
         source = Path(job.source_path)
     root = user_root(settings.workspaces_dir, document.user_id)
@@ -776,6 +781,9 @@ def _revert(
     moved_aside: list[tuple[Path, Path]] = []
 
     def rollback() -> None:
+        # Only what this revert touched goes back to the head revision: the tree may
+        # hold edits a failed shell commit left unrecorded, and those are not this
+        # revert's to discard (docs/workspace.md § Revisions).
         git.reset_index(root)
         for source, target in reversed(moved_aside):
             with contextlib.suppress(OSError, safe_io.UnsafeEntry):
@@ -783,12 +791,14 @@ def _revert(
         for current, then in reversed(done_moves):
             with contextlib.suppress(OSError, safe_io.UnsafeEntry):
                 safe_io.rename(root, root / then, root / current)
-        git.reset_hard(root)
-        for now, _data in writes:
-            if not git.tracked_at_head(root, now):
-                with contextlib.suppress(OSError, safe_io.UnsafeEntry):
-                    safe_io.remove_file(root, root / now)
-                    _prune_empty(root, (root / now).parent)
+        touched = {now for now, _data in writes} | set(removals) | set(restored)
+        tracked = [now for now in touched if git.tracked_at_head(root, now)]
+        if tracked:
+            git.restore_paths(root, tracked)
+        for now in touched - set(tracked):
+            with contextlib.suppress(OSError, safe_io.UnsafeEntry):
+                safe_io.remove_file(root, root / now)
+                _prune_empty(root, (root / now).parent)
         for _current, then in done_moves:
             _prune_empty(root, (root / then).parent)
 

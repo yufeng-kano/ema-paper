@@ -800,7 +800,12 @@ async function send() {
         // Shown until the record is reloaded; negative so it never meets a stored id.
         id: -(messages.value.length + 1),
         role: 'user',
-        content: [{ type: 'text', text }],
+        // The selection too, in the shape the record serves it (the passage alone, marked
+        // as context), so its note does not vanish for the length of the turn.
+        content: [
+          { type: 'text', text },
+          ...(picked ? [{ type: 'text' as const, text: picked, context: 'selection' }] : []),
+        ],
         turn_id,
         created_at: new Date().toISOString(),
       },

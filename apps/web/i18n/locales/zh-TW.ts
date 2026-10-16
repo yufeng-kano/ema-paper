@@ -281,6 +281,7 @@ export default {
       failed: '未儲存',
     },
     blockEdit: '編輯這個段落',
+    blockAdd: '新增文字',
     blockSource: '段落 markdown',
     changedUnderneath: '文件在另一個分頁或由 agent 修改過，已重新載入。',
     notesShow: '顯示筆記',

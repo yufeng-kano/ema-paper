@@ -617,8 +617,10 @@ async def _run_tool_unguarded(
             kind=ctx.job.kind,
         )
     elif name == "view_figure":
+        # Bounded by the round's image budget, as a page is: `CONTENT_MAX_BYTES` is the
+        # cap on `doc.md` and `notes.md`, and a legitimate crop can be larger.
         outcome = await chat_tools.view_figure(
-            ctx.paths, tool_input, max_bytes=ctx.settings.content_max_bytes
+            ctx.paths, tool_input, max_bytes=ctx.settings.chat_image_round_max_bytes
         )
     else:
         outcome = chat_tools.ToolOutcome(f"unknown tool {name!r}", is_error=True)

@@ -440,6 +440,17 @@ async def fail_orphaned_turns(
             except SandboxUnavailable:
                 left.add(user_id)
                 continue
+        elif settings is not None and read_writing(user_root(settings.workspaces_dir, user_id)):
+            # A shell command was writing when the worker died, and this worker has no
+            # runner to stop it with (SANDBOX_URL gone from its environment): the VM may
+            # still be running the command, so the tree is not declared safe here.
+            logger.warning(
+                "an orphaned shell command of user %d cannot be stopped: no sandbox runner "
+                "is configured; the workspace stays closed",
+                user_id,
+            )
+            left.add(user_id)
+            continue
         if settings is not None and not await _record_orphaned_changes(
             db, settings, user_id, conversation_id
         ):
@@ -466,7 +477,16 @@ async def recover_unsettled_commands(settings: Settings, sandbox: SandboxClient 
             continue
         root = user_root(settings.workspaces_dir, user_id)
         named = read_writing(root)
-        if named is not None and sandbox is not None and sandbox.configured:
+        if named is not None:
+            if sandbox is None or not sandbox.configured:
+                # Nothing to stop the shell with: unconfirmed, as a restart that failed.
+                logger.warning(
+                    "an unconfirmed shell command of user %d cannot be stopped: no sandbox "
+                    "runner is configured; the workspace stays closed",
+                    user_id,
+                )
+                left.add(user_id)
+                continue
             try:
                 await sandbox.restart(user_id, named[1])
             except SandboxUnavailable:

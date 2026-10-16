@@ -1472,17 +1472,32 @@ async def test_a_worker_starting_records_what_an_orphaned_turn_left_unrecorded(
     def failing(*args, **kwargs):
         raise git.GitError("index.lock exists")
 
+    class Runner:
+        configured = True
+        restarted: list[tuple[int, str]] = []
+
+        async def restart(self, user_id: int, session: str) -> None:
+            self.restarted.append((user_id, session))
+
+    runner = Runner()
+    # No runner to stop the shell the marker names: the VM may still run the command,
+    # so the turn and the marker wait rather than the tree being declared safe.
+    async with chatting.app.state.sessionmaker() as db:
+        assert await fail_orphaned_turns(db, None, settings) == (0, {chatting.user_id})
+        assert (await db.get(ChatTurn, turn_id)).finished_at is None
+    assert writing_marker(paths.root).exists()
     # A tree that cannot be committed leaves the turn for the next pass: finishing it
     # would let the next revision carry these changes as its own.
     monkeypatch.setattr(git, "commit_all", failing)
     async with chatting.app.state.sessionmaker() as db:
-        assert await fail_orphaned_turns(db, None, settings) == (0, {chatting.user_id})
+        assert await fail_orphaned_turns(db, runner, settings) == (0, {chatting.user_id})
         assert (await db.get(ChatTurn, turn_id)).finished_at is None
     assert writing_marker(paths.root).exists()  # still recovering: host writes wait
     monkeypatch.setattr(git, "commit_all", real)
 
     async with chatting.app.state.sessionmaker() as db:
-        assert await fail_orphaned_turns(db, None, settings) == (1, set())
+        assert await fail_orphaned_turns(db, runner, settings) == (1, set())
+        assert runner.restarted and runner.restarted[-1][0] == chatting.user_id
         turn = await db.get(ChatTurn, turn_id)
         assert turn.status == "failed" and turn.finished_at is not None
     assert not writing_marker(paths.root).exists()  # recorded: host writes resume
@@ -2568,7 +2583,9 @@ async def test_a_command_the_runner_could_not_confirm_over_keeps_the_marker_unti
             await workspace_documents.read_content(db, settings, document)
 
     # The recovery a worker runs at start: the restart confirms the command dead, the
-    # tree is recorded in the conversation's name, the marker goes.
+    # tree is recorded in the conversation's name, the marker goes. No runner to ask, or
+    # one that does not answer, leaves it for the next pass.
+    assert await recover_unsettled_commands(settings, None) == {user.id}
     assert await recover_unsettled_commands(settings, shell) == {user.id}  # runner still away
     shell.restart_ok = True
     assert await recover_unsettled_commands(settings, shell) == set()
@@ -2582,6 +2599,45 @@ async def test_a_command_the_runner_could_not_confirm_over_keeps_the_marker_unti
     assert result["is_error"] and "restarted" in result["content"]
     assert not writing_marker(paths.root).exists()
     assert git.log(paths.root)[0].message == "bash: python write.py"
+
+
+async def test_a_figure_read_is_bounded_by_the_image_budget_not_the_text_cap(
+    tmp_path, monkeypatch
+) -> None:
+    from PIL import Image
+
+    from sightread.workspace.documents import DocumentPaths
+
+    root = tmp_path / "ws" / "1"
+    paths = DocumentPaths(root=root, relative=Path("files/paper"))
+    paths.figures.mkdir(parents=True)
+    # A legitimate crop far larger than the cap on doc.md and notes.md.
+    Image.radial_gradient("L").resize((900, 900)).save(paths.figures / "p1_0_0_1000_1000.png")
+    crop_bytes = (paths.figures / "p1_0_0_1000_1000.png").stat().st_size
+    assert crop_bytes > 4096
+
+    async def no_events(ctx, event, data):
+        return None
+
+    monkeypatch.setattr(chat_runner, "_emit", no_events)
+    ctx = SimpleNamespace(
+        settings=SimpleNamespace(
+            chat_tool_result_max_chars=1000,
+            content_max_bytes=4096,
+            chat_image_round_max_bytes=32 << 20,
+        ),
+        paths=paths,
+        turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
+        conversation=SimpleNamespace(id=1, session="s"),
+    )
+    result = await chat_runner._run_tool_unguarded(
+        ctx,
+        {"id": "f1", "name": "view_figure", "input": {"page": 1, "bbox": [0, 0, 1000, 1000]}},
+        set(),
+        None,
+    )
+    assert "is_error" not in result
+    assert result["content"][0]["type"] == "image"
 
 
 async def test_a_shell_command_stands_marked_as_writing_for_its_whole_run(

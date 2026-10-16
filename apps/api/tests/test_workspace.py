@@ -553,6 +553,33 @@ def test_path_scoped_commits_name_their_paths_literally(tmp_path) -> None:
     assert git.commit_paths(root, "user", "nothing", [Path("files/zzz")]) is None
 
 
+async def test_a_failed_library_parse_keeps_its_original(sessionmaker, tmp_path) -> None:
+    from sightread.jobs import runner
+
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        job = (await db.execute(select(Job).where(Job.id == document.job_id))).scalar_one()
+        upload = tmp_path / "upload.pdf"
+        upload.write_bytes(b"%PDF-1.4")
+        job.source_path = str(upload)
+        job.status = "running"
+        await db.commit()
+        document_id, job_id = document.id, job.id
+    root = user_root(settings.workspaces_dir, user.id)
+    # The parse fails: the row keeps the upload as its original all the same, so the
+    # document is not lost with the error (docs/jobs.md § Retention).
+    await runner._finish(
+        sessionmaker, job_id, status="failed", error="the document is unreadable", settings=settings
+    )
+    original = documents.original_of(root, document_id)
+    assert original is not None and original.read_bytes() == b"%PDF-1.4"
+    assert not upload.exists()
+    async with sessionmaker() as db:
+        job = await db.get(Job, job_id)
+        assert job.status == "failed" and job.source_deleted_at is not None
+
+
 async def test_retention_copies_for_its_recipients_when_a_late_row_took_the_upload(
     sessionmaker, tmp_path
 ) -> None:
@@ -1273,15 +1300,29 @@ async def test_a_revert_whose_revision_cannot_be_recorded_is_rolled_back(
                 raise git.GitError("disk full")
             return real(root_, author, message, paths_)
 
+        # Edits a failed shell commit left unrecorded elsewhere in the tree: not this
+        # revert's to discard when it rolls back.
+        paths.notes.write_text("unrecorded notes\n")
+        (paths.directory / "scratch.txt").write_text("untracked\n")
+
         monkeypatch.setattr(git, "commit_paths", refuse)
         with pytest.raises(ApiError) as refused:
             await documents.revert(db, settings, document, shell)
         assert refused.value.status_code == 409
-        # The tree as it was, the index clean, the head unchanged.
+        # The tree as it was, the head unchanged; the revert's own paths clean, the
+        # unrecorded edits still there.
         assert paths.doc.read_text() == "# Title\n\nShelled\n"
         assert (paths.directory / "helper.py").read_text() == "print(1)\n"
-        assert git._git(root, "status", "--porcelain", check=False).stdout.strip() == ""
+        assert paths.notes.read_text() == "unrecorded notes\n"
+        assert (paths.directory / "scratch.txt").read_text() == "untracked\n"
+        dirty = git._git(root, "status", "--porcelain", check=False).stdout.strip().splitlines()
+        assert sorted(line.split()[-1] for line in dirty) == [
+            "files/Papers/paper.pdf/notes.md",
+            "files/Papers/paper.pdf/scratch.txt",
+        ]
         assert git.log(root)[0].commit == shell
+        paths.notes.write_text("")
+        (paths.directory / "scratch.txt").unlink()
         monkeypatch.setattr(git, "commit_paths", real)
         await documents.revert(db, settings, document, shell)
         assert paths.doc.read_text() == "# Title\n\nBody\n"
