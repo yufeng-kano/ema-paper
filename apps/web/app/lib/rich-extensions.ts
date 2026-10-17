@@ -123,6 +123,11 @@ function inlineMath(options: RichOptions) {
             return match ? { index: match.index, text: text.slice(match.index), data: { tex: match.tex } } : null
           },
           handler: ({ state, range, match }) => {
+            // Dollars inside a code span are code, as the parser reads them.
+            const code = state.schema.marks.code
+            if (code && (state.doc.rangeHasMark(range.from, range.to, code) || code.isInSet(state.doc.resolve(range.from).marks()))) {
+              return null
+            }
             const tex = String((match as unknown as { data?: { tex?: string } }).data?.tex ?? '')
             state.tr.replaceWith(range.from, range.to, this.type.create({ latex: tex }))
           },

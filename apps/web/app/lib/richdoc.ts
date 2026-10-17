@@ -203,14 +203,6 @@ function escapeText(text: string, inTable: boolean): string {
       out += char
     }
   }
-  // Dollars last, against the escaped text: escaping a backtick or a backslash can remove
-  // what kept a dollar from opening a span, so the check has to see the final characters.
-  for (let index = 0; index < out.length; index += 1) {
-    if (out[index] === '$' && !isEscaped(out, index) && mathSpanAt(out, index)) {
-      out = `${out.slice(0, index)}\\${out.slice(index)}`
-      index += 1
-    }
-  }
   return out
 }
 
@@ -223,6 +215,10 @@ function markSet(node: JSONContent): Mark[] {
 function sameMarks(a: Mark[], b: Mark[]): boolean {
   return a.length === b.length && a.every((mark) => b.includes(mark))
 }
+
+/** Stands in for a formula or a code span while the line's dollars are checked: neither's
+ *  characters are prose, so neither may be escaped. A private-use character, never typed. */
+const HELD = '\uE000'
 
 /** A textblock's inline content as one line of markdown. */
 export function serializeInline(content: JSONContent[] = [], inTable = false): string {
@@ -237,64 +233,93 @@ export function serializeInline(content: JSONContent[] = [], inTable = false): s
       runs.push(node)
     }
   }
-  return runs
-    .map((node, index) => {
-      if (node.type === 'hardBreak') {
-        return '<br>'
+  const held: string[] = []
+  const hold = (markdown: string) => {
+    held.push(markdown)
+    return HELD
+  }
+  const pieces = runs.map((node, index) => {
+    if (node.type === 'hardBreak') {
+      return '<br>'
+    }
+    if (node.type === 'inlineMath') {
+      const latex = String(node.attrs?.latex ?? '').trim()
+      if (!latex) {
+        return ''
       }
-      if (node.type === 'inlineMath') {
-        const latex = String(node.attrs?.latex ?? '').trim()
-        if (!latex) {
-          return ''
-        }
-        // A span never closes on a dollar followed by a digit ("$5 and $6" are prices), so
-        // a formula right before one is kept apart by an invisible zero-width space —
-        // anything visible would change the text the reader typed.
-        const next = runs[index + 1]
-        return next?.type === 'text' && /^\d/.test(next.text ?? '') ? `$${latex}$\u200b` : `$${latex}$`
-      }
-      const text = node.text ?? ''
-      const marks = markSet(node)
-      // A code span is single backticks with no backtick inside (`parseInline`), so code
-      // that holds one is written as plain text rather than as a broken span. A pipe in a
-      // table cell is escaped even inside code: the row is split before the cell is read.
-      if (marks.includes('code') && !text.includes('`') && !text.includes('\n')) {
-        return `\`${inTable ? text.replace(/\|/g, '\\|') : text}\``
-      }
-      // Whitespace stays outside the markers: `** bold**` opens nothing.
-      const [, lead = '', body = '', trail = ''] = /^(\s*)([\s\S]*?)(\s*)$/.exec(text) ?? []
+      // A span never closes on a dollar followed by a digit ("$5 and $6" are prices), so
+      // a formula right before one is kept apart by an invisible zero-width space —
+      // anything visible would change the text the reader typed.
+      const next = runs[index + 1]
+      return hold(next?.type === 'text' && /^\d/.test(next.text ?? '') ? `$${latex}$\u200b` : `$${latex}$`)
+    }
+    const text = node.text ?? ''
+    const marks = markSet(node)
+    // Whitespace stays outside the markers: `** bold**` opens nothing.
+    const [, lead = '', body = '', trail = ''] = /^(\s*)([\s\S]*?)(\s*)$/.exec(text) ?? []
+    if (!body) {
+      return escapeText(text, inTable)
+    }
+    let inner: string
+    // A code span is single backticks with no backtick inside (`parseInline`), so code
+    // that holds one is written as plain text rather than as a broken span. A pipe in a
+    // table cell is escaped even inside code: the row is split before the cell is read.
+    if (marks.includes('code') && !body.includes('`') && !body.includes('\n')) {
+      inner = hold(`\`${inTable ? body.replace(/\|/g, '\\|') : body}\``)
+    } else {
+      inner = escapeText(body, inTable)
       // A literal dollar right before a formula would become its opener (`price $$x$`).
-      const beforeMath = runs[index + 1]?.type === 'inlineMath' && !trail
-      const escapeEnd = (value: string) =>
-        beforeMath && value.endsWith('$') && !value.endsWith('\\$') ? `${value.slice(0, -1)}\\$` : value
-      if (!body) {
-        return escapeText(text, inTable)
+      if (runs[index + 1]?.type === 'inlineMath' && !trail && inner.endsWith('$') && !isEscaped(inner, inner.length - 1)) {
+        inner = `${inner.slice(0, -1)}\\$`
       }
-      let inner = escapeEnd(escapeText(body, inTable))
-      if (marks.includes('italic')) {
-        inner = `*${inner}*`
-      }
-      if (marks.includes('bold')) {
-        inner = `**${inner}**`
-      }
-      return `${lead}${inner}${trail}`
-    })
-    .join('')
+    }
+    if (marks.includes('italic')) {
+      inner = `*${inner}*`
+    }
+    if (marks.includes('bold')) {
+      inner = `**${inner}**`
+    }
+    return `${lead}${inner}${trail}`
+  })
+  // Two emphasis runs that meet (`*a*` then `**b**`) would merge their asterisks into a
+  // run the parser cannot split; an invisible zero-width space keeps them apart.
+  let line = pieces.reduce((out, piece) => (out.endsWith('*') && piece.startsWith('*') ? `${out}\u200b${piece}` : `${out}${piece}`), '')
+  // Dollars last, across the whole line: a literal dollar in one run and another in the
+  // next (`\$**sale**\$`) would otherwise pair into a formula.
+  for (let index = 0; index < line.length; index += 1) {
+    if (line[index] === '$' && !isEscaped(line, index) && mathSpanAt(line, index)) {
+      line = `${line.slice(0, index)}\\${line.slice(index)}`
+      index += 1
+    }
+  }
+  let next = 0
+  return line.replace(new RegExp(HELD, 'g'), () => held[next++] ?? '')
+}
+
+/** A line with its leading characters escaped where they would start another block. */
+function escapeLineStart(line: string): string {
+  // A sentence ending in a dot leader and a number would read back as a contents row; one
+  // escaped dot breaks the leader and still renders as a dot.
+  const text = readsAsTocRow(line) ? line.replace(/\.(?=[^.]*$)/, '\\.') : line
+  if (/^(#|[-+*]\s|\d{1,9}[.)]\s|\$\$|```|~~~|<!--|!\[)/.test(text)) {
+    const marker = /^\d{1,9}/.exec(text)
+    return marker ? `${marker[0]}\\${text.slice(marker[0].length)}` : `\\${text}`
+  }
+  return text
 }
 
 /** A paragraph's line, with a leading character escaped where it would start a block. */
 function paragraphLine(content: JSONContent[] | undefined): string {
-  let line = serializeInline(content)
-  // A sentence ending in a dot leader and a number would read back as a contents row; one
-  // escaped dot breaks the leader and still renders as a dot.
-  if (readsAsTocRow(line)) {
-    line = line.replace(/\.(?=[^.]*$)/, '\\.')
-  }
-  if (/^(#|[-+*]\s|\d{1,9}[.)]\s|\$\$|```|~~~|<!--|!\[)/.test(line)) {
-    const marker = /^\d{1,9}/.exec(line)
-    return marker ? `${marker[0]}\\${line.slice(marker[0].length)}` : `\\${line}`
-  }
-  return line
+  return escapeLineStart(serializeInline(content))
+}
+
+/**
+ * A figure caption from its editor's markdown: one line, never starting another block —
+ * the parser reads only the line under a placeholder as its caption.
+ */
+export function captionLine(markdown: string): string {
+  const line = markdown.replace(/\s*\n+\s*/g, ' ').trim()
+  return line ? escapeLineStart(line.replace(/^(#{1,6}|[-+*]|\d{1,9}[.)])\s+/, '')) : ''
 }
 
 /** Every textblock under a node, flattened — a list item's paragraphs, a cell's lines. */

@@ -18,6 +18,7 @@ import {
   type ResultBlock,
 } from '~/lib/markdown'
 import type { Caret } from '~/lib/rich-extensions'
+import { captionLine } from '~/lib/richdoc'
 
 /**
  * Module scope, not component state: the rail, the notes column and the agent panel are
@@ -254,11 +255,13 @@ async function saveContent() {
   saving = true
   saveState.value = 'saving'
   saveError.value = null
-  const snapshot = markdown.value
+  // The open block's draft goes too: a reader can type in one block for minutes without
+  // leaving it, and a reload in that time must not lose it.
+  const snapshot = documentWithDraft()
   try {
     const saved = await putDocumentContent(id, { markdown: snapshot, base_revision: revision.value })
     revision.value = saved.revision
-    if (markdown.value === snapshot) {
+    if (documentWithDraft() === snapshot) {
       saveState.value = 'saved'
     } else {
       scheduleSave()
@@ -516,7 +519,12 @@ function onBlockPress(event: MouseEvent, pageIndex: number, blockIndex: number) 
     return
   }
   const rect = event.currentTarget.getBoundingClientRect()
-  pressed = { page: pageIndex, index: blockIndex, src: block.src, dx: event.clientX - rect.left, dy: event.clientY - rect.top }
+  // Where the block will be once the open one is written back: a block after it on its
+  // page moves by however many blocks the draft becomes.
+  const open = editing.value
+  const span = joined.value ? 2 : 1
+  const shift = open && open.page === pageIndex && blockIndex > open.index ? draftBlockCount() - span : 0
+  pressed = { page: pageIndex, index: blockIndex + shift, src: block.src, dx: event.clientX - rect.left, dy: event.clientY - rect.top }
 }
 
 /** A click opens the pressed block with the caret where the press landed in it — unless it
@@ -545,15 +553,17 @@ function onBlockClick() {
   void startEdit(press.page, index, rect ? { x: rect.left + press.dx, y: rect.top + press.dy } : 'end')
 }
 
-/** The open editor's markdown. A caption is one line under the figure's placeholder. */
+/** The open editor's markdown, saved on the debounce while the block stays open. A caption
+ *  is one line under the figure's placeholder. */
 function onEditorChange(markdown: string) {
   const block = openBlock.value
   if (block?.kind === 'fig') {
-    const caption = markdown.replace(/\s*\n+\s*/g, ' ').trim()
+    const caption = captionLine(markdown)
     draft.value = caption ? `${figurePlaceholder(block)}\n${caption}` : figurePlaceholder(block)
-    return
+  } else {
+    draft.value = markdown
   }
-  draft.value = markdown
+  scheduleSave()
 }
 
 /** The source of the block under the open editor, or null when none is open. Never the
@@ -562,36 +572,39 @@ function openBlockSource(): string | null {
   return editing.value && !joined.value ? (openBlock.value?.src ?? null) : null
 }
 
-/** Renders the block again, and if its source changed, writes it into the document. */
-function commitEdit() {
+/** The document with the open editor's draft written in — what leaving the block would
+ *  make it, and what a save sends while the block is still open. */
+function documentWithDraft(): string {
   const open = editing.value
   if (!open) {
-    return
+    return markdown.value
   }
-  editing.value = null
   const block = pages.value[open.page]?.blocks[open.index]
   if (!block) {
     // The editor past the last block (`startNewBlock`): text typed there is a new block,
     // nothing typed is nothing.
-    if (draft.value.trim() !== '') {
-      markdown.value = appendBlockSource(markdown.value, open.page, draft.value)
-      scheduleSave()
-    }
-    return
+    return draft.value.trim() !== '' ? appendBlockSource(markdown.value, open.page, draft.value) : markdown.value
   }
   if (joined.value) {
-    joined.value = false
     // The later block first, so the open one's index still holds.
     const without = replaceBlockSource(markdown.value, open.page, open.index + 1, '')
-    markdown.value = replaceBlockSource(without, open.page, open.index, draft.value)
+    return replaceBlockSource(without, open.page, open.index, draft.value)
+  }
+  return draft.value === block.src ? markdown.value : replaceBlockSource(markdown.value, open.page, open.index, draft.value)
+}
+
+/** Renders the block again, and if its source changed, writes it into the document. */
+function commitEdit() {
+  if (!editing.value) {
+    return
+  }
+  const next = documentWithDraft()
+  editing.value = null
+  joined.value = false
+  if (next !== markdown.value) {
+    markdown.value = next
     scheduleSave()
-    return
   }
-  if (draft.value === block.src) {
-    return
-  }
-  markdown.value = replaceBlockSource(markdown.value, open.page, open.index, draft.value)
-  scheduleSave()
 }
 
 /** The nearest block before or after one, across page markers, that a reader can open —
@@ -687,6 +700,19 @@ function onLineEditorKey(event: KeyboardEvent) {
     event.stopPropagation()
     event.preventDefault()
     commitEdit()
+    return
+  }
+  // Arrowing past the first or last line moves to the next block, as in the rich editor.
+  const box = event.target instanceof HTMLTextAreaElement ? event.target : null
+  if (!box || box.selectionStart !== box.selectionEnd) {
+    return
+  }
+  const firstLine = box.value.lastIndexOf('\n', box.selectionStart - 1) === -1
+  const lastLine = box.value.indexOf('\n', box.selectionEnd) === -1
+  if ((event.key === 'ArrowUp' && firstLine) || (event.key === 'ArrowDown' && lastLine)) {
+    if (navigateFrom(event.key === 'ArrowUp' ? 'up' : 'down')) {
+      event.preventDefault()
+    }
   }
 }
 
@@ -1322,8 +1348,8 @@ const awaitingContent = computed(
                     v-for="(block, index) in page.blocks"
                     :key="index"
                     class="block"
-                    :class="{ editable, open: isEditing(pageIndex, index) }"
-                    :tabindex="editable && !isEditing(pageIndex, index) ? 0 : undefined"
+                    :class="{ editable: editable && block.kind !== 'comment', open: isEditing(pageIndex, index) }"
+                    :tabindex="editable && block.kind !== 'comment' && !isEditing(pageIndex, index) ? 0 : undefined"
                     :data-block="`${pageIndex}-${index}`"
                     :hidden="isJoinedAway(pageIndex, index)"
                     @mousedown="editable && onBlockPress($event, pageIndex, index)"

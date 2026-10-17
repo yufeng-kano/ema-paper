@@ -2,7 +2,7 @@ import { getSchema, type JSONContent } from '@tiptap/core'
 import { describe, expect, it } from 'vitest'
 import { parseResultMarkdown } from './markdown'
 import { richExtensions } from './rich-extensions'
-import { docToMarkdown, inlineMathAtEnd, markdownToDoc, serializeInline, sliceToMarkdown } from './richdoc'
+import { captionLine, docToMarkdown, inlineMathAtEnd, markdownToDoc, serializeInline, sliceToMarkdown } from './richdoc'
 
 const schema = getSchema(richExtensions())
 
@@ -263,6 +263,29 @@ describe('third review', () => {
     expect(docToMarkdown(doc)).toBe(notes)
     doc.content![2]!.content = [{ type: 'text', text: 'more2' }]
     expect(docToMarkdown(doc)).toBe('intro\n\n<!-- page: 1 -->\nmore2')
+  })
+})
+
+describe('pull request review', () => {
+  const doc = (...content: JSONContent[]): JSONContent => ({ type: 'doc', content: [{ type: 'paragraph', content }] })
+  const text = (value: string, ...marks: string[]): JSONContent =>
+    marks.length ? { type: 'text', text: value, marks: marks.map((type) => ({ type })) } : { type: 'text', text: value }
+
+  it.each([
+    ['italic then bold', [text('a', 'italic'), text('b', 'bold')]],
+    ['dollars around bold', [text('$'), text('sale', 'bold'), text('$')]],
+    ['bold code', [text('code', 'code', 'bold')]],
+  ])('%s reads back as written', (_name, content) => {
+    const markdown = docToMarkdown(doc(...content))
+    // The zero-width separators the serializer adds are invisible; they are not content.
+    const back = load(markdown).content![0]!.content!.filter((node) => node.text !== '\u200b')
+    expect(back.map((node) => [node.text?.replace(/\u200b/g, ''), (node.marks ?? []).map((mark) => mark.type).sort()]))
+      .toEqual(content.map((node) => [node.text, (node.marks ?? []).map((mark) => mark.type).sort()]))
+  })
+
+  it('keeps a caption one line that starts no block', () => {
+    expect(captionLine('# Figure 2\n\nmore')).toBe('Figure 2 more')
+    expect(captionLine('- 1. a')).toBe('1\\. a')
   })
 })
 

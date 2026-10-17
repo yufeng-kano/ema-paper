@@ -59,7 +59,7 @@ let closing = false
 /** What this editor last emitted, so a notes reload of the same text is not a reload. */
 let emitted: string | null = null
 /** What the file ended with (a final newline, say): kept when the file is written back. */
-let trailing = /\s*$/.exec(props.source)?.[0] ?? ''
+let trailing = /\n\s*$/.exec(props.source)?.[0] ?? ''
 
 // --- the TeX field -------------------------------------------------------------------
 
@@ -125,7 +125,10 @@ function onMathKey(event: KeyboardEvent) {
   }
   const commit =
     event.key === 'Escape' ||
-    (event.key === 'Enter' && !event.isComposing && (!open.display || event.ctrlKey || event.metaKey))
+    (event.key === 'Enter' &&
+      !event.isComposing &&
+      event.keyCode !== 229 &&
+      (!open.display || event.ctrlKey || event.metaKey))
   if (commit) {
     event.preventDefault()
     event.stopPropagation()
@@ -161,8 +164,18 @@ function onEdgeLine(direction: 'up' | 'down'): boolean {
 }
 
 function onKey(event: KeyboardEvent): boolean {
-  if (!editor || event.isComposing) {
+  if (!editor || event.isComposing || event.keyCode === 229) {
     return false
+  }
+  // Enter on a selected formula opens its TeX field: the keyboard's click.
+  const { selection } = editor.state
+  if (event.key === 'Enter' && selection instanceof NodeSelection) {
+    const name = selection.node.type.name
+    const dom = editor.view.nodeDOM(selection.from)
+    if ((name === 'inlineMath' || name === 'blockMath') && dom instanceof HTMLElement) {
+      void openMath({ pos: selection.from, latex: String(selection.node.attrs.latex), display: name === 'blockMath', dom })
+      return true
+    }
   }
   if (event.key === 'Escape') {
     // The editor's Escape, not the dialog's: it leaves the text, and the next one closes.
@@ -250,6 +263,8 @@ onMounted(() => {
       onEditMath: (target) => void openMath(target),
     }),
     content: markdownToDoc(props.source),
+    // A caption is one line: no shortcut there may make a heading, a list or a block.
+    ...(props.singleLine ? { enableInputRules: ['bold', 'italic', 'code', 'inlineMath'] } : {}),
     editorProps: {
       attributes: {
         class: 'rich-doc',
@@ -305,7 +320,7 @@ watch(
       return
     }
     emitted = null
-    trailing = /\s*$/.exec(source)?.[0] ?? ''
+    trailing = /\n\s*$/.exec(source)?.[0] ?? ''
     editor.commands.setContent(markdownToDoc(source), { emitUpdate: false })
   },
 )
