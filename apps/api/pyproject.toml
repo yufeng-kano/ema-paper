@@ -58,8 +58,11 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S105", "S106"]
 "migrations/*" = ["E501"]
-# The chat agent's system prompt is prose; a wrapped prompt reads worse to the model.
+# The chat agent's system prompt is prose; a wrapped prompt reads worse to the model. So
+# are the built-in skills' and subagents' instructions.
 "src/sightread/agents/chat.py" = ["E501"]
+"src/sightread/agents/skills.py" = ["E501"]
+"src/sightread/agents/subagents.py" = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -308,6 +308,8 @@ async def test_a_turn_edits_the_document_and_streams_its_events(chatting, monkey
         "str_replace_based_edit_tool",
         "view_page",
         "view_figure",
+        "skill",
+        "subagent",
     ]  # no sandbox configured → no bash
     assert first["system"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
     assert first["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
@@ -1231,6 +1233,8 @@ async def test_the_agent_page_lists_only_the_tools_the_deployment_has(
         "str_replace_based_edit_tool",
         "view_page",
         "view_figure",
+        "skill",
+        "subagent",
     ]
     bare = make_client(workspaces_dir=str(tmp_path / "ws2"), sandbox_url="")
     await bare.post("/api/auth/dev-login", headers=CSRF_HEADERS)
@@ -1239,7 +1243,13 @@ async def test_the_agent_page_lists_only_the_tools_the_deployment_has(
         for agent in (await bare.get("/api/agents")).json()["agents"]
         if agent["name"] == "chat"
     )
-    assert without["tools"] == ["str_replace_based_edit_tool", "view_page", "view_figure"]
+    assert without["tools"] == [
+        "str_replace_based_edit_tool",
+        "view_page",
+        "view_figure",
+        "skill",
+        "subagent",
+    ]
 
 
 async def test_a_file_with_a_live_conversation_cannot_be_renamed(chatting) -> None:

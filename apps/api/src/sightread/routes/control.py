@@ -53,6 +53,7 @@ from ..db.models import (
 from ..errors import ApiError
 from ..jobs.intake import PDF_MEDIA_TYPE
 from ..jobs.runner import result_payload
+from ..parsing.attachments import ATTACHMENT_EXTENSIONS
 from ..parsing.images import ACCEPTED_IMAGE_TYPES
 from ..upstream.client import (
     agent_models,
@@ -177,8 +178,12 @@ async def me(user: SessionUser, settings: AppSettings):
             # The extensions intake falls back to when a browser reports a generic type
             # for a file it has no association for (docs/api.md § Limits).
             "accepted_extensions": [".pdf", *sorted(set(ACCEPTED_IMAGE_TYPES.values()))],
-            # The prompt dialog counts against the same cap `POST /api/prompts` enforces.
+            # The prompt dialogs count against the same cap the writes enforce.
             "prompt_max_chars": settings.system_prompt_max_chars,
+            # What the chat composer may attach (docs/chat.md § What a user message carries).
+            "attachment_max_bytes": settings.chat_attachment_max_bytes,
+            "attachments_per_message": settings.chat_attachments_per_message,
+            "attachment_extensions": list(ATTACHMENT_EXTENSIONS),
         },
     }
 
@@ -608,6 +613,8 @@ def _agent_settings_payload(row: AgentSetting | None) -> dict:
     return {
         "connection_id": row.connection_id if row else None,
         "model": row.model if row else None,
+        # The user's own template; null for the agent's default (docs/agents.md).
+        "prompt": row.prompt if row else None,
         "prompt_preset_id": row.prompt_preset_id if row else None,
         "effort": (row.effort if row and row.effort else EFFORT_DEFAULT),
     }
@@ -641,8 +648,10 @@ async def list_agents(user: SessionUser, db: DbSession, settings: AppSettings):
                 "capabilities": list(agent.capabilities),
                 "input": agent.input,
                 "output": agent.output,
-                # What "default" means for this agent's prompt picker.
+                # What the prompt dialog opens on when the user saved no prompt, and the
+                # tokens it offers as chips (docs/web.md).
                 "default_prompt": agent.default_prompt_template,
+                "prompt_tokens": list(agent.prompt_tokens),
                 # The tools this deployment really gives the agent: `bash` only with a
                 # sandbox runner configured (docs/chat.md § Tools).
                 "tools": _agent_tools(agent.name, settings),
@@ -661,16 +670,33 @@ class AgentSettingsPut(BaseModel):
 
     connection_id: int | None = None
     model: str | None = Field(default=None, max_length=255)
+    # Capped in the route, where the settings are (`SYSTEM_PROMPT_MAX_CHARS`).
+    prompt: str | None = None
     prompt_preset_id: int | None = None
     effort: str | None = Field(default=None, max_length=8)
 
 
 @router.put("/agents/{agent_name}/settings", dependencies=[CsrfGuard])
 async def put_agent_settings(
-    agent_name: str, body: AgentSettingsPut, user: SessionUser, db: DbSession
+    agent_name: str, body: AgentSettingsPut, user: SessionUser, db: DbSession, settings: AppSettings
 ):
     agent = _known_agent(agent_name)
     provided = body.model_fields_set
+    prompt: str | None = None
+    if "prompt" in provided:
+        prompt = (body.prompt or "").strip() or None
+        if prompt is not None and len(prompt) > settings.system_prompt_max_chars:
+            raise ApiError(
+                400,
+                "invalid_request",
+                f"The prompt exceeds {settings.system_prompt_max_chars} characters",
+            )
+        # The default stored as no prompt, so a later default reaches it.
+        if prompt == agent.default_prompt_template.strip():
+            prompt = None
+    if prompt is not None and body.prompt_preset_id is not None:
+        # The two exclude each other (docs/agents.md § Per-agent settings).
+        raise ApiError(400, "invalid_request", "Send either prompt or prompt_preset_id")
     if body.connection_id is not None:
         if "anthropic" in agent.capabilities:
             # The chat agent speaks the Messages API through Kano Proxy only (docs/chat.md).
@@ -706,7 +732,9 @@ async def put_agent_settings(
             row.model = None
     if "model" in provided:
         row.model = (body.model or "").strip() or None
-    if "prompt_preset_id" in provided:
+    if "prompt" in provided or "prompt_preset_id" in provided:
+        # Writing either clears the other: one of the two is ever in force.
+        row.prompt = prompt
         row.prompt_preset_id = body.prompt_preset_id
     if "effort" in provided:
         row.effort = body.effort or EFFORT_DEFAULT

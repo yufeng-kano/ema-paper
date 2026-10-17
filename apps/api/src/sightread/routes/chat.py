@@ -9,6 +9,9 @@ sandbox client's.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import contextlib
 import secrets
 import uuid
 from pathlib import Path
@@ -16,24 +19,28 @@ from pathlib import Path
 from fastapi import APIRouter, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..agents import CHAT
+from ..agents import skills as skill_defs
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
 from ..db.models import (
     AgentSetting,
+    ChatAttachment,
     ChatTurn,
     Conversation,
     Document,
     KanoProxyKey,
     Message,
+    Skill,
     User,
     utcnow,
 )
 from ..errors import ApiError
 from ..jobs import chat_events
 from ..jobs.queue import HISTORY_FULL, count_active_turns, enqueue_turn, history_bytes
+from ..parsing.attachments import prepared_path
 from ..sandbox.client import SandboxClient, SandboxUnavailable
 from ..workspace.documents import (
     current_revision,
@@ -135,6 +142,14 @@ async def create_conversation(
 
 # What the stored selection block says before the passage (docs/chat.md § Prompt caching).
 SELECTION_PREFIX = "The passage selected in the document:\n\n"
+# And the reply's quote before its passage (docs/chat.md § What a user message carries).
+QUOTE_PREFIX = "The user is replying to this passage of your earlier answer:\n\n"
+ATTACHMENT_EXPIRED = "An attachment is no longer available; attach it again"
+# Who may cache an attached image's bytes: only the reader, for as long as it likes — a
+# stored message never changes (docs/api.md).
+ATTACHMENT_CACHE = "private, max-age=31536000, immutable"
+
+
 # The per-turn context block (docs/chat.md § Prompt caching): what the model must know
 # about this message and may not learn from the cached prefix.
 TURN_CONTEXT = "turn"
@@ -150,21 +165,35 @@ def turn_note(revision: str | None, locale: str) -> str:
 def display_content(content: list) -> list:
     """The blocks as the panel draws them: an image — a page or a figure a tool returned,
     stored for the model's replay — is sent without its bytes, which the panel never
-    renders and a long thread would otherwise carry by the hundred megabytes; the
-    selection block is sent as the passage alone, without the line that introduces it
-    to the model, so the note the panel shows counts the selection and nothing else
-    (docs/api.md § Chat)."""
+    renders and a long thread would otherwise carry by the hundred megabytes, and an
+    attached image without them too, the panel asking for them by the block's index; the
+    selection and the quote are sent as the passage alone, without the line that
+    introduces it to the model, so the note the panel shows counts the passage and
+    nothing else; a command's skill and an attached file are sent as what they name, not
+    the text the model reads (docs/api.md § Chat)."""
     shown = []
     for block in content:
         if not isinstance(block, dict):
             continue
+        marker = block.get("context")
         if block.get("type") == "image":
-            shown.append({"type": "image"})
+            image: dict = {"type": "image"}
+            if isinstance(block.get("attachment"), dict):
+                image["attachment"] = block["attachment"]
+            shown.append(image)
         elif block.get("type") == "tool_result" and isinstance(block.get("content"), list):
             shown.append({**block, "content": display_content(block["content"])})
-        elif block.get("context") == "selection" and isinstance(block.get("text"), str):
+        elif marker == "selection" and isinstance(block.get("text"), str):
             shown.append({**block, "text": block["text"].removeprefix(SELECTION_PREFIX)})
-        elif block.get("context") == TURN_CONTEXT:
+        elif marker == "quote" and isinstance(block.get("text"), str):
+            shown.append({**block, "text": block["text"].removeprefix(QUOTE_PREFIX)})
+        elif marker == "skill":
+            shown.append({"type": "text", "context": "skill", "skill": block.get("skill")})
+        elif marker == "attachment":
+            shown.append(
+                {"type": "text", "context": "attachment", "attachment": block.get("attachment")}
+            )
+        elif marker == TURN_CONTEXT:
             continue  # the model's context, nothing the thread shows
         else:
             shown.append(block)
@@ -233,12 +262,20 @@ async def delete_conversation(conversation_id: int, user: SessionUser, db: DbSes
 
 
 class MessageCreate(BaseModel):
-    # The caps are the deployment's (`CHAT_MESSAGE_MAX_CHARS`, `CHAT_SELECTION_MAX_CHARS`),
-    # checked in the route where the settings are.
-    text: str = Field(min_length=1)
+    # The caps are the deployment's (`CHAT_MESSAGE_MAX_CHARS`, `CHAT_SELECTION_MAX_CHARS`,
+    # `CHAT_ATTACHMENTS_PER_MESSAGE`), checked in the route where the settings are. Empty
+    # text is a message only with a command or an attachment; with a command it is the
+    # command's arguments (docs/chat.md § What a user message carries).
+    text: str = ""
     # The passage the reader had selected when they sent — context, appended as its own
     # block of the user message (docs/chat.md § Prompt caching).
     selection: str | None = None
+    # The passage of an earlier answer the reader is replying to.
+    quote: str | None = None
+    # A skill the reader runs as `/name` (docs/chat.md § Skills).
+    command: str | None = Field(default=None, max_length=64)
+    # Ids `POST /api/attachments` returned.
+    attachments: list[uuid.UUID] = Field(default_factory=list)
     # The web app's locale: the language the turn answers in (docs/chat.md § System prompt).
     locale: str = Field(default="en", max_length=16, pattern=r"^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$")
 
@@ -304,6 +341,18 @@ async def post_message(
         raise ApiError(400, "invalid_request", "The message is too long")
     if body.selection is not None and len(body.selection) > settings.chat_selection_max_chars:
         raise ApiError(400, "invalid_request", "The selection is too long")
+    if body.quote is not None and len(body.quote) > settings.chat_selection_max_chars:
+        raise ApiError(400, "invalid_request", "The quoted passage is too long")
+    attachment_ids = list(dict.fromkeys(body.attachments))
+    if len(attachment_ids) > settings.chat_attachments_per_message:
+        raise ApiError(
+            400,
+            "invalid_request",
+            f"At most {settings.chat_attachments_per_message} attachments go with one message",
+        )
+    command = (body.command or "").strip() or None
+    if not body.text.strip() and command is None and not attachment_ids:
+        raise ApiError(400, "invalid_request", "The message needs text, a command or a file")
     row = await owned_conversation(db, user.id, conversation_id)
     # Enforced where the decisions are made, under row locks held until this transaction
     # commits (PostgreSQL; the SQLite fallback runs one request at a time): the user's row
@@ -337,7 +386,33 @@ async def post_message(
     if await history_bytes(db, row.id) > settings.chat_history_max_bytes:
         raise ApiError(409, "invalid_request", HISTORY_FULL)
 
-    content: list[dict] = [{"type": "text", "text": body.text}]
+    skill = None
+    if command is not None:
+        rows = (await db.execute(select(Skill).where(Skill.user_id == user.id))).scalars().all()
+        skill = next(
+            (
+                candidate
+                for candidate in skill_defs.resolve_skills(rows)
+                if candidate.name == command and candidate.user_invocable
+            ),
+            None,
+        )
+        if skill is None:
+            raise ApiError(400, "invalid_request", f"No command /{command}")
+
+    # The attachments first, images before files, as the Messages API advises; each was
+    # prepared at its upload, and the send embeds and deletes it (docs/chat.md § What a
+    # user message carries). Under the user's row lock: two sends cannot take one.
+    attachments = await _claimed_attachments(db, settings, user.id, attachment_ids)
+    content: list[dict] = [block for _, block in attachments]
+
+    if skill is not None:
+        arguments = body.text.strip()
+        visible = f"/{skill.name}" + (f" {arguments}" if arguments else "")
+    else:
+        visible = body.text
+    if visible.strip():
+        content.append({"type": "text", "text": visible})
     selection = (body.selection or "").strip()
     if selection:
         # Marked as ours: the runner strips the marker before the block goes upstream,
@@ -347,6 +422,20 @@ async def post_message(
                 "type": "text",
                 "text": f"{SELECTION_PREFIX}{selection}",
                 "context": "selection",
+            }
+        )
+    quote = (body.quote or "").strip()
+    if quote:
+        content.append({"type": "text", "text": f"{QUOTE_PREFIX}{quote}", "context": "quote"})
+    if skill is not None:
+        rendered = skill_defs.render_skill(skill.body, body.text)
+        content.append(
+            {
+                "type": "text",
+                "text": f"The user ran the skill /{skill.name}. Follow its instructions:\n\n"
+                f"{rendered}",
+                "context": "skill",
+                "skill": skill.name,
             }
         )
     # The document's revision as the message is accepted, and the reader's locale: with
@@ -361,7 +450,8 @@ async def post_message(
     db.add(message)
     await db.flush()
     if not row.title:
-        first_line = body.text.strip().splitlines()[0] if body.text.strip() else ""
+        named = visible.strip() or (attachments[0][0].name if attachments else "")
+        first_line = named.splitlines()[0] if named else ""
         row.title = first_line[:TITLE_MAX_CHARS]
     turn = await enqueue_turn(
         db,
@@ -375,7 +465,105 @@ async def post_message(
     # The message belongs to the turn that answers it: a reloaded thread groups by turn.
     message.turn_id = turn.id
     await db.commit()
+    # Embedded now: the prepared files have nothing left to wait for.
+    for attachment, _ in attachments:
+        path = prepared_path(Path(settings.upload_dir), attachment.id, attachment.media_type)
+        with contextlib.suppress(OSError):
+            await asyncio.to_thread(path.unlink, missing_ok=True)
     return {"turn_id": str(turn.id), "message_id": message.id}
+
+
+async def _claimed_attachments(
+    db: AsyncSession, settings: AppSettings, user_id: int, ids: list[uuid.UUID]
+) -> list[tuple[ChatAttachment, dict]]:
+    """The caller's pending attachments as the message's blocks, images first, their rows
+    deleted in the send's transaction. 409 for one that is not the caller's, already sent,
+    or whose prepared file the sweeper took (docs/api.md)."""
+    if not ids:
+        return []
+    rows = {
+        row.id: row
+        for row in (
+            await db.execute(
+                select(ChatAttachment).where(
+                    ChatAttachment.id.in_(ids), ChatAttachment.user_id == user_id
+                )
+            )
+        ).scalars()
+    }
+    if len(rows) != len(ids):
+        raise ApiError(409, "invalid_request", ATTACHMENT_EXPIRED)
+    upload_dir = Path(settings.upload_dir)
+    claimed: list[tuple[ChatAttachment, dict]] = []
+    for attachment_id in ids:
+        row = rows[attachment_id]
+        path = prepared_path(upload_dir, row.id, row.media_type)
+        try:
+            data = await asyncio.to_thread(path.read_bytes)
+        except OSError as exc:
+            raise ApiError(409, "invalid_request", ATTACHMENT_EXPIRED) from exc
+        if row.kind == "image":
+            block = {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": row.media_type,
+                    "data": base64.b64encode(data).decode("ascii"),
+                },
+                "attachment": {"name": row.name},
+            }
+        else:
+            block = {
+                "type": "text",
+                "text": f"Attached file: {row.name}\n\n{data.decode('utf-8', 'replace')}",
+                "context": "attachment",
+                "attachment": {"name": row.name, "kind": row.kind, "chars": row.chars},
+            }
+        claimed.append((row, block))
+    # A remove of one of them racing this send: whichever commits first wins it.
+    removed = await db.execute(
+        delete(ChatAttachment).where(ChatAttachment.id.in_(ids), ChatAttachment.user_id == user_id)
+    )
+    if removed.rowcount != len(ids):
+        raise ApiError(409, "invalid_request", ATTACHMENT_EXPIRED)
+    claimed.sort(key=lambda item: item[0].kind != "image")
+    return claimed
+
+
+@router.get("/conversations/{conversation_id}/messages/{message_id}/attachments/{index}")
+async def message_attachment(
+    conversation_id: int, message_id: int, index: int, user: SessionUser, db: DbSession
+) -> Response:
+    """The bytes of an image the reader attached to one of their messages, from the stored
+    block itself — the record, and the only copy kept (docs/chat.md § What a user message
+    carries)."""
+    row = await owned_conversation(db, user.id, conversation_id)
+    message = (
+        await db.execute(
+            select(Message).where(Message.id == message_id, Message.conversation_id == row.id)
+        )
+    ).scalar_one_or_none()
+    content = message.content if message is not None and message.role == "user" else None
+    block = content[index] if isinstance(content, list) and 0 <= index < len(content) else None
+    source = block.get("source") if isinstance(block, dict) else None
+    if (
+        not isinstance(block, dict)
+        or block.get("type") != "image"
+        or not isinstance(block.get("attachment"), dict)
+        or not isinstance(source, dict)
+        or source.get("media_type") not in ("image/png", "image/jpeg")
+        or not isinstance(source.get("data"), str)
+    ):
+        raise ApiError(404, "invalid_request", "No such attachment")
+    try:
+        data = base64.b64decode(source["data"], validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ApiError(404, "invalid_request", "No such attachment") from exc
+    return Response(
+        content=data,
+        media_type=source["media_type"],
+        headers={"Cache-Control": ATTACHMENT_CACHE},
+    )
 
 
 @router.post(

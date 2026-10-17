@@ -14,6 +14,7 @@ from pathlib import Path
 
 PDFINFO = "pdfinfo"
 PDFTOPPM = "pdftoppm"
+PDFTOTEXT = "pdftotext"
 
 # Per-call ceiling (docs/parsing.md: default 60 s/page).
 DEFAULT_TIMEOUT_SECONDS = 60.0
@@ -172,3 +173,23 @@ async def render_page(
     if not rendered.exists():
         raise PopplerError(f"pdftoppm wrote no image for page {page_no}")
     return rendered
+
+
+async def pdf_text(
+    pdf_path: Path,
+    target: Path,
+    *,
+    cwd: Path,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+) -> Path:
+    """Write the PDF's text layer to `target` as UTF-8 — to a file rather than a pipe, so a
+    long document's text is read back bounded instead of held whole (the chat composer's
+    attachments, docs/chat.md § What a user message carries)."""
+    await _run(
+        [PDFTOTEXT, "-q", "-enc", "UTF-8", str(pdf_path), str(target)],
+        cwd=cwd,
+        timeout=timeout,
+    )
+    if not target.exists():
+        raise PopplerError("pdftotext wrote no text")
+    return target

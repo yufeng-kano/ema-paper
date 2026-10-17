@@ -16,6 +16,10 @@ BBOX_FORMAT_YXYX = "yxyx_norm1000"
 # Part of the dedup cache key; bump when the pipeline changes results (docs/jobs.md).
 PIPELINE_VERSION = 6  # 6: the coordinate paragraph follows the model's family
 
+# What the template substitutes per page (upstream/client.py): the chips the Agent page's
+# prompt dialog inserts (docs/web.md).
+PROMPT_TOKENS: tuple[str, ...] = ("{page}", "{bbox_format}", "{bbox_instructions}")
+
 # Transcription prompt for a rendered page. `{page}` is the real page number: the model is
 # told what to write so the placeholder it emits already matches our own numbering.
 # `{bbox_instructions}` is the coordinate paragraph for the model's family — the placeholder

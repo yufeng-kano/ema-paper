@@ -60,6 +60,9 @@ class ToolOutcome:
     # the tree is not committed now — the next command's revision carries it, once the
     # runner has confirmed the VM gone (docs/chat.md § Tools).
     settled: bool = True
+    # What a `subagent` call did, stored with its result for the panel and stripped before
+    # the result goes upstream (docs/chat.md § Subagents).
+    subagent: dict | None = field(default=None)
 
 
 def truncate(text: str, max_chars: int) -> str:

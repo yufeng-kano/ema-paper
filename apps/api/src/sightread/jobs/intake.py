@@ -79,19 +79,22 @@ async def upload_chunks(upload: ChunkReader) -> AsyncIterator[bytes]:
         yield chunk
 
 
-async def capped_stream(stream: AsyncIterator[bytes], max_bytes: int) -> AsyncIterator[bytes]:
+async def capped_stream(
+    stream: AsyncIterator[bytes], max_bytes: int, *, cap_name: str = "UPLOAD_MAX_BYTES"
+) -> AsyncIterator[bytes]:
     """A request body that stops at a size, for the multipart parser to read.
 
     The parser spools every file part to disk as it arrives with no cap of its own, and
     `store_upload` only sees the file once the whole body has been parsed. A request that
     declares no length — chunked, or simply lying — could therefore fill the upload
     directory long before anything answered 413. This is where that request stops.
+    `cap_name` is the setting the refusal names: an attachment's cap is not a parse's.
     """
     total = 0
     async for chunk in stream:
         total += len(chunk)
         if total > max_bytes:
-            raise ApiError(413, "invalid_request", "The upload exceeds UPLOAD_MAX_BYTES")
+            raise ApiError(413, "invalid_request", f"The upload exceeds {cap_name}")
         yield chunk
 
 
@@ -146,8 +149,8 @@ async def resolve_target(
 ) -> Target:
     """Upstream, model and prompt for a job of `agent`, from that agent's settings
     (docs/agents.md § Enqueue rules). A per-request `model` overrides the stored one; the
-    selected prompt preset replaces the agent's default template (docs/parsing.md §
-    Prompts)."""
+    user's own prompt — or a legacy preset — replaces the agent's default template
+    (docs/parsing.md § Prompts)."""
     row = (
         await db.execute(
             select(AgentSetting).where(
@@ -187,13 +190,24 @@ async def resolve_target(
             f"No model chosen for the {agent.name} agent: pick one on the Agent page or "
             f"pass 'model'",
         )
+    # The user's own prompt, else a legacy preset, else the default — each replacing the
+    # template whole (docs/parsing.md § Prompts).
     preset = row.prompt_preset if row else None
-    prompt = preset.text if preset else agent.default_prompt_template
+    if row is not None and row.prompt:
+        prompt = row.prompt
+    elif preset is not None:
+        prompt = preset.text
+    else:
+        prompt = agent.default_prompt_template
     return Target(agent.name, model, agent.bbox_format, prompt, connection_id, snapshot)
 
 
 async def store_upload(
-    chunks: AsyncIterator[bytes], destination: Path, max_bytes: int
+    chunks: AsyncIterator[bytes],
+    destination: Path,
+    max_bytes: int,
+    *,
+    cap_name: str = "UPLOAD_MAX_BYTES",
 ) -> tuple[int, str]:
     """Stream an upload to disk, hashing as it goes; the whole file never sits in memory."""
     digest = hashlib.sha256()
@@ -203,7 +217,7 @@ async def store_upload(
             async for chunk in chunks:
                 size += len(chunk)
                 if size > max_bytes:
-                    raise ApiError(413, "invalid_request", "The upload exceeds UPLOAD_MAX_BYTES")
+                    raise ApiError(413, "invalid_request", f"The upload exceeds {cap_name}")
                 digest.update(chunk)
                 handle.write(chunk)
     except BaseException:

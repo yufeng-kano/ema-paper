@@ -265,7 +265,7 @@ async def test_kano_proxy_migration_moves_settings_to_the_parse_agent(scratch_ur
         settings = (
             await db.execute(
                 text(
-                    "SELECT user_id, agent, connection_id, model, prompt_preset_id "
+                    "SELECT user_id, agent, connection_id, model, prompt_preset_id, prompt "
                     "FROM agent_settings ORDER BY user_id"
                 )
             )
@@ -306,10 +306,11 @@ async def test_kano_proxy_migration_moves_settings_to_the_parse_agent(scratch_ur
         ).all()
 
     assert [tuple(row) for row in settings] == [
-        # OpenRouter user: Kano Proxy, no model (its catalog is not OpenRouter's), preset kept.
-        (openrouter_user, "parse", None, None, preset_id),
+        # OpenRouter user: Kano Proxy, no model (its catalog is not OpenRouter's), preset kept
+        # — as the agent's own prompt since the agent prompt migration moved it there.
+        (openrouter_user, "parse", None, None, None, "Only tables."),
         # Connection user: the connection and the model it carried.
-        (connection_user, "parse", connection_id, "grok/grok-4.5", None),
+        (connection_user, "parse", connection_id, "grok/grok-4.5", None, None),
         # A user who selected neither connection nor preset gets no row (defaults).
     ]
     assert {"user_settings", "openrouter_keys"}.isdisjoint(tables)
@@ -425,4 +426,147 @@ async def test_chat_migration_backfills_the_agent_of_every_usage_row(scratch_url
     assert [tuple(row) for row in rows] == [("parse", None, 0, 0), ("parse", None, 0, 0)]
     assert effort == "medium"
     assert {"conversations", "messages", "chat_turns", "chat_events"} <= tables
+    await engine.dispose()
+
+
+BEFORE_AGENT_PROMPT = "d843179c6c58"
+AGENT_PROMPT = "90dc3c3c5c36"
+
+
+def _agent_prompt_migration():
+    import importlib.util
+
+    path = (
+        API_DIR
+        / "migrations"
+        / "versions"
+        / "90dc3c3c5c36_skills_subagents_attachments_and_agent_.py"
+    )
+    spec = importlib.util.spec_from_file_location("agent_prompt_migration", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+async def test_the_agent_prompt_migration_moves_every_selected_preset(scratch_url) -> None:
+    """From the last schema without `agent_settings.prompt`, with presets selected: a parse
+    preset becomes the parse prompt as it was, a chat preset the chat prompt behind that
+    release's default, the presets stay, unselected (docs/database.md § The agent prompt
+    migration) — and a downgrade takes back what the upgrade made."""
+    _alembic(scratch_url, "upgrade", BEFORE_AGENT_PROMPT)
+
+    engine = create_async_engine(scratch_url)
+    async with engine.begin() as db:
+
+        async def user(sub: str) -> int:
+            return (
+                await db.execute(
+                    text(
+                        "INSERT INTO users (google_sub, email, created_at) "
+                        "VALUES (:sub, :email, now()) RETURNING id"
+                    ),
+                    {"sub": sub, "email": f"{sub}@example.com"},
+                )
+            ).scalar_one()
+
+        async def preset(user_id: int, agent: str, name: str, body: str) -> int:
+            return (
+                await db.execute(
+                    text(
+                        "INSERT INTO prompt_presets (user_id, agent, name, text, created_at, "
+                        "updated_at) VALUES (:user, :agent, :name, :text, now(), now()) "
+                        "RETURNING id"
+                    ),
+                    {"user": user_id, "agent": agent, "name": name, "text": body},
+                )
+            ).scalar_one()
+
+        reader, plain = await user("reader"), await user("plain")
+        parse_preset = await preset(reader, "parse", "Tables", "  Only tables from page {page}. ")
+        chat_preset = await preset(reader, "chat", "Haiku", "Answer in haiku.")
+        await preset(plain, "parse", "Unused", "Never selected.")
+        for user_id, agent, chosen in (
+            (reader, "parse", parse_preset),
+            (reader, "chat", chat_preset),
+            (plain, "parse", None),
+        ):
+            await db.execute(
+                text(
+                    "INSERT INTO agent_settings (user_id, agent, model, prompt_preset_id) "
+                    "VALUES (:user, :agent, 'm', :preset)"
+                ),
+                {"user": user_id, "agent": agent, "preset": chosen},
+            )
+
+    _alembic(scratch_url, "upgrade", AGENT_PROMPT)
+
+    async with engine.connect() as db:
+        settings = {
+            (row.user_id, row.agent): (row.prompt, row.prompt_preset_id)
+            for row in (
+                await db.execute(
+                    text("SELECT user_id, agent, prompt, prompt_preset_id FROM agent_settings")
+                )
+            ).all()
+        }
+        presets = (await db.execute(text("SELECT count(*) FROM prompt_presets"))).scalar_one()
+    default = _agent_prompt_migration().CHAT_DEFAULT_PROMPT
+    assert default.startswith("You are the document agent inside Sightread")
+    assert settings == {
+        (reader, "parse"): ("Only tables from page {page}.", None),
+        (reader, "chat"): (f"{default.strip()}\n\nAnswer in haiku.", None),
+        (plain, "parse"): (None, None),
+    }
+    assert presets == 3
+
+    async with engine.begin() as db:
+        # The new tables take rows, and a user's names are their own.
+        await db.execute(
+            text(
+                "INSERT INTO skills (user_id, name, description, argument_hint, body, "
+                "created_at, updated_at) VALUES (:user, 'mine', '', '', 'x', now(), now())"
+            ),
+            {"user": reader},
+        )
+        defaults = (
+            await db.execute(text("SELECT user_invocable, model_invocable FROM skills"))
+        ).one()
+    assert tuple(defaults) == (True, True)
+    with pytest.raises(IntegrityError):
+        async with engine.begin() as db:
+            await db.execute(
+                text(
+                    "INSERT INTO skills (user_id, name, description, argument_hint, body, "
+                    "created_at, updated_at) VALUES (:user, 'mine', '', '', 'y', now(), now())"
+                ),
+                {"user": reader},
+            )
+
+    _alembic(scratch_url, "downgrade", BEFORE_AGENT_PROMPT)
+    async with engine.connect() as db:
+        tables = {
+            row[0]
+            for row in (
+                await db.execute(
+                    text(
+                        "SELECT table_name FROM information_schema.tables "
+                        "WHERE table_schema = 'public'"
+                    )
+                )
+            ).all()
+        }
+        columns = {
+            row[0]
+            for row in (
+                await db.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name = 'agent_settings'"
+                    )
+                )
+            ).all()
+        }
+    assert not {"skills", "subagents", "chat_attachments"} & tables
+    assert "prompt" not in columns
     await engine.dispose()

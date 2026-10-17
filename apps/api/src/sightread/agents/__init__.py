@@ -23,6 +23,8 @@ class AgentDefinition:
     input: str
     output: str
     default_prompt_template: str
+    # The tokens a template of this agent substitutes, the default's and a user's alike.
+    prompt_tokens: tuple[str, ...]
     # Part of the dedup key: moves when this agent's output for the same input would change.
     pipeline_version: int
     bbox_format: str
@@ -34,6 +36,7 @@ PARSE = AgentDefinition(
     input="document",
     output="markdown",
     default_prompt_template=parse.DEFAULT_PROMPT_TEMPLATE,
+    prompt_tokens=parse.PROMPT_TOKENS,
     pipeline_version=parse.PIPELINE_VERSION,
     bbox_format=parse.BBOX_FORMAT_YXYX,
 )
@@ -44,6 +47,7 @@ CHAT = AgentDefinition(
     input="document",
     output="edits",
     default_prompt_template=chat.DEFAULT_SYSTEM_PROMPT,
+    prompt_tokens=chat.PROMPT_TOKENS,
     pipeline_version=chat.PIPELINE_VERSION,
     bbox_format=chat.BBOX_FORMAT,
 )
