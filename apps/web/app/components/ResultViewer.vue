@@ -181,6 +181,7 @@ async function loadContent(replaceDirty: Replace = false) {
       // against the fresh text would land on whatever does now.
       if (editing.value !== null) {
         editing.value = null
+        joined.value = false
         draft.value = ''
       }
       markdown.value = content.markdown
@@ -363,9 +364,10 @@ function onNotesChange(markdown: string) {
 
 const notesEditor = ref<{ focus: (where?: 'start' | 'end') => void } | null>(null)
 
-/** A click below the last line of the notes still means "write here". */
+/** A click below the last line of the notes still means "write here" — a click inside the
+ *  editor, its TeX field included, is the editor's own. */
 function onNotesClick(event: MouseEvent) {
-  if (!(event.target instanceof Element) || !event.target.closest('.ProseMirror')) {
+  if (!(event.target instanceof Element) || !event.target.closest('.rich')) {
     notesEditor.value?.focus('end')
   }
 }
@@ -422,6 +424,10 @@ const draft = ref('')
 const editorSource = ref('')
 const editorCaret = ref<Caret | null>(null)
 const editorKey = ref(0)
+/** The open editor holds the block after the open one too — Backspace joined them. Both
+ *  are written back together when it closes, and until then the document keeps both, so
+ *  a reload that drops the draft never drops a block that was saved. */
+const joined = ref(false)
 /** A contents page opens as its lines (docs/web.md § Editing): the textarea for that one
  *  kind. A plain variable set through a function ref — there is only ever one. */
 let lineEditor: HTMLTextAreaElement | null = null
@@ -457,6 +463,7 @@ async function startEdit(pageIndex: number, blockIndex: number, caret: Caret = '
     return
   }
   editing.value = { page: pageIndex, index: blockIndex }
+  joined.value = false
   draft.value = block.src
   editorSource.value = block.kind === 'fig' ? (block.caption ?? '') : block.src
   editorCaret.value = caret
@@ -475,6 +482,7 @@ function startNewBlock(pageIndex: number) {
   }
   commitEdit()
   editing.value = { page: pageIndex, index: pages.value[pageIndex]?.blocks.length ?? 0 }
+  joined.value = false
   draft.value = ''
   editorSource.value = ''
   editorCaret.value = 'end'
@@ -496,7 +504,8 @@ function forgetPress() {
 
 function onBlockPress(event: MouseEvent, pageIndex: number, blockIndex: number) {
   const block = pages.value[pageIndex]?.blocks[blockIndex]
-  if (!block || !(event.currentTarget instanceof HTMLElement) || isEditing(pageIndex, blockIndex)) {
+  // The primary button only: a right-click is the browser's menu, a middle-click a scroll.
+  if (event.button !== 0 || !block || !(event.currentTarget instanceof HTMLElement) || isEditing(pageIndex, blockIndex)) {
     pressed = null
     return
   }
@@ -541,9 +550,10 @@ function onEditorChange(markdown: string) {
   draft.value = markdown
 }
 
-/** The source of the block under the open editor, or null when none is open. */
+/** The source of the block under the open editor, or null when none is open. Never the
+ *  draft while two blocks are joined: that draft is always unsaved work. */
 function openBlockSource(): string | null {
-  return editing.value ? (openBlock.value?.src ?? null) : null
+  return editing.value && !joined.value ? (openBlock.value?.src ?? null) : null
 }
 
 /** Renders the block again, and if its source changed, writes it into the document. */
@@ -561,6 +571,14 @@ function commitEdit() {
       markdown.value = appendBlockSource(markdown.value, open.page, draft.value)
       scheduleSave()
     }
+    return
+  }
+  if (joined.value) {
+    joined.value = false
+    // The later block first, so the open one's index still holds.
+    const without = replaceBlockSource(markdown.value, open.page, open.index + 1, '')
+    markdown.value = replaceBlockSource(without, open.page, open.index, draft.value)
+    scheduleSave()
     return
   }
   if (draft.value === block.src) {
@@ -607,14 +625,16 @@ function navigateFrom(direction: 'up' | 'down'): boolean {
   if (!open || !openBlock.value) {
     return false
   }
-  const target = neighbour(open.page, open.index, direction === 'up' ? -1 : 1)
+  // A joined editor spans the open block and the one after it.
+  const span = joined.value ? 2 : 1
+  const target = neighbour(open.page, open.index + (direction === 'up' ? 0 : span - 1), direction === 'up' ? -1 : 1)
   if (!target) {
     return false
   }
   // Written back, the open block may have become more blocks or none: a target after it
   // on its page moves by the difference.
   if (direction === 'down' && target.page === open.page) {
-    target.index += draftBlockCount() - 1
+    target.index += draftBlockCount() - span
   }
   commitEdit()
   void startEdit(target.page, target.index, direction === 'up' ? 'end' : 'start')
@@ -631,18 +651,22 @@ function mergeBack(current: string): boolean {
   }
   const previous = pages.value[open.page]?.blocks[open.index - 1]
   const empty = current.trim() === ''
-  if (!previous || (!empty && !(JOINABLE.has(block.kind) && JOINABLE.has(previous.kind)))) {
+  // A joined editor already spans two blocks; joining a third is a second Backspace's
+  // job once this one is written back.
+  if (joined.value || !previous || (!empty && !(JOINABLE.has(block.kind) && JOINABLE.has(previous.kind)))) {
     return false
   }
-  // The open block is consumed, not committed: its text travels into the one before.
-  editing.value = null
-  markdown.value = replaceBlockSource(markdown.value, open.page, open.index, '')
-  scheduleSave()
   if (empty) {
+    // An emptied block is deleted, as leaving it would; the caret goes to the one before.
+    draft.value = ''
+    commitEdit()
     void startEdit(open.page, open.index - 1, 'end')
     return true
   }
+  // The open block's text travels into the one before: both stay in the document until
+  // the joined editor is written back (`joined`).
   editing.value = { page: open.page, index: open.index - 1 }
+  joined.value = true
   // Both blocks, so a reader who leaves at once still keeps every word; the editor joins
   // them at the seam as it opens.
   draft.value = `${previous.src}\n\n${current}`

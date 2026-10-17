@@ -60,6 +60,9 @@ const SourceAttributes = Extension.create({
         attributes: {
           src: { default: null, rendered: false, parseHTML: () => null, keepOnSplit: true },
           canon: { default: null, rendered: false, parseHTML: () => null, keepOnSplit: true },
+          // The whitespace before the block in its file. Not kept by a split: the new half
+          // is a new block, and gets the default gap.
+          lead: { default: null, rendered: false, parseHTML: () => null, keepOnSplit: false },
         },
       },
     ]

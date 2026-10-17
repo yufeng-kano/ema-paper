@@ -58,6 +58,8 @@ let editor: Editor | null = null
 let closing = false
 /** What this editor last emitted, so a notes reload of the same text is not a reload. */
 let emitted: string | null = null
+/** What the file ended with (a final newline, say): kept when the file is written back. */
+let trailing = /\s*$/.exec(props.source)?.[0] ?? ''
 
 // --- the TeX field -------------------------------------------------------------------
 
@@ -156,8 +158,11 @@ function onKey(event: KeyboardEvent): boolean {
     return false
   }
   if (event.key === 'Escape') {
-    // The editor's Escape, not the dialog's.
+    // The editor's Escape, not the dialog's: it leaves the text, and the next one closes.
     event.stopPropagation()
+    if (props.variant === 'notes') {
+      editor.commands.blur()
+    }
     emit('leave')
     return true
   }
@@ -258,8 +263,18 @@ onMounted(() => {
       if (!transaction.docChanged) {
         return
       }
-      emitted = docToMarkdown(current.getJSON())
+      // The TeX field follows its formula as text before it changes.
+      if (math.value) {
+        math.value.pos = transaction.mapping.map(math.value.pos)
+      }
+      emitted = docToMarkdown(current.getJSON(), props.variant === 'notes' ? trailing : '')
       emit('change', emitted)
+    },
+    // Back in the text, the TeX field is done with: a click away closes it.
+    onFocus: () => {
+      if (math.value) {
+        closeMath(false)
+      }
     },
     onBlur: ({ event }) => {
       // Into the TeX field is still inside the editor.
@@ -283,6 +298,7 @@ watch(
       return
     }
     emitted = null
+    trailing = /\s*$/.exec(source)?.[0] ?? ''
     editor.commands.setContent(markdownToDoc(source), { emitUpdate: false })
   },
 )

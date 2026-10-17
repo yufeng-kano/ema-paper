@@ -89,6 +89,12 @@ function opensMath(line: string): boolean {
 const TOC_PAGE = String.raw`(?:\*\*|__)?(?:\d+|[ivxlcdm]+)(?:\*\*|__)?`
 /** `Title . . . . 13` / `Title.....13`: a dot leader of four or more, then the page. */
 const TOC_LEADER = new RegExp(String.raw`^(.*?\S)(\s*(?:\.\s*){4,})(${TOC_PAGE})$`, 'i')
+/** Whether a line would be read as a contents row — what an editor writing prose must
+ *  escape so a typed `Wait.... 5` stays a sentence. */
+export function readsAsTocRow(line: string): boolean {
+  return TOC_LEADER.test(line)
+}
+
 /** A row of the same run without a leader — `**1 Introduction** **13**`. Digits only:
  *  with no leader to vouch for it, a trailing "mix" or "civil" is a word, not a numeral. */
 const TOC_BARE = /^(.*?\S)(\s+)((?:\*\*|__)?\d+(?:\*\*|__)?)$/

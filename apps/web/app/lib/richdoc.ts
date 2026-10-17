@@ -21,6 +21,7 @@ import {
   mathSpanAt,
   parseInline,
   parseResultMarkdown,
+  readsAsTocRow,
   type InlineSegment,
   type ResultBlock,
 } from './markdown'
@@ -120,33 +121,50 @@ function blockNode(block: ResultBlock): JSONContent {
   }
 }
 
-/** The editor's document for a run of blocks. Never empty: an editor needs a textblock. */
-export function blocksToDoc(blocks: ResultBlock[]): JSONContent {
-  const content = blocks.map((block) => {
+/** The editor's document for a run of blocks. Never empty: an editor needs a textblock.
+ *  `leads` is the whitespace before each block in the file it came from (`markdownToDoc`). */
+export function blocksToDoc(blocks: ResultBlock[], leads: (string | null)[] = []): JSONContent {
+  const content = blocks.map((block, index) => {
     const node = blockNode(block)
-    return { ...node, attrs: { ...node.attrs, src: block.src, canon: serializeNode(node) } }
+    const lead = leads[index] ?? null
+    return { ...node, attrs: { ...node.attrs, src: block.src, canon: serializeNode(node), lead } }
   })
   return { type: 'doc', content: content.length ? content : [{ type: 'paragraph' }] }
 }
 
-const PAGE_MARKER_LINE = /^\s*<!--\s*page:\s*\d+\s*-->\s*$/m
+const PAGE_MARKER_LINE = /^\s*<!--\s*page:\s*\d+\s*-->\s*$/
 
 /**
  * The editor's document for a markdown string — one block's source, or a whole notes file.
- * A file with page markers keeps them, as source the editor carries through untouched: the
- * notes editor rewrites the whole file, and a marker is part of it.
+ *
+ * The notes editor writes the whole file back, so what lies between blocks is kept too: a
+ * page marker the file carries rides through as its own line, and the whitespace before
+ * each block is remembered (`lead`) so an edit elsewhere does not respace the file.
  */
 export function markdownToDoc(markdown: string): JSONContent {
-  const pages = parseResultMarkdown(markdown)
-  if (!PAGE_MARKER_LINE.test(markdown)) {
-    return blocksToDoc(pages.flatMap((page) => page.blocks))
+  const source = markdown.replace(/\r\n?/g, '\n')
+  const markers = [...source.matchAll(/^[ \t]*(<!--\s*page:\s*(\d+)\s*-->)[ \t]*$/gm)]
+  const blocks: ResultBlock[] = []
+  for (const page of parseResultMarkdown(source)) {
+    // Only a marker the file has: the parser opens page 1 for content before any marker.
+    const marker = markers.find((match) => Number(match[2]) === page.page)
+    if (marker) {
+      blocks.push({ kind: 'comment', src: marker[1] ?? '' })
+    }
+    blocks.push(...page.blocks)
   }
-  return blocksToDoc(
-    pages.flatMap((page) => {
-      const marker = `<!-- page: ${page.page} -->`
-      return [{ kind: 'comment' as const, src: marker }, ...page.blocks]
-    }),
-  )
+  const leads: (string | null)[] = []
+  let cursor = 0
+  for (const block of blocks) {
+    const at = source.indexOf(block.src, cursor)
+    if (at === -1) {
+      leads.push(null)
+      continue
+    }
+    leads.push(source.slice(cursor, at))
+    cursor = at + block.src.length
+  }
+  return blocksToDoc(blocks, leads)
 }
 
 // --- content -> markdown -----------------------------------------------------------------
@@ -235,10 +253,14 @@ export function serializeInline(content: JSONContent[] = [], inTable = false): s
       }
       // Whitespace stays outside the markers: `** bold**` opens nothing.
       const [, lead = '', body = '', trail = ''] = /^(\s*)([\s\S]*?)(\s*)$/.exec(text) ?? []
+      // A literal dollar right before a formula would become its opener (`price $$x$`).
+      const beforeMath = runs[index + 1]?.type === 'inlineMath' && !trail
+      const escapeEnd = (value: string) =>
+        beforeMath && value.endsWith('$') && !value.endsWith('\\$') ? `${value.slice(0, -1)}\\$` : value
       if (!body) {
         return escapeText(text, inTable)
       }
-      let inner = escapeText(body, inTable)
+      let inner = escapeEnd(escapeText(body, inTable))
       if (marks.includes('italic')) {
         inner = `*${inner}*`
       }
@@ -252,7 +274,12 @@ export function serializeInline(content: JSONContent[] = [], inTable = false): s
 
 /** A paragraph's line, with a leading character escaped where it would start a block. */
 function paragraphLine(content: JSONContent[] | undefined): string {
-  const line = serializeInline(content)
+  let line = serializeInline(content)
+  // A sentence ending in a dot leader and a number would read back as a contents row; one
+  // escaped dot breaks the leader and still renders as a dot.
+  if (readsAsTocRow(line)) {
+    line = line.replace(/\.(\s*\S+)$/, '\\.$1')
+  }
   if (/^(#|[-+*]\s|\d{1,9}[.)]\s|\$\$|```|~~~|<!--|!\[)/.test(line)) {
     const marker = /^\d{1,9}/.exec(line)
     return marker ? `${marker[0]}\\${line.slice(marker[0].length)}` : `\\${line}`
@@ -352,9 +379,13 @@ export function serializeNode(node: JSONContent): string {
       return latex ? `$$\n${latex}\n$$` : ''
     }
     case 'codeBlock': {
-      const text = (node.content ?? []).map((child) => child.text ?? '').join('')
-      const fence = /^```/m.test(text) ? '~~~' : '```'
-      return `${fence}${String(node.attrs?.language ?? '')}\n${text}\n${fence}`
+      // The parser closes a code block on any fence line, whatever opened it, so a fence
+      // inside the code is kept from closing it by a zero-width space in front.
+      const text = (node.content ?? [])
+        .map((child) => child.text ?? '')
+        .join('')
+        .replace(/^(\s*)(```|~~~)/gm, '$1\u200b$2')
+      return `\`\`\`${String(node.attrs?.language ?? '')}\n${text}\n\`\`\``
     }
     case 'rawBlock':
       return String(node.attrs?.source ?? '')
@@ -378,23 +409,28 @@ function collectItems(item: JSONContent): string[] {
 
 /**
  * The editor's document as markdown: unchanged blocks as the bytes they came from, changed
- * ones in canonical form, blocks separated by one blank line, empty ones dropped — emptying
- * a block deletes it.
+ * ones in canonical form, empty ones dropped — emptying a block deletes it. Blocks are
+ * separated by the whitespace the file had before them (`lead`), one blank line for a block
+ * that is new, a single newline under a page marker; `trailing` is what the file ended with.
  */
-export function docToMarkdown(doc: JSONContent): string {
-  const parts = (doc.content ?? [])
-    .map((node) => {
-      const fresh = serializeNode(node)
-      const { src, canon } = node.attrs ?? {}
-      return typeof src === 'string' && typeof canon === 'string' && fresh === canon ? src : fresh
-    })
-    .filter((markdown) => markdown.trim() !== '')
-  // A page marker sits directly over its first block, as `serializeDocument` writes it.
-  return parts.reduce(
-    (out, part, index) =>
-      index === 0 ? part : `${out}${PAGE_MARKER_LINE.test(parts[index - 1] ?? '') ? '\n' : '\n\n'}${part}`,
-    '',
-  )
+export function docToMarkdown(doc: JSONContent, trailing = ''): string {
+  let out = ''
+  let previous = ''
+  for (const node of doc.content ?? []) {
+    const fresh = serializeNode(node)
+    const { src, canon, lead } = node.attrs ?? {}
+    const markdown = typeof src === 'string' && typeof canon === 'string' && fresh === canon ? src : fresh
+    if (markdown.trim() === '') {
+      continue
+    }
+    if (out) {
+      const gap = typeof lead === 'string' && /\n/.test(lead) ? lead : PAGE_MARKER_LINE.test(previous) ? '\n' : '\n\n'
+      out += gap
+    }
+    out += markdown
+    previous = markdown
+  }
+  return out ? `${out}${trailing}` : ''
 }
 
 /**
