@@ -515,7 +515,7 @@ export type InlineSegment =
  * leading or trailing space, and never closes on a dollar followed by a digit, so
  * "$5 and $6" stays two prices.
  */
-function mathSpanAt(text: string, open: number): { tex: string; length: number } | null {
+export function mathSpanAt(text: string, open: number): { tex: string; length: number } | null {
   let depth = 0
   for (let index = open + 1; index < text.length; index += 1) {
     const char = text[index]

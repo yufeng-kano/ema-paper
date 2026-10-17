@@ -17,6 +17,7 @@ import {
   type Bbox,
   type ResultBlock,
 } from '~/lib/markdown'
+import type { Caret } from '~/lib/rich-extensions'
 
 /**
  * Module scope, not component state: the rail, the notes column and the agent panel are
@@ -27,6 +28,21 @@ import {
 const railOpen = ref(false)
 const notesOpen = ref(false)
 const agentOpen = ref(false)
+
+/** The side columns' widths, dragged by the rule on their left edge (docs/web.md § Column
+ *  widths) — a reading preference like the three above, with the same lifetime. */
+const COLUMN_WIDTHS = {
+  notes: { initial: 320, min: 240, max: 560 },
+  agent: { initial: 360, min: 300, max: 640 },
+} as const
+const columnWidth = { notes: ref<number>(COLUMN_WIDTHS.notes.initial), agent: ref<number>(COLUMN_WIDTHS.agent.initial) }
+/** The document pane never gets narrower than this to make room for a dragged column. */
+const PANE_MIN_WIDTH = 360
+
+/** The block kinds the rich editor opens in place; the rest have their own path. */
+const RICH_KINDS = new Set<ResultBlock['kind']>(['p', 'h2', 'h3', 'list', 'table', 'math', 'code'])
+/** The kinds Backspace can join: text blocks, one into the one before. */
+const JOINABLE = new Set<ResultBlock['kind']>(['p', 'h2', 'h3'])
 
 /** How long after the last change a save is sent (docs/web.md § Editing). */
 const SAVE_DEBOUNCE_MS = 1200
@@ -339,29 +355,18 @@ async function saveNotes() {
   }
 }
 
-const notesEditing = ref(false)
-const notesEditor = ref<HTMLTextAreaElement | null>(null)
-const notesPages = computed(() => (notesEditing.value ? [] : parseResultMarkdown(notes.value)))
-
-async function startNotes() {
-  if (!editable.value) {
-    return
-  }
-  notesEditing.value = true
-  await nextTick()
-  notesEditor.value?.focus()
-}
-
-function onNotesInput() {
+/** The notes editor's change: the file's new markdown, saved on the debounce. */
+function onNotesChange(markdown: string) {
+  notes.value = markdown
   scheduleNotesSave()
 }
 
-function onNotesKey(event: KeyboardEvent) {
-  if (event.key === 'Escape' || (event.key === 'Enter' && (event.ctrlKey || event.metaKey))) {
-    // The dialog closes on Escape too; this one is the editor's.
-    event.stopPropagation()
-    event.preventDefault()
-    notesEditing.value = false
+const notesEditor = ref<{ focus: (where?: 'start' | 'end') => void } | null>(null)
+
+/** A click below the last line of the notes still means "write here". */
+function onNotesClick(event: MouseEvent) {
+  if (!(event.target instanceof Element) || !event.target.closest('.ProseMirror')) {
+    notesEditor.value?.focus('end')
   }
 }
 
@@ -408,67 +413,98 @@ onBeforeUnmount(() => {
 
 // --- block editing -------------------------------------------------------------------
 
-/** The block whose source is open, by position; null while every block is rendered. */
+/** The open block, by position; null while every block is rendered. */
 const editing = ref<{ page: number; index: number } | null>(null)
+/** The open block's markdown as it now stands — its `src` until the reader changes it. */
 const draft = ref('')
-/** The open block's textarea. A plain variable set through a function ref: a `ref`
- *  attribute inside `v-for` collects an array, and there is only ever one of these. */
-let editor: HTMLTextAreaElement | null = null
+/** What the open editor was loaded with, and where its caret goes. Set once per opening:
+ *  the editor reads them on mount, and `editorKey` remounts it for the next block. */
+const editorSource = ref('')
+const editorCaret = ref<Caret | null>(null)
+const editorKey = ref(0)
+/** A contents page opens as its lines (docs/web.md § Editing): the textarea for that one
+ *  kind. A plain variable set through a function ref — there is only ever one. */
+let lineEditor: HTMLTextAreaElement | null = null
 
-function setEditor(el: Element | ComponentPublicInstance | null) {
-  editor = el instanceof HTMLTextAreaElement ? el : null
+function setLineEditor(el: Element | ComponentPublicInstance | null) {
+  lineEditor = el instanceof HTMLTextAreaElement ? el : null
 }
 
 function isEditing(pageIndex: number, blockIndex: number): boolean {
   return editing.value?.page === pageIndex && editing.value.index === blockIndex
 }
 
-async function startEdit(pageIndex: number, blockIndex: number) {
+/** The open block, or undefined for the editor past the last block of a page. */
+const openBlock = computed(() => {
+  const open = editing.value
+  return open ? pages.value[open.page]?.blocks[open.index] : undefined
+})
+
+/** The first line of a figure block: its placeholder, which the caption editor keeps. */
+function figurePlaceholder(block: ResultBlock): string {
+  return block.src.split('\n')[0] ?? ''
+}
+
+async function startEdit(pageIndex: number, blockIndex: number, caret: Caret = 'end') {
   if (!editable.value || isEditing(pageIndex, blockIndex)) {
     return
   }
-  // Removing a focused textarea does not reliably blur it, so the open block is closed
-  // by hand before the next one opens.
+  // Leaving the open block re-parses the document, which can move the one asked for —
+  // the caller passes indices that already account for that.
   commitEdit()
   const block = pages.value[pageIndex]?.blocks[blockIndex]
-  if (!block) {
+  if (!block || block.kind === 'comment') {
     return
   }
   editing.value = { page: pageIndex, index: blockIndex }
   draft.value = block.src
-  await nextTick()
-  editor?.focus()
+  editorSource.value = block.kind === 'fig' ? (block.caption ?? '') : block.src
+  editorCaret.value = caret
+  editorKey.value += 1
+  if (block.kind === 'toc') {
+    await nextTick()
+    lineEditor?.focus()
+  }
 }
 
 /** A page emptied of its blocks, or a document with none: text comes back through an
  *  editor opened past the last block — index `blocks.length`, which no block holds. */
-async function startNewBlock(pageIndex: number) {
+function startNewBlock(pageIndex: number) {
   if (!editable.value) {
     return
   }
   commitEdit()
   editing.value = { page: pageIndex, index: pages.value[pageIndex]?.blocks.length ?? 0 }
   draft.value = ''
-  await nextTick()
-  editor?.focus()
+  editorSource.value = ''
+  editorCaret.value = 'end'
+  editorKey.value += 1
 }
 
-/** A click that ends a text selection is a selection, not a request to edit. */
-function onBlockClick(pageIndex: number, blockIndex: number) {
+/** A click opens the block with the caret where the click landed — unless it ended a text
+ *  selection, which is a selection, not a request to edit. */
+function onBlockClick(event: MouseEvent, pageIndex: number, blockIndex: number) {
   const selection = window.getSelection()
-  if (selection && !selection.isCollapsed) {
+  if (isEditing(pageIndex, blockIndex) || (selection && !selection.isCollapsed)) {
     return
   }
-  void startEdit(pageIndex, blockIndex)
+  void startEdit(pageIndex, blockIndex, { x: event.clientX, y: event.clientY })
+}
+
+/** The open editor's markdown. A caption is one line under the figure's placeholder. */
+function onEditorChange(markdown: string) {
+  const block = openBlock.value
+  if (block?.kind === 'fig') {
+    const caption = markdown.replace(/\s*\n+\s*/g, ' ').trim()
+    draft.value = caption ? `${figurePlaceholder(block)}\n${caption}` : figurePlaceholder(block)
+    return
+  }
+  draft.value = markdown
 }
 
 /** The source of the block under the open editor, or null when none is open. */
 function openBlockSource(): string | null {
-  const open = editing.value
-  if (!open) {
-    return null
-  }
-  return pages.value[open.page]?.blocks[open.index]?.src ?? null
+  return editing.value ? (openBlock.value?.src ?? null) : null
 }
 
 /** Renders the block again, and if its source changed, writes it into the document. */
@@ -495,7 +531,89 @@ function commitEdit() {
   scheduleSave()
 }
 
-function onEditorKey(event: KeyboardEvent) {
+/** The nearest block before or after one, across page markers, that a reader can open —
+ *  a comment is drawn as nothing and is stepped over. */
+function neighbour(pageIndex: number, blockIndex: number, step: -1 | 1): { page: number; index: number } | null {
+  let page = pageIndex
+  let index = blockIndex + step
+  while (page >= 0 && page < pages.value.length) {
+    const blocks = pages.value[page]?.blocks ?? []
+    if (index < 0) {
+      page -= 1
+      index = (pages.value[page]?.blocks.length ?? 0) - 1
+    } else if (index >= blocks.length) {
+      page += 1
+      index = 0
+    } else if (blocks[index]?.kind === 'comment') {
+      index += step
+    } else {
+      return { page, index }
+    }
+  }
+  return null
+}
+
+/** How many blocks the open draft becomes once it is written back. */
+function draftBlockCount(): number {
+  if (draft.value === openBlockSource()) {
+    return 1
+  }
+  return parseResultMarkdown(draft.value).reduce((total, page) => total + page.blocks.length, 0)
+}
+
+/** ArrowUp on the first line or ArrowDown on the last: into the block beside it, caret
+ *  and all (docs/web.md § Editing). */
+function navigateFrom(direction: 'up' | 'down'): boolean {
+  const open = editing.value
+  if (!open || !openBlock.value) {
+    return false
+  }
+  const target = neighbour(open.page, open.index, direction === 'up' ? -1 : 1)
+  if (!target) {
+    return false
+  }
+  // Written back, the open block may have become more blocks or none: a target after it
+  // on its page moves by the difference.
+  if (direction === 'down' && target.page === open.page) {
+    target.index += draftBlockCount() - 1
+  }
+  commitEdit()
+  void startEdit(target.page, target.index, direction === 'up' ? 'end' : 'start')
+  return true
+}
+
+/** Backspace at the very start of a block: join it to the text block before it on the
+ *  same page, or — emptied — remove it and continue at the end of the one before. */
+function mergeBack(current: string): boolean {
+  const open = editing.value
+  const block = openBlock.value
+  if (!open || !block || open.index === 0) {
+    return false
+  }
+  const previous = pages.value[open.page]?.blocks[open.index - 1]
+  const empty = current.trim() === ''
+  if (!previous || (!empty && !(JOINABLE.has(block.kind) && JOINABLE.has(previous.kind)))) {
+    return false
+  }
+  // The open block is consumed, not committed: its text travels into the one before.
+  editing.value = null
+  markdown.value = replaceBlockSource(markdown.value, open.page, open.index, '')
+  scheduleSave()
+  if (empty) {
+    void startEdit(open.page, open.index - 1, 'end')
+    return true
+  }
+  editing.value = { page: open.page, index: open.index - 1 }
+  // Both blocks, so a reader who leaves at once still keeps every word; the editor joins
+  // them at the seam as it opens.
+  draft.value = `${previous.src}\n\n${current}`
+  editorSource.value = draft.value
+  editorCaret.value = 'join'
+  editorKey.value += 1
+  return true
+}
+
+function onLineEditorKey(event: KeyboardEvent) {
   if (event.key === 'Escape' || (event.key === 'Enter' && (event.ctrlKey || event.metaKey))) {
     event.stopPropagation()
     event.preventDefault()
@@ -503,12 +621,55 @@ function onEditorKey(event: KeyboardEvent) {
   }
 }
 
-/** Enough rows for the source plus one to type into — the textarea does not scroll. */
-const editorRows = computed(() => {
-  const lines = draft.value.split('\n')
-  const wrapped = lines.reduce((total, line) => total + Math.max(1, Math.ceil(line.length / 90)), 0)
-  return Math.max(2, wrapped + 1)
-})
+/** Enough rows for the lines plus one to type into — the textarea does not scroll. */
+const lineEditorRows = computed(() => Math.max(2, draft.value.split('\n').length + 1))
+
+// --- column widths -----------------------------------------------------------------------
+
+const columnsBox = ref<HTMLElement | null>(null)
+let resizing: { column: 'notes' | 'agent'; x: number; width: number } | null = null
+
+/** The widest a column may be right now: its own cap, and whatever leaves the document
+ *  pane its minimum beside the other column. */
+function columnMax(column: 'notes' | 'agent'): number {
+  const other = column === 'notes' ? 'agent' : 'notes'
+  const otherOpen = other === 'notes' ? notesOpen.value : agentOpen.value
+  const total = columnsBox.value?.clientWidth ?? Number.POSITIVE_INFINITY
+  const room = total - PANE_MIN_WIDTH - (otherOpen ? columnWidth[other].value : 0)
+  return Math.max(COLUMN_WIDTHS[column].min, Math.min(COLUMN_WIDTHS[column].max, room))
+}
+
+function setColumnWidth(column: 'notes' | 'agent', width: number) {
+  columnWidth[column].value = Math.round(Math.min(columnMax(column), Math.max(COLUMN_WIDTHS[column].min, width)))
+}
+
+function startResize(event: PointerEvent, column: 'notes' | 'agent') {
+  if (event.button !== 0 || !(event.currentTarget instanceof HTMLElement)) {
+    return
+  }
+  event.preventDefault()
+  event.currentTarget.setPointerCapture(event.pointerId)
+  resizing = { column, x: event.clientX, width: columnWidth[column].value }
+}
+
+function onResize(event: PointerEvent) {
+  if (resizing) {
+    // The column sits right of its rule: dragging the rule left widens it.
+    setColumnWidth(resizing.column, resizing.width - (event.clientX - resizing.x))
+  }
+}
+
+function endResize() {
+  resizing = null
+}
+
+function onResizeKey(event: KeyboardEvent, column: 'notes' | 'agent') {
+  const step = event.shiftKey ? 64 : 16
+  if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+    event.preventDefault()
+    setColumnWidth(column, columnWidth[column].value + (event.key === 'ArrowLeft' ? step : -step))
+  }
+}
 
 /** The document's current selection as text, for the agent — null when there is none or
  *  it lies outside the document pane. */
@@ -794,7 +955,8 @@ function partialMathBlocks(selection: Selection): Set<string> {
 /** Ctrl+C inside the document copies markdown, tables included (docs/web.md). A copy
  *  from inside an open block editor is the textarea's own, and is left to it. */
 function onCopy(event: ClipboardEvent) {
-  if (event.target instanceof HTMLTextAreaElement) {
+  // A textarea copies its text; an open rich editor has already written markdown.
+  if (event.defaultPrevented || event.target instanceof HTMLTextAreaElement) {
     return
   }
   const selection = window.getSelection()
@@ -1005,7 +1167,7 @@ const awaitingContent = computed(
         </div>
 
         <!-- The document pane and, beside it, the columns the header toggles. -->
-        <div class="columns">
+        <div ref="columnsBox" class="columns">
           <!-- The rail and the find bar are positioned against this, not laid out in it. -->
           <div class="pane">
             <nav v-if="railOpen" class="page-rail" :aria-label="t('viewer.pagesLabel')">
@@ -1038,16 +1200,15 @@ const awaitingContent = computed(
               <!-- A document with no page at all: one editor, which makes page 1. -->
               <section v-if="editable && !pages.length" class="page">
                 <article class="prose">
-                  <textarea
+                  <RichEditor
                     v-if="isEditing(0, 0)"
-                    :ref="setEditor"
-                    v-model="draft"
-                    class="block-editor mono"
-                    :rows="editorRows"
-                    :aria-label="t('viewer.blockSource')"
-                    spellcheck="false"
-                    @blur="commitEdit"
-                    @keydown="onEditorKey"
+                    :key="editorKey"
+                    :source="editorSource"
+                    :caret="editorCaret"
+                    :placeholder="t('viewer.blockPlaceholder')"
+                    :label="t('viewer.blockSource')"
+                    @change="onEditorChange"
+                    @leave="commitEdit"
                   />
                   <button v-else type="button" class="block-add" @click="startNewBlock(0)">
                     {{ t('viewer.blockAdd') }}
@@ -1061,28 +1222,65 @@ const awaitingContent = computed(
                 class="page"
               >
                 <article class="prose">
-                  <!-- Every block is markdown: clicked, it opens as its source; left, it
-                       renders again (docs/web.md § Editing). Read-only without a document. -->
+                  <!-- Every block is edited in place: clicked, it becomes a rich editor drawn
+                       exactly as it was read, caret where the click landed; left, it renders
+                       again (docs/web.md § Editing). Read-only without a document. -->
                   <div
                     v-for="(block, index) in page.blocks"
                     :key="index"
                     class="block"
                     :class="{ editable, open: isEditing(pageIndex, index) }"
                     :tabindex="editable && !isEditing(pageIndex, index) ? 0 : undefined"
-                    @click="editable && onBlockClick(pageIndex, index)"
+                    @click="editable && onBlockClick($event, pageIndex, index)"
                     @keydown.enter.self.prevent="startEdit(pageIndex, index)"
                   >
-                    <textarea
-                      v-if="isEditing(pageIndex, index)"
-                      :ref="setEditor"
-                      v-model="draft"
-                      class="block-editor mono"
-                      :rows="editorRows"
-                      :aria-label="t('viewer.blockSource')"
-                      spellcheck="false"
-                      @blur="commitEdit"
-                      @keydown="onEditorKey"
-                    />
+                    <template v-if="isEditing(pageIndex, index)">
+                      <RichEditor
+                        v-if="RICH_KINDS.has(block.kind)"
+                        :key="editorKey"
+                        :source="editorSource"
+                        :caret="editorCaret"
+                        :label="t('viewer.blockSource')"
+                        :on-navigate="navigateFrom"
+                        :on-merge="mergeBack"
+                        @change="onEditorChange"
+                        @leave="commitEdit"
+                      />
+                      <!-- A figure: the image stays an image, its caption is edited as a
+                           line of text under it. -->
+                      <div v-else-if="block.kind === 'fig'" class="figure-edit">
+                        <MdBlock
+                          :block="{ ...block, caption: null }"
+                          :page="page.page"
+                          :figure-url="figureUrl(page.page, block)"
+                          @figure-error="onFigureError"
+                        />
+                        <RichEditor
+                          :key="editorKey"
+                          class="caption-editor"
+                          :source="editorSource"
+                          :caret="editorCaret"
+                          :placeholder="t('viewer.captionPlaceholder')"
+                          :label="t('viewer.captionSource')"
+                          single-line
+                          :on-navigate="navigateFrom"
+                          @change="onEditorChange"
+                          @leave="commitEdit"
+                        />
+                      </div>
+                      <!-- A contents page has no rich-text form: its lines, in the prose face. -->
+                      <textarea
+                        v-else
+                        :ref="setLineEditor"
+                        v-model="draft"
+                        class="block-editor"
+                        :rows="lineEditorRows"
+                        :aria-label="t('viewer.blockSource')"
+                        spellcheck="false"
+                        @blur="commitEdit"
+                        @keydown="onLineEditorKey"
+                      />
+                    </template>
                     <MdBlock
                       v-else
                       :block="block"
@@ -1095,16 +1293,15 @@ const awaitingContent = computed(
                        § Editing): an editor past the last block, or the control that
                        opens one. -->
                   <template v-if="editable && !page.blocks.length">
-                    <textarea
+                    <RichEditor
                       v-if="isEditing(pageIndex, 0)"
-                      :ref="setEditor"
-                      v-model="draft"
-                      class="block-editor mono"
-                      :rows="editorRows"
-                      :aria-label="t('viewer.blockSource')"
-                      spellcheck="false"
-                      @blur="commitEdit"
-                      @keydown="onEditorKey"
+                      :key="editorKey"
+                      :source="editorSource"
+                      :caret="editorCaret"
+                      :placeholder="t('viewer.blockPlaceholder')"
+                      :label="t('viewer.blockSource')"
+                      @change="onEditorChange"
+                      @leave="commitEdit"
                     />
                     <button
                       v-else
@@ -1125,45 +1322,67 @@ const awaitingContent = computed(
             </div>
           </div>
 
-          <!-- Notes: markdown too. Rendered until clicked, source while editing
+          <!-- Notes: the same in-place editor over the whole file, always open
                (docs/web.md § Notes). No title row, no toolbar — the column is the notes. -->
-          <aside v-if="editable && notesOpen" class="notes" :aria-label="t('viewer.notesLabel')">
-            <textarea
-              v-if="notesEditing"
-              ref="notesEditor"
-              v-model="notes"
-              class="notes-editor mono"
-              :aria-label="t('viewer.notesSource')"
-              :placeholder="t('viewer.notesPlaceholder')"
-              spellcheck="false"
-              @input="onNotesInput"
-              @blur="notesEditing = false"
-              @keydown="onNotesKey"
-            />
+          <template v-if="editable && notesOpen">
             <div
-              v-else
-              class="notes-view"
+              class="split"
+              role="separator"
               tabindex="0"
-              :title="t('viewer.notesEdit')"
-              @click="startNotes"
-              @keydown.enter.self.prevent="startNotes"
+              aria-orientation="vertical"
+              :aria-label="t('viewer.resizeNotes')"
+              :aria-valuenow="columnWidth.notes.value"
+              :aria-valuemin="COLUMN_WIDTHS.notes.min"
+              :aria-valuemax="COLUMN_WIDTHS.notes.max"
+              @pointerdown="startResize($event, 'notes')"
+              @pointermove="onResize"
+              @pointerup="endResize"
+              @pointercancel="endResize"
+              @dblclick="columnWidth.notes.value = COLUMN_WIDTHS.notes.initial"
+              @keydown="onResizeKey($event, 'notes')"
+            />
+            <aside
+              class="notes"
+              :style="{ '--column-width': `${columnWidth.notes.value}px` }"
+              :aria-label="t('viewer.notesLabel')"
             >
-              <template v-if="notesPages.some((page) => page.blocks.length)">
-                <template v-for="page in notesPages" :key="page.page">
-                  <MdBlock
-                    v-for="(block, index) in page.blocks"
-                    :key="index"
-                    :block="block"
-                    :page="page.page"
-                  />
-                </template>
-              </template>
-              <span v-else class="notes-empty">{{ t('viewer.notesPlaceholder') }}</span>
-            </div>
-          </aside>
+              <div class="notes-view" @click="onNotesClick">
+                <RichEditor
+                  ref="notesEditor"
+                  variant="notes"
+                  :source="notes"
+                  :placeholder="t('viewer.notesPlaceholder')"
+                  :label="t('viewer.notesLabel')"
+                  @change="onNotesChange"
+                />
+              </div>
+            </aside>
+          </template>
 
           <!-- The agent's thread about this document (docs/web.md § The agent panel). -->
-          <aside v-if="editable && agentOpen && documentId !== null" class="agent" :aria-label="t('chat.panel')">
+          <div
+            v-if="editable && agentOpen && documentId !== null"
+            class="split"
+            role="separator"
+            tabindex="0"
+            aria-orientation="vertical"
+            :aria-label="t('viewer.resizeAgent')"
+            :aria-valuenow="columnWidth.agent.value"
+            :aria-valuemin="COLUMN_WIDTHS.agent.min"
+            :aria-valuemax="COLUMN_WIDTHS.agent.max"
+            @pointerdown="startResize($event, 'agent')"
+            @pointermove="onResize"
+            @pointerup="endResize"
+            @pointercancel="endResize"
+            @dblclick="columnWidth.agent.value = COLUMN_WIDTHS.agent.initial"
+            @keydown="onResizeKey($event, 'agent')"
+          />
+          <aside
+            v-if="editable && agentOpen && documentId !== null"
+            class="agent"
+            :style="{ '--column-width': `${columnWidth.agent.value}px` }"
+            :aria-label="t('chat.panel')"
+          >
             <ChatPanel
               :document-id="documentId"
               :document-selection="documentSelection"
@@ -1485,24 +1704,42 @@ const awaitingContent = computed(
   border-color: var(--accent);
 }
 
-/* The source of one block, in the measure the rendered block had, in the mono face. It
-   grows with its lines rather than scrolling: the block is being read as much as typed. */
+/* A contents page's lines, in the prose face and the measure the rendered block had: no
+   box, no ring — the block is the same block with a caret in it. It grows with its lines
+   rather than scrolling. */
 .block-editor {
   display: block;
   width: 100%;
   min-width: 0;
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--accent);
-  border-radius: var(--radius);
-  background: var(--paper);
+  padding: 0;
+  border: 0;
+  background: transparent;
   color: var(--ink-soft);
-  font-size: var(--text-read-sm);
-  line-height: 1.6;
-  resize: vertical;
+  font-size: var(--text-read);
+  line-height: 1.75;
+  resize: none;
 }
 
 .block-editor:focus-visible {
   outline: none;
+}
+
+/* A figure open for its caption: the crop as it was, the caption editor where the caption
+   sits, in the caption's own face. */
+.figure-edit {
+  text-align: center;
+}
+
+.caption-editor {
+  --block-text: var(--text-xs);
+
+  margin-top: var(--space-2);
+}
+
+.caption-editor :deep(.md-p) {
+  color: var(--faint);
+  line-height: 1.6;
+  text-align: center;
 }
 
 /* Where the next page will land while the parse runs. */
@@ -1510,21 +1747,43 @@ const awaitingContent = computed(
   width: 100%;
 }
 
-/* KaTeX brings its own faces and sizing; the span only needs to not fight the line. */
-.prose :deep(.md-inline-math .katex) {
-  font-size: 1.06em;
+/* --- Column rules ----------------------------------------------------------- */
+
+/* The rule between the document and a side column, and the handle that resizes the column
+   (docs/web.md § Column widths): a 7px hit area centred on a 1px line, which thickens to
+   the edge colour while it is hovered, dragged or focused. */
+.split {
+  position: relative;
+  z-index: 1;
+  flex: 0 0 7px;
+  margin-inline: -3px;
+  cursor: col-resize;
+  touch-action: none;
 }
 
-/* An inline code span: the mono face on the sunken surface, sized to sit in the line.
-   `pre-wrap`, because its spaces are content — `a  b` must read as it copies. */
-.prose :deep(.md-inline-code),
-.notes-view :deep(.md-inline-code) {
-  padding: 1px var(--space-1);
-  border-radius: var(--radius);
-  background: var(--paper-sunken);
-  font-family: var(--mono);
-  font-size: 0.9em;
-  white-space: pre-wrap;
+.split::after {
+  content: '';
+  position: absolute;
+  inset-block: 0;
+  left: 3px;
+  width: 1px;
+  background: var(--line);
+  transition:
+    background var(--duration-fast) var(--ease),
+    width var(--duration-fast) var(--ease),
+    left var(--duration-fast) var(--ease);
+}
+
+.split:hover::after,
+.split:active::after,
+.split:focus-visible::after {
+  left: 2px;
+  width: 3px;
+  background: var(--edge);
+}
+
+.split:focus-visible {
+  outline: none;
 }
 
 /* --- Notes column --------------------------------------------------------- */
@@ -1536,81 +1795,45 @@ const awaitingContent = computed(
   --block-subheading: var(--text-base);
   --block-text: var(--text-sm);
   --block-text-sm: var(--text-xs);
+  --rich-gap: var(--space-3);
 
   display: flex;
-  flex: 0 0 320px;
+  flex: 0 0 var(--column-width, 320px);
   flex-direction: column;
   min-width: 0;
   min-height: 0;
-  border-left: 1px solid var(--line);
   background: var(--paper-sunken);
 }
 
-.notes-view,
-.notes-editor {
+/* The whole column is the notes: a click below the last line still writes. */
+.notes-view {
   flex: 1 1 auto;
   min-height: 0;
   width: 100%;
-  margin: 0;
   padding: var(--space-5) var(--space-5) var(--space-8);
   overflow: auto;
   overscroll-behavior: contain;
   scrollbar-width: none;
-}
-
-.notes-view::-webkit-scrollbar,
-.notes-editor::-webkit-scrollbar {
-  display: none;
-}
-
-.notes-view {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
   cursor: text;
 }
 
-.notes-view:focus-visible {
-  outline-offset: -2px;
+.notes-view::-webkit-scrollbar {
+  display: none;
 }
 
 .notes-view :deep(.md-p),
-.notes-view :deep(.md-list),
-.notes-view :deep(.md-toc) {
+.notes-view :deep(.md-list) {
   line-height: 1.65;
-}
-
-.notes-empty {
-  color: var(--faint);
-  font-size: var(--text-sm);
-}
-
-.notes-editor {
-  border: 0;
-  background: transparent;
-  color: var(--ink-soft);
-  font-size: var(--text-xs);
-  line-height: 1.7;
-  resize: none;
-}
-
-.notes-editor:focus-visible {
-  outline: none;
-}
-
-.notes-editor::placeholder {
-  color: var(--faint);
 }
 
 /* --- Agent column --------------------------------------------------------- */
 
 .agent {
   display: flex;
-  flex: 0 0 360px;
+  flex: 0 0 var(--column-width, 360px);
   flex-direction: column;
   min-width: 0;
   min-height: 0;
-  border-left: 1px solid var(--line);
   background: var(--paper);
 }
 
@@ -1649,8 +1872,11 @@ const awaitingContent = computed(
   .notes,
   .agent {
     flex: 0 0 45%;
-    border-left: none;
     border-top: 1px solid var(--line);
+  }
+
+  .split {
+    display: none;
   }
 }
 
