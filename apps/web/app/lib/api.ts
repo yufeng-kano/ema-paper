@@ -61,7 +61,9 @@ export interface AgentSettings {
   connection_id: number | null
   /** Model id on that upstream's catalog; null means none chosen yet. */
   model: string | null
-  /** Selected prompt preset; null means the agent's shipped default prompt. */
+  /** The user's own template; null means the agent's `default_prompt` (docs/agents.md). */
+  prompt: string | null
+  /** The legacy preset selection, which only an API call still makes; the page shows none. */
   prompt_preset_id: number | null
   /** Reasoning effort; meaningful for the `chat` agent, `medium` when unset. */
   effort: AgentEffort | null
@@ -83,8 +85,10 @@ export interface AgentEntry {
   capabilities: string[]
   input: string
   output: string
-  /** What "default" means for this agent's prompt picker. */
+  /** What the prompt dialog opens on when the user saved no prompt of their own. */
   default_prompt: string
+  /** The tokens the template substitutes — the prompt dialog's chips. */
+  prompt_tokens?: string[]
   /** The tools this deployment really gives the agent (empty for agents without any). */
   tools: string[]
   settings: AgentSettings
@@ -108,25 +112,78 @@ export interface ConnectionModel {
   name: string | null
 }
 
-export interface PromptPreset {
-  id: number
-  /** The agent this prompt is for; fixed once created. */
-  agent: string
-  name: string
-  text: string
-  created_at: string
-  updated_at: string
-}
-
-/** The server's own limits, so the file picker and the prompt dialog enforce one set of numbers. */
+/** The server's own limits, so the file picker, the prompt dialog and the composer enforce
+ *  one set of numbers. */
 export interface UploadLimits {
   upload_max_bytes: number
   page_cap: number
   accepted_media_types: string[]
   /** What intake accepts by extension when the browser reports a generic media type. */
   accepted_extensions: string[]
-  /** The cap `POST /api/prompts` enforces on a preset's text. */
+  /** The cap on an agent's prompt, a skill's body and a subagent's prompt. */
   prompt_max_chars: number
+  /** The chat composer's attachments (docs/chat.md § What a user message carries). Optional
+   *  only so a page served by an older API still renders. */
+  attachment_max_bytes?: number
+  attachments_per_message?: number
+  attachment_extensions?: string[]
+}
+
+// --- skills and subagents (docs/chat.md § Skills, § Subagents) -----------------------
+
+/** What a skill holds, apart from its name. */
+export interface SkillFields {
+  /** When to use it: what the model reads to decide. */
+  description: string
+  /** What its command takes, shown in the `/` menu. */
+  argument_hint: string
+  body: string
+  /** The reader can run it as `/name`. */
+  user_invocable: boolean
+  /** The agent may load it on its own. */
+  model_invocable: boolean
+}
+
+export interface Skill extends SkillFields {
+  name: string
+  /** Defined in code: editable and restorable, never deleted or renamed. */
+  builtin: boolean
+  /** A built-in carrying the reader's edit. */
+  modified: boolean
+  /** A built-in's shipped fields; null for a skill of the reader's own. */
+  default: SkillFields | null
+}
+
+/** The tools a subagent may hold: the read-only ones, the editor limited to `view`. */
+export const SUBAGENT_TOOLS = ['view_page', 'view_figure', 'str_replace_based_edit_tool'] as const
+
+export interface SubagentFields {
+  /** When to start it: what the agent reads. */
+  description: string
+  /** A Claude model id; null runs it on the conversation's model. */
+  model: string | null
+  tools: string[]
+  prompt: string
+}
+
+export interface Subagent extends SubagentFields {
+  name: string
+  builtin: boolean
+  modified: boolean
+  default: SubagentFields | null
+}
+
+// --- attachments (docs/chat.md § What a user message carries) -------------------------
+
+/** One prepared upload waiting for its message. */
+export interface Attachment {
+  id: string
+  name: string
+  /** An image goes to the model as an image; a PDF or a text file as its text. */
+  kind: 'image' | 'text'
+  media_type: string
+  size_bytes: number
+  chars: number | null
 }
 
 export interface MeResponse {
@@ -245,11 +302,44 @@ export interface ConversationDetail extends Conversation {
   document_id: number
 }
 
+/** What the thread knows of an attached file: its name, never its text or bytes. */
+export interface AttachmentMeta {
+  name: string
+  kind?: 'image' | 'text'
+  chars?: number | null
+}
+
+/** One thing a subagent did, as its run's record keeps it (docs/chat.md § Subagents). */
+export type SubagentStep =
+  | { type: 'tool'; name: string; input: Record<string, unknown>; is_error: boolean }
+  | { type: 'note'; text: string }
+
+/** What a `subagent` call's result carries beside the report, for the thread to draw. */
+export interface SubagentRecord {
+  name: string
+  model: string | null
+  steps: SubagentStep[]
+  tool_calls: number
+  elapsed_ms: number
+}
+
 /** Anthropic-shaped content blocks, stored verbatim (docs/chat.md § History). */
 export type ContentBlock =
-  /** `context` marks a text block the backend appended (the selected passage), not the
-   *  reader's own words (docs/chat.md § Prompt caching). */
-  | { type: 'text'; text: string; context?: string }
+  /**
+   * `context` marks a text block the backend appended — the selected passage, the quoted
+   * one, a command's skill, an attached file — not the reader's own words (docs/chat.md
+   * § What a user message carries). A skill block is served without its body and an
+   * attached file without its text, so `text` can be absent on them.
+   */
+  | {
+      type: 'text'
+      text: string
+      context?: string
+      /** The skill a `context: skill` block ran. */
+      skill?: string
+      /** The file a `context: attachment` block holds. */
+      attachment?: AttachmentMeta
+    }
   | { type: 'thinking'; thinking: string }
   | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
   | {
@@ -257,9 +347,17 @@ export type ContentBlock =
       tool_use_id: string
       content: string | ContentBlock[]
       is_error?: boolean
+      /** A `subagent` call's record of what the subagent did. */
+      subagent?: SubagentRecord
     }
-  /** Any other block the API stores (an image a tool returned, say): kept, not drawn. */
-  | { type: 'image' | 'document'; source?: unknown }
+  /**
+   * An image: a page or figure a tool returned (kept, not drawn), or one the reader
+   * attached (`attachment`), whose bytes the thread asks for by the block's index. A
+   * message drawn before the record holds it carries its local preview as `preview`.
+   */
+  | { type: 'image'; source?: unknown; attachment?: AttachmentMeta; preview?: string }
+  /** Any other block the API stores: kept, not drawn. */
+  | { type: 'document'; source?: unknown }
 
 export interface ChatMessage {
   id: number
@@ -297,12 +395,25 @@ export type ChatEvent = ChatEventData & {
   turn_id: string
 }
 
+/**
+ * `parent` names the `subagent` call a subagent's own events belong to; the turn's own
+ * events carry none (docs/chat.md § Conversations, turns, events).
+ */
 type ChatEventData =
   | { event: 'turn_start'; model: string }
   | { event: 'text_delta'; text: string }
-  | { event: 'thinking'; text: string }
-  | { event: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
-  | { event: 'tool_result'; id: string; name: string; is_error: boolean; output: string }
+  | { event: 'thinking'; text: string; parent?: string }
+  | { event: 'tool_use'; id: string; name: string; input: Record<string, unknown>; parent?: string }
+  | {
+      event: 'tool_result'
+      id: string
+      name: string
+      is_error: boolean
+      output: string
+      parent?: string
+      /** On a `subagent` call's result: what the subagent did. */
+      subagent?: SubagentRecord
+    }
   | {
       event: 'edit'
       path: string
@@ -311,7 +422,7 @@ type ChatEventData =
       diff: string
       tool_use_id: string
     }
-  | { event: 'retry'; attempt: number }
+  | { event: 'retry'; attempt: number; parent?: string }
   | { event: 'turn_done' }
   | { event: 'turn_error'; status: string; error: string }
 
@@ -581,29 +692,45 @@ export function listAgentModels(agent: string): Promise<{ data: ConnectionModel[
   return request('GET', `/api/agents/${encodeURIComponent(agent)}/models`)
 }
 
-// --- prompt presets ---------------------------------------------------------
+// --- skills and subagents (docs/chat.md § Skills, § Subagents) -----------------------
 
-export function listPrompts(): Promise<{ prompts: PromptPreset[] }> {
-  return request('GET', '/api/prompts')
+export function listSkills(): Promise<{ skills: Skill[] }> {
+  return request('GET', '/api/skills')
 }
 
-export function createPrompt(body: {
-  agent: string
-  name: string
-  text: string
-}): Promise<PromptPreset> {
-  return request('POST', '/api/prompts', body)
+/** One of the reader's own; a built-in's name is never free for it (409). */
+export function createSkill(body: SkillFields & { name: string }): Promise<Skill> {
+  return request('POST', '/api/skills', body)
 }
 
-export function updatePrompt(
-  id: number,
-  body: Partial<{ name: string; text: string }>,
-): Promise<PromptPreset> {
-  return request('PUT', `/api/prompts/${id}`, body)
+/** Writes the fields present. On a built-in it stores the reader's edit — one equal to the
+ *  default is removed instead; `name` renames one of the reader's own. */
+export function updateSkill(name: string, body: Partial<SkillFields & { name: string }>): Promise<Skill> {
+  return request('PUT', `/api/skills/${encodeURIComponent(name)}`, body)
 }
 
-export function deletePrompt(id: number): Promise<void> {
-  return request<undefined>('DELETE', `/api/prompts/${id}`)
+/** Deletes one of the reader's own; on a built-in, removes the edit — restore default. */
+export function deleteSkill(name: string): Promise<void> {
+  return request<undefined>('DELETE', `/api/skills/${encodeURIComponent(name)}`)
+}
+
+export function listSubagents(): Promise<{ subagents: Subagent[] }> {
+  return request('GET', '/api/subagents')
+}
+
+export function createSubagent(body: SubagentFields & { name: string }): Promise<Subagent> {
+  return request('POST', '/api/subagents', body)
+}
+
+export function updateSubagent(
+  name: string,
+  body: Partial<SubagentFields & { name: string }>,
+): Promise<Subagent> {
+  return request('PUT', `/api/subagents/${encodeURIComponent(name)}`, body)
+}
+
+export function deleteSubagent(name: string): Promise<void> {
+  return request<undefined>('DELETE', `/api/subagents/${encodeURIComponent(name)}`)
 }
 
 export function getUsage(days: number): Promise<UsageResponse> {
@@ -749,13 +876,85 @@ export function getConversation(id: number): Promise<ConversationResponse> {
   return request('GET', `/api/conversations/${id}`)
 }
 
+/** What one message carries besides its text (docs/chat.md § What a user message carries). */
+export interface MessageBody {
+  /** The reader's words; a command's arguments when `command` is set. */
+  text: string
+  selection?: string
+  /** The passage of an earlier answer the reader replies to. */
+  quote?: string
+  /** A skill run as `/name`. */
+  command?: string
+  /** Ids from `POST /api/attachments`. */
+  attachments?: string[]
+  locale: string
+}
+
 /** Stores the user message and queues a turn: 202 with the turn's id. 429 when too many
- *  turns are already running, 400 when the chat agent has no model. */
-export function sendMessage(
-  id: number,
-  body: { text: string; selection?: string; locale: string },
-): Promise<{ turn_id: string; message_id: number }> {
+ *  turns are already running, 400 when the chat agent has no model, 409 for an attachment
+ *  that is gone. */
+export function sendMessage(id: number, body: MessageBody): Promise<{ turn_id: string; message_id: number }> {
   return request('POST', `/api/conversations/${id}/messages`, body)
+}
+
+/** The bytes of the image attached to a stored user message, by its block's index. */
+export function attachmentUrl(conversationId: number, messageId: number, index: number): string {
+  return `/api/conversations/${conversationId}/messages/${messageId}/attachments/${index}`
+}
+
+/** An upload in flight: its result, and a way to stop it. */
+export interface AttachmentUpload {
+  promise: Promise<Attachment>
+  abort: () => void
+}
+
+/**
+ * One attachment, uploaded on its own so the composer can draw its progress — which
+ * `fetch` cannot report for a request body, so this is the one call made with
+ * `XMLHttpRequest`. Same origin, the session cookie and the CSRF header like every other
+ * mutation; the bytes never enter the Nuxt server (docs/web.md § Rules).
+ */
+export function uploadAttachment(
+  file: File,
+  onProgress?: (loaded: number, total: number) => void,
+): AttachmentUpload {
+  const xhr = new XMLHttpRequest()
+  const promise = new Promise<Attachment>((resolve, reject) => {
+    xhr.open('POST', '/api/attachments')
+    xhr.withCredentials = true
+    xhr.setRequestHeader(CSRF_HEADER, 'fetch')
+    xhr.responseType = 'text'
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) {
+        onProgress?.(event.loaded, event.total)
+      }
+    }
+    xhr.onload = () => {
+      let payload: unknown
+      try {
+        payload = xhr.responseText ? JSON.parse(xhr.responseText) : null
+      } catch {
+        reject(new ApiRequestError(xhr.status, 'internal', xhr.statusText || 'Invalid response'))
+        return
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(payload as Attachment)
+      } else {
+        reject(toApiError(xhr.status, xhr.statusText, payload))
+      }
+    }
+    xhr.onerror = () => reject(new ApiRequestError(0, 'internal', 'Network error'))
+    xhr.onabort = () => reject(new ApiRequestError(0, 'internal', 'Aborted'))
+    const body = new FormData()
+    body.append('file', file)
+    xhr.send(body)
+  })
+  return { promise, abort: () => xhr.abort() }
+}
+
+/** Drops an attachment not yet sent. */
+export function deleteAttachment(id: string): Promise<void> {
+  return request<undefined>('DELETE', `/api/attachments/${encodeURIComponent(id)}`)
 }
 
 /** The stream's URL — `EventSource` opens it, not `fetch` (docs/chat.md). */

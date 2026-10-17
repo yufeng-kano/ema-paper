@@ -58,8 +58,12 @@ def image_size(path: Path) -> tuple[int, int]:
         return image.width, image.height
 
 
-def normalize_image(source: Path, out_dir: Path) -> NormalizedImage:
-    """Write a model-ready copy of `source` into `out_dir`."""
+def normalize_image(
+    source: Path, out_dir: Path, *, max_long_edge: int = MAX_LONG_EDGE_PX, stem: str = "source"
+) -> NormalizedImage:
+    """Write a model-ready copy of `source` into `out_dir` as `<stem>.png` or `.jpg`. A
+    parse keeps the defaults; the chat composer's attachments ask for Claude's own long
+    edge and a name of their own (docs/chat.md § What a user message carries)."""
     try:
         with Image.open(source) as opened:
             image = ImageOps.exif_transpose(opened) or opened
@@ -76,9 +80,9 @@ def normalize_image(source: Path, out_dir: Path) -> NormalizedImage:
                 image = flattened
             else:
                 image = image.convert("RGB")
-            image.thumbnail((MAX_LONG_EDGE_PX, MAX_LONG_EDGE_PX), Image.LANCZOS)
+            image.thumbnail((max_long_edge, max_long_edge), Image.LANCZOS)
 
-            target = out_dir / ("source.png" if keep_png else "source.jpg")
+            target = out_dir / (f"{stem}.png" if keep_png else f"{stem}.jpg")
             if keep_png:
                 image.save(target, format="PNG", optimize=True)
             else:

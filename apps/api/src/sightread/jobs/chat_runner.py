@@ -22,6 +22,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ..agents import CHAT
 from ..agents import chat as chat_agent
+from ..agents import skills as skill_defs
+from ..agents import subagents as subagent_defs
 from ..config import Settings
 from ..db.models import (
     EFFORT_DEFAULT,
@@ -31,6 +33,8 @@ from ..db.models import (
     Document,
     Job,
     Message,
+    Skill,
+    Subagent,
     UsageLog,
     utcnow,
 )
@@ -48,7 +52,7 @@ from ..workspace import git
 from ..workspace.documents import DocumentPaths, ensure_within_quota, materialize_document
 from ..workspace.locks import clear_writing, mark_writing, shell_lock, workspace_lock
 from ..workspace.reconcile import reconcile_locked, reconcile_user
-from . import chat_events, chat_tools
+from . import chat_events, chat_subagent, chat_tools
 from .queue import HISTORY_FULL, history_bytes
 
 logger = logging.getLogger(__name__)
@@ -88,6 +92,11 @@ class TurnContext:
     tools: list[dict]
     sandbox: SandboxClient | None
     render_slots: asyncio.Semaphore
+    # The reader's skills and subagents as this turn has them (docs/chat.md § Skills,
+    # § Subagents), and the document's facts a subagent's preamble is rendered with.
+    skills: dict[str, skill_defs.ResolvedSkill] = field(default_factory=dict)
+    subagents: dict[str, subagent_defs.ResolvedSubagent] = field(default_factory=dict)
+    facts: dict[str, str] = field(default_factory=dict)
     tool_calls: int = 0
     # Encoded image bytes the turn's reads have returned so far, every round together
     # (docs/chat.md § Tools).
@@ -156,8 +165,17 @@ async def _load(
             builtin=True,
             report_cost=True,
         )
-        preset = setting.prompt_preset if setting else None
+        # The reader's own prompt replaces the default whole; a legacy preset is appended
+        # to it as before, and never stands beside a prompt (docs/chat.md § System prompt).
+        own_prompt = setting.prompt if setting and setting.prompt else None
+        preset = setting.prompt_preset if setting and own_prompt is None else None
         effort = setting.effort if setting and setting.effort else EFFORT_DEFAULT
+        skills = skill_defs.resolve_skills(
+            (await db.execute(select(Skill).where(Skill.user_id == turn.user_id))).scalars()
+        )
+        subagents = subagent_defs.resolve_subagents(
+            (await db.execute(select(Subagent).where(Subagent.user_id == turn.user_id))).scalars()
+        )
         try:
             paths = await materialize_document(db, settings, document)
             # A full workspace runs no shell: what the turn writes has nowhere to go
@@ -180,12 +198,22 @@ async def _load(
             "type": "text",
             # The tool list as the turn has it: no `bash` line without a runner.
             "text": chat_agent.render_system_prompt(
-                CHAT.default_prompt_template, facts, tools=[tool["name"] for tool in tools]
+                own_prompt or CHAT.default_prompt_template,
+                facts,
+                tools=[tool["name"] for tool in tools],
             ),
         }
     ]
     if preset is not None and preset.text.strip():
         system.append({"type": "text", "text": preset.text})
+    # The catalogue last: what the agent may load and start, read per turn like the prompt,
+    # so an edit on the Agent page misses the cache once (docs/chat.md § Prompt caching).
+    catalogue = chat_agent.render_catalogue(
+        [(skill.name, skill.description) for skill in skills if skill.model_invocable],
+        [(subagent.name, subagent.description) for subagent in subagents],
+    )
+    if catalogue is not None:
+        system.append({"type": "text", "text": catalogue})
     system[-1]["cache_control"] = {"type": "ephemeral", "ttl": chat_agent.CACHE_TTL}
 
     return TurnContext(
@@ -203,6 +231,9 @@ async def _load(
         tools=tools,
         sandbox=sandbox,
         render_slots=render_slots,
+        skills={skill.name: skill for skill in skills},
+        subagents={subagent.name: subagent for subagent in subagents},
+        facts=facts,
     )
 
 
@@ -275,13 +306,19 @@ async def _history(ctx: TurnContext) -> list[dict]:
         return repaired([{"role": row.role, "content": _api_blocks(row.content)} for row in rows])
 
 
+# The keys a stored block carries for the web app and the API never sees: the context
+# marker (docs/chat.md § Prompt caching), a command's skill, an attachment's name and a
+# subagent call's record (docs/chat.md § What a user message carries, § Subagents).
+PRIVATE_KEYS = frozenset({"context", "skill", "attachment", "subagent"})
+
+
 def _api_blocks(content: object) -> object:
-    """The stored content as the API takes it: the `context` marker a stored block
-    carries for the web app (docs/chat.md § Prompt caching) is ours, not the API's."""
+    """The stored content as the API takes it: the keys a stored block carries for the
+    web app are ours, not the API's."""
     if not isinstance(content, list):
         return content
     return [
-        {key: value for key, value in block.items() if key != "context"}
+        {key: value for key, value in block.items() if key not in PRIVATE_KEYS}
         if isinstance(block, dict)
         else block
         for block in content
@@ -434,19 +471,31 @@ async def _record_usage_settled(ctx: TurnContext, completed: CompletedMessage) -
 # --- one model call ----------------------------------------------------------------------------
 
 
-async def _stream_once(ctx: TurnContext, body: dict) -> CompletedMessage:
-    """One streamed request, its deltas relayed as events as they arrive."""
+def _with_parent(data: dict, parent: str | None) -> dict:
+    """A subagent's events name the `subagent` call that started it (docs/chat.md
+    § Conversations, turns, events)."""
+    return {**data, "parent": parent} if parent is not None else data
+
+
+async def _stream_once(
+    ctx: TurnContext, body: dict, *, parent: str | None = None
+) -> CompletedMessage:
+    """One streamed request, its deltas relayed as events as they arrive. A subagent's
+    call (`parent`) streams no text: its report arrives as its call's result."""
     text_buffer: list[str] = []
     thinking_buffer: list[str] = []
 
     async def flush_text() -> None:
         if text_buffer:
-            await _emit(ctx, chat_events.TEXT_DELTA, {"text": "".join(text_buffer)})
+            if parent is None:
+                await _emit(ctx, chat_events.TEXT_DELTA, {"text": "".join(text_buffer)})
             text_buffer.clear()
 
     async def flush_thinking() -> None:
         if thinking_buffer:
-            await _emit(ctx, chat_events.THINKING, {"text": "".join(thinking_buffer)})
+            await _emit(
+                ctx, chat_events.THINKING, _with_parent({"text": "".join(thinking_buffer)}, parent)
+            )
             thinking_buffer.clear()
 
     completed: CompletedMessage | None = None
@@ -513,11 +562,14 @@ async def _stream_once(ctx: TurnContext, body: dict) -> CompletedMessage:
                     await _emit(
                         ctx,
                         chat_events.TOOL_USE,
-                        {
-                            "id": block.get("id"),
-                            "name": block.get("name"),
-                            "input": block.get("input", {}),
-                        },
+                        _with_parent(
+                            {
+                                "id": block.get("id"),
+                                "name": block.get("name"),
+                                "input": block.get("input", {}),
+                            },
+                            parent,
+                        ),
                     )
     finally:
         if not reader.done():
@@ -550,22 +602,25 @@ async def _backoff(ctx: TurnContext, seconds: float) -> None:
             raise TurnCancelled()
 
 
-async def _call_model(ctx: TurnContext, body: dict) -> CompletedMessage:
+async def _call_model(
+    ctx: TurnContext, body: dict, *, parent: str | None = None
+) -> CompletedMessage:
     for attempt in range(MAX_ATTEMPTS):
         try:
-            return await _stream_once(ctx, body)
+            return await _stream_once(ctx, body, parent=parent)
         except RateLimited as exc:
             if attempt == MAX_ATTEMPTS - 1:
                 raise
             await _backoff(ctx, exc.retry_after or BACKOFF_BASE_SECONDS * (2**attempt))
             # What the failed attempt streamed is already out: the thread starts over
-            # from here (docs/chat.md § Conversations, turns, events).
-            await _emit(ctx, chat_events.RETRY, {"attempt": attempt + 2})
+            # from here — a subagent's steps only, for a call of one (docs/chat.md
+            # § Conversations, turns, events).
+            await _emit(ctx, chat_events.RETRY, _with_parent({"attempt": attempt + 2}, parent))
         except UpstreamError as exc:
             if attempt == MAX_ATTEMPTS - 1 or not exc.transient:
                 raise
             await _backoff(ctx, BACKOFF_BASE_SECONDS * (2**attempt))
-            await _emit(ctx, chat_events.RETRY, {"attempt": attempt + 2})
+            await _emit(ctx, chat_events.RETRY, _with_parent({"attempt": attempt + 2}, parent))
     raise RateLimited()
 
 
@@ -583,7 +638,8 @@ async def _run_tool(
     `admit` sees the outcome before it is reported and may replace it."""
     try:
         return await _run_tool_unguarded(ctx, block, malformed, admit)
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, TurnCancelled):
+        # A Stop a subagent saw inside its run is the turn's, not a failed tool.
         raise
     except Exception:  # noqa: BLE001 - any failure is this tool's, never the turn's
         logger.exception("tool %s failed in turn %s", block.get("name"), ctx.turn.id)
@@ -662,11 +718,30 @@ async def _run_tool_unguarded(
         outcome = await chat_tools.view_figure(
             ctx.paths, tool_input, max_bytes=ctx.settings.chat_image_round_max_bytes
         )
+    elif name == "skill":
+        outcome = _load_skill(ctx, tool_input)
+    elif name == "subagent":
+        outcome = await chat_subagent.run_subagent(ctx, tool_use_id, tool_input)
     else:
         outcome = chat_tools.ToolOutcome(f"unknown tool {name!r}", is_error=True)
     if admit is not None:
         outcome = admit(outcome)
     return await _report_tool(ctx, tool_use_id, name, outcome)
+
+
+def _load_skill(ctx: TurnContext, tool_input: dict) -> chat_tools.ToolOutcome:
+    """A skill the agent may load, rendered with the call's arguments (docs/chat.md
+    § Skills); one the catalogue does not list is an error the model can correct."""
+    name = tool_input.get("name")
+    skill = ctx.skills.get(name.strip()) if isinstance(name, str) else None
+    if skill is None or not skill.model_invocable:
+        return chat_tools.ToolOutcome(
+            f"No skill named {name!r} is available; the system prompt lists the ones there are.",
+            is_error=True,
+        )
+    arguments = tool_input.get("arguments")
+    rendered = skill_defs.render_skill(skill.body, arguments if isinstance(arguments, str) else "")
+    return chat_tools.ToolOutcome(f"Skill {skill.name} — follow these instructions:\n\n{rendered}")
 
 
 async def _run_shell_command(
@@ -732,16 +807,18 @@ async def _report_tool(
 ) -> dict:
 
     summary = outcome.content if isinstance(outcome.content, str) else "(image)"
-    await _emit(
-        ctx,
-        chat_events.TOOL_RESULT,
-        {"id": tool_use_id, "name": name, "is_error": outcome.is_error, "output": summary},
-    )
+    data = {"id": tool_use_id, "name": name, "is_error": outcome.is_error, "output": summary}
+    if outcome.subagent is not None:
+        data["subagent"] = outcome.subagent
+    await _emit(ctx, chat_events.TOOL_RESULT, data)
     if outcome.edit is not None:
         await _emit(ctx, chat_events.EDIT, {**outcome.edit, "tool_use_id": tool_use_id})
     result: dict = {"type": "tool_result", "tool_use_id": tool_use_id, "content": outcome.content}
     if outcome.is_error:
         result["is_error"] = True
+    if outcome.subagent is not None:
+        # Kept for the panel, stripped before the history goes upstream (PRIVATE_KEYS).
+        result["subagent"] = outcome.subagent
     return result
 
 
@@ -821,7 +898,13 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
                         ctx, str(block.get("id")), block.get("name"), refusal
                     )
                     return
-                results[index] = await _run_tool(ctx, block, malformed, admit)
+                try:
+                    results[index] = await _run_tool(ctx, block, malformed, admit)
+                except TurnCancelled:
+                    # A subagent that saw the Stop inside its run ends quietly like any
+                    # other read, so a write still running finishes (docs/chat.md
+                    # § Subagents) and the reads beside it are not left running.
+                    stopped.set()
 
         await asyncio.gather(
             *(
@@ -932,7 +1015,8 @@ async def _loop(ctx: TurnContext) -> None:
         # Every result in one user message, in the order the calls were made
         # (docs/chat.md § Tools).
         await _store(ctx, "user", list(results))
-        messages.append({"role": "user", "content": list(results)})
+        # Replayed as the API takes it: a subagent's record is the panel's, not the model's.
+        messages.append({"role": "user", "content": _api_blocks(list(results))})
         since_marker += len(results)
 
 

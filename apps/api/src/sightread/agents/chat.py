@@ -56,8 +56,56 @@ VIEW_FIGURE_TOOL = {
     },
     "strict": True,
 }
-TOOLS: tuple[dict, ...] = (BASH_TOOL, EDITOR_TOOL, VIEW_PAGE_TOOL, VIEW_FIGURE_TOOL)
+SKILL_TOOL = {
+    "name": "skill",
+    "description": (
+        "Load one of the user's skills — instructions for one kind of task — by its name, "
+        "as the system prompt's catalogue lists it, then follow it. `arguments` is what the "
+        "skill should work on (a range of pages, a section), empty when nothing in particular."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "The skill's name"},
+            "arguments": {"type": "string", "description": "What the skill works on, or ''"},
+        },
+        "required": ["name", "arguments"],
+        "additionalProperties": False,
+    },
+    "strict": True,
+}
+SUBAGENT_TOOL = {
+    "name": "subagent",
+    "description": (
+        "Start one of the user's subagents, by its name as the system prompt's catalogue "
+        "lists it, on one task. It works alone, in a context of its own, can only read, and "
+        "answers with a report. Several started in one round work at the same time. Give it "
+        "everything it needs in `task`: it sees nothing of this conversation."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "The subagent's name"},
+            "task": {"type": "string", "description": "The whole task, self-contained"},
+        },
+        "required": ["name", "task"],
+        "additionalProperties": False,
+    },
+    "strict": True,
+}
+TOOLS: tuple[dict, ...] = (
+    BASH_TOOL,
+    EDITOR_TOOL,
+    VIEW_PAGE_TOOL,
+    VIEW_FIGURE_TOOL,
+    SKILL_TOOL,
+    SUBAGENT_TOOL,
+)
 TOOL_NAMES: tuple[str, ...] = tuple(tool["name"] for tool in TOOLS)
+# What a subagent may be given: the tools that only read (docs/chat.md § Subagents). The
+# editor among them answers `view` only.
+SUBAGENT_TOOLS: tuple[dict, ...] = (VIEW_PAGE_TOOL, VIEW_FIGURE_TOOL, EDITOR_TOOL)
+SUBAGENT_TOOL_NAMES: tuple[str, ...] = tuple(tool["name"] for tool in SUBAGENT_TOOLS)
 
 # Without the sandbox the bash tool is not declared at all: a tool the harness cannot
 # run must not be offered (docs/sandbox.md).
@@ -149,6 +197,34 @@ NETWORK_NONE = (
     "There is no network at all: `uv add` and anything else that reaches out fails, "
     "so work with what is installed."
 )
+
+
+CATALOGUE_SKILLS = """# Skills
+
+Instructions the user keeps for kinds of task. When the task at hand matches one's description, load it with the `skill` tool before you start, and follow it:
+"""
+CATALOGUE_SUBAGENTS = """# Subagents
+
+Helpers you can start with the `subagent` tool. Each works alone on the task you give it, can only read, and reports back; you make any edits. Start one when its description fits and the work is large or splits into parts that can run at the same time:
+"""
+
+
+def render_catalogue(
+    skills: Iterable[tuple[str, str]], subagents: Iterable[tuple[str, str]]
+) -> str | None:
+    """The system prompt's last block: the skills the agent may load and the subagents it
+    may start, as `(name, description)` pairs (docs/chat.md § Skills, § Subagents). None
+    when there is neither, so a reader with nothing to list sends no block at all."""
+    sections = []
+    listed_skills = [f"- {name}: {description.strip() or name}" for name, description in skills]
+    if listed_skills:
+        sections.append(CATALOGUE_SKILLS + "\n".join(listed_skills))
+    listed_subagents = [
+        f"- {name}: {description.strip() or name}" for name, description in subagents
+    ]
+    if listed_subagents:
+        sections.append(CATALOGUE_SUBAGENTS + "\n".join(listed_subagents))
+    return "\n\n".join(sections) if sections else None
 
 
 def network_note(sandbox_network: str, sandbox_index_url: str) -> str:

@@ -94,7 +94,9 @@ async def run_worker(stop: asyncio.Event) -> None:
     upload_dir = Path(settings.upload_dir)
     upload_dir.mkdir(parents=True, exist_ok=True)
 
-    sweeper = asyncio.create_task(sweep_forever(upload_dir, stop))
+    sweeper = asyncio.create_task(
+        sweep_forever(upload_dir, stop, max_age=settings.upload_max_age_seconds)
+    )
     sandbox = SandboxClient(settings) if settings.sandbox_configured else None
     # Retried until it goes through: a database or runner blip at start must not leave
     # the turns a dead worker held unfinished until the next restart (docs/jobs.md).

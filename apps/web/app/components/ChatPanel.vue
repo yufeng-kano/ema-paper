@@ -1,5 +1,22 @@
-<script lang="ts">
+<script setup lang="ts">
+/**
+ * The `chat` agent's thread about one document (docs/web.md § The agent panel).
+ *
+ * The thread is `messages` — the persisted history — plus the live `chat_events` stream
+ * for the turn in flight; what that reads as (which steps share a group, where a
+ * subagent's steps come from, when a turn is done) is `lib/thread.ts`, and this component
+ * is the reactive glue around it: the conversation list, the stream, what the reader has
+ * opened, the edit cards' reverts, the reply toolbar and the drop zone.
+ *
+ * The stream is opened from sequence 0 whenever a conversation is opened, for two reasons:
+ * a turn that was already running when the viewer opened has no other way back into view,
+ * and the `edit` events are the only place an edit's commit is named — the history's
+ * editor calls carry the diff they asked for, not the revision they made — so replaying
+ * them is what puts **Revert** back on a card after a reload. The stream ends by itself
+ * once nothing is running, so the replay is one bounded read.
+ */
 import {
+  attachmentUrl,
   cancelTurn,
   createConversation,
   deleteConversation,
@@ -13,153 +30,23 @@ import {
   type ContentBlock,
   type Conversation,
 } from '~/lib/api'
+import { commandArguments, formatBytes, type ComposerPayload } from '~/lib/composer'
+import { nodesToMarkdown } from '~/lib/copy'
 import { parseResultMarkdown, type ResultBlock } from '~/lib/markdown'
 import type { MenuItem, Point } from '~/lib/menu'
+import {
+  buildThread,
+  isLive,
+  type CardState,
+  type EditCard,
+  type ThreadItem,
+  type UserAttachment,
+} from '~/lib/thread'
 import type { StreamedEvent } from '~/composables/useConversationStream'
 
-/** What the thread draws, in order (docs/web.md § The agent panel). */
-type ThreadItem =
-  | { kind: 'user'; key: string; text: string; selection: number }
-  | { kind: 'text'; key: string; text: string }
-  | { kind: 'thinking'; key: string; text: string }
-  | {
-      kind: 'tool'
-      key: string
-      name: string
-      summary: string
-      /** `none`: the turn ended without a result for it (a cancel) — no mark to draw. */
-      status: 'pending' | 'ok' | 'error' | 'none'
-    }
-  | { kind: 'edit'; key: string; card: EditCard }
-  | { kind: 'error'; key: string; text: string }
-  | { kind: 'cancelled'; key: string }
-  | { kind: 'working'; key: string }
-
-interface DiffLine {
-  kind: 'added' | 'removed' | 'context' | 'hunk'
-  text: string
-}
-
-interface EditCard {
-  /** The editor tool call that made it — the card's identity across reloads. */
-  toolUseId: string
-  path: string
-  command: string
-  lines: DiffLine[]
-  /** The commit the `edit` event named; null for a card rebuilt from history alone. */
-  commit: string | null
-}
-
-/** The chat agent's editor tool and the commands of it that write (docs/chat.md § Tools). */
-const EDITOR_TOOL = 'str_replace_based_edit_tool'
-const EDITOR_WRITES = new Set(['str_replace', 'insert', 'create'])
-/** A turn the backend has not finished: queued, running, or cancelled and still winding
- *  down a tool call — `finished_at` says, not the status (docs/chat.md § Conversations). */
-const isLive = (turn: ChatTurn): boolean => turn.finished_at === null
 /** How long to wait before following a still-live turn again after the stream gave up. */
 const RESUME_AFTER_MS = 10_000
-/** A tool line is one line: longer command text is cut, the full one rides on `title`. */
-const SUMMARY_MAX = 72
 
-function lineOf(value: unknown): string {
-  return typeof value === 'string' ? value : value === undefined ? '' : JSON.stringify(value)
-}
-
-function clip(text: string): string {
-  const first = text.split('\n')[0] ?? ''
-  return first.length > SUMMARY_MAX ? `${first.slice(0, SUMMARY_MAX - 1)}…` : first
-}
-
-/** `bash ls figures`, `str_replace doc.md`, `view_page 3` — the argument that names the call. */
-function summarizeTool(name: string, input: Record<string, unknown>): string {
-  switch (name) {
-    case 'bash':
-      return input.restart ? 'restart' : clip(lineOf(input.command))
-    case EDITOR_TOOL: {
-      const path = lineOf(input.path)
-      return `${lineOf(input.command)} ${path.slice(path.lastIndexOf('/') + 1)}`.trim()
-    }
-    case 'view_page':
-      return lineOf(input.page)
-    case 'view_figure':
-      return `p${lineOf(input.page)} ${lineOf(input.bbox)}`
-    default:
-      return clip(JSON.stringify(input))
-  }
-}
-
-/**
- * A unified diff as lines. The file header and hunk markers are kept as their own kinds
- * so the card can mute them; everything else is an added, removed or context line.
- */
-function parseDiff(diff: string): DiffLine[] {
-  const lines: DiffLine[] = []
-  for (const line of diff.replace(/\n$/, '').split('\n')) {
-    if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('diff ') || line.startsWith('index ')) {
-      continue
-    }
-    if (line.startsWith('@@')) {
-      lines.push({ kind: 'hunk', text: line })
-    } else if (line.startsWith('+')) {
-      lines.push({ kind: 'added', text: line.slice(1) })
-    } else if (line.startsWith('-')) {
-      lines.push({ kind: 'removed', text: line.slice(1) })
-    } else {
-      lines.push({ kind: 'context', text: line.startsWith(' ') ? line.slice(1) : line })
-    }
-  }
-  return lines
-}
-
-/** The diff a stored editor call implies, for a card whose `edit` event is not at hand. */
-function diffFromInput(input: Record<string, unknown>): DiffLine[] {
-  const removed = lineOf(input.old_str)
-  const added = lineOf(input.new_str ?? input.file_text)
-  return [
-    ...(removed ? removed.split('\n').map((text) => ({ kind: 'removed' as const, text })) : []),
-    ...(added ? added.split('\n').map((text) => ({ kind: 'added' as const, text })) : []),
-  ]
-}
-
-/** The user's own words: a text block the backend marked as context (the selected
- *  passage it appended) is scaffolding for the model, not something the reader typed. */
-function textOf(blocks: ContentBlock[]): string {
-  return blocks
-    .filter((block): block is { type: 'text'; text: string } => block.type === 'text' && !block.context)
-    .map((block) => block.text)
-    .join('\n')
-    .trim()
-}
-
-/** How many characters of the document went with the message as its selection, or 0. */
-function selectionOf(blocks: ContentBlock[]): number {
-  return blocks
-    .filter((block): block is { type: 'text'; text: string; context: string } => block.type === 'text' && block.context === 'selection')
-    .reduce((total, block) => total + block.text.length, 0)
-}
-
-function isToolResultOnly(blocks: ContentBlock[]): boolean {
-  return blocks.length > 0 && blocks.every((block) => block.type === 'tool_result')
-}
-</script>
-
-<script setup lang="ts">
-/**
- * The `chat` agent's thread about one document (docs/web.md § The agent panel).
- *
- * The thread is `messages` — the persisted history — plus the live `chat_events` stream
- * for the turn in flight. The stream is opened from sequence 0 whenever a conversation is
- * opened, for two reasons: a turn that was already running when the viewer opened has no
- * other way back into view, and the `edit` events are the only place an edit's commit is
- * named — the history's editor calls carry the diff they asked for, not the revision they
- * made — so replaying them is what puts **Revert** back on a card after a reload. The
- * stream ends by itself once nothing is running, so the replay is one bounded read.
- *
- * Turns are matched to the stream by order: the k-th `turn_start` is the k-th turn of
- * the conversation. A turn with its assistant message stored renders from the message
- * (its edit cards taking their commits from the matching replayed group); one still
- * running renders from its events as they arrive.
- */
 const props = defineProps<{
   documentId: number
   /** The document pane's current selection, read at the moment a message is composed. */
@@ -171,6 +58,20 @@ const emit = defineEmits<{ changed: [] }>()
 
 const { t, locale } = useI18n()
 const { resolve } = useApiError()
+const auth = useAuth()
+
+/** The server's own numbers: the composer checks attachments against them. */
+const limits = computed(() => auth.me.value?.limits ?? null)
+
+/** What the composer exposes to the panel: the drop zone and the reply toolbar feed it. */
+interface ComposerControls {
+  addFiles: (files: readonly File[]) => void
+  setQuote: (text: string) => Promise<void>
+  focus: () => void
+}
+
+const composer = ref<ComposerControls | null>(null)
+const composerError = ref<string | null>(null)
 
 // --- conversations --------------------------------------------------------------
 
@@ -430,12 +331,6 @@ const stream = useConversationStream(
   },
 )
 
-onBeforeUnmount(() => {
-  if (flushTimer !== null) {
-    clearTimeout(flushTimer)
-  }
-})
-
 /** The frames of each turn, by the id every frame carries — never by position, since a
  *  turn whose load failed emits only its `turn_error`. */
 const groups = computed(() => {
@@ -453,233 +348,17 @@ const groups = computed(() => {
 
 // --- the thread --------------------------------------------------------------------
 
-/** Each card's state after the reader acted on it: reverted, and the commit that undoes
- *  the undo. Keyed by the tool call, which survives a reload where the item list does not. */
-const cards = reactive(
-  new Map<string, { reverted: boolean; undoCommit: string | null; redoCommit: string | null; pending: boolean }>(),
-)
-
-/** The turns in order — those the record lists (oldest first, as the API sends them), then
- *  any a message or a frame names that it does not, in the order they were seen. */
-const turnOrder = computed(() => {
-  const ids: string[] = turns.value.map((turn) => turn.id)
-  for (const message of messages.value) {
-    if (message.turn_id !== null && !ids.includes(message.turn_id)) {
-      ids.push(message.turn_id)
-    }
-  }
-  for (const turnId of groups.value.keys()) {
-    if (!ids.includes(turnId)) {
-      ids.push(turnId)
-    }
-  }
-  return ids
-})
-
-function isTerminal(turn: ChatTurn | undefined, group: ChatEvent[] | undefined, stored: boolean): boolean {
-  if (group?.some((event) => event.event === 'turn_done' || event.event === 'turn_error')) {
-    return true
-  }
-  if (turn) {
-    return !isLive(turn)
-  }
-  return stored
-}
-
-const thread = computed<ThreadItem[]>(() => {
-  const items: ThreadItem[] = []
-  const turnById = new Map(turns.value.map((turn) => [turn.id, turn]))
-
-  turnOrder.value.forEach((turnId) => {
-    const turn = turnById.get(turnId)
-    const group = groups.value.get(turnId)
-    const own = messages.value.filter((message) => message.turn_id === turnId)
-    // One assistant message per model round: a tool-using turn has several, and the
-    // final answer is the last of them.
-    const assistants = own.filter((message) => message.role === 'assistant')
-    const prefix = `t${turnId}`
-
-    const typed = own.filter((message) => message.role === 'user' && !isToolResultOnly(message.content))
-    const userText = typed
-      .map((message) => textOf(message.content))
-      .filter(Boolean)
-      .join('\n')
-    if (userText) {
-      items.push({
-        kind: 'user',
-        key: `${prefix}-user`,
-        text: userText,
-        selection: typed.reduce((total, message) => total + selectionOf(message.content), 0),
-      })
-    }
-
-    // Tool outcomes, from the record and from the stream — whichever has them.
-    const results = new Map<string, boolean>()
-    for (const message of own) {
-      for (const block of message.content) {
-        if (block.type === 'tool_result') {
-          results.set(block.tool_use_id, block.is_error === true)
-        }
-      }
-    }
-    const edits = new Map<string, Extract<ChatEvent, { event: 'edit' }>>()
-    for (const event of group ?? []) {
-      if (event.event === 'tool_result') {
-        results.set(event.id, event.is_error)
-      } else if (event.event === 'edit') {
-        edits.set(event.tool_use_id, event)
-      }
-    }
-
-    const done = isTerminal(turn, group, assistants.length > 0)
-
-    const toolItem = (id: string, name: string, input: Record<string, unknown>): ThreadItem => {
-      const outcome = results.get(id)
-      return {
-        kind: 'tool',
-        key: `${prefix}-tool-${id}`,
-        name,
-        summary: summarizeTool(name, input),
-        status: outcome === undefined ? (done ? 'none' : 'pending') : outcome ? 'error' : 'ok',
-      }
-    }
-
-    const editItem = (id: string, input: Record<string, unknown>): ThreadItem | null => {
-      const command = lineOf(input.command)
-      const event = edits.get(id)
-      if (!event && !EDITOR_WRITES.has(command)) {
-        return null
-      }
-      return {
-        kind: 'edit',
-        key: `${prefix}-edit-${id}`,
-        card: {
-          toolUseId: id,
-          path: event?.path ?? lineOf(input.path),
-          command: event?.command ?? command,
-          lines: event ? parseDiff(event.diff) : diffFromInput(input),
-          commit: event?.commit ?? null,
-        },
-      }
-    }
-
-    // The live events a persisted round does not cover: what streamed after the last
-    // tool call the record holds (its results and the next round), or the whole group
-    // when nothing of the turn is stored yet. A retried model call starts over, so what
-    // the abandoned attempt streamed is noise.
-    const renderLive = (events: ChatEvent[], coveredEdits: Set<string>) => {
-      const restart = events.map((event) => event.event).lastIndexOf('retry')
-      const live = restart === -1 ? events : events.slice(restart + 1)
-      let text = ''
-      let textKey = 0
-      const flushText = () => {
-        if (text.trim()) {
-          items.push({ kind: 'text', key: `${prefix}-live-${textKey}`, text: text.trim() })
-        }
-        text = ''
-        textKey += 1
-      }
-      for (const event of live) {
-        switch (event.event) {
-          case 'text_delta':
-            text += event.text
-            break
-          case 'thinking':
-            flushText()
-            if (event.text.trim()) {
-              items.push({ kind: 'thinking', key: `${prefix}-live-think-${items.length}`, text: event.text.trim() })
-            }
-            break
-          case 'tool_use':
-            flushText()
-            items.push(toolItem(event.id, event.name, event.input))
-            break
-          case 'edit': {
-            if (coveredEdits.has(event.tool_use_id)) {
-              break // drawn with the stored round's tool call
-            }
-            flushText()
-            const card = editItem(event.tool_use_id, {})
-            if (card) {
-              items.push(card)
-            }
-            break
-          }
-          default:
-            break
-        }
-      }
-      flushText()
-    }
-
-    if (assistants.length > 0) {
-      const storedTools = new Set<string>()
-      assistants.forEach((message, round) => {
-        message.content.forEach((block, position) => {
-          const at = `${round}-${position}`
-          if (block.type === 'text' && block.text.trim()) {
-            items.push({ kind: 'text', key: `${prefix}-text-${at}`, text: block.text.trim() })
-          } else if (block.type === 'thinking' && block.thinking.trim()) {
-            items.push({ kind: 'thinking', key: `${prefix}-think-${at}`, text: block.thinking.trim() })
-          } else if (block.type === 'tool_use') {
-            storedTools.add(block.id)
-            items.push(toolItem(block.id, block.name, block.input))
-            // Any tool whose `edit` event is on record — a shell command that changed the
-            // tree has a revision to show and revert too — or an editor write the record
-            // says succeeded; a failed one has nothing to show.
-            if (edits.has(block.id) || (block.name === EDITOR_TOOL && results.get(block.id) === false)) {
-              const card = editItem(block.id, block.input)
-              if (card) {
-                items.push(card)
-              }
-            }
-          }
-        })
-      })
-      if (group && !done) {
-        // The stream past the last stored round: a tool-using turn goes on after the
-        // panel opened or the record was reloaded, and its later rounds show live
-        // until the next reload stores them (docs/web.md § The agent panel).
-        const cut = group.map((event) => event.event === 'tool_use' && storedTools.has(event.id)).lastIndexOf(true)
-        if (cut !== -1) {
-          renderLive(group.slice(cut + 1), storedTools)
-        }
-      }
-    } else if (group) {
-      renderLive(group, new Set())
-    }
-
-    const streamError = group?.find(
-      (event): event is Extract<ChatEvent, { event: 'turn_error' }> => event.event === 'turn_error',
-    )
-    // A cancelled turn ends in a `turn_error` whose status says so: a cancellation, not an
-    // error with the backend's word in it.
-    if (streamError?.status === 'cancelled' || turn?.status === 'cancelled') {
-      items.push({ kind: 'cancelled', key: `${prefix}-cancelled` })
-    } else if (streamError) {
-      items.push({ kind: 'error', key: `${prefix}-error`, text: streamError.error })
-    } else if (turn?.error) {
-      items.push({ kind: 'error', key: `${prefix}-error`, text: turn.error })
-    }
-
-    if (!done) {
-      items.push({ kind: 'working', key: `${prefix}-working` })
-    }
-  })
-
-  return items
-})
+const thread = computed(() => buildThread({ turns: turns.value, messages: messages.value, groups: groups.value }))
+const items = computed(() => thread.value.items)
 
 /** A turn is in flight: the composer waits, and Stop is the one control. */
-const running = computed(
-  () => thread.value.some((item) => item.kind === 'working') || stream.active.value,
-)
+const running = computed(() => thread.value.liveTurns.length > 0 || stream.active.value)
 
 const scroller = ref<HTMLElement | null>(null)
 
 /** Follows the thread as it grows — a reader watching a turn is reading its tail. */
 watch(
-  () => [thread.value.length, events.value.length],
+  () => [items.value.length, events.value.length],
   async () => {
     await nextTick()
     const box = scroller.value
@@ -688,156 +367,6 @@ watch(
     }
   },
 )
-
-// --- edit cards: revert and apply again ---------------------------------------------
-
-function cardState(card: EditCard) {
-  return cards.get(card.toolUseId) ?? { reverted: false, undoCommit: null, redoCommit: null, pending: false }
-}
-
-const cardError = ref<string | null>(null)
-
-/**
- * Revert writes the file as it was before the edit's commit, as a new commit; that new
- * commit is what *Apply again* reverts in turn, and so on — undo is itself a revision
- * (docs/workspace.md § Revisions). The revision list, newest first, names each one.
- */
-async function toggleEdit(card: EditCard) {
-  const state = cardState(card)
-  const target = state.reverted ? state.undoCommit : (state.redoCommit ?? card.commit)
-  if (!target || state.pending) {
-    return
-  }
-  cards.set(card.toolUseId, { ...state, pending: true })
-  cardError.value = null
-  try {
-    // The commit the revert made, from the response: the newest revision could by now
-    // be someone else's.
-    const { commit: made } = await revertRevision(props.documentId, target)
-    cards.set(card.toolUseId, {
-      reverted: !state.reverted,
-      undoCommit: state.reverted ? state.undoCommit : made,
-      redoCommit: state.reverted ? made : state.redoCommit,
-      pending: false,
-    })
-    emit('changed')
-  } catch (error) {
-    cardError.value = await resolve(error)
-    cards.set(card.toolUseId, { ...state, pending: false })
-  }
-}
-
-// --- the composer --------------------------------------------------------------------
-
-const draft = ref('')
-const composer = ref<HTMLTextAreaElement | null>(null)
-const composerError = ref<string | null>(null)
-const sending = ref(false)
-/** The document selection picked up when the reader came to the composer. */
-const selection = ref<string | null>(null)
-
-/** Before the composer takes focus — on the pointer's way in, and on keyboard focus — the
- *  document's selection is still the reader's, so this is when it is read. Every reading
- *  replaces the last, none included: a passage selected and then deselected is not sent.
- *  The focus that follows a pointer capture is skipped, since by then the click has
- *  collapsed what the pointer already read. */
-let capturedByPointer = false
-
-function captureSelection() {
-  selection.value = props.documentSelection() || null
-}
-
-function captureOnPointer() {
-  captureSelection()
-  capturedByPointer = true
-  // Cleared once the focus this press causes (if any) has been handled.
-  setTimeout(() => {
-    capturedByPointer = false
-  }, 0)
-}
-
-function captureOnFocus() {
-  if (capturedByPointer) {
-    return
-  }
-  captureSelection()
-}
-
-async function send() {
-  const text = draft.value.trim()
-  if (!text || sending.value || running.value) {
-    return
-  }
-  sending.value = true
-  composerError.value = null
-  try {
-    let id = currentId.value
-    if (id === null) {
-      id = await startConversation()
-      if (id === null) {
-        return
-      }
-    }
-    const picked = selection.value
-    const { turn_id } = await sendMessage(id, {
-      text,
-      ...(picked ? { selection: picked } : {}),
-      locale: locale.value,
-    })
-    if (currentId.value !== id) {
-      // The reader switched threads while the send was in flight: the turn belongs to
-      // the thread it was sent to, which shows it when it is opened again. The text and
-      // the selection were accepted there, so they are not a draft of this thread —
-      // unless the reader has typed since, which is this thread's draft and stays.
-      if (draft.value.trim() === text) {
-        draft.value = ''
-      }
-      if (selection.value === picked) {
-        selection.value = null
-      }
-      return
-    }
-    // A record reload still in flight (a terminal event's, a dropped stream's) fetched the
-    // thread before this message was accepted: dropped, or it would replace the message
-    // and the turn below with a record that lacks them (docs/web.md).
-    detailSeq++
-    detailPending.value = false
-    messages.value = [
-      ...messages.value,
-      {
-        // Shown until the record is reloaded; negative so it never meets a stored id.
-        id: -(messages.value.length + 1),
-        role: 'user',
-        // The selection too, in the shape the record serves it (the passage alone, marked
-        // as context), so its note does not vanish for the length of the turn.
-        content: [
-          { type: 'text', text },
-          ...(picked ? [{ type: 'text' as const, text: picked, context: 'selection' }] : []),
-        ],
-        turn_id,
-        created_at: new Date().toISOString(),
-      },
-    ]
-    turns.value = [...turns.value, { id: turn_id, status: 'queued', error: null, finished_at: null }]
-    draft.value = ''
-    selection.value = null
-    stream.expectTurn(turn_id)
-  } catch (error) {
-    composerError.value = await resolve(error)
-  } finally {
-    sending.value = false
-  }
-}
-
-/** Enter sends and Shift+Enter breaks the line, as in Claude's own chat; an Enter that
- *  confirms an input method's composition only confirms it (docs/web.md § The agent panel). */
-function onComposerKey(event: KeyboardEvent) {
-  if (event.key !== 'Enter' || event.shiftKey || event.isComposing || event.keyCode === 229) {
-    return
-  }
-  event.preventDefault()
-  void send()
-}
 
 /** Parsed messages by text: the panel re-renders on every streamed delta, and re-parsing
  *  every answer in a long thread each time would make typing stutter. Streaming makes many
@@ -858,6 +387,274 @@ function messageBlocks(text: string): ResultBlock[] {
   return blocks
 }
 
+type UserItem = Extract<ThreadItem, { kind: 'user' }>
+type StepsItem = Extract<ThreadItem, { kind: 'steps' }>
+type SubagentItem = Extract<ThreadItem, { kind: 'subagent' }>
+type ChangesItem = Extract<ThreadItem, { kind: 'changes' }>
+
+/** A command message reads as its chip and then its arguments. */
+function userText(item: UserItem): string {
+  return item.command ? commandArguments(item.text, item.command) : item.text
+}
+
+/** An attached image's thumbnail: its local preview until the record holds the message,
+ *  then the stored block's bytes. */
+function imageSource(item: UserItem, attachment: UserAttachment): string | null {
+  if (attachment.preview) {
+    return attachment.preview
+  }
+  if (item.messageId === null || item.messageId < 0 || currentId.value === null) {
+    return null
+  }
+  return attachmentUrl(currentId.value, item.messageId, attachment.index)
+}
+
+// --- what the reader opened ------------------------------------------------------------
+
+/** Kept by key, since the items are rebuilt on every frame: a group the reader toggled
+ *  stays as they left it, one they never touched is open while its turn is live. */
+const openGroups = reactive(new Map<string, boolean>())
+const openSteps = reactive(new Set<string>())
+const openCards = reactive(new Map<string, boolean>())
+
+function groupOpen(item: StepsItem): boolean {
+  return openGroups.get(item.key) ?? item.live
+}
+
+function toggleGroup(item: StepsItem) {
+  openGroups.set(item.key, !groupOpen(item))
+}
+
+function toggleStep(key: string) {
+  if (openSteps.has(key)) {
+    openSteps.delete(key)
+  } else {
+    openSteps.add(key)
+  }
+}
+
+function cardOpen(item: SubagentItem): boolean {
+  return openCards.get(item.card.id) ?? item.card.status === 'running'
+}
+
+function toggleCard(item: SubagentItem) {
+  openCards.set(item.card.id, !cardOpen(item))
+}
+
+/** **View** on a changes card: the turn's groups open, and every edit in them. */
+function viewChanges(turnId: string) {
+  for (const item of items.value) {
+    if (item.kind === 'steps' && item.turnId === turnId) {
+      openGroups.set(item.key, true)
+      for (const step of item.steps) {
+        if (step.type === 'tool' && step.card) {
+          openSteps.add(step.key)
+        }
+      }
+    }
+  }
+}
+
+/** When the panel first saw each subagent running: what its live duration counts from. */
+const subagentSeen = reactive(new Map<string, number>())
+const now = ref(Date.now())
+let ticker: ReturnType<typeof setInterval> | null = null
+
+watch(
+  items,
+  (list) => {
+    for (const item of list) {
+      if (item.kind === 'subagent' && item.card.status === 'running' && !subagentSeen.has(item.card.id)) {
+        subagentSeen.set(item.card.id, Date.now())
+      }
+    }
+  },
+  { immediate: true },
+)
+
+// A clock for the running subagents' durations, stopped while none runs.
+watch(
+  () => items.value.some((item) => item.kind === 'subagent' && item.card.status === 'running'),
+  (anyRunning) => {
+    if (anyRunning && ticker === null) {
+      now.value = Date.now()
+      ticker = setInterval(() => {
+        now.value = Date.now()
+      }, 1000)
+    } else if (!anyRunning && ticker !== null) {
+      clearInterval(ticker)
+      ticker = null
+    }
+  },
+  { immediate: true },
+)
+
+// --- edit cards: revert and apply again ---------------------------------------------
+
+/** Each card's state after the reader acted on it: reverted, and the commit that undoes
+ *  the undo. Keyed by the tool call, which survives a reload where the item list does not. */
+const cards = reactive(new Map<string, CardState>())
+
+function cardState(card: EditCard): CardState {
+  return cards.get(card.toolUseId) ?? { reverted: false, undoCommit: null, redoCommit: null, pending: false }
+}
+
+const cardError = ref<string | null>(null)
+
+/**
+ * Revert writes the file as it was before the edit's commit, as a new commit; that new
+ * commit is what *Apply again* reverts in turn, and so on — undo is itself a revision
+ * (docs/workspace.md § Revisions). The revision list, newest first, names each one.
+ * `quiet` leaves the document's reload to a caller reverting several in a row.
+ */
+async function toggleEdit(card: EditCard, quiet = false): Promise<boolean> {
+  const state = cardState(card)
+  const target = state.reverted ? state.undoCommit : (state.redoCommit ?? card.commit)
+  if (!target || state.pending) {
+    return false
+  }
+  cards.set(card.toolUseId, { ...state, pending: true })
+  cardError.value = null
+  try {
+    // The commit the revert made, from the response: the newest revision could by now
+    // be someone else's.
+    const { commit: made } = await revertRevision(props.documentId, target)
+    cards.set(card.toolUseId, {
+      reverted: !state.reverted,
+      undoCommit: state.reverted ? state.undoCommit : made,
+      redoCommit: state.reverted ? made : state.redoCommit,
+      pending: false,
+    })
+    if (!quiet) {
+      emit('changed')
+    }
+    return true
+  } catch (error) {
+    cardError.value = await resolve(error)
+    cards.set(card.toolUseId, { ...state, pending: false })
+    return false
+  }
+}
+
+/** The changes cards whose Revert all or Apply again is under way, by turn. */
+const bulkPending = reactive(new Set<string>())
+
+/**
+ * **Revert all**: the turn's edits still applied, newest first, so each revert meets the
+ * file as the later edits left it — one route call each, stopping at the first refused.
+ * **Apply again** once all are reverted: the same, oldest first, the order they were made.
+ */
+async function toggleAll(item: ChangesItem) {
+  if (bulkPending.has(item.turnId)) {
+    return
+  }
+  const allReverted = item.cards.every((card) => cardState(card).reverted)
+  const order = allReverted ? item.cards : [...item.cards].reverse()
+  const targets = order.filter((card) => cardState(card).reverted === allReverted)
+  bulkPending.add(item.turnId)
+  let changed = false
+  try {
+    for (const card of targets) {
+      if (!(await toggleEdit(card, true))) {
+        break
+      }
+      changed = true
+    }
+  } finally {
+    bulkPending.delete(item.turnId)
+    if (changed) {
+      emit('changed')
+    }
+  }
+}
+
+// --- sending -------------------------------------------------------------------------
+
+/** The message as the record will serve it — its blocks in their stored order, the
+ *  scaffolding marked and empty — so the thread draws it the same before the reload. */
+function sentContent(payload: ComposerPayload): ContentBlock[] {
+  const blocks: ContentBlock[] = []
+  for (const attachment of payload.attachments.filter((entry) => entry.image)) {
+    blocks.push({
+      type: 'image',
+      attachment: { name: attachment.name, kind: 'image' },
+      ...(attachment.preview ? { preview: attachment.preview } : {}),
+    })
+  }
+  for (const attachment of payload.attachments.filter((entry) => !entry.image)) {
+    blocks.push({ type: 'text', text: '', context: 'attachment', attachment: { name: attachment.name, kind: 'text' } })
+  }
+  const line = payload.command ? `/${payload.command}${payload.text ? ` ${payload.text}` : ''}` : payload.text
+  if (line) {
+    blocks.push({ type: 'text', text: line })
+  }
+  if (payload.selection) {
+    blocks.push({ type: 'text', text: payload.selection, context: 'selection' })
+  }
+  if (payload.quote) {
+    blocks.push({ type: 'text', text: payload.quote, context: 'quote' })
+  }
+  if (payload.command) {
+    blocks.push({ type: 'text', text: '', context: 'skill', skill: payload.command })
+  }
+  return blocks
+}
+
+/** Posts the composer's message, opening a conversation first if none is. True once the
+ *  server accepted it: the composer then clears what it sent. */
+async function submit(payload: ComposerPayload): Promise<boolean> {
+  if (running.value) {
+    return false
+  }
+  composerError.value = null
+  let id = currentId.value
+  if (id === null) {
+    id = await startConversation()
+    if (id === null) {
+      return false
+    }
+  }
+  try {
+    const { turn_id, message_id } = await sendMessage(id, {
+      text: payload.text,
+      ...(payload.selection ? { selection: payload.selection } : {}),
+      ...(payload.quote ? { quote: payload.quote } : {}),
+      ...(payload.command ? { command: payload.command } : {}),
+      ...(payload.attachments.length ? { attachments: payload.attachments.map((entry) => entry.id) } : {}),
+      locale: locale.value,
+    })
+    if (currentId.value !== id) {
+      // The reader switched threads while the send was in flight: the turn belongs to
+      // the thread it was sent to, which shows it when it is opened again. What was sent
+      // was accepted there, so it is no draft of this thread.
+      return true
+    }
+    // A record reload still in flight (a terminal event's, a dropped stream's) fetched the
+    // thread before this message was accepted: dropped, or it would replace the message
+    // and the turn below with a record that lacks them (docs/web.md).
+    detailSeq++
+    detailPending.value = false
+    messages.value = [
+      ...messages.value,
+      {
+        // The stored id, so an attached image's bytes can be asked for once its preview
+        // is gone; negative only if the server named none, so it never meets a stored one.
+        id: message_id ?? -(messages.value.length + 1),
+        role: 'user',
+        content: sentContent(payload),
+        turn_id,
+        created_at: new Date().toISOString(),
+      },
+    ]
+    turns.value = [...turns.value, { id: turn_id, status: 'queued', error: null, finished_at: null }]
+    stream.expectTurn(turn_id)
+    return true
+  } catch (error) {
+    composerError.value = await resolve(error)
+    return false
+  }
+}
+
 const stopping = ref(false)
 
 async function stop() {
@@ -874,10 +671,185 @@ async function stop() {
     stopping.value = false
   }
 }
+
+// --- reply: the toolbar over a selection in an answer ------------------------------------
+
+/** Where the toolbar stands (viewport coordinates) and the passage it would quote. */
+const toolbar = ref<{ x: number; y: number; below: boolean; text: string } | null>(null)
+/** A pointer is down in the thread: the selection is still being made. */
+let selecting = false
+let toolbarFrame = 0
+
+/** The answer a node sits in, if it is one of this thread's. */
+function answerOf(node: Node | null): Element | null {
+  const element = node instanceof Element ? node : (node?.parentElement ?? null)
+  const answer = element?.closest('.assistant') ?? null
+  return answer && scroller.value?.contains(answer) ? answer : null
+}
+
+/** The passage as markdown — math back as `$…$`, as the viewer's own copy does — so the
+ *  quote reads as the answer was written. */
+function passageOf(selection: Selection): string {
+  const range = selection.getRangeAt(0)
+  return (nodesToMarkdown(range.cloneContents().childNodes) || selection.toString()).trim()
+}
+
+function readAnswerSelection() {
+  toolbarFrame = 0
+  const selection = window.getSelection()
+  if (selecting || !selection || selection.isCollapsed || selection.rangeCount === 0) {
+    toolbar.value = null
+    return
+  }
+  const answer = answerOf(selection.anchorNode)
+  if (!answer || answer !== answerOf(selection.focusNode)) {
+    toolbar.value = null
+    return
+  }
+  const text = passageOf(selection)
+  if (!text) {
+    toolbar.value = null
+    return
+  }
+  const rect = selection.getRangeAt(0).getBoundingClientRect()
+  // Under the passage when there is no room over it.
+  const below = rect.top < 48
+  toolbar.value = {
+    x: Math.min(Math.max(rect.left + rect.width / 2, 96), window.innerWidth - 96),
+    y: below ? rect.bottom + 6 : rect.top - 6,
+    below,
+    text,
+  }
+}
+
+function scheduleToolbar() {
+  if (!toolbarFrame) {
+    toolbarFrame = requestAnimationFrame(readAnswerSelection)
+  }
+}
+
+function onThreadPointerDown() {
+  selecting = true
+  toolbar.value = null
+}
+
+function onPointerUp() {
+  if (selecting) {
+    selecting = false
+    scheduleToolbar()
+  }
+}
+
+/** *Reply* puts the passage in the composer as the quote and focuses the textarea. */
+function replyToSelection() {
+  const text = toolbar.value?.text
+  toolbar.value = null
+  if (!text) {
+    return
+  }
+  window.getSelection()?.removeAllRanges()
+  void composer.value?.setQuote(text)
+}
+
+async function copySelection() {
+  const text = toolbar.value?.text
+  toolbar.value = null
+  if (!text) {
+    return
+  }
+  try {
+    await navigator.clipboard.writeText(text)
+  } catch {
+    // Clipboard access can be denied; the passage is still selected for a manual copy.
+  }
+}
+
+// --- attachments dropped anywhere on the panel -------------------------------------------
+
+const dragging = ref(false)
+/** Enter and leave fire for every child the drag crosses: the zone stays while any holds it. */
+let dragDepth = 0
+
+function carriesFiles(event: DragEvent): boolean {
+  return Array.from(event.dataTransfer?.types ?? []).includes('Files')
+}
+
+function onDragEnter(event: DragEvent) {
+  if (!carriesFiles(event)) {
+    return
+  }
+  event.preventDefault()
+  dragDepth += 1
+  // The composer takes nothing while a turn runs, so neither does the panel.
+  dragging.value = !running.value
+}
+
+function onDragOver(event: DragEvent) {
+  if (!carriesFiles(event)) {
+    return
+  }
+  // Taken here, never handed to the browser — which would open the file in the tab.
+  event.preventDefault()
+  if (event.dataTransfer) {
+    event.dataTransfer.dropEffect = running.value ? 'none' : 'copy'
+  }
+}
+
+function onDragLeave(event: DragEvent) {
+  if (!carriesFiles(event)) {
+    return
+  }
+  dragDepth = Math.max(0, dragDepth - 1)
+  if (!dragDepth) {
+    dragging.value = false
+  }
+}
+
+function endDrag() {
+  dragDepth = 0
+  dragging.value = false
+}
+
+function onDrop(event: DragEvent) {
+  if (!carriesFiles(event)) {
+    return
+  }
+  event.preventDefault()
+  endDrag()
+  if (!running.value) {
+    composer.value?.addFiles(Array.from(event.dataTransfer?.files ?? []))
+  }
+}
+
+const maxAttachmentBytes = computed(() => limits.value?.attachment_max_bytes ?? null)
+
+onMounted(() => {
+  document.addEventListener('selectionchange', scheduleToolbar)
+  window.addEventListener('pointerup', onPointerUp)
+  // A drag that ends anywhere — dropped elsewhere, or cancelled — takes the zone with it.
+  window.addEventListener('dragend', endDrag)
+  window.addEventListener('drop', endDrag)
+})
+
+onBeforeUnmount(() => {
+  if (flushTimer !== null) {
+    clearTimeout(flushTimer)
+  }
+  if (ticker !== null) {
+    clearInterval(ticker)
+  }
+  if (toolbarFrame) {
+    cancelAnimationFrame(toolbarFrame)
+  }
+  document.removeEventListener('selectionchange', scheduleToolbar)
+  window.removeEventListener('pointerup', onPointerUp)
+  window.removeEventListener('dragend', endDrag)
+  window.removeEventListener('drop', endDrag)
+})
 </script>
 
 <template>
-  <div class="chat">
+  <div class="chat" @dragenter="onDragEnter" @dragover="onDragOver" @dragleave="onDragLeave" @drop="onDrop">
     <!-- The conversation's name opens the document's list of them. -->
     <div class="head">
       <button
@@ -904,76 +876,92 @@ async function stop() {
       @close="menu = null"
     />
 
-    <div ref="scroller" class="thread">
+    <div ref="scroller" class="thread" @pointerdown="onThreadPointerDown" @scroll="scheduleToolbar">
       <UiBanner v-if="conversationsError" tone="error">{{ conversationsError }}</UiBanner>
       <UiBanner v-else-if="detailError" tone="error">{{ detailError }}</UiBanner>
       <UiBanner v-if="cardError" tone="error">{{ cardError }}</UiBanner>
 
-      <UiSkeleton v-if="detailPending && !thread.length" :rows="3" />
-      <p v-else-if="!thread.length" class="empty">{{ t('chat.empty') }}</p>
+      <UiSkeleton v-if="detailPending && !items.length" :rows="3" />
+      <p v-else-if="!items.length" class="empty">{{ t('chat.empty') }}</p>
 
-      <template v-for="item in thread" :key="item.key">
-        <!-- The reader's turn: right-aligned on the sunken surface. -->
+      <template v-for="item in items" :key="item.key">
+        <!-- The reader's turn: right-aligned, what went with it above the bubble. -->
         <div v-if="item.kind === 'user'" class="user-row">
-          <p class="user">{{ item.text }}</p>
+          <div v-if="item.attachments.length" class="user-attachments">
+            <template v-for="attachment in item.attachments" :key="attachment.key">
+              <span
+                v-if="attachment.image"
+                class="user-image"
+                role="img"
+                :aria-label="attachment.name"
+                :title="attachment.name"
+              >
+                <img v-if="imageSource(item, attachment)" :src="imageSource(item, attachment) ?? undefined" alt="" >
+                <UiIcon v-else name="image" />
+              </span>
+              <span v-else class="user-file" :title="attachment.name">
+                <UiIcon name="file-text" />
+                <span class="user-file-name">{{ attachment.name }}</span>
+              </span>
+            </template>
+          </div>
+          <p v-if="item.quote" class="user-quote">
+            <UiIcon name="reply" />
+            <span class="user-quote-text">{{ item.quote }}</span>
+          </p>
+          <p v-if="item.text || item.command" class="user" :class="{ command: item.command }">
+            <span v-if="item.command" class="user-command mono">/{{ item.command }}</span>
+            <span v-if="userText(item)" class="user-text">{{ userText(item) }}</span>
+          </p>
           <p v-if="item.selection" class="user-selection">{{ t('chat.selection', { count: item.selection }) }}</p>
         </div>
 
-        <div v-else-if="item.kind === 'text'" class="assistant md-message">
-          <MdBlock v-for="(block, index) in messageBlocks(item.text)" :key="index" :block="block" :page="1" />
-        </div>
-
-        <!-- The model's note between tool calls: muted, one line. -->
-        <p v-else-if="item.kind === 'thinking'" class="thinking">{{ item.text }}</p>
-
-        <!-- One tool call, one mono line, marked when its result arrives. -->
-        <p v-else-if="item.kind === 'tool'" class="tool mono" :title="item.summary">
-          <span class="tool-mark" :class="item.status">
-            <UiIcon v-if="item.status === 'ok'" name="check" />
-            <UiIcon v-else-if="item.status === 'error'" name="x" />
-            <UiSpinner v-else-if="item.status === 'pending'" :size="11" />
-          </span>
-          <span class="tool-name">{{ item.name }}</span>
-          <span class="tool-args">{{ item.summary }}</span>
-          <span class="sr-only">{{ item.status === 'ok' ? t('chat.toolOk') : item.status === 'error' ? t('chat.toolFailed') : '' }}</span>
-        </p>
-
-        <!-- An edit as a diff card: applied as made, undone from its footer. -->
-        <div v-else-if="item.kind === 'edit'" class="card">
-          <div class="diff mono">
-            <div
-              v-for="(line, lineIndex) in item.card.lines"
-              :key="lineIndex"
-              class="diff-line"
-              :class="line.kind"
-            >
-              <span class="diff-sign" aria-hidden="true">{{
-                line.kind === 'added' ? '+' : line.kind === 'removed' ? '−' : ' '
-              }}</span>
-              <span class="diff-text">{{ line.text }}</span>
-            </div>
+        <div v-else-if="item.kind === 'text'" class="answer">
+          <div class="assistant md-message">
+            <MdBlock v-for="(block, index) in messageBlocks(item.text)" :key="index" :block="block" :page="1" />
           </div>
-          <div class="card-foot">
-            <span class="card-state">
-              {{ cardState(item.card).reverted ? t('chat.reverted') : t('chat.applied') }}
-              <span class="mono card-path">· {{ item.card.path.slice(item.card.path.lastIndexOf('/') + 1) }}</span>
-            </span>
-            <button
-              v-if="item.card.commit"
-              type="button"
-              class="text-link"
-              :disabled="cardState(item.card).pending || running"
-              @click="toggleEdit(item.card)"
-            >
-              {{ cardState(item.card).reverted ? t('chat.applyAgain') : t('chat.revert') }}
-            </button>
+          <!-- The last answer of a finished turn copies whole, as its markdown. -->
+          <div v-if="item.copy" class="answer-tools">
+            <UiCopyButton :text="item.text" size="xs" :label="t('chat.copyAnswer')" />
           </div>
         </div>
+
+        <ChatStepGroup
+          v-else-if="item.kind === 'steps'"
+          :steps="item.steps"
+          :live="item.live"
+          :open="groupOpen(item)"
+          :open-steps="openSteps"
+          :card-state="cardState"
+          :locked="running"
+          @toggle="toggleGroup(item)"
+          @toggle-step="toggleStep"
+          @toggle-edit="toggleEdit"
+        />
+
+        <ChatSubagentCard
+          v-else-if="item.kind === 'subagent'"
+          :card="item.card"
+          :open="cardOpen(item)"
+          :started-at="subagentSeen.get(item.card.id) ?? null"
+          :now="now"
+          @toggle="toggleCard(item)"
+        />
+
+        <ChatChangesCard
+          v-else-if="item.kind === 'changes'"
+          :cards="item.cards"
+          :card-state="cardState"
+          :locked="running"
+          :pending="bulkPending.has(item.turnId)"
+          @view="viewChanges(item.turnId)"
+          @toggle-all="toggleAll(item)"
+        />
 
         <p v-else-if="item.kind === 'error'" class="turn-error" role="alert">
           {{ t('chat.turnError', { error: item.text }) }}
         </p>
-        <p v-else-if="item.kind === 'cancelled'" class="thinking">{{ t('chat.turnCancelled') }}</p>
+        <p v-else-if="item.kind === 'cancelled'" class="turn-note">{{ t('chat.turnCancelled') }}</p>
         <p v-else-if="item.kind === 'working'" class="working">
           <UiSpinner :size="12" />
           <span>{{ t('chat.working') }}</span>
@@ -981,58 +969,46 @@ async function stop() {
       </template>
     </div>
 
-    <!-- One rounded field: the text, the attach control and the send control. -->
-    <form class="composer" @submit.prevent="send" @mousedown.capture="captureOnPointer">
-      <div class="field" :class="{ disabled: running }">
-        <p v-if="selection" class="selection">
-          <span class="selection-text">{{ t('chat.selection', { count: selection.length }) }}</span>
-          <button type="button" class="selection-drop" :aria-label="t('chat.dropSelection')" @click="selection = null">
-            <UiIcon name="x" />
-          </button>
-        </p>
-        <label for="chat-composer" class="sr-only">{{ t('chat.composer') }}</label>
-        <textarea
-          id="chat-composer"
-          ref="composer"
-          v-model="draft"
-          class="input"
-          rows="2"
-          :placeholder="t('chat.placeholder')"
-          :disabled="running"
-          @focus="captureOnFocus"
-          @keydown="onComposerKey"
-        />
-        <div class="field-foot">
-          <!-- Attachments are not wired yet; the control is where they will go. -->
-          <button type="button" class="round ghost" :aria-label="t('chat.attach')" :title="t('chat.attach')" disabled>
-            <UiIcon name="paperclip" />
-          </button>
-          <button
-            v-if="running"
-            type="button"
-            class="round stop"
-            :aria-label="t('chat.stop')"
-            :title="t('chat.stop')"
-            :disabled="stopping"
-            @click="stop"
-          >
-            <UiIcon name="square" />
-          </button>
-          <button
-            v-else
-            type="submit"
-            class="round send"
-            :aria-label="t('chat.send')"
-            :title="t('chat.send')"
-            :disabled="sending || !draft.trim()"
-          >
-            <UiSpinner v-if="sending" :size="13" />
-            <UiIcon v-else name="arrow-up" />
-          </button>
-        </div>
+    <ChatComposer
+      ref="composer"
+      :running="running"
+      :stopping="stopping"
+      :limits="limits"
+      :document-selection="documentSelection"
+      :submit="submit"
+      :error="composerError"
+      @stop="stop"
+      @new-conversation="startConversation"
+    />
+
+    <!-- A file dragged over the panel: the whole column is the target. -->
+    <div v-if="dragging" class="drop-zone" aria-hidden="true">
+      <p class="drop-title">{{ t('chat.dropToAttach') }}</p>
+      <p v-if="maxAttachmentBytes" class="drop-kinds">
+        {{ t('chat.dropKinds', { size: formatBytes(maxAttachmentBytes) }) }}
+      </p>
+    </div>
+
+    <!-- Selecting inside an answer: Reply and Copy, built like the context menu. -->
+    <Teleport to="body">
+      <div
+        v-if="toolbar"
+        class="reply-toolbar"
+        :class="{ below: toolbar.below }"
+        role="toolbar"
+        :aria-label="t('chat.selectionTools')"
+        :style="{ left: `${toolbar.x}px`, top: `${toolbar.y}px` }"
+      >
+        <button type="button" class="reply-item" @mousedown.prevent @click="replyToSelection">
+          <UiIcon name="reply" />
+          <span>{{ t('chat.reply') }}</span>
+        </button>
+        <button type="button" class="reply-item" @mousedown.prevent @click="copySelection">
+          <UiIcon name="copy" />
+          <span>{{ t('common.copy') }}</span>
+        </button>
       </div>
-      <p v-if="composerError" class="composer-error" role="alert">{{ composerError }}</p>
-    </form>
+    </Teleport>
 
     <UiConfirmDialog
       v-if="confirmingDelete"
@@ -1049,6 +1025,7 @@ async function stop() {
 
 <style scoped>
 .chat {
+  position: relative;
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -1112,6 +1089,12 @@ async function stop() {
   display: none;
 }
 
+/* The thread scrolls rather than squeezing its items: a card that clips its own overflow
+   would otherwise shrink to nothing once the thread outgrows the column. */
+.thread > * {
+  flex-shrink: 0;
+}
+
 .empty {
   margin: auto 0;
   color: var(--faint);
@@ -1119,13 +1102,18 @@ async function stop() {
   text-align: center;
 }
 
+/* --- the reader's turn ------------------------------------------------------------ */
+
 .user-row {
   display: flex;
-  justify-content: flex-end;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
 }
 
 .user {
   max-width: 88%;
+  margin: 0;
   padding: var(--space-2) var(--space-3);
   border-radius: var(--radius);
   background: var(--rail);
@@ -1134,6 +1122,124 @@ async function stop() {
   line-height: 1.55;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.user.command {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.user-command {
+  padding: 1px 6px;
+  border-radius: var(--radius);
+  background: var(--rail-active);
+  color: var(--ink);
+}
+
+.user-text {
+  white-space: pre-wrap;
+}
+
+.user-quote {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  max-width: 88%;
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+}
+
+.user-quote :deep(svg) {
+  flex-shrink: 0;
+  width: 12px;
+  height: 12px;
+  margin-top: 3px;
+}
+
+.user-quote-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.user-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+  max-width: 88%;
+}
+
+.user-image {
+  display: grid;
+  place-items: center;
+  width: 72px;
+  height: 72px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--rail);
+  color: var(--faint);
+}
+
+.user-image img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.user-image :deep(svg) {
+  width: 18px;
+  height: 18px;
+}
+
+.user-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  height: 28px;
+  padding: 0 10px 0 var(--space-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--paper);
+  color: var(--ink-soft);
+  font-size: var(--text-xs);
+}
+
+.user-file :deep(svg) {
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+  color: var(--faint);
+}
+
+.user-file-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.user-selection {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--muted);
+  text-align: right;
+}
+
+/* --- the agent's answer --------------------------------------------------------------- */
+
+.answer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
 }
 
 /* The assistant's markdown at the panel's UI scale: the document's blocks, drawn smaller. */
@@ -1156,144 +1262,10 @@ async function stop() {
   line-height: 1.6;
 }
 
-.thinking {
-  color: var(--faint);
-  font-size: var(--text-xs);
-  line-height: 1.5;
-}
-
-.tool {
+.answer-tools {
   display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  min-width: 0;
-  color: var(--faint);
-  font-size: var(--text-2xs);
-}
-
-.tool-mark {
-  display: inline-flex;
-  flex-shrink: 0;
-  width: 12px;
-  height: 12px;
-}
-
-.tool-mark :deep(svg) {
-  width: 12px;
-  height: 12px;
-}
-
-/* A finished call takes the accent, a failed one the danger hue — the mark is the data. */
-.tool-mark.ok {
-  color: var(--accent);
-}
-
-.tool-mark.error {
-  color: var(--danger);
-}
-
-.tool-name {
-  flex-shrink: 0;
-  color: var(--muted);
-}
-
-.tool-args {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* --- the edit card ------------------------------------------------------------ */
-
-.card {
-  border: 1px solid var(--edge);
-  border-radius: var(--radius);
-  overflow: hidden;
-}
-
-.diff {
-  display: flex;
-  flex-direction: column;
-  max-height: 240px;
-  overflow: auto;
-  padding: var(--space-2) 0;
-  font-size: var(--text-2xs);
-  line-height: 1.6;
-}
-
-.diff-line {
-  display: flex;
-  gap: var(--space-2);
-  padding: 0 var(--space-3);
-  white-space: pre;
-}
-
-.diff-line.removed {
-  background: var(--diff-removed);
-  color: var(--danger);
-}
-
-.diff-line.added {
-  background: var(--diff-added);
-  color: var(--accent);
-}
-
-.diff-line.hunk {
-  color: var(--faint);
-}
-
-.diff-line.context {
-  color: var(--muted);
-}
-
-.diff-sign {
-  flex-shrink: 0;
-  width: 1ch;
-}
-
-.card-foot {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-3);
-  padding: var(--space-1) var(--space-2) var(--space-1) var(--space-3);
-  border-top: 1px solid var(--line);
-  font-size: var(--text-xs);
-  color: var(--faint);
-}
-
-.card-state {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.card-path {
-  font-size: var(--text-2xs);
-}
-
-.text-link {
-  flex-shrink: 0;
-  height: var(--control-height-xs);
-  padding: 0 var(--space-2);
-  border: 0;
-  border-radius: var(--radius);
-  background: transparent;
-  color: var(--accent);
-  font-size: var(--text-xs);
-  cursor: pointer;
-  transition: background var(--duration-fast) var(--ease);
-}
-
-.text-link:hover {
-  background: var(--rail);
-}
-
-.text-link:disabled {
-  cursor: not-allowed;
-  opacity: 0.5;
+  gap: 2px;
+  margin-left: -5px;
 }
 
 .turn-error {
@@ -1301,6 +1273,12 @@ async function stop() {
   font-size: var(--text-xs);
   line-height: 1.5;
   overflow-wrap: anywhere;
+}
+
+.turn-note {
+  color: var(--faint);
+  font-size: var(--text-xs);
+  line-height: 1.5;
 }
 
 .working {
@@ -1311,170 +1289,80 @@ async function stop() {
   font-size: var(--text-xs);
 }
 
-/* --- the composer ---------------------------------------------------------------- */
+/* --- the drop zone: a dashed accent outline over the whole column ---------------------- */
 
-.composer {
-  flex-shrink: 0;
-  margin: 0;
-  padding: var(--space-2) var(--space-4) var(--space-4);
-}
-
-/* The one rounded control in the app besides the context menu: a field a message is
-   typed into (docs/web.md § The agent panel). */
-.field {
+.drop-zone {
+  position: absolute;
+  inset: var(--space-2);
+  z-index: 3;
   display: flex;
   flex-direction: column;
-  gap: var(--space-1);
-  padding: var(--space-3) var(--space-2) var(--space-2) var(--space-4);
-  border: 1px solid var(--edge);
-  border-radius: var(--radius-composer);
-  background: var(--paper);
-  transition: border-color var(--duration-fast) var(--ease);
-}
-
-.field:focus-within {
-  border-color: var(--accent);
-}
-
-.field.disabled {
-  background: var(--paper-sunken);
-}
-
-.user-selection {
-  margin: 2px 0 0;
-  font-size: 12px;
-  color: var(--muted);
-  text-align: right;
-}
-
-.selection {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-1);
-  align-self: flex-start;
-  height: var(--control-height-xs);
-  padding: 0 var(--space-1) 0 var(--space-2);
-  border-radius: var(--radius-full);
-  background: var(--rail);
-  color: var(--muted);
-  font-size: var(--text-2xs);
-}
-
-.selection-drop {
-  display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 18px;
-  height: 18px;
-  padding: 0;
-  border: 0;
-  border-radius: var(--radius-full);
-  background: transparent;
-  color: var(--muted);
-  cursor: pointer;
+  gap: var(--space-2);
+  border: 2px dashed var(--accent);
+  border-radius: var(--radius-menu);
+  background: color-mix(in srgb, var(--paper) 94%, transparent);
+  pointer-events: none;
 }
 
-.selection-drop :deep(svg) {
-  width: 11px;
-  height: 11px;
-}
-
-.input {
-  display: block;
-  width: 100%;
-  min-width: 0;
+.drop-title {
   margin: 0;
-  padding: 0;
-  border: 0;
-  background: transparent;
   color: var(--ink);
-  font-size: var(--text-sm);
-  line-height: 1.5;
-  resize: none;
+  font-size: var(--text-base);
+  font-weight: var(--weight-medium);
 }
 
-/* The field carries the focus ring; the textarea inside it must not draw a second one. */
-.input:focus-visible {
-  outline: none;
-}
-
-.input::placeholder {
-  color: var(--faint);
-}
-
-.input:disabled {
+.drop-kinds {
+  margin: 0;
   color: var(--muted);
+  font-size: var(--text-xs);
 }
 
-.field-foot {
+/* --- the reply toolbar: the context menu's radius, surface and shadow ------------------ */
+
+.reply-toolbar {
+  position: fixed;
+  z-index: 90;
   display: flex;
-  align-items: center;
-  justify-content: space-between;
+  gap: 2px;
+  padding: var(--space-1);
+  border: 1px solid var(--menu-edge);
+  border-radius: var(--radius-menu);
+  background: var(--menu-surface);
+  box-shadow: var(--shadow-menu);
+  transform: translate(-50%, -100%);
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
 }
 
-.round {
+.reply-toolbar.below {
+  transform: translate(-50%, 0);
+}
+
+.reply-item {
   display: inline-flex;
   align-items: center;
-  justify-content: center;
-  width: var(--control-height-sm);
-  height: var(--control-height-sm);
-  padding: 0;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px 0 var(--space-2);
   border: 0;
-  border-radius: var(--radius-full);
-  cursor: pointer;
-  transition:
-    background var(--duration-fast) var(--ease),
-    color var(--duration-fast) var(--ease);
-}
-
-.round :deep(svg) {
-  width: 15px;
-  height: 15px;
-}
-
-.round:disabled {
-  cursor: not-allowed;
-  opacity: 0.5;
-}
-
-.round.ghost {
+  border-radius: var(--radius-menu-item);
   background: transparent;
-  color: var(--muted);
-}
-
-.round.ghost:hover:not(:disabled) {
-  background: var(--rail);
   color: var(--ink);
+  font-size: var(--text-xs);
+  cursor: pointer;
 }
 
-/* The accent's one non-data use: the control that commits the message. */
-.round.send {
+/* The accent fills the highlighted row, as in the context menu. */
+.reply-item:hover,
+.reply-item:focus-visible {
   background: var(--accent);
   color: var(--accent-fg);
 }
 
-.round.send:hover:not(:disabled) {
-  background: var(--accent-hover);
-}
-
-.round.stop {
-  background: var(--rail-active);
-  color: var(--ink);
-}
-
-.round.stop:hover:not(:disabled) {
-  background: var(--edge);
-}
-
-.composer-error {
-  margin-top: var(--space-2);
-  color: var(--danger);
-  font-size: var(--text-xs);
-}
-
-@media (pointer: coarse) {
-  .input {
-    font-size: 16px;
-  }
+.reply-item :deep(svg) {
+  width: 13px;
+  height: 13px;
 }
 </style>

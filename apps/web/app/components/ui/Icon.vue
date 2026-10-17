@@ -247,6 +247,54 @@ defineProps<{ name: IconName }>()
       <path d="M18 6 6 18M6 6l12 12" />
     </template>
 
+    <!-- reply: answer one passage of an answer — the arrow turns back to it. -->
+    <template v-else-if="name === 'reply'">
+      <path d="m9 17-5-5 5-5" />
+      <path d="M20 18v-2a4 4 0 0 0-4-4H4" />
+    </template>
+
+    <!-- square-slash: the composer's command control — a key with the slash on it. -->
+    <template v-else-if="name === 'square-slash'">
+      <rect x="3" y="3" width="18" height="18" rx="2" />
+      <path d="M9 15 15 9" />
+    </template>
+
+    <!-- terminal: a step that ran a command in the shell. -->
+    <template v-else-if="name === 'terminal'">
+      <path d="m4 17 6-6-6-6" />
+      <path d="M12 19h8" />
+    </template>
+
+    <!-- hash: a step that counted lines or words. -->
+    <template v-else-if="name === 'hash'">
+      <path d="M4 9h16M4 15h16M10 3 8 21M16 3l-2 18" />
+    </template>
+
+    <!-- file-plus: a step that created a file. -->
+    <template v-else-if="name === 'file-plus'">
+      <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" />
+      <path d="M14 2v4a2 2 0 0 0 2 2h4" />
+      <path d="M9 15h6M12 18v-6" />
+    </template>
+
+    <!-- crop: a step that looked at one figure — the crop of a page. -->
+    <template v-else-if="name === 'crop'">
+      <path d="M6 2v14a2 2 0 0 0 2 2h14" />
+      <path d="M18 22V8a2 2 0 0 0-2-2H2" />
+    </template>
+
+    <!-- book-open: a skill — instructions the agent reads before it starts. -->
+    <template v-else-if="name === 'book-open'">
+      <path d="M12 7v14" />
+      <path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z" />
+    </template>
+
+    <!-- rotate-ccw: put the shipped default back. -->
+    <template v-else-if="name === 'rotate-ccw'">
+      <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+      <path d="M3 3v5h5" />
+    </template>
+
     <!-- check: the confirmation a copy swaps to. -->
     <template v-else>
       <path d="M20 6 9 17l-5-5" />

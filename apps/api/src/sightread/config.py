@@ -58,6 +58,9 @@ class Settings(BaseSettings):
     vision_concurrency_per_job: int = 8
     render_workers: int = 0  # 0 means "CPU count", resolved by the worker
     upload_dir: str = "/data/uploads"
+    # How old an entry of the upload directory may grow before the sweeper takes it, an
+    # unsent chat attachment's included (docs/jobs.md § Retention).
+    upload_max_age_seconds: int = 86_400
     # Stored figure crops, kept with the result — outside the upload dir on purpose, so the
     # sweeper never touches them (docs/parsing.md § Figure crops).
     figures_dir: str = "/data/figures"
@@ -114,6 +117,25 @@ class Settings(BaseSettings):
     # The stored history a conversation may replay, every message together: a turn past
     # it is refused with a pointer to a new conversation (docs/chat.md § History).
     chat_history_max_bytes: int = 256 * 1024 * 1024
+    # The composer's attachments: one file's upload cap, how many go with one message, how
+    # much of a PDF's or text file's text the model is given, and the long edge an image is
+    # kept at — what Claude would resize to (docs/chat.md § What a user message carries).
+    chat_attachment_max_bytes: int = 20 * 1024 * 1024
+    chat_attachments_per_message: int = 8
+    chat_attachment_text_max_chars: int = 100_000
+    chat_attachment_image_long_edge: int = 1568
+    # How many of a user's attachments may wait for their message at once — each is bounded,
+    # their number must be too, or uploads never sent could fill the upload directory for a
+    # day — and how long the reader's browser may keep an attached image's bytes.
+    chat_attachments_pending_max: int = 32
+    chat_attachment_cache_seconds: int = 31_536_000
+    # How long `pdftotext` may take on an attached PDF (docs/parsing.md).
+    chat_attachment_pdf_timeout_seconds: float = 60.0
+    # A user's own skills and subagents, and the tool calls one subagent run may make
+    # (docs/chat.md § Skills, § Subagents).
+    chat_skills_max: int = 64
+    chat_subagents_max: int = 32
+    chat_subagent_max_tool_calls: int = 30
 
     # The sandbox runner (docs/sandbox.md). Empty URL = no sandbox: the chat agent runs
     # without its bash tool. The token is what api and worker present to the runner.

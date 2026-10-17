@@ -25,7 +25,7 @@ from sightread.jobs.queue import (
     parse_pages_spec,
     requeue_job,
 )
-from sightread.jobs.sweeper import MAX_AGE_SECONDS, sweep_uploads
+from sightread.jobs.sweeper import sweep_uploads
 from tests.conftest import DATABASE_URL
 
 postgres_only = pytest.mark.skipif(
@@ -375,11 +375,12 @@ def test_sweeper_removes_only_stale_entries(tmp_path) -> None:
     stale_dir.mkdir()
     (stale_dir / "page-1.png").write_bytes(b"x")
 
-    old = time.time() - MAX_AGE_SECONDS - 60
+    max_age = 3600
+    old = time.time() - max_age - 60
     for entry in (stale, stale_dir):
         os.utime(entry, (old, old))
 
-    assert sweep_uploads(tmp_path) == 2
+    assert sweep_uploads(tmp_path, max_age=max_age) == 2
     assert fresh.exists()
     assert not stale.exists()
     assert not stale_dir.exists()

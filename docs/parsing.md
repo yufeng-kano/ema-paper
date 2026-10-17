@@ -6,6 +6,7 @@ All PDF work goes through Poppler CLI tools in short-lived subprocesses:
 
 - `pdfinfo` — page count + page dimensions (points).
 - `pdftoppm -png -r <dpi>` — page rendering for vision calls, scaled so the long edge ≤ **2000 px** (large images destabilize VLM detection).
+- `pdftotext -enc UTF-8 <file> -` — only for a PDF attached to a chat message, never for a parse ([chat.md](./chat.md) § What a user message carries): its text is read from the pipe, and the child is stopped once `CHAT_ATTACHMENT_TEXT_MAX_CHARS` characters have come, so a small PDF that holds text far past its own size never has the rest read or written anywhere; the call is killed after `CHAT_ATTACHMENT_PDF_TIMEOUT_SECONDS`.
 
 Why subprocess, not a linked library: crash isolation (a malicious PDF kills the child, not the worker), free multi-core parallelism, and licensing (Poppler is GPL — fine to invoke as a separate program; PyMuPDF is AGPL and banned here). Every subprocess gets a timeout (default 60 s/page) and runs against the job's temp directory only.
 
@@ -16,7 +17,7 @@ Every page is converted the same way — **one path, no routing**:
 1. Render the page (`pdftoppm`).
 2. Send the rendered image to the model chosen for the `parse` agent ([agents.md](./agents.md)), on its upstream (Kano Proxy or a provider connection), with the transcription prompt. The model returns the page's markdown with figure placeholders inline. `method: "vision"` on every page.
 
-There is no PDF-text-layer conversion path: the product converts what the page *looks like*, and a single pipeline means every page obeys the same prompt, the same figure contract and the same failure rules. The PDF text layer is never extracted — `pdfinfo` and `pdftoppm` are the only Poppler calls.
+There is no PDF-text-layer conversion path: the product converts what the page *looks like*, and a single pipeline means every page obeys the same prompt, the same figure contract and the same failure rules. A parse never extracts the PDF text layer — `pdfinfo` and `pdftoppm` are its only Poppler calls; `pdftotext` serves the chat composer's attachments alone.
 
 A page that cannot be rendered or transcribed → entry in `errors`, parsing continues. Whole document unreadable → job fails, no partial markdown; the failure message names the per-page reasons.
 
@@ -57,12 +58,13 @@ The transcription prompt is a template with three tokens, substituted per call b
 
 Resolution order for a job's prompt, decided at enqueue time and stored on the job row:
 
-1. **The user's selected prompt preset for the agent** (`agent_settings.prompt_preset_id` → `prompt_presets.text`, managed on the web Agent page) when one is selected. It replaces the template entirely, and figure/bbox quality is then the user's own responsibility.
-2. The agent's default template — for `parse`, `DEFAULT_PROMPT_TEMPLATE`, part of the agent's definition in code and the starting text of a new preset on the Agent page ([agents.md](./agents.md)).
+1. **The user's own prompt for the agent** (`agent_settings.prompt`, edited on the web Agent page, where the dialog opens on the default and offers *Restore default*) when one is saved. It replaces the template entirely, and figure/bbox quality is then the user's own responsibility.
+2. Else a **legacy prompt preset** (`agent_settings.prompt_preset_id` → `prompt_presets.text`) when one is still selected through the API; it replaces the template the same way. Saving a prompt clears the selection and selecting a preset clears the prompt, so never both.
+3. The agent's default template — for `parse`, `DEFAULT_PROMPT_TEMPLATE`, part of the agent's definition in code and the text the Agent page's prompt dialog opens on ([agents.md](./agents.md)).
 
 What the default template asks for beyond the markdown itself: the page's **furniture is left out** — a page or slide number, and a running header or footer that repeats across pages. A deck numbers every slide and a paper numbers every page; neither is what a reader of a transcription came for, and the viewer already knows which page a passage came from (web.md § Result viewer). The instruction then says, explicitly, that a number inside a sentence, a figure or table label, a citation marker, a numbered heading or a table **is** content: a model told to drop numbers will otherwise drop the ones that carry meaning. Changing the template changes results, so `PIPELINE_VERSION` moves with it and cached results parsed under the old wording stop answering new uploads.
 
-`jobs.prompt` holds the effective template verbatim (reproducibility); `jobs.prompt_sha256` is part of the dedup cache key ([jobs.md](./jobs.md)), so editing a preset's text invalidates cached results parsed with the old one.
+`jobs.prompt` holds the effective template verbatim (reproducibility); `jobs.prompt_sha256` is part of the dedup cache key ([jobs.md](./jobs.md)), so editing the prompt invalidates cached results parsed with the old one.
 
 ## Coordinate conventions
 

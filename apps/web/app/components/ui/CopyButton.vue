@@ -15,8 +15,10 @@ const props = withDefaults(
     variant?: 'secondary' | 'ghost'
     size?: 'xs' | 'sm' | 'md'
     labelled?: boolean
+    /** The icon-only control's name, for a value its glyph alone does not say. */
+    label?: string
   }>(),
-  { variant: 'ghost', size: 'md' },
+  { variant: 'ghost', size: 'md', label: undefined },
 )
 
 const { t } = useI18n()
@@ -47,7 +49,7 @@ onUnmounted(() => clearTimeout(resetTimer))
       :variant="variant"
       :size="size"
       :icon-only="!labelled"
-      :label="labelled ? undefined : copied ? t('common.copied') : t('common.copy')"
+      :label="labelled ? undefined : copied ? t('common.copied') : (label ?? t('common.copy'))"
       @click="copy"
     >
       <template #icon><UiIcon :name="copied ? 'check' : 'copy'" /></template>

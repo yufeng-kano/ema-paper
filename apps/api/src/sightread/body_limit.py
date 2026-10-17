@@ -1,7 +1,7 @@
 """A ceiling on request bodies the API would otherwise buffer whole (docs/api.md).
 
-Uploads stream to disk under `UPLOAD_MAX_BYTES` and are not touched here: a multipart
-body on an upload route is theirs. Everything else — JSON a route parses in memory, a
+Uploads stream to disk under their own caps and are not touched here: a multipart body on
+an upload route is theirs. Everything else — JSON a route parses in memory, a
 document save above all — is refused past `JSON_BODY_MAX_BYTES`, by the declared length
 when there is one and by counting the bytes as they arrive when there is not, before
 any of it reaches the route. The JSON form of `/v1/parse`, which `request.json()` holds
@@ -17,9 +17,12 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 TOO_LARGE = {"error": {"type": "invalid_request", "message": "The request body is too large"}}
 
 
-# The routes that stream a multipart body to disk under UPLOAD_MAX_BYTES themselves.
+# The routes that stream a multipart body to disk under a cap of their own: UPLOAD_MAX_BYTES
+# for a parse, CHAT_ATTACHMENT_MAX_BYTES for the chat composer's attachments (docs/api.md).
 PARSE_ROUTE = ("POST", "/v1/parse")
-STREAMING_UPLOADS = frozenset({PARSE_ROUTE, ("POST", "/api/library/documents")})
+STREAMING_UPLOADS = frozenset(
+    {PARSE_ROUTE, ("POST", "/api/library/documents"), ("POST", "/api/attachments")}
+)
 MULTIPART = b"multipart/form-data"
 
 

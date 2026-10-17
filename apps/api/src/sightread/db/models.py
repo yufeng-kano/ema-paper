@@ -207,7 +207,10 @@ class AgentSetting(Base):
     )
     # A model id on that upstream; NULL means not chosen yet.
     model: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    # The selected prompt preset; NULL means the agent's default (docs/parsing.md § Prompts).
+    # The user's own template for the agent; NULL means the agent's default. It replaces
+    # the default whole and is never set together with a preset (docs/agents.md).
+    prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The legacy selection of a prompt preset; NULL means none (docs/parsing.md § Prompts).
     prompt_preset_id: Mapped[int | None] = mapped_column(
         ForeignKey("prompt_presets.id", ondelete="SET NULL"), nullable=True
     )
@@ -517,6 +520,67 @@ class ChatEvent(Base):
     seq: Mapped[int] = mapped_column(Integer)
     event: Mapped[str] = mapped_column(String(32))
     data: Mapped[dict] = mapped_column(JSON_COLUMN, default=dict)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
+
+
+class Skill(Base):
+    """A skill of the user's own, or the user's edit of a built-in under the built-in's
+    name; the built-ins themselves live in code (docs/chat.md § Skills)."""
+
+    __tablename__ = "skills"
+    __table_args__ = (UniqueConstraint("user_id", "name", name="uq_skills_user_name"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(64))
+    description: Mapped[str] = mapped_column(Text, default="")
+    argument_hint: Mapped[str] = mapped_column(String(128), default="")
+    body: Mapped[str] = mapped_column(Text)
+    # The reader runs it as `/name`; the agent loads it on its own (docs/chat.md § Skills).
+    user_invocable: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
+    model_invocable: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=text("true")
+    )
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
+
+
+class Subagent(Base):
+    """A subagent of the user's own, or the user's edit of a built-in under its name
+    (docs/chat.md § Subagents)."""
+
+    __tablename__ = "subagents"
+    __table_args__ = (UniqueConstraint("user_id", "name", name="uq_subagents_user_name"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(64))
+    description: Mapped[str] = mapped_column(Text, default="")
+    # NULL: the conversation's model.
+    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # A subset of the read-only tools (agents/subagents.py), in their canonical order.
+    tools: Mapped[list] = mapped_column(JSON_COLUMN, default=list)
+    prompt: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
+
+
+class ChatAttachment(Base):
+    """A prepared upload waiting for the message that will carry it: the file is
+    `{UPLOAD_DIR}/chat-attachment-{id}.{png|jpg|txt}`, and the send embeds both into the
+    message and deletes them (docs/chat.md § What a user message carries)."""
+
+    __tablename__ = "chat_attachments"
+    __table_args__ = (Index("ix_chat_attachments_user_created", "user_id", "created_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    name: Mapped[str] = mapped_column(String(255))
+    kind: Mapped[str] = mapped_column(String(16))  # image | text
+    media_type: Mapped[str] = mapped_column(String(127))
+    size_bytes: Mapped[int] = mapped_column(Integer)
+    # The prepared text's length, for a text attachment.
+    chars: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
 
 
