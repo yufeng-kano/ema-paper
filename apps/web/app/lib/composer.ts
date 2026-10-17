@@ -1,0 +1,136 @@
+/**
+ * The composer's decisions that need no DOM (docs/web.md § The agent panel): whether a
+ * draft is a command being typed and which commands it matches, and whether a file may be
+ * attached at all before a byte of it is sent.
+ */
+
+/** One row of the `/` menu. */
+export interface CommandOption {
+  name: string
+  description: string
+  /** What the command takes, shown at the row's end. */
+  hint: string
+  /** `skill` runs one of the reader's skills; `builtin` is the composer's own (`/new`). */
+  group: 'skill' | 'builtin'
+}
+
+/** What follows the `/` while a command is being typed, lower case; null when the draft is
+ *  not a command — it must start with `/` and hold no space yet. */
+export function commandQuery(draft: string): string | null {
+  if (!draft.startsWith('/')) {
+    return null
+  }
+  const term = draft.slice(1)
+  return /\s/.test(term) ? null : term.toLowerCase()
+}
+
+/** The commands a term matches: names that start with it first, then names or
+ *  descriptions that merely contain it. */
+export function matchCommands(options: readonly CommandOption[], term: string): CommandOption[] {
+  if (!term) {
+    return [...options]
+  }
+  const starts = options.filter((option) => option.name.startsWith(term))
+  const contains = options.filter(
+    (option) =>
+      !option.name.startsWith(term) &&
+      (option.name.includes(term) || option.description.toLowerCase().includes(term)),
+  )
+  return [...starts, ...contains]
+}
+
+/** A sent command's arguments: the reader's line with its `/name` taken off the front. */
+export function commandArguments(text: string, command: string): string {
+  const head = `/${command}`
+  return text.startsWith(head) ? text.slice(head.length).trim() : text.trim()
+}
+
+/** The extension a file is judged by: lower case, no dot, empty when it has none. */
+export function extensionOf(name: string): string {
+  const dot = name.lastIndexOf('.')
+  return dot <= 0 || dot === name.length - 1 ? '' : name.slice(dot + 1).toLowerCase()
+}
+
+function bare(extension: string): string {
+  return extension.replace(/^\./, '').toLowerCase()
+}
+
+/** The file picker's `accept`, from the server's list; undefined accepts anything. */
+export function acceptList(extensions: readonly string[] | undefined): string | undefined {
+  if (!extensions?.length) {
+    return undefined
+  }
+  return extensions.map((extension) => `.${bare(extension)}`).join(',')
+}
+
+const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif', 'heic', 'heif'])
+
+/** An image is drawn as a thumbnail and sent as one; anything else is a file chip. */
+export function isImageFile(file: { name: string; type: string }): boolean {
+  return file.type.startsWith('image/') || IMAGE_EXTENSIONS.has(extensionOf(file.name))
+}
+
+export type AttachmentRefusal =
+  | { reason: 'type' }
+  | { reason: 'size'; max: number }
+  | { reason: 'count'; max: number }
+
+export interface AttachmentLimits {
+  attachment_max_bytes?: number
+  attachments_per_message?: number
+  attachment_extensions?: string[]
+}
+
+/**
+ * Why a file cannot be attached, or null when it can — checked against the server's own
+ * numbers before it is uploaded. `attached` is how many the message already carries. A
+ * limit the server did not send is not checked here; the upload's answer decides.
+ */
+export function refuseAttachment(
+  file: { name: string; size: number },
+  limits: AttachmentLimits | null | undefined,
+  attached: number,
+): AttachmentRefusal | null {
+  const perMessage = limits?.attachments_per_message
+  if (perMessage !== undefined && attached >= perMessage) {
+    return { reason: 'count', max: perMessage }
+  }
+  const extensions = limits?.attachment_extensions
+  if (extensions?.length && !extensions.map(bare).includes(extensionOf(file.name))) {
+    return { reason: 'type' }
+  }
+  const max = limits?.attachment_max_bytes
+  if (max !== undefined && file.size > max) {
+    return { reason: 'size', max }
+  }
+  return null
+}
+
+/** Bytes in the unit a person reads a file's size in: KB under a megabyte, else MB. */
+export function formatBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024) {
+    const megabytes = bytes / 1024 / 1024
+    return `${Number.isInteger(megabytes) ? megabytes : megabytes.toFixed(1)} MB`
+  }
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`
+}
+
+/** An attachment as the message carries it: the id the upload returned, and what the
+ *  thread draws for it until the record holds the message. */
+export interface SentAttachment {
+  id: string
+  name: string
+  image: boolean
+  /** The local preview a thumbnail shows before the record's bytes can be asked for. */
+  preview: string | null
+}
+
+/** What the composer hands the panel to send (docs/chat.md § What a user message carries). */
+export interface ComposerPayload {
+  /** As typed; a command's arguments when `command` is set. */
+  text: string
+  selection: string | null
+  quote: string | null
+  command: string | null
+  attachments: SentAttachment[]
+}

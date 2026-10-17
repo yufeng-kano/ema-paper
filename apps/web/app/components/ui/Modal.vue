@@ -23,7 +23,8 @@ const props = withDefaults(
   defineProps<{
     /** The dialog's accessible name. Also the visible title unless the `title` slot fills it. */
     title: string
-    size?: 'sm' | 'md' | 'lg' | 'full'
+    /** `wide` is a form around one long text — a prompt, a skill's body. */
+    size?: 'sm' | 'md' | 'wide' | 'lg' | 'full'
     /** Fixed-height grid body — for a dialog whose content owns its own scroll regions. */
     tall?: boolean
     /** The body manages its own padding. */
@@ -196,6 +197,10 @@ onBeforeUnmount(() => {
 
 .panel.md {
   max-width: 480px;
+}
+
+.panel.wide {
+  max-width: 760px;
 }
 
 .panel.lg {

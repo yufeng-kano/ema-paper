@@ -10,7 +10,6 @@ import {
   getKano,
   kanoConnectUrl,
   listAgents,
-  listPrompts,
   type AgentEntry,
   type SavedAgentSettings,
 } from '~/lib/api'
@@ -93,13 +92,6 @@ function setAgentSettings(name: string, saved: SavedAgentSettings) {
     agent.name === name ? { ...agent, settings, bbox } : agent,
   )
 }
-
-const {
-  data: promptsData,
-  errorMessage: promptsError,
-  refresh: refreshPrompts,
-} = useAuthedData(() => listPrompts())
-const prompts = computed(() => promptsData.value?.prompts ?? [])
 
 const promptMaxChars = computed(() => auth.me.value?.limits.prompt_max_chars ?? null)
 
@@ -206,15 +198,11 @@ function onTabKeydown(event: KeyboardEvent, index: number) {
         <template #meta>
           <span class="mono io">{{ selected.input }} → {{ selected.output }}</span>
         </template>
-        <UiBanner v-if="promptsError" class="panel-banner" tone="error">{{ promptsError }}</UiBanner>
         <AgentPanel
           :key="selected.name"
           :agent="selected"
-          :prompts="prompts"
-          :prompts-loaded="promptsData !== null"
           :prompt-max-chars="promptMaxChars"
           @saved="setAgentSettings"
-          @prompts-changed="refreshPrompts"
         />
       </UiPanel>
       <UiPanel v-else section>
@@ -376,11 +364,6 @@ function onTabKeydown(event: KeyboardEvent, index: number) {
 .io {
   color: var(--muted);
   font-size: var(--text-xs);
-}
-
-.panel-banner {
-  margin-bottom: var(--space-4);
-  max-width: 72ch;
 }
 
 @media (max-width: 900px) {
