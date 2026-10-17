@@ -268,6 +268,8 @@ onMounted(() => {
     editorProps: {
       attributes: {
         class: 'rich-doc',
+        // A parsed paper's names and acronyms are not misspellings (docs/web.md § Editing).
+        spellcheck: 'false',
         ...(props.label ? { 'aria-label': props.label } : {}),
       },
       handleKeyDown: (_view, event) => onKey(event),
