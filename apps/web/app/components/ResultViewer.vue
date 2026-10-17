@@ -123,10 +123,9 @@ type SaveState = 'saved' | 'editing' | 'saving' | 'failed'
  * header toggles, off by default. Navigation is a thing you ask for; a page number printed
  * through the prose is a thing you cannot decline (docs/web.md § Result viewer).
  *
- * The rail and the find bar **float over** the document rather than sitting beside or above
- * it: opening either leaves every line of text where it was. The notes and agent columns
- * are the opposite — they sit beside the pane and take their width from it, because they
- * are read alongside the document, not over it.
+ * The find bar **floats over** the document: opening it leaves every line of text where it
+ * was. The rail, the notes and the agent columns take their width from the document
+ * instead, so the column stays centered in whatever room they leave.
  *
  * Two mechanics keep the rail and the document from fighting each other while both scroll:
  *
@@ -1430,7 +1429,7 @@ const awaitingContent = computed(
               @close="findOpen = false"
             />
 
-            <div ref="scroller" class="document" @scroll="onScroll" @copy="onCopy" @mousedown.capture="forgetPress" @mouseup="editable && onBlockClick()">
+            <div ref="scroller" class="document" :class="{ 'beside-rail': railOpen }" @scroll="onScroll" @copy="onCopy" @mousedown.capture="forgetPress" @mouseup="editable && onBlockClick()">
               <!-- A document with no page at all: one editor, which makes page 1. -->
               <section v-if="editable && !pages.length" class="page">
                 <article class="prose">
@@ -1748,7 +1747,7 @@ const awaitingContent = computed(
 
 /* The head band always has its own row, even when it is empty: a warning about the whole
    document and the live progress note push the pane down rather than scrolling away inside
-   it. The rail and the find bar do the opposite — they float (see `.pane`). */
+   it. The rail and the find bar sit inside the pane instead (see `.pane`). */
 .markdown {
   display: grid;
   /* `minmax(0, 1fr)` and not the implicit `auto` track it would otherwise get: an auto
@@ -1768,8 +1767,10 @@ const awaitingContent = computed(
   min-height: 0;
 }
 
-/* The positioning context for everything that floats over the document. */
+/* The positioning context for the rail and the find bar. */
 .pane {
+  --page-rail-width: 148px;
+
   position: relative;
   display: grid;
   flex: 1 1 auto;
@@ -1793,9 +1794,8 @@ const awaitingContent = computed(
   font-size: var(--text-xs);
 }
 
-/* Over the document, not beside it: the text does not move when the rail opens. At a 70%
-   column there is a margin on the left for it to sit in, so on a wide dialog it covers
-   nothing but empty page. */
+/* Pinned to the pane's left edge; the document makes room for it (`.beside-rail`), so the
+   column is centered in what the rail leaves rather than under it. */
 .page-rail {
   position: absolute;
   inset-block: 0;
@@ -1804,14 +1804,13 @@ const awaitingContent = computed(
   display: flex;
   flex-direction: column;
   gap: 2px;
-  width: 148px;
+  width: var(--page-rail-width);
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
   padding: var(--space-4) var(--space-3);
   background: var(--rail);
   border-right: 1px solid var(--line);
-  box-shadow: var(--shadow-menu);
 }
 
 /* Top right of the pane, clear of the rail whether it is open or not. */
@@ -1891,6 +1890,11 @@ const awaitingContent = computed(
 /* The column, centered in the pane. The page boundary carries no rule and no label: it is
    the grouping the data has, not a division the reader is asked to see, so consecutive pages
    are separated by exactly the gap the blocks inside one page already keep. */
+/* The rail's room: the column is centered beside it, not under it. */
+.document.beside-rail {
+  padding-left: calc(var(--page-rail-width) + var(--space-10));
+}
+
 .page {
   width: 70%;
   margin-inline: auto;
@@ -2129,7 +2133,8 @@ const awaitingContent = computed(
     width: calc(100% - var(--space-8));
   }
 
-  .document {
+  .document,
+  .document.beside-rail {
     padding: var(--space-7) var(--space-5) var(--space-10);
   }
 }
