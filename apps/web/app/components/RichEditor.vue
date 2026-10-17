@@ -393,6 +393,10 @@ defineExpose({
   outline: none;
   white-space: pre-wrap;
   overflow-wrap: break-word;
+  /* ProseMirror turns ligatures off, and Firefox then sets the whole text narrower than the
+     rendered block: they stay on, as they are there. */
+  font-variant-ligatures: normal;
+  font-feature-settings: normal;
 }
 
 .rich :deep(.rich-doc > * + *) {
