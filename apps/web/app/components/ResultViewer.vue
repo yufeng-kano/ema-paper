@@ -481,14 +481,53 @@ function startNewBlock(pageIndex: number) {
   editorKey.value += 1
 }
 
-/** A click opens the block with the caret where the click landed — unless it ended a text
- *  selection, which is a selection, not a request to edit. */
-function onBlockClick(event: MouseEvent, pageIndex: number, blockIndex: number) {
-  const selection = window.getSelection()
-  if (isEditing(pageIndex, blockIndex) || (selection && !selection.isCollapsed)) {
+/**
+ * The block a press landed on, and where in it, read on mousedown — before the press blurs
+ * the open editor. That blur writes the open block back, which can delete it or split it,
+ * shifting every block after it on the page; by the click, the indices and the layout the
+ * reader aimed at are gone. Every other block keeps its source, so the source finds it.
+ */
+let pressed: { page: number; index: number; src: string; dx: number; dy: number } | null = null
+
+/** Every press starts clean; a press on a block then records itself. */
+function forgetPress() {
+  pressed = null
+}
+
+function onBlockPress(event: MouseEvent, pageIndex: number, blockIndex: number) {
+  const block = pages.value[pageIndex]?.blocks[blockIndex]
+  if (!block || !(event.currentTarget instanceof HTMLElement) || isEditing(pageIndex, blockIndex)) {
+    pressed = null
     return
   }
-  void startEdit(pageIndex, blockIndex, { x: event.clientX, y: event.clientY })
+  const rect = event.currentTarget.getBoundingClientRect()
+  pressed = { page: pageIndex, index: blockIndex, src: block.src, dx: event.clientX - rect.left, dy: event.clientY - rect.top }
+}
+
+/** A click opens the pressed block with the caret where the press landed in it — unless it
+ *  ended a text selection, which is a selection, not a request to edit. Opened on the
+ *  release, listened for on the whole pane: when the write-back re-renders the pressed
+ *  block between press and release, the browser sends no click at all. */
+function onBlockClick() {
+  const press = pressed
+  pressed = null
+  const selection = window.getSelection()
+  if (!press || (selection && !selection.isCollapsed)) {
+    return
+  }
+  const blocks = pages.value[press.page]?.blocks ?? []
+  let index = -1
+  for (let at = 0; at < blocks.length; at += 1) {
+    if (blocks[at]?.src === press.src && (index === -1 || Math.abs(at - press.index) < Math.abs(index - press.index))) {
+      index = at
+    }
+  }
+  if (index === -1) {
+    return
+  }
+  const element = scroller.value?.querySelector(`[data-block="${press.page}-${index}"]`)
+  const rect = element?.getBoundingClientRect()
+  void startEdit(press.page, index, rect ? { x: rect.left + press.dx, y: rect.top + press.dy } : 'end')
 }
 
 /** The open editor's markdown. A caption is one line under the figure's placeholder. */
@@ -1196,7 +1235,7 @@ const awaitingContent = computed(
               @close="findOpen = false"
             />
 
-            <div ref="scroller" class="document" @scroll="onScroll" @copy="onCopy">
+            <div ref="scroller" class="document" @scroll="onScroll" @copy="onCopy" @mousedown.capture="forgetPress" @mouseup="editable && onBlockClick()">
               <!-- A document with no page at all: one editor, which makes page 1. -->
               <section v-if="editable && !pages.length" class="page">
                 <article class="prose">
@@ -1231,7 +1270,8 @@ const awaitingContent = computed(
                     class="block"
                     :class="{ editable, open: isEditing(pageIndex, index) }"
                     :tabindex="editable && !isEditing(pageIndex, index) ? 0 : undefined"
-                    @click="editable && onBlockClick($event, pageIndex, index)"
+                    :data-block="`${pageIndex}-${index}`"
+                    @mousedown="editable && onBlockPress($event, pageIndex, index)"
                     @keydown.enter.self.prevent="startEdit(pageIndex, index)"
                   >
                     <template v-if="isEditing(pageIndex, index)">

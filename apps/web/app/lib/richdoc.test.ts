@@ -141,6 +141,61 @@ describe('an edited document', () => {
   })
 })
 
+describe('review fixes', () => {
+  const p = (text: string) => ({ type: 'paragraph', content: [{ type: 'text', text }] })
+
+  it('keeps a formula and code made inside a list item', () => {
+    const doc: JSONContent = {
+      type: 'doc',
+      content: [
+        {
+          type: 'bulletList',
+          content: [
+            {
+              type: 'listItem',
+              content: [
+                p('item'),
+                { type: 'blockMath', attrs: { latex: 'E=mc^2' } },
+                { type: 'codeBlock', content: [{ type: 'text', text: 'print(1)' }] },
+              ],
+            },
+          ],
+        },
+      ],
+    }
+    expect(docToMarkdown(doc)).toBe('- item $E=mc^2$ `print(1)`')
+  })
+
+  it('keeps a formula a formula right before a digit', () => {
+    const markdown = serializeInline([
+      { type: 'inlineMath', attrs: { latex: 'x' } },
+      { type: 'text', text: '2 apples' },
+    ])
+    expect(reading(markdown)).toEqual([{ kind: 'p', text: markdown }])
+    expect(parseResultMarkdown(markdown)[0]!.blocks[0]).toMatchObject({ kind: 'p' })
+    const segments = (reading(markdown)[0] as { text: string }).text
+    expect(segments.startsWith('$x$')).toBe(true)
+  })
+
+  it('writes code with a pipe in a table cell, and code holding a backtick as text', () => {
+    const doc = load('| a | b |\n| --- | --- |\n| 1 | 2 |')
+    doc.content![0]!.content![0]!.content![0]!.content = [
+      { type: 'paragraph', content: [{ type: 'text', text: 'a|b', marks: [{ type: 'code' }] }] },
+    ]
+    const markdown = docToMarkdown(doc)
+    expect(reading(markdown)).toEqual([{ kind: 'table', header: ['`a|b`', 'b'], rows: [['1', '2']] }])
+    expect(serializeInline([{ type: 'text', text: 'a`b', marks: [{ type: 'code' }] }])).toBe('a\\`b')
+  })
+
+  it('keeps the page markers of a notes file', () => {
+    const notes = '<!-- page: 1 -->\nA\n\n<!-- page: 2 -->\nB'
+    const doc = load(notes)
+    expect(docToMarkdown(doc)).toBe(notes)
+    doc.content![1]!.content = [{ type: 'text', text: 'A2' }]
+    expect(docToMarkdown(doc)).toBe('<!-- page: 1 -->\nA2\n\n<!-- page: 2 -->\nB')
+  })
+})
+
 describe('inline math as it is typed', () => {
   it.each([
     ['the formula $x$', { index: 12, tex: 'x' }],

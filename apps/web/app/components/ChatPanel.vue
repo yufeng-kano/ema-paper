@@ -13,7 +13,7 @@ import {
   type ContentBlock,
   type Conversation,
 } from '~/lib/api'
-import { parseResultMarkdown } from '~/lib/markdown'
+import { parseResultMarkdown, type ResultBlock } from '~/lib/markdown'
 import type { MenuItem, Point } from '~/lib/menu'
 import type { StreamedEvent } from '~/composables/useConversationStream'
 
@@ -839,10 +839,23 @@ function onComposerKey(event: KeyboardEvent) {
   void send()
 }
 
+/** Parsed messages by text: the panel re-renders on every streamed delta, and re-parsing
+ *  every answer in a long thread each time would make typing stutter. Streaming makes many
+ *  short-lived texts, so the cache is simply emptied once it grows. */
+const parsedMessages = new Map<string, ResultBlock[]>()
+
 /** A message as the blocks the viewer's parser reads in it — markdown and TeX drawn, not
  *  shown as source. */
-function messageBlocks(text: string) {
-  return parseResultMarkdown(text).flatMap((page) => page.blocks)
+function messageBlocks(text: string): ResultBlock[] {
+  let blocks = parsedMessages.get(text)
+  if (!blocks) {
+    if (parsedMessages.size > 200) {
+      parsedMessages.clear()
+    }
+    blocks = parseResultMarkdown(text).flatMap((page) => page.blocks)
+    parsedMessages.set(text, blocks)
+  }
+  return blocks
 }
 
 const stopping = ref(false)

@@ -129,9 +129,24 @@ export function blocksToDoc(blocks: ResultBlock[]): JSONContent {
   return { type: 'doc', content: content.length ? content : [{ type: 'paragraph' }] }
 }
 
-/** The editor's document for a markdown string — one block's source, or a whole notes file. */
+const PAGE_MARKER_LINE = /^\s*<!--\s*page:\s*\d+\s*-->\s*$/m
+
+/**
+ * The editor's document for a markdown string — one block's source, or a whole notes file.
+ * A file with page markers keeps them, as source the editor carries through untouched: the
+ * notes editor rewrites the whole file, and a marker is part of it.
+ */
 export function markdownToDoc(markdown: string): JSONContent {
-  return blocksToDoc(parseResultMarkdown(markdown).flatMap((page) => page.blocks))
+  const pages = parseResultMarkdown(markdown)
+  if (!PAGE_MARKER_LINE.test(markdown)) {
+    return blocksToDoc(pages.flatMap((page) => page.blocks))
+  }
+  return blocksToDoc(
+    pages.flatMap((page) => {
+      const marker = `<!-- page: ${page.page} -->`
+      return [{ kind: 'comment' as const, src: marker }, ...page.blocks]
+    }),
+  )
 }
 
 // --- content -> markdown -----------------------------------------------------------------
@@ -195,18 +210,28 @@ export function serializeInline(content: JSONContent[] = [], inTable = false): s
     }
   }
   return runs
-    .map((node) => {
+    .map((node, index) => {
       if (node.type === 'hardBreak') {
         return '<br>'
       }
       if (node.type === 'inlineMath') {
         const latex = String(node.attrs?.latex ?? '').trim()
-        return latex ? `$${latex}$` : ''
+        if (!latex) {
+          return ''
+        }
+        // A span never closes on a dollar followed by a digit ("$5 and $6" are prices), so
+        // a formula right before one is kept apart by an invisible zero-width space —
+        // anything visible would change the text the reader typed.
+        const next = runs[index + 1]
+        return next?.type === 'text' && /^\d/.test(next.text ?? '') ? `$${latex}$\u200b` : `$${latex}$`
       }
       const text = node.text ?? ''
       const marks = markSet(node)
-      if (marks.includes('code')) {
-        return `\`${text}\``
+      // A code span is single backticks with no backtick inside (`parseInline`), so code
+      // that holds one is written as plain text rather than as a broken span. A pipe in a
+      // table cell is escaped even inside code: the row is split before the cell is read.
+      if (marks.includes('code') && !text.includes('`') && !text.includes('\n')) {
+        return `\`${inTable ? text.replace(/\|/g, '\\|') : text}\``
       }
       // Whitespace stays outside the markers: `** bold**` opens nothing.
       const [, lead = '', body = '', trail = ''] = /^(\s*)([\s\S]*?)(\s*)$/.exec(text) ?? []
@@ -243,11 +268,35 @@ function textblocks(node: JSONContent): JSONContent[] {
   return (node.content ?? []).flatMap(textblocks)
 }
 
+/**
+ * A node inside a list item or a table cell as lines of inline markdown. The parser reads
+ * items and cells as one line each, so a formula or code block made inside one is written
+ * inline (`$…$`, `` `…` ``) rather than dropped.
+ */
+function inlineLines(node: JSONContent, inTable: boolean): string[] {
+  switch (node.type) {
+    case 'paragraph':
+    case 'heading':
+      return [serializeInline(node.content, inTable)]
+    case 'blockMath':
+      return [serializeInline([{ type: 'inlineMath', attrs: node.attrs }], inTable)]
+    case 'codeBlock':
+      return (node.content ?? [])
+        .map((child) => child.text ?? '')
+        .join('')
+        .split('\n')
+        .map((line) => serializeInline(line ? [{ type: 'text', text: line, marks: [{ type: 'code' }] }] : [], inTable))
+    case 'rawBlock':
+      return [String(node.attrs?.source ?? '')]
+    default:
+      return (node.content ?? []).flatMap((child) => inlineLines(child, inTable))
+  }
+}
+
 function serializeTable(node: JSONContent): string {
   const rows = (node.content ?? []).map((row) =>
     (row.content ?? []).map((cell) =>
-      textblocks(cell)
-        .map((block) => serializeInline(block.content, true))
+      inlineLines(cell, true)
         .filter((line) => line !== '')
         .join('<br>'),
     ),
@@ -321,7 +370,7 @@ function collectItems(item: JSONContent): string[] {
     if (child.type === 'bulletList' || child.type === 'orderedList') {
       nested.push(...(child.content ?? []).flatMap(collectItems))
     } else {
-      lines.push(...textblocks(child).map((block) => serializeInline(block.content)))
+      lines.push(...inlineLines(child, false))
     }
   }
   return [lines.filter((line) => line !== '').join(' '), ...nested]
@@ -333,14 +382,19 @@ function collectItems(item: JSONContent): string[] {
  * a block deletes it.
  */
 export function docToMarkdown(doc: JSONContent): string {
-  return (doc.content ?? [])
+  const parts = (doc.content ?? [])
     .map((node) => {
       const fresh = serializeNode(node)
       const { src, canon } = node.attrs ?? {}
       return typeof src === 'string' && typeof canon === 'string' && fresh === canon ? src : fresh
     })
     .filter((markdown) => markdown.trim() !== '')
-    .join('\n\n')
+  // A page marker sits directly over its first block, as `serializeDocument` writes it.
+  return parts.reduce(
+    (out, part, index) =>
+      index === 0 ? part : `${out}${PAGE_MARKER_LINE.test(parts[index - 1] ?? '') ? '\n' : '\n\n'}${part}`,
+    '',
+  )
 }
 
 /**
