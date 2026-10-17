@@ -20,23 +20,69 @@ import {
 import type { Caret } from '~/lib/rich-extensions'
 import { captionLine } from '~/lib/richdoc'
 
-/**
- * Module scope, not component state: the rail, the notes column and the agent panel are
- * reading preferences, so opening the next document keeps the choice you just made instead
- * of asking for it again. Deliberately not persisted — they last as long as the page is
- * loaded and no longer, which is the lifetime a preference this small earns.
- */
-const railOpen = ref(false)
-const notesOpen = ref(false)
-const agentOpen = ref(false)
+/** Where the viewer's layout is kept in the browser between visits. */
+const LAYOUT_KEY = 'sightread.viewer.layout'
+
+type Layout = { rail: boolean; notes: boolean; agent: boolean; notesWidth: number; agentWidth: number }
+
+function storedLayout(): Partial<Layout> {
+  if (!import.meta.client) {
+    return {}
+  }
+  try {
+    const stored: unknown = JSON.parse(localStorage.getItem(LAYOUT_KEY) ?? '{}')
+    return stored && typeof stored === 'object' ? stored : {}
+  } catch {
+    return {}
+  }
+}
 
 /** The side columns' widths, dragged by the rule on their left edge (docs/web.md § Column
- *  widths) — a reading preference like the three above, with the same lifetime. */
+ *  widths). */
 const COLUMN_WIDTHS = {
   notes: { initial: 320, min: 240, max: 560 },
   agent: { initial: 360, min: 300, max: 640 },
 } as const
-const columnWidth = { notes: ref<number>(COLUMN_WIDTHS.notes.initial), agent: ref<number>(COLUMN_WIDTHS.agent.initial) }
+
+function storedWidth(column: 'notes' | 'agent', width: unknown): number {
+  const { initial, min, max } = COLUMN_WIDTHS[column]
+  return typeof width === 'number' && Number.isFinite(width) ? Math.min(max, Math.max(min, width)) : initial
+}
+
+/**
+ * Module scope, not component state: the rail, the notes column, the agent panel and the
+ * columns' widths are reading preferences, so opening the next document keeps the choice you
+ * just made instead of asking for it again — and so does the next visit, from the browser.
+ */
+const layout = storedLayout()
+const railOpen = ref(layout.rail === true)
+const notesOpen = ref(layout.notes === true)
+const agentOpen = ref(layout.agent === true)
+const columnWidth = {
+  notes: ref<number>(storedWidth('notes', layout.notesWidth)),
+  agent: ref<number>(storedWidth('agent', layout.agentWidth)),
+}
+
+/** The widths the reader last set, which is what is stored: a width the window clamped is
+ *  not a width the reader chose. */
+const chosenWidth = { notes: columnWidth.notes.value, agent: columnWidth.agent.value }
+
+function saveLayout() {
+  const next: Layout = {
+    rail: railOpen.value,
+    notes: notesOpen.value,
+    agent: agentOpen.value,
+    notesWidth: chosenWidth.notes,
+    agentWidth: chosenWidth.agent,
+  }
+  try {
+    localStorage.setItem(LAYOUT_KEY, JSON.stringify(next))
+  } catch {
+    // Storage full or blocked: the layout still holds for as long as the page is loaded.
+  }
+}
+
+watch([railOpen, notesOpen, agentOpen], saveLayout)
 /** The document pane never gets narrower than this to make room for a dragged column. */
 const PANE_MIN_WIDTH = 360
 
@@ -182,6 +228,7 @@ async function loadContent(replaceDirty: Replace = false) {
       // against the fresh text would land on whatever does now.
       if (editing.value !== null) {
         editing.value = null
+        span.value = 1
         joined.value = false
         draft.value = ''
       }
@@ -427,9 +474,12 @@ const draft = ref('')
 const editorSource = ref('')
 const editorCaret = ref<Caret | null>(null)
 const editorKey = ref(0)
-/** The open editor holds the block after the open one too — Backspace joined them. Both
- *  are written back together when it closes, and until then the document keeps both, so
- *  a reload that drops the draft never drops a block that was saved. */
+/** How many blocks the open editor holds, from the open one on: more than one after a
+ *  selection across blocks or a Backspace join. They are written back together when it
+ *  closes, and until then the document keeps them all, so a reload that drops the draft
+ *  never drops a block that was saved. */
+const span = ref(1)
+/** The open editor's draft is already a change — Backspace joined two blocks. */
 const joined = ref(false)
 /** A contents page opens as its lines (docs/web.md § Editing): the textarea for that one
  *  kind. A plain variable set through a function ref — there is only ever one. */
@@ -443,10 +493,11 @@ function isEditing(pageIndex: number, blockIndex: number): boolean {
   return editing.value?.page === pageIndex && editing.value.index === blockIndex
 }
 
-/** The block a Backspace join carried into the open editor: still in the document until
+/** A block after the open one that the open editor holds too: still in the document until
  *  the editor is written back, but drawn only once — in the editor. */
-function isJoinedAway(pageIndex: number, blockIndex: number): boolean {
-  return joined.value && editing.value?.page === pageIndex && editing.value.index + 1 === blockIndex
+function isHeldByEditor(pageIndex: number, blockIndex: number): boolean {
+  const open = editing.value
+  return open?.page === pageIndex && blockIndex > open.index && blockIndex < open.index + span.value
 }
 
 /** The open block, or undefined for the editor past the last block of a page. */
@@ -460,7 +511,8 @@ function figurePlaceholder(block: ResultBlock): string {
   return block.src.split('\n')[0] ?? ''
 }
 
-async function startEdit(pageIndex: number, blockIndex: number, caret: Caret = 'end') {
+/** Opens a block — or, for a selection across blocks, the run of `count` blocks from it. */
+async function startEdit(pageIndex: number, blockIndex: number, caret: Caret = 'end', count = 1) {
   if (!editable.value || isEditing(pageIndex, blockIndex)) {
     return
   }
@@ -472,9 +524,10 @@ async function startEdit(pageIndex: number, blockIndex: number, caret: Caret = '
     return
   }
   editing.value = { page: pageIndex, index: blockIndex }
+  span.value = count
   joined.value = false
-  draft.value = block.src
-  editorSource.value = block.kind === 'fig' ? (block.caption ?? '') : block.src
+  draft.value = openBlockSource() ?? block.src
+  editorSource.value = block.kind === 'fig' ? (block.caption ?? '') : draft.value
   editorCaret.value = caret
   editorKey.value += 1
   if (block.kind === 'toc') {
@@ -491,6 +544,7 @@ function startNewBlock(pageIndex: number) {
   }
   commitEdit()
   editing.value = { page: pageIndex, index: pages.value[pageIndex]?.blocks.length ?? 0 }
+  span.value = 1
   joined.value = false
   draft.value = ''
   editorSource.value = ''
@@ -522,20 +576,23 @@ function onBlockPress(event: MouseEvent, pageIndex: number, blockIndex: number) 
   // Where the block will be once the open one is written back: a block after it on its
   // page moves by however many blocks the draft becomes.
   const open = editing.value
-  const span = joined.value ? 2 : 1
-  const shift = open && open.page === pageIndex && blockIndex > open.index ? draftBlockCount() - span : 0
+  const shift = open && open.page === pageIndex && blockIndex > open.index ? draftBlockCount() - span.value : 0
   pressed = { page: pageIndex, index: blockIndex + shift, src: block.src, dx: event.clientX - rect.left, dy: event.clientY - rect.top }
 }
 
-/** A click opens the pressed block with the caret where the press landed in it — unless it
- *  ended a text selection, which is a selection, not a request to edit. Opened on the
- *  release, listened for on the whole pane: when the write-back re-renders the pressed
- *  block between press and release, the browser sends no click at all. */
+/** A click opens the pressed block with the caret where the press landed in it; a drag that
+ *  selected text opens what it selected. Opened on the release, listened for on the whole
+ *  pane: when the write-back re-renders the pressed block between press and release, the
+ *  browser sends no click at all. */
 function onBlockClick() {
   const press = pressed
   pressed = null
   const selection = window.getSelection()
-  if (!press || (selection && !selection.isCollapsed)) {
+  if (selection && !selection.isCollapsed && selection.rangeCount > 0) {
+    openSelection(selection)
+    return
+  }
+  if (!press) {
     return
   }
   const blocks = pages.value[press.page]?.blocks ?? []
@@ -553,6 +610,46 @@ function onBlockClick() {
   void startEdit(press.page, index, rect ? { x: rect.left + press.dx, y: rect.top + press.dy } : 'end')
 }
 
+/**
+ * A selection on the rendered blocks opens them as one editor with the same text selected,
+ * so Delete, typing or Ctrl+B act on it (docs/web.md § Editing). Only a run of rich-text
+ * blocks on one page: a page marker, a contents page and a figure have no place inside one
+ * rich editor, so a selection over any of them stays a selection.
+ */
+function openSelection(selection: Selection) {
+  const first = selection.getRangeAt(0)
+  const last = selection.getRangeAt(selection.rangeCount - 1)
+  const from = selectionEdge(first.startContainer, first.startOffset)
+  const to = selectionEdge(last.endContainer, last.endOffset)
+  if (!from || !to || from.page !== to.page || to.index < from.index) {
+    return
+  }
+  const blocks = pages.value[from.page]?.blocks.slice(from.index, to.index + 1) ?? []
+  if (!blocks.length || !blocks.every((block) => RICH_KINDS.has(block.kind))) {
+    return
+  }
+  void startEdit(from.page, from.index, { from: from.point, to: to.point }, blocks.length)
+}
+
+/** The rendered block a selection boundary lies in, and the boundary's point on screen —
+ *  read before the editor replaces the rendering, which it draws the same. Null inside the
+ *  open editor (its own selection is its own) or where the boundary has no caret box. */
+function selectionEdge(node: Node, offset: number) {
+  const element = node instanceof Element ? node : node.parentElement
+  const block = element?.closest<HTMLElement>('[data-block]')
+  if (!block || !scroller.value?.contains(block) || block.classList.contains('open')) {
+    return null
+  }
+  const [page, index] = (block.dataset.block ?? '').split('-').map(Number)
+  const caret = document.createRange()
+  caret.setStart(node, offset)
+  const rect = caret.getClientRects()[0]
+  if (page === undefined || index === undefined || !Number.isInteger(page) || !Number.isInteger(index) || !rect) {
+    return null
+  }
+  return { page, index, point: { x: rect.left, y: rect.top + rect.height / 2 } }
+}
+
 /** The open editor's markdown, saved on the debounce while the block stays open. A caption
  *  is one line under the figure's placeholder. */
 function onEditorChange(markdown: string) {
@@ -566,10 +663,15 @@ function onEditorChange(markdown: string) {
   scheduleSave()
 }
 
-/** The source of the block under the open editor, or null when none is open. Never the
+/** The source of the blocks under the open editor, or null when none is open. Never the
  *  draft while two blocks are joined: that draft is always unsaved work. */
 function openBlockSource(): string | null {
-  return editing.value && !joined.value ? (openBlock.value?.src ?? null) : null
+  const open = editing.value
+  if (!open || joined.value) {
+    return null
+  }
+  const blocks = pages.value[open.page]?.blocks.slice(open.index, open.index + span.value) ?? []
+  return blocks.length ? blocks.map((block) => block.src).join('\n\n') : null
 }
 
 /** The document with the open editor's draft written in — what leaving the block would
@@ -585,12 +687,15 @@ function documentWithDraft(): string {
     // nothing typed is nothing.
     return draft.value.trim() !== '' ? appendBlockSource(markdown.value, open.page, draft.value) : markdown.value
   }
-  if (joined.value) {
-    // The later block first, so the open one's index still holds.
-    const without = replaceBlockSource(markdown.value, open.page, open.index + 1, '')
-    return replaceBlockSource(without, open.page, open.index, draft.value)
+  if (draft.value === openBlockSource()) {
+    return markdown.value
   }
-  return draft.value === block.src ? markdown.value : replaceBlockSource(markdown.value, open.page, open.index, draft.value)
+  // The later blocks first, so the open one's index still holds.
+  let next = markdown.value
+  for (let index = open.index + span.value - 1; index > open.index; index -= 1) {
+    next = replaceBlockSource(next, open.page, index, '')
+  }
+  return replaceBlockSource(next, open.page, open.index, draft.value)
 }
 
 /** Renders the block again, and if its source changed, writes it into the document. */
@@ -600,6 +705,7 @@ function commitEdit() {
   }
   const next = documentWithDraft()
   editing.value = null
+  span.value = 1
   joined.value = false
   if (next !== markdown.value) {
     markdown.value = next
@@ -632,7 +738,7 @@ function neighbour(pageIndex: number, blockIndex: number, step: -1 | 1): { page:
 /** How many blocks the open draft becomes once it is written back. */
 function draftBlockCount(): number {
   if (draft.value === openBlockSource()) {
-    return 1
+    return span.value
   }
   return parseResultMarkdown(draft.value).reduce((total, page) => total + page.blocks.length, 0)
 }
@@ -644,16 +750,14 @@ function navigateFrom(direction: 'up' | 'down'): boolean {
   if (!open || !openBlock.value) {
     return false
   }
-  // A joined editor spans the open block and the one after it.
-  const span = joined.value ? 2 : 1
-  const target = neighbour(open.page, open.index + (direction === 'up' ? 0 : span - 1), direction === 'up' ? -1 : 1)
+  const target = neighbour(open.page, open.index + (direction === 'up' ? 0 : span.value - 1), direction === 'up' ? -1 : 1)
   if (!target) {
     return false
   }
   // Written back, the open block may have become more blocks or none: a target after it
   // on its page moves by the difference.
   if (direction === 'down' && target.page === open.page) {
-    target.index += draftBlockCount() - span
+    target.index += draftBlockCount() - span.value
   }
   commitEdit()
   void startEdit(target.page, target.index, direction === 'up' ? 'end' : 'start')
@@ -670,9 +774,9 @@ function mergeBack(current: string): boolean {
   }
   const previous = pages.value[open.page]?.blocks[open.index - 1]
   const empty = current.trim() === ''
-  // A joined editor already spans two blocks; joining a third is a second Backspace's
-  // job once this one is written back.
-  if (joined.value || !previous || (!empty && !(JOINABLE.has(block.kind) && JOINABLE.has(previous.kind)))) {
+  // An editor holding several blocks joins nothing more; joining a third is a second
+  // Backspace's job once this one is written back.
+  if (span.value > 1 || !previous || (!empty && !(JOINABLE.has(block.kind) && JOINABLE.has(previous.kind)))) {
     return false
   }
   if (empty) {
@@ -685,6 +789,7 @@ function mergeBack(current: string): boolean {
   // The open block's text travels into the one before: both stay in the document until
   // the joined editor is written back (`joined`).
   editing.value = { page: open.page, index: open.index - 1 }
+  span.value = 2
   joined.value = true
   // Both blocks, so a reader who leaves at once still keeps every word; the editor joins
   // them at the seam as it opens.
@@ -779,7 +884,16 @@ function onResize(event: PointerEvent) {
 }
 
 function endResize() {
+  if (resizing) {
+    chooseWidth(resizing.column)
+  }
   resizing = null
+}
+
+/** The column's width as it now stands is the reader's choice: kept for the next visit. */
+function chooseWidth(column: 'notes' | 'agent') {
+  chosenWidth[column] = columnWidth[column].value
+  saveLayout()
 }
 
 function onResizeKey(event: KeyboardEvent, column: 'notes' | 'agent') {
@@ -787,6 +901,7 @@ function onResizeKey(event: KeyboardEvent, column: 'notes' | 'agent') {
   if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
     event.preventDefault()
     setColumnWidth(column, columnWidth[column].value + (event.key === 'ArrowLeft' ? step : -step))
+    chooseWidth(column)
   }
 }
 
@@ -1351,7 +1466,7 @@ const awaitingContent = computed(
                     :class="{ editable: editable && block.kind !== 'comment', open: isEditing(pageIndex, index) }"
                     :tabindex="editable && block.kind !== 'comment' && !isEditing(pageIndex, index) ? 0 : undefined"
                     :data-block="`${pageIndex}-${index}`"
-                    :hidden="isJoinedAway(pageIndex, index)"
+                    :hidden="isHeldByEditor(pageIndex, index)"
                     @mousedown="editable && onBlockPress($event, pageIndex, index)"
                     @keydown.enter.self.prevent="startEdit(pageIndex, index)"
                   >
@@ -1459,7 +1574,7 @@ const awaitingContent = computed(
               @pointermove="onResize"
               @pointerup="endResize"
               @pointercancel="endResize"
-              @dblclick="columnWidth.notes.value = COLUMN_WIDTHS.notes.initial"
+              @dblclick="setColumnWidth('notes', COLUMN_WIDTHS.notes.initial); chooseWidth('notes')"
               @keydown="onResizeKey($event, 'notes')"
             />
             <aside
@@ -1495,7 +1610,7 @@ const awaitingContent = computed(
             @pointermove="onResize"
             @pointerup="endResize"
             @pointercancel="endResize"
-            @dblclick="columnWidth.agent.value = COLUMN_WIDTHS.agent.initial"
+            @dblclick="setColumnWidth('agent', COLUMN_WIDTHS.agent.initial); chooseWidth('agent')"
             @keydown="onResizeKey($event, 'agent')"
           />
           <aside

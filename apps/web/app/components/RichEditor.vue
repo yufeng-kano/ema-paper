@@ -19,7 +19,7 @@
 import { Editor } from '@tiptap/core'
 import { Slice } from '@tiptap/pm/model'
 import { NodeSelection, Selection, TextSelection } from '@tiptap/pm/state'
-import { richExtensions, type Caret, type MathTarget } from '~/lib/rich-extensions'
+import { richExtensions, type Caret, type MathTarget, type Point } from '~/lib/rich-extensions'
 import { docToMarkdown, markdownToDoc, sliceToMarkdown } from '~/lib/richdoc'
 
 const props = withDefaults(
@@ -233,6 +233,14 @@ function placeCaret(caret: Caret | null) {
       editor.commands.joinBackward()
       return
     }
+  }
+  if (caret && typeof caret === 'object' && 'from' in caret) {
+    // A selection made on the rendered blocks, which the editor draws the same: the same
+    // text, selected.
+    const { view } = editor
+    const at = (point: Point) => view.posAtCoords({ left: point.x, top: point.y })?.pos
+    focusAt(TextSelection.between(doc.resolve(at(caret.from) ?? 0), doc.resolve(at(caret.to) ?? doc.content.size)))
+    return
   }
   if (caret && typeof caret === 'object') {
     const hit = editor.view.posAtCoords({ left: caret.x, top: caret.y })

@@ -16,9 +16,12 @@ import StarterKit from '@tiptap/starter-kit'
 import { renderTexHtml } from './math'
 import { inlineMathAtEnd } from './richdoc'
 
-/** Where the caret goes when an editor opens: a click's coordinates, an edge, or — after
- *  Backspace joined two blocks — the seam between the first block and the second. */
-export type Caret = { x: number; y: number } | 'start' | 'end' | 'join'
+export type Point = { x: number; y: number }
+
+/** Where the caret goes when an editor opens: a click's coordinates, a selection's two ends,
+ *  an edge, or — after Backspace joined two blocks — the seam between the first block and
+ *  the second. */
+export type Caret = Point | { from: Point; to: Point } | 'start' | 'end' | 'join'
 
 /** Where a formula sits and what it holds, for the floating TeX field. */
 export interface MathTarget {
