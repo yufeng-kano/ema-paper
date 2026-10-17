@@ -26,7 +26,6 @@ from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
 from ..db.models import ChatAttachment, User, utcnow
 from ..errors import ApiError
 from ..jobs.intake import MULTIPART_ENVELOPE_BYTES, capped_stream, store_upload, upload_chunks
-from ..jobs.sweeper import MAX_AGE_SECONDS
 from ..parsing.attachments import (
     FILE_PREFIX,
     AttachmentRefused,
@@ -41,16 +40,17 @@ CAP_NAME = "CHAT_ATTACHMENT_MAX_BYTES"
 PENDING_FULL = "Too many attachments are waiting to be sent; send or remove some first"
 
 
-async def _pending(db: DbSession, user_id: int) -> int:
+async def _pending(db: DbSession, user_id: int, max_age: int) -> int:
     """The caller's attachments still waiting for a message: one older than the sweeper's
-    day has lost its file and is no attachment any more (docs/jobs.md § Retention)."""
+    `UPLOAD_MAX_AGE_SECONDS` has lost its file and is no attachment any more (docs/jobs.md
+    § Retention)."""
     return (
         await db.execute(
             select(func.count())
             .select_from(ChatAttachment)
             .where(
                 ChatAttachment.user_id == user_id,
-                ChatAttachment.created_at >= utcnow() - timedelta(seconds=MAX_AGE_SECONDS),
+                ChatAttachment.created_at >= utcnow() - timedelta(seconds=max_age),
             )
         )
     ).scalar_one()
@@ -86,7 +86,8 @@ async def upload_attachment(
         raise ApiError(400, "invalid_request", "The upload must be multipart/form-data")
     # A cheap refusal before a byte is read; the count under the user's lock below, once the
     # file is prepared, is the one that holds (docs/api.md).
-    if await _pending(db, user_id) >= settings.chat_attachments_pending_max:
+    max_age = settings.upload_max_age_seconds
+    if await _pending(db, user_id, max_age) >= settings.chat_attachments_pending_max:
         raise ApiError(429, "rate_limit", PENDING_FULL)
     cap = settings.chat_attachment_max_bytes
     declared = request.headers.get("content-length", "")
@@ -121,6 +122,7 @@ async def upload_attachment(
                 max_pixels=settings.chat_page_image_max_pixels,
                 long_edge=settings.chat_attachment_image_long_edge,
                 text_max_chars=settings.chat_attachment_text_max_chars,
+                pdf_timeout=settings.chat_attachment_pdf_timeout_seconds,
             )
         except AttachmentRefused as exc:
             raise ApiError(exc.status, "invalid_request", exc.message) from exc
@@ -138,10 +140,10 @@ async def upload_attachment(
     await db.execute(
         delete(ChatAttachment).where(
             ChatAttachment.user_id == user_id,
-            ChatAttachment.created_at < utcnow() - timedelta(seconds=MAX_AGE_SECONDS),
+            ChatAttachment.created_at < utcnow() - timedelta(seconds=max_age),
         )
     )
-    if await _pending(db, user_id) >= settings.chat_attachments_pending_max:
+    if await _pending(db, user_id, max_age) >= settings.chat_attachments_pending_max:
         prepared.path.unlink(missing_ok=True)
         raise ApiError(429, "rate_limit", PENDING_FULL)
     row = ChatAttachment(

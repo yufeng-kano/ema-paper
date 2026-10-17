@@ -6,6 +6,7 @@ All PDF work goes through Poppler CLI tools in short-lived subprocesses:
 
 - `pdfinfo` — page count + page dimensions (points).
 - `pdftoppm -png -r <dpi>` — page rendering for vision calls, scaled so the long edge ≤ **2000 px** (large images destabilize VLM detection).
+- `pdftotext -enc UTF-8 <file> -` — only for a PDF attached to a chat message, never for a parse ([chat.md](./chat.md) § What a user message carries): its text is read from the pipe, and the child is stopped once `CHAT_ATTACHMENT_TEXT_MAX_CHARS` characters have come, so a small PDF that holds text far past its own size never has the rest read or written anywhere; the call is killed after `CHAT_ATTACHMENT_PDF_TIMEOUT_SECONDS`.
 
 Why subprocess, not a linked library: crash isolation (a malicious PDF kills the child, not the worker), free multi-core parallelism, and licensing (Poppler is GPL — fine to invoke as a separate program; PyMuPDF is AGPL and banned here). Every subprocess gets a timeout (default 60 s/page) and runs against the job's temp directory only.
 
@@ -16,7 +17,7 @@ Every page is converted the same way — **one path, no routing**:
 1. Render the page (`pdftoppm`).
 2. Send the rendered image to the model chosen for the `parse` agent ([agents.md](./agents.md)), on its upstream (Kano Proxy or a provider connection), with the transcription prompt. The model returns the page's markdown with figure placeholders inline. `method: "vision"` on every page.
 
-There is no PDF-text-layer conversion path: the product converts what the page *looks like*, and a single pipeline means every page obeys the same prompt, the same figure contract and the same failure rules. The PDF text layer is never extracted — `pdfinfo` and `pdftoppm` are the only Poppler calls.
+There is no PDF-text-layer conversion path: the product converts what the page *looks like*, and a single pipeline means every page obeys the same prompt, the same figure contract and the same failure rules. A parse never extracts the PDF text layer — `pdfinfo` and `pdftoppm` are its only Poppler calls; `pdftotext` serves the chat composer's attachments alone.
 
 A page that cannot be rendered or transcribed → entry in `errors`, parsing continues. Whole document unreadable → job fails, no partial markdown; the failure message names the per-page reasons.
 

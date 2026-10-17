@@ -65,9 +65,12 @@ ATTACHMENT_EXTENSIONS: tuple[str, ...] = tuple(
     sorted({*IMAGE_TYPES, *PDF_EXTENSIONS, *TEXT_EXTENSIONS})
 )
 # Every attachment file starts so, in the upload directory the sweeper empties of anything
-# older than a day (docs/jobs.md § Retention).
+# older than `UPLOAD_MAX_AGE_SECONDS` (docs/jobs.md § Retention).
 FILE_PREFIX = "chat-attachment-"
 READ_CHUNK_BYTES = 64 * 1024
+# What follows a PDF's text where `pdftotext` was stopped (docs/chat.md § What a user
+# message carries).
+PDF_TEXT_CUT = "\n\n[... the PDF's text goes on past this point ...]"
 
 
 class AttachmentRefused(Exception):
@@ -198,12 +201,12 @@ async def prepare_attachment(
     max_pixels: int,
     long_edge: int,
     text_max_chars: int,
-    timeout: float = poppler.DEFAULT_TIMEOUT_SECONDS,
+    pdf_timeout: float,
 ) -> PreparedAttachment:
     """Prepare the upload at `source` into `out_dir` under the attachment's own name. An
     image is decoded, turned upright, flattened onto white and downscaled (PNG stays PNG,
-    anything else becomes JPEG); a PDF is its text layer, through Poppler; a text file is
-    its UTF-8 text. Raises `AttachmentRefused` for anything that cannot be attached."""
+    anything else becomes JPEG); a PDF is its text layer's head, through Poppler; a text
+    file is its UTF-8 text. Raises `AttachmentRefused` for anything that cannot be attached."""
     kind = classify(name, media_type)
     if kind is None:
         raise AttachmentRefused(415, "Only images, PDFs and text files can be attached")
@@ -212,16 +215,22 @@ async def prepare_attachment(
         return await asyncio.to_thread(_prepare_image, source, out_dir, stem, max_pixels, long_edge)
     if kind == "pdf":
         with tempfile.TemporaryDirectory(prefix="sr-attach-", dir=out_dir) as work:
-            target = Path(work) / "text.txt"
             try:
-                await poppler.pdf_text(source, target, cwd=Path(work), timeout=timeout)
+                # Four bytes a character at most: the cap always holds `text_max_chars`.
+                data, goes_on = await poppler.pdf_text(
+                    source, cwd=Path(work), timeout=pdf_timeout, max_bytes=4 * text_max_chars
+                )
             except poppler.PopplerError as exc:
                 raise AttachmentRefused(400, "The PDF could not be read") from exc
-            text = await asyncio.to_thread(_read_bounded, target, text_max_chars, strict=False)
+        # Not final: a character the cap split is dropped rather than replaced.
+        text = codecs.getincrementaldecoder("utf-8-sig")("replace").decode(data)
+        text = text.replace("\x00", "")
         if not text.strip():
             raise AttachmentRefused(
                 400, "The PDF has no text layer to read; attach its pages as images instead"
             )
+        if goes_on or len(text) > text_max_chars:
+            text = text[:text_max_chars] + PDF_TEXT_CUT
     else:
         try:
             text = await asyncio.to_thread(_read_bounded, source, text_max_chars, strict=True)

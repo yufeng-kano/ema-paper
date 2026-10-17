@@ -176,20 +176,49 @@ async def render_page(
 
 
 async def pdf_text(
-    pdf_path: Path,
-    target: Path,
-    *,
-    cwd: Path,
-    timeout: float = DEFAULT_TIMEOUT_SECONDS,
-) -> Path:
-    """Write the PDF's text layer to `target` as UTF-8 — to a file rather than a pipe, so a
-    long document's text is read back bounded instead of held whole (the chat composer's
-    attachments, docs/chat.md § What a user message carries)."""
-    await _run(
-        [PDFTOTEXT, "-q", "-enc", "UTF-8", str(pdf_path), str(target)],
-        cwd=cwd,
-        timeout=timeout,
-    )
-    if not target.exists():
-        raise PopplerError("pdftotext wrote no text")
-    return target
+    pdf_path: Path, *, cwd: Path, timeout: float, max_bytes: int
+) -> tuple[bytes, bool]:
+    """The PDF's text layer as UTF-8, read from the child's pipe up to `max_bytes`, and
+    whether it went on past them. A small PDF can hold text far past its own size, so the
+    child is stopped at the cap rather than drained: the rest is never read, held or
+    written anywhere (the chat composer's attachments, docs/parsing.md)."""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            PDFTOTEXT,
+            "-q",
+            "-enc",
+            "UTF-8",
+            str(pdf_path),
+            "-",
+            cwd=str(cwd),
+            stdout=asyncio.subprocess.PIPE,
+            # Silent under `-q`; a pipe nobody read would stall the child once full.
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError as exc:  # Poppler not installed on this host.
+        raise PopplerError(f"could not start {PDFTOTEXT}") from exc
+
+    async def collect() -> tuple[bytes, int | None]:
+        assert process.stdout is not None
+        try:
+            # One byte past the cap says whether the text goes on.
+            data = await process.stdout.readexactly(max_bytes + 1)
+        except asyncio.IncompleteReadError as short:
+            # The text ended within the cap: the child's own exit says how it went.
+            return short.partial, await process.wait()
+        return data[:max_bytes], None
+
+    try:
+        data, returncode = await asyncio.wait_for(collect(), timeout=timeout)
+    except TimeoutError as exc:
+        raise PopplerTimeout(f"{PDFTOTEXT} timed out after {timeout:.0f}s") from exc
+    finally:
+        if process.returncode is None:
+            # Past the cap, over the timeout, or the caller gave up: the child goes with
+            # the call, killed and reaped, never left running outside it.
+            process.kill()
+            await process.wait()
+        process._transport.close()
+    if returncode is not None and returncode != 0:
+        raise PopplerError(f"{PDFTOTEXT} failed: exit {returncode}")
+    return data, returncode is None

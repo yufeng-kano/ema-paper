@@ -13,10 +13,13 @@ import httpx
 import respx
 from httpx import AsyncClient
 from PIL import Image
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
 from sqlalchemy import select
 
 from sightread.db.models import ChatAttachment, User, utcnow
 from sightread.parsing import attachments as attachment_prep
+from sightread.parsing import poppler
 from tests.conftest import CSRF_HEADERS
 from tests.test_chat import _run_queued_turn
 from tests.test_chat_extensions import chatting_client, new_conversation, send, stub_messages
@@ -169,6 +172,39 @@ async def test_a_long_text_keeps_its_head_and_tail(make_client, tmp_path) -> Non
     source.write_bytes(b"\x00" + "é".encode() * attachment_prep.READ_CHUNK_BYTES)
     bounded = attachment_prep._read_bounded(source, 100, strict=True)
     assert "\x00" not in bounded and len(bounded) <= 100 and bounded.startswith("é")
+
+
+async def test_a_pdf_is_read_only_to_its_text_cap(make_client, tmp_path) -> None:
+    """A small PDF can hold text far past its own size: `pdftotext` is read from its pipe and
+    stopped at the cap, never drained into a file (docs/parsing.md)."""
+    source = tmp_path / "long.pdf"
+    pdf = canvas.Canvas(str(source), pagesize=letter, pageCompression=1)
+    for page in range(100):
+        pdf.drawString(72, 740, f"PAGE {page}")
+        for line in range(40):
+            pdf.drawString(72, 720 - line * 16, "the same words again " * 4)
+        pdf.showPage()
+    pdf.save()
+    head, goes_on = await poppler.pdf_text(source, cwd=tmp_path, timeout=60, max_bytes=1000)
+    assert len(head) == 1000 and goes_on
+    assert head.startswith(b"PAGE 0")
+    whole, goes_on = await poppler.pdf_text(source, cwd=tmp_path, timeout=60, max_bytes=10**8)
+    # Past its own size, which is what the cap is for.
+    assert not goes_on and len(whole) > source.stat().st_size
+
+    client = make_client(chat_attachment_text_max_chars=300)
+    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    created = await attach(client, "long.pdf", source.read_bytes(), "application/pdf")
+    assert created.status_code == 201, created.text
+    prepared = waiting(client)[0].read_text(encoding="utf-8")
+    assert prepared.startswith("PAGE 0")
+    assert prepared.endswith(attachment_prep.PDF_TEXT_CUT)
+    assert len(prepared) == 300 + len(attachment_prep.PDF_TEXT_CUT) == created.json()["chars"]
+    # The prepared text is all that is left: nothing was staged beside it.
+    assert len(waiting(client)) == 1
+    assert [entry.name for entry in Path(client.app.state.settings.upload_dir).iterdir()] == [
+        waiting(client)[0].name
+    ]
 
 
 async def test_the_attachment_route_streams_past_the_json_body_cap(make_client) -> None:

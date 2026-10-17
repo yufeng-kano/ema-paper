@@ -107,9 +107,14 @@ async function setQuote(text: string) {
 /** The skill picked from the menu: a chip at the start of the field. */
 const command = ref<CommandOption | null>(null)
 const skills = ref<CommandOption[]>([])
-/** The first list of skills has come back, or failed to. Before it, the menu holds no
- *  skill yet, so Enter and Tab wait: a command typed at once is not sent as text. */
+/** The first list of skills has come back, or failed to: until then the menu says it is
+ *  loading rather than listing nothing. */
 const skillsLoaded = ref(false)
+/** A fetch of the list is in flight. Enter and Tab then pick only a skill already listed
+ *  and otherwise wait, so a command typed meanwhile is not sent as text. */
+const skillsLoading = ref(false)
+/** Numbers the fetches: only the latest may fill the list. */
+let skillsRequest = 0
 /** The command control opened the menu over a draft that is not a command. */
 const menuForced = ref(false)
 /** Escape closed it for the command being typed; the next one opens it again. */
@@ -119,14 +124,24 @@ const active = ref(0)
 /** The reader's commands: their skills that can be run as `/name`, fetched each time the
  *  menu opens, since the Agent page may have changed them since. */
 async function loadSkills() {
+  const request = ++skillsRequest
+  skillsLoading.value = true
   try {
-    skills.value = (await listSkills()).skills
+    const listed: CommandOption[] = (await listSkills()).skills
       .filter((skill) => skill.user_invocable)
       .map((skill) => ({ name: skill.name, description: skill.description, hint: skill.argument_hint, group: 'skill' }))
+    if (request === skillsRequest) {
+      skills.value = listed
+    }
   } catch (error) {
-    localError.value = await resolve(error)
+    if (request === skillsRequest) {
+      localError.value = await resolve(error)
+    }
   } finally {
-    skillsLoaded.value = true
+    if (request === skillsRequest) {
+      skillsLoading.value = false
+      skillsLoaded.value = true
+    }
   }
 }
 
@@ -228,11 +243,12 @@ function onKeydown(event: KeyboardEvent) {
       return
     }
     if ((event.key === 'Enter' && !event.shiftKey) || event.key === 'Tab') {
-      if (!skillsLoaded.value) {
+      const option = matches.value[active.value]
+      // Anything but a listed skill may be standing in for one not listed yet.
+      if (skillsLoading.value && option?.group !== 'skill') {
         event.preventDefault()
         return
       }
-      const option = matches.value[active.value]
       if (option) {
         event.preventDefault()
         pick(option)
@@ -278,6 +294,9 @@ interface PendingAttachment {
   /** Why it was refused, as the reader reads it. */
   reason: string | null
   id: string | null
+  /** A send in flight carries it: the server is claiming it, so it is neither removed
+   *  nor deleted with a panel that goes meanwhile. */
+  claimed: boolean
 }
 
 const pending = ref<PendingAttachment[]>([])
@@ -285,9 +304,6 @@ const pending = ref<PendingAttachment[]>([])
 const uploads = new Map<number, AttachmentUpload>()
 /** Every preview made, released when the panel goes: a sent one is still on screen. */
 const previews = new Set<string>()
-/** The keys of the attachments a send in flight carries. The server is claiming them, so
- *  a composer that goes away meanwhile leaves them to that send. */
-const claimed = new Set<number>()
 let unmounted = false
 let nextKey = 0
 
@@ -333,6 +349,7 @@ function addFiles(files: readonly File[]) {
       progress: 0,
       reason: refusal ? refusalText(refusal) : null,
       id: null,
+      claimed: false,
     })
     if (!refusal) {
       upload(key, file)
@@ -371,7 +388,7 @@ function upload(key: number, file: File) {
 
 function remove(key: number) {
   const item = find(key)
-  if (!item) {
+  if (!item || item.claimed) {
     return
   }
   pending.value = pending.value.filter((entry) => entry.key !== key)
@@ -422,7 +439,7 @@ onBeforeUnmount(() => {
     request.abort()
   }
   for (const item of pending.value) {
-    if (item.id && !claimed.has(item.key)) {
+    if (item.id && !item.claimed) {
       void deleteAttachment(item.id).catch(() => {})
     }
   }
@@ -467,14 +484,14 @@ async function send() {
       attachments: ready.map((item) => ({ id: item.id!, name: item.name, image: item.image, preview: item.preview })),
     }
     for (const item of ready) {
-      claimed.add(item.key)
+      item.claimed = true
     }
     let accepted = false
     try {
       accepted = await props.submit(payload)
     } finally {
       for (const item of ready) {
-        claimed.delete(item.key)
+        item.claimed = false
       }
     }
     if (!accepted) {
@@ -550,7 +567,9 @@ defineExpose({ addFiles, setQuote, focus })
           </button>
         </div>
       </div>
-      <p v-if="skillsLoaded && !matches.length" class="menu-empty">{{ t('chat.commandNoMatch') }}</p>
+      <p v-if="skillsLoaded && !matches.length" class="menu-empty" role="status">
+        {{ skillsLoading ? t('common.loading') : t('chat.commandNoMatch') }}
+      </p>
       <p class="menu-keys">{{ t('chat.commandKeys') }}</p>
     </div>
 
@@ -604,6 +623,7 @@ defineExpose({ addFiles, setQuote, focus })
               class="thumb-drop"
               :aria-label="t('chat.attachmentRemove', { name: item.name })"
               :title="t('chat.attachmentRemove', { name: item.name })"
+              :disabled="item.claimed"
               @click="remove(item.key)"
             >
               <UiIcon name="x" />
@@ -631,6 +651,7 @@ defineExpose({ addFiles, setQuote, focus })
               class="file-drop"
               :aria-label="t('chat.attachmentRemove', { name: item.name })"
               :title="t('chat.attachmentRemove', { name: item.name })"
+              :disabled="item.claimed"
               @click="remove(item.key)"
             >
               <UiIcon name="x" />
@@ -979,6 +1000,13 @@ defineExpose({ addFiles, setQuote, focus })
 .thumb-drop :deep(svg) {
   width: 10px;
   height: 10px;
+}
+
+/* While a send carries the attachment, it cannot be taken back. */
+.thumb-drop:disabled,
+.file-drop:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
 }
 
 .file {

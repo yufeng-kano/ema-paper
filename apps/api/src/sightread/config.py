@@ -58,6 +58,9 @@ class Settings(BaseSettings):
     vision_concurrency_per_job: int = 8
     render_workers: int = 0  # 0 means "CPU count", resolved by the worker
     upload_dir: str = "/data/uploads"
+    # How old an entry of the upload directory may grow before the sweeper takes it, an
+    # unsent chat attachment's included (docs/jobs.md § Retention).
+    upload_max_age_seconds: int = 86_400
     # Stored figure crops, kept with the result — outside the upload dir on purpose, so the
     # sweeper never touches them (docs/parsing.md § Figure crops).
     figures_dir: str = "/data/figures"
@@ -126,6 +129,8 @@ class Settings(BaseSettings):
     # day — and how long the reader's browser may keep an attached image's bytes.
     chat_attachments_pending_max: int = 32
     chat_attachment_cache_seconds: int = 31_536_000
+    # How long `pdftotext` may take on an attached PDF (docs/parsing.md).
+    chat_attachment_pdf_timeout_seconds: float = 60.0
     # A user's own skills and subagents, and the tool calls one subagent run may make
     # (docs/chat.md § Skills, § Subagents).
     chat_skills_max: int = 64
