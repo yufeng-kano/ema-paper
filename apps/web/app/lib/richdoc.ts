@@ -18,6 +18,9 @@
  */
 import type { JSONContent } from '@tiptap/core'
 import {
+  ESCAPABLE,
+  WORD_CHAR,
+  isEscaped,
   mathSpanAt,
   parseInline,
   parseResultMarkdown,
@@ -127,7 +130,10 @@ export function blocksToDoc(blocks: ResultBlock[], leads: (string | null)[] = []
   const content = blocks.map((block, index) => {
     const node = blockNode(block)
     const lead = leads[index] ?? null
-    return { ...node, attrs: { ...node.attrs, src: block.src, canon: serializeNode(node), lead } }
+    // `src` before `canon`: a table's rule row is read from its source, on the way in as on
+    // the way back, or an untouched table would never match its canonical form.
+    const sourced = { ...node, attrs: { ...node.attrs, src: block.src } }
+    return { ...sourced, attrs: { ...sourced.attrs, canon: serializeNode(sourced), lead } }
   })
   return { type: 'doc', content: content.length ? content : [{ type: 'paragraph' }] }
 }
@@ -143,34 +149,32 @@ const PAGE_MARKER_LINE = /^\s*<!--\s*page:\s*\d+\s*-->\s*$/
  */
 export function markdownToDoc(markdown: string): JSONContent {
   const source = markdown.replace(/\r\n?/g, '\n')
-  const markers = [...source.matchAll(/^[ \t]*(<!--\s*page:\s*(\d+)\s*-->)[ \t]*$/gm)]
-  const blocks: ResultBlock[] = []
-  for (const page of parseResultMarkdown(source)) {
-    // Only a marker the file has: the parser opens page 1 for content before any marker.
-    const marker = markers.find((match) => Number(match[2]) === page.page)
-    if (marker) {
-      blocks.push({ kind: 'comment', src: marker[1] ?? '' })
-    }
-    blocks.push(...page.blocks)
+  const placed: { at: number; block: ResultBlock }[] = []
+  for (const match of source.matchAll(/^[ \t]*(<!--\s*page:\s*\d+\s*-->)[ \t]*$/gm)) {
+    placed.push({ at: match.index + match[0].indexOf(match[1] ?? ''), block: { kind: 'comment', src: match[1] ?? '' } })
   }
-  const leads: (string | null)[] = []
+  // Every block where the file has it — a marker included, so content before the first
+  // marker stays before it.
   let cursor = 0
-  for (const block of blocks) {
+  for (const block of parseResultMarkdown(source).flatMap((page) => page.blocks)) {
     const at = source.indexOf(block.src, cursor)
-    if (at === -1) {
-      leads.push(null)
-      continue
-    }
-    leads.push(source.slice(cursor, at))
-    cursor = at + block.src.length
+    placed.push({ at: at === -1 ? cursor : at, block })
+    cursor = at === -1 ? cursor : at + block.src.length
   }
-  return blocksToDoc(blocks, leads)
+  placed.sort((a, b) => a.at - b.at)
+  const leads: (string | null)[] = []
+  let end = 0
+  for (const { at, block } of placed) {
+    leads.push(at >= end ? source.slice(end, at) : null)
+    end = Math.max(end, at + block.src.length)
+  }
+  return blocksToDoc(
+    placed.map(({ block }) => block),
+    leads,
+  )
 }
 
 // --- content -> markdown -----------------------------------------------------------------
-
-const WORD_CHAR = /[\p{L}\p{N}_]/u
-const ESCAPABLE = /[!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~]/
 
 /**
  * Plain text as markdown that `parseInline` reads back as the same text: every character it
@@ -191,14 +195,20 @@ function escapeText(text: string, inTable: boolean): string {
     } else if (char === '_') {
       const inWord = WORD_CHAR.test(text[index - 1] ?? '') && WORD_CHAR.test(next ?? '')
       out += inWord ? '_' : '\\_'
-    } else if (char === '$') {
-      out += mathSpanAt(text, index) ? '\\$' : '$'
     } else if (char === '<' && /^<br\s*\/?>/i.test(text.slice(index))) {
       out += '\\<'
     } else if (char === '|' && inTable) {
       out += '\\|'
     } else {
       out += char
+    }
+  }
+  // Dollars last, against the escaped text: escaping a backtick or a backslash can remove
+  // what kept a dollar from opening a span, so the check has to see the final characters.
+  for (let index = 0; index < out.length; index += 1) {
+    if (out[index] === '$' && !isEscaped(out, index) && mathSpanAt(out, index)) {
+      out = `${out.slice(0, index)}\\${out.slice(index)}`
+      index += 1
     }
   }
   return out
@@ -278,7 +288,7 @@ function paragraphLine(content: JSONContent[] | undefined): string {
   // A sentence ending in a dot leader and a number would read back as a contents row; one
   // escaped dot breaks the leader and still renders as a dot.
   if (readsAsTocRow(line)) {
-    line = line.replace(/\.(\s*\S+)$/, '\\.$1')
+    line = line.replace(/\.(?=[^.]*$)/, '\\.')
   }
   if (/^(#|[-+*]\s|\d{1,9}[.)]\s|\$\$|```|~~~|<!--|!\[)/.test(line)) {
     const marker = /^\d{1,9}/.exec(line)
@@ -305,8 +315,11 @@ function inlineLines(node: JSONContent, inTable: boolean): string[] {
     case 'paragraph':
     case 'heading':
       return [serializeInline(node.content, inTable)]
-    case 'blockMath':
-      return [serializeInline([{ type: 'inlineMath', attrs: node.attrs }], inTable)]
+    case 'blockMath': {
+      // One line: an item or a row ends at a line break.
+      const latex = String(node.attrs?.latex ?? '').replace(/\s*\n\s*/g, ' ')
+      return [serializeInline([{ type: 'inlineMath', attrs: { latex } }], inTable)]
+    }
     case 'codeBlock':
       return (node.content ?? [])
         .map((child) => child.text ?? '')
@@ -379,12 +392,12 @@ export function serializeNode(node: JSONContent): string {
       return latex ? `$$\n${latex}\n$$` : ''
     }
     case 'codeBlock': {
-      // The parser closes a code block on any fence line, whatever opened it, so a fence
-      // inside the code is kept from closing it by a zero-width space in front.
+      // The parser closes a code block on any fence line, whatever opened it, and on a page
+      // marker, so either inside the code is kept from closing it by a zero-width space.
       const text = (node.content ?? [])
         .map((child) => child.text ?? '')
         .join('')
-        .replace(/^(\s*)(```|~~~)/gm, '$1\u200b$2')
+        .replace(/^(\s*)(```|~~~|<!--\s*page:)/gm, '$1\u200b$2')
       return `\`\`\`${String(node.attrs?.language ?? '')}\n${text}\n\`\`\``
     }
     case 'rawBlock':
@@ -459,11 +472,7 @@ export function inlineMathAtEnd(text: string): { index: number; tex: string } | 
     if (open === -1) {
       return null
     }
-    let slashes = 0
-    while (text[open - 1 - slashes] === '\\') {
-      slashes += 1
-    }
-    const span = slashes % 2 === 0 ? mathSpanAt(text, open) : null
+    const span = isEscaped(text, open) ? null : mathSpanAt(text, open)
     if (span) {
       if (open + span.length === text.length) {
         // `$$x$` is a display fence being typed, not a dollar sign and a formula.

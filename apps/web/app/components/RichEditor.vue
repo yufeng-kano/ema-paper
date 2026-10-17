@@ -18,7 +18,7 @@
  */
 import { Editor } from '@tiptap/core'
 import { Slice } from '@tiptap/pm/model'
-import { Selection, TextSelection } from '@tiptap/pm/state'
+import { NodeSelection, Selection, TextSelection } from '@tiptap/pm/state'
 import { richExtensions, type Caret, type MathTarget } from '~/lib/rich-extensions'
 import { docToMarkdown, markdownToDoc, sliceToMarkdown } from '~/lib/richdoc'
 
@@ -150,7 +150,14 @@ function atEdge(edge: 'start' | 'end'): boolean {
   }
   const { state } = editor
   const bound = edge === 'start' ? Selection.atStart(state.doc) : Selection.atEnd(state.doc)
-  return state.selection.empty && state.selection.$from.start() === bound.$from.start()
+  // A block that is one display formula opens with the formula selected as a whole.
+  const whole = state.selection instanceof NodeSelection
+  return (state.selection.empty || whole) && state.selection.$from.start() === bound.$from.start()
+}
+
+/** On the first (or last) line of its textblock — or on a selected formula, which is one. */
+function onEdgeLine(direction: 'up' | 'down'): boolean {
+  return !!editor && (editor.state.selection instanceof NodeSelection || editor.view.endOfTextblock(direction))
 }
 
 function onKey(event: KeyboardEvent): boolean {
@@ -173,11 +180,11 @@ function onKey(event: KeyboardEvent): boolean {
   if (props.variant !== 'block') {
     return false
   }
-  const { view, state } = editor
-  if (event.key === 'ArrowUp' && atEdge('start') && view.endOfTextblock('up')) {
+  const { state } = editor
+  if (event.key === 'ArrowUp' && atEdge('start') && onEdgeLine('up')) {
     return props.onNavigate?.('up') ?? false
   }
-  if (event.key === 'ArrowDown' && atEdge('end') && view.endOfTextblock('down')) {
+  if (event.key === 'ArrowDown' && atEdge('end') && onEdgeLine('down')) {
     return props.onNavigate?.('down') ?? false
   }
   if (event.key === 'Backspace' && atEdge('start') && state.selection.$from.parentOffset === 0) {
@@ -319,7 +326,7 @@ defineExpose({
 </script>
 
 <template>
-  <div ref="root" class="rich" :class="variant">
+  <div ref="root" class="rich" :class="`rich-${variant}`">
     <div ref="mount" />
     <!-- The TeX field: the context menu's floating surface, under the formula it edits. -->
     <div

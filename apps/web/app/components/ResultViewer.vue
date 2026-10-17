@@ -440,6 +440,12 @@ function isEditing(pageIndex: number, blockIndex: number): boolean {
   return editing.value?.page === pageIndex && editing.value.index === blockIndex
 }
 
+/** The block a Backspace join carried into the open editor: still in the document until
+ *  the editor is written back, but drawn only once — in the editor. */
+function isJoinedAway(pageIndex: number, blockIndex: number): boolean {
+  return joined.value && editing.value?.page === pageIndex && editing.value.index + 1 === blockIndex
+}
+
 /** The open block, or undefined for the editor past the last block of a page. */
 const openBlock = computed(() => {
   const open = editing.value
@@ -690,15 +696,39 @@ const lineEditorRows = computed(() => Math.max(2, draft.value.split('\n').length
 // --- column widths -----------------------------------------------------------------------
 
 const columnsBox = ref<HTMLElement | null>(null)
+/** The width the document and its columns share, kept current so the columns are clamped
+ *  again when the window narrows or the other column opens — not only while dragging. */
+const columnsWidth = ref(Number.POSITIVE_INFINITY)
 let resizing: { column: 'notes' | 'agent'; x: number; width: number } | null = null
+let columnsObserver: ResizeObserver | null = null
+
+watch(columnsBox, (box) => {
+  columnsObserver?.disconnect()
+  columnsObserver = null
+  if (box) {
+    columnsObserver = new ResizeObserver(() => {
+      columnsWidth.value = box.clientWidth
+    })
+    columnsObserver.observe(box)
+  }
+})
+
+onBeforeUnmount(() => columnsObserver?.disconnect())
+
+watch([columnsWidth, notesOpen, agentOpen], () => {
+  setColumnWidth('notes', columnWidth.notes.value)
+  setColumnWidth('agent', columnWidth.agent.value)
+})
 
 /** The widest a column may be right now: its own cap, and whatever leaves the document
  *  pane its minimum beside the other column. */
 function columnMax(column: 'notes' | 'agent'): number {
   const other = column === 'notes' ? 'agent' : 'notes'
   const otherOpen = other === 'notes' ? notesOpen.value : agentOpen.value
-  const total = columnsBox.value?.clientWidth ?? Number.POSITIVE_INFINITY
-  const room = total - PANE_MIN_WIDTH - (otherOpen ? columnWidth[other].value : 0)
+  const total = columnsWidth.value
+  // Each open column's rule takes 1px of the row (7px wide, overlapping its neighbours).
+  const rules = (notesOpen.value ? 1 : 0) + (agentOpen.value ? 1 : 0)
+  const room = total - PANE_MIN_WIDTH - rules - (otherOpen ? columnWidth[other].value : 0)
   return Math.max(COLUMN_WIDTHS[column].min, Math.min(COLUMN_WIDTHS[column].max, room))
 }
 
@@ -1295,6 +1325,7 @@ const awaitingContent = computed(
                     :class="{ editable, open: isEditing(pageIndex, index) }"
                     :tabindex="editable && !isEditing(pageIndex, index) ? 0 : undefined"
                     :data-block="`${pageIndex}-${index}`"
+                    :hidden="isJoinedAway(pageIndex, index)"
                     @mousedown="editable && onBlockPress($event, pageIndex, index)"
                     @keydown.enter.self.prevent="startEdit(pageIndex, index)"
                   >
@@ -1397,7 +1428,7 @@ const awaitingContent = computed(
               :aria-label="t('viewer.resizeNotes')"
               :aria-valuenow="columnWidth.notes.value"
               :aria-valuemin="COLUMN_WIDTHS.notes.min"
-              :aria-valuemax="COLUMN_WIDTHS.notes.max"
+              :aria-valuemax="columnMax('notes')"
               @pointerdown="startResize($event, 'notes')"
               @pointermove="onResize"
               @pointerup="endResize"
@@ -1433,7 +1464,7 @@ const awaitingContent = computed(
             :aria-label="t('viewer.resizeAgent')"
             :aria-valuenow="columnWidth.agent.value"
             :aria-valuemin="COLUMN_WIDTHS.agent.min"
-            :aria-valuemax="COLUMN_WIDTHS.agent.max"
+            :aria-valuemax="columnMax('agent')"
             @pointerdown="startResize($event, 'agent')"
             @pointermove="onResize"
             @pointerup="endResize"

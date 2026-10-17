@@ -224,6 +224,48 @@ describe('second review', () => {
   })
 })
 
+describe('third review', () => {
+  const para = (text: string): JSONContent => ({ type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text }] }] })
+
+  it('leaves an untouched table with its own spacing alone', () => {
+    const notes = '|A|B|\n|---|---|\n|1|2|\n\nedit me'
+    const doc = load(notes)
+    doc.content![1]!.content = [{ type: 'text', text: 'edited' }]
+    expect(docToMarkdown(doc)).toBe('|A|B|\n|---|---|\n|1|2|\n\nedited')
+  })
+
+  it.each(['$a\\$', 'cost $a`b$ x', 'Wait.....5', 'Loading........12'])('keeps %s plain text', (text) => {
+    const markdown = docToMarkdown(para(text))
+    expect(reading(markdown)).toEqual([{ kind: 'p', text: markdown }])
+    expect(load(markdown).content![0]!.content).toEqual([{ type: 'text', text }])
+  })
+
+  it('writes a multi-line formula in a list item on one line', () => {
+    const doc: JSONContent = {
+      type: 'doc',
+      content: [{ type: 'bulletList', content: [
+        { type: 'listItem', content: [{ type: 'paragraph', content: [{ type: 'text', text: 'a' }] }, { type: 'blockMath', attrs: { latex: 'x \\\\\ny' } }] },
+        { type: 'listItem', content: [{ type: 'paragraph', content: [{ type: 'text', text: 'b' }] }] },
+      ] }],
+    }
+    expect(reading(docToMarkdown(doc)).map((block) => block.kind)).toEqual(['list'])
+  })
+
+  it('keeps a page marker line inside code', () => {
+    const doc: JSONContent = { type: 'doc', content: [{ type: 'codeBlock', content: [{ type: 'text', text: 'a\n<!-- page: 9 -->\nb' }] }] }
+    const pages = parseResultMarkdown(docToMarkdown(doc))
+    expect(pages.map((page) => page.blocks.map((block) => block.kind))).toEqual([['code']])
+  })
+
+  it('keeps content before the first page marker before it', () => {
+    const notes = 'intro\n\n<!-- page: 1 -->\nmore'
+    const doc = load(notes)
+    expect(docToMarkdown(doc)).toBe(notes)
+    doc.content![2]!.content = [{ type: 'text', text: 'more2' }]
+    expect(docToMarkdown(doc)).toBe('intro\n\n<!-- page: 1 -->\nmore2')
+  })
+})
+
 describe('inline math as it is typed', () => {
   it.each([
     ['the formula $x$', { index: 12, tex: 'x' }],
