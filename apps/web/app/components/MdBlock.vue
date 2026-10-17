@@ -126,46 +126,6 @@ const figureSource = computed(() => {
 </template>
 
 <style scoped>
-/*
- * The two reading sizes come from the surface the block sits on: the document pane sets
- * `--block-text` / `--block-text-sm` to the read scale, the notes column to the UI scale.
- */
-.md-h2 {
-  font-size: var(--block-heading, var(--display-lg));
-  letter-spacing: var(--tracking-heading);
-}
-
-.md-h3 {
-  margin: 0;
-  font-family: var(--font-display);
-  font-size: var(--block-subheading, var(--display-sm));
-  font-weight: var(--weight-semibold);
-  line-height: 1.3;
-}
-
-.md-p {
-  color: var(--ink-soft);
-  font-size: var(--block-text, var(--text-read));
-  line-height: 1.75;
-  text-wrap: pretty;
-}
-
-/* A formula is read, not scanned, so it keeps the body's colour and size — but it scrolls
-   sideways rather than wrapping, because a re-wrapped equation is a different equation.
-   Sideways only: `overflow-y` is stated because CSS computes a `visible` axis to `auto` the
-   moment the other one is not, and an equation behind a vertical scrollbar is half an
-   equation. */
-.md-math {
-  margin: 0;
-  overflow-x: auto;
-  overflow-y: hidden;
-  color: var(--ink-soft);
-  font-family: var(--mono);
-  font-size: var(--block-text-sm, var(--text-read-sm));
-  line-height: 1.7;
-  white-space: pre;
-}
-
 /* A contents row: title left, page right, the leader stretched between them on the text's
    baseline. A long title wraps inside its own span and the number stays on the last line. */
 .md-toc {
@@ -196,65 +156,6 @@ const figureSource = computed(() => {
 .md-toc-page {
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
-}
-
-/* Markers stay outside the measure, so the text edge lines up with the paragraphs above
-   and below it rather than being indented away from them. */
-.md-list {
-  margin: 0;
-  padding-left: var(--space-5);
-  color: var(--ink-soft);
-  font-size: var(--block-text, var(--text-read));
-  line-height: 1.75;
-}
-
-.md-list li + li {
-  margin-top: var(--space-2);
-}
-
-/* The table's own scroll axis: wider than the reading measure, it slides in place rather
-   than stretching the page — the prose column's width is fixed (docs/web.md). */
-.md-table-wrap {
-  max-width: 100%;
-  overflow-x: auto;
-  overscroll-behavior-x: contain;
-}
-
-.md-table {
-  width: max-content;
-  min-width: 100%;
-  border-collapse: separate;
-  border-spacing: 0;
-  font-size: var(--block-text-sm, var(--text-read-sm));
-  font-variant-numeric: tabular-nums;
-}
-
-/* Long prose cells still wrap; the cap is what keeps one wordy cell from dragging the
-   whole table out to a single unreadable line. */
-.md-table th,
-.md-table td {
-  max-width: 36ch;
-}
-
-.md-table th {
-  padding: var(--cell-y-tight) var(--space-4) var(--cell-y-tight) 0;
-  text-align: left;
-  font-size: var(--text-2xs);
-  font-weight: var(--weight-semibold);
-  letter-spacing: var(--tracking-label);
-  text-transform: uppercase;
-  color: var(--faint);
-  border-bottom: 1px solid var(--line-soft);
-}
-
-.md-table td {
-  padding: var(--cell-y-tight) var(--space-4) var(--cell-y-tight) 0;
-  border-bottom: 1px solid var(--line-soft);
-  color: var(--ink-soft);
-}
-
-.md-table tbody tr:last-child td {
-  border-bottom: none;
 }
 
 /* A figure is centered in the column, caption and all: a crop is narrower than the measure

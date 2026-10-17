@@ -89,6 +89,12 @@ function opensMath(line: string): boolean {
 const TOC_PAGE = String.raw`(?:\*\*|__)?(?:\d+|[ivxlcdm]+)(?:\*\*|__)?`
 /** `Title . . . . 13` / `Title.....13`: a dot leader of four or more, then the page. */
 const TOC_LEADER = new RegExp(String.raw`^(.*?\S)(\s*(?:\.\s*){4,})(${TOC_PAGE})$`, 'i')
+/** Whether a line would be read as a contents row — what an editor writing prose must
+ *  escape so a typed `Wait.... 5` stays a sentence. */
+export function readsAsTocRow(line: string): boolean {
+  return TOC_LEADER.test(line)
+}
+
 /** A row of the same run without a leader — `**1 Introduction** **13**`. Digits only:
  *  with no leader to vouch for it, a trailing "mix" or "civil" is a word, not a numeral. */
 const TOC_BARE = /^(.*?\S)(\s+)((?:\*\*|__)?\d+(?:\*\*|__)?)$/
@@ -515,7 +521,7 @@ export type InlineSegment =
  * leading or trailing space, and never closes on a dollar followed by a digit, so
  * "$5 and $6" stays two prices.
  */
-function mathSpanAt(text: string, open: number): { tex: string; length: number } | null {
+export function mathSpanAt(text: string, open: number): { tex: string; length: number } | null {
   let depth = 0
   for (let index = open + 1; index < text.length; index += 1) {
     const char = text[index]
@@ -554,7 +560,7 @@ const CODE_AT = /^`([^`\n]+)`/
  * character literal **and does not print itself** — `\[87]` in a reference list is `[87]`.
  * Before anything else (`C:\path`, a stray `\n`) it is an ordinary backslash and stays.
  */
-const ESCAPABLE = /[!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~]/
+export const ESCAPABLE = /[!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~]/
 
 // Emphasis opens on a marker followed by non-space and closes on non-space + marker, per
 // GFM's flanking idea reduced to what transcriptions produce. The asterisk forms allow
@@ -568,7 +574,7 @@ const ESCAPABLE = /[!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~]/
 // admits a complete `` `code` `` span as one unit (the leading alternative in each
 // group), so a delimiter *inside* code — `*use \`a*b\` now*` — cannot close the
 // emphasis around it, mirroring how the math scan protects code spans.
-const WORD_CHAR = /[\p{L}\p{N}_]/u
+export const WORD_CHAR = /[\p{L}\p{N}_]/u
 /** `***text***` is em(strong(text)) — matched before the pair forms, which would
  *  otherwise close two asterisks early and strand the third. */
 const TRIPLE_AST_AT = /^\*\*\*(?![\s*])((?:`[^`\n]*`|[^*\n])+?)(?<=\S)(?<!(?<!\\)\\)\*\*\*(?!\*)/
@@ -584,7 +590,7 @@ const EM_UND_AT = /^_(?![\s_])((?:`[^`\n]*`|[^_\n])+?)(?<=\S)(?<!(?<!\\)\\)_(?![
  * `\*word*` the asterisk is literal, but in `\\*word*` the first backslash escapes the
  * second and the asterisk is a live delimiter.
  */
-function isEscaped(text: string, index: number): boolean {
+export function isEscaped(text: string, index: number): boolean {
   let count = 0
   while (index - 1 - count >= 0 && text[index - 1 - count] === '\\') {
     count += 1

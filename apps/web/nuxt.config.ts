@@ -7,7 +7,7 @@ export default defineNuxtConfig({
   devtools: { enabled: false },
   // KaTeX's stylesheet ships with the package (fonts bundled by the build) — the result
   // viewer's math depends on nothing remote (docs/web.md § Result viewer).
-  css: ['~/assets/css/main.css', 'katex/dist/katex.min.css'],
+  css: ['~/assets/css/main.css', '~/assets/css/markdown.css', 'katex/dist/katex.min.css'],
 
   app: {
     head: {

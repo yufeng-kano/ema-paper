@@ -13,6 +13,7 @@ import {
   type ContentBlock,
   type Conversation,
 } from '~/lib/api'
+import { parseResultMarkdown, type ResultBlock } from '~/lib/markdown'
 import type { MenuItem, Point } from '~/lib/menu'
 import type { StreamedEvent } from '~/composables/useConversationStream'
 
@@ -828,11 +829,33 @@ async function send() {
   }
 }
 
+/** Enter sends and Shift+Enter breaks the line, as in Claude's own chat; an Enter that
+ *  confirms an input method's composition only confirms it (docs/web.md § The agent panel). */
 function onComposerKey(event: KeyboardEvent) {
-  if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
-    event.preventDefault()
-    void send()
+  if (event.key !== 'Enter' || event.shiftKey || event.isComposing || event.keyCode === 229) {
+    return
   }
+  event.preventDefault()
+  void send()
+}
+
+/** Parsed messages by text: the panel re-renders on every streamed delta, and re-parsing
+ *  every answer in a long thread each time would make typing stutter. Streaming makes many
+ *  short-lived texts, so the cache is simply emptied once it grows. */
+const parsedMessages = new Map<string, ResultBlock[]>()
+
+/** A message as the blocks the viewer's parser reads in it — markdown and TeX drawn, not
+ *  shown as source. */
+function messageBlocks(text: string): ResultBlock[] {
+  let blocks = parsedMessages.get(text)
+  if (!blocks) {
+    if (parsedMessages.size > 200) {
+      parsedMessages.clear()
+    }
+    blocks = parseResultMarkdown(text).flatMap((page) => page.blocks)
+    parsedMessages.set(text, blocks)
+  }
+  return blocks
 }
 
 const stopping = ref(false)
@@ -896,7 +919,9 @@ async function stop() {
           <p v-if="item.selection" class="user-selection">{{ t('chat.selection', { count: item.selection }) }}</p>
         </div>
 
-        <p v-else-if="item.kind === 'text'" class="assistant">{{ item.text }}</p>
+        <div v-else-if="item.kind === 'text'" class="assistant md-message">
+          <MdBlock v-for="(block, index) in messageBlocks(item.text)" :key="index" :block="block" :page="1" />
+        </div>
 
         <!-- The model's note between tool calls: muted, one line. -->
         <p v-else-if="item.kind === 'thinking'" class="thinking">{{ item.text }}</p>
@@ -1111,12 +1136,24 @@ async function stop() {
   overflow-wrap: anywhere;
 }
 
+/* The assistant's markdown at the panel's UI scale: the document's blocks, drawn smaller. */
 .assistant {
+  --block-heading: var(--display-xs);
+  --block-subheading: var(--text-base);
+  --block-text: var(--text-sm);
+  --block-text-sm: var(--text-xs);
+
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
   color: var(--ink-soft);
-  font-size: var(--text-sm);
-  line-height: 1.55;
-  white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.assistant :deep(.md-p),
+.assistant :deep(.md-list) {
+  line-height: 1.6;
 }
 
 .thinking {
