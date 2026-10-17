@@ -200,6 +200,7 @@ export default {
     promptInsertToken: 'Insert {token}',
     promptRestore: 'Restore default',
     promptCount: '{count} / {max}',
+    promptLegacyPreset: 'A prompt saved in an earlier version still runs after this one. Saving here replaces it.',
     effortLabel: 'Effort',
     effort: { low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Very high', max: 'Max' },
     cacheNote: 'Changing the effort or the prompt rebuilds the next turn’s prompt cache.',

@@ -22,6 +22,9 @@ const { t } = useI18n()
 const { resolve } = useApiError()
 
 const initial = props.agent.settings.prompt ?? props.agent.default_prompt
+/** A preset selected before agents had a prompt of their own still runs after the default
+ *  (docs/agents.md § Per-agent settings). Saving anything, the default included, replaces it. */
+const legacyPreset = props.agent.settings.prompt === null && props.agent.settings.prompt_preset_id !== null
 const text = ref(initial)
 const textarea = ref<HTMLTextAreaElement | null>(null)
 const pending = ref(false)
@@ -31,7 +34,9 @@ const isDefault = computed(() => text.value.trim() === props.agent.default_promp
 /** Counted as the server counts: the trimmed text, in code points rather than UTF-16 units. */
 const length = computed(() => [...text.value.trim()].length)
 const overCap = computed(() => props.maxChars !== null && length.value > props.maxChars)
-const saveDisabled = computed(() => text.value === initial || !text.value.trim() || overCap.value)
+const saveDisabled = computed(
+  () => (text.value === initial && !legacyPreset) || !text.value.trim() || overCap.value,
+)
 
 /** A chip inserts its token at the caret, replacing a selection, and hands focus back. */
 async function insertToken(token: string) {
@@ -75,12 +80,13 @@ async function save() {
       <div class="heading">
         <h2 class="heading-title">{{ t('agents.promptDialogTitle', { agent: title }) }}</h2>
         <span class="heading-state" role="status">
-          {{ isDefault ? t('agents.promptDefault') : t('agents.promptEdited') }}
+          {{ isDefault && !legacyPreset ? t('agents.promptDefault') : t('agents.promptEdited') }}
         </span>
       </div>
     </template>
 
     <form :id="`prompt-form-${agent.name}`" class="form" @submit.prevent="save">
+      <UiBanner v-if="legacyPreset">{{ t('agents.promptLegacyPreset') }}</UiBanner>
       <div v-if="agent.prompt_tokens?.length" class="tokens">
         <button
           v-for="token in agent.prompt_tokens"

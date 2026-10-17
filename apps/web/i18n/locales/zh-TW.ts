@@ -194,6 +194,7 @@ export default {
     promptInsertToken: '插入 {token}',
     promptRestore: '還原預設',
     promptCount: '{count} / {max}',
+    promptLegacyPreset: '舊版儲存的提示詞仍接在這份之後執行。在這裡儲存就會取代它。',
     effortLabel: '推理強度',
     effort: { low: '低', medium: '中', high: '高', xhigh: '很高', max: '最高' },
     cacheNote: '推理強度或提示詞一改，下一輪對話的快取就會重建。',

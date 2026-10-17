@@ -107,6 +107,9 @@ async function setQuote(text: string) {
 /** The skill picked from the menu: a chip at the start of the field. */
 const command = ref<CommandOption | null>(null)
 const skills = ref<CommandOption[]>([])
+/** The first list of skills has come back, or failed to. Before it, the menu holds no
+ *  skill yet, so Enter and Tab wait: a command typed at once is not sent as text. */
+const skillsLoaded = ref(false)
 /** The command control opened the menu over a draft that is not a command. */
 const menuForced = ref(false)
 /** Escape closed it for the command being typed; the next one opens it again. */
@@ -122,6 +125,8 @@ async function loadSkills() {
       .map((skill) => ({ name: skill.name, description: skill.description, hint: skill.argument_hint, group: 'skill' }))
   } catch (error) {
     localError.value = await resolve(error)
+  } finally {
+    skillsLoaded.value = true
   }
 }
 
@@ -155,7 +160,7 @@ function optionId(option: CommandOption): string {
 
 const activeId = computed(() => {
   const option = matches.value[active.value]
-  return menuOpen.value && option ? optionId(option) : undefined
+  return menuOpen.value && skillsLoaded.value && option ? optionId(option) : undefined
 })
 
 watch(menuOpen, (open) => {
@@ -223,6 +228,10 @@ function onKeydown(event: KeyboardEvent) {
       return
     }
     if ((event.key === 'Enter' && !event.shiftKey) || event.key === 'Tab') {
+      if (!skillsLoaded.value) {
+        event.preventDefault()
+        return
+      }
       const option = matches.value[active.value]
       if (option) {
         event.preventDefault()
@@ -276,6 +285,10 @@ const pending = ref<PendingAttachment[]>([])
 const uploads = new Map<number, AttachmentUpload>()
 /** Every preview made, released when the panel goes: a sent one is still on screen. */
 const previews = new Set<string>()
+/** The keys of the attachments a send in flight carries. The server is claiming them, so
+ *  a composer that goes away meanwhile leaves them to that send. */
+const claimed = new Set<number>()
+let unmounted = false
 let nextKey = 0
 
 const accept = computed(() => acceptList(props.limits?.attachment_extensions))
@@ -404,11 +417,12 @@ function fileMeta(item: PendingAttachment): string {
 }
 
 onBeforeUnmount(() => {
+  unmounted = true
   for (const request of uploads.values()) {
     request.abort()
   }
   for (const item of pending.value) {
-    if (item.id) {
+    if (item.id && !claimed.has(item.key)) {
       void deleteAttachment(item.id).catch(() => {})
     }
   }
@@ -435,6 +449,10 @@ async function send() {
   try {
     // Send waits for the uploads in flight; one that fails stays as a refused chip.
     await Promise.allSettled([...uploads.values()].map((request) => request.promise))
+    if (unmounted) {
+      // The panel went before the message did: the draft, its attachments with it, went too.
+      return
+    }
     const ready = pending.value.filter((item) => item.state === 'ready')
     const text = draft.value.trim()
     const picked = command.value
@@ -448,7 +466,24 @@ async function send() {
       command: picked?.name ?? null,
       attachments: ready.map((item) => ({ id: item.id!, name: item.name, image: item.image, preview: item.preview })),
     }
-    if (!(await props.submit(payload))) {
+    for (const item of ready) {
+      claimed.add(item.key)
+    }
+    let accepted = false
+    try {
+      accepted = await props.submit(payload)
+    } finally {
+      for (const item of ready) {
+        claimed.delete(item.key)
+      }
+    }
+    if (!accepted) {
+      if (unmounted) {
+        // Refused after the panel went: no draft holds them any more.
+        for (const item of ready) {
+          void deleteAttachment(item.id!).catch(() => {})
+        }
+      }
       return
     }
     if (draft.value.trim() === text) {
@@ -486,7 +521,8 @@ defineExpose({ addFiles, setQuote, focus })
          highlight only by moving, so a menu that opens under a resting cursor keeps its
          first row. -->
     <div v-if="menuOpen" class="menu" @mousedown.prevent>
-      <div id="chat-commands" class="menu-list" role="listbox" :aria-label="t('chat.commands')">
+      <p v-if="!skillsLoaded" class="menu-empty" role="status">{{ t('common.loading') }}</p>
+      <div v-else id="chat-commands" class="menu-list" role="listbox" :aria-label="t('chat.commands')">
         <div
           v-for="section in sections"
           :key="section.group"
@@ -514,7 +550,7 @@ defineExpose({ addFiles, setQuote, focus })
           </button>
         </div>
       </div>
-      <p v-if="!matches.length" class="menu-empty">{{ t('chat.commandNoMatch') }}</p>
+      <p v-if="skillsLoaded && !matches.length" class="menu-empty">{{ t('chat.commandNoMatch') }}</p>
       <p class="menu-keys">{{ t('chat.commandKeys') }}</p>
     </div>
 

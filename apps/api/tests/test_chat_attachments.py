@@ -39,7 +39,9 @@ def waiting(client: AsyncClient) -> list[Path]:
 async def test_attachments_are_prepared_embedded_and_shown_without_their_bytes(
     make_client, tmp_path, documents
 ) -> None:
-    client = await chatting_client(make_client(workspaces_dir=str(tmp_path / "workspaces")))
+    client = await chatting_client(
+        make_client(workspaces_dir=str(tmp_path / "workspaces"), chat_attachment_cache_seconds=600)
+    )
     image = await attach(client, "wide.png", documents["wide_png"].read_bytes(), "image/png")
     assert image.status_code == 201, image.text
     image = image.json()
@@ -109,7 +111,8 @@ async def test_attachments_are_prepared_embedded_and_shown_without_their_bytes(
     served = await client.get(f"{base}/0")
     assert served.status_code == 200
     assert served.headers["content-type"] == "image/png"
-    assert served.headers["cache-control"] == "private, max-age=31536000, immutable"
+    # As long as the deployment says, and only in the reader's browser.
+    assert served.headers["cache-control"] == "private, max-age=600, immutable"
     assert served.content == base64.b64decode(content[0]["source"]["data"])
     for index in (1, 3, 99):
         assert (await client.get(f"{base}/{index}")).status_code == 404, index
@@ -240,6 +243,52 @@ async def test_a_new_upload_drops_the_rows_the_sweeper_has_taken(make_client) ->
     async with client.app.state.sessionmaker() as db:
         ids = {str(row.id) for row in (await db.execute(select(ChatAttachment))).scalars()}
     assert ids == {fresh["id"]}
+
+
+async def test_the_attachments_waiting_for_a_message_are_capped(make_client) -> None:
+    """Each upload is bounded and so is their number: uploads never sent would otherwise fill
+    the upload directory for a day (docs/api.md)."""
+    client = make_client(chat_attachments_pending_max=2)
+    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    first = await attach(client, "a.txt", b"one", "text/plain")
+    second = await attach(client, "b.txt", b"two", "text/plain")
+    assert (first.status_code, second.status_code) == (201, 201)
+    third = await attach(client, "c.txt", b"three", "text/plain")
+    assert third.status_code == 429
+    assert "waiting to be sent" in third.json()["error"]["message"]
+    # Refused before a byte was stored.
+    assert len(waiting(client)) == 2
+    # Removing one frees its place.
+    removed = await client.delete(f"/api/attachments/{first.json()['id']}", headers=CSRF_HEADERS)
+    assert removed.status_code == 204
+    assert (await attach(client, "c.txt", b"three", "text/plain")).status_code == 201
+
+
+@respx.mock
+async def test_attachments_that_would_fill_the_history_stay_for_another_conversation(
+    make_client, tmp_path, documents
+) -> None:
+    """The cap counts the message being sent: an image that would carry the history past it
+    is refused before it is spent, rather than embedded into a turn that then cannot run
+    (docs/chat.md § History is append-only)."""
+    client = await chatting_client(
+        make_client(workspaces_dir=str(tmp_path / "workspaces"), chat_history_max_bytes=2000)
+    )
+    image = (
+        await attach(client, "wide.png", documents["wide_png"].read_bytes(), "image/png")
+    ).json()
+    conversation_id = await new_conversation(client)
+    refused = await send(client, conversation_id, text="Look", attachments=[image["id"]])
+    assert refused.status_code == 409
+    assert "start a new conversation" in refused.json()["error"]["message"]
+    # Rolled back with the send: still waiting, file and row, for the next conversation.
+    assert len(waiting(client)) == 1
+    async with client.app.state.sessionmaker() as db:
+        assert [str(row.id) for row in (await db.execute(select(ChatAttachment))).scalars()] == [
+            image["id"]
+        ]
+    # The same history takes a message that fits.
+    assert (await send(client, conversation_id, text="Look")).status_code == 202
 
 
 def test_an_attachment_is_classified_by_extension_then_by_media_type() -> None:

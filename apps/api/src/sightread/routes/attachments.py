@@ -18,12 +18,12 @@ from datetime import timedelta
 from pathlib import Path, PurePath
 
 from fastapi import APIRouter, Request, Response, status
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from starlette.datastructures import UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser
 
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
-from ..db.models import ChatAttachment, utcnow
+from ..db.models import ChatAttachment, User, utcnow
 from ..errors import ApiError
 from ..jobs.intake import MULTIPART_ENVELOPE_BYTES, capped_stream, store_upload, upload_chunks
 from ..jobs.sweeper import MAX_AGE_SECONDS
@@ -38,6 +38,22 @@ router = APIRouter(prefix="/api", tags=["attachments"])
 
 NAME_MAX = 255
 CAP_NAME = "CHAT_ATTACHMENT_MAX_BYTES"
+PENDING_FULL = "Too many attachments are waiting to be sent; send or remove some first"
+
+
+async def _pending(db: DbSession, user_id: int) -> int:
+    """The caller's attachments still waiting for a message: one older than the sweeper's
+    day has lost its file and is no attachment any more (docs/jobs.md § Retention)."""
+    return (
+        await db.execute(
+            select(func.count())
+            .select_from(ChatAttachment)
+            .where(
+                ChatAttachment.user_id == user_id,
+                ChatAttachment.created_at >= utcnow() - timedelta(seconds=MAX_AGE_SECONDS),
+            )
+        )
+    ).scalar_one()
 
 
 def attachment_name(raw: str | None) -> str:
@@ -68,6 +84,10 @@ async def upload_attachment(
     user_id = user.id
     if not request.headers.get("content-type", "").startswith("multipart/form-data"):
         raise ApiError(400, "invalid_request", "The upload must be multipart/form-data")
+    # A cheap refusal before a byte is read; the count under the user's lock below, once the
+    # file is prepared, is the one that holds (docs/api.md).
+    if await _pending(db, user_id) >= settings.chat_attachments_pending_max:
+        raise ApiError(429, "rate_limit", PENDING_FULL)
     cap = settings.chat_attachment_max_bytes
     declared = request.headers.get("content-length", "")
     if declared.isdigit() and int(declared) > cap + MULTIPART_ENVELOPE_BYTES:
@@ -109,6 +129,9 @@ async def upload_attachment(
     finally:
         await form.close()
 
+    # Under the user's row, held until the insert commits: two uploads at the cap must not
+    # both count below it (PostgreSQL; the SQLite fallback runs one request at a time).
+    await db.execute(select(User.id).where(User.id == user_id).with_for_update())
     # The caller's rows the sweeper has taken the files of are no attachments any more:
     # they go with this upload, so the never-sent ones do not pile up (docs/jobs.md
     # § Retention).
@@ -118,6 +141,9 @@ async def upload_attachment(
             ChatAttachment.created_at < utcnow() - timedelta(seconds=MAX_AGE_SECONDS),
         )
     )
+    if await _pending(db, user_id) >= settings.chat_attachments_pending_max:
+        prepared.path.unlink(missing_ok=True)
+        raise ApiError(429, "rate_limit", PENDING_FULL)
     row = ChatAttachment(
         id=attachment_id,
         user_id=user_id,

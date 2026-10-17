@@ -145,9 +145,6 @@ SELECTION_PREFIX = "The passage selected in the document:\n\n"
 # And the reply's quote before its passage (docs/chat.md § What a user message carries).
 QUOTE_PREFIX = "The user is replying to this passage of your earlier answer:\n\n"
 ATTACHMENT_EXPIRED = "An attachment is no longer available; attach it again"
-# Who may cache an attached image's bytes: only the reader, for as long as it likes — a
-# stored message never changes (docs/api.md).
-ATTACHMENT_CACHE = "private, max-age=31536000, immutable"
 
 
 # The per-turn context block (docs/chat.md § Prompt caching): what the model must know
@@ -449,6 +446,12 @@ async def post_message(
     message = Message(conversation_id=row.id, role="user", content=content)
     db.add(message)
     await db.flush()
+    # Again with the message in, measured as the worker measures it: attached images can
+    # carry a history from under the cap to past it, and the turn would then fail before
+    # its first call with the attachments spent. Refused here instead, so the rollback
+    # keeps them for a new conversation.
+    if await history_bytes(db, row.id) > settings.chat_history_max_bytes:
+        raise ApiError(409, "invalid_request", HISTORY_FULL)
     if not row.title:
         named = visible.strip() or (attachments[0][0].name if attachments else "")
         first_line = named.splitlines()[0] if named else ""
@@ -532,7 +535,12 @@ async def _claimed_attachments(
 
 @router.get("/conversations/{conversation_id}/messages/{message_id}/attachments/{index}")
 async def message_attachment(
-    conversation_id: int, message_id: int, index: int, user: SessionUser, db: DbSession
+    conversation_id: int,
+    message_id: int,
+    index: int,
+    user: SessionUser,
+    db: DbSession,
+    settings: AppSettings,
 ) -> Response:
     """The bytes of an image the reader attached to one of their messages, from the stored
     block itself — the record, and the only copy kept (docs/chat.md § What a user message
@@ -562,7 +570,11 @@ async def message_attachment(
     return Response(
         content=data,
         media_type=source["media_type"],
-        headers={"Cache-Control": ATTACHMENT_CACHE},
+        # Only the reader's browser may keep it, and for as long as the deployment says: a
+        # stored message never changes (docs/api.md).
+        headers={
+            "Cache-Control": f"private, max-age={settings.chat_attachment_cache_seconds}, immutable"
+        },
     )
 
 

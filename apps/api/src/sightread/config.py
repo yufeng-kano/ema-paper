@@ -121,6 +121,11 @@ class Settings(BaseSettings):
     chat_attachments_per_message: int = 8
     chat_attachment_text_max_chars: int = 100_000
     chat_attachment_image_long_edge: int = 1568
+    # How many of a user's attachments may wait for their message at once — each is bounded,
+    # their number must be too, or uploads never sent could fill the upload directory for a
+    # day — and how long the reader's browser may keep an attached image's bytes.
+    chat_attachments_pending_max: int = 32
+    chat_attachment_cache_seconds: int = 31_536_000
     # A user's own skills and subagents, and the tool calls one subagent run may make
     # (docs/chat.md § Skills, § Subagents).
     chat_skills_max: int = 64

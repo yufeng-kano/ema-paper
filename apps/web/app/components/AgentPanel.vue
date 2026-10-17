@@ -180,7 +180,11 @@ function onPromptSaved(saved: SavedAgentSettings) {
             @click="promptOpen = true"
           >
             <span :id="`prompt-state-${agent.name}`">
-              {{ settings.prompt === null ? t('agents.promptDefault') : t('agents.promptEdited') }}
+              {{
+                settings.prompt === null && settings.prompt_preset_id === null
+                  ? t('agents.promptDefault')
+                  : t('agents.promptEdited')
+              }}
             </span>
             <UiIcon name="edit" class="prompt-glyph" />
           </UiButton>

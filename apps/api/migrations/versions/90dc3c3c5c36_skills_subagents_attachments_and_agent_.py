@@ -76,6 +76,19 @@ Reply in the user's language: each message ends with a context block naming the 
 """
 
 
+# The chat template's tokens as this migration knows them. A chat preset was appended
+# verbatim, never rendered: one that holds a token would have it substituted once it is part
+# of the template, so it stays the selected legacy preset it was (docs/database.md § Rules).
+CHAT_TOKENS = ("{document_path}", "{page_count}", "{bbox_format}", "{parse_model}", "{network}")
+# What a downgrade names the preset it makes of a prompt written after the upgrade.
+RESTORED_PRESET_NAME = "Custom prompt"
+
+
+def moves(agent: str, preset_text: str) -> bool:
+    """Whether a selected preset can become the agent's prompt with nothing changing."""
+    return agent != "chat" or not any(token in preset_text for token in CHAT_TOKENS)
+
+
 def moved_prompt(agent: str, preset_text: str) -> str:
     """What a selected preset becomes: the template it stood for. A chat preset was
     appended to the default, so it keeps the default in front of it; any other agent's
@@ -142,7 +155,8 @@ def upgrade() -> None:
 
     # Every selected preset becomes the agent's prompt and stops being selected, so one of
     # the two is ever in force and nobody's agent changes (docs/agents.md § Per-agent
-    # settings). The presets themselves stay, unselected.
+    # settings) — but a chat preset holding a token, which the template would render, stays
+    # selected as it was. The presets themselves stay, unselected.
     bind = op.get_bind()
     selected = bind.execute(
         sa.text(
@@ -151,6 +165,8 @@ def upgrade() -> None:
         )
     ).all()
     for user_id, agent, preset_text in selected:
+        if not moves(agent, preset_text):
+            continue
         bind.execute(
             sa.text(
                 "UPDATE agent_settings SET prompt = :prompt, prompt_preset_id = NULL "
@@ -160,7 +176,67 @@ def upgrade() -> None:
         )
 
 
+def restored_preset_text(agent: str, prompt: str) -> str | None:
+    """What a prompt is as a preset of the old schema, or None when it has no such form: a
+    parse template is a preset as it is, a chat prompt only as the tail it adds behind this
+    migration's default — one that edits the default itself goes back to the default."""
+    text = prompt.strip()
+    if agent != "chat":
+        return text or None
+    head = f"{CHAT_DEFAULT_PROMPT.strip()}\n\n"
+    tail = text[len(head) :].strip() if text.startswith(head) else ""
+    return tail or None
+
+
 def downgrade() -> None:
+    # The prompts go back to the presets they came from, so a rollback leaves every agent
+    # running what it ran before: a moved preset is selected again, and a prompt written
+    # since becomes a preset of its own where the old schema can say it (docs/database.md
+    # § Rules).
+    bind = op.get_bind()
+    prompts = bind.execute(
+        sa.text("SELECT user_id, agent, prompt FROM agent_settings WHERE prompt IS NOT NULL")
+    ).all()
+    for user_id, agent, prompt in prompts:
+        text = restored_preset_text(agent, prompt)
+        if text is None:
+            continue
+        keys = {"user_id": user_id, "agent": agent}
+        presets = bind.execute(
+            sa.text(
+                "SELECT id, text FROM prompt_presets WHERE user_id = :user_id AND agent = :agent "
+                "ORDER BY id"
+            ),
+            keys,
+        ).all()
+        preset_id = next((row.id for row in presets if row.text.strip() == text), None)
+        if preset_id is None:
+            # Names are unique per user across agents, as the presets route keeps them.
+            taken = {
+                row.name
+                for row in bind.execute(
+                    sa.text("SELECT name FROM prompt_presets WHERE user_id = :user_id"), keys
+                )
+            }
+            name, suffix = RESTORED_PRESET_NAME, 2
+            while name in taken:
+                name, suffix = f"{RESTORED_PRESET_NAME} ({suffix})", suffix + 1
+            preset_id = bind.execute(
+                sa.text(
+                    "INSERT INTO prompt_presets (user_id, agent, name, text, created_at, "
+                    "updated_at) VALUES (:user_id, :agent, :name, :text, CURRENT_TIMESTAMP, "
+                    "CURRENT_TIMESTAMP) RETURNING id"
+                ),
+                {**keys, "name": name, "text": text},
+            ).scalar_one()
+        bind.execute(
+            sa.text(
+                "UPDATE agent_settings SET prompt_preset_id = :preset_id "
+                "WHERE user_id = :user_id AND agent = :agent"
+            ),
+            {**keys, "preset_id": preset_id},
+        )
+
     op.drop_index("ix_chat_attachments_user_created", table_name="chat_attachments")
     op.drop_table("chat_attachments")
     op.drop_index(op.f("ix_subagents_user_id"), table_name="subagents")

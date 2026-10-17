@@ -482,14 +482,17 @@ async def test_the_agent_prompt_migration_moves_every_selected_preset(scratch_ur
                 )
             ).scalar_one()
 
-        reader, plain = await user("reader"), await user("plain")
+        reader, plain, tokened = await user("reader"), await user("plain"), await user("tokened")
         parse_preset = await preset(reader, "parse", "Tables", "  Only tables from page {page}. ")
         chat_preset = await preset(reader, "chat", "Haiku", "Answer in haiku.")
         await preset(plain, "parse", "Unused", "Never selected.")
+        # Appended verbatim until now: as part of the template its token would be rendered.
+        verbatim = await preset(tokened, "chat", "Literal", "Quote {document_path} as is.")
         for user_id, agent, chosen in (
             (reader, "parse", parse_preset),
             (reader, "chat", chat_preset),
             (plain, "parse", None),
+            (tokened, "chat", verbatim),
         ):
             await db.execute(
                 text(
@@ -517,8 +520,9 @@ async def test_the_agent_prompt_migration_moves_every_selected_preset(scratch_ur
         (reader, "parse"): ("Only tables from page {page}.", None),
         (reader, "chat"): (f"{default.strip()}\n\nAnswer in haiku.", None),
         (plain, "parse"): (None, None),
+        (tokened, "chat"): (None, verbatim),
     }
-    assert presets == 3
+    assert presets == 4
 
     async with engine.begin() as db:
         # The new tables take rows, and a user's names are their own.
@@ -543,8 +547,38 @@ async def test_the_agent_prompt_migration_moves_every_selected_preset(scratch_ur
                 {"user": reader},
             )
 
+    async with engine.begin() as db:
+        # A prompt written after the upgrade, which no preset holds.
+        await db.execute(
+            text(
+                "UPDATE agent_settings SET prompt = 'Edited after the upgrade.' "
+                "WHERE user_id = :user AND agent = 'parse'"
+            ),
+            {"user": plain},
+        )
+
     _alembic(scratch_url, "downgrade", BEFORE_AGENT_PROMPT)
     async with engine.connect() as db:
+        # A rollback leaves every agent running what it ran: the moved presets are selected
+        # again, and the later prompt is a preset of its own.
+        selected = {
+            (row.user_id, row.agent): row.prompt_preset_id
+            for row in (
+                await db.execute(
+                    text("SELECT user_id, agent, prompt_preset_id FROM agent_settings")
+                )
+            ).all()
+        }
+        restored = (
+            await db.execute(
+                text(
+                    "SELECT p.name, p.text FROM agent_settings s "
+                    "JOIN prompt_presets p ON p.id = s.prompt_preset_id "
+                    "WHERE s.user_id = :user AND s.agent = 'parse'"
+                ),
+                {"user": plain},
+            )
+        ).one()
         tables = {
             row[0]
             for row in (
@@ -567,6 +601,10 @@ async def test_the_agent_prompt_migration_moves_every_selected_preset(scratch_ur
                 )
             ).all()
         }
+    assert selected[(reader, "parse")] == parse_preset
+    assert selected[(reader, "chat")] == chat_preset
+    assert selected[(tokened, "chat")] == verbatim
+    assert tuple(restored) == ("Custom prompt", "Edited after the upgrade.")
     assert not {"skills", "subagents", "chat_attachments"} & tables
     assert "prompt" not in columns
     await engine.dispose()
