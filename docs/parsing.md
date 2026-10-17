@@ -57,12 +57,13 @@ The transcription prompt is a template with three tokens, substituted per call b
 
 Resolution order for a job's prompt, decided at enqueue time and stored on the job row:
 
-1. **The user's selected prompt preset for the agent** (`agent_settings.prompt_preset_id` → `prompt_presets.text`, managed on the web Agent page) when one is selected. It replaces the template entirely, and figure/bbox quality is then the user's own responsibility.
-2. The agent's default template — for `parse`, `DEFAULT_PROMPT_TEMPLATE`, part of the agent's definition in code and the starting text of a new preset on the Agent page ([agents.md](./agents.md)).
+1. **The user's own prompt for the agent** (`agent_settings.prompt`, edited on the web Agent page, where the dialog opens on the default and offers *Restore default*) when one is saved. It replaces the template entirely, and figure/bbox quality is then the user's own responsibility.
+2. Else a **legacy prompt preset** (`agent_settings.prompt_preset_id` → `prompt_presets.text`) when one is still selected through the API; it replaces the template the same way. Saving a prompt clears the selection and selecting a preset clears the prompt, so never both.
+3. The agent's default template — for `parse`, `DEFAULT_PROMPT_TEMPLATE`, part of the agent's definition in code and the text the Agent page's prompt dialog opens on ([agents.md](./agents.md)).
 
 What the default template asks for beyond the markdown itself: the page's **furniture is left out** — a page or slide number, and a running header or footer that repeats across pages. A deck numbers every slide and a paper numbers every page; neither is what a reader of a transcription came for, and the viewer already knows which page a passage came from (web.md § Result viewer). The instruction then says, explicitly, that a number inside a sentence, a figure or table label, a citation marker, a numbered heading or a table **is** content: a model told to drop numbers will otherwise drop the ones that carry meaning. Changing the template changes results, so `PIPELINE_VERSION` moves with it and cached results parsed under the old wording stop answering new uploads.
 
-`jobs.prompt` holds the effective template verbatim (reproducibility); `jobs.prompt_sha256` is part of the dedup cache key ([jobs.md](./jobs.md)), so editing a preset's text invalidates cached results parsed with the old one.
+`jobs.prompt` holds the effective template verbatim (reproducibility); `jobs.prompt_sha256` is part of the dedup cache key ([jobs.md](./jobs.md)), so editing the prompt invalidates cached results parsed with the old one.
 
 ## Coordinate conventions
 

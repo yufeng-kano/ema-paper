@@ -11,12 +11,17 @@ agent-sightread/
         auth/                 # oidc.py, sessions.py, api_keys.py, oauth_as.py, crypto.py
         routes/               # v1.py (data plane), control.py (/api, incl. /api/agents),
                               # kano.py (/api/kano — the Kano Proxy connect flow),
-                              # library.py (/api/library — the web file library), oauth.py
+                              # library.py (/api/library — the web file library),
+                              # chat.py (/api/conversations, /api/sandbox),
+                              # attachments.py (/api/attachments), extensions.py
+                              # (/api/skills, /api/subagents), oauth.py
         agents/               # the agent registry (docs/agents.md); parse.py holds the
                               # parse agent's definition: default prompt, pipeline version;
-                              # chat.py the chat agent's system prompt and tool definitions
+                              # chat.py the chat agent's system prompt and tool definitions;
+                              # skills.py and subagents.py the built-in skills and subagents
         parsing/              # poppler.py (subprocess wrappers),
-                              # images.py (heic/exif/downscale), markdown.py, figures.py
+                              # images.py (heic/exif/downscale), markdown.py, figures.py,
+                              # attachments.py (the chat composer's files, prepared)
         workspace/            # the per-user file tree and its git revisions
                               # (docs/workspace.md): layout.py, git.py, documents.py,
                               # reconcile.py
@@ -30,6 +35,7 @@ agent-sightread/
         jobs/                 # queue.py (claim/enqueue), intake.py (store/dedup/enqueue),
                               # runner.py, sweeper.py, events.py (SSE + event pairs),
                               # chat_runner.py (the chat agent's tool loop),
+                              # chat_subagent.py (a subagent's nested loop),
                               # chat_tools.py, chat_events.py (the conversation stream)
         mcp/                  # server.py: thin shell over the service layer (docs/mcp.md)
         worker.py             # `python -m sightread.worker`

@@ -44,8 +44,10 @@ agent_settings   (user_id FK, agent) PK,
                                                   -- not chosen yet
                  effort low|medium|high|xhigh|max NOT NULL DEFAULT 'medium',
                                                   -- the chat agent's reasoning depth
-                 prompt_preset_id FK NULL         -- prompt_presets; NULL = the agent's
-                                                  -- default prompt
+                 prompt TEXT NULL,                -- the user's own template; NULL = the
+                                                  -- agent's default (agents.md)
+                 prompt_preset_id FK NULL         -- prompt_presets, the legacy selection;
+                                                  -- never set together with `prompt`
                  -- one row per user and agent (agents.md); no row means every column's
                  -- default. Both FKs ON DELETE SET NULL; deleting a connection also clears
                  -- the model, which belonged to that connection's catalog
@@ -152,6 +154,23 @@ chat_events      id PK, conversation_id FK, turn_id FK, seq, event, data JSONB,
                  UNIQUE (conversation_id, seq)
                  -- what the worker streamed while the turn ran; the SSE route replays
                  -- and tails it (chat.md § Conversations, turns, events)
+skills           id PK, user_id FK, name, description TEXT, argument_hint, body TEXT,
+                 user_invocable BOOL, model_invocable BOOL, created_at, updated_at
+                 UNIQUE (user_id, name)
+                 -- the chat agent's skills of the user's own, and the user's edits of a
+                 -- built-in under the built-in's name; built-ins themselves live in code
+                 -- and deleting an edit restores the built-in (chat.md § Skills)
+subagents        id PK, user_id FK, name, description TEXT, model NULL,
+                 tools JSONB, prompt TEXT, created_at, updated_at
+                 UNIQUE (user_id, name)
+                 -- the same for subagents; `model` NULL = the conversation's model,
+                 -- `tools` a subset of the read-only tools (chat.md § Subagents)
+chat_attachments id UUID PK, user_id FK, name, kind image|text, media_type, size_bytes,
+                 chars NULL, created_at
+                 INDEX (user_id, created_at)
+                 -- a prepared upload waiting for its message: the file is
+                 -- {UPLOAD_DIR}/chat-attachment-{id}.{png|jpg|txt}; the send embeds it
+                 -- in the message and deletes both (chat.md § What a user message carries)
 upload_tickets   id PK, user_id FK, token_hash UNIQUE, prefix, job_id FK NULL,
                  created_at, expires_at, spent_at NULL
                  INDEX (user_id, created_at)                                 -- mint rate limit
@@ -169,6 +188,7 @@ oauth_grants     id PK, client_id FK, user_id FK, kind code|access|refresh,
 
 - All credentials at rest follow [auth.md](./auth.md): hashes for anything we only verify, AES-GCM ciphertext for what we must replay (the Kano Proxy key, every provider connection's key, and a pending connect's PKCE verifier). No plaintext secrets in any column.
 - `user_settings.system_prompt` no longer exists: the migration turned each stored custom prompt into a `prompt_presets` row named "Custom prompt" and pointed `prompt_preset_id` at it, so behavior did not change for anyone.
+- **The agent prompt migration** (`skills subagents attachments and agent prompt`) gave `agent_settings` its `prompt` column and moved every selected preset into it, clearing `prompt_preset_id`: a `parse` preset's text as it was (a parse preset replaced the template), a `chat` preset's text behind the chat agent's default system prompt of that release and a blank line (a chat preset was appended to it) — the default is copied into the migration, never imported, so the migration stays what it was when it ran. The presets themselves stay, unselected; nothing else reads them. A moved `chat` prompt can exceed `SYSTEM_PROMPT_MAX_CHARS`, which caps writes, not stored rows: the dialog says so and the reader shortens it before the next save. The same revision created `skills`, `subagents` and `chat_attachments`.
 - **The Kano Proxy migration** (`837c0e9a9a4f_kano_proxy_and_agents`) removed OpenRouter and introduced agents in one step, on existing data:
   - every `prompt_presets` row and every `jobs` row became `agent = 'parse'` (the only agent);
   - each `user_settings` row became an `agent_settings('parse')` row when it selected anything: a user on a provider connection keeps it, with the model that connection used to carry (`provider_connections.model`), and keeps the selected prompt preset; a user on OpenRouter gets `connection_id` NULL — Kano Proxy — and `model` NULL, so the first parse after the upgrade asks them to connect Kano Proxy and pick a model rather than guessing one. `user_settings` was then dropped, and with it `default_model` / `default_profile`;
