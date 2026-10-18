@@ -121,14 +121,6 @@ BETAS: tuple[str, ...] = (
 CACHE_TTL = "1h"
 
 
-def is_claude_model(model_id: str) -> bool:
-    """The catalog filter for this agent: it speaks the Messages API and nothing else, and
-    Kano Proxy passes that to Anthropic untouched only for its `claude-code` provider.
-    Claude behind any other provider is a conversion that drops the cache breakpoints and
-    the Anthropic-defined tools (docs/chat.md)."""
-    return model_id.startswith("claude-code/claude-")
-
-
 # `{...}` tokens are replaced by `render_system_prompt`, never by str.format: the text
 # carries literal braces of its own.
 DEFAULT_SYSTEM_PROMPT = """You are the document agent inside Sightread, working for one signed-in user on documents they parsed from PDFs and images. You run in that user's own sandbox VM. Nothing you do leaves it except the text you send back.

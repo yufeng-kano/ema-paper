@@ -385,8 +385,7 @@ async def test_subagents_follow_the_skills_contract(signed_in) -> None:
         {"name": "shell", "prompt": "x", "tools": ["bash"]},
         {"name": "nesting", "prompt": "x", "tools": ["subagent"]},
         {"name": "none", "prompt": "x", "tools": []},
-        {"name": "gpt", "prompt": "x", "model": "gpt-9"},
-        {"name": "converted", "prompt": "x", "model": "antigravity/claude-opus-4-6-thinking"},
+        {"name": "long", "prompt": "x", "model": "m" * 256},
     ):
         refused = await signed_in.post("/api/subagents", json=body, headers=CSRF_HEADERS)
         assert refused.status_code == 400, body
@@ -396,12 +395,11 @@ async def test_subagents_follow_the_skills_contract(signed_in) -> None:
     assert taken.status_code == 409
 
     # A built-in: edited under its name, `model: null` kept as a value, restored by delete.
+    # Any model of the catalog, Claude or not.
     edited = await signed_in.put(
-        "/api/subagents/verifier",
-        json={"model": "claude-code/claude-haiku-5-5"},
-        headers=CSRF_HEADERS,
+        "/api/subagents/verifier", json={"model": "codex/gpt-5.5"}, headers=CSRF_HEADERS
     )
-    assert edited.json()["model"] == "claude-code/claude-haiku-5-5"
+    assert edited.json()["model"] == "codex/gpt-5.5"
     assert edited.json()["modified"] is True
     cleared = await signed_in.put(
         "/api/subagents/verifier", json={"model": None}, headers=CSRF_HEADERS

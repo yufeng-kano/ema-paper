@@ -3,7 +3,7 @@
  * One subagent, opened from the Agent page's Subagents table (docs/web.md § Pages,
  * docs/chat.md § Subagents): the skill dialog's shape — name, model, when to use, whether
  * it may change files, its tools and its prompt — with **Restore default** on a built-in
- * and **Delete subagent** on one of the reader's own. The model list is the chat agent's live Claude
+ * and **Delete subagent** on one of the reader's own. The model list is the chat agent's live
  * catalog, after *Follows the conversation*.
  */
 import {

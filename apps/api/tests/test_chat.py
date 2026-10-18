@@ -209,13 +209,12 @@ async def test_chat_settings_refuse_connections_and_validate_effort(chatting) ->
         "/api/agents/chat/settings", json={"effort": "ultra"}, headers=CSRF_HEADERS
     )
     assert bad.status_code == 400
-    # The catalog's filter, at the write: a model the Messages route cannot run is refused
-    # rather than fixed onto the next turn (docs/api.md).
-    for model in ("vendor/gpt-9", "antigravity/claude-opus-4-6-thinking", "claude-opus-5-5"):
-        wrong = await chatting.put(
-            "/api/agents/chat/settings", json={"model": model}, headers=CSRF_HEADERS
-        )
-        assert wrong.status_code == 400, model
+    # Any model of the catalog may be saved, Claude or not (docs/api.md).
+    other = await chatting.put(
+        "/api/agents/chat/settings", json={"model": "codex/gpt-5.5"}, headers=CSRF_HEADERS
+    )
+    assert other.status_code == 200, other.text
+    assert other.json()["model"] == "codex/gpt-5.5"
     ok = await chatting.put(
         "/api/agents/chat/settings", json={"effort": "high"}, headers=CSRF_HEADERS
     )
@@ -227,27 +226,18 @@ async def test_chat_settings_refuse_connections_and_validate_effort(chatting) ->
 
 
 @respx.mock
-async def test_the_chat_catalog_lists_claude_models_only(chatting) -> None:
+async def test_the_chat_catalog_lists_every_kano_proxy_model(chatting) -> None:
+    ids = [
+        "claude-code/claude-opus-5-5",
+        "codex/gpt-5.5",
+        "antigravity/claude-opus-4-6-thinking",
+        "dgx/qwen3.8-flash-next",
+    ]
     respx.get(MODELS_URL).mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "data": [
-                    {"id": "claude-code/claude-opus-5-5"},
-                    {"id": "codex/gpt-5.5"},
-                    # Claude, but converted on the way: no cache breakpoints, no bash.
-                    {"id": "antigravity/claude-opus-4-6-thinking"},
-                    {"id": "claude-relay/gpt-9"},
-                    {"id": "claude-code/claude-haiku-5-5"},
-                ]
-            },
-        )
+        return_value=httpx.Response(200, json={"data": [{"id": model} for model in ids]})
     )
     listed = await chatting.get("/api/agents/chat/models")
-    assert [model["id"] for model in listed.json()["data"]] == [
-        "claude-code/claude-opus-5-5",
-        "claude-code/claude-haiku-5-5",
-    ]
+    assert [model["id"] for model in listed.json()["data"]] == ids
 
 
 @respx.mock

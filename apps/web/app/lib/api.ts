@@ -163,7 +163,7 @@ export const WRITING_TOOLS: readonly string[] = ['bash']
 export interface SubagentFields {
   /** When to start it: what the agent reads. */
   description: string
-  /** A Claude model id; null runs it on the conversation's model. */
+  /** A model id of the chat agent's catalog; null runs it on the conversation's model. */
   model: string | null
   /** May change files: the editor writes, and `bash` may be among its tools. */
   writes: boolean

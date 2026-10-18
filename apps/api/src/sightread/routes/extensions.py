@@ -16,7 +16,7 @@ from sqlalchemy.exc import IntegrityError
 
 from ..agents import skills as skill_defs
 from ..agents import subagents as subagent_defs
-from ..agents.chat import SUBAGENT_TOOL_NAMES, is_claude_model
+from ..agents.chat import SUBAGENT_TOOL_NAMES
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
 from ..db.models import Skill, Subagent, User, utcnow
 from ..errors import ApiError
@@ -267,9 +267,8 @@ def subagent_payload(subagent: subagent_defs.ResolvedSubagent) -> dict:
 
 def _checked_subagent_values(values: dict, settings) -> dict:
     model = (values["model"] or "").strip() or None
-    if model is not None and (len(model) > 255 or not is_claude_model(model)):
-        # The chat agent's catalog filter: a subagent runs on the Messages route too.
-        raise ApiError(400, "invalid_request", "A subagent runs claude-code/claude-* models only")
+    if model is not None and len(model) > 255:
+        raise ApiError(400, "invalid_request", "A subagent's model id is at most 255 characters")
     tools = values["tools"] or []
     unknown = [tool for tool in tools if tool not in SUBAGENT_TOOL_NAMES]
     if unknown:

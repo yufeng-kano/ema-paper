@@ -20,7 +20,6 @@ from sqlalchemy.exc import IntegrityError
 from ..agents import AGENTS, CHAT, AgentDefinition, get_agent
 from ..agents import chat as chat_agent
 from ..agents.bbox import convention_for_model
-from ..agents.chat import is_claude_model
 from ..auth.api_keys import create_api_key
 from ..auth.crypto import encrypt_connection_key, mask_secret
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
@@ -704,12 +703,6 @@ async def put_agent_settings(
                 400, "invalid_request", f"The {agent.name} agent runs on Kano Proxy only"
             )
         await _owned_connection(db, user.id, body.connection_id)
-    if body.model and "anthropic" in agent.capabilities and not is_claude_model(body.model):
-        # The same filter the catalog applies, at the write: a model the Messages route
-        # cannot run would otherwise be fixed onto the next turn and fail it upstream.
-        raise ApiError(
-            400, "invalid_request", f"The {agent.name} agent runs claude-code/claude-* models only"
-        )
     if body.effort is not None and body.effort not in EFFORT_LEVELS:
         raise ApiError(400, "invalid_request", "effort must be one of " + ", ".join(EFFORT_LEVELS))
     if body.prompt_preset_id is not None:
@@ -759,11 +752,7 @@ async def list_agent_models(
 ):
     """The live catalog of the agent's saved upstream — the Agent page's model picker."""
     agent = _known_agent(agent_name)
-    models = await agent_models(db, settings, user.id, agent.name)
-    if "anthropic" in agent.capabilities:
-        # Only what the Messages API can run (docs/agents.md § The registry).
-        models = [model for model in models if is_claude_model(model["id"])]
-    return {"data": models}
+    return {"data": await agent_models(db, settings, user.id, agent.name)}
 
 
 # --- usage ----------------------------------------------------------------------------
