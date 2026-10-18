@@ -32,31 +32,7 @@ class SubagentDefinition:
     writes: bool = False
 
 
-VERIFIER = SubagentDefinition(
-    name="verifier",
-    description="Compares the transcription with the page images — figure captions, table cells, numbers, names, formulas — over a range of pages, and reports every mismatch. Start one per range when much of a document must be checked.",
-    model=None,
-    tools=("view_page", "view_figure", "str_replace_based_edit_tool"),
-    prompt="""You check a transcription against its original, page by page, over the range of pages the task names.
-
-For each page: open it with view_page, read the same page of doc.md with the editor's view (a view_range around its page marker), and compare the figure captions, table cells, numbers, names and formulas. Open a figure with view_figure when its caption or content needs a closer look.
-
-Report every mismatch as one line: the page, where it is (caption, table, formula, paragraph), what doc.md says and what the page shows. When there is none, report that you found none. Report only what the page settles, and say so when it cannot settle something.""",
-)
-
-READER = SubagentDefinition(
-    name="reader",
-    description="Reads a range of the document and reports its structure and main points, so the agent need not read it all itself.",
-    model=None,
-    tools=("view_page", "str_replace_based_edit_tool"),
-    prompt="""You read part of a document and report on it, so the agent that asked does not have to read it all.
-
-Read the range the task names in doc.md with the editor's view, going through it in pieces with view_range. Open a page with view_page only where the transcription reads oddly.
-
-Report the headings in the range with their line numbers, then the main points of each section in a sentence or two, then anything that looks wrong in the transcription. Keep the report short and factual.""",
-)
-
-# The two halves of `/translate` (docs/chat.md § Translation): both read doc.md and write
+# What `/translate` starts (docs/chat.md § Translation): translators read doc.md and write
 # into it themselves, the agent only splits the work and starts them.
 TRANSLATOR = SubagentDefinition(
     name="translator",
@@ -77,32 +53,7 @@ Write each translation with str_replace: old_str is the end of the block — its
 Report briefly at the end: how many blocks you translated, the key terms with the translation you chose for each, one per line as `term → translation`, and anything you could not translate. If you did not finish your part, say after which page you stopped.""",
 )
 
-TRANSLATION_CHECKER = SubagentDefinition(
-    name="translation-checker",
-    description="Checks the translations written under the pages the task names, or the passage it quotes, against their originals (omissions, changed meaning, numbers, names, terms) and fixes each problem in doc.md itself.",
-    model=None,
-    tools=("str_replace_based_edit_tool", "bash"),
-    writes=True,
-    prompt="""You check the translations written into a document — over the pages the task names, or the passage it quotes — into the language the task names: each block of the original is followed by its translation. Display math, code, tables, figure placeholders and the reference list are left untranslated on purpose.
-
-Read your part of doc.md with the editor's view, going through it in pieces with view_range. For each block and the translation under it, look for:
-- a sentence or clause left out, or added;
-- a meaning changed;
-- a number, unit, name, symbol, citation or inline formula that differs from the original;
-- a term translated otherwise than the task's list of terms;
-- anything the task's instructions ask for that the translation does not do.
-
-Fix each problem in place with the smallest str_replace on the translation, never on the original. Where a block of prose has no translation under it, write one: str_replace on the end of the block, with an empty line and the translation after it. Change nothing you would merely word differently.
-
-Report briefly at the end: what you fixed, by page, and anything you could not settle.""",
-)
-
-BUILTIN_SUBAGENTS: tuple[SubagentDefinition, ...] = (
-    VERIFIER,
-    READER,
-    TRANSLATOR,
-    TRANSLATION_CHECKER,
-)
+BUILTIN_SUBAGENTS: tuple[SubagentDefinition, ...] = (TRANSLATOR,)
 BUILTIN_SUBAGENT_NAMES = frozenset(subagent.name for subagent in BUILTIN_SUBAGENTS)
 
 # What every subagent is told before its own instructions: the document, that it works

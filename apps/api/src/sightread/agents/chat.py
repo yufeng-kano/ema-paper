@@ -13,7 +13,7 @@ from .parse import BBOX_FORMAT_YXYX
 
 # Bumped when the prompt or the tool contract changes what a conversation does. Chat has
 # no dedup cache; the number is bookkeeping for the registry (docs/agents.md).
-PIPELINE_VERSION = 4
+PIPELINE_VERSION = 5
 
 # Anthropic-defined tools carry no schema of their own (docs/chat.md § Tools). The order
 # is part of the cache prefix and never changes. The custom tools are strict: their schemas
@@ -103,10 +103,64 @@ TOOLS: tuple[dict, ...] = (
     SUBAGENT_TOOL,
 )
 TOOL_NAMES: tuple[str, ...] = tuple(tool["name"] for tool in TOOLS)
+# A subagent's editor and shell: the agent's own, by name and input, declared with a schema.
+# A subagent may run on a model Kano Proxy reaches through a conversion, and the conversion
+# drops every tool without one — the Anthropic-defined editor and bash among them, which
+# would leave a translator on such a model no tool at all (docs/chat.md § Subagents). The
+# editor is not strict: which fields a call needs depends on its command, and the tool
+# checks them.
+SUBAGENT_EDITOR_TOOL = {
+    "name": "str_replace_based_edit_tool",
+    "description": (
+        "View and edit files under /workspace. `view` shows a file with line numbers — "
+        "`view_range` [start, end] for part of it, end -1 for the rest — or lists a "
+        "directory. `str_replace` replaces `old_str`, which must occur exactly once in the "
+        "file, with `new_str`. `insert` puts `insert_text` after line `insert_line` (0 for "
+        "the top). `create` writes a new file with `file_text`."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "command": {"type": "string", "enum": ["view", "str_replace", "insert", "create"]},
+            "path": {"type": "string", "description": "Absolute path under /workspace"},
+            "view_range": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": "view: [start, end], 1-based lines; end -1 for the rest",
+            },
+            "old_str": {"type": "string", "description": "str_replace: the text to replace"},
+            "new_str": {"type": "string", "description": "str_replace: its replacement"},
+            "insert_line": {"type": "integer", "description": "insert: the line to insert after"},
+            "insert_text": {"type": "string", "description": "insert: the text to insert"},
+            "file_text": {"type": "string", "description": "create: the new file's content"},
+        },
+        "required": ["command", "path"],
+        "additionalProperties": False,
+    },
+}
+SUBAGENT_BASH_TOOL = {
+    "name": "bash",
+    "description": (
+        "Run one command in the shell of the sandbox VM and return its output and exit code. "
+        "The working directory and exported variables carry over between commands."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {"command": {"type": "string", "description": "The command to run"}},
+        "required": ["command"],
+        "additionalProperties": False,
+    },
+    "strict": True,
+}
 # What a subagent may be given (docs/chat.md § Subagents). The editor answers `view` only
 # to one that may not change files, and `bash` is given only to one that may. `bash` comes
 # last, so the tools of a subagent without it are the prefix they always were.
-SUBAGENT_TOOLS: tuple[dict, ...] = (VIEW_PAGE_TOOL, VIEW_FIGURE_TOOL, EDITOR_TOOL, BASH_TOOL)
+SUBAGENT_TOOLS: tuple[dict, ...] = (
+    VIEW_PAGE_TOOL,
+    VIEW_FIGURE_TOOL,
+    SUBAGENT_EDITOR_TOOL,
+    SUBAGENT_BASH_TOOL,
+)
 SUBAGENT_TOOL_NAMES: tuple[str, ...] = tuple(tool["name"] for tool in SUBAGENT_TOOLS)
 
 # Without the sandbox the bash tool is not declared at all: a tool the harness cannot

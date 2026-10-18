@@ -14,6 +14,7 @@ import respx
 from httpx import AsyncClient
 from sqlalchemy import select
 
+from sightread.agents import chat as chat_agent
 from sightread.agents import skills as skill_defs
 from sightread.agents import subagents as subagent_defs
 from sightread.db.models import Skill, UsageLog
@@ -297,13 +298,12 @@ def test_translate_takes_a_language_and_the_readers_instructions() -> None:
     rendered = skill_defs.render_skill(skill_defs.TRANSLATE.body, " zh-TW 術語保留英文 ")
     assert "Arguments: zh-TW 術語保留英文\n" in rendered
     assert "$ARGUMENTS" not in rendered
-    # Both halves are subagents the skill names, and they write into the document themselves.
-    names = {subagent.name: subagent for subagent in subagent_defs.BUILTIN_SUBAGENTS}
-    for name in ("translator", "translation-checker"):
-        assert f"`{name}`" in rendered
-        assert names[name].writes is True
-        assert names[name].tools == ("str_replace_based_edit_tool", "bash")
-    assert not subagent_defs.VERIFIER.writes and not subagent_defs.READER.writes
+    # The translators are the subagent the skill names, and they write into the document
+    # themselves; there is no checking pass.
+    assert "`translator`" in rendered and "translation-checker" not in rendered
+    assert subagent_defs.BUILTIN_SUBAGENTS == (subagent_defs.TRANSLATOR,)
+    assert subagent_defs.TRANSLATOR.writes is True
+    assert subagent_defs.TRANSLATOR.tools == ("str_replace_based_edit_tool", "bash")
 
 
 async def test_skills_and_subagents_are_capped(make_client) -> None:
@@ -311,7 +311,9 @@ async def test_skills_and_subagents_are_capped(make_client) -> None:
     await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
     # An edit of a built-in is not one of the reader's own: it does not count.
     await client.put("/api/skills/fix-math", json={"description": "Mine"}, headers=CSRF_HEADERS)
-    await client.put("/api/subagents/reader", json={"description": "Mine"}, headers=CSRF_HEADERS)
+    await client.put(
+        "/api/subagents/translator", json={"description": "Mine"}, headers=CSRF_HEADERS
+    )
     for route, field in (("/api/skills", "body"), ("/api/subagents", "prompt")):
         first = await client.post(route, json={"name": "one", field: "x"}, headers=CSRF_HEADERS)
         assert first.status_code == 201, first.text
@@ -330,13 +332,9 @@ async def test_skills_and_subagents_are_capped(make_client) -> None:
 
 async def test_subagents_follow_the_skills_contract(signed_in) -> None:
     listed = (await signed_in.get("/api/subagents")).json()["subagents"]
-    assert [subagent["name"] for subagent in listed] == [
-        "verifier",
-        "reader",
-        "translator",
-        "translation-checker",
-    ]
-    assert listed[1]["tools"] == ["view_page", "str_replace_based_edit_tool"]
+    assert [subagent["name"] for subagent in listed] == ["translator"]
+    assert listed[0]["tools"] == ["str_replace_based_edit_tool", "bash"]
+    assert listed[0]["writes"] is True
     assert listed[0]["model"] is None and listed[0]["builtin"] is True
 
     created = await signed_in.post(
@@ -390,44 +388,37 @@ async def test_subagents_follow_the_skills_contract(signed_in) -> None:
         refused = await signed_in.post("/api/subagents", json=body, headers=CSRF_HEADERS)
         assert refused.status_code == 400, body
     taken = await signed_in.post(
-        "/api/subagents", json={"name": "verifier", "prompt": "x"}, headers=CSRF_HEADERS
+        "/api/subagents", json={"name": "translator", "prompt": "x"}, headers=CSRF_HEADERS
     )
     assert taken.status_code == 409
 
     # A built-in: edited under its name, `model: null` kept as a value, restored by delete.
     # Any model of the catalog, Claude or not.
     edited = await signed_in.put(
-        "/api/subagents/verifier", json={"model": "codex/gpt-5.5"}, headers=CSRF_HEADERS
+        "/api/subagents/translator", json={"model": "codex/gpt-5.5"}, headers=CSRF_HEADERS
     )
     assert edited.json()["model"] == "codex/gpt-5.5"
     assert edited.json()["modified"] is True
     cleared = await signed_in.put(
-        "/api/subagents/verifier", json={"model": None}, headers=CSRF_HEADERS
+        "/api/subagents/translator", json={"model": None}, headers=CSRF_HEADERS
     )
     assert cleared.json()["model"] is None and cleared.json()["modified"] is False
     # The shipped tools named in another order are still the shipped tools.
     same = await signed_in.put(
-        "/api/subagents/reader",
-        json={"tools": ["str_replace_based_edit_tool", "view_page"]},
+        "/api/subagents/translator",
+        json={"tools": ["bash", "str_replace_based_edit_tool"]},
         headers=CSRF_HEADERS,
     )
     assert same.json()["modified"] is False
     renamed = await signed_in.put(
-        "/api/subagents/reader", json={"name": "readers"}, headers=CSRF_HEADERS
+        "/api/subagents/translator", json={"name": "translators"}, headers=CSRF_HEADERS
     )
     assert renamed.status_code == 400
     assert (
-        await signed_in.delete("/api/subagents/reader", headers=CSRF_HEADERS)
+        await signed_in.delete("/api/subagents/translator", headers=CSRF_HEADERS)
     ).status_code == 204
     names = [entry["name"] for entry in (await signed_in.get("/api/subagents")).json()["subagents"]]
-    assert names == [
-        "verifier",
-        "reader",
-        "translator",
-        "translation-checker",
-        "all-tools",
-        "tables",
-    ]
+    assert names == ["translator", "all-tools", "tables"]
 
     moved = await signed_in.put(
         "/api/subagents/tables", json={"name": "grids", "model": None}, headers=CSRF_HEADERS
@@ -580,9 +571,9 @@ async def test_a_turn_runs_on_the_readers_prompt_with_the_catalogue_last(chat_cl
     # A skill the agent may not load is not listed: those are the reader's commands only.
     assert "check-figures" not in catalogue and "mine-only" not in catalogue
     assert "- translate: " not in catalogue
-    assert "- verifier: " in catalogue and "- reader: " in catalogue
     assert "- translator (changes files itself): " in catalogue
-    assert "- translation-checker (changes files itself): " in catalogue
+    assert "- verifier" not in catalogue and "- reader" not in catalogue
+    assert "- translation-checker" not in catalogue
 
 
 @respx.mock
@@ -674,6 +665,12 @@ async def test_a_subagent_works_alone_and_hands_back_its_report(chat_client, mon
     doc = f"{DOC_PATH}/doc.md"
     report = "Page 1: doc.md says 3450, the page shows 3.45."
     write = {"command": "str_replace", "path": doc, "old_str": "3450", "new_str": "3.45"}
+    created = await client.post(
+        "/api/subagents",
+        json={"name": "checker", "description": "Checks pages", "prompt": "Check each page."},
+        headers=CSRF_HEADERS,
+    )
+    assert created.status_code == 201, created.text
     main, sub = stub_messages(
         [
             (
@@ -683,12 +680,12 @@ async def test_a_subagent_works_alone_and_hands_back_its_report(chat_client, mon
                         "type": "tool_use",
                         "id": "call",
                         "name": "subagent",
-                        "input": {"name": "verifier", "task": "Check page 1 against doc.md."},
+                        "input": {"name": "checker", "task": "Check page 1 against doc.md."},
                     },
                 ],
                 "tool_use",
             ),
-            ([{"type": "text", "text": "The verifier found one mismatch."}], "end_turn"),
+            ([{"type": "text", "text": "The checker found one mismatch."}], "end_turn"),
         ],
         [
             (
@@ -712,16 +709,19 @@ async def test_a_subagent_works_alone_and_hands_back_its_report(chat_client, mon
     # Its own context: the preamble and its prompt, the task its only message, its tools.
     first = sub[0]
     assert first["model"] == "claude-code/claude-opus-5-5"  # none of its own: the conversation's
-    assert [tool["name"] for tool in first["tools"]] == [
-        "view_page",
-        "view_figure",
-        "str_replace_based_edit_tool",
+    assert first["tools"] == [
+        chat_agent.VIEW_PAGE_TOOL,
+        chat_agent.VIEW_FIGURE_TOOL,
+        chat_agent.SUBAGENT_EDITOR_TOOL,
     ]
+    # Every tool carries a schema: a conversion to a model outside the passthrough drops a
+    # tool without one, and a subagent may run on such a model (docs/chat.md § Subagents).
+    assert all("input_schema" in tool and "type" not in tool for tool in first["tools"])
     assert first["messages"] == [
         {"role": "user", "content": [{"type": "text", "text": "Check page 1 against doc.md."}]}
     ]
     assert DOC_PATH in first["system"][0]["text"]
-    assert first["system"][0]["text"].endswith(subagent_defs.VERIFIER.prompt)
+    assert first["system"][0]["text"].endswith("# Your instructions\n\nCheck each page.")
     assert f"{DOC_PATH}/doc.md" in first["system"][0]["text"]
     assert subagent_defs.READ_ONLY in first["system"][0]["text"]
     assert first["system"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
@@ -748,7 +748,7 @@ async def test_a_subagent_works_alone_and_hands_back_its_report(chat_client, mon
         "assistant",
     ]
     record = thread["messages"][2]["content"][0]["subagent"]
-    assert record["name"] == "verifier" and record["model"] == "claude-code/claude-opus-5-5"
+    assert record["name"] == "checker" and record["model"] == "claude-code/claude-opus-5-5"
     assert record["tool_calls"] == 3 and isinstance(record["elapsed_ms"], int)
     assert record["steps"] == [
         {"type": "note", "text": "Open the page first."},
@@ -817,7 +817,7 @@ async def test_a_subagent_that_writes_edits_the_document_itself(chat_client) -> 
     assert thread["turns"][0]["status"] == "succeeded", thread["turns"]
     # Told it may change files; no sandbox here, so no shell is offered.
     first = sub[0]
-    assert [tool["name"] for tool in first["tools"]] == ["str_replace_based_edit_tool"]
+    assert first["tools"] == [chat_agent.SUBAGENT_EDITOR_TOOL]
     assert subagent_defs.WRITES in first["system"][0]["text"]
     assert "The shell is" not in first["system"][0]["text"]
     # Its write is a revision of the document, like the agent's own.
@@ -927,6 +927,12 @@ async def test_a_stop_reaches_a_subagent_inside_its_run(chat_client, monkeypatch
         return stopped or await checks(ctx)
 
     monkeypatch.setattr(chat_runner, "_cancelled", cancelled)
+    created = await client.post(
+        "/api/subagents",
+        json={"name": "pages", "prompt": "Read.", "tools": ["view_page"]},
+        headers=CSRF_HEADERS,
+    )
+    assert created.status_code == 201, created.text
 
     def answer(request: httpx.Request) -> httpx.Response:
         nonlocal stopped
@@ -941,7 +947,7 @@ async def test_a_stop_reaches_a_subagent_inside_its_run(chat_client, monkeypatch
                     "type": "tool_use",
                     "id": "call",
                     "name": "subagent",
-                    "input": {"name": "reader", "task": "Read it."},
+                    "input": {"name": "pages", "task": "Read it."},
                 }
             ]
         return httpx.Response(200, content=streamed(blocks, "tool_use", model=body["model"]))

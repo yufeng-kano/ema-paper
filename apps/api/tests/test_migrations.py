@@ -608,3 +608,49 @@ async def test_the_agent_prompt_migration_moves_every_selected_preset(scratch_ur
     assert not {"skills", "subagents", "chat_attachments"} & tables
     assert "prompt" not in columns
     await engine.dispose()
+
+
+BEFORE_SUBAGENT_REMOVAL = "d4b5d736a2ff"
+SUBAGENT_REMOVAL = "ecd8f04df825"
+
+
+async def test_the_removed_built_in_subagents_take_the_readers_edits_with_them(
+    scratch_url,
+) -> None:
+    """The rows under `verifier`, `reader` and `translation-checker` go; the edit of the
+    built-in that stays, and a subagent of the reader's own, are left as they were
+    (docs/database.md § Rules)."""
+    _alembic(scratch_url, "upgrade", BEFORE_SUBAGENT_REMOVAL)
+
+    engine = create_async_engine(scratch_url)
+    async with engine.begin() as db:
+        user_id = (
+            await db.execute(
+                text(
+                    "INSERT INTO users (google_sub, email, created_at) "
+                    "VALUES ('sub', 's@example.com', now()) RETURNING id"
+                )
+            )
+        ).scalar_one()
+        for name, writes in (
+            ("verifier", False),
+            ("reader", False),
+            ("translation-checker", True),
+            ("translator", True),
+            ("tables", False),
+        ):
+            await db.execute(
+                text(
+                    "INSERT INTO subagents (user_id, name, description, model, writes, tools, "
+                    "prompt, created_at, updated_at) VALUES (:user, :name, '', 'm', :writes, "
+                    "'[\"view_page\"]', 'x', now(), now())"
+                ),
+                {"user": user_id, "name": name, "writes": writes},
+            )
+
+    _alembic(scratch_url, "upgrade", SUBAGENT_REMOVAL)
+
+    async with engine.connect() as db:
+        names = (await db.execute(text("SELECT name FROM subagents ORDER BY name"))).scalars()
+        assert list(names) == ["tables", "translator"]
+    await engine.dispose()
