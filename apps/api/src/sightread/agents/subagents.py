@@ -33,7 +33,7 @@ class SubagentDefinition:
 
 
 # What `/translate` starts (docs/chat.md § Translation): translators read doc.md and write
-# into it themselves, the agent only splits the work and starts them.
+# into it themselves; the agent splits the work, starts them and proofreads what they wrote.
 TRANSLATOR = SubagentDefinition(
     name="translator",
     description="Translates the pages the task names, or the passage it quotes, into the language it names, writing each block's translation into doc.md right under the block. Start one per few pages; several run at the same time.",

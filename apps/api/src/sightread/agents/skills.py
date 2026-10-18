@@ -68,12 +68,12 @@ Change nothing else. When the page cannot settle a formula, leave it and say so.
 
 # The reader's command only: a translation asked for in their own words is answered in the
 # reply, and running the command is the request to write one. The translators read and
-# write; the agent only splits the work (docs/chat.md § Translation).
+# write; the agent splits the work and proofreads the result (docs/chat.md § Translation).
 TRANSLATE = SkillDefinition(
     name="translate",
     description="Translate the selected passage, or the whole document, inserting each block's translation right under it.",
     argument_hint="[language] [instructions]",
-    body="""Translate into the document with the `translator` subagent: translators read doc.md and write the translation into it themselves. Do not read or edit the document yourself; your part is to split the work, start them, and tell the user how it went. The user ran this command to have the translation written into the document.
+    body="""Translate into the document with the `translator` subagent: translators read doc.md and write the translation into it themselves. Do not translate yourself: your part is to split the work, start them, proofread what they wrote as one translation, and tell the user how it went. The user ran this command to have the translation written into the document.
 
 Arguments: $ARGUMENTS
 The first word is the target language when it names one (zh-TW, 日本語, English); otherwise translate into the reader locale named in the message's context. The rest is the user's own instructions for this translation: pass them word for word to every translator.
@@ -81,8 +81,9 @@ The first word is the target language when it names one (zh-TW, 日本語, Engli
 1. Split the work. With a selection, it is one piece: the passage, given by its first and last few words. Otherwise it is the whole document: split its pages (the page count is in your facts) into pieces of two to four pages.
 2. Start one `translator` per piece, all in the same round, giving each its pages or passage, the target language and the user's instructions.
 3. When a translator stopped before the end of its piece, start a `translator` for what it left.
+4. Proofread once every translator has reported. The pieces were translated apart, so one term can come out differently in each. Compare the `term → translation` lines of the reports; for each term rendered more than one way, keep one rendering (the user's instructions decide, otherwise the most common) and change the others to it. Find them with grep rather than reading the document whole, and change each with str_replace on its own translation line, never a replace-all: a term a translation kept in English is also in the original above it, and the original stays as it is. Fix what else reads wrong in the translation lines you see; do not retranslate.
 
-End with a sentence or two in the user's terms: what was translated and anything left untranslated.""",
+End with a sentence or two in the user's terms: what was translated, the terms you made consistent, and anything left untranslated.""",
     user_invocable=True,
     model_invocable=False,
 )

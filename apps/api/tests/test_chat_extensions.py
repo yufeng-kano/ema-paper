@@ -299,8 +299,9 @@ def test_translate_takes_a_language_and_the_readers_instructions() -> None:
     assert "Arguments: zh-TW 術語保留英文\n" in rendered
     assert "$ARGUMENTS" not in rendered
     # The translators are the subagent the skill names, and they write into the document
-    # themselves; there is no checking pass.
+    # themselves; the agent proofreads after them, and no checker subagent is started.
     assert "`translator`" in rendered and "translation-checker" not in rendered
+    assert "Proofread once every translator has reported" in rendered
     assert subagent_defs.BUILTIN_SUBAGENTS == (subagent_defs.TRANSLATOR,)
     assert subagent_defs.TRANSLATOR.writes is True
     assert subagent_defs.TRANSLATOR.tools == ("str_replace_based_edit_tool", "bash")
