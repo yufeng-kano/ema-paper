@@ -9,7 +9,7 @@ Agents are defined in code (`apps/api/src/sightread/agents/`), never in the data
 | Field | Meaning |
 |-------|---------|
 | `name` | Stable id stored on `jobs.agent`, `prompt_presets.agent`, `agent_settings.agent` and `usage_log.agent` (`parse`, `chat`) |
-| `capabilities` | Model capabilities the agent needs (`parse`: `vision`; `chat`: `vision`, `tools`, `anthropic`). `anthropic` is the one that filters: the `chat` agent's catalog route lists only Claude models, because it speaks the Messages API and nothing else ([chat.md](./chat.md)). The others are declared metadata only |
+| `capabilities` | Model capabilities the agent needs (`parse`: `vision`; `chat`: `vision`, `tools`, `anthropic`). `anthropic` is the one that filters: the `chat` agent's catalog route lists only the Claude models of Kano Proxy's `claude-code` provider (`claude-code/claude-*`), because it speaks the Messages API and nothing else, and that provider is the one the catalog shows Kano Proxy passing to Anthropic untouched ([chat.md](./chat.md)). The others are declared metadata only |
 | `input` / `output` | What the agent consumes and produces (`parse`: `document` → `markdown`; `chat`: `document` → `edits`) |
 | `default_prompt_template` | The prompt the agent runs when the user saved none of their own (`parse`: `DEFAULT_PROMPT_TEMPLATE`, [parsing.md](./parsing.md) § Prompts; `chat`: the system prompt, [chat.md](./chat.md) § System prompt) — and the text the Agent page's prompt dialog opens on. A saved prompt replaces it for both agents; a legacy preset replaces it for `parse` and is **appended** to it for `chat` |
 | `pipeline_version` | Part of the dedup key; moves when the agent's output for the same input would change (`parse`: `PIPELINE_VERSION`) |

@@ -178,8 +178,7 @@ function onTabKeydown(event: KeyboardEvent, index: number) {
            hover or focus, and always where there is no hover. -->
       <div class="kano">
         <p class="kano-line">
-          <UiStatusDot tone="ok" :label="t('agents.kanoConnected')" />
-          <span>{{ t('agents.kanoConnected') }}</span>
+          <UiStatusDot class="kano-status" tone="ok" :label="t('agents.kanoConnected')" />
           <span class="mono reveal">{{ keyTail }}</span>
         </p>
         <button
@@ -297,8 +296,10 @@ function onTabKeydown(event: KeyboardEvent, index: number) {
 
 /* --- Rail: the Kano Proxy line ---------------------------------------------- */
 
+/* Wraps rather than squeezes: on a narrow rail Disconnect drops under the line. */
 .kano {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: var(--space-3);
@@ -315,6 +316,15 @@ function onTabKeydown(event: KeyboardEvent, index: number) {
   min-width: 0;
   color: var(--muted);
   font-size: var(--text-xs);
+}
+
+/* The dot's label is the line's text; it never shrinks under the key's tail. */
+.kano-status {
+  flex-shrink: 0;
+}
+
+.kano-status :deep(.label) {
+  color: var(--muted);
 }
 
 .kano-line .mono {

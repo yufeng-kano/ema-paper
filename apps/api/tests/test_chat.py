@@ -148,7 +148,9 @@ async def chatting(make_client, tmp_path) -> AsyncClient:
     user_id = (await client.get("/api/me")).json()["user"]["id"]
     await _connect_kano(client.app.state.sessionmaker, user_id)
     chosen = await client.put(
-        "/api/agents/chat/settings", json={"model": "claude-opus-5-5"}, headers=CSRF_HEADERS
+        "/api/agents/chat/settings",
+        json={"model": "claude-code/claude-opus-5-5"},
+        headers=CSRF_HEADERS,
     )
     assert chosen.status_code == 200, chosen.text
     client.document_id = await _seed_document(client, user_id)
@@ -209,10 +211,11 @@ async def test_chat_settings_refuse_connections_and_validate_effort(chatting) ->
     assert bad.status_code == 400
     # The catalog's filter, at the write: a model the Messages route cannot run is refused
     # rather than fixed onto the next turn (docs/api.md).
-    wrong = await chatting.put(
-        "/api/agents/chat/settings", json={"model": "vendor/gpt-9"}, headers=CSRF_HEADERS
-    )
-    assert wrong.status_code == 400
+    for model in ("vendor/gpt-9", "antigravity/claude-opus-4-6-thinking", "claude-opus-5-5"):
+        wrong = await chatting.put(
+            "/api/agents/chat/settings", json={"model": model}, headers=CSRF_HEADERS
+        )
+        assert wrong.status_code == 400, model
     ok = await chatting.put(
         "/api/agents/chat/settings", json={"effort": "high"}, headers=CSRF_HEADERS
     )
@@ -229,14 +232,21 @@ async def test_the_chat_catalog_lists_claude_models_only(chatting) -> None:
         return_value=httpx.Response(
             200,
             json={
-                "data": [{"id": "claude-opus-5-5"}, {"id": "gpt-x"}, {"id": "anthropic/claude-3"}]
+                "data": [
+                    {"id": "claude-code/claude-opus-5-5"},
+                    {"id": "codex/gpt-5.5"},
+                    # Claude, but converted on the way: no cache breakpoints, no bash.
+                    {"id": "antigravity/claude-opus-4-6-thinking"},
+                    {"id": "claude-relay/gpt-9"},
+                    {"id": "claude-code/claude-haiku-5-5"},
+                ]
             },
         )
     )
     listed = await chatting.get("/api/agents/chat/models")
     assert [model["id"] for model in listed.json()["data"]] == [
-        "claude-opus-5-5",
-        "anthropic/claude-3",
+        "claude-code/claude-opus-5-5",
+        "claude-code/claude-haiku-5-5",
     ]
 
 
@@ -1441,11 +1451,13 @@ async def test_a_fallback_answer_moves_the_conversation_to_its_model(chatting) -
     )
     assert sent.status_code == 202, sent.text
     await _run_queued_turn(chatting)
-    assert requests[0]["model"] == "claude-opus-5-5"
+    assert requests[0]["model"] == "claude-code/claude-opus-5-5"
     async with chatting.app.state.sessionmaker() as db:
         # The safety fallback answered from another model: its thinking blocks are that
         # model's, so the conversation follows it before the answer is stored.
-        assert (await db.get(Conversation, conversation_id)).model == "claude-fallback-9"
+        assert (
+            await db.get(Conversation, conversation_id)
+        ).model == "claude-code/claude-fallback-9"
     again = await chatting.post(
         f"/api/conversations/{conversation_id}/messages",
         json={"text": "more"},
@@ -1453,7 +1465,7 @@ async def test_a_fallback_answer_moves_the_conversation_to_its_model(chatting) -
     )
     assert again.status_code == 202, again.text
     await _run_queued_turn(chatting)
-    assert requests[1]["model"] == "claude-fallback-9"
+    assert requests[1]["model"] == "claude-code/claude-fallback-9"
 
 
 async def test_the_history_cap_counts_bytes_not_characters(chatting) -> None:

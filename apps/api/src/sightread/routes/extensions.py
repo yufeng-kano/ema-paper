@@ -269,7 +269,7 @@ def _checked_subagent_values(values: dict, settings) -> dict:
     model = (values["model"] or "").strip() or None
     if model is not None and (len(model) > 255 or not is_claude_model(model)):
         # The chat agent's catalog filter: a subagent runs on the Messages route too.
-        raise ApiError(400, "invalid_request", "A subagent runs Claude models only")
+        raise ApiError(400, "invalid_request", "A subagent runs claude-code/claude-* models only")
     tools = values["tools"] or []
     unknown = [tool for tool in tools if tool not in SUBAGENT_TOOL_NAMES]
     if unknown:

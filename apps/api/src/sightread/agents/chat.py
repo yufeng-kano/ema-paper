@@ -122,8 +122,11 @@ CACHE_TTL = "1h"
 
 
 def is_claude_model(model_id: str) -> bool:
-    """The catalog filter for this agent: it speaks the Messages API and nothing else."""
-    return "claude" in model_id.lower()
+    """The catalog filter for this agent: it speaks the Messages API and nothing else, and
+    Kano Proxy passes that to Anthropic untouched only for its `claude-code` provider.
+    Claude behind any other provider is a conversion that drops the cache breakpoints and
+    the Anthropic-defined tools (docs/chat.md)."""
+    return model_id.startswith("claude-code/claude-")
 
 
 # `{...}` tokens are replaced by `render_system_prompt`, never by str.format: the text

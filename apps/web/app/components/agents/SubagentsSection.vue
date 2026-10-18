@@ -35,7 +35,15 @@ const columns = computed<TableColumn<Subagent>[]>(() => [
   { key: 'description', header: t('agents.skillDescription') },
   { key: 'model', header: t('agents.subagentModel'), width: '11rem' },
   { key: 'tools', header: t('agents.subagentTools'), width: '8.5rem' },
-  { key: 'actions', header: '', srHeader: t('agents.actions'), width: '3rem', align: 'end' },
+  // The edit button's width past the column's left padding: any narrower and the button
+  // overflows the table's edge, which then scrolls sideways.
+  {
+    key: 'actions',
+    header: '',
+    srHeader: t('agents.actions'),
+    width: 'calc(var(--cell-x) + var(--control-height-xs))',
+    align: 'end',
+  },
 ])
 
 const rowKey = (row: Subagent) => row.name

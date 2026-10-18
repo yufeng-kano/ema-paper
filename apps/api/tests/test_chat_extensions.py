@@ -101,7 +101,9 @@ async def chatting_client(client: AsyncClient) -> AsyncClient:
     user_id = (await client.get("/api/me")).json()["user"]["id"]
     await _connect_kano(client.app.state.sessionmaker, user_id)
     chosen = await client.put(
-        "/api/agents/chat/settings", json={"model": "claude-opus-5-5"}, headers=CSRF_HEADERS
+        "/api/agents/chat/settings",
+        json={"model": "claude-code/claude-opus-5-5"},
+        headers=CSRF_HEADERS,
     )
     assert chosen.status_code == 200, chosen.text
     client.document_id = await _seed_document(client, user_id)
@@ -342,7 +344,7 @@ async def test_subagents_follow_the_skills_contract(signed_in) -> None:
         json={
             "name": "tables",
             "description": "Checks tables",
-            "model": "claude-haiku-5-5",
+            "model": "claude-code/claude-haiku-5-5",
             "tools": ["str_replace_based_edit_tool", "view_page", "view_page"],
             "prompt": "Check every table.",
         },
@@ -351,7 +353,8 @@ async def test_subagents_follow_the_skills_contract(signed_in) -> None:
     assert created.status_code == 201, created.text
     # The tools in their fixed order, each once.
     assert created.json()["tools"] == ["view_page", "str_replace_based_edit_tool"]
-    assert created.json()["model"] == "claude-haiku-5-5" and created.json()["default"] is None
+    assert created.json()["model"] == "claude-code/claude-haiku-5-5"
+    assert created.json()["default"] is None
     defaulted = await signed_in.post(
         "/api/subagents", json={"name": "all-tools", "prompt": "Read."}, headers=CSRF_HEADERS
     )
@@ -383,6 +386,7 @@ async def test_subagents_follow_the_skills_contract(signed_in) -> None:
         {"name": "nesting", "prompt": "x", "tools": ["subagent"]},
         {"name": "none", "prompt": "x", "tools": []},
         {"name": "gpt", "prompt": "x", "model": "gpt-9"},
+        {"name": "converted", "prompt": "x", "model": "antigravity/claude-opus-4-6-thinking"},
     ):
         refused = await signed_in.post("/api/subagents", json=body, headers=CSRF_HEADERS)
         assert refused.status_code == 400, body
@@ -393,9 +397,12 @@ async def test_subagents_follow_the_skills_contract(signed_in) -> None:
 
     # A built-in: edited under its name, `model: null` kept as a value, restored by delete.
     edited = await signed_in.put(
-        "/api/subagents/verifier", json={"model": "claude-haiku-5-5"}, headers=CSRF_HEADERS
+        "/api/subagents/verifier",
+        json={"model": "claude-code/claude-haiku-5-5"},
+        headers=CSRF_HEADERS,
     )
-    assert edited.json()["model"] == "claude-haiku-5-5" and edited.json()["modified"] is True
+    assert edited.json()["model"] == "claude-code/claude-haiku-5-5"
+    assert edited.json()["modified"] is True
     cleared = await signed_in.put(
         "/api/subagents/verifier", json={"model": None}, headers=CSRF_HEADERS
     )
@@ -706,7 +713,7 @@ async def test_a_subagent_works_alone_and_hands_back_its_report(chat_client, mon
     assert thread["turns"][0]["status"] == "succeeded", thread["turns"]
     # Its own context: the preamble and its prompt, the task its only message, its tools.
     first = sub[0]
-    assert first["model"] == "claude-opus-5-5"  # none of its own: the conversation's
+    assert first["model"] == "claude-code/claude-opus-5-5"  # none of its own: the conversation's
     assert [tool["name"] for tool in first["tools"]] == [
         "view_page",
         "view_figure",
@@ -743,7 +750,7 @@ async def test_a_subagent_works_alone_and_hands_back_its_report(chat_client, mon
         "assistant",
     ]
     record = thread["messages"][2]["content"][0]["subagent"]
-    assert record["name"] == "verifier" and record["model"] == "claude-opus-5-5"
+    assert record["name"] == "verifier" and record["model"] == "claude-code/claude-opus-5-5"
     assert record["tool_calls"] == 3 and isinstance(record["elapsed_ms"], int)
     assert record["steps"] == [
         {"type": "note", "text": "Open the page first."},
@@ -849,7 +856,7 @@ async def test_a_subagent_runs_on_its_own_model_and_stops_at_its_call_cap(
         json={
             "name": "quick",
             "description": "Fast reads",
-            "model": "claude-haiku-5-5",
+            "model": "claude-code/claude-haiku-5-5",
             "tools": ["view_page"],
             "prompt": "Read fast.",
         },
@@ -886,7 +893,7 @@ async def test_a_subagent_runs_on_its_own_model_and_stops_at_its_call_cap(
     await send(client, conversation_id, text="Read")
     await _run_queued_turn(client)
 
-    assert sub[0]["model"] == "claude-haiku-5-5"
+    assert sub[0]["model"] == "claude-code/claude-haiku-5-5"
     assert [tool["name"] for tool in sub[0]["tools"]] == ["view_page"]
     # Past the cap nothing more runs: no read, no further call.
     assert len(sub) == 1 and pages == []
@@ -898,13 +905,17 @@ async def test_a_subagent_runs_on_its_own_model_and_stops_at_its_call_cap(
     )
     thread = (await client.get(f"/api/conversations/{conversation_id}")).json()
     record = thread["messages"][2]["content"][0]["subagent"]
-    assert record["model"] == "claude-haiku-5-5" and record["tool_calls"] == 2
+    assert record["model"] == "claude-code/claude-haiku-5-5" and record["tool_calls"] == 2
     assert [step["is_error"] for step in record["steps"]] == [True, True]
     async with client.app.state.sessionmaker() as db:
         models = sorted(
             (await db.execute(select(UsageLog.model).where(UsageLog.agent == "chat"))).scalars()
         )
-    assert models == ["claude-haiku-5-5", "claude-opus-5-5", "claude-opus-5-5"]
+    assert models == [
+        "claude-code/claude-haiku-5-5",
+        "claude-code/claude-opus-5-5",
+        "claude-code/claude-opus-5-5",
+    ]
 
 
 @respx.mock
