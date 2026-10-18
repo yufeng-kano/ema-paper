@@ -47,6 +47,10 @@ import type { StreamedEvent } from '~/composables/useConversationStream'
 /** How long to wait before following a still-live turn again after the stream gave up. */
 const RESUME_AFTER_MS = 10_000
 
+/** How close to the thread's end counts as at it: the thread follows a live turn only
+ *  from there (docs/web.md § The agent panel). */
+const FOLLOW_SLACK_PX = 24
+
 const props = defineProps<{
   documentId: number
   /** The document pane's current selection, read at the moment a message is composed. */
@@ -228,6 +232,7 @@ async function select(id: number) {
   messages.value = []
   turns.value = []
   discardFrames()
+  following = true
   // The cards' state stays: keyed by tool-call id, it belongs to the card, not to the
   // conversation now open, and a thread switched away from and back must not offer to
   // revert a commit the reader already reverted (docs/web.md § Agent panel).
@@ -356,10 +361,54 @@ const running = computed(() => thread.value.liveTurns.length > 0 || stream.activ
 
 const scroller = ref<HTMLElement | null>(null)
 
-/** Follows the thread as it grows — a reader watching a turn is reading its tail. */
+/** Whether the thread follows what arrives: only while the reader is at its end. One who
+ *  scrolled up to read, or opened something that runs past the bottom, is left where they
+ *  are until they scroll back down. */
+let following = true
+let lastScrollTop = 0
+
+function onThreadScroll() {
+  const box = scroller.value
+  if (box) {
+    const fromEnd = box.scrollHeight - box.scrollTop - box.clientHeight
+    // Up is reading back — unless the thread got shorter under a reader at its end, which
+    // moves the scroll up without the reader leaving the end.
+    const up = box.scrollTop < lastScrollTop
+    if (up && fromEnd > 1) {
+      following = false
+    } else if (!up && fromEnd <= FOLLOW_SLACK_PX) {
+      following = true
+    }
+    lastScrollTop = box.scrollTop
+  }
+  scheduleToolbar()
+}
+
+/** A wheel turned up stops the following at once: a frame folded in before its scroll
+ *  lands would otherwise pull the thread back to its end. */
+function onThreadWheel(event: WheelEvent) {
+  if (event.deltaY < 0) {
+    following = false
+  }
+}
+
+/** After the reader opens or closes something, the thread follows only if its end is
+ *  still in view — a card opened at the bottom is being read, not watched. */
+async function settleFollowing() {
+  await nextTick()
+  const box = scroller.value
+  if (box) {
+    following = box.scrollHeight - box.scrollTop - box.clientHeight <= FOLLOW_SLACK_PX
+  }
+}
+
+/** Keeps the end in view as the thread grows, while it is followed. */
 watch(
   () => [items.value.length, events.value.length],
   async () => {
+    if (!following) {
+      return
+    }
     await nextTick()
     const box = scroller.value
     if (box) {
@@ -411,7 +460,8 @@ function imageSource(item: UserItem, attachment: UserAttachment): string | null 
 // --- what the reader opened ------------------------------------------------------------
 
 /** Kept by key, since the items are rebuilt on every frame: a group the reader toggled
- *  stays as they left it, one they never touched is open while its turn is live. */
+ *  stays as they left it, one they never touched is open while its turn is live. A
+ *  subagent card starts closed, running or not. */
 const openGroups = reactive(new Map<string, boolean>())
 const openSteps = reactive(new Set<string>())
 const openCards = reactive(new Map<string, boolean>())
@@ -422,6 +472,7 @@ function groupOpen(item: StepsItem): boolean {
 
 function toggleGroup(item: StepsItem) {
   openGroups.set(item.key, !groupOpen(item))
+  void settleFollowing()
 }
 
 function toggleStep(key: string) {
@@ -430,14 +481,16 @@ function toggleStep(key: string) {
   } else {
     openSteps.add(key)
   }
+  void settleFollowing()
 }
 
 function cardOpen(item: SubagentItem): boolean {
-  return openCards.get(item.card.id) ?? item.card.status === 'running'
+  return openCards.get(item.card.id) ?? false
 }
 
 function toggleCard(item: SubagentItem) {
   openCards.set(item.card.id, !cardOpen(item))
+  void settleFollowing()
 }
 
 /** When the panel first saw each subagent running: what its live duration counts from. */
@@ -582,6 +635,8 @@ async function submit(payload: ComposerPayload): Promise<boolean> {
     // and the turn below with a record that lacks them (docs/web.md).
     detailSeq++
     detailPending.value = false
+    // The reader's own message is followed into view, wherever they had scrolled.
+    following = true
     messages.value = [
       ...messages.value,
       {
@@ -824,7 +879,13 @@ onBeforeUnmount(() => {
       @close="menu = null"
     />
 
-    <div ref="scroller" class="thread" @pointerdown="onThreadPointerDown" @scroll="scheduleToolbar">
+    <div
+      ref="scroller"
+      class="thread"
+      @pointerdown="onThreadPointerDown"
+      @scroll="onThreadScroll"
+      @wheel.passive="onThreadWheel"
+    >
       <UiBanner v-if="conversationsError" tone="error">{{ conversationsError }}</UiBanner>
       <UiBanner v-else-if="detailError" tone="error">{{ detailError }}</UiBanner>
       <UiBanner v-if="cardError" tone="error">{{ cardError }}</UiBanner>
