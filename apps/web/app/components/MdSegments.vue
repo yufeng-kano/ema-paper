@@ -4,8 +4,8 @@
  * (`_**Abstract**_` is an `em` holding a `strong`).
  *
  * Every styled element carries its exact source: `data-tex` on a math span, `data-src` on
- * strong/em/code/br — how copy-as-markdown hands back the markers the document actually
- * carries rather than the drawn glyphs (docs/web.md § Result viewer).
+ * strong/em/sup/sub/code/br — how copy-as-markdown hands back the markers the document
+ * actually carries rather than the drawn glyphs (docs/web.md § Result viewer).
  *
  * Math is typeset by KaTeX; `v-html` is safe here because KaTeX escapes its input and
  * `trust` is off (app/lib/math.ts). TeX KaTeX cannot parse renders as its `$…$` source.
@@ -46,6 +46,12 @@ const rendered = computed(() =>
     <em v-else-if="segment.kind === 'em'" :data-src="segment.src">
       <MdSegments :segments="segment.segments" />
     </em>
+    <sup v-else-if="segment.kind === 'sup'" class="md-sup" :data-src="segment.src">
+      <MdSegments :segments="segment.segments" />
+    </sup>
+    <sub v-else-if="segment.kind === 'sub'" class="md-sub" :data-src="segment.src">
+      <MdSegments :segments="segment.segments" />
+    </sub>
     <code v-else-if="segment.kind === 'code'" class="md-inline-code" :data-src="segment.src">{{
       segment.text
     }}</code>

@@ -29,7 +29,7 @@ import {
   type ResultBlock,
 } from './markdown'
 
-type Mark = 'bold' | 'italic' | 'code'
+type Mark = 'bold' | 'italic' | 'code' | 'superscript' | 'subscript'
 
 // --- markdown -> content -----------------------------------------------------------------
 
@@ -50,6 +50,12 @@ function inlineContent(segments: InlineSegment[], marks: Mark[] = []): JSONConte
         break
       case 'em':
         content.push(...inlineContent(segment.segments, [...marks, 'italic']))
+        break
+      case 'sup':
+        content.push(...inlineContent(segment.segments, [...marks, 'superscript']))
+        break
+      case 'sub':
+        content.push(...inlineContent(segment.segments, [...marks, 'subscript']))
         break
       case 'code':
         if (segment.text) {
@@ -195,7 +201,7 @@ function escapeText(text: string, inTable: boolean): string {
     } else if (char === '_') {
       const inWord = WORD_CHAR.test(text[index - 1] ?? '') && WORD_CHAR.test(next ?? '')
       out += inWord ? '_' : '\\_'
-    } else if (char === '<' && /^<br\s*\/?>/i.test(text.slice(index))) {
+    } else if (char === '<' && /^<(?:br\s*\/?|sup|sub)>/i.test(text.slice(index))) {
       out += '\\<'
     } else if (char === '|' && inTable) {
       out += '\\|'
@@ -209,7 +215,10 @@ function escapeText(text: string, inTable: boolean): string {
 function markSet(node: JSONContent): Mark[] {
   return (node.marks ?? [])
     .map((mark) => mark.type)
-    .filter((type): type is Mark => type === 'bold' || type === 'italic' || type === 'code')
+    .filter(
+      (type): type is Mark =>
+        type === 'bold' || type === 'italic' || type === 'code' || type === 'superscript' || type === 'subscript',
+    )
 }
 
 function sameMarks(a: Mark[], b: Mark[]): boolean {
@@ -278,6 +287,14 @@ export function serializeInline(content: JSONContent[] = [], inTable = false): s
     }
     if (marks.includes('bold')) {
       inner = `**${inner}**`
+    }
+    // Outside the asterisks: `**a**<sup>**1**</sup>**b**` has no two runs of asterisks
+    // meeting, so it needs none of the separators below.
+    if (marks.includes('superscript')) {
+      inner = `<sup>${inner}</sup>`
+    }
+    if (marks.includes('subscript')) {
+      inner = `<sub>${inner}</sub>`
     }
     return `${lead}${inner}${trail}`
   })

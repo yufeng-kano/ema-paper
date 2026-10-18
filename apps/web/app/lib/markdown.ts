@@ -492,8 +492,9 @@ export function appendBlockSource(markdown: string, pageIndex: number, src: stri
 // inline markdown the way tables do — `**96.5**`, `UniVLA<br>(Ours)` — and showing either
 // as source characters makes the document read like a syntax error. `$…$` spans are split
 // out here and typeset by KaTeX at render time (docs/web.md § Result viewer); the text
-// between them is parsed for strong/em, inline code and `<br>` line breaks. Each styled
-// segment keeps its exact source (`tex`, `src`), which is what copy-as-markdown reads back.
+// between them is parsed for strong/em, inline code, `<br>` line breaks and `<sup>`/`<sub>`.
+// Each styled segment keeps its exact source (`tex`, `src`), which is what copy-as-markdown
+// reads back.
 
 export type InlineSegment =
   | { kind: 'text'; text: string }
@@ -501,6 +502,8 @@ export type InlineSegment =
   | { kind: 'math'; tex: string }
   | { kind: 'strong'; segments: InlineSegment[]; src: string }
   | { kind: 'em'; segments: InlineSegment[]; src: string }
+  | { kind: 'sup'; segments: InlineSegment[]; src: string }
+  | { kind: 'sub'; segments: InlineSegment[]; src: string }
   | { kind: 'code'; text: string; src: string }
   | { kind: 'br'; src: string }
 
@@ -549,8 +552,15 @@ export function mathSpanAt(text: string, open: number): { tex: string; length: n
   return null
 }
 
-/** `<br>` in a table cell is a line break, not text — the one HTML tag transcriptions use. */
+/** `<br>` in a table cell is a line break, not text. */
 const BR_AT = /^<br\s*\/?>/i
+
+/**
+ * `<sup>…</sup>` / `<sub>…</sub>`: GFM has no superscript syntax, so a transcription that does
+ * not write `$^{1}$` writes the tag GitHub renders — an author's affiliation mark, a chemical
+ * index. Bare tags only: these and `<br>` are the only HTML read, every other tag stays text.
+ */
+const SCRIPT_AT = /^<(sup|sub)>([^\n]+?)<\/\1>/i
 
 /** An inline code span. Single backticks only — a fenced block never reaches this parser. */
 const CODE_AT = /^`([^`\n]+)`/
@@ -599,10 +609,10 @@ export function isEscaped(text: string, index: number): boolean {
 }
 
 /**
- * Parses the styled-inline shapes — emphasis, code, `<br>` — inside one math-free run of
- * text. Recursive for nesting (`_**Abstract**_` is an `em` holding a `strong`); anything
- * that fails a marker's rules stays literal text, which is also the wrong-guess fallback:
- * visible markers beat text silently bolded.
+ * Parses the styled-inline shapes — emphasis, code, `<br>`, `<sup>`/`<sub>` — inside one
+ * math-free run of text. Recursive for nesting (`_**Abstract**_` is an `em` holding a
+ * `strong`); anything that fails a marker's rules stays literal text, which is also the
+ * wrong-guess fallback: visible markers beat text silently bolded.
  */
 function parseStyled(text: string): InlineSegment[] {
   const segments: InlineSegment[] = []
@@ -664,6 +674,12 @@ function parseStyled(text: string): InlineSegment[] {
       const br = BR_AT.exec(rest)
       if (br) {
         push({ kind: 'br', src: br[0] }, br[0].length)
+        continue
+      }
+      const script = SCRIPT_AT.exec(rest)
+      if (script) {
+        const kind = script[1]?.toLowerCase() === 'sub' ? 'sub' : 'sup'
+        push({ kind, segments: parseStyled(script[2] ?? ''), src: script[0] }, script[0].length)
         continue
       }
       scan += 1

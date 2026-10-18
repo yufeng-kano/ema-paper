@@ -191,6 +191,17 @@ describe('rendered inline markdown', () => {
     )
   })
 
+  it('hands back <sup> and <sub> from data-src', () => {
+    const paragraph = el('p', { class: 'md-p' }, [
+      text('H'),
+      el('sub', { class: 'md-sub', 'data-src': '<sub>2</sub>' }, [text('2')]),
+      text('O and THYAGATURU'),
+      el('sup', { class: 'md-sup', 'data-src': '<SUP>1</SUP>' }, [text('1')]),
+    ])
+
+    expect(nodesToMarkdown([paragraph])).toBe('H<sub>2</sub>O and THYAGATURU<SUP>1</SUP>')
+  })
+
   it('hands back a KaTeX display block from its data-md', () => {
     const block = el('div', { class: 'md-math-block', 'data-md': '$$\nx = 1\n$$' }, [
       text('x=1'),
@@ -207,6 +218,12 @@ describe('partially selected styled elements', () => {
     expect(nodesToMarkdown([el('p', { class: 'md-p' }, [cut, text(' result')])])).toBe(
       '**6.5** result',
     )
+  })
+
+  it('re-wraps a cut superscript in its own tags', () => {
+    const cut = el('sup', { class: 'md-sup', 'data-src': '<sup>1,2</sup>' }, [text(',2')])
+
+    expect(nodesToMarkdown([el('p', { class: 'md-p' }, [text('Bu'), cut])])).toBe('Bu<sup>,2</sup>')
   })
 
   it('drops an element cloned empty at the selection edge', () => {

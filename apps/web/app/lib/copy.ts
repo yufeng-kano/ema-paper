@@ -65,7 +65,7 @@ function inlineText(node: MarkdownNode): string {
   if (tex !== null) {
     return tex
   }
-  // Rendered emphasis, code and <br> carry their exact markdown source (docs/web.md).
+  // Rendered emphasis, code, <br>, <sup> and <sub> carry their exact markdown source (docs/web.md).
   const src = attribute(node, 'data-src')
   if (src !== null) {
     return inlineSource(node, src)
@@ -91,18 +91,22 @@ function inlineSource(node: MarkdownNode, src: string): string {
     marker = src.startsWith('_') ? '_' : '*'
   } else if (name === 'code') {
     marker = '`'
+  } else if (name === 'sup' || name === 'sub') {
+    marker = `<${name}>`
   } else {
     // <br> has no children to lose — its source is its source.
     return src
   }
+  // A tag closes with its end tag; every other marker closes with itself.
+  const close = marker.startsWith('<') ? `</${name}>` : marker
   const inner = children(node).map(inlineText).join('')
   // A boundary sitting exactly on the element's edge clones it empty — markers around
   // nothing are not markdown, they are noise.
   if (!inner) {
     return ''
   }
-  const expected = src.slice(marker.length, src.length - marker.length)
-  return inner === expected ? src : `${marker}${inner}${marker}`
+  const expected = src.slice(marker.length, src.length - close.length)
+  return inner === expected ? src : `${marker}${inner}${close}`
 }
 
 /** A table cell's markdown: inline content with its pipes escaped, on one line. */

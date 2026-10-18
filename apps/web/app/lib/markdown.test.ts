@@ -345,6 +345,42 @@ describe('parseInline', () => {
     ])
   })
 
+  it('renders <sup> and <sub> with their source kept for copy', () => {
+    expect(parseInline('THYAGATURU<sup>1</sup>, H<sub>2</sub>O')).toEqual([
+      { kind: 'text', text: 'THYAGATURU' },
+      { kind: 'sup', segments: [{ kind: 'text', text: '1' }], src: '<sup>1</sup>' },
+      { kind: 'text', text: ', H' },
+      { kind: 'sub', segments: [{ kind: 'text', text: '2' }], src: '<sub>2</sub>' },
+      { kind: 'text', text: 'O' },
+    ])
+    expect(parseInline('<SUP>a</SUP>')).toEqual([
+      { kind: 'sup', segments: [{ kind: 'text', text: 'a' }], src: '<SUP>a</SUP>' },
+    ])
+  })
+
+  it('renders the superscripts of an author line inside its strong emphasis', () => {
+    expect(parseInline('**THYAGATURU<sup>1</sup>, (Senior Member, IEEE)** <sup>1</sup>Intel')).toEqual([
+      {
+        kind: 'strong',
+        segments: [
+          { kind: 'text', text: 'THYAGATURU' },
+          { kind: 'sup', segments: [{ kind: 'text', text: '1' }], src: '<sup>1</sup>' },
+          { kind: 'text', text: ', (Senior Member, IEEE)' },
+        ],
+        src: '**THYAGATURU<sup>1</sup>, (Senior Member, IEEE)**',
+      },
+      { kind: 'text', text: ' ' },
+      { kind: 'sup', segments: [{ kind: 'text', text: '1' }], src: '<sup>1</sup>' },
+      { kind: 'text', text: 'Intel' },
+    ])
+  })
+
+  it('keeps any other tag, and an escaped or unclosed <sup>, as text', () => {
+    expect(parseInline('<span>x</span> \\<sup>1</sup> <sup>open')).toEqual([
+      { kind: 'text', text: '<span>x</span> <sup>1</sup> <sup>open' },
+    ])
+  })
+
   it('nests emphasis one inside the other', () => {
     expect(parseInline('_**Abstract**_')).toEqual([
       {

@@ -32,6 +32,7 @@ describe('an unchanged document', () => {
     ['a contents page', '1.1 Intro . . . . 13\n1.2 More . . . . 15'],
     ['a figure with caption', '![fig1](sightread://p3/1,2,3,4)\nFigure 1: Learning curves.'],
     ['prices', 'It cost $5 and $6 in total.'],
+    ['an author line with superscripts', '**THYAGATURU<sup>1</sup>, (Senior Member, IEEE)** <sup>1</sup>Intel, H<sub>2</sub>O'],
     ['several blocks', '# Title\n\nPara one.\n\n- a\n- b\n\n$$\nx\n$$'],
   ])('%s comes back byte for byte', (_name, markdown) => {
     expect(docToMarkdown(load(markdown))).toBe(markdown)
@@ -275,6 +276,9 @@ describe('pull request review', () => {
     ['italic then bold', [text('a', 'italic'), text('b', 'bold')]],
     ['dollars around bold', [text('$'), text('sale', 'bold'), text('$')]],
     ['bold code', [text('code', 'code', 'bold')]],
+    ['a superscript inside bold', [text('THYAGATURU', 'bold'), text('1', 'bold', 'superscript'), text(', IEEE', 'bold')]],
+    ['a subscript', [text('H'), text('2', 'subscript'), text('O')]],
+    ['a typed tag', [text('x<sup>1</sup> and <sub>2</sub>')]],
   ])('%s reads back as written', (_name, content) => {
     const markdown = docToMarkdown(doc(...content))
     // The zero-width separators the serializer adds are invisible; they are not content.

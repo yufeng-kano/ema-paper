@@ -15,6 +15,8 @@
   "dependencies": {
     "@tiptap/core": "3.32.0",
     "@tiptap/extension-heading": "3.32.0",
+    "@tiptap/extension-subscript": "3.32.0",
+    "@tiptap/extension-superscript": "3.32.0",
     "@tiptap/extension-table": "3.32.0",
     "@tiptap/extensions": "3.32.0",
     "@tiptap/pm": "3.32.0",

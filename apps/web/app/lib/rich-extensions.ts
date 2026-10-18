@@ -3,13 +3,15 @@
  * views are plain DOM, so the schema also builds in node for the round-trip tests.
  *
  * The schema is exactly what the viewer's parser reads — paragraphs, headings, one-level
- * lists, pipe tables, display and inline math, code — and no more: a blockquote, a rule or a
- * strikethrough the editor could make but `markdown.ts` cannot read back would be an edit
- * that vanishes when the block closes. Elements carry the same `md-*` classes the rendered
- * block uses, so opening a block moves nothing on screen.
+ * lists, pipe tables, display and inline math, code, superscript and subscript — and no
+ * more: a blockquote, a rule or a strikethrough the editor could make but `markdown.ts`
+ * cannot read back would be an edit that vanishes when the block closes. Elements carry the
+ * same `md-*` classes the rendered block uses, so opening a block moves nothing on screen.
  */
 import { Extension, InputRule, Node, mergeAttributes, type Extensions } from '@tiptap/core'
 import { Heading } from '@tiptap/extension-heading'
+import { Subscript } from '@tiptap/extension-subscript'
+import { Superscript } from '@tiptap/extension-superscript'
 import { Table, TableCell, TableHeader, TableRow } from '@tiptap/extension-table'
 import { Placeholder } from '@tiptap/extensions'
 import StarterKit from '@tiptap/starter-kit'
@@ -266,6 +268,8 @@ export function richExtensions(options: RichOptions = {}): Extensions {
       codeBlock: { HTMLAttributes: { class: 'md-math' } },
     }),
     ViewerHeading.configure({ levels: [1, 2, 3, 4, 5, 6] }),
+    Superscript.configure({ HTMLAttributes: { class: 'md-sup' } }),
+    Subscript.configure({ HTMLAttributes: { class: 'md-sub' } }),
     Table.configure({ resizable: false, HTMLAttributes: { class: 'md-table' } }),
     TableRow,
     TableHeader,
