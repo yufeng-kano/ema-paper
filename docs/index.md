@@ -10,7 +10,7 @@ Hosted, multi-user **vision document parsing** service. Users sign in with Googl
 | [api.md](./api.md) | REST data plane (`/v1/*`), control plane (`/api/*`), partial results, figure crop routes, SSE, limits, errors |
 | [auth.md](./auth.md) | Google OIDC sessions, hashed API keys, encrypted upstream keys, OAuth 2.1 AS for Claude Connectors, single-use upload tickets, the Kano Proxy connect flow |
 | [agents.md](./agents.md) | The agent registry (`parse` and `chat`), per-agent upstream/model/prompt/effort settings, enqueue rules |
-| [chat.md](./chat.md) | The `chat` agent: the Messages API over Kano Proxy, tools (bash, editor, page and figure views, skills, subagents), the reader's own prompt, prompt caching breakpoints, append-only history, what a user message carries (replies, commands, attachments), conversations/turns/events |
+| [chat.md](./chat.md) | The `chat` agent: the Messages API over Kano Proxy, tools (bash, editor, page and figure views, skills, subagents), the reader's own prompt, prompt caching breakpoints, append-only history, translation (`/translate`), what a user message carries (replies, commands, attachments), conversations/turns/events |
 | [workspace.md](./workspace.md) | The per-user file tree: document directories, git revisions, reconciliation with the library, quota, backups |
 | [sandbox.md](./sandbox.md) | One Kata microVM per user: the runner service, its HTTP contract, isolation, lifecycle, the image, operations |
 | [parsing.md](./parsing.md) | Poppler rendering, vision-only conversion, page markers, bbox contract, figure crop persistence, prompts, coordinate conventions per model family, models, image normalization |

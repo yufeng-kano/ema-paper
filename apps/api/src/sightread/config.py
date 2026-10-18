@@ -93,8 +93,10 @@ class Settings(BaseSettings):
     # The `Retry-After` a refused send (429, the per-user turn cap) tells the client.
     chat_retry_after_seconds: int = 15
     chat_max_output_tokens: int = 64_000
-    chat_max_tool_calls_per_turn: int = 50
-    chat_turn_timeout_seconds: int = 900
+    # High enough that a document translated block by block is one turn (docs/chat.md
+    # § Translation); the cap is a guard against a loop, the timeout bounds the turn.
+    chat_max_tool_calls_per_turn: int = 1000
+    chat_turn_timeout_seconds: int = 3600
     chat_stream_timeout_seconds: int = 900
     chat_tool_result_max_chars: int = 20_000
     chat_message_max_chars: int = 32_000

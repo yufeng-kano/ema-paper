@@ -13,7 +13,7 @@ from .parse import BBOX_FORMAT_YXYX
 
 # Bumped when the prompt or the tool contract changes what a conversation does. Chat has
 # no dedup cache; the number is bookkeeping for the registry (docs/agents.md).
-PIPELINE_VERSION = 2
+PIPELINE_VERSION = 3
 
 # Anthropic-defined tools carry no schema of their own (docs/chat.md § Tools). The order
 # is part of the cache prefix and never changes. The custom tools are strict: their schemas

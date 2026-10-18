@@ -161,7 +161,7 @@ def fake_pages(monkeypatch) -> list[int]:
 
 async def test_the_skills_are_the_builtins_then_the_readers_own(signed_in) -> None:
     listed = (await signed_in.get("/api/skills")).json()["skills"]
-    assert [skill["name"] for skill in listed] == ["check-figures", "fix-math"]
+    assert [skill["name"] for skill in listed] == ["check-figures", "fix-math", "translate"]
     check = listed[0]
     assert check["builtin"] is True and check["modified"] is False
     assert check["user_invocable"] is True and check["model_invocable"] is False
@@ -207,7 +207,12 @@ async def test_the_skills_are_the_builtins_then_the_readers_own(signed_in) -> No
     )
     assert empty.status_code == 400
     listed = (await signed_in.get("/api/skills")).json()["skills"]
-    assert [skill["name"] for skill in listed] == ["check-figures", "fix-math", "zh-summary"]
+    assert [skill["name"] for skill in listed] == [
+        "check-figures",
+        "fix-math",
+        "translate",
+        "zh-summary",
+    ]
 
 
 async def test_a_builtin_skill_is_edited_and_restored_never_renamed_or_deleted(
@@ -273,7 +278,28 @@ async def test_a_readers_own_skill_is_renamed_and_deleted(signed_in) -> None:
     assert (await signed_in.delete("/api/skills/final", headers=CSRF_HEADERS)).status_code == 204
     assert (await signed_in.delete("/api/skills/final", headers=CSRF_HEADERS)).status_code == 404
     names = [skill["name"] for skill in (await signed_in.get("/api/skills")).json()["skills"]]
-    assert names == ["check-figures", "fix-math", "other"]
+    assert names == ["check-figures", "fix-math", "translate", "other"]
+
+
+def test_a_readers_own_skill_under_a_later_builtins_name_reads_as_their_edit() -> None:
+    mine = skill_defs.SkillDefinition(
+        name="translate", description="Mine", argument_hint="", body="My own steps."
+    )
+    resolved = {skill.name: skill for skill in skill_defs.resolve_skills([mine])}
+    translate = resolved["translate"]
+    assert translate.builtin and translate.modified
+    assert translate.body == "My own steps." and translate.default is skill_defs.TRANSLATE
+
+
+def test_translate_takes_a_language_and_the_readers_instructions() -> None:
+    rendered = skill_defs.render_skill(skill_defs.TRANSLATE.body, " zh-TW 術語保留英文 ")
+    assert "Arguments: zh-TW 術語保留英文\n" in rendered
+    assert "$ARGUMENTS" not in rendered
+    # Both halves are subagents the skill names, and they can only read.
+    names = {subagent.name: subagent for subagent in subagent_defs.BUILTIN_SUBAGENTS}
+    for name in ("translator", "translation-checker"):
+        assert f"`{name}`" in rendered
+        assert names[name].tools == ("str_replace_based_edit_tool",)
 
 
 async def test_skills_and_subagents_are_capped(make_client) -> None:
@@ -300,7 +326,12 @@ async def test_skills_and_subagents_are_capped(make_client) -> None:
 
 async def test_subagents_follow_the_skills_contract(signed_in) -> None:
     listed = (await signed_in.get("/api/subagents")).json()["subagents"]
-    assert [subagent["name"] for subagent in listed] == ["verifier", "reader"]
+    assert [subagent["name"] for subagent in listed] == [
+        "verifier",
+        "reader",
+        "translator",
+        "translation-checker",
+    ]
     assert listed[1]["tools"] == ["view_page", "str_replace_based_edit_tool"]
     assert listed[0]["model"] is None and listed[0]["builtin"] is True
 
@@ -360,7 +391,14 @@ async def test_subagents_follow_the_skills_contract(signed_in) -> None:
         await signed_in.delete("/api/subagents/reader", headers=CSRF_HEADERS)
     ).status_code == 204
     names = [entry["name"] for entry in (await signed_in.get("/api/subagents")).json()["subagents"]]
-    assert names == ["verifier", "reader", "all-tools", "tables"]
+    assert names == [
+        "verifier",
+        "reader",
+        "translator",
+        "translation-checker",
+        "all-tools",
+        "tables",
+    ]
 
     moved = await signed_in.put(
         "/api/subagents/tables", json={"name": "grids", "model": None}, headers=CSRF_HEADERS
@@ -512,7 +550,9 @@ async def test_a_turn_runs_on_the_readers_prompt_with_the_catalogue_last(chat_cl
     assert "- fix-math: " in catalogue and "- zh-summary: Add a Chinese summary" in catalogue
     # A skill the agent may not load is not listed: those are the reader's commands only.
     assert "check-figures" not in catalogue and "mine-only" not in catalogue
+    assert "- translate: " not in catalogue
     assert "- verifier: " in catalogue and "- reader: " in catalogue
+    assert "- translator: " in catalogue and "- translation-checker: " in catalogue
 
 
 @respx.mock

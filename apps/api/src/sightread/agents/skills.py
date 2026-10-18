@@ -66,7 +66,31 @@ Change nothing else. When the page cannot settle a formula, leave it and say so.
     model_invocable=True,
 )
 
-BUILTIN_SKILLS: tuple[SkillDefinition, ...] = (CHECK_FIGURES, FIX_MATH)
+# The reader's command only: a translation asked for in their own words is answered in the
+# reply, and running the command is the request to write one (docs/chat.md § Translation).
+TRANSLATE = SkillDefinition(
+    name="translate",
+    description="Translate the selected passage, or the whole document, inserting each block's translation right under it.",
+    argument_hint="[language] [instructions]",
+    body="""Translate into the document: each block's translation goes right under the block, as ordinary markdown. The user ran this command to have the translation written into the document.
+
+Arguments: $ARGUMENTS
+The first word is the target language when it names one (zh-TW, 日本語, English); otherwise translate into the reader locale named in the message's context. The rest is the user's own instructions for this translation: pass them word for word to every subagent you start, and follow them over the rules here.
+
+Range: the blocks the selected passage covers when the message carries a selection, the whole document otherwise. If the range is already in the target language, say so and stop.
+
+1. Find the range in doc.md. Read its headings and its opening (the abstract, in a paper) and list the key terms with the translation each must take, so that every piece uses the same words.
+2. Split the range at its page markers into pieces of two to four pages; a short range is one piece. Start one `translator` per piece, all in the same round, giving each its pages, the target language, the user's instructions and your list of terms.
+3. Insert what the translators report with the editor's insert: for each `@@ N` entry, insert after line N an empty line followed by the translation. Go from the last piece to the first and, within a piece, from its last entry to its first, so that every line number still points where the translator read it. Make one piece's inserts per round of calls.
+4. When a report says its translator stopped before the end of its pages, then once every report is inserted, start a `translator` for the pages it did not finish and insert its report the same way.
+5. Start one `translation-checker` per piece, all in the same round, with the same pages, language, instructions and list of terms. Apply each correction it reports with str_replace, checking first that the text to replace is still there.
+
+End with a short summary in the user's terms: what was translated, what the check corrected, and anything left untranslated.""",
+    user_invocable=True,
+    model_invocable=False,
+)
+
+BUILTIN_SKILLS: tuple[SkillDefinition, ...] = (CHECK_FIGURES, FIX_MATH, TRANSLATE)
 BUILTIN_SKILL_NAMES = frozenset(skill.name for skill in BUILTIN_SKILLS)
 
 

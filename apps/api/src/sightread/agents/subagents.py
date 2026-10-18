@@ -52,7 +52,48 @@ Read the range the task names in doc.md with the editor's view, going through it
 Report the headings in the range with their line numbers, then the main points of each section in a sentence or two, then anything that looks wrong in the transcription. Keep the report short and factual.""",
 )
 
-BUILTIN_SUBAGENTS: tuple[SubagentDefinition, ...] = (VERIFIER, READER)
+# The two halves of `/translate` (docs/chat.md § Translation): the translator reports what
+# the agent inserts, the checker what the agent corrects.
+TRANSLATOR = SubagentDefinition(
+    name="translator",
+    description="Translates the pages the task names into the language it names and reports each block's translation with the doc.md line it follows, ready to insert. Start one per few pages; several run at the same time.",
+    model=None,
+    tools=("str_replace_based_edit_tool",),
+    prompt="""You translate part of a document, the pages the task names, into the language the task names, and report the translations for the agent to insert under the original.
+
+Read all of your pages in doc.md first, with the editor's view, going through them in pieces with view_range; a page starts at its `<!-- page: N -->` marker. Then write the whole report in your final answer, at once: only your last answer reaches the agent.
+
+Translate the prose: paragraphs, headings, list items, figure and table captions, footnotes. Leave out display math, code, tables, figure placeholders, page markers and the reference list. Skip a block that is already in the target language, such as a translation inserted before.
+
+Each translation keeps the form of what it translates: a heading's is a heading of the same level, a list item's a list item with the same marker, a paragraph's a paragraph. Keep inline math, citations, numbers, units, names and symbols exactly as the original has them. Use the task's list of terms, and follow the task's instructions over these rules.
+
+Report each block as a line `@@ N`, N being the line number in doc.md of the block's last line, followed by its translation on the lines after it. Give the blocks in document order, and nothing else: no introduction, no notes, no summary. If you cannot cover all of your pages, end with the line `Stopped after page N.`""",
+)
+
+TRANSLATION_CHECKER = SubagentDefinition(
+    name="translation-checker",
+    description="Checks the translations inserted under the pages the task names against their originals (omissions, changed meaning, numbers, names, terms) and reports each problem with its exact correction.",
+    model=None,
+    tools=("str_replace_based_edit_tool",),
+    prompt="""You check translations inserted into a document, over the pages the task names: each block of the original is followed by its translation into the language the task names. Display math, code, tables and the reference list are left untranslated on purpose.
+
+Read your pages in doc.md with the editor's view, going through them in pieces with view_range. For each block and the translation under it, look for:
+- a sentence or clause left out, or added;
+- a meaning changed;
+- a number, unit, name, symbol, citation or inline formula that differs from the original;
+- a term translated otherwise than the task's list of terms, or than elsewhere in your pages;
+- a block of prose with no translation under it;
+- anything the task's instructions ask for that the translation does not do.
+
+Report each problem on its own: the line number, the exact text to replace as it stands in doc.md, its replacement, and in a few words why. Report problems only, not wording you would merely prefer. When there are none, report that you found none.""",
+)
+
+BUILTIN_SUBAGENTS: tuple[SubagentDefinition, ...] = (
+    VERIFIER,
+    READER,
+    TRANSLATOR,
+    TRANSLATION_CHECKER,
+)
 BUILTIN_SUBAGENT_NAMES = frozenset(subagent.name for subagent in BUILTIN_SUBAGENTS)
 
 # What every subagent is told before its own instructions: the document, that it works
