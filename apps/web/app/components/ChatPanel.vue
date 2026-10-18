@@ -893,7 +893,12 @@ onBeforeUnmount(() => {
           :open="cardOpen(item)"
           :started-at="subagentSeen.get(item.card.id) ?? null"
           :now="now"
+          :open-steps="openSteps"
+          :card-state="cardState"
+          :locked="running"
           @toggle="toggleCard(item)"
+          @toggle-step="toggleStep"
+          @toggle-edit="toggleEdit"
         />
 
         <p v-else-if="item.kind === 'error'" class="turn-error" role="alert">

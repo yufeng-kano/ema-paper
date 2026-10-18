@@ -79,7 +79,9 @@ function onDeleted(name: string) {
           <span v-else class="cell-block follows">{{ t('agents.followsConversation') }}</span>
         </template>
         <template #cell-tools="{ row }">
-          <span class="tools">{{ t('agents.subagentToolsCount', { n: row.tools.length }, row.tools.length) }}</span>
+          <span class="tools">{{
+            t(row.writes ? 'agents.subagentToolsWrites' : 'agents.subagentToolsCount', { n: row.tools.length }, row.tools.length)
+          }}</span>
         </template>
         <template #cell-actions="{ row }">
           <UiButton

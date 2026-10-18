@@ -154,14 +154,19 @@ export interface Skill extends SkillFields {
   default: SkillFields | null
 }
 
-/** The tools a subagent may hold: the read-only ones, the editor limited to `view`. */
-export const SUBAGENT_TOOLS = ['view_page', 'view_figure', 'str_replace_based_edit_tool'] as const
+/** The tools a subagent may hold: the editor answers `view` only to one that cannot change
+ *  files, and `bash` needs `writes` (docs/chat.md § Subagents). */
+export const SUBAGENT_TOOLS = ['view_page', 'view_figure', 'str_replace_based_edit_tool', 'bash'] as const
+/** The tools that need `writes`. */
+export const WRITING_TOOLS: readonly string[] = ['bash']
 
 export interface SubagentFields {
   /** When to start it: what the agent reads. */
   description: string
   /** A Claude model id; null runs it on the conversation's model. */
   model: string | null
+  /** May change files: the editor writes, and `bash` may be among its tools. */
+  writes: boolean
   tools: string[]
   prompt: string
 }
@@ -311,7 +316,8 @@ export interface AttachmentMeta {
 
 /** One thing a subagent did, as its run's record keeps it (docs/chat.md § Subagents). */
 export type SubagentStep =
-  | { type: 'tool'; name: string; input: Record<string, unknown>; is_error: boolean }
+  /** `id` joins the step to its `edit` event; a record from before it lacks one. */
+  | { type: 'tool'; id?: string; name: string; input: Record<string, unknown>; is_error: boolean }
   | { type: 'note'; text: string }
 
 /** What a `subagent` call's result carries beside the report, for the thread to draw. */

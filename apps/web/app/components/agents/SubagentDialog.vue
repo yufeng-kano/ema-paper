@@ -1,9 +1,9 @@
 <script setup lang="ts">
 /**
  * One subagent, opened from the Agent page's Subagents table (docs/web.md § Pages,
- * docs/chat.md § Subagents): the skill dialog's shape — name, model, when to use, its
- * read-only tools and its prompt — with **Restore default** on a built-in and **Delete
- * subagent** on one of the reader's own. The model list is the chat agent's live Claude
+ * docs/chat.md § Subagents): the skill dialog's shape — name, model, when to use, whether
+ * it may change files, its tools and its prompt — with **Restore default** on a built-in
+ * and **Delete subagent** on one of the reader's own. The model list is the chat agent's live Claude
  * catalog, after *Follows the conversation*.
  */
 import {
@@ -11,6 +11,7 @@ import {
   deleteSubagent,
   SUBAGENT_TOOLS,
   updateSubagent,
+  WRITING_TOOLS,
   type ConnectionModel,
   type Subagent,
   type SubagentFields,
@@ -39,8 +40,20 @@ const EDITOR_TOOL = 'str_replace_based_edit_tool'
 
 function fieldsOf(subagent: Subagent | null): SubagentFields {
   return subagent
-    ? { description: subagent.description, model: subagent.model, tools: [...subagent.tools], prompt: subagent.prompt }
-    : { description: '', model: null, tools: [...SUBAGENT_TOOLS], prompt: '' }
+    ? {
+        description: subagent.description,
+        model: subagent.model,
+        writes: subagent.writes,
+        tools: [...subagent.tools],
+        prompt: subagent.prompt,
+      }
+    : {
+        description: '',
+        model: null,
+        writes: false,
+        tools: SUBAGENT_TOOLS.filter((tool) => !WRITING_TOOLS.includes(tool)),
+        prompt: '',
+      }
 }
 
 /** Tools compared as a set, in the one order the checkboxes list them. */
@@ -49,6 +62,7 @@ function sameFields(left: SubagentFields, right: SubagentFields): boolean {
   return (
     left.description === right.description &&
     left.model === right.model &&
+    left.writes === right.writes &&
     left.prompt === right.prompt &&
     tools(left.tools) === tools(right.tools)
   )
@@ -100,6 +114,14 @@ function toggleTool(tool: string, on: boolean) {
   fields.tools = on ? [...fields.tools.filter((entry) => entry !== tool), tool] : fields.tools.filter((entry) => entry !== tool)
 }
 
+/** Turned off, it takes the tools that need it along: the API refuses `bash` without it. */
+function toggleWrites(on: boolean) {
+  fields.writes = on
+  if (!on) {
+    fields.tools = fields.tools.filter((tool) => !WRITING_TOOLS.includes(tool))
+  }
+}
+
 function restoreDefault() {
   const shipped = props.subagent?.default
   if (shipped) {
@@ -116,6 +138,7 @@ async function save() {
   const written: SubagentFields = {
     description: fields.description.trim(),
     model: fields.model,
+    writes: fields.writes,
     tools: SUBAGENT_TOOLS.filter((tool) => fields.tools.includes(tool)),
     prompt: fields.prompt.trim(),
   }
@@ -217,16 +240,31 @@ async function remove() {
 
       <fieldset class="tools">
         <legend class="legend">{{ t('agents.subagentTools') }}</legend>
+        <label class="writes">
+          <input
+            type="checkbox"
+            :checked="fields.writes"
+            :disabled="pending"
+            @change="toggleWrites(($event.target as HTMLInputElement).checked)"
+          >
+          <span>{{ t('agents.subagentWrites') }}</span>
+        </label>
         <div class="tool-row">
-          <label v-for="tool in SUBAGENT_TOOLS" :key="tool" class="tool">
+          <label
+            v-for="tool in SUBAGENT_TOOLS"
+            :key="tool"
+            class="tool"
+            :class="{ off: WRITING_TOOLS.includes(tool) && !fields.writes }"
+          >
             <input
               type="checkbox"
               :checked="fields.tools.includes(tool)"
-              :disabled="pending"
+              :disabled="pending || (WRITING_TOOLS.includes(tool) && !fields.writes)"
               @change="toggleTool(tool, ($event.target as HTMLInputElement).checked)"
             >
             <span class="mono">{{ tool }}</span>
-            <span v-if="tool === EDITOR_TOOL" class="tool-note">{{ t('agents.viewOnly') }}</span>
+            <span v-if="tool === EDITOR_TOOL && !fields.writes" class="tool-note">{{ t('agents.viewOnly') }}</span>
+            <span v-else-if="WRITING_TOOLS.includes(tool) && !fields.writes" class="tool-note">{{ t('agents.needsWrites') }}</span>
           </label>
         </div>
       </fieldset>
@@ -383,6 +421,29 @@ async function remove() {
 .tool-note {
   color: var(--faint);
   font-size: var(--text-2xs);
+}
+
+/* A tool the switch above has not allowed: there, but not to be picked. */
+.tool.off {
+  color: var(--faint);
+  cursor: not-allowed;
+}
+
+.writes {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  justify-self: start;
+  color: var(--ink-soft);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.writes input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
 }
 
 .prompt-field {

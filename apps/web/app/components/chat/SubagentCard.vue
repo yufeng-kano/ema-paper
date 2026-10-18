@@ -3,11 +3,12 @@
  * A `subagent` call as a card rather than a step (docs/web.md § The agent panel): the
  * subagent's name in mono, its task, then how many steps it has taken, how long it has run
  * and what it does now — or, once done, that it reported back. Opening it shows its own
- * steps (from its `parent` events while it runs, from the result's record once stored) and
- * the report it handed the agent.
+ * steps (from its `parent` events while it runs, from the result's record once stored) —
+ * a write's diff card with **Revert** among them, as in a group — and the report it handed
+ * the agent.
  */
 import { parseResultMarkdown } from '~/lib/markdown'
-import type { SubagentView } from '~/lib/thread'
+import type { CardState, EditCard, SubagentView } from '~/lib/thread'
 
 const props = defineProps<{
   card: SubagentView
@@ -15,9 +16,17 @@ const props = defineProps<{
   /** When the panel first saw it running; with `now`, how long it has run so far. */
   startedAt: number | null
   now: number
+  openSteps: ReadonlySet<string>
+  cardState: (card: EditCard) => CardState
+  /** A turn is unfinished: the revisions route refuses a revert under one. */
+  locked: boolean
 }>()
 
-const emit = defineEmits<{ toggle: [] }>()
+const emit = defineEmits<{
+  toggle: []
+  'toggle-step': [key: string]
+  'toggle-edit': [card: EditCard]
+}>()
 
 const { t } = useI18n()
 const labels = useStepLabels()
@@ -80,7 +89,15 @@ const reportBlocks = computed(() =>
     <div v-if="open" class="inside">
       <template v-for="step in card.steps" :key="step.key">
         <p v-if="step.type === 'note'" class="note">{{ step.text }}</p>
-        <div v-else class="row"><ChatStepLine :step="step" /></div>
+        <ChatStepRow
+          v-else-if="step.type === 'tool'"
+          :step="step"
+          :open="openSteps.has(step.key)"
+          :card-state="cardState"
+          :locked="locked"
+          @toggle="emit('toggle-step', step.key)"
+          @toggle-edit="emit('toggle-edit', $event)"
+        />
       </template>
       <div v-if="card.report" class="report" :class="{ failed: card.status === 'error' }">
         <span class="report-label">{{ t('chat.subagentReport') }}</span>
@@ -197,17 +214,6 @@ const reportBlocks = computed(() =>
   font-size: var(--text-xs);
   line-height: 1.5;
   overflow-wrap: anywhere;
-}
-
-.row {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  min-width: 0;
-  min-height: 26px;
-  padding: 2px var(--space-2);
-  color: var(--muted);
-  font-size: var(--text-xs);
 }
 
 .report {

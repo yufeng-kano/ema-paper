@@ -147,6 +147,59 @@ describe('buildThread', () => {
     expect(card.steps.map((step) => step.type)).toEqual(['tool', 'note'])
   })
 
+  it('gives a subagent’s writes their diff cards, live and from its record', () => {
+    const edit = {
+      event: 'edit',
+      tool_use_id: 'w',
+      path: 'files/a/doc.md',
+      command: 'str_replace',
+      commit: 'c1',
+      diff: '@@ -1 +1,2 @@\n x\n+y\n',
+      parent: 's',
+    }
+    const live = buildThread({
+      turns: [turn(false)],
+      messages: [message('user', [{ type: 'text', text: '/translate' }])],
+      groups: events(
+        { event: 'tool_use', id: 's', name: 'subagent', input: { name: 'translator', task: 'pages 1-2' } },
+        { event: 'tool_use', id: 'w', name: 'str_replace_based_edit_tool', input: EDIT, parent: 's' },
+        { event: 'tool_result', id: 'w', name: 'str_replace_based_edit_tool', is_error: false, output: 'ok', parent: 's' },
+        edit,
+      ),
+    })
+    const running = (live.items[1] as Extract<ThreadItem, { kind: 'subagent' }>).card
+    expect(running.steps[0]).toMatchObject({ type: 'tool', id: 'w', card: { toolUseId: 'w', commit: 'c1' }, added: 1 })
+
+    // Stored: the record's step id joins the replayed `edit`; a step from before ids has none.
+    const messages = [
+      message('user', [{ type: 'text', text: '/translate' }]),
+      message('assistant', [{ type: 'tool_use', id: 's', name: 'subagent', input: { name: 'translator', task: 'pages 1-2' } }]),
+      message('user', [
+        {
+          type: 'tool_result',
+          tool_use_id: 's',
+          content: '1 block.',
+          subagent: {
+            name: 'translator',
+            model: null,
+            steps: [
+              { type: 'tool', id: 'w', name: 'str_replace_based_edit_tool', input: EDIT, is_error: false },
+              { type: 'tool', name: 'str_replace_based_edit_tool', input: EDIT, is_error: false },
+            ],
+            tool_calls: 2,
+            elapsed_ms: 1_000,
+          },
+        },
+      ]),
+    ]
+    const stored = buildThread({ turns: [turn(true)], messages, groups: events(edit) })
+    const card = (stored.items[1] as Extract<ThreadItem, { kind: 'subagent' }>).card
+    expect(card.steps.map((step) => (step.type === 'tool' ? step.card?.commit ?? null : step.type))).toEqual([
+      'c1',
+      null,
+    ])
+  })
+
   it('opens a command’s answer with the skill it ran and reads the user’s message parts', () => {
     const messages = [
       message('user', [

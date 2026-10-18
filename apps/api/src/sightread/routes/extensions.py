@@ -229,7 +229,8 @@ class SubagentCreate(BaseModel):
     name: str
     description: str = ""
     model: str | None = None
-    tools: list[str] = list(SUBAGENT_TOOL_NAMES)
+    writes: bool = False
+    tools: list[str] = list(subagent_defs.DEFAULT_TOOLS)
     prompt: str
 
 
@@ -239,6 +240,7 @@ class SubagentUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
     model: str | None = None
+    writes: bool | None = None
     tools: list[str] | None = None
     prompt: str | None = None
 
@@ -247,6 +249,7 @@ def _subagent_values(source) -> dict:
     return {
         "description": source.description,
         "model": source.model or None,
+        "writes": bool(source.writes),
         "tools": list(subagent_defs.canonical_tools(source.tools or ())),
         "prompt": source.prompt,
     }
@@ -278,11 +281,16 @@ def _checked_subagent_values(values: dict, settings) -> dict:
     canonical = list(subagent_defs.canonical_tools(tools))
     if not canonical:
         raise ApiError(400, "invalid_request", "A subagent needs at least one tool")
+    writes = bool(values["writes"])
+    if "bash" in canonical and not writes:
+        # A shell can change anything: it is given only to a subagent that may.
+        raise ApiError(400, "invalid_request", "Only a subagent that can change files has bash")
     return {
         "description": _checked_text(
             values["description"], skill_defs.DESCRIPTION_MAX_CHARS, "description"
         ),
         "model": model,
+        "writes": writes,
         "tools": canonical,
         "prompt": _checked_text(
             values["prompt"], settings.system_prompt_max_chars, "prompt", required=True

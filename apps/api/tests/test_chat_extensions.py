@@ -295,11 +295,13 @@ def test_translate_takes_a_language_and_the_readers_instructions() -> None:
     rendered = skill_defs.render_skill(skill_defs.TRANSLATE.body, " zh-TW 術語保留英文 ")
     assert "Arguments: zh-TW 術語保留英文\n" in rendered
     assert "$ARGUMENTS" not in rendered
-    # Both halves are subagents the skill names, and they can only read.
+    # Both halves are subagents the skill names, and they write into the document themselves.
     names = {subagent.name: subagent for subagent in subagent_defs.BUILTIN_SUBAGENTS}
     for name in ("translator", "translation-checker"):
         assert f"`{name}`" in rendered
-        assert names[name].tools == ("str_replace_based_edit_tool",)
+        assert names[name].writes is True
+        assert names[name].tools == ("str_replace_based_edit_tool", "bash")
+    assert not subagent_defs.VERIFIER.writes and not subagent_defs.READER.writes
 
 
 async def test_skills_and_subagents_are_capped(make_client) -> None:
@@ -354,6 +356,28 @@ async def test_subagents_follow_the_skills_contract(signed_in) -> None:
         "/api/subagents", json={"name": "all-tools", "prompt": "Read."}, headers=CSRF_HEADERS
     )
     assert defaulted.json()["tools"] == ["view_page", "view_figure", "str_replace_based_edit_tool"]
+    assert defaulted.json()["writes"] is False
+    # The shell only for one that may change files: given with `writes`, refused without.
+    shell = await signed_in.put(
+        "/api/subagents/all-tools",
+        json={"writes": True, "tools": ["bash", "str_replace_based_edit_tool"]},
+        headers=CSRF_HEADERS,
+    )
+    assert shell.json()["writes"] is True
+    assert shell.json()["tools"] == ["str_replace_based_edit_tool", "bash"]
+    unshelled = await signed_in.put(
+        "/api/subagents/all-tools", json={"writes": False}, headers=CSRF_HEADERS
+    )
+    assert unshelled.status_code == 400
+    back = await signed_in.put(
+        "/api/subagents/all-tools",
+        json={
+            "writes": False,
+            "tools": ["view_page", "view_figure", "str_replace_based_edit_tool"],
+        },
+        headers=CSRF_HEADERS,
+    )
+    assert back.json()["writes"] is False
     for body in (
         {"name": "shell", "prompt": "x", "tools": ["bash"]},
         {"name": "nesting", "prompt": "x", "tools": ["subagent"]},
@@ -552,7 +576,8 @@ async def test_a_turn_runs_on_the_readers_prompt_with_the_catalogue_last(chat_cl
     assert "check-figures" not in catalogue and "mine-only" not in catalogue
     assert "- translate: " not in catalogue
     assert "- verifier: " in catalogue and "- reader: " in catalogue
-    assert "- translator: " in catalogue and "- translation-checker: " in catalogue
+    assert "- translator (changes files itself): " in catalogue
+    assert "- translation-checker (changes files itself): " in catalogue
 
 
 @respx.mock
@@ -692,6 +717,8 @@ async def test_a_subagent_works_alone_and_hands_back_its_report(chat_client, mon
     ]
     assert DOC_PATH in first["system"][0]["text"]
     assert first["system"][0]["text"].endswith(subagent_defs.VERIFIER.prompt)
+    assert f"{DOC_PATH}/doc.md" in first["system"][0]["text"]
+    assert subagent_defs.READ_ONLY in first["system"][0]["text"]
     assert first["system"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
     assert first["output_config"] == main[0]["output_config"]
     assert first["thinking"] == main[0]["thinking"]
@@ -720,14 +747,21 @@ async def test_a_subagent_works_alone_and_hands_back_its_report(chat_client, mon
     assert record["tool_calls"] == 3 and isinstance(record["elapsed_ms"], int)
     assert record["steps"] == [
         {"type": "note", "text": "Open the page first."},
-        {"type": "tool", "name": "view_page", "input": {"page": 1}, "is_error": False},
+        {"type": "tool", "id": "v1", "name": "view_page", "input": {"page": 1}, "is_error": False},
         {
             "type": "tool",
+            "id": "v2",
             "name": "str_replace_based_edit_tool",
             "input": {"command": "view", "path": doc},
             "is_error": False,
         },
-        {"type": "tool", "name": "str_replace_based_edit_tool", "input": write, "is_error": True},
+        {
+            "type": "tool",
+            "id": "w1",
+            "name": "str_replace_based_edit_tool",
+            "input": write,
+            "is_error": True,
+        },
     ]
 
     # Its events name the call that started it, and its report streams as no turn text.
@@ -743,6 +777,63 @@ async def test_a_subagent_works_alone_and_hands_back_its_report(chat_client, mon
     async with client.app.state.sessionmaker() as db:
         rows = (await db.execute(select(UsageLog).where(UsageLog.agent == "chat"))).scalars().all()
     assert len(rows) == 6 and all(row.turn_id is not None for row in rows)
+
+
+@respx.mock
+async def test_a_subagent_that_writes_edits_the_document_itself(chat_client) -> None:
+    client = chat_client
+    doc = f"{DOC_PATH}/doc.md"
+    write = {"command": "str_replace", "path": doc, "old_str": "3450", "new_str": "3.45"}
+    main, sub = stub_messages(
+        [
+            (
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "call",
+                        "name": "subagent",
+                        "input": {"name": "translator", "task": "Pages 1-1 into zh-TW."},
+                    }
+                ],
+                "tool_use",
+            ),
+            ([{"type": "text", "text": "Translated."}], "end_turn"),
+        ],
+        [
+            one_call("w1", "str_replace_based_edit_tool", write),
+            ([{"type": "text", "text": "1 block. Greedy → 貪婪"}], "end_turn"),
+        ],
+    )
+    conversation_id = await new_conversation(client)
+    await send(client, conversation_id, text="Translate page 1")
+    await _run_queued_turn(client)
+
+    thread = (await client.get(f"/api/conversations/{conversation_id}")).json()
+    assert thread["turns"][0]["status"] == "succeeded", thread["turns"]
+    # Told it may change files; no sandbox here, so no shell is offered.
+    first = sub[0]
+    assert [tool["name"] for tool in first["tools"]] == ["str_replace_based_edit_tool"]
+    assert subagent_defs.WRITES in first["system"][0]["text"]
+    assert "The shell is" not in first["system"][0]["text"]
+    # Its write is a revision of the document, like the agent's own.
+    written = sub[1]["messages"][2]["content"][0]
+    assert written["tool_use_id"] == "w1" and "is_error" not in written
+    markdown = (await client.get(f"/api/library/documents/{client.document_id}/content")).json()
+    assert "| Greedy | 3.45 |" in markdown["markdown"]
+    # Its `edit` names the call that started it: the panel draws the diff card in its card.
+    events = await replayed_events(client, conversation_id)
+    edit = next(data for name, data in events if name == "edit")
+    assert edit["tool_use_id"] == "w1" and edit["parent"] == "call" and edit["commit"]
+    record = thread["messages"][2]["content"][0]["subagent"]
+    assert record["steps"] == [
+        {
+            "type": "tool",
+            "id": "w1",
+            "name": "str_replace_based_edit_tool",
+            "input": write,
+            "is_error": False,
+        }
+    ]
 
 
 @respx.mock
@@ -873,12 +964,23 @@ def test_a_skill_renders_its_arguments() -> None:
 def test_the_subagent_records_bound_a_long_input() -> None:
     from sightread.jobs import chat_subagent
 
-    long_input = {"command": "view", "path": "x" * 5000}
-    bounded = chat_subagent._bounded_input(long_input)
+    # A long field is cut, so the step still reads as the call it was.
+    write = {"command": "str_replace", "path": "/workspace/doc.md", "new_str": "x" * 5000}
+    assert chat_subagent._bounded_input(write) == {
+        **write,
+        "new_str": "x" * chat_subagent.FIELD_MAX_CHARS,
+    }
+    # Too long even so: cut whole.
+    many = {str(index): "x" * 500 for index in range(50)}
+    bounded = chat_subagent._bounded_input(many)
     assert isinstance(bounded, str) and len(bounded) == chat_subagent.INPUT_MAX_CHARS
     assert chat_subagent._bounded_input({"page": 1}) == {"page": 1}
 
 
-def test_a_subagents_tools_are_the_read_only_ones_in_their_order() -> None:
+def test_a_subagents_tools_are_the_subagent_tools_in_their_order() -> None:
     named = ["bash", "str_replace_based_edit_tool", "skill", "view_page", "subagent", "view_page"]
-    assert subagent_defs.canonical_tools(named) == ("view_page", "str_replace_based_edit_tool")
+    assert subagent_defs.canonical_tools(named) == (
+        "view_page",
+        "str_replace_based_edit_tool",
+        "bash",
+    )

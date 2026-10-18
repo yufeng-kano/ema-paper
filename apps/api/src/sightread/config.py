@@ -137,7 +137,7 @@ class Settings(BaseSettings):
     # (docs/chat.md § Skills, § Subagents).
     chat_skills_max: int = 64
     chat_subagents_max: int = 32
-    chat_subagent_max_tool_calls: int = 30
+    chat_subagent_max_tool_calls: int = 1000
 
     # The sandbox runner (docs/sandbox.md). Empty URL = no sandbox: the chat agent runs
     # without its bash tool. The token is what api and worker present to the runner.

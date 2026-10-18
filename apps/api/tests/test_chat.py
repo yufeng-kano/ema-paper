@@ -886,7 +886,8 @@ async def test_a_cancelled_turn_blocks_deletion_until_the_worker_is_done(chattin
 
 
 def _round_ctx(image_budget: int = 32 << 20) -> SimpleNamespace:
-    """What `_run_tools` reads from its context: the round's and the turn's image budgets."""
+    """What `_run_tools` reads from its context: the round's and the turn's image budgets,
+    and the turn's writes in flight with the gate that starts them one at a time."""
     return SimpleNamespace(
         settings=SimpleNamespace(
             chat_image_round_max_bytes=image_budget,
@@ -894,6 +895,8 @@ def _round_ctx(image_budget: int = 32 << 20) -> SimpleNamespace:
             chat_page_image_max_pixels=1,
         ),
         image_spent=0,
+        writers={},
+        write_gate=asyncio.Lock(),
     )
 
 
@@ -1777,11 +1780,11 @@ async def test_the_deadline_waits_for_the_write_in_flight(monkeypatch) -> None:
             sandbox_start_timeout_seconds=0,
             sandbox_exec_grace_seconds=0,
         ),
-        writer=asyncio.ensure_future(slow_write()),
+        writers={asyncio.ensure_future(slow_write()): "str_replace_based_edit_tool"},
     )
     # The turn's deadline interrupted the loop while this write ran: it is waited for,
     # so its commit precedes the terminal event.
-    await chat_runner._settle_writer(ctx)
+    await chat_runner._settle_writers(ctx)
     assert done == ["w"]
 
 
@@ -2045,11 +2048,13 @@ async def test_a_shell_command_holds_the_workspace_lock(tmp_path, monkeypatch) -
         sandbox=object(),
         turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
         image_spent=0,
-        writer=None,
+        writers={},
+        write_gate=asyncio.Lock(),
     )
     tool_uses = [{"type": "tool_use", "id": "b1", "name": "bash", "input": {"command": "sleep"}}]
     running = asyncio.create_task(chat_runner._run_tools(ctx, tool_uses, set()))
-    await started.wait()
+    # Bounded: a run that fails before the command starts must fail the test, not hang it.
+    await asyncio.wait_for(started.wait(), 5)
 
     async def take_lock() -> None:
         async with workspace_lock(root):
@@ -2217,7 +2222,8 @@ async def test_a_shell_move_is_reconciled_before_the_lock_is_released(
         sessionmaker=Sessions(),
         turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
         image_spent=0,
-        writer=None,
+        writers={},
+        write_gate=asyncio.Lock(),
     )
     tool_uses = [{"type": "tool_use", "id": "b1", "name": "bash", "input": {"command": "mv a b"}}]
     await chat_runner._run_tools(ctx, tool_uses, set())
@@ -2283,6 +2289,39 @@ async def test_a_thread_for_a_document_deleted_underneath_is_a_404(chatting, mon
     assert created.status_code == 404, created.text
 
 
+async def test_the_turns_writes_run_one_at_a_time_and_none_starts_after_a_stop(
+    monkeypatch,
+) -> None:
+    stop = asyncio.Event()
+
+    async def cancelled(ctx) -> bool:
+        return stop.is_set()
+
+    monkeypatch.setattr(chat_runner, "_cancelled", cancelled)
+    ctx = SimpleNamespace(writers={}, write_gate=asyncio.Lock())
+    running: list[str] = []
+    done: list[str] = []
+
+    async def write(name: str) -> str:
+        running.append(name)
+        # The agent's own and every subagent's writes share the gate: never two at once.
+        assert running == [name]
+        await asyncio.sleep(0.01)
+        running.remove(name)
+        done.append(name)
+        return name
+
+    written = await asyncio.gather(
+        *(chat_runner.run_writer(ctx, "bash", lambda name=name: write(name)) for name in "abc")
+    )
+    assert written == ["a", "b", "c"] and done == ["a", "b", "c"]
+    assert ctx.writers == {}
+    stop.set()
+    with pytest.raises(chat_runner.TurnCancelled):
+        await chat_runner.run_writer(ctx, "bash", lambda: write("d"))
+    assert done == ["a", "b", "c"]
+
+
 async def test_the_writer_is_waited_for_through_the_runner_clients_grace() -> None:
     async def slow_write() -> str:
         await asyncio.sleep(0.3)
@@ -2296,9 +2335,9 @@ async def test_the_writer_is_waited_for_through_the_runner_clients_grace() -> No
             sandbox_start_timeout_seconds=0,
             sandbox_exec_grace_seconds=0.5,
         ),
-        writer=writer,
+        writers={writer: "str_replace_based_edit_tool"},
     )
-    await chat_runner._settle_writer(ctx)
+    await chat_runner._settle_writers(ctx)
     assert writer.done() and writer.result() == "committed"
 
 
@@ -2321,15 +2360,14 @@ async def test_a_writer_past_its_grace_is_killed_in_the_vm_and_waited_to_its_end
             sandbox_start_timeout_seconds=0,
             sandbox_exec_grace_seconds=0.1,
         ),
-        writer=writer,
-        writer_tool="bash",
+        writers={writer: "bash"},
         sandbox=FakeSandbox(),
         turn=SimpleNamespace(id="t", user_id=7),
         conversation=SimpleNamespace(session="s"),
     )
     # Past the grace: the command is killed where it runs, and the writer is still
     # waited for to its end — the turn is never finished over a write in flight.
-    await chat_runner._settle_writer(ctx)
+    await chat_runner._settle_writers(ctx)
     assert restarted == [(7, "s")]
     assert writer.done() and writer.result() == "committed"
 

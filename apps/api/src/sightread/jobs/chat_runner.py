@@ -13,7 +13,7 @@ import contextlib
 import logging
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -101,11 +101,13 @@ class TurnContext:
     # Encoded image bytes the turn's reads have returned so far, every round together
     # (docs/chat.md § Tools).
     image_spent: int = 0
-    # The mutating tool call in flight, if any: finished before the turn is, whatever
-    # ended the turn.
-    writer: asyncio.Future | None = None
-    # Which tool the writer runs: a shell command past its grace is killed in the VM.
-    writer_tool: str | None = None
+    # The mutating tool calls in flight — the agent's own or a subagent's — each with the
+    # tool it runs: every one is finished before the turn is, whatever ended the turn, and a
+    # shell command past its grace is killed in the VM.
+    writers: dict[asyncio.Future, str] = field(default_factory=dict)
+    # One write of the turn at a time, the agent's or any subagent's, each started only
+    # after a look for a Stop (docs/chat.md § Tools).
+    write_gate: asyncio.Lock = field(default_factory=asyncio.Lock)
     # One image decoded at a time per turn: a round of page reads never holds a raster
     # per read (docs/chat.md § Tools).
     decode_slot: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(1))
@@ -210,7 +212,7 @@ async def _load(
     # so an edit on the Agent page misses the cache once (docs/chat.md § Prompt caching).
     catalogue = chat_agent.render_catalogue(
         [(skill.name, skill.description) for skill in skills if skill.model_invocable],
-        [(subagent.name, subagent.description) for subagent in subagents],
+        [(subagent.name, subagent.description, subagent.writes) for subagent in subagents],
     )
     if catalogue is not None:
         system.append({"type": "text", "text": catalogue})
@@ -657,49 +659,13 @@ async def _run_tool_unguarded(
     name = block.get("name")
     tool_use_id = str(block.get("id"))
     tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
-    max_chars = ctx.settings.chat_tool_result_max_chars
-    author = f"{git.AGENT_AUTHOR_PREFIX}{ctx.conversation.id}"
 
     if tool_use_id in malformed:
         outcome = chat_tools.ToolOutcome(
             "The tool input was not valid JSON; send it again.", is_error=True
         )
-    elif name == "bash":
-        if ctx.sandbox is None:
-            outcome = chat_tools.ToolOutcome("No sandbox on this deployment.", is_error=True)
-        else:
-            # One shell at a time per user, through the command *and* its commit: two
-            # conversations' shells must never have the tree dirty together, or one's
-            # revision would carry the other's half-written files. The workspace lock
-            # is held across the command as well: a save or another conversation's
-            # editor landing on a file the command is writing would otherwise read and
-            # commit a half-written file (docs/chat.md § Tools).
-            async with (
-                shell_lock(ctx.paths.root),
-                workspace_lock(ctx.paths.root, recovering=True),
-            ):
-                # Marked for as long as the command may write: a worker that dies here
-                # leaves the mark, and so does a command the runner could not confirm
-                # over, and every host write is refused until a shell restart has
-                # confirmed the command dead and the tree is recorded — here, or by
-                # the recovery the next worker runs at start (docs/workspace.md
-                # § Revisions). `recovering`: this path is that recovery's peer.
-                mark_writing(ctx.paths.root, ctx.conversation.id, ctx.conversation.session)
-                unsettled = False
-                try:
-                    outcome = await _run_shell_command(ctx, tool_input, author, max_chars)
-                    unsettled = not outcome.settled
-                finally:
-                    if not unsettled:
-                        clear_writing(ctx.paths.root)
-    elif name == "str_replace_based_edit_tool":
-        outcome = await chat_tools.run_editor(
-            ctx.paths.root,
-            tool_input,
-            author,
-            max_chars=max_chars,
-            max_bytes=ctx.settings.content_max_bytes,
-        )
+    elif name in MUTATING_TOOLS:
+        outcome = await run_mutating(ctx, name, tool_input)
     elif name == "view_page":
         outcome = await chat_tools.view_page(
             ctx.paths,
@@ -727,6 +693,70 @@ async def _run_tool_unguarded(
     if admit is not None:
         outcome = admit(outcome)
     return await _report_tool(ctx, tool_use_id, name, outcome)
+
+
+async def run_mutating(ctx: TurnContext, name: str, tool_input: dict) -> chat_tools.ToolOutcome:
+    """A `bash` command or an editor call, the agent's own or a subagent's that may change
+    files: the shell under the user's shell and workspace locks with its writing marker, the
+    editor on the host, each write a revision (docs/chat.md § Tools)."""
+    max_chars = ctx.settings.chat_tool_result_max_chars
+    author = f"{git.AGENT_AUTHOR_PREFIX}{ctx.conversation.id}"
+    if name != "bash":
+        return await chat_tools.run_editor(
+            ctx.paths.root,
+            tool_input,
+            author,
+            max_chars=max_chars,
+            max_bytes=ctx.settings.content_max_bytes,
+        )
+    if ctx.sandbox is None:
+        return chat_tools.ToolOutcome("No sandbox on this deployment.", is_error=True)
+    # One shell at a time per user, through the command *and* its commit: two
+    # conversations' shells must never have the tree dirty together, or one's revision
+    # would carry the other's half-written files. The workspace lock is held across the
+    # command as well: a save or another conversation's editor landing on a file the
+    # command is writing would otherwise read and commit a half-written file (docs/chat.md
+    # § Tools).
+    async with (
+        shell_lock(ctx.paths.root),
+        workspace_lock(ctx.paths.root, recovering=True),
+    ):
+        # Marked for as long as the command may write: a worker that dies here leaves the
+        # mark, and so does a command the runner could not confirm over, and every host
+        # write is refused until a shell restart has confirmed the command dead and the tree
+        # is recorded — here, or by the recovery the next worker runs at start
+        # (docs/workspace.md § Revisions). `recovering`: this path is that recovery's peer.
+        mark_writing(ctx.paths.root, ctx.conversation.id, ctx.conversation.session)
+        unsettled = False
+        try:
+            outcome = await _run_shell_command(ctx, tool_input, author, max_chars)
+            unsettled = not outcome.settled
+        finally:
+            if not unsettled:
+                clear_writing(ctx.paths.root)
+    return outcome
+
+
+async def run_writer[Written](
+    ctx: TurnContext, name: str, start: Callable[[], Awaitable[Written]]
+) -> Written:
+    """One mutating call of the turn — the agent's own or a subagent's — started once every
+    write before it has finished, and only if no Stop came: Stop means after the *current*
+    write, whoever makes it. Shielded: the turn's deadline cancels the loop, not a shell
+    command or editor write in flight, which `run_turn` waits for before the terminal event;
+    so `start` reports its own result (docs/chat.md § Tools)."""
+    async with ctx.write_gate:
+        # A write whose caller was cancelled may still be running: it finishes first.
+        if ctx.writers:
+            await asyncio.wait(list(ctx.writers))
+        if await _cancelled(ctx):
+            raise TurnCancelled()
+        writer = asyncio.ensure_future(start())
+        ctx.writers[writer] = name
+        # Dropped when the writer is done, not when this await ends: a cancelled await
+        # leaves the writer running, and run_turn must still find it.
+        writer.add_done_callback(lambda done, ctx=ctx: ctx.writers.pop(done, None))
+        return await asyncio.shield(writer)
 
 
 def _load_skill(ctx: TurnContext, tool_input: dict) -> chat_tools.ToolOutcome:
@@ -919,22 +949,11 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
             if block.get("name") in MUTATING_TOOLS:
                 # Stop means after the *current* call: a write not yet started — the
                 # first of the round included — is not started once the user cancelled.
-                if await _cancelled(ctx):
-                    raise TurnCancelled()
-                # Shielded: the turn's deadline cancels the loop, not a shell command
-                # or editor write in flight, which run_turn waits for before the
-                # terminal event (docs/chat.md § Tools).
-                writer = asyncio.ensure_future(_run_tool(ctx, block, malformed))
-                ctx.writer = writer
-                ctx.writer_tool = block.get("name")
-                # Cleared when the writer is done, not when this await ends: a cancelled
-                # await leaves the writer running, and run_turn must still find it.
-                writer.add_done_callback(
-                    lambda done, ctx=ctx: (
-                        setattr(ctx, "writer", None) if ctx.writer is done else None
-                    )
+                results[index] = await run_writer(
+                    ctx,
+                    str(block.get("name")),
+                    lambda block=block: _run_tool(ctx, block, malformed),
                 )
-                results[index] = await asyncio.shield(writer)
 
     # A task group: when the writes stop on a cancel, the reads still running are
     # cancelled with them rather than left to finish a turn that is over.
@@ -1067,15 +1086,23 @@ async def _finish(
         await db.commit()
 
 
-async def _settle_writer(ctx: TurnContext) -> None:
-    """Wait for the mutating tool call the deadline interrupted: cancelling the loop does
-    not stop a shell command in the VM or an editor thread, and the terminal event must
-    not precede their commit. Past the grace a shell command is killed in the VM (its
+async def _settle_writers(ctx: TurnContext) -> None:
+    """Wait for every mutating tool call the end of the turn interrupted — the agent's own
+    or a subagent's (docs/chat.md § Tools): cancelling the loop does not stop a shell
+    command in the VM or an editor thread, and the terminal event must not precede their
+    commit."""
+    while pending := [writer for writer in ctx.writers if not writer.done()]:
+        writer = pending[0]
+        await _settle_writer(ctx, writer, ctx.writers.get(writer))
+        ctx.writers.pop(writer, None)
+
+
+async def _settle_writer(ctx: TurnContext, writer: asyncio.Future, tool: str | None) -> None:
+    """One writer, waited for. Past the grace a shell command is killed in the VM (its
     shell restarted) and the writer is then waited for to its end — every step of it is
     bounded on its own (the runner client's deadline, git's timeouts), so the wait is
     too — rather than the turn being finished over a write still in flight."""
-    writer = ctx.writer
-    if writer is None or writer.done():
+    if writer.done():
         return
     # The command's own timeout, the time the runner client allows a reply past it, and
     # the margin for the commit and reconciliation that follow (docs/chat.md § Tools).
@@ -1092,7 +1119,7 @@ async def _settle_writer(ctx: TurnContext) -> None:
         logger.warning("turn %s: the writer outlived its grace; waiting it out", ctx.turn.id)
     except Exception:  # noqa: BLE001 - the writer's own failure is its result
         return
-    if ctx.writer_tool == "bash" and ctx.sandbox is not None:
+    if tool == "bash" and ctx.sandbox is not None:
         # The command, if it is what runs on: ended where it runs, and the exec returns.
         with contextlib.suppress(Exception):
             await ctx.sandbox.restart(ctx.turn.user_id, ctx.conversation.session)
@@ -1118,13 +1145,13 @@ async def run_turn(
         async with asyncio.timeout(settings.chat_turn_timeout_seconds):
             await _loop(ctx)
     except TurnCancelled:
-        await _settle_writer(ctx)
+        await _settle_writers(ctx)
         await _finish(sessionmaker, turn_id, status="cancelled", error="cancelled")
     except TurnFailed as exc:
-        await _settle_writer(ctx)
+        await _settle_writers(ctx)
         await _finish(sessionmaker, turn_id, status="failed", error=str(exc))
     except TimeoutError:
-        await _settle_writer(ctx)
+        await _settle_writers(ctx)
         await _finish(sessionmaker, turn_id, status="failed", error="the turn timed out")
     except PaymentRequired:
         await _finish(
@@ -1136,14 +1163,14 @@ async def run_turn(
         await _finish(sessionmaker, turn_id, status="failed", error=str(exc))
     except asyncio.CancelledError:
         # A worker shutting down: the write in flight finishes and commits first.
-        await _settle_writer(ctx)
+        await _settle_writers(ctx)
         raise
     except Exception:
         # A read's own failure (its cancel check lost the database) cancels the round
         # around a shielded writer: that write finishes and commits before the terminal
         # event, like a timeout's (docs/chat.md § Tools).
         logger.exception("turn %s failed unexpectedly", turn_id)
-        await _settle_writer(ctx)
+        await _settle_writers(ctx)
         await _finish(sessionmaker, turn_id, status="failed", error="internal error")
     else:
         await _finish(sessionmaker, turn_id, status="succeeded")

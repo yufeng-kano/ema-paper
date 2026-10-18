@@ -558,7 +558,10 @@ class Subagent(Base):
     description: Mapped[str] = mapped_column(Text, default="")
     # NULL: the conversation's model.
     model: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    # A subset of the read-only tools (agents/subagents.py), in their canonical order.
+    # Whether it may change files: the editor's writes and the shell.
+    writes: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    # A subset of the subagent tools (agents/chat.py), in their canonical order; `bash`
+    # only with `writes`.
     tools: Mapped[list] = mapped_column(JSON_COLUMN, default=list)
     prompt: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)

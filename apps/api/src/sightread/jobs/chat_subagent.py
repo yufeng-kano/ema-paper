@@ -2,10 +2,12 @@
 § Subagents).
 
 It is the turn's loop in miniature — the same request shape, the same streaming, cancel
-polling and billing (`chat_runner`'s own) — with three differences that are the point of
+polling and billing (`chat_runner`'s own) — with two differences that are the point of
 it: its messages are never stored (what the conversation keeps is the call and its
-result), its tools only read, and its events carry `parent`, the id of the call that
-started it, so the panel can draw its steps inside its card.
+result), and its events carry `parent`, the id of the call that started it, so the panel
+can draw its steps — and the diff cards of a subagent that writes — inside its card. Its
+tools are the subset it was given; it writes only if it may, through the agent's own
+paths, one write of the turn at a time (`chat_runner.run_writer`).
 """
 
 from __future__ import annotations
@@ -28,7 +30,11 @@ logger = logging.getLogger(__name__)
 STEPS_MAX = 200
 NOTE_MAX_CHARS = 600
 INPUT_MAX_CHARS = 2000
+# A long text field of an input — a write's new text — as the record keeps it: the step's
+# label needs the command and the path, and its diff comes from the `edit` event.
+FIELD_MAX_CHARS = 200
 READ_ONLY = "This subagent can only read: the editor answers `view` here."
+EDITOR = "str_replace_based_edit_tool"
 IMAGE_RUN_BUDGET_SPENT = "This subagent's image budget is spent; report with what you have seen."
 NO_REPORT = "The subagent finished without a report."
 
@@ -66,12 +72,23 @@ class _ImageBudget:
 
 
 def _bounded_input(value: object) -> object:
-    """A tool call's input as the record keeps it: as it was, unless it is long."""
+    """A tool call's input as the record keeps it: as it was, unless it is long — then with
+    its long text fields cut, so the step still reads as what it did, and cut whole only
+    when that is not enough."""
     try:
         encoded = json.dumps(value, ensure_ascii=False)
     except (TypeError, ValueError):
         return {}
-    return value if len(encoded) <= INPUT_MAX_CHARS else encoded[:INPUT_MAX_CHARS]
+    if len(encoded) <= INPUT_MAX_CHARS:
+        return value
+    if isinstance(value, dict):
+        cut = {
+            key: field[:FIELD_MAX_CHARS] if isinstance(field, str) else field
+            for key, field in value.items()
+        }
+        if len(json.dumps(cut, ensure_ascii=False)) <= INPUT_MAX_CHARS:
+            return cut
+    return encoded[:INPUT_MAX_CHARS]
 
 
 async def _run_one(
@@ -106,7 +123,10 @@ async def _run_one(
         return await chat_tools.view_figure(
             ctx.paths, tool_input, max_bytes=ctx.settings.chat_image_round_max_bytes
         )
-    # The editor, for `view` alone: a subagent reports, the agent edits (docs/chat.md
+    if _writes(definition, block):
+        # The agent's own paths: a revision per write, the shell under the user's locks.
+        return await chat_runner.run_mutating(ctx, str(name), tool_input)
+    # The editor, for `view` alone, to a subagent that may not change files (docs/chat.md
     # § Subagents).
     if tool_input.get("command") != "view":
         return chat_tools.ToolOutcome(READ_ONLY, is_error=True)
@@ -116,6 +136,17 @@ async def _run_one(
         f"{git.AGENT_AUTHOR_PREFIX}{ctx.conversation.id}",
         max_chars=ctx.settings.chat_tool_result_max_chars,
         max_bytes=ctx.settings.content_max_bytes,
+    )
+
+
+def _writes(definition: subagent_defs.ResolvedSubagent, block: dict) -> bool:
+    """A call that may change files: the shell, or an editor command other than `view`, of a
+    subagent that may change files."""
+    if not definition.writes:
+        return False
+    tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
+    return block.get("name") == "bash" or (
+        block.get("name") == EDITOR and tool_input.get("command") != "view"
     )
 
 
@@ -146,50 +177,90 @@ async def _run_tools(
     steps_by_id: dict[str, dict],
     budget: _ImageBudget,
 ) -> list[dict]:
-    """One round of the run's reads, together, at most as many at a time as the turn's,
-    each looking for a Stop before it starts; the results in the order of the calls."""
+    """One round of the run's calls, the results in the order of the calls. Reads run
+    together, at most as many at a time as the turn's, each looking for a Stop before it
+    starts; writes run one after another, each waiting its turn with every other write of
+    the turn and started only if no Stop came (docs/chat.md § Tools)."""
     results: dict[int, dict] = {}
     slots = asyncio.Semaphore(chat_runner.READ_CONCURRENCY)
+    stopped = asyncio.Event()
     budget.start_round()
 
-    async def one(index: int, block: dict) -> None:
-        async with slots:
-            if await chat_runner._cancelled(ctx):
-                # Nothing of a run writes, so a Stop raises at once: there is no write
-                # in flight to wait for.
-                raise chat_runner.TurnCancelled()
-            outcome = budget.refusal() or await _run_one_guarded(ctx, definition, block, malformed)
-            outcome = budget.admit(outcome)
-            tool_use_id = str(block.get("id"))
-            summary = outcome.content if isinstance(outcome.content, str) else "(image)"
+    async def report(block: dict, outcome: chat_tools.ToolOutcome) -> dict:
+        tool_use_id = str(block.get("id"))
+        summary = outcome.content if isinstance(outcome.content, str) else "(image)"
+        await chat_runner._emit(
+            ctx,
+            chat_events.TOOL_RESULT,
+            {
+                "id": tool_use_id,
+                "name": block.get("name"),
+                "is_error": outcome.is_error,
+                "output": summary,
+                "parent": parent,
+            },
+        )
+        if outcome.edit is not None:
+            # The viewer reloads on it, and the panel joins it to the step's diff card.
             await chat_runner._emit(
                 ctx,
-                chat_events.TOOL_RESULT,
-                {
-                    "id": tool_use_id,
-                    "name": block.get("name"),
-                    "is_error": outcome.is_error,
-                    "output": summary,
-                    "parent": parent,
-                },
+                chat_events.EDIT,
+                {**outcome.edit, "tool_use_id": tool_use_id, "parent": parent},
             )
-            if tool_use_id in steps_by_id:
-                steps_by_id[tool_use_id]["is_error"] = outcome.is_error
-            result: dict = {
-                "type": "tool_result",
-                "tool_use_id": tool_use_id,
-                "content": outcome.content,
-            }
-            if outcome.is_error:
-                result["is_error"] = True
-            results[index] = result
+        if tool_use_id in steps_by_id:
+            steps_by_id[tool_use_id]["is_error"] = outcome.is_error
+        result: dict = {
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "content": outcome.content,
+        }
+        if outcome.is_error:
+            result["is_error"] = True
+        return result
 
+    async def reads() -> None:
+        async def one(index: int, block: dict) -> None:
+            async with slots:
+                # Noted, not raised, as the turn's own reads do: a raise here would leave
+                # the reads beside it running while the run ends.
+                if stopped.is_set() or await chat_runner._cancelled(ctx):
+                    stopped.set()
+                    return
+                outcome = budget.refusal() or await _run_one_guarded(
+                    ctx, definition, block, malformed
+                )
+                results[index] = await report(block, budget.admit(outcome))
+
+        await asyncio.gather(
+            *(
+                one(index, block)
+                for index, block in enumerate(tool_uses)
+                if not _writes(definition, block)
+            )
+        )
+
+    async def writes() -> None:
+        async def write(block: dict) -> dict:
+            # Reported inside the shielded writer: an `edit` the deadline interrupted is
+            # still announced before the terminal event.
+            return await report(block, await _run_one_guarded(ctx, definition, block, malformed))
+
+        for index, block in enumerate(tool_uses):
+            if _writes(definition, block):
+                results[index] = await chat_runner.run_writer(
+                    ctx, str(block.get("name")), lambda block=block: write(block)
+                )
+
+    # A task group: when the writes stop on a cancel, the reads still running are cancelled
+    # with them rather than left to finish a run that is over.
     try:
         async with asyncio.TaskGroup() as group:
-            for index, block in enumerate(tool_uses):
-                group.create_task(one(index, block))
+            group.create_task(reads())
+            group.create_task(writes())
     except* chat_runner.TurnCancelled:
         raise chat_runner.TurnCancelled() from None
+    if stopped.is_set():
+        raise chat_runner.TurnCancelled()
     return [results[index] for index in range(len(tool_uses))]
 
 
@@ -210,14 +281,23 @@ async def run_subagent(
 
     started = time.monotonic()
     model = definition.model or ctx.model
+    # The shell only to one that may change files, and only where there is a sandbox: a
+    # tool the harness cannot run is never offered (docs/chat.md § Subagents).
+    shell = definition.writes and "bash" in definition.tools and ctx.sandbox is not None
     system = [
         {
             "type": "text",
-            "text": subagent_defs.render_system(definition.prompt, ctx.facts),
+            "text": subagent_defs.render_system(
+                definition.prompt, ctx.facts, writes=definition.writes, shell=shell
+            ),
             "cache_control": {"type": "ephemeral", "ttl": chat_agent.CACHE_TTL},
         }
     ]
-    tools = [tool for tool in chat_agent.SUBAGENT_TOOLS if tool["name"] in definition.tools]
+    tools = [
+        tool
+        for tool in chat_agent.SUBAGENT_TOOLS
+        if tool["name"] in definition.tools and (tool["name"] != "bash" or shell)
+    ]
     messages: list[dict] = [{"role": "user", "content": [{"type": "text", "text": task.strip()}]}]
     steps: list[dict] = []
     calls = 0
@@ -288,6 +368,8 @@ async def run_subagent(
             elif block.get("type") == "tool_use":
                 step = {
                     "type": "tool",
+                    # What joins the step to its `edit` event, and so to its diff card.
+                    "id": str(block.get("id")),
                     "name": block.get("name"),
                     "input": _bounded_input(block.get("input")),
                     "is_error": None,

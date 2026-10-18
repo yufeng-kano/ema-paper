@@ -30,6 +30,7 @@ Canonical project rules (`.rule`; AGENTS.md / CLAUDE.md symlink here). This file
 
 - Check existing files and `git status` before editing; never overwrite changes you didn't make.
 - Before delivering: `uv run ruff check` + `uv run pytest` (api), `pnpm typecheck` + `pnpm lint` + `pnpm test` (web), `docker compose config` when compose files changed.
+- The api tests need Linux (`os.O_PATH`, `/proc/self/fd`): on macOS run them in a Linux container (`ghcr.io/astral-sh/uv:python3.12-bookworm` with `poppler-utils` and `git`). Bound every test run with `timeout` and keep its output in view; a hung test otherwise runs unseen for hours.
 
 ## Real data only
 

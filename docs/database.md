@@ -161,10 +161,13 @@ skills           id PK, user_id FK, name, description TEXT, argument_hint, body 
                  -- built-in under the built-in's name; built-ins themselves live in code
                  -- and deleting an edit restores the built-in (chat.md § Skills)
 subagents        id PK, user_id FK, name, description TEXT, model NULL,
-                 tools JSONB, prompt TEXT, created_at, updated_at
+                 writes BOOL DEFAULT false, tools JSONB, prompt TEXT,
+                 created_at, updated_at
                  UNIQUE (user_id, name)
                  -- the same for subagents; `model` NULL = the conversation's model,
-                 -- `tools` a subset of the read-only tools (chat.md § Subagents)
+                 -- `writes` whether it may change files, `tools` a subset of
+                 -- view_page, view_figure, the editor and bash, bash only with
+                 -- `writes` (chat.md § Subagents)
 chat_attachments id UUID PK, user_id FK, name, kind image|text, media_type, size_bytes,
                  chars NULL, created_at
                  INDEX (user_id, created_at)

@@ -13,7 +13,7 @@ from .parse import BBOX_FORMAT_YXYX
 
 # Bumped when the prompt or the tool contract changes what a conversation does. Chat has
 # no dedup cache; the number is bookkeeping for the registry (docs/agents.md).
-PIPELINE_VERSION = 3
+PIPELINE_VERSION = 4
 
 # Anthropic-defined tools carry no schema of their own (docs/chat.md § Tools). The order
 # is part of the cache prefix and never changes. The custom tools are strict: their schemas
@@ -78,9 +78,10 @@ SUBAGENT_TOOL = {
     "name": "subagent",
     "description": (
         "Start one of the user's subagents, by its name as the system prompt's catalogue "
-        "lists it, on one task. It works alone, in a context of its own, can only read, and "
-        "answers with a report. Several started in one round work at the same time. Give it "
-        "everything it needs in `task`: it sees nothing of this conversation."
+        "lists it, on one task. It works alone, in a context of its own, and answers with a "
+        "report; one the catalogue says changes files makes its own edits. Several started "
+        "in one round work at the same time. Give it everything it needs in `task`: it sees "
+        "nothing of this conversation."
     ),
     "input_schema": {
         "type": "object",
@@ -102,9 +103,10 @@ TOOLS: tuple[dict, ...] = (
     SUBAGENT_TOOL,
 )
 TOOL_NAMES: tuple[str, ...] = tuple(tool["name"] for tool in TOOLS)
-# What a subagent may be given: the tools that only read (docs/chat.md § Subagents). The
-# editor among them answers `view` only.
-SUBAGENT_TOOLS: tuple[dict, ...] = (VIEW_PAGE_TOOL, VIEW_FIGURE_TOOL, EDITOR_TOOL)
+# What a subagent may be given (docs/chat.md § Subagents). The editor answers `view` only
+# to one that may not change files, and `bash` is given only to one that may. `bash` comes
+# last, so the tools of a subagent without it are the prefix they always were.
+SUBAGENT_TOOLS: tuple[dict, ...] = (VIEW_PAGE_TOOL, VIEW_FIGURE_TOOL, EDITOR_TOOL, BASH_TOOL)
 SUBAGENT_TOOL_NAMES: tuple[str, ...] = tuple(tool["name"] for tool in SUBAGENT_TOOLS)
 
 # Without the sandbox the bash tool is not declared at all: a tool the harness cannot
@@ -213,22 +215,25 @@ Instructions the user keeps for kinds of task. When the task at hand matches one
 """
 CATALOGUE_SUBAGENTS = """# Subagents
 
-Helpers you can start with the `subagent` tool. Each works alone on the task you give it, can only read, and reports back; you make any edits. Start one when its description fits and the work is large or splits into parts that can run at the same time:
+Helpers you can start with the `subagent` tool. Each works alone on the task you give it and reports back. One marked as changing files makes its own edits: leave that work to it rather than redoing it. The others only read; you make any edits their reports call for. Start one when its description fits and the work is large or splits into parts that can run at the same time:
 """
+CHANGES_FILES = " (changes files itself)"
 
 
 def render_catalogue(
-    skills: Iterable[tuple[str, str]], subagents: Iterable[tuple[str, str]]
+    skills: Iterable[tuple[str, str]], subagents: Iterable[tuple[str, str, bool]]
 ) -> str | None:
-    """The system prompt's last block: the skills the agent may load and the subagents it
-    may start, as `(name, description)` pairs (docs/chat.md § Skills, § Subagents). None
-    when there is neither, so a reader with nothing to list sends no block at all."""
+    """The system prompt's last block: the skills the agent may load, as `(name,
+    description)` pairs, and the subagents it may start, as `(name, description, writes)`
+    (docs/chat.md § Skills, § Subagents). None when there is neither, so a reader with
+    nothing to list sends no block at all."""
     sections = []
     listed_skills = [f"- {name}: {description.strip() or name}" for name, description in skills]
     if listed_skills:
         sections.append(CATALOGUE_SKILLS + "\n".join(listed_skills))
     listed_subagents = [
-        f"- {name}: {description.strip() or name}" for name, description in subagents
+        f"- {name}{CHANGES_FILES if writes else ''}: {description.strip() or name}"
+        for name, description, writes in subagents
     ]
     if listed_subagents:
         sections.append(CATALOGUE_SUBAGENTS + "\n".join(listed_subagents))

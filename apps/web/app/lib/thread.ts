@@ -357,18 +357,10 @@ export function buildThread(input: ThreadInput): Thread {
           if (step.type === 'note') {
             steps.push({ type: 'note', key, text: step.text })
           } else {
-            steps.push({
-              type: 'tool',
-              key,
-              id: key,
-              name: step.name,
-              step: readStep(step.name, step.input),
-              status: step.is_error ? 'error' : 'ok',
-              output: null,
-              command: step.name === 'bash' ? lineOf(step.input.command) : null,
-              card: null,
-              added: null,
-            })
+            // The record's status is the run's own; a step of a record from before ids has
+            // no edit to join (docs/chat.md § Subagents).
+            const status = step.is_error ? 'error' : 'ok'
+            steps.push({ ...toolStep(step.id ?? key, step.name, step.input, key), status })
           }
         })
       } else if (group) {
@@ -378,18 +370,7 @@ export function buildThread(input: ThreadInput): Thread {
         )
         own.forEach((event, index) => {
           if (event.event === 'tool_use') {
-            steps.push({
-              type: 'tool',
-              key: `${prefix}-sub-${id}-${event.id}`,
-              id: event.id,
-              name: event.name,
-              step: readStep(event.name, event.input),
-              status: statusOf(event.id),
-              output: results.get(event.id)?.output ?? null,
-              command: event.name === 'bash' ? lineOf(event.input.command) : null,
-              card: null,
-              added: null,
-            })
+            steps.push(toolStep(event.id, event.name, event.input, `${prefix}-sub-${id}-${event.id}`))
           } else if (event.event === 'thinking' && event.text.trim()) {
             steps.push({ type: 'note', key: `${prefix}-sub-${id}-note-${index}`, text: event.text.trim() })
           }
