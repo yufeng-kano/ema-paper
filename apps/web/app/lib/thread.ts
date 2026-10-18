@@ -113,7 +113,6 @@ export type ThreadItem =
   | { kind: 'text'; key: string; text: string; copy: boolean }
   | { kind: 'steps'; key: string; turnId: string; steps: StepItem[]; live: boolean }
   | { kind: 'subagent'; key: string; card: SubagentView }
-  | { kind: 'changes'; key: string; turnId: string; cards: EditCard[]; added: number }
   | { kind: 'error'; key: string; text: string }
   | { kind: 'cancelled'; key: string }
   | { kind: 'working'; key: string }
@@ -499,17 +498,6 @@ export function buildThread(input: ThreadInput): Thread {
           flat[index] = { ...entry, copy: true }
           break
         }
-      }
-      // One card sums up what the turn changed, and undoes it all.
-      const cards = flat.flatMap((entry) => (entry.kind === 'step' && entry.item.type === 'tool' && entry.item.card?.commit ? [entry.item.card] : []))
-      if (cards.length) {
-        flat.push({
-          kind: 'changes',
-          key: `${prefix}-changes`,
-          turnId,
-          cards,
-          added: cards.reduce((total, card) => total + addedLines(card.lines), 0),
-        })
       }
     }
 

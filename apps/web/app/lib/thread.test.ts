@@ -47,7 +47,7 @@ describe('buildThread', () => {
     )
     const { items, liveTurns } = buildThread({ turns: [turn(true)], messages, groups })
     expect(liveTurns).toEqual([])
-    expect(kinds(items)).toEqual(['user', 'text', 'steps', 'text', 'changes'])
+    expect(kinds(items)).toEqual(['user', 'text', 'steps', 'text'])
     const steps = items[2] as Extract<ThreadItem, { kind: 'steps' }>
     expect(steps.live).toBe(false)
     expect(steps.steps.map((step) => step.type)).toEqual(['tool', 'note', 'tool'])
@@ -59,7 +59,6 @@ describe('buildThread', () => {
     expect(edit.type === 'tool' && edit.added).toBe(1)
     expect((items[3] as Extract<ThreadItem, { kind: 'text' }>).copy).toBe(true)
     expect((items[1] as Extract<ThreadItem, { kind: 'text' }>).copy).toBe(false)
-    expect(items[4]).toMatchObject({ kind: 'changes', added: 1 })
   })
 
   it('shows a live turn from its events, the trailing group in flight', () => {

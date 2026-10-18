@@ -1,5 +1,5 @@
 import type { IconName } from '~/lib/icons'
-import { countKinds, splitDuration, type Step, type StepKind } from '~/lib/steps'
+import { basename, countKinds, splitDuration, type Step, type StepKind } from '~/lib/steps'
 import type { StepItem } from '~/lib/thread'
 
 /** The glyph each kind of step is drawn with. */
@@ -19,6 +19,16 @@ const ICONS: Record<StepKind, IconName> = {
   tool: 'terminal',
 }
 
+/** The document's own files, named for what they are: the workspace's file names are the
+ *  agent's business, not the reader's (docs/web.md § The agent panel). */
+const OWN_FILES: Record<string, string> = {
+  'doc.md': 'chat.files.document',
+  'notes.md': 'chat.files.notes',
+}
+
+/** The kinds whose target is a file. */
+const FILE_KINDS: ReadonlySet<StepKind> = new Set(['read', 'count', 'edit', 'create'])
+
 /**
  * A step's words, through the catalog (docs/web.md § The agent panel): its verb, the detail
  * after its target, a group's summary and the line a live group shows for the step in
@@ -29,6 +39,18 @@ export function useStepLabels() {
 
   function icon(kind: StepKind): IconName {
     return ICONS[kind]
+  }
+
+  /** The reader's word for one of the document's own files; null for any other file. */
+  function ownFile(path: string): string | null {
+    const key = OWN_FILES[basename(path)]
+    return key ? t(key) : null
+  }
+
+  /** A step's target as the line draws it; `own` is a word, not a name, so not in mono. */
+  function target(step: Step): { text: string; own: boolean } {
+    const own = FILE_KINDS.has(step.kind) ? ownFile(step.target) : null
+    return { text: own ?? step.target, own: own !== null }
   }
 
   function verb(step: Step): string {
@@ -50,7 +72,7 @@ export function useStepLabels() {
       return t('chat.stepLastLines', { n: step.last })
     }
     if (step.file) {
-      return t('chat.stepInFile', { file: step.file })
+      return t('chat.stepInFile', { file: ownFile(step.file) ?? step.file })
     }
     return ''
   }
@@ -67,7 +89,7 @@ export function useStepLabels() {
 
   /** The step in flight, as the live group's summary says it. */
   function doing(step: Step): string {
-    return t(`chat.doing.${step.kind}`, { target: step.target, page: step.page ?? '?' })
+    return t(`chat.doing.${step.kind}`, { target: target(step).text, page: step.page ?? '?' })
   }
 
   function duration(ms: number): string {
@@ -75,5 +97,5 @@ export function useStepLabels() {
     return minutes ? t('chat.durationMinutes', { m: minutes, s: seconds }) : t('chat.durationSeconds', { s: seconds })
   }
 
-  return { icon, verb, detail, summary, doing, duration }
+  return { icon, ownFile, target, verb, detail, summary, doing, duration }
 }

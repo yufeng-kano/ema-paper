@@ -7,7 +7,7 @@
 import { basename } from '~/lib/steps'
 import type { CardState, EditCard } from '~/lib/thread'
 
-defineProps<{
+const props = defineProps<{
   card: EditCard
   state: CardState
   /** A turn is unfinished: the revisions route refuses a revert under one. */
@@ -17,6 +17,9 @@ defineProps<{
 const emit = defineEmits<{ toggle: [] }>()
 
 const { t } = useI18n()
+const labels = useStepLabels()
+
+const ownFile = computed(() => labels.ownFile(props.card.path))
 </script>
 
 <template>
@@ -32,7 +35,8 @@ const { t } = useI18n()
     <div class="card-foot">
       <span class="card-state">
         {{ state.reverted ? t('chat.reverted') : t('chat.applied') }}
-        <span class="mono card-path">· {{ basename(card.path) }}</span>
+        <span v-if="ownFile" class="card-file">· {{ ownFile }}</span>
+        <span v-else class="mono card-path">· {{ basename(card.path) }}</span>
       </span>
       <button
         v-if="card.commit"
@@ -55,9 +59,9 @@ const { t } = useI18n()
   background: var(--paper);
 }
 
+/* Block layout, not a flex column: in a column of capped height the lines would shrink to
+   their min-height, and a wrapped line would be drawn over the next. */
 .diff {
-  display: flex;
-  flex-direction: column;
   max-height: 240px;
   overflow-y: auto;
   padding: var(--space-2) 0;

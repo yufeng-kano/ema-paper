@@ -390,7 +390,6 @@ function messageBlocks(text: string): ResultBlock[] {
 type UserItem = Extract<ThreadItem, { kind: 'user' }>
 type StepsItem = Extract<ThreadItem, { kind: 'steps' }>
 type SubagentItem = Extract<ThreadItem, { kind: 'subagent' }>
-type ChangesItem = Extract<ThreadItem, { kind: 'changes' }>
 
 /** A command message reads as its chip and then its arguments. */
 function userText(item: UserItem): string {
@@ -439,20 +438,6 @@ function cardOpen(item: SubagentItem): boolean {
 
 function toggleCard(item: SubagentItem) {
   openCards.set(item.card.id, !cardOpen(item))
-}
-
-/** **View** on a changes card: the turn's groups open, and every edit in them. */
-function viewChanges(turnId: string) {
-  for (const item of items.value) {
-    if (item.kind === 'steps' && item.turnId === turnId) {
-      openGroups.set(item.key, true)
-      for (const step of item.steps) {
-        if (step.type === 'tool' && step.card) {
-          openSteps.add(step.key)
-        }
-      }
-    }
-  }
 }
 
 /** When the panel first saw each subagent running: what its live duration counts from. */
@@ -505,9 +490,8 @@ const cardError = ref<string | null>(null)
  * Revert writes the file as it was before the edit's commit, as a new commit; that new
  * commit is what *Apply again* reverts in turn, and so on — undo is itself a revision
  * (docs/workspace.md § Revisions). The revision list, newest first, names each one.
- * `quiet` leaves the document's reload to a caller reverting several in a row.
  */
-async function toggleEdit(card: EditCard, quiet = false): Promise<boolean> {
+async function toggleEdit(card: EditCard) {
   const state = cardState(card)
   const target = state.reverted ? state.undoCommit : (state.redoCommit ?? card.commit)
   if (!target || state.pending) {
@@ -525,46 +509,10 @@ async function toggleEdit(card: EditCard, quiet = false): Promise<boolean> {
       redoCommit: state.reverted ? made : state.redoCommit,
       pending: false,
     })
-    if (!quiet) {
-      emit('changed')
-    }
-    return true
+    emit('changed')
   } catch (error) {
     cardError.value = await resolve(error)
     cards.set(card.toolUseId, { ...state, pending: false })
-    return false
-  }
-}
-
-/** The changes cards whose Revert all or Apply again is under way, by turn. */
-const bulkPending = reactive(new Set<string>())
-
-/**
- * **Revert all**: the turn's edits still applied, newest first, so each revert meets the
- * file as the later edits left it — one route call each, stopping at the first refused.
- * **Apply again** once all are reverted: the same, oldest first, the order they were made.
- */
-async function toggleAll(item: ChangesItem) {
-  if (bulkPending.has(item.turnId)) {
-    return
-  }
-  const allReverted = item.cards.every((card) => cardState(card).reverted)
-  const order = allReverted ? item.cards : [...item.cards].reverse()
-  const targets = order.filter((card) => cardState(card).reverted === allReverted)
-  bulkPending.add(item.turnId)
-  let changed = false
-  try {
-    for (const card of targets) {
-      if (!(await toggleEdit(card, true))) {
-        break
-      }
-      changed = true
-    }
-  } finally {
-    bulkPending.delete(item.turnId)
-    if (changed) {
-      emit('changed')
-    }
   }
 }
 
@@ -946,16 +894,6 @@ onBeforeUnmount(() => {
           :started-at="subagentSeen.get(item.card.id) ?? null"
           :now="now"
           @toggle="toggleCard(item)"
-        />
-
-        <ChatChangesCard
-          v-else-if="item.kind === 'changes'"
-          :cards="item.cards"
-          :card-state="cardState"
-          :locked="running"
-          :pending="bulkPending.has(item.turnId)"
-          @view="viewChanges(item.turnId)"
-          @toggle-all="toggleAll(item)"
         />
 
         <p v-else-if="item.kind === 'error'" class="turn-error" role="alert">

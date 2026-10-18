@@ -1,7 +1,7 @@
 <script setup lang="ts">
 /**
  * One step's line (docs/web.md § The agent panel): a glyph for its kind, a verb, its target
- * in mono and a detail, the lines an edit added, then its mark — a check, a cross, a
+ * (in mono, unless it is one of the document's own files) and a detail, the lines an edit added, then its mark — a check, a cross, a
  * spinner while it runs. The reading of the call is `lib/steps.ts`; the words are the
  * catalog's. The row around it (a button, or a plain line in a subagent card) is the
  * caller's.
@@ -23,6 +23,7 @@ const view = computed<Step>(() =>
 )
 // The skill a command ran was loaded with the message: done before the answer began.
 const status = computed<StepStatus>(() => (props.step.type === 'tool' ? props.step.status : 'ok'))
+const target = computed(() => labels.target(view.value))
 const detail = computed(() => labels.detail(view.value))
 const added = computed(() => (props.step.type === 'tool' ? props.step.added : null))
 </script>
@@ -30,7 +31,7 @@ const added = computed(() => (props.step.type === 'tool' ? props.step.added : nu
 <template>
   <UiIcon :name="labels.icon(view.kind)" class="glyph" />
   <span class="verb">{{ labels.verb(view) }}</span>
-  <span v-if="view.target" class="target mono">{{ view.target }}</span>
+  <span v-if="target.text" class="target" :class="{ mono: !target.own }">{{ target.text }}</span>
   <span v-if="detail" class="detail">{{ detail }}</span>
   <span v-if="added" class="added mono tabular">+{{ added }}</span>
   <span class="spacer" />
