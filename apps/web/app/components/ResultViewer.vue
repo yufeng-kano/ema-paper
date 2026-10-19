@@ -17,13 +17,14 @@ import {
   type Bbox,
   type ResultBlock,
 } from '~/lib/markdown'
+import type { MenuFact, MenuItem, Point } from '~/lib/menu'
 import type { Caret } from '~/lib/rich-extensions'
 import { captionLine } from '~/lib/richdoc'
 
 /** Where the viewer's layout is kept in the browser between visits. */
 const LAYOUT_KEY = 'sightread.viewer.layout'
 
-type Layout = { rail: boolean; notes: boolean; agent: boolean; notesWidth: number; agentWidth: number }
+type Layout = { notes: boolean; agent: boolean; notesWidth: number; agentWidth: number }
 
 function storedLayout(): Partial<Layout> {
   if (!import.meta.client) {
@@ -50,12 +51,11 @@ function storedWidth(column: 'notes' | 'agent', width: unknown): number {
 }
 
 /**
- * Module scope, not component state: the rail, the notes column, the agent panel and the
- * columns' widths are reading preferences, so opening the next document keeps the choice you
- * just made instead of asking for it again — and so does the next visit, from the browser.
+ * Module scope, not component state: the notes column, the agent panel and the columns'
+ * widths are reading preferences, so opening the next document keeps the choice you just made
+ * instead of asking for it again — and so does the next visit, from the browser.
  */
 const layout = storedLayout()
-const railOpen = ref(layout.rail === true)
 const notesOpen = ref(layout.notes === true)
 const agentOpen = ref(layout.agent === true)
 const columnWidth = {
@@ -69,7 +69,6 @@ const chosenWidth = { notes: columnWidth.notes.value, agent: columnWidth.agent.v
 
 function saveLayout() {
   const next: Layout = {
-    rail: railOpen.value,
     notes: notesOpen.value,
     agent: agentOpen.value,
     notesWidth: chosenWidth.notes,
@@ -82,7 +81,7 @@ function saveLayout() {
   }
 }
 
-watch([railOpen, notesOpen, agentOpen], saveLayout)
+watch([notesOpen, agentOpen], saveLayout)
 /** The document pane never gets narrower than this to make room for a dragged column. */
 const PANE_MIN_WIDTH = 360
 
@@ -116,29 +115,19 @@ type SaveState = 'saved' | 'editing' | 'saving' | 'failed'
  * and agent columns become available. History, with no document, keeps the read-only
  * viewer exactly as it was.
  *
- * The markdown tab is one continuous scroll, and **the document itself carries no page
- * labels**: what a reader checks is the transcription, and which page a passage came from is
- * the pipeline's fact rather than the page's content. The grouping is real all the same — a
- * figure's crop is addressed by the page it came from — and it is offered as a rail the
- * header toggles, off by default. Navigation is a thing you ask for; a page number printed
- * through the prose is a thing you cannot decline (docs/web.md § Result viewer).
+ * The markdown tab is one continuous scroll, and **the document carries no page labels and
+ * the viewer no page navigation**: what a reader checks is the transcription, and which page
+ * a passage came from is the pipeline's fact rather than the page's content. The grouping is
+ * real all the same — a figure's crop is addressed by the page it came from — but a reader
+ * finds a passage with Find (docs/web.md § Result viewer).
+ *
+ * The header is the filename and its controls. What the parse was — model, pages, bbox
+ * format — and the JSON view sit in the More menu: read once, not every time the document
+ * is open.
  *
  * The find bar **floats over** the document: opening it leaves every line of text where it
- * was. The rail, the notes and the agent columns take their width from the document
- * instead, so the column stays centered in whatever room they leave.
- *
- * Two mechanics keep the rail and the document from fighting each other while both scroll:
- *
- *  - Scrolling sets the active page to the *last* section whose top has passed a reading
- *    line 72px below the pane's top edge — not the first visible one, which flickers between
- *    two pages for the whole length of a page boundary.
- *  - A click sets `scrollTop` from `offsetTop` rather than calling `scrollIntoView`, which
- *    would also scroll the dialog itself inside the viewport, and suppresses the
- *    scroll-driven update briefly so the click's own target wins the race against the smooth
- *    scroll it just started.
- *
- * The element refs are plain variables, not reactive state: they are the DOM, and making
- * them reactive would re-render the document on every scroll frame.
+ * was. The notes and the agent columns take their width from the document instead, so the
+ * column stays centered in whatever room they leave.
  */
 const props = withDefaults(
   defineProps<{
@@ -441,6 +430,10 @@ const statusWord = computed<SaveState>(() => {
   }
   return 'saved'
 })
+
+/** The one state the header draws: either file's save failed and its text is unsaved work.
+ *  Every other state is announced, not shown (docs/web.md § Editing). */
+const unsaved = computed(() => saveState.value === 'failed' || notesState.value === 'failed')
 
 /** Closing with an edit still in the debounce — or still in an open block — sends it now
  *  rather than losing it. */
@@ -920,75 +913,10 @@ function documentSelection(): string | null {
   return text || null
 }
 
-// --- the page rail ---------------------------------------------------------
-
-/** The rail's rows. The figure count is computed here rather than carried through the
- *  parser: it is what this list draws, not something the document means. */
-const rail = computed(() =>
-  pages.value.map((page) => ({
-    page: page.page,
-    figures: page.blocks.filter((block) => block.kind === 'fig').length,
-  })),
-)
-
-const activePage = ref(0)
-const scroller = ref<HTMLElement | null>(null)
-const sections = new Map<number, HTMLElement>()
-/** Set while a click-driven scroll is still settling, so `onScroll` does not overrule it. */
-let suppressUntil = 0
-
-/** A result that arrives, or is replaced by a partial one's next snapshot, must not leave
- *  the rail pointing at a page the document no longer has. */
-watch(
-  pages,
-  (list) => {
-    if (!list.some((page) => page.page === activePage.value)) {
-      activePage.value = list[0]?.page ?? 0
-    }
-  },
-  { immediate: true },
-)
-
-function registerSection(page: number, el: Element | ComponentPublicInstance | null) {
-  if (el instanceof HTMLElement) {
-    sections.set(page, el)
-  } else {
-    sections.delete(page)
-  }
-}
-
-function goToPage(page: number) {
-  const box = scroller.value
-  const section = sections.get(page)
-  activePage.value = page
-  if (!box || !section) {
-    return
-  }
-  suppressUntil = Date.now() + 120
-  box.scrollTop = section.offsetTop - box.offsetTop
-}
-
-const READING_LINE = 72
-
-function onScroll() {
-  const box = scroller.value
-  // Nothing reads this while the rail is closed, and the walk is per scroll frame.
-  if (!box || !railOpen.value || Date.now() < suppressUntil) {
-    return
-  }
-  const line = box.scrollTop + READING_LINE
-  let current = activePage.value
-  for (const page of pages.value) {
-    const section = sections.get(page.page)
-    if (section && section.offsetTop - box.offsetTop <= line) {
-      current = page.page
-    }
-  }
-  activePage.value = current
-}
-
 // --- find in document ------------------------------------------------------
 
+/** The document's scroll region. A plain ref to the DOM: nothing renders from it. */
+const scroller = ref<HTMLElement | null>(null)
 const findOpen = ref(false)
 const find = ref<{ focus: () => void } | null>(null)
 
@@ -1020,36 +948,71 @@ function onFindKey(event: KeyboardEvent) {
 onMounted(() => document.addEventListener('keydown', onFindKey, true))
 onBeforeUnmount(() => document.removeEventListener('keydown', onFindKey, true))
 
-/**
- * The JSON tab replaces the whole body, so coming back mounts a fresh scroller at the top
- * while `activePage` still names wherever the reader had got to — the rail would highlight
- * page 5 over a document showing page 1. The find bar goes the other way: it belongs to the
- * document, so leaving the document closes it rather than leaving it hanging over JSON.
- */
-watch(tab, async (view) => {
+/** The find bar belongs to the document, so leaving the document for the JSON view closes
+ *  it rather than leaving it hanging over JSON; an open block is written back first. */
+watch(tab, (view) => {
   if (view === 'json') {
     findOpen.value = false
     commitEdit()
-    return
   }
-  if (!activePage.value) {
-    return
-  }
-  await nextTick()
-  goToPage(activePage.value)
 })
 
-const meta = computed(() => {
+// --- the header's More menu ------------------------------------------------
+
+const moreMenu = ref<Point | null>(null)
+const moreFromKey = ref(false)
+/** When the menu last closed itself. The press on More that closes it (a press outside the
+ *  menu) is followed by that button's click, which must not open it again. */
+let moreClosedAt = 0
+
+/** Anchored under the button's right edge: More sits at the dialog's right, so the menu
+ *  opens leftwards under it (`placeMenu` flips it). */
+function toggleMore(event: MouseEvent) {
+  if (moreMenu.value || performance.now() - moreClosedAt < 200) {
+    moreMenu.value = null
+    return
+  }
+  const box = (event.currentTarget as HTMLElement).getBoundingClientRect()
+  // A click the keyboard made carries no pointer detail.
+  moreFromKey.value = event.detail === 0
+  moreMenu.value = { x: box.right, y: box.bottom + 4 }
+}
+
+function closeMore() {
+  moreMenu.value = null
+  moreClosedAt = performance.now()
+}
+
+/** What the parse was: read once, not every time the document is open. */
+const parseFacts = computed<MenuFact[]>(() => {
   const result = props.result
   if (!result) {
-    return ''
+    return []
   }
-  return t('viewer.meta', {
-    model: result.meta.model,
-    pages: result.pages.length,
-    bbox: result.meta.bbox_format,
-  })
+  return [
+    { label: t('viewer.fact.model'), value: result.meta.model, mono: true },
+    { label: t('viewer.fact.pages'), value: String(result.pages.length) },
+    { label: t('viewer.fact.bbox'), value: result.meta.bbox_format, mono: true },
+  ]
 })
+
+/** The two views, as a pair of choices: the JSON view is the contract a developer checks
+ *  now and then, not a mode to flip while reading. */
+const moreItems = computed<MenuItem[]>(() => [
+  {
+    key: 'markdown',
+    label: t('viewer.view.markdown'),
+    checked: tab.value === 'markdown',
+    separated: parseFacts.value.length > 0,
+  },
+  { key: 'json', label: t('viewer.view.json'), checked: tab.value === 'json' },
+])
+
+function onMoreSelect(key: string) {
+  if (key === 'markdown' || key === 'json') {
+    tab.value = key
+  }
+}
 
 /** The live "x of y pages" line a partial result carries; empty once the job is done. */
 const progress = computed(() => {
@@ -1262,89 +1225,90 @@ const awaitingContent = computed(
   <UiModal :title="title" size="full" tall flush @close="emit('close')">
     <template #title>
       <div class="doc-head">
-        <h2 class="doc-title">{{ title }}</h2>
-        <!-- The one word that says where the edits are (docs/web.md § Editing). -->
+        <h2 class="doc-title" :title="title">{{ title }}</h2>
+        <!-- Where the edits are, announced as they move; drawn only when a save failed,
+             the one state that needs the reader (docs/web.md § Editing). -->
         <span
           v-if="editable"
           class="save-state"
-          :class="statusWord"
+          :class="unsaved ? 'failed' : 'sr-only'"
           role="status"
           aria-live="polite"
         >
-          {{ t(`viewer.status.${statusWord}`) }}
+          {{ t(`viewer.status.${unsaved ? 'failed' : statusWord}`) }}
         </span>
       </div>
-      <p v-if="meta" class="doc-meta mono">{{ meta }}</p>
     </template>
 
-    <!-- A segmented pair, not two loose buttons: they are two views of one thing, and the
-         shared border is what says so. -->
     <template #actions>
-      <!-- The switches for the markdown view. None means anything over the JSON tab. -->
+      <!-- The switches for the markdown view, each with its word: four bare glyphs read as
+           decoration until each one is hovered. None of them means anything over JSON. -->
       <template v-if="tab === 'markdown'">
         <UiButton
           variant="ghost"
           size="sm"
-          icon-only
-          class="rail-toggle"
-          :label="t(railOpen ? 'viewer.railHide' : 'viewer.railShow')"
-          :aria-pressed="railOpen ? 'true' : 'false'"
-          @click="railOpen = !railOpen"
-        >
-          <template #icon><UiIcon name="panel-left" /></template>
-        </UiButton>
-        <UiButton
-          variant="ghost"
-          size="sm"
-          icon-only
+          class="view-toggle"
+          :class="{ on: findOpen }"
           :label="t('viewer.find')"
           :aria-pressed="findOpen ? 'true' : 'false'"
           @click="findOpen ? (findOpen = false) : openFind()"
         >
           <template #icon><UiIcon name="search" /></template>
+          {{ t('viewer.findLabel') }}
         </UiButton>
         <template v-if="editable">
           <UiButton
             variant="ghost"
             size="sm"
-            icon-only
-            class="column-toggle"
+            class="view-toggle"
             :class="{ on: notesOpen }"
-            :label="t(notesOpen ? 'viewer.notesHide' : 'viewer.notesShow')"
             :aria-pressed="notesOpen ? 'true' : 'false'"
             @click="notesOpen = !notesOpen"
           >
             <template #icon><UiIcon name="notebook" /></template>
+            {{ t('viewer.notesLabel') }}
           </UiButton>
           <UiButton
             variant="ghost"
             size="sm"
-            icon-only
-            class="column-toggle"
+            class="view-toggle"
             :class="{ on: agentOpen }"
-            :label="t(agentOpen ? 'viewer.agentHide' : 'viewer.agentShow')"
             :aria-pressed="agentOpen ? 'true' : 'false'"
             @click="agentOpen = !agentOpen"
           >
             <template #icon><UiIcon name="message-circle" /></template>
+            {{ t('viewer.agentLabel') }}
           </UiButton>
         </template>
+        <span class="actions-rule" aria-hidden="true" />
       </template>
 
-      <div class="tabs" role="tablist" :aria-label="t('viewer.views')">
-        <button
-          v-for="view in (['markdown', 'json'] as const)"
-          :key="view"
-          type="button"
-          role="tab"
-          class="tab"
-          :class="{ active: tab === view }"
-          :aria-selected="tab === view ? 'true' : 'false'"
-          @click="tab = view"
-        >
-          {{ t(`viewer.view.${view}`) }}
-        </button>
-      </div>
+      <!-- What the parse was, and the JSON view: read now and then, so one press away
+           rather than on the header for good. -->
+      <UiButton
+        variant="ghost"
+        size="sm"
+        icon-only
+        class="view-toggle"
+        :class="{ on: moreMenu }"
+        :label="t('viewer.more')"
+        aria-haspopup="menu"
+        :aria-expanded="moreMenu ? 'true' : 'false'"
+        @click="toggleMore"
+      >
+        <template #icon><UiIcon name="ellipsis" /></template>
+      </UiButton>
+      <UiContextMenu
+        v-if="moreMenu"
+        :at="moreMenu"
+        :items="moreItems"
+        :label="t('viewer.more')"
+        :header="parseFacts.length ? t('viewer.details') : undefined"
+        :facts="parseFacts"
+        :focus-first="moreFromKey"
+        @select="onMoreSelect"
+        @close="closeMore"
+      />
     </template>
 
     <div class="body">
@@ -1401,26 +1365,8 @@ const awaitingContent = computed(
 
         <!-- The document pane and, beside it, the columns the header toggles. -->
         <div ref="columnsBox" class="columns">
-          <!-- The rail and the find bar are positioned against this, not laid out in it. -->
+          <!-- The find bar is positioned against this, not laid out in it. -->
           <div class="pane">
-            <nav v-if="railOpen" class="page-rail" :aria-label="t('viewer.pagesLabel')">
-              <p class="eyebrow sm page-rail-label">{{ t('viewer.pagesLabel') }}</p>
-              <button
-                v-for="entry in rail"
-                :key="entry.page"
-                type="button"
-                class="page-button"
-                :class="{ active: entry.page === activePage }"
-                :aria-current="entry.page === activePage ? 'true' : undefined"
-                @click="goToPage(entry.page)"
-              >
-                <span>{{ t('viewer.pageN', { page: entry.page }) }}</span>
-                <span v-if="entry.figures" class="page-figures">
-                  {{ t('viewer.figureCount', { count: entry.figures }) }}
-                </span>
-              </button>
-            </nav>
-
             <MdFind
               v-if="findOpen"
               ref="find"
@@ -1429,7 +1375,7 @@ const awaitingContent = computed(
               @close="findOpen = false"
             />
 
-            <div ref="scroller" class="document" :class="{ 'beside-rail': railOpen }" @scroll="onScroll" @copy="onCopy" @mousedown.capture="forgetPress" @mouseup="editable && onBlockClick()">
+            <div ref="scroller" class="document" @copy="onCopy" @mousedown.capture="forgetPress" @mouseup="editable && onBlockClick()">
               <!-- A document with no page at all: one editor, which makes page 1. -->
               <section v-if="editable && !pages.length" class="page">
                 <article class="prose">
@@ -1451,7 +1397,6 @@ const awaitingContent = computed(
               <section
                 v-for="(page, pageIndex) in pages"
                 :key="page.page"
-                :ref="(el) => registerSection(page.page, el)"
                 class="page"
               >
                 <article class="prose">
@@ -1581,7 +1526,7 @@ const awaitingContent = computed(
               :style="{ '--column-width': `${columnWidth.notes.value}px` }"
               :aria-label="t('viewer.notesLabel')"
             >
-              <div class="notes-view" @click="onNotesClick">
+              <div class="notes-view md-side" @click="onNotesClick">
                 <RichEditor
                   ref="notesEditor"
                   variant="notes"
@@ -1659,95 +1604,34 @@ const awaitingContent = computed(
   letter-spacing: normal;
 }
 
-/* Quiet while saved; the accent while something is in motion, because then it is a fact
-   about data that has not landed yet. */
+/* Drawn only when a save failed — the danger colour, beside the title; every other state is
+   in the live region and nowhere on screen. */
 .save-state {
   flex-shrink: 0;
-  color: var(--faint);
+  color: var(--danger);
   font-size: var(--text-xs);
   white-space: nowrap;
-  transition: color var(--duration-fast) var(--ease);
 }
 
-.save-state.editing,
-.save-state.saving {
-  color: var(--accent);
-}
-
-.save-state.failed {
-  color: var(--danger);
-}
-
-.doc-meta {
-  margin-top: var(--space-1);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--faint);
-  font-size: var(--text-2xs);
-}
-
-/* A column toggle that is on sits on the rail-active surface, as a pressed nav row does. */
-.column-toggle.on {
+/* A toggle that is on sits on the rail-active surface, as a pressed nav row does. */
+.view-toggle.on {
   background: var(--rail-active);
   color: var(--ink);
 }
 
-/* --- Tabs ----------------------------------------------------------------- */
-
-/*
- * No `overflow: hidden` to round the children: the focus ring is an outline at a 2px
- * offset, and a clipping ancestor eats most of it on a control that sits flush against the
- * edge. The buttons carry the corners themselves instead — one pixel less than the border's
- * radius, since the border sits outside them.
- */
-.tabs {
-  display: inline-flex;
-  flex-shrink: 0;
-  border: 1px solid var(--edge);
-  border-radius: var(--radius);
-}
-
-.tab {
-  height: var(--control-height-sm);
-  padding: 0 var(--space-3);
-  border: none;
-  background: var(--paper);
-  color: var(--ink);
-  font-size: var(--text-xs);
-  font-weight: var(--weight-medium);
-  cursor: pointer;
-  transition:
-    background var(--duration-fast) var(--ease),
-    color var(--duration-fast) var(--ease);
-}
-
-.tab:first-child {
-  border-radius: calc(var(--radius) - 1px) 0 0 calc(var(--radius) - 1px);
-}
-
-.tab:last-child {
-  border-radius: 0 calc(var(--radius) - 1px) calc(var(--radius) - 1px) 0;
-}
-
-.tab + .tab {
-  border-left: 1px solid var(--edge);
-}
-
-.tab:hover:not(.active) {
-  background: var(--rail);
-}
-
-.tab.active {
-  background: var(--accent);
-  color: var(--accent-fg);
+/* The rule between the document's switches and More: two groups, not one row. */
+.actions-rule {
+  width: 1px;
+  height: var(--space-5);
+  margin-inline: var(--space-1);
+  background: var(--hair);
 }
 
 /* --- Markdown view -------------------------------------------------------- */
 
 /* The head band always has its own row, even when it is empty: a warning about the whole
    document and the live progress note push the pane down rather than scrolling away inside
-   it. The rail and the find bar sit inside the pane instead (see `.pane`). */
+   it. The find bar sits inside the pane instead (see `.pane`). */
 .markdown {
   display: grid;
   /* `minmax(0, 1fr)` and not the implicit `auto` track it would otherwise get: an auto
@@ -1767,10 +1651,8 @@ const awaitingContent = computed(
   min-height: 0;
 }
 
-/* The positioning context for the rail and the find bar. */
+/* The positioning context for the find bar. */
 .pane {
-  --page-rail-width: 148px;
-
   position: relative;
   display: grid;
   flex: 1 1 auto;
@@ -1794,26 +1676,7 @@ const awaitingContent = computed(
   font-size: var(--text-xs);
 }
 
-/* Pinned to the pane's left edge; the document makes room for it (`.beside-rail`), so the
-   column is centered in what the rail leaves rather than under it. */
-.page-rail {
-  position: absolute;
-  inset-block: 0;
-  left: 0;
-  z-index: 2;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  width: var(--page-rail-width);
-  min-height: 0;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  padding: var(--space-4) var(--space-3);
-  background: var(--rail);
-  border-right: 1px solid var(--line);
-}
-
-/* Top right of the pane, clear of the rail whether it is open or not. */
+/* Top right of the pane, over the document's margin. */
 .doc-find {
   position: absolute;
   top: var(--space-4);
@@ -1822,53 +1685,9 @@ const awaitingContent = computed(
   width: min(400px, calc(100% - var(--space-12)));
 }
 
-.page-rail-label {
-  padding: 0 var(--space-2) var(--space-2);
-}
-
-.page-button {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-2);
-  flex-shrink: 0;
-  height: var(--control-height-sm);
-  padding: 0 var(--space-2);
-  border: none;
-  border-radius: var(--radius);
-  background: transparent;
-  color: var(--muted);
-  font-size: var(--text-xs);
-  text-align: left;
-  cursor: pointer;
-  transition:
-    background var(--duration-fast) var(--ease),
-    color var(--duration-fast) var(--ease);
-}
-
-.page-button:hover:not(.active) {
-  background: var(--rail-active);
-  color: var(--ink);
-}
-
-/* Only the page you are reading is marked in the accent — that is what makes the rail a
-   position indicator rather than a list of numbers. */
-.page-button.active {
-  background: var(--rail-active);
-  color: var(--ink);
-  font-weight: var(--weight-semibold);
-}
-
-.page-figures {
-  flex-shrink: 0;
-  font-size: var(--text-3xs);
-  font-weight: var(--weight-normal);
-  color: var(--faint);
-}
-
-/* One continuous scroll of the whole document — the rail selects, it does not filter. A
-   reader comparing two pages should not have to click between them. The scrollbar is
-   hidden on this region, as on the two columns beside it; it still scrolls. */
+/* One continuous scroll of the whole document: a reader comparing two pages should not have
+   to click between them. The scrollbar is hidden on this region, as on the two columns
+   beside it; it still scrolls. */
 .document {
   --block-heading: var(--display-lg);
   --block-subheading: var(--display-sm);
@@ -1890,11 +1709,6 @@ const awaitingContent = computed(
 /* The column, centered in the pane. The page boundary carries no rule and no label: it is
    the grouping the data has, not a division the reader is asked to see, so consecutive pages
    are separated by exactly the gap the blocks inside one page already keep. */
-/* The rail's room: the column is centered beside it, not under it. */
-.document.beside-rail {
-  padding-left: calc(var(--page-rail-width) + var(--space-10));
-}
-
 .page {
   width: 70%;
   margin-inline: auto;
@@ -2121,11 +1935,15 @@ const awaitingContent = computed(
 }
 
 @media (max-width: 640px) {
-  /* No room for a rail over the document on a phone, so its switch goes too — a header this
-     narrow has no space for a control that cannot do anything. */
-  .page-rail,
-  .rail-toggle {
-    display: none;
+  /* A phone's header has room for the glyphs, not their words: the words stay the
+     buttons' names, out of sight. */
+  .view-toggle :deep(.btn-label) {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
   }
 
   .doc-find {
@@ -2133,8 +1951,7 @@ const awaitingContent = computed(
     width: calc(100% - var(--space-8));
   }
 
-  .document,
-  .document.beside-rail {
+  .document {
     padding: var(--space-7) var(--space-5) var(--space-10);
   }
 }

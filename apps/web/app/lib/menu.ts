@@ -34,6 +34,15 @@ export interface MenuItem {
   separated?: boolean
 }
 
+/** A fact about what the menu is about, drawn under its header: it takes no focus and does
+ *  nothing, as the header does not (docs/web.md § Design system). */
+export interface MenuFact {
+  label: string
+  value: string
+  /** An identifier — a model id, a format name — set in the monospace face. */
+  mono?: boolean
+}
+
 export interface Point {
   x: number
   y: number

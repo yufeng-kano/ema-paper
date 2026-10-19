@@ -207,11 +207,11 @@ defineProps<{ name: IconName }>()
       <path d="m21 21-4.35-4.35" />
     </template>
 
-    <!-- panel-left: shows and hides the result viewer's page rail — the glyph is the
-         layout it toggles, a column beside a body. -->
-    <template v-else-if="name === 'panel-left'">
-      <rect x="3" y="3" width="18" height="18" rx="2" />
-      <path d="M9 3v18" />
+    <!-- ellipsis: the result viewer's More menu — what the header does not show. -->
+    <template v-else-if="name === 'ellipsis'">
+      <circle cx="12" cy="12" r="1" />
+      <circle cx="19" cy="12" r="1" />
+      <circle cx="5" cy="12" r="1" />
     </template>
 
     <!-- notebook-text: the result viewer's notes column — a bound pad with lines on it. -->

@@ -19,7 +19,7 @@
  * Teleported to `<body>`: the panel it opens from is a scroll container with its own stacking
  * context, and a menu that clips at the panel edge is not a menu.
  */
-import { placeMenu, type MenuItem, type Point } from '~/lib/menu'
+import { placeMenu, type MenuFact, type MenuItem, type Point } from '~/lib/menu'
 
 const props = defineProps<{
   /** Where the gesture happened, in viewport coordinates. */
@@ -29,6 +29,9 @@ const props = defineProps<{
   label: string
   /** A line of context above the items, e.g. which account this menu belongs to. */
   header?: string
+  /** Label/value rows under the header, for the facts one line cannot hold — the result
+   *  viewer's parse details. */
+  facts?: MenuFact[]
   /**
    * Open with the first item already highlighted. For a menu opened from the keyboard, where
    * the highlight *is* the cursor — a pointer-opened menu highlights nothing until the
@@ -193,6 +196,13 @@ function choose(item: MenuItem) {
     >
       <p v-if="header" class="header">{{ header }}</p>
 
+      <dl v-if="facts?.length" class="facts">
+        <template v-for="fact in facts" :key="fact.label">
+          <dt>{{ fact.label }}</dt>
+          <dd :class="{ mono: fact.mono }">{{ fact.value }}</dd>
+        </template>
+      </dl>
+
       <template v-for="item in items" :key="item.key">
         <!-- A destination is a real link: it can be opened in a new tab, and the locale
              items are URLs rather than actions. -->
@@ -292,6 +302,28 @@ function choose(item: MenuItem) {
   font-size: var(--text-xs);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* Facts, like the header: no focus, no action. They wrap rather than ellipsize, because a
+   model id cut short is a different model id. */
+.facts {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: var(--space-1) var(--space-4);
+  margin: 0;
+  padding: var(--space-2) var(--space-3) var(--space-3);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+}
+
+.facts dt {
+  color: var(--faint);
+}
+
+.facts dd {
+  margin: 0;
+  color: var(--ink);
+  overflow-wrap: anywhere;
 }
 
 .item {

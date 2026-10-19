@@ -926,7 +926,7 @@ onBeforeUnmount(() => {
         </div>
 
         <div v-else-if="item.kind === 'text'" class="answer">
-          <div class="assistant md-message">
+          <div class="assistant md-message md-side">
             <MdBlock v-for="(block, index) in messageBlocks(item.text)" :key="index" :block="block" :page="1" />
           </div>
           <!-- The last answer of a finished turn copies whole, as its markdown. -->
@@ -1036,9 +1036,12 @@ onBeforeUnmount(() => {
   height: 100%;
 }
 
+/* Ruled off from the thread, so the title reads as the column's heading rather than as the
+   answer's first line (docs/web.md § The agent panel). */
 .head {
   flex-shrink: 0;
-  padding: var(--space-3) var(--space-3) 0;
+  padding: var(--space-3);
+  border-bottom: 1px solid var(--line);
 }
 
 .title {
