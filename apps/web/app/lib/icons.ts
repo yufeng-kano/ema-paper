@@ -33,7 +33,7 @@ export type IconName =
   | 'chevron-down'
   | 'chevron-up'
   | 'search'
-  | 'panel-left'
+  | 'ellipsis'
   | 'notebook'
   | 'message-circle'
   | 'arrow-up'

@@ -23,6 +23,44 @@
   line-height: 1.3;
 }
 
+/*
+ * The side columns — the notes and the agent's answers — keep three levels where the
+ * document keeps two: at reading size two heading sizes are plenty, in a 320px column they
+ * came out within a pixel of each other (docs/web.md § Notes). A `#` heading is the column's
+ * title; a `##` opens a section under a hairline; `###` and deeper are run-in labels. The
+ * rule is dropped on a first block, where it would only underline the column's top edge.
+ */
+.md-side .md-h2[data-level='1'] {
+  font-size: var(--display-sm);
+  line-height: 1.3;
+}
+
+.md-side .md-h2:not([data-level='1']) {
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--line);
+  font-family: var(--font);
+  font-size: var(--text-base);
+  letter-spacing: normal;
+  line-height: 1.4;
+}
+
+.md-side .md-h2:not([data-level='1']):first-child {
+  padding-top: 0;
+  border-top: none;
+}
+
+.md-side .md-h3 {
+  color: var(--ink-soft);
+  font-family: var(--font);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+}
+
+/* Items closer than sections, so the gaps between sections are what read as structure. */
+.md-side .md-list li + li {
+  margin-top: var(--space-1);
+}
+
 .md-p {
   color: var(--ink-soft);
   font-size: var(--block-text, var(--text-read));

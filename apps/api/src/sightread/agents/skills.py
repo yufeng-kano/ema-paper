@@ -43,7 +43,7 @@ For each figure placeholder in doc.md within the range:
 2. Compare the caption line under the placeholder with the page: the figure number, the sub-figure labels, numbers, names and units.
 3. Where the caption differs from the page, correct it with the smallest str_replace edit that makes it match.
 
-Change nothing but captions. When the page cannot settle a caption, leave it and say so. End with a list of what you changed, by page.""",
+Change nothing but captions. When the page cannot settle a caption, leave it and say so. End with a list of what you changed, each by the section heading it is under and the caption's first words.""",
     user_invocable=True,
     model_invocable=False,
 )
@@ -61,7 +61,7 @@ For each formula in doc.md within the range — `$...$` inline, `$$...$$` on its
 2. Compare symbol by symbol: sub- and superscripts, Greek letters, operators, brackets and equation numbers.
 3. Where the transcription differs, correct it with the smallest str_replace edit, in KaTeX syntax.
 
-Change nothing else. When the page cannot settle a formula, leave it and say so. End with a list of what you changed, by page.""",
+Change nothing else. When the page cannot settle a formula, leave it and say so. End with a list of what you changed, each by the section heading it is under and the start of the formula.""",
     user_invocable=True,
     model_invocable=True,
 )
@@ -83,7 +83,7 @@ The first word is the target language when it names one (zh-TW, 日本語, Engli
 3. When a translator stopped before the end of its piece, start a `translator` for what it left.
 4. Proofread once every translator has reported. The pieces were translated apart, so one term can come out differently in each. Compare the `term → translation` lines of the reports; for each term rendered more than one way, keep one rendering (the user's instructions decide, otherwise the most common) and change the others to it. Find them with grep rather than reading the document whole, and change each with str_replace on its own translation line, never a replace-all: a term a translation kept in English is also in the original above it, and the original stays as it is. Fix what else reads wrong in the translation lines you see; do not retranslate.
 
-End with a sentence or two in the user's terms: what was translated, the terms you made consistent, and anything left untranslated.""",
+End with a sentence or two in the user's terms: what was translated, the terms you made consistent, and anything left untranslated, named by its section heading rather than its pages.""",
     user_invocable=True,
     model_invocable=False,
 )
