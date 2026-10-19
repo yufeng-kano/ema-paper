@@ -1,4 +1,12 @@
+import type { InjectionKey, Ref } from 'vue'
 import type { IconName } from './icons'
+
+/**
+ * The open dialog's panel, provided by `UiModal`. A menu opened inside a dialog is teleported
+ * there rather than to `<body>`: the panel is `aria-modal`, so assistive tech treats anything
+ * outside it as hidden, and the dialog's Tab trap treats it as outside too.
+ */
+export const modalPanelKey: InjectionKey<Ref<HTMLElement | null>> = Symbol('modal-panel')
 
 /**
  * Where a context menu opens (docs/web.md § Files).

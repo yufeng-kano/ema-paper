@@ -1294,7 +1294,7 @@ const awaitingContent = computed(
       </template>
 
       <!-- What the parse was, and the JSON view: read now and then, so one press away
-           rather than on the header for good. -->
+           rather than on the header for good. Both are the result, so More waits for it. -->
       <UiButton
         variant="ghost"
         size="sm"
@@ -1302,6 +1302,7 @@ const awaitingContent = computed(
         class="view-toggle"
         :class="{ on: moreMenu }"
         :label="t('viewer.more')"
+        :disabled="!result"
         aria-haspopup="menu"
         :aria-expanded="moreMenu ? 'true' : 'false'"
         @click="toggleMore"

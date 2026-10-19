@@ -19,6 +19,8 @@
  * is not inside the scrolling region at all. `overscroll-behavior: contain` on the panel
  * body stops a scroll that reaches its end from chaining anywhere.
  */
+import { modalPanelKey } from '~/lib/menu'
+
 const props = withDefaults(
   defineProps<{
     /** The dialog's accessible name. Also the visible title unless the `title` slot fills it. */
@@ -45,6 +47,7 @@ const emit = defineEmits<{ close: [] }>()
 
 const { t } = useI18n()
 const panel = ref<HTMLElement | null>(null)
+provide(modalPanelKey, panel)
 /** Restored on unmount, so closing a dialog does not dump focus on `<body>`. */
 let previouslyFocused: HTMLElement | null = null
 

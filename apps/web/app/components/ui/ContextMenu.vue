@@ -18,9 +18,11 @@
  *    thing: a menu taller than the window scrolls within its own edge.
  *
  * Teleported to `<body>`: the panel it opens from is a scroll container with its own stacking
- * context, and a menu that clips at the panel edge is not a menu.
+ * context, and a menu that clips at the panel edge is not a menu. Inside a dialog it goes to
+ * the dialog's panel instead (`modalPanelKey`), which is still above every scroll container
+ * in it, and the only place `aria-modal` leaves visible to assistive tech.
  */
-import { placeMenu, type MenuFact, type MenuItem, type Point } from '~/lib/menu'
+import { modalPanelKey, placeMenu, type MenuFact, type MenuItem, type Point } from '~/lib/menu'
 
 const props = defineProps<{
   /** Where the gesture happened, in viewport coordinates. */
@@ -44,6 +46,7 @@ const props = defineProps<{
 const emit = defineEmits<{ select: [string]; close: [] }>()
 
 const menu = ref<HTMLElement | null>(null)
+const modalPanel = inject(modalPanelKey, null)
 /** The facts are the menu's description: a static list inside a menu is otherwise skipped,
  *  since arrow keys move only between the items. */
 const factsId = useId()
@@ -190,7 +193,7 @@ function choose(item: MenuItem) {
 </script>
 
 <template>
-  <Teleport to="body">
+  <Teleport :to="modalPanel ?? 'body'">
     <div
       ref="menu"
       class="menu"
