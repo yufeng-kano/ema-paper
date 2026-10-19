@@ -948,12 +948,23 @@ function onFindKey(event: KeyboardEvent) {
 onMounted(() => document.addEventListener('keydown', onFindKey, true))
 onBeforeUnmount(() => document.removeEventListener('keydown', onFindKey, true))
 
+/** Where the reader was when they left for JSON: the document is remounted on the way back
+ *  and would otherwise open at the top. */
+let documentScroll = 0
+
 /** The find bar belongs to the document, so leaving the document for the JSON view closes
- *  it rather than leaving it hanging over JSON; an open block is written back first. */
-watch(tab, (view) => {
+ *  it rather than leaving it hanging over JSON; an open block is written back first. The
+ *  watcher runs before the DOM changes, so the old document is still there to measure. */
+watch(tab, async (view) => {
   if (view === 'json') {
+    documentScroll = scroller.value?.scrollTop ?? 0
     findOpen.value = false
     commitEdit()
+    return
+  }
+  await nextTick()
+  if (scroller.value) {
+    scroller.value.scrollTop = documentScroll
   }
 })
 
@@ -1249,7 +1260,6 @@ const awaitingContent = computed(
           size="sm"
           class="view-toggle"
           :class="{ on: findOpen }"
-          :label="t('viewer.find')"
           :aria-pressed="findOpen ? 'true' : 'false'"
           @click="findOpen ? (findOpen = false) : openFind()"
         >

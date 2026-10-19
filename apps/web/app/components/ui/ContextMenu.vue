@@ -14,7 +14,8 @@
  *    opens with a row already lit is claiming the pointer is on that row.
  *  - **It closes on anything that means "not this".** A press outside, a scroll under it, a
  *    resize, a Tab out, another right-click. A menu still hanging over content that has moved
- *    is the failure people remember from home-made menus.
+ *    is the failure people remember from home-made menus. A scroll *inside* it is not such a
+ *    thing: a menu taller than the window scrolls within its own edge.
  *
  * Teleported to `<body>`: the panel it opens from is a scroll container with its own stacking
  * context, and a menu that clips at the panel edge is not a menu.
@@ -43,6 +44,9 @@ const props = defineProps<{
 const emit = defineEmits<{ select: [string]; close: [] }>()
 
 const menu = ref<HTMLElement | null>(null)
+/** The facts are the menu's description: a static list inside a menu is otherwise skipped,
+ *  since arrow keys move only between the items. */
+const factsId = useId()
 /** Off-screen until measured, so the first paint is never at the wrong place. */
 const position = ref<Point>({ x: -9999, y: -9999 })
 /** The corner the menu grows from — the pointer's, so a flipped menu opens back towards it. */
@@ -116,6 +120,13 @@ function close() {
   emit('close')
 }
 
+/** Moving to an item scrolls a menu taller than the window, and that must not close it. */
+function onScrollOutside(event: Event) {
+  if (!menu.value?.contains(event.target as Node)) {
+    emit('close')
+  }
+}
+
 /** Measured after the items are in the DOM, because where it fits depends on how big it is. */
 async function place() {
   await nextTick()
@@ -158,14 +169,14 @@ onMounted(() => {
   window.addEventListener('contextmenu', onContextmenuOutside, true)
   window.addEventListener('resize', close)
   // Capture, because the scroll that matters happens inside a panel, not on the window.
-  window.addEventListener('scroll', close, true)
+  window.addEventListener('scroll', onScrollOutside, true)
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('pointerdown', onPointerdownOutside, true)
   window.removeEventListener('contextmenu', onContextmenuOutside, true)
   window.removeEventListener('resize', close)
-  window.removeEventListener('scroll', close, true)
+  window.removeEventListener('scroll', onScrollOutside, true)
   previouslyFocused?.focus?.()
 })
 
@@ -186,6 +197,7 @@ function choose(item: MenuItem) {
       role="menu"
       tabindex="-1"
       :aria-label="label"
+      :aria-describedby="facts?.length ? factsId : undefined"
       :style="{
         left: `${position.x}px`,
         top: `${position.y}px`,
@@ -196,7 +208,7 @@ function choose(item: MenuItem) {
     >
       <p v-if="header" class="header">{{ header }}</p>
 
-      <dl v-if="facts?.length" class="facts">
+      <dl v-if="facts?.length" :id="factsId" class="facts">
         <template v-for="fact in facts" :key="fact.label">
           <dt>{{ fact.label }}</dt>
           <dd :class="{ mono: fact.mono }">{{ fact.value }}</dd>
@@ -259,6 +271,10 @@ function choose(item: MenuItem) {
   z-index: 90;
   min-width: 200px;
   max-width: 300px;
+  /* Never taller than the window, less the margin `placeMenu` keeps on both sides: a menu
+     that is scrolls, rather than putting its last items out of reach. */
+  max-height: calc(100dvh - 16px);
+  overflow-y: auto;
   padding: var(--space-1);
   border-radius: var(--radius-menu);
   border: 1px solid var(--menu-edge);
