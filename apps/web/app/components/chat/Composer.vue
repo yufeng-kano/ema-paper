@@ -20,6 +20,7 @@ import {
   isImageFile,
   matchCommands,
   refuseAttachment,
+  sectionHeading,
   sectionText,
   type AskRequest,
   type AttachmentRefusal,
@@ -166,8 +167,40 @@ function addEntry(entry: OutlineEntry) {
   })
 }
 
+const contextRow = ref<HTMLElement | null>(null)
+
+/** The chips' remove controls, in order: the selection's, then each section's. */
+function removeControls(): HTMLElement[] {
+  return [...(contextRow.value?.querySelectorAll<HTMLElement>('[data-chip-remove]') ?? [])]
+}
+
+/** A chip removed from its own control takes the focused button with it: focus goes to the
+ *  remove control now in its place — the next chip's — or, past the last chip, to **+**. It
+ *  stays inside the field, so it is no reader coming back to read the selection again. */
+async function refocusAfterRemove(index: number) {
+  await nextTick()
+  const active = document.activeElement
+  if (active && active !== document.body) {
+    // A click that never focused the control (Safari's) left focus where it was.
+    return
+  }
+  const next = removeControls()[index] ?? addButton.value
+  if (next) {
+    expectFocusReturn()
+    next.focus()
+  }
+}
+
+function removeSelection() {
+  selection.value = null
+  void refocusAfterRemove(0)
+}
+
 function removeSection(key: string) {
+  // Counted before the chip goes: the selection's control, if any, comes first.
+  const index = addedSections.value.findIndex((section) => section.key === key) + (selection.value ? 1 : 0)
   addedSections.value = addedSections.value.filter((section) => section.key !== key)
+  void refocusAfterRemove(index)
 }
 
 // --- *Add context*: the current section, then every heading --------------------------------
@@ -178,36 +211,41 @@ const addMenuFromKey = ref(false)
 /** The section the document was at when the menu opened: scrolling with the menu open
  *  closes it, so this is the one the menu offers. */
 const menuCurrent = ref<OutlineEntry | null>(null)
-/** When the menu last closed itself. The press on **+** that closes it (a press outside
- *  the menu) is followed by that button's click, which must not open it again. */
-let addMenuClosedAt = 0
+/** The event that last closed the menu, if one did. */
+let addMenuClosedBy: Event | null = null
+/** The press now on **+** is the one that closed the menu (a press outside it, caught
+ *  first): that press's click must not open it again. A pick, Escape or a press elsewhere
+ *  leaves the next press free. */
+let addPressClosedMenu = false
 
-/** A heading longer than the menu is cut there; the chip it adds says it whole. */
-const LABEL_MAX = 48
-/** A subsection is set in by a space as wide as the type, so the outline reads as one. */
+/** A subsection is set in by a space as wide as the type, so the outline reads as one. A
+ *  heading longer than the menu is cut by the menu, with an ellipsis; the row's title and
+ *  the chip it adds say it whole. */
 const SUBSECTION_INDENT = ' '
 
-function clip(text: string): string {
-  const chars = [...text]
-  return chars.length > LABEL_MAX ? `${chars.slice(0, LABEL_MAX - 1).join('')}…` : text
+function onAddPointerdown(event: PointerEvent) {
+  addPressClosedMenu = addMenuClosedBy === event
 }
 
 function toggleAddMenu(event: MouseEvent) {
-  if (addMenu.value || performance.now() - addMenuClosedAt < 200) {
+  // A click the keyboard made carries no pointer detail, and no press came before it.
+  const fromKey = event.detail === 0
+  if (addMenu.value || (addPressClosedMenu && !fromKey)) {
+    addPressClosedMenu = false
     addMenu.value = null
     return
   }
   const box = addButton.value?.getBoundingClientRect()
-  // A click the keyboard made carries no pointer detail.
-  addMenuFromKey.value = event.detail === 0
+  addMenuFromKey.value = fromKey
   menuCurrent.value = props.currentSection()
-  // Over the button: the composer sits at the foot of the column, and the menu flips up.
+  // Over the button, ending just above it: the composer sits at the foot of the column, and
+  // a menu opened down would cover the control and the draft.
   addMenu.value = box ? { x: box.left, y: box.top - 4 } : { x: 0, y: 0 }
 }
 
-function closeAddMenu() {
+function closeAddMenu(cause?: Event) {
   addMenu.value = null
-  addMenuClosedAt = performance.now()
+  addMenuClosedBy = cause ?? null
   // The menu gives focus back to what had it, inside the field.
   expectFocusReturn()
 }
@@ -218,15 +256,13 @@ const addMenuItems = computed<MenuItem[]>(() => {
   return [
     {
       key: 'current',
-      label: current
-        ? t('chat.context.currentSectionNamed', { heading: clip(current.plain) })
-        : t('chat.context.currentSection'),
+      label: current ? t('chat.context.currentSectionNamed', { heading: current.plain }) : t('chat.context.currentSection'),
       icon: 'locate' as const,
       disabled: !current || (sectionsFull.value && !added.has(entryKey(current))),
     },
     ...props.outline.map((entry, index) => ({
       key: entryKey(entry),
-      label: `${entry.level >= 3 ? SUBSECTION_INDENT : ''}${clip(entry.plain)}`,
+      label: `${entry.level >= 3 ? SUBSECTION_INDENT : ''}${entry.plain}`,
       checked: added.has(entryKey(entry)),
       disabled: sectionsFull.value && !added.has(entryKey(entry)),
       separated: index === 0,
@@ -627,10 +663,12 @@ async function send() {
       return
     }
     const sentSections = addedSections.value
+    const headingMax = props.limits?.section_heading_max_chars
     const payload: ComposerPayload = {
       text,
       selection: selection.value,
-      sections: sentSections.map(({ heading, text: source }) => ({ heading, text: source })),
+      // Added from the menu or asked for by the reader's view, a heading goes within the cap.
+      sections: sentSections.map(({ heading, text: source }) => ({ heading: sectionHeading(heading, headingMax), text: source })),
       quote: quote.value,
       command: picked?.name ?? null,
       attachments: ready.map((item) => ({ id: item.id!, name: item.name, image: item.image, preview: item.preview })),
@@ -783,7 +821,7 @@ defineExpose({ addFiles, setQuote, focus, ask })
       <!-- What goes with the message besides its text (docs/web.md § The agent panel,
            *Context chips*): the control that adds a section, the document the
            conversation is about, the selection read on the way in, the sections added. -->
-      <div class="context" role="group" :aria-label="t('chat.context.label')">
+      <div ref="contextRow" class="context" role="group" :aria-label="t('chat.context.label')">
         <button
           ref="addButton"
           type="button"
@@ -793,6 +831,7 @@ defineExpose({ addFiles, setQuote, focus, ask })
           :aria-label="t('chat.context.add')"
           :title="t('chat.context.add')"
           :disabled="running"
+          @pointerdown="onAddPointerdown"
           @click="toggleAddMenu"
         >
           <UiIcon name="plus" />
@@ -803,12 +842,12 @@ defineExpose({ addFiles, setQuote, focus, ask })
           icon="text-quote"
           :text="selectionPreview"
           :remove-label="t('chat.context.removeSelection')"
-          @remove="selection = null"
+          @remove="removeSelection"
         />
         <ChatContextChip
           v-for="section in addedSections"
           :key="section.key"
-          icon="hash"
+          icon="heading"
           :text="t('chat.context.section', { heading: section.plain })"
           :remove-label="t('chat.context.removeSection', { heading: section.plain })"
           @remove="removeSection(section.key)"
@@ -820,6 +859,7 @@ defineExpose({ addFiles, setQuote, focus, ask })
         :items="addMenuItems"
         :label="t('chat.context.add')"
         :focus-first="addMenuFromKey"
+        above
         @select="onAddSelect"
         @close="closeAddMenu"
       />

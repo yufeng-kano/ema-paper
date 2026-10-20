@@ -140,10 +140,11 @@ export interface UploadLimits {
   /** The chat agent's instructions and one memory (docs/chat.md § Instructions, § Memory). */
   instructions_max_chars?: number
   memory_max_chars?: number
-  /** Whole sections one message may carry, and the cap on one section's text and on the
-   *  selection (docs/chat.md § What a user message carries). */
+  /** Whole sections one message may carry, the cap on one section's text and on the
+   *  selection, and on a section's heading (docs/chat.md § What a user message carries). */
   sections_per_message?: number
   selection_max_chars?: number
+  section_heading_max_chars?: number
 }
 
 // --- memory (docs/chat.md § Memory) ----------------------------------------------------

@@ -64,10 +64,18 @@ export interface Size {
 /** How close to the viewport edge a menu is allowed to sit. */
 const MARGIN = 8
 
-export function placeMenu(at: Point, menu: Size, viewport: Size, margin = MARGIN): Point {
+export interface PlaceOptions {
+  margin?: number
+  /** Open over the point rather than under it, wherever there is room there: a menu asked
+   *  for at the top of a control low in the window, which it must not cover. */
+  above?: boolean
+}
+
+export function placeMenu(at: Point, menu: Size, viewport: Size, options: PlaceOptions = {}): Point {
+  const margin = options.margin ?? MARGIN
   return {
     x: fit(at.x, menu.width, viewport.width, margin),
-    y: fit(at.y, menu.height, viewport.height, margin),
+    y: options.above ? fitAbove(at.y, menu.height, viewport.height, margin) : fit(at.y, menu.height, viewport.height, margin),
   }
 }
 
@@ -81,4 +89,13 @@ function fit(at: number, size: number, viewport: number, margin: number): number
     return Math.max(margin, at)
   }
   return Math.max(margin, Math.min(at - size, viewport - margin - size))
+}
+
+/** The same axis the other way first: ending at the point when the menu fits before it, and
+ *  only otherwise placed as `fit` places it. */
+function fitAbove(at: number, size: number, viewport: number, margin: number): number {
+  if (at - size >= margin) {
+    return Math.min(at - size, viewport - margin - size)
+  }
+  return fit(at, size, viewport, margin)
 }

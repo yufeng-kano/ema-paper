@@ -44,6 +44,7 @@ export type IconName =
   | 'square-slash'
   | 'terminal'
   | 'hash'
+  | 'heading'
   | 'file-plus'
   | 'crop'
   | 'book-open'

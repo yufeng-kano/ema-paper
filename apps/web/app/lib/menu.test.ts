@@ -19,6 +19,17 @@ describe('placeMenu', () => {
     expect(placeMenu({ x: 990, y: 790 }, menu, viewport)).toEqual({ x: 790, y: 490 })
   })
 
+  it('ends a menu asked for above at the point, even where it would fit below', () => {
+    // A control at 500 with 300 to spare under it: the menu still ends at its top.
+    expect(placeMenu({ x: 120, y: 500 }, menu, viewport, { above: true })).toEqual({ x: 120, y: 200 })
+  })
+
+  it('opens a menu asked for above under the point when there is no room over it', () => {
+    expect(placeMenu({ x: 120, y: 200 }, menu, viewport, { above: true })).toEqual({ x: 120, y: 200 })
+    // No room on either side: the near edge, as for any menu.
+    expect(placeMenu({ x: 5, y: 100 }, menu, { width: 150, height: 150 }, { above: true })).toEqual({ x: 8, y: 8 })
+  })
+
   it('falls back to the near edge when nothing fits', () => {
     // A viewport smaller than the menu — flipping runs off the near edge, so the margin wins
     // and the far end is clipped. Showing the top of the menu beats starting it off-screen.
