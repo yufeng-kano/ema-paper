@@ -606,7 +606,7 @@ async def test_the_agent_loads_the_skills_it_may_and_no_other(chat_client) -> No
     )
     assert loaded["tool_use_id"] == "s1" and "is_error" not in loaded
     assert loaded["content"].startswith("Skill fix-math")
-    assert "Range: pages 2-3 (the whole document when empty)." in loaded["content"]
+    assert "Otherwise the pages given here: pages 2-3 (the whole document" in loaded["content"]
     # The reader's command only, and a subagent that is not there: errors to correct.
     assert user_only["is_error"] is True and missing["is_error"] is True
 
@@ -631,7 +631,9 @@ async def test_a_command_runs_a_skill_the_reader_can_run(chat_client) -> None:
     content = main[0]["messages"][0]["content"]
     assert content[0] == {"type": "text", "text": "/check-figures 1-3"}
     assert content[1]["text"].startswith("The user ran the skill /check-figures.")
-    assert "Range: 1-3 (the whole document when empty)." in content[1]["text"]
+    assert "Otherwise the pages given here: 1-3 (the whole document" in content[1]["text"]
+    # Sent with neither a selection nor sections, nothing narrows the pages it names.
+    assert "Run it on" not in content[1]["text"]
     assert set(content[1]) == {"type", "text"}
     thread = (await client.get(f"/api/conversations/{conversation_id}")).json()
     # The thread shows the command, not the instructions the model read.
@@ -640,6 +642,43 @@ async def test_a_command_runs_a_skill_the_reader_can_run(chat_client) -> None:
         {"type": "text", "context": "skill", "skill": "check-figures"},
     ]
     assert thread["conversation"]["title"] == "/check-figures 1-3"
+
+
+@respx.mock
+async def test_a_command_keeps_to_the_selection_and_sections_it_is_sent_with(chat_client) -> None:
+    client = chat_client
+    main, _ = stub_messages([([{"type": "text", "text": "Done."}], "end_turn")] * 3)
+    conversation_id = await new_conversation(client)
+    for extra in (
+        {"selection": "Greedy is 3.45."},
+        {"sections": [{"heading": "3.2 Attention", "text": "## 3.2 Attention\n\nBody."}]},
+        {
+            "text": "zh-TW keep terms",
+            "selection": "Greedy is 3.45.",
+            "sections": [
+                {"heading": "3.2 Attention", "text": "## 3.2 Attention\n\nBody."},
+                {"heading": "4 Results", "text": None},
+            ],
+        },
+    ):
+        sent = await send(client, conversation_id, command="translate", **extra)
+        assert sent.status_code == 202, sent.text
+        await _run_queued_turn(client)
+
+    lines = []
+    for index in range(3):
+        skill = main[index]["messages"][2 * index]["content"][-2]["text"]
+        assert skill.startswith("The user ran the skill /translate.")
+        lines.append(skill.splitlines()[-1])
+    assert lines == [
+        "Run it on the selection above only: the rest of the document is outside its range.",
+        'Run it on the section "3.2 Attention" only: '
+        "the rest of the document is outside its range.",
+        'Run it on the selection above, the section "3.2 Attention" and the section "4 Results" '
+        "only: the rest of the document is outside its range.",
+    ]
+    # The range names where; the arguments still say how.
+    assert "Arguments: zh-TW keep terms" in main[2]["messages"][4]["content"][-2]["text"]
 
 
 @respx.mock

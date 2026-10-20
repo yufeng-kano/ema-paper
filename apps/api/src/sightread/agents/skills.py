@@ -36,7 +36,7 @@ CHECK_FIGURES = SkillDefinition(
     argument_hint="[pages]",
     body="""Check every figure caption in the range against the page it is on.
 
-Range: $ARGUMENTS (the whole document when empty).
+Range: the selected passage or the sections this message carries, when it carries any. Otherwise the pages given here: $ARGUMENTS (the whole document when none are given).
 
 For each figure placeholder in doc.md within the range:
 1. Open the crop with view_figure and the whole page with view_page.
@@ -54,7 +54,7 @@ FIX_MATH = SkillDefinition(
     argument_hint="[pages]",
     body="""Check the formulas in the range against the page images and correct them.
 
-Range: $ARGUMENTS (the whole document when empty).
+Range: the selected passage or the sections this message carries, when it carries any. Otherwise the pages given here: $ARGUMENTS (the whole document when none are given).
 
 For each formula in doc.md within the range — `$...$` inline, `$$...$$` on its own lines:
 1. Open its page with view_page.
@@ -71,15 +71,15 @@ Change nothing else. When the page cannot settle a formula, leave it and say so.
 # write; the agent splits the work and proofreads the result (docs/chat.md § Translation).
 TRANSLATE = SkillDefinition(
     name="translate",
-    description="Translate the selected passage, or the whole document, inserting each block's translation right under it.",
+    description="Translate the selected passage, the sections sent with it, or the whole document, inserting each block's translation right under it.",
     argument_hint="[language] [instructions]",
     body="""Translate into the document with the `translator` subagent: translators read doc.md and write the translation into it themselves. Do not translate yourself: your part is to split the work, start them, proofread what they wrote as one translation, and tell the user how it went. The user ran this command to have the translation written into the document.
 
 Arguments: $ARGUMENTS
 The first word is the target language when it names one (zh-TW, 日本語, English); otherwise translate into the translation language named in the message's context, or, when it names none, into its reader locale. The rest is the user's own instructions for this translation: pass them word for word to every translator. Pass the user's term memories (the Terms of your memory section) to every translator as terms to use, unless the user's instructions for this translation say otherwise.
 
-1. Split the work. With a selection, it is one piece: the passage, given by its first and last few words. Otherwise it is the whole document: split its pages (the page count is in your facts) into pieces of two to four pages.
-2. Start one `translator` per piece, all in the same round, giving each its pages or passage, the target language, the user's instructions and the user's terms.
+1. Split the work. The range is what the message carries, when it carries anything. A selection is one piece: the passage, given by its first and last few words. Each section sent with the message is a piece of its own, given the same way when its text came with the message; one that came without its text is split at its own subheadings, which you find with grep on the heading lines rather than by reading the section, each piece given by its heading. Only a message carrying neither is the whole document: split its pages (the page count is in your facts) into pieces of two to four pages.
+2. Start one `translator` per piece, all in the same round, giving each its pages, passage or section, the target language, the user's instructions and the user's terms.
 3. When a translator stopped before the end of its piece, start a `translator` for what it left.
 4. Proofread once every translator has reported. The pieces were translated apart, so one term can come out differently in each. Compare the `term → translation` lines of the reports; for each term rendered more than one way, keep one rendering (the user's instructions decide, otherwise the most common) and change the others to it. Find them with grep rather than reading the document whole, and change each with str_replace on its own translation line, never a replace-all: a term a translation kept in English is also in the original above it, and the original stays as it is. Fix what else reads wrong in the translation lines you see; do not retranslate.
 
