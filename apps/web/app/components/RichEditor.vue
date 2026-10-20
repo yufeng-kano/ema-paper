@@ -33,12 +33,27 @@ const props = withDefaults(
     /** A figure caption is one line: Enter leaves instead of starting a paragraph. */
     singleLine?: boolean
     label?: string
+    /** The ids of what describes the text (a note, a count), as `aria-describedby`. */
+    describedBy?: string
+    /** False holds the text as it is — still selectable, never changed — while the caller
+     *  saves it. */
+    editable?: boolean
     /** Arrow past the first or last line. False keeps the key for the editor. */
     onNavigate?: (direction: 'up' | 'down') => boolean
     /** Backspace at the very start, with the editor's current markdown. False keeps the key. */
     onMerge?: (markdown: string) => boolean
   }>(),
-  { variant: 'block', caret: null, placeholder: '', singleLine: false, label: undefined, onNavigate: undefined, onMerge: undefined },
+  {
+    variant: 'block',
+    caret: null,
+    placeholder: '',
+    singleLine: false,
+    label: undefined,
+    describedBy: undefined,
+    editable: true,
+    onNavigate: undefined,
+    onMerge: undefined,
+  },
 )
 
 const emit = defineEmits<{
@@ -68,7 +83,7 @@ const mathInput = ref<HTMLInputElement | HTMLTextAreaElement | null>(null)
 
 async function openMath(target: MathTarget) {
   const box = root.value
-  if (!box) {
+  if (!box || !props.editable) {
     return
   }
   const outer = box.getBoundingClientRect()
@@ -271,6 +286,7 @@ onMounted(() => {
       onEditMath: (target) => void openMath(target),
     }),
     content: markdownToDoc(props.source),
+    editable: props.editable,
     // A caption is one line: no shortcut there may make a heading, a list or a block.
     ...(props.singleLine ? { enableInputRules: ['bold', 'italic', 'code', 'inlineMath'] } : {}),
     editorProps: {
@@ -279,6 +295,7 @@ onMounted(() => {
         // A parsed paper's names and acronyms are not misspellings (docs/web.md § Editing).
         spellcheck: 'false',
         ...(props.label ? { 'aria-label': props.label } : {}),
+        ...(props.describedBy ? { 'aria-describedby': props.describedBy } : {}),
       },
       handleKeyDown: (_view, event) => onKey(event),
       // Copy is markdown whether the block is open or rendered (docs/web.md § Editing).
@@ -332,6 +349,14 @@ watch(
     emitted = null
     trailing = /\n\s*$/.exec(source)?.[0] ?? ''
     editor.commands.setContent(markdownToDoc(source), { emitUpdate: false })
+  },
+)
+
+watch(
+  () => props.editable,
+  (editable) => {
+    // No update event: nothing in the text changed.
+    editor?.setEditable(editable, false)
   },
 )
 
