@@ -302,6 +302,11 @@ def test_translate_takes_a_language_and_the_readers_instructions() -> None:
     # themselves; the agent proofreads after them, and no checker subagent is started.
     assert "`translator`" in rendered and "translation-checker" not in rendered
     assert "Proofread once every translator has reported" in rendered
+    # Without a language, the translation language the turn names, else the locale; the
+    # reader's term memories go to every translator (docs/chat.md § Translation).
+    assert "translation language named in the message's context" in rendered
+    assert "into its reader locale" in rendered
+    assert "Pass the user's term memories (the Terms of your memory section)" in rendered
     assert subagent_defs.BUILTIN_SUBAGENTS == (subagent_defs.TRANSLATOR,)
     assert subagent_defs.TRANSLATOR.writes is True
     assert subagent_defs.TRANSLATOR.tools == ("str_replace_based_edit_tool", "bash")
@@ -538,7 +543,9 @@ async def test_a_parse_runs_on_the_readers_own_prompt(make_client, sessionmaker,
 
 
 @respx.mock
-async def test_a_turn_runs_on_the_readers_prompt_with_the_catalogue_last(chat_client) -> None:
+async def test_a_turn_runs_on_the_readers_prompt_with_the_catalogue_before_memory(
+    chat_client,
+) -> None:
     client = chat_client
     await client.put(
         "/api/agents/chat/settings",
@@ -563,10 +570,12 @@ async def test_a_turn_runs_on_the_readers_prompt_with_the_catalogue_last(chat_cl
     await _run_queued_turn(client)
 
     system = main[0]["system"]
-    assert len(system) == 2
+    assert len(system) == 3
     assert system[0]["text"] == f"Custom agent for {DOC_PATH}, 1 pages."
-    assert "cache_control" not in system[0]
-    assert system[1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert "cache_control" not in system[0] and "cache_control" not in system[1]
+    # The memory block is last, rules and all, though the reader replaced the prompt.
+    assert system[2]["text"].startswith("# Memory\n")
+    assert system[2]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
     catalogue = system[1]["text"]
     assert "- fix-math: " in catalogue and "- zh-summary: Add a Chinese summary" in catalogue
     # A skill the agent may not load is not listed: those are the reader's commands only.

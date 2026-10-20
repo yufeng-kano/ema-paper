@@ -6,6 +6,7 @@ SameSite=Lax), enforced by `require_csrf_header`.
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import timedelta
 
@@ -19,6 +20,9 @@ from sqlalchemy.exc import IntegrityError
 
 from ..agents import AGENTS, CHAT, AgentDefinition, get_agent
 from ..agents import chat as chat_agent
+from ..agents import memory as memory_defs
+from ..agents import skills as skill_defs
+from ..agents import subagents as subagent_defs
 from ..agents.bbox import convention_for_model
 from ..auth.api_keys import create_api_key
 from ..auth.crypto import encrypt_connection_key, mask_secret
@@ -46,10 +50,13 @@ from ..db.models import (
     PromptPreset,
     ProviderConnection,
     Result,
+    Skill,
+    Subagent,
     UsageLog,
     utcnow,
 )
 from ..errors import ApiError
+from ..jobs import chat_memory, chat_runner
 from ..jobs.intake import PDF_MEDIA_TYPE
 from ..jobs.runner import result_payload
 from ..parsing.attachments import ATTACHMENT_EXTENSIONS
@@ -60,6 +67,8 @@ from ..upstream.client import (
     normalize_base_url,
     stored_connection_models,
 )
+from ..workspace.documents import document_paths
+from .chat import owned_document, turn_note
 from .library import figure_crop_response, partial_result
 
 router = APIRouter(prefix="/api", tags=["control"])
@@ -183,6 +192,13 @@ async def me(user: SessionUser, settings: AppSettings):
             "attachment_max_bytes": settings.chat_attachment_max_bytes,
             "attachments_per_message": settings.chat_attachments_per_message,
             "attachment_extensions": list(ATTACHMENT_EXTENSIONS),
+            # The Agent page's instructions and memory editors, and the composer's sections
+            # and selection (docs/chat.md § Instructions, § Memory, § What a user message
+            # carries).
+            "instructions_max_chars": settings.chat_instructions_max_chars,
+            "memory_max_chars": settings.chat_memory_max_chars,
+            "sections_per_message": settings.chat_sections_per_message,
+            "selection_max_chars": settings.chat_selection_max_chars,
         },
     }
 
@@ -616,6 +632,13 @@ def _agent_settings_payload(row: AgentSetting | None) -> dict:
         "prompt": row.prompt if row else None,
         "prompt_preset_id": row.prompt_preset_id if row else None,
         "effort": (row.effort if row and row.effort else EFFORT_DEFAULT),
+        # The chat agent's own: instructions appended after the prompt, the languages it
+        # answers and translates into, and the memory switches (docs/agents.md).
+        "instructions": row.instructions if row else None,
+        "answer_language": row.answer_language if row else None,
+        "translate_language": row.translate_language if row else None,
+        "memory_auto": row.memory_auto if row and row.memory_auto is not None else True,
+        "memory_paused": bool(row.memory_paused) if row else False,
     }
 
 
@@ -673,6 +696,49 @@ class AgentSettingsPut(BaseModel):
     prompt: str | None = None
     prompt_preset_id: int | None = None
     effort: str | None = Field(default=None, max_length=8)
+    # The chat agent's own (docs/agents.md); checked in the route, which answers 400 for
+    # each — capped where the settings are (`CHAT_INSTRUCTIONS_MAX_CHARS`).
+    instructions: str | None = None
+    answer_language: str | None = None
+    translate_language: str | None = None
+    memory_auto: bool | None = None
+    memory_paused: bool | None = None
+
+
+# The chat agent's settings no other agent takes (docs/agents.md § Per-agent settings).
+CHAT_ONLY_SETTINGS = (
+    "instructions",
+    "answer_language",
+    "translate_language",
+    "memory_auto",
+    "memory_paused",
+)
+# A language tag, as the composer's locale is one (docs/api.md).
+LANGUAGE_TAG = re.compile(r"^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$")
+LANGUAGE_TAG_MAX_CHARS = 16
+
+
+def _checked_language(value: str | None, label: str) -> str | None:
+    """A language tag, or None to follow the reader's locale; 400 for anything else."""
+    tag = (value or "").strip()
+    if not tag:
+        return None
+    if len(tag) > LANGUAGE_TAG_MAX_CHARS or not LANGUAGE_TAG.fullmatch(tag):
+        raise ApiError(400, "invalid_request", f"{label} must be a language tag such as zh-TW")
+    return tag
+
+
+def _checked_instructions(value: str | None, settings: AppSettings) -> str | None:
+    """The reader's instructions cleaned of what pasted text carries unseen, trimmed and
+    capped in characters as cleaned; empty is none (docs/chat.md § Instructions)."""
+    instructions = memory_defs.clean_text(value or "", single_line=False) or None
+    if instructions is not None and len(instructions) > settings.chat_instructions_max_chars:
+        raise ApiError(
+            400,
+            "invalid_request",
+            f"The instructions exceed {settings.chat_instructions_max_chars} characters",
+        )
+    return instructions
 
 
 @router.put("/agents/{agent_name}/settings", dependencies=[CsrfGuard])
@@ -681,6 +747,19 @@ async def put_agent_settings(
 ):
     agent = _known_agent(agent_name)
     provided = body.model_fields_set
+    chat_only = [name for name in CHAT_ONLY_SETTINGS if name in provided]
+    if chat_only and agent.name != CHAT.name:
+        raise ApiError(
+            400, "invalid_request", f"The {agent.name} agent takes no {', '.join(chat_only)}"
+        )
+    for switch in ("memory_auto", "memory_paused"):
+        if switch in provided and getattr(body, switch) is None:
+            raise ApiError(400, "invalid_request", f"{switch} is true or false")
+    instructions = (
+        _checked_instructions(body.instructions, settings) if "instructions" in provided else None
+    )
+    answer_language = _checked_language(body.answer_language, "answer_language")
+    translate_language = _checked_language(body.translate_language, "translate_language")
     prompt: str | None = None
     if "prompt" in provided:
         prompt = (body.prompt or "").strip() or None
@@ -733,6 +812,16 @@ async def put_agent_settings(
         row.prompt_preset_id = body.prompt_preset_id
     if "effort" in provided:
         row.effort = body.effort or EFFORT_DEFAULT
+    if "instructions" in provided:
+        row.instructions = instructions
+    if "answer_language" in provided:
+        row.answer_language = answer_language
+    if "translate_language" in provided:
+        row.translate_language = translate_language
+    if "memory_auto" in provided:
+        row.memory_auto = bool(body.memory_auto)
+    if "memory_paused" in provided:
+        row.memory_paused = bool(body.memory_paused)
     try:
         await db.commit()
     except IntegrityError as exc:
@@ -744,6 +833,94 @@ async def put_agent_settings(
         ) from exc
     # The convention follows the model, so a write answers the new one along with the row.
     return {**_agent_settings_payload(row), "bbox": _bbox_payload(row)}
+
+
+@router.get("/agents/chat/context")
+async def chat_agent_context(
+    user: SessionUser,
+    db: DbSession,
+    settings: AppSettings,
+    locale: str = Query(default="en", max_length=16, pattern=LANGUAGE_TAG.pattern),
+    document_id: int | None = None,
+):
+    """What the chat agent receives, rendered by the code the runner uses, for the Agent
+    page's drawer (docs/api.md): the system blocks in the order a turn sends them, the turn
+    block a message sent now in `locale` would carry, and the document's facts when one is
+    named. Reads only: nothing is materialized and no snapshot is taken."""
+    facts: dict[str, str] | None = None
+    if document_id is not None:
+        document = await owned_document(db, user.id, document_id)
+        job = await db.get(Job, document.job_id)
+        if job is not None:
+            facts = chat_runner.document_facts(
+                settings, job, await document_paths(db, settings, document)
+            )
+    setting = (
+        await db.execute(
+            select(AgentSetting).where(
+                AgentSetting.user_id == user.id, AgentSetting.agent == CHAT.name
+            )
+        )
+    ).scalar_one_or_none()
+    own_prompt = setting.prompt if setting and setting.prompt else None
+    preset = setting.prompt_preset if setting and own_prompt is None else None
+    skills = skill_defs.resolve_skills(
+        (await db.execute(select(Skill).where(Skill.user_id == user.id))).scalars()
+    )
+    subagents = subagent_defs.resolve_subagents(
+        (await db.execute(select(Subagent).where(Subagent.user_id == user.id))).scalars()
+    )
+    # What a new conversation would load: the first turn's selection, over every
+    # document's memories and, with a document, this one's (docs/chat.md § Memory).
+    auto = setting.memory_auto if setting else True
+    paused = setting.memory_paused if setting else False
+    loaded = (
+        []
+        if paused
+        else chat_memory.first_turn_selection(
+            await chat_memory.applicable_memories(db, user.id, document_id if facts else None),
+            settings,
+        )
+    )
+    tools = [str(tool["name"]) for tool in chat_runner.turn_tools(settings)]
+    parts = chat_agent.system_parts(
+        # Without a document the template keeps its tokens, its tool lines filtered as a
+        # turn's would be.
+        chat_agent.render_system_prompt(
+            own_prompt or CHAT.default_prompt_template, facts, tools=tools
+        ),
+        preset=preset.text if preset is not None else None,
+        instructions=setting.instructions if setting else None,
+        catalogue=chat_runner.turn_catalogue(skills, subagents),
+        memory=memory_defs.render_memory_block(loaded, auto=auto, paused=paused),
+    )
+    extras = {
+        "prompt": {"own": own_prompt is not None},
+        "catalogue": {
+            "skills": sum(1 for skill in skills if skill.model_invocable),
+            "subagents": len(subagents),
+        },
+        "memory": {"count": len(loaded), "paused": paused},
+    }
+    turn = turn_note(
+        "<revision>",
+        locale,
+        setting.answer_language if setting else None,
+        setting.translate_language if setting else None,
+    )
+    return {
+        "parts": [
+            {
+                "kind": part.kind,
+                "text": part.text,
+                "chars": len(part.text),
+                **extras.get(part.kind, {}),
+            }
+            for part in parts
+        ],
+        "turn": {"text": turn, "chars": len(turn)},
+        "facts": facts,
+    }
 
 
 @router.get("/agents/{agent_name}/models")
