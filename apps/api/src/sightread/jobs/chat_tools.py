@@ -63,6 +63,9 @@ class ToolOutcome:
     # What a `subagent` call did, stored with its result for the panel and stripped before
     # the result goes upstream (docs/chat.md § Subagents).
     subagent: dict | None = field(default=None)
+    # What a `memory` call changed, for its `memory` event: `{action, memory, previous}`
+    # (docs/chat.md § Memory). Set on success only.
+    memory: dict | None = field(default=None)
 
 
 def truncate(text: str, max_chars: int) -> str:

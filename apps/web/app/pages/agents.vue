@@ -86,11 +86,16 @@ watch(agentsData, (data) => {
   agents.value = data?.agents ?? []
 })
 
+const contextVersion = useAgentContextVersion()
+
+/** Every settings save of the panel comes through here, so this is also where *What the
+ *  agent receives* learns that the parts it lists may have changed. */
 function setAgentSettings(name: string, saved: SavedAgentSettings) {
   const { bbox, ...settings } = saved
   agents.value = agents.value.map((agent) =>
     agent.name === name ? { ...agent, settings, bbox } : agent,
   )
+  contextVersion.changed()
 }
 
 const promptMaxChars = computed(() => auth.me.value?.limits.prompt_max_chars ?? null)
@@ -192,7 +197,9 @@ function onTabKeydown(event: KeyboardEvent, index: number) {
       </div>
     </UiRail>
 
-    <UiRegion>
+    <!-- Positioned: the panel's drawers anchor to the region's right edge, outside the
+         panel's own scroll. -->
+    <UiRegion class="agent-region">
       <UiPanel v-if="selected" :title="agentTitle(selected)" lead>
         <template #meta>
           <span class="mono io">{{ selected.input }} → {{ selected.output }}</span>
@@ -370,6 +377,12 @@ function onTabKeydown(event: KeyboardEvent, index: number) {
 }
 
 /* --- Region -------------------------------------------------------------------- */
+
+/* The containing block of *What the agent receives*, which stays put while the panel
+   scrolls under it (docs/web.md § Pages). */
+.agent-region {
+  position: relative;
+}
 
 .io {
   color: var(--muted);

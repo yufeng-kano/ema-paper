@@ -506,6 +506,22 @@ export type InlineSegment =
   | { kind: 'sub'; segments: InlineSegment[]; src: string }
   | { kind: 'code'; text: string; src: string }
   | { kind: 'br'; src: string }
+  /** An answer's link to a section of the document — `[3.2 Attention](#32-attention)`,
+   *  or with `doc.md` before the `#` — read only when the caller asks for it (`cites`,
+   *  docs/web.md § The agent panel, *Section links*). `segments` is its text as drawn,
+   *  `label` that text with the markdown removed, `anchor` what follows the `#`. */
+  | { kind: 'cite'; segments: InlineSegment[]; label: string; anchor: string; src: string }
+
+/** Whether a section link's heading is still in the document: a link that answers yes is
+ *  drawn as a chip, one that answers no as its plain text. */
+export type CiteResolver = (label: string, anchor: string) => boolean
+
+/** What `parseInline` reads beyond the document's own shapes. */
+export interface InlineOptions {
+  /** Section links, which only an answer of the agent panel writes; everywhere else a
+   *  link stays the text it was (docs/web.md § Result viewer, *Inline markdown*). */
+  cites?: boolean
+}
 
 /**
  * The `$…$` span opening at `open`, or null when there is none.
@@ -609,12 +625,35 @@ export function isEscaped(text: string, index: number): boolean {
 }
 
 /**
- * Parses the styled-inline shapes — emphasis, code, `<br>`, `<sup>`/`<sub>` — inside one
- * math-free run of text. Recursive for nesting (`_**Abstract**_` is an `em` holding a
- * `strong`); anything that fails a marker's rules stays literal text, which is also the
- * wrong-guess fallback: visible markers beat text silently bolded.
+ * A section link: a non-blank text in brackets — escaped brackets and code allowed inside,
+ * bare ones not — then `(#anchor)` or `(doc.md#anchor)`, the anchor free of spaces and
+ * parentheses. Any other target (`https://…`, `notes.md#x`, `#a b`) is not one.
  */
-function parseStyled(text: string): InlineSegment[] {
+const CITE_AT = /^\[((?:\\[\s\S]|[^[\]\\\n])+)\]\((?:doc\.md)?#([^\s()]*)\)/
+
+/** The section link opening at `index`, or null. Its text is read like any other inline
+ *  run — math and emphasis drawn — but holds no link of its own. */
+function citeAt(text: string, index: number): { segment: InlineSegment; length: number } | null {
+  const match = CITE_AT.exec(text.slice(index))
+  const label = match?.[1] ?? ''
+  if (!match || !label.trim()) {
+    return null
+  }
+  const segments = parseInline(label)
+  return {
+    segment: { kind: 'cite', segments, label: plainText(segments).replace(/\s+/g, ' ').trim(), anchor: match[2] ?? '', src: match[0] },
+    length: match[0].length,
+  }
+}
+
+/**
+ * Parses the styled-inline shapes — emphasis, code, `<br>`, `<sup>`/`<sub>` and, when asked,
+ * section links — inside one math-free run of text. Recursive for nesting (`_**Abstract**_`
+ * is an `em` holding a `strong`); anything that fails a marker's rules stays literal text,
+ * which is also the wrong-guess fallback: visible markers beat text silently bolded.
+ */
+function parseStyled(text: string, options?: InlineOptions): InlineSegment[] {
+  const cites = options?.cites === true
   const segments: InlineSegment[] = []
   let cursor = 0
   let scan = 0
@@ -649,7 +688,7 @@ function parseStyled(text: string): InlineSegment[] {
 
   while (scan < text.length) {
     const char = text[scan]
-    if (char !== '*' && char !== '_' && char !== '`' && char !== '<' && char !== '\\') {
+    if (char !== '*' && char !== '_' && char !== '`' && char !== '<' && char !== '\\' && !(cites && char === '[')) {
       scan += 1
       continue
     }
@@ -669,6 +708,15 @@ function parseStyled(text: string): InlineSegment[] {
       scan += 1
       continue
     }
+    if (char === '[') {
+      const cite = citeAt(text, scan)
+      if (cite) {
+        push(cite.segment, cite.length)
+        continue
+      }
+      scan += 1
+      continue
+    }
     const rest = text.slice(scan)
     if (char === '<') {
       const br = BR_AT.exec(rest)
@@ -679,7 +727,7 @@ function parseStyled(text: string): InlineSegment[] {
       const script = SCRIPT_AT.exec(rest)
       if (script) {
         const kind = script[1]?.toLowerCase() === 'sub' ? 'sub' : 'sup'
-        push({ kind, segments: parseStyled(script[2] ?? ''), src: script[0] }, script[0].length)
+        push({ kind, segments: parseStyled(script[2] ?? '', options), src: script[0] }, script[0].length)
         continue
       }
       scan += 1
@@ -703,7 +751,7 @@ function parseStyled(text: string): InlineSegment[] {
           {
             kind: 'em',
             segments: [
-              { kind: 'strong', segments: parseStyled(content), src: `**${content}**` },
+              { kind: 'strong', segments: parseStyled(content, options), src: `**${content}**` },
             ],
             src: triple[0],
           },
@@ -717,12 +765,12 @@ function parseStyled(text: string): InlineSegment[] {
     const wordBefore = scan > 0 && WORD_CHAR.test(text[scan - 1] ?? '')
     const strong = char === '*' ? STRONG_AST_AT.exec(rest) : wordBefore ? null : STRONG_UND_AT.exec(rest)
     if (strong) {
-      push({ kind: 'strong', segments: parseStyled(strong[1] ?? ''), src: strong[0] }, strong[0].length)
+      push({ kind: 'strong', segments: parseStyled(strong[1] ?? '', options), src: strong[0] }, strong[0].length)
       continue
     }
     const em = char === '*' ? EM_AST_AT.exec(rest) : wordBefore ? null : EM_UND_AT.exec(rest)
     if (em) {
-      push({ kind: 'em', segments: parseStyled(em[1] ?? ''), src: em[0] }, em[0].length)
+      push({ kind: 'em', segments: parseStyled(em[1] ?? '', options), src: em[0] }, em[0].length)
       continue
     }
     scan += 1
@@ -741,15 +789,18 @@ function parseStyled(text: string): InlineSegment[] {
  * closer, so "cost $5 and variable $x$" would lose the real formula. Splitting math first
  * also keeps `$a_{1}$` out of the underscore-emphasis rules; the cost is that emphasis
  * *around* a math span stays source characters, which is the rarer shape.
+ *
+ * `cites` reads section links as well (`InlineOptions`); without it a link is the text it
+ * always was.
  */
-export function parseInline(text: string): InlineSegment[] {
+export function parseInline(text: string, options?: InlineOptions): InlineSegment[] {
   const segments: InlineSegment[] = []
   let cursor = 0
   let scan = 0
 
   function flushStyled(end: number): void {
     if (end > cursor) {
-      segments.push(...parseStyled(text.slice(cursor, end)))
+      segments.push(...parseStyled(text.slice(cursor, end), options))
     }
   }
 
@@ -761,6 +812,15 @@ export function parseInline(text: string): InlineSegment[] {
     // literal character (the same rule parseStyled applies), so it must not open a span
     // here and swallow a real formula behind it.
     const tick = text.indexOf('`', scan)
+    // A section link before the next dollar is stepped over whole too: its text may hold
+    // math of its own (`[3.1 The $\epsilon$-greedy policy](#…)`), which parseStyled reads
+    // with the link rather than splitting the link around it.
+    const bracket = options?.cites && open !== -1 ? text.indexOf('[', scan) : -1
+    if (bracket !== -1 && bracket < open && (tick === -1 || bracket < tick)) {
+      const cite = isEscaped(text, bracket) ? null : citeAt(text, bracket)
+      scan = bracket + (cite ? cite.length : 1)
+      continue
+    }
     if (tick !== -1 && (open === -1 || tick < open)) {
       const code = isEscaped(text, tick) ? null : CODE_AT.exec(text.slice(tick))
       scan = tick + (code ? code[0].length : 1)
@@ -790,4 +850,149 @@ export function parseInline(text: string): InlineSegment[] {
     segments.push({ kind: 'text', text: '' })
   }
   return segments
+}
+
+/** Inline segments as the text they draw: markdown removed, a formula as its TeX. What a
+ *  heading and a section link are compared by, and how a heading reads in a chip. */
+export function plainText(segments: readonly InlineSegment[]): string {
+  return segments
+    .map((segment) => {
+      switch (segment.kind) {
+        case 'text':
+        case 'code':
+          return segment.text
+        case 'math':
+          return segment.tex
+        case 'br':
+          return ' '
+        default:
+          return plainText(segment.segments)
+      }
+    })
+    .join('')
+}
+
+/** A line of inline markdown as plain text, its spacing collapsed. */
+export function inlinePlain(text: string): string {
+  return plainText(parseInline(text)).replace(/\s+/g, ' ').trim()
+}
+
+// --- the document's sections ----------------------------------------------------------------
+//
+// The agent panel adds a section to a message by its heading and draws an answer's link to
+// one as a chip that scrolls the document there (docs/web.md § The agent panel). Both read
+// the document's headings the same way, from the blocks the viewer renders.
+
+/** One heading of the document, where it sits and the two ways a link can name it. */
+export interface OutlineEntry {
+  /** Indices into the parsed pages and that page's blocks. */
+  page: number
+  index: number
+  /** The `#…` depth the source wrote. */
+  level: number
+  /** The heading's markdown as the document has it. */
+  text: string
+  /** Its text with the markdown removed. */
+  plain: string
+  /** `plain` with its spacing collapsed and lower-cased: what a link's text is matched by. */
+  key: string
+  /** Its GitHub-style anchor, a repeat numbered as GitHub numbers it (`intro-1`). */
+  slug: string
+}
+
+/** How a heading's text is compared: spacing and case ignored. */
+export function headingKey(plain: string): string {
+  return plain.replace(/\s+/g, ' ').trim().toLowerCase()
+}
+
+/** GitHub's anchor for a heading: lower case, every character but letters, digits, `_`,
+ *  `-` and spaces dropped, each space a hyphen. */
+export function headingSlug(plain: string): string {
+  return plain
+    .toLowerCase()
+    .replace(/[^\p{L}\p{M}\p{N}\p{Pc}\- ]/gu, '')
+    .replace(/ /g, '-')
+}
+
+/** Every heading of the document in reading order, page markers crossed. */
+export function documentOutline(pages: readonly ResultPageBlocks[]): OutlineEntry[] {
+  const outline: OutlineEntry[] = []
+  const repeats = new Map<string, number>()
+  pages.forEach((page, pageIndex) => {
+    page.blocks.forEach((block, index) => {
+      if (block.kind !== 'h2' && block.kind !== 'h3') {
+        return
+      }
+      const plain = inlinePlain(block.text)
+      const slug = headingSlug(plain)
+      const seen = repeats.get(slug) ?? 0
+      repeats.set(slug, seen + 1)
+      outline.push({
+        page: pageIndex,
+        index,
+        level: block.level,
+        text: block.text,
+        plain,
+        key: headingKey(plain),
+        slug: seen ? `${slug}-${seen}` : slug,
+      })
+    })
+  })
+  return outline
+}
+
+/** A link's anchor as a slug compares with one: percent-escapes read, lower case. */
+function anchorKey(anchor: string): string {
+  let decoded = anchor
+  try {
+    decoded = decodeURIComponent(anchor)
+  } catch {
+    // A stray `%` is part of the anchor as written.
+  }
+  return decoded.trim().toLowerCase()
+}
+
+/**
+ * The heading a section link points to: the first whose text matches the link's text,
+ * markdown removed and spacing and case ignored, else the one whose GitHub-style anchor is
+ * the link's (docs/web.md § The agent panel, *Section links*). Null when the document no
+ * longer has it — the link then reads as its plain text.
+ */
+export function findHeading(outline: readonly OutlineEntry[], label: string, anchor: string): OutlineEntry | null {
+  const key = headingKey(label)
+  const byText = key ? outline.find((entry) => entry.key === key) : undefined
+  if (byText) {
+    return byText
+  }
+  const slug = anchorKey(anchor)
+  return (slug && outline.find((entry) => entry.slug === slug)) || null
+}
+
+/**
+ * A whole section's markdown, as a message carries it (docs/chat.md § What a user message
+ * carries): the heading's source through the last block before the next heading of the
+ * same or a higher level (`#` count no deeper than its own), across page markers, blocks
+ * joined by blank lines. The markers and the document's other comments are left out — they
+ * are the file's bookkeeping, not the section. Null when the block is not a heading; how
+ * long is too long is the caller's to decide.
+ */
+export function sectionSource(pages: readonly ResultPageBlocks[], pageIndex: number, blockIndex: number): string | null {
+  const heading = pages[pageIndex]?.blocks[blockIndex]
+  if (!heading || (heading.kind !== 'h2' && heading.kind !== 'h3')) {
+    return null
+  }
+  const parts = [heading.src]
+  for (let page = pageIndex; page < pages.length; page += 1) {
+    const blocks = pages[page]?.blocks ?? []
+    for (let index = page === pageIndex ? blockIndex + 1 : 0; index < blocks.length; index += 1) {
+      const block = blocks[index]!
+      if ((block.kind === 'h2' || block.kind === 'h3') && block.level <= heading.level) {
+        return parts.join('\n\n')
+      }
+      if (block.kind !== 'comment' && block.src.trim()) {
+        parts.push(block.src)
+      }
+    }
+  }
+  return parts.join('\n\n')
 }

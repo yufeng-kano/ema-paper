@@ -13,7 +13,13 @@
  * and the `edit` events are the only place an edit's commit is named — the history's
  * editor calls carry the diff they asked for, not the revision they made — so replaying
  * them is what puts **Revert** back on a card after a reload. The stream ends by itself
- * once nothing is running, so the replay is one bounded read.
+ * once nothing is running, so the replay is one bounded read. The same replay brings back
+ * each turn's `turn_start` and `memory` events, which are all a reloaded thread has of what
+ * an answer used and what it saved to memory.
+ *
+ * The document is the viewer's: the panel reads its headings to offer whole sections and
+ * to tell which of an answer's section links still lead somewhere, and asks the viewer to
+ * scroll to one (`locate`).
  */
 import {
   attachmentUrl,
@@ -22,6 +28,7 @@ import {
   deleteConversation,
   getConversation,
   listConversations,
+  listMemories,
   revertRevision,
   sendMessage,
   type ChatEvent,
@@ -29,15 +36,28 @@ import {
   type ChatTurn,
   type ContentBlock,
   type Conversation,
+  type Memory,
 } from '~/lib/api'
-import { commandArguments, formatBytes, type ComposerPayload } from '~/lib/composer'
+import { commandArguments, formatBytes, type AskRequest, type ComposerPayload } from '~/lib/composer'
 import { nodesToMarkdown } from '~/lib/copy'
-import { parseResultMarkdown, type ResultBlock } from '~/lib/markdown'
+import {
+  documentOutline,
+  findHeading,
+  inlinePlain,
+  parseResultMarkdown,
+  sectionSource,
+  type CiteResolver,
+  type OutlineEntry,
+  type ResultBlock,
+  type ResultPageBlocks,
+} from '~/lib/markdown'
 import type { MenuItem, Point } from '~/lib/menu'
 import {
+  applyMemoryEvent,
   buildThread,
   isLive,
   type CardState,
+  type ContextCardView,
   type EditCard,
   type ThreadItem,
   type UserAttachment,
@@ -55,23 +75,34 @@ const props = defineProps<{
   documentId: number
   /** The document pane's current selection, read at the moment a message is composed. */
   documentSelection: () => string | null
+  /** The document as the viewer renders it: its headings are what sections are added by
+   *  and what an answer's section links lead to. */
+  documentPages: () => ResultPageBlocks[]
+  /** Where the heading of the section the document is scrolled to sits, if any. */
+  currentSection: () => { page: number; index: number } | null
 }>()
 
-/** The document's files changed on disk — an edit landed, or a revert — so reload them. */
-const emit = defineEmits<{ changed: [] }>()
+const emit = defineEmits<{
+  /** The document's files changed on disk — an edit landed, or a revert — so reload them. */
+  changed: []
+  /** An answer's section link was clicked: scroll the document to that heading. */
+  locate: [target: { label: string; anchor: string }]
+}>()
 
 const { t, locale } = useI18n()
 const { resolve } = useApiError()
 const auth = useAuth()
 
-/** The server's own numbers: the composer checks attachments against them. */
+/** The server's own numbers: the composer checks attachments and sections against them. */
 const limits = computed(() => auth.me.value?.limits ?? null)
 
-/** What the composer exposes to the panel: the drop zone and the reply toolbar feed it. */
+/** What the composer exposes to the panel: the drop zone, the reply toolbar and the
+ *  reader's view (`ask`) feed it. */
 interface ComposerControls {
   addFiles: (files: readonly File[]) => void
   setQuote: (text: string) => Promise<void>
   focus: () => void
+  ask: (request: AskRequest) => Promise<void>
 }
 
 const composer = ref<ComposerControls | null>(null)
@@ -172,6 +203,7 @@ async function removeConversation() {
     messages.value = []
     turns.value = []
     discardFrames()
+    card.value = null
     const next = conversations.value[0]
     if (next) {
       await select(next.id)
@@ -232,6 +264,7 @@ async function select(id: number) {
   messages.value = []
   turns.value = []
   discardFrames()
+  card.value = null
   following = true
   // The cards' state stays: keyed by tool-call id, it belongs to the card, not to the
   // conversation now open, and a thread switched away from and back must not offer to
@@ -254,6 +287,150 @@ async function startConversation() {
 }
 
 onMounted(loadConversations)
+
+// --- the document's sections ----------------------------------------------------------
+
+const outline = computed(() => documentOutline(props.documentPages()))
+
+/** Whether an answer's section link leads to a heading the document still has: one that
+ *  does is a chip, one that does not reads as its plain text (docs/web.md § The agent
+ *  panel, *Section links*). Read as the answer renders, so it follows the document. */
+const resolveCite: CiteResolver = (label, anchor) => findHeading(outline.value, label, anchor) !== null
+
+function currentSectionEntry(): OutlineEntry | null {
+  const at = props.currentSection()
+  return at ? (outline.value.find((entry) => entry.page === at.page && entry.index === at.index) ?? null) : null
+}
+
+function sectionSourceOf(entry: OutlineEntry): string | null {
+  return sectionSource(props.documentPages(), entry.page, entry.index)
+}
+
+/** A click on a section link in an answer: the viewer scrolls there. Taken here, from the
+ *  whole thread, since the links are drawn deep inside the answers' markdown. */
+function onThreadClick(event: MouseEvent) {
+  const link = event.target instanceof Element ? event.target.closest<HTMLElement>('.md-cite') : null
+  if (link && answerOf(link)) {
+    emit('locate', { label: link.dataset.citeLabel ?? '', anchor: link.dataset.citeAnchor ?? '' })
+  }
+}
+
+// --- memory -------------------------------------------------------------------------------
+
+/** The reader's memories as they are now: what each memory line's state is read from
+ *  (docs/web.md § The agent panel). Null until first read. Read when the panel opens, when
+ *  a `memory` event arrives — replayed ones included, since a line may be from another
+ *  tab's turn — and after each Undo. */
+const memories = ref<Memory[] | null>(null)
+const memoriesError = ref<string | null>(null)
+/** Numbers the reads: only the latest may fill the list. */
+let memoriesRequest = 0
+/** The memories changed — a `memory` event, a line's Undo — and no read has come back since:
+ *  the list is the one from before, or the panel's guess at what the change made of it. */
+const memoriesStale = ref(false)
+
+async function loadMemories() {
+  const request = ++memoriesRequest
+  try {
+    const { memories: rows } = await listMemories()
+    if (request === memoriesRequest) {
+      memories.value = rows
+      memoriesError.value = null
+      // The latest read began after every change so far.
+      memoriesStale.value = false
+    }
+  } catch (error) {
+    if (request === memoriesRequest) {
+      memoriesError.value = await resolve(error)
+    }
+  }
+}
+
+/** The memories changed under the list: read them again, and until that read succeeds take
+ *  the list as unconfirmed. */
+function memoriesChanged(): Promise<void> {
+  memoriesStale.value = true
+  return loadMemories()
+}
+
+/** The list the memory lines and the card read. One the read after a change failed to
+ *  confirm is withheld: the lines then wait, saying why, rather than offer an action on a
+ *  state that may be wrong. */
+const shownMemories = computed(() => (memoriesStale.value && memoriesError.value !== null ? null : memories.value))
+
+/** Turns the panel knows are over: the record says so, or their terminal frame has come. */
+function endedTurns(): Set<string> {
+  const ended = new Set(turns.value.filter((turn) => !isLive(turn)).map((turn) => turn.id))
+  for (const frame of events.value) {
+    if (frame.event.event === 'turn_done' || frame.event.event === 'turn_error') {
+      ended.add(frame.event.turn_id)
+    }
+  }
+  return ended
+}
+
+/**
+ * A memory a running turn saved, changed or forgot is folded into the list at once: its line
+ * renders with the frame, and read against the list from before the call a fresh save would
+ * read as undone for a round trip. A replayed frame of a turn already over is left to the read
+ * that follows — the list may well be newer than it. `live` says which turns are running.
+ */
+function applyMemoryFrames(frames: readonly StreamedEvent[], live: (turnId: string) => boolean) {
+  if (memories.value === null) {
+    return
+  }
+  const context = {
+    conversationId: currentId.value,
+    conversationTitle: current.value?.title ?? null,
+    now: new Date().toISOString(),
+  }
+  let rows = memories.value
+  for (const { event } of frames) {
+    if (event.event === 'memory' && live(event.turn_id)) {
+      rows = applyMemoryEvent(rows, event, context)
+    }
+  }
+  memories.value = rows
+}
+
+onMounted(loadMemories)
+
+/** The floating card a memory line's **View** or a part of the *Used* line opened, and the
+ *  control that opened it — where it stands, and where focus goes back to. */
+const card = ref<{ key: string; anchor: HTMLElement; view: ContextCardView } | null>(null)
+
+/** The same control again closes it; another opens its own. A card open is being read, so
+ *  the thread stops following under it — the card stays with its control, which a thread
+ *  kept at its end would carry off — and once it closes, follows again only from its end. */
+function openCard(key: string, anchor: HTMLElement, view: ContextCardView) {
+  if (card.value?.key === key) {
+    closeCard()
+    return
+  }
+  card.value = { key, anchor, view }
+  following = false
+}
+
+function closeCard() {
+  card.value = null
+  void settleFollowing()
+}
+
+type FootItem = Extract<ThreadItem, { kind: 'foot' }>
+type UsedPart = 'instructions' | 'memories'
+
+/** *Used: your instructions · 3 memories* — each part opens the card of what it names. */
+function openUsed(item: FootItem, part: UsedPart, anchor: HTMLElement) {
+  const view: ContextCardView =
+    part === 'instructions' ? { kind: 'instructions' } : { kind: 'memories', ids: item.used?.memoryIds ?? [] }
+  openCard(`${item.key}:${part}`, anchor, view)
+}
+
+/** Which part of this answer's *Used* line has its card open. */
+function usedExpanded(item: FootItem): UsedPart | null {
+  const key = card.value?.key ?? ''
+  return key === `${item.key}:instructions` ? 'instructions' : key === `${item.key}:memories` ? 'memories' : null
+}
 
 // --- the stream --------------------------------------------------------------------
 
@@ -288,12 +465,28 @@ function flushFrames() {
   }
   const batch = pendingFrames
   pendingFrames = []
+  const memoryFrames = batch.filter((frame) => frame.event.event === 'memory')
+  // Which turns were running is read before this batch joins the thread: a turn's terminal
+  // frame follows its memory frames, often in the same batch (a Stop during a save), and must
+  // not make that save read as a replay. A turn the panel does not know yet — a replay racing
+  // the record — counts as running only while this batch does not end it.
+  const endedBefore = memoryFrames.length ? endedTurns() : null
+  const liveBefore = new Set(turns.value.filter(isLive).map((turn) => turn.id))
   events.value = events.value.concat(batch)
   // A replayed edit of a finished turn changed nothing since the viewer loaded; one of a
   // turn still in flight did. One reload covers however many landed in this batch.
   if (liveEdit) {
     liveEdit = false
     emit('changed')
+  }
+  // A memory saved, changed or forgotten: its line's state is read from the list.
+  if (endedBefore) {
+    const endedNow = endedTurns()
+    applyMemoryFrames(
+      memoryFrames,
+      (turnId) => !endedBefore.has(turnId) && (liveBefore.has(turnId) || !endedNow.has(turnId)),
+    )
+    void memoriesChanged()
   }
   const ended = batch.some(
     (frame) => frame.event.event === 'turn_done' || frame.event.event === 'turn_error',
@@ -445,6 +638,11 @@ function userText(item: UserItem): string {
   return item.command ? commandArguments(item.text, item.command) : item.text
 }
 
+/** A sent passage as its chip shows it: its first words on one line. */
+function selectionPreview(text: string): string {
+  return text.replace(/\s+/g, ' ').trim()
+}
+
 /** An attached image's thumbnail: its local preview until the record holds the message,
  *  then the stored block's bytes. */
 function imageSource(item: UserItem, attachment: UserAttachment): string | null {
@@ -592,6 +790,10 @@ function sentContent(payload: ComposerPayload): ContentBlock[] {
   if (payload.selection) {
     blocks.push({ type: 'text', text: payload.selection, context: 'selection' })
   }
+  // Served without their text, as the record serves them.
+  for (const section of payload.sections) {
+    blocks.push({ type: 'text', text: '', context: 'section', section: section.heading })
+  }
   if (payload.quote) {
     blocks.push({ type: 'text', text: payload.quote, context: 'quote' })
   }
@@ -619,6 +821,7 @@ async function submit(payload: ComposerPayload): Promise<boolean> {
     const { turn_id, message_id } = await sendMessage(id, {
       text: payload.text,
       ...(payload.selection ? { selection: payload.selection } : {}),
+      ...(payload.sections.length ? { sections: payload.sections } : {}),
       ...(payload.quote ? { quote: payload.quote } : {}),
       ...(payload.command ? { command: payload.command } : {}),
       ...(payload.attachments.length ? { attachments: payload.attachments.map((entry) => entry.id) } : {}),
@@ -826,6 +1029,16 @@ function onDrop(event: DragEvent) {
 
 const maxAttachmentBytes = computed(() => limits.value?.attachment_max_bytes ?? null)
 
+/**
+ * For the reader's view: put a passage, a whole section or a command in the composer and
+ * focus it — sent at once with `send`, while nothing runs and nothing was being typed.
+ */
+function ask(request: AskRequest) {
+  void composer.value?.ask(request)
+}
+
+defineExpose({ ask })
+
 onMounted(() => {
   document.addEventListener('selectionchange', scheduleToolbar)
   window.addEventListener('pointerup', onPointerUp)
@@ -883,6 +1096,7 @@ onBeforeUnmount(() => {
       ref="scroller"
       class="thread"
       @pointerdown="onThreadPointerDown"
+      @click="onThreadClick"
       @scroll="onThreadScroll"
       @wheel.passive="onThreadWheel"
     >
@@ -922,17 +1136,51 @@ onBeforeUnmount(() => {
             <span v-if="item.command" class="user-command mono">/{{ item.command }}</span>
             <span v-if="userText(item)" class="user-text">{{ userText(item) }}</span>
           </p>
-          <p v-if="item.selection" class="user-selection">{{ t('chat.selection', { count: item.selection }) }}</p>
+          <!-- What went with it, as the composer's chips showed it, without remove controls. -->
+          <div v-if="item.selection || item.sections.length" class="user-context">
+            <ChatContextChip v-if="item.selection" icon="text-quote" :text="selectionPreview(item.selection)" />
+            <ChatContextChip
+              v-for="(heading, index) in item.sections"
+              :key="index"
+              icon="heading"
+              :text="t('chat.context.section', { heading: inlinePlain(heading) })"
+              :tooltip="inlinePlain(heading)"
+            />
+          </div>
         </div>
 
-        <div v-else-if="item.kind === 'text'" class="answer">
-          <div class="assistant md-message md-side">
-            <MdBlock v-for="(block, index) in messageBlocks(item.text)" :key="index" :block="block" :page="1" />
-          </div>
-          <!-- The last answer of a finished turn copies whole, as its markdown. -->
-          <div v-if="item.copy" class="answer-tools">
-            <UiCopyButton :text="item.text" size="xs" :label="t('chat.copyAnswer')" />
-          </div>
+        <!-- An answer: its section links are chips that scroll the document there. -->
+        <div v-else-if="item.kind === 'text'" class="assistant md-message md-side">
+          <MdBlock
+            v-for="(block, index) in messageBlocks(item.text)"
+            :key="index"
+            :block="block"
+            :page="1"
+            :cite="resolveCite"
+          />
+        </div>
+
+        <ChatMemoryLine
+          v-else-if="item.kind === 'memory'"
+          :line="item.line"
+          :memories="shownMemories"
+          :conversation-id="currentId"
+          :load-error="memoriesError"
+          :reload="memoriesChanged"
+          :viewing="card?.key === item.key"
+          @view="(anchor) => openCard(item.key, anchor, { kind: 'memory', line: item.line })"
+        />
+
+        <!-- Under a finished turn's last answer: what it used, and the control that copies
+             it whole, as its markdown. -->
+        <div v-else-if="item.kind === 'foot'" class="answer-foot">
+          <UiCopyButton :text="item.text" size="xs" :label="t('chat.copyAnswer')" />
+          <ChatUsedLine
+            v-if="item.used"
+            :used="item.used"
+            :expanded="usedExpanded(item)"
+            @open="(part, anchor) => openUsed(item, part, anchor)"
+          />
         </div>
 
         <ChatStepGroup
@@ -979,10 +1227,22 @@ onBeforeUnmount(() => {
       :stopping="stopping"
       :limits="limits"
       :document-selection="documentSelection"
+      :outline="outline"
+      :current-section="currentSectionEntry"
+      :section-source="sectionSourceOf"
       :submit="submit"
       :error="composerError"
       @stop="stop"
       @new-conversation="startConversation"
+    />
+
+    <ChatContextCard
+      v-if="card"
+      :anchor="card.anchor"
+      :view="card.view"
+      :memories="shownMemories"
+      :load-error="memoriesError"
+      @close="closeCard"
     />
 
     <!-- A file dragged over the panel: the whole column is the target. -->
@@ -1233,21 +1493,16 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 
-.user-selection {
-  margin: 0;
-  font-size: var(--text-xs);
-  color: var(--muted);
-  text-align: right;
+/* What went with the message, as chips under it: a passage and whole sections. */
+.user-context {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+  max-width: 88%;
 }
 
 /* --- the agent's answer --------------------------------------------------------------- */
-
-.answer {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  min-width: 0;
-}
 
 /* The assistant's markdown at the panel's UI scale: the document's blocks, drawn smaller. */
 .assistant {
@@ -1269,9 +1524,23 @@ onBeforeUnmount(() => {
   line-height: 1.6;
 }
 
-.answer-tools {
+/* The memory lines and the foot belong to the answer above them, not to the thread's rhythm:
+   they sit closer to it than one item to the next. */
+.thread > .assistant + .memory-line,
+.thread > .memory-line + .memory-line {
+  margin-top: calc(-1 * var(--space-2));
+}
+
+.answer-foot {
   display: flex;
-  gap: 2px;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px var(--space-3);
+  margin-top: calc(-1 * var(--space-3));
+}
+
+/* The copy control's glyph lines up with the answer's edge, past its own padding. */
+.answer-foot > :first-child {
   margin-left: -5px;
 }
 

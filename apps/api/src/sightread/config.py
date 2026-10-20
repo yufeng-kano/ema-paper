@@ -138,6 +138,17 @@ class Settings(BaseSettings):
     chat_skills_max: int = 64
     chat_subagents_max: int = 32
     chat_subagent_max_tool_calls: int = 1000
+    # The reader's instructions, appended after the prompt (docs/chat.md § Instructions).
+    chat_instructions_max_chars: int = 8000
+    # The agent's memories of the reader: one memory's text, how many a reader keeps, and
+    # how much of them one conversation loads into its memory block (docs/chat.md § Memory).
+    chat_memory_max_chars: int = 500
+    chat_memories_max: int = 200
+    chat_memory_block_max_chars: int = 12_000
+    # Whole sections the reader adds to one message by their heading (docs/chat.md § What
+    # a user message carries); each is capped like the selection, its heading on its own.
+    chat_sections_per_message: int = 4
+    chat_section_heading_max_chars: int = 512
 
     # The sandbox runner (docs/sandbox.md). Empty URL = no sandbox: the chat agent runs
     # without its bash tool. The token is what api and worker present to the runner.

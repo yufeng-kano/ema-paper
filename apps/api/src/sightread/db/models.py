@@ -218,6 +218,19 @@ class AgentSetting(Base):
     effort: Mapped[str] = mapped_column(
         String(8), default=EFFORT_DEFAULT, server_default=text("'medium'")
     )
+    # The chat agent's instructions from the reader, appended after the prompt as a block
+    # of their own; NULL for none (docs/chat.md § Instructions).
+    instructions: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Language tags the chat agent answers and translates into; NULL follows the reader's
+    # locale of each message.
+    answer_language: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    translate_language: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # The chat agent's memory switches: it saves on its own, and memory is paused — kept,
+    # neither read nor written (docs/chat.md § Memory).
+    memory_auto: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
+    memory_paused: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false")
+    )
 
     connection: Mapped[ProviderConnection | None] = relationship(
         foreign_keys=[connection_id], lazy="selectin"
@@ -459,6 +472,9 @@ class Conversation(Base):
     # Set by the first turn and kept: the stored thinking blocks belong to this model
     # (docs/chat.md § History is append-only).
     model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # The ids of the memories its first turn loaded, in the order they are rendered; NULL
+    # until a turn took the snapshot (docs/chat.md § Memory).
+    memory_ids: Mapped[list | None] = mapped_column(JSON_COLUMN, nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
 
@@ -564,6 +580,58 @@ class Subagent(Base):
     # only with `writes`.
     tools: Mapped[list] = mapped_column(JSON_COLUMN, default=list)
     prompt: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
+
+
+MEMORY_KINDS = ("term", "preference", "about", "document")
+
+
+class Memory(Base):
+    """One of the chat agent's notes about the reader, kept across conversations: the reader
+    lists and edits them on the Agent page, the agent reads them from its system prompt and
+    writes them with its `memory` tool (docs/chat.md § Memory)."""
+
+    __tablename__ = "memories"
+    __table_args__ = (
+        Index("ix_memories_user_updated", "user_id", "updated_at"),
+        # What a document's delete (CASCADE) and a conversation's (SET NULL) look rows up
+        # by: without them every such delete scans every reader's memories
+        # (docs/database.md).
+        Index(
+            "ix_memories_document_id",
+            "document_id",
+            postgresql_where=text("document_id IS NOT NULL"),
+            sqlite_where=text("document_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_memories_conversation_id",
+            "conversation_id",
+            postgresql_where=text("conversation_id IS NOT NULL"),
+            sqlite_where=text("conversation_id IS NOT NULL"),
+        ),
+        CheckConstraint(
+            "kind IN ('term', 'preference', 'about', 'document')", name="ck_memories_kind"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    kind: Mapped[str] = mapped_column(String(16))
+    text: Mapped[str] = mapped_column(Text)
+    # The one document it applies to; NULL for every document. A note about one document
+    # goes with it, never widened to every document.
+    document_id: Mapped[int | None] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), nullable=True
+    )
+    # Always loaded by a new conversation. (A plain default: `text` is a column here.)
+    pinned: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    # The conversation that saved it, and the `tool_use_id` of the call: deleting the
+    # conversation keeps what it saved.
+    conversation_id: Mapped[int | None] = mapped_column(
+        ForeignKey("conversations.id", ondelete="SET NULL"), nullable=True
+    )
+    source_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
 

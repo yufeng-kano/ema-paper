@@ -9,9 +9,12 @@ import {
   putDocumentNotes,
   type JobResult,
 } from '~/lib/api'
-import { cellGroupsToMarkdown, nodesToMarkdown, type OrphanListContext } from '~/lib/copy'
+import type { AskRequest } from '~/lib/composer'
+import { cellGroupsToMarkdown, nodesToMarkdown, selectionText, type OrphanListContext } from '~/lib/copy'
 import {
   appendBlockSource,
+  documentOutline,
+  findHeading,
   parseResultMarkdown,
   replaceBlockSource,
   type Bbox,
@@ -898,7 +901,8 @@ function onResizeKey(event: KeyboardEvent, column: 'notes' | 'agent') {
 }
 
 /** The document's current selection as text, for the agent — null when there is none or
- *  it lies outside the document pane. */
+ *  it lies outside the document pane. Read off a clone of the range, so each formula goes
+ *  as its TeX rather than as KaTeX's glyphs (`selectionText`). */
 function documentSelection(): string | null {
   const selection = window.getSelection()
   const box = scroller.value
@@ -909,8 +913,102 @@ function documentSelection(): string | null {
   if (!box.contains(range.commonAncestorContainer)) {
     return null
   }
-  const text = selection.toString().trim()
+  const text = selectionText(range.cloneContents().childNodes)
   return text || null
+}
+
+// --- the agent panel's view of the document ---------------------------------------
+
+/** The agent panel: the reader's view asks it (`ask`) to take a passage, a section or a
+ *  command (docs/web.md § The agent panel). */
+const chatPanel = ref<{ ask: (request: AskRequest) => void } | null>(null)
+
+const outline = computed(() => documentOutline(pages.value))
+
+/** The document as rendered, read when the panel needs it rather than handed over whole. */
+function documentPages() {
+  return pages.value
+}
+
+/** The heading of the section in view: the last one above a third of the way down the pane,
+ *  where a reader's eye is. Null above the first heading. */
+function currentSection(): { page: number; index: number } | null {
+  const box = scroller.value
+  if (!box || tab.value !== 'markdown') {
+    return null
+  }
+  const line = box.getBoundingClientRect().top + box.clientHeight / 3
+  let found: { page: number; index: number } | null = null
+  for (const entry of outline.value) {
+    const element = box.querySelector(`[data-block="${entry.page}-${entry.index}"]`)
+    if (!element?.getClientRects().length) {
+      continue
+    }
+    if (element.getBoundingClientRect().top > line) {
+      break
+    }
+    found = { page: entry.page, index: entry.index }
+  }
+  return found
+}
+
+/** How far under the pane's top a located heading lands: the line above it shows. */
+const LOCATE_MARGIN_PX = 48
+/** How long a located heading keeps its wash. */
+const FLASH_MS = 700
+/** How long the wash then takes to fade — `--duration-slow`, which the style fades it over. */
+const FADE_MS = 240
+
+/** The block a section link just led to, by `page-index`, washed for a moment; then the one
+ *  whose wash is fading. */
+const flashed = ref<string | null>(null)
+const fading = ref<string | null>(null)
+let flashTimer: ReturnType<typeof setTimeout> | null = null
+
+onBeforeUnmount(() => {
+  if (flashTimer !== null) {
+    clearTimeout(flashTimer)
+  }
+})
+
+/**
+ * An answer's section link, followed (docs/web.md § The agent panel, *Section links*): the
+ * heading scrolled near the pane's top and washed for a moment. An open editor holding it is
+ * written back first, so the heading is drawn — and found again, since that can move it.
+ */
+async function locateSection(target: { label: string; anchor: string }) {
+  if (tab.value !== 'markdown') {
+    tab.value = 'markdown'
+    await nextTick()
+    // After the tab's own watcher has put the reader's old place back.
+    await new Promise((done) => requestAnimationFrame(done))
+  }
+  let heading = findHeading(outline.value, target.label, target.anchor)
+  const open = editing.value
+  if (heading && open && open.page === heading.page && heading.index >= open.index && heading.index < open.index + span.value) {
+    commitEdit()
+    await nextTick()
+    heading = findHeading(outline.value, target.label, target.anchor)
+  }
+  const box = scroller.value
+  const element = heading ? box?.querySelector(`[data-block="${heading.page}-${heading.index}"]`) : null
+  if (!heading || !box || !element) {
+    return
+  }
+  box.scrollTop += element.getBoundingClientRect().top - box.getBoundingClientRect().top - LOCATE_MARGIN_PX
+  if (flashTimer !== null) {
+    clearTimeout(flashTimer)
+  }
+  fading.value = null
+  flashed.value = `${heading.page}-${heading.index}`
+  flashTimer = setTimeout(() => {
+    fading.value = flashed.value
+    flashed.value = null
+    flashTimer = setTimeout(() => {
+      fading.value = null
+      flashTimer = null
+    }, FADE_MS)
+  }, FLASH_MS)
 }
 
 // --- find in document ------------------------------------------------------
@@ -1418,7 +1516,12 @@ const awaitingContent = computed(
                     v-for="(block, index) in page.blocks"
                     :key="index"
                     class="block"
-                    :class="{ editable: editable && block.kind !== 'comment', open: isEditing(pageIndex, index) }"
+                    :class="{
+                      editable: editable && block.kind !== 'comment',
+                      open: isEditing(pageIndex, index),
+                      flash: flashed === `${pageIndex}-${index}`,
+                      'flash-fade': fading === `${pageIndex}-${index}`,
+                    }"
                     :tabindex="editable && block.kind !== 'comment' && !isEditing(pageIndex, index) ? 0 : undefined"
                     :data-block="`${pageIndex}-${index}`"
                     :hidden="isHeldByEditor(pageIndex, index)"
@@ -1575,9 +1678,13 @@ const awaitingContent = computed(
             :aria-label="t('chat.panel')"
           >
             <ChatPanel
+              ref="chatPanel"
               :document-id="documentId"
               :document-selection="documentSelection"
+              :document-pages="documentPages"
+              :current-section="currentSection"
               @changed="loadContent()"
+              @locate="locateSection"
             />
           </aside>
         </div>
@@ -1739,6 +1846,38 @@ const awaitingContent = computed(
    so, and nothing else does — a hover fill on every paragraph would make reading noisy. */
 .block {
   min-width: 0;
+}
+
+/* A heading an answer's section link led to: the accent's wash for a moment, spread past
+   the text so it reads as a place rather than a highlight (docs/web.md § The agent panel).
+   The wash is a layer behind the block, so the spread moves nothing, and only its background
+   changes — in, and back out as the block fades. */
+.block.flash,
+.block.flash-fade {
+  position: relative;
+  isolation: isolate;
+}
+
+.block.flash::before,
+.block.flash-fade::before {
+  content: '';
+  position: absolute;
+  inset: calc(-1 * var(--space-2));
+  z-index: -1;
+  border-radius: var(--radius);
+  background: var(--accent-wash);
+  pointer-events: none;
+  transition: background var(--duration-slow) var(--ease);
+}
+
+.block.flash-fade::before {
+  background: transparent;
+}
+
+@starting-style {
+  .block.flash::before {
+    background: transparent;
+  }
 }
 
 .block.editable {

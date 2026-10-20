@@ -143,11 +143,13 @@ def _raise_for_status(response: httpx.Response) -> None:
 async def _bounded_lines(
     response: httpx.Response, max_bytes: int, line_max_bytes: int
 ) -> AsyncIterator[str]:
-    """The body's lines, decoded, from fixed-size chunks; a line that outgrows
-    `line_max_bytes` or a body that outgrows `max_bytes` ends the read."""
+    """The body's lines, decoded, from the chunks as the transport hands them on; a line
+    that outgrows `line_max_bytes` or a body that outgrows `max_bytes` ends the read. No
+    chunk size is asked for: httpx would then hold the bytes until that many had come, and
+    an answer shorter than that would reach the reader in one piece at its end."""
     pending = bytearray()
     seen = 0
-    async for chunk in response.aiter_bytes(65_536):
+    async for chunk in response.aiter_bytes():
         seen += len(chunk)
         if seen > max_bytes:
             raise ResponseTooLarge()

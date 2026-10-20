@@ -277,6 +277,12 @@ async def test_switching_the_upstream_clears_a_model_from_the_other_catalog(sign
         "prompt_preset_id": None,
         "prompt": None,
         "effort": "medium",
+        # The chat agent's own settings, at their defaults: one shape for every agent.
+        "instructions": None,
+        "answer_language": None,
+        "translate_language": None,
+        "memory_auto": True,
+        "memory_paused": False,
         "bbox": {"family": "default", "format": "yxyx_norm1000"},
     }
     # Sent together, the model is kept: it was picked from the new upstream's catalog.

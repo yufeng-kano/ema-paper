@@ -25,7 +25,11 @@ def create_engine(database_url: str) -> AsyncEngine:
         if database_url.startswith("postgresql+asyncpg")
         else {}
     )
-    return create_async_engine(database_url, pool_pre_ping=True, connect_args=connect_args)
+    # A failed statement's log line never carries its bound values: they are the reader's
+    # text — a memory, instructions, a message — and that is never logged (docs/product.md).
+    return create_async_engine(
+        database_url, pool_pre_ping=True, hide_parameters=True, connect_args=connect_args
+    )
 
 
 def create_sessionmaker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:

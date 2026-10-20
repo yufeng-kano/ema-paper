@@ -22,7 +22,7 @@
  * the dialog's panel instead (`modalPanelKey`), which is still above every scroll container
  * in it, and the only place `aria-modal` leaves visible to assistive tech.
  */
-import { modalPanelKey, placeMenu, type MenuFact, type MenuItem, type Point } from '~/lib/menu'
+import { heightAbove, modalPanelKey, placeMenu, type MenuFact, type MenuItem, type Point } from '~/lib/menu'
 
 const props = defineProps<{
   /** Where the gesture happened, in viewport coordinates. */
@@ -41,9 +41,17 @@ const props = defineProps<{
    * pointer picks a row, exactly as the platform's own menus behave.
    */
   focusFirst?: boolean
+  /** Open over `at` rather than under it, wherever there is room there: a menu asked for at
+   *  the top of a control it must not cover — the composer's, at the foot of its column. */
+  above?: boolean
 }>()
 
-const emit = defineEmits<{ select: [string]; close: [] }>()
+const emit = defineEmits<{
+  select: [string]
+  /** With the event that closed it, when one did — a press, a key, a scroll — so the page can
+   *  tell the press on its own opener from any other. */
+  close: [cause?: Event]
+}>()
 
 const menu = ref<HTMLElement | null>(null)
 const modalPanel = inject(modalPanelKey, null)
@@ -81,7 +89,7 @@ function onKeydown(event: KeyboardEvent) {
   switch (event.key) {
     case 'Escape':
       event.stopPropagation()
-      emit('close')
+      emit('close', event)
       break
     case 'ArrowDown':
       event.preventDefault()
@@ -101,32 +109,32 @@ function onKeydown(event: KeyboardEvent) {
       break
     case 'Tab':
       // Tabbing away is leaving, and the browser's own focus move is the right one.
-      emit('close')
+      emit('close', event)
       break
   }
 }
 
 function onPointerdownOutside(event: PointerEvent) {
   if (!menu.value?.contains(event.target as Node)) {
-    emit('close')
+    emit('close', event)
   }
 }
 
 /** A second right-click closes this menu; the page opens the next one from its own handler. */
 function onContextmenuOutside(event: MouseEvent) {
   if (!menu.value?.contains(event.target as Node)) {
-    emit('close')
+    emit('close', event)
   }
 }
 
-function close() {
-  emit('close')
+function close(event: Event) {
+  emit('close', event)
 }
 
 /** Moving to an item scrolls a menu taller than the window, and that must not close it. */
 function onScrollOutside(event: Event) {
   if (!menu.value?.contains(event.target as Node)) {
-    emit('close')
+    emit('close', event)
   }
 }
 
@@ -134,12 +142,18 @@ function onScrollOutside(event: Event) {
 async function place() {
   await nextTick()
   const element = menu.value
-  const box = element?.getBoundingClientRect()
-  if (element && box) {
+  if (element) {
+    // Opened above its point, it is held to the room there, so a long list scrolls rather
+    // than being pushed down over the control below.
+    const room = props.above ? heightAbove(props.at) : null
+    element.style.maxHeight = room === null ? '' : `${room}px`
+    // The layout box, not the drawn one: the opening animation's scale would shrink it, and
+    // a menu placed by a size it does not have runs past the point it was meant to end at.
     const at = placeMenu(
       props.at,
-      { width: box.width, height: box.height },
+      { width: element.offsetWidth, height: element.offsetHeight },
       { width: window.innerWidth, height: window.innerHeight },
+      { above: props.above },
     )
     position.value = at
     origin.value = `${at.x < props.at.x ? 'right' : 'left'} ${at.y < props.at.y ? 'bottom' : 'top'}`
@@ -229,12 +243,13 @@ function choose(item: MenuItem) {
           tabindex="-1"
           class="item"
           :class="{ danger: item.danger, separated: item.separated }"
+          :title="item.label"
           @click="choose(item)"
         >
           <UiIcon v-if="item.checked" name="check" />
           <UiIcon v-else-if="item.icon" :name="item.icon" />
           <span v-else class="icon-space" />
-          {{ item.label }}
+          <span class="label">{{ item.label }}</span>
         </NuxtLink>
 
         <button
@@ -246,12 +261,13 @@ function choose(item: MenuItem) {
           class="item"
           :class="{ danger: item.danger, separated: item.separated }"
           :disabled="item.disabled"
+          :title="item.label"
           @click="choose(item)"
         >
           <UiIcon v-if="item.checked" name="check" />
           <UiIcon v-else-if="item.icon" :name="item.icon" />
           <span v-else class="icon-space" />
-          {{ item.label }}
+          <span class="label">{{ item.label }}</span>
         </button>
       </template>
     </div>
@@ -277,6 +293,8 @@ function choose(item: MenuItem) {
   /* Never taller than the window, less the margin `placeMenu` keeps on both sides: a menu
      that is scrolls, rather than putting its last items out of reach. */
   max-height: calc(100dvh - 16px);
+  /* Never sideways: a label longer than the menu is cut with an ellipsis instead. */
+  overflow-x: hidden;
   overflow-y: auto;
   padding: var(--space-1);
   border-radius: var(--radius-menu);
@@ -428,5 +446,13 @@ function choose(item: MenuItem) {
 .icon-space {
   width: 15px;
   flex-shrink: 0;
+}
+
+/* A label wider than the menu ends in an ellipsis; the row's title says it whole. */
+.label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 </style>

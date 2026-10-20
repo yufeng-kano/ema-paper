@@ -3,6 +3,7 @@ here reaches the network (docs/testing.md § Cost safety)."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 from decimal import Decimal
 
@@ -156,6 +157,40 @@ async def test_the_stream_becomes_blocks_the_runner_replays(key) -> None:
     assert final.usage.output_tokens == 42
     assert final.usage.cost == Decimal("0.012300")
     assert final.usage.cost_source == "estimated"
+
+
+@respx.mock
+async def test_each_event_is_handed_on_as_it_arrives(key) -> None:
+    """The reader sees an event the moment its bytes come, not once 64 KiB have piled up:
+    otherwise a short answer reaches the panel in one piece (docs/chat.md § Upstream)."""
+    first_seen = asyncio.Event()
+    whole = a_turn()
+    # Up to the first delta, the first event the reader is handed.
+    split = whole.index(b"\n\n", whole.index(b"thinking_delta")) + 2
+    head, tail = whole[:split], whole[split:]
+
+    async def body():
+        yield head
+        # The rest only comes once the first event was read: a reader that waits for more
+        # bytes before it parses would wait here for ever.
+        await first_seen.wait()
+        yield tail
+
+    respx.post(MESSAGES_URL).mock(
+        return_value=httpx.Response(
+            200, content=body(), headers={"content-type": "text/event-stream"}
+        )
+    )
+
+    async def read() -> list:
+        seen = []
+        async for event in stream_messages(key, {"model": "claude-opus-5-5", "messages": []}):
+            seen.append(event)
+            first_seen.set()
+        return seen
+
+    seen = await asyncio.wait_for(read(), 5)
+    assert isinstance(seen[-1], CompletedMessage)
 
 
 @respx.mock

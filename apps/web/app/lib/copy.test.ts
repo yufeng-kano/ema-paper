@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { cellGroupsToMarkdown, nodesToMarkdown, type MarkdownNode } from './copy'
+import { cellGroupsToMarkdown, nodesToMarkdown, selectionText, type MarkdownNode } from './copy'
 
 /** Minimal DOM stand-ins — the serializer reads a structural subset of `Node`. */
 function el(
@@ -296,5 +296,90 @@ describe('a table of contents', () => {
       ['**1 Introduction** **13**', '1.1 Sequential decision making . . . . . 13'].join('\n'),
     )
   })
+
+  it('hands an answer’s section link back as its markdown, chip or plain text', () => {
+    const source = '[3.2 Attention](#32-attention)'
+    const chip = el('button', { class: 'md-cite', type: 'button', 'data-src': source }, [
+      el('svg'),
+      text('3.2 Attention'),
+    ])
+    const plain = el('span', { class: 'md-cite-text', 'data-src': source }, [text('3.2 Attention')])
+
+    expect(nodesToMarkdown([el('p', { class: 'md-p' }, [text('See '), chip, text('.')])])).toBe(`See ${source}.`)
+    // A selection inside the paragraph arrives without it.
+    expect(nodesToMarkdown([text('See '), chip, text(' and '), plain])).toBe(`See ${source} and ${source}`)
+  })
 })
 
+/** KaTeX's output as the browser holds it: a MathML mirror with the TeX annotated, then the
+ *  glyphs, each layer read by `toString()` in turn. */
+function katex(tex: string, glyphs: string[], display = false): MarkdownNode {
+  const formula = el('span', { class: 'katex' }, [
+    el('span', { class: 'katex-mathml' }, [
+      el('math', {}, [
+        el('semantics', {}, [
+          el('mrow', {}, glyphs.map((glyph) => el('mi', {}, [text(glyph)]))),
+          el('annotation', { encoding: 'application/x-tex' }, [text(tex)]),
+        ]),
+      ]),
+    ]),
+    el('span', { class: 'katex-html', 'aria-hidden': 'true' }, glyphs.map((glyph) => el('span', {}, [text(glyph)]))),
+  ])
+  return display ? el('span', { class: 'katex-display' }, [formula]) : formula
+}
+
+describe('selectionText', () => {
+  it('sends a formula as its TeX, not as the glyphs of both its renderings', () => {
+    const inline = el('span', { class: 'md-inline-math', 'data-tex': '$d_{model}$' }, [
+      katex('d_{model}', ['𝑑', '𝑚', '𝑜', '𝑑', '𝑒', '𝑙']),
+    ])
+    const paragraph = el('p', { class: 'md-p' }, [text('Keys of '), inline, text('\n dimensions.')])
+    expect(selectionText([paragraph])).toBe('Keys of $d_{model}$ dimensions.')
+    // KaTeX the viewer did not draw itself: its annotation, display math between `$$`.
+    expect(selectionText([text('so '), katex('x^2', ['𝑥', '2'])])).toBe('so $x^2$')
+    expect(selectionText([el('div', {}, [katex('a+b', ['𝑎', '+', '𝑏'], true)])])).toBe('$$a+b$$')
+  })
+
+  it('keeps a formula whole when the selection starts inside it', () => {
+    // The clone keeps the partly selected span, attributes and all, but only the glyphs.
+    const cut = el('span', { class: 'md-inline-math', 'data-tex': '$d_k$' }, [
+      el('span', { class: 'katex' }, [el('span', { class: 'katex-html' }, [text('𝑘')])]),
+    ])
+    expect(selectionText([cut, text(' = 64')])).toBe('$d_k$ = 64')
+  })
+
+  it('puts each block on a line of its own and leaves out what is not on the page', () => {
+    const block = (...children: MarkdownNode[]) => el('div', { class: 'block' }, children)
+    const nodes = [
+      block(el('h3', { class: 'md-h2' }, [text('3.2 Attention')])),
+      el('div', { class: 'block', hidden: '' }, [el('p', {}, [text('held by an editor')])]),
+      block(el('p', {}, [text('  An attention function  '), el('br'), text('maps a query.')])),
+      block(el('pre', {}, [text('def f():\n    return 1')])),
+    ]
+    expect(selectionText(nodes)).toBe('3.2 Attention\nAn attention function\nmaps a query.\ndef f():\n    return 1')
+  })
+
+  it('keeps table cells apart, whether the selection holds the table, its rows or cells of one row', () => {
+    const row = (...cells: string[]) => el('tr', {}, cells.map((cell) => el('td', {}, [text(cell)])))
+    const table = el('table', {}, [
+      el('thead', {}, [el('tr', {}, [el('th', {}, [text('Model')]), el('th', {}, [text('BLEU')])])]),
+      el('tbody', {}, [row('Transformer (base)', '27.3'), row('Transformer (big)', '28.4')]),
+    ])
+    expect(selectionText([table])).toBe('Model\tBLEU\nTransformer (base)\t27.3\nTransformer (big)\t28.4')
+    expect(selectionText([row('a', '1'), row('b', '2')])).toBe('a\t1\nb\t2')
+    expect(selectionText([el('td', {}, [text('27.3')]), el('td', {}, [text('38.1')])])).toBe('27.3\t38.1')
+  })
+
+  it('reads a table the block editor holds as rows too, its cells wrapped in paragraphs', () => {
+    // A drag opens the blocks in the editor, which puts each cell's text in a `<p>`.
+    const cell = (...lines: string[]) =>
+      el('td', {}, [el('p', { class: 'md-p' }, lines.flatMap((line, i) => (i ? [el('br'), text(line)] : [text(line)])))])
+    const rows = [
+      el('tr', {}, [cell('Transformer base'), cell('27.3'), cell('38.1')]),
+      el('tr', {}, [cell('Transformer', 'big'), cell(' 28.4 '), cell('41.8')]),
+    ]
+    expect(selectionText([el('table', {}, [el('tbody', {}, rows)])])).toBe(
+      'Transformer base\t27.3\t38.1\nTransformer big\t28.4\t41.8',
+    )
+  })
+})

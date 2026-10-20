@@ -295,6 +295,40 @@ defineProps<{ name: IconName }>()
       <path d="M3 3v5h5" />
     </template>
 
+    <!-- locate: go to the place in the document an answer names. -->
+    <template v-else-if="name === 'locate'">
+      <path d="M2 12h3M19 12h3M12 2v3M12 19v3" />
+      <circle cx="12" cy="12" r="7" />
+    </template>
+    <!-- bookmark: a memory the agent keeps about the reader. -->
+    <template v-else-if="name === 'bookmark'">
+      <path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16z" />
+    </template>
+    <!-- bookmark-x: a memory removed, or a save undone. -->
+    <template v-else-if="name === 'bookmark-x'">
+      <path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16z" />
+      <path d="m14.5 7.5-5 5M9.5 7.5l5 5" />
+    </template>
+    <!-- text-quote: a passage of the document that goes with a message. -->
+    <template v-else-if="name === 'text-quote'">
+      <path d="M17 6H3M21 12H8M21 18H8M3 12v6" />
+    </template>
+    <!-- pin: always loaded. -->
+    <template v-else-if="name === 'pin'">
+      <path d="M12 17v5" />
+      <path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" />
+    </template>
+    <!-- pause: memory kept but not used. -->
+    <template v-else-if="name === 'pause'">
+      <rect x="6" y="4" width="4" height="16" rx="1" />
+      <rect x="14" y="4" width="4" height="16" rx="1" />
+    </template>
+    <!-- heading: a whole section of the document, named by its heading. -->
+    <template v-else-if="name === 'heading'">
+      <path d="M6 12h12" />
+      <path d="M6 20V4" />
+      <path d="M18 20V4" />
+    </template>
     <!-- check: the confirmation a copy swaps to. -->
     <template v-else>
       <path d="M20 6 9 17l-5-5" />

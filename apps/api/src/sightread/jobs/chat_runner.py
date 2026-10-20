@@ -52,7 +52,7 @@ from ..workspace import git
 from ..workspace.documents import DocumentPaths, ensure_within_quota, materialize_document
 from ..workspace.locks import clear_writing, mark_writing, shell_lock, workspace_lock
 from ..workspace.reconcile import reconcile_locked, reconcile_user
-from . import chat_events, chat_subagent, chat_tools
+from . import chat_events, chat_memory, chat_subagent, chat_tools
 from .queue import HISTORY_FULL, history_bytes
 
 logger = logging.getLogger(__name__)
@@ -97,13 +97,19 @@ class TurnContext:
     skills: dict[str, skill_defs.ResolvedSkill] = field(default_factory=dict)
     subagents: dict[str, subagent_defs.ResolvedSubagent] = field(default_factory=dict)
     facts: dict[str, str] = field(default_factory=dict)
+    # What the turn was given beyond the document, for its `turn_start` event: whether the
+    # reader's instructions went with it, and the memories its block rendered (docs/chat.md
+    # § Memory).
+    instructions: bool = False
+    memory_ids: list[int] = field(default_factory=list)
     tool_calls: int = 0
     # Encoded image bytes the turn's reads have returned so far, every round together
     # (docs/chat.md § Tools).
     image_spent: int = 0
-    # The mutating tool calls in flight — the agent's own or a subagent's — each with the
-    # tool it runs: every one is finished before the turn is, whatever ended the turn, and a
-    # shell command past its grace is killed in the VM.
+    # The mutating tool calls in flight — the agent's own or a subagent's, and the `memory`
+    # calls with what reports them — each with the tool it runs: every one is finished
+    # before the turn is, whatever ended the turn, and a shell command past its grace is
+    # killed in the VM.
     writers: dict[asyncio.Future, str] = field(default_factory=dict)
     # One write of the turn at a time, the agent's or any subagent's, each started only
     # after a look for a Stop (docs/chat.md § Tools).
@@ -171,6 +177,8 @@ async def _load(
         # to it as before, and never stands beside a prompt (docs/chat.md § System prompt).
         own_prompt = setting.prompt if setting and setting.prompt else None
         preset = setting.prompt_preset if setting and own_prompt is None else None
+        # Appended after the prompt, whichever is in force (docs/chat.md § Instructions).
+        instructions = setting.instructions if setting else None
         effort = setting.effort if setting and setting.effort else EFFORT_DEFAULT
         skills = skill_defs.resolve_skills(
             (await db.execute(select(Skill).where(Skill.user_id == turn.user_id))).scalars()
@@ -178,6 +186,16 @@ async def _load(
         subagents = subagent_defs.resolve_subagents(
             (await db.execute(select(Subagent).where(Subagent.user_id == turn.user_id))).scalars()
         )
+        # The memory block: the conversation's snapshot, taken by its first turn and stored
+        # with this commit, rendered from the rows as they are now (docs/chat.md § Memory).
+        memory = await chat_memory.load_turn_memory(
+            db,
+            settings,
+            conversation,
+            auto=setting.memory_auto if setting else True,
+            paused=setting.memory_paused if setting else False,
+        )
+        await db.commit()
         try:
             paths = await materialize_document(db, settings, document)
             # A full workspace runs no shell: what the turn writes has nowhere to go
@@ -186,37 +204,24 @@ async def _load(
         except ApiError as exc:
             raise TurnFailed(exc.message) from exc
 
-    facts = {
-        "document_path": str(chat_tools.VM_ROOT / paths.relative.as_posix()),
-        "page_count": str(job.page_count or 1),
-        "bbox_format": job.bbox_format,
-        "parse_model": job.model,
-        "network": chat_agent.network_note(settings.sandbox_network, settings.sandbox_index_url),
-    }
+    facts = document_facts(settings, job, paths)
     sandbox = SandboxClient(settings) if settings.sandbox_configured else None
-    tools = list(chat_agent.TOOLS if sandbox is not None else chat_agent.TOOLS_WITHOUT_BASH)
-    system = [
-        {
-            "type": "text",
-            # The tool list as the turn has it: no `bash` line without a runner.
-            "text": chat_agent.render_system_prompt(
-                own_prompt or CHAT.default_prompt_template,
-                facts,
-                tools=[tool["name"] for tool in tools],
-            ),
-        }
-    ]
-    if preset is not None and preset.text.strip():
-        system.append({"type": "text", "text": preset.text})
-    # The catalogue last: what the agent may load and start, read per turn like the prompt,
-    # so an edit on the Agent page misses the cache once (docs/chat.md § Prompt caching).
-    catalogue = chat_agent.render_catalogue(
-        [(skill.name, skill.description) for skill in skills if skill.model_invocable],
-        [(subagent.name, subagent.description, subagent.writes) for subagent in subagents],
+    tools = turn_tools(settings)
+    # The prompt, then a legacy preset, the reader's instructions, the catalogue — read
+    # per turn like the prompt, so an edit on the Agent page misses the cache once — and
+    # the memory block last (docs/chat.md § Prompt caching).
+    parts = chat_agent.system_parts(
+        # The tool list as the turn has it: no `bash` line without a runner.
+        chat_agent.render_system_prompt(
+            own_prompt or CHAT.default_prompt_template,
+            facts,
+            tools=[tool["name"] for tool in tools],
+        ),
+        preset=preset.text if preset is not None else None,
+        instructions=instructions,
+        catalogue=turn_catalogue(skills, subagents),
+        memory=memory.block,
     )
-    if catalogue is not None:
-        system.append({"type": "text", "text": catalogue})
-    system[-1]["cache_control"] = {"type": "ephemeral", "ttl": chat_agent.CACHE_TTL}
 
     return TurnContext(
         settings=settings,
@@ -229,13 +234,43 @@ async def _load(
         connection=connection,
         model=model,
         effort=effort,
-        system=system,
+        system=chat_agent.system_blocks(parts),
         tools=tools,
         sandbox=sandbox,
         render_slots=render_slots,
         skills={skill.name: skill for skill in skills},
         subagents={subagent.name: subagent for subagent in subagents},
         facts=facts,
+        instructions=any(part.kind == "instructions" for part in parts),
+        memory_ids=memory.ids,
+    )
+
+
+def document_facts(settings: Settings, job: Job, paths: DocumentPaths) -> dict[str, str]:
+    """The document's facts the prompt is rendered with (docs/chat.md § System prompt)."""
+    return {
+        "document_path": str(chat_tools.VM_ROOT / paths.relative.as_posix()),
+        "page_count": str(job.page_count or 1),
+        "bbox_format": job.bbox_format,
+        "parse_model": job.model,
+        "network": chat_agent.network_note(settings.sandbox_network, settings.sandbox_index_url),
+    }
+
+
+def turn_tools(settings: Settings) -> list[dict]:
+    """The tools a turn declares: every one, in its fixed order, but `bash` without a
+    sandbox runner — a tool the harness cannot run is not offered (docs/sandbox.md)."""
+    return list(chat_agent.TOOLS if settings.sandbox_configured else chat_agent.TOOLS_WITHOUT_BASH)
+
+
+def turn_catalogue(
+    skills: list[skill_defs.ResolvedSkill], subagents: list[subagent_defs.ResolvedSubagent]
+) -> str | None:
+    """The catalogue block of the reader's skills the agent may load and their subagents
+    (docs/chat.md § Skills, § Subagents)."""
+    return chat_agent.render_catalogue(
+        [(skill.name, skill.description) for skill in skills if skill.model_invocable],
+        [(subagent.name, subagent.description, subagent.writes) for subagent in subagents],
     )
 
 
@@ -309,9 +344,10 @@ async def _history(ctx: TurnContext) -> list[dict]:
 
 
 # The keys a stored block carries for the web app and the API never sees: the context
-# marker (docs/chat.md § Prompt caching), a command's skill, an attachment's name and a
-# subagent call's record (docs/chat.md § What a user message carries, § Subagents).
-PRIVATE_KEYS = frozenset({"context", "skill", "attachment", "subagent"})
+# marker (docs/chat.md § Prompt caching), a command's skill, an attachment's name, a
+# section's heading and a subagent call's record (docs/chat.md § What a user message
+# carries, § Subagents).
+PRIVATE_KEYS = frozenset({"context", "skill", "attachment", "section", "subagent"})
 
 
 def _api_blocks(content: object) -> object:
@@ -688,11 +724,58 @@ async def _run_tool_unguarded(
         outcome = _load_skill(ctx, tool_input)
     elif name == "subagent":
         outcome = await chat_subagent.run_subagent(ctx, tool_use_id, tool_input)
+    elif name == "memory":
+        return await _run_memory(ctx, tool_use_id, tool_input, admit)
     else:
         outcome = chat_tools.ToolOutcome(f"unknown tool {name!r}", is_error=True)
     if admit is not None:
         outcome = admit(outcome)
     return await _report_tool(ctx, tool_use_id, name, outcome)
+
+
+async def _run_memory(
+    ctx: TurnContext, tool_use_id: str, tool_input: dict, admit: Admit | None
+) -> dict:
+    """One `memory` call. It writes rows, no file, so it runs with the reads (docs/chat.md
+    § Tools); but its commit and what reports it — the tool_result and the `memory` event —
+    are one task, shielded and kept with the turn's writers, which the turn's end waits
+    for: a cancel between the two would leave a memory the thread draws no line for, with
+    no Undo (docs/chat.md § Memory)."""
+
+    # The task outlives a Stop or a timeout, and then nobody awaits it — so its failures are
+    # logged and reported here, not left to `_run_tool`, which by then has moved on.
+    async def run() -> dict:
+        try:
+            outcome = await chat_memory.run_memory_tool(
+                ctx.sessionmaker,
+                ctx.settings,
+                user_id=ctx.turn.user_id,
+                conversation_id=ctx.conversation.id,
+                document_id=ctx.document.id,
+                tool_use_id=tool_use_id,
+                tool_input=tool_input,
+            )
+        except Exception:  # noqa: BLE001 - any failure is this call's, never the turn's
+            logger.exception("tool memory failed in turn %s", ctx.turn.id)
+            outcome = chat_tools.ToolOutcome(
+                "The tool failed unexpectedly; try another way.", is_error=True
+            )
+        if admit is not None:
+            outcome = admit(outcome)
+        try:
+            return await _report_tool(ctx, tool_use_id, "memory", outcome)
+        except Exception:  # noqa: BLE001 - the events are lost, the model's answer is not
+            logger.exception("tool memory's events were not recorded in turn %s", ctx.turn.id)
+            result = {"type": "tool_result", "tool_use_id": tool_use_id, "content": outcome.content}
+            if outcome.is_error:
+                result["is_error"] = True
+            return result
+
+    task = asyncio.ensure_future(run())
+    ctx.writers[task] = "memory"
+    # Dropped when the call is done, not when this await ends, as a write's is.
+    task.add_done_callback(lambda done, ctx=ctx: ctx.writers.pop(done, None))
+    return await asyncio.shield(task)
 
 
 async def run_mutating(ctx: TurnContext, name: str, tool_input: dict) -> chat_tools.ToolOutcome:
@@ -843,6 +926,10 @@ async def _report_tool(
     await _emit(ctx, chat_events.TOOL_RESULT, data)
     if outcome.edit is not None:
         await _emit(ctx, chat_events.EDIT, {**outcome.edit, "tool_use_id": tool_use_id})
+    if outcome.memory is not None:
+        # The thread's quiet line with Undo, which finds the row by this id (docs/chat.md
+        # § Memory).
+        await _emit(ctx, chat_events.MEMORY, {"tool_use_id": tool_use_id, **outcome.memory})
     result: dict = {"type": "tool_result", "tool_use_id": tool_use_id, "content": outcome.content}
     if outcome.is_error:
         result["is_error"] = True
@@ -922,7 +1009,9 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
                 if stopped.is_set() or await _cancelled(ctx):
                     stopped.set()
                     return
-                refusal = exhausted()
+                # `memory` returns no image, so a spent budget is no reason to refuse it:
+                # a reader's "remember this" late in a page-by-page check still lands.
+                refusal = exhausted() if block.get("name") != "memory" else None
                 if refusal is not None:
                     results[index] = await _report_tool(
                         ctx, str(block.get("id")), block.get("name"), refusal
@@ -1088,9 +1177,9 @@ async def _finish(
 
 async def _settle_writers(ctx: TurnContext) -> None:
     """Wait for every mutating tool call the end of the turn interrupted — the agent's own
-    or a subagent's (docs/chat.md § Tools): cancelling the loop does not stop a shell
-    command in the VM or an editor thread, and the terminal event must not precede their
-    commit."""
+    or a subagent's, and a `memory` call (docs/chat.md § Tools): cancelling the loop does
+    not stop a shell command in the VM or an editor thread, and the terminal event must not
+    precede their commit, nor a memory's commit precede no event at all."""
     while pending := [writer for writer in ctx.writers if not writer.done()]:
         writer = pending[0]
         await _settle_writer(ctx, writer, ctx.writers.get(writer))
@@ -1140,7 +1229,13 @@ async def run_turn(
         await _finish(sessionmaker, turn_id, status="failed", error=str(exc))
         return
 
-    await _emit(ctx, chat_events.TURN_START, {"model": ctx.model})
+    # What the turn was given beyond the document: the answer's *Used:* line (docs/chat.md
+    # § Memory).
+    await _emit(
+        ctx,
+        chat_events.TURN_START,
+        {"model": ctx.model, "instructions": ctx.instructions, "memory_ids": ctx.memory_ids},
+    )
     try:
         async with asyncio.timeout(settings.chat_turn_timeout_seconds):
             await _loop(ctx)

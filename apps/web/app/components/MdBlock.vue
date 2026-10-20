@@ -11,14 +11,19 @@
  * A figure's crop is the caller's: `figureUrl` is the image to load, or null for the
  * dashed placeholder (no figure route, or a crop that already failed), and a load failure
  * is reported back so the caller can remember it per snapshot.
+ *
+ * `cite` is the agent panel's alone: given, an answer's links to the document's sections
+ * are read and drawn as chips — those whose heading it says the document still has
+ * (docs/web.md § The agent panel, *Section links*).
  */
-import type { Bbox, ResultBlock } from '~/lib/markdown'
+import type { Bbox, CiteResolver, ResultBlock } from '~/lib/markdown'
 
 const props = defineProps<{
   block: ResultBlock
   /** The page the block came from — what addresses its figure crop. */
   page: number
   figureUrl?: string | null
+  cite?: CiteResolver
 }>()
 
 const emit = defineEmits<{ 'figure-error': [page: number, bbox: Bbox] }>()
@@ -38,12 +43,12 @@ const figureSource = computed(() => {
 
 <template>
   <h3 v-if="block.kind === 'h2'" class="md-h2" :data-level="block.level">
-    <MdInline :text="block.text" />
+    <MdInline :text="block.text" :cite="cite" />
   </h3>
   <h4 v-else-if="block.kind === 'h3'" class="md-h3" :data-level="block.level">
-    <MdInline :text="block.text" />
+    <MdInline :text="block.text" :cite="cite" />
   </h4>
-  <p v-else-if="block.kind === 'p'" class="md-p"><MdInline :text="block.text" /></p>
+  <p v-else-if="block.kind === 'p'" class="md-p"><MdInline :text="block.text" :cite="cite" /></p>
 
   <!-- KaTeX-typeset, falling back to the verbatim source when it cannot parse. -->
   <MdMath v-else-if="block.kind === 'math'" :tex="block.text" />
@@ -60,7 +65,7 @@ const figureSource = computed(() => {
     :start="block.start"
   >
     <li v-for="(item, itemIndex) in block.items" :key="itemIndex">
-      <MdInline :text="item" />
+      <MdInline :text="item" :cite="cite" />
     </li>
   </component>
 
@@ -71,14 +76,14 @@ const figureSource = computed(() => {
       <thead>
         <tr>
           <th v-for="(cell, column) in block.header" :key="column" scope="col">
-            <MdInline :text="cell" />
+            <MdInline :text="cell" :cite="cite" />
           </th>
         </tr>
       </thead>
       <tbody>
         <tr v-for="(row, rowIndex) in block.rows" :key="rowIndex">
           <td v-for="(cell, column) in row" :key="column">
-            <MdInline :text="cell" />
+            <MdInline :text="cell" :cite="cite" />
           </td>
         </tr>
       </tbody>
@@ -89,7 +94,7 @@ const figureSource = computed(() => {
        column instead of wrapping; its `data-src` is the dots the line carried. -->
   <div v-else-if="block.kind === 'toc'" class="md-toc">
     <p v-for="(entry, entryIndex) in block.entries" :key="entryIndex" class="md-toc-row">
-      <span class="md-toc-title"><MdInline :text="entry.title" /></span>
+      <span class="md-toc-title"><MdInline :text="entry.title" :cite="cite" /></span>
       <template v-if="entry.page !== null">
         <span
           class="md-toc-leader"
@@ -120,7 +125,7 @@ const figureSource = computed(() => {
     <!-- Only the caption the page carried: the generated `figN` name and the bbox are how
          a crop is addressed, not something a reader was asked to read. -->
     <figcaption v-if="block.caption" class="figure-caption">
-      <MdInline :text="block.caption" />
+      <MdInline :text="block.caption" :cite="cite" />
     </figcaption>
   </figure>
 </template>

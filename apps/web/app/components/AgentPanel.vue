@@ -1,12 +1,14 @@
 <script setup lang="ts">
 /**
  * The selected agent's panel on `/agents` (docs/web.md § Pages, docs/agents.md): one row of
- * controls — which model of Kano Proxy's live catalog it runs, for the chat agent its
- * effort, and its prompt — then, for the chat agent, its tools, skills and subagents. Every
- * pick saves on change and hands the server's answer back through `saved`, so the page's
- * tab list reads the same state these controls write.
+ * controls — which model of Kano Proxy's live catalog it runs, then for the chat agent its
+ * effort, for the parse agent its prompt — then, for the chat agent, its instructions (with
+ * the whole prompt as their advanced option), its memory, its tools, skills and subagents.
+ * Every save hands the server's answer back through `saved`, so the page's tab list reads
+ * the same state these controls write.
  *
- * Nothing on this panel explains itself: labels, states and errors only (docs/web.md).
+ * Nothing on this panel explains itself beyond the few lines that state a consequence the
+ * controls cannot show: labels, states and errors only (docs/web.md).
  */
 import {
   AGENT_EFFORTS,
@@ -41,8 +43,8 @@ const title = computed(() =>
 )
 const settings = computed(() => props.agent.settings)
 
-/** The chat agent has the effort, tools, skills and subagents; parse has the coordinate
- *  convention. */
+/** The chat agent has the effort, instructions, memory, tools, skills and subagents; parse
+ *  has the coordinate convention and its prompt in the row. */
 const isChat = computed(() => props.agent.name === CHAT_AGENT)
 
 // --- model ----------------------------------------------------------------------
@@ -138,17 +140,20 @@ async function applyEffort(value: string) {
 
 // --- prompt ---------------------------------------------------------------------
 
-const promptOpen = ref(false)
-
+/** The prompt dialog answers for the agent it was opened on. */
 function onPromptSaved(saved: SavedAgentSettings) {
-  promptOpen.value = false
   emit('saved', props.agent.name, saved)
+}
+
+/** A section's own save, already named for its agent. */
+function onSectionSaved(agent: string, saved: SavedAgentSettings) {
+  emit('saved', agent, saved)
 }
 </script>
 
 <template>
   <div class="rows">
-    <!-- Model, effort and prompt: one row that wraps on a narrow window. ------------ -->
+    <!-- Model, then effort (chat) or prompt (parse): one row that wraps on a narrow window. -->
     <div class="row reveal-on-hover">
       <div class="controls">
         <UiField v-slot="{ id }" class="model" :label="t('agents.modelLabel')">
@@ -170,25 +175,14 @@ function onPromptSaved(saved: SavedAgentSettings) {
             <option v-for="effort in AGENT_EFFORTS" :key="effort" :value="effort">{{ t(`agents.effort.${effort}`) }}</option>
           </UiSelect>
         </UiField>
-        <!-- A button under a field label, named by the label and its state together. -->
-        <div class="prompt">
-          <span :id="`prompt-label-${agent.name}`" class="prompt-label">{{ t('agents.promptLabel') }}</span>
-          <UiButton
-            variant="secondary"
-            aria-haspopup="dialog"
-            :aria-labelledby="`prompt-label-${agent.name} prompt-state-${agent.name}`"
-            @click="promptOpen = true"
-          >
-            <span :id="`prompt-state-${agent.name}`">
-              {{
-                settings.prompt === null && settings.prompt_preset_id === null
-                  ? t('agents.promptDefault')
-                  : t('agents.promptEdited')
-              }}
-            </span>
-            <UiIcon name="edit" class="prompt-glyph" />
-          </UiButton>
-        </div>
+        <!-- The chat agent's prompt is its instructions' advanced option, not a row control. -->
+        <AgentsPromptField
+          v-if="!isChat"
+          :agent="agent"
+          :title="title"
+          :max-chars="promptMaxChars"
+          @saved="onPromptSaved"
+        />
       </div>
       <p v-if="convention" class="convention mono reveal">{{ convention }}</p>
       <p v-if="isChat" class="note">{{ t('agents.cacheNote') }}</p>
@@ -196,27 +190,26 @@ function onPromptSaved(saved: SavedAgentSettings) {
       <UiBanner v-if="effortError" class="row-banner" tone="error">{{ effortError }}</UiBanner>
     </div>
 
-    <!-- Tools (chat): read-only facts. The sandbox's state is on the Usage page. ---- -->
-    <div v-if="isChat" class="row">
-      <p class="tools-label">{{ t('agents.toolsLabel') }}</p>
-      <ul class="tools" :aria-label="t('agents.toolsLabel')">
-        <li v-for="tool in agent.tools" :key="tool" class="chip mono">{{ tool }}</li>
-      </ul>
-    </div>
-
     <template v-if="isChat">
+      <AgentsInstructionsSection
+        :agent="agent"
+        :title="title"
+        :prompt-max-chars="promptMaxChars"
+        @saved="onSectionSaved"
+      />
+      <AgentsMemorySection :agent="agent" @saved="onSectionSaved" />
+
+      <!-- Tools: read-only facts. The sandbox's state is on the Usage page. ---------- -->
+      <div class="row">
+        <p class="tools-label">{{ t('agents.toolsLabel') }}</p>
+        <ul class="tools" :aria-label="t('agents.toolsLabel')">
+          <li v-for="tool in agent.tools" :key="tool" class="chip mono">{{ tool }}</li>
+        </ul>
+      </div>
+
       <AgentsSkillsSection :max-chars="promptMaxChars" />
       <AgentsSubagentsSection :models="models" :max-chars="promptMaxChars" />
     </template>
-
-    <AgentsPromptDialog
-      v-if="promptOpen"
-      :agent="agent"
-      :title="title"
-      :max-chars="promptMaxChars"
-      @close="promptOpen = false"
-      @saved="onPromptSaved"
-    />
   </div>
 </template>
 
@@ -255,29 +248,6 @@ function onPromptSaved(saved: SavedAgentSettings) {
 .effort {
   flex: 0 1 8rem;
   min-width: 6rem;
-}
-
-.prompt {
-  display: grid;
-  flex: 0 0 auto;
-  gap: var(--space-2);
-}
-
-/* `UiField`'s label, for a control that is a button rather than a field. */
-.prompt-label {
-  font-size: var(--text-2xs);
-  font-weight: var(--weight-semibold);
-  letter-spacing: var(--tracking-label);
-  text-transform: uppercase;
-  color: var(--faint);
-}
-
-.prompt-glyph {
-  width: 14px;
-  height: 14px;
-  margin-left: var(--space-2);
-  vertical-align: -2px;
-  color: var(--muted);
 }
 
 /* A fact about the model, read when the reader looks for it: visible on hover or focus,

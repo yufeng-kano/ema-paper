@@ -14,6 +14,7 @@
 
 const TEXT_NODE = 3
 const ELEMENT_NODE = 1
+const DOCUMENT_FRAGMENT_NODE = 11
 
 /** The subset of `Node`/`Element` the serializer reads. Real DOM nodes satisfy it. */
 export interface MarkdownNode {
@@ -65,7 +66,8 @@ function inlineText(node: MarkdownNode): string {
   if (tex !== null) {
     return tex
   }
-  // Rendered emphasis, code, <br>, <sup> and <sub> carry their exact markdown source (docs/web.md).
+  // Rendered emphasis, code, <br>, <sup> and <sub> carry their exact markdown source (docs/web.md),
+  // and so does an answer's section link, drawn as a button or as its plain text.
   const src = attribute(node, 'data-src')
   if (src !== null) {
     return inlineSource(node, src)
@@ -94,7 +96,8 @@ function inlineSource(node: MarkdownNode, src: string): string {
   } else if (name === 'sup' || name === 'sub') {
     marker = `<${name}>`
   } else {
-    // <br> has no children to lose — its source is its source.
+    // <br> has no children to lose, and a section link is copied whole — its source is its
+    // source.
     return src
   }
   // A tag closes with its end tag; every other marker closes with itself.
@@ -250,8 +253,9 @@ function blockToMarkdown(node: MarkdownNode, partialBlocks?: ReadonlySet<string>
   }
 }
 
-/** Tags that carry inline content — a selection inside one paragraph arrives as these. */
-const INLINE_TAGS = new Set(['span', 'sup', 'sub', 'em', 'strong', 'i', 'b', 'a', 'code', 'br'])
+/** Tags that carry inline content — a selection inside one paragraph arrives as these. A
+ *  button is an answer's section link (docs/web.md § The agent panel). */
+const INLINE_TAGS = new Set(['span', 'sup', 'sub', 'em', 'strong', 'i', 'b', 'a', 'code', 'br', 'button'])
 
 function isInline(node: MarkdownNode): boolean {
   if (node.nodeType === TEXT_NODE) {
@@ -412,4 +416,144 @@ export function nodesToMarkdown(
   walkNodes(Array.from(nodes), walk, list)
   flush(walk)
   return walk.blocks.join('\n\n')
+}
+
+// --- the selection the agent is sent ------------------------------------------------------
+
+/** Elements that start a line of their own in the plain text. */
+const LINE_TAGS = new Set([
+  'address', 'article', 'blockquote', 'dd', 'div', 'dl', 'dt', 'figcaption', 'figure', 'h1', 'h2', 'h3', 'h4',
+  'h5', 'h6', 'li', 'ol', 'p', 'pre', 'section', 'table', 'tbody', 'thead', 'tr', 'ul',
+])
+
+/** The TeX a KaTeX element was typeset from, as its MathML annotation carries it. */
+function annotationOf(node: MarkdownNode): string | null {
+  if (tag(node) === 'annotation' && attribute(node, 'encoding') === 'application/x-tex') {
+    return node.textContent ?? ''
+  }
+  for (const child of children(node)) {
+    const found = annotationOf(child)
+    if (found !== null) {
+      return found
+    }
+  }
+  return null
+}
+
+/** A formula as the TeX it was written in, or null for anything else. The viewer's own
+ *  math carries its source (`data-tex`, `data-md`), whole even in a clone a selection
+ *  boundary cut short; any other KaTeX has its annotation. */
+function formulaSource(node: MarkdownNode, display: boolean): string | null {
+  const own = classes(node)
+  if (own.includes('md-inline-math')) {
+    return attribute(node, 'data-tex')
+  }
+  if (own.includes('md-math-block')) {
+    return attribute(node, 'data-md')
+  }
+  if (own.includes('katex')) {
+    const tex = annotationOf(node)?.trim()
+    if (tex) {
+      return display ? `$$${tex}$$` : `$${tex}$`
+    }
+  }
+  return null
+}
+
+/** A line ends here: a block's edge, or a `<br>`. */
+const BREAK = Symbol('break')
+
+/** The edge between two table cells on a row. */
+const CELL = Symbol('cell')
+
+/** A run of text; `pre` keeps its own spacing and lines, as a code block shows them. */
+type PlainPart = { text: string; pre: boolean } | typeof BREAK | typeof CELL
+
+/** Where a node sits: inside display math, inside a code block, inside a table cell. */
+interface PlainContext {
+  display: boolean
+  pre: boolean
+  cell: boolean
+}
+
+function plainParts(node: MarkdownNode, out: PlainPart[], context: PlainContext): void {
+  if (node.nodeType === TEXT_NODE) {
+    const text = node.textContent ?? ''
+    out.push({ text: context.pre ? text : text.replace(/\s+/g, ' '), pre: context.pre })
+    return
+  }
+  if (node.nodeType !== ELEMENT_NODE && node.nodeType !== DOCUMENT_FRAGMENT_NODE) {
+    return
+  }
+  // A block an open editor holds is not on the page, so not in what the reader selected.
+  if (attribute(node, 'hidden') !== null) {
+    return
+  }
+  const formula = formulaSource(node, context.display)
+  if (formula !== null) {
+    out.push({ text: formula, pre: true })
+    return
+  }
+  const name = tag(node)
+  // A cell is one value on its row: the paragraph the editor wraps a cell's text in, or a
+  // `<br>` in it, is a space there, never a line of its own.
+  const edge: PlainPart = context.cell ? { text: ' ', pre: false } : BREAK
+  if (name === 'br') {
+    out.push(edge)
+    return
+  }
+  const line = LINE_TAGS.has(name)
+  if (line) {
+    out.push(edge)
+  }
+  plainChildren(children(node), out, {
+    display: context.display || classes(node).includes('katex-display'),
+    pre: context.pre || name === 'pre',
+    cell: context.cell || name === 'td' || name === 'th',
+  })
+  if (line) {
+    out.push(edge)
+  }
+}
+
+/** Sibling nodes in order, a tab between two table cells: the rendered table leaves no
+ *  whitespace between its `<td>`s, and `27.3` and `38.1` must not reach the agent as `27.338.1`. */
+function plainChildren(nodes: Iterable<MarkdownNode>, out: PlainPart[], context: PlainContext): void {
+  let cellBefore = false
+  for (const node of nodes) {
+    const cell = tag(node) === 'td' || tag(node) === 'th'
+    if (cell && cellBefore) {
+      out.push(CELL)
+    }
+    cellBefore ||= cell
+    plainParts(node, out, context)
+  }
+}
+
+/**
+ * The selection fragment as the plain text it reads as — a line per block, words as the
+ * page shows them — with each formula as its TeX between `$…$` (`$$…$$` on display). This is
+ * what the agent is sent as the reader's selection: the selection's own `toString()` reads
+ * both of KaTeX's renderings, so `$d_{model}$` reached it as `𝑑 𝑚 𝑜 𝑑 𝑒 𝑙 d model`.
+ */
+export function selectionText(nodes: ArrayLike<MarkdownNode>): string {
+  const parts: PlainPart[] = []
+  plainChildren(Array.from(nodes), parts, { display: false, pre: false, cell: false })
+  let text = ''
+  for (const part of parts) {
+    if (part === BREAK) {
+      // One line break however many block edges meet here, and no space left before it.
+      text = text.replace(/ +$/, '')
+      if (text && !text.endsWith('\n')) {
+        text += '\n'
+      }
+    } else if (part === CELL) {
+      // A tab, with no space on either side of it.
+      text = `${text.replace(/ +$/, '')}\t`
+    } else {
+      const lineStart = text === '' || text.endsWith('\n') || text.endsWith('\t')
+      text += lineStart && !part.pre ? part.text.replace(/^ +/, '') : part.text
+    }
+  }
+  return text.trim()
 }

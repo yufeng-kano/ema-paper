@@ -1,9 +1,10 @@
 <script setup lang="ts">
 /**
  * The agent panel's composer (docs/web.md § The agent panel): one rounded field holding,
- * top to bottom, what goes with the message — the reply's quote, the document selection,
- * the attachments, a picked command — then the textarea, and a foot of the attach and
- * command controls with the send button at the right.
+ * top to bottom, what goes with the message — the context chips (the document, the
+ * selection, whole sections, after the control that adds them), the reply's quote, the
+ * attachments, a picked command — then the textarea, and a foot of the attach and command
+ * controls with the send button at the right.
  *
  * It owns the draft and everything attached to it; the panel owns the conversation, so
  * sending is the panel's `submit`, which says whether the server took the message. Only
@@ -19,10 +20,16 @@ import {
   isImageFile,
   matchCommands,
   refuseAttachment,
+  sectionHeading,
+  sectionText,
+  type AskRequest,
   type AttachmentRefusal,
   type CommandOption,
   type ComposerPayload,
+  type SentSection,
 } from '~/lib/composer'
+import { inlinePlain, type OutlineEntry } from '~/lib/markdown'
+import type { MenuItem, Point } from '~/lib/menu'
 
 const props = defineProps<{
   /** A turn is in flight: the composer waits, and Stop is the one control. */
@@ -31,6 +38,12 @@ const props = defineProps<{
   limits: UploadLimits | null
   /** The document pane's selection, read as the reader comes to the composer. */
   documentSelection: () => string | null
+  /** The document's headings, which *Add context* lists. */
+  outline: OutlineEntry[]
+  /** The heading of the section the document is scrolled to, read when the menu opens. */
+  currentSection: () => OutlineEntry | null
+  /** A heading's whole section, as its markdown. */
+  sectionSource: (entry: OutlineEntry) => string | null
   /** Posts the message; true once the server accepted it. */
   submit: (payload: ComposerPayload) => Promise<boolean>
   error: string | null
@@ -67,6 +80,11 @@ const quote = ref<string | null>(null)
  *  collapsed what the pointer already read; so is a press or a focus that moves within
  *  the composer, where the document no longer holds a selection to read. */
 let capturedByPointer = false
+/** The next focus into the composer is not the reader coming to it: *Add context*'s menu
+ *  handing focus back as it closes (it lives outside the field), or `ask` focusing the
+ *  textarea after setting the context itself. Read on that focus, the selection would be
+ *  cleared or overwritten just after the reader chose what goes. */
+let focusReturning = false
 
 function captureSelection() {
   selection.value = props.documentSelection() || null
@@ -85,10 +103,178 @@ function captureOnPointer() {
 }
 
 function onFocusIn(event: FocusEvent) {
+  if (focusReturning) {
+    focusReturning = false
+    return
+  }
   if (capturedByPointer || form.value?.contains(event.relatedTarget as Node | null)) {
     return
   }
   captureSelection()
+}
+
+/** Marks the focus about to come back as not the reader's; forgotten if none comes. */
+function expectFocusReturn() {
+  focusReturning = true
+  setTimeout(() => {
+    focusReturning = false
+  }, 0)
+}
+
+/** The passage, as its chip shows it: its first words on one line. */
+const selectionPreview = computed(() => selection.value?.replace(/\s+/g, ' ').trim() ?? '')
+
+// --- whole sections ----------------------------------------------------------------------
+
+/** A section the reader added, by heading. `key` is where its heading sits, so the menu
+ *  checks it rather than adding it twice; `plain` is the heading as the chip draws it. */
+interface AddedSection extends SentSection {
+  key: string
+  plain: string
+}
+
+const addedSections = ref<AddedSection[]>([])
+
+function entryKey(entry: OutlineEntry): string {
+  return `${entry.page}-${entry.index}`
+}
+
+/** `limits.sections_per_message` reached: no further section is offered. */
+const sectionsFull = computed(() => {
+  const cap = props.limits?.sections_per_message
+  return cap !== undefined && addedSections.value.length >= cap
+})
+
+/** Its text is read when it is added, and past `limits.selection_max_chars` it goes as its
+ *  heading alone (docs/chat.md § What a user message carries). */
+function addSection(section: AddedSection) {
+  if (sectionsFull.value || addedSections.value.some((added) => added.key === section.key)) {
+    return
+  }
+  addedSections.value = [...addedSections.value, section]
+}
+
+function addEntry(entry: OutlineEntry) {
+  const source = props.sectionSource(entry)
+  if (source === null) {
+    return
+  }
+  addSection({
+    key: entryKey(entry),
+    heading: entry.text,
+    plain: entry.plain,
+    text: sectionText(source, props.limits?.selection_max_chars),
+  })
+}
+
+const contextRow = ref<HTMLElement | null>(null)
+
+/** The chips' remove controls, in order: the selection's, then each section's. */
+function removeControls(): HTMLElement[] {
+  return [...(contextRow.value?.querySelectorAll<HTMLElement>('[data-chip-remove]') ?? [])]
+}
+
+/** A chip removed from its own control takes the focused button with it: focus goes to the
+ *  remove control now in its place — the next chip's — or, past the last chip, to **+**. It
+ *  stays inside the field, so it is no reader coming back to read the selection again. */
+async function refocusAfterRemove(index: number) {
+  await nextTick()
+  const active = document.activeElement
+  if (active && active !== document.body) {
+    // A click that never focused the control (Safari's) left focus where it was.
+    return
+  }
+  const next = removeControls()[index] ?? addButton.value
+  if (next) {
+    expectFocusReturn()
+    next.focus()
+  }
+}
+
+function removeSelection() {
+  selection.value = null
+  void refocusAfterRemove(0)
+}
+
+function removeSection(key: string) {
+  // Counted before the chip goes: the selection's control, if any, comes first.
+  const index = addedSections.value.findIndex((section) => section.key === key) + (selection.value ? 1 : 0)
+  addedSections.value = addedSections.value.filter((section) => section.key !== key)
+  void refocusAfterRemove(index)
+}
+
+// --- *Add context*: the current section, then every heading --------------------------------
+
+const addButton = ref<HTMLButtonElement | null>(null)
+const addMenu = ref<Point | null>(null)
+const addMenuFromKey = ref(false)
+/** The section the document was at when the menu opened: scrolling with the menu open
+ *  closes it, so this is the one the menu offers. */
+const menuCurrent = ref<OutlineEntry | null>(null)
+/** The event that last closed the menu, if one did. */
+let addMenuClosedBy: Event | null = null
+/** The press now on **+** is the one that closed the menu (a press outside it, caught
+ *  first): that press's click must not open it again. A pick, Escape or a press elsewhere
+ *  leaves the next press free. */
+let addPressClosedMenu = false
+
+/** A subsection is set in by a space as wide as the type, so the outline reads as one. A
+ *  heading longer than the menu is cut by the menu, with an ellipsis; the row's title and
+ *  the chip it adds say it whole. */
+const SUBSECTION_INDENT = ' '
+
+function onAddPointerdown(event: PointerEvent) {
+  addPressClosedMenu = addMenuClosedBy === event
+}
+
+function toggleAddMenu(event: MouseEvent) {
+  // A click the keyboard made carries no pointer detail, and no press came before it.
+  const fromKey = event.detail === 0
+  if (addMenu.value || (addPressClosedMenu && !fromKey)) {
+    addPressClosedMenu = false
+    addMenu.value = null
+    return
+  }
+  const box = addButton.value?.getBoundingClientRect()
+  addMenuFromKey.value = fromKey
+  menuCurrent.value = props.currentSection()
+  // Over the button, ending just above it: the composer sits at the foot of the column, and
+  // a menu opened down would cover the control and the draft.
+  addMenu.value = box ? { x: box.left, y: box.top - 4 } : { x: 0, y: 0 }
+}
+
+function closeAddMenu(cause?: Event) {
+  addMenu.value = null
+  addMenuClosedBy = cause ?? null
+  // The menu gives focus back to what had it, inside the field.
+  expectFocusReturn()
+}
+
+const addMenuItems = computed<MenuItem[]>(() => {
+  const added = new Set(addedSections.value.map((section) => section.key))
+  const current = menuCurrent.value
+  return [
+    {
+      key: 'current',
+      label: current ? t('chat.context.currentSectionNamed', { heading: current.plain }) : t('chat.context.currentSection'),
+      icon: 'locate' as const,
+      disabled: !current || (sectionsFull.value && !added.has(entryKey(current))),
+    },
+    ...props.outline.map((entry, index) => ({
+      key: entryKey(entry),
+      label: `${entry.level >= 3 ? SUBSECTION_INDENT : ''}${entry.plain}`,
+      checked: added.has(entryKey(entry)),
+      disabled: sectionsFull.value && !added.has(entryKey(entry)),
+      separated: index === 0,
+    })),
+  ]
+})
+
+function onAddSelect(key: string) {
+  const entry = key === 'current' ? menuCurrent.value : props.outline.find((candidate) => entryKey(candidate) === key)
+  if (entry) {
+    addEntry(entry)
+  }
 }
 
 function onBlur() {
@@ -476,9 +662,13 @@ async function send() {
     if (!text && !picked && !ready.length) {
       return
     }
+    const sentSections = addedSections.value
+    const headingMax = props.limits?.section_heading_max_chars
     const payload: ComposerPayload = {
       text,
       selection: selection.value,
+      // Added from the menu or asked for by the reader's view, a heading goes within the cap.
+      sections: sentSections.map(({ heading, text: source }) => ({ heading: sectionHeading(heading, headingMax), text: source })),
       quote: quote.value,
       command: picked?.name ?? null,
       attachments: ready.map((item) => ({ id: item.id!, name: item.name, image: item.image, preview: item.preview })),
@@ -512,6 +702,7 @@ async function send() {
     if (selection.value === payload.selection) {
       selection.value = null
     }
+    addedSections.value = addedSections.value.filter((section) => !sentSections.includes(section))
     if (quote.value === payload.quote) {
       quote.value = null
     }
@@ -522,7 +713,59 @@ async function send() {
   }
 }
 
-defineExpose({ addFiles, setQuote, focus })
+// --- asked for by the reader's view --------------------------------------------------------
+
+/** A command named from outside the menu: the listed skill once the list is in, so its
+ *  chip carries its description and hint. */
+function setCommand(name: string) {
+  menuForced.value = false
+  if (query.value !== null) {
+    draft.value = ''
+  }
+  const listed = skills.value.find((option) => option.name === name)
+  command.value = listed ?? { name, description: '', hint: '', group: 'skill' }
+  if (!listed) {
+    void loadSkills().then(() => {
+      const found = skills.value.find((option) => option.name === name)
+      if (found && command.value?.name === name) {
+        command.value = found
+      }
+    })
+  }
+}
+
+/**
+ * Puts what the reader's view asks for into the composer — a passage as the selection, a
+ * whole section, a command — and focuses it. With `send`, it goes at once, but only while
+ * nothing runs and the reader had typed nothing: a draft is never sent for them.
+ */
+async function ask(request: AskRequest) {
+  const untouched = draft.value.trim() === ''
+  if (request.selection !== undefined) {
+    selection.value = request.selection.trim() || null
+  }
+  if (request.section) {
+    const { heading, text } = request.section
+    const entry = props.outline.find((candidate) => candidate.text === heading)
+    addSection({
+      key: entry ? entryKey(entry) : `heading:${heading}`,
+      heading,
+      plain: entry?.plain ?? inlinePlain(heading),
+      text: text === null ? null : sectionText(text, props.limits?.selection_max_chars),
+    })
+  }
+  if (request.command) {
+    setCommand(request.command)
+  }
+  await nextTick()
+  expectFocusReturn()
+  focus()
+  if (request.send && untouched && !props.running && !sending.value) {
+    await send()
+  }
+}
+
+defineExpose({ addFiles, setQuote, focus, ask })
 </script>
 
 <template>
@@ -575,23 +818,58 @@ defineExpose({ addFiles, setQuote, focus })
 
     <!-- The one rounded control in the app besides the context menu. -->
     <div class="field" :class="{ disabled: running }">
+      <!-- What goes with the message besides its text (docs/web.md § The agent panel,
+           *Context chips*): the control that adds a section, the document the
+           conversation is about, the selection read on the way in, the sections added. -->
+      <div ref="contextRow" class="context" role="group" :aria-label="t('chat.context.label')">
+        <button
+          ref="addButton"
+          type="button"
+          class="context-add"
+          aria-haspopup="menu"
+          :aria-expanded="addMenu ? 'true' : 'false'"
+          :aria-label="t('chat.context.add')"
+          :title="t('chat.context.add')"
+          :disabled="running"
+          @pointerdown="onAddPointerdown"
+          @click="toggleAddMenu"
+        >
+          <UiIcon name="plus" />
+        </button>
+        <ChatContextChip icon="file-text" :text="t('chat.context.document')" faint />
+        <ChatContextChip
+          v-if="selection"
+          icon="text-quote"
+          :text="selectionPreview"
+          :remove-label="t('chat.context.removeSelection')"
+          @remove="removeSelection"
+        />
+        <ChatContextChip
+          v-for="section in addedSections"
+          :key="section.key"
+          icon="heading"
+          :text="t('chat.context.section', { heading: section.plain })"
+          :tooltip="section.plain"
+          :remove-label="t('chat.context.removeSection', { heading: section.plain })"
+          @remove="removeSection(section.key)"
+        />
+      </div>
+      <UiContextMenu
+        v-if="addMenu"
+        :at="addMenu"
+        :items="addMenuItems"
+        :label="t('chat.context.add')"
+        :focus-first="addMenuFromKey"
+        above
+        @select="onAddSelect"
+        @close="closeAddMenu"
+      />
+
       <p v-if="quote" class="chip">
         <UiIcon name="reply" class="chip-glyph" />
         <span class="chip-label">{{ t('chat.reply') }}</span>
         <span class="chip-text">{{ quote }}</span>
         <button type="button" class="chip-drop" :aria-label="t('chat.quoteDrop')" :title="t('chat.quoteDrop')" @click="quote = null">
-          <UiIcon name="x" />
-        </button>
-      </p>
-      <p v-if="selection" class="chip">
-        <span class="chip-text">{{ t('chat.selection', { count: selection.length }) }}</span>
-        <button
-          type="button"
-          class="chip-drop"
-          :aria-label="t('chat.dropSelection')"
-          :title="t('chat.dropSelection')"
-          @click="selection = null"
-        >
           <UiIcon name="x" />
         </button>
       </p>
@@ -874,7 +1152,57 @@ defineExpose({ addFiles, setQuote, focus })
   background: var(--paper-sunken);
 }
 
-/* What goes with the message as a pill: the quote, the selection. */
+/* --- the context chips: a row at the top of the field --------------------------------- */
+
+/* Set out a little past the textarea's text, so the chips' edges, not their glyphs, line
+   up with it. */
+.context {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: -2px 0 var(--space-1) -2px;
+}
+
+.context-add {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition:
+    background var(--duration-fast) var(--ease),
+    color var(--duration-fast) var(--ease);
+}
+
+.context-add:hover:not(:disabled),
+.context-add[aria-expanded='true'] {
+  background: var(--rail);
+  color: var(--ink);
+}
+
+.context-add:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.context-add :deep(svg) {
+  width: 14px;
+  height: 14px;
+}
+
+.context-add:focus-visible {
+  outline-offset: 1px;
+}
+
+/* The reply's quote as a pill. */
 .chip {
   display: flex;
   align-items: center;
