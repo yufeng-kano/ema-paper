@@ -263,7 +263,6 @@ export default {
       preset: '舊版儲存的提示詞',
       instructions: '你的指示',
       catalogue: 'Skills 目錄（{skills} 個）',
-      catalogueSubagents: 'Skills 目錄（{skills} 個）與子代理（{subagents} 個）',
       memory: '記憶索引（{count} 條）',
       memoryPaused: '記憶 · 已暫停',
       turn: '每則訊息附帶的脈絡',

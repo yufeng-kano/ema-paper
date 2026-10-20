@@ -32,6 +32,7 @@ const auth = useAuth()
 
 const labelId = useId()
 const descriptionId = useId()
+const countId = useId()
 const drawerId = useId()
 const advancedId = useId()
 
@@ -84,31 +85,21 @@ async function save() {
     return
   }
   const name = props.agent.name
-  const sent = {
-    text: text.value,
-    answer: answerLanguage.value,
-    translate: translateLanguage.value,
-  }
+  // Nothing changes these while the save is in flight: the editor is read-only and the
+  // dropdowns are disabled until it answers.
   pending.value = true
   error.value = null
   try {
     const result = await putAgentSettings(name, {
-      instructions: sent.text.trim() || null,
-      answer_language: sent.answer || null,
-      translate_language: sent.translate || null,
+      instructions: text.value.trim() || null,
+      answer_language: answerLanguage.value || null,
+      translate_language: translateLanguage.value || null,
     })
     emit('saved', name, result)
-    // The stored text, cleaned by the server, becomes the draft — unless the reader went on
-    // typing while the save was in flight, which stays theirs to save.
-    if (text.value === sent.text) {
-      text.value = result.instructions ?? ''
-    }
-    if (answerLanguage.value === sent.answer) {
-      answerLanguage.value = result.answer_language ?? ''
-    }
-    if (translateLanguage.value === sent.translate) {
-      translateLanguage.value = result.translate_language ?? ''
-    }
+    // The stored values, the text as the server cleaned it, become the draft.
+    text.value = result.instructions ?? ''
+    answerLanguage.value = result.answer_language ?? ''
+    translateLanguage.value = result.translate_language ?? ''
   } catch (failure) {
     error.value = await resolve(failure)
   } finally {
@@ -149,6 +140,8 @@ const advancedOpen = ref(props.agent.settings.prompt !== null || props.agent.set
       <h3 :id="labelId" class="section-label">{{ t('agents.instructions.label') }}</h3>
       <p :id="descriptionId" class="note">{{ t('agents.instructions.description') }}</p>
       <div class="editor md-side" @click="onEditorClick">
+        <!-- Read-only while Save is in flight: a keystroke then would land in a draft the
+             answer is about to reload under it. -->
         <RichEditor
           :key="editorKey"
           ref="editor"
@@ -156,6 +149,8 @@ const advancedOpen = ref(props.agent.settings.prompt !== null || props.agent.set
           :source="saved.instructions"
           :placeholder="t('agents.instructions.placeholder')"
           :label="t('agents.instructions.label')"
+          :described-by="`${descriptionId} ${countId}`"
+          :editable="!pending"
           @change="text = $event"
         />
       </div>
@@ -170,7 +165,7 @@ const advancedOpen = ref(props.agent.settings.prompt !== null || props.agent.set
         >
           {{ t('agents.instructions.receives') }}
         </button>
-        <span class="count tabular" :class="{ over: overCap }">
+        <span :id="countId" class="count tabular" :class="{ over: overCap }">
           {{
             maxChars === null
               ? length.toLocaleString(locale)
@@ -269,7 +264,8 @@ const advancedOpen = ref(props.agent.settings.prompt !== null || props.agent.set
 }
 
 /* The notes' editor in a field's hairline box: the column's sizes, the headings as plain
-   run-in labels — a rule above a heading would only cut the box in two. */
+   run-in labels — a rule above a heading would only cut the box in two. The box is as tall
+   as what it holds, with room for a few lines when it is empty. */
 .editor {
   --block-heading: var(--display-2xs);
   --block-subheading: var(--text-base);
@@ -277,7 +273,7 @@ const advancedOpen = ref(props.agent.settings.prompt !== null || props.agent.set
   --block-text-sm: var(--text-xs);
   --rich-gap: var(--space-3);
 
-  min-height: 14rem;
+  min-height: 7rem;
   margin-top: var(--space-1);
   padding: var(--space-4);
   border: 1px solid var(--edge);

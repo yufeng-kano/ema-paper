@@ -12,6 +12,8 @@ defineProps<{ maxChars: number | null }>()
 
 const { t } = useI18n()
 const { resolve } = useApiError()
+/** A skill the agent may load is listed in its catalogue block. */
+const contextVersion = useAgentContextVersion()
 
 const skills = ref<Skill[] | null>(null)
 const error = ref<string | null>(null)
@@ -58,6 +60,7 @@ async function toggle(skill: Skill, field: 'user_invocable' | 'model_invocable',
   try {
     const change = field === 'user_invocable' ? { user_invocable: box.checked } : { model_invocable: box.checked }
     replace(await updateSkill(skill.name, change), skill.name)
+    contextVersion.changed()
   } catch (failure) {
     // The box shows what is stored, not the click that was refused.
     box.checked = skill[field]
@@ -70,11 +73,13 @@ async function toggle(skill: Skill, field: 'user_invocable' | 'model_invocable',
 function onSaved(saved: Skill, previous: string | null) {
   replace(saved, previous)
   editing.value = null
+  contextVersion.changed()
 }
 
 function onDeleted(name: string) {
   skills.value = (skills.value ?? []).filter((row) => row.name !== name)
   editing.value = null
+  contextVersion.changed()
 }
 </script>
 

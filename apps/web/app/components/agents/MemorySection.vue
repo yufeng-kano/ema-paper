@@ -44,6 +44,8 @@ const emit = defineEmits<{
 const { t, locale } = useI18n()
 const { resolve } = useApiError()
 const auth = useAuth()
+/** A row's change reaches the memory block without passing through the agent's settings. */
+const contextVersion = useAgentContextVersion()
 
 const labelId = useId()
 const searchId = useId()
@@ -185,6 +187,7 @@ async function togglePin(memory: Memory) {
   actionError.value = null
   try {
     replace(await updateMemory(memory.id, { pinned: !memory.pinned }), seq)
+    contextVersion.changed()
   } catch (failure) {
     actionError.value = await resolve(failure)
   } finally {
@@ -257,6 +260,7 @@ async function saveEdit(memory: Memory) {
   draftError.value = null
   try {
     replace(await updateMemory(memory.id, change), seq)
+    contextVersion.changed()
     if (draft.value?.id === memory.id) {
       cancelEdit()
     }
@@ -311,6 +315,7 @@ async function confirmDelete() {
   try {
     await deleteMemory(memory.id)
     memories.value = (memories.value ?? []).filter((row) => row.id !== memory.id)
+    contextVersion.changed()
     deleting.value = null
     // The control that opened the dialog is gone with its row.
     await nextTick()
@@ -334,6 +339,7 @@ async function confirmClear() {
     await clearMemories()
     generation += 1
     memories.value = []
+    contextVersion.changed()
     draft.value = null
     clearing.value = false
     await nextTick()
@@ -474,8 +480,9 @@ async function confirmClear() {
             <li v-else class="row">
               <span class="kind">{{ kindLabel(memory.kind) }}</span>
               <div class="row-main">
+                <!-- Typeset as the chat's memory card shows it; the edit field keeps the source. -->
                 <p class="text">
-                  <UiIcon v-if="memory.pinned" name="pin" class="pin-glyph" />{{ memory.text }}
+                  <UiIcon v-if="memory.pinned" name="pin" class="pin-glyph" /><MdInline :text="memory.text" />
                 </p>
                 <p class="meta">{{ meta(memory) }}</p>
               </div>
@@ -782,10 +789,13 @@ async function confirmClear() {
 }
 
 /* One grid for every row, so the kind tags share a column as wide as the longest of them
-   in the reader's language. */
+   in the reader's language. The gap is the list's, which each row's subgrid inherits: a
+   gap set on the row instead would only be split between the cells on either side of a
+   line, and the text would start half a gap closer to its tag. */
 .list {
   display: grid;
   grid-template-columns: minmax(var(--space-14), max-content) minmax(0, 1fr) auto;
+  column-gap: var(--space-3);
   margin: 0;
   padding: 0;
   list-style: none;
@@ -797,8 +807,7 @@ async function confirmClear() {
   grid-column: 1 / -1;
   grid-template-columns: subgrid;
   align-items: start;
-  gap: var(--space-3);
-  padding: var(--space-2) 0;
+  padding: 9px 0;
   border-bottom: 1px solid var(--line-soft);
 }
 
