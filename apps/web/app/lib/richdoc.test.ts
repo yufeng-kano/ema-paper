@@ -2,7 +2,17 @@ import { getSchema, type JSONContent } from '@tiptap/core'
 import { describe, expect, it } from 'vitest'
 import { parseResultMarkdown } from './markdown'
 import { richExtensions } from './rich-extensions'
-import { captionLine, docToMarkdown, inlineMathAtEnd, markdownToDoc, serializeInline, sliceToMarkdown } from './richdoc'
+import {
+  captionLine,
+  convertBlock,
+  docToMarkdown,
+  inlineMathAtEnd,
+  markdownToDoc,
+  quoteLines,
+  serializeInline,
+  serializeNode,
+  sliceToMarkdown,
+} from './richdoc'
 
 const schema = getSchema(richExtensions())
 
@@ -34,6 +44,7 @@ describe('an unchanged document', () => {
     ['prices', 'It cost $5 and $6 in total.'],
     ['an author line with superscripts', '**THYAGATURU<sup>1</sup>, (Senior Member, IEEE)** <sup>1</sup>Intel, H<sub>2</sub>O'],
     ['several blocks', '# Title\n\nPara one.\n\n- a\n- b\n\n$$\nx\n$$'],
+    ['a quote over blocks', '> ## Said\n> first line\n>second\n>\n> - a\n> - b'],
   ])('%s comes back byte for byte', (_name, markdown) => {
     expect(docToMarkdown(load(markdown))).toBe(markdown)
   })
@@ -318,5 +329,97 @@ describe('the clipboard', () => {
 
   it('keeps whitespace outside emphasis markers', () => {
     expect(serializeInline([{ type: 'text', text: ' bold ', marks: [{ type: 'bold' }] }])).toBe(' **bold** ')
+  })
+})
+
+describe('quotes in the editor', () => {
+  it('holds a quote as a node of its blocks, one level', () => {
+    const doc = load('> Words $x$\n>\n> - item')
+    expect(doc.content![0]!.type).toBe('blockquote')
+    expect(doc.content![0]!.content!.map((node) => node.type)).toEqual(['paragraph', 'bulletList'])
+  })
+
+  it('writes an edited quote with > before each line and > alone on blank ones', () => {
+    const doc = load('> one\n>\n> two')
+    doc.content![0]!.content![1]!.content = [{ type: 'text', text: 'changed' }]
+    expect(docToMarkdown(doc)).toBe('> one\n>\n> changed')
+    expect(reading(docToMarkdown(doc))[0]).toMatchObject({ kind: 'quote' })
+  })
+
+  it('escapes a paragraph that starts with > so it stays a paragraph', () => {
+    const markdown = serializeNode({ type: 'paragraph', content: [{ type: 'text', text: '> not a quote' }] })
+    expect(markdown).toBe('\\> not a quote')
+    expect(reading(markdown)).toEqual([{ kind: 'p', text: '\\> not a quote' }])
+  })
+
+  it('makes quote lines of any markdown', () => {
+    expect(quoteLines('a\n\nb')).toBe('> a\n>\n> b')
+    expect(quoteLines('')).toBe('')
+  })
+})
+
+describe('section links in the notes', () => {
+  const linked = getSchema(richExtensions({ links: { state: () => 'chip', locate: () => {} } }))
+
+  it('keeps a link as one atom that writes its source back byte for byte', () => {
+    const markdown = '> passage\n\n[3.2 *Attention*](#32-attention)'
+    const doc = linked.nodeFromJSON(markdownToDoc(markdown, { cites: true })).toJSON() as JSONContent
+    expect(doc.content![1]!.content).toEqual([
+      { type: 'sectionLink', attrs: { src: '[3.2 *Attention*](#32-attention)', label: '3.2 Attention', anchor: '32-attention' } },
+    ])
+    expect(docToMarkdown(doc)).toBe(markdown)
+    doc.content![1]!.content!.push({ type: 'text', text: ' and more' })
+    expect(docToMarkdown(doc)).toBe('> passage\n\n[3.2 *Attention*](#32-attention) and more')
+  })
+
+  it('stays text in the document, which reads no links', () => {
+    expect(load('[3.2 Attention](#32-attention)').content![0]!.content![0]!.type).toBe('text')
+  })
+})
+
+describe('convertBlock', () => {
+  it('turns paragraphs and headings into one another, keeping their inline text', () => {
+    expect(convertBlock('Some **bold** and $x$', 'heading')).toBe('## Some **bold** and $x$')
+    expect(convertBlock('# Title', 'subheading')).toBe('### Title')
+    expect(convertBlock('## 1. Intro', 'paragraph')).toBe('1\\. Intro')
+  })
+
+  it('writes nothing for the kind a block already is, or a kind that cannot be turned', () => {
+    expect(convertBlock('# Title', 'heading')).toBeNull()
+    expect(convertBlock('Plain.', 'paragraph')).toBeNull()
+    expect(convertBlock('| a |\n| --- |\n| 1 |', 'paragraph')).toBeNull()
+    expect(convertBlock('![fig1](sightread://p1/0,0,1,1)', 'quote')).toBeNull()
+  })
+
+  it('turns text into lists and lists into one block per item', () => {
+    expect(convertBlock('Item text', 'bulleted')).toBe('- Item text')
+    expect(convertBlock('- a\n- b', 'paragraph')).toBe('a\n\nb')
+    expect(convertBlock('- a\n- b', 'subheading')).toBe('### a\n\n### b')
+    expect(convertBlock('- a\n- b', 'numbered')).toBe('1. a\n2. b')
+    expect(convertBlock('5. a\n6. b', 'bulleted')).toBe('- a\n- b')
+  })
+
+  it('wraps a block in a quote and unwraps a quote', () => {
+    expect(convertBlock('$$\nx\n$$', 'quote')).toBe('> $$\n> x\n> $$')
+    expect(convertBlock('> ## Said\n>\n> text', 'paragraph')).toBe('## Said\n\ntext')
+    expect(convertBlock('> one\n>\n> - a\n> - b', 'heading')).toBe('## one\n\n## a\n\n## b')
+  })
+
+  it('turns text into a display formula: a lone inline formula as itself, other text as written', () => {
+    expect(convertBlock('$E = mc^2$', 'formula')).toBe('$$\nE = mc^2\n$$')
+    expect(convertBlock('a + b', 'formula')).toBe('$$\na + b\n$$')
+    expect(convertBlock('- x\n- y', 'formula')).toBe('$$\nx\ny\n$$')
+  })
+
+  it('takes the source verbatim as code, and turns code and formulas back into text', () => {
+    expect(convertBlock('> quoted', 'code')).toBe('```\n> quoted\n```')
+    expect(convertBlock('```\na*b\nc\n```', 'paragraph')).toBe('a\\*b<br>c')
+    expect(convertBlock('$$\na\n= b\n$$', 'paragraph')).toBe('$a = b$')
+    expect(convertBlock('$$\nx\n$$', 'bulleted')).toBe('- $x$')
+  })
+
+  it('reads back as the block it meant', () => {
+    expect(reading(convertBlock('Text', 'quote')!)).toEqual([{ kind: 'quote', blocks: [{ kind: 'p', text: 'Text', src: 'Text' }] }])
+    expect(reading(convertBlock('```\n# not a heading\n```', 'paragraph')!)).toEqual([{ kind: 'p', text: '\\# not a heading' }])
   })
 })

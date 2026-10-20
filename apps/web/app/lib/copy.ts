@@ -12,6 +12,8 @@
  * the logic is unit-testable in the framework-free node suite (docs/testing.md).
  */
 
+import { quoteLines } from './richdoc'
+
 const TEXT_NODE = 3
 const ELEMENT_NODE = 1
 const DOCUMENT_FRAGMENT_NODE = 11
@@ -42,6 +44,16 @@ function tag(node: MarkdownNode): string {
 }
 
 /**
+ * Whether a node is not the document's text: one of the viewer's own controls drawn among
+ * the blocks (`data-chrome` — a handle, a collapse chevron, a fold note, a backlink marker),
+ * or a block the reader cannot see (`hidden` — a collapsed section's, or one an open editor
+ * holds). Every walk over the rendered text skips both (docs/web.md § Result viewer).
+ */
+function isOffText(node: MarkdownNode): boolean {
+  return node.nodeType === ELEMENT_NODE && (attribute(node, 'data-chrome') !== null || attribute(node, 'hidden') !== null)
+}
+
+/**
  * Collapses runs of whitespace into one space and trims — except inside `` `code` ``
  * spans, whose spaces are content: `` `a  b` `` restored from `data-src` must not lose
  * its double space to the surrounding block's normalization.
@@ -59,7 +71,7 @@ function inlineText(node: MarkdownNode): string {
   if (node.nodeType === TEXT_NODE) {
     return node.textContent ?? ''
   }
-  if (node.nodeType !== ELEMENT_NODE) {
+  if (node.nodeType !== ELEMENT_NODE || isOffText(node)) {
     return ''
   }
   const tex = attribute(node, 'data-tex')
@@ -239,6 +251,13 @@ function blockToMarkdown(node: MarkdownNode, partialBlocks?: ReadonlySet<string>
       .join('\n')
   }
   switch (tag(node)) {
+    case 'blockquote': {
+      // A quote is `> ` lines over its blocks' own markdown, `>` alone on a blank line.
+      const inner: Walk = { blocks: [], inline: [], partialBlocks }
+      walkNodes(children(node), inner)
+      flush(inner)
+      return quoteLines(inner.blocks.join('\n\n'))
+    }
     case 'table':
       return tableToMarkdown(node)
     case 'ul':
@@ -374,6 +393,9 @@ function walkNodes(nodes: MarkdownNode[], walk: Walk, list?: OrphanListContext):
 }
 
 function walkNode(node: MarkdownNode, walk: Walk): void {
+  if (isOffText(node)) {
+    return
+  }
   // Consecutive inline runs — text and math spans from inside one paragraph — stay one
   // line rather than becoming a block each.
   if (isInline(node)) {
@@ -485,8 +507,9 @@ function plainParts(node: MarkdownNode, out: PlainPart[], context: PlainContext)
   if (node.nodeType !== ELEMENT_NODE && node.nodeType !== DOCUMENT_FRAGMENT_NODE) {
     return
   }
-  // A block an open editor holds is not on the page, so not in what the reader selected.
-  if (attribute(node, 'hidden') !== null) {
+  // A block an open editor holds or a collapsed section hides is not on the page, and the
+  // viewer's own controls are not the document: neither is in what the reader selected.
+  if (isOffText(node)) {
     return
   }
   const formula = formulaSource(node, context.display)

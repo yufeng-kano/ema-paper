@@ -40,6 +40,16 @@ export interface MenuItem {
   disabled?: boolean
   /** A group rule above this item, as a native menu separates its groups. */
   separated?: boolean
+  /** Drawn right-aligned in `--faint`: the item's key (`⌘⇧↑`), or — `shortcutMono` — the
+   *  markdown or command it stands for (`##`, `/translate`). */
+  shortcut?: string
+  shortcutMono?: boolean
+  /** The label in the mono face, followed on the same line by `description` in `--muted`: a
+   *  skill's name and what it does (docs/web.md § Design system, *Primitives*). */
+  labelMono?: boolean
+  description?: string
+  /** A submenu, flown out beside this row: a short list of parallel choices under one action. */
+  children?: MenuItem[]
 }
 
 /** A fact about what the menu is about, drawn under its header: it takes no focus and does
@@ -111,4 +121,32 @@ function fitAbove(at: number, size: number, viewport: number, margin: number): n
     return Math.min(at - size, viewport - margin - size)
   }
   return fit(at, size, viewport, margin)
+}
+
+/** A box in viewport coordinates. */
+export interface Rect {
+  left: number
+  top: number
+  right: number
+  bottom: number
+}
+
+/**
+ * Where a submenu opens (docs/web.md § Design system, *Primitives*): beside its parent menu,
+ * top-aligned with the row it came from — to the right, or to the left where the viewport has
+ * no room — and, where neither side has room (a phone), over the parent, `inset` down and in
+ * from the row's lower left, so the row stays in sight. Kept inside the viewport vertically.
+ */
+export function placeSubmenu(row: Rect, menu: Rect, sub: Size, viewport: Size, margin = MARGIN, inset = 8): Point {
+  const y = (top: number) => Math.max(margin, Math.min(top, viewport.height - margin - sub.height))
+  if (menu.right + sub.width <= viewport.width - margin) {
+    return { x: menu.right, y: y(row.top) }
+  }
+  if (menu.left - sub.width >= margin) {
+    return { x: menu.left - sub.width, y: y(row.top) }
+  }
+  return {
+    x: Math.max(margin, Math.min(row.left + inset, viewport.width - margin - sub.width)),
+    y: y(row.bottom + inset),
+  }
 }

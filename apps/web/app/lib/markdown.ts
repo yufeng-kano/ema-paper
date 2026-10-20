@@ -40,8 +40,14 @@ export type ResultBlock =
   | { kind: 'math'; text: string; src: string }
   | { kind: 'code'; text: string; lang: string | null; src: string }
   | { kind: 'table'; header: string[]; rows: string[][]; src: string }
-  | { kind: 'fig'; id: string; bbox: Bbox; caption: string | null; src: string }
+  /** `page` is the one its placeholder names (`sightread://pN/…`), not the page the block
+   *  sits in: blocks move across page markers, and the crop stays where it was cut
+   *  (docs/web.md § Result viewer, *Figures*). */
+  | { kind: 'fig'; id: string; page: number; bbox: Bbox; caption: string | null; src: string }
   | { kind: 'toc'; entries: TocEntry[]; src: string }
+  /** A run of `>` lines, its content read as blocks of their own — one level: a `>` inside
+   *  is that quote's text (docs/web.md § Result viewer, *Blockquotes*). */
+  | { kind: 'quote'; blocks: ResultBlock[]; src: string }
   /** An HTML comment that is not a page marker: kept in the source, drawn as nothing. */
   | { kind: 'comment'; src: string }
 
@@ -137,19 +143,26 @@ function isOrdered(marker: string): boolean {
   return !'-*+'.includes(marker)
 }
 
+/** A quote's line: `>` first. Inside a quote it is text — quotes are one level deep. */
+function isQuoteLine(line: string, quoted: boolean): boolean {
+  return !quoted && line.startsWith('>')
+}
+
 /**
  * Every line that starts a block of its own — so a paragraph knows where to stop. `next` is
- * the line after it, which only the table check needs.
+ * the line after it, which only the table check needs; `quoted` reads a quote's content,
+ * where a `>` is text.
  */
-function startsBlock(line: string, next = ''): boolean {
+function startsBlock(line: string, next = '', quoted = false): boolean {
   return (
     !line ||
+    isQuoteLine(line, quoted) ||
     opensMath(line) ||
     CODE_FENCE.test(line) ||
     isTableStart(line, next) ||
     line.startsWith('#') ||
     LIST_ITEM.test(line) ||
-    FIGURE.test(line) ||
+    (!quoted && FIGURE.test(line)) ||
     PAGE_MARKER.test(line) ||
     COMMENT.test(line)
   )
@@ -174,6 +187,18 @@ function splitRow(line: string): string[] {
  * would otherwise show an empty document for a job that has one.
  */
 export function parseResultMarkdown(markdown: string): ResultPageBlocks[] {
+  return parsePages(markdown, false)
+}
+
+/** A quote's content as blocks: no page of its own, and a `>` in it stays text. */
+function parseQuoted(content: string): ResultBlock[] {
+  return parsePages(content, true).flatMap((page) => page.blocks)
+}
+
+/** `>` and one space after it, off a quote's line. */
+const QUOTE_MARKER = /^\s*> ?/
+
+function parsePages(markdown: string, quoted: boolean): ResultPageBlocks[] {
   const pages: ResultPageBlocks[] = []
   const lines = markdown.replace(/\r\n?/g, '\n').split('\n')
 
@@ -196,7 +221,8 @@ export function parseResultMarkdown(markdown: string): ResultPageBlocks[] {
     const line = (lines[index] ?? '').trim()
     const first = index
 
-    const marker = PAGE_MARKER.exec(line)
+    // Inside a quote a page marker is the quote's own comment: a quote holds no pages.
+    const marker = quoted ? null : PAGE_MARKER.exec(line)
     if (marker) {
       const number = Number(marker[1])
       // A marker for the page already open (the leading-content case above) continues it
@@ -211,6 +237,19 @@ export function parseResultMarkdown(markdown: string): ResultPageBlocks[] {
     if (!line) {
       continue
     }
+    if (isQuoteLine(line, quoted)) {
+      // Every line starting with `>` up to the first that does not: a blank line or any other
+      // line ends the quote, so two quotes a blank line apart stay two.
+      const content: string[] = []
+      let cursor = index
+      while (cursor < lines.length && isQuoteLine((lines[cursor] ?? '').trim(), false)) {
+        content.push((lines[cursor] ?? '').replace(QUOTE_MARKER, ''))
+        cursor += 1
+      }
+      index = cursor - 1
+      page().blocks.push({ kind: 'quote', blocks: parseQuoted(content.join('\n')), src: source(first, index) })
+      continue
+    }
     if (COMMENT.test(line)) {
       // Not a page marker, but the file's: a block of its own so an edit elsewhere
       // leaves it in the source (docs/web.md § Editing).
@@ -218,19 +257,22 @@ export function parseResultMarkdown(markdown: string): ResultPageBlocks[] {
       continue
     }
 
-    const figure = FIGURE.exec(line)
+    // Inside a quote a placeholder is a line of text: a quote holds only what reads as text
+    // (docs/web.md § Notes, *Excerpts*), and a crop has no place in one.
+    const figure = quoted ? null : FIGURE.exec(line)
     if (figure) {
       const target = page()
       // The caption is written verbatim on the next line, and only there — anything that
       // starts another block is the next block, not this figure's caption.
       const next = (lines[index + 1] ?? '').trim()
-      const captioned = Boolean(next) && !startsBlock(next, (lines[index + 2] ?? '').trim())
+      const captioned = Boolean(next) && !startsBlock(next, (lines[index + 2] ?? '').trim(), quoted)
       if (captioned) {
         index += 1
       }
       target.blocks.push({
         kind: 'fig',
         id: figure[1] || `fig${target.blocks.filter((block) => block.kind === 'fig').length + 1}`,
+        page: Number(figure[2]),
         bbox: [Number(figure[3]), Number(figure[4]), Number(figure[5]), Number(figure[6])],
         caption: captioned ? next : null,
         src: source(first, index),
@@ -347,7 +389,7 @@ export function parseResultMarkdown(markdown: string): ResultPageBlocks[] {
         const continues =
           items.length > 0 &&
           /^\s+\S/.test(raw) &&
-          !startsBlock(trimmed, (lines[cursor + 1] ?? '').trim())
+          !startsBlock(trimmed, (lines[cursor + 1] ?? '').trim(), quoted)
         if (!continues) {
           break
         }
@@ -398,7 +440,7 @@ export function parseResultMarkdown(markdown: string): ResultPageBlocks[] {
     let cursor = index + 1
     while (cursor < lines.length) {
       const next = (lines[cursor] ?? '').trim()
-      if (startsBlock(next, (lines[cursor + 1] ?? '').trim())) {
+      if (startsBlock(next, (lines[cursor + 1] ?? '').trim(), quoted)) {
         break
       }
       paragraph.push(next)
@@ -407,7 +449,7 @@ export function parseResultMarkdown(markdown: string): ResultPageBlocks[] {
     index = cursor - 1
     // A contents page keeps its lines: joined, a book's `1.1 Title . . . . 13` rows read
     // as one run-on paragraph of dots (docs/web.md § Result viewer).
-    const entries = tocEntries(paragraph)
+    const entries = quoted ? null : tocEntries(paragraph)
     const src = source(first, index)
     page().blocks.push(
       entries ? { kind: 'toc', entries, src } : { kind: 'p', text: paragraph.join(' '), src },
@@ -995,4 +1037,235 @@ export function sectionSource(pages: readonly ResultPageBlocks[], pageIndex: num
     }
   }
   return parts.join('\n\n')
+}
+
+// --- a block's words ---------------------------------------------------------------------
+//
+// A block link names a block by its first words, locate finds a quoted passage by its text,
+// and the viewer names a block by its words (docs/web.md § Files, § Notes, § Editing). All
+// three read a block the same way: as the text it shows.
+
+/** A block as the text it reads as: markdown removed, a formula as its TeX, a list's items, a
+ *  table's cells and a quote's blocks one after another, spacing collapsed. A figure is its
+ *  caption; a comment is nothing. */
+export function blockPlain(block: ResultBlock): string {
+  switch (block.kind) {
+    case 'h2':
+    case 'h3':
+    case 'p':
+      return inlinePlain(block.text)
+    case 'list':
+      return block.items.map(inlinePlain).join(' ')
+    case 'math':
+    case 'code':
+      return block.text.replace(/\s+/g, ' ').trim()
+    case 'table':
+      return [block.header, ...block.rows]
+        .flat()
+        .map(inlinePlain)
+        .filter(Boolean)
+        .join(' ')
+    case 'fig':
+      return block.caption ? inlinePlain(block.caption) : ''
+    case 'toc':
+      return block.entries
+        .map((entry) => [inlinePlain(entry.title), entry.page === null ? '' : inlinePlain(entry.page)].filter(Boolean).join(' '))
+        .join(' ')
+    case 'quote':
+      return block.blocks.map(blockPlain).filter(Boolean).join(' ')
+    case 'comment':
+      return ''
+  }
+}
+
+/** Text as a passage is compared: spacing ignored — a line wrapped differently, or a
+ *  formula's TeX spaced differently, is the same passage. */
+export function passageKey(text: string): string {
+  return text.replace(/\s+/g, '')
+}
+
+/** The first words of a block's text, as a block link names it: at most `words` words, then
+ *  at most `chars` characters (code points) — a sentence without spaces is cut by length. */
+export function firstWords(text: string, words = 8, chars = 60): string {
+  const cut = text.replace(/\s+/g, ' ').trim().split(' ').slice(0, words).join(' ')
+  const points = [...cut]
+  return (points.length > chars ? points.slice(0, chars).join('') : cut).trim()
+}
+
+// --- blocks as a run, across pages ------------------------------------------------------
+
+/** Where a block sits: indices into the parsed pages and that page's blocks. */
+export interface BlockAt {
+  page: number
+  index: number
+}
+
+/** A block with where it sits — the document in reading order, page markers crossed. */
+export interface PlacedBlock extends BlockAt {
+  block: ResultBlock
+}
+
+export function placedBlocks(pages: readonly ResultPageBlocks[]): PlacedBlock[] {
+  return pages.flatMap((page, pageIndex) => page.blocks.map((block, index) => ({ page: pageIndex, index, block })))
+}
+
+/** Whether `a` comes before `b` in reading order. */
+export function isBefore(a: BlockAt, b: BlockAt): boolean {
+  return a.page < b.page || (a.page === b.page && a.index < b.index)
+}
+
+function isHeading(block: ResultBlock): block is Extract<ResultBlock, { kind: 'h2' | 'h3' }> {
+  return block.kind === 'h2' || block.kind === 'h3'
+}
+
+/**
+ * The blocks a heading's section holds, by their positions in `placedBlocks`: from the block
+ * after the heading up to the last before the next heading of the same or a higher level —
+ * the extent `sectionSource` reads and a collapsed heading hides. `[start, end)`.
+ */
+export function sectionExtent(placed: readonly PlacedBlock[], heading: number): { start: number; end: number } {
+  const block = placed[heading]?.block
+  const level = block && isHeading(block) ? block.level : 0
+  let end = heading + 1
+  while (end < placed.length) {
+    const next = placed[end]!.block
+    if (isHeading(next) && next.level <= level) {
+      break
+    }
+    end += 1
+  }
+  return { start: heading + 1, end }
+}
+
+// --- moving blocks --------------------------------------------------------------------------
+
+/** A move as it lands: the document, and where the moved run — trailing comments included —
+ *  now sits. */
+export interface MovedBlocks {
+  markdown: string
+  first: BlockAt
+  last: BlockAt
+}
+
+/**
+ * The document with the run of blocks from `from` to `to` — in reading order, page markers
+ * crossed — moved before or after `target` (docs/web.md § Editing, *Moving blocks*). Parse,
+ * splice, `serializeDocument`: everything not moved keeps its bytes, and the page markers stay
+ * where they were, so a page a move empties keeps its marker and draws nothing.
+ *
+ * A comment travels with the block before it on its page: one right after the run goes with
+ * it, and a move placed after `target` lands past the comments `target` carries. Null when the
+ * positions are not a run, the target is inside it, or the move would change nothing.
+ */
+export function moveBlocks(
+  markdown: string,
+  run: { from: BlockAt; to: BlockAt },
+  target: BlockAt,
+  place: 'before' | 'after',
+): MovedBlocks | null {
+  const pages = parseResultMarkdown(markdown)
+  const placed = placedBlocks(pages)
+  const find = (at: BlockAt) => placed.findIndex((entry) => entry.page === at.page && entry.index === at.index)
+  const first = find(run.from)
+  let last = find(run.to)
+  const aim = find(target)
+  if (first === -1 || last < first || aim === -1) {
+    return null
+  }
+  while (last + 1 < placed.length && placed[last + 1]!.block.kind === 'comment' && placed[last + 1]!.page === placed[last]!.page) {
+    last += 1
+  }
+  if (aim >= first && aim <= last) {
+    return null
+  }
+  const moving = placed.slice(first, last + 1).map((entry) => entry.block)
+  const aimed = placed[aim]!.block
+  const staying = new Set(moving)
+  const rest = pages.map((page) => ({ page: page.page, blocks: page.blocks.filter((block) => !staying.has(block)) }))
+  const host = rest.find((page) => page.blocks.includes(aimed))!
+  let at = host.blocks.indexOf(aimed)
+  if (place === 'after') {
+    at += 1
+    while (host.blocks[at]?.kind === 'comment') {
+      at += 1
+    }
+  }
+  host.blocks.splice(at, 0, ...moving)
+  const next = serializeDocument(rest)
+  if (next === serializeDocument(pages)) {
+    return null
+  }
+  const page = rest.indexOf(host)
+  return { markdown: next, first: { page, index: at }, last: { page, index: at + moving.length - 1 } }
+}
+
+// --- links to a block -------------------------------------------------------------------------
+
+/**
+ * A block's anchor, as *Copy link to block* writes it (docs/web.md § Files, *A block can be
+ * linked to*): a heading's own slug; any other block's section slug — empty before the first
+ * heading — then `~` and its first words. A block with no words of its own, a figure without a
+ * caption, is its section. Not yet URL-encoded.
+ */
+export function blockAnchor(pages: readonly ResultPageBlocks[], at: BlockAt, outline = documentOutline(pages)): string {
+  const block = pages[at.page]?.blocks[at.index]
+  if (!block) {
+    return ''
+  }
+  let section = ''
+  for (const entry of outline) {
+    if (entry.page === at.page && entry.index === at.index) {
+      return entry.slug
+    }
+    if (!isBefore(entry, at)) {
+      break
+    }
+    section = entry.slug
+  }
+  const words = firstWords(blockPlain(block))
+  return words ? `${section}~${words}` : section
+}
+
+/**
+ * Where a block link leads: the first block in its section whose text starts with its words,
+ * else such a block anywhere, else the section's heading, else null — the top of the document.
+ * Compared as a located passage is, spacing ignored; a link survives edits above it and a
+ * block moved to another section.
+ */
+export function resolveAnchor(pages: readonly ResultPageBlocks[], anchor: string, outline = documentOutline(pages)): BlockAt | null {
+  const tilde = anchor.indexOf('~')
+  const slug = (tilde === -1 ? anchor : anchor.slice(0, tilde)).trim().toLowerCase()
+  const key = tilde === -1 ? '' : passageKey(anchor.slice(tilde + 1))
+  const placed = placedBlocks(pages)
+  const heading = slug ? outline.find((entry) => entry.slug === slug) : undefined
+  const headingAt = heading ? placed.findIndex((entry) => entry.page === heading.page && entry.index === heading.index) : -1
+  const position = (index: number): BlockAt => ({ page: placed[index]!.page, index: placed[index]!.index })
+  if (key) {
+    const starts = (index: number) => {
+      const block = placed[index]!.block
+      return block.kind !== 'comment' && passageKey(blockPlain(block)).startsWith(key)
+    }
+    // The section first: after its heading to the next of its level, or — with no slug —
+    // everything before the first heading.
+    let start = -1
+    let end = -1
+    if (headingAt !== -1) {
+      ;({ start, end } = sectionExtent(placed, headingAt))
+    } else if (!slug) {
+      start = 0
+      end = placed.findIndex((entry) => isHeading(entry.block))
+      end = end === -1 ? placed.length : end
+    }
+    for (let index = start; index !== -1 && index < end; index += 1) {
+      if (starts(index)) {
+        return position(index)
+      }
+    }
+    for (let index = 0; index < placed.length; index += 1) {
+      if (starts(index)) {
+        return position(index)
+      }
+    }
+  }
+  return headingAt === -1 ? null : position(headingAt)
 }
