@@ -14,7 +14,8 @@ agent-sightread/
                               # library.py (/api/library — the web file library),
                               # chat.py (/api/conversations, /api/sandbox),
                               # attachments.py (/api/attachments), extensions.py
-                              # (/api/skills, /api/subagents), oauth.py
+                              # (/api/skills, /api/subagents), memories.py
+                              # (/api/memories), oauth.py
         agents/               # the agent registry (docs/agents.md); parse.py holds the
                               # parse agent's definition: default prompt, pipeline version;
                               # chat.py the chat agent's system prompt and tool definitions;

@@ -67,6 +67,16 @@ export interface AgentSettings {
   prompt_preset_id: number | null
   /** Reasoning effort; meaningful for the `chat` agent, `medium` when unset. */
   effort: AgentEffort | null
+  /** `chat` only: the reader's instructions, appended after the prompt; null for none
+   *  (docs/chat.md § Instructions). Optional fields so a page served by an older API
+   *  still renders. */
+  instructions?: string | null
+  /** `chat` only: language tags; null follows the reader's locale of each message. */
+  answer_language?: string | null
+  translate_language?: string | null
+  /** `chat` only: the memory switches (docs/chat.md § Memory). */
+  memory_auto?: boolean
+  memory_paused?: boolean
 }
 
 /**
@@ -127,6 +137,91 @@ export interface UploadLimits {
   attachment_max_bytes?: number
   attachments_per_message?: number
   attachment_extensions?: string[]
+  /** The chat agent's instructions and one memory (docs/chat.md § Instructions, § Memory). */
+  instructions_max_chars?: number
+  memory_max_chars?: number
+  /** Whole sections one message may carry, and the cap on one section's text and on the
+   *  selection (docs/chat.md § What a user message carries). */
+  sections_per_message?: number
+  selection_max_chars?: number
+}
+
+// --- memory (docs/chat.md § Memory) ----------------------------------------------------
+
+export type MemoryKind = 'term' | 'preference' | 'about' | 'document'
+
+export const MEMORY_KINDS: readonly MemoryKind[] = ['term', 'preference', 'about', 'document']
+
+/** One of the reader's memories, as `GET /api/memories` lists it. */
+export interface Memory {
+  id: number
+  kind: MemoryKind
+  text: string
+  /** The one document it applies to; null for every document. */
+  document_id: number | null
+  /** That document's name while it exists. */
+  document_name: string | null
+  /** Always loaded by a new conversation. */
+  pinned: boolean
+  /** The conversation that saved it, and its title, while it exists. */
+  conversation_id: number | null
+  conversation_title: string | null
+  /** The `tool_use_id` of the call that saved it: what a thread's memory line finds it by. */
+  source_ref: string | null
+  created_at: string
+  updated_at: string
+}
+
+/** A memory as the `memory` tool left it, carried by the `memory` event. */
+export interface MemorySnapshot {
+  id: number
+  kind: MemoryKind
+  text: string
+  document_id: number | null
+  pinned: boolean
+}
+
+export interface MemoryFields {
+  kind: MemoryKind
+  text: string
+  document_id: number | null
+  pinned: boolean
+}
+
+// --- what the chat agent receives (docs/api.md, GET /api/agents/chat/context) -------------
+
+export type AgentContextPartKind = 'prompt' | 'preset' | 'instructions' | 'catalogue' | 'memory'
+
+export interface AgentContextPart {
+  kind: AgentContextPartKind
+  text: string
+  /** Its length in characters (code points). */
+  chars: number
+  /** `prompt`: the reader's own prompt rather than the default. */
+  own?: boolean
+  /** `catalogue`: how many skills and subagents it lists. */
+  skills?: number
+  subagents?: number
+  /** `memory`: how many memories a new conversation would load, and whether memory is paused. */
+  count?: number
+  paused?: boolean
+}
+
+export interface AgentContextFacts {
+  document_path: string
+  page_count: string
+  bbox_format: string
+  parse_model: string
+  network: string
+}
+
+export interface AgentContext {
+  /** The system blocks in the order a turn sends them; a block not sent is not listed. */
+  parts: AgentContextPart[]
+  /** The context block a message sent now would carry. */
+  turn: { text: string; chars: number }
+  /** The document's facts, when one was named; null on the Agent page. */
+  facts: AgentContextFacts | null
 }
 
 // --- skills and subagents (docs/chat.md § Skills, § Subagents) -----------------------
@@ -343,6 +438,8 @@ export type ContentBlock =
       context?: string
       /** The skill a `context: skill` block ran. */
       skill?: string
+      /** The heading of a `context: section` block, served without the section's text. */
+      section?: string
       /** The file a `context: attachment` block holds. */
       attachment?: AttachmentMeta
     }
@@ -406,7 +503,14 @@ export type ChatEvent = ChatEventData & {
  * events carry none (docs/chat.md § Conversations, turns, events).
  */
 type ChatEventData =
-  | { event: 'turn_start'; model: string }
+  | {
+      event: 'turn_start'
+      model: string
+      /** Whether the turn had the reader's instructions, and the memories it loaded
+       *  (docs/chat.md § Memory). Absent on turns from before both existed. */
+      instructions?: boolean
+      memory_ids?: number[]
+    }
   | { event: 'text_delta'; text: string }
   | { event: 'thinking'; text: string; parent?: string }
   | { event: 'tool_use'; id: string; name: string; input: Record<string, unknown>; parent?: string }
@@ -428,6 +532,15 @@ type ChatEventData =
       diff: string
       tool_use_id: string
     }
+  | {
+      event: 'memory'
+      tool_use_id: string
+      action: 'saved' | 'updated' | 'forgotten'
+      /** The row as the call left it; as it was before a `forgotten`. */
+      memory: MemorySnapshot
+      /** The row before an `updated`, else null. */
+      previous: MemorySnapshot | null
+    }
   | { event: 'retry'; attempt: number; parent?: string }
   | { event: 'turn_done' }
   | { event: 'turn_error'; status: string; error: string }
@@ -439,6 +552,7 @@ export const CHAT_EVENT_NAMES: readonly ChatEvent['event'][] = [
   'tool_use',
   'tool_result',
   'edit',
+  'memory',
   'retry',
   'turn_done',
   'turn_error',
@@ -698,6 +812,46 @@ export function listAgentModels(agent: string): Promise<{ data: ConnectionModel[
   return request('GET', `/api/agents/${encodeURIComponent(agent)}/models`)
 }
 
+/** What the chat agent receives, rendered by the runner's own code, for a message sent in
+ *  `locale`; with a document, its facts filled in. */
+export function getAgentContext(locale: string, documentId?: number): Promise<AgentContext> {
+  const query = new URLSearchParams({ locale })
+  if (documentId !== undefined) query.set('document_id', String(documentId))
+  return request('GET', `/api/agents/chat/context?${query}`)
+}
+
+// --- memory (docs/chat.md § Memory) ----------------------------------------------------
+
+export function listMemories(): Promise<{ memories: Memory[]; max: number }> {
+  return request('GET', '/api/memories')
+}
+
+/** Saves one again: how a thread's Undo puts back what the agent forgot, and Save again
+ *  restores what Undo removed (with the call's `tool_use_id` as `source_ref`). */
+export function createMemory(
+  body: Pick<MemoryFields, 'kind' | 'text'> &
+    Partial<Pick<MemoryFields, 'document_id' | 'pinned'>> & {
+      conversation_id?: number | null
+      source_ref?: string | null
+    },
+): Promise<Memory> {
+  return request('POST', '/api/memories', body)
+}
+
+/** Writes the fields present; `document_id: null` widens it to every document. */
+export function updateMemory(id: number, body: Partial<MemoryFields>): Promise<Memory> {
+  return request('PUT', `/api/memories/${id}`, body)
+}
+
+export function deleteMemory(id: number): Promise<void> {
+  return request<undefined>('DELETE', `/api/memories/${id}`)
+}
+
+/** Clear all memories; the switches stay as they are. */
+export function clearMemories(): Promise<void> {
+  return request<undefined>('DELETE', '/api/memories')
+}
+
 // --- skills and subagents (docs/chat.md § Skills, § Subagents) -----------------------
 
 export function listSkills(): Promise<{ skills: Skill[] }> {
@@ -887,6 +1041,9 @@ export interface MessageBody {
   /** The reader's words; a command's arguments when `command` is set. */
   text: string
   selection?: string
+  /** Whole sections the reader added by heading; `text` null for one past the selection
+   *  cap, which the agent then reads from the document. */
+  sections?: { heading: string; text: string | null }[]
   /** The passage of an earlier answer the reader replies to. */
   quote?: string
   /** A skill run as `/name`. */
