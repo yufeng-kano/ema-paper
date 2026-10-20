@@ -764,9 +764,12 @@ async def _run_memory(
             outcome = admit(outcome)
         try:
             return await _report_tool(ctx, tool_use_id, "memory", outcome)
-        except Exception:
-            logger.exception("tool memory's result was not recorded in turn %s", ctx.turn.id)
-            raise
+        except Exception:  # noqa: BLE001 - the events are lost, the model's answer is not
+            logger.exception("tool memory's events were not recorded in turn %s", ctx.turn.id)
+            result = {"type": "tool_result", "tool_use_id": tool_use_id, "content": outcome.content}
+            if outcome.is_error:
+                result["is_error"] = True
+            return result
 
     task = asyncio.ensure_future(run())
     ctx.writers[task] = "memory"

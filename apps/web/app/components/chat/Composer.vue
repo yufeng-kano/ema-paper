@@ -849,6 +849,7 @@ defineExpose({ addFiles, setQuote, focus, ask })
           :key="section.key"
           icon="heading"
           :text="t('chat.context.section', { heading: section.plain })"
+          :tooltip="section.plain"
           :remove-label="t('chat.context.removeSection', { heading: section.plain })"
           @remove="removeSection(section.key)"
         />

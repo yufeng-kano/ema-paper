@@ -20,7 +20,7 @@ The origin spec (v0.1) is a reference, not a contract. Decisions that supersede 
 
 - Every user brings their **own upstream**: their Kano Proxy account, connected once through Kano Proxy's consent screen ([auth.md](./auth.md) § 6), or an OpenAI-compatible endpoint and key of their own. Vision spend is theirs. The operator pays only for CPU/disk, protected by per-user concurrency caps.
 - Documents are untrusted input: parsing runs in short-lived subprocesses with timeouts; uploads are size- and page-capped.
-- Document content is sensitive: source files are short-lived, prompts/completions are never logged, results are visible only to their owner.
+- Document content is sensitive: source files are short-lived, prompts/completions are never logged (nor are a failed database statement's bound values, which hold the same text), results are visible only to their owner.
 
 ## Non-goals
 

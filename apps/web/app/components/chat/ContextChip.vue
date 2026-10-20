@@ -3,7 +3,7 @@
  * One chip of what goes with a message besides its text — the document, the selection, a
  * whole section (docs/web.md § The agent panel, *Context chips*). The composer's carry a
  * remove control; a sent message's, under its bubble in the thread, do not. The text is cut
- * to one line: a passage reads by its first words, and the whole of it is the tooltip.
+ * to one line: a passage reads by its first words.
  */
 import type { IconName } from '~/lib/icons'
 
@@ -14,6 +14,8 @@ defineProps<{
   faint?: boolean
   /** The remove control's name; none, no control. */
   removeLabel?: string
+  /** What a cut text stands for in full — a section's heading. */
+  tooltip?: string
 }>()
 
 const emit = defineEmits<{ remove: [] }>()
@@ -22,7 +24,7 @@ const emit = defineEmits<{ remove: [] }>()
 <template>
   <span class="chip" :class="{ faint }">
     <UiIcon :name="icon" />
-    <span class="chip-text" :title="text">{{ text }}</span>
+    <span class="chip-text" :title="tooltip">{{ text }}</span>
     <button
       v-if="removeLabel"
       type="button"

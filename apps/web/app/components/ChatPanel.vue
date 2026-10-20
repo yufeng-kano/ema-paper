@@ -373,9 +373,9 @@ function endedTurns(): Set<string> {
  * A memory a running turn saved, changed or forgot is folded into the list at once: its line
  * renders with the frame, and read against the list from before the call a fresh save would
  * read as undone for a round trip. A replayed frame of a turn already over is left to the read
- * that follows — the list may well be newer than it.
+ * that follows — the list may well be newer than it. `live` says which turns are running.
  */
-function applyMemoryFrames(frames: readonly StreamedEvent[], ended: ReadonlySet<string>) {
+function applyMemoryFrames(frames: readonly StreamedEvent[], live: (turnId: string) => boolean) {
   if (memories.value === null) {
     return
   }
@@ -386,7 +386,7 @@ function applyMemoryFrames(frames: readonly StreamedEvent[], ended: ReadonlySet<
   }
   let rows = memories.value
   for (const { event } of frames) {
-    if (event.event === 'memory' && !ended.has(event.turn_id)) {
+    if (event.event === 'memory' && live(event.turn_id)) {
       rows = applyMemoryEvent(rows, event, context)
     }
   }
@@ -466,10 +466,12 @@ function flushFrames() {
   const batch = pendingFrames
   pendingFrames = []
   const memoryFrames = batch.filter((frame) => frame.event.event === 'memory')
-  // Which turns were over is read before this batch joins the thread: a turn's terminal frame
-  // follows its memory frames, often in the same batch (a Stop during a save), and must not
-  // make that save read as a replay.
+  // Which turns were running is read before this batch joins the thread: a turn's terminal
+  // frame follows its memory frames, often in the same batch (a Stop during a save), and must
+  // not make that save read as a replay. A turn the panel does not know yet — a replay racing
+  // the record — counts as running only while this batch does not end it.
   const endedBefore = memoryFrames.length ? endedTurns() : null
+  const liveBefore = new Set(turns.value.filter(isLive).map((turn) => turn.id))
   events.value = events.value.concat(batch)
   // A replayed edit of a finished turn changed nothing since the viewer loaded; one of a
   // turn still in flight did. One reload covers however many landed in this batch.
@@ -479,7 +481,11 @@ function flushFrames() {
   }
   // A memory saved, changed or forgotten: its line's state is read from the list.
   if (endedBefore) {
-    applyMemoryFrames(memoryFrames, endedBefore)
+    const endedNow = endedTurns()
+    applyMemoryFrames(
+      memoryFrames,
+      (turnId) => !endedBefore.has(turnId) && (liveBefore.has(turnId) || !endedNow.has(turnId)),
+    )
     void memoriesChanged()
   }
   const ended = batch.some(
@@ -1138,6 +1144,7 @@ onBeforeUnmount(() => {
               :key="index"
               icon="heading"
               :text="t('chat.context.section', { heading: inlinePlain(heading) })"
+              :tooltip="inlinePlain(heading)"
             />
           </div>
         </div>

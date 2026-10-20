@@ -369,4 +369,17 @@ describe('selectionText', () => {
     expect(selectionText([row('a', '1'), row('b', '2')])).toBe('a\t1\nb\t2')
     expect(selectionText([el('td', {}, [text('27.3')]), el('td', {}, [text('38.1')])])).toBe('27.3\t38.1')
   })
+
+  it('reads a table the block editor holds as rows too, its cells wrapped in paragraphs', () => {
+    // A drag opens the blocks in the editor, which puts each cell's text in a `<p>`.
+    const cell = (...lines: string[]) =>
+      el('td', {}, [el('p', { class: 'md-p' }, lines.flatMap((line, i) => (i ? [el('br'), text(line)] : [text(line)])))])
+    const rows = [
+      el('tr', {}, [cell('Transformer base'), cell('27.3'), cell('38.1')]),
+      el('tr', {}, [cell('Transformer', 'big'), cell(' 28.4 '), cell('41.8')]),
+    ]
+    expect(selectionText([el('table', {}, [el('tbody', {}, rows)])])).toBe(
+      'Transformer base\t27.3\t38.1\nTransformer big\t28.4\t41.8',
+    )
+  })
 })
