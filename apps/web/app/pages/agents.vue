@@ -192,7 +192,9 @@ function onTabKeydown(event: KeyboardEvent, index: number) {
       </div>
     </UiRail>
 
-    <UiRegion>
+    <!-- Positioned: the panel's drawers anchor to the region's right edge, outside the
+         panel's own scroll. -->
+    <UiRegion class="agent-region">
       <UiPanel v-if="selected" :title="agentTitle(selected)" lead>
         <template #meta>
           <span class="mono io">{{ selected.input }} → {{ selected.output }}</span>
@@ -370,6 +372,12 @@ function onTabKeydown(event: KeyboardEvent, index: number) {
 }
 
 /* --- Region -------------------------------------------------------------------- */
+
+/* The containing block of *What the agent receives*, which stays put while the panel
+   scrolls under it (docs/web.md § Pages). */
+.agent-region {
+  position: relative;
+}
 
 .io {
   color: var(--muted);
