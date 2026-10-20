@@ -32,7 +32,7 @@ from sightread.db.models import (
 from sightread.jobs import chat_events, chat_memory, chat_runner, chat_tools
 from sightread.routes.chat import TURN_CONTEXT, turn_note
 from sightread.workspace.layout import user_root
-from tests.conftest import CSRF_HEADERS
+from tests.conftest import CSRF_HEADERS, DATABASE_URL
 from tests.test_chat import _run_queued_turn
 from tests.test_chat_extensions import (
     DOC_PATH,
@@ -499,6 +499,37 @@ async def test_a_memory_is_checked_capped_and_the_callers_own(make_client, tmp_p
     async with client.app.state.sessionmaker() as db:
         left = (await db.execute(select(Memory.id))).scalars().all()
     assert left == [theirs.memory_id]
+
+
+@pytest.mark.skipif(
+    not (DATABASE_URL or "").startswith("postgresql"),
+    reason="row locks only block on PostgreSQL",
+)
+async def test_the_readers_memory_writes_wait_for_a_call_in_flight(chat_client) -> None:
+    """A Pause, an edit, a delete and *Clear all* each take the reader's row before they
+    act, as the `memory` tool does before it reads the switch, so none lands under a call
+    already deciding (docs/chat.md § Memory)."""
+    client = chat_client
+    edited = await save_memory(client, kind="term", text="query → 查詢")
+    deleted = await save_memory(client, kind="term", text="key → 鍵")
+    writes = {
+        "pause": lambda: put_chat(client, memory_paused=True),
+        "edit": lambda: client.put(
+            f"/api/memories/{edited['id']}", json={"pinned": True}, headers=CSRF_HEADERS
+        ),
+        "delete": lambda: client.delete(f"/api/memories/{deleted['id']}", headers=CSRF_HEADERS),
+        "clear": lambda: client.delete("/api/memories", headers=CSRF_HEADERS),
+    }
+    for name, write in writes.items():
+        async with client.app.state.sessionmaker() as call:
+            # A `memory` call deciding: it holds the reader's row until it commits.
+            await call.execute(select(User.id).where(User.id == client.user_id).with_for_update())
+            pending = asyncio.create_task(write())
+            await asyncio.sleep(0.3)
+            assert not pending.done(), name
+            await call.commit()
+        response = await asyncio.wait_for(pending, 5)
+        assert response.status_code in (200, 204), (name, response.text)
 
 
 # --- what the agent receives ------------------------------------------------------------------

@@ -53,6 +53,7 @@ from ..db.models import (
     Skill,
     Subagent,
     UsageLog,
+    User,
     utcnow,
 )
 from ..errors import ApiError
@@ -790,6 +791,11 @@ async def put_agent_settings(
         if preset.agent != agent.name:
             raise ApiError(400, "invalid_request", f"That prompt is for the {preset.agent} agent")
 
+    if "memory_paused" in provided:
+        # The reader's row, held until the commit: the `memory` tool reads the switch under
+        # it, so a Pause waits for a call already deciding and every later call sees it
+        # (docs/chat.md § Memory).
+        await db.execute(select(User.id).where(User.id == user.id).with_for_update())
     row = (
         await db.execute(
             select(AgentSetting).where(
