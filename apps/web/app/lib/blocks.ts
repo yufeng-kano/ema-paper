@@ -266,17 +266,19 @@ export function followFolds(
 }
 
 /**
- * The collapsed headings whose sections hold block `index` of `placedBlocks` — all of them, so a
- * fold inside a fold opens with it (docs/web.md § Result viewer, *What leads into a fold opens
- * it*). A heading's own fold does not hold it: the heading is what the reader is taken to.
+ * The collapsed headings whose sections hold any of the blocks at `indices` of `placedBlocks` —
+ * all of them, so a fold inside a fold opens with it (docs/web.md § Result viewer, *What leads
+ * into a fold opens it*). A heading's own fold does not hold it: the heading is what the reader
+ * is taken to.
  */
 export function foldsOver(
   placed: readonly PlacedBlock[],
   outline: readonly OutlineEntry[],
   collapsed: ReadonlySet<string>,
-  index: number,
+  indices: readonly number[],
 ): string[] {
   const at = new Map(placed.map((entry, position) => [blockKey(entry), position]))
+  const targets = new Set(indices)
   return outline
     .filter((entry) => {
       const heading = at.get(blockKey(entry))
@@ -284,7 +286,12 @@ export function foldsOver(
         return false
       }
       const { start, end } = sectionExtent(placed, heading)
-      return index >= start && index < end
+      for (let index = start; index < end; index += 1) {
+        if (targets.has(index)) {
+          return true
+        }
+      }
+      return false
     })
     .map((entry) => entry.slug)
 }

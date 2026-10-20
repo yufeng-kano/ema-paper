@@ -177,9 +177,9 @@ describe('foldsOver', () => {
   it('names every collapsed section holding a block, not the heading’s own', () => {
     const collapsed = new Set(['1-intro', '11-sub'])
     const at = (key: string) => placed.findIndex((entry) => `${entry.page}-${entry.index}` === key)
-    expect(foldsOver(placed, outline, collapsed, at('0-4'))).toEqual(['1-intro', '11-sub'])
-    expect(foldsOver(placed, outline, collapsed, at('0-3'))).toEqual(['1-intro'])
-    expect(foldsOver(placed, outline, collapsed, at('1-1'))).toEqual([])
+    expect(foldsOver(placed, outline, collapsed, [at('0-4')])).toEqual(['1-intro', '11-sub'])
+    expect(foldsOver(placed, outline, collapsed, [at('0-3')])).toEqual(['1-intro'])
+    expect(foldsOver(placed, outline, collapsed, [at('1-1'), at('0-0')])).toEqual([])
   })
 })
 
