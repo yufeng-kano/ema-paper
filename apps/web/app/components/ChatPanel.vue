@@ -1340,7 +1340,11 @@ onBeforeUnmount(() => {
 }
 
 /* The thread scrolls on its own, scrollbar hidden (docs/web.md § The agent panel). */
+/* Positioned, so what sits absolutely inside it — each copy button's live region — scrolls
+   and clips with it. Placed against the column instead, those reach past its foot, and the
+   viewer's body, which hides its overflow but can still be scrolled, has room to slide up. */
 .thread {
+  position: relative;
   display: flex;
   flex: 1 1 auto;
   flex-direction: column;

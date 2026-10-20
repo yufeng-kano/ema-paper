@@ -660,9 +660,11 @@ const canSend = computed(
     (draft.value.trim() !== '' || command.value !== null || pending.value.some((item) => item.state !== 'refused')),
 )
 
-async function send() {
+/** Sends what the composer holds; whether the message was taken, so an ask that sends can
+ *  tell a refusal, which leaves everything in place, from a send. */
+async function send(): Promise<boolean> {
   if (!canSend.value) {
-    return
+    return false
   }
   sending.value = true
   localError.value = null
@@ -671,13 +673,13 @@ async function send() {
     await Promise.allSettled([...uploads.values()].map((request) => request.promise))
     if (unmounted) {
       // The panel went before the message did: the draft, its attachments with it, went too.
-      return
+      return false
     }
     const ready = pending.value.filter((item) => item.state === 'ready')
     const text = draft.value.trim()
     const picked = command.value
     if (!text && !picked && !ready.length) {
-      return
+      return false
     }
     const sentSections = addedSections.value
     const headingMax = props.limits?.section_heading_max_chars
@@ -708,12 +710,14 @@ async function send() {
           void deleteAttachment(item.id!).catch(() => {})
         }
       }
-      return
+      return false
     }
     if (draft.value.trim() === text) {
       draft.value = ''
     }
-    if (command.value === picked) {
+    // By name: `setCommand` swaps a command for its listed entry once the list arrives, which
+    // can land while the send is out.
+    if (command.value?.name === picked?.name) {
       command.value = null
     }
     if (selection.value === payload.selection) {
@@ -726,6 +730,7 @@ async function send() {
     }
     const sent = new Set(ready.map((item) => item.key))
     pending.value = pending.value.filter((item) => !sent.has(item.key))
+    return true
   } finally {
     sending.value = false
   }
@@ -757,7 +762,8 @@ function setCommand(name: string) {
  * whole section, a command (docs/web.md § The agent panel, *Asked from the document*). With
  * `send` it goes at once only while nothing runs and the composer held nothing before it —
  * no draft, no command, no chip, quote or attachment — so a command acts on what the reader
- * just pointed at alone; otherwise it waits for Send, with focus, unless a turn is running.
+ * just pointed at alone; otherwise, or when the send is refused, it waits for Send, with
+ * focus, unless a turn is running.
  * A section the composer has no room for is not added, and then nothing is.
  */
 async function ask(request: AskRequest): Promise<AskOutcome> {
@@ -792,8 +798,7 @@ async function ask(request: AskRequest): Promise<AskOutcome> {
     setCommand(request.command)
   }
   await nextTick()
-  if (request.send && clean && !props.running && !sending.value && !selectionTooLong.value) {
-    await send()
+  if (request.send && clean && !props.running && !sending.value && !selectionTooLong.value && (await send())) {
     return 'sent'
   }
   if (props.running) {

@@ -24,10 +24,11 @@
  *
  * An item with `children` flies a submenu out beside its row — a second surface teleported
  * beside this one rather than drawn inside it, where the scrolling box would clip it, and
- * counted as inside: a press, a scroll or a right-click in it closes nothing. It opens on a
- * press, on ArrowRight or Enter with its first item highlighted, or when the pointer rests on
- * the row; another row takes over only after a longer rest, so a diagonal path to the
- * submenu does not lose it on the way. ArrowLeft or Escape goes back to the row.
+ * counted as inside: a press, a scroll or a right-click in it closes nothing, while a scroll
+ * of the menu, which moves its row out from beside it, closes it. It opens on a press, on
+ * ArrowRight or Enter with its first item highlighted, or when the pointer rests on the row;
+ * another row takes over only after a longer rest, so a diagonal path to the submenu does
+ * not lose it on the way. ArrowLeft or Escape goes back to the row.
  */
 import { heightAbove, modalPanelKey, placeMenu, placeSubmenu, type MenuFact, type MenuItem, type Point } from '~/lib/menu'
 
@@ -182,10 +183,18 @@ function close(event: Event) {
   emit('close', event)
 }
 
-/** Moving to an item scrolls a menu taller than the window, and that must not close it. */
+/** Moving to an item scrolls a menu taller than the window, and that must not close it. Its
+ *  own scroll takes the row an open submenu stands beside away from it, so that closes; focus
+ *  that was in the submenu goes to the menu, where the scroll leaves the reader. */
 function onScrollOutside(event: Event) {
   if (!inside(event)) {
     emit('close', event)
+  } else if (event.target === menu.value && subKey.value !== null) {
+    const focused = sub.value?.contains(document.activeElement) ?? false
+    closeSub()
+    if (focused) {
+      menu.value?.focus({ preventScroll: true })
+    }
   }
 }
 

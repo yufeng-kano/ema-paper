@@ -875,15 +875,20 @@ defineExpose({
     const storage = editor?.storage as { sectionLink?: { refresh: () => void } } | undefined
     storage?.sectionLink?.refresh()
   },
-  /** The selection as markdown — the clipboard's serializer over it — and the top-level
-   *  block it starts in; null with nothing selected. */
-  selectedMarkdown: (): { markdown: string; block: number } | null => {
+  /** The selection as markdown — the clipboard's serializer over it — and, as the editor
+   *  writes them, the top-level blocks before the one it starts in; null with nothing
+   *  selected. */
+  selectedMarkdown: (): { markdown: string; before: string } | null => {
     if (!editor || editor.state.selection.empty) {
       return null
     }
     const { selection, doc } = editor.state
     const markdown = sliceToMarkdown(selection.content().content.toJSON() ?? [])
-    return markdown.trim() ? { markdown, block: doc.resolve(selection.from).index(0) } : null
+    if (!markdown.trim()) {
+      return null
+    }
+    const json = editor.getJSON()
+    return { markdown, before: docToMarkdown({ ...json, content: (json.content ?? []).slice(0, doc.resolve(selection.from).index(0)) }) }
   },
 })
 </script>

@@ -196,7 +196,7 @@ interface EditorControls {
   wash: (first: number, count: number) => void
   focusBlock: (index: number) => void
   refreshLinks: () => void
-  selectedMarkdown: () => { markdown: string; block: number } | null
+  selectedMarkdown: () => { markdown: string; before: string } | null
 }
 
 /** A rendered block's text slots, in reading order: the textblocks the editor will hold, and a
@@ -2452,8 +2452,9 @@ function selectionTranslates(selection: Selection): boolean {
   return from !== undefined && to !== undefined && placed.value.slice(from, to + 1).some((entry) => translatable(entry.block))
 }
 
-/** The passage the toolbar acts on, as markdown, and the block it starts in: inside the editor
- *  its own serializer over its selection, over rendered blocks the walk Ctrl+C makes. */
+/** The passage the toolbar acts on, as markdown, and the block it starts in once an open
+ *  editor is written back: inside the editor its own serializer over its selection, over
+ *  rendered blocks the walk Ctrl+C makes. */
 function toolbarPassage(): { markdown: string; at: BlockAt } | null {
   const selection = window.getSelection()
   if (!selection || selection.isCollapsed || !selection.rangeCount) {
@@ -2463,10 +2464,16 @@ function toolbarPassage(): { markdown: string; at: BlockAt } | null {
   const open = editing.value
   if (open && start === blockKey(open)) {
     const picked = blockEditor?.selectedMarkdown()
-    return picked ? { markdown: picked.markdown, at: { page: open.page, index: open.index + Math.min(picked.block, span.value - 1) } } : null
+    if (!picked) {
+      return null
+    }
+    // Counted on their own, the blocks before can come to one more than the whole draft holds
+    // there — a list right before a list reads as one — so the index stays within the draft.
+    const before = parseResultMarkdown(picked.before).reduce((total, page) => total + page.blocks.length, 0)
+    return { markdown: picked.markdown, at: { page: open.page, index: open.index + Math.min(before, draftBlockCount() - 1) } }
   }
   const text = selectionMarkdown(selection)
-  return text && start ? { markdown: text, at: parseKey(start) } : null
+  return text && start ? { markdown: text, at: afterCommit(parseKey(start)) } : null
 }
 
 function onToolbarAction(action: 'ask' | 'translate' | 'quote' | 'copy') {
@@ -2480,7 +2487,12 @@ function onToolbarAction(action: 'ask' | 'translate' | 'quote' | 'copy') {
   }
   toolbar.value = null
   if (action === 'quote') {
+    // The excerpt names the section as the document has it with the draft written in.
+    const focus = commitOpenEditor(null)
     quoteInNotes(passage.markdown, passage.at)
+    if (focus !== null) {
+      void nextTick(() => focusBlock(focus))
+    }
   } else {
     const request: AskRequest = action === 'translate' ? { selection: passage.markdown, command: 'translate', send: true } : { selection: passage.markdown }
     void askAgent(request, blockKey(passage.at))
@@ -2569,6 +2581,18 @@ const chatPanel = ref<{ ask: (request: AskRequest) => Promise<'sent' | 'focused'
 
 const limits = computed(() => auth.me.value?.limits ?? null)
 
+/** Writes an open editor back for an action that leaves the reader in the document, and gives
+ *  where focus then goes: the first block the editor became, else `focusKey`. */
+function commitOpenEditor(focusKey: string | null): string | null {
+  const open = editing.value
+  if (!open) {
+    return focusKey
+  }
+  const count = draftBlockCount()
+  commitEdit()
+  return rowKeysIn(open.page, open.index, count)[0] ?? focusKey
+}
+
 /**
  * Asks the agent (docs/web.md § The agent panel, *Asked from the document*): the column opens,
  * an open editor is written back first, and a sending ask waits for both files' saves — one
@@ -2577,13 +2601,7 @@ const limits = computed(() => auth.me.value?.limits ?? null)
  * block an open editor became.
  */
 async function askAgent(request: AskRequest, focusKey: string | null) {
-  let focus = focusKey
-  const open = editing.value
-  if (open) {
-    const count = draftBlockCount()
-    commitEdit()
-    focus = rowKeysIn(open.page, open.index, count)[0] ?? focus
-  }
+  const focus = commitOpenEditor(focusKey)
   agentOpen.value = true
   let next = request
   if (request.send && !(await flushSaves())) {
@@ -3163,13 +3181,23 @@ async function jumpToHeading(index: number) {
   armWayBack()
 }
 
+/** An outline row's ask. An open editor is written back first — Safari gives a pressed button
+ *  no focus, so one can still be open — and the heading found again where it then stands, so
+ *  the section is read as the reader sees it; a heading the draft took away asks nothing. */
 function askAboutHeading(index: number, translate: boolean) {
   const entry = outline.value[index]
   if (!entry) {
     return
   }
-  const section = { heading: entry.text, text: sectionSource(pages.value, entry.page, entry.index) }
-  void askAgent(translate ? { section, command: 'translate', send: true } : { section }, null)
+  const at = afterCommit(entry)
+  const focus = commitOpenEditor(null)
+  const heading = outline.value.find((row) => row.page === at.page && row.index === at.index)
+  if (heading) {
+    const section = { heading: heading.text, text: sectionSource(pages.value, heading.page, heading.index) }
+    void askAgent(translate ? { section, command: 'translate', send: true } : { section }, focus)
+  } else if (focus !== null) {
+    void nextTick(() => focusBlock(focus))
+  }
 }
 
 let scrollFrame = 0

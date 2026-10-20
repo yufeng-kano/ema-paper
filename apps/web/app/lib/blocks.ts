@@ -598,14 +598,23 @@ export function blocksInRanges(
   ranges: readonly { start: number; end: number }[],
 ): number[] {
   const found = new Set<number>()
+  // A block's source is whole lines, found only where whole lines are: a paragraph that is only
+  // `1` is not the `1` in `<!-- page: 1 -->`.
+  const wholeLines = (start: number, length: number) =>
+    (start === 0 || markdown[start - 1] === '\n') && (start + length === markdown.length || markdown[start + length] === '\n')
   let cursor = 0
   const spans = placed.map((entry) => {
-    const start = markdown.indexOf(entry.block.src, cursor)
-    if (start === -1 || entry.block.kind === 'comment') {
+    const { src } = entry.block
+    let start = markdown.indexOf(src, cursor)
+    while (start !== -1 && !wholeLines(start, src.length)) {
+      start = markdown.indexOf(src, start + 1)
+    }
+    if (start === -1) {
       return null
     }
-    cursor = start + entry.block.src.length
-    return { start, end: cursor }
+    // A comment is stepped over, so no later block is found inside it, but never selected.
+    cursor = start + src.length
+    return entry.block.kind === 'comment' ? null : { start, end: cursor }
   })
   for (const range of ranges) {
     const held = spans.flatMap((span, index) => {

@@ -318,6 +318,17 @@ describe('undo', () => {
     expect(blocksInRanges(markdown, all, [{ start: markdown.length, end: markdown.length }])).toEqual([])
   })
 
+  it('finds a block by its own lines, never inside a page marker or a comment before it', () => {
+    const markdown = 'Intro.\n\n<!-- page: 1 -->\n1\n\n<!-- see 2 -->\n\n2\n\nEnd.'
+    const all = placedBlocks(parseResultMarkdown(markdown))
+    expect(all.map((entry) => entry.block.src)).toEqual(['Intro.', '1', '<!-- see 2 -->', '2', 'End.'])
+    const two = markdown.indexOf('\n2\n') + 1
+    expect(blocksInRanges(markdown, all, [{ start: two, end: two + 1 }])).toEqual([3])
+    // The `1` deleted and taken back is the `1` selected, not the page marker's.
+    const spans = diffSpans(markdown, markdown.replace('\n1\n\n', '\n'))
+    expect(blocksInRanges(markdown, all, restoredRanges(spans, 'undo'))).toEqual([1])
+  })
+
   it('hashes by content and length', () => {
     expect(hashText('abc')).toBe(hashText('abc'))
     expect(hashText('abc')).not.toBe(hashText('abd'))
