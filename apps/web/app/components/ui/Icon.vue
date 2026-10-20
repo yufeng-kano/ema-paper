@@ -329,6 +329,120 @@ defineProps<{ name: IconName }>()
       <path d="M6 20V4" />
       <path d="M18 20V4" />
     </template>
+    <!-- grip-vertical: a block's handle — six dots to take hold of. -->
+    <template v-else-if="name === 'grip-vertical'">
+      <circle cx="9" cy="12" r="1" />
+      <circle cx="9" cy="5" r="1" />
+      <circle cx="9" cy="19" r="1" />
+      <circle cx="15" cy="12" r="1" />
+      <circle cx="15" cy="5" r="1" />
+      <circle cx="15" cy="19" r="1" />
+    </template>
+    <!-- languages: translate, on every surface that offers it. -->
+    <template v-else-if="name === 'languages'">
+      <path d="m5 8 6 6" />
+      <path d="m4 14 6-6 2-3" />
+      <path d="M2 5h12" />
+      <path d="M7 2h1" />
+      <path d="m22 22-5-10-5 10" />
+      <path d="M14 18h6" />
+    </template>
+    <!-- notebook-pen: quote a passage in the notes. -->
+    <template v-else-if="name === 'notebook-pen'">
+      <path d="M13.4 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-7.4" />
+      <path d="M2 6h4M2 10h4M2 14h4M2 18h4" />
+      <path
+        d="M21.378 5.626a1 1 0 1 0-3.004-3.004l-5.01 5.012a2 2 0 0 0-.506.854l-.837 2.87a.5.5 0 0 0 .62.62l2.87-.837a2 2 0 0 0 .854-.506z"
+      />
+    </template>
+    <!-- quote: a passage quoted in the notes — the backlink marker and its menu item. -->
+    <template v-else-if="name === 'quote'">
+      <path
+        d="M16 3a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2 1 1 0 0 1 1 1v1a2 2 0 0 1-2 2 1 1 0 0 0-1 1v2a1 1 0 0 0 1 1 6 6 0 0 0 6-6V5a2 2 0 0 0-2-2z"
+      />
+      <path
+        d="M5 3a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2 1 1 0 0 1 1 1v1a2 2 0 0 1-2 2 1 1 0 0 0-1 1v2a1 1 0 0 0 1 1 6 6 0 0 0 6-6V5a2 2 0 0 0-2-2z"
+      />
+    </template>
+    <!-- link: copy a link to a block. -->
+    <template v-else-if="name === 'link'">
+      <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+      <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+    </template>
+    <!-- repeat: turn a block into another kind. -->
+    <template v-else-if="name === 'repeat'">
+      <path d="m17 2 4 4-4 4" />
+      <path d="M3 11v-1a4 4 0 0 1 4-4h14" />
+      <path d="m7 22-4-4 4-4" />
+      <path d="M21 13v1a4 4 0 0 1-4 4H3" />
+    </template>
+    <!-- arrow-down: move a block down, beside arrow-up's move up. -->
+    <template v-else-if="name === 'arrow-down'">
+      <path d="M12 5v14" />
+      <path d="m19 12-7 7-7-7" />
+    </template>
+    <!-- message-circle-plus: add a section to the agent's context. -->
+    <template v-else-if="name === 'message-circle-plus'">
+      <path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z" />
+      <path d="M8 12h8M12 8v8" />
+    </template>
+    <!-- corner-up-left: back to where the reader was before a jump. -->
+    <template v-else-if="name === 'corner-up-left'">
+      <path d="M20 20v-7a4 4 0 0 0-4-4H4" />
+      <path d="M9 14 4 9l5-5" />
+    </template>
+    <!-- list-tree: the outline, where its ticks would not fit. -->
+    <template v-else-if="name === 'list-tree'">
+      <path d="M21 12h-8M21 6H8M21 18h-8" />
+      <path d="M3 6v4c0 1.1.9 2 2 2h3" />
+      <path d="M3 10v6c0 1.1.9 2 2 2h3" />
+    </template>
+    <!-- type: a plain paragraph, in the slash menu. -->
+    <template v-else-if="name === 'type'">
+      <path d="M12 4v16" />
+      <path d="M4 7V5a1 1 0 0 1 1-1h14a1 1 0 0 1 1 1v2" />
+      <path d="M9 20h6" />
+    </template>
+    <!-- heading-2 / heading-3: a heading and a subheading. -->
+    <template v-else-if="name === 'heading-2'">
+      <path d="M4 12h8M4 18V6M12 18V6" />
+      <path d="M21 18h-4c0-4 4-3 4-6 0-1.5-2-2.5-4-1" />
+    </template>
+    <template v-else-if="name === 'heading-3'">
+      <path d="M4 12h8M4 18V6M12 18V6" />
+      <path d="M17.5 10.5c1.7-1 3.5 0 3.5 1.5a2 2 0 0 1-2 2" />
+      <path d="M17 17.5c2 1.5 4 .3 4-1.5a2 2 0 0 0-2-2" />
+    </template>
+    <!-- list / list-ordered: a bulleted and a numbered list. -->
+    <template v-else-if="name === 'list'">
+      <path d="M3 6h.01M3 12h.01M3 18h.01" />
+      <path d="M8 6h13M8 12h13M8 18h13" />
+    </template>
+    <template v-else-if="name === 'list-ordered'">
+      <path d="M10 6h11M10 12h11M10 18h11" />
+      <path d="M4 10h2M4 6h1v4" />
+      <path d="M6 18H4c0-1 2-2 2-3s-1-1.5-2-1" />
+    </template>
+    <!-- sigma: a display formula. -->
+    <template v-else-if="name === 'sigma'">
+      <path d="M18 7V5a1 1 0 0 0-1-1H6.5a.5.5 0 0 0-.4.8l4.5 6a2 2 0 0 1 0 2.4l-4.5 6a.5.5 0 0 0 .4.8H17a1 1 0 0 0 1-1v-2" />
+    </template>
+    <!-- code: a code block. -->
+    <template v-else-if="name === 'code'">
+      <path d="m16 18 6-6-6-6" />
+      <path d="m8 6-6 6 6 6" />
+    </template>
+    <!-- table: a table. -->
+    <template v-else-if="name === 'table'">
+      <rect x="3" y="3" width="18" height="18" rx="2" />
+      <path d="M12 3v18M3 9h18M3 15h18" />
+    </template>
+    <!-- square-function: the fix-math skill. -->
+    <template v-else-if="name === 'square-function'">
+      <rect x="3" y="3" width="18" height="18" rx="2" />
+      <path d="M9 17c2 0 2.8-1 2.8-2.8V10c0-2 1-3.3 3.2-3" />
+      <path d="M9 11.2h5.7" />
+    </template>
     <!-- check: the confirmation a copy swaps to. -->
     <template v-else>
       <path d="M20 6 9 17l-5-5" />

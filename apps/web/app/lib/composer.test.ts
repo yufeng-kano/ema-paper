@@ -7,6 +7,7 @@ import {
   formatBytes,
   isImageFile,
   matchCommands,
+  passageTooLong,
   refuseAttachment,
   sectionHeading,
   sectionText,
@@ -119,5 +120,17 @@ describe('sectionHeading', () => {
     expect([...cut]).toHaveLength(12)
     expect(cut).toBe(`${'𝑑'.repeat(11)}…`)
     expect(sectionHeading('x'.repeat(600), undefined)).toHaveLength(600)
+  })
+})
+
+describe('passageTooLong', () => {
+  it('holds a passage past the cap, counted in code points, and never one within it', () => {
+    expect(passageTooLong('𝑥'.repeat(12), 12)).toBe(false)
+    expect(passageTooLong('x'.repeat(13), 12)).toBe(true)
+  })
+
+  it('holds nothing without a passage or without a cap from the server', () => {
+    expect(passageTooLong(null, 12)).toBe(false)
+    expect(passageTooLong('x'.repeat(600), undefined)).toBe(false)
   })
 })

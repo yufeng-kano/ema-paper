@@ -1,13 +1,18 @@
 import { describe, expect, it } from 'vitest'
 import {
+  blockAnchor,
+  blockPlain,
   documentOutline,
   findHeading,
+  firstWords,
   headingSlug,
   inlinePlain,
+  moveBlocks,
   parseInline,
   parseResultMarkdown,
   appendBlockSource,
   replaceBlockSource,
+  resolveAnchor,
   sectionSource,
   serializeDocument,
   type ResultBlock,
@@ -68,6 +73,7 @@ describe('parseResultMarkdown', () => {
       {
         kind: 'fig',
         id: 'fig1',
+        page: 3,
         bbox: [120, 60, 480, 940],
         caption: 'Figure 1: revenue by region',
       },
@@ -80,7 +86,7 @@ describe('parseResultMarkdown', () => {
     )
 
     expect(bare(pages[0]!.blocks)).toEqual([
-      { kind: 'fig', id: 'fig1', bbox: [0, 0, 10, 10], caption: null },
+      { kind: 'fig', id: 'fig1', page: 1, bbox: [0, 0, 10, 10], caption: null },
       { kind: 'h2', text: 'Next section', level: 2 },
     ])
   })
@@ -969,5 +975,183 @@ describe('sectionSource', () => {
     expect(sectionSource(pages, 1, 4)).toBe('# Appendix\n\nMore.')
     expect(sectionSource(pages, 0, 1)).toBeNull()
     expect(sectionSource(pages, 5, 0)).toBeNull()
+  })
+})
+
+describe('quotes', () => {
+  it('reads a run of > lines as one quote whose content is blocks of its own', () => {
+    const [page] = parseResultMarkdown(
+      ['<!-- page: 1 -->', '> ## Said', '> First line', '>second line', '>', '> - a', '> - b', 'After.'].join('\n'),
+    )
+    const [quote, after] = page!.blocks
+    expect(quote?.kind).toBe('quote')
+    expect(quote?.src).toBe('> ## Said\n> First line\n>second line\n>\n> - a\n> - b')
+    expect(quote?.kind === 'quote' && bare(quote.blocks)).toEqual([
+      { kind: 'h2', text: 'Said', level: 2 },
+      { kind: 'p', text: 'First line second line' },
+      { kind: 'list', ordered: false, items: ['a', 'b'] },
+    ])
+    expect(bare([after!])).toEqual([{ kind: 'p', text: 'After.' }])
+  })
+
+  it('is one level deep: a > inside a quote, a placeholder and a contents row are its text', () => {
+    const [page] = parseResultMarkdown(
+      ['> > nested', '>', '> ![fig1](sightread://p2/1,2,3,4)', '>', '> Intro . . . . 13'].join('\n'),
+    )
+    const quote = page!.blocks[0]
+    expect(quote?.kind === 'quote' && bare(quote.blocks)).toEqual([
+      { kind: 'p', text: '> nested' },
+      { kind: 'p', text: '![fig1](sightread://p2/1,2,3,4)' },
+      { kind: 'p', text: 'Intro . . . . 13' },
+    ])
+  })
+
+  it('ends a paragraph, and two quotes a blank line apart stay two', () => {
+    const [page] = parseResultMarkdown(['Prose', '> quoted', '', '> another'].join('\n'))
+    expect(page!.blocks.map((block) => block.kind)).toEqual(['p', 'quote', 'quote'])
+  })
+
+  it('round-trips byte for byte, and its headings are not the document\'s sections', () => {
+    const markdown = ['<!-- page: 1 -->', '## Real', '', '> ## Quoted heading', '> text', '', 'Body.'].join('\n')
+    const pages = parseResultMarkdown(markdown)
+    expect(serializeDocument(pages)).toBe(markdown)
+    expect(documentOutline(pages).map((entry) => entry.plain)).toEqual(['Real'])
+    expect(sectionSource(pages, 0, 0)).toBe('## Real\n\n> ## Quoted heading\n> text\n\nBody.')
+  })
+})
+
+describe('a figure keeps its own page', () => {
+  it('reads the page its placeholder names, wherever the block sits', () => {
+    const [page] = parseResultMarkdown(['<!-- page: 4 -->', '![fig2](sightread://p7/1,2,3,4)'].join('\n'))
+    expect(page!.page).toBe(4)
+    expect(page!.blocks[0]).toMatchObject({ kind: 'fig', page: 7 })
+  })
+})
+
+describe('blockPlain and firstWords', () => {
+  it('reads a block as the text it shows, formulas as their TeX', () => {
+    const blocks = parseResultMarkdown(
+      [
+        '**Bold** and $x_1$ text',
+        '',
+        '- one',
+        '- *two*',
+        '',
+        '| A | B |',
+        '| --- | --- |',
+        '| 1 | **2** |',
+        '',
+        '![fig1](sightread://p1/0,0,1,1)',
+        'Figure 1: *curves*',
+        '',
+        '> quoted $y$',
+      ].join('\n'),
+    ).flatMap((page) => page.blocks)
+    expect(blocks.map(blockPlain)).toEqual(['Bold and x_1 text', 'one two', 'A B 1 2', 'Figure 1: curves', 'quoted y'])
+  })
+
+  it('cuts to eight words, then to sixty characters', () => {
+    expect(firstWords('one two three four five six seven eight nine ten')).toBe('one two three four five six seven eight')
+    expect(firstWords('注意力機制'.repeat(20))).toBe('注意力機制'.repeat(12))
+  })
+})
+
+describe('moveBlocks', () => {
+  const doc = [
+    '<!-- page: 1 -->',
+    '## A',
+    '',
+    'one',
+    '',
+    '<!-- note on one -->',
+    '',
+    'two',
+    '',
+    '<!-- page: 2 -->',
+    'three',
+    '',
+    '![fig1](sightread://p2/1,2,3,4)',
+  ].join('\n')
+
+  it('moves a run before another block, its comment with it, everything else byte for byte', () => {
+    const moved = moveBlocks(doc, { from: { page: 0, index: 1 }, to: { page: 0, index: 1 } }, { page: 1, index: 1 }, 'before')
+    expect(moved?.markdown).toBe(
+      ['<!-- page: 1 -->', '## A', '', 'two', '', '<!-- page: 2 -->', 'three', '', 'one', '', '<!-- note on one -->', '', '![fig1](sightread://p2/1,2,3,4)'].join('\n'),
+    )
+    expect(moved?.first).toEqual({ page: 1, index: 1 })
+    expect(moved?.last).toEqual({ page: 1, index: 2 })
+  })
+
+  it('crosses page markers, which stay where they were, and a figure keeps its page', () => {
+    const moved = moveBlocks(doc, { from: { page: 1, index: 0 }, to: { page: 1, index: 1 } }, { page: 0, index: 0 }, 'before')
+    const pages = parseResultMarkdown(moved!.markdown)
+    expect(pages.map((page) => page.page)).toEqual([1, 2])
+    expect(pages[0]!.blocks.map((block) => block.kind)).toEqual(['p', 'fig', 'h2', 'p', 'comment', 'p'])
+    expect(pages[0]!.blocks[1]).toMatchObject({ kind: 'fig', page: 2 })
+    expect(pages[1]!.blocks).toEqual([])
+    expect(moved!.markdown.endsWith('<!-- page: 2 -->')).toBe(true)
+  })
+
+  it('lands after a target past the comments it carries', () => {
+    const moved = moveBlocks(doc, { from: { page: 0, index: 0 }, to: { page: 0, index: 0 } }, { page: 0, index: 1 }, 'after')
+    expect(parseResultMarkdown(moved!.markdown)[0]!.blocks.map((block) => block.src)).toEqual([
+      'one',
+      '<!-- note on one -->',
+      '## A',
+      'two',
+    ])
+  })
+
+  it('does nothing for a target inside the run or a move that changes nothing', () => {
+    expect(moveBlocks(doc, { from: { page: 0, index: 0 }, to: { page: 0, index: 1 } }, { page: 0, index: 1 }, 'after')).toBeNull()
+    expect(moveBlocks(doc, { from: { page: 0, index: 0 }, to: { page: 0, index: 0 } }, { page: 0, index: 1 }, 'before')).toBeNull()
+    expect(moveBlocks(doc, { from: { page: 0, index: 9 }, to: { page: 0, index: 9 } }, { page: 0, index: 1 }, 'before')).toBeNull()
+  })
+})
+
+describe('block anchors', () => {
+  const markdown = [
+    '<!-- page: 1 -->',
+    'Before any heading, a preface.',
+    '',
+    '## 3.2 Attention',
+    '',
+    'An attention function can be described as mapping a query and a set of pairs.',
+    '',
+    '![fig1](sightread://p1/0,0,1,1)',
+    '',
+    '<!-- page: 2 -->',
+    '## Exercises',
+    '',
+    'Same words here.',
+    '',
+    '## Exercises',
+    '',
+    'Same words here.',
+  ].join('\n')
+  const pages = parseResultMarkdown(markdown)
+
+  it('names a heading by its slug and any other block by its section and first words', () => {
+    expect(blockAnchor(pages, { page: 0, index: 1 })).toBe('32-attention')
+    expect(blockAnchor(pages, { page: 0, index: 2 })).toBe('32-attention~An attention function can be described as mapping')
+    expect(blockAnchor(pages, { page: 0, index: 0 })).toBe('~Before any heading, a preface.')
+    expect(blockAnchor(pages, { page: 0, index: 3 })).toBe('32-attention')
+    expect(blockAnchor(pages, { page: 1, index: 3 })).toBe('exercises-1~Same words here.')
+  })
+
+  it('resolves in its section first, then anywhere, then its heading, then the top', () => {
+    expect(resolveAnchor(pages, 'exercises-1~Same words here.')).toEqual({ page: 1, index: 3 })
+    expect(resolveAnchor(pages, 'exercises~Same   words here.')).toEqual({ page: 1, index: 1 })
+    expect(resolveAnchor(pages, 'missing~An attention function')).toEqual({ page: 0, index: 2 })
+    expect(resolveAnchor(pages, '32-attention~Words no block has')).toEqual({ page: 0, index: 1 })
+    expect(resolveAnchor(pages, '~Before any')).toEqual({ page: 0, index: 0 })
+    expect(resolveAnchor(pages, 'gone~Nothing')).toBeNull()
+    expect(resolveAnchor(pages, '')).toBeNull()
+  })
+
+  it('survives the block moving to another section', () => {
+    const moved = moveBlocks(markdown, { from: { page: 0, index: 2 }, to: { page: 0, index: 2 } }, { page: 1, index: 3 }, 'after')
+    const after = parseResultMarkdown(moved!.markdown)
+    expect(resolveAnchor(after, '32-attention~An attention function can be described as mapping')).toEqual({ page: 1, index: 4 })
   })
 })

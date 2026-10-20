@@ -38,7 +38,7 @@ import {
   type Conversation,
   type Memory,
 } from '~/lib/api'
-import { commandArguments, formatBytes, type AskRequest, type ComposerPayload } from '~/lib/composer'
+import { commandArguments, formatBytes, type AskOutcome, type AskRequest, type ComposerPayload } from '~/lib/composer'
 import { nodesToMarkdown } from '~/lib/copy'
 import {
   documentOutline,
@@ -102,7 +102,7 @@ interface ComposerControls {
   addFiles: (files: readonly File[]) => void
   setQuote: (text: string) => Promise<void>
   focus: () => void
-  ask: (request: AskRequest) => Promise<void>
+  ask: (request: AskRequest) => Promise<AskOutcome>
 }
 
 const composer = ref<ComposerControls | null>(null)
@@ -1030,11 +1030,12 @@ function onDrop(event: DragEvent) {
 const maxAttachmentBytes = computed(() => limits.value?.attachment_max_bytes ?? null)
 
 /**
- * For the reader's view: put a passage, a whole section or a command in the composer and
- * focus it — sent at once with `send`, while nothing runs and nothing was being typed.
+ * For the reader's view: put a passage, a whole section or a command in the composer —
+ * sent at once with `send` while nothing runs and the composer held nothing else, otherwise
+ * left there for Send (docs/web.md § The agent panel, *Asked from the document*).
  */
-function ask(request: AskRequest) {
-  void composer.value?.ask(request)
+function ask(request: AskRequest): Promise<AskOutcome> {
+  return composer.value?.ask(request) ?? Promise.resolve('kept')
 }
 
 defineExpose({ ask })
@@ -1155,7 +1156,6 @@ onBeforeUnmount(() => {
             v-for="(block, index) in messageBlocks(item.text)"
             :key="index"
             :block="block"
-            :page="1"
             :cite="resolveCite"
           />
         </div>
@@ -1340,7 +1340,11 @@ onBeforeUnmount(() => {
 }
 
 /* The thread scrolls on its own, scrollbar hidden (docs/web.md § The agent panel). */
+/* Positioned, so what sits absolutely inside it — each copy button's live region — scrolls
+   and clips with it. Placed against the column instead, those reach past its foot, and the
+   viewer's body, which hides its overflow but can still be scrolled, has room to slide up. */
 .thread {
+  position: relative;
   display: flex;
   flex: 1 1 auto;
   flex-direction: column;

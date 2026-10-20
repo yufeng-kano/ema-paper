@@ -383,3 +383,29 @@ describe('selectionText', () => {
     )
   })
 })
+
+describe('quotes and the viewer’s own controls', () => {
+  it('hands a quote back as > lines over its blocks, > alone on a blank line', () => {
+    const quote = el('blockquote', { class: 'md-quote' }, [
+      el('p', { class: 'md-p' }, [text('First '), mathSpan('$x$', 'x')]),
+      el('ul', { class: 'md-list' }, [el('li', {}, [text('a')]), el('li', {}, [text('b')])]),
+    ])
+    expect(nodesToMarkdown([quote])).toBe('> First $x$\n>\n> - a\n> - b')
+  })
+
+  it('skips handles, chevrons, fold notes, markers and hidden blocks', () => {
+    const block = (children: MarkdownNode[], attrs: Record<string, string> = {}) =>
+      el('div', { class: 'block', ...attrs }, children)
+    const nodes = [
+      block([
+        el('button', { 'data-chrome': '' }, [text('')]),
+        el('h3', { class: 'md-h2', 'data-level': '2' }, [text('Model')]),
+        el('button', { 'data-chrome': '' }, [text('4 blocks collapsed')]),
+      ]),
+      block([el('p', { class: 'md-p' }, [text('Hidden away.')])], { hidden: '' }),
+      block([el('p', { class: 'md-p' }, [text('Shown.')]), el('button', { 'data-chrome': '' }, [text('“')])]),
+    ]
+    expect(nodesToMarkdown(nodes)).toBe('## Model\n\nShown.')
+    expect(selectionText(nodes)).toBe('Model\nShown.')
+  })
+})

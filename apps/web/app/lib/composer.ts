@@ -178,3 +178,16 @@ export interface AskRequest {
   command?: string
   send?: boolean
 }
+
+/**
+ * What an ask did (docs/web.md § The agent panel, *Asked from the document*): went at once;
+ * waits in the composer, which took focus; waits there without it, while a turn runs; or
+ * nothing at all, because the composer already holds as many sections as a message takes.
+ */
+export type AskOutcome = 'sent' | 'focused' | 'kept' | 'full'
+
+/** Whether a passage is past the server's cap, counted in code points as the server counts:
+ *  shown, never cut and never sent (docs/web.md § The agent panel, *Asked from the document*). */
+export function passageTooLong(passage: string | null, max: number | undefined): boolean {
+  return passage !== null && max !== undefined && [...passage].length > max
+}

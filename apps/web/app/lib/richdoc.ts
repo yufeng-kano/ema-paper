@@ -25,6 +25,7 @@ import {
   parseInline,
   parseResultMarkdown,
   readsAsTocRow,
+  type InlineOptions,
   type InlineSegment,
   type ResultBlock,
 } from './markdown'
@@ -65,6 +66,11 @@ function inlineContent(segments: InlineSegment[], marks: Mark[] = []): JSONConte
       case 'br':
         content.push({ type: 'hardBreak' })
         break
+      // A section link, read only in the notes: one atom that keeps its source byte for
+      // byte (docs/web.md § Notes).
+      case 'cite':
+        content.push({ type: 'sectionLink', attrs: { src: segment.src, label: segment.label, anchor: segment.anchor } })
+        break
     }
   }
   return content
@@ -77,35 +83,41 @@ function textNode(text: string, marks: Mark[]): JSONContent {
     : { type: 'text', text }
 }
 
-function paragraph(text: string): JSONContent {
-  return { type: 'paragraph', content: inlineContent(parseInline(text)) }
+function paragraph(text: string, options?: InlineOptions): JSONContent {
+  return { type: 'paragraph', content: inlineContent(parseInline(text, options)) }
 }
 
 /** One parsed block as the node the editor holds, without its source attributes. */
-function blockNode(block: ResultBlock): JSONContent {
+function blockNode(block: ResultBlock, options?: InlineOptions): JSONContent {
   switch (block.kind) {
     case 'p':
-      return paragraph(block.text)
+      return paragraph(block.text, options)
     case 'h2':
     case 'h3':
       return {
         type: 'heading',
         attrs: { level: Math.min(6, Math.max(1, block.level)) },
-        content: inlineContent(parseInline(block.text)),
+        content: inlineContent(parseInline(block.text, options)),
       }
     case 'list':
       return {
         type: block.ordered ? 'orderedList' : 'bulletList',
         ...(block.ordered ? { attrs: { start: block.start ?? 1 } } : {}),
-        content: block.items.map((item) => ({ type: 'listItem', content: [paragraph(item)] })),
+        content: block.items.map((item) => ({ type: 'listItem', content: [paragraph(item, options)] })),
       }
+    // One level: the quote's blocks, none of them a quote (the parser reads a `>` inside
+    // one as text).
+    case 'quote': {
+      const content = block.blocks.map((inner) => blockNode(inner, options))
+      return { type: 'blockquote', content: content.length ? content : [{ type: 'paragraph' }] }
+    }
     case 'table': {
       const width = Math.max(block.header.length, ...block.rows.map((row) => row.length), 1)
       const row = (cells: string[], type: 'tableHeader' | 'tableCell'): JSONContent => ({
         type: 'tableRow',
         content: Array.from({ length: width }, (_, column) => ({
           type,
-          content: [paragraph(cells[column] ?? '')],
+          content: [paragraph(cells[column] ?? '', options)],
         })),
       })
       return {
@@ -131,10 +143,11 @@ function blockNode(block: ResultBlock): JSONContent {
 }
 
 /** The editor's document for a run of blocks. Never empty: an editor needs a textblock.
- *  `leads` is the whitespace before each block in the file it came from (`markdownToDoc`). */
-export function blocksToDoc(blocks: ResultBlock[], leads: (string | null)[] = []): JSONContent {
+ *  `leads` is the whitespace before each block in the file it came from (`markdownToDoc`);
+ *  `options.cites` reads section links, which only the notes do. */
+export function blocksToDoc(blocks: ResultBlock[], leads: (string | null)[] = [], options?: InlineOptions): JSONContent {
   const content = blocks.map((block, index) => {
-    const node = blockNode(block)
+    const node = blockNode(block, options)
     const lead = leads[index] ?? null
     // `src` before `canon`: a table's rule row is read from its source, on the way in as on
     // the way back, or an untouched table would never match its canonical form.
@@ -146,6 +159,31 @@ export function blocksToDoc(blocks: ResultBlock[], leads: (string | null)[] = []
 
 const PAGE_MARKER_LINE = /^\s*<!--\s*page:\s*\d+\s*-->\s*$/
 
+/** The blocks of a markdown file as the editor's document holds them, each where the file has
+ *  it — a page marker included, so content before the first marker stays before it. */
+function placedSource(source: string): { at: number; block: ResultBlock }[] {
+  const placed: { at: number; block: ResultBlock }[] = []
+  for (const match of source.matchAll(/^[ \t]*(<!--\s*page:\s*\d+\s*-->)[ \t]*$/gm)) {
+    placed.push({ at: match.index + match[0].indexOf(match[1] ?? ''), block: { kind: 'comment', src: match[1] ?? '' } })
+  }
+  let cursor = 0
+  for (const block of parseResultMarkdown(source).flatMap((page) => page.blocks)) {
+    const at = source.indexOf(block.src, cursor)
+    placed.push({ at: at === -1 ? cursor : at, block })
+    cursor = at === -1 ? cursor : at + block.src.length
+  }
+  return placed.sort((a, b) => a.at - b.at)
+}
+
+/** The editor's top-level block that holds an offset into its markdown, by index — or the
+ *  first after it, when the offset falls between blocks; the last past the end. */
+export function blockIndexAt(markdown: string, offset: number): number {
+  const at = markdown.slice(0, offset).replace(/\r\n?/g, '\n').length
+  const placed = placedSource(markdown.replace(/\r\n?/g, '\n'))
+  const index = placed.findIndex((entry) => entry.at + entry.block.src.length > at)
+  return index === -1 ? Math.max(placed.length - 1, 0) : index
+}
+
 /**
  * The editor's document for a markdown string — one block's source, or a whole notes file.
  *
@@ -153,21 +191,9 @@ const PAGE_MARKER_LINE = /^\s*<!--\s*page:\s*\d+\s*-->\s*$/
  * page marker the file carries rides through as its own line, and the whitespace before
  * each block is remembered (`lead`) so an edit elsewhere does not respace the file.
  */
-export function markdownToDoc(markdown: string): JSONContent {
+export function markdownToDoc(markdown: string, options?: InlineOptions): JSONContent {
   const source = markdown.replace(/\r\n?/g, '\n')
-  const placed: { at: number; block: ResultBlock }[] = []
-  for (const match of source.matchAll(/^[ \t]*(<!--\s*page:\s*\d+\s*-->)[ \t]*$/gm)) {
-    placed.push({ at: match.index + match[0].indexOf(match[1] ?? ''), block: { kind: 'comment', src: match[1] ?? '' } })
-  }
-  // Every block where the file has it — a marker included, so content before the first
-  // marker stays before it.
-  let cursor = 0
-  for (const block of parseResultMarkdown(source).flatMap((page) => page.blocks)) {
-    const at = source.indexOf(block.src, cursor)
-    placed.push({ at: at === -1 ? cursor : at, block })
-    cursor = at === -1 ? cursor : at + block.src.length
-  }
-  placed.sort((a, b) => a.at - b.at)
+  const placed = placedSource(source)
   const leads: (string | null)[] = []
   let end = 0
   for (const { at, block } of placed) {
@@ -177,6 +203,7 @@ export function markdownToDoc(markdown: string): JSONContent {
   return blocksToDoc(
     placed.map(({ block }) => block),
     leads,
+    options,
   )
 }
 
@@ -251,6 +278,9 @@ export function serializeInline(content: JSONContent[] = [], inTable = false): s
     if (node.type === 'hardBreak') {
       return '<br>'
     }
+    if (node.type === 'sectionLink') {
+      return hold(String(node.attrs?.src ?? ''))
+    }
     if (node.type === 'inlineMath') {
       const latex = String(node.attrs?.latex ?? '').trim()
       if (!latex) {
@@ -318,7 +348,7 @@ function escapeLineStart(line: string): string {
   // A sentence ending in a dot leader and a number would read back as a contents row; one
   // escaped dot breaks the leader and still renders as a dot.
   const text = readsAsTocRow(line) ? line.replace(/\.(?=[^.]*$)/, '\\.') : line
-  if (/^(#|[-+*]\s|\d{1,9}[.)]\s|\$\$|```|~~~|<!--|!\[)/.test(text)) {
+  if (/^(#|>|[-+*]\s|\d{1,9}[.)]\s|\$\$|```|~~~|<!--|!\[)/.test(text)) {
     const marker = /^\d{1,9}/.exec(text)
     return marker ? `${marker[0]}\\${text.slice(marker[0].length)}` : `\\${text}`
   }
@@ -444,9 +474,21 @@ export function serializeNode(node: JSONContent): string {
     }
     case 'rawBlock':
       return String(node.attrs?.source ?? '')
+    case 'blockquote':
+      return quoteLines((node.content ?? []).map(serializeNode).filter(Boolean).join('\n\n'))
     default:
       return textblocks(node).map((block) => serializeInline(block.content)).join(' ')
   }
+}
+
+/** Markdown as a quote's lines: `> ` before each, `>` alone on a blank one. */
+export function quoteLines(markdown: string): string {
+  return markdown
+    ? markdown
+        .split('\n')
+        .map((line) => (line.trim() ? `> ${line}` : '>'))
+        .join('\n')
+    : ''
 }
 
 function collectItems(item: JSONContent): string[] {
@@ -493,7 +535,9 @@ export function docToMarkdown(doc: JSONContent, trailing = ''): string {
  * one line, anything structural is the blocks it holds.
  */
 export function sliceToMarkdown(content: JSONContent[]): string {
-  const inline = content.every((node) => node.type === 'text' || node.type === 'inlineMath' || node.type === 'hardBreak')
+  const inline = content.every(
+    (node) => node.type === 'text' || node.type === 'inlineMath' || node.type === 'hardBreak' || node.type === 'sectionLink',
+  )
   return inline ? serializeInline(content) : content.map(serializeNode).filter(Boolean).join('\n\n')
 }
 
@@ -526,4 +570,160 @@ export function inlineMathAtEnd(text: string): { index: number; tex: string } | 
     }
   }
   return null
+}
+
+// --- turning a block into another -----------------------------------------------------------
+
+/** What *Turn into…* offers (docs/web.md § Editing, *Turning a block into another*). */
+export type BlockKindName = 'paragraph' | 'heading' | 'subheading' | 'bulleted' | 'numbered' | 'quote' | 'formula' | 'code'
+
+/** A block's kind as *Turn into…* names it, or null for the kinds that cannot be turned — a
+ *  figure, a table, a contents run, a comment. A `#` heading is a *Heading*. */
+export function blockKindName(block: ResultBlock): BlockKindName | null {
+  switch (block.kind) {
+    case 'p':
+      return 'paragraph'
+    case 'h2':
+      return 'heading'
+    case 'h3':
+      return 'subheading'
+    case 'list':
+      return block.ordered ? 'numbered' : 'bulleted'
+    case 'quote':
+      return 'quote'
+    case 'math':
+      return 'formula'
+    case 'code':
+      return 'code'
+    default:
+      return null
+  }
+}
+
+/** Literal text as inline content: what a code block or a formula's source becomes in a
+ *  paragraph — characters, each line break a hard break. */
+function literalInline(text: string): JSONContent[] {
+  const content: JSONContent[] = []
+  text.split('\n').forEach((line, index) => {
+    if (index > 0) {
+      content.push({ type: 'hardBreak' })
+    }
+    if (line) {
+      content.push({ type: 'text', text: line })
+    }
+  })
+  return content
+}
+
+/** The lines of inline content a text block holds: a paragraph's or heading's one, a list's
+ *  items, a formula as one inline formula, code as its literal text. */
+function inlineRuns(block: ResultBlock): JSONContent[][] {
+  switch (block.kind) {
+    case 'p':
+    case 'h2':
+    case 'h3':
+      return [inlineContent(parseInline(block.text))]
+    case 'list':
+      return block.items.map((item) => inlineContent(parseInline(item)))
+    case 'math': {
+      // An inline formula cannot break a line: its rows are joined by spaces.
+      const latex = block.text.replace(/\s*\n\s*/g, ' ').trim()
+      return [latex ? [{ type: 'inlineMath', attrs: { latex } }] : []]
+    }
+    case 'code':
+      return [literalInline(block.text)]
+    default:
+      return []
+  }
+}
+
+/** A quote's content as the markdown it holds: its lines with `>` and one space removed. */
+function unquoted(src: string): string {
+  return src
+    .split('\n')
+    .map((line) => line.replace(/^\s*> ?/, ''))
+    .join('\n')
+}
+
+/** The text a display formula takes when the block is not one formula: as written. */
+function textAsWritten(block: ResultBlock): string {
+  switch (block.kind) {
+    case 'p':
+    case 'h2':
+    case 'h3':
+    case 'code':
+      return block.text
+    case 'list':
+      return block.items.join('\n')
+    case 'quote':
+      return unquoted(block.src).trim()
+    default:
+      return block.src
+  }
+}
+
+function convertParsed(block: ResultBlock, to: BlockKindName): string | null {
+  const from = blockKindName(block)
+  if (from === null || from === to) {
+    return null
+  }
+  switch (to) {
+    case 'quote':
+      return quoteLines(block.src)
+    case 'code':
+      // Code is where markdown is shown rather than read: the block's source, verbatim.
+      return serializeNode({ type: 'codeBlock', attrs: { language: null }, content: [{ type: 'text', text: block.src }] })
+    case 'formula': {
+      const segments = block.kind === 'p' ? parseInline(block.text).filter((segment) => segment.kind !== 'text' || segment.text.trim()) : []
+      const only = segments.length === 1 && segments[0]?.kind === 'math' ? segments[0].tex : null
+      return serializeNode({ type: 'blockMath', attrs: { latex: only ?? textAsWritten(block) } })
+    }
+    default:
+      break
+  }
+  if (block.kind === 'quote') {
+    // Unwrapped: as a paragraph its blocks become blocks again; as a heading or a list each
+    // is turned as a selection's would be.
+    const inner = unquoted(block.src).trim()
+    if (to === 'paragraph') {
+      return inner
+    }
+    return block.blocks
+      .filter((child) => child.kind !== 'comment')
+      .map((child) => convertParsed(child, to) ?? child.src)
+      .join('\n\n')
+  }
+  const runs = inlineRuns(block)
+  switch (to) {
+    case 'paragraph':
+      return runs.map((content) => serializeNode({ type: 'paragraph', content })).filter(Boolean).join('\n\n')
+    case 'heading':
+    case 'subheading':
+      return runs
+        .map((content) => serializeNode({ type: 'heading', attrs: { level: to === 'heading' ? 2 : 3 }, content }))
+        .filter(Boolean)
+        .join('\n\n')
+    case 'bulleted':
+    case 'numbered':
+      return serializeNode({
+        type: to === 'numbered' ? 'orderedList' : 'bulletList',
+        ...(to === 'numbered' ? { attrs: { start: 1 } } : {}),
+        content: runs.map((content) => ({ type: 'listItem', content: [{ type: 'paragraph', content }] })),
+      })
+  }
+}
+
+/**
+ * A block's source turned into another kind (docs/web.md § Editing, *Turning a block into
+ * another*): built through the parser and this serializer, so what it writes reads back as the
+ * block it meant, in canonical form. Null when there is nothing to write — the block is that
+ * kind already, or a kind that cannot be turned.
+ */
+export function convertBlock(src: string, to: BlockKindName): string | null {
+  const blocks = parseResultMarkdown(src).flatMap((page) => page.blocks)
+  if (blocks.length !== 1) {
+    return null
+  }
+  const converted = convertParsed(blocks[0]!, to)
+  return converted === null || converted === src || !converted.trim() ? null : converted
 }

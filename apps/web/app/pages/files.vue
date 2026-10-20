@@ -89,12 +89,17 @@ function openFolder(id: FolderId) {
 
 /**
  * `/files?document=<id>` — History's *Show in Files* (docs/web.md § Files). Read once and
- * replaced away, so a refresh or a later visit opens at the top level as usual.
+ * replaced away, so a refresh or a later visit opens at the top level as usual. With
+ * `&block=<anchor>` — a block's *Copy link to block* — the document opens too, scrolled to
+ * that block.
  */
 const route = useRoute()
 const router = useRouter()
 const revealId = Number(route.query.document) || null
+const revealBlock = typeof route.query.block === 'string' ? route.query.block : null
 const revealed = ref<number | null>(null)
+/** The block link's target, handed to the viewer only while it shows that document. */
+const linkedBlock = ref<{ id: number; anchor: string } | null>(null)
 let revealTimer: ReturnType<typeof setTimeout> | undefined
 if (route.query.document !== undefined) {
   void router.replace({ query: {} })
@@ -115,6 +120,10 @@ if (revealId !== null) {
       await nextTick()
       document.querySelector('.contents tr.revealed')?.scrollIntoView({ block: 'center' })
       revealTimer = setTimeout(() => (revealed.value = null), REVEAL_MS)
+      if (revealBlock !== null) {
+        linkedBlock.value = { id: target.id, anchor: revealBlock }
+        void showResult(target)
+      }
     },
     { once: true },
   )
@@ -335,6 +344,15 @@ onBeforeUnmount(() => {
 // --- the result viewer -----------------------------------------------------
 
 const openDocument = ref<LibraryDocument | null>(null)
+// Read once: closing the viewer, or opening another document, spends the link.
+watch(
+  () => openDocument.value?.id,
+  (id) => {
+    if (linkedBlock.value && id !== linkedBlock.value.id) {
+      linkedBlock.value = null
+    }
+  },
+)
 
 // A reload onto a new build would drop files still waiting to upload, or lose a reader's
 // place — so it waits for both to be over (docs/web.md § Rules).
@@ -1265,6 +1283,7 @@ function rowAttrs(row: Row): Record<string, unknown> {
       :error-message="resultErrors.get(openDocument.id) ?? null"
       :figure-base="`/api/library/documents/${openDocument.id}/figures`"
       :document-id="openDocument.id"
+      :initial-block="linkedBlock?.id === openDocument.id ? linkedBlock.anchor : null"
       @close="openDocument = null"
     />
   </UiScreen>

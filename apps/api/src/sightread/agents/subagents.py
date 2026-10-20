@@ -36,17 +36,17 @@ class SubagentDefinition:
 # into it themselves; the agent splits the work, starts them and proofreads what they wrote.
 TRANSLATOR = SubagentDefinition(
     name="translator",
-    description="Translates the pages the task names, or the passage it quotes, into the language it names, writing each block's translation into doc.md right under the block. Start one per few pages; several run at the same time.",
+    description="Translates the pages the task names, the passage it quotes or the section it names, into the language it names, writing each block's translation into doc.md right under the block. Start one per few pages; several run at the same time.",
     model=None,
     tools=("str_replace_based_edit_tool", "bash"),
     writes=True,
-    prompt="""You translate part of a document — the pages the task names, or the passage it quotes — into the language the task names, writing each translation into doc.md right under the block it translates.
+    prompt="""You translate part of a document — the pages the task names, the passage it quotes or the section it names — into the language the task names, writing each translation into doc.md right under the block it translates.
 
-Read your part of doc.md with the editor's view, going through it in pieces with view_range; a page starts at its `<!-- page: N -->` marker. A passage quoted by its first and last words covers the blocks from the one holding the first words to the one holding the last.
+Read your part of doc.md with the editor's view, going through it in pieces with view_range; a page starts at its `<!-- page: N -->` marker. A passage quoted by its first and last words covers the blocks from the one holding the first words to the one holding the last. A section named by its heading runs from that heading to the next heading of the same or a higher level; find it with grep on the heading line.
 
-Translate the prose: paragraphs, headings, lists, figure and table captions, footnotes. Leave display math, code, tables, figure placeholders, page markers and the reference list as they are. Skip a block that is already in the target language, and one already followed by its translation.
+Translate the prose: paragraphs, headings, lists, quotes, figure and table captions, footnotes. Leave display math, code, tables, figure placeholders, page markers and the reference list as they are. Skip a block that is already in the target language, and one already followed by its translation.
 
-Each translation keeps the form of what it translates: a heading's is a heading of the same level, a paragraph's a paragraph, and a list is one block, whose translation is a list with the same markers after its last item. Keep inline math, citations, numbers, units, names and symbols exactly as the original has them. Follow the task's instructions over these rules.
+Each translation keeps the form of what it translates: a heading's is a heading of the same level, a paragraph's a paragraph, a quote's a quote, and a list is one block, whose translation is a list with the same markers after its last item. Keep inline math, citations, numbers, units, names and symbols exactly as the original has them. Follow the task's instructions over these rules.
 
 Write each translation with str_replace: old_str is the end of the block — its last sentence or so, enough to occur only once in the file — and new_str is that same text followed by an empty line and the translation. Work through your part in order, several blocks per round of calls.
 

@@ -486,6 +486,18 @@ async def post_message(
         content.append({"type": "text", "text": f"{QUOTE_PREFIX}{quote}", "context": "quote"})
     if skill is not None:
         rendered = skill_defs.render_skill(skill.body, body.text)
+        # Sent with a selection or sections, the command runs on them alone. The range is
+        # this line's, not the body's: a body can be older than the range it is sent with
+        # (docs/chat.md § Skills, *A command keeps to what it was sent with*).
+        ranges = (["the selection above"] if selection else []) + [
+            f'the section "{heading}"' for heading, _ in sections
+        ]
+        if ranges:
+            *rest, last = ranges
+            named = f"{', '.join(rest)} and {last}" if rest else last
+            rendered += (
+                f"\n\nRun it on {named} only: the rest of the document is outside its range."
+            )
         content.append(
             {
                 "type": "text",

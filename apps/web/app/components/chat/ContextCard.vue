@@ -300,7 +300,7 @@ onBeforeUnmount(() => {
         <p v-else-if="instructions === null" class="card-wait"><UiSpinner :size="12" /></p>
         <p v-else-if="!instructions.length" class="card-note">{{ t('chat.used.instructionsNone') }}</p>
         <div v-else class="instructions md-side">
-          <MdBlock v-for="(block, index) in instructions" :key="index" :block="block" :page="1" />
+          <MdBlock v-for="(block, index) in instructions" :key="index" :block="block" />
         </div>
       </template>
 
