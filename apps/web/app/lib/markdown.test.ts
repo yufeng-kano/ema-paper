@@ -1,9 +1,14 @@
 import { describe, expect, it } from 'vitest'
 import {
+  documentOutline,
+  findHeading,
+  headingSlug,
+  inlinePlain,
   parseInline,
   parseResultMarkdown,
   appendBlockSource,
   replaceBlockSource,
+  sectionSource,
   serializeDocument,
   type ResultBlock,
 } from './markdown'
@@ -824,5 +829,145 @@ describe('comments', () => {
     expect(pages[0]?.blocks.map((block) => block.kind)).toEqual(['p', 'comment', 'p'])
     const edited = replaceBlockSource(source, 0, 0, 'First, edited.')
     expect(edited).toBe('<!-- page: 1 -->\nFirst, edited.\n\n<!-- reviewer: check this -->\n\nSecond.')
+  })
+})
+
+describe('section links', () => {
+  const link = '[3.2 Attention](#32-attention)'
+
+  it('reads a link to a section only when asked to', () => {
+    expect(parseInline(`See ${link}.`)).toEqual([{ kind: 'text', text: `See ${link}.` }])
+    expect(parseInline(`See ${link}.`, { cites: true })).toEqual([
+      { kind: 'text', text: 'See ' },
+      {
+        kind: 'cite',
+        segments: [{ kind: 'text', text: '3.2 Attention' }],
+        label: '3.2 Attention',
+        anchor: '32-attention',
+        src: link,
+      },
+      { kind: 'text', text: '.' },
+    ])
+  })
+
+  it('reads the document’s own file name before the anchor', () => {
+    expect(parseInline('[Results](doc.md#4-results)', { cites: true })).toMatchObject([
+      { kind: 'cite', label: 'Results', anchor: '4-results', src: '[Results](doc.md#4-results)' },
+    ])
+  })
+
+  it('leaves every other link the text it was', () => {
+    for (const text of [
+      '[site](https://example.com)',
+      '[notes](notes.md#x)',
+      '[spaced](#a b)',
+      '[ ](#blank)',
+      '[paren](#a(b))',
+    ]) {
+      expect(parseInline(text, { cites: true }).some((segment) => segment.kind === 'cite')).toBe(false)
+    }
+  })
+
+  it('draws emphasis and math inside the link text, and around the link', () => {
+    const [cite] = parseInline('[**3.1** The $\\epsilon$-greedy policy](#31-the-epsilon-greedy-policy)', { cites: true })
+    expect(cite).toMatchObject({
+      kind: 'cite',
+      label: '3.1 The \\epsilon-greedy policy',
+      segments: [
+        { kind: 'strong', segments: [{ kind: 'text', text: '3.1' }], src: '**3.1**' },
+        { kind: 'text', text: ' The ' },
+        { kind: 'math', tex: '\\epsilon' },
+        { kind: 'text', text: '-greedy policy' },
+      ],
+    })
+    expect(parseInline(`**${link}**`, { cites: true })).toMatchObject([
+      { kind: 'strong', segments: [{ kind: 'cite', label: '3.2 Attention' }] },
+    ])
+  })
+
+  it('keeps an escaped bracket, and a link inside code, literal', () => {
+    expect(parseInline(`\\${link}`, { cites: true })).toEqual([{ kind: 'text', text: link }])
+    expect(parseInline(`\`${link}\` costs $5 and $x$`, { cites: true })).toMatchObject([
+      { kind: 'code', text: link },
+      { kind: 'text', text: ' costs $5 and ' },
+      { kind: 'math', tex: 'x' },
+    ])
+    expect(parseInline('[a \\] b](#a-b)', { cites: true })).toMatchObject([{ kind: 'cite', label: 'a ] b' }])
+  })
+})
+
+describe('documentOutline and findHeading', () => {
+  const pages = parseResultMarkdown(
+    [
+      '<!-- page: 1 -->',
+      '# Attention Is All You Need',
+      '## 3.2 Attention',
+      'Text.',
+      '### 3.2.1 Scaled **Dot-Product** Attention',
+      '<!-- page: 2 -->',
+      '## Notes',
+      '## Notes',
+    ].join('\n'),
+  )
+  const outline = documentOutline(pages)
+
+  it('lists every heading with its place, its text and its GitHub anchor', () => {
+    expect(outline.map((entry) => [entry.page, entry.index, entry.level, entry.plain, entry.slug])).toEqual([
+      [0, 0, 1, 'Attention Is All You Need', 'attention-is-all-you-need'],
+      [0, 1, 2, '3.2 Attention', '32-attention'],
+      [0, 3, 3, '3.2.1 Scaled Dot-Product Attention', '321-scaled-dot-product-attention'],
+      [1, 0, 2, 'Notes', 'notes'],
+      [1, 1, 2, 'Notes', 'notes-1'],
+    ])
+    expect(headingSlug('3.2.2 Multi-Head Attention')).toBe('322-multi-head-attention')
+    expect(headingSlug('2.1 注意力（機制）')).toBe('21-注意力機制')
+  })
+
+  it('matches a link by its text first, markdown, spacing and case ignored', () => {
+    expect(findHeading(outline, '3.2.1  scaled dot-product ATTENTION', 'nothing')).toMatchObject({ index: 3 })
+    expect(findHeading(outline, inlinePlain('3.2 *Attention*'), '')).toMatchObject({ index: 1 })
+  })
+
+  it('falls back to the anchor, and finds nothing for a heading that is gone', () => {
+    expect(findHeading(outline, 'Attention (renamed)', '32-attention')).toMatchObject({ index: 1 })
+    expect(findHeading(outline, 'Notes again', 'notes-1')).toMatchObject({ page: 1, index: 1 })
+    expect(findHeading(outline, 'Second notes', 'Notes')).toMatchObject({ page: 1, index: 0 })
+    expect(findHeading(outline, 'Results', '4-results')).toBeNull()
+    expect(findHeading(outline, 'Results', '')).toBeNull()
+  })
+})
+
+describe('sectionSource', () => {
+  const pages = parseResultMarkdown(
+    [
+      '<!-- page: 1 -->',
+      '## 3 Model',
+      'Intro.',
+      '### 3.1 Encoder',
+      'Six layers.',
+      '<!-- page: 2 -->',
+      'Continued.',
+      '<!-- a reviewer note -->',
+      '### 3.2 Attention',
+      'Heads.',
+      '# Appendix',
+      'More.',
+    ].join('\n'),
+  )
+
+  it('runs to the next heading of the same level, across a page marker', () => {
+    expect(sectionSource(pages, 0, 2)).toBe('### 3.1 Encoder\n\nSix layers.\n\nContinued.')
+  })
+
+  it('takes its subsections with it and stops at a higher level', () => {
+    expect(sectionSource(pages, 0, 0)).toBe(
+      ['## 3 Model', 'Intro.', '### 3.1 Encoder', 'Six layers.', 'Continued.', '### 3.2 Attention', 'Heads.'].join('\n\n'),
+    )
+  })
+
+  it('runs to the end of the document after the last heading, and is null off a heading', () => {
+    expect(sectionSource(pages, 1, 4)).toBe('# Appendix\n\nMore.')
+    expect(sectionSource(pages, 0, 1)).toBeNull()
+    expect(sectionSource(pages, 5, 0)).toBeNull()
   })
 })

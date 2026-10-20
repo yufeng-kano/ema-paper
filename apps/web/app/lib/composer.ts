@@ -125,12 +125,42 @@ export interface SentAttachment {
   preview: string | null
 }
 
+/** A whole section as a message carries it: its heading as the document has it, and its
+ *  markdown — null past the cap, so the agent reads it from the document instead. */
+export interface SentSection {
+  heading: string
+  text: string | null
+}
+
 /** What the composer hands the panel to send (docs/chat.md § What a user message carries). */
 export interface ComposerPayload {
   /** As typed; a command's arguments when `command` is set. */
   text: string
   selection: string | null
+  sections: SentSection[]
   quote: string | null
   command: string | null
   attachments: SentAttachment[]
+}
+
+/**
+ * A section's text as it is sent: whole, or null when it is longer than the server takes
+ * (`limits.selection_max_chars`, counted in code points as the server counts) — a cut
+ * section must never pass for a whole one (docs/chat.md § What a user message carries).
+ * No cap from the server sends it whole and leaves the answer to the server.
+ */
+export function sectionText(source: string, max: number | undefined): string | null {
+  return max !== undefined && [...source].length > max ? null : source
+}
+
+/**
+ * What the reader's view asks the agent panel to put in the composer: a passage, a whole
+ * section, a command — and whether to send at once, which happens only while nothing is
+ * running and nothing was being typed (the reader's draft is never sent for them).
+ */
+export interface AskRequest {
+  selection?: string
+  section?: SentSection
+  command?: string
+  send?: boolean
 }

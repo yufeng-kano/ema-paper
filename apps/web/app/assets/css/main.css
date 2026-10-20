@@ -71,6 +71,9 @@
   --find: rgb(23 96 125 / 18%);
   --find-current: #17607d;
   --find-current-fg: #fcfcfd;
+  /* A heading an answer's section link scrolled to, washed for a moment so the eye lands
+     on it (docs/web.md § The agent panel, *Section links*). */
+  --accent-wash: rgb(23 96 125 / 9%);
 
   /* --- Color: diff ---------------------------------------------------------
      The agent panel's edit cards: a removed line sits on the danger wash, an added one on
@@ -250,6 +253,7 @@
     --find: rgb(106 169 196 / 26%);
     --find-current: #6aa9c4;
     --find-current-fg: #10161a;
+    --accent-wash: rgb(106 169 196 / 14%);
     --diff-removed: rgb(224 139 118 / 14%);
     --diff-added: rgb(106 169 196 / 14%);
     --overlay: rgb(6 8 10 / 62%);

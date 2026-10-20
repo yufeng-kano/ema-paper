@@ -296,5 +296,17 @@ describe('a table of contents', () => {
       ['**1 Introduction** **13**', '1.1 Sequential decision making . . . . . 13'].join('\n'),
     )
   })
-})
 
+  it('hands an answer’s section link back as its markdown, chip or plain text', () => {
+    const source = '[3.2 Attention](#32-attention)'
+    const chip = el('button', { class: 'md-cite', type: 'button', 'data-src': source }, [
+      el('svg'),
+      text('3.2 Attention'),
+    ])
+    const plain = el('span', { class: 'md-cite-text', 'data-src': source }, [text('3.2 Attention')])
+
+    expect(nodesToMarkdown([el('p', { class: 'md-p' }, [text('See '), chip, text('.')])])).toBe(`See ${source}.`)
+    // A selection inside the paragraph arrives without it.
+    expect(nodesToMarkdown([text('See '), chip, text(' and '), plain])).toBe(`See ${source} and ${source}`)
+  })
+})
