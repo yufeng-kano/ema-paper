@@ -10,7 +10,9 @@
  * block moves nothing on screen.
  */
 import { Extension, InputRule, Node, mergeAttributes, type Extensions, type JSONContent } from '@tiptap/core'
+import { Plugin, PluginKey } from '@tiptap/pm/state'
 import { findWrapping } from '@tiptap/pm/transform'
+import { Decoration, DecorationSet } from '@tiptap/pm/view'
 import { Heading } from '@tiptap/extension-heading'
 import { Subscript } from '@tiptap/extension-subscript'
 import { Superscript } from '@tiptap/extension-superscript'
@@ -23,10 +25,25 @@ import { inlineMathAtEnd, sliceToMarkdown } from './richdoc'
 
 export type Point = { x: number; y: number }
 
-/** Where the caret goes when an editor opens: a click's coordinates, a selection's two ends,
- *  an edge, or — after Backspace joined two blocks — the seam between the first block and
- *  the second. */
-export type Caret = Point | { from: Point; to: Point } | 'start' | 'end' | 'join'
+/**
+ * A place in the text as the rendered blocks and the editor both hold it (docs/web.md
+ * § Editing, *Selecting is editing*): the textblock — a paragraph, a heading, a list item, a
+ * table cell, a code block's text, a display formula, in reading order from the editor's
+ * first block — and the character offset within it, an inline formula and a line break each
+ * one character.
+ */
+export interface TextPoint {
+  slot: number
+  offset: number
+}
+
+/** Where the caret goes when an editor opens: a click's coordinates, a selection's two ends
+ *  by text position, an edge, or — after Backspace joined two blocks — the seam between the
+ *  first block and the second. */
+export type Caret = Point | { from: TextPoint; to: TextPoint } | 'start' | 'end' | 'join'
+
+/** How the reader left an editor: Escape, focus going elsewhere, or Enter in a one-line one. */
+export type LeaveReason = 'escape' | 'blur' | 'enter'
 
 /** Where a formula sits and what it holds, for the floating TeX field. */
 export interface MathTarget {
@@ -487,6 +504,56 @@ const ViewerHeading = Heading.extend({
   },
 })
 
+/** The wash's state: top-level blocks drawn washed, and whether the wash is fading. */
+export const washKey = new PluginKey<DecorationSet>('wash')
+
+/** What a transaction's `washKey` meta asks: wash these top-level blocks, fade the wash, or
+ *  end it. */
+export type WashMeta = { first: number; count: number } | 'fade' | 'clear'
+
+/**
+ * The located heading's wash, inside an editor (docs/web.md § Notes, *Then the notes show
+ * it*): an excerpt the notes just took, or the one a marker leads to, is drawn washed and
+ * then fades — as decorations, never written into the text, so they follow the text if it
+ * changes underneath.
+ */
+const Washes = Extension.create({
+  name: 'washes',
+  addProseMirrorPlugins() {
+    return [
+      new Plugin<DecorationSet>({
+        key: washKey,
+        state: {
+          init: () => DecorationSet.empty,
+          apply(tr, set) {
+            const meta = tr.getMeta(washKey) as WashMeta | undefined
+            if (meta === undefined) {
+              return set.map(tr.mapping, tr.doc)
+            }
+            if (meta === 'clear') {
+              return DecorationSet.empty
+            }
+            if (meta === 'fade') {
+              const faded = set.find().map((wash) => Decoration.node(wash.from, wash.to, { class: 'rich-wash rich-wash-fade' }))
+              return DecorationSet.create(tr.doc, faded)
+            }
+            const washes: Decoration[] = []
+            tr.doc.forEach((node, offset, index) => {
+              if (index >= meta.first && index < meta.first + meta.count) {
+                washes.push(Decoration.node(offset, offset + node.nodeSize, { class: 'rich-wash' }))
+              }
+            })
+            return DecorationSet.create(tr.doc, washes)
+          },
+        },
+        props: {
+          decorations: (state) => washKey.getState(state),
+        },
+      }),
+    ]
+  },
+})
+
 /** Lists stay one level: Tab inside a list item does nothing rather than nest. */
 const FlatLists = Extension.create({
   name: 'flatLists',
@@ -529,6 +596,7 @@ export function richExtensions(options: RichOptions = {}): Extensions {
     RawBlock,
     SourceAttributes,
     FlatLists,
+    Washes,
     ...(options.placeholder ? [Placeholder.configure({ placeholder: options.placeholder })] : []),
   ]
 }

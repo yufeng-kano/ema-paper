@@ -22,6 +22,7 @@ import {
   sectionExtent,
   type BlockAt,
   type OutlineEntry,
+  type PlacedBlock,
   type ResultBlock,
   type ResultPageBlocks,
 } from './markdown'
@@ -222,29 +223,31 @@ function linkLine(block: ResultBlock): { label: string; anchor: string } | null 
   return only?.kind === 'cite' ? { label: only.label, anchor: only.anchor } : null
 }
 
-/**
- * Where a passage is in the document: within the linked section first, then anywhere — the
- * first match in reading order, which is also the block a marker sits on. `heading` null with
- * an empty anchor is the whole document (`[Beginning of the document](#)`).
- */
-export function locatePassage(
-  pages: readonly ResultPageBlocks[],
-  passage: string,
-  heading: OutlineEntry | null,
-): { start: BlockAt; end: BlockAt } | null {
+/** The document as a passage is searched: its blocks in reading order, each as its text compared
+ *  — read once for every excerpt the notes hold, not once per excerpt. */
+interface PassageIndex {
+  placed: PlacedBlock[]
+  keys: string[]
+}
+
+function passageIndex(pages: readonly ResultPageBlocks[]): PassageIndex {
+  const placed = placedBlocks(pages)
+  return { placed, keys: placed.map((entry) => (entry.block.kind === 'comment' ? '' : passageKey(blockPlain(entry.block)))) }
+}
+
+function locateIn(index: PassageIndex, passage: string, heading: OutlineEntry | null): { start: BlockAt; end: BlockAt } | null {
   const key = passageText(passage)
   if (!key) {
     return null
   }
-  const placed = placedBlocks(pages)
-  const keys = placed.map((entry) => (entry.block.kind === 'comment' ? '' : passageKey(blockPlain(entry.block))))
+  const { placed, keys } = index
   const search = (from: number, to: number) => {
     let text = ''
     const owner: number[] = []
-    for (let index = from; index < to; index += 1) {
-      text += keys[index]!
-      for (let char = 0; char < keys[index]!.length; char += 1) {
-        owner.push(index)
+    for (let block = from; block < to; block += 1) {
+      text += keys[block]!
+      for (let char = 0; char < keys[block]!.length; char += 1) {
+        owner.push(block)
       }
     }
     const at = text.indexOf(key)
@@ -269,6 +272,19 @@ export function locatePassage(
 }
 
 /**
+ * Where a passage is in the document: within the linked section first, then anywhere — the
+ * first match in reading order, which is also the block a marker sits on. `heading` null with
+ * an empty anchor is the whole document (`[Beginning of the document](#)`).
+ */
+export function locatePassage(
+  pages: readonly ResultPageBlocks[],
+  passage: string,
+  heading: OutlineEntry | null,
+): { start: BlockAt; end: BlockAt } | null {
+  return locateIn(passageIndex(pages), passage, heading)
+}
+
+/**
  * Every excerpt in the notes — a quote right before a paragraph that is only a section link —
  * matched against the document (`matchExcerpts`, docs/web.md § Notes, *Backlink markers*):
  * where its passage is, by the comparison locate makes, and whether its heading is still there.
@@ -276,6 +292,7 @@ export function locatePassage(
 export function matchExcerpts(notes: string, pages: readonly ResultPageBlocks[], outline: readonly OutlineEntry[]): ExcerptMatch[] {
   const blocks = located(notes)
   const matches: ExcerptMatch[] = []
+  let index_: PassageIndex | null = null
   blocks.forEach((entry, index) => {
     const next = blocks[index + 1]
     if (entry.block.kind !== 'quote' || !next) {
@@ -287,7 +304,8 @@ export function matchExcerpts(notes: string, pages: readonly ResultPageBlocks[],
     }
     const passage = quoteContent(entry.block)
     const heading = link.anchor === '' ? null : findHeading(outline, link.label, link.anchor)
-    matches.push({ at: entry.start, passage, ...link, heading, found: locatePassage(pages, passage, heading) })
+    index_ ??= passageIndex(pages)
+    matches.push({ at: entry.start, passage, ...link, heading, found: locateIn(index_, passage, heading) })
   })
   return matches
 }

@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import { parseResultMarkdown } from './markdown'
 import { richExtensions } from './rich-extensions'
 import {
+  blockIndexAt,
   captionLine,
   convertBlock,
   docToMarkdown,
@@ -374,6 +375,29 @@ describe('section links in the notes', () => {
 
   it('stays text in the document, which reads no links', () => {
     expect(load('[3.2 Attention](#32-attention)').content![0]!.content![0]!.type).toBe('text')
+  })
+})
+
+describe('blockIndexAt', () => {
+  const notes = 'Intro\n\n<!-- page: 2 -->\n\n## Excerpts\n\n> passage\n\n[3.2 Attention](#32-attention)'
+
+  it('names the editor block an offset falls in, page markers counted as the editor counts them', () => {
+    expect(load(notes).content).toHaveLength(5)
+    expect(blockIndexAt(notes, 0)).toBe(0)
+    expect(blockIndexAt(notes, notes.indexOf('<!--'))).toBe(1)
+    expect(blockIndexAt(notes, notes.indexOf('> passage'))).toBe(3)
+    expect(blockIndexAt(notes, notes.indexOf('[3.2'))).toBe(4)
+  })
+
+  it('takes the next block between blocks and the last past the end', () => {
+    expect(blockIndexAt(notes, notes.indexOf('> passage') - 1)).toBe(3)
+    expect(blockIndexAt(notes, notes.length + 4)).toBe(4)
+    expect(blockIndexAt('', 0)).toBe(0)
+  })
+
+  it('counts an offset into a file with carriage returns as the editor reads it', () => {
+    const crlf = 'One\r\n\r\nTwo'
+    expect(blockIndexAt(crlf, crlf.indexOf('Two'))).toBe(1)
   })
 })
 

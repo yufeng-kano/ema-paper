@@ -159,6 +159,31 @@ export function blocksToDoc(blocks: ResultBlock[], leads: (string | null)[] = []
 
 const PAGE_MARKER_LINE = /^\s*<!--\s*page:\s*\d+\s*-->\s*$/
 
+/** The blocks of a markdown file as the editor's document holds them, each where the file has
+ *  it — a page marker included, so content before the first marker stays before it. */
+function placedSource(source: string): { at: number; block: ResultBlock }[] {
+  const placed: { at: number; block: ResultBlock }[] = []
+  for (const match of source.matchAll(/^[ \t]*(<!--\s*page:\s*\d+\s*-->)[ \t]*$/gm)) {
+    placed.push({ at: match.index + match[0].indexOf(match[1] ?? ''), block: { kind: 'comment', src: match[1] ?? '' } })
+  }
+  let cursor = 0
+  for (const block of parseResultMarkdown(source).flatMap((page) => page.blocks)) {
+    const at = source.indexOf(block.src, cursor)
+    placed.push({ at: at === -1 ? cursor : at, block })
+    cursor = at === -1 ? cursor : at + block.src.length
+  }
+  return placed.sort((a, b) => a.at - b.at)
+}
+
+/** The editor's top-level block that holds an offset into its markdown, by index — or the
+ *  first after it, when the offset falls between blocks; the last past the end. */
+export function blockIndexAt(markdown: string, offset: number): number {
+  const at = markdown.slice(0, offset).replace(/\r\n?/g, '\n').length
+  const placed = placedSource(markdown.replace(/\r\n?/g, '\n'))
+  const index = placed.findIndex((entry) => entry.at + entry.block.src.length > at)
+  return index === -1 ? Math.max(placed.length - 1, 0) : index
+}
+
 /**
  * The editor's document for a markdown string — one block's source, or a whole notes file.
  *
@@ -168,19 +193,7 @@ const PAGE_MARKER_LINE = /^\s*<!--\s*page:\s*\d+\s*-->\s*$/
  */
 export function markdownToDoc(markdown: string, options?: InlineOptions): JSONContent {
   const source = markdown.replace(/\r\n?/g, '\n')
-  const placed: { at: number; block: ResultBlock }[] = []
-  for (const match of source.matchAll(/^[ \t]*(<!--\s*page:\s*\d+\s*-->)[ \t]*$/gm)) {
-    placed.push({ at: match.index + match[0].indexOf(match[1] ?? ''), block: { kind: 'comment', src: match[1] ?? '' } })
-  }
-  // Every block where the file has it — a marker included, so content before the first
-  // marker stays before it.
-  let cursor = 0
-  for (const block of parseResultMarkdown(source).flatMap((page) => page.blocks)) {
-    const at = source.indexOf(block.src, cursor)
-    placed.push({ at: at === -1 ? cursor : at, block })
-    cursor = at === -1 ? cursor : at + block.src.length
-  }
-  placed.sort((a, b) => a.at - b.at)
+  const placed = placedSource(source)
   const leads: (string | null)[] = []
   let end = 0
   for (const { at, block } of placed) {

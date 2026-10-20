@@ -371,6 +371,7 @@ async function showResult(job: JobSummary) {
       :pending="inFlight.has(openJob.job_id)"
       :error-message="resultErrors.get(openJob.job_id) ?? null"
       :figure-base="`/api/jobs/${openJob.job_id}/figures`"
+      :job-id="openJob.job_id"
       @close="openJob = null"
     />
 

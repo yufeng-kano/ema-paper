@@ -7,6 +7,12 @@
 import type { IconName } from './icons'
 import type { BlockKindName } from './richdoc'
 
+/** A skill as the slash menu lists it: its name and what it does. */
+export interface SlashSkill {
+  name: string
+  description: string
+}
+
 /** What a conversion row turns the empty paragraph into. */
 export type SlashConversion = BlockKindName | 'table'
 
