@@ -16,7 +16,7 @@ from .config import Settings, get_settings
 from .db.session import create_engine, create_sessionmaker
 from .errors import install_error_handlers
 from .mcp import mcp_session_manager, mount_mcp
-from .routes import attachments, chat, control, extensions, kano, library, oauth, v1
+from .routes import attachments, chat, control, extensions, kano, library, memories, oauth, v1
 
 # Signed cookie holding only the transient OIDC state/PKCE verifier during a login
 # round trip. The durable credential is the server-side session row.
@@ -70,6 +70,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(chat.router)
     app.include_router(attachments.router)
     app.include_router(extensions.router)
+    app.include_router(memories.router)
     app.include_router(v1.router)
     app.include_router(oauth.router)
     mount_mcp(app)

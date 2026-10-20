@@ -23,6 +23,7 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..agents import CHAT
+from ..agents import memory as memory_defs
 from ..agents import skills as skill_defs
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
 from ..db.models import (
@@ -145,18 +146,47 @@ SELECTION_PREFIX = "The passage selected in the document:\n\n"
 # And the reply's quote before its passage (docs/chat.md § What a user message carries).
 QUOTE_PREFIX = "The user is replying to this passage of your earlier answer:\n\n"
 ATTACHMENT_EXPIRED = "An attachment is no longer available; attach it again"
+# The longest heading a section added to a message may have (docs/api.md).
+SECTION_HEADING_MAX_CHARS = 512
 
 
 # The per-turn context block (docs/chat.md § Prompt caching): what the model must know
 # about this message and may not learn from the cached prefix.
 TURN_CONTEXT = "turn"
+SECTION_CONTEXT = "section"
 
 
-def turn_note(revision: str | None, locale: str) -> str:
-    return (
-        f"Context for this message:\n- document revision: {revision or 'unknown'}\n"
-        f"- reader locale: {locale}"
-    )
+def turn_note(
+    revision: str | None,
+    locale: str,
+    answer_language: str | None,
+    translate_language: str | None,
+) -> str:
+    """The turn block: the document's revision, the reader's locale and the languages the
+    reader chose on the Agent page, each line only when chosen (docs/chat.md
+    § Instructions)."""
+    lines = [
+        "Context for this message:",
+        f"- document revision: {revision or 'unknown'}",
+        f"- reader locale: {locale}",
+    ]
+    if answer_language:
+        lines.append(f"- answer language: {answer_language}")
+    if translate_language:
+        lines.append(f"- translation language: {translate_language}")
+    return "\n".join(lines)
+
+
+def section_text(heading: str, text: str | None) -> str:
+    """A whole section the reader added, introduced by its heading; one too long to send
+    names the heading and points the agent at the document rather than passing a cut
+    section for a whole one (docs/chat.md § What a user message carries)."""
+    if text is None:
+        return (
+            f'The user added the whole section "{heading}" of the document to this message. '
+            "It is too long to include here: read it from the document."
+        )
+    return f'The whole section "{heading}" of the document:\n\n{text}'
 
 
 def display_content(content: list) -> list:
@@ -166,8 +196,8 @@ def display_content(content: list) -> list:
     attached image without them too, the panel asking for them by the block's index; the
     selection and the quote are sent as the passage alone, without the line that
     introduces it to the model, so the note the panel shows counts the passage and
-    nothing else; a command's skill and an attached file are sent as what they name, not
-    the text the model reads (docs/api.md § Chat)."""
+    nothing else; a command's skill, an attached file and a whole section are sent as what
+    they name, not the text the model reads (docs/api.md § Chat)."""
     shown = []
     for block in content:
         if not isinstance(block, dict):
@@ -186,6 +216,11 @@ def display_content(content: list) -> list:
             shown.append({**block, "text": block["text"].removeprefix(QUOTE_PREFIX)})
         elif marker == "skill":
             shown.append({"type": "text", "context": "skill", "skill": block.get("skill")})
+        elif marker == SECTION_CONTEXT:
+            # The heading the thread draws as a chip, never the section's text.
+            shown.append(
+                {"type": "text", "context": SECTION_CONTEXT, "section": block.get("section")}
+            )
         elif marker == "attachment":
             shown.append(
                 {"type": "text", "context": "attachment", "attachment": block.get("attachment")}
@@ -258,15 +293,26 @@ async def delete_conversation(conversation_id: int, user: SessionUser, db: DbSes
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+class SectionIn(BaseModel):
+    """A whole section the reader added by its heading: its markdown, or null for one past
+    the selection cap, which the agent then reads from the document."""
+
+    heading: str
+    text: str | None = None
+
+
 class MessageCreate(BaseModel):
     # The caps are the deployment's (`CHAT_MESSAGE_MAX_CHARS`, `CHAT_SELECTION_MAX_CHARS`,
-    # `CHAT_ATTACHMENTS_PER_MESSAGE`), checked in the route where the settings are. Empty
-    # text is a message only with a command or an attachment; with a command it is the
-    # command's arguments (docs/chat.md § What a user message carries).
+    # `CHAT_SECTIONS_PER_MESSAGE`, `CHAT_ATTACHMENTS_PER_MESSAGE`), checked in the route
+    # where the settings are. Empty text is a message only with a command or an attachment;
+    # with a command it is the command's arguments (docs/chat.md § What a user message
+    # carries).
     text: str = ""
     # The passage the reader had selected when they sent — context, appended as its own
     # block of the user message (docs/chat.md § Prompt caching).
     selection: str | None = None
+    # Whole sections the reader added, each its own block after the selection.
+    sections: list[SectionIn] = Field(default_factory=list)
     # The passage of an earlier answer the reader is replying to.
     quote: str | None = None
     # A skill the reader runs as `/name` (docs/chat.md § Skills).
@@ -340,6 +386,7 @@ async def post_message(
         raise ApiError(400, "invalid_request", "The selection is too long")
     if body.quote is not None and len(body.quote) > settings.chat_selection_max_chars:
         raise ApiError(400, "invalid_request", "The quoted passage is too long")
+    sections = _checked_sections(body.sections, settings)
     attachment_ids = list(dict.fromkeys(body.attachments))
     if len(attachment_ids) > settings.chat_attachments_per_message:
         raise ApiError(
@@ -421,6 +468,15 @@ async def post_message(
                 "context": "selection",
             }
         )
+    for heading, text in sections:
+        content.append(
+            {
+                "type": "text",
+                "text": section_text(heading, text),
+                "context": SECTION_CONTEXT,
+                "section": heading,
+            }
+        )
     quote = (body.quote or "").strip()
     if quote:
         content.append({"type": "text", "text": f"{QUOTE_PREFIX}{quote}", "context": "quote"})
@@ -435,14 +491,19 @@ async def post_message(
                 "skill": skill.name,
             }
         )
-    # The document's revision as the message is accepted, and the reader's locale: with
-    # the message rather than in the system prompt, so an edit made meanwhile reaches the
-    # model and a change of language costs no cache (docs/chat.md § Prompt caching).
+    # The document's revision as the message is accepted, the reader's locale and the
+    # languages they chose: with the message rather than in the system prompt, so an edit
+    # made meanwhile reaches the model and a change of language costs no cache (docs/chat.md
+    # § Prompt caching, § Instructions).
     document = await db.get(Document, row.document_id)
     revision = None if document is None else await current_revision(db, settings, document)
-    content.append(
-        {"type": "text", "text": turn_note(revision, body.locale), "context": TURN_CONTEXT}
+    note = turn_note(
+        revision,
+        body.locale,
+        setting.answer_language if setting else None,
+        setting.translate_language if setting else None,
     )
+    content.append({"type": "text", "text": note, "context": TURN_CONTEXT})
     message = Message(conversation_id=row.id, role="user", content=content)
     db.add(message)
     await db.flush()
@@ -474,6 +535,35 @@ async def post_message(
         with contextlib.suppress(OSError):
             await asyncio.to_thread(path.unlink, missing_ok=True)
     return {"turn_id": str(turn.id), "message_id": message.id}
+
+
+def _checked_sections(
+    sections: list[SectionIn], settings: AppSettings
+) -> list[tuple[str, str | None]]:
+    """The sections as `(heading, text)`, refused past the deployment's caps: their number
+    (`CHAT_SECTIONS_PER_MESSAGE`), a heading empty or longer than 512 characters, a text
+    past `CHAT_SELECTION_MAX_CHARS` — a section that long is sent with no text (docs/api.md).
+    The heading is one line, cleaned like a memory: it is shown and quoted back."""
+    if len(sections) > settings.chat_sections_per_message:
+        raise ApiError(
+            400,
+            "invalid_request",
+            f"At most {settings.chat_sections_per_message} sections go with one message",
+        )
+    checked: list[tuple[str, str | None]] = []
+    for section in sections:
+        heading = memory_defs.clean_text(section.heading, single_line=True)
+        if not heading or len(heading) > SECTION_HEADING_MAX_CHARS:
+            raise ApiError(
+                400,
+                "invalid_request",
+                f"A section's heading is 1 to {SECTION_HEADING_MAX_CHARS} characters",
+            )
+        text = section.text.strip() if section.text is not None else None
+        if text is not None and len(text) > settings.chat_selection_max_chars:
+            raise ApiError(400, "invalid_request", "A section is too long; send it without text")
+        checked.append((heading, text))
+    return checked
 
 
 async def _claimed_attachments(

@@ -654,3 +654,155 @@ async def test_the_removed_built_in_subagents_take_the_readers_edits_with_them(
         names = (await db.execute(text("SELECT name FROM subagents ORDER BY name"))).scalars()
         assert list(names) == ["tables", "translator"]
     await engine.dispose()
+
+
+INSTRUCTIONS_AND_MEMORIES = "09bcc2e96c63"
+
+
+async def test_the_memory_migration_keeps_every_row_and_scopes_memories(scratch_url) -> None:
+    """Existing settings and conversations read as before — no instructions, memory on and
+    not paused, no snapshot yet — and a memory goes with its document but outlives the
+    conversation that saved it (docs/database.md § Rules)."""
+    _alembic(scratch_url, "upgrade", SUBAGENT_REMOVAL)
+
+    engine = create_async_engine(scratch_url)
+    job_id = uuid.uuid4()
+    async with engine.begin() as db:
+        user_id = (
+            await db.execute(
+                text(
+                    "INSERT INTO users (google_sub, email, created_at) "
+                    "VALUES ('sub', 'm@example.com', now()) RETURNING id"
+                )
+            )
+        ).scalar_one()
+        await db.execute(
+            text(
+                "INSERT INTO agent_settings (user_id, agent, model, prompt) "
+                "VALUES (:user, 'chat', 'm', 'Mine.')"
+            ),
+            {"user": user_id},
+        )
+        await db.execute(
+            text(
+                "INSERT INTO jobs (id, user_id, agent, kind, filename, media_type, size_bytes, "
+                "sha256, pages_spec, model, pipeline_version, bbox_format, status, pages_done, "
+                "prompt_sha256, created_at) VALUES (:id, :user, 'parse', 'image', 'a.png', "
+                "'image/png', 1, 'h', '', 'm', 1, 'yxyx_norm1000', 'succeeded', 1, '', now())"
+            ),
+            {"id": job_id, "user": user_id},
+        )
+        document_id = (
+            await db.execute(
+                text(
+                    "INSERT INTO documents (user_id, folder_id, job_id, name, created_at, "
+                    "updated_at) VALUES (:user, NULL, :job, 'a.png', now(), now()) RETURNING id"
+                ),
+                {"user": user_id, "job": job_id},
+            )
+        ).scalar_one()
+        conversation_id = (
+            await db.execute(
+                text(
+                    "INSERT INTO conversations (user_id, document_id, title, session, model, "
+                    "created_at, updated_at) VALUES (:user, :document, 'Thread', 's', 'm', "
+                    "now(), now()) RETURNING id"
+                ),
+                {"user": user_id, "document": document_id},
+            )
+        ).scalar_one()
+
+    _alembic(scratch_url, "upgrade", INSTRUCTIONS_AND_MEMORIES)
+
+    async with engine.begin() as db:
+        setting = (
+            (
+                await db.execute(
+                    text(
+                        "SELECT prompt, instructions, answer_language, translate_language, "
+                        "memory_auto, memory_paused FROM agent_settings"
+                    )
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert dict(setting) == {
+            "prompt": "Mine.",
+            "instructions": None,
+            "answer_language": None,
+            "translate_language": None,
+            "memory_auto": True,
+            "memory_paused": False,
+        }
+        snapshot = (await db.execute(text("SELECT memory_ids FROM conversations"))).scalar_one()
+        assert snapshot is None
+        for scope in (document_id, None):
+            await db.execute(
+                text(
+                    "INSERT INTO memories (user_id, kind, text, document_id, conversation_id, "
+                    "source_ref, created_at, updated_at) VALUES (:user, 'document', :text, "
+                    ":document, :conversation, 'toolu_1', now(), now())"
+                ),
+                {
+                    "user": user_id,
+                    "text": f"scoped to {scope}",
+                    "document": scope,
+                    "conversation": conversation_id,
+                },
+            )
+    with pytest.raises(IntegrityError):
+        async with engine.begin() as db:
+            await db.execute(
+                text(
+                    "INSERT INTO memories (user_id, kind, text, created_at, updated_at) "
+                    "VALUES (:user, 'fact', 'x', now(), now())"
+                ),
+                {"user": user_id},
+            )
+
+    async with engine.begin() as db:
+        await db.execute(text("DELETE FROM conversations WHERE id = :id"), {"id": conversation_id})
+        kept = (
+            await db.execute(
+                text("SELECT document_id, conversation_id, pinned FROM memories ORDER BY id")
+            )
+        ).all()
+        # Deleting the conversation keeps what it saved, its source cleared.
+        assert [tuple(row) for row in kept] == [(document_id, None, False), (None, None, False)]
+        await db.execute(text("DELETE FROM documents WHERE id = :id"), {"id": document_id})
+        left = (await db.execute(text("SELECT text FROM memories"))).scalars().all()
+        # A note about one document goes with it, never widened to every document.
+        assert left == ["scoped to None"]
+
+    _alembic(scratch_url, "downgrade", SUBAGENT_REMOVAL)
+    async with engine.connect() as db:
+        tables = set(
+            (
+                await db.execute(
+                    text("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
+                )
+            ).scalars()
+        )
+        columns = set(
+            (
+                await db.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name IN ('agent_settings', 'conversations')"
+                    )
+                )
+            ).scalars()
+        )
+    added = {
+        "instructions",
+        "answer_language",
+        "translate_language",
+        "memory_auto",
+        "memory_paused",
+        "memory_ids",
+    }
+    assert "memories" not in tables
+    assert not added & columns
+    _alembic(scratch_url, "upgrade", "head")
+    await engine.dispose()

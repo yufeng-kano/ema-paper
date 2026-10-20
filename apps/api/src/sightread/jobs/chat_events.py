@@ -32,6 +32,9 @@ THINKING = "thinking"
 TOOL_USE = "tool_use"
 TOOL_RESULT = "tool_result"
 EDIT = "edit"
+# A `memory` call that saved, changed or forgot one of the reader's memories (docs/chat.md
+# § Memory): the thread draws it as a quiet line with Undo.
+MEMORY = "memory"
 RETRY = "retry"
 TURN_DONE = "turn_done"
 TURN_ERROR = "turn_error"
