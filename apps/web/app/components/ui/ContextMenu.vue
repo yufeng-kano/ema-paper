@@ -628,10 +628,12 @@ function choose(item: MenuItem, event?: MouseEvent) {
   text-overflow: ellipsis;
 }
 
-/* A skill's name and what it does on one line: the name keeps its width where it can, and
-   the description takes the rest, cut with an ellipsis. */
+/* A skill's name and what it does on one line: the name keeps its width, up to most of the
+   row, and the description takes the rest, cut with an ellipsis — shrunk in proportion to
+   their widths, a long description would cut the name to a letter. */
 .label.described {
-  flex: 0 1 auto;
+  flex: 0 0 auto;
+  max-width: 70%;
 }
 
 .description {
@@ -649,6 +651,14 @@ function choose(item: MenuItem, event?: MouseEvent) {
   padding-left: var(--space-3);
   color: var(--faint);
   font-size: var(--text-xs);
+}
+
+/* A key names nothing on a coarse pointer, which has no keyboard to press it on; markdown or
+   a command (mono) is typed, and stays. */
+@media (pointer: coarse) {
+  .shortcut:not(.mono) {
+    display: none;
+  }
 }
 
 .item:hover .description,

@@ -240,7 +240,8 @@ export function followBlocks(before: readonly PlacedBlock[], after: readonly Pla
  * The collapsed headings after an edit (docs/web.md § Result viewer, *A fold follows its heading
  * through an edit*): each fold moves to its own heading's new slug — which repeated headings,
  * numbered in document order, change whenever one of them is added, deleted, moved or renamed —
- * and a fold whose heading is gone is dropped.
+ * and a fold whose heading is gone is dropped. A fold whose heading `before` did not hold — not
+ * loaded yet, or on a page still to come — is kept as it is.
  */
 export function followFolds(
   before: readonly PlacedBlock[],
@@ -253,7 +254,8 @@ export function followFolds(
   const beforeAt = new Map(before.map((entry, index) => [blockKey(entry), index]))
   const afterAt = new Map(after.map((entry, index) => [blockKey(entry), index]))
   const slugAt = new Map(afterOutline.map((entry) => [afterAt.get(blockKey(entry)), entry.slug]))
-  const followed = new Set<string>()
+  const known = new Set(beforeOutline.map((entry) => entry.slug))
+  const followed = new Set([...collapsed].filter((slug) => !known.has(slug)))
   for (const entry of beforeOutline) {
     const index = beforeAt.get(blockKey(entry))
     const moved = index === undefined ? null : (map[index] ?? null)

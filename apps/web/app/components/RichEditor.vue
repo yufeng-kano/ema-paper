@@ -225,7 +225,14 @@ const SLASH_GAP = 4
  *  section runs on. */
 const slash = ref<{ pos: number; query: string; besides: string } | null>(null)
 const slashActive = ref(0)
-const slashPlace = ref({ top: 0, left: 0, maxHeight: SLASH_MAX_HEIGHT })
+/** Below the line the menu hangs from its top; flipped above, it stands on its bottom edge, so
+ *  a filter that shortens it keeps it against the line instead of leaving it where it was. */
+const slashPlace = ref<{ top: number | null; bottom: number | null; left: number; maxHeight: number }>({
+  top: 0,
+  bottom: null,
+  left: 0,
+  maxHeight: SLASH_MAX_HEIGHT,
+})
 const slashMenu = ref<HTMLElement | null>(null)
 const slashList = ref<HTMLElement | null>(null)
 /** A slash paragraph whose menu the reader closed: it stays closed until its slash is gone,
@@ -360,8 +367,9 @@ async function placeSlash() {
     return
   }
   const left = Math.min(Math.max(0, coords.left - outer.left - SLASH_GAP), Math.max(0, outer.width - menu.offsetWidth))
-  const top = flip ? coords.top - outer.top - SLASH_GAP - menu.offsetHeight : coords.bottom - outer.top + SLASH_GAP
-  slashPlace.value = { top, left, maxHeight }
+  slashPlace.value = flip
+    ? { top: null, bottom: outer.bottom - coords.top + SLASH_GAP, left, maxHeight }
+    : { top: coords.bottom - outer.top + SLASH_GAP, bottom: null, left, maxHeight }
 }
 
 /**
@@ -925,7 +933,13 @@ defineExpose({
       v-if="slash"
       ref="slashMenu"
       class="slash"
-      :style="{ top: `${slashPlace.top}px`, left: `${slashPlace.left}px`, maxHeight: `${slashPlace.maxHeight}px` }"
+      :class="{ above: slashPlace.bottom !== null }"
+      :style="{
+        top: slashPlace.top === null ? 'auto' : `${slashPlace.top}px`,
+        bottom: slashPlace.bottom === null ? 'auto' : `${slashPlace.bottom}px`,
+        left: `${slashPlace.left}px`,
+        maxHeight: `${slashPlace.maxHeight}px`,
+      }"
       @mousedown.prevent
     >
       <div :id="`${slashId}-list`" ref="slashList" class="slash-list" role="listbox" :aria-label="t('viewer.slash.label')">
@@ -963,12 +977,12 @@ defineExpose({
               :class="{ active: slashActive === slashConversions.length + index }"
               :aria-selected="slashActive === slashConversions.length + index ? 'true' : 'false'"
               tabindex="-1"
-              :title="`${row.name}: ${row.description}`"
+              :title="`/${row.name}: ${row.description}`"
               @mousemove="slashActive = slashConversions.length + index"
               @click="applySlash(row)"
             >
               <UiIcon :name="row.icon" />
-              <span class="slash-name mono described">{{ row.name }}</span>
+              <span class="slash-name mono described">/{{ row.name }}</span>
               <span class="slash-description">{{ row.description }}</span>
             </button>
           </template>
@@ -1202,7 +1216,12 @@ defineExpose({
   font-family: var(--font);
   line-height: normal;
   white-space: normal;
+  transform-origin: top left;
   animation: slash-in var(--duration-fast) var(--ease-enter);
+}
+
+.slash.above {
+  transform-origin: bottom left;
 }
 
 @supports not (backdrop-filter: blur(1px)) {
@@ -1291,8 +1310,11 @@ defineExpose({
   text-overflow: ellipsis;
 }
 
+/* A skill's name keeps its width, up to most of the row, and the description takes the rest:
+   shrunk in proportion to their widths, a long description would cut the name to a letter. */
 .slash-name.described {
-  flex: 0 1 auto;
+  flex: 0 0 auto;
+  max-width: 70%;
 }
 
 .slash-description {

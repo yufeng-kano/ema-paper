@@ -165,6 +165,12 @@ describe('followFolds', () => {
     expect(follow(chapters, after, ['exercises', 'exercises-1'])).toEqual(['exercises-1', 'exercises-2'])
   })
 
+  it('keeps a fold whose heading the document before did not hold yet', () => {
+    expect(follow([], chapters, ['2-method', 'exercises-1'])).toEqual(['2-method', 'exercises-1'])
+    // A partial result growing: the heading on the page still to come keeps its fold.
+    expect(follow(chapters.slice(0, 4), chapters, ['exercises', 'exercises-1'])).toEqual(['exercises-1', 'exercises'])
+  })
+
   it('pairs renamed headings in order only where as many came as went', () => {
     const translated = ['## 1 導論', 'Intro text.', '## 習題', 'First set.', '## 2 方法', 'Method text.', '## 習題', 'Second set.']
     expect(follow(chapters, translated, ['1-intro', 'exercises-1'])).toEqual(['1-導論', '習題-1'])

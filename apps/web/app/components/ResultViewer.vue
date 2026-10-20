@@ -59,6 +59,7 @@ import {
   replaceBlockSource,
   resolveAnchor,
   sectionSource,
+  serializeDocument,
   type Bbox,
   type BlockAt,
   type OutlineEntry,
@@ -528,7 +529,9 @@ function retryAfterClose(file: 'markdown' | 'notes', save: () => Promise<void>) 
  *  after the typing debounce — one deliberate change, which the less it waits, the less room
  *  an agent writing meanwhile has to turn into a 409 (docs/web.md § Editing). */
 function applyDocument(next: string) {
-  undo.record('document', markdown.value, next)
+  // From the file as the action writes it: a copy spaced otherwise would make the first
+  // step span the whole file, and its undo select every block (docs/web.md § Editing).
+  undo.record('document', serializeDocument(parseResultMarkdown(markdown.value)), next)
   markdown.value = next
   saveState.value = 'editing'
   void saveContent()
@@ -2356,6 +2359,11 @@ let toolbarTimer: ReturnType<typeof setTimeout> | undefined
 let toolbarFrame = 0
 /** A coarse pointer: the toolbar sits under the selection, where the platform's callout is not. */
 const coarse = ref(false)
+let coarseQuery: MediaQueryList | null = null
+
+function onCoarseChange(change: MediaQueryListEvent) {
+  coarse.value = change.matches
+}
 
 function onPanePointerDown(event: PointerEvent) {
   if (event.target instanceof Element && event.target.closest('[role="toolbar"]')) {
@@ -2499,7 +2507,7 @@ function onToolbarMore(event: MouseEvent) {
     passage,
     items: skills.value
       .filter((skill) => skill.name !== 'translate')
-      .map((skill) => ({ key: skill.name, label: skill.name, labelMono: true, description: skill.description, icon: skillIcon(skill.name) })),
+      .map((skill) => ({ key: skill.name, label: `/${skill.name}`, labelMono: true, description: skill.description, icon: skillIcon(skill.name) })),
   }
 }
 
@@ -3693,9 +3701,9 @@ onMounted(() => {
   window.addEventListener('pointercancel', forgetChromePress)
   window.addEventListener('dragover', onWindowDragOver)
   window.addEventListener('dragend', endDrag, true)
-  const query = window.matchMedia('(pointer: coarse)')
-  coarse.value = query.matches
-  query.addEventListener('change', (change) => (coarse.value = change.matches))
+  coarseQuery = window.matchMedia('(pointer: coarse)')
+  coarse.value = coarseQuery.matches
+  coarseQuery.addEventListener('change', onCoarseChange)
 })
 
 onBeforeUnmount(() => {
@@ -3706,6 +3714,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('pointercancel', forgetChromePress)
   window.removeEventListener('dragover', onWindowDragOver)
   window.removeEventListener('dragend', endDrag, true)
+  coarseQuery?.removeEventListener('change', onCoarseChange)
   columnsObserver?.disconnect()
   paneObserver?.disconnect()
   footObserver?.disconnect()
@@ -4916,7 +4925,7 @@ watch(
 /* A percentage column needs a floor: below the shell breakpoint 70% of the pane is a
    gutter wider than the text it frames. The side columns stack under the document there,
    each keeping its own scroll. The gutter is the 40px padding: room for a handle or a
-   chevron, not both, so on Files the chevron goes and collapsing is the menu's. */
+   chevron, not both, so on Files a heading's two take turns in one slot. */
 @media (max-width: 900px) {
   .page,
   .page-skeleton {
@@ -4941,13 +4950,21 @@ watch(
     display: none;
   }
 
-  .document.files .block-chevron {
-    display: none;
-  }
-
+  /* One gutter slot for a heading: its chevron, or its handle while the heading is open in
+     its editor, selected, moving or has its menu open — how a touch screen reaches a handle
+     anyway (docs/web.md § Result viewer, *Outline, collapse and the way back*). */
   .document.files .block[data-kind='h2'] > .block-handle,
   .document.files .block[data-kind='h3'] > .block-handle {
     left: -28px;
+  }
+
+  .document.files .block:is([data-kind='h2'], [data-kind='h3']):not(.open, .selected, .moving) > .block-handle:not(.on) {
+    display: none;
+  }
+
+  .document.files .block:is(.open, .selected, .moving) > .block-chevron,
+  .document.files .block-handle.on ~ .block-chevron {
+    display: none;
   }
 }
 
@@ -4968,18 +4985,10 @@ watch(
     width: calc(100% - var(--space-8));
   }
 
+  /* The side padding is the gutter's room: a handle or a chevron on the left, on Files a
+     backlink marker on the right. */
   .document {
-    padding: var(--space-7) var(--space-5) var(--space-10);
-  }
-
-  /* On Files the side padding is the room a handle and a backlink marker need. History's
-     chevron does not fit the 20px there, and is not drawn. */
-  .document.files {
-    padding-inline: var(--space-8);
-  }
-
-  .document:not(.files) .block-chevron {
-    display: none;
+    padding: var(--space-7) var(--space-8) var(--space-10);
   }
 }
 </style>
