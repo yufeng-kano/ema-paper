@@ -188,9 +188,16 @@ memories         id PK, user_id FK, kind term|preference|about|document, text TE
                                                   -- the conversation that saved it; ON DELETE
                                                   -- SET NULL: deleting a conversation keeps
                                                   -- what it saved
-                 source_ref VARCHAR(255) NULL,    -- the tool_use_id of the call that saved it
+                 source_ref VARCHAR(255) NULL,    -- the tool_use_id of the call that saved it,
+                                                  -- or of the forget call whose Undo saved
+                                                  -- it again (chat.md § Memory)
                  created_at, updated_at
                  INDEX (user_id, updated_at)
+                 INDEX (document_id) WHERE document_id IS NOT NULL
+                 INDEX (conversation_id) WHERE conversation_id IS NOT NULL
+                                                  -- what a document's or a conversation's
+                                                  -- delete cascades through, so it never
+                                                  -- scans every reader's memories
                  CHECK (kind IN ('term', 'preference', 'about', 'document'))
                  -- the chat agent's memories of the reader (chat.md § Memory)
 chat_attachments id UUID PK, user_id FK, name, kind image|text, media_type, size_bytes,
@@ -217,7 +224,7 @@ oauth_grants     id PK, client_id FK, user_id FK, kind code|access|refresh,
 - All credentials at rest follow [auth.md](./auth.md): hashes for anything we only verify, AES-GCM ciphertext for what we must replay (the Kano Proxy key, every provider connection's key, and a pending connect's PKCE verifier). No plaintext secrets in any column.
 - `user_settings.system_prompt` no longer exists: the migration turned each stored custom prompt into a `prompt_presets` row named "Custom prompt" and pointed `prompt_preset_id` at it, so behavior did not change for anyone.
 - **The agent prompt migration** (`skills subagents attachments and agent prompt`) gave `agent_settings` its `prompt` column and moved every selected preset into it, clearing `prompt_preset_id`: a `parse` preset's text as it was (a parse preset replaced the template), a `chat` preset's text behind the chat agent's default system prompt of that release and a blank line (a chat preset was appended to it) — the default is copied into the migration, never imported, so the migration stays what it was when it ran. The presets themselves stay, unselected; nothing else reads them. A `chat` preset holding one of the template's tokens is not moved: it was appended verbatim, and inside the template the token would be substituted, so it stays the selected preset. The downgrade puts the selections back before it drops the column: an agent whose prompt is a moved preset selects that preset again (matched by its text), and a prompt written after the upgrade becomes a preset of its own named *Custom prompt* (numbered past a taken name) where the old schema can say it — a `parse` prompt as it is, a `chat` prompt as what it adds behind that release's default; a `chat` prompt that edits the default itself has no such form and goes back to the default. A moved `chat` prompt can exceed `SYSTEM_PROMPT_MAX_CHARS`, which caps writes, not stored rows: the dialog says so and the reader shortens it before the next save. The same revision created `skills`, `subagents` and `chat_attachments`.
-- **The instructions and memory migration** (`agent instructions and memories`) added `agent_settings.instructions`, `answer_language`, `translate_language` (NULL: none, and the reader's locale as before), `memory_auto` (true) and `memory_paused` (false), `conversations.memory_ids` (NULL: a conversation takes its snapshot at its next turn) and the `memories` table, empty. No row is rewritten. Its downgrade drops them, the memories with them.
+- **The instructions and memory migration** (`agent instructions and memories`) added `agent_settings.instructions`, `answer_language`, `translate_language` (NULL: none, and the reader's locale as before), `memory_auto` (true) and `memory_paused` (false), `conversations.memory_ids` (NULL: a conversation takes its snapshot at its next turn) and the `memories` table, empty, with its three indexes. No row is rewritten. Its downgrade drops them, the memories with them.
 - **The built-in subagent removal** (`remove three built-in subagents`) deleted every `subagents` row named `verifier`, `reader` or `translation-checker`: the readers' edits of built-ins that left the code, which would otherwise have stayed on as subagents of their own ([chat.md](./chat.md) § Subagents). Its downgrade restores none of them; the built-ins come back with the code they belong to, unedited.
 - **The Kano Proxy migration** (`837c0e9a9a4f_kano_proxy_and_agents`) removed OpenRouter and introduced agents in one step, on existing data:
   - every `prompt_presets` row and every `jobs` row became `agent = 'parse'` (the only agent);

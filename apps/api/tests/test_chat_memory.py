@@ -5,6 +5,7 @@ reaches the network (docs/testing.md § Cost safety)."""
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -27,7 +28,7 @@ from sightread.db.models import (
     Result,
     User,
 )
-from sightread.jobs import chat_memory
+from sightread.jobs import chat_events, chat_memory, chat_runner, chat_tools
 from sightread.routes.chat import TURN_CONTEXT, turn_note
 from sightread.workspace.layout import user_root
 from tests.conftest import CSRF_HEADERS
@@ -151,6 +152,15 @@ def test_clean_text_drops_invisible_characters_and_keeps_the_joiners() -> None:
     assert memory_defs.clean_text("  # Me\n\n- brief  \n", single_line=False) == "# Me\n\n- brief"
 
 
+def test_clean_text_drops_control_characters_but_tab_newline_and_return() -> None:
+    # NUL first: PostgreSQL refuses it in TEXT, and the write would fail with the text logged.
+    assert memory_defs.clean_text("a\x00b\x07c\x1bd\x7fe", single_line=True) == "abcde"
+    assert memory_defs.clean_text("# Me\x00\n\n-\tbrief\r\n\x0bend\x0c", single_line=False) == (
+        "# Me\n\n-\tbrief\r\nend"
+    )
+    assert memory_defs.clean_text("\x00 \x01", single_line=True) == ""
+
+
 def _row(memory_id: int, kind: str, text: str, *, minutes: int = 0, **extra) -> SimpleNamespace:
     return SimpleNamespace(
         id=memory_id,
@@ -250,20 +260,30 @@ def test_the_prompt_says_how_to_link_a_section_and_which_language_to_answer_in()
     assert "\n- memory: save, update or forget one of the user's memories" in prompt
     assert "[3.2 Attention](#32-attention)" in prompt and "Link nothing else that way." in prompt
     assert "whole sections of the document they added to it" in prompt
-    assert "Answer in the answer language when the block names one, else in the reader's" in (
-        prompt
-    )
+    assert "Answer in the reader's locale unless the block names an answer language." in prompt
     # A turn without the tool would not be told of it; the tokens stay without facts.
     rendered = chat_agent.render_system_prompt(prompt, None, tools=["view_page"])
     assert "- memory:" not in rendered and "{document_path}" in rendered
+
+
+ANSWER_JA = "- answer language: ja (the reader's choice: answer in it, whatever the locale)"
+
+
+def translation_line(tag: str) -> str:
+    return (
+        f"- translation language: {tag} "
+        "(the reader's choice: translate into it unless told otherwise)"
+    )
 
 
 def test_the_turn_block_names_the_languages_only_when_chosen() -> None:
     assert turn_note("abc", "en", None, None) == (
         "Context for this message:\n- document revision: abc\n- reader locale: en"
     )
+    # Each line carries its own rule: a prompt the reader replaced, or the one a migration
+    # moved their preset into, knows nothing of these lines (docs/chat.md § Instructions).
     assert turn_note(None, "zh-TW", "ja", "zh-TW").endswith(
-        "- reader locale: zh-TW\n- answer language: ja\n- translation language: zh-TW"
+        f"- reader locale: zh-TW\n{ANSWER_JA}\n{translation_line('zh-TW')}"
     )
     assert "unknown" in turn_note(None, "en", None, "fr")
     assert "answer language" not in turn_note("r", "en", None, "fr")
@@ -340,6 +360,7 @@ async def test_me_carries_the_composer_and_editor_limits(make_client) -> None:
         chat_instructions_max_chars=111,
         chat_memory_max_chars=222,
         chat_sections_per_message=3,
+        chat_section_heading_max_chars=55,
         chat_selection_max_chars=444,
     )
     await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
@@ -347,6 +368,7 @@ async def test_me_carries_the_composer_and_editor_limits(make_client) -> None:
     assert limits["instructions_max_chars"] == 111
     assert limits["memory_max_chars"] == 222
     assert limits["sections_per_message"] == 3
+    assert limits["section_heading_max_chars"] == 55
     assert limits["selection_max_chars"] == 444
 
 
@@ -530,7 +552,7 @@ async def test_the_context_route_shows_what_a_turn_would_send(chat_client) -> No
     }
     assert f"Current document: {DOC_PATH}" in parts["prompt"]["text"]
     assert with_document["turn"]["text"].endswith(
-        "- reader locale: zh-TW\n- answer language: ja\n- translation language: en"
+        f"- reader locale: zh-TW\n{ANSWER_JA}\n{translation_line('en')}"
     )
     # Reads only: the document was never materialized for it.
     assert not (user_root(client.app.state.settings.workspaces_dir, client.user_id)).exists()
@@ -620,6 +642,7 @@ async def test_sections_are_capped_and_never_a_message_alone(make_client, tmp_pa
         make_client(
             workspaces_dir=str(tmp_path / "ws"),
             chat_sections_per_message=2,
+            chat_section_heading_max_chars=20,
             chat_selection_max_chars=50,
         )
     )
@@ -628,7 +651,7 @@ async def test_sections_are_capped_and_never_a_message_alone(make_client, tmp_pa
     for sections in (
         [section] * 3,
         [{"heading": "  \u200b\n ", "text": "x"}],
-        [{"heading": "h" * 513, "text": "x"}],
+        [{"heading": "h" * 21, "text": "x"}],
         [{"heading": "Long", "text": "x" * 51}],
     ):
         refused = await send(client, conversation_id, text="Look", sections=sections)
@@ -639,7 +662,7 @@ async def test_sections_are_capped_and_never_a_message_alone(make_client, tmp_pa
         client,
         conversation_id,
         text="Look",
-        sections=[{"heading": "h" * 512, "text": "x" * 50}, {"heading": "Long", "text": None}],
+        sections=[{"heading": "h" * 20, "text": "x" * 50}, {"heading": "Long", "text": None}],
     )
     assert ok.status_code == 202, ok.text
 
@@ -655,9 +678,7 @@ async def test_the_turn_block_carries_the_readers_languages(chat_client) -> None
     async with client.app.state.sessionmaker() as db:
         stored = (await db.execute(select(Message))).scalars().one().content
     note = next(block for block in stored if block.get("context") == TURN_CONTEXT)["text"]
-    assert note.endswith(
-        "- reader locale: en\n- answer language: ja\n- translation language: zh-TW"
-    )
+    assert note.endswith(f"- reader locale: en\n{ANSWER_JA}\n{translation_line('zh-TW')}")
 
 
 @respx.mock
@@ -902,3 +923,200 @@ async def test_the_tool_refuses_what_it_cannot_do(chat_client) -> None:
     assert "No memory" in await tool(action="forget", id=f"m{theirs.memory_id}")
     async with sessionmaker() as db:
         assert (await db.get(Memory, theirs.memory_id)) is not None
+
+
+async def test_a_save_of_what_is_already_saved_adds_nothing(chat_client) -> None:
+    """A save cut off before its result was stored reads as interrupted on the replay, and
+    the agent makes it again: the reader keeps one memory, not two (docs/chat.md § Memory)."""
+    client = chat_client
+    settings = client.app.state.settings.model_copy(update={"chat_memories_max": 2})
+    conversation_id = await new_conversation(client)
+    sessionmaker = client.app.state.sessionmaker
+
+    async def save(tool_use_id: str, **fields):
+        tool_input = {
+            "action": "save",
+            "id": "",
+            "kind": "term",
+            "text": "query → 查詢",
+            "scope": "all",
+            **fields,
+        }
+        return await chat_memory.run_memory_tool(
+            sessionmaker,
+            settings,
+            user_id=client.user_id,
+            conversation_id=conversation_id,
+            document_id=client.document_id,
+            tool_use_id=tool_use_id,
+            tool_input=tool_input,
+        )
+
+    first = await save("toolu_1")
+    saved_id = first.memory["memory"]["id"]
+    # The same memory once cleaned: answered with its id, no row and no event.
+    again = await save("toolu_2", text=" query\n→ 查詢​ ")
+    assert (again.content, again.is_error, again.memory) == (
+        f"Already saved as m{saved_id}.",
+        False,
+        None,
+    )
+    # Another scope is another memory; at the cap, the same one still answers its id
+    # rather than saying the memory is full.
+    scoped = await save("toolu_3", scope="document")
+    assert scoped.memory is not None and scoped.memory["memory"]["id"] != saved_id
+    assert (await save("toolu_4", scope="document")).content == (
+        f"Already saved as m{scoped.memory['memory']['id']}."
+    )
+    assert "full" in (await save("toolu_5", kind="preference")).content
+    async with sessionmaker() as db:
+        rows = (await db.execute(select(Memory).order_by(Memory.id))).scalars().all()
+    assert [(row.source_ref, row.document_id) for row in rows] == [
+        ("toolu_1", None),
+        ("toolu_3", client.document_id),
+    ]
+
+
+async def test_control_characters_never_reach_a_stored_text(chat_client) -> None:
+    """NUL is refused by PostgreSQL's TEXT: every way a memory, the instructions or a
+    section's heading comes in is cleaned of it first, never answered with a 500."""
+    client = chat_client
+    saved = await save_memory(client, kind="term", text="a\x00b\x07")
+    assert saved["text"] == "ab"
+    edited = await client.put(
+        f"/api/memories/{saved['id']}", json={"text": "c\x00d"}, headers=CSRF_HEADERS
+    )
+    assert edited.status_code == 200 and edited.json()["text"] == "cd"
+    instructions = (await put_chat(client, instructions="Be\x00 brief.\n\tAlways.")).json()
+    assert instructions["instructions"] == "Be brief.\n\tAlways."
+    conversation_id = await new_conversation(client)
+    outcome = await chat_memory.run_memory_tool(
+        client.app.state.sessionmaker,
+        client.app.state.settings,
+        user_id=client.user_id,
+        conversation_id=conversation_id,
+        document_id=client.document_id,
+        tool_use_id="toolu_nul",
+        tool_input={"action": "save", "id": "", "kind": "about", "text": "x\x00y", "scope": "all"},
+    )
+    assert outcome.memory is not None and outcome.memory["memory"]["text"] == "xy"
+    sent = await send(
+        client,
+        conversation_id,
+        text="Look",
+        sections=[{"heading": "3.2\x00 Attention", "text": "Body."}],
+    )
+    assert sent.status_code == 202, sent.text
+    async with client.app.state.sessionmaker() as db:
+        stored = (await db.execute(select(Message))).scalars().one().content
+    assert [block.get("section") for block in stored if block.get("context") == "section"] == [
+        "3.2 Attention"
+    ]
+
+
+# --- the tool in a round ------------------------------------------------------------------
+
+
+def round_context() -> SimpleNamespace:
+    """What `_run_tools` reads of a turn, for a round of reads with no database behind it."""
+    return SimpleNamespace(
+        settings=SimpleNamespace(
+            chat_image_round_max_bytes=1000,
+            chat_image_turn_max_bytes=1000,
+            chat_page_image_max_pixels=1,
+            upload_max_bytes=1,
+            chat_bash_timeout_seconds=1,
+            sandbox_start_timeout_seconds=1,
+            sandbox_exec_grace_seconds=1,
+            chat_writer_grace_seconds=1,
+        ),
+        sessionmaker=None,
+        conversation=SimpleNamespace(id=1, session="s"),
+        paths=None,
+        document=SimpleNamespace(id=1),
+        decode_slot=asyncio.Semaphore(1),
+        job=SimpleNamespace(page_count=12, kind="pdf"),
+        render_slots=None,
+        sandbox=None,
+        turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
+        image_spent=0,
+        writers={},
+        write_gate=asyncio.Lock(),
+    )
+
+
+SAVED = chat_tools.ToolOutcome(
+    "Saved as m1.",
+    memory={
+        "action": "saved",
+        "memory": {"id": 1, "kind": "about", "text": "x", "document_id": None, "pinned": False},
+        "previous": None,
+    },
+)
+MEMORY_CALL = {
+    "type": "tool_use",
+    "id": "toolu_m",
+    "name": "memory",
+    "input": {"action": "save", "id": "", "kind": "about", "text": "x", "scope": "all"},
+}
+
+
+async def test_a_spent_image_budget_never_refuses_the_memory_tool(monkeypatch) -> None:
+    async def fake_memory_tool(sessionmaker, settings, **kwargs):
+        return SAVED
+
+    async def no_events(ctx, event, data):
+        return None
+
+    async def never_cancelled(ctx):
+        return False
+
+    monkeypatch.setattr(chat_memory, "run_memory_tool", fake_memory_tool)
+    monkeypatch.setattr(chat_runner, "_emit", no_events)
+    monkeypatch.setattr(chat_runner, "_cancelled", never_cancelled)
+    ctx = round_context()
+    ctx.image_spent = ctx.settings.chat_image_turn_max_bytes
+    page = {"type": "tool_use", "id": "p1", "name": "view_page", "input": {"page": 1}}
+    viewed, remembered = await chat_runner._run_tools(ctx, [page, MEMORY_CALL], set())
+    # The page is refused; the memory, which returns no image, is saved all the same.
+    assert viewed["content"] == chat_runner.IMAGE_TURN_BUDGET_SPENT
+    assert remembered["content"] == "Saved as m1." and "is_error" not in remembered
+
+
+async def test_a_cancel_never_parts_a_memorys_commit_from_its_events(monkeypatch) -> None:
+    """Cancelled between the row's commit and what reports it, the call runs on, and the
+    end of the turn waits for its tool_result and `memory` event, as it does for a write:
+    otherwise the reader keeps a memory the thread draws no line for."""
+    in_flight = asyncio.Event()
+    release = asyncio.Event()
+    emitted: list[tuple[str, dict]] = []
+
+    async def slow_memory_tool(sessionmaker, settings, **kwargs):
+        in_flight.set()
+        await release.wait()
+        return SAVED
+
+    async def record(ctx, event, data):
+        emitted.append((event, data))
+
+    async def never_cancelled(ctx):
+        return False
+
+    monkeypatch.setattr(chat_memory, "run_memory_tool", slow_memory_tool)
+    monkeypatch.setattr(chat_runner, "_emit", record)
+    monkeypatch.setattr(chat_runner, "_cancelled", never_cancelled)
+    ctx = round_context()
+    running = asyncio.create_task(chat_runner._run_tools(ctx, [MEMORY_CALL], set()))
+    await asyncio.wait_for(in_flight.wait(), 5)
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    assert list(ctx.writers.values()) == ["memory"] and emitted == []
+
+    settling = asyncio.create_task(chat_runner._settle_writers(ctx))
+    await asyncio.sleep(0.05)
+    assert not settling.done()
+    release.set()
+    await asyncio.wait_for(settling, 5)
+    assert [event for event, _ in emitted] == [chat_events.TOOL_RESULT, chat_events.MEMORY]
+    assert emitted[1][1]["tool_use_id"] == "toolu_m" and ctx.writers == {}

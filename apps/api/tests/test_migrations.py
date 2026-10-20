@@ -715,6 +715,20 @@ async def test_the_memory_migration_keeps_every_row_and_scopes_memories(scratch_
     _alembic(scratch_url, "upgrade", INSTRUCTIONS_AND_MEMORIES)
 
     async with engine.begin() as db:
+        indexes = dict(
+            (
+                await db.execute(
+                    text("SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'memories'")
+                )
+            ).all()
+        )
+        # What a document's delete and a conversation's look memories up by is indexed, so
+        # neither scans every reader's memories.
+        assert "(document_id) WHERE (document_id IS NOT NULL)" in indexes["ix_memories_document_id"]
+        assert (
+            "(conversation_id) WHERE (conversation_id IS NOT NULL)"
+            in (indexes["ix_memories_conversation_id"])
+        )
         setting = (
             (
                 await db.execute(

@@ -146,14 +146,17 @@ SELECTION_PREFIX = "The passage selected in the document:\n\n"
 # And the reply's quote before its passage (docs/chat.md § What a user message carries).
 QUOTE_PREFIX = "The user is replying to this passage of your earlier answer:\n\n"
 ATTACHMENT_EXPIRED = "An attachment is no longer available; attach it again"
-# The longest heading a section added to a message may have (docs/api.md).
-SECTION_HEADING_MAX_CHARS = 512
 
 
 # The per-turn context block (docs/chat.md § Prompt caching): what the model must know
 # about this message and may not learn from the cached prefix.
 TURN_CONTEXT = "turn"
 SECTION_CONTEXT = "section"
+# What each language line of the turn block says beside the tag: the rule travels with the
+# line, not with a prompt or a skill the reader may have replaced (docs/chat.md
+# § Instructions).
+ANSWER_LANGUAGE_RULE = "(the reader's choice: answer in it, whatever the locale)"
+TRANSLATION_LANGUAGE_RULE = "(the reader's choice: translate into it unless told otherwise)"
 
 
 def turn_note(
@@ -163,7 +166,8 @@ def turn_note(
     translate_language: str | None,
 ) -> str:
     """The turn block: the document's revision, the reader's locale and the languages the
-    reader chose on the Agent page, each line only when chosen (docs/chat.md
+    reader chose on the Agent page, each line only when chosen and stating its own rule, so
+    it holds under a replaced or migrated prompt and an edited `translate` (docs/chat.md
     § Instructions)."""
     lines = [
         "Context for this message:",
@@ -171,9 +175,9 @@ def turn_note(
         f"- reader locale: {locale}",
     ]
     if answer_language:
-        lines.append(f"- answer language: {answer_language}")
+        lines.append(f"- answer language: {answer_language} {ANSWER_LANGUAGE_RULE}")
     if translate_language:
-        lines.append(f"- translation language: {translate_language}")
+        lines.append(f"- translation language: {translate_language} {TRANSLATION_LANGUAGE_RULE}")
     return "\n".join(lines)
 
 
@@ -541,9 +545,10 @@ def _checked_sections(
     sections: list[SectionIn], settings: AppSettings
 ) -> list[tuple[str, str | None]]:
     """The sections as `(heading, text)`, refused past the deployment's caps: their number
-    (`CHAT_SECTIONS_PER_MESSAGE`), a heading empty or longer than 512 characters, a text
-    past `CHAT_SELECTION_MAX_CHARS` — a section that long is sent with no text (docs/api.md).
-    The heading is one line, cleaned like a memory: it is shown and quoted back."""
+    (`CHAT_SECTIONS_PER_MESSAGE`), a heading empty or past `CHAT_SECTION_HEADING_MAX_CHARS`,
+    a text past `CHAT_SELECTION_MAX_CHARS` — a section that long is sent with no text
+    (docs/api.md). The heading is one line, cleaned like a memory: it is shown and quoted
+    back."""
     if len(sections) > settings.chat_sections_per_message:
         raise ApiError(
             400,
@@ -553,11 +558,11 @@ def _checked_sections(
     checked: list[tuple[str, str | None]] = []
     for section in sections:
         heading = memory_defs.clean_text(section.heading, single_line=True)
-        if not heading or len(heading) > SECTION_HEADING_MAX_CHARS:
+        if not heading or len(heading) > settings.chat_section_heading_max_chars:
             raise ApiError(
                 400,
                 "invalid_request",
-                f"A section's heading is 1 to {SECTION_HEADING_MAX_CHARS} characters",
+                f"A section's heading is 1 to {settings.chat_section_heading_max_chars} characters",
             )
         text = section.text.strip() if section.text is not None else None
         if text is not None and len(text) > settings.chat_selection_max_chars:

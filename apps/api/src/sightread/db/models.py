@@ -595,6 +595,21 @@ class Memory(Base):
     __tablename__ = "memories"
     __table_args__ = (
         Index("ix_memories_user_updated", "user_id", "updated_at"),
+        # What a document's delete (CASCADE) and a conversation's (SET NULL) look rows up
+        # by: without them every such delete scans every reader's memories
+        # (docs/database.md).
+        Index(
+            "ix_memories_document_id",
+            "document_id",
+            postgresql_where=text("document_id IS NOT NULL"),
+            sqlite_where=text("document_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_memories_conversation_id",
+            "conversation_id",
+            postgresql_where=text("conversation_id IS NOT NULL"),
+            sqlite_where=text("conversation_id IS NOT NULL"),
+        ),
         CheckConstraint(
             "kind IN ('term', 'preference', 'about', 'document')", name="ck_memories_kind"
         ),
