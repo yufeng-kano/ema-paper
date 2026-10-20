@@ -14,6 +14,7 @@
 
 const TEXT_NODE = 3
 const ELEMENT_NODE = 1
+const DOCUMENT_FRAGMENT_NODE = 11
 
 /** The subset of `Node`/`Element` the serializer reads. Real DOM nodes satisfy it. */
 export interface MarkdownNode {
@@ -415,4 +416,114 @@ export function nodesToMarkdown(
   walkNodes(Array.from(nodes), walk, list)
   flush(walk)
   return walk.blocks.join('\n\n')
+}
+
+// --- the selection the agent is sent ------------------------------------------------------
+
+/** Elements that start a line of their own in the plain text. */
+const LINE_TAGS = new Set([
+  'address', 'article', 'blockquote', 'dd', 'div', 'dl', 'dt', 'figcaption', 'figure', 'h1', 'h2', 'h3', 'h4',
+  'h5', 'h6', 'li', 'ol', 'p', 'pre', 'section', 'table', 'tbody', 'thead', 'tr', 'ul',
+])
+
+/** The TeX a KaTeX element was typeset from, as its MathML annotation carries it. */
+function annotationOf(node: MarkdownNode): string | null {
+  if (tag(node) === 'annotation' && attribute(node, 'encoding') === 'application/x-tex') {
+    return node.textContent ?? ''
+  }
+  for (const child of children(node)) {
+    const found = annotationOf(child)
+    if (found !== null) {
+      return found
+    }
+  }
+  return null
+}
+
+/** A formula as the TeX it was written in, or null for anything else. The viewer's own
+ *  math carries its source (`data-tex`, `data-md`), whole even in a clone a selection
+ *  boundary cut short; any other KaTeX has its annotation. */
+function formulaSource(node: MarkdownNode, display: boolean): string | null {
+  const own = classes(node)
+  if (own.includes('md-inline-math')) {
+    return attribute(node, 'data-tex')
+  }
+  if (own.includes('md-math-block')) {
+    return attribute(node, 'data-md')
+  }
+  if (own.includes('katex')) {
+    const tex = annotationOf(node)?.trim()
+    if (tex) {
+      return display ? `$$${tex}$$` : `$${tex}$`
+    }
+  }
+  return null
+}
+
+/** A line ends here: a block's edge, or a `<br>`. */
+const BREAK = Symbol('break')
+
+/** A run of text; `pre` keeps its own spacing and lines, as a code block shows them. */
+type PlainPart = { text: string; pre: boolean } | typeof BREAK
+
+function plainParts(node: MarkdownNode, out: PlainPart[], display: boolean, pre: boolean): void {
+  if (node.nodeType === TEXT_NODE) {
+    const text = node.textContent ?? ''
+    out.push({ text: pre ? text : text.replace(/\s+/g, ' '), pre })
+    return
+  }
+  if (node.nodeType !== ELEMENT_NODE && node.nodeType !== DOCUMENT_FRAGMENT_NODE) {
+    return
+  }
+  // A block an open editor holds is not on the page, so not in what the reader selected.
+  if (attribute(node, 'hidden') !== null) {
+    return
+  }
+  const formula = formulaSource(node, display)
+  if (formula !== null) {
+    out.push({ text: formula, pre: true })
+    return
+  }
+  const name = tag(node)
+  if (name === 'br') {
+    out.push(BREAK)
+    return
+  }
+  const line = LINE_TAGS.has(name)
+  if (line) {
+    out.push(BREAK)
+  }
+  for (const child of children(node)) {
+    plainParts(child, out, display || classes(node).includes('katex-display'), pre || name === 'pre')
+  }
+  if (line) {
+    out.push(BREAK)
+  }
+}
+
+/**
+ * The selection fragment as the plain text it reads as — a line per block, words as the
+ * page shows them — with each formula as its TeX between `$…$` (`$$…$$` on display). This is
+ * what the agent is sent as the reader's selection: the selection's own `toString()` reads
+ * both of KaTeX's renderings, so `$d_{model}$` reached it as `𝑑 𝑚 𝑜 𝑑 𝑒 𝑙 d model`.
+ */
+export function selectionText(nodes: ArrayLike<MarkdownNode>): string {
+  const parts: PlainPart[] = []
+  for (const node of Array.from(nodes)) {
+    plainParts(node, parts, false, false)
+  }
+  let text = ''
+  for (const part of parts) {
+    if (part === BREAK) {
+      // One line break however many block edges meet here, and no space left before it.
+      text = text.replace(/ +$/, '')
+      if (text && !text.endsWith('\n')) {
+        text += '\n'
+      }
+    } else {
+      const lineStart = text === '' || text.endsWith('\n')
+      text += lineStart && !part.pre ? part.text.replace(/^ +/, '') : part.text
+    }
+  }
+  return text.trim()
 }
