@@ -28,6 +28,8 @@ export type DragClaim =
   | 'target'
   /** The open folder's list is under the pointer — where dropped files land. */
   | 'list'
+  /** A block of the result viewer is under a block being dragged — where it would land. */
+  | 'block'
 
 const claims = new WeakMap<DragEvent, DragClaim>()
 

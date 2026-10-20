@@ -98,6 +98,18 @@
   margin-top: var(--space-2);
 }
 
+/* A quote: its blocks inset behind a bar, at whatever size the surface sets (docs/web.md
+   § Result viewer). One level: what it holds never holds a quote of its own. */
+.md-quote {
+  margin: 0;
+  padding-left: var(--space-3);
+  border-left: 2px solid var(--edge);
+}
+
+.md-quote > * + * {
+  margin-top: var(--space-3);
+}
+
 /* The table's own scroll axis: wider than the reading measure, it slides in place rather
    than stretching the page — the prose column's width is fixed (docs/web.md). */
 .md-table-wrap {

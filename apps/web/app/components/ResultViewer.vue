@@ -1155,12 +1155,13 @@ function figureKey(page: number, bbox: Bbox): string {
   return `${page}/${bbox.join(',')}`
 }
 
-/** The crop to load for a figure block, or null for the placeholder. */
-function figureUrl(page: number, block: ResultBlock): string | null {
-  if (block.kind !== 'fig' || !props.figureBase || failedCrops.has(figureKey(page, block.bbox))) {
+/** The crop to load for a figure block — by its own page, which a move does not change
+ *  (docs/web.md § Result viewer) — or null for the placeholder. */
+function figureUrl(block: ResultBlock): string | null {
+  if (block.kind !== 'fig' || !props.figureBase || failedCrops.has(figureKey(block.page, block.bbox))) {
     return null
   }
-  return `${props.figureBase}/${figureKey(page, block.bbox)}`
+  return `${props.figureBase}/${figureKey(block.page, block.bbox)}`
 }
 
 function onFigureError(page: number, bbox: Bbox) {
@@ -1545,8 +1546,7 @@ const awaitingContent = computed(
                       <div v-else-if="block.kind === 'fig'" class="figure-edit">
                         <MdBlock
                           :block="{ ...block, caption: null }"
-                          :page="page.page"
-                          :figure-url="figureUrl(page.page, block)"
+                          :figure-url="figureUrl(block)"
                           @figure-error="onFigureError"
                         />
                         <RichEditor
@@ -1578,8 +1578,7 @@ const awaitingContent = computed(
                     <MdBlock
                       v-else
                       :block="block"
-                      :page="page.page"
-                      :figure-url="figureUrl(page.page, block)"
+                      :figure-url="figureUrl(block)"
                       @figure-error="onFigureError"
                     />
                   </div>

@@ -135,6 +135,221 @@ export function foldsOf(placed: readonly PlacedBlock[], outline: readonly Outlin
   return folds
 }
 
+function isHeading(entry: PlacedBlock): boolean {
+  return entry.block.kind === 'h2' || entry.block.kind === 'h3'
+}
+
+/** How many shared blocks a move's rotation may take back from either side. */
+const TWIN_REACH = 4
+
+/** The `turn` for which blocks `start`… of `to`, `width` of them, are those of `from` rotated
+ *  left by it, or null. */
+function blockRotation(from: readonly string[], to: readonly string[], start: number, width: number): number | null {
+  for (let turn = 1; turn < width; turn += 1) {
+    let rotated = true
+    for (let at = 0; at < width && rotated; at += 1) {
+      rotated = to[start + at] === from[start + ((at + turn) % width)]
+    }
+    if (rotated) {
+      return turn
+    }
+  }
+  return null
+}
+
+/**
+ * Where each block of `before` stands in `after`, by positions in `placedBlocks`, null for one
+ * that is gone (docs/web.md § Result viewer, *A fold follows its heading through an edit*). The
+ * blocks both versions open and close with keep their order. Between them, a run moved past
+ * another is the same blocks rotated, each carried to its new place; anything else was
+ * replaced, and only its headings are followed — by their source, in order, and a renamed one
+ * paired with the new heading between the same two kept ones, where as many came as went.
+ */
+export function followBlocks(before: readonly PlacedBlock[], after: readonly PlacedBlock[]): (number | null)[] {
+  const from = before.map((entry) => entry.block.src)
+  const to = after.map((entry) => entry.block.src)
+  let head = 0
+  while (head < from.length && head < to.length && from[head] === to[head]) {
+    head += 1
+  }
+  let tail = 0
+  while (tail < from.length - head && tail < to.length - head && from[from.length - 1 - tail] === to[to.length - 1 - tail]) {
+    tail += 1
+  }
+  const fromEnd = from.length - tail
+  const toEnd = to.length - tail
+  const map = from.map((_, index) => (index < head ? index : index >= fromEnd ? index - fromEnd + toEnd : null))
+  if (from.length === to.length && head < fromEnd) {
+    // A run moved next to its twin starts with blocks the shared head or tail already took,
+    // so they are given back a block at a time until the rotation shows.
+    for (let back = 0; back <= Math.min(TWIN_REACH, head); back += 1) {
+      for (let forward = 0; forward <= Math.min(TWIN_REACH, tail); forward += 1) {
+        const start = head - back
+        const width = fromEnd + forward - start
+        const turn = blockRotation(from, to, start, width)
+        if (turn === null) {
+          continue
+        }
+        for (let at = 0; at < width; at += 1) {
+          map[start + ((at + turn) % width)] = start + at
+        }
+        return map
+      }
+    }
+  }
+  const went: number[] = []
+  for (let index = head; index < fromEnd; index += 1) {
+    if (isHeading(before[index]!)) {
+      went.push(index)
+    }
+  }
+  const came: number[] = []
+  for (let index = head; index < toEnd; index += 1) {
+    if (isHeading(after[index]!)) {
+      came.push(index)
+    }
+  }
+  // Kept by source, in order: each heading takes the first new one after the last taken.
+  const kept: [number, number][] = [[head - 1, head - 1]]
+  let next = 0
+  for (const index of went) {
+    const found = came.findIndex((other, at) => at >= next && to[other] === from[index])
+    if (found !== -1) {
+      map[index] = came[found]!
+      kept.push([index, came[found]!])
+      next = found + 1
+    }
+  }
+  kept.push([fromEnd, toEnd])
+  // Renamed: between two kept headings, as many new ones as old ones are the same ones.
+  for (let gap = 1; gap < kept.length; gap += 1) {
+    const [fromStart, toStart] = kept[gap - 1]!
+    const [fromStop, toStop] = kept[gap]!
+    const old = went.filter((index) => index > fromStart && index < fromStop)
+    const renamed = came.filter((index) => index > toStart && index < toStop)
+    if (old.length === renamed.length) {
+      old.forEach((index, at) => {
+        map[index] = renamed[at]!
+      })
+    }
+  }
+  return map
+}
+
+/**
+ * The collapsed headings after an edit (docs/web.md § Result viewer, *A fold follows its heading
+ * through an edit*): each fold moves to its own heading's new slug — which repeated headings,
+ * numbered in document order, change whenever one of them is added, deleted, moved or renamed —
+ * and a fold whose heading is gone is dropped.
+ */
+export function followFolds(
+  before: readonly PlacedBlock[],
+  beforeOutline: readonly OutlineEntry[],
+  after: readonly PlacedBlock[],
+  afterOutline: readonly OutlineEntry[],
+  collapsed: ReadonlySet<string>,
+): Set<string> {
+  const map = followBlocks(before, after)
+  const beforeAt = new Map(before.map((entry, index) => [blockKey(entry), index]))
+  const afterAt = new Map(after.map((entry, index) => [blockKey(entry), index]))
+  const slugAt = new Map(afterOutline.map((entry) => [afterAt.get(blockKey(entry)), entry.slug]))
+  const followed = new Set<string>()
+  for (const entry of beforeOutline) {
+    const index = beforeAt.get(blockKey(entry))
+    const moved = index === undefined ? null : (map[index] ?? null)
+    const slug = moved === null ? undefined : slugAt.get(moved)
+    if (collapsed.has(entry.slug) && slug !== undefined) {
+      followed.add(slug)
+    }
+  }
+  return followed
+}
+
+/**
+ * The collapsed headings whose sections hold block `index` of `placedBlocks` — all of them, so a
+ * fold inside a fold opens with it (docs/web.md § Result viewer, *What leads into a fold opens
+ * it*). A heading's own fold does not hold it: the heading is what the reader is taken to.
+ */
+export function foldsOver(
+  placed: readonly PlacedBlock[],
+  outline: readonly OutlineEntry[],
+  collapsed: ReadonlySet<string>,
+  index: number,
+): string[] {
+  const at = new Map(placed.map((entry, position) => [blockKey(entry), position]))
+  return outline
+    .filter((entry) => {
+      const heading = at.get(blockKey(entry))
+      if (!collapsed.has(entry.slug) || heading === undefined) {
+        return false
+      }
+      const { start, end } = sectionExtent(placed, heading)
+      return index >= start && index < end
+    })
+    .map((entry) => entry.slug)
+}
+
+/**
+ * The blocks of `after` whose source `before` did not have, by their positions in `placedBlocks`
+ * — where an edit the viewer did not make landed (docs/web.md § Result viewer, *What leads into a
+ * fold opens it*). Counted, so a paragraph written once more is new once. Comments draw nothing,
+ * so none is new.
+ */
+export function changedBlocks(before: readonly PlacedBlock[], after: readonly PlacedBlock[]): number[] {
+  const left = new Map<string, number>()
+  for (const entry of before) {
+    left.set(entry.block.src, (left.get(entry.block.src) ?? 0) + 1)
+  }
+  const changed: number[] = []
+  after.forEach((entry, index) => {
+    const count = left.get(entry.block.src) ?? 0
+    if (count > 0) {
+      left.set(entry.block.src, count - 1)
+    } else if (entry.block.kind !== 'comment') {
+      changed.push(index)
+    }
+  })
+  return changed
+}
+
+/** The most documents whose folds the browser keeps: `localStorage` is small, and shared. */
+export const FOLD_MEMORY_LIMIT = 100
+
+/** The folds remembered per document — `doc:<id>` on Files, `job:<id>` on History — with when
+ *  each was last set, so the oldest are the ones let go. */
+export type FoldMemory = Record<string, { slugs: string[]; at: number }>
+
+/** The remembered folds as stored: anything unreadable is nothing remembered. */
+export function readFoldMemory(raw: string | null): FoldMemory {
+  try {
+    const parsed: unknown = JSON.parse(raw ?? '{}')
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return {}
+    }
+    const memory: FoldMemory = {}
+    for (const [id, entry] of Object.entries(parsed as Record<string, unknown>)) {
+      const { slugs, at } = (entry ?? {}) as { slugs?: unknown; at?: unknown }
+      if (Array.isArray(slugs) && typeof at === 'number') {
+        memory[id] = { slugs: slugs.filter((slug): slug is string => typeof slug === 'string'), at }
+      }
+    }
+    return memory
+  } catch {
+    return {}
+  }
+}
+
+/** The memory with one document's folds set — none forgets it — keeping the `limit` most
+ *  recently set. */
+export function rememberFolds(memory: FoldMemory, id: string, slugs: Iterable<string>, now: number, limit = FOLD_MEMORY_LIMIT): FoldMemory {
+  const list = [...new Set(slugs)]
+  const entries = Object.entries(memory).filter(([key]) => key !== id)
+  if (list.length) {
+    entries.push([id, { slugs: list, at: now }])
+  }
+  return Object.fromEntries(entries.sort(([, a], [, b]) => b.at - a.at).slice(0, limit))
+}
+
 // --- rows: what the keyboard and a move step over ---------------------------------------------
 
 /**
@@ -348,16 +563,56 @@ export function revertSpans(text: string, spans: readonly Span[]): string {
     .reduce((out, span) => `${out.slice(0, span.at)}${span.removed}${out.slice(span.at + span.inserted.length)}`, text)
 }
 
-/** The stretches of the resulting text an undo (or redo) put back: where to select. */
+/** The stretches of the resulting text an undo (or redo) put back: where to select. A step
+ *  that puts nothing back — a delete, redone — gives the point where the text went, so the
+ *  block now standing there can be selected. */
 export function restoredRanges(spans: readonly Span[], direction: 'undo' | 'redo'): { start: number; end: number }[] {
-  if (direction === 'redo') {
-    // Applied forward, each span's insertion stands at its own place once the later spans
-    // have gone in after it.
-    return spans.filter((span) => span.inserted).map((span) => ({ start: span.at, end: span.at + span.inserted.length }))
+  // Applied forward, each span's insertion stands at its own place once the later spans have
+  // gone in after it. Reverted last first, the first span's removal is back where it was; with
+  // two spans (a move) the second was taken out after it, beyond it, so it holds.
+  const back = (span: Span) => (direction === 'redo' ? span.inserted : span.removed)
+  const ranges = spans.filter((span) => back(span)).map((span) => ({ start: span.at, end: span.at + back(span).length }))
+  return ranges.length ? ranges : spans.slice(0, 1).map((span) => ({ start: span.at, end: span.at }))
+}
+
+/**
+ * The blocks a stretch of the file holds, by their positions in `placedBlocks`: each block at
+ * least half inside one of `ranges`, or holding all of it. A diff puts a change as late as the
+ * text allows, so a restored block's stretch can start a few characters into it and run as far
+ * into the next one — `Two.` deleted before `Three.` comes back as `wo.\n\nT` — and touching a
+ * block is not enough. An empty range, or one that holds no block, gives the block at that point
+ * or the first after it. Comments are never among them; nothing is selected that draws nothing.
+ */
+export function blocksInRanges(
+  markdown: string,
+  placed: readonly PlacedBlock[],
+  ranges: readonly { start: number; end: number }[],
+): number[] {
+  const found = new Set<number>()
+  let cursor = 0
+  const spans = placed.map((entry) => {
+    const start = markdown.indexOf(entry.block.src, cursor)
+    if (start === -1 || entry.block.kind === 'comment') {
+      return null
+    }
+    cursor = start + entry.block.src.length
+    return { start, end: cursor }
+  })
+  for (const range of ranges) {
+    const held = spans.flatMap((span, index) => {
+      if (!span) {
+        return []
+      }
+      const overlap = Math.min(span.end, range.end) - Math.max(span.start, range.start)
+      const within = span.start <= range.start && range.end <= span.end
+      return overlap > 0 && (overlap * 2 >= span.end - span.start || within) ? [index] : []
+    })
+    const point = spans.findIndex((span) => span !== null && span.end > range.start)
+    for (const index of held.length ? held : point === -1 ? [] : [point]) {
+      found.add(index)
+    }
   }
-  // Reverted last first, the first span's removal is back where it was; with two spans (a
-  // move) the second was taken out after it, beyond it, so it holds.
-  return spans.filter((span) => span.removed).map((span) => ({ start: span.at, end: span.at + span.removed.length }))
+  return [...found].sort((a, b) => a - b)
 }
 
 /** What undo or redo hands back: the file, its text as it now is, and what was put back. */

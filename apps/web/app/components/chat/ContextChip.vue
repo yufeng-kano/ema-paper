@@ -16,15 +16,19 @@ defineProps<{
   removeLabel?: string
   /** What a cut text stands for in full — a section's heading. */
   tooltip?: string
+  /** Why it cannot be sent — a passage past the server's cap — drawn in the danger hue, as a
+   *  refused attachment is. */
+  refusal?: string
 }>()
 
 const emit = defineEmits<{ remove: [] }>()
 </script>
 
 <template>
-  <span class="chip" :class="{ faint }">
+  <span class="chip" :class="{ faint, refused: refusal }">
     <UiIcon :name="icon" />
     <span class="chip-text" :title="tooltip">{{ text }}</span>
+    <span v-if="refusal" class="chip-reason">{{ refusal }}</span>
     <button
       v-if="removeLabel"
       type="button"
@@ -65,6 +69,19 @@ const emit = defineEmits<{ remove: [] }>()
 
 .chip.faint {
   color: var(--faint);
+}
+
+.chip.refused {
+  border-color: var(--danger-edge);
+  color: var(--danger);
+}
+
+.chip.refused > :deep(svg) {
+  color: var(--danger);
+}
+
+.chip-reason {
+  flex: none;
 }
 
 .chip-text {

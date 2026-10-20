@@ -15,14 +15,22 @@
  * The search runs over the document's text as one string with an offset map back into its
  * text nodes, not node by node, so a phrase that runs through a bold word is one hit rather
  * than none. KaTeX subtrees are skipped: a typeset formula is a tree of per-glyph spans plus
- * a hidden MathML twin, which yields fragments and doubles every hit.
+ * a hidden MathML twin, which yields fragments and doubles every hit. So are the viewer's own
+ * controls drawn among the blocks (`data-chrome`: handles, chevrons, fold notes, markers) and
+ * the blocks an open editor holds, whose text the editor shows — but not the blocks a
+ * collapsed section hides (`.folded`): a hit there counts like any other, and becoming the
+ * current one asks the viewer to open its section (docs/web.md § Result viewer).
  */
 const props = defineProps<{
   /** The scrolling document pane — what is searched, and what is scrolled to a hit. */
   scroller: HTMLElement | null
 }>()
 
-const emit = defineEmits<{ close: [] }>()
+const emit = defineEmits<{
+  close: []
+  /** The current hit is in a block a collapsed section hides, by its `data-block`. */
+  expand: [block: string]
+}>()
 
 const { t } = useI18n()
 
@@ -68,7 +76,9 @@ function scan(reset: boolean): void {
 
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
     acceptNode: (node) =>
-      node.parentElement?.closest('.katex') ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT,
+      node.parentElement?.closest('.katex, [data-chrome], [hidden]:not(.folded)')
+        ? NodeFilter.FILTER_REJECT
+        : NodeFilter.FILTER_ACCEPT,
   })
 
   // Empty text nodes are dropped rather than recorded: they would give two parts the same
@@ -117,7 +127,7 @@ function scan(reset: boolean): void {
   hits.value = found
   current.value = reset || !found.length ? 0 : Math.min(current.value, found.length - 1)
   paint()
-  reveal()
+  void reveal()
 }
 
 function paint(): void {
@@ -142,11 +152,17 @@ function paint(): void {
  *  technically visible and practically missed. */
 const MARGIN = 48
 
-function reveal(): void {
+async function reveal(): Promise<void> {
   const box = props.scroller
   const range = hits.value[current.value]
   if (!box || !range) {
     return
+  }
+  // A hit a fold hides is opened first, so stepping never lands on text the reader cannot see.
+  const folded = range.startContainer.parentElement?.closest<HTMLElement>('.block.folded')
+  if (folded?.dataset.block) {
+    emit('expand', folded.dataset.block)
+    await nextTick()
   }
   const rect = range.getBoundingClientRect()
   const view = box.getBoundingClientRect()
@@ -168,7 +184,7 @@ function step(delta: number): void {
   }
   current.value = (current.value + delta + hits.value.length) % hits.value.length
   paint()
-  reveal()
+  void reveal()
 }
 
 function onKey(event: KeyboardEvent): void {
@@ -200,9 +216,28 @@ const count = computed(() => {
  * results), and a range into a replaced node is dead — it stops painting and stops scrolling
  * anywhere. Re-scanning on mutation is what keeps the count honest while a parse is running.
  * Painting cannot re-trigger this: the highlight API colours ranges without touching the DOM.
+ * A mutation that only draws or takes away the viewer's controls — a handle under a moving
+ * pointer, and the placeholder comment Vue leaves where it was — changes no text and rescans
+ * nothing.
  */
 let observer: MutationObserver | null = null
 let pending: ReturnType<typeof setTimeout> | null = null
+
+function inChrome(node: Node): boolean {
+  return Boolean((node instanceof Element ? node : node.parentElement)?.closest('[data-chrome]'))
+}
+
+function changesText(record: MutationRecord): boolean {
+  if (inChrome(record.target)) {
+    return false
+  }
+  if (record.type !== 'childList') {
+    return true
+  }
+  return [...record.addedNodes, ...record.removedNodes].some(
+    (node) => node.nodeType !== Node.COMMENT_NODE && !(node instanceof Element && node.hasAttribute('data-chrome')),
+  )
+}
 
 function observe(root: HTMLElement | null): void {
   observer?.disconnect()
@@ -210,7 +245,10 @@ function observe(root: HTMLElement | null): void {
   if (!root) {
     return
   }
-  observer = new MutationObserver(() => {
+  observer = new MutationObserver((records) => {
+    if (!records.some(changesText)) {
+      return
+    }
     if (pending) {
       clearTimeout(pending)
     }

@@ -19,9 +19,11 @@ import {
   formatBytes,
   isImageFile,
   matchCommands,
+  passageTooLong,
   refuseAttachment,
   sectionHeading,
   sectionText,
+  type AskOutcome,
   type AskRequest,
   type AttachmentRefusal,
   type CommandOption,
@@ -86,8 +88,17 @@ let capturedByPointer = false
  *  cleared or overwritten just after the reader chose what goes. */
 let focusReturning = false
 
+/** The selection was asked for by the reader's view: chosen by blocks, it stays until the
+ *  reader removes it, sends it or comes back with another passage selected — a reading that
+ *  finds nothing does not clear it. */
+let selectionAsked = false
+
 function captureSelection() {
-  selection.value = props.documentSelection() || null
+  const read = props.documentSelection() || null
+  if (read !== null || !selectionAsked) {
+    selection.value = read
+    selectionAsked = false
+  }
 }
 
 function captureOnPointer() {
@@ -123,6 +134,10 @@ function expectFocusReturn() {
 
 /** The passage, as its chip shows it: its first words on one line. */
 const selectionPreview = computed(() => selection.value?.replace(/\s+/g, ' ').trim() ?? '')
+
+/** A passage past the server's cap is shown and holds Send, never cut: a cut passage would
+ *  pass for the whole one. */
+const selectionTooLong = computed(() => passageTooLong(selection.value, props.limits?.selection_max_chars))
 
 // --- whole sections ----------------------------------------------------------------------
 
@@ -193,6 +208,7 @@ async function refocusAfterRemove(index: number) {
 
 function removeSelection() {
   selection.value = null
+  selectionAsked = false
   void refocusAfterRemove(0)
 }
 
@@ -640,6 +656,7 @@ const canSend = computed(
   () =>
     !props.running &&
     !sending.value &&
+    !selectionTooLong.value &&
     (draft.value.trim() !== '' || command.value !== null || pending.value.some((item) => item.state !== 'refused')),
 )
 
@@ -701,6 +718,7 @@ async function send() {
     }
     if (selection.value === payload.selection) {
       selection.value = null
+      selectionAsked = false
     }
     addedSections.value = addedSections.value.filter((section) => !sentSections.includes(section))
     if (quote.value === payload.quote) {
@@ -736,33 +754,54 @@ function setCommand(name: string) {
 
 /**
  * Puts what the reader's view asks for into the composer — a passage as the selection, a
- * whole section, a command — and focuses it. With `send`, it goes at once, but only while
- * nothing runs and the reader had typed nothing: a draft is never sent for them.
+ * whole section, a command (docs/web.md § The agent panel, *Asked from the document*). With
+ * `send` it goes at once only while nothing runs and the composer held nothing before it —
+ * no draft, no command, no chip, quote or attachment — so a command acts on what the reader
+ * just pointed at alone; otherwise it waits for Send, with focus, unless a turn is running.
+ * A section the composer has no room for is not added, and then nothing is.
  */
-async function ask(request: AskRequest) {
-  const untouched = draft.value.trim() === ''
-  if (request.selection !== undefined) {
-    selection.value = request.selection.trim() || null
-  }
+async function ask(request: AskRequest): Promise<AskOutcome> {
+  const clean =
+    draft.value.trim() === '' &&
+    command.value === null &&
+    selection.value === null &&
+    !addedSections.value.length &&
+    quote.value === null &&
+    !pending.value.length
   if (request.section) {
     const { heading, text } = request.section
     const entry = props.outline.find((candidate) => candidate.text === heading)
-    addSection({
-      key: entry ? entryKey(entry) : `heading:${heading}`,
-      heading,
-      plain: entry?.plain ?? inlinePlain(heading),
-      text: text === null ? null : sectionText(text, props.limits?.selection_max_chars),
-    })
+    const key = entry ? entryKey(entry) : `heading:${heading}`
+    if (!addedSections.value.some((added) => added.key === key)) {
+      if (sectionsFull.value) {
+        return 'full'
+      }
+      addSection({
+        key,
+        heading,
+        plain: entry?.plain ?? inlinePlain(heading),
+        text: text === null ? null : sectionText(text, props.limits?.selection_max_chars),
+      })
+    }
+  }
+  if (request.selection !== undefined) {
+    selection.value = request.selection.trim() || null
+    selectionAsked = selection.value !== null
   }
   if (request.command) {
     setCommand(request.command)
   }
   await nextTick()
+  if (request.send && clean && !props.running && !sending.value && !selectionTooLong.value) {
+    await send()
+    return 'sent'
+  }
+  if (props.running) {
+    return 'kept'
+  }
   expectFocusReturn()
   focus()
-  if (request.send && untouched && !props.running && !sending.value) {
-    await send()
-  }
+  return 'focused'
 }
 
 defineExpose({ addFiles, setQuote, focus, ask })
@@ -841,6 +880,9 @@ defineExpose({ addFiles, setQuote, focus, ask })
           v-if="selection"
           icon="text-quote"
           :text="selectionPreview"
+          :refusal="
+            selectionTooLong ? t('chat.context.selectionTooLong', { max: limits?.selection_max_chars }) : undefined
+          "
           :remove-label="t('chat.context.removeSelection')"
           @remove="removeSelection"
         />

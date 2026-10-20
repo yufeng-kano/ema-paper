@@ -21,8 +21,15 @@
  * context, and a menu that clips at the panel edge is not a menu. Inside a dialog it goes to
  * the dialog's panel instead (`modalPanelKey`), which is still above every scroll container
  * in it, and the only place `aria-modal` leaves visible to assistive tech.
+ *
+ * An item with `children` flies a submenu out beside its row — a second surface teleported
+ * beside this one rather than drawn inside it, where the scrolling box would clip it, and
+ * counted as inside: a press, a scroll or a right-click in it closes nothing. It opens on a
+ * press, on ArrowRight or Enter with its first item highlighted, or when the pointer rests on
+ * the row; another row takes over only after a longer rest, so a diagonal path to the
+ * submenu does not lose it on the way. ArrowLeft or Escape goes back to the row.
  */
-import { heightAbove, modalPanelKey, placeMenu, type MenuFact, type MenuItem, type Point } from '~/lib/menu'
+import { heightAbove, modalPanelKey, placeMenu, placeSubmenu, type MenuFact, type MenuItem, type Point } from '~/lib/menu'
 
 const props = defineProps<{
   /** Where the gesture happened, in viewport coordinates. */
@@ -64,14 +71,28 @@ const position = ref<Point>({ x: -9999, y: -9999 })
 const origin = ref('left top')
 /** Restored on unmount: closing a menu must not drop focus on `<body>`. */
 let previouslyFocused: HTMLElement | null = null
+// `resolveComponent` is only valid at setup: an item is a link where it is a destination.
+const NuxtLinkComponent = resolveComponent('NuxtLink')
+
+/** The submenu: the row it belongs to, by key, and where it is drawn. */
+const sub = ref<HTMLElement | null>(null)
+const subKey = ref<string | null>(null)
+const subPosition = ref<Point>({ x: -9999, y: -9999 })
+const subOrigin = ref('left top')
+const subItem = computed(() => props.items.find((item) => item.key === subKey.value && item.children?.length) ?? null)
+/** How long the pointer rests on a row before its submenu opens, and before another row
+ *  takes over from an open one (docs/web.md § Design system, *Primitives*). */
+const SUBMENU_OPEN_MS = 150
+const SUBMENU_TAKEOVER_MS = 300
+let restTimer: ReturnType<typeof setTimeout> | undefined
 
 /** Items are buttons, or links where the item is a destination — both are options here. */
-function options(): HTMLElement[] {
-  return [...(menu.value?.querySelectorAll<HTMLElement>('button:not([disabled]), a') ?? [])]
+function options(surface: HTMLElement | null): HTMLElement[] {
+  return [...(surface?.querySelectorAll<HTMLElement>('button:not([disabled]), a') ?? [])]
 }
 
-function focusAt(index: number) {
-  const all = options()
+function focusAt(surface: HTMLElement | null, index: number) {
+  const all = options(surface)
   if (!all.length) {
     return
   }
@@ -79,50 +100,80 @@ function focusAt(index: number) {
   all[((index % all.length) + all.length) % all.length]!.focus()
 }
 
-function step(delta: number) {
-  const all = options()
+function step(surface: HTMLElement | null, delta: number) {
+  const all = options(surface)
   const from = all.indexOf(document.activeElement as HTMLElement)
-  focusAt(from < 0 ? (delta > 0 ? 0 : -1) : from + delta)
+  focusAt(surface, from < 0 ? (delta > 0 ? 0 : -1) : from + delta)
+}
+
+/** The arrow keys move within whichever surface holds focus; the rest is the caller's. */
+function moveKeys(event: KeyboardEvent, surface: HTMLElement | null): boolean {
+  const moves: Record<string, () => void> = {
+    ArrowDown: () => step(surface, 1),
+    ArrowUp: () => step(surface, -1),
+    Home: () => focusAt(surface, 0),
+    End: () => focusAt(surface, -1),
+  }
+  const move = moves[event.key]
+  if (!move) {
+    return false
+  }
+  event.preventDefault()
+  move()
+  return true
 }
 
 function onKeydown(event: KeyboardEvent) {
-  switch (event.key) {
-    case 'Escape':
-      event.stopPropagation()
+  const row = (event.target as HTMLElement).closest<HTMLElement>('[data-key]')
+  const item = props.items.find((entry) => entry.key === row?.dataset.key)
+  if (event.key === 'Escape') {
+    event.stopPropagation()
+    // One layer at a time: an open submenu closes before the menu does.
+    if (subKey.value !== null) {
+      backToRow()
+    } else {
       emit('close', event)
-      break
-    case 'ArrowDown':
-      event.preventDefault()
-      step(1)
-      break
-    case 'ArrowUp':
-      event.preventDefault()
-      step(-1)
-      break
-    case 'Home':
-      event.preventDefault()
-      focusAt(0)
-      break
-    case 'End':
-      event.preventDefault()
-      focusAt(-1)
-      break
-    case 'Tab':
-      // Tabbing away is leaving, and the browser's own focus move is the right one.
-      emit('close', event)
-      break
+    }
+  } else if (event.key === 'ArrowRight' && item?.children?.length && !item.disabled) {
+    event.preventDefault()
+    void openSub(item, true)
+  } else if (event.key === 'Tab') {
+    // Tabbing away is leaving, and the browser's own focus move is the right one.
+    emit('close', event)
+  } else if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+    closeSub()
+    moveKeys(event, menu.value)
   }
 }
 
+function onSubKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape' || event.key === 'ArrowLeft') {
+    // Back to the row, not out of the menu — and the dialog behind must not hear the key.
+    event.preventDefault()
+    event.stopPropagation()
+    backToRow()
+  } else if (event.key === 'Tab') {
+    emit('close', event)
+  } else {
+    moveKeys(event, sub.value)
+  }
+}
+
+/** Whether an event happened in the menu or its submenu, which count as one. */
+function inside(event: Event): boolean {
+  const target = event.target as Node
+  return Boolean(menu.value?.contains(target) || sub.value?.contains(target))
+}
+
 function onPointerdownOutside(event: PointerEvent) {
-  if (!menu.value?.contains(event.target as Node)) {
+  if (!inside(event)) {
     emit('close', event)
   }
 }
 
 /** A second right-click closes this menu; the page opens the next one from its own handler. */
 function onContextmenuOutside(event: MouseEvent) {
-  if (!menu.value?.contains(event.target as Node)) {
+  if (!inside(event)) {
     emit('close', event)
   }
 }
@@ -133,9 +184,93 @@ function close(event: Event) {
 
 /** Moving to an item scrolls a menu taller than the window, and that must not close it. */
 function onScrollOutside(event: Event) {
-  if (!menu.value?.contains(event.target as Node)) {
+  if (!inside(event)) {
     emit('close', event)
   }
+}
+
+function rowOf(key: string): HTMLElement | null {
+  return [...(menu.value?.querySelectorAll<HTMLElement>('[data-key]') ?? [])].find((row) => row.dataset.key === key) ?? null
+}
+
+/** Restarts a surface's opening animation: a reused element would not run it again. */
+function replay(element: HTMLElement) {
+  element.style.animation = 'none'
+  void element.offsetHeight
+  element.style.animation = ''
+}
+
+/**
+ * Opens a row's submenu beside it (`placeSubmenu`), measured from the layout boxes rather than
+ * the drawn ones, which the opening animation's scale would shrink. From the keyboard its
+ * first item is highlighted; from the pointer nothing is, as the menu itself opens.
+ */
+async function openSub(item: MenuItem, focusFirst: boolean) {
+  clearTimeout(restTimer)
+  subKey.value = item.key
+  await nextTick()
+  const element = sub.value
+  const parent = menu.value
+  const row = rowOf(item.key)
+  if (!element || !parent || !row) {
+    return
+  }
+  const left = position.value.x
+  const top = position.value.y
+  const rowTop = top + parent.clientTop + row.offsetTop - parent.scrollTop
+  const rowLeft = left + parent.clientLeft + row.offsetLeft
+  const at = placeSubmenu(
+    { left: rowLeft, top: rowTop, right: rowLeft + row.offsetWidth, bottom: rowTop + row.offsetHeight },
+    { left, top, right: left + parent.offsetWidth, bottom: top + parent.offsetHeight },
+    { width: element.offsetWidth, height: element.offsetHeight },
+    { width: window.innerWidth, height: window.innerHeight },
+  )
+  subPosition.value = at
+  subOrigin.value = at.x + element.offsetWidth <= left ? 'right top' : 'left top'
+  replay(element)
+  if (focusFirst) {
+    focusAt(element, 0)
+  }
+}
+
+function closeSub() {
+  clearTimeout(restTimer)
+  subKey.value = null
+}
+
+function backToRow() {
+  const key = subKey.value
+  closeSub()
+  if (key !== null) {
+    rowOf(key)?.focus()
+  }
+}
+
+/** The pointer resting on a row: a submenu row opens after a short rest, and while a submenu
+ *  is open any other row takes over only after a longer one. */
+function onRowEnter(item: MenuItem) {
+  clearTimeout(restTimer)
+  if (item.key === subKey.value) {
+    return
+  }
+  const opens = Boolean(item.children?.length) && !item.disabled
+  if (subKey.value === null) {
+    if (opens) {
+      restTimer = setTimeout(() => void openSub(item, false), SUBMENU_OPEN_MS)
+    }
+    return
+  }
+  restTimer = setTimeout(() => {
+    closeSub()
+    if (opens) {
+      void openSub(item, false)
+    }
+  }, SUBMENU_TAKEOVER_MS)
+}
+
+/** The pointer left the row before it rested there, or reached the submenu. */
+function cancelRest() {
+  clearTimeout(restTimer)
 }
 
 /** Measured after the items are in the DOM, because where it fits depends on how big it is. */
@@ -159,12 +294,10 @@ async function place() {
     origin.value = `${at.x < props.at.x ? 'right' : 'left'} ${at.y < props.at.y ? 'bottom' : 'top'}`
     // Reopened on another row, the same element is reused and its opening animation would
     // not run again — so it is restarted by hand. The read is what forces the reflow.
-    element.style.animation = 'none'
-    void element.offsetHeight
-    element.style.animation = ''
+    replay(element)
   }
   if (props.focusFirst) {
-    focusAt(0)
+    focusAt(menu.value, 0)
   } else {
     // The menu, not an item: nothing is highlighted until the pointer or an arrow key picks
     // a row, while Escape and the arrows still have somewhere to land.
@@ -177,7 +310,13 @@ async function place() {
  * reopens in one tick, so this component is reused rather than remounted and `onMounted`
  * never runs again; without this the second menu would draw at the first one's point.
  */
-watch(() => props.at, place)
+watch(
+  () => props.at,
+  () => {
+    closeSub()
+    void place()
+  },
+)
 
 onMounted(() => {
   previouslyFocused = document.activeElement as HTMLElement | null
@@ -190,6 +329,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  clearTimeout(restTimer)
   window.removeEventListener('pointerdown', onPointerdownOutside, true)
   window.removeEventListener('contextmenu', onContextmenuOutside, true)
   window.removeEventListener('resize', close)
@@ -197,8 +337,14 @@ onBeforeUnmount(() => {
   previouslyFocused?.focus?.()
 })
 
-function choose(item: MenuItem) {
+/** A row chosen: a submenu row opens its submenu — highlighting its first item when the
+ *  keyboard chose it (a click with no `detail` is Enter or Space) — any other is the choice. */
+function choose(item: MenuItem, event?: MouseEvent) {
   if (item.disabled) {
+    return
+  }
+  if (item.children?.length) {
+    void openSub(item, event?.detail === 0)
     return
   }
   emit('select', item.key)
@@ -232,44 +378,68 @@ function choose(item: MenuItem) {
         </template>
       </dl>
 
-      <template v-for="item in items" :key="item.key">
-        <!-- A destination is a real link: it can be opened in a new tab, and the locale
-             items are URLs rather than actions. -->
-        <NuxtLink
-          v-if="item.to"
-          :to="item.to"
-          :role="item.checked === undefined ? 'menuitem' : 'menuitemradio'"
-          :aria-checked="item.checked"
-          tabindex="-1"
-          class="item"
-          :class="{ danger: item.danger, separated: item.separated }"
-          :title="item.label"
-          @click="choose(item)"
-        >
-          <UiIcon v-if="item.checked" name="check" />
-          <UiIcon v-else-if="item.icon" :name="item.icon" />
-          <span v-else class="icon-space" />
-          <span class="label">{{ item.label }}</span>
-        </NuxtLink>
+      <!-- A destination is a real link: it can be opened in a new tab, and the locale items
+           are URLs rather than actions. -->
+      <component
+        :is="item.to ? NuxtLinkComponent : 'button'"
+        v-for="item in items"
+        :key="item.key"
+        v-bind="item.to ? { to: item.to } : { type: 'button', disabled: item.disabled }"
+        :role="item.checked === undefined ? 'menuitem' : 'menuitemradio'"
+        :aria-checked="item.checked"
+        :aria-haspopup="item.children ? 'menu' : undefined"
+        :aria-expanded="item.children ? subKey === item.key : undefined"
+        :data-key="item.key"
+        tabindex="-1"
+        class="item"
+        :class="{ danger: item.danger, separated: item.separated, open: subKey === item.key }"
+        :title="item.description ? `${item.label}: ${item.description}` : item.label"
+        @click="choose(item, $event)"
+        @pointerenter="onRowEnter(item)"
+        @pointerleave="cancelRest"
+      >
+        <UiIcon v-if="item.checked" name="check" />
+        <UiIcon v-else-if="item.icon" :name="item.icon" />
+        <span v-else class="icon-space" />
+        <span class="label" :class="{ mono: item.labelMono, described: item.description }">{{ item.label }}</span>
+        <span v-if="item.description" class="description">{{ item.description }}</span>
+        <span v-if="item.shortcut" class="shortcut" :class="{ mono: item.shortcutMono }">{{ item.shortcut }}</span>
+        <UiIcon v-if="item.children" name="chevron-right" class="chevron" />
+      </component>
+    </div>
 
-        <button
-          v-else
-          type="button"
-          :role="item.checked === undefined ? 'menuitem' : 'menuitemradio'"
-          :aria-checked="item.checked"
-          tabindex="-1"
-          class="item"
-          :class="{ danger: item.danger, separated: item.separated }"
-          :disabled="item.disabled"
-          :title="item.label"
-          @click="choose(item)"
-        >
-          <UiIcon v-if="item.checked" name="check" />
-          <UiIcon v-else-if="item.icon" :name="item.icon" />
-          <span v-else class="icon-space" />
-          <span class="label">{{ item.label }}</span>
-        </button>
-      </template>
+    <div
+      v-if="subItem"
+      ref="sub"
+      class="menu submenu"
+      role="menu"
+      tabindex="-1"
+      :aria-label="subItem.label"
+      :style="{ left: `${subPosition.x}px`, top: `${subPosition.y}px`, transformOrigin: subOrigin }"
+      @keydown="onSubKeydown"
+      @pointerenter="cancelRest"
+      @contextmenu.prevent
+    >
+      <button
+        v-for="child in subItem.children"
+        :key="child.key"
+        type="button"
+        :role="child.checked === undefined ? 'menuitem' : 'menuitemradio'"
+        :aria-checked="child.checked"
+        tabindex="-1"
+        class="item"
+        :class="{ danger: child.danger, separated: child.separated }"
+        :disabled="child.disabled"
+        :title="child.description ? `${child.label}: ${child.description}` : child.label"
+        @click="choose(child)"
+      >
+        <UiIcon v-if="child.checked" name="check" />
+        <UiIcon v-else-if="child.icon" :name="child.icon" />
+        <span v-else class="icon-space" />
+        <span class="label" :class="{ mono: child.labelMono, described: child.description }">{{ child.label }}</span>
+        <span v-if="child.description" class="description">{{ child.description }}</span>
+        <span v-if="child.shortcut" class="shortcut" :class="{ mono: child.shortcutMono }">{{ child.shortcut }}</span>
+      </button>
     </div>
   </Teleport>
 </template>
@@ -407,10 +577,12 @@ function choose(item: MenuItem) {
 /*
  * The highlight is the accent, filled, and it is the one place the accent covers a surface.
  * It earns it: the highlighted row is the action about to be committed, which is exactly
- * what the accent is reserved for.
+ * what the accent is reserved for. A row whose submenu is open keeps it, as the platform's
+ * menus do, so the eye can follow where the submenu came from.
  */
 .item:hover,
-.item:focus {
+.item:focus,
+.item.open {
   background: var(--accent);
   color: var(--accent-fg);
   outline: none;
@@ -454,5 +626,51 @@ function choose(item: MenuItem) {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* A skill's name and what it does on one line: the name keeps its width where it can, and
+   the description takes the rest, cut with an ellipsis. */
+.label.described {
+  flex: 0 1 auto;
+}
+
+.description {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+}
+
+/* The key, or the markdown the row stands for, right-aligned and quiet. */
+.shortcut {
+  flex-shrink: 0;
+  margin-left: auto;
+  padding-left: var(--space-3);
+  color: var(--faint);
+  font-size: var(--text-xs);
+}
+
+.item:hover .description,
+.item:focus .description,
+.item.open .description,
+.item:hover .shortcut,
+.item:focus .shortcut,
+.item.open .shortcut {
+  color: currentcolor;
+}
+
+.item:disabled .description,
+.item:disabled .shortcut {
+  color: var(--faint);
+}
+
+.item .chevron {
+  margin-left: auto;
+}
+
+/* Its own second surface, the menu's width or less: a short list of parallel choices. */
+.submenu {
+  min-width: 180px;
 }
 </style>

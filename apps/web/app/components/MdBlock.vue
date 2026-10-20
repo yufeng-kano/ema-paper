@@ -10,7 +10,12 @@
  *
  * A figure's crop is the caller's: `figureUrl` is the image to load, or null for the
  * dashed placeholder (no figure route, or a crop that already failed), and a load failure
- * is reported back so the caller can remember it per snapshot.
+ * is reported back so the caller can remember it per snapshot. A figure is addressed by its
+ * own page — the one its placeholder names — whatever page the block now sits in, since a
+ * move can carry it across a page marker.
+ *
+ * A quote draws its inner blocks through this same component, one level deep: what the
+ * parser reads inside a quote never holds another quote or a figure.
  *
  * `cite` is the agent panel's alone: given, an answer's links to the document's sections
  * are read and drawn as chips — those whose heading it says the document still has
@@ -20,8 +25,6 @@ import type { Bbox, CiteResolver, ResultBlock } from '~/lib/markdown'
 
 const props = defineProps<{
   block: ResultBlock
-  /** The page the block came from — what addresses its figure crop. */
-  page: number
   figureUrl?: string | null
   cite?: CiteResolver
 }>()
@@ -36,7 +39,7 @@ const figureSource = computed(() => {
   if (block.kind !== 'fig') {
     return ''
   }
-  const placeholder = `![${block.id}](sightread://p${props.page}/${block.bbox.join(',')})`
+  const placeholder = `![${block.id}](sightread://p${block.page}/${block.bbox.join(',')})`
   return block.caption ? `${placeholder}\n${block.caption}` : placeholder
 })
 </script>
@@ -107,6 +110,10 @@ const figureSource = computed(() => {
     </p>
   </div>
 
+  <blockquote v-else-if="block.kind === 'quote'" class="md-quote">
+    <MdBlock v-for="(inner, innerIndex) in block.blocks" :key="innerIndex" :block="inner" :cite="cite" />
+  </blockquote>
+
   <!-- The stored crop when one exists; the dashed frame when it does not. `data-md` is
        what a copy hands back. -->
   <figure v-else-if="block.kind === 'fig'" class="md-figure" :data-md="figureSource">
@@ -116,7 +123,7 @@ const figureSource = computed(() => {
       :src="figureUrl"
       :alt="block.caption || block.id"
       loading="lazy"
-      @error="emit('figure-error', page, block.bbox)"
+      @error="emit('figure-error', block.page, block.bbox)"
     >
     <div v-else class="figure-frame">
       <UiIcon name="scan-text" />

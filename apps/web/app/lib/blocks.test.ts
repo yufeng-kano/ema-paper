@@ -3,12 +3,19 @@ import {
   UndoHistory,
   applySpans,
   blockName,
+  blocksInRanges,
+  changedBlocks,
   currentTick,
   diffSpans,
   fitTicks,
   foldsOf,
+  foldsOver,
+  followFolds,
   hashText,
   moveTarget,
+  readFoldMemory,
+  rememberFolds,
+  restoredRanges,
   revertSpans,
   rowsOf,
   translatable,
@@ -115,6 +122,75 @@ describe('folds', () => {
   })
 })
 
+describe('followFolds', () => {
+  const chapters = [
+    '## 1 Intro',
+    'Intro text.',
+    '## Exercises',
+    'First set.',
+    '## 2 Method',
+    'Method text.',
+    '## Exercises',
+    'Second set.',
+  ]
+
+  function follow(before: string[], after: string[], collapsed: string[]): string[] {
+    const from = parseResultMarkdown(before.join('\n\n'))
+    const to = parseResultMarkdown(after.join('\n\n'))
+    return [...followFolds(placedBlocks(from), documentOutline(from), placedBlocks(to), documentOutline(to), new Set(collapsed))]
+  }
+
+  it('moves a fold to its heading’s new slug when a twin before it is deleted', () => {
+    const after = chapters.filter((_, index) => index !== 2 && index !== 3)
+    expect(follow(chapters, after, ['exercises-1'])).toEqual(['exercises'])
+    // The deleted twin's fold goes with it rather than landing on the one that is left.
+    expect(follow(chapters, after, ['exercises'])).toEqual([])
+  })
+
+  it('follows a collapsed section moved past its twin', () => {
+    const after = [chapters[0]!, chapters[1]!, chapters[6]!, chapters[7]!, chapters[2]!, chapters[3]!, chapters[4]!, chapters[5]!]
+    expect(follow(chapters, after, ['exercises-1'])).toEqual(['exercises'])
+    expect(follow(chapters, after, ['exercises'])).toEqual(['exercises-1'])
+  })
+
+  it('follows a heading renamed in place and drops one turned into a paragraph', () => {
+    const renamed = chapters.map((block) => (block === '## 1 Intro' ? '## 1 Introduction' : block))
+    expect(follow(chapters, renamed, ['1-intro', 'exercises-1'])).toEqual(['1-introduction', 'exercises-1'])
+    const flattened = chapters.map((block) => (block === '## 2 Method' ? '2 Method' : block))
+    expect(follow(chapters, flattened, ['2-method', 'exercises-1'])).toEqual(['exercises-1'])
+  })
+
+  it('keeps a twin’s fold when a heading like it is added before it', () => {
+    const after = ['## Exercises', 'Warm-up.', ...chapters]
+    expect(follow(chapters, after, ['exercises', 'exercises-1'])).toEqual(['exercises-1', 'exercises-2'])
+  })
+
+  it('pairs renamed headings in order only where as many came as went', () => {
+    const translated = ['## 1 導論', 'Intro text.', '## 習題', 'First set.', '## 2 方法', 'Method text.', '## 習題', 'Second set.']
+    expect(follow(chapters, translated, ['1-intro', 'exercises-1'])).toEqual(['1-導論', '習題-1'])
+    const merged = ['## 1 導論', 'Intro text.', 'First set.', '## 2 Method', 'Method text.', '## 習題', 'Second set.']
+    expect(follow(chapters, merged, ['1-intro', 'exercises-1'])).toEqual(['習題'])
+  })
+})
+
+describe('foldsOver', () => {
+  it('names every collapsed section holding a block, not the heading’s own', () => {
+    const collapsed = new Set(['1-intro', '11-sub'])
+    const at = (key: string) => placed.findIndex((entry) => `${entry.page}-${entry.index}` === key)
+    expect(foldsOver(placed, outline, collapsed, at('0-4'))).toEqual(['1-intro', '11-sub'])
+    expect(foldsOver(placed, outline, collapsed, at('0-3'))).toEqual(['1-intro'])
+    expect(foldsOver(placed, outline, collapsed, at('1-1'))).toEqual([])
+  })
+})
+
+describe('changedBlocks', () => {
+  it('is the blocks whose source is new, counted', () => {
+    const before = placedBlocks(parseResultMarkdown('A.\n\nB.\n\n<!-- note -->'))
+    const after = placedBlocks(parseResultMarkdown('A.\n\nB.\n\nB.\n\nC.\n\n<!-- other -->'))
+    expect(changedBlocks(before, after)).toEqual([2, 3])
+  })
+})
+
 describe('moveTarget', () => {
   const rows = rowsOf(placed, foldsOf(placed, outline, new Set(['11-sub'])))
 
@@ -212,6 +288,30 @@ describe('undo', () => {
     expect(history.undo((file) => files[file])?.file).toBe('document')
   })
 
+  it('selects what an undo put back, or where a redone delete took it from', () => {
+    const markdown = 'One.\n\nTwo.\n\nThree.'
+    const shorter = 'One.\n\nThree.'
+    const spans = diffSpans(markdown, shorter)
+    // The diff puts the change as late as the text allows: `wo.\n\nT`, not `Two.\n\n`.
+    expect(restoredRanges(spans, 'undo')).toEqual([{ start: 7, end: 13 }])
+    expect(restoredRanges(spans, 'redo')).toEqual([{ start: 7, end: 7 }])
+    const all = placedBlocks(parseResultMarkdown(markdown))
+    expect(blocksInRanges(markdown, all, restoredRanges(spans, 'undo'))).toEqual([1])
+    const rest = placedBlocks(parseResultMarkdown(shorter))
+    expect(blocksInRanges(shorter, rest, restoredRanges(spans, 'redo'))).toEqual([1])
+  })
+
+  it('finds the blocks a stretch holds at least half of, never a comment', () => {
+    const markdown = 'One.\n\n<!-- note -->\n\nTwo.\n\nThree.'
+    const all = placedBlocks(parseResultMarkdown(markdown))
+    const two = markdown.indexOf('Two.')
+    expect(blocksInRanges(markdown, all, [{ start: 2, end: two + 3 }])).toEqual([0, 2])
+    expect(blocksInRanges(markdown, all, [{ start: 3, end: two + 1 }])).toEqual([0])
+    expect(blocksInRanges(markdown, all, [{ start: two + 1, end: two + 2 }])).toEqual([2])
+    expect(blocksInRanges(markdown, all, [{ start: markdown.indexOf('<!--'), end: markdown.indexOf('<!--') }])).toEqual([2])
+    expect(blocksInRanges(markdown, all, [{ start: markdown.length, end: markdown.length }])).toEqual([])
+  })
+
   it('hashes by content and length', () => {
     expect(hashText('abc')).toBe(hashText('abc'))
     expect(hashText('abc')).not.toBe(hashText('abd'))
@@ -230,5 +330,25 @@ describe('undo', () => {
     expect(history.undo(() => text)?.text).toBe('xa')
     text = 'xa'
     expect(history.undo(() => text)).toBeNull()
+  })
+})
+
+describe('fold memory', () => {
+  it('reads what it can and nothing from what it cannot', () => {
+    expect(readFoldMemory(null)).toEqual({})
+    expect(readFoldMemory('not json')).toEqual({})
+    expect(readFoldMemory('[1]')).toEqual({})
+    expect(readFoldMemory(JSON.stringify({ 'doc:a': { slugs: ['x', 3], at: 5 }, 'doc:b': { slugs: 'x', at: 1 } }))).toEqual({
+      'doc:a': { slugs: ['x'], at: 5 },
+    })
+  })
+
+  it('forgets a document with no folds and keeps the most recently set', () => {
+    let memory = rememberFolds({}, 'doc:a', ['x'], 1, 2)
+    memory = rememberFolds(memory, 'doc:b', ['y', 'y'], 2, 2)
+    expect(memory['doc:b']).toEqual({ slugs: ['y'], at: 2 })
+    memory = rememberFolds(memory, 'doc:c', ['z'], 3, 2)
+    expect(Object.keys(memory).sort()).toEqual(['doc:b', 'doc:c'])
+    expect(rememberFolds(memory, 'doc:b', [], 4, 2)).toEqual({ 'doc:c': { slugs: ['z'], at: 3 } })
   })
 })
