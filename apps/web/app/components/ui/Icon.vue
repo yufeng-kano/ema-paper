@@ -295,7 +295,6 @@ defineProps<{ name: IconName }>()
       <path d="M3 3v5h5" />
     </template>
 
-    <!-- check: the confirmation a copy swaps to. -->
     <!-- locate: go to the place in the document an answer names. -->
     <template v-else-if="name === 'locate'">
       <path d="M2 12h3M19 12h3M12 2v3M12 19v3" />
@@ -324,6 +323,13 @@ defineProps<{ name: IconName }>()
       <rect x="6" y="4" width="4" height="16" rx="1" />
       <rect x="14" y="4" width="4" height="16" rx="1" />
     </template>
+    <!-- heading: a whole section of the document, named by its heading. -->
+    <template v-else-if="name === 'heading'">
+      <path d="M6 12h12" />
+      <path d="M6 20V4" />
+      <path d="M18 20V4" />
+    </template>
+    <!-- check: the confirmation a copy swaps to. -->
     <template v-else>
       <path d="M20 6 9 17l-5-5" />
     </template>

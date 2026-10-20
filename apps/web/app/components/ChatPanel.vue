@@ -53,6 +53,7 @@ import {
 } from '~/lib/markdown'
 import type { MenuItem, Point } from '~/lib/menu'
 import {
+  applyMemoryEvent,
   buildThread,
   isLive,
   type CardState,
@@ -324,6 +325,9 @@ const memories = ref<Memory[] | null>(null)
 const memoriesError = ref<string | null>(null)
 /** Numbers the reads: only the latest may fill the list. */
 let memoriesRequest = 0
+/** The memories changed — a `memory` event, a line's Undo — and no read has come back since:
+ *  the list is the one from before, or the panel's guess at what the change made of it. */
+const memoriesStale = ref(false)
 
 async function loadMemories() {
   const request = ++memoriesRequest
@@ -332,6 +336,8 @@ async function loadMemories() {
     if (request === memoriesRequest) {
       memories.value = rows
       memoriesError.value = null
+      // The latest read began after every change so far.
+      memoriesStale.value = false
     }
   } catch (error) {
     if (request === memoriesRequest) {
@@ -340,15 +346,75 @@ async function loadMemories() {
   }
 }
 
+/** The memories changed under the list: read them again, and until that read succeeds take
+ *  the list as unconfirmed. */
+function memoriesChanged(): Promise<void> {
+  memoriesStale.value = true
+  return loadMemories()
+}
+
+/** The list the memory lines and the card read. One the read after a change failed to
+ *  confirm is withheld: the lines then wait, saying why, rather than offer an action on a
+ *  state that may be wrong. */
+const shownMemories = computed(() => (memoriesStale.value && memoriesError.value !== null ? null : memories.value))
+
+/** Turns the panel knows are over: the record says so, or their terminal frame has come. */
+function endedTurns(): Set<string> {
+  const ended = new Set(turns.value.filter((turn) => !isLive(turn)).map((turn) => turn.id))
+  for (const frame of events.value) {
+    if (frame.event.event === 'turn_done' || frame.event.event === 'turn_error') {
+      ended.add(frame.event.turn_id)
+    }
+  }
+  return ended
+}
+
+/**
+ * A memory a running turn saved, changed or forgot is folded into the list at once: its line
+ * renders with the frame, and read against the list from before the call a fresh save would
+ * read as undone for a round trip. A replayed frame of a turn already over is left to the read
+ * that follows — the list may well be newer than it.
+ */
+function applyMemoryFrames(frames: readonly StreamedEvent[]) {
+  if (memories.value === null) {
+    return
+  }
+  const ended = endedTurns()
+  const context = {
+    conversationId: currentId.value,
+    conversationTitle: current.value?.title ?? null,
+    now: new Date().toISOString(),
+  }
+  let rows = memories.value
+  for (const { event } of frames) {
+    if (event.event === 'memory' && !ended.has(event.turn_id)) {
+      rows = applyMemoryEvent(rows, event, context)
+    }
+  }
+  memories.value = rows
+}
+
 onMounted(loadMemories)
 
 /** The floating card a memory line's **View** or a part of the *Used* line opened, and the
  *  control that opened it — where it stands, and where focus goes back to. */
 const card = ref<{ key: string; anchor: HTMLElement; view: ContextCardView } | null>(null)
 
-/** The same control again closes it; another opens its own. */
+/** The same control again closes it; another opens its own. A card open is being read, so
+ *  the thread stops following under it — the card stays with its control, which a thread
+ *  kept at its end would carry off — and once it closes, follows again only from its end. */
 function openCard(key: string, anchor: HTMLElement, view: ContextCardView) {
-  card.value = card.value?.key === key ? null : { key, anchor, view }
+  if (card.value?.key === key) {
+    closeCard()
+    return
+  }
+  card.value = { key, anchor, view }
+  following = false
+}
+
+function closeCard() {
+  card.value = null
+  void settleFollowing()
 }
 
 type FootItem = Extract<ThreadItem, { kind: 'foot' }>
@@ -408,8 +474,10 @@ function flushFrames() {
     emit('changed')
   }
   // A memory saved, changed or forgotten: its line's state is read from the list.
-  if (batch.some((frame) => frame.event.event === 'memory')) {
-    void loadMemories()
+  const memoryFrames = batch.filter((frame) => frame.event.event === 'memory')
+  if (memoryFrames.length) {
+    applyMemoryFrames(memoryFrames)
+    void memoriesChanged()
   }
   const ended = batch.some(
     (frame) => frame.event.event === 'turn_done' || frame.event.event === 'turn_error',
@@ -1065,7 +1133,7 @@ onBeforeUnmount(() => {
             <ChatContextChip
               v-for="(heading, index) in item.sections"
               :key="index"
-              icon="hash"
+              icon="heading"
               :text="t('chat.context.section', { heading: inlinePlain(heading) })"
             />
           </div>
@@ -1085,10 +1153,10 @@ onBeforeUnmount(() => {
         <ChatMemoryLine
           v-else-if="item.kind === 'memory'"
           :line="item.line"
-          :memories="memories"
+          :memories="shownMemories"
           :conversation-id="currentId"
           :load-error="memoriesError"
-          :reload="loadMemories"
+          :reload="memoriesChanged"
           :viewing="card?.key === item.key"
           @view="(anchor) => openCard(item.key, anchor, { kind: 'memory', line: item.line })"
         />
@@ -1162,9 +1230,9 @@ onBeforeUnmount(() => {
       v-if="card"
       :anchor="card.anchor"
       :view="card.view"
-      :memories="memories"
+      :memories="shownMemories"
       :load-error="memoriesError"
-      @close="card = null"
+      @close="closeCard"
     />
 
     <!-- A file dragged over the panel: the whole column is the target. -->

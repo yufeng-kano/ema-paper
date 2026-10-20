@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { cellGroupsToMarkdown, nodesToMarkdown, type MarkdownNode } from './copy'
+import { cellGroupsToMarkdown, nodesToMarkdown, selectionText, type MarkdownNode } from './copy'
 
 /** Minimal DOM stand-ins — the serializer reads a structural subset of `Node`. */
 function el(
@@ -308,5 +308,54 @@ describe('a table of contents', () => {
     expect(nodesToMarkdown([el('p', { class: 'md-p' }, [text('See '), chip, text('.')])])).toBe(`See ${source}.`)
     // A selection inside the paragraph arrives without it.
     expect(nodesToMarkdown([text('See '), chip, text(' and '), plain])).toBe(`See ${source} and ${source}`)
+  })
+})
+
+/** KaTeX's output as the browser holds it: a MathML mirror with the TeX annotated, then the
+ *  glyphs, each layer read by `toString()` in turn. */
+function katex(tex: string, glyphs: string[], display = false): MarkdownNode {
+  const formula = el('span', { class: 'katex' }, [
+    el('span', { class: 'katex-mathml' }, [
+      el('math', {}, [
+        el('semantics', {}, [
+          el('mrow', {}, glyphs.map((glyph) => el('mi', {}, [text(glyph)]))),
+          el('annotation', { encoding: 'application/x-tex' }, [text(tex)]),
+        ]),
+      ]),
+    ]),
+    el('span', { class: 'katex-html', 'aria-hidden': 'true' }, glyphs.map((glyph) => el('span', {}, [text(glyph)]))),
+  ])
+  return display ? el('span', { class: 'katex-display' }, [formula]) : formula
+}
+
+describe('selectionText', () => {
+  it('sends a formula as its TeX, not as the glyphs of both its renderings', () => {
+    const inline = el('span', { class: 'md-inline-math', 'data-tex': '$d_{model}$' }, [
+      katex('d_{model}', ['𝑑', '𝑚', '𝑜', '𝑑', '𝑒', '𝑙']),
+    ])
+    const paragraph = el('p', { class: 'md-p' }, [text('Keys of '), inline, text('\n dimensions.')])
+    expect(selectionText([paragraph])).toBe('Keys of $d_{model}$ dimensions.')
+    // KaTeX the viewer did not draw itself: its annotation, display math between `$$`.
+    expect(selectionText([text('so '), katex('x^2', ['𝑥', '2'])])).toBe('so $x^2$')
+    expect(selectionText([el('div', {}, [katex('a+b', ['𝑎', '+', '𝑏'], true)])])).toBe('$$a+b$$')
+  })
+
+  it('keeps a formula whole when the selection starts inside it', () => {
+    // The clone keeps the partly selected span, attributes and all, but only the glyphs.
+    const cut = el('span', { class: 'md-inline-math', 'data-tex': '$d_k$' }, [
+      el('span', { class: 'katex' }, [el('span', { class: 'katex-html' }, [text('𝑘')])]),
+    ])
+    expect(selectionText([cut, text(' = 64')])).toBe('$d_k$ = 64')
+  })
+
+  it('puts each block on a line of its own and leaves out what is not on the page', () => {
+    const block = (...children: MarkdownNode[]) => el('div', { class: 'block' }, children)
+    const nodes = [
+      block(el('h3', { class: 'md-h2' }, [text('3.2 Attention')])),
+      el('div', { class: 'block', hidden: '' }, [el('p', {}, [text('held by an editor')])]),
+      block(el('p', {}, [text('  An attention function  '), el('br'), text('maps a query.')])),
+      block(el('pre', {}, [text('def f():\n    return 1')])),
+    ]
+    expect(selectionText(nodes)).toBe('3.2 Attention\nAn attention function\nmaps a query.\ndef f():\n    return 1')
   })
 })

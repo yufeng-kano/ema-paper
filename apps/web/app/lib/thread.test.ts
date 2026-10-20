@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { ChatEvent, ChatMessage, ChatTurn, Memory } from './api'
-import { buildThread, memoryLineState, type MemoryLine, type ThreadItem } from './thread'
+import { applyMemoryEvent, buildThread, memoryLineState, type MemoryLine, type ThreadItem } from './thread'
 
 const TURN = 'turn-1'
 
@@ -332,7 +332,42 @@ describe('memoryLineState', () => {
     expect(memoryLineState(saved, [row({ source_ref: 'm' })])).toMatchObject({ state: 'saved', row: { id: 12 } })
     // Saved again after an Undo: a new row, found by the call it carries.
     expect(memoryLineState(saved, [row({ id: 40, source_ref: 'm' })])).toMatchObject({ state: 'saved', row: { id: 40 } })
-    expect(memoryLineState(saved, [row({ id: 7, source_ref: 'other' })])).toEqual({ state: 'unsaved' })
+    // Gone: *Undone* only right after this line's own Undo, else neutrally gone.
+    const other = row({ id: 7, text: 'key → 鍵', source_ref: 'other' })
+    expect(memoryLineState(saved, [other], true)).toEqual({ state: 'unsaved' })
+    expect(memoryLineState(saved, [other])).toEqual({ state: 'removed' })
+  })
+
+  it('reads a save a later turn forgot as gone, not as undone', () => {
+    const forgot: MemoryLine = { toolUseId: 'f', action: 'forgotten', memory: { ...SAVED, kind: 'term' }, previous: null }
+    expect(memoryLineState(saved, [])).toEqual({ state: 'removed' })
+    expect(memoryLineState(forgot, [])).toEqual({ state: 'forgotten' })
+  })
+
+  it('never offers to keep a memory twice once a forget is undone', () => {
+    const forgot: MemoryLine = { toolUseId: 'f', action: 'forgotten', memory: { ...SAVED, kind: 'term' }, previous: null }
+    // The forget's Undo saved it again as a new row carrying the forget's call.
+    const back = [row({ id: 41, source_ref: 'f' })]
+    expect(memoryLineState(forgot, back)).toMatchObject({ state: 'restored', row: { id: 41 } })
+    // The save's line finds the memory held by that row: View only, no Save again.
+    expect(memoryLineState(saved, back)).toEqual({ state: 'elsewhere', row: back[0] })
+    expect(memoryLineState(saved, back, true)).toMatchObject({ state: 'elsewhere' })
+    // And the other way round: saved again from the save's line, the forget's Undo is moot.
+    const savedAgain = [row({ id: 42, source_ref: 'm' })]
+    expect(memoryLineState(forgot, savedAgain)).toEqual({ state: 'elsewhere', row: savedAgain[0] })
+  })
+
+  it('reads every line after Clear all as gone, none of them as undone', () => {
+    const updated: MemoryLine = {
+      toolUseId: 'u',
+      action: 'updated',
+      memory: { ...SAVED, kind: 'term', text: 'query → 查詢語句' },
+      previous: { ...SAVED, kind: 'term' },
+    }
+    const forgot: MemoryLine = { toolUseId: 'f', action: 'forgotten', memory: { ...SAVED, kind: 'term' }, previous: null }
+    expect(memoryLineState(saved, [])).toEqual({ state: 'removed' })
+    expect(memoryLineState(updated, [])).toEqual({ state: 'changed', row: null })
+    expect(memoryLineState(forgot, [])).toEqual({ state: 'forgotten' })
   })
 
   it('reads an update as applied, undone, or changed since', () => {
@@ -352,5 +387,39 @@ describe('memoryLineState', () => {
     const forgotten: MemoryLine = { toolUseId: 'f', action: 'forgotten', memory: { ...SAVED, kind: 'term' }, previous: null }
     expect(memoryLineState(forgotten, [])).toEqual({ state: 'forgotten' })
     expect(memoryLineState(forgotten, [row({ id: 41, source_ref: 'f' })])).toMatchObject({ state: 'restored', row: { id: 41 } })
+  })
+})
+
+describe('applyMemoryEvent', () => {
+  const context = { conversationId: 3, conversationTitle: 'Attention', now: '2026-10-20T12:00:00Z' }
+  const saved: MemoryLine = { toolUseId: 'm', action: 'saved', memory: { ...SAVED, kind: 'term' }, previous: null }
+  function frame(action: 'saved' | 'updated' | 'forgotten', memory: MemoryLine['memory'] = saved.memory) {
+    return { event: 'memory', turn_id: TURN, tool_use_id: 'm', action, memory, previous: null } as const
+  }
+
+  it('reads a fresh save as saved before the list is read again', () => {
+    const before = [row({ id: 3, text: 'key → 鍵' })]
+    expect(memoryLineState(saved, before)).toEqual({ state: 'removed' })
+    const after = applyMemoryEvent(before, frame('saved'), context)
+    expect(memoryLineState(saved, after)).toMatchObject({
+      state: 'saved',
+      row: { id: 12, source_ref: 'm', conversation_id: 3 },
+    })
+    // A frame for a row already listed adds nothing.
+    expect(applyMemoryEvent(after, frame('saved'), context)).toHaveLength(2)
+  })
+
+  it('rewrites a changed row and drops a forgotten one', () => {
+    const before = [row({ pinned: true }), row({ id: 3, text: 'key → 鍵' })]
+    const updated: MemoryLine = {
+      toolUseId: 'm',
+      action: 'updated',
+      memory: { ...SAVED, kind: 'term', text: 'query → 查詢語句' },
+      previous: { ...SAVED, kind: 'term' },
+    }
+    const after = applyMemoryEvent(before, frame('updated', updated.memory), context)
+    // The reader's pin stays theirs.
+    expect(memoryLineState(updated, after)).toMatchObject({ state: 'updated', row: { pinned: true } })
+    expect(applyMemoryEvent(before, frame('forgotten'), context).map((memory) => memory.id)).toEqual([3])
   })
 })

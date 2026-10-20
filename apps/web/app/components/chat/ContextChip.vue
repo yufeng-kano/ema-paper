@@ -27,6 +27,7 @@ const emit = defineEmits<{ remove: [] }>()
       v-if="removeLabel"
       type="button"
       class="chip-drop"
+      data-chip-remove
       :aria-label="removeLabel"
       :title="removeLabel"
       @click="emit('remove')"

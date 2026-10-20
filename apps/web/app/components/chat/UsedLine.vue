@@ -73,11 +73,12 @@ function open(part: UsedPart, event: MouseEvent) {
   height: 13px;
 }
 
+/* The line's own faint colour, as in the design: the underline is what says they open. */
 .link {
   padding: 0;
   border: 0;
   background: transparent;
-  color: var(--muted);
+  color: inherit;
   font: inherit;
   text-decoration: underline;
   text-decoration-color: var(--edge);

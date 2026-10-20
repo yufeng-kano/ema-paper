@@ -154,6 +154,20 @@ export function sectionText(source: string, max: number | undefined): string | n
 }
 
 /**
+ * A section's heading as it is sent: cut with an ellipsis to `limits.section_heading_max_chars`
+ * code points, as the server counts — a paragraph a parse took for a heading must not make
+ * the server refuse the whole message. It only names the section; its text goes whole or
+ * not at all. No cap from the server sends it as it is.
+ */
+export function sectionHeading(heading: string, max: number | undefined): string {
+  if (max === undefined || max < 1) {
+    return heading
+  }
+  const chars = [...heading]
+  return chars.length > max ? `${chars.slice(0, max - 1).join('')}…` : heading
+}
+
+/**
  * What the reader's view asks the agent panel to put in the composer: a passage, a whole
  * section, a command — and whether to send at once, which happens only while nothing is
  * running and nothing was being typed (the reader's draft is never sent for them).
