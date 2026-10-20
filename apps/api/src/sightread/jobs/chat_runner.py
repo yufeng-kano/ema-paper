@@ -106,9 +106,10 @@ class TurnContext:
     # Encoded image bytes the turn's reads have returned so far, every round together
     # (docs/chat.md § Tools).
     image_spent: int = 0
-    # The mutating tool calls in flight — the agent's own or a subagent's — each with the
-    # tool it runs: every one is finished before the turn is, whatever ended the turn, and a
-    # shell command past its grace is killed in the VM.
+    # The mutating tool calls in flight — the agent's own or a subagent's, and the `memory`
+    # calls with what reports them — each with the tool it runs: every one is finished
+    # before the turn is, whatever ended the turn, and a shell command past its grace is
+    # killed in the VM.
     writers: dict[asyncio.Future, str] = field(default_factory=dict)
     # One write of the turn at a time, the agent's or any subagent's, each started only
     # after a look for a Stop (docs/chat.md § Tools).
@@ -724,7 +725,24 @@ async def _run_tool_unguarded(
     elif name == "subagent":
         outcome = await chat_subagent.run_subagent(ctx, tool_use_id, tool_input)
     elif name == "memory":
-        # Writes rows, no file: it runs with the reads (docs/chat.md § Tools).
+        return await _run_memory(ctx, tool_use_id, tool_input, admit)
+    else:
+        outcome = chat_tools.ToolOutcome(f"unknown tool {name!r}", is_error=True)
+    if admit is not None:
+        outcome = admit(outcome)
+    return await _report_tool(ctx, tool_use_id, name, outcome)
+
+
+async def _run_memory(
+    ctx: TurnContext, tool_use_id: str, tool_input: dict, admit: Admit | None
+) -> dict:
+    """One `memory` call. It writes rows, no file, so it runs with the reads (docs/chat.md
+    § Tools); but its commit and what reports it — the tool_result and the `memory` event —
+    are one task, shielded and kept with the turn's writers, which the turn's end waits
+    for: a cancel between the two would leave a memory the thread draws no line for, with
+    no Undo (docs/chat.md § Memory)."""
+
+    async def run() -> dict:
         outcome = await chat_memory.run_memory_tool(
             ctx.sessionmaker,
             ctx.settings,
@@ -734,11 +752,15 @@ async def _run_tool_unguarded(
             tool_use_id=tool_use_id,
             tool_input=tool_input,
         )
-    else:
-        outcome = chat_tools.ToolOutcome(f"unknown tool {name!r}", is_error=True)
-    if admit is not None:
-        outcome = admit(outcome)
-    return await _report_tool(ctx, tool_use_id, name, outcome)
+        if admit is not None:
+            outcome = admit(outcome)
+        return await _report_tool(ctx, tool_use_id, "memory", outcome)
+
+    task = asyncio.ensure_future(run())
+    ctx.writers[task] = "memory"
+    # Dropped when the call is done, not when this await ends, as a write's is.
+    task.add_done_callback(lambda done, ctx=ctx: ctx.writers.pop(done, None))
+    return await asyncio.shield(task)
 
 
 async def run_mutating(ctx: TurnContext, name: str, tool_input: dict) -> chat_tools.ToolOutcome:
@@ -972,7 +994,9 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
                 if stopped.is_set() or await _cancelled(ctx):
                     stopped.set()
                     return
-                refusal = exhausted()
+                # `memory` returns no image, so a spent budget is no reason to refuse it:
+                # a reader's "remember this" late in a page-by-page check still lands.
+                refusal = exhausted() if block.get("name") != "memory" else None
                 if refusal is not None:
                     results[index] = await _report_tool(
                         ctx, str(block.get("id")), block.get("name"), refusal
@@ -1138,9 +1162,9 @@ async def _finish(
 
 async def _settle_writers(ctx: TurnContext) -> None:
     """Wait for every mutating tool call the end of the turn interrupted — the agent's own
-    or a subagent's (docs/chat.md § Tools): cancelling the loop does not stop a shell
-    command in the VM or an editor thread, and the terminal event must not precede their
-    commit."""
+    or a subagent's, and a `memory` call (docs/chat.md § Tools): cancelling the loop does
+    not stop a shell command in the VM or an editor thread, and the terminal event must not
+    precede their commit, nor a memory's commit precede no event at all."""
     while pending := [writer for writer in ctx.writers if not writer.done()]:
         writer = pending[0]
         await _settle_writer(ctx, writer, ctx.writers.get(writer))

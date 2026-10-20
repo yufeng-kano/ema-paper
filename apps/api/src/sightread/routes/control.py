@@ -198,6 +198,7 @@ async def me(user: SessionUser, settings: AppSettings):
             "instructions_max_chars": settings.chat_instructions_max_chars,
             "memory_max_chars": settings.chat_memory_max_chars,
             "sections_per_message": settings.chat_sections_per_message,
+            "section_heading_max_chars": settings.chat_section_heading_max_chars,
             "selection_max_chars": settings.chat_selection_max_chars,
         },
     }

@@ -2,10 +2,10 @@
 
 The chat agent's instructions, its answer and translation languages and its two memory
 switches on `agent_settings`, the memory snapshot a conversation's first turn takes
-(`conversations.memory_ids`), and the `memories` table (docs/chat.md § Instructions,
-§ Memory). Every existing row reads as before: no instructions, the reader's locale, memory
-on and not paused, and a conversation that takes its snapshot at its next turn. No row is
-rewritten. The downgrade drops them all, the memories with them.
+(`conversations.memory_ids`), and the `memories` table with its indexes (docs/chat.md
+§ Instructions, § Memory). Every existing row reads as before: no instructions, the
+reader's locale, memory on and not paused, and a conversation that takes its snapshot at
+its next turn. No row is rewritten. The downgrade drops them all, the memories with them.
 
 Revision ID: 09bcc2e96c63
 Revises: ecd8f04df825
@@ -70,9 +70,27 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index("ix_memories_user_updated", "memories", ["user_id", "updated_at"])
+    # What a document's delete (CASCADE) and a conversation's (SET NULL) look rows up by, so
+    # neither scans every reader's memories (docs/database.md).
+    op.create_index(
+        "ix_memories_document_id",
+        "memories",
+        ["document_id"],
+        postgresql_where=sa.text("document_id IS NOT NULL"),
+        sqlite_where=sa.text("document_id IS NOT NULL"),
+    )
+    op.create_index(
+        "ix_memories_conversation_id",
+        "memories",
+        ["conversation_id"],
+        postgresql_where=sa.text("conversation_id IS NOT NULL"),
+        sqlite_where=sa.text("conversation_id IS NOT NULL"),
+    )
 
 
 def downgrade() -> None:
+    op.drop_index("ix_memories_conversation_id", table_name="memories")
+    op.drop_index("ix_memories_document_id", table_name="memories")
     op.drop_index("ix_memories_user_updated", table_name="memories")
     op.drop_table("memories")
     op.drop_column("conversations", "memory_ids")

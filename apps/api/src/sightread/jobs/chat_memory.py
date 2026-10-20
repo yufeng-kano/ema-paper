@@ -148,7 +148,7 @@ async def run_memory_tool(
 ) -> ToolOutcome:
     """One `memory` call: save, update or forget one of the reader's memories (docs/chat.md
     § Memory). Every refusal is an error result the model can correct; a success carries
-    what its `memory` event reports."""
+    what its `memory` event reports, and a save of what is already saved carries nothing."""
     action = _field(tool_input, "action")
     if action not in ACTIONS:
         return _error("`action` is save, update or forget.")
@@ -201,6 +201,25 @@ async def run_memory_tool(
         previous: dict | None = None
         forgotten: dict | None = None
         if action == "save":
+            scoped = document_id if scope == "document" else None
+            # A memory saved again as it is — a save the turn's end cut off before its
+            # result was stored reads as interrupted on the replay — is answered with the
+            # row there is, and adds none (docs/chat.md § Memory).
+            same = (
+                await db.execute(
+                    select(Memory.id)
+                    .where(
+                        Memory.user_id == user_id,
+                        Memory.kind == kind,
+                        Memory.text == text,
+                        Memory.document_id.is_not_distinct_from(scoped),
+                    )
+                    .order_by(Memory.id)
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if same is not None:
+                return ToolOutcome(f"Already saved as m{same}.")
             count = (
                 await db.execute(
                     select(func.count()).select_from(Memory).where(Memory.user_id == user_id)
@@ -215,7 +234,7 @@ async def run_memory_tool(
                 user_id=user_id,
                 kind=kind,
                 text=text,
-                document_id=document_id if scope == "document" else None,
+                document_id=scoped,
                 conversation_id=conversation_id,
                 source_ref=tool_use_id[:255],
             )

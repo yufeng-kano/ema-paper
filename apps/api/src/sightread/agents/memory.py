@@ -19,13 +19,17 @@ KINDS: tuple[str, ...] = ("term", "preference", "about", "document")
 # would read to the model as something the reader never wrote (docs/chat.md § Instructions).
 # The joiners U+200C and U+200D stay — scripts and emoji sequences need them.
 _INVISIBLE = re.compile("[\u200b\u2060\ufeff\u200e\u200f\u061c\u202a-\u202e\u2066-\u2069]")
+# The C0 control characters and DEL, but tab, newline and carriage return: NUL is refused by
+# PostgreSQL's TEXT outright, and none of them is anything a reader typed.
+_CONTROL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _WHITESPACE = re.compile(r"\s+")
 
 
 def clean_text(value: str, *, single_line: bool) -> str:
-    """The text without the invisible characters, its ends trimmed; with `single_line`,
-    every run of whitespace — newlines included — one space, as a memory is one line."""
-    cleaned = _INVISIBLE.sub("", value)
+    """The text without the invisible and control characters, its ends trimmed; with
+    `single_line`, every run of whitespace — newlines included — one space, as a memory is
+    one line."""
+    cleaned = _CONTROL.sub("", _INVISIBLE.sub("", value))
     if single_line:
         cleaned = _WHITESPACE.sub(" ", cleaned)
     return cleaned.strip()

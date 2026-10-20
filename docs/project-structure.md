@@ -19,7 +19,8 @@ agent-sightread/
         agents/               # the agent registry (docs/agents.md); parse.py holds the
                               # parse agent's definition: default prompt, pipeline version;
                               # chat.py the chat agent's system prompt and tool definitions;
-                              # skills.py and subagents.py the built-in skills and subagents
+                              # skills.py and subagents.py the built-in skills and subagents;
+                              # memory.py the memory block, its selection and text cleaning
         parsing/              # poppler.py (subprocess wrappers),
                               # images.py (heic/exif/downscale), markdown.py, figures.py,
                               # attachments.py (the chat composer's files, prepared)
@@ -37,7 +38,8 @@ agent-sightread/
                               # runner.py, sweeper.py, events.py (SSE + event pairs),
                               # chat_runner.py (the chat agent's tool loop),
                               # chat_subagent.py (a subagent's nested loop),
-                              # chat_tools.py, chat_events.py (the conversation stream)
+                              # chat_tools.py, chat_events.py (the conversation stream),
+                              # chat_memory.py (a turn's memory snapshot, the memory tool)
         mcp/                  # server.py: thin shell over the service layer (docs/mcp.md)
         worker.py             # `python -m sightread.worker`
       migrations/             # Alembic

@@ -282,7 +282,7 @@ The user's view of the document has no page numbers and no way to go to a page; 
 
 When you point the user to a section, write its heading as a link: the heading's text exactly as the document has it, linked to its GitHub-style anchor, as in [3.2 Attention](#32-attention). Their view turns it into a button that scrolls the document there. Link nothing else that way.
 
-Each message ends with a context block naming the document's current revision, the reader's locale and, when the user chose them, an answer language and a translation language. Answer in the answer language when the block names one, else in the reader's locale. A revision that changed since your last look at the file means it was edited meanwhile; read it again before you rely on what you saw.
+Each message ends with a context block naming the document's current revision, the reader's locale and any language the user chose, with its rule. Answer in the reader's locale unless the block names an answer language. A revision that changed since your last look at the file means it was edited meanwhile; read it again before you rely on what you saw.
 """
 
 PROMPT_TOKENS: tuple[str, ...] = (
