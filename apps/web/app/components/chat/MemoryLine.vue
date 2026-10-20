@@ -6,9 +6,11 @@
  *
  * Which state it is in comes from the memories as they are now (`memoryLineState`), never
  * from what was clicked: an action reads the list again and the line follows it, so a
- * reload or another tab shows what is true. Undo is the memories routes (docs/chat.md §
- * Memory) — delete what was saved, write back what was changed, save again what was
- * removed — and a row saved again carries the call's id, which is how the line finds it.
+ * reload or another tab shows what is true. What was clicked picks only the words — *Undone*
+ * right after this line's own Undo, *No longer in memory* for a row that went any other
+ * way. Undo is the memories routes (docs/chat.md § Memory) — delete what was saved, write
+ * back what was changed, save again what was removed — and a row saved again carries the
+ * call's id, which is how the line finds it.
  */
 import {
   createMemory,
@@ -38,13 +40,18 @@ const emit = defineEmits<{ view: [anchor: HTMLElement] }>()
 const { t } = useI18n()
 const { resolve } = useApiError()
 
-const state = computed(() => memoryLineState(props.line, props.memories))
+/** This line's own Undo deleted the row it saved, while the page has been open: only then
+ *  does it say *Undone*; a row that went any other way is *No longer in memory*. */
+const undoneHere = ref(false)
+
+const state = computed(() => memoryLineState(props.line, props.memories, undoneHere.value))
 
 const kind = computed(() => t(`chat.memory.kinds.${props.line.memory.kind}`))
 const noun = computed(() => t(`chat.memory.nouns.${props.line.memory.kind}`))
 
-/** The line: what the call did, or — once undone — what that left. */
-const message = computed(() => {
+/** What an Undo left, in words of its own; null while the line names the memory, which is
+ *  drawn with its markup — `$…$` typeset — as the card draws it. */
+const undoneMessage = computed(() => {
   switch (state.value.state) {
     case 'unsaved':
       return t('chat.memory.unsaved', { noun: noun.value })
@@ -53,15 +60,20 @@ const message = computed(() => {
     case 'restored':
       return t('chat.memory.restored', { noun: noun.value })
     default:
-      return t(`chat.memory.${props.line.action}`, { kind: kind.value, text: props.line.memory.text })
+      return null
   }
 })
 
-/** The memory is gone because of this line: removed by the call, or its save undone. */
-const gone = computed(() => state.value.state === 'forgotten' || state.value.state === 'unsaved')
+/** What the call did, or that its memory has gone since. */
+const keypath = computed(() =>
+  state.value.state === 'removed' ? 'chat.memory.gone' : `chat.memory.${props.line.action}`,
+)
 
-/** A saved memory undone has nothing left to view; every other line does. */
-const viewable = computed(() => state.value.state !== 'unsaved')
+/** The memory is not kept: removed by the call, its save undone, or gone since. */
+const gone = computed(() => ['forgotten', 'unsaved', 'removed'].includes(state.value.state))
+
+/** A saved memory no longer kept has nothing left to view; every other line does. */
+const viewable = computed(() => state.value.state !== 'unsaved' && state.value.state !== 'removed')
 
 interface LineAction {
   label: string
@@ -95,6 +107,7 @@ const action = computed<LineAction | null>(() => {
         run: () => deleteMemory(current.row.id),
       }
     case 'unsaved':
+    case 'removed':
       return {
         label: t('chat.memory.saveAgain'),
         name: t('chat.memory.saveAgain'),
@@ -128,7 +141,8 @@ const action = computed<LineAction | null>(() => {
         name: t('chat.memory.removeAgain'),
         run: () => deleteMemory(current.row.id),
       }
-    // Not read yet, or changed since by someone else: there is nothing safe to undo.
+    // Not read yet, changed since by someone else, or held by another row: there is
+    // nothing safe to undo.
     default:
       return null
   }
@@ -145,10 +159,12 @@ async function act() {
   if (!chosen || pending.value) {
     return
   }
+  const from = state.value.state
   pending.value = true
   error.value = null
   try {
     await chosen.run()
+    undoneHere.value = from === 'saved'
   } catch (caught) {
     error.value = await resolve(caught)
   } finally {
@@ -167,7 +183,13 @@ function view(event: MouseEvent) {
   <div class="memory-line">
     <UiIcon :name="gone ? 'bookmark-x' : 'bookmark'" />
     <p class="memory-text">
-      <span role="status">{{ message }}</span>
+      <span role="status">
+        <template v-if="undoneMessage">{{ undoneMessage }}</template>
+        <i18n-t v-else :keypath="keypath" scope="global">
+          <template #kind>{{ kind }}</template>
+          <template #text><MdInline :text="line.memory.text" /></template>
+        </i18n-t>
+      </span>
       <button
         v-if="viewable"
         type="button"
@@ -179,12 +201,15 @@ function view(event: MouseEvent) {
       >
         {{ t('chat.memory.view') }}
       </button>
+      <!-- Busy rather than disabled while it runs: a disabled button drops the keyboard's
+           focus, and the control stays where it is as its state changes. -->
       <button
         v-if="action"
         type="button"
         class="link"
         :aria-label="action.name"
-        :disabled="pending"
+        :aria-disabled="pending ? 'true' : undefined"
+        :aria-busy="pending ? 'true' : undefined"
         @click="act"
       >
         {{ action.label }}
@@ -242,13 +267,14 @@ function view(event: MouseEvent) {
     text-decoration-color var(--duration-fast) var(--ease);
 }
 
-.link:hover:not(:disabled),
+.link:hover:not(:disabled, [aria-disabled='true']),
 .link[aria-expanded='true'] {
   color: var(--ink);
   text-decoration-color: currentcolor;
 }
 
-.link:disabled {
+.link:disabled,
+.link[aria-disabled='true'] {
   color: var(--faint);
   cursor: default;
 }

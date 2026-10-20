@@ -8,8 +8,10 @@
  *
  * It floats the way the context menu does: teleported out of the thread's scroll container
  * (into the dialog's panel when there is one), under the control that opened it or over it
- * where there is no room, and closed by Escape, a press outside, a scroll under it, a resize
- * or focus leaving it — focus then goes back to that control.
+ * where there is no room. Unlike a menu it is read, so it stays with that control while the
+ * thread scrolls or grows under it, and closes only once the control has scrolled out of
+ * the thread's view, or on Escape, a press outside or focus leaving it — focus then goes
+ * back to that control.
  */
 import { listAgents, type Memory, type MemoryKind } from '~/lib/api'
 import { formatShortDateTime } from '~/lib/format'
@@ -155,14 +157,37 @@ watch(
 const GAP = 6
 const MARGIN = 8
 
-/** Under the control, or over it where there is no room under; kept inside the window. */
+/** The nearest box that scrolls the control: the thread. */
+function scrollerOf(element: HTMLElement): HTMLElement | null {
+  for (let node = element.parentElement; node; node = node.parentElement) {
+    const { overflowY } = getComputedStyle(node)
+    if (overflowY === 'auto' || overflowY === 'scroll') {
+      return node
+    }
+  }
+  return null
+}
+
+/** Under the control, or over it where there is no room under; kept inside the window. A
+ *  control scrolled out of the thread's view, or gone from it, takes the card with it. */
 function place() {
   const element = card.value
   if (!element) {
     return
   }
+  if (!props.anchor.isConnected) {
+    close()
+    return
+  }
   const at = props.anchor.getBoundingClientRect()
-  const size = element.getBoundingClientRect()
+  const view = scrollerOf(props.anchor)?.getBoundingClientRect()
+  if (view && (at.bottom <= view.top || at.top >= view.bottom)) {
+    close()
+    return
+  }
+  // The layout box, not the drawn one: the opening animation's scale would shrink it, and
+  // the card would be placed by a size it does not have.
+  const size = { width: element.offsetWidth, height: element.offsetHeight }
   const roomBelow = window.innerHeight - MARGIN - (at.bottom + GAP)
   const y =
     size.height <= roomBelow || at.top - GAP - size.height < MARGIN
@@ -205,12 +230,6 @@ function onPointerdown(event: PointerEvent) {
   }
 }
 
-function onScroll(event: Event) {
-  if (outside(event.target)) {
-    close()
-  }
-}
-
 function onFocusout(event: FocusEvent) {
   if (outside(event.relatedTarget)) {
     close()
@@ -218,6 +237,22 @@ function onFocusout(event: FocusEvent) {
 }
 
 let observer: ResizeObserver | null = null
+/** Where the control stood when the card was last placed, and the frame that checks again. */
+let anchorAt = ''
+let frame = 0
+
+/** The control moves with the thread — scrolled, or pushed down as an answer streams in
+ *  above it, which fires no scroll — so where it stands is checked every frame the card is
+ *  open, and the card placed again when that changed. Read after the frame's scrolls. */
+function follow() {
+  const at = props.anchor.getBoundingClientRect()
+  const where = `${at.left} ${at.top} ${at.width} ${at.height}`
+  if (where !== anchorAt) {
+    anchorAt = where
+    place()
+  }
+  frame = requestAnimationFrame(follow)
+}
 
 onMounted(() => {
   place()
@@ -227,20 +262,21 @@ onMounted(() => {
   if (card.value) {
     observer.observe(card.value)
   }
+  frame = requestAnimationFrame(follow)
   window.addEventListener('pointerdown', onPointerdown, true)
-  window.addEventListener('scroll', onScroll, true)
-  window.addEventListener('resize', close)
+  window.addEventListener('resize', place)
 })
 
 onBeforeUnmount(() => {
   observer?.disconnect()
+  cancelAnimationFrame(frame)
   window.removeEventListener('pointerdown', onPointerdown, true)
-  window.removeEventListener('scroll', onScroll, true)
-  window.removeEventListener('resize', close)
-  // Back to the control, unless the reader has already put focus somewhere else.
+  window.removeEventListener('resize', place)
+  // Back to the control, unless the reader has already put focus somewhere else — without
+  // scrolling the thread back to a control the reader scrolled away from.
   const active = document.activeElement
   if ((!active || active === document.body || card.value?.contains(active)) && props.anchor.isConnected) {
-    props.anchor.focus()
+    props.anchor.focus({ preventScroll: true })
   }
 })
 </script>

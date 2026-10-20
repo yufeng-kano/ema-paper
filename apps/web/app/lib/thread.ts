@@ -629,20 +629,28 @@ export function buildThread(input: ThreadInput): Thread {
  * panel). The row a call saved is found by the call's id (`source_ref`), which Undo and
  * Save again carry too; a row a call changed, by its own id.
  *
- * - `saved`: the row is there — **Undo** deletes it. `unsaved`: it is not — **Save again**.
+ * - `saved`: the row is there — **Undo** deletes it. `unsaved`: this line's own Undo just
+ *   deleted it — **Save again**. `removed`: it went some other way (deleted on the Agent
+ *   page, cleared, forgotten by a later turn) — **Save again** too, worded neutrally.
  * - `updated`: the row reads as the call left it — **Undo** writes back what it was.
  *   `reverted`: it reads as it was before — **Apply again**. `changed`: neither, edited or
  *   deleted since — only **View**.
  * - `forgotten`: nothing holds it — **Undo** saves it again. `restored`: Undo put it back —
  *   **Remove again** deletes that row.
+ * - `elsewhere`: a saved or forgotten memory that another row now holds, word for word (a
+ *   later call saved it, or another line's Undo did) — only **View**, since saving it again
+ *   would keep it twice.
  *
  * `loading` until the memories have been read. Only the fields the tool writes are compared
- * (kind, text, scope): a pin the reader added since is theirs, not the call's.
+ * (kind, text, scope): a pin the reader added since is theirs, not the call's. Whether this
+ * line's Undo is what removed the row (`undoneHere`) is the line's own, kept while the page is.
  */
 export type MemoryLineState =
   | { state: 'loading' }
   | { state: 'saved'; row: Memory }
   | { state: 'unsaved' }
+  | { state: 'removed' }
+  | { state: 'elsewhere'; row: Memory }
   | { state: 'updated'; row: Memory }
   | { state: 'reverted'; row: Memory }
   | { state: 'changed'; row: Memory | null }
@@ -654,16 +662,27 @@ export function sameMemory(row: Pick<Memory, 'kind' | 'text' | 'document_id'>, s
   return row.kind === snapshot.kind && row.text === snapshot.text && row.document_id === snapshot.document_id
 }
 
-export function memoryLineState(line: MemoryLine, memories: readonly Memory[] | null): MemoryLineState {
+export function memoryLineState(
+  line: MemoryLine,
+  memories: readonly Memory[] | null,
+  undoneHere = false,
+): MemoryLineState {
   if (memories === null) {
     return { state: 'loading' }
   }
   const bySource = memories.find((row) => row.source_ref === line.toolUseId)
   const byId = memories.find((row) => row.id === line.memory.id)
+  const same = memories.find((row) => sameMemory(row, line.memory))
   switch (line.action) {
     case 'saved': {
       const row = bySource ?? byId
-      return row ? { state: 'saved', row } : { state: 'unsaved' }
+      if (row) {
+        return { state: 'saved', row }
+      }
+      if (same) {
+        return { state: 'elsewhere', row: same }
+      }
+      return { state: undoneHere ? 'unsaved' : 'removed' }
     }
     case 'updated':
       if (byId && sameMemory(byId, line.memory)) {
@@ -674,6 +693,63 @@ export function memoryLineState(line: MemoryLine, memories: readonly Memory[] | 
       }
       return { state: 'changed', row: byId ?? null }
     case 'forgotten':
-      return bySource ? { state: 'restored', row: bySource } : { state: 'forgotten' }
+      if (bySource) {
+        return { state: 'restored', row: bySource }
+      }
+      return same ? { state: 'elsewhere', row: same } : { state: 'forgotten' }
+  }
+}
+
+/** Who a memory a running turn just saved is credited to, and when, until the list is read. */
+export interface MemoryEventContext {
+  conversationId: number | null
+  conversationTitle: string | null
+  now: string
+}
+
+/**
+ * The memories as a `memory` event leaves them: a saved row added (found by its call, as the
+ * server stores it), a changed one rewritten, a forgotten one dropped. The panel folds a
+ * running turn's events in at once, so the line under the answer reads what the call did
+ * rather than the list from before it; the read that follows replaces this guess.
+ */
+export function applyMemoryEvent(
+  memories: readonly Memory[],
+  event: Extract<ChatEvent, { event: 'memory' }>,
+  context: MemoryEventContext,
+): Memory[] {
+  const snapshot = event.memory
+  switch (event.action) {
+    case 'saved':
+      if (memories.some((row) => row.id === snapshot.id)) {
+        return [...memories]
+      }
+      return [
+        ...memories,
+        {
+          ...snapshot,
+          document_name: null,
+          conversation_id: context.conversationId,
+          conversation_title: context.conversationTitle,
+          source_ref: event.tool_use_id,
+          created_at: context.now,
+          updated_at: context.now,
+        },
+      ]
+    case 'updated':
+      return memories.map((row) =>
+        row.id === snapshot.id
+          ? {
+              ...row,
+              kind: snapshot.kind,
+              text: snapshot.text,
+              document_id: snapshot.document_id,
+              document_name: row.document_id === snapshot.document_id ? row.document_name : null,
+              updated_at: context.now,
+            }
+          : row,
+      )
+    case 'forgotten':
+      return memories.filter((row) => row.id !== snapshot.id)
   }
 }
