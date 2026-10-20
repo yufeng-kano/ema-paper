@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { placeMenu } from './menu'
+import { heightAbove, placeMenu } from './menu'
 
 const viewport = { width: 1000, height: 800 }
 const menu = { width: 200, height: 300 }
@@ -28,6 +28,16 @@ describe('placeMenu', () => {
     expect(placeMenu({ x: 120, y: 200 }, menu, viewport, { above: true })).toEqual({ x: 120, y: 200 })
     // No room on either side: the near edge, as for any menu.
     expect(placeMenu({ x: 5, y: 100 }, menu, { width: 150, height: 150 }, { above: true })).toEqual({ x: 8, y: 8 })
+  })
+
+  it('holds a long menu asked for above to the room over the point, so it never covers it', () => {
+    // An outline of 30 headings under a control at 761 in an 800-high window.
+    const room = heightAbove({ x: 900, y: 761 })
+    expect(room).toBe(753)
+    const held = { width: 280, height: Math.min(784, room!) }
+    expect(placeMenu({ x: 900, y: 761 }, held, viewport, { above: true }).y + held.height).toBe(761)
+    // Too little room over the point: no cap, and the menu opens as any other.
+    expect(heightAbove({ x: 900, y: 100 })).toBeNull()
   })
 
   it('falls back to the near edge when nothing fits', () => {

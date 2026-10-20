@@ -493,11 +493,23 @@ function plainParts(node: MarkdownNode, out: PlainPart[], display: boolean, pre:
   if (line) {
     out.push(BREAK)
   }
-  for (const child of children(node)) {
-    plainParts(child, out, display || classes(node).includes('katex-display'), pre || name === 'pre')
-  }
+  plainChildren(children(node), out, display || classes(node).includes('katex-display'), pre || name === 'pre')
   if (line) {
     out.push(BREAK)
+  }
+}
+
+/** Sibling nodes in order, a tab between two table cells: the rendered table leaves no
+ *  whitespace between its `<td>`s, and `27.3` and `38.1` must not reach the agent as `27.338.1`. */
+function plainChildren(nodes: Iterable<MarkdownNode>, out: PlainPart[], display: boolean, pre: boolean): void {
+  let cellBefore = false
+  for (const node of nodes) {
+    const cell = tag(node) === 'td' || tag(node) === 'th'
+    if (cell && cellBefore) {
+      out.push({ text: '\t', pre: true })
+    }
+    cellBefore ||= cell
+    plainParts(node, out, display, pre)
   }
 }
 
@@ -509,9 +521,7 @@ function plainParts(node: MarkdownNode, out: PlainPart[], display: boolean, pre:
  */
 export function selectionText(nodes: ArrayLike<MarkdownNode>): string {
   const parts: PlainPart[] = []
-  for (const node of Array.from(nodes)) {
-    plainParts(node, parts, false, false)
-  }
+  plainChildren(Array.from(nodes), parts, false, false)
   let text = ''
   for (const part of parts) {
     if (part === BREAK) {

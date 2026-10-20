@@ -6,6 +6,7 @@ reaches the network (docs/testing.md § Cost safety)."""
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -156,9 +157,17 @@ def test_clean_text_drops_control_characters_but_tab_newline_and_return() -> Non
     # NUL first: PostgreSQL refuses it in TEXT, and the write would fail with the text logged.
     assert memory_defs.clean_text("a\x00b\x07c\x1bd\x7fe", single_line=True) == "abcde"
     assert memory_defs.clean_text("# Me\x00\n\n-\tbrief\r\n\x0bend\x0c", single_line=False) == (
-        "# Me\n\n-\tbrief\r\nend"
+        "# Me\n\n-\tbrief\r\n\nend"
     )
     assert memory_defs.clean_text("\x00 \x01", single_line=True) == ""
+    # A vertical tab, a form feed or a separator breaks the line where it stands: it never
+    # joins the words on either side.
+    assert (
+        memory_defs.clean_text("Results\x0cand discussion", single_line=True)
+        == "Results and discussion"
+    )
+    assert memory_defs.clean_text("line one\x0bline two", single_line=False) == "line one\nline two"
+    assert memory_defs.clean_text("a\x1fb", single_line=True) == "a b"
 
 
 def _row(memory_id: int, kind: str, text: str, *, minutes: int = 0, **extra) -> SimpleNamespace:
@@ -1120,3 +1129,43 @@ async def test_a_cancel_never_parts_a_memorys_commit_from_its_events(monkeypatch
     await asyncio.wait_for(settling, 5)
     assert [event for event, _ in emitted] == [chat_events.TOOL_RESULT, chat_events.MEMORY]
     assert emitted[1][1]["tool_use_id"] == "toolu_m" and ctx.writers == {}
+
+
+async def test_a_memory_call_that_fails_after_a_cancel_is_logged_and_reported(
+    monkeypatch, caplog
+) -> None:
+    """Nobody awaits the call once the round is cancelled, so its own failure is logged and
+    answered as an error tool_result there, as `_run_tool` would have done."""
+    in_flight = asyncio.Event()
+    release = asyncio.Event()
+    emitted: list[tuple[str, dict]] = []
+
+    async def failing_memory_tool(sessionmaker, settings, **kwargs):
+        in_flight.set()
+        await release.wait()
+        raise RuntimeError("the connection dropped")
+
+    async def record(ctx, event, data):
+        emitted.append((event, data))
+
+    async def never_cancelled(ctx):
+        return False
+
+    monkeypatch.setattr(chat_memory, "run_memory_tool", failing_memory_tool)
+    monkeypatch.setattr(chat_runner, "_emit", record)
+    monkeypatch.setattr(chat_runner, "_cancelled", never_cancelled)
+    ctx = round_context()
+    running = asyncio.create_task(chat_runner._run_tools(ctx, [MEMORY_CALL], set()))
+    await asyncio.wait_for(in_flight.wait(), 5)
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+
+    release.set()
+    with caplog.at_level(logging.ERROR, logger=chat_runner.logger.name):
+        await asyncio.wait_for(chat_runner._settle_writers(ctx), 5)
+    assert [record.getMessage() for record in caplog.records] == [
+        f"tool memory failed in turn {ctx.turn.id}"
+    ]
+    assert [event for event, _ in emitted] == [chat_events.TOOL_RESULT]
+    assert emitted[0][1]["is_error"] is True and ctx.writers == {}

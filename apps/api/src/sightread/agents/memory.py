@@ -19,9 +19,12 @@ KINDS: tuple[str, ...] = ("term", "preference", "about", "document")
 # would read to the model as something the reader never wrote (docs/chat.md § Instructions).
 # The joiners U+200C and U+200D stay — scripts and emoji sequences need them.
 _INVISIBLE = re.compile("[\u200b\u2060\ufeff\u200e\u200f\u061c\u202a-\u202e\u2066-\u2069]")
-# The C0 control characters and DEL, but tab, newline and carriage return: NUL is refused by
-# PostgreSQL's TEXT outright, and none of them is anything a reader typed.
-_CONTROL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# The C0 control characters and DEL: NUL is refused by PostgreSQL's TEXT outright, and none of
+# them is anything a reader typed. Tab, newline and carriage return stay; the vertical tab, the
+# form feed and the separators U+001C–U+001F break a line where they stand (a pasted Word line
+# break, a page break in extracted text), so they become one rather than joining two words.
+_CONTROL = re.compile("[\x00-\x08\x0e-\x1b\x7f]")
+_BREAKING = re.compile("[\x0b\x0c\x1c-\x1f]")
 _WHITESPACE = re.compile(r"\s+")
 
 
@@ -29,7 +32,7 @@ def clean_text(value: str, *, single_line: bool) -> str:
     """The text without the invisible and control characters, its ends trimmed; with
     `single_line`, every run of whitespace — newlines included — one space, as a memory is
     one line."""
-    cleaned = _CONTROL.sub("", _INVISIBLE.sub("", value))
+    cleaned = _BREAKING.sub("\n", _CONTROL.sub("", _INVISIBLE.sub("", value)))
     if single_line:
         cleaned = _WHITESPACE.sub(" ", cleaned)
     return cleaned.strip()

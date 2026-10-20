@@ -3,7 +3,7 @@
  * One chip of what goes with a message besides its text — the document, the selection, a
  * whole section (docs/web.md § The agent panel, *Context chips*). The composer's carry a
  * remove control; a sent message's, under its bubble in the thread, do not. The text is cut
- * to one line: a passage reads by its first words.
+ * to one line: a passage reads by its first words, and the whole of it is the tooltip.
  */
 import type { IconName } from '~/lib/icons'
 
@@ -22,7 +22,7 @@ const emit = defineEmits<{ remove: [] }>()
 <template>
   <span class="chip" :class="{ faint }">
     <UiIcon :name="icon" />
-    <span class="chip-text">{{ text }}</span>
+    <span class="chip-text" :title="text">{{ text }}</span>
     <button
       v-if="removeLabel"
       type="button"

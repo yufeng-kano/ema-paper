@@ -71,6 +71,19 @@ export interface PlaceOptions {
   above?: boolean
 }
 
+/** Below this much room over the point, a menu asked to open above it opens as any other. */
+const ROOM_ABOVE_MIN = 120
+
+/**
+ * The tallest a menu opened `above` a point may be: the room between the point and the
+ * window's top margin, so a long list scrolls inside that room rather than being pushed
+ * down over the control it opened from. Null when there is too little room to be worth it.
+ */
+export function heightAbove(at: Point, margin = MARGIN): number | null {
+  const room = at.y - margin
+  return room >= ROOM_ABOVE_MIN ? room : null
+}
+
 export function placeMenu(at: Point, menu: Size, viewport: Size, options: PlaceOptions = {}): Point {
   const margin = options.margin ?? MARGIN
   return {

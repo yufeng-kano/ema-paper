@@ -742,19 +742,31 @@ async def _run_memory(
     for: a cancel between the two would leave a memory the thread draws no line for, with
     no Undo (docs/chat.md § Memory)."""
 
+    # The task outlives a Stop or a timeout, and then nobody awaits it — so its failures are
+    # logged and reported here, not left to `_run_tool`, which by then has moved on.
     async def run() -> dict:
-        outcome = await chat_memory.run_memory_tool(
-            ctx.sessionmaker,
-            ctx.settings,
-            user_id=ctx.turn.user_id,
-            conversation_id=ctx.conversation.id,
-            document_id=ctx.document.id,
-            tool_use_id=tool_use_id,
-            tool_input=tool_input,
-        )
+        try:
+            outcome = await chat_memory.run_memory_tool(
+                ctx.sessionmaker,
+                ctx.settings,
+                user_id=ctx.turn.user_id,
+                conversation_id=ctx.conversation.id,
+                document_id=ctx.document.id,
+                tool_use_id=tool_use_id,
+                tool_input=tool_input,
+            )
+        except Exception:  # noqa: BLE001 - any failure is this call's, never the turn's
+            logger.exception("tool memory failed in turn %s", ctx.turn.id)
+            outcome = chat_tools.ToolOutcome(
+                "The tool failed unexpectedly; try another way.", is_error=True
+            )
         if admit is not None:
             outcome = admit(outcome)
-        return await _report_tool(ctx, tool_use_id, "memory", outcome)
+        try:
+            return await _report_tool(ctx, tool_use_id, "memory", outcome)
+        except Exception:
+            logger.exception("tool memory's result was not recorded in turn %s", ctx.turn.id)
+            raise
 
     task = asyncio.ensure_future(run())
     ctx.writers[task] = "memory"

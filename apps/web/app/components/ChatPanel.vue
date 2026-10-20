@@ -375,11 +375,10 @@ function endedTurns(): Set<string> {
  * read as undone for a round trip. A replayed frame of a turn already over is left to the read
  * that follows — the list may well be newer than it.
  */
-function applyMemoryFrames(frames: readonly StreamedEvent[]) {
+function applyMemoryFrames(frames: readonly StreamedEvent[], ended: ReadonlySet<string>) {
   if (memories.value === null) {
     return
   }
-  const ended = endedTurns()
   const context = {
     conversationId: currentId.value,
     conversationTitle: current.value?.title ?? null,
@@ -466,6 +465,11 @@ function flushFrames() {
   }
   const batch = pendingFrames
   pendingFrames = []
+  const memoryFrames = batch.filter((frame) => frame.event.event === 'memory')
+  // Which turns were over is read before this batch joins the thread: a turn's terminal frame
+  // follows its memory frames, often in the same batch (a Stop during a save), and must not
+  // make that save read as a replay.
+  const endedBefore = memoryFrames.length ? endedTurns() : null
   events.value = events.value.concat(batch)
   // A replayed edit of a finished turn changed nothing since the viewer loaded; one of a
   // turn still in flight did. One reload covers however many landed in this batch.
@@ -474,9 +478,8 @@ function flushFrames() {
     emit('changed')
   }
   // A memory saved, changed or forgotten: its line's state is read from the list.
-  const memoryFrames = batch.filter((frame) => frame.event.event === 'memory')
-  if (memoryFrames.length) {
-    applyMemoryFrames(memoryFrames)
+  if (endedBefore) {
+    applyMemoryFrames(memoryFrames, endedBefore)
     void memoriesChanged()
   }
   const ended = batch.some(

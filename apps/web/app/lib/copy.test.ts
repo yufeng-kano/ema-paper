@@ -358,4 +358,15 @@ describe('selectionText', () => {
     ]
     expect(selectionText(nodes)).toBe('3.2 Attention\nAn attention function\nmaps a query.\ndef f():\n    return 1')
   })
+
+  it('keeps table cells apart, whether the selection holds the table, its rows or cells of one row', () => {
+    const row = (...cells: string[]) => el('tr', {}, cells.map((cell) => el('td', {}, [text(cell)])))
+    const table = el('table', {}, [
+      el('thead', {}, [el('tr', {}, [el('th', {}, [text('Model')]), el('th', {}, [text('BLEU')])])]),
+      el('tbody', {}, [row('Transformer (base)', '27.3'), row('Transformer (big)', '28.4')]),
+    ])
+    expect(selectionText([table])).toBe('Model\tBLEU\nTransformer (base)\t27.3\nTransformer (big)\t28.4')
+    expect(selectionText([row('a', '1'), row('b', '2')])).toBe('a\t1\nb\t2')
+    expect(selectionText([el('td', {}, [text('27.3')]), el('td', {}, [text('38.1')])])).toBe('27.3\t38.1')
+  })
 })

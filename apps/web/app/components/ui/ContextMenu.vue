@@ -22,7 +22,7 @@
  * the dialog's panel instead (`modalPanelKey`), which is still above every scroll container
  * in it, and the only place `aria-modal` leaves visible to assistive tech.
  */
-import { modalPanelKey, placeMenu, type MenuFact, type MenuItem, type Point } from '~/lib/menu'
+import { heightAbove, modalPanelKey, placeMenu, type MenuFact, type MenuItem, type Point } from '~/lib/menu'
 
 const props = defineProps<{
   /** Where the gesture happened, in viewport coordinates. */
@@ -143,6 +143,10 @@ async function place() {
   await nextTick()
   const element = menu.value
   if (element) {
+    // Opened above its point, it is held to the room there, so a long list scrolls rather
+    // than being pushed down over the control below.
+    const room = props.above ? heightAbove(props.at) : null
+    element.style.maxHeight = room === null ? '' : `${room}px`
     // The layout box, not the drawn one: the opening animation's scale would shrink it, and
     // a menu placed by a size it does not have runs past the point it was meant to end at.
     const at = placeMenu(
