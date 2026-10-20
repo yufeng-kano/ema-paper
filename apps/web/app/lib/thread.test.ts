@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import type { ChatEvent, ChatMessage, ChatTurn } from './api'
-import { buildThread, type ThreadItem } from './thread'
+import type { ChatEvent, ChatMessage, ChatTurn, Memory } from './api'
+import { buildThread, memoryLineState, type MemoryLine, type ThreadItem } from './thread'
 
 const TURN = 'turn-1'
 
@@ -47,7 +47,7 @@ describe('buildThread', () => {
     )
     const { items, liveTurns } = buildThread({ turns: [turn(true)], messages, groups })
     expect(liveTurns).toEqual([])
-    expect(kinds(items)).toEqual(['user', 'text', 'steps', 'text'])
+    expect(kinds(items)).toEqual(['user', 'text', 'steps', 'text', 'foot'])
     const steps = items[2] as Extract<ThreadItem, { kind: 'steps' }>
     expect(steps.live).toBe(false)
     expect(steps.steps.map((step) => step.type)).toEqual(['tool', 'note', 'tool'])
@@ -57,8 +57,8 @@ describe('buildThread', () => {
     const edit = steps.steps[2]!
     expect(edit.type === 'tool' && edit.card?.commit).toBe('c1')
     expect(edit.type === 'tool' && edit.added).toBe(1)
-    expect((items[3] as Extract<ThreadItem, { kind: 'text' }>).copy).toBe(true)
-    expect((items[1] as Extract<ThreadItem, { kind: 'text' }>).copy).toBe(false)
+    // The last answer of a finished turn is the one its foot copies.
+    expect(items[4]).toMatchObject({ kind: 'foot', text: 'Done.', used: null })
   })
 
   it('shows a live turn from its events, the trailing group in flight', () => {
@@ -141,7 +141,7 @@ describe('buildThread', () => {
       message('assistant', [{ type: 'text', text: 'Fixed.' }]),
     ]
     const { items } = buildThread({ turns: [turn(true)], messages, groups: new Map() })
-    expect(kinds(items)).toEqual(['user', 'subagent', 'text'])
+    expect(kinds(items)).toEqual(['user', 'subagent', 'text', 'foot'])
     const card = (items[1] as Extract<ThreadItem, { kind: 'subagent' }>).card
     expect(card).toMatchObject({ status: 'ok', report: 'Two mismatches.', elapsedMs: 52_000 })
     expect(card.steps.map((step) => step.type)).toEqual(['tool', 'note'])
@@ -231,5 +231,126 @@ describe('buildThread', () => {
     const groups = events({ event: 'turn_error', status: 'cancelled', error: 'cancelled' })
     const { items } = buildThread({ turns: [turn(true, 'cancelled')], messages, groups })
     expect(kinds(items)).toEqual(['user', 'cancelled'])
+  })
+
+  it('reads the selection’s text and the sections a message carried', () => {
+    const messages = [
+      message('user', [
+        { type: 'text', text: 'Explain' },
+        { type: 'text', text: 'Instead of performing a single attention function', context: 'selection' },
+        { type: 'text', text: '', context: 'section', section: '3.2 Attention' },
+        { type: 'text', text: '', context: 'section', section: '3.3 Feed-Forward' },
+      ]),
+    ]
+    const { items } = buildThread({ turns: [turn(false)], messages, groups: new Map() })
+    expect(items[0]).toMatchObject({
+      kind: 'user',
+      text: 'Explain',
+      selection: 'Instead of performing a single attention function',
+      sections: ['3.2 Attention', '3.3 Feed-Forward'],
+    })
+  })
+})
+
+const SAVED = { id: 12, kind: 'term', text: 'query → 查詢', document_id: null, pinned: false }
+const REMEMBER = { kind: 'term', text: 'query → 查詢', scope: 'all', action: 'save', id: '' }
+
+describe('memory lines and what an answer used', () => {
+  it('turns a memory call into a line under the final answer, never a step', () => {
+    const messages = [
+      message('user', [{ type: 'text', text: 'Translate query as 查詢 from now on' }]),
+      message('assistant', [
+        { type: 'text', text: 'Noted.' },
+        { type: 'tool_use', id: 'm', name: 'memory', input: REMEMBER },
+      ]),
+      message('user', [{ type: 'tool_result', tool_use_id: 'm', content: 'Saved as m12.' }]),
+      message('assistant', [{ type: 'text', text: 'I will use 查詢.' }]),
+    ]
+    const groups = events(
+      { event: 'turn_start', model: 'm', instructions: true, memory_ids: [3, 4] },
+      { event: 'tool_use', id: 'm', name: 'memory', input: REMEMBER },
+      { event: 'memory', tool_use_id: 'm', action: 'saved', memory: SAVED, previous: null },
+      { event: 'tool_result', id: 'm', name: 'memory', is_error: false, output: 'Saved as m12.' },
+      { event: 'turn_done' },
+    )
+    const { items } = buildThread({ turns: [turn(true)], messages, groups })
+    expect(kinds(items)).toEqual(['user', 'text', 'text', 'memory', 'foot'])
+    expect(items[3]).toMatchObject({ kind: 'memory', line: { toolUseId: 'm', action: 'saved', memory: SAVED } })
+    expect(items[4]).toMatchObject({ text: 'I will use 查詢.', used: { instructions: true, memoryIds: [3, 4] } })
+  })
+
+  it('hides a live memory call too, the line following the newest text', () => {
+    const messages = [message('user', [{ type: 'text', text: 'Remember this' }])]
+    const groups = events(
+      { event: 'turn_start', model: 'm', instructions: false, memory_ids: [] },
+      { event: 'text_delta', text: 'Saving it.' },
+      { event: 'tool_use', id: 'm', name: 'memory', input: REMEMBER },
+      { event: 'memory', tool_use_id: 'm', action: 'saved', memory: SAVED, previous: null },
+    )
+    const { items } = buildThread({ turns: [turn(false)], messages, groups })
+    expect(kinds(items)).toEqual(['user', 'text', 'memory', 'working'])
+  })
+
+  it('says nothing of what a turn used when it had neither instructions nor memories', () => {
+    const messages = [message('user', [{ type: 'text', text: 'Hi' }]), message('assistant', [{ type: 'text', text: 'Hello.' }])]
+    for (const start of [{ model: 'm' }, { model: 'm', instructions: false, memory_ids: [] }]) {
+      const { items } = buildThread({ turns: [turn(true)], messages, groups: events({ event: 'turn_start', ...start }) })
+      expect(items.at(-1)).toMatchObject({ kind: 'foot', used: null })
+    }
+  })
+
+  it('keeps the lines of a turn that ended without an answer', () => {
+    const messages = [message('user', [{ type: 'text', text: 'Forget that' }])]
+    const groups = events(
+      { event: 'memory', tool_use_id: 'f', action: 'forgotten', memory: SAVED, previous: null },
+      { event: 'turn_error', status: 'failed', error: 'boom' },
+    )
+    const { items } = buildThread({ turns: [turn(true, 'failed')], messages, groups })
+    expect(kinds(items)).toEqual(['user', 'memory', 'error'])
+  })
+})
+
+function row(fields: Partial<Memory> = {}): Memory {
+  return {
+    ...SAVED,
+    kind: 'term',
+    document_name: null,
+    conversation_id: 1,
+    conversation_title: null,
+    source_ref: null,
+    created_at: '2026-10-20T00:00:00Z',
+    updated_at: '2026-10-20T00:00:00Z',
+    ...fields,
+  }
+}
+
+describe('memoryLineState', () => {
+  const saved: MemoryLine = { toolUseId: 'm', action: 'saved', memory: { ...SAVED, kind: 'term' }, previous: null }
+
+  it('waits for the memories, then finds the saved row by the call', () => {
+    expect(memoryLineState(saved, null)).toEqual({ state: 'loading' })
+    expect(memoryLineState(saved, [row({ source_ref: 'm' })])).toMatchObject({ state: 'saved', row: { id: 12 } })
+    // Saved again after an Undo: a new row, found by the call it carries.
+    expect(memoryLineState(saved, [row({ id: 40, source_ref: 'm' })])).toMatchObject({ state: 'saved', row: { id: 40 } })
+    expect(memoryLineState(saved, [row({ id: 7, source_ref: 'other' })])).toEqual({ state: 'unsaved' })
+  })
+
+  it('reads an update as applied, undone, or changed since', () => {
+    const updated: MemoryLine = {
+      toolUseId: 'u',
+      action: 'updated',
+      memory: { ...SAVED, kind: 'term', text: 'query → 查詢語句' },
+      previous: { ...SAVED, kind: 'term' },
+    }
+    expect(memoryLineState(updated, [row({ text: 'query → 查詢語句', pinned: true })])).toMatchObject({ state: 'updated' })
+    expect(memoryLineState(updated, [row()])).toMatchObject({ state: 'reverted', row: { id: 12 } })
+    expect(memoryLineState(updated, [row({ text: 'edited on the Agent page' })])).toMatchObject({ state: 'changed' })
+    expect(memoryLineState(updated, [])).toEqual({ state: 'changed', row: null })
+  })
+
+  it('reads a forget as forgotten until Undo puts a row back for the call', () => {
+    const forgotten: MemoryLine = { toolUseId: 'f', action: 'forgotten', memory: { ...SAVED, kind: 'term' }, previous: null }
+    expect(memoryLineState(forgotten, [])).toEqual({ state: 'forgotten' })
+    expect(memoryLineState(forgotten, [row({ id: 41, source_ref: 'f' })])).toMatchObject({ state: 'restored', row: { id: 41 } })
   })
 })

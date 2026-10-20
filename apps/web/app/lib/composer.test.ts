@@ -8,6 +8,7 @@ import {
   isImageFile,
   matchCommands,
   refuseAttachment,
+  sectionText,
   type CommandOption,
 } from './composer'
 
@@ -90,5 +91,18 @@ describe('attachments', () => {
     expect(formatBytes(2_400_000)).toBe('2.3 MB')
     expect(formatBytes(12_400)).toBe('12 KB')
     expect(formatBytes(10)).toBe('1 KB')
+  })
+})
+
+describe('sectionText', () => {
+  it('sends a section whole up to the cap, counted in code points', () => {
+    expect(sectionText('## 3.2 注意力\n\n內文', 14)).toBe('## 3.2 注意力\n\n內文')
+    // Twelve code points, more UTF-16 units than that: still within a cap of 12.
+    expect(sectionText('𝑥'.repeat(12), 12)).toBe('𝑥'.repeat(12))
+  })
+
+  it('sends null rather than a cut section past the cap, and whole without one', () => {
+    expect(sectionText('x'.repeat(13), 12)).toBeNull()
+    expect(sectionText('x'.repeat(13), undefined)).toBe('x'.repeat(13))
   })
 })

@@ -65,7 +65,8 @@ function inlineText(node: MarkdownNode): string {
   if (tex !== null) {
     return tex
   }
-  // Rendered emphasis, code, <br>, <sup> and <sub> carry their exact markdown source (docs/web.md).
+  // Rendered emphasis, code, <br>, <sup> and <sub> carry their exact markdown source (docs/web.md),
+  // and so does an answer's section link, drawn as a button or as its plain text.
   const src = attribute(node, 'data-src')
   if (src !== null) {
     return inlineSource(node, src)
@@ -94,7 +95,8 @@ function inlineSource(node: MarkdownNode, src: string): string {
   } else if (name === 'sup' || name === 'sub') {
     marker = `<${name}>`
   } else {
-    // <br> has no children to lose — its source is its source.
+    // <br> has no children to lose, and a section link is copied whole — its source is its
+    // source.
     return src
   }
   // A tag closes with its end tag; every other marker closes with itself.
@@ -250,8 +252,9 @@ function blockToMarkdown(node: MarkdownNode, partialBlocks?: ReadonlySet<string>
   }
 }
 
-/** Tags that carry inline content — a selection inside one paragraph arrives as these. */
-const INLINE_TAGS = new Set(['span', 'sup', 'sub', 'em', 'strong', 'i', 'b', 'a', 'code', 'br'])
+/** Tags that carry inline content — a selection inside one paragraph arrives as these. A
+ *  button is an answer's section link (docs/web.md § The agent panel). */
+const INLINE_TAGS = new Set(['span', 'sup', 'sub', 'em', 'strong', 'i', 'b', 'a', 'code', 'br', 'button'])
 
 function isInline(node: MarkdownNode): boolean {
   if (node.nodeType === TEXT_NODE) {

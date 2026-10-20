@@ -8,15 +8,20 @@
  * in flight. A turn with its assistant messages stored renders from them (its edit cards
  * taking their commits from the replayed `edit` events); one still running renders from
  * its events as they arrive, and a stored turn still running shows the stream past the
- * last tool call the record holds.
+ * last tool call the record holds. What only the events say — the memories a turn saved,
+ * changed or forgot, and what it was given beyond the document — is read from them for
+ * every turn, stored or live, since the panel replays a conversation's events from 0.
  */
-import type { ChatEvent, ChatMessage, ChatTurn, ContentBlock, SubagentRecord } from './api'
+import type { ChatEvent, ChatMessage, ChatTurn, ContentBlock, Memory, MemorySnapshot, SubagentRecord } from './api'
 import { addedLines, diffFromInput, groupRuns, parseDiff, readStep, resultText, type DiffLine, type Step } from './steps'
 
 /** The chat agent's editor tool and the commands of it that write (docs/chat.md § Tools). */
 export const EDITOR_TOOL = 'str_replace_based_edit_tool'
 export const EDITOR_WRITES = new Set(['str_replace', 'insert', 'create'])
 export const SUBAGENT_TOOL = 'subagent'
+/** A `memory` call is not a step: its `memory` event is a line under the answer instead
+ *  (docs/web.md § The agent panel, *What the answer used, and memory lines*). */
+export const MEMORY_TOOL = 'memory'
 
 /** A turn the backend has not finished: queued, running, or cancelled and still winding
  *  down a tool call — `finished_at` says, not the status (docs/chat.md § Conversations). */
@@ -98,6 +103,29 @@ export interface UserAttachment {
   preview: string | null
 }
 
+/** What one `memory` call did, from its event (docs/chat.md § Memory). */
+export interface MemoryLine {
+  toolUseId: string
+  action: 'saved' | 'updated' | 'forgotten'
+  /** The row as the call left it; as it was before a `forgotten`. */
+  memory: MemorySnapshot
+  /** The row before an `updated`. */
+  previous: MemorySnapshot | null
+}
+
+/** What a turn was given beyond the document, from its `turn_start`. */
+export interface UsedContext {
+  instructions: boolean
+  memoryIds: number[]
+}
+
+/** What the small card under an answer shows: a memory line's memory, the reader's
+ *  instructions as they are now, or the memories a turn loaded. */
+export type ContextCardView =
+  | { kind: 'memory'; line: MemoryLine }
+  | { kind: 'instructions' }
+  | { kind: 'memories'; ids: number[] }
+
 export type ThreadItem =
   | {
       kind: 'user'
@@ -105,12 +133,19 @@ export type ThreadItem =
       /** The stored message the attachments belong to; null before one is known. */
       messageId: number | null
       text: string
-      selection: number
+      /** The passage of the document that went with it. */
+      selection: string | null
+      /** The headings of the whole sections that went with it. */
+      sections: string[]
       quote: string | null
       command: string | null
       attachments: UserAttachment[]
     }
-  | { kind: 'text'; key: string; text: string; copy: boolean }
+  | { kind: 'text'; key: string; text: string }
+  | { kind: 'memory'; key: string; turnId: string; line: MemoryLine }
+  /** Under a finished turn's last answer, after its memory lines: what the turn used and
+   *  the control that copies the answer, as its markdown. */
+  | { kind: 'foot'; key: string; turnId: string; text: string; used: UsedContext | null }
   | { kind: 'steps'; key: string; turnId: string; steps: StepItem[]; live: boolean }
   | { kind: 'subagent'; key: string; card: SubagentView }
   | { kind: 'error'; key: string; text: string }
@@ -147,11 +182,21 @@ export function textOf(blocks: readonly ContentBlock[]): string {
     .trim()
 }
 
-/** How many characters of the document went with the message as its selection, or 0. */
-export function selectionOf(blocks: readonly ContentBlock[]): number {
-  return blocks
+/** The passage of the document that went with the message as its selection, or null. */
+export function selectionOf(blocks: readonly ContentBlock[]): string | null {
+  const text = blocks
     .filter((block) => block.type === 'text' && block.context === 'selection')
-    .reduce((total, block) => total + blockText(block).length, 0)
+    .map(blockText)
+    .join('\n')
+    .trim()
+  return text || null
+}
+
+/** The headings of the whole sections that went with the message, in the order sent. */
+export function sectionsOf(blocks: readonly ContentBlock[]): string[] {
+  return blocks.flatMap((block) =>
+    block.type === 'text' && block.context === 'section' && block.section ? [block.section] : [],
+  )
 }
 
 export function isToolResultOnly(blocks: readonly ContentBlock[]): boolean {
@@ -222,7 +267,12 @@ function userItem(prefix: string, typed: ChatMessage[]): ThreadItem | null {
     key: `${prefix}-user`,
     messageId: first.id,
     text,
-    selection: typed.reduce((total, message) => total + selectionOf(message.content), 0),
+    selection:
+      typed
+        .map((message) => selectionOf(message.content))
+        .filter(Boolean)
+        .join('\n') || null,
+    sections: typed.flatMap((message) => sectionsOf(message.content)),
     quote: quotes.filter(Boolean).join('\n') || null,
     command,
     attachments,
@@ -252,6 +302,36 @@ function sinceRestart(events: ChatEvent[], parent: string | undefined): ChatEven
 
 function parentOf(event: ChatEvent): string | undefined {
   return 'parent' in event ? event.parent : undefined
+}
+
+/** The turn's `memory` events, one line per call, in the order they arrived. */
+function memoryLines(group: readonly ChatEvent[] | undefined): MemoryLine[] {
+  const lines = new Map<string, MemoryLine>()
+  for (const event of group ?? []) {
+    if (event.event === 'memory') {
+      lines.set(event.tool_use_id, {
+        toolUseId: event.tool_use_id,
+        action: event.action,
+        memory: event.memory,
+        previous: event.previous,
+      })
+    }
+  }
+  return [...lines.values()]
+}
+
+/** What the turn was given beyond the document, or null when it was given neither the
+ *  reader's instructions nor a memory (or ran before either existed). */
+function usedContext(group: readonly ChatEvent[] | undefined): UsedContext | null {
+  let start: Extract<ChatEvent, { event: 'turn_start' }> | undefined
+  for (const event of group ?? []) {
+    if (event.event === 'turn_start') {
+      start = event
+    }
+  }
+  const instructions = start?.instructions === true
+  const memoryIds = start?.memory_ids ?? []
+  return instructions || memoryIds.length ? { instructions, memoryIds } : null
 }
 
 export function buildThread(input: ThreadInput): Thread {
@@ -388,10 +468,12 @@ export function buildThread(input: ThreadInput): Thread {
       }
     }
 
-    const callItem = (id: string, name: string, input: Record<string, unknown>, key: string): Flat =>
-      name === SUBAGENT_TOOL
-        ? { kind: 'subagent', key, card: subagentView(id, input) }
-        : { kind: 'step', item: toolStep(id, name, input, key) }
+    const callItem = (id: string, name: string, input: Record<string, unknown>, key: string): Flat[] =>
+      name === MEMORY_TOOL
+        ? []
+        : name === SUBAGENT_TOOL
+          ? [{ kind: 'subagent', key, card: subagentView(id, input) }]
+          : [{ kind: 'step', item: toolStep(id, name, input, key) }]
 
     // The live events a persisted round does not cover: what streamed after the last
     // tool call the record holds (its results and the next round), or the whole group
@@ -405,7 +487,7 @@ export function buildThread(input: ThreadInput): Thread {
       let textKey = 0
       const flushText = () => {
         if (text.trim()) {
-          flat.push({ kind: 'text', key: `${prefix}-live-${textKey}`, text: text.trim(), copy: false })
+          flat.push({ kind: 'text', key: `${prefix}-live-${textKey}`, text: text.trim() })
         }
         text = ''
         textKey += 1
@@ -423,7 +505,7 @@ export function buildThread(input: ThreadInput): Thread {
             break
           case 'tool_use':
             flushText()
-            flat.push(callItem(event.id, event.name, event.input, `${prefix}-tool-${event.id}`))
+            flat.push(...callItem(event.id, event.name, event.input, `${prefix}-tool-${event.id}`))
             break
           default:
             break
@@ -438,12 +520,12 @@ export function buildThread(input: ThreadInput): Thread {
         message.content.forEach((block, position) => {
           const at = `${round}-${position}`
           if (block.type === 'text' && blockText(block).trim()) {
-            flat.push({ kind: 'text', key: `${prefix}-text-${at}`, text: blockText(block).trim(), copy: false })
+            flat.push({ kind: 'text', key: `${prefix}-text-${at}`, text: blockText(block).trim() })
           } else if (block.type === 'thinking' && block.thinking.trim()) {
             flat.push({ kind: 'step', item: { type: 'note', key: `${prefix}-think-${at}`, text: block.thinking.trim() } })
           } else if (block.type === 'tool_use') {
             storedTools.add(block.id)
-            flat.push(callItem(block.id, block.name, block.input, `${prefix}-tool-${block.id}`))
+            flat.push(...callItem(block.id, block.name, block.input, `${prefix}-tool-${block.id}`))
           }
         })
       })
@@ -471,16 +553,27 @@ export function buildThread(input: ThreadInput): Thread {
       }
     }
 
-    if (done) {
-      // The last answer of a finished turn can be copied whole.
-      for (let index = flat.length - 1; index >= 0; index -= 1) {
-        const entry = flat[index]!
-        if (entry.kind === 'text') {
-          flat[index] = { ...entry, copy: true }
-          break
-        }
+    // Under the last answer: the turn's memory lines, then — once it is finished — what it
+    // used and the control that copies the answer. Live, the lines follow the newest text and
+    // so land under the final one when the turn ends; a turn with no text keeps them at its
+    // end.
+    let lastText = -1
+    flat.forEach((entry, index) => {
+      if (entry.kind === 'text') {
+        lastText = index
       }
+    })
+    const under: Flat[] = memoryLines(group).map((line) => ({
+      kind: 'memory',
+      key: `${prefix}-memory-${line.toolUseId}`,
+      turnId,
+      line,
+    }))
+    const answer = flat[lastText]
+    if (done && answer?.kind === 'text') {
+      under.push({ kind: 'foot', key: `${prefix}-foot`, turnId, text: answer.text, used: usedContext(group) })
     }
+    flat.splice(lastText === -1 ? flat.length : lastText + 1, 0, ...under)
 
     const streamError = group?.find(
       (event): event is Extract<ChatEvent, { event: 'turn_error' }> => event.event === 'turn_error',
@@ -528,4 +621,59 @@ export function buildThread(input: ThreadInput): Thread {
   }
 
   return { items, liveTurns }
+}
+
+/**
+ * Where a memory line stands, read from the memories as they are now rather than from what
+ * was clicked, so a reload or another tab shows what is true (docs/web.md § The agent
+ * panel). The row a call saved is found by the call's id (`source_ref`), which Undo and
+ * Save again carry too; a row a call changed, by its own id.
+ *
+ * - `saved`: the row is there — **Undo** deletes it. `unsaved`: it is not — **Save again**.
+ * - `updated`: the row reads as the call left it — **Undo** writes back what it was.
+ *   `reverted`: it reads as it was before — **Apply again**. `changed`: neither, edited or
+ *   deleted since — only **View**.
+ * - `forgotten`: nothing holds it — **Undo** saves it again. `restored`: Undo put it back —
+ *   **Remove again** deletes that row.
+ *
+ * `loading` until the memories have been read. Only the fields the tool writes are compared
+ * (kind, text, scope): a pin the reader added since is theirs, not the call's.
+ */
+export type MemoryLineState =
+  | { state: 'loading' }
+  | { state: 'saved'; row: Memory }
+  | { state: 'unsaved' }
+  | { state: 'updated'; row: Memory }
+  | { state: 'reverted'; row: Memory }
+  | { state: 'changed'; row: Memory | null }
+  | { state: 'forgotten' }
+  | { state: 'restored'; row: Memory }
+
+/** Whether a row holds what a snapshot says, in the fields the `memory` tool writes. */
+export function sameMemory(row: Pick<Memory, 'kind' | 'text' | 'document_id'>, snapshot: MemorySnapshot): boolean {
+  return row.kind === snapshot.kind && row.text === snapshot.text && row.document_id === snapshot.document_id
+}
+
+export function memoryLineState(line: MemoryLine, memories: readonly Memory[] | null): MemoryLineState {
+  if (memories === null) {
+    return { state: 'loading' }
+  }
+  const bySource = memories.find((row) => row.source_ref === line.toolUseId)
+  const byId = memories.find((row) => row.id === line.memory.id)
+  switch (line.action) {
+    case 'saved': {
+      const row = bySource ?? byId
+      return row ? { state: 'saved', row } : { state: 'unsaved' }
+    }
+    case 'updated':
+      if (byId && sameMemory(byId, line.memory)) {
+        return { state: 'updated', row: byId }
+      }
+      if (byId && line.previous && sameMemory(byId, line.previous)) {
+        return { state: 'reverted', row: byId }
+      }
+      return { state: 'changed', row: byId ?? null }
+    case 'forgotten':
+      return bySource ? { state: 'restored', row: bySource } : { state: 'forgotten' }
+  }
 }
