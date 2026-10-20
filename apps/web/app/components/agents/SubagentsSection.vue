@@ -16,6 +16,8 @@ defineProps<{
 
 const { t } = useI18n()
 const { resolve } = useApiError()
+/** Every subagent is listed in the agent's catalogue block. */
+const contextVersion = useAgentContextVersion()
 
 const subagents = ref<Subagent[] | null>(null)
 const error = ref<string | null>(null)
@@ -52,11 +54,13 @@ function onSaved(saved: Subagent, previous: string | null) {
   const list = subagents.value ?? []
   subagents.value = previous === null ? [...list, saved] : list.map((row) => (row.name === previous ? saved : row))
   editing.value = null
+  contextVersion.changed()
 }
 
 function onDeleted(name: string) {
   subagents.value = (subagents.value ?? []).filter((row) => row.name !== name)
   editing.value = null
+  contextVersion.changed()
 }
 </script>
 

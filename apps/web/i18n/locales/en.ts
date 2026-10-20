@@ -271,7 +271,6 @@ export default {
       preset: 'Prompt saved in an earlier version',
       instructions: 'Your instructions',
       catalogue: 'Skills catalogue ({skills})',
-      catalogueSubagents: 'Skills catalogue ({skills}) and subagents ({subagents})',
       memory: 'Memory index ({count})',
       memoryPaused: 'Memory · paused',
       turn: 'Each message’s context',

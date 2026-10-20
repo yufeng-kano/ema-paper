@@ -10,8 +10,12 @@
  * No document is open on the Agent page, so the facts are listed by name, each filled in
  * per document, and the prompt shows its tokens as they are. Sizes are characters: counting
  * tokens would be an upstream call.
+ *
+ * The panel stays usable beside it, so it reloads after every save that can change what it
+ * lists (`useAgentContextVersion`), and Escape closes it from anywhere on the page.
  */
-import { getAgentContext, type AgentContext, type AgentContextFacts, type AgentContextPart } from '~/lib/api'
+import { getAgentContext, type AgentContext, type AgentContextPart } from '~/lib/api'
+import { escapeClosesDrawer, receivesRows } from '~/lib/receives'
 
 defineProps<{
   /** The drawer's element id, which the button that opens it names in `aria-controls`. */
@@ -22,29 +26,28 @@ const emit = defineEmits<{ close: [] }>()
 
 const { t, locale } = useI18n()
 const { resolve } = useApiError()
-
-/** The facts the prompt is rendered with, in the order the API lists them. */
-const FACT_NAMES: readonly (keyof AgentContextFacts)[] = [
-  'document_path',
-  'page_count',
-  'bbox_format',
-  'parse_model',
-  'network',
-]
+const { version } = useAgentContextVersion()
 
 const headingId = useId()
 const heading = ref<HTMLElement | null>(null)
 const context = ref<AgentContext | null>(null)
 const error = ref<string | null>(null)
+/** A reload after a save is in flight; the rows it replaces stay until it answers. */
+const reloading = ref(false)
 /** The rows opened onto their text. */
 const opened = reactive(new Set<string>())
 /** Request generation: only the newest load may fill the drawer. */
 let loads = 0
 
-async function load() {
+/** `again` keeps the rows on screen while the reload is in flight, rather than flashing
+ *  back to the skeleton after every save. */
+async function load(again = false) {
   const seq = ++loads
-  context.value = null
+  if (!again) {
+    context.value = null
+  }
   error.value = null
+  reloading.value = again
   try {
     const answer = await getAgentContext(locale.value)
     if (seq === loads) {
@@ -54,16 +57,11 @@ async function load() {
     if (seq === loads) {
       error.value = await resolve(failure)
     }
+  } finally {
+    if (seq === loads) {
+      reloading.value = false
+    }
   }
-}
-
-interface Row {
-  key: string
-  label: string
-  /** The text the row opens onto; null for the facts, which are a list of their own. */
-  text: string | null
-  /** Its size in characters; null where there is no one text to measure. */
-  chars: number | null
 }
 
 function partLabel(part: AgentContextPart): string {
@@ -75,9 +73,8 @@ function partLabel(part: AgentContextPart): string {
     case 'instructions':
       return t('agents.receives.instructions')
     case 'catalogue':
-      return part.subagents
-        ? t('agents.receives.catalogueSubagents', { skills: part.skills ?? 0, subagents: part.subagents })
-        : t('agents.receives.catalogue', { skills: part.skills ?? 0 })
+      // The skills the agent may load; the subagents the block also lists are in its text.
+      return t('agents.receives.catalogue', { skills: part.skills ?? 0 })
     case 'memory':
       return part.paused ? t('agents.receives.memoryPaused') : t('agents.receives.memory', { count: part.count ?? 0 })
   }
@@ -85,24 +82,17 @@ function partLabel(part: AgentContextPart): string {
   return String((part as { kind: string }).kind)
 }
 
-/** The system blocks as sent, then the turn block, then the facts — a part that is not
- *  sent is not in the answer, so it is not listed. */
-const rows = computed<Row[]>(() => {
-  const answer = context.value
-  if (!answer) {
-    return []
-  }
-  return [
-    ...answer.parts.map((part, index) => ({
-      key: `${part.kind}-${index}`,
-      label: partLabel(part),
-      text: part.text,
-      chars: part.chars,
-    })),
-    { key: 'turn', label: t('agents.receives.turn'), text: answer.turn.text, chars: answer.turn.chars },
-    { key: 'facts', label: t('agents.receives.facts'), text: null, chars: null },
-  ]
-})
+const rows = computed(() =>
+  (context.value ? receivesRows(context.value) : []).map((row) => ({
+    row,
+    label:
+      row.kind === 'part'
+        ? partLabel(row.part)
+        : row.kind === 'turn'
+          ? t('agents.receives.turn')
+          : t('agents.receives.facts'),
+  })),
+)
 
 function toggle(key: string) {
   if (opened.has(key)) {
@@ -110,11 +100,6 @@ function toggle(key: string) {
   } else {
     opened.add(key)
   }
-}
-
-/** A fact's value, or — on the Agent page, where no document is open — its token. */
-function factValue(name: keyof AgentContextFacts): string {
-  return context.value?.facts?.[name] ?? `{${name}}`
 }
 
 function size(chars: number): string {
@@ -129,15 +114,27 @@ function onKeydown(event: KeyboardEvent) {
   }
 }
 
+/** An Escape from anywhere else on the page — the language dropdowns, the memory list —
+ *  unless a dialog or a menu is open, or the control it was pressed in took it. */
+function onDocumentKeydown(event: KeyboardEvent) {
+  const overlayOpen = document.querySelector('[aria-modal="true"], [role="menu"]') !== null
+  if (escapeClosesDrawer(event, overlayOpen)) {
+    emit('close')
+  }
+}
+
 watch(locale, () => void load())
+watch(version, () => void load(true))
 
 onMounted(async () => {
+  document.addEventListener('keydown', onDocumentKeydown)
   void load()
   await nextTick()
   heading.value?.focus()
 })
 
 onBeforeUnmount(() => {
+  document.removeEventListener('keydown', onDocumentKeydown)
   loads += 1
 })
 </script>
@@ -151,11 +148,11 @@ onBeforeUnmount(() => {
       </UiButton>
     </div>
 
-    <div class="body">
+    <div class="body" :aria-busy="reloading || undefined">
       <UiBanner v-if="error" tone="error">{{ error }}</UiBanner>
       <UiSkeleton v-else-if="!context" :rows="5" />
       <ol v-else class="rows">
-        <li v-for="(row, index) in rows" :key="row.key">
+        <li v-for="({ row, label }, index) in rows" :key="row.key">
           <button
             type="button"
             class="row"
@@ -164,21 +161,21 @@ onBeforeUnmount(() => {
             @click="toggle(row.key)"
           >
             <span class="number tabular" aria-hidden="true">{{ index + 1 }}</span>
-            <span class="label">{{ row.label }}</span>
-            <span v-if="row.chars !== null" class="size tabular">{{ size(row.chars) }}</span>
+            <span class="label">{{ label }}</span>
+            <span class="size tabular">{{ size(row.chars) }}</span>
             <UiIcon :name="opened.has(row.key) ? 'chevron-down' : 'chevron-right'" class="chevron" />
           </button>
           <div v-show="opened.has(row.key)" :id="`${id}-${row.key}`" class="detail">
-            <pre v-if="row.text !== null" class="text mono">{{ row.text }}</pre>
-            <template v-else>
+            <template v-if="row.kind === 'facts'">
               <dl class="facts">
-                <div v-for="name in FACT_NAMES" :key="name" class="fact">
-                  <dt>{{ t(`agents.receives.factNames.${name}`) }}</dt>
-                  <dd class="mono">{{ factValue(name) }}</dd>
+                <div v-for="fact in row.facts" :key="fact.name" class="fact">
+                  <dt>{{ t(`agents.receives.factNames.${fact.name}`) }}</dt>
+                  <dd class="mono">{{ fact.value }}</dd>
                 </div>
               </dl>
               <p v-if="!context?.facts" class="facts-note">{{ t('agents.receives.factsNote') }}</p>
             </template>
+            <pre v-else class="text mono">{{ row.text }}</pre>
           </div>
         </li>
       </ol>
