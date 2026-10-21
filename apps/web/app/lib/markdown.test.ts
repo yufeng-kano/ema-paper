@@ -767,9 +767,21 @@ describe('serializeDocument', () => {
     expect(serializeDocument([{ page: 4, blocks: [] }])).toBe('<!-- page: 4 -->')
   })
 
-  it('gives content ahead of the first marker a page 1 marker', () => {
-    const pages = parseResultMarkdown(['# Title', '', 'Body.'].join('\n'))
+  it('leaves a document with no marker without one', () => {
+    const written = ['# Title', '', 'Body.'].join('\n')
+    expect(serializeDocument(parseResultMarkdown(written))).toBe(written)
+  })
+
+  it('folds content ahead of a page 1 marker under that marker', () => {
+    const pages = parseResultMarkdown(['# Title', '<!-- page: 1 -->', 'Body.'].join('\n'))
     expect(serializeDocument(pages)).toBe('<!-- page: 1 -->\n# Title\n\nBody.')
+  })
+
+  it('keeps content ahead of a later page unmarked, and drops it once it is empty', () => {
+    const doc = ['Intro.', '', '<!-- page: 2 -->', 'Body.'].join('\n')
+    const pages = parseResultMarkdown(doc)
+    expect(serializeDocument(pages)).toBe(doc)
+    expect(serializeDocument([{ ...pages[0]!, blocks: [] }, pages[1]!])).toBe('<!-- page: 2 -->\nBody.')
   })
 })
 
@@ -781,8 +793,9 @@ describe('appendBlockSource', () => {
     )
   })
 
-  it('makes page 1 for a document with no page at all', () => {
-    expect(appendBlockSource('', 0, 'First words.')).toBe('<!-- page: 1 -->\nFirst words.')
+  it('starts a document with no page at all without a marker', () => {
+    expect(appendBlockSource('', 0, 'First words.')).toBe('First words.')
+    expect(appendBlockSource('First words.', 0, 'More.')).toBe('First words.\n\nMore.')
     expect(parseResultMarkdown(appendBlockSource('', 0, 'First words.'))[0]?.blocks[0]?.kind).toBe('p')
   })
 })
@@ -1058,6 +1071,11 @@ describe('blockPlain and firstWords', () => {
 })
 
 describe('moveBlocks', () => {
+  it('moves blocks in a document with no marker without adding one', () => {
+    const moved = moveBlocks(['one', '', 'two'].join('\n'), { from: { page: 0, index: 1 }, to: { page: 0, index: 1 } }, { page: 0, index: 0 }, 'before')
+    expect(moved?.markdown).toBe(['two', '', 'one'].join('\n'))
+  })
+
   const doc = [
     '<!-- page: 1 -->',
     '## A',

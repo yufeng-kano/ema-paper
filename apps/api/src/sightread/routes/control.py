@@ -68,7 +68,7 @@ from ..upstream.client import (
     normalize_base_url,
     stored_connection_models,
 )
-from ..workspace.documents import document_paths
+from ..workspace.documents import MARKDOWN_EXTENSIONS, MARKDOWN_MEDIA_TYPE, document_paths
 from .chat import owned_document, turn_note
 from .library import figure_crop_response, partial_result
 
@@ -183,10 +183,19 @@ async def me(user: SessionUser, settings: AppSettings):
         "limits": {
             "upload_max_bytes": settings.upload_max_bytes,
             "page_cap": settings.page_cap,
-            "accepted_media_types": [PDF_MEDIA_TYPE, *ACCEPTED_IMAGE_TYPES],
+            "accepted_media_types": [PDF_MEDIA_TYPE, *ACCEPTED_IMAGE_TYPES, MARKDOWN_MEDIA_TYPE],
             # The extensions intake falls back to when a browser reports a generic type
             # for a file it has no association for (docs/api.md § Limits).
-            "accepted_extensions": [".pdf", *sorted(set(ACCEPTED_IMAGE_TYPES.values()))],
+            "accepted_extensions": [
+                ".pdf",
+                *sorted(set(ACCEPTED_IMAGE_TYPES.values())),
+                *MARKDOWN_EXTENSIONS,
+            ],
+            # A markdown upload is not parsed: which files are one, and their cap — the one a
+            # `doc.md` is read under (docs/workspace.md § Markdown documents).
+            "markdown_media_types": [MARKDOWN_MEDIA_TYPE],
+            "markdown_extensions": list(MARKDOWN_EXTENSIONS),
+            "markdown_max_bytes": settings.content_max_bytes,
             # The prompt dialogs count against the same cap the writes enforce.
             "prompt_max_chars": settings.system_prompt_max_chars,
             # What the chat composer may attach (docs/chat.md § What a user message carries).
@@ -857,8 +866,9 @@ async def chat_agent_context(
     facts: dict[str, str] | None = None
     if document_id is not None:
         document = await owned_document(db, user.id, document_id)
-        job = await db.get(Job, document.job_id)
-        if job is not None:
+        # A markdown document has no job and still has facts: it has no pages to name.
+        job = await db.get(Job, document.job_id) if document.job_id is not None else None
+        if document.job_id is None or job is not None:
             facts = chat_runner.document_facts(
                 settings, job, await document_paths(db, settings, document)
             )

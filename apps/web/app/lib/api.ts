@@ -130,6 +130,12 @@ export interface UploadLimits {
   accepted_media_types: string[]
   /** What intake accepts by extension when the browser reports a generic media type. */
   accepted_extensions: string[]
+  /** Which uploads are markdown, and their own cap: they are not parsed, they become
+   *  `doc.md` (docs/workspace.md § Markdown documents). Optional only so a page served by an
+   *  older API still renders. */
+  markdown_media_types?: string[]
+  markdown_extensions?: string[]
+  markdown_max_bytes?: number
   /** The cap on an agent's prompt, a skill's body and a subagent's prompt. */
   prompt_max_chars: number
   /** The chat composer's attachments (docs/chat.md § What a user message carries). Optional
@@ -648,19 +654,20 @@ export interface LibraryFolder {
 
 /**
  * One file: the entry, plus the live state of the parse behind it. The two travel together
- * so a row renders — name, status, progress — from a single `GET /api/library`.
+ * so a row renders — name, status, progress — from a single `GET /api/library`. A markdown
+ * document (`kind` `markdown`) has no parse: every parse field is null (docs/api.md).
  */
 export interface LibraryDocument {
   id: number
   folder_id: number | null
   name: string
-  job_id: string
-  status: JobStatus
+  job_id: string | null
+  status: JobStatus | null
   kind: string
-  model: string
+  model: string | null
   page_count: number | null
-  pages_done: number
-  size_bytes: number
+  pages_done: number | null
+  size_bytes: number | null
   error: string | null
   created_at: string
   finished_at: string | null
@@ -965,6 +972,11 @@ export function uploadDocument(file: File, folderId: number | null): Promise<Lib
     body.append('folder_id', String(folderId))
   }
   return request('POST', '/api/library/documents', body)
+}
+
+/** A new, empty markdown document; a taken name is suffixed (docs/web.md § Files). */
+export function createDocument(body: { name: string; folder_id: number | null }): Promise<LibraryDocument> {
+  return request('POST', '/api/library/documents/new', body)
 }
 
 /** File a parse that is already in the history — no upload, no second parse

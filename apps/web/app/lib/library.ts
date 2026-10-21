@@ -127,7 +127,7 @@ export function isPending(document: LibraryDocument): boolean {
 
 /** 0..1 of the pages that came back, for the meter on a running row. */
 export function parseProgress(document: LibraryDocument): number {
-  if (!document.page_count) {
+  if (!document.page_count || document.pages_done === null) {
     return 0
   }
   return Math.min(1, Math.max(0, document.pages_done / document.page_count))
@@ -157,4 +157,15 @@ export function acceptsUpload(
   const dot = file.name.lastIndexOf('.')
   const extension = dot === -1 ? '' : file.name.slice(dot).toLowerCase()
   return extension !== '' && limits.accepted_extensions.includes(extension)
+}
+
+/** Whether the upload endpoint would file this as a markdown document rather than parse it —
+ *  by type or by extension, as the server decides (docs/workspace.md § Markdown documents). */
+export function isMarkdownUpload(file: { name: string; type: string }, limits: UploadLimits | null): boolean {
+  if (file.type && limits?.markdown_media_types?.includes(file.type)) {
+    return true
+  }
+  const dot = file.name.lastIndexOf('.')
+  const extension = dot === -1 ? '' : file.name.slice(dot).toLowerCase()
+  return extension !== '' && (limits?.markdown_extensions?.includes(extension) ?? false)
 }

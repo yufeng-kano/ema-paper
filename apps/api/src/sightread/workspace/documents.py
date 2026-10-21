@@ -9,6 +9,7 @@ every file is opened through `safe_io`, which follows nothing the shell could ha
 from __future__ import annotations
 
 import asyncio
+import codecs
 import contextlib
 import hashlib
 import json
@@ -48,6 +49,13 @@ logger = logging.getLogger(__name__)
 
 NOT_PLAIN = "The document's files are not regular files"
 TOO_LARGE = "The document file is too large to open"
+NOT_UTF8 = "The document file is not UTF-8 text"
+
+# A document with no parse behind it (docs/workspace.md § Markdown documents): what the
+# library calls its kind, and what an upload is recognised as one by.
+MARKDOWN_KIND = "markdown"
+MARKDOWN_MEDIA_TYPE = "text/markdown"
+MARKDOWN_EXTENSIONS = (".md", ".markdown")
 
 
 @dataclass(frozen=True)
@@ -137,7 +145,7 @@ def _read_text(root: Path, path: Path, max_bytes: int) -> str:
     except safe_io.EntryTooLarge as exc:
         raise ApiError(409, "invalid_request", TOO_LARGE) from exc
     except UnicodeDecodeError as exc:
-        raise ApiError(409, "invalid_request", "The document file is not UTF-8 text") from exc
+        raise ApiError(409, "invalid_request", NOT_UTF8) from exc
     except (safe_io.UnsafeEntry, OSError) as exc:
         raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
 
@@ -188,15 +196,47 @@ def _write_if_missing(root: Path, path: Path, text: str) -> bool:
     return True
 
 
+def markdown_baseline(root: Path, document_id: int, max_bytes: int) -> str:
+    """A markdown document's baseline: its original as text, a leading byte-order mark
+    dropped and CRLF line ends made LF, or "" for one written new, which keeps no original
+    (docs/workspace.md § Markdown documents). 409 past `max_bytes` or when not UTF-8."""
+    original = original_of(root, document_id)
+    if original is None:
+        return ""
+    if original.stat().st_size > max_bytes:
+        raise ApiError(409, "invalid_request", TOO_LARGE)
+    try:
+        text = original.read_bytes().decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ApiError(409, "invalid_request", NOT_UTF8) from exc
+    return text.removeprefix("\ufeff").replace("\r\n", "\n")
+
+
+def is_utf8_file(path: Path) -> bool:
+    """Whether a staged upload decodes as UTF-8, read in slices, never whole."""
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    try:
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                decoder.decode(chunk)
+        decoder.decode(b"", final=True)
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
 def _materialize_files(
     paths: DocumentPaths,
     *,
     document_id: int,
-    job: Job,
-    result: Result,
+    job: Job | None,
+    result: Result | None,
     figures_dir: Path,
+    max_bytes: int,
 ) -> list[Path]:
-    """Write what is missing. Returns the tracked files written (they need a commit)."""
+    """Write what is missing. Returns the tracked files written (they need a commit).
+    `job` None is a markdown document: `doc.md` from its original, and nothing of a parse
+    (docs/workspace.md § Markdown documents)."""
     git.ensure_repo(paths.root)
     paths.check()
     try:
@@ -204,20 +244,39 @@ def _materialize_files(
     except safe_io.UnsafeEntry as exc:
         raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
     written: list[Path] = []
-    if _write_if_missing(paths.root, paths.doc, result.markdown):
-        written.append(paths.doc)
+    if safe_io.entry_kind(paths.root, paths.doc) == "none":
+        if result is not None:
+            baseline = result.markdown
+        else:
+            baseline = markdown_baseline(paths.root, document_id, max_bytes)
+        if _write_if_missing(paths.root, paths.doc, baseline):
+            written.append(paths.doc)
     if _write_if_missing(paths.root, paths.notes, ""):
         written.append(paths.notes)
-    meta = {
-        "document_id": document_id,
-        "job_id": str(job.id),
-        "model": job.model,
-        "bbox_format": job.bbox_format,
-        "page_count": job.page_count,
-        "kind": job.kind,
-    }
+    # `document_id` first, whatever follows: the lookup for a directory the tree moved
+    # matches `"document_id": N,` (`materialize_document`).
+    if job is None:
+        meta = {
+            "document_id": document_id,
+            "job_id": None,
+            "model": None,
+            "bbox_format": None,
+            "page_count": None,
+            "kind": MARKDOWN_KIND,
+        }
+    else:
+        meta = {
+            "document_id": document_id,
+            "job_id": str(job.id),
+            "model": job.model,
+            "bbox_format": job.bbox_format,
+            "page_count": job.page_count,
+            "kind": job.kind,
+        }
     if _write_if_missing(paths.root, paths.meta, json.dumps(meta, indent=2) + "\n"):
         written.append(paths.meta)
+    if job is None or result is None:
+        return written  # a markdown document: no parse output, no crops, no shell copy
     parse = results_root(paths.root) / str(job.id) / "result.md"
     _write_if_missing(paths.root, parse, result.markdown)  # excluded from history
     original = original_of(paths.root, document_id)
@@ -243,17 +302,20 @@ async def materialize_document(
     """Make sure the document's directory exists with its files; idempotent. The path is
     resolved under the workspace lock, after the row is re-read: a rename on the Files
     page holds the same lock across its row write and its move (docs/workspace.md).
-    `locked`: the caller already holds that lock (it is not reentrant)."""
-    job = (await db.execute(select(Job).where(Job.id == document.job_id))).scalar_one_or_none()
-    if job is None:
-        raise ApiError(404, "invalid_request", "No such job")
-    result = (
-        await db.execute(select(Result).where(Result.job_id == document.job_id))
-    ).scalar_one_or_none()
-    if result is None:
-        # An empty doc.md written now would never be replaced by the parse result
-        # (materialization writes only what is missing), so there is nothing to edit yet.
-        raise ApiError(409, "invalid_request", "The document has no parse result to edit yet")
+    `locked`: the caller already holds that lock (it is not reentrant). A markdown
+    document (no job) has no result to wait for: its baseline is its original."""
+    job = result = None
+    if document.job_id is not None:
+        job = (await db.execute(select(Job).where(Job.id == document.job_id))).scalar_one_or_none()
+        if job is None:
+            raise ApiError(404, "invalid_request", "No such job")
+        result = (
+            await db.execute(select(Result).where(Result.job_id == document.job_id))
+        ).scalar_one_or_none()
+        if result is None:
+            # An empty doc.md written now would never be replaced by the parse result
+            # (materialization writes only what is missing), so there is nothing to edit yet.
+            raise ApiError(409, "invalid_request", "The document has no parse result to edit yet")
     root = user_root(settings.workspaces_dir, document.user_id)
     async with contextlib.nullcontext() if locked else workspace_lock(root):
         try:
@@ -288,6 +350,7 @@ async def materialize_document(
             job=job,
             result=result,
             figures_dir=Path(settings.figures_dir),
+            max_bytes=settings.content_max_bytes,
         )
         # What was written needs a commit — and so does what an earlier materialization
         # wrote and never committed (the process died between the two): left in place
@@ -336,9 +399,10 @@ async def make_folder_dir(settings: Settings, user_id: int, relative: Path) -> N
 
 async def current_revision(db: AsyncSession, settings: Settings, document: Document) -> str | None:
     """The revision the viewer would save against right now: the hash of `doc.md` as it
-    is on disk, or of the parse result when the document is not materialized yet; None
-    when neither can be read. The per-turn context of a chat message (docs/chat.md
-    § Prompt caching), read without the workspace lock: a hint, not a write."""
+    is on disk, or of its baseline — the parse result, a markdown document's original —
+    when the document is not materialized yet; None when neither can be read. The per-turn
+    context of a chat message (docs/chat.md § Prompt caching), read without the workspace
+    lock: a hint, not a write."""
     paths = await document_paths(db, settings, document)
     try:
         text = await asyncio.to_thread(
@@ -350,6 +414,14 @@ async def current_revision(db: AsyncSession, settings: Settings, document: Docum
         return None
     if text is not None:
         return revision_of(text)
+    if document.job_id is None:
+        try:
+            baseline = await asyncio.to_thread(
+                markdown_baseline, paths.root, document.id, settings.content_max_bytes
+            )
+        except (ApiError, OSError):
+            return None
+        return revision_of(baseline)
     markdown = (
         await db.execute(select(Result.markdown).where(Result.job_id == document.job_id))
     ).scalar_one_or_none()
@@ -580,6 +652,31 @@ async def adopt_source(
             await db.commit()
 
 
+def _keep_markdown(root: Path, upload: Path, document_id: int) -> None:
+    canonical = sources_dir(root) / f"{document_id}.md"
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    staging = canonical.with_name(f".tmp-{canonical.name}")
+    shutil.copyfile(upload, staging)
+    os.replace(staging, canonical)
+
+
+async def adopt_markdown(settings: Settings, document: Document, upload: Path) -> None:
+    """Keep an uploaded `.md` as the markdown document's original, `{document_id}.md` beside
+    the other originals; the upload goes either way (docs/workspace.md § Markdown
+    documents). The quota refusing it (409), or a copy that fails, leaves nothing behind:
+    the caller rolls the row back. No shell copy: `doc.md` is made from it. The caller
+    holds the workspace lock."""
+    root = user_root(settings.workspaces_dir, document.user_id)
+    try:
+        await ensure_within_quota(settings, root)
+        await asyncio.to_thread(_keep_markdown, root, upload, document.id)
+    except BaseException:
+        await asyncio.to_thread(_discard_originals, root, [document.id])
+        raise
+    finally:
+        upload.unlink(missing_ok=True)
+
+
 def _undo_adoption(root: Path, document_id: int, directory: Path, suffix: str) -> None:
     _discard_originals(root, [document_id])
     with contextlib.suppress(OSError, safe_io.UnsafeEntry):
@@ -617,7 +714,7 @@ async def discard_adopted(
 # --- content ------------------------------------------------------------------------------
 
 
-def _read(paths: DocumentPaths, max_bytes: int, *, document_id: int) -> Content:
+def _read(paths: DocumentPaths, max_bytes: int, *, document_id: int, parsed: bool) -> Content:
     paths.check()
     markdown = _read_text(paths.root, paths.doc, max_bytes)
     notes = _read_text(paths.root, paths.notes, max_bytes)
@@ -626,7 +723,9 @@ def _read(paths: DocumentPaths, max_bytes: int, *, document_id: int) -> Content:
         revision=revision_of(markdown),
         notes=notes,
         notes_revision=revision_of(notes),
-        has_source=original_of(paths.root, document_id) is not None or paths.source() is not None,
+        # A markdown document's original is its first text, not pages to render.
+        has_source=parsed
+        and (original_of(paths.root, document_id) is not None or paths.source() is not None),
     )
 
 
@@ -640,7 +739,11 @@ async def read_content(
     async with contextlib.nullcontext() if locked else workspace_lock(root):
         paths = await materialize_document(db, settings, document, locked=True)
         return await asyncio.to_thread(
-            _read, paths, settings.content_max_bytes, document_id=document.id
+            _read,
+            paths,
+            settings.content_max_bytes,
+            document_id=document.id,
+            parsed=document.job_id is not None,
         )
 
 

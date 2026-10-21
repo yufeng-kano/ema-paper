@@ -820,3 +820,92 @@ async def test_the_memory_migration_keeps_every_row_and_scopes_memories(scratch_
     assert not added & columns
     _alembic(scratch_url, "upgrade", "head")
     await engine.dispose()
+
+
+MARKDOWN_DOCUMENTS = "a19738bb7f6e"
+
+
+async def test_the_markdown_migration_keeps_every_job_and_refuses_to_downgrade_over_one(
+    scratch_url,
+) -> None:
+    """Existing documents keep their jobs; a document without one can be stored after the
+    upgrade, and the downgrade refuses while it stands rather than delete it to bring the
+    constraint back (docs/database.md § Rules)."""
+    _alembic(scratch_url, "upgrade", INSTRUCTIONS_AND_MEMORIES)
+
+    engine = create_async_engine(scratch_url)
+    job_id = uuid.uuid4()
+    async with engine.begin() as db:
+        user_id = (
+            await db.execute(
+                text(
+                    "INSERT INTO users (google_sub, email, created_at) "
+                    "VALUES ('sub', 'm@example.com', now()) RETURNING id"
+                )
+            )
+        ).scalar_one()
+        await db.execute(
+            text(
+                "INSERT INTO jobs (id, user_id, agent, kind, filename, media_type, size_bytes, "
+                "sha256, pages_spec, model, pipeline_version, bbox_format, status, pages_done, "
+                "prompt_sha256, created_at) VALUES (:id, :user, 'parse', 'pdf', 'a.pdf', "
+                "'application/pdf', 1, 'h', '', 'm', 1, 'yxyx_norm1000', 'succeeded', 1, '', "
+                "now())"
+            ),
+            {"id": job_id, "user": user_id},
+        )
+        await db.execute(
+            text(
+                "INSERT INTO documents (user_id, folder_id, job_id, name, created_at, "
+                "updated_at) VALUES (:user, NULL, :job, 'a.pdf', now(), now())"
+            ),
+            {"user": user_id, "job": job_id},
+        )
+    with pytest.raises(IntegrityError):
+        async with engine.begin() as db:
+            await db.execute(
+                text(
+                    "INSERT INTO documents (user_id, folder_id, job_id, name, created_at, "
+                    "updated_at) VALUES (:user, NULL, NULL, 'notes.md', now(), now())"
+                ),
+                {"user": user_id},
+            )
+
+    _alembic(scratch_url, "upgrade", MARKDOWN_DOCUMENTS)
+
+    async with engine.begin() as db:
+        kept = (await db.execute(text("SELECT name, job_id FROM documents"))).all()
+        assert [tuple(row) for row in kept] == [("a.pdf", job_id)]
+        markdown_id = (
+            await db.execute(
+                text(
+                    "INSERT INTO documents (user_id, folder_id, job_id, name, created_at, "
+                    "updated_at) VALUES (:user, NULL, NULL, 'notes.md', now(), now()) "
+                    "RETURNING id"
+                ),
+                {"user": user_id},
+            )
+        ).scalar_one()
+
+    with pytest.raises(subprocess.CalledProcessError) as refused:
+        _alembic(scratch_url, "downgrade", INSTRUCTIONS_AND_MEMORIES)
+    assert b"1 markdown document(s) have no job" in refused.value.stderr
+    async with engine.begin() as db:
+        # Refused whole: the row is still there, and so is the revision.
+        version = (await db.execute(text("SELECT version_num FROM alembic_version"))).scalar()
+        assert version == MARKDOWN_DOCUMENTS
+        await db.execute(text("DELETE FROM documents WHERE id = :id"), {"id": markdown_id})
+
+    _alembic(scratch_url, "downgrade", INSTRUCTIONS_AND_MEMORIES)
+    async with engine.connect() as db:
+        nullable = (
+            await db.execute(
+                text(
+                    "SELECT is_nullable FROM information_schema.columns "
+                    "WHERE table_name = 'documents' AND column_name = 'job_id'"
+                )
+            )
+        ).scalar_one()
+    assert nullable == "NO"
+    _alembic(scratch_url, "upgrade", "head")
+    await engine.dispose()

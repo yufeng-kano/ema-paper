@@ -336,6 +336,8 @@ export default {
     upload: '上傳',
     newFolder: '新增資料夾',
     newFolderName: '新資料夾',
+    newDocument: '新增文件',
+    newDocumentName: '未命名',
     newFolderIn: '在「{folder}」中新增資料夾',
     create: '建立',
     nameLabel: '名稱',
@@ -362,10 +364,11 @@ export default {
     progress: '{total} 頁中的 {done} 頁',
     deleteFile: '刪除檔案',
     deleteFileConfirm: '刪除「{name}」？解析紀錄仍會保留在紀錄頁。',
+    deleteMarkdownConfirm: '刪除「{name}」？',
     deleteFolder: '刪除資料夾',
     deleteFolderConfirm: '刪除「{name}」與其中所有內容？解析紀錄仍會保留在紀錄頁。',
     tooLarge: '「{name}」超過 {limit} 的上傳上限。',
-    unsupported: '「{name}」不是 PDF 或圖片。',
+    unsupported: '「{name}」不是 PDF、圖片或 Markdown 檔案。',
   },
   viewer: {
     view: {

@@ -24,6 +24,7 @@
  */
 import {
   ApiRequestError,
+  createDocument,
   createFolder,
   deleteDocument,
   deleteFolder,
@@ -54,6 +55,7 @@ import {
   FOLDER_NAME_MAX,
   documentsIn,
   folderPath,
+  isMarkdownUpload,
   isPending,
   parseProgress,
   subtreeIds,
@@ -229,7 +231,8 @@ function onPicked(event: Event) {
  * (`GET /api/me` § limits) — an upload that cannot succeed should not spend the upload.
  */
 function rejected(file: File): string | null {
-  const max = limits.value?.upload_max_bytes
+  // A markdown file is not parsed; its cap is the one its text is read under.
+  const max = isMarkdownUpload(file, limits.value) ? limits.value?.markdown_max_bytes : limits.value?.upload_max_bytes
   if (max && file.size > max) {
     return t('files.tooLarge', { name: file.name, limit: formatBytes(max, locale.value) })
   }
@@ -398,6 +401,10 @@ async function showResult(document: LibraryDocument) {
   // Reading something by hand settles what the screen is for; a queued auto-preview must
   // not take it away when it finishes.
   autoPreviewFor = null
+  // A markdown document has no result: the viewer reads its copy (docs/web.md § Files).
+  if (document.kind === 'markdown') {
+    return
+  }
   const held = results.get(document.id)
   // A held final result is done; a held partial one is a stale snapshot — refetch it.
   if (held && !held.meta.partial) {
@@ -422,6 +429,9 @@ watch(documents, (list) => {
     return
   }
   openDocument.value = fresh
+  if (fresh.kind === 'markdown') {
+    return
+  }
   const held = results.get(fresh.id)
   // A failed fetch is not retried on every list change — reopening the document retries.
   // The same guard covers a held partial over a terminal row (a failed job answers 404
@@ -450,7 +460,7 @@ watch(documents, (list) => {
     autoPreviewFor = null
     return
   }
-  if (target.status === 'succeeded') {
+  if (target.status === 'succeeded' || target.kind === 'markdown') {
     void showResult(target)
   } else {
     autoPreviewFor = null
@@ -464,6 +474,10 @@ const newFolderName = ref('')
 const showNewFolder = ref(false)
 /** The folder the new one goes into — the menu's folder, not necessarily the open one. */
 const newFolderParent = ref<FolderId>(null)
+const newDocumentName = ref('')
+const showNewDocument = ref(false)
+/** Where the new document goes — the menu's folder, as for a new folder. */
+const newDocumentFolder = ref<FolderId>(null)
 const renaming = ref<Row | null>(null)
 const renameValue = ref('')
 const moving = ref<Row | null>(null)
@@ -471,7 +485,8 @@ const deleting = ref<Row | null>(null)
 const busy = ref(false)
 /** A dialog owns the page's error while it is open — see the banner in each of them. */
 const dialogOpen = computed(
-  () => showNewFolder.value || !!renaming.value || !!moving.value || !!deleting.value,
+  () =>
+    showNewFolder.value || showNewDocument.value || !!renaming.value || !!moving.value || !!deleting.value,
 )
 
 function rowName(row: Row): string {
@@ -485,6 +500,13 @@ function openNewFolder(parent: FolderId) {
   newFolderName.value = t('files.newFolderName')
   mutationError.value = null
   showNewFolder.value = true
+}
+
+function openNewDocument(folder: FolderId) {
+  newDocumentFolder.value = folder
+  newDocumentName.value = t('files.newDocumentName')
+  mutationError.value = null
+  showNewDocument.value = true
 }
 
 /** Every mutation is the same three steps: run it, re-read, report what went wrong. */
@@ -525,6 +547,19 @@ async function submitNewFolder() {
   if (ok) {
     showNewFolder.value = false
   }
+}
+
+/** The new document opens at once, to be written in (docs/web.md § Files). */
+async function submitNewDocument() {
+  const name = newDocumentName.value.trim()
+  if (!name) {
+    return
+  }
+  await commit(async () => {
+    const created = await createDocument({ name, folder_id: newDocumentFolder.value })
+    showNewDocument.value = false
+    void showResult(created)
+  })
 }
 
 function openRename(row: Row) {
@@ -672,6 +707,7 @@ const menuItems = computed<MenuItem[]>(() => {
   }
   return [
     { key: 'upload', label: t('files.upload'), icon: 'upload' },
+    { key: 'newDocument', label: t('files.newDocument'), icon: 'file-plus' },
     { key: 'newFolder', label: t('files.newFolder'), icon: 'plus' },
   ]
 })
@@ -720,6 +756,8 @@ function runMenu(action: string) {
   switch (action) {
     case 'upload':
       return pickFiles(on.id)
+    case 'newDocument':
+      return openNewDocument(on.id)
     case 'newFolder':
       return openNewFolder(on.id)
   }
@@ -1097,8 +1135,9 @@ function rowAttrs(row: Row): Record<string, unknown> {
               </span>
             </template>
 
+            <!-- A markdown document has no parse: no status, pages or size to report. -->
             <template #cell-status="{ row }">
-              <span v-if="row.kind === 'file'" class="state-cell">
+              <span v-if="row.kind === 'file' && row.document.status" class="state-cell">
                 <UiStatusDot
                   :tone="STATUS_TONE[row.document.status]"
                   :label="t(`status.${row.document.status}`)"
@@ -1132,7 +1171,7 @@ function rowAttrs(row: Row): Record<string, unknown> {
 
             <template #cell-size="{ row }">
               <span class="muted">
-                <template v-if="row.kind === 'file'">
+                <template v-if="row.kind === 'file' && row.document.size_bytes !== null">
                   {{ formatBytes(row.document.size_bytes, locale) }}
                 </template>
                 <template v-else-if="row.kind === 'upload'">
@@ -1206,6 +1245,36 @@ function rowAttrs(row: Row): Record<string, unknown> {
     </UiModal>
 
     <UiModal
+      v-if="showNewDocument"
+      :title="t('files.newDocument')"
+      :busy="busy"
+      @close="showNewDocument = false"
+    >
+      <form id="new-document" @submit.prevent="submitNewDocument">
+        <UiField v-slot="{ id }" :label="t('files.nameLabel')">
+          <UiTextInput :id="id" v-model="newDocumentName" :maxlength="DOCUMENT_NAME_MAX" required />
+        </UiField>
+        <UiBanner v-if="mutationError" class="dialog-error" tone="error">
+          {{ mutationError }}
+        </UiBanner>
+      </form>
+      <template #footer>
+        <UiButton variant="ghost" :disabled="busy" @click="showNewDocument = false">
+          {{ t('common.cancel') }}
+        </UiButton>
+        <UiButton
+          variant="primary"
+          type="submit"
+          form="new-document"
+          :loading="busy"
+          :disabled="!newDocumentName.trim()"
+        >
+          {{ t('files.create') }}
+        </UiButton>
+      </template>
+    </UiModal>
+
+    <UiModal
       v-if="renaming"
       :title="renaming.kind === 'folder' ? t('files.renameFolder') : t('files.renameFile')"
       :busy="busy"
@@ -1259,7 +1328,9 @@ function rowAttrs(row: Row): Record<string, unknown> {
       :message="
         deleting.kind === 'folder'
           ? t('files.deleteFolderConfirm', { name: rowName(deleting) })
-          : t('files.deleteFileConfirm', { name: rowName(deleting) })
+          : deleting.kind === 'file' && deleting.document.kind === 'markdown'
+            ? t('files.deleteMarkdownConfirm', { name: rowName(deleting) })
+            : t('files.deleteFileConfirm', { name: rowName(deleting) })
       "
       :confirm-label="t('common.delete')"
       :pending="busy"
@@ -1281,8 +1352,9 @@ function rowAttrs(row: Row): Record<string, unknown> {
         (loadingResults.has(openDocument.id) || isPending(openDocument))
       "
       :error-message="resultErrors.get(openDocument.id) ?? null"
-      :figure-base="`/api/library/documents/${openDocument.id}/figures`"
+      :figure-base="openDocument.kind === 'markdown' ? null : `/api/library/documents/${openDocument.id}/figures`"
       :document-id="openDocument.id"
+      :markdown-document="openDocument.kind === 'markdown'"
       :initial-block="linkedBlock?.id === openDocument.id ? linkedBlock.anchor : null"
       @close="openDocument = null"
     />

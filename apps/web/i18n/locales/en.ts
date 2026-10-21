@@ -347,6 +347,8 @@ export default {
     upload: 'Upload',
     newFolder: 'New folder',
     newFolderName: 'New folder',
+    newDocument: 'New document',
+    newDocumentName: 'Untitled',
     newFolderIn: 'New folder in {folder}',
     create: 'Create',
     nameLabel: 'Name',
@@ -373,11 +375,12 @@ export default {
     progress: '{done} of {total} pages',
     deleteFile: 'Delete file',
     deleteFileConfirm: 'Delete “{name}”? The parse itself stays in your history.',
+    deleteMarkdownConfirm: 'Delete “{name}”?',
     deleteFolder: 'Delete folder',
     deleteFolderConfirm:
       'Delete “{name}” and everything inside it? The parses themselves stay in your history.',
     tooLarge: '“{name}” is bigger than the {limit} upload limit.',
-    unsupported: '“{name}” is not a PDF or an image.',
+    unsupported: '“{name}” is not a PDF, an image or a markdown file.',
   },
   viewer: {
     view: {

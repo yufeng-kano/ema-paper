@@ -263,8 +263,19 @@ const props = withDefaults(
     jobId?: string | null
     /** A block link's anchor (`/files?document=…&block=…`): followed once the copy loads. */
     initialBlock?: string | null
+    /** A markdown document: no parse result to wait for, its copy is the document
+     *  (docs/web.md § Result viewer). */
+    markdownDocument?: boolean
   }>(),
-  { error: null, errorMessage: null, figureBase: null, documentId: null, jobId: null, initialBlock: null },
+  {
+    error: null,
+    errorMessage: null,
+    figureBase: null,
+    documentId: null,
+    jobId: null,
+    initialBlock: null,
+    markdownDocument: false,
+  },
 )
 
 const emit = defineEmits<{ close: [] }>()
@@ -296,9 +307,12 @@ const notice = ref<string | null>(null)
 /** The viewer edits when it has a document and that document's copy has been read. */
 const editable = computed(() => props.documentId !== null && contentLoaded.value)
 
-/** The copy exists only once the parse is final: a running job has nothing to edit yet. */
+/** The copy exists only once the parse is final: a running job has nothing to edit yet. A
+ *  markdown document has no parse: its copy is all there is. */
 const contentWanted = computed(
-  () => props.documentId !== null && props.result !== null && !partial.value && !props.error,
+  () =>
+    props.documentId !== null &&
+    (props.markdownDocument || (props.result !== null && !partial.value && !props.error)),
 )
 
 let contentSeq = 0
@@ -1334,7 +1348,9 @@ function rowIndexNear(page: number, index: number): number | null {
 }
 
 /** The document loaded whole: a partial result lacks pages still to come. */
-const wholeDocument = computed(() => props.result !== null && !partial.value && (props.documentId === null || editable.value))
+const wholeDocument = computed(
+  () => (props.result !== null || props.markdownDocument) && !partial.value && (props.documentId === null || editable.value),
+)
 
 function onFindExpand(key: string) {
   const index = placedIndex.value.get(key)
@@ -3818,6 +3834,10 @@ watch(
     if (now) {
       void loadSkills()
       matchNow()
+      // A markdown document opened empty — just made — is opened to be written in.
+      if (props.markdownDocument && !markdown.value.trim()) {
+        startNewBlock(0)
+      }
     }
   },
   { immediate: true },
@@ -3933,6 +3953,11 @@ watch(
       <pre v-else-if="tab === 'json'" class="json mono">{{ json }}</pre>
 
       <UiSkeleton v-else-if="awaitingContent" class="state" :rows="5" />
+      <!-- A markdown document is its copy alone: one that cannot be read has nothing
+           else to show. -->
+      <UiBanner v-else-if="markdownDocument && !editable && contentError" class="state" tone="error">
+        {{ contentError }}
+      </UiBanner>
 
       <!-- A result with no markdown has nothing to show; a document emptied by its reader
            has an editor to type into (docs/web.md § Editing). -->

@@ -66,6 +66,9 @@ export interface ResultPageBlocks {
   /** The viewer never prints this — it addresses a figure's crop with it. */
   page: number
   blocks: ResultBlock[]
+  /** Text ahead of any marker, written back without one: a markdown document never gains
+   *  a page it did not have (docs/web.md § Result viewer). */
+  unmarked?: true
 }
 
 const PAGE_MARKER = /^<!--\s*page:\s*(\d+)\s*-->$/
@@ -183,8 +186,9 @@ function splitRow(line: string): string[] {
 
 /**
  * Groups the document by page marker. Content before the first marker — a result stored
- * before the pipeline wrote them, say — is kept as page 1 rather than dropped: the viewer
- * would otherwise show an empty document for a job that has one.
+ * before the pipeline wrote them, say, or a markdown document, which has none — is kept as
+ * an unmarked page 1 rather than dropped: the viewer would otherwise show an empty document
+ * for a job that has one.
  */
 export function parseResultMarkdown(markdown: string): ResultPageBlocks[] {
   return parsePages(markdown, false)
@@ -206,7 +210,7 @@ function parsePages(markdown: string, quoted: boolean): ResultPageBlocks[] {
 
   function page(): ResultPageBlocks {
     if (!current) {
-      current = { page: 1, blocks: [] }
+      current = { page: 1, blocks: [], unmarked: true }
       pages.push(current)
     }
     return current
@@ -230,6 +234,8 @@ function parsePages(markdown: string, quoted: boolean): ResultPageBlocks[] {
       if (!current || current.page !== number) {
         current = { page: number, blocks: [] }
         pages.push(current)
+      } else {
+        delete current.unmarked
       }
       continue
     }
@@ -479,16 +485,21 @@ function pageMarker(page: number): string {
  * block in the editor deletes it rather than leaving a hole of blank lines.
  *
  * Byte-stable through `parseResultMarkdown` for a document in that shape; a document with
- * extra blank lines between blocks, or content ahead of its first marker, comes back in
- * it, which is the one normalisation this round trip makes.
+ * extra blank lines between blocks, or content ahead of a marker for page 1, comes back in
+ * it, which is the one normalisation this round trip makes. An unmarked page is written
+ * with no marker — and with nothing at all once it has no block.
  */
 export function serializeDocument(pages: ResultPageBlocks[]): string {
   return pages
     .map((page) => {
       const blocks = page.blocks.map((block) => block.src).filter((src) => src.trim() !== '')
+      if (page.unmarked) {
+        return blocks.join('\n\n')
+      }
       const marker = pageMarker(page.page)
       return blocks.length ? `${marker}\n${blocks.join('\n\n')}` : marker
     })
+    .filter((text) => text !== '')
     .join('\n\n')
 }
 
@@ -514,8 +525,8 @@ export function replaceBlockSource(
 /**
  * `markdown` with a new block appended to one page — how text comes back to a page whose
  * last block was emptied, and to a document with no block at all: a document without a
- * page gets page 1. Only the source matters to the stored string; the block parses into
- * its kind on the next render.
+ * page gets an unmarked page 1. Only the source matters to the stored string; the block
+ * parses into its kind on the next render.
  */
 export function appendBlockSource(markdown: string, pageIndex: number, src: string): string {
   const pages = parseResultMarkdown(markdown)
@@ -523,7 +534,7 @@ export function appendBlockSource(markdown: string, pageIndex: number, src: stri
   if (page) {
     page.blocks.push({ kind: 'p', text: src, src })
   } else {
-    pages.push({ page: 1, blocks: [{ kind: 'p', text: src, src }] })
+    pages.push({ page: 1, blocks: [{ kind: 'p', text: src, src }], unmarked: true })
   }
   return serializeDocument(pages)
 }
@@ -1181,7 +1192,7 @@ export function moveBlocks(
   const moving = placed.slice(first, last + 1).map((entry) => entry.block)
   const aimed = placed[aim]!.block
   const staying = new Set(moving)
-  const rest = pages.map((page) => ({ page: page.page, blocks: page.blocks.filter((block) => !staying.has(block)) }))
+  const rest = pages.map((page) => ({ ...page, blocks: page.blocks.filter((block) => !staying.has(block)) }))
   const host = rest.find((page) => page.blocks.includes(aimed))!
   let at = host.blocks.indexOf(aimed)
   if (place === 'after') {

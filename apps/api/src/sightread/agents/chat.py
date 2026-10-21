@@ -14,7 +14,7 @@ from .parse import BBOX_FORMAT_YXYX
 
 # Bumped when the prompt or the tool contract changes what a conversation does. Chat has
 # no dedup cache; the number is bookkeeping for the registry (docs/agents.md).
-PIPELINE_VERSION = 7  # 7: the memory tool, section links, the answer language
+PIPELINE_VERSION = 8  # 8: markdown documents, which have no parse
 
 # Anthropic-defined tools carry no schema of their own (docs/chat.md § Tools). The order
 # is part of the cache prefix and never changes. The custom tools are strict: their schemas
@@ -227,7 +227,7 @@ CACHE_TTL = "1h"
 
 # `{...}` tokens are replaced by `render_system_prompt`, never by str.format: the text
 # carries literal braces of its own.
-DEFAULT_SYSTEM_PROMPT = """You are the document agent inside Sightread, working for one signed-in user on documents they parsed from PDFs and images. You run in that user's own sandbox VM. Nothing you do leaves it except the text you send back.
+DEFAULT_SYSTEM_PROMPT = """You are the document agent inside Sightread, working for one signed-in user on documents they parsed from PDFs and images, or wrote or uploaded as markdown. You run in that user's own sandbox VM. Nothing you do leaves it except the text you send back.
 
 # Workspace
 
@@ -239,6 +239,8 @@ DEFAULT_SYSTEM_PROMPT = """You are the document agent inside Sightread, working 
     figures/                        figure crops, p<page>_<y1>_<x1>_<y2>_<x2>.png
     .meta.json                      document id, job id, model, bbox format, page count
 /workspace/.sightread/results/<job_id>/result.md   the untouched parse output, read-only
+
+A markdown document (.meta.json kind markdown, job id null) was never parsed: doc.md is the user's own text, uploaded or written in Sightread, and it has no pages, no figures/, no source.* and no parse output. view_page has nothing to show for it.
 
 Current document: {document_path}
 Pages: {page_count}   Bbox format: {bbox_format}   Parsed with: {parse_model}
