@@ -176,24 +176,35 @@ def test_a_blank_page_is_passed_over_and_never_joined() -> None:
     assert joins.join_pages(pages, 2) == "page 2 has nothing to join"
 
 
-def test_a_block_ends_where_another_kind_starts() -> None:
+def test_blocks_are_read_as_the_viewer_reads_them() -> None:
+    # apps/web/app/lib/markdown.ts: a paragraph ends where a line starts another block,
+    # blank line or not.
     body = (
         "Example:\n```python\nprint(1)\n\nprint(2)\n```\nand after the listing.\n\n"
         "The loss is\n$$L = x$$\nwhere\n$$\nx = 1\n$$\n\n"
-        "An introductory sentence.\n## Results\nWe use:\n- a\n- b\ncontinued lazily\n\n"
+        "An introductory sentence.\n## Results\nWe use:\n- a\n- b\n  wrapped item\n"
+        "continued lazily\n\n"
         "Table 1: Scores\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\n"
+        "Region | Revenue\n--- | ---\nAPAC | 1204\n\n"
+        "Its norm |x| = 3 holds.\n\n"
         "See below\n![fig1](sightread://p1/0,0,10,10)\nFigure 1: The model\n\n"
-        "Above the rule\n---\n\\[ x = 1\n\\]"
+        "Above the rule\n---\n\\[\nx = 1\n\\]\n\n"
+        "Contents\n\n1 Introduction . . . . 1\n2 Method . . . . 3"
     )
-    kinds = [joins.block_kind(body[start:end]) for start, end in joins.block_spans(body)]
-    assert kinds == [
+    found = joins.blocks(body)
+    assert [kind for _, _, kind in found] == [
         *("paragraph", "code", "paragraph"),
         *("paragraph", "math", "paragraph", "math"),
-        *("paragraph", "heading", "paragraph", "list"),
+        *("paragraph", "heading", "paragraph", "list", "paragraph"),
         *("paragraph", "table"),
+        *("table",),
+        *("paragraph",),
         *("paragraph", "figure"),
         *("paragraph", "rule", "math"),
+        *("paragraph", "contents"),
     ]
+    start, end, _ = found[10]
+    assert body[start:end] == "- a\n- b\n  wrapped item"
 
 
 @pytest.mark.parametrize(
@@ -205,12 +216,15 @@ def test_a_block_ends_where_another_kind_starts() -> None:
         "An introductory sentence.\n## Results",
         "Above the rule\n---",
         "Table 1: Scores\n| a | b |\n| --- | --- |\n| 1 | 2 |",
+        "Region | Revenue\n--- | ---\nAPAC | 1204",
         "See below\n![fig1](sightread://p1/0,0,10,10)\nFigure 1: The model",
+        "Contents\n\n1 Introduction . . . . 1",
     ],
 )
 def test_no_join_reaches_past_a_paragraph_into_another_block(last: str) -> None:
-    # Written straight under prose, a listing, a formula, a heading, a rule, a table or a
-    # figure still ends its page: the next page's lowercase start must never land on it.
+    # Written straight under prose, a listing, a formula, a heading, a rule, a table (with
+    # or without the outer pipes), a figure or a contents run still ends its page: the next
+    # page's lowercase start must never land on it.
     pages = [joins.Page(1, last), joins.Page(2, "next paragraph starts here.")]
     assert joins.sure_joins(pages) == 0
     assert pages[0].body == last

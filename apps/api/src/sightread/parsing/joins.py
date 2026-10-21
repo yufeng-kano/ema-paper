@@ -18,9 +18,24 @@ MARKER_LINE_RE = re.compile(r"^<!-- page: (\d+) -->$", re.MULTILINE)
 SENTENCE_END_RE = re.compile(r"[.!?:;。！？：；][\"'”’)\]）」』*_~]*$")
 STARTS_LOWER_RE = re.compile(r"^[\"'“‘(\[]*[a-z]")
 HYPHEN_END_RE = re.compile(r"[A-Za-z]-$")
-LIST_ITEM_RE = re.compile(r"^(?:[-*+]|\d+[.)])\s")
-TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)*\|?\s*$")
+# The result viewer's block grammar (apps/web/app/lib/markdown.ts), read the same way here
+# so the rules and the reader agree on where a block ends.
+HEADING_RE = re.compile(r"^#{1,6}\s+")
+LIST_ITEM_RE = re.compile(r"^([-*+]|\d{1,9}[.)])\s+")
 RULE_RE = re.compile(r"^(?:(?:-\s*){3,}|(?:\*\s*){3,}|(?:_\s*){3,})$")
+CODE_FENCE_RE = re.compile(r"^(?:```|~~~)\s*[^\s`]*\s*$")
+TABLE_RULE_RE = re.compile(r"^\|?[\s|:-]+\|[\s|:-]*$")
+COMMENT_LINE_RE = re.compile(r"^<!--.*-->$")
+FIGURE_RE = re.compile(
+    r"^!\[[^\]\n]*\]\(\s*(?:sightread://p\d+/-?\d+,-?\d+,-?\d+,-?\d+"
+    r"|figures/img-[0-9a-f]{16}\.(?:png|jpg))\s*\)$"
+)
+# What a formula holds and an escaped reference number does not.
+TEX_LIKE_RE = re.compile(r"[\\^_{}=]")
+# A contents page's row: a dot leader of four or more, then the page, arabic or roman.
+TOC_LEADER_RE = re.compile(
+    r"^.*?\S\s*(?:\.\s*){4,}(?:\*\*|__)?(?:\d+|[ivxlcdm]+)(?:\*\*|__)?$", re.IGNORECASE
+)
 # A paragraph that is one bold run starting with a section number: a heading set in bold.
 BOLD_HEADING_RE = re.compile(r"^\*\*\d+(?:\.\d+)*\.?\s+[^*\n]+\*\*$")
 # What the text key leaves out: comments, tags, the LaTeX delimiters, the markup
@@ -76,87 +91,130 @@ def render(lead: str, pages: list[Page]) -> str:
     return f"{lead}{marked}"
 
 
-def block_spans(body: str) -> list[tuple[int, int]]:
-    """Where a page's blocks are: runs of lines between blank lines, split further wherever
-    another kind of block starts with no blank line before it, as markdown allows. A fence,
-    a display formula, a heading and a rule are each a block of their own, a fence or a
-    formula whole whatever blank lines it holds; a list, a table, a quote, a figure or a
-    comment written straight under a paragraph starts a block there. So a join, which
-    appends to a page's last line, never reaches past a paragraph into another block."""
-    spans: list[tuple[int, int]] = []
-    start: int | None = None
-    # The kind of the block being read, from its first line.
-    kind = ""
-    end = 0
-    closer: str | None = None
+def _table_rule(line: str) -> bool:
+    """A table's separator row, with or without the outer pipes: `| --- | :-: |`."""
+    return bool(TABLE_RULE_RE.match(line)) and "-" in line
+
+
+def _math_close(line: str) -> str | None:
+    """The delimiter that closes the display formula `line` opens, or None. `$$` alone
+    opens one, as do `$$x = 1$$` and `$$x = 1` closed lines later, but a line with a second
+    `$$` before its end is prose; `\\[` opens one alone on its line, or as a whole line
+    `\\[…\\]` around TeX, so a reference's `\\[87] A. Author` stays prose."""
+    if line.startswith("$$"):
+        again = line.find("$$", 2)
+        return "$$" if again == -1 or (again == len(line) - 2 and again > 2) else None
+    if line == "\\[" or (
+        line.startswith("\\[")
+        and line.find("\\]", 2) == len(line) - 2
+        and TEX_LIKE_RE.search(line[2:-2])
+    ):
+        return "\\]"
+    return None
+
+
+def _starts_block(line: str, under: str) -> bool:
+    """Whether a stripped line starts a block of its own, so a paragraph ends above it.
+    `under` is the line below it, which only a table's separator row needs."""
+    return (
+        not line
+        or line.startswith((">", "#"))
+        or bool(RULE_RE.match(line))
+        or _math_close(line) is not None
+        or bool(CODE_FENCE_RE.match(line))
+        or ("|" in line and _table_rule(under))
+        or bool(LIST_ITEM_RE.match(line))
+        or bool(FIGURE_RE.match(line))
+        or bool(COMMENT_LINE_RE.match(line))
+    )
+
+
+def blocks(body: str) -> list[tuple[int, int, str]]:
+    """A page's blocks as the result viewer reads them (apps/web/app/lib/markdown.ts,
+    docs/web.md § Result viewer): where each starts and ends in `body`, and its kind. A
+    paragraph runs until a blank line or a line that starts another block, so the rules
+    and the reader agree on where a block ends, and no join reaches past a paragraph."""
+    raws = body.split("\n")
+    count = len(raws)
+    # Two blank lines past the end, so looking under the last line reads a blank one.
+    lines = [raw.strip() for raw in raws] + ["", ""]
+    starts = []
     offset = 0
-    for line in body.split("\n"):
-        line_start, line_end = offset, offset + len(line)
-        offset = line_end + 1
-        stripped = line.strip()
-        if closer is not None:
-            end = line_end
-            # A formula closes where a line ends with its delimiter, a fence where one
-            # starts with it.
-            math = closer in ("$$", "\\]")
-            if stripped.endswith(closer) if math else stripped.startswith(closer):
-                closer = None
-                spans.append((start, end))
-                start = None
+    for raw in raws:
+        starts.append(offset)
+        offset += len(raw) + 1
+    found: list[tuple[int, int, str]] = []
+    index = 0
+    while index < count:
+        line = lines[index]
+        if not line:
+            index += 1
             continue
-        if not stripped:
-            if start is not None:
-                spans.append((start, end))
-                start = None
-            continue
-        line_kind = block_kind(stripped)
-        # A fence, or a formula whose closing delimiter is on a later line.
-        if stripped.startswith(("```", "~~~")):
-            closer = stripped[:3]
-        elif stripped.startswith("$$") and "$$" not in stripped[2:]:
-            closer = "$$"
-        elif stripped.startswith("\\[") and "\\]" not in stripped[2:]:
-            closer = "\\]"
-        # A block of one line: a heading, a rule, or a formula closed on the line it opens.
-        alone = closer is None and line_kind in ("heading", "rule", "math")
-        if start is not None and (
-            closer is not None or alone or (kind == "paragraph" and line_kind != "paragraph")
-        ):
-            # Written straight under the block above: that block ends here.
-            spans.append((start, end))
-            start = None
-        if start is None:
-            start, kind = line_start, line_kind
-        end = line_end
-        if alone:
-            spans.append((start, end))
-            start = None
-    if start is not None:
-        spans.append((start, end))
-    return spans
-
-
-def block_kind(block: str) -> str:
-    first = block.lstrip()
-    if first.startswith(("```", "~~~")):
-        return "code"
-    if first.startswith(("$$", "\\[")):
-        return "math"
-    if first.startswith("#"):
-        return "heading"
-    if first.startswith("<!--"):
-        return "comment"
-    if first.startswith("!["):
-        return "figure"
-    if first.startswith(">"):
-        return "quote"
-    if first.startswith("|"):
-        return "table"
-    if RULE_RE.match(first.split("\n", 1)[0].strip()):
-        return "rule"
-    if LIST_ITEM_RE.match(first):
-        return "list"
-    return "paragraph"
+        last = index
+        if line.startswith(">"):
+            kind = "quote"
+            while last + 1 < count and lines[last + 1].startswith(">"):
+                last += 1
+        elif COMMENT_LINE_RE.match(line):
+            kind = "comment"
+        elif RULE_RE.match(line):
+            kind = "rule"
+        elif FIGURE_RE.match(line):
+            # Its caption is the next line, unless that line starts a block of its own.
+            kind = "figure"
+            if lines[index + 1] and not _starts_block(lines[index + 1], lines[index + 2]):
+                last += 1
+        elif CODE_FENCE_RE.match(line):
+            # To the next fence line, or to the end of the page.
+            kind = "code"
+            last += 1
+            while last < count and not CODE_FENCE_RE.match(lines[last]):
+                last += 1
+            last = min(last, count - 1)
+        elif (close := _math_close(line)) is not None:
+            # Closed on its own line, or on the first line after it that ends with the
+            # delimiter, or at the end of the page.
+            kind = "math"
+            if not line[2:].endswith(close):
+                last += 1
+                while last < count and not raws[last].rstrip().endswith(close):
+                    last += 1
+                last = min(last, count - 1)
+        elif HEADING_RE.match(line):
+            kind = "heading"
+        elif item := LIST_ITEM_RE.match(line):
+            # Items with one marker kind, and the indented lines that wrap one; a rule,
+            # an item of the other kind or any other line ends the list.
+            kind = "list"
+            ordered = item[1] not in ("-", "*", "+")
+            while last + 1 < count and not RULE_RE.match(lines[last + 1]):
+                following = LIST_ITEM_RE.match(lines[last + 1])
+                if following and (following[1] not in ("-", "*", "+")) != ordered:
+                    break
+                wraps = (
+                    raws[last + 1][:1].isspace()
+                    and bool(lines[last + 1])
+                    and not _starts_block(lines[last + 1], lines[last + 2])
+                )
+                if not following and not wraps:
+                    break
+                last += 1
+        elif "|" in line and _table_rule(lines[index + 1]):
+            # Every line still carrying a pipe.
+            kind = "table"
+            while last + 1 < count and "|" in lines[last + 1]:
+                last += 1
+        else:
+            kind = "paragraph"
+            while last + 1 < count and not _starts_block(lines[last + 1], lines[last + 2]):
+                last += 1
+            # A contents page's rows keep their lines: the viewer shows them as a list of
+            # entries, not as prose.
+            if any(TOC_LEADER_RE.match(row) for row in lines[index : last + 1]):
+                kind = "contents"
+        found.append((starts[index], starts[last] + len(raws[last]), kind))
+        index = last + 1
+    return found
 
 
 def text_key(text: str) -> str:
@@ -176,16 +234,17 @@ def _before(pages: list[Page], index: int) -> int | None:
     return None
 
 
-def _edges(pages: list[Page], index: int) -> tuple[int, str, str] | None:
-    """The break before `pages[index]`: the page before it, its last block and this
-    page's first block — None when either side has no block."""
+def _edges(pages: list[Page], index: int) -> tuple[int, str, str, str, str] | None:
+    """The break before `pages[index]`: the page before it, its last block and that
+    block's kind, then this page's first block and its kind — None when either side has
+    no block."""
     before = _before(pages, index)
     if before is None or not pages[index].body.strip():
         return None
-    upper = pages[before].body
-    last = upper[block_spans(upper)[-1][0] :]
-    first_start, first_end = block_spans(pages[index].body)[0]
-    return before, last, pages[index].body[first_start:first_end]
+    upper, lower = pages[before].body, pages[index].body
+    last_start, _, last_kind = blocks(upper)[-1]
+    first_start, first_end, first_kind = blocks(lower)[0]
+    return before, upper[last_start:], last_kind, lower[first_start:first_end], first_kind
 
 
 def _join(pages: list[Page], before: int, index: int) -> None:
@@ -194,12 +253,13 @@ def _join(pages: list[Page], before: int, index: int) -> None:
     its header kept as a row; anything else continues after a space, or after nothing when
     the first part ends in a hyphen after a letter — the hyphen stays."""
     upper, lower = pages[before], pages[index]
-    last = upper.body[block_spans(upper.body)[-1][0] :]
-    first_end = block_spans(lower.body)[0][1]
+    last_start, _, last_kind = blocks(upper.body)[-1]
+    _, first_end, first_kind = blocks(lower.body)[0]
+    last = upper.body[last_start:]
     first = lower.body[:first_end]
-    if block_kind(last) == "table" and block_kind(first) == "table":
+    if last_kind == first_kind == "table":
         rows = first.split("\n")
-        if len(rows) > 1 and TABLE_SEPARATOR_RE.match(rows[1]):
+        if len(rows) > 1 and _table_rule(rows[1].strip()):
             del rows[1]
         upper.body = upper.body + "\n" + "\n".join(rows)
     else:
@@ -216,10 +276,9 @@ def sure_joins(pages: list[Page]) -> int:
         edges = _edges(pages, index)
         if edges is None:
             continue
-        before, last, first = edges
+        before, last, last_kind, first, first_kind = edges
         if (
-            block_kind(last) == "paragraph"
-            and block_kind(first) == "paragraph"
+            last_kind == first_kind == "paragraph"
             and not SENTENCE_END_RE.search(last)
             and STARTS_LOWER_RE.match(first)
         ):
@@ -240,8 +299,7 @@ def find_spots(pages: list[Page]) -> list[Spot]:
     for index, page in enumerate(pages):
         edges = _edges(pages, index) if index else None
         if edges is not None:
-            _, last, first = edges
-            upper, lower = block_kind(last), block_kind(first)
+            _, last, upper, first, lower = edges
             cut = (
                 (
                     upper == lower == "paragraph"
@@ -255,9 +313,8 @@ def find_spots(pages: list[Page]) -> list[Spot]:
                 spots.append(
                     Spot("join", page.number, last[-EXCERPT_CHARS:], after=first[:EXCERPT_CHARS])
                 )
-        for start, end in block_spans(page.body):
+        for start, end, kind in blocks(page.body):
             block = page.body[start:end]
-            kind = block_kind(block)
             if kind in ("code", "math", "comment", "figure", "rule"):
                 continue
             excerpt = block[: EXCERPT_CHARS * 2]
@@ -286,8 +343,8 @@ def join_pages(pages: list[Page], number: int) -> str | None:
     edges = _edges(pages, index)
     if edges is None:
         return f"page {number} has nothing to join"
-    before, last, first = edges
-    if (block_kind(last), block_kind(first)) not in JOINS:
+    before, _, last_kind, _, first_kind = edges
+    if (last_kind, first_kind) not in JOINS:
         return (
             "only a paragraph continuing a paragraph or a list item, or a table continuing "
             "a table, joins across a page break"

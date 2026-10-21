@@ -193,7 +193,8 @@ function isQuoteLine(line: string, quoted: boolean): boolean {
 /**
  * Every line that starts a block of its own — so a paragraph knows where to stop. `next` is
  * the line after it, which only the table check needs; `quoted` reads a quote's content,
- * where a `>` is text.
+ * where a `>` is text. The format check reads blocks by the same rules
+ * (apps/api/src/sightread/parsing/joins.py): a change here is made there too.
  */
 function startsBlock(line: string, next = '', quoted = false): boolean {
   return (
