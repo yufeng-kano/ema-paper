@@ -471,6 +471,7 @@ export default {
         img: 'Image',
         quote: 'Quote',
         toc: 'Contents',
+        hr: 'Rule',
       },
       ask: {
         paragraph: 'Ask the agent about this paragraph',

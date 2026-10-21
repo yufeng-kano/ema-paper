@@ -53,6 +53,8 @@ export type ResultBlock =
   | { kind: 'quote'; blocks: ResultBlock[]; src: string }
   /** An HTML comment that is not a page marker: kept in the source, drawn as nothing. */
   | { kind: 'comment'; src: string }
+  /** A thematic break (`---`, `***`, `___`): a page's footnote rule, drawn as a rule. */
+  | { kind: 'hr'; src: string }
 
 /**
  * One line of a contents page. `title + leader + page` is the source line exactly — the
@@ -83,21 +85,52 @@ const HEADING = /^(#{1,6})\s+(.*)$/
 const COMMENT = /^<!--.*-->$/
 /** `- item`, `* item`, `+ item`, `1. item`, `2) item`. */
 const LIST_ITEM = /^([-*+]|\d{1,9}[.)])\s+(.*)$/
-/** A display-math fence: `$$` alone on its line, or sharing a line with the formula. */
-const MATH_FENCE = '$$'
+/**
+ * A thematic break: three or more of one of `-`, `*`, `_`, spaces allowed between. Never the
+ * setext heading CommonMark makes of `---` under a line — a transcription's `---` is the
+ * page's footnote rule (docs/web.md § Result viewer).
+ */
+export const THEMATIC_BREAK = /^(?:(?:-[ \t]*){3,}|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})$/
+
+/** Display math's two spellings: the `$$` fence, and LaTeX's `\[ … \]` that GPT models write. */
+interface MathFence {
+  open: string
+  close: string
+}
+const DOLLARS: MathFence = { open: '$$', close: '$$' }
+const BRACKETS: MathFence = { open: '\\[', close: '\\]' }
+
+/** What a formula holds and an escaped reference number does not. */
+const TEX_LIKE = /[\\^_{}=]/
 
 /**
- * Whether a line opens display math. `$$` alone does; so does `$$x = 1$$` on one line —
- * how most models write a numbered equation — and `$$x = 1` whose closing dollars come
- * lines later. A line with a second `$$` anywhere but its end (`$$x$$ where x is…`) is
- * prose: read as an opener it would swallow the document up to the next fence.
+ * The fence a line opens display math with, or null. `$$` alone does; so does `$$x = 1$$`
+ * on one line — how most models write a numbered equation — and `$$x = 1` whose closing
+ * dollars come lines later. A line with a second `$$` anywhere but its end (`$$x$$ where x
+ * is…`) is prose: read as an opener it would swallow the document up to the next fence.
+ * `\[` opens only alone on its line, or on a line its first `\]` ends, around TeX: a
+ * reference list's `\[87] A. Author …` is an escaped bracket, and so is `\[87\]`, while
+ * `\[x^2\] and \[y^2\]` is prose holding two formulas.
  */
-function opensMath(line: string): boolean {
-  if (!line.startsWith(MATH_FENCE)) {
-    return false
+function mathFence(line: string): MathFence | null {
+  if (line.startsWith(DOLLARS.open)) {
+    const again = line.indexOf(DOLLARS.close, DOLLARS.open.length)
+    return again === -1 || (again === line.length - DOLLARS.close.length && again > DOLLARS.open.length)
+      ? DOLLARS
+      : null
   }
-  const again = line.indexOf(MATH_FENCE, MATH_FENCE.length)
-  return again === -1 || (again === line.length - MATH_FENCE.length && again > MATH_FENCE.length)
+  if (line === BRACKETS.open) {
+    return BRACKETS
+  }
+  const close = line.indexOf(BRACKETS.close, BRACKETS.open.length)
+  const inner = line.slice(BRACKETS.open.length, -BRACKETS.close.length)
+  return line.startsWith(BRACKETS.open) && close === line.length - BRACKETS.close.length && TEX_LIKE.test(inner)
+    ? BRACKETS
+    : null
+}
+
+function opensMath(line: string): boolean {
+  return mathFence(line) !== null
 }
 
 /** A page number as a contents page prints one: arabic or roman, possibly emphasised. */
@@ -166,6 +199,7 @@ function startsBlock(line: string, next = '', quoted = false): boolean {
   return (
     !line ||
     isQuoteLine(line, quoted) ||
+    THEMATIC_BREAK.test(line) ||
     opensMath(line) ||
     CODE_FENCE.test(line) ||
     isTableStart(line, next) ||
@@ -268,6 +302,11 @@ function parsePages(markdown: string, quoted: boolean): ResultPageBlocks[] {
       page().blocks.push({ kind: 'comment', src: source(first, index) })
       continue
     }
+    // Before lists: `* * *` and `- - -` would otherwise read as list items.
+    if (THEMATIC_BREAK.test(line)) {
+      page().blocks.push({ kind: 'hr', src: source(first, index) })
+      continue
+    }
 
     // Inside a quote a placeholder is a line of text: a quote holds only what reads as text
     // (docs/web.md § Notes, *Excerpts*), and a crop has no place in one. An image likewise.
@@ -326,14 +365,15 @@ function parsePages(markdown: string, quoted: boolean): ResultPageBlocks[] {
     // Display math is the one block whose line breaks *are* its content: an aligned group
     // of equations joined into a paragraph is no longer the formula the page carried, and
     // the prompt asks for formulas to be kept.
-    if (opensMath(line)) {
-      // The dollars may share a line with the formula at either end, so what follows the
+    const fence = mathFence(line)
+    if (fence) {
+      // The fence may share a line with the formula at either end, so what follows the
       // opener and what precedes the closer are rows like any other.
-      const opening = line.slice(MATH_FENCE.length)
-      if (opening.endsWith(MATH_FENCE)) {
+      const opening = line.slice(fence.open.length)
+      if (opening.endsWith(fence.close)) {
         page().blocks.push({
           kind: 'math',
-          text: opening.slice(0, -MATH_FENCE.length).trim(),
+          text: opening.slice(0, -fence.close.length).trim(),
           src: source(first, index),
         })
         continue
@@ -345,8 +385,8 @@ function parsePages(markdown: string, quoted: boolean): ResultPageBlocks[] {
       // not swallow the rest of the document into one formula.
       while (cursor < lines.length && !PAGE_MARKER.test((lines[cursor] ?? '').trim())) {
         const row = (lines[cursor] ?? '').trimEnd()
-        if (row.endsWith(MATH_FENCE)) {
-          const last = row.slice(0, -MATH_FENCE.length).trimEnd()
+        if (row.endsWith(fence.close)) {
+          const last = row.slice(0, -fence.close.length).trimEnd()
           if (last.trim()) {
             rows.push(last)
           }
@@ -389,6 +429,11 @@ function parsePages(markdown: string, quoted: boolean): ResultPageBlocks[] {
       while (cursor < lines.length) {
         const raw = lines[cursor] ?? ''
         const trimmed = raw.trim()
+
+        // A rule ends the list: `- - -` under an item is a rule, not an item reading `- -`.
+        if (THEMATIC_BREAK.test(trimmed)) {
+          break
+        }
 
         // One block per marker kind: a bulleted list directly under a numbered one is two
         // lists, not one with a confused type.
@@ -845,32 +890,117 @@ function parseStyled(text: string, options?: InlineOptions): InlineSegment[] {
 }
 
 /**
+ * The `\( … \)` or `\[ … \]` span whose backslash is at `open`, or null — the LaTeX
+ * spellings of math GPT models write. Spaces inside are TeX's to ignore, so they are allowed
+ * and trimmed off. Like a `$…$` span it never crosses a backtick or a line break, and an
+ * escaped character inside (`\\`, `\{`) is content; it closes on the first `\)` / `\]`.
+ * `\[ … \]` must hold something that reads as TeX: `\[87\]` is how a markdown-escaping
+ * model writes the reference `[87]`.
+ */
+export function latexMathAt(text: string, open: number): { tex: string; length: number } | null {
+  const kind = text[open + 1]
+  const close = kind === '(' ? ')' : kind === '[' ? ']' : null
+  if (text[open] !== '\\' || !close) {
+    return null
+  }
+  for (let index = open + 2; index < text.length; index += 1) {
+    const char = text[index]
+    if (char === '`' || char === '\n') {
+      return null
+    }
+    if (char !== '\\') {
+      continue
+    }
+    if (text[index + 1] === close) {
+      const tex = text.slice(open + 2, index).trim()
+      if (!tex || (kind === '[' && !TEX_LIKE.test(tex))) {
+        return null
+      }
+      return { tex, length: index + 2 - open }
+    }
+    index += 1
+  }
+  return null
+}
+
+/** Where the next `\(` or `\[` could open. */
+const LATEX_OPEN = /\\[([]/g
+
+/**
+ * While emphasis is read, each math span stands in the text as one opaque run: these two
+ * private-use characters around its index. Neither is a space, a word character or a marker,
+ * so `**a $x$ b**` pairs its asterisks across the formula, and a `*` or `_` inside one never
+ * opens or closes anything.
+ */
+const STAND_IN_OPEN = ''
+const STAND_IN_CLOSE = ''
+const STAND_IN = /(\d+)/g
+
+/** A math span as the stand-ins put it back: the TeX it renders, the source it copies as. */
+interface MathSource {
+  tex: string
+  src: string
+}
+
+function restoreSource(src: string, maths: readonly MathSource[]): string {
+  return src.replace(STAND_IN, (_, index: string) => maths[Number(index)]?.src ?? '')
+}
+
+/** The segments `parseStyled` read from the stand-in text, with their formulas back. */
+function restoreMath(segments: readonly InlineSegment[], maths: readonly MathSource[]): InlineSegment[] {
+  const restored: InlineSegment[] = []
+  for (const segment of segments) {
+    if (segment.kind === 'text') {
+      let last = 0
+      for (const match of segment.text.matchAll(STAND_IN)) {
+        if (match.index > last) {
+          restored.push({ kind: 'text', text: segment.text.slice(last, match.index) })
+        }
+        restored.push({ kind: 'math', tex: maths[Number(match[1])]?.tex ?? '' })
+        last = match.index + match[0].length
+      }
+      if (last < segment.text.length) {
+        restored.push({ kind: 'text', text: segment.text.slice(last) })
+      }
+    } else if (segment.kind === 'strong' || segment.kind === 'em' || segment.kind === 'sup' || segment.kind === 'sub') {
+      restored.push({ ...segment, segments: restoreMath(segment.segments, maths), src: restoreSource(segment.src, maths) })
+    } else if (segment.kind === 'cite') {
+      // The scan steps over a link it can read, but `[The $[0,1]$ interval](#…)` reads only
+      // once its formula stands in, so its text holds stand-ins, and its label is read again.
+      const segments = restoreMath(segment.segments, maths)
+      const label = plainText(segments).replace(/\s+/g, ' ').trim()
+      restored.push({ ...segment, segments, label, src: restoreSource(segment.src, maths) })
+    } else {
+      // Code is stepped over whole by the scan, so no stand-in is inside.
+      restored.push(segment)
+    }
+  }
+  return restored
+}
+
+/**
  * Splits one line of prose (a paragraph, heading, list item, table cell or caption) into
  * plain text, math spans and styled-inline segments.
  *
- * Math is split first, and scanned dollar by dollar rather than with one global match on
- * purpose: a rejected candidate (a price, a span padded with spaces) resumes just past its
+ * Math is found first, and scanned candidate by candidate rather than with one global match
+ * on purpose: a rejected candidate (a price, a span padded with spaces) resumes just past its
  * *opening* dollar — a global match would have consumed the next span's opener as its own
- * closer, so "cost $5 and variable $x$" would lose the real formula. Splitting math first
- * also keeps `$a_{1}$` out of the underscore-emphasis rules; the cost is that emphasis
- * *around* a math span stays source characters, which is the rarer shape.
+ * closer, so "cost $5 and variable $x$" would lose the real formula. Emphasis is read after,
+ * with each formula standing in as one opaque run, so `$a_{1}$` stays out of the
+ * underscore-emphasis rules while a caption bolded around its formulas still reads bold.
  *
  * `cites` reads section links as well (`InlineOptions`); without it a link is the text it
  * always was.
  */
 export function parseInline(text: string, options?: InlineOptions): InlineSegment[] {
-  const segments: InlineSegment[] = []
-  let cursor = 0
+  const spans: { at: number; length: number; tex: string }[] = []
   let scan = 0
 
-  function flushStyled(end: number): void {
-    if (end > cursor) {
-      segments.push(...parseStyled(text.slice(cursor, end), options))
-    }
-  }
-
   while (scan < text.length) {
-    const open = text.indexOf('$', scan)
+    const dollar = text.indexOf('$', scan)
+    LATEX_OPEN.lastIndex = scan
+    const latex = LATEX_OPEN.exec(text)?.index ?? -1
+    const open = dollar === -1 ? latex : latex === -1 ? dollar : Math.min(dollar, latex)
     // A code span protects its contents: in "write `$x$` literally" the dollars are code,
     // not math, so a complete span is stepped over whole — parseStyled reads it later from
     // the same text. An unclosed backtick protects nothing, and an escaped one is a
@@ -895,26 +1025,46 @@ export function parseInline(text: string, options?: InlineOptions): InlineSegmen
       break
     }
     // A backslash-escaped dollar is a dollar sign, never an opener — the same rule
-    // `parseStyled` applies when it renders `\$` as `$`.
+    // `parseStyled` applies when it renders `\$` as `$`. So is an escaped backslash: `\\(`
+    // is a backslash and a parenthesis.
     if (isEscaped(text, open)) {
       scan = open + 1
       continue
     }
-    const match = mathSpanAt(text, open)
+    const match = text[open] === '$' ? mathSpanAt(text, open) : latexMathAt(text, open)
     if (!match) {
       scan = open + 1
       continue
     }
-    flushStyled(open)
-    segments.push({ kind: 'math', tex: match.tex })
-    cursor = open + match.length
-    scan = cursor
+    spans.push({ at: open, length: match.length, tex: match.tex })
+    scan = open + match.length
   }
-  flushStyled(text.length)
-  if (segments.length === 0) {
-    segments.push({ kind: 'text', text: '' })
+
+  if (spans.length === 0) {
+    const segments = parseStyled(text, options)
+    return segments.length ? segments : [{ kind: 'text', text: '' }]
   }
-  return segments
+  // A text that holds a stand-in character of its own cannot stand its formulas in: its
+  // emphasis is read between them only, as it was before emphasis could hold math.
+  if (text.includes(STAND_IN_OPEN) || text.includes(STAND_IN_CLOSE)) {
+    const segments: InlineSegment[] = []
+    let cursor = 0
+    for (const span of spans) {
+      segments.push(...parseStyled(text.slice(cursor, span.at), options), { kind: 'math', tex: span.tex })
+      cursor = span.at + span.length
+    }
+    segments.push(...parseStyled(text.slice(cursor), options))
+    return segments
+  }
+  let standIn = ''
+  let cursor = 0
+  spans.forEach((span, index) => {
+    standIn += `${text.slice(cursor, span.at)}${STAND_IN_OPEN}${index}${STAND_IN_CLOSE}`
+    cursor = span.at + span.length
+  })
+  standIn += text.slice(cursor)
+  const maths = spans.map((span) => ({ tex: span.tex, src: text.slice(span.at, span.at + span.length) }))
+  return restoreMath(parseStyled(standIn, options), maths)
 }
 
 /** Inline segments as the text they draw: markdown removed, a formula as its TeX. What a
@@ -1070,7 +1220,7 @@ export function sectionSource(pages: readonly ResultPageBlocks[], pageIndex: num
 
 /** A block as the text it reads as: markdown removed, a formula as its TeX, a list's items, a
  *  table's cells and a quote's blocks one after another, spacing collapsed. A figure or an
- *  image is its caption; a comment is nothing. */
+ *  image is its caption; a comment and a rule are nothing. */
 export function blockPlain(block: ResultBlock): string {
   switch (block.kind) {
     case 'h2':
@@ -1098,6 +1248,7 @@ export function blockPlain(block: ResultBlock): string {
     case 'quote':
       return block.blocks.map(blockPlain).filter(Boolean).join(' ')
     case 'comment':
+    case 'hr':
       return ''
   }
 }

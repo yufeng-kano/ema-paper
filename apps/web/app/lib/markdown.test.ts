@@ -618,6 +618,152 @@ describe('parseInline', () => {
   })
 })
 
+describe('parseInline emphasis around math', () => {
+  it('reads a bold caption around its formulas, the source kept for copy', () => {
+    expect(parseInline('**Figure 1: $8\\times 8$ patches.**')).toEqual([
+      {
+        kind: 'strong',
+        segments: [
+          { kind: 'text', text: 'Figure 1: ' },
+          { kind: 'math', tex: '8\\times 8' },
+          { kind: 'text', text: ' patches.' },
+        ],
+        src: '**Figure 1: $8\\times 8$ patches.**',
+      },
+    ])
+  })
+
+  it('reads an italic abstract whose formula sits at its edge', () => {
+    expect(parseInline('*with $k$*')).toEqual([
+      {
+        kind: 'em',
+        segments: [
+          { kind: 'text', text: 'with ' },
+          { kind: 'math', tex: 'k' },
+        ],
+        src: '*with $k$*',
+      },
+    ])
+    expect(parseInline('_$x$_')).toEqual([{ kind: 'em', segments: [{ kind: 'math', tex: 'x' }], src: '_$x$_' }])
+  })
+
+  it('never lets a marker inside a formula pair with one outside it', () => {
+    expect(parseInline('*a $b*c$ d')).toEqual([
+      { kind: 'text', text: '*a ' },
+      { kind: 'math', tex: 'b*c' },
+      { kind: 'text', text: ' d' },
+    ])
+  })
+
+  it('reads a superscript around a formula', () => {
+    expect(parseInline('A<sup>$\\dagger$</sup>')).toEqual([
+      { kind: 'text', text: 'A' },
+      { kind: 'sup', segments: [{ kind: 'math', tex: '\\dagger' }], src: '<sup>$\\dagger$</sup>' },
+    ])
+  })
+})
+
+describe('parseInline LaTeX math delimiters', () => {
+  it('reads \\( … \\) as inline math, its inner spaces trimmed', () => {
+    expect(parseInline('the student \\( g_{\\theta_s} \\) is')).toEqual([
+      { kind: 'text', text: 'the student ' },
+      { kind: 'math', tex: 'g_{\\theta_s}' },
+      { kind: 'text', text: ' is' },
+    ])
+  })
+
+  it('reads \\[ … \\] inside a line only around TeX', () => {
+    expect(parseInline('so \\[ x^2 \\] holds')).toEqual([
+      { kind: 'text', text: 'so ' },
+      { kind: 'math', tex: 'x^2' },
+      { kind: 'text', text: ' holds' },
+    ])
+    expect(parseInline('see \\[87\\] and \\[12]')).toEqual([{ kind: 'text', text: 'see [87] and [12]' }])
+  })
+
+  it('opens nothing on an escaped backslash, or across a code span', () => {
+    expect(parseInline('a \\\\(b\\) c')).toEqual([{ kind: 'text', text: 'a \\(b) c' }])
+    expect(parseInline('`\\(x\\)`')).toEqual([{ kind: 'code', text: '\\(x\\)', src: '`\\(x\\)`' }])
+  })
+
+  it('keeps the LaTeX source of a formula inside emphasis', () => {
+    expect(parseInline('**loss \\(L\\)**')).toEqual([
+      {
+        kind: 'strong',
+        segments: [
+          { kind: 'text', text: 'loss ' },
+          { kind: 'math', tex: 'L' },
+        ],
+        src: '**loss \\(L\\)**',
+      },
+    ])
+  })
+})
+
+describe('parseResultMarkdown rules and LaTeX display math', () => {
+  it('reads a footnote rule as a block of its own, the paragraph above it ended', () => {
+    const [page] = parseResultMarkdown(['Body text.', '---', '¹ A footnote.'].join('\n'))
+    expect(bare(page!.blocks)).toEqual([
+      { kind: 'p', text: 'Body text.' },
+      { kind: 'hr' },
+      { kind: 'p', text: '¹ A footnote.' },
+    ])
+  })
+
+  it('reads the other spellings of a rule, and not a list of dashes', () => {
+    const [page] = parseResultMarkdown(['* * *', '', '___', '', '- item'].join('\n'))
+    expect(bare(page!.blocks)).toEqual([
+      { kind: 'hr' },
+      { kind: 'hr' },
+      { kind: 'list', ordered: false, items: ['item'] },
+    ])
+  })
+
+  it('ends a list at a rule right under it, spaced or not', () => {
+    for (const rule of ['- - -', '* * *', '---']) {
+      const [page] = parseResultMarkdown(['- Item', rule, 'Footnote.'].join('\n'))
+      expect(bare(page!.blocks)).toEqual([
+        { kind: 'list', ordered: false, items: ['Item'] },
+        { kind: 'hr' },
+        { kind: 'p', text: 'Footnote.' },
+      ])
+    }
+  })
+
+  it('reads \\[ alone on its line as display math, to its closing line', () => {
+    const [page] = parseResultMarkdown(['\\[', 'P_s(x) = \\frac{a}{b}, \\tag{1}', '\\]', 'After.'].join('\n'))
+    expect(bare(page!.blocks)).toEqual([
+      { kind: 'math', text: 'P_s(x) = \\frac{a}{b}, \\tag{1}' },
+      { kind: 'p', text: 'After.' },
+    ])
+  })
+
+  it('reads a one-line \\[ … \\] around TeX, and leaves a reference line as prose', () => {
+    const [page] = parseResultMarkdown(['\\[ E = mc^2 \\]', '', '\\[87] A. Author, A title.', '', '\\[87\\]'].join('\n'))
+    expect(bare(page!.blocks)).toEqual([
+      { kind: 'math', text: 'E = mc^2' },
+      { kind: 'p', text: '\\[87] A. Author, A title.' },
+      { kind: 'p', text: '\\[87\\]' },
+    ])
+  })
+
+  it('leaves a line of two bracketed formulas to the inline reader', () => {
+    const line = '\\[x^2\\] and \\[y^2\\]'
+    const [page] = parseResultMarkdown(line)
+    expect(bare(page!.blocks)).toEqual([{ kind: 'p', text: line }])
+    expect(parseInline(line)).toEqual([
+      { kind: 'math', tex: 'x^2' },
+      { kind: 'text', text: ' and ' },
+      { kind: 'math', tex: 'y^2' },
+    ])
+  })
+
+  it('round-trips a rule and LaTeX display math byte for byte', () => {
+    const markdown = ['<!-- page: 1 -->', 'Text.', '', '---', '', '\\[', 'x^2', '\\]'].join('\n')
+    expect(serializeDocument(parseResultMarkdown(markdown))).toBe(markdown)
+  })
+})
+
 describe('display math with the dollars on the formula’s own line', () => {
   it('reads a one-line $$…$$ as a display block, not a paragraph', () => {
     const [page] = parseResultMarkdown(
@@ -906,6 +1052,23 @@ describe('section links', () => {
     })
     expect(parseInline(`**${link}**`, { cites: true })).toMatchObject([
       { kind: 'strong', segments: [{ kind: 'cite', label: '3.2 Attention' }] },
+    ])
+  })
+
+  it('reads a link whose formula holds brackets with that formula, not its stand-in', () => {
+    const src = '[The $[0,1]$ interval](#the-01-interval)'
+    expect(parseInline(src, { cites: true })).toEqual([
+      {
+        kind: 'cite',
+        segments: [
+          { kind: 'text', text: 'The ' },
+          { kind: 'math', tex: '[0,1]' },
+          { kind: 'text', text: ' interval' },
+        ],
+        label: 'The [0,1] interval',
+        anchor: 'the-01-interval',
+        src,
+      },
     ])
   })
 

@@ -458,6 +458,7 @@ export default {
         img: '圖片',
         quote: '引用',
         toc: '目錄',
+        hr: '分隔線',
       },
       ask: {
         paragraph: '問 Agent 這一段',

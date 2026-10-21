@@ -87,6 +87,31 @@ async def test_transcribe_page_strips_a_code_fence(key, documents) -> None:
     assert result.markdown == "# Page"
 
 
+@pytest.mark.parametrize(
+    ("answer", "markdown"),
+    [
+        # A wrapper around a page that carries its own code block: only the wrapper goes.
+        (
+            "```markdown\n# Page\n\n```python\nprint(1)\n```\n```",
+            "# Page\n\n```python\nprint(1)\n```",
+        ),
+        # A wrapper the model forgot to close is still a wrapper.
+        ("```md\nText", "Text"),
+        # A page ending with a listing keeps the listing's closing fence.
+        ("Text\n\n```python\nprint(1)\n```", "Text\n\n```python\nprint(1)\n```"),
+        # A page opening with one keeps its opening fence.
+        ("```python\nprint(1)\n```\n\nText", "```python\nprint(1)\n```\n\nText"),
+        # A bare fence cannot be told from an unlabelled listing: left as it came.
+        ("```\ncode\n```", "```\ncode\n```"),
+    ],
+)
+@respx.mock
+async def test_only_a_markdown_wrapper_is_unwrapped(key, documents, answer, markdown) -> None:
+    respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(200, json=completion(answer)))
+    result = await transcribe_page(key, "m", PROMPT, documents["png"], 1)
+    assert result.markdown == markdown
+
+
 @respx.mock
 async def test_a_prompt_with_stray_braces_still_substitutes_its_tokens(key, documents) -> None:
     """User-supplied templates go through plain replacement, never `str.format`."""

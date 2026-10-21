@@ -45,6 +45,7 @@ describe('an unchanged document', () => {
     ['an inserted image with caption', '![shot](figures/img-0123456789abcdef.png)\nThe login screen'],
     ['prices', 'It cost $5 and $6 in total.'],
     ['an author line with superscripts', '**THYAGATURU<sup>1</sup>, (Senior Member, IEEE)** <sup>1</sup>Intel, H<sub>2</sub>O'],
+    ['formulas inside marks', 'A<sup>$n$</sup>, *the $k$ value* and **loss \\(L\\)**'],
     ['several blocks', '# Title\n\nPara one.\n\n- a\n- b\n\n$$\nx\n$$'],
     ['a quote over blocks', '> ## Said\n> first line\n>second\n>\n> - a\n> - b'],
   ])('%s comes back byte for byte', (_name, markdown) => {
@@ -58,6 +59,19 @@ describe('an edited document', () => {
     const changed = structuredClone(doc)
     changed.content![1]!.content = [{ type: 'text', text: 'Changed.' }]
     expect(docToMarkdown(changed)).toBe('Keep _this_ exactly.\n\nChanged.')
+  })
+
+  it('keeps the marks around a formula when the text beside it changes', () => {
+    const superscript = load('A<sup>$n$</sup>.')
+    superscript.content![0]!.content!.splice(-1, 1, { type: 'text', text: '!' })
+    expect(docToMarkdown(superscript)).toBe('A<sup>$n$</sup>!')
+
+    const emphasis = load('*the $k$ value*')
+    emphasis.content![0]!.content!.push({ type: 'text', text: '.' })
+    const markdown = docToMarkdown(emphasis)
+    expect(markdown).toBe('*the* *$k$* *value*.')
+    const formula = load(markdown).content![0]!.content!.find((node) => node.type === 'inlineMath')
+    expect(formula?.marks).toEqual([{ type: 'italic' }])
   })
 
   it('drops an emptied block', () => {
@@ -352,6 +366,28 @@ describe('quotes in the editor', () => {
     const markdown = serializeNode({ type: 'paragraph', content: [{ type: 'text', text: '> not a quote' }] })
     expect(markdown).toBe('\\> not a quote')
     expect(reading(markdown)).toEqual([{ kind: 'p', text: '\\> not a quote' }])
+  })
+
+  it('escapes a paragraph of dashes so it stays a paragraph, not a rule', () => {
+    for (const text of ['---', '-- -']) {
+      const markdown = serializeNode({ type: 'paragraph', content: [{ type: 'text', text }] })
+      expect(markdown).toBe(`\\${text}`)
+      expect(load(markdown).content![0]).toMatchObject({ type: 'paragraph', content: [{ type: 'text', text }] })
+    }
+  })
+
+  it('escapes a bullet item of dashes so the list keeps it', () => {
+    for (const text of ['--', '---', '- -']) {
+      const markdown = serializeNode({
+        type: 'bulletList',
+        content: [
+          { type: 'listItem', content: [{ type: 'paragraph', content: [{ type: 'text', text: 'first' }] }] },
+          { type: 'listItem', content: [{ type: 'paragraph', content: [{ type: 'text', text }] }] },
+        ],
+      })
+      expect(markdown).toBe(`- first\n- \\${text}`)
+      expect(reading(markdown)).toEqual([{ kind: 'list', ordered: false, items: ['first', `\\${text}`] }])
+    }
   })
 
   it('makes quote lines of any markdown', () => {

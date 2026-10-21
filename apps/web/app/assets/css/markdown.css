@@ -84,6 +84,15 @@
   white-space: pre;
 }
 
+/* A thematic break is almost always a page's footnote rule, so it is drawn as one: a short
+   hairline at the start of the measure, not a divider across the column. */
+.md-hr {
+  width: 33%;
+  margin: 0;
+  border: 0;
+  border-top: 1px solid var(--edge);
+}
+
 /* Markers stay outside the measure, so the text edge lines up with the paragraphs above
    and below it rather than being indented away from them. */
 .md-list {

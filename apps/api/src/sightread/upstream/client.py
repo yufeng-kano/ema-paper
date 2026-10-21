@@ -51,7 +51,27 @@ COST_QUANTUM = Decimal("0.000001")
 MAX_REPORTED_COST = Decimal("999999.999999")
 
 # Model answers sometimes arrive wrapped in a fence despite the prompt.
-_CODE_FENCE_RE = re.compile(r"^\s*```[a-zA-Z]*\s*|\s*```\s*$")
+_FENCE_LINE_RE = re.compile(r"^\s*(```|~~~)\s*([^\s`]*)\s*$")
+_WRAPPER_INFO = frozenset({"markdown", "md"})
+
+
+def _unwrap_answer(text: str) -> str:
+    """The answer without the fence a model wrapped it in, and nothing else removed.
+
+    Only a first line opening a `markdown`/`md` fence is a wrapper; a bare closing fence on
+    the last line goes with it. A page that opens or ends with a code block of its own keeps
+    its fences, and a bare ``` opener is left alone: it cannot be told from a page that is
+    one unlabelled listing (docs/parsing.md § Vision-only conversion).
+    """
+    lines = text.strip().split("\n")
+    opener = _FENCE_LINE_RE.match(lines[0])
+    if not opener or opener.group(2).lower() not in _WRAPPER_INFO:
+        return text.strip()
+    body = lines[1:]
+    closer = _FENCE_LINE_RE.match(body[-1]) if body else None
+    if closer and closer.group(1) == opener.group(1) and not closer.group(2):
+        body = body[:-1]
+    return "\n".join(body).strip()
 
 
 # --- provider connections (user-defined OpenAI-compatible endpoints) ------------------
@@ -538,7 +558,5 @@ async def transcribe_page(
         .replace("{bbox_format}", convention.format)
     )
     text, usage = await _chat_with_image(connection, model, prompt, image, max_response_bytes)
-    markdown = bbox.canonicalize(
-        _CODE_FENCE_RE.sub("", text.strip()), convention, width_px, height_px
-    )
+    markdown = bbox.canonicalize(_unwrap_answer(text), convention, width_px, height_px)
     return PageTranscription(markdown=markdown, usage=usage)

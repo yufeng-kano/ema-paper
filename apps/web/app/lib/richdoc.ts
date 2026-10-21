@@ -19,6 +19,7 @@
 import type { JSONContent } from '@tiptap/core'
 import {
   ESCAPABLE,
+  THEMATIC_BREAK,
   WORD_CHAR,
   isEscaped,
   mathSpanAt,
@@ -43,8 +44,9 @@ function inlineContent(segments: InlineSegment[], marks: Mark[] = []): JSONConte
           content.push(textNode(segment.text, marks))
         }
         break
+      // A formula inside emphasis or a superscript keeps it: `A<sup>$n$</sup>`.
       case 'math':
-        content.push({ type: 'inlineMath', attrs: { latex: segment.tex } })
+        content.push(withMarks({ type: 'inlineMath', attrs: { latex: segment.tex } }, marks))
         break
       case 'strong':
         content.push(...inlineContent(segment.segments, [...marks, 'bold']))
@@ -76,11 +78,13 @@ function inlineContent(segments: InlineSegment[], marks: Mark[] = []): JSONConte
   return content
 }
 
-function textNode(text: string, marks: Mark[]): JSONContent {
+function withMarks(node: JSONContent, marks: Mark[]): JSONContent {
   const unique = [...new Set(marks)]
-  return unique.length
-    ? { type: 'text', text, marks: unique.map((type) => ({ type })) }
-    : { type: 'text', text }
+  return unique.length ? { ...node, marks: unique.map((type) => ({ type })) } : node
+}
+
+function textNode(text: string, marks: Mark[]): JSONContent {
+  return withMarks({ type: 'text', text }, marks)
 }
 
 function paragraph(text: string, options?: InlineOptions): JSONContent {
@@ -133,13 +137,14 @@ function blockNode(block: ResultBlock, options?: InlineOptions): JSONContent {
         attrs: { language: block.lang },
         ...(block.text ? { content: [{ type: 'text', text: block.text }] } : {}),
       }
-    // A contents page, a figure placeholder, an image and a comment have no rich-text form:
-    // they ride through the editor as their source, untouched (a figure and an image drawn
-    // as themselves where the editor is given their addresses, `rich-extensions.ts`).
+    // A contents page, a figure placeholder, an image, a comment and a rule have no rich-text
+    // form: they ride through the editor as their source, untouched (a figure and an image
+    // drawn as themselves where the editor is given their addresses, `rich-extensions.ts`).
     case 'toc':
     case 'fig':
     case 'img':
     case 'comment':
+    case 'hr':
       return { type: 'rawBlock', attrs: { source: block.src } }
   }
 }
@@ -254,6 +259,26 @@ function sameMarks(a: Mark[], b: Mark[]): boolean {
   return a.length === b.length && a.every((mark) => b.includes(mark))
 }
 
+/** A run's markdown inside the markers of its marks. */
+function wrapMarks(markdown: string, marks: Mark[]): string {
+  let inner = markdown
+  if (marks.includes('italic')) {
+    inner = `*${inner}*`
+  }
+  if (marks.includes('bold')) {
+    inner = `**${inner}**`
+  }
+  // Outside the asterisks: `**a**<sup>**1**</sup>**b**` has no two runs of asterisks
+  // meeting, so it needs none of the separators below.
+  if (marks.includes('superscript')) {
+    inner = `<sup>${inner}</sup>`
+  }
+  if (marks.includes('subscript')) {
+    inner = `<sub>${inner}</sub>`
+  }
+  return inner
+}
+
 /** Stands in for a formula or a code span while the line's dollars are checked: neither's
  *  characters are prose, so neither may be escaped. A private-use character, never typed. */
 const HELD = '\uE000'
@@ -288,6 +313,11 @@ export function serializeInline(content: JSONContent[] = [], inTable = false): s
       if (!latex) {
         return ''
       }
+      const marks = markSet(node)
+      if (marks.length) {
+        // Inside its marks the formula closes before their closer, never before a digit.
+        return wrapMarks(hold(`$${latex}$`), marks)
+      }
       // A span never closes on a dollar followed by a digit ("$5 and $6" are prices), so
       // a formula right before one is kept apart by an invisible zero-width space —
       // anything visible would change the text the reader typed.
@@ -314,21 +344,7 @@ export function serializeInline(content: JSONContent[] = [], inTable = false): s
         inner = `${inner.slice(0, -1)}\\$`
       }
     }
-    if (marks.includes('italic')) {
-      inner = `*${inner}*`
-    }
-    if (marks.includes('bold')) {
-      inner = `**${inner}**`
-    }
-    // Outside the asterisks: `**a**<sup>**1**</sup>**b**` has no two runs of asterisks
-    // meeting, so it needs none of the separators below.
-    if (marks.includes('superscript')) {
-      inner = `<sup>${inner}</sup>`
-    }
-    if (marks.includes('subscript')) {
-      inner = `<sub>${inner}</sub>`
-    }
-    return `${lead}${inner}${trail}`
+    return `${lead}${wrapMarks(inner, marks)}${trail}`
   })
   // Two emphasis runs that meet (`*a*` then `**b**`) would merge their asterisks into a
   // run the parser cannot split; an invisible zero-width space keeps them apart.
@@ -350,7 +366,9 @@ function escapeLineStart(line: string): string {
   // A sentence ending in a dot leader and a number would read back as a contents row; one
   // escaped dot breaks the leader and still renders as a dot.
   const text = readsAsTocRow(line) ? line.replace(/\.(?=[^.]*$)/, '\\.') : line
-  if (/^(#|>|[-+*]\s|\d{1,9}[.)]\s|\$\$|```|~~~|<!--|!\[)/.test(text)) {
+  // Dashes alone on the line read back as a rule; the other rules' `*` and `_` are escaped
+  // already, one by one.
+  if (/^(#|>|[-+*]\s|\d{1,9}[.)]\s|\$\$|```|~~~|<!--|!\[)/.test(text) || THEMATIC_BREAK.test(text)) {
     const marker = /^\d{1,9}/.exec(text)
     return marker ? `${marker[0]}\\${text.slice(marker[0].length)}` : `\\${text}`
   }
@@ -456,7 +474,13 @@ export function serializeNode(node: JSONContent): string {
         .filter((item) => item !== '')
       const start = Number(node.attrs?.start ?? 1)
       return items
-        .map((item, index) => (node.type === 'orderedList' ? `${start + index}. ${item}` : `- ${item}`))
+        .map((item, index) => {
+          if (node.type === 'orderedList') {
+            return `${start + index}. ${item}`
+          }
+          // An item of dashes, under its own dash, would read back as a rule.
+          return THEMATIC_BREAK.test(`- ${item}`) ? `- \\${item}` : `- ${item}`
+        })
         .join('\n')
     }
     case 'table':
