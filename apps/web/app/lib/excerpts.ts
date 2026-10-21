@@ -96,22 +96,34 @@ export function droppedBlocksMarkdown(markdown: string): string | null {
  *  level deep (`…block=a~Let+(x)+be`), as a markdown link's destination may hold them. */
 const ADDRESS_LINK = /\[((?:\\[\s\S]|[^[\]\\\n])+)\]\((https?:\/\/(?:[^\s()]|\([^\s()]*\))+)\)/g
 
+/** Code in markdown, where nothing is a link: a fenced block, then a span on one line. */
+const CODE_REGIONS = /(```[\s\S]*?(?:```|$)|`[^`\n]+`)/
+
 /**
  * Block references pasted into the notes (docs/web.md § Notes, *Quotes and section links*):
  * each markdown link whose address `anchorOf` knows as this document's — it answers the
  * block anchor the address carries, or null — becomes the section link `[label](#anchor)`,
  * the anchor escaped so it reads as one (`CITE_AT` allows no spaces or parentheses in it).
- * Any other link stays as written.
+ * Any other link stays as written, and so does code — a fenced block, a span — and a link
+ * whose bracket is escaped: those are the text they show.
  */
 export function rewriteBlockLinks(markdown: string, anchorOf: (address: string) => string | null): string {
-  return markdown.replace(ADDRESS_LINK, (whole, label: string, address: string) => {
-    const anchor = anchorOf(address)
-    if (anchor === null) {
-      return whole
-    }
-    const escaped = encodeURIComponent(decodeBlockAnchor(anchor)).replace(/\(/g, '%28').replace(/\)/g, '%29')
-    return `[${label}](#${escaped})`
-  })
+  return markdown
+    .split(CODE_REGIONS)
+    .map((part, index) =>
+      index % 2
+        ? part
+        : part.replace(ADDRESS_LINK, (whole, label: string, address: string, offset: number) => {
+            const slashes = /\\*$/.exec(part.slice(0, offset))?.[0].length ?? 0
+            const anchor = slashes % 2 ? null : anchorOf(address)
+            if (anchor === null) {
+              return whole
+            }
+            const escaped = encodeURIComponent(decodeBlockAnchor(anchor)).replace(/\(/g, '%28').replace(/\)/g, '%29')
+            return `[${label}](#${escaped})`
+          }),
+    )
+    .join('')
 }
 
 /** The section a passage is in, as its excerpt's link names it; null before the first heading. */

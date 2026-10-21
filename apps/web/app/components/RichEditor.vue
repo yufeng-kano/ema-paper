@@ -25,6 +25,7 @@
 import { Editor } from '@tiptap/core'
 import { Slice, type Node as ProseNode } from '@tiptap/pm/model'
 import { NodeSelection, Selection, TextSelection, type Transaction } from '@tiptap/pm/state'
+import type { EditorView } from '@tiptap/pm/view'
 import { matchCommands } from '~/lib/composer'
 import { BLOCK_DRAG_TYPE, setDropEffect } from '~/lib/dnd'
 import { droppedBlocksMarkdown } from '~/lib/excerpts'
@@ -714,6 +715,17 @@ function onCompositionEnd() {
   }, 30)
 }
 
+/** Pasted text as the editor takes it: markdown through the viewer's parser, block references
+ *  to this document rewritten as section links first (`links.rewrite`); one line of plain
+ *  text, or a paste asked plain, lands inline. */
+function pastedSlice(view: EditorView, text: string, plain: boolean): Slice {
+  const markdown = props.links?.rewrite?.(text) ?? text
+  const doc = view.state.schema.nodeFromJSON(markdownToDoc(markdown, inlineOptions))
+  return plain || !markdown.includes('\n') && doc.childCount === 1 && doc.firstChild?.type.name === 'paragraph'
+    ? new Slice(doc.content, 1, 1)
+    : Slice.maxOpen(doc.content)
+}
+
 // --- blocks dropped from the document -----------------------------------------------------------
 
 /**
@@ -826,12 +838,18 @@ onMounted(() => {
       clipboardTextSerializer: (slice) => sliceToMarkdown(slice.content.toJSON() ?? []),
       // Pasted markdown reads as markdown, through the viewer's parser — block references to
       // this document rewritten as section links first, where links are read.
-      clipboardTextParser: (text, _context, plain, view) => {
-        const markdown = props.links?.rewrite?.(text) ?? text
-        const doc = view.state.schema.nodeFromJSON(markdownToDoc(markdown, inlineOptions))
-        return plain || !markdown.includes('\n') && doc.childCount === 1 && doc.firstChild?.type.name === 'paragraph'
-          ? new Slice(doc.content, 1, 1)
-          : Slice.maxOpen(doc.content)
+      clipboardTextParser: (text, _context, plain, view) => pastedSlice(view, text, plain),
+      // A block reference copied by *Copy link to block* carries an HTML form too, which the
+      // editor would otherwise read in place of the text and reduce to the label (its schema
+      // has no link mark): where the text holds a reference the rewrite knows, the text is
+      // what is pasted.
+      handlePaste: (view, event) => {
+        const text = event.clipboardData?.getData('text/plain') ?? ''
+        if (!event.clipboardData?.getData('text/html') || !props.links?.rewrite || props.links.rewrite(text) === text) {
+          return false
+        }
+        view.dispatch(view.state.tr.replaceSelection(pastedSlice(view, text, false)).scrollIntoView())
+        return true
       },
       // A drag of the viewer's blocks is the root's to land (`onBlockDrop`), never text dropped
       // into the line under the pointer.

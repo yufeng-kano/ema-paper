@@ -2049,7 +2049,8 @@ function copyLink(at: BlockAt) {
   const path = localePath({ path: '/files', query: { document: String(props.documentId), block: anchor } })
   const href = new URL(path, window.location.origin).href
   const name = blockName(block, nameText.value)
-  const markdown = `[${name.replace(/[[\]]/g, '\\$&')}](${href})`
+  // The destination's parentheses escaped, or a `)` in the block's words would end the link.
+  const markdown = `[${name.replace(/[[\]]/g, '\\$&')}](${href.replace(/\(/g, '%28').replace(/\)/g, '%29')})`
   const anchorEl = document.createElement('a')
   anchorEl.href = href
   anchorEl.textContent = name

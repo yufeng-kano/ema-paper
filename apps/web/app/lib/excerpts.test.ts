@@ -142,6 +142,14 @@ describe('block references in the notes', () => {
     expect(rewriteBlockLinks('[a plain link](https://example.com/page)', anchorOf)).toBe('[a plain link](https://example.com/page)')
   })
 
+  it('leaves code and escaped links as the text they show', () => {
+    const link = `[x](${address('a~x')})`
+    expect(rewriteBlockLinks(`Write \`${link}\` to cite.`, anchorOf)).toBe(`Write \`${link}\` to cite.`)
+    expect(rewriteBlockLinks(`\`\`\`md\n${link}\n\`\`\`\n\n${link}`, anchorOf)).toBe(`\`\`\`md\n${link}\n\`\`\`\n\n[x](#a~x)`)
+    expect(rewriteBlockLinks(`\\${link}`, anchorOf)).toBe(`\\${link}`)
+    expect(rewriteBlockLinks(`\\\\${link}`, anchorOf)).toBe('\\\\[x](#a~x)')
+  })
+
   it('resolves a block reference by its anchor, read back from its escapes', () => {
     expect(linkResolves(pages, outline, { label: 'x', anchor: '321-scaled-dot-product-attention~We%20suspect%20that', passage: null })).toBe(true)
     expect(linkResolves(pages, outline, { label: 'x', anchor: '~A+preface+before', passage: null })).toBe(true)
