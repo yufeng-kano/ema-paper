@@ -18,7 +18,7 @@ from sqlalchemy import case, func, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
 
-from ..agents import AGENTS, CHAT, PARSE, AgentDefinition, get_agent
+from ..agents import AGENTS, CHAT, CHECK, PARSE, AgentDefinition, get_agent
 from ..agents import chat as chat_agent
 from ..agents import memory as memory_defs
 from ..agents import skills as skill_defs
@@ -661,6 +661,9 @@ def _agent_settings_payload(row: AgentSetting | None) -> dict:
         # there on its own (docs/parsing.md § Fallback model).
         "fallback_model": row.fallback_model if row else None,
         "auto_fallback": bool(row.auto_fallback) if row else False,
+        # The check agent's own: whether a Files upload is checked before it opens
+        # (docs/parsing.md § Format check).
+        "auto_check": row.auto_check if row and row.auto_check is not None else True,
     }
 
 
@@ -718,8 +721,9 @@ class AgentSettingsPut(BaseModel):
     prompt: str | None = None
     prompt_preset_id: int | None = None
     effort: str | None = Field(default=None, max_length=8)
-    # The chat agent's own (docs/agents.md); checked in the route, which answers 400 for
-    # each — capped where the settings are (`CHAT_INSTRUCTIONS_MAX_CHARS`).
+    # The chat agent's own, the instructions the check agent's too (docs/agents.md);
+    # checked in the route, which answers 400 for each — capped where the settings are
+    # (`CHAT_INSTRUCTIONS_MAX_CHARS`).
     instructions: str | None = None
     answer_language: str | None = None
     translate_language: str | None = None
@@ -728,18 +732,21 @@ class AgentSettingsPut(BaseModel):
     # The parse agent's own (docs/agents.md).
     fallback_model: str | None = Field(default=None, max_length=255)
     auto_fallback: bool | None = None
+    # The check agent's own (docs/agents.md).
+    auto_check: bool | None = None
 
 
-# The chat agent's settings no other agent takes, and the parse agent's (docs/agents.md
-# § Per-agent settings).
-CHAT_ONLY_SETTINGS = (
-    "instructions",
-    "answer_language",
-    "translate_language",
-    "memory_auto",
-    "memory_paused",
-)
-PARSE_ONLY_SETTINGS = ("fallback_model", "auto_fallback")
+# The settings only some agents take, and which (docs/agents.md § Per-agent settings).
+SETTING_OWNERS: dict[str, tuple[str, ...]] = {
+    "instructions": (CHAT.name, CHECK.name),
+    "answer_language": (CHAT.name,),
+    "translate_language": (CHAT.name,),
+    "memory_auto": (CHAT.name,),
+    "memory_paused": (CHAT.name,),
+    "fallback_model": (PARSE.name,),
+    "auto_fallback": (PARSE.name,),
+    "auto_check": (CHECK.name,),
+}
 # A language tag, as the composer's locale is one (docs/api.md).
 LANGUAGE_TAG = re.compile(r"^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$")
 LANGUAGE_TAG_MAX_CHARS = 16
@@ -774,17 +781,16 @@ async def put_agent_settings(
 ):
     agent = _known_agent(agent_name)
     provided = body.model_fields_set
-    chat_only = [name for name in CHAT_ONLY_SETTINGS if name in provided]
-    if chat_only and agent.name != CHAT.name:
+    foreign = [
+        name
+        for name, owners in SETTING_OWNERS.items()
+        if name in provided and agent.name not in owners
+    ]
+    if foreign:
         raise ApiError(
-            400, "invalid_request", f"The {agent.name} agent takes no {', '.join(chat_only)}"
+            400, "invalid_request", f"The {agent.name} agent takes no {', '.join(foreign)}"
         )
-    parse_only = [name for name in PARSE_ONLY_SETTINGS if name in provided]
-    if parse_only and agent.name != PARSE.name:
-        raise ApiError(
-            400, "invalid_request", f"The {agent.name} agent takes no {', '.join(parse_only)}"
-        )
-    for switch in ("memory_auto", "memory_paused", "auto_fallback"):
+    for switch in ("memory_auto", "memory_paused", "auto_fallback", "auto_check"):
         if switch in provided and getattr(body, switch) is None:
             raise ApiError(400, "invalid_request", f"{switch} is true or false")
     instructions = (
@@ -809,7 +815,8 @@ async def put_agent_settings(
         raise ApiError(400, "invalid_request", "Send either prompt or prompt_preset_id")
     if body.connection_id is not None:
         if "anthropic" in agent.capabilities:
-            # The chat agent speaks the Messages API through Kano Proxy only (docs/chat.md).
+            # The chat and check agents speak the Messages API through Kano Proxy only
+            # (docs/chat.md).
             raise ApiError(
                 400, "invalid_request", f"The {agent.name} agent runs on Kano Proxy only"
             )
@@ -849,6 +856,8 @@ async def put_agent_settings(
         row.fallback_model = (body.fallback_model or "").strip() or None
     if "auto_fallback" in provided:
         row.auto_fallback = bool(body.auto_fallback)
+    if "auto_check" in provided:
+        row.auto_check = bool(body.auto_check)
     if "prompt" in provided or "prompt_preset_id" in provided:
         # Writing either clears the other: one of the two is ever in force.
         row.prompt = prompt

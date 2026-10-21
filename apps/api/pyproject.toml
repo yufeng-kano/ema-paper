@@ -59,8 +59,9 @@ ignore = [
 "tests/*" = ["S105", "S106"]
 "migrations/*" = ["E501"]
 # The chat agent's system prompt is prose; a wrapped prompt reads worse to the model. So
-# are the built-in skills' and subagents' instructions.
+# are the built-in skills' and subagents' instructions, and the check agent's prompt.
 "src/sightread/agents/chat.py" = ["E501"]
+"src/sightread/agents/check.py" = ["E501"]
 "src/sightread/agents/memory.py" = ["E501"]
 "src/sightread/agents/skills.py" = ["E501"]
 "src/sightread/agents/subagents.py" = ["E501"]

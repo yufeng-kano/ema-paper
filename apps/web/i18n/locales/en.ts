@@ -174,6 +174,7 @@ export default {
     names: {
       parse: 'Parse',
       chat: 'Chat',
+      check: 'Format check',
     },
     modelChosen: 'Model chosen',
     modelMissing: 'No model chosen',
@@ -327,6 +328,16 @@ export default {
       auto: 'Retry blocked pages on it automatically',
       note: 'It is also the first choice when you retry failed pages.',
     },
+    check: {
+      label: 'Format check',
+      auto: 'Check automatically after converting',
+      note: 'Once every page has converted, paragraphs cut by a page break are joined and the markup is fixed, without changing the text. A document whose check fails does not open.',
+      sameModel: 'Same as the parse model',
+      instructions: 'Instructions for the check',
+      placeholder: 'For example: vectors are set in bold, and equations are numbered on the right.',
+      advancedNote:
+        'A replaced prompt sends none of the default’s rules for joining pages and fixing markup. You answer for those yourself.',
+    },
     languages: {
       'zh-TW': 'Traditional Chinese',
       'zh-CN': 'Simplified Chinese',
@@ -409,11 +420,15 @@ export default {
       emptied: 'Emptied the Trash',
       inTrash: 'Put it back to open it',
       parsing: 'It opens once every page is done',
+      checking: 'It opens once its format is checked',
     },
     failedPages: '{n} page failed | {n} pages failed',
+    checking: 'Checking format',
     retryFailed: 'Retry failed pages…',
+    retryWhole: 'Retry…',
     retry: {
       title: 'Retry failed pages',
+      titleWhole: 'Retry',
       pages: 'Pages to retry',
       page: 'Page {n}',
       pageImage: 'Page {n} of the original',
@@ -430,6 +445,10 @@ export default {
       },
       model: 'Model',
       note: 'Only these pages are sent. The rest are kept and not paid for again. The document opens once every page has succeeded.',
+      checkFailed: 'The format check failed: {reason}',
+      noteCheck:
+        'Every page has converted, and none is sent again. The document is checked again, with the format check’s settings on the Agent page, and opens once the check succeeds.',
+      noteWhole: 'Every page has converted, and none is sent again. The document opens once the retry succeeds.',
       submitOne: 'Retry page {n}',
       submitMany: 'Retry {n} pages',
       submit: 'Retry',

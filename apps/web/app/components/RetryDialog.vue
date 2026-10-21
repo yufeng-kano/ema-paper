@@ -5,7 +5,9 @@
  * failed and on which model — the model to send them to, and the retry itself.
  *
  * Only the pages without a result go; the ones that succeeded are kept and not paid for
- * again. The page opens the document by itself once the retry has every page.
+ * again. A parse that failed only its format check has every page: its retry sends none, so
+ * the dialog asks for no model and is titled for the whole document. The page opens the
+ * document by itself once the retry has every page and its check.
  */
 import {
   getDocumentPages,
@@ -16,9 +18,10 @@ import {
   type DocumentPage,
   type LibraryDocument,
 } from '~/lib/api'
-import { PAGE_FAILURE_REASONS, RETRY_TILES_MAX } from '~/lib/library'
+import { PAGE_FAILURE_REASONS, RETRY_TILES_MAX, checkFailureReason } from '~/lib/library'
 
 const PARSE_AGENT = 'parse'
+const CHECK_AGENT = 'check'
 
 const props = defineProps<{ document: LibraryDocument }>()
 
@@ -35,6 +38,9 @@ const modelsError = ref<string | null>(null)
 const fallback = ref<string | null>(null)
 /** The reader's pick; until there is one, the default below. */
 const chosen = ref<string | null>(null)
+/** Whether the format check is on now — a retry checks with the settings of its moment.
+ *  Null until the agents have loaded. */
+const checkOn = ref<boolean | null>(null)
 const retryError = ref<string | null>(null)
 const busy = ref(false)
 /** Pages whose image could not be drawn — the original gone, a page Poppler refused. */
@@ -42,11 +48,22 @@ const broken = reactive(new Set<number>())
 
 /** Every page of the selection without a result: what a retry sends. */
 const missing = computed(() => (pages.value ?? []).filter((page) => page.status !== 'succeeded'))
+/** Known before the pages load, from the row: a parse with no page missing retries whole. */
+const title = computed(() => t(props.document.failed_pages ? 'files.retry.title' : 'files.retry.titleWhole'))
 const tiles = computed(() => missing.value.slice(0, RETRY_TILES_MAX))
-/** The job's own error, when no page carries one: something ended it before any page did. */
-const jobError = computed(() =>
-  pages.value && !missing.value.some((page) => page.reason) ? props.document.error : null,
-)
+/** The job's own error, when no page carries one: something ended it before any page did,
+ *  or its format check failed after every page — said in the reader's language. */
+const jobError = computed(() => {
+  if (!pages.value || missing.value.some((page) => page.reason)) {
+    return null
+  }
+  const check = checkFailureReason(props.document.error)
+  if (check === null) {
+    return props.document.error
+  }
+  const key = PAGE_FAILURE_REASONS[check]
+  return t('files.retry.checkFailed', { reason: key ? t(`files.retry.reasons.${key}`) : check })
+})
 
 /** The fallback, else the model the failed pages last ran on. */
 const model = computed(
@@ -88,6 +105,7 @@ async function loadModels() {
   try {
     const [agents, catalog] = await Promise.all([listAgents(), listAgentModels(PARSE_AGENT)])
     fallback.value = agents.agents.find((agent) => agent.name === PARSE_AGENT)?.settings.fallback_model ?? null
+    checkOn.value = agents.agents.find((agent) => agent.name === CHECK_AGENT)?.settings.auto_check ?? false
     models.value = [...catalog.data].sort((left, right) => left.id.localeCompare(right.id))
   } catch (error) {
     modelsError.value = await resolve(error)
@@ -103,7 +121,8 @@ async function retry() {
   busy.value = true
   retryError.value = null
   try {
-    await retryDocument(props.document.id, model.value || null)
+    // No model for a retry that sends no page.
+    await retryDocument(props.document.id, missing.value.length ? model.value || null : null)
     emit('retried')
   } catch (error) {
     retryError.value = await resolve(error)
@@ -114,9 +133,9 @@ async function retry() {
 </script>
 
 <template>
-  <UiModal :title="t('files.retry.title')" size="md" :busy="busy" @close="emit('close')">
+  <UiModal :title="title" size="md" :busy="busy" @close="emit('close')">
     <template #title>
-      <h2 class="title">{{ t('files.retry.title') }}</h2>
+      <h2 class="title">{{ title }}</h2>
       <p class="subject">{{ document.name }}</p>
     </template>
 
@@ -145,16 +164,19 @@ async function retry() {
         {{ t('files.retry.more', { n: missing.length - tiles.length }, missing.length - tiles.length) }}
       </p>
 
-      <UiField v-slot="{ id }" :label="t('files.retry.model')">
-        <UiSelect :id="id" :model-value="model" :disabled="busy" @update:model-value="chosen = $event">
-          <option v-if="modelInjected" :value="modelInjected">{{ modelInjected }}</option>
-          <option v-for="entry in models ?? []" :key="entry.id" :value="entry.id">
-            {{ entry.name ? `${entry.name} · ${entry.id}` : entry.id }}
-          </option>
-        </UiSelect>
-      </UiField>
-      <p class="note">{{ t('files.retry.note') }}</p>
-      <UiBanner v-if="modelsError" tone="error">{{ modelsError }}</UiBanner>
+      <template v-if="missing.length">
+        <UiField v-slot="{ id }" :label="t('files.retry.model')">
+          <UiSelect :id="id" :model-value="model" :disabled="busy" @update:model-value="chosen = $event">
+            <option v-if="modelInjected" :value="modelInjected">{{ modelInjected }}</option>
+            <option v-for="entry in models ?? []" :key="entry.id" :value="entry.id">
+              {{ entry.name ? `${entry.name} · ${entry.id}` : entry.id }}
+            </option>
+          </UiSelect>
+        </UiField>
+        <p class="note">{{ t('files.retry.note') }}</p>
+        <UiBanner v-if="modelsError" tone="error">{{ modelsError }}</UiBanner>
+      </template>
+      <p v-else class="note">{{ t(checkOn ? 'files.retry.noteCheck' : 'files.retry.noteWhole') }}</p>
       <UiBanner v-if="retryError" tone="error">{{ retryError }}</UiBanner>
     </div>
 

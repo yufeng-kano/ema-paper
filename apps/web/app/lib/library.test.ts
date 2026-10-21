@@ -6,6 +6,7 @@ import {
   PAGE_FAILURE_REASONS,
   acceptsUpload,
   canMoveFolder,
+  checkFailureReason,
   childFolders,
   documentsIn,
   flattenTree,
@@ -259,5 +260,16 @@ describe('PAGE_FAILURE_REASONS', () => {
       expect(en.files.retry.reasons).toHaveProperty(key)
       expect(zhTW.files.retry.reasons).toHaveProperty(key)
     }
+  })
+})
+
+describe('checkFailureReason', () => {
+  it('reads the reason of a failed format check, and of nothing else', () => {
+    expect(checkFailureReason('the format check failed (blocked)')).toBe('blocked')
+    expect(checkFailureReason('the format check failed (Kano Proxy is not connected)')).toBe(
+      'Kano Proxy is not connected',
+    )
+    expect(checkFailureReason('1 of 3 pages failed (page 2: blocked)')).toBeNull()
+    expect(checkFailureReason(null)).toBeNull()
   })
 })

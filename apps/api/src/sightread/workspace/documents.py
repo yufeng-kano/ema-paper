@@ -335,7 +335,11 @@ def _materialize_files(
     written: list[Path] = []
     if safe_io.entry_kind(paths.root, paths.doc) == "none":
         if result is not None:
-            baseline = result.markdown
+            # The reading copy when the parse was checked, else the transcription
+            # (docs/workspace.md § Layout); `result.md` below is always the transcription.
+            baseline = (
+                result.reading_markdown if result.reading_markdown is not None else result.markdown
+            )
         else:
             baseline = markdown_baseline(paths.root, document_id, max_bytes)
         if _write_if_missing(paths.root, paths.doc, baseline):
@@ -507,10 +511,10 @@ async def make_folder_dir(settings: Settings, user_id: int, relative: Path) -> N
 
 async def current_revision(db: AsyncSession, settings: Settings, document: Document) -> str | None:
     """The revision the viewer would save against right now: the hash of `doc.md` as it
-    is on disk, or of its baseline — the parse result, a markdown document's original —
-    when the document is not materialized yet; None when neither can be read. The per-turn
-    context of a chat message (docs/chat.md § Prompt caching), read without the workspace
-    lock: a hint, not a write."""
+    is on disk, or of its baseline — the parse result (its reading copy when it was
+    checked), a markdown document's original — when the document is not materialized yet;
+    None when neither can be read. The per-turn context of a chat message (docs/chat.md
+    § Prompt caching), read without the workspace lock: a hint, not a write."""
     paths = await document_paths(db, settings, document)
     try:
         text = await asyncio.to_thread(
@@ -530,10 +534,14 @@ async def current_revision(db: AsyncSession, settings: Settings, document: Docum
         except (ApiError, OSError):
             return None
         return revision_of(baseline)
-    markdown = (
-        await db.execute(select(Result.markdown).where(Result.job_id == document.job_id))
-    ).scalar_one_or_none()
-    return None if markdown is None else revision_of(markdown)
+    row = (
+        await db.execute(
+            select(Result.reading_markdown, Result.markdown).where(Result.job_id == document.job_id)
+        )
+    ).one_or_none()
+    if row is None:
+        return None
+    return revision_of(row.reading_markdown if row.reading_markdown is not None else row.markdown)
 
 
 async def ensure_within_quota(settings: Settings, root: Path) -> None:

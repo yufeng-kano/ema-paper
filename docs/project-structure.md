@@ -20,9 +20,11 @@ agent-sightread/
                               # parse agent's definition: default prompt, pipeline version;
                               # chat.py the chat agent's system prompt and tool definitions;
                               # skills.py and subagents.py the built-in skills and subagents;
-                              # memory.py the memory block, its selection and text cleaning
+                              # memory.py the memory block, its selection and text cleaning;
+                              # check.py the check agent's prompt and tools
         parsing/              # poppler.py (subprocess wrappers),
                               # images.py (heic/exif/downscale), markdown.py, figures.py,
+                              # joins.py (the format check's program rules),
                               # attachments.py (the chat composer's files, prepared)
         workspace/            # the per-user file tree and its git revisions
                               # (docs/workspace.md): layout.py, git.py, documents.py,
@@ -37,6 +39,7 @@ agent-sightread/
         jobs/                 # queue.py (claim/enqueue), intake.py (store/dedup/enqueue),
                               # runner.py, sweeper.py, events.py (SSE + event pairs),
                               # chat_runner.py (the chat agent's tool loop),
+                              # check.py (the check agent's loop, inside a parse's run),
                               # chat_subagent.py (a subagent's nested loop),
                               # chat_tools.py, chat_events.py (the conversation stream),
                               # chat_memory.py (a turn's memory snapshot, the memory tool)

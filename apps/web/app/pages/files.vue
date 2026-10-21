@@ -676,7 +676,7 @@ async function showResult(document: LibraryDocument) {
   // A parse opens only once every page has succeeded: until then its row's status and
   // progress are what there is to see (docs/web.md § Files).
   if (isPending(document)) {
-    showNote(t('files.note.parsing'), false)
+    showNote(t(document.checking ? 'files.note.checking' : 'files.note.parsing'), false)
     return
   }
   // Reading something by hand settles what the screen is for; a queued auto-preview must
@@ -1579,8 +1579,15 @@ const menuItems = computed<MenuItem[]>(() => {
             // A parse opens only once every page has succeeded (docs/web.md § Files).
             disabled: !!parse && isPending(parse),
           },
+          // With no page missing (its format check failed), the retry is of the whole document.
           ...(parse?.status === 'failed'
-            ? [{ key: 'retry', label: t('files.retryFailed'), icon: 'rotate-ccw' as const }]
+            ? [
+                {
+                  key: 'retry',
+                  label: t(parse.failed_pages ? 'files.retryFailed' : 'files.retryWhole'),
+                  icon: 'rotate-ccw' as const,
+                },
+              ]
             : []),
           { key: 'rename', label: t('files.rename'), icon: 'edit' as const, shortcut: label(apple ? 'enter' : 'f2') },
         ]
@@ -2216,13 +2223,16 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
                 <!-- A markdown document has no parse: no status, pages or size to report. -->
                 <template #cell-status="{ row }">
                   <span v-if="row.kind === 'file' && row.document.status" class="state-cell">
-                    <!-- A failed parse says what a retry would send: its pages without a result. -->
+                    <!-- A failed parse says what a retry would send: its pages without a result;
+                         a running one past its last page, that it is being checked. -->
                     <UiStatusDot
                       :tone="STATUS_TONE[row.document.status]"
                       :label="
                         row.document.failed_pages
                           ? t('files.failedPages', { n: row.document.failed_pages }, row.document.failed_pages)
-                          : t(`status.${row.document.status}`)
+                          : row.document.checking
+                            ? t('files.checking')
+                            : t(`status.${row.document.status}`)
                       "
                     />
                     <UiUsageBar

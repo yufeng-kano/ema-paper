@@ -3,8 +3,9 @@
  * The selected agent's panel on `/agents` (docs/web.md § Pages, docs/agents.md): one row of
  * controls — which model of Kano Proxy's live catalog it runs, then for the chat agent its
  * effort, for the parse agent its prompt — then, for the parse agent, its fallback for failed
- * pages; for the chat agent, its instructions (with the whole prompt as their advanced
- * option), its memory, its tools, skills and subagents.
+ * pages and the format check (the `check` agent's settings, which have no tab of their own);
+ * for the chat agent, its instructions (with the whole prompt as their advanced option), its
+ * memory, its tools, skills and subagents.
  * Every save hands the server's answer back through `saved`, so the page's tab list reads
  * the same state these controls write.
  *
@@ -26,6 +27,9 @@ const DEFAULT_EFFORT: AgentEffort = 'medium'
 
 const props = defineProps<{
   agent: AgentEntry
+  /** The `check` agent, whose settings the parse panel shows; null while the registry has
+   *  none (an older API). */
+  check: AgentEntry | null
   /** `limits.prompt_max_chars` from `GET /api/me`; null until the session has loaded. */
   promptMaxChars: number | null
 }>()
@@ -191,7 +195,16 @@ function onSectionSaved(agent: string, saved: SavedAgentSettings) {
       <UiBanner v-if="effortError" class="row-banner" tone="error">{{ effortError }}</UiBanner>
     </div>
 
-    <AgentsFallbackSection v-if="!isChat" :agent="agent" :models="models" @saved="onSectionSaved" />
+    <template v-if="!isChat">
+      <AgentsFallbackSection :agent="agent" :models="models" @saved="onSectionSaved" />
+      <AgentsCheckSection
+        v-if="check"
+        :agent="check"
+        :models="models"
+        :prompt-max-chars="promptMaxChars"
+        @saved="onSectionSaved"
+      />
+    </template>
 
     <template v-if="isChat">
       <AgentsInstructionsSection

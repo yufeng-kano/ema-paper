@@ -54,6 +54,7 @@ from ..jobs.chat_tools import PageUnavailable, original_page_png
 from ..jobs.intake import (
     MULTIPART_ENVELOPE_BYTES,
     capped_stream,
+    resolve_check,
     store_upload,
     submit_parse,
     upload_chunks,
@@ -514,7 +515,8 @@ def document_payload(row: Document, job: Job | None, failed_pages: int | None = 
     Joined rather than fetched per row, so one `GET /api/library` renders every name,
     status and progress bar the page needs (docs/web.md § Files). A markdown document
     (`job` None) has no parse to report on: every parse field is null. `failed_pages` is
-    what a retry of a failed parse would send, null for any other.
+    what a retry of a failed parse would send, null for any other; `checking` says a
+    running parse is past its last page and being checked (docs/api.md).
     """
     if job is None:
         return {
@@ -532,6 +534,7 @@ def document_payload(row: Document, job: Job | None, failed_pages: int | None = 
             "created_at": row.created_at,
             "finished_at": None,
             "failed_pages": None,
+            "checking": False,
         }
     return {
         "id": row.id,
@@ -548,6 +551,11 @@ def document_payload(row: Document, job: Job | None, failed_pages: int | None = 
         "created_at": row.created_at,
         "finished_at": job.finished_at,
         "failed_pages": failed_pages,
+        "checking": (
+            job.status == "running"
+            and job.check_model is not None
+            and job.pages_done >= len(parse_pages_spec(job.pages_spec, job.page_count or 1))
+        ),
     }
 
 
@@ -1306,6 +1314,8 @@ async def upload_document(
         # A library upload keeps its original even if the worker finishes before the
         # document row below exists (docs/jobs.md § Retention).
         retain_source=True,
+        # Checked before it opens (docs/parsing.md § Format check).
+        check=True,
     )
     # A dedup hit is a finished parse rather than a new one, so the file points at the job
     # that already produced it (docs/jobs.md § Dedup).
@@ -1876,7 +1886,10 @@ async def retry_document(
         copy = upload_dir / f"{job.id}.retry-{uuid.uuid4().hex[:12]}{original.suffix}"
         await asyncio.to_thread(shutil.copyfile, original, copy)
         try:
-            await retry_job(db, job.id, source_path=str(copy), model=model)
+            # The check as the settings say now: a check that failed may have failed on
+            # its model (docs/jobs.md § Retrying failed pages).
+            check = await resolve_check(db, settings, user.id, job.model)
+            await retry_job(db, job.id, source_path=str(copy), model=model, check=check)
             await events.notify(db, job.id)
         except BaseException:
             copy.unlink(missing_ok=True)

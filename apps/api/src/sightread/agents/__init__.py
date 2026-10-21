@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from . import chat, parse
+from . import chat, check, parse
 
 
 @dataclass(frozen=True)
@@ -52,7 +52,18 @@ CHAT = AgentDefinition(
     bbox_format=chat.BBOX_FORMAT,
 )
 
-AGENTS: dict[str, AgentDefinition] = {agent.name: agent for agent in (PARSE, CHAT)}
+CHECK = AgentDefinition(
+    name="check",
+    capabilities=("tools", "anthropic"),
+    input="markdown",
+    output="edits",
+    default_prompt_template=check.DEFAULT_PROMPT,
+    prompt_tokens=(),
+    pipeline_version=check.PIPELINE_VERSION,
+    bbox_format=check.BBOX_FORMAT,
+)
+
+AGENTS: dict[str, AgentDefinition] = {agent.name: agent for agent in (PARSE, CHAT, CHECK)}
 
 
 def get_agent(name: str) -> AgentDefinition | None:
