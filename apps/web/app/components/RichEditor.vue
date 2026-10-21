@@ -25,7 +25,10 @@
 import { Editor } from '@tiptap/core'
 import { Slice, type Node as ProseNode } from '@tiptap/pm/model'
 import { NodeSelection, Selection, TextSelection, type Transaction } from '@tiptap/pm/state'
+import type { EditorView } from '@tiptap/pm/view'
 import { matchCommands } from '~/lib/composer'
+import { BLOCK_DRAG_TYPE, setDropEffect } from '~/lib/dnd'
+import { droppedBlocksMarkdown } from '~/lib/excerpts'
 import type { IconName } from '~/lib/icons'
 import {
   richExtensions,
@@ -712,7 +715,101 @@ function onCompositionEnd() {
   }, 30)
 }
 
+/** Pasted text as the editor takes it: markdown through the viewer's parser, block references
+ *  to this document rewritten as section links first (`links.rewrite`); one line of plain
+ *  text, or a paste asked plain, lands inline. */
+function pastedSlice(view: EditorView, text: string, plain: boolean): Slice {
+  const markdown = props.links?.rewrite?.(text) ?? text
+  const doc = view.state.schema.nodeFromJSON(markdownToDoc(markdown, inlineOptions))
+  return plain || !markdown.includes('\n') && doc.childCount === 1 && doc.firstChild?.type.name === 'paragraph'
+    ? new Slice(doc.content, 1, 1)
+    : Slice.maxOpen(doc.content)
+}
+
+// --- blocks dropped from the document -----------------------------------------------------------
+
+/**
+ * Where a drag of the viewer's blocks would land (docs/web.md § Notes, *A block dragged into
+ * the notes lands as blocks*): the line drawn on the edge of the top-level block the drop goes
+ * before or after, in the root's coordinates.
+ */
+const dropLine = ref<{ top: number; left: number; width: number } | null>(null)
+
+function carriesBlocks(event: DragEvent): boolean {
+  return props.variant === 'notes' && [...(event.dataTransfer?.types ?? [])].includes(BLOCK_DRAG_TYPE)
+}
+
+/** The top-level position the drop lands at — before or after the block under the pointer by
+ *  its vertical middle, after the last block below them all, the whole of empty notes — and
+ *  the edge the line sits on. */
+function blockDropAt(y: number): { pos: number; replace: boolean; edge: number } | null {
+  if (!editor) {
+    return null
+  }
+  const { view } = editor
+  const { doc } = view.state
+  const paper = view.dom.getBoundingClientRect()
+  if (doc.childCount === 1 && doc.firstChild?.type.name === 'paragraph' && doc.firstChild.content.size === 0) {
+    return { pos: 0, replace: true, edge: paper.top }
+  }
+  let found: { pos: number; replace: boolean; edge: number } | null = null
+  doc.forEach((node, offset) => {
+    const dom = found ? null : view.nodeDOM(offset)
+    if (dom instanceof HTMLElement) {
+      const rect = dom.getBoundingClientRect()
+      if (y <= rect.bottom) {
+        const after = y > (rect.top + rect.bottom) / 2
+        found = after ? { pos: offset + node.nodeSize, replace: false, edge: rect.bottom } : { pos: offset, replace: false, edge: rect.top }
+      }
+    }
+  })
+  return found ?? { pos: doc.content.size, replace: false, edge: paper.bottom }
+}
+
+function onBlockDragOver(event: DragEvent) {
+  if (!carriesBlocks(event) || !editor) {
+    return
+  }
+  event.preventDefault()
+  setDropEffect(event, 'copy')
+  const at = blockDropAt(event.clientY)
+  const frame = root.value?.getBoundingClientRect()
+  const paper = editor.view.dom.getBoundingClientRect()
+  dropLine.value = at && frame ? { top: at.edge - frame.top, left: paper.left - frame.left, width: paper.width } : null
+}
+
+function onBlockDragLeave(event: DragEvent) {
+  if (!root.value?.contains(event.relatedTarget as Node | null)) {
+    dropLine.value = null
+  }
+}
+
+function clearDropLine() {
+  dropLine.value = null
+}
+
+/** The blocks land as blocks: the drag's markdown, a figure as its caption and a page marker
+ *  left out, read through the viewer's parser and inserted whole. A copy — the document keeps
+ *  its block — saved like any notes edit. */
+function onBlockDrop(event: DragEvent) {
+  if (!carriesBlocks(event) || !editor) {
+    return
+  }
+  event.preventDefault()
+  dropLine.value = null
+  const at = blockDropAt(event.clientY)
+  const markdown = droppedBlocksMarkdown(event.dataTransfer?.getData('text/plain') ?? '')
+  if (!at || markdown === null) {
+    return
+  }
+  const { view } = editor
+  const doc = view.state.schema.nodeFromJSON(markdownToDoc(markdown, inlineOptions))
+  const tr = at.replace ? view.state.tr.replaceWith(0, view.state.doc.content.size, doc.content) : view.state.tr.insert(at.pos, doc.content)
+  view.dispatch(tr.scrollIntoView())
+}
+
 onMounted(() => {
+  window.addEventListener('dragend', clearDropLine)
   const element = mount.value
   if (!element) {
     return
@@ -739,13 +836,24 @@ onMounted(() => {
       handleKeyDown: (_view, event) => onKey(event),
       // Copy is markdown whether the block is open or rendered (docs/web.md § Editing).
       clipboardTextSerializer: (slice) => sliceToMarkdown(slice.content.toJSON() ?? []),
-      // Pasted markdown reads as markdown, through the viewer's parser.
-      clipboardTextParser: (text, _context, plain, view) => {
-        const doc = view.state.schema.nodeFromJSON(markdownToDoc(text, inlineOptions))
-        return plain || !text.includes('\n') && doc.childCount === 1 && doc.firstChild?.type.name === 'paragraph'
-          ? new Slice(doc.content, 1, 1)
-          : Slice.maxOpen(doc.content)
+      // Pasted markdown reads as markdown, through the viewer's parser — block references to
+      // this document rewritten as section links first, where links are read.
+      clipboardTextParser: (text, _context, plain, view) => pastedSlice(view, text, plain),
+      // A block reference copied by *Copy link to block* carries an HTML form too, which the
+      // editor would otherwise read in place of the text and reduce to the label (its schema
+      // has no link mark): where the text holds a reference the rewrite knows, the text is
+      // what is pasted.
+      handlePaste: (view, event) => {
+        const text = event.clipboardData?.getData('text/plain') ?? ''
+        if (!event.clipboardData?.getData('text/html') || !props.links?.rewrite || props.links.rewrite(text) === text) {
+          return false
+        }
+        view.dispatch(view.state.tr.replaceSelection(pastedSlice(view, text, false)).scrollIntoView())
+        return true
       },
+      // A drag of the viewer's blocks is the root's to land (`onBlockDrop`), never text dropped
+      // into the line under the pointer.
+      handleDrop: (_view, event) => carriesBlocks(event),
     },
     onTransaction: ({ transaction }) => syncSlash(transaction),
     onUpdate: ({ editor: current, transaction }) => {
@@ -850,6 +958,7 @@ function wash(first: number, count: number) {
 onBeforeUnmount(() => {
   closing = true
   clearTimeout(washTimer)
+  window.removeEventListener('dragend', clearDropLine)
   editor?.view.dom.removeEventListener('compositionend', onCompositionEnd)
   editor?.destroy()
   editor = null
@@ -894,8 +1003,22 @@ defineExpose({
 </script>
 
 <template>
-  <div ref="root" class="rich" :class="`rich-${variant}`">
+  <div
+    ref="root"
+    class="rich"
+    :class="`rich-${variant}`"
+    @dragover="onBlockDragOver"
+    @dragleave="onBlockDragLeave"
+    @drop="onBlockDrop"
+  >
     <div ref="mount" />
+    <!-- Where blocks dragged from the document would land: on a block's edge. -->
+    <div
+      v-if="dropLine"
+      class="drop-line"
+      aria-hidden="true"
+      :style="{ top: `${dropLine.top}px`, left: `${dropLine.left}px`, width: `${dropLine.width}px` }"
+    />
     <!-- The TeX field: the context menu's floating surface, under the formula it edits. -->
     <div
       v-if="math"
@@ -993,13 +1116,6 @@ defineExpose({
           </template>
         </div>
       </div>
-      <p class="slash-keys">
-        <span class="slash-hint"><UiKbd keys="updown" />{{ t('viewer.slash.select') }}</span>
-        <span aria-hidden="true">·</span>
-        <span class="slash-hint"><UiKbd keys="enter" />{{ t('viewer.slash.apply') }}</span>
-        <span aria-hidden="true">·</span>
-        <span class="slash-hint"><UiKbd keys="esc" />{{ t('viewer.slash.close') }}</span>
-      </p>
     </div>
   </div>
 </template>
@@ -1008,6 +1124,34 @@ defineExpose({
 .rich {
   position: relative;
   min-width: 0;
+}
+
+/* The notes fill their column, so a drop anywhere in it lands. */
+.rich-notes {
+  min-height: 100%;
+}
+
+/* The document pane's drop line, on the notes (docs/web.md § Editing, *Moving blocks*). */
+.drop-line {
+  position: absolute;
+  z-index: 4;
+  height: 2px;
+  margin-top: -1px;
+  background: var(--accent);
+  pointer-events: none;
+}
+
+.drop-line::before {
+  content: '';
+  position: absolute;
+  top: -3px;
+  left: -8px;
+  box-sizing: border-box;
+  width: 8px;
+  height: 8px;
+  border: 2px solid var(--accent);
+  border-radius: 50%;
+  background: var(--paper);
 }
 
 /* The editable surface draws nothing of its own: no border, no ring, no fill — the block is
@@ -1348,26 +1492,5 @@ defineExpose({
   padding: var(--space-1) var(--space-3) var(--space-2);
   color: var(--faint);
   font-size: var(--text-xs);
-}
-
-.slash-keys {
-  display: flex;
-  flex: none;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-1) var(--space-2);
-  margin: var(--space-1) calc(-1 * var(--space-1)) 0;
-  padding: 6px var(--space-4) 2px;
-  border-top: 1px solid var(--menu-edge);
-  color: var(--faint);
-  font-size: var(--text-xs);
-  line-height: 18px;
-}
-
-.slash-hint {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-1);
-  white-space: nowrap;
 }
 </style>

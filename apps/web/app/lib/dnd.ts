@@ -22,6 +22,10 @@
  * nothing here should keep one alive.
  */
 
+/** The type a drag of the result viewer's blocks carries, and that the notes read on drop
+ *  (docs/web.md § Notes, *A block dragged into the notes lands as blocks*). */
+export const BLOCK_DRAG_TYPE = 'application/x-sightread-blocks'
+
 /** What a handler claimed a drag event for. */
 export type DragClaim =
   /** A folder is the destination under the pointer, and it is drawn as the target. */

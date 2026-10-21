@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
+  appendBlockSource,
   blockAnchor,
   blockPlain,
+  decodeBlockAnchor,
   documentOutline,
   findHeading,
   firstWords,
@@ -10,7 +12,6 @@ import {
   moveBlocks,
   parseInline,
   parseResultMarkdown,
-  appendBlockSource,
   replaceBlockSource,
   resolveAnchor,
   sectionSource,
@@ -1147,6 +1148,13 @@ describe('block anchors', () => {
     expect(resolveAnchor(pages, '~Before any')).toEqual({ page: 0, index: 0 })
     expect(resolveAnchor(pages, 'gone~Nothing')).toBeNull()
     expect(resolveAnchor(pages, '')).toBeNull()
+  })
+
+  it('reads an anchor back from the escapes an address gave it', () => {
+    expect(decodeBlockAnchor('32-attention~An+attention+function')).toBe('32-attention~An attention function')
+    expect(decodeBlockAnchor('a~Let%20%28x%29%20be')).toBe('a~Let (x) be')
+    expect(decodeBlockAnchor('a~100%')).toBe('a~100%')
+    expect(resolveAnchor(pages, decodeBlockAnchor('32-attention~An+attention+function'))).toEqual({ page: 0, index: 2 })
   })
 
   it('survives the block moving to another section', () => {

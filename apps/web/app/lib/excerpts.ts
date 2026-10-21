@@ -11,6 +11,7 @@
  */
 import {
   blockPlain,
+  decodeBlockAnchor,
   findHeading,
   headingKey,
   inlinePlain,
@@ -19,6 +20,7 @@ import {
   parseResultMarkdown,
   passageKey,
   placedBlocks,
+  resolveAnchor,
   sectionExtent,
   type BlockAt,
   type OutlineEntry,
@@ -67,6 +69,62 @@ export function excerptPassage(markdown: string): string | null {
   blocksOf(markdown).forEach(take)
   const passage = parts.join('\n\n').trim()
   return passage ? passage : null
+}
+
+/**
+ * Blocks dragged from the document, as the notes take them (docs/web.md § Notes, *A block
+ * dragged into the notes lands as blocks*): a figure as its caption, a page marker not at
+ * all, every other block — a quote included — as it was. Null when nothing is left.
+ */
+export function droppedBlocksMarkdown(markdown: string): string | null {
+  const parts: string[] = []
+  for (const block of blocksOf(markdown)) {
+    if (block.kind === 'fig') {
+      if (block.caption) {
+        parts.push(block.caption)
+      }
+    } else if (block.kind !== 'comment') {
+      parts.push(block.src)
+    }
+  }
+  const dropped = parts.join('\n\n').trim()
+  return dropped ? dropped : null
+}
+
+/** A markdown link to an address, `[label](https://…)`: the label free of bare brackets as
+ *  `CITE_AT` reads a section link's, the address free of spaces, its parentheses balanced one
+ *  level deep (`…block=a~Let+(x)+be`), as a markdown link's destination may hold them. */
+const ADDRESS_LINK = /\[((?:\\[\s\S]|[^[\]\\\n])+)\]\((https?:\/\/(?:[^\s()]|\([^\s()]*\))+)\)/g
+
+/** Code in markdown, where nothing is a link: a fenced block — backticks or tildes, as
+ *  `CODE_FENCE` opens one — then a span on one line. */
+const CODE_REGIONS = /(```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`[^`\n]+`)/
+
+/**
+ * Block references pasted into the notes (docs/web.md § Notes, *Quotes and section links*):
+ * each markdown link whose address `anchorOf` knows as this document's — it answers the
+ * block anchor the address carries, or null — becomes the section link `[label](#anchor)`,
+ * the anchor escaped so it reads as one (`CITE_AT` allows no spaces or parentheses in it).
+ * Any other link stays as written, and so does code — a fenced block, a span — and a link
+ * whose bracket is escaped: those are the text they show.
+ */
+export function rewriteBlockLinks(markdown: string, anchorOf: (address: string) => string | null): string {
+  return markdown
+    .split(CODE_REGIONS)
+    .map((part, index) =>
+      index % 2
+        ? part
+        : part.replace(ADDRESS_LINK, (whole, label: string, address: string, offset: number) => {
+            const slashes = /\\*$/.exec(part.slice(0, offset))?.[0].length ?? 0
+            const anchor = slashes % 2 ? null : anchorOf(address)
+            if (anchor === null) {
+              return whole
+            }
+            const escaped = encodeURIComponent(decodeBlockAnchor(anchor)).replace(/\(/g, '%28').replace(/\)/g, '%29')
+            return `[${label}](#${escaped})`
+          }),
+    )
+    .join('')
 }
 
 /** The section a passage is in, as its excerpt's link names it; null before the first heading. */
@@ -327,7 +385,8 @@ export function excerptMarkers(matches: readonly ExcerptMatch[]): Map<string, Ex
 }
 
 /** Whether a section link in the notes leads anywhere: an excerpt's while its passage or its
- *  heading is found, any other while its heading is, and `#` — the whole document — always. */
+ *  heading is found, a block reference's while its anchor resolves, any other while its
+ *  heading is found, and `#` — the whole document — always. */
 export function linkResolves(
   pages: readonly ResultPageBlocks[],
   outline: readonly OutlineEntry[],
@@ -335,6 +394,10 @@ export function linkResolves(
 ): boolean {
   if (link.anchor === '') {
     return true
+  }
+  if (link.anchor.includes('~')) {
+    // A block reference: it leads wherever its anchor resolves to.
+    return resolveAnchor(pages, decodeBlockAnchor(link.anchor), outline) !== null
   }
   const heading = findHeading(outline, link.label, link.anchor)
   return heading !== null || (link.passage !== null && locatePassage(pages, link.passage, null) !== null)

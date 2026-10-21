@@ -526,19 +526,15 @@ export default {
     toolbar: {
       label: 'Selection actions',
       ask: 'Ask the agent',
-      translate: 'Translate',
       quote: 'Quote in notes',
       copy: 'Copy',
-      more: 'More',
       skills: 'Run a skill on the selection',
+      skillsLabel: 'Skills',
     },
     slash: {
       label: 'Slash commands',
       convert: 'Turn this block into',
       skills: 'Skills · Run on this block',
-      select: 'Select',
-      apply: 'Apply',
-      close: 'Close',
     },
     excerpt: {
       heading: 'Excerpts',

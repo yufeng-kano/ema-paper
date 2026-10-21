@@ -513,19 +513,15 @@ export default {
     toolbar: {
       label: '選取動作',
       ask: '問 Agent',
-      translate: '翻譯',
       quote: '引用到筆記',
       copy: '複製',
-      more: '更多',
       skills: '對選取執行 Skill',
+      skillsLabel: 'Skills',
     },
     slash: {
       label: '斜線指令',
       convert: '轉換這一塊',
       skills: 'Skills · 對這一塊執行',
-      select: '選擇',
-      apply: '套用',
-      close: '關閉',
     },
     excerpt: {
       heading: '摘錄',
