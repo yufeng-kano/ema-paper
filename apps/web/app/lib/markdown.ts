@@ -430,6 +430,11 @@ function parsePages(markdown: string, quoted: boolean): ResultPageBlocks[] {
         const raw = lines[cursor] ?? ''
         const trimmed = raw.trim()
 
+        // A rule ends the list: `- - -` under an item is a rule, not an item reading `- -`.
+        if (THEMATIC_BREAK.test(trimmed)) {
+          break
+        }
+
         // One block per marker kind: a bulleted list directly under a numbered one is two
         // lists, not one with a confused type.
         const match = LIST_ITEM.exec(trimmed)

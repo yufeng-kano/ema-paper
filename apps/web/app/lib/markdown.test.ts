@@ -719,6 +719,17 @@ describe('parseResultMarkdown rules and LaTeX display math', () => {
     ])
   })
 
+  it('ends a list at a rule right under it, spaced or not', () => {
+    for (const rule of ['- - -', '* * *', '---']) {
+      const [page] = parseResultMarkdown(['- Item', rule, 'Footnote.'].join('\n'))
+      expect(bare(page!.blocks)).toEqual([
+        { kind: 'list', ordered: false, items: ['Item'] },
+        { kind: 'hr' },
+        { kind: 'p', text: 'Footnote.' },
+      ])
+    }
+  })
+
   it('reads \\[ alone on its line as display math, to its closing line', () => {
     const [page] = parseResultMarkdown(['\\[', 'P_s(x) = \\frac{a}{b}, \\tag{1}', '\\]', 'After.'].join('\n'))
     expect(bare(page!.blocks)).toEqual([
