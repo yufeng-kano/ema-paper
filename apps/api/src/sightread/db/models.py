@@ -352,13 +352,23 @@ class Folder(Base):
 
     `parent_id` NULL is the root. The self-reference cascades, so deleting a folder takes
     its subtree — and, through `documents.folder_id`, the files in it — exactly the way
-    removing a directory does.
+    removing a directory does. `trashed_at` is set on a folder put in the Trash, and its
+    subtree is in the Trash with it; names are unique among the rows not in the Trash
+    (docs/database.md § Rules).
     """
 
     __tablename__ = "folders"
     __table_args__ = (
-        UniqueConstraint("user_id", "parent_id", "name", name="uq_folders_parent_name"),
-        # The root level needs its own index: NULLs are distinct to a unique constraint, so
+        Index(
+            "uq_folders_parent_name",
+            "user_id",
+            "parent_id",
+            "name",
+            unique=True,
+            postgresql_where=text("trashed_at IS NULL"),
+            sqlite_where=text("trashed_at IS NULL"),
+        ),
+        # The root level needs its own index: NULLs are distinct to a unique index, so
         # the one above would happily allow two root folders called "Invoices"
         # (docs/database.md § Rules).
         Index(
@@ -366,8 +376,8 @@ class Folder(Base):
             "user_id",
             "name",
             unique=True,
-            postgresql_where=text("parent_id IS NULL"),
-            sqlite_where=text("parent_id IS NULL"),
+            postgresql_where=text("parent_id IS NULL AND trashed_at IS NULL"),
+            sqlite_where=text("parent_id IS NULL AND trashed_at IS NULL"),
         ),
     )
 
@@ -377,6 +387,7 @@ class Folder(Base):
         ForeignKey("folders.id", ondelete="CASCADE"), nullable=True
     )
     name: Mapped[str] = mapped_column(String(255))
+    trashed_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
 
@@ -388,19 +399,27 @@ class Document(Base):
     `results`, keyed by `job_id`. Deleting one deletes the entry only; the job stays in the
     parse history and its usage rows stay with it (docs/database.md § Rules). `job_id` NULL
     is a markdown document: no parse, its baseline its original (docs/workspace.md
-    § Markdown documents).
+    § Markdown documents). `trashed_at` as for a folder.
     """
 
     __tablename__ = "documents"
     __table_args__ = (
-        UniqueConstraint("user_id", "folder_id", "name", name="uq_documents_folder_name"),
+        Index(
+            "uq_documents_folder_name",
+            "user_id",
+            "folder_id",
+            "name",
+            unique=True,
+            postgresql_where=text("trashed_at IS NULL"),
+            sqlite_where=text("trashed_at IS NULL"),
+        ),
         Index(
             "uq_documents_root_name",
             "user_id",
             "name",
             unique=True,
-            postgresql_where=text("folder_id IS NULL"),
-            sqlite_where=text("folder_id IS NULL"),
+            postgresql_where=text("folder_id IS NULL AND trashed_at IS NULL"),
+            sqlite_where=text("folder_id IS NULL AND trashed_at IS NULL"),
         ),
         Index("ix_documents_user_created", "user_id", "created_at"),
     )
@@ -414,6 +433,7 @@ class Document(Base):
         ForeignKey("jobs.id", ondelete="CASCADE"), nullable=True
     )
     name: Mapped[str] = mapped_column(String(512))
+    trashed_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
 

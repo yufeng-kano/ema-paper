@@ -517,7 +517,11 @@ async def test_another_accounts_library_is_invisible(
     # domain-scoped cookie then never matches the request it was set for.
     stranger.cookies.set(SESSION_COOKIE, token)
 
-    assert (await stranger.get("/api/library")).json() == {"folders": [], "documents": []}
+    assert (await stranger.get("/api/library")).json() == {
+        "folders": [],
+        "documents": [],
+        "trash": {"folders": [], "documents": []},
+    }
     assert (
         await stranger.put(
             f"/api/library/folders/{folder['id']}", json={"name": "Mine"}, headers=CSRF_HEADERS

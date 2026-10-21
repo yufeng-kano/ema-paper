@@ -18,7 +18,7 @@ import os
 import re
 import shutil
 import uuid
-from collections.abc import Collection
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -36,13 +36,18 @@ from .layout import (
     FILES_DIR,
     META_FILE,
     NOTES_FILE,
+    SIGHTREAD_DIR,
     SOURCE_STEM,
+    TRASH_DIR,
     document_relative_dir,
     files_root,
     git_dir,
     images_dir,
+    path_segment,
     results_root,
     sources_dir,
+    trash_entry,
+    trash_root,
     user_root,
 )
 from .locks import workspace_lock
@@ -177,21 +182,63 @@ def _write_text(root: Path, path: Path, text: str) -> None:
 # --- where a document lives ---------------------------------------------------------------
 
 
+async def user_folders(db: AsyncSession, user_id: int) -> dict[int, Folder]:
+    """Every folder of the user, by id: a library is a handful of rows."""
+    rows = (await db.execute(select(Folder).where(Folder.user_id == user_id))).scalars().all()
+    return {row.id: row for row in rows}
+
+
+def folder_chain(by_id: dict[int, Folder], folder_id: int | None) -> list[Folder]:
+    """The folders from the root down to `folder_id`."""
+    chain: list[Folder] = []
+    cursor = by_id.get(folder_id) if folder_id is not None else None
+    seen: set[int] = set()
+    while cursor is not None and cursor.id not in seen:
+        seen.add(cursor.id)
+        chain.append(cursor)
+        cursor = by_id.get(cursor.parent_id) if cursor.parent_id is not None else None
+    chain.reverse()
+    return chain
+
+
 async def folder_names(db: AsyncSession, user_id: int, folder_id: int | None) -> list[str]:
     """The folder chain from the root down to `folder_id`, as names."""
     if folder_id is None:
         return []
-    rows = (await db.execute(select(Folder).where(Folder.user_id == user_id))).scalars().all()
-    by_id = {row.id: row for row in rows}
-    chain: list[str] = []
-    cursor = by_id.get(folder_id)
-    seen: set[int] = set()
-    while cursor is not None and cursor.id not in seen:
-        seen.add(cursor.id)
-        chain.append(cursor.name)
-        cursor = by_id.get(cursor.parent_id) if cursor.parent_id is not None else None
-    chain.reverse()
-    return chain
+    return [row.name for row in folder_chain(await user_folders(db, user_id), folder_id)]
+
+
+def trashed_folder_ids(folders: Iterable[Folder]) -> set[int]:
+    """Every folder in the Trash: put there itself, or inside one that was. Nothing marks
+    the second kind, so it is computed (docs/database.md § Rules)."""
+    by_id = {row.id: row for row in folders}
+    trashed: dict[int, bool] = {}
+    for start in by_id:
+        trail: list[int] = []
+        cursor: int | None = start
+        verdict = False
+        while cursor is not None:
+            if cursor in trashed:
+                verdict = trashed[cursor]
+                break
+            row = by_id.get(cursor)
+            if row is None or cursor in trail:
+                break
+            trail.append(cursor)
+            if row.trashed_at is not None:
+                verdict = True
+                break
+            cursor = row.parent_id
+        for folder_id in trail:
+            trashed[folder_id] = verdict
+    return {folder_id for folder_id, verdict in trashed.items() if verdict}
+
+
+def is_live(document: Document, by_id: dict[int, Folder]) -> bool:
+    """Neither the document nor any folder above it is in the Trash."""
+    return document.trashed_at is None and all(
+        row.trashed_at is None for row in folder_chain(by_id, document.folder_id)
+    )
 
 
 async def document_paths(db: AsyncSession, settings: Settings, document: Document) -> DocumentPaths:
@@ -242,6 +289,31 @@ def is_utf8_file(path: Path) -> bool:
     return True
 
 
+def meta_text(document_id: int, job: Job | None) -> str:
+    """A document directory's `.meta.json`. `document_id` first, whatever follows: the
+    lookup for a directory the tree moved matches `"document_id": N,`
+    (`materialize_document`)."""
+    if job is None:
+        meta = {
+            "document_id": document_id,
+            "job_id": None,
+            "model": None,
+            "bbox_format": None,
+            "page_count": None,
+            "kind": MARKDOWN_KIND,
+        }
+    else:
+        meta = {
+            "document_id": document_id,
+            "job_id": str(job.id),
+            "model": job.model,
+            "bbox_format": job.bbox_format,
+            "page_count": job.page_count,
+            "kind": job.kind,
+        }
+    return json.dumps(meta, indent=2) + "\n"
+
+
 def _materialize_files(
     paths: DocumentPaths,
     *,
@@ -270,27 +342,7 @@ def _materialize_files(
             written.append(paths.doc)
     if _write_if_missing(paths.root, paths.notes, ""):
         written.append(paths.notes)
-    # `document_id` first, whatever follows: the lookup for a directory the tree moved
-    # matches `"document_id": N,` (`materialize_document`).
-    if job is None:
-        meta = {
-            "document_id": document_id,
-            "job_id": None,
-            "model": None,
-            "bbox_format": None,
-            "page_count": None,
-            "kind": MARKDOWN_KIND,
-        }
-    else:
-        meta = {
-            "document_id": document_id,
-            "job_id": str(job.id),
-            "model": job.model,
-            "bbox_format": job.bbox_format,
-            "page_count": job.page_count,
-            "kind": job.kind,
-        }
-    if _write_if_missing(paths.root, paths.meta, json.dumps(meta, indent=2) + "\n"):
+    if _write_if_missing(paths.root, paths.meta, meta_text(document_id, job)):
         written.append(paths.meta)
     _copy_images(paths, document_id)  # excluded from history
     if job is None or result is None:
@@ -358,7 +410,27 @@ async def materialize_document(
             await db.refresh(document)
         except InvalidRequestError as exc:
             raise ApiError(404, "invalid_request", "No such document") from exc
+        # Decided under the lock a move to the Trash holds: a copy written now for a
+        # document in the Trash would stand under `files/` for a file that is not there
+        # (docs/workspace.md § The Trash).
+        folders = await user_folders(db, document.user_id)
+        if not is_live(document, folders):
+            raise ApiError(404, "invalid_request", "No such document")
         paths = await document_paths(db, settings, document)
+        if safe_io.entry_kind(root, paths.directory) == "none":
+            # An interrupted move to or from the Trash may have left the directory there:
+            # it goes back where the row says before anything fresh is written, and a
+            # directory the Trash could not return is not replaced by a fresh copy
+            # (docs/workspace.md § The Trash).
+            await recover_trash(db, settings, document.user_id)
+            if safe_io.entry_kind(root, paths.directory) == "none" and await asyncio.to_thread(
+                _trash_holds, root, document, folders
+            ):
+                raise ApiError(
+                    409,
+                    "invalid_request",
+                    "The document's files could not be brought back from the Trash",
+                )
         if safe_io.entry_kind(root, paths.directory) == "none":
             # Missing where the row points while HEAD holds this document's metadata
             # elsewhere: the tree moved it (a reverted rename whose reconciliation
@@ -513,7 +585,7 @@ def _copy_source(root: Path, directory: Path, original: Path) -> Path:
 
 def keep_source(
     root: Path,
-    relative: Path,
+    relative: Path | None,
     source: Path,
     *,
     document_id: int,
@@ -525,7 +597,9 @@ def keep_source(
     the git directory, outside the mount — then make the shell's copy of it in the
     document directory, and unless `copy`, remove the upload (docs/jobs.md § Retention).
     The original lands first and whole: a copy the tree refuses is made again on the
-    next materialization. Returns the original's path."""
+    next materialization. `relative` None makes no shell copy: the document is in the
+    Trash, and its directory is not under `files/` (docs/workspace.md § The Trash).
+    Returns the original's path."""
     git.ensure_repo(root)
     canonical = sources_dir(root) / f"{document_id}{_source_suffix(source, kind)}"
     canonical.parent.mkdir(parents=True, exist_ok=True)
@@ -533,7 +607,8 @@ def keep_source(
     staging = canonical.with_name(f".tmp-{canonical.name}")
     shutil.copyfile(source, staging)
     os.replace(staging, canonical)
-    _copy_source(root, root / relative, canonical)
+    if relative is not None:
+        _copy_source(root, root / relative, canonical)
     if not copy:
         source.unlink(missing_ok=True)
     return canonical
@@ -1486,6 +1561,351 @@ def sweep_aside(root: Path, keep: Collection[str] = ()) -> int:
                 with contextlib.suppress(OSError, safe_io.UnsafeEntry):
                     safe_io.remove_file(root, root / name)
     return swept
+
+
+# --- the Trash ----------------------------------------------------------------------------
+
+# What the Trash names its entries: `trash_entry` (layout.py) in reverse.
+TRASH_ENTRY = re.compile(r"(document|folder)-([0-9]+)")
+
+
+def _stash_tree(root: Path, relative: Path, entry: str) -> bool:
+    git.ensure_repo(root)
+    if safe_io.entry_kind(root, root / relative) == "none":
+        return False  # never materialized (a parse still running): nothing to move
+    target = trash_root(root) / entry
+    if safe_io.entry_kind(root, target) != "none":
+        # An entry the repair rule could not return, its place taken: kept, never
+        # overwritten (docs/workspace.md § The Trash).
+        raise ApiError(409, "invalid_request", "The Trash still holds an earlier copy of this item")
+    try:
+        # Through descriptors that follow nothing, into `.sightread/trash` (made on the
+        # way when missing): an ancestor the shell swapped for a link is a refusal.
+        safe_io.rename(root, root / relative, target)
+    except safe_io.UnsafeEntry as exc:
+        raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
+    except OSError as exc:
+        raise ApiError(
+            409, "invalid_request", "The move to the Trash failed; nothing was changed"
+        ) from exc
+    try:
+        git.commit_paths(root, git.USER_AUTHOR, f"trash {relative}", [relative])
+    except git.GitError as exc:
+        # Back where it was before the refusal: nothing waits in the Trash for a row
+        # that will not say so.
+        safe_io.rename(root, target, root / relative)
+        raise ApiError(
+            409,
+            "invalid_request",
+            "The move to the Trash could not be recorded; nothing was changed",
+        ) from exc
+    return True
+
+
+async def stash_path(settings: Settings, user_id: int, relative: Path, entry: str) -> bool:
+    """Move a folder's or a document's directory into the Trash after the database
+    marked it, as the revision `trash <path>`; False when there was no directory. The
+    caller holds the workspace lock (docs/workspace.md § The Trash)."""
+    root = user_root(settings.workspaces_dir, user_id)
+    return await asyncio.to_thread(_stash_tree, root, relative, entry)
+
+
+def _unstash_tree(root: Path, entry: str, relative: Path, message: str) -> bool:
+    git.ensure_repo(root)
+    source = trash_root(root) / entry
+    if safe_io.entry_kind(root, source) == "none":
+        return False
+    touched = [relative]
+    aside: Path | None = None
+    if safe_io.entry_kind(root, root / relative) != "none":
+        # Something the shell made under that name meanwhile moves aside, as a move moves
+        # a squatter, so the item lands where its row says (docs/workspace.md § Layout).
+        aside = relative.with_name(f"{relative.name} ({uuid.uuid4().hex[:6]})")
+        git.move(root, root / relative, root / aside)
+        touched.append(aside)
+    try:
+        safe_io.rename(root, source, root / relative)
+    except BaseException:
+        if aside is not None:
+            with contextlib.suppress(OSError, safe_io.UnsafeEntry):
+                safe_io.rename(root, root / aside, root / relative)
+        raise
+    try:
+        git.commit_paths(root, git.USER_AUTHOR, message, touched)
+    except git.GitError:
+        safe_io.rename(root, root / relative, source)
+        if aside is not None:
+            safe_io.rename(root, root / aside, root / relative)
+        raise
+    return True
+
+
+async def unstash_path(
+    settings: Settings, user_id: int, entry: str, relative: Path, message: str
+) -> bool:
+    """Bring an entry of the Trash back to `relative` under `files/` as one revision:
+    Put Back once its rows are committed, or a move to the Trash whose rows did not
+    commit. False when the Trash held nothing for it; raises when the tree refuses, the
+    entry then still in the Trash for the repair rule. The caller holds the workspace
+    lock."""
+    root = user_root(settings.workspaces_dir, user_id)
+    return await asyncio.to_thread(_unstash_tree, root, entry, relative, message)
+
+
+def trash_home(row: Folder | Document, by_id: dict[int, Folder]) -> Path:
+    """Where the directory of a row that is not trashed itself belongs, relative to the
+    user root: under `files/` when the row is live, else inside the entry of the nearest
+    trashed folder above it, which holds everything under that folder."""
+    parent = row.parent_id if isinstance(row, Folder) else row.folder_id
+    chain = folder_chain(by_id, parent)
+    home = Path(FILES_DIR)
+    below = chain
+    for index in range(len(chain) - 1, -1, -1):
+        if chain[index].trashed_at is not None:
+            home = Path(SIGHTREAD_DIR, TRASH_DIR, trash_entry("folder", chain[index].id))
+            below = chain[index + 1 :]
+            break
+    for folder in below:
+        home /= path_segment(folder.name)
+    return home / path_segment(row.name)
+
+
+def _trash_entries(root: Path) -> list[tuple[str, int, str]]:
+    """`(kind, row id, entry name)` for each entry of the Trash."""
+    if safe_io.entry_kind(root, trash_root(root)) != "dir":
+        return []
+    found = []
+    for name, _is_dir in safe_io.list_dir(root, trash_root(root)):
+        match = TRASH_ENTRY.fullmatch(name)
+        if match is not None:
+            found.append((match[1], int(match[2]), name))
+    return found
+
+
+def _return_entry(root: Path, name: str, home: Path) -> bool:
+    source = trash_root(root) / name
+    if safe_io.entry_kind(root, root / home) != "none":
+        logger.warning("the Trash keeps %s: %s is taken", name, home)
+        return False
+    try:
+        safe_io.rename(root, source, root / home)
+    except (safe_io.UnsafeEntry, OSError):
+        logger.exception("could not return %s from the Trash to %s", name, home)
+        return False
+    if home.parts[0] != FILES_DIR:
+        return True  # from one entry of the Trash into another: outside history
+    try:
+        git.ensure_repo(root)
+        git.commit_paths(root, git.USER_AUTHOR, f"restore {home}", [home])
+    except git.GitError:
+        logger.exception("the return of %s to %s could not be recorded; undone", name, home)
+        with contextlib.suppress(OSError, safe_io.UnsafeEntry):
+            safe_io.rename(root, root / home, source)
+        return False
+    return True
+
+
+def _discard_entries(root: Path, names: Iterable[str]) -> None:
+    for name in names:
+        safe_io.remove_tree(root, trash_root(root) / name)
+
+
+async def recover_trash(db: AsyncSession, settings: Settings, user_id: int) -> int:
+    """The repair rule of docs/workspace.md § The Trash: an entry whose row is not trashed
+    itself goes back where the row places it, and an entry whose row is gone — a delete
+    for good that died before its cleanup — is removed. Returns how many entries moved.
+    Reads the rows only; the caller holds the workspace lock, which every move into or
+    out of the Trash holds."""
+    root = user_root(settings.workspaces_dir, user_id)
+    entries = await asyncio.to_thread(_trash_entries, root)
+    if not entries:
+        return 0
+    folders = await user_folders(db, user_id)
+    wanted = [row_id for kind, row_id, _name in entries if kind == "document"]
+    documents = (
+        {
+            row.id: row
+            for row in (
+                await db.execute(
+                    select(Document).where(Document.user_id == user_id, Document.id.in_(wanted))
+                )
+            ).scalars()
+        }
+        if wanted
+        else {}
+    )
+    moved = 0
+    for kind, row_id, name in entries:
+        row = folders.get(row_id) if kind == "folder" else documents.get(row_id)
+        if row is None:
+            logger.warning("the Trash of user %d held %s with no row; removed", user_id, name)
+            await asyncio.to_thread(_discard_entries, root, [name])
+            continue
+        if row.trashed_at is not None:
+            continue
+        if await asyncio.to_thread(_return_entry, root, name, trash_home(row, folders)):
+            moved += 1
+    return moved
+
+
+def _trash_holds(root: Path, document: Document, by_id: dict[int, Folder]) -> bool:
+    """Whether the Trash holds an entry the document's directory may be in: its own, or a
+    folder's above it — what the repair rule could not return."""
+    names = {name for _kind, _row_id, name in _trash_entries(root)}
+    return trash_entry("document", document.id) in names or any(
+        trash_entry("folder", row.id) in names for row in folder_chain(by_id, document.folder_id)
+    )
+
+
+async def discard_trash(settings: Settings, user_id: int, names: Iterable[str]) -> None:
+    """The entries of items deleted for good, once their rows are gone."""
+    root = user_root(settings.workspaces_dir, user_id)
+    await asyncio.to_thread(_discard_entries, root, list(names))
+
+
+# --- copies -------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CopiedDocument:
+    """One document of a copy: its row and the new one, the parse behind both, where its
+    directory sits below the copied item's (`.` for a document copied on its own), the
+    documents whose original the new one may take, its source first, and whether that
+    parse is still running — a directory at its path is then not its document's yet, and
+    the copy gets its files when the parse ends, as the original does."""
+
+    source_id: int
+    target_id: int
+    job: Job | None
+    inner: Path
+    donors: tuple[int, ...]
+    parsing: bool
+
+
+@dataclass(frozen=True)
+class Copy:
+    """A copy on disk: the revision it made, and where a squatter that sat at the
+    destination was moved to (docs/workspace.md § Copies)."""
+
+    commit: str | None
+    displaced: Path | None
+
+
+def _copy_stored_images(root: Path, source_id: int, target_id: int) -> None:
+    store = images_dir(root) / str(source_id)
+    if not store.is_dir() or store.is_symlink():
+        return
+    target = images_dir(root) / str(target_id)
+    target.mkdir(parents=True, exist_ok=True)
+    for image in store.iterdir():
+        if IMAGE_NAME.fullmatch(image.name) and image.is_file() and not image.is_symlink():
+            shutil.copyfile(image, target / image.name)
+
+
+def _undo_copy(root: Path, target: Path, displaced: Path | None, target_ids: list[int]) -> None:
+    safe_io.remove_tree(root, root / target)
+    if displaced is not None and safe_io.entry_kind(root, root / displaced) != "none":
+        safe_io.rename(root, root / displaced, root / target)
+    _discard_originals(root, target_ids)
+
+
+def _copy_files(
+    root: Path, source: Path, target: Path, documents: list[CopiedDocument], *, folder: bool
+) -> Copy:
+    git.ensure_repo(root)
+    aside: Path | None = None
+    if safe_io.entry_kind(root, root / target) != "none":
+        # A directory the shell made under the copy's name: aside, as a move's squatter.
+        aside = target.with_name(f"{target.name} ({uuid.uuid4().hex[:6]})")
+        try:
+            git.move(root, root / target, root / aside)
+        except (safe_io.UnsafeEntry, OSError) as exc:
+            raise ApiError(
+                409, "invalid_request", "The copy could not be made; nothing was copied"
+            ) from exc
+    directories = {document.inner for document in documents}
+    parsing = {document.inner for document in documents if document.parsing}
+
+    def left_behind(inner: Path) -> bool:
+        # What materialization makes again for the new id — the shell's copy of the
+        # original, the crops and images — the metadata, written fresh below, and the
+        # directory of a parse still running, which is not its document's yet.
+        return inner in parsing or (
+            inner.parent in directories
+            and (inner.name in (FIGURES_DIR, META_FILE) or inner.name.startswith(f"{SOURCE_STEM}."))
+        )
+
+    try:
+        if safe_io.entry_kind(root, root / source) == "dir" and Path() not in parsing:
+            safe_io.copy_tree(root, root / source, root / target, skip=left_behind)
+        elif folder:
+            safe_io.ensure_dir(root, root / target)
+        for document in documents:
+            directory = root / target / document.inner
+            if not document.parsing and safe_io.entry_kind(root, directory) == "dir":
+                safe_io.write_text(
+                    root, directory / META_FILE, meta_text(document.target_id, document.job)
+                )
+            for donor in document.donors:
+                if copy_original(root, donor, document.target_id):
+                    break
+            _copy_stored_images(root, document.source_id, document.target_id)
+        touched = [target] if aside is None else [target, aside]
+        commit = git.commit_paths(root, git.USER_AUTHOR, f"copy {source} -> {target}", touched)
+    except BaseException as exc:
+        # Whole or not at all: what the copy made goes, and the squatter comes back.
+        try:
+            _undo_copy(root, target, aside, [document.target_id for document in documents])
+        except Exception:  # noqa: BLE001 - the refusal stands; the leftovers are logged
+            logger.exception("could not take back the copy at %s", target)
+        if isinstance(exc, safe_io.TreeTooDeep):
+            raise ApiError(
+                409, "invalid_request", "The item has a directory nested too deep to copy"
+            ) from exc
+        if isinstance(exc, safe_io.UnsafeEntry):
+            raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
+        if isinstance(exc, (OSError, git.GitError)):
+            raise ApiError(
+                409, "invalid_request", "The copy could not be made; nothing was copied"
+            ) from exc
+        raise
+    return Copy(commit, aside)
+
+
+async def copy_path(
+    settings: Settings,
+    user_id: int,
+    source: Path,
+    target: Path,
+    documents: list[CopiedDocument],
+    *,
+    folder: bool,
+) -> Copy:
+    """Copy a document's or a folder's directory to `target` after the database made
+    the rows, with the originals and inserted images under the new ids, as the revision
+    `copy <from> -> <to>`; whole or nothing (409). The caller holds the workspace lock
+    and checked the quota (docs/workspace.md § Copies)."""
+    root = user_root(settings.workspaces_dir, user_id)
+    return await asyncio.to_thread(_copy_files, root, source, target, documents, folder=folder)
+
+
+def _remove_copy(root: Path, target: Path, made: Copy, target_ids: list[int]) -> None:
+    safe_io.remove_tree(root, root / target)
+    touched = [target]
+    if made.displaced is not None and safe_io.entry_kind(root, root / made.displaced) != "none":
+        git.move(root, root / made.displaced, root / target)
+        touched.append(made.displaced)
+    _discard_originals(root, target_ids)
+    git.commit_paths(root, git.USER_AUTHOR, f"remove {target}", touched)
+
+
+async def remove_copy(
+    settings: Settings, user_id: int, target: Path, made: Copy, target_ids: list[int]
+) -> None:
+    """A copy whose rows did not commit: its directory, originals and images go, the
+    squatter it displaced comes back, as a revision of its own."""
+    root = user_root(settings.workspaces_dir, user_id)
+    await asyncio.to_thread(_remove_copy, root, target, made, target_ids)
 
 
 def directory_size(root: Path, path: Path | None = None) -> int:

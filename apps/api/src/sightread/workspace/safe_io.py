@@ -389,6 +389,34 @@ def rename(root: Path, source: Path, target: Path) -> None:
         os.close(src_fd)
 
 
+def copy_tree(root: Path, source: Path, target: Path, *, skip=None) -> None:
+    """Copy the directory at `source` to `target`, both beneath `root`, every directory
+    made and every file opened through descriptors that follow nothing, as every host
+    write is: a link, a FIFO or a device is left out, never followed or opened.
+    `skip(inner)` names what to leave behind by its path below `source`; a write in
+    progress (`.sr-tmp-*`) is never copied. No deeper than `DEPTH_MAX`."""
+    ensure_dir(root, target)
+    pending = [Path()]
+    while pending:
+        inner = pending.pop()
+        if len(inner.parts) >= DEPTH_MAX:
+            raise TreeTooDeep(f"a directory is nested deeper than {DEPTH_MAX} levels")
+        for name, is_dir in list_dir(root, source / inner):
+            child = inner / name
+            if name.startswith(TEMP_PREFIX) or (skip is not None and skip(child)):
+                continue
+            if is_dir:
+                ensure_dir(root, target / child)
+                pending.append(child)
+                continue
+            try:
+                entry = _open_file(root, source / child, os.O_RDONLY)
+            except (UnsafeEntry, FileNotFoundError):
+                continue  # a link or a special file, or gone: not part of the copy
+            with os.fdopen(entry, "rb") as reader:
+                write_from(root, target / child, reader)
+
+
 def remove_empty_dir(root: Path, path: Path) -> bool:
     """`rmdir` the directory at `path` through its parent's descriptor; False when it is
     not empty or not there."""

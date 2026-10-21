@@ -27,9 +27,12 @@ from . import git, safe_io
 from .documents import (
     aside_origin,
     folder_names,
+    recover_trash,
     sweep_aside,
     sweep_orphaned_images,
     sweep_orphaned_originals,
+    trashed_folder_ids,
+    user_folders,
 )
 from .layout import (
     FILES_DIR,
@@ -207,9 +210,10 @@ def _restore_aside(root: Path, aside_dir: Path, target: Path) -> bool:
 
 
 async def _row_names(db: AsyncSession, user_id: int, origin: Path) -> bool:
-    """Whether a folder or document row still places itself at `origin` (`files/…`): what
-    decides that an aside holding no document metadata goes back there rather than
-    being swept (docs/workspace.md § Revisions)."""
+    """Whether a live folder or document row still places itself at `origin` (`files/…`):
+    what decides that an aside holding no document metadata goes back there rather than
+    being swept (docs/workspace.md § Revisions). A row in the Trash places nothing under
+    `files/`."""
     segments = origin.parts[1:]
     if origin.parts[:1] != (FILES_DIR,) or not segments:
         return False
@@ -218,7 +222,9 @@ async def _row_names(db: AsyncSession, user_id: int, origin: Path) -> bool:
         at_parent = Folder.parent_id.is_(None) if parent is None else Folder.parent_id == parent
         folders = (
             await db.execute(
-                select(Folder.id, Folder.name).where(Folder.user_id == user_id, at_parent)
+                select(Folder.id, Folder.name).where(
+                    Folder.user_id == user_id, at_parent, Folder.trashed_at.is_(None)
+                )
             )
         ).all()
         match = next((row.id for row in folders if path_segment(row.name) == segment), None)
@@ -229,7 +235,11 @@ async def _row_names(db: AsyncSession, user_id: int, origin: Path) -> bool:
             return False
         in_folder = Document.folder_id.is_(None) if parent is None else Document.folder_id == parent
         names = (
-            await db.execute(select(Document.name).where(Document.user_id == user_id, in_folder))
+            await db.execute(
+                select(Document.name).where(
+                    Document.user_id == user_id, in_folder, Document.trashed_at.is_(None)
+                )
+            )
         ).scalars()
         return any(path_segment(name) == segment for name in names)
     return True
@@ -265,8 +275,9 @@ async def _folder_for(
 ) -> int | None:
     """The folder row at this path, created when the shell made the directory — unless
     a segment is a document's: a folder under a document's name would share its
-    directory (docs/workspace.md § The tree is the truth). `created` collects the ids
-    of the rows made here."""
+    directory (docs/workspace.md § The tree is the truth). Live rows only: a folder in
+    the Trash is matched to no directory, so one the shell makes under its name gets a
+    row of its own (§ The Trash). `created` collects the ids of the rows made here."""
     parent: int | None = None
     for segment in segments:
         key = (parent, segment)
@@ -281,6 +292,7 @@ async def _folder_for(
                         Document.folder_id.is_(None)
                         if parent is None
                         else Document.folder_id == parent,
+                        Document.trashed_at.is_(None),
                     )
                 )
             )
@@ -297,6 +309,7 @@ async def _folder_for(
                         Folder.parent_id.is_(None)
                         if parent is None
                         else Folder.parent_id == parent,
+                        Folder.trashed_at.is_(None),
                     )
                 )
             )
@@ -326,9 +339,12 @@ async def reconcile_user(db: AsyncSession, settings: Settings, user_id: int) -> 
 async def reconcile_locked(db: AsyncSession, settings: Settings, user_id: int) -> int:
     """`reconcile_user` for a caller that already holds the workspace lock."""
     root = user_root(settings.workspaces_dir, user_id)
+    # What an interrupted move to or from the Trash left goes where its row says first,
+    # so the scan below finds it there (docs/workspace.md § The Trash).
+    restored = await recover_trash(db, settings, user_id)
     if not files_root(root).is_dir():
-        return 0
-    return await _reconcile_locked(db, user_id, root)
+        return restored
+    return restored + await _reconcile_locked(db, user_id, root)
 
 
 async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
@@ -362,9 +378,14 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
     # folder row added here shares the namespace the Files page's name decisions lock
     # (docs/workspace.md § Revisions).
     await db.execute(select(User.id).where(User.id == user_id).with_for_update())
+    # Live rows only: a `.meta.json` under `files/` that names a document in the Trash —
+    # copied out of the read-only Trash, brought back by a revert — is not that document,
+    # and its row stays in the Trash (docs/workspace.md § The Trash).
+    trashed = trashed_folder_ids((await user_folders(db, user_id)).values())
     documents = {
         row.id: row
         for row in (await db.execute(select(Document).where(Document.user_id == user_id))).scalars()
+        if row.trashed_at is None and (row.folder_id is None or row.folder_id not in trashed)
     }
     # A document set aside by a delete whose rows survived (the process died between the
     # removal's revision and the rows' commit) goes back where its row says; an aside
@@ -424,6 +445,7 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
                 select(Folder.name).where(
                     Folder.user_id == user_id,
                     Folder.parent_id.is_(None) if parent is None else Folder.parent_id == parent,
+                    Folder.trashed_at.is_(None),
                 )
             )
             folder_segments[parent] = {path_segment(name) for name in rows.scalars()}

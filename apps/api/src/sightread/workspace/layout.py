@@ -23,6 +23,7 @@ FILES_DIR = "files"
 REPOS_DIR = ".repos"
 SIGHTREAD_DIR = ".sightread"
 RESULTS_DIR = "results"
+TRASH_DIR = "trash"
 CACHE_DIR = ".cache"
 DOC_FILE = "doc.md"
 NOTES_FILE = "notes.md"
@@ -159,6 +160,18 @@ def files_root(root: Path) -> Path:
 
 def results_root(root: Path) -> Path:
     return root / SIGHTREAD_DIR / RESULTS_DIR
+
+
+def trash_root(root: Path) -> Path:
+    """`.sightread/trash`: where an item put in the Trash waits, inside the user directory
+    (one filesystem with `files/`) and read-only in the VM (docs/workspace.md § The Trash)."""
+    return root / SIGHTREAD_DIR / TRASH_DIR
+
+
+def trash_entry(kind: str, row_id: int) -> str:
+    """The Trash's name for a trashed folder's or document's directory: `folder-3`,
+    `document-12` — by id, so it never collides and survives a rename of anything above."""
+    return f"{kind}-{row_id}"
 
 
 def document_relative_dir(folder_names: list[str], document_name: str) -> Path:

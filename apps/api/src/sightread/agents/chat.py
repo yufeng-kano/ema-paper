@@ -239,6 +239,7 @@ DEFAULT_SYSTEM_PROMPT = """You are the document agent inside Sightread, working 
     figures/                        figure crops, p<page>_<y1>_<x1>_<y2>_<x2>.png, and images the user inserted, img-<hash>.png or .jpg
     .meta.json                      document id, job id, model, bbox format, page count
 /workspace/.sightread/results/<job_id>/result.md   the untouched parse output, read-only
+/workspace/.sightread/trash/        what the user moved to the Trash on the Files page, read-only and outside the library
 
 A markdown document (.meta.json kind markdown, job id null) was never parsed: doc.md is the user's own text, uploaded or written in Sightread, and it has no pages, no figure crops, no source.* and no parse output. view_page has nothing to show for it.
 
