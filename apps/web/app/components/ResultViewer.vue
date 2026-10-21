@@ -3770,6 +3770,24 @@ const editorImages = computed(() => {
     : undefined
 })
 
+/** The blocks around the open editor's run, and where it starts among the document's blocks:
+ *  where an image goes whose block editor closed holding no other block beside it. */
+const openRunNear = computed<PlaceNear | null>(() => {
+  const open = editing.value
+  if (!open) {
+    return null
+  }
+  const flat = pages.value.flatMap((page, pageIndex) => page.blocks.map((block, index) => ({ src: block.src, pageIndex, index })))
+  const found = flat.findIndex((entry) => entry.pageIndex > open.page || (entry.pageIndex === open.page && entry.index >= open.index))
+  const start = found === -1 ? flat.length : found
+  // A new block's editor holds no block of the document yet.
+  const run = flat.filter((entry) => entry.pageIndex === open.page && entry.index >= open.index && entry.index < open.index + span.value).length
+  return { after: flat[start - 1]?.src ?? null, before: flat[start + run]?.src ?? null, gap: start }
+})
+
+/** The block editors' images: the editor's place in the document goes with them. */
+const blockImages = computed(() => editorImages.value && { ...editorImages.value, outer: openRunNear.value })
+
 const notesImages = computed(() => {
   const id = props.documentId
   return editorImages.value && id !== null
@@ -4215,7 +4233,7 @@ watch(
                     :label="t('viewer.blockSource')"
                     :skills="slashSkills"
                     :figures="editorFigures"
-                    :images="editorImages"
+                    :images="blockImages"
                     @change="onEditorChange"
                     @leave="leaveEditor"
                     @slash-open="loadSkills"
@@ -4307,7 +4325,7 @@ watch(
                         :on-merge="mergeBack"
                         :skills="slashSkills"
                         :figures="editorFigures"
-                        :images="editorImages"
+                        :images="blockImages"
                         @change="onEditorChange"
                         @leave="leaveEditor"
                         @slash-open="loadSkills"
@@ -4401,7 +4419,7 @@ watch(
                       :label="t('viewer.blockSource')"
                       :skills="slashSkills"
                       :figures="editorFigures"
-                      :images="editorImages"
+                      :images="blockImages"
                       @change="onEditorChange"
                       @leave="leaveEditor"
                       @slash-open="loadSkills"

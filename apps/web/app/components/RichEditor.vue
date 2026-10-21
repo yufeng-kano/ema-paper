@@ -95,6 +95,9 @@ const props = withDefaults(
       /** An image whose editor closed before it uploaded: its line, and the place it was
        *  to land by the blocks around it, for the owner to land it there. */
       strayed?: (line: string, near: PlaceNear) => void
+      /** The blocks around the editor's own text in its owner's file: the neighbours of a
+       *  slot with no block of the editor's beside it. */
+      outer?: PlaceNear | null
     }
   }>(),
   {
@@ -1131,9 +1134,11 @@ function wash(first: number, count: number) {
 onBeforeUnmount(() => {
   closing = true
   // Images still uploading: each place by the blocks around it, while the editor can still
-  // say, empty paragraphs passed over (`images.strayed`).
+  // say, empty paragraphs passed over — past the editor's own text, the blocks around the
+  // editor (`images.strayed`, `images.outer`).
   if (editor) {
     const { doc } = editor.state
+    const outer = props.images?.outer ?? null
     for (const slot of landing) {
       let after: string | null = null
       let before: string | null = null
@@ -1148,7 +1153,7 @@ onBeforeUnmount(() => {
           before = markdown
         }
       })
-      slot.near = { after, before }
+      slot.near = { after: after ?? outer?.after ?? null, before: before ?? outer?.before ?? null, gap: outer?.gap }
     }
   }
   clearTimeout(washTimer)
