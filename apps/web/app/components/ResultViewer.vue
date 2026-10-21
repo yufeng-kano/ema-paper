@@ -805,8 +805,12 @@ async function startEdit(pageIndex: number, blockIndex: number, caret: Caret = '
   editorSource.value = block.kind === 'fig' || block.kind === 'img' ? (block.caption ?? '') : draft.value
   editorCaret.value = caret
   editorKey.value += 1
-  if (block.kind === 'toc') {
+  // The textarea — a contents page, a rule — is focused here, the caret at the end the
+  // arrows came in from; the rich editors do both themselves as they mount.
+  if (!RICH_KINDS.has(block.kind) && block.kind !== 'fig' && block.kind !== 'img') {
     await nextTick()
+    const at = caret === 'start' ? 0 : draft.value.length
+    lineEditor?.setSelectionRange(at, at)
     lineEditor?.focus()
   }
 }
@@ -1149,6 +1153,11 @@ function afterCommit(at: BlockAt): BlockAt {
   return at
 }
 
+/** Set while the arrows move the editor to the next block, until the page has redrawn: a
+ *  textarea taken down blurs as it goes, and that blur is the viewer moving on, not the
+ *  reader leaving. */
+let movingOn = false
+
 /** ArrowUp on the first line or ArrowDown on the last: into the block beside it, caret
  *  and all (docs/web.md § Editing). */
 function navigateFrom(direction: 'up' | 'down'): boolean {
@@ -1165,8 +1174,10 @@ function navigateFrom(direction: 'up' | 'down'): boolean {
   if (direction === 'down' && target.page === open.page) {
     target.index += draftBlockCount() - span.value
   }
+  movingOn = true
   commitEdit()
   void startEdit(target.page, target.index, direction === 'up' ? 'end' : 'start')
+  void nextTick(() => (movingOn = false))
   return true
 }
 
@@ -1224,6 +1235,9 @@ function mergeBack(current: string): boolean {
 function leaveEditor(reason: LeaveReason) {
   if (reason === 'blur' && chromePressed) {
     chromePressed = false
+    return
+  }
+  if (reason === 'blur' && movingOn) {
     return
   }
   const open = editing.value

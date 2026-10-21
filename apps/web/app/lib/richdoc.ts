@@ -44,8 +44,9 @@ function inlineContent(segments: InlineSegment[], marks: Mark[] = []): JSONConte
           content.push(textNode(segment.text, marks))
         }
         break
+      // A formula inside emphasis or a superscript keeps it: `A<sup>$n$</sup>`.
       case 'math':
-        content.push({ type: 'inlineMath', attrs: { latex: segment.tex } })
+        content.push(withMarks({ type: 'inlineMath', attrs: { latex: segment.tex } }, marks))
         break
       case 'strong':
         content.push(...inlineContent(segment.segments, [...marks, 'bold']))
@@ -77,11 +78,13 @@ function inlineContent(segments: InlineSegment[], marks: Mark[] = []): JSONConte
   return content
 }
 
-function textNode(text: string, marks: Mark[]): JSONContent {
+function withMarks(node: JSONContent, marks: Mark[]): JSONContent {
   const unique = [...new Set(marks)]
-  return unique.length
-    ? { type: 'text', text, marks: unique.map((type) => ({ type })) }
-    : { type: 'text', text }
+  return unique.length ? { ...node, marks: unique.map((type) => ({ type })) } : node
+}
+
+function textNode(text: string, marks: Mark[]): JSONContent {
+  return withMarks({ type: 'text', text }, marks)
 }
 
 function paragraph(text: string, options?: InlineOptions): JSONContent {
@@ -256,6 +259,26 @@ function sameMarks(a: Mark[], b: Mark[]): boolean {
   return a.length === b.length && a.every((mark) => b.includes(mark))
 }
 
+/** A run's markdown inside the markers of its marks. */
+function wrapMarks(markdown: string, marks: Mark[]): string {
+  let inner = markdown
+  if (marks.includes('italic')) {
+    inner = `*${inner}*`
+  }
+  if (marks.includes('bold')) {
+    inner = `**${inner}**`
+  }
+  // Outside the asterisks: `**a**<sup>**1**</sup>**b**` has no two runs of asterisks
+  // meeting, so it needs none of the separators below.
+  if (marks.includes('superscript')) {
+    inner = `<sup>${inner}</sup>`
+  }
+  if (marks.includes('subscript')) {
+    inner = `<sub>${inner}</sub>`
+  }
+  return inner
+}
+
 /** Stands in for a formula or a code span while the line's dollars are checked: neither's
  *  characters are prose, so neither may be escaped. A private-use character, never typed. */
 const HELD = '\uE000'
@@ -290,6 +313,11 @@ export function serializeInline(content: JSONContent[] = [], inTable = false): s
       if (!latex) {
         return ''
       }
+      const marks = markSet(node)
+      if (marks.length) {
+        // Inside its marks the formula closes before their closer, never before a digit.
+        return wrapMarks(hold(`$${latex}$`), marks)
+      }
       // A span never closes on a dollar followed by a digit ("$5 and $6" are prices), so
       // a formula right before one is kept apart by an invisible zero-width space —
       // anything visible would change the text the reader typed.
@@ -316,21 +344,7 @@ export function serializeInline(content: JSONContent[] = [], inTable = false): s
         inner = `${inner.slice(0, -1)}\\$`
       }
     }
-    if (marks.includes('italic')) {
-      inner = `*${inner}*`
-    }
-    if (marks.includes('bold')) {
-      inner = `**${inner}**`
-    }
-    // Outside the asterisks: `**a**<sup>**1**</sup>**b**` has no two runs of asterisks
-    // meeting, so it needs none of the separators below.
-    if (marks.includes('superscript')) {
-      inner = `<sup>${inner}</sup>`
-    }
-    if (marks.includes('subscript')) {
-      inner = `<sub>${inner}</sub>`
-    }
-    return `${lead}${inner}${trail}`
+    return `${lead}${wrapMarks(inner, marks)}${trail}`
   })
   // Two emphasis runs that meet (`*a*` then `**b**`) would merge their asterisks into a
   // run the parser cannot split; an invisible zero-width space keeps them apart.
