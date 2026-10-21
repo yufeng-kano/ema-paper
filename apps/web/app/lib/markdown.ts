@@ -1227,12 +1227,25 @@ export function blockAnchor(pages: readonly ResultPageBlocks[], at: BlockAt, out
 }
 
 /**
+ * A block anchor as an address carried it, read back: `+` and percent-escapes as the words
+ * they stand for. A stray `%` is part of the words as written.
+ */
+export function decodeBlockAnchor(anchor: string): string {
+  const spaced = anchor.replace(/\+/g, ' ')
+  try {
+    return decodeURIComponent(spaced)
+  } catch {
+    return spaced
+  }
+}
+
+/**
  * Where a block link leads: the first block in its section whose text starts with its words,
  * else such a block anywhere, else the section's heading, else null — the top of the document.
  * Compared as a located passage is, spacing ignored; a link survives edits above it and a
  * block moved to another section.
  */
-export function resolveAnchor(pages: readonly ResultPageBlocks[], anchor: string, outline = documentOutline(pages)): BlockAt | null {
+export function resolveAnchor(pages: readonly ResultPageBlocks[], anchor: string, outline: readonly OutlineEntry[] = documentOutline(pages)): BlockAt | null {
   const tilde = anchor.indexOf('~')
   const slug = (tilde === -1 ? anchor : anchor.slice(0, tilde)).trim().toLowerCase()
   const key = tilde === -1 ? '' : passageKey(anchor.slice(tilde + 1))

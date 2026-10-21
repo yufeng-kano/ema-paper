@@ -2,7 +2,7 @@
 // Both script blocks compile into one module, so the imports belong to the block that comes
 // first — the whole component reads them, `<script setup>` included.
 import type { ComponentPublicInstance } from 'vue'
-import type { ToolbarRect } from '~/components/ViewerToolbar.vue'
+import type { ToolbarRect, ToolbarSkill } from '~/components/ViewerToolbar.vue'
 import {
   ApiRequestError,
   getDocumentContent,
@@ -33,7 +33,7 @@ import {
 } from '~/lib/blocks'
 import type { AskRequest } from '~/lib/composer'
 import { cellGroupsToMarkdown, nodesToMarkdown, selectionText, type OrphanListContext } from '~/lib/copy'
-import { claimDrag, dragClaim, setDropEffect } from '~/lib/dnd'
+import { BLOCK_DRAG_TYPE, claimDrag, dragClaim, setDropEffect } from '~/lib/dnd'
 import {
   appendExcerpt,
   excerptMarkdown,
@@ -44,6 +44,7 @@ import {
   locatePassage,
   matchExcerpts,
   passageText,
+  rewriteBlockLinks,
   sectionOf,
   type ExcerptMatch,
 } from '~/lib/excerpts'
@@ -51,6 +52,7 @@ import {
   appendBlockSource,
   blockAnchor,
   blockPlain,
+  decodeBlockAnchor,
   documentOutline,
   findHeading,
   moveBlocks,
@@ -158,7 +160,6 @@ const NOTE_UNDO_MS = 8000
 const TOOLBAR_SETTLE_MS = 300
 
 /** A block drag's own type: what tells it from text or files dragged over the pane. */
-const DRAG_TYPE = 'application/x-sightread-blocks'
 /** How near the pane's top or bottom a drag scrolls it, and how far each step goes. */
 const AUTOSCROLL_EDGE_PX = 48
 const AUTOSCROLL_STEP_PX = 16
@@ -2036,19 +2037,39 @@ function turnRows(range: RowRange, kind: BlockKindName): string[] {
   return start === undefined || end === undefined ? [] : rowsCovering(start, end)
 }
 
-/** *Copy link to block*: the link on the app's own origin, in the current locale (docs/web.md
- *  § Files, *A block can be linked to*). */
+/** *Copy link to block*: a reference to the block — its name linking to the app's own origin,
+ *  in the current locale — as markdown and as HTML (docs/web.md § Editing, *The block handle
+ *  and its menu*; § Files, *A block can be linked to*). */
 function copyLink(at: BlockAt) {
-  const block = blockAnchor(pages.value, at, outline.value)
-  const path = localePath({ path: '/files', query: { document: String(props.documentId), block } })
-  void writeClipboard(new URL(path, window.location.origin).href, t('viewer.note.linkCopied'))
+  const block = pages.value[at.page]?.blocks[at.index]
+  if (!block) {
+    return
+  }
+  const anchor = blockAnchor(pages.value, at, outline.value)
+  const path = localePath({ path: '/files', query: { document: String(props.documentId), block: anchor } })
+  const href = new URL(path, window.location.origin).href
+  const name = blockName(block, nameText.value)
+  const markdown = `[${name.replace(/[[\]]/g, '\\$&')}](${href})`
+  const anchorEl = document.createElement('a')
+  anchorEl.href = href
+  anchorEl.textContent = name
+  void writeClipboard(markdown, t('viewer.note.linkCopied'), anchorEl.outerHTML)
 }
 
-/** Writes to the clipboard and says so — or says it could not, never *Copied* for a write the
- *  browser refused. */
-async function writeClipboard(text: string, note: string) {
+/** Writes to the clipboard — with an HTML form too, where the browser takes one — and says
+ *  so; or says it could not, never *Copied* for a write the browser refused. */
+async function writeClipboard(text: string, note: string, html?: string) {
   try {
-    await navigator.clipboard.writeText(text)
+    if (html && typeof ClipboardItem === 'function') {
+      await navigator.clipboard.write([
+        new ClipboardItem({
+          'text/plain': new Blob([text], { type: 'text/plain' }),
+          'text/html': new Blob([html], { type: 'text/html' }),
+        }),
+      ])
+    } else {
+      await navigator.clipboard.writeText(text)
+    }
     showNote(note, false)
   } catch {
     showNote(t('viewer.note.copyFailed'), false)
@@ -2216,7 +2237,7 @@ function onHandleDragStart(event: DragEvent, key: string) {
   dragRun = range
   dragKeys.value = new Set(rows.value.slice(range.from, range.to + 1).map((row) => row.key))
   transfer.effectAllowed = 'copyMove'
-  transfer.setData(DRAG_TYPE, JSON.stringify([...dragKeys.value]))
+  transfer.setData(BLOCK_DRAG_TYPE, JSON.stringify([...dragKeys.value]))
   transfer.setData('text/plain', rowsMarkdown(range))
   // A small card rather than the browser's picture of the block: written here, since the
   // drag image is taken before the next render.
@@ -2234,7 +2255,7 @@ function onHandleDragStart(event: DragEvent, key: string) {
 /** `dragover` decides (`app/lib/dnd.ts`): over the pane a block drag is claimed, the pane
  *  scrolls near its edges, and the drop line follows the pointer. */
 function onPaneDragOver(event: DragEvent) {
-  if (!dragRun || ![...(event.dataTransfer?.types ?? [])].includes(DRAG_TYPE)) {
+  if (!dragRun || ![...(event.dataTransfer?.types ?? [])].includes(BLOCK_DRAG_TYPE)) {
     return
   }
   claimDrag(event, 'block')
@@ -2313,7 +2334,7 @@ function clearDropLine() {
 }
 
 function onPaneDrop(event: DragEvent) {
-  if (!dragRun || ![...(event.dataTransfer?.types ?? [])].includes(DRAG_TYPE)) {
+  if (!dragRun || ![...(event.dataTransfer?.types ?? [])].includes(BLOCK_DRAG_TYPE)) {
     return
   }
   event.preventDefault()
@@ -2476,7 +2497,7 @@ function toolbarPassage(): { markdown: string; at: BlockAt } | null {
   return text && start ? { markdown: text, at: afterCommit(parseKey(start)) } : null
 }
 
-function onToolbarAction(action: 'ask' | 'translate' | 'quote' | 'copy') {
+function onToolbarAction(action: 'ask' | 'quote' | 'copy') {
   const passage = toolbarPassage()
   if (!passage) {
     return
@@ -2494,40 +2515,26 @@ function onToolbarAction(action: 'ask' | 'translate' | 'quote' | 'copy') {
       void nextTick(() => focusBlock(focus))
     }
   } else {
-    const request: AskRequest = action === 'translate' ? { selection: passage.markdown, command: 'translate', send: true } : { selection: passage.markdown }
-    void askAgent(request, blockKey(passage.at))
+    void askAgent({ selection: passage.markdown }, blockKey(passage.at))
   }
 }
 
-/** More: the other skills, in the viewer's own menu, with the passage read at the press — its
- *  menu takes focus, which closes an open editor and the toolbar with it. */
-const skillMenu = ref<{ at: Point; passage: { markdown: string; at: BlockAt }; items: MenuItem[] } | null>(null)
+/** The toolbar's skill list: every user-invocable skill, `translate` only where the selection
+ *  touches something it translates (docs/web.md § Editing, *The selection toolbar*). */
+const toolbarSkills = computed((): ToolbarSkill[] =>
+  skills.value
+    .filter((skill) => skill.name !== 'translate' || toolbar.value?.translate)
+    .map((skill) => ({ name: skill.name, description: skill.description, icon: skillIcon(skill.name) })),
+)
 
-function onToolbarMore(event: MouseEvent) {
-  if (skillMenu.value) {
-    skillMenu.value = null
-    return
-  }
+/** A skill picked from the toolbar's list, with the passage read at the press. */
+function onToolbarSkill(name: string) {
   const passage = toolbarPassage()
   if (!passage) {
     return
   }
-  const button = event.target instanceof Element ? event.target.closest('button') : null
-  const rect = button?.getBoundingClientRect()
-  skillMenu.value = {
-    at: rect ? { x: rect.left, y: rect.bottom + 4 } : { x: event.clientX, y: event.clientY },
-    passage,
-    items: skills.value
-      .filter((skill) => skill.name !== 'translate')
-      .map((skill) => ({ key: skill.name, label: `/${skill.name}`, labelMono: true, description: skill.description, icon: skillIcon(skill.name) })),
-  }
-}
-
-function onSkillSelect(name: string) {
-  const menu = skillMenu.value
-  if (menu) {
-    void askAgent({ selection: menu.passage.markdown, command: name, send: true }, blockKey(menu.passage.at))
-  }
+  toolbar.value = null
+  void askAgent({ selection: passage.markdown, command: name, send: true }, blockKey(passage.at))
 }
 
 /** The toolbar follows its selection as the pane scrolls. */
@@ -2737,6 +2744,29 @@ const notesLinks = {
     return linkResolves(pages.value, outline.value, target) ? 'chip' : 'text'
   },
   locate: (target: SectionLinkTarget) => void locateLink(target),
+  rewrite: (markdown: string) => rewriteBlockLinks(markdown, blockLinkAnchor),
+}
+
+/**
+ * The block anchor an address carries when it is this document's *Copy link to block* — the
+ * app's own origin, the files page in any locale, this document — else null (docs/web.md
+ * § Notes, *Quotes and section links*). The anchor as the address wrote it, still escaped.
+ */
+function blockLinkAnchor(address: string): string | null {
+  let url: URL
+  try {
+    url = new URL(address)
+  } catch {
+    return null
+  }
+  if (url.origin !== window.location.origin || !/\/files\/?$/.test(url.pathname)) {
+    return null
+  }
+  if (url.searchParams.get('document') !== String(props.documentId)) {
+    return null
+  }
+  const block = /[?&]block=([^&#]*)/.exec(url.search)?.[1]
+  return block ? block : null
 }
 
 /**
@@ -2757,6 +2787,17 @@ async function locateLink(target: SectionLinkTarget) {
   }
   commitEdit()
   await nextTick()
+  if (target.anchor.includes('~')) {
+    // A block reference: revealed as opening its address does.
+    const at = resolveAnchor(pages.value, decodeBlockAnchor(target.anchor), outline.value)
+    if (at && placedIndex.value.has(blockKey(at))) {
+      setWayBack()
+      pressLink(target)
+      await revealBlock(at)
+      armWayBack()
+    }
+    return
+  }
   const heading = target.anchor === '' ? null : findHeading(outline.value, target.label, target.anchor)
   const found = target.passage === null ? null : locatePassage(pages.value, target.passage, heading)
   const box = scroller.value
@@ -3233,24 +3274,33 @@ watch(
     }
     linkFollowed = true
     const at = resolveAnchor(pages.value, props.initialBlock, outline.value)
-    const index = at ? placedIndex.value.get(blockKey(at)) : undefined
-    if (!at || index === undefined) {
+    if (!at || !placedIndex.value.has(blockKey(at))) {
       return
     }
     wayBackArmed = false
     wayBack.value = { key: '', src: '', offset: 0, label: t('viewer.back.top') }
-    openFoldsOver([index])
-    await nextTick()
-    const box = scroller.value
-    const element = box?.querySelector(`[data-block="${blockKey(at)}"]`)
-    if (box && element) {
-      box.scrollTop += element.getBoundingClientRect().top - box.getBoundingClientRect().top - LOCATE_MARGIN_PX
-      flashBlock(blockKey(at))
-    }
+    await revealBlock(at)
     armWayBack()
   },
   { immediate: true },
 )
+
+/** A linked block shown: the fold holding it opened, the pane scrolled to put it near the top,
+ *  the block washed (docs/web.md § Files, *A block can be linked to*). */
+async function revealBlock(at: BlockAt) {
+  const index = placedIndex.value.get(blockKey(at))
+  if (index === undefined) {
+    return
+  }
+  openFoldsOver([index])
+  await nextTick()
+  const box = scroller.value
+  const element = box?.querySelector(`[data-block="${blockKey(at)}"]`)
+  if (box && element) {
+    box.scrollTop += element.getBoundingClientRect().top - box.getBoundingClientRect().top - LOCATE_MARGIN_PX
+    flashBlock(blockKey(at))
+  }
+}
 
 // --- following the shown document ------------------------------------------------------------
 
@@ -3436,7 +3486,6 @@ function closeOverBlocks() {
   blockMenu.value = null
   menuHandleKey.value = null
   menuAfter = null
-  skillMenu.value = null
   toolbar.value = null
   endDrag()
 }
@@ -4195,14 +4244,11 @@ watch(
               :last="toolbar.last"
               :bounds="toolbar.bounds"
               :coarse="coarse"
-              :translate="toolbar.translate"
-              :more="skills.some((skill) => skill.name !== 'translate')"
-              :more-open="skillMenu !== null"
+              :skills="toolbarSkills"
               @ask="onToolbarAction('ask')"
-              @translate="onToolbarAction('translate')"
               @quote="onToolbarAction('quote')"
               @copy="onToolbarAction('copy')"
-              @more="onToolbarMore"
+              @skill="onToolbarSkill"
             />
 
             <!-- Where a dragged block would land. -->
@@ -4321,15 +4367,6 @@ watch(
       :focus-first="blockMenu.fromKey"
       @select="onBlockMenuSelect"
       @close="onBlockMenuClose"
-    />
-    <UiContextMenu
-      v-if="skillMenu"
-      :at="skillMenu.at"
-      :items="skillMenu.items"
-      :label="t('viewer.toolbar.skills')"
-      :header="t('viewer.toolbar.skills')"
-      @select="onSkillSelect"
-      @close="skillMenu = null"
     />
   </UiModal>
 </template>

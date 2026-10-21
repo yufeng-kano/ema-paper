@@ -19,6 +19,7 @@ import { Superscript } from '@tiptap/extension-superscript'
 import { Table, TableCell, TableHeader, TableRow } from '@tiptap/extension-table'
 import { Placeholder } from '@tiptap/extensions'
 import StarterKit from '@tiptap/starter-kit'
+import { BLOCK_DRAG_TYPE } from './dnd'
 import { parseInline, type InlineSegment } from './markdown'
 import { renderTexHtml } from './math'
 import { inlineMathAtEnd, sliceToMarkdown } from './richdoc'
@@ -73,6 +74,9 @@ export interface RichOptions {
   links?: {
     state: (target: SectionLinkTarget) => SectionLinkState
     locate: (target: SectionLinkTarget) => void
+    /** Pasted or dropped markdown before it is read: block references to this document become
+     *  section links (docs/web.md § Notes, *Quotes and section links*). */
+    rewrite?: (markdown: string) => string
   }
 }
 
@@ -95,6 +99,13 @@ function typesetInto(dom: HTMLElement, latex: string, display: boolean): void {
  */
 const SourceAttributes = Extension.create({
   name: 'sourceAttributes',
+  // A drag of the viewer's blocks lands between blocks, where the editor draws its own line
+  // (`RichEditor`): the drop cursor, which marks a place in the text, is not drawn for it.
+  extendNodeSchema() {
+    return {
+      disableDropCursor: (_view: unknown, _pos: unknown, event: DragEvent) => [...(event.dataTransfer?.types ?? [])].includes(BLOCK_DRAG_TYPE),
+    }
+  },
   addGlobalAttributes() {
     return [
       {

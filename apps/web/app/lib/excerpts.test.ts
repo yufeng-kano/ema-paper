@@ -1,12 +1,14 @@
 import { describe, expect, it } from 'vitest'
 import {
   appendExcerpt,
+  droppedBlocksMarkdown,
   excerptMarkdown,
   excerptMarkers,
   excerptPassage,
   findPassage,
   linkResolves,
   matchExcerpts,
+  rewriteBlockLinks,
   sectionOf,
 } from './excerpts'
 import { documentOutline, parseResultMarkdown } from './markdown'
@@ -121,5 +123,47 @@ describe('matchExcerpts', () => {
     expect(sectionOf(outline, { page: 0, index: 0 })).toBeNull()
     expect(sectionOf(outline, { page: 0, index: 2 })?.slug).toBe('321-scaled-dot-product-attention')
     expect(sectionOf(outline, { page: 0, index: 4 })?.slug).toBe('4-results')
+  })
+})
+
+describe('block references in the notes', () => {
+  const address = (block: string) => `https://app.example/files?document=7&block=${block}`
+  const anchorOf = (href: string) => {
+    const url = new URL(href)
+    return url.searchParams.get('document') === '7' ? /[?&]block=([^&#]*)/.exec(url.search)?.[1] ?? null : null
+  }
+
+  it('rewrites a link to this document as a section link, the anchor escaped', () => {
+    const pasted = `See [“We suspect that…”](${address('321-scaled-dot-product-attention~We+suspect+that+for+large')}) and [other](https://app.example/files?document=8&block=x).`
+    expect(rewriteBlockLinks(pasted, anchorOf)).toBe(
+      'See [“We suspect that…”](#321-scaled-dot-product-attention~We%20suspect%20that%20for%20large) and [other](https://app.example/files?document=8&block=x).',
+    )
+    expect(rewriteBlockLinks(`[x](${address('a~Let+(x)+be')})`, anchorOf)).toBe('[x](#a~Let%20%28x%29%20be)')
+    expect(rewriteBlockLinks('[a plain link](https://example.com/page)', anchorOf)).toBe('[a plain link](https://example.com/page)')
+  })
+
+  it('resolves a block reference by its anchor, read back from its escapes', () => {
+    expect(linkResolves(pages, outline, { label: 'x', anchor: '321-scaled-dot-product-attention~We%20suspect%20that', passage: null })).toBe(true)
+    expect(linkResolves(pages, outline, { label: 'x', anchor: '~A+preface+before', passage: null })).toBe(true)
+    expect(linkResolves(pages, outline, { label: 'x', anchor: 'gone~Words+no+block+has', passage: null })).toBe(false)
+  })
+})
+
+describe('droppedBlocksMarkdown', () => {
+  it('keeps blocks and quotes, takes a figure as its caption and leaves page markers out', () => {
+    const dragged = [
+      '<!-- page: 2 -->',
+      '![fig1](sightread://p2/0,0,1,1)',
+      'Figure 1: The architecture.',
+      '',
+      '> A quoted line.',
+      '',
+      '![fig2](sightread://p2/0,0,1,1)',
+      '',
+      '- one',
+      '- two',
+    ].join('\n')
+    expect(droppedBlocksMarkdown(dragged)).toBe('Figure 1: The architecture.\n\n> A quoted line.\n\n- one\n- two')
+    expect(droppedBlocksMarkdown('<!-- page: 3 -->\n![fig3](sightread://p3/0,0,1,1)')).toBeNull()
   })
 })

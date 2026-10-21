@@ -207,7 +207,7 @@ onBeforeUnmount(() => {
 .ticks {
   display: flex;
   flex-direction: column;
-  align-items: flex-start;
+  align-items: center;
   width: 24px;
   padding: var(--space-1) 0;
   border: 0;
