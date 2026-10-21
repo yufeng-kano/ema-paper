@@ -138,6 +138,9 @@ class Target:
     prompt: str
     connection_id: int | None
     connection_base_url: str
+    # The fallback a blocked page goes to, only while the agent's switch is on
+    # (docs/agents.md § Enqueue rules); not part of the dedup key.
+    fallback_model: str | None = None
 
 
 async def resolve_target(
@@ -199,7 +202,8 @@ async def resolve_target(
         prompt = preset.text
     else:
         prompt = agent.default_prompt_template
-    return Target(agent.name, model, agent.bbox_format, prompt, connection_id, snapshot)
+    fallback = row.fallback_model if row is not None and row.auto_fallback else None
+    return Target(agent.name, model, agent.bbox_format, prompt, connection_id, snapshot, fallback)
 
 
 async def store_upload(
@@ -383,6 +387,7 @@ async def submit_parse(
         page_count=page_count,
         source_path=str(stored),
         retain_source=retain_source,
+        fallback_model=target.fallback_model,
     )
     if ticket is not None:
         upload_tickets.spend(ticket, job.id)

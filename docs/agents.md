@@ -28,8 +28,9 @@ The definition says nothing about *how* the agent calls a model. `parse` makes o
 - **Instructions** (`chat` only) — `instructions`: the reader's own markdown, appended after the prompt as a system block of its own; NULL for none ([chat.md](./chat.md) § Instructions). Unlike `prompt` it replaces nothing, so it is what the Agent page offers first; `prompt` is the advanced option.
 - **Languages** (`chat` only) — `answer_language` and `translate_language`: language tags, NULL to follow the reader's locale of each message ([chat.md](./chat.md) § Instructions).
 - **Memory** (`chat` only) — `memory_auto` (default on: the agent saves memories on its own) and `memory_paused` (default off: memories are neither read nor saved while on) ([chat.md](./chat.md) § Memory). The memories themselves are the user's, not an agent setting: the `memories` table.
+- **Fallback** (`parse` only) — `fallback_model`: an id from the same upstream's catalog, or NULL for none, and `auto_fallback` (default **off**): whether a page the job's model blocked is sent to the fallback on its own ([parsing.md](./parsing.md) § Fallback model). The fallback is also the model the retry dialog offers first ([web.md](./web.md) § Files), whatever the switch says. Changing the upstream clears it, as it clears the model.
 
-`parse` takes none of the `chat`-only settings (**400**). No row means every default. The rows are written by `PUT /api/agents/{agent}/settings` and read by `GET /api/agents` ([api.md](./api.md)). The `chat` agent runs on Kano Proxy only: a `connection_id` on its row is refused.
+`parse` takes none of the `chat`-only settings and `chat` neither fallback setting (**400**). No row means every default. The rows are written by `PUT /api/agents/{agent}/settings` and read by `GET /api/agents` ([api.md](./api.md)). The `chat` agent runs on Kano Proxy only: a `connection_id` on its row is refused.
 
 ## Jobs
 
@@ -43,3 +44,4 @@ Resolved at enqueue from the agent's settings, then snapshotted on the job like 
 2. No model in the request and none stored → **400** `No model chosen for the parse agent: pick one on the Agent page or pass 'model'`.
 3. Kano Proxy selected but no key stored → **400** `Kano Proxy is not connected: connect it on the Agent page or choose a provider connection for the parse agent`. Kano Proxy not configured on this deployment → **503** saying so.
 4. The prompt is the user's own prompt, else the selected legacy preset's text, else the agent's default template.
+5. The fallback model goes on the job (`jobs.fallback_model`) when `auto_fallback` is on and a fallback is set, and only then: a job queued with the switch off never changes model on its own, whatever the settings say by the time it runs.

@@ -13,9 +13,10 @@ import uuid
 from datetime import timedelta
 
 import pytest
+from sqlalchemy import select
 
 from sightread.agents import PARSE
-from sightread.db.models import Document, Job, User, utcnow
+from sightread.db.models import Document, Job, JobPage, User, utcnow
 from sightread.jobs.queue import (
     claim_next_job,
     count_running_jobs,
@@ -208,15 +209,21 @@ async def test_claim_honours_the_per_user_cap(sessionmaker) -> None:
         assert await claim_next_job(db, max_jobs_per_user=2) is not None
 
 
-async def test_requeue_forgets_partial_progress(sessionmaker) -> None:
+async def test_requeue_keeps_the_pages_that_succeeded(sessionmaker) -> None:
     async with sessionmaker() as db:
         user = await _user(db)
         job = await enqueue_job(
             db, user_id=user.id, sha256="5" * 64, source_path="unused-5.pdf", **JOB_DEFAULTS
         )
         job.status = "running"
-        job.pages_done = 1
+        job.pages_done = 2
         job.started_at = utcnow()
+        db.add_all(
+            [
+                JobPage(job_id=job.id, page_no=1, status="succeeded", markdown="# One"),
+                JobPage(job_id=job.id, page_no=2, status="failed", error="upstream call failed"),
+            ]
+        )
         await db.commit()
         job_id = job.id
 
@@ -224,7 +231,11 @@ async def test_requeue_forgets_partial_progress(sessionmaker) -> None:
         assert await requeue_job(db, job_id) is True
     async with sessionmaker() as db:
         requeued = await db.get(Job, job_id)
-        assert (requeued.status, requeued.pages_done, requeued.started_at) == ("queued", 0, None)
+        assert (requeued.status, requeued.pages_done, requeued.started_at) == ("queued", 1, None)
+        # The page the key paid for stays for the next attempt; the failed one is
+        # forgotten, to be sent again (docs/jobs.md § Queue).
+        kept = (await db.execute(select(JobPage.page_no).where(JobPage.job_id == job_id))).all()
+        assert kept == [(1,)]
         # A job whose result was committed before the shutdown's cancel landed is not
         # requeued, and the worker leaves its crops alone (docs/jobs.md § Retention).
         requeued.status = "succeeded"
@@ -461,7 +472,13 @@ async def test_a_stale_workers_writes_are_fenced_by_its_generation(sessionmaker,
         height_pt=1.0,
         method="vision",
         markdown="x",
-        usage=[Usage(prompt_tokens=1, completion_tokens=1, cost=None, cost_source="unknown")],
+        model=job.model,
+        usage=[
+            (
+                job.model,
+                Usage(prompt_tokens=1, completion_tokens=1, cost=None, cost_source="unknown"),
+            )
+        ],
     )
     settings = Settings(
         app_env="local",

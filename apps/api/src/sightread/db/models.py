@@ -231,6 +231,12 @@ class AgentSetting(Base):
     memory_paused: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default=text("false")
     )
+    # The parse agent's fallback: a model of the same upstream a blocked page is sent to,
+    # on its own only while `auto_fallback` is on (docs/parsing.md § Fallback model).
+    fallback_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    auto_fallback: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false")
+    )
 
     connection: Mapped[ProviderConnection | None] = relationship(
         foreign_keys=[connection_id], lazy="selectin"
@@ -292,6 +298,12 @@ class Job(Base):
     # The effective prompt template, verbatim; its hash is part of the dedup key.
     prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
     prompt_sha256: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # The fallback a blocked page goes to, snapshotted at enqueue while the agent's
+    # `auto_fallback` was on; NULL otherwise (docs/parsing.md § Fallback model).
+    fallback_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # The model a retry runs the remaining pages on; NULL is `model` (docs/jobs.md
+    # § Retrying failed pages). Neither is part of the dedup key.
+    retry_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     status: Mapped[str] = mapped_column(String(16))  # queued | running | succeeded | failed
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     page_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -329,6 +341,9 @@ class JobPage(Base):
     # The page's transcription, written as the page finishes — what a partial result reads
     # (docs/jobs.md § Progress). NULL on failed pages and rows predating the column.
     markdown: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The model that wrote the page, or failed it last; NULL on rows predating the column,
+    # which the job's own model wrote (docs/parsing.md § Fallback model).
+    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
 
 class Result(Base):

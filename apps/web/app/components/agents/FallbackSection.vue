@@ -1,0 +1,217 @@
+<script setup lang="ts">
+/**
+ * The parse agent's **Failed pages** (docs/web.md § Pages, docs/parsing.md § Fallback model):
+ * the model a page the run model blocked goes to, and the switch that sends it there on its
+ * own — off until the reader turns it on, and usable only once a fallback is chosen. The
+ * fallback is also the retry dialog's first choice.
+ *
+ * Both save at once, like every control on the panel.
+ */
+import {
+  putAgentSettings,
+  type AgentEntry,
+  type ConnectionModel,
+  type SavedAgentSettings,
+} from '~/lib/api'
+
+const props = defineProps<{
+  agent: AgentEntry
+  /** The panel's live catalog; null while it loads. */
+  models: ConnectionModel[] | null
+}>()
+
+const emit = defineEmits<{
+  /** Named for the agent the request was made for, like every control on the panel. */
+  saved: [agent: string, settings: SavedAgentSettings]
+}>()
+
+const { t } = useI18n()
+const { resolve } = useApiError()
+
+const labelId = useId()
+
+const fallback = computed(() => props.agent.settings.fallback_model ?? null)
+const modelPending = ref(false)
+/** The click being saved; the stored value otherwise. Put back when the save fails. */
+const autoChoice = ref<boolean | null>(null)
+/** Drawn off with no fallback, whatever is stored: there is nowhere to send a page. */
+const autoOn = computed(
+  () => fallback.value !== null && (autoChoice.value ?? props.agent.settings.auto_fallback ?? false),
+)
+const error = ref<string | null>(null)
+
+/** A stored fallback the catalog does not list is still the current choice. */
+const modelInjected = computed(() => {
+  const current = fallback.value
+  return current && !(props.models ?? []).some((model) => model.id === current) ? current : null
+})
+
+async function applyModel(value: string) {
+  const name = props.agent.name
+  modelPending.value = true
+  error.value = null
+  try {
+    emit('saved', name, await putAgentSettings(name, { fallback_model: value || null }))
+  } catch (failure) {
+    error.value = await resolve(failure)
+  } finally {
+    modelPending.value = false
+  }
+}
+
+async function toggleAuto() {
+  if (autoChoice.value !== null) {
+    return
+  }
+  const name = props.agent.name
+  const next = !autoOn.value
+  autoChoice.value = next
+  error.value = null
+  try {
+    emit('saved', name, await putAgentSettings(name, { auto_fallback: next }))
+  } catch (failure) {
+    error.value = await resolve(failure)
+  } finally {
+    autoChoice.value = null
+  }
+}
+</script>
+
+<template>
+  <section class="section" :aria-labelledby="labelId">
+    <h3 :id="labelId" class="section-label">{{ t('agents.fallback.label') }}</h3>
+    <div class="controls">
+      <UiField v-slot="{ id }" class="model" :label="t('agents.fallback.model')">
+        <UiSelect
+          :id="id"
+          :model-value="fallback ?? ''"
+          :disabled="modelPending || (!models && !fallback)"
+          @update:model-value="applyModel"
+        >
+          <option value="">{{ t('common.notSet') }}</option>
+          <option v-if="modelInjected" :value="modelInjected">{{ modelInjected }}</option>
+          <option v-for="model in models ?? []" :key="model.id" :value="model.id">
+            {{ model.name ? `${model.name} · ${model.id}` : model.id }}
+          </option>
+        </UiSelect>
+      </UiField>
+      <button
+        type="button"
+        role="switch"
+        class="switch"
+        :aria-checked="autoOn"
+        :aria-busy="autoChoice !== null || undefined"
+        :disabled="fallback === null"
+        @click="toggleAuto"
+      >
+        {{ t('agents.fallback.auto') }}
+        <span class="track" aria-hidden="true"><span class="knob" /></span>
+      </button>
+    </div>
+    <p class="note">{{ t('agents.fallback.note') }}</p>
+    <UiBanner v-if="error" tone="error">{{ error }}</UiBanner>
+  </section>
+</template>
+
+<style scoped>
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+/* The field label's treatment: a section of the panel, not a heading of the page. */
+.section-label {
+  margin: 0;
+  font-family: inherit;
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+/* The picker and its switch on one row, wrapping on a narrow window. */
+.controls {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.model {
+  flex: 1 1 14rem;
+  min-width: 0;
+}
+
+/* The memory section's switch: the words, then a square track whose knob says on or off. */
+.switch {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  height: var(--control-height-sm);
+  padding: 0 var(--space-1) 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--ink);
+  font-size: var(--text-sm);
+  cursor: pointer;
+  transition: background var(--duration-fast) var(--ease);
+}
+
+.switch:hover:not(:disabled) {
+  background: var(--rail);
+}
+
+/* Not disabled while it saves — a disabled button drops the keyboard's focus — only busy. */
+.switch[aria-busy='true'] {
+  cursor: progress;
+}
+
+.switch:disabled {
+  color: var(--faint);
+  cursor: not-allowed;
+}
+
+.track {
+  position: relative;
+  display: inline-block;
+  flex-shrink: 0;
+  width: 30px;
+  height: 18px;
+  border: 1px solid var(--muted);
+  border-radius: var(--radius);
+  background: var(--paper);
+  transition:
+    background var(--duration-fast) var(--ease),
+    border-color var(--duration-fast) var(--ease);
+}
+
+.knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+  background: var(--muted);
+}
+
+.switch[aria-checked='true'] .track {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+.switch[aria-checked='true'] .knob {
+  left: 14px;
+  background: var(--accent-fg);
+}
+
+.note {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+}
+</style>

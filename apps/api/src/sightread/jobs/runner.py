@@ -5,14 +5,16 @@ the user's key, work out the pages, then fan the pages out. Poppler work is boun
 worker-wide render semaphore; upstream calls are bounded by this job's own vision budget,
 which halves itself when the upstream says 429.
 
-Page failures are page-scoped by design: an unreadable page becomes an entry in `errors`
-and the rest of the document still parses. Only a document where no page survived, a dead
-key, or exhausted credits ends the whole job.
+A page fails on its own: the other pages still run to their end and are kept on their rows.
+But a document is every page or nothing — a job with a failed page fails whole, and its
+failed pages are retried alone later, the kept ones never transcribed again (docs/jobs.md
+§ Retrying failed pages). A dead key or exhausted credits end the job at once.
 """
 
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import shutil
 import threading
@@ -33,10 +35,11 @@ from ..errors import ApiError
 from ..parsing import poppler
 from ..parsing.figures import discard_job_figures, publish_job_figures, save_page_figures
 from ..parsing.images import ImageError, normalize_image
-from ..parsing.markdown import PageMarkdown, assemble
+from ..parsing.markdown import PLACEHOLDER_RE, PageMarkdown, assemble
 from ..upstream.client import (
     Connection,
     EmptyCompletion,
+    IncompleteCompletion,
     PageTranscription,
     PaymentRequired,
     RateLimited,
@@ -111,6 +114,10 @@ class VisionBudget:
 # The one conversion method (docs/parsing.md § Vision-only conversion).
 VISION = "vision"
 
+# The failure reason of a page its model blocked: the one a fallback model is tried on
+# (docs/parsing.md § Fallback model).
+BLOCKED = "blocked"
+
 
 @dataclass
 class PageOutcome:
@@ -120,7 +127,21 @@ class PageOutcome:
     method: str | None = None
     error: str | None = None
     markdown: str = ""
-    usage: list[Usage] = field(default_factory=list)
+    # The model whose answer the page holds, or that failed it last; None when no model
+    # saw the page (a render failure).
+    model: str | None = None
+    # Every call the page billed, with the model it went to.
+    usage: list[tuple[str, Usage]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class KeptPage:
+    """A page an earlier attempt of the job finished: kept, never transcribed again
+    (docs/jobs.md § Retrying failed pages)."""
+
+    markdown: str
+    method: str | None
+    model: str | None
 
 
 @dataclass
@@ -177,7 +198,10 @@ def partial_result_payload(job: Job, rows: list[JobPage]) -> dict:
     )
     return {
         "markdown": document.markdown,
-        "pages": [{"page": row.page_no, "method": row.method, "error": row.error} for row in rows],
+        "pages": [
+            {"page": row.page_no, "method": row.method, "model": row.model, "error": row.error}
+            for row in rows
+        ],
         "figures": document.figures,
         "errors": [{"page": row.page_no, "reason": row.error} for row in rows if row.error],
         "meta": {
@@ -234,8 +258,8 @@ async def _call_upstream(state: RunState, call):
     raise RateLimited()
 
 
-async def _guarded_call(state: RunState, outcome: PageOutcome, call):
-    """Apply the upstream failure policy of docs/parsing.md to one page.
+async def _guarded_call(state: RunState, outcome: PageOutcome, model: str, call):
+    """Apply the upstream failure policy of docs/parsing.md to one page's call to `model`.
 
     Returns the call's result, or None when the page failed — the failure is already
     recorded on the outcome. Failures that will repeat for every page abort the job.
@@ -255,6 +279,14 @@ async def _guarded_call(state: RunState, outcome: PageOutcome, call):
         # Empty through every attempt: the page has nothing on it, which is a result and
         # not a failure (docs/parsing.md § Upstream usage).
         result = PageTranscription(markdown="", usage=exc.usage)
+    except IncompleteCompletion as exc:
+        # The model stopped its own answer: an answered call, billed like one, and the
+        # page's failure at once (docs/parsing.md § Upstream usage).
+        logger.warning("job %s page %d %s: %s", state.job_id, outcome.page, exc.reason, model)
+        state.payment_failures = 0
+        outcome.usage.append((model, exc.usage))
+        outcome.error = exc.reason
+        return None
     except UpstreamError as exc:
         if exc.fatal:
             raise JobAborted("the upstream rejected the stored key") from None
@@ -264,8 +296,56 @@ async def _guarded_call(state: RunState, outcome: PageOutcome, call):
         return None
 
     state.payment_failures = 0
-    outcome.usage.append(result.usage)
+    outcome.usage.append((model, result.usage))
     return result
+
+
+async def _transcribe(
+    job: Job,
+    state: RunState,
+    connection: Connection,
+    outcome: PageOutcome,
+    image: Path,
+    page_no: int,
+) -> PageTranscription | None:
+    """The page's transcription, or None when it failed — the outcome says why. The run's
+    model first (a retry's, else the job's); a page it blocked goes once more to the
+    job's fallback, when it has one that is not that model (docs/parsing.md § Fallback
+    model). The outcome names the model that answered, or failed, last."""
+    first = job.retry_model or job.model
+    models = [first]
+    if job.fallback_model and job.fallback_model != first:
+        models.append(job.fallback_model)
+    transcription = None
+    for model in models:
+        outcome.error = None
+        outcome.model = model
+        convention = convention_for_job(model, job.pipeline_version)
+        # Pillow work, so it runs beside the in-flight HTTP calls rather than under them —
+        # and settled under a cancel, so no thread writes the work directory after the
+        # requeue has removed it. Prepared per model: each family is sent its own image.
+        sent = await _to_the_end(asyncio.to_thread(prepare_image, image, convention))
+        try:
+            transcription = await _guarded_call(
+                state,
+                outcome,
+                model,
+                functools.partial(
+                    transcribe_page,
+                    connection,
+                    model,
+                    job_prompt(job),
+                    sent.path,
+                    page_no,
+                    convention=convention,
+                    max_response_bytes=state.max_response_bytes,
+                ),
+            )
+        finally:
+            sent.cleanup()
+        if transcription is not None or outcome.error != BLOCKED:
+            break
+    return transcription
 
 
 async def _process_pdf_page(
@@ -294,36 +374,55 @@ async def _process_pdf_page(
         await _record_page(sessionmaker, job, outcome, state.generation)
         return outcome
 
-    convention = convention_for_job(job.model, job.pipeline_version)
-    # Pillow work, so it runs beside the in-flight HTTP calls rather than under them —
-    # and settled under a cancel, so no thread writes the work directory after the
-    # requeue has removed it.
-    sent = await _to_the_end(asyncio.to_thread(prepare_image, image, convention))
     try:
-        transcription = await _guarded_call(
-            state,
-            outcome,
-            lambda: transcribe_page(
-                connection,
-                job.model,
-                job_prompt(job),
-                sent.path,
-                page_no,
-                convention=convention,
-                max_response_bytes=state.max_response_bytes,
-            ),
-        )
+        transcription = await _transcribe(job, state, connection, outcome, image, page_no)
         if transcription is not None:
             outcome.markdown = transcription.markdown
         # Billing before the optional raster work: a SIGTERM landing mid-crop cancels this
-        # task, and the requeued reparse bills the page again — the call that already ran
-        # must be in `usage_log` first.
+        # task, and the calls that already ran must be in `usage_log` first.
         await _record_page(sessionmaker, job, outcome, state.generation)
         if transcription is not None:
             await _save_figures(state, outcome.markdown, image, page_no)
     finally:
         # The rendered page has served its purpose; nothing may outlive the call.
-        sent.cleanup()
+        image.unlink(missing_ok=True)
+    return outcome
+
+
+async def _restore_pdf_page(
+    job: Job,
+    state: RunState,
+    info: poppler.PdfInfo,
+    page_no: int,
+    kept: KeptPage,
+    source: Path,
+    work_dir: Path,
+    render_slots: asyncio.Semaphore,
+) -> PageOutcome:
+    """A page an earlier attempt finished: its stored transcription, and its crops made
+    again from it on a fresh render — no upstream call, and no render for a page without
+    figures. An attempt's crops are its own (docs/parsing.md § Figure crops); a render that
+    fails costs the page its crops, never the page."""
+    size = info.page_size(page_no)
+    outcome = PageOutcome(
+        page=page_no,
+        width_pt=size.width_pt,
+        height_pt=size.height_pt,
+        method=kept.method or VISION,
+        markdown=kept.markdown,
+        model=kept.model or job.model,
+    )
+    if state.figures_dir is None or not PLACEHOLDER_RE.search(kept.markdown):
+        return outcome
+    try:
+        async with render_slots:
+            image = await poppler.render_page(source, page_no, size, cwd=work_dir)
+    except poppler.PopplerError as exc:
+        logger.warning("job %s page %d render for its crops failed: %s", job.id, page_no, exc)
+        return outcome
+    try:
+        await _save_figures(state, outcome.markdown, image, page_no)
+    finally:
         image.unlink(missing_ok=True)
     return outcome
 
@@ -351,22 +450,8 @@ async def _process_image(
         height_pt=float(normalized.height_px),
         method=VISION,
     )
-    convention = convention_for_job(job.model, job.pipeline_version)
-    sent = await _to_the_end(asyncio.to_thread(prepare_image, normalized.path, convention))
     try:
-        transcription = await _guarded_call(
-            state,
-            outcome,
-            lambda: transcribe_page(
-                connection,
-                job.model,
-                job_prompt(job),
-                sent.path,
-                1,
-                convention=convention,
-                max_response_bytes=state.max_response_bytes,
-            ),
-        )
+        transcription = await _transcribe(job, state, connection, outcome, normalized.path, 1)
         if transcription is not None:
             outcome.markdown = transcription.markdown
         # Same ordering as the PDF path: the billed call is persisted before crop work.
@@ -374,7 +459,33 @@ async def _process_image(
         if transcription is not None:
             await _save_figures(state, outcome.markdown, normalized.path, 1)
     finally:
-        sent.cleanup()
+        normalized.path.unlink(missing_ok=True)
+    return outcome
+
+
+async def _restore_image(
+    job: Job, state: RunState, source: Path, work_dir: Path, kept: KeptPage
+) -> PageOutcome:
+    """The image's one page, finished by an earlier attempt: kept as `_restore_pdf_page`
+    keeps a PDF page, its size and its crops taken from the image again."""
+    outcome = PageOutcome(
+        page=1,
+        width_pt=0,
+        height_pt=0,
+        method=kept.method or VISION,
+        markdown=kept.markdown,
+        model=kept.model or job.model,
+    )
+    try:
+        normalized = normalize_image(source, work_dir)
+    except ImageError:
+        logger.warning("job %s image no longer decodes; its kept page has no crops", job.id)
+        return outcome
+    outcome.width_pt = float(normalized.width_px)
+    outcome.height_pt = float(normalized.height_px)
+    try:
+        await _save_figures(state, outcome.markdown, normalized.path, 1)
+    finally:
         normalized.path.unlink(missing_ok=True)
     return outcome
 
@@ -456,20 +567,22 @@ async def _record_page(
                     method=outcome.method,
                     status="failed" if outcome.error else "succeeded",
                     error=outcome.error,
-                    # What the partial result reads while the job runs (docs/jobs.md).
+                    # What the partial result reads while the job runs, and what a later
+                    # attempt keeps (docs/jobs.md § Progress); none on a failed page.
                     markdown=outcome.markdown if not outcome.error else None,
+                    model=outcome.model,
                 )
             )
         else:
             logger.warning(
                 "job %s is no longer this worker's; page %d is not recorded", job.id, outcome.page
             )
-        for usage in outcome.usage:
+        for model, usage in outcome.usage:
             db.add(
                 UsageLog(
                     user_id=job.user_id,
                     job_id=job.id,
-                    model=job.model,
+                    model=model,
                     prompt_tokens=usage.prompt_tokens,
                     completion_tokens=usage.completion_tokens,
                     cost=usage.cost,
@@ -798,6 +911,18 @@ async def run_job(
                 return
             job.connection_base_url = connection.snapshot
             await db.commit()
+        # What an earlier attempt finished — before a requeue, or before the failure a
+        # retry follows — is kept, never transcribed again (docs/jobs.md § Retrying
+        # failed pages). A row with markdown is a page that succeeded; a failed one has
+        # none, and the requeue or the retry removed those already.
+        kept = {
+            row.page_no: KeptPage(markdown=row.markdown, method=row.method, model=row.model)
+            for row in (
+                await db.execute(
+                    select(JobPage).where(JobPage.job_id == job_id, JobPage.markdown.is_not(None))
+                )
+            ).scalars()
+        }
 
     figures_root = Path(settings.figures_dir)
 
@@ -840,7 +965,7 @@ async def run_job(
     try:
         try:
             outcomes = await _process_job(
-                job, state, connection, source, work_dir, render_slots, sessionmaker
+                job, state, connection, source, work_dir, render_slots, sessionmaker, kept
             )
         except JobAborted as exc:
             await _finish(
@@ -878,28 +1003,27 @@ async def run_job(
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 
-        if all(outcome.error for outcome in outcomes):
-            # Partial markdown from a document nothing could read is worse than nothing,
-            # but the caller still deserves to know what killed each page.
-            reasons = "; ".join(f"page {o.page}: {o.error}" for o in outcomes[:5])
-            if len(outcomes) > 5:
+        failed = [outcome for outcome in outcomes if outcome.error]
+        if failed:
+            # Every page or nothing: a document with a page missing is no result
+            # (docs/parsing.md § Vision-only conversion). The pages that succeeded stay
+            # on their rows for a retry to keep, and the caller learns what killed each
+            # page that did not.
+            reasons = "; ".join(f"page {o.page}: {o.error}" for o in failed[:5])
+            if len(failed) > 5:
                 reasons += "; …"
             await _finish(
                 sessionmaker,
                 job_id,
                 status="failed",
-                error=f"no page could be parsed ({reasons})",
+                error=f"{len(failed)} of {len(outcomes)} pages failed ({reasons})",
                 settings=settings,
                 generation=generation,
             )
             return
 
         document = assemble(
-            [
-                PageMarkdown(page=outcome.page, markdown=outcome.markdown)
-                for outcome in outcomes
-                if not outcome.error
-            ]
+            [PageMarkdown(page=outcome.page, markdown=outcome.markdown) for outcome in outcomes]
         )
         if document.dropped_figures:
             # A count only: how badly the chosen model follows the coordinate contract is
@@ -938,16 +1062,15 @@ async def run_job(
                     "width_pt": round(outcome.width_pt, 2),
                     "height_pt": round(outcome.height_pt, 2),
                     "method": outcome.method,
-                    "error": outcome.error,
+                    "model": outcome.model,
+                    "error": None,
                 }
                 for outcome in outcomes
             ],
             "figures": document.figures,
-            "errors": [
-                {"page": outcome.page, "reason": outcome.error}
-                for outcome in outcomes
-                if outcome.error
-            ],
+            # Empty since a failed page fails the job; kept for the shape older results
+            # and their readers have (docs/api.md).
+            "errors": [],
             "meta": {
                 "job_id": str(job.id),
                 "agent": job.agent,
@@ -981,9 +1104,13 @@ async def _process_job(
     work_dir: Path,
     render_slots: asyncio.Semaphore,
     sessionmaker: async_sessionmaker[AsyncSession],
+    kept: dict[int, KeptPage],
 ) -> list[PageOutcome]:
-    """Fan the job's pages out; each page records itself the moment its billed call ran."""
+    """Fan the job's pages out; each page records itself the moment its billed call ran.
+    A page in `kept` is restored instead of transcribed."""
     if job.kind == "image":
+        if 1 in kept:
+            return [await _restore_image(job, state, source, work_dir, kept[1])]
         return [await _process_image(job, state, connection, source, work_dir, sessionmaker)]
 
     info = await poppler.pdf_info(source, cwd=work_dir)
@@ -992,6 +1119,11 @@ async def _process_job(
     outcomes: dict[int, PageOutcome] = {}
 
     async def process(page_no: int) -> None:
+        if page_no in kept:
+            outcomes[page_no] = await _restore_pdf_page(
+                job, state, info, page_no, kept[page_no], source, work_dir, render_slots
+            )
+            return
         outcomes[page_no] = await _process_pdf_page(
             job, state, connection, info, page_no, source, work_dir, render_slots, sessionmaker
         )

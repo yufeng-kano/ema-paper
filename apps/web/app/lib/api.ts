@@ -77,6 +77,10 @@ export interface AgentSettings {
   /** `chat` only: the memory switches (docs/chat.md § Memory). */
   memory_auto?: boolean
   memory_paused?: boolean
+  /** `parse` only: the model a blocked page goes to, and whether it goes there on its own
+   *  (docs/parsing.md § Fallback model). */
+  fallback_model?: string | null
+  auto_fallback?: boolean
 }
 
 /**
@@ -607,6 +611,9 @@ export interface ResultPage {
   width_pt?: number
   height_pt?: number
   method: 'vision' | null
+  /** The model that wrote the page — the fallback's or a retry's when it was not the job's.
+   *  Absent on results written before pages named it. */
+  model?: string | null
   error: string | null
 }
 
@@ -675,6 +682,20 @@ export interface LibraryDocument {
   error: string | null
   created_at: string
   finished_at: string | null
+  /** A failed parse's pages with no result — what a retry would send; null for any other
+   *  (docs/api.md). */
+  failed_pages: number | null
+}
+
+/** One page of a parse's selection, as the retry dialog lists it (docs/api.md). */
+export interface DocumentPage {
+  page: number
+  /** `pending`: never reached — still queued or running, or the job ended before it. */
+  status: 'succeeded' | 'failed' | 'pending'
+  /** Why it failed (docs/parsing.md § Vision-only conversion); null unless it did. */
+  reason: string | null
+  /** The model that wrote it, or failed it; null when it was never reached. */
+  model: string | null
 }
 
 /** A folder in the Trash: trashed itself, never one inside a trashed folder (docs/api.md). */
@@ -1065,6 +1086,16 @@ export function emptyTrash(): Promise<void> {
 
 export function getDocumentResult(id: number): Promise<JobResult> {
   return request('GET', `/api/library/documents/${id}/result`)
+}
+
+export function getDocumentPages(id: number): Promise<{ pages: DocumentPage[] }> {
+  return request('GET', `/api/library/documents/${id}/pages`)
+}
+
+/** A failed parse back on the queue for the pages it is missing, on `model` — null runs
+ *  them on the job's own (docs/jobs.md § Retrying failed pages). */
+export function retryDocument(id: number, model: string | null): Promise<{ job_id: string; status: JobStatus }> {
+  return request('POST', `/api/library/documents/${id}/retry`, { model })
 }
 
 // --- workspace: content, notes, revisions (docs/web.md § Editing) -------------------

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
 from pathlib import Path
 
@@ -15,11 +16,11 @@ import httpx
 import pytest
 import respx
 from httpx import AsyncClient
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from sightread.agents.parse import PIPELINE_VERSION
 from sightread.auth.crypto import encrypt_kano_proxy_key
-from sightread.db.models import Job, KanoProxyKey, UsageLog
+from sightread.db.models import Job, JobPage, KanoProxyKey, Result, UsageLog
 from sightread.jobs.queue import claim_next_job
 from sightread.jobs.runner import run_job
 from tests.conftest import CSRF_HEADERS, DATABASE_URL, KANO_CHAT_URL, TEST_SECRET_KEY
@@ -185,8 +186,16 @@ async def test_parse_an_image(api_client, sessionmaker, documents) -> None:
     result = (await api_client.get(f"/v1/jobs/{job_id}/result")).json()
     # Page space is the original pixel size, not the downscaled copy we sent upstream.
     assert result["pages"] == [
-        {"page": 1, "width_pt": 3000.0, "height_pt": 1000.0, "method": "vision", "error": None}
+        {
+            "page": 1,
+            "width_pt": 3000.0,
+            "height_pt": 1000.0,
+            "method": "vision",
+            "model": MODEL,
+            "error": None,
+        }
     ]
+    assert result["errors"] == []
     assert result["figures"][0]["page"] == 1
     assert "![fig1](sightread://p1/200,100,600,900)" in result["markdown"]
 
@@ -226,10 +235,10 @@ async def test_second_identical_upload_is_served_from_the_cache(
 
 
 @respx.mock
-async def test_a_page_that_cannot_be_transcribed_fails_alone(
+async def test_a_page_that_cannot_be_transcribed_fails_the_job(
     api_client, sessionmaker, documents
 ) -> None:
-    # A 400 is not retried, so the second response is the second page's.
+    # A 400 is not retried, so the second response is the other page's.
     responses = [httpx.Response(400), _completion(VISION_MARKDOWN)]
     respx.post(KANO_CHAT_URL).mock(side_effect=responses)
 
@@ -237,23 +246,38 @@ async def test_a_page_that_cannot_be_transcribed_fails_alone(
     job_id = accepted.json()["job_id"]
     await _drain_queue(api_client, sessionmaker)
 
-    result = (await api_client.get(f"/v1/jobs/{job_id}/result")).json()
-    reasons = {entry["page"]: entry["reason"] for entry in result["errors"]}
-    assert len(reasons) == 1
-    assert "upstream call failed" in reasons.values()
-    assert result["markdown"]
+    # Every page or nothing: no result, and the error names the page that failed and why.
+    status = (await api_client.get(f"/v1/jobs/{job_id}")).json()
+    assert status["status"] == "failed"
+    assert re.fullmatch(r"1 of 2 pages failed \(page [12]: upstream call failed\)", status["error"])
+    assert (await api_client.get(f"/v1/jobs/{job_id}/result")).status_code == 404
+    # The page that succeeded stays on its row, for a retry to keep; the other has none.
+    async with sessionmaker() as db:
+        rows = (
+            (await db.execute(select(JobPage).where(JobPage.job_id == uuid.UUID(job_id))))
+            .scalars()
+            .all()
+        )
+    assert sorted(row.markdown is not None for row in rows) == [False, True]
 
 
 @respx.mock
 async def test_a_degraded_result_is_never_served_from_the_cache(
     api_client, sessionmaker, documents
 ) -> None:
-    respx.post(KANO_CHAT_URL).mock(side_effect=[httpx.Response(400), _completion(VISION_MARKDOWN)])
-    await _upload(api_client, documents["mixed_pdf"], pages="1,2")
+    respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
+    first = await _upload(api_client, documents["mixed_pdf"], pages="1,2")
     await _drain_queue(api_client, sessionmaker)
+    # A result from before a failed page failed the job: served, with a page missing.
+    async with sessionmaker() as db:
+        await db.execute(
+            update(Result)
+            .where(Result.job_id == uuid.UUID(first.json()["job_id"]))
+            .values(errors=[{"page": 1, "reason": "upstream call failed"}])
+        )
+        await db.commit()
 
     # The same upload again: the stored result carries a failed page, so no cache hit.
-    respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
     retried = await _upload(api_client, documents["mixed_pdf"], pages="1,2")
     assert retried.status_code == 202
     await _drain_queue(api_client, sessionmaker)
@@ -279,7 +303,7 @@ async def test_a_wholly_failed_job_names_the_page_reasons(
 
     status = (await api_client.get(f"/v1/jobs/{job_id}")).json()
     assert status["status"] == "failed"
-    assert status["error"] == "no page could be parsed (page 1: upstream call failed)"
+    assert status["error"] == "1 of 1 pages failed (page 1: upstream call failed)"
 
 
 @respx.mock
@@ -401,7 +425,7 @@ async def test_a_failure_that_stays_transient_fails_the_page_after_the_last_atte
 
     status = (await api_client.get(f"/v1/jobs/{job_id}")).json()
     assert status["status"] == "failed"
-    assert status["error"] == "no page could be parsed (page 1: upstream call failed)"
+    assert status["error"] == "1 of 1 pages failed (page 1: upstream call failed)"
     assert respx.calls.call_count == 4
 
 

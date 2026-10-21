@@ -1003,3 +1003,90 @@ async def test_the_trash_migration_frees_trashed_names_and_refuses_to_downgrade_
     _alembic(scratch_url, "downgrade", MARKDOWN_DOCUMENTS)
     _alembic(scratch_url, "upgrade", "head")
     await engine.dispose()
+
+
+RETRY_FAILED_PAGES = "556f2408fba9"
+
+
+async def test_the_failed_pages_migration_keeps_every_row_and_falls_back_to_nothing(
+    scratch_url,
+) -> None:
+    """Existing settings take no fallback, and existing jobs and pages keep every value —
+    a page that succeeded keeps the markdown a retry reads. The downgrade drops only what
+    the upgrade added (docs/database.md § Rules)."""
+    _alembic(scratch_url, "upgrade", LIBRARY_TRASH)
+
+    engine = create_async_engine(scratch_url)
+    job_id = uuid.uuid4()
+    async with engine.begin() as db:
+        user_id = (
+            await db.execute(
+                text(
+                    "INSERT INTO users (google_sub, email, created_at) "
+                    "VALUES ('sub', 'f@example.com', now()) RETURNING id"
+                )
+            )
+        ).scalar_one()
+        await db.execute(
+            text("INSERT INTO agent_settings (user_id, agent, model) VALUES (:user, 'parse', 'm')"),
+            {"user": user_id},
+        )
+        await db.execute(
+            text(
+                "INSERT INTO jobs (id, user_id, agent, kind, filename, media_type, size_bytes, "
+                "sha256, pages_spec, model, pipeline_version, bbox_format, status, pages_done, "
+                "prompt_sha256, error, created_at) VALUES (:id, :user, 'parse', 'pdf', 'a.pdf', "
+                "'application/pdf', 1, 'h', '', 'm', 1, 'yxyx_norm1000', 'failed', 2, '', "
+                "'no page could be parsed', now())"
+            ),
+            {"id": job_id, "user": user_id},
+        )
+        await db.execute(
+            text(
+                "INSERT INTO job_pages (job_id, page_no, method, status, error, markdown) "
+                "VALUES (:job, 1, 'vision', 'succeeded', NULL, '# One'), "
+                "(:job, 2, 'vision', 'failed', 'upstream call failed', NULL)"
+            ),
+            {"job": job_id},
+        )
+
+    _alembic(scratch_url, "upgrade", RETRY_FAILED_PAGES)
+
+    async with engine.begin() as db:
+        setting = (
+            await db.execute(
+                text("SELECT model, fallback_model, auto_fallback FROM agent_settings")
+            )
+        ).one()
+        assert tuple(setting) == ("m", None, False)
+        job = (
+            await db.execute(text("SELECT status, error, fallback_model, retry_model FROM jobs"))
+        ).one()
+        assert tuple(job) == ("failed", "no page could be parsed", None, None)
+        pages = (
+            await db.execute(
+                text("SELECT page_no, status, markdown, model FROM job_pages ORDER BY page_no")
+            )
+        ).all()
+        assert [tuple(row) for row in pages] == [
+            (1, "succeeded", "# One", None),
+            (2, "failed", None, None),
+        ]
+
+    _alembic(scratch_url, "downgrade", LIBRARY_TRASH)
+    async with engine.connect() as db:
+        added = (
+            await db.execute(
+                text(
+                    "SELECT table_name || '.' || column_name FROM information_schema.columns "
+                    "WHERE (table_name = 'agent_settings' "
+                    "AND column_name IN ('fallback_model', 'auto_fallback')) "
+                    "OR (table_name = 'jobs' AND column_name IN ('fallback_model', 'retry_model')) "
+                    "OR (table_name = 'job_pages' AND column_name = 'model')"
+                )
+            )
+        ).all()
+        assert added == []
+        assert (await db.execute(text("SELECT count(*) FROM job_pages"))).scalar_one() == 2
+    _alembic(scratch_url, "upgrade", "head")
+    await engine.dispose()

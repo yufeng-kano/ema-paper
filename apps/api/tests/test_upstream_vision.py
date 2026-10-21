@@ -17,6 +17,7 @@ from sightread.auth.crypto import encrypt_connection_key, encrypt_kano_proxy_key
 from sightread.upstream.client import (
     Connection,
     EmptyCompletion,
+    IncompleteCompletion,
     PaymentRequired,
     RateLimited,
     UpstreamError,
@@ -222,14 +223,29 @@ async def test_an_ambiguous_empty_completion_carries_its_usage(key, documents, c
 
 
 @respx.mock
-async def test_a_completion_cut_short_is_never_read_as_blank(key, documents) -> None:
+@pytest.mark.parametrize(
+    ("finish_reason", "content", "reason"),
+    [
+        ("length", None, "cut off"),
+        ("length", "# Page\n\nthe first half", "cut off"),
+        ("content_filter", "", "blocked"),
+        ("content_filter", "a recited line", "blocked"),
+    ],
+)
+async def test_a_completion_the_model_stopped_fails_its_page_with_the_reason(
+    key, documents, finish_reason, content, reason
+) -> None:
+    """Never read as blank, nor as the page: whatever text came back is a part of it. Not
+    worth asking the same model again, and billed all the same (docs/parsing.md)."""
     body = completion("x")
-    body["choices"] = [{"message": {"content": None}, "finish_reason": "length"}]
+    body["choices"] = [{"message": {"content": content}, "finish_reason": finish_reason}]
     respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(200, json=body))
 
-    with pytest.raises(UpstreamError) as raised:
+    with pytest.raises(IncompleteCompletion) as raised:
         await transcribe_page(key, "m", PROMPT, documents["png"], 1)
-    assert not isinstance(raised.value, EmptyCompletion)
+    assert raised.value.reason == reason
+    assert not raised.value.transient and not raised.value.fatal
+    assert (raised.value.usage.prompt_tokens, raised.value.usage.completion_tokens) == (1200, 300)
 
 
 def test_user_key_never_reveals_itself_in_a_repr(key) -> None:
