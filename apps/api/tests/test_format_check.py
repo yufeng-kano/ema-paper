@@ -28,7 +28,7 @@ from tests.conftest import CSRF_HEADERS, KANO_BASE, KANO_CHAT_URL, TEST_SECRET_K
 from tests.test_chat import MESSAGES_URL, assistant_turn
 from tests.test_library import MODEL
 from tests.test_parse_end_to_end import KANO_KEY, _drain_queue
-from tests.test_retry_failed_pages import Upstream, _answer, _retry, _row, _upload
+from tests.test_retry_failed_pages import FALLBACK, Upstream, _answer, _retry, _row, _upload
 
 # Three pages a vision model might send back for a paper: a sentence the first page break
 # cuts before a capital, a bold run left open, and a word the second break hyphenates.
@@ -257,6 +257,21 @@ def test_two_tables_join_as_one_with_the_second_header_kept_as_a_row() -> None:
     assert joins.join_pages(pages, 2) is None
     assert pages[0].body == "| a | b |\n| --- | --- |\n| 1 | 2 |\n| a | b |\n| 3 | 4 |"
     assert pages[1].body == "After the table."
+
+
+def test_a_paragraph_joined_to_a_list_item_stays_in_the_item() -> None:
+    pages = [
+        joins.Page(1, "Steps:\n\n1. The method works by"),
+        joins.Page(2, "learning a policy\nthat maximizes\nreturn.\n\nAfter the list."),
+    ]
+    assert joins.join_pages(pages, 2) is None
+    # Its later lines indented, as the viewer reads a wrapped item: one item, no stray
+    # paragraph under the list.
+    assert pages[0].body == (
+        "Steps:\n\n1. The method works by learning a policy\n  that maximizes\n  return."
+    )
+    assert [kind for _, _, kind in joins.blocks(pages[0].body)] == ["paragraph", "list"]
+    assert pages[1].body == "After the list."
 
 
 @pytest.mark.parametrize(
@@ -546,6 +561,36 @@ async def test_a_retry_takes_the_check_settings_of_its_moment(
     assert (result.reading_markdown, "check" in result.meta) == (None, False)
     content = await library.get(f"/api/library/documents/{uploaded['id']}/content")
     assert content.json()["markdown"] == TRANSCRIPTION
+
+
+@respx.mock
+async def test_a_retry_checks_on_the_model_it_names_when_the_check_has_none(
+    library, sessionmaker, documents
+) -> None:
+    respx.post(KANO_CHAT_URL).mock(
+        side_effect=Upstream(
+            {
+                (MODEL, 1): lambda: _answer(PAGES[1]),
+                (MODEL, 2): lambda: _answer("", "content_filter"),
+                (MODEL, 3): lambda: _answer(PAGES[3]),
+                (FALLBACK, 2): lambda: _answer(PAGES[2]),
+            }
+        )
+    )
+    agent = respx.post(MESSAGES_URL).mock(side_effect=lambda request: _done())
+    uploaded = await _upload(library, documents["mixed_pdf"])
+    await _drain_queue(library, sessionmaker)
+    row = await _row(library, uploaded["id"])
+    assert row["error"] == "1 of 3 pages failed (page 2: blocked)"
+    assert not agent.called
+
+    # The page goes to another model, and the check, with no model of its own, follows it:
+    # the model that blocked the page is not sent its text again.
+    assert (await _retry(library, uploaded["id"], model=FALLBACK)).status_code == 202
+    assert (await _job(sessionmaker, uploaded["job_id"])).check_model == FALLBACK
+    await _drain_queue(library, sessionmaker)
+    assert (await _row(library, uploaded["id"]))["status"] == "succeeded"
+    assert [json.loads(call.request.content)["model"] for call in agent.calls] == [FALLBACK]
 
 
 async def test_the_check_takes_its_own_settings(library, sessionmaker, documents) -> None:

@@ -1887,8 +1887,9 @@ async def retry_document(
         await asyncio.to_thread(shutil.copyfile, original, copy)
         try:
             # The check as the settings say now: a check that failed may have failed on
-            # its model (docs/jobs.md § Retrying failed pages).
-            check = await resolve_check(db, settings, user.id, job.model)
+            # its model. One with no model of its own follows this run's parse model, the
+            # one the retry named (docs/jobs.md § Retrying failed pages).
+            check = await resolve_check(db, settings, user.id, model or job.model)
             await retry_job(db, job.id, source_path=str(copy), model=model, check=check)
             await events.notify(db, job.id)
         except BaseException:

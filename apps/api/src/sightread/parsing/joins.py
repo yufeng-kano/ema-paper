@@ -251,7 +251,8 @@ def _join(pages: list[Page], before: int, index: int) -> None:
     """Move the first block of `pages[index]` up to continue the last block of
     `pages[before]`: a table takes the second table's rows, its separator row dropped and
     its header kept as a row; anything else continues after a space, or after nothing when
-    the first part ends in a hyphen after a letter — the hyphen stays."""
+    the first part ends in a hyphen after a letter — the hyphen stays — and a list item
+    takes the continuation's later lines indented, as the viewer reads a wrapped item."""
     upper, lower = pages[before], pages[index]
     last_start, _, last_kind = blocks(upper.body)[-1]
     _, first_end, first_kind = blocks(lower.body)[0]
@@ -264,7 +265,12 @@ def _join(pages: list[Page], before: int, index: int) -> None:
         upper.body = upper.body + "\n" + "\n".join(rows)
     else:
         separator = "" if HYPHEN_END_RE.search(last) else " "
-        upper.body = upper.body + separator + first.lstrip()
+        rows = first.lstrip().split("\n")
+        if last_kind == "list":
+            # The viewer keeps only indented lines in an item: unindented, the rest of the
+            # continuation would be a paragraph of its own under the list.
+            rows[1:] = ["  " + row.lstrip() for row in rows[1:]]
+        upper.body = upper.body + separator + "\n".join(rows)
     lower.body = lower.body[first_end:].lstrip("\n")
 
 
