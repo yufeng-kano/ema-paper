@@ -871,12 +871,16 @@ function liveRow(item: Item): { parent: FolderId; name: string } | null {
   return document ? { parent: document.folder_id, name: document.name } : null
 }
 
-/** ⌘⌫ (Delete off Apple platforms): the selection to the Trash, at once, with Undo. */
-async function trashSelection() {
-  const items = selection.value
+/**
+ * `items` to the Trash, at once, with Undo: the selection on ⌘⌫ (Delete off Apple
+ * platforms), or what a drag carried to the Trash's tab — which a folder that sprang open on
+ * the way has taken out of the list, and so out of the selection.
+ */
+async function trashItems(items: Entry[]) {
   if (!items.length || busy.value) {
     return
   }
+  // -1 when the rows were left behind in another folder: the open one keeps its selection.
   const index = entryKeys.value.indexOf(items[0]!.key)
   const done: Item[] = []
   await run(async () => {
@@ -896,7 +900,9 @@ async function trashSelection() {
       openDocument.value = null
     }
     showNote(t('files.note.trashed', { n: done.length }, done.length), true)
-    await selectAt(index)
+    if (index !== -1) {
+      await selectAt(index)
+    }
   }
 }
 
@@ -1458,7 +1464,7 @@ function onKeydown(event: KeyboardEvent) {
   } else if (files && key('mod+d')) {
     act(duplicateSelection)
   } else if (files && (key('mod+backspace') || key('delete'))) {
-    act(trashSelection)
+    act(() => trashItems(selection.value))
   } else if (!files && key('mod+backspace')) {
     act(putBackSelection)
   } else if (!files && (apple ? key('alt+mod+backspace') : key('delete'))) {
@@ -1633,7 +1639,7 @@ function runMenu(action: string) {
     case 'duplicate':
       return duplicateSelection()
     case 'trash':
-      return trashSelection()
+      return trashItems(items)
     case 'upload':
       return pickFiles(currentFolder.value)
     case 'newDocument':
@@ -1901,8 +1907,7 @@ function onTrashTabDrop(event: DragEvent) {
   }
   event.preventDefault()
   endDrag()
-  selectKeys(items.map((item) => item.key))
-  void trashSelection()
+  void trashItems(items)
 }
 
 /** The list itself: where files from the desktop land, and rows a folder sprang open for. */
