@@ -514,6 +514,7 @@ export default {
       copyFailed: '無法複製',
       moved: '已搬移',
       imagesAdded: '已插入 {n} 張圖片',
+      blockAdded: '已加入區塊',
       deleted: '已刪除 {n} 個區塊',
       undo: '復原 ({keys})',
       alreadyInNotes: '筆記裡已有這段摘錄',
@@ -541,6 +542,12 @@ export default {
   },
   chat: {
     panel: 'Agent',
+    block: {
+      handle: '回答區塊：{name}',
+      menu: '回答區塊',
+      toNotes: '加入筆記',
+      copy: '複製',
+    },
     conversations: '對話',
     pick: '選擇對話',
     newConversation: '新對話',

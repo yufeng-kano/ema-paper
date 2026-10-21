@@ -527,6 +527,7 @@ export default {
       copyFailed: 'Couldn’t copy',
       moved: 'Moved',
       imagesAdded: 'Image inserted | {n} images inserted',
+      blockAdded: 'Block added',
       deleted: '{n} block deleted | {n} blocks deleted',
       undo: 'Undo ({keys})',
       alreadyInNotes: 'Already in notes',
@@ -554,6 +555,12 @@ export default {
   },
   chat: {
     panel: 'Agent',
+    block: {
+      handle: 'Answer block: {name}',
+      menu: 'Answer block',
+      toNotes: 'Add to notes',
+      copy: 'Copy',
+    },
     conversations: 'Conversations',
     pick: 'Choose a conversation',
     newConversation: 'New conversation',

@@ -38,9 +38,12 @@ import {
   type Conversation,
   type Memory,
 } from '~/lib/api'
+import { blockName, type NameText } from '~/lib/blocks'
 import { commandArguments, formatBytes, type AskOutcome, type AskRequest, type ComposerPayload } from '~/lib/composer'
 import { nodesToMarkdown } from '~/lib/copy'
+import { BLOCK_DRAG_TYPE } from '~/lib/dnd'
 import {
+  blockPlain,
   documentOutline,
   findHeading,
   inlinePlain,
@@ -87,6 +90,8 @@ const emit = defineEmits<{
   changed: []
   /** An answer's section link was clicked: scroll the document to that heading. */
   locate: [target: { label: string; anchor: string }]
+  /** An answer block's *Add to notes*: its markdown, for the end of the notes. */
+  'to-notes': [markdown: string]
 }>()
 
 const { t, locale } = useI18n()
@@ -940,6 +945,7 @@ function onThreadPointerDown() {
 }
 
 function onPointerUp() {
+  pressedBlock.value = null
   if (selecting) {
     selecting = false
     scheduleToolbar()
@@ -967,6 +973,97 @@ async function copySelection() {
     await navigator.clipboard.writeText(text)
   } catch {
     // Clipboard access can be denied; the passage is still selected for a manual copy.
+  }
+}
+
+// --- answer blocks: the handle, its drag and its menu ------------------------------------
+
+/** Answer blocks by `{item key}:{index}`: a handle is drawn only on the block under the
+ *  pointer, the one whose menu is open and the one being dragged (docs/web.md § The agent
+ *  panel, *An answer is blocks*). A pressed handle stays until the press ends: a drag starts
+ *  only once the pointer has moved, by then often off the block, and a handle gone by then
+ *  starts none. */
+const hoveredBlock = ref<string | null>(null)
+const pressedBlock = ref<string | null>(null)
+const draggedBlock = ref<string | null>(null)
+const blockMenu = ref<{ at: Point; key: string; block: ResultBlock; fromKey: boolean } | null>(null)
+const dragCard = ref<HTMLElement | null>(null)
+
+/** What a handle calls its block, as the document's handles do. */
+const nameText = computed<NameText>(() => ({
+  formula: t('viewer.names.formula'),
+  formulaTag: (tag) => t('viewer.names.formulaTag', { tag }),
+  quoted: (words) => t('viewer.names.quoted', { words }),
+  figure: (words) => t('viewer.names.figure', { name: t('viewer.names.quoted', { words }) }),
+  figureBare: t('viewer.names.figureBare'),
+  image: (words) => t('viewer.names.image', { name: t('viewer.names.quoted', { words }) }),
+  imageBare: t('viewer.names.imageBare'),
+}))
+
+function handleShown(key: string): boolean {
+  return (
+    hoveredBlock.value === key ||
+    pressedBlock.value === key ||
+    draggedBlock.value === key ||
+    blockMenu.value?.key === key
+  )
+}
+
+function leaveBlock(key: string) {
+  if (hoveredBlock.value === key) {
+    hoveredBlock.value = null
+  }
+}
+
+/** The drag is a copy: the document's block type with no run of the document's, and the
+ *  block's markdown as text — what the notes, the document and any text field land. */
+function onBlockDragStart(event: DragEvent, key: string, block: ResultBlock) {
+  const transfer = event.dataTransfer
+  if (!transfer) {
+    event.preventDefault()
+    return
+  }
+  draggedBlock.value = key
+  toolbar.value = null
+  transfer.effectAllowed = 'copy'
+  transfer.setData(BLOCK_DRAG_TYPE, '[]')
+  transfer.setData('text/plain', block.src)
+  const card = dragCard.value
+  const text = card?.querySelector('.drag-card-text')
+  if (card && text) {
+    text.textContent = blockPlain(block) || blockName(block, nameText.value)
+    transfer.setDragImage(card, 12, 14)
+  }
+}
+
+function openBlockMenu(event: MouseEvent, key: string, block: ResultBlock) {
+  if (blockMenu.value?.key === key) {
+    blockMenu.value = null
+    return
+  }
+  const handle = (event.currentTarget as HTMLElement).getBoundingClientRect()
+  blockMenu.value = { at: { x: handle.right + 4, y: handle.top }, key, block, fromKey: event.detail === 0 }
+}
+
+const blockMenuItems = computed<MenuItem[]>(() => [
+  { key: 'notes', label: t('chat.block.toNotes'), icon: 'notebook-pen' },
+  { key: 'copy', label: t('chat.block.copy'), icon: 'copy' },
+])
+
+async function onBlockMenuSelect(key: string) {
+  const block = blockMenu.value?.block
+  blockMenu.value = null
+  if (!block) {
+    return
+  }
+  if (key === 'notes') {
+    emit('to-notes', block.src)
+  } else if (key === 'copy') {
+    try {
+      await navigator.clipboard.writeText(block.src)
+    } catch {
+      // Clipboard access can be denied; the answer's own copy control is still there.
+    }
   }
 }
 
@@ -1093,6 +1190,22 @@ onBeforeUnmount(() => {
       @close="menu = null"
     />
 
+    <UiContextMenu
+      v-if="blockMenu"
+      :at="blockMenu.at"
+      :items="blockMenuItems"
+      :label="t('chat.block.menu')"
+      :focus-first="blockMenu.fromKey"
+      @select="onBlockMenuSelect"
+      @close="blockMenu = null"
+    />
+
+    <!-- An answer block's drag picture, written as the drag starts; never seen in place. -->
+    <div ref="dragCard" class="drag-card" aria-hidden="true">
+      <UiIcon name="grip-vertical" />
+      <span class="drag-card-text" />
+    </div>
+
     <div
       ref="scroller"
       class="thread"
@@ -1152,12 +1265,34 @@ onBeforeUnmount(() => {
 
         <!-- An answer: its section links are chips that scroll the document there. -->
         <div v-else-if="item.kind === 'text'" class="assistant md-message md-side">
-          <MdBlock
+          <div
             v-for="(block, index) in messageBlocks(item.text)"
             :key="index"
-            :block="block"
-            :cite="resolveCite"
-          />
+            class="answer-block"
+            @pointerenter="hoveredBlock = `${item.key}:${index}`"
+            @pointerleave="leaveBlock(`${item.key}:${index}`)"
+          >
+            <MdBlock :block="block" :cite="resolveCite" />
+            <!-- After the block, so a heading stays its wrapper's first child. -->
+            <div
+              v-if="block.kind !== 'comment' && handleShown(`${item.key}:${index}`)"
+              role="button"
+              class="answer-handle"
+              :class="{ on: blockMenu?.key === `${item.key}:${index}` }"
+              data-chrome
+              tabindex="-1"
+              draggable="true"
+              :aria-label="t('chat.block.handle', { name: blockName(block, nameText) })"
+              aria-haspopup="menu"
+              :aria-expanded="blockMenu?.key === `${item.key}:${index}` ? 'true' : 'false'"
+              @pointerdown.stop="pressedBlock = `${item.key}:${index}`"
+              @click.stop="openBlockMenu($event, `${item.key}:${index}`, block)"
+              @dragstart="onBlockDragStart($event, `${item.key}:${index}`, block)"
+              @dragend="draggedBlock = null; pressedBlock = null"
+            >
+              <UiIcon name="grip-vertical" />
+            </div>
+          </div>
         </div>
 
         <ChatMemoryLine
@@ -1526,6 +1661,90 @@ onBeforeUnmount(() => {
 .assistant :deep(.md-p),
 .assistant :deep(.md-list) {
   line-height: 1.6;
+}
+
+/* Each block of an answer, its handle placed against it in the thread's left gutter. */
+.answer-block {
+  position: relative;
+  min-width: 0;
+}
+
+/* Each block is its wrapper's first child, which markdown.css reads as the column's top: a
+   `##` past an answer's first block keeps the rule over it. */
+.answer-block + .answer-block :deep(.md-h2:not([data-level='1'])) {
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--line);
+}
+
+/* The document's handle (ResultViewer's .block-handle), narrowed to the 20px gutter. */
+.answer-handle {
+  position: absolute;
+  top: 0;
+  left: calc(-1 * var(--space-5));
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 24px;
+  border-radius: var(--radius);
+  color: var(--faint);
+  cursor: grab;
+  transition:
+    background var(--duration-fast) var(--ease),
+    color var(--duration-fast) var(--ease);
+}
+
+.answer-handle:hover {
+  background: var(--rail-active);
+}
+
+.answer-handle.on {
+  background: var(--rail-active);
+  color: var(--ink);
+}
+
+/* Beside a ruled `##`'s text, not on its rule. */
+.answer-block + .answer-block:has(> .md-h2:not([data-level='1'])) > .answer-handle {
+  top: calc(var(--space-4) + 1px);
+}
+
+.answer-handle > :deep(svg) {
+  width: 16px;
+  height: 16px;
+}
+
+/* The drag's picture, as the document's: off screen until the browser takes it. */
+.drag-card {
+  position: fixed;
+  top: -1000px;
+  left: -1000px;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  max-width: 280px;
+  padding: var(--space-1) var(--space-3) var(--space-1) var(--space-2);
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
+  background: var(--paper);
+  box-shadow: var(--shadow-menu);
+  color: var(--ink);
+  font-size: var(--text-sm);
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.drag-card > :deep(svg) {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  color: var(--faint);
+}
+
+.drag-card-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* The memory lines and the foot belong to the answer above them, not to the thread's rhythm:

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  appendBlocks,
   appendExcerpt,
   droppedBlocksMarkdown,
   excerptMarkdown,
@@ -188,5 +189,23 @@ describe('droppedBlocksMarkdown', () => {
       ].join('\n\n'),
     )
     expect(droppedBlocksMarkdown('<!-- page: 3 -->')).toBeNull()
+  })
+})
+
+describe('appendBlocks', () => {
+  it('puts the blocks after the last one, a blank line between, the trailing newline kept', () => {
+    const added = appendBlocks('# My notes\n\nThoughts.\n', 'An answer line.\n\n- one\n- two')
+    expect(added).toEqual({
+      notes: '# My notes\n\nThoughts.\n\nAn answer line.\n\n- one\n- two\n',
+      at: '# My notes\n\nThoughts.\n\n'.length,
+      count: 2,
+    })
+    expect(added!.notes.slice(added!.at)).toMatch(/^An answer line\./)
+  })
+
+  it('fills empty notes and adds nothing for nothing', () => {
+    expect(appendBlocks('', '$$x$$')).toEqual({ notes: '$$x$$', at: 0, count: 1 })
+    expect(appendBlocks('  \n', 'Text.')).toEqual({ notes: 'Text.  \n', at: 0, count: 1 })
+    expect(appendBlocks('Kept.', '<!-- page: 1 -->')).toBeNull()
   })
 })

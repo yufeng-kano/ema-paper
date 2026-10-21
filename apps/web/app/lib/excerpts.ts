@@ -88,6 +88,22 @@ export function droppedBlocksMarkdown(markdown: string): string | null {
   return dropped ? dropped : null
 }
 
+/**
+ * An answer's block put at the end of the notes (docs/web.md § The agent panel, *An answer is
+ * blocks*): taken as a drop takes it, after the last block with a blank line between, the
+ * notes' trailing whitespace kept after it. `at` is where it starts, `count` how many blocks
+ * it is. Null when nothing is left to add.
+ */
+export function appendBlocks(notes: string, markdown: string): { notes: string; at: number; count: number } | null {
+  const blocks = droppedBlocksMarkdown(markdown)
+  if (blocks === null) {
+    return null
+  }
+  const body = notes.replace(/\s+$/, '')
+  const lead = body ? `${body}\n\n` : ''
+  return { notes: `${lead}${blocks}${notes.slice(body.length)}`, at: lead.length, count: blocksOf(blocks).length }
+}
+
 /** A markdown link to an address, `[label](https://…)`: the label free of bare brackets as
  *  `CITE_AT` reads a section link's, the address free of spaces, its parentheses balanced one
  *  level deep (`…block=a~Let+(x)+be`), as a markdown link's destination may hold them. */
