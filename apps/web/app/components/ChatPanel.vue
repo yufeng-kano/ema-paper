@@ -1000,6 +1000,7 @@ const blockMenu = ref<{ at: Point; key: string; itemKey: string; index: number; 
 const dragCard = ref<HTMLElement | null>(null)
 let blockMenuClosedAt = 0
 let blockMenuClosedBy: EventTarget | null = null
+let blockMenuClosedKey: string | null = null
 
 /** What a handle calls its block, as the document's handles do. */
 const nameText = computed<NameText>(() => ({
@@ -1061,7 +1062,11 @@ function onThreadFocusIn(event: FocusEvent) {
   focusedBlock.value = event.target instanceof Element && event.target.matches(':focus-visible') ? answerBlockOf(event.target) : null
 }
 
+/** The window losing focus is not focus leaving: the handle stays to be given it back. */
 function onThreadFocusOut(event: FocusEvent) {
+  if (event.relatedTarget === null && (!document.hasFocus() || document.activeElement === event.target)) {
+    return
+  }
   if (answerBlockOf(event.relatedTarget) !== focusedBlock.value) {
     focusedBlock.value = null
   }
@@ -1102,14 +1107,17 @@ function blockOfMenu(): ResultBlock | null {
  *  close the menu, as a card does (`openCard`). */
 function openBlockMenu(event: MouseEvent | KeyboardEvent, itemKey: string, index: number) {
   const handle = event.currentTarget as HTMLElement
+  const key = `${itemKey}:${index}`
+  // The press that closed this block's own menu is not a press to open it again; one that
+  // closed another block's menu is.
   if (
     performance.now() - blockMenuClosedAt < REOPEN_GUARD_MS &&
+    blockMenuClosedKey === key &&
     blockMenuClosedBy instanceof Node &&
     handle.contains(blockMenuClosedBy)
   ) {
     return
   }
-  const key = `${itemKey}:${index}`
   if (blockMenu.value?.key === key) {
     closeBlockMenu()
     return
@@ -1126,14 +1134,16 @@ function openBlockMenu(event: MouseEvent | KeyboardEvent, itemKey: string, index
 }
 
 function closeBlockMenu(cause?: Event) {
-  // Opened from the keyboard, the menu gives focus back to its handle: the handle stays drawn
-  // to take it.
-  if (blockMenu.value?.fromKey) {
-    focusedBlock.value = blockMenu.value.key
+  const menu = blockMenu.value
+  // The menu gives focus back to its handle as it closes, and the handle stays drawn to take
+  // it — unless a press elsewhere closed it, which puts focus where it pressed.
+  if (menu && (menu.fromKey || !(cause instanceof PointerEvent))) {
+    focusedBlock.value = menu.key
   }
   blockMenu.value = null
   blockMenuClosedAt = performance.now()
   blockMenuClosedBy = cause?.target ?? null
+  blockMenuClosedKey = menu?.key ?? null
   void settleFollowing()
 }
 

@@ -2515,6 +2515,7 @@ function endDrag() {
   dragKeys.value = new Set()
   dropSaid = ''
   clearDropLine()
+  scheduleWaitingImages()
 }
 
 // --- the selection toolbar ------------------------------------------------------------------
@@ -3815,18 +3816,37 @@ function landStrayed(file: 'document' | 'notes', id: number, line: string, near:
     return true
   }
   waitingImages.push({ line, near })
-  if (!editing.value) {
-    landWaitingImages()
-  }
+  scheduleWaitingImages()
   return true
 }
 
 /** Strayed images on their way into the document, in the order they uploaded: landing one
- *  writes the document back, which would close the editor the reader is typing in, so they
- *  wait for no editor to be open. */
+ *  writes the document back, which would close the editor the reader is typing in, and moves
+ *  every block after it a place down, so they wait while anything holds blocks by place. */
 const waitingImages: { line: string; near: PlaceNear }[] = []
+let waitingTimer: ReturnType<typeof setTimeout> | undefined
+
+/** A task later, not in the tick that closed what held the blocks: the close's own work — a
+ *  menu opening on the blocks it read, a drop, focus given back to a block — runs first, on
+ *  the document as it was. */
+function scheduleWaitingImages() {
+  if (!waitingImages.length || waitingTimer !== undefined) {
+    return
+  }
+  waitingTimer = setTimeout(() => {
+    waitingTimer = undefined
+    if (!closed && !editing.value && !dragRun && !blockMenu.value && !toolbar.value) {
+      landWaitingImages()
+    }
+  }, 0)
+}
 
 function landWaitingImages() {
+  clearTimeout(waitingTimer)
+  waitingTimer = undefined
+  const before = placed.value
+  const active = document.activeElement
+  const focused = active instanceof HTMLElement && scroller.value?.contains(active) ? active.dataset.block : undefined
   let landed = 0
   for (const { line, near } of waitingImages.splice(0)) {
     const { target, place } = findPlace(markdown.value, near)
@@ -3834,16 +3854,20 @@ function landWaitingImages() {
       landed += 1
     }
   }
-  if (landed) {
-    showNote(t('viewer.note.imagesAdded', { n: landed }, landed), false)
+  if (!landed) {
+    return
+  }
+  showNote(t('viewer.note.imagesAdded', { n: landed }, landed), false)
+  // Blocks are drawn by place, so focus would stay on the place: it goes with its block.
+  const at = focused === undefined ? -1 : before.findIndex((entry) => blockKey(entry) === focused)
+  const moved = at < 0 ? null : (followBlocks(before, placed.value)[at] ?? null)
+  if (moved !== null) {
+    const key = blockKey(placed.value[moved]!)
+    void nextTick(() => focusBlock(key))
   }
 }
 
-watch(editing, (open) => {
-  if (!open && !closed && waitingImages.length) {
-    landWaitingImages()
-  }
-})
+watch([editing, blockMenu, toolbar], scheduleWaitingImages)
 
 /** What the editors insert images with: only on Files, where the document has an images route. */
 const editorImages = computed(() => {
