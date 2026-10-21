@@ -207,8 +207,9 @@ async def test_a_trashed_folder_goes_with_everything_in_it(writer) -> None:
     assert library["folders"] == [] and library["documents"] == []
     [folder] = library["trash"]["folders"]
     assert (folder["id"], folder["origin"], folder["items"]) == (papers["id"], [], 1)
+    # Its origin is where Put Back returns it: its folder is in the Trash too.
     [document] = library["trash"]["documents"]
-    assert (document["id"], document["origin"]) == (alone["id"], ["Papers"])
+    assert (document["id"], document["origin"]) == (alone["id"], [])
 
     # What is inside a trashed folder is the folder's: not addressable on its own, and
     # nothing is made in it.

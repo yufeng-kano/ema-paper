@@ -579,7 +579,8 @@ async def read_library(user: SessionUser, db: DbSession):
             items[cursor.id] = items.get(cursor.id, 0) + 1
 
     def origin(parent_id: int | None) -> list[str]:
-        return [row.name for row in workspace_documents.folder_chain(by_id, parent_id)]
+        place = nearest_live(by_id, parent_id)
+        return [row.name for row in workspace_documents.folder_chain(by_id, place)]
 
     def recent(row) -> float:
         return -row.trashed_at.timestamp()
