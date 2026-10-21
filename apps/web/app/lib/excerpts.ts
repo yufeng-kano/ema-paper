@@ -49,16 +49,16 @@ export function passageText(markdown: string): string {
 }
 
 /**
- * The passage as an excerpt holds it: every quote in it unwrapped, every figure given as its
- * caption and one without left out, so the excerpt stays one level and holds only text. Null
- * when nothing is left to quote — a passage that is only a captionless figure.
+ * The passage as an excerpt holds it: every quote in it unwrapped, every figure or image given
+ * as its caption and one without left out, so the excerpt stays one level and holds only text.
+ * Null when nothing is left to quote — a passage that is only a captionless figure.
  */
 export function excerptPassage(markdown: string): string | null {
   const parts: string[] = []
   const take = (block: ResultBlock) => {
     if (block.kind === 'quote') {
       block.blocks.forEach(take)
-    } else if (block.kind === 'fig') {
+    } else if (block.kind === 'fig' || block.kind === 'img') {
       if (block.caption) {
         parts.push(block.caption)
       }
@@ -73,17 +73,14 @@ export function excerptPassage(markdown: string): string | null {
 
 /**
  * Blocks dragged from the document, as the notes take them (docs/web.md § Notes, *A block
- * dragged into the notes lands as blocks*): a figure as its caption, a page marker not at
- * all, every other block — a quote included — as it was. Null when nothing is left.
+ * dragged into the notes lands as blocks*): every block as it was — a figure and an image
+ * whole, drawn in the notes as they are in the document, a quote included — and a page marker
+ * not at all. Null when nothing is left.
  */
 export function droppedBlocksMarkdown(markdown: string): string | null {
   const parts: string[] = []
   for (const block of blocksOf(markdown)) {
-    if (block.kind === 'fig') {
-      if (block.caption) {
-        parts.push(block.caption)
-      }
-    } else if (block.kind !== 'comment') {
+    if (block.kind !== 'comment') {
       parts.push(block.src)
     }
   }

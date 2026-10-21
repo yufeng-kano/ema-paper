@@ -14,7 +14,7 @@ from .parse import BBOX_FORMAT_YXYX
 
 # Bumped when the prompt or the tool contract changes what a conversation does. Chat has
 # no dedup cache; the number is bookkeeping for the registry (docs/agents.md).
-PIPELINE_VERSION = 8  # 8: markdown documents, which have no parse
+PIPELINE_VERSION = 9  # 8: markdown documents, which have no parse; 9: inserted images
 
 # Anthropic-defined tools carry no schema of their own (docs/chat.md § Tools). The order
 # is part of the cache prefix and never changes. The custom tools are strict: their schemas
@@ -236,11 +236,11 @@ DEFAULT_SYSTEM_PROMPT = """You are the document agent inside Sightread, working 
     doc.md                          the editable transcription (markdown)
     notes.md                        the user's notes on this document
     source.pdf                      the original upload, when it was kept (or source.<image ext>)
-    figures/                        figure crops, p<page>_<y1>_<x1>_<y2>_<x2>.png
+    figures/                        figure crops, p<page>_<y1>_<x1>_<y2>_<x2>.png, and images the user inserted, img-<hash>.png or .jpg
     .meta.json                      document id, job id, model, bbox format, page count
 /workspace/.sightread/results/<job_id>/result.md   the untouched parse output, read-only
 
-A markdown document (.meta.json kind markdown, job id null) was never parsed: doc.md is the user's own text, uploaded or written in Sightread, and it has no pages, no figures/, no source.* and no parse output. view_page has nothing to show for it.
+A markdown document (.meta.json kind markdown, job id null) was never parsed: doc.md is the user's own text, uploaded or written in Sightread, and it has no pages, no figure crops, no source.* and no parse output. view_page has nothing to show for it.
 
 Current document: {document_path}
 Pages: {page_count}   Bbox format: {bbox_format}   Parsed with: {parse_model}
@@ -250,6 +250,7 @@ Pages: {page_count}   Bbox format: {bbox_format}   Parsed with: {parse_model}
 doc.md keeps these shapes; never remove or reorder them unless asked:
 - `<!-- page: N -->` marks where page N starts.
 - A figure is `![figN](sightread://pPAGE/y1,x1,y2,x2)` with its caption on the next line. Coordinates are 0-1000 of page height and width.
+- An image the user inserted is `![name](figures/img-<16 hex digits>.png)` (or `.jpg`), with an optional caption on the next line, in doc.md or notes.md. Keep the line as it is and move it with its caption when you move the text around it; never write a new one, since only the user's upload makes the file it names. view_figure cannot open it.
 - Math is `$...$` inline and `$$...$$` on its own lines, KaTeX syntax.
 - Tables are GFM pipe tables. Code is fenced.
 - A quote is `> ` before each of its lines, one level deep: the user's view reads a `>` inside a quote as text.

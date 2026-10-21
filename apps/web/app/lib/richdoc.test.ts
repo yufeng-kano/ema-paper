@@ -42,6 +42,7 @@ describe('an unchanged document', () => {
     ['a code block', '```py\nprint(1)\n  indented\n```'],
     ['a contents page', '1.1 Intro . . . . 13\n1.2 More . . . . 15'],
     ['a figure with caption', '![fig1](sightread://p3/1,2,3,4)\nFigure 1: Learning curves.'],
+    ['an inserted image with caption', '![shot](figures/img-0123456789abcdef.png)\nThe login screen'],
     ['prices', 'It cost $5 and $6 in total.'],
     ['an author line with superscripts', '**THYAGATURU<sup>1</sup>, (Senior Member, IEEE)** <sup>1</sup>Intel, H<sub>2</sub>O'],
     ['several blocks', '# Title\n\nPara one.\n\n- a\n- b\n\n$$\nx\n$$'],

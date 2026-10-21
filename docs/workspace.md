@@ -6,6 +6,7 @@ Every user owns one directory on the server, `{WORKSPACES_DIR}/{user_id}/`. It i
 
 ```text
 {WORKSPACES_DIR}/.repos/{user_id}/     the user's git directory: outside the VM's mount
+{WORKSPACES_DIR}/.repos/{user_id}.images/{document_id}/   the images inserted into a document's doc.md or notes.md: outside the mount too
 {WORKSPACES_DIR}/{user_id}/            host side; the VM mounts it as /workspace
 ├── .sightread/
 │   └── results/{job_id}/result.md     the untouched parse output, written once, never edited
@@ -15,7 +16,7 @@ Every user owns one directory on the server, `{WORKSPACES_DIR}/{user_id}/`. It i
             ├── doc.md                 the editable transcription (a markdown document's own text)
             ├── notes.md               the user's notes, shown beside the document
             ├── source.pdf             the shell's copy of the original upload (or source.<image ext>); the original itself is outside the mount, see below; none for a markdown document
-            ├── figures/               p<page>_<y1>_<x1>_<y2>_<x2>.png, copied file by file from FIGURES_DIR (each missing one, on every materialization)
+            ├── figures/               p<page>_<y1>_<x1>_<y2>_<x2>.png, copied file by file from FIGURES_DIR, and img-<hash>.png|jpg, copied from the images directory (each missing one, on every materialization)
             └── .meta.json             document_id, job_id, model, bbox_format, page_count, kind (job_id and the parse fields null, kind markdown, for a markdown document)
 ```
 
@@ -33,6 +34,20 @@ A markdown document is a library entry with no parse behind it (`documents.job_i
 - **Its baseline is its original.** An uploaded `.md` is kept as the document's original, `{document_id}.md` in the sources directory beside the other originals, under the same rules (outside the mount, deleted with the row, counted against the quota, refused whole when the quota has no room). Materialization writes `doc.md` from it — decoded as UTF-8, a leading byte-order mark dropped and `\r\n` line ends made `\n` — where a parsed document's comes from its result. A document written new keeps no original and its baseline is empty. So a directory the shell removed comes back with the text the document started with, as a parsed one comes back with its parse.
 - **No parse artifacts.** No `.sightread/results/…`, no crops, and no `source.*` copy: the original is the document's own first text, already in `doc.md` and in history, and a second copy beside it would only drift. `.meta.json` keeps its shape — `document_id` first, so the reconciliation's lookup still matches — with `job_id`, `model`, `bbox_format` and `page_count` null and `kind` `markdown`. The content route reports `has_source` false: there are no pages to render.
 - **The upload is checked before it is filed.** The bytes stream to the upload directory under `CONTENT_MAX_BYTES`, the cap a `doc.md` is read under anyway (**413** past it), and must decode as UTF-8 (**400** otherwise); only then is the row inserted and the file kept, under the workspace lock, as a parse's upload is.
+
+
+### Inserted images
+
+An image the reader puts into a document — into `doc.md` or `notes.md`, from the editor's slash menu, a paste or a drop ([web.md](./web.md) § Editing, *Images*) — is a file of the document's, written as one line of markdown:
+
+```
+![diagram](figures/img-3f9a0c1d2e4b5a6c.png)
+An optional caption, on the next line
+```
+
+- **It is stored like an original.** `POST /api/library/images` ([api.md](./api.md)) decodes the upload, turns it upright and flattens it onto white, downscales it to `DOCUMENT_IMAGE_LONG_EDGE` (2400 px; PNG stays PNG, anything else becomes JPEG, as the composer's attachments are prepared, [chat.md](./chat.md)) and keeps it as `{WORKSPACES_DIR}/.repos/{user_id}.images/{document_id}/img-<hash>.<ext>` — the first 16 hex digits of the stored file's SHA-256, so the same picture inserted twice is one file. That directory is outside the mount, beside the originals and for the same reason: the document's text points at it, and no command can damage it. A copy goes into the document directory's `figures/`, the one directory beside `doc.md` that history already excludes and that no document may be called, so the shell sees what the text names; materialization copies each missing one again, as it does the crops. The image route serves the stored file, never the shell's copy.
+- **It goes with the document.** The images are deleted with the row (and swept with the originals when a delete died before its cleanup) and count against the quota. Nothing removes an image the text no longer names: a revert or an undo can bring the line back, and the line must still show its picture.
+- **Only these names are images.** The viewer reads a line as an image only when it names `figures/img-` and sixteen hex digits with `.png` or `.jpg`: never a URL, so a document — an agent's edit included — cannot make the reader's browser fetch anything from anywhere else.
 
 ## Revisions
 
@@ -67,7 +82,7 @@ Reconciliation stops at a document's directory: once a `.meta.json` is found, no
 
 ## Quota
 
-`WORKSPACE_QUOTA_BYTES` (default 10 GiB) is the size the Usage page shows the workspace against and the point past which the API refuses to materialize another document (**409**) and a chat turn fails before it starts — no shell runs in a full workspace. Hard enforcement is the operator's: mount `{WORKSPACES_DIR}` on a filesystem with per-directory quotas, or back each user directory with a fixed-size image ([sandbox.md](./sandbox.md) § Operations). Usage is measured by walking the tree plus the git directory and the originals beside it (through directory descriptors that follow nothing, like every other look at the tree, so a link the shell plants cannot send the walk into another user's files; one descriptor per level of depth, and no deeper than 512 levels — a tree nested past that cannot be measured, the Usage page and the quota answer **409** naming it, and deleting the document or folder that holds it, which removes a tree of any depth with a handful of descriptors by folding its deepest levels up as it goes, is the way out), which the status route lists as its own line.
+`WORKSPACE_QUOTA_BYTES` (default 10 GiB) is the size the Usage page shows the workspace against and the point past which the API refuses to materialize another document (**409**) and a chat turn fails before it starts — no shell runs in a full workspace. Hard enforcement is the operator's: mount `{WORKSPACES_DIR}` on a filesystem with per-directory quotas, or back each user directory with a fixed-size image ([sandbox.md](./sandbox.md) § Operations). Usage is measured by walking the tree plus the git directory, the originals and the inserted images beside it (through directory descriptors that follow nothing, like every other look at the tree, so a link the shell plants cannot send the walk into another user's files; one descriptor per level of depth, and no deeper than 512 levels — a tree nested past that cannot be measured, the Usage page and the quota answer **409** naming it, and deleting the document or folder that holds it, which removes a tree of any depth with a handful of descriptors by folding its deepest levels up as it goes, is the way out), which the status route lists as its own line.
 
 ## Backups
 

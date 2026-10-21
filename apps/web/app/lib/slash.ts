@@ -13,8 +13,9 @@ export interface SlashSkill {
   description: string
 }
 
-/** What a conversion row turns the empty paragraph into. */
-export type SlashConversion = BlockKindName | 'table'
+/** What a conversion row turns the empty paragraph into — an image, once one is picked and
+ *  uploaded, only where the editor can insert one. */
+export type SlashConversion = BlockKindName | 'table' | 'image'
 
 export interface SlashItem {
   key: SlashConversion
@@ -34,6 +35,7 @@ export const SLASH_CONVERSIONS: readonly SlashItem[] = [
   { key: 'formula', icon: 'sigma', markdown: '$$', keywords: ['formula', 'math', 'equation', 'latex', 'tex', '公式', '數學', '方程式'] },
   { key: 'code', icon: 'code', markdown: '```', keywords: ['code', 'codeblock', 'pre', '程式碼', '程式', '代碼'] },
   { key: 'table', icon: 'table', markdown: '', keywords: ['table', 'grid', '表格', '表'] },
+  { key: 'image', icon: 'image', markdown: '', keywords: ['image', 'picture', 'photo', 'img', '圖片', '圖像', '影像', '插圖', '照片'] },
 ]
 
 /** The slash a reader types: ASCII, or the full-width one an input method commits. */

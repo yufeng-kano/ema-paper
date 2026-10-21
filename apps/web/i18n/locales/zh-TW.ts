@@ -395,6 +395,9 @@ export default {
     findNext: '下一筆',
     findClose: '關閉搜尋',
     figurePending: '這張圖沒有已儲存的裁切圖',
+    imagePending: '無法載入這張圖片',
+    imageUploading: '正在上傳圖片…',
+    imageTooLarge: '圖片超過 {size}',
     parsing: '解析中 — 已完成 {done}/{total} 頁',
     parsingSimple: '解析中…',
     status: {
@@ -430,6 +433,7 @@ export default {
         table: '表格',
         code: '程式碼',
         fig: '圖',
+        img: '圖片',
         quote: '引用',
         toc: '目錄',
       },
@@ -467,6 +471,7 @@ export default {
       formula: '公式區塊',
       code: '程式碼',
       table: '表格',
+      image: '圖片',
     },
     names: {
       formula: '公式',
@@ -474,6 +479,8 @@ export default {
       quoted: '「{words}」',
       figure: '圖{name}',
       figureBare: '圖',
+      image: '圖片{name}',
+      imageBare: '圖片',
     },
     fold: {
       collapse: '收合這一節',
@@ -506,6 +513,7 @@ export default {
       linkCopied: '已複製連結',
       copyFailed: '無法複製',
       moved: '已搬移',
+      imagesAdded: '已插入 {n} 張圖片',
       deleted: '已刪除 {n} 個區塊',
       undo: '復原 ({keys})',
       alreadyInNotes: '筆記裡已有這段摘錄',

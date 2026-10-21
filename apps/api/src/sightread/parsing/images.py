@@ -59,13 +59,19 @@ def image_size(path: Path) -> tuple[int, int]:
 
 
 def normalize_image(
-    source: Path, out_dir: Path, *, max_long_edge: int = MAX_LONG_EDGE_PX, stem: str = "source"
+    source: Path,
+    out_dir: Path,
+    *,
+    max_long_edge: int = MAX_LONG_EDGE_PX,
+    stem: str = "source",
+    formats: tuple[str, ...] | None = None,
 ) -> NormalizedImage:
     """Write a model-ready copy of `source` into `out_dir` as `<stem>.png` or `.jpg`. A
     parse keeps the defaults; the chat composer's attachments ask for Claude's own long
-    edge and a name of their own (docs/chat.md § What a user message carries)."""
+    edge and a name of their own (docs/chat.md § What a user message carries). `formats`
+    limits the decoders Pillow may try, by its format names."""
     try:
-        with Image.open(source) as opened:
+        with Image.open(source, formats=formats) as opened:
             image = ImageOps.exif_transpose(opened) or opened
             width, height = image.width, image.height
             # PNG sources are usually screenshots and diagrams, where JPEG ringing costs

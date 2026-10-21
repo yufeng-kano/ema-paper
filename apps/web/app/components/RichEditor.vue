@@ -21,15 +21,21 @@
  * never leaves the text — the editor names its highlighted row as its active descendant. Its
  * rows turn the paragraph into another block, or — in the document's block editor, given
  * `skills` — run a skill on the editor's text, which the viewer sends.
+ *
+ * Given `images`, a picture goes in from the slash menu's *Image* row, a paste of image files,
+ * or — in the notes — image files dropped between blocks (docs/web.md § Editing, *Images*):
+ * each file is uploaded through the caller and lands as one block of its line. Given
+ * `figures`, a figure or an image is drawn as itself rather than as its source.
  */
 import { Editor } from '@tiptap/core'
 import { Slice, type Node as ProseNode } from '@tiptap/pm/model'
 import { NodeSelection, Selection, TextSelection, type Transaction } from '@tiptap/pm/state'
 import type { EditorView } from '@tiptap/pm/view'
-import { matchCommands } from '~/lib/composer'
-import { BLOCK_DRAG_TYPE, setDropEffect } from '~/lib/dnd'
+import { isImageFile, matchCommands } from '~/lib/composer'
+import { BLOCK_DRAG_TYPE, carriesFiles, claimDrag, droppedFiles, setDropEffect } from '~/lib/dnd'
 import { droppedBlocksMarkdown } from '~/lib/excerpts'
 import type { IconName } from '~/lib/icons'
+import type { PlaceNear } from '~/lib/markdown'
 import {
   richExtensions,
   washKey,
@@ -78,6 +84,22 @@ const props = withDefaults(
      *  editor: given that text, the slash line left out, the skills to list, or null while
      *  they load. Without it the menu has the conversions only. */
     skills?: (text: string) => SlashSkill[] | null
+    /** Figures and images drawn as themselves: their addresses. Read once, as the editor is
+     *  built. */
+    figures?: RichOptions['figures']
+    /** Images can be inserted: `upload` sends one file and answers its markdown line, or
+     *  null when it was refused (the caller says why); `accept` is the file picker's. */
+    images?: {
+      upload: (file: File) => Promise<string | null>
+      accept: string
+      /** An image whose editor closed before it uploaded: its line, and the place it was
+       *  to land by the blocks around it, for the owner to land it there. False when the
+       *  owner takes no more — the rest of the files are then not sent. */
+      strayed?: (line: string, near: PlaceNear) => boolean
+      /** The blocks around the editor's own text in its owner's file: the neighbours of a
+       *  slot with no block of the editor's beside it. */
+      outer?: PlaceNear | null
+    }
   }>(),
   {
     variant: 'block',
@@ -91,6 +113,8 @@ const props = withDefaults(
     onMerge: undefined,
     links: undefined,
     skills: undefined,
+    figures: undefined,
+    images: undefined,
   },
 )
 
@@ -249,7 +273,10 @@ type SlashRow = ConvertRow | SkillRow
 
 const slashConversions = computed<ConvertRow[]>(() =>
   slash.value
-    ? matchSlash(SLASH_CONVERSIONS, slash.value.query).map((item) => ({
+    ? matchSlash(
+        SLASH_CONVERSIONS.filter((item) => item.key !== 'image' || props.images),
+        slash.value.query,
+      ).map((item) => ({
         kind: 'convert',
         key: item.key,
         icon: item.icon,
@@ -478,6 +505,12 @@ function applySlash(row: SlashRow) {
   if (row.kind === 'skill') {
     editor.view.dispatch(editor.state.tr.delete(start, end))
     emit('run-skill', row.name, docToMarkdown(editor.getJSON()))
+    return
+  }
+  if (row.key === 'image') {
+    // The paragraph stays, emptied, until the picked file has uploaded and takes its place.
+    editor.view.dispatch(editor.state.tr.delete(start + 1, end - 1))
+    pickImage(start)
     return
   }
   const chain = editor.chain().deleteRange({ from: start + 1, to: end - 1 })
@@ -726,6 +759,144 @@ function pastedSlice(view: EditorView, text: string, plain: boolean): Slice {
     : Slice.maxOpen(doc.content)
 }
 
+// --- images --------------------------------------------------------------------------------------
+
+const imagePicker = ref<HTMLInputElement | null>(null)
+
+/** Where images land: a top-level position — replacing the empty paragraph there, for the
+ *  first — and, once the editor has closed under them, that place by the blocks around it. */
+interface ImageSlot {
+  pos: number
+  replace: boolean
+  near?: PlaceNear
+}
+
+/** Images on their way in, each slot mapped through every transaction until it has landed. */
+const landing = new Set<ImageSlot>()
+/** Where the file picker's files go, while it is open: a blur then is the picker taking
+ *  focus, not the reader leaving (docs/web.md § Editing, *Images*). */
+let picking: ImageSlot | null = null
+const uploading = ref(0)
+
+function pickImage(pos: number) {
+  picking = { pos, replace: true }
+  landing.add(picking)
+  imagePicker.value?.click()
+}
+
+function onImagesPicked() {
+  const input = imagePicker.value
+  const files = [...(input?.files ?? [])]
+  if (input) {
+    input.value = ''
+  }
+  const slot = picking
+  picking = null
+  editor?.commands.focus()
+  if (slot) {
+    landing.delete(slot)
+    void insertImages(files, slot)
+  }
+}
+
+function onImagePickCancelled() {
+  if (picking) {
+    landing.delete(picking)
+  }
+  picking = null
+  editor?.commands.focus()
+}
+
+/** Where an image pasted at the caret lands: in place of the empty top-level paragraph the
+ *  caret is in, otherwise after the top-level block it is in. */
+function imageSlotAtCaret(): ImageSlot | null {
+  if (!editor) {
+    return null
+  }
+  const { $from } = editor.state.selection
+  if ($from.depth === 0) {
+    return { pos: $from.pos, replace: false }
+  }
+  const top = $from.node(1)
+  return top.type.name === 'paragraph' && top.content.size === 0
+    ? { pos: $from.before(1), replace: true }
+    : { pos: $from.after(1), replace: false }
+}
+
+/** Each file uploaded in turn and inserted as its line's block, the next after it. */
+async function insertImages(files: File[], slot: ImageSlot) {
+  const upload = props.images?.upload
+  const strayed = props.images?.strayed
+  if (!upload) {
+    return
+  }
+  landing.add(slot)
+  try {
+    for (const file of files) {
+      uploading.value += 1
+      let line: string | null
+      try {
+        line = await upload(file)
+      } finally {
+        uploading.value -= 1
+      }
+      if (!line) {
+        continue
+      }
+      if (!editor) {
+        // The editor closed while the file uploaded: the owner lands it where it was to go,
+        // and the next one after it — unless the owner has closed too.
+        if (!slot.near || !strayed?.(line, slot.near)) {
+          return
+        }
+        slot.near = { after: line, before: slot.near.before }
+        continue
+      }
+      const { state } = editor
+      const node = state.schema.nodes.rawBlock!.create({ source: line })
+      const here = state.doc.nodeAt(slot.pos)
+      const tr =
+        slot.replace && here?.type.name === 'paragraph' && here.content.size === 0
+          ? state.tr.replaceWith(slot.pos, slot.pos + here.nodeSize, node)
+          : state.tr.insert(slot.pos, node)
+      slot.replace = false
+      editor.view.dispatch(tr.scrollIntoView())
+    }
+  } finally {
+    landing.delete(slot)
+  }
+}
+
+/** A place in the editor by the top-level blocks around it, empty paragraphs passed over: the
+ *  last before it, the first from it on, and how many come before it. */
+function placeIn(doc: ProseNode, pos: number): PlaceNear {
+  let after: string | null = null
+  let before: string | null = null
+  let gap = 0
+  doc.forEach((node, offset) => {
+    const markdown = docToMarkdown({ type: 'doc', content: [node.toJSON()] }).trim()
+    if (!markdown) {
+      return
+    }
+    if (offset < pos) {
+      after = markdown
+      gap += 1
+    } else if (before === null) {
+      before = markdown
+    }
+  })
+  return { after, before, gap }
+}
+
+function imagesOf(transfer: DataTransfer | null): File[] {
+  return [...(transfer?.files ?? [])].filter(isImageFile)
+}
+
+/** Image files dragged over the notes: theirs to land between blocks, as dragged blocks do. */
+function carriesImages(event: DragEvent): boolean {
+  return props.variant === 'notes' && Boolean(props.images) && carriesFiles(event.dataTransfer)
+}
+
 // --- blocks dropped from the document -----------------------------------------------------------
 
 /**
@@ -767,8 +938,12 @@ function blockDropAt(y: number): { pos: number; replace: boolean; edge: number }
 }
 
 function onBlockDragOver(event: DragEvent) {
-  if (!carriesBlocks(event) || !editor) {
+  const images = carriesImages(event)
+  if ((!carriesBlocks(event) && !images) || !editor) {
     return
+  }
+  if (images) {
+    claimDrag(event, 'image')
   }
   event.preventDefault()
   setDropEffect(event, 'copy')
@@ -792,12 +967,20 @@ function clearDropLine() {
  *  left out, read through the viewer's parser and inserted whole. A copy — the document keeps
  *  its block — saved like any notes edit. */
 function onBlockDrop(event: DragEvent) {
-  if (!carriesBlocks(event) || !editor) {
+  const images = carriesImages(event)
+  if ((!carriesBlocks(event) && !images) || !editor) {
     return
   }
   event.preventDefault()
   dropLine.value = null
   const at = blockDropAt(event.clientY)
+  if (images) {
+    const files = droppedFiles(event).filter(isImageFile)
+    if (at && files.length) {
+      void insertImages(files, { pos: at.pos, replace: at.replace })
+    }
+    return
+  }
   const markdown = droppedBlocksMarkdown(event.dataTransfer?.getData('text/plain') ?? '')
   if (!at || markdown === null) {
     return
@@ -820,6 +1003,7 @@ onMounted(() => {
       placeholder: props.placeholder,
       onEditMath: (target) => void openMath(target),
       links: props.links,
+      figures: props.figures,
     }),
     content: markdownToDoc(props.source, inlineOptions),
     editable: props.editable,
@@ -845,6 +1029,14 @@ onMounted(() => {
       // what is pasted.
       handlePaste: (view, event) => {
         const text = event.clipboardData?.getData('text/plain') ?? ''
+        // Image files with no text: a screenshot. Beside text — a spreadsheet's or a word
+        // processor's picture of what it copied — the text is what was meant.
+        const images = props.images ? imagesOf(event.clipboardData) : []
+        const slot = images.length && !text ? imageSlotAtCaret() : null
+        if (slot) {
+          void insertImages(images, slot)
+          return true
+        }
         if (!event.clipboardData?.getData('text/html') || !props.links?.rewrite || props.links.rewrite(text) === text) {
           return false
         }
@@ -853,9 +1045,14 @@ onMounted(() => {
       },
       // A drag of the viewer's blocks is the root's to land (`onBlockDrop`), never text dropped
       // into the line under the pointer.
-      handleDrop: (_view, event) => carriesBlocks(event),
+      handleDrop: (_view, event) => carriesBlocks(event) || carriesImages(event),
     },
-    onTransaction: ({ transaction }) => syncSlash(transaction),
+    onTransaction: ({ transaction }) => {
+      for (const slot of landing) {
+        slot.pos = transaction.mapping.map(slot.pos)
+      }
+      syncSlash(transaction)
+    },
     onUpdate: ({ editor: current, transaction }) => {
       if (!transaction.docChanged) {
         return
@@ -874,8 +1071,9 @@ onMounted(() => {
       }
     },
     onBlur: ({ event }) => {
-      // Into the TeX field — or onto the slash menu — is still inside the editor.
-      if (closing || root.value?.contains(event.relatedTarget as Node | null)) {
+      // Into the TeX field — or onto the slash menu — is still inside the editor, and the file
+      // picker taking focus is the reader choosing an image for it.
+      if (closing || picking || root.value?.contains(event.relatedTarget as Node | null)) {
         return
       }
       if (slash.value) {
@@ -902,7 +1100,39 @@ watch(
     emitted = null
     trailing = /\n\s*$/.exec(source)?.[0] ?? ''
     closeSlash()
+    // Images still uploading keep their place by the blocks around it: the whole text is
+    // replaced, which maps every position to its end (docs/web.md § Editing, *Images*).
+    const places = [...landing].map((slot) => ({ slot, near: placeIn(editor!.state.doc, slot.pos) }))
     editor.chain().setMeta('addToHistory', false).setContent(markdownToDoc(source, inlineOptions), { emitUpdate: false }).run()
+    const { doc } = editor.state
+    const blocks: { markdown: string; from: number; to: number }[] = []
+    doc.forEach((node, offset) => {
+      const markdown = docToMarkdown({ type: 'doc', content: [node.toJSON()] }).trim()
+      if (markdown) {
+        blocks.push({ markdown, from: offset, to: offset + node.nodeSize })
+      }
+    })
+    for (const { slot, near } of places) {
+      // The nearest block alike, as `findPlace` finds it in a file: after the one it
+      // followed, else before the one it preceded, else at the end.
+      const nearest = (src: string | null, offset: number) => {
+        let best = -1
+        let bestDistance = Infinity
+        for (const [index, block] of blocks.entries()) {
+          const distance = Math.abs(index + offset - (near.gap ?? 0))
+          if (src !== null && block.markdown === src && distance < bestDistance) {
+            best = index
+            bestDistance = distance
+          }
+        }
+        return best
+      }
+      const after = nearest(near.after, 1)
+      const before = after === -1 ? nearest(near.before, 0) : -1
+      slot.pos = after !== -1 ? blocks[after]!.to : before !== -1 ? blocks[before]!.from : doc.content.size
+      // The empty paragraph it was to replace is gone with the old text.
+      slot.replace = false
+    }
   },
 )
 
@@ -957,6 +1187,17 @@ function wash(first: number, count: number) {
 
 onBeforeUnmount(() => {
   closing = true
+  // Images still uploading: each place by the blocks around it, while the editor can still
+  // say, empty paragraphs passed over — past the editor's own text, the blocks around the
+  // editor (`images.strayed`, `images.outer`).
+  if (editor) {
+    const { doc } = editor.state
+    const outer = props.images?.outer ?? null
+    for (const slot of landing) {
+      const { after, before, gap } = placeIn(doc, slot.pos)
+      slot.near = { after: after ?? outer?.after ?? null, before: before ?? outer?.before ?? null, gap: (outer?.gap ?? 0) + (gap ?? 0) }
+    }
+  }
   clearTimeout(washTimer)
   window.removeEventListener('dragend', clearDropLine)
   editor?.view.dom.removeEventListener('compositionend', onCompositionEnd)
@@ -1012,6 +1253,19 @@ defineExpose({
     @drop="onBlockDrop"
   >
     <div ref="mount" />
+    <input
+      v-if="images"
+      ref="imagePicker"
+      class="image-picker"
+      type="file"
+      multiple
+      :accept="images.accept"
+      tabindex="-1"
+      aria-hidden="true"
+      @change="onImagesPicked"
+      @cancel="onImagePickCancelled"
+    >
+    <p v-if="uploading" class="image-status" role="status">{{ t('viewer.imageUploading') }}</p>
     <!-- Where blocks dragged from the document would land: on a block's edge. -->
     <div
       v-if="dropLine"
@@ -1215,6 +1469,54 @@ defineExpose({
 }
 
 .rich :deep(.rich-raw) {
+  color: var(--faint);
+}
+
+/* A figure or an image in the editor, drawn as `MdBlock` draws one (its styles are scoped
+   there): centered, the picture at the column's width and never more, the caption faint. */
+.rich :deep(.rich-figure) {
+  margin: 0;
+  text-align: center;
+}
+
+.rich :deep(.rich-figure .figure-image) {
+  display: block;
+  margin-inline: auto;
+  max-width: 100%;
+  border: 1px solid var(--line-soft);
+  background: var(--paper);
+}
+
+.rich :deep(.rich-figure .figure-frame) {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 120px;
+  border: 1px dashed var(--edge);
+  background: var(--rail);
+  color: var(--faint);
+  font-size: var(--text-xs);
+}
+
+.rich :deep(.rich-figure .figure-caption) {
+  margin-top: var(--space-2);
+  font-size: var(--text-xs);
+  line-height: 1.6;
+  color: var(--faint);
+}
+
+/* Selected as one atom: the surface a selected formula gets. */
+.rich :deep(.rich-figure.ProseMirror-selectednode) {
+  background: var(--rail-active);
+}
+
+.image-picker {
+  display: none;
+}
+
+.image-status {
+  margin: var(--space-2) 0 0;
+  font-size: var(--text-xs);
   color: var(--faint);
 }
 

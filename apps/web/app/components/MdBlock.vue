@@ -12,7 +12,8 @@
  * dashed placeholder (no figure route, or a crop that already failed), and a load failure
  * is reported back so the caller can remember it per snapshot. A figure is addressed by its
  * own page — the one its placeholder names — whatever page the block now sits in, since a
- * move can carry it across a page marker.
+ * move can carry it across a page marker. An image the reader inserted is drawn the same way,
+ * its address the caller's too (the document's images route), and copies back as its line.
  *
  * A quote draws its inner blocks through this same component, one level deep: what the
  * parser reads inside a quote never holds another quote or a figure.
@@ -21,7 +22,7 @@
  * are read and drawn as chips — those whose heading it says the document still has
  * (docs/web.md § The agent panel, *Section links*).
  */
-import type { Bbox, CiteResolver, ResultBlock } from '~/lib/markdown'
+import type { CiteResolver, ResultBlock } from '~/lib/markdown'
 
 const props = defineProps<{
   block: ResultBlock
@@ -29,7 +30,7 @@ const props = defineProps<{
   cite?: CiteResolver
 }>()
 
-const emit = defineEmits<{ 'figure-error': [page: number, bbox: Bbox] }>()
+const emit = defineEmits<{ 'figure-error': [] }>()
 
 const { t } = useI18n()
 
@@ -123,7 +124,7 @@ const figureSource = computed(() => {
       :src="figureUrl"
       :alt="block.caption || block.id"
       loading="lazy"
-      @error="emit('figure-error', block.page, block.bbox)"
+      @error="emit('figure-error')"
     >
     <div v-else class="figure-frame">
       <UiIcon name="scan-text" />
@@ -131,6 +132,25 @@ const figureSource = computed(() => {
     </div>
     <!-- Only the caption the page carried: the generated `figN` name and the bbox are how
          a crop is addressed, not something a reader was asked to read. -->
+    <figcaption v-if="block.caption" class="figure-caption">
+      <MdInline :text="block.caption" :cite="cite" />
+    </figcaption>
+  </figure>
+
+  <!-- An inserted image: the reader's own picture, its line what a copy hands back. -->
+  <figure v-else-if="block.kind === 'img'" class="md-figure" :data-md="block.src">
+    <img
+      v-if="figureUrl"
+      class="figure-image"
+      :src="figureUrl"
+      :alt="block.caption || block.alt"
+      loading="lazy"
+      @error="emit('figure-error')"
+    >
+    <div v-else class="figure-frame">
+      <UiIcon name="image" />
+      <span>{{ t('viewer.imagePending') }}</span>
+    </div>
     <figcaption v-if="block.caption" class="figure-caption">
       <MdInline :text="block.caption" :cite="cite" />
     </figcaption>

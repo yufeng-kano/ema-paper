@@ -9,6 +9,7 @@ import {
   listSkills,
   putDocumentContent,
   putDocumentNotes,
+  uploadDocumentImage,
   type JobResult,
   type Skill,
 } from '~/lib/api'
@@ -31,9 +32,9 @@ import {
   type NameText,
   type UndoFile,
 } from '~/lib/blocks'
-import type { AskRequest } from '~/lib/composer'
+import { formatBytes, isImageFile, type AskRequest } from '~/lib/composer'
 import { cellGroupsToMarkdown, nodesToMarkdown, selectionText, type OrphanListContext } from '~/lib/copy'
-import { BLOCK_DRAG_TYPE, claimDrag, dragClaim, setDropEffect } from '~/lib/dnd'
+import { BLOCK_DRAG_TYPE, carriesFiles, claimDrag, dragClaim, droppedFiles, setDropEffect } from '~/lib/dnd'
 import {
   appendExcerpt,
   excerptMarkdown,
@@ -55,21 +56,25 @@ import {
   decodeBlockAnchor,
   documentOutline,
   findHeading,
+  findPlace,
+  imageLine,
+  insertBlocks,
   moveBlocks,
   parseResultMarkdown,
+  placeNear,
   placedBlocks,
   replaceBlockSource,
   resolveAnchor,
   sectionSource,
   serializeDocument,
-  type Bbox,
   type BlockAt,
   type OutlineEntry,
+  type PlaceNear,
   type PlacedBlock,
   type ResultBlock,
 } from '~/lib/markdown'
 import type { MenuFact, MenuItem, Point } from '~/lib/menu'
-import type { Caret, LeaveReason, SectionLinkState, SectionLinkTarget, TextPoint } from '~/lib/rich-extensions'
+import type { Caret, LeaveReason, RichOptions, SectionLinkState, SectionLinkTarget, TextPoint } from '~/lib/rich-extensions'
 import { blockIndexAt, blockKindName, captionLine, convertBlock, type BlockKindName } from '~/lib/richdoc'
 import { SLASH_CONVERSIONS, skillIcon, type SlashSkill } from '~/lib/slash'
 
@@ -257,6 +262,9 @@ const props = withDefaults(
     errorMessage?: string | null
     /** Where this caller's figure crops live (`…/figures`); null hides images entirely. */
     figureBase?: string | null
+    /** Where the document's inserted images live (`…/images`), on Files: what lets a picture
+     *  be drawn and inserted (docs/web.md § Editing, *Images*). */
+    imageBase?: string | null
     /** The library document, when there is one: what makes the viewer editable. */
     documentId?: number | null
     /** History's job, when there is no document: whose collapsed sections are remembered. */
@@ -271,6 +279,7 @@ const props = withDefaults(
     error: null,
     errorMessage: null,
     figureBase: null,
+    imageBase: null,
     documentId: null,
     jobId: null,
     initialBlock: null,
@@ -766,7 +775,7 @@ const openBlock = computed(() => {
   return open ? pages.value[open.page]?.blocks[open.index] : undefined
 })
 
-/** The first line of a figure block: its placeholder, which the caption editor keeps. */
+/** The first line of a figure or image block: its placeholder, which the caption editor keeps. */
 function figurePlaceholder(block: ResultBlock): string {
   return block.src.split('\n')[0] ?? ''
 }
@@ -788,7 +797,7 @@ async function startEdit(pageIndex: number, blockIndex: number, caret: Caret = '
   span.value = count
   joined.value = false
   draft.value = openBlockSource() ?? block.src
-  editorSource.value = block.kind === 'fig' ? (block.caption ?? '') : draft.value
+  editorSource.value = block.kind === 'fig' || block.kind === 'img' ? (block.caption ?? '') : draft.value
   editorCaret.value = caret
   editorKey.value += 1
   if (block.kind === 'toc') {
@@ -1030,10 +1039,10 @@ function unitsBefore(slot: Element, node: Node, offset: number): number {
 }
 
 /** The open editor's markdown, saved on the debounce while the block stays open. A caption
- *  is one line under the figure's placeholder. */
+ *  is one line under the figure's or the image's placeholder. */
 function onEditorChange(markdown: string) {
   const block = openBlock.value
-  if (block?.kind === 'fig') {
+  if (block?.kind === 'fig' || block?.kind === 'img') {
     const caption = captionLine(markdown)
     draft.value = caption ? `${figurePlaceholder(block)}\n${caption}` : figurePlaceholder(block)
   } else {
@@ -1663,6 +1672,8 @@ const nameText = computed<NameText>(() => ({
   quoted: (words) => t('viewer.names.quoted', { words }),
   figure: (words) => t('viewer.names.figure', { name: t('viewer.names.quoted', { words }) }),
   figureBare: t('viewer.names.figureBare'),
+  image: (words) => t('viewer.names.image', { name: t('viewer.names.quoted', { words }) }),
+  imageBare: t('viewer.names.imageBare'),
 }))
 
 function isHeading(block: ResultBlock): boolean {
@@ -2269,15 +2280,26 @@ function onHandleDragStart(event: DragEvent, key: string) {
   }
 }
 
-/** `dragover` decides (`app/lib/dnd.ts`): over the pane a block drag is claimed, the pane
- *  scrolls near its edges, and the drop line follows the pointer. */
+/** Image files dragged over the document, where it can hold them: theirs to land between
+ *  blocks on the dragged block's drop line (docs/web.md § Editing, *Images*). */
+function carriesImageFiles(event: DragEvent): boolean {
+  return !dragRun && Boolean(editorImages.value) && carriesFiles(event.dataTransfer)
+}
+
+/** The last `dragover` the pane took image files for: any other means the pointer left it. */
+let paneFileEvent: DragEvent | null = null
+
+/** `dragover` decides (`app/lib/dnd.ts`): over the pane a block drag or image files are
+ *  claimed, the pane scrolls near its edges, and the drop line follows the pointer. */
 function onPaneDragOver(event: DragEvent) {
-  if (!dragRun || ![...(event.dataTransfer?.types ?? [])].includes(BLOCK_DRAG_TYPE)) {
+  const images = carriesImageFiles(event)
+  if (!images && (!dragRun || ![...(event.dataTransfer?.types ?? [])].includes(BLOCK_DRAG_TYPE))) {
     return
   }
-  claimDrag(event, 'block')
+  claimDrag(event, images ? 'image' : 'block')
+  paneFileEvent = images ? event : null
   event.preventDefault()
-  setDropEffect(event, 'move')
+  setDropEffect(event, images ? 'copy' : 'move')
   const box = scroller.value
   if (box) {
     const rect = box.getBoundingClientRect()
@@ -2293,14 +2315,15 @@ function onPaneDragOver(event: DragEvent) {
 /**
  * The drop line, in the gap the pointer is nearest: before or after the hovered row by its
  * vertical middle, a collapsed section one row. A drop inside the moving run, or where it
- * would move nothing, draws no line. A screen reader hears the target as it changes.
+ * would move nothing, draws no line; files have no run, and land in any gap. A screen reader
+ * hears the target as it changes.
  */
 function placeDropLine(y: number) {
   const box = scroller.value
   const pane = paneEl.value
   const run = dragRun
   const list = rows.value
-  if (!box || !pane || !run || !list.length) {
+  if (!box || !pane || !list.length) {
     return
   }
   const rectAt = (index: number) => box.querySelector(`[data-block="${list[index]!.key}"]`)?.getBoundingClientRect() ?? null
@@ -2322,7 +2345,7 @@ function placeDropLine(y: number) {
   const after = rect !== null && y >= (rect.top + rect.bottom) / 2
   // The drop goes before row `gap`.
   const gap = after ? found + 1 : found
-  if (!rect || (gap >= run.from && gap <= run.to + 1)) {
+  if (!rect || (run && gap >= run.from && gap <= run.to + 1)) {
     clearDropLine()
     return
   }
@@ -2351,6 +2374,16 @@ function clearDropLine() {
 }
 
 function onPaneDrop(event: DragEvent) {
+  if (carriesImageFiles(event)) {
+    event.preventDefault()
+    const at = dropAt
+    endDrag()
+    const files = droppedFiles(event).filter(isImageFile)
+    if (files.length) {
+      void dropImages(files, at)
+    }
+    return
+  }
   if (!dragRun || ![...(event.dataTransfer?.types ?? [])].includes(BLOCK_DRAG_TYPE)) {
     return
   }
@@ -2364,9 +2397,67 @@ function onPaneDrop(event: DragEvent) {
   }
 }
 
-/** Anything not claimed for a block drag takes the line away: the pointer left the pane. */
+/** Image files dropped on the document: each uploaded, then all of them inserted where the
+ *  line was — at the end without one — as one block action. An open editor is written back
+ *  first, and again once the files are in, so no block under an editor moves out from under
+ *  it. The line's place is held by the blocks around it (`placeNear`): the draft written
+ *  back may become more blocks or fewer, and the reader may edit while the files upload. */
+async function dropImages(files: File[], at: { target: number; place: 'before' | 'after' } | null) {
+  const aimed = at ? placed.value[at.target] : undefined
+  const open = editing.value
+  let target: BlockAt | null = null
+  let place = at?.place ?? 'after'
+  if (aimed && open && aimed.page === open.page && aimed.index >= open.index && aimed.index < open.index + span.value) {
+    // On the open draft's own edge: after its last block, or before its first — or before
+    // what follows it, when it becomes no block at all.
+    const count = draftBlockCount()
+    const after = place === 'after' && count > 0
+    target = { page: open.page, index: after ? open.index + count - 1 : open.index }
+    place = after ? 'after' : 'before'
+  } else if (aimed) {
+    target = afterCommit({ page: aimed.page, index: aimed.index })
+  }
+  commitEdit()
+  const near = placeNear(markdown.value, target, place)
+  const id = props.documentId
+  const lines: string[] = []
+  for (const file of files) {
+    const line = await uploadImage(file)
+    // The viewer closed, or turned to another document, while it uploaded: nothing lands,
+    // and the rest are not sent (docs/web.md § Editing, *Images*).
+    if (closed || id !== props.documentId) {
+      return
+    }
+    if (line) {
+      lines.push(line)
+    }
+  }
+  commitEdit()
+  const found = findPlace(markdown.value, near)
+  if (lines.length && landBlocks(lines.join('\n\n'), found.target, found.place)) {
+    showNote(t('viewer.note.imagesAdded', { n: lines.length }, lines.length), false)
+  }
+}
+
+/** Blocks inserted before or after `target` — at the end without one — as one block action,
+ *  a fold over them opened. False when nothing was inserted. */
+function landBlocks(blocks: string, target: BlockAt | null, place: 'before' | 'after'): boolean {
+  const inserted = insertBlocks(markdown.value, target, place, blocks)
+  if (!inserted) {
+    return false
+  }
+  applyDocument(inserted.markdown)
+  const start = placedIndex.value.get(blockKey(inserted.first))
+  if (start !== undefined) {
+    openFoldsOver([start])
+  }
+  return true
+}
+
+/** Anything not claimed for a block drag — or, for files, any `dragover` but the pane's own —
+ *  takes the line away: the pointer left the pane. */
 function onWindowDragOver(event: DragEvent) {
-  if (dragRun && dragClaim(event) !== 'block') {
+  if (dragRun ? dragClaim(event) !== 'block' : dropLine.value && paneFileEvent !== event) {
     clearDropLine()
   }
 }
@@ -2374,6 +2465,7 @@ function onWindowDragOver(event: DragEvent) {
 /** Escape, a drop outside the document, or a reload: the drag is over. */
 function endDrag() {
   dragRun = null
+  paneFileEvent = null
   dragKeys.value = new Set()
   dropSaid = ''
   clearDropLine()
@@ -3594,22 +3686,121 @@ watch(
   },
 )
 
-function figureKey(page: number, bbox: Bbox): string {
-  return `${page}/${bbox.join(',')}`
+/** Where a figure's crop is — by its own page, which a move does not change (docs/web.md
+ *  § Result viewer) — or an image's file, by the name its line carries; null without a route. */
+function pictureAddress(block: ResultBlock): string | null {
+  if (block.kind === 'fig') {
+    return props.figureBase ? `${props.figureBase}/${block.page}/${block.bbox.join(',')}` : null
+  }
+  if (block.kind === 'img') {
+    return props.imageBase ? `${props.imageBase}/${block.name}` : null
+  }
+  return null
 }
 
-/** The crop to load for a figure block — by its own page, which a move does not change
- *  (docs/web.md § Result viewer) — or null for the placeholder. */
+/** The picture to load for a figure or an image block, or null for the placeholder. */
 function figureUrl(block: ResultBlock): string | null {
-  if (block.kind !== 'fig' || !props.figureBase || failedCrops.has(figureKey(block.page, block.bbox))) {
+  const address = pictureAddress(block)
+  return address && !failedCrops.has(address) ? address : null
+}
+
+function onFigureError(block: ResultBlock) {
+  const address = pictureAddress(block)
+  if (address) {
+    failedCrops.add(address)
+  }
+}
+
+/** What the editors draw a figure or an image with: the same addresses, and the frame's words. */
+const editorFigures = computed<RichOptions['figures']>(() => ({
+  url: figureUrl,
+  pending: { figure: t('viewer.figurePending'), image: t('viewer.imagePending') },
+}))
+
+// --- inserted images ---------------------------------------------------------------
+
+/** One file sent as the document's image, its line answered; a refusal — the browser's own
+ *  size check, or the server's — is said on the status note (docs/web.md § Editing, *Images*). */
+async function uploadImage(file: File): Promise<string | null> {
+  const id = props.documentId
+  const cap = limits.value?.image_max_bytes
+  if (id === null) {
     return null
   }
-  return `${props.figureBase}/${figureKey(block.page, block.bbox)}`
+  if (cap !== undefined && file.size > cap) {
+    showNote(t('viewer.imageTooLarge', { size: formatBytes(cap) }), false)
+    return null
+  }
+  try {
+    const { path } = await uploadDocumentImage(id, file)
+    return imageLine(file.name, path)
+  } catch (error) {
+    showNote(await resolve(error), false)
+    return null
+  }
 }
 
-function onFigureError(page: number, bbox: Bbox) {
-  failedCrops.add(figureKey(page, bbox))
+/**
+ * An image whose editor closed before it uploaded (docs/web.md § Editing, *Images*): it lands
+ * in the document, or the notes, where it was to go, found by the blocks around it — not when
+ * the viewer has closed or moved on to another document since, which is false: send no more.
+ */
+function landStrayed(file: 'document' | 'notes', id: number, line: string, near: PlaceNear): boolean {
+  if (closed || id !== props.documentId) {
+    return false
+  }
+  if (file === 'notes') {
+    const { target, place } = findPlace(notes.value, near)
+    const inserted = insertBlocks(notes.value, target, place, line)
+    if (inserted) {
+      applyNotes(inserted.markdown)
+    }
+    return true
+  }
+  commitEdit()
+  const { target, place } = findPlace(markdown.value, near)
+  if (landBlocks(line, target, place)) {
+    showNote(t('viewer.note.imagesAdded', { n: 1 }, 1), false)
+  }
+  return true
 }
+
+/** What the editors insert images with: only on Files, where the document has an images route. */
+const editorImages = computed(() => {
+  const id = props.documentId
+  return props.imageBase && id !== null
+    ? {
+        upload: uploadImage,
+        accept: (limits.value?.image_media_types ?? ['image/*']).join(','),
+        strayed: (line: string, near: PlaceNear) => landStrayed('document', id, line, near),
+      }
+    : undefined
+})
+
+/** The blocks around the open editor's run, and where it starts among the document's blocks:
+ *  where an image goes whose block editor closed holding no other block beside it. */
+const openRunNear = computed<PlaceNear | null>(() => {
+  const open = editing.value
+  if (!open) {
+    return null
+  }
+  const flat = pages.value.flatMap((page, pageIndex) => page.blocks.map((block, index) => ({ src: block.src, pageIndex, index })))
+  const found = flat.findIndex((entry) => entry.pageIndex > open.page || (entry.pageIndex === open.page && entry.index >= open.index))
+  const start = found === -1 ? flat.length : found
+  // A new block's editor holds no block of the document yet.
+  const run = flat.filter((entry) => entry.pageIndex === open.page && entry.index >= open.index && entry.index < open.index + span.value).length
+  return { after: flat[start - 1]?.src ?? null, before: flat[start + run]?.src ?? null, gap: start }
+})
+
+/** The block editors' images: the editor's place in the document goes with them. */
+const blockImages = computed(() => editorImages.value && { ...editorImages.value, outer: openRunNear.value })
+
+const notesImages = computed(() => {
+  const id = props.documentId
+  return editorImages.value && id !== null
+    ? { ...editorImages.value, strayed: (line: string, near: PlaceNear) => landStrayed('notes', id, line, near) }
+    : undefined
+})
 
 // --- copy as markdown ------------------------------------------------------
 
@@ -4048,6 +4239,8 @@ watch(
                     :placeholder="t('viewer.blockPlaceholder')"
                     :label="t('viewer.blockSource')"
                     :skills="slashSkills"
+                    :figures="editorFigures"
+                    :images="blockImages"
                     @change="onEditorChange"
                     @leave="leaveEditor"
                     @slash-open="loadSkills"
@@ -4138,18 +4331,20 @@ watch(
                         :on-navigate="navigateFrom"
                         :on-merge="mergeBack"
                         :skills="slashSkills"
+                        :figures="editorFigures"
+                        :images="blockImages"
                         @change="onEditorChange"
                         @leave="leaveEditor"
                         @slash-open="loadSkills"
                         @run-skill="runSkill"
                       />
-                      <!-- A figure: the image stays an image, its caption is edited as a
-                           line of text under it. -->
-                      <div v-else-if="block.kind === 'fig'" class="figure-edit">
+                      <!-- A figure or an image: the picture stays a picture, its caption is
+                           edited as a line of text under it. -->
+                      <div v-else-if="block.kind === 'fig' || block.kind === 'img'" class="figure-edit">
                         <MdBlock
                           :block="{ ...block, caption: null }"
                           :figure-url="figureUrl(block)"
-                          @figure-error="onFigureError"
+                          @figure-error="onFigureError(block)"
                         />
                         <RichEditor
                           :ref="setBlockEditor"
@@ -4182,7 +4377,7 @@ watch(
                       v-else
                       :block="block"
                       :figure-url="figureUrl(block)"
-                      @figure-error="onFigureError"
+                      @figure-error="onFigureError(block)"
                     />
                     <!-- What a collapsed section hides, named for what pressing it does. -->
                     <button
@@ -4230,6 +4425,8 @@ watch(
                       :placeholder="t('viewer.blockPlaceholder')"
                       :label="t('viewer.blockSource')"
                       :skills="slashSkills"
+                      :figures="editorFigures"
+                      :images="blockImages"
                       @change="onEditorChange"
                       @leave="leaveEditor"
                       @slash-open="loadSkills"
@@ -4340,6 +4537,8 @@ watch(
                   :placeholder="t('viewer.notesPlaceholder')"
                   :label="t('viewer.notesLabel')"
                   :links="notesLinks"
+                  :figures="editorFigures"
+                  :images="notesImages"
                   @change="onNotesChange"
                 />
               </div>
@@ -4583,7 +4782,8 @@ watch(
   --first-line: 32px;
 }
 
-.block[data-kind='fig'] {
+.block[data-kind='fig'],
+.block[data-kind='img'] {
   --first-line: 24px;
 }
 

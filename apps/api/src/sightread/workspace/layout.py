@@ -30,6 +30,7 @@ META_FILE = ".meta.json"
 FIGURES_DIR = "figures"
 SOURCE_STEM = "source"
 SOURCES_SUFFIX = ".sources"
+IMAGES_SUFFIX = ".images"
 LOCK_FILE = "lock"
 
 # What a document directory may not be called: the workspace's own names, git's, and
@@ -90,6 +91,13 @@ def sources_dir(root: Path) -> Path:
     directory and like it outside the mount, so no command can touch the one file nothing
     can recreate (docs/workspace.md § Layout). One file per document, named by its id."""
     return root.parent / REPOS_DIR / f"{root.name}{SOURCES_SUFFIX}"
+
+
+def images_dir(root: Path) -> Path:
+    """Where the images inserted into documents live, `{WORKSPACES_DIR}/.repos/{user_id}.images`:
+    beside the originals and outside the mount for the same reason (docs/workspace.md
+    § Inserted images). One directory per document, named by its id."""
+    return root.parent / REPOS_DIR / f"{root.name}{IMAGES_SUFFIX}"
 
 
 def segment_name(segment: str) -> str:

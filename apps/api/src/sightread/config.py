@@ -87,6 +87,10 @@ class Settings(BaseSettings):
     workspace_quota_bytes: int = 10_737_418_240
     # The largest document file the API opens; the shell can write anything.
     content_max_bytes: int = 8_388_608
+    # An image inserted into a document: the upload's cap, and the long edge it is kept at
+    # (docs/workspace.md § Inserted images).
+    document_image_max_bytes: int = 20 * 1024 * 1024
+    document_image_long_edge: int = 2400
 
     # The chat agent's limits (docs/chat.md).
     max_chat_turns_per_user: int = 4

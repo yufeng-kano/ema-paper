@@ -34,6 +34,9 @@ export type DragClaim =
   | 'list'
   /** A block of the result viewer is under a block being dragged — where it would land. */
   | 'block'
+  /** The open document or its notes are under image files being dragged — where they would
+   *  be inserted (docs/web.md § Editing, *Images*). */
+  | 'image'
 
 const claims = new WeakMap<DragEvent, DragClaim>()
 

@@ -34,6 +34,10 @@ export interface NameText {
   figure: (words: string) => string
   /** A figure with no caption. */
   figureBare: string
+  /** An inserted image named by its caption's first words: `Image “…”`. */
+  image: (words: string) => string
+  /** An image with no caption. */
+  imageBare: string
 }
 
 /** How long a name's words run before they are cut. A heading keeps more: it is its name. */
@@ -56,7 +60,7 @@ function cutWords(text: string, chars: number): string {
  * A block's name, as the handle's label and a drag's live region say it (docs/web.md § Editing,
  * *Moving blocks*): a formula by its kind — `Formula (1)` by its `\tag` — and anything else by
  * its words in the locale's quotation marks: a heading's text, other blocks' first words, a
- * figure's caption after *Figure*.
+ * figure's caption after *Figure*, an image's after *Image*.
  */
 export function blockName(block: ResultBlock, text: NameText): string {
   if (block.kind === 'math') {
@@ -67,6 +71,10 @@ export function blockName(block: ResultBlock, text: NameText): string {
     const caption = block.caption ? inlinePlain(block.caption) : ''
     return caption ? text.figure(cutWords(firstWords(caption), NAME_CHARS)) : text.figureBare
   }
+  if (block.kind === 'img') {
+    const caption = block.caption ? inlinePlain(block.caption) : ''
+    return caption ? text.image(cutWords(firstWords(caption), NAME_CHARS)) : text.imageBare
+  }
   const words = blockPlain(block)
   if (block.kind === 'h2' || block.kind === 'h3') {
     return text.quoted(cutWords(words, HEADING_NAME_CHARS))
@@ -76,8 +84,8 @@ export function blockName(block: ResultBlock, text: NameText): string {
 
 /**
  * Whether `/translate` has something to translate in a block: prose — a paragraph, a heading,
- * a list, a quote, a figure's caption. A formula, code, a table, a contents run and a figure
- * without a caption are left as they are (docs/chat.md § Translation), so offering it there
+ * a list, a quote, a figure's or an image's caption. A formula, code, a table, a contents run
+ * and a figure or image without a caption are left as they are (docs/chat.md § Translation), so offering it there
  * would start a paid turn that writes nothing.
  */
 export function translatable(block: ResultBlock): boolean {
@@ -89,6 +97,7 @@ export function translatable(block: ResultBlock): boolean {
     case 'quote':
       return true
     case 'fig':
+    case 'img':
       return Boolean(block.caption)
     default:
       return false

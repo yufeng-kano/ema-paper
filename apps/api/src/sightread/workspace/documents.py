@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import uuid
 from collections.abc import Collection
@@ -39,6 +40,7 @@ from .layout import (
     document_relative_dir,
     files_root,
     git_dir,
+    images_dir,
     results_root,
     sources_dir,
     user_root,
@@ -56,6 +58,21 @@ NOT_UTF8 = "The document file is not UTF-8 text"
 MARKDOWN_KIND = "markdown"
 MARKDOWN_MEDIA_TYPE = "text/markdown"
 MARKDOWN_EXTENSIONS = (".md", ".markdown")
+# An inserted image's file name: the first 16 hex digits of its bytes' SHA-256, as it is
+# kept (docs/workspace.md § Inserted images). Never a name from the request.
+IMAGE_NAME = re.compile(r"img-[0-9a-f]{16}\.(?:png|jpg)")
+# What an inserted image may be uploaded as, and the only decoders it is offered, by
+# Pillow's names (HEIF is HEIC's container); it is kept as PNG or JPEG.
+IMAGE_MEDIA_TYPES = (
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+    "image/heic",
+    "image/heif",
+)
+IMAGE_FORMATS = ("PNG", "JPEG", "WEBP", "GIF", "HEIF")
+IMAGE_SUFFIX_MEDIA = {".png": "image/png", ".jpg": "image/jpeg"}
 
 
 @dataclass(frozen=True)
@@ -275,6 +292,7 @@ def _materialize_files(
         }
     if _write_if_missing(paths.root, paths.meta, json.dumps(meta, indent=2) + "\n"):
         written.append(paths.meta)
+    _copy_images(paths, document_id)  # excluded from history
     if job is None or result is None:
         return written  # a markdown document: no parse output, no crops, no shell copy
     parse = results_root(paths.root) / str(job.id) / "result.md"
@@ -294,6 +312,24 @@ def _materialize_files(
                 with crop.open("rb") as reader:
                     safe_io.write_from(paths.root, target, reader)
     return written
+
+
+def _copy_images(paths: DocumentPaths, document_id: int) -> None:
+    """Each stored image the document directory's `figures/` lacks, copied in through a
+    descriptor like a crop: the shell's view of what the text names."""
+    store = images_dir(paths.root) / str(document_id)
+    if not store.is_dir():
+        return
+    for image in store.iterdir():
+        target = paths.figures / image.name
+        if (
+            IMAGE_NAME.fullmatch(image.name)
+            and image.is_file()
+            and not image.is_symlink()
+            and safe_io.entry_kind(paths.root, target) == "none"
+        ):
+            with image.open("rb") as reader:
+                safe_io.write_from(paths.root, target, reader)
 
 
 async def materialize_document(
@@ -574,10 +610,12 @@ def _discard_originals(root: Path, document_ids: list[int]) -> None:
     for document_id in document_ids:
         while (original := original_of(root, document_id)) is not None:
             original.unlink(missing_ok=True)
+        shutil.rmtree(images_dir(root) / str(document_id), ignore_errors=True)
 
 
 async def discard_originals(settings: Settings, user_id: int, document_ids: list[int]) -> None:
-    """The originals of documents whose rows are gone (docs/workspace.md § Layout)."""
+    """The originals and inserted images of documents whose rows are gone
+    (docs/workspace.md § Layout, § Inserted images)."""
     if document_ids:
         root = user_root(settings.workspaces_dir, user_id)
         await asyncio.to_thread(_discard_originals, root, list(document_ids))
@@ -675,6 +713,56 @@ async def adopt_markdown(settings: Settings, document: Document, upload: Path) -
         raise
     finally:
         upload.unlink(missing_ok=True)
+
+
+def _keep_image(paths: DocumentPaths, document_id: int, prepared: Path) -> str:
+    """Store a prepared image under its hash, then copy it into `figures/`; its name."""
+    digest = hashlib.sha256()
+    with prepared.open("rb") as reader:
+        while chunk := reader.read(safe_io.READ_CHUNK):
+            digest.update(chunk)
+    name = f"img-{digest.hexdigest()[:16]}{prepared.suffix}"
+    store = images_dir(paths.root) / str(document_id)
+    store.mkdir(parents=True, exist_ok=True)
+    kept = store / name
+    if not kept.is_file():
+        staging = store / f".tmp-{uuid.uuid4().hex}"
+        try:
+            shutil.copyfile(prepared, staging)
+            os.replace(staging, kept)
+        finally:
+            staging.unlink(missing_ok=True)
+    target = paths.figures / name
+    if safe_io.entry_kind(paths.root, target) == "none":
+        with kept.open("rb") as reader:
+            safe_io.write_from(paths.root, target, reader)
+    return name
+
+
+async def keep_image(
+    db: AsyncSession, settings: Settings, document: Document, prepared: Path
+) -> str:
+    """An image inserted into the document, prepared at `prepared`: kept beside the
+    originals and copied into the document directory, under the workspace lock, with the
+    quota checked first. Returns the file's name; the text that names it is the caller's
+    (docs/workspace.md § Inserted images)."""
+    root = user_root(settings.workspaces_dir, document.user_id)
+    async with workspace_lock(root):
+        paths = await materialize_document(db, settings, document, locked=True)
+        await ensure_within_quota(settings, root)
+        try:
+            return await asyncio.to_thread(_keep_image, paths, document.id, prepared)
+        except safe_io.UnsafeEntry as exc:
+            raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
+
+
+def image_of(root: Path, document_id: int, name: str) -> Path | None:
+    """The stored image `name` of a document, or None: only a name the store makes, only a
+    plain file."""
+    if not IMAGE_NAME.fullmatch(name):
+        return None
+    image = images_dir(root) / str(document_id) / name
+    return image if image.is_file() and not image.is_symlink() else None
 
 
 def _undo_adoption(root: Path, document_id: int, directory: Path, suffix: str) -> None:
@@ -1360,6 +1448,21 @@ def sweep_orphaned_originals(root: Path, live_ids: Collection[int]) -> int:
     return swept
 
 
+def sweep_orphaned_images(root: Path, live_ids: Collection[int]) -> int:
+    """The images of documents whose rows are gone, as `sweep_orphaned_originals` takes
+    their originals, under the same lock."""
+    directory = images_dir(root)
+    if not directory.is_dir():
+        return 0
+    swept = 0
+    for entry in directory.iterdir():
+        if not entry.name.isdigit() or int(entry.name) in live_ids:
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        swept += 1
+    return swept
+
+
 def sweep_aside(root: Path, keep: Collection[str] = ()) -> int:
     """Remove what a delete left aside and never discarded (a crash between its commit
     and the discard); run under the workspace lock, where no delete is in flight. `keep`
@@ -1400,7 +1503,12 @@ def directory_size(root: Path, path: Path | None = None) -> int:
 
 
 def workspace_size(root: Path) -> int:
-    """What the user holds: the tree, the history and the originals beside it (the git
-    and sources directories are the service's own, outside the mount, walked the same
-    way from their own roots)."""
-    return directory_size(root) + directory_size(git_dir(root)) + directory_size(sources_dir(root))
+    """What the user holds: the tree, the history, the originals and the inserted images
+    beside it (the git, sources and images directories are the service's own, outside the
+    mount, walked the same way from their own roots)."""
+    return (
+        directory_size(root)
+        + directory_size(git_dir(root))
+        + directory_size(sources_dir(root))
+        + directory_size(images_dir(root))
+    )

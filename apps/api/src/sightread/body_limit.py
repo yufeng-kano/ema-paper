@@ -18,10 +18,16 @@ TOO_LARGE = {"error": {"type": "invalid_request", "message": "The request body i
 
 
 # The routes that stream a multipart body to disk under a cap of their own: UPLOAD_MAX_BYTES
-# for a parse, CHAT_ATTACHMENT_MAX_BYTES for the chat composer's attachments (docs/api.md).
+# for a parse, CHAT_ATTACHMENT_MAX_BYTES for the chat composer's attachments,
+# DOCUMENT_IMAGE_MAX_BYTES for an image inserted into a document (docs/api.md).
 PARSE_ROUTE = ("POST", "/v1/parse")
 STREAMING_UPLOADS = frozenset(
-    {PARSE_ROUTE, ("POST", "/api/library/documents"), ("POST", "/api/attachments")}
+    {
+        PARSE_ROUTE,
+        ("POST", "/api/library/documents"),
+        ("POST", "/api/attachments"),
+        ("POST", "/api/library/images"),
+    }
 )
 MULTIPART = b"multipart/form-data"
 
