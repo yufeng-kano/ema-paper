@@ -474,7 +474,13 @@ export function serializeNode(node: JSONContent): string {
         .filter((item) => item !== '')
       const start = Number(node.attrs?.start ?? 1)
       return items
-        .map((item, index) => (node.type === 'orderedList' ? `${start + index}. ${item}` : `- ${item}`))
+        .map((item, index) => {
+          if (node.type === 'orderedList') {
+            return `${start + index}. ${item}`
+          }
+          // An item of dashes, under its own dash, would read back as a rule.
+          return THEMATIC_BREAK.test(`- ${item}`) ? `- \\${item}` : `- ${item}`
+        })
         .join('\n')
     }
     case 'table':

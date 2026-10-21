@@ -14,7 +14,7 @@ from __future__ import annotations
 BBOX_FORMAT_YXYX = "yxyx_norm1000"
 
 # Part of the dedup cache key; bump when the pipeline changes results (docs/jobs.md).
-PIPELINE_VERSION = 6  # 6: the coordinate paragraph follows the model's family
+PIPELINE_VERSION = 7  # 6: the coordinate paragraph follows the model's family; 7: code fences kept
 
 # What the template substitutes per page (upstream/client.py): the chips the Agent page's
 # prompt dialog inserts (docs/web.md).

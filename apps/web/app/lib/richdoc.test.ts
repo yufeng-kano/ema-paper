@@ -376,6 +376,20 @@ describe('quotes in the editor', () => {
     }
   })
 
+  it('escapes a bullet item of dashes so the list keeps it', () => {
+    for (const text of ['--', '---', '- -']) {
+      const markdown = serializeNode({
+        type: 'bulletList',
+        content: [
+          { type: 'listItem', content: [{ type: 'paragraph', content: [{ type: 'text', text: 'first' }] }] },
+          { type: 'listItem', content: [{ type: 'paragraph', content: [{ type: 'text', text }] }] },
+        ],
+      })
+      expect(markdown).toBe(`- first\n- \\${text}`)
+      expect(reading(markdown)).toEqual([{ kind: 'list', ordered: false, items: ['first', `\\${text}`] }])
+    }
+  })
+
   it('makes quote lines of any markdown', () => {
     expect(quoteLines('a\n\nb')).toBe('> a\n>\n> b')
     expect(quoteLines('')).toBe('')
