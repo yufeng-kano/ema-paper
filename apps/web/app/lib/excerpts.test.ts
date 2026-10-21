@@ -36,6 +36,8 @@ describe('excerptPassage', () => {
       'quoted text\n\nFigure 2: Curves',
     )
     expect(excerptPassage('![g](sightread://p1/0,0,1,1)')).toBeNull()
+    expect(excerptPassage('![shot](figures/img-0123456789abcdef.png)\nThe login screen')).toBe('The login screen')
+    expect(excerptPassage('![shot](figures/img-0123456789abcdef.png)')).toBeNull()
   })
 })
 
@@ -161,7 +163,7 @@ describe('block references in the notes', () => {
 })
 
 describe('droppedBlocksMarkdown', () => {
-  it('keeps blocks and quotes, takes a figure as its caption and leaves page markers out', () => {
+  it('keeps blocks, quotes, figures and images whole and leaves page markers out', () => {
     const dragged = [
       '<!-- page: 2 -->',
       '![fig1](sightread://p2/0,0,1,1)',
@@ -171,10 +173,20 @@ describe('droppedBlocksMarkdown', () => {
       '',
       '![fig2](sightread://p2/0,0,1,1)',
       '',
+      '![shot](figures/img-0123456789abcdef.png)',
+      '',
       '- one',
       '- two',
     ].join('\n')
-    expect(droppedBlocksMarkdown(dragged)).toBe('Figure 1: The architecture.\n\n> A quoted line.\n\n- one\n- two')
-    expect(droppedBlocksMarkdown('<!-- page: 3 -->\n![fig3](sightread://p3/0,0,1,1)')).toBeNull()
+    expect(droppedBlocksMarkdown(dragged)).toBe(
+      [
+        '![fig1](sightread://p2/0,0,1,1)\nFigure 1: The architecture.',
+        '> A quoted line.',
+        '![fig2](sightread://p2/0,0,1,1)',
+        '![shot](figures/img-0123456789abcdef.png)',
+        '- one\n- two',
+      ].join('\n\n'),
+    )
+    expect(droppedBlocksMarkdown('<!-- page: 3 -->')).toBeNull()
   })
 })

@@ -21,13 +21,18 @@
  * never leaves the text — the editor names its highlighted row as its active descendant. Its
  * rows turn the paragraph into another block, or — in the document's block editor, given
  * `skills` — run a skill on the editor's text, which the viewer sends.
+ *
+ * Given `images`, a picture goes in from the slash menu's *Image* row, a paste of image files,
+ * or — in the notes — image files dropped between blocks (docs/web.md § Editing, *Images*):
+ * each file is uploaded through the caller and lands as one block of its line. Given
+ * `figures`, a figure or an image is drawn as itself rather than as its source.
  */
 import { Editor } from '@tiptap/core'
 import { Slice, type Node as ProseNode } from '@tiptap/pm/model'
 import { NodeSelection, Selection, TextSelection, type Transaction } from '@tiptap/pm/state'
 import type { EditorView } from '@tiptap/pm/view'
-import { matchCommands } from '~/lib/composer'
-import { BLOCK_DRAG_TYPE, setDropEffect } from '~/lib/dnd'
+import { isImageFile, matchCommands } from '~/lib/composer'
+import { BLOCK_DRAG_TYPE, carriesFiles, claimDrag, droppedFiles, setDropEffect } from '~/lib/dnd'
 import { droppedBlocksMarkdown } from '~/lib/excerpts'
 import type { IconName } from '~/lib/icons'
 import {
@@ -78,6 +83,12 @@ const props = withDefaults(
      *  editor: given that text, the slash line left out, the skills to list, or null while
      *  they load. Without it the menu has the conversions only. */
     skills?: (text: string) => SlashSkill[] | null
+    /** Figures and images drawn as themselves: their addresses. Read once, as the editor is
+     *  built. */
+    figures?: RichOptions['figures']
+    /** Images can be inserted: `upload` sends one file and answers its markdown line, or
+     *  null when it was refused (the caller says why); `accept` is the file picker's. */
+    images?: { upload: (file: File) => Promise<string | null>; accept: string }
   }>(),
   {
     variant: 'block',
@@ -91,6 +102,8 @@ const props = withDefaults(
     onMerge: undefined,
     links: undefined,
     skills: undefined,
+    figures: undefined,
+    images: undefined,
   },
 )
 
@@ -249,7 +262,10 @@ type SlashRow = ConvertRow | SkillRow
 
 const slashConversions = computed<ConvertRow[]>(() =>
   slash.value
-    ? matchSlash(SLASH_CONVERSIONS, slash.value.query).map((item) => ({
+    ? matchSlash(
+        SLASH_CONVERSIONS.filter((item) => item.key !== 'image' || props.images),
+        slash.value.query,
+      ).map((item) => ({
         kind: 'convert',
         key: item.key,
         icon: item.icon,
@@ -478,6 +494,12 @@ function applySlash(row: SlashRow) {
   if (row.kind === 'skill') {
     editor.view.dispatch(editor.state.tr.delete(start, end))
     emit('run-skill', row.name, docToMarkdown(editor.getJSON()))
+    return
+  }
+  if (row.key === 'image') {
+    // The paragraph stays, emptied, until the picked file has uploaded and takes its place.
+    editor.view.dispatch(editor.state.tr.delete(start + 1, end - 1))
+    pickImage(start)
     return
   }
   const chain = editor.chain().deleteRange({ from: start + 1, to: end - 1 })
@@ -726,6 +748,105 @@ function pastedSlice(view: EditorView, text: string, plain: boolean): Slice {
     : Slice.maxOpen(doc.content)
 }
 
+// --- images --------------------------------------------------------------------------------------
+
+const imagePicker = ref<HTMLInputElement | null>(null)
+/** Images on their way in, each at the top-level position it lands at — replacing the empty
+ *  paragraph there, for the first — mapped through every transaction until it has landed. */
+const landing = new Set<{ pos: number; replace: boolean }>()
+/** Where the file picker's files go, while it is open: a blur then is the picker taking
+ *  focus, not the reader leaving (docs/web.md § Editing, *Images*). */
+let picking: { pos: number; replace: boolean } | null = null
+const uploading = ref(0)
+
+function pickImage(pos: number) {
+  picking = { pos, replace: true }
+  landing.add(picking)
+  imagePicker.value?.click()
+}
+
+function onImagesPicked() {
+  const input = imagePicker.value
+  const files = [...(input?.files ?? [])]
+  if (input) {
+    input.value = ''
+  }
+  const slot = picking
+  picking = null
+  editor?.commands.focus()
+  if (slot) {
+    landing.delete(slot)
+    void insertImages(files, slot)
+  }
+}
+
+function onImagePickCancelled() {
+  if (picking) {
+    landing.delete(picking)
+  }
+  picking = null
+  editor?.commands.focus()
+}
+
+/** Where an image pasted at the caret lands: in place of the empty top-level paragraph the
+ *  caret is in, otherwise after the top-level block it is in. */
+function imageSlotAtCaret(): { pos: number; replace: boolean } | null {
+  if (!editor) {
+    return null
+  }
+  const { $from } = editor.state.selection
+  if ($from.depth === 0) {
+    return { pos: $from.pos, replace: false }
+  }
+  const top = $from.node(1)
+  return top.type.name === 'paragraph' && top.content.size === 0
+    ? { pos: $from.before(1), replace: true }
+    : { pos: $from.after(1), replace: false }
+}
+
+/** Each file uploaded in turn and inserted as its line's block, the next after it. */
+async function insertImages(files: File[], slot: { pos: number; replace: boolean }) {
+  const upload = props.images?.upload
+  if (!upload) {
+    return
+  }
+  landing.add(slot)
+  try {
+    for (const file of files) {
+      uploading.value += 1
+      let line: string | null
+      try {
+        line = await upload(file)
+      } finally {
+        uploading.value -= 1
+      }
+      if (!line || !editor) {
+        continue
+      }
+      const { state } = editor
+      const node = state.schema.nodes.rawBlock!.create({ source: line })
+      const here = state.doc.nodeAt(slot.pos)
+      const tr =
+        slot.replace && here?.type.name === 'paragraph' && here.content.size === 0
+          ? state.tr.replaceWith(slot.pos, slot.pos + here.nodeSize, node)
+          : state.tr.insert(slot.pos, node)
+      slot.replace = false
+      editor.view.dispatch(tr.scrollIntoView())
+    }
+  } finally {
+    landing.delete(slot)
+  }
+}
+
+function imagesOf(transfer: DataTransfer | null): File[] {
+  return [...(transfer?.files ?? [])].filter(isImageFile)
+}
+
+/** Image files dragged over the notes: theirs to land between blocks, as dragged blocks do. */
+function carriesImages(event: DragEvent): boolean {
+  return props.variant === 'notes' && Boolean(props.images) && carriesFiles(event.dataTransfer)
+}
+
 // --- blocks dropped from the document -----------------------------------------------------------
 
 /**
@@ -767,8 +888,12 @@ function blockDropAt(y: number): { pos: number; replace: boolean; edge: number }
 }
 
 function onBlockDragOver(event: DragEvent) {
-  if (!carriesBlocks(event) || !editor) {
+  const images = carriesImages(event)
+  if ((!carriesBlocks(event) && !images) || !editor) {
     return
+  }
+  if (images) {
+    claimDrag(event, 'image')
   }
   event.preventDefault()
   setDropEffect(event, 'copy')
@@ -792,12 +917,20 @@ function clearDropLine() {
  *  left out, read through the viewer's parser and inserted whole. A copy — the document keeps
  *  its block — saved like any notes edit. */
 function onBlockDrop(event: DragEvent) {
-  if (!carriesBlocks(event) || !editor) {
+  const images = carriesImages(event)
+  if ((!carriesBlocks(event) && !images) || !editor) {
     return
   }
   event.preventDefault()
   dropLine.value = null
   const at = blockDropAt(event.clientY)
+  if (images) {
+    const files = droppedFiles(event).filter(isImageFile)
+    if (at && files.length) {
+      void insertImages(files, { pos: at.pos, replace: at.replace })
+    }
+    return
+  }
   const markdown = droppedBlocksMarkdown(event.dataTransfer?.getData('text/plain') ?? '')
   if (!at || markdown === null) {
     return
@@ -820,6 +953,7 @@ onMounted(() => {
       placeholder: props.placeholder,
       onEditMath: (target) => void openMath(target),
       links: props.links,
+      figures: props.figures,
     }),
     content: markdownToDoc(props.source, inlineOptions),
     editable: props.editable,
@@ -845,6 +979,14 @@ onMounted(() => {
       // what is pasted.
       handlePaste: (view, event) => {
         const text = event.clipboardData?.getData('text/plain') ?? ''
+        // Image files with no text: a screenshot. Beside text — a spreadsheet's or a word
+        // processor's picture of what it copied — the text is what was meant.
+        const images = props.images ? imagesOf(event.clipboardData) : []
+        const slot = images.length && !text ? imageSlotAtCaret() : null
+        if (slot) {
+          void insertImages(images, slot)
+          return true
+        }
         if (!event.clipboardData?.getData('text/html') || !props.links?.rewrite || props.links.rewrite(text) === text) {
           return false
         }
@@ -853,9 +995,14 @@ onMounted(() => {
       },
       // A drag of the viewer's blocks is the root's to land (`onBlockDrop`), never text dropped
       // into the line under the pointer.
-      handleDrop: (_view, event) => carriesBlocks(event),
+      handleDrop: (_view, event) => carriesBlocks(event) || carriesImages(event),
     },
-    onTransaction: ({ transaction }) => syncSlash(transaction),
+    onTransaction: ({ transaction }) => {
+      for (const slot of landing) {
+        slot.pos = transaction.mapping.map(slot.pos)
+      }
+      syncSlash(transaction)
+    },
     onUpdate: ({ editor: current, transaction }) => {
       if (!transaction.docChanged) {
         return
@@ -874,8 +1021,9 @@ onMounted(() => {
       }
     },
     onBlur: ({ event }) => {
-      // Into the TeX field — or onto the slash menu — is still inside the editor.
-      if (closing || root.value?.contains(event.relatedTarget as Node | null)) {
+      // Into the TeX field — or onto the slash menu — is still inside the editor, and the file
+      // picker taking focus is the reader choosing an image for it.
+      if (closing || picking || root.value?.contains(event.relatedTarget as Node | null)) {
         return
       }
       if (slash.value) {
@@ -1012,6 +1160,19 @@ defineExpose({
     @drop="onBlockDrop"
   >
     <div ref="mount" />
+    <input
+      v-if="images"
+      ref="imagePicker"
+      class="image-picker"
+      type="file"
+      multiple
+      :accept="images.accept"
+      tabindex="-1"
+      aria-hidden="true"
+      @change="onImagesPicked"
+      @cancel="onImagePickCancelled"
+    >
+    <p v-if="uploading" class="image-status" role="status">{{ t('viewer.imageUploading') }}</p>
     <!-- Where blocks dragged from the document would land: on a block's edge. -->
     <div
       v-if="dropLine"
@@ -1215,6 +1376,54 @@ defineExpose({
 }
 
 .rich :deep(.rich-raw) {
+  color: var(--faint);
+}
+
+/* A figure or an image in the editor, drawn as `MdBlock` draws one (its styles are scoped
+   there): centered, the picture at the column's width and never more, the caption faint. */
+.rich :deep(.rich-figure) {
+  margin: 0;
+  text-align: center;
+}
+
+.rich :deep(.rich-figure .figure-image) {
+  display: block;
+  margin-inline: auto;
+  max-width: 100%;
+  border: 1px solid var(--line-soft);
+  background: var(--paper);
+}
+
+.rich :deep(.rich-figure .figure-frame) {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 120px;
+  border: 1px dashed var(--edge);
+  background: var(--rail);
+  color: var(--faint);
+  font-size: var(--text-xs);
+}
+
+.rich :deep(.rich-figure .figure-caption) {
+  margin-top: var(--space-2);
+  font-size: var(--text-xs);
+  line-height: 1.6;
+  color: var(--faint);
+}
+
+/* Selected as one atom: the surface a selected formula gets. */
+.rich :deep(.rich-figure.ProseMirror-selectednode) {
+  background: var(--rail-active);
+}
+
+.image-picker {
+  display: none;
+}
+
+.image-status {
+  margin: var(--space-2) 0 0;
+  font-size: var(--text-xs);
   color: var(--faint);
 }
 

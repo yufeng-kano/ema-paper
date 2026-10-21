@@ -23,6 +23,8 @@ describe('the slash menu', () => {
     expect(keys('list')).toEqual(['bulleted', 'numbered'])
     expect(keys('')).toHaveLength(SLASH_CONVERSIONS.length)
     expect(keys('zzz')).toEqual([])
+    expect(keys('圖')).toEqual(['image'])
+    expect(keys('pic')).toEqual(['image'])
   })
 
   it('gives each skill its action’s glyph where there is one', () => {

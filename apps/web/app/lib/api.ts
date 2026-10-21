@@ -136,6 +136,10 @@ export interface UploadLimits {
   markdown_media_types?: string[]
   markdown_extensions?: string[]
   markdown_max_bytes?: number
+  /** What an image inserted into a document may be (docs/web.md § Editing, *Images*).
+   *  Optional, as above. */
+  image_media_types?: string[]
+  image_max_bytes?: number
   /** The cap on an agent's prompt, a skill's body and a subagent's prompt. */
   prompt_max_chars: number
   /** The chat composer's attachments (docs/chat.md § What a user message carries). Optional
@@ -972,6 +976,15 @@ export function uploadDocument(file: File, folderId: number | null): Promise<Lib
     body.append('folder_id', String(folderId))
   }
   return request('POST', '/api/library/documents', body)
+}
+
+/** An image for a document's text, kept as the document's: the path its markdown line names
+ *  (`figures/img-<hash>.png`). The line is the caller's to write (docs/api.md). */
+export function uploadDocumentImage(documentId: number, file: File): Promise<{ path: string }> {
+  const body = new FormData()
+  body.append('document_id', String(documentId))
+  body.append('file', file)
+  return request('POST', '/api/library/images', body)
 }
 
 /** A new, empty markdown document; a taken name is suffixed (docs/web.md § Files). */

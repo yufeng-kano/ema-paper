@@ -29,6 +29,8 @@ const en: NameText = {
   quoted: (words) => `“${words}”`,
   figure: (words) => `Figure “${words}”`,
   figureBare: 'Figure',
+  image: (words) => `Image “${words}”`,
+  imageBare: 'Image',
 }
 
 function blocks(markdown: string) {
@@ -59,6 +61,15 @@ describe('blockName', () => {
     expect(blockName(prose!, en)).toBe('“An attention function…”')
     expect(blockName(figure!, en)).toBe('Figure “Figure 1: Learning…”')
     expect(blockName(bare!, en)).toBe('Figure')
+  })
+
+  it('names an inserted image by its caption, after Image', () => {
+    const [captioned, bare] = blocks(
+      ['![shot](figures/img-0123456789abcdef.png)', 'The login screen', '', '![shot](figures/img-0123456789abcdef.jpg)'].join('\n'),
+    )
+    expect(blockName(captioned!, en)).toBe('Image “The login screen”')
+    expect(blockName(bare!, en)).toBe('Image')
+    expect([captioned, bare].map((block) => translatable(block!))).toEqual([true, false])
   })
 
   it('cuts words without spaces by length', () => {

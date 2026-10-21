@@ -68,7 +68,12 @@ from ..upstream.client import (
     normalize_base_url,
     stored_connection_models,
 )
-from ..workspace.documents import MARKDOWN_EXTENSIONS, MARKDOWN_MEDIA_TYPE, document_paths
+from ..workspace.documents import (
+    IMAGE_MEDIA_TYPES,
+    MARKDOWN_EXTENSIONS,
+    MARKDOWN_MEDIA_TYPE,
+    document_paths,
+)
 from .chat import owned_document, turn_note
 from .library import figure_crop_response, partial_result
 
@@ -196,6 +201,8 @@ async def me(user: SessionUser, settings: AppSettings):
             "markdown_media_types": [MARKDOWN_MEDIA_TYPE],
             "markdown_extensions": list(MARKDOWN_EXTENSIONS),
             "markdown_max_bytes": settings.content_max_bytes,
+            "image_media_types": list(IMAGE_MEDIA_TYPES),
+            "image_max_bytes": settings.document_image_max_bytes,
             # The prompt dialogs count against the same cap the writes enforce.
             "prompt_max_chars": settings.system_prompt_max_chars,
             # What the chat composer may attach (docs/chat.md § What a user message carries).

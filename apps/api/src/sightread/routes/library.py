@@ -19,11 +19,13 @@ import os
 import re
 import unicodedata
 import uuid
+import warnings
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from fastapi import APIRouter, Request, Response, status
 from fastapi.responses import StreamingResponse
+from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field
 from sqlalchemy import ColumnElement, delete, select, update
 from sqlalchemy.exc import IntegrityError
@@ -53,6 +55,7 @@ from ..jobs.intake import (
 )
 from ..jobs.runner import partial_result_payload, result_payload
 from ..parsing.figures import crop_chunks, open_crop, parse_bbox_path
+from ..parsing.images import ImageError, normalize_image
 from ..workspace import documents as workspace_documents
 from ..workspace import safe_io
 from ..workspace.layout import document_relative_dir, path_segment, user_root
@@ -1250,6 +1253,122 @@ async def document_figure(
     if row.job_id is None:
         raise ApiError(404, "invalid_request", "No such figure")
     return await figure_crop_response(settings, await job_of(db, row.job_id), page, bbox)
+
+
+# --- images inserted into a document --------------------------------------------------------
+
+IMAGE_CAP_NAME = "DOCUMENT_IMAGE_MAX_BYTES"
+
+
+def prepare_image(
+    source: Path, out_dir: Path, stem: str, *, max_pixels: int, long_edge: int
+) -> Path:
+    """The upload as it is kept: decoded only as one of the accepted formats, refused past
+    the pixel cap read from its header, then upright, flattened and downscaled as an
+    attachment is (docs/workspace.md § Inserted images)."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(source, formats=workspace_documents.IMAGE_FORMATS) as opened:
+                too_large = opened.width * opened.height > max_pixels
+    except (
+        UnidentifiedImageError,
+        Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
+        OSError,
+        ValueError,
+    ) as exc:
+        raise ApiError(
+            400, "invalid_request", "The file is not a PNG, JPEG, WebP, GIF or HEIC image"
+        ) from exc
+    if too_large:
+        raise ApiError(400, "invalid_request", "The image has too many pixels")
+    try:
+        normalized = normalize_image(
+            source,
+            out_dir,
+            max_long_edge=long_edge,
+            stem=stem,
+            formats=workspace_documents.IMAGE_FORMATS,
+        )
+    except ImageError as exc:
+        raise ApiError(400, "invalid_request", "The image could not be read") from exc
+    return normalized.path
+
+
+@router.post("/images", dependencies=[CsrfGuard], status_code=status.HTTP_201_CREATED)
+async def upload_image(request: Request, user: SessionUser, db: DbSession, settings: AppSettings):
+    """An image for a document's text: kept as the document's, its path answered for the
+    markdown line the caller writes (docs/api.md)."""
+    if not request.headers.get("content-type", "").startswith("multipart/form-data"):
+        raise ApiError(400, "invalid_request", "The upload must be multipart/form-data")
+    cap = settings.document_image_max_bytes
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > cap + MULTIPART_ENVELOPE_BYTES:
+        raise ApiError(413, "invalid_request", f"The upload exceeds {IMAGE_CAP_NAME}")
+    # Bounded before the parser spools a byte, as an attachment's body is.
+    try:
+        form = await MultiPartParser(
+            request.headers,
+            capped_stream(
+                request.stream(), cap + MULTIPART_ENVELOPE_BYTES, cap_name=IMAGE_CAP_NAME
+            ),
+        ).parse()
+    except MultiPartException as exc:
+        raise ApiError(400, "invalid_request", "The multipart body could not be read") from exc
+    try:
+        upload = form.get("file")
+        if not isinstance(upload, UploadFile):
+            raise ApiError(400, "invalid_request", "Multipart requests need a 'file' part")
+        document_id = form.get("document_id")
+        if not isinstance(document_id, str) or not document_id.isdigit():
+            raise ApiError(400, "invalid_request", "Multipart requests need a 'document_id' part")
+        row = await owned_document(db, user.id, int(document_id))
+        upload_dir = Path(settings.upload_dir)
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        stem = uuid.uuid4().hex
+        staged = upload_dir / f"{stem}.upload"
+        try:
+            await store_upload(upload_chunks(upload), staged, cap, cap_name=IMAGE_CAP_NAME)
+            prepared = await asyncio.to_thread(
+                prepare_image,
+                staged,
+                upload_dir,
+                stem,
+                max_pixels=settings.chat_page_image_max_pixels,
+                long_edge=settings.document_image_long_edge,
+            )
+            try:
+                name = await workspace_documents.keep_image(db, settings, row, prepared)
+            finally:
+                prepared.unlink(missing_ok=True)
+        finally:
+            staged.unlink(missing_ok=True)
+    finally:
+        await form.close()
+    return {"path": f"figures/{name}"}
+
+
+@router.get("/documents/{document_id}/images/{name}")
+async def document_image(
+    document_id: int, name: str, user: SessionUser, db: DbSession, settings: AppSettings
+):
+    row = await owned_document(db, user.id, document_id)
+    root = user_root(settings.workspaces_dir, row.user_id)
+    image = workspace_documents.image_of(root, row.id, name)
+    if image is None:
+        raise ApiError(404, "invalid_request", "No such image")
+    try:
+        handle = image.open("rb")
+    except OSError as exc:
+        raise ApiError(404, "invalid_request", "No such image") from exc
+    size = os.fstat(handle.fileno()).st_size
+    # Never cached, as a crop is not: a cached image would outlive a sign-out.
+    return StreamingResponse(
+        iterate_in_threadpool(crop_chunks(handle)),
+        media_type=workspace_documents.IMAGE_SUFFIX_MEDIA[image.suffix],
+        headers={"Cache-Control": "private, no-store", "Content-Length": str(size)},
+    )
 
 
 # --- the workspace: where a row's directory is ----------------------------------------------

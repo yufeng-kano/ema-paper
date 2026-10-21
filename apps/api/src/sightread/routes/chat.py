@@ -49,7 +49,15 @@ from ..workspace.documents import (
     materialize_document,
     workspace_size,
 )
-from ..workspace.layout import CACHE_DIR, FILES_DIR, SIGHTREAD_DIR, git_dir, sources_dir, user_root
+from ..workspace.layout import (
+    CACHE_DIR,
+    FILES_DIR,
+    SIGHTREAD_DIR,
+    git_dir,
+    images_dir,
+    sources_dir,
+    user_root,
+)
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
@@ -770,6 +778,9 @@ def _workspace_usage(root: Path, quota: int) -> dict:
     originals = directory_size(sources_dir(root))
     if originals:
         breakdown.append({"path": "originals/", "bytes": originals})
+    images = directory_size(images_dir(root))
+    if images:
+        breakdown.append({"path": "images/", "bytes": images})
     return {
         "bytes": workspace_size(root),
         "quota_bytes": quota,

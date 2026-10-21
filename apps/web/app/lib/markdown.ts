@@ -44,6 +44,9 @@ export type ResultBlock =
    *  sits in: blocks move across page markers, and the crop stays where it was cut
    *  (docs/web.md § Result viewer, *Figures*). */
   | { kind: 'fig'; id: string; page: number; bbox: Bbox; caption: string | null; src: string }
+  /** A picture the reader inserted: `name` is the stored file (`img-<hash>.png`), which the
+   *  document's images route serves, never a URL (docs/web.md § Result viewer). */
+  | { kind: 'img'; alt: string; name: string; caption: string | null; src: string }
   | { kind: 'toc'; entries: TocEntry[]; src: string }
   /** A run of `>` lines, its content read as blocks of their own — one level: a `>` inside
    *  is that quote's text (docs/web.md § Result viewer, *Blockquotes*). */
@@ -73,6 +76,9 @@ export interface ResultPageBlocks {
 
 const PAGE_MARKER = /^<!--\s*page:\s*(\d+)\s*-->$/
 const FIGURE = /^!\[([^\]\n]*)\]\(\s*sightread:\/\/p(\d+)\/(-?\d+),(-?\d+),(-?\d+),(-?\d+)\s*\)$/
+/** Only the names the image store makes: anything else in `![…](…)` stays text, so nothing in
+ *  a document is ever fetched from elsewhere (docs/workspace.md § Inserted images). */
+const IMAGE = /^!\[([^\]\n]*)\]\(\s*figures\/(img-[0-9a-f]{16}\.(?:png|jpg))\s*\)$/
 const HEADING = /^(#{1,6})\s+(.*)$/
 const COMMENT = /^<!--.*-->$/
 /** `- item`, `* item`, `+ item`, `1. item`, `2) item`. */
@@ -165,7 +171,7 @@ function startsBlock(line: string, next = '', quoted = false): boolean {
     isTableStart(line, next) ||
     line.startsWith('#') ||
     LIST_ITEM.test(line) ||
-    (!quoted && FIGURE.test(line)) ||
+    (!quoted && (FIGURE.test(line) || IMAGE.test(line))) ||
     PAGE_MARKER.test(line) ||
     COMMENT.test(line)
   )
@@ -264,9 +270,10 @@ function parsePages(markdown: string, quoted: boolean): ResultPageBlocks[] {
     }
 
     // Inside a quote a placeholder is a line of text: a quote holds only what reads as text
-    // (docs/web.md § Notes, *Excerpts*), and a crop has no place in one.
+    // (docs/web.md § Notes, *Excerpts*), and a crop has no place in one. An image likewise.
     const figure = quoted ? null : FIGURE.exec(line)
-    if (figure) {
+    const image = quoted || figure ? null : IMAGE.exec(line)
+    if (figure || image) {
       const target = page()
       // The caption is written verbatim on the next line, and only there — anything that
       // starts another block is the next block, not this figure's caption.
@@ -275,14 +282,19 @@ function parsePages(markdown: string, quoted: boolean): ResultPageBlocks[] {
       if (captioned) {
         index += 1
       }
-      target.blocks.push({
-        kind: 'fig',
-        id: figure[1] || `fig${target.blocks.filter((block) => block.kind === 'fig').length + 1}`,
-        page: Number(figure[2]),
-        bbox: [Number(figure[3]), Number(figure[4]), Number(figure[5]), Number(figure[6])],
-        caption: captioned ? next : null,
-        src: source(first, index),
-      })
+      const caption = captioned ? next : null
+      if (figure) {
+        target.blocks.push({
+          kind: 'fig',
+          id: figure[1] || `fig${target.blocks.filter((block) => block.kind === 'fig').length + 1}`,
+          page: Number(figure[2]),
+          bbox: [Number(figure[3]), Number(figure[4]), Number(figure[5]), Number(figure[6])],
+          caption,
+          src: source(first, index),
+        })
+      } else if (image) {
+        target.blocks.push({ kind: 'img', alt: image[1]!, name: image[2]!, caption, src: source(first, index) })
+      }
       continue
     }
 
@@ -1057,8 +1069,8 @@ export function sectionSource(pages: readonly ResultPageBlocks[], pageIndex: num
 // three read a block the same way: as the text it shows.
 
 /** A block as the text it reads as: markdown removed, a formula as its TeX, a list's items, a
- *  table's cells and a quote's blocks one after another, spacing collapsed. A figure is its
- *  caption; a comment is nothing. */
+ *  table's cells and a quote's blocks one after another, spacing collapsed. A figure or an
+ *  image is its caption; a comment is nothing. */
 export function blockPlain(block: ResultBlock): string {
   switch (block.kind) {
     case 'h2':
@@ -1077,6 +1089,7 @@ export function blockPlain(block: ResultBlock): string {
         .filter(Boolean)
         .join(' ')
     case 'fig':
+    case 'img':
       return block.caption ? inlinePlain(block.caption) : ''
     case 'toc':
       return block.entries
@@ -1208,6 +1221,54 @@ export function moveBlocks(
   }
   const page = rest.indexOf(host)
   return { markdown: next, first: { page, index: at }, last: { page, index: at + moving.length - 1 } }
+}
+
+/**
+ * The document with the blocks `src` holds inserted before or after `target` — at the end of
+ * the document's last page when there is no target, as on an empty document — and where they
+ * now sit (docs/web.md § Editing, *Images*). Page markers in `src` are left out: what lands
+ * belongs to the page it lands on. Null when `src` holds no block.
+ */
+export function insertBlocks(markdown: string, target: BlockAt | null, place: 'before' | 'after', src: string): MovedBlocks | null {
+  const adding = parseResultMarkdown(src).flatMap((page) => page.blocks)
+  if (!adding.length) {
+    return null
+  }
+  const pages = parseResultMarkdown(markdown)
+  const aimed = target ? pages[target.page]?.blocks[target.index] : undefined
+  let host: ResultPageBlocks
+  let at: number
+  if (target && aimed) {
+    host = pages[target.page]!
+    at = host.blocks.indexOf(aimed)
+    if (place === 'after') {
+      at += 1
+      while (host.blocks[at]?.kind === 'comment') {
+        at += 1
+      }
+    }
+  } else {
+    host = pages[pages.length - 1] ?? { page: 1, blocks: [], unmarked: true }
+    if (!pages.length) {
+      pages.push(host)
+    }
+    at = host.blocks.length
+  }
+  host.blocks.splice(at, 0, ...adding)
+  const page = pages.indexOf(host)
+  return { markdown: serializeDocument(pages), first: { page, index: at }, last: { page, index: at + adding.length - 1 } }
+}
+
+/** The line an uploaded image is written as: its file's name for the alt text — the
+ *  extension dropped, and what would end the brackets or the line taken out. */
+export function imageLine(fileName: string, path: string): string {
+  const alt = fileName
+    .replace(/\.[^.]*$/, '')
+    .replace(/[[\]\n\r]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80)
+  return `![${alt || 'image'}](${path})`
 }
 
 // --- links to a block -------------------------------------------------------------------------

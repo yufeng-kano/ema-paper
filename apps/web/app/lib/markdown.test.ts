@@ -8,7 +8,9 @@ import {
   findHeading,
   firstWords,
   headingSlug,
+  imageLine,
   inlinePlain,
+  insertBlocks,
   moveBlocks,
   parseInline,
   parseResultMarkdown,
@@ -1179,5 +1181,73 @@ describe('block anchors', () => {
     const moved = moveBlocks(markdown, { from: { page: 0, index: 2 }, to: { page: 0, index: 2 } }, { page: 1, index: 3 }, 'after')
     const after = parseResultMarkdown(moved!.markdown)
     expect(resolveAnchor(after, '32-attention~An attention function can be described as mapping')).toEqual({ page: 1, index: 4 })
+  })
+})
+
+describe('inserted images', () => {
+  it('reads only a stored image name as an image, with its caption line', () => {
+    const blocks = parseResultMarkdown(
+      [
+        '![diagram](figures/img-3f9a0c1d2e4b5a6c.png)',
+        'The pipeline, end to end',
+        '',
+        '![photo](figures/img-3f9a0c1d2e4b5a6c.jpg)',
+        '',
+        '![remote](https://example.com/a.png)',
+        '',
+        '![short](figures/img-3f9a.png)',
+        '',
+        '![other](figures/p1_0_0_1_1.png)',
+      ].join('\n'),
+    )[0]!.blocks
+    expect(bare(blocks)).toEqual([
+      { kind: 'img', alt: 'diagram', name: 'img-3f9a0c1d2e4b5a6c.png', caption: 'The pipeline, end to end' },
+      { kind: 'img', alt: 'photo', name: 'img-3f9a0c1d2e4b5a6c.jpg', caption: null },
+      { kind: 'p', text: '![remote](https://example.com/a.png)' },
+      { kind: 'p', text: '![short](figures/img-3f9a.png)' },
+      { kind: 'p', text: '![other](figures/p1_0_0_1_1.png)' },
+    ])
+    expect(blocks[0]!.src).toBe('![diagram](figures/img-3f9a0c1d2e4b5a6c.png)\nThe pipeline, end to end')
+    expect(blockPlain(blocks[0]!)).toBe('The pipeline, end to end')
+  })
+
+  it('is text inside a quote, as a figure is', () => {
+    const [quote] = parseResultMarkdown('> ![a](figures/img-3f9a0c1d2e4b5a6c.png)')[0]!.blocks
+    expect(quote?.kind === 'quote' && quote.blocks[0]?.kind).toBe('p')
+  })
+
+  it('writes the line from the file name, nothing in it able to end the brackets', () => {
+    expect(imageLine('Screen Shot 2026-10-21.png', 'figures/img-0123456789abcdef.png')).toBe(
+      '![Screen Shot 2026-10-21](figures/img-0123456789abcdef.png)',
+    )
+    expect(imageLine('a]b[c\nd.jpeg', 'figures/img-0123456789abcdef.jpg')).toBe('![a b c d](figures/img-0123456789abcdef.jpg)')
+    expect(imageLine('.png', 'figures/img-0123456789abcdef.png')).toBe('![image](figures/img-0123456789abcdef.png)')
+  })
+})
+
+describe('insertBlocks', () => {
+  const line = '![shot](figures/img-0123456789abcdef.png)'
+
+  it('lands before or after a block, past the comments it carries', () => {
+    const doc = ['<!-- page: 1 -->', 'one', '', '<!-- note -->', '', 'two'].join('\n')
+    const after = insertBlocks(doc, { page: 0, index: 0 }, 'after', line)
+    expect(after?.markdown).toBe(['<!-- page: 1 -->', 'one', '', '<!-- note -->', '', line, '', 'two'].join('\n'))
+    expect(after?.first).toEqual({ page: 0, index: 2 })
+    const before = insertBlocks(doc, { page: 0, index: 0 }, 'before', `${line}\n\nA caption-less paragraph.`)
+    expect(before?.markdown).toBe(['<!-- page: 1 -->', line, '', 'A caption-less paragraph.', '', 'one', '', '<!-- note -->', '', 'two'].join('\n'))
+    expect([before?.first, before?.last]).toEqual([
+      { page: 0, index: 0 },
+      { page: 0, index: 1 },
+    ])
+  })
+
+  it('goes at the end without a target, and makes an empty document its first block', () => {
+    expect(insertBlocks('', null, 'after', line)).toEqual({ markdown: line, first: { page: 0, index: 0 }, last: { page: 0, index: 0 } })
+    expect(insertBlocks('one', null, 'after', line)?.markdown).toBe(`one\n\n${line}`)
+  })
+
+  it('leaves page markers out of what it inserts, and inserts nothing for no block', () => {
+    expect(insertBlocks('one', { page: 0, index: 0 }, 'after', '<!-- page: 4 -->\ntwo')?.markdown).toBe('one\n\ntwo')
+    expect(insertBlocks('one', null, 'after', '\n\n')).toBeNull()
   })
 })

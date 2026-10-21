@@ -1353,6 +1353,7 @@ function rowAttrs(row: Row): Record<string, unknown> {
       "
       :error-message="resultErrors.get(openDocument.id) ?? null"
       :figure-base="openDocument.kind === 'markdown' ? null : `/api/library/documents/${openDocument.id}/figures`"
+      :image-base="`/api/library/documents/${openDocument.id}/images`"
       :document-id="openDocument.id"
       :markdown-document="openDocument.kind === 'markdown'"
       :initial-block="linkedBlock?.id === openDocument.id ? linkedBlock.anchor : null"

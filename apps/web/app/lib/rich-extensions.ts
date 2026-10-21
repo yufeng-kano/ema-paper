@@ -20,7 +20,7 @@ import { Table, TableCell, TableHeader, TableRow } from '@tiptap/extension-table
 import { Placeholder } from '@tiptap/extensions'
 import StarterKit from '@tiptap/starter-kit'
 import { BLOCK_DRAG_TYPE } from './dnd'
-import { parseInline, type InlineSegment } from './markdown'
+import { inlinePlain, parseInline, parseResultMarkdown, type InlineSegment, type ResultBlock } from './markdown'
 import { renderTexHtml } from './math'
 import { inlineMathAtEnd, sliceToMarkdown } from './richdoc'
 
@@ -77,6 +77,12 @@ export interface RichOptions {
     /** Pasted or dropped markdown before it is read: block references to this document become
      *  section links (docs/web.md § Notes, *Quotes and section links*). */
     rewrite?: (markdown: string) => string
+  }
+  /** Figures and images drawn as themselves rather than as their source: the address of a
+   *  block's picture, or null for the dashed frame, and the frame's words for each. */
+  figures?: {
+    url: (block: Extract<ResultBlock, { kind: 'fig' | 'img' }>) => string | null
+    pending: { figure: string; image: string }
   }
 }
 
@@ -258,22 +264,84 @@ function blockMath(options: RichOptions) {
   })
 }
 
-/** A block with no rich-text form — a contents page, a figure placeholder, a comment —
- *  carried through as its source. */
-const RawBlock = Node.create({
-  name: 'rawBlock',
-  group: 'block',
-  atom: true,
-  addAttributes() {
-    return { source: { default: '' } }
-  },
-  parseHTML() {
-    return [{ tag: 'pre[data-raw-block]', getAttrs: (el) => ({ source: (el as HTMLElement).textContent ?? '' }) }]
-  },
-  renderHTML({ node, HTMLAttributes }) {
-    return ['pre', mergeAttributes(HTMLAttributes, { 'data-raw-block': '', class: 'md-math rich-raw' }), node.attrs.source]
-  },
-})
+/** The figure or image a raw block's source is, alone, or null. */
+function pictureOf(source: string): Extract<ResultBlock, { kind: 'fig' | 'img' }> | null {
+  const blocks = parseResultMarkdown(source).flatMap((page) => page.blocks)
+  const only = blocks.length === 1 ? blocks[0]! : null
+  return only?.kind === 'fig' || only?.kind === 'img' ? only : null
+}
+
+/** The dashed frame a picture with nothing to load is drawn as, as `MdBlock` draws it. */
+function pictureFrame(pending: string): HTMLElement {
+  const frame = document.createElement('div')
+  frame.className = 'figure-frame'
+  frame.textContent = pending
+  return frame
+}
+
+/** A block with no rich-text form — a contents page, a figure placeholder, an image, a
+ *  comment — carried through as its source. Given `figures`, a figure or an image is drawn as
+ *  the document draws it, the picture and its caption, and stays one atom (docs/web.md
+ *  § Editing, *Images*). */
+function rawBlock(options: RichOptions) {
+  const figures = options.figures
+  return Node.create({
+    name: 'rawBlock',
+    group: 'block',
+    atom: true,
+    addAttributes() {
+      return { source: { default: '' } }
+    },
+    parseHTML() {
+      return [{ tag: 'pre[data-raw-block]', getAttrs: (el) => ({ source: (el as HTMLElement).textContent ?? '' }) }]
+    },
+    renderHTML({ node, HTMLAttributes }) {
+      return ['pre', mergeAttributes(HTMLAttributes, { 'data-raw-block': '', class: 'md-math rich-raw' }), node.attrs.source]
+    },
+    ...(figures
+      ? {
+          addNodeView() {
+            return ({ node }) => {
+              const source = String(node.attrs.source)
+              // Any other change is a new view: a figure's source is its whole address.
+              const update = (next: typeof node) => next.type === node.type && next.attrs.source === source
+              const picture = pictureOf(source)
+              if (!picture) {
+                const dom = document.createElement('pre')
+                dom.className = 'md-math rich-raw'
+                dom.dataset.rawBlock = ''
+                dom.textContent = source
+                return { dom, update }
+              }
+              const dom = document.createElement('figure')
+              dom.className = 'md-figure rich-figure'
+              dom.contentEditable = 'false'
+              const pending = picture.kind === 'fig' ? figures.pending.figure : figures.pending.image
+              const url = figures.url(picture)
+              if (url) {
+                const image = document.createElement('img')
+                image.className = 'figure-image'
+                image.src = url
+                image.alt = picture.caption ? inlinePlain(picture.caption) : picture.kind === 'fig' ? picture.id : picture.alt
+                image.draggable = false
+                image.addEventListener('error', () => image.replaceWith(pictureFrame(pending)), { once: true })
+                dom.append(image)
+              } else {
+                dom.append(pictureFrame(pending))
+              }
+              if (picture.caption) {
+                const caption = document.createElement('figcaption')
+                caption.className = 'figure-caption'
+                caption.textContent = inlinePlain(picture.caption)
+                dom.append(caption)
+              }
+              return { dom, update }
+            }
+          },
+        }
+      : {}),
+  })
+}
 
 /**
  * A quote: blocks behind a bar, one level — its content holds no quote, as the parser reads
@@ -604,7 +672,7 @@ export function richExtensions(options: RichOptions = {}): Extensions {
     blockMath(options),
     Quote,
     ...(options.links ? [sectionLink(options)] : []),
-    RawBlock,
+    rawBlock(options),
     SourceAttributes,
     FlatLists,
     Washes,

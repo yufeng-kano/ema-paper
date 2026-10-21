@@ -408,6 +408,9 @@ export default {
     findNext: 'Next match',
     findClose: 'Close find',
     figurePending: 'No stored crop for this figure',
+    imagePending: 'This image could not be loaded',
+    imageUploading: 'Uploading image…',
+    imageTooLarge: 'The image is larger than {size}',
     parsing: 'Still parsing — {done} of {total} pages ready',
     parsingSimple: 'Still parsing…',
     status: {
@@ -443,6 +446,7 @@ export default {
         table: 'Table',
         code: 'Code',
         fig: 'Figure',
+        img: 'Image',
         quote: 'Quote',
         toc: 'Contents',
       },
@@ -480,6 +484,7 @@ export default {
       formula: 'Display formula',
       code: 'Code',
       table: 'Table',
+      image: 'Image',
     },
     names: {
       formula: 'Formula',
@@ -487,6 +492,8 @@ export default {
       quoted: '“{words}”',
       figure: 'Figure {name}',
       figureBare: 'Figure',
+      image: 'Image {name}',
+      imageBare: 'Image',
     },
     fold: {
       collapse: 'Collapse section',
@@ -519,6 +526,7 @@ export default {
       linkCopied: 'Link copied',
       copyFailed: 'Couldn’t copy',
       moved: 'Moved',
+      imagesAdded: 'Image inserted | {n} images inserted',
       deleted: '{n} block deleted | {n} blocks deleted',
       undo: 'Undo ({keys})',
       alreadyInNotes: 'Already in notes',
