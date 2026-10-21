@@ -49,9 +49,11 @@ from ..workspace.documents import (
     copy_original,
     ensure_within_quota,
     folder_names,
+    is_live,
     keep_source,
     materialize_document,
     original_of,
+    user_folders,
 )
 from ..workspace.layout import document_relative_dir, user_root
 from ..workspace.locks import backup_shared, workspace_lock
@@ -667,7 +669,9 @@ async def _finish_held(
                     # The rows again, in this session: the ones above belong to the one
                     # that committed the result, and a detached row cannot be refreshed.
                     row = await db.get(Document, document.id)
-                    if row is not None:
+                    # A document in the Trash gets its directory when it is put back
+                    # (docs/workspace.md § The Trash); materialization refuses it anyway.
+                    if row is not None and is_live(row, await user_folders(db, row.user_id)):
                         await materialize_document(db, settings, row)
                 except Exception:  # noqa: BLE001 - the parse succeeded; the copy can wait
                     logger.exception("could not materialize document %d", document.id)
@@ -720,10 +724,16 @@ async def _retain_source(
                     len(pending),
                 )
                 pending = []
+            folders = await user_folders(db, job.user_id)
             for index, row in enumerate(pending):
-                relative = document_relative_dir(
-                    await folder_names(db, row.user_id, row.folder_id), row.name
-                )
+                # A document in the Trash keeps its original without the shell's copy,
+                # which would make a directory under `files/` for a file that is not
+                # there (docs/workspace.md § The Trash).
+                relative = None
+                if is_live(row, folders):
+                    relative = document_relative_dir(
+                        await folder_names(db, row.user_id, row.folder_id), row.name
+                    )
                 try:
                     # Every copy counts: a full workspace keeps no more of them.
                     await ensure_within_quota(settings, root)

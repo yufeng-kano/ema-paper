@@ -909,3 +909,97 @@ async def test_the_markdown_migration_keeps_every_job_and_refuses_to_downgrade_o
     assert nullable == "NO"
     _alembic(scratch_url, "upgrade", "head")
     await engine.dispose()
+
+
+LIBRARY_TRASH = "593bad709660"
+
+
+async def test_the_trash_migration_frees_trashed_names_and_refuses_to_downgrade_over_them(
+    scratch_url,
+) -> None:
+    """Every existing row stays live; after the upgrade a row in the Trash no longer holds
+    its name, and the downgrade refuses while anything is in the Trash rather than choose
+    which of two same-named rows survives (docs/database.md § Rules)."""
+    _alembic(scratch_url, "upgrade", MARKDOWN_DOCUMENTS)
+
+    engine = create_async_engine(scratch_url)
+    async with engine.begin() as db:
+        user_id = (
+            await db.execute(
+                text(
+                    "INSERT INTO users (google_sub, email, created_at) "
+                    "VALUES ('sub', 't@example.com', now()) RETURNING id"
+                )
+            )
+        ).scalar_one()
+        folder_id = (
+            await db.execute(
+                text(
+                    "INSERT INTO folders (user_id, parent_id, name, created_at, updated_at) "
+                    "VALUES (:user, NULL, 'Papers', now(), now()) RETURNING id"
+                ),
+                {"user": user_id},
+            )
+        ).scalar_one()
+        await db.execute(
+            text(
+                "INSERT INTO documents (user_id, folder_id, job_id, name, created_at, "
+                "updated_at) VALUES (:user, :folder, NULL, 'a.md', now(), now())"
+            ),
+            {"user": user_id, "folder": folder_id},
+        )
+
+    _alembic(scratch_url, "upgrade", LIBRARY_TRASH)
+
+    async with engine.begin() as db:
+        marks = (
+            await db.execute(
+                text("SELECT trashed_at FROM folders UNION ALL SELECT trashed_at FROM documents")
+            )
+        ).scalars()
+        assert list(marks) == [None, None]
+        # In the Trash, a folder and a file free their names, at the top level and inside
+        # a folder.
+        await db.execute(text("UPDATE folders SET trashed_at = now()"))
+        await db.execute(text("UPDATE documents SET trashed_at = now()"))
+        await db.execute(
+            text(
+                "INSERT INTO folders (user_id, parent_id, name, created_at, updated_at) "
+                "VALUES (:user, NULL, 'Papers', now(), now())"
+            ),
+            {"user": user_id},
+        )
+        await db.execute(
+            text(
+                "INSERT INTO documents (user_id, folder_id, job_id, name, created_at, "
+                "updated_at) VALUES (:user, :folder, NULL, 'a.md', now(), now())"
+            ),
+            {"user": user_id, "folder": folder_id},
+        )
+    # Two live rows still cannot share a name.
+    with pytest.raises(IntegrityError):
+        async with engine.begin() as db:
+            await db.execute(
+                text(
+                    "INSERT INTO folders (user_id, parent_id, name, created_at, updated_at) "
+                    "VALUES (:user, NULL, 'Papers', now(), now())"
+                ),
+                {"user": user_id},
+            )
+
+    with pytest.raises(subprocess.CalledProcessError) as refused:
+        _alembic(scratch_url, "downgrade", MARKDOWN_DOCUMENTS)
+    assert b"2 item(s) are in the Trash" in refused.value.stderr
+    async with engine.begin() as db:
+        version = (await db.execute(text("SELECT version_num FROM alembic_version"))).scalar()
+        assert version == LIBRARY_TRASH
+        await db.execute(text("DELETE FROM documents WHERE trashed_at IS NOT NULL"))
+        # Put back under a free name: nothing left in the Trash, the downgrade goes ahead.
+        await db.execute(
+            text("UPDATE folders SET name = 'Old papers', trashed_at = NULL WHERE id = :id"),
+            {"id": folder_id},
+        )
+
+    _alembic(scratch_url, "downgrade", MARKDOWN_DOCUMENTS)
+    _alembic(scratch_url, "upgrade", "head")
+    await engine.dispose()

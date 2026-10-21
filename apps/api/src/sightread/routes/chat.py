@@ -46,7 +46,9 @@ from ..sandbox.client import SandboxClient, SandboxUnavailable
 from ..workspace.documents import (
     current_revision,
     directory_size,
+    is_live,
     materialize_document,
+    user_folders,
     workspace_size,
 )
 from ..workspace.layout import (
@@ -56,6 +58,7 @@ from ..workspace.layout import (
     git_dir,
     images_dir,
     sources_dir,
+    trash_root,
     user_root,
 )
 
@@ -92,12 +95,14 @@ async def owned_conversation(db: AsyncSession, user_id: int, conversation_id: in
 
 
 async def owned_document(db: AsyncSession, user_id: int, document_id: int) -> Document:
+    """A document of the caller's that is not in the Trash: a trashed file is not talked
+    about until it is put back (docs/api.md)."""
     row = (
         await db.execute(
             select(Document).where(Document.id == document_id, Document.user_id == user_id)
         )
     ).scalar_one_or_none()
-    if row is None:
+    if row is None or not is_live(row, await user_folders(db, user_id)):
         raise ApiError(404, "invalid_request", "No such document")
     return row
 
@@ -130,13 +135,8 @@ async def create_conversation(
     # again under it: a delete racing this ends with a clean 404 here, or with a thread
     # the delete then takes along with the document — never a 500 (docs/api.md).
     await db.execute(select(User.id).where(User.id == user.id).with_for_update())
-    still = (
-        await db.execute(
-            select(Document.id).where(Document.id == document.id, Document.user_id == user.id)
-        )
-    ).first()
-    if still is None:
-        raise ApiError(404, "invalid_request", "No such document")
+    # The same lock a move to the Trash takes: one meanwhile is a 404 here too.
+    await owned_document(db, user.id, document.id)
     row = Conversation(
         user_id=user.id,
         document_id=document.id,
@@ -422,6 +422,12 @@ async def post_message(
         # Deleted while this send waited for the lock: a clean 404, not rows inserted
         # for a conversation that is gone (docs/chat.md § Conversations).
         raise ApiError(404, "invalid_request", "No such conversation")
+    # Under the user's row lock, which a move to the Trash takes before it marks the row:
+    # no turn starts on a file in the Trash, and none queued here is missed by its check
+    # for unfinished turns (docs/workspace.md § The Trash).
+    document = await db.get(Document, row.document_id)
+    if document is None or not is_live(document, await user_folders(db, user.id)):
+        raise ApiError(409, "invalid_request", "This file is in the Trash; put it back to continue")
     setting = await _ready_to_chat(db, settings, user.id, needs_model=row.model is None)
     if row.model is None and setting is not None and setting.model:
         # The model the message was sent under, fixed as it is accepted: a change on the
@@ -519,8 +525,7 @@ async def post_message(
     # languages they chose: with the message rather than in the system prompt, so an edit
     # made meanwhile reaches the model and a change of language costs no cache (docs/chat.md
     # § Prompt caching, § Instructions).
-    document = await db.get(Document, row.document_id)
-    revision = None if document is None else await current_revision(db, settings, document)
+    revision = await current_revision(db, settings, document)
     note = turn_note(
         revision,
         body.locale,
@@ -781,6 +786,9 @@ def _workspace_usage(root: Path, quota: int) -> dict:
     images = directory_size(images_dir(root))
     if images:
         breakdown.append({"path": "images/", "bytes": images})
+    trash = directory_size(root, trash_root(root))
+    if trash:
+        breakdown.append({"path": "trash/", "bytes": trash})
     return {
         "bytes": workspace_size(root),
         "quota_bytes": quota,
