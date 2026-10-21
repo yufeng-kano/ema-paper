@@ -31,11 +31,17 @@ export const BLOCK_DRAG_TYPE = 'application/x-sightread-blocks'
  *  one (docs/web.md § The agent panel, *An answer is blocks*). */
 export const ANSWER_DRAG_TYPE = 'application/x-sightread-answer'
 
+/** The type a drag of the library's own rows carries: what tells it from text or files
+ *  dragged in from elsewhere, which carry the same `text/plain` (docs/web.md § Files,
+ *  *Moving*). */
+export const ROWS_DRAG_TYPE = 'application/x-sightread-rows'
+
 /** What a handler claimed a drag event for. */
 export type DragClaim =
   /** A folder is the destination under the pointer, and it is drawn as the target. */
   | 'target'
-  /** The open folder's list is under the pointer — where dropped files land. */
+  /** The open folder's list is under the pointer — where dropped files land, and rows a
+   *  drag brought from another folder. */
   | 'list'
   /** A block of the result viewer is under a block being dragged — where it would land. */
   | 'block'

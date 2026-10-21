@@ -169,3 +169,36 @@ export function isMarkdownUpload(file: { name: string; type: string }, limits: U
   const extension = dot === -1 ? '' : file.name.slice(dot).toLowerCase()
   return extension !== '' && (limits?.markdown_extensions?.includes(extension) ?? false)
 }
+
+/**
+ * How much of a name a rename selects when it opens: a document's name up to its extension
+ * (`DINO` of `DINO.pdf`), a folder's whole name — Finder's choice, since the extension is the
+ * part a rename almost never means to change. A leading dot is a name, not an extension.
+ */
+export function renameSelectionEnd(name: string, folder: boolean): number {
+  const dot = name.lastIndexOf('.')
+  return folder || dot <= 0 ? name.length : dot
+}
+
+/** The keys from `from` to `to`, both included, in list order — what ⇧-click and ⇧↑↓ select.
+ *  With `from` gone from the list, the run is `to` alone. */
+export function keyRange(keys: string[], from: string, to: string): string[] {
+  const start = keys.indexOf(from)
+  const end = keys.indexOf(to)
+  if (end === -1) {
+    return []
+  }
+  if (start === -1) {
+    return [to]
+  }
+  return keys.slice(Math.min(start, end), Math.max(start, end) + 1)
+}
+
+/**
+ * The row typing selects: the first, in list order, whose name starts with what was typed —
+ * case-insensitively, as a file manager's type-ahead reads names.
+ */
+export function typeAheadMatch(rows: { key: string; name: string }[], typed: string): string | null {
+  const prefix = typed.toLocaleLowerCase()
+  return rows.find((row) => row.name.toLocaleLowerCase().startsWith(prefix))?.key ?? null
+}

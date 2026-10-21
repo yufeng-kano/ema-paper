@@ -1,12 +1,19 @@
 <script setup lang="ts">
 /**
- * The file library: folders on the left, what is in the open one on the right
- * (docs/web.md § Files).
+ * The file library: the folder that is open, and a Trash (docs/web.md § Files).
  *
- * Three things make this screen work, and each is a decision rather than a detail:
+ * It works the way the desktop's file manager does — Finder's model, with ⌘ read as Ctrl off
+ * Apple platforms — because that is the one model every reader already has. Each of these is
+ * a decision rather than a detail:
  *
- *  - **One read.** `GET /api/library` returns the whole tree, so opening a folder is a
- *    filter over data already in memory. There is no spinner between a click and a list.
+ *  - **One read.** `GET /api/library` returns the whole tree and the Trash, so opening a
+ *    folder is a filter over data already in memory. There is no spinner between a click and
+ *    a list.
+ *  - **A click selects, a double click opens**, and every action takes the selection — the
+ *    menus, Finder's keys, a drag. Nothing that can be undone asks first: Move to Trash is
+ *    immediate, and ⌘Z takes back any file operation made here.
+ *  - **Nothing pops up.** A new item and a rename are named in their row; only the two
+ *    deletes nothing can undo ask, in a strip over the Trash's list.
  *  - **Uploading is a queue.** The server caps running jobs per user, so a five-file drop
  *    earns 429s if it fires at once. Files go up one at a time and a refusal is treated as
  *    back-pressure: the file waits and tries again. Every dropped file is a row from the
@@ -14,22 +21,25 @@
  *  - **Polling, not streaming.** While anything is queued or running, the same one read
  *    repeats every couple of seconds and refreshes every row's status and progress at once.
  *
- * The screen has no action buttons at all. Uploading, making a folder, renaming, moving and
- * deleting are opened where a desktop file manager opens them — a right-click, a long press,
- * or `Shift+F10` on whatever is focused — so there is one interaction to learn instead of a
- * button per verb. Left-click still means open (docs/web.md § Files).
- *
  * Nothing on this screen explains itself in prose: the drop target, the empty folder and
  * the menu items say what they are.
  */
+import type { ComponentPublicInstance } from 'vue'
 import {
   ApiRequestError,
+  copyDocument,
+  copyFolder,
   createDocument,
   createFolder,
   deleteDocument,
   deleteFolder,
+  emptyTrash,
   getDocumentResult,
   getLibrary,
+  restoreDocument,
+  restoreFolder,
+  trashDocument,
+  trashFolder,
   updateDocument,
   updateFolder,
   uploadDocument,
@@ -37,19 +47,21 @@ import {
   type JobStatus,
   type LibraryDocument,
   type LibraryFolder,
+  type TrashedDocument,
+  type TrashedFolder,
 } from '~/lib/api'
 import {
   carriesFiles,
   claimDrag,
   dragClaim,
   droppedFiles,
+  ROWS_DRAG_TYPE,
   setDropEffect,
 } from '~/lib/dnd'
 import { formatBytes, formatShortDateTime } from '~/lib/format'
 import type { MenuItem, Point } from '~/lib/menu'
 import {
   acceptsUpload,
-  canMoveFolder,
   childFolders,
   DOCUMENT_NAME_MAX,
   FOLDER_NAME_MAX,
@@ -57,8 +69,11 @@ import {
   folderPath,
   isMarkdownUpload,
   isPending,
+  keyRange,
   parseProgress,
+  renameSelectionEnd,
   subtreeIds,
+  typeAheadMatch,
   type FolderId,
 } from '~/lib/library'
 import type { TableColumn } from '~/lib/table'
@@ -71,22 +86,86 @@ const POLL_MS = 2000
 const BACKOFF_MS = 3000
 /** How long a row reached through `?document=` stays lit. */
 const REVEAL_MS = 2400
+/** How long a drag rests on a folder before the folder springs open under it. */
+const SPRING_MS = 800
+/** How long typed letters keep adding to the name being looked for. */
+const TYPE_AHEAD_MS = 1000
+/** How long the status note shows, and how long one carrying *Undo* waits for the reader
+ *  (docs/web.md § Editing, *Undo and the status note*). */
+const NOTE_MS = 1600
+const NOTE_UNDO_MS = 8000
+/** How many file operations ⌘Z can take back. */
+const UNDO_MAX = 50
 
 const { t, locale } = useI18n()
 const auth = useAuth()
 const { resolve } = useApiError()
+const { apple, label, matches } = useShortcuts()
 const { data, pending, errorMessage, refresh } = useAuthedData(() => getLibrary())
 
 const folders = computed<LibraryFolder[]>(() => data.value?.folders ?? [])
 const documents = computed<LibraryDocument[]>(() => data.value?.documents ?? [])
+const trash = computed(() => data.value?.trash ?? { folders: [], documents: [] })
+const trashTotal = computed(() => trash.value.folders.length + trash.value.documents.length)
+
+/** Which of the two tabs is showing. */
+const view = ref<'files' | 'trash'>('files')
 
 // --- where we are ----------------------------------------------------------
 
 const currentFolder = ref<FolderId>(null)
 const crumbs = computed(() => folderPath(folders.value, currentFolder.value))
 
-function openFolder(id: FolderId) {
+/**
+ * Open a folder. `select` is the row to select on arrival — the folder just left, when the
+ * way there was up (Esc, ⌘↑, a crumb), so the keys go on from where the reader was.
+ */
+function openFolder(id: FolderId, select?: number) {
   currentFolder.value = id
+  clearSelection()
+  if (select !== undefined) {
+    selectOnly(`folder-${select}`)
+    scrollToRow(`folder-${select}`)
+  }
+}
+
+/** Esc and ⌘↑: the folder above, with the one just left selected. */
+function goUp() {
+  const here = currentFolder.value
+  if (here === null) {
+    return
+  }
+  openFolder(folders.value.find((folder) => folder.id === here)?.parent_id ?? null, here)
+}
+
+/** A crumb opens its folder with the next folder of the path selected — the way back down. */
+function openCrumb(id: FolderId) {
+  const path = crumbs.value
+  const index = id === null ? -1 : path.findIndex((crumb) => crumb.id === id)
+  const below = path[index + 1]
+  if (id === currentFolder.value) {
+    return
+  }
+  openFolder(id, below?.id)
+}
+
+function showView(next: 'files' | 'trash') {
+  if (view.value === next) {
+    return
+  }
+  view.value = next
+  confirming.value = null
+  clearSelection()
+}
+
+/** ← and → between the two tabs, as a tab list is expected to. */
+function onTabKeydown(event: KeyboardEvent) {
+  if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') {
+    return
+  }
+  event.preventDefault()
+  showView(view.value === 'files' ? 'trash' : 'files')
+  void nextTick(() => document.getElementById(`files-tab-${view.value}`)?.focus())
 }
 
 /**
@@ -120,6 +199,7 @@ if (revealId !== null) {
       currentFolder.value = target.folder_id
       revealed.value = target.id
       await nextTick()
+      selectOnly(`file-${target.id}`)
       document.querySelector('.contents tr.revealed')?.scrollIntoView({ block: 'center' })
       revealTimer = setTimeout(() => (revealed.value = null), REVEAL_MS)
       if (revealBlock !== null) {
@@ -133,7 +213,8 @@ if (revealId !== null) {
 
 onBeforeUnmount(() => clearTimeout(revealTimer))
 
-/** A folder deleted in another tab would otherwise leave this screen looking at nothing. */
+/** A folder deleted or trashed in another tab would otherwise leave this screen looking at
+ *  nothing. */
 watch(folders, (list) => {
   if (currentFolder.value !== null && !list.some((row) => row.id === currentFolder.value)) {
     currentFolder.value = null
@@ -158,6 +239,11 @@ type Row =
   | { kind: 'file'; key: string; document: LibraryDocument }
   | { kind: 'upload'; key: string; upload: PendingUpload }
 
+/** A row of the Trash: an item trashed itself, never one inside a trashed folder. */
+type TrashRow =
+  | { kind: 'folder'; key: string; folder: TrashedFolder }
+  | { kind: 'file'; key: string; document: TrashedDocument }
+
 const queue = ref<PendingUpload[]>([])
 
 /** Folders first, then files, then what is still going up — a file manager's order. */
@@ -177,6 +263,22 @@ const rows = computed<Row[]>(() => [
     .map<Row>((upload) => ({ kind: 'upload', key: `upload-${upload.localId}`, upload })),
 ])
 
+/** The latest first, folders and files together, as the Trash lists them. */
+const trashRows = computed<TrashRow[]>(() =>
+  [
+    ...trash.value.folders.map<TrashRow>((folder) => ({ kind: 'folder', key: `folder-${folder.id}`, folder })),
+    ...trash.value.documents.map<TrashRow>((document) => ({
+      kind: 'file',
+      key: `file-${document.id}`,
+      document,
+    })),
+  ].sort((a, b) => trashedAt(b).localeCompare(trashedAt(a))),
+)
+
+function trashedAt(row: TrashRow): string {
+  return row.kind === 'folder' ? row.folder.trashed_at : row.document.trashed_at
+}
+
 const columns = computed<TableColumn<Row>[]>(() => [
   { key: 'name', header: t('files.columnName') },
   { key: 'status', header: t('files.columnStatus'), width: '150px' },
@@ -185,11 +287,198 @@ const columns = computed<TableColumn<Row>[]>(() => [
   { key: 'added', header: t('files.columnAdded'), numeric: true, width: '148px' },
 ])
 
+const trashColumns = computed<TableColumn<TrashRow>[]>(() => [
+  { key: 'name', header: t('files.columnName') },
+  { key: 'origin', header: t('files.columnOrigin'), width: '220px' },
+  { key: 'size', header: t('files.columnSize'), numeric: true, width: '110px' },
+  { key: 'trashed', header: t('files.columnTrashed'), numeric: true, width: '168px' },
+])
+
 const STATUS_TONE: Record<JobStatus, 'neutral' | 'info' | 'ok' | 'danger'> = {
   queued: 'neutral',
   running: 'info',
   succeeded: 'ok',
   failed: 'danger',
+}
+
+/** Where Put Back returns an item, as the column says it: the folder's name, or Home. */
+function originName(origin: string[]): string {
+  return origin.at(-1) ?? t('files.root')
+}
+
+function originPath(origin: string[]): string {
+  return [t('files.root'), ...origin].join(' › ')
+}
+
+// --- the selection ---------------------------------------------------------
+
+/**
+ * A row that can be selected, in either tab: everything but a file still uploading, which
+ * has nothing to act on yet.
+ */
+interface Entry {
+  kind: 'folder' | 'file'
+  id: number
+  key: string
+  name: string
+}
+
+const entries = computed<Entry[]>(() => {
+  const list: (Row | TrashRow)[] = view.value === 'files' ? rows.value : trashRows.value
+  return list.flatMap<Entry>((row) => {
+    if (row.kind === 'folder') {
+      return [{ kind: 'folder', id: row.folder.id, key: row.key, name: row.folder.name }]
+    }
+    if (row.kind === 'file') {
+      return [{ kind: 'file', id: row.document.id, key: row.key, name: row.document.name }]
+    }
+    return []
+  })
+})
+const entryKeys = computed(() => entries.value.map((entry) => entry.key))
+
+/** The selected rows, by key; replaced whole on every change. */
+const selected = ref<ReadonlySet<string>>(new Set())
+/** The row the arrow keys move from: the last one clicked or reached. */
+const cursor = ref<string | null>(null)
+/** Where a ⇧-click or a ⇧↑↓ run starts. */
+let anchor: string | null = null
+
+/** The selection, in list order — what every action takes. */
+const selection = computed(() => entries.value.filter((entry) => selected.value.has(entry.key)))
+
+function selectOnly(key: string) {
+  selected.value = new Set([key])
+  cursor.value = key
+  anchor = key
+}
+
+function selectKeys(keys: string[]) {
+  selected.value = new Set(keys)
+  cursor.value = keys.at(-1) ?? null
+  anchor = keys[0] ?? null
+}
+
+function toggleSelected(key: string) {
+  const next = new Set(selected.value)
+  if (!next.delete(key)) {
+    next.add(key)
+  }
+  selected.value = next
+  cursor.value = key
+  anchor = key
+}
+
+/** ⇧: the run from the anchor to `key`, the anchor kept for the next one. */
+function extendTo(key: string) {
+  selected.value = new Set(keyRange(entryKeys.value, anchor ?? key, key))
+  cursor.value = key
+  anchor ??= key
+}
+
+function clearSelection() {
+  selected.value = new Set()
+  cursor.value = null
+  anchor = null
+}
+
+/** A poll, an action or another tab can take rows away; what is gone leaves the selection. */
+watch(entryKeys, (keys) => {
+  const live = new Set(keys)
+  if ([...selected.value].some((key) => !live.has(key))) {
+    selected.value = new Set([...selected.value].filter((key) => live.has(key)))
+  }
+  if (cursor.value !== null && !live.has(cursor.value)) {
+    cursor.value = null
+  }
+  if (anchor !== null && !live.has(anchor)) {
+    anchor = null
+  }
+  // A row renamed elsewhere out of the list takes its field with it.
+  if (renaming.value && !live.has(renaming.value.key)) {
+    renaming.value = null
+  }
+})
+
+/** After a row left the list, the one now standing in its place is selected, so the keys
+ *  keep a place. */
+async function selectAt(index: number) {
+  await nextTick()
+  const keys = entryKeys.value
+  const key = keys[Math.min(index, keys.length - 1)]
+  if (key === undefined) {
+    clearSelection()
+  } else {
+    selectOnly(key)
+    scrollToRow(key)
+  }
+}
+
+function rowId(key: string): string {
+  return `files-row-${key}`
+}
+
+function scrollToRow(key: string) {
+  void nextTick(() => document.getElementById(rowId(key))?.scrollIntoView({ block: 'nearest' }))
+}
+
+/** What the last press was made with: on touch a tap opens, where a click selects. */
+let pointerKind = 'mouse'
+
+function onPointerDown(event: PointerEvent) {
+  pointerKind = event.pointerType || 'mouse'
+}
+
+/** The platform's command key on a click: ⌘ on Apple platforms, Ctrl elsewhere. */
+function modClick(event: MouseEvent): boolean {
+  return apple ? event.metaKey : event.ctrlKey
+}
+
+function onRowClick(event: MouseEvent, key: string) {
+  if (renaming.value?.key === key) {
+    return
+  }
+  if (pointerKind === 'touch') {
+    // A coarse pointer has no double click and no modifier keys (docs/web.md § Files).
+    selectOnly(key)
+    openEntry(key)
+    return
+  }
+  if (event.shiftKey && anchor !== null) {
+    extendTo(key)
+  } else if (modClick(event)) {
+    toggleSelected(key)
+  } else {
+    selectOnly(key)
+  }
+}
+
+function onRowDblclick(event: MouseEvent, key: string) {
+  if (pointerKind === 'touch' || event.shiftKey || modClick(event) || renaming.value?.key === key) {
+    return
+  }
+  openEntry(key)
+}
+
+/** A click on the list's own empty space clears the selection, as a file manager's does. */
+function onListClick(event: MouseEvent) {
+  if (!(event.target as Element).closest('tbody tr, button, a, input')) {
+    clearSelection()
+  }
+}
+
+/** Open a row: a folder in place, a document in the viewer. Nothing in the Trash opens. */
+function openEntry(key: string) {
+  if (view.value === 'trash') {
+    showNote(t('files.note.inTrash'), false)
+    return
+  }
+  const row = rows.value.find((entry) => entry.key === key)
+  if (row?.kind === 'folder') {
+    openFolder(row.folder.id)
+  } else if (row?.kind === 'file') {
+    void showResult(row.document)
+  }
 }
 
 // --- uploading -------------------------------------------------------------
@@ -210,8 +499,8 @@ let draining = false
 /** Set on unmount: a queue retrying against the job cap must not outlive the screen. */
 let left = false
 
-/** Where the picker's files will land. The menu can be opened on a folder that is not the
- *  open one, and the OS dialog answers long after the menu has gone. */
+/** Where the picker's files will land. The OS dialog answers long after the menu has gone,
+ *  and the reader may have opened another folder meanwhile. */
 let pickInto: FolderId = null
 
 function pickFiles(into: FolderId) {
@@ -357,9 +646,6 @@ watch(
   },
 )
 
-// A reload onto a new build would drop files still waiting to upload, or lose a reader's
-// place — so it waits for both to be over (docs/web.md § Rules).
-useBuildHold(() => queue.value.length > 0 || openDocument.value !== null)
 const results = reactive(new Map<number, JobResult>())
 const resultErrors = reactive(new Map<number, string>())
 /** Ids with a result request in flight — a set, since the viewer can be reopened on
@@ -454,7 +740,7 @@ watch(documents, (list) => {
   if (!target || isPending(target)) {
     return
   }
-  if (target.folder_id !== currentFolder.value) {
+  if (target.folder_id !== currentFolder.value || view.value !== 'files') {
     // The reader walked off to another folder while it parsed. "Upload it and read it"
     // was about the folder they were in, not about interrupting wherever they are now.
     autoPreviewFor = null
@@ -467,191 +753,742 @@ watch(documents, (list) => {
   }
 })
 
-// --- create, rename, move, delete ------------------------------------------
+// --- file operations -------------------------------------------------------
 
-/** What a dialog is currently about. One ref per dialog, never a shared "mode". */
-const newFolderName = ref('')
-const showNewFolder = ref(false)
-/** The folder the new one goes into — the menu's folder, not necessarily the open one. */
-const newFolderParent = ref<FolderId>(null)
-const newDocumentName = ref('')
-const showNewDocument = ref(false)
-/** Where the new document goes — the menu's folder, as for a new folder. */
-const newDocumentFolder = ref<FolderId>(null)
-const renaming = ref<Row | null>(null)
-const renameValue = ref('')
-const moving = ref<Row | null>(null)
-const deleting = ref<Row | null>(null)
+/** An item an operation acted on, as the undo stack keeps it. */
+interface Item {
+  kind: 'folder' | 'file'
+  id: number
+}
+
+/** A move as undo needs it: where from and where to, and the name on each side — the
+ *  destination suffixes a name it already holds. */
+interface Move {
+  item: Item
+  from: FolderId
+  to: FolderId
+  fromName: string
+  toName: string
+}
+
+/**
+ * One file operation, as ⌘Z takes it back (docs/web.md § Files, *Undo*). Trashing and
+ * putting back are each other's undo; whatever made items appear — a copy, a paste, a
+ * duplicate, a new folder or document, a Put Back — is undone by trashing them.
+ */
+type Step =
+  | { type: 'trash'; items: Item[] }
+  | { type: 'appear'; items: Item[] }
+  | { type: 'move'; moves: Move[] }
+  | { type: 'rename'; item: Item; from: string; to: string }
+
+const undoSteps: Step[] = []
+const redoSteps: Step[] = []
+
+/** A new operation: the step on the stack, and no redo past it. */
+function record(step: Step) {
+  undoSteps.push(step)
+  if (undoSteps.length > UNDO_MAX) {
+    undoSteps.shift()
+  }
+  redoSteps.length = 0
+}
+
+function stepItems(step: Step): Item[] {
+  if (step.type === 'move') {
+    return step.moves.map((move) => move.item)
+  }
+  return step.type === 'rename' ? [step.item] : step.items
+}
+
+/** Deleted for good: no step can bring these back, so none is kept that would try. */
+function forget(gone: Item[]) {
+  const ids = new Set(gone.map((item) => `${item.kind}-${item.id}`))
+  for (const stack of [undoSteps, redoSteps]) {
+    const kept = stack.filter((step) => !stepItems(step).some((item) => ids.has(`${item.kind}-${item.id}`)))
+    stack.splice(0, stack.length, ...kept)
+  }
+}
+
+/** One request in flight at a time: a second key press while one runs does nothing. */
 const busy = ref(false)
-/** A dialog owns the page's error while it is open — see the banner in each of them. */
-const dialogOpen = computed(
-  () =>
-    showNewFolder.value || showNewDocument.value || !!renaming.value || !!moving.value || !!deleting.value,
-)
 
-function rowName(row: Row): string {
-  if (row.kind === 'folder') return row.folder.name
-  if (row.kind === 'file') return row.document.name
-  return row.upload.name
-}
-
-function openNewFolder(parent: FolderId) {
-  newFolderParent.value = parent
-  newFolderName.value = t('files.newFolderName')
-  mutationError.value = null
-  showNewFolder.value = true
-}
-
-function openNewDocument(folder: FolderId) {
-  newDocumentFolder.value = folder
-  newDocumentName.value = t('files.newDocumentName')
-  mutationError.value = null
-  showNewDocument.value = true
-}
-
-/** Every mutation is the same three steps: run it, re-read, report what went wrong. */
-async function commit(action: () => Promise<unknown>): Promise<boolean> {
+/**
+ * Every operation is the same steps: run it, re-read the library, report what went wrong
+ * over the list. The re-read runs on failure too — a batch that stopped halfway has still
+ * changed what it changed. A note carrying *Undo* is replaced by the next action.
+ */
+async function run(action: () => Promise<unknown>): Promise<boolean> {
   if (busy.value) {
     return false
   }
   busy.value = true
   mutationError.value = null
+  confirming.value = null
+  hideUndoNote()
   try {
     await action()
-    await refresh()
     return true
   } catch (error) {
     mutationError.value = await resolve(error)
     return false
   } finally {
+    await refresh()
     busy.value = false
   }
 }
 
+function sendToTrash(item: Item): Promise<unknown> {
+  return item.kind === 'folder' ? trashFolder(item.id) : trashDocument(item.id)
+}
+
+function putBackItem(item: Item): Promise<unknown> {
+  return item.kind === 'folder' ? restoreFolder(item.id) : restoreDocument(item.id)
+}
+
+/** Move, rename, or both, by the item's own route; the payload carries the name it got. */
+function place(item: Item, body: { folder?: FolderId; name?: string }): Promise<{ name: string }> {
+  if (item.kind === 'folder') {
+    return updateFolder(item.id, {
+      ...(body.folder !== undefined ? { parent_id: body.folder } : {}),
+      ...(body.name !== undefined ? { name: body.name } : {}),
+    })
+  }
+  return updateDocument(item.id, {
+    ...(body.folder !== undefined ? { folder_id: body.folder } : {}),
+    ...(body.name !== undefined ? { name: body.name } : {}),
+  })
+}
+
+/** The live row behind an item: its folder and its name now, which a stored entry may no
+ *  longer have. */
+function liveRow(item: Item): { parent: FolderId; name: string } | null {
+  if (item.kind === 'folder') {
+    const folder = folders.value.find((row) => row.id === item.id)
+    return folder ? { parent: folder.parent_id, name: folder.name } : null
+  }
+  const document = documents.value.find((row) => row.id === item.id)
+  return document ? { parent: document.folder_id, name: document.name } : null
+}
+
 /**
- * A folder the move picker made, added locally rather than by a re-read: an unawaited read
- * started here could land after the move that follows and put the moved item back.
+ * `items` to the Trash, at once, with Undo: the selection on ⌘⌫ (Delete off Apple
+ * platforms), or what a drag carried to the Trash's tab — which a folder that sprang open on
+ * the way has taken out of the list, and so out of the selection.
  */
-function addFolder(folder: LibraryFolder) {
-  if (data.value) {
-    data.value = { ...data.value, folders: [...data.value.folders, folder] }
-  }
-}
-
-async function submitNewFolder() {
-  const name = newFolderName.value.trim()
-  if (!name) {
+async function trashItems(items: Entry[]) {
+  if (!items.length || busy.value) {
     return
   }
-  const ok = await commit(() => createFolder({ name, parent_id: newFolderParent.value }))
-  if (ok) {
-    showNewFolder.value = false
-  }
-}
-
-/** The new document opens at once, to be written in (docs/web.md § Files). */
-async function submitNewDocument() {
-  const name = newDocumentName.value.trim()
-  if (!name) {
-    return
-  }
-  await commit(async () => {
-    const created = await createDocument({ name, folder_id: newDocumentFolder.value })
-    showNewDocument.value = false
-    void showResult(created)
-  })
-}
-
-function openRename(row: Row) {
-  renaming.value = row
-  renameValue.value = rowName(row)
-  mutationError.value = null
-}
-
-async function submitRename() {
-  const row = renaming.value
-  const name = renameValue.value.trim()
-  if (!row || !name || name === rowName(row)) {
-    renaming.value = null
-    return
-  }
-  const ok = await commit(() => {
-    if (row.kind === 'folder') {
-      return updateFolder(row.folder.id, { name })
+  // -1 when the rows were left behind in another folder: the open one keeps its selection.
+  const index = entryKeys.value.indexOf(items[0]!.key)
+  const done: Item[] = []
+  await run(async () => {
+    try {
+      for (const item of items) {
+        await sendToTrash(item)
+        done.push({ kind: item.kind, id: item.id })
+      }
+    } finally {
+      if (done.length) {
+        record({ type: 'trash', items: done })
+      }
     }
-    return row.kind === 'file' ? updateDocument(row.document.id, { name }) : Promise.resolve()
   })
-  if (ok) {
-    renaming.value = null
+  if (done.length) {
+    if (done.some((item) => item.kind === 'file' && item.id === openDocument.value?.id)) {
+      openDocument.value = null
+    }
+    showNote(t('files.note.trashed', { n: done.length }, done.length), true)
+    if (index !== -1) {
+      await selectAt(index)
+    }
   }
 }
 
-/** Where the thing being moved lives now — the destination the dialog opens on. */
-const movingFrom = computed<FolderId>(() => {
-  const row = moving.value
-  if (row?.kind === 'folder') {
-    return row.folder.parent_id
+/** Put Back, from the Trash: where each came from, or the nearest live folder above. */
+async function putBackSelection() {
+  const items = selection.value
+  if (!items.length || busy.value) {
+    return
   }
-  return row?.kind === 'file' ? row.document.folder_id : null
+  const index = entryKeys.value.indexOf(items[0]!.key)
+  const done: Item[] = []
+  await run(async () => {
+    try {
+      for (const item of items) {
+        await putBackItem(item)
+        done.push({ kind: item.kind, id: item.id })
+      }
+    } finally {
+      if (done.length) {
+        record({ type: 'appear', items: done })
+      }
+    }
+  })
+  if (done.length) {
+    showNote(t('files.note.putBack', { n: done.length }, done.length), true)
+    await selectAt(index)
+  }
+}
+
+/** Copies of `items` in `destination` — a paste, a duplicate, an ⌥-drag — selected after. */
+async function copyInto(items: Entry[], destination: FolderId) {
+  if (!items.length || busy.value) {
+    return
+  }
+  const made: Item[] = []
+  await run(async () => {
+    try {
+      for (const item of items) {
+        const copy = item.kind === 'folder' ? await copyFolder(item.id, destination) : await copyDocument(item.id, destination)
+        made.push({ kind: item.kind, id: copy.id })
+      }
+    } finally {
+      if (made.length) {
+        record({ type: 'appear', items: made })
+      }
+    }
+  })
+  if (made.length && view.value === 'files' && destination === currentFolder.value) {
+    await nextTick()
+    selectKeys(made.map((item) => `${item.kind}-${item.id}`))
+    scrollToRow(`${made.at(-1)!.kind}-${made.at(-1)!.id}`)
+  }
+}
+
+/** `items` into `destination` — a drag, or ⌥⌘V. An item already there stays as it is. */
+async function moveInto(items: Entry[], destination: FolderId): Promise<boolean> {
+  if (!items.length || busy.value) {
+    return false
+  }
+  const moves: Move[] = []
+  const ok = await run(async () => {
+    try {
+      for (const item of items) {
+        const live = liveRow(item)
+        if (live?.parent === destination) {
+          continue
+        }
+        const moved = await place(item, { folder: destination })
+        moves.push({
+          item: { kind: item.kind, id: item.id },
+          from: live?.parent ?? null,
+          to: destination,
+          fromName: live?.name ?? item.name,
+          toName: moved.name,
+        })
+      }
+    } finally {
+      if (moves.length) {
+        record({ type: 'move', moves })
+      }
+    }
+  })
+  return ok
+}
+
+// --- the clipboard ---------------------------------------------------------
+
+/** What ⌘C copied: the page's own, not the system's, which cannot hold a library row. */
+const clipboard = ref<Entry[]>([])
+
+/** A text selection is the browser's to copy, as it is everywhere else. */
+function textSelected(): boolean {
+  const range = window.getSelection()
+  return !!range && !range.isCollapsed && range.toString().trim() !== ''
+}
+
+function copySelection() {
+  const items = selection.value
+  if (!items.length) {
+    return
+  }
+  clipboard.value = items.map((item) => ({ ...item }))
+  showNote(t('files.note.copied', { n: items.length }, items.length), false)
+}
+
+function pasteHere() {
+  void copyInto(clipboard.value, currentFolder.value)
+}
+
+/** ⌥⌘V, Finder's *Move Item Here*: the copied rows move, and the clipboard empties. */
+async function moveHere() {
+  const items = clipboard.value
+  if (!items.length) {
+    return
+  }
+  const destination = currentFolder.value
+  if (await moveInto(items, destination)) {
+    clipboard.value = []
+    if (view.value === 'files' && destination === currentFolder.value) {
+      await nextTick()
+      selectKeys(items.map((item) => item.key).filter((key) => entryKeys.value.includes(key)))
+    }
+  }
+}
+
+function duplicateSelection() {
+  void copyInto(selection.value, currentFolder.value)
+}
+
+// --- naming ----------------------------------------------------------------
+
+/**
+ * The rename in progress: the row's name as a field in its row (docs/web.md § Files,
+ * *Nothing pops up for a file operation*). `original` is what Esc puts back.
+ */
+const renaming = ref<{ key: string; item: Item; original: string; value: string; busy: boolean } | null>(null)
+const renameField = ref<ComponentPublicInstance | null>(null)
+
+function renameInput(): HTMLInputElement | null {
+  return (renameField.value?.$el as HTMLInputElement | undefined) ?? null
+}
+
+/** The field takes focus with the name before its extension selected — Finder's choice. */
+async function focusRename() {
+  await nextTick()
+  const editing = renaming.value
+  const input = renameInput()
+  if (!editing || !input) {
+    return
+  }
+  input.focus()
+  input.setSelectionRange(0, renameSelectionEnd(editing.value, editing.item.kind === 'folder'))
+}
+
+function startRename(key: string) {
+  const entry = entries.value.find((row) => row.key === key)
+  if (!entry || view.value !== 'files' || busy.value) {
+    return
+  }
+  selectOnly(key)
+  renaming.value = { key, item: { kind: entry.kind, id: entry.id }, original: entry.name, value: entry.name, busy: false }
+  void focusRename()
+}
+
+/** The list takes focus back, so the keys go on from the row. */
+function focusList() {
+  listEl.value?.focus({ preventScroll: true })
+}
+
+function cancelRename() {
+  renaming.value = null
+  focusList()
+}
+
+/**
+ * Return or a click anywhere else keeps the name. Empty or unchanged sends nothing; a name
+ * the server refuses — one already taken — keeps the field open with it selected, and the
+ * message over the list.
+ */
+async function commitRename() {
+  const editing = renaming.value
+  if (!editing || editing.busy) {
+    return
+  }
+  const name = editing.value.trim()
+  if (!name || name === editing.original) {
+    renaming.value = null
+    return
+  }
+  editing.busy = true
+  mutationError.value = null
+  hideUndoNote()
+  try {
+    const saved = await place(editing.item, { name })
+    record({ type: 'rename', item: editing.item, from: editing.original, to: saved.name })
+    await refresh()
+    if (renaming.value === editing) {
+      // Return leaves focus in the field; a click that ended the edit took it where it
+      // meant to, and the list must not take it back from there.
+      const kept = document.activeElement === renameInput() || document.activeElement === document.body
+      renaming.value = null
+      if (kept) {
+        focusList()
+      }
+    }
+  } catch (error) {
+    mutationError.value = await resolve(error)
+    if (renaming.value !== editing) {
+      return
+    }
+    editing.busy = false
+    // Still on screen: back to the field. Gone — another folder opened meanwhile — the
+    // message is all that is left of it.
+    if (entryKeys.value.includes(editing.key)) {
+      void focusRename()
+    } else {
+      renaming.value = null
+    }
+  }
+}
+
+/** A click elsewhere keeps the name. The window losing focus — another app, a system
+ *  dialog — does not end the edit: the field still holds focus there, and gets it back. */
+function onRenameBlur() {
+  if (document.activeElement !== renameInput()) {
+    void commitRename()
+  }
+}
+
+function onRenameKeydown(event: KeyboardEvent) {
+  if (event.isComposing) {
+    return
+  }
+  if (event.key === 'Enter') {
+    event.preventDefault()
+    void commitRename()
+  } else if (event.key === 'Escape') {
+    event.preventDefault()
+    event.stopPropagation()
+    cancelRename()
+  }
+}
+
+/** New folder and New document: made at once with the default name, then named in place. */
+async function createEntry(kind: 'folder' | 'file') {
+  if (busy.value || view.value !== 'files') {
+    return
+  }
+  const into = currentFolder.value
+  let made: Item | null = null
+  await run(async () => {
+    const created =
+      kind === 'folder'
+        ? await createFolder({ name: t('files.newFolderName'), parent_id: into })
+        : await createDocument({ name: t('files.newDocumentName'), folder_id: into })
+    made = { kind, id: created.id }
+    record({ type: 'appear', items: [made] })
+  })
+  const item = made as Item | null
+  if (item && currentFolder.value === into && view.value === 'files') {
+    await nextTick()
+    startRename(`${item.kind}-${item.id}`)
+  }
+}
+
+// --- undo ------------------------------------------------------------------
+
+async function replay(step: Step, direction: 'undo' | 'redo') {
+  const back = direction === 'undo'
+  if (step.type === 'trash' || step.type === 'appear') {
+    const hide = (step.type === 'trash') !== back
+    for (const item of back ? [...step.items].reverse() : step.items) {
+      await (hide ? sendToTrash(item) : putBackItem(item))
+    }
+  } else if (step.type === 'move') {
+    for (const move of back ? [...step.moves].reverse() : step.moves) {
+      // Back under its old name too, when the destination had suffixed it.
+      const name = back && move.toName !== move.fromName ? move.fromName : undefined
+      await place(move.item, { folder: back ? move.from : move.to, name })
+    }
+  } else {
+    await place(step.item, { name: back ? step.from : step.to })
+  }
+}
+
+/** ⌘Z and ⇧⌘Z. A step that fails — the library changed elsewhere — is dropped with its
+ *  message, never retried. */
+async function stepHistory(direction: 'undo' | 'redo') {
+  const from = direction === 'undo' ? undoSteps : redoSteps
+  if (busy.value || !from.length) {
+    return
+  }
+  const step = from.pop()!
+  const ok = await run(() => replay(step, direction))
+  if (ok) {
+    ;(direction === 'undo' ? redoSteps : undoSteps).push(step)
+    showNote(t(direction === 'undo' ? 'viewer.note.undone' : 'viewer.note.redone'), false)
+  }
+}
+
+// --- deleting for good -----------------------------------------------------
+
+/** The question the strip over the Trash's list asks: these items, or all of it. */
+const confirming = ref<{ items: Entry[] } | { all: number } | null>(null)
+const confirmCancel = ref<ComponentPublicInstance | null>(null)
+
+const confirmText = computed(() => {
+  const ask = confirming.value
+  if (!ask) {
+    return ''
+  }
+  if ('all' in ask) {
+    return t('files.confirmEmpty', { n: ask.all }, ask.all)
+  }
+  return ask.items.length === 1
+    ? t('files.confirmDelete', { name: ask.items[0]!.name })
+    : t('files.confirmDeleteItems', { n: ask.items.length }, ask.items.length)
 })
 
-/** The subtree a folder may not be moved into — its own. */
-const forbiddenTargets = computed(() =>
-  moving.value?.kind === 'folder'
-    ? subtreeIds(folders.value, moving.value.folder.id)
-    : new Set<number>(),
-)
+/** The strip opens with Cancel focused: the one answer that loses nothing. */
+function ask(question: { items: Entry[] } | { all: number }) {
+  confirming.value = question
+  void nextTick(() => (confirmCancel.value?.$el as HTMLElement | undefined)?.focus())
+}
 
-async function submitMove(destination: FolderId) {
-  const row = moving.value
-  if (!row) {
-    return
-  }
-  const ok = await moveRow(row, destination)
-  if (ok) {
-    moving.value = null
+function askDelete() {
+  const items = selection.value
+  if (items.length && !busy.value) {
+    ask({ items })
   }
 }
 
-function moveRow(row: Row, destination: FolderId): Promise<boolean> {
-  if (row.kind === 'folder') {
-    return commit(() => updateFolder(row.folder.id, { parent_id: destination }))
+function askEmpty() {
+  if (trashTotal.value && !busy.value) {
+    ask({ all: trashTotal.value })
   }
-  if (row.kind === 'file') {
-    return commit(() => updateDocument(row.document.id, { folder_id: destination }))
-  }
-  return Promise.resolve(false)
+}
+
+function cancelConfirm() {
+  confirming.value = null
+  focusList()
 }
 
 async function confirmDelete() {
-  const row = deleting.value
-  if (!row) {
+  const question = confirming.value
+  if (!question || busy.value) {
     return
   }
-  const ok = await commit(() => {
-    if (row.kind === 'folder') {
-      return deleteFolder(row.folder.id)
+  const index = 'items' in question ? entryKeys.value.indexOf(question.items[0]!.key) : 0
+  const gone: Item[] = []
+  const everything = trashRows.value.map<Item>((row) => ({ kind: row.kind, id: row.kind === 'folder' ? row.folder.id : row.document.id }))
+  const ok = await run(async () => {
+    try {
+      if ('all' in question) {
+        await emptyTrash()
+        gone.push(...everything)
+        return
+      }
+      for (const item of question.items) {
+        await (item.kind === 'folder' ? deleteFolder(item.id) : deleteDocument(item.id))
+        gone.push({ kind: item.kind, id: item.id })
+      }
+    } finally {
+      forget(gone)
     }
-    return row.kind === 'file' ? deleteDocument(row.document.id) : Promise.resolve()
   })
   if (ok) {
-    if (row.kind === 'file' && openDocument.value?.id === row.document.id) {
-      openDocument.value = null
-    }
-    deleting.value = null
+    showNote('all' in question ? t('files.note.emptied') : t('files.note.deleted', { n: gone.length }, gone.length), false)
+  }
+  if ('items' in question) {
+    await selectAt(index)
+  }
+  focusList()
+}
+
+// --- the status note -------------------------------------------------------
+
+/** The one line at the list's foot an action with nothing else to show confirms in. */
+const note = ref<{ text: string; undo: boolean } | null>(null)
+let noteTimer: ReturnType<typeof setTimeout> | undefined
+let noteHeld = false
+
+function showNote(text: string, undoable: boolean) {
+  note.value = { text, undo: undoable }
+  announce(text)
+  timeNote()
+}
+
+function timeNote() {
+  clearTimeout(noteTimer)
+  const shown = note.value
+  if (shown && !noteHeld) {
+    noteTimer = setTimeout(() => (note.value = null), shown.undo ? NOTE_UNDO_MS : NOTE_MS)
   }
 }
+
+/** The pointer resting on the note holds it; leaving starts its time again. */
+function holdNote(held: boolean) {
+  noteHeld = held
+  if (held) {
+    clearTimeout(noteTimer)
+  } else {
+    timeNote()
+  }
+}
+
+/** A note carrying *Undo* stays until the reader's next action. */
+function hideUndoNote() {
+  if (note.value?.undo) {
+    clearTimeout(noteTimer)
+    note.value = null
+  }
+}
+
+onBeforeUnmount(() => clearTimeout(noteTimer))
+
+/** The page's one polite live region, for what its notes and the keys' selection say. */
+const liveText = ref('')
+
+function announce(text: string) {
+  liveText.value = ''
+  void nextTick(() => (liveText.value = text))
+}
+
+/** A selection the keys made is said: the row's name, or how many rows. */
+function announceSelection() {
+  const items = selection.value
+  if (items.length === 1) {
+    announce(items[0]!.name)
+  } else if (items.length > 1) {
+    announce(t('files.selected', { n: items.length }, items.length))
+  }
+}
+
+// --- the keys --------------------------------------------------------------
+
+/** The selection data region: both tabs and the list under them. */
+const region = ref<HTMLElement | null>(null)
+const listEl = ref<HTMLElement | null>(null)
+
+let typed = ''
+let typedTimer: ReturnType<typeof setTimeout> | undefined
+
+/** ↑ and ↓ select the next row, ⇧ extends; from nothing, they start at an end. */
+function moveCursor(step: 1 | -1, extend: boolean) {
+  const keys = entryKeys.value
+  if (!keys.length) {
+    return
+  }
+  const at = cursor.value === null ? -1 : keys.indexOf(cursor.value)
+  const next =
+    at === -1 ? keys[step > 0 ? 0 : keys.length - 1]! : keys[Math.max(0, Math.min(keys.length - 1, at + step))]!
+  if (extend && anchor !== null) {
+    extendTo(next)
+  } else {
+    selectOnly(next)
+  }
+  scrollToRow(next)
+  announceSelection()
+}
+
+function selectEdge(last: boolean) {
+  const key = last ? entryKeys.value.at(-1) : entryKeys.value[0]
+  if (key !== undefined) {
+    selectOnly(key)
+    scrollToRow(key)
+    announceSelection()
+  }
+}
+
+/** Letters typed in a row select the first name they start, as a file manager's do. */
+function typeAhead(char: string) {
+  clearTimeout(typedTimer)
+  typed += char
+  typedTimer = setTimeout(() => (typed = ''), TYPE_AHEAD_MS)
+  const key = typeAheadMatch(entries.value, typed)
+  if (key !== null) {
+    selectOnly(key)
+    scrollToRow(key)
+    announceSelection()
+  }
+}
+
+onBeforeUnmount(() => clearTimeout(typedTimer))
+
+/**
+ * Finder's keys, read at the window so they work after a click with nothing holding focus
+ * (docs/web.md § Files, *The keyboard is Finder's*). Never from a text field, an open menu,
+ * a dialog or the viewer — each owns its keys — nor from anything outside this screen's
+ * region, the sidebar's links among them.
+ */
+function onKeydown(event: KeyboardEvent) {
+  if (event.defaultPrevented || event.isComposing || openDocument.value || menu.value) {
+    return
+  }
+  if (document.querySelector('[aria-modal="true"]')) {
+    return
+  }
+  const target = event.target as HTMLElement | null
+  if (target?.isContentEditable || target?.closest('input, textarea, select')) {
+    return
+  }
+  if (target && target !== document.body && !region.value?.contains(target)) {
+    return
+  }
+  // A focused button or link answers Return and Space itself.
+  if ((event.key === 'Enter' || event.key === ' ') && target?.closest('button, a')) {
+    return
+  }
+  const key = (spec: string) => matches(event, spec)
+  const files = view.value === 'files'
+  const one = selection.value.length === 1
+  const act = (handler: () => unknown) => {
+    event.preventDefault()
+    if (!event.repeat) {
+      void handler()
+    }
+  }
+
+  if (confirming.value) {
+    if (key('esc')) {
+      event.preventDefault()
+      cancelConfirm()
+    }
+    return
+  }
+  if (key('down') || key('up')) {
+    event.preventDefault()
+    moveCursor(key('down') ? 1 : -1, false)
+  } else if (key('shift+down') || key('shift+up')) {
+    event.preventDefault()
+    moveCursor(key('shift+down') ? 1 : -1, true)
+  } else if (key('home') || key('end')) {
+    event.preventDefault()
+    selectEdge(key('end'))
+  } else if (key('mod+a')) {
+    event.preventDefault()
+    selectKeys(entryKeys.value)
+    announceSelection()
+  } else if (key('mod+down') || (!apple && key('enter'))) {
+    act(() => one && openEntry(selection.value[0]!.key))
+  } else if (files && ((apple && key('enter')) || key('f2'))) {
+    act(() => one && startRename(selection.value[0]!.key))
+  } else if (files && (key('esc') || key('mod+up'))) {
+    if (currentFolder.value !== null) {
+      event.preventDefault()
+      goUp()
+    }
+  } else if (files && key('alt+mod+n')) {
+    act(() => createEntry('folder'))
+  } else if (files && key('mod+c')) {
+    if (selection.value.length && !textSelected()) {
+      act(copySelection)
+    }
+  } else if (files && key('mod+v')) {
+    act(pasteHere)
+  } else if (files && key('alt+mod+v')) {
+    act(moveHere)
+  } else if (files && key('mod+d')) {
+    act(duplicateSelection)
+  } else if (files && (key('mod+backspace') || key('delete'))) {
+    act(() => trashItems(selection.value))
+  } else if (!files && key('mod+backspace')) {
+    act(putBackSelection)
+  } else if (!files && (apple ? key('alt+mod+backspace') : key('delete'))) {
+    act(askDelete)
+  } else if (key('mod+z')) {
+    act(() => stepHistory('undo'))
+  } else if (key('shift+mod+z') || (!apple && key('mod+y'))) {
+    act(() => stepHistory('redo'))
+  } else if (event.key.length === 1 && event.key !== ' ' && !event.metaKey && !event.ctrlKey && !event.altKey) {
+    typeAhead(event.key)
+  }
+}
+
+onMounted(() => window.addEventListener('keydown', onKeydown))
+onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 
 // --- the menu --------------------------------------------------------------
 
 /**
- * The screen's only action surface (docs/web.md § Files).
- *
- * Two things can be right-clicked, and they mean different targets: a row acts on itself,
- * while the list's empty space acts on the folder that is open — which is why `MenuOn` has
- * two shapes rather than one.
+ * The menus (docs/web.md § Files, *The menus act on the selection*). A row's acts on the
+ * selection — the row is selected first when it was not — and the list's own empty space
+ * acts on the folder that is open, or on the whole Trash.
  */
-type MenuOn = { kind: 'row'; row: Row } | { kind: 'folder'; id: FolderId }
+type MenuOn = 'selection' | 'list'
 
 /** `fromKey` is how it was opened: only then does the menu open with a row highlighted. */
 const menu = ref<{ on: MenuOn; at: Point; fromKey?: boolean } | null>(null)
@@ -663,25 +1500,38 @@ function openMenu(on: MenuOn, at: Point, fromKey = false) {
   menu.value = { on, at, fromKey }
 }
 
-function openMenuFromPointer(event: MouseEvent, on: MenuOn) {
-  event.preventDefault()
-  // The list under the row is a target too; the innermost thing under the pointer wins.
-  event.stopPropagation()
-  openMenu(on, { x: event.clientX, y: event.clientY })
+function openRowMenu(key: string, at: Point) {
+  if (!selected.value.has(key)) {
+    selectOnly(key)
+  }
+  openMenu('selection', at)
+}
+
+function openListMenu(at: Point) {
+  clearSelection()
+  openMenu('list', at)
 }
 
 /**
- * The keyboard's route in — the Menu key, or `Shift+F10` where there is no Menu key. It has
- * no pointer, so the menu opens under the control that asked for it, as Windows and GNOME
- * both do.
+ * The keyboard's route in — the Menu key, or `Shift+F10` where there is no Menu key — with
+ * the list focused. It has no pointer, so the menu opens under the row it is about, as
+ * Windows and GNOME both do, or under the list with nothing selected.
  */
-function openMenuFromKey(event: KeyboardEvent, on: MenuOn) {
+function onListKeydown(event: KeyboardEvent) {
   if (event.key !== 'ContextMenu' && !(event.key === 'F10' && event.shiftKey)) {
     return
   }
   event.preventDefault()
-  const box = (event.target as HTMLElement).getBoundingClientRect()
-  openMenu(on, { x: box.left, y: box.bottom }, true)
+  const key = cursor.value !== null && selected.value.has(cursor.value) ? cursor.value : selection.value[0]?.key
+  const row = key ? document.getElementById(rowId(key)) : null
+  if (row) {
+    const box = row.getBoundingClientRect()
+    openMenu('selection', { x: box.left, y: box.bottom }, true)
+  } else {
+    const box = (event.currentTarget as HTMLElement).getBoundingClientRect()
+    clearSelection()
+    openMenu('list', { x: box.left, y: box.top }, true)
+  }
 }
 
 function folderName(id: FolderId): string {
@@ -693,22 +1543,72 @@ const menuItems = computed<MenuItem[]>(() => {
   if (!on) {
     return []
   }
-  if (on.kind === 'row') {
+  const items = selection.value
+  if (view.value === 'trash') {
+    if (on === 'list') {
+      return [{ key: 'empty', label: t('files.emptyTrash'), icon: 'trash', danger: true, disabled: !trashTotal.value }]
+    }
     return [
+      { key: 'putBack', label: t('files.putBack'), icon: 'undo-2', shortcut: label('mod+backspace') },
       {
-        key: 'open',
-        label: t('files.open'),
-        icon: on.row.kind === 'folder' ? 'folder-open' : 'file-text',
+        key: 'deleteNow',
+        label: t('files.deleteNow'),
+        icon: 'x',
+        danger: true,
+        separated: true,
+        shortcut: label(apple ? 'alt+mod+backspace' : 'delete'),
       },
-      { key: 'rename', label: t('files.rename'), icon: 'edit', separated: true },
-      { key: 'move', label: t('files.move'), icon: 'folder-input' },
-      { key: 'delete', label: t('common.delete'), icon: 'trash', danger: true, separated: true },
     ]
   }
+  if (on === 'list') {
+    const copied = clipboard.value.length
+    return [
+      { key: 'upload', label: t('files.upload'), icon: 'upload' },
+      { key: 'newDocument', label: t('files.newDocument'), icon: 'file-plus' },
+      { key: 'newFolder', label: t('files.newFolder'), icon: 'plus', shortcut: label('alt+mod+n') },
+      {
+        key: 'paste',
+        label: copied ? t('files.pasteItems', { n: copied }, copied) : t('files.paste'),
+        icon: 'clipboard-paste',
+        disabled: !copied,
+        separated: true,
+        shortcut: label('mod+v'),
+      },
+      ...(copied
+        ? [
+            {
+              key: 'moveHere',
+              label: t('files.moveHere', { n: copied }, copied),
+              icon: 'folder-input' as const,
+              shortcut: label('alt+mod+v'),
+            },
+          ]
+        : []),
+    ]
+  }
+  const one = items.length === 1 ? items[0]! : null
   return [
-    { key: 'upload', label: t('files.upload'), icon: 'upload' },
-    { key: 'newDocument', label: t('files.newDocument'), icon: 'file-plus' },
-    { key: 'newFolder', label: t('files.newFolder'), icon: 'plus' },
+    ...(one
+      ? [
+          {
+            key: 'open',
+            label: t('files.open'),
+            icon: one.kind === 'folder' ? ('folder-open' as const) : ('file-text' as const),
+            shortcut: label(apple ? 'mod+down' : 'enter'),
+          },
+          { key: 'rename', label: t('files.rename'), icon: 'edit' as const, shortcut: label(apple ? 'enter' : 'f2') },
+        ]
+      : []),
+    { key: 'copy', label: t('files.copy'), icon: 'copy', separated: !!one, shortcut: label('mod+c') },
+    { key: 'duplicate', label: t('files.duplicate'), icon: 'copy-plus', shortcut: label('mod+d') },
+    {
+      key: 'trash',
+      label: t('files.moveToTrash'),
+      icon: 'trash',
+      danger: true,
+      separated: true,
+      shortcut: label(apple ? 'mod+backspace' : 'delete'),
+    },
   ]
 })
 
@@ -718,53 +1618,46 @@ const menuLabel = computed(() => {
   if (!on) {
     return ''
   }
-  return t('files.menuFor', {
-    name: on.kind === 'row' ? rowName(on.row) : folderName(on.id),
-  })
+  if (on === 'list') {
+    return t('files.menuFor', { name: view.value === 'trash' ? t('files.tabTrash') : folderName(currentFolder.value) })
+  }
+  const items = selection.value
+  return items.length === 1
+    ? t('files.menuFor', { name: items[0]!.name })
+    : t('files.menuForItems', { n: items.length }, items.length)
 })
 
-/** A left-click on the row's name, as an action — so the menu's Open is the same thing. */
-function openRow(row: Row) {
-  if (row.kind === 'folder') {
-    openFolder(row.folder.id)
-  } else if (row.kind === 'file') {
-    void showResult(row.document)
-  }
-}
-
 function runMenu(action: string) {
-  const on = menu.value?.on
-  if (!on) {
-    return
-  }
-  mutationError.value = null
-  if (on.kind === 'row') {
-    switch (action) {
-      case 'open':
-        return openRow(on.row)
-      case 'rename':
-        return openRename(on.row)
-      case 'move':
-        moving.value = on.row
-        return
-      case 'delete':
-        deleting.value = on.row
-        return
-    }
-    return
-  }
+  const items = selection.value
   switch (action) {
+    case 'open':
+      return items[0] && openEntry(items[0].key)
+    case 'rename':
+      return items[0] && startRename(items[0].key)
+    case 'copy':
+      return copySelection()
+    case 'duplicate':
+      return duplicateSelection()
+    case 'trash':
+      return trashItems(items)
     case 'upload':
-      return pickFiles(on.id)
+      return pickFiles(currentFolder.value)
     case 'newDocument':
-      return openNewDocument(on.id)
+      return createEntry('file')
     case 'newFolder':
-      return openNewFolder(on.id)
+      return createEntry('folder')
+    case 'paste':
+      return pasteHere()
+    case 'moveHere':
+      return moveHere()
+    case 'putBack':
+      return putBackSelection()
+    case 'deleteNow':
+      return askDelete()
+    case 'empty':
+      return askEmpty()
   }
 }
-
-/** The list's own menu: the empty space below the rows, and the panel around them. */
-const listMenu = computed<MenuOn>(() => ({ kind: 'folder', id: currentFolder.value }))
 
 // --- dragging --------------------------------------------------------------
 
@@ -778,14 +1671,17 @@ const listMenu = computed<MenuOn>(() => ({ kind: 'folder', id: currentFolder.val
  * itself halfway across, and browsers disagree about what `relatedTarget` holds on a drag.
  */
 
-/** What is being dragged inside the page. A drag from the desktop is `fileDrag`. */
-const dragItem = ref<Row | null>(null)
-/** The folder a drag is over — the one drawn as the target. */
-const dropTarget = ref<FolderId | undefined>(undefined)
+/** The rows a drag inside the page carries: the selection when it started. Read only while
+ *  the drag carries `ROWS_DRAG_TYPE`, so a drag from elsewhere never finds stale rows here. */
+let draggedRows: Entry[] = []
+/** The folder a drag is over — the one drawn as the target — or the Trash's tab. */
+const dropTarget = ref<FolderId | 'trash' | undefined>(undefined)
 /** A drag carrying files is somewhere over the window. */
 const fileDrag = ref(false)
 /** …and it is over the list, so the overlay names where a drop would land. */
 const fileOverList = ref(false)
+/** Rows from another folder are over the list, which they would move into. */
+const rowsOverList = ref(false)
 
 /** How long the page waits for the next drag event before assuming the drag is gone. */
 const DRAG_IDLE_MS = 700
@@ -801,29 +1697,46 @@ let dragWatchdog: ReturnType<typeof setTimeout> | undefined
  */
 const TARGET_CLEAR_MS = 80
 let clearTargetTimer: ReturnType<typeof setTimeout> | undefined
+let springTimer: ReturnType<typeof setTimeout> | undefined
 
-/**
- * Whether this row can land in this folder. Takes the row rather than reading `dragItem`,
- * because the drop handler has to ask *after* it has let go of the drag — asking about
- * state it just cleared is how a drop silently does nothing.
- */
-function canMoveInto(item: Row | null, target: FolderId): boolean {
-  if (!item) {
-    return false
-  }
-  if (item.kind === 'folder') {
-    return canMoveFolder(folders.value, item.folder, target)
-  }
-  return item.kind === 'file' && item.document.folder_id !== target
+/** The rows this drag carries, when it is a drag of this page's rows. */
+function rowsOf(event: DragEvent): Entry[] {
+  return [...(event.dataTransfer?.types ?? [])].includes(ROWS_DRAG_TYPE) ? draggedRows : []
 }
 
-function startDrag(event: DragEvent, row: Row) {
-  dragItem.value = row
+/** ⌥ as it drops copies, as in Finder — Ctrl off Apple platforms, as in Explorer. */
+function copyDrop(event: DragEvent): boolean {
+  return apple ? event.altKey : event.ctrlKey
+}
+
+/**
+ * Whether these rows can land in `target`. A copy may land beside its original; a move may
+ * not, and no folder goes into its own subtree either way. Takes the rows rather than reading
+ * them from state, because the drop handler has to ask *after* it has let go of the drag.
+ */
+function canDropInto(items: Entry[], target: FolderId, copy: boolean): boolean {
+  if (!items.length) {
+    return false
+  }
+  return items.every((item) => {
+    if (item.kind === 'folder' && target !== null && subtreeIds(folders.value, item.id).has(target)) {
+      return false
+    }
+    return copy || liveRow(item)?.parent !== target
+  })
+}
+
+function startDrag(event: DragEvent, key: string) {
+  if (!selected.value.has(key)) {
+    selectOnly(key)
+  }
+  draggedRows = selection.value
   if (event.dataTransfer) {
-    // Firefox starts no drag at all unless the payload is set, even when the data itself
-    // goes unused — the page reads `dragItem`, not the transfer.
-    event.dataTransfer.setData('text/plain', rowName(row))
-    event.dataTransfer.effectAllowed = 'move'
+    // Firefox starts no drag at all unless a payload is set; the names are what a drop
+    // outside the page gets.
+    event.dataTransfer.setData('text/plain', draggedRows.map((item) => item.name).join('\n'))
+    event.dataTransfer.setData(ROWS_DRAG_TYPE, '')
+    event.dataTransfer.effectAllowed = 'copyMove'
   }
 }
 
@@ -842,27 +1755,48 @@ function releaseTarget() {
   }, TARGET_CLEAR_MS)
 }
 
+/**
+ * Folders spring open: a drag resting on a folder row or a crumb opens that folder under it,
+ * so a drag goes down any number of levels (docs/web.md § Files, *Moving*). Leaving the
+ * target — another target, or none — starts the wait again.
+ */
+watch(dropTarget, (target) => {
+  clearTimeout(springTimer)
+  if (target === undefined || target === 'trash' || target === currentFolder.value) {
+    return
+  }
+  springTimer = setTimeout(() => {
+    if (dropTarget.value === target) {
+      dropTarget.value = undefined
+      openFolder(target)
+    }
+  }, SPRING_MS)
+})
+
 /** Everything a finished or abandoned drag leaves behind. */
 function endDrag() {
   clearTimeout(dragWatchdog)
   dragWatchdog = undefined
+  clearTimeout(springTimer)
   holdTarget()
-  dragItem.value = null
+  draggedRows = []
   dropTarget.value = undefined
   fileDrag.value = false
   fileOverList.value = false
+  rowsOverList.value = false
 }
 
 /**
  * A drag from the desktop ends with no event this page can rely on — it can be carried out
  * of the window, and `dragend` fires on the source, which is another application. So the
- * flags a file drag sets expire on their own if drag events stop arriving. `dragItem` is
- * not touched: an internal drag does get a `dragend`, and dropping it after a trip outside
- * the window has to still work.
+ * flags a drag sets expire on their own if drag events stop arriving. `draggedRows` is not
+ * touched: a drag of the page's rows does get its `dragend`, and dropping it after a trip
+ * outside the window has to still work.
  */
 function dragGoneIdle() {
   fileDrag.value = false
   fileOverList.value = false
+  rowsOverList.value = false
   holdTarget()
   dropTarget.value = undefined
 }
@@ -873,6 +1807,7 @@ function onWindowDragOver(event: DragEvent) {
 
   fileDrag.value = files
   fileOverList.value = files && claim === 'list'
+  rowsOverList.value = !files && claim === 'list'
   if (claim === 'target') {
     holdTarget()
   } else {
@@ -901,8 +1836,8 @@ function onWindowDrop(event: DragEvent) {
 onMounted(() => {
   window.addEventListener('dragover', onWindowDragOver)
   window.addEventListener('drop', onWindowDrop)
-  // The row that started the drag can be replaced by a poll while the drag is in the air,
-  // and its own `dragend` then never arrives. The window's always does.
+  // The row that started the drag can be replaced by a poll, or left behind by a folder
+  // springing open, while the drag is in the air; its own `dragend` then never arrives.
   window.addEventListener('dragend', endDrag)
 })
 
@@ -912,27 +1847,17 @@ onBeforeUnmount(() => {
   window.removeEventListener('dragend', endDrag)
   clearTimeout(dragWatchdog)
   clearTimeout(clearTargetTimer)
+  clearTimeout(springTimer)
 })
 
-/** A drop onto a folder: either the desktop's files land in it, or a row moves into it. */
-function dropOn(target: FolderId, event: DragEvent) {
-  const files = droppedFiles(event)
-  const item = dragItem.value
-  endDrag()
-  if (files.length) {
-    addToQueue(files, target)
+/** Rows dropped on a folder: moved into it, or copied with the copy key held. */
+function dropRows(items: Entry[], target: FolderId, copy: boolean) {
+  if (!canDropInto(items, target, copy)) {
     return
   }
-  if (canMoveInto(item, target)) {
-    void moveRow(item!, target)
-  }
+  void (copy ? copyInto(items, target) : moveInto(items, target))
 }
 
-/**
- * A folder row in the list, and a breadcrumb above it, take rows of this page only. Files
- * dropped on the list go to the folder that is open — that is what the overlay says, and
- * it covers the rows while it is up.
- */
 /**
  * A drop on a folder row or a breadcrumb. Files are not theirs to take: the overlay names
  * the open folder while a file drag is up, and a row quietly landing them somewhere else
@@ -945,35 +1870,96 @@ function onTargetDrop(target: FolderId, event: DragEvent) {
   }
   event.preventDefault()
   event.stopPropagation()
-  dropOn(target, event)
+  const items = rowsOf(event)
+  const copy = copyDrop(event)
+  endDrag()
+  dropRows(items, target, copy)
 }
 
 function onTargetDragOver(event: DragEvent, target: FolderId) {
-  if (carriesFiles(event.dataTransfer) || !canMoveInto(dragItem.value, target)) {
+  const copy = copyDrop(event)
+  if (carriesFiles(event.dataTransfer) || !canDropInto(rowsOf(event), target, copy)) {
+    return
+  }
+  event.preventDefault()
+  claimDrag(event, 'target')
+  setDropEffect(event, copy ? 'copy' : 'move')
+  holdTarget()
+  dropTarget.value = target
+}
+
+/** The Trash's tab takes the page's rows: a drop there moves them to the Trash. */
+function onTrashTabDragOver(event: DragEvent) {
+  if (view.value !== 'files' || !rowsOf(event).length) {
     return
   }
   event.preventDefault()
   claimDrag(event, 'target')
   setDropEffect(event, 'move')
   holdTarget()
-  dropTarget.value = target
+  dropTarget.value = 'trash'
 }
 
-/** The list itself: where files from the desktop land. */
+function onTrashTabDrop(event: DragEvent) {
+  const items = rowsOf(event)
+  if (view.value !== 'files' || !items.length) {
+    return
+  }
+  event.preventDefault()
+  endDrag()
+  void trashItems(items)
+}
+
+/** The list itself: where files from the desktop land, and rows a folder sprang open for. */
 function onListDragOver(event: DragEvent) {
-  if (!carriesFiles(event.dataTransfer)) {
+  if (view.value !== 'files') {
+    return
+  }
+  if (carriesFiles(event.dataTransfer)) {
+    event.preventDefault()
+    claimDrag(event, 'list')
+    setDropEffect(event, 'copy')
+    return
+  }
+  const copy = copyDrop(event)
+  if (dragClaim(event) || !canDropInto(rowsOf(event), currentFolder.value, copy)) {
     return
   }
   event.preventDefault()
   claimDrag(event, 'list')
-  setDropEffect(event, 'copy')
+  setDropEffect(event, copy ? 'copy' : 'move')
 }
 
 function onListDrop(event: DragEvent) {
   const files = droppedFiles(event)
+  const items = rowsOf(event)
+  const copy = copyDrop(event)
   endDrag()
+  if (view.value !== 'files') {
+    return
+  }
   if (files.length) {
     addToQueue(files, currentFolder.value)
+    return
+  }
+  dropRows(items, currentFolder.value, copy)
+}
+
+/** What every selectable row carries, in either tab: its selection, its gestures. */
+function entryAttrs(key: string): Record<string, unknown> {
+  const isSelected = selected.value.has(key)
+  return {
+    id: rowId(key),
+    'aria-selected': isSelected ? 'true' : 'false',
+    onClick: (event: MouseEvent) => onRowClick(event, key),
+    onDblclick: (event: MouseEvent) => onRowDblclick(event, key),
+    onContextmenu: (event: MouseEvent) => {
+      event.preventDefault()
+      // The list under the row is a target too; the innermost thing under the pointer wins.
+      event.stopPropagation()
+      openRowMenu(key, { x: event.clientX, y: event.clientY })
+    },
+    ...press.on((at) => openRowMenu(key, at)),
   }
 }
 
@@ -983,25 +1969,38 @@ function rowAttrs(row: Row): Record<string, unknown> {
     // whose menu is the right one for it anyway.
     return {}
   }
-  const on: MenuOn = { kind: 'row', row }
+  const editing = renaming.value?.key === row.key
   const base: Record<string, unknown> = {
-    draggable: 'true',
-    onDragstart: (event: DragEvent) => startDrag(event, row),
+    ...entryAttrs(row.key),
+    // A field being typed in is not a handle: its text is selected by dragging.
+    draggable: editing ? 'false' : 'true',
+    onDragstart: (event: DragEvent) => startDrag(event, row.key),
     onDragend: endDrag,
-    onContextmenu: (event: MouseEvent) => openMenuFromPointer(event, on),
-    onKeydown: (event: KeyboardEvent) => openMenuFromKey(event, on),
-    ...press.on((at) => openMenu(on, at)),
   }
+  const lit = { selected: selected.value.has(row.key), editing }
   if (row.kind === 'file') {
-    return { ...base, class: { file: true, revealed: revealed.value === row.document.id } }
+    return { ...base, class: { ...lit, file: true, revealed: revealed.value === row.document.id } }
   }
   return {
     ...base,
-    class: { 'drop-target': dropTarget.value === row.folder.id },
+    class: { ...lit, 'drop-target': dropTarget.value === row.folder.id },
     onDragover: (event: DragEvent) => onTargetDragOver(event, row.folder.id),
     onDrop: (event: DragEvent) => onTargetDrop(row.folder.id, event),
   }
 }
+
+function trashRowAttrs(row: TrashRow): Record<string, unknown> {
+  return { ...entryAttrs(row.key), class: { selected: selected.value.has(row.key) } }
+}
+
+/** The row the keys are on, for the list's `aria-activedescendant`. */
+const activeRow = computed(() =>
+  cursor.value !== null && entryKeys.value.includes(cursor.value) ? rowId(cursor.value) : undefined,
+)
+
+// A reload onto a new build would drop files still waiting to upload, a name being typed or
+// a reader's place — so it waits for all three to be over (docs/web.md § Rules).
+useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocument.value !== null)
 </script>
 
 <template>
@@ -1015,191 +2014,337 @@ function rowAttrs(row: Row): Record<string, unknown> {
         :accept="accept"
         @change="onPicked"
       >
-      <!-- The whole data region is a drop target for files from the desktop; the overlay
-           says which folder they would land in, and nothing else.
+      <div ref="region" class="library" @pointerdown.capture="onPointerDown">
+        <div class="tabs" role="tablist" :aria-label="t('files.tabs')">
+          <button
+            id="files-tab-files"
+            type="button"
+            role="tab"
+            class="tab"
+            :class="{ active: view === 'files' }"
+            :aria-selected="view === 'files'"
+            aria-controls="files-panel"
+            :tabindex="view === 'files' ? 0 : -1"
+            @click="showView('files')"
+            @keydown="onTabKeydown"
+          >
+            <UiIcon name="files" />
+            <span>{{ t('files.tabFiles') }}</span>
+          </button>
+          <!-- Also a drop target: rows dragged here go to the Trash. -->
+          <button
+            id="files-tab-trash"
+            type="button"
+            role="tab"
+            class="tab"
+            :class="{ active: view === 'trash', target: dropTarget === 'trash' }"
+            :aria-selected="view === 'trash'"
+            aria-controls="files-panel"
+            :tabindex="view === 'trash' ? 0 : -1"
+            @click="showView('trash')"
+            @keydown="onTabKeydown"
+            @dragover="onTrashTabDragOver"
+            @drop="onTrashTabDrop"
+          >
+            <UiIcon name="trash" />
+            <span>{{ t('files.tabTrash') }}</span>
+            <span v-if="trashTotal" class="tab-count">{{ trashTotal }}</span>
+          </button>
+        </div>
 
-           It is also the open folder's own menu — which is why it takes a tab stop: with no
-           buttons left on the screen, this is where a keyboard reaches Upload. -->
-      <div
-        class="contents"
-        tabindex="0"
-        role="group"
-        :aria-label="t('files.listRegion', { folder: folderName(currentFolder) })"
-        v-bind="press.on((at) => openMenu(listMenu, at))"
-        @dragover="onListDragOver"
-        @drop.prevent="onListDrop"
-        @contextmenu="openMenuFromPointer($event, listMenu)"
-        @keydown="openMenuFromKey($event, listMenu)"
-      >
-        <UiPanel lead>
-          <template #title>
-            <!-- Each crumb is also a drop target: dropping a row on the folder you came
-                 from is how a file manager moves something back up a level. -->
-            <h2 class="crumbs">
-              <button
-                type="button"
-                class="crumb"
-                :class="{ current: !crumbs.length, target: dropTarget === null }"
-                :aria-current="!crumbs.length ? 'page' : undefined"
-                @click="openFolder(null)"
-                @dragover="onTargetDragOver($event, null)"
-                @drop="onTargetDrop(null, $event)"
-              >
-                {{ t('files.root') }}
-              </button>
-              <template v-for="(crumb, index) in crumbs" :key="crumb.id">
-                <UiIcon class="crumb-sep" name="chevron-right" />
+        <!-- The whole data region is a drop target for files from the desktop; the overlay
+             says which folder they would land in, and nothing else.
+
+             It is also the open folder's own menu and the selection's keyboard home — which
+             is why it takes a tab stop: with no buttons left on the screen, this is where a
+             keyboard reaches Upload. -->
+        <div
+          id="files-panel"
+          ref="listEl"
+          class="contents"
+          :class="{ 'rows-target': rowsOverList }"
+          role="tabpanel"
+          :aria-labelledby="`files-tab-${view}`"
+          tabindex="0"
+          :aria-activedescendant="activeRow"
+          v-bind="press.on((at) => openListMenu(at))"
+          @click="onListClick"
+          @dragover="onListDragOver"
+          @drop.prevent="onListDrop"
+          @contextmenu.prevent="openListMenu({ x: $event.clientX, y: $event.clientY })"
+          @keydown="onListKeydown"
+        >
+          <UiPanel>
+            <template #title>
+              <!-- Each crumb is also a drop target: dropping a row on the folder you came
+                   from is how a file manager moves something back up a level. -->
+              <h2 v-if="view === 'files'" class="crumbs">
                 <button
                   type="button"
                   class="crumb"
-                  :class="{ current: index === crumbs.length - 1, target: dropTarget === crumb.id }"
-                  :aria-current="index === crumbs.length - 1 ? 'page' : undefined"
-                  @click="openFolder(crumb.id)"
-                  @dragover="onTargetDragOver($event, crumb.id)"
-                  @drop="onTargetDrop(crumb.id, $event)"
+                  :class="{ current: !crumbs.length, target: dropTarget === null }"
+                  :aria-current="!crumbs.length ? 'page' : undefined"
+                  @click="openCrumb(null)"
+                  @dragover="onTargetDragOver($event, null)"
+                  @drop="onTargetDrop(null, $event)"
                 >
-                  {{ crumb.name }}
+                  {{ t('files.root') }}
                 </button>
+                <template v-for="(crumb, index) in crumbs" :key="crumb.id">
+                  <UiIcon class="crumb-sep" name="chevron-right" />
+                  <button
+                    type="button"
+                    class="crumb"
+                    :class="{ current: index === crumbs.length - 1, target: dropTarget === crumb.id }"
+                    :aria-current="index === crumbs.length - 1 ? 'page' : undefined"
+                    @click="openCrumb(crumb.id)"
+                    @dragover="onTargetDragOver($event, crumb.id)"
+                    @drop="onTargetDrop(crumb.id, $event)"
+                  >
+                    {{ crumb.name }}
+                  </button>
+                </template>
+              </h2>
+              <h2 v-else class="crumbs">
+                <span class="crumb current">{{ t('files.tabTrash') }}</span>
+              </h2>
+            </template>
+
+            <template #meta>
+              <template v-if="view === 'files'">
+                <span v-if="data">
+                  {{
+                    selection.length > 1
+                      ? t('files.selectedCount', { selected: selection.length, n: rows.length })
+                      : t('files.itemCount', { n: rows.length }, rows.length)
+                  }}
+                </span>
+                <UiButton
+                  variant="ghost"
+                  size="xs"
+                  icon-only
+                  :label="t('common.refresh')"
+                  :loading="pending"
+                  @click="refresh"
+                >
+                  <template #icon><UiIcon name="refresh" /></template>
+                </UiButton>
               </template>
-            </h2>
-          </template>
-
-          <template #meta>
-            <span v-if="data">{{ t('files.itemCount', { count: rows.length }) }}</span>
-            <UiButton
-              variant="ghost"
-              size="xs"
-              icon-only
-              :label="t('common.refresh')"
-              :loading="pending"
-              @click="refresh"
-            >
-              <template #icon><UiIcon name="refresh" /></template>
-            </UiButton>
-          </template>
-
-          <UiBanner v-if="errorMessage" class="state" tone="error">{{ errorMessage }}</UiBanner>
-          <!-- Only when no dialog is open: a dialog reports its own failure inside
-               itself, where the button that failed is. -->
-          <UiBanner v-if="mutationError && !dialogOpen" class="state" tone="error">
-            {{ mutationError }}
-            <template #actions>
-              <UiButton variant="ghost" size="xs" @click="mutationError = null">
-                {{ t('common.close') }}
-              </UiButton>
-            </template>
-          </UiBanner>
-
-          <UiSkeleton v-if="!data && !errorMessage" class="state" :rows="6" />
-
-          <UiEmptyState
-            v-else-if="data && !rows.length"
-            :title="currentFolder === null ? t('files.empty') : t('files.emptyFolder')"
-          />
-
-          <UiDataTable
-            v-else-if="data"
-            :columns="columns"
-            :rows="rows"
-            :row-key="(row) => row.key"
-            :row-attrs="rowAttrs"
-            :caption="t('files.headTitle')"
-          >
-            <template #cell-name="{ row }">
-              <button
-                v-if="row.kind === 'folder'"
-                type="button"
-                class="entry"
-                :title="row.folder.name"
-                @click="openFolder(row.folder.id)"
-              >
-                <UiIcon name="folder" />
-                <span class="entry-name">{{ row.folder.name }}</span>
-              </button>
-
-              <button
-                v-else-if="row.kind === 'file'"
-                type="button"
-                class="entry"
-                :class="{ failed: row.document.status === 'failed' }"
-                :title="row.document.name"
-                @click="showResult(row.document)"
-              >
-                <UiIcon :name="row.document.kind === 'image' ? 'image' : 'file-text'" />
-                <span class="entry-name link">{{ row.document.name }}</span>
-              </button>
-
-              <span v-else class="entry pendingup" :title="row.upload.name">
-                <UiSpinner />
-                <span class="entry-name">{{ row.upload.name }}</span>
-              </span>
-            </template>
-
-            <!-- A markdown document has no parse: no status, pages or size to report. -->
-            <template #cell-status="{ row }">
-              <span v-if="row.kind === 'file' && row.document.status" class="state-cell">
-                <UiStatusDot
-                  :tone="STATUS_TONE[row.document.status]"
-                  :label="t(`status.${row.document.status}`)"
-                />
-                <UiUsageBar
-                  v-if="row.document.status === 'running'"
-                  class="meter"
-                  :share="parseProgress(row.document)"
-                  :label="
-                    t('files.progress', {
-                      done: row.document.pages_done,
-                      total: row.document.page_count ?? 0,
-                    })
-                  "
-                />
-              </span>
-              <span v-else-if="row.kind === 'upload'" class="muted">
-                {{ row.upload.state === 'uploading' ? t('files.uploading') : t('files.waiting') }}
-              </span>
-            </template>
-
-            <template #cell-pages="{ row }">
-              <template v-if="row.kind === 'file'">
-                {{
-                  row.document.page_count
-                    ? `${row.document.pages_done}/${row.document.page_count}`
-                    : row.document.pages_done || ''
-                }}
+              <template v-else>
+                <span v-if="data">
+                  {{
+                    selection.length > 1
+                      ? t('files.selectedCount', { selected: selection.length, n: trashTotal })
+                      : t('files.itemCount', { n: trashTotal }, trashTotal)
+                  }}
+                </span>
+                <UiButton variant="danger" size="xs" :disabled="!trashTotal || busy" @click="askEmpty">
+                  {{ t('files.emptyTrash') }}
+                </UiButton>
               </template>
             </template>
 
-            <template #cell-size="{ row }">
-              <span class="muted">
-                <template v-if="row.kind === 'file' && row.document.size_bytes !== null">
-                  {{ formatBytes(row.document.size_bytes, locale) }}
+            <UiBanner v-if="errorMessage" class="state" tone="error">{{ errorMessage }}</UiBanner>
+            <UiBanner v-if="mutationError" class="state" tone="error">
+              {{ mutationError }}
+              <template #actions>
+                <UiButton variant="ghost" size="xs" @click="mutationError = null">
+                  {{ t('common.close') }}
+                </UiButton>
+              </template>
+            </UiBanner>
+
+            <!-- The two deletes nothing can undo ask here, not in a dialog: nothing else on
+                 the page is held up while the question stands. -->
+            <UiBanner v-if="view === 'trash' && confirming" class="state confirm" tone="error">
+              {{ confirmText }}
+              <template #actions>
+                <UiButton ref="confirmCancel" variant="ghost" size="xs" :disabled="busy" @click="cancelConfirm">
+                  {{ t('common.cancel') }}
+                </UiButton>
+                <UiButton variant="danger" size="xs" :loading="busy" @click="confirmDelete">
+                  {{ t('files.deleteForGood') }}
+                </UiButton>
+              </template>
+            </UiBanner>
+
+            <UiSkeleton v-if="!data && !errorMessage" class="state" :rows="6" />
+
+            <template v-else-if="data && view === 'files'">
+              <UiEmptyState
+                v-if="!rows.length"
+                :title="currentFolder === null ? t('files.empty') : t('files.emptyFolder')"
+              />
+
+              <UiDataTable
+                v-else
+                role="grid"
+                aria-multiselectable="true"
+                :columns="columns"
+                :rows="rows"
+                :row-key="(row) => row.key"
+                :row-attrs="rowAttrs"
+                :caption="t('files.headTitle')"
+              >
+                <template #cell-name="{ row }">
+                  <span
+                    v-if="row.kind === 'upload'"
+                    class="entry pendingup"
+                    :title="row.upload.name"
+                  >
+                    <UiSpinner />
+                    <span class="entry-name">{{ row.upload.name }}</span>
+                  </span>
+
+                  <span
+                    v-else
+                    class="entry"
+                    :class="{ failed: row.kind === 'file' && row.document.status === 'failed' }"
+                    :title="row.kind === 'folder' ? row.folder.name : row.document.name"
+                  >
+                    <UiIcon
+                      :name="row.kind === 'folder' ? 'folder' : row.document.kind === 'image' ? 'image' : 'file-text'"
+                    />
+                    <UiTextInput
+                      v-if="renaming?.key === row.key"
+                      ref="renameField"
+                      v-model="renaming.value"
+                      class="rename"
+                      :aria-label="t('files.nameLabel')"
+                      :maxlength="row.kind === 'folder' ? FOLDER_NAME_MAX : DOCUMENT_NAME_MAX"
+                      :readonly="renaming.busy"
+                      @keydown="onRenameKeydown"
+                      @blur="onRenameBlur"
+                      @click.stop
+                      @dblclick.stop
+                      @contextmenu.stop
+                    />
+                    <span v-else class="entry-name">
+                      {{ row.kind === 'folder' ? row.folder.name : row.document.name }}
+                    </span>
+                  </span>
                 </template>
-                <template v-else-if="row.kind === 'upload'">
-                  {{ formatBytes(row.upload.size, locale) }}
+
+                <!-- A markdown document has no parse: no status, pages or size to report. -->
+                <template #cell-status="{ row }">
+                  <span v-if="row.kind === 'file' && row.document.status" class="state-cell">
+                    <UiStatusDot
+                      :tone="STATUS_TONE[row.document.status]"
+                      :label="t(`status.${row.document.status}`)"
+                    />
+                    <UiUsageBar
+                      v-if="row.document.status === 'running'"
+                      class="meter"
+                      :share="parseProgress(row.document)"
+                      :label="
+                        t('files.progress', {
+                          done: row.document.pages_done,
+                          total: row.document.page_count ?? 0,
+                        })
+                      "
+                    />
+                  </span>
+                  <span v-else-if="row.kind === 'upload'" class="muted">
+                    {{ row.upload.state === 'uploading' ? t('files.uploading') : t('files.waiting') }}
+                  </span>
                 </template>
-              </span>
+
+                <template #cell-pages="{ row }">
+                  <template v-if="row.kind === 'file'">
+                    {{
+                      row.document.page_count
+                        ? `${row.document.pages_done}/${row.document.page_count}`
+                        : row.document.pages_done || ''
+                    }}
+                  </template>
+                </template>
+
+                <template #cell-size="{ row }">
+                  <span class="muted">
+                    <template v-if="row.kind === 'file' && row.document.size_bytes !== null">
+                      {{ formatBytes(row.document.size_bytes, locale) }}
+                    </template>
+                    <template v-else-if="row.kind === 'upload'">
+                      {{ formatBytes(row.upload.size, locale) }}
+                    </template>
+                  </span>
+                </template>
+
+                <template #cell-added="{ row }">
+                  <span class="muted">
+                    <template v-if="row.kind === 'folder'">
+                      {{ formatShortDateTime(row.folder.created_at, locale) }}
+                    </template>
+                    <template v-else-if="row.kind === 'file'">
+                      {{ formatShortDateTime(row.document.created_at, locale) }}
+                    </template>
+                  </span>
+                </template>
+              </UiDataTable>
             </template>
 
-            <template #cell-added="{ row }">
-              <span class="muted">
-                <template v-if="row.kind === 'folder'">
-                  {{ formatShortDateTime(row.folder.created_at, locale) }}
+            <template v-else-if="data">
+              <UiEmptyState v-if="!trashRows.length" :title="t('files.trashEmpty')" />
+
+              <UiDataTable
+                v-else
+                role="grid"
+                aria-multiselectable="true"
+                :columns="trashColumns"
+                :rows="trashRows"
+                :row-key="(row) => row.key"
+                :row-attrs="trashRowAttrs"
+                :caption="t('files.trashRegion')"
+              >
+                <template #cell-name="{ row }">
+                  <span class="entry" :title="row.kind === 'folder' ? row.folder.name : row.document.name">
+                    <UiIcon
+                      :name="row.kind === 'folder' ? 'folder' : row.document.kind === 'image' ? 'image' : 'file-text'"
+                    />
+                    <span class="entry-name">{{ row.kind === 'folder' ? row.folder.name : row.document.name }}</span>
+                  </span>
                 </template>
-                <template v-else-if="row.kind === 'file'">
-                  {{ formatShortDateTime(row.document.created_at, locale) }}
+
+                <template #cell-origin="{ row }">
+                  <span
+                    class="entry origin"
+                    :title="originPath(row.kind === 'folder' ? row.folder.origin : row.document.origin)"
+                  >
+                    <UiIcon name="folder" />
+                    <span class="entry-name">
+                      {{ originName(row.kind === 'folder' ? row.folder.origin : row.document.origin) }}
+                    </span>
+                  </span>
                 </template>
-              </span>
+
+                <template #cell-size="{ row }">
+                  <span class="muted">
+                    <template v-if="row.kind === 'folder'">
+                      {{ t('files.itemCount', { n: row.folder.items }, row.folder.items) }}
+                    </template>
+                    <template v-else-if="row.document.size_bytes !== null">
+                      {{ formatBytes(row.document.size_bytes, locale) }}
+                    </template>
+                  </span>
+                </template>
+
+                <template #cell-trashed="{ row }">
+                  <span class="muted">{{ formatShortDateTime(trashedAt(row), locale) }}</span>
+                </template>
+              </UiDataTable>
             </template>
+          </UiPanel>
 
-          </UiDataTable>
-        </UiPanel>
-
-        <!-- Where the files would land. A destination, not an instruction. -->
-        <div v-if="fileOverList" class="dropzone">
-          <div class="dropzone-mark">
-            <UiIcon name="folder-open" />
-            <span>{{ crumbs.length ? crumbs[crumbs.length - 1]!.name : t('files.root') }}</span>
+          <!-- Where the files would land. A destination, not an instruction. -->
+          <div v-if="fileOverList" class="dropzone">
+            <div class="dropzone-mark">
+              <UiIcon name="folder-open" />
+              <span>{{ crumbs.length ? crumbs[crumbs.length - 1]!.name : t('files.root') }}</span>
+            </div>
           </div>
+
+          <PaneFoot :hint="false" :back="null" :note="note" @undo="stepHistory('undo')" @hold="holdNote" />
+          <p class="sr-only" role="status" aria-live="polite">{{ liveText }}</p>
         </div>
       </div>
     </UiRegion>
@@ -1212,131 +2357,6 @@ function rowAttrs(row: Row): Record<string, unknown> {
       :focus-first="menu.fromKey"
       @select="runMenu"
       @close="menu = null"
-    />
-
-    <UiModal
-      v-if="showNewFolder"
-      :title="t('files.newFolder')"
-      :busy="busy"
-      @close="showNewFolder = false"
-    >
-      <form id="new-folder" @submit.prevent="submitNewFolder">
-        <UiField v-slot="{ id }" :label="t('files.nameLabel')">
-          <UiTextInput :id="id" v-model="newFolderName" :maxlength="FOLDER_NAME_MAX" required />
-        </UiField>
-        <UiBanner v-if="mutationError" class="dialog-error" tone="error">
-          {{ mutationError }}
-        </UiBanner>
-      </form>
-      <template #footer>
-        <UiButton variant="ghost" :disabled="busy" @click="showNewFolder = false">
-          {{ t('common.cancel') }}
-        </UiButton>
-        <UiButton
-          variant="primary"
-          type="submit"
-          form="new-folder"
-          :loading="busy"
-          :disabled="!newFolderName.trim()"
-        >
-          {{ t('common.save') }}
-        </UiButton>
-      </template>
-    </UiModal>
-
-    <UiModal
-      v-if="showNewDocument"
-      :title="t('files.newDocument')"
-      :busy="busy"
-      @close="showNewDocument = false"
-    >
-      <form id="new-document" @submit.prevent="submitNewDocument">
-        <UiField v-slot="{ id }" :label="t('files.nameLabel')">
-          <UiTextInput :id="id" v-model="newDocumentName" :maxlength="DOCUMENT_NAME_MAX" required />
-        </UiField>
-        <UiBanner v-if="mutationError" class="dialog-error" tone="error">
-          {{ mutationError }}
-        </UiBanner>
-      </form>
-      <template #footer>
-        <UiButton variant="ghost" :disabled="busy" @click="showNewDocument = false">
-          {{ t('common.cancel') }}
-        </UiButton>
-        <UiButton
-          variant="primary"
-          type="submit"
-          form="new-document"
-          :loading="busy"
-          :disabled="!newDocumentName.trim()"
-        >
-          {{ t('files.create') }}
-        </UiButton>
-      </template>
-    </UiModal>
-
-    <UiModal
-      v-if="renaming"
-      :title="renaming.kind === 'folder' ? t('files.renameFolder') : t('files.renameFile')"
-      :busy="busy"
-      @close="renaming = null"
-    >
-      <form id="rename" @submit.prevent="submitRename">
-        <UiField v-slot="{ id }" :label="t('files.nameLabel')">
-          <UiTextInput
-            :id="id"
-            v-model="renameValue"
-            :maxlength="renaming.kind === 'folder' ? FOLDER_NAME_MAX : DOCUMENT_NAME_MAX"
-            required
-          />
-        </UiField>
-        <UiBanner v-if="mutationError" class="dialog-error" tone="error">
-          {{ mutationError }}
-        </UiBanner>
-      </form>
-      <template #footer>
-        <UiButton variant="ghost" :disabled="busy" @click="renaming = null">
-          {{ t('common.cancel') }}
-        </UiButton>
-        <UiButton
-          variant="primary"
-          type="submit"
-          form="rename"
-          :loading="busy"
-          :disabled="!renameValue.trim()"
-        >
-          {{ t('common.save') }}
-        </UiButton>
-      </template>
-    </UiModal>
-
-    <MoveDialog
-      v-if="moving"
-      :folders="folders"
-      :name="rowName(moving)"
-      :current="movingFrom"
-      :forbidden="forbiddenTargets"
-      :pending="busy"
-      :error="mutationError"
-      @choose="submitMove"
-      @created="addFolder"
-      @cancel="moving = null"
-    />
-
-    <UiConfirmDialog
-      v-if="deleting"
-      :title="deleting.kind === 'folder' ? t('files.deleteFolder') : t('files.deleteFile')"
-      :message="
-        deleting.kind === 'folder'
-          ? t('files.deleteFolderConfirm', { name: rowName(deleting) })
-          : deleting.kind === 'file' && deleting.document.kind === 'markdown'
-            ? t('files.deleteMarkdownConfirm', { name: rowName(deleting) })
-            : t('files.deleteFileConfirm', { name: rowName(deleting) })
-      "
-      :confirm-label="t('common.delete')"
-      :pending="busy"
-      :error="mutationError"
-      @confirm="confirmDelete"
-      @cancel="deleting = null"
     />
 
     <!-- Keyed per document so reopening on another file resets scroll and page state.
@@ -1363,6 +2383,71 @@ function rowAttrs(row: Row): Record<string, unknown> {
 </template>
 
 <style scoped>
+/* The tabs over the list, then the list: the list's row is the one that scrolls. */
+.library {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+}
+
+/* --- Tabs ----------------------------------------------------------------- */
+
+/* Two words over a hairline, the open one inked and underlined: a tab is a place, not a
+   control to commit, so the accent stays out of it. */
+.tabs {
+  display: flex;
+  gap: var(--space-6);
+  padding: var(--space-6) var(--panel-x) 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.tab {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  height: var(--control-height);
+  margin-bottom: -1px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: var(--text-sm);
+  cursor: pointer;
+  transition:
+    color var(--duration-fast) var(--ease),
+    box-shadow var(--duration-fast) var(--ease);
+}
+
+.tab :deep(svg) {
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+}
+
+.tab:hover {
+  color: var(--ink);
+}
+
+.tab.active {
+  color: var(--ink);
+  font-weight: var(--weight-medium);
+  box-shadow: inset 0 -2px 0 var(--ink);
+}
+
+/* Lit only while rows are dragged over it — a drop target, so the accent, as a crumb's. */
+.tab.target {
+  color: var(--accent);
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+.tab-count {
+  color: var(--faint);
+  font-weight: var(--weight-normal);
+  font-variant-numeric: tabular-nums;
+}
+
 /* The drop surface: it has to be the box the panel fills, so the overlay can cover exactly
    the list and nothing else. It is also the list's menu target and a tab stop, so it takes
    the app's focus ring rather than the browser's. */
@@ -1379,11 +2464,12 @@ function rowAttrs(row: Row): Record<string, unknown> {
   outline-offset: -2px;
 }
 
-.state {
-  margin-top: var(--space-4);
+/* Rows from another folder over the list they would move into: its edge, as a drop target's. */
+.contents.rows-target {
+  box-shadow: inset 0 0 0 1px var(--accent);
 }
 
-.dialog-error {
+.state {
   margin-top: var(--space-4);
 }
 
@@ -1423,6 +2509,10 @@ function rowAttrs(row: Row): Record<string, unknown> {
   color: var(--ink);
 }
 
+span.crumb {
+  cursor: default;
+}
+
 /* Lit only while a drag is over it. Underlined rather than boxed: a crumb is a word in a
    heading, and a box around one word would jump the line. */
 .crumb.target {
@@ -1448,17 +2538,14 @@ function rowAttrs(row: Row): Record<string, unknown> {
   gap: var(--space-2);
   max-width: 100%;
   min-width: 0;
-  padding: 0;
-  border: none;
-  background: none;
   color: var(--ink);
-  font: inherit;
-  text-align: left;
-  cursor: pointer;
 }
 
 .entry.pendingup {
-  cursor: default;
+  color: var(--muted);
+}
+
+.entry.origin {
   color: var(--muted);
 }
 
@@ -1476,23 +2563,17 @@ function rowAttrs(row: Row): Record<string, unknown> {
   white-space: nowrap;
 }
 
-/* A file opens a dialog, so it is a button — but it is the row's identity and the thing
-   worth opening, so it reads as the link it behaves like. */
-.entry-name.link {
-  border-bottom: 1px solid var(--edge);
-  transition:
-    color var(--duration-fast) var(--ease),
-    border-color var(--duration-fast) var(--ease);
-}
-
-.entry:hover .entry-name.link {
-  color: var(--accent);
-  border-color: var(--accent);
-}
-
-.entry.failed .entry-name.link {
+.entry.failed .entry-name {
   color: var(--danger);
-  border-color: var(--danger-edge);
+}
+
+/* The name as a field in its row, at the row's own height so naming does not move the list:
+   the field is 8px taller than the row's 20px line, and the margins give those 8px back. */
+.entry .rename {
+  height: calc(var(--control-height-xs) + 2px);
+  max-width: 40ch;
+  margin-block: -4px;
+  padding: 0 var(--space-2);
 }
 
 .state-cell {
@@ -1511,12 +2592,19 @@ function rowAttrs(row: Row): Record<string, unknown> {
   color: var(--muted);
 }
 
-/* A row is held, not selected: a long press that starts a text selection cannot become a
-   menu, and on iOS it raises the callout instead. Same reason a file manager's rows do not
-   select their text either. */
+/* A row is held, not selected as text: a long press that starts a text selection cannot
+   become a menu, and on iOS it raises the callout instead. Same reason a file manager's rows
+   do not select their text either. */
 .contents :deep(tbody tr) {
   user-select: none;
   -webkit-touch-callout: none;
+  cursor: default;
+}
+
+/* The selected rows: the sidebar's current-row fill, never the accent — selecting commits
+   nothing (docs/web.md § Files). */
+.contents :deep(tr.selected) td {
+  background: var(--rail-active);
 }
 
 /* The row `?document=` pointed at: lit on arrival, then fading back to an ordinary row. */
@@ -1570,6 +2658,7 @@ function rowAttrs(row: Row): Record<string, unknown> {
 @media (max-width: 900px) {
   /* The content region scrolls as a whole below the breakpoint, so the list must not be a
      bounded grid row inside it. */
+  .library,
   .contents {
     display: block;
   }
