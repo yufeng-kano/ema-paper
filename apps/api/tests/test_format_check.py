@@ -176,6 +176,41 @@ def test_a_blank_page_is_passed_over_and_never_joined() -> None:
     assert joins.join_pages(pages, 2) == "page 2 has nothing to join"
 
 
+def test_a_fence_or_formula_is_a_block_of_its_own() -> None:
+    body = (
+        "Example:\n```python\nprint(1)\n\nprint(2)\n```\nand after the listing.\n\n"
+        "The loss is\n$$L = x$$\nwhere\n$$\nx = 1\n$$"
+    )
+    kinds = [joins.block_kind(body[start:end]) for start, end in joins.block_spans(body)]
+    assert kinds == ["paragraph", "code", "paragraph", "paragraph", "math", "paragraph", "math"]
+
+
+@pytest.mark.parametrize(
+    "last",
+    [
+        "Example:\n```python\nprint(1)\n```",
+        "The loss is\n$$L = x$$",
+        "- an item\n  ```\n  code\n  ```",
+    ],
+)
+def test_no_join_reaches_into_code_or_a_formula(last: str) -> None:
+    # Written straight under prose, a listing or a formula still ends its page: the next
+    # page's lowercase start must never land on its closing line.
+    pages = [joins.Page(1, last), joins.Page(2, "next paragraph starts here.")]
+    assert joins.sure_joins(pages) == 0
+    assert pages[0].body == last
+    assert joins.find_spots(pages) == []
+    assert joins.join_pages(pages, 2) == (
+        "only paragraphs, list items and tables join across a page break"
+    )
+
+
+def test_prose_written_straight_after_a_listing_still_joins() -> None:
+    pages = [joins.Page(1, "```\ncode\n```\nthe text goes"), joins.Page(2, "on here.")]
+    assert joins.sure_joins(pages) == 1
+    assert pages[0].body == "```\ncode\n```\nthe text goes on here."
+
+
 def test_two_tables_join_as_one_with_the_second_header_kept_as_a_row() -> None:
     pages = _pages(
         "<!-- page: 1 -->\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\n"

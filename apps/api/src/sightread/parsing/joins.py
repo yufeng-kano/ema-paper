@@ -75,8 +75,9 @@ def render(lead: str, pages: list[Page]) -> str:
 
 
 def block_spans(body: str) -> list[tuple[int, int]]:
-    """Where a page's blocks are: runs of lines between blank lines, with a fenced code
-    block or a display formula whole whatever blank lines it holds."""
+    """Where a page's blocks are: runs of lines between blank lines. A fenced code block or
+    a display formula is a block of its own, whole whatever blank lines it holds and apart
+    from the lines around it even with no blank line between, so no join reaches into it."""
     spans: list[tuple[int, int]] = []
     start: int | None = None
     end = 0
@@ -93,21 +94,35 @@ def block_spans(body: str) -> list[tuple[int, int]]:
             math = closer in ("$$", "\\]")
             if stripped.endswith(closer) if math else stripped.startswith(closer):
                 closer = None
+                spans.append((start, end))
+                start = None
             continue
         if not stripped:
             if start is not None:
                 spans.append((start, end))
                 start = None
             continue
-        if start is None:
-            start = line_start
-        end = line_end
         if stripped.startswith(("```", "~~~")):
             closer = stripped[:3]
         elif stripped.startswith("$$") and not (len(stripped) >= 4 and stripped.endswith("$$")):
             closer = "$$"
         elif stripped == "\\[":
             closer = "\\]"
+        # A formula opened and closed on its own line.
+        formula = len(stripped) >= 4 and (
+            (stripped.startswith("$$") and stripped.endswith("$$"))
+            or (stripped.startswith("\\[") and stripped.endswith("\\]"))
+        )
+        if (closer is not None or formula) and start is not None:
+            # Written straight under other lines: their block ends above it.
+            spans.append((start, end))
+            start = None
+        if start is None:
+            start = line_start
+        end = line_end
+        if formula:
+            spans.append((start, end))
+            start = None
     if start is not None:
         spans.append((start, end))
     return spans
