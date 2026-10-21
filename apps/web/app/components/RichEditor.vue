@@ -35,6 +35,7 @@ import { isImageFile, matchCommands } from '~/lib/composer'
 import { BLOCK_DRAG_TYPE, carriesFiles, claimDrag, droppedFiles, setDropEffect } from '~/lib/dnd'
 import { droppedBlocksMarkdown } from '~/lib/excerpts'
 import type { IconName } from '~/lib/icons'
+import type { PlaceNear } from '~/lib/markdown'
 import {
   richExtensions,
   washKey,
@@ -88,7 +89,13 @@ const props = withDefaults(
     figures?: RichOptions['figures']
     /** Images can be inserted: `upload` sends one file and answers its markdown line, or
      *  null when it was refused (the caller says why); `accept` is the file picker's. */
-    images?: { upload: (file: File) => Promise<string | null>; accept: string }
+    images?: {
+      upload: (file: File) => Promise<string | null>
+      accept: string
+      /** An image whose editor closed before it uploaded: its line, and the place it was
+       *  to land by the blocks around it, for the owner to land it there. */
+      strayed?: (line: string, near: PlaceNear) => void
+    }
   }>(),
   {
     variant: 'block',
@@ -751,12 +758,20 @@ function pastedSlice(view: EditorView, text: string, plain: boolean): Slice {
 // --- images --------------------------------------------------------------------------------------
 
 const imagePicker = ref<HTMLInputElement | null>(null)
-/** Images on their way in, each at the top-level position it lands at — replacing the empty
- *  paragraph there, for the first — mapped through every transaction until it has landed. */
-const landing = new Set<{ pos: number; replace: boolean }>()
+
+/** Where images land: a top-level position — replacing the empty paragraph there, for the
+ *  first — and, once the editor has closed under them, that place by the blocks around it. */
+interface ImageSlot {
+  pos: number
+  replace: boolean
+  near?: PlaceNear
+}
+
+/** Images on their way in, each slot mapped through every transaction until it has landed. */
+const landing = new Set<ImageSlot>()
 /** Where the file picker's files go, while it is open: a blur then is the picker taking
  *  focus, not the reader leaving (docs/web.md § Editing, *Images*). */
-let picking: { pos: number; replace: boolean } | null = null
+let picking: ImageSlot | null = null
 const uploading = ref(0)
 
 function pickImage(pos: number) {
@@ -790,7 +805,7 @@ function onImagePickCancelled() {
 
 /** Where an image pasted at the caret lands: in place of the empty top-level paragraph the
  *  caret is in, otherwise after the top-level block it is in. */
-function imageSlotAtCaret(): { pos: number; replace: boolean } | null {
+function imageSlotAtCaret(): ImageSlot | null {
   if (!editor) {
     return null
   }
@@ -805,8 +820,9 @@ function imageSlotAtCaret(): { pos: number; replace: boolean } | null {
 }
 
 /** Each file uploaded in turn and inserted as its line's block, the next after it. */
-async function insertImages(files: File[], slot: { pos: number; replace: boolean }) {
+async function insertImages(files: File[], slot: ImageSlot) {
   const upload = props.images?.upload
+  const strayed = props.images?.strayed
   if (!upload) {
     return
   }
@@ -820,7 +836,16 @@ async function insertImages(files: File[], slot: { pos: number; replace: boolean
       } finally {
         uploading.value -= 1
       }
-      if (!line || !editor) {
+      if (!line) {
+        continue
+      }
+      if (!editor) {
+        // The editor closed while the file uploaded: the owner lands it where it was to go,
+        // and the next one after it.
+        if (slot.near) {
+          strayed?.(line, slot.near)
+          slot.near = { after: line, before: slot.near.before }
+        }
         continue
       }
       const { state } = editor
@@ -1105,6 +1130,27 @@ function wash(first: number, count: number) {
 
 onBeforeUnmount(() => {
   closing = true
+  // Images still uploading: each place by the blocks around it, while the editor can still
+  // say, empty paragraphs passed over (`images.strayed`).
+  if (editor) {
+    const { doc } = editor.state
+    for (const slot of landing) {
+      let after: string | null = null
+      let before: string | null = null
+      doc.forEach((node, offset) => {
+        const markdown = docToMarkdown({ type: 'doc', content: [node.toJSON()] }).trim()
+        if (!markdown) {
+          return
+        }
+        if (offset < slot.pos) {
+          after = markdown
+        } else if (before === null) {
+          before = markdown
+        }
+      })
+      slot.near = { after, before }
+    }
+  }
   clearTimeout(washTimer)
   window.removeEventListener('dragend', clearDropLine)
   editor?.view.dom.removeEventListener('compositionend', onCompositionEnd)

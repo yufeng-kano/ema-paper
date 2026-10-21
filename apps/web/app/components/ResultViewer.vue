@@ -56,10 +56,12 @@ import {
   decodeBlockAnchor,
   documentOutline,
   findHeading,
+  findPlace,
   imageLine,
   insertBlocks,
   moveBlocks,
   parseResultMarkdown,
+  placeNear,
   placedBlocks,
   replaceBlockSource,
   resolveAnchor,
@@ -67,6 +69,7 @@ import {
   serializeDocument,
   type BlockAt,
   type OutlineEntry,
+  type PlaceNear,
   type PlacedBlock,
   type ResultBlock,
 } from '~/lib/markdown'
@@ -2397,11 +2400,25 @@ function onPaneDrop(event: DragEvent) {
 /** Image files dropped on the document: each uploaded, then all of them inserted where the
  *  line was — at the end without one — as one block action. An open editor is written back
  *  first, and again once the files are in, so no block under an editor moves out from under
- *  it. */
+ *  it. The line's place is held by the blocks around it (`placeNear`): the draft written
+ *  back may become more blocks or fewer, and the reader may edit while the files upload. */
 async function dropImages(files: File[], at: { target: number; place: 'before' | 'after' } | null) {
-  commitEdit()
   const aimed = at ? placed.value[at.target] : undefined
-  const target = aimed ? { page: aimed.page, index: aimed.index } : null
+  const open = editing.value
+  let target: BlockAt | null = null
+  let place = at?.place ?? 'after'
+  if (aimed && open && aimed.page === open.page && aimed.index >= open.index && aimed.index < open.index + span.value) {
+    // On the open draft's own edge: after its last block, or before its first — or before
+    // what follows it, when it becomes no block at all.
+    const count = draftBlockCount()
+    const after = place === 'after' && count > 0
+    target = { page: open.page, index: after ? open.index + count - 1 : open.index }
+    place = after ? 'after' : 'before'
+  } else if (aimed) {
+    target = afterCommit({ page: aimed.page, index: aimed.index })
+  }
+  commitEdit()
+  const near = placeNear(markdown.value, target, place)
   const lines: string[] = []
   for (const file of files) {
     const line = await uploadImage(file)
@@ -2410,16 +2427,25 @@ async function dropImages(files: File[], at: { target: number; place: 'before' |
     }
   }
   commitEdit()
-  const inserted = lines.length ? insertBlocks(markdown.value, target, at?.place ?? 'after', lines.join('\n\n')) : null
+  const found = findPlace(markdown.value, near)
+  if (lines.length && landBlocks(lines.join('\n\n'), found.target, found.place)) {
+    showNote(t('viewer.note.imagesAdded', { n: lines.length }, lines.length), false)
+  }
+}
+
+/** Blocks inserted before or after `target` — at the end without one — as one block action,
+ *  a fold over them opened. False when nothing was inserted. */
+function landBlocks(blocks: string, target: BlockAt | null, place: 'before' | 'after'): boolean {
+  const inserted = insertBlocks(markdown.value, target, place, blocks)
   if (!inserted) {
-    return
+    return false
   }
   applyDocument(inserted.markdown)
   const start = placedIndex.value.get(blockKey(inserted.first))
   if (start !== undefined) {
     openFoldsOver([start])
   }
-  showNote(t('viewer.note.imagesAdded', { n: lines.length }, lines.length), false)
+  return true
 }
 
 /** Anything not claimed for a block drag — or, for files, any `dragover` but the pane's own —
@@ -3708,12 +3734,48 @@ async function uploadImage(file: File): Promise<string | null> {
   }
 }
 
+/**
+ * An image whose editor closed before it uploaded (docs/web.md § Editing, *Images*): it lands
+ * in the document, or the notes, where it was to go, found by the blocks around it — not when
+ * the viewer has closed or moved on to another document since.
+ */
+function landStrayed(file: 'document' | 'notes', id: number, line: string, near: PlaceNear) {
+  if (closed || id !== props.documentId) {
+    return
+  }
+  if (file === 'notes') {
+    const { target, place } = findPlace(notes.value, near)
+    const inserted = insertBlocks(notes.value, target, place, line)
+    if (inserted) {
+      applyNotes(inserted.markdown)
+    }
+    return
+  }
+  commitEdit()
+  const { target, place } = findPlace(markdown.value, near)
+  if (landBlocks(line, target, place)) {
+    showNote(t('viewer.note.imagesAdded', { n: 1 }, 1), false)
+  }
+}
+
 /** What the editors insert images with: only on Files, where the document has an images route. */
-const editorImages = computed(() =>
-  props.imageBase && props.documentId !== null
-    ? { upload: uploadImage, accept: (limits.value?.image_media_types ?? ['image/*']).join(',') }
-    : undefined,
-)
+const editorImages = computed(() => {
+  const id = props.documentId
+  return props.imageBase && id !== null
+    ? {
+        upload: uploadImage,
+        accept: (limits.value?.image_media_types ?? ['image/*']).join(','),
+        strayed: (line: string, near: PlaceNear) => landStrayed('document', id, line, near),
+      }
+    : undefined
+})
+
+const notesImages = computed(() => {
+  const id = props.documentId
+  return editorImages.value && id !== null
+    ? { ...editorImages.value, strayed: (line: string, near: PlaceNear) => landStrayed('notes', id, line, near) }
+    : undefined
+})
 
 // --- copy as markdown ------------------------------------------------------
 
@@ -4451,7 +4513,7 @@ watch(
                   :label="t('viewer.notesLabel')"
                   :links="notesLinks"
                   :figures="editorFigures"
-                  :images="editorImages"
+                  :images="notesImages"
                   @change="onNotesChange"
                 />
               </div>

@@ -1259,6 +1259,56 @@ export function insertBlocks(markdown: string, target: BlockAt | null, place: 'b
   return { markdown: serializeDocument(pages), first: { page, index: at }, last: { page, index: at + adding.length - 1 } }
 }
 
+/** A place between blocks held by its neighbours' markdown, so it is found again after edits
+ *  have moved it: the block it follows, the one it precedes, and its position then among the
+ *  document's blocks in reading order (docs/web.md § Editing, *Images*). */
+export interface PlaceNear {
+  after: string | null
+  before: string | null
+  gap?: number
+}
+
+/** The document's blocks in reading order, each with where it sits. */
+function blocksAt(markdown: string): { src: string; at: BlockAt }[] {
+  return parseResultMarkdown(markdown).flatMap((page, pageIndex) =>
+    page.blocks.map((block, index) => ({ src: block.src, at: { page: pageIndex, index } })),
+  )
+}
+
+/** The place before or after `target` — the document's end without one — as `PlaceNear`. */
+export function placeNear(markdown: string, target: BlockAt | null, place: 'before' | 'after'): PlaceNear {
+  const blocks = blocksAt(markdown)
+  const found = target ? blocks.findIndex((entry) => entry.at.page === target.page && entry.at.index === target.index) : -1
+  const gap = found === -1 ? blocks.length : place === 'after' ? found + 1 : found
+  return { after: blocks[gap - 1]?.src ?? null, before: blocks[gap]?.src ?? null, gap }
+}
+
+/** Where `near` is in the document now: after the block it followed, else before the one it
+ *  preceded — of several with the same text, the one nearest where it was — and at the end
+ *  when neither is there any more. */
+export function findPlace(markdown: string, near: PlaceNear): { target: BlockAt | null; place: 'before' | 'after' } {
+  const blocks = blocksAt(markdown)
+  // The gap after a block is its index + 1, before it its index.
+  const nearest = (src: string | null, offset: number): BlockAt | null => {
+    let best: BlockAt | null = null
+    let bestDistance = Infinity
+    for (const [index, entry] of blocks.entries()) {
+      const distance = Math.abs(index + offset - (near.gap ?? 0))
+      if (src !== null && entry.src === src && distance < bestDistance) {
+        best = entry.at
+        bestDistance = distance
+      }
+    }
+    return best
+  }
+  const after = nearest(near.after, 1)
+  if (after) {
+    return { target: after, place: 'after' }
+  }
+  const before = nearest(near.before, 0)
+  return before ? { target: before, place: 'before' } : { target: null, place: 'after' }
+}
+
 /** The line an uploaded image is written as: its file's name for the alt text — the
  *  extension dropped, and what would end the brackets or the line taken out. */
 export function imageLine(fileName: string, path: string): string {

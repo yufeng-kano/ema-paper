@@ -6,6 +6,7 @@ import {
   decodeBlockAnchor,
   documentOutline,
   findHeading,
+  findPlace,
   firstWords,
   headingSlug,
   imageLine,
@@ -14,6 +15,7 @@ import {
   moveBlocks,
   parseInline,
   parseResultMarkdown,
+  placeNear,
   replaceBlockSource,
   resolveAnchor,
   sectionSource,
@@ -1249,5 +1251,31 @@ describe('insertBlocks', () => {
   it('leaves page markers out of what it inserts, and inserts nothing for no block', () => {
     expect(insertBlocks('one', { page: 0, index: 0 }, 'after', '<!-- page: 4 -->\ntwo')?.markdown).toBe('one\n\ntwo')
     expect(insertBlocks('one', null, 'after', '\n\n')).toBeNull()
+  })
+})
+
+describe('placeNear and findPlace', () => {
+  const doc = ['<!-- page: 1 -->', 'One.', '', 'Two.', '', '<!-- page: 2 -->', 'Three.'].join('\n')
+
+  it('holds a place by its neighbours and finds it again after edits', () => {
+    const near = placeNear(doc, { page: 0, index: 1 }, 'after')
+    expect(near).toEqual({ after: 'Two.', before: 'Three.', gap: 2 })
+    // A block added above moves the place: its text finds it again.
+    const edited = doc.replace('One.', 'One.\n\nOne and a half.')
+    expect(findPlace(edited, near)).toEqual({ target: { page: 0, index: 2 }, place: 'after' })
+    // The block it followed is gone: the one it preceded holds it.
+    expect(findPlace(doc.replace('Two.', ''), near)).toEqual({ target: { page: 1, index: 0 }, place: 'before' })
+    // Neither is there: the end of the document.
+    expect(findPlace('Else.', near)).toEqual({ target: null, place: 'after' })
+  })
+
+  it('takes the nearest of repeated text, and the end of the document without a target', () => {
+    const repeated = ['Same.', 'Other.', 'Same.', 'Last.'].join('\n\n')
+    const near = placeNear(repeated, { page: 0, index: 2 }, 'after')
+    expect(near).toEqual({ after: 'Same.', before: 'Last.', gap: 3 })
+    expect(findPlace(repeated, near)).toEqual({ target: { page: 0, index: 2 }, place: 'after' })
+    expect(findPlace(repeated, { after: null, before: 'Same.', gap: 0 })).toEqual({ target: { page: 0, index: 0 }, place: 'before' })
+    expect(placeNear('One.', null, 'after')).toEqual({ after: 'One.', before: null, gap: 1 })
+    expect(placeNear('', null, 'after')).toEqual({ after: null, before: null, gap: 0 })
   })
 })
