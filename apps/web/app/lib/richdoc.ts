@@ -133,13 +133,14 @@ function blockNode(block: ResultBlock, options?: InlineOptions): JSONContent {
         attrs: { language: block.lang },
         ...(block.text ? { content: [{ type: 'text', text: block.text }] } : {}),
       }
-    // A contents page, a figure placeholder, an image and a comment have no rich-text form:
-    // they ride through the editor as their source, untouched (a figure and an image drawn
-    // as themselves where the editor is given their addresses, `rich-extensions.ts`).
+    // A contents page, a figure placeholder, an image, a comment and a rule have no rich-text
+    // form: they ride through the editor as their source, untouched (a figure and an image
+    // drawn as themselves where the editor is given their addresses, `rich-extensions.ts`).
     case 'toc':
     case 'fig':
     case 'img':
     case 'comment':
+    case 'hr':
       return { type: 'rawBlock', attrs: { source: block.src } }
   }
 }

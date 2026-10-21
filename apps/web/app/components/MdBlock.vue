@@ -57,6 +57,9 @@ const figureSource = computed(() => {
   <!-- KaTeX-typeset, falling back to the verbatim source when it cannot parse. -->
   <MdMath v-else-if="block.kind === 'math'" :tex="block.text" />
 
+  <!-- A page's footnote rule; copy hands its source back. -->
+  <hr v-else-if="block.kind === 'hr'" class="md-hr" :data-md="block.src">
+
   <pre
     v-else-if="block.kind === 'code'"
     class="md-math"
