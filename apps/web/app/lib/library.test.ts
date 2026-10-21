@@ -7,6 +7,7 @@ import {
   documentsIn,
   flattenTree,
   folderPath,
+  isMarkdownUpload,
   isPending,
   parseProgress,
   subtreeIds,
@@ -172,5 +173,29 @@ describe('acceptsUpload', () => {
 
   it('defers to the server while the limits are still loading', () => {
     expect(acceptsUpload({ name: 'notes.txt', type: 'text/plain' }, null)).toBe(true)
+  })
+})
+
+describe('isMarkdownUpload', () => {
+  const limits: UploadLimits = {
+    upload_max_bytes: 1000,
+    page_cap: 500,
+    accepted_media_types: ['application/pdf', 'text/markdown'],
+    accepted_extensions: ['.pdf', '.md', '.markdown'],
+    markdown_media_types: ['text/markdown'],
+    markdown_extensions: ['.md', '.markdown'],
+    markdown_max_bytes: 100,
+    prompt_max_chars: 8000,
+  }
+
+  it('knows a markdown file by its type or its extension, as the server does', () => {
+    expect(isMarkdownUpload({ name: 'readme', type: 'text/markdown' }, limits)).toBe(true)
+    expect(isMarkdownUpload({ name: 'Notes.MD', type: '' }, limits)).toBe(true)
+    expect(isMarkdownUpload({ name: 'plan.markdown', type: 'application/octet-stream' }, limits)).toBe(true)
+  })
+
+  it('takes anything else for a parse', () => {
+    expect(isMarkdownUpload({ name: 'report.pdf', type: 'application/pdf' }, limits)).toBe(false)
+    expect(isMarkdownUpload({ name: 'notes.md', type: '' }, null)).toBe(false)
   })
 })

@@ -49,7 +49,12 @@ from ..upstream.client import (
     load_connection,
 )
 from ..workspace import git
-from ..workspace.documents import DocumentPaths, ensure_within_quota, materialize_document
+from ..workspace.documents import (
+    MARKDOWN_KIND,
+    DocumentPaths,
+    ensure_within_quota,
+    materialize_document,
+)
 from ..workspace.locks import clear_writing, mark_writing, shell_lock, workspace_lock
 from ..workspace.reconcile import reconcile_locked, reconcile_user
 from . import chat_events, chat_memory, chat_subagent, chat_tools
@@ -83,7 +88,7 @@ class TurnContext:
     turn: ChatTurn
     conversation: Conversation
     document: Document
-    job: Job
+    job: Job | None  # None: a markdown document, which has no parse (docs/workspace.md)
     paths: DocumentPaths
     connection: Connection
     model: str
@@ -136,8 +141,8 @@ async def _load(
         document = await db.get(Document, conversation.document_id) if conversation else None
         if conversation is None or document is None:
             raise TurnFailed("the conversation's document no longer exists")
-        job = await db.get(Job, document.job_id)
-        if job is None:
+        job = await db.get(Job, document.job_id) if document.job_id is not None else None
+        if document.job_id is not None and job is None:
             raise TurnFailed("the document's parse no longer exists")
         setting = (
             await db.execute(
@@ -246,13 +251,14 @@ async def _load(
     )
 
 
-def document_facts(settings: Settings, job: Job, paths: DocumentPaths) -> dict[str, str]:
-    """The document's facts the prompt is rendered with (docs/chat.md § System prompt)."""
+def document_facts(settings: Settings, job: Job | None, paths: DocumentPaths) -> dict[str, str]:
+    """The document's facts the prompt is rendered with (docs/chat.md § System prompt);
+    a markdown document (`job` None) has no pages and no parse to name."""
     return {
         "document_path": str(chat_tools.VM_ROOT / paths.relative.as_posix()),
-        "page_count": str(job.page_count or 1),
-        "bbox_format": job.bbox_format,
-        "parse_model": job.model,
+        "page_count": str(job.page_count or 1) if job is not None else "none",
+        "bbox_format": job.bbox_format if job is not None else "none",
+        "parse_model": job.model if job is not None else "not parsed (a markdown document)",
         "network": chat_agent.network_note(settings.sandbox_network, settings.sandbox_index_url),
     }
 
@@ -707,12 +713,12 @@ async def _run_tool_unguarded(
             ctx.paths,
             tool_input,
             document_id=ctx.document.id,
-            page_count=ctx.job.page_count,
+            page_count=ctx.job.page_count if ctx.job is not None else None,
             render_slots=ctx.render_slots,
             decode_slot=ctx.decode_slot,
             max_bytes=ctx.settings.upload_max_bytes,
             max_pixels=ctx.settings.chat_page_image_max_pixels,
-            kind=ctx.job.kind,
+            kind=ctx.job.kind if ctx.job is not None else MARKDOWN_KIND,
         )
     elif name == "view_figure":
         # Bounded by the round's image budget, as a page is: `CONTENT_MAX_BYTES` is the

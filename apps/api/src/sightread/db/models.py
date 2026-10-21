@@ -386,7 +386,9 @@ class Document(Base):
 
     A document is an entry, never a second copy of the output — the markdown lives in
     `results`, keyed by `job_id`. Deleting one deletes the entry only; the job stays in the
-    parse history and its usage rows stay with it (docs/database.md § Rules).
+    parse history and its usage rows stay with it (docs/database.md § Rules). `job_id` NULL
+    is a markdown document: no parse, its baseline its original (docs/workspace.md
+    § Markdown documents).
     """
 
     __tablename__ = "documents"
@@ -408,7 +410,9 @@ class Document(Base):
     folder_id: Mapped[int | None] = mapped_column(
         ForeignKey("folders.id", ondelete="CASCADE"), nullable=True
     )
-    job_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"))
+    job_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("jobs.id", ondelete="CASCADE"), nullable=True
+    )
     name: Mapped[str] = mapped_column(String(512))
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)

@@ -21,6 +21,7 @@ from ..agents import chat as chat_agent
 from ..agents import subagents as subagent_defs
 from ..upstream.client import PaymentRequired, RateLimited, UpstreamError
 from ..workspace import git
+from ..workspace.documents import MARKDOWN_KIND
 from . import chat_events, chat_runner, chat_tools
 
 logger = logging.getLogger(__name__)
@@ -112,12 +113,12 @@ async def _run_one(
             ctx.paths,
             tool_input,
             document_id=ctx.document.id,
-            page_count=ctx.job.page_count,
+            page_count=ctx.job.page_count if ctx.job is not None else None,
             render_slots=ctx.render_slots,
             decode_slot=ctx.decode_slot,
             max_bytes=ctx.settings.upload_max_bytes,
             max_pixels=ctx.settings.chat_page_image_max_pixels,
-            kind=ctx.job.kind,
+            kind=ctx.job.kind if ctx.job is not None else MARKDOWN_KIND,
         )
     if name == "view_figure":
         return await chat_tools.view_figure(

@@ -261,7 +261,8 @@ def test_the_memory_tool_is_the_last_tool_and_never_a_subagents() -> None:
     assert schema["required"] == ["action", "id", "kind", "text", "scope"]
     assert schema["properties"]["kind"]["enum"] == ["term", "preference", "about", "document", ""]
     assert schema["properties"]["scope"]["enum"] == ["all", "document", ""]
-    assert CHAT.pipeline_version == 7
+    # Bumped with the memory tool (7), and only ever forward since.
+    assert CHAT.pipeline_version >= 7
 
 
 def test_the_prompt_says_how_to_link_a_section_and_which_language_to_answer_in() -> None:

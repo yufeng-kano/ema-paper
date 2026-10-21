@@ -26,7 +26,7 @@ from ..parsing import poppler
 from ..parsing.figures import parse_bbox_path
 from ..sandbox.client import SandboxClient, SandboxRejected, SandboxUnavailable
 from ..workspace import git, safe_io
-from ..workspace.documents import DocumentPaths, original_of
+from ..workspace.documents import MARKDOWN_KIND, DocumentPaths, original_of
 from ..workspace.layout import (
     CACHE_DIR,
     FIGURES_DIR,
@@ -505,6 +505,12 @@ async def view_page(
     max_pixels: int,
     kind: str,
 ) -> ToolOutcome:
+    if kind == MARKDOWN_KIND:
+        # Its original is the text doc.md started as (docs/workspace.md § Markdown documents).
+        return ToolOutcome(
+            "This is a markdown document: it has no pages, and doc.md is the text itself.",
+            is_error=True,
+        )
     # The original kept outside the mount first; the shell's copy only when there is
     # none (a document filed before originals were kept there).
     source = original_of(paths.root, document_id) or paths.source()

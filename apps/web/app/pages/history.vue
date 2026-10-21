@@ -37,10 +37,14 @@ function refreshAll() {
   void library.refresh()
 }
 
-/** Each job's files, newest first — the order `GET /api/library` already returns. */
+/** Each job's files, newest first — the order `GET /api/library` already returns. A
+ *  markdown document has no job and files nothing here. */
 const filesByJob = computed(() => {
   const map = new Map<string, LibraryDocument[]>()
   for (const document of library.data.value?.documents ?? []) {
+    if (document.job_id === null) {
+      continue
+    }
     const files = map.get(document.job_id)
     if (files) {
       files.push(document)

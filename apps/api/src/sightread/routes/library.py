@@ -47,6 +47,7 @@ from ..errors import ApiError
 from ..jobs.intake import (
     MULTIPART_ENVELOPE_BYTES,
     capped_stream,
+    store_upload,
     submit_parse,
     upload_chunks,
 )
@@ -414,12 +415,29 @@ def folder_payload(row: Folder) -> dict:
     }
 
 
-def document_payload(row: Document, job: Job) -> dict:
+def document_payload(row: Document, job: Job | None) -> dict:
     """The row the file list draws: the entry, plus the live state of its parse.
 
     Joined rather than fetched per row, so one `GET /api/library` renders every name,
-    status and progress bar the page needs (docs/web.md § Files).
+    status and progress bar the page needs (docs/web.md § Files). A markdown document
+    (`job` None) has no parse to report on: every parse field is null.
     """
+    if job is None:
+        return {
+            "id": row.id,
+            "folder_id": row.folder_id,
+            "name": row.name,
+            "job_id": None,
+            "status": None,
+            "kind": workspace_documents.MARKDOWN_KIND,
+            "model": None,
+            "page_count": None,
+            "pages_done": None,
+            "size_bytes": None,
+            "error": None,
+            "created_at": row.created_at,
+            "finished_at": None,
+        }
     return {
         "id": row.id,
         "folder_id": row.folder_id,
@@ -474,7 +492,7 @@ async def read_library(user: SessionUser, db: DbSession):
     documents = (
         await db.execute(
             select(Document, Job)
-            .join(Job, Job.id == Document.job_id)
+            .outerjoin(Job, Job.id == Document.job_id)
             .where(Document.user_id == user_id)
             .order_by(Document.created_at.desc())
         )
@@ -720,6 +738,11 @@ class DocumentFromJob(BaseModel):
     folder_id: int | None = None
 
 
+class DocumentCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=DOCUMENT_NAME_MAX)
+    folder_id: int | None = None
+
+
 def form_folder_id(form: FormData) -> int | None:
     """`folder_id` as a multipart field: absent or empty means the root."""
     raw = form.get("folder_id")
@@ -772,6 +795,14 @@ async def upload_document(
         await owned_folder(db, user_id, folder_id)
 
     filename = upload.filename or "upload"
+    media_type = upload.content_type or ""
+    if (
+        media_type == workspace_documents.MARKDOWN_MEDIA_TYPE
+        or Path(filename).suffix.lower() in workspace_documents.MARKDOWN_EXTENSIONS
+    ):
+        return await file_markdown(
+            upload, filename, user_id=user_id, folder_id=folder_id, db=db, settings=settings
+        )
     # The library name is decided before the parse is queued: a name that cleans to
     # nothing is filed as `upload`, like a parse filed from the history, never a 400
     # after a billed parse is already on its way (docs/api.md).
@@ -784,7 +815,7 @@ async def upload_document(
         settings,
         user=user,
         chunks=upload_chunks(upload),
-        media_type=upload.content_type or "",
+        media_type=media_type,
         filename=filename,
         # The browser cannot tell a lost response from a lost request, so its retry of an
         # upload that in fact landed must not buy a second parse (docs/jobs.md § Dedup).
@@ -869,6 +900,107 @@ async def upload_document(
             undo=lambda: workspace_documents.discard_adopted(settings, user_id, row_id, relative),
         )
     return document_payload(row, job)
+
+
+async def file_markdown(
+    upload: UploadFile,
+    filename: str,
+    *,
+    user_id: int,
+    folder_id: int | None,
+    db: DbSession,
+    settings: AppSettings,
+) -> dict:
+    """A `.md` upload: no parse, a markdown document whose original is the file
+    (docs/workspace.md § Markdown documents). Staged and checked before any row exists,
+    under the cap a `doc.md` is read under anyway."""
+    try:
+        wanted = clean_name(filename, DOCUMENT_NAME_MAX)
+    except ApiError:
+        wanted = "upload"
+    upload_dir = Path(settings.upload_dir)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    staged = upload_dir / f"{uuid.uuid4().hex}.md"
+    await store_upload(
+        upload_chunks(upload), staged, settings.content_max_bytes, cap_name="CONTENT_MAX_BYTES"
+    )
+    try:
+        if not await asyncio.to_thread(workspace_documents.is_utf8_file, staged):
+            raise ApiError(400, "invalid_request", "A markdown file must be UTF-8 text")
+        root = user_root(settings.workspaces_dir, user_id)
+        # The row, its original and their commit under one hold of the workspace lock, the
+        # backup lock shared around it, as for a parse's upload (docs/workspace.md § Backups).
+        async with backup_shared(root), workspace_lock(root):
+            try:
+                row = await insert_named(
+                    db,
+                    user_id=user_id,
+                    build=lambda name: Document(
+                        user_id=user_id, folder_id=folder_id, job_id=None, name=name
+                    ),
+                    taken=lambda: sibling_names(db, user_id, folder_id),
+                    wanted=wanted,
+                    limit=DOCUMENT_NAME_MAX,
+                    message="A file with this name already exists here",
+                    commit=False,
+                )
+            except ApiError:
+                if folder_id is None or await folder_exists(db, user_id, folder_id):
+                    raise
+                raise ApiError(404, "invalid_request", "No such folder") from None
+            row_id = row.id
+            try:
+                await workspace_documents.adopt_markdown(settings, row, staged)
+            except ApiError:
+                await db.rollback()
+                raise
+            except Exception as exc:
+                logger.exception("could not keep the upload for document %d", row_id)
+                await db.rollback()
+                raise ApiError(
+                    409, "invalid_request", "The upload could not be kept; nothing was filed"
+                ) from exc
+            relative = document_relative_dir(
+                await workspace_documents.folder_names(db, user_id, row.folder_id), row.name
+            )
+            row = await commit_filing(
+                db,
+                row,
+                what="The upload",
+                undo=lambda: workspace_documents.discard_adopted(
+                    settings, user_id, row_id, relative
+                ),
+            )
+    finally:
+        staged.unlink(missing_ok=True)
+    return document_payload(row, None)
+
+
+@router.post("/documents/new", dependencies=[CsrfGuard], status_code=status.HTTP_201_CREATED)
+async def create_document(body: DocumentCreate, user: SessionUser, db: DbSession):
+    """A new, empty markdown document: a row with no job and no original — its baseline is
+    empty (docs/workspace.md § Markdown documents). Its directory is made the first time it
+    is read, like any document's. A taken name is suffixed, as a new folder's is."""
+    user_id, folder_id = user.id, body.folder_id
+    if folder_id is not None:
+        await owned_folder(db, user_id, folder_id)
+    try:
+        row = await insert_named(
+            db,
+            user_id=user_id,
+            build=lambda name: Document(
+                user_id=user_id, folder_id=folder_id, job_id=None, name=name
+            ),
+            taken=lambda: sibling_names(db, user_id, folder_id),
+            wanted=clean_name(body.name, DOCUMENT_NAME_MAX),
+            limit=DOCUMENT_NAME_MAX,
+            message="A file with this name already exists here",
+        )
+    except ApiError:
+        if folder_id is None or await folder_exists(db, user_id, folder_id):
+            raise
+        raise ApiError(404, "invalid_request", "No such folder") from None
+    return document_payload(row, None)
 
 
 @router.post("/documents/from-job", dependencies=[CsrfGuard], status_code=status.HTTP_201_CREATED)
@@ -1019,7 +1151,8 @@ async def _update_document_locked(
     after = await document_relative(db, row)
     landed = (Document, row.id, {"folder_id": row.folder_id, "name": row.name})
     await move_then_commit(db, settings, user.id, before, after, landed=landed)
-    return document_payload(row, await job_of(db, row.job_id))
+    job = await job_of(db, row.job_id) if row.job_id is not None else None
+    return document_payload(row, job)
 
 
 @router.delete(
@@ -1042,6 +1175,8 @@ async def delete_document(
 @router.get("/documents/{document_id}/result")
 async def document_result(document_id: int, user: SessionUser, db: DbSession):
     row = await owned_document(db, user.id, document_id)
+    if row.job_id is None:
+        raise ApiError(404, "invalid_request", "A markdown document has no parse result")
     # The job before the result, deliberately: under READ COMMITTED each statement gets its
     # own snapshot, so read the other way a job finishing between the two reads answers
     # "no result" + "succeeded" — a 404 for a result that now exists. This way the same
@@ -1112,6 +1247,8 @@ async def document_figure(
     settings: AppSettings,
 ):
     row = await owned_document(db, user.id, document_id)
+    if row.job_id is None:
+        raise ApiError(404, "invalid_request", "No such figure")
     return await figure_crop_response(settings, await job_of(db, row.job_id), page, bbox)
 
 
