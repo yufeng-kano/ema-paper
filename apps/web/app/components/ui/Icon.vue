@@ -110,6 +110,28 @@ defineProps<{ name: IconName }>()
       <path d="M4 16a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2" />
     </template>
 
+    <!-- copy-plus: a second sheet made beside the first — Duplicate. -->
+    <template v-else-if="name === 'copy-plus'">
+      <path d="M15 12v6M12 15h6" />
+      <rect x="8" y="8" width="14" height="14" rx="2" />
+      <path d="M4 16a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2" />
+    </template>
+
+    <!-- clipboard-paste: what was copied, put here. -->
+    <template v-else-if="name === 'clipboard-paste'">
+      <path d="M11 14h10" />
+      <path d="M16 4h2a2 2 0 0 1 2 2v1.344" />
+      <path d="m17 18 4-4-4-4" />
+      <path d="M8 4H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 1.793-1.113" />
+      <rect x="8" y="2" width="8" height="4" rx="1" />
+    </template>
+
+    <!-- undo-2: Put Back — out of the Trash to where it was. -->
+    <template v-else-if="name === 'undo-2'">
+      <path d="M9 14 4 9l5-5" />
+      <path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5a5.5 5.5 0 0 1-5.5 5.5H11" />
+    </template>
+
     <!-- x: dismiss one thing. -->
     <template v-else-if="name === 'close'">
       <path d="M18 6 6 18M6 6l12 12" />

@@ -20,6 +20,16 @@ describe('shortcut labels', () => {
     expect(shortcutLabel('esc', false)).toBe('Esc')
   })
 
+  it('names the file keys Finder and Explorer use', () => {
+    expect(shortcutLabel('mod+backspace', true)).toBe('⌘⌫')
+    expect(shortcutLabel('mod+backspace', false)).toBe('Ctrl+Backspace')
+    expect(shortcutLabel('alt+mod+backspace', true)).toBe('⌥⌘⌫')
+    expect(shortcutLabel('alt+mod+n', false)).toBe('Ctrl+Alt+N')
+    expect(shortcutLabel('delete', true)).toBe('⌦')
+    expect(shortcutLabel('delete', false)).toBe('Delete')
+    expect(shortcutLabel('f2', true)).toBe('F2')
+  })
+
   it('names keys for aria-keyshortcuts', () => {
     expect(ariaShortcut('mod+[', true)).toBe('Meta+[')
     expect(ariaShortcut('mod+shift+up', false)).toBe('Control+Shift+ArrowUp')
@@ -52,5 +62,17 @@ describe('reading a shortcut off a key event', () => {
     expect(matchesShortcut(key('「', { ctrl: true }, 'BracketLeft'), 'mod+[', false)).toBe(true)
     expect(matchesShortcut(key('ArrowDown', { ctrl: true }), 'down', false)).toBe(false)
     expect(matchesShortcut(key('ArrowDown'), 'down', false)).toBe(true)
+  })
+
+  it('reads the file keys, the Option ones by the key they sit on', () => {
+    expect(matchesShortcut(key('Backspace', { meta: true }), 'mod+backspace', true)).toBe(true)
+    expect(matchesShortcut(key('Backspace', { meta: true, alt: true }), 'mod+backspace', true)).toBe(false)
+    expect(matchesShortcut(key('Backspace', { meta: true, alt: true }), 'alt+mod+backspace', true)).toBe(true)
+    expect(matchesShortcut(key('˜', { meta: true, alt: true }, 'KeyN'), 'alt+mod+n', true)).toBe(true)
+    expect(matchesShortcut(key('√', { meta: true, alt: true }, 'KeyV'), 'mod+v', true)).toBe(false)
+    expect(matchesShortcut(key('Delete'), 'delete', false)).toBe(true)
+    expect(matchesShortcut(key('Delete', { ctrl: true }), 'delete', false)).toBe(false)
+    expect(matchesShortcut(key('F2'), 'f2', true)).toBe(true)
+    expect(matchesShortcut(key('End'), 'end', false)).toBe(true)
   })
 })

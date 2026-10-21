@@ -27,6 +27,11 @@ const APPLE: Record<string, string> = {
   updown: '↑↓',
   enter: '↵',
   esc: 'Esc',
+  backspace: '⌫',
+  delete: '⌦',
+  home: 'Home',
+  end: 'End',
+  f2: 'F2',
 }
 
 const OTHER: Record<string, string> = {
@@ -38,6 +43,11 @@ const OTHER: Record<string, string> = {
   updown: '↑↓',
   enter: '↵',
   esc: 'Esc',
+  backspace: 'Backspace',
+  delete: 'Delete',
+  home: 'Home',
+  end: 'End',
+  f2: 'F2',
 }
 
 const MODIFIERS = new Set(['mod', 'shift', 'alt'])
@@ -59,12 +69,23 @@ export function shortcutLabel(spec: string, apple: boolean): string {
   return apple ? labels.join('') : labels.join('+')
 }
 
-const ARIA_KEYS: Record<string, string> = { up: 'ArrowUp', down: 'ArrowDown', enter: 'Enter', esc: 'Escape' }
+/** Named keys by their `KeyboardEvent.key`, for `aria-keyshortcuts` and for reading an event. */
+const KEY_NAMES: Record<string, string> = {
+  up: 'ArrowUp',
+  down: 'ArrowDown',
+  enter: 'Enter',
+  esc: 'Escape',
+  backspace: 'Backspace',
+  delete: 'Delete',
+  home: 'Home',
+  end: 'End',
+  f2: 'F2',
+}
 
 /** The same shortcut for `aria-keyshortcuts`, in `KeyboardEvent.key` names. */
 export function ariaShortcut(spec: string, apple: boolean): string {
   return parts(spec)
-    .map((key) => (key === 'mod' ? (apple ? 'Meta' : 'Control') : key === 'shift' ? 'Shift' : key === 'alt' ? 'Alt' : (ARIA_KEYS[key] ?? key)))
+    .map((key) => (key === 'mod' ? (apple ? 'Meta' : 'Control') : key === 'shift' ? 'Shift' : key === 'alt' ? 'Alt' : (KEY_NAMES[key] ?? key)))
     .join('+')
 }
 
@@ -84,8 +105,6 @@ export function hasMod(event: KeyEventLike, apple: boolean): boolean {
   return apple ? event.metaKey !== event.ctrlKey : event.ctrlKey && !event.metaKey
 }
 
-const EVENT_KEYS: Record<string, string> = { up: 'ArrowUp', down: 'ArrowDown', enter: 'Enter', esc: 'Escape' }
-
 /** The `KeyboardEvent.code` a character key sits on, so a shortcut is read on any layout. */
 const CODES: Record<string, string> = { '/': 'Slash', '[': 'BracketLeft', ']': 'BracketRight' }
 
@@ -104,7 +123,7 @@ export function matchesShortcut(event: KeyEventLike, spec: string, apple: boolea
     return false
   }
   const shift = keys.includes('shift') === event.shiftKey
-  const name = EVENT_KEYS[key]
+  const name = KEY_NAMES[key]
   if (name) {
     return shift && event.key === name
   }

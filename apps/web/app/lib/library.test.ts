@@ -9,8 +9,11 @@ import {
   folderPath,
   isMarkdownUpload,
   isPending,
+  keyRange,
   parseProgress,
+  renameSelectionEnd,
   subtreeIds,
+  typeAheadMatch,
 } from './library'
 
 function folder(id: number, name: string, parent_id: number | null = null): LibraryFolder {
@@ -197,5 +200,51 @@ describe('isMarkdownUpload', () => {
   it('takes anything else for a parse', () => {
     expect(isMarkdownUpload({ name: 'report.pdf', type: 'application/pdf' }, limits)).toBe(false)
     expect(isMarkdownUpload({ name: 'notes.md', type: '' }, null)).toBe(false)
+  })
+})
+
+describe('renameSelectionEnd', () => {
+  it('selects a document up to its extension and a folder whole', () => {
+    expect(renameSelectionEnd('DINO.pdf', false)).toBe(4)
+    expect(renameSelectionEnd('archive.tar.gz', false)).toBe(11)
+    expect(renameSelectionEnd('Untitled', false)).toBe(8)
+    expect(renameSelectionEnd('v1.2 drafts', true)).toBe(11)
+  })
+
+  it('takes a leading dot for part of the name', () => {
+    expect(renameSelectionEnd('.notes', false)).toBe(6)
+  })
+})
+
+describe('keyRange', () => {
+  const keys = ['folder-1', 'folder-2', 'file-3', 'file-4']
+
+  it('runs either way between the two, both included', () => {
+    expect(keyRange(keys, 'folder-2', 'file-4')).toEqual(['folder-2', 'file-3', 'file-4'])
+    expect(keyRange(keys, 'file-4', 'folder-2')).toEqual(['folder-2', 'file-3', 'file-4'])
+    expect(keyRange(keys, 'file-3', 'file-3')).toEqual(['file-3'])
+  })
+
+  it('starts again from the row reached when the anchor has gone', () => {
+    expect(keyRange(keys, 'file-9', 'file-3')).toEqual(['file-3'])
+    expect(keyRange(keys, 'file-3', 'file-9')).toEqual([])
+  })
+})
+
+describe('typeAheadMatch', () => {
+  const rows = [
+    { key: 'folder-1', name: 'Papers' },
+    { key: 'file-2', name: 'attention.pdf' },
+    { key: 'file-3', name: 'Attic notes' },
+  ]
+
+  it('selects the first name starting with what was typed, in any case', () => {
+    expect(typeAheadMatch(rows, 'att')).toBe('file-2')
+    expect(typeAheadMatch(rows, 'ATTI')).toBe('file-3')
+    expect(typeAheadMatch(rows, 'p')).toBe('folder-1')
+  })
+
+  it('selects nothing when no name starts so', () => {
+    expect(typeAheadMatch(rows, 'z')).toBeNull()
   })
 })

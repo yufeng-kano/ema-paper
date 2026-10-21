@@ -7,6 +7,9 @@
 export type IconName =
   | 'refresh'
   | 'copy'
+  | 'copy-plus'
+  | 'clipboard-paste'
+  | 'undo-2'
   | 'check'
   | 'plus'
   | 'edit'

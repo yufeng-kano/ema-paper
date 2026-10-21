@@ -677,9 +677,25 @@ export interface LibraryDocument {
   finished_at: string | null
 }
 
+/** A folder in the Trash: trashed itself, never one inside a trashed folder (docs/api.md). */
+export interface TrashedFolder extends LibraryFolder {
+  trashed_at: string
+  /** The folder names from the top level down to where Put Back returns it; `[]` is the top. */
+  origin: string[]
+  /** How many documents are inside it. */
+  items: number
+}
+
+export interface TrashedDocument extends LibraryDocument {
+  trashed_at: string
+  origin: string[]
+}
+
+/** `folders` and `documents` are the live library; `trash` is what was moved to the Trash. */
 export interface LibraryResponse {
   folders: LibraryFolder[]
   documents: LibraryDocument[]
+  trash: { folders: TrashedFolder[]; documents: TrashedDocument[] }
 }
 
 // --- transport -------------------------------------------------------------
@@ -958,8 +974,24 @@ export function updateFolder(
   return request('PUT', `/api/library/folders/${id}`, body)
 }
 
+/** Delete Immediately: a live folder or one in the Trash, for good, with what is inside it. */
 export function deleteFolder(id: number): Promise<void> {
   return request<undefined>('DELETE', `/api/library/folders/${id}`)
+}
+
+/** Move to Trash, with everything inside it (docs/web.md § Files, *The Trash*). */
+export function trashFolder(id: number): Promise<LibraryFolder> {
+  return request('POST', `/api/library/folders/${id}/trash`)
+}
+
+/** Put Back: where it came from, or the nearest live folder above it; a taken name is suffixed. */
+export function restoreFolder(id: number): Promise<LibraryFolder> {
+  return request('POST', `/api/library/folders/${id}/restore`)
+}
+
+/** A copy of the folder and everything live under it, into `parentId` (null: the top level). */
+export function copyFolder(id: number, parentId: number | null): Promise<LibraryFolder> {
+  return request('POST', `/api/library/folders/${id}/copy`, { parent_id: parentId })
 }
 
 /**
@@ -1008,8 +1040,27 @@ export function updateDocument(
   return request('PUT', `/api/library/documents/${id}`, body)
 }
 
+/** Delete Immediately: a live file or one in the Trash, for good. The parse stays in History. */
 export function deleteDocument(id: number): Promise<void> {
   return request<undefined>('DELETE', `/api/library/documents/${id}`)
+}
+
+export function trashDocument(id: number): Promise<LibraryDocument> {
+  return request('POST', `/api/library/documents/${id}/trash`)
+}
+
+export function restoreDocument(id: number): Promise<LibraryDocument> {
+  return request('POST', `/api/library/documents/${id}/restore`)
+}
+
+/** A copy with its own text, notes, original and images; the parse is shared, not repeated. */
+export function copyDocument(id: number, folderId: number | null): Promise<LibraryDocument> {
+  return request('POST', `/api/library/documents/${id}/copy`, { folder_id: folderId })
+}
+
+/** Empty Trash: every item in it, for good. */
+export function emptyTrash(): Promise<void> {
+  return request<undefined>('DELETE', '/api/library/trash')
 }
 
 export function getDocumentResult(id: number): Promise<JobResult> {
