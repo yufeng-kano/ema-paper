@@ -736,6 +736,17 @@ describe('parseResultMarkdown rules and LaTeX display math', () => {
     ])
   })
 
+  it('leaves a line of two bracketed formulas to the inline reader', () => {
+    const line = '\\[x^2\\] and \\[y^2\\]'
+    const [page] = parseResultMarkdown(line)
+    expect(bare(page!.blocks)).toEqual([{ kind: 'p', text: line }])
+    expect(parseInline(line)).toEqual([
+      { kind: 'math', tex: 'x^2' },
+      { kind: 'text', text: ' and ' },
+      { kind: 'math', tex: 'y^2' },
+    ])
+  })
+
   it('round-trips a rule and LaTeX display math byte for byte', () => {
     const markdown = ['<!-- page: 1 -->', 'Text.', '', '---', '', '\\[', 'x^2', '\\]'].join('\n')
     expect(serializeDocument(parseResultMarkdown(markdown))).toBe(markdown)
@@ -1030,6 +1041,23 @@ describe('section links', () => {
     })
     expect(parseInline(`**${link}**`, { cites: true })).toMatchObject([
       { kind: 'strong', segments: [{ kind: 'cite', label: '3.2 Attention' }] },
+    ])
+  })
+
+  it('reads a link whose formula holds brackets with that formula, not its stand-in', () => {
+    const src = '[The $[0,1]$ interval](#the-01-interval)'
+    expect(parseInline(src, { cites: true })).toEqual([
+      {
+        kind: 'cite',
+        segments: [
+          { kind: 'text', text: 'The ' },
+          { kind: 'math', tex: '[0,1]' },
+          { kind: 'text', text: ' interval' },
+        ],
+        label: 'The [0,1] interval',
+        anchor: 'the-01-interval',
+        src,
+      },
     ])
   })
 

@@ -354,6 +354,14 @@ describe('quotes in the editor', () => {
     expect(reading(markdown)).toEqual([{ kind: 'p', text: '\\> not a quote' }])
   })
 
+  it('escapes a paragraph of dashes so it stays a paragraph, not a rule', () => {
+    for (const text of ['---', '-- -']) {
+      const markdown = serializeNode({ type: 'paragraph', content: [{ type: 'text', text }] })
+      expect(markdown).toBe(`\\${text}`)
+      expect(load(markdown).content![0]).toMatchObject({ type: 'paragraph', content: [{ type: 'text', text }] })
+    }
+  })
+
   it('makes quote lines of any markdown', () => {
     expect(quoteLines('a\n\nb')).toBe('> a\n>\n> b')
     expect(quoteLines('')).toBe('')

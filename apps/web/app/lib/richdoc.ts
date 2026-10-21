@@ -19,6 +19,7 @@
 import type { JSONContent } from '@tiptap/core'
 import {
   ESCAPABLE,
+  THEMATIC_BREAK,
   WORD_CHAR,
   isEscaped,
   mathSpanAt,
@@ -351,7 +352,9 @@ function escapeLineStart(line: string): string {
   // A sentence ending in a dot leader and a number would read back as a contents row; one
   // escaped dot breaks the leader and still renders as a dot.
   const text = readsAsTocRow(line) ? line.replace(/\.(?=[^.]*$)/, '\\.') : line
-  if (/^(#|>|[-+*]\s|\d{1,9}[.)]\s|\$\$|```|~~~|<!--|!\[)/.test(text)) {
+  // Dashes alone on the line read back as a rule; the other rules' `*` and `_` are escaped
+  // already, one by one.
+  if (/^(#|>|[-+*]\s|\d{1,9}[.)]\s|\$\$|```|~~~|<!--|!\[)/.test(text) || THEMATIC_BREAK.test(text)) {
     const marker = /^\d{1,9}/.exec(text)
     return marker ? `${marker[0]}\\${text.slice(marker[0].length)}` : `\\${text}`
   }

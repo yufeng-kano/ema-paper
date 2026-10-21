@@ -90,7 +90,7 @@ const LIST_ITEM = /^([-*+]|\d{1,9}[.)])\s+(.*)$/
  * setext heading CommonMark makes of `---` under a line — a transcription's `---` is the
  * page's footnote rule (docs/web.md § Result viewer).
  */
-const THEMATIC_BREAK = /^(?:(?:-[ \t]*){3,}|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})$/
+export const THEMATIC_BREAK = /^(?:(?:-[ \t]*){3,}|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})$/
 
 /** Display math's two spellings: the `$$` fence, and LaTeX's `\[ … \]` that GPT models write. */
 interface MathFence {
@@ -108,8 +108,9 @@ const TEX_LIKE = /[\\^_{}=]/
  * on one line — how most models write a numbered equation — and `$$x = 1` whose closing
  * dollars come lines later. A line with a second `$$` anywhere but its end (`$$x$$ where x
  * is…`) is prose: read as an opener it would swallow the document up to the next fence.
- * `\[` opens only alone on its line, or on a line it also closes around TeX: a reference
- * list's `\[87] A. Author …` is an escaped bracket, and so is `\[87\]`.
+ * `\[` opens only alone on its line, or on a line its first `\]` ends, around TeX: a
+ * reference list's `\[87] A. Author …` is an escaped bracket, and so is `\[87\]`, while
+ * `\[x^2\] and \[y^2\]` is prose holding two formulas.
  */
 function mathFence(line: string): MathFence | null {
   if (line.startsWith(DOLLARS.open)) {
@@ -121,8 +122,11 @@ function mathFence(line: string): MathFence | null {
   if (line === BRACKETS.open) {
     return BRACKETS
   }
+  const close = line.indexOf(BRACKETS.close, BRACKETS.open.length)
   const inner = line.slice(BRACKETS.open.length, -BRACKETS.close.length)
-  return line.startsWith(BRACKETS.open) && line.endsWith(BRACKETS.close) && TEX_LIKE.test(inner) ? BRACKETS : null
+  return line.startsWith(BRACKETS.open) && close === line.length - BRACKETS.close.length && TEX_LIKE.test(inner)
+    ? BRACKETS
+    : null
 }
 
 function opensMath(line: string): boolean {
@@ -955,8 +959,14 @@ function restoreMath(segments: readonly InlineSegment[], maths: readonly MathSou
       }
     } else if (segment.kind === 'strong' || segment.kind === 'em' || segment.kind === 'sup' || segment.kind === 'sub') {
       restored.push({ ...segment, segments: restoreMath(segment.segments, maths), src: restoreSource(segment.src, maths) })
+    } else if (segment.kind === 'cite') {
+      // The scan steps over a link it can read, but `[The $[0,1]$ interval](#…)` reads only
+      // once its formula stands in, so its text holds stand-ins, and its label is read again.
+      const segments = restoreMath(segment.segments, maths)
+      const label = plainText(segments).replace(/\s+/g, ' ').trim()
+      restored.push({ ...segment, segments, label, src: restoreSource(segment.src, maths) })
     } else {
-      // Code and section links are stepped over whole by the scan, so no stand-in is inside.
+      // Code is stepped over whole by the scan, so no stand-in is inside.
       restored.push(segment)
     }
   }
