@@ -2419,9 +2419,15 @@ async function dropImages(files: File[], at: { target: number; place: 'before' |
   }
   commitEdit()
   const near = placeNear(markdown.value, target, place)
+  const id = props.documentId
   const lines: string[] = []
   for (const file of files) {
     const line = await uploadImage(file)
+    // The viewer closed, or turned to another document, while it uploaded: nothing lands,
+    // and the rest are not sent (docs/web.md § Editing, *Images*).
+    if (closed || id !== props.documentId) {
+      return
+    }
     if (line) {
       lines.push(line)
     }
@@ -3737,11 +3743,11 @@ async function uploadImage(file: File): Promise<string | null> {
 /**
  * An image whose editor closed before it uploaded (docs/web.md § Editing, *Images*): it lands
  * in the document, or the notes, where it was to go, found by the blocks around it — not when
- * the viewer has closed or moved on to another document since.
+ * the viewer has closed or moved on to another document since, which is false: send no more.
  */
-function landStrayed(file: 'document' | 'notes', id: number, line: string, near: PlaceNear) {
+function landStrayed(file: 'document' | 'notes', id: number, line: string, near: PlaceNear): boolean {
   if (closed || id !== props.documentId) {
-    return
+    return false
   }
   if (file === 'notes') {
     const { target, place } = findPlace(notes.value, near)
@@ -3749,13 +3755,14 @@ function landStrayed(file: 'document' | 'notes', id: number, line: string, near:
     if (inserted) {
       applyNotes(inserted.markdown)
     }
-    return
+    return true
   }
   commitEdit()
   const { target, place } = findPlace(markdown.value, near)
   if (landBlocks(line, target, place)) {
     showNote(t('viewer.note.imagesAdded', { n: 1 }, 1), false)
   }
+  return true
 }
 
 /** What the editors insert images with: only on Files, where the document has an images route. */

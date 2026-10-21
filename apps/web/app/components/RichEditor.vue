@@ -93,8 +93,9 @@ const props = withDefaults(
       upload: (file: File) => Promise<string | null>
       accept: string
       /** An image whose editor closed before it uploaded: its line, and the place it was
-       *  to land by the blocks around it, for the owner to land it there. */
-      strayed?: (line: string, near: PlaceNear) => void
+       *  to land by the blocks around it, for the owner to land it there. False when the
+       *  owner takes no more — the rest of the files are then not sent. */
+      strayed?: (line: string, near: PlaceNear) => boolean
       /** The blocks around the editor's own text in its owner's file: the neighbours of a
        *  slot with no block of the editor's beside it. */
       outer?: PlaceNear | null
@@ -844,11 +845,11 @@ async function insertImages(files: File[], slot: ImageSlot) {
       }
       if (!editor) {
         // The editor closed while the file uploaded: the owner lands it where it was to go,
-        // and the next one after it.
-        if (slot.near) {
-          strayed?.(line, slot.near)
-          slot.near = { after: line, before: slot.near.before }
+        // and the next one after it — unless the owner has closed too.
+        if (!slot.near || !strayed?.(line, slot.near)) {
+          return
         }
+        slot.near = { after: line, before: slot.near.before }
         continue
       }
       const { state } = editor
@@ -864,6 +865,27 @@ async function insertImages(files: File[], slot: ImageSlot) {
   } finally {
     landing.delete(slot)
   }
+}
+
+/** A place in the editor by the top-level blocks around it, empty paragraphs passed over: the
+ *  last before it, the first from it on, and how many come before it. */
+function placeIn(doc: ProseNode, pos: number): PlaceNear {
+  let after: string | null = null
+  let before: string | null = null
+  let gap = 0
+  doc.forEach((node, offset) => {
+    const markdown = docToMarkdown({ type: 'doc', content: [node.toJSON()] }).trim()
+    if (!markdown) {
+      return
+    }
+    if (offset < pos) {
+      after = markdown
+      gap += 1
+    } else if (before === null) {
+      before = markdown
+    }
+  })
+  return { after, before, gap }
 }
 
 function imagesOf(transfer: DataTransfer | null): File[] {
@@ -1078,7 +1100,39 @@ watch(
     emitted = null
     trailing = /\n\s*$/.exec(source)?.[0] ?? ''
     closeSlash()
+    // Images still uploading keep their place by the blocks around it: the whole text is
+    // replaced, which maps every position to its end (docs/web.md § Editing, *Images*).
+    const places = [...landing].map((slot) => ({ slot, near: placeIn(editor!.state.doc, slot.pos) }))
     editor.chain().setMeta('addToHistory', false).setContent(markdownToDoc(source, inlineOptions), { emitUpdate: false }).run()
+    const { doc } = editor.state
+    const blocks: { markdown: string; from: number; to: number }[] = []
+    doc.forEach((node, offset) => {
+      const markdown = docToMarkdown({ type: 'doc', content: [node.toJSON()] }).trim()
+      if (markdown) {
+        blocks.push({ markdown, from: offset, to: offset + node.nodeSize })
+      }
+    })
+    for (const { slot, near } of places) {
+      // The nearest block alike, as `findPlace` finds it in a file: after the one it
+      // followed, else before the one it preceded, else at the end.
+      const nearest = (src: string | null, offset: number) => {
+        let best = -1
+        let bestDistance = Infinity
+        for (const [index, block] of blocks.entries()) {
+          const distance = Math.abs(index + offset - (near.gap ?? 0))
+          if (src !== null && block.markdown === src && distance < bestDistance) {
+            best = index
+            bestDistance = distance
+          }
+        }
+        return best
+      }
+      const after = nearest(near.after, 1)
+      const before = after === -1 ? nearest(near.before, 0) : -1
+      slot.pos = after !== -1 ? blocks[after]!.to : before !== -1 ? blocks[before]!.from : doc.content.size
+      // The empty paragraph it was to replace is gone with the old text.
+      slot.replace = false
+    }
   },
 )
 
@@ -1140,20 +1194,8 @@ onBeforeUnmount(() => {
     const { doc } = editor.state
     const outer = props.images?.outer ?? null
     for (const slot of landing) {
-      let after: string | null = null
-      let before: string | null = null
-      doc.forEach((node, offset) => {
-        const markdown = docToMarkdown({ type: 'doc', content: [node.toJSON()] }).trim()
-        if (!markdown) {
-          return
-        }
-        if (offset < slot.pos) {
-          after = markdown
-        } else if (before === null) {
-          before = markdown
-        }
-      })
-      slot.near = { after: after ?? outer?.after ?? null, before: before ?? outer?.before ?? null, gap: outer?.gap }
+      const { after, before, gap } = placeIn(doc, slot.pos)
+      slot.near = { after: after ?? outer?.after ?? null, before: before ?? outer?.before ?? null, gap: (outer?.gap ?? 0) + (gap ?? 0) }
     }
   }
   clearTimeout(washTimer)
