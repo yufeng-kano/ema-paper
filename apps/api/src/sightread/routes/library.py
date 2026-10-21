@@ -1851,7 +1851,9 @@ async def retry_document(
     kept (docs/jobs.md § Retrying failed pages). Its upload went with the failure, so it
     runs on a copy of the document's original. Decided under the workspace lock — the
     original cannot go while it is copied, nor the file to the Trash — and the job's row
-    lock, from `failed` only: two retries cannot both put it back."""
+    lock, from `failed` only: two retries cannot both put it back. A commit that raises is
+    read back on a connection of its own, as a filing's is: the copy goes only with a
+    retry that did not land."""
     model = (body.model or "").strip() or None
     root = user_root(settings.workspaces_dir, user.id)
     async with workspace_lock(root):
@@ -1876,10 +1878,33 @@ async def retry_document(
         try:
             await retry_job(db, job.id, source_path=str(copy), model=model)
             await events.notify(db, job.id)
-            await db.commit()
         except BaseException:
             copy.unlink(missing_ok=True)
             raise
+        # Read before the commit: a rollback expires the row.
+        job_id = job.id
+        try:
+            await db.commit()
+        except Exception as exc:  # noqa: BLE001 - verified below, whatever raised
+            readable, landed = await _read_row(db, Job, job_id)
+            with contextlib.suppress(Exception):
+                await db.rollback()
+            if readable and landed is not None and landed.source_path == str(copy):
+                logger.warning("the retry of job %s was committed despite the error", job_id)
+                return {"job_id": str(job_id), "status": "queued"}
+            if readable:
+                copy.unlink(missing_ok=True)
+                raise ApiError(
+                    409, "invalid_request", "The retry could not be queued; nothing changed"
+                ) from exc
+            # The copy stays: a retry that landed runs on it, and the upload sweeper
+            # takes it otherwise (docs/jobs.md § Retrying failed pages).
+            raise ApiError(
+                409,
+                "invalid_request",
+                "The retry may have been queued, but the database could not confirm it; "
+                "reload the library before trying again",
+            ) from exc
     return {"job_id": str(job.id), "status": "queued"}
 
 

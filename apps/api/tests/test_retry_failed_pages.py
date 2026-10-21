@@ -27,6 +27,7 @@ from sightread.workspace.layout import user_root
 from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL
 from tests.test_connections_and_prompts import MODELS_URL, _create_connection, _models_ok
 from tests.test_library import MODEL, _ready_to_parse
+from tests.test_library_trash import _fail_next_commit
 from tests.test_parse_end_to_end import VISION_MARKDOWN, _drain_queue
 
 FALLBACK = "vendor/fallback-model"
@@ -236,6 +237,34 @@ async def test_a_failed_parse_in_the_trash_is_retried_only_once_it_is_put_back(
 
 
 @respx.mock
+@pytest.mark.parametrize("landed", [True, False])
+async def test_a_retry_whose_commit_raised_keeps_its_copy_only_if_it_landed(
+    library, sessionmaker, documents, monkeypatch, landed
+) -> None:
+    respx.post(KANO_CHAT_URL).mock(side_effect=Upstream({(MODEL, 2): lambda: httpx.Response(400)}))
+    uploaded = await _upload(library, documents["mixed_pdf"])
+    await _drain_queue(library, sessionmaker)
+
+    _fail_next_commit(monkeypatch, landed=landed)
+    response = await _retry(library, uploaded["id"])
+    async with sessionmaker() as db:
+        job = await db.get(Job, uuid.UUID(uploaded["job_id"]))
+    copies = list(Path(library.app.state.settings.upload_dir).glob(f"{job.id}.retry-*"))
+    if landed:
+        # The acknowledgement was lost, not the retry: it stands, on its copy.
+        assert response.status_code == 202, response.text
+        assert job.status == "queued"
+        assert [str(copy) for copy in copies] == [job.source_path]
+    else:
+        assert response.status_code == 409
+        assert response.json()["error"]["message"] == (
+            "The retry could not be queued; nothing changed"
+        )
+        assert job.status == "failed"
+        assert copies == []
+
+
+@respx.mock
 async def test_a_page_already_transcribed_is_not_sent_again(
     library, sessionmaker, documents
 ) -> None:
@@ -326,6 +355,34 @@ async def test_a_page_the_model_stopped_fails_the_job_after_one_call(
                 select(UsageLog.model).where(UsageLog.job_id == uuid.UUID(uploaded["job_id"]))
             )
         ).all()
+    assert billed == [(MODEL,)]
+
+
+@respx.mock
+async def test_a_blocked_call_stays_billed_when_its_fallback_aborts_the_job(
+    library, sessionmaker, documents
+) -> None:
+    upstream = Upstream(
+        {
+            (MODEL, 1): lambda: _answer("", "content_filter"),
+            (FALLBACK, 1): lambda: httpx.Response(401),
+        }
+    )
+    respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
+    await _set_fallback(library, fallback_model=FALLBACK, auto_fallback=True)
+    uploaded = await _upload(library, documents["png"], "image/png")
+    await _drain_queue(library, sessionmaker)
+
+    assert upstream.calls == [(MODEL, 1), (FALLBACK, 1)]
+    row = await _row(library, uploaded["id"])
+    assert (row["status"], row["error"]) == ("failed", "the upstream rejected the stored key")
+    async with sessionmaker() as db:
+        billed = (
+            await db.execute(
+                select(UsageLog.model).where(UsageLog.job_id == uuid.UUID(uploaded["job_id"]))
+            )
+        ).all()
+    # The rejected key answered nothing; the block was an answer, and the key paid for it.
     assert billed == [(MODEL,)]
 
 

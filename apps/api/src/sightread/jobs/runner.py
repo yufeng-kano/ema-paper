@@ -307,6 +307,7 @@ async def _transcribe(
     outcome: PageOutcome,
     image: Path,
     page_no: int,
+    sessionmaker: async_sessionmaker[AsyncSession],
 ) -> PageTranscription | None:
     """The page's transcription, or None when it failed — the outcome says why. The run's
     model first (a retry's, else the job's); a page it blocked goes once more to the
@@ -317,7 +318,13 @@ async def _transcribe(
     if job.fallback_model and job.fallback_model != first:
         models.append(job.fallback_model)
     transcription = None
-    for model in models:
+    for index, model in enumerate(models):
+        if index:
+            # The blocked call is logged before the fallback is sent: a fallback that
+            # aborts the job, or a cancel while it runs, ends the page before it is
+            # recorded, and must not take a call the user's key paid for with it.
+            await _to_the_end(_log_usage(sessionmaker, job, outcome.usage))
+            outcome.usage.clear()
         outcome.error = None
         outcome.model = model
         convention = convention_for_job(model, job.pipeline_version)
@@ -375,7 +382,9 @@ async def _process_pdf_page(
         return outcome
 
     try:
-        transcription = await _transcribe(job, state, connection, outcome, image, page_no)
+        transcription = await _transcribe(
+            job, state, connection, outcome, image, page_no, sessionmaker
+        )
         if transcription is not None:
             outcome.markdown = transcription.markdown
         # Billing before the optional raster work: a SIGTERM landing mid-crop cancels this
@@ -451,7 +460,9 @@ async def _process_image(
         method=VISION,
     )
     try:
-        transcription = await _transcribe(job, state, connection, outcome, normalized.path, 1)
+        transcription = await _transcribe(
+            job, state, connection, outcome, normalized.path, 1, sessionmaker
+        )
         if transcription is not None:
             outcome.markdown = transcription.markdown
         # Same ordering as the PDF path: the billed call is persisted before crop work.
@@ -577,20 +588,35 @@ async def _record_page(
             logger.warning(
                 "job %s is no longer this worker's; page %d is not recorded", job.id, outcome.page
             )
-        for model, usage in outcome.usage:
-            db.add(
-                UsageLog(
-                    user_id=job.user_id,
-                    job_id=job.id,
-                    model=model,
-                    prompt_tokens=usage.prompt_tokens,
-                    completion_tokens=usage.completion_tokens,
-                    cost=usage.cost,
-                    cost_source=usage.cost_source,
-                )
-            )
+        db.add_all(_usage_rows(job, outcome.usage))
         if owned:
             await events.notify(db, job.id)
+        await db.commit()
+
+
+def _usage_rows(job: Job, usage: list[tuple[str, Usage]]) -> list[UsageLog]:
+    """A `usage_log` row for each call a page billed, under the model it went to."""
+    return [
+        UsageLog(
+            user_id=job.user_id,
+            job_id=job.id,
+            model=model,
+            prompt_tokens=entry.prompt_tokens,
+            completion_tokens=entry.completion_tokens,
+            cost=entry.cost,
+            cost_source=entry.cost_source,
+        )
+        for model, entry in usage
+    ]
+
+
+async def _log_usage(
+    sessionmaker: async_sessionmaker[AsyncSession], job: Job, usage: list[tuple[str, Usage]]
+) -> None:
+    """Calls a page billed, logged ahead of the page itself — unfenced, as `_record_page`
+    logs them."""
+    async with sessionmaker() as db:
+        db.add_all(_usage_rows(job, usage))
         await db.commit()
 
 
