@@ -32,9 +32,9 @@ READ_PAGE_TOOL = {
 JOIN_PAGES_TOOL = {
     "name": "join_pages",
     "description": (
-        "Join the page break before `page`: the first paragraph, list item or table of "
-        "`page` moves up to continue the last block of the page before it. Only for a "
-        "place marked join."
+        "Join the page break before `page`: the first paragraph of `page` moves up to "
+        "continue the last paragraph or list item of the page before it, or its first "
+        "table to continue the last table. Only for a place marked join."
     ),
     "input_schema": {
         "type": "object",

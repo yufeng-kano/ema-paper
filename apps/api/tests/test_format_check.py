@@ -176,13 +176,24 @@ def test_a_blank_page_is_passed_over_and_never_joined() -> None:
     assert joins.join_pages(pages, 2) == "page 2 has nothing to join"
 
 
-def test_a_fence_or_formula_is_a_block_of_its_own() -> None:
+def test_a_block_ends_where_another_kind_starts() -> None:
     body = (
         "Example:\n```python\nprint(1)\n\nprint(2)\n```\nand after the listing.\n\n"
-        "The loss is\n$$L = x$$\nwhere\n$$\nx = 1\n$$"
+        "The loss is\n$$L = x$$\nwhere\n$$\nx = 1\n$$\n\n"
+        "An introductory sentence.\n## Results\nWe use:\n- a\n- b\ncontinued lazily\n\n"
+        "Table 1: Scores\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\n"
+        "See below\n![fig1](sightread://p1/0,0,10,10)\nFigure 1: The model\n\n"
+        "Above the rule\n---\n\\[ x = 1\n\\]"
     )
     kinds = [joins.block_kind(body[start:end]) for start, end in joins.block_spans(body)]
-    assert kinds == ["paragraph", "code", "paragraph", "paragraph", "math", "paragraph", "math"]
+    assert kinds == [
+        *("paragraph", "code", "paragraph"),
+        *("paragraph", "math", "paragraph", "math"),
+        *("paragraph", "heading", "paragraph", "list"),
+        *("paragraph", "table"),
+        *("paragraph", "figure"),
+        *("paragraph", "rule", "math"),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -191,18 +202,31 @@ def test_a_fence_or_formula_is_a_block_of_its_own() -> None:
         "Example:\n```python\nprint(1)\n```",
         "The loss is\n$$L = x$$",
         "- an item\n  ```\n  code\n  ```",
+        "An introductory sentence.\n## Results",
+        "Above the rule\n---",
+        "Table 1: Scores\n| a | b |\n| --- | --- |\n| 1 | 2 |",
+        "See below\n![fig1](sightread://p1/0,0,10,10)\nFigure 1: The model",
     ],
 )
-def test_no_join_reaches_into_code_or_a_formula(last: str) -> None:
-    # Written straight under prose, a listing or a formula still ends its page: the next
-    # page's lowercase start must never land on its closing line.
+def test_no_join_reaches_past_a_paragraph_into_another_block(last: str) -> None:
+    # Written straight under prose, a listing, a formula, a heading, a rule, a table or a
+    # figure still ends its page: the next page's lowercase start must never land on it.
     pages = [joins.Page(1, last), joins.Page(2, "next paragraph starts here.")]
     assert joins.sure_joins(pages) == 0
     assert pages[0].body == last
     assert joins.find_spots(pages) == []
     assert joins.join_pages(pages, 2) == (
-        "only paragraphs, list items and tables join across a page break"
+        "only a paragraph continuing a paragraph or a list item, or a table continuing "
+        "a table, joins across a page break"
     )
+    assert pages[0].body == last
+
+
+@pytest.mark.parametrize("last", ["The **conclusion.**", "The *conclusion.*", "The __end.__"])
+def test_a_sentence_ends_inside_closing_emphasis_too(last: str) -> None:
+    pages = [joins.Page(1, last), joins.Page(2, "iPhone users need a separate setup.")]
+    assert joins.sure_joins(pages) == 0
+    assert joins.find_spots(pages) == []
 
 
 def test_prose_written_straight_after_a_listing_still_joins() -> None:
@@ -221,11 +245,22 @@ def test_two_tables_join_as_one_with_the_second_header_kept_as_a_row() -> None:
     assert pages[1].body == "After the table."
 
 
-def test_a_join_needs_a_paragraph_list_item_or_table_on_both_sides() -> None:
-    pages = _pages("<!-- page: 1 -->\n## A heading\n\n<!-- page: 2 -->\nA paragraph.")
+@pytest.mark.parametrize(
+    ("last", "first"),
+    [
+        ("## A heading", "A paragraph."),
+        ("A paragraph that", "| a | b |\n| --- | --- |"),
+        ("- an item", "- another item"),
+        ("| a | b |\n| --- | --- |", "and a paragraph."),
+    ],
+)
+def test_a_join_mends_only_a_cut_paragraph_list_item_or_table(last: str, first: str) -> None:
+    pages = [joins.Page(1, last), joins.Page(2, first)]
     assert joins.join_pages(pages, 2) == (
-        "only paragraphs, list items and tables join across a page break"
+        "only a paragraph continuing a paragraph or a list item, or a table continuing "
+        "a table, joins across a page break"
     )
+    assert [page.body for page in pages] == [last, first]
     assert joins.join_pages(pages, 9) == "there is no page 9"
     assert joins.join_pages(pages, 1) == "page 1 has nothing to join"
 

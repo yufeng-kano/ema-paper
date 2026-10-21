@@ -13,8 +13,9 @@ from dataclasses import dataclass
 from .markdown import page_marker
 
 MARKER_LINE_RE = re.compile(r"^<!-- page: (\d+) -->$", re.MULTILINE)
-# A sentence's end: . ! ? : ; or a full-width form, a closing quote or bracket after one.
-SENTENCE_END_RE = re.compile(r"[.!?:;。！？：；][\"'”’)\]）」』]*$")
+# A sentence's end: . ! ? : ; or a full-width form, with closing quotes, brackets or
+# emphasis markers after one (`**the conclusion.**`).
+SENTENCE_END_RE = re.compile(r"[.!?:;。！？：；][\"'”’)\]）」』*_~]*$")
 STARTS_LOWER_RE = re.compile(r"^[\"'“‘(\[]*[a-z]")
 HYPHEN_END_RE = re.compile(r"[A-Za-z]-$")
 LIST_ITEM_RE = re.compile(r"^(?:[-*+]|\d+[.)])\s")
@@ -28,8 +29,9 @@ COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 TAG_RE = re.compile(r"</?[A-Za-z][A-Za-z0-9]*(?:\s[^<>]*)?/?>")
 LATEX_DELIMITER_RE = re.compile(r"\\[()\[\]]")
 MARKUP_RE = re.compile(r"[\s#*_`~$\\|>:-]")
-# The blocks a page break can cut in two, and so the ones a join may move.
-JOINABLE = frozenset({"paragraph", "list", "table"})
+# The cuts a join mends, as (the last block of one page, the first of the next): a
+# paragraph continuing a paragraph or a list item, and a table continuing a table.
+JOINS = frozenset({("paragraph", "paragraph"), ("list", "paragraph"), ("table", "table")})
 # How much of a block a spot shows the agent; `read_page` has the rest.
 EXCERPT_CHARS = 600
 
@@ -75,11 +77,16 @@ def render(lead: str, pages: list[Page]) -> str:
 
 
 def block_spans(body: str) -> list[tuple[int, int]]:
-    """Where a page's blocks are: runs of lines between blank lines. A fenced code block or
-    a display formula is a block of its own, whole whatever blank lines it holds and apart
-    from the lines around it even with no blank line between, so no join reaches into it."""
+    """Where a page's blocks are: runs of lines between blank lines, split further wherever
+    another kind of block starts with no blank line before it, as markdown allows. A fence,
+    a display formula, a heading and a rule are each a block of their own, a fence or a
+    formula whole whatever blank lines it holds; a list, a table, a quote, a figure or a
+    comment written straight under a paragraph starts a block there. So a join, which
+    appends to a page's last line, never reaches past a paragraph into another block."""
     spans: list[tuple[int, int]] = []
     start: int | None = None
+    # The kind of the block being read, from its first line.
+    kind = ""
     end = 0
     closer: str | None = None
     offset = 0
@@ -102,25 +109,26 @@ def block_spans(body: str) -> list[tuple[int, int]]:
                 spans.append((start, end))
                 start = None
             continue
+        line_kind = block_kind(stripped)
+        # A fence, or a formula whose closing delimiter is on a later line.
         if stripped.startswith(("```", "~~~")):
             closer = stripped[:3]
-        elif stripped.startswith("$$") and not (len(stripped) >= 4 and stripped.endswith("$$")):
+        elif stripped.startswith("$$") and "$$" not in stripped[2:]:
             closer = "$$"
-        elif stripped == "\\[":
+        elif stripped.startswith("\\[") and "\\]" not in stripped[2:]:
             closer = "\\]"
-        # A formula opened and closed on its own line.
-        formula = len(stripped) >= 4 and (
-            (stripped.startswith("$$") and stripped.endswith("$$"))
-            or (stripped.startswith("\\[") and stripped.endswith("\\]"))
-        )
-        if (closer is not None or formula) and start is not None:
-            # Written straight under other lines: their block ends above it.
+        # A block of one line: a heading, a rule, or a formula closed on the line it opens.
+        alone = closer is None and line_kind in ("heading", "rule", "math")
+        if start is not None and (
+            closer is not None or alone or (kind == "paragraph" and line_kind != "paragraph")
+        ):
+            # Written straight under the block above: that block ends here.
             spans.append((start, end))
             start = None
         if start is None:
-            start = line_start
+            start, kind = line_start, line_kind
         end = line_end
-        if formula:
+        if alone:
             spans.append((start, end))
             start = None
     if start is not None:
@@ -279,8 +287,11 @@ def join_pages(pages: list[Page], number: int) -> str | None:
     if edges is None:
         return f"page {number} has nothing to join"
     before, last, first = edges
-    if block_kind(last) not in JOINABLE or block_kind(first) not in JOINABLE:
-        return "only paragraphs, list items and tables join across a page break"
+    if (block_kind(last), block_kind(first)) not in JOINS:
+        return (
+            "only a paragraph continuing a paragraph or a list item, or a table continuing "
+            "a table, joins across a page break"
+        )
     _join(pages, before, index)
     return None
 
