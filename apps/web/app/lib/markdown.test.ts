@@ -1252,6 +1252,17 @@ describe('insertBlocks', () => {
     expect(insertBlocks('one', { page: 0, index: 0 }, 'after', '<!-- page: 4 -->\ntwo')?.markdown).toBe('one\n\ntwo')
     expect(insertBlocks('one', null, 'after', '\n\n')).toBeNull()
   })
+
+  it("goes at the end of the target's page when the target is past its last block", () => {
+    const doc = ['<!-- page: 1 -->', 'one', '', '<!-- page: 2 -->', 'two'].join('\n')
+    expect(insertBlocks(doc, { page: 0, index: 1 }, 'before', line)?.markdown).toBe(
+      ['<!-- page: 1 -->', 'one', '', line, '', '<!-- page: 2 -->', 'two'].join('\n'),
+    )
+    const emptied = ['<!-- page: 1 -->', 'one', '', '<!-- page: 2 -->', '', '<!-- page: 3 -->', 'three'].join('\n')
+    expect(insertBlocks(emptied, { page: 1, index: 0 }, 'before', line)?.markdown).toBe(
+      ['<!-- page: 1 -->', 'one', '', '<!-- page: 2 -->', line, '', '<!-- page: 3 -->', 'three'].join('\n'),
+    )
+  })
 })
 
 describe('placeNear and findPlace', () => {
@@ -1259,7 +1270,7 @@ describe('placeNear and findPlace', () => {
 
   it('holds a place by its neighbours and finds it again after edits', () => {
     const near = placeNear(doc, { page: 0, index: 1 }, 'after')
-    expect(near).toEqual({ after: 'Two.', before: 'Three.', gap: 2 })
+    expect(near).toEqual({ after: 'Two.', before: 'Three.', gap: 2, prefer: 'after' })
     // A block added above moves the place: its text finds it again.
     const edited = doc.replace('One.', 'One.\n\nOne and a half.')
     expect(findPlace(edited, near)).toEqual({ target: { page: 0, index: 2 }, place: 'after' })
@@ -1272,10 +1283,25 @@ describe('placeNear and findPlace', () => {
   it('takes the nearest of repeated text, and the end of the document without a target', () => {
     const repeated = ['Same.', 'Other.', 'Same.', 'Last.'].join('\n\n')
     const near = placeNear(repeated, { page: 0, index: 2 }, 'after')
-    expect(near).toEqual({ after: 'Same.', before: 'Last.', gap: 3 })
+    expect(near).toEqual({ after: 'Same.', before: 'Last.', gap: 3, prefer: 'after' })
     expect(findPlace(repeated, near)).toEqual({ target: { page: 0, index: 2 }, place: 'after' })
     expect(findPlace(repeated, { after: null, before: 'Same.', gap: 0 })).toEqual({ target: { page: 0, index: 0 }, place: 'before' })
-    expect(placeNear('One.', null, 'after')).toEqual({ after: 'One.', before: null, gap: 1 })
-    expect(placeNear('', null, 'after')).toEqual({ after: null, before: null, gap: 0 })
+    expect(placeNear('One.', null, 'after')).toEqual({ after: 'One.', before: null, gap: 1, prefer: 'after' })
+    expect(placeNear('', null, 'after')).toEqual({ after: null, before: null, gap: 0, prefer: 'after' })
+  })
+
+  it('keeps a place at a page edge on its page', () => {
+    // Before the first block of page 2: not after the last block of page 1.
+    const opening = placeNear(doc, { page: 1, index: 0 }, 'before')
+    expect(opening).toEqual({ after: 'Two.', before: 'Three.', gap: 2, prefer: 'before' })
+    expect(findPlace(doc, opening)).toEqual({ target: { page: 1, index: 0 }, place: 'before' })
+    // Past a page's last block, as a draft emptied away leaves it: the end of that page.
+    const closing = placeNear(doc, { page: 0, index: 2 }, 'before')
+    expect(closing).toEqual({ after: 'Two.', before: 'Three.', gap: 2, prefer: 'after' })
+    expect(findPlace(doc, closing)).toEqual({ target: { page: 0, index: 1 }, place: 'after' })
+  })
+
+  it('compares blocks without the spacing at their ends', () => {
+    expect(findPlace('Text.  \n\nNext.', { after: 'Text.', before: null, gap: 1 })).toEqual({ target: { page: 0, index: 0 }, place: 'after' })
   })
 })

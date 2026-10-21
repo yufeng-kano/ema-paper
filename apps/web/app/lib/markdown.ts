@@ -1225,9 +1225,10 @@ export function moveBlocks(
 
 /**
  * The document with the blocks `src` holds inserted before or after `target` — at the end of
- * the document's last page when there is no target, as on an empty document — and where they
- * now sit (docs/web.md § Editing, *Images*). Page markers in `src` are left out: what lands
- * belongs to the page it lands on. Null when `src` holds no block.
+ * the document's last page when there is no target, as on an empty document, and at the end
+ * of the target's page when it is past that page's last block (a block written away from
+ * it) — and where they now sit (docs/web.md § Editing, *Images*). Page markers in `src` are
+ * left out: what lands belongs to the page it lands on. Null when `src` holds no block.
  */
 export function insertBlocks(markdown: string, target: BlockAt | null, place: 'before' | 'after', src: string): MovedBlocks | null {
   const adding = parseResultMarkdown(src).flatMap((page) => page.blocks)
@@ -1235,11 +1236,12 @@ export function insertBlocks(markdown: string, target: BlockAt | null, place: 'b
     return null
   }
   const pages = parseResultMarkdown(markdown)
-  const aimed = target ? pages[target.page]?.blocks[target.index] : undefined
+  const targetPage = target ? pages[target.page] : undefined
+  const aimed = target ? targetPage?.blocks[target.index] : undefined
   let host: ResultPageBlocks
   let at: number
-  if (target && aimed) {
-    host = pages[target.page]!
+  if (targetPage && aimed) {
+    host = targetPage
     at = host.blocks.indexOf(aimed)
     if (place === 'after') {
       at += 1
@@ -1247,6 +1249,9 @@ export function insertBlocks(markdown: string, target: BlockAt | null, place: 'b
         at += 1
       }
     }
+  } else if (targetPage) {
+    host = targetPage
+    at = host.blocks.length
   } else {
     host = pages[pages.length - 1] ?? { page: 1, blocks: [], unmarked: true }
     if (!pages.length) {
@@ -1261,11 +1266,14 @@ export function insertBlocks(markdown: string, target: BlockAt | null, place: 'b
 
 /** A place between blocks held by its neighbours' markdown, so it is found again after edits
  *  have moved it: the block it follows, the one it precedes, and its position then among the
- *  document's blocks in reading order (docs/web.md § Editing, *Images*). */
+ *  document's blocks in reading order (docs/web.md § Editing, *Images*). `prefer` names the
+ *  neighbour looked for first: `before` for a place opening its page, which the last block of
+ *  the page before borders too. */
 export interface PlaceNear {
   after: string | null
   before: string | null
   gap?: number
+  prefer?: 'before' | 'after'
 }
 
 /** The document's blocks in reading order, each with where it sits. */
@@ -1275,38 +1283,51 @@ function blocksAt(markdown: string): { src: string; at: BlockAt }[] {
   )
 }
 
-/** The place before or after `target` — the document's end without one — as `PlaceNear`. */
+/** The place before or after `target` — the document's end without one, the end of its page
+ *  when it is past that page's last block — as `PlaceNear`. */
 export function placeNear(markdown: string, target: BlockAt | null, place: 'before' | 'after'): PlaceNear {
   const blocks = blocksAt(markdown)
-  const found = target ? blocks.findIndex((entry) => entry.at.page === target.page && entry.at.index === target.index) : -1
-  const gap = found === -1 ? blocks.length : place === 'after' ? found + 1 : found
-  return { after: blocks[gap - 1]?.src ?? null, before: blocks[gap]?.src ?? null, gap }
+  const gap =
+    target === null
+      ? blocks.length
+      : blocks.filter(({ at }) => at.page < target.page || (at.page === target.page && at.index < target.index + (place === 'after' ? 1 : 0))).length
+  const opensPage = target !== null && blocks[gap]?.at.page === target.page && blocks[gap - 1]?.at.page !== target.page
+  return { after: blocks[gap - 1]?.src ?? null, before: blocks[gap]?.src ?? null, gap, prefer: opensPage ? 'before' : 'after' }
 }
 
-/** Where `near` is in the document now: after the block it followed, else before the one it
- *  preceded — of several with the same text, the one nearest where it was — and at the end
- *  when neither is there any more. */
-export function findPlace(markdown: string, near: PlaceNear): { target: BlockAt | null; place: 'before' | 'after' } {
-  const blocks = blocksAt(markdown)
+/** Which of `srcs` a place held by `near` is beside now: the block it followed, else the one
+ *  it preceded (`near.prefer` looked for first) — of several alike, the one nearest where it
+ *  was, the spacing at their ends ignored — or null when neither is there any more. */
+export function nearestBlock(srcs: readonly string[], near: PlaceNear): { index: number; place: 'before' | 'after' } | null {
   // The gap after a block is its index + 1, before it its index.
-  const nearest = (src: string | null, offset: number): BlockAt | null => {
-    let best: BlockAt | null = null
+  const nearest = (src: string | null, offset: number): number => {
+    let best = -1
     let bestDistance = Infinity
-    for (const [index, entry] of blocks.entries()) {
+    for (const [index, entry] of srcs.entries()) {
       const distance = Math.abs(index + offset - (near.gap ?? 0))
-      if (src !== null && entry.src === src && distance < bestDistance) {
-        best = entry.at
+      if (src !== null && entry.trim() === src.trim() && distance < bestDistance) {
+        best = index
         bestDistance = distance
       }
     }
     return best
   }
-  const after = nearest(near.after, 1)
-  if (after) {
-    return { target: after, place: 'after' }
+  const sides = near.prefer === 'before' ? (['before', 'after'] as const) : (['after', 'before'] as const)
+  for (const place of sides) {
+    const index = place === 'after' ? nearest(near.after, 1) : nearest(near.before, 0)
+    if (index !== -1) {
+      return { index, place }
+    }
   }
-  const before = nearest(near.before, 0)
-  return before ? { target: before, place: 'before' } : { target: null, place: 'after' }
+  return null
+}
+
+/** Where `near` is in the document now (`nearestBlock`), and at the end when neither of its
+ *  neighbours is there any more. */
+export function findPlace(markdown: string, near: PlaceNear): { target: BlockAt | null; place: 'before' | 'after' } {
+  const blocks = blocksAt(markdown)
+  const found = nearestBlock(blocks.map((entry) => entry.src), near)
+  return found ? { target: blocks[found.index]!.at, place: found.place } : { target: null, place: 'after' }
 }
 
 /** The line an uploaded image is written as: its file's name for the alt text — the

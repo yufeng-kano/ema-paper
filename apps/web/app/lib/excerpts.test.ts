@@ -1,11 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import {
+  appendBlocks,
   appendExcerpt,
   droppedBlocksMarkdown,
   excerptMarkdown,
   excerptMarkers,
   excerptPassage,
   findPassage,
+  insertNoteBlocks,
   linkResolves,
   matchExcerpts,
   rewriteBlockLinks,
@@ -188,5 +190,47 @@ describe('droppedBlocksMarkdown', () => {
       ].join('\n\n'),
     )
     expect(droppedBlocksMarkdown('<!-- page: 3 -->')).toBeNull()
+  })
+})
+
+describe('appendBlocks', () => {
+  it('puts the blocks after the last one, a blank line between, the trailing newline kept', () => {
+    const added = appendBlocks('# My notes\n\nThoughts.\n', 'An answer line.\n\n- one\n- two')
+    expect(added).toEqual({
+      notes: '# My notes\n\nThoughts.\n\nAn answer line.\n\n- one\n- two\n',
+      at: '# My notes\n\nThoughts.\n\n'.length,
+      count: 2,
+    })
+    expect(added!.notes.slice(added!.at)).toMatch(/^An answer line\./)
+  })
+
+  it('fills empty notes and adds nothing for nothing', () => {
+    expect(appendBlocks('', '$$x$$')).toEqual({ notes: '$$x$$', at: 0, count: 1 })
+    expect(appendBlocks('  \n', 'Text.')).toEqual({ notes: 'Text.  \n', at: 0, count: 1 })
+    expect(appendBlocks('Kept.', '<!-- page: 1 -->')).toBeNull()
+  })
+})
+
+describe('insertNoteBlocks', () => {
+  const line = '![shot](figures/img-0123456789abcdef.png)'
+
+  it('puts the blocks beside the block found, the rest of the notes as written', () => {
+    const notes = 'Zero.\n\n\n\nFirst.\n\nSecond.\n'
+    expect(insertNoteBlocks(notes, { after: 'First.', before: 'Second.', gap: 2 }, line)).toBe(`Zero.\n\n\n\nFirst.\n\n${line}\n\nSecond.\n`)
+    // The block it followed is gone: before the one it preceded.
+    expect(insertNoteBlocks(notes, { after: 'Gone.', before: 'Second.', gap: 2 }, line)).toBe(`Zero.\n\n\n\nFirst.\n\n${line}\n\nSecond.\n`)
+  })
+
+  it('takes the nearest of repeated blocks, as two excerpts from one section leave them', () => {
+    const link = '[3.2 Attention](#32-attention)'
+    const notes = ['> First passage.', link, '> Second passage.', link, 'Tail.'].join('\n\n')
+    expect(insertNoteBlocks(notes, { after: link, before: 'Tail.', gap: 4 }, line)).toBe(
+      ['> First passage.', link, '> Second passage.', link, line, 'Tail.'].join('\n\n'),
+    )
+  })
+
+  it('goes at the end when neither neighbour is left, and adds nothing for nothing', () => {
+    expect(insertNoteBlocks('A.\n', { after: 'X.', before: 'Y.', gap: 0 }, line)).toBe(`A.\n\n${line}\n`)
+    expect(insertNoteBlocks('A.', { after: 'A.', before: null, gap: 1 }, '<!-- page: 2 -->')).toBeNull()
   })
 })

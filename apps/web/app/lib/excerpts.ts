@@ -16,6 +16,7 @@ import {
   headingKey,
   inlinePlain,
   isBefore,
+  nearestBlock,
   parseInline,
   parseResultMarkdown,
   passageKey,
@@ -24,6 +25,7 @@ import {
   sectionExtent,
   type BlockAt,
   type OutlineEntry,
+  type PlaceNear,
   type PlacedBlock,
   type ResultBlock,
   type ResultPageBlocks,
@@ -86,6 +88,46 @@ export function droppedBlocksMarkdown(markdown: string): string | null {
   }
   const dropped = parts.join('\n\n').trim()
   return dropped ? dropped : null
+}
+
+/**
+ * An answer's block put at the end of the notes (docs/web.md § The agent panel, *An answer is
+ * blocks*): taken as a drop takes it, after the last block with a blank line between, the
+ * notes' trailing whitespace kept after it. `at` is where it starts, `count` how many blocks
+ * it is. Null when nothing is left to add.
+ */
+export function appendBlocks(notes: string, markdown: string): { notes: string; at: number; count: number } | null {
+  const blocks = droppedBlocksMarkdown(markdown)
+  if (blocks === null) {
+    return null
+  }
+  const body = notes.replace(/\s+$/, '')
+  const lead = body ? `${body}\n\n` : ''
+  return { notes: `${lead}${blocks}${notes.slice(body.length)}`, at: lead.length, count: blocksOf(blocks).length }
+}
+
+/**
+ * Blocks put into the notes at a place held by its neighbours (docs/web.md § Editing,
+ * *Images*): before or after the block `nearestBlock` finds, one blank line on each side, the
+ * rest of the text kept as written — at the end, as `appendBlocks` puts them, when neither
+ * neighbour is there. Null when nothing is left to add.
+ */
+export function insertNoteBlocks(notes: string, near: PlaceNear, markdown: string): string | null {
+  const blocks = droppedBlocksMarkdown(markdown)
+  if (blocks === null) {
+    return null
+  }
+  const all = located(notes)
+  const found = nearestBlock(all.map((entry) => entry.block.src), near)
+  if (!found) {
+    return appendBlocks(notes, blocks)?.notes ?? null
+  }
+  const entry = all[found.index]!
+  const at = found.place === 'after' ? entry.end : entry.start
+  const head = notes.slice(0, at).replace(/\s+$/, '')
+  const rest = notes.slice(at)
+  const tail = rest.replace(/^\s+/, '')
+  return `${head ? `${head}\n\n` : ''}${blocks}${tail ? `\n\n${tail}` : rest}`
 }
 
 /** A markdown link to an address, `[label](https://…)`: the label free of bare brackets as

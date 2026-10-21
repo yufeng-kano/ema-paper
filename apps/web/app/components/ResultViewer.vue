@@ -34,13 +34,16 @@ import {
 } from '~/lib/blocks'
 import { formatBytes, isImageFile, type AskRequest } from '~/lib/composer'
 import { cellGroupsToMarkdown, nodesToMarkdown, selectionText, type OrphanListContext } from '~/lib/copy'
-import { BLOCK_DRAG_TYPE, carriesFiles, claimDrag, dragClaim, droppedFiles, setDropEffect } from '~/lib/dnd'
+import { ANSWER_DRAG_TYPE, BLOCK_DRAG_TYPE, carriesFiles, claimDrag, dragClaim, droppedFiles, setDropEffect } from '~/lib/dnd'
 import {
+  appendBlocks,
   appendExcerpt,
+  droppedBlocksMarkdown,
   excerptMarkdown,
   excerptMarkers,
   excerptPassage,
   findPassage,
+  insertNoteBlocks,
   linkResolves,
   locatePassage,
   matchExcerpts,
@@ -704,6 +707,8 @@ const unsaved = computed(() => saveState.value === 'failed' || notesState.value 
 onBeforeUnmount(() => {
   closed = true
   commitEdit()
+  // Images already uploaded and waiting on that editor go in with it.
+  landWaitingImages()
   // A failed save left its text unsaved with no timer: it gets one more try too.
   if (saveTimer !== null || saveState.value === 'failed') {
     if (saveTimer !== null) {
@@ -2286,20 +2291,32 @@ function carriesImageFiles(event: DragEvent): boolean {
   return !dragRun && Boolean(editorImages.value) && carriesFiles(event.dataTransfer)
 }
 
-/** The last `dragover` the pane took image files for: any other means the pointer left it. */
-let paneFileEvent: DragEvent | null = null
+/** Blocks dragged from an answer in the agent panel: a copy to land on the drop line, with no
+ *  run of the document's to move (docs/web.md § The agent panel, *An answer is blocks*). */
+function carriesAnswerBlocks(event: DragEvent): boolean {
+  return !dragRun && editable.value && [...(event.dataTransfer?.types ?? [])].includes(ANSWER_DRAG_TYPE)
+}
 
-/** `dragover` decides (`app/lib/dnd.ts`): over the pane a block drag or image files are
- *  claimed, the pane scrolls near its edges, and the drop line follows the pointer. */
+/** The last `dragover` the pane took a copy for — image files or an answer's blocks: any
+ *  other means the pointer left it. */
+let paneCopyEvent: DragEvent | null = null
+
+/** `dragover` decides (`app/lib/dnd.ts`): over the pane a block drag, an answer's blocks or
+ *  image files are claimed, the pane scrolls near its edges, and the drop line follows the
+ *  pointer. */
 function onPaneDragOver(event: DragEvent) {
   const images = carriesImageFiles(event)
-  if (!images && (!dragRun || ![...(event.dataTransfer?.types ?? [])].includes(BLOCK_DRAG_TYPE))) {
+  const copy = images || carriesAnswerBlocks(event)
+  if (!copy && (!dragRun || ![...(event.dataTransfer?.types ?? [])].includes(BLOCK_DRAG_TYPE))) {
     return
   }
   claimDrag(event, images ? 'image' : 'block')
-  paneFileEvent = images ? event : null
+  paneCopyEvent = copy ? event : null
+  if (copy) {
+    window.addEventListener('pointermove', endCopyDrag, { once: true })
+  }
   event.preventDefault()
-  setDropEffect(event, images ? 'copy' : 'move')
+  setDropEffect(event, copy ? 'copy' : 'move')
   const box = scroller.value
   if (box) {
     const rect = box.getBoundingClientRect()
@@ -2384,6 +2401,17 @@ function onPaneDrop(event: DragEvent) {
     }
     return
   }
+  if (carriesAnswerBlocks(event)) {
+    event.preventDefault()
+    const at = dropAt
+    endDrag()
+    const blocks = droppedBlocksMarkdown(event.dataTransfer?.getData('text/plain') ?? '')
+    const { target, place } = commitDropAt(at)
+    if (blocks !== null && landBlocks(blocks, target, place)) {
+      showNote(t('viewer.note.blockAdded'), false)
+    }
+    return
+  }
   if (!dragRun || ![...(event.dataTransfer?.types ?? [])].includes(BLOCK_DRAG_TYPE)) {
     return
   }
@@ -2397,12 +2425,10 @@ function onPaneDrop(event: DragEvent) {
   }
 }
 
-/** Image files dropped on the document: each uploaded, then all of them inserted where the
- *  line was — at the end without one — as one block action. An open editor is written back
- *  first, and again once the files are in, so no block under an editor moves out from under
- *  it. The line's place is held by the blocks around it (`placeNear`): the draft written
- *  back may become more blocks or fewer, and the reader may edit while the files upload. */
-async function dropImages(files: File[], at: { target: number; place: 'before' | 'after' } | null) {
+/** Writes an open editor back and answers where the drop line was in the document that
+ *  leaves: the draft may become more blocks or fewer, and a block after it moves by the
+ *  difference (`afterCommit`). */
+function commitDropAt(at: { target: number; place: 'before' | 'after' } | null): { target: BlockAt | null; place: 'before' | 'after' } {
   const aimed = at ? placed.value[at.target] : undefined
   const open = editing.value
   let target: BlockAt | null = null
@@ -2418,6 +2444,16 @@ async function dropImages(files: File[], at: { target: number; place: 'before' |
     target = afterCommit({ page: aimed.page, index: aimed.index })
   }
   commitEdit()
+  return { target, place }
+}
+
+/** Image files dropped on the document: each uploaded, then all of them inserted where the
+ *  line was — at the end without one — as one block action. An open editor is written back
+ *  first, and again once the files are in, so no block under an editor moves out from under
+ *  it. The line's place is held by the blocks around it (`placeNear`): the reader may edit
+ *  while the files upload. */
+async function dropImages(files: File[], at: { target: number; place: 'before' | 'after' } | null) {
+  const { target, place } = commitDropAt(at)
   const near = placeNear(markdown.value, target, place)
   const id = props.documentId
   const lines: string[] = []
@@ -2457,18 +2493,29 @@ function landBlocks(blocks: string, target: BlockAt | null, place: 'before' | 'a
 /** Anything not claimed for a block drag — or, for files, any `dragover` but the pane's own —
  *  takes the line away: the pointer left the pane. */
 function onWindowDragOver(event: DragEvent) {
-  if (dragRun ? dragClaim(event) !== 'block' : dropLine.value && paneFileEvent !== event) {
+  if (dragRun ? dragClaim(event) !== 'block' : dropLine.value && paneCopyEvent !== event) {
     clearDropLine()
+  }
+}
+
+/** A copy's drop line outliving its drag — the drag's source taken off the page, as an
+ *  answer's block is when the answer is stored, so its `dragend` never reached the window —
+ *  goes at the next pointer move, which no drag fires (docs/web.md § Editing, *Moving
+ *  blocks*). */
+function endCopyDrag() {
+  if (!dragRun) {
+    endDrag()
   }
 }
 
 /** Escape, a drop outside the document, or a reload: the drag is over. */
 function endDrag() {
   dragRun = null
-  paneFileEvent = null
+  paneCopyEvent = null
   dragKeys.value = new Set()
   dropSaid = ''
   clearDropLine()
+  scheduleWaitingImages()
 }
 
 // --- the selection toolbar ------------------------------------------------------------------
@@ -2762,6 +2809,17 @@ function quoteInNotes(text: string, at: BlockAt) {
   }
   applyNotes(appended.notes)
   void revealNotes(appended.at, 2, false)
+}
+
+/** An answer block's *Add to notes* (docs/web.md § The agent panel, *An answer is blocks*):
+ *  at the end of the notes as blocks, the notes opened on it, washed. A block action. */
+function addToNotes(text: string) {
+  const appended = appendBlocks(notes.value, text)
+  if (!appended) {
+    return
+  }
+  applyNotes(appended.notes)
+  void revealNotes(appended.at, appended.count, false)
 }
 
 /** Opens the notes on the blocks starting at `at`, washed once — and with `focus`, the caret
@@ -3744,26 +3802,72 @@ async function uploadImage(file: File): Promise<string | null> {
  * An image whose editor closed before it uploaded (docs/web.md § Editing, *Images*): it lands
  * in the document, or the notes, where it was to go, found by the blocks around it — not when
  * the viewer has closed or moved on to another document since, which is false: send no more.
+ * In the document it waits while another block's editor is open (`waitingImages`).
  */
 function landStrayed(file: 'document' | 'notes', id: number, line: string, near: PlaceNear): boolean {
   if (closed || id !== props.documentId) {
     return false
   }
   if (file === 'notes') {
-    const { target, place } = findPlace(notes.value, near)
-    const inserted = insertBlocks(notes.value, target, place, line)
-    if (inserted) {
-      applyNotes(inserted.markdown)
+    const next = insertNoteBlocks(notes.value, near, line)
+    if (next !== null) {
+      applyNotes(next)
     }
     return true
   }
-  commitEdit()
-  const { target, place } = findPlace(markdown.value, near)
-  if (landBlocks(line, target, place)) {
-    showNote(t('viewer.note.imagesAdded', { n: 1 }, 1), false)
-  }
+  waitingImages.push({ line, near })
+  scheduleWaitingImages()
   return true
 }
+
+/** Strayed images on their way into the document, in the order they uploaded: landing one
+ *  writes the document back, which would close the editor the reader is typing in, and moves
+ *  every block after it a place down, so they wait while anything holds blocks by place. */
+const waitingImages: { line: string; near: PlaceNear }[] = []
+let waitingTimer: ReturnType<typeof setTimeout> | undefined
+
+/** A task later, not in the tick that closed what held the blocks: the close's own work — a
+ *  menu opening on the blocks it read, a drop, focus given back to a block — runs first, on
+ *  the document as it was. */
+function scheduleWaitingImages() {
+  if (!waitingImages.length || waitingTimer !== undefined) {
+    return
+  }
+  waitingTimer = setTimeout(() => {
+    waitingTimer = undefined
+    if (!closed && !editing.value && !dragRun && !blockMenu.value && !toolbar.value) {
+      landWaitingImages()
+    }
+  }, 0)
+}
+
+function landWaitingImages() {
+  clearTimeout(waitingTimer)
+  waitingTimer = undefined
+  const before = placed.value
+  const active = document.activeElement
+  const focused = active instanceof HTMLElement && scroller.value?.contains(active) ? active.dataset.block : undefined
+  let landed = 0
+  for (const { line, near } of waitingImages.splice(0)) {
+    const { target, place } = findPlace(markdown.value, near)
+    if (landBlocks(line, target, place)) {
+      landed += 1
+    }
+  }
+  if (!landed) {
+    return
+  }
+  showNote(t('viewer.note.imagesAdded', { n: landed }, landed), false)
+  // Blocks are drawn by place, so focus would stay on the place: it goes with its block.
+  const at = focused === undefined ? -1 : before.findIndex((entry) => blockKey(entry) === focused)
+  const moved = at < 0 ? null : (followBlocks(before, placed.value)[at] ?? null)
+  if (moved !== null) {
+    const key = blockKey(placed.value[moved]!)
+    void nextTick(() => focusBlock(key))
+  }
+}
+
+watch([editing, blockMenu, toolbar], scheduleWaitingImages)
 
 /** What the editors insert images with: only on Files, where the document has an images route. */
 const editorImages = computed(() => {
@@ -3789,7 +3893,9 @@ const openRunNear = computed<PlaceNear | null>(() => {
   const start = found === -1 ? flat.length : found
   // A new block's editor holds no block of the document yet.
   const run = flat.filter((entry) => entry.pageIndex === open.page && entry.index >= open.index && entry.index < open.index + span.value).length
-  return { after: flat[start - 1]?.src ?? null, before: flat[start + run]?.src ?? null, gap: start }
+  // The neighbour on the editor's own page first: the place stays on it.
+  const prefer = flat[start - 1]?.pageIndex !== open.page && flat[start + run]?.pageIndex === open.page ? 'before' : 'after'
+  return { after: flat[start - 1]?.src ?? null, before: flat[start + run]?.src ?? null, gap: start, prefer }
 })
 
 /** The block editors' images: the editor's place in the document goes with them. */
@@ -4001,6 +4107,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('pointercancel', forgetChromePress)
   window.removeEventListener('dragover', onWindowDragOver)
   window.removeEventListener('dragend', endDrag, true)
+  window.removeEventListener('pointermove', endCopyDrag)
   coarseQuery?.removeEventListener('change', onCoarseChange)
   columnsObserver?.disconnect()
   paneObserver?.disconnect()
@@ -4577,6 +4684,7 @@ watch(
               :current-section="currentSection"
               @changed="loadContent()"
               @locate="locateSection"
+              @to-notes="addToNotes"
             />
           </aside>
         </div>
