@@ -133,6 +133,24 @@ export function parseProgress(document: LibraryDocument): number {
   return Math.min(1, Math.max(0, document.pages_done / document.page_count))
 }
 
+/** How many pages the retry dialog draws; the rest are a count (docs/web.md § Files). */
+export const RETRY_TILES_MAX = 12
+
+/**
+ * Why a page failed, as the API writes it (docs/parsing.md § Vision-only conversion), to the
+ * catalog key that names it (`files.retry.reasons.*`). A reason missing here reads as the
+ * API wrote it.
+ */
+export const PAGE_FAILURE_REASONS: Readonly<Record<string, string>> = {
+  blocked: 'blocked',
+  'cut off': 'cutOff',
+  'upstream call failed': 'upstream',
+  'rate limited': 'rateLimited',
+  payment: 'payment',
+  'render failed': 'render',
+  'the image could not be decoded': 'image',
+}
+
 /**
  * Whether the upload endpoint would take this file, judged by the server's own two lists
  * (`GET /api/me` § limits).

@@ -18,7 +18,7 @@ from sqlalchemy import case, func, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
 
-from ..agents import AGENTS, CHAT, AgentDefinition, get_agent
+from ..agents import AGENTS, CHAT, PARSE, AgentDefinition, get_agent
 from ..agents import chat as chat_agent
 from ..agents import memory as memory_defs
 from ..agents import skills as skill_defs
@@ -452,12 +452,12 @@ async def update_connection(
 async def delete_connection(connection_id: int, user: SessionUser, db: DbSession) -> Response:
     row = await _owned_connection(db, user.id, connection_id)
     # Explicit fallback (not just the FK's SET NULL): every agent on this connection goes
-    # back to Kano Proxy, and its model goes too — it belonged to the deleted endpoint's
+    # back to Kano Proxy, and its models go too — they belonged to the deleted endpoint's
     # catalog (docs/agents.md).
     await db.execute(
         sa_update(AgentSetting)
         .where(AgentSetting.user_id == user.id, AgentSetting.connection_id == row.id)
-        .values(connection_id=None, model=None)
+        .values(connection_id=None, model=None, fallback_model=None)
     )
     await db.delete(row)
     await db.commit()
@@ -657,6 +657,10 @@ def _agent_settings_payload(row: AgentSetting | None) -> dict:
         "translate_language": row.translate_language if row else None,
         "memory_auto": row.memory_auto if row and row.memory_auto is not None else True,
         "memory_paused": bool(row.memory_paused) if row else False,
+        # The parse agent's own: the model a blocked page goes to, and whether it goes
+        # there on its own (docs/parsing.md § Fallback model).
+        "fallback_model": row.fallback_model if row else None,
+        "auto_fallback": bool(row.auto_fallback) if row else False,
     }
 
 
@@ -721,9 +725,13 @@ class AgentSettingsPut(BaseModel):
     translate_language: str | None = None
     memory_auto: bool | None = None
     memory_paused: bool | None = None
+    # The parse agent's own (docs/agents.md).
+    fallback_model: str | None = Field(default=None, max_length=255)
+    auto_fallback: bool | None = None
 
 
-# The chat agent's settings no other agent takes (docs/agents.md § Per-agent settings).
+# The chat agent's settings no other agent takes, and the parse agent's (docs/agents.md
+# § Per-agent settings).
 CHAT_ONLY_SETTINGS = (
     "instructions",
     "answer_language",
@@ -731,6 +739,7 @@ CHAT_ONLY_SETTINGS = (
     "memory_auto",
     "memory_paused",
 )
+PARSE_ONLY_SETTINGS = ("fallback_model", "auto_fallback")
 # A language tag, as the composer's locale is one (docs/api.md).
 LANGUAGE_TAG = re.compile(r"^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$")
 LANGUAGE_TAG_MAX_CHARS = 16
@@ -770,7 +779,12 @@ async def put_agent_settings(
         raise ApiError(
             400, "invalid_request", f"The {agent.name} agent takes no {', '.join(chat_only)}"
         )
-    for switch in ("memory_auto", "memory_paused"):
+    parse_only = [name for name in PARSE_ONLY_SETTINGS if name in provided]
+    if parse_only and agent.name != PARSE.name:
+        raise ApiError(
+            400, "invalid_request", f"The {agent.name} agent takes no {', '.join(parse_only)}"
+        )
+    for switch in ("memory_auto", "memory_paused", "auto_fallback"):
         if switch in provided and getattr(body, switch) is None:
             raise ApiError(400, "invalid_request", f"{switch} is true or false")
     instructions = (
@@ -824,11 +838,17 @@ async def put_agent_settings(
         db.add(row)
     if "connection_id" in provided and body.connection_id != row.connection_id:
         row.connection_id = body.connection_id
-        # The stored model belonged to the other upstream's catalog (docs/agents.md).
+        # The stored models belonged to the other upstream's catalog (docs/agents.md).
         if "model" not in provided:
             row.model = None
+        if "fallback_model" not in provided:
+            row.fallback_model = None
     if "model" in provided:
         row.model = (body.model or "").strip() or None
+    if "fallback_model" in provided:
+        row.fallback_model = (body.fallback_model or "").strip() or None
+    if "auto_fallback" in provided:
+        row.auto_fallback = bool(body.auto_fallback)
     if "prompt" in provided or "prompt_preset_id" in provided:
         # Writing either clears the other: one of the two is ever in force.
         row.prompt = prompt

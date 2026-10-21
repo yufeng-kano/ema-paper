@@ -426,11 +426,13 @@ def _png_block(data: bytes) -> dict:
     }
 
 
-def _as_png(source: Path | bytes, max_pixels: int) -> bytes:
-    """A PNG no larger than the model would keep, oriented, flattened onto white. The
-    size comes from the header: a file that would decode past `max_pixels`
-    (`CHAT_PAGE_IMAGE_MAX_PIXELS`) is refused before a raster exists, and Pillow's own
-    bomb check is an error, never a warning."""
+def _as_png(
+    source: Path | bytes, max_pixels: int, long_edge_px: int = PAGE_IMAGE_LONG_EDGE_PX
+) -> bytes:
+    """A PNG no longer than `long_edge_px` — what the model would keep, or what a preview
+    shows — oriented, flattened onto white. The size comes from the header: a file that
+    would decode past `max_pixels` (`CHAT_PAGE_IMAGE_MAX_PIXELS`) is refused before a
+    raster exists, and Pillow's own bomb check is an error, never a warning."""
     with warnings.catch_warnings():
         warnings.simplefilter("error", Image.DecompressionBombWarning)
         opened = Image.open(io.BytesIO(source) if isinstance(source, bytes) else source)
@@ -445,8 +447,8 @@ def _as_png(source: Path | bytes, max_pixels: int) -> bytes:
         elif image.mode != "RGB":
             image = image.convert("RGB")
         long_edge = max(image.width, image.height)
-        if long_edge > PAGE_IMAGE_LONG_EDGE_PX:
-            scale = PAGE_IMAGE_LONG_EDGE_PX / long_edge
+        if long_edge > long_edge_px:
+            scale = long_edge_px / long_edge
             image = image.resize(
                 (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
                 Image.LANCZOS,
@@ -527,15 +529,50 @@ async def view_page(
         return ToolOutcome(f"page must be between 1 and {page_count or 1}", is_error=True)
     if kind != "pdf" and page != 1:
         return ToolOutcome("an image document has one page", is_error=True)
+    try:
+        data = await original_page_png(
+            paths.root,
+            source,
+            kind=kind,
+            page=page,
+            render_slots=render_slots,
+            decode_slot=decode_slot,
+            max_bytes=max_bytes,
+            max_pixels=max_pixels,
+        )
+    except PageUnavailable as exc:
+        return ToolOutcome(str(exc), is_error=True)
+    return ToolOutcome([_png_block(data), {"type": "text", "text": f"Page {page}."}])
 
+
+class PageUnavailable(Exception):
+    """Why a page of an original cannot be drawn: what `view_page` tells the model, and why
+    a page preview answers 404."""
+
+
+async def original_page_png(
+    root: Path,
+    source: Path,
+    *,
+    kind: str,
+    page: int,
+    render_slots: asyncio.Semaphore,
+    decode_slot: asyncio.Semaphore,
+    max_bytes: int,
+    max_pixels: int,
+    long_edge_px: int = PAGE_IMAGE_LONG_EDGE_PX,
+) -> bytes:
+    """One page of a document's original as a PNG of at most `long_edge_px`: Poppler's
+    render of a PDF page, or the image itself. Shared by the chat agent's `view_page` and
+    the library's page preview (docs/api.md). Raises `PageUnavailable`."""
     # Poppler gets the file as a descriptor opened without following anything, not as a
     # path it would resolve again (docs/workspace.md § Revisions).
     try:
-        fd = _open_source(paths.root, source, max_bytes)
+        fd = _open_source(root, source, max_bytes)
     except (safe_io.UnsafeEntry, safe_io.EntryTooLarge, OSError):
-        return ToolOutcome("the original file could not be opened", is_error=True)
+        raise PageUnavailable("the original file could not be opened") from None
     if fd is None:
-        return ToolOutcome("the original file is gone", is_error=True)
+        raise PageUnavailable("the original file is gone")
     try:
         if kind == "pdf":
             handle = Path(f"/proc/self/fd/{fd}")
@@ -550,22 +587,22 @@ async def view_page(
                     # The raster, one at a time per turn: a round of four reads must
                     # not hold four decoded pages before the budget sees any of them.
                     async with decode_slot:
-                        data = await _settled(asyncio.to_thread(_as_png, rendered, max_pixels))
+                        return await _settled(
+                            asyncio.to_thread(_as_png, rendered, max_pixels, long_edge_px)
+                        )
                 except poppler.PopplerError:
-                    return ToolOutcome(f"page {page} could not be rendered", is_error=True)
-        else:
-            try:
-                with os.fdopen(os.dup(fd), "rb") as reader:
-                    raw = await asyncio.to_thread(reader.read, max_bytes + 1)
-                async with decode_slot:
-                    data = await _settled(asyncio.to_thread(_as_png, raw, max_pixels))
-            except OSError:
-                return ToolOutcome("the original image could not be read", is_error=True)
-            except (ImageTooLarge, Image.DecompressionBombError, Image.DecompressionBombWarning):
-                return ToolOutcome("the original image is too large to render", is_error=True)
+                    raise PageUnavailable(f"page {page} could not be rendered") from None
+        try:
+            with os.fdopen(os.dup(fd), "rb") as reader:
+                raw = await asyncio.to_thread(reader.read, max_bytes + 1)
+            async with decode_slot:
+                return await _settled(asyncio.to_thread(_as_png, raw, max_pixels, long_edge_px))
+        except OSError:
+            raise PageUnavailable("the original image could not be read") from None
+        except (ImageTooLarge, Image.DecompressionBombError, Image.DecompressionBombWarning):
+            raise PageUnavailable("the original image is too large to render") from None
     finally:
         os.close(fd)
-    return ToolOutcome([_png_block(data), {"type": "text", "text": f"Page {page}."}])
 
 
 async def view_figure(paths: DocumentPaths, tool_input: dict, *, max_bytes: int) -> ToolOutcome:

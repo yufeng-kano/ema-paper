@@ -55,8 +55,14 @@ agent_settings   (user_id FK, agent) PK,
                                                   -- chat: language tags; NULL = the reader's
                                                   -- locale of each message
                  memory_auto BOOL NOT NULL DEFAULT true,
-                 memory_paused BOOL NOT NULL DEFAULT false
+                 memory_paused BOOL NOT NULL DEFAULT false,
                                                   -- chat: the memory switches (chat.md § Memory)
+                 fallback_model VARCHAR(255) NULL,
+                                                  -- parse: the model a blocked page goes to,
+                                                  -- and the retry dialog's first choice
+                 auto_fallback BOOL NOT NULL DEFAULT false
+                                                  -- parse: send blocked pages to it on its own
+                                                  -- (parsing.md § Fallback model)
                  -- one row per user and agent (agents.md); no row means every column's
                  -- default. Both FKs ON DELETE SET NULL; deleting a connection also clears
                  -- the model, which belonged to that connection's catalog
@@ -79,6 +85,11 @@ jobs             id UUID PK, user_id FK, agent, kind pdf|image, filename, media_
                                                   -- (jobs.md § Dedup)
                  prompt TEXT NULL,                -- effective prompt template, verbatim
                  prompt_sha256,                   -- its hash; part of the dedup key
+                 fallback_model NULL,             -- snapshot at enqueue: the fallback when
+                                                  -- auto_fallback was on, else NULL
+                 retry_model NULL,                -- the model a retry runs the remaining
+                                                  -- pages on; NULL = `model` (jobs.md
+                                                  -- § Retrying failed pages)
                  status queued|running|succeeded|failed, error,
                  page_count, pages_done, source_path NULL, source_deleted_at NULL,
                  retain_source,                   -- a library upload keeps its original
@@ -96,10 +107,13 @@ jobs             id UUID PK, user_id FK, agent, kind pdf|image, filename, media_
                                                   -- (jobs.md § Queue). The SQLite fallback
                                                   -- takes the highest on record plus one
 job_pages        (job_id FK, page_no) PK, method NULL, status, error NULL,
-                 markdown TEXT NULL               -- the page's transcription, written as
+                 markdown TEXT NULL,              -- the page's transcription, written as
                                                   -- the page finishes; what the partial
                                                   -- result reads (jobs.md § Progress);
                                                   -- NULL on failed pages
+                 model NULL                       -- the model that wrote the page, or that
+                                                  -- failed it last; NULL on rows written
+                                                  -- before the column (the job's model)
 results          job_id PK/FK, markdown TEXT, pages JSONB, figures JSONB,
                  errors JSONB, meta JSONB, created_at
 folders          id PK, user_id FK, parent_id FK folders NULL, name,
@@ -232,6 +246,7 @@ oauth_grants     id PK, client_id FK, user_id FK, kind code|access|refresh,
 - `user_settings.system_prompt` no longer exists: the migration turned each stored custom prompt into a `prompt_presets` row named "Custom prompt" and pointed `prompt_preset_id` at it, so behavior did not change for anyone.
 - **The agent prompt migration** (`skills subagents attachments and agent prompt`) gave `agent_settings` its `prompt` column and moved every selected preset into it, clearing `prompt_preset_id`: a `parse` preset's text as it was (a parse preset replaced the template), a `chat` preset's text behind the chat agent's default system prompt of that release and a blank line (a chat preset was appended to it) — the default is copied into the migration, never imported, so the migration stays what it was when it ran. The presets themselves stay, unselected; nothing else reads them. A `chat` preset holding one of the template's tokens is not moved: it was appended verbatim, and inside the template the token would be substituted, so it stays the selected preset. The downgrade puts the selections back before it drops the column: an agent whose prompt is a moved preset selects that preset again (matched by its text), and a prompt written after the upgrade becomes a preset of its own named *Custom prompt* (numbered past a taken name) where the old schema can say it — a `parse` prompt as it is, a `chat` prompt as what it adds behind that release's default; a `chat` prompt that edits the default itself has no such form and goes back to the default. A moved `chat` prompt can exceed `SYSTEM_PROMPT_MAX_CHARS`, which caps writes, not stored rows: the dialog says so and the reader shortens it before the next save. The same revision created `skills`, `subagents` and `chat_attachments`.
 - **The instructions and memory migration** (`agent instructions and memories`) added `agent_settings.instructions`, `answer_language`, `translate_language` (NULL: none, and the reader's locale as before), `memory_auto` (true) and `memory_paused` (false), `conversations.memory_ids` (NULL: a conversation takes its snapshot at its next turn) and the `memories` table, empty, with its three indexes. No row is rewritten. Its downgrade drops them, the memories with them.
+- **The failed pages migration** (`retry failed pages`) added `agent_settings.fallback_model` (NULL) and `auto_fallback` (false), `jobs.fallback_model` and `jobs.retry_model` (NULL) and `job_pages.model` (NULL: the job's model). No row is rewritten: a job already `succeeded` with page errors keeps its result as it was ([parsing.md](./parsing.md) § Vision-only conversion). Its downgrade drops the five columns.
 - **The markdown documents migration** (`markdown documents`) dropped NOT NULL from `documents.job_id` and nothing else: every existing row keeps its job, and no row is rewritten. Its downgrade refuses while any document has no job, naming the count — restoring NOT NULL would otherwise have to delete the reader's markdown documents and their conversations with them. Delete them first, deliberately, if the downgrade is really wanted.
 - **The trash migration** (`library trash`) added `folders.trashed_at` and `documents.trashed_at`, NULL on every existing row — nothing is in the Trash — and narrowed the two name constraints and the two root-level indexes to the rows not in the Trash (`uq_folders_parent_name` and `uq_documents_folder_name` were constraints and became partial unique indexes under the same names). Its downgrade refuses while anything is in the Trash, naming the count: restoring the full constraints would have to pick which of two same-named rows survives. Empty the Trash first, deliberately, if the downgrade is really wanted.
 - **The built-in subagent removal** (`remove three built-in subagents`) deleted every `subagents` row named `verifier`, `reader` or `translation-checker`: the readers' edits of built-ins that left the code, which would otherwise have stayed on as subagents of their own ([chat.md](./chat.md) § Subagents). Its downgrade restores none of them; the built-ins come back with the code they belong to, unedited.

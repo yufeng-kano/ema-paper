@@ -91,6 +91,10 @@ class Settings(BaseSettings):
     # (docs/workspace.md § Inserted images).
     document_image_max_bytes: int = 20 * 1024 * 1024
     document_image_long_edge: int = 2400
+    # A page of an original drawn for the retry dialog: its long edge, and how many the
+    # API process makes at once (docs/api.md § Limits).
+    page_preview_long_edge: int = 1200
+    page_preview_renders: int = 2
 
     # The chat agent's limits (docs/chat.md).
     max_chat_turns_per_user: int = 4

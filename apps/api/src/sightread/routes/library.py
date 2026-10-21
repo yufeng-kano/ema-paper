@@ -17,6 +17,7 @@ import contextlib
 import logging
 import os
 import re
+import shutil
 import unicodedata
 import uuid
 import warnings
@@ -27,13 +28,14 @@ from fastapi import APIRouter, Request, Response, status
 from fastapi.responses import StreamingResponse
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field
-from sqlalchemy import ColumnElement, delete, select, update
+from sqlalchemy import ColumnElement, delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import iterate_in_threadpool
 from starlette.datastructures import FormData, UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser
 
+from ..agents import PARSE
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
 from ..db.models import (
     ChatTurn,
@@ -47,6 +49,8 @@ from ..db.models import (
     utcnow,
 )
 from ..errors import ApiError
+from ..jobs import events
+from ..jobs.chat_tools import PageUnavailable, original_page_png
 from ..jobs.intake import (
     MULTIPART_ENVELOPE_BYTES,
     capped_stream,
@@ -54,6 +58,7 @@ from ..jobs.intake import (
     submit_parse,
     upload_chunks,
 )
+from ..jobs.queue import parse_pages_spec, retry_job
 from ..jobs.runner import partial_result_payload, result_payload
 from ..parsing.figures import crop_chunks, open_crop, parse_bbox_path
 from ..parsing.images import ImageError, normalize_image
@@ -503,12 +508,13 @@ def folder_payload(row: Folder) -> dict:
     }
 
 
-def document_payload(row: Document, job: Job | None) -> dict:
+def document_payload(row: Document, job: Job | None, failed_pages: int | None = None) -> dict:
     """The row the file list draws: the entry, plus the live state of its parse.
 
     Joined rather than fetched per row, so one `GET /api/library` renders every name,
     status and progress bar the page needs (docs/web.md § Files). A markdown document
-    (`job` None) has no parse to report on: every parse field is null.
+    (`job` None) has no parse to report on: every parse field is null. `failed_pages` is
+    what a retry of a failed parse would send, null for any other.
     """
     if job is None:
         return {
@@ -525,6 +531,7 @@ def document_payload(row: Document, job: Job | None) -> dict:
             "error": None,
             "created_at": row.created_at,
             "finished_at": None,
+            "failed_pages": None,
         }
     return {
         "id": row.id,
@@ -540,6 +547,32 @@ def document_payload(row: Document, job: Job | None) -> dict:
         "error": job.error,
         "created_at": row.created_at,
         "finished_at": job.finished_at,
+        "failed_pages": failed_pages,
+    }
+
+
+async def failed_page_counts(db: DbSession, jobs: list[Job | None]) -> dict[uuid.UUID, int]:
+    """For each failed parse, how many of its pages have no succeeded row — what a retry
+    sends (docs/jobs.md § Retrying failed pages). A row with markdown is a page that
+    succeeded; a failed one stores none."""
+    failed = [job for job in jobs if job is not None and job.status == "failed"]
+    if not failed:
+        return {}
+    kept = dict(
+        (
+            await db.execute(
+                select(JobPage.job_id, func.count())
+                .where(
+                    JobPage.job_id.in_([job.id for job in failed]),
+                    JobPage.markdown.is_not(None),
+                )
+                .group_by(JobPage.job_id)
+            )
+        ).all()
+    )
+    return {
+        job.id: len(parse_pages_spec(job.pages_spec, job.page_count or 1)) - kept.get(job.id, 0)
+        for job in failed
     }
 
 
@@ -585,6 +618,7 @@ async def read_library(user: SessionUser, db: DbSession):
             .order_by(Document.created_at.desc())
         )
     ).all()
+    failed = await failed_page_counts(db, [job for _, job in documents])
 
     # The live rows are the library; the Trash lists what was trashed itself, never
     # what sits inside a trashed folder (docs/api.md).
@@ -611,7 +645,7 @@ async def read_library(user: SessionUser, db: DbSession):
     return {
         "folders": [folder_payload(row) for row in folders if row.id not in trashed],
         "documents": [
-            document_payload(row, job)
+            document_payload(row, job, failed.get(row.job_id))
             for row, job in documents
             if row.trashed_at is None and row.folder_id not in trashed
         ],
@@ -627,7 +661,7 @@ async def read_library(user: SessionUser, db: DbSession):
             ],
             "documents": [
                 {
-                    **document_payload(row, job),
+                    **document_payload(row, job, failed.get(row.job_id)),
                     "trashed_at": row.trashed_at,
                     "origin": origin(row.folder_id),
                 }
@@ -1035,7 +1069,8 @@ async def trash_document(document_id: int, user: SessionUser, db: DbSession, set
             landed=(Document, row.id),
         )
     job = await job_of(db, row.job_id) if row.job_id is not None else None
-    return {**document_payload(row, job), "trashed_at": row.trashed_at}
+    failed = await failed_page_counts(db, [job])
+    return {**document_payload(row, job, failed.get(row.job_id)), "trashed_at": row.trashed_at}
 
 
 @router.post("/folders/{folder_id}/trash", dependencies=[CsrfGuard])
@@ -1097,7 +1132,7 @@ async def restore_document(
             or row
         )
     job = await job_of(db, row.job_id) if row.job_id is not None else None
-    return document_payload(row, job)
+    return document_payload(row, job, (await failed_page_counts(db, [job])).get(row.job_id))
 
 
 @router.post("/folders/{folder_id}/restore", dependencies=[CsrfGuard])
@@ -1351,7 +1386,7 @@ async def upload_document(
             what="The upload",
             undo=lambda: workspace_documents.discard_adopted(settings, user_id, row_id, relative),
         )
-    return document_payload(row, job)
+    return document_payload(row, job, (await failed_page_counts(db, [job])).get(row.job_id))
 
 
 async def file_markdown(
@@ -1554,7 +1589,7 @@ async def file_job(body: DocumentFromJob, user: SessionUser, db: DbSession, sett
         )
         if not filed:
             raise ApiError(404, "invalid_request", "The file was deleted while it was being filed")
-    return document_payload(row, job)
+    return document_payload(row, job, (await failed_page_counts(db, [job])).get(row.job_id))
 
 
 @router.put("/documents/{document_id}", dependencies=[CsrfGuard])
@@ -1607,7 +1642,7 @@ async def _update_document_locked(
     landed = (Document, row.id, {"folder_id": row.folder_id, "name": row.name})
     await move_then_commit(db, settings, user.id, before, after, landed=landed)
     job = await job_of(db, row.job_id) if row.job_id is not None else None
-    return document_payload(row, job)
+    return document_payload(row, job, (await failed_page_counts(db, [job])).get(row.job_id))
 
 
 @router.delete(
@@ -1724,6 +1759,153 @@ async def document_figure(
     if row.job_id is None:
         raise ApiError(404, "invalid_request", "No such figure")
     return await figure_crop_response(settings, await job_of(db, row.job_id), page, bbox)
+
+
+# --- a parse page by page, and the retry of its failed pages --------------------------------
+
+
+@router.get("/documents/{document_id}/pages")
+async def document_pages(document_id: int, user: SessionUser, db: DbSession):
+    """Every page of the parse's selection with its state — what the retry dialog lists
+    (docs/api.md). A page with no row is `pending`: queued, running, or never reached
+    before a failure that ended the job."""
+    row = await live_document(db, user.id, document_id)
+    if row.job_id is None:
+        raise ApiError(404, "invalid_request", "A markdown document has no pages")
+    job = await job_of(db, row.job_id)
+    rows = {
+        page.page_no: page
+        for page in (await db.execute(select(JobPage).where(JobPage.job_id == job.id))).scalars()
+    }
+    return {
+        "pages": [
+            {
+                "page": page_no,
+                "status": rows[page_no].status if page_no in rows else "pending",
+                "reason": rows[page_no].error if page_no in rows else None,
+                "model": rows[page_no].model if page_no in rows else None,
+            }
+            for page_no in parse_pages_spec(job.pages_spec, job.page_count or 1)
+        ]
+    }
+
+
+@router.get("/documents/{document_id}/pages/{page}/image")
+async def document_page_image(
+    document_id: int,
+    page: int,
+    request: Request,
+    user: SessionUser,
+    db: DbSession,
+    settings: AppSettings,
+):
+    """One page of the document's original as a PNG, for the retry dialog: drawn the way
+    the chat agent's `view_page` draws it, smaller, a few at a time per process
+    (docs/api.md § Limits). Never cached, as a crop is not."""
+    row = await live_document(db, user.id, document_id)
+    if row.job_id is None:
+        raise ApiError(404, "invalid_request", "A markdown document has no pages")
+    job = await job_of(db, row.job_id)
+    last = (job.page_count or 1) if job.kind == "pdf" else 1
+    if not 1 <= page <= last:
+        raise ApiError(404, "invalid_request", "No such page")
+    root = user_root(settings.workspaces_dir, row.user_id)
+    source = workspace_documents.original_of(root, row.id)
+    if source is None:
+        raise ApiError(404, "invalid_request", "This document kept no original")
+    slots = request.app.state.preview_slots
+    try:
+        data = await original_page_png(
+            root,
+            source,
+            kind=job.kind,
+            page=page,
+            render_slots=slots,
+            decode_slot=slots,
+            max_bytes=settings.upload_max_bytes,
+            max_pixels=settings.chat_page_image_max_pixels,
+            long_edge_px=settings.page_preview_long_edge,
+        )
+    except PageUnavailable as exc:
+        raise ApiError(404, "invalid_request", str(exc)) from exc
+    return Response(
+        content=data, media_type="image/png", headers={"Cache-Control": "private, no-store"}
+    )
+
+
+class DocumentRetry(BaseModel):
+    """The model the failed pages are sent to; none is the job's own."""
+
+    model: str | None = Field(default=None, max_length=255)
+
+
+@router.post(
+    "/documents/{document_id}/retry",
+    dependencies=[CsrfGuard],
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def retry_document(
+    document_id: int, body: DocumentRetry, user: SessionUser, db: DbSession, settings: AppSettings
+):
+    """Put the failed parse behind the document back on the queue, its succeeded pages
+    kept (docs/jobs.md § Retrying failed pages). Its upload went with the failure, so it
+    runs on a copy of the document's original. Decided under the workspace lock — the
+    original cannot go while it is copied, nor the file to the Trash — and the job's row
+    lock, from `failed` only: two retries cannot both put it back. A commit that raises is
+    read back on a connection of its own, as a filing's is: the copy goes only with a
+    retry that did not land."""
+    model = (body.model or "").strip() or None
+    root = user_root(settings.workspaces_dir, user.id)
+    async with workspace_lock(root):
+        row = await live_document(db, user.id, document_id)
+        if row.job_id is None:
+            raise ApiError(404, "invalid_request", "A markdown document has no parse to retry")
+        await lock_job(db, row.job_id)
+        job = await job_of(db, row.job_id)
+        if job.agent != PARSE.name or job.status != "failed":
+            raise ApiError(409, "invalid_request", "Only a failed parse can be retried")
+        original = workspace_documents.original_of(root, row.id)
+        if original is None:
+            raise ApiError(
+                409,
+                "invalid_request",
+                "This document kept no original to parse again; upload the file again",
+            )
+        upload_dir = Path(settings.upload_dir)
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        copy = upload_dir / f"{job.id}.retry-{uuid.uuid4().hex[:12]}{original.suffix}"
+        await asyncio.to_thread(shutil.copyfile, original, copy)
+        try:
+            await retry_job(db, job.id, source_path=str(copy), model=model)
+            await events.notify(db, job.id)
+        except BaseException:
+            copy.unlink(missing_ok=True)
+            raise
+        # Read before the commit: a rollback expires the row.
+        job_id = job.id
+        try:
+            await db.commit()
+        except Exception as exc:  # noqa: BLE001 - verified below, whatever raised
+            readable, landed = await _read_row(db, Job, job_id)
+            with contextlib.suppress(Exception):
+                await db.rollback()
+            if readable and landed is not None and landed.source_path == str(copy):
+                logger.warning("the retry of job %s was committed despite the error", job_id)
+                return {"job_id": str(job_id), "status": "queued"}
+            if readable:
+                copy.unlink(missing_ok=True)
+                raise ApiError(
+                    409, "invalid_request", "The retry could not be queued; nothing changed"
+                ) from exc
+            # The copy stays: a retry that landed runs on it, and the upload sweeper
+            # takes it otherwise (docs/jobs.md § Retrying failed pages).
+            raise ApiError(
+                409,
+                "invalid_request",
+                "The retry may have been queued, but the database could not confirm it; "
+                "reload the library before trying again",
+            ) from exc
+    return {"job_id": str(job.id), "status": "queued"}
 
 
 # --- images inserted into a document --------------------------------------------------------
@@ -2007,7 +2189,7 @@ async def copy_document(
         # is the row as committed, with its job read again.
         row = landed
         job = await job_of(db, row.job_id) if row.job_id is not None else None
-    return document_payload(row, job)
+    return document_payload(row, job, (await failed_page_counts(db, [job])).get(row.job_id))
 
 
 @router.post(

@@ -299,6 +299,24 @@ class EmptyCompletion(UpstreamError):
         )
 
 
+class IncompleteCompletion(UpstreamError):
+    """The model stopped its own answer: `content_filter` (`blocked`) or `length` (`cut
+    off`). The page fails at once, whatever text came with it — the same page asks the
+    same thing again, so it is not retried on the same model (docs/parsing.md § Upstream
+    usage). `reason` is the page's failure reason; `usage` what the answer was billed."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"The model stopped the completion ({reason})")
+        self.reason = reason
+        self.usage = Usage(
+            prompt_tokens=0, completion_tokens=0, cost=None, cost_source=COST_SOURCE_UNKNOWN
+        )
+
+
+# A choice's `finish_reason` that ends its page (docs/parsing.md § Upstream usage).
+STOPPED_REASONS = {"content_filter": "blocked", "length": "cut off"}
+
+
 class PaymentRequired(UpstreamError):
     """402. The page fails with reason `payment`; a repeat means the key is dead."""
 
@@ -435,6 +453,11 @@ def _message_text(payload: dict) -> str:
     choices = payload.get("choices") or []
     if not choices or not isinstance(choices[0], dict):
         raise EmptyCompletion()
+    finish_reason = choices[0].get("finish_reason")
+    # A stopped answer fails its page with whatever text came with it: a page cut short is
+    # never a shorter page (docs/parsing.md § Upstream usage).
+    if isinstance(finish_reason, str) and finish_reason in STOPPED_REASONS:
+        raise IncompleteCompletion(STOPPED_REASONS[finish_reason])
     content = (choices[0].get("message") or {}).get("content")
     if isinstance(content, str):
         return content
@@ -445,7 +468,6 @@ def _message_text(payload: dict) -> str:
         # How some servers say "nothing": a page with nothing to transcribe. Only a choice
         # that finished on its own is that answer; one cut short is a failed call, and
         # one that does not say is ambiguous (docs/parsing.md § Upstream usage).
-        finish_reason = choices[0].get("finish_reason")
         if finish_reason == "stop":
             return ""
         if finish_reason is None:
@@ -528,7 +550,7 @@ async def _chat_with_image(
     _raise_for_error_payload(payload)
     try:
         text = _message_text(payload)
-    except EmptyCompletion as exc:
+    except (EmptyCompletion, IncompleteCompletion) as exc:
         exc.usage = _usage(payload, connection)
         raise
     return text, _usage(payload, connection)

@@ -254,6 +254,7 @@ async def enqueue_job(
     page_count: int,
     source_path: str,
     retain_source: bool = False,
+    fallback_model: str | None = None,
 ) -> Job:
     """Create the queued job row. The caller commits — creation and enqueue are one act."""
     job = Job(
@@ -273,6 +274,7 @@ async def enqueue_job(
         bbox_format=bbox_format,
         prompt=prompt,
         prompt_sha256=prompt_sha256,
+        fallback_model=fallback_model,
         status="queued",
         page_count=page_count,
         pages_done=0,
@@ -404,12 +406,30 @@ async def requeue_orphaned_jobs(db: AsyncSession) -> list[uuid.UUID]:
     return orphans
 
 
-async def requeue_job(db: AsyncSession, job_id: uuid.UUID, generation: int | None = None) -> bool:
-    """Put an interrupted job back on the queue and forget its partial progress.
+async def _keep_succeeded_pages(db: AsyncSession, job_id: uuid.UUID) -> None:
+    """Forget a requeued job's failed pages and count the ones it keeps: a row with
+    markdown is a page that succeeded (a failed one stores none), and the next attempt
+    transcribes only what has no such row (docs/jobs.md § Retrying failed pages)."""
+    await db.execute(delete(JobPage).where(JobPage.job_id == job_id, JobPage.markdown.is_(None)))
+    await db.execute(
+        update(Job)
+        .where(Job.id == job_id)
+        .values(
+            pages_done=select(func.count())
+            .select_from(JobPage)
+            .where(JobPage.job_id == job_id)
+            .scalar_subquery()
+        )
+    )
 
-    Shutdown mid-run reparses from scratch: pages are not individually resumable, and a
-    reparse is cheaper to reason about than a half-written result. False when the job
-    was no longer `running` — its result committed before the cancel landed — and so
+
+async def requeue_job(db: AsyncSession, job_id: uuid.UUID, generation: int | None = None) -> bool:
+    """Put an interrupted job back on the queue, keeping the pages it finished.
+
+    The next attempt transcribes only the pages without a succeeded row — a page the
+    user's key already paid for is not transcribed again — and crops every page anew,
+    so the caller discards this attempt's crops (docs/jobs.md § Queue). False when the
+    job was no longer `running` — its result committed before the cancel landed — and so
     stays as it is, its pages and crops with it; or, with `generation`, when the row no
     longer holds the caller's: a worker that lost the lock must not put back a job the
     replacement has taken (docs/jobs.md § Queue). A worker starting requeues without
@@ -420,13 +440,41 @@ async def requeue_job(db: AsyncSession, job_id: uuid.UUID, generation: int | Non
         await db.execute(
             update(Job)
             .where(Job.id == job_id, Job.status == "running", *owned)
-            .values(status="queued", started_at=None, pages_done=0, worker_generation=None)
+            .values(status="queued", started_at=None, worker_generation=None)
         )
     ).rowcount > 0
     if requeued:
-        await db.execute(delete(JobPage).where(JobPage.job_id == job_id))
+        await _keep_succeeded_pages(db, job_id)
     await db.commit()
     return requeued
+
+
+async def retry_job(
+    db: AsyncSession, job_id: uuid.UUID, *, source_path: str, model: str | None
+) -> bool:
+    """Put a failed parse back on the queue to run its failed pages, on `model` (None: the
+    job's own), from `source_path` — a copy of its document's original. The caller holds
+    the job's row lock and commits. False when the job is no longer `failed`
+    (docs/jobs.md § Retrying failed pages)."""
+    retried = (
+        await db.execute(
+            update(Job)
+            .where(Job.id == job_id, Job.status == "failed")
+            .values(
+                status="queued",
+                error=None,
+                started_at=None,
+                finished_at=None,
+                worker_generation=None,
+                retry_model=model,
+                source_path=source_path,
+                source_deleted_at=None,
+            )
+        )
+    ).rowcount > 0
+    if retried:
+        await _keep_succeeded_pages(db, job_id)
+    return retried
 
 
 # --- chat turns (docs/jobs.md § Chat turns) ----------------------------------------------

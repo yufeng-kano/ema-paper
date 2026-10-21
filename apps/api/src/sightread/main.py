@@ -5,6 +5,7 @@ process.
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -44,6 +45,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="agent-sightread", lifespan=lifespan)
     app.state.settings = settings
     app.state.oauth = build_oauth(settings)
+    # Page previews render in this process: Poppler and a decode, a few at a time
+    # (docs/api.md § Limits).
+    app.state.preview_slots = asyncio.Semaphore(max(1, settings.page_preview_renders))
 
     # Before the session layer, so an oversized body is refused before anything reads it.
     app.add_middleware(

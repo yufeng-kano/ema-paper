@@ -283,6 +283,9 @@ async def test_switching_the_upstream_clears_a_model_from_the_other_catalog(sign
         "translate_language": None,
         "memory_auto": True,
         "memory_paused": False,
+        # The parse agent's own: no fallback, and none taken on its own.
+        "fallback_model": None,
+        "auto_fallback": False,
         "bbox": {"family": "default", "format": "yxyx_norm1000"},
     }
     # Sent together, the model is kept: it was picked from the new upstream's catalog.

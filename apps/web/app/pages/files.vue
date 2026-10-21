@@ -636,6 +636,8 @@ onBeforeUnmount(() => {
 // --- the result viewer -----------------------------------------------------
 
 const openDocument = ref<LibraryDocument | null>(null)
+/** The failed parse whose retry dialog is open: opening a failed document opens this. */
+const retrying = ref<LibraryDocument | null>(null)
 // Read once: closing the viewer, or opening another document, spends the link.
 watch(
   () => openDocument.value?.id,
@@ -654,86 +656,60 @@ const loadingResults = reactive(new Set<number>())
 /** The single upload whose result should open itself; `-1` while it has no id yet. */
 let autoPreviewFor: number | null = null
 
-/** One read of the document's result — the final one, or a running job's partial
- *  snapshot (docs/api.md § Partial results). At most one request per document in flight. */
+/** One read of the document's result. At most one request per document in flight. */
 async function fetchResult(document: LibraryDocument) {
   if (loadingResults.has(document.id)) {
     return
   }
   loadingResults.add(document.id)
   resultErrors.delete(document.id)
-  let fetched: JobResult | null = null
   try {
-    fetched = await getDocumentResult(document.id)
-    results.set(document.id, fetched)
+    results.set(document.id, await getDocumentResult(document.id))
   } catch (error) {
     resultErrors.set(document.id, await resolve(error))
   } finally {
     loadingResults.delete(document.id)
   }
-  // The parse can finish while a partial request is in flight: the watcher's final fetch
-  // was swallowed by the in-flight guard, and with nothing left pending the poll has
-  // stopped — so nothing else will ask again. Recheck the row this response landed on.
-  // Only after a *successful partial* response: a failed request retrying here would be
-  // an unbounded loop against a route that answers the same error every time.
-  const row = documents.value.find((entry) => entry.id === document.id)
-  if (fetched?.meta.partial && row && !isPending(row)) {
-    void fetchResult(row)
-  }
 }
 
 async function showResult(document: LibraryDocument) {
-  openDocument.value = document
+  // A parse opens only once every page has succeeded: until then its row's status and
+  // progress are what there is to see (docs/web.md § Files).
+  if (isPending(document)) {
+    showNote(t('files.note.parsing'), false)
+    return
+  }
   // Reading something by hand settles what the screen is for; a queued auto-preview must
   // not take it away when it finishes.
   autoPreviewFor = null
-  // A markdown document has no result: the viewer reads its copy (docs/web.md § Files).
-  if (document.kind === 'markdown') {
+  // A failed parse has no result to read, ever: opening it is its retry (docs/web.md § Files).
+  if (document.status === 'failed') {
+    retrying.value = document
     return
   }
-  const held = results.get(document.id)
-  // A held final result is done; a held partial one is a stale snapshot — refetch it.
-  if (held && !held.meta.partial) {
+  openDocument.value = document
+  // A markdown document has no result: the viewer reads its copy (docs/web.md § Files).
+  if (document.kind === 'markdown' || results.has(document.id)) {
     return
   }
   await fetchResult(document)
 }
 
-/**
- * The open dialog follows its own row. A document opened while it is still parsing
- * re-reads its partial result on the same poll that advances the row's progress, so pages
- * appear as they land — and the moment the poll says the job finished, the final result
- * replaces the last snapshot (nothing partial is ever kept).
- */
+/** The open viewer follows its own row: a parse only opens finished, so there is nothing
+ *  more of it to read, but its name and folder can still change. */
 watch(documents, (list) => {
   const open = openDocument.value
-  if (!open) {
-    return
-  }
-  const fresh = list.find((row) => row.id === open.id)
-  if (!fresh) {
-    return
-  }
-  openDocument.value = fresh
-  if (fresh.kind === 'markdown') {
-    return
-  }
-  const held = results.get(fresh.id)
-  // A failed fetch is not retried on every list change — reopening the document retries.
-  // The same guard covers a held partial over a terminal row (a failed job answers 404
-  // forever); a still-pending row retries freely, since each attempt clears the error.
-  const failed = resultErrors.has(fresh.id)
-  const missing = !held && !failed
-  const stalePartial = held?.meta.partial === true && !failed
-  if (isPending(fresh) || stalePartial || missing) {
-    void fetchResult(fresh)
+  const fresh = open && list.find((row) => row.id === open.id)
+  if (fresh) {
+    openDocument.value = fresh
   }
 })
 
-/** The upload that just finished parsing opens itself — unless the reader is already
- *  reading something, in which case taking the screen away would be rude. */
+/** The upload that just finished parsing opens itself — its retry, if it failed — unless
+ *  the reader is already reading something, in which case taking the screen away would be
+ *  rude. A retried document waits here the same way. */
 watch(documents, (list) => {
-  if (autoPreviewFor === null || autoPreviewFor < 0 || openDocument.value) {
+  if (autoPreviewFor === null || autoPreviewFor < 0 || openDocument.value || retrying.value) {
     return
   }
   const target = list.find((row) => row.id === autoPreviewFor)
@@ -746,12 +722,16 @@ watch(documents, (list) => {
     autoPreviewFor = null
     return
   }
-  if (target.status === 'succeeded' || target.kind === 'markdown') {
-    void showResult(target)
-  } else {
-    autoPreviewFor = null
-  }
+  void showResult(target)
 })
+
+/** Queued again: the row says so at once, and the document opens by itself once every page
+ *  has succeeded — or this dialog comes back, if a page fails again. */
+async function onRetried() {
+  autoPreviewFor = retrying.value?.id ?? null
+  retrying.value = null
+  await refresh()
+}
 
 // --- file operations -------------------------------------------------------
 
@@ -1587,6 +1567,7 @@ const menuItems = computed<MenuItem[]>(() => {
     ]
   }
   const one = items.length === 1 ? items[0]! : null
+  const parse = one?.kind === 'file' ? documents.value.find((row) => row.id === one.id) : undefined
   return [
     ...(one
       ? [
@@ -1595,7 +1576,12 @@ const menuItems = computed<MenuItem[]>(() => {
             label: t('files.open'),
             icon: one.kind === 'folder' ? ('folder-open' as const) : ('file-text' as const),
             shortcut: label(apple ? 'mod+down' : 'enter'),
+            // A parse opens only once every page has succeeded (docs/web.md § Files).
+            disabled: !!parse && isPending(parse),
           },
+          ...(parse?.status === 'failed'
+            ? [{ key: 'retry', label: t('files.retryFailed'), icon: 'rotate-ccw' as const }]
+            : []),
           { key: 'rename', label: t('files.rename'), icon: 'edit' as const, shortcut: label(apple ? 'enter' : 'f2') },
         ]
       : []),
@@ -1630,7 +1616,9 @@ const menuLabel = computed(() => {
 function runMenu(action: string) {
   const items = selection.value
   switch (action) {
+    // Retry is what Open does for a failed parse, named in its menu so it can be found.
     case 'open':
+    case 'retry':
       return items[0] && openEntry(items[0].key)
     case 'rename':
       return items[0] && startRename(items[0].key)
@@ -2228,9 +2216,14 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
                 <!-- A markdown document has no parse: no status, pages or size to report. -->
                 <template #cell-status="{ row }">
                   <span v-if="row.kind === 'file' && row.document.status" class="state-cell">
+                    <!-- A failed parse says what a retry would send: its pages without a result. -->
                     <UiStatusDot
                       :tone="STATUS_TONE[row.document.status]"
-                      :label="t(`status.${row.document.status}`)"
+                      :label="
+                        row.document.failed_pages
+                          ? t('files.failedPages', { n: row.document.failed_pages }, row.document.failed_pages)
+                          : t(`status.${row.document.status}`)
+                      "
                     />
                     <UiUsageBar
                       v-if="row.document.status === 'running'"
@@ -2359,18 +2352,23 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
       @close="menu = null"
     />
 
+    <RetryDialog
+      v-if="retrying"
+      :key="retrying.id"
+      :document="retrying"
+      @retried="onRetried"
+      @close="retrying = null"
+    />
+
     <!-- Keyed per document so reopening on another file resets scroll and page state.
-         `pending` only while there is nothing to draw: a partial result is a document. -->
+         Only a finished parse opens, so `pending` is its one read of the result. -->
     <ResultViewer
       v-if="openDocument"
       :key="openDocument.id"
       :title="openDocument.name"
       :error="openDocument.error"
       :result="results.get(openDocument.id) ?? null"
-      :pending="
-        !results.has(openDocument.id) &&
-        (loadingResults.has(openDocument.id) || isPending(openDocument))
-      "
+      :pending="!results.has(openDocument.id) && loadingResults.has(openDocument.id)"
       :error-message="resultErrors.get(openDocument.id) ?? null"
       :figure-base="openDocument.kind === 'markdown' ? null : `/api/library/documents/${openDocument.id}/figures`"
       :image-base="`/api/library/documents/${openDocument.id}/images`"

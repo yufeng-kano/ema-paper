@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest'
+import en from '../../i18n/locales/en'
+import zhTW from '../../i18n/locales/zh-TW'
 import type { LibraryDocument, LibraryFolder, UploadLimits } from './api'
 import {
+  PAGE_FAILURE_REASONS,
   acceptsUpload,
   canMoveFolder,
   childFolders,
@@ -40,6 +43,7 @@ function document(
     error: null,
     created_at: '2026-08-01T00:00:00Z',
     finished_at: '2026-08-01T00:01:00Z',
+    failed_pages: null,
     ...overrides,
   }
 }
@@ -246,5 +250,14 @@ describe('typeAheadMatch', () => {
 
   it('selects nothing when no name starts so', () => {
     expect(typeAheadMatch(rows, 'z')).toBeNull()
+  })
+})
+
+describe('PAGE_FAILURE_REASONS', () => {
+  it('names every reason a page fails with, in both languages', () => {
+    for (const key of Object.values(PAGE_FAILURE_REASONS)) {
+      expect(en.files.retry.reasons).toHaveProperty(key)
+      expect(zhTW.files.retry.reasons).toHaveProperty(key)
+    }
   })
 })
