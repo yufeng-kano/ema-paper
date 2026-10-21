@@ -64,6 +64,9 @@ const list = ref<HTMLElement | null>(null)
 const place = ref({ left: -9999, top: -9999 })
 const compact = ref(false)
 const skillsOpen = ref(false)
+/** The rows the open list shows: read when Skills is pressed, so a skills read answering
+ *  while it is open cannot move a row under the pointer; the next opening shows the new list. */
+const shown = ref<readonly ToolbarSkill[]>([])
 /** The list's box, in the toolbar's coordinates, and which side of the toolbar it is on. */
 const listPlace = ref({ left: 0, top: 0, width: LIST_WIDTH, maxHeight: 0, above: false })
 
@@ -144,6 +147,7 @@ onMounted(() => void position())
 async function toggleSkills() {
   skillsOpen.value = !skillsOpen.value
   if (skillsOpen.value) {
+    shown.value = [...props.skills]
     await nextTick()
     placeList()
   }
@@ -224,7 +228,7 @@ function pick(name: string) {
       <p class="skills-head">{{ t('viewer.toolbar.skills') }}</p>
       <div class="skills-list">
         <button
-          v-for="skill in skills"
+          v-for="skill in shown"
           :key="skill.name"
           type="button"
           class="skill"

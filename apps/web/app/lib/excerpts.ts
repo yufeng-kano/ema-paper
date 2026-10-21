@@ -96,8 +96,9 @@ export function droppedBlocksMarkdown(markdown: string): string | null {
  *  level deep (`…block=a~Let+(x)+be`), as a markdown link's destination may hold them. */
 const ADDRESS_LINK = /\[((?:\\[\s\S]|[^[\]\\\n])+)\]\((https?:\/\/(?:[^\s()]|\([^\s()]*\))+)\)/g
 
-/** Code in markdown, where nothing is a link: a fenced block, then a span on one line. */
-const CODE_REGIONS = /(```[\s\S]*?(?:```|$)|`[^`\n]+`)/
+/** Code in markdown, where nothing is a link: a fenced block — backticks or tildes, as
+ *  `CODE_FENCE` opens one — then a span on one line. */
+const CODE_REGIONS = /(```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`[^`\n]+`)/
 
 /**
  * Block references pasted into the notes (docs/web.md § Notes, *Quotes and section links*):

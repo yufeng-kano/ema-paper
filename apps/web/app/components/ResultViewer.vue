@@ -2751,7 +2751,8 @@ const notesLinks = {
 /**
  * The block anchor an address carries when it is this document's *Copy link to block* — the
  * app's own origin, the files page in any locale, this document — else null (docs/web.md
- * § Notes, *Quotes and section links*). The anchor as the address wrote it, still escaped.
+ * § Notes, *Quotes and section links*). The anchor as the address wrote it, still escaped;
+ * empty for the top of the document.
  */
 function blockLinkAnchor(address: string): string | null {
   let url: URL
@@ -2766,8 +2767,9 @@ function blockLinkAnchor(address: string): string | null {
   if (url.searchParams.get('document') !== String(props.documentId)) {
     return null
   }
-  const block = /[?&]block=([^&#]*)/.exec(url.search)?.[1]
-  return block ? block : null
+  // Present but empty is an anchor too: a wordless block before the first heading, the top.
+  const block = /[?&]block=([^&#]*)/.exec(url.search)
+  return block ? block[1]! : null
 }
 
 /**

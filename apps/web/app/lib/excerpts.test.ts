@@ -140,12 +140,15 @@ describe('block references in the notes', () => {
     )
     expect(rewriteBlockLinks(`[x](${address('a~Let+(x)+be')})`, anchorOf)).toBe('[x](#a~Let%20%28x%29%20be)')
     expect(rewriteBlockLinks('[a plain link](https://example.com/page)', anchorOf)).toBe('[a plain link](https://example.com/page)')
+    // An empty anchor — a wordless block before the first heading — is the top of the document.
+    expect(rewriteBlockLinks(`[Figure](${address('')})`, (href) => (new URL(href).searchParams.has('block') ? '' : null))).toBe('[Figure](#)')
   })
 
   it('leaves code and escaped links as the text they show', () => {
     const link = `[x](${address('a~x')})`
     expect(rewriteBlockLinks(`Write \`${link}\` to cite.`, anchorOf)).toBe(`Write \`${link}\` to cite.`)
     expect(rewriteBlockLinks(`\`\`\`md\n${link}\n\`\`\`\n\n${link}`, anchorOf)).toBe(`\`\`\`md\n${link}\n\`\`\`\n\n[x](#a~x)`)
+    expect(rewriteBlockLinks(`~~~\n${link}\n~~~\n\n${link}`, anchorOf)).toBe(`~~~\n${link}\n~~~\n\n[x](#a~x)`)
     expect(rewriteBlockLinks(`\\${link}`, anchorOf)).toBe(`\\${link}`)
     expect(rewriteBlockLinks(`\\\\${link}`, anchorOf)).toBe('\\\\[x](#a~x)')
   })
