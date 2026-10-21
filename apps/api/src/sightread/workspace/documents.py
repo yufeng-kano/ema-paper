@@ -22,7 +22,7 @@ from collections.abc import Collection, Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import Row, select
 from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -208,7 +208,7 @@ async def folder_names(db: AsyncSession, user_id: int, folder_id: int | None) ->
     return [row.name for row in folder_chain(await user_folders(db, user_id), folder_id)]
 
 
-def trashed_folder_ids(folders: Iterable[Folder]) -> set[int]:
+def trashed_folder_ids(folders: Iterable[Folder] | Iterable[Row]) -> set[int]:
     """Every folder in the Trash: put there itself, or inside one that was. Nothing marks
     the second kind, so it is computed (docs/database.md § Rules)."""
     by_id = {row.id: row for row in folders}
@@ -1754,6 +1754,19 @@ def _trash_holds(root: Path, document: Document, by_id: dict[int, Folder]) -> bo
     names = {name for _kind, _row_id, name in _trash_entries(root)}
     return trash_entry("document", document.id) in names or any(
         trash_entry("folder", row.id) in names for row in folder_chain(by_id, document.folder_id)
+    )
+
+
+async def held_in_trash(
+    settings: Settings, user_id: int, *, folders: Iterable[int], documents: Iterable[int]
+) -> bool:
+    """Whether the Trash holds an entry of any of these rows. Asked of live rows after the
+    repair rule ran, it is what the rule could not bring back: their files are not under
+    `files/`, and nothing may take them for never written (docs/workspace.md § Copies)."""
+    root = user_root(settings.workspaces_dir, user_id)
+    held = {(kind, row_id) for kind, row_id, _name in await asyncio.to_thread(_trash_entries, root)}
+    return any(("folder", row_id) in held for row_id in folders) or any(
+        ("document", row_id) in held for row_id in documents
     )
 
 

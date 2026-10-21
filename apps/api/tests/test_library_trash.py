@@ -661,6 +661,92 @@ async def test_a_copy_whose_commit_landed_despite_the_error_is_answered_as_made(
     assert (writer.root / "files" / "draft (2).md" / "doc.md").read_text() == "# Draft\n"
 
 
+async def test_a_copy_brings_back_files_an_interrupted_move_left_in_the_trash(writer) -> None:
+    """The process died between the move into the Trash and the row's commit: the row is
+    live and its edits wait in the Trash. A copy runs the repair rule first, so it copies
+    the edits, not a baseline (docs/workspace.md § Copies)."""
+    document = await _document(writer, "draft.md", None, "# Edited\n")
+    entry = trash_root(writer.root) / f"document-{document['id']}"
+    entry.parent.mkdir(parents=True)
+    (writer.root / "files" / "draft.md").rename(entry)
+
+    copied = await _copy(writer, "documents", document["id"], None)
+    assert copied.status_code == 201, copied.text
+    assert not entry.exists()
+    assert (writer.root / "files" / "draft.md" / "doc.md").read_text() == "# Edited\n"
+    assert (writer.root / "files" / "draft (2).md" / "doc.md").read_text() == "# Edited\n"
+
+
+async def test_no_copy_is_made_while_the_trash_keeps_the_files(writer, monkeypatch) -> None:
+    """The repair rule cannot bring the files back: the copy is refused, never made from
+    the baseline as if the item had never been read — a document's own entry, a folder's
+    above it, or an entry of anything inside a copied folder."""
+    papers = await _folder(writer, "Papers")
+    year = await _folder(writer, "2026", papers["id"])
+    deep = await _document(writer, "deep.md", year["id"], "# Deep\n")
+    monkeypatch.setattr(workspace_documents, "_return_entry", lambda root, name, home: False)
+    entry = trash_root(writer.root) / f"document-{deep['id']}"
+    entry.parent.mkdir(parents=True)
+    (writer.root / "files" / "Papers" / "2026" / "deep.md").rename(entry)
+
+    for kind, row_id in (("documents", deep["id"]), ("folders", papers["id"])):
+        refused = await _copy(writer, kind, row_id, None)
+        assert refused.status_code == 409, refused.text
+        assert "could not be brought back from the Trash" in refused.json()["error"]["message"]
+
+    entry.rename(writer.root / "files" / "Papers" / "2026" / "deep.md")
+    stranded = trash_root(writer.root) / f"folder-{year['id']}"
+    (writer.root / "files" / "Papers" / "2026").rename(stranded)
+    refused = await _copy(writer, "documents", deep["id"], None)
+    assert refused.status_code == 409, refused.text
+
+    library = await _read(writer)
+    assert [row["name"] for row in library["documents"]] == ["deep.md"]
+    assert sorted(row["name"] for row in library["folders"]) == ["2026", "Papers"]
+    assert (stranded / "deep.md" / "doc.md").read_text() == "# Deep\n"
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("/api/library/documents/new", {"name": "draft"}),
+        ("/api/library/folders", {"name": "child"}),
+    ],
+)
+async def test_a_destination_trashed_after_the_check_takes_no_new_entry(
+    writer, monkeypatch, path, body
+) -> None:
+    """Another tab moves the destination to the Trash between a create's check and its
+    insert. The insert decides again under the user's row lock, from a fresh read — the
+    session still holds the folder as the check saw it — and refuses, rather than hiding
+    the new item in the Trash at once (docs/database.md § Rules)."""
+    from sqlalchemy import select, update
+
+    from sightread.routes import library as routes
+
+    inbox = await _folder(writer, "Inbox")
+    checked = routes.live_folder
+
+    async def check_then_trash(db, user_id, folder_id):
+        row = await checked(db, user_id, folder_id)
+        async with writer.app.state.sessionmaker() as other:
+            await other.execute(
+                update(Folder).where(Folder.id == folder_id).values(trashed_at=utcnow())
+            )
+            await other.commit()
+        return row
+
+    monkeypatch.setattr(routes, "live_folder", check_then_trash)
+    key = "folder_id" if "documents" in path else "parent_id"
+    response = await writer.post(path, json={**body, key: inbox["id"]}, headers=CSRF_HEADERS)
+    assert response.status_code == 404, response.text
+
+    async with writer.app.state.sessionmaker() as db:
+        documents = (await db.execute(select(Document.id))).all()
+        folders = (await db.execute(select(Folder.name))).scalars().all()
+    assert (documents, folders) == ([], ["Inbox"])
+
+
 async def test_the_status_route_counts_the_trash_on_its_own_line(writer) -> None:
     from sightread.routes.chat import _workspace_usage
 

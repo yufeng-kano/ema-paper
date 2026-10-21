@@ -72,6 +72,9 @@ DOCUMENT_NAME_MAX = 512
 NAME_ATTEMPTS = 500
 # An insert can lose a name race with another tab; the retry re-reads the folder's names.
 INSERT_ATTEMPTS = 3
+# A copy of an item whose files the Trash's repair rule could not bring back is refused,
+# not made from the baseline as if the item had never been read (docs/workspace.md § Copies).
+STRANDED = "The item's files could not be brought back from the Trash; nothing was copied"
 
 # A name is a label in a tree, never a path. Separators would make a breadcrumb lie about
 # where a file is, and control characters would make two different names look identical.
@@ -301,6 +304,7 @@ async def insert_named[RowT: (Folder, Document)](
     db: DbSession,
     *,
     user_id: int,
+    into: int | None,
     build: Callable[[str], RowT],
     taken: Callable[[], Awaitable[set[str]]],
     wanted: str,
@@ -316,11 +320,30 @@ async def insert_named[RowT: (Folder, Document)](
     request that keeps losing gives up. Without `commit` the row is flushed and left in
     the open transaction, for a caller that has more to make true before it commits
     (a filing, whose original lands first — docs/workspace.md § Backups).
+
+    `into` is the folder the row lands in, decided again under the user's row lock: a
+    move to the Trash takes that lock too, so a folder trashed since the caller's check
+    answers 404 here rather than taking a row that would be hidden in the Trash at once
+    (docs/database.md § Rules).
     """
     attempts = INSERT_ATTEMPTS
     while True:
         attempts -= 1
         await lock_user(db, user_id)
+        if into is not None:
+            # Columns, not rows: the session may hold the folders the caller's check
+            # loaded, and a row already in it is not read again.
+            folders = (
+                await db.execute(
+                    select(Folder.id, Folder.parent_id, Folder.trashed_at).where(
+                        Folder.user_id == user_id
+                    )
+                )
+            ).all()
+            if into not in {folder.id for folder in folders} or into in (
+                workspace_documents.trashed_folder_ids(folders)
+            ):
+                raise ApiError(404, "invalid_request", "No such folder")
         row = build(free_name(await taken(), wanted, limit))
         db.add(row)
         try:
@@ -650,6 +673,7 @@ async def create_folder(
             row = await insert_named(
                 db,
                 user_id=user_id,
+                into=parent_id,
                 build=lambda name: Folder(user_id=user_id, parent_id=parent_id, name=name),
                 taken=lambda: sibling_names(db, user_id, parent_id),
                 wanted=clean_name(body.name, FOLDER_NAME_MAX),
@@ -1268,6 +1292,7 @@ async def upload_document(
         return await insert_named(
             db,
             user_id=user_id,
+            into=place,
             build=lambda name: Document(user_id=user_id, folder_id=place, job_id=job_id, name=name),
             taken=taken,
             wanted=wanted,
@@ -1285,10 +1310,13 @@ async def upload_document(
     async with backup_shared(root), workspace_lock(root):
         try:
             row = await land(folder_id)
-        except ApiError:
-            # The remaining sliver of that same race: deleted between the check above and
-            # this insert, which arrives as a foreign-key failure rather than a name one.
-            if folder_id is None or await folder_exists(db, user_id, folder_id):
+        except ApiError as exc:
+            # The remaining sliver of that same race: deleted or moved to the Trash between
+            # the check above and this insert — the 404 of the check under the user's row
+            # lock, or a foreign-key failure rather than a name one.
+            if folder_id is None or (
+                exc.status_code != 404 and await folder_exists(db, user_id, folder_id)
+            ):
                 raise
             row = await land(None)
         row_id = row.id
@@ -1359,6 +1387,7 @@ async def file_markdown(
                 row = await insert_named(
                     db,
                     user_id=user_id,
+                    into=folder_id,
                     build=lambda name: Document(
                         user_id=user_id, folder_id=folder_id, job_id=None, name=name
                     ),
@@ -1412,6 +1441,7 @@ async def create_document(body: DocumentCreate, user: SessionUser, db: DbSession
         row = await insert_named(
             db,
             user_id=user_id,
+            into=folder_id,
             build=lambda name: Document(
                 user_id=user_id, folder_id=folder_id, job_id=None, name=name
             ),
@@ -1482,6 +1512,7 @@ async def file_job(body: DocumentFromJob, user: SessionUser, db: DbSession, sett
             row = await insert_named(
                 db,
                 user_id=user_id,
+                into=folder_id,
                 build=lambda name: Document(
                     user_id=user_id, folder_id=folder_id, job_id=job_id, name=name
                 ),
@@ -1933,10 +1964,20 @@ async def copy_document(
     # lock shared around it, as a filing: no row without its original, in the database
     # or in a snapshot (docs/workspace.md § Backups).
     async with backup_shared(root), workspace_lock(root):
+        # What an interrupted move to or from the Trash left goes back first: the copy
+        # reads the source's directory, and the edits may be waiting there.
+        await workspace_documents.recover_trash(db, settings, user_id)
         await lock_user(db, user_id)
         source = await live_document(db, user_id, document_id)
         if folder_id is not None:
             await live_folder(db, user_id, folder_id)
+        above = workspace_documents.folder_chain(
+            await workspace_documents.user_folders(db, user_id), source.folder_id
+        )
+        if await workspace_documents.held_in_trash(
+            settings, user_id, folders=[row.id for row in above], documents=[source.id]
+        ):
+            raise ApiError(409, "invalid_request", STRANDED)
         await workspace_documents.ensure_within_quota(settings, root)
         job = await job_of(db, source.job_id) if source.job_id is not None else None
         if job is not None:
@@ -1980,6 +2021,7 @@ async def copy_folder(
     user_id, parent_id = user.id, body.parent_id
     root = user_root(settings.workspaces_dir, user_id)
     async with backup_shared(root), workspace_lock(root):
+        await workspace_documents.recover_trash(db, settings, user_id)
         await lock_user(db, user_id)
         source = await live_folder(db, user_id, folder_id)
         folders = await workspace_documents.user_folders(db, user_id)
@@ -2004,6 +2046,14 @@ async def copy_folder(
             .scalars()
             .all()
         )
+        above = workspace_documents.folder_chain(folders, source.parent_id)
+        if await workspace_documents.held_in_trash(
+            settings,
+            user_id,
+            folders=[*inside, *(row.id for row in above)],
+            documents=[document.id for document in sources],
+        ):
+            raise ApiError(409, "invalid_request", STRANDED)
         job_ids = {document.job_id for document in sources if document.job_id is not None}
         jobs = {
             job.id: job
