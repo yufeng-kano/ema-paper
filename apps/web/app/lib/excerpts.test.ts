@@ -7,6 +7,7 @@ import {
   excerptMarkers,
   excerptPassage,
   findPassage,
+  insertNoteBlocks,
   linkResolves,
   matchExcerpts,
   rewriteBlockLinks,
@@ -207,5 +208,29 @@ describe('appendBlocks', () => {
     expect(appendBlocks('', '$$x$$')).toEqual({ notes: '$$x$$', at: 0, count: 1 })
     expect(appendBlocks('  \n', 'Text.')).toEqual({ notes: 'Text.  \n', at: 0, count: 1 })
     expect(appendBlocks('Kept.', '<!-- page: 1 -->')).toBeNull()
+  })
+})
+
+describe('insertNoteBlocks', () => {
+  const line = '![shot](figures/img-0123456789abcdef.png)'
+
+  it('puts the blocks beside the block found, the rest of the notes as written', () => {
+    const notes = 'Zero.\n\n\n\nFirst.\n\nSecond.\n'
+    expect(insertNoteBlocks(notes, { after: 'First.', before: 'Second.', gap: 2 }, line)).toBe(`Zero.\n\n\n\nFirst.\n\n${line}\n\nSecond.\n`)
+    // The block it followed is gone: before the one it preceded.
+    expect(insertNoteBlocks(notes, { after: 'Gone.', before: 'Second.', gap: 2 }, line)).toBe(`Zero.\n\n\n\nFirst.\n\n${line}\n\nSecond.\n`)
+  })
+
+  it('takes the nearest of repeated blocks, as two excerpts from one section leave them', () => {
+    const link = '[3.2 Attention](#32-attention)'
+    const notes = ['> First passage.', link, '> Second passage.', link, 'Tail.'].join('\n\n')
+    expect(insertNoteBlocks(notes, { after: link, before: 'Tail.', gap: 4 }, line)).toBe(
+      ['> First passage.', link, '> Second passage.', link, line, 'Tail.'].join('\n\n'),
+    )
+  })
+
+  it('goes at the end when neither neighbour is left, and adds nothing for nothing', () => {
+    expect(insertNoteBlocks('A.\n', { after: 'X.', before: 'Y.', gap: 0 }, line)).toBe(`A.\n\n${line}\n`)
+    expect(insertNoteBlocks('A.', { after: 'A.', before: null, gap: 1 }, '<!-- page: 2 -->')).toBeNull()
   })
 })

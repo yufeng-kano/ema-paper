@@ -41,7 +41,7 @@ import {
 import { blockName, type NameText } from '~/lib/blocks'
 import { commandArguments, formatBytes, type AskOutcome, type AskRequest, type ComposerPayload } from '~/lib/composer'
 import { nodesToMarkdown } from '~/lib/copy'
-import { BLOCK_DRAG_TYPE } from '~/lib/dnd'
+import { ANSWER_DRAG_TYPE, BLOCK_DRAG_TYPE } from '~/lib/dnd'
 import {
   blockPlain,
   documentOutline,
@@ -73,6 +73,10 @@ const RESUME_AFTER_MS = 10_000
 /** How close to the thread's end counts as at it: the thread follows a live turn only
  *  from there (docs/web.md § The agent panel). */
 const FOLLOW_SLACK_PX = 24
+
+/** A press on a handle that closed that handle's own menu: its click must not open it again
+ *  (the document handle's guard, ResultViewer). */
+const REOPEN_GUARD_MS = 300
 
 const props = defineProps<{
   documentId: number
@@ -939,9 +943,13 @@ function scheduleToolbar() {
   }
 }
 
-function onThreadPointerDown() {
+function onThreadPointerDown(event: PointerEvent) {
   selecting = true
   toolbar.value = null
+  // A touch screen has no hover: the block tapped shows its handle until another tap.
+  if (event.pointerType === 'touch') {
+    hoveredBlock.value = answerBlockOf(event.target)
+  }
 }
 
 function onPointerUp() {
@@ -978,16 +986,20 @@ async function copySelection() {
 
 // --- answer blocks: the handle, its drag and its menu ------------------------------------
 
-/** Answer blocks by `{item key}:{index}`: a handle is drawn only on the block under the
- *  pointer, the one whose menu is open and the one being dragged (docs/web.md § The agent
- *  panel, *An answer is blocks*). A pressed handle stays until the press ends: a drag starts
- *  only once the pointer has moved, by then often off the block, and a handle gone by then
- *  starts none. */
+/** Answer blocks by `{item key}:{index}`: a handle is drawn only on the block the pointer is
+ *  over or level with, the one last tapped, the one holding keyboard focus, the one whose menu
+ *  is open and the one being dragged (docs/web.md § The agent panel, *An answer is blocks*). A
+ *  pressed handle stays until the press ends: a drag starts only once the pointer has moved,
+ *  by then often off the block, and a handle gone by then starts none. */
 const hoveredBlock = ref<string | null>(null)
+const focusedBlock = ref<string | null>(null)
 const pressedBlock = ref<string | null>(null)
 const draggedBlock = ref<string | null>(null)
-const blockMenu = ref<{ at: Point; key: string; block: ResultBlock; fromKey: boolean } | null>(null)
+/** The open menu's block by where it is, not as it read then: a live answer grows under it. */
+const blockMenu = ref<{ at: Point; key: string; itemKey: string; index: number; fromKey: boolean } | null>(null)
 const dragCard = ref<HTMLElement | null>(null)
+let blockMenuClosedAt = 0
+let blockMenuClosedBy: EventTarget | null = null
 
 /** What a handle calls its block, as the document's handles do. */
 const nameText = computed<NameText>(() => ({
@@ -1003,20 +1015,61 @@ const nameText = computed<NameText>(() => ({
 function handleShown(key: string): boolean {
   return (
     hoveredBlock.value === key ||
+    focusedBlock.value === key ||
     pressedBlock.value === key ||
     draggedBlock.value === key ||
     blockMenu.value?.key === key
   )
 }
 
-function leaveBlock(key: string) {
-  if (hoveredBlock.value === key) {
+function answerBlockOf(target: EventTarget | null): string | null {
+  return target instanceof Element ? (target.closest<HTMLElement>('[data-answer-block]')?.dataset.answerBlock ?? null) : null
+}
+
+/** The block the pointer is over — or level with, in the gutter — and in the gap between two
+ *  blocks of an answer the last one, so the pointer on its way to a handle keeps it: the
+ *  document's rule (ResultViewer's `readHover`). */
+function onThreadPointerMove(event: PointerEvent) {
+  if (event.pointerType === 'touch') {
+    return
+  }
+  let probe = event.target instanceof Element ? event.target : null
+  if (probe && !probe.closest('[data-answer-block]')) {
+    const column = scroller.value?.querySelector('.assistant')?.getBoundingClientRect()
+    if (column && event.clientX < column.left) {
+      probe = document.elementFromPoint(column.left + 1, event.clientY)
+    }
+  }
+  const key = answerBlockOf(probe)
+  if (key !== null) {
+    hoveredBlock.value = key
+  } else if (!probe?.closest('.assistant')) {
     hoveredBlock.value = null
   }
 }
 
-/** The drag is a copy: the document's block type with no run of the document's, and the
- *  block's markdown as text — what the notes, the document and any text field land. */
+/** A finger lifted leaves too: a tapped block keeps its handle. */
+function onThreadPointerLeave(event: PointerEvent) {
+  if (event.pointerType !== 'touch') {
+    hoveredBlock.value = null
+  }
+}
+
+/** Keyboard focus only: a handle pressed with the pointer takes focus too, and would keep its
+ *  handle drawn once the pointer has gone. */
+function onThreadFocusIn(event: FocusEvent) {
+  focusedBlock.value = event.target instanceof Element && event.target.matches(':focus-visible') ? answerBlockOf(event.target) : null
+}
+
+function onThreadFocusOut(event: FocusEvent) {
+  if (answerBlockOf(event.relatedTarget) !== focusedBlock.value) {
+    focusedBlock.value = null
+  }
+}
+
+/** The drag is a copy: the document's block type with no run of the document's, the
+ *  answer's own type, and the block's markdown as text — what the notes, the document and any
+ *  text field land. */
 function onBlockDragStart(event: DragEvent, key: string, block: ResultBlock) {
   const transfer = event.dataTransfer
   if (!transfer) {
@@ -1027,6 +1080,7 @@ function onBlockDragStart(event: DragEvent, key: string, block: ResultBlock) {
   toolbar.value = null
   transfer.effectAllowed = 'copy'
   transfer.setData(BLOCK_DRAG_TYPE, '[]')
+  transfer.setData(ANSWER_DRAG_TYPE, '')
   transfer.setData('text/plain', block.src)
   const card = dragCard.value
   const text = card?.querySelector('.drag-card-text')
@@ -1036,14 +1090,58 @@ function onBlockDragStart(event: DragEvent, key: string, block: ResultBlock) {
   }
 }
 
-function openBlockMenu(event: MouseEvent, key: string, block: ResultBlock) {
-  if (blockMenu.value?.key === key) {
-    blockMenu.value = null
+/** The menu's block as it reads now, or null when the answer it was in is gone or stored
+ *  under another key. */
+function blockOfMenu(): ResultBlock | null {
+  const menu = blockMenu.value
+  const item = menu ? items.value.find((entry) => entry.key === menu.itemKey) : undefined
+  return menu && item?.kind === 'text' ? (messageBlocks(item.text)[menu.index] ?? null) : null
+}
+
+/** A menu open is being read: the thread stops following under it, since its scroll would
+ *  close the menu, as a card does (`openCard`). */
+function openBlockMenu(event: MouseEvent | KeyboardEvent, itemKey: string, index: number) {
+  const handle = event.currentTarget as HTMLElement
+  if (
+    performance.now() - blockMenuClosedAt < REOPEN_GUARD_MS &&
+    blockMenuClosedBy instanceof Node &&
+    handle.contains(blockMenuClosedBy)
+  ) {
     return
   }
-  const handle = (event.currentTarget as HTMLElement).getBoundingClientRect()
-  blockMenu.value = { at: { x: handle.right + 4, y: handle.top }, key, block, fromKey: event.detail === 0 }
+  const key = `${itemKey}:${index}`
+  if (blockMenu.value?.key === key) {
+    closeBlockMenu()
+    return
+  }
+  const rect = handle.getBoundingClientRect()
+  blockMenu.value = {
+    at: { x: rect.right + 4, y: rect.top },
+    key,
+    itemKey,
+    index,
+    fromKey: event instanceof KeyboardEvent || event.detail === 0,
+  }
+  following = false
 }
+
+function closeBlockMenu(cause?: Event) {
+  // Opened from the keyboard, the menu gives focus back to its handle: the handle stays drawn
+  // to take it.
+  if (blockMenu.value?.fromKey) {
+    focusedBlock.value = blockMenu.value.key
+  }
+  blockMenu.value = null
+  blockMenuClosedAt = performance.now()
+  blockMenuClosedBy = cause?.target ?? null
+  void settleFollowing()
+}
+
+watch(items, () => {
+  if (blockMenu.value && !blockOfMenu()) {
+    closeBlockMenu()
+  }
+})
 
 const blockMenuItems = computed<MenuItem[]>(() => [
   { key: 'notes', label: t('chat.block.toNotes'), icon: 'notebook-pen' },
@@ -1051,8 +1149,7 @@ const blockMenuItems = computed<MenuItem[]>(() => [
 ])
 
 async function onBlockMenuSelect(key: string) {
-  const block = blockMenu.value?.block
-  blockMenu.value = null
+  const block = blockOfMenu()
   if (!block) {
     return
   }
@@ -1197,7 +1294,7 @@ onBeforeUnmount(() => {
       :label="t('chat.block.menu')"
       :focus-first="blockMenu.fromKey"
       @select="onBlockMenuSelect"
-      @close="blockMenu = null"
+      @close="closeBlockMenu"
     />
 
     <!-- An answer block's drag picture, written as the drag starts; never seen in place. -->
@@ -1210,6 +1307,10 @@ onBeforeUnmount(() => {
       ref="scroller"
       class="thread"
       @pointerdown="onThreadPointerDown"
+      @pointermove="onThreadPointerMove"
+      @pointerleave="onThreadPointerLeave"
+      @focusin="onThreadFocusIn"
+      @focusout="onThreadFocusOut"
       @click="onThreadClick"
       @scroll="onThreadScroll"
       @wheel.passive="onThreadWheel"
@@ -1265,34 +1366,32 @@ onBeforeUnmount(() => {
 
         <!-- An answer: its section links are chips that scroll the document there. -->
         <div v-else-if="item.kind === 'text'" class="assistant md-message md-side">
-          <div
-            v-for="(block, index) in messageBlocks(item.text)"
-            :key="index"
-            class="answer-block"
-            @pointerenter="hoveredBlock = `${item.key}:${index}`"
-            @pointerleave="leaveBlock(`${item.key}:${index}`)"
-          >
-            <MdBlock :block="block" :cite="resolveCite" />
-            <!-- After the block, so a heading stays its wrapper's first child. -->
-            <div
-              v-if="block.kind !== 'comment' && handleShown(`${item.key}:${index}`)"
-              role="button"
-              class="answer-handle"
-              :class="{ on: blockMenu?.key === `${item.key}:${index}` }"
-              data-chrome
-              tabindex="-1"
-              draggable="true"
-              :aria-label="t('chat.block.handle', { name: blockName(block, nameText) })"
-              aria-haspopup="menu"
-              :aria-expanded="blockMenu?.key === `${item.key}:${index}` ? 'true' : 'false'"
-              @pointerdown.stop="pressedBlock = `${item.key}:${index}`"
-              @click.stop="openBlockMenu($event, `${item.key}:${index}`, block)"
-              @dragstart="onBlockDragStart($event, `${item.key}:${index}`, block)"
-              @dragend="draggedBlock = null; pressedBlock = null"
-            >
-              <UiIcon name="grip-vertical" />
+          <template v-for="(block, index) in messageBlocks(item.text)" :key="index">
+            <!-- A comment draws nothing, and takes no wrapper that would count as a block. -->
+            <div v-if="block.kind !== 'comment'" class="answer-block" :data-answer-block="`${item.key}:${index}`">
+              <MdBlock :block="block" :cite="resolveCite" />
+              <!-- After the block, so a heading stays its wrapper's first child. -->
+              <div
+                v-if="handleShown(`${item.key}:${index}`)"
+                role="button"
+                class="answer-handle"
+                :class="{ on: blockMenu?.key === `${item.key}:${index}` }"
+                data-chrome
+                tabindex="0"
+                draggable="true"
+                :aria-label="t('chat.block.handle', { name: blockName(block, nameText) })"
+                aria-haspopup="menu"
+                :aria-expanded="blockMenu?.key === `${item.key}:${index}` ? 'true' : 'false'"
+                @pointerdown.stop="pressedBlock = `${item.key}:${index}`"
+                @click.stop="openBlockMenu($event, item.key, index)"
+                @keydown.enter.space.prevent="openBlockMenu($event, item.key, index)"
+                @dragstart="onBlockDragStart($event, `${item.key}:${index}`, block)"
+                @dragend="draggedBlock = null; pressedBlock = null"
+              >
+                <UiIcon name="grip-vertical" />
+              </div>
             </div>
-          </div>
+          </template>
         </div>
 
         <ChatMemoryLine
@@ -1670,8 +1769,9 @@ onBeforeUnmount(() => {
 }
 
 /* Each block is its wrapper's first child, which markdown.css reads as the column's top: a
-   `##` past an answer's first block keeps the rule over it. */
-.answer-block + .answer-block :deep(.md-h2:not([data-level='1'])) {
+   `##` past an answer's first block keeps the rule over it — the block's own heading only,
+   never one inside a quote. */
+.answer-block + .answer-block > :deep(.md-h2:not([data-level='1'])) {
   padding-top: var(--space-4);
   border-top: 1px solid var(--line);
 }

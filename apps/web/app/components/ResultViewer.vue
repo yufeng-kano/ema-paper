@@ -34,7 +34,7 @@ import {
 } from '~/lib/blocks'
 import { formatBytes, isImageFile, type AskRequest } from '~/lib/composer'
 import { cellGroupsToMarkdown, nodesToMarkdown, selectionText, type OrphanListContext } from '~/lib/copy'
-import { BLOCK_DRAG_TYPE, carriesFiles, claimDrag, dragClaim, droppedFiles, setDropEffect } from '~/lib/dnd'
+import { ANSWER_DRAG_TYPE, BLOCK_DRAG_TYPE, carriesFiles, claimDrag, dragClaim, droppedFiles, setDropEffect } from '~/lib/dnd'
 import {
   appendBlocks,
   appendExcerpt,
@@ -43,6 +43,7 @@ import {
   excerptMarkers,
   excerptPassage,
   findPassage,
+  insertNoteBlocks,
   linkResolves,
   locatePassage,
   matchExcerpts,
@@ -706,6 +707,8 @@ const unsaved = computed(() => saveState.value === 'failed' || notesState.value 
 onBeforeUnmount(() => {
   closed = true
   commitEdit()
+  // Images already uploaded and waiting on that editor go in with it.
+  landWaitingImages()
   // A failed save left its text unsaved with no timer: it gets one more try too.
   if (saveTimer !== null || saveState.value === 'failed') {
     if (saveTimer !== null) {
@@ -2291,7 +2294,7 @@ function carriesImageFiles(event: DragEvent): boolean {
 /** Blocks dragged from an answer in the agent panel: a copy to land on the drop line, with no
  *  run of the document's to move (docs/web.md § The agent panel, *An answer is blocks*). */
 function carriesAnswerBlocks(event: DragEvent): boolean {
-  return !dragRun && editable.value && [...(event.dataTransfer?.types ?? [])].includes(BLOCK_DRAG_TYPE)
+  return !dragRun && editable.value && [...(event.dataTransfer?.types ?? [])].includes(ANSWER_DRAG_TYPE)
 }
 
 /** The last `dragover` the pane took a copy for — image files or an answer's blocks: any
@@ -2309,6 +2312,9 @@ function onPaneDragOver(event: DragEvent) {
   }
   claimDrag(event, images ? 'image' : 'block')
   paneCopyEvent = copy ? event : null
+  if (copy) {
+    window.addEventListener('pointermove', endCopyDrag, { once: true })
+  }
   event.preventDefault()
   setDropEffect(event, copy ? 'copy' : 'move')
   const box = scroller.value
@@ -2489,6 +2495,16 @@ function landBlocks(blocks: string, target: BlockAt | null, place: 'before' | 'a
 function onWindowDragOver(event: DragEvent) {
   if (dragRun ? dragClaim(event) !== 'block' : dropLine.value && paneCopyEvent !== event) {
     clearDropLine()
+  }
+}
+
+/** A copy's drop line outliving its drag — the drag's source taken off the page, as an
+ *  answer's block is when the answer is stored, so its `dragend` never reached the window —
+ *  goes at the next pointer move, which no drag fires (docs/web.md § Editing, *Moving
+ *  blocks*). */
+function endCopyDrag() {
+  if (!dragRun) {
+    endDrag()
   }
 }
 
@@ -3785,26 +3801,49 @@ async function uploadImage(file: File): Promise<string | null> {
  * An image whose editor closed before it uploaded (docs/web.md § Editing, *Images*): it lands
  * in the document, or the notes, where it was to go, found by the blocks around it — not when
  * the viewer has closed or moved on to another document since, which is false: send no more.
+ * In the document it waits while another block's editor is open (`waitingImages`).
  */
 function landStrayed(file: 'document' | 'notes', id: number, line: string, near: PlaceNear): boolean {
   if (closed || id !== props.documentId) {
     return false
   }
   if (file === 'notes') {
-    const { target, place } = findPlace(notes.value, near)
-    const inserted = insertBlocks(notes.value, target, place, line)
-    if (inserted) {
-      applyNotes(inserted.markdown)
+    const next = insertNoteBlocks(notes.value, near, line)
+    if (next !== null) {
+      applyNotes(next)
     }
     return true
   }
-  commitEdit()
-  const { target, place } = findPlace(markdown.value, near)
-  if (landBlocks(line, target, place)) {
-    showNote(t('viewer.note.imagesAdded', { n: 1 }, 1), false)
+  waitingImages.push({ line, near })
+  if (!editing.value) {
+    landWaitingImages()
   }
   return true
 }
+
+/** Strayed images on their way into the document, in the order they uploaded: landing one
+ *  writes the document back, which would close the editor the reader is typing in, so they
+ *  wait for no editor to be open. */
+const waitingImages: { line: string; near: PlaceNear }[] = []
+
+function landWaitingImages() {
+  let landed = 0
+  for (const { line, near } of waitingImages.splice(0)) {
+    const { target, place } = findPlace(markdown.value, near)
+    if (landBlocks(line, target, place)) {
+      landed += 1
+    }
+  }
+  if (landed) {
+    showNote(t('viewer.note.imagesAdded', { n: landed }, landed), false)
+  }
+}
+
+watch(editing, (open) => {
+  if (!open && !closed && waitingImages.length) {
+    landWaitingImages()
+  }
+})
 
 /** What the editors insert images with: only on Files, where the document has an images route. */
 const editorImages = computed(() => {
@@ -3830,7 +3869,9 @@ const openRunNear = computed<PlaceNear | null>(() => {
   const start = found === -1 ? flat.length : found
   // A new block's editor holds no block of the document yet.
   const run = flat.filter((entry) => entry.pageIndex === open.page && entry.index >= open.index && entry.index < open.index + span.value).length
-  return { after: flat[start - 1]?.src ?? null, before: flat[start + run]?.src ?? null, gap: start }
+  // The neighbour on the editor's own page first: the place stays on it.
+  const prefer = flat[start - 1]?.pageIndex !== open.page && flat[start + run]?.pageIndex === open.page ? 'before' : 'after'
+  return { after: flat[start - 1]?.src ?? null, before: flat[start + run]?.src ?? null, gap: start, prefer }
 })
 
 /** The block editors' images: the editor's place in the document goes with them. */
@@ -4042,6 +4083,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('pointercancel', forgetChromePress)
   window.removeEventListener('dragover', onWindowDragOver)
   window.removeEventListener('dragend', endDrag, true)
+  window.removeEventListener('pointermove', endCopyDrag)
   coarseQuery?.removeEventListener('change', onCoarseChange)
   columnsObserver?.disconnect()
   paneObserver?.disconnect()

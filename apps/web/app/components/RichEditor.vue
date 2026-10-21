@@ -35,7 +35,7 @@ import { isImageFile, matchCommands } from '~/lib/composer'
 import { BLOCK_DRAG_TYPE, carriesFiles, claimDrag, droppedFiles, setDropEffect } from '~/lib/dnd'
 import { droppedBlocksMarkdown } from '~/lib/excerpts'
 import type { IconName } from '~/lib/icons'
-import type { PlaceNear } from '~/lib/markdown'
+import { nearestBlock, type PlaceNear } from '~/lib/markdown'
 import {
   richExtensions,
   washKey,
@@ -849,7 +849,7 @@ async function insertImages(files: File[], slot: ImageSlot) {
         if (!slot.near || !strayed?.(line, slot.near)) {
           return
         }
-        slot.near = { after: line, before: slot.near.before }
+        slot.near = { after: line, before: slot.near.before, gap: (slot.near.gap ?? 0) + 1 }
         continue
       }
       const { state } = editor
@@ -1113,23 +1113,9 @@ watch(
       }
     })
     for (const { slot, near } of places) {
-      // The nearest block alike, as `findPlace` finds it in a file: after the one it
-      // followed, else before the one it preceded, else at the end.
-      const nearest = (src: string | null, offset: number) => {
-        let best = -1
-        let bestDistance = Infinity
-        for (const [index, block] of blocks.entries()) {
-          const distance = Math.abs(index + offset - (near.gap ?? 0))
-          if (src !== null && block.markdown === src && distance < bestDistance) {
-            best = index
-            bestDistance = distance
-          }
-        }
-        return best
-      }
-      const after = nearest(near.after, 1)
-      const before = after === -1 ? nearest(near.before, 0) : -1
-      slot.pos = after !== -1 ? blocks[after]!.to : before !== -1 ? blocks[before]!.from : doc.content.size
+      // After the block it followed, else before the one it preceded, else at the end.
+      const found = nearestBlock(blocks.map((block) => block.markdown), near)
+      slot.pos = !found ? doc.content.size : found.place === 'after' ? blocks[found.index]!.to : blocks[found.index]!.from
       // The empty paragraph it was to replace is gone with the old text.
       slot.replace = false
     }
@@ -1195,7 +1181,14 @@ onBeforeUnmount(() => {
     const outer = props.images?.outer ?? null
     for (const slot of landing) {
       const { after, before, gap } = placeIn(doc, slot.pos)
-      slot.near = { after: after ?? outer?.after ?? null, before: before ?? outer?.before ?? null, gap: (outer?.gap ?? 0) + (gap ?? 0) }
+      slot.near = {
+        after: after ?? outer?.after ?? null,
+        before: before ?? outer?.before ?? null,
+        gap: (outer?.gap ?? 0) + (gap ?? 0),
+        // Beside a block of its own editor's, that block first: the editor's text is on its
+        // page, a neighbour from around the editor may not be.
+        prefer: after !== null ? 'after' : before !== null ? 'before' : (outer?.prefer ?? 'after'),
+      }
     }
   }
   clearTimeout(washTimer)

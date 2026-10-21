@@ -26,6 +26,11 @@
  *  (docs/web.md § Notes, *A block dragged into the notes lands as blocks*). */
 export const BLOCK_DRAG_TYPE = 'application/x-sightread-blocks'
 
+/** The type a block dragged from an agent answer carries besides `BLOCK_DRAG_TYPE`: the one
+ *  the document lands as a copy, so a drag of its own a reload cut short is never taken for
+ *  one (docs/web.md § The agent panel, *An answer is blocks*). */
+export const ANSWER_DRAG_TYPE = 'application/x-sightread-answer'
+
 /** What a handler claimed a drag event for. */
 export type DragClaim =
   /** A folder is the destination under the pointer, and it is drawn as the target. */
