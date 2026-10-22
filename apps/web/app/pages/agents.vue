@@ -3,7 +3,8 @@
  * Agent (docs/web.md § Pages): every agent runs on the user's own Kano Proxy, so the page
  * has two states. Not connected, it is one control — the connect link, nothing else.
  * Connected, the rail lists the agents as tabs with the Kano Proxy line at its foot, and
- * the data region shows the selected agent's panel (`AgentPanel`) and nothing else.
+ * the data region shows the selected agent's panel (`AgentPanel`) and nothing else. The
+ * `check` agent is no tab: its settings are the parse panel's *Format check*.
  */
 import {
   deleteKano,
@@ -100,10 +101,15 @@ function setAgentSettings(name: string, saved: SavedAgentSettings) {
 
 const promptMaxChars = computed(() => auth.me.value?.limits.prompt_max_chars ?? null)
 
+const CHECK_AGENT = 'check'
+/** The agents that are tabs; the check agent's settings are a section of the parse panel. */
+const tabs = computed(() => agents.value.filter((agent) => agent.name !== CHECK_AGENT))
+const checkAgent = computed(() => agents.value.find((agent) => agent.name === CHECK_AGENT) ?? null)
+
 /** The tab that is open: the first agent until one is picked. */
 const selectedName = ref<string | null>(null)
 const selected = computed(
-  () => agents.value.find((agent) => agent.name === selectedName.value) ?? agents.value[0] ?? null,
+  () => tabs.value.find((agent) => agent.name === selectedName.value) ?? tabs.value[0] ?? null,
 )
 
 function agentTitle(agent: AgentEntry): string {
@@ -113,12 +119,12 @@ function agentTitle(agent: AgentEntry): string {
 /** Arrow keys move between tabs, as a tab list is expected to. */
 function onTabKeydown(event: KeyboardEvent, index: number) {
   const step = event.key === 'ArrowDown' ? 1 : event.key === 'ArrowUp' ? -1 : 0
-  if (!step || agents.value.length === 0) {
+  if (!step || tabs.value.length === 0) {
     return
   }
   event.preventDefault()
-  const nextIndex = (index + step + agents.value.length) % agents.value.length
-  const next = agents.value[nextIndex]
+  const nextIndex = (index + step + tabs.value.length) % tabs.value.length
+  const next = tabs.value[nextIndex]
   if (!next) {
     return
   }
@@ -160,7 +166,7 @@ function onTabKeydown(event: KeyboardEvent, index: number) {
       <UiSkeleton v-else-if="!agentsData" :rows="2" />
       <div v-else class="tabs" role="tablist" :aria-label="t('agents.tabs')" aria-orientation="vertical">
         <button
-          v-for="(agent, index) in agents"
+          v-for="(agent, index) in tabs"
           :key="agent.name"
           type="button"
           role="tab"
@@ -207,6 +213,7 @@ function onTabKeydown(event: KeyboardEvent, index: number) {
         <AgentPanel
           :key="selected.name"
           :agent="selected"
+          :check="checkAgent"
           :prompt-max-chars="promptMaxChars"
           @saved="setAgentSettings"
         />

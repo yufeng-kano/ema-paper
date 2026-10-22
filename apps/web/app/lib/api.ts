@@ -65,10 +65,10 @@ export interface AgentSettings {
   prompt: string | null
   /** The legacy preset selection, which only an API call still makes; the page shows none. */
   prompt_preset_id: number | null
-  /** Reasoning effort; meaningful for the `chat` agent, `medium` when unset. */
+  /** Reasoning effort; meaningful for the `chat` and `check` agents, `medium` when unset. */
   effort: AgentEffort | null
-  /** `chat` only: the reader's instructions, appended after the prompt; null for none
-   *  (docs/chat.md § Instructions). Optional fields so a page served by an older API
+  /** `chat` and `check` only: the reader's instructions, appended after the prompt; null for
+   *  none (docs/chat.md § Instructions). Optional fields so a page served by an older API
    *  still renders. */
   instructions?: string | null
   /** `chat` only: language tags; null follows the reader's locale of each message. */
@@ -81,6 +81,9 @@ export interface AgentSettings {
    *  (docs/parsing.md § Fallback model). */
   fallback_model?: string | null
   auto_fallback?: boolean
+  /** `check` only: whether a Files upload is checked before it opens (docs/parsing.md
+   *  § Format check). */
+  auto_check?: boolean
 }
 
 /**
@@ -685,6 +688,9 @@ export interface LibraryDocument {
   /** A failed parse's pages with no result — what a retry would send; null for any other
    *  (docs/api.md). */
   failed_pages: number | null
+  /** A running parse past its last page, being checked before it opens (docs/parsing.md
+   *  § Format check). Optional so a page served by an older API still renders. */
+  checking?: boolean
 }
 
 /** One page of a parse's selection, as the retry dialog lists it (docs/api.md). */

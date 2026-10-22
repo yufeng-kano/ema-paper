@@ -237,6 +237,9 @@ class AgentSetting(Base):
     auto_fallback: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default=text("false")
     )
+    # The check agent's switch: check every Files upload before it opens (docs/parsing.md
+    # § Format check).
+    auto_check: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
 
     connection: Mapped[ProviderConnection | None] = relationship(
         foreign_keys=[connection_id], lazy="selectin"
@@ -304,6 +307,11 @@ class Job(Base):
     # The model a retry runs the remaining pages on; NULL is `model` (docs/jobs.md
     # § Retrying failed pages). Neither is part of the dedup key.
     retry_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # The format check, snapshotted when the job is queued or retried: NULL `check_model`
+    # is a job with no check (docs/parsing.md § Format check). Not part of the dedup key.
+    check_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    check_effort: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    check_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(16))  # queued | running | succeeded | failed
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     page_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -359,6 +367,9 @@ class Result(Base):
     figures: Mapped[list] = mapped_column(JSON_COLUMN, default=list)
     errors: Mapped[list] = mapped_column(JSON_COLUMN, default=list)
     meta: Mapped[dict] = mapped_column(JSON_COLUMN, default=dict)
+    # The checked copy a library document's doc.md starts from; NULL when the parse was
+    # not checked (docs/parsing.md § Format check).
+    reading_markdown: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
 
 

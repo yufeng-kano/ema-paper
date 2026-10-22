@@ -12,6 +12,7 @@ import contextlib
 import logging
 import re
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -234,6 +235,17 @@ async def find_recent_terminal_job(
     ).scalar_one_or_none()
 
 
+@dataclass(frozen=True)
+class CheckTarget:
+    """The format check a job is queued or retried with, snapshotted on its row: model,
+    effort, and the system prompt with the reader's instructions after it (docs/parsing.md
+    § Format check)."""
+
+    model: str
+    effort: str
+    prompt: str
+
+
 async def enqueue_job(
     db: AsyncSession,
     *,
@@ -255,6 +267,7 @@ async def enqueue_job(
     source_path: str,
     retain_source: bool = False,
     fallback_model: str | None = None,
+    check: CheckTarget | None = None,
 ) -> Job:
     """Create the queued job row. The caller commits — creation and enqueue are one act."""
     job = Job(
@@ -275,6 +288,9 @@ async def enqueue_job(
         prompt=prompt,
         prompt_sha256=prompt_sha256,
         fallback_model=fallback_model,
+        check_model=check.model if check is not None else None,
+        check_effort=check.effort if check is not None else None,
+        check_prompt=check.prompt if check is not None else None,
         status="queued",
         page_count=page_count,
         pages_done=0,
@@ -450,12 +466,18 @@ async def requeue_job(db: AsyncSession, job_id: uuid.UUID, generation: int | Non
 
 
 async def retry_job(
-    db: AsyncSession, job_id: uuid.UUID, *, source_path: str, model: str | None
+    db: AsyncSession,
+    job_id: uuid.UUID,
+    *,
+    source_path: str,
+    model: str | None,
+    check: CheckTarget | None,
 ) -> bool:
     """Put a failed parse back on the queue to run its failed pages, on `model` (None: the
-    job's own), from `source_path` — a copy of its document's original. The caller holds
-    the job's row lock and commits. False when the job is no longer `failed`
-    (docs/jobs.md § Retrying failed pages)."""
+    job's own), from `source_path` — a copy of its document's original — and checked as
+    `check` says, the settings of this moment (None: unchecked). The caller holds the job's
+    row lock and commits. False when the job is no longer `failed` (docs/jobs.md
+    § Retrying failed pages)."""
     retried = (
         await db.execute(
             update(Job)
@@ -467,6 +489,9 @@ async def retry_job(
                 finished_at=None,
                 worker_generation=None,
                 retry_model=model,
+                check_model=check.model if check is not None else None,
+                check_effort=check.effort if check is not None else None,
+                check_prompt=check.prompt if check is not None else None,
                 source_path=source_path,
                 source_deleted_at=None,
             )

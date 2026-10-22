@@ -95,6 +95,11 @@ class Settings(BaseSettings):
     # API process makes at once (docs/api.md § Limits).
     page_preview_long_edge: int = 1200
     page_preview_renders: int = 2
+    # The format check of a Files upload: spots sent to the check agent, calls one check
+    # may make, and the tokens of one answer (docs/parsing.md § Format check).
+    check_spots_max: int = 80
+    check_max_calls: int = 16
+    check_max_output_tokens: int = 16_000
 
     # The chat agent's limits (docs/chat.md).
     max_chat_turns_per_user: int = 4

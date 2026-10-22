@@ -151,6 +151,12 @@ export const PAGE_FAILURE_REASONS: Readonly<Record<string, string>> = {
   'the image could not be decoded': 'image',
 }
 
+/** The reason a failed format check gives in the job's error — `the format check failed
+ *  (<reason>)` (docs/parsing.md § Format check) — or null for any other error. */
+export function checkFailureReason(error: string | null): string | null {
+  return /^the format check failed \((.+)\)$/.exec(error ?? '')?.[1] ?? null
+}
+
 /**
  * Whether the upload endpoint would take this file, judged by the server's own two lists
  * (`GET /api/me` § limits).

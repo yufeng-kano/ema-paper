@@ -1090,3 +1090,85 @@ async def test_the_failed_pages_migration_keeps_every_row_and_falls_back_to_noth
         assert (await db.execute(text("SELECT count(*) FROM job_pages"))).scalar_one() == 2
     _alembic(scratch_url, "upgrade", "head")
     await engine.dispose()
+
+
+FORMAT_CHECK = "6f91eb4561a5"
+
+
+async def test_the_format_check_migration_checks_nothing_that_came_before(scratch_url) -> None:
+    """Existing settings take the check's default (on); a job queued before it runs
+    unchecked, and a result written before it has no reading copy. The downgrade drops
+    only what the upgrade added (docs/database.md § Rules)."""
+    _alembic(scratch_url, "upgrade", RETRY_FAILED_PAGES)
+
+    engine = create_async_engine(scratch_url)
+    queued, done = uuid.uuid4(), uuid.uuid4()
+    async with engine.begin() as db:
+        user_id = (
+            await db.execute(
+                text(
+                    "INSERT INTO users (google_sub, email, created_at) "
+                    "VALUES ('sub', 'c@example.com', now()) RETURNING id"
+                )
+            )
+        ).scalar_one()
+        await db.execute(
+            text("INSERT INTO agent_settings (user_id, agent, model) VALUES (:user, 'parse', 'm')"),
+            {"user": user_id},
+        )
+        for job_id, status in ((queued, "queued"), (done, "succeeded")):
+            await db.execute(
+                text(
+                    "INSERT INTO jobs (id, user_id, agent, kind, filename, media_type, "
+                    "size_bytes, sha256, pages_spec, model, pipeline_version, bbox_format, "
+                    "status, pages_done, prompt_sha256, created_at) VALUES (:id, :user, "
+                    "'parse', 'pdf', 'a.pdf', 'application/pdf', 1, 'h', '', 'm', 1, "
+                    "'yxyx_norm1000', :status, 0, '', now())"
+                ),
+                {"id": job_id, "user": user_id, "status": status},
+            )
+        await db.execute(
+            text(
+                "INSERT INTO results (job_id, markdown, pages, figures, errors, meta, created_at) "
+                "VALUES (:job, '<!-- page: 1 -->\nOne', '[]', '[]', '[]', '{}', now())"
+            ),
+            {"job": done},
+        )
+
+    _alembic(scratch_url, "upgrade", FORMAT_CHECK)
+
+    async with engine.begin() as db:
+        setting = (await db.execute(text("SELECT model, auto_check FROM agent_settings"))).one()
+        assert tuple(setting) == ("m", True)
+        jobs = (
+            await db.execute(
+                text(
+                    "SELECT status, check_model, check_effort, check_prompt FROM jobs "
+                    "ORDER BY status"
+                )
+            )
+        ).all()
+        assert [tuple(row) for row in jobs] == [
+            ("queued", None, None, None),
+            ("succeeded", None, None, None),
+        ]
+        result = (await db.execute(text("SELECT markdown, reading_markdown FROM results"))).one()
+        assert tuple(result) == ("<!-- page: 1 -->\nOne", None)
+
+    _alembic(scratch_url, "downgrade", RETRY_FAILED_PAGES)
+    async with engine.connect() as db:
+        added = (
+            await db.execute(
+                text(
+                    "SELECT table_name || '.' || column_name FROM information_schema.columns "
+                    "WHERE (table_name = 'agent_settings' AND column_name = 'auto_check') "
+                    "OR (table_name = 'jobs' AND column_name IN "
+                    "('check_model', 'check_effort', 'check_prompt')) "
+                    "OR (table_name = 'results' AND column_name = 'reading_markdown')"
+                )
+            )
+        ).all()
+        assert added == []
+        assert (await db.execute(text("SELECT count(*) FROM results"))).scalar_one() == 1
+    _alembic(scratch_url, "upgrade", "head")
+    await engine.dispose()

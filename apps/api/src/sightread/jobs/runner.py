@@ -27,15 +27,16 @@ from pathlib import Path
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from ..agents import get_agent
+from ..agents import CHECK, get_agent
 from ..agents.bbox import convention_for_job, prepare_image
 from ..config import Settings
-from ..db.models import Document, Job, JobPage, Result, UsageLog, utcnow
+from ..db.models import EFFORT_DEFAULT, Document, Job, JobPage, Result, UsageLog, utcnow
 from ..errors import ApiError
 from ..parsing import poppler
 from ..parsing.figures import discard_job_figures, publish_job_figures, save_page_figures
 from ..parsing.images import ImageError, normalize_image
 from ..parsing.markdown import PLACEHOLDER_RE, PageMarkdown, assemble
+from ..upstream.anthropic import CompletedMessage
 from ..upstream.client import (
     Connection,
     EmptyCompletion,
@@ -61,6 +62,7 @@ from ..workspace.documents import (
 from ..workspace.layout import document_relative_dir, user_root
 from ..workspace.locks import backup_shared, workspace_lock
 from . import events
+from .check import CheckFailed, run_check
 from .queue import parse_pages_spec
 
 logger = logging.getLogger(__name__)
@@ -620,6 +622,31 @@ async def _log_usage(
         await db.commit()
 
 
+async def _record_check_usage(
+    sessionmaker: async_sessionmaker[AsyncSession], job: Job, completed: CompletedMessage
+) -> None:
+    """One call of the format check, billed as the `check` agent's under the parse's job
+    and the model it was sent to — logged whatever happened, like a page's calls
+    (docs/parsing.md § Format check)."""
+    usage = completed.usage
+    async with sessionmaker() as db:
+        db.add(
+            UsageLog(
+                user_id=job.user_id,
+                job_id=job.id,
+                agent=CHECK.name,
+                model=job.check_model,
+                prompt_tokens=usage.input_tokens,
+                completion_tokens=usage.output_tokens,
+                cache_read_tokens=usage.cache_read_tokens,
+                cache_write_tokens=usage.cache_write_tokens,
+                cost=usage.cost,
+                cost_source=usage.cost_source,
+            )
+        )
+        await db.commit()
+
+
 async def fail_job(
     sessionmaker: async_sessionmaker[AsyncSession],
     settings: Settings,
@@ -759,6 +786,7 @@ async def _finish_held(
                     figures=result["figures"],
                     errors=result["errors"],
                     meta=result["meta"],
+                    reading_markdown=result.get("reading_markdown"),
                 )
             )
         job.status = status
@@ -1055,6 +1083,60 @@ async def run_job(
             # A count only: how badly the chosen model follows the coordinate contract is
             # worth knowing, what it said about the document is not.
             logger.info("job %s dropped %d unusable figure boxes", job_id, document.dropped_figures)
+
+        # A Files upload is checked before it opens, and a check that fails fails the job
+        # as a failed page does, every page kept (docs/parsing.md § Format check).
+        reading: str | None = None
+        check_meta: dict | None = None
+        if job.check_model:
+            async with sessionmaker() as db:
+                kano = await load_connection(db, settings, job.user_id, None)
+            # The check speaks the Messages API, on Kano Proxy's Anthropic-format route,
+            # whatever upstream the pages went to.
+            check_connection = (
+                None
+                if kano is None
+                else Connection(
+                    ciphertext=kano.ciphertext,
+                    secret_key=kano.secret_key,
+                    base_url=settings.kano_proxy_anthropic_base,
+                    snapshot=kano.snapshot,
+                    builtin=True,
+                    report_cost=True,
+                )
+            )
+
+            async def bill(completed: CompletedMessage) -> None:
+                await _to_the_end(_record_check_usage(sessionmaker, job, completed))
+
+            try:
+                checked = await run_check(
+                    check_connection,
+                    settings,
+                    model=job.check_model,
+                    effort=job.check_effort or EFFORT_DEFAULT,
+                    system=job.check_prompt or CHECK.default_prompt_template,
+                    markdown=document.markdown,
+                    on_usage=bill,
+                )
+            except CheckFailed as exc:
+                checked, reason = None, str(exc)
+            except Exception:
+                logger.exception("job %s format check failed unexpectedly", job_id)
+                checked, reason = None, "internal error"
+            if checked is None:
+                logger.warning("job %s format check failed: %s", job_id, reason)
+                await _finish(
+                    sessionmaker,
+                    job_id,
+                    status="failed",
+                    error=f"the format check failed ({reason})",
+                    settings=settings,
+                    generation=generation,
+                )
+                return
+            reading = checked.markdown
+            check_meta = {"model": job.check_model, "joins": checked.joins, "edits": checked.edits}
         # Set before the commit below, deliberately: a SIGTERM can land after PostgreSQL
         # has durably committed the result but before this coroutine resumes, and a
         # committed result must keep its crops. The trade is the right way round — if the
@@ -1105,7 +1187,9 @@ async def run_job(
                 "pipeline_version": job.pipeline_version,
                 "sha256": job.sha256,
                 "cached": False,
+                **({"check": check_meta} if check_meta is not None else {}),
             },
+            "reading_markdown": reading,
         }
         # Run to its end whatever the worker does: a cancel landing after the commit
         # would otherwise drop the workspace and backup locks under a copy still being

@@ -22,14 +22,25 @@ from typing import Protocol
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..agents import PARSE, AgentDefinition
+from ..agents import CHECK, PARSE, AgentDefinition
+from ..agents import check as check_agent
 from ..auth import upload_tickets
 from ..config import Settings
-from ..db.models import AgentSetting, Job, KanoProxyKey, Result, UploadTicket, User, utcnow
+from ..db.models import (
+    EFFORT_DEFAULT,
+    AgentSetting,
+    Job,
+    KanoProxyKey,
+    Result,
+    UploadTicket,
+    User,
+    utcnow,
+)
 from ..errors import ApiError
 from ..parsing import poppler
 from ..parsing.images import ACCEPTED_IMAGE_TYPES, ImageError, probe_image
 from .queue import (
+    CheckTarget,
     count_running_jobs,
     enqueue_job,
     find_active_job,
@@ -206,6 +217,45 @@ async def resolve_target(
     return Target(agent.name, model, agent.bbox_format, prompt, connection_id, snapshot, fallback)
 
 
+async def resolve_check(
+    db: AsyncSession, settings: Settings, user_id: int, parse_model: str
+) -> CheckTarget | None:
+    """The check a Files upload or a retry takes, from the `check` agent's settings as they
+    are now; None while its switch is off or Kano Proxy is not connected, the one upstream
+    it speaks (docs/parsing.md § Format check)."""
+    row = (
+        await db.execute(
+            select(AgentSetting).where(
+                AgentSetting.user_id == user_id, AgentSetting.agent == CHECK.name
+            )
+        )
+    ).scalar_one_or_none()
+    if row is not None and not row.auto_check:
+        return None
+    if not settings.kano_proxy_configured:
+        return None
+    connected = (
+        await db.execute(select(KanoProxyKey.user_id).where(KanoProxyKey.user_id == user_id))
+    ).first()
+    if connected is None:
+        return None
+    if row is None:
+        return CheckTarget(parse_model, EFFORT_DEFAULT, CHECK.default_prompt_template)
+    # The user's own prompt, else a legacy preset, else the default, as for the parse
+    # agent (docs/agents.md § Enqueue rules).
+    if row.prompt:
+        prompt = row.prompt
+    elif row.prompt_preset is not None:
+        prompt = row.prompt_preset.text
+    else:
+        prompt = CHECK.default_prompt_template
+    return CheckTarget(
+        row.model or parse_model,
+        row.effort or EFFORT_DEFAULT,
+        check_agent.system_prompt(prompt, row.instructions),
+    )
+
+
 async def store_upload(
     chunks: AsyncIterator[bytes],
     destination: Path,
@@ -265,6 +315,7 @@ async def submit_parse(
     ticket: UploadTicket | None = None,
     reuse_in_flight: bool = False,
     retain_source: bool = False,
+    check: bool = False,
 ) -> Submission:
     """Store the document, dedup it and queue the parse. Commits before it returns.
 
@@ -275,6 +326,10 @@ async def submit_parse(
     these exact bytes instead of starting a second one. Only the web library asks for it: a
     browser cannot tell a lost response from a lost request, so its retry would otherwise
     buy the user a second parse of a document they already paid for (docs/jobs.md § Dedup).
+
+    `check` asks for the format check, which only a Files upload takes; the check is no
+    part of the dedup key, so a cached result or a parse already on its way is answered
+    as it is (docs/parsing.md § Format check).
     """
     kind, media_type = resolve_kind(filename, media_type)
     # An upload is always the parse agent's input (docs/agents.md).
@@ -368,6 +423,7 @@ async def submit_parse(
                     await db.commit()
                 return Submission(job=active, upload=stored if retain_source else None)
 
+    check_target = await resolve_check(db, settings, user.id, target.model) if check else None
     job = await enqueue_job(
         db,
         user_id=user.id,
@@ -388,6 +444,7 @@ async def submit_parse(
         source_path=str(stored),
         retain_source=retain_source,
         fallback_model=target.fallback_model,
+        check=check_target,
     )
     if ticket is not None:
         upload_tickets.spend(ticket, job.id)
