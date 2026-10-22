@@ -51,6 +51,36 @@ def test_vision_placeholders_are_renumbered_and_captions_captured() -> None:
     assert lines[index + 1] == "Figure 1: the first chart"
 
 
+def test_a_figure_without_a_caption_claims_nothing_after_it() -> None:
+    # The prompt asks for an empty line after a figure with no caption; the paragraph, the
+    # table or the figure that follows is the next block, as the result viewer reads it.
+    document = assemble(
+        [
+            PageMarkdown(
+                page=1,
+                markdown=(
+                    "![fig](sightread://p1/10,10,200,500)\n\n"
+                    "amount of training. We have performed learning rate sweeps.\n\n"
+                    "![fig](sightread://p1/300,10,400,500)\n"
+                    "| | Random | DINO |\n"
+                    "|---|---|---|\n"
+                    "| ViT-S/16 | 22.0 | 45.9 |\n\n"
+                    "![fig](sightread://p1/500,10,600,500)\n"
+                    "![fig](sightread://p1/700,10,800,500)\n"
+                    "Figure 4: the last one has a caption"
+                ),
+            )
+        ]
+    )
+
+    assert [figure["caption"] for figure in document.figures] == [
+        "",
+        "",
+        "",
+        "Figure 4: the last one has a caption",
+    ]
+
+
 def test_malformed_placeholders_are_dropped_and_counted() -> None:
     document = assemble(
         [
