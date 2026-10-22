@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import en from '../../i18n/locales/en'
 import zhTW from '../../i18n/locales/zh-TW'
-import type { LibraryDocument, LibraryFolder, UploadLimits } from './api'
+import type { DocumentReconvert, LibraryDocument, LibraryFolder, UploadLimits } from './api'
 import {
   PAGE_FAILURE_REASONS,
   acceptsUpload,
@@ -13,6 +13,7 @@ import {
   folderPath,
   isMarkdownUpload,
   isPending,
+  isReconverting,
   keyRange,
   parseProgress,
   renameSelectionEnd,
@@ -152,6 +153,40 @@ describe('parse state', () => {
     expect(parseProgress(document(1, 'a.pdf', null, { pages_done: 3, page_count: 12 }))).toBe(0.25)
     expect(parseProgress(document(1, 'a.pdf', null, { pages_done: 0, page_count: null }))).toBe(0)
     expect(parseProgress(document(1, 'a.pdf', null, { pages_done: 20, page_count: 10 }))).toBe(1)
+  })
+})
+
+describe('re-convert state', () => {
+  function reconvert(overrides: Partial<DocumentReconvert> = {}): DocumentReconvert {
+    return {
+      job_id: 'job-new',
+      status: 'running',
+      model: 'vendor/other',
+      page_count: 8,
+      pages_done: 2,
+      error: null,
+      failed_pages: null,
+      checking: false,
+      created_at: '2026-08-02T00:00:00Z',
+      finished_at: null,
+      ...overrides,
+    }
+  }
+
+  it('polls for a re-convert until its document takes it, never for a failed one', () => {
+    for (const status of ['queued', 'running', 'succeeded'] as const) {
+      expect(isReconverting(document(1, 'a.pdf', null, { reconvert: reconvert({ status }) }))).toBe(true)
+    }
+    expect(isReconverting(document(1, 'a.pdf', null, { reconvert: reconvert({ status: 'failed' }) }))).toBe(false)
+    expect(isReconverting(document(1, 'a.pdf', null, { reconvert: null }))).toBe(false)
+    // An older API sends no field at all.
+    expect(isReconverting(document(1, 'a.pdf'))).toBe(false)
+  })
+
+  it('measures a re-convert by its own pages, not its document\'s', () => {
+    const row = document(1, 'a.pdf', null, { reconvert: reconvert() })
+    expect(parseProgress(row)).toBe(1)
+    expect(parseProgress(row.reconvert!)).toBe(0.25)
   })
 })
 

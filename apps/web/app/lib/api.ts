@@ -696,6 +696,27 @@ export interface LibraryDocument {
   /** A running parse past its last page, being checked before it opens (docs/parsing.md
    *  § Format check). Optional so a page served by an older API still renders. */
   checking?: boolean
+  /** The re-convert queued, running or failed — null when there is none. Optional so a page
+   *  served by an older API still renders. */
+  reconvert?: DocumentReconvert | null
+}
+
+/**
+ * A document's re-convert: a new parse of its original, which the document takes once it
+ * succeeds and until then only points at — the version it has opens as before (docs/jobs.md
+ * § Re-converting a document). The same fields as the row's own parse.
+ */
+export interface DocumentReconvert {
+  job_id: string
+  status: JobStatus
+  model: string | null
+  page_count: number | null
+  pages_done: number | null
+  error: string | null
+  failed_pages: number | null
+  checking: boolean
+  created_at: string
+  finished_at: string | null
 }
 
 /** One page of a parse's selection, as the retry dialog lists it (docs/api.md). */
@@ -1107,6 +1128,18 @@ export function getDocumentPages(id: number): Promise<{ pages: DocumentPage[] }>
  *  them on the job's own (docs/jobs.md § Retrying failed pages). */
 export function retryDocument(id: number, model: string | null): Promise<{ job_id: string; status: JobStatus }> {
   return request('POST', `/api/library/documents/${id}/retry`, { model })
+}
+
+/** A new parse of the document's original on `model` — null runs it on the parse agent's
+ *  own. The document keeps its version until that parse succeeds (docs/jobs.md
+ *  § Re-converting a document). */
+export function reconvertDocument(id: number, model: string | null): Promise<{ job_id: string; status: JobStatus }> {
+  return request('POST', `/api/library/documents/${id}/reconvert`, { model })
+}
+
+/** A failed re-convert let go: the document stops pointing at it; the parse stays in History. */
+export function dismissReconvert(id: number): Promise<void> {
+  return request<undefined>('DELETE', `/api/library/documents/${id}/reconvert`)
 }
 
 // --- workspace: content, notes, revisions (docs/web.md § Editing) -------------------

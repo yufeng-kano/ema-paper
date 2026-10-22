@@ -995,6 +995,101 @@ async def write_notes(
         )
 
 
+# --- re-convert ---------------------------------------------------------------------------
+
+
+def _take_parse(
+    paths: DocumentPaths, *, document_id: int, job: Job, result: Result, max_bytes: int
+) -> None:
+    """`doc.md` and `.meta.json` from a re-convert's parse, as one revision; both as they
+    were when it cannot be recorded (docs/workspace.md § Revisions)."""
+    paths.check()
+    try:
+        before = {
+            path: safe_io.read_bytes(paths.root, path, max_bytes)
+            for path in (paths.doc, paths.meta)
+        }
+    except safe_io.EntryTooLarge as exc:
+        raise ApiError(409, "invalid_request", TOO_LARGE) from exc
+    except (safe_io.UnsafeEntry, OSError) as exc:
+        raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
+    # The baseline materialization writes: the reading copy when the parse was checked.
+    _write_text(
+        paths.root,
+        paths.doc,
+        result.reading_markdown if result.reading_markdown is not None else result.markdown,
+    )
+    _write_text(paths.root, paths.meta, meta_text(document_id, job))
+    try:
+        git.commit_paths(
+            paths.root,
+            git.USER_AUTHOR,
+            f"reconvert {paths.relative}",
+            [paths.doc_relative, paths.relative / META_FILE],
+        )
+    except git.GitError as exc:
+        for path, data in before.items():
+            if data is None:
+                safe_io.remove_file(paths.root, path)
+            else:
+                safe_io.write_bytes(paths.root, path, data)
+        raise ApiError(
+            409, "invalid_request", "The re-convert could not be recorded; the file is as it was"
+        ) from exc
+
+
+async def take_reconvert(
+    db: AsyncSession, settings: Settings, document: Document, *, locked: bool = False
+) -> bool:
+    """The document takes its re-convert once that parse has succeeded (docs/jobs.md
+    § Re-converting a document): its directory as it stands is recorded first, then
+    `doc.md` and `.meta.json` take the new parse as one revision, then the row names the
+    new job and the pointer clears — files before the row, so a commit that fails leaves
+    the pointer standing over files already in place, for the next reader to finish. A
+    document in the Trash keeps its version: only the pointer clears. True when the
+    document's parse changed. `locked`: the caller holds the workspace lock."""
+    document_id, user_id = document.id, document.user_id
+    root = user_root(settings.workspaces_dir, user_id)
+    async with contextlib.nullcontext() if locked else workspace_lock(root):
+        try:
+            # Read again under the lock: a delete, a dismissal and another taker hold it.
+            if await db.get(Document, document_id, populate_existing=True) is None:
+                return False
+            if document.reconvert_job_id is None:
+                return False
+            job = await db.get(Job, document.reconvert_job_id, populate_existing=True)
+            if job is None or job.status != "succeeded":
+                return False
+            if not is_live(document, await user_folders(db, user_id)):
+                document.reconvert_job_id = None
+                await db.commit()
+                return False
+            result = (await db.execute(select(Result).where(Result.job_id == job.id))).scalar_one()
+            # The version it has, recorded, so the revision below is the change from it.
+            paths = await materialize_document(db, settings, document, locked=True)
+            await asyncio.to_thread(
+                _take_parse,
+                paths,
+                document_id=document_id,
+                job=job,
+                result=result,
+                max_bytes=settings.content_max_bytes,
+            )
+            document.job_id = job.id
+            document.reconvert_job_id = None
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+        try:
+            # The new parse's crops and `result.md`, as any materialization writes them;
+            # a copy that fails is finished by the next one.
+            await materialize_document(db, settings, document, locked=True)
+        except Exception:  # noqa: BLE001 - the document took its parse; the copies can wait
+            logger.exception("could not materialize document %d after its re-convert", document_id)
+    return True
+
+
 # --- revisions ----------------------------------------------------------------------------
 
 

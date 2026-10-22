@@ -125,8 +125,16 @@ export function isPending(document: LibraryDocument): boolean {
   return document.status === 'queued' || document.status === 'running'
 }
 
-/** 0..1 of the pages that came back, for the meter on a running row. */
-export function parseProgress(document: LibraryDocument): number {
+/** A re-convert on its way: queued, running, or succeeded and not yet taken by its document
+ *  — what the list polls for. A failed one waits for the reader (docs/jobs.md
+ *  § Re-converting a document). */
+export function isReconverting(document: LibraryDocument): boolean {
+  return !!document.reconvert && document.reconvert.status !== 'failed'
+}
+
+/** 0..1 of the pages that came back, for the meter on a running row — its parse's, or its
+ *  re-convert's. */
+export function parseProgress(document: Pick<LibraryDocument, 'page_count' | 'pages_done'>): number {
   if (!document.page_count || document.pages_done === null) {
     return 0
   }

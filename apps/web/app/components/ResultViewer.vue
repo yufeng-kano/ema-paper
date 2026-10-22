@@ -277,6 +277,9 @@ const props = withDefaults(
     /** A markdown document: no parse result to wait for, its copy is the document
      *  (docs/web.md § Result viewer). */
     markdownDocument?: boolean
+    /** Said under the header while the document is being re-converted: what happens to the
+     *  version open now (docs/web.md § Files). */
+    reconvertNote?: string | null
   }>(),
   {
     error: null,
@@ -287,6 +290,7 @@ const props = withDefaults(
     jobId: null,
     initialBlock: null,
     markdownDocument: false,
+    reconvertNote: null,
   },
 )
 
@@ -4320,6 +4324,7 @@ watch(
              Banner and progress can hold at once — a page can fail while the rest is still
              parsing, and the failure must not silence the live progress. -->
         <div class="doc-notes">
+          <UiBanner v-if="reconvertNote" class="degraded-note">{{ reconvertNote }}</UiBanner>
           <UiBanner v-if="failedPages.length" class="degraded-note" tone="error">
             {{
               t('viewer.degraded', {

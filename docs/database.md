@@ -149,10 +149,14 @@ folders          id PK, user_id FK, parent_id FK folders NULL, name,
                  -- parent_id: the place Put Back returns it to
 documents        id PK, user_id FK, folder_id FK folders NULL, job_id FK jobs NULL,
                  name, trashed_at NULL,           -- as for folders
+                 reconvert_job_id FK jobs NULL,   -- the re-convert queued, running or
+                                                  -- failed (docs/jobs.md § Re-converting
+                                                  -- a document); ON DELETE SET NULL
                  created_at, updated_at
                  UNIQUE (user_id, folder_id, name) WHERE trashed_at IS NULL
                  UNIQUE (user_id, name) WHERE folder_id IS NULL AND trashed_at IS NULL
                  INDEX (user_id, created_at)
+                 INDEX (reconvert_job_id) WHERE reconvert_job_id IS NOT NULL
                  -- one row = one file in the library: a parse result, or (job_id
                  -- NULL) a markdown document, uploaded as .md or written new
                  -- (docs/web.md § Files). folder_id NULL = root
@@ -268,6 +272,7 @@ oauth_grants     id PK, client_id FK, user_id FK, kind code|access|refresh,
 - **The failed pages migration** (`retry failed pages`) added `agent_settings.fallback_model` (NULL) and `auto_fallback` (false), `jobs.fallback_model` and `jobs.retry_model` (NULL) and `job_pages.model` (NULL: the job's model). No row is rewritten: a job already `succeeded` with page errors keeps its result as it was ([parsing.md](./parsing.md) § Vision-only conversion). Its downgrade drops the five columns.
 - **The format check migration** (`format check`) added `agent_settings.auto_check` (true), `jobs.check_model`, `check_effort` and `check_prompt` (NULL: no check) and `results.reading_markdown` (NULL: not checked). No row is rewritten: a job queued before it runs unchecked, and a result written before it has no reading copy. Its downgrade drops the five columns.
 - **The figure check migration** (`figure check`) added `job_pages.figures` (NULL: no check). No row is rewritten: a page kept from before it keeps no statuses, and its figures carry no `check`. Its downgrade drops the column.
+- **The re-convert migration** (`reconvert documents`) added `documents.reconvert_job_id` (NULL: no re-convert) and its partial index. No row is rewritten. Its downgrade drops both: a re-convert still running then finishes as a parse in History that no document takes.
 - **The markdown documents migration** (`markdown documents`) dropped NOT NULL from `documents.job_id` and nothing else: every existing row keeps its job, and no row is rewritten. Its downgrade refuses while any document has no job, naming the count — restoring NOT NULL would otherwise have to delete the reader's markdown documents and their conversations with them. Delete them first, deliberately, if the downgrade is really wanted.
 - **The trash migration** (`library trash`) added `folders.trashed_at` and `documents.trashed_at`, NULL on every existing row — nothing is in the Trash — and narrowed the two name constraints and the two root-level indexes to the rows not in the Trash (`uq_folders_parent_name` and `uq_documents_folder_name` were constraints and became partial unique indexes under the same names). Its downgrade refuses while anything is in the Trash, naming the count: restoring the full constraints would have to pick which of two same-named rows survives. Empty the Trash first, deliberately, if the downgrade is really wanted.
 - **The built-in subagent removal** (`remove three built-in subagents`) deleted every `subagents` row named `verifier`, `reader` or `translation-checker`: the readers' edits of built-ins that left the code, which would otherwise have stayed on as subagents of their own ([chat.md](./chat.md) § Subagents). Its downgrade restores none of them; the built-ins come back with the code they belong to, unedited.

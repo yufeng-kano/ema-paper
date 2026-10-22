@@ -33,6 +33,7 @@ import {
   createFolder,
   deleteDocument,
   deleteFolder,
+  dismissReconvert,
   emptyTrash,
   getDocumentResult,
   getLibrary,
@@ -69,6 +70,7 @@ import {
   folderPath,
   isMarkdownUpload,
   isPending,
+  isReconverting,
   keyRange,
   parseProgress,
   renameSelectionEnd,
@@ -607,7 +609,9 @@ async function drain() {
 
 // --- live progress ---------------------------------------------------------
 
-const anyPending = computed(() => documents.value.some(isPending))
+// A re-convert on its way polls too: its row shows its progress, and its document takes it
+// when it succeeds (docs/web.md § Files).
+const anyPending = computed(() => documents.value.some((row) => isPending(row) || isReconverting(row)))
 let poller: ReturnType<typeof setInterval> | undefined
 
 function stopPolling() {
@@ -636,8 +640,11 @@ onBeforeUnmount(() => {
 // --- the result viewer -----------------------------------------------------
 
 const openDocument = ref<LibraryDocument | null>(null)
-/** The failed parse whose retry dialog is open: opening a failed document opens this. */
+/** The failed parse whose retry dialog is open: opening a failed document opens this. A
+ *  failed re-convert's comes as its document with the re-convert's state (`reconvertRetry`). */
 const retrying = ref<LibraryDocument | null>(null)
+/** The parsed document whose re-convert dialog is open. */
+const reconverting = ref<LibraryDocument | null>(null)
 // Read once: closing the viewer, or opening another document, spends the link.
 watch(
   () => openDocument.value?.id,
@@ -696,13 +703,34 @@ async function showResult(document: LibraryDocument) {
 }
 
 /** The open viewer follows its own row: a parse only opens finished, so there is nothing
- *  more of it to read, but its name and folder can still change. */
-watch(documents, (list) => {
+ *  more of it to read, but its name and folder can still change — and a re-convert that
+ *  lands makes the document another parse, whose result is read again and whose viewer
+ *  starts over on the new version (docs/web.md § Files). */
+watch(documents, (list, previous) => {
+  const before = new Map((previous ?? []).map((row) => [row.id, row.job_id]))
+  for (const row of list) {
+    if (before.has(row.id) && before.get(row.id) !== row.job_id) {
+      results.delete(row.id)
+      resultErrors.delete(row.id)
+    }
+  }
   const open = openDocument.value
   const fresh = open && list.find((row) => row.id === open.id)
   if (fresh) {
     openDocument.value = fresh
+    if (fresh.job_id !== open.job_id) {
+      showNote(t('files.note.reconverted'), false)
+      void fetchResult(fresh)
+    }
   }
+})
+
+/** What the open viewer says while its document is being re-converted. */
+const reconvertNote = computed(() => {
+  const open = openDocument.value
+  return open && isReconverting(open)
+    ? t('files.reconvertingNote', { model: open.reconvert?.model ?? '' })
+    : null
 })
 
 /** The upload that just finished parsing opens itself — its retry, if it failed — unless
@@ -726,10 +754,31 @@ watch(documents, (list) => {
 })
 
 /** Queued again: the row says so at once, and the document opens by itself once every page
- *  has succeeded — or this dialog comes back, if a page fails again. */
+ *  has succeeded — or this dialog comes back, if a page fails again. A failed re-convert's
+ *  document opens already: the re-convert is taken in when it succeeds, and nothing opens. */
 async function onRetried() {
-  autoPreviewFor = retrying.value?.id ?? null
+  const retried = retrying.value
+  autoPreviewFor = retried && retried.reconvert?.status !== 'failed' ? retried.id : null
   retrying.value = null
+  await refresh()
+}
+
+/** A failed re-convert as the retry dialog reads a document: the pages, the error and the
+ *  model are the re-convert's, and so is what the retry sends (docs/api.md). */
+function reconvertRetry(document: LibraryDocument): LibraryDocument {
+  const reconvert = document.reconvert!
+  return {
+    ...document,
+    status: reconvert.status,
+    model: reconvert.model,
+    error: reconvert.error,
+    failed_pages: reconvert.failed_pages,
+  }
+}
+
+/** Started: the row shows the re-convert from the next read on. */
+async function onReconvertStarted() {
+  reconverting.value = null
   await refresh()
 }
 
@@ -1589,6 +1638,20 @@ const menuItems = computed<MenuItem[]>(() => {
                 },
               ]
             : []),
+          // A failed re-convert is retried or let go; a new one replaces it as well.
+          ...(parse?.status === 'succeeded' && parse.reconvert?.status === 'failed'
+            ? [
+                {
+                  key: 'retryReconvert',
+                  label: t(parse.reconvert.failed_pages ? 'files.retryFailed' : 'files.retryWhole'),
+                  icon: 'rotate-ccw' as const,
+                },
+                { key: 'dismissReconvert', label: t('files.dismissReconvert'), icon: 'x' as const },
+              ]
+            : []),
+          ...(parse?.status === 'succeeded' && !isReconverting(parse)
+            ? [{ key: 'reconvert', label: t('files.reconvert'), icon: 'refresh' as const }]
+            : []),
           { key: 'rename', label: t('files.rename'), icon: 'edit' as const, shortcut: label(apple ? 'enter' : 'f2') },
         ]
       : []),
@@ -1629,6 +1692,22 @@ function runMenu(action: string) {
       return items[0] && openEntry(items[0].key)
     case 'rename':
       return items[0] && startRename(items[0].key)
+    case 'reconvert':
+    case 'retryReconvert':
+    case 'dismissReconvert': {
+      const document = items[0] && documents.value.find((row) => row.id === items[0]!.id)
+      if (!document) {
+        return
+      }
+      if (action === 'reconvert') {
+        reconverting.value = document
+      } else if (action === 'retryReconvert') {
+        retrying.value = reconvertRetry(document)
+      } else {
+        return run(() => dismissReconvert(document.id))
+      }
+      return
+    }
     case 'copy':
       return copySelection()
     case 'duplicate':
@@ -2220,9 +2299,35 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
                   </span>
                 </template>
 
-                <!-- A markdown document has no parse: no status, pages or size to report. -->
+                <!-- A markdown document has no parse: no status, pages or size to report. A
+                     re-convert is what a parsed row says while it is on its way or failed:
+                     the version the document has opens all the same. -->
                 <template #cell-status="{ row }">
-                  <span v-if="row.kind === 'file' && row.document.status" class="state-cell">
+                  <span v-if="row.kind === 'file' && row.document.reconvert" class="state-cell">
+                    <UiStatusDot
+                      v-if="row.document.reconvert.status === 'failed'"
+                      tone="danger"
+                      :label="t('files.reconvertFailed')"
+                    />
+                    <template v-else>
+                      <UiStatusDot
+                        :tone="row.document.reconvert.status === 'queued' ? 'neutral' : 'info'"
+                        :label="t(row.document.reconvert.checking ? 'files.checking' : 'files.reconverting')"
+                      />
+                      <UiUsageBar
+                        v-if="row.document.reconvert.status === 'running'"
+                        class="meter"
+                        :share="parseProgress(row.document.reconvert)"
+                        :label="
+                          t('files.progress', {
+                            done: row.document.reconvert.pages_done,
+                            total: row.document.reconvert.page_count ?? 0,
+                          })
+                        "
+                      />
+                    </template>
+                  </span>
+                  <span v-else-if="row.kind === 'file' && row.document.status" class="state-cell">
                     <!-- A failed parse says what a retry would send: its pages without a result;
                          a running one past its last page, that it is being checked. -->
                     <UiStatusDot
@@ -2370,11 +2475,20 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
       @close="retrying = null"
     />
 
-    <!-- Keyed per document so reopening on another file resets scroll and page state.
-         Only a finished parse opens, so `pending` is its one read of the result. -->
+    <ReconvertDialog
+      v-if="reconverting"
+      :key="reconverting.id"
+      :document="reconverting"
+      @started="onReconvertStarted"
+      @close="reconverting = null"
+    />
+
+    <!-- Keyed per document, and per parse: reopening on another file, or a re-convert taken
+         in, resets scroll and page state and reads the copy again. Only a finished parse
+         opens, so `pending` is its one read of the result. -->
     <ResultViewer
       v-if="openDocument"
-      :key="openDocument.id"
+      :key="`${openDocument.id}:${openDocument.job_id}`"
       :title="openDocument.name"
       :error="openDocument.error"
       :result="results.get(openDocument.id) ?? null"
@@ -2385,6 +2499,7 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
       :document-id="openDocument.id"
       :markdown-document="openDocument.kind === 'markdown'"
       :initial-block="linkedBlock?.id === openDocument.id ? linkedBlock.anchor : null"
+      :reconvert-note="reconvertNote"
       @close="openDocument = null"
     />
   </UiScreen>

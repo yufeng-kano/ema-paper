@@ -9,6 +9,7 @@ business logic (docs/project-structure.md).
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
@@ -29,6 +30,7 @@ from ..config import Settings
 from ..db.models import (
     EFFORT_DEFAULT,
     AgentSetting,
+    Document,
     Job,
     KanoProxyKey,
     Result,
@@ -118,6 +120,14 @@ async def base64_chunks(source: str) -> AsyncIterator[bytes]:
             yield base64.b64decode(piece, validate=False)
         except (binascii.Error, ValueError) as exc:
             raise ApiError(400, "invalid_request", "'source' is not valid base64") from exc
+
+
+async def file_chunks(path: Path) -> AsyncIterator[bytes]:
+    """Read a file already on disk in slices, off the event loop: a library document's
+    original, parsed again (docs/jobs.md § Re-converting a document)."""
+    with path.open("rb") as handle:
+        while chunk := await asyncio.to_thread(handle.read, UPLOAD_CHUNK_BYTES):
+            yield chunk
 
 
 def resolve_kind(filename: str, media_type: str) -> tuple[str, str]:
@@ -316,6 +326,7 @@ async def submit_parse(
     reuse_in_flight: bool = False,
     retain_source: bool = False,
     check: bool = False,
+    reconvert: Document | None = None,
 ) -> Submission:
     """Store the document, dedup it and queue the parse. Commits before it returns.
 
@@ -330,6 +341,10 @@ async def submit_parse(
     `check` asks for the format check, which only a Files upload takes; the check is no
     part of the dedup key, so a cached result or a parse already on its way is answered
     as it is (docs/parsing.md § Format check).
+
+    `reconvert` is the library document this parse re-converts, with `force`: it points at
+    the job in the commit that queues it, so no re-convert runs that its document would
+    not take (docs/jobs.md § Re-converting a document).
     """
     kind, media_type = resolve_kind(filename, media_type)
     # An upload is always the parse agent's input (docs/agents.md).
@@ -448,6 +463,8 @@ async def submit_parse(
     )
     if ticket is not None:
         upload_tickets.spend(ticket, job.id)
+    if reconvert is not None:
+        reconvert.reconvert_job_id = job.id
     await db.commit()
     return Submission(job=job)
 

@@ -452,6 +452,12 @@ class Document(Base):
             sqlite_where=text("folder_id IS NULL AND trashed_at IS NULL"),
         ),
         Index("ix_documents_user_created", "user_id", "created_at"),
+        Index(
+            "ix_documents_reconvert_job_id",
+            "reconvert_job_id",
+            postgresql_where=text("reconvert_job_id IS NOT NULL"),
+            sqlite_where=text("reconvert_job_id IS NOT NULL"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -464,6 +470,12 @@ class Document(Base):
     )
     name: Mapped[str] = mapped_column(String(512))
     trashed_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
+    # The re-convert queued, running or failed: a new parse of the document's original that
+    # becomes its parse once it succeeds (docs/jobs.md § Re-converting a document).
+    reconvert_job_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("jobs.id", name="fk_documents_reconvert_job_id_jobs", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
 
