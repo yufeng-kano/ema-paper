@@ -53,14 +53,21 @@ def page_marker(page: int) -> str:
 
 
 def _caption_after(text: str, end: int) -> str:
-    """The caption a placeholder claims: the first non-empty line after its own line."""
-    _, _, remainder = text[end:].partition("\n")
-    for line in remainder.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        return "" if PLACEHOLDER_RE.search(stripped) else stripped
-    return ""
+    """The caption a placeholder claims, read as the result viewer reads it: the line right
+    after its own, unless that line is blank or starts a block of its own. A figure without
+    a caption is followed by an empty line and claims nothing after it (docs/parsing.md
+    § Coordinate contract)."""
+    # joins reads pages through this module, so its grammar is imported where it is used.
+    from .joins import starts_block
+
+    lines = text[end:].split("\n")
+    caption = lines[1].strip() if len(lines) > 1 else ""
+    under = lines[2].strip() if len(lines) > 2 else ""
+    # A page's placeholders are not normalized yet, so one with spaces between its numbers
+    # is a figure that joins' stricter pattern would not see.
+    if PLACEHOLDER_RE.search(caption) or starts_block(caption, under):
+        return ""
+    return caption
 
 
 def assemble(pages: list[PageMarkdown]) -> AssembledDocument:

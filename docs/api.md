@@ -62,7 +62,7 @@ A parse with any failed page is `failed` as a whole ([parsing.md](./parsing.md) 
 }
 ```
 
-`markdown` carries a `<!-- page: N -->` marker line before each page's content ([parsing.md](./parsing.md) § Page markers). Figure placeholders in markdown: `![fig1](sightread://p3/120,60,480,940)` with the caption verbatim on the next line. Cropping is the caller's job (add ~2% margin; denormalize `x_px = x/1000 * page_width_px`).
+`markdown` carries a `<!-- page: N -->` marker line before each page's content ([parsing.md](./parsing.md) § Page markers). Figure placeholders in markdown: `![fig1](sightread://p3/120,60,480,940)` with the caption verbatim on the next line; a figure's `caption` in `figures` is that line, and empty for a figure without one ([parsing.md](./parsing.md) § Coordinate contract). Cropping is the caller's job (add ~2% margin; denormalize `x_px = x/1000 * page_width_px`).
 
 A page's `model` is the model that wrote it: `meta.model` for most, another for a page a fallback or a retry finished ([parsing.md](./parsing.md) § Fallback model); results written before the field carry none. `errors` is empty on every result written since a failed page fails the job; older results can list `{page, reason}` entries for pages they omit.
 

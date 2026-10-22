@@ -113,7 +113,7 @@ def _math_close(line: str) -> str | None:
     return None
 
 
-def _starts_block(line: str, under: str) -> bool:
+def starts_block(line: str, under: str) -> bool:
     """Whether a stripped line starts a block of its own, so a paragraph ends above it.
     `under` is the line below it, which only a table's separator row needs."""
     return (
@@ -162,7 +162,7 @@ def blocks(body: str) -> list[tuple[int, int, str]]:
         elif FIGURE_RE.match(line):
             # Its caption is the next line, unless that line starts a block of its own.
             kind = "figure"
-            if lines[index + 1] and not _starts_block(lines[index + 1], lines[index + 2]):
+            if lines[index + 1] and not starts_block(lines[index + 1], lines[index + 2]):
                 last += 1
         elif CODE_FENCE_RE.match(line):
             # To the next fence line, or to the end of the page.
@@ -194,7 +194,7 @@ def blocks(body: str) -> list[tuple[int, int, str]]:
                 wraps = (
                     raws[last + 1][:1].isspace()
                     and bool(lines[last + 1])
-                    and not _starts_block(lines[last + 1], lines[last + 2])
+                    and not starts_block(lines[last + 1], lines[last + 2])
                 )
                 if not following and not wraps:
                     break
@@ -206,7 +206,7 @@ def blocks(body: str) -> list[tuple[int, int, str]]:
                 last += 1
         else:
             kind = "paragraph"
-            while last + 1 < count and not _starts_block(lines[last + 1], lines[last + 2]):
+            while last + 1 < count and not starts_block(lines[last + 1], lines[last + 2]):
                 last += 1
             # A contents page's rows keep their lines: the viewer shows them as a list of
             # entries, not as prose.
