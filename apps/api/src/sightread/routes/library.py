@@ -1736,17 +1736,20 @@ async def delete_document(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-async def take_pending_reconvert(db: DbSession, settings: AppSettings, row: Document) -> None:
+async def take_pending_reconvert(db: DbSession, settings: AppSettings, row: Document) -> Document:
     """A re-convert that succeeded while its document still points at it — the worker
     stopped between the parse's terminal commit and the swap — taken before the document
     is read; one that cannot be taken now leaves the document as it is (docs/jobs.md
-    § Re-converting a document)."""
+    § Re-converting a document). The document comes back read again: a take that failed
+    rolled the session back, which expires every row the session holds."""
     if row.reconvert_job_id is None:
-        return
+        return row
+    document_id, user_id = row.id, row.user_id
     try:
         await workspace_documents.take_reconvert(db, settings, row)
     except Exception:  # noqa: BLE001 - the document opens as it is; the next read tries again
-        logger.exception("document %d could not take its re-convert", row.id)
+        logger.exception("document %d could not take its re-convert", document_id)
+    return await live_document(db, user_id, document_id)
 
 
 @router.get("/documents/{document_id}/result")
@@ -1754,7 +1757,7 @@ async def document_result(
     document_id: int, user: SessionUser, db: DbSession, settings: AppSettings
 ):
     row = await live_document(db, user.id, document_id)
-    await take_pending_reconvert(db, settings, row)
+    row = await take_pending_reconvert(db, settings, row)
     if row.job_id is None:
         raise ApiError(404, "invalid_request", "A markdown document has no parse result")
     # The job before the result, deliberately: under READ COMMITTED each statement gets its
@@ -2530,7 +2533,7 @@ async def document_content(
     document_id: int, user: SessionUser, db: DbSession, settings: AppSettings
 ):
     row = await live_document(db, user.id, document_id)
-    await take_pending_reconvert(db, settings, row)
+    row = await take_pending_reconvert(db, settings, row)
     content = await workspace_documents.read_content(db, settings, row)
     return {
         "markdown": content.markdown,

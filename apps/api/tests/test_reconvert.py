@@ -370,6 +370,52 @@ async def test_a_swap_whose_commit_fails_leaves_the_files_ahead_for_the_next_tak
 
 
 @respx.mock
+async def test_a_swap_that_cannot_be_written_leaves_the_document_as_it_was_and_readable(
+    library, sessionmaker, documents, monkeypatch
+) -> None:
+    respx.post(KANO_CHAT_URL).mock(side_effect=_upstream())
+    uploaded = await _parsed(library, sessionmaker, documents)
+    before = await _content(library, uploaded["id"])
+    new_job = (await _reconvert(library, uploaded["id"], model=FALLBACK)).json()["job_id"]
+    monkeypatch.setattr("sightread.jobs.runner.take_reconvert", _not_taken)
+    await _drain_queue(library, sessionmaker)
+    monkeypatch.undo()
+
+    # The disk fills between the two files the swap writes.
+    write_text = workspace_documents.safe_io.write_text
+
+    def full_at_meta(root, path, text, **kwargs):
+        if path.name == ".meta.json":
+            raise OSError(28, "No space left on device")
+        write_text(root, path, text, **kwargs)
+
+    monkeypatch.setattr(workspace_documents.safe_io, "write_text", full_at_meta)
+    directory = _directory(library)
+    meta = (directory / ".meta.json").read_text()
+
+    # Each read tries the swap, which rolls back, and answers with the version it has.
+    result = await library.get(f"/api/library/documents/{uploaded['id']}/result")
+    assert result.status_code == 200, result.text
+    assert result.json()["meta"]["job_id"] == uploaded["job_id"]
+    assert (await _content(library, uploaded["id"]))["markdown"] == before["markdown"]
+    assert (directory / "doc.md").read_text() == before["markdown"]
+    assert (directory / ".meta.json").read_text() == meta
+    revisions = (await library.get(f"/api/library/documents/{uploaded['id']}/revisions")).json()[
+        "revisions"
+    ]
+    assert "reconvert files/mixed.pdf" not in [entry["message"] for entry in revisions]
+    row = await _row(library, uploaded["id"])
+    assert (row["job_id"], row["reconvert"]["status"]) == (uploaded["job_id"], "succeeded")
+    monkeypatch.undo()
+
+    # With room again, the next read takes it.
+    assert (await _content(library, uploaded["id"]))["markdown"] == await _baseline(
+        sessionmaker, new_job
+    )
+    assert (await _row(library, uploaded["id"]))["job_id"] == new_job
+
+
+@respx.mock
 async def test_a_figure_from_before_a_reconvert_keeps_its_crop(
     library, sessionmaker, documents
 ) -> None:

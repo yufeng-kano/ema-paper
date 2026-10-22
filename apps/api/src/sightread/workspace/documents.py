@@ -1013,26 +1013,29 @@ def _take_parse(
         raise ApiError(409, "invalid_request", TOO_LARGE) from exc
     except (safe_io.UnsafeEntry, OSError) as exc:
         raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
-    # The baseline materialization writes: the reading copy when the parse was checked.
-    _write_text(
-        paths.root,
-        paths.doc,
-        result.reading_markdown if result.reading_markdown is not None else result.markdown,
-    )
-    _write_text(paths.root, paths.meta, meta_text(document_id, job))
     try:
+        # The baseline materialization writes: the reading copy when the parse was checked.
+        _write_text(
+            paths.root,
+            paths.doc,
+            result.reading_markdown if result.reading_markdown is not None else result.markdown,
+        )
+        _write_text(paths.root, paths.meta, meta_text(document_id, job))
         git.commit_paths(
             paths.root,
             git.USER_AUTHOR,
             f"reconvert {paths.relative}",
             [paths.doc_relative, paths.relative / META_FILE],
         )
-    except git.GitError as exc:
+    except (ApiError, git.GitError) as exc:
+        # Both files as they were, whichever step failed: a parse half taken, with no
+        # revision, is neither version.
         for path, data in before.items():
-            if data is None:
-                safe_io.remove_file(paths.root, path)
-            else:
-                safe_io.write_bytes(paths.root, path, data)
+            with contextlib.suppress(OSError, safe_io.UnsafeEntry):
+                if data is None:
+                    safe_io.remove_file(paths.root, path)
+                else:
+                    safe_io.write_bytes(paths.root, path, data)
         raise ApiError(
             409, "invalid_request", "The re-convert could not be recorded; the file is as it was"
         ) from exc

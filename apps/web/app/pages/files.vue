@@ -657,25 +657,36 @@ watch(
 
 const results = reactive(new Map<number, JobResult>())
 const resultErrors = reactive(new Map<number, string>())
-/** Ids with a result request in flight — a set, since the viewer can be reopened on
- *  another file while the first request is still running. */
-const loadingResults = reactive(new Set<number>())
+/** Ids with a result request in flight, each with the parse it was made for — a map, since
+ *  the viewer can be reopened on another file while the first request is still running. */
+const loadingResults = reactive(new Map<number, string | null>())
 /** The single upload whose result should open itself; `-1` while it has no id yet. */
 let autoPreviewFor: number | null = null
 
-/** One read of the document's result. At most one request per document in flight. */
+/** One read of the document's result. At most one request per document and parse in
+ *  flight: one made before a re-convert was taken in answers nothing, since the read for
+ *  the new parse replaced it (docs/web.md § Files). */
 async function fetchResult(document: LibraryDocument) {
-  if (loadingResults.has(document.id)) {
+  const job = document.job_id
+  if (loadingResults.get(document.id) === job) {
     return
   }
-  loadingResults.add(document.id)
+  loadingResults.set(document.id, job)
   resultErrors.delete(document.id)
   try {
-    results.set(document.id, await getDocumentResult(document.id))
+    const result = await getDocumentResult(document.id)
+    if (loadingResults.get(document.id) === job) {
+      results.set(document.id, result)
+    }
   } catch (error) {
-    resultErrors.set(document.id, await resolve(error))
+    const message = await resolve(error)
+    if (loadingResults.get(document.id) === job) {
+      resultErrors.set(document.id, message)
+    }
   } finally {
-    loadingResults.delete(document.id)
+    if (loadingResults.get(document.id) === job) {
+      loadingResults.delete(document.id)
+    }
   }
 }
 
@@ -710,8 +721,10 @@ watch(documents, (list, previous) => {
   const before = new Map((previous ?? []).map((row) => [row.id, row.job_id]))
   for (const row of list) {
     if (before.has(row.id) && before.get(row.id) !== row.job_id) {
+      // A read still on its way for the old parse answers nothing (`fetchResult`).
       results.delete(row.id)
       resultErrors.delete(row.id)
+      loadingResults.delete(row.id)
     }
   }
   const open = openDocument.value
