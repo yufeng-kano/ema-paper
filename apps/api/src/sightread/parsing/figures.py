@@ -128,6 +128,46 @@ def publish_job_figures(figures_dir: Path, job_id: uuid.UUID, attempt: Path) -> 
 DEFAULT_FIGURES_PER_PAGE = 40
 
 
+def page_boxes(markdown: str, limit: int = DEFAULT_FIGURES_PER_PAGE) -> tuple[list[Bbox], bool]:
+    """The page's distinct usable boxes in reading order, at most `limit` of them, and
+    whether there were more (FIGURES_PER_PAGE_MAX): the boxes a page's crops and its figure
+    check take (docs/parsing.md § Figure check).
+
+    The upstream response body is capped, but a malicious user-defined endpoint could
+    otherwise turn one response into unbounded PNG encodes and durable disk."""
+    boxes: list[Bbox] = []
+    seen: set[Bbox] = set()
+    for match in PLACEHOLDER_RE.finditer(markdown):
+        bbox = clean_bbox(
+            (
+                int(match.group("ymin")),
+                int(match.group("xmin")),
+                int(match.group("ymax")),
+                int(match.group("xmax")),
+            )
+        )
+        if bbox is None or bbox in seen:
+            continue
+        if len(boxes) >= max(0, limit):
+            return boxes, True
+        seen.add(bbox)
+        boxes.append(bbox)
+    return boxes, False
+
+
+def crop_rect(bbox: Bbox, width: int, height: int) -> tuple[int, int, int, int]:
+    """The pixels a box's crop takes on a `width` x `height` render: the box and CROP_MARGIN
+    per side, clamped to the page, as (left, top, right, bottom) with right and bottom
+    exclusive."""
+    y_min, x_min, y_max, x_max = bbox
+    return (
+        max(0, round((x_min - CROP_MARGIN) / BBOX_MAX * width)),
+        max(0, round((y_min - CROP_MARGIN) / BBOX_MAX * height)),
+        min(width, round((x_max + CROP_MARGIN) / BBOX_MAX * width)),
+        min(height, round((y_max + CROP_MARGIN) / BBOX_MAX * height)),
+    )
+
+
 def save_page_figures(
     markdown: str,
     image_path: Path,
@@ -141,29 +181,9 @@ def save_page_figures(
     so the stored name matches the placeholder the result will carry. Returns how many
     crops were written; failures are logged and never raised.
 
-    At most `limit` distinct boxes, in reading order (FIGURES_PER_PAGE_MAX): the upstream
-    response body is capped, but a malicious user-defined endpoint could otherwise turn
-    one response into unbounded PNG encodes and durable disk.
+    At most `limit` distinct boxes, in reading order (`page_boxes`).
     """
-    boxes: list[Bbox] = []
-    seen: set[Bbox] = set()
-    truncated = False
-    for match in PLACEHOLDER_RE.finditer(markdown):
-        bbox = clean_bbox(
-            (
-                int(match.group("ymin")),
-                int(match.group("xmin")),
-                int(match.group("ymax")),
-                int(match.group("xmax")),
-            )
-        )
-        if bbox is None or bbox in seen:
-            continue
-        if len(boxes) >= max(0, limit):
-            truncated = True
-            break
-        seen.add(bbox)
-        boxes.append(bbox)
+    boxes, truncated = page_boxes(markdown, limit)
     if truncated:
         logger.warning("page %d exceeded the per-page figure crop cap (%d)", page, limit)
     if not boxes:
@@ -175,13 +195,10 @@ def save_page_figures(
             width, height = image.size
             job_dir.mkdir(parents=True, exist_ok=True)
             for bbox in boxes:
-                y_min, x_min, y_max, x_max = bbox
-                left = max(0, round((x_min - CROP_MARGIN) / BBOX_MAX * width))
-                top = max(0, round((y_min - CROP_MARGIN) / BBOX_MAX * height))
-                right = min(width, round((x_max + CROP_MARGIN) / BBOX_MAX * width))
-                bottom = min(height, round((y_max + CROP_MARGIN) / BBOX_MAX * height))
+                left, top, right, bottom = crop_rect(bbox, width, height)
                 if right <= left or bottom <= top:
                     continue
+                y_min, x_min, y_max, x_max = bbox
                 destination = job_dir / f"p{page}_{y_min}_{x_min}_{y_max}_{x_max}.png"
                 # Encode to a temporary name and rename: a partial result can point the
                 # viewer at this crop while it is still being written, and a name that

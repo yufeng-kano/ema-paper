@@ -29,13 +29,34 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ..agents import CHECK, get_agent
 from ..agents.bbox import convention_for_job, prepare_image
+from ..agents.parse import FIGURE_CHECK_SINCE_PIPELINE
 from ..config import Settings
 from ..db.models import EFFORT_DEFAULT, Document, Job, JobPage, Result, UsageLog, utcnow
 from ..errors import ApiError
 from ..parsing import poppler
-from ..parsing.figures import discard_job_figures, publish_job_figures, save_page_figures
+from ..parsing.figure_check import (
+    PageInk,
+    check_prompt,
+    lands_on_another,
+    mark_boxes,
+    move_boxes,
+    read_verdicts,
+)
+from ..parsing.figures import (
+    discard_job_figures,
+    page_boxes,
+    publish_job_figures,
+    save_page_figures,
+)
 from ..parsing.images import ImageError, normalize_image
-from ..parsing.markdown import PLACEHOLDER_RE, PageMarkdown, assemble
+from ..parsing.markdown import (
+    ADJUSTED,
+    PLACEHOLDER_RE,
+    UNVERIFIED,
+    VERIFIED,
+    PageMarkdown,
+    assemble,
+)
 from ..upstream.anthropic import CompletedMessage
 from ..upstream.client import (
     Connection,
@@ -46,6 +67,7 @@ from ..upstream.client import (
     RateLimited,
     UpstreamError,
     Usage,
+    ask_about_page,
     load_connection,
     transcribe_page,
 )
@@ -134,16 +156,20 @@ class PageOutcome:
     model: str | None = None
     # Every call the page billed, with the model it went to.
     usage: list[tuple[str, Usage]] = field(default_factory=list)
+    # The figure check's status of each box, keyed "ymin,xmin,ymax,xmax"; None when the
+    # page ran no check (docs/parsing.md § Figure check).
+    figures: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
 class KeptPage:
-    """A page an earlier attempt of the job finished: kept, never transcribed again
-    (docs/jobs.md § Retrying failed pages)."""
+    """A page an earlier attempt of the job finished: kept, never transcribed or checked
+    again (docs/jobs.md § Retrying failed pages)."""
 
     markdown: str
     method: str | None
     model: str | None
+    figures: dict[str, str] | None = None
 
 
 @dataclass
@@ -164,6 +190,8 @@ class RunState:
     generation: int | None = None
     # FIGURES_PER_PAGE_MAX — the crop cap one page may spend (docs/parsing.md).
     figures_per_page: int = 40
+    # FIGURE_CHECK_ROUNDS — the model rounds one page's figure check may take.
+    figure_check_rounds: int = 2
     # Crop threads cannot be cancelled from the event loop, so writing and discarding
     # serialize on this guard; once `figures_discarded` is set, a late crop thread writes
     # nothing and cannot recreate a directory the cleanup just removed.
@@ -196,7 +224,10 @@ def partial_result_payload(job: Job, rows: list[JobPage]) -> dict:
     # bodies itself either way).
     finished = [row for row in rows if not row.error and row.markdown is not None]
     document = assemble(
-        [PageMarkdown(page=row.page_no, markdown=row.markdown or "") for row in finished]
+        [
+            PageMarkdown(page=row.page_no, markdown=row.markdown or "", figures=row.figures)
+            for row in finished
+        ]
     )
     return {
         "markdown": document.markdown,
@@ -357,6 +388,113 @@ async def _transcribe(
     return transcription
 
 
+async def _check_figures(
+    job: Job,
+    state: RunState,
+    connection: Connection,
+    outcome: PageOutcome,
+    image: Path,
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    """Check the transcribed page's figure boxes (docs/parsing.md § Figure check): the rules
+    on every box, then the model that wrote the page, at most `figure_check_rounds` calls,
+    when the rules flag one. Leaves the checked markdown and each box's status on the
+    outcome, or the page's failure when a call failed."""
+    if job.pipeline_version < FIGURE_CHECK_SINCE_PIPELINE:
+        return
+    boxes, _ = page_boxes(outcome.markdown, state.figures_per_page)
+    if not boxes:
+        outcome.figures = {}
+        return
+    # The transcription is billed before the raster work: a cancel landing in it ends the
+    # page before it is recorded, and must not take a call the user's key paid for.
+    await _to_the_end(_log_usage(sessionmaker, job, outcome.usage))
+    outcome.usage.clear()
+    ink = await asyncio.to_thread(PageInk, image)
+    original = boxes
+    boxes, cut = await asyncio.to_thread(ink.push_out, boxes, range(len(boxes)))
+    # Every box of a page the rules flag waits on the model, the ones they found whole too:
+    # a part set apart by white space is what only the model sees.
+    settled: set[int] = set() if cut else set(range(len(boxes)))
+    asking = set(range(len(boxes))) - settled
+    calls = 0
+    model = outcome.model or job.model
+    convention = convention_for_job(model, job.pipeline_version)
+    sent = None
+    try:
+        while asking and calls < max(1, state.figure_check_rounds):
+            if sent is None:
+                sent = await _to_the_end(asyncio.to_thread(prepare_image, image, convention))
+            if calls:
+                # The previous round's call is billed before this one is sent.
+                await _to_the_end(_log_usage(sessionmaker, job, outcome.usage))
+                outcome.usage.clear()
+            marked = sent.path.with_name(f"{sent.path.stem}-check.png")
+            await _to_the_end(asyncio.to_thread(mark_boxes, sent.path, boxes, marked))
+            try:
+                answer = await _guarded_call(
+                    state,
+                    outcome,
+                    model,
+                    functools.partial(
+                        ask_about_page,
+                        connection,
+                        model,
+                        check_prompt(boxes, convention, sent.width_px, sent.height_px),
+                        marked,
+                        max_response_bytes=state.max_response_bytes,
+                    ),
+                )
+            finally:
+                marked.unlink(missing_ok=True)
+            calls += 1
+            if answer is None:
+                return  # the page failed; the outcome says why
+            verdicts = read_verdicts(
+                answer.markdown, len(boxes), convention, sent.width_px, sent.height_px
+            )
+            corrected: set[int] = set()
+            for index in sorted(asking):
+                if index not in verdicts:
+                    continue  # no verdict: not asked again
+                verdict = verdicts[index]
+                if verdict is None:
+                    settled.add(index)
+                elif verdict != boxes[index] and not lands_on_another(
+                    verdict, (box for n, box in enumerate(boxes) if n != index)
+                ):
+                    boxes[index] = verdict
+                    corrected.add(index)
+            asking = corrected
+            if corrected:
+                boxes, _ = await asyncio.to_thread(ink.push_out, boxes, sorted(corrected))
+    finally:
+        if sent is not None:
+            sent.cleanup()
+
+    statuses: dict[str, str] = {}
+    for index, box in enumerate(boxes):
+        if index not in settled:
+            status = UNVERIFIED
+        elif box == original[index]:
+            status = VERIFIED
+        else:
+            status = ADJUSTED
+        statuses[",".join(str(value) for value in box)] = status
+    outcome.markdown = move_boxes(outcome.markdown, dict(zip(original, boxes, strict=True)))
+    outcome.figures = statuses
+    if calls:
+        # Counts only: what the page shows is not logged.
+        logger.info(
+            "job %s page %d figure check: %d boxes, %d calls, %d unverified",
+            state.job_id,
+            outcome.page,
+            len(boxes),
+            calls,
+            sum(1 for status in statuses.values() if status == UNVERIFIED),
+        )
+
+
 async def _process_pdf_page(
     job: Job,
     state: RunState,
@@ -389,10 +527,11 @@ async def _process_pdf_page(
         )
         if transcription is not None:
             outcome.markdown = transcription.markdown
+            await _check_figures(job, state, connection, outcome, image, sessionmaker)
         # Billing before the optional raster work: a SIGTERM landing mid-crop cancels this
         # task, and the calls that already ran must be in `usage_log` first.
         await _record_page(sessionmaker, job, outcome, state.generation)
-        if transcription is not None:
+        if not outcome.error:
             await _save_figures(state, outcome.markdown, image, page_no)
     finally:
         # The rendered page has served its purpose; nothing may outlive the call.
@@ -422,6 +561,7 @@ async def _restore_pdf_page(
         method=kept.method or VISION,
         markdown=kept.markdown,
         model=kept.model or job.model,
+        figures=kept.figures,
     )
     if state.figures_dir is None or not PLACEHOLDER_RE.search(kept.markdown):
         return outcome
@@ -467,9 +607,10 @@ async def _process_image(
         )
         if transcription is not None:
             outcome.markdown = transcription.markdown
+            await _check_figures(job, state, connection, outcome, normalized.path, sessionmaker)
         # Same ordering as the PDF path: the billed call is persisted before crop work.
         await _record_page(sessionmaker, job, outcome, state.generation)
-        if transcription is not None:
+        if not outcome.error:
             await _save_figures(state, outcome.markdown, normalized.path, 1)
     finally:
         normalized.path.unlink(missing_ok=True)
@@ -488,6 +629,7 @@ async def _restore_image(
         method=kept.method or VISION,
         markdown=kept.markdown,
         model=kept.model or job.model,
+        figures=kept.figures,
     )
     try:
         normalized = normalize_image(source, work_dir)
@@ -584,6 +726,7 @@ async def _record_page(
                     # attempt keeps (docs/jobs.md § Progress); none on a failed page.
                     markdown=outcome.markdown if not outcome.error else None,
                     model=outcome.model,
+                    figures=outcome.figures if not outcome.error else None,
                 )
             )
         else:
@@ -970,7 +1113,9 @@ async def run_job(
         # failed pages). A row with markdown is a page that succeeded; a failed one has
         # none, and the requeue or the retry removed those already.
         kept = {
-            row.page_no: KeptPage(markdown=row.markdown, method=row.method, model=row.model)
+            row.page_no: KeptPage(
+                markdown=row.markdown, method=row.method, model=row.model, figures=row.figures
+            )
             for row in (
                 await db.execute(
                     select(JobPage).where(JobPage.job_id == job_id, JobPage.markdown.is_not(None))
@@ -1012,6 +1157,7 @@ async def run_job(
         max_response_bytes=settings.upstream_response_max_bytes,
         figures_dir=figures_root / attempt,
         figures_per_page=settings.figures_per_page_max,
+        figure_check_rounds=settings.figure_check_rounds,
         generation=generation,
     )
 
@@ -1077,7 +1223,10 @@ async def run_job(
             return
 
         document = assemble(
-            [PageMarkdown(page=outcome.page, markdown=outcome.markdown) for outcome in outcomes]
+            [
+                PageMarkdown(page=outcome.page, markdown=outcome.markdown, figures=outcome.figures)
+                for outcome in outcomes
+            ]
         )
         if document.dropped_figures:
             # A count only: how badly the chosen model follows the coordinate contract is
@@ -1188,6 +1337,18 @@ async def run_job(
                 "sha256": job.sha256,
                 "cached": False,
                 **({"check": check_meta} if check_meta is not None else {}),
+                **(
+                    {
+                        "figure_check": {
+                            status: sum(
+                                1 for figure in document.figures if figure.get("check") == status
+                            )
+                            for status in (VERIFIED, ADJUSTED, UNVERIFIED)
+                        }
+                    }
+                    if job.pipeline_version >= FIGURE_CHECK_SINCE_PIPELINE
+                    else {}
+                ),
             },
             "reading_markdown": reading,
         }

@@ -79,9 +79,11 @@ export interface RichOptions {
     rewrite?: (markdown: string) => string
   }
   /** Figures and images drawn as themselves rather than as their source: the address of a
-   *  block's picture, or null for the dashed frame, and the frame's words for each. */
+   *  block's picture, or null for the dashed frame, the note under it, or null, and the
+   *  frame's words for each. */
   figures?: {
     url: (block: Extract<ResultBlock, { kind: 'fig' | 'img' }>) => string | null
+    note: (block: Extract<ResultBlock, { kind: 'fig' | 'img' }>) => string | null
     pending: { figure: string; image: string }
   }
 }
@@ -328,6 +330,14 @@ function rawBlock(options: RichOptions) {
                 dom.append(image)
               } else {
                 dom.append(pictureFrame(pending))
+              }
+              const note = figures.note(picture)
+              if (note) {
+                const element = document.createElement('p')
+                element.className = 'figure-note'
+                element.dataset.chrome = ''
+                element.textContent = note
+                dom.append(element)
               }
               if (picture.caption) {
                 const caption = document.createElement('figcaption')

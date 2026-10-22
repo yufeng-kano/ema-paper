@@ -1491,6 +1491,16 @@ defineExpose({
   font-size: var(--text-xs);
 }
 
+.rich :deep(.rich-figure .figure-note) {
+  display: inline-block;
+  margin: var(--space-2) 0 0;
+  padding: 0 var(--space-2);
+  background: var(--rail-active);
+  color: var(--ink-soft);
+  font-size: var(--text-xs);
+  line-height: 1.6;
+}
+
 .rich :deep(.rich-figure .figure-caption) {
   margin-top: var(--space-2);
   font-size: var(--text-xs);

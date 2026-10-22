@@ -15,7 +15,7 @@ Agents are defined in code (`apps/api/src/sightread/agents/`), never in the data
 | `pipeline_version` | Part of the dedup key; moves when the agent's output for the same input would change (`parse`: `PIPELINE_VERSION`; `chat` and `check` have no cache, and theirs is bookkeeping) |
 | `bbox_format` | The coordinate contract the agent's output declares (`parse`: `yxyx_norm1000`) |
 
-The definition says nothing about *how* the agent calls a model. `parse` makes one vision call per page; `chat` runs a tool loop over the Messages API; `check` runs a short one, inside the parse's own run. The run loop belongs to the agent's runner (`jobs/runner.py` is `parse`'s, `jobs/chat_runner.py` is `chat`'s, `jobs/check.py` is `check`'s, called by `parse`'s), not to the registry. The worker drains two queues: `jobs` for `parse` and `chat_turns` for `chat` ([jobs.md](./jobs.md) § Chat turns); `check` has none of its own.
+The definition says nothing about *how* the agent calls a model. `parse` makes one vision call per page, and one or two more on a page whose figure boxes the rules flag ([parsing.md](./parsing.md) § Figure check); `chat` runs a tool loop over the Messages API; `check` runs a short one, inside the parse's own run. The run loop belongs to the agent's runner (`jobs/runner.py` is `parse`'s, `jobs/chat_runner.py` is `chat`'s, `jobs/check.py` is `check`'s, called by `parse`'s), not to the registry. The worker drains two queues: `jobs` for `parse` and `chat_turns` for `chat` ([jobs.md](./jobs.md) § Chat turns); `check` has none of its own.
 
 ## Per-agent settings
 

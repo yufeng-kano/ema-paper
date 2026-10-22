@@ -120,9 +120,15 @@ job_pages        (job_id FK, page_no) PK, method NULL, status, error NULL,
                                                   -- the page finishes; what the partial
                                                   -- result reads (jobs.md § Progress);
                                                   -- NULL on failed pages
-                 model NULL                       -- the model that wrote the page, or that
+                 model NULL,                      -- the model that wrote the page, or that
                                                   -- failed it last; NULL on rows written
                                                   -- before the column (the job's model)
+                 figures JSONB NULL               -- the figure check's status of each box
+                                                  -- the page's markdown holds, keyed
+                                                  -- "ymin,xmin,ymax,xmax": verified,
+                                                  -- adjusted or unverified; NULL on failed
+                                                  -- pages and pages parsed without the
+                                                  -- check (parsing.md § Figure check)
 results          job_id PK/FK, markdown TEXT, pages JSONB, figures JSONB,
                  errors JSONB, meta JSONB,
                  reading_markdown TEXT NULL,      -- the checked copy a library document's
@@ -261,6 +267,7 @@ oauth_grants     id PK, client_id FK, user_id FK, kind code|access|refresh,
 - **The instructions and memory migration** (`agent instructions and memories`) added `agent_settings.instructions`, `answer_language`, `translate_language` (NULL: none, and the reader's locale as before), `memory_auto` (true) and `memory_paused` (false), `conversations.memory_ids` (NULL: a conversation takes its snapshot at its next turn) and the `memories` table, empty, with its three indexes. No row is rewritten. Its downgrade drops them, the memories with them.
 - **The failed pages migration** (`retry failed pages`) added `agent_settings.fallback_model` (NULL) and `auto_fallback` (false), `jobs.fallback_model` and `jobs.retry_model` (NULL) and `job_pages.model` (NULL: the job's model). No row is rewritten: a job already `succeeded` with page errors keeps its result as it was ([parsing.md](./parsing.md) § Vision-only conversion). Its downgrade drops the five columns.
 - **The format check migration** (`format check`) added `agent_settings.auto_check` (true), `jobs.check_model`, `check_effort` and `check_prompt` (NULL: no check) and `results.reading_markdown` (NULL: not checked). No row is rewritten: a job queued before it runs unchecked, and a result written before it has no reading copy. Its downgrade drops the five columns.
+- **The figure check migration** (`figure check`) added `job_pages.figures` (NULL: no check). No row is rewritten: a page kept from before it keeps no statuses, and its figures carry no `check`. Its downgrade drops the column.
 - **The markdown documents migration** (`markdown documents`) dropped NOT NULL from `documents.job_id` and nothing else: every existing row keeps its job, and no row is rewritten. Its downgrade refuses while any document has no job, naming the count — restoring NOT NULL would otherwise have to delete the reader's markdown documents and their conversations with them. Delete them first, deliberately, if the downgrade is really wanted.
 - **The trash migration** (`library trash`) added `folders.trashed_at` and `documents.trashed_at`, NULL on every existing row — nothing is in the Trash — and narrowed the two name constraints and the two root-level indexes to the rows not in the Trash (`uq_folders_parent_name` and `uq_documents_folder_name` were constraints and became partial unique indexes under the same names). Its downgrade refuses while anything is in the Trash, naming the count: restoring the full constraints would have to pick which of two same-named rows survives. Empty the Trash first, deliberately, if the downgrade is really wanted.
 - **The built-in subagent removal** (`remove three built-in subagents`) deleted every `subagents` row named `verifier`, `reader` or `translation-checker`: the readers' edits of built-ins that left the code, which would otherwise have stayed on as subagents of their own ([chat.md](./chat.md) § Subagents). Its downgrade restores none of them; the built-ins come back with the code they belong to, unedited.

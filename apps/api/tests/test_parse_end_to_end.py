@@ -28,9 +28,11 @@ from tests.test_jobs_queue import postgres_only
 
 MODEL = "vendor/vision-model"
 KANO_KEY = "sk-kano-proxy-test-key"
+# Its figure takes the whole page: no side of its crop can cut anything, so the figure check
+# (docs/parsing.md § Figure check) asks no model, whatever the fixture page holds.
 VISION_MARKDOWN = (
     "## Scanned page\n\n"
-    "![fig](sightread://p9/200,100,600,900)\n"
+    "![fig](sightread://p9/0,0,1000,1000)\n"
     "Figure 2: the photograph\n\n"
     "Body text."
 )
@@ -123,11 +125,12 @@ async def test_parse_a_mixed_pdf_end_to_end(api_client, sessionmaker, documents)
     assert result["figures"][0] == {
         "id": "fig1",
         "page": 1,
-        "bbox": [200, 100, 600, 900],
+        "bbox": [0, 0, 1000, 1000],
         "caption": "Figure 2: the photograph",
+        "check": "verified",
     }
     # The page number in a placeholder is ours, not the model's claim of "p9".
-    assert "![fig2](sightread://p2/200,100,600,900)" in result["markdown"]
+    assert "![fig2](sightread://p2/0,0,1000,1000)" in result["markdown"]
     # Every page's content sits behind its marker.
     for page_no in (1, 2, 3):
         assert f"<!-- page: {page_no} -->" in result["markdown"]
@@ -140,6 +143,7 @@ async def test_parse_a_mixed_pdf_end_to_end(api_client, sessionmaker, documents)
         "pipeline_version": PIPELINE_VERSION,
         "sha256": result["meta"]["sha256"],
         "cached": False,
+        "figure_check": {"verified": 3, "adjusted": 0, "unverified": 0},
     }
     assert len(result["meta"]["sha256"]) == 64
 
@@ -167,7 +171,7 @@ async def test_parse_a_mixed_pdf_end_to_end(api_client, sessionmaker, documents)
     # our page number and the cleaned bbox (docs/parsing.md § Figure crops).
     figures_dir = Path(api_client.app.state.settings.figures_dir) / job_id
     for page_no in (1, 2, 3):
-        assert (figures_dir / f"p{page_no}_200_100_600_900.png").is_file()
+        assert (figures_dir / f"p{page_no}_0_0_1000_1000.png").is_file()
 
 
 @respx.mock
@@ -197,7 +201,7 @@ async def test_parse_an_image(api_client, sessionmaker, documents) -> None:
     ]
     assert result["errors"] == []
     assert result["figures"][0]["page"] == 1
-    assert "![fig1](sightread://p1/200,100,600,900)" in result["markdown"]
+    assert "![fig1](sightread://p1/0,0,1000,1000)" in result["markdown"]
 
     async with sessionmaker() as db:
         job = await db.get(Job, uuid.UUID(job_id))
@@ -205,7 +209,7 @@ async def test_parse_an_image(api_client, sessionmaker, documents) -> None:
     assert not Path(job.source_path).exists()
     # The figure was cropped from the normalized image before it was deleted.
     figures_dir = Path(api_client.app.state.settings.figures_dir) / job_id
-    assert (figures_dir / "p1_200_100_600_900.png").is_file()
+    assert (figures_dir / "p1_0_0_1000_1000.png").is_file()
     # The rendered/normalized copy is gone with the job's work directory.
     assert list(Path(api_client.app.state.settings.upload_dir).iterdir()) == []
 
