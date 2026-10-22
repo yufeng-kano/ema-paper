@@ -79,6 +79,7 @@ from ..workspace.documents import (
     keep_source,
     materialize_document,
     original_of,
+    take_reconvert,
     user_folders,
 )
 from ..workspace.layout import document_relative_dir, user_root
@@ -985,6 +986,28 @@ async def _finish_held(
                         await materialize_document(db, settings, row)
                 except Exception:  # noqa: BLE001 - the parse succeeded; the copy can wait
                     logger.exception("could not materialize document %d", document.id)
+    if settings is not None and status == "succeeded":
+        # A document re-converted onto this parse takes it now (docs/jobs.md
+        # § Re-converting a document). Its pointer landed with the job, so it is read here.
+        async with sessionmaker() as db:
+            pointing = (
+                (
+                    await db.execute(
+                        select(Document.id)
+                        .where(Document.reconvert_job_id == job_id)
+                        .order_by(Document.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for document_id in pointing:
+                try:
+                    row = await db.get(Document, document_id)
+                    if row is not None:
+                        await take_reconvert(db, settings, row)
+                except Exception:  # noqa: BLE001 - the document's next read takes it
+                    logger.exception("document %d could not take its re-convert", document_id)
     return True
 
 

@@ -56,6 +56,7 @@ The page image a vision call already rendered is also where figures are cropped 
 - At most `FIGURES_PER_PAGE_MAX` (default 40) crops per page, in reading order; the excess is logged and skipped. The upstream response body is already capped, but a malicious or malfunctioning user-defined endpoint could otherwise turn one small response into unbounded PNG encodes and durable disk under the shared figures volume.
 - Crop work runs in a thread the event loop cannot cancel, so writing and discarding are serialized under one per-job lock: a failed or interrupted job's cleanup waits out any in-flight crop and marks the job's figures discarded, after which a late crop thread writes nothing — the directory of an abandoned attempt cannot be recreated behind the cleanup.
 - Crops persist with the result (kept indefinitely, like `results`), under `FIGURES_DIR` — outside the upload dir, so the sweeper never touches them. They are served to the signed-in owner by control-plane routes only ([api.md](./api.md)); the data plane still ships coordinates, not image bytes.
+- A library document's figure route reads the crops of the parse the document names. A crop that parse does not hold is looked for among the user's other succeeded parses of the same original (same `sha256`), newest first: after a re-convert ([jobs.md](./jobs.md) § Re-converting a document), a placeholder from before it — in a reverted text, or quoted in the notes — still finds the crop it was made with.
 
 ## Figure check
 

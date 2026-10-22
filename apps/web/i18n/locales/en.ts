@@ -421,11 +421,24 @@ export default {
       inTrash: 'Put it back to open it',
       parsing: 'It opens once every page is done',
       checking: 'It opens once its format is checked',
+      reconverted: 'Re-converted: this is the new version',
     },
     failedPages: '{n} page failed | {n} pages failed',
     checking: 'Checking format',
     retryFailed: 'Retry failed pages…',
     retryWhole: 'Retry…',
+    reconvert: 'Re-convert…',
+    reconverting: 'Re-converting',
+    reconvertFailed: 'Re-convert failed',
+    dismissReconvert: 'Dismiss re-convert',
+    reconvertingNote:
+      'Re-converting on {model}. This version stays until the new one is ready, then is replaced. Edits made meanwhile are replaced too and stay in the document’s revisions.',
+    reconvertDialog: {
+      title: 'Re-convert',
+      model: 'Model',
+      note: 'The original is converted again on this model, with the parse agent’s prompt and the format check, as an upload would be. The version you have stays open until the new one is ready, then is replaced. Edits made meanwhile are replaced too and stay in the document’s revisions; the notes stay.',
+      submit: 'Re-convert',
+    },
     retry: {
       title: 'Retry failed pages',
       titleWhole: 'Retry',
@@ -449,6 +462,10 @@ export default {
       noteCheck:
         'Every page has converted, and none is sent again. The document is checked again, with the format check’s settings on the Agent page, and opens once the check succeeds.',
       noteWhole: 'Every page has converted, and none is sent again. The document opens once the retry succeeds.',
+      noteReconvert:
+        'Only these pages are sent. The rest are kept and not paid for again. The new version replaces the one you have once every page has succeeded.',
+      noteReconvertWhole:
+        'Every page has converted, and none is sent again. The new version replaces the one you have once the retry succeeds.',
       submitOne: 'Retry page {n}',
       submitMany: 'Retry {n} pages',
       submit: 'Retry',

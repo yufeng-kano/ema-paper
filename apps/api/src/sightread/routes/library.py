@@ -54,6 +54,7 @@ from ..jobs.chat_tools import PageUnavailable, original_page_png
 from ..jobs.intake import (
     MULTIPART_ENVELOPE_BYTES,
     capped_stream,
+    file_chunks,
     resolve_check,
     store_upload,
     submit_parse,
@@ -509,15 +510,33 @@ def folder_payload(row: Folder) -> dict:
     }
 
 
-def document_payload(row: Document, job: Job | None, failed_pages: int | None = None) -> dict:
-    """The row the file list draws: the entry, plus the live state of its parse.
+def is_checking(job: Job) -> bool:
+    """A running parse past its last page: its format check is what it waits for
+    (docs/parsing.md § Format check)."""
+    return (
+        job.status == "running"
+        and job.check_model is not None
+        and job.pages_done >= len(parse_pages_spec(job.pages_spec, job.page_count or 1))
+    )
+
+
+def document_payload(
+    row: Document,
+    job: Job | None,
+    failed: dict[uuid.UUID, int] | None = None,
+    reconvert: Job | None = None,
+) -> dict:
+    """The row the file list draws: the entry, plus the live state of its parse and of
+    its re-convert.
 
     Joined rather than fetched per row, so one `GET /api/library` renders every name,
     status and progress bar the page needs (docs/web.md § Files). A markdown document
-    (`job` None) has no parse to report on: every parse field is null. `failed_pages` is
-    what a retry of a failed parse would send, null for any other; `checking` says a
-    running parse is past its last page and being checked (docs/api.md).
+    (`job` None) has no parse to report on: every parse field is null. `failed` holds
+    what a retry of each failed parse would send (`failed_page_counts`); `checking` says
+    a running parse is past its last page and being checked; `reconvert` is the parse
+    the row points at as its re-convert (docs/api.md).
     """
+    failed = failed or {}
     if job is None:
         return {
             "id": row.id,
@@ -535,6 +554,7 @@ def document_payload(row: Document, job: Job | None, failed_pages: int | None = 
             "finished_at": None,
             "failed_pages": None,
             "checking": False,
+            "reconvert": None,
         }
     return {
         "id": row.id,
@@ -550,11 +570,23 @@ def document_payload(row: Document, job: Job | None, failed_pages: int | None = 
         "error": job.error,
         "created_at": row.created_at,
         "finished_at": job.finished_at,
-        "failed_pages": failed_pages,
-        "checking": (
-            job.status == "running"
-            and job.check_model is not None
-            and job.pages_done >= len(parse_pages_spec(job.pages_spec, job.page_count or 1))
+        "failed_pages": failed.get(job.id),
+        "checking": is_checking(job),
+        "reconvert": (
+            None
+            if reconvert is None
+            else {
+                "job_id": str(reconvert.id),
+                "status": reconvert.status,
+                "model": reconvert.model,
+                "page_count": reconvert.page_count,
+                "pages_done": reconvert.pages_done,
+                "error": reconvert.error,
+                "failed_pages": failed.get(reconvert.id),
+                "checking": is_checking(reconvert),
+                "created_at": reconvert.created_at,
+                "finished_at": reconvert.finished_at,
+            }
         ),
     }
 
@@ -589,6 +621,13 @@ async def job_of(db: DbSession, job_id: uuid.UUID) -> Job:
     if job is None:
         raise ApiError(404, "invalid_request", "No such job")
     return job
+
+
+async def read_document_payload(db: DbSession, row: Document) -> dict:
+    """One row's payload, its parse and its re-convert read for it."""
+    job = await job_of(db, row.job_id) if row.job_id is not None else None
+    reconvert = await job_of(db, row.reconvert_job_id) if row.reconvert_job_id is not None else None
+    return document_payload(row, job, await failed_page_counts(db, [job, reconvert]), reconvert)
 
 
 # --- read ---------------------------------------------------------------------------------
@@ -626,7 +665,17 @@ async def read_library(user: SessionUser, db: DbSession):
             .order_by(Document.created_at.desc())
         )
     ).all()
-    failed = await failed_page_counts(db, [job for _, job in documents])
+    # The re-converts the rows point at: a second read only when there is one.
+    pointed = [row.reconvert_job_id for row, _ in documents if row.reconvert_job_id is not None]
+    reconverts = (
+        {
+            job.id: job
+            for job in (await db.execute(select(Job).where(Job.id.in_(pointed)))).scalars()
+        }
+        if pointed
+        else {}
+    )
+    failed = await failed_page_counts(db, [job for _, job in documents] + list(reconverts.values()))
 
     # The live rows are the library; the Trash lists what was trashed itself, never
     # what sits inside a trashed folder (docs/api.md).
@@ -653,7 +702,7 @@ async def read_library(user: SessionUser, db: DbSession):
     return {
         "folders": [folder_payload(row) for row in folders if row.id not in trashed],
         "documents": [
-            document_payload(row, job, failed.get(row.job_id))
+            document_payload(row, job, failed, reconverts.get(row.reconvert_job_id))
             for row, job in documents
             if row.trashed_at is None and row.folder_id not in trashed
         ],
@@ -669,7 +718,7 @@ async def read_library(user: SessionUser, db: DbSession):
             ],
             "documents": [
                 {
-                    **document_payload(row, job, failed.get(row.job_id)),
+                    **document_payload(row, job, failed, reconverts.get(row.reconvert_job_id)),
                     "trashed_at": row.trashed_at,
                     "origin": origin(row.folder_id),
                 }
@@ -1076,9 +1125,7 @@ async def trash_document(document_id: int, user: SessionUser, db: DbSession, set
             trash_entry("document", row.id),
             landed=(Document, row.id),
         )
-    job = await job_of(db, row.job_id) if row.job_id is not None else None
-    failed = await failed_page_counts(db, [job])
-    return {**document_payload(row, job, failed.get(row.job_id)), "trashed_at": row.trashed_at}
+    return {**(await read_document_payload(db, row)), "trashed_at": row.trashed_at}
 
 
 @router.post("/folders/{folder_id}/trash", dependencies=[CsrfGuard])
@@ -1139,8 +1186,7 @@ async def restore_document(
             )
             or row
         )
-    job = await job_of(db, row.job_id) if row.job_id is not None else None
-    return document_payload(row, job, (await failed_page_counts(db, [job])).get(row.job_id))
+    return await read_document_payload(db, row)
 
 
 @router.post("/folders/{folder_id}/restore", dependencies=[CsrfGuard])
@@ -1396,7 +1442,7 @@ async def upload_document(
             what="The upload",
             undo=lambda: workspace_documents.discard_adopted(settings, user_id, row_id, relative),
         )
-    return document_payload(row, job, (await failed_page_counts(db, [job])).get(row.job_id))
+    return await read_document_payload(db, row)
 
 
 async def file_markdown(
@@ -1599,7 +1645,7 @@ async def file_job(body: DocumentFromJob, user: SessionUser, db: DbSession, sett
         )
         if not filed:
             raise ApiError(404, "invalid_request", "The file was deleted while it was being filed")
-    return document_payload(row, job, (await failed_page_counts(db, [job])).get(row.job_id))
+    return await read_document_payload(db, row)
 
 
 @router.put("/documents/{document_id}", dependencies=[CsrfGuard])
@@ -1651,8 +1697,7 @@ async def _update_document_locked(
     after = await document_relative(db, row)
     landed = (Document, row.id, {"folder_id": row.folder_id, "name": row.name})
     await move_then_commit(db, settings, user.id, before, after, landed=landed)
-    job = await job_of(db, row.job_id) if row.job_id is not None else None
-    return document_payload(row, job, (await failed_page_counts(db, [job])).get(row.job_id))
+    return await read_document_payload(db, row)
 
 
 @router.delete(
@@ -1691,9 +1736,28 @@ async def delete_document(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+async def take_pending_reconvert(db: DbSession, settings: AppSettings, row: Document) -> Document:
+    """A re-convert that succeeded while its document still points at it — the worker
+    stopped between the parse's terminal commit and the swap — taken before the document
+    is read; one that cannot be taken now leaves the document as it is (docs/jobs.md
+    § Re-converting a document). The document comes back read again: a take that failed
+    rolled the session back, which expires every row the session holds."""
+    if row.reconvert_job_id is None:
+        return row
+    document_id, user_id = row.id, row.user_id
+    try:
+        await workspace_documents.take_reconvert(db, settings, row)
+    except Exception:  # noqa: BLE001 - the document opens as it is; the next read tries again
+        logger.exception("document %d could not take its re-convert", document_id)
+    return await live_document(db, user_id, document_id)
+
+
 @router.get("/documents/{document_id}/result")
-async def document_result(document_id: int, user: SessionUser, db: DbSession):
+async def document_result(
+    document_id: int, user: SessionUser, db: DbSession, settings: AppSettings
+):
     row = await live_document(db, user.id, document_id)
+    row = await take_pending_reconvert(db, settings, row)
     if row.job_id is None:
         raise ApiError(404, "invalid_request", "A markdown document has no parse result")
     # The job before the result, deliberately: under READ COMMITTED each statement gets its
@@ -1768,7 +1832,32 @@ async def document_figure(
     row = await live_document(db, user.id, document_id)
     if row.job_id is None:
         raise ApiError(404, "invalid_request", "No such figure")
-    return await figure_crop_response(settings, await job_of(db, row.job_id), page, bbox)
+    job = await job_of(db, row.job_id)
+    try:
+        return await figure_crop_response(settings, job, page, bbox)
+    except ApiError:
+        pass  # not this parse's crop
+    # One an earlier parse of the same original made: a placeholder from before a
+    # re-convert, in a reverted text or quoted in the notes (docs/parsing.md § Figure
+    # crops). Newest first.
+    others = (
+        await db.execute(
+            select(Job)
+            .where(
+                Job.user_id == user.id,
+                Job.sha256 == job.sha256,
+                Job.status == "succeeded",
+                Job.id != job.id,
+            )
+            .order_by(Job.finished_at.desc())
+        )
+    ).scalars()
+    for other in others:
+        try:
+            return await figure_crop_response(settings, other, page, bbox)
+        except ApiError:
+            continue
+    raise ApiError(404, "invalid_request", "No crop is stored for this figure")
 
 
 # --- a parse page by page, and the retry of its failed pages --------------------------------
@@ -1777,12 +1866,17 @@ async def document_figure(
 @router.get("/documents/{document_id}/pages")
 async def document_pages(document_id: int, user: SessionUser, db: DbSession):
     """Every page of the parse's selection with its state — what the retry dialog lists
-    (docs/api.md). A page with no row is `pending`: queued, running, or never reached
+    (docs/api.md): the document's parse, or its failed re-convert, since that is what a
+    retry would send. A page with no row is `pending`: queued, running, or never reached
     before a failure that ended the job."""
     row = await live_document(db, user.id, document_id)
     if row.job_id is None:
         raise ApiError(404, "invalid_request", "A markdown document has no pages")
     job = await job_of(db, row.job_id)
+    if job.status != "failed" and row.reconvert_job_id is not None:
+        reconvert = await job_of(db, row.reconvert_job_id)
+        if reconvert.status == "failed":
+            job = reconvert
     rows = {
         page.page_no: page
         for page in (await db.execute(select(JobPage).where(JobPage.job_id == job.id))).scalars()
@@ -1858,12 +1952,13 @@ async def retry_document(
     document_id: int, body: DocumentRetry, user: SessionUser, db: DbSession, settings: AppSettings
 ):
     """Put the failed parse behind the document back on the queue, its succeeded pages
-    kept (docs/jobs.md § Retrying failed pages). Its upload went with the failure, so it
-    runs on a copy of the document's original. Decided under the workspace lock — the
-    original cannot go while it is copied, nor the file to the Trash — and the job's row
-    lock, from `failed` only: two retries cannot both put it back. A commit that raises is
-    read back on a connection of its own, as a filing's is: the copy goes only with a
-    retry that did not land."""
+    kept (docs/jobs.md § Retrying failed pages) — or its failed re-convert, when the
+    document's own parse stands (§ Re-converting a document). Its upload went with the
+    failure, so it runs on a copy of the document's original. Decided under the workspace
+    lock — the original cannot go while it is copied, nor the file to the Trash — and the
+    job's row lock, from `failed` only: two retries cannot both put it back. A commit that
+    raises is read back on a connection of its own, as a filing's is: the copy goes only
+    with a retry that did not land."""
     model = (body.model or "").strip() or None
     root = user_root(settings.workspaces_dir, user.id)
     async with workspace_lock(root):
@@ -1872,6 +1967,9 @@ async def retry_document(
             raise ApiError(404, "invalid_request", "A markdown document has no parse to retry")
         await lock_job(db, row.job_id)
         job = await job_of(db, row.job_id)
+        if job.status != "failed" and row.reconvert_job_id is not None:
+            await lock_job(db, row.reconvert_job_id)
+            job = await job_of(db, row.reconvert_job_id)
         if job.agent != PARSE.name or job.status != "failed":
             raise ApiError(409, "invalid_request", "Only a failed parse can be retried")
         original = workspace_documents.original_of(root, row.id)
@@ -1920,6 +2018,94 @@ async def retry_document(
                 "reload the library before trying again",
             ) from exc
     return {"job_id": str(job.id), "status": "queued"}
+
+
+class DocumentReconvert(BaseModel):
+    """The model the new parse runs on; none is the parse agent's own."""
+
+    model: str | None = Field(default=None, max_length=255)
+
+
+@router.post(
+    "/documents/{document_id}/reconvert",
+    dependencies=[CsrfGuard],
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def reconvert_document(
+    document_id: int,
+    body: DocumentReconvert,
+    user: SessionUser,
+    db: DbSession,
+    settings: AppSettings,
+):
+    """Parse the document's original again, whole, as a Files upload of it would be,
+    never answered from the cache: the cached answer is the one being replaced. The
+    document keeps its version and points at the new parse, which it takes once that
+    succeeds (docs/jobs.md § Re-converting a document). Decided under the workspace
+    lock, which every writer of the pointer holds, so two clicks cannot start two
+    parses; the job and the pointer land in one commit."""
+    model = (body.model or "").strip() or None
+    root = user_root(settings.workspaces_dir, user.id)
+    async with workspace_lock(root):
+        row = await live_document(db, user.id, document_id)
+        if row.job_id is None:
+            raise ApiError(404, "invalid_request", "A markdown document has no parse to re-convert")
+        job = await job_of(db, row.job_id)
+        if job.status != "succeeded":
+            raise ApiError(
+                409,
+                "invalid_request",
+                "Only a parsed document can be re-converted; a failed parse is retried",
+            )
+        # A failed re-convert gives way to the new one; any other is on its way (one that
+        # succeeded is being taken).
+        if (
+            row.reconvert_job_id is not None
+            and (await job_of(db, row.reconvert_job_id)).status != "failed"
+        ):
+            raise ApiError(409, "invalid_request", "The document is already being re-converted")
+        original = workspace_documents.original_of(root, row.id)
+        if original is None:
+            raise ApiError(
+                409,
+                "invalid_request",
+                "This document kept no original to parse again; upload the file again",
+            )
+        submission = await submit_parse(
+            db,
+            settings,
+            user=user,
+            chunks=file_chunks(original),
+            media_type=job.media_type,
+            filename=job.filename,
+            model=model,
+            force=True,
+            check=True,
+            reconvert=row,
+        )
+    return {"job_id": str(submission.job.id), "status": "queued"}
+
+
+@router.delete(
+    "/documents/{document_id}/reconvert",
+    dependencies=[CsrfGuard],
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def dismiss_reconvert(
+    document_id: int, user: SessionUser, db: DbSession, settings: AppSettings
+) -> Response:
+    """Dismiss a failed re-convert: the document stops pointing at it, and the parse
+    stays in History (docs/jobs.md § Re-converting a document). Under the workspace lock,
+    which a retry of it holds too."""
+    async with workspace_lock(user_root(settings.workspaces_dir, user.id)):
+        row = await live_document(db, user.id, document_id)
+        if row.reconvert_job_id is None:
+            raise ApiError(404, "invalid_request", "The document has no re-convert")
+        if (await job_of(db, row.reconvert_job_id)).status != "failed":
+            raise ApiError(409, "invalid_request", "Only a failed re-convert can be dismissed")
+        row.reconvert_job_id = None
+        await db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 # --- images inserted into a document --------------------------------------------------------
@@ -2198,12 +2384,9 @@ async def copy_document(
             folder=False,
             landed=(Document, row.id),
         )
-    if landed is not None:
-        # The commit raised and landed: the request's session rolled back, so the answer
-        # is the row as committed, with its job read again.
-        row = landed
-        job = await job_of(db, row.job_id) if row.job_id is not None else None
-    return document_payload(row, job, (await failed_page_counts(db, [job])).get(row.job_id))
+    # A commit that raised and landed answers with the row as committed: the request's
+    # session rolled back.
+    return await read_document_payload(db, landed or row)
 
 
 @router.post(
@@ -2350,6 +2533,7 @@ async def document_content(
     document_id: int, user: SessionUser, db: DbSession, settings: AppSettings
 ):
     row = await live_document(db, user.id, document_id)
+    row = await take_pending_reconvert(db, settings, row)
     content = await workspace_documents.read_content(db, settings, row)
     return {
         "markdown": content.markdown,

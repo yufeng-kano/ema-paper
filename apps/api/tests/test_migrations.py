@@ -1172,3 +1172,79 @@ async def test_the_format_check_migration_checks_nothing_that_came_before(scratc
         assert (await db.execute(text("SELECT count(*) FROM results"))).scalar_one() == 1
     _alembic(scratch_url, "upgrade", "head")
     await engine.dispose()
+
+
+FIGURE_CHECK = "fe01cb0fe911"
+RECONVERT = "3241469fe768"
+
+
+async def test_the_reconvert_migration_leaves_every_document_on_its_own_parse(
+    scratch_url,
+) -> None:
+    """No existing document has a re-convert; the pointer names only a job, and a job
+    that goes takes only the pointer with it, never the document. The downgrade drops
+    only what the upgrade added (docs/database.md § Rules)."""
+    _alembic(scratch_url, "upgrade", FIGURE_CHECK)
+
+    engine = create_async_engine(scratch_url)
+    parse, reconvert = uuid.uuid4(), uuid.uuid4()
+    async with engine.begin() as db:
+        user_id = (
+            await db.execute(
+                text(
+                    "INSERT INTO users (google_sub, email, created_at) "
+                    "VALUES ('sub', 'r@example.com', now()) RETURNING id"
+                )
+            )
+        ).scalar_one()
+        for job_id in (parse, reconvert):
+            await db.execute(
+                text(
+                    "INSERT INTO jobs (id, user_id, agent, kind, filename, media_type, "
+                    "size_bytes, sha256, pages_spec, model, pipeline_version, bbox_format, "
+                    "status, pages_done, prompt_sha256, created_at) VALUES (:id, :user, "
+                    "'parse', 'pdf', 'a.pdf', 'application/pdf', 1, 'h', '', 'm', 1, "
+                    "'yxyx_norm1000', 'succeeded', 1, '', now())"
+                ),
+                {"id": job_id, "user": user_id},
+            )
+        await db.execute(
+            text(
+                "INSERT INTO documents (user_id, folder_id, job_id, name, created_at, "
+                "updated_at) VALUES (:user, NULL, :job, 'a.pdf', now(), now())"
+            ),
+            {"user": user_id, "job": parse},
+        )
+
+    _alembic(scratch_url, "upgrade", RECONVERT)
+
+    async with engine.begin() as db:
+        row = (await db.execute(text("SELECT job_id, reconvert_job_id FROM documents"))).one()
+        assert tuple(row) == (parse, None)
+    with pytest.raises(IntegrityError):
+        async with engine.begin() as db:
+            await db.execute(
+                text("UPDATE documents SET reconvert_job_id = :job"), {"job": uuid.uuid4()}
+            )
+    async with engine.begin() as db:
+        await db.execute(text("UPDATE documents SET reconvert_job_id = :job"), {"job": reconvert})
+        await db.execute(text("DELETE FROM jobs WHERE id = :job"), {"job": reconvert})
+        row = (await db.execute(text("SELECT job_id, reconvert_job_id FROM documents"))).one()
+        assert tuple(row) == (parse, None)
+
+    _alembic(scratch_url, "downgrade", FIGURE_CHECK)
+    async with engine.connect() as db:
+        added = (
+            await db.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'documents' AND column_name = 'reconvert_job_id' "
+                    "UNION ALL SELECT indexname FROM pg_indexes "
+                    "WHERE indexname = 'ix_documents_reconvert_job_id'"
+                )
+            )
+        ).all()
+        assert added == []
+        assert (await db.execute(text("SELECT count(*) FROM documents"))).scalar_one() == 1
+    _alembic(scratch_url, "upgrade", "head")
+    await engine.dispose()

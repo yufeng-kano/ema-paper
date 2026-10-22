@@ -7,7 +7,9 @@
  * Only the pages without a result go; the ones that succeeded are kept and not paid for
  * again. A parse that failed only its format check has every page: its retry sends none, so
  * the dialog asks for no model and is titled for the whole document. The page opens the
- * document by itself once the retry has every page and its check.
+ * document by itself once the retry has every page and its check. A failed re-convert's
+ * retry — its document carries it as `reconvert` — replaces the version the document has
+ * instead, which opens all along (docs/jobs.md § Re-converting a document).
  */
 import {
   getDocumentPages,
@@ -46,6 +48,8 @@ const busy = ref(false)
 /** Pages whose image could not be drawn — the original gone, a page Poppler refused. */
 const broken = reactive(new Set<number>())
 
+/** A failed re-convert's retry: its success replaces a version that opens already. */
+const replacing = computed(() => props.document.reconvert?.status === 'failed')
 /** Every page of the selection without a result: what a retry sends. */
 const missing = computed(() => (pages.value ?? []).filter((page) => page.status !== 'succeeded'))
 /** Known before the pages load, from the row: a parse with no page missing retries whole. */
@@ -173,10 +177,14 @@ async function retry() {
             </option>
           </UiSelect>
         </UiField>
-        <p class="note">{{ t('files.retry.note') }}</p>
+        <p class="note">{{ t(replacing ? 'files.retry.noteReconvert' : 'files.retry.note') }}</p>
         <UiBanner v-if="modelsError" tone="error">{{ modelsError }}</UiBanner>
       </template>
-      <p v-else class="note">{{ t(checkOn ? 'files.retry.noteCheck' : 'files.retry.noteWhole') }}</p>
+      <p v-else class="note">
+        {{
+          t(replacing ? 'files.retry.noteReconvertWhole' : checkOn ? 'files.retry.noteCheck' : 'files.retry.noteWhole')
+        }}
+      </p>
       <UiBanner v-if="retryError" tone="error">{{ retryError }}</UiBanner>
     </div>
 
