@@ -63,7 +63,11 @@ def _caption_after(text: str, end: int) -> str:
     lines = text[end:].split("\n")
     caption = lines[1].strip() if len(lines) > 1 else ""
     under = lines[2].strip() if len(lines) > 2 else ""
-    return "" if starts_block(caption, under) else caption
+    # A page's placeholders are not normalized yet, so one with spaces between its numbers
+    # is a figure that joins' stricter pattern would not see.
+    if PLACEHOLDER_RE.search(caption) or starts_block(caption, under):
+        return ""
+    return caption
 
 
 def assemble(pages: list[PageMarkdown]) -> AssembledDocument:

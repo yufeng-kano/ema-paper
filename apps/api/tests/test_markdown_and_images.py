@@ -66,8 +66,9 @@ def test_a_figure_without_a_caption_claims_nothing_after_it() -> None:
                     "|---|---|---|\n"
                     "| ViT-S/16 | 22.0 | 45.9 |\n\n"
                     "![fig](sightread://p1/500,10,600,500)\n"
+                    "![fig](sightread://p1/650, 10, 680, 500)\n"
                     "![fig](sightread://p1/700,10,800,500)\n"
-                    "Figure 4: the last one has a caption"
+                    "Figure 5: the last one has a caption"
                 ),
             )
         ]
@@ -77,7 +78,8 @@ def test_a_figure_without_a_caption_claims_nothing_after_it() -> None:
         "",
         "",
         "",
-        "Figure 4: the last one has a caption",
+        "",
+        "Figure 5: the last one has a caption",
     ]
 
 
