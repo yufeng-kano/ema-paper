@@ -352,6 +352,10 @@ class JobPage(Base):
     # The model that wrote the page, or failed it last; NULL on rows predating the column,
     # which the job's own model wrote (docs/parsing.md § Fallback model).
     model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # The figure check's status of each box the page's markdown holds, keyed
+    # "ymin,xmin,ymax,xmax"; NULL on failed pages and pages parsed without the check
+    # (docs/parsing.md § Figure check).
+    figures: Mapped[dict | None] = mapped_column(JSON_COLUMN, nullable=True)
 
 
 class Result(Base):

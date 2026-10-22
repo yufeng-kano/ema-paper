@@ -145,7 +145,7 @@ async def test_a_retry_sends_only_the_failed_pages_and_keeps_the_rest(
     assert result["markdown"].count("<!-- page:") == 3
     # The kept pages were cropped again from their stored markdown, beside the new one.
     for page_no in (1, 2, 3):
-        assert (figures / f"p{page_no}_200_100_600_900.png").is_file()
+        assert (figures / f"p{page_no}_0_0_1000_1000.png").is_file()
     # The copy the retry ran on went with its terminal state; the original stays.
     assert list(Path(library.app.state.settings.upload_dir).iterdir()) == []
     async with sessionmaker() as db:
@@ -298,7 +298,7 @@ async def test_a_page_already_transcribed_is_not_sent_again(
     assert result["markdown"].count("Body text.") == 3
     figures = Path(library.app.state.settings.figures_dir) / uploaded["job_id"]
     for page_no in (1, 2, 3):
-        assert (figures / f"p{page_no}_200_100_600_900.png").is_file()
+        assert (figures / f"p{page_no}_0_0_1000_1000.png").is_file()
 
 
 # --- the fallback model ---------------------------------------------------------------------

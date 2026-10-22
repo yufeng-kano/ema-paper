@@ -625,6 +625,9 @@ export interface ResultFigure {
   page: number
   bbox: [number, number, number, number]
   caption: string | null
+  /** What the figure check made of the box (docs/api.md). Absent on results parsed before
+   *  it (`pipeline_version` below 10). */
+  check?: 'verified' | 'adjusted' | 'unverified'
 }
 
 export interface ResultPageError {
@@ -643,6 +646,8 @@ export interface ResultMeta {
   pipeline_version: number
   sha256: string
   cached: boolean
+  /** The figure check's statuses, counted. Absent on results parsed before it. */
+  figure_check?: { verified: number; adjusted: number; unverified: number }
   /** True on a running job's snapshot — never cache one (docs/api.md § Partial results). */
   partial?: boolean
   page_count?: number | null

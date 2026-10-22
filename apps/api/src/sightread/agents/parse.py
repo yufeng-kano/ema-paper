@@ -16,8 +16,13 @@ BBOX_FORMAT_YXYX = "yxyx_norm1000"
 # Part of the dedup cache key; bump when the pipeline changes results (docs/jobs.md).
 # 6: the coordinate paragraph follows the model's family; 7: code fences kept; 8: a page
 # the model stopped (blocked, cut off) fails rather than passing as the page; 9: the box
-# encloses the whole figure, and a caption is only the line right after its placeholder.
-PIPELINE_VERSION = 9
+# encloses the whole figure, and a caption is only the line right after its placeholder;
+# 10: every page's boxes are checked, and each figure carries the check's status.
+PIPELINE_VERSION = 10
+
+# A job queued under an earlier version runs without the figure check: its result answers
+# a dedup key that promised none (docs/parsing.md § Figure check).
+FIGURE_CHECK_SINCE_PIPELINE = 10
 
 # What the template substitutes per page (upstream/client.py): the chips the Agent page's
 # prompt dialog inserts (docs/web.md).
@@ -43,4 +48,27 @@ annotations. A figure made of several panels is one figure with one placeholder,
 each panel has a caption of its own. The box must exclude the figure's caption and any
 surrounding body text: the caption is the text on the next line, never part of the box.
 Emit no other Markdown images.
+"""
+
+# The figure check's question about a transcribed page whose boxes the rules flagged
+# (docs/parsing.md § Figure check). The page image carries every box's crop as a numbered
+# rectangle; `{box_format}` says what a rectangle's four integers are in the model's own
+# convention and `{boxes}` lists each rectangle in it. Part of the pipeline, not a setting.
+FIGURE_CHECK_PROMPT = """This page image has a numbered rectangle drawn around each figure of
+the page. Check every rectangle.
+
+A rectangle is right when it encloses its whole figure: every panel, and everything drawn as
+part of it — axes, tick labels, axis titles, legends, colour bars, panel titles and labels,
+and annotations — and nothing else: not the figure's caption, not the surrounding body text,
+not another figure. Each rectangle stays on its own figure, or on its own part of a figure
+drawn as several rectangles: never merge two rectangles into one box.
+
+Each rectangle's box, as {box_format}:
+{boxes}
+
+Answer with JSON only, one entry per rectangle, in this shape, where a, b, c and d stand for
+the four integers of a corrected box:
+{"figures": [{"n": 1, "ok": true}, {"n": 2, "ok": false, "box": [a, b, c, d]}]}
+"ok" is true when the rectangle is right. When it is not, "box" is the corrected box for the
+same figure, in the same form as the boxes above.
 """

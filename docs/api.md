@@ -48,7 +48,7 @@ A parse with any failed page is `failed` as a whole ([parsing.md](./parsing.md) 
 {
   "markdown": "…",
   "pages":   [ { "page": 1, "width_pt": 612, "height_pt": 792, "method": "vision", "model": "provider/model", "error": null } ],
-  "figures": [ { "id": "fig1", "page": 3, "bbox": [120, 60, 480, 940], "caption": "Figure 1: …" } ],
+  "figures": [ { "id": "fig1", "page": 3, "bbox": [120, 60, 480, 940], "caption": "Figure 1: …", "check": "verified" } ],
   "errors":  [],
   "meta": {
     "job_id": "…",
@@ -57,12 +57,15 @@ A parse with any failed page is `failed` as a whole ([parsing.md](./parsing.md) 
     "bbox_format": "yxyx_norm1000",
     "pipeline_version": 2,
     "sha256": "…",
-    "cached": false
+    "cached": false,
+    "figure_check": { "verified": 1, "adjusted": 0, "unverified": 0 }
   }
 }
 ```
 
 `markdown` carries a `<!-- page: N -->` marker line before each page's content ([parsing.md](./parsing.md) § Page markers). Figure placeholders in markdown: `![fig1](sightread://p3/120,60,480,940)` with the caption verbatim on the next line; a figure's `caption` in `figures` is that line, and empty for a figure without one ([parsing.md](./parsing.md) § Coordinate contract). Cropping is the caller's job (add ~2% margin; denormalize `x_px = x/1000 * page_width_px`).
+
+A figure's `check` is what the figure check made of its box ([parsing.md](./parsing.md) § Figure check): `verified`, `adjusted` (the box was moved to take in what it cut off, then confirmed) or `unverified` (the check could not confirm the box: crop it with a wider margin, or look at it). `meta.figure_check` counts the three. Results parsed before the check (`pipeline_version` below 10) carry neither.
 
 A page's `model` is the model that wrote it: `meta.model` for most, another for a page a fallback or a retry finished ([parsing.md](./parsing.md) § Fallback model); results written before the field carry none. `errors` is empty on every result written since a failed page fails the job; older results can list `{page, reason}` entries for pages they omit.
 
@@ -177,7 +180,8 @@ While a job is still `queued` or `running`, the two control-plane result routes 
 - `CHAT_INSTRUCTIONS_MAX_CHARS` = 8000 — the chat agent's instructions; `CHAT_MEMORY_MAX_CHARS` = 500 one memory, `CHAT_MEMORIES_MAX` = 200 a user's memories, `CHAT_MEMORY_BLOCK_MAX_CHARS` = 12000 the memories one conversation loads; `CHAT_SECTIONS_PER_MESSAGE` = 4 whole sections added to one message, `CHAT_SECTION_HEADING_MAX_CHARS` = 512 the heading of one ([chat.md](./chat.md) § Instructions, § Memory, § What a user message carries).
 - `CHAT_ATTACHMENT_MAX_BYTES` = 20971520 (20 MiB) per attached file, `CHAT_ATTACHMENTS_PER_MESSAGE` = 8, `CHAT_ATTACHMENT_TEXT_MAX_CHARS` = 100000 of a PDF's or text file's text, `CHAT_ATTACHMENT_IMAGE_LONG_EDGE` = 1568 px, `CHAT_ATTACHMENTS_PENDING_MAX` = 32 of a user's attachments waiting for a message at once, `CHAT_ATTACHMENT_CACHE_SECONDS` = 31536000 (a year) that the browser may cache an attached image, `CHAT_ATTACHMENT_PDF_TIMEOUT_SECONDS` = 60 for a PDF's text, `UPLOAD_MAX_AGE_SECONDS` = 86400 (a day) before the sweeper takes an upload entry, an unsent attachment's included; `CHAT_SKILLS_MAX` = 64 and `CHAT_SUBAGENTS_MAX` = 32 of a user's own; `CHAT_SUBAGENT_MAX_TOOL_CALLS` = 1000 per subagent run ([chat.md](./chat.md)).
 - `DOCUMENT_IMAGE_MAX_BYTES` = 20971520 (20 MiB) per image inserted into a document, kept at a long edge of `DOCUMENT_IMAGE_LONG_EDGE` = 2400 px ([workspace.md](./workspace.md) § Inserted images).
-- `FIGURES_PER_PAGE_MAX` = 40 — cap on stored figure crops per page ([parsing.md](./parsing.md) § Figure crops).
+- `FIGURES_PER_PAGE_MAX` = 40 — cap on stored figure crops per page, and on the boxes a page's figure check reads ([parsing.md](./parsing.md) § Figure crops).
+- `FIGURE_CHECK_ROUNDS` = 2 — model rounds one page's figure check may take, one call each; at least 1 ([parsing.md](./parsing.md) § Figure check).
 - `PAGE_PREVIEW_LONG_EDGE` = 1200 px — a page preview's long edge; `PAGE_PREVIEW_RENDERS` = 2 previews made at once per API process.
 - `CHECK_SPOTS_MAX` = 80 spots sent to the check agent, `CHECK_MAX_CALLS` = 16 calls one check may make, `CHECK_MAX_OUTPUT_TOKENS` = 16000 per answer ([parsing.md](./parsing.md) § Format check).
 - Request bodies are capped at six times `CONTENT_MAX_BYTES` plus 64 KiB — the worst case of JSON escaping, where a one-byte control character becomes a six-byte `\uXXXX` and an emoji's four bytes a twelve-byte surrogate pair, so no document under the content cap is refused for its encoding — (**413** past it, by declared length or as the bytes arrive) on every route but the four that stream an upload to disk under a cap of their own (`POST /v1/parse` and `POST /api/library/documents` under `UPLOAD_MAX_BYTES` — a markdown file then under `CONTENT_MAX_BYTES` —, `POST /api/attachments` under `CHAT_ATTACHMENT_MAX_BYTES`, `POST /api/library/images` under `DOCUMENT_IMAGE_MAX_BYTES`); a multipart label on any other route buys no exemption.

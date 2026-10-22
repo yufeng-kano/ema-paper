@@ -3705,11 +3705,24 @@ const parseFacts = computed<MenuFact[]>(() => {
   if (!result) {
     return []
   }
-  return [
+  const facts: MenuFact[] = [
     { label: t('viewer.fact.model'), value: result.meta.model, mono: true },
     { label: t('viewer.fact.pages'), value: String(result.pages.length) },
     { label: t('viewer.fact.bbox'), value: result.meta.bbox_format, mono: true },
   ]
+  // The figure check, once the result's figures went through one: how many passed it, or
+  // how many of them are unverified (docs/web.md § Result viewer).
+  const check = result.meta.figure_check
+  const total = check ? check.verified + check.adjusted + check.unverified : 0
+  if (check && total > 0) {
+    facts.push({
+      label: t('viewer.fact.figureCheck'),
+      value: check.unverified
+        ? t('viewer.fact.figuresUnverified', { count: check.unverified, n: total })
+        : t('viewer.fact.figuresPassed', { n: total }, total),
+    })
+  }
+  return facts
 })
 
 /** The two views, as a pair of choices: the JSON view is the contract a developer checks
@@ -3783,9 +3796,30 @@ function onFigureError(block: ResultBlock) {
   }
 }
 
-/** What the editors draw a figure or an image with: the same addresses, and the frame's words. */
+/** The figures the figure check could not confirm, by the page and bbox their placeholders
+ *  carry, so a figure moved to another page keeps its note (docs/web.md § Result viewer). */
+const unverifiedFigures = computed(() => {
+  const keys = new Set<string>()
+  for (const figure of props.result?.figures ?? []) {
+    if (figure.check === 'unverified') {
+      keys.add(`${figure.page}/${figure.bbox.join(',')}`)
+    }
+  }
+  return keys
+})
+
+/** The note under a figure the figure check could not confirm, or null. */
+function figureNote(block: ResultBlock): string | null {
+  return block.kind === 'fig' && unverifiedFigures.value.has(`${block.page}/${block.bbox.join(',')}`)
+    ? t('viewer.figureUnverified')
+    : null
+}
+
+/** What the editors draw a figure or an image with: the same addresses and notes, and the
+ *  frame's words. */
 const editorFigures = computed<RichOptions['figures']>(() => ({
   url: figureUrl,
+  note: figureNote,
   pending: { figure: t('viewer.figurePending'), image: t('viewer.imagePending') },
 }))
 
@@ -4465,6 +4499,7 @@ watch(
                         <MdBlock
                           :block="{ ...block, caption: null }"
                           :figure-url="figureUrl(block)"
+                          :figure-note="figureNote(block)"
                           @figure-error="onFigureError(block)"
                         />
                         <RichEditor
@@ -4498,6 +4533,7 @@ watch(
                       v-else
                       :block="block"
                       :figure-url="figureUrl(block)"
+                      :figure-note="figureNote(block)"
                       @figure-error="onFigureError(block)"
                     />
                     <!-- What a collapsed section hides, named for what pressing it does. -->

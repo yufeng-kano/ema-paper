@@ -582,3 +582,18 @@ async def transcribe_page(
     text, usage = await _chat_with_image(connection, model, prompt, image, max_response_bytes)
     markdown = bbox.canonicalize(_unwrap_answer(text), convention, width_px, height_px)
     return PageTranscription(markdown=markdown, usage=usage)
+
+
+async def ask_about_page(
+    connection: Connection,
+    model: str,
+    prompt: str,
+    image: Path,
+    *,
+    max_response_bytes: int = DEFAULT_RESPONSE_MAX_BYTES,
+) -> PageTranscription:
+    """One more question about a page image, the figure check's (docs/parsing.md § Figure
+    check), on the same wire as its transcription. The answer's text comes back as it is,
+    in the shape a transcription has, so the runner's failure policy reads both alike."""
+    text, usage = await _chat_with_image(connection, model, prompt, image, max_response_bytes)
+    return PageTranscription(markdown=text, usage=usage)

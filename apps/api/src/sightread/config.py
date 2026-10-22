@@ -67,6 +67,9 @@ class Settings(BaseSettings):
     # Cap on crops per page: a malicious user-defined upstream must not turn one response
     # into unbounded PNG encodes and durable disk (docs/parsing.md § Figure crops).
     figures_per_page_max: int = 40
+    # Model rounds one page's figure check may take, one call each; at least 1
+    # (docs/parsing.md § Figure check).
+    figure_check_rounds: int = 2
     # Cap on a user's custom system prompt (docs/api.md § Limits).
     system_prompt_max_chars: int = 8000
     # Cap on any upstream response body — a user-controlled endpoint must not be able to

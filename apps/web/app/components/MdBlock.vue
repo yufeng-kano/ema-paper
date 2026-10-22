@@ -14,6 +14,8 @@
  * own page — the one its placeholder names — whatever page the block now sits in, since a
  * move can carry it across a page marker. An image the reader inserted is drawn the same way,
  * its address the caller's too (the document's images route), and copies back as its line.
+ * `figureNote` is the caller's too: the note under a figure the figure check could not
+ * confirm, drawn as chrome (`data-chrome`), so copy and find pass over it.
  *
  * A quote draws its inner blocks through this same component, one level deep: what the
  * parser reads inside a quote never holds another quote or a figure.
@@ -27,6 +29,7 @@ import type { CiteResolver, ResultBlock } from '~/lib/markdown'
 const props = defineProps<{
   block: ResultBlock
   figureUrl?: string | null
+  figureNote?: string | null
   cite?: CiteResolver
 }>()
 
@@ -133,6 +136,7 @@ const figureSource = computed(() => {
       <UiIcon name="scan-text" />
       <span>{{ t('viewer.figurePending') }}</span>
     </div>
+    <p v-if="figureNote" class="figure-note" data-chrome>{{ figureNote }}</p>
     <!-- Only the caption the page carried: the generated `figN` name and the bbox are how
          a crop is addressed, not something a reader was asked to read. -->
     <figcaption v-if="block.caption" class="figure-caption">
@@ -227,6 +231,18 @@ const figureSource = computed(() => {
 .figure-frame :deep(svg) {
   width: 22px;
   height: 22px;
+}
+
+/* A label on the picture, not the document's text: filled rather than outlined, so it
+   reads as a tag and not as a button, and set apart from the faint caption under it. */
+.figure-note {
+  display: inline-block;
+  margin: var(--space-2) 0 0;
+  padding: 0 var(--space-2);
+  background: var(--rail-active);
+  color: var(--ink-soft);
+  font-size: var(--text-xs);
+  line-height: 1.6;
 }
 
 /* Prose now that the coordinates have gone from beside it: it wraps to as many lines as

@@ -13,6 +13,12 @@ from dataclasses import dataclass
 
 BBOX_MAX = 1000
 
+# What the figure check made of a figure's box: a figure's `check` in a result
+# (docs/parsing.md § Figure check).
+VERIFIED = "verified"
+ADJUSTED = "adjusted"
+UNVERIFIED = "unverified"
+
 # A placeholder as emitted by the model or by us: ![anything](sightread://p3/10,20,30,40).
 PLACEHOLDER_RE = re.compile(
     r"!\[(?P<alt>[^\]\n]*)\]\(\s*sightread://p(?P<page>\d+)/"
@@ -24,6 +30,9 @@ PLACEHOLDER_RE = re.compile(
 class PageMarkdown:
     page: int
     markdown: str
+    # The figure check's status of each box, keyed "ymin,xmin,ymax,xmax"; None for a page
+    # parsed without the check, whose figures then carry no `check`.
+    figures: dict[str, str] | None = None
 
 
 @dataclass
@@ -96,14 +105,18 @@ def assemble(pages: list[PageMarkdown]) -> AssembledDocument:
             figure_id = f"fig{len(figures) + 1}"
             # The page number is ours: a model that mislabels the page must not corrupt
             # the coordinate contract.
-            figures.append(
-                {
-                    "id": figure_id,
-                    "page": page.page,
-                    "bbox": list(bbox),
-                    "caption": _caption_after(page.markdown, match.end()),
-                }
-            )
+            figure = {
+                "id": figure_id,
+                "page": page.page,
+                "bbox": list(bbox),
+                "caption": _caption_after(page.markdown, match.end()),
+            }
+            if page.figures is not None:
+                # A box the check holds no status for is past the per-page cap: it has no
+                # crop, and nothing confirmed it.
+                key = ",".join(str(value) for value in bbox)
+                figure["check"] = page.figures.get(key, UNVERIFIED)
+            figures.append(figure)
             parts.append(placeholder(figure_id, page.page, bbox))
         parts.append(page.markdown[cursor:])
 

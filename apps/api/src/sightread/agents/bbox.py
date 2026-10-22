@@ -58,6 +58,20 @@ class BboxConvention:
             f"top-left corner of this page image."
         )
 
+    def box_format(self, width_px: int, height_px: int) -> str:
+        """What one box's four integers are, as the figure check's prompt names them
+        (docs/parsing.md § Figure check)."""
+        if self.pixel:
+            return (
+                f"[x1, y1, x2, y2], integer pixel coordinates in this image, which is "
+                f"{width_px} pixels wide and {height_px} pixels tall: the top-left and "
+                f"bottom-right corners of the box, origin at the top-left corner of the image"
+            )
+        return (
+            f"[ymin, xmin, ymax, xmax], integers normalized to 0-{BBOX_MAX}: origin at the "
+            f"top-left corner of the image"
+        )
+
 
 GEMINI = BboxConvention(family="gemini", format=CANONICAL_FORMAT)
 CLAUDE = BboxConvention(family="claude", format=PIXEL_FORMAT)
@@ -176,6 +190,38 @@ def prepare_image(image: Path, convention: BboxConvention) -> PreparedImage:
 # --- back into the stored contract -----------------------------------------------------------
 
 
+def to_canonical(
+    values: tuple[int, int, int, int], convention: BboxConvention, width_px: int, height_px: int
+) -> tuple[int, int, int, int]:
+    """One box as the model was asked for it, in `yxyx_norm1000`. Clamping and rejection
+    stay with `clean_bbox`, downstream."""
+    if not convention.pixel or width_px <= 0 or height_px <= 0:
+        return values
+    x1, y1, x2, y2 = values
+    return (
+        round(y1 / height_px * BBOX_MAX),
+        round(x1 / width_px * BBOX_MAX),
+        round(y2 / height_px * BBOX_MAX),
+        round(x2 / width_px * BBOX_MAX),
+    )
+
+
+def from_canonical(
+    box: tuple[int, int, int, int], convention: BboxConvention, width_px: int, height_px: int
+) -> tuple[int, int, int, int]:
+    """A stored box in the convention the model is asked for: what the figure check lists
+    beside the rectangles it draws."""
+    if not convention.pixel:
+        return box
+    y_min, x_min, y_max, x_max = box
+    return (
+        round(x_min / BBOX_MAX * width_px),
+        round(y_min / BBOX_MAX * height_px),
+        round(x_max / BBOX_MAX * width_px),
+        round(y_max / BBOX_MAX * height_px),
+    )
+
+
 def canonicalize(markdown: str, convention: BboxConvention, width_px: int, height_px: int) -> str:
     """Rewrite every placeholder from the convention the model was asked for into
     `yxyx_norm1000`. Clamping and rejection stay with `clean_bbox`, downstream."""
@@ -185,11 +231,12 @@ def canonicalize(markdown: str, convention: BboxConvention, width_px: int, heigh
     def rewrite(match) -> str:
         # The pattern names its groups for the stored order; a pixel answer fills them in
         # the order it was asked for: x1, y1, x2, y2.
-        x1, y1, x2, y2 = (int(match.group(name)) for name in ("ymin", "xmin", "ymax", "xmax"))
-        y_min = round(y1 / height_px * BBOX_MAX)
-        x_min = round(x1 / width_px * BBOX_MAX)
-        y_max = round(y2 / height_px * BBOX_MAX)
-        x_max = round(x2 / width_px * BBOX_MAX)
+        y_min, x_min, y_max, x_max = to_canonical(
+            tuple(int(match.group(name)) for name in ("ymin", "xmin", "ymax", "xmax")),
+            convention,
+            width_px,
+            height_px,
+        )
         return (
             f"![{match.group('alt')}](sightread://p{match.group('page')}/"
             f"{y_min},{x_min},{y_max},{x_max})"
