@@ -4,12 +4,13 @@ idempotent settlement, the chat overdraft, the 402s, and what the payloads show.
 from __future__ import annotations
 
 import asyncio
+import uuid
 from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
 import respx
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from sightread.billing import ledger
 from sightread.config import Settings
@@ -24,7 +25,7 @@ from sightread.db.models import (
     User,
 )
 from sightread.jobs import chat_runner
-from sightread.jobs.queue import claim_next_turn
+from sightread.jobs.queue import claim_next_turn, fail_turn
 from tests.conftest import CSRF_HEADERS, TEST_MODEL_PRICES
 from tests.test_chat import MESSAGES_URL, _seed_document, assistant_turn
 from tests.test_library import _read, _ready_to_parse, _upload
@@ -62,9 +63,16 @@ async def _period(sessionmaker, user_id: int) -> CreditPeriod:
 async def test_two_parses_racing_for_the_last_credits(sessionmaker) -> None:
     settings = settings_with(free_credits_per_period=3)
     user_id = await _user(sessionmaker)
-    async with sessionmaker() as db:
-        job_ids = []
-        for _ in range(2):
+    started = asyncio.Barrier(2)
+
+    async def charge() -> None:
+        # The order `submit_parse` takes (docs/jobs.md § Credits): the user's row lock,
+        # then the job, then its reservation, in one transaction. The two transactions
+        # hold their lock requests at the same time; locking after the insert would
+        # deadlock them on the share lock the insert's foreign key already holds.
+        async with sessionmaker() as db:
+            await started.wait()
+            await db.execute(select(User.id).where(User.id == user_id).with_for_update())
             job = Job(
                 user_id=user_id,
                 agent="parse",
@@ -81,25 +89,21 @@ async def test_two_parses_racing_for_the_last_credits(sessionmaker) -> None:
             )
             db.add(job)
             await db.flush()
-            job_ids.append(job.id)
-        await db.commit()
-
-    async def charge(job_id):
-        async with sessionmaker() as db:
-            await db.execute(select(User.id).where(User.id == user_id).with_for_update())
             await ledger.reserve(
-                db, settings, user_id=user_id, kind=ledger.PARSE, amount=2, job_id=job_id
+                db, settings, user_id=user_id, kind=ledger.PARSE, amount=2, job_id=job.id
             )
             await db.commit()
 
-    outcomes = await asyncio.gather(*(charge(job_id) for job_id in job_ids), return_exceptions=True)
+    outcomes = await asyncio.gather(charge(), charge(), return_exceptions=True)
     refused = [outcome for outcome in outcomes if isinstance(outcome, ledger.InsufficientCredits)]
     assert len(refused) == 1, outcomes
     assert (refused[0].need, refused[0].remaining) == (2, 1)
     assert (await _period(sessionmaker, user_id)).spent == 2
     async with sessionmaker() as db:
         entries = (await db.execute(select(CreditEntry))).scalars().all()
-    assert [entry.state for entry in entries] == ["reserved"]
+        jobs = (await db.execute(select(Job.id))).scalars().all()
+    # The refused job was never queued: its transaction rolled back whole.
+    assert [entry.state for entry in entries] == ["reserved"] and len(jobs) == 1
 
 
 async def test_settlement_is_idempotent_and_a_release_restores_the_balance(sessionmaker) -> None:
@@ -351,14 +355,16 @@ async def test_a_send_without_the_minimum_balance_is_refused(make_client, tmp_pa
 
 
 @respx.mock
+@pytest.mark.parametrize("granted", [1, 6])
 async def test_a_turn_that_runs_out_of_credits_ends_with_its_answer_kept(
-    make_client, tmp_path
+    make_client, tmp_path, granted: int
 ) -> None:
-    # One credit granted; each stubbed call carries 510 tokens at US$1 per million, which
-    # at US$0.0001 a credit is 6 credits: the first call overdraws the period.
+    # Each stubbed call carries 510 tokens at US$1 per million, which at US$0.0001 a
+    # credit is 6 credits: the first call overdraws a period of one credit, and spends a
+    # period of six to exactly zero — the turn ends either way, before another call.
     client = make_client(
         workspaces_dir=str(tmp_path / "workspaces"),
-        free_credits_per_period=1,
+        free_credits_per_period=granted,
         credit_usd="0.0001",
     )
     await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
@@ -415,5 +421,73 @@ async def test_a_turn_that_runs_out_of_credits_ends_with_its_answer_kept(
         for block in message["content"]
     )
     billing = (await client.get("/api/billing")).json()
-    assert (billing["period"]["spent"], billing["period"]["remaining"]) == (6, -5)
-    assert (await client.get("/api/me")).json()["credits_remaining"] == -5
+    assert (billing["period"]["spent"], billing["period"]["remaining"]) == (6, granted - 6)
+    assert (await client.get("/api/me")).json()["credits_remaining"] == granted - 6
+
+
+async def _running_turn(sessionmaker, settings: Settings, user_id: int) -> tuple[int, uuid.UUID]:
+    """A conversation with one running turn and its reserved chat entry."""
+    async with sessionmaker() as db:
+        document = Document(user_id=user_id, name="d.md")
+        db.add(document)
+        await db.flush()
+        conversation = Conversation(user_id=user_id, document_id=document.id, session="s")
+        db.add(conversation)
+        await db.flush()
+        turn = ChatTurn(
+            user_id=user_id, conversation_id=conversation.id, message_id=1, status="running"
+        )
+        db.add(turn)
+        await db.flush()
+        await ledger.reserve(
+            db, settings, user_id=user_id, kind=ledger.CHAT, amount=0, turn_id=turn.id, minimum=1
+        )
+        db.add(
+            UsageLog(
+                user_id=user_id,
+                turn_id=turn.id,
+                agent="chat",
+                model="m",
+                prompt_tokens=1000,
+                completion_tokens=1000,
+                cost_source="unknown",
+            )
+        )
+        await db.flush()
+        await ledger.settle_chat(db, settings, turn.id)
+        await db.commit()
+        return conversation.id, turn.id
+
+
+async def test_a_turn_the_worker_fails_closes_its_entry(sessionmaker) -> None:
+    """docs/billing.md § A chat turn: `fail_turn` — a shutdown, a restart, an escaped
+    error — settles what the turn was charged, as the runner's own finish does."""
+    settings = settings_with(free_credits_per_period=10, credit_usd="0.001")
+    user_id = await _user(sessionmaker)
+    _, turn_id = await _running_turn(sessionmaker, settings, user_id)
+    async with sessionmaker() as db:
+        assert await ledger.credits_by_turn(db, [turn_id]) == {turn_id: None}
+        await fail_turn(db, turn_id, "worker restarted")
+    async with sessionmaker() as db:
+        turn = await db.get(ChatTurn, turn_id)
+        assert (turn.status, turn.error) == ("failed", "worker restarted")
+        # Two credits' worth of tokens, consumed; shown as the turn's cost from now on.
+        assert await ledger.credits_by_turn(db, [turn_id]) == {turn_id: 2}
+    assert (await _period(sessionmaker, user_id)).spent == 2
+
+
+async def test_a_deleted_conversation_leaves_its_entries_in_the_ledger(sessionmaker) -> None:
+    """docs/billing.md § The ledger: the record outlives the thread it was charged for;
+    the period's `spent` and the entries keep agreeing."""
+    settings = settings_with(free_credits_per_period=10, credit_usd="0.001")
+    user_id = await _user(sessionmaker)
+    conversation_id, turn_id = await _running_turn(sessionmaker, settings, user_id)
+    async with sessionmaker() as db:
+        await ledger.close_chat(db, turn_id)
+        await db.execute(delete(Conversation).where(Conversation.id == conversation_id))
+        await db.commit()
+    async with sessionmaker() as db:
+        assert await db.get(ChatTurn, turn_id) is None
+        [entry] = (await db.execute(select(CreditEntry))).scalars().all()
+    assert (entry.kind, entry.state, entry.amount, entry.turn_id) == ("chat", "consumed", 2, None)
+    assert (await _period(sessionmaker, user_id)).spent == 2

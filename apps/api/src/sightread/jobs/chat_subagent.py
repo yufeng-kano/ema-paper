@@ -160,7 +160,7 @@ async def _run_one_guarded(
     """A tool that raises answers an error result, as the turn's own do."""
     try:
         return await _run_one(ctx, definition, block, malformed)
-    except (asyncio.CancelledError, chat_runner.TurnCancelled):
+    except (asyncio.CancelledError, chat_runner.TurnCancelled, chat_runner.TurnOutOfCredits):
         raise
     except Exception:  # noqa: BLE001 - any failure is this tool's, never the run's
         logger.exception("a subagent's %s failed in turn %s", block.get("name"), ctx.turn.id)
@@ -320,6 +320,9 @@ async def run_subagent(
     while True:
         if await chat_runner._cancelled(ctx):
             raise chat_runner.TurnCancelled()
+        if ctx.credits_exhausted:
+            # Another call of the turn spent the balance meanwhile: no call on it.
+            raise chat_runner.TurnOutOfCredits()
         body = {
             "model": model,
             "max_tokens": ctx.settings.chat_max_output_tokens,

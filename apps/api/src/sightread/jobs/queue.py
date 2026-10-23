@@ -20,6 +20,7 @@ from sqlalchemy import LargeBinary, Text, bindparam, cast, delete, func, select,
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 
 from ..agents import get_agent
+from ..billing import ledger
 from ..config import Settings
 from ..db.models import (
     WORKER_GENERATION_SEQ,
@@ -794,6 +795,9 @@ async def fail_turn(db: AsyncSession, turn_id: uuid.UUID, error: str) -> None:
         turn.status = "failed"
         turn.error = error
     turn.finished_at = utcnow()
+    # Charged for what ran: the entry closes with the turn whichever path ends it
+    # (docs/billing.md § A chat turn).
+    await ledger.close_chat(db, turn.id)
     await chat_events.append(
         db,
         turn.conversation_id,

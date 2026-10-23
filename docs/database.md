@@ -287,16 +287,18 @@ credit_periods   (user_id FK, period_start) PK, period_end, plan_id NULL,
                  -- = Free
 credit_entries   id PK, user_id FK, period_start,
                  kind parse|chat, state reserved|consumed|released,
-                 amount INT, job_id FK jobs NULL UNIQUE, turn_id FK chat_turns NULL UNIQUE,
+                 amount INT, job_id FK jobs NULL UNIQUE,
+                 turn_id FK chat_turns ON DELETE SET NULL, NULL UNIQUE,
                  model NULL, created_at, settled_at NULL
                  INDEX (user_id, created_at)
                  CHECK (amount >= 0), CHECK ((kind = 'parse') = (job_id IS NOT NULL)),
-                 CHECK ((kind = 'chat') = (turn_id IS NOT NULL))
+                 CHECK (kind = 'chat' OR turn_id IS NULL)
                  -- what a parse or a turn cost (billing.md § The ledger): one entry per
                  -- job, reserved at enqueue and settled at the terminal state; one per
                  -- turn, its amount raised as the turn runs. ON DELETE CASCADE from the
-                 -- job and the turn: a parse or a conversation deleted with its user
-                 -- goes with the user; neither is deleted otherwise
+                 -- job, which is only deleted with its user; a conversation the reader
+                 -- deletes takes its turns and leaves their entries with turn_id NULL,
+                 -- so the balance and its record keep agreeing
 ```
 
 ## Rules
@@ -309,6 +311,7 @@ credit_entries   id PK, user_id FK, period_start,
 - **The failed pages migration** (`retry failed pages`) added `agent_settings.fallback_model` (NULL) and `auto_fallback` (false), `jobs.fallback_model` and `jobs.retry_model` (NULL) and `job_pages.model` (NULL: the job's model). No row is rewritten: a job already `succeeded` with page errors keeps its result as it was ([parsing.md](./parsing.md) § Vision-only conversion). Its downgrade drops the five columns.
 - **The format check migration** (`format check`) added `agent_settings.auto_check` (true), `jobs.check_model`, `check_effort` and `check_prompt` (NULL: no check) and `results.reading_markdown` (NULL: not checked). No row is rewritten: a job queued before it runs unchecked, and a result written before it has no reading copy. Its downgrade drops the five columns.
 - **The figure check migration** (`figure check`) added `job_pages.figures` (NULL: no check). No row is rewritten: a page kept from before it keeps no statuses, and its figures carry no `check`. Its downgrade drops the column.
+- **The ledger migration** (`credit entries outlive turns`) changed `credit_entries.turn_id` from `ON DELETE CASCADE` to `ON DELETE SET NULL` and replaced the check that a chat entry has a turn with one that a parse entry has none: a conversation deleted by its reader takes its turns and leaves their entries behind, still counted in the period and in `/api/billing/entries`. No row is rewritten. Its downgrade restores the cascade and refuses while any chat entry has no turn, naming the count — those entries would otherwise have to be deleted from the billing record.
 - **The re-convert migration** (`reconvert documents`) added `documents.reconvert_job_id` (NULL: no re-convert) and its partial index. No row is rewritten. Its downgrade drops both: a re-convert still running then finishes as a parse in History that no document takes.
 - **The markdown documents migration** (`markdown documents`) dropped NOT NULL from `documents.job_id` and nothing else: every existing row keeps its job, and no row is rewritten. Its downgrade refuses while any document has no job, naming the count — restoring NOT NULL would otherwise have to delete the reader's markdown documents and their conversations with them. Delete them first, deliberately, if the downgrade is really wanted.
 - **The trash migration** (`library trash`) added `folders.trashed_at` and `documents.trashed_at`, NULL on every existing row — nothing is in the Trash — and narrowed the two name constraints and the two root-level indexes to the rows not in the Trash (`uq_folders_parent_name` and `uq_documents_folder_name` were constraints and became partial unique indexes under the same names). Its downgrade refuses while anything is in the Trash, naming the count: restoring the full constraints would have to pick which of two same-named rows survives. Empty the Trash first, deliberately, if the downgrade is really wanted.

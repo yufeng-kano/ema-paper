@@ -61,7 +61,7 @@ Only a library document whose own parse succeeded, with an original kept and no 
 
 ## Credits
 
-A parse is charged in credits when it is queued and settled when it ends: the reservation is written in the commit that creates the job, consumed by `succeeded`, released by `failed`, and a dedup hit or an in-flight reuse costs nothing ([billing.md](./billing.md) § A parse). The worker settles in the same commit that writes the terminal state, idempotently, so a requeue that raced a finish cannot charge twice.
+A parse is charged in credits when it is queued and settled when it ends: the reservation is written in the commit that creates the job, consumed by `succeeded`, released by `failed`, and a dedup hit or an in-flight reuse costs nothing ([billing.md](./billing.md) § A parse). The worker settles in the same commit that writes the terminal state, idempotently, so a requeue that raced a finish cannot charge twice. The user's row is locked before the job is inserted, not after: the insert's foreign-key check already holds a share lock on that row, and two uploads taking the exclusive lock after it would deadlock instead of queueing one behind the other. A chat turn's entry is closed by whichever path finishes the turn, the runner's own or `fail_turn` ([billing.md](./billing.md) § A chat turn).
 
 ## Dedup cache
 

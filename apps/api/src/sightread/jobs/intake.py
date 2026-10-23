@@ -441,6 +441,11 @@ async def submit_parse(
                 return Submission(job=active, upload=stored if retain_source else None)
 
     check_target = await resolve_check(db, settings, user.id, target.model) if check else None
+    # The user's row lock that every charge takes (docs/billing.md § A parse), before the
+    # job is inserted: the insert's foreign-key check holds a share lock on this row, and
+    # two uploads taking the exclusive lock after it would deadlock (docs/jobs.md
+    # § Credits).
+    await db.execute(select(User.id).where(User.id == user.id).with_for_update())
     job = await enqueue_job(
         db,
         user_id=user.id,
@@ -463,10 +468,8 @@ async def submit_parse(
         fallback_model=target.fallback_model,
         check=check_target,
     )
-    # The job's credits, reserved in the commit that queues it, under the user's row lock
-    # that every charge takes (docs/billing.md § A parse): a job the balance cannot cover
-    # is never queued, and the upload is not kept for it.
-    await db.execute(select(User.id).where(User.id == user.id).with_for_update())
+    # The job's credits, reserved in the commit that queues it: a job the balance cannot
+    # cover is never queued, and the upload is not kept for it.
     try:
         await ledger.reserve(
             db,

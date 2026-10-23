@@ -966,6 +966,60 @@ async def test_a_subagent_runs_on_its_own_model_and_stops_at_its_call_cap(
 
 
 @respx.mock
+async def test_a_subagent_that_spends_the_balance_ends_the_turn(
+    make_client, tmp_path, monkeypatch
+) -> None:
+    """docs/billing.md § A chat turn: the call that spends the balance is the turn's last,
+    a subagent's included — its result says so, and no call of the turn's own follows."""
+    # Each stubbed call carries 105 tokens at US$1 per million: 3 credits for the first
+    # at US$0.00005 a credit, 5 for the two together. Four granted: the turn's own call
+    # leaves one, the subagent's call overdraws.
+    client = await chatting_client(
+        make_client(
+            workspaces_dir=str(tmp_path / "workspaces"),
+            free_credits_per_period=4,
+            credit_usd="0.00005",
+        )
+    )
+    pages = fake_pages(monkeypatch)
+    created = await client.post(
+        "/api/subagents",
+        json={
+            "name": "quick",
+            "description": "Fast reads",
+            "model": "claude-code/claude-haiku-5-5",
+            "tools": ["view_page"],
+            "prompt": "Read fast.",
+        },
+        headers=CSRF_HEADERS,
+    )
+    assert created.status_code == 201, created.text
+    main, sub = stub_messages(
+        [
+            one_call("call", "subagent", {"name": "quick", "task": "Read page 1."}),
+            ([{"type": "text", "text": "Never sent."}], "end_turn"),
+        ],
+        [
+            one_call("p1", "view_page", {"page": 1}),
+            ([{"type": "text", "text": "Never sent either."}], "end_turn"),
+        ],
+    )
+    conversation_id = await new_conversation(client)
+    await send(client, conversation_id, text="Read")
+    await _run_queued_turn(client)
+
+    # One call each: the subagent's spent the balance, and neither made another.
+    assert (len(main), len(sub), pages) == (1, 1, [])
+    thread = (await client.get(f"/api/conversations/{conversation_id}")).json()
+    [turn] = thread["turns"]
+    assert (turn["status"], turn["error"], turn["credits"]) == ("failed", "out_of_credits", 5)
+    result = thread["messages"][2]["content"][0]
+    assert result["is_error"] and result["content"] == chat_runner.OUT_OF_CREDITS
+    billing = (await client.get("/api/billing")).json()
+    assert (billing["period"]["spent"], billing["period"]["remaining"]) == (5, -1)
+
+
+@respx.mock
 async def test_a_stop_reaches_a_subagent_inside_its_run(chat_client, monkeypatch) -> None:
     client = chat_client
     pages = fake_pages(monkeypatch)

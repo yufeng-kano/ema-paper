@@ -37,7 +37,7 @@ Two plans. Free is a platform policy, never a product at the payment provider; a
 ### A chat turn
 
 - A turn is charged **by the tokens its model calls really used**, every call of the turn together (subagent calls carry the turn's `turn_id` and count with it): `input × price.input + cache_read × price.cache_read + cache_write × price.cache_write + output × price.output`, prices per token from `MODEL_PRICES_JSON` (§ Models), summed in USD and **rounded up to whole credits once per turn**, never per call, with a floor of 1 credit. A `/translate` turn is a turn like any other.
-- A turn needs a balance of **at least `CHAT_MIN_CREDITS` (1)** to be queued (`402` otherwise) — its cost is not known in advance. The runner settles the turn's entry **after every model call** (the entry's `amount` becomes the rounded-up total so far, the period's `spent` moves by the difference), and when the balance is gone mid-turn the loop ends with `turn_error` `out_of_credits` after the call that spent it: the turn's output so far stays in the thread, nothing is refunded, and the period may end a few credits in the red. That overdraft is not carried into the next period.
+- A turn needs a balance of **at least `CHAT_MIN_CREDITS` (1)** to be queued (`402` otherwise) — its cost is not known in advance. The runner settles the turn's entry **after every model call** (the entry's `amount` becomes the rounded-up total so far, the period's `spent` moves by the difference), and when the balance is gone mid-turn — the settled remaining balance is zero or below, a subagent's call included — the loop ends with `turn_error` `out_of_credits` after the call that spent it, before any further tool or model call: the turn's output so far stays in the thread, nothing is refunded, and the period may end a few credits in the red. That overdraft is not carried into the next period. A turn the worker finishes on its own (`fail_turn`: a shutdown, a restart, an escaped error) closes the entry at what it was charged so far, like any other terminal state.
 - The worker records every call's `usage_log` row as it does now ([chat.md](./chat.md)); credits are computed from those same token counts, so Usage and the ledger agree by construction.
 
 ### Rates at the launch configuration
@@ -94,14 +94,14 @@ pay_events       id PK (Pay's event id), type, user_id FK NULL, received_at
 credit_periods   (user_id FK, period_start) PK, period_end, plan_id NULL, granted, spent,
                  created_at, updated_at
 credit_entries   id PK, user_id FK, period_start, kind parse|chat, state reserved|consumed|released,
-                 amount, job_id FK NULL UNIQUE, turn_id FK NULL UNIQUE, model NULL,
+                 amount, job_id FK NULL UNIQUE, turn_id FK SET NULL NULL UNIQUE, model NULL,
                  created_at, settled_at NULL
 ```
 
 - **`credit_periods.spent` is the balance's fast path and `credit_entries` its record**; the two agree because every write touches both in one transaction. `spent` counts the reserved and consumed entries of the period; a release subtracts its amount. `remaining = granted − spent` and may be negative only through a chat overdraft.
 - **Reserving a parse** is one statement under the user's row lock (`SELECT … FOR UPDATE` on `users`, which `submit_parse` and the chat send already take for their caps): read or create the period row, then `UPDATE credit_periods SET spent = spent + :amount WHERE user_id = :u AND period_start = :p AND granted − spent ≥ :amount`; no row updated is the 402. The entry is inserted in the same transaction as the job, with `state = reserved`.
 - **Settling** is idempotent: the entry's `state` is the guard. A job finishing twice (a requeue that raced a finish) moves `reserved → consumed` once; a release of an entry already consumed does nothing and is logged. The chat entry is updated by its `turn_id`, and the period's `spent` by the difference between the new and the old `amount`, so a repeated settlement of the same usage moves nothing.
-- **Deleting a user** takes the ledger with them, as it takes `usage_log` today. Nothing else deletes a row: the ledger is the billing record, kept as long as the account.
+- **Deleting a user** takes the ledger with them, as it takes `usage_log` today. Nothing else deletes a row: the ledger is the billing record, kept as long as the account. Deleting a conversation takes its turns and sets the entries' `turn_id` to NULL, as it does for `usage_log`; the amounts stay in the period and in the usage breakdown.
 - **Periods are small** — one row per user per month or paid period — and are never swept. Entries are one per job and one per turn.
 
 What the web app reads: `GET /api/billing` (§ Routes) for the plan, the period and its balance; the Usage tab's credits per day and per agent come from `credit_entries` grouped like `usage_log` is today ([web.md](./web.md) § Pages).

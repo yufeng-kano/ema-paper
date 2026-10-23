@@ -1337,3 +1337,91 @@ async def test_the_billing_migration_adds_five_empty_tables_and_touches_nothing(
         assert {"users", "jobs", "usage_log"} <= names
     finally:
         await engine.dispose()
+
+
+LEDGER = "1906f6693711"
+
+
+async def test_the_ledger_migration_keeps_a_deleted_conversations_entries(scratch_url):
+    """docs/database.md § Migrations: a chat entry outlives its turn after the upgrade,
+    and the downgrade refuses while any such entry stands rather than delete it."""
+    _alembic(scratch_url, "upgrade", BILLING)
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO users (id, google_sub, email, name, created_at) "
+                    "VALUES (1, 'sub-1', 'a@example.com', 'A', now())"
+                )
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO documents (id, user_id, folder_id, job_id, name, created_at, "
+                    "updated_at) VALUES (1, 1, NULL, NULL, 'a.md', now(), now())"
+                )
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO conversations (id, user_id, document_id, title, session, "
+                    "model, created_at, updated_at) VALUES (1, 1, 1, 'Thread', 's', 'm', "
+                    "now(), now())"
+                )
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO chat_turns (id, user_id, conversation_id, message_id, status, "
+                    "locale, created_at, finished_at) VALUES "
+                    "('22222222-2222-2222-2222-222222222222', 1, 1, 1, 'succeeded', 'en', "
+                    "now(), now())"
+                )
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO credit_periods (user_id, period_start, period_end, plan_id, "
+                    "granted, spent, created_at, updated_at) VALUES (1, '2026-10-01+00', "
+                    "'2026-11-01+00', NULL, 150, 2, now(), now())"
+                )
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO credit_entries (user_id, period_start, kind, state, amount, "
+                    "turn_id, created_at, settled_at) VALUES (1, '2026-10-01+00', 'chat', "
+                    "'consumed', 2, '22222222-2222-2222-2222-222222222222', now(), now())"
+                )
+            )
+        _alembic(scratch_url, "upgrade", LEDGER)
+        async with engine.begin() as connection:
+            # The thread goes; its cost stays, in the period and in the record.
+            await connection.execute(text("DELETE FROM conversations WHERE id = 1"))
+            assert await _count(connection, "chat_turns") == 0
+            rows = (
+                await connection.execute(
+                    text("SELECT kind, state, amount, turn_id FROM credit_entries")
+                )
+            ).all()
+            assert rows == [("chat", "consumed", 2, None)]
+            spent = (await connection.execute(text("SELECT spent FROM credit_periods"))).scalar()
+            assert spent == 2
+        async with engine.connect() as connection:
+            # A parse entry still never has a turn.
+            with pytest.raises(IntegrityError):
+                await connection.execute(
+                    text(
+                        "INSERT INTO credit_entries (user_id, period_start, kind, state, "
+                        "amount, job_id, turn_id, created_at) VALUES (1, '2026-10-01+00', "
+                        "'parse', 'reserved', 1, NULL, NULL, now())"
+                    )
+                )
+        with pytest.raises(subprocess.CalledProcessError) as refused:
+            _alembic(scratch_url, "downgrade", BILLING)
+        assert b"1 chat credit entries have no turn" in refused.value.stderr
+        async with engine.begin() as connection:
+            version = (
+                await connection.execute(text("SELECT version_num FROM alembic_version"))
+            ).scalar()
+            assert version == LEDGER
+            await connection.execute(text("DELETE FROM credit_entries"))
+        _alembic(scratch_url, "downgrade", BILLING)
+    finally:
+        await engine.dispose()

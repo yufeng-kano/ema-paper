@@ -875,9 +875,9 @@ class CreditEntry(Base):
         CheckConstraint(
             "(kind = 'parse') = (job_id IS NOT NULL)", name="ck_credit_entries_parse_job"
         ),
-        CheckConstraint(
-            "(kind = 'chat') = (turn_id IS NOT NULL)", name="ck_credit_entries_chat_turn"
-        ),
+        # A chat entry outlives its turn (a deleted conversation sets this NULL); a parse
+        # entry never has one.
+        CheckConstraint("kind = 'chat' OR turn_id IS NULL", name="ck_credit_entries_turn_kind"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -891,7 +891,7 @@ class CreditEntry(Base):
         ForeignKey("jobs.id", ondelete="CASCADE"), unique=True, nullable=True
     )
     turn_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("chat_turns.id", ondelete="CASCADE"), unique=True, nullable=True
+        ForeignKey("chat_turns.id", ondelete="SET NULL"), unique=True, nullable=True
     )
     model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
