@@ -1248,3 +1248,92 @@ async def test_the_reconvert_migration_leaves_every_document_on_its_own_parse(
         assert (await db.execute(text("SELECT count(*) FROM documents"))).scalar_one() == 1
     _alembic(scratch_url, "upgrade", "head")
     await engine.dispose()
+
+
+BEFORE_BILLING = "3241469fe768"
+BILLING = "bd4210aa38cf"
+BILLING_TABLES = ("subscriptions", "checkouts", "pay_events", "credit_periods", "credit_entries")
+
+
+async def _count(connection, table: str) -> int:
+    """Rows of one of the tables named in this module — never a value from outside it."""
+    return (await connection.execute(text(f"SELECT count(*) FROM {table}"))).scalar()  # noqa: S608
+
+
+async def test_the_billing_migration_adds_five_empty_tables_and_touches_nothing(scratch_url):
+    """docs/billing.md § Acceptance: applied over existing users, jobs and usage rows,
+    which it leaves as they are; the downgrade drops the five tables and nothing else."""
+    _alembic(scratch_url, "upgrade", BEFORE_BILLING)
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO users (id, google_sub, email, name, created_at) "
+                    "VALUES (1, 'sub-1', 'a@example.com', 'A', now())"
+                )
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO jobs (id, user_id, agent, kind, filename, media_type, "
+                    "size_bytes, sha256, pages_spec, model, bbox_format, prompt_sha256, "
+                    "pipeline_version, status, pages_done, retain_source, created_at) VALUES "
+                    "('11111111-1111-1111-1111-111111111111', 1, 'parse', 'pdf', 'a.pdf', "
+                    "'application/pdf', 1, 'h', 'all', 'm', 'yxyx_norm1000', 'p', 1, "
+                    "'succeeded', 1, false, now())"
+                )
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO usage_log (user_id, job_id, agent, model, prompt_tokens, "
+                    "completion_tokens, cost, cost_source, created_at) VALUES (1, "
+                    "'11111111-1111-1111-1111-111111111111', 'parse', 'm', 1, 1, NULL, "
+                    "'unknown', now())"
+                )
+            )
+        _alembic(scratch_url, "upgrade", BILLING)
+        async with engine.begin() as connection:
+            for table in BILLING_TABLES:
+                assert await _count(connection, table) == 0, table
+            assert await _count(connection, "users") == 1
+            assert await _count(connection, "usage_log") == 1
+            # The constraints hold: a chat entry without a turn, a parse entry with one.
+            await connection.execute(
+                text(
+                    "INSERT INTO credit_periods (user_id, period_start, period_end, plan_id, "
+                    "granted, spent, created_at, updated_at) VALUES (1, '2026-10-01+00', "
+                    "'2026-11-01+00', NULL, 150, 0, now(), now())"
+                )
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO credit_entries (user_id, period_start, kind, state, amount, "
+                    "job_id, created_at) VALUES (1, '2026-10-01+00', 'parse', 'reserved', 3, "
+                    "'11111111-1111-1111-1111-111111111111', now())"
+                )
+            )
+        async with engine.connect() as connection:
+            with pytest.raises(IntegrityError):
+                await connection.execute(
+                    text(
+                        "INSERT INTO credit_entries (user_id, period_start, kind, state, amount, "
+                        "created_at) VALUES (1, '2026-10-01+00', 'chat', 'consumed', 1, now())"
+                    )
+                )
+        async with engine.begin() as connection:
+            # A user deleted takes their ledger with them.
+            await connection.execute(text("DELETE FROM users WHERE id = 1"))
+            for table in ("credit_periods", "credit_entries"):
+                assert await _count(connection, table) == 0
+        _alembic(scratch_url, "downgrade", BEFORE_BILLING)
+        async with engine.connect() as connection:
+            names = {
+                row[0]
+                for row in await connection.execute(
+                    text("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
+                )
+            }
+        assert not names & set(BILLING_TABLES)
+        assert {"users", "jobs", "usage_log"} <= names
+    finally:
+        await engine.dispose()

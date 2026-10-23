@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
+from decimal import Decimal
+from functools import cached_property, lru_cache
 from typing import Literal
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from .billing.credits import ModelPrice, parse_model_prices
+from .billing.plans import FREE_PLAN_ID, Plan, parse_plans
 
 # Only ever used when APP_ENV=local and SECRET_KEY is unset, so `uv run uvicorn` works
 # without a .env file. Production refuses to start without a real SECRET_KEY.
@@ -45,6 +49,36 @@ class Settings(BaseSettings):
     kano_proxy_client_secret: str = ""
     # Lifetime of a pending connect state (state + PKCE verifier).
     kano_connect_ttl_seconds: int = 600
+
+    # The subscription (docs/billing.md). The operator's own Kano Proxy key, the models the
+    # deployment offers and their list prices; read and validated here, run on from the
+    # upstream step of docs/billing.md § Transition.
+    kano_proxy_api_key: str = ""
+    parse_model: str = ""
+    check_model: str = ""
+    parse_fallback_model: str = ""
+    # Comma-separated ids the chat agent offers; the first is the default.
+    chat_models: str = ""
+    # `{"<model>": {"input", "cache_read", "cache_write", "output"}}`, USD per 1M tokens.
+    model_prices_json: str = "{}"
+    # What one credit is worth in list-price USD, and the flat rates (docs/billing.md
+    # § Credits).
+    credit_usd: Decimal = Decimal("0.002")
+    parse_credits_per_page: int = 1
+    chat_min_credits: int = 1
+    # The Free plan (docs/billing.md § Plans).
+    free_credits_per_period: int = 150
+    free_storage_bytes: int = 52_428_800
+    free_max_jobs: int = 1
+    # Kano Pay (docs/billing.md § Kano Pay): all four set = configured; otherwise every
+    # user is on Free and checkout is unavailable.
+    kano_pay_url: str = ""
+    kano_pay_app_id: str = ""
+    kano_pay_api_key: str = ""
+    kano_pay_webhook_secret: str = ""
+    # `[{"planId", "credits", "storageBytes", "sandbox", "maxJobs"}]`; prices are Pay's.
+    kano_pay_plans_json: str = "[]"
+    billing_refresh_seconds: int = 120
 
     upload_max_bytes: int = 134_217_728
     page_cap: int = 500
@@ -195,7 +229,67 @@ class Settings(BaseSettings):
         # One spelling of the origin everywhere it is joined or compared — the dedup
         # snapshot included (docs/jobs.md § Dedup).
         self.kano_proxy_base_url = self.kano_proxy_base_url.strip().rstrip("/")
+        self.kano_pay_url = self.kano_pay_url.strip().rstrip("/")
+        if self.credit_usd <= 0:
+            raise ValueError("CREDIT_USD must be positive")
+        for name in ("parse_credits_per_page", "chat_min_credits", "free_credits_per_period"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name.upper()} must be >= 0")
+        if self.free_storage_bytes > self.workspace_quota_bytes:
+            raise ValueError("FREE_STORAGE_BYTES exceeds WORKSPACE_QUOTA_BYTES")
+        if self.free_max_jobs > self.max_jobs_per_user:
+            raise ValueError("FREE_MAX_JOBS exceeds MAX_JOBS_PER_USER")
+        # Parsed once, at start: a malformed table or an offered model nobody priced
+        # refuses to start rather than running a model for free (docs/billing.md § Models).
+        prices = self.model_prices
+        unpriced = [model for model in self.offered_models if model not in prices]
+        if unpriced:
+            raise ValueError(f"MODEL_PRICES_JSON prices none of: {', '.join(sorted(unpriced))}")
+        self.plans  # noqa: B018 - validated for its errors
         return self
+
+    @cached_property
+    def model_prices(self) -> dict[str, ModelPrice]:
+        return parse_model_prices(self.model_prices_json)
+
+    @cached_property
+    def plans(self) -> dict[str, Plan]:
+        """The paid plans, by Pay's plan id (docs/billing.md § Plans)."""
+        return parse_plans(
+            self.kano_pay_plans_json,
+            storage_ceiling=self.workspace_quota_bytes,
+            jobs_ceiling=self.max_jobs_per_user,
+        )
+
+    @property
+    def free_plan(self) -> Plan:
+        return Plan(
+            id=FREE_PLAN_ID,
+            credits=self.free_credits_per_period,
+            storage_bytes=self.free_storage_bytes,
+            sandbox=False,
+            max_jobs=self.free_max_jobs,
+        )
+
+    @property
+    def chat_model_list(self) -> list[str]:
+        """`CHAT_MODELS` as ids, in the operator's order, the first the default."""
+        return list(dict.fromkeys(m.strip() for m in self.chat_models.split(",") if m.strip()))
+
+    @property
+    def offered_models(self) -> set[str]:
+        """Every model the deployment runs, each of which must be priced."""
+        fixed = (self.parse_model, self.check_model, self.parse_fallback_model)
+        return {m.strip() for m in fixed if m.strip()} | set(self.chat_model_list)
+
+    @property
+    def kano_pay_configured(self) -> bool:
+        return bool(
+            self.kano_pay_url
+            and self.kano_pay_app_id
+            and self.kano_pay_api_key
+            and self.kano_pay_webhook_secret
+        )
 
     @property
     def dev_login_enabled(self) -> bool:

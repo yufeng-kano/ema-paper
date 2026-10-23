@@ -773,3 +773,126 @@ class OAuthGrant(Base):
     expires_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ)
     revoked_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
+
+
+# --- billing (docs/billing.md § The ledger) -----------------------------------------------------
+
+
+class Subscription(Base):
+    """The user's Kano Pay subscription, the canonical copy (docs/billing.md § Kano Pay).
+
+    No row is Free: every user has Free without one.
+    """
+
+    __tablename__ = "subscriptions"
+    __table_args__ = (CheckConstraint("period_end > period_start", name="ck_subscriptions_period"),)
+
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    subscription_id: Mapped[str] = mapped_column(String(255), unique=True)
+    status: Mapped[str] = mapped_column(String(32))
+    plan_id: Mapped[str] = mapped_column(String(64))
+    period_start: Mapped[datetime] = mapped_column(TIMESTAMPTZ)
+    period_end: Mapped[datetime] = mapped_column(TIMESTAMPTZ)
+    cancel_at_period_end: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false"
+    )
+    # Pay's version (milliseconds): an update carrying an older one is ignored.
+    version: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+    updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
+
+
+class Checkout(Base):
+    """The one checkout a user may have open: its idempotency key is written before Pay
+    is called, so a retry repeats the same request (docs/billing.md § Kano Pay)."""
+
+    __tablename__ = "checkouts"
+
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    plan_id: Mapped[str] = mapped_column(String(64))
+    idempotency_key: Mapped[str] = mapped_column(String(128), unique=True)
+    transaction_id: Mapped[str | None] = mapped_column(String(255), unique=True, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
+
+
+class PayEvent(Base):
+    """A processed Kano Pay notification, by Pay's own event id: a duplicate is answered
+    and not applied again (docs/billing.md § Kano Pay)."""
+
+    __tablename__ = "pay_events"
+
+    id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    type: Mapped[str] = mapped_column(String(64))
+    # The record of the event outlives the user it was about.
+    user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    received_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
+
+
+class CreditPeriod(Base):
+    """One row per user per allowance period — Free's UTC month or a paid period — created
+    on first use; `granted - spent` is the balance (docs/billing.md § Periods)."""
+
+    __tablename__ = "credit_periods"
+    __table_args__ = (
+        CheckConstraint("period_end > period_start", name="ck_credit_periods_period"),
+        CheckConstraint("granted >= 0", name="ck_credit_periods_granted"),
+    )
+
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    period_start: Mapped[datetime] = mapped_column(TIMESTAMPTZ, primary_key=True)
+    period_end: Mapped[datetime] = mapped_column(TIMESTAMPTZ)
+    # NULL = Free.
+    plan_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    granted: Mapped[int] = mapped_column(Integer)
+    # Reserved and consumed entries of the period; a release subtracts. May exceed
+    # `granted` only through a chat turn's overdraft.
+    spent: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
+
+
+class CreditEntry(Base):
+    """What a parse or a turn cost: one entry per job, reserved at enqueue and settled at
+    its terminal state; one per turn, its amount raised as the turn runs (docs/billing.md
+    § The ledger)."""
+
+    __tablename__ = "credit_entries"
+    __table_args__ = (
+        Index("ix_credit_entries_user_created", "user_id", "created_at"),
+        CheckConstraint("amount >= 0", name="ck_credit_entries_amount"),
+        CheckConstraint("kind IN ('parse', 'chat')", name="ck_credit_entries_kind"),
+        CheckConstraint(
+            "state IN ('reserved', 'consumed', 'released')", name="ck_credit_entries_state"
+        ),
+        CheckConstraint(
+            "(kind = 'parse') = (job_id IS NOT NULL)", name="ck_credit_entries_parse_job"
+        ),
+        CheckConstraint(
+            "(kind = 'chat') = (turn_id IS NOT NULL)", name="ck_credit_entries_chat_turn"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    # The period the entry was made in, where it is settled whenever that happens.
+    period_start: Mapped[datetime] = mapped_column(TIMESTAMPTZ)
+    kind: Mapped[str] = mapped_column(String(8))  # parse | chat
+    state: Mapped[str] = mapped_column(String(8))  # reserved | consumed | released
+    amount: Mapped[int] = mapped_column(Integer)
+    job_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("jobs.id", ondelete="CASCADE"), unique=True, nullable=True
+    )
+    turn_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("chat_turns.id", ondelete="CASCADE"), unique=True, nullable=True
+    )
+    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
+    settled_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)

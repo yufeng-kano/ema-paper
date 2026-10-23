@@ -88,6 +88,9 @@ Certificates are always this stack's own: the site block carries an explicit `tl
 | `KANO_PROXY_BASE_URL` | Kano Proxy's origin (e.g. `https://kano-proxy.example.com`, no path). Vision calls go to `{origin}/openai/v1`, consent to `{origin}/connect/authorize`, the token exchange to `{origin}/api/connect/token` ([auth.md](./auth.md) § 6). Empty = Kano Proxy unavailable |
 | `KANO_PROXY_CLIENT_ID` / `KANO_PROXY_CLIENT_SECRET` | sightread's client registration on Kano Proxy. The redirect URI registered there is `<APP_URL>/api/kano/callback`. The secret lives only in `.env` |
 | `KANO_CONNECT_TTL_SECONDS` | lifetime of a pending connect state (default 600) |
+| `KANO_PROXY_API_KEY`, `PARSE_MODEL`, `CHECK_MODEL`, `PARSE_FALLBACK_MODEL`, `CHAT_MODELS`, `MODEL_PRICES_JSON` | the operator's own upstream key and the models it offers, with their list prices ([billing.md](./billing.md) § Models). Read and validated from the schema step on; nothing runs on them until the upstream step of [billing.md](./billing.md) § Transition |
+| `CREDIT_USD`, `PARSE_CREDITS_PER_PAGE`, `CHAT_MIN_CREDITS`, `FREE_CREDITS_PER_PERIOD`, `FREE_STORAGE_BYTES`, `FREE_MAX_JOBS` | credits and the Free plan ([billing.md](./billing.md) § Credits, § Plans) |
+| `KANO_PAY_URL`, `KANO_PAY_APP_ID`, `KANO_PAY_API_KEY`, `KANO_PAY_WEBHOOK_SECRET`, `KANO_PAY_PLANS_JSON`, `BILLING_REFRESH_SECONDS` | the Kano Pay registration and the paid plans ([billing.md](./billing.md) § Kano Pay). The key and the secret live only in `.env`; all four unset = every user on Free |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | OIDC |
 | `AUTH_DEV_MODE` | local only; absent from `.env.production.example` |
 | `UPLOAD_MAX_BYTES`, `PAGE_CAP`, `MAX_JOBS_PER_USER`, `UPLOAD_RETRY_WINDOW_SECONDS`, `VISION_CONCURRENCY_PER_JOB`, `RENDER_WORKERS` | defaults in [api.md](./api.md) / [jobs.md](./jobs.md) |
