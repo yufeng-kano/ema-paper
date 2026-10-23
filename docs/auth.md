@@ -55,6 +55,8 @@ A ticket lets an agent do exactly one upload and then read the job that upload c
 
 ## 6. Kano Proxy connect — authorization code + PKCE, sightread as the client
 
+**Going away** with the operator's own upstream key ([billing.md](./billing.md) § Transition, step 4): the subscription runs every user on one Kano Proxy account of the operator's, so this flow, `kano_proxy_keys` and `kano_connect_states` are removed by that step. Until then it is what runs.
+
 Kano Proxy is the built-in upstream ([api.md](./api.md) § Upstreams). Its key is not pasted: the user approves sightread on Kano Proxy and sightread receives a key for that user and app. The contract is shared with kano-proxy-cloud, which implements the other side, and is followed exactly.
 
 Configuration: `KANO_PROXY_BASE_URL` (the origin, e.g. `https://kano-proxy.example.com`), `KANO_PROXY_CLIENT_ID`, `KANO_PROXY_CLIENT_SECRET` ([deployment.md](./deployment.md)). With any of the three unset, Kano Proxy is unavailable: `GET /api/kano` says so, connect answers `?kano=error`, and enqueueing on it is refused.

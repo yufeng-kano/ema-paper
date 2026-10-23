@@ -237,9 +237,7 @@ async def test_a_markdown_document_is_renamed_moved_and_deleted(writer) -> None:
     assert moved.json()["name"] == "plan.md" and moved.json()["job_id"] is None
     assert (writer.root / "files" / "Kept" / "plan.md" / "doc.md").read_text() == "# Doc\n"
 
-    deleted = await writer.delete(
-        f"/api/library/documents/{document['id']}", headers=CSRF_HEADERS
-    )
+    deleted = await writer.delete(f"/api/library/documents/{document['id']}", headers=CSRF_HEADERS)
     assert deleted.status_code == 204
     assert original_of(writer.root, document["id"]) is None
     assert not (writer.root / "files" / "Kept" / "plan.md").exists()
@@ -256,9 +254,7 @@ async def test_me_lists_markdown_with_its_own_cap(writer) -> None:
 
 async def test_the_agent_page_renders_a_markdown_documents_facts(writer) -> None:
     document = (await _new(writer, "Draft")).json()
-    context = await writer.get(
-        "/api/agents/chat/context", params={"document_id": document["id"]}
-    )
+    context = await writer.get("/api/agents/chat/context", params={"document_id": document["id"]})
     assert context.status_code == 200, context.text
     facts = context.json()["facts"]
     assert facts["page_count"] == "none" and facts["bbox_format"] == "none"

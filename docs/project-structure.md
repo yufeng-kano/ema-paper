@@ -22,6 +22,9 @@ agent-sightread/
                               # skills.py and subagents.py the built-in skills and subagents;
                               # memory.py the memory block, its selection and text cleaning;
                               # check.py the check agent's prompt and tools
+        billing/              # plans, periods and credit arithmetic (docs/billing.md):
+                              # credits.py prices a parse and a turn, plans.py reads the
+                              # plans and decides the current period; pure, no HTTP
         parsing/              # poppler.py (subprocess wrappers),
                               # images.py (heic/exif/downscale), markdown.py, figures.py,
                               # joins.py (the format check's program rules),

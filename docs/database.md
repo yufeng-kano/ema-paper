@@ -261,12 +261,49 @@ oauth_grants     id PK, client_id FK, user_id FK, kind code|access|refresh,
                  scope, expires_at, revoked_at NULL, created_at
                  -- redirect_uri is set on `code` rows only: the token endpoint
                  -- checks a code came back from the URI it was issued for
+subscriptions    user_id PK/FK, subscription_id UNIQUE, status, plan_id,
+                 period_start, period_end,       -- the paid period Pay reports
+                 cancel_at_period_end BOOL, version BIGINT,
+                                                  -- Pay's version (ms); an update with an
+                                                  -- older one is ignored
+                 updated_at
+                 CHECK (period_end > period_start)
+                 -- the user's Kano Pay subscription, canonical copy (billing.md § Kano
+                 -- Pay); no row = Free. Every user has Free without a row
+checkouts        user_id PK/FK, plan_id, idempotency_key UNIQUE,
+                 transaction_id UNIQUE NULL, created_at, completed_at NULL
+                 -- the one checkout a user may have open: the key is written before
+                 -- Pay is called, so a retry repeats the same request
+pay_events       id PK,                           -- Pay's event id
+                 type, user_id FK NULL, received_at
+                 -- processed notifications; a duplicate id is answered and not applied
+credit_periods   (user_id FK, period_start) PK, period_end, plan_id NULL,
+                 granted INT, spent INT,          -- the balance's fast path:
+                                                  -- remaining = granted - spent
+                 created_at, updated_at
+                 CHECK (period_end > period_start), CHECK (granted >= 0)
+                 -- one row per user per allowance period (Free's UTC month, or a paid
+                 -- period), created on first use (billing.md § Periods); plan_id NULL
+                 -- = Free
+credit_entries   id PK, user_id FK, period_start,
+                 kind parse|chat, state reserved|consumed|released,
+                 amount INT, job_id FK jobs NULL UNIQUE, turn_id FK chat_turns NULL UNIQUE,
+                 model NULL, created_at, settled_at NULL
+                 INDEX (user_id, created_at)
+                 CHECK (amount >= 0), CHECK ((kind = 'parse') = (job_id IS NOT NULL)),
+                 CHECK ((kind = 'chat') = (turn_id IS NOT NULL))
+                 -- what a parse or a turn cost (billing.md § The ledger): one entry per
+                 -- job, reserved at enqueue and settled at the terminal state; one per
+                 -- turn, its amount raised as the turn runs. ON DELETE CASCADE from the
+                 -- job and the turn: a parse or a conversation deleted with its user
+                 -- goes with the user; neither is deleted otherwise
 ```
 
 ## Rules
 
 - All credentials at rest follow [auth.md](./auth.md): hashes for anything we only verify, AES-GCM ciphertext for what we must replay (the Kano Proxy key, every provider connection's key, and a pending connect's PKCE verifier). No plaintext secrets in any column.
 - `user_settings.system_prompt` no longer exists: the migration turned each stored custom prompt into a `prompt_presets` row named "Custom prompt" and pointed `prompt_preset_id` at it, so behavior did not change for anyone.
+- **The billing migration** (`subscriptions and credits`) created `subscriptions`, `checkouts`, `pay_events`, `credit_periods` and `credit_entries`, empty, with their constraints and indexes ([billing.md](./billing.md) § The ledger). No existing row is read or rewritten: every user is on Free without a row, and nothing reads the tables until the ledger step of [billing.md](./billing.md) § Transition. Its downgrade drops the five tables and nothing else — a ledger already written is lost with them, which is the point of not downgrading past a step that wrote one.
 - **The agent prompt migration** (`skills subagents attachments and agent prompt`) gave `agent_settings` its `prompt` column and moved every selected preset into it, clearing `prompt_preset_id`: a `parse` preset's text as it was (a parse preset replaced the template), a `chat` preset's text behind the chat agent's default system prompt of that release and a blank line (a chat preset was appended to it) — the default is copied into the migration, never imported, so the migration stays what it was when it ran. The presets themselves stay, unselected; nothing else reads them. A `chat` preset holding one of the template's tokens is not moved: it was appended verbatim, and inside the template the token would be substituted, so it stays the selected preset. The downgrade puts the selections back before it drops the column: an agent whose prompt is a moved preset selects that preset again (matched by its text), and a prompt written after the upgrade becomes a preset of its own named *Custom prompt* (numbered past a taken name) where the old schema can say it — a `parse` prompt as it is, a `chat` prompt as what it adds behind that release's default; a `chat` prompt that edits the default itself has no such form and goes back to the default. A moved `chat` prompt can exceed `SYSTEM_PROMPT_MAX_CHARS`, which caps writes, not stored rows: the dialog says so and the reader shortens it before the next save. The same revision created `skills`, `subagents` and `chat_attachments`.
 - **The instructions and memory migration** (`agent instructions and memories`) added `agent_settings.instructions`, `answer_language`, `translate_language` (NULL: none, and the reader's locale as before), `memory_auto` (true) and `memory_paused` (false), `conversations.memory_ids` (NULL: a conversation takes its snapshot at its next turn) and the `memories` table, empty, with its three indexes. No row is rewritten. Its downgrade drops them, the memories with them.
 - **The failed pages migration** (`retry failed pages`) added `agent_settings.fallback_model` (NULL) and `auto_fallback` (false), `jobs.fallback_model` and `jobs.retry_model` (NULL) and `job_pages.model` (NULL: the job's model). No row is rewritten: a job already `succeeded` with page errors keeps its result as it was ([parsing.md](./parsing.md) § Vision-only conversion). Its downgrade drops the five columns.
