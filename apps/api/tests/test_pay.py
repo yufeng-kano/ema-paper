@@ -38,9 +38,15 @@ def _ms(when: datetime) -> int:
     return int(when.timestamp() * 1000)
 
 
-# Pay's `version` is the subscription's last update in milliseconds: the ones the tests
-# answer with sit a minute ahead of every checkout they complete, counted from here.
-VERSION_BASE = _ms(datetime.now(UTC)) + 60_000
+# Pay's `version` is the subscription's last update in milliseconds. A test's `version`
+# is a step of this many from a minute ahead of now, so an answer completes the checkout
+# opened moments before it, versions keep their order across one test, and a negative
+# step lands before anything the test opened.
+VERSION_STEP = 1_000_000
+
+
+def _version(step: int) -> int:
+    return _ms(datetime.now(UTC)) + 60_000 + step * VERSION_STEP
 
 
 def canonical(
@@ -64,7 +70,7 @@ def canonical(
             "periodStart": _ms(now - timedelta(days=1)),
             "periodEnd": _ms(now + timedelta(days=29)),
             "cancelAtPeriodEnd": cancel,
-            "version": VERSION_BASE + version,
+            "version": _version(version),
             "active": status == "active",
         }
     }
@@ -166,8 +172,9 @@ async def test_a_notification_is_written_from_the_canonical_fetch_not_its_body(
     client = make_client(**PAY_SETTINGS)
     user_id = await _signed_in(client)
     assert await _plan_shown(client) == "free"
+    answer = canonical(user_id, version=7)
     fetch = respx.get(f"{SUBSCRIPTIONS_URL}{user_id}").mock(
-        return_value=httpx.Response(200, json=canonical(user_id, version=7))
+        return_value=httpx.Response(200, json=answer)
     )
 
     # The body claims a plan and a status of its own; neither is read.
@@ -183,7 +190,7 @@ async def test_a_notification_is_written_from_the_canonical_fetch_not_its_body(
     assert (row.plan_id, row.status, row.version, row.subscription_id) == (
         "pro",
         "active",
-        VERSION_BASE + 7,
+        answer["subscription"]["version"],
         "sub_canonical",
     )
     assert await _events(client) == ["evt_1"]
@@ -218,7 +225,8 @@ async def test_a_wrong_or_stale_signature_is_refused_before_anything_is_read(
 async def test_a_duplicate_event_id_is_answered_without_a_second_write(make_client) -> None:
     client = make_client(**PAY_SETTINGS)
     user_id = await _signed_in(client)
-    answers = iter([canonical(user_id, version=1), canonical(user_id, version=2, cancel=True)])
+    first, second = canonical(user_id, version=1), canonical(user_id, version=2, cancel=True)
+    answers = iter([first, second])
     fetch = respx.get(f"{SUBSCRIPTIONS_URL}{user_id}").mock(
         side_effect=lambda request: httpx.Response(200, json=next(answers))
     )
@@ -227,11 +235,11 @@ async def test_a_duplicate_event_id_is_answered_without_a_second_write(make_clie
     # The same delivery again: 200, and Pay is not asked a second time.
     assert (await _notify(client, _event(user_id, "evt_1"))).status_code == 200
     assert fetch.call_count == 1
-    assert (await _row(client, user_id)).version == VERSION_BASE + 1
+    assert (await _row(client, user_id)).version == first["subscription"]["version"]
     # A new event id is a new fetch.
     assert (await _notify(client, _event(user_id, "evt_2"))).status_code == 200
     row = await _row(client, user_id)
-    assert (row.version, row.cancel_at_period_end) == (VERSION_BASE + 2, True)
+    assert (row.version, row.cancel_at_period_end) == (second["subscription"]["version"], True)
     assert await _events(client) == ["evt_1", "evt_2"]
 
 
@@ -239,9 +247,8 @@ async def test_a_duplicate_event_id_is_answered_without_a_second_write(make_clie
 async def test_a_stale_version_never_rolls_access_backwards(make_client) -> None:
     client = make_client(**PAY_SETTINGS)
     user_id = await _signed_in(client)
-    answers = iter(
-        [canonical(user_id, version=5), canonical(user_id, version=3, status="canceled")]
-    )
+    newer = canonical(user_id, version=5)
+    answers = iter([newer, canonical(user_id, version=3, status="canceled")])
     respx.get(f"{SUBSCRIPTIONS_URL}{user_id}").mock(
         side_effect=lambda request: httpx.Response(200, json=next(answers))
     )
@@ -250,7 +257,7 @@ async def test_a_stale_version_never_rolls_access_backwards(make_client) -> None
     assert (await _notify(client, _event(user_id, "evt_3"))).status_code == 200
 
     row = await _row(client, user_id)
-    assert (row.version, row.status) == (VERSION_BASE + 5, "active")
+    assert (row.version, row.status) == (newer["subscription"]["version"], "active")
     assert await _events(client) == ["evt_3", "evt_5"]
     assert await _plan_shown(client) == "pro"
 
@@ -428,7 +435,7 @@ async def test_a_refresh_completes_the_checkout_a_missed_notification_left_open(
 
     # A subscription updated before the checkout was opened does not complete it.
     fetch = respx.get(f"{SUBSCRIPTIONS_URL}{user_id}").mock(
-        return_value=httpx.Response(200, json=canonical(user_id, version=-120_000))
+        return_value=httpx.Response(200, json=canonical(user_id, version=-1))
     )
     assert (await client.get("/api/billing")).json()["plan"]["id"] == "pro"
     assert (await _checkout_row(client, user_id)).completed_at is None
