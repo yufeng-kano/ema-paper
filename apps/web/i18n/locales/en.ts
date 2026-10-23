@@ -9,6 +9,13 @@ export default {
     en: 'English',
     'zh-TW': 'Chinese (Traditional)',
   },
+  footer: {
+    nav: 'Site',
+    pricing: 'Pricing',
+    terms: 'Terms',
+    privacy: 'Privacy',
+    refund: 'Refunds',
+  },
   nav: {
     primary: 'Main navigation',
     files: 'Files',
@@ -79,7 +86,6 @@ export default {
     factInterfacesValue: 'REST · MCP',
     factBilling: 'Billing',
     factBillingValue: 'Credits, Free every month',
-    pricing: 'Pricing',
     account: 'Account',
     signIn: 'Sign in',
     lede: 'Continue to your account.',
@@ -927,7 +933,6 @@ export default {
     seoDescription:
       'Parse PDFs and images into markdown with figure coordinates. A fixed number of credits per parsed page, chat by tokens; Free every month, more on Pro. No API key to bring.',
     nav: 'Pricing',
-    signIn: 'Sign in',
     eyebrow: 'Pricing',
     title: 'A flat price per page, the model included.',
     lede: 'PDFs and images in, markdown with figure coordinates out. A parse costs a fixed number of credits per page and a chat turn costs its tokens. The models are ours to pick and pay for: you bring no API key.',
@@ -976,5 +981,92 @@ export default {
     a3: 'Ema Paper picks one parse model and offers a short list of chat models, and changes them over time. There is no key to bring.',
     q4: 'How do I pay, and how do I cancel?',
     a4: 'Through the customer portal, in the Billing section once signed in. A cancelled subscription runs to the end of its period, then the account is on Free, files kept.',
+  },
+  legal: {
+    updated: 'Last updated {date}',
+    operator: 'Operated by {operator}',
+    contactTitle: 'Contact',
+    contactBody: 'Questions, deletion requests and refund requests go to',
+    terms: {
+      seoTitle: 'Ema Paper terms of service',
+      seoDescription: 'The terms under which Ema Paper is provided: the service, your account and content, plans and credits, cancellation, availability and liability.',
+      title: 'Terms of Service',
+      lede: 'These terms govern your use of Ema Paper. By signing in you accept them.',
+      s1Title: 'The service',
+      s1Body:
+        "{name} turns PDFs and images into markdown with figure coordinates, over the web app, a REST API and an MCP connector, and lets you read, edit and discuss the result with an agent. The models that do the work run on the operator's own account with its providers; you bring no key.",
+      s2Title: 'Your account',
+      s2Body:
+        "You sign in with a Google account, and one account is one person. You are responsible for what happens under it, including every API key you create: keep those keys to yourself, and revoke one you think is exposed.\n\nWe may suspend or close an account that abuses the service: automated traffic beyond what its plan allows, content that is illegal where you or we are, or attempts to reach another user's data or the machines behind the service.",
+      s3Title: 'Your content',
+      s3Body:
+        "What you upload stays yours, and so does what {name} makes from it. You give us the right to process it only as the service requires: rendering pages, sending them and your messages to the model providers behind the operator's proxy, and storing the results in your library. We do not use your content to train models, and we do not read it except to run the service or when you ask us to look into a problem.\n\nYou must have the right to upload what you upload.",
+      s4Title: 'Plans and credits',
+      s4Body:
+        'Every account has the Free plan, with a grant of credits each month. A paid plan is billed per cycle, in advance, through Dodo Payments, which sells the subscription as merchant of record and handles tax and invoices. The price is the one shown at checkout.\n\nA parse costs a fixed number of credits per page and a chat turn is charged on its tokens, at the rates the pricing page shows. Credits not spent by the end of a period do not carry over. A parse that fails is not charged. We may change plans and rates; a change takes effect from your next period, and the pricing page always shows the current ones.',
+      s5Title: 'Cancellation and refunds',
+      s5Body:
+        'You can cancel at any time in the customer portal. A cancelled subscription runs to the end of the period you paid for, then the account is on Free with its files kept. Refunds follow the refund policy.',
+      s6Title: 'Availability and changes to the service',
+      s6Body:
+        '{name} is provided as is. We work to keep it available and your files intact, with backups, but we do not promise uninterrupted service, and we may change or retire features, models and limits. Your files stay as long as your account exists.',
+      s7Title: 'Liability',
+      s7Body:
+        'To the extent the law allows, we are not liable for indirect or consequential loss, for the content a model produces, or for what you do with it, and our liability to you is limited to what you paid us in the twelve months before the claim.',
+      s8Title: 'Changes to these terms',
+      s8Body:
+        'We may revise these terms. The date at the top says when they last changed; using the service after a change means you accept the revised terms. Questions go to the support address below.',
+    },
+    privacy: {
+      seoTitle: 'Ema Paper privacy policy',
+      seoDescription: 'What Ema Paper keeps about you, what for, who else receives it, how long it is kept, and how to have it removed.',
+      title: 'Privacy Policy',
+      lede: 'What {name} keeps about you, why, who else sees it, and how to have it removed.',
+      s1Title: 'What we collect',
+      s1Body:
+        "Your account: the Google account's identifier, email address, name and picture, as Google gives them at sign-in.\n\nYour content: the files you upload, the markdown and figure crops parsed from them, the documents, notes and workspace files you keep, your conversations with the agent, and the memories it keeps of you.\n\nYour usage: for every model call, the model, the token counts and the credits it cost, kept with the parse or conversation it belongs to, and the record of each credit reserved and spent.\n\nYour subscription: its plan, state and period, as the payment service reports them. Card and bank details are entered at Dodo Payments and never reach us.\n\nTechnical records: one session cookie, and server logs with the time, route and outcome of requests. Prompts, documents and model answers are never written to a log.",
+      s2Title: 'What we use it for',
+      s2Body:
+        'To run the service: parse, store and show your documents, run the agent, meter your credits and bill a paid plan. To keep the service safe: spot abuse and resolve failures. To answer you when you write to us. Nothing else: no advertising, no profiling, no sale of data.',
+      s3Title: 'Who else receives it',
+      s3Body:
+        "The model providers: the pages, text and messages you parse or discuss are sent to the provider of the model that runs, through the operator's own Kano Proxy account, under that provider's terms for API use.\n\nDodo Payments, through Kano Pay, for checkout, invoices, tax and the customer portal: your email address and the subscription, never your documents.\n\nGoogle, for sign-in.\n\nNo one else, except where the law requires it.",
+      s4Title: 'How long we keep it',
+      s4Body:
+        'Your results, documents, notes and conversations stay as long as your account exists, on every plan. The source file of a parse made through the API or the connector is deleted when its job ends; a document in your library keeps its original, so it can be parsed again. Usage and credit records are kept as the billing record of the account.\n\nTo delete your account and everything in it, write to the support address below. What you delete also leaves our backups as those rotate.',
+      s5Title: 'Cookies',
+      s5Body: 'One cookie, for the session that keeps you signed in. Your theme and language choices are stored in your browser.',
+      s6Title: 'Security',
+      s6Body:
+        "Transport is encrypted. API keys are stored hashed. Each user's files live in their own directory, and the agent's shell runs in an isolated virtual machine over that user's files only. Prompts and completions are kept out of logs by design.",
+      s7Title: 'Your rights',
+      s7Body:
+        'You can see and download what you keep here at any time, and ask us to correct or delete it. Where the law gives you further rights over your data, you have them here too; write to the support address to exercise any of them.',
+      s8Title: 'Changes to this policy',
+      s8Body: 'We may revise this policy. The date at the top says when it last changed.',
+    },
+    refund: {
+      seoTitle: 'Ema Paper refund policy',
+      seoDescription: 'When a payment to Ema Paper is refunded, what happens at a renewal or an outage, and how to ask.',
+      title: 'Refund Policy',
+      lede: 'When a payment to {name} comes back, and how to ask.',
+      s1Title: 'Who sells, and who refunds',
+      s1Body:
+        'Paid plans are sold by Dodo Payments as merchant of record: it charges you, issues the invoice, handles tax, and makes refunds to the payment method you used.',
+      s2Title: 'Your first subscription',
+      s2Body:
+        'If a paid plan is not what you expected, ask within 14 days of your first purchase and we refund it in full, whatever you used.',
+      s3Title: 'Renewals',
+      s3Body:
+        'A renewal is not refunded. To avoid one, cancel in the customer portal before the period ends: your plan stays until then, and nothing more is charged.',
+      s4Title: 'When the service fails',
+      s4Body:
+        'A parse that fails costs no credits, so there is nothing to refund. If the service was unavailable or unusable for a meaningful part of a period you paid for, write to us: we credit the time back or refund it pro rata.',
+      s5Title: 'How to ask',
+      s5Body:
+        'Write to the support address below from the email address of your account, with the invoice or order number. We answer within a few business days, and a refund usually reaches your payment method within five to ten business days of being made, depending on your bank.\n\nIf a charge looks wrong, write to us before disputing it with your bank: a dispute takes far longer than a refund.',
+      s6Title: 'Changes to this policy',
+      s6Body: 'We may revise this policy. The date at the top says when it last changed.',
+    },
   },
 }

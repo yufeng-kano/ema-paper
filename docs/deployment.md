@@ -90,6 +90,7 @@ Certificates are always this stack's own: the site block carries an explicit `tl
 | `PARSE_MODEL`, `CHECK_MODEL`, `PARSE_FALLBACK_MODEL`, `CHAT_MODELS`, `MODEL_PRICES_JSON` | the models the deployment offers, with their list prices ([billing.md](./billing.md) § Models). The API and the worker refuse to start with an offered model unpriced; parses are refused with 503 while `PARSE_MODEL` is empty |
 | `CREDIT_USD`, `PARSE_CREDITS_PER_PAGE`, `CHAT_MIN_CREDITS`, `FREE_CREDITS_PER_PERIOD`, `FREE_STORAGE_BYTES`, `FREE_MAX_JOBS` | credits and the Free plan ([billing.md](./billing.md) § Credits, § Plans) |
 | `KANO_PAY_URL`, `KANO_PAY_APP_ID`, `KANO_PAY_API_KEY`, `KANO_PAY_WEBHOOK_SECRET`, `KANO_PAY_PLANS_JSON`, `BILLING_REFRESH_SECONDS` | the Kano Pay registration and the paid plans ([billing.md](./billing.md) § Kano Pay). The key and the secret live only in `.env`; all four unset = every user on Free |
+| `SUPPORT_EMAIL`, `OPERATOR_NAME` | the address the public Terms, Privacy and Refund pages name for questions, deletion and refund requests, and the name of who operates the service; both served by `GET /api/site`, either empty = the pages print no such line ([web.md](./web.md) § Pages). Dodo's site review needs the address |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | OIDC |
 | `AUTH_DEV_MODE` | local only; absent from `.env.production.example` |
 | `UPLOAD_MAX_BYTES`, `PAGE_CAP`, `MAX_JOBS_PER_USER`, `UPLOAD_RETRY_WINDOW_SECONDS`, `VISION_CONCURRENCY_PER_JOB`, `RENDER_WORKERS` | defaults in [api.md](./api.md) / [jobs.md](./jobs.md) |
