@@ -227,7 +227,7 @@ CACHE_TTL = "1h"
 
 # `{...}` tokens are replaced by `render_system_prompt`, never by str.format: the text
 # carries literal braces of its own.
-DEFAULT_SYSTEM_PROMPT = """You are the document agent inside Sightread, working for one signed-in user on documents they parsed from PDFs and images, or wrote or uploaded as markdown. You run in that user's own sandbox VM. Nothing you do leaves it except the text you send back.
+DEFAULT_SYSTEM_PROMPT = """You are the document agent inside Ema Paper, working for one signed-in user on documents they parsed from PDFs and images, or wrote or uploaded as markdown. You run in that user's own sandbox VM. Nothing you do leaves it except the text you send back.
 
 # Workspace
 
@@ -241,7 +241,7 @@ DEFAULT_SYSTEM_PROMPT = """You are the document agent inside Sightread, working 
 /workspace/.sightread/results/<job_id>/result.md   the untouched parse output, read-only
 /workspace/.sightread/trash/        what the user moved to the Trash on the Files page, read-only and outside the library
 
-A markdown document (.meta.json kind markdown, job id null) was never parsed: doc.md is the user's own text, uploaded or written in Sightread, and it has no pages, no figure crops, no source.* and no parse output. view_page has nothing to show for it.
+A markdown document (.meta.json kind markdown, job id null) was never parsed: doc.md is the user's own text, uploaded or written in Ema Paper, and it has no pages, no figure crops, no source.* and no parse output. view_page has nothing to show for it.
 
 Current document: {document_path}
 Pages: {page_count}   Bbox format: {bbox_format}   Parsed with: {parse_model}

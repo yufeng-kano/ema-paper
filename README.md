@@ -1,4 +1,4 @@
-# Sightread
+# Ema Paper
 
 <p align="center">
   <strong>Vision document parsing service: turn complex PDFs and images into structured Markdown with precise figure coordinates.</strong>
@@ -19,7 +19,7 @@
 
 ---
 
-**Sightread** is a self-hosted, multi-user document parsing service designed for developers and AI agents. It transforms unstructured PDFs, scans, and images into clean, layout-preserving Markdown, extracting exact bounding box coordinates for figures and charts.
+**Ema Paper** is a self-hosted, multi-user document parsing service designed for developers and AI agents. It transforms unstructured PDFs, scans, and images into clean, layout-preserving Markdown, extracting exact bounding box coordinates for figures and charts.
 
 Connect your Kano Proxy account in one click, or bring your own OpenAI-compatible vision endpoint. Every vision call runs on your own account with zero markup.
 
@@ -39,7 +39,7 @@ Connect your Kano Proxy account in one click, or bring your own OpenAI-compatibl
 ## How It Works
 
 <p align="center">
-  <img src="./docs/assets/how-it-works.svg" alt="How Sightread Works" width="100%" />
+  <img src="./docs/assets/how-it-works.svg" alt="How Ema Paper Works" width="100%" />
 </p>
 
 1. **Upload** a PDF, scan, or image via the Web UI, REST API, or Claude MCP tool.
@@ -80,12 +80,12 @@ curl -X POST http://localhost:8000/v1/parse \
 
 ### Claude Desktop / MCP Configuration
 
-Add Sightread to your `claude_desktop_config.json`:
+Add Ema Paper to your `claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
-    "sightread": {
+    "emapaper": {
       "command": "npx",
       "args": [
         "-y",

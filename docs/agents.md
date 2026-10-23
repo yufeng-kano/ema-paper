@@ -1,6 +1,6 @@
 # Agents
 
-Sightread hosts **agents**: named pieces of work a user runs against a document, each with its own upstream, model and prompt. There are three: `parse` — the vision pipeline of [parsing.md](./parsing.md) — `chat`, a tool-using conversation about one parsed document ([chat.md](./chat.md)), and `check`, which checks a Files upload's markdown before it opens ([parsing.md](./parsing.md) § Format check). The framework exists so an agent is a registry entry, a runner and a settings row.
+Ema Paper hosts **agents**: named pieces of work a user runs against a document, each with its own upstream, model and prompt. There are three: `parse` — the vision pipeline of [parsing.md](./parsing.md) — `chat`, a tool-using conversation about one parsed document ([chat.md](./chat.md)), and `check`, which checks a Files upload's markdown before it opens ([parsing.md](./parsing.md) § Format check). The framework exists so an agent is a registry entry, a runner and a settings row.
 
 ## The registry
 

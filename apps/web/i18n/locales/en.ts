@@ -1,7 +1,7 @@
 // Source catalog. Every user-visible string in the app lives here (docs/web.md).
 export default {
   app: {
-    name: 'Sightread',
+    name: 'Ema Paper',
     skipToContent: 'Skip to content',
   },
   language: {
@@ -42,7 +42,7 @@ export default {
     unexpected: 'Something went wrong.',
   },
   login: {
-    seoTitle: 'Sightread — parse PDFs and images into markdown with figure coordinates',
+    seoTitle: 'Ema Paper — parse PDFs and images into markdown with figure coordinates',
     seoDescription:
       'Hosted vision document parsing. POST a PDF or image, get markdown with figure bounding boxes, run on your own Kano Proxy key or any OpenAI-compatible endpoint. REST API and MCP connector for Claude.',
     pitchTitle: 'PDFs and images in, markdown with figure coordinates out.',
@@ -183,7 +183,7 @@ export default {
     kanoConnected: 'Kano Proxy',
     kanoDisconnect: 'Disconnect',
     kanoDisconnectConfirm:
-      'Disconnect Kano Proxy? Sightread forgets the key. The key itself stays listed on the Access page in Kano Proxy, where you can delete it.',
+      'Disconnect Kano Proxy? Ema Paper forgets the key. The key itself stays listed on the Access page in Kano Proxy, where you can delete it.',
     kanoOutcomeDenied: 'Access was not granted.',
     kanoOutcomeError: 'Connecting failed.',
     modelLabel: 'Model',

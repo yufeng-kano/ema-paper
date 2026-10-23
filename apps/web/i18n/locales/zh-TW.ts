@@ -1,6 +1,6 @@
 export default {
   app: {
-    name: 'Sightread',
+    name: 'Ema Paper',
     skipToContent: '跳到主要內容',
   },
   language: {
@@ -41,7 +41,7 @@ export default {
     unexpected: '發生錯誤。',
   },
   login: {
-    seoTitle: 'Sightread — 將 PDF 與圖片解析成帶圖表座標的 Markdown',
+    seoTitle: 'Ema Paper — 將 PDF 與圖片解析成帶圖表座標的 Markdown',
     seoDescription:
       '雲端視覺文件解析服務。上傳 PDF 或圖片，取得含圖表邊界框的 Markdown，使用你自己的 Kano Proxy 金鑰或任何 OpenAI 相容端點。提供 REST API 與 Claude 可用的 MCP 連接器。',
     pitchTitle: '送進 PDF 或圖片，取回帶圖表座標的 Markdown。',
@@ -177,7 +177,7 @@ export default {
     kanoConnected: 'Kano Proxy',
     kanoDisconnect: '中斷連接',
     kanoDisconnectConfirm:
-      '要中斷 Kano Proxy 嗎？Sightread 會刪除這把金鑰的副本。金鑰本身仍列在 Kano Proxy 的 Access 頁面，可以在那裡刪除。',
+      '要中斷 Kano Proxy 嗎？Ema Paper 會刪除這把金鑰的副本。金鑰本身仍列在 Kano Proxy 的 Access 頁面，可以在那裡刪除。',
     kanoOutcomeDenied: '未取得授權。',
     kanoOutcomeError: '連接失敗。',
     modelLabel: '模型',

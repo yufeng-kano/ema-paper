@@ -42,7 +42,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             await engine.dispose()
 
-    app = FastAPI(title="agent-sightread", lifespan=lifespan)
+    app = FastAPI(title="Ema Paper", lifespan=lifespan)
     app.state.settings = settings
     app.state.oauth = build_oauth(settings)
     # Page previews render in this process: Poppler and a decode, a few at a time

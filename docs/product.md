@@ -2,7 +2,11 @@
 
 ## What it is
 
-agent-sightread is a hosted, multi-user document-understanding service: PDF and image in, markdown with figure coordinate placeholders out. It descends from the "sightread MCP" spec (vision-based extraction, coordinates-not-crops) but is deliberately a **platform**, not a stateless tool.
+Ema Paper is a hosted, multi-user document-understanding service: PDF and image in, markdown with figure coordinate placeholders out. It descends from the "sightread MCP" spec (vision-based extraction, coordinates-not-crops) but is deliberately a **platform**, not a stateless tool.
+
+## Name
+
+The product is **Ema Paper** (renamed from Sightread on 2026-10-23). The name is what users see: the web app, the sign-in page's SEO title, the MCP server name, the agent prompts and these docs. The identifiers underneath keep the old word on purpose, because renaming them would break clients and data without changing anything a user sees: the repository `sightread`, the Python package `sightread`, the database and compose service names, browser storage keys, and the `sightread://` figure placeholder scheme, which is part of the `/v1/parse` contract ([api.md](./api.md)).
 
 ## Deliberate deviations from the origin spec
 
