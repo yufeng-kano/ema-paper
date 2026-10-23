@@ -12,7 +12,7 @@ import type { MenuItem, Point } from '~/lib/menu'
  *
  * The account row is the session's own menu: the avatar-and-name button opens `UiContextMenu`
  * — the same floating surface the library's right-click opens — headed by the address that is
- * signed in, holding Agent, Language, and sign-out below a rule. Everything the account is,
+ * signed in, holding Settings, Language, and sign-out below a rule. Everything the account is,
  * in one place, the way a desktop app's account menu holds it. Language is a row rather than a
  * submenu: it opens `LanguageDialog` (docs/web.md § The account menu).
  *
@@ -27,17 +27,13 @@ const localePath = useLocalePath()
 const auth = useAuth()
 
 /**
- * Ordered by how often a screen is opened, not by when it was built: the two that are the
- * work — Files and History — then the two that hand out credentials, and at the bottom the
- * two you visit occasionally and then leave alone: Usage and Agent (docs/web.md § Pages).
+ * The two screens that are the work. Everything configured once — the agent, keys, the
+ * connector, usage, theme, the account — is a section of the settings sheet behind the
+ * account menu, so the nav never fills with things opened twice a month (docs/web.md § Pages).
  */
 const NAV = [
   { icon: 'files', to: '/files', label: 'nav.files' },
   { icon: 'history', to: '/history', label: 'nav.history' },
-  { icon: 'keys', to: '/keys', label: 'nav.keys' },
-  { icon: 'connect', to: '/connect', label: 'nav.connect' },
-  { icon: 'dashboard', to: '/dashboard', label: 'nav.dashboard' },
-  { icon: 'agent', to: '/agents', label: 'nav.agents' },
 ] as const
 
 /** The signed-in identity: the name when Google sent one, the address otherwise. */
@@ -83,7 +79,7 @@ function closeAccountMenu() {
 }
 
 const accountItems = computed<MenuItem[]>(() => [
-  { key: 'agents', label: t('nav.agents'), icon: 'agent', to: localePath('/agents') },
+  { key: 'settings', label: t('nav.settings'), icon: 'settings' },
   { key: 'language', label: t('nav.language'), icon: 'globe' },
   { key: 'signOut', label: t('nav.signOut'), icon: 'sign-out', separated: true },
 ])
@@ -91,8 +87,14 @@ const accountItems = computed<MenuItem[]>(() => [
 /** The language dialog the menu's Language row opens (`LanguageDialog`). */
 const languageOpen = ref(false)
 
+/** The sheet remembers where it was opened from, so its X comes back here. */
+const settingsReturn = useSettingsReturn()
+
 function onAccountAction(action: string) {
-  if (action === 'language') {
+  if (action === 'settings') {
+    settingsReturn.value = route.fullPath
+    void navigateTo(localePath('/settings/general'))
+  } else if (action === 'language') {
     languageOpen.value = true
   } else if (action === 'signOut') {
     void signOut()

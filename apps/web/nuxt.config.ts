@@ -13,6 +13,15 @@ export default defineNuxtConfig({
     head: {
       htmlAttrs: { lang: 'en' },
       meta: [{ name: 'viewport', content: 'width=device-width, initial-scale=1' }],
+      // The pinned theme, applied before first paint so a reader who chose dark never sees
+      // the light tokens flash. The same key `useTheme` writes (docs/web.md § Design system).
+      script: [
+        {
+          innerHTML:
+            "try{var t=localStorage.getItem('sightread.theme');if(t==='light'||t==='dark'){document.documentElement.setAttribute('data-theme',t)}}catch(e){}",
+          tagPosition: 'head',
+        },
+      ],
       // The .ico is not decoration: clients that do not take SVG (and connector webviews
       // that just fetch /favicon.ico) fall back to whatever icon they already hold for the
       // parent domain when this 404s or answers a blank placeholder.
@@ -51,16 +60,22 @@ export default defineNuxtConfig({
     '/': { prerender: true },
     '/zh-TW': { prerender: true },
     // Control-plane pages are per-user and session-authenticated: client-rendered only.
-    '/dashboard': { ssr: false },
-    '/keys': { ssr: false },
-    '/agents': { ssr: false },
     '/files': { ssr: false },
     '/history': { ssr: false },
-    '/zh-TW/dashboard': { ssr: false },
-    '/zh-TW/keys': { ssr: false },
-    '/zh-TW/agents': { ssr: false },
+    '/settings/**': { ssr: false },
     '/zh-TW/files': { ssr: false },
     '/zh-TW/history': { ssr: false },
+    '/zh-TW/settings/**': { ssr: false },
+    // The four screens that became sections of the settings sheet (docs/web.md § Pages):
+    // a bookmark of the old path lands on its section.
+    '/agents': { redirect: '/settings/agent' },
+    '/keys': { redirect: '/settings/keys' },
+    '/connect': { redirect: '/settings/mcp' },
+    '/dashboard': { redirect: '/settings/usage' },
+    '/zh-TW/agents': { redirect: '/zh-TW/settings/agent' },
+    '/zh-TW/keys': { redirect: '/zh-TW/settings/keys' },
+    '/zh-TW/connect': { redirect: '/zh-TW/settings/mcp' },
+    '/zh-TW/dashboard': { redirect: '/zh-TW/settings/usage' },
   },
 
   nitro: {

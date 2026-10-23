@@ -9,9 +9,10 @@
  * only what has no component to belong to: the token blocks, the document reset, and the
  * four utilities (`.sr-only`, `.mono`, `.tabular`, `.eyebrow`) any of them may need.
  *
- * Light and dark are both first-class: every color token below is redeclared in the single
- * `prefers-color-scheme: dark` block, and nothing outside these two blocks names a color.
- * The light values are the design's own; the dark block is the same ramp inverted, since
+ * Light and dark are both first-class: every color token below is one `light-dark()` pair,
+ * resolved by `color-scheme` — the system's choice, or the one the reader pinned in the
+ * settings sheet (`data-theme` on <html>) — and nothing outside this block names a color.
+ * The light values are the design's own; the dark values are the same ramp inverted, since
  * the palette this system was handed is a light one.
  */
 
@@ -22,84 +23,88 @@
      Paper is the page and every control on it; sunken is the lower panel of a split
      region; rail is the nav column and the viewer's page list; desk is what shows outside
      the app frame. */
-  --paper: #fcfcfd;
-  --paper-sunken: #f7f8f9;
-  --rail: #f2f4f6;
-  --rail-active: #e6eaee;
-  --desk: #eceef0;
+  --paper: light-dark(#fcfcfd, #16191d);
+  --paper-sunken: light-dark(#f7f8f9, #121519);
+  --rail: light-dark(#f2f4f6, #1b1f24);
+  --rail-active: light-dark(#e6eaee, #272c33);
+  --desk: light-dark(#eceef0, #0e1114);
 
   /* --- Color: text --------------------------------------------------------
      Four steps, each clearing WCAG AA (4.5:1) on --paper: ink for headings and primary
      text, ink-soft for long-form body, muted for secondary, faint for the uppercase
      labels and captions. */
-  --ink: #15181c;
-  --ink-soft: #2f343a;
-  --muted: #4b5157;
-  --faint: #5c636a;
+  --ink: light-dark(#15181c, #eef1f4);
+  --ink-soft: light-dark(#2f343a, #d3d8dd);
+  --muted: light-dark(#4b5157, #aeb6bd);
+  --faint: light-dark(#5c636a, #949ca4);
 
   /* --- Color: rules -------------------------------------------------------
      Structure is carried by hairlines, not by card outlines, so the ramp is finer than a
      card system needs: line divides columns and panels, line-soft separates table rows,
      line-strong underlines a sticky header and bounds a dialog, hair rules inside a panel,
      edge is a control's own border. */
-  --line: #e4e8ec;
-  --line-soft: #eaedf0;
-  --line-strong: #dfe3e7;
-  --hair: #e0e5ea;
-  --edge: #cdd3d9;
+  --line: light-dark(#e4e8ec, #272c32);
+  --line-soft: light-dark(#eaedf0, #23282e);
+  --line-strong: light-dark(#dfe3e7, #333941);
+  --hair: light-dark(#e0e5ea, #2c323a);
+  --edge: light-dark(#cdd3d9, #454c55);
 
   /* --- Color: accent ------------------------------------------------------
      Data only. Cost figures, meters, the brand mark, primary buttons, the succeeded dot,
      active page markers, the active locale's underline, focus rings. Never a heading,
      never a border, never decoration (docs/web.md § Design system). */
-  --accent: #17607d;
-  --accent-fg: #fcfcfd;
-  --accent-hover: #124f68;
+  --accent: light-dark(#17607d, #6aa9c4);
+  --accent-fg: light-dark(#fcfcfd, #10161a);
+  --accent-hover: light-dark(#124f68, #8bbed4);
 
   /* --- Color: status ------------------------------------------------------
      Succeeded is the accent itself — it is the only status that is also data. */
   --running: #6f9ab1;
-  --queued: #9aa3ab;
-  --danger: #a3341f;
-  --danger-edge: #e0b6ac;
-  --danger-hover: #f7f0ee;
+  --queued: light-dark(#9aa3ab, #79828b);
+  --danger: light-dark(#a3341f, #e08b76);
+  --danger-edge: light-dark(#e0b6ac, #6d3628);
+  --danger-hover: light-dark(#f7f0ee, #221715);
 
   /* --- Color: find --------------------------------------------------------
      The result viewer's search. Every hit takes the accent as a wash and the one you are
      on takes it solid, because "where am I in 40 hits" is the question the bar exists to
      answer. The accent is data here, not decoration: a hit is a position in a document. */
-  --find: rgb(23 96 125 / 18%);
-  --find-current: #17607d;
-  --find-current-fg: #fcfcfd;
+  --find: light-dark(rgb(23 96 125 / 18%), rgb(106 169 196 / 26%));
+  --find-current: light-dark(#17607d, #6aa9c4);
+  --find-current-fg: light-dark(#fcfcfd, #10161a);
   /* A heading an answer's section link scrolled to, washed for a moment so the eye lands
      on it (docs/web.md § The agent panel, *Section links*). */
-  --accent-wash: rgb(23 96 125 / 9%);
+  --accent-wash: light-dark(rgb(23 96 125 / 9%), rgb(106 169 196 / 14%));
   /* The result viewer's block selection: neutral, between rail and rail-active, because
      selecting blocks commits nothing and an accent wash already means a place the viewer
      led the reader to (docs/web.md § Design system). */
-  --block-selected: #eef1f4;
+  --block-selected: light-dark(#eef1f4, #21262c);
 
   /* --- Color: diff ---------------------------------------------------------
      The agent panel's edit cards: a removed line sits on the danger wash, an added one on
      the accent wash — the same two hues the rest of the app already gives to "gone" and
      "data", at a strength text stays readable on (docs/web.md § The agent panel). */
-  --diff-removed: rgb(163 52 31 / 9%);
-  --diff-added: rgb(23 96 125 / 9%);
+  --diff-removed: light-dark(rgb(163 52 31 / 9%), rgb(224 139 118 / 14%));
+  --diff-added: light-dark(rgb(23 96 125 / 9%), rgb(106 169 196 / 14%));
 
   /* --- Color: interaction -------------------------------------------------- */
-  --overlay: rgb(21 24 28 / 42%);
-  /* The only shadow in the system: dialogs, and the sidebar when it is a drawer. */
-  --shadow-dialog: 0 24px 60px rgb(21 24 28 / 18%);
+  --overlay: light-dark(rgb(21 24 28 / 42%), rgb(6 8 10 / 62%));
+  /* The only shadow in the system: dialogs, and the sidebar when it is a drawer. A shadow
+     is not a color, so its color is the token that switches with the theme. */
+  --shadow-dialog-color: light-dark(rgb(21 24 28 / 18%), rgb(0 0 0 / 55%));
+  --shadow-dialog: 0 24px 60px var(--shadow-dialog-color);
 
   /* --- The context menu ---------------------------------------------------
      A floating surface, and the one thing in this design that is not flat paper: it is
      translucent over whatever it covers, hairlined, and rounded, so it reads as hovering
      above the page rather than cut into it. Its own tokens because nothing else in the app
      is built this way (docs/web.md § Design system). */
-  --menu-surface: rgb(252 252 253 / 98%);
-  --menu-edge: rgb(21 24 28 / 14%);
+  --menu-surface: light-dark(rgb(252 252 253 / 98%), rgb(38 43 50 / 98%));
+  --menu-edge: light-dark(rgb(21 24 28 / 14%), rgb(255 255 255 / 12%));
+  --shadow-menu-near: light-dark(rgb(21 24 28 / 8%), rgb(0 0 0 / 40%));
+  --shadow-menu-far: light-dark(rgb(21 24 28 / 16%), rgb(0 0 0 / 50%));
   --shadow-menu:
-    0 1px 2px rgb(21 24 28 / 8%), 0 12px 32px rgb(21 24 28 / 16%);
+    0 1px 2px var(--shadow-menu-near), 0 12px 32px var(--shadow-menu-far);
 
   /* --- Spacing ------------------------------------------------------------
      A 4px base. Component padding, gaps and margins pick from here so density is tuned in
@@ -230,44 +235,15 @@
   }
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --paper: #16191d;
-    --paper-sunken: #121519;
-    --rail: #1b1f24;
-    --rail-active: #272c33;
-    --desk: #0e1114;
-    --ink: #eef1f4;
-    --ink-soft: #d3d8dd;
-    --muted: #aeb6bd;
-    --faint: #949ca4;
-    --line: #272c32;
-    --line-soft: #23282e;
-    --line-strong: #333941;
-    --hair: #2c323a;
-    --edge: #454c55;
-    --accent: #6aa9c4;
-    --accent-fg: #10161a;
-    --accent-hover: #8bbed4;
-    --running: #6f9ab1;
-    --queued: #79828b;
-    --danger: #e08b76;
-    --danger-edge: #6d3628;
-    --danger-hover: #221715;
-    --find: rgb(106 169 196 / 26%);
-    --find-current: #6aa9c4;
-    --find-current-fg: #10161a;
-    --accent-wash: rgb(106 169 196 / 14%);
-    --block-selected: #21262c;
-    --diff-removed: rgb(224 139 118 / 14%);
-    --diff-added: rgb(106 169 196 / 14%);
-    --overlay: rgb(6 8 10 / 62%);
-    --shadow-dialog: 0 24px 60px rgb(0 0 0 / 55%);
-    --menu-surface: rgb(38 43 50 / 98%);
-    --menu-edge: rgb(255 255 255 / 12%);
-    --shadow-menu:
-      0 1px 2px rgb(0 0 0 / 40%), 0 12px 32px rgb(0 0 0 / 50%);
-  }
+/* The reader's choice, from the settings sheet (docs/web.md § Design system, *Theme*). With
+   no attribute every `light-dark()` pair above follows the system; pinned, it follows the pin.
+   An inline script in <head> sets the attribute from localStorage before first paint. */
+:root[data-theme="light"] {
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
 }
 
 /* --- Document ------------------------------------------------------------- */

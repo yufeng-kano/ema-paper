@@ -1,6 +1,4 @@
 <script setup lang="ts">
-definePageMeta({ middleware: 'authed' })
-
 const { t } = useI18n()
 
 // The connector URL is this deployment's own origin; Caddy routes /mcp to the API.
@@ -15,32 +13,30 @@ const STEPS = ['connect.step1', 'connect.step2', 'connect.step3'] as const
 </script>
 
 <template>
-  <UiScreen>
-    <UiRail>
-      <UiPageHeader :eyebrow="t('connect.eyebrow')" :title="t('connect.headTitle')" size="md" />
-    </UiRail>
+  <SettingsSection :eyebrow="t('connect.eyebrow')" :title="t('connect.headTitle')">
+    <div class="region">
+      <h2 class="heading">{{ t('connect.mcpTitle') }}</h2>
+      <div class="endpoint">
+        <span class="endpoint-url mono">{{ mcpUrl }}</span>
+        <UiCopyButton :text="mcpUrl" variant="secondary" size="sm" labelled />
+      </div>
 
-    <UiRegion>
-      <UiPanel section>
-        <h2 class="heading">{{ t('connect.mcpTitle') }}</h2>
-        <div class="endpoint">
-          <span class="endpoint-url mono">{{ mcpUrl }}</span>
-          <UiCopyButton :text="mcpUrl" variant="secondary" size="sm" labelled />
-        </div>
-
-        <p class="eyebrow steps-label">{{ t('connect.howTitle') }}</p>
-        <ol class="steps">
-          <li v-for="(step, index) in STEPS" :key="step" class="step">
-            <span class="step-number tabular">{{ String(index + 1).padStart(2, '0') }}</span>
-            <p class="step-body">{{ t(step) }}</p>
-          </li>
-        </ol>
-      </UiPanel>
-    </UiRegion>
-  </UiScreen>
+      <p class="eyebrow steps-label">{{ t('connect.howTitle') }}</p>
+      <ol class="steps">
+        <li v-for="(step, index) in STEPS" :key="step" class="step">
+          <span class="step-number tabular">{{ String(index + 1).padStart(2, '0') }}</span>
+          <p class="step-body">{{ t(step) }}</p>
+        </li>
+      </ol>
+    </div>
+  </SettingsSection>
 </template>
 
 <style scoped>
+.region {
+  padding-top: var(--space-8);
+}
+
 .heading {
   font-size: var(--display-sm);
   letter-spacing: normal;

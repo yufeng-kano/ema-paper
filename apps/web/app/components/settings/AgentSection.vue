@@ -1,10 +1,10 @@
 <script setup lang="ts">
 /**
- * Agent (docs/web.md § Pages): every agent runs on the user's own Kano Proxy, so the page
- * has two states. Not connected, it is one control — the connect link, nothing else.
- * Connected, the rail lists the agents as tabs with the Kano Proxy line at its foot, and
- * the data region shows the selected agent's panel (`AgentPanel`) and nothing else. The
- * `check` agent is no tab: its settings are the parse panel's *Format check*.
+ * Agent (docs/web.md § Pages, `/settings/agent`): every agent runs on the user's own Kano
+ * Proxy, so the section opens with the Kano Proxy row — the connect button while there is
+ * no key, the key's tail and Disconnect once there is one. Connected, the agents follow as
+ * a tab row over the selected agent's panel (`AgentPanel`) and nothing else. The `check`
+ * agent is no tab: its settings are the parse panel's *Format check*.
  */
 import {
   deleteKano,
@@ -14,8 +14,6 @@ import {
   type AgentEntry,
   type SavedAgentSettings,
 } from '~/lib/api'
-
-definePageMeta({ middleware: 'authed' })
 
 const { t, te, locale } = useI18n()
 const route = useRoute()
@@ -118,7 +116,7 @@ function agentTitle(agent: AgentEntry): string {
 
 /** Arrow keys move between tabs, as a tab list is expected to. */
 function onTabKeydown(event: KeyboardEvent, index: number) {
-  const step = event.key === 'ArrowDown' ? 1 : event.key === 'ArrowUp' ? -1 : 0
+  const step = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0
   if (!step || tabs.value.length === 0) {
     return
   }
@@ -133,96 +131,81 @@ function onTabKeydown(event: KeyboardEvent, index: number) {
   list?.querySelectorAll<HTMLElement>('[role="tab"]')[nextIndex]?.focus()
 }
 </script>
-
 <template>
-  <UiScreen v-if="!kano || !kano.connected" full>
-    <!-- Not connected: one control on the whole screen. -->
-    <UiRegion>
-      <UiPanel section>
-        <div class="connect">
-          <UiBanner v-if="kanoError" tone="error">{{ kanoError }}</UiBanner>
-          <UiSkeleton v-else-if="!kano" :rows="1" />
-          <p v-else-if="!kano.available" class="state">{{ t('agents.kanoUnavailable') }}</p>
-          <template v-else>
-            <p v-if="kanoOutcome === 'denied'" class="outcome" role="status">
-              {{ t('agents.kanoOutcomeDenied') }}
-            </p>
-            <p v-else-if="kanoOutcome === 'error'" class="outcome" role="status">
-              {{ t('agents.kanoOutcomeError') }}
-            </p>
-            <UiButton variant="primary" :href="connectHref">{{ t('agents.kanoConnect') }}</UiButton>
-          </template>
-        </div>
-      </UiPanel>
-    </UiRegion>
-  </UiScreen>
-
-  <UiScreen v-else>
-    <!-- Connected: the agents as tabs, the selected one's panel. -->
-    <UiRail>
-      <UiPageHeader :title="t('agents.headTitle')" />
-
-      <UiBanner v-if="agentsError" tone="error">{{ agentsError }}</UiBanner>
-      <UiSkeleton v-else-if="!agentsData" :rows="2" />
-      <div v-else class="tabs" role="tablist" :aria-label="t('agents.tabs')" aria-orientation="vertical">
-        <button
-          v-for="(agent, index) in tabs"
-          :key="agent.name"
-          type="button"
-          role="tab"
-          class="tab"
-          :class="{ active: selected?.name === agent.name }"
-          :aria-selected="selected?.name === agent.name"
-          :tabindex="selected?.name === agent.name ? 0 : -1"
-          @click="selectedName = agent.name"
-          @keydown="onTabKeydown($event, index)"
-        >
-          <span class="tab-label">{{ agentTitle(agent) }}</span>
-          <UiStatusDot
-            :tone="agent.settings.model ? 'ok' : 'neutral'"
-            :label="agent.settings.model ? t('agents.modelChosen') : t('agents.modelMissing')"
-          />
-        </button>
-      </div>
-
-      <!-- The foot: what every agent runs on. The key's tail and Disconnect appear on
-           hover or focus, and always where there is no hover. -->
-      <div class="kano">
+  <SettingsSection :title="t('agents.headTitle')">
+    <!-- What every agent runs on. Not connected, the row is the connect control; connected,
+         the key's tail and Disconnect. -->
+    <SettingsRow :label="t('agents.kanoConnected')">
+      <UiSkeleton v-if="!kano && !kanoError" class="kano-wait" :rows="1" />
+      <template v-else-if="kano?.connected">
         <p class="kano-line">
-          <UiStatusDot class="kano-status" tone="ok" :label="t('agents.kanoConnected')" />
-          <span class="mono reveal">{{ keyTail }}</span>
+          <UiStatusDot class="kano-status" tone="ok" :label="t('agents.kanoConnectedState')" />
+          <span class="mono kano-tail">{{ keyTail }}</span>
         </p>
         <button
           type="button"
-          class="text-link danger reveal"
+          class="text-link danger"
           :disabled="disconnectPending"
           @click="confirmingDisconnect = true"
         >
           {{ t('agents.kanoDisconnect') }}
         </button>
-      </div>
-    </UiRail>
+      </template>
+      <p v-else-if="kano && !kano.available" class="state">{{ t('agents.kanoUnavailable') }}</p>
+      <UiButton v-else-if="kano" variant="primary" :href="connectHref">
+        {{ t('agents.kanoConnect') }}
+      </UiButton>
 
-    <!-- Positioned: the panel's drawers anchor to the region's right edge, outside the
-         panel's own scroll. -->
-    <UiRegion class="agent-region">
-      <UiPanel v-if="selected" :title="agentTitle(selected)" lead>
-        <template #meta>
-          <span class="mono io">{{ selected.input }} → {{ selected.output }}</span>
-        </template>
-        <AgentPanel
-          :key="selected.name"
-          :agent="selected"
-          :check="checkAgent"
-          :prompt-max-chars="promptMaxChars"
-          @saved="setAgentSettings"
-        />
-      </UiPanel>
-      <UiPanel v-else section>
-        <UiBanner v-if="agentsError" tone="error">{{ agentsError }}</UiBanner>
-        <UiSkeleton v-else :rows="3" />
-      </UiPanel>
-    </UiRegion>
+      <template v-if="kanoError || kanoOutcome === 'denied' || kanoOutcome === 'error'" #note>
+        <UiBanner v-if="kanoError" tone="error">{{ kanoError }}</UiBanner>
+        <p v-else-if="kanoOutcome === 'denied'" class="outcome" role="status">
+          {{ t('agents.kanoOutcomeDenied') }}
+        </p>
+        <p v-else class="outcome" role="status">{{ t('agents.kanoOutcomeError') }}</p>
+      </template>
+    </SettingsRow>
+
+    <template v-if="kano?.connected">
+      <UiBanner v-if="agentsError" class="agents-state" tone="error">{{ agentsError }}</UiBanner>
+      <UiSkeleton v-else-if="!agentsData" class="agents-state" :rows="2" />
+      <template v-else>
+        <div class="tabs" role="tablist" :aria-label="t('agents.tabs')">
+          <button
+            v-for="(agent, index) in tabs"
+            :key="agent.name"
+            type="button"
+            role="tab"
+            class="tab"
+            :class="{ active: selected?.name === agent.name }"
+            :aria-selected="selected?.name === agent.name"
+            :tabindex="selected?.name === agent.name ? 0 : -1"
+            @click="selectedName = agent.name"
+            @keydown="onTabKeydown($event, index)"
+          >
+            <span class="tab-label">{{ agentTitle(agent) }}</span>
+            <UiStatusDot
+              :tone="agent.settings.model ? 'ok' : 'neutral'"
+              :label="agent.settings.model ? t('agents.modelChosen') : t('agents.modelMissing')"
+            />
+          </button>
+        </div>
+
+        <!-- Positioned: the panel's drawers anchor to this box's right edge. -->
+        <div v-if="selected" class="agent-region">
+          <div class="agent-head">
+            <h2 class="agent-title">{{ agentTitle(selected) }}</h2>
+            <span class="mono io">{{ selected.input }} → {{ selected.output }}</span>
+          </div>
+          <AgentPanel
+            :key="selected.name"
+            :agent="selected"
+            :check="checkAgent"
+            :prompt-max-chars="promptMaxChars"
+            @saved="setAgentSettings"
+          />
+        </div>
+      </template>
+    </template>
 
     <UiConfirmDialog
       v-if="confirmingDisconnect"
@@ -234,19 +217,63 @@ function onTabKeydown(event: KeyboardEvent, index: number) {
       @confirm="disconnectKano"
       @cancel="confirmingDisconnect = false"
     />
-  </UiScreen>
+  </SettingsSection>
 </template>
 
 <style scoped>
-/* --- Not connected ---------------------------------------------------------- */
+/* --- The Kano Proxy row -------------------------------------------------------- */
 
-.connect {
+.kano-wait {
+  width: 160px;
+}
+
+.kano-line {
   display: flex;
-  flex-direction: column;
   align-items: center;
-  justify-content: center;
-  gap: var(--space-4);
-  min-height: 60vh;
+  gap: var(--space-2);
+  min-width: 0;
+  color: var(--muted);
+  font-size: var(--text-sm);
+}
+
+.kano-status {
+  flex-shrink: 0;
+}
+
+.kano-status :deep(.label) {
+  color: var(--muted);
+}
+
+.kano-tail {
+  font-size: var(--text-xs);
+}
+
+.text-link {
+  flex-shrink: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: var(--text-sm);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+
+.text-link.danger {
+  color: var(--danger);
+}
+
+.text-link:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.state {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--text-sm);
 }
 
 .outcome {
@@ -255,17 +282,17 @@ function onTabKeydown(event: KeyboardEvent, index: number) {
   font-size: var(--text-sm);
 }
 
-.state {
-  margin: 0;
-  color: var(--muted);
-}
+/* --- The tabs ------------------------------------------------------------------ */
 
-/* --- Rail: the tabs ---------------------------------------------------------- */
+.agents-state {
+  margin-top: var(--space-6);
+}
 
 .tabs {
   display: flex;
-  flex-direction: column;
+  flex-wrap: wrap;
   gap: 2px;
+  padding: var(--space-6) 0 var(--space-2);
 }
 
 /* The same row the sidebar's nav uses: a fill and a step up in weight say "open",
@@ -274,15 +301,14 @@ function onTabKeydown(event: KeyboardEvent, index: number) {
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  height: var(--control-height);
+  height: var(--control-height-sm);
   padding: 0 var(--space-3);
   border: 0;
   border-radius: var(--radius);
   background: transparent;
   color: var(--ink-soft);
   font: inherit;
-  font-size: var(--text-base);
-  text-align: left;
+  font-size: var(--text-sm);
   cursor: pointer;
   transition:
     background var(--duration-fast) var(--ease),
@@ -301,104 +327,35 @@ function onTabKeydown(event: KeyboardEvent, index: number) {
 }
 
 .tab-label {
-  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-/* --- Rail: the Kano Proxy line ---------------------------------------------- */
+/* --- The selected agent ---------------------------------------------------------- */
 
-/* Wraps rather than squeezes: on a narrow rail Disconnect drops under the line. */
-.kano {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-3);
-  margin-top: auto;
-  padding-top: var(--space-4);
-  border-top: 1px solid var(--line);
-}
-
-.kano-line {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  margin: 0;
-  min-width: 0;
-  color: var(--muted);
-  font-size: var(--text-xs);
-}
-
-/* The dot's label is the line's text; it never shrinks under the key's tail. */
-.kano-status {
-  flex-shrink: 0;
-}
-
-.kano-status :deep(.label) {
-  color: var(--muted);
-}
-
-.kano-line .mono {
-  font-size: var(--text-2xs);
-}
-
-.reveal {
-  opacity: 0;
-  transition: opacity var(--duration-fast) var(--ease);
-}
-
-.kano:hover .reveal,
-.kano:focus-within .reveal {
-  opacity: 1;
-}
-
-@media (hover: none) {
-  .reveal {
-    opacity: 1;
-  }
-}
-
-.text-link {
-  flex-shrink: 0;
-  padding: 0;
-  border: 0;
-  background: none;
-  color: var(--muted);
-  font: inherit;
-  font-size: var(--text-xs);
-  text-decoration: underline;
-  text-underline-offset: 3px;
-  cursor: pointer;
-}
-
-.text-link.danger {
-  color: var(--danger);
-}
-
-.text-link:disabled {
-  cursor: not-allowed;
-  opacity: 0.5;
-}
-
-/* --- Region -------------------------------------------------------------------- */
-
-/* The containing block of *What the agent receives*, which stays put while the panel
-   scrolls under it (docs/web.md § Pages). */
+/* The containing block of *What the agent receives*, which anchors to this box's right
+   edge (docs/web.md § Pages). */
 .agent-region {
   position: relative;
+  padding-top: var(--space-4);
+}
+
+.agent-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding-bottom: var(--space-3);
+}
+
+.agent-title {
+  font-size: var(--display-sm);
 }
 
 .io {
   color: var(--muted);
   font-size: var(--text-xs);
-}
-
-@media (max-width: 900px) {
-  .kano {
-    margin-top: var(--space-4);
-  }
 }
 </style>

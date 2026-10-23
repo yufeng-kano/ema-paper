@@ -1,8 +1,8 @@
 <script setup lang="ts">
 /**
- * Usage (docs/web.md § Pages): three sections behind a vertical tab list in the rail —
- * Calls, Conversations, Sandbox — each row carrying its headline figure, the data region
- * showing the selected one only. Billed, estimated and unpriced never share a figure
+ * Usage (docs/web.md § Pages, `/settings/usage`): three sections behind a tab row under
+ * the title — Calls, Conversations, Sandbox — each tab carrying its headline figure, the
+ * column below showing the selected one only. Billed, estimated and unpriced never share a figure
  * (docs/api.md § Usage aggregates): a cost with no billed call behind it reads "—", an
  * estimate is always prefixed "≈", and an unpriced call is a count.
  */
@@ -19,8 +19,6 @@ import { formatBytes, formatCost, formatCount, formatDay, formatShortDateTime } 
 import type { TableColumn } from '~/lib/table'
 import { cacheReadRatio, summarizeUsage, type UsageRow } from '~/lib/usage'
 
-definePageMeta({ middleware: 'authed' })
-
 const USAGE_DAYS = 30
 
 const { t, locale } = useI18n()
@@ -32,7 +30,7 @@ const section = ref<Section>('calls')
 
 /** Arrow keys move between tabs, as a tab list is expected to. */
 function onTabKeydown(event: KeyboardEvent, index: number) {
-  const step = event.key === 'ArrowDown' ? 1 : event.key === 'ArrowUp' ? -1 : 0
+  const step = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0
   if (!step) {
     return
   }
@@ -183,13 +181,11 @@ async function runSandboxAction(action: () => Promise<void>) {
 </script>
 
 <template>
-  <UiScreen>
-    <UiRail>
-      <UiPageHeader :eyebrow="t('dashboard.period', { days: USAGE_DAYS })" :title="t('dashboard.headTitle')" />
-
-      <!-- The three sections, each row carrying its headline figure: an estimate for the
-           two that cost something, the VM's state for the third. -->
-      <div class="tabs" role="tablist" :aria-label="t('dashboard.sections')" aria-orientation="vertical">
+  <SettingsSection :eyebrow="t('dashboard.period', { days: USAGE_DAYS })" :title="t('dashboard.headTitle')">
+    <!-- The three sections, each tab carrying its headline figure: an estimate for the
+         two that cost something, the VM's state for the third. -->
+    <div class="tabs-row">
+      <div class="tabs" role="tablist" :aria-label="t('dashboard.sections')">
         <button
           type="button"
           role="tab"
@@ -239,13 +235,12 @@ async function runSandboxAction(action: () => Promise<void>) {
           />
         </button>
       </div>
+      <p class="tabs-note">{{ t('dashboard.estimateNote') }}</p>
+    </div>
 
-      <p class="rail-note">{{ t('dashboard.estimateNote') }}</p>
-    </UiRail>
-
-    <UiRegion>
+    <div class="region">
       <!-- ---------- Calls ---------- -->
-      <UiPanel v-if="section === 'calls'" :title="t('dashboard.tabCalls')" lead flush>
+      <UiPanel v-if="section === 'calls'" :title="t('dashboard.tabCalls')" flush>
         <template #meta>
           <span>{{ t('dashboard.callsMeta') }}</span>
           <UiButton
@@ -366,7 +361,7 @@ async function runSandboxAction(action: () => Promise<void>) {
       </UiPanel>
 
       <!-- ---------- Conversations ---------- -->
-      <UiPanel v-else-if="section === 'conversations'" :title="t('dashboard.tabConversations')" lead flush>
+      <UiPanel v-else-if="section === 'conversations'" :title="t('dashboard.tabConversations')" flush>
         <template #meta>
           <span>{{ t('dashboard.conversationsMeta') }}</span>
           <UiButton
@@ -449,7 +444,7 @@ async function runSandboxAction(action: () => Promise<void>) {
       </UiPanel>
 
       <!-- ---------- Sandbox ---------- -->
-      <UiPanel v-else :title="t('dashboard.tabSandbox')" lead flush>
+      <UiPanel v-else :title="t('dashboard.tabSandbox')" flush>
         <template #meta>
           <template v-if="sandboxAvailable">
             <UiButton
@@ -551,7 +546,7 @@ async function runSandboxAction(action: () => Promise<void>) {
           </template>
         </div>
       </UiPanel>
-    </UiRegion>
+    </div>
 
     <UiConfirmDialog
       v-if="confirmingReset"
@@ -563,15 +558,21 @@ async function runSandboxAction(action: () => Promise<void>) {
       @confirm="runSandboxAction(resetSandbox)"
       @cancel="confirmingReset = false"
     />
-  </UiScreen>
+  </SettingsSection>
 </template>
 
 <style scoped>
-/* --- Rail: the tabs ---------------------------------------------------------- */
+/* --- The tabs ------------------------------------------------------------------ */
+
+.tabs-row {
+  display: grid;
+  gap: var(--space-3);
+  padding: var(--space-6) 0 var(--space-2);
+}
 
 .tabs {
   display: flex;
-  flex-direction: column;
+  flex-wrap: wrap;
   gap: 2px;
 }
 
@@ -633,9 +634,8 @@ async function runSandboxAction(action: () => Promise<void>) {
   color: var(--faint);
 }
 
-/* One line at the rail's foot: what the cost figures are. */
-.rail-note {
-  margin-top: auto;
+/* One line under the tabs: what the cost figures are. */
+.tabs-note {
   color: var(--muted);
   font-size: var(--text-xs);
   line-height: 1.6;

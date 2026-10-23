@@ -322,7 +322,7 @@ onBeforeUnmount(() => {
         </ul>
       </template>
 
-      <NuxtLink :to="localePath('/agents')" class="manage">{{ t('chat.memory.manage') }}</NuxtLink>
+      <NuxtLink :to="localePath('/settings/agent')" class="manage">{{ t('chat.memory.manage') }}</NuxtLink>
     </div>
   </Teleport>
 </template>
