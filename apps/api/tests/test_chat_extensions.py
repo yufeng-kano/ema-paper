@@ -1055,6 +1055,89 @@ async def test_a_subagent_that_spends_the_balance_ends_the_turn(
     assert (turn["status"], turn["error"], turn["credits"]) == ("failed", "out_of_credits", 5)
     result = thread["messages"][2]["content"][0]
     assert result["is_error"] and result["content"] == chat_runner.OUT_OF_CREDITS
+
+
+@respx.mock
+async def test_a_write_waiting_when_a_subagent_spends_the_balance_is_not_started(
+    make_client, tmp_path, monkeypatch
+) -> None:
+    """docs/billing.md § A chat turn: a tool of the round not yet started when the balance
+    is spent answers an error result; the write already running finishes."""
+    client = await chatting_client(
+        make_client(
+            workspaces_dir=str(tmp_path / "workspaces"),
+            free_credits_per_period=4,
+            credit_usd="0.00005",
+        )
+    )
+    created = await client.post(
+        "/api/subagents",
+        json={
+            "name": "quick",
+            "description": "Fast reads",
+            "model": "claude-code/claude-haiku-5-5",
+            "tools": ["view_page"],
+            "prompt": "Read fast.",
+        },
+        headers=CSRF_HEADERS,
+    )
+    assert created.status_code == 201, created.text
+    writes: list[str] = []
+
+    async def run_mutating(ctx, name, tool_input):
+        # The first write of the round runs until the subagent beside it has spent the
+        # balance, so the second is still waiting its turn when that happens.
+        writes.append(tool_input["path"])
+        for _ in range(200):
+            if ctx.credits_exhausted:
+                break
+            await asyncio.sleep(0.05)
+        return chat_tools.ToolOutcome("written")
+
+    monkeypatch.setattr(chat_runner, "run_mutating", run_mutating)
+    main, sub = stub_messages(
+        [
+            (
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "call",
+                        "name": "subagent",
+                        "input": {"name": "quick", "task": "Read page 1."},
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "w1",
+                        "name": "str_replace_based_edit_tool",
+                        "input": {"command": "create", "path": "a.md", "file_text": "a"},
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "w2",
+                        "name": "str_replace_based_edit_tool",
+                        "input": {"command": "create", "path": "b.md", "file_text": "b"},
+                    },
+                ],
+                "tool_use",
+            ),
+            ([{"type": "text", "text": "Never sent."}], "end_turn"),
+        ],
+        [one_call("p1", "view_page", {"page": 1})],
+    )
+    conversation_id = await new_conversation(client)
+    await send(client, conversation_id, text="Write")
+    await _run_queued_turn(client)
+
+    assert (len(main), len(sub), writes) == (1, 1, ["a.md"])
+    thread = (await client.get(f"/api/conversations/{conversation_id}")).json()
+    [turn] = thread["turns"]
+    assert (turn["status"], turn["error"]) == ("failed", "out_of_credits")
+    results = thread["messages"][2]["content"]
+    assert [(block.get("is_error", False), block["content"]) for block in results] == [
+        (True, chat_runner.OUT_OF_CREDITS),
+        (False, "written"),
+        (True, chat_runner.NOT_RUN_OUT_OF_CREDITS),
+    ]
     billing = (await client.get("/api/billing")).json()
     assert (billing["period"]["spent"], billing["period"]["remaining"]) == (5, -1)
 

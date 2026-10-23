@@ -1081,6 +1081,7 @@ def round_context() -> SimpleNamespace:
         sandbox=None,
         turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
         image_spent=0,
+        credits_exhausted=False,
         writers={},
         write_gate=asyncio.Lock(),
     )

@@ -896,6 +896,7 @@ def _round_ctx(image_budget: int = 32 << 20) -> SimpleNamespace:
             chat_page_image_max_pixels=1,
         ),
         image_spent=0,
+        credits_exhausted=False,
         writers={},
         write_gate=asyncio.Lock(),
     )
@@ -937,6 +938,7 @@ async def test_a_rounds_images_never_exceed_the_budget(monkeypatch) -> None:
         sandbox=None,
         turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
         image_spent=0,
+        credits_exhausted=False,
     )
     tool_uses = [
         {"type": "tool_use", "id": str(index), "name": "view_page", "input": {"page": index + 1}}
@@ -1985,6 +1987,7 @@ async def test_a_turns_images_never_exceed_the_turn_budget(monkeypatch) -> None:
         sandbox=None,
         turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
         image_spent=0,
+        credits_exhausted=False,
     )
     one_round = [
         {"type": "tool_use", "id": str(index), "name": "view_page", "input": {"page": index + 1}}
@@ -2053,6 +2056,7 @@ async def test_a_shell_command_holds_the_workspace_lock(tmp_path, monkeypatch) -
         sandbox=object(),
         turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
         image_spent=0,
+        credits_exhausted=False,
         writers={},
         write_gate=asyncio.Lock(),
     )
@@ -2227,6 +2231,7 @@ async def test_a_shell_move_is_reconciled_before_the_lock_is_released(
         sessionmaker=Sessions(),
         turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
         image_spent=0,
+        credits_exhausted=False,
         writers={},
         write_gate=asyncio.Lock(),
     )

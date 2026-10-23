@@ -974,6 +974,7 @@ IMAGE_TURN_BUDGET_SPENT = (
     "the user ask again."
 )
 OUT_OF_CREDITS = "The subagent stopped: the account's credits are spent."
+NOT_RUN_OUT_OF_CREDITS = "This tool was not run: the account's credits are spent."
 
 
 def _image_bytes(result: dict) -> int:
@@ -1036,6 +1037,16 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
                 if stopped.is_set() or await _cancelled(ctx):
                     stopped.set()
                     return
+                if ctx.credits_exhausted:
+                    # A subagent beside this read spent the balance: a read not yet
+                    # started is not started (docs/billing.md § A chat turn).
+                    results[index] = await _report_tool(
+                        ctx,
+                        str(block.get("id")),
+                        block.get("name"),
+                        chat_tools.ToolOutcome(NOT_RUN_OUT_OF_CREDITS, is_error=True),
+                    )
+                    return
                 # `memory` returns no image, so a spent budget is no reason to refuse it:
                 # a reader's "remember this" late in a page-by-page check still lands.
                 refusal = exhausted() if block.get("name") != "memory" else None
@@ -1073,6 +1084,17 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
     async def writes() -> None:
         for index, block in enumerate(tool_uses):
             if block.get("name") in MUTATING_TOOLS:
+                if ctx.credits_exhausted:
+                    # A write still waiting its turn when a subagent of the round spent
+                    # the balance does not start; one already running finishes and
+                    # commits as it would (docs/billing.md § A chat turn).
+                    results[index] = await _report_tool(
+                        ctx,
+                        str(block.get("id")),
+                        block.get("name"),
+                        chat_tools.ToolOutcome(NOT_RUN_OUT_OF_CREDITS, is_error=True),
+                    )
+                    continue
                 # Stop means after the *current* call: a write not yet started — the
                 # first of the round included — is not started once the user cancelled.
                 results[index] = await run_writer(
