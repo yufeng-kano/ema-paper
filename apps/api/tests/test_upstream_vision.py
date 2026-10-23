@@ -13,7 +13,6 @@ import httpx
 import pytest
 import respx
 
-from sightread.auth.crypto import encrypt_connection_key, encrypt_kano_proxy_key
 from sightread.upstream.client import (
     Connection,
     EmptyCompletion,
@@ -31,14 +30,11 @@ PROMPT = "Transcribe page {page} in {bbox_format}."
 
 @pytest.fixture
 def key() -> Connection:
-    """The built-in upstream, as `load_connection` resolves it for a connected user."""
+    """Kano Proxy, as `kano_connection` resolves it on the operator's key."""
     return Connection(
-        ciphertext=encrypt_kano_proxy_key(SECRET, "sk-kano-proxy-test"),
-        secret_key=SECRET,
+        api_key="sk-kano-proxy-test",
         base_url=f"{KANO_BASE}/openai/v1",
         snapshot=KANO_BASE,
-        builtin=True,
-        report_cost=True,
     )
 
 
@@ -248,45 +244,32 @@ async def test_a_completion_the_model_stopped_fails_its_page_with_the_reason(
     assert (raised.value.usage.prompt_tokens, raised.value.usage.completion_tokens) == (1200, 300)
 
 
-def test_user_key_never_reveals_itself_in_a_repr(key) -> None:
+def test_the_operator_key_never_reveals_itself_in_a_repr(key) -> None:
     assert repr(key) == "Connection(...)"
     assert "sk-kano" not in repr(key)
 
 
 @respx.mock
-async def test_a_connection_calls_its_own_endpoint_and_prices_nothing_by_default(
-    documents,
-) -> None:
-    """A custom connection posts to `{base_url}/chat/completions` with its own key, and
-    without `report_cost` its claimed cost is not recorded (docs/parsing.md § Upstream
-    usage)."""
-    connection = Connection(
-        ciphertext=encrypt_connection_key(SECRET, "sk-custom-endpoint-test"),
-        secret_key=SECRET,
-        base_url="https://proxy.example/openai/v1",
-        snapshot="https://proxy.example/openai/v1",
-    )
-    route = respx.post("https://proxy.example/openai/v1/chat/completions").mock(
+async def test_every_call_carries_the_operator_key_and_asks_for_no_usage(key, documents) -> None:
+    """A vision call posts to `{base_url}/chat/completions` as `Bearer` the operator's key
+    and nothing else of it (docs/auth.md § 3)."""
+    route = respx.post(KANO_CHAT_URL).mock(
         return_value=httpx.Response(
             200,
             json={
                 "choices": [{"message": {"content": "# Page"}}],
-                # Without `report_cost` a claimed cost is not recorded at all.
-                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "cost": 9.99},
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
             },
         )
     )
 
-    result = await transcribe_page(connection, "vendor/vision", PROMPT, documents["png"], 2)
+    result = await transcribe_page(key, "vendor/vision", PROMPT, documents["png"], 2)
 
     assert result.markdown == "# Page"
     assert result.usage.prompt_tokens == 10
-    # Unknown, not $0: nobody priced this call (docs/parsing.md § Upstream usage).
-    assert result.usage.cost is None
-    assert result.usage.cost_source == "unknown"
     sent = json.loads(route.calls[0].request.content)
     assert "usage" not in sent
-    assert route.calls[0].request.headers["authorization"] == "Bearer sk-custom-endpoint-test"
+    assert route.calls[0].request.headers["authorization"] == "Bearer sk-kano-proxy-test"
 
 
 @respx.mock
@@ -317,13 +300,11 @@ async def test_an_oversized_completion_fails_the_call(key, documents) -> None:
 PROXY_CHAT = "https://proxy.example/openai/v1/chat/completions"
 
 
-def _proxy(report_cost: bool) -> Connection:
+def _proxy() -> Connection:
     return Connection(
-        ciphertext=encrypt_connection_key(SECRET, "sk-custom-endpoint-test"),
-        secret_key=SECRET,
+        api_key="sk-kano-proxy-test",
         base_url="https://proxy.example/openai/v1",
-        snapshot="https://proxy.example/openai/v1",
-        report_cost=report_cost,
+        snapshot="https://proxy.example",
     )
 
 
@@ -337,9 +318,9 @@ async def _usage_for(connection: Connection, usage: dict, documents):
 
 
 @respx.mock
-async def test_an_opted_in_connection_records_its_reported_cost_as_an_estimate(documents) -> None:
+async def test_a_reported_cost_is_recorded_as_an_estimate(documents) -> None:
     usage = await _usage_for(
-        _proxy(report_cost=True),
+        _proxy(),
         {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.0123456789},
         documents,
     )
@@ -352,7 +333,7 @@ async def test_an_opted_in_connection_records_its_reported_cost_as_an_estimate(d
 @respx.mock
 async def test_a_reported_zero_is_a_real_estimate(documents) -> None:
     """An endpoint that prices a call at 0 said so; that is not the same as not saying."""
-    usage = await _usage_for(_proxy(report_cost=True), {"cost": 0}, documents)
+    usage = await _usage_for(_proxy(), {"cost": 0}, documents)
 
     assert usage.cost_source == "estimated"
     assert usage.cost == Decimal("0")
@@ -373,7 +354,7 @@ async def test_a_reported_zero_is_a_real_estimate(documents) -> None:
     ],
 )
 async def test_an_unusable_reported_cost_is_unknown_not_zero(documents, usage_body) -> None:
-    usage = await _usage_for(_proxy(report_cost=True), usage_body, documents)
+    usage = await _usage_for(_proxy(), usage_body, documents)
 
     assert usage.cost_source == "unknown"
     assert usage.cost is None

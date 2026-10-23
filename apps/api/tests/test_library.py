@@ -21,19 +21,12 @@ from sightread.db.models import Document, Job, JobPage, Result, User
 from sightread.routes.library import DOCUMENT_NAME_MAX, clean_name, free_name
 from sightread.workspace.layout import user_root
 from tests.conftest import CSRF_HEADERS, DATABASE_URL
-from tests.test_parse_end_to_end import _connect_kano
 
 MODEL = "vendor/vision-model"
 
 
 async def _ready_to_parse(client: AsyncClient) -> None:
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    user_id = (await client.get("/api/me")).json()["user"]["id"]
-    await _connect_kano(client.app.state.sessionmaker, user_id)
-    chosen = await client.put(
-        "/api/agents/parse/settings", json={"model": MODEL}, headers=CSRF_HEADERS
-    )
-    assert chosen.status_code == 200
+    assert (await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)).status_code == 200
 
 
 @pytest.fixture
@@ -293,11 +286,12 @@ async def test_moving_a_file_onto_a_taken_name_is_suffixed(library, documents) -
     assert moved.json()["name"] == "tiny (2).png"
 
 
-async def test_an_upload_without_a_configured_model_is_refused(client, documents) -> None:
+async def test_an_upload_without_a_configured_model_is_refused(make_client, documents) -> None:
+    client = make_client(parse_model="")
     await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
     response = await _upload(client, documents)
-    assert response.status_code == 400
-    assert response.json()["error"]["type"] == "invalid_request"
+    assert response.status_code == 503
+    assert response.json()["error"]["type"] == "upstream"
 
 
 async def test_an_upload_into_a_folder_that_is_not_yours_is_a_404(library, documents) -> None:

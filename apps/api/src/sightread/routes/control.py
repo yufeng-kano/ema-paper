@@ -25,7 +25,6 @@ from ..agents import skills as skill_defs
 from ..agents import subagents as subagent_defs
 from ..agents.bbox import convention_for_model
 from ..auth.api_keys import create_api_key
-from ..auth.crypto import encrypt_connection_key, mask_secret
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
 from ..auth.oidc import (
     DEV_USER_EMAIL,
@@ -49,7 +48,6 @@ from ..db.models import (
     Document,
     Job,
     PromptPreset,
-    ProviderConnection,
     Result,
     Skill,
     Subagent,
@@ -63,12 +61,7 @@ from ..jobs.intake import PDF_MEDIA_TYPE
 from ..jobs.runner import result_payload
 from ..parsing.attachments import ATTACHMENT_EXTENSIONS
 from ..parsing.images import ACCEPTED_IMAGE_TYPES
-from ..upstream.client import (
-    agent_models,
-    fetch_connection_models,
-    normalize_base_url,
-    stored_connection_models,
-)
+from ..upstream.client import agent_models, offered_models
 from ..workspace.documents import (
     IMAGE_MEDIA_TYPES,
     MARKDOWN_EXTENSIONS,
@@ -286,27 +279,7 @@ async def revoke_key(key_id: int, user: SessionUser, db: DbSession) -> Response:
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-# --- provider connections -------------------------------------------------------------
-
-
-class ConnectionCreate(BaseModel):
-    """An endpoint, its key and the cost flag; the model is each agent's choice
-    (docs/agents.md)."""
-
-    name: str = Field(min_length=1, max_length=255)
-    base_url: str = Field(min_length=1, max_length=1024)
-    api_key: str = Field(min_length=8, max_length=512)
-    # Record the endpoint's reported `usage.cost` as an estimate (docs/parsing.md).
-    report_cost: bool = False
-
-
-class ConnectionUpdate(BaseModel):
-    """Partial update; changing the endpoint or the key re-validates against it."""
-
-    name: str | None = Field(default=None, min_length=1, max_length=255)
-    base_url: str | None = Field(default=None, min_length=1, max_length=1024)
-    api_key: str | None = Field(default=None, min_length=8, max_length=512)
-    report_cost: bool | None = None
+# --- prompt presets ---------------------------------------------------------------------
 
 
 async def _commit_or_name_conflict(db: DbSession, message: str) -> None:
@@ -320,191 +293,6 @@ async def _commit_or_name_conflict(db: DbSession, message: str) -> None:
     except IntegrityError as exc:
         await db.rollback()
         raise ApiError(400, "invalid_request", message) from exc
-
-
-def _connection_payload(row: ProviderConnection) -> dict:
-    return {
-        "id": row.id,
-        "name": row.name,
-        "base_url": row.base_url,
-        "masked": row.masked,
-        "report_cost": row.report_cost,
-        "created_at": row.created_at,
-        "updated_at": row.updated_at,
-    }
-
-
-async def _owned_connection(
-    db: DbSession, user_id: int, connection_id: int, for_update: bool = False
-) -> ProviderConnection:
-    # `for_update` serializes concurrent edits of one connection (PostgreSQL row lock;
-    # compiled away on the SQLite test fallback): two edits validating different URL/key
-    # pairs must not interleave into a stored pair nobody validated.
-    query = select(ProviderConnection).where(
-        ProviderConnection.id == connection_id, ProviderConnection.user_id == user_id
-    )
-    if for_update:
-        query = query.with_for_update()
-    row = (await db.execute(query)).scalar_one_or_none()
-    if row is None:
-        raise ApiError(404, "invalid_request", "No such connection")
-    return row
-
-
-async def _refuse_duplicate_connection_name(
-    db: DbSession, user_id: int, name: str, exclude_id: int | None = None
-) -> None:
-    query = select(ProviderConnection.id).where(
-        ProviderConnection.user_id == user_id, ProviderConnection.name == name
-    )
-    if exclude_id is not None:
-        query = query.where(ProviderConnection.id != exclude_id)
-    if (await db.execute(query)).first() is not None:
-        raise ApiError(400, "invalid_request", "A connection with this name already exists")
-
-
-@router.get("/connections")
-async def list_connections(user: SessionUser, db: DbSession):
-    rows = (
-        (
-            await db.execute(
-                select(ProviderConnection)
-                .where(ProviderConnection.user_id == user.id)
-                .order_by(ProviderConnection.created_at)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    return {"connections": [_connection_payload(row) for row in rows]}
-
-
-@router.post("/connections", dependencies=[CsrfGuard], status_code=status.HTTP_201_CREATED)
-async def create_connection(
-    body: ConnectionCreate, user: SessionUser, db: DbSession, settings: AppSettings
-):
-    name = body.name.strip()
-    if not name:
-        raise ApiError(400, "invalid_request", "The connection needs a name")
-    base_url = await normalize_base_url(body.base_url, settings.app_env)
-    candidate = body.api_key.strip()
-    await _refuse_duplicate_connection_name(db, user.id, name)
-    # `GET {base_url}/models` doubles as the save-time key check (docs/auth.md § 3).
-    await fetch_connection_models(base_url, candidate, settings.upstream_response_max_bytes)
-
-    row = ProviderConnection(
-        user_id=user.id,
-        name=name,
-        base_url=base_url,
-        ciphertext=encrypt_connection_key(settings.secret_key, candidate),
-        masked=mask_secret(candidate),
-        report_cost=body.report_cost,
-    )
-    db.add(row)
-    await _commit_or_name_conflict(db, "A connection with this name already exists")
-    return _connection_payload(row)
-
-
-@router.put("/connections/{connection_id}", dependencies=[CsrfGuard])
-async def update_connection(
-    connection_id: int,
-    body: ConnectionUpdate,
-    user: SessionUser,
-    db: DbSession,
-    settings: AppSettings,
-):
-    row = await _owned_connection(db, user.id, connection_id, for_update=True)
-    provided = body.model_fields_set
-
-    name = body.name.strip() if body.name else row.name
-    if not name:
-        raise ApiError(400, "invalid_request", "The connection needs a name")
-    if "name" in provided:
-        await _refuse_duplicate_connection_name(db, user.id, name, exclude_id=row.id)
-
-    base_url = (
-        await normalize_base_url(body.base_url, settings.app_env)
-        if "base_url" in provided and body.base_url
-        else row.base_url
-    )
-    candidate = body.api_key.strip() if "api_key" in provided and body.api_key else None
-
-    if candidate is not None:
-        await fetch_connection_models(base_url, candidate, settings.upstream_response_max_bytes)
-        row.ciphertext = encrypt_connection_key(settings.secret_key, candidate)
-        row.masked = mask_secret(candidate)
-    elif base_url != row.base_url:
-        # A moved endpoint must still accept the stored key before we point jobs at it.
-        await stored_connection_models(
-            base_url, settings.secret_key, row.ciphertext, settings.upstream_response_max_bytes
-        )
-
-    if body.report_cost is not None:
-        row.report_cost = body.report_cost
-
-    row.name = name
-    row.base_url = base_url
-    row.updated_at = utcnow()
-    await _commit_or_name_conflict(db, "A connection with this name already exists")
-    return _connection_payload(row)
-
-
-@router.delete(
-    "/connections/{connection_id}",
-    dependencies=[CsrfGuard],
-    status_code=status.HTTP_204_NO_CONTENT,
-)
-async def delete_connection(connection_id: int, user: SessionUser, db: DbSession) -> Response:
-    row = await _owned_connection(db, user.id, connection_id)
-    # Explicit fallback (not just the FK's SET NULL): every agent on this connection goes
-    # back to Kano Proxy, and its models go too — they belonged to the deleted endpoint's
-    # catalog (docs/agents.md).
-    await db.execute(
-        sa_update(AgentSetting)
-        .where(AgentSetting.user_id == user.id, AgentSetting.connection_id == row.id)
-        .values(connection_id=None, model=None, fallback_model=None)
-    )
-    await db.delete(row)
-    await db.commit()
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-
-class ConnectionModelsPreview(BaseModel):
-    """The connection dialog's catalog request: a candidate key, or a stored one by id."""
-
-    base_url: str = Field(min_length=1, max_length=1024)
-    api_key: str | None = Field(default=None, min_length=8, max_length=512)
-    connection_id: int | None = None
-
-
-@router.post("/connections/preview-models", dependencies=[CsrfGuard])
-async def preview_connection_models(
-    body: ConnectionModelsPreview, user: SessionUser, db: DbSession, settings: AppSettings
-):
-    """The live model catalog the connection dialog picks from (docs/api.md).
-
-    Works before the connection exists (candidate `api_key`) and while editing one
-    (`connection_id` reuses the stored key, so editing never requires re-typing it). The
-    URL passes the same rules as saving — this must not be a free server-side probe
-    (docs/auth.md § 3).
-    """
-    base_url = await normalize_base_url(body.base_url, settings.app_env)
-    candidate = body.api_key.strip() if body.api_key else None
-    if candidate:
-        models = await fetch_connection_models(
-            base_url, candidate, settings.upstream_response_max_bytes
-        )
-    elif body.connection_id is not None:
-        row = await _owned_connection(db, user.id, body.connection_id)
-        models = await stored_connection_models(
-            base_url, settings.secret_key, row.ciphertext, settings.upstream_response_max_bytes
-        )
-    else:
-        raise ApiError(400, "invalid_request", "Provide an API key or an existing connection")
-    return {"data": models}
-
-
-# --- prompt presets ---------------------------------------------------------------------
 
 
 class PromptCreate(BaseModel):
@@ -647,10 +435,18 @@ def _known_agent(name: str) -> AgentDefinition:
     return agent
 
 
-def _agent_settings_payload(row: AgentSetting | None) -> dict:
+def _effective_model(settings: AppSettings, agent: str, row: AgentSetting | None) -> str | None:
+    """The model the agent runs, as `GET /api/agents` answers it (docs/api.md): the
+    deployment's for parse and check, the reader's pick or the first offered for chat."""
+    if agent == CHAT.name:
+        return chat_runner.chat_model(settings, row)
+    models = offered_models(settings, agent)
+    return models[0] if models else None
+
+
+def _agent_settings_payload(settings: AppSettings, agent: str, row: AgentSetting | None) -> dict:
     return {
-        "connection_id": row.connection_id if row else None,
-        "model": row.model if row else None,
+        "model": _effective_model(settings, agent, row),
         # The user's own template; null for the agent's default (docs/agents.md).
         "prompt": row.prompt if row else None,
         "prompt_preset_id": row.prompt_preset_id if row else None,
@@ -662,9 +458,9 @@ def _agent_settings_payload(row: AgentSetting | None) -> dict:
         "translate_language": row.translate_language if row else None,
         "memory_auto": row.memory_auto if row and row.memory_auto is not None else True,
         "memory_paused": bool(row.memory_paused) if row else False,
-        # The parse agent's own: the model a blocked page goes to, and whether it goes
-        # there on its own (docs/parsing.md § Fallback model).
-        "fallback_model": row.fallback_model if row else None,
+        # The parse agent's own: the model a blocked page goes to — the deployment's, a
+        # fact — and whether it goes there on its own (docs/parsing.md § Fallback model).
+        "fallback_model": (settings.parse_fallback_model or None) if agent == PARSE.name else None,
         "auto_fallback": bool(row.auto_fallback) if row else False,
         # The check agent's own: whether a Files upload is checked before it opens
         # (docs/parsing.md § Format check).
@@ -672,8 +468,8 @@ def _agent_settings_payload(row: AgentSetting | None) -> dict:
     }
 
 
-def _bbox_payload(row: AgentSetting | None) -> dict:
-    convention = convention_for_model(row.model if row else None)
+def _bbox_payload(settings: AppSettings, agent: str, row: AgentSetting | None) -> dict:
+    convention = convention_for_model(_effective_model(settings, agent, row))
     return {"family": convention.family, "format": convention.format}
 
 
@@ -708,10 +504,10 @@ async def list_agents(user: SessionUser, db: DbSession, settings: AppSettings):
                 # on a plan that grants it, with a sandbox runner configured
                 # (docs/chat.md § Tools, docs/billing.md § Plans).
                 "tools": _agent_tools(agent.name, shell),
-                "settings": _agent_settings_payload(rows.get(agent.name)),
-                # A fact about the saved model, not a setting: the coordinate convention
-                # the pipeline will ask it for (docs/parsing.md § Coordinate conventions).
-                "bbox": _bbox_payload(rows.get(agent.name)),
+                "settings": _agent_settings_payload(settings, agent.name, rows.get(agent.name)),
+                # A fact about the model, not a setting: the coordinate convention the
+                # pipeline will ask it for (docs/parsing.md § Coordinate conventions).
+                "bbox": _bbox_payload(settings, agent.name, rows.get(agent.name)),
             }
             for agent in AGENTS.values()
         ]
@@ -721,7 +517,7 @@ async def list_agents(user: SessionUser, db: DbSession, settings: AppSettings):
 class AgentSettingsPut(BaseModel):
     """Partial update: only the fields present in the body change (docs/api.md)."""
 
-    connection_id: int | None = None
+    # The chat agent's own: one of `CHAT_MODELS`, null its first (docs/api.md).
     model: str | None = Field(default=None, max_length=255)
     # Capped in the route, where the settings are (`SYSTEM_PROMPT_MAX_CHARS`).
     prompt: str | None = None
@@ -736,7 +532,6 @@ class AgentSettingsPut(BaseModel):
     memory_auto: bool | None = None
     memory_paused: bool | None = None
     # The parse agent's own (docs/agents.md).
-    fallback_model: str | None = Field(default=None, max_length=255)
     auto_fallback: bool | None = None
     # The check agent's own (docs/agents.md).
     auto_check: bool | None = None
@@ -744,12 +539,12 @@ class AgentSettingsPut(BaseModel):
 
 # The settings only some agents take, and which (docs/agents.md § Per-agent settings).
 SETTING_OWNERS: dict[str, tuple[str, ...]] = {
+    "model": (CHAT.name,),
     "instructions": (CHAT.name, CHECK.name),
     "answer_language": (CHAT.name,),
     "translate_language": (CHAT.name,),
     "memory_auto": (CHAT.name,),
     "memory_paused": (CHAT.name,),
-    "fallback_model": (PARSE.name,),
     "auto_fallback": (PARSE.name,),
     "auto_check": (CHECK.name,),
 }
@@ -819,14 +614,12 @@ async def put_agent_settings(
     if prompt is not None and body.prompt_preset_id is not None:
         # The two exclude each other (docs/agents.md § Per-agent settings).
         raise ApiError(400, "invalid_request", "Send either prompt or prompt_preset_id")
-    if body.connection_id is not None:
-        if "anthropic" in agent.capabilities:
-            # The chat and check agents speak the Messages API through Kano Proxy only
-            # (docs/chat.md).
-            raise ApiError(
-                400, "invalid_request", f"The {agent.name} agent runs on Kano Proxy only"
-            )
-        await _owned_connection(db, user.id, body.connection_id)
+    model: str | None = None
+    if "model" in provided:
+        model = (body.model or "").strip() or None
+        if model is not None and model not in settings.chat_model_list:
+            # The offered list is the operator's (docs/billing.md § Models).
+            raise ApiError(400, "invalid_request", "That model is not one the chat agent offers")
     if body.effort is not None and body.effort not in EFFORT_LEVELS:
         raise ApiError(400, "invalid_request", "effort must be one of " + ", ".join(EFFORT_LEVELS))
     if body.prompt_preset_id is not None:
@@ -849,17 +642,8 @@ async def put_agent_settings(
     if row is None:
         row = AgentSetting(user_id=user.id, agent=agent.name)
         db.add(row)
-    if "connection_id" in provided and body.connection_id != row.connection_id:
-        row.connection_id = body.connection_id
-        # The stored models belonged to the other upstream's catalog (docs/agents.md).
-        if "model" not in provided:
-            row.model = None
-        if "fallback_model" not in provided:
-            row.fallback_model = None
     if "model" in provided:
-        row.model = (body.model or "").strip() or None
-    if "fallback_model" in provided:
-        row.fallback_model = (body.fallback_model or "").strip() or None
+        row.model = model
     if "auto_fallback" in provided:
         row.auto_fallback = bool(body.auto_fallback)
     if "auto_check" in provided:
@@ -883,14 +667,15 @@ async def put_agent_settings(
     try:
         await db.commit()
     except IntegrityError as exc:
-        # Another tab deleted the selected connection/prompt between the ownership
-        # pre-check and this commit — an ordinary selection race, not a 500.
+        # Another tab deleted the selected prompt between the ownership pre-check and
+        # this commit — an ordinary selection race, not a 500.
         await db.rollback()
-        raise ApiError(
-            409, "invalid_request", "The selected connection or prompt was just deleted"
-        ) from exc
+        raise ApiError(409, "invalid_request", "The selected prompt was just deleted") from exc
     # The convention follows the model, so a write answers the new one along with the row.
-    return {**_agent_settings_payload(row), "bbox": _bbox_payload(row)}
+    return {
+        **_agent_settings_payload(settings, agent.name, row),
+        "bbox": _bbox_payload(settings, agent.name, row),
+    }
 
 
 @router.get("/agents/chat/context")
@@ -987,9 +772,9 @@ async def chat_agent_context(
 async def list_agent_models(
     agent_name: str, user: SessionUser, db: DbSession, settings: AppSettings
 ):
-    """The live catalog of the agent's saved upstream — the Agent page's model picker."""
+    """The models the agent may run — the Agent page's model picker (docs/api.md)."""
     agent = _known_agent(agent_name)
-    return {"data": await agent_models(db, settings, user.id, agent.name)}
+    return {"data": await agent_models(settings, agent.name)}
 
 
 # --- usage ----------------------------------------------------------------------------

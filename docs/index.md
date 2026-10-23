@@ -1,6 +1,6 @@
 # Ema Paper documentation
 
-Hosted, multi-user **vision document parsing** service. Users sign in with Google, connect their own Kano Proxy account (or an OpenAI-compatible endpoint of their own — every vision call runs on the user's account, never the operator's), and parse PDFs/images into markdown with figure bounding boxes via REST or a hosted MCP endpoint (Claude Connectors compatible).
+Hosted, multi-user **vision document parsing** service. Users sign in with Google and parse PDFs/images into markdown with figure bounding boxes via REST or a hosted MCP endpoint (Claude Connectors compatible), then read and edit them with a tool-using chat agent. Every model call runs on the operator's Kano Proxy account and is paid for in credits — Free each month, more on a paid plan ([billing.md](./billing.md)).
 
 **In transition** (decided 2026-10-23, [billing.md](./billing.md)): the service moves to a subscription that includes the model spend — one Kano Proxy account of the operator's, credits per period, Free and Pro, payment through Kano Pay. Until each step of [billing.md](./billing.md) § Transition lands, the docs below describe what runs today, and say where that will change.
 
@@ -10,8 +10,8 @@ Hosted, multi-user **vision document parsing** service. Users sign in with Googl
 |-----|---------|
 | [product.md](./product.md) | Goals, non-goals, origin spec deviations, tenants |
 | [api.md](./api.md) | REST data plane (`/v1/*`), control plane (`/api/*`), partial results, figure crop routes, SSE, limits, errors |
-| [auth.md](./auth.md) | Google OIDC sessions, hashed API keys, encrypted upstream keys, OAuth 2.1 AS for Claude Connectors, single-use upload tickets, the Kano Proxy connect flow |
-| [agents.md](./agents.md) | The agent registry (`parse`, `chat` and `check`), per-agent upstream/model/prompt/effort settings, the parse agent's fallback model, the chat agent's instructions, languages and memory switches, the check agent's switch and instructions, enqueue rules |
+| [auth.md](./auth.md) | Google OIDC sessions, hashed API keys, the operator's upstream key, OAuth 2.1 AS for Claude Connectors, single-use upload tickets |
+| [agents.md](./agents.md) | The agent registry (`parse`, `chat` and `check`), per-agent prompt/effort settings and the chat agent's model, the parse agent's fallback switch, the chat agent's instructions, languages and memory switches, the check agent's switch and instructions, enqueue rules |
 | [chat.md](./chat.md) | The `chat` agent: the Messages API over Kano Proxy, tools (bash, editor, page and figure views, skills, subagents, memory), the reader's instructions appended to the prompt (whole-prompt replacement as the advanced option), answer and translation languages, memory (snapshot per conversation, the `memory` tool), prompt caching breakpoints, append-only history, translation (`/translate` — the document, a selection or sections), commands kept to the passage or sections they are sent with, what a user message carries (replies, sections, commands, attachments), conversations/turns/events |
 | [workspace.md](./workspace.md) | The per-user file tree: document directories, markdown documents, inserted images, the Trash (move out of `files/`, Put Back, crash repair), copies, git revisions, reconciliation with the library, quota, backups |
 | [sandbox.md](./sandbox.md) | One Kata microVM per user: the runner service, its HTTP contract, isolation, lifecycle, the image, operations |
@@ -31,10 +31,10 @@ Hosted, multi-user **vision document parsing** service. Users sign in with Googl
 - **PDF engine:** Poppler CLI (`pdftoppm`, `pdfinfo`) via subprocess — never a linked PDF library. See [parsing.md](./parsing.md).
 - **Web:** Nuxt (latest stable) + TypeScript + `@nuxtjs/i18n` (en, zh-TW), pnpm.
 - **Data:** PostgreSQL only — relational state **and** job queue (`FOR UPDATE SKIP LOCKED`). No Redis, no message broker.
-- **Upstream:** Kano Proxy by default (`KANO_PROXY_BASE_URL`), with the key each user obtains through Kano Proxy's connect flow ([auth.md](./auth.md) § 6); model list fetched live from `{KANO_PROXY_BASE_URL}/openai/v1/models` with that key — never hard-coded. Users may instead route the parse agent's calls through a **provider connection**: their own OpenAI-compatible Chat Completions endpoint (base URL + key), models listed live from that endpoint's `/models` ([api.md](./api.md) § Upstreams). The chat agent speaks the Anthropic Messages API through Kano Proxy's `/anthropic/v1` route only ([chat.md](./chat.md)).
+- **Upstream:** Kano Proxy (`KANO_PROXY_BASE_URL`) on the operator's own key (`KANO_PROXY_API_KEY`, [auth.md](./auth.md) § 3); the models are the deployment's (`PARSE_MODEL`, `CHAT_MODELS`, …, [billing.md](./billing.md) § Models), the chat list checked against `{KANO_PROXY_BASE_URL}/openai/v1/models` live — never hard-coded in code. The chat agent speaks the Anthropic Messages API through Kano Proxy's `/anthropic/v1` route ([chat.md](./chat.md)).
 - **Sandbox:** one Kata microVM per user, started by a separate runner service that alone holds the Docker socket; the user's workspace directory is the VM's `/workspace` ([sandbox.md](./sandbox.md), [workspace.md](./workspace.md)).
 - **Deploy:** docker-compose on a single server, Caddy for TLS + routing. Environments: local + production only.
 
 ## Product one-liner
 
-Sign in with Google, connect Kano Proxy and pick a model, get an API key (or connect Claude via the MCP connector), then `POST /v1/parse` a PDF or image — back comes markdown with `<!-- page: N -->` markers, `sightread://` figure placeholders, and the exact model/bbox-format used, run on your own Kano Proxy account.
+Sign in with Google, get an API key (or connect Claude via the MCP connector), then `POST /v1/parse` a PDF or image — back comes markdown with `<!-- page: N -->` markers, `sightread://` figure placeholders, and the exact model/bbox-format used, paid for in credits.

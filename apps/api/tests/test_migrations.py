@@ -259,7 +259,9 @@ async def test_kano_proxy_migration_moves_settings_to_the_parse_agent(scratch_ur
             {"user": openrouter_user, "job": historical_job},
         )
 
-    _alembic(scratch_url, "upgrade", "head")
+    # Up to the last revision that still has the connections (the operator upstream
+    # migration drops them, docs/database.md § Migrations).
+    _alembic(scratch_url, "upgrade", LEDGER)
 
     async with engine.connect() as db:
         settings = (
@@ -1423,5 +1425,110 @@ async def test_the_ledger_migration_keeps_a_deleted_conversations_entries(scratc
             assert version == LEDGER
             await connection.execute(text("DELETE FROM credit_entries"))
         _alembic(scratch_url, "downgrade", BILLING)
+    finally:
+        await engine.dispose()
+
+
+OPERATOR_UPSTREAM = "8431924126b1"
+
+
+async def test_the_operator_upstream_migration_drops_the_keys_and_keeps_the_history(
+    scratch_url,
+) -> None:
+    """docs/database.md § Migrations: the three key tables and the two columns go, a
+    parse row's model with them, a chat row's pick and a job's connection stay; the
+    downgrade puts the tables and columns back empty."""
+    _alembic(scratch_url, "upgrade", LEDGER)
+    engine = create_async_engine(scratch_url)
+    job_id = uuid.uuid4()
+    try:
+        async with engine.begin() as db:
+            await db.execute(
+                text(
+                    "INSERT INTO users (id, google_sub, email, created_at) "
+                    "VALUES (1, 'sub', 'o@example.com', now())"
+                )
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO provider_connections (id, user_id, name, base_url, ciphertext, "
+                    "masked, report_cost, created_at, updated_at) VALUES (7, 1, 'own', "
+                    "'https://llm.example/v1', '\\x00'::bytea, '...ab', false, now(), now())"
+                )
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO kano_proxy_keys (user_id, ciphertext, masked, updated_at) "
+                    "VALUES (1, '\\x00'::bytea, '...cd', now())"
+                )
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO kano_connect_states (user_id, state_hash, verifier_ciphertext, "
+                    "created_at, expires_at) VALUES (1, 'h', '\\x00'::bytea, now(), now())"
+                )
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO agent_settings (user_id, agent, connection_id, model, "
+                    "fallback_model, auto_fallback) VALUES (1, 'parse', 7, 'vendor/old', "
+                    "'vendor/older', true), (1, 'check', NULL, 'vendor/checker', NULL, false), "
+                    "(1, 'chat', NULL, 'vendor/chosen', NULL, false)"
+                )
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO jobs (id, user_id, agent, kind, filename, media_type, "
+                    "size_bytes, sha256, pages_spec, model, connection_id, connection_base_url, "
+                    "pipeline_version, bbox_format, status, pages_done, prompt_sha256, "
+                    "created_at) VALUES (:id, 1, 'parse', 'pdf', 'a.pdf', 'application/pdf', 1, "
+                    "'h', '', 'vendor/old', 7, 'https://llm.example/v1', 1, 'yxyx_norm1000', "
+                    "'queued', 0, '', now())"
+                ),
+                {"id": job_id},
+            )
+        _alembic(scratch_url, "upgrade", OPERATOR_UPSTREAM)
+        async with engine.begin() as db:
+            tables = {
+                row[0]
+                for row in await db.execute(
+                    text("SELECT table_name FROM information_schema.tables")
+                )
+            }
+            assert not tables & {"provider_connections", "kano_proxy_keys", "kano_connect_states"}
+            columns = {
+                row[0]
+                for row in await db.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name = 'agent_settings'"
+                    )
+                )
+            }
+            assert not columns & {"connection_id", "fallback_model"}
+            rows = (
+                await db.execute(
+                    text("SELECT agent, model, auto_fallback FROM agent_settings ORDER BY agent")
+                )
+            ).all()
+            assert rows == [
+                ("chat", "vendor/chosen", False),
+                ("check", None, False),
+                ("parse", None, True),
+            ]
+            job = (
+                await db.execute(text("SELECT connection_id, connection_base_url FROM jobs"))
+            ).one()
+            assert job == (7, "https://llm.example/v1")
+        _alembic(scratch_url, "downgrade", LEDGER)
+        async with engine.begin() as db:
+            for table in ("provider_connections", "kano_proxy_keys", "kano_connect_states"):
+                assert await _count(db, table) == 0
+            rows = (
+                await db.execute(
+                    text("SELECT agent, connection_id, fallback_model FROM agent_settings")
+                )
+            ).all()
+            assert {row[1:] for row in rows} == {(None, None)}
     finally:
         await engine.dispose()

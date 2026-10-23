@@ -57,9 +57,9 @@ export const AGENT_EFFORTS: readonly AgentEffort[] = ['low', 'medium', 'high', '
 
 /** One agent's settings (docs/agents.md); every null is that field's default. */
 export interface AgentSettings {
-  /** The agent's upstream; null means Kano Proxy, the built-in one (docs/api.md § Upstreams). */
-  connection_id: number | null
-  /** Model id on that upstream's catalog; null means none chosen yet. */
+  /** The model the agent runs (docs/api.md § GET /api/agents): the deployment's for `parse`
+   *  and `check` — a fact — and for `chat` the reader's pick among the offered models, or
+   *  the first offered; null when the deployment names none. Only `chat` takes a write. */
   model: string | null
   /** The user's own template; null means the agent's `default_prompt` (docs/agents.md). */
   prompt: string | null
@@ -77,8 +77,8 @@ export interface AgentSettings {
   /** `chat` only: the memory switches (docs/chat.md § Memory). */
   memory_auto?: boolean
   memory_paused?: boolean
-  /** `parse` only: the model a blocked page goes to, and whether it goes there on its own
-   *  (docs/parsing.md § Fallback model). */
+  /** `parse` only: the deployment's fallback model, a fact (null: none), and whether a
+   *  blocked page goes there on its own (docs/parsing.md § Fallback model). */
   fallback_model?: string | null
   auto_fallback?: boolean
   /** `check` only: whether a Files upload is checked before it opens (docs/parsing.md
@@ -98,7 +98,6 @@ export interface BboxConvention {
 /** An entry of the code-defined agent registry, with the caller's settings for it. */
 export interface AgentEntry {
   name: string
-  /** Declared, not enforced yet: the model picker lists the whole catalog. */
   capabilities: string[]
   input: string
   output: string
@@ -115,15 +114,7 @@ export interface AgentEntry {
 /** What a settings write answers: the row as stored, and the convention it now implies. */
 export type SavedAgentSettings = AgentSettings & { bbox: BboxConvention }
 
-/** Kano Proxy as this user sees it; the key itself only ever comes back masked. */
-export interface KanoState {
-  /** False when this deployment has no Kano Proxy configured. */
-  available: boolean
-  connected: boolean
-  masked: string | null
-}
-
-/** One row of a live model catalog (docs/api.md § Upstreams). */
+/** One model an agent may run (docs/api.md § GET /api/agents/{agent}/models). */
 export interface ConnectionModel {
   id: string
   name: string | null
@@ -851,36 +842,13 @@ export function revokeKey(id: number): Promise<void> {
   return request<undefined>('DELETE', `/api/keys/${id}`)
 }
 
-// --- Kano Proxy (docs/auth.md § 6) --------------------------------------------
-
-export function getKano(): Promise<KanoState> {
-  return request('GET', '/api/kano')
-}
-
-/** Forgets the key here only; it stays listed on Kano Proxy's Access page. */
-export function deleteKano(): Promise<void> {
-  return request<undefined>('DELETE', '/api/kano')
-}
-
-/**
- * Where Connect / Reconnect send the browser: a full-page navigation into the server's
- * redirect flow, like sign-in — never a fetch. `locale` brings the user back to the same
- * language.
- */
-export function kanoConnectUrl(locale: string): string {
-  return locale ? `/api/kano/connect?locale=${encodeURIComponent(locale)}` : '/api/kano/connect'
-}
-
 // --- agents (docs/agents.md) ---------------------------------------------------
 
 export function listAgents(): Promise<{ agents: AgentEntry[] }> {
   return request('GET', '/api/agents')
 }
 
-/**
- * Partial update: only the fields present change. Changing `connection_id` without
- * `model` clears the model on the server — it belonged to the other upstream's catalog.
- */
+/** Partial update: only the fields present change; `model` is the chat agent's alone. */
 export function putAgentSettings(
   agent: string,
   settings: Partial<AgentSettings>,
@@ -888,7 +856,7 @@ export function putAgentSettings(
   return request('PUT', `/api/agents/${encodeURIComponent(agent)}/settings`, settings)
 }
 
-/** The live catalog of the agent's saved upstream — what its model picker lists. */
+/** The models the agent may run — what a model picker lists (docs/billing.md § Models). */
 export function listAgentModels(agent: string): Promise<{ data: ConnectionModel[] }> {
   return request('GET', `/api/agents/${encodeURIComponent(agent)}/models`)
 }

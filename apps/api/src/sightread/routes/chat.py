@@ -33,14 +33,13 @@ from ..db.models import (
     ChatTurn,
     Conversation,
     Document,
-    KanoProxyKey,
     Message,
     Skill,
     User,
     utcnow,
 )
 from ..errors import ApiError
-from ..jobs import chat_events
+from ..jobs import chat_events, chat_runner
 from ..jobs.intake import insufficient_credits
 from ..jobs.queue import HISTORY_FULL, count_active_turns, enqueue_turn, history_bytes
 from ..parsing.attachments import prepared_path
@@ -364,9 +363,10 @@ async def _active_turn(db: AsyncSession, conversation_id: int) -> uuid.UUID | No
 
 async def _ready_to_chat(
     db: AsyncSession, settings: AppSettings, user_id: int, *, needs_model: bool
-) -> AgentSetting | None:
-    """The enqueue rules of docs/agents.md, applied to the chat agent. A conversation
-    that has its model already needs none chosen on the Agent page: later turns use
+) -> tuple[AgentSetting | None, str | None]:
+    """The enqueue rules of docs/agents.md, applied to the chat agent: its settings, and
+    the model the conversation starts on, one of `CHAT_MODELS` (docs/billing.md
+    § Models). A conversation that has its model already needs none: later turns use
     the stored one, whatever the page says now (docs/chat.md § Conversations)."""
     if not settings.kano_proxy_configured:
         raise ApiError(503, "upstream", "Kano Proxy is not configured on this deployment")
@@ -377,18 +377,12 @@ async def _ready_to_chat(
             )
         )
     ).scalar_one_or_none()
-    if needs_model and (setting is None or not setting.model):
-        raise ApiError(
-            400, "invalid_request", "No model chosen for the chat agent: pick one on the Agent page"
-        )
-    key = (
-        await db.execute(select(KanoProxyKey).where(KanoProxyKey.user_id == user_id))
-    ).scalar_one_or_none()
-    if key is None:
-        raise ApiError(
-            400, "invalid_request", "Kano Proxy is not connected: connect it on the Agent page"
-        )
-    return setting
+    if not needs_model:
+        return setting, None
+    model = chat_runner.chat_model(settings, setting)
+    if model is None:
+        raise ApiError(503, "upstream", "No chat model is offered on this deployment")
+    return setting, model
 
 
 @router.post(
@@ -439,11 +433,11 @@ async def post_message(
     document = await db.get(Document, row.document_id)
     if document is None or not is_live(document, await user_folders(db, user.id)):
         raise ApiError(409, "invalid_request", "This file is in the Trash; put it back to continue")
-    setting = await _ready_to_chat(db, settings, user.id, needs_model=row.model is None)
-    if row.model is None and setting is not None and setting.model:
+    setting, model = await _ready_to_chat(db, settings, user.id, needs_model=row.model is None)
+    if row.model is None and model is not None:
         # The model the message was sent under, fixed as it is accepted: a change on the
         # Agent page while the turn waits in the queue does not reach it (docs/chat.md).
-        row.model = setting.model
+        row.model = model
     if await count_active_turns(db, user.id) >= settings.max_chat_turns_per_user:
         raise ApiError(
             429,

@@ -48,9 +48,10 @@ CSRF_HEADERS = {"X-Requested-With": "XMLHttpRequest"}
 KANO_BASE = "https://kano.test"
 KANO_CHAT_URL = f"{KANO_BASE}/openai/v1/chat/completions"
 KANO_MODELS_URL = f"{KANO_BASE}/openai/v1/models"
-KANO_TOKEN_URL = f"{KANO_BASE}/api/connect/token"
-KANO_CLIENT_ID = "sightread-test"
-KANO_CLIENT_SECRET = "kano-client-secret-not-a-real-one"
+# The operator's key, and what the deployment offers (docs/billing.md § Models).
+KANO_API_KEY = "sk-kano-proxy-test-not-a-real-one"
+PARSE_MODEL = "vendor/vision-model"
+CHAT_MODELS = "claude-code/claude-opus-5-5,codex/gpt-5.5,vendor/chat-model"
 
 DATABASE_URL = os.environ.get("TEST_DATABASE_URL") or os.environ.get("DATABASE_URL")
 
@@ -65,7 +66,9 @@ TEST_MODEL_PRICES = json.dumps(
             "claude-code/claude-haiku-5-5",
             "claude-opus-5-5",
             "codex/gpt-5.5",
+            "vendor/chat-model",
             "vendor/chosen",
+            "vendor/fallback-model",
             "vendor/vision-model",
             "m",
         )
@@ -105,8 +108,9 @@ async def make_client(sessionmaker, tmp_path) -> AsyncIterator[Callable[..., Asy
                 "upload_dir": str(tmp_path / "uploads"),
                 "figures_dir": str(tmp_path / "figures"),
                 "kano_proxy_base_url": KANO_BASE,
-                "kano_proxy_client_id": KANO_CLIENT_ID,
-                "kano_proxy_client_secret": KANO_CLIENT_SECRET,
+                "kano_proxy_api_key": KANO_API_KEY,
+                "parse_model": PARSE_MODEL,
+                "chat_models": CHAT_MODELS,
                 # Every model a test turn runs on is priced, as the deployment requires
                 # of its offered models (docs/billing.md § Models): a flat list price so
                 # the credits a test sees are predictable. Tests of the arithmetic set

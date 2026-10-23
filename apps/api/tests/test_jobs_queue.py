@@ -545,6 +545,9 @@ async def test_a_run_whose_snapshot_update_is_fenced_out_ends_there(
     and the stale run starts nothing (docs/jobs.md § Queue)."""
     from types import SimpleNamespace
 
+    from sqlalchemy import Update
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
     from sightread.config import Settings
     from sightread.jobs import runner
     from sightread.jobs.queue import next_worker_generation
@@ -561,15 +564,27 @@ async def test_a_run_whose_snapshot_update_is_fenced_out_ends_there(
         stale = await next_worker_generation(db)
         assert await claim_next_job(db, 2, None, stale) == job_id
 
-    async def taken_over(db, settings, user_id, connection_id):
-        # The replacement requeues and claims the job while this run loads its upstream.
-        async with sessionmaker() as other:
-            fresh = await next_worker_generation(other)
-            assert await requeue_job(other, job_id) is True
-            assert await claim_next_job(other, 2, None, fresh) == job_id
-        return SimpleNamespace(snapshot="https://moved.test")
+    monkeypatch.setattr(
+        runner, "kano_connection", lambda settings: SimpleNamespace(snapshot="https://moved.test")
+    )
 
-    monkeypatch.setattr(runner, "load_connection", taken_over)
+    class Interposed(AsyncSession):
+        """The replacement requeues and claims the job between this run's read of the row
+        and its first write — the snapshot reconcile, which must then miss."""
+
+        async def execute(self, statement, *args, **kwargs):
+            if isinstance(statement, Update) and not replaced:
+                replaced.append(True)
+                async with sessionmaker() as other:
+                    fresh = await next_worker_generation(other)
+                    assert await requeue_job(other, job_id) is True
+                    assert await claim_next_job(other, 2, None, fresh) == job_id
+            return await super().execute(statement, *args, **kwargs)
+
+    replaced: list[bool] = []
+    interposed = async_sessionmaker(
+        sessionmaker.kw["bind"], class_=Interposed, expire_on_commit=False, autoflush=False
+    )
     settings = Settings(
         app_env="local",
         secret_key=TEST_SECRET_KEY,
@@ -578,7 +593,8 @@ async def test_a_run_whose_snapshot_update_is_fenced_out_ends_there(
         figures_dir=str(tmp_path / "figures"),
         kano_proxy_base_url=KANO_BASE,
     )
-    await runner.run_job(sessionmaker, settings, job_id, asyncio.Semaphore(1), stale)
+    await runner.run_job(interposed, settings, job_id, asyncio.Semaphore(1), stale)
+    assert replaced
     async with sessionmaker() as db:
         row = await db.get(Job, job_id)
     assert (row.status, row.connection_base_url) == ("running", JOB_DEFAULTS["connection_base_url"])

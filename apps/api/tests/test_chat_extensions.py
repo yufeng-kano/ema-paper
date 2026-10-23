@@ -21,16 +21,8 @@ from sightread.db.models import Skill, UsageLog
 from sightread.jobs import chat_runner, chat_tools
 from sightread.jobs.queue import claim_next_job
 from sightread.jobs.runner import run_job
-from tests.conftest import CSRF_HEADERS
+from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL
 from tests.test_chat import MESSAGES_URL, _run_queued_turn, _seed_document, sse
-from tests.test_connections_and_prompts import (
-    CHAT,
-    MODELS_URL,
-    _create_connection,
-    _models_ok,
-    _run_parse_on,
-)
-from tests.test_parse_end_to_end import _connect_kano
 
 DOC_PATH = "/workspace/files/Papers/paper.pdf"
 SUBAGENT_PREAMBLE_START = "You are a subagent"
@@ -100,7 +92,6 @@ async def chatting_client(client: AsyncClient) -> AsyncClient:
     """Signed in, Kano Proxy connected, a model chosen for the chat agent, one document."""
     await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
     user_id = (await client.get("/api/me")).json()["user"]["id"]
-    await _connect_kano(client.app.state.sessionmaker, user_id)
     chosen = await client.put(
         "/api/agents/chat/settings",
         json={"model": "claude-code/claude-opus-5-5"},
@@ -503,8 +494,7 @@ async def test_the_agent_prompt_replaces_the_default_and_excludes_a_preset(signe
 
 @respx.mock
 async def test_a_parse_runs_on_the_readers_own_prompt(make_client, sessionmaker, documents) -> None:
-    respx.get(MODELS_URL).mock(side_effect=_models_ok)
-    upstream = respx.post(CHAT).mock(
+    upstream = respx.post(KANO_CHAT_URL).mock(
         return_value=httpx.Response(
             200,
             json={
@@ -515,8 +505,6 @@ async def test_a_parse_runs_on_the_readers_own_prompt(make_client, sessionmaker,
     )
     client = make_client()
     await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    created = await _create_connection(client)
-    await _run_parse_on(client, created["id"])
     saved = await client.put(
         "/api/agents/parse/settings",
         json={"prompt": "Transcribe page {page} as plain text."},

@@ -4,7 +4,6 @@ import {
   createKey,
   getMe,
   isDevLoginAvailable,
-  kanoConnectUrl,
   listJobs,
   putAgentSettings,
   putDocumentContent,
@@ -185,19 +184,3 @@ describe('isDevLoginAvailable', () => {
   })
 })
 
-describe('kanoConnectUrl', () => {
-  it('carries the locale so the callback returns to the same language', () => {
-    expect(kanoConnectUrl('zh-TW')).toBe('/api/kano/connect?locale=zh-TW')
-  })
-
-  it('cannot be steered by a crafted locale', () => {
-    // The value is a query parameter, never a path: the server allowlists it.
-    expect(kanoConnectUrl('../../evil?x=1&y')).toBe(
-      '/api/kano/connect?locale=..%2F..%2Fevil%3Fx%3D1%26y',
-    )
-  })
-
-  it('omits the parameter when there is no locale', () => {
-    expect(kanoConnectUrl('')).toBe('/api/kano/connect')
-  })
-})

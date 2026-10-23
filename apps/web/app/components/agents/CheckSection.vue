@@ -3,16 +3,15 @@
  * The parse agent's **Format check** (docs/web.md § Pages, docs/parsing.md § Format check):
  * the `check` agent's settings, shown in the parse panel rather than as a tab of their own.
  * The switch that checks every Files upload before it opens, on unless the reader turns it
- * off; the model — the parse's own unless one is picked — and the effort, each saved at
- * once; the reader's instructions for the check, edited in place and saved with Save, as the
- * chat agent's are; and, as their advanced option, the whole prompt.
+ * off; the model — the deployment's, a fact — and the effort, saved at once; the reader's
+ * instructions for the check, edited in place and saved with Save, as the chat agent's are;
+ * and, as their advanced option, the whole prompt.
  */
 import {
   AGENT_EFFORTS,
   putAgentSettings,
   type AgentEffort,
   type AgentEntry,
-  type ConnectionModel,
   type SavedAgentSettings,
 } from '~/lib/api'
 
@@ -21,8 +20,6 @@ const DEFAULT_EFFORT: AgentEffort = 'medium'
 const props = defineProps<{
   /** The `check` agent's registry entry. */
   agent: AgentEntry
-  /** The panel's live catalog; null while it loads. */
-  models: ConnectionModel[] | null
   /** `limits.prompt_max_chars`; null until the session has loaded. */
   promptMaxChars: number | null
 }>()
@@ -68,31 +65,10 @@ async function toggleAuto() {
   }
 }
 
-// --- model and effort -----------------------------------------------------------------
+// --- effort ---------------------------------------------------------------------------
 
-const modelPending = ref(false)
 const effortPending = ref(false)
 const effortChoice = computed(() => settings.value.effort ?? DEFAULT_EFFORT)
-
-/** A stored model the catalog does not list is still the current choice. */
-const modelInjected = computed(() => {
-  const current = settings.value.model
-  return current && !(props.models ?? []).some((model) => model.id === current) ? current : null
-})
-
-/** No model of its own (`''`, stored as null) is the parse's model. */
-async function applyModel(value: string) {
-  const name = props.agent.name
-  modelPending.value = true
-  error.value = null
-  try {
-    emit('saved', name, await putAgentSettings(name, { model: value || null }))
-  } catch (failure) {
-    error.value = await resolve(failure)
-  } finally {
-    modelPending.value = false
-  }
-}
 
 async function applyEffort(value: string) {
   const name = props.agent.name
@@ -182,20 +158,12 @@ const advancedOpen = ref(settings.value.prompt !== null || settings.value.prompt
     </div>
 
     <div class="controls">
-      <UiField v-slot="{ id }" class="model" :label="t('agents.modelLabel')">
-        <UiSelect
-          :id="id"
-          :model-value="settings.model ?? ''"
-          :disabled="modelPending"
-          @update:model-value="applyModel"
-        >
-          <option value="">{{ t('agents.check.sameModel') }}</option>
-          <option v-if="modelInjected" :value="modelInjected">{{ modelInjected }}</option>
-          <option v-for="model in models ?? []" :key="model.id" :value="model.id">
-            {{ model.name ? `${model.name} · ${model.id}` : model.id }}
-          </option>
-        </UiSelect>
-      </UiField>
+      <!-- The check's model is the deployment's: a fact under its label, not a control. -->
+      <div class="model fact">
+        <span class="fact-label">{{ t('agents.modelLabel') }}</span>
+        <span v-if="settings.model" class="mono fact-value">{{ settings.model }}</span>
+        <span v-else class="fact-value muted">{{ t('agents.modelNone') }}</span>
+      </div>
       <UiField v-slot="{ id }" class="effort" :label="t('agents.effortLabel')">
         <UiSelect
           :id="id"
@@ -294,7 +262,8 @@ const advancedOpen = ref(settings.value.prompt !== null || settings.value.prompt
 
 /* The field label's treatment: a section of the panel, not a heading of the page. */
 .section-label,
-.field-label {
+.field-label,
+.fact-label {
   margin: 0;
   font-family: inherit;
   font-size: var(--text-2xs);
@@ -382,6 +351,27 @@ const advancedOpen = ref(settings.value.prompt !== null || settings.value.prompt
 .model {
   flex: 1 1 14rem;
   min-width: 0;
+}
+
+/* The panel's fact treatment: the label, then the value where a control would be. */
+.fact {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.fact-value {
+  display: flex;
+  align-items: center;
+  min-height: var(--control-height);
+  overflow: hidden;
+  font-size: var(--text-sm);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fact-value.muted {
+  color: var(--muted);
 }
 
 .effort {

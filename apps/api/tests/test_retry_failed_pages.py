@@ -25,7 +25,6 @@ from sightread.db.models import Document, Job, JobPage, UsageLog, User
 from sightread.workspace.documents import original_of
 from sightread.workspace.layout import user_root
 from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL
-from tests.test_connections_and_prompts import MODELS_URL, _create_connection, _models_ok
 from tests.test_library import MODEL, _ready_to_parse
 from tests.test_library_trash import _fail_next_commit
 from tests.test_parse_end_to_end import VISION_MARKDOWN, _drain_queue
@@ -63,7 +62,8 @@ class Upstream:
 @pytest.fixture
 async def library(make_client, tmp_path) -> AsyncClient:
     """A signed-in client that can parse, whose library keeps originals under tmp_path."""
-    client = make_client(workspaces_dir=str(tmp_path / "ws"))
+    # The deployment names a fallback, the model a retry may send failed pages to.
+    client = make_client(workspaces_dir=str(tmp_path / "ws"), parse_fallback_model=FALLBACK)
     await _ready_to_parse(client)
     return client
 
@@ -89,9 +89,15 @@ async def _retry(client: AsyncClient, document_id: int, **body) -> httpx.Respons
     )
 
 
-async def _set_fallback(client: AsyncClient, **body) -> None:
-    response = await client.put("/api/agents/parse/settings", json=body, headers=CSRF_HEADERS)
-    assert response.status_code == 200, response.text
+async def _with_fallback(make_client, tmp_path, fallback: str | None, auto_fallback: bool):
+    """A library on a deployment that names `fallback`, the reader's switch set."""
+    client = make_client(workspaces_dir=str(tmp_path / "ws"), parse_fallback_model=fallback or "")
+    await _ready_to_parse(client)
+    switched = await client.put(
+        "/api/agents/parse/settings", json={"auto_fallback": auto_fallback}, headers=CSRF_HEADERS
+    )
+    assert switched.status_code == 200, switched.text
+    return client
 
 
 # --- every page or nothing, and the retry ---------------------------------------------------
@@ -306,11 +312,11 @@ async def test_a_page_already_transcribed_is_not_sent_again(
 
 @respx.mock
 async def test_a_blocked_page_goes_to_the_fallback_when_it_is_switched_on(
-    library, sessionmaker, documents
+    make_client, tmp_path, sessionmaker, documents
 ) -> None:
     upstream = Upstream({(MODEL, 1): lambda: _answer("", "content_filter")})
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
-    await _set_fallback(library, fallback_model=FALLBACK, auto_fallback=True)
+    library = await _with_fallback(make_client, tmp_path, FALLBACK, True)
     uploaded = await _upload(library, documents["png"], "image/png")
     await _drain_queue(library, sessionmaker)
 
@@ -330,19 +336,21 @@ async def test_a_blocked_page_goes_to_the_fallback_when_it_is_switched_on(
     ("finish_reason", "reason", "settings"),
     [
         # Blocked, with no fallback switched on: the page fails, and the call is billed.
-        ("content_filter", "blocked", {"fallback_model": FALLBACK, "auto_fallback": False}),
+        ("content_filter", "blocked", (FALLBACK, False)),
+        # Blocked, with the deployment naming no fallback: nowhere else to go.
+        ("content_filter", "blocked", (None, True)),
         # Blocked, with the fallback the model the job already runs on: not asked twice.
-        ("content_filter", "blocked", {"fallback_model": MODEL, "auto_fallback": True}),
+        ("content_filter", "blocked", (MODEL, True)),
         # Cut off is the page's length, not the model's refusal: no fallback for it.
-        ("length", "cut off", {"fallback_model": FALLBACK, "auto_fallback": True}),
+        ("length", "cut off", (FALLBACK, True)),
     ],
 )
 async def test_a_page_the_model_stopped_fails_the_job_after_one_call(
-    library, sessionmaker, documents, finish_reason, reason, settings
+    make_client, tmp_path, sessionmaker, documents, finish_reason, reason, settings
 ) -> None:
     upstream = Upstream({(MODEL, 1): lambda: _answer("half a page", finish_reason)})
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
-    await _set_fallback(library, **settings)
+    library = await _with_fallback(make_client, tmp_path, *settings)
     uploaded = await _upload(library, documents["png"], "image/png")
     await _drain_queue(library, sessionmaker)
 
@@ -360,7 +368,7 @@ async def test_a_page_the_model_stopped_fails_the_job_after_one_call(
 
 @respx.mock
 async def test_a_blocked_call_stays_billed_when_its_fallback_aborts_the_job(
-    library, sessionmaker, documents
+    make_client, tmp_path, sessionmaker, documents
 ) -> None:
     upstream = Upstream(
         {
@@ -369,7 +377,7 @@ async def test_a_blocked_call_stays_billed_when_its_fallback_aborts_the_job(
         }
     )
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
-    await _set_fallback(library, fallback_model=FALLBACK, auto_fallback=True)
+    library = await _with_fallback(make_client, tmp_path, FALLBACK, True)
     uploaded = await _upload(library, documents["png"], "image/png")
     await _drain_queue(library, sessionmaker)
 
@@ -389,44 +397,31 @@ async def test_a_blocked_call_stays_billed_when_its_fallback_aborts_the_job(
 # --- settings --------------------------------------------------------------------------------
 
 
-@respx.mock
-async def test_the_fallback_is_the_parse_agents_alone_and_follows_its_upstream(library) -> None:
-    respx.get(MODELS_URL).mock(side_effect=_models_ok)
+async def test_the_fallback_switch_is_the_parse_agents_alone(
+    library, make_client, tmp_path
+) -> None:
+    """The switch is the reader's; the fallback model is the deployment's, a fact
+    (docs/api.md § GET /api/agents)."""
     saved = await library.put(
-        "/api/agents/parse/settings",
-        json={"fallback_model": "  vendor/fallback-model ", "auto_fallback": True},
-        headers=CSRF_HEADERS,
+        "/api/agents/parse/settings", json={"auto_fallback": True}, headers=CSRF_HEADERS
     )
     assert (saved.json()["fallback_model"], saved.json()["auto_fallback"]) == (FALLBACK, True)
-    for body in ({"fallback_model": FALLBACK}, {"auto_fallback": True}):
-        refused = await library.put("/api/agents/chat/settings", json=body, headers=CSRF_HEADERS)
-        assert refused.status_code == 400
+    for agent in ("chat", "check"):
+        refused = await library.put(
+            f"/api/agents/{agent}/settings", json={"auto_fallback": True}, headers=CSRF_HEADERS
+        )
+        assert refused.status_code == 400, agent
     switch = await library.put(
         "/api/agents/parse/settings", json={"auto_fallback": None}, headers=CSRF_HEADERS
     )
     assert switch.status_code == 400
-    # Another upstream's catalog has other models: the fallback goes with the switch, and
-    # with the connection's deletion.
-    created = await _create_connection(library)
-    moved = await library.put(
-        "/api/agents/parse/settings",
-        json={"connection_id": created["id"], "fallback_model": FALLBACK},
-        headers=CSRF_HEADERS,
+
+    # A deployment naming no fallback: the switch is kept, with nowhere to send a page.
+    unnamed = await _with_fallback(make_client, tmp_path, None, True)
+    parse = next(
+        a for a in (await unnamed.get("/api/agents")).json()["agents"] if a["name"] == "parse"
     )
-    assert moved.json()["fallback_model"] == FALLBACK
-    deleted = await library.delete(f"/api/connections/{created['id']}", headers=CSRF_HEADERS)
-    assert deleted.status_code == 204, deleted.text
-    after = (await library.get("/api/agents")).json()
-    parse = next(agent for agent in after["agents"] if agent["name"] == "parse")
     assert (parse["settings"]["fallback_model"], parse["settings"]["auto_fallback"]) == (None, True)
-    await library.put(
-        "/api/agents/parse/settings", json={"fallback_model": FALLBACK}, headers=CSRF_HEADERS
-    )
-    other = await _create_connection(library, name="other")
-    switched = await library.put(
-        "/api/agents/parse/settings", json={"connection_id": other["id"]}, headers=CSRF_HEADERS
-    )
-    assert (switched.json()["fallback_model"], switched.json()["auto_fallback"]) == (None, True)
 
 
 # --- the page previews -----------------------------------------------------------------------

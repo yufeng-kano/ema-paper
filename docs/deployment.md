@@ -84,11 +84,10 @@ Certificates are always this stack's own: the site block carries an explicit `tl
 | `APP_ENV` | `local` / `production` |
 | `APP_URL` | public origin, used in OAuth metadata + OIDC redirect |
 | `DATABASE_URL` | `postgresql+asyncpg://...` |
-| `SECRET_KEY` | sessions + HKDF root for upstream-key encryption (Kano Proxy keys, connection keys, connect verifiers); generate long random |
-| `KANO_PROXY_BASE_URL` | Kano Proxy's origin (e.g. `https://kano-proxy.example.com`, no path). Vision calls go to `{origin}/openai/v1`, consent to `{origin}/connect/authorize`, the token exchange to `{origin}/api/connect/token` ([auth.md](./auth.md) § 6). Empty = Kano Proxy unavailable |
-| `KANO_PROXY_CLIENT_ID` / `KANO_PROXY_CLIENT_SECRET` | sightread's client registration on Kano Proxy. The redirect URI registered there is `<APP_URL>/api/kano/callback`. The secret lives only in `.env` |
-| `KANO_CONNECT_TTL_SECONDS` | lifetime of a pending connect state (default 600) |
-| `KANO_PROXY_API_KEY`, `PARSE_MODEL`, `CHECK_MODEL`, `PARSE_FALLBACK_MODEL`, `CHAT_MODELS`, `MODEL_PRICES_JSON` | the operator's own upstream key and the models it offers, with their list prices ([billing.md](./billing.md) § Models). Read and validated from the schema step on; nothing runs on them until the upstream step of [billing.md](./billing.md) § Transition |
+| `SECRET_KEY` | sessions and the signed cookies; generate long random |
+| `KANO_PROXY_BASE_URL` | Kano Proxy's origin (e.g. `https://kano-proxy.example.com`, no path). Vision calls and the catalog go to `{origin}/openai/v1`, the chat and check agents to `{origin}/anthropic/v1`. Empty = no upstream: parses and turns are refused with 503 |
+| `KANO_PROXY_API_KEY` | the operator's own Kano Proxy key, presented on every upstream call ([auth.md](./auth.md) § 3). Lives only in `.env`. Empty = no upstream, as above |
+| `PARSE_MODEL`, `CHECK_MODEL`, `PARSE_FALLBACK_MODEL`, `CHAT_MODELS`, `MODEL_PRICES_JSON` | the models the deployment offers, with their list prices ([billing.md](./billing.md) § Models). The API and the worker refuse to start with an offered model unpriced; parses are refused with 503 while `PARSE_MODEL` is empty |
 | `CREDIT_USD`, `PARSE_CREDITS_PER_PAGE`, `CHAT_MIN_CREDITS`, `FREE_CREDITS_PER_PERIOD`, `FREE_STORAGE_BYTES`, `FREE_MAX_JOBS` | credits and the Free plan ([billing.md](./billing.md) § Credits, § Plans) |
 | `KANO_PAY_URL`, `KANO_PAY_APP_ID`, `KANO_PAY_API_KEY`, `KANO_PAY_WEBHOOK_SECRET`, `KANO_PAY_PLANS_JSON`, `BILLING_REFRESH_SECONDS` | the Kano Pay registration and the paid plans ([billing.md](./billing.md) § Kano Pay). The key and the secret live only in `.env`; all four unset = every user on Free |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | OIDC |
@@ -119,7 +118,7 @@ Secrets live in `.env` (gitignored) on the server; tracked files carry placehold
 
 Google OAuth client (production): the authorized redirect URI is `https://<domain>/api/auth/callback`, and the authorized origin is `https://<domain>`. Nothing else in the app needs registering with Google — the connector flow uses this app's own authorization server.
 
-Kano Proxy client (production): sightread is registered on Kano Proxy as an app with the exact redirect URI `https://<domain>/api/kano/callback`; the client id and secret it was issued go into `KANO_PROXY_CLIENT_ID` / `KANO_PROXY_CLIENT_SECRET`. The compose files pass `.env` through whole (`env_file`), so nothing else changes there.
+Kano Proxy (production): the operator's own project API key goes into `KANO_PROXY_API_KEY`; no app registration on Kano Proxy is needed any more (the connect flow is gone, [auth.md](./auth.md) § 6). The compose files pass `.env` through whole (`env_file`), so nothing else changes there.
 
 ## Release flow (initial)
 

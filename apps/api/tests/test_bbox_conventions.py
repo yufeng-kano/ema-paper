@@ -22,7 +22,6 @@ from sightread.agents.bbox import (
     convention_for_model,
     prepare_image,
 )
-from sightread.auth.crypto import encrypt_kano_proxy_key
 from sightread.parsing.images import JPEG_QUALITY, image_size
 from sightread.upstream.client import Connection, transcribe_page
 from tests.conftest import CSRF_HEADERS, KANO_BASE, KANO_CHAT_URL
@@ -120,12 +119,9 @@ def test_only_claude_gets_a_pre_resized_image(documents) -> None:
 
 def _key() -> Connection:
     return Connection(
-        ciphertext=encrypt_kano_proxy_key(SECRET, "sk-kano-proxy-test"),
-        secret_key=SECRET,
+        api_key="sk-kano-proxy-test",
         base_url=f"{KANO_BASE}/openai/v1",
         snapshot=KANO_BASE,
-        builtin=True,
-        report_cost=True,
     )
 
 
@@ -190,18 +186,27 @@ async def test_a_normalized_model_keeps_the_original_contract_wording(documents)
     assert result.markdown == "![fig](sightread://p1/10,20,30,40)"
 
 
-async def test_the_agents_payload_names_the_saved_models_convention(signed_in) -> None:
+async def test_the_agents_payload_names_the_parse_models_convention(signed_in, make_client) -> None:
     before = (await signed_in.get("/api/agents")).json()["agents"][0]
     assert before["bbox"] == {"family": "default", "format": "yxyx_norm1000"}
 
-    saved = await signed_in.put(
-        "/api/agents/parse/settings",
-        json={"model": "anthropic/claude-sonnet-4-5"},
-        headers=CSRF_HEADERS,
+    client = make_client(
+        parse_model="anthropic/claude-sonnet-4-5",
+        chat_models="",
+        model_prices_json=json.dumps(
+            {
+                "anthropic/claude-sonnet-4-5": {
+                    "input": 1,
+                    "cache_read": 1,
+                    "cache_write": 1,
+                    "output": 1,
+                }
+            }
+        ),
     )
-    assert saved.status_code == 200
-    assert saved.json()["bbox"] == {"family": "claude", "format": "xyxy_px"}
-    after = (await signed_in.get("/api/agents")).json()["agents"][0]
+    assert (await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)).status_code == 200
+    after = (await client.get("/api/agents")).json()["agents"][0]
+    assert after["settings"]["model"] == "anthropic/claude-sonnet-4-5"
     assert after["bbox"] == {"family": "claude", "format": "xyxy_px"}
 
 

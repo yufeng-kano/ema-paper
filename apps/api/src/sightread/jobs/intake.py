@@ -34,7 +34,6 @@ from ..db.models import (
     AgentSetting,
     Document,
     Job,
-    KanoProxyKey,
     Result,
     UploadTicket,
     User,
@@ -43,6 +42,7 @@ from ..db.models import (
 from ..errors import ApiError
 from ..parsing import poppler
 from ..parsing.images import ACCEPTED_IMAGE_TYPES, ImageError, probe_image
+from ..upstream.client import offered_models
 from .queue import (
     CheckTarget,
     count_running_jobs,
@@ -149,10 +149,10 @@ def resolve_kind(filename: str, media_type: str) -> tuple[str, str]:
 class Target:
     """What a job will run: agent, model, prompt and the upstream it calls.
 
-    `connection_base_url` snapshots the endpoint at enqueue time — part of the dedup key,
-    so editing a connection's URL invalidates the old endpoint's cached results, and the
-    built-in upstream's snapshot (KANO_PROXY_BASE_URL) keeps historical OpenRouter results
-    from ever answering (docs/jobs.md § Dedup).
+    `connection_id` is always NULL now — every job runs on the operator's Kano Proxy —
+    and `connection_base_url` snapshots `KANO_PROXY_BASE_URL` at enqueue: part of the
+    dedup key, so historical OpenRouter and provider-connection results never answer
+    (docs/jobs.md § Dedup).
     """
 
     agent: str
@@ -166,6 +166,19 @@ class Target:
     fallback_model: str | None = None
 
 
+def checked_parse_model(settings: Settings, model: str | None) -> str:
+    """The model a parse, a retry or a re-convert runs on: `PARSE_MODEL`, or the one named
+    when it is one of the parse agent's two (docs/agents.md § Enqueue rules). 503 with no
+    parse model configured, 400 for any other model."""
+    if not settings.parse_model:
+        raise ApiError(503, "upstream", "No parse model is configured on this deployment")
+    if model is None:
+        return settings.parse_model
+    if model not in offered_models(settings, PARSE.name):
+        raise ApiError(400, "invalid_request", "That model is not one the parse agent runs")
+    return model
+
+
 async def resolve_target(
     db: AsyncSession,
     settings: Settings,
@@ -173,10 +186,13 @@ async def resolve_target(
     agent: AgentDefinition,
     model: str | None,
 ) -> Target:
-    """Upstream, model and prompt for a job of `agent`, from that agent's settings
-    (docs/agents.md § Enqueue rules). A per-request `model` overrides the stored one; the
-    user's own prompt — or a legacy preset — replaces the agent's default template
-    (docs/parsing.md § Prompts)."""
+    """Upstream, model and prompt for a job of `agent` (docs/agents.md § Enqueue rules):
+    the operator's Kano Proxy, the deployment's parse model — a per-request `model` must
+    be one of the parse agent's — and the user's own prompt, else a legacy preset, else
+    the agent's default template (docs/parsing.md § Prompts)."""
+    model = checked_parse_model(settings, model)
+    if not settings.kano_proxy_configured:
+        raise ApiError(503, "upstream", "Kano Proxy is not configured on this deployment")
     row = (
         await db.execute(
             select(AgentSetting).where(
@@ -184,38 +200,6 @@ async def resolve_target(
             )
         )
     ).scalar_one_or_none()
-    connection = row.connection if row else None
-
-    if connection is None:
-        if not settings.kano_proxy_configured:
-            raise ApiError(
-                503,
-                "upstream",
-                f"Kano Proxy is not configured on this deployment: choose a provider "
-                f"connection for the {agent.name} agent through the API",
-            )
-        connected = (
-            await db.execute(select(KanoProxyKey.user_id).where(KanoProxyKey.user_id == user.id))
-        ).first()
-        if connected is None:
-            raise ApiError(
-                400,
-                "invalid_request",
-                f"Kano Proxy is not connected: connect it on the Agent page or choose a provider "
-                f"connection for the {agent.name} agent",
-            )
-        connection_id, snapshot = None, settings.kano_proxy_base_url
-    else:
-        connection_id, snapshot = connection.id, connection.base_url
-
-    model = model or (row.model if row else None)
-    if not model:
-        raise ApiError(
-            400,
-            "invalid_request",
-            f"No model chosen for the {agent.name} agent: pick one on the Agent page or "
-            f"pass 'model'",
-        )
     # The user's own prompt, else a legacy preset, else the default — each replacing the
     # template whole (docs/parsing.md § Prompts).
     preset = row.prompt_preset if row else None
@@ -225,16 +209,29 @@ async def resolve_target(
         prompt = preset.text
     else:
         prompt = agent.default_prompt_template
-    fallback = row.fallback_model if row is not None and row.auto_fallback else None
-    return Target(agent.name, model, agent.bbox_format, prompt, connection_id, snapshot, fallback)
+    fallback = (
+        settings.parse_fallback_model
+        if row is not None and row.auto_fallback and settings.parse_fallback_model
+        else None
+    )
+    return Target(
+        agent.name,
+        model,
+        agent.bbox_format,
+        prompt,
+        None,
+        settings.kano_proxy_base_url,
+        fallback,
+    )
 
 
 async def resolve_check(
     db: AsyncSession, settings: Settings, user_id: int, parse_model: str
 ) -> CheckTarget | None:
     """The check a Files upload or a retry takes, from the `check` agent's settings as they
-    are now; None while its switch is off or Kano Proxy is not connected, the one upstream
-    it speaks (docs/parsing.md § Format check)."""
+    are now; None while its switch is off or Kano Proxy is not configured, the one
+    upstream it speaks (docs/parsing.md § Format check). Its model is `CHECK_MODEL`, else
+    the parse's."""
     row = (
         await db.execute(
             select(AgentSetting).where(
@@ -246,13 +243,9 @@ async def resolve_check(
         return None
     if not settings.kano_proxy_configured:
         return None
-    connected = (
-        await db.execute(select(KanoProxyKey.user_id).where(KanoProxyKey.user_id == user_id))
-    ).first()
-    if connected is None:
-        return None
+    model = settings.check_model or parse_model
     if row is None:
-        return CheckTarget(parse_model, EFFORT_DEFAULT, CHECK.default_prompt_template)
+        return CheckTarget(model, EFFORT_DEFAULT, CHECK.default_prompt_template)
     # The user's own prompt, else a legacy preset, else the default, as for the parse
     # agent (docs/agents.md § Enqueue rules).
     if row.prompt:
@@ -262,7 +255,7 @@ async def resolve_check(
     else:
         prompt = CHECK.default_prompt_template
     return CheckTarget(
-        row.model or parse_model,
+        model,
         row.effort or EFFORT_DEFAULT,
         check_agent.system_prompt(prompt, row.instructions),
     )

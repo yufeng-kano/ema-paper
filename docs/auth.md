@@ -14,9 +14,11 @@ Six credential kinds, strictly separated. No password login anywhere.
 - Format `sr_<32 random url-safe chars>`; shown exactly once at creation; stored as SHA-256 hash + display prefix (`sr_...abc4`).
 - Sent as `Authorization: Bearer sr_...` on `/v1/*`. Constant-time lookup by hash. Revocation = soft delete.
 
-## 3. User's upstream keys — encrypted, never hashed (we must use them)
+## 3. The upstream key — the operator's, never a user's
 
-Two flavours, same rules: the Kano Proxy key (`kano_proxy_keys`, one per user, obtained by the connect flow in § 6 — never typed in) and the API key of each user-defined provider connection (`provider_connections`, any OpenAI-compatible endpoint — [api.md](./api.md) § Upstreams).
+Every upstream call runs on the operator's own Kano Proxy key, `KANO_PROXY_API_KEY` in the server's `.env` ([billing.md](./billing.md) § Models and the operator's upstream, [deployment.md](./deployment.md)): the API and the worker read it from configuration and present it as `Authorization: Bearer`; it is never stored in the database, never returned by a route, never logged. Users hold no upstream credential of their own any more — the per-user Kano Proxy key the connect flow used to obtain and the user-defined provider connections were removed by step 4 of [billing.md](./billing.md) § Transition, their tables with them. The encryption helpers went with them: `auth/crypto.py` keeps only the token hashing sessions, API keys and upload tickets use.
+
+The rules the removed keys followed, kept here for the record because the next secret that must be *replayed* (not merely verified) follows them again:
 
 - AES-256-GCM, key derived from `SECRET_KEY` via HKDF (context strings `kano-proxy-key-v1` and `provider-connection-key-v1`), random nonce per encryption.
 - The Kano Proxy key is not validated separately: it arrives from Kano Proxy's own token endpoint in exchange for a code the user just approved. A connection's key is validated at save time with `GET {base_url}/models` on its own endpoint; invalid → 400, nothing stored. A connection's `base_url` must be `http(s)`, must never carry userinfo (`user:pass@` — the URL is stored and displayed in plaintext), and outside `APP_ENV=local` must be `https` and must not denote a non-public address (the app fetches it server-side). Host literals are canonicalized before the check — the shortened/decimal/hex IPv4 spellings the resolver accepts (`127.1`, `2130706433`, `0x7f000001`) are judged by the address they denote, not their text — and a hostname is **resolved** at save time (`getaddrinfo`), every resolved address required to be global, which rejects `/etc/hosts` aliases (`ip6-localhost`) and attacker domains pointing into internal space. Residual, accepted: a domain whose DNS answer changes *after* validation (rebinding) is not re-checked at call time — full protection needs request-time resolve-and-pin, revisit if the threat model hardens. A malformed URL (bad IPv6 bracket syntax included) is a 400, never a 500.
@@ -53,24 +55,9 @@ A ticket lets an agent do exactly one upload and then read the job that upload c
 - **Mint rate limit:** `UPLOAD_TICKET_RATE_PER_HOUR` (default 30) per user; exceeding it is a 429-shaped tool error. Minting also deletes that user's expired tickets (opportunistic cleanup — no sweeper involvement, the table stays small because every mint tidies up).
 - Never in query strings, like every other bearer.
 
-## 6. Kano Proxy connect — authorization code + PKCE, sightread as the client
+## 6. Kano Proxy connect — removed
 
-**Going away** with the operator's own upstream key ([billing.md](./billing.md) § Transition, step 4): the subscription runs every user on one Kano Proxy account of the operator's, so this flow, `kano_proxy_keys` and `kano_connect_states` are removed by that step. Until then it is what runs.
-
-Kano Proxy is the built-in upstream ([api.md](./api.md) § Upstreams). Its key is not pasted: the user approves sightread on Kano Proxy and sightread receives a key for that user and app. The contract is shared with kano-proxy-cloud, which implements the other side, and is followed exactly.
-
-Configuration: `KANO_PROXY_BASE_URL` (the origin, e.g. `https://kano-proxy.example.com`), `KANO_PROXY_CLIENT_ID`, `KANO_PROXY_CLIENT_SECRET` ([deployment.md](./deployment.md)). With any of the three unset, Kano Proxy is unavailable: `GET /api/kano` says so, connect answers `?kano=error`, and enqueueing on it is refused.
-
-1. **`GET /api/kano/connect`** (session; optional `?locale=` as on sign-in, § 1). Creates a connect state in `kano_connect_states`, bound to the signed-in user: a random `state` stored as its SHA-256 hash, and a random PKCE `code_verifier` stored AES-GCM (HKDF context `kano-connect-verifier-v1` — it is replayed at the token step, so it cannot be hashed), expiring after `KANO_CONNECT_TTL_SECONDS` (default 600). The user's expired states are deleted on the way. Then 302 to
-   `{KANO_PROXY_BASE_URL}/connect/authorize?response_type=code&client_id=<KANO_PROXY_CLIENT_ID>&redirect_uri=<APP_URL>/api/kano/callback&state=<state>&code_challenge=<base64url(sha256(verifier)), no padding>&code_challenge_method=S256`.
-   `redirect_uri` is always exactly `APP_URL + /api/kano/callback`, and the same value is sent again at the token step.
-2. **`GET /api/kano/callback?code=&state=`** (session). The state must exist, be unexpired and belong to the user of the current session. It is consumed by deleting its row in the same statement that finds it, so a replay finds nothing (single use) and two concurrent callbacks cannot both win. A state bound to another user is refused and left alone. Every failure ends in a 302 to the web Agent page (`/agents`) with a non-secret status: `error=access_denied` → `?kano=denied`; no session, an unknown, expired, foreign or used state, a missing code, or a failed token exchange → `?kano=error`. Nothing answers JSON to a browser in the middle of a redirect chain.
-3. **Token exchange**, server to server: `POST {KANO_PROXY_BASE_URL}/api/connect/token`, `application/x-www-form-urlencoded`, body `grant_type=authorization_code&code=…&redirect_uri=…&client_id=…&client_secret=…&code_verifier=…`. Success is 200 `{"access_token": "sk-kano-proxy-…", "token_type": "bearer"}` — no expiry, no refresh token. Errors are 400 `{"error": "invalid_request|invalid_grant|unsupported_grant_type"}` and 401 `{"error": "invalid_client"}`; only the error code is logged.
-4. **Store or replace** the user's `kano_proxy_keys` row with the new key (encrypted, masked), then 302 to `/settings/agent?kano=connected`, which also takes the code out of the address bar. Reconnecting replaces the stored key; Kano Proxy itself revokes the previous key for the same user and app.
-
-`GET /api/kano` answers `{available, connected, masked}`. **`DELETE /api/kano`** (session + the CSRF header) deletes the stored key locally only. The key stays listed on Kano Proxy's Access page, where the user deletes it; the Agent page's confirm dialog says so.
-
-The Agent section the callback returns to is `WEB_URL/settings/agent`, prefixed with the locale parked by `/api/kano/connect` when that locale is in `WEB_LOCALE_PREFIXES` (the allowlist rule of § 1). The locale rides in the same short-lived signed cookie sign-in uses; the state itself is server-side.
+The authorization-code flow by which a user approved Ema Paper on Kano Proxy and the app received a key for them (`GET /api/kano/connect`, `GET /api/kano/callback`, `GET/DELETE /api/kano`, the `kano_proxy_keys` and `kano_connect_states` tables, `KANO_PROXY_CLIENT_ID` / `KANO_PROXY_CLIENT_SECRET` / `KANO_CONNECT_TTL_SECONDS`) was removed by step 4 of [billing.md](./billing.md) § Transition: every user runs on the operator's one Kano Proxy account (§ 3), paid for in credits. Kano Proxy's side of the contract (kano-proxy-cloud's connect endpoints) is untouched by this; Ema Paper is simply no longer a client of it.
 
 ## Logging rule
 

@@ -69,7 +69,7 @@ from ..upstream.client import (
     UpstreamError,
     Usage,
     ask_about_page,
-    load_connection,
+    kano_connection,
     transcribe_page,
 )
 from ..workspace.documents import (
@@ -1119,11 +1119,13 @@ async def run_job(
             return
         if generation is not None and job.worker_generation != generation:
             return
-        connection = await load_connection(db, settings, job.user_id, job.connection_id)
+        # A job queued for a provider connection — history, from before the operator's
+        # upstream — has no upstream to run on (docs/database.md § Rules).
+        connection = None if job.connection_id is not None else kano_connection(settings)
         if connection is not None and job.connection_base_url != connection.snapshot:
-            # The connection's URL (or KANO_PROXY_BASE_URL) changed while the job sat
-            # queued. The dedup key must name the endpoint that actually produced the
-            # result, not the one selected at submission (docs/jobs.md § Dedup). Fenced
+            # KANO_PROXY_BASE_URL changed while the job sat queued. The dedup key must
+            # name the endpoint that actually produced the result, not the one
+            # snapshotted at submission (docs/jobs.md § Dedup). Fenced
             # like every write to the row: a replacement that took the job meanwhile
             # keeps its own snapshot, and this run ends here (docs/jobs.md § Queue).
             moved = await db.execute(
@@ -1154,7 +1156,7 @@ async def run_job(
 
     if connection is None:
         error = (
-            "Kano Proxy is not connected"
+            "Kano Proxy is not configured on this deployment"
             if job.connection_id is None
             else "the provider connection for this job no longer exists"
         )
@@ -1265,22 +1267,8 @@ async def run_job(
         reading: str | None = None
         check_meta: dict | None = None
         if job.check_model:
-            async with sessionmaker() as db:
-                kano = await load_connection(db, settings, job.user_id, None)
-            # The check speaks the Messages API, on Kano Proxy's Anthropic-format route,
-            # whatever upstream the pages went to.
-            check_connection = (
-                None
-                if kano is None
-                else Connection(
-                    ciphertext=kano.ciphertext,
-                    secret_key=kano.secret_key,
-                    base_url=settings.kano_proxy_anthropic_base,
-                    snapshot=kano.snapshot,
-                    builtin=True,
-                    report_cost=True,
-                )
-            )
+            # The check speaks the Messages API, on Kano Proxy's Anthropic-format route.
+            check_connection = kano_connection(settings, anthropic=True)
 
             async def bill(completed: CompletedMessage) -> None:
                 await _to_the_end(_record_check_usage(sessionmaker, job, completed))

@@ -30,7 +30,6 @@ from sightread.workspace.reconcile import reconcile_user
 from tests.conftest import CSRF_HEADERS
 from tests.test_document_images import _image, _insert
 from tests.test_markdown_documents import _new, _upload_markdown
-from tests.test_parse_end_to_end import _connect_kano
 
 RESULT = {"markdown": "# Paper\n", "pages": [], "figures": [], "errors": [], "meta": {}}
 
@@ -479,7 +478,6 @@ async def test_a_parse_that_ends_in_the_trash_keeps_its_original_outside_files(
 
 
 async def test_a_trashed_files_conversation_takes_no_message(writer) -> None:
-    await _connect_kano(writer.app.state.sessionmaker, writer.user_id)
     chosen = await writer.put(
         "/api/agents/chat/settings", json={"model": "vendor/chat-model"}, headers=CSRF_HEADERS
     )

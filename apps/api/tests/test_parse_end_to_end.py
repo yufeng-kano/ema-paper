@@ -19,15 +19,13 @@ from httpx import AsyncClient
 from sqlalchemy import select, update
 
 from sightread.agents.parse import PIPELINE_VERSION
-from sightread.auth.crypto import encrypt_kano_proxy_key
-from sightread.db.models import Job, JobPage, KanoProxyKey, Result, UsageLog
+from sightread.db.models import Job, JobPage, Result, UsageLog
 from sightread.jobs.queue import claim_next_job
 from sightread.jobs.runner import run_job
-from tests.conftest import CSRF_HEADERS, DATABASE_URL, KANO_CHAT_URL, TEST_SECRET_KEY
+from tests.conftest import CSRF_HEADERS, DATABASE_URL, KANO_API_KEY, KANO_CHAT_URL
 from tests.test_jobs_queue import postgres_only
 
 MODEL = "vendor/vision-model"
-KANO_KEY = "sk-kano-proxy-test-key"
 # Its figure takes the whole page: no side of its crop can cut anything, so the figure check
 # (docs/parsing.md § Figure check) asks no model, whatever the fixture page holds.
 VISION_MARKDOWN = (
@@ -53,25 +51,10 @@ def _vision_stub(request: httpx.Request) -> httpx.Response:
     return _completion(VISION_MARKDOWN)
 
 
-async def _connect_kano(sessionmaker, user_id: int) -> None:
-    """What a finished connect flow leaves behind: the user's Kano Proxy key, stored."""
-    async with sessionmaker() as db:
-        db.add(
-            KanoProxyKey(
-                user_id=user_id,
-                ciphertext=encrypt_kano_proxy_key(TEST_SECRET_KEY, KANO_KEY),
-                masked="sk-kano-...-key",
-            )
-        )
-        await db.commit()
-
-
 async def _authorize(client: AsyncClient, sessionmaker) -> AsyncClient:
-    """Give a client an API key and a connected Kano Proxy."""
+    """Give a client an API key."""
     assert (await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)).status_code == 200
     created = await client.post("/api/keys", json={"name": "test"}, headers=CSRF_HEADERS)
-    user_id = (await client.get("/api/me")).json()["user"]["id"]
-    await _connect_kano(sessionmaker, user_id)
     client.headers["Authorization"] = f"Bearer {created.json()['key']}"
     return client
 
@@ -161,9 +144,9 @@ async def test_parse_a_mixed_pdf_end_to_end(api_client, sessionmaker, documents)
     # Kano Proxy's reported cost is a list-price estimate, never billing.
     assert {row.cost_source for row in usage} == {"estimated"}
     assert float(sum(row.cost for row in usage)) == pytest.approx(0.0045)
-    # The built-in upstream is Kano Proxy's OpenAI base, called with the user's own key,
-    # and the job's dedup snapshot is the Kano Proxy origin (docs/jobs.md § Dedup).
-    assert route.calls[0].request.headers["authorization"] == f"Bearer {KANO_KEY}"
+    # The upstream is Kano Proxy's OpenAI base, called with the operator's key, and the
+    # job's dedup snapshot is the Kano Proxy origin (docs/jobs.md § Dedup).
+    assert route.calls[0].request.headers["authorization"] == f"Bearer {KANO_API_KEY}"
     assert (job.connection_id, job.connection_base_url) == (None, "https://kano.test")
     assert job.agent == "parse"
 
@@ -535,16 +518,15 @@ async def test_the_event_stream_follows_a_job_it_is_already_watching(
     assert "event: done" in body
 
 
-async def test_a_queued_job_whose_kano_key_was_disconnected_fails_cleanly(
-    api_client, sessionmaker, documents
+async def test_a_queued_job_fails_cleanly_when_kano_proxy_is_unconfigured_by_run_time(
+    api_client, make_client, sessionmaker, documents
 ) -> None:
     accepted = await _upload(api_client, documents["text_pdf"])
     assert accepted.status_code == 202
-    disconnected = await api_client.delete("/api/kano", headers=CSRF_HEADERS)
-    assert disconnected.status_code == 204
 
-    await _drain_queue(api_client, sessionmaker)
+    # The worker restarted without the operator's key.
+    await _drain_queue(make_client(kano_proxy_api_key=""), sessionmaker)
 
     status = (await api_client.get(f"/v1/jobs/{accepted.json()['job_id']}")).json()
     assert status["status"] == "failed"
-    assert status["error"] == "Kano Proxy is not connected"
+    assert status["error"] == "Kano Proxy is not configured on this deployment"

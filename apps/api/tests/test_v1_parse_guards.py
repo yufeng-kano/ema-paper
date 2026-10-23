@@ -13,17 +13,14 @@ from sqlalchemy import select
 
 from sightread.db.models import Job, utcnow
 from tests.conftest import CSRF_HEADERS
-from tests.test_parse_end_to_end import _connect_kano
 
 MODEL = "vendor/vision-model"
 
 
 async def _keyed_client(client: AsyncClient) -> AsyncClient:
-    """An API key and a connected Kano Proxy, so the guards below are what answers."""
+    """An API key, so the guards below are what answers."""
     await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
     created = await client.post("/api/keys", json={"name": "test"}, headers=CSRF_HEADERS)
-    user_id = (await client.get("/api/me")).json()["user"]["id"]
-    await _connect_kano(client.app.state.sessionmaker, user_id)
     client.headers["Authorization"] = f"Bearer {created.json()['key']}"
     return client
 
@@ -171,66 +168,44 @@ async def test_broken_base64_is_rejected(client: AsyncClient, documents) -> None
     assert response.status_code == 400
 
 
-async def test_a_job_needs_a_model(client: AsyncClient, sessionmaker, documents) -> None:
-    """No model in the request and none chosen on the Agent page: refused before any file is
-    stored, with a message that says where to choose one (docs/agents.md)."""
+async def test_a_job_runs_on_the_deployments_parse_model(
+    client: AsyncClient, sessionmaker, documents
+) -> None:
+    """No model in the request: the deployment's parse model, never a stored pick
+    (docs/agents.md § Enqueue rules)."""
     await _keyed_client(client)
     response = await client.post(
         "/v1/parse",
         files={"file": ("text.pdf", documents["text_pdf"].read_bytes(), "application/pdf")},
     )
 
-    assert response.status_code == 400
-    assert response.json()["error"]["message"] == (
-        "No model chosen for the parse agent: pick one on the Agent page or pass 'model'"
-    )
+    assert response.status_code == 202, response.text
     async with sessionmaker() as db:
-        assert (await db.execute(select(Job))).scalars().all() == []
+        job = await db.get(Job, uuid.UUID(response.json()["job_id"]))
+    assert (job.model, job.agent) == (MODEL, "parse")
 
 
-async def test_the_model_chosen_in_settings_runs_and_a_request_model_overrides_it(
-    client: AsyncClient, sessionmaker, documents
+async def test_a_deployment_without_a_parse_model_refuses_every_parse(
+    make_client, sessionmaker, documents
 ) -> None:
-    await _keyed_client(client)
-    chosen = await client.put(
-        "/api/agents/parse/settings", json={"model": "vendor/chosen"}, headers=CSRF_HEADERS
-    )
-    assert chosen.status_code == 200
-
-    from_settings = await client.post(
-        "/v1/parse",
-        files={"file": ("text.pdf", documents["text_pdf"].read_bytes(), "application/pdf")},
-    )
-    overridden = await _upload(client, documents["mixed_pdf"])
-
-    async with sessionmaker() as db:
-        first = await db.get(Job, uuid.UUID(from_settings.json()["job_id"]))
-        second = await db.get(Job, uuid.UUID(overridden.json()["job_id"]))
-    assert (first.model, first.agent) == ("vendor/chosen", "parse")
-    assert second.model == MODEL
-
-
-async def test_kano_proxy_must_be_connected_to_parse_on_it(client: AsyncClient, documents) -> None:
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    created = await client.post("/api/keys", json={"name": "test"}, headers=CSRF_HEADERS)
-    client.headers["Authorization"] = f"Bearer {created.json()['key']}"
-
+    client = await _keyed_client(make_client(parse_model=""))
     response = await _upload(client, documents["text_pdf"])
 
-    assert response.status_code == 400
-    assert response.json()["error"]["message"].startswith("Kano Proxy is not connected")
+    assert response.status_code == 503
+    assert response.json()["error"]["message"] == "No parse model is configured on this deployment"
+    async with sessionmaker() as db:
+        assert (await db.execute(select(Job))).scalars().all() == []
     upload_dir = Path(client.app.state.settings.upload_dir)
     assert not upload_dir.exists() or list(upload_dir.iterdir()) == []
 
 
-async def test_a_deployment_without_kano_proxy_refuses_the_built_in_upstream(
-    make_client, documents
-) -> None:
-    client = await _keyed_client(make_client(kano_proxy_base_url=""))
-    response = await _upload(client, documents["text_pdf"])
+async def test_a_deployment_without_kano_proxy_refuses_every_parse(make_client, documents) -> None:
+    for overrides in ({"kano_proxy_base_url": ""}, {"kano_proxy_api_key": ""}):
+        client = await _keyed_client(make_client(**overrides))
+        response = await _upload(client, documents["text_pdf"])
 
-    assert response.status_code == 503
-    assert "not configured" in response.json()["error"]["message"]
+        assert response.status_code == 503, overrides
+        assert "not configured" in response.json()["error"]["message"]
 
 
 async def test_jobs_of_other_users_are_invisible(make_client, sessionmaker, documents) -> None:

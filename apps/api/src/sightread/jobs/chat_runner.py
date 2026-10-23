@@ -47,7 +47,7 @@ from ..upstream.client import (
     PaymentRequired,
     RateLimited,
     UpstreamError,
-    load_connection,
+    kano_connection,
 )
 from ..workspace import git
 from ..workspace.documents import (
@@ -135,6 +135,15 @@ class TurnContext:
 # --- loading -------------------------------------------------------------------------------
 
 
+def chat_model(settings: Settings, setting: AgentSetting | None) -> str | None:
+    """The model the chat agent runs: the reader's pick while `CHAT_MODELS` still offers
+    it, else the list's first entry, None with none offered (docs/billing.md § Models)."""
+    offered = settings.chat_model_list
+    if setting is not None and setting.model in offered:
+        return setting.model
+    return offered[0] if offered else None
+
+
 async def _load(
     sessionmaker: async_sessionmaker[AsyncSession],
     settings: Settings,
@@ -161,14 +170,12 @@ async def _load(
         ).scalar_one_or_none()
         # The conversation's model is the model of its first turn, whatever the Agent page
         # says now: the stored thinking blocks carry its signatures (docs/chat.md).
-        model = conversation.model or (setting.model if setting else None)
+        model = conversation.model or chat_model(settings, setting)
         if not model:
-            raise TurnFailed("No model chosen for the chat agent: pick one on the Agent page")
+            raise TurnFailed("No chat model is offered on this deployment")
         if model not in settings.model_prices:
             # Never a call nobody priced (docs/billing.md § Models).
             raise TurnFailed("model_unpriced")
-        if setting and setting.connection_id is not None:
-            raise TurnFailed("The chat agent runs on Kano Proxy only")
         if conversation.model is None:
             conversation.model = model
             await db.commit()
@@ -178,17 +185,9 @@ async def _load(
         # refused past it too; this catches a turn queued before the history crossed it.
         if await history_bytes(db, conversation.id) > settings.chat_history_max_bytes:
             raise TurnFailed(HISTORY_FULL)
-        connection = await load_connection(db, settings, turn.user_id, None)
+        connection = kano_connection(settings, anthropic=True)
         if connection is None:
-            raise TurnFailed("Kano Proxy is not connected: connect it on the Agent page")
-        connection = Connection(
-            ciphertext=connection.ciphertext,
-            secret_key=connection.secret_key,
-            base_url=settings.kano_proxy_anthropic_base,
-            snapshot=connection.snapshot,
-            builtin=True,
-            report_cost=True,
-        )
+            raise TurnFailed("Kano Proxy is not configured on this deployment")
         # The reader's own prompt replaces the default whole; a legacy preset is appended
         # to it as before, and never stands beside a prompt (docs/chat.md § System prompt).
         own_prompt = setting.prompt if setting and setting.prompt else None
