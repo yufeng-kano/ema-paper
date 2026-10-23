@@ -8,6 +8,7 @@ import type { IconName } from './icons'
 export const SETTINGS_SECTIONS = [
   { key: 'general', icon: 'settings' },
   { key: 'account', icon: 'user' },
+  { key: 'billing', icon: 'credit-card' },
   { key: 'agent', icon: 'agent' },
   { key: 'keys', icon: 'keys' },
   { key: 'mcp', icon: 'connect' },

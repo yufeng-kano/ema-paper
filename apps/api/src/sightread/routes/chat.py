@@ -841,9 +841,13 @@ async def sandbox_status(user: SessionUser, db: DbSession, settings: AppSettings
     except SandboxUnavailable:
         state = {"state": "unavailable", "last_used_at": None, "shells": 0, "uptime_seconds": 0}
     root = user_root(settings.workspaces_dir, user.id)
-    quota = ledger.storage_limit(settings, await ledger.plan_of(db, settings, user.id))
-    workspace = await asyncio.to_thread(_workspace_usage, root, quota)
-    return {**state, "workspace": workspace}
+    plan = await ledger.plan_of(db, settings, user.id)
+    workspace = await asyncio.to_thread(
+        _workspace_usage, root, ledger.storage_limit(settings, plan)
+    )
+    # Whether the plan gives the chat agent a sandbox at all; the runner's state above
+    # says whether this deployment has one to give (docs/billing.md § Plans).
+    return {**state, "granted": plan.sandbox, "workspace": workspace}
 
 
 @router.post("/sandbox/stop", dependencies=[CsrfGuard], status_code=status.HTTP_204_NO_CONTENT)

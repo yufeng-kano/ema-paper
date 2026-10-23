@@ -475,6 +475,11 @@ defineProps<{ name: IconName }>()
       <path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2" />
       <circle cx="12" cy="7" r="4" />
     </template>
+    <!-- credit-card: the Billing section. -->
+    <template v-else-if="name === 'credit-card'">
+      <rect x="2" y="5" width="20" height="14" rx="2" />
+      <path d="M2 10h20" />
+    </template>
     <!-- sun / moon / monitor: the three theme choices. -->
     <template v-else-if="name === 'sun'">
       <circle cx="12" cy="12" r="4" />

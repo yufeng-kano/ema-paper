@@ -44,6 +44,8 @@ import {
   updateDocument,
   updateFolder,
   uploadDocument,
+  creditsRefusalOf,
+  type CreditsRefusal,
   type JobResult,
   type JobStatus,
   type LibraryDocument,
@@ -59,7 +61,7 @@ import {
   ROWS_DRAG_TYPE,
   setDropEffect,
 } from '~/lib/dnd'
-import { formatBytes, formatShortDateTime } from '~/lib/format'
+import { formatBytes, formatCount, formatShortDateTime } from '~/lib/format'
 import type { MenuItem, Point } from '~/lib/menu'
 import {
   acceptsUpload,
@@ -487,6 +489,8 @@ function openEntry(key: string) {
 
 const fileInput = ref<HTMLInputElement | null>(null)
 const mutationError = ref<string | null>(null)
+/** The 402 of an upload: the dialog that says what the document needs (docs/web.md § Files). */
+const creditsRefusal = ref<CreditsRefusal | null>(null)
 const limits = computed(() => auth.me.value?.limits ?? null)
 /** Both lists: a file picker filters on either, and a system that types `.heic` as
  *  nothing at all would otherwise grey the file out. */
@@ -599,6 +603,13 @@ async function drain() {
           continue
         }
         queue.value.shift()
+        // Not enough credits: nothing was stored or charged, and the dialog says how far
+        // short the balance is (docs/billing.md § Refusals).
+        const refusal = creditsRefusalOf(error)
+        if (refusal) {
+          creditsRefusal.value = refusal
+          continue
+        }
         mutationError.value = await resolve(error)
       }
     }
@@ -2377,6 +2388,13 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
                         ? `${row.document.pages_done}/${row.document.page_count}`
                         : row.document.pages_done || ''
                     }}
+                    <!-- A parse on its way says what it reserved (docs/billing.md § A parse). -->
+                    <span
+                      v-if="isPending(row.document) && row.document.credits != null"
+                      class="muted"
+                    >
+                      · {{ t('credits.n', { n: formatCount(row.document.credits, locale) }, row.document.credits) }}
+                    </span>
                   </template>
                 </template>
 
@@ -2494,6 +2512,13 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
       :document="reconverting"
       @started="onReconvertStarted"
       @close="reconverting = null"
+    />
+
+    <CreditsDialog
+      v-if="creditsRefusal"
+      :refusal="creditsRefusal"
+      action="parse"
+      @close="creditsRefusal = null"
     />
 
     <!-- Keyed per document, and per parse: reopening on another file, or a re-convert taken

@@ -6,6 +6,7 @@
  * (docs/api.md § Usage aggregates): a cost with no billed call behind it reads "—", an
  * estimate is always prefixed "≈", and an unpriced call is a count.
  */
+import { SETTINGS_QUERY } from '~/lib/settings'
 import {
   getSandbox,
   getUsage,
@@ -135,7 +136,18 @@ const {
   refresh: refreshSandbox,
 } = useAuthedData(() => getSandbox())
 
-const sandboxAvailable = computed(() => sandbox.value !== null && sandbox.value.state !== 'unavailable')
+/** The VM's controls and figures: a runner this deployment has, on a plan that gives one. */
+const sandboxAvailable = computed(
+  () => sandbox.value !== null && sandbox.value.state !== 'unavailable' && sandbox.value.granted !== false,
+)
+
+const route = useRoute()
+const router = useRouter()
+
+/** The Billing section, where *Upgrade* is — the dialog's own navigation, so Back leaves it. */
+function openBilling() {
+  void router.replace({ query: { ...route.query, [SETTINGS_QUERY]: 'billing' } })
+}
 
 function stateTone(state: SandboxState): 'ok' | 'info' | 'neutral' {
   return state === 'running' ? 'ok' : state === 'starting' ? 'info' : 'neutral'
@@ -482,15 +494,28 @@ async function runSandboxAction(action: () => Promise<void>) {
           <UiBanner v-if="sandboxActionError" class="gutter" tone="error">{{ sandboxActionError }}</UiBanner>
           <UiSkeleton v-if="!sandbox && !sandboxError" class="gutter" :rows="4" />
 
-          <!-- A deployment without a runner: a state, not an error. -->
-          <UiEmptyState
-            v-else-if="sandbox && !sandboxAvailable"
-            :title="t('dashboard.sandboxStates.unavailable')"
-            :body="t('dashboard.sandboxUnavailable')"
-          />
-
           <template v-else-if="sandbox">
-            <dl class="metrics">
+            <!-- The plan's say first, then the runner's: neither is an error, and the
+                 workspace below is the reader's either way (docs/billing.md § Plans). -->
+            <UiEmptyState
+              v-if="sandbox.granted === false"
+              compact
+              :title="t('dashboard.sandboxNotInPlan')"
+              :body="t('dashboard.sandboxNotInPlanBody')"
+            >
+              <template #action>
+                <UiButton variant="secondary" size="xs" @click="openBilling">
+                  {{ t('dashboard.sandboxUpgrade') }}
+                </UiButton>
+              </template>
+            </UiEmptyState>
+            <UiEmptyState
+              v-else-if="!sandboxAvailable"
+              compact
+              :title="t('dashboard.sandboxStates.unavailable')"
+              :body="t('dashboard.sandboxUnavailable')"
+            />
+            <dl v-else class="metrics">
               <div class="metric">
                 <dt class="eyebrow">{{ t('dashboard.sandboxState') }}</dt>
                 <dd class="figure state">

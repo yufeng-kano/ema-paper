@@ -17,6 +17,7 @@ from sqlalchemy import select
 from sightread.billing import pay
 from sightread.db.models import Checkout, Job, PayEvent, Subscription, utcnow
 from tests.conftest import (
+    CHAT_MODELS,
     CSRF_HEADERS,
     PAY_APP_ID,
     PAY_SETTINGS,
@@ -544,7 +545,18 @@ async def test_the_public_catalog_is_cached_and_lists_what_is_on_sale(make_clien
 
     assert first.status_code == 200, first.text
     assert first.headers["Cache-Control"] == "public, max-age=300"
-    assert first.json() == {
+    body = first.json()
+    # The deployment's side comes with Pay's: the Free plan and the rates, for the pricing
+    # page to read in one request.
+    assert body["free"] == {
+        "credits": 150,
+        "storage_bytes": 52_428_800,
+        "sandbox": False,
+        "max_jobs": 1,
+    }
+    assert body["rates"]["parse_per_page"] == 1
+    assert set(body["rates"]["chat"]) == set(CHAT_MODELS.split(","))
+    assert {"available": True, "plans": body["plans"]} == {
         "available": True,
         "plans": [
             {
@@ -574,13 +586,16 @@ async def test_an_unconfigured_or_unreachable_pay_gives_an_empty_catalog(make_cl
     bare = make_client()
     empty = await bare.get("/api/billing/catalog")
     assert empty.status_code == 200
-    assert empty.json() == {"available": False, "plans": []}
+    assert (empty.json()["available"], empty.json()["plans"]) == (False, [])
+    # The Free plan and the rates are ours to answer, Pay or no Pay.
+    assert empty.json()["free"]["credits"] == 150
+    assert empty.json()["rates"]["parse_per_page"] == 1
     assert empty.headers["Cache-Control"] == "no-store"
 
     client = make_client(**PAY_SETTINGS)
     listing = respx.get(CATALOG_URL).mock(return_value=httpx.Response(503))
     down = await client.get("/api/billing/catalog")
-    assert down.json() == {"available": False, "plans": []}
+    assert (down.json()["available"], down.json()["plans"]) == (False, [])
     assert down.headers["Cache-Control"] == "no-store"
     # A failure is not remembered: the next read asks again.
     await client.get("/api/billing/catalog")
@@ -811,11 +826,16 @@ async def test_the_plan_caps_the_parses_a_user_runs_at_once(make_client, documen
 async def test_the_plan_sets_the_storage_the_usage_shows(make_client, tmp_path) -> None:
     client = make_client(workspaces_dir=str(tmp_path / "ws"), **PAY_SETTINGS)
     user_id = await _signed_in(client)
-    free = (await client.get("/api/sandbox")).json()["workspace"]["quota_bytes"]
+    status = (await client.get("/api/sandbox")).json()
+    free = status["workspace"]["quota_bytes"]
+    # Free gives no sandbox; the paid plan below does (docs/billing.md § Plans).
+    assert status["granted"] is False
     assert free == client.app.state.settings.free_storage_bytes == 52_428_800
 
     await grant_plan(client.app.state.sessionmaker, user_id)
-    assert (await client.get("/api/sandbox")).json()["workspace"]["quota_bytes"] == 1_073_741_824
+    paid = (await client.get("/api/sandbox")).json()
+    assert paid["workspace"]["quota_bytes"] == 1_073_741_824
+    assert paid["granted"] is True
 
     # Never past the deployment's ceiling.
     client.app.state.settings.workspace_quota_bytes = 1_000_000

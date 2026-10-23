@@ -15,6 +15,9 @@ export type ApiErrorType =
   | 'auth'
   | 'rate_limit'
   | 'payment'
+  | 'insufficient_credits'
+  | 'checkout_unavailable'
+  | 'pay_unavailable'
   | 'upstream'
   | 'internal'
 
@@ -22,12 +25,16 @@ export type ApiErrorType =
 export class ApiRequestError extends Error {
   readonly status: number
   readonly type: ApiErrorType
+  /** The envelope's other fields — a 402's `need`, `remaining`, `period_end`
+   *  (docs/api.md § Errors); empty for every other error. */
+  readonly details: Record<string, unknown>
 
-  constructor(status: number, type: ApiErrorType, message: string) {
+  constructor(status: number, type: ApiErrorType, message: string, details: Record<string, unknown> = {}) {
     super(message)
     this.name = 'ApiRequestError'
     this.status = status
     this.type = type
+    this.details = details
   }
 
   get isUnauthorized(): boolean {
@@ -298,6 +305,92 @@ export interface Attachment {
 export interface MeResponse {
   user: User
   limits: UploadLimits
+  /** `free`, or the paid plan's id, and the period's balance — the shell's figures, so
+   *  it needs no second request (docs/billing.md § Routes). */
+  plan: string
+  credits_remaining: number
+}
+
+// --- billing (docs/billing.md § Routes) --------------------------------------------
+
+export interface BillingPlan {
+  id: string
+  name: string
+  credits: number
+  storage_bytes: number
+  sandbox: boolean
+  max_jobs: number
+}
+
+export interface BillingSubscription {
+  status: string
+  plan_id: string
+  period_start: string
+  period_end: string
+  cancel_at_period_end: boolean
+}
+
+/** Credits per 1K tokens of one offered chat model. */
+export interface ChatRate {
+  input: number
+  cache_read: number
+  cache_write: number
+  output: number
+}
+
+export interface BillingRates {
+  parse_per_page: number
+  chat: Record<string, ChatRate>
+}
+
+export interface BillingResponse {
+  plan: BillingPlan
+  subscription: BillingSubscription | null
+  period: { start: string; end: string; granted: number; spent: number; remaining: number }
+  rates: BillingRates
+  checkout_available: boolean
+  pay_reachable: boolean | null
+}
+
+/** A plan on sale: Pay's price and this deployment's grants (docs/billing.md § Kano Pay). */
+export interface CatalogPlan {
+  plan_id: string
+  name: string
+  /** The amount in the currency's minor unit, as Pay gives it. */
+  amount: string
+  currency: string
+  cycle: { interval: string; frequency: number }
+  credits: number
+  storage_bytes: number
+  sandbox: boolean
+  max_jobs: number
+}
+
+export interface CatalogResponse {
+  available: boolean
+  plans: CatalogPlan[]
+  free: { credits: number; storage_bytes: number; sandbox: boolean; max_jobs: number }
+  rates: BillingRates
+}
+
+/** What a 402 says (docs/billing.md § Refusals): the credits the action needs, the balance,
+ *  and when the period resets. */
+export interface CreditsRefusal {
+  need: number
+  remaining: number
+  period_end: string
+}
+
+/** The refusal a failed request carries, or null for any other failure. */
+export function creditsRefusalOf(error: unknown): CreditsRefusal | null {
+  if (!(error instanceof ApiRequestError) || error.type !== 'insufficient_credits') {
+    return null
+  }
+  const { need, remaining, period_end } = error.details
+  if (typeof need !== 'number' || typeof remaining !== 'number' || typeof period_end !== 'string') {
+    return null
+  }
+  return { need, remaining, period_end }
 }
 
 export interface ApiKeySummary {
@@ -486,6 +579,9 @@ export interface ChatTurn {
   id: string
   status: TurnStatus
   error: string | null
+  /** What the turn cost, once settled; null while unsettled, absent from a record served by
+   *  an older API (docs/billing.md § Routes). */
+  credits?: number | null
   /** Null while the turn is unfinished, whatever its status: a cancel marks the status
    *  first and the writer winds down after (docs/chat.md § Conversations). */
   finished_at: string | null
@@ -573,6 +669,9 @@ export type SandboxState = 'stopped' | 'starting' | 'running' | 'unavailable'
 
 export interface SandboxStatus {
   state: SandboxState
+  /** Whether the plan gives the chat agent a sandbox at all; `state` says whether the
+   *  deployment has one to give (docs/billing.md § Plans). */
+  granted?: boolean
   last_used_at: string | null
   shells: number
   uptime_seconds: number
@@ -597,6 +696,8 @@ export interface JobSummary {
   error: string | null
   created_at: string
   finished_at: string | null
+  /** What the parse cost (docs/billing.md § Routes); null while reserved and unsettled. */
+  credits?: number | null
 }
 
 export interface ResultPage {
@@ -690,6 +791,8 @@ export interface LibraryDocument {
   /** The re-convert queued, running or failed — null when there is none. Optional so a page
    *  served by an older API still renders. */
   reconvert?: DocumentReconvert | null
+  /** The parse's credits, reserved when it queued (docs/billing.md § A parse). */
+  credits?: number | null
 }
 
 /**
@@ -749,12 +852,14 @@ const CSRF_HEADER = 'X-Requested-With'
 function toApiError(status: number, statusText: string, payload: unknown): ApiRequestError {
   const envelope =
     payload && typeof payload === 'object' && 'error' in payload
-      ? (payload as { error?: { type?: ApiErrorType; message?: string } }).error
+      ? (payload as { error?: { type?: ApiErrorType; message?: string } & Record<string, unknown> }).error
       : undefined
+  const { type, message, ...details } = envelope ?? {}
   return new ApiRequestError(
     status,
-    envelope?.type ?? 'internal',
-    envelope?.message ?? statusText ?? 'Request failed',
+    type ?? 'internal',
+    message ?? statusText ?? 'Request failed',
+    envelope && typeof envelope === 'object' ? details : {},
   )
 }
 
@@ -951,6 +1056,25 @@ export function getUsageConversations(days: number): Promise<UsageConversationsR
 }
 
 // --- sandbox (docs/sandbox.md) --------------------------------------------------
+
+export function getBilling(): Promise<BillingResponse> {
+  return request('GET', '/api/billing')
+}
+
+/** Public: no session needed (docs/billing.md § Kano Pay). */
+export function getBillingCatalog(): Promise<CatalogResponse> {
+  return request('GET', '/api/billing/catalog')
+}
+
+/** Pay's checkout page for the plan — the browser goes there (docs/billing.md § Kano Pay). */
+export function createCheckout(planId: string): Promise<{ url: string }> {
+  return request('POST', '/api/billing/checkout', { plan_id: planId })
+}
+
+/** Pay's customer portal: payment method, invoices, cancelling. */
+export function createPortal(): Promise<{ url: string }> {
+  return request('POST', '/api/billing/portal', {})
+}
 
 export function getSandbox(): Promise<SandboxStatus> {
   return request('GET', '/api/sandbox')

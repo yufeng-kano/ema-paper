@@ -138,17 +138,30 @@ async def billing(request: Request, user: SessionUser, db: DbSession, settings: 
 
 @router.get("/catalog")
 async def catalog(request: Request, response: Response, settings: AppSettings):
-    """Public: the plans on sale with Pay's prices and this deployment's grants, cached
-    for five minutes; unconfigured or unreachable Pay answers `available: false` and
-    nothing else, never an error (docs/billing.md § Kano Pay)."""
+    """Public: the plans on sale with Pay's prices and this deployment's grants, the Free
+    plan and the credit rates, cached for five minutes; unconfigured or unreachable Pay
+    answers `available: false` with no plans, never an error (docs/billing.md § Kano Pay)."""
+    # The deployment's own side of the page: the Free plan and the rates, which Pay has no
+    # say in, answered whether or not Pay is.
+    free = settings.free_plan
+    ours = {
+        "free": {
+            "credits": free.credits,
+            "storage_bytes": free.storage_bytes,
+            "sandbox": free.sandbox,
+            "max_jobs": free.max_jobs,
+        },
+        "rates": rates(settings),
+    }
     sale = await _on_sale(request, settings)
     if sale is None:
         response.headers["Cache-Control"] = "no-store"
-        return {"available": False, "plans": []}
+        return {"available": False, "plans": [], **ours}
     enabled, plans = sale
     response.headers["Cache-Control"] = f"public, max-age={settings.kano_pay_catalog_ttl_seconds}"
     return {
         "available": enabled and bool(plans),
+        **ours,
         "plans": [
             {
                 "plan_id": plan.plan_id,

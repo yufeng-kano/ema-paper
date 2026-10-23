@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   ApiRequestError,
   createKey,
+  creditsRefusalOf,
   getMe,
   isDevLoginAvailable,
   listJobs,
@@ -77,6 +78,27 @@ describe('request', () => {
     expect((error as ApiRequestError).status).toBe(404)
     expect((error as ApiRequestError).type).toBe('invalid_request')
     expect((error as ApiRequestError).message).toBe("No such agent 'nope'")
+  })
+
+  it('keeps the envelope’s other fields, which a 402 fills with the refusal', async () => {
+    stubFetch(
+      Response.json(
+        { error: { type: 'insufficient_credits', message: 'Not enough credits', need: 21, remaining: 4, period_end: '2026-11-01T00:00:00+00:00' } },
+        { status: 402 },
+      ),
+    )
+    let caught: unknown
+    try {
+      await listJobs(50)
+    } catch (error) {
+      caught = error
+    }
+    expect(caught).toBeInstanceOf(ApiRequestError)
+    expect(creditsRefusalOf(caught)).toEqual({ need: 21, remaining: 4, period_end: '2026-11-01T00:00:00+00:00' })
+    // Any other failure, or a 402 whose fields are not the refusal's, is not one.
+    expect(creditsRefusalOf(new ApiRequestError(500, 'internal', 'boom'))).toBeNull()
+    expect(creditsRefusalOf(new ApiRequestError(402, 'insufficient_credits', 'short', { need: '21' }))).toBeNull()
+    expect(creditsRefusalOf(new Error('x'))).toBeNull()
   })
 
   it('flags a 401 as unauthorized', async () => {

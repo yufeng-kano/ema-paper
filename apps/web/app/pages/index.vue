@@ -145,6 +145,7 @@ async function signInAsDeveloper() {
         <!-- Each option is written in its own language, so it is legible whichever catalog
              is loaded. Real links: the locale lives in the URL, so the choice is
              bookmarkable and works without JavaScript on this prerendered page. -->
+        <NuxtLink class="locale" :to="localePath('/pricing')">{{ t('login.pricing') }}</NuxtLink>
         <nav class="locales" :aria-label="t('nav.language')">
           <NuxtLink
             v-for="option in locales"

@@ -59,6 +59,8 @@ export default defineNuxtConfig({
     // The landing page is the SEO surface: prerendered HTML in both locales.
     '/': { prerender: true },
     '/zh-TW': { prerender: true },
+    '/pricing': { prerender: true },
+    '/zh-TW/pricing': { prerender: true },
     // Control-plane pages are per-user and session-authenticated: client-rendered only.
     '/files': { ssr: false },
     '/history': { ssr: false },

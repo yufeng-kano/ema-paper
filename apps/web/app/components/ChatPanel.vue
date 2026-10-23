@@ -31,6 +31,8 @@ import {
   listMemories,
   revertRevision,
   sendMessage,
+  creditsRefusalOf,
+  type CreditsRefusal,
   type ChatEvent,
   type ChatMessage,
   type ChatTurn,
@@ -41,6 +43,7 @@ import {
 import { blockName, type NameText } from '~/lib/blocks'
 import { commandArguments, formatBytes, type AskOutcome, type AskRequest, type ComposerPayload } from '~/lib/composer'
 import { nodesToMarkdown } from '~/lib/copy'
+import { formatCount } from '~/lib/format'
 import { ANSWER_DRAG_TYPE, BLOCK_DRAG_TYPE } from '~/lib/dnd'
 import {
   blockPlain,
@@ -116,6 +119,8 @@ interface ComposerControls {
 
 const composer = ref<ComposerControls | null>(null)
 const composerError = ref<string | null>(null)
+/** The 402 of a send: the dialog that says what a turn needs (docs/web.md § The agent panel). */
+const creditsRefusal = ref<CreditsRefusal | null>(null)
 
 // --- conversations --------------------------------------------------------------
 
@@ -870,9 +875,20 @@ async function submit(payload: ComposerPayload): Promise<boolean> {
     stream.expectTurn(turn_id)
     return true
   } catch (error) {
+    const refusal = creditsRefusalOf(error)
+    if (refusal) {
+      creditsRefusal.value = refusal
+      return false
+    }
     composerError.value = await resolve(error)
     return false
   }
+}
+
+/** What a turn cost, from the record (`credits` is settled once the turn ends and the
+ *  record is read again); null until then (docs/billing.md § Routes). */
+function turnCredits(turnId: string): number | null {
+  return turns.value.find((turn) => turn.id === turnId)?.credits ?? null
 }
 
 const stopping = ref(false)
@@ -1424,6 +1440,10 @@ onBeforeUnmount(() => {
              it whole, as its markdown. -->
         <div v-else-if="item.kind === 'foot'" class="answer-foot">
           <UiCopyButton :text="item.text" size="xs" :label="t('chat.copyAnswer')" />
+          <!-- The turn's credits: a cost figure, so in the accent (docs/web.md § The agent panel). -->
+          <span v-if="turnCredits(item.turnId) !== null" class="answer-credits tabular">
+            {{ t('credits.n', { n: formatCount(turnCredits(item.turnId)!, locale) }, turnCredits(item.turnId)!) }}
+          </span>
           <ChatUsedLine
             v-if="item.used"
             :used="item.used"
@@ -1460,7 +1480,7 @@ onBeforeUnmount(() => {
         />
 
         <p v-else-if="item.kind === 'error'" class="turn-error" role="alert">
-          {{ t('chat.turnError', { error: item.text }) }}
+          {{ item.text === 'out_of_credits' ? t('chat.outOfCredits') : t('chat.turnError', { error: item.text }) }}
         </p>
         <p v-else-if="item.kind === 'cancelled'" class="turn-note">{{ t('chat.turnCancelled') }}</p>
         <p v-else-if="item.kind === 'working'" class="working">
@@ -1492,6 +1512,13 @@ onBeforeUnmount(() => {
       :memories="shownMemories"
       :load-error="memoriesError"
       @close="closeCard"
+    />
+
+    <CreditsDialog
+      v-if="creditsRefusal"
+      :refusal="creditsRefusal"
+      action="chat"
+      @close="creditsRefusal = null"
     />
 
     <!-- A file dragged over the panel: the whole column is the target. -->
@@ -1880,6 +1907,11 @@ onBeforeUnmount(() => {
 /* The copy control's glyph lines up with the answer's edge, past its own padding. */
 .answer-foot > :first-child {
   margin-left: -5px;
+}
+
+.answer-credits {
+  color: var(--accent);
+  font-size: var(--text-xs);
 }
 
 .turn-error {
