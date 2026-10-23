@@ -70,10 +70,10 @@ export default {
   login: {
     seoTitle: 'Ema Paper — 將 PDF 與圖片解析成帶圖表座標的 Markdown',
     seoDescription:
-      '雲端視覺文件解析服務。上傳 PDF 或圖片，取得含圖表邊界框的 Markdown，再和 agent 一起讀。解析每頁 1 點，含模型費用。提供 REST API 與 Claude 可用的 MCP 連接器。',
+      '雲端視覺文件解析服務。上傳 PDF 或圖片，取得含圖表邊界框的 Markdown，再和 agent 一起讀。解析按頁扣點，含模型費用。提供 REST API 與 Claude 可用的 MCP 連接器。',
     pitchTitle: '送進 PDF 或圖片，取回帶圖表座標的 Markdown。',
     pitchBody:
-      '透過 REST 或雲端 MCP 端點解析文件，再接著讀、接著問。模型費用包含在內：解析每頁扣 1 點，每月有免費點數，Pro 更多。',
+      '透過 REST 或雲端 MCP 端點解析文件，再接著讀、接著問。模型費用包含在內：解析按頁扣固定點數，每月有免費點數，Pro 更多。',
     factInterfaces: '介面',
     factInterfacesValue: 'REST · MCP',
     factBilling: '計費',
@@ -907,7 +907,7 @@ export default {
     headTitle: '定價',
     seoTitle: 'Ema Paper 定價：每頁固定點數，含模型費用',
     seoDescription:
-      '將 PDF 與圖片解析成帶圖表座標的 Markdown。解析每頁 1 點，對話按 token 計；每月有免費點數，Pro 更多。不用自備 API 金鑰。',
+      '將 PDF 與圖片解析成帶圖表座標的 Markdown。解析每頁固定點數，對話按 token 計；每月有免費點數，Pro 更多。不用自備 API 金鑰。',
     nav: '定價',
     signIn: '登入',
     eyebrow: '定價',

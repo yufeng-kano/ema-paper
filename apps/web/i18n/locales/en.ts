@@ -71,10 +71,10 @@ export default {
   login: {
     seoTitle: 'Ema Paper — parse PDFs and images into markdown with figure coordinates',
     seoDescription:
-      'Hosted vision document parsing. POST a PDF or image, get markdown with figure bounding boxes, then read and talk it through with an agent. One credit per page, the model included. REST API and MCP connector for Claude.',
+      'Hosted vision document parsing. POST a PDF or image, get markdown with figure bounding boxes, then read and talk it through with an agent. Credits per page, the model included. REST API and MCP connector for Claude.',
     pitchTitle: 'PDFs and images in, markdown with figure coordinates out.',
     pitchBody:
-      'Parse documents over REST or a hosted MCP endpoint, then read and talk them through. The model is included: a parse costs a credit per page, Free every month, more on Pro.',
+      'Parse documents over REST or a hosted MCP endpoint, then read and talk them through. The model is included: a parse costs a fixed number of credits per page, Free every month, more on Pro.',
     factInterfaces: 'Interfaces',
     factInterfacesValue: 'REST · MCP',
     factBilling: 'Billing',
@@ -923,9 +923,9 @@ export default {
   },
   pricing: {
     headTitle: 'Pricing',
-    seoTitle: 'Ema Paper pricing — a flat credit per page, the model included',
+    seoTitle: 'Ema Paper pricing — a flat price per page, the model included',
     seoDescription:
-      'Parse PDFs and images into markdown with figure coordinates. One credit per parsed page, chat by tokens; Free every month, more on Pro. No API key to bring.',
+      'Parse PDFs and images into markdown with figure coordinates. A fixed number of credits per parsed page, chat by tokens; Free every month, more on Pro. No API key to bring.',
     nav: 'Pricing',
     signIn: 'Sign in',
     eyebrow: 'Pricing',
