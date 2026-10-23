@@ -1,4 +1,4 @@
-# agent-sightread documentation
+# Ema Paper documentation
 
 Hosted, multi-user **vision document parsing** service. Users sign in with Google, connect their own Kano Proxy account (or an OpenAI-compatible endpoint of their own — every vision call runs on the user's account, never the operator's), and parse PDFs/images into markdown with figure bounding boxes via REST or a hosted MCP endpoint (Claude Connectors compatible).
 

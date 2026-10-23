@@ -1,1 +1,1 @@
-"""agent-sightread: hosted vision document parsing service."""
+"""Ema Paper: hosted vision document parsing service."""

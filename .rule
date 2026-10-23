@@ -1,4 +1,4 @@
-# agent-sightread
+# Ema Paper (repository `sightread`)
 
 Canonical project rules (`.rule`; AGENTS.md / CLAUDE.md symlink here). This file is agent guardrails only — mechanisms, schemas, and behavior live in `docs/`, starting at `docs/index.md`.
 

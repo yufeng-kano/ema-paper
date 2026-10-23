@@ -46,7 +46,7 @@
   <!-- Arrow 1 -> 2 -->
   <line x1="205" y1="125" x2="235" y2="125" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrow)" />
 
-  <!-- Step 2: Sightread Processing Core -->
+  <!-- Step 2: Ema Paper Processing Core -->
   <g transform="translate(245, 20)">
     <rect class="bg-card" width="220" height="210" rx="10" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1.5" />
     <rect width="220" height="34" rx="10" fill="#17607d" />

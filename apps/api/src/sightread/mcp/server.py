@@ -85,7 +85,7 @@ async def _current_user(db: AsyncSession) -> User:
 def build_server(app: FastAPI) -> MCPServer:
     """The MCP server and its one tool (docs/mcp.md § The one tool)."""
     server = MCPServer(
-        "agent-sightread",
+        "Ema Paper",
         instructions=(
             "Parse PDFs and images into markdown with figure bounding boxes. Call `parse` "
             "for a single-use upload ticket and ready-to-run curl commands, then run them "

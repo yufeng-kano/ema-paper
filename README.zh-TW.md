@@ -1,4 +1,4 @@
-# Sightread
+# Ema Paper
 
 <p align="center">
   <strong>視覺文件解析服務：將複雜 PDF 與圖片轉換為結構化 Markdown，並精準標記圖表座標。</strong>
@@ -19,7 +19,7 @@
 
 ---
 
-**Sightread** 是一套專為開發者與 AI Agent 設計的自託管、多租戶視覺文件解析服務。它能將非結構化的 PDF、掃描件與各類圖片轉換為保留完整版面結構的 Markdown，並自動提取圖表與插圖的精準邊界座標。
+**Ema Paper** 是一套專為開發者與 AI Agent 設計的自託管、多租戶視覺文件解析服務。它能將非結構化的 PDF、掃描件與各類圖片轉換為保留完整版面結構的 Markdown，並自動提取圖表與插圖的精準邊界座標。
 
 一鍵連結您的 Kano Proxy 帳戶，或串接任何相容 OpenAI 的視覺端點。所有模型呼叫都使用您自己的帳戶，零中介抽成。
 
@@ -39,7 +39,7 @@
 ## 運作架構
 
 <p align="center">
-  <img src="./docs/assets/how-it-works.svg" alt="Sightread 運作架構" width="100%" />
+  <img src="./docs/assets/how-it-works.svg" alt="Ema Paper 運作架構" width="100%" />
 </p>
 
 1. **上傳**：透過 Web 介面、REST API 或 Claude MCP 工具上傳 PDF、掃描件或圖片。
@@ -80,12 +80,12 @@ curl -X POST http://localhost:8000/v1/parse \
 
 ### Claude Desktop / MCP 連線設定
 
-在 `claude_desktop_config.json` 中加入 Sightread：
+在 `claude_desktop_config.json` 中加入 Ema Paper：
 
 ```json
 {
   "mcpServers": {
-    "sightread": {
+    "emapaper": {
       "command": "npx",
       "args": [
         "-y",

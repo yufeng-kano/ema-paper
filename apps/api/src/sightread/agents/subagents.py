@@ -59,7 +59,7 @@ BUILTIN_SUBAGENT_NAMES = frozenset(subagent.name for subagent in BUILTIN_SUBAGEN
 # What every subagent is told before its own instructions: the document, that it works
 # alone, what it may change, and that its last answer is all the agent sees (docs/chat.md
 # § Subagents). Rendered with the conversation's facts.
-PREAMBLE_HEAD = """You are a subagent of the document agent inside Sightread. The agent gave you one task; you work on it alone, then report.
+PREAMBLE_HEAD = """You are a subagent of the document agent inside Ema Paper. The agent gave you one task; you work on it alone, then report.
 
 The document: {document_path} — its editable transcription is {document_path}/doc.md, and the pages are its original. Pages: {page_count}   Bbox format: {bbox_format}   Parsed with: {parse_model}
 
