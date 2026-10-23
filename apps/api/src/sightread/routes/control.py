@@ -35,6 +35,7 @@ from ..auth.oidc import (
     upsert_user,
 )
 from ..auth.sessions import SESSION_COOKIE, SESSION_TTL, create_session, delete_session
+from ..billing import ledger
 from ..db.models import (
     COST_SOURCE_ESTIMATED,
     COST_SOURCE_OPENROUTER,
@@ -74,6 +75,7 @@ from ..workspace.documents import (
     MARKDOWN_MEDIA_TYPE,
     document_paths,
 )
+from .billing import me_fields
 from .chat import owned_document, turn_note
 from .library import figure_crop_response, partial_result
 
@@ -174,7 +176,7 @@ async def dev_login(db: DbSession):
 
 
 @router.get("/me")
-async def me(user: SessionUser, settings: AppSettings):
+async def me(user: SessionUser, db: DbSession, settings: AppSettings):
     return {
         "user": {
             "id": user.id,
@@ -183,6 +185,9 @@ async def me(user: SessionUser, settings: AppSettings):
             "picture": user.picture,
             "created_at": user.created_at,
         },
+        # The plan and the balance, so the shell shows them without a second request
+        # (docs/billing.md § Routes).
+        **await me_fields(db, settings, user.id),
         # What the upload UI is allowed to send, from the server's own configuration —
         # a limit written twice is a limit that drifts (docs/api.md § Limits).
         "limits": {
@@ -1140,6 +1145,7 @@ async def list_jobs(user: SessionUser, db: DbSession, limit: int = Query(default
         .scalars()
         .all()
     )
+    credits = await ledger.credits_by_job(db, [row.id for row in rows])
     return {
         "jobs": [
             {
@@ -1154,6 +1160,8 @@ async def list_jobs(user: SessionUser, db: DbSession, limit: int = Query(default
                 "error": row.error,
                 "created_at": row.created_at,
                 "finished_at": row.finished_at,
+                # What the parse cost (docs/billing.md § Routes).
+                "credits": credits.get(row.id),
             }
             for row in rows
         ]

@@ -15,7 +15,14 @@ from .body_limit import BodyTooLarge
 # `revision_conflict`: a save whose `base_revision` is not the file's current one — the
 # one 409 a client answers by reloading, apart from every other 409 (docs/api.md).
 ErrorType = Literal[
-    "invalid_request", "revision_conflict", "auth", "rate_limit", "payment", "upstream", "internal"
+    "invalid_request",
+    "revision_conflict",
+    "auth",
+    "rate_limit",
+    "payment",
+    "insufficient_credits",
+    "upstream",
+    "internal",
 ]
 
 _STATUS_TO_TYPE: dict[int, ErrorType] = {
@@ -47,12 +54,17 @@ class ApiError(Exception):
         error_type: ErrorType,
         message: str,
         headers: dict[str, str] | None = None,
+        details: dict | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.error_type = error_type
         self.message = message
         self.headers = headers
+        # Extra fields inside `error`, for the one refusal a client acts on by number:
+        # `insufficient_credits` carries `need`, `remaining` and `period_end`
+        # (docs/billing.md § Refusals).
+        self.details = details
 
 
 def error_response(
@@ -60,10 +72,11 @@ def error_response(
     error_type: ErrorType,
     message: str,
     headers: dict[str, str] | None = None,
+    details: dict | None = None,
 ) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
-        content={"error": {"type": error_type, "message": message}},
+        content={"error": {"type": error_type, "message": message, **(details or {})}},
         headers=headers,
     )
 
@@ -71,7 +84,9 @@ def error_response(
 def install_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(ApiError)
     async def _api_error(_: Request, exc: ApiError) -> JSONResponse:
-        return error_response(exc.status_code, exc.error_type, exc.message, exc.headers)
+        return error_response(
+            exc.status_code, exc.error_type, exc.message, exc.headers, exc.details
+        )
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_error(_: Request, exc: StarletteHTTPException) -> JSONResponse:

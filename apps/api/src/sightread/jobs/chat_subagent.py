@@ -351,6 +351,8 @@ async def run_subagent(
         await chat_runner._record_usage_settled(ctx, completed)
         if await chat_runner._cancelled(ctx):
             raise chat_runner.TurnCancelled()
+        if ctx.credits_exhausted:
+            raise chat_runner.TurnOutOfCredits()
         if completed.model and completed.model != model:
             # A fallback answered: the blocks the run replays are that model's now.
             model = completed.model

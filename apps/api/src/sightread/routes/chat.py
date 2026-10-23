@@ -26,6 +26,7 @@ from ..agents import CHAT
 from ..agents import memory as memory_defs
 from ..agents import skills as skill_defs
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
+from ..billing import ledger
 from ..db.models import (
     AgentSetting,
     ChatAttachment,
@@ -40,6 +41,7 @@ from ..db.models import (
 )
 from ..errors import ApiError
 from ..jobs import chat_events
+from ..jobs.intake import insufficient_credits
 from ..jobs.queue import HISTORY_FULL, count_active_turns, enqueue_turn, history_bytes
 from ..parsing.attachments import prepared_path
 from ..sandbox.client import SandboxClient, SandboxUnavailable
@@ -253,10 +255,17 @@ async def read_conversation(conversation_id: int, user: SessionUser, db: DbSessi
         )
     ).scalars()
     turns = (
-        await db.execute(
-            select(ChatTurn).where(ChatTurn.conversation_id == row.id).order_by(ChatTurn.created_at)
+        (
+            await db.execute(
+                select(ChatTurn)
+                .where(ChatTurn.conversation_id == row.id)
+                .order_by(ChatTurn.created_at)
+            )
         )
-    ).scalars()
+        .scalars()
+        .all()
+    )
+    credits = await ledger.credits_by_turn(db, [turn.id for turn in turns])
     return {
         "conversation": conversation_payload(row),
         "messages": [
@@ -277,6 +286,8 @@ async def read_conversation(conversation_id: int, user: SessionUser, db: DbSessi
                 # Null while the turn is unfinished, whatever its status says: a cancel
                 # marks the status first and the writer winds down after (docs/chat.md).
                 "finished_at": turn.finished_at,
+                # What the turn cost, once it is settled (docs/billing.md § Routes).
+                "credits": credits.get(turn.id),
             }
             for turn in turns
         ],
@@ -553,6 +564,22 @@ async def post_message(
         message_id=message.id,
         locale=body.locale,
     )
+    # The turn's entry, under the user's row lock taken above: a send needs the minimum
+    # balance, and what the turn costs is settled on it as it runs (docs/billing.md
+    # § A chat turn).
+    try:
+        await ledger.reserve(
+            db,
+            settings,
+            user_id=user.id,
+            kind=ledger.CHAT,
+            amount=0,
+            turn_id=turn.id,
+            model=row.model,
+            minimum=settings.chat_min_credits,
+        )
+    except ledger.InsufficientCredits as exc:
+        raise insufficient_credits(exc) from exc
     # The conversation list orders by it: the thread continued last is listed first.
     row.updated_at = utcnow()
     # The message belongs to the turn that answers it: a reloaded thread groups by turn.

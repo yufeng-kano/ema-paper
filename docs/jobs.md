@@ -59,6 +59,10 @@ A document whose parse succeeded can be parsed again, whole, on a model the read
 
 Only a library document whose own parse succeeded, with an original kept and no re-convert queued or running, is re-converted: a failed parse is retried instead, a running one is waited for, and a document that kept no original is uploaded again (409); a markdown document has no parse (404). A figure placeholder from before the swap — in a reverted text or quoted in the notes — keeps its crop: the figure route looks for a crop the document's parse does not hold among the user's other succeeded parses of the same original ([parsing.md](./parsing.md) § Figure crops).
 
+## Credits
+
+A parse is charged in credits when it is queued and settled when it ends: the reservation is written in the commit that creates the job, consumed by `succeeded`, released by `failed`, and a dedup hit or an in-flight reuse costs nothing ([billing.md](./billing.md) § A parse). The worker settles in the same commit that writes the terminal state, idempotently, so a requeue that raced a finish cannot charge twice.
+
 ## Dedup cache
 
 Key: `(user_id, agent, sha256, model, connection_id, connection_base_url, pages_spec, prompt_sha256, pipeline_version)` — `agent` because one agent's output never answers another's request ([agents.md](./agents.md)), `connection_id` because the same model id on two different endpoints is not the same model, and `connection_base_url` (the endpoint snapshot) because *editing* a connection's URL repoints what that id means: results parsed through the old endpoint must not answer uploads aimed at the new one. `pipeline_version` is the agent's own (`parse`: `PIPELINE_VERSION`).

@@ -26,6 +26,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..agents import CHECK, PARSE, AgentDefinition
 from ..agents import check as check_agent
 from ..auth import upload_tickets
+from ..billing import ledger
+from ..billing.credits import parse_credits
 from ..config import Settings
 from ..db.models import (
     EFFORT_DEFAULT,
@@ -461,12 +463,46 @@ async def submit_parse(
         fallback_model=target.fallback_model,
         check=check_target,
     )
+    # The job's credits, reserved in the commit that queues it, under the user's row lock
+    # that every charge takes (docs/billing.md § A parse): a job the balance cannot cover
+    # is never queued, and the upload is not kept for it.
+    await db.execute(select(User.id).where(User.id == user.id).with_for_update())
+    try:
+        await ledger.reserve(
+            db,
+            settings,
+            user_id=user.id,
+            kind=ledger.PARSE,
+            amount=parse_credits(
+                len(parse_pages_spec(pages_spec, page_count)), settings.parse_credits_per_page
+            ),
+            job_id=job.id,
+            model=target.model,
+        )
+    except ledger.InsufficientCredits as exc:
+        stored.unlink(missing_ok=True)
+        raise insufficient_credits(exc) from exc
     if ticket is not None:
         upload_tickets.spend(ticket, job.id)
     if reconvert is not None:
         reconvert.reconvert_job_id = job.id
     await db.commit()
     return Submission(job=job)
+
+
+def insufficient_credits(exc: ledger.InsufficientCredits) -> ApiError:
+    """The 402 of docs/billing.md § Refusals, for a parse or a chat send alike."""
+    return ApiError(
+        402,
+        "insufficient_credits",
+        f"Not enough credits: this needs {exc.need}, {exc.remaining} left until "
+        f"{exc.period_end.isoformat()}",
+        details={
+            "need": exc.need,
+            "remaining": exc.remaining,
+            "period_end": exc.period_end.isoformat(),
+        },
+    )
 
 
 def cached_payload(result: Result) -> dict:

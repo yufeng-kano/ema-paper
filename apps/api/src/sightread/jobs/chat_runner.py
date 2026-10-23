@@ -24,6 +24,7 @@ from ..agents import CHAT
 from ..agents import chat as chat_agent
 from ..agents import skills as skill_defs
 from ..agents import subagents as subagent_defs
+from ..billing import ledger
 from ..config import Settings
 from ..db.models import (
     EFFORT_DEFAULT,
@@ -81,6 +82,11 @@ class TurnFailed(Exception):
     pass
 
 
+class TurnOutOfCredits(Exception):
+    """The period's balance ran out mid-turn: the loop ends after the call that spent it
+    (docs/billing.md § A chat turn)."""
+
+
 @dataclass
 class TurnContext:
     settings: Settings
@@ -122,6 +128,8 @@ class TurnContext:
     # One image decoded at a time per turn: a round of page reads never holds a raster
     # per read (docs/chat.md § Tools).
     decode_slot: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(1))
+    # Set by the settlement that found the period overdrawn: the next look ends the turn.
+    credits_exhausted: bool = False
 
 
 # --- loading -------------------------------------------------------------------------------
@@ -156,6 +164,9 @@ async def _load(
         model = conversation.model or (setting.model if setting else None)
         if not model:
             raise TurnFailed("No model chosen for the chat agent: pick one on the Agent page")
+        if model not in settings.model_prices:
+            # Never a call nobody priced (docs/billing.md § Models).
+            raise TurnFailed("model_unpriced")
         if setting and setting.connection_id is not None:
             raise TurnFailed("The chat agent runs on Kano Proxy only")
         if conversation.model is None:
@@ -495,7 +506,13 @@ async def _record_usage(ctx: TurnContext, completed: CompletedMessage) -> None:
                 cost_source=usage.cost_source,
             )
         )
+        await db.flush()
+        # The turn re-priced from the same rows, in the same commit: Usage and the ledger
+        # agree by construction (docs/billing.md § A chat turn).
+        remaining = await ledger.settle_chat(db, ctx.settings, ctx.turn.id)
         await db.commit()
+    if remaining is not None and remaining < 0:
+        ctx.credits_exhausted = True
 
 
 async def _record_usage_settled(ctx: TurnContext, completed: CompletedMessage) -> None:
@@ -1109,6 +1126,10 @@ async def _loop(ctx: TurnContext) -> None:
         elif followed is not None:
             await _follow_model(ctx, followed)
 
+        if ctx.credits_exhausted:
+            # Kept and billed: the answer so far stays in the thread, and nothing runs on
+            # a balance that is gone (docs/billing.md § A chat turn).
+            raise TurnOutOfCredits()
         if completed.stop_reason == "refusal":
             raise TurnFailed("The model declined this request")
         if completed.stop_reason == "max_tokens":
@@ -1163,6 +1184,7 @@ async def _finish(
         turn.status = status
         turn.error = error
         turn.finished_at = utcnow()
+        await ledger.close_chat(db, turn.id)
         await db.execute(
             update(Conversation)
             .where(Conversation.id == turn.conversation_id)
@@ -1251,6 +1273,9 @@ async def run_turn(
     except TurnFailed as exc:
         await _settle_writers(ctx)
         await _finish(sessionmaker, turn_id, status="failed", error=str(exc))
+    except TurnOutOfCredits:
+        await _settle_writers(ctx)
+        await _finish(sessionmaker, turn_id, status="failed", error="out_of_credits")
     except TimeoutError:
         await _settle_writers(ctx)
         await _finish(sessionmaker, turn_id, status="failed", error="the turn timed out")
