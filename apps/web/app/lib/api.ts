@@ -373,6 +373,13 @@ export interface CatalogResponse {
   rates: BillingRates
 }
 
+/** What the public policy pages print (docs/api.md, `GET /api/site`): the deployment's
+ *  support address and operator name, each null when `.env` leaves it empty. */
+export interface SiteInfo {
+  support_email: string | null
+  operator_name: string | null
+}
+
 /** What a 402 says (docs/billing.md § Refusals): the credits the action needs, the balance,
  *  and when the period resets. */
 export interface CreditsRefusal {
@@ -1065,6 +1072,10 @@ export function getBilling(): Promise<BillingResponse> {
 /** Public: no session needed (docs/billing.md § Kano Pay). */
 export function getBillingCatalog(): Promise<CatalogResponse> {
   return request('GET', '/api/billing/catalog')
+}
+
+export function getSite(): Promise<SiteInfo> {
+  return request('GET', '/api/site')
 }
 
 /** Pay's checkout page for the plan — the browser goes there (docs/billing.md § Kano Pay). */

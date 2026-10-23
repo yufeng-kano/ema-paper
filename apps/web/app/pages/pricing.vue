@@ -15,9 +15,8 @@ import type { TableColumn } from '~/lib/table'
 
 definePageMeta({ layout: false })
 
-const { t, locale, locales } = useI18n()
+const { t, locale } = useI18n()
 const localePath = useLocalePath()
-const switchLocalePath = useSwitchLocalePath()
 const { resolve } = useApiError()
 
 useSeoMeta({
@@ -28,8 +27,6 @@ useSeoMeta({
   ogType: 'website',
   twitterCard: 'summary',
 })
-
-const year = String(new Date().getFullYear())
 
 const catalog = ref<CatalogResponse | null>(null)
 const loadError = ref<string | null>(null)
@@ -92,15 +89,7 @@ const questions = ['1', '2', '3', '4'] as const
 </script>
 
 <template>
-  <div class="pricing-page">
-    <header class="bar">
-      <AppBrand :to="localePath('/')" />
-      <nav class="bar-nav" :aria-label="t('pricing.nav')">
-        <span class="bar-current" aria-current="page">{{ t('pricing.nav') }}</span>
-        <NuxtLink class="bar-link" :to="localePath('/')">{{ t('pricing.signIn') }}</NuxtLink>
-      </nav>
-    </header>
-
+  <PublicShell :title="t('pricing.nav')">
     <main class="content">
       <section class="hero">
         <p class="eyebrow">{{ t('pricing.eyebrow') }}</p>
@@ -221,64 +210,10 @@ const questions = ['1', '2', '3', '4'] as const
       </section>
     </main>
 
-    <footer class="foot">
-      <span>{{ t('login.copyright', { year, name: t('app.name') }) }}</span>
-      <nav class="locales" :aria-label="t('nav.language')">
-        <NuxtLink
-          v-for="option in locales"
-          :key="option.code"
-          class="locale"
-          :class="{ active: option.code === locale }"
-          :to="switchLocalePath(option.code)"
-          :aria-current="option.code === locale ? 'true' : undefined"
-        >
-          {{ option.name }}
-        </NuxtLink>
-      </nav>
-    </footer>
-  </div>
+  </PublicShell>
 </template>
 
 <style scoped>
-.pricing-page {
-  display: flex;
-  flex-direction: column;
-  min-height: 100vh;
-  background: var(--paper);
-  color: var(--ink);
-}
-
-/* The sign-in page's brand panel reduced to a bar. */
-.bar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-4);
-  padding: var(--space-4) var(--space-6);
-  border-bottom: 1px solid var(--line);
-}
-
-
-.bar-nav {
-  display: flex;
-  align-items: center;
-  gap: var(--space-5);
-  font-size: var(--text-sm);
-}
-
-.bar-current {
-  color: var(--ink);
-  font-weight: var(--weight-medium);
-}
-
-.bar-link {
-  color: var(--muted);
-}
-
-.bar-link:hover {
-  color: var(--accent);
-}
-
 .content {
   width: 100%;
   max-width: 880px;
@@ -451,43 +386,6 @@ const questions = ['1', '2', '3', '4'] as const
   color: var(--muted);
   font-size: var(--text-sm);
   line-height: 1.6;
-}
-
-.foot {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-3) var(--space-5);
-  width: 100%;
-  max-width: 880px;
-  margin: auto auto 0;
-  padding: var(--space-5) var(--space-6);
-  border-top: 1px solid var(--line);
-  color: var(--muted);
-  font-size: var(--text-xs);
-}
-
-.locales {
-  display: inline-flex;
-  gap: var(--space-4);
-}
-
-.locale {
-  color: var(--muted);
-  white-space: nowrap;
-}
-
-.locale:hover {
-  color: var(--accent);
-}
-
-.locale.active {
-  color: var(--ink);
-  font-weight: var(--weight-medium);
-  text-decoration: underline;
-  text-decoration-color: var(--accent);
-  text-underline-offset: 4px;
 }
 
 @media (max-width: 640px) {

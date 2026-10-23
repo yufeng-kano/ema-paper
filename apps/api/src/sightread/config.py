@@ -65,6 +65,10 @@ class Settings(BaseSettings):
     free_credits_per_period: int = 150
     free_storage_bytes: int = 52_428_800
     free_max_jobs: int = 1
+    # What the public policy pages print (docs/web.md § Pages): the support address and
+    # who operates the service, served by `GET /api/site`; empty = not printed.
+    support_email: str = ""
+    operator_name: str = ""
     # Kano Pay (docs/billing.md § Kano Pay): all four set = configured; otherwise every
     # user is on Free and checkout is unavailable.
     kano_pay_url: str = ""

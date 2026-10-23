@@ -10,8 +10,8 @@
  * official four-color mark inlined as SVG (never a remote asset), and Google's own dark
  * variant. Those values are Google's to set, not ours to tokenize.
  *
- * The locale links live here rather than in the signed-in shell: this is the page a visitor
- * lands on, and it is the last point where the choice costs nothing.
+ * The locale links live in the public footer rather than in the signed-in shell: this is the
+ * page a visitor lands on, and it is the last point where the choice costs nothing.
  *
  * Full-bleed, so the page owns its frame rather than sitting in a layout.
  */
@@ -20,9 +20,8 @@ import { takeAfterSignIn } from '~/lib/settings'
 
 definePageMeta({ layout: false })
 
-const { t, locale, locales } = useI18n()
+const { t, locale } = useI18n()
 const localePath = useLocalePath()
-const switchLocalePath = useSwitchLocalePath()
 const auth = useAuth()
 const { resolve } = useApiError()
 
@@ -38,10 +37,6 @@ useSeoMeta({
 const devLoginAvailable = ref(false)
 const devLoginError = ref<string | null>(null)
 const signingIn = ref(false)
-
-/** A string, not a number: the interpolator runs numbers through `Intl.NumberFormat`, which
- *  would print the year with a thousands separator. */
-const year = String(new Date().getFullYear())
 
 onMounted(async () => {
   await auth.ensureLoaded()
@@ -142,25 +137,7 @@ async function signInAsDeveloper() {
         </UiBanner>
       </div>
 
-      <footer class="login-footer">
-        <span>{{ t('login.copyright', { year, name: t('app.name') }) }}</span>
-        <!-- Each option is written in its own language, so it is legible whichever catalog
-             is loaded. Real links: the locale lives in the URL, so the choice is
-             bookmarkable and works without JavaScript on this prerendered page. -->
-        <NuxtLink class="locale" :to="localePath('/pricing')">{{ t('login.pricing') }}</NuxtLink>
-        <nav class="locales" :aria-label="t('nav.language')">
-          <NuxtLink
-            v-for="option in locales"
-            :key="option.code"
-            class="locale"
-            :class="{ active: option.code === locale }"
-            :to="switchLocalePath(option.code)"
-            :aria-current="option.code === locale ? 'true' : undefined"
-          >
-            {{ option.name }}
-          </NuxtLink>
-        </nav>
-      </footer>
+      <PublicFooter class="login-footer" />
     </main>
   </div>
 </template>
@@ -339,43 +316,6 @@ async function signInAsDeveloper() {
 
 .login-error {
   margin-top: var(--space-4);
-}
-
-.login-footer {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-3) var(--space-5);
-  padding-top: var(--space-5);
-  border-top: 1px solid var(--line);
-  color: var(--muted);
-  font-size: var(--text-xs);
-}
-
-.locales {
-  display: inline-flex;
-  gap: var(--space-4);
-  flex-shrink: 0;
-}
-
-.locale {
-  color: var(--muted);
-  white-space: nowrap;
-  transition: color var(--duration-fast) var(--ease);
-}
-
-.locale:hover {
-  color: var(--accent);
-}
-
-/* The current locale is ink and a weight step, underlined in the accent — the accent's one
-   navigational use, marking which of two states of the same page you are on. */
-.locale.active {
-  color: var(--ink);
-  font-weight: var(--weight-semibold);
-  padding-bottom: 2px;
-  border-bottom: 1px solid var(--accent);
 }
 
 /* --- Responsive ----------------------------------------------------------- */

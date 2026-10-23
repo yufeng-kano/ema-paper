@@ -168,6 +168,16 @@ async def dev_login(db: DbSession):
 # --- account --------------------------------------------------------------------------
 
 
+@router.get("/site")
+async def site(settings: AppSettings):
+    """What the public policy pages print (docs/web.md § Pages): the deployment's support
+    address and operator name, `null` when `.env` leaves them empty. Public, no session."""
+    return {
+        "support_email": settings.support_email or None,
+        "operator_name": settings.operator_name or None,
+    }
+
+
 @router.get("/me")
 async def me(user: SessionUser, db: DbSession, settings: AppSettings):
     return {

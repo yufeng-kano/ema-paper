@@ -61,6 +61,13 @@ export default defineNuxtConfig({
     '/zh-TW': { prerender: true },
     '/pricing': { prerender: true },
     '/zh-TW/pricing': { prerender: true },
+    // The policy pages Dodo's site review reads (docs/billing.md § Transition, step 6).
+    '/terms': { prerender: true },
+    '/zh-TW/terms': { prerender: true },
+    '/privacy': { prerender: true },
+    '/zh-TW/privacy': { prerender: true },
+    '/refund': { prerender: true },
+    '/zh-TW/refund': { prerender: true },
     // Control-plane pages are per-user and session-authenticated: client-rendered only.
     '/files': { ssr: false },
     '/history': { ssr: false },
