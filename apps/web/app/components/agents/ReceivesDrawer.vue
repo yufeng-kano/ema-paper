@@ -30,6 +30,7 @@ const { version } = useAgentContextVersion()
 
 const headingId = useId()
 const heading = ref<HTMLElement | null>(null)
+const drawer = ref<HTMLElement | null>(null)
 const context = ref<AgentContext | null>(null)
 const error = ref<string | null>(null)
 /** A reload after a save is in flight; the rows it replaces stay until it answers. */
@@ -115,9 +116,14 @@ function onKeydown(event: KeyboardEvent) {
 }
 
 /** An Escape from anywhere else on the page — the language dropdowns, the memory list —
- *  unless a dialog or a menu is open, or the control it was pressed in took it. */
+ *  unless a dialog or a menu is open over the drawer, or the control it was pressed in took
+ *  it. The settings dialog the drawer sits in is not over it: the topmost dialog must be
+ *  the drawer's own host, if it has one. */
 function onDocumentKeydown(event: KeyboardEvent) {
-  const overlayOpen = document.querySelector('[aria-modal="true"], [role="menu"]') !== null
+  const dialogs = document.querySelectorAll('[aria-modal="true"]')
+  const host = drawer.value?.closest('[aria-modal="true"]') ?? null
+  const overlayOpen =
+    document.querySelector('[role="menu"]') !== null || (dialogs[dialogs.length - 1] ?? null) !== host
   if (escapeClosesDrawer(event, overlayOpen)) {
     emit('close')
   }
@@ -140,7 +146,14 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <aside :id="id" class="drawer" :aria-labelledby="headingId" @keydown="onKeydown">
+  <aside
+    :id="id"
+    ref="drawer"
+    class="drawer"
+    :aria-labelledby="headingId"
+    data-escape-owner
+    @keydown="onKeydown"
+  >
     <div class="head">
       <h2 :id="headingId" ref="heading" class="title" tabindex="-1">{{ t('agents.receives.title') }}</h2>
       <UiButton class="close" variant="ghost" size="xs" icon-only :label="t('common.close')" @click="emit('close')">

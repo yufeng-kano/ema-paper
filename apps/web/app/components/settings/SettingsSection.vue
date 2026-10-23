@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * One section of the settings sheet (docs/web.md § Pages, `/settings/<section>`): the serif
+ * One section of the settings dialog (docs/web.md § Pages, `/settings/<section>`): the serif
  * title with an optional eyebrow over it and the section's one action beside it, then the
  * section's rows and tables.
  *
