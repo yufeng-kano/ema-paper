@@ -16,7 +16,6 @@ from sqlalchemy import select
 
 from sightread.agents import CHECK
 from sightread.agents import check as check_agent
-from sightread.auth.crypto import encrypt_kano_proxy_key
 from sightread.config import Settings
 from sightread.db.models import Document, Job, Result, UsageLog
 from sightread.jobs.check import CheckFailed, run_check
@@ -24,10 +23,10 @@ from sightread.parsing import joins
 from sightread.routes.library import document_payload
 from sightread.upstream.client import Connection
 from sightread.workspace.layout import user_root
-from tests.conftest import CSRF_HEADERS, KANO_BASE, KANO_CHAT_URL, TEST_SECRET_KEY
+from tests.conftest import CSRF_HEADERS, KANO_API_KEY, KANO_BASE, KANO_CHAT_URL, TEST_SECRET_KEY
 from tests.test_chat import MESSAGES_URL, assistant_turn
-from tests.test_library import MODEL
-from tests.test_parse_end_to_end import KANO_KEY, _drain_queue
+from tests.test_library import MODEL, _ready_to_parse
+from tests.test_parse_end_to_end import _drain_queue
 from tests.test_retry_failed_pages import FALLBACK, Upstream, _answer, _retry, _row, _upload
 
 # Three pages a vision model might send back for a paper: a sentence the first page break
@@ -75,12 +74,9 @@ def _done() -> httpx.Response:
 
 def _connection() -> Connection:
     return Connection(
-        ciphertext=encrypt_kano_proxy_key(TEST_SECRET_KEY, KANO_KEY),
-        secret_key=TEST_SECRET_KEY,
+        api_key=KANO_API_KEY,
         base_url=f"{KANO_BASE}/anthropic/v1",
         snapshot=KANO_BASE,
-        builtin=True,
-        report_cost=True,
     )
 
 
@@ -412,7 +408,7 @@ async def test_an_agent_still_working_at_the_cap_fails() -> None:
 async def test_spots_without_kano_proxy_fail() -> None:
     with pytest.raises(CheckFailed) as failed:
         await _check(TRANSCRIPTION, None)
-    assert str(failed.value) == "Kano Proxy is not connected"
+    assert str(failed.value) == "Kano Proxy is not configured on this deployment"
 
 
 @respx.mock
@@ -431,7 +427,8 @@ async def test_the_spots_past_the_cap_stay_as_they_are() -> None:
 async def library(make_client, tmp_path) -> AsyncClient:
     from tests.test_library import _ready_to_parse
 
-    client = make_client(workspaces_dir=str(tmp_path / "ws"))
+    # The deployment names a fallback, the model a retry may send failed pages to.
+    client = make_client(workspaces_dir=str(tmp_path / "ws"), parse_fallback_model=FALLBACK)
     await _ready_to_parse(client)
     client.user_id = (await client.get("/api/me")).json()["user"]["id"]
     return client
@@ -593,14 +590,23 @@ async def test_a_retry_checks_on_the_model_it_names_when_the_check_has_none(
     assert [json.loads(call.request.content)["model"] for call in agent.calls] == [FALLBACK]
 
 
-async def test_the_check_takes_its_own_settings(library, sessionmaker, documents) -> None:
+async def test_the_check_takes_its_own_settings(
+    make_client, tmp_path, sessionmaker, documents
+) -> None:
+    """Its model is the deployment's `CHECK_MODEL`; the effort and the instructions are
+    the reader's (docs/agents.md § Enqueue rules)."""
+    library = make_client(
+        workspaces_dir=str(tmp_path / "ws"), check_model="claude-code/claude-haiku-5-5"
+    )
+    await _ready_to_parse(library)
     saved = await library.put(
         "/api/agents/check/settings",
-        json={"model": "claude-code/claude-haiku-5-5", "effort": "low", "instructions": "Use $."},
+        json={"effort": "low", "instructions": "Use $."},
         headers=CSRF_HEADERS,
     )
     assert saved.status_code == 200, saved.text
     assert saved.json()["auto_check"] is True
+    assert saved.json()["model"] == "claude-code/claude-haiku-5-5"
     uploaded = await _upload(library, documents["mixed_pdf"])
     job = await _job(sessionmaker, uploaded["job_id"])
     assert (job.check_model, job.check_effort) == ("claude-code/claude-haiku-5-5", "low")
@@ -662,14 +668,11 @@ async def test_each_agent_takes_only_its_own_settings(library) -> None:
         ("parse", {"auto_check": False}),
         ("chat", {"auto_check": False}),
         ("parse", {"instructions": "x"}),
-        ("check", {"fallback_model": "m"}),
+        ("check", {"auto_fallback": True}),
+        ("check", {"model": MODEL}),
         ("check", {"answer_language": "en"}),
         ("check", {"memory_auto": False}),
         ("check", {"auto_check": None}),
     ]:
         refused = await put(agent, **body)
         assert refused.status_code == 400, (agent, body)
-    # The check speaks the Messages API through Kano Proxy only.
-    refused = await put("check", connection_id=1)
-    assert refused.status_code == 400
-    assert refused.json()["error"]["message"] == "The check agent runs on Kano Proxy only"

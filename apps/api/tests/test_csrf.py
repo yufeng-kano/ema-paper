@@ -12,8 +12,7 @@ from httpx import AsyncClient
 MUTATIONS = [
     ("post", "/api/keys", {"name": "x"}),
     ("delete", "/api/keys/1", None),
-    ("put", "/api/agents/parse/settings", {"model": None}),
-    ("delete", "/api/kano", None),
+    ("put", "/api/agents/chat/settings", {"model": None}),
     ("post", "/api/auth/logout", None),
     ("post", "/api/auth/dev-login", None),
 ]

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 /**
- * "Are you sure?" for the two actions in this app that destroy something the user would have
- * to re-create: revoking an API key, deleting a provider connection, disconnecting Kano Proxy.
+ * "Are you sure?" for the actions in this app that destroy something the user would have
+ * to re-create: revoking an API key, deleting a skill, clearing every memory.
  *
  * A dialog rather than `window.confirm`: the native one cannot say which key, cannot be
  * styled to mark the action as destructive, and on some browsers is suppressed entirely.

@@ -11,7 +11,6 @@ import httpx
 import pytest
 import respx
 
-from sightread.auth.crypto import encrypt_kano_proxy_key
 from sightread.upstream.anthropic import CompletedMessage, StreamEvent, stream_messages
 from sightread.upstream.client import Connection, PaymentRequired, RateLimited, UpstreamError
 from tests.conftest import KANO_BASE
@@ -23,12 +22,9 @@ MESSAGES_URL = f"{KANO_BASE}/anthropic/v1/messages"
 @pytest.fixture
 def key() -> Connection:
     return Connection(
-        ciphertext=encrypt_kano_proxy_key(SECRET, "sk-kano-proxy-test"),
-        secret_key=SECRET,
+        api_key="sk-kano-proxy-test",
         base_url=f"{KANO_BASE}/anthropic/v1",
         snapshot=KANO_BASE,
-        builtin=True,
-        report_cost=True,
     )
 
 

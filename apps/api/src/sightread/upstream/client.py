@@ -1,38 +1,24 @@
-"""Upstream client — the module that calls a model upstream (the built-in Kano Proxy or a
-user-defined OpenAI-compatible connection) and the only one that ever decrypts a stored
-user key (docs/project-structure.md).
+"""Upstream client — the module that calls the model upstream, Kano Proxy, on the
+operator's own key (docs/auth.md § 3, docs/project-structure.md).
 
-Key material is never logged and never appears in raised messages.
+The key is never logged and never appears in raised messages or responses.
 """
 
 from __future__ import annotations
 
-import asyncio
 import base64
-import ipaddress
 import json
 import re
-import socket
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from urllib.parse import urlsplit
 
 import httpx
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..agents import bbox
+from ..agents import CHAT, CHECK, PARSE, bbox
 from ..agents.bbox import BboxConvention
-from ..auth.crypto import decrypt_connection_key, decrypt_kano_proxy_key
 from ..config import Settings
-from ..db.models import (
-    COST_SOURCE_ESTIMATED,
-    COST_SOURCE_UNKNOWN,
-    AgentSetting,
-    KanoProxyKey,
-    ProviderConnection,
-)
+from ..db.models import COST_SOURCE_ESTIMATED, COST_SOURCE_UNKNOWN
 from ..errors import ApiError
 from ..parsing.images import image_size
 
@@ -74,91 +60,7 @@ def _unwrap_answer(text: str) -> str:
     return "\n".join(body).strip()
 
 
-# --- provider connections (user-defined OpenAI-compatible endpoints) ------------------
-
-
-def _literal_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
-    """The IP a host literal denotes, canonicalizing the forms the resolver accepts.
-
-    `ipaddress` only parses canonical text, but the system resolver also takes the
-    shortened/decimal/hex IPv4 spellings (`127.1`, `2130706433`, `0x7f000001`) — exactly
-    what an SSRF probe would use. `inet_aton` speaks the resolver's dialect, so anything
-    it accepts is judged by the address it denotes, not the spelling.
-    """
-    try:
-        return ipaddress.ip_address(host)
-    except ValueError:
-        pass
-    try:
-        return ipaddress.ip_address(socket.inet_ntoa(socket.inet_aton(host)))
-    except OSError:
-        return None
-
-
-# Module-level so tests can stub it: resolving a hostname is a real network side effect,
-# and the suite must never touch DNS (docs/testing.md).
-_getaddrinfo = socket.getaddrinfo
-
-
-async def _resolved_addresses(host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
-    """Every address `host` currently resolves to; 400 when it resolves to nothing.
-
-    Resolution runs in a worker thread: a slow or black-holed DNS name must not stall the
-    event loop for every other request while the resolver waits it out.
-    """
-    try:
-        infos = await asyncio.to_thread(_getaddrinfo, host, None, type=socket.SOCK_STREAM)
-    except OSError as exc:
-        raise ApiError(400, "invalid_request", "base_url's host could not be resolved") from exc
-    addresses = []
-    for info in infos:
-        try:
-            addresses.append(ipaddress.ip_address(info[4][0]))
-        except ValueError:
-            continue
-    if not addresses:
-        raise ApiError(400, "invalid_request", "base_url's host could not be resolved")
-    return addresses
-
-
-async def normalize_base_url(raw: str, app_env: str) -> str:
-    """Validate and canonicalize a connection's base URL (docs/auth.md § 3).
-
-    The app fetches this URL server-side, so outside local it must be https and must not
-    denote a non-public address — a hosted deployment must not be usable as a probe into
-    its own network. A hostname is resolved here and every answer must be global, which
-    catches `/etc/hosts` aliases and attacker domains pointing inward; a later DNS change
-    (rebinding) is accepted residual risk, documented in docs/auth.md. Userinfo is refused
-    everywhere: `base_url` is stored and displayed in plaintext, so credentials must never
-    ride inside it.
-    """
-    candidate = raw.strip().rstrip("/")
-    try:
-        parts = urlsplit(candidate)
-        host = parts.hostname
-        parts.port  # noqa: B018 - raises ValueError for a malformed/out-of-range port
-    except ValueError as exc:  # a bad IPv6 bracket or port is a typo, not a 500
-        raise ApiError(400, "invalid_request", "base_url must be an http(s) URL") from exc
-    if parts.scheme not in ("http", "https") or not host:
-        raise ApiError(400, "invalid_request", "base_url must be an http(s) URL")
-    if parts.query or parts.fragment:
-        raise ApiError(400, "invalid_request", "base_url must not carry a query or fragment")
-    if parts.username or parts.password:
-        raise ApiError(
-            400,
-            "invalid_request",
-            "base_url must not contain credentials — the key is stored separately",
-        )
-    if app_env != "local":
-        if parts.scheme != "https":
-            raise ApiError(400, "invalid_request", "base_url must use https")
-        if host == "localhost" or host.endswith(".localhost"):
-            raise ApiError(400, "invalid_request", "base_url must be a public endpoint")
-        literal = _literal_ip(host)
-        addresses = [literal] if literal is not None else await _resolved_addresses(host)
-        if any(not address.is_global for address in addresses):
-            raise ApiError(400, "invalid_request", "base_url must be a public endpoint")
-    return candidate
+# --- the model catalog ---------------------------------------------------------------
 
 
 class ResponseTooLarge(Exception):
@@ -178,54 +80,45 @@ async def _read_body_capped(response: httpx.Response, max_bytes: int) -> bytes:
     return b"".join(chunks)
 
 
-async def stored_connection_models(
-    base_url: str,
-    secret_key: str,
-    ciphertext: bytes,
-    max_bytes: int = DEFAULT_RESPONSE_MAX_BYTES,
-) -> list[dict]:
-    """`fetch_connection_models` for a stored key — decryption stays inside this module."""
-    return await fetch_connection_models(
-        base_url, decrypt_connection_key(secret_key, ciphertext), max_bytes=max_bytes
-    )
-
-
-async def agent_models(
-    db: AsyncSession, settings: Settings, user_id: int, agent: str
-) -> list[dict]:
-    """The live catalog of the upstream an agent is set to — Kano Proxy or a connection —
-    fetched with the stored key (docs/api.md § GET /v1/models). No capability filtering
-    yet (docs/agents.md), and no cache: the picker shows what the upstream says now."""
-    connection_id = (
-        await db.execute(
-            select(AgentSetting.connection_id).where(
-                AgentSetting.user_id == user_id, AgentSetting.agent == agent
-            )
+def offered_models(settings: Settings, agent: str) -> list[str]:
+    """The ids an agent may run, in the operator's order (docs/billing.md § Models): the
+    parse agent its fixed model and the fallback, the check agent its own or the parse's,
+    the chat agent `CHAT_MODELS`. Empty when the deployment names none."""
+    if agent == PARSE.name:
+        return list(
+            dict.fromkeys(m for m in (settings.parse_model, settings.parse_fallback_model) if m)
         )
-    ).scalar_one_or_none()
-    connection = await load_connection(db, settings, user_id, connection_id)
+    if agent == CHECK.name:
+        return [settings.check_model or settings.parse_model] if settings.parse_model else []
+    if agent == CHAT.name:
+        return settings.chat_model_list
+    return []
+
+
+async def agent_models(settings: Settings, agent: str) -> list[dict]:
+    """`GET /api/agents/{agent}/models` (docs/api.md): the parse and check agents' models
+    are configuration, answered as they are with no name; the chat agent's are the
+    `CHAT_MODELS` entries Kano Proxy's live catalog still lists, each with its name."""
+    offered = offered_models(settings, agent)
+    if agent != CHAT.name:
+        if not offered:
+            raise ApiError(503, "upstream", "No parse model is configured on this deployment")
+        return [{"id": model, "name": None} for model in offered]
+    connection = kano_connection(settings)
     if connection is None:
-        if connection_id is not None:
-            raise ApiError(400, "invalid_request", "The selected connection no longer exists")
-        if not settings.kano_proxy_configured:
-            raise ApiError(503, "upstream", "Kano Proxy is not configured on this deployment")
-        raise ApiError(400, "invalid_request", "Kano Proxy is not connected")
-    return await fetch_connection_models(
-        connection.base_url,
-        connection.api_key(),
-        max_bytes=settings.upstream_response_max_bytes,
+        raise ApiError(503, "upstream", "Kano Proxy is not configured on this deployment")
+    catalog = await fetch_models(
+        connection.base_url, connection.api_key, max_bytes=settings.upstream_response_max_bytes
     )
+    names = {entry["id"]: entry["name"] for entry in catalog}
+    return [{"id": model, "name": names[model]} for model in offered if model in names]
 
 
-async def fetch_connection_models(
+async def fetch_models(
     base_url: str, api_key: str, max_bytes: int = DEFAULT_RESPONSE_MAX_BYTES
 ) -> list[dict]:
-    """The model catalog of an OpenAI-compatible endpoint — also the save-time key check.
-
-    `GET {base_url}/models` is free on every OpenAI-format server we care about (Kano
-    Proxy's `/openai/v1` included), so it doubles as validation without spending the
-    user's money (docs/auth.md § 3).
-    """
+    """The model catalog of an OpenAI-compatible endpoint, `GET {base_url}/models` —
+    free on Kano Proxy's `/openai/v1`. Every failure is the upstream's, 502."""
     try:
         async with (
             httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client,
@@ -234,24 +127,24 @@ async def fetch_connection_models(
             ) as response,
         ):
             if response.status_code in (401, 403):
-                raise ApiError(400, "invalid_request", "The endpoint rejected this API key")
+                raise ApiError(502, "upstream", "Kano Proxy rejected the operator's key")
             if response.status_code >= 400:
                 raise ApiError(
-                    502, "upstream", f"The endpoint returned {response.status_code} for /models"
+                    502, "upstream", f"The upstream returned {response.status_code} for /models"
                 )
             body = await _read_body_capped(response, max_bytes)
     except httpx.HTTPError as exc:
-        raise ApiError(502, "upstream", "Could not reach the connection's endpoint") from exc
+        raise ApiError(502, "upstream", "Could not reach Kano Proxy") from exc
     except ResponseTooLarge as exc:
-        raise ApiError(502, "upstream", "The endpoint's model list exceeded the size cap") from exc
+        raise ApiError(502, "upstream", "The upstream's model list exceeded the size cap") from exc
 
     try:
         payload = json.loads(body)
     except ValueError as exc:
-        raise ApiError(502, "upstream", "The endpoint returned a non-JSON model list") from exc
+        raise ApiError(502, "upstream", "The upstream returned a non-JSON model list") from exc
     # An upstream answering `[]` (or any non-object) is a broken endpoint, not our bug.
     if not isinstance(payload, dict) or not isinstance(payload.get("data") or [], list):
-        raise ApiError(502, "upstream", "The endpoint returned an unreadable model list")
+        raise ApiError(502, "upstream", "The upstream returned an unreadable model list")
 
     models = []
     for entry in payload.get("data") or []:
@@ -326,28 +219,16 @@ class PaymentRequired(UpstreamError):
 
 @dataclass(frozen=True)
 class Connection:
-    """A resolved upstream: where to call, and the still-encrypted key to call it with.
+    """The upstream to call: where, and the operator's key (docs/auth.md § 3). The key
+    lives in this value for the request it authorises and in no log line; `snapshot` is
+    what the job's dedup key stores for the upstream (docs/jobs.md § Dedup)."""
 
-    Only this module ever opens the ciphertext, and the plaintext never leaves the request
-    it authorises (docs/project-structure.md). `builtin` is the Kano Proxy upstream, whose
-    reported cost is always recorded as an estimate; a provider connection records its
-    cost only when the user opted in (`report_cost`, docs/parsing.md § Upstream usage).
-    `snapshot` is what the job's dedup key stores for this upstream (docs/jobs.md § Dedup).
-    """
-
-    ciphertext: bytes
-    secret_key: str
+    api_key: str
     base_url: str
     snapshot: str
-    builtin: bool = False
-    report_cost: bool = False
 
     def __repr__(self) -> str:  # never let key material reach a log line
         return "Connection(...)"
-
-    def api_key(self) -> str:
-        decrypt = decrypt_kano_proxy_key if self.builtin else decrypt_connection_key
-        return decrypt(self.secret_key, self.ciphertext)
 
 
 @dataclass(frozen=True)
@@ -365,43 +246,16 @@ class PageTranscription:
     usage: Usage
 
 
-async def load_connection(
-    db: AsyncSession, settings: Settings, user_id: int, connection_id: int | None
-) -> Connection | None:
-    """The upstream to call: Kano Proxy when `connection_id` is NULL, else that provider
-    connection (docs/api.md § Upstreams). None when the credential is gone — no Kano Proxy
-    key stored, Kano Proxy not configured, or the connection deleted."""
-    if connection_id is None:
-        if not settings.kano_proxy_configured:
-            return None
-        row = (
-            await db.execute(select(KanoProxyKey).where(KanoProxyKey.user_id == user_id))
-        ).scalar_one_or_none()
-        if row is None:
-            return None
-        return Connection(
-            ciphertext=row.ciphertext,
-            secret_key=settings.secret_key,
-            base_url=settings.kano_proxy_api_base,
-            snapshot=settings.kano_proxy_base_url,
-            builtin=True,
-            report_cost=True,
-        )
-    connection = (
-        await db.execute(
-            select(ProviderConnection).where(
-                ProviderConnection.id == connection_id, ProviderConnection.user_id == user_id
-            )
-        )
-    ).scalar_one_or_none()
-    if connection is None:
+def kano_connection(settings: Settings, *, anthropic: bool = False) -> Connection | None:
+    """Kano Proxy on the operator's key — its OpenAI-format base for vision calls and the
+    catalog, its Anthropic-format base (`anthropic=True`) for the chat and check agents
+    (docs/chat.md § Upstream). None when the deployment configures no upstream."""
+    if not settings.kano_proxy_configured:
         return None
     return Connection(
-        ciphertext=connection.ciphertext,
-        secret_key=settings.secret_key,
-        base_url=connection.base_url,
-        snapshot=connection.base_url,
-        report_cost=connection.report_cost,
+        api_key=settings.kano_proxy_api_key,
+        base_url=settings.kano_proxy_anthropic_base if anthropic else settings.kano_proxy_api_base,
+        snapshot=settings.kano_proxy_base_url,
     )
 
 
@@ -418,12 +272,11 @@ def _int(value: object) -> int:
         return 0
 
 
-def _usage(payload: dict, connection: Connection) -> Usage:
-    """Token counts from any upstream, and the cost tagged with where it came from.
+def _usage(payload: dict) -> Usage:
+    """Token counts, and the cost tagged with where it came from.
 
-    A reported cost is recorded only as an estimate — always for Kano Proxy (list prices),
-    and for a provider connection only when the user opted in (`report_cost`). Otherwise,
-    or when the reported value is not a usable number, the cost is unknown — never 0
+    Kano Proxy's reported cost is recorded as an estimate (list prices). When it reports
+    none, or the value is not a usable number, the cost is unknown — never 0
     (docs/parsing.md § Upstream usage).
     """
     raw = payload.get("usage") or {}
@@ -433,11 +286,7 @@ def _usage(payload: dict, connection: Connection) -> Usage:
     reported = raw.get("cost")
     # A JSON number only: `bool` is an `int` to Python, and a string is not what an
     # OpenAI-compatible `usage.cost` is. `json` also parses NaN and Infinity.
-    if (
-        connection.report_cost
-        and isinstance(reported, int | float)
-        and not isinstance(reported, bool)
-    ):
+    if isinstance(reported, int | float) and not isinstance(reported, bool):
         cost = Decimal(str(reported))
         if cost.is_finite() and 0 <= cost <= MAX_REPORTED_COST:
             return Usage(
@@ -517,7 +366,7 @@ async def _chat_with_image(
             client.stream(
                 "POST",
                 f"{connection.base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {connection.api_key()}"},
+                headers={"Authorization": f"Bearer {connection.api_key}"},
                 json=body,
             ) as response,
         ):
@@ -551,9 +400,9 @@ async def _chat_with_image(
     try:
         text = _message_text(payload)
     except (EmptyCompletion, IncompleteCompletion) as exc:
-        exc.usage = _usage(payload, connection)
+        exc.usage = _usage(payload)
         raise
-    return text, _usage(payload, connection)
+    return text, _usage(payload)
 
 
 async def transcribe_page(

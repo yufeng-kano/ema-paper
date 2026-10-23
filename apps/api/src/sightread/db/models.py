@@ -20,7 +20,6 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
-    LargeBinary,
     Numeric,
     Sequence,
     String,
@@ -107,68 +106,6 @@ class ApiKey(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
 
 
-class KanoProxyKey(Base):
-    """One per user: the key the Kano Proxy connect flow obtained (docs/auth.md § 6).
-
-    AES-256-GCM ciphertext only — never a plaintext key (docs/auth.md § 3).
-    """
-
-    __tablename__ = "kano_proxy_keys"
-
-    user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
-    )
-    ciphertext: Mapped[bytes] = mapped_column(LargeBinary)
-    masked: Mapped[str] = mapped_column(String(64))
-    updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
-
-
-class KanoConnectState(Base):
-    """A pending Kano Proxy connect, bound to the user who started it (docs/auth.md § 6).
-
-    `state_hash` is the SHA-256 of the `state` sent to Kano Proxy; the PKCE verifier is
-    replayed at the token step, so it is encrypted rather than hashed. Single use:
-    consuming a state deletes its row.
-    """
-
-    __tablename__ = "kano_connect_states"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    state_hash: Mapped[str] = mapped_column(String(64), unique=True)
-    verifier_ciphertext: Mapped[bytes] = mapped_column(LargeBinary)
-    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
-    expires_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ)
-
-
-class ProviderConnection(Base):
-    """A user-defined OpenAI-compatible upstream (docs/api.md § Upstreams).
-
-    The connection's API key follows the Kano Proxy key's rules exactly: AES-256-GCM
-    ciphertext only, masked form for display, plaintext never stored (docs/auth.md § 3).
-
-    A connection is an endpoint, a key and the cost flag; which model runs on it is each
-    agent's own setting (`AgentSetting.model`).
-    """
-
-    __tablename__ = "provider_connections"
-    __table_args__ = (
-        UniqueConstraint("user_id", "name", name="uq_provider_connections_user_name"),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    name: Mapped[str] = mapped_column(String(255))
-    base_url: Mapped[str] = mapped_column(String(1024))
-    ciphertext: Mapped[bytes] = mapped_column(LargeBinary)
-    masked: Mapped[str] = mapped_column(String(64))
-    # Record the `usage.cost` this endpoint reports, as an estimate; opt-in, never inferred
-    # from the URL (docs/parsing.md § Upstream usage).
-    report_cost: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
-    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
-    updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
-
-
 class PromptPreset(Base):
     """A named prompt for one agent; selecting one replaces that agent's template entirely
     (docs/parsing.md § Prompts)."""
@@ -192,7 +129,7 @@ EFFORT_DEFAULT = "medium"
 class AgentSetting(Base):
     """What one user picked for one agent (docs/agents.md § Per-agent settings).
 
-    No row means every default: Kano Proxy, no model chosen, the agent's default prompt.
+    No row means every default: the first chat model offered, the agent's default prompt.
     """
 
     __tablename__ = "agent_settings"
@@ -201,11 +138,9 @@ class AgentSetting(Base):
         ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
     )
     agent: Mapped[str] = mapped_column(String(32), primary_key=True)
-    # The upstream; NULL means the built-in Kano Proxy (docs/api.md § Upstreams).
-    connection_id: Mapped[int | None] = mapped_column(
-        ForeignKey("provider_connections.id", ondelete="SET NULL"), nullable=True
-    )
-    # A model id on that upstream; NULL means not chosen yet.
+    # The chat agent's pick among `CHAT_MODELS`; NULL means the first offered. The parse
+    # and check agents' models are the deployment's, never stored here (docs/billing.md
+    # § Models).
     model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # The user's own template for the agent; NULL means the agent's default. It replaces
     # the default whole and is never set together with a preset (docs/agents.md).
@@ -231,9 +166,8 @@ class AgentSetting(Base):
     memory_paused: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default=text("false")
     )
-    # The parse agent's fallback: a model of the same upstream a blocked page is sent to,
-    # on its own only while `auto_fallback` is on (docs/parsing.md § Fallback model).
-    fallback_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # The parse agent's switch: a blocked page goes to `PARSE_FALLBACK_MODEL` on its own
+    # (docs/parsing.md § Fallback model).
     auto_fallback: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default=text("false")
     )
@@ -241,9 +175,6 @@ class AgentSetting(Base):
     # § Format check).
     auto_check: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
 
-    connection: Mapped[ProviderConnection | None] = relationship(
-        foreign_keys=[connection_id], lazy="selectin"
-    )
     prompt_preset: Mapped[PromptPreset | None] = relationship(
         foreign_keys=[prompt_preset_id], lazy="selectin"
     )

@@ -24,7 +24,6 @@ from .routes import (
     chat,
     control,
     extensions,
-    kano,
     library,
     memories,
     oauth,
@@ -86,7 +85,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(billing.router)
     if settings.dev_login_enabled:
         app.include_router(control.dev_router)
-    app.include_router(kano.router)
     app.include_router(library.router)
     app.include_router(chat.router)
     app.include_router(attachments.router)

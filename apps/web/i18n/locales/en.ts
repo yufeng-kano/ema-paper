@@ -202,18 +202,8 @@ export default {
       chat: 'Chat',
       check: 'Format check',
     },
-    modelChosen: 'Model chosen',
-    modelMissing: 'No model chosen',
-    kanoConnect: 'Connect Kano Proxy',
-    kanoUnavailable: 'Kano Proxy is not configured on this deployment.',
-    kanoConnected: 'Kano Proxy',
-    kanoConnectedState: 'Connected',
-    kanoDisconnect: 'Disconnect',
-    kanoDisconnectConfirm:
-      'Disconnect Kano Proxy? Ema Paper forgets the key. The key itself stays listed on the Access page in Kano Proxy, where you can delete it.',
-    kanoOutcomeDenied: 'Access was not granted.',
-    kanoOutcomeError: 'Connecting failed.',
-    modelLabel: 'Model',
+        modelLabel: 'Model',
+    modelNone: 'This deployment names no model.',
     bbox: {
       gemini: 'Gemini · [ymin, xmin, ymax, xmax] · 0–1000',
       claude: 'Claude · [x1, y1, x2, y2] · px',
@@ -352,6 +342,7 @@ export default {
     fallback: {
       label: 'Failed pages',
       model: 'Fallback model',
+      none: 'This deployment names no fallback model.',
       auto: 'Retry blocked pages on it automatically',
       note: 'It is also the first choice when you retry failed pages.',
     },
@@ -359,7 +350,6 @@ export default {
       label: 'Format check',
       auto: 'Check automatically after converting',
       note: 'Once every page has converted, paragraphs cut by a page break are joined and the markup is fixed, without changing the text. A document whose check fails does not open.',
-      sameModel: 'Same as the parse model',
       instructions: 'Instructions for the check',
       placeholder: 'For example: vectors are set in bold, and equations are numbered on the right.',
       advancedNote:

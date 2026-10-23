@@ -11,37 +11,15 @@ users            id PK, google_sub UNIQUE, email, name,
 sessions         id PK, user_id FK, token_hash UNIQUE, created_at, expires_at
 api_keys         id PK, user_id FK, name, key_hash UNIQUE, prefix, created_at,
                  last_used_at, revoked_at NULL
-kano_proxy_keys  user_id PK/FK, ciphertext BYTEA, masked, updated_at        -- one per user:
-                                                  -- the Kano Proxy key the connect flow
-                                                  -- obtained (auth.md § 3), AES-GCM
-kano_connect_states
-                 id PK, user_id FK, state_hash UNIQUE,
-                 verifier_ciphertext BYTEA,       -- the PKCE code_verifier, AES-GCM
-                 created_at, expires_at
-                 -- one pending Kano Proxy connect (auth.md § 6): single use — consuming
-                 -- a state deletes its row; expired rows are deleted on the user's next
-                 -- connect
-provider_connections
-                 id PK, user_id FK, name, base_url,
-                 ciphertext BYTEA, masked,        -- the connection's API key, AES-GCM
-                 report_cost BOOL NOT NULL DEFAULT false,
-                                                  -- record the usage.cost this endpoint
-                                                  -- reports, as an estimate (parsing.md
-                                                  -- § Upstream usage); opt-in, never
-                                                  -- inferred from base_url
-                 created_at, updated_at
-                 UNIQUE (user_id, name)
-                 -- user-defined OpenAI-compatible endpoints: name, endpoint, key and the
-                 -- cost flag, nothing else — the model is chosen per agent
-                 -- (agent_settings); the built-in Kano Proxy upstream is NOT a row here
 prompt_presets   id PK, user_id FK, agent, name, text TEXT, created_at, updated_at
                  UNIQUE (user_id, name)
                  -- named prompts for one agent (agents.md); selecting one replaces that
                  -- agent's template entirely (docs/parsing.md § Prompts)
 agent_settings   (user_id FK, agent) PK,
-                 connection_id FK NULL,           -- provider_connections; NULL = Kano Proxy
-                 model NULL,                      -- a model id on that upstream; NULL =
-                                                  -- not chosen yet
+                 model NULL,                      -- chat: one of CHAT_MODELS; NULL = the
+                                                  -- default (billing.md § Models). NULL on
+                                                  -- parse and check, whose models are the
+                                                  -- deployment's
                  effort low|medium|high|xhigh|max NOT NULL DEFAULT 'medium',
                                                   -- the chat agent's reasoning depth
                  prompt TEXT NULL,                -- the user's own template; NULL = the
@@ -57,9 +35,6 @@ agent_settings   (user_id FK, agent) PK,
                  memory_auto BOOL NOT NULL DEFAULT true,
                  memory_paused BOOL NOT NULL DEFAULT false,
                                                   -- chat: the memory switches (chat.md § Memory)
-                 fallback_model VARCHAR(255) NULL,
-                                                  -- parse: the model a blocked page goes to,
-                                                  -- and the retry dialog's first choice
                  auto_fallback BOOL NOT NULL DEFAULT false,
                                                   -- parse: send blocked pages to it on its own
                                                   -- (parsing.md § Fallback model)
@@ -76,16 +51,17 @@ jobs             id UUID PK, user_id FK, agent, kind pdf|image, filename, media_
                                                   -- input; NO FK (immutable history, like
                                                   -- connection_id). NULL for `parse`, whose
                                                   -- input is an upload
-                 connection_id NULL,              -- provider connection; NULL = the
-                                                  -- built-in upstream (Kano Proxy; OpenRouter
-                                                  -- on historical rows). Deliberately NO FK:
-                                                  -- immutable history (see Rules)
-                 connection_base_url NULL,        -- endpoint snapshot at enqueue: the
-                                                  -- connection's base_url, or
-                                                  -- KANO_PROXY_BASE_URL for the built-in
-                                                  -- upstream (NULL only on historical
-                                                  -- OpenRouter rows); part of the dedup key
-                                                  -- (jobs.md § Dedup)
+                 connection_id NULL,              -- history only: the provider connection
+                                                  -- a job of an earlier release ran on;
+                                                  -- NULL on every job since (Kano Proxy;
+                                                  -- OpenRouter on the oldest rows). No FK,
+                                                  -- and the table it named is gone (see
+                                                  -- Rules)
+                 connection_base_url NULL,        -- endpoint snapshot at enqueue:
+                                                  -- KANO_PROXY_BASE_URL (a connection's
+                                                  -- base_url on historical rows, NULL only
+                                                  -- on OpenRouter rows); part of the dedup
+                                                  -- key (jobs.md § Dedup)
                  prompt TEXT NULL,                -- effective prompt template, verbatim
                  prompt_sha256,                   -- its hash; part of the dedup key
                  fallback_model NULL,             -- snapshot at enqueue: the fallback when
@@ -309,6 +285,7 @@ credit_entries   id PK, user_id FK, period_start,
 - **The agent prompt migration** (`skills subagents attachments and agent prompt`) gave `agent_settings` its `prompt` column and moved every selected preset into it, clearing `prompt_preset_id`: a `parse` preset's text as it was (a parse preset replaced the template), a `chat` preset's text behind the chat agent's default system prompt of that release and a blank line (a chat preset was appended to it) — the default is copied into the migration, never imported, so the migration stays what it was when it ran. The presets themselves stay, unselected; nothing else reads them. A `chat` preset holding one of the template's tokens is not moved: it was appended verbatim, and inside the template the token would be substituted, so it stays the selected preset. The downgrade puts the selections back before it drops the column: an agent whose prompt is a moved preset selects that preset again (matched by its text), and a prompt written after the upgrade becomes a preset of its own named *Custom prompt* (numbered past a taken name) where the old schema can say it — a `parse` prompt as it is, a `chat` prompt as what it adds behind that release's default; a `chat` prompt that edits the default itself has no such form and goes back to the default. A moved `chat` prompt can exceed `SYSTEM_PROMPT_MAX_CHARS`, which caps writes, not stored rows: the dialog says so and the reader shortens it before the next save. The same revision created `skills`, `subagents` and `chat_attachments`.
 - **The instructions and memory migration** (`agent instructions and memories`) added `agent_settings.instructions`, `answer_language`, `translate_language` (NULL: none, and the reader's locale as before), `memory_auto` (true) and `memory_paused` (false), `conversations.memory_ids` (NULL: a conversation takes its snapshot at its next turn) and the `memories` table, empty, with its three indexes. No row is rewritten. Its downgrade drops them, the memories with them.
 - **The failed pages migration** (`retry failed pages`) added `agent_settings.fallback_model` (NULL) and `auto_fallback` (false), `jobs.fallback_model` and `jobs.retry_model` (NULL) and `job_pages.model` (NULL: the job's model). No row is rewritten: a job already `succeeded` with page errors keeps its result as it was ([parsing.md](./parsing.md) § Vision-only conversion). Its downgrade drops the five columns.
+- **The operator upstream migration** (`operator upstream`, [billing.md](./billing.md) § Transition step 4) dropped `kano_proxy_keys`, `kano_connect_states` and `provider_connections` — the stored keys are gone, not migrated: nothing can use them — and `agent_settings.connection_id` and `fallback_model`, and set `agent_settings.model` to NULL on every `parse` and `check` row (their models are the deployment's). A `chat` row keeps its model. `jobs.connection_id` stays as history; the worker fails a queued job that carries one. Its downgrade recreates the three tables and the two columns, empty: there is no key to put back.
 - **The format check migration** (`format check`) added `agent_settings.auto_check` (true), `jobs.check_model`, `check_effort` and `check_prompt` (NULL: no check) and `results.reading_markdown` (NULL: not checked). No row is rewritten: a job queued before it runs unchecked, and a result written before it has no reading copy. Its downgrade drops the five columns.
 - **The figure check migration** (`figure check`) added `job_pages.figures` (NULL: no check). No row is rewritten: a page kept from before it keeps no statuses, and its figures carry no `check`. Its downgrade drops the column.
 - **The ledger migration** (`credit entries outlive turns`) changed `credit_entries.turn_id` from `ON DELETE CASCADE` to `ON DELETE SET NULL` and replaced the check that a chat entry has a turn with one that a parse entry has none: a conversation deleted by its reader takes its turns and leaves their entries behind, still counted in the period and in `/api/billing/entries`. No row is rewritten. Its downgrade restores the cascade and refuses while any chat entry has no turn, naming the count — those entries would otherwise have to be deleted from the billing record.
@@ -322,8 +299,8 @@ credit_entries   id PK, user_id FK, period_start,
   - `provider_connections.model` was dropped. A connection that was not anyone's selected upstream loses its model; picking it later means picking a model again. Accepted by the operator, with no compatibility path;
   - `openrouter_keys` was dropped — the stored OpenRouter keys are gone, not migrated (nothing can use them);
   - `jobs.profile` and `jobs.profile_version` were dropped rather than kept as history. Nothing reads them once profiles are gone: the dedup key no longer has them, and a historical job's profile is still recorded where a reader sees it, in its stored result's `meta.profile`. Old OpenRouter jobs keep `connection_id` and `connection_base_url` NULL, which no new job ever has, so they can never answer a new upload ([jobs.md](./jobs.md) § Dedup).
-- **Editing** a connection's URL or key applies to jobs still queued on it — the worker resolves the row at run time, the same semantics as reconnecting Kano Proxy while jobs are queued. Deliberate: snapshotting encrypted credentials onto job rows would copy secrets around, and a user edits their own connection precisely so pending work uses the fix. The model is not the connection's: it is snapshotted onto `jobs.model` at enqueue from the agent's settings, like every other parse parameter. The dedup cache is protected separately by the `connection_base_url` snapshot ([jobs.md](./jobs.md) § Dedup).
-- `jobs.connection_id` carries **no foreign key** on purpose: the upstream a job ran on is immutable history. A FK with SET NULL would relabel a deleted connection's jobs as built-in (Kano Proxy) jobs — a still-queued one would then run against the user's Kano Proxy key, and a succeeded one would answer Kano Proxy dedup lookups with another upstream's output; RESTRICT would make a connection undeletable once any job exists. Instead the id simply outlives the row: the worker fails a queued job whose connection is gone ("the provider connection for this job no longer exists"), and dedup keys keep matching only their own upstream (connection ids are never reused). `jobs.source_job_id` follows the same rule for the same reason.
+- **The upstream key is read at run time**, never snapshotted onto a job: the worker presents `KANO_PROXY_API_KEY` as configured when the job runs, so a rotated key applies to queued work. The model is snapshotted onto `jobs.model` at enqueue, like every other parse parameter. The dedup cache is protected separately by the `connection_base_url` snapshot ([jobs.md](./jobs.md) § Dedup).
+- `jobs.connection_id` is **history**: the provider connection a job of an earlier release ran on, kept so a result parsed through another endpoint never answers a Kano Proxy dedup lookup (the key keeps the column), and so a job still queued on one fails when the worker takes it ("the provider connection for this job no longer exists") rather than run on the operator's key. It never had a foreign key — the upstream a job ran on is immutable — and no new job sets it. `jobs.source_job_id` follows the same no-FK rule for the same reason.
 - **A usage row's cost is only as good as its source.** `cost_source` is written with the row and never revised: `openrouter` is billing, `estimated` is what the endpoint said the call cost, `unknown` has `cost` NULL. The migration that added the column backfilled it from the job each row belongs to — rows of a job with a `connection_id` became `unknown` with `cost` NULL (their reported cost had been discarded and 0 recorded in its place, which was never a price), every other row `openrouter` with its cost untouched. Rows with no job left (`job_id` NULL) count as `openrouter`: jobs are only ever deleted with their user, and the user's usage goes with them. Since OpenRouter was removed no new row is `openrouter`; the historical ones stay readable and keep counting as billed. `provider_connections.report_cost` follows the URL and key rule above — the worker reads it when the job runs, so toggling it affects calls made from then on, including jobs already queued, and never rewrites rows already recorded. Usage per agent is read through the job (`usage_log.job_id → jobs.agent`).
 - **A document is a library entry, not a second copy of the result.** `documents` names a parse and places it in a folder; the markdown lives in `results` exactly once, keyed by the job that produced it. A markdown document has no parse: `job_id` is NULL, and its baseline is the `.md` it was uploaded as, kept as its original, or nothing for one written new ([workspace.md](./workspace.md) § Markdown documents). Nothing in the database tells the two apart but `job_id`. Deleting a document deletes the entry only — the job stays in the parse history and its `usage_log` rows stay, because they are the billing record of something that really ran. Deleting a folder cascades to its subfolders and their documents, the way removing a directory does.
 - **The Trash is a column, not a table.** Putting a folder or a document in the Trash sets its `trashed_at` and nothing else: the row keeps its place (`parent_id`, `folder_id`) and its name, which is where *Put Back* returns it, and everything under a trashed folder is in the Trash with it without a write of its own. So *live* is computed, not stored — a folder is live when neither it nor any folder above it has `trashed_at`, a document when it has none and its folder (if any) is live — and every route of the library, the reader and the agent answers 404 for what is not live ([workspace.md](./workspace.md) § The Trash). Names are unique among the live rows only: the unique indexes carry `WHERE trashed_at IS NULL`, so a trashed `report.pdf` does not keep its folder from taking a new one, and Put Back resolves the collision the way a move does, with ` (2)`. A row inside a trashed folder still holds its name there, which nothing can contest: a trashed folder takes no new entries. That is decided again under the user's row lock, which a move to the Trash takes too: a folder or a file created while its destination goes to the Trash either lands first and goes with it, or is refused (404) — an upload whose parse is already under way lands at the top level instead, since the parse is not undone. An item trashed on its own stays its own entry in the Trash when a folder above it is trashed later. Deleting a row for good — from the Trash, or a live one deleted immediately — takes its own subtree only: an item inside it that was trashed separately is moved up to the deleted folder's parent first, so the cascade cannot take it, and it stays in the Trash. Nothing in the database empties the Trash by itself; the reader does.

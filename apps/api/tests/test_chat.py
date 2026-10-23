@@ -39,7 +39,6 @@ from sightread.workspace import documents as workspace_documents
 from sightread.workspace import git
 from sightread.workspace.layout import user_root
 from tests.conftest import CSRF_HEADERS, KANO_BASE
-from tests.test_parse_end_to_end import _connect_kano
 
 MESSAGES_URL = f"{KANO_BASE}/anthropic/v1/messages"
 MODELS_URL = f"{KANO_BASE}/openai/v1/models"
@@ -147,7 +146,6 @@ async def chatting(make_client, tmp_path) -> AsyncClient:
     client = make_client(workspaces_dir=str(tmp_path / "workspaces"))
     await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
     user_id = (await client.get("/api/me")).json()["user"]["id"]
-    await _connect_kano(client.app.state.sessionmaker, user_id)
     chosen = await client.put(
         "/api/agents/chat/settings",
         json={"model": "claude-code/claude-opus-5-5"},
@@ -201,16 +199,16 @@ def test_strict_tool_schemas_hold_only_what_strict_accepts() -> None:
     assert [hit for tool in strict for hit in walk(tool["input_schema"], tool["name"])] == []
 
 
-async def test_chat_settings_refuse_connections_and_validate_effort(chatting) -> None:
+async def test_chat_settings_refuse_unoffered_models_and_validate_effort(chatting) -> None:
     refused = await chatting.put(
-        "/api/agents/chat/settings", json={"connection_id": 1}, headers=CSRF_HEADERS
+        "/api/agents/chat/settings", json={"model": "vendor/unoffered"}, headers=CSRF_HEADERS
     )
     assert refused.status_code == 400
     bad = await chatting.put(
         "/api/agents/chat/settings", json={"effort": "ultra"}, headers=CSRF_HEADERS
     )
     assert bad.status_code == 400
-    # Any model of the catalog may be saved, Claude or not (docs/api.md).
+    # Any offered model may be saved, Claude or not (docs/api.md).
     other = await chatting.put(
         "/api/agents/chat/settings", json={"model": "codex/gpt-5.5"}, headers=CSRF_HEADERS
     )
@@ -226,19 +224,25 @@ async def test_chat_settings_refuse_connections_and_validate_effort(chatting) ->
     assert chat["output"] == "edits"
 
 
+@pytest.mark.own_catalog
 @respx.mock
-async def test_the_chat_catalog_lists_every_kano_proxy_model(chatting) -> None:
+async def test_the_chat_catalog_lists_the_offered_models_the_catalog_confirms(chatting) -> None:
+    """`CHAT_MODELS` in the operator's order, only those Kano Proxy still lists
+    (docs/api.md § GET /api/agents/{agent}/models)."""
     ids = [
-        "claude-code/claude-opus-5-5",
+        "dgx/qwen3.8-flash-next",
         "codex/gpt-5.5",
         "antigravity/claude-opus-4-6-thinking",
-        "dgx/qwen3.8-flash-next",
+        "claude-code/claude-opus-5-5",
     ]
     respx.get(MODELS_URL).mock(
         return_value=httpx.Response(200, json={"data": [{"id": model} for model in ids]})
     )
     listed = await chatting.get("/api/agents/chat/models")
-    assert [model["id"] for model in listed.json()["data"]] == ids
+    assert [model["id"] for model in listed.json()["data"]] == [
+        "claude-code/claude-opus-5-5",
+        "codex/gpt-5.5",
+    ]
 
 
 @respx.mock
@@ -436,21 +440,61 @@ async def test_a_refusal_fails_the_turn_and_a_cancel_stops_it(chatting) -> None:
     assert "cancelled" in statuses
 
 
-async def test_messages_need_a_model_and_a_connected_kano_proxy(make_client, tmp_path) -> None:
-    client = make_client(workspaces_dir=str(tmp_path / "ws"))
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    user_id = (await client.get("/api/me")).json()["user"]["id"]
-    document_id = await _seed_document(client, user_id)
+@pytest.mark.own_catalog
+@respx.mock
+async def test_a_first_message_needs_a_model_the_catalog_still_serves(chatting) -> None:
+    """The pick is in CHAT_MODELS but Kano Proxy dropped it: refused before it is fixed
+    on the conversation; a catalog that cannot be read is the upstream's failure."""
+    document_id = chatting.document_id
     conversation_id = (
-        await client.post(
+        await chatting.post(
             f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
         )
     ).json()["id"]
-    no_model = await client.post(
+    respx.get(MODELS_URL).mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "codex/gpt-5.5"}]})
+    )
+    dropped = await chatting.post(
         f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
     )
-    assert no_model.status_code == 400
-    assert "No model chosen" in no_model.json()["error"]["message"]
+    assert dropped.status_code == 400
+    assert dropped.json()["error"]["message"] == (
+        "That model is no longer served: pick another on the Agent page"
+    )
+    respx.get(MODELS_URL).mock(return_value=httpx.Response(500))
+    unreadable = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
+    )
+    assert unreadable.status_code == 502
+    async with chatting.app.state.sessionmaker() as db:
+        assert (await db.get(Conversation, conversation_id)).model is None
+        assert (await db.execute(select(ChatTurn.id))).all() == []
+
+
+async def test_messages_need_an_offered_model_and_a_configured_kano_proxy(
+    make_client, tmp_path
+) -> None:
+    """A deployment offering no chat model, or no Kano Proxy, refuses the send with 503
+    before a turn exists (docs/agents.md § Enqueue rules)."""
+    document_id: int | None = None
+    for overrides in ({"chat_models": ""}, {"kano_proxy_api_key": ""}):
+        client = make_client(workspaces_dir=str(tmp_path / "ws"), **overrides)
+        await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+        if document_id is None:
+            user_id = (await client.get("/api/me")).json()["user"]["id"]
+            document_id = await _seed_document(client, user_id)
+        conversation_id = (
+            await client.post(
+                f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+            )
+        ).json()["id"]
+        refused = await client.post(
+            f"/api/conversations/{conversation_id}/messages",
+            json={"text": "hi"},
+            headers=CSRF_HEADERS,
+        )
+        assert refused.status_code == 503, overrides
+        assert refused.json()["error"]["type"] == "upstream"
 
 
 async def test_the_editor_tool_stays_inside_the_workspace(tmp_path) -> None:
@@ -2469,7 +2513,11 @@ async def test_the_sandbox_client_takes_an_empty_success_answer(monkeypatch) -> 
         await client.stop(7)
 
 
-async def test_a_conversation_with_a_stored_model_needs_none_on_the_agent_page(chatting) -> None:
+async def test_a_conversation_with_a_stored_model_keeps_it_whatever_the_page_says(
+    chatting,
+) -> None:
+    """The conversation's model is its first turn's; a fresh conversation starts on the
+    reader's pick, or the first offered when that pick is gone (docs/chat.md)."""
     document_id = chatting.document_id
     conversation_id = (
         await chatting.post(
@@ -2482,22 +2530,24 @@ async def test_a_conversation_with_a_stored_model_needs_none_on_the_agent_page(c
         setting = (
             await db.execute(select(AgentSetting).where(AgentSetting.agent == "chat"))
         ).scalar_one()
-        setting.model = None  # "Not set" on the Agent page
+        setting.model = "vendor/delisted"  # no longer offered
         await db.commit()
     accepted = await chatting.post(
         f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
     )
     assert accepted.status_code == 202, accepted.text
-    # A fresh conversation still needs one chosen.
     fresh = (
         await chatting.post(
             f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
         )
     ).json()["id"]
-    refused = await chatting.post(
+    started = await chatting.post(
         f"/api/conversations/{fresh}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
     )
-    assert refused.status_code == 400
+    assert started.status_code == 202, started.text
+    async with chatting.app.state.sessionmaker() as db:
+        assert (await db.get(Conversation, conversation_id)).model == "claude-stored"
+        assert (await db.get(Conversation, fresh)).model == "claude-code/claude-opus-5-5"
     thread = (await chatting.get(f"/api/conversations/{conversation_id}")).json()
     assert thread["turns"][-1]["finished_at"] is None
 

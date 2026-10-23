@@ -59,8 +59,8 @@ class ParseJson(BaseModel):
 
 @router.get("/models")
 async def list_models(user: ReaderUser, db: DbSession, settings: AppSettings):
-    """The live catalog of the caller's parse upstream (docs/api.md § GET /v1/models)."""
-    return {"data": await agent_models(db, settings, user.id, PARSE.name)}
+    """The models a parse may run (docs/api.md § GET /v1/models)."""
+    return {"data": await agent_models(settings, PARSE.name)}
 
 
 # --- parse ----------------------------------------------------------------------------

@@ -5,8 +5,8 @@
  * A `UiModal` over whichever screen the account menu was opened from — the screen stays
  * behind the scrim, so closing the dialog is just closing it. Inside, the section list at
  * the left and the open section's column at the right, each scrolling on its own. Which
- * section is open is the route's `?settings=<section>` query, so a section can be linked
- * and the Kano Proxy connect flow has somewhere to land; the dialog's own navigation
+ * section is open is the route's `?settings=<section>` query, so a section can be linked;
+ * the dialog's own navigation
  * replaces the query rather than pushing it, so Back leaves the dialog in one step.
  *
  * Escape reaches this dialog only when nothing over it owns the key: `UiModal` yields to a

@@ -55,6 +55,7 @@ from ..jobs.chat_tools import PageUnavailable, original_page_png
 from ..jobs.intake import (
     MULTIPART_ENVELOPE_BYTES,
     capped_stream,
+    checked_parse_model,
     file_chunks,
     resolve_check,
     store_upload,
@@ -1978,6 +1979,9 @@ async def retry_document(
     raises is read back on a connection of its own, as a filing's is: the copy goes only
     with a retry that did not land."""
     model = (body.model or "").strip() or None
+    if model is not None:
+        # One of the parse agent's two, as at enqueue (docs/agents.md § Enqueue rules).
+        model = checked_parse_model(settings, model)
     root = user_root(settings.workspaces_dir, user.id)
     async with workspace_lock(root):
         row = await live_document(db, user.id, document_id)

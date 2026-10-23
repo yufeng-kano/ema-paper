@@ -41,19 +41,14 @@ class Settings(BaseSettings):
 
     auth_dev_mode: bool = False
 
-    # Kano Proxy, the built-in upstream (docs/auth.md § 6). The origin only: vision calls
-    # go to `{origin}/openai/v1`, consent to `{origin}/connect/authorize`, the token
-    # exchange to `{origin}/api/connect/token`. Any of the three empty = unavailable.
+    # Kano Proxy, the only upstream (docs/auth.md § 3): the origin only — vision calls go
+    # to `{origin}/openai/v1`, chat to `{origin}/anthropic/v1` — and the operator's own key,
+    # presented on every upstream call. Either empty = no upstream, 503 `upstream`.
     kano_proxy_base_url: str = ""
-    kano_proxy_client_id: str = ""
-    kano_proxy_client_secret: str = ""
-    # Lifetime of a pending connect state (state + PKCE verifier).
-    kano_connect_ttl_seconds: int = 600
-
-    # The subscription (docs/billing.md). The operator's own Kano Proxy key, the models the
-    # deployment offers and their list prices; read and validated here, run on from the
-    # upstream step of docs/billing.md § Transition.
     kano_proxy_api_key: str = ""
+
+    # The subscription (docs/billing.md): the models the deployment offers and their list
+    # prices.
     parse_model: str = ""
     check_model: str = ""
     parse_fallback_model: str = ""
@@ -310,9 +305,7 @@ class Settings(BaseSettings):
 
     @property
     def kano_proxy_configured(self) -> bool:
-        return bool(
-            self.kano_proxy_base_url and self.kano_proxy_client_id and self.kano_proxy_client_secret
-        )
+        return bool(self.kano_proxy_base_url and self.kano_proxy_api_key)
 
     @property
     def kano_proxy_api_base(self) -> str:

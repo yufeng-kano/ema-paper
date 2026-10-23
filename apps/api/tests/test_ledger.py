@@ -29,7 +29,6 @@ from sightread.jobs.queue import claim_next_turn, fail_turn
 from tests.conftest import CSRF_HEADERS, TEST_MODEL_PRICES
 from tests.test_chat import MESSAGES_URL, _seed_document, assistant_turn
 from tests.test_library import _read, _ready_to_parse, _upload
-from tests.test_parse_end_to_end import _connect_kano
 
 pytestmark = pytest.mark.usefixtures("documents")
 
@@ -333,7 +332,6 @@ async def test_a_send_without_the_minimum_balance_is_refused(make_client, tmp_pa
     client = make_client(workspaces_dir=str(tmp_path / "workspaces"), free_credits_per_period=0)
     await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
     user_id = (await client.get("/api/me")).json()["user"]["id"]
-    await _connect_kano(client.app.state.sessionmaker, user_id)
     chosen = await client.put(
         "/api/agents/chat/settings",
         json={"model": "claude-code/claude-opus-5-5"},
@@ -369,7 +367,6 @@ async def test_a_turn_that_runs_out_of_credits_ends_with_its_answer_kept(
     )
     await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
     user_id = (await client.get("/api/me")).json()["user"]["id"]
-    await _connect_kano(client.app.state.sessionmaker, user_id)
     await client.put(
         "/api/agents/chat/settings",
         json={"model": "claude-code/claude-opus-5-5"},

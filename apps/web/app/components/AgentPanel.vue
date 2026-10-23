@@ -1,9 +1,10 @@
 <script setup lang="ts">
 /**
  * The selected agent's panel on `/agents` (docs/web.md § Pages, docs/agents.md): one row of
- * controls — which model of Kano Proxy's live catalog it runs, then for the chat agent its
- * effort, for the parse agent its prompt — then, for the parse agent, its fallback for failed
- * pages and the format check (the `check` agent's settings, which have no tab of their own);
+ * controls — the model it runs (the deployment's parse model as a fact; for the chat agent a
+ * dropdown of the offered models), then for the chat agent its effort, for the parse agent
+ * its prompt — then, for the parse agent, its fallback for failed pages and the format check
+ * (the `check` agent's settings, which have no tab of their own);
  * for the chat agent, its instructions (with the whole prompt as their advanced option), its
  * memory, its tools, skills and subagents.
  * Every save hands the server's answer back through `saved`, so the page's tab list reads
@@ -54,13 +55,15 @@ const isChat = computed(() => props.agent.name === CHAT_AGENT)
 
 // --- model ----------------------------------------------------------------------
 
+/** The chat agent's offered models (docs/billing.md § Models); the parse agent's model is
+ *  a fact of the deployment and loads nothing. */
 const models = ref<ConnectionModel[] | null>(null)
 const modelsError = ref<string | null>(null)
 const modelPending = ref(false)
 /** Request generation: only the newest load may fill the picker. */
 let modelsSeq = 0
 
-/** The catalog loads when the panel opens; opening it again is what reloads it. */
+/** The list loads when the panel opens; opening it again is what reloads it. */
 async function loadModels() {
   const seq = ++modelsSeq
   models.value = null
@@ -68,7 +71,7 @@ async function loadModels() {
   try {
     const data = (await listAgentModels(props.agent.name)).data
     if (seq === modelsSeq) {
-      models.value = [...data].sort((left, right) => left.id.localeCompare(right.id))
+      models.value = data
     }
   } catch (error) {
     if (seq === modelsSeq) {
@@ -77,27 +80,18 @@ async function loadModels() {
   }
 }
 
-/**
- * An agent still pointing at a provider connection — set on the former Settings page —
- * is moved back to Kano Proxy before its catalog loads. The picker would otherwise list
- * one upstream's models while parses ran, and were charged, on another.
- */
-async function resolveUpstream() {
-  if (settings.value.connection_id !== null) {
-    try {
-      emit('saved', props.agent.name, await putAgentSettings(props.agent.name, { connection_id: null }))
-    } catch (error) {
-      modelsError.value = await resolve(error)
-      return
+watch(
+  () => props.agent.name,
+  () => {
+    if (isChat.value) {
+      void loadModels()
     }
-  }
-  await loadModels()
-}
+  },
+  { immediate: true },
+)
 
-watch(() => props.agent.name, () => void resolveUpstream(), { immediate: true })
-
-/** A stored model the catalog does not list (delisted, or not loaded) is still the
-    current choice, so the picker shows it rather than silently blanking it. */
+/** A stored model the list does not carry (delisted, or not loaded) is still the current
+    choice, so the picker shows it rather than silently blanking it. */
 const modelInjected = computed(() => {
   const current = settings.value.model
   if (!current) {
@@ -118,7 +112,7 @@ async function applyModel(value: string) {
   }
 }
 
-/** The convention the pipeline will ask the saved model for — a fact about the model
+/** The convention the pipeline will ask the parse model for — a fact about the model
     (docs/parsing.md § Coordinate conventions), shown beside it and never a control. Only
     the parse agent has one: the chat agent reads pages, it does not transcribe them. */
 const convention = computed(() =>
@@ -161,20 +155,26 @@ function onSectionSaved(agent: string, saved: SavedAgentSettings) {
     <!-- Model, then effort (chat) or prompt (parse): one row that wraps on a narrow window. -->
     <div class="row reveal-on-hover">
       <div class="controls">
-        <UiField v-slot="{ id }" class="model" :label="t('agents.modelLabel')">
+        <UiField v-if="isChat" v-slot="{ id }" class="model" :label="t('agents.modelLabel')">
           <UiSelect
             :id="id"
             :model-value="settings.model ?? ''"
             :disabled="modelPending || (!models && !settings.model)"
             @update:model-value="applyModel"
           >
-            <option value="">{{ t('common.notSet') }}</option>
+            <option v-if="!settings.model" value="">{{ t('agents.modelNone') }}</option>
             <option v-if="modelInjected" :value="modelInjected">{{ modelInjected }}</option>
             <option v-for="model in models ?? []" :key="model.id" :value="model.id">
               {{ model.name ? `${model.name} · ${model.id}` : model.id }}
             </option>
           </UiSelect>
         </UiField>
+        <!-- The parse model is the deployment's: a fact under the label, not a control. -->
+        <div v-else class="model fact">
+          <span class="fact-label">{{ t('agents.modelLabel') }}</span>
+          <span v-if="settings.model" class="mono fact-value">{{ settings.model }}</span>
+          <span v-else class="fact-value muted">{{ t('agents.modelNone') }}</span>
+        </div>
         <UiField v-if="isChat" v-slot="{ id }" class="effort" :label="t('agents.effortLabel')">
           <UiSelect :id="id" :model-value="effortChoice" :disabled="effortPending" @update:model-value="applyEffort">
             <option v-for="effort in AGENT_EFFORTS" :key="effort" :value="effort">{{ t(`agents.effort.${effort}`) }}</option>
@@ -196,11 +196,10 @@ function onSectionSaved(agent: string, saved: SavedAgentSettings) {
     </div>
 
     <template v-if="!isChat">
-      <AgentsFallbackSection :agent="agent" :models="models" @saved="onSectionSaved" />
+      <AgentsFallbackSection :agent="agent" @saved="onSectionSaved" />
       <AgentsCheckSection
         v-if="check"
         :agent="check"
-        :models="models"
         :prompt-max-chars="promptMaxChars"
         @saved="onSectionSaved"
       />
@@ -258,6 +257,36 @@ function onSectionSaved(agent: string, saved: SavedAgentSettings) {
 .model {
   flex: 1 1 14rem;
   min-width: 0;
+}
+
+/* The parse model, drawn as a field — its label, then the value where a control would be —
+   so the row reads the same whichever agent is open. */
+.fact {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.fact-label {
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.fact-value {
+  display: flex;
+  align-items: center;
+  min-height: var(--control-height);
+  overflow: hidden;
+  font-size: var(--text-sm);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fact-value.muted {
+  color: var(--muted);
 }
 
 /* An effort picker is five short words; it does not need the model picker's width. */

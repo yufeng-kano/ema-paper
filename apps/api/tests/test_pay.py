@@ -26,7 +26,6 @@ from tests.conftest import (
 )
 from tests.test_chat import MESSAGES_URL, _seed_document, assistant_turn
 from tests.test_library import MODEL, _ready_to_parse, _upload
-from tests.test_parse_end_to_end import _connect_kano
 
 SUBSCRIPTIONS_URL = f"{PAY_URL}/v1/subscriptions/"
 CATALOG_URL = f"{PAY_URL}/v1/catalog"
@@ -722,7 +721,6 @@ async def test_a_turn_on_a_paid_plan_offers_the_shell_to_the_model(make_client, 
         **PAY_SETTINGS,
     )
     user_id = await _signed_in(client)
-    await _connect_kano(client.app.state.sessionmaker, user_id)
     chosen = await client.put(
         "/api/agents/chat/settings",
         json={"model": "claude-code/claude-opus-5-5"},

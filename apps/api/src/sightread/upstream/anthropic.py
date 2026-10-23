@@ -103,15 +103,11 @@ def _index(data: dict) -> int:
     return value
 
 
-def _usage(raw: dict, connection: Connection, *, output_tokens: int) -> ChatUsage:
+def _usage(raw: dict, *, output_tokens: int) -> ChatUsage:
     reported = raw.get("cost")
     cost: Decimal | None = None
     source = COST_SOURCE_UNKNOWN
-    if (
-        connection.report_cost
-        and isinstance(reported, int | float)
-        and not isinstance(reported, bool)
-    ):
+    if isinstance(reported, int | float) and not isinstance(reported, bool):
         candidate = Decimal(str(reported))
         if candidate.is_finite() and 0 <= candidate <= MAX_REPORTED_COST:
             cost, source = candidate.quantize(COST_QUANTUM), COST_SOURCE_ESTIMATED
@@ -223,8 +219,8 @@ async def stream_messages(
     `CompletedMessage` last — unless the upstream fails, in which case it raises. The
     bounds are the deployment's (`UPSTREAM_*`, docs/chat.md § Upstream)."""
     headers = {
-        "Authorization": f"Bearer {connection.api_key()}",
-        "x-api-key": connection.api_key(),
+        "Authorization": f"Bearer {connection.api_key}",
+        "x-api-key": connection.api_key,
         "anthropic-version": ANTHROPIC_VERSION,
         "content-type": "application/json",
         "accept": "text/event-stream",
@@ -374,7 +370,7 @@ async def stream_messages(
         content=[block for block in blocks if block],
         stop_reason=stop_reason,
         stop_details=stop_details,
-        usage=_usage(start_usage, connection, output_tokens=output_tokens),
+        usage=_usage(start_usage, output_tokens=output_tokens),
         model=model,
         malformed_tool_uses=malformed,
     )

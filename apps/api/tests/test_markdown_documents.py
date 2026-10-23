@@ -21,7 +21,6 @@ from sightread.workspace.documents import original_of
 from sightread.workspace.layout import user_root
 from tests.conftest import CSRF_HEADERS
 from tests.test_chat import MESSAGES_URL, _run_queued_turn, assistant_turn
-from tests.test_parse_end_to_end import _connect_kano
 
 
 @pytest.fixture
@@ -264,7 +263,6 @@ async def test_the_agent_page_renders_a_markdown_documents_facts(writer) -> None
 
 @respx.mock
 async def test_a_turn_on_a_markdown_document_edits_it_and_has_no_pages(writer) -> None:
-    await _connect_kano(writer.app.state.sessionmaker, writer.user_id)
     chosen = await writer.put(
         "/api/agents/chat/settings",
         json={"model": "claude-code/claude-opus-5-5"},

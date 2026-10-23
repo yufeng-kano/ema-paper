@@ -1,23 +1,14 @@
 <script setup lang="ts">
 /**
  * The parse agent's **Failed pages** (docs/web.md § Pages, docs/parsing.md § Fallback model):
- * the model a page the run model blocked goes to, and the switch that sends it there on its
- * own — off until the reader turns it on, and usable only once a fallback is chosen. The
- * fallback is also the retry dialog's first choice.
- *
- * Both save at once, like every control on the panel.
+ * the deployment's fallback model, a fact, and the switch that sends a page the run model
+ * blocked there on its own — off until the reader turns it on, and usable only while the
+ * deployment names a fallback. The fallback is also the retry dialog's first choice.
  */
-import {
-  putAgentSettings,
-  type AgentEntry,
-  type ConnectionModel,
-  type SavedAgentSettings,
-} from '~/lib/api'
+import { putAgentSettings, type AgentEntry, type SavedAgentSettings } from '~/lib/api'
 
 const props = defineProps<{
   agent: AgentEntry
-  /** The panel's live catalog; null while it loads. */
-  models: ConnectionModel[] | null
 }>()
 
 const emit = defineEmits<{
@@ -31,7 +22,6 @@ const { resolve } = useApiError()
 const labelId = useId()
 
 const fallback = computed(() => props.agent.settings.fallback_model ?? null)
-const modelPending = ref(false)
 /** The click being saved; the stored value otherwise. Put back when the save fails. */
 const autoChoice = ref<boolean | null>(null)
 /** Drawn off with no fallback, whatever is stored: there is nowhere to send a page. */
@@ -39,25 +29,6 @@ const autoOn = computed(
   () => fallback.value !== null && (autoChoice.value ?? props.agent.settings.auto_fallback ?? false),
 )
 const error = ref<string | null>(null)
-
-/** A stored fallback the catalog does not list is still the current choice. */
-const modelInjected = computed(() => {
-  const current = fallback.value
-  return current && !(props.models ?? []).some((model) => model.id === current) ? current : null
-})
-
-async function applyModel(value: string) {
-  const name = props.agent.name
-  modelPending.value = true
-  error.value = null
-  try {
-    emit('saved', name, await putAgentSettings(name, { fallback_model: value || null }))
-  } catch (failure) {
-    error.value = await resolve(failure)
-  } finally {
-    modelPending.value = false
-  }
-}
 
 async function toggleAuto() {
   if (autoChoice.value !== null) {
@@ -81,20 +52,12 @@ async function toggleAuto() {
   <section class="section" :aria-labelledby="labelId">
     <h3 :id="labelId" class="section-label">{{ t('agents.fallback.label') }}</h3>
     <div class="controls">
-      <UiField v-slot="{ id }" class="model" :label="t('agents.fallback.model')">
-        <UiSelect
-          :id="id"
-          :model-value="fallback ?? ''"
-          :disabled="modelPending || (!models && !fallback)"
-          @update:model-value="applyModel"
-        >
-          <option value="">{{ t('common.notSet') }}</option>
-          <option v-if="modelInjected" :value="modelInjected">{{ modelInjected }}</option>
-          <option v-for="model in models ?? []" :key="model.id" :value="model.id">
-            {{ model.name ? `${model.name} · ${model.id}` : model.id }}
-          </option>
-        </UiSelect>
-      </UiField>
+      <!-- The deployment's fallback: a fact under its label, not a control. -->
+      <div class="model fact">
+        <span class="fact-label">{{ t('agents.fallback.model') }}</span>
+        <span v-if="fallback" class="mono fact-value">{{ fallback }}</span>
+        <span v-else class="fact-value muted">{{ t('agents.fallback.none') }}</span>
+      </div>
       <button
         type="button"
         role="switch"
@@ -142,6 +105,35 @@ async function toggleAuto() {
 .model {
   flex: 1 1 14rem;
   min-width: 0;
+}
+
+/* The panel's fact treatment: the label, then the value where a control would be. */
+.fact {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.fact-label {
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.fact-value {
+  display: flex;
+  align-items: center;
+  min-height: var(--control-height-sm);
+  overflow: hidden;
+  font-size: var(--text-sm);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fact-value.muted {
+  color: var(--muted);
 }
 
 /* The memory section's switch: the words, then a square track whose knob says on or off. */

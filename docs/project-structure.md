@@ -10,7 +10,6 @@ agent-sightread/
         db/                   # engine, models, session helpers
         auth/                 # oidc.py, sessions.py, api_keys.py, oauth_as.py, crypto.py
         routes/               # v1.py (data plane), control.py (/api, incl. /api/agents),
-                              # kano.py (/api/kano — the Kano Proxy connect flow),
                               # library.py (/api/library — the web file library),
                               # chat.py (/api/conversations, /api/sandbox),
                               # attachments.py (/api/attachments), extensions.py
@@ -35,10 +34,9 @@ agent-sightread/
         sandbox/              # client.py: the HTTP client of the sandbox runner
         upstream/             # anthropic.py (Messages API over Kano Proxy, streaming,
                               # tools — the chat agent's client, docs/chat.md);
-                              # client.py (httpx client for Kano Proxy and user-defined
-                              # OpenAI-compatible connections: vision calls, model
-                              # catalogs, usage capture, backoff); kano.py (the connect
-                              # flow's authorize URL and token exchange)
+                              # client.py (httpx client for Kano Proxy's OpenAI-compatible
+                              # route: vision calls, the model catalog, usage capture,
+                              # backoff)
         jobs/                 # queue.py (claim/enqueue), intake.py (store/dedup/enqueue),
                               # runner.py, sweeper.py, events.py (SSE + event pairs),
                               # chat_runner.py (the chat agent's tool loop),
@@ -73,7 +71,7 @@ agent-sightread/
 
 - `routes/*` and `mcp/*` are thin: validation + auth + calls into `jobs`/`parsing` services. MCP owns zero business logic. `jobs/intake.py` is the shared sequence **all three** entry points run (store → hash → probe → dedup → enqueue), so REST, MCP and the web library's upload cannot drift apart — `routes/library.py` adds a name and a folder to the job that sequence returns, nothing more.
 - `parsing/poppler.py` is the **only** place that spawns Poppler; everything else consumes its typed results. No PDF library imports anywhere (AGPL ban, [parsing.md](./parsing.md)).
-- `upstream/` is the only package that talks to an upstream (Kano Proxy or a user-defined OpenAI-compatible connection): `client.py` for vision calls and catalogs, `anthropic.py` for the chat agent's Messages API calls — together the only modules that ever decrypt a stored user key — and `kano.py` for the connect flow, which receives a Kano Proxy key in plaintext and hands it straight to encryption.
+- `upstream/` is the only package that talks to the upstream, Kano Proxy on the operator's key: `client.py` for vision calls and the catalog, `anthropic.py` for the chat and check agents' Messages API calls — the only modules that ever read `KANO_PROXY_API_KEY`.
 - `workspace/` is the only package that touches `WORKSPACES_DIR` and the only one that runs git; `sandbox/client.py` is the only module that calls the runner. The runner (`apps/sandbox`) is the only process with the Docker socket.
 - `agents/` defines agents and nothing else: no HTTP, no database. Runners and settings consume its definitions ([agents.md](./agents.md)).
 - `jobs/queue.py` is the only module that knows the queue is Postgres.

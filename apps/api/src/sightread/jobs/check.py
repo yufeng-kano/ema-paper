@@ -120,16 +120,16 @@ async def run_check(
     markdown: str,
     on_usage: Callable[[CompletedMessage], Awaitable[None]],
 ) -> CheckOutcome:
-    """Check one assembled document. `connection` is the user's Kano Proxy on its
-    Anthropic-format route, None when it is not connected: needed only when the rules
-    leave a spot."""
+    """Check one assembled document. `connection` is Kano Proxy on its Anthropic-format
+    route, None when the deployment configures none: needed only when the rules leave a
+    spot."""
     lead, pages = joins.split_pages(markdown)
     joined = joins.sure_joins(pages)
     spots = joins.find_spots(pages)[: settings.check_spots_max]
     if not spots:
         return CheckOutcome(joins.render(lead, pages), joins=joined, edits=0)
     if connection is None:
-        raise CheckFailed("Kano Proxy is not connected")
+        raise CheckFailed("Kano Proxy is not configured on this deployment")
 
     messages: list[dict] = [{"role": "user", "content": _spots_message(spots)}]
     edits = 0
