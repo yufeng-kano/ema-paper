@@ -966,6 +966,46 @@ async def test_a_subagent_runs_on_its_own_model_and_stops_at_its_call_cap(
 
 
 @respx.mock
+async def test_a_subagent_on_an_unpriced_model_never_calls_it(chat_client) -> None:
+    """docs/billing.md § Models: a model nobody priced must never run for free — the
+    subagent answers an error result before its first call, and the turn goes on."""
+    created = await chat_client.post(
+        "/api/subagents",
+        json={
+            "name": "quick",
+            "description": "Fast reads",
+            "model": "vendor/unpriced-model",
+            "tools": ["view_page"],
+            "prompt": "Read fast.",
+        },
+        headers=CSRF_HEADERS,
+    )
+    assert created.status_code == 201, created.text
+    main, sub = stub_messages(
+        [
+            one_call("call", "subagent", {"name": "quick", "task": "Read page 1."}),
+            ([{"type": "text", "text": "Noted."}], "end_turn"),
+        ],
+        [([{"type": "text", "text": "Never sent."}], "end_turn")],
+    )
+    conversation_id = await new_conversation(chat_client)
+    await send(chat_client, conversation_id, text="Read")
+    await _run_queued_turn(chat_client)
+
+    assert (len(main), len(sub)) == (2, 0)
+    result = main[1]["messages"][2]["content"][0]
+    assert result["is_error"] and "vendor/unpriced-model is not priced" in result["content"]
+    thread = (await chat_client.get(f"/api/conversations/{conversation_id}")).json()
+    [turn] = thread["turns"]
+    assert turn["status"] == "succeeded"
+    async with chat_client.app.state.sessionmaker() as db:
+        models = (
+            await db.execute(select(UsageLog.model).where(UsageLog.agent == "chat"))
+        ).scalars()
+        assert set(models) == {"claude-code/claude-opus-5-5"}
+
+
+@respx.mock
 async def test_a_subagent_that_spends_the_balance_ends_the_turn(
     make_client, tmp_path, monkeypatch
 ) -> None:

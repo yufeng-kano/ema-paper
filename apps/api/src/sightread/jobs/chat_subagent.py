@@ -282,6 +282,14 @@ async def run_subagent(
 
     started = time.monotonic()
     model = definition.model or ctx.model
+    if model not in ctx.settings.model_prices:
+        # Never a call nobody priced (docs/billing.md § Models): the reader may save any
+        # id of the catalog for a subagent, and an unpriced one would run for nothing.
+        return chat_tools.ToolOutcome(
+            f"The subagent's model {model} is not priced on this deployment; give the "
+            "subagent another model, or none to run on the conversation's.",
+            is_error=True,
+        )
     # The shell only to one that may change files, and only where there is a sandbox: a
     # tool the harness cannot run is never offered (docs/chat.md § Subagents).
     shell = definition.writes and "bash" in definition.tools and ctx.sandbox is not None
