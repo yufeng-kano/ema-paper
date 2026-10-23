@@ -14,6 +14,7 @@ types (JSONB and timestamptz) precisely so this fallback stays honest.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
@@ -53,6 +54,24 @@ KANO_CLIENT_SECRET = "kano-client-secret-not-a-real-one"
 
 DATABASE_URL = os.environ.get("TEST_DATABASE_URL") or os.environ.get("DATABASE_URL")
 
+# USD per 1M tokens, every kind alike, for the models the tests chat on.
+TEST_MODEL_PRICES = json.dumps(
+    {
+        model: {"input": 1, "cache_read": 1, "cache_write": 1, "output": 1}
+        for model in (
+            "claude-code/claude-opus-5-5",
+            "claude-code/claude-opus-5",
+            "claude-code/claude-fallback-9",
+            "claude-code/claude-haiku-5-5",
+            "claude-opus-5-5",
+            "codex/gpt-5.5",
+            "vendor/chosen",
+            "vendor/vision-model",
+            "m",
+        )
+    }
+)
+
 
 @pytest_asyncio.fixture
 async def sessionmaker(tmp_path):
@@ -88,6 +107,11 @@ async def make_client(sessionmaker, tmp_path) -> AsyncIterator[Callable[..., Asy
                 "kano_proxy_base_url": KANO_BASE,
                 "kano_proxy_client_id": KANO_CLIENT_ID,
                 "kano_proxy_client_secret": KANO_CLIENT_SECRET,
+                # Every model a test turn runs on is priced, as the deployment requires
+                # of its offered models (docs/billing.md § Models): a flat list price so
+                # the credits a test sees are predictable. Tests of the arithmetic set
+                # their own.
+                "model_prices_json": TEST_MODEL_PRICES,
                 **overrides,
             }
         )

@@ -160,7 +160,7 @@ async def _run_one_guarded(
     """A tool that raises answers an error result, as the turn's own do."""
     try:
         return await _run_one(ctx, definition, block, malformed)
-    except (asyncio.CancelledError, chat_runner.TurnCancelled):
+    except (asyncio.CancelledError, chat_runner.TurnCancelled, chat_runner.TurnOutOfCredits):
         raise
     except Exception:  # noqa: BLE001 - any failure is this tool's, never the run's
         logger.exception("a subagent's %s failed in turn %s", block.get("name"), ctx.turn.id)
@@ -282,6 +282,14 @@ async def run_subagent(
 
     started = time.monotonic()
     model = definition.model or ctx.model
+    if model not in ctx.settings.model_prices:
+        # Never a call nobody priced (docs/billing.md § Models): the reader may save any
+        # id of the catalog for a subagent, and an unpriced one would run for nothing.
+        return chat_tools.ToolOutcome(
+            f"The subagent's model {model} is not priced on this deployment; give the "
+            "subagent another model, or none to run on the conversation's.",
+            is_error=True,
+        )
     # The shell only to one that may change files, and only where there is a sandbox: a
     # tool the harness cannot run is never offered (docs/chat.md § Subagents).
     shell = definition.writes and "bash" in definition.tools and ctx.sandbox is not None
@@ -320,6 +328,9 @@ async def run_subagent(
     while True:
         if await chat_runner._cancelled(ctx):
             raise chat_runner.TurnCancelled()
+        if ctx.credits_exhausted:
+            # Another call of the turn spent the balance meanwhile: no call on it.
+            raise chat_runner.TurnOutOfCredits()
         body = {
             "model": model,
             "max_tokens": ctx.settings.chat_max_output_tokens,
@@ -351,6 +362,8 @@ async def run_subagent(
         await chat_runner._record_usage_settled(ctx, completed)
         if await chat_runner._cancelled(ctx):
             raise chat_runner.TurnCancelled()
+        if ctx.credits_exhausted:
+            raise chat_runner.TurnOutOfCredits()
         if completed.model and completed.model != model:
             # A fallback answered: the blocks the run replays are that model's now.
             model = completed.model

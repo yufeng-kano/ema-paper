@@ -37,6 +37,7 @@ from starlette.formparsers import MultiPartException, MultiPartParser
 
 from ..agents import PARSE
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
+from ..billing import ledger
 from ..db.models import (
     ChatTurn,
     Conversation,
@@ -525,6 +526,7 @@ def document_payload(
     job: Job | None,
     failed: dict[uuid.UUID, int] | None = None,
     reconvert: Job | None = None,
+    credits: dict[uuid.UUID, int | None] | None = None,
 ) -> dict:
     """The row the file list draws: the entry, plus the live state of its parse and of
     its re-convert.
@@ -534,9 +536,11 @@ def document_payload(
     (`job` None) has no parse to report on: every parse field is null. `failed` holds
     what a retry of each failed parse would send (`failed_page_counts`); `checking` says
     a running parse is past its last page and being checked; `reconvert` is the parse
-    the row points at as its re-convert (docs/api.md).
+    the row points at as its re-convert (docs/api.md); `credits` what each parse cost
+    (`ledger.credits_by_job`, docs/billing.md § Routes).
     """
     failed = failed or {}
+    credits = credits or {}
     if job is None:
         return {
             "id": row.id,
@@ -555,6 +559,7 @@ def document_payload(
             "failed_pages": None,
             "checking": False,
             "reconvert": None,
+            "credits": None,
         }
     return {
         "id": row.id,
@@ -572,6 +577,7 @@ def document_payload(
         "finished_at": job.finished_at,
         "failed_pages": failed.get(job.id),
         "checking": is_checking(job),
+        "credits": credits.get(job.id),
         "reconvert": (
             None
             if reconvert is None
@@ -586,6 +592,7 @@ def document_payload(
                 "checking": is_checking(reconvert),
                 "created_at": reconvert.created_at,
                 "finished_at": reconvert.finished_at,
+                "credits": credits.get(reconvert.id),
             }
         ),
     }
@@ -627,7 +634,14 @@ async def read_document_payload(db: DbSession, row: Document) -> dict:
     """One row's payload, its parse and its re-convert read for it."""
     job = await job_of(db, row.job_id) if row.job_id is not None else None
     reconvert = await job_of(db, row.reconvert_job_id) if row.reconvert_job_id is not None else None
-    return document_payload(row, job, await failed_page_counts(db, [job, reconvert]), reconvert)
+    jobs = [job, reconvert]
+    return document_payload(
+        row,
+        job,
+        await failed_page_counts(db, jobs),
+        reconvert,
+        await ledger.credits_by_job(db, [one.id for one in jobs if one is not None]),
+    )
 
 
 # --- read ---------------------------------------------------------------------------------
@@ -675,7 +689,9 @@ async def read_library(user: SessionUser, db: DbSession):
         if pointed
         else {}
     )
-    failed = await failed_page_counts(db, [job for _, job in documents] + list(reconverts.values()))
+    every = [job for _, job in documents] + list(reconverts.values())
+    failed = await failed_page_counts(db, every)
+    credits = await ledger.credits_by_job(db, [job.id for job in every if job is not None])
 
     # The live rows are the library; the Trash lists what was trashed itself, never
     # what sits inside a trashed folder (docs/api.md).
@@ -702,7 +718,7 @@ async def read_library(user: SessionUser, db: DbSession):
     return {
         "folders": [folder_payload(row) for row in folders if row.id not in trashed],
         "documents": [
-            document_payload(row, job, failed, reconverts.get(row.reconvert_job_id))
+            document_payload(row, job, failed, reconverts.get(row.reconvert_job_id), credits)
             for row, job in documents
             if row.trashed_at is None and row.folder_id not in trashed
         ],
@@ -718,7 +734,9 @@ async def read_library(user: SessionUser, db: DbSession):
             ],
             "documents": [
                 {
-                    **document_payload(row, job, failed, reconverts.get(row.reconvert_job_id)),
+                    **document_payload(
+                        row, job, failed, reconverts.get(row.reconvert_job_id), credits
+                    ),
                     "trashed_at": row.trashed_at,
                     "origin": origin(row.folder_id),
                 }

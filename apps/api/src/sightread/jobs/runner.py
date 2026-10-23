@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from ..agents import CHECK, get_agent
 from ..agents.bbox import convention_for_job, prepare_image
 from ..agents.parse import FIGURE_CHECK_SINCE_PIPELINE
+from ..billing import ledger
 from ..config import Settings
 from ..db.models import EFFORT_DEFAULT, Document, Job, JobPage, Result, UsageLog, utcnow
 from ..errors import ApiError
@@ -936,6 +937,9 @@ async def _finish_held(
         job.status = status
         job.error = error
         job.finished_at = utcnow()
+        # The reservation settles with the state that says what the user got: consumed
+        # by a result, released by a failure, in this commit (docs/billing.md § A parse).
+        await ledger.settle_parse(db, job.id, status)
         documents: list[Document] = []
         if settings is not None:
             # Whatever the terminal state: a failed parse's row keeps its original as a

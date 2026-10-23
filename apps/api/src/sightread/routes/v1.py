@@ -25,6 +25,7 @@ from ..auth.deps import (
     TicketJobId,
     UploaderCaller,
 )
+from ..billing import ledger
 from ..db.models import Job, Result, User
 from ..errors import ApiError
 from ..jobs import events
@@ -171,7 +172,7 @@ async def _owned_job(db: DbSession, job_id: uuid.UUID, user: User) -> Job:
     return job
 
 
-def _status_payload(job: Job) -> dict:
+async def _status_payload(db: DbSession, job: Job) -> dict:
     return {
         "job_id": str(job.id),
         "status": job.status,
@@ -180,6 +181,8 @@ def _status_payload(job: Job) -> dict:
         "error": job.error,
         "created_at": job.created_at,
         "finished_at": job.finished_at,
+        # What the parse cost, once settled (docs/billing.md § Routes).
+        "credits": (await ledger.credits_by_job(db, [job.id])).get(job.id),
     }
 
 
@@ -203,7 +206,7 @@ async def last_job_status(job_id: TicketJobId, db: DbSession):
     job = (await db.execute(select(Job).where(Job.id == job_id))).scalar_one_or_none()
     if job is None:
         raise ApiError(404, "invalid_request", "No such job")
-    return _status_payload(job)
+    return await _status_payload(db, job)
 
 
 @router.get("/jobs/last/result")
@@ -218,7 +221,7 @@ async def last_job_markdown(job_id: TicketJobId, db: DbSession):
 
 @router.get("/jobs/{job_id}")
 async def job_status(job_id: uuid.UUID, user: JobReader, db: DbSession):
-    return _status_payload(await _owned_job(db, job_id, user))
+    return await _status_payload(db, await _owned_job(db, job_id, user))
 
 
 @router.get("/jobs/{job_id}/result")

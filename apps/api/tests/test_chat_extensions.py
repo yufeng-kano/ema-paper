@@ -966,6 +966,183 @@ async def test_a_subagent_runs_on_its_own_model_and_stops_at_its_call_cap(
 
 
 @respx.mock
+async def test_a_subagent_on_an_unpriced_model_never_calls_it(chat_client) -> None:
+    """docs/billing.md § Models: a model nobody priced must never run for free — the
+    subagent answers an error result before its first call, and the turn goes on."""
+    created = await chat_client.post(
+        "/api/subagents",
+        json={
+            "name": "quick",
+            "description": "Fast reads",
+            "model": "vendor/unpriced-model",
+            "tools": ["view_page"],
+            "prompt": "Read fast.",
+        },
+        headers=CSRF_HEADERS,
+    )
+    assert created.status_code == 201, created.text
+    main, sub = stub_messages(
+        [
+            one_call("call", "subagent", {"name": "quick", "task": "Read page 1."}),
+            ([{"type": "text", "text": "Noted."}], "end_turn"),
+        ],
+        [([{"type": "text", "text": "Never sent."}], "end_turn")],
+    )
+    conversation_id = await new_conversation(chat_client)
+    await send(chat_client, conversation_id, text="Read")
+    await _run_queued_turn(chat_client)
+
+    assert (len(main), len(sub)) == (2, 0)
+    result = main[1]["messages"][2]["content"][0]
+    assert result["is_error"] and "vendor/unpriced-model is not priced" in result["content"]
+    thread = (await chat_client.get(f"/api/conversations/{conversation_id}")).json()
+    [turn] = thread["turns"]
+    assert turn["status"] == "succeeded"
+    async with chat_client.app.state.sessionmaker() as db:
+        models = (
+            await db.execute(select(UsageLog.model).where(UsageLog.agent == "chat"))
+        ).scalars()
+        assert set(models) == {"claude-code/claude-opus-5-5"}
+
+
+@respx.mock
+async def test_a_subagent_that_spends_the_balance_ends_the_turn(
+    make_client, tmp_path, monkeypatch
+) -> None:
+    """docs/billing.md § A chat turn: the call that spends the balance is the turn's last,
+    a subagent's included — its result says so, and no call of the turn's own follows."""
+    # Each stubbed call carries 105 tokens at US$1 per million: 3 credits for the first
+    # at US$0.00005 a credit, 5 for the two together. Four granted: the turn's own call
+    # leaves one, the subagent's call overdraws.
+    client = await chatting_client(
+        make_client(
+            workspaces_dir=str(tmp_path / "workspaces"),
+            free_credits_per_period=4,
+            credit_usd="0.00005",
+        )
+    )
+    pages = fake_pages(monkeypatch)
+    created = await client.post(
+        "/api/subagents",
+        json={
+            "name": "quick",
+            "description": "Fast reads",
+            "model": "claude-code/claude-haiku-5-5",
+            "tools": ["view_page"],
+            "prompt": "Read fast.",
+        },
+        headers=CSRF_HEADERS,
+    )
+    assert created.status_code == 201, created.text
+    main, sub = stub_messages(
+        [
+            one_call("call", "subagent", {"name": "quick", "task": "Read page 1."}),
+            ([{"type": "text", "text": "Never sent."}], "end_turn"),
+        ],
+        [
+            one_call("p1", "view_page", {"page": 1}),
+            ([{"type": "text", "text": "Never sent either."}], "end_turn"),
+        ],
+    )
+    conversation_id = await new_conversation(client)
+    await send(client, conversation_id, text="Read")
+    await _run_queued_turn(client)
+
+    # One call each: the subagent's spent the balance, and neither made another.
+    assert (len(main), len(sub), pages) == (1, 1, [])
+    thread = (await client.get(f"/api/conversations/{conversation_id}")).json()
+    [turn] = thread["turns"]
+    assert (turn["status"], turn["error"], turn["credits"]) == ("failed", "out_of_credits", 5)
+    result = thread["messages"][2]["content"][0]
+    assert result["is_error"] and result["content"] == chat_runner.OUT_OF_CREDITS
+
+
+@respx.mock
+async def test_a_write_waiting_when_a_subagent_spends_the_balance_is_not_started(
+    make_client, tmp_path, monkeypatch
+) -> None:
+    """docs/billing.md § A chat turn: a tool of the round not yet started when the balance
+    is spent answers an error result; the write already running finishes."""
+    client = await chatting_client(
+        make_client(
+            workspaces_dir=str(tmp_path / "workspaces"),
+            free_credits_per_period=4,
+            credit_usd="0.00005",
+        )
+    )
+    created = await client.post(
+        "/api/subagents",
+        json={
+            "name": "quick",
+            "description": "Fast reads",
+            "model": "claude-code/claude-haiku-5-5",
+            "tools": ["view_page"],
+            "prompt": "Read fast.",
+        },
+        headers=CSRF_HEADERS,
+    )
+    assert created.status_code == 201, created.text
+    writes: list[str] = []
+
+    async def run_mutating(ctx, name, tool_input):
+        # The first write of the round runs until the subagent beside it has spent the
+        # balance, so the second is still waiting its turn when that happens.
+        writes.append(tool_input["path"])
+        for _ in range(200):
+            if ctx.credits_exhausted:
+                break
+            await asyncio.sleep(0.05)
+        return chat_tools.ToolOutcome("written")
+
+    monkeypatch.setattr(chat_runner, "run_mutating", run_mutating)
+    main, sub = stub_messages(
+        [
+            (
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "call",
+                        "name": "subagent",
+                        "input": {"name": "quick", "task": "Read page 1."},
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "w1",
+                        "name": "str_replace_based_edit_tool",
+                        "input": {"command": "create", "path": "a.md", "file_text": "a"},
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "w2",
+                        "name": "str_replace_based_edit_tool",
+                        "input": {"command": "create", "path": "b.md", "file_text": "b"},
+                    },
+                ],
+                "tool_use",
+            ),
+            ([{"type": "text", "text": "Never sent."}], "end_turn"),
+        ],
+        [one_call("p1", "view_page", {"page": 1})],
+    )
+    conversation_id = await new_conversation(client)
+    await send(client, conversation_id, text="Write")
+    await _run_queued_turn(client)
+
+    assert (len(main), len(sub), writes) == (1, 1, ["a.md"])
+    thread = (await client.get(f"/api/conversations/{conversation_id}")).json()
+    [turn] = thread["turns"]
+    assert (turn["status"], turn["error"]) == ("failed", "out_of_credits")
+    results = thread["messages"][2]["content"]
+    assert [(block.get("is_error", False), block["content"]) for block in results] == [
+        (True, chat_runner.OUT_OF_CREDITS),
+        (False, "written"),
+        (True, chat_runner.NOT_RUN_OUT_OF_CREDITS),
+    ]
+    billing = (await client.get("/api/billing")).json()
+    assert (billing["period"]["spent"], billing["period"]["remaining"]) == (5, -1)
+
+
+@respx.mock
 async def test_a_stop_reaches_a_subagent_inside_its_run(chat_client, monkeypatch) -> None:
     client = chat_client
     pages = fake_pages(monkeypatch)
