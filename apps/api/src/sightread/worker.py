@@ -110,6 +110,8 @@ async def run_worker(stop: asyncio.Event) -> None:
     # the cleanup has gone through, and no parse of theirs, since a parse finishing
     # writes their tree too (docs/jobs.md § Chat turns).
     orphaned_users: set[int] = set()
+    # The per-user parse cap the claim applies (docs/billing.md § Plans).
+    plan_jobs = {plan_id: plan.max_jobs for plan_id, plan in settings.plans.items()}
     logger.info("worker started; %d render slots", render_count)
     prefer_turns = False
 
@@ -158,7 +160,12 @@ async def run_worker(stop: asyncio.Event) -> None:
                         turn_id = await claim_next_turn(db, settings.max_chat_turns_per_user)
                     if turn_id is None:
                         job_id = await claim_next_job(
-                            db, settings.max_jobs_per_user, orphaned_users, generation
+                            db,
+                            settings.max_jobs_per_user,
+                            orphaned_users,
+                            generation,
+                            plan_jobs=plan_jobs,
+                            free_max_jobs=settings.free_max_jobs,
                         )
                     if job_id is None and turn_id is None and not (prefer_turns or orphans_pending):
                         turn_id = await claim_next_turn(db, settings.max_chat_turns_per_user)

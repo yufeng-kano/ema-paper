@@ -22,16 +22,11 @@ import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings
-from ..db.models import Subscription, utcnow
+from ..db.models import Checkout, Subscription, utcnow
+from .plans import PAID_STATUSES
 
 logger = logging.getLogger(__name__)
 
-REQUEST_TIMEOUT_SECONDS = 15.0
-# How far a notification's timestamp may be from ours before it is refused as a replay.
-SIGNATURE_TOLERANCE_SECONDS = 300
-# One answer from Pay serves every catalog read for this long (docs/billing.md § Kano Pay).
-CATALOG_TTL_SECONDS = 300
-EVENT_MAX_BYTES = 65_536
 STATUSES = frozenset(
     {
         "active",
@@ -165,6 +160,8 @@ class PayClient:
     def __init__(self, settings: Settings) -> None:
         self.url = settings.kano_pay_url
         self.app_id = settings.kano_pay_app_id
+        self.timeout = settings.kano_pay_timeout_seconds
+        self.catalog_ttl = settings.kano_pay_catalog_ttl_seconds
         self._headers = {
             "Authorization": f"Bearer {settings.kano_pay_api_key}",
             "X-App-Id": settings.kano_pay_app_id,
@@ -174,7 +171,7 @@ class PayClient:
         self, method: str, path: str, *, json: dict | None = None, headers: dict | None = None
     ) -> dict:
         try:
-            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.request(
                     method,
                     f"{self.url}{path}",
@@ -253,8 +250,8 @@ class PayClient:
 
 
 class CatalogCache:
-    """Pay's catalog remembered for `CATALOG_TTL_SECONDS`, shared by the public catalog
-    route and the signed-in billing view; an answer that failed is not remembered."""
+    """Pay's catalog remembered for `KANO_PAY_CATALOG_TTL_SECONDS`, shared by the public
+    catalog route and the signed-in billing view; an answer that failed is not remembered."""
 
     def __init__(self) -> None:
         self._value: Catalog | None = None
@@ -265,7 +262,7 @@ class CatalogCache:
         if self._value is not None and now < self._until:
             return self._value
         self._value = await client.catalog()
-        self._until = now + CATALOG_TTL_SECONDS
+        self._until = now + client.catalog_ttl
         return self._value
 
     def clear(self) -> None:
@@ -285,14 +282,17 @@ def sign(secret: str, timestamp: int, raw: bytes) -> str:
     return f"ts={timestamp};h1={digest.hexdigest()}"
 
 
-def verify_signature(header: str | None, raw: bytes, secret: str, now: float) -> bool:
+def verify_signature(
+    header: str | None, raw: bytes, secret: str, now: float, tolerance: int
+) -> bool:
     """`ts=<unix seconds>;h1=<hex HMAC-SHA256>` over `<ts>.<raw body>`, compared in
-    constant time, the timestamp within tolerance (docs/billing.md § Kano Pay)."""
+    constant time, the timestamp within `tolerance` seconds of `now` (docs/billing.md
+    § Kano Pay)."""
     match = _SIGNATURE.match(header or "")
     if match is None:
         return False
     timestamp = int(match.group(1))
-    if abs(now - timestamp) > SIGNATURE_TOLERANCE_SECONDS:
+    if abs(now - timestamp) > tolerance:
         return False
     expected = hmac.new(secret.encode(), f"{timestamp}.".encode() + raw, hashlib.sha256)
     return hmac.compare_digest(expected.hexdigest(), match.group(2))
@@ -318,3 +318,22 @@ async def write_subscription(db: AsyncSession, user_id: int, canonical: PaySubsc
     row.updated_at = utcnow()
     await db.flush()
     return True
+
+
+async def apply_canonical(db: AsyncSession, user_id: int, canonical: PaySubscription) -> bool:
+    """What Pay's canonical answer changes here, whichever way it arrived — the webhook
+    or a refresh: the subscription row (`write_subscription`), and the user's open
+    checkout marked completed when the answer is a paid subscription updated after the
+    checkout was opened — the purchase that checkout started. The caller holds the
+    user's row lock and commits. Returns whether the subscription row changed."""
+    written = await write_subscription(db, user_id, canonical)
+    checkout = await db.get(Checkout, user_id)
+    if (
+        checkout is not None
+        and checkout.completed_at is None
+        and canonical.status in PAID_STATUSES
+        and checkout.created_at <= datetime.fromtimestamp(canonical.version / 1000, tz=UTC)
+    ):
+        checkout.completed_at = utcnow()
+        await db.flush()
+    return written

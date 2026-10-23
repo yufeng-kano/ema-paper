@@ -52,7 +52,10 @@ async def _refresh(
     except (pay.PayUnavailable, pay.PayRefused) as exc:
         logger.warning("billing refresh of user %d failed: %s", user_id, exc)
         return False
-    if canonical is not None and await pay.write_subscription(db, user_id, canonical):
+    if canonical is not None:
+        # The same write the webhook makes, under the same lock.
+        await db.execute(select(User.id).where(User.id == user_id).with_for_update())
+        await pay.apply_canonical(db, user_id, canonical)
         await db.commit()
     stamps[user_id] = now
     return True
@@ -143,7 +146,7 @@ async def catalog(request: Request, response: Response, settings: AppSettings):
         response.headers["Cache-Control"] = "no-store"
         return {"available": False, "plans": []}
     enabled, plans = sale
-    response.headers["Cache-Control"] = f"public, max-age={pay.CATALOG_TTL_SECONDS}"
+    response.headers["Cache-Control"] = f"public, max-age={settings.kano_pay_catalog_ttl_seconds}"
     return {
         "available": enabled and bool(plans),
         "plans": [
@@ -244,13 +247,14 @@ async def pay_webhook(request: Request, db: DbSession, settings: AppSettings):
     if not settings.kano_pay_configured:
         raise ApiError(503, "pay_unavailable", "Billing is not configured")
     raw = await request.body()
-    if len(raw) > pay.EVENT_MAX_BYTES:
+    if len(raw) > settings.kano_pay_event_max_bytes:
         raise ApiError(413, "invalid_request", "Event too large")
     if not pay.verify_signature(
         request.headers.get("Kano-Pay-Signature"),
         raw,
         settings.kano_pay_webhook_secret,
         time.time(),
+        settings.kano_pay_signature_tolerance_seconds,
     ):
         raise ApiError(401, "auth", "Invalid signature")
     try:
@@ -292,18 +296,7 @@ async def pay_webhook(request: Request, db: DbSession, settings: AppSettings):
         await db.rollback()
         return {}
     db.add(PayEvent(id=event_id, type=event_type, user_id=user_id))
-    await pay.write_subscription(db, user_id, canonical)
-    checkout_row = await db.get(Checkout, user_id)
-    if (
-        checkout_row is not None
-        and checkout_row.completed_at is None
-        and canonical.status
-        in (
-            "active",
-            "trialing",
-        )
-    ):
-        checkout_row.completed_at = utcnow()
+    await pay.apply_canonical(db, user_id, canonical)
     await db.commit()
     request.app.state.pay_refreshed[user_id] = time.monotonic()
     return {}

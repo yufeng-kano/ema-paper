@@ -38,6 +38,11 @@ def _ms(when: datetime) -> int:
     return int(when.timestamp() * 1000)
 
 
+# Pay's `version` is the subscription's last update in milliseconds: the ones the tests
+# answer with sit a minute ahead of every checkout they complete, counted from here.
+VERSION_BASE = _ms(datetime.now(UTC)) + 60_000
+
+
 def canonical(
     user_id: int,
     *,
@@ -59,7 +64,7 @@ def canonical(
             "periodStart": _ms(now - timedelta(days=1)),
             "periodEnd": _ms(now + timedelta(days=29)),
             "cancelAtPeriodEnd": cancel,
-            "version": version,
+            "version": VERSION_BASE + version,
             "active": status == "active",
         }
     }
@@ -135,19 +140,20 @@ def test_the_signature_covers_the_timestamp_and_the_exact_bytes() -> None:
     raw = b'{"id":"evt"}'
     now = 1_700_000_000
     header = pay.sign("secret", now, raw)
-    assert pay.verify_signature(header, raw, "secret", now + 100)
-    assert pay.verify_signature(header, raw, "secret", now - 300)
+    assert pay.verify_signature(header, raw, "secret", now + 100, 300)
+    assert pay.verify_signature(header, raw, "secret", now - 300, 300)
     # One byte more and the signature no longer covers the body; another key, another
     # timestamp, or a timestamp past the tolerance, and it is refused.
-    assert not pay.verify_signature(header, raw + b" ", "secret", now)
-    assert not pay.verify_signature(header, raw, "other", now)
-    assert not pay.verify_signature(header, raw, "secret", now + 301)
+    assert not pay.verify_signature(header, raw + b" ", "secret", now, 300)
+    assert not pay.verify_signature(header, raw, "other", now, 300)
+    assert not pay.verify_signature(header, raw, "secret", now + 301, 300)
+    assert not pay.verify_signature(header, raw, "secret", now + 100, 60)
     assert not pay.verify_signature(
-        header.replace(f"ts={now}", f"ts={now + 1}"), raw, "secret", now
+        header.replace(f"ts={now}", f"ts={now + 1}"), raw, "secret", now, 300
     )
-    assert not pay.verify_signature(None, raw, "secret", now)
-    assert not pay.verify_signature("ts=1;h1=zz", raw, "secret", now)
-    assert not pay.verify_signature(header.upper(), raw, "secret", now)
+    assert not pay.verify_signature(None, raw, "secret", now, 300)
+    assert not pay.verify_signature("ts=1;h1=zz", raw, "secret", now, 300)
+    assert not pay.verify_signature(header.upper(), raw, "secret", now, 300)
 
 
 # --- the webhook ------------------------------------------------------------------------
@@ -177,7 +183,7 @@ async def test_a_notification_is_written_from_the_canonical_fetch_not_its_body(
     assert (row.plan_id, row.status, row.version, row.subscription_id) == (
         "pro",
         "active",
-        7,
+        VERSION_BASE + 7,
         "sub_canonical",
     )
     assert await _events(client) == ["evt_1"]
@@ -221,11 +227,11 @@ async def test_a_duplicate_event_id_is_answered_without_a_second_write(make_clie
     # The same delivery again: 200, and Pay is not asked a second time.
     assert (await _notify(client, _event(user_id, "evt_1"))).status_code == 200
     assert fetch.call_count == 1
-    assert (await _row(client, user_id)).version == 1
+    assert (await _row(client, user_id)).version == VERSION_BASE + 1
     # A new event id is a new fetch.
     assert (await _notify(client, _event(user_id, "evt_2"))).status_code == 200
     row = await _row(client, user_id)
-    assert (row.version, row.cancel_at_period_end) == (2, True)
+    assert (row.version, row.cancel_at_period_end) == (VERSION_BASE + 2, True)
     assert await _events(client) == ["evt_1", "evt_2"]
 
 
@@ -244,7 +250,7 @@ async def test_a_stale_version_never_rolls_access_backwards(make_client) -> None
     assert (await _notify(client, _event(user_id, "evt_3"))).status_code == 200
 
     row = await _row(client, user_id)
-    assert (row.version, row.status) == (5, "active")
+    assert (row.version, row.status) == (VERSION_BASE + 5, "active")
     assert await _events(client) == ["evt_3", "evt_5"]
     assert await _plan_shown(client) == "pro"
 
@@ -328,7 +334,7 @@ async def test_a_notification_that_is_not_about_a_user_of_this_app_is_refused(
         client,
         json.dumps({"type": "subscription.updated", "subscription": {}}).encode(),
     )
-    too_big = await _notify(client, b" " * (pay.EVENT_MAX_BYTES + 1))
+    too_big = await _notify(client, b" " * (client.app.state.settings.kano_pay_event_max_bytes + 1))
 
     assert other_app.status_code == 400
     assert unknown_subject.status_code == 404
@@ -396,6 +402,46 @@ async def test_a_checkout_keeps_its_idempotency_key_across_a_retry(make_client) 
         "/api/billing/checkout", json={"plan_id": "pro"}, headers=CSRF_HEADERS
     )
     assert third.status_code == 200
+    assert create.calls[-1].request.headers["Idempotency-Key"] != key
+
+
+@respx.mock
+async def test_a_refresh_completes_the_checkout_a_missed_notification_left_open(
+    make_client,
+) -> None:
+    """The purchase lands, the webhook never arrives: the billing view's refresh writes
+    the subscription and closes the checkout, so a later purchase of the same plan is
+    a new checkout, not the consumed one's key sent again."""
+    client = make_client(**PAY_SETTINGS)
+    user_id = await _signed_in(client)
+    respx.get(CATALOG_URL).mock(return_value=httpx.Response(200, json=catalog()))
+    create = respx.post(CHECKOUTS_URL).mock(
+        return_value=httpx.Response(
+            200, json={"checkoutUrl": f"{PAY_URL}/checkout/cks_1", "transactionId": "cks_1"}
+        )
+    )
+    opened = await client.post(
+        "/api/billing/checkout", json={"plan_id": "pro"}, headers=CSRF_HEADERS
+    )
+    assert opened.status_code == 200, opened.text
+    key = create.calls[0].request.headers["Idempotency-Key"]
+
+    # A subscription updated before the checkout was opened does not complete it.
+    fetch = respx.get(f"{SUBSCRIPTIONS_URL}{user_id}").mock(
+        return_value=httpx.Response(200, json=canonical(user_id, version=-120_000))
+    )
+    assert (await client.get("/api/billing")).json()["plan"]["id"] == "pro"
+    assert (await _checkout_row(client, user_id)).completed_at is None
+    # One updated after it does.
+    client.app.state.pay_refreshed.clear()
+    fetch.mock(return_value=httpx.Response(200, json=canonical(user_id, version=1)))
+    assert (await client.get("/api/billing")).json()["plan"]["id"] == "pro"
+    assert (await _checkout_row(client, user_id)).completed_at is not None
+
+    again = await client.post(
+        "/api/billing/checkout", json={"plan_id": "pro"}, headers=CSRF_HEADERS
+    )
+    assert again.status_code == 200, again.text
     assert create.calls[-1].request.headers["Idempotency-Key"] != key
 
 
@@ -769,3 +815,55 @@ async def test_the_plan_sets_the_storage_the_usage_shows(make_client, tmp_path) 
     # Never past the deployment's ceiling.
     client.app.state.settings.workspace_quota_bytes = 1_000_000
     assert (await client.get("/api/sandbox")).json()["workspace"]["quota_bytes"] == 1_000_000
+
+
+async def test_the_claim_applies_the_users_plan_cap_as_it_stands(make_client, sessionmaker) -> None:
+    """Two queued parses of a Free user: the worker runs one at a time, whatever the
+    deployment's ceiling; on Pro, the plan's two — until the paid period is over."""
+    from sightread.jobs.queue import claim_next_job
+
+    client = make_client(**PAY_SETTINGS)
+    user_id = await _signed_in(client)
+    async with sessionmaker() as db:
+        for index in range(3):
+            db.add(
+                Job(
+                    user_id=user_id,
+                    kind="pdf",
+                    filename=f"queued-{index}.pdf",
+                    media_type="application/pdf",
+                    size_bytes=10,
+                    sha256=str(index) * 64,
+                    pages_spec="",
+                    model=MODEL,
+                    agent="parse",
+                    pipeline_version=1,
+                    bbox_format="yxyx_norm1000",
+                    status="queued",
+                    page_count=1,
+                )
+            )
+        await db.commit()
+    plan_jobs = {"pro": 2}
+
+    async def claim():
+        async with sessionmaker() as db:
+            return await claim_next_job(db, 2, plan_jobs=plan_jobs, free_max_jobs=1)
+
+    assert await claim() is not None
+    assert await claim() is None  # Free: one running, the second waits
+
+    await grant_plan(sessionmaker, user_id)
+    assert await claim() is not None  # Pro: two
+    assert await claim() is None  # the ceiling and the plan alike
+
+    # The paid period over, the stored row grants nothing: back to one at a time.
+    async with sessionmaker() as db:
+        for job in (await db.execute(select(Job).where(Job.user_id == user_id))).scalars():
+            if job.status == "running":
+                job.status = "queued"
+        row = await db.get(Subscription, user_id)
+        row.period_end = datetime.now(UTC) - timedelta(seconds=1)
+        await db.commit()
+    assert await claim() is not None
+    assert await claim() is None

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import re
 import uuid
@@ -21,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 
 from ..agents import get_agent
 from ..billing import ledger
+from ..billing.plans import PAID_STATUSES
 from ..config import Settings
 from ..db.models import (
     WORKER_GENERATION_SEQ,
@@ -53,8 +55,11 @@ ORPHAN_REVISION_MESSAGE = "bash: interrupted by a worker restart"
 UNSETTLED_REVISION_MESSAGE = "bash: recovered after an unconfirmed command"
 
 # PostgreSQL claim (docs/jobs.md). The correlated count applies the per-user running cap
-# to the same scan that picks the oldest queued job; the generation is the claimer's
-# fence on every later write to the row.
+# to the same scan that picks the oldest queued job: the user's plan's parses at once —
+# their paid `subscriptions` row as it stands now, joined to `:plan_jobs` (`{plan id:
+# maxJobs}`), Free's `:free_max_jobs` otherwise — under the deployment's
+# `:max_jobs_per_user` (docs/billing.md § Plans). The generation is the claimer's fence
+# on every later write to the row.
 CLAIM_SQL = text(
     """
     UPDATE jobs SET status = 'running', started_at = now(), worker_generation = :generation
@@ -65,13 +70,25 @@ CLAIM_SQL = text(
         AND (
           SELECT count(*) FROM jobs running
           WHERE running.user_id = j.user_id AND running.status = 'running'
-        ) < :max_jobs_per_user
+        ) < LEAST(
+          :max_jobs_per_user,
+          COALESCE(
+            (
+              SELECT (CAST(:plan_jobs AS jsonb) ->> s.plan_id)::int FROM subscriptions s
+              WHERE s.user_id = j.user_id AND s.status IN :paid_statuses
+                AND s.period_start <= :now AND :now < s.period_end
+            ),
+            :free_max_jobs
+          )
+        )
       ORDER BY j.created_at
       FOR UPDATE SKIP LOCKED LIMIT 1
     )
     RETURNING id
     """
-).bindparams(bindparam("excluded_users", expanding=True))
+).bindparams(
+    bindparam("excluded_users", expanding=True), bindparam("paid_statuses", expanding=True)
+)
 
 # SQLite has neither SKIP LOCKED nor row locks. The fallback keeps the whole test suite
 # runnable with no services; the guarded UPDATE still makes a double claim impossible.
@@ -83,10 +100,22 @@ CLAIM_SQL_SQLITE_SELECT = text(
       AND (
         SELECT count(*) FROM jobs running
         WHERE running.user_id = j.user_id AND running.status = 'running'
-      ) < :max_jobs_per_user
+      ) < MIN(
+        :max_jobs_per_user,
+        COALESCE(
+          (
+            SELECT json_extract(:plan_jobs, '$."' || s.plan_id || '"') FROM subscriptions s
+            WHERE s.user_id = j.user_id AND s.status IN :paid_statuses
+              AND s.period_start <= :now AND :now < s.period_end
+          ),
+          :free_max_jobs
+        )
+      )
     ORDER BY j.created_at LIMIT 1
     """
-).bindparams(bindparam("excluded_users", expanding=True))
+).bindparams(
+    bindparam("excluded_users", expanding=True), bindparam("paid_statuses", expanding=True)
+)
 
 _PAGES_SPEC_RE = re.compile(r"^\d+(-\d+)?(,\d+(-\d+)?)*$")
 
@@ -309,18 +338,27 @@ async def claim_next_job(
     max_jobs_per_user: int,
     excluded_users: set[int] | None = None,
     generation: int | None = None,
+    *,
+    plan_jobs: dict[str, int] | None = None,
+    free_max_jobs: int | None = None,
 ) -> uuid.UUID | None:
-    """Claim the oldest queued job whose user is under the running cap, or None. A user
-    in `excluded_users` — one whose orphaned turn the worker could not stop yet — gets
-    no parse run, since its finish writes that user's tree (docs/jobs.md § Chat turns).
-    `generation` is the claimer's (`next_worker_generation`), written on the row: the
-    fence every write it makes to the job carries, so a worker that lost the worker
-    lock cannot write over the one that took the job (docs/jobs.md § Queue)."""
+    """Claim the oldest queued job whose user is under their running cap, or None: the
+    plan's parses at once (`plan_jobs` by plan id for a paid period, `free_max_jobs`
+    otherwise; the ceiling alone when neither is given) under `max_jobs_per_user`. A
+    user in `excluded_users` — one whose orphaned turn the worker could not stop yet —
+    gets no parse run, since its finish writes that user's tree (docs/jobs.md § Chat
+    turns). `generation` is the claimer's (`next_worker_generation`), written on the
+    row: the fence every write it makes to the job carries, so a worker that lost the
+    worker lock cannot write over the one that took the job (docs/jobs.md § Queue)."""
     # No user id is 0: the sentinel keeps the clause well-formed when nobody is excluded.
     params = {
         "max_jobs_per_user": max_jobs_per_user,
         "excluded_users": sorted(excluded_users or ()) or [0],
         "generation": generation,
+        "plan_jobs": json.dumps(plan_jobs or {}),
+        "paid_statuses": sorted(PAID_STATUSES),
+        "free_max_jobs": max_jobs_per_user if free_max_jobs is None else free_max_jobs,
+        "now": utcnow(),
     }
     if db.get_bind().dialect.name == "postgresql":
         claimed = (await db.execute(CLAIM_SQL, params)).scalar_one_or_none()
