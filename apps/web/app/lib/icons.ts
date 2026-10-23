@@ -26,6 +26,7 @@ export type IconName =
   | 'globe'
   | 'settings'
   | 'user'
+  | 'credit-card'
   | 'sun'
   | 'moon'
   | 'monitor'

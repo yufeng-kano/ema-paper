@@ -10,7 +10,7 @@ import {
   type LibraryDocument,
   type LibraryFolder,
 } from '~/lib/api'
-import { formatShortDateTime } from '~/lib/format'
+import { formatCount, formatShortDateTime } from '~/lib/format'
 import type { FolderId } from '~/lib/library'
 import type { MenuItem, Point } from '~/lib/menu'
 import type { TableColumn } from '~/lib/table'
@@ -107,6 +107,7 @@ const columns = computed<TableColumn<JobSummary>[]>(() => [
   { key: 'status', header: t('history.columnStatus') },
   { key: 'model', header: t('history.columnModel') },
   { key: 'pages', header: t('history.columnPages'), numeric: true, width: '80px' },
+  { key: 'credits', header: t('history.columnCredits'), numeric: true, width: '90px' },
   { key: 'created', header: t('history.columnCreated'), numeric: true },
 ])
 
@@ -357,6 +358,11 @@ async function showResult(job: JobSummary) {
           </template>
           <template #cell-pages="{ row }">
             {{ row.page_count ? `${row.pages_done}/${row.page_count}` : row.pages_done }}
+          </template>
+          <!-- What the parse cost; empty while its reservation is unsettled or for a job from
+               before the ledger (docs/billing.md § Routes). -->
+          <template #cell-credits="{ row }">
+            <span class="tabular">{{ row.credits == null ? '' : formatCount(row.credits, locale) }}</span>
           </template>
           <template #cell-created="{ row }">
             <span class="created">{{ formatShortDateTime(row.created_at, locale) }}</span>

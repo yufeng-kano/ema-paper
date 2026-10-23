@@ -16,6 +16,7 @@
  * Full-bleed, so the page owns its frame rather than sitting in a layout.
  */
 import { devLogin, isDevLoginAvailable } from '~/lib/api'
+import { takeAfterSignIn } from '~/lib/settings'
 
 definePageMeta({ layout: false })
 
@@ -45,9 +46,10 @@ const year = String(new Date().getFullYear())
 onMounted(async () => {
   await auth.ensureLoaded()
   // The OAuth callback redirects to the web root, so this is the hop that lands a signed-in
-  // visitor in the app. No signed-in variant of this page exists to fall back to.
+  // visitor in the app — on Files, or where the pricing page's Upgrade was going. No
+  // signed-in variant of this page exists to fall back to.
   if (auth.signedIn.value) {
-    await navigateTo(localePath('/files'))
+    await navigateTo(takeAfterSignIn() ?? localePath('/files'))
     return
   }
   devLoginAvailable.value = await isDevLoginAvailable()
@@ -59,7 +61,7 @@ async function signInAsDeveloper() {
   try {
     await devLogin()
     await auth.refresh()
-    await navigateTo(localePath('/files'))
+    await navigateTo(takeAfterSignIn() ?? localePath('/files'))
   } catch (error) {
     devLoginError.value = await resolve(error)
   } finally {
@@ -145,6 +147,7 @@ async function signInAsDeveloper() {
         <!-- Each option is written in its own language, so it is legible whichever catalog
              is loaded. Real links: the locale lives in the URL, so the choice is
              bookmarkable and works without JavaScript on this prerendered page. -->
+        <NuxtLink class="locale" :to="localePath('/pricing')">{{ t('login.pricing') }}</NuxtLink>
         <nav class="locales" :aria-label="t('nav.language')">
           <NuxtLink
             v-for="option in locales"
