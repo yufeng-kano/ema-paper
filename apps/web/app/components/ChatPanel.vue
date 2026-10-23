@@ -404,6 +404,11 @@ function applyMemoryFrames(frames: readonly StreamedEvent[], live: (turnId: stri
 
 onMounted(loadMemories)
 
+/** A memory pinned, edited or deleted in the settings dialog over this panel: the dialog
+ *  keeps the panel mounted, so the change is read here rather than on a remount. */
+const { version: contextVersion } = useAgentContextVersion()
+watch(contextVersion, () => void memoriesChanged())
+
 /** The floating card a memory line's **View** or a part of the *Used* line opened, and the
  *  control that opened it — where it stands, and where focus goes back to. */
 const card = ref<{ key: string; anchor: HTMLElement; view: ContextCardView } | null>(null)

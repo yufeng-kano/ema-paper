@@ -106,8 +106,9 @@ function onAccountAction(action: string) {
   }
 }
 
-// Following a menu item navigates; the route change is what closes the menu.
-watch(() => route.path, () => {
+// Following a menu item navigates; the route change is what closes the menu. The full
+// path, since Settings navigates by query alone.
+watch(() => route.fullPath, () => {
   accountMenu.value = null
 })
 
@@ -124,8 +125,10 @@ function isDrawerLayout(): boolean {
   return typeof matchMedia !== 'undefined' && matchMedia('(max-width: 900px)').matches
 }
 
-// A destination the user just picked is behind the drawer they picked it from.
-watch(() => route.path, () => {
+// A destination the user just picked is behind the drawer they picked it from — the
+// settings dialog too, which opens by query from the drawer's account menu and is teleported
+// outside the drawer, where the drawer's focus trap would otherwise hold Tab.
+watch(() => route.fullPath, () => {
   drawerOpen.value = false
 })
 
