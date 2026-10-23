@@ -69,3 +69,6 @@ ignore = [
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "own_catalog: the test stubs Kano Proxy's model catalog itself (conftest.kano_catalog)",
+]

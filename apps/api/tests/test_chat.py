@@ -224,6 +224,7 @@ async def test_chat_settings_refuse_unoffered_models_and_validate_effort(chattin
     assert chat["output"] == "edits"
 
 
+@pytest.mark.own_catalog
 @respx.mock
 async def test_the_chat_catalog_lists_the_offered_models_the_catalog_confirms(chatting) -> None:
     """`CHAT_MODELS` in the operator's order, only those Kano Proxy still lists
@@ -437,6 +438,37 @@ async def test_a_refusal_fails_the_turn_and_a_cancel_stops_it(chatting) -> None:
             .all()
         )
     assert "cancelled" in statuses
+
+
+@pytest.mark.own_catalog
+@respx.mock
+async def test_a_first_message_needs_a_model_the_catalog_still_serves(chatting) -> None:
+    """The pick is in CHAT_MODELS but Kano Proxy dropped it: refused before it is fixed
+    on the conversation; a catalog that cannot be read is the upstream's failure."""
+    document_id = chatting.document_id
+    conversation_id = (
+        await chatting.post(
+            f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    respx.get(MODELS_URL).mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "codex/gpt-5.5"}]})
+    )
+    dropped = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
+    )
+    assert dropped.status_code == 400
+    assert dropped.json()["error"]["message"] == (
+        "That model is no longer served: pick another on the Agent page"
+    )
+    respx.get(MODELS_URL).mock(return_value=httpx.Response(500))
+    unreadable = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
+    )
+    assert unreadable.status_code == 502
+    async with chatting.app.state.sessionmaker() as db:
+        assert (await db.get(Conversation, conversation_id)).model is None
+        assert (await db.execute(select(ChatTurn.id))).all() == []
 
 
 async def test_messages_need_an_offered_model_and_a_configured_kano_proxy(

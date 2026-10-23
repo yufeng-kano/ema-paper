@@ -74,6 +74,7 @@ async def test_the_parse_and_check_models_are_the_deployments(signed_in, make_cl
     assert (await _settings_of(none, "parse"))["settings"]["model"] is None
 
 
+@pytest.mark.own_catalog
 @respx.mock
 async def test_the_chat_models_are_the_offered_ones_the_catalog_still_lists(signed_in) -> None:
     """`CHAT_MODELS` in the operator's order, each with the catalog's name, fetched with
@@ -92,6 +93,7 @@ async def test_the_chat_models_are_the_offered_ones_the_catalog_still_lists(sign
     assert KANO_API_KEY not in (await signed_in.get("/api/agents")).text
 
 
+@pytest.mark.own_catalog
 @respx.mock
 async def test_an_unreadable_catalog_is_an_upstream_error(signed_in, make_client) -> None:
     for response in (

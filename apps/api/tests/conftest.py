@@ -19,8 +19,10 @@ import os
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 
+import httpx
 import pytest
 import pytest_asyncio
+import respx
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -135,6 +137,26 @@ async def make_client(sessionmaker, tmp_path) -> AsyncIterator[Callable[..., Asy
 @pytest.fixture
 def client(make_client) -> AsyncClient:
     return make_client()
+
+
+@pytest.fixture(autouse=True)
+def kano_catalog(request: pytest.FixtureRequest):
+    """Kano Proxy's catalog, listing every offered chat model: a conversation's first
+    message checks its model against it (docs/billing.md § Models). The router started
+    first answers first, so a test that needs another catalog opts out with the
+    `own_catalog` marker and stubs the URL itself; nothing else is mocked here, and an
+    unstubbed request still fails (docs/testing.md)."""
+    if request.node.get_closest_marker("own_catalog"):
+        yield
+        return
+    router = respx.mock(assert_all_called=False)
+    router.get(KANO_MODELS_URL).mock(
+        return_value=httpx.Response(
+            200, json={"data": [{"id": model} for model in CHAT_MODELS.split(",")]}
+        )
+    )
+    with router:
+        yield
 
 
 @pytest.fixture(scope="session")

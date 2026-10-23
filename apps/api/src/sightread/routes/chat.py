@@ -44,6 +44,7 @@ from ..jobs.intake import insufficient_credits
 from ..jobs.queue import HISTORY_FULL, count_active_turns, enqueue_turn, history_bytes
 from ..parsing.attachments import prepared_path
 from ..sandbox.client import SandboxClient, SandboxUnavailable
+from ..upstream.client import agent_models
 from ..workspace.documents import (
     current_revision,
     directory_size,
@@ -382,6 +383,15 @@ async def _ready_to_chat(
     model = chat_runner.chat_model(settings, setting)
     if model is None:
         raise ApiError(503, "upstream", "No chat model is offered on this deployment")
+    # Against the live catalog, as the picker lists it: a model Kano Proxy no longer
+    # serves must not be fixed on a conversation for every later turn to fail on
+    # (docs/billing.md § Models).
+    if model not in {entry["id"] for entry in await agent_models(settings, CHAT.name)}:
+        raise ApiError(
+            400,
+            "invalid_request",
+            "That model is no longer served: pick another on the Agent page",
+        )
     return setting, model
 
 
