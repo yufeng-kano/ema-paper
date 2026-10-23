@@ -11,7 +11,7 @@
  *
  * Light and dark are both first-class: every color token below is one `light-dark()` pair,
  * resolved by `color-scheme` — the system's choice, or the one the reader pinned in the
- * settings sheet (`data-theme` on <html>) — and nothing outside this block names a color.
+ * settings dialog (`data-theme` on <html>) — and nothing outside this block names a color.
  * The light values are the design's own; the dark values are the same ramp inverted, since
  * the palette this system was handed is a light one.
  */
@@ -235,7 +235,7 @@
   }
 }
 
-/* The reader's choice, from the settings sheet (docs/web.md § Design system, *Theme*). With
+/* The reader's choice, from the settings dialog (docs/web.md § Design system, *Theme*). With
    no attribute every `light-dark()` pair above follows the system; pinned, it follows the pin.
    An inline script in <head> sets the attribute from localStorage before first paint. */
 :root[data-theme="light"] {

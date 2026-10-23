@@ -70,15 +70,32 @@ function focusables(): HTMLElement[] {
  * overlay, so a dialog whose action failed could not be closed with Escape and Tab
  * restarted from the top of the page behind it.
  */
+/**
+ * Whether this dialog is the one a key is meant for. Dialogs open over dialogs — the
+ * settings dialog's confirmations, a prompt dialog inside it — and each listens on the
+ * document, so without this the Escape that closes the top one would close every one
+ * under it, and two focus traps would fight over Tab. The last of the overlays in document
+ * order is the top one, since each is teleported after the ones before it; for Escape the
+ * overlays also count a menu and a drawer that owns the key (`data-escape-owner`), which
+ * close themselves.
+ */
+function topmost(selector: string): boolean {
+  const overlays = document.querySelectorAll(selector)
+  return overlays[overlays.length - 1] === panel.value
+}
+
 function onKeydown(event: KeyboardEvent) {
   if (event.key === 'Escape') {
+    if (!topmost('[aria-modal="true"], [role="menu"], [data-escape-owner]')) {
+      return
+    }
     event.stopPropagation()
     if (!props.busy) {
       emit('close')
     }
     return
   }
-  if (event.key !== 'Tab') {
+  if (event.key !== 'Tab' || !topmost('[aria-modal="true"]')) {
     return
   }
 

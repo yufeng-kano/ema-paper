@@ -17,6 +17,7 @@ import { listAgents, type Memory, type MemoryKind } from '~/lib/api'
 import { formatShortDateTime } from '~/lib/format'
 import { parseResultMarkdown, type ResultBlock } from '~/lib/markdown'
 import { modalPanelKey } from '~/lib/menu'
+import { SETTINGS_QUERY } from '~/lib/settings'
 import { memoryLineState, type ContextCardView } from '~/lib/thread'
 
 const props = defineProps<{
@@ -32,7 +33,7 @@ const emit = defineEmits<{ close: [] }>()
 
 const { t, locale } = useI18n()
 const { resolve } = useApiError()
-const localePath = useLocalePath()
+const route = useRoute()
 const modalPanel = inject(modalPanelKey, null)
 const titleId = useId()
 
@@ -322,7 +323,9 @@ onBeforeUnmount(() => {
         </ul>
       </template>
 
-      <NuxtLink :to="localePath('/settings/agent')" class="manage">{{ t('chat.memory.manage') }}</NuxtLink>
+      <NuxtLink :to="{ query: { ...route.query, [SETTINGS_QUERY]: 'agent' } }" class="manage">
+        {{ t('chat.memory.manage') }}
+      </NuxtLink>
     </div>
   </Teleport>
 </template>

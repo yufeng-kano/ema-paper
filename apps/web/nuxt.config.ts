@@ -66,8 +66,9 @@ export default defineNuxtConfig({
     '/zh-TW/files': { ssr: false },
     '/zh-TW/history': { ssr: false },
     '/zh-TW/settings/**': { ssr: false },
-    // The four screens that became sections of the settings sheet (docs/web.md § Pages):
-    // a bookmark of the old path lands on its section.
+    // The four screens that became sections of the settings dialog (docs/web.md § Pages):
+    // a bookmark of the old path lands on its section, through the `/settings/<section>`
+    // deep-link page.
     '/agents': { redirect: '/settings/agent' },
     '/keys': { redirect: '/settings/keys' },
     '/connect': { redirect: '/settings/mcp' },

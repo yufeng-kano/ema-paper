@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import type { ComponentPublicInstance } from 'vue'
 import type { MenuItem, Point } from '~/lib/menu'
+import { SETTINGS_QUERY, settingsSectionOf } from '~/lib/settings'
 
 /**
  * The signed-in frame.
@@ -28,7 +29,7 @@ const auth = useAuth()
 
 /**
  * The two screens that are the work. Everything configured once — the agent, keys, the
- * connector, usage, theme, the account — is a section of the settings sheet behind the
+ * connector, usage, theme, the account — is a section of the settings dialog behind the
  * account menu, so the nav never fills with things opened twice a month (docs/web.md § Pages).
  */
 const NAV = [
@@ -87,13 +88,17 @@ const accountItems = computed<MenuItem[]>(() => [
 /** The language dialog the menu's Language row opens (`LanguageDialog`). */
 const languageOpen = ref(false)
 
-/** The sheet remembers where it was opened from, so its X comes back here. */
-const settingsReturn = useSettingsReturn()
+/**
+ * The settings dialog is open while the route carries `?settings=<section>`
+ * (`SettingsDialog`): opening it pushes the query over the current screen, so Back closes
+ * it, and the screen stays where it was behind the scrim.
+ */
+const router = useRouter()
+const settingsSection = computed(() => settingsSectionOf(route.query[SETTINGS_QUERY]))
 
 function onAccountAction(action: string) {
   if (action === 'settings') {
-    settingsReturn.value = route.fullPath
-    void navigateTo(localePath('/settings/general'))
+    void router.push({ query: { ...route.query, [SETTINGS_QUERY]: 'general' } })
   } else if (action === 'language') {
     languageOpen.value = true
   } else if (action === 'signOut') {
@@ -101,8 +106,9 @@ function onAccountAction(action: string) {
   }
 }
 
-// Following a menu item navigates; the route change is what closes the menu.
-watch(() => route.path, () => {
+// Following a menu item navigates; the route change is what closes the menu. The full
+// path, since Settings navigates by query alone.
+watch(() => route.fullPath, () => {
   accountMenu.value = null
 })
 
@@ -119,8 +125,10 @@ function isDrawerLayout(): boolean {
   return typeof matchMedia !== 'undefined' && matchMedia('(max-width: 900px)').matches
 }
 
-// A destination the user just picked is behind the drawer they picked it from.
-watch(() => route.path, () => {
+// A destination the user just picked is behind the drawer they picked it from — the
+// settings dialog too, which opens by query from the drawer's account menu and is teleported
+// outside the drawer, where the drawer's focus trap would otherwise hold Tab.
+watch(() => route.fullPath, () => {
   drawerOpen.value = false
 })
 
@@ -250,6 +258,7 @@ async function signOut() {
         />
 
         <LanguageDialog v-if="languageOpen" @close="languageOpen = false" />
+        <SettingsDialog v-if="settingsSection" :section="settingsSection" />
       </div>
     </aside>
 

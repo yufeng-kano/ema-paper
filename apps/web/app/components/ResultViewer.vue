@@ -3631,6 +3631,13 @@ function onDocumentKey(event: KeyboardEvent) {
   if (tab.value !== 'markdown') {
     return
   }
+  // Not while a dialog is open over the viewer — the settings dialog a conversation's
+  // context card opens keeps the viewer mounted underneath. Find would then move focus into
+  // the hidden document, and ⌘[ would be swallowed instead of reaching the dialog.
+  const dialogs = document.querySelectorAll('[aria-modal="true"]')
+  if (dialogs[dialogs.length - 1] !== scroller.value?.closest('[aria-modal="true"]')) {
+    return
+  }
   if (event.key === 'f' && (event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey) {
     event.preventDefault()
     void openFind()
