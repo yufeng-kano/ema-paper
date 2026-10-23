@@ -912,7 +912,7 @@ export default {
     signIn: '登入',
     eyebrow: '定價',
     title: '每頁固定點數，模型費用包含在內。',
-    lede: 'PDF 與圖片進來，帶圖表座標的 Markdown 出去。解析一頁 {n} 點，對話每輪按實際 token 計。模型由 Ema Paper 選定與付費，你不用帶 API 金鑰。',
+    lede: 'PDF 與圖片進來，帶圖表座標的 Markdown 出去。解析一頁固定點數，對話每輪按實際 token 計。模型由 Ema Paper 選定與付費，你不用帶 API 金鑰。',
     plans: '方案',
     free: 'Free',
     freePrice: '免費',

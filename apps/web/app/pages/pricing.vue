@@ -10,6 +10,7 @@
  */
 import { getBillingCatalog, type CatalogPlan, type CatalogResponse } from '~/lib/api'
 import { formatBytes, formatCount, formatMinorAmount } from '~/lib/format'
+import { SETTINGS_QUERY, keepAfterSignIn } from '~/lib/settings'
 import type { TableColumn } from '~/lib/table'
 
 definePageMeta({ layout: false })
@@ -41,7 +42,8 @@ onMounted(async () => {
   }
 })
 
-const parsePerPage = computed(() => catalog.value?.rates.parse_per_page ?? 1)
+/** Null until the catalog answers: no rate is ever assumed (docs/web.md § Rules). */
+const parsePerPage = computed(() => catalog.value?.rates.parse_per_page ?? null)
 
 /** `per month`, `per year`, or `per 3 months` — as Pay reports the cycle. */
 function cycleOf(plan: CatalogPlan): string {
@@ -51,6 +53,10 @@ function cycleOf(plan: CatalogPlan): string {
   }
   return t('pricing.cycle.other', { n: formatCount(frequency, locale.value), interval })
 }
+
+/** The Billing section, where *Upgrade* is; a signed-out visitor is sent to sign in first
+ *  and lands there after it (the destination kept for this tab). */
+const billingPath = computed(() => `${localePath('/files')}?${SETTINGS_QUERY}=billing`)
 
 function price(plan: CatalogPlan): string {
   return formatMinorAmount(plan.amount, plan.currency, locale.value)
@@ -99,7 +105,7 @@ const questions = ['1', '2', '3', '4'] as const
       <section class="hero">
         <p class="eyebrow">{{ t('pricing.eyebrow') }}</p>
         <h1 class="title">{{ t('pricing.title') }}</h1>
-        <p class="lede">{{ t('pricing.lede', { n: formatCount(parsePerPage, locale) }, parsePerPage) }}</p>
+        <p class="lede">{{ t('pricing.lede') }}</p>
       </section>
 
       <section class="plans" :aria-label="t('pricing.plans')">
@@ -138,7 +144,9 @@ const questions = ['1', '2', '3', '4'] as const
                 <li>{{ t('pricing.api') }}</li>
                 <li>{{ plan.sandbox ? t('pricing.chatSandbox') : t('pricing.chatNoSandbox') }}</li>
               </ul>
-              <NuxtLink class="cta" :to="localePath('/')">{{ t('pricing.upgrade') }}</NuxtLink>
+              <NuxtLink class="cta" :to="billingPath" @click="keepAfterSignIn(billingPath)">
+                {{ t('pricing.upgrade') }}
+              </NuxtLink>
             </article>
           </template>
           <p v-else-if="catalog" class="not-on-sale">{{ t('pricing.notOnSale') }}</p>
@@ -153,7 +161,8 @@ const questions = ['1', '2', '3', '4'] as const
           <h2 class="section-title">{{ t('pricing.howTitle') }}</h2>
           <p class="section-lede">{{ t('pricing.howLede') }}</p>
         </div>
-        <table class="how-table">
+        <UiSkeleton v-if="parsePerPage === null && !loadError" :rows="4" />
+        <table v-else-if="parsePerPage !== null" class="how-table">
           <thead>
             <tr>
               <th scope="col">{{ t('pricing.columnAction') }}</th>

@@ -61,7 +61,7 @@ import {
   ROWS_DRAG_TYPE,
   setDropEffect,
 } from '~/lib/dnd'
-import { formatBytes, formatCount, formatShortDateTime } from '~/lib/format'
+import { formatBytes, formatShortDateTime } from '~/lib/format'
 import type { MenuItem, Point } from '~/lib/menu'
 import {
   acceptsUpload,
@@ -2388,13 +2388,6 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
                         ? `${row.document.pages_done}/${row.document.page_count}`
                         : row.document.pages_done || ''
                     }}
-                    <!-- A parse on its way says what it reserved (docs/billing.md § A parse). -->
-                    <span
-                      v-if="isPending(row.document) && row.document.credits != null"
-                      class="muted"
-                    >
-                      · {{ t('credits.n', { n: formatCount(row.document.credits, locale) }, row.document.credits) }}
-                    </span>
                   </template>
                 </template>
 

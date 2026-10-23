@@ -791,7 +791,8 @@ export interface LibraryDocument {
   /** The re-convert queued, running or failed — null when there is none. Optional so a page
    *  served by an older API still renders. */
   reconvert?: DocumentReconvert | null
-  /** The parse's credits, reserved when it queued (docs/billing.md § A parse). */
+  /** What the parse cost once settled; null while its reservation is pending, which is
+   *  the whole of a queued or running parse (docs/billing.md § Routes). */
   credits?: number | null
 }
 
