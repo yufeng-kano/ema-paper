@@ -3,8 +3,6 @@ import { createKey, listKeys, revokeKey, type ApiKeySummary, type CreatedApiKey 
 import { formatDateTime } from '~/lib/format'
 import type { TableColumn } from '~/lib/table'
 
-definePageMeta({ middleware: 'authed' })
-
 const { t, locale } = useI18n()
 
 const { data, pending, errorMessage, refresh } = useAuthedData(() => listKeys())
@@ -61,8 +59,8 @@ async function submitCreate() {
     showCreate.value = false
     await refresh()
     // The plaintext is shown exactly once and is unrecoverable, so it must not be left
-    // above the fold: Create key lives in the rail, which is reachable at any scroll depth
-    // in this panel, and the reveal is inserted at the panel's top.
+    // above the fold: Create key sits beside the section title, which is reachable at any
+    // scroll depth of the column, and the reveal is inserted at the panel's top.
     await nextTick()
     keysPanel.value?.scrollToTop()
   } catch (error) {
@@ -95,22 +93,21 @@ async function confirmRevoke() {
 </script>
 
 <template>
-  <UiScreen>
-    <UiRail>
-      <UiPageHeader
-        :eyebrow="data ? t('keys.activeCount', { count: data.keys.length }) : ''"
-        :title="t('keys.headTitle')"
-      />
-      <!-- The page's primary action lives in the rail, not in a header bar: it is the one
-           thing this screen is for, and the rail is where the eye already is. -->
-      <UiButton variant="primary" block @click="openCreate">
+  <SettingsSection
+    :eyebrow="data ? t('keys.activeCount', { count: data.keys.length }) : undefined"
+    :title="t('keys.headTitle')"
+  >
+    <!-- The section's primary action, beside its title: the one thing this section is for,
+         reachable at any scroll depth of the sheet's column. -->
+    <template #actions>
+      <UiButton variant="primary" @click="openCreate">
         <template #icon><UiIcon name="plus" /></template>
         {{ t('keys.create') }}
       </UiButton>
-    </UiRail>
+    </template>
 
-    <UiRegion split ratio="1.35fr 1fr">
-      <UiPanel ref="keysPanel" :title="t('keys.listTitle')" lead>
+    <div class="region">
+      <UiPanel ref="keysPanel" :title="t('keys.listTitle')">
         <template #meta>
           <span v-if="data">{{ t('keys.keyCount', { count: data.keys.length }) }}</span>
           <UiButton
@@ -157,7 +154,7 @@ async function confirmRevoke() {
              working when it has stopped. -->
         <UiSkeleton v-if="!data && !errorMessage" class="state" />
 
-        <!-- No action here: Create key is in the rail, present in every state of the page. -->
+        <!-- No action here: Create key is beside the title, present in every state. -->
         <UiEmptyState
           v-else-if="data && !data.keys.length"
           :title="t('keys.empty')"
@@ -206,7 +203,7 @@ async function confirmRevoke() {
         </template>
         <pre class="code mono">{{ curlExample }}</pre>
       </UiPanel>
-    </UiRegion>
+    </div>
     <UiModal v-if="showCreate" :title="t('keys.create')" size="md" @close="showCreate = false">
       <form id="create-key" @submit.prevent="submitCreate">
         <UiField v-slot="{ id }" :label="t('keys.nameLabel')">
@@ -238,10 +235,15 @@ async function confirmRevoke() {
       @confirm="confirmRevoke"
       @cancel="revokeTarget = null"
     />
-  </UiScreen>
+  </SettingsSection>
 </template>
 
 <style scoped>
+.region {
+  display: grid;
+  min-width: 0;
+}
+
 .state {
   margin-top: var(--space-4);
 }

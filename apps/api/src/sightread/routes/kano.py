@@ -43,7 +43,7 @@ CONNECT_LOCALE_KEY = "kano_connect_locale"
 def _back_to_agents(request: Request, settings: Settings, outcome: str) -> RedirectResponse:
     locale = str(request.session.pop(CONNECT_LOCALE_KEY, ""))
     return RedirectResponse(
-        f"{settings.web_url_for_locale(locale)}/agents?kano={outcome}",
+        f"{settings.web_url_for_locale(locale)}/settings/agent?kano={outcome}",
         status_code=status.HTTP_302_FOUND,
     )
 

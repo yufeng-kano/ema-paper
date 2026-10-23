@@ -283,10 +283,12 @@ async function signInAsDeveloper() {
    Google's prescribed values, not this app's palette — the one place besides the brand panel
    where a literal color is correct. */
 .btn-google {
-  --g-bg: #ffffff;
-  --g-border: #dadce0;
-  --g-text: #1f1f1f;
-  --g-hover: #f7f8f8;
+  /* Google's light and dark button variants — their values, not ours — following the same
+     color-scheme the app's own tokens do (docs/web.md § Design system, *Theme*). */
+  --g-bg: light-dark(#ffffff, #131314);
+  --g-border: light-dark(#dadce0, #8e918f);
+  --g-text: light-dark(#1f1f1f, #e3e3e3);
+  --g-hover: light-dark(#f7f8f8, #1e1f20);
 
   width: 100%;
   display: inline-flex;
@@ -371,16 +373,6 @@ async function signInAsDeveloper() {
   font-weight: var(--weight-semibold);
   padding-bottom: 2px;
   border-bottom: 1px solid var(--accent);
-}
-
-@media (prefers-color-scheme: dark) {
-  /* Google's dark-theme button variant — again their values, not ours. */
-  .btn-google {
-    --g-bg: #131314;
-    --g-border: #8e918f;
-    --g-text: #e3e3e3;
-    --g-hover: #1e1f20;
-  }
 }
 
 /* --- Responsive ----------------------------------------------------------- */

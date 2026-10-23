@@ -35,7 +35,7 @@ from tests.conftest import (
 )
 
 REDIRECT_URI = "http://localhost:8000/api/kano/callback"
-AGENTS_URL = "http://localhost:3000/agents"
+AGENTS_URL = "http://localhost:3000/settings/agent"
 KEY = "sk-kano-proxy-first-key-0001"
 NEW_KEY = "sk-kano-proxy-second-key-0002"
 
@@ -269,7 +269,7 @@ async def test_the_callback_returns_to_the_locale_the_connect_started_in(client)
     query = await _start(client, locale="zh-TW")
 
     assert await _finish(client, code="c", state=query["state"]) == (
-        "http://localhost:3000/zh-TW/agents?kano=connected"
+        "http://localhost:3000/zh-TW/settings/agent?kano=connected"
     )
 
 
