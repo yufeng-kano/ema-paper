@@ -669,6 +669,10 @@ async def _call_model(
     ctx: TurnContext, body: dict, *, parent: str | None = None
 ) -> CompletedMessage:
     for attempt in range(MAX_ATTEMPTS):
+        if ctx.credits_exhausted:
+            # Another call of the turn spent the balance while this one waited to retry:
+            # no attempt on a balance that is gone (docs/billing.md § A chat turn).
+            raise TurnOutOfCredits()
         try:
             return await _stream_once(ctx, body, parent=parent)
         except RateLimited as exc:
