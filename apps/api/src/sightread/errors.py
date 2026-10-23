@@ -21,6 +21,8 @@ ErrorType = Literal[
     "rate_limit",
     "payment",
     "insufficient_credits",
+    "checkout_unavailable",
+    "pay_unavailable",
     "upstream",
     "internal",
 ]

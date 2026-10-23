@@ -79,6 +79,14 @@ class Settings(BaseSettings):
     # `[{"planId", "credits", "storageBytes", "sandbox", "maxJobs"}]`; prices are Pay's.
     kano_pay_plans_json: str = "[]"
     billing_refresh_seconds: int = 120
+    # Each call to Pay's App API, and how far a notification's timestamp may be from
+    # ours before it is refused as a replay.
+    kano_pay_timeout_seconds: float = 15
+    kano_pay_signature_tolerance_seconds: int = 300
+    # How long one answer from Pay serves every catalog read, and the most a
+    # notification may carry.
+    kano_pay_catalog_ttl_seconds: int = 300
+    kano_pay_event_max_bytes: int = 65_536
 
     upload_max_bytes: int = 134_217_728
     page_cap: int = 500

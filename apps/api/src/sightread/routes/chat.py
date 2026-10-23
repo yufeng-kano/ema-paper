@@ -824,7 +824,7 @@ def _workspace_usage(root: Path, quota: int) -> dict:
 
 
 @router.get("/sandbox")
-async def sandbox_status(user: SessionUser, settings: AppSettings):
+async def sandbox_status(user: SessionUser, db: DbSession, settings: AppSettings):
     client = SandboxClient(settings)
     try:
         runner = await client.status(user.id)
@@ -837,7 +837,8 @@ async def sandbox_status(user: SessionUser, settings: AppSettings):
     except SandboxUnavailable:
         state = {"state": "unavailable", "last_used_at": None, "shells": 0, "uptime_seconds": 0}
     root = user_root(settings.workspaces_dir, user.id)
-    workspace = await asyncio.to_thread(_workspace_usage, root, settings.workspace_quota_bytes)
+    quota = ledger.storage_limit(settings, await ledger.plan_of(db, settings, user.id))
+    workspace = await asyncio.to_thread(_workspace_usage, root, quota)
     return {**state, "workspace": workspace}
 
 

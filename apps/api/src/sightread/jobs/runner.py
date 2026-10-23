@@ -1073,7 +1073,7 @@ async def _retain_source(
                     )
                 try:
                     # Every copy counts: a full workspace keeps no more of them.
-                    await ensure_within_quota(settings, root)
+                    await ensure_within_quota(db, settings, job.user_id, root)
                 except ApiError:
                     logger.warning(
                         "workspace of user %d is at its quota; "

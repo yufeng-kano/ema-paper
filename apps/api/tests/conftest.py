@@ -170,3 +170,51 @@ def mcp_running(client: AsyncClient):
     touches `/mcp` enters it explicitly.
     """
     return mcp_session_manager(client.app)
+
+
+# A Kano Pay that only exists inside respx (docs/billing.md § Kano Pay).
+PAY_URL = "https://pay.test"
+PAY_APP_ID = "ema-paper-test"
+PAY_WEBHOOK_SECRET = "pay-webhook-secret-not-a-real-one"
+PRO_PLANS_JSON = json.dumps(
+    [
+        {
+            "planId": "pro",
+            "credits": 5000,
+            "storageBytes": 1_073_741_824,
+            "sandbox": True,
+            "maxJobs": 2,
+        }
+    ]
+)
+PAY_SETTINGS = {
+    "kano_pay_url": PAY_URL,
+    "kano_pay_app_id": PAY_APP_ID,
+    "kano_pay_api_key": "pay-api-key-not-a-real-one",
+    "kano_pay_webhook_secret": PAY_WEBHOOK_SECRET,
+    "kano_pay_plans_json": PRO_PLANS_JSON,
+}
+
+
+async def grant_plan(sessionmaker, user_id: int, plan_id: str = "pro", *, version: int = 1):
+    """A subscription row as the webhook would write it: the user is on `plan_id` for a
+    period around now (docs/billing.md § Periods)."""
+    from datetime import UTC, datetime, timedelta
+
+    from sightread.db.models import Subscription
+
+    now = datetime.now(UTC)
+    async with sessionmaker() as db:
+        db.add(
+            Subscription(
+                user_id=user_id,
+                subscription_id=f"sub_{user_id}",
+                status="active",
+                plan_id=plan_id,
+                period_start=now - timedelta(days=1),
+                period_end=now + timedelta(days=29),
+                cancel_at_period_end=False,
+                version=version,
+            )
+        )
+        await db.commit()

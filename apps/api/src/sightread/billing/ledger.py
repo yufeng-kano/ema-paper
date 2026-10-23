@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import Settings
 from ..db.models import CreditEntry, CreditPeriod, Subscription, UsageLog, utcnow
 from .credits import credits_for_usd
-from .plans import Period, current_period
+from .plans import Period, Plan, current_period
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,30 @@ async def read_balance(
     if row is None:
         return Balance(period, period.plan.credits, 0)
     return Balance(period, max(row.granted, period.plan.credits), row.spent)
+
+
+async def plan_of(db: AsyncSession, settings: Settings, user_id: int) -> Plan:
+    """The plan the user's current period belongs to, which is where their entitlements
+    come from (docs/billing.md § Plans): the storage cap, the concurrency cap and
+    whether the chat agent gets `bash`."""
+    return current_period(
+        await db.get(Subscription, user_id), settings.plans, settings.free_plan, utcnow()
+    ).plan
+
+
+def storage_limit(settings: Settings, plan: Plan) -> int:
+    """The plan's storage, never past the deployment's ceiling."""
+    return min(plan.storage_bytes, settings.workspace_quota_bytes)
+
+
+def jobs_limit(settings: Settings, plan: Plan) -> int:
+    """The plan's parses at once, never past the deployment's ceiling."""
+    return min(plan.max_jobs, settings.max_jobs_per_user)
+
+
+def sandbox_granted(settings: Settings, plan: Plan) -> bool:
+    """`bash` for the chat agent: the plan grants it and the deployment has a runner."""
+    return plan.sandbox and settings.sandbox_configured
 
 
 async def period_row(

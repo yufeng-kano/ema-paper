@@ -26,6 +26,7 @@ from sqlalchemy import Row, select
 from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..billing import ledger
 from ..config import Settings
 from ..db.models import Document, Folder, Job, Result, utcnow
 from ..errors import ApiError
@@ -454,7 +455,7 @@ async def materialize_document(
                 await db.refresh(document)
                 paths = await document_paths(db, settings, document)
         if safe_io.entry_kind(root, paths.directory) == "none":
-            await ensure_within_quota(settings, root)
+            await ensure_within_quota(db, settings, document.user_id, root)
         written = await asyncio.to_thread(
             _materialize_files,
             paths,
@@ -544,11 +545,15 @@ async def current_revision(db: AsyncSession, settings: Settings, document: Docum
     return revision_of(row.reading_markdown if row.reading_markdown is not None else row.markdown)
 
 
-async def ensure_within_quota(settings: Settings, root: Path) -> None:
-    """Refuse new material once the workspace is at its quota (docs/workspace.md § Quota).
-    A walk of the tree: cheap at the sizes a quota allows, and only on growth."""
+async def ensure_within_quota(
+    db: AsyncSession, settings: Settings, user_id: int, root: Path
+) -> None:
+    """Refuse new material once the workspace is at the plan's storage (docs/workspace.md
+    § Quota, docs/billing.md § Plans). A walk of the tree: cheap at the sizes a quota
+    allows, and only on growth."""
+    limit = ledger.storage_limit(settings, await ledger.plan_of(db, settings, user_id))
     used = await asyncio.to_thread(workspace_size, root)
-    if used >= settings.workspace_quota_bytes:
+    if used >= limit:
         raise ApiError(
             409, "invalid_request", "The workspace is at its quota; free some space first"
         )
@@ -669,7 +674,7 @@ async def inherit_original(
         )
         if siblings:
             try:
-                await ensure_within_quota(settings, root)
+                await ensure_within_quota(db, settings, document.user_id, root)
             except ApiError:
                 logger.warning(
                     "workspace of user %d is at its quota; document %d keeps no original",
@@ -746,7 +751,7 @@ async def adopt_source(
             await folder_names(db, document.user_id, document.folder_id), document.name
         )
         try:
-            await ensure_within_quota(settings, root)
+            await ensure_within_quota(db, settings, document.user_id, root)
         except ApiError:
             # No room for the one file nothing can recreate: the filing is refused whole
             # (the caller rolls the row back), never a row that could not render a page.
@@ -781,7 +786,9 @@ def _keep_markdown(root: Path, upload: Path, document_id: int) -> None:
     os.replace(staging, canonical)
 
 
-async def adopt_markdown(settings: Settings, document: Document, upload: Path) -> None:
+async def adopt_markdown(
+    db: AsyncSession, settings: Settings, document: Document, upload: Path
+) -> None:
     """Keep an uploaded `.md` as the markdown document's original, `{document_id}.md` beside
     the other originals; the upload goes either way (docs/workspace.md § Markdown
     documents). The quota refusing it (409), or a copy that fails, leaves nothing behind:
@@ -789,7 +796,7 @@ async def adopt_markdown(settings: Settings, document: Document, upload: Path) -
     holds the workspace lock."""
     root = user_root(settings.workspaces_dir, document.user_id)
     try:
-        await ensure_within_quota(settings, root)
+        await ensure_within_quota(db, settings, document.user_id, root)
         await asyncio.to_thread(_keep_markdown, root, upload, document.id)
     except BaseException:
         await asyncio.to_thread(_discard_originals, root, [document.id])
@@ -832,7 +839,7 @@ async def keep_image(
     root = user_root(settings.workspaces_dir, document.user_id)
     async with workspace_lock(root):
         paths = await materialize_document(db, settings, document, locked=True)
-        await ensure_within_quota(settings, root)
+        await ensure_within_quota(db, settings, document.user_id, root)
         try:
             return await asyncio.to_thread(_keep_image, paths, document.id, prepared)
         except safe_io.UnsafeEntry as exc:

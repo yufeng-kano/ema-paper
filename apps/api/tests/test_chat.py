@@ -1224,12 +1224,18 @@ async def test_the_body_cap_ignores_a_multipart_label_off_the_upload_routes(
 async def test_the_agent_page_lists_only_the_tools_the_deployment_has(
     make_client, tmp_path
 ) -> None:
+    from tests.conftest import PAY_SETTINGS, grant_plan
+
+    # A shell needs both a runner and a plan that grants one (docs/billing.md § Plans).
     with_runner = make_client(
         workspaces_dir=str(tmp_path / "ws1"),
         sandbox_url="http://sandbox:8100",
         sandbox_token="runner-token-not-a-real-one",
+        **PAY_SETTINGS,
     )
     await with_runner.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    user_id = (await with_runner.get("/api/me")).json()["user"]["id"]
+    await grant_plan(with_runner.app.state.sessionmaker, user_id)
     with_sandbox = next(
         agent
         for agent in (await with_runner.get("/api/agents")).json()["agents"]
