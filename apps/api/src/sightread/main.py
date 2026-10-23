@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from starlette.middleware.sessions import SessionMiddleware
 
 from .auth.oidc import build_oauth
+from .billing import pay
 from .body_limit import BodyLimitMiddleware
 from .config import Settings, get_settings
 from .db.session import create_engine, create_sessionmaker
@@ -56,6 +57,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="Ema Paper", lifespan=lifespan)
     app.state.settings = settings
     app.state.oauth = build_oauth(settings)
+    # Pay's catalog, shared by the public route and the billing view, and when each
+    # user's row was last reconciled with Pay (docs/billing.md § Kano Pay).
+    app.state.pay_catalog = pay.CatalogCache()
+    app.state.pay_refreshed = {}
     # Page previews render in this process: Poppler and a decode, a few at a time
     # (docs/api.md § Limits).
     app.state.preview_slots = asyncio.Semaphore(max(1, settings.page_preview_renders))

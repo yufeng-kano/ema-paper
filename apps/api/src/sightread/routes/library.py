@@ -1512,7 +1512,7 @@ async def file_markdown(
                 raise ApiError(404, "invalid_request", "No such folder") from None
             row_id = row.id
             try:
-                await workspace_documents.adopt_markdown(settings, row, staged)
+                await workspace_documents.adopt_markdown(db, settings, row, staged)
             except ApiError:
                 await db.rollback()
                 raise
@@ -2378,7 +2378,7 @@ async def copy_document(
             settings, user_id, folders=[row.id for row in above], documents=[source.id]
         ):
             raise ApiError(409, "invalid_request", STRANDED)
-        await workspace_documents.ensure_within_quota(settings, root)
+        await workspace_documents.ensure_within_quota(db, settings, user_id, root)
         job = await job_of(db, source.job_id) if source.job_id is not None else None
         if job is not None:
             await keep_parses(db, [job])
@@ -2427,7 +2427,7 @@ async def copy_folder(
             await live_folder(db, user_id, parent_id)
             if parent_id in inside:
                 raise ApiError(400, "invalid_request", "A folder cannot be copied inside itself")
-        await workspace_documents.ensure_within_quota(settings, root)
+        await workspace_documents.ensure_within_quota(db, settings, user_id, root)
         sources = (
             (
                 await db.execute(

@@ -211,18 +211,22 @@ async def _load(
             auto=setting.memory_auto if setting else True,
             paused=setting.memory_paused if setting else False,
         )
+        # The plan's entitlements, read at the turn's start (docs/billing.md § Plans).
+        plan = await ledger.plan_of(db, settings, turn.user_id)
         await db.commit()
         try:
             paths = await materialize_document(db, settings, document)
             # A full workspace runs no shell: what the turn writes has nowhere to go
             # (docs/workspace.md § Quota).
-            await ensure_within_quota(settings, paths.root)
+            await ensure_within_quota(db, settings, turn.user_id, paths.root)
         except ApiError as exc:
             raise TurnFailed(exc.message) from exc
 
     facts = document_facts(settings, job, paths)
-    sandbox = SandboxClient(settings) if settings.sandbox_configured else None
-    tools = turn_tools(settings)
+    # `bash` only on a plan that grants it, and only with a runner (docs/billing.md).
+    shell = ledger.sandbox_granted(settings, plan)
+    sandbox = SandboxClient(settings) if shell else None
+    tools = turn_tools(shell)
     # The prompt, then a legacy preset, the reader's instructions, the catalogue — read
     # per turn like the prompt, so an edit on the Agent page misses the cache once — and
     # the memory block last (docs/chat.md § Prompt caching).
@@ -274,10 +278,11 @@ def document_facts(settings: Settings, job: Job | None, paths: DocumentPaths) ->
     }
 
 
-def turn_tools(settings: Settings) -> list[dict]:
-    """The tools a turn declares: every one, in its fixed order, but `bash` without a
-    sandbox runner — a tool the harness cannot run is not offered (docs/sandbox.md)."""
-    return list(chat_agent.TOOLS if settings.sandbox_configured else chat_agent.TOOLS_WITHOUT_BASH)
+def turn_tools(shell: bool) -> list[dict]:
+    """The tools a turn declares: every one, in its fixed order, but `bash` only where the
+    plan grants a shell and a sandbox runner exists — a tool the harness cannot run is
+    not offered (docs/sandbox.md, docs/billing.md § Plans)."""
+    return list(chat_agent.TOOLS if shell else chat_agent.TOOLS_WITHOUT_BASH)
 
 
 def turn_catalogue(

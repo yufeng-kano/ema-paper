@@ -21,11 +21,11 @@ One worker process runs one job at a time — concurrency inside a job is the pa
 
 ## Concurrency caps (defaults)
 
-- `MAX_JOBS_PER_USER` = 2 running jobs; excess `POST /v1/parse` gets 429 + `Retry-After: PARSE_RETRY_AFTER_SECONDS` (30; fail closed, never crash). The web library's upload runs the same intake and hits the same cap, so a multi-file drop is a client-side queue that treats the 429 as back-pressure and retries ([web.md](./web.md) § Files) — the cap is not relaxed for a browser.
+- `MAX_JOBS_PER_USER` = 2 running jobs, the ceiling; intake caps a user at their plan's `maxJobs` under it (Free: `FREE_MAX_JOBS` = 1, [billing.md](./billing.md) § Plans); excess `POST /v1/parse` gets 429 + `Retry-After: PARSE_RETRY_AFTER_SECONDS` (30; fail closed, never crash). The web library's upload runs the same intake and hits the same cap, so a multi-file drop is a client-side queue that treats the 429 as back-pressure and retries ([web.md](./web.md) § Files) — the cap is not relaxed for a browser.
 - `VISION_CONCURRENCY_PER_JOB` = 8 concurrent upstream calls.
 - `RENDER_WORKERS` = CPU count (env-overridable) concurrent Poppler subprocesses per worker.
 
-Fairness: the claim query above is FIFO; per-user cap is enforced at claim time too (skip a queued job whose user already has `MAX_JOBS_PER_USER` running).
+Fairness: the claim query above is FIFO; the ceiling is enforced at claim time too (skip a queued job whose user already has `MAX_JOBS_PER_USER` running) — the plan's cap is intake's, where the 429 is answered.
 
 ## Progress
 

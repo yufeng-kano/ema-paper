@@ -10,7 +10,7 @@ Two planes, one FastAPI app.
 `GET /healthz` is public and DB-free (`{"ok": true}`). It backs the compose healthchecks and is also routed to the API on the public origin, so an external monitor can reach it — Caddy's `@api` matcher includes it explicitly ([deployment.md](./deployment.md)). All responses are JSON unless SSE is requested. Errors use one shape:
 
 ```json
-{ "error": { "type": "invalid_request | revision_conflict | auth | rate_limit | payment | insufficient_credits | upstream | internal", "message": "..." } }
+{ "error": { "type": "invalid_request | revision_conflict | auth | rate_limit | payment | insufficient_credits | checkout_unavailable | pay_unavailable | upstream | internal", "message": "..." } }
 ```
 
 ## Data plane
@@ -128,6 +128,7 @@ The live model catalog of the caller's **parse** upstream — `GET {KANO_PROXY_B
 | `GET/POST /api/prompts`, `PUT/DELETE /api/prompts/{id}` | legacy prompt presets (`{id, agent, name, text}`) — the web app edits one prompt per agent instead (`PUT /api/agents/{agent}/settings` `prompt`); `POST` takes `agent` (default `parse`, must be a registered agent; fixed afterwards); text capped at `SYSTEM_PROMPT_MAX_CHARS`; deleting a selected preset falls back to the agent's default prompt |
 | `GET /api/usage?days=30` | per-day, per-model and per-agent aggregates of tokens + cost from `usage_log`, billed and estimated cost kept apart (§ Usage aggregates) |
 | `GET /api/billing`, `GET /api/billing/entries?days=30` | the plan, the period's balance and the credit rates; credits per day and per agent ([billing.md](./billing.md) § Routes) |
+| `GET /api/billing/catalog` (public), `POST /api/billing/checkout`, `POST /api/billing/portal`, `POST /api/billing/pay-webhook` (signed, no session) | the plans on sale with Pay's prices; a Pay checkout `{url}` for a plan; Pay's customer portal `{url}`; Pay's notifications ([billing.md](./billing.md) § Kano Pay) |
 | `GET /api/usage/conversations?days=30` | per-conversation totals: `{conversations: [{id, title, document_id, document_name, turns, prompt_tokens, cache_read_tokens, cache_write_tokens, completion_tokens, estimated_cost, estimated_calls, unpriced_calls}]}` — `estimated_calls` is what tells an estimate of exactly $0 from no estimate at all |
 | `GET /api/jobs?limit=50` | recent jobs (history): `job_id`, `agent`, `kind`, `filename`, `status`, `model`, `page_count`, `pages_done`, `error`, timestamps, `credits` (what the parse cost, as above); `GET /api/jobs/{id}/result` same payload as data plane, plus partial results (below) |
 | `GET /api/jobs/{id}/figures/{page}/{ymin},{xmin},{ymax},{xmax}` | one stored figure crop as `image/png`, addressed exactly as its `sightread://` placeholder addresses it; 404 when no crop was stored (old results, failed crop). Control plane only — the data plane ships coordinates, not image bytes ([parsing.md](./parsing.md) § Figure crops) |
@@ -178,7 +179,7 @@ While a job is still `queued` or `running`, the two control-plane result routes 
 ## Limits (defaults, env-overridable)
 
 - `UPLOAD_MAX_BYTES` = 134217728 (128 MB) — enforced in the app **and** in Caddy; keep in sync ([deployment.md](./deployment.md)).
-- `PAGE_CAP` = 500, `MAX_JOBS_PER_USER` = 2 concurrent, `VISION_CONCURRENCY_PER_JOB` = 8.
+- `PAGE_CAP` = 500, `MAX_JOBS_PER_USER` = 2 concurrent — the ceiling; what a user may run at once is their plan's `maxJobs` under it ([billing.md](./billing.md) § Plans) — `VISION_CONCURRENCY_PER_JOB` = 8.
 - `SYSTEM_PROMPT_MAX_CHARS` = 8000 — cap on an agent's prompt, a prompt preset's text, a skill's body and a subagent's prompt.
 - `CHAT_INSTRUCTIONS_MAX_CHARS` = 8000 — the chat agent's instructions; `CHAT_MEMORY_MAX_CHARS` = 500 one memory, `CHAT_MEMORIES_MAX` = 200 a user's memories, `CHAT_MEMORY_BLOCK_MAX_CHARS` = 12000 the memories one conversation loads; `CHAT_SECTIONS_PER_MESSAGE` = 4 whole sections added to one message, `CHAT_SECTION_HEADING_MAX_CHARS` = 512 the heading of one ([chat.md](./chat.md) § Instructions, § Memory, § What a user message carries).
 - `CHAT_ATTACHMENT_MAX_BYTES` = 20971520 (20 MiB) per attached file, `CHAT_ATTACHMENTS_PER_MESSAGE` = 8, `CHAT_ATTACHMENT_TEXT_MAX_CHARS` = 100000 of a PDF's or text file's text, `CHAT_ATTACHMENT_IMAGE_LONG_EDGE` = 1568 px, `CHAT_ATTACHMENTS_PENDING_MAX` = 32 of a user's attachments waiting for a message at once, `CHAT_ATTACHMENT_CACHE_SECONDS` = 31536000 (a year) that the browser may cache an attached image, `CHAT_ATTACHMENT_PDF_TIMEOUT_SECONDS` = 60 for a PDF's text, `UPLOAD_MAX_AGE_SECONDS` = 86400 (a day) before the sweeper takes an upload entry, an unsent attachment's included; `CHAT_SKILLS_MAX` = 64 and `CHAT_SUBAGENTS_MAX` = 32 of a user's own; `CHAT_SUBAGENT_MAX_TOOL_CALLS` = 1000 per subagent run ([chat.md](./chat.md)).

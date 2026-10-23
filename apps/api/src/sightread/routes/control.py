@@ -677,11 +677,10 @@ def _bbox_payload(row: AgentSetting | None) -> dict:
     return {"family": convention.family, "format": convention.format}
 
 
-def _agent_tools(name: str, settings: AppSettings) -> list[str]:
+def _agent_tools(name: str, shell: bool) -> list[str]:
     if name != CHAT.name:
         return []
-    tools = chat_agent.TOOLS if settings.sandbox_configured else chat_agent.TOOLS_WITHOUT_BASH
-    return [str(tool["name"]) for tool in tools]
+    return [str(tool["name"]) for tool in chat_runner.turn_tools(shell)]
 
 
 @router.get("/agents")
@@ -693,6 +692,7 @@ async def list_agents(user: SessionUser, db: DbSession, settings: AppSettings):
             await db.execute(select(AgentSetting).where(AgentSetting.user_id == user.id))
         ).scalars()
     }
+    shell = ledger.sandbox_granted(settings, await ledger.plan_of(db, settings, user.id))
     return {
         "agents": [
             {
@@ -704,9 +704,10 @@ async def list_agents(user: SessionUser, db: DbSession, settings: AppSettings):
                 # tokens it offers as chips (docs/web.md).
                 "default_prompt": agent.default_prompt_template,
                 "prompt_tokens": list(agent.prompt_tokens),
-                # The tools this deployment really gives the agent: `bash` only with a
-                # sandbox runner configured (docs/chat.md § Tools).
-                "tools": _agent_tools(agent.name, settings),
+                # The tools this deployment really gives this user's agent: `bash` only
+                # on a plan that grants it, with a sandbox runner configured
+                # (docs/chat.md § Tools, docs/billing.md § Plans).
+                "tools": _agent_tools(agent.name, shell),
                 "settings": _agent_settings_payload(rows.get(agent.name)),
                 # A fact about the saved model, not a setting: the coordinate convention
                 # the pipeline will ask it for (docs/parsing.md § Coordinate conventions).
@@ -940,7 +941,8 @@ async def chat_agent_context(
             settings,
         )
     )
-    tools = [str(tool["name"]) for tool in chat_runner.turn_tools(settings)]
+    shell = ledger.sandbox_granted(settings, await ledger.plan_of(db, settings, user.id))
+    tools = [str(tool["name"]) for tool in chat_runner.turn_tools(shell)]
     parts = chat_agent.system_parts(
         # Without a document the template keeps its tokens, its tool lines filtered as a
         # turn's would be.

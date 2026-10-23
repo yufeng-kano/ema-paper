@@ -353,7 +353,9 @@ async def submit_parse(
     target = await resolve_target(db, settings, user, PARSE, model)
     prompt_sha256 = hashlib.sha256(target.prompt.encode()).hexdigest()
 
-    if await count_running_jobs(db, user.id) >= settings.max_jobs_per_user:
+    # The plan's parses at once (docs/billing.md § Plans), under the deployment's cap.
+    plan = await ledger.plan_of(db, settings, user.id)
+    if await count_running_jobs(db, user.id) >= ledger.jobs_limit(settings, plan):
         raise ApiError(
             429,
             "rate_limit",
