@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import type { ComponentPublicInstance } from 'vue'
-import type { MenuItem, Point } from '~/lib/menu'
+import { formatCount } from '~/lib/format'
+import type { MenuFact, MenuItem, Point } from '~/lib/menu'
 import { SETTINGS_QUERY, settingsSectionOf } from '~/lib/settings'
 
 /**
@@ -13,7 +14,8 @@ import { SETTINGS_QUERY, settingsSectionOf } from '~/lib/settings'
  *
  * The account row is the session's own menu: the avatar-and-name button opens `UiContextMenu`
  * — the same floating surface the library's right-click opens — headed by the address that is
- * signed in, holding Settings, Language, and sign-out below a rule. Everything the account is,
+ * signed in and the plan with its balance, holding Upgrade (or Billing), Settings, Language,
+ * and sign-out below a rule. Everything the account is,
  * in one place, the way a desktop app's account menu holds it. Language is a row rather than a
  * submenu: it opens `LanguageDialog` (docs/web.md § The account menu).
  *
@@ -22,7 +24,7 @@ import { SETTINGS_QUERY, settingsSectionOf } from '~/lib/settings'
  * tab bar: the labels are doing the work, and a tab bar would spend the scarcest axis on a
  * phone.
  */
-const { t } = useI18n()
+const { t, locale } = useI18n()
 const route = useRoute()
 const localePath = useLocalePath()
 const auth = useAuth()
@@ -79,7 +81,33 @@ function closeAccountMenu() {
   accountMenuClosedAt = performance.now()
 }
 
+/** The plan and what is left of the period, from `GET /api/me`; none until it answers. */
+const accountFacts = computed<MenuFact[]>(() => {
+  const me = auth.me.value
+  if (!me) {
+    return []
+  }
+  return [
+    { label: t('nav.plan'), value: me.plan === 'free' ? t('billing.free') : me.plan },
+    {
+      label: t('nav.credits'),
+      value: t('nav.creditsLeft', { n: formatCount(me.credits_remaining, locale.value) }, me.credits_remaining),
+    },
+  ]
+})
+
+/** Upgrade on Free, Billing on a paid plan: both open the Billing section, where the plan's
+ *  action is — the menu starts no checkout itself (docs/web.md § The account menu). */
 const accountItems = computed<MenuItem[]>(() => [
+  ...(auth.me.value
+    ? [
+        {
+          key: 'billing',
+          label: auth.me.value.plan === 'free' ? t('nav.upgrade') : t('nav.billing'),
+          icon: 'credit-card' as const,
+        },
+      ]
+    : []),
   { key: 'settings', label: t('nav.settings'), icon: 'settings' },
   { key: 'language', label: t('nav.language'), icon: 'globe' },
   { key: 'signOut', label: t('nav.signOut'), icon: 'sign-out', separated: true },
@@ -97,8 +125,8 @@ const router = useRouter()
 const settingsSection = computed(() => settingsSectionOf(route.query[SETTINGS_QUERY]))
 
 function onAccountAction(action: string) {
-  if (action === 'settings') {
-    void router.push({ query: { ...route.query, [SETTINGS_QUERY]: 'general' } })
+  if (action === 'settings' || action === 'billing') {
+    void router.push({ query: { ...route.query, [SETTINGS_QUERY]: action === 'billing' ? 'billing' : 'general' } })
   } else if (action === 'language') {
     languageOpen.value = true
   } else if (action === 'signOut') {
@@ -253,6 +281,7 @@ async function signOut() {
           :items="accountItems"
           :label="account"
           :header="auth.me.value?.user.email"
+          :facts="accountFacts"
           @select="onAccountAction"
           @close="closeAccountMenu"
         />

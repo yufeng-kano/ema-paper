@@ -12,6 +12,7 @@
 export type ApiErrorType =
   | 'revision_conflict'
   | 'invalid_request'
+  | 'storage_full'
   | 'auth'
   | 'rate_limit'
   | 'payment'
@@ -309,6 +310,8 @@ export interface MeResponse {
    *  it needs no second request (docs/billing.md § Routes). */
   plan: string
   credits_remaining: number
+  /** The balance a chat send needs (`CHAT_MIN_CREDITS`). */
+  chat_min_credits: number
 }
 
 // --- billing (docs/billing.md § Routes) --------------------------------------------

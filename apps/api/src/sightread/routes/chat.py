@@ -48,6 +48,7 @@ from ..upstream.client import agent_models
 from ..workspace.documents import (
     current_revision,
     directory_size,
+    ensure_within_quota,
     is_live,
     materialize_document,
     user_folders,
@@ -425,6 +426,9 @@ async def post_message(
     if not body.text.strip() and command is None and not attachment_ids:
         raise ApiError(400, "invalid_request", "The message needs text, a command or a file")
     row = await owned_conversation(db, user.id, conversation_id)
+    # A full workspace runs no turn (docs/workspace.md § Quota): refused here, where the
+    # reader is told at once, rather than as a turn that fails after it was accepted.
+    await ensure_within_quota(db, settings, user.id, user_root(settings.workspaces_dir, user.id))
     # Enforced where the decisions are made, under row locks held until this transaction
     # commits (PostgreSQL; the SQLite fallback runs one request at a time): the user's row
     # for the per-user cap, so two sends to different conversations cannot both slip under

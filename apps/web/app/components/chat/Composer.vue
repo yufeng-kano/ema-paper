@@ -37,6 +37,8 @@ const props = defineProps<{
   /** A turn is in flight: the composer waits, and Stop is the one control. */
   running: boolean
   stopping: boolean
+  /** A send would be refused (no credits, a full workspace): the draft waits, Send is off. */
+  blocked?: boolean
   limits: UploadLimits | null
   /** The document pane's selection, read as the reader comes to the composer. */
   documentSelection: () => string | null
@@ -655,6 +657,7 @@ onBeforeUnmount(() => {
 const canSend = computed(
   () =>
     !props.running &&
+    !props.blocked &&
     !sending.value &&
     !selectionTooLong.value &&
     (draft.value.trim() !== '' || command.value !== null || pending.value.some((item) => item.state !== 'refused')),

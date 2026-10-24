@@ -26,6 +26,9 @@ import {
   cancelTurn,
   createConversation,
   deleteConversation,
+  ApiRequestError,
+  getMe,
+  getSandbox,
   getConversation,
   listConversations,
   listMemories,
@@ -44,6 +47,8 @@ import { blockName, type NameText } from '~/lib/blocks'
 import { commandArguments, formatBytes, type AskOutcome, type AskRequest, type ComposerPayload } from '~/lib/composer'
 import { nodesToMarkdown } from '~/lib/copy'
 import { formatCount } from '~/lib/format'
+import { SETTINGS_QUERY } from '~/lib/settings'
+import { turnErrorKey, turnErrorNeedsPlan } from '~/lib/turnError'
 import { ANSWER_DRAG_TYPE, BLOCK_DRAG_TYPE } from '~/lib/dnd'
 import {
   blockPlain,
@@ -571,6 +576,75 @@ const items = computed(() => thread.value.items)
 /** A turn is in flight: the composer waits, and Stop is the one control. */
 const running = computed(() => thread.value.liveTurns.length > 0 || stream.active.value)
 
+// --- what would refuse a send (docs/web.md § The agent panel) -------------------------
+
+/** The workspace against the plan's storage, from `GET /api/sandbox`; null until read, or
+ *  when it cannot be — the server's 409 is the authority either way. */
+const storage = ref<{ bytes: number; quota: number } | null>(null)
+/** A send the server refused for storage (409 `storage_full`) while the figures read
+ *  showed room, or could not be read: the notice stands until a read shows room again. */
+const storageRefused = ref(false)
+
+async function readStorage() {
+  try {
+    const { workspace } = await getSandbox()
+    storage.value = { bytes: workspace.bytes, quota: workspace.quota_bytes }
+    storageRefused.value = false
+  } catch {
+    storage.value = null
+  }
+}
+
+const storageFull = computed(
+  () => storageRefused.value || (storage.value !== null && storage.value.bytes >= storage.value.quota),
+)
+
+/** The balance, read again and handed to the shell. A failed read keeps the figures there
+ *  were, where `auth.refresh` would sign the panel out on a network blip. */
+async function readBalance() {
+  try {
+    auth.me.value = await getMe()
+  } catch {
+    // The cached figures stand; the server's 402 is the authority either way.
+  }
+}
+
+/** Both figures, when the panel opens, when the window comes back — a period may have
+ *  reset or files been deleted meanwhile — and once a turn, which spends and writes, ends. */
+function readLimits() {
+  void readStorage()
+  void readBalance()
+}
+
+onMounted(() => {
+  readLimits()
+  window.addEventListener('focus', readLimits)
+})
+onBeforeUnmount(() => window.removeEventListener('focus', readLimits))
+watch(running, (now, before) => {
+  if (before && !now) {
+    readLimits()
+  }
+})
+
+const sendBlock = computed<'credits' | 'storage' | null>(() => {
+  const me = auth.me.value
+  if (me && me.credits_remaining < me.chat_min_credits) {
+    return 'credits'
+  }
+  if (storageFull.value) {
+    return 'storage'
+  }
+  return null
+})
+
+const router = useRouter()
+const route = useRoute()
+
+function seePlans() {
+  void router.push({ query: { ...route.query, [SETTINGS_QUERY]: 'billing' } })
+}
+
 const scroller = ref<HTMLElement | null>(null)
 
 /** Whether the thread follows what arrives: only while the reader is at its end. One who
@@ -878,6 +952,12 @@ async function submit(payload: ComposerPayload): Promise<boolean> {
     const refusal = creditsRefusalOf(error)
     if (refusal) {
       creditsRefusal.value = refusal
+      return false
+    }
+    if (error instanceof ApiRequestError && error.type === 'storage_full') {
+      // The notice says it, with the figures read again, rather than an error line.
+      await readStorage()
+      storageRefused.value = true
       return false
     }
     composerError.value = await resolve(error)
@@ -1479,9 +1559,14 @@ onBeforeUnmount(() => {
           @toggle-edit="toggleEdit"
         />
 
-        <p v-else-if="item.kind === 'error'" class="turn-error" role="alert">
-          {{ item.text === 'out_of_credits' ? t('chat.outOfCredits') : t('chat.turnError', { error: item.text }) }}
-        </p>
+        <!-- The worker's text is for the log: the line says it in the reader's words and
+             keeps the original in the tooltip (docs/web.md § The agent panel). -->
+        <div v-else-if="item.kind === 'error'" class="turn-error-row">
+          <p class="turn-error" role="alert" :title="item.text">{{ t(turnErrorKey(item.text)) }}</p>
+          <UiButton v-if="turnErrorNeedsPlan(item.text)" size="sm" variant="secondary" @click="seePlans">
+            {{ t('credits.seePlans') }}
+          </UiButton>
+        </div>
         <p v-else-if="item.kind === 'cancelled'" class="turn-note">{{ t('chat.turnCancelled') }}</p>
         <p v-else-if="item.kind === 'working'" class="working">
           <UiSpinner :size="12" />
@@ -1490,8 +1575,22 @@ onBeforeUnmount(() => {
       </template>
     </div>
 
+    <div v-if="sendBlock" class="send-block" role="status">
+      <p class="send-block-text">
+        {{
+          sendBlock === 'credits'
+            ? t('chat.blockedCredits')
+            : storage
+              ? t('chat.blockedStorage', { used: formatBytes(storage.bytes), quota: formatBytes(storage.quota) })
+              : t('chat.blockedStorageBare')
+        }}
+      </p>
+      <UiButton size="sm" @click="seePlans">{{ t('credits.seePlans') }}</UiButton>
+    </div>
+
     <ChatComposer
       ref="composer"
+      :blocked="sendBlock !== null"
       :running="running"
       :stopping="stopping"
       :limits="limits"
@@ -1914,7 +2013,15 @@ onBeforeUnmount(() => {
   font-size: var(--text-xs);
 }
 
+.turn-error-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
 .turn-error {
+  flex: 1 1 auto;
+  min-width: 0;
   color: var(--danger);
   font-size: var(--text-xs);
   line-height: 1.5;
@@ -1936,6 +2043,26 @@ onBeforeUnmount(() => {
 }
 
 /* --- the drop zone: a dashed accent outline over the whole column ---------------------- */
+
+/* What would refuse a send, over the composer: a fact with its way out, not an error. */
+.send-block {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: var(--space-3);
+  margin: var(--space-2) var(--space-4) 0;
+  padding: var(--space-3);
+  border: 1px solid var(--edge);
+  background: var(--rail);
+}
+
+.send-block-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--ink);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+}
 
 .drop-zone {
   position: absolute;

@@ -139,7 +139,7 @@ Payment is through **Kano Pay** (`pay.yuufeng.com`), the operator's payment serv
 | `POST /api/billing/pay-webhook` | `Kano-Pay-Signature` | `{}` |
 | `GET /api/billing/entries?days=30` | session | `{days, per_day: [{date, parse, chat}], per_agent: [{agent, credits}]}` — the Usage tab's credits view, from `credit_entries` |
 
-`GET /api/me` grows `plan` (`free` or the plan id) and `credits_remaining`, so the shell can show the balance without a second request; `POST /api/library/documents` and `POST /v1/parse` answer 402 as above; the `jobs` and `chat_turns` payloads grow `credits` (the entry's amount, `null` while a reservation is pending its settlement), so History and the thread can show what a parse or a turn cost ([web.md](./web.md) § The agent panel).
+`GET /api/me` grows `plan` (`free` or the plan id), `credits_remaining` and `chat_min_credits` (`CHAT_MIN_CREDITS`), so the shell can show the balance, and the agent panel say a send would be refused, without a second request; `POST /api/library/documents` and `POST /v1/parse` answer 402 as above; the `jobs` and `chat_turns` payloads grow `credits` (the entry's amount, `null` while a reservation is pending its settlement), so History and the thread can show what a parse or a turn cost ([web.md](./web.md) § The agent panel).
 
 ## Web
 

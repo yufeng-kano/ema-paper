@@ -555,7 +555,7 @@ async def ensure_within_quota(
     used = await asyncio.to_thread(workspace_size, root)
     if used >= limit:
         raise ApiError(
-            409, "invalid_request", "The workspace is at its quota; free some space first"
+            409, "storage_full", "The workspace is at its quota; free some space first"
         )
 
 
