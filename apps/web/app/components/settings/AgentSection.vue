@@ -73,22 +73,22 @@ function onTabKeydown(event: KeyboardEvent, index: number) {
     <UiBanner v-if="agentsError" class="agents-state" tone="error">{{ agentsError }}</UiBanner>
     <UiSkeleton v-else-if="!agentsData" class="agents-state" :rows="2" />
     <template v-else>
-      <div class="tabs" role="tablist" :aria-label="t('agents.tabs')">
+      <UiSegmented class="tabs" role="tablist" :aria-label="t('agents.tabs')">
         <button
           v-for="(agent, index) in tabs"
           :key="agent.name"
           type="button"
           role="tab"
-          class="tab"
+          class="segment"
           :class="{ active: selected?.name === agent.name }"
           :aria-selected="selected?.name === agent.name"
           :tabindex="selected?.name === agent.name ? 0 : -1"
           @click="selectedName = agent.name"
           @keydown="onTabKeydown($event, index)"
         >
-          <span class="tab-label">{{ agentTitle(agent) }}</span>
+          {{ agentTitle(agent) }}
         </button>
-      </div>
+      </UiSegmented>
 
       <!-- Positioned: the panel's drawers anchor to this box's right edge. -->
       <div v-if="selected" class="agent-region">
@@ -109,51 +109,15 @@ function onTabKeydown(event: KeyboardEvent, index: number) {
 </template>
 
 <style scoped>
+.agents-state {
+  margin-top: var(--space-5);
+}
+
 /* --- The tabs ------------------------------------------------------------------ */
 
 .tabs {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 2px;
-  padding: 0 0 var(--space-2);
-}
-
-/* The same row the sidebar's nav uses: a fill and a step up in weight say "open",
-   nothing else (docs/web.md § Design system). */
-.tab {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  height: var(--control-height-sm);
-  padding: 0 var(--space-3);
-  border: 0;
-  border-radius: var(--radius);
-  background: transparent;
-  color: var(--ink-soft);
-  font: inherit;
-  font-size: var(--text-sm);
-  cursor: pointer;
-  transition:
-    background var(--duration-fast) var(--ease),
-    color var(--duration-fast) var(--ease);
-}
-
-.tab:hover {
-  background: var(--rail-active);
-  color: var(--ink);
-}
-
-.tab.active {
-  background: var(--rail-active);
-  color: var(--ink);
-  font-weight: var(--weight-medium);
-}
-
-.tab-label {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  align-self: flex-start;
+  margin-top: var(--space-5);
 }
 
 /* --- The selected agent ---------------------------------------------------------- */
@@ -162,7 +126,7 @@ function onTabKeydown(event: KeyboardEvent, index: number) {
    edge (docs/web.md § Pages). */
 .agent-region {
   position: relative;
-  padding-top: var(--space-4);
+  padding-top: var(--space-6);
 }
 
 .agent-head {

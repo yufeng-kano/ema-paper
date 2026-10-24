@@ -247,7 +247,8 @@ function pick(name: string) {
 </template>
 
 <style scoped>
-/* The menu's floating surface with 4px of padding (docs/web.md § Design system). */
+/* A glass capsule over the document, as the screens' toolbars are (docs/web.md § Design
+   system, *Glass is for what floats*). */
 .toolbar {
   position: absolute;
   z-index: 4;
@@ -255,12 +256,11 @@ function pick(name: string) {
   align-items: center;
   gap: 2px;
   padding: var(--space-1);
-  border: 1px solid var(--menu-edge);
-  border-radius: var(--radius-menu);
-  background: var(--menu-surface);
-  box-shadow: var(--shadow-menu);
-  backdrop-filter: blur(24px) saturate(180%);
-  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  border-radius: var(--radius-full);
+  background: var(--glass);
+  box-shadow: var(--shadow-glass), var(--shadow-menu);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
   white-space: nowrap;
   animation: toolbar-in var(--duration-fast) var(--ease-enter);
 }
@@ -286,15 +286,15 @@ function pick(name: string) {
   }
 }
 
-/* A hovered button is the context menu's highlighted row on another surface: the accent. */
+/* The capsule's buttons: capsules themselves, the gray fill under the pointer. */
 .tool {
   display: inline-flex;
   align-items: center;
-  gap: var(--space-1);
-  height: 30px;
-  padding: 0 var(--space-2);
+  gap: 6px;
+  height: 32px;
+  padding: 0 12px 0 10px;
   border: 0;
-  border-radius: var(--radius-menu-item);
+  border-radius: var(--radius-full);
   background: transparent;
   color: var(--ink);
   font-size: var(--text-sm);
@@ -306,17 +306,13 @@ function pick(name: string) {
 
 .toolbar.compact .tool {
   justify-content: center;
-  width: 30px;
+  width: 36px;
   padding: 0;
 }
 
-.tool:hover {
-  background: var(--accent);
-  color: var(--accent-fg);
-}
-
+.tool:hover,
 .tool.on {
-  background: var(--rail-active);
+  background: var(--fill);
 }
 
 .tool > :deep(svg) {
@@ -330,7 +326,7 @@ function pick(name: string) {
   width: 1px;
   height: 18px;
   margin-inline: 2px;
-  background: var(--menu-edge);
+  background: var(--line-strong);
 }
 
 /* The skill list: the same surface, hung under the toolbar's right edge. */

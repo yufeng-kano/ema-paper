@@ -31,7 +31,7 @@ defineProps<{
   align-items: center;
   justify-content: center;
   gap: var(--space-2);
-  padding: var(--space-12) var(--space-5);
+  padding: var(--space-14) var(--space-5);
   text-align: center;
 }
 
@@ -41,16 +41,19 @@ defineProps<{
 }
 
 .empty-title {
-  font-size: var(--text-sm);
+  font-size: var(--text-base);
   font-weight: var(--weight-semibold);
   color: var(--ink);
 }
 
+/* Balanced, so a line never ends on one stray character — which a CJK line otherwise
+   does at this width. */
 .empty-body {
   max-width: 44ch;
   color: var(--muted);
   font-size: var(--text-sm);
-  line-height: 1.6;
+  line-height: 1.55;
+  text-wrap: balance;
 }
 
 .empty-action {

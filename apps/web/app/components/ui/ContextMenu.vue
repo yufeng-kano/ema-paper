@@ -457,9 +457,7 @@ function choose(item: MenuItem, event?: MouseEvent) {
 /*
  * A floating surface, built the way the platform builds one: rounded, hairlined, translucent
  * over what it covers, and lifted by a two-part shadow — a tight contact shadow so the edge
- * reads, and a wide soft one for the height. This is the design's one exception to flat
- * square paper, and it is deliberate: a menu that shares the page's geometry looks pasted
- * into it (docs/web.md § Design system).
+ * reads, and a wide soft one for the height (docs/web.md § Design system).
  */
 .menu {
   position: fixed;
@@ -475,7 +473,7 @@ function choose(item: MenuItem, event?: MouseEvent) {
   /* Never sideways: a label longer than the menu is cut with an ellipsis instead. */
   overflow-x: hidden;
   overflow-y: auto;
-  padding: var(--space-1);
+  padding: 5px;
   border-radius: var(--radius-menu);
   border: 1px solid var(--menu-edge);
   background: var(--menu-surface);

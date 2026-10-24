@@ -3,10 +3,9 @@
  * Status indicator. The dot is never alone — it always ships with its label, because
  * color-only status fails both colorblind users and screen readers.
  *
- * Succeeded takes the accent: a finished job is the data this page is about. Running and
- * queued sit on their own quiet steps, outside the danger hue, so a job in flight never
- * reads as a problem. Failed colours the label as well as the dot — it is the one state a
- * reader has to find while scanning a column of rows.
+ * The system's status hues: succeeded green, running cyan, queued gray, so a job in flight
+ * never reads as a problem. Failed colours the label as well as the dot — it is the one
+ * state a reader has to find while scanning a column of rows.
  */
 withDefaults(
   defineProps<{
@@ -33,8 +32,8 @@ withDefaults(
 }
 
 .dot {
-  width: 7px;
-  height: 7px;
+  width: 8px;
+  height: 8px;
   flex-shrink: 0;
   border-radius: var(--radius-full);
   background: var(--queued);
@@ -46,7 +45,7 @@ withDefaults(
 }
 
 .ok .dot {
-  background: var(--accent);
+  background: var(--success);
 }
 
 .info .dot {

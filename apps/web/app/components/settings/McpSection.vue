@@ -14,43 +14,31 @@ const STEPS = ['connect.step1', 'connect.step2', 'connect.step3'] as const
 
 <template>
   <SettingsSection :eyebrow="t('connect.eyebrow')" :title="t('connect.headTitle')">
-    <div class="region">
-      <h2 class="heading">{{ t('connect.mcpTitle') }}</h2>
+    <SettingsGroup :title="t('connect.mcpTitle')">
       <div class="endpoint">
         <span class="endpoint-url mono">{{ mcpUrl }}</span>
         <UiCopyButton :text="mcpUrl" variant="secondary" size="sm" labelled />
       </div>
+    </SettingsGroup>
 
-      <p class="eyebrow steps-label">{{ t('connect.howTitle') }}</p>
+    <SettingsGroup :title="t('connect.howTitle')">
       <ol class="steps">
         <li v-for="(step, index) in STEPS" :key="step" class="step">
-          <span class="step-number tabular">{{ String(index + 1).padStart(2, '0') }}</span>
+          <span class="step-number tabular" aria-hidden="true">{{ index + 1 }}</span>
           <p class="step-body">{{ t(step) }}</p>
         </li>
       </ol>
-    </div>
+    </SettingsGroup>
   </SettingsSection>
 </template>
 
 <style scoped>
-.region {
-  padding-top: var(--space-8);
-}
-
-.heading {
-  font-size: var(--display-sm);
-  letter-spacing: normal;
-}
-
-/* Rule-bounded rather than boxed — the same treatment every value in this design gets. */
 .endpoint {
   display: flex;
   align-items: center;
   gap: var(--space-4);
-  margin-top: var(--space-4);
-  padding: var(--space-4) 0;
-  border-top: 1px solid var(--hair);
-  border-bottom: 1px solid var(--hair);
+  min-height: 56px;
+  padding: var(--space-3) 0;
 }
 
 .endpoint-url {
@@ -59,44 +47,45 @@ const STEPS = ['connect.step1', 'connect.step2', 'connect.step3'] as const
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: var(--text-base);
+  font-size: var(--text-sm);
   color: var(--ink);
-}
-
-.steps-label {
-  margin-top: var(--space-9);
 }
 
 .steps {
   list-style: none;
-  margin: var(--space-4) 0 0;
+  margin: 0;
   padding: 0;
 }
 
 .step {
-  display: grid;
-  grid-template-columns: 36px minmax(0, 1fr);
-  gap: var(--space-4);
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
   padding: var(--space-4) 0;
-  border-top: 1px solid var(--hair);
 }
 
-.step:last-child {
-  border-bottom: 1px solid var(--hair);
+.step + .step {
+  border-top: 1px solid var(--line);
 }
 
-/* The step number is the only accent on this page: it is the sequence, which is the data
-   the page carries. */
+/* The sequence is the data this list carries: the number on a small accent disc. */
 .step-number {
-  font-family: var(--font-display);
-  font-size: var(--display-sm);
-  font-weight: var(--weight-semibold);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
+  border-radius: var(--radius-full);
+  background: var(--accent-tint);
   color: var(--accent);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
 }
 
 .step-body {
   max-width: 60ch;
-  color: var(--muted);
-  line-height: 1.7;
+  color: var(--ink-soft);
+  line-height: 1.6;
 }
 </style>

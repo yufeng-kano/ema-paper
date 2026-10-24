@@ -31,36 +31,38 @@ async function signOut() {
 
 <template>
   <SettingsSection :title="t('settings.sections.account')">
-    <SettingsRow
-      :label="t('settings.account.signedInAs')"
-      :description="t('settings.account.signedInAsDescription')"
-    >
-      <div v-if="user" class="identity">
-        <img
-          v-if="user.picture && !pictureFailed"
-          class="avatar"
-          :src="user.picture"
-          alt=""
-          referrerpolicy="no-referrer"
-          @error="pictureFailed = true"
-        >
-        <span v-else class="avatar avatar-initial" aria-hidden="true">{{ initial }}</span>
-        <span class="who">
-          <span class="name">{{ name }}</span>
-          <span v-if="user.name && user.email" class="email">{{ user.email }}</span>
-        </span>
-      </div>
-    </SettingsRow>
+    <SettingsGroup>
+      <SettingsRow
+        :label="t('settings.account.signedInAs')"
+        :description="t('settings.account.signedInAsDescription')"
+      >
+        <div v-if="user" class="identity">
+          <img
+            v-if="user.picture && !pictureFailed"
+            class="avatar"
+            :src="user.picture"
+            alt=""
+            referrerpolicy="no-referrer"
+            @error="pictureFailed = true"
+          >
+          <span v-else class="avatar avatar-initial" aria-hidden="true">{{ initial }}</span>
+          <span class="who">
+            <span class="name">{{ name }}</span>
+            <span v-if="user.name && user.email" class="email">{{ user.email }}</span>
+          </span>
+        </div>
+      </SettingsRow>
 
-    <SettingsRow
-      :label="t('settings.account.signOut')"
-      :description="t('settings.account.signOutDescription')"
-    >
-      <UiButton variant="secondary" :loading="signingOut" @click="signOut">
-        <template #icon><UiIcon name="sign-out" /></template>
-        {{ t('settings.account.signOut') }}
-      </UiButton>
-    </SettingsRow>
+      <SettingsRow
+        :label="t('settings.account.signOut')"
+        :description="t('settings.account.signOutDescription')"
+      >
+        <UiButton variant="secondary" :loading="signingOut" @click="signOut">
+          <template #icon><UiIcon name="sign-out" /></template>
+          {{ t('settings.account.signOut') }}
+        </UiButton>
+      </SettingsRow>
+    </SettingsGroup>
   </SettingsSection>
 </template>
 
@@ -80,12 +82,13 @@ async function signOut() {
   object-fit: cover;
 }
 
+/* The sidebar's initial: white on the system's gray, as a contact without a photo. */
 .avatar-initial {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  background: var(--rail-active);
-  color: var(--ink);
+  background: linear-gradient(180deg, var(--faint), var(--muted));
+  color: var(--accent-fg);
   font-size: var(--text-base);
   font-weight: var(--weight-semibold);
 }
@@ -99,7 +102,8 @@ async function signOut() {
 .name {
   overflow: hidden;
   color: var(--ink);
-  font-size: var(--text-base);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
   text-overflow: ellipsis;
   white-space: nowrap;
 }

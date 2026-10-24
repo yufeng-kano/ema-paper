@@ -1,52 +1,59 @@
 <script setup lang="ts">
 /**
- * The top of the left rail: what this screen is, in two lines.
+ * A screen's large title, and what is beside it.
  *
- * It is not a top bar any more. The design puts the page's identity — an uppercase eyebrow
- * naming the range or the state of the data, then the title in the display serif — at the
- * head of the narrative rail, and the screen's controls either in the rail beneath it or in
- * the panel header they act on (docs/web.md § Design system).
- *
- * The eyebrow is a fact about the data ("Last 30 days", "3 active", "OAuth · no key"), never
- * a line explaining what the page is for.
+ * The title is the screen's name in the system's large-title style — or, through the
+ * `title` slot, something made of more than a string, as the file library's breadcrumb is;
+ * the default slot is the quiet line beside it on the same baseline — a count, a tally —
+ * never a sentence explaining what the screen is for (docs/web.md § Design system, *The
+ * frame*).
  */
-withDefaults(
-  defineProps<{
-    title: string
-    eyebrow?: string
-    /** One step down, for a title that is two words wide ("MCP Connector"). */
-    size?: 'md' | 'lg'
-  }>(),
-  { size: 'lg', eyebrow: undefined },
-)
+defineProps<{ title?: string }>()
+
+defineSlots<{
+  /** In place of the title's text: a breadcrumb. */
+  title?: () => unknown
+  /** Beside the title: a count or a tally, in the muted color. */
+  default?: () => unknown
+}>()
 </script>
 
 <template>
-  <header class="rail-header">
-    <p v-if="eyebrow" class="eyebrow">{{ eyebrow }}</p>
-    <h1 class="title" :class="size">{{ title }}</h1>
+  <header class="page-head">
+    <h1 class="title">
+      <slot name="title">{{ title }}</slot>
+    </h1>
+    <div v-if="$slots.default" class="meta">
+      <slot />
+    </div>
   </header>
 </template>
 
 <style scoped>
-.rail-header {
-  display: grid;
-  gap: var(--space-3);
+.page-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-3);
   min-width: 0;
 }
 
 .title {
   min-width: 0;
-  /* Tight enough that a two-line title reads as one block rather than two rows. */
-  line-height: 1.05;
-  overflow-wrap: anywhere;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--display-lg);
+  line-height: 1.15;
 }
 
-.title.lg {
-  font-size: var(--display-4xl);
-}
-
-.title.md {
-  font-size: var(--display-3xl);
+.meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-3);
+  min-width: 0;
+  color: var(--muted);
+  font-size: var(--text-sm);
 }
 </style>

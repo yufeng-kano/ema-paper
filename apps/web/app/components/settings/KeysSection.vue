@@ -197,7 +197,7 @@ async function confirmRevoke() {
 
       <!-- The keys' one consumer worth showing here: the REST call they authorize. The
            example carries the header, so no sentence restates it. -->
-      <UiPanel :title="t('keys.restTitle')" sunken divided>
+      <UiPanel :title="t('keys.restTitle')">
         <template #meta>
           <UiCopyButton :text="curlExample" variant="secondary" size="xs" labelled />
         </template>
@@ -275,14 +275,15 @@ async function confirmRevoke() {
 }
 
 /* A command line must not be re-wrapped into something that no longer runs: it scrolls in
-   its own box rather than growing the panel sideways. */
+   its own rounded well rather than growing the panel sideways. */
 .code {
   margin: 0;
   overflow-x: auto;
-  padding-top: var(--space-4);
-  border-top: 1px solid var(--hair);
-  color: var(--muted);
-  font-size: var(--text-sm);
+  padding: var(--space-4);
+  border-radius: var(--radius-lg);
+  background: var(--paper-sunken);
+  color: var(--ink-soft);
+  font-size: var(--text-xs);
   line-height: 1.8;
   white-space: pre;
 }

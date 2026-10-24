@@ -51,9 +51,9 @@ function cycleOf(plan: CatalogPlan): string {
   return t('pricing.cycle.other', { n: formatCount(frequency, locale.value), interval })
 }
 
-/** The Billing section, where *Upgrade* is; a signed-out visitor is sent to sign in first
+/** The Usage section, where *Upgrade* is; a signed-out visitor is sent to sign in first
  *  and lands there after it (the destination kept for this tab). */
-const billingPath = computed(() => `${localePath('/files')}?${SETTINGS_QUERY}=billing`)
+const usagePath = computed(() => `${localePath('/files')}?${SETTINGS_QUERY}=usage`)
 
 // --- a signed-in reader -------------------------------------------------------------------
 
@@ -65,7 +65,7 @@ const myPlan = computed(() => auth.me.value?.plan ?? null)
 const checkingOut = ref<string | null>(null)
 const checkoutError = ref<{ plan: string; message: string } | null>(null)
 
-/** Pay's checkout for the plan, in this tab: the return lands on the Billing section, as
+/** Pay's checkout for the plan, in this tab: the return lands on the Usage section, as
  *  that section's own *Upgrade* does (docs/billing.md § Kano Pay). */
 async function upgrade(plan: CatalogPlan) {
   if (checkingOut.value) {
@@ -169,7 +169,7 @@ const questions = ['1', '2', '3', '4'] as const
               <div class="actions">
                 <template v-if="myPlan === plan.plan_id">
                   <p class="current">{{ t('pricing.currentPlan') }}</p>
-                  <NuxtLink class="cta secondary" :to="billingPath">{{ t('pricing.manage') }}</NuxtLink>
+                  <NuxtLink class="cta secondary" :to="usagePath">{{ t('pricing.manage') }}</NuxtLink>
                 </template>
                 <button
                   v-else-if="myPlan === 'free'"
@@ -181,7 +181,7 @@ const questions = ['1', '2', '3', '4'] as const
                 >
                   {{ t('pricing.upgrade') }}
                 </button>
-                <NuxtLink v-else-if="myPlan === null" class="cta" :to="billingPath" @click="keepAfterSignIn(billingPath)">
+                <NuxtLink v-else-if="myPlan === null" class="cta" :to="usagePath" @click="keepAfterSignIn(usagePath)">
                   {{ t('pricing.upgrade') }}
                 </NuxtLink>
               </div>
@@ -200,8 +200,8 @@ const questions = ['1', '2', '3', '4'] as const
           <h2 class="section-title">{{ t('pricing.howTitle') }}</h2>
           <p class="section-lede">{{ t('pricing.howLede') }}</p>
         </div>
-        <UiSkeleton v-if="parsePerPage === null && !loadError" :rows="4" />
-        <table v-else-if="parsePerPage !== null" class="how-table">
+        <UiSkeleton v-if="parsePerPage === null && !loadError" class="sheet" :rows="4" />
+        <table v-else-if="parsePerPage !== null" class="how-table sheet">
           <thead>
             <tr>
               <th scope="col">{{ t('pricing.columnAction') }}</th>
@@ -234,19 +234,22 @@ const questions = ['1', '2', '3', '4'] as const
           <h2 class="section-title">{{ t('pricing.ratesTitle') }}</h2>
           <p class="section-lede">{{ t('pricing.ratesLede') }}</p>
         </div>
-        <UiDataTable
-          :columns="rateColumns"
-          :rows="rateRows"
-          :row-key="(row) => row.model"
-          :caption="t('pricing.ratesTitle')"
-          density="tight"
-        >
-          <template #cell-model="{ row }"><span class="mono">{{ row.model }}</span></template>
-          <template #cell-input="{ row }">{{ rate(row.input) }}</template>
-          <template #cell-cache_read="{ row }">{{ rate(row.cache_read) }}</template>
-          <template #cell-cache_write="{ row }">{{ rate(row.cache_write) }}</template>
-          <template #cell-output="{ row }">{{ rate(row.output) }}</template>
-        </UiDataTable>
+        <!-- Wider than a phone: the sheet scrolls sideways, the page does not. -->
+        <div class="sheet rates-sheet">
+          <UiDataTable
+            :columns="rateColumns"
+            :rows="rateRows"
+            :row-key="(row) => row.model"
+            :caption="t('pricing.ratesTitle')"
+            density="tight"
+          >
+            <template #cell-model="{ row }"><span class="mono">{{ row.model }}</span></template>
+            <template #cell-input="{ row }">{{ rate(row.input) }}</template>
+            <template #cell-cache_read="{ row }">{{ rate(row.cache_read) }}</template>
+            <template #cell-cache_write="{ row }">{{ rate(row.cache_write) }}</template>
+            <template #cell-output="{ row }">{{ rate(row.output) }}</template>
+          </UiDataTable>
+        </div>
       </section>
 
       <section class="faq">
@@ -264,39 +267,46 @@ const questions = ['1', '2', '3', '4'] as const
 </template>
 
 <style scoped>
+/* Apple's product-page rhythm on the desk: a centered hero, paper cards, centered section
+   heads over content the width of the cards. */
 .content {
-  width: 100%;
-  max-width: 880px;
-  margin: 0 auto;
-  padding: var(--space-10) var(--space-6) var(--space-12);
   display: flex;
   flex-direction: column;
-  gap: var(--space-11);
+  gap: var(--space-14);
+  width: 100%;
+  max-width: 920px;
+  margin: 0 auto;
+  padding: var(--space-14) var(--space-6) var(--space-12);
 }
 
 .hero {
   display: grid;
+  justify-items: center;
   gap: var(--space-3);
-  max-width: 640px;
+  text-align: center;
 }
 
 .title {
-  font-size: var(--display-xl);
-  line-height: 1.1;
+  max-width: 16em;
+  font-size: var(--display-3xl);
+  line-height: 1.08;
+  text-wrap: balance;
 }
 
 .lede,
 .section-lede,
 .for {
   color: var(--muted);
-  line-height: 1.6;
+  line-height: 1.55;
 }
 
 .lede {
-  font-size: var(--text-read-sm);
+  max-width: 34em;
+  font-size: var(--text-lg);
+  text-wrap: pretty;
 }
 
-/* Two cards side by side, stacking on a phone; the paid one carries the accent edge. */
+/* Two cards side by side, stacking on a phone; the paid one carries an accent ring. */
 .plans {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
@@ -308,13 +318,20 @@ const questions = ['1', '2', '3', '4'] as const
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
-  padding: var(--space-6);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
+  padding: var(--space-8);
+  border-radius: var(--radius-card);
+  background: var(--paper);
+  box-shadow: var(--shadow-pane);
 }
 
 .plan.paid {
-  border-color: var(--accent);
+  box-shadow:
+    0 0 0 2px var(--accent),
+    var(--shadow-pane);
+}
+
+.plan .eyebrow {
+  font-size: var(--text-sm);
 }
 
 .eyebrow.accent {
@@ -322,22 +339,34 @@ const questions = ['1', '2', '3', '4'] as const
 }
 
 .price {
-  font-size: var(--display-sm);
-  font-weight: var(--weight-semibold);
+  font-size: var(--display-xl);
+  font-weight: var(--weight-bold);
+  letter-spacing: var(--tracking-tight);
+  line-height: 1.1;
 }
 
 .cycle {
   color: var(--muted);
-  font-size: var(--text-sm);
+  font-size: var(--text-base);
   font-weight: var(--weight-normal);
+  letter-spacing: normal;
 }
 
+/* What the plan gives, as a spec list: one line each, hairlines between. */
 .gives {
-  display: grid;
-  gap: var(--space-2);
-  margin: var(--space-2) 0 0;
-  padding: 0 0 0 var(--space-5);
-  line-height: 1.5;
+  margin: var(--space-3) 0 var(--space-6);
+  padding: 0;
+  list-style: none;
+  font-size: var(--text-sm);
+}
+
+.gives li {
+  padding: 10px 0;
+  border-top: 1px solid var(--line);
+}
+
+.gives li:last-child {
+  border-bottom: 1px solid var(--line);
 }
 
 /* The card's action at its foot: a link, the checkout button, or *Current plan*. */
@@ -357,18 +386,21 @@ const questions = ['1', '2', '3', '4'] as const
 
 .cta {
   display: inline-flex;
+  flex: 1 1 auto;
   align-items: center;
   justify-content: center;
-  height: var(--control-height);
-  padding: 0 var(--space-4);
+  height: var(--control-height-lg);
+  padding: 0 var(--space-5);
   border: 0;
-  border-radius: var(--radius);
+  border-radius: var(--radius-full);
   font: inherit;
+  font-size: var(--text-base);
+  font-weight: var(--weight-medium);
   cursor: pointer;
   background: var(--accent);
   color: var(--accent-fg);
-  font-weight: var(--weight-medium);
   text-decoration: none;
+  box-shadow: inset 0 1px 0 var(--accent-highlight);
   transition: background var(--duration-fast) var(--ease);
 }
 
@@ -382,57 +414,86 @@ const questions = ['1', '2', '3', '4'] as const
 }
 
 .cta.secondary {
-  border: 1px solid var(--line-strong);
-  background: transparent;
+  background: var(--fill);
   color: var(--ink);
+  box-shadow: none;
 }
 
 .cta.secondary:hover {
-  background: var(--rail);
+  background: var(--fill-strong);
 }
 
 .not-on-sale {
   align-self: center;
   color: var(--muted);
   font-size: var(--text-sm);
+  text-align: center;
 }
 
 .how,
 .rates,
 .faq {
   display: grid;
-  gap: var(--space-5);
+  gap: var(--space-6);
 }
 
 .how-head {
   display: grid;
+  justify-items: center;
   gap: var(--space-2);
+  text-align: center;
 }
 
 .section-title {
-  font-size: var(--display-sm);
+  font-size: var(--display-lg);
+  text-align: center;
+}
+
+.section-lede {
+  max-width: 40em;
+  font-size: var(--text-base);
+}
+
+/* A table on the desk sits on a paper sheet with the plans' lift, at the grouped list's
+   radius. */
+.sheet {
+  overflow: hidden;
+  border-radius: var(--radius-lg);
+  background: var(--paper);
+  box-shadow:
+    0 0 0 0.5px var(--pane-edge),
+    0 4px 14px var(--glass-shadow);
+}
+
+.rates-sheet {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  padding: var(--space-2) var(--space-3);
 }
 
 .how-table {
   width: 100%;
-  border-collapse: collapse;
+  border-collapse: separate;
+  border-spacing: 0;
   font-size: var(--text-sm);
 }
 
 .how-table th,
 .how-table td {
-  padding: var(--space-3) 0;
-  border-bottom: 1px solid var(--hair);
+  padding: var(--space-3) var(--space-5);
+  border-bottom: 1px solid var(--line);
   text-align: left;
   vertical-align: top;
 }
 
+.how-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
 .how-table th {
-  color: var(--faint);
-  font-size: var(--text-2xs);
+  color: var(--muted);
+  font-size: var(--text-xs);
   font-weight: var(--weight-semibold);
-  letter-spacing: var(--tracking-label);
-  text-transform: uppercase;
 }
 
 .num {
@@ -443,13 +504,14 @@ const questions = ['1', '2', '3', '4'] as const
 .questions {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-  gap: var(--space-6);
+  gap: var(--space-8) var(--space-10);
   margin: 0;
 }
 
 .question dt {
   margin-bottom: var(--space-2);
-  font-weight: var(--weight-medium);
+  font-size: var(--text-base);
+  font-weight: var(--weight-semibold);
 }
 
 .question dd {
@@ -461,11 +523,23 @@ const questions = ['1', '2', '3', '4'] as const
 
 @media (max-width: 640px) {
   .content {
-    padding: var(--space-8) var(--space-4) var(--space-10);
-    gap: var(--space-9);
+    gap: var(--space-11);
+    padding: var(--space-10) var(--space-4) var(--space-10);
   }
 
   .title {
+    font-size: var(--display-lg);
+  }
+
+  .lede {
+    font-size: var(--text-base);
+  }
+
+  .plan {
+    padding: var(--space-6);
+  }
+
+  .section-title {
     font-size: var(--display-md);
   }
 }

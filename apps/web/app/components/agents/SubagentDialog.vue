@@ -368,11 +368,9 @@ async function remove() {
 /* The field label's treatment, for a legend and a label outside `UiField`. */
 .legend {
   padding: 0;
-  font-size: var(--text-2xs);
+  font-size: var(--text-xs);
   font-weight: var(--weight-semibold);
-  letter-spacing: var(--tracking-label);
-  text-transform: uppercase;
-  color: var(--faint);
+  color: var(--muted);
 }
 
 .tools {

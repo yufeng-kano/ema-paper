@@ -29,17 +29,6 @@ export default defineNuxtConfig({
         { rel: 'icon', href: '/favicon.svg', type: 'image/svg+xml' },
         { rel: 'icon', href: '/favicon.ico', sizes: '48x48' },
         { rel: 'apple-touch-icon', href: '/apple-touch-icon.png' },
-        // Source Serif 4 is the display face of the Graphite system (docs/web.md). Served
-        // from Google Fonts — there is no font pipeline in this app to self-host through —
-        // with both preconnects, since the stylesheet host and the font host differ and
-        // the second request is what actually blocks the first serif paint. The fallback
-        // in `--font-display` carries the page until it lands.
-        { rel: 'preconnect', href: 'https://fonts.googleapis.com' },
-        { rel: 'preconnect', href: 'https://fonts.gstatic.com', crossorigin: '' },
-        {
-          rel: 'stylesheet',
-          href: 'https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&display=swap',
-        },
       ],
     },
   },

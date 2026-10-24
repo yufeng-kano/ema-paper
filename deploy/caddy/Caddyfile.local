@@ -5,7 +5,7 @@ http://localhost:8080 {
 	# so a CSP violation shows up here first (docs/deployment.md § Security headers).
 	header {
 		defer
-		Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com; img-src 'self' data: blob: https://*.googleusercontent.com; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+		Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob: https://*.googleusercontent.com; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
 		X-Frame-Options DENY
 		X-Content-Type-Options nosniff
 		Referrer-Policy strict-origin-when-cross-origin

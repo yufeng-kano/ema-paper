@@ -1,12 +1,13 @@
 <script setup lang="ts">
 /**
- * The one surface a signed-out visitor sees, and still the app's SEO page.
+ * The one surface a signed-out visitor sees, and still the app's SEO page (docs/web.md
+ * § Pages, `/`).
  *
- * Two columns: an ink brand panel that says what this is, and the sign-in panel. The brand
- * panel is deliberately dark in *both* themes — the single exception to the token palette —
- * so it carries its own local `--panel-*` values rather than reading `--paper`.
+ * One centered column, the way Apple introduces a product: the app icon and name, the hero
+ * line and the body line, the sign-in card, then two facts — under the public bar and over
+ * the public footer every public page shares (`PublicShell`).
  *
- * The Google button is the other prescribed surface: white background, `#dadce0` border, the
+ * The Google button is the one prescribed surface: white background, `#dadce0` border, the
  * official four-color mark inlined as SVG (never a remote asset), and Google's own dark
  * variant. Those values are Google's to set, not ours to tokenize.
  *
@@ -66,36 +67,17 @@ async function signInAsDeveloper() {
 </script>
 
 <template>
-  <div class="login-page">
-    <aside class="login-brand">
-      <div class="login-brand-inner">
+  <PublicShell>
+    <main class="intro">
+      <header class="hero">
         <AppBrand size="lg" />
+        <h1 class="hero-title">{{ t('login.pitchTitle') }}</h1>
+        <p class="hero-body">{{ t('login.pitchBody') }}</p>
+      </header>
 
-        <div class="login-pitch">
-          <h2>{{ t('login.pitchTitle') }}</h2>
-          <p>{{ t('login.pitchBody') }}</p>
-        </div>
-
-        <!-- Two facts, not a feature list: what you talk to it with, and whose money pays
-             for the vision calls. -->
-        <dl class="login-facts">
-          <div class="fact">
-            <dt>{{ t('login.factInterfaces') }}</dt>
-            <dd>{{ t('login.factInterfacesValue') }}</dd>
-          </div>
-          <div class="fact">
-            <dt>{{ t('login.factBilling') }}</dt>
-            <dd>{{ t('login.factBillingValue') }}</dd>
-          </div>
-        </dl>
-      </div>
-    </aside>
-
-    <main class="login-panel">
-      <div class="login-form">
-        <p class="eyebrow">{{ t('login.account') }}</p>
-        <h1>{{ t('login.signIn') }}</h1>
-        <p class="login-lede">{{ t('login.lede') }}</p>
+      <section class="card" :aria-label="t('login.signIn')">
+        <h2 class="card-title">{{ t('login.signIn') }}</h2>
+        <p class="card-lede">{{ t('login.lede') }}</p>
 
         <!-- A plain link, not a client OAuth call: the backend owns the redirect flow. The
              locale rides along because it lives in the URL everywhere else, and Google is
@@ -124,7 +106,7 @@ async function signInAsDeveloper() {
         </a>
 
         <div v-if="devLoginAvailable" class="login-dev">
-          <UiButton class="dev-button" :loading="signingIn" @click="signInAsDeveloper">
+          <UiButton :loading="signingIn" @click="signInAsDeveloper">
             {{ t('login.devSignIn') }}
           </UiButton>
           <!-- Set to be read rather than shrunk and greyed: it is the one thing that explains
@@ -135,133 +117,87 @@ async function signInAsDeveloper() {
         <UiBanner v-if="devLoginError" class="login-error" tone="error">
           {{ devLoginError }}
         </UiBanner>
-      </div>
+      </section>
 
-      <PublicFooter class="login-footer" />
+      <!-- Two facts, not a feature list: what you talk to it with, and whose money pays
+           for the vision calls. -->
+      <dl class="facts">
+        <div class="fact">
+          <dt>{{ t('login.factInterfaces') }}</dt>
+          <dd>{{ t('login.factInterfacesValue') }}</dd>
+        </div>
+        <div class="fact">
+          <dt>{{ t('login.factBilling') }}</dt>
+          <dd>{{ t('login.factBillingValue') }}</dd>
+        </div>
+      </dl>
     </main>
-  </div>
+  </PublicShell>
 </template>
 
 <style scoped>
-.login-page {
-  display: grid;
-  grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
-  min-height: 100dvh;
-  background: var(--paper);
-}
-
-/* --- Brand panel (intentionally dark in both themes) ----------------------- */
-
-.login-brand {
-  --panel-bg: #15181c;
-  --panel-text: #eef1f4;
-  --panel-muted: #aeb6bd;
-  --panel-label: #9aa3ab;
-  --panel-rule: rgb(255 255 255 / 12%);
-  --panel-grid: rgb(255 255 255 / 4%);
-
-  position: relative;
-  overflow: hidden;
+.intro {
   display: flex;
+  flex-direction: column;
   align-items: center;
-  padding: var(--space-14);
-  color: var(--panel-text);
-  background: var(--panel-bg);
+  gap: var(--space-10);
+  width: 100%;
+  max-width: 760px;
+  margin: 0 auto;
+  padding: var(--space-14) var(--space-6) var(--space-12);
+  text-align: center;
 }
 
-/* Vertical grid lines only — a ruled page rather than a texture. Clipped by the panel's own
-   `overflow: hidden` and inert to the pointer. */
-.login-brand::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  background-image: linear-gradient(90deg, var(--panel-grid) 1px, transparent 1px);
-  background-size: 118px 100%;
-  pointer-events: none;
+.hero {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-5);
 }
 
-/* A column measure, not spacing: the copy sits against the panel's inner edge so it reads as
-   one spread with the sign-in block rather than as two centred islands. */
-.login-brand-inner {
-  position: relative;
-  display: grid;
-  gap: var(--space-11);
-  width: min(470px, 100%);
-  margin-left: auto;
-}
-
-/* The mark keeps the accent square here too — this is the brand, not the palette. */
-.login-brand :deep(.brand) {
-  color: var(--panel-text);
-}
-
-.login-pitch h2 {
-  margin-bottom: var(--space-5);
+.hero-title {
+  max-width: 18em;
+  margin-top: var(--space-2);
   font-size: var(--display-3xl);
-  line-height: 1.14;
+  line-height: 1.08;
   text-wrap: balance;
 }
 
-.login-pitch p {
-  max-width: 44ch;
-  line-height: 1.7;
-  color: var(--panel-muted);
-}
-
-.login-facts {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-8);
-  margin: 0;
-  padding-top: var(--space-7);
-  border-top: 1px solid var(--panel-rule);
-}
-
-.fact dt {
-  margin-bottom: var(--space-2);
-  font-size: var(--text-3xs);
-  font-weight: var(--weight-semibold);
-  letter-spacing: var(--tracking-facts);
-  text-transform: uppercase;
-  color: var(--panel-label);
-}
-
-.fact dd {
-  margin: 0;
-  font-family: var(--font-display);
-  font-size: var(--display-sm);
-}
-
-/* --- Sign-in panel -------------------------------------------------------- */
-
-.login-panel {
-  /* The sign-in block centres in the space above the footer, which stays pinned to the
-     bottom edge like a normal site footer. */
-  display: grid;
-  grid-template-rows: 1fr auto;
-  padding: var(--space-14) var(--space-14) var(--space-8);
-  background: var(--paper);
-}
-
-.login-form {
-  width: min(370px, 100%);
-  align-self: center;
-}
-
-.login-form h1 {
-  margin-top: var(--space-3);
-  font-size: var(--display-xl);
-}
-
-.login-lede {
-  margin-top: var(--space-2);
-  margin-bottom: var(--space-7);
+.hero-body {
+  max-width: 36em;
   color: var(--muted);
+  font-size: var(--text-lg);
+  line-height: 1.55;
+  text-wrap: pretty;
+}
+
+/* The sign-in card: paper on the desk, the reader's cards' radius and lift. */
+.card {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  width: min(400px, 100%);
+  padding: var(--space-8);
+  border-radius: var(--radius-card);
+  background: var(--paper);
+  box-shadow: var(--shadow-pane);
+  text-align: left;
+}
+
+.card-title {
+  font-size: var(--display-md);
+}
+
+.card-lede {
+  margin-top: var(--space-1);
+  margin-bottom: var(--space-6);
+  color: var(--muted);
+  font-size: var(--text-base);
 }
 
 /* Google Sign-In branding: white surface, #dadce0 border, four-color mark. These are
-   Google's prescribed values, not this app's palette — the one place besides the brand panel
-   where a literal color is correct. */
+   Google's prescribed values, not this app's palette — the one place where a literal color
+   is correct. The shape is the app's capsule, which Google's guidelines allow ("pill"). */
 .btn-google {
   /* Google's light and dark button variants — their values, not ours — following the same
      color-scheme the app's own tokens do (docs/web.md § Design system, *Theme*). */
@@ -270,16 +206,18 @@ async function signInAsDeveloper() {
   --g-text: light-dark(#1f1f1f, #e3e3e3);
   --g-hover: light-dark(#f7f8f8, #1e1f20);
 
-  width: 100%;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: var(--space-3);
-  padding: var(--space-3) var(--space-4);
+  width: 100%;
+  height: var(--control-height-lg);
+  padding: 0 var(--space-5);
   border: 1px solid var(--g-border);
-  border-radius: var(--radius);
+  border-radius: var(--radius-full);
   background: var(--g-bg);
   color: var(--g-text);
+  font-size: var(--text-base);
   font-weight: var(--weight-medium);
   transition: background var(--duration-fast) var(--ease);
 }
@@ -300,13 +238,7 @@ async function signInAsDeveloper() {
   align-items: center;
   flex-wrap: wrap;
   gap: var(--space-3);
-  margin-top: var(--space-5);
-}
-
-/* One step under the Google button it sits below: this is the secondary way in, and on a
-   dev build only. */
-.login-dev .dev-button {
-  height: var(--control-height-md);
+  margin-top: var(--space-4);
 }
 
 .login-dev-note {
@@ -318,68 +250,47 @@ async function signInAsDeveloper() {
   margin-top: var(--space-4);
 }
 
-/* --- Responsive ----------------------------------------------------------- */
-
-/* Two columns still fit, but the full gutters start crowding the copy. */
-@media (max-width: 1080px) {
-  .login-brand {
-    padding: var(--space-10);
-  }
-
-  .login-panel {
-    padding: var(--space-10) var(--space-10) var(--space-8);
-  }
-
-  .login-pitch h2 {
-    font-size: var(--display-xl);
-  }
+.facts {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--space-6) var(--space-14);
+  margin: 0;
 }
 
-@media (max-width: 860px) {
-  /* Brand strip sizes to content; the sign-in panel absorbs the rest so its surface reaches
-     the bottom of the viewport. */
-  .login-page {
-    grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: auto 1fr;
-  }
-
-  .login-brand {
-    padding: var(--space-8) var(--space-6);
-  }
-
-  .login-brand-inner {
-    width: 100%;
-    margin-left: 0;
-    gap: var(--space-6);
-  }
-
-  /* Single column: the form sits at the top of the panel, and the footer keeps the same
-     width so its rule lines up with the sign-in block above it. */
-  .login-panel {
-    justify-items: center;
-    padding: var(--space-10) var(--space-6) var(--space-8);
-  }
-
-  .login-form {
-    align-self: start;
-  }
-
-  .login-footer {
-    width: min(370px, 100%);
-  }
+.fact {
+  display: grid;
+  gap: var(--space-1);
 }
 
-@media (max-width: 560px) {
-  .login-pitch h2 {
-    font-size: var(--display-md);
+.fact dt {
+  color: var(--muted);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+}
+
+.fact dd {
+  margin: 0;
+  font-size: var(--display-xs);
+  font-weight: var(--weight-semibold);
+}
+
+@media (max-width: 640px) {
+  .intro {
+    gap: var(--space-8);
+    padding: var(--space-10) var(--space-4) var(--space-10);
   }
 
-  .login-brand {
-    padding: var(--space-6) var(--space-4);
+  .hero-title {
+    font-size: var(--display-lg);
   }
 
-  .login-panel {
-    padding: var(--space-8) var(--space-4) calc(var(--space-6) + env(safe-area-inset-bottom, 0px));
+  .hero-body {
+    font-size: var(--text-base);
+  }
+
+  .card {
+    padding: var(--space-6);
   }
 }
 </style>

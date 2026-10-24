@@ -21,11 +21,11 @@ const { label } = useShortcuts()
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 18px;
-  height: 18px;
+  min-width: 20px;
+  height: 20px;
   padding: 0 var(--space-1);
-  border: 1px solid var(--edge);
-  border-radius: var(--radius);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-xs);
   background: var(--paper);
   color: var(--muted);
   font-family: var(--font);

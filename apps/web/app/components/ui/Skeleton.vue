@@ -38,7 +38,9 @@ const { t } = useI18n()
 .bar {
   display: block;
   height: var(--text-sm);
-  background: var(--rail);
+  border-radius: var(--radius-full);
+  background: var(--fill);
+  animation: breathe 1.6s var(--ease) infinite;
 }
 
 .name {
@@ -47,5 +49,11 @@ const { t } = useI18n()
 
 .meta {
   width: 85%;
+}
+
+@keyframes breathe {
+  50% {
+    opacity: 0.55;
+  }
 }
 </style>

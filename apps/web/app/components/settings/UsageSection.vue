@@ -1,134 +1,30 @@
 <script setup lang="ts">
 /**
- * Usage (docs/web.md § Pages, `/settings/usage`): three sections behind a tab row under
- * the title — Calls, Conversations, Sandbox — each tab carrying its headline figure, the
- * column below showing the selected one only. Billed, estimated and unpriced never share a figure
- * (docs/api.md § Usage aggregates): a cost with no billed call behind it reads "—", an
- * estimate is always prefixed "≈", and an unpriced call is a count.
+ * Usage (docs/web.md § Pages, `/settings/usage`; the contract is docs/billing.md), laid out
+ * as Claude's own usage page: the plan and its action — *Upgrade* (a checkout) or *Manage
+ * subscription* (Pay's portal) — then the usage limits, the period's credits and the
+ * workspace's storage, each a bar with *N% used*, then the rates and the sandbox the plan
+ * gives. Every figure is the API's: the section never names a price or a plan the API did not.
  */
-import { SETTINGS_QUERY } from '~/lib/settings'
 import {
+  createCheckout,
+  createPortal,
+  getBilling,
+  getBillingCatalog,
   getSandbox,
-  getUsage,
-  getUsageConversations,
   resetSandbox,
   stopSandbox,
+  type ChatRate,
   type SandboxState,
-  type UsageConversation,
 } from '~/lib/api'
-import { formatBytes, formatCost, formatCount, formatDay, formatShortDateTime } from '~/lib/format'
+import { formatBytes, formatCount, formatDate, formatShortDateTime } from '~/lib/format'
 import type { TableColumn } from '~/lib/table'
-import { cacheReadRatio, summarizeUsage, type UsageRow } from '~/lib/usage'
-
-const USAGE_DAYS = 30
 
 const { t, locale } = useI18n()
 const { resolve } = useApiError()
+const auth = useAuth()
 
-type Section = 'calls' | 'conversations' | 'sandbox'
-const SECTIONS: readonly Section[] = ['calls', 'conversations', 'sandbox']
-const section = ref<Section>('calls')
-
-/** Arrow keys move between tabs, as a tab list is expected to. */
-function onTabKeydown(event: KeyboardEvent, index: number) {
-  const step = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0
-  if (!step) {
-    return
-  }
-  event.preventDefault()
-  const nextIndex = (index + step + SECTIONS.length) % SECTIONS.length
-  section.value = SECTIONS[nextIndex]!
-  const list = (event.currentTarget as HTMLElement).parentElement
-  list?.querySelectorAll<HTMLElement>('[role="tab"]')[nextIndex]?.focus()
-}
-
-// --- calls ---------------------------------------------------------------------------
-
-const { data, pending, errorMessage, refresh } = useAuthedData(() => getUsage(USAGE_DAYS))
-const summary = computed(() => (data.value ? summarizeUsage(data.value) : null))
-
-/**
- * The per-day table. The meter column carries no visible header — it ranks the cost column
- * beside it — but keeps an accessible name, since a blank `<th>` is an unnamed column to a
- * screen reader reading the table's structure.
- */
-const dayColumns = computed<TableColumn<UsageRow>[]>(() => [
-  { key: 'label', header: t('dashboard.columnDate') },
-  { key: 'share', header: '', srHeader: t('dashboard.columnShare'), width: '120px' },
-  { key: 'agents', header: t('dashboard.columnAgents') },
-  { key: 'cost', header: t('dashboard.columnCost'), numeric: true },
-  // Estimates and unpriced calls get columns of their own, and only in a period that has
-  // any: they are never summed into the billed cost beside them (docs/web.md § Pages).
-  ...(summary.value?.totalEstimatedCalls
-    ? [{ key: 'estimated', header: t('dashboard.columnEstimated'), numeric: true }]
-    : []),
-  ...(summary.value?.totalUnpricedCalls
-    ? [{ key: 'unpriced', header: t('dashboard.columnUnpriced'), numeric: true }]
-    : []),
-  { key: 'prompt', header: t('dashboard.columnPrompt'), numeric: true },
-  { key: 'completion', header: t('dashboard.columnCompletion'), numeric: true },
-])
-
-/** Billed cost, or a dash where nothing was billed: $0 would claim a bill that never existed. */
-function billedCost(row: UsageRow): string {
-  return row.billedCalls > 0 ? formatCost(row.cost, locale.value) : t('dashboard.none')
-}
-
-/** An estimate, prefixed as one — or a dash where no call reported a cost. */
-function estimate(cost: number, calls: number): string {
-  return calls > 0
-    ? t('dashboard.estimatedValue', { cost: formatCost(cost, locale.value) })
-    : t('dashboard.none')
-}
-
-function percent(ratio: number | null): string {
-  return ratio === null
-    ? t('dashboard.none')
-    : new Intl.NumberFormat(locale.value, { style: 'percent', maximumFractionDigits: 0 }).format(ratio)
-}
-
-// --- conversations -------------------------------------------------------------------
-
-const {
-  data: conversationsData,
-  pending: conversationsPending,
-  errorMessage: conversationsError,
-  refresh: refreshConversations,
-} = useAuthedData(() => getUsageConversations(USAGE_DAYS))
-
-const conversations = computed(() => conversationsData.value?.conversations ?? [])
-
-const conversationTotals = computed(() => {
-  const rows = conversations.value
-  const sum = (pick: (row: UsageConversation) => number) =>
-    rows.reduce((total, row) => total + pick(row), 0)
-  const promptTokens = sum((row) => row.prompt_tokens)
-  const cacheReadTokens = sum((row) => row.cache_read_tokens)
-  const cacheWriteTokens = sum((row) => row.cache_write_tokens)
-  return {
-    count: rows.length,
-    turns: sum((row) => row.turns),
-    estimatedCost: sum((row) => row.estimated_cost),
-    estimatedCalls: sum((row) => row.estimated_calls),
-    unpricedCalls: sum((row) => row.unpriced_calls),
-    promptTokens,
-    cacheReadTokens,
-    cacheRatio: cacheReadRatio(cacheReadTokens, promptTokens, cacheWriteTokens),
-  }
-})
-
-const conversationColumns = computed<TableColumn<UsageConversation>[]>(() => [
-  { key: 'title', header: t('dashboard.columnConversation') },
-  { key: 'document', header: t('dashboard.columnDocument') },
-  { key: 'turns', header: t('dashboard.columnTurns'), numeric: true },
-  { key: 'prompt', header: t('dashboard.columnPrompt'), numeric: true },
-  { key: 'cache', header: t('dashboard.columnCacheRead'), numeric: true },
-  { key: 'completion', header: t('dashboard.columnCompletion'), numeric: true },
-  { key: 'estimated', header: t('dashboard.columnEstimated'), numeric: true },
-])
-
-// --- sandbox -------------------------------------------------------------------------
-
+const { data: billing, pending, errorMessage, refresh } = useAuthedData(() => getBilling())
 const {
   data: sandbox,
   pending: sandboxPending,
@@ -136,42 +32,155 @@ const {
   refresh: refreshSandbox,
 } = useAuthedData(() => getSandbox())
 
-/** The VM's controls and figures: a runner this deployment has, on a plan that gives one. */
+// --- the plan ----------------------------------------------------------------------------
+
+const free = computed(() => billing.value?.plan.id === 'free')
+
+const planName = computed(() => {
+  const plan = billing.value?.plan
+  return !plan ? '' : plan.id === 'free' ? t('usage.free') : plan.name
+})
+
+/** One line of what the plan gives, from its four grants. */
+const planGives = computed(() => {
+  const plan = billing.value?.plan
+  if (!plan) {
+    return ''
+  }
+  return [
+    t('usage.planCredits', { n: formatCount(plan.credits, locale.value) }, plan.credits),
+    t('usage.planStorage', { size: formatBytes(plan.storage_bytes, locale.value) }),
+    t('usage.planJobs', { n: formatCount(plan.max_jobs, locale.value) }, plan.max_jobs),
+    plan.sandbox ? t('usage.planSandbox') : t('usage.planNoSandbox'),
+  ].join(' · ')
+})
+
+/** The subscription's state under the plan: renewing, cancelled at the end, lapsed. */
+const subscriptionLine = computed(() => {
+  const subscription = billing.value?.subscription
+  if (!subscription) {
+    return null
+  }
+  const end = formatDate(subscription.period_end, locale.value)
+  if (subscription.status !== 'active' && subscription.status !== 'trialing') {
+    return t('usage.lapsed', { status: subscription.status })
+  }
+  return subscription.cancel_at_period_end ? t('usage.cancelAtEnd', { date: end }) : t('usage.renews', { date: end })
+})
+
+// --- the usage limits --------------------------------------------------------------------
+
+/** An overdrawn period reads 100 % and 0 left, never a negative balance (docs/billing.md
+ *  § A chat turn). */
+const creditsShare = computed(() => {
+  const period = billing.value?.period
+  return period && period.granted > 0 ? Math.min(1, period.spent / period.granted) : 0
+})
+
+const remaining = computed(() => Math.max(0, billing.value?.period.remaining ?? 0))
+
+const storageShare = computed(() => {
+  const workspace = sandbox.value?.workspace
+  return workspace && workspace.quota_bytes > 0 ? Math.min(1, workspace.bytes / workspace.quota_bytes) : 0
+})
+
+/** When the figures on screen were read: either read landing moves it. */
+const updatedAt = ref<Date | null>(null)
+watch([billing, sandbox], () => {
+  updatedAt.value = new Date()
+})
+
+const updatedLabel = computed(() =>
+  updatedAt.value ? new Intl.DateTimeFormat(locale.value, { timeStyle: 'short' }).format(updatedAt.value) : '',
+)
+
+/** The shell's balance follows the section's read, so the two never disagree. */
+async function reload() {
+  await Promise.all([refresh(), refreshSandbox(), auth.refresh()])
+}
+
+// --- the rates table ---------------------------------------------------------------------
+
+interface RateRow extends ChatRate {
+  model: string
+}
+
+const rateRows = computed<RateRow[]>(() =>
+  Object.entries(billing.value?.rates.chat ?? {}).map(([model, rate]) => ({ model, ...rate })),
+)
+
+const rateColumns = computed<TableColumn<RateRow>[]>(() => [
+  { key: 'model', header: t('usage.columnModel') },
+  { key: 'input', header: t('usage.columnInput'), numeric: true },
+  { key: 'cache_read', header: t('usage.columnCacheRead'), numeric: true },
+  { key: 'cache_write', header: t('usage.columnCacheWrite'), numeric: true },
+  { key: 'output', header: t('usage.columnOutput'), numeric: true },
+])
+
+/** A rate to at most three decimals: 0.005 credits per 1K cache reads stays legible. */
+function rate(value: number): string {
+  return new Intl.NumberFormat(locale.value, { maximumFractionDigits: 3 }).format(value)
+}
+
+// --- checkout and portal ------------------------------------------------------------------
+
+const acting = ref(false)
+const actionError = ref<string | null>(null)
+
+/**
+ * Pay's checkout for the first plan on sale, in this tab: the return lands on
+ * `/files?settings=billing`, which opens this section, where it reads the plan the webhook
+ * or the refresh wrote (docs/billing.md § Kano Pay).
+ */
+async function upgrade() {
+  if (acting.value) {
+    return
+  }
+  acting.value = true
+  actionError.value = null
+  try {
+    const catalog = await getBillingCatalog()
+    const plan = catalog.plans[0]
+    if (!catalog.available || !plan) {
+      actionError.value = t('usage.notOnSale')
+      return
+    }
+    const { url } = await createCheckout(plan.plan_id)
+    window.location.assign(url)
+  } catch (error) {
+    actionError.value = await resolve(error)
+  } finally {
+    acting.value = false
+  }
+}
+
+/** Pay's portal, in this tab: one link, where the payment method, invoices and cancelling live. */
+async function manage() {
+  if (acting.value) {
+    return
+  }
+  acting.value = true
+  actionError.value = null
+  try {
+    const { url } = await createPortal()
+    window.location.assign(url)
+  } catch (error) {
+    actionError.value = await resolve(error)
+  } finally {
+    acting.value = false
+  }
+}
+
+// --- the sandbox -------------------------------------------------------------------------
+
+/** The VM's controls: a runner this deployment has, on a plan that gives one. */
 const sandboxAvailable = computed(
   () => sandbox.value !== null && sandbox.value.state !== 'unavailable' && sandbox.value.granted !== false,
 )
 
-const route = useRoute()
-const router = useRouter()
-
-/** The Billing section, where *Upgrade* is — the dialog's own navigation, so Back leaves it. */
-function openBilling() {
-  void router.replace({ query: { ...route.query, [SETTINGS_QUERY]: 'billing' } })
-}
-
 function stateTone(state: SandboxState): 'ok' | 'info' | 'neutral' {
   return state === 'running' ? 'ok' : state === 'starting' ? 'info' : 'neutral'
 }
-
-/** Hours to one decimal past an hour, minutes under it — the reading a VM's uptime gets. */
-function duration(seconds: number): string {
-  if (seconds >= 3600) {
-    return t('dashboard.hours', {
-      count: new Intl.NumberFormat(locale.value, { maximumFractionDigits: 1 }).format(seconds / 3600),
-    })
-  }
-  return t('dashboard.minutes', { count: formatCount(Math.round(seconds / 60), locale.value) })
-}
-
-const workspaceShare = computed(() => {
-  const workspace = sandbox.value?.workspace
-  return workspace && workspace.quota_bytes > 0 ? workspace.bytes / workspace.quota_bytes : 0
-})
-
-const breakdownColumns = computed<TableColumn<{ path: string; bytes: number }>[]>(() => [
-  { key: 'path', header: t('dashboard.columnPath') },
-  { key: 'bytes', header: t('dashboard.columnSize'), numeric: true },
-])
 
 const sandboxActionPending = ref(false)
 const sandboxActionError = ref<string | null>(null)
@@ -193,391 +202,156 @@ async function runSandboxAction(action: () => Promise<void>) {
 </script>
 
 <template>
-  <SettingsSection :eyebrow="t('dashboard.period', { days: USAGE_DAYS })" :title="t('dashboard.headTitle')">
-    <!-- The three sections, each tab carrying its headline figure: an estimate for the
-         two that cost something, the VM's state for the third. -->
-    <div class="tabs-row">
-      <div class="tabs" role="tablist" :aria-label="t('dashboard.sections')">
-        <button
-          type="button"
-          role="tab"
-          class="tab"
-          :class="{ active: section === 'calls' }"
-          :aria-selected="section === 'calls'"
-          :tabindex="section === 'calls' ? 0 : -1"
-          @click="section = 'calls'"
-          @keydown="onTabKeydown($event, 0)"
-        >
-          <span class="tab-label">{{ t('dashboard.tabCalls') }}</span>
-          <span v-if="summary" class="tab-figure mono tabular">
-            {{ estimate(summary.totalEstimatedCost, summary.totalEstimatedCalls) }}
-          </span>
-        </button>
-        <button
-          type="button"
-          role="tab"
-          class="tab"
-          :class="{ active: section === 'conversations' }"
-          :aria-selected="section === 'conversations'"
-          :tabindex="section === 'conversations' ? 0 : -1"
-          @click="section = 'conversations'"
-          @keydown="onTabKeydown($event, 1)"
-        >
-          <span class="tab-label">{{ t('dashboard.tabConversations') }}</span>
-          <span v-if="conversationsData" class="tab-figure mono tabular">
-            {{ estimate(conversationTotals.estimatedCost, conversationTotals.estimatedCalls) }}
-          </span>
-        </button>
-        <button
-          type="button"
-          role="tab"
-          class="tab"
-          :class="{ active: section === 'sandbox' }"
-          :aria-selected="section === 'sandbox'"
-          :tabindex="section === 'sandbox' ? 0 : -1"
-          @click="section = 'sandbox'"
-          @keydown="onTabKeydown($event, 2)"
-        >
-          <span class="tab-label">{{ t('dashboard.tabSandbox') }}</span>
-          <UiStatusDot
-            v-if="sandbox"
-            class="tab-dot"
-            :tone="stateTone(sandbox.state)"
-            :label="t(`dashboard.sandboxStates.${sandbox.state}`)"
-          />
-        </button>
-      </div>
-      <p class="tabs-note">{{ t('dashboard.estimateNote') }}</p>
-    </div>
+  <SettingsSection :title="t('settings.sections.usage')">
+    <UiBanner v-if="errorMessage" class="state" tone="error">{{ errorMessage }}</UiBanner>
+    <UiSkeleton v-if="!billing && !errorMessage" class="state" :rows="4" />
 
-    <div class="region">
-      <!-- ---------- Calls ---------- -->
-      <UiPanel v-if="section === 'calls'" :title="t('dashboard.tabCalls')" flush>
-        <template #meta>
-          <span>{{ t('dashboard.callsMeta') }}</span>
-          <UiButton
-            variant="ghost"
-            size="xs"
-            icon-only
-            :label="t('common.refresh')"
-            :loading="pending"
-            @click="refresh"
-          >
-            <template #icon><UiIcon name="refresh" /></template>
+    <template v-else-if="billing">
+      <SettingsGroup :title="t('usage.plan')">
+        <div class="plan">
+          <div class="plan-text">
+            <p class="plan-name">{{ planName }}</p>
+            <p class="plan-gives">{{ planGives }}</p>
+          </div>
+          <UiButton v-if="billing.subscription" variant="secondary" :loading="acting" @click="manage">
+            {{ t('usage.manage') }}
           </UiButton>
-        </template>
-
-        <div class="section-body">
-          <!-- A failed refresh keeps the figures it already has: the banner says what went
-               wrong, and blanking the page on top of that helps nobody. -->
-          <UiBanner v-if="errorMessage" class="gutter" tone="error">{{ errorMessage }}</UiBanner>
-          <UiSkeleton v-if="!summary && !errorMessage" class="gutter" :rows="4" />
-
-          <UiEmptyState
-            v-else-if="summary?.isEmpty"
-            :title="t('dashboard.empty')"
-            :body="t('dashboard.emptyBody')"
-          />
-
-          <template v-else-if="summary">
-            <!-- Figures on rules, not in boxes. The estimate is the accent: it is the number
-                 this page exists to answer, and it is data. -->
-            <dl class="metrics">
-              <div class="metric">
-                <dt class="eyebrow">{{ t('dashboard.totalEstimatedCost') }}</dt>
-                <dd class="figure cost tabular">
-                  {{ estimate(summary.totalEstimatedCost, summary.totalEstimatedCalls) }}
-                </dd>
-              </div>
-              <div class="metric">
-                <dt class="eyebrow">{{ t('dashboard.totalPromptTokens') }}</dt>
-                <dd class="figure tabular">{{ formatCount(summary.totalPromptTokens, locale) }}</dd>
-              </div>
-              <div class="metric">
-                <dt class="eyebrow">{{ t('dashboard.totalCompletionTokens') }}</dt>
-                <dd class="figure tabular">{{ formatCount(summary.totalCompletionTokens, locale) }}</dd>
-              </div>
-              <div class="metric">
-                <dt class="eyebrow">{{ t('dashboard.totalUnpriced') }}</dt>
-                <dd class="figure tabular">{{ formatCount(summary.totalUnpricedCalls, locale) }}</dd>
-              </div>
-            </dl>
-
-            <div class="subhead">
-              <h3 class="subtitle">{{ t('dashboard.perDay') }}</h3>
-              <span class="submeta">{{ t('dashboard.daysRecorded', { count: summary.days.length }) }}</span>
-            </div>
-            <div class="table-gutter">
-              <UiDataTable
-                :columns="dayColumns"
-                :rows="summary.days"
-                :row-key="(row) => row.label"
-                :caption="t('dashboard.perDay')"
-                density="tight"
-              >
-                <template #cell-label="{ row }">{{ formatDay(row.label, locale) }}</template>
-                <template #cell-share="{ row }">
-                  <UiUsageBar :share="row.costShare" :label="formatDay(row.label, locale)" />
-                </template>
-                <template #cell-agents="{ row }">
-                  <span class="mono agents">{{ row.agents.join(' · ') || t('dashboard.none') }}</span>
-                </template>
-                <template #cell-cost="{ row }">{{ billedCost(row) }}</template>
-                <template #cell-estimated="{ row }">
-                  {{ estimate(row.estimatedCost, row.estimatedCalls) }}
-                </template>
-                <template #cell-unpriced="{ row }">
-                  {{ row.unpricedCalls ? formatCount(row.unpricedCalls, locale) : t('dashboard.none') }}
-                </template>
-                <template #cell-prompt="{ row }">{{ formatCount(row.promptTokens, locale) }}</template>
-                <template #cell-completion="{ row }">
-                  {{ formatCount(row.completionTokens, locale) }}
-                </template>
-              </UiDataTable>
-            </div>
-
-            <!-- Not a table: a model id is long and its token figures are secondary to its
-                 cost, so each model gets a small block of its own. -->
-            <div class="subhead">
-              <h3 class="subtitle">{{ t('dashboard.perModel') }}</h3>
-              <span class="submeta">{{ t('dashboard.modelsRecorded', { count: summary.models.length }) }}</span>
-            </div>
-            <ul class="models">
-              <li v-for="row in summary.models" :key="row.label" class="model">
-                <div class="model-main">
-                  <p class="model-id mono" :title="row.label">{{ row.label }}</p>
-                  <UiUsageBar :share="row.costShare" :label="row.label" />
-                  <p class="model-tokens tabular">
-                    {{
-                      t('dashboard.modelTokens', {
-                        prompt: formatCount(row.promptTokens, locale),
-                        completion: formatCount(row.completionTokens, locale),
-                      })
-                    }}
-                    <template v-if="row.cacheReadTokens">
-                      · {{ t('dashboard.modelCache', { ratio: percent(cacheReadRatio(row.cacheReadTokens, row.promptTokens, row.cacheWriteTokens)) }) }}
-                    </template>
-                  </p>
-                  <p v-if="row.estimatedCalls" class="model-tokens tabular">
-                    {{ t('dashboard.modelEstimated', { cost: formatCost(row.estimatedCost, locale) }) }}
-                  </p>
-                  <p v-if="row.unpricedCalls" class="model-tokens tabular">
-                    {{ t('dashboard.modelUnpriced', { count: formatCount(row.unpricedCalls, locale) }) }}
-                  </p>
-                </div>
-                <p class="model-cost tabular">{{ billedCost(row) }}</p>
-              </li>
-            </ul>
-          </template>
-        </div>
-      </UiPanel>
-
-      <!-- ---------- Conversations ---------- -->
-      <UiPanel v-else-if="section === 'conversations'" :title="t('dashboard.tabConversations')" flush>
-        <template #meta>
-          <span>{{ t('dashboard.conversationsMeta') }}</span>
-          <UiButton
-            variant="ghost"
-            size="xs"
-            icon-only
-            :label="t('common.refresh')"
-            :loading="conversationsPending"
-            @click="refreshConversations"
-          >
-            <template #icon><UiIcon name="refresh" /></template>
+          <UiButton v-else-if="free && billing.checkout_available" :loading="acting" @click="upgrade">
+            {{ t('usage.upgrade') }}
           </UiButton>
-        </template>
-
-        <div class="section-body">
-          <UiBanner v-if="conversationsError" class="gutter" tone="error">{{ conversationsError }}</UiBanner>
-          <UiSkeleton v-if="!conversationsData && !conversationsError" class="gutter" :rows="4" />
-
-          <UiEmptyState
-            v-else-if="conversationsData && !conversations.length"
-            :title="t('dashboard.conversationsEmpty')"
-            :body="t('dashboard.conversationsEmptyBody')"
-          />
-
-          <template v-else-if="conversationsData">
-            <dl class="metrics">
-              <div class="metric">
-                <dt class="eyebrow">{{ t('dashboard.totalEstimatedCost') }}</dt>
-                <dd class="figure cost tabular">
-                  {{ estimate(conversationTotals.estimatedCost, conversationTotals.estimatedCalls) }}
-                </dd>
-              </div>
-              <div class="metric">
-                <dt class="eyebrow">{{ t('dashboard.totalConversations') }}</dt>
-                <dd class="figure tabular">{{ formatCount(conversationTotals.count, locale) }}</dd>
-              </div>
-              <div class="metric">
-                <dt class="eyebrow">{{ t('dashboard.totalTurns') }}</dt>
-                <dd class="figure tabular">{{ formatCount(conversationTotals.turns, locale) }}</dd>
-              </div>
-              <!-- The figure that says whether the prompt cache is working (docs/chat.md). -->
-              <div class="metric">
-                <dt class="eyebrow">{{ t('dashboard.cacheRatio') }}</dt>
-                <dd class="figure cost tabular">{{ percent(conversationTotals.cacheRatio) }}</dd>
-                <dd class="metric-note">{{ t('dashboard.cacheRatioNote') }}</dd>
-              </div>
-            </dl>
-
-            <div class="subhead">
-              <h3 class="subtitle">{{ t('dashboard.perConversation') }}</h3>
-              <span class="submeta">{{ t('dashboard.conversationCount', { count: conversations.length }) }}</span>
-            </div>
-            <div class="table-gutter">
-              <UiDataTable
-                :columns="conversationColumns"
-                :rows="conversations"
-                :row-key="(row) => String(row.id)"
-                :caption="t('dashboard.perConversation')"
-                density="tight"
-              >
-                <template #cell-title="{ row }">
-                  <span class="cell-block">{{ row.title || t('dashboard.untitledConversation') }}</span>
-                </template>
-                <template #cell-document="{ row }">
-                  <span class="cell-block document">{{ row.document_name || t('dashboard.none') }}</span>
-                </template>
-                <template #cell-turns="{ row }">{{ formatCount(row.turns, locale) }}</template>
-                <template #cell-prompt="{ row }">{{ formatCount(row.prompt_tokens, locale) }}</template>
-                <template #cell-cache="{ row }">
-                  {{ percent(cacheReadRatio(row.cache_read_tokens, row.prompt_tokens, row.cache_write_tokens)) }}
-                </template>
-                <template #cell-completion="{ row }">{{ formatCount(row.completion_tokens, locale) }}</template>
-                <template #cell-estimated="{ row }">
-                  <span class="estimate">{{ estimate(row.estimated_cost, row.estimated_calls) }}</span>
-                </template>
-              </UiDataTable>
-            </div>
-          </template>
         </div>
-      </UiPanel>
+        <template
+          v-if="subscriptionLine || billing.subscription || !billing.checkout_available || billing.pay_reachable === false || actionError"
+          #foot
+        >
+          <p v-if="subscriptionLine">{{ subscriptionLine }}</p>
+          <p v-if="billing.subscription">{{ t('usage.manageNote') }}</p>
+          <p v-else-if="!billing.checkout_available">{{ t('usage.notOnSale') }}</p>
+          <p v-if="billing.pay_reachable === false">{{ t('usage.payBehind') }}</p>
+          <UiBanner v-if="actionError" tone="error">{{ actionError }}</UiBanner>
+        </template>
+      </SettingsGroup>
 
-      <!-- ---------- Sandbox ---------- -->
-      <UiPanel v-else :title="t('dashboard.tabSandbox')" flush>
-        <template #meta>
-          <template v-if="sandboxAvailable">
+      <!-- One row per limit, as Claude draws its own: the name and a line under it, the
+           bar, the share used. -->
+      <SettingsGroup :title="t('usage.limits')">
+        <div class="limit">
+          <div class="limit-text">
+            <p class="limit-name">{{ t('usage.credits') }}</p>
+            <p class="limit-line">
+              {{ t('usage.resets', { date: formatDate(billing.period.end, locale) }) }} ·
+              {{
+                t('usage.left', {
+                  remaining: formatCount(remaining, locale),
+                  granted: formatCount(billing.period.granted, locale),
+                })
+              }}
+            </p>
+          </div>
+          <UiUsageBar class="limit-bar" :share="creditsShare" :label="t('usage.creditsMeter')" />
+          <p class="limit-used tabular">{{ t('usage.used', { n: Math.round(creditsShare * 100) }) }}</p>
+        </div>
+
+        <div v-if="sandbox" class="limit">
+          <div class="limit-text">
+            <p class="limit-name">{{ t('usage.storage') }}</p>
+            <p class="limit-line">
+              {{
+                t('usage.storageOf', {
+                  used: formatBytes(sandbox.workspace.bytes, locale),
+                  quota: formatBytes(sandbox.workspace.quota_bytes, locale),
+                })
+              }}
+            </p>
+          </div>
+          <UiUsageBar class="limit-bar" :share="storageShare" :label="t('usage.storageMeter')" />
+          <p class="limit-used tabular">{{ t('usage.used', { n: Math.round(storageShare * 100) }) }}</p>
+        </div>
+        <UiSkeleton v-else-if="!sandboxError" :rows="1" />
+
+        <template #foot>
+          <div class="updated">
+            <span v-if="updatedAt">{{ t('usage.lastUpdated', { time: updatedLabel }) }}</span>
             <UiButton
               variant="ghost"
               size="xs"
-              :disabled="sandboxActionPending"
-              @click="confirmingReset = true"
+              icon-only
+              :label="t('common.refresh')"
+              :loading="pending || sandboxPending"
+              @click="reload"
             >
-              {{ t('dashboard.sandboxReset') }}
+              <template #icon><UiIcon name="refresh" /></template>
             </UiButton>
+          </div>
+        </template>
+      </SettingsGroup>
+
+      <SettingsGroup :title="t('usage.rates')" plain>
+        <p class="rate-line">
+          {{ t('usage.rateLine', { n: formatCount(billing.rates.parse_per_page, locale) }, billing.rates.parse_per_page) }}
+        </p>
+        <UiDataTable
+          v-if="rateRows.length"
+          :columns="rateColumns"
+          :rows="rateRows"
+          :row-key="(row) => row.model"
+          :caption="t('usage.ratesCaption')"
+          density="tight"
+        >
+          <template #cell-model="{ row }"><span class="mono">{{ row.model }}</span></template>
+          <template #cell-input="{ row }">{{ rate(row.input) }}</template>
+          <template #cell-cache_read="{ row }">{{ rate(row.cache_read) }}</template>
+          <template #cell-cache_write="{ row }">{{ rate(row.cache_write) }}</template>
+          <template #cell-output="{ row }">{{ rate(row.output) }}</template>
+        </UiDataTable>
+        <p v-else class="rate-line">{{ t('usage.noRates') }}</p>
+      </SettingsGroup>
+
+      <SettingsGroup :title="t('usage.sandbox')">
+        <UiSkeleton v-if="!sandbox && !sandboxError" :rows="1" />
+        <div v-else-if="sandbox && sandboxAvailable" class="sandbox">
+          <div class="sandbox-text">
+            <UiStatusDot :tone="stateTone(sandbox.state)" :label="t(`usage.sandboxStates.${sandbox.state}`)" />
+            <p class="limit-line">
+              {{
+                sandbox.last_used_at
+                  ? t('usage.lastUsed', { time: formatShortDateTime(sandbox.last_used_at, locale) })
+                  : t('usage.neverUsed')
+              }}
+            </p>
+          </div>
+          <div class="sandbox-actions">
             <UiButton
+              v-if="sandbox.state !== 'stopped'"
               variant="secondary"
-              size="xs"
-              :disabled="sandboxActionPending || sandbox?.state === 'stopped'"
+              size="sm"
+              :disabled="sandboxActionPending"
               :loading="sandboxActionPending && !confirmingReset"
               @click="runSandboxAction(stopSandbox)"
             >
-              {{ t('dashboard.sandboxStop') }}
+              {{ t('usage.stop') }}
             </UiButton>
-          </template>
-          <UiButton
-            variant="ghost"
-            size="xs"
-            icon-only
-            :label="t('common.refresh')"
-            :loading="sandboxPending"
-            @click="refreshSandbox"
-          >
-            <template #icon><UiIcon name="refresh" /></template>
-          </UiButton>
-        </template>
-
-        <div class="section-body">
-          <UiBanner v-if="sandboxError" class="gutter" tone="error">{{ sandboxError }}</UiBanner>
-          <UiBanner v-if="sandboxActionError" class="gutter" tone="error">{{ sandboxActionError }}</UiBanner>
-          <UiSkeleton v-if="!sandbox && !sandboxError" class="gutter" :rows="4" />
-
-          <template v-else-if="sandbox">
-            <!-- The plan's say first, then the runner's: neither is an error, and the
-                 workspace below is the reader's either way (docs/billing.md § Plans). -->
-            <UiEmptyState
-              v-if="sandbox.granted === false"
-              compact
-              :title="t('dashboard.sandboxNotInPlan')"
-              :body="t('dashboard.sandboxNotInPlanBody')"
-            >
-              <template #action>
-                <UiButton variant="secondary" size="xs" @click="openBilling">
-                  {{ t('dashboard.sandboxUpgrade') }}
-                </UiButton>
-              </template>
-            </UiEmptyState>
-            <UiEmptyState
-              v-else-if="!sandboxAvailable"
-              compact
-              :title="t('dashboard.sandboxStates.unavailable')"
-              :body="t('dashboard.sandboxUnavailable')"
-            />
-            <dl v-else class="metrics">
-              <div class="metric">
-                <dt class="eyebrow">{{ t('dashboard.sandboxState') }}</dt>
-                <dd class="figure state">
-                  <UiStatusDot
-                    :tone="stateTone(sandbox.state)"
-                    :label="t(`dashboard.sandboxStates.${sandbox.state}`)"
-                  />
-                </dd>
-              </div>
-              <div class="metric">
-                <dt class="eyebrow">{{ t('dashboard.sandboxLastUsed') }}</dt>
-                <dd class="figure tabular">
-                  {{ sandbox.last_used_at ? formatShortDateTime(sandbox.last_used_at, locale) : t('dashboard.none') }}
-                </dd>
-              </div>
-              <div class="metric">
-                <dt class="eyebrow">{{ t('dashboard.sandboxUptime') }}</dt>
-                <dd class="figure tabular">{{ duration(sandbox.uptime_seconds) }}</dd>
-              </div>
-              <div class="metric">
-                <dt class="eyebrow">{{ t('dashboard.sandboxShells') }}</dt>
-                <dd class="figure tabular">{{ formatCount(sandbox.shells, locale) }}</dd>
-              </div>
-            </dl>
-
-            <div class="subhead">
-              <h3 class="subtitle">{{ t('dashboard.workspace') }}</h3>
-              <span class="submeta mono tabular">
-                {{
-                  t('dashboard.workspaceOf', {
-                    used: formatBytes(sandbox.workspace.bytes, locale),
-                    quota: formatBytes(sandbox.workspace.quota_bytes, locale),
-                  })
-                }}
-              </span>
-            </div>
-            <div class="gutter">
-              <UiUsageBar :share="workspaceShare" :label="t('dashboard.workspaceMeter')" />
-            </div>
-            <div v-if="sandbox.workspace.breakdown.length" class="table-gutter">
-              <UiDataTable
-                :columns="breakdownColumns"
-                :rows="sandbox.workspace.breakdown"
-                :row-key="(row) => row.path"
-                :caption="t('dashboard.workspace')"
-                density="tight"
-              >
-                <template #cell-path="{ row }"><span class="mono">{{ row.path }}</span></template>
-                <template #cell-bytes="{ row }">{{ formatBytes(row.bytes, locale) }}</template>
-              </UiDataTable>
-            </div>
-            <UiEmptyState v-else compact :title="t('dashboard.workspaceEmpty')" />
-          </template>
+            <UiButton variant="secondary" size="sm" :disabled="sandboxActionPending" @click="confirmingReset = true">
+              {{ t('usage.reset') }}
+            </UiButton>
+          </div>
         </div>
-      </UiPanel>
-    </div>
+        <!-- The workspace above is the reader's either way (docs/billing.md § Plans). -->
+        <p v-else-if="sandbox" class="sandbox-note">
+          {{ sandbox.granted === false ? t('usage.notInPlan') : t('usage.unavailable') }}
+        </p>
+        <template v-if="sandboxError || (sandboxActionError && !confirmingReset)" #foot>
+          <UiBanner v-if="sandboxError" tone="error">{{ sandboxError }}</UiBanner>
+          <UiBanner v-if="sandboxActionError && !confirmingReset" tone="error">{{ sandboxActionError }}</UiBanner>
+        </template>
+      </SettingsGroup>
+    </template>
 
     <UiConfirmDialog
       v-if="confirmingReset"
-      :title="t('dashboard.sandboxReset')"
-      :message="t('dashboard.sandboxResetConfirm')"
-      :confirm-label="t('dashboard.sandboxReset')"
+      :title="t('usage.resetTitle')"
+      :message="t('usage.resetConfirm')"
+      :confirm-label="t('usage.reset')"
       :pending="sandboxActionPending"
       :error="sandboxActionError"
       @confirm="runSandboxAction(resetSandbox)"
@@ -587,233 +361,133 @@ async function runSandboxAction(action: () => Promise<void>) {
 </template>
 
 <style scoped>
-/* --- The tabs ------------------------------------------------------------------ */
-
-.tabs-row {
-  display: grid;
-  gap: var(--space-3);
-  padding: var(--space-6) 0 var(--space-2);
+.state {
+  margin-top: var(--space-6);
 }
 
-.tabs {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 2px;
-}
+/* --- The plan ------------------------------------------------------------------ */
 
-/* The same row the sidebar's nav uses: a fill and a step up in weight say "open",
-   nothing else (docs/web.md § Design system). */
-.tab {
+.plan {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: var(--space-3);
-  height: var(--control-height);
-  padding: 0 var(--space-3);
-  border: 0;
-  border-radius: var(--radius);
-  background: transparent;
-  color: var(--ink-soft);
-  font: inherit;
+  gap: var(--space-4);
+  min-width: 0;
+  min-height: 64px;
+  padding: var(--space-3) 0;
+}
+
+.plan-text {
+  display: grid;
+  flex: 1;
+  gap: 2px;
+  min-width: 0;
+}
+
+.plan-name {
   font-size: var(--text-base);
-  text-align: left;
-  cursor: pointer;
-  transition:
-    background var(--duration-fast) var(--ease),
-    color var(--duration-fast) var(--ease);
+  font-weight: var(--weight-semibold);
 }
 
-.tab:hover {
-  background: var(--rail-active);
-  color: var(--ink);
+.plan-gives {
+  color: var(--muted);
+  font-size: var(--text-xs);
+  line-height: 1.5;
 }
 
-.tab.active {
-  background: var(--rail-active);
-  color: var(--ink);
+/* --- The usage limits ----------------------------------------------------------- */
+
+.limit {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(120px, 1.3fr) 76px;
+  align-items: center;
+  gap: var(--space-2) var(--space-6);
+  min-height: 60px;
+  padding: var(--space-3) 0;
+}
+
+.limit + .limit {
+  border-top: 1px solid var(--line);
+}
+
+.limit-text,
+.sandbox-text {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.limit-name {
+  font-size: var(--text-sm);
   font-weight: var(--weight-medium);
 }
 
-.tab-label {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+.limit-line {
+  color: var(--muted);
+  font-size: var(--text-xs);
+}
+
+.limit-used {
+  color: var(--muted);
+  font-size: var(--text-xs);
+  text-align: right;
   white-space: nowrap;
 }
 
-.tab-figure {
-  flex-shrink: 0;
-  color: var(--faint);
-  font-size: var(--text-2xs);
-  font-weight: var(--weight-normal);
-}
-
-.tab-dot {
-  flex-shrink: 0;
-  font-size: var(--text-2xs);
-  font-weight: var(--weight-normal);
-}
-
-.tab-dot :deep(.label) {
-  color: var(--faint);
-}
-
-/* One line under the tabs: what the cost figures are. */
-.tabs-note {
-  color: var(--muted);
-  font-size: var(--text-xs);
-  line-height: 1.6;
-}
-
-/* --- Region -------------------------------------------------------------------- */
-
-/* The panel body is flush so the metrics band and the tables can run to the panel's
-   edges; each part sets its own gutter. */
-.section-body {
-  display: flex;
-  flex-direction: column;
-  padding-bottom: var(--space-8);
-}
-
-.gutter {
-  margin: 0 var(--panel-x) var(--space-4);
-}
-
-/* Four figures in a band under the header, on a rule. */
-.metrics {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: var(--space-6);
-  margin: 0;
-  padding: var(--space-6) var(--panel-x) var(--space-7);
-  border-bottom: 1px solid var(--line);
-}
-
-.metric {
-  min-width: 0;
-}
-
-.metric-note {
-  margin: var(--space-2) 0 0;
-  font-size: var(--text-xs);
-  line-height: 1.6;
-  color: var(--muted);
-}
-
-.figure {
-  margin: var(--space-2) 0 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-family: var(--font-display);
-  font-size: var(--display-lg);
-  font-weight: var(--weight-semibold);
-  letter-spacing: var(--tracking-tight);
-  line-height: 1.1;
-}
-
-/* Cost is data, and the largest thing on the page. */
-.figure.cost {
-  color: var(--accent);
-}
-
-.figure.state {
+.updated {
   display: flex;
   align-items: center;
+  gap: var(--space-1);
 }
 
-.figure.state :deep(.dot) {
-  width: 9px;
-  height: 9px;
+/* --- The rates ------------------------------------------------------------------ */
+
+.rate-line {
+  padding: 0 var(--space-1) var(--space-2);
+  color: var(--muted);
+  font-size: var(--text-sm);
+  line-height: 1.6;
 }
 
-.subhead {
+/* --- The sandbox ---------------------------------------------------------------- */
+
+.sandbox {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   justify-content: space-between;
   gap: var(--space-4);
-  padding: var(--space-6) var(--panel-x) var(--space-2);
+  min-height: 60px;
+  padding: var(--space-3) 0;
 }
 
-.subtitle {
-  font-size: var(--display-xs);
-  letter-spacing: normal;
-}
-
-.submeta {
+.sandbox-actions {
+  display: flex;
+  gap: var(--space-2);
   flex-shrink: 0;
-  color: var(--faint);
-  font-size: var(--text-xs);
 }
 
-/* Tables run inside the panel's gutter and scroll sideways there when they must. */
-.table-gutter {
-  min-width: 0;
-  overflow-x: auto;
-  padding: 0 var(--panel-x);
-}
-
-.agents {
+.sandbox-note {
+  display: flex;
+  align-items: center;
+  min-height: 52px;
+  padding: var(--space-3) 0;
   color: var(--muted);
+  font-size: var(--text-sm);
+  line-height: 1.5;
 }
 
-.document {
-  color: var(--muted);
-}
-
-.estimate {
-  color: var(--accent);
-}
-
-.models {
-  list-style: none;
-  margin: 0;
-  padding: 0 var(--panel-x);
-}
-
-.model {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 96px;
-  align-items: baseline;
-  gap: var(--space-4);
-  padding: var(--space-4) 0;
-  border-top: 1px solid var(--hair);
-}
-
-.model-main {
-  min-width: 0;
-}
-
-.model-id {
-  margin-bottom: var(--space-2);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--ink);
-}
-
-.model-tokens {
-  margin-top: var(--space-2);
-  font-size: var(--text-2xs);
-  color: var(--faint);
-}
-
-.model-cost {
-  margin: 0;
-  font-family: var(--font-display);
-  font-size: var(--display-sm);
-  font-weight: var(--weight-semibold);
-  text-align: right;
-}
-
-@media (max-width: 900px) {
-  .metrics {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+@media (max-width: 640px) {
+  /* The bar takes the row's width under its name, the share beside it. */
+  .limit {
+    grid-template-columns: minmax(0, 1fr) auto;
   }
 
-  .rail-note {
-    margin-top: var(--space-4);
+  .limit-text {
+    grid-column: 1 / -1;
+  }
+
+  .plan,
+  .sandbox {
+    flex-wrap: wrap;
   }
 }
 </style>

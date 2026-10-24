@@ -6,20 +6,19 @@ import { SETTINGS_QUERY, settingsSectionOf } from '~/lib/settings'
 /**
  * The signed-in frame.
  *
- * A fixed grid, not a scrolling document: the sidebar stays put and the content region is
- * handed a bounded box, which is what lets each screen split it into a narrative rail and a
- * data column that scroll independently (docs/web.md § Design system). Nothing in the
- * signed-in app puts a whole screen on one scrollbar.
+ * A fixed grid, not a scrolling document: the sidebar is a glass pane floating at the
+ * window's left, and the content region is handed a bounded box, which is what lets each
+ * screen keep its toolbar and title while its content scrolls (docs/web.md § Design system,
+ * *The frame*). Nothing in the signed-in app puts a whole screen on one scrollbar.
  *
  * The account row is the session's own menu: the avatar-and-name button opens `UiContextMenu`
  * — the same floating surface the library's right-click opens — headed by the address that is
- * signed in and the plan with its balance, holding Upgrade (or Billing), Settings, Language,
- * and sign-out below a rule. Everything the account is,
- * in one place, the way a desktop app's account menu holds it. Language is a row rather than a
- * submenu: it opens `LanguageDialog` (docs/web.md § The account menu).
+ * signed in, holding Upgrade (or Usage), Settings, Language, and sign-out below a rule.
+ * Everything the account is, in one place, the way a desktop app's account menu holds it.
+ * Language is a row rather than a submenu: it opens `LanguageDialog` (docs/web.md § The
+ * account menu).
  *
- * Below 900px the rail collapses above the data region (each screen's own stylesheets do
- * that) and the sidebar becomes a drawer behind a menu button. No icon rail and no bottom
+ * Below 900px the sidebar becomes a drawer behind a menu button. No icon rail and no bottom
  * tab bar: the labels are doing the work, and a tab bar would spend the scarcest axis on a
  * phone.
  */
@@ -81,14 +80,14 @@ function closeAccountMenu() {
 }
 
 /** Upgrade on Free — the pricing page, where the plans are presented and the checkout
- *  starts — and Billing on a paid plan, the Billing section; the menu starts no checkout
+ *  starts — and Usage on a paid plan, the Usage section; the menu starts no checkout
  *  itself (docs/web.md § The account menu). */
 const accountItems = computed<MenuItem[]>(() => [
   ...(auth.me.value
     ? [
         auth.me.value.plan === 'free'
           ? { key: 'upgrade', label: t('nav.upgrade'), icon: 'credit-card' as const }
-          : { key: 'billing', label: t('nav.billing'), icon: 'credit-card' as const },
+          : { key: 'usage', label: t('nav.usage'), icon: 'dashboard' as const },
       ]
     : []),
   { key: 'settings', label: t('nav.settings'), icon: 'settings' },
@@ -110,8 +109,8 @@ const settingsSection = computed(() => settingsSectionOf(route.query[SETTINGS_QU
 function onAccountAction(action: string) {
   if (action === 'upgrade') {
     void navigateTo(localePath('/pricing'))
-  } else if (action === 'settings' || action === 'billing') {
-    void router.push({ query: { ...route.query, [SETTINGS_QUERY]: action === 'billing' ? 'billing' : 'general' } })
+  } else if (action === 'settings' || action === 'usage') {
+    void router.push({ query: { ...route.query, [SETTINGS_QUERY]: action === 'usage' ? 'usage' : 'general' } })
   } else if (action === 'language') {
     languageOpen.value = true
   } else if (action === 'signOut') {
@@ -257,7 +256,7 @@ async function signOut() {
           >
           <span v-else class="avatar avatar-initial" aria-hidden="true">{{ initial }}</span>
           <span class="account-label">{{ account }}</span>
-          <UiIcon class="account-caret" name="chevron-down" />
+          <UiIcon class="account-caret" name="chevrons-up-down" />
         </button>
 
         <UiContextMenu
@@ -292,8 +291,8 @@ async function signOut() {
       </header>
 
       <!--
-        The content region. Every screen is a `UiScreen` — a rail and a data region, each
-        owning its own scroll axis — so this element never scrolls above the breakpoint, and
+        The content region. Every screen is a `UiScreen` — a toolbar, a title and content
+        that scrolls on its own — so this element never scrolls above the breakpoint, and
         below it becomes the single one.
       -->
       <main id="content" class="content" tabindex="-1">
@@ -306,12 +305,13 @@ async function signOut() {
 <style scoped>
 .shell {
   display: grid;
-  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+  /* The sidebar's column holds the pane and the inset on both its sides. */
+  grid-template-columns: calc(var(--sidebar-width) + 2 * var(--sidebar-inset)) minmax(0, 1fr);
   /* The frame owns the viewport: the document behind it never scrolls, which is what keeps
      the sidebar put and gives every screen's panels a bounded box to scroll inside. */
   height: 100dvh;
   overflow: hidden;
-  background: var(--desk);
+  background: var(--paper);
 }
 
 .skip-link {
@@ -319,8 +319,8 @@ async function signOut() {
   top: var(--space-2);
   left: var(--space-2);
   z-index: 80;
-  padding: var(--space-2) var(--space-3);
-  border-radius: var(--radius);
+  padding: var(--space-2) var(--space-4);
+  border-radius: var(--radius-full);
   background: var(--accent);
   color: var(--accent-fg);
   font-size: var(--text-sm);
@@ -344,13 +344,26 @@ async function signOut() {
 
 /* --- Sidebar -------------------------------------------------------------- */
 
+/* A glass pane floating at the window's left, inset by the same margin on three sides
+   (docs/web.md § Design system, *Glass is for what floats*). */
 .sidebar {
   display: flex;
   flex-direction: column;
+  width: var(--sidebar-width);
   min-height: 0;
-  padding: var(--space-7) var(--space-6);
-  background: var(--rail);
-  border-right: 1px solid var(--line);
+  margin: var(--sidebar-inset) 0 var(--sidebar-inset) var(--sidebar-inset);
+  padding: 14px 10px 10px;
+  border-radius: var(--radius-card);
+  background: var(--glass-pane);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  box-shadow: var(--shadow-pane);
+}
+
+@supports not (backdrop-filter: blur(1px)) {
+  .sidebar {
+    background: var(--rail);
+  }
 }
 
 .sidebar-head {
@@ -358,7 +371,9 @@ async function signOut() {
   align-items: center;
   justify-content: space-between;
   gap: var(--space-2);
-  margin-bottom: var(--space-9);
+  min-height: var(--space-10);
+  padding: 0 var(--space-2);
+  margin-bottom: 14px;
 }
 
 /* The close control only exists once the sidebar is a drawer. Qualified by its parent so it
@@ -382,37 +397,31 @@ async function signOut() {
   display: flex;
   align-items: center;
   gap: 10px;
-  height: var(--control-height-sm);
-  padding: 0 var(--space-2) 0 10px;
-  border-radius: var(--radius);
-  color: var(--muted);
+  height: var(--control-height);
+  padding: 0 var(--space-3);
+  border-radius: var(--radius-md);
+  color: var(--ink);
   font-size: var(--text-sm);
   overflow: hidden;
-  transition:
-    background var(--duration-fast) var(--ease),
-    color var(--duration-fast) var(--ease);
+  transition: background var(--duration-fast) var(--ease);
 }
 
 .nav-item:hover {
-  background: var(--rail-active);
-  color: var(--ink);
+  background: var(--fill-weak);
 }
 
-/*
- * Active is a fill *and* a step up in weight, and nothing else — no left accent bar, no
- * vertical rule. The accent belongs to data (docs/web.md § Design system), and the fill on
- * its own is a couple of percent of luminance and reads as noise without the weight.
- */
+/* The current place: a fill and a weight step, as the system's sidebar marks it. */
 .nav-item.active {
-  background: var(--rail-active);
-  color: var(--ink);
+  background: var(--fill);
   font-weight: var(--weight-semibold);
 }
 
+/* The sidebar's glyphs carry the accent, as the system tints a sidebar's symbols. */
 .nav-item :deep(svg) {
-  width: 15px;
-  height: 15px;
+  width: 18px;
+  height: 18px;
   flex-shrink: 0;
+  color: var(--accent);
   pointer-events: none;
 }
 
@@ -422,46 +431,55 @@ async function signOut() {
   white-space: nowrap;
 }
 
-/* Pinned to the bottom, divided by a rule: the session's own row. The popover anchors
-   to it, so it owns a positioning context. */
+/* Pinned to the bottom: the session's own row. The popover anchors to it, so it owns a
+   positioning context. */
 .sidebar-foot {
   display: flex;
   align-items: center;
   margin-top: auto;
-  padding-top: var(--space-4);
-  border-top: 1px solid var(--line-strong);
+  padding-top: var(--space-2);
 }
 
-/* The disclosure: the avatar, the name and the caret are one button, styled as the plain
-   row it replaces — borderless, with the same hover shift the nav rows use. */
+/* The disclosure: the avatar, the name and the chevrons are one button, a row like the
+   nav's with the same hover. */
 .account {
   display: flex;
   align-items: center;
   gap: 10px;
   flex: 1;
   min-width: 0;
-  padding: 0;
+  height: var(--space-12);
+  padding: 0 var(--space-2);
   border: none;
+  border-radius: var(--radius-lg);
   background: transparent;
   cursor: pointer;
   text-align: left;
+  transition: background var(--duration-fast) var(--ease);
+}
+
+.account:hover,
+.account[aria-expanded='true'] {
+  background: var(--fill-weak);
 }
 
 .avatar {
   display: grid;
   place-items: center;
-  width: 26px;
-  height: 26px;
+  width: 30px;
+  height: 30px;
   flex-shrink: 0;
-  border: 1px solid var(--line-strong);
   border-radius: var(--radius-full);
   background: var(--paper);
   object-fit: cover;
 }
 
+/* No picture: the identity's first letter on a gray disc, as the system draws a contact
+   without one. */
 .avatar-initial {
-  color: var(--faint);
-  font-size: var(--text-2xs);
+  background: linear-gradient(180deg, var(--faint), var(--muted));
+  color: var(--accent-fg);
+  font-size: var(--text-xs);
   font-weight: var(--weight-semibold);
 }
 
@@ -471,22 +489,17 @@ async function signOut() {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: var(--text-xs);
-  color: var(--muted);
-  transition: color var(--duration-fast) var(--ease);
-}
-
-.account:hover .account-label {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
   color: var(--ink);
 }
 
-/* The one mark that says this row opens something, kept quiet: on a menu that opens upward
-   it points at the row, not away from it. */
+/* The one mark that says this row opens something, kept quiet. */
 .account-caret {
-  width: 13px;
-  height: 13px;
+  width: 14px;
+  height: 14px;
   flex-shrink: 0;
-  color: var(--faint);
+  color: var(--muted);
 }
 
 /* --- Content -------------------------------------------------------------- */
@@ -534,11 +547,12 @@ async function signOut() {
 
   .sidebar {
     position: fixed;
-    inset: 0 auto 0 0;
+    inset: var(--sidebar-inset) auto var(--sidebar-inset) var(--sidebar-inset);
     z-index: 50;
-    width: var(--sidebar-width);
-    transform: translateX(-100%);
+    margin: 0;
+    background: var(--paper);
     box-shadow: var(--shadow-dialog);
+    transform: translateX(calc(-100% - 2 * var(--sidebar-inset)));
     /* Off-screen *and* inert: a translated-away drawer is still focusable, so Tab would walk
        into a menu nobody can see. `visibility` fixes that, but it is not interpolable —
        applied plainly it would snap to hidden on the first frame and eat the slide-out.
@@ -569,12 +583,11 @@ async function signOut() {
     min-height: var(--space-12);
     flex-shrink: 0;
     padding: var(--space-2) var(--space-4);
-    background: var(--rail);
+    background: var(--paper);
     border-bottom: 1px solid var(--line);
   }
 
-  /* One scroll axis: the screen's rail collapses above its data region, and this becomes
-     the only thing that scrolls. */
+  /* One scroll axis: the screen's toolbar, title and content scroll together. */
   .content {
     display: block;
     overflow-y: auto;

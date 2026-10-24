@@ -333,19 +333,19 @@ defineExpose({ focus })
 </template>
 
 <style scoped>
-/* The design's floating-surface tokens, the same ones the context menu is built from: this
-   is the other thing in the app that hovers over the page rather than being cut into it. */
+/* A glass capsule over the document, as the reader's toolbar is: it hovers over the page
+   rather than being cut into it (docs/web.md § Design system, *Glass is for what floats*). */
 .find {
   display: flex;
   align-items: center;
   gap: var(--space-1);
-  padding: var(--space-1) var(--space-1) var(--space-1) var(--space-3);
-  border: 1px solid var(--menu-edge);
-  border-radius: var(--radius-menu);
-  background: var(--menu-surface);
-  box-shadow: var(--shadow-menu);
-  backdrop-filter: blur(24px) saturate(180%);
-  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  height: var(--control-height-lg);
+  padding: 0 var(--space-1) 0 var(--space-4);
+  border-radius: var(--radius-full);
+  background: var(--glass);
+  box-shadow: var(--shadow-glass), var(--shadow-menu);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
   animation: find-in var(--duration-fast) var(--ease-enter);
 }
 

@@ -98,7 +98,7 @@ function storedLayout(): Partial<Layout> {
   }
 }
 
-/** The side columns' widths, dragged by the rule on their left edge (docs/web.md § Column
+/** The cards' widths, dragged by the grip on their inner edge (docs/web.md § Column
  *  widths). */
 const COLUMN_WIDTHS = {
   notes: { initial: 320, min: 240, max: 560 },
@@ -144,6 +144,8 @@ function saveLayout() {
 watch([notesOpen, agentOpen], saveLayout)
 /** The document pane never gets narrower than this to make room for a dragged column. */
 const PANE_MIN_WIDTH = 360
+/** A card's inset from the window's edge, and the gap its grip sits in: `--space-4`. */
+const CARD_GAP = 16
 
 /** The block kinds the rich editor opens in place; the rest have their own path. */
 const RICH_KINDS = new Set<ResultBlock['kind']>(['p', 'h2', 'h3', 'list', 'table', 'math', 'code', 'quote'])
@@ -3556,9 +3558,9 @@ function columnMax(column: 'notes' | 'agent'): number {
   const other = column === 'notes' ? 'agent' : 'notes'
   const otherOpen = other === 'notes' ? notesOpen.value : agentOpen.value
   const total = columnsWidth.value
-  // Each open column's rule takes 1px of the row (7px wide, overlapping its neighbours).
-  const rules = (notesOpen.value ? 1 : 0) + (agentOpen.value ? 1 : 0)
-  const room = total - PANE_MIN_WIDTH - rules - (otherOpen ? columnWidth[other].value : 0)
+  // Each open card takes its inset from the window's edge and its grip's gap beside it.
+  const gaps = ((notesOpen.value ? 2 : 0) + (agentOpen.value ? 2 : 0)) * CARD_GAP
+  const room = total - PANE_MIN_WIDTH - gaps - (otherOpen ? columnWidth[other].value : 0)
   return Math.max(COLUMN_WIDTHS[column].min, Math.min(COLUMN_WIDTHS[column].max, room))
 }
 
@@ -3577,8 +3579,10 @@ function startResize(event: PointerEvent, column: 'notes' | 'agent') {
 
 function onResize(event: PointerEvent) {
   if (resizing) {
-    // The column sits right of its rule: dragging the rule left widens it.
-    setColumnWidth(resizing.column, resizing.width - (event.clientX - resizing.x))
+    // The notes card is left of its grip and the agent card right of its own: a drag away
+    // from the document widens either.
+    const moved = event.clientX - resizing.x
+    setColumnWidth(resizing.column, resizing.width + (resizing.column === 'notes' ? moved : -moved))
   }
 }
 
@@ -3599,7 +3603,9 @@ function onResizeKey(event: KeyboardEvent, column: 'notes' | 'agent') {
   const step = event.shiftKey ? 64 : 16
   if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
     event.preventDefault()
-    setColumnWidth(column, columnWidth[column].value + (event.key === 'ArrowLeft' ? step : -step))
+    // The arrow moves the edge: away from the document widens the card.
+    const outward = event.key === (column === 'notes' ? 'ArrowRight' : 'ArrowLeft')
+    setColumnWidth(column, columnWidth[column].value + (outward ? step : -step))
     chooseWidth(column)
   }
 }
@@ -4212,7 +4218,7 @@ watch(
 </script>
 
 <template>
-  <UiModal :title="title" size="full" tall flush @close="emit('close')">
+  <UiModal :title="title" size="full" tall flush back @close="emit('close')">
     <template #title>
       <div class="doc-head">
         <h2 class="doc-title" :title="title">{{ title }}</h2>
@@ -4231,63 +4237,57 @@ watch(
     </template>
 
     <template #actions>
-      <!-- The switches for the markdown view, each with its word: four bare glyphs read as
-           decoration until each one is hovered. None of them means anything over JSON. -->
-      <template v-if="tab === 'markdown'">
+      <!-- The switches for the markdown view, then More: one glass capsule, each button
+           named by its label (docs/web.md § Result viewer). None of the switches means
+           anything over JSON. -->
+      <UiCapsule :label="t('viewer.tools')">
+        <template v-if="tab === 'markdown'">
+          <UiButton
+            variant="ghost"
+            icon-only
+            :label="t('viewer.findLabel')"
+            :aria-pressed="findOpen ? 'true' : 'false'"
+            @click="findOpen ? (findOpen = false) : openFind()"
+          >
+            <template #icon><UiIcon name="search" /></template>
+          </UiButton>
+          <template v-if="editable">
+            <UiButton
+              variant="ghost"
+              icon-only
+              :label="t('viewer.notesLabel')"
+              :aria-pressed="notesOpen ? 'true' : 'false'"
+              @click="notesOpen = !notesOpen"
+            >
+              <template #icon><UiIcon name="notebook" /></template>
+            </UiButton>
+            <UiButton
+              variant="ghost"
+              icon-only
+              :label="t('viewer.agentLabel')"
+              :aria-pressed="agentOpen ? 'true' : 'false'"
+              @click="agentOpen = !agentOpen"
+            >
+              <template #icon><UiIcon name="message-circle" /></template>
+            </UiButton>
+          </template>
+          <span class="capsule-rule" aria-hidden="true" />
+        </template>
+
+        <!-- What the parse was, and the JSON view: read now and then, so one press away
+             rather than on the header for good. Both are the result, so More waits for it. -->
         <UiButton
           variant="ghost"
-          size="sm"
-          class="view-toggle"
-          :class="{ on: findOpen }"
-          :aria-pressed="findOpen ? 'true' : 'false'"
-          @click="findOpen ? (findOpen = false) : openFind()"
+          icon-only
+          :label="t('viewer.more')"
+          :disabled="!result"
+          aria-haspopup="menu"
+          :aria-expanded="moreMenu ? 'true' : 'false'"
+          @click="toggleMore"
         >
-          <template #icon><UiIcon name="search" /></template>
-          {{ t('viewer.findLabel') }}
+          <template #icon><UiIcon name="ellipsis" /></template>
         </UiButton>
-        <template v-if="editable">
-          <UiButton
-            variant="ghost"
-            size="sm"
-            class="view-toggle"
-            :class="{ on: notesOpen }"
-            :aria-pressed="notesOpen ? 'true' : 'false'"
-            @click="notesOpen = !notesOpen"
-          >
-            <template #icon><UiIcon name="notebook" /></template>
-            {{ t('viewer.notesLabel') }}
-          </UiButton>
-          <UiButton
-            variant="ghost"
-            size="sm"
-            class="view-toggle"
-            :class="{ on: agentOpen }"
-            :aria-pressed="agentOpen ? 'true' : 'false'"
-            @click="agentOpen = !agentOpen"
-          >
-            <template #icon><UiIcon name="message-circle" /></template>
-            {{ t('viewer.agentLabel') }}
-          </UiButton>
-        </template>
-        <span class="actions-rule" aria-hidden="true" />
-      </template>
-
-      <!-- What the parse was, and the JSON view: read now and then, so one press away
-           rather than on the header for good. Both are the result, so More waits for it. -->
-      <UiButton
-        variant="ghost"
-        size="sm"
-        icon-only
-        class="view-toggle"
-        :class="{ on: moreMenu }"
-        :label="t('viewer.more')"
-        :disabled="!result"
-        aria-haspopup="menu"
-        :aria-expanded="moreMenu ? 'true' : 'false'"
-        @click="toggleMore"
-      >
-        <template #icon><UiIcon name="ellipsis" /></template>
-      </UiButton>
+      </UiCapsule>
       <UiContextMenu
         v-if="moreMenu"
         :at="moreMenu"
@@ -4359,8 +4359,55 @@ watch(
           </div>
         </div>
 
-        <!-- The document pane and, beside it, the columns the header toggles. -->
+        <!-- The document pane and, either side of it, the cards the header toggles. -->
         <div ref="columnsBox" class="columns">
+          <!-- Notes: a card at the document's left, its head the name and a close, then
+               the same in-place editor over the whole file, always open (docs/web.md
+               § Notes). The grip on its right edge resizes it. -->
+          <template v-if="editable && notesOpen">
+            <aside
+              class="notes card"
+              :style="{ '--column-width': `${columnWidth.notes.value}px` }"
+              :aria-label="t('viewer.notesLabel')"
+            >
+              <header class="card-head">
+                <h3 class="card-title">{{ t('viewer.notesLabel') }}</h3>
+                <UiButton variant="ghost" icon-only :label="t('viewer.closeNotes')" @click="notesOpen = false">
+                  <template #icon><UiIcon name="panel-left-close" /></template>
+                </UiButton>
+              </header>
+              <div class="notes-view md-side" @click="onNotesClick">
+                <RichEditor
+                  ref="notesEditor"
+                  variant="notes"
+                  :source="notes"
+                  :placeholder="t('viewer.notesPlaceholder')"
+                  :label="t('viewer.notesLabel')"
+                  :links="notesLinks"
+                  :figures="editorFigures"
+                  :images="notesImages"
+                  @change="onNotesChange"
+                />
+              </div>
+            </aside>
+            <div
+              class="split"
+              role="separator"
+              tabindex="0"
+              aria-orientation="vertical"
+              :aria-label="t('viewer.resizeNotes')"
+              :aria-valuenow="columnWidth.notes.value"
+              :aria-valuemin="COLUMN_WIDTHS.notes.min"
+              :aria-valuemax="columnMax('notes')"
+              @pointerdown="startResize($event, 'notes')"
+              @pointermove="onResize"
+              @pointerup="endResize"
+              @pointercancel="endResize"
+              @dblclick="setColumnWidth('notes', COLUMN_WIDTHS.notes.initial); chooseWidth('notes')"
+              @keydown="onResizeKey($event, 'notes')"
+            />
+          </template>
+
           <!-- What floats over the document — the find bar, the outline, the toolbar, the
                pieces at its foot — is positioned against this, never laid out in it. -->
           <div
@@ -4674,46 +4721,6 @@ watch(
             <p class="sr-only" role="status" aria-live="polite">{{ liveText }}</p>
           </div>
 
-          <!-- Notes: the same in-place editor over the whole file, always open
-               (docs/web.md § Notes). No title row, no toolbar — the column is the notes. -->
-          <template v-if="editable && notesOpen">
-            <div
-              class="split"
-              role="separator"
-              tabindex="0"
-              aria-orientation="vertical"
-              :aria-label="t('viewer.resizeNotes')"
-              :aria-valuenow="columnWidth.notes.value"
-              :aria-valuemin="COLUMN_WIDTHS.notes.min"
-              :aria-valuemax="columnMax('notes')"
-              @pointerdown="startResize($event, 'notes')"
-              @pointermove="onResize"
-              @pointerup="endResize"
-              @pointercancel="endResize"
-              @dblclick="setColumnWidth('notes', COLUMN_WIDTHS.notes.initial); chooseWidth('notes')"
-              @keydown="onResizeKey($event, 'notes')"
-            />
-            <aside
-              class="notes"
-              :style="{ '--column-width': `${columnWidth.notes.value}px` }"
-              :aria-label="t('viewer.notesLabel')"
-            >
-              <div class="notes-view md-side" @click="onNotesClick">
-                <RichEditor
-                  ref="notesEditor"
-                  variant="notes"
-                  :source="notes"
-                  :placeholder="t('viewer.notesPlaceholder')"
-                  :label="t('viewer.notesLabel')"
-                  :links="notesLinks"
-                  :figures="editorFigures"
-                  :images="notesImages"
-                  @change="onNotesChange"
-                />
-              </div>
-            </aside>
-          </template>
-
           <!-- The agent's thread about this document (docs/web.md § The agent panel). -->
           <div
             v-if="editable && agentOpen && documentId !== null"
@@ -4734,7 +4741,7 @@ watch(
           />
           <aside
             v-if="editable && agentOpen && documentId !== null"
-            class="agent"
+            class="agent card"
             :style="{ '--column-width': `${columnWidth.agent.value}px` }"
             :aria-label="t('chat.panel')"
           >
@@ -4747,6 +4754,7 @@ watch(
               @changed="loadContent()"
               @locate="locateSection"
               @to-notes="addToNotes"
+              @close="agentOpen = false"
             />
           </aside>
         </div>
@@ -4781,9 +4789,11 @@ watch(
   margin: var(--space-6);
 }
 
+/* The filename, centred between the back button and the capsule. */
 .doc-head {
   display: flex;
   align-items: baseline;
+  justify-content: center;
   gap: var(--space-3);
   min-width: 0;
 }
@@ -4793,8 +4803,9 @@ watch(
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: var(--display-sm);
-  letter-spacing: normal;
+  font-size: var(--display-xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: -0.01em;
 }
 
 /* Drawn only when a save failed — the danger colour, beside the title; every other state is
@@ -4804,20 +4815,6 @@ watch(
   color: var(--danger);
   font-size: var(--text-xs);
   white-space: nowrap;
-}
-
-/* A toggle that is on sits on the rail-active surface, as a pressed nav row does. */
-.view-toggle.on {
-  background: var(--rail-active);
-  color: var(--ink);
-}
-
-/* The rule between the document's switches and More: two groups, not one row. */
-.actions-rule {
-  width: 1px;
-  height: var(--space-5);
-  margin-inline: var(--space-1);
-  background: var(--hair);
 }
 
 /* --- Markdown view -------------------------------------------------------- */
@@ -4836,8 +4833,9 @@ watch(
   height: 100%;
 }
 
-/* The pane and the two columns, side by side. The columns take their width from the pane
-   and never float over it; closing one gives the width back (docs/web.md § Notes). */
+/* The notes card, the pane and the agent card, side by side. The cards take their width
+   from the pane and never float over it; closing one gives the width back (docs/web.md
+   § Notes). */
 .columns {
   display: flex;
   min-width: 0;
@@ -4853,18 +4851,26 @@ watch(
   min-width: 0;
 }
 
-.degraded-note {
-  border-inline: none;
-  border-top: none;
+.doc-notes {
+  display: grid;
+  gap: var(--space-2);
+  padding-inline: var(--space-4);
 }
 
-/* A fact about the whole document — it is still growing. */
+.doc-notes:not(:empty) {
+  padding-bottom: var(--space-3);
+}
+
+/* A fact about the whole document — it is still growing: a quiet capsule under the header. */
 .parsing-note {
   display: flex;
   align-items: center;
+  justify-self: center;
   gap: var(--space-2);
-  padding: var(--space-2) var(--space-4);
-  border-bottom: 1px solid var(--line);
+  height: var(--control-height-sm);
+  padding: 0 var(--space-4);
+  border-radius: var(--radius-full);
+  background: var(--fill-weak);
   color: var(--muted);
   font-size: var(--text-xs);
 }
@@ -4893,6 +4899,10 @@ watch(
   overscroll-behavior: contain;
   padding: var(--space-7) var(--space-10) var(--space-12);
   scrollbar-width: none;
+  /* Text scrolling up under the header fades out rather than being cut at a line. A mask,
+     so it is the text's own alpha and works over any surface. */
+  -webkit-mask-image: linear-gradient(to bottom, transparent, black var(--space-6));
+  mask-image: linear-gradient(to bottom, transparent, black var(--space-6));
   transition: --locate-fade var(--duration-slow) var(--ease);
 }
 
@@ -5222,7 +5232,7 @@ watch(
   display: block;
   width: 100%;
   padding: var(--space-2) var(--space-3);
-  border: 1px dashed var(--rule);
+  border: 1px dashed var(--line-strong);
   border-radius: var(--radius);
   background: transparent;
   color: var(--muted);
@@ -5280,16 +5290,16 @@ watch(
   width: 100%;
 }
 
-/* --- Column rules ----------------------------------------------------------- */
+/* --- The cards and their grips ----------------------------------------------- */
 
-/* The rule between the document and a side column, and the handle that resizes the column
-   (docs/web.md § Column widths): a 7px hit area centred on a 1px line, which thickens to
-   the edge colour while it is hovered, dragged or focused. */
+/* The grip between a card and the document, which resizes the card (docs/web.md § Column
+   widths): the whole 16px gap is the hit area, the pill in its middle the mark, darkening
+   and growing while it is hovered, dragged or focused. It stops where the card does. */
 .split {
   position: relative;
   z-index: 1;
-  flex: 0 0 7px;
-  margin-inline: -3px;
+  flex: 0 0 var(--space-4);
+  margin-bottom: var(--space-4);
   cursor: col-resize;
   touch-action: none;
 }
@@ -5297,53 +5307,97 @@ watch(
 .split::after {
   content: '';
   position: absolute;
-  inset-block: 0;
-  left: 3px;
-  width: 1px;
-  background: var(--line);
+  top: 50%;
+  left: 50%;
+  width: 5px;
+  height: 40px;
+  border-radius: var(--radius-full);
+  background: var(--grip);
+  transform: translate(-50%, -50%);
   transition:
     background var(--duration-fast) var(--ease),
-    width var(--duration-fast) var(--ease),
-    left var(--duration-fast) var(--ease);
+    height var(--duration-fast) var(--ease);
 }
 
 .split:hover::after,
 .split:active::after,
 .split:focus-visible::after {
-  left: 2px;
-  width: 3px;
-  background: var(--edge);
+  height: 56px;
+  background: var(--grip-active);
 }
 
 .split:focus-visible {
   outline: none;
 }
 
-/* --- Notes column --------------------------------------------------------- */
+/* A card floats beside the document, inset from the window's edges as the sidebar is: the
+   glass pane, the card's radius, its head and then what it holds (docs/web.md § Design
+   system, *Glass is for what floats*). */
+.card {
+  display: flex;
+  flex: 0 0 var(--column-width);
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  margin-bottom: var(--space-4);
+  overflow: hidden;
+  border-radius: var(--radius-card);
+  background: var(--glass-pane);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  box-shadow: var(--shadow-pane);
+}
 
-/* The notes at the UI scale on the sunken surface: a margin beside the document, not a
-   second document. */
+@supports not (backdrop-filter: blur(1px)) {
+  .card {
+    background: var(--rail);
+  }
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  flex-shrink: 0;
+  height: 56px;
+  padding: 0 10px 0 var(--space-5);
+}
+
+.card-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--display-xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: -0.01em;
+}
+
+.card-head :deep(.btn) {
+  color: var(--muted);
+}
+
+/* --- Notes card ----------------------------------------------------------- */
+
+/* The notes at the UI scale: a margin beside the document, not a second document. */
 .notes {
+  --column-width: 320px;
   --block-heading: var(--display-2xs);
   --block-subheading: var(--text-base);
   --block-text: var(--text-sm);
   --block-text-sm: var(--text-xs);
   --rich-gap: var(--space-3);
 
-  display: flex;
-  flex: 0 0 var(--column-width, 320px);
-  flex-direction: column;
-  min-width: 0;
-  min-height: 0;
-  background: var(--paper-sunken);
+  margin-left: var(--space-4);
 }
 
-/* The whole column is the notes: a click below the last line still writes. */
+/* The whole card under its head is the notes: a click below the last line still writes. */
 .notes-view {
   flex: 1 1 auto;
   min-height: 0;
   width: 100%;
-  padding: var(--space-5) var(--space-5) var(--space-8);
+  padding: var(--space-1) var(--space-5) var(--space-8);
   overflow: auto;
   overscroll-behavior: contain;
   scrollbar-width: none;
@@ -5359,15 +5413,12 @@ watch(
   line-height: 1.65;
 }
 
-/* --- Agent column --------------------------------------------------------- */
+/* --- Agent card ----------------------------------------------------------- */
 
 .agent {
-  display: flex;
-  flex: 0 0 var(--column-width, 360px);
-  flex-direction: column;
-  min-width: 0;
-  min-height: 0;
-  background: var(--paper);
+  --column-width: 360px;
+
+  margin-right: var(--space-4);
 }
 
 /* --- JSON view ------------------------------------------------------------ */
@@ -5403,10 +5454,18 @@ watch(
     flex: 1 1 50%;
   }
 
-  .notes,
-  .agent {
+  /* The cards stack under the document, the notes first, full width and inset. */
+  .card {
     flex: 0 0 45%;
-    border-top: 1px solid var(--line);
+    margin: 0 var(--space-4) var(--space-4);
+  }
+
+  .notes {
+    order: 1;
+  }
+
+  .agent {
+    order: 2;
   }
 
   .split {
@@ -5432,17 +5491,6 @@ watch(
 }
 
 @media (max-width: 640px) {
-  /* A phone's header has room for the glyphs, not their words: the words stay the
-     buttons' names, out of sight. */
-  .view-toggle :deep(.btn-label) {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip-path: inset(50%);
-    white-space: nowrap;
-  }
-
   .doc-find {
     right: var(--space-4);
     width: calc(100% - var(--space-8));

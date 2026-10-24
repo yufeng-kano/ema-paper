@@ -87,15 +87,20 @@ const sections = computed<Section[]>(() => {
 <style scoped>
 .content {
   width: 100%;
-  max-width: 720px;
+  max-width: 800px;
   margin: 0 auto;
-  padding: var(--space-10) var(--space-6) var(--space-12);
+  padding: var(--space-12) var(--space-6) var(--space-12);
 }
 
+/* The text on a paper sheet over the desk, the reading column inside it. */
 .document {
   display: flex;
   flex-direction: column;
   gap: var(--space-8);
+  padding: var(--space-12) var(--space-10);
+  border-radius: var(--radius-card);
+  background: var(--paper);
+  box-shadow: var(--shadow-pane);
 }
 
 .head {
@@ -104,9 +109,7 @@ const sections = computed<Section[]>(() => {
 }
 
 .title {
-  font-size: var(--display-lg);
-  font-weight: var(--weight-semibold);
-  letter-spacing: -0.02em;
+  font-size: var(--display-2xl);
   line-height: 1.1;
 }
 
@@ -130,27 +133,37 @@ const sections = computed<Section[]>(() => {
 }
 
 .section-title {
-  font-size: var(--text-lg);
-  font-weight: var(--weight-semibold);
+  font-size: var(--display-xs);
+  letter-spacing: normal;
 }
 
 .section p {
+  color: var(--ink-soft);
+  font-size: var(--text-base);
   line-height: 1.7;
 }
 
 .mail {
   color: var(--accent);
+}
+
+.mail:hover {
   text-decoration: underline;
   text-underline-offset: 3px;
 }
 
 @media (max-width: 640px) {
   .content {
-    padding: var(--space-8) var(--space-4) var(--space-10);
+    padding: var(--space-6) var(--space-4) var(--space-10);
+  }
+
+  .document {
+    padding: var(--space-8) var(--space-5);
+    border-radius: var(--radius-xl);
   }
 
   .title {
-    font-size: var(--display-md);
+    font-size: var(--display-lg);
   }
 }
 </style>

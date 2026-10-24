@@ -139,11 +139,9 @@ function onDeleted(name: string) {
 .section-label {
   margin: 0;
   font-family: inherit;
-  font-size: var(--text-2xs);
+  font-size: var(--text-xs);
   font-weight: var(--weight-semibold);
-  letter-spacing: var(--tracking-label);
-  text-transform: uppercase;
-  color: var(--faint);
+  color: var(--muted);
 }
 
 .table-scroll {

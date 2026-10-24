@@ -1,16 +1,15 @@
 <script setup lang="ts">
 /**
- * One row's share of the largest value in its column, as a bar.
+ * A share as a bar: how much of a limit is used — the Usage section's credits and storage
+ * (docs/web.md § Pages, `/settings/usage`) — or how far a parse has got.
  *
- * Unlike a quota meter the fill never escalates through amber to red: a bigger share of a
- * month's spend is not a worse state, it is just a bigger number. The figure it ranks is
- * always printed beside it, so the bar is emphasis and never the only signal — which is
- * also why it carries an accessible name rather than a visible label.
- *
- * A meter is data, so it is one of the few things allowed to be the accent colour.
+ * The fill never escalates through amber to red: the figure is always printed beside it
+ * (*N% used*, *9 of 32*), so the bar is emphasis and never the only signal — which is also why it
+ * carries an accessible name rather than a visible label. A meter is data, so it is one of
+ * the few things allowed to be the accent colour.
  */
 const props = defineProps<{
-  /** 0..1, this row against the largest row in the same table. */
+  /** 0..1, the used share of the limit, or the parse's pages done. */
   share: number
   /** Accessible name — the row this bar belongs to. */
   label: string
@@ -33,17 +32,19 @@ const percent = computed(() => Math.round(Math.max(0, Math.min(1, props.share)) 
 </template>
 
 <style scoped>
-/* 3px and square. A rounded cap on a 3px bar spends a third of the smallest value on the
-   curve, which is what made short rows unreadable. */
+/* A rounded bar on the system's gray fill, filled in the accent: tall enough for its round
+   ends not to eat a small value. */
 .track {
-  height: 3px;
-  background: var(--hair);
+  height: 6px;
+  border-radius: var(--radius-full);
+  background: var(--fill);
   overflow: hidden;
 }
 
 .fill {
   height: 100%;
-  min-width: 1px;
+  min-width: 2px;
+  border-radius: inherit;
   background: var(--accent);
   transition: width var(--duration-slow) var(--ease);
 }

@@ -24,16 +24,6 @@ export function formatShortDateTime(iso: string, locale: string): string {
   }).format(at)
 }
 
-/**
- * `YYYY-MM-DD` day buckets from `GET /api/usage`. Rendered in UTC because that is the
- * timezone the backend grouped them in — a local-timezone render would shift labels.
- */
-export function formatDay(day: string, locale: string): string {
-  return new Intl.DateTimeFormat(locale, { dateStyle: 'medium', timeZone: 'UTC' }).format(
-    new Date(`${day}T00:00:00Z`),
-  )
-}
-
 /** A date alone — the day a period resets — in the reader's own timezone. */
 export function formatDate(iso: string, locale: string): string {
   return new Intl.DateTimeFormat(locale, { dateStyle: 'medium' }).format(new Date(iso))
@@ -47,16 +37,6 @@ export function formatMinorAmount(amount: string, currency: string, locale: stri
   const format = new Intl.NumberFormat(locale, { style: 'currency', currency })
   const digits = format.resolvedOptions().maximumFractionDigits ?? 2
   return format.format(Number(amount) / 10 ** digits)
-}
-
-/** Costs are USD amounts, billed or estimated, and are often fractions of a cent. */
-export function formatCost(value: number, locale: string): string {
-  return new Intl.NumberFormat(locale, {
-    style: 'currency',
-    currency: 'USD',
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 4,
-  }).format(value)
 }
 
 export function formatCount(value: number, locale: string): string {

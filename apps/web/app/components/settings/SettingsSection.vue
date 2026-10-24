@@ -1,16 +1,15 @@
 <script setup lang="ts">
 /**
- * One section of the settings dialog (docs/web.md § Pages, `/settings/<section>`): the serif
- * title with an optional eyebrow over it and the section's one action beside it, then the
- * section's rows and tables.
+ * One section of the settings dialog (docs/web.md § Pages, `/settings/<section>`): the bold
+ * title with an optional quiet line under it and the section's one action beside it, then
+ * the section's grouped lists and tables.
  *
- * `--panel-x` is zeroed here so a `UiPanel` inside a section — the keys table, the usage
- * sections — aligns with the title instead of indenting by the panel gutter the full-width
- * screens need.
+ * `--panel-x` is zeroed here so a `UiPanel` inside a section — the keys table — aligns with
+ * the title instead of indenting by the gutter a full-width screen needs.
  */
 defineProps<{
   title: string
-  /** A fact about the section's data, uppercase over the title: "3 active", "Last 30 days". */
+  /** A fact about the section's data, under the title: "3 active", "OAuth · no key". */
   eyebrow?: string
 }>()
 
@@ -25,8 +24,8 @@ defineSlots<{
   <section class="section">
     <header class="head">
       <div class="heading">
-        <p v-if="eyebrow" class="eyebrow">{{ eyebrow }}</p>
         <h1 class="title">{{ title }}</h1>
+        <p v-if="eyebrow" class="meta">{{ eyebrow }}</p>
       </div>
       <div v-if="$slots.actions" class="actions">
         <slot name="actions" />
@@ -49,23 +48,27 @@ defineSlots<{
 
 .head {
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   justify-content: space-between;
   gap: var(--space-4);
-  padding-bottom: var(--space-6);
-  border-bottom: 1px solid var(--line);
+  padding-bottom: var(--space-2);
 }
 
 .heading {
   display: grid;
-  gap: var(--space-2);
+  gap: 2px;
   min-width: 0;
 }
 
 .title {
   font-size: var(--display-md);
-  line-height: 1.1;
+  line-height: 1.15;
   overflow-wrap: anywhere;
+}
+
+.meta {
+  color: var(--muted);
+  font-size: var(--text-sm);
 }
 
 .actions {

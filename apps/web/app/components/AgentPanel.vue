@@ -272,11 +272,9 @@ function onSectionSaved(agent: string, saved: SavedAgentSettings) {
 }
 
 .fact-label {
-  font-size: var(--text-2xs);
+  font-size: var(--text-xs);
   font-weight: var(--weight-semibold);
-  letter-spacing: var(--tracking-label);
-  text-transform: uppercase;
-  color: var(--faint);
+  color: var(--muted);
 }
 
 .fact-value {
@@ -337,11 +335,9 @@ function onSectionSaved(agent: string, saved: SavedAgentSettings) {
 /* The tools row has the field label's treatment with no control under it. */
 .tools-label {
   margin: 0;
-  font-size: var(--text-2xs);
+  font-size: var(--text-xs);
   font-weight: var(--weight-semibold);
-  letter-spacing: var(--tracking-label);
-  text-transform: uppercase;
-  color: var(--faint);
+  color: var(--muted);
 }
 
 .tools {
