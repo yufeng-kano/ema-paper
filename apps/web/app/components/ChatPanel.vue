@@ -27,6 +27,7 @@ import {
   createConversation,
   deleteConversation,
   ApiRequestError,
+  getMe,
   getSandbox,
   getConversation,
   listConversations,
@@ -598,12 +599,31 @@ const storageFull = computed(
   () => storageRefused.value || (storage.value !== null && storage.value.bytes >= storage.value.quota),
 )
 
-onMounted(readStorage)
-// A turn spends credits and writes files: both figures are read again once it ends.
+/** The balance, read again and handed to the shell. A failed read keeps the figures there
+ *  were, where `auth.refresh` would sign the panel out on a network blip. */
+async function readBalance() {
+  try {
+    auth.me.value = await getMe()
+  } catch {
+    // The cached figures stand; the server's 402 is the authority either way.
+  }
+}
+
+/** Both figures, when the panel opens, when the window comes back — a period may have
+ *  reset or files been deleted meanwhile — and once a turn, which spends and writes, ends. */
+function readLimits() {
+  void readStorage()
+  void readBalance()
+}
+
+onMounted(() => {
+  readLimits()
+  window.addEventListener('focus', readLimits)
+})
+onBeforeUnmount(() => window.removeEventListener('focus', readLimits))
 watch(running, (now, before) => {
   if (before && !now) {
-    void readStorage()
-    void auth.refresh()
+    readLimits()
   }
 })
 
