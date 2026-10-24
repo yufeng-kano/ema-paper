@@ -123,8 +123,10 @@ defineSlots<Record<string, (props: { row: Row }) => unknown>>()
   background-clip: padding-box;
 }
 
-/* Every other row on a faint fill, its ends rounded, as Finder's list draws it. */
-.table tbody tr:nth-child(even) td {
+/* Every other row on a faint fill, its ends rounded, as Finder's list draws it. The parity
+   sits in `:where()` so it adds no weight: a caller's row states (Files' selection, drop
+   target) must win over the stripe on even rows too. */
+.table tbody tr:where(:nth-child(even)) td {
   background: var(--row-alt);
 }
 
