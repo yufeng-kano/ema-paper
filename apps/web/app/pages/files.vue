@@ -25,6 +25,7 @@
  * the menu items say what they are.
  */
 import type { ComponentPublicInstance } from 'vue'
+import type { LocationQueryRaw } from 'vue-router'
 import {
   ApiRequestError,
   copyDocument,
@@ -117,8 +118,60 @@ const view = ref<'files' | 'trash'>('files')
 
 // --- where we are ----------------------------------------------------------
 
-const currentFolder = ref<FolderId>(null)
+/**
+ * The open folder and the open document live in the URL — `?folder=<id>`, `?doc=<id>` — so
+ * Back and Forward walk them and a refresh or a pasted address opens the same place
+ * (docs/web.md § Files). Anything that is not a positive id reads as none.
+ */
+const route = useRoute()
+const router = useRouter()
+
+function queryId(value: unknown): number | null {
+  const id = typeof value === 'string' ? Number(value) : Number.NaN
+  return Number.isInteger(id) && id > 0 ? id : null
+}
+
+/** The query the last navigation asked for, until it lands, and the navigations one after
+ *  another: a navigation started before the previous one landed would cancel it, and one
+ *  built from the route before it moved would undo it. */
+let wantedQuery: LocationQueryRaw | null = null
+let navigating: Promise<unknown> = Promise.resolve()
+
+function writeQuery(patch: Record<string, string | undefined>, replace: boolean) {
+  const query = { ...(wantedQuery ?? route.query), ...patch }
+  wantedQuery = query
+  navigating = navigating
+    .then(() => (replace ? router.replace({ query }) : router.push({ query })))
+    .finally(() => {
+      if (wantedQuery === query) {
+        wantedQuery = null
+      }
+    })
+}
+
+const currentFolder = ref<FolderId>(queryId(route.query.folder))
 const crumbs = computed(() => folderPath(folders.value, currentFolder.value))
+
+/** The folder in the URL: a new history entry, or the current one replaced when the folder
+ *  went away on its own. */
+function writeFolder(id: FolderId, replace = false) {
+  if (queryId((wantedQuery ?? route.query).folder) === id) {
+    return
+  }
+  writeQuery({ folder: id === null ? undefined : String(id) }, replace)
+}
+
+/** Back and Forward move the folder; the screen follows. */
+watch(
+  () => route.query.folder,
+  (value) => {
+    const id = queryId(value)
+    if (id !== currentFolder.value) {
+      currentFolder.value = id
+      clearSelection()
+    }
+  },
+)
 
 /**
  * Open a folder. `select` is the row to select on arrival — the folder just left, when the
@@ -126,6 +179,7 @@ const crumbs = computed(() => folderPath(folders.value, currentFolder.value))
  */
 function openFolder(id: FolderId, select?: number) {
   currentFolder.value = id
+  writeFolder(id)
   clearSelection()
   if (select !== undefined) {
     selectOnly(`folder-${select}`)
@@ -178,8 +232,6 @@ function onTabKeydown(event: KeyboardEvent) {
  * `&block=<anchor>` — a block's *Copy link to block* — the document opens too, scrolled to
  * that block.
  */
-const route = useRoute()
-const router = useRouter()
 const revealId = Number(route.query.document) || null
 const revealBlock = typeof route.query.block === 'string' ? route.query.block : null
 const revealed = ref<number | null>(null)
@@ -187,7 +239,7 @@ const revealed = ref<number | null>(null)
 const linkedBlock = ref<{ id: number; anchor: string } | null>(null)
 let revealTimer: ReturnType<typeof setTimeout> | undefined
 if (route.query.document !== undefined) {
-  void router.replace({ query: {} })
+  writeQuery({ document: undefined, block: undefined }, true)
 }
 
 if (revealId !== null) {
@@ -201,6 +253,7 @@ if (revealId !== null) {
         return
       }
       currentFolder.value = target.folder_id
+      writeFolder(target.folder_id, true)
       revealed.value = target.id
       await nextTick()
       selectOnly(`file-${target.id}`)
@@ -218,12 +271,21 @@ if (revealId !== null) {
 onBeforeUnmount(() => clearTimeout(revealTimer))
 
 /** A folder deleted or trashed in another tab would otherwise leave this screen looking at
- *  nothing. */
-watch(folders, (list) => {
-  if (currentFolder.value !== null && !list.some((row) => row.id === currentFolder.value)) {
-    currentFolder.value = null
-  }
-})
+ *  nothing, and so would a `?folder` the library does not hold — checked as soon as there
+ *  is a library, the one already in hand included. */
+watch(
+  folders,
+  (list) => {
+    if (!data.value) {
+      return
+    }
+    if (currentFolder.value !== null && !list.some((row) => row.id === currentFolder.value)) {
+      currentFolder.value = null
+      writeFolder(null, true)
+    }
+  },
+  { immediate: true },
+)
 
 // --- rows ------------------------------------------------------------------
 
@@ -723,6 +785,61 @@ async function showResult(document: LibraryDocument) {
   }
   await fetchResult(document)
 }
+
+/**
+ * The open document in the URL (`?doc=<id>`, docs/web.md § Files). Opening one pushes an
+ * entry, so Back closes the viewer; closing it here goes back over that entry rather than
+ * adding another, or drops `doc` when the viewer was opened from the URL itself.
+ */
+let docPushed = false
+watch(
+  () => openDocument.value?.id ?? null,
+  (id) => {
+    if (queryId((wantedQuery ?? route.query).doc) === id) {
+      return
+    }
+    if (id !== null) {
+      docPushed = true
+      writeQuery({ doc: String(id) }, false)
+    } else if (docPushed) {
+      docPushed = false
+      navigating = navigating.then(() => router.back())
+    } else {
+      writeQuery({ doc: undefined }, true)
+    }
+  },
+)
+
+/** A `doc` that arrives with the URL — a refresh, a pasted address, Forward — opens once the
+ *  library has it; one that cannot be opened is dropped. */
+async function openDocQuery() {
+  const id = queryId(route.query.doc)
+  if (id === null || id === openDocument.value?.id || !data.value) {
+    return
+  }
+  const target = documents.value.find((row) => row.id === id)
+  if (target) {
+    await showResult(target)
+  }
+  if (openDocument.value?.id !== id) {
+    writeQuery({ doc: undefined }, true)
+  }
+}
+
+/** Back taking `doc` away closes the viewer; Forward bringing one opens it. */
+watch(
+  () => route.query.doc,
+  (value) => {
+    if (queryId(value) === null) {
+      docPushed = false
+      openDocument.value = null
+      return
+    }
+    void openDocQuery()
+  },
+)
+watch(data, () => void openDocQuery(), { once: true })
+onMounted(() => void openDocQuery())
 
 /** The open viewer follows its own row: a parse only opens finished, so there is nothing
  *  more of it to read, but its name and folder can still change — and a re-convert that
