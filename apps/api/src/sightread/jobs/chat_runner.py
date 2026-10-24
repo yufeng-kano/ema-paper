@@ -654,9 +654,23 @@ async def _stream_once(
     # Kano Proxy names a model `provider/model`; the upstream answers with the bare id. Read
     # with the requested provider, the same model is not a fallback, and a real fallback is
     # followed under a name Kano Proxy can route (docs/chat.md § Request).
-    provider = str(body["model"]).rpartition("/")[0]
+    asked = str(body["model"])
+    provider = asked.rpartition("/")[0]
     if provider and completed.model and "/" not in completed.model:
         completed.model = f"{provider}/{completed.model}"
+    if completed.model and completed.model not in ctx.settings.model_prices:
+        # A name this deployment does not price — a group alias the upstream answers under
+        # the target's own id, or a fallback nobody priced — is not one to follow or bill
+        # as: the conversation would sit on a name no later turn may run, and the call
+        # would be charged nothing. It is the model asked for (docs/chat.md § Request).
+        logger.warning(
+            "turn %s: %s answered as %s, which is unpriced; kept as %s",
+            ctx.turn.id,
+            asked,
+            completed.model,
+            asked,
+        )
+        completed.model = asked
     return completed
 
 
