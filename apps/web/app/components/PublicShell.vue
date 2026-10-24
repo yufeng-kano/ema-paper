@@ -2,14 +2,15 @@
 /**
  * The frame of a public page other than sign-in (docs/web.md § Pages, `/pricing` and the
  * policy pages): the sign-in page's brand panel reduced to a bar — the mark, the page's
- * name, *Sign in* — the page's own content between, and the public footer at the bottom.
- * Full-bleed like the sign-in page: a visitor lands here signed out, and a signed-in reader
- * is not sent away.
+ * name, *Sign in* (*Back to Files* once `GET /api/me` says someone is signed in) — the
+ * page's own content between, and the public footer at the bottom. Full-bleed like the
+ * sign-in page: a visitor lands here signed out, and a signed-in reader is not sent away.
  */
 defineProps<{ title: string }>()
 
 const { t } = useI18n()
 const localePath = useLocalePath()
+const auth = useAuth()
 </script>
 
 <template>
@@ -18,7 +19,10 @@ const localePath = useLocalePath()
       <AppBrand :to="localePath('/')" />
       <nav class="bar-nav" :aria-label="title">
         <span class="bar-current" aria-current="page">{{ title }}</span>
-        <NuxtLink class="bar-link" :to="localePath('/')">{{ t('login.signIn') }}</NuxtLink>
+        <NuxtLink v-if="auth.me.value" class="bar-link" :to="localePath('/files')">
+          {{ t('login.backToFiles') }}
+        </NuxtLink>
+        <NuxtLink v-else class="bar-link" :to="localePath('/')">{{ t('login.signIn') }}</NuxtLink>
       </nav>
     </header>
 

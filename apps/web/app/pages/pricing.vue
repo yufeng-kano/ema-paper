@@ -8,7 +8,7 @@
  * Prerendered in both locales like the sign-in page, and full-bleed like it: a visitor
  * lands here signed out, and a signed-in reader is not sent away.
  */
-import { getBillingCatalog, type CatalogPlan, type CatalogResponse } from '~/lib/api'
+import { createCheckout, getBillingCatalog, type CatalogPlan, type CatalogResponse } from '~/lib/api'
 import { formatBytes, formatCount, formatMinorAmount } from '~/lib/format'
 import { SETTINGS_QUERY, keepAfterSignIn } from '~/lib/settings'
 import type { TableColumn } from '~/lib/table'
@@ -54,6 +54,34 @@ function cycleOf(plan: CatalogPlan): string {
 /** The Billing section, where *Upgrade* is; a signed-out visitor is sent to sign in first
  *  and lands there after it (the destination kept for this tab). */
 const billingPath = computed(() => `${localePath('/files')}?${SETTINGS_QUERY}=billing`)
+
+// --- a signed-in reader -------------------------------------------------------------------
+
+const auth = useAuth()
+/** `free` or the paid plan's id once `GET /api/me` answers; null for a signed-out visitor,
+ *  whose cards keep their public actions (docs/web.md § Pages, `/pricing`). */
+const myPlan = computed(() => auth.me.value?.plan ?? null)
+
+const checkingOut = ref<string | null>(null)
+const checkoutError = ref<{ plan: string; message: string } | null>(null)
+
+/** Pay's checkout for the plan, in this tab: the return lands on the Billing section, as
+ *  that section's own *Upgrade* does (docs/billing.md § Kano Pay). */
+async function upgrade(plan: CatalogPlan) {
+  if (checkingOut.value) {
+    return
+  }
+  checkingOut.value = plan.plan_id
+  checkoutError.value = null
+  try {
+    const { url } = await createCheckout(plan.plan_id)
+    window.location.assign(url)
+  } catch (error) {
+    checkoutError.value = { plan: plan.plan_id, message: await resolve(error) }
+  } finally {
+    checkingOut.value = null
+  }
+}
 
 function price(plan: CatalogPlan): string {
   return formatMinorAmount(plan.amount, plan.currency, locale.value)
@@ -112,7 +140,12 @@ const questions = ['1', '2', '3', '4'] as const
               <li>{{ t('pricing.api') }}</li>
               <li>{{ catalog.free.sandbox ? t('pricing.chatSandbox') : t('pricing.chatNoSandbox') }}</li>
             </ul>
-            <NuxtLink class="cta secondary" :to="localePath('/')">{{ t('pricing.startFree') }}</NuxtLink>
+            <div class="actions">
+              <p v-if="myPlan === 'free'" class="current">{{ t('pricing.currentPlan') }}</p>
+              <NuxtLink v-else-if="myPlan === null" class="cta secondary" :to="localePath('/')">
+                {{ t('pricing.startFree') }}
+              </NuxtLink>
+            </div>
           </article>
           <div v-else class="plan" aria-busy="true" :aria-label="t('pricing.loading')">
             <UiSkeleton :rows="5" />
@@ -133,9 +166,26 @@ const questions = ['1', '2', '3', '4'] as const
                 <li>{{ t('pricing.api') }}</li>
                 <li>{{ plan.sandbox ? t('pricing.chatSandbox') : t('pricing.chatNoSandbox') }}</li>
               </ul>
-              <NuxtLink class="cta" :to="billingPath" @click="keepAfterSignIn(billingPath)">
-                {{ t('pricing.upgrade') }}
-              </NuxtLink>
+              <div class="actions">
+                <template v-if="myPlan === plan.plan_id">
+                  <p class="current">{{ t('pricing.currentPlan') }}</p>
+                  <NuxtLink class="cta secondary" :to="billingPath">{{ t('pricing.manage') }}</NuxtLink>
+                </template>
+                <button
+                  v-else-if="myPlan === 'free'"
+                  type="button"
+                  class="cta"
+                  :disabled="checkingOut !== null"
+                  :aria-busy="checkingOut === plan.plan_id"
+                  @click="upgrade(plan)"
+                >
+                  {{ t('pricing.upgrade') }}
+                </button>
+                <NuxtLink v-else-if="myPlan === null" class="cta" :to="billingPath" @click="keepAfterSignIn(billingPath)">
+                  {{ t('pricing.upgrade') }}
+                </NuxtLink>
+              </div>
+              <UiBanner v-if="checkoutError?.plan === plan.plan_id" tone="error">{{ checkoutError.message }}</UiBanner>
             </article>
           </template>
           <p v-else-if="catalog" class="not-on-sale">{{ t('pricing.notOnSale') }}</p>
@@ -290,15 +340,31 @@ const questions = ['1', '2', '3', '4'] as const
   line-height: 1.5;
 }
 
+/* The card's action at its foot: a link, the checkout button, or *Current plan*. */
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  margin-top: auto;
+}
+
+.current {
+  margin: 0;
+  color: var(--muted);
+  font-weight: var(--weight-medium);
+}
+
 .cta {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  align-self: flex-start;
   height: var(--control-height);
-  margin-top: auto;
   padding: 0 var(--space-4);
+  border: 0;
   border-radius: var(--radius);
+  font: inherit;
+  cursor: pointer;
   background: var(--accent);
   color: var(--accent-fg);
   font-weight: var(--weight-medium);
@@ -308,6 +374,11 @@ const questions = ['1', '2', '3', '4'] as const
 
 .cta:hover {
   background: var(--accent-hover);
+}
+
+.cta:disabled {
+  opacity: 0.6;
+  cursor: progress;
 }
 
 .cta.secondary {

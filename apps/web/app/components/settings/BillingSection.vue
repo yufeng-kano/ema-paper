@@ -58,6 +58,9 @@ const subscriptionLine = computed(() => {
   return subscription.cancel_at_period_end ? t('billing.cancelAtEnd', { date: end }) : t('billing.renews', { date: end })
 })
 
+/** An overdrawn period reads 0, never a negative balance (docs/billing.md § A chat turn). */
+const remaining = computed(() => Math.max(0, billing.value?.period.remaining ?? 0))
+
 const spentShare = computed(() => {
   const period = billing.value?.period
   return period && period.granted > 0 ? Math.min(1, period.spent / period.granted) : 0
@@ -185,11 +188,11 @@ async function reload() {
 
       <SettingsRow :label="t('billing.credits')" :description="t('billing.creditsDescription')">
         <p class="balance tabular">
-          <span class="remaining">{{ formatCount(billing.period.remaining, locale) }}</span>
+          <span class="remaining">{{ formatCount(remaining, locale) }}</span>
           <span class="of">
             {{
               t('billing.remainingOf', {
-                remaining: formatCount(billing.period.remaining, locale),
+                remaining: formatCount(remaining, locale),
                 granted: formatCount(billing.period.granted, locale),
               })
             }}

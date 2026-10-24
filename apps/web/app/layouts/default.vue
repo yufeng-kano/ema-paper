@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import type { ComponentPublicInstance } from 'vue'
-import { formatCount } from '~/lib/format'
-import type { MenuFact, MenuItem, Point } from '~/lib/menu'
+import type { MenuItem, Point } from '~/lib/menu'
 import { SETTINGS_QUERY, settingsSectionOf } from '~/lib/settings'
 
 /**
@@ -24,7 +23,7 @@ import { SETTINGS_QUERY, settingsSectionOf } from '~/lib/settings'
  * tab bar: the labels are doing the work, and a tab bar would spend the scarcest axis on a
  * phone.
  */
-const { t, locale } = useI18n()
+const { t } = useI18n()
 const route = useRoute()
 const localePath = useLocalePath()
 const auth = useAuth()
@@ -81,31 +80,15 @@ function closeAccountMenu() {
   accountMenuClosedAt = performance.now()
 }
 
-/** The plan and what is left of the period, from `GET /api/me`; none until it answers. */
-const accountFacts = computed<MenuFact[]>(() => {
-  const me = auth.me.value
-  if (!me) {
-    return []
-  }
-  return [
-    { label: t('nav.plan'), value: me.plan === 'free' ? t('billing.free') : me.plan },
-    {
-      label: t('nav.credits'),
-      value: t('nav.creditsLeft', { n: formatCount(me.credits_remaining, locale.value) }, me.credits_remaining),
-    },
-  ]
-})
-
-/** Upgrade on Free, Billing on a paid plan: both open the Billing section, where the plan's
- *  action is — the menu starts no checkout itself (docs/web.md § The account menu). */
+/** Upgrade on Free — the pricing page, where the plans are presented and the checkout
+ *  starts — and Billing on a paid plan, the Billing section; the menu starts no checkout
+ *  itself (docs/web.md § The account menu). */
 const accountItems = computed<MenuItem[]>(() => [
   ...(auth.me.value
     ? [
-        {
-          key: 'billing',
-          label: auth.me.value.plan === 'free' ? t('nav.upgrade') : t('nav.billing'),
-          icon: 'credit-card' as const,
-        },
+        auth.me.value.plan === 'free'
+          ? { key: 'upgrade', label: t('nav.upgrade'), icon: 'credit-card' as const }
+          : { key: 'billing', label: t('nav.billing'), icon: 'credit-card' as const },
       ]
     : []),
   { key: 'settings', label: t('nav.settings'), icon: 'settings' },
@@ -125,7 +108,9 @@ const router = useRouter()
 const settingsSection = computed(() => settingsSectionOf(route.query[SETTINGS_QUERY]))
 
 function onAccountAction(action: string) {
-  if (action === 'settings' || action === 'billing') {
+  if (action === 'upgrade') {
+    void navigateTo(localePath('/pricing'))
+  } else if (action === 'settings' || action === 'billing') {
     void router.push({ query: { ...route.query, [SETTINGS_QUERY]: action === 'billing' ? 'billing' : 'general' } })
   } else if (action === 'language') {
     languageOpen.value = true
@@ -281,7 +266,6 @@ async function signOut() {
           :items="accountItems"
           :label="account"
           :header="auth.me.value?.user.email"
-          :facts="accountFacts"
           @select="onAccountAction"
           @close="closeAccountMenu"
         />

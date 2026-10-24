@@ -47,7 +47,6 @@ import { blockName, type NameText } from '~/lib/blocks'
 import { commandArguments, formatBytes, type AskOutcome, type AskRequest, type ComposerPayload } from '~/lib/composer'
 import { nodesToMarkdown } from '~/lib/copy'
 import { formatCount } from '~/lib/format'
-import { SETTINGS_QUERY } from '~/lib/settings'
 import { turnErrorKey, turnErrorNeedsPlan } from '~/lib/turnError'
 import { ANSWER_DRAG_TYPE, BLOCK_DRAG_TYPE } from '~/lib/dnd'
 import {
@@ -638,11 +637,20 @@ const sendBlock = computed<'credits' | 'storage' | null>(() => {
   return null
 })
 
-const router = useRouter()
-const route = useRoute()
+const localePath = useLocalePath()
 
+/** The pricing page, where the plans are presented and the checkout starts. */
 function seePlans() {
-  void router.push({ query: { ...route.query, [SETTINGS_QUERY]: 'billing' } })
+  void navigateTo(localePath('/pricing'))
+}
+
+/** A failed turn's *See plans*, unless the notice above the composer stands for the same
+ *  cause and carries it already: one cause, one See plans (docs/web.md § The agent panel). */
+function errorNeedsPlan(error: string): boolean {
+  if (!turnErrorNeedsPlan(error)) {
+    return false
+  }
+  return sendBlock.value !== (error === 'out_of_credits' ? 'credits' : 'storage')
 }
 
 const scroller = ref<HTMLElement | null>(null)
@@ -1563,7 +1571,7 @@ onBeforeUnmount(() => {
              keeps the original in the tooltip (docs/web.md § The agent panel). -->
         <div v-else-if="item.kind === 'error'" class="turn-error-row">
           <p class="turn-error" role="alert" :title="item.text">{{ t(turnErrorKey(item.text)) }}</p>
-          <UiButton v-if="turnErrorNeedsPlan(item.text)" size="sm" variant="secondary" @click="seePlans">
+          <UiButton v-if="errorNeedsPlan(item.text)" size="sm" variant="secondary" @click="seePlans">
             {{ t('credits.seePlans') }}
           </UiButton>
         </div>

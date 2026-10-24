@@ -38,6 +38,10 @@ READ_ONLY = "This subagent can only read: the editor answers `view` here."
 EDITOR = "str_replace_based_edit_tool"
 IMAGE_RUN_BUDGET_SPENT = "This subagent's image budget is spent; report with what you have seen."
 NO_REPORT = "The subagent finished without a report."
+CREDITS_SPENT = (
+    "The account's credits are spent and the tool calls left to this turn are used; the "
+    "subagent stopped here."
+)
 
 
 class _ImageBudget:
@@ -160,7 +164,7 @@ async def _run_one_guarded(
     """A tool that raises answers an error result, as the turn's own do."""
     try:
         return await _run_one(ctx, definition, block, malformed)
-    except (asyncio.CancelledError, chat_runner.TurnCancelled, chat_runner.TurnOutOfCredits):
+    except (asyncio.CancelledError, chat_runner.TurnCancelled):
         raise
     except Exception:  # noqa: BLE001 - any failure is this tool's, never the run's
         logger.exception("a subagent's %s failed in turn %s", block.get("name"), ctx.turn.id)
@@ -183,6 +187,7 @@ async def _run_tools(
     starts; writes run one after another, each waiting its turn with every other write of
     the turn and started only if no Stop came (docs/chat.md § Tools)."""
     results: dict[int, dict] = {}
+    may_run = ctx.round_admission(len(tool_uses))
     slots = asyncio.Semaphore(chat_runner.READ_CONCURRENCY)
     stopped = asyncio.Event()
     budget.start_round()
@@ -227,9 +232,14 @@ async def _run_tools(
                 if stopped.is_set() or await chat_runner._cancelled(ctx):
                     stopped.set()
                     return
-                outcome = budget.refusal() or await _run_one_guarded(
-                    ctx, definition, block, malformed
-                )
+                refusal = budget.refusal()
+                if refusal is None and not may_run(index):
+                    # Past the turn's allowance once the credits ran out (docs/billing.md
+                    # § A chat turn).
+                    refusal = chat_tools.ToolOutcome(
+                        chat_runner.NOT_RUN_OUT_OF_CREDITS, is_error=True
+                    )
+                outcome = refusal or await _run_one_guarded(ctx, definition, block, malformed)
                 results[index] = await report(block, budget.admit(outcome))
 
         await asyncio.gather(
@@ -241,15 +251,23 @@ async def _run_tools(
         )
 
     async def writes() -> None:
-        async def write(block: dict) -> dict:
-            # Reported inside the shielded writer: an `edit` the deadline interrupted is
-            # still announced before the terminal event.
+        async def write(index: int, block: dict) -> dict:
+            # Admitted when its turn at the gate has come, as the turn's own writes are
+            # (docs/billing.md § A chat turn). Reported inside the shielded writer: an
+            # `edit` the deadline interrupted is still announced before the terminal event.
+            if not may_run(index):
+                return await report(
+                    block,
+                    chat_tools.ToolOutcome(chat_runner.NOT_RUN_OUT_OF_CREDITS, is_error=True),
+                )
             return await report(block, await _run_one_guarded(ctx, definition, block, malformed))
 
         for index, block in enumerate(tool_uses):
             if _writes(definition, block):
                 results[index] = await chat_runner.run_writer(
-                    ctx, str(block.get("name")), lambda block=block: write(block)
+                    ctx,
+                    str(block.get("name")),
+                    lambda index=index, block=block: write(index, block),
                 )
 
     # A task group: when the writes stop on a cancel, the reads still running are cancelled
@@ -328,9 +346,11 @@ async def run_subagent(
     while True:
         if await chat_runner._cancelled(ctx):
             raise chat_runner.TurnCancelled()
-        if ctx.credits_exhausted:
-            # Another call of the turn spent the balance meanwhile: no call on it.
-            raise chat_runner.TurnOutOfCredits()
+        if ctx.overdraft_spent():
+            # The credits ran out and the turn's tool calls allowed after them are used:
+            # no further call, the run reports what it has (docs/billing.md § A chat turn).
+            note = CREDITS_SPENT
+            break
         body = {
             "model": model,
             "max_tokens": ctx.settings.chat_max_output_tokens,
@@ -344,6 +364,9 @@ async def run_subagent(
         }
         try:
             completed = await chat_runner._call_model(ctx, body, parent=tool_use_id)
+        except chat_runner.TurnOutOfCredits:
+            note = CREDITS_SPENT
+            break
         except PaymentRequired:
             return chat_tools.ToolOutcome(
                 "The subagent could not run: the upstream reported exhausted credits.",
@@ -362,8 +385,6 @@ async def run_subagent(
         await chat_runner._record_usage_settled(ctx, completed)
         if await chat_runner._cancelled(ctx):
             raise chat_runner.TurnCancelled()
-        if ctx.credits_exhausted:
-            raise chat_runner.TurnOutOfCredits()
         if completed.model and completed.model != model:
             # A fallback answered: the blocks the run replays are that model's now.
             model = completed.model

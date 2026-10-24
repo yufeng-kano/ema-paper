@@ -1,10 +1,9 @@
 <script setup lang="ts">
 /**
  * The 402 of a parse or a send (docs/billing.md § Refusals, docs/web.md § Files): what the
- * action needs, what is left and when the period resets, with the way to the Billing
- * section, where *Upgrade* is. Nothing was queued and nothing was charged.
+ * action needs, what is left and when the period resets, with the way to the pricing
+ * page, where *Upgrade* is. Nothing was queued and nothing was charged.
  */
-import { SETTINGS_QUERY } from '~/lib/settings'
 import { formatCount, formatDate } from '~/lib/format'
 import type { CreditsRefusal } from '~/lib/api'
 
@@ -17,15 +16,17 @@ const props = defineProps<{
 const emit = defineEmits<{ close: [] }>()
 
 const { t, locale } = useI18n()
-const route = useRoute()
-const router = useRouter()
+const localePath = useLocalePath()
 
+/** An overdrawn period reads 0, never a negative balance (docs/billing.md § A chat turn);
+ *  what it is short is counted from the real one, which the overdraft is still owed from. */
+const remaining = computed(() => Math.max(0, props.refusal.remaining))
 const short = computed(() => Math.max(0, props.refusal.need - props.refusal.remaining))
 
-/** The Billing section over this screen, as the account menu would open it. */
+/** The pricing page, where the plans are presented and the checkout starts. */
 function seePlans() {
   emit('close')
-  void router.push({ query: { ...route.query, [SETTINGS_QUERY]: 'billing' } })
+  void navigateTo(localePath('/pricing'))
 }
 </script>
 
@@ -39,7 +40,7 @@ function seePlans() {
       </div>
       <div class="figure">
         <dt>{{ t('credits.left') }}</dt>
-        <dd class="short">{{ t('credits.n', { n: formatCount(refusal.remaining, locale) }, refusal.remaining) }}</dd>
+        <dd class="short">{{ t('credits.n', { n: formatCount(remaining, locale) }, remaining) }}</dd>
       </div>
     </dl>
     <p class="note" role="status">

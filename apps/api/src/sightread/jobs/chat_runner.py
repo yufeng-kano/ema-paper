@@ -83,8 +83,9 @@ class TurnFailed(Exception):
 
 
 class TurnOutOfCredits(Exception):
-    """The period's balance ran out mid-turn: the loop ends after the call that spent it
-    (docs/billing.md § A chat turn)."""
+    """The period's balance ran out mid-turn and the turn's last call, made with no tools
+    left to it, still asked for one — or a subagent's retry found the allowance used, which
+    its run answers on its own (docs/billing.md § A chat turn)."""
 
 
 @dataclass
@@ -128,8 +129,39 @@ class TurnContext:
     # One image decoded at a time per turn: a round of page reads never holds a raster
     # per read (docs/chat.md § Tools).
     decode_slot: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(1))
-    # Set by the settlement that found the period overdrawn: the next look ends the turn.
+    # Set by the settlement that found the period overdrawn: from then on the turn may run
+    # only `chat_overdraft_max_tool_calls` more tool calls, counted here, then answers
+    # (docs/billing.md § A chat turn).
     credits_exhausted: bool = False
+    overdraft_tool_calls: int = 0
+
+    def overdraft_spent(self) -> bool:
+        """The credits ran out and the tool calls allowed after them are used."""
+        return (
+            self.credits_exhausted
+            and self.overdraft_tool_calls >= self.settings.chat_overdraft_max_tool_calls
+        )
+
+    def admit_tool_call(self) -> bool:
+        """Whether a tool call about to start may run — always, until the credits run out;
+        then while the allowance lasts, which it spends. No await between the check and the
+        count, so calls starting together never overrun it."""
+        if not self.credits_exhausted:
+            return True
+        if self.overdraft_spent():
+            return False
+        self.overdraft_tool_calls += 1
+        return True
+
+    def round_admission(self, calls: int) -> Callable[[int], bool]:
+        """Whether a round's call (by its index) may run. A round that starts with the
+        credits already spent hands out what is left of the allowance in the order the
+        calls were made; one that starts before admits each call as it starts, since a
+        subagent beside it may spend the balance meanwhile."""
+        if not self.credits_exhausted:
+            return lambda index: self.admit_tool_call()
+        admitted = [self.admit_tool_call() for _ in range(calls)]
+        return lambda index: admitted[index]
 
 
 # --- loading -------------------------------------------------------------------------------
@@ -377,9 +409,13 @@ def _api_blocks(content: object) -> object:
     ]
 
 
-def build_request(ctx: TurnContext, messages: list[dict], *, since_marker: int) -> dict:
+def build_request(
+    ctx: TurnContext, messages: list[dict], *, since_marker: int, final: bool = False
+) -> dict:
     """The request body, with the cache guard on the latest tool results when a long turn
-    has accrued enough positions since the last marker (docs/chat.md § Prompt caching)."""
+    has accrued enough positions since the last marker (docs/chat.md § Prompt caching).
+    `final`: the turn's last call once its credits are spent — the model may call no tool
+    (docs/billing.md § A chat turn)."""
     replay = [dict(message) for message in messages]
     if since_marker >= CACHE_GUARD_EVERY and replay and replay[-1]["role"] == "user":
         content = replay[-1]["content"]
@@ -390,7 +426,7 @@ def build_request(ctx: TurnContext, messages: list[dict], *, since_marker: int) 
                 "cache_control": {"type": "ephemeral", "ttl": chat_agent.CACHE_TTL},
             }
             replay[-1] = {"role": "user", "content": marked}
-    return {
+    body = {
         "model": ctx.model,
         "max_tokens": ctx.settings.chat_max_output_tokens,
         "system": ctx.system,
@@ -401,6 +437,9 @@ def build_request(ctx: TurnContext, messages: list[dict], *, since_marker: int) 
         "fallbacks": "default",
         "cache_control": {"type": "ephemeral", "ttl": chat_agent.CACHE_TTL},
     }
+    if final:
+        body["tool_choice"] = {"type": "none"}
+    return body
 
 
 # --- events and persistence ------------------------------------------------------------------
@@ -509,8 +548,7 @@ async def _record_usage(ctx: TurnContext, completed: CompletedMessage) -> None:
         remaining = await ledger.settle_chat(db, ctx.settings, ctx.turn.id)
         await db.commit()
     if remaining is not None and remaining <= 0:
-        # The call that spent the balance is the turn's last (docs/billing.md § A chat
-        # turn): nothing more runs at zero.
+        # The turn finishes within the overdraft allowance (docs/billing.md § A chat turn).
         ctx.credits_exhausted = True
 
 
@@ -680,9 +718,10 @@ async def _call_model(
     ctx: TurnContext, body: dict, *, parent: str | None = None
 ) -> CompletedMessage:
     for attempt in range(MAX_ATTEMPTS):
-        if ctx.credits_exhausted:
-            # Another call of the turn spent the balance while this one waited to retry:
-            # no attempt on a balance that is gone (docs/billing.md § A chat turn).
+        if attempt and parent is not None and ctx.overdraft_spent():
+            # Another call of the turn used the allowance while this subagent's call waited
+            # to retry: no further attempt, the run reports what it has (docs/billing.md
+            # § A chat turn).
             raise TurnOutOfCredits()
         try:
             return await _stream_once(ctx, body, parent=parent)
@@ -716,9 +755,8 @@ async def _run_tool(
     `admit` sees the outcome before it is reported and may replace it."""
     try:
         return await _run_tool_unguarded(ctx, block, malformed, admit)
-    except (asyncio.CancelledError, TurnCancelled, TurnOutOfCredits):
-        # A Stop, or a spent balance, a subagent saw inside its run is the turn's, not a
-        # failed tool.
+    except (asyncio.CancelledError, TurnCancelled):
+        # A Stop a subagent saw inside its run is the turn's, not a failed tool.
         raise
     except Exception:  # noqa: BLE001 - any failure is this tool's, never the turn's
         logger.exception("tool %s failed in turn %s", block.get("name"), ctx.turn.id)
@@ -988,8 +1026,10 @@ IMAGE_TURN_BUDGET_SPENT = (
     "This turn's image budget is spent; finish with what you have seen, or answer and let "
     "the user ask again."
 )
-OUT_OF_CREDITS = "The subagent stopped: the account's credits are spent."
-NOT_RUN_OUT_OF_CREDITS = "This tool was not run: the account's credits are spent."
+NOT_RUN_OUT_OF_CREDITS = (
+    "This tool was not run: the account's credits are spent and the tool calls left to this "
+    "turn are used. Answer with what you have."
+)
 
 
 def _image_bytes(result: dict) -> int:
@@ -1010,6 +1050,7 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
     dirty and two in flight would file one's changes under the other (docs/chat.md § Tools)."""
     results: dict[int, dict] = {}
     stopped = asyncio.Event()
+    may_run = ctx.round_admission(len(tool_uses))
 
     async def reads() -> None:
         # A few at a time, against one image budget for the round: fifty page renders at
@@ -1052,9 +1093,12 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
                 if stopped.is_set() or await _cancelled(ctx):
                     stopped.set()
                     return
-                if ctx.credits_exhausted:
-                    # A subagent beside this read spent the balance: a read not yet
-                    # started is not started (docs/billing.md § A chat turn).
+                # `memory` returns no image, so a spent budget is no reason to refuse it:
+                # a reader's "remember this" late in a page-by-page check still lands.
+                refusal = exhausted() if block.get("name") != "memory" else None
+                if refusal is None and not may_run(index):
+                    # The credits ran out and the calls allowed after them are used: a
+                    # read not yet started is not started (docs/billing.md § A chat turn).
                     results[index] = await _report_tool(
                         ctx,
                         str(block.get("id")),
@@ -1062,9 +1106,6 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
                         chat_tools.ToolOutcome(NOT_RUN_OUT_OF_CREDITS, is_error=True),
                     )
                     return
-                # `memory` returns no image, so a spent budget is no reason to refuse it:
-                # a reader's "remember this" late in a page-by-page check still lands.
-                refusal = exhausted() if block.get("name") != "memory" else None
                 if refusal is not None:
                     results[index] = await _report_tool(
                         ctx, str(block.get("id")), block.get("name"), refusal
@@ -1077,16 +1118,6 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
                     # other read, so a write still running finishes (docs/chat.md
                     # § Subagents) and the reads beside it are not left running.
                     stopped.set()
-                except TurnOutOfCredits:
-                    # A subagent spent the balance: its result says so, the round ends
-                    # as it would have, and the loop stops before the next model call
-                    # (docs/billing.md § A chat turn).
-                    results[index] = await _report_tool(
-                        ctx,
-                        str(block.get("id")),
-                        block.get("name"),
-                        chat_tools.ToolOutcome(OUT_OF_CREDITS, is_error=True),
-                    )
 
         await asyncio.gather(
             *(
@@ -1096,26 +1127,29 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
             )
         )
 
+    async def write(index: int, block: dict) -> dict:
+        # Admitted when its turn at the gate has come, not while it waited: a write still
+        # waiting once the calls allowed after the credits ran out are used does not start;
+        # one already running finishes and commits as it would (docs/billing.md § A chat
+        # turn).
+        if not may_run(index):
+            return await _report_tool(
+                ctx,
+                str(block.get("id")),
+                block.get("name"),
+                chat_tools.ToolOutcome(NOT_RUN_OUT_OF_CREDITS, is_error=True),
+            )
+        return await _run_tool(ctx, block, malformed)
+
     async def writes() -> None:
         for index, block in enumerate(tool_uses):
             if block.get("name") in MUTATING_TOOLS:
-                if ctx.credits_exhausted:
-                    # A write still waiting its turn when a subagent of the round spent
-                    # the balance does not start; one already running finishes and
-                    # commits as it would (docs/billing.md § A chat turn).
-                    results[index] = await _report_tool(
-                        ctx,
-                        str(block.get("id")),
-                        block.get("name"),
-                        chat_tools.ToolOutcome(NOT_RUN_OUT_OF_CREDITS, is_error=True),
-                    )
-                    continue
                 # Stop means after the *current* call: a write not yet started — the
                 # first of the round included — is not started once the user cancelled.
                 results[index] = await run_writer(
                     ctx,
                     str(block.get("name")),
-                    lambda block=block: _run_tool(ctx, block, malformed),
+                    lambda index=index, block=block: write(index, block),
                 )
 
     # A task group: when the writes stop on a cancel, the reads still running are
@@ -1140,11 +1174,10 @@ async def _loop(ctx: TurnContext) -> None:
     while True:
         if await _cancelled(ctx):
             raise TurnCancelled()
-        if ctx.credits_exhausted:
-            # A subagent's call spent the balance during the last round: its result is
-            # stored, and no call of the turn's own follows it.
-            raise TurnOutOfCredits()
-        body = build_request(ctx, messages, since_marker=since_marker)
+        # The credits ran out and the tool calls allowed after them are used: this call is
+        # the turn's last, and answers with what the turn has (docs/billing.md § A chat turn).
+        final = ctx.overdraft_spent()
+        body = build_request(ctx, messages, since_marker=since_marker, final=final)
         if since_marker >= CACHE_GUARD_EVERY:
             since_marker = 0
         completed = await _call_model(ctx, body)
@@ -1169,9 +1202,10 @@ async def _loop(ctx: TurnContext) -> None:
             followed = completed.model
         tool_uses = [block for block in completed.content if block.get("type") == "tool_use"]
         content = completed.content
-        if completed.stop_reason == "max_tokens":
+        if completed.stop_reason == "max_tokens" or final:
             # What came through is kept; a tool call cut off with the limit is not — it is
             # never run, and a tool_use with no result would make the history unsendable.
+            # Nor is one the last call made with no tool left to it.
             content = [block for block in content if block.get("type") != "tool_use"]
         if content:
             await _store(ctx, "assistant", content, model=followed)
@@ -1181,8 +1215,8 @@ async def _loop(ctx: TurnContext) -> None:
         elif followed is not None:
             await _follow_model(ctx, followed)
 
-        if ctx.credits_exhausted:
-            # Kept and billed: the answer so far stays in the thread, and nothing runs on
+        if final and completed.stop_reason == "tool_use":
+            # Kept and billed: the answer so far stays in the thread, and no tool runs on
             # a balance that is gone (docs/billing.md § A chat turn).
             raise TurnOutOfCredits()
         if completed.stop_reason == "refusal":

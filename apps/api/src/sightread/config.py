@@ -152,6 +152,9 @@ class Settings(BaseSettings):
     # High enough that a document translated block by block is one turn (docs/chat.md
     # § Translation); the cap is a guard against a loop, the timeout bounds the turn.
     chat_max_tool_calls_per_turn: int = 1000
+    # Tool calls a turn may still make once the credits run out mid-turn, its subagents'
+    # included; then it answers (docs/billing.md § A chat turn).
+    chat_overdraft_max_tool_calls: int = 25
     chat_turn_timeout_seconds: int = 3600
     chat_stream_timeout_seconds: int = 900
     chat_tool_result_max_chars: int = 20_000

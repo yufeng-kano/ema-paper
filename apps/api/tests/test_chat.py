@@ -957,6 +957,7 @@ def _round_ctx(image_budget: int = 32 << 20) -> SimpleNamespace:
         ),
         image_spent=0,
         credits_exhausted=False,
+        round_admission=lambda calls: lambda index: True,
         writers={},
         write_gate=asyncio.Lock(),
     )
@@ -999,6 +1000,7 @@ async def test_a_rounds_images_never_exceed_the_budget(monkeypatch) -> None:
         turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
         image_spent=0,
         credits_exhausted=False,
+        round_admission=lambda calls: lambda index: True,
     )
     tool_uses = [
         {"type": "tool_use", "id": str(index), "name": "view_page", "input": {"page": index + 1}}
@@ -2102,6 +2104,7 @@ async def test_a_turns_images_never_exceed_the_turn_budget(monkeypatch) -> None:
         turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
         image_spent=0,
         credits_exhausted=False,
+        round_admission=lambda calls: lambda index: True,
     )
     one_round = [
         {"type": "tool_use", "id": str(index), "name": "view_page", "input": {"page": index + 1}}
@@ -2171,6 +2174,7 @@ async def test_a_shell_command_holds_the_workspace_lock(tmp_path, monkeypatch) -
         turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
         image_spent=0,
         credits_exhausted=False,
+        round_admission=lambda calls: lambda index: True,
         writers={},
         write_gate=asyncio.Lock(),
     )
@@ -2346,6 +2350,7 @@ async def test_a_shell_move_is_reconciled_before_the_lock_is_released(
         turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
         image_spent=0,
         credits_exhausted=False,
+        round_admission=lambda calls: lambda index: True,
         writers={},
         write_gate=asyncio.Lock(),
     )
@@ -3276,19 +3281,23 @@ def test_a_directory_view_is_bounded_like_every_tool_result(tmp_path) -> None:
     assert cut.startswith("entry-000.txt")
 
 
-async def test_a_retry_after_backoff_is_not_made_once_the_balance_is_spent(monkeypatch) -> None:
-    """docs/billing.md § A chat turn: a call waiting out a 429 while a subagent beside it
-    spends the balance makes no further attempt."""
-    ctx = SimpleNamespace(credits_exhausted=False)
+async def test_a_subagents_retry_is_not_made_once_the_allowance_is_used(monkeypatch) -> None:
+    """docs/billing.md § A chat turn: a subagent's call waiting out a 429 while another call
+    of the turn uses the allowance makes no further attempt; the turn's own call does."""
+    spent = False
+    ctx = SimpleNamespace(overdraft_spent=lambda: spent)
     attempts = 0
 
     async def stream_once(ctx, body, parent=None):
         nonlocal attempts
         attempts += 1
+        if attempts > 1:
+            return "answered"
         raise RateLimited(retry_after=1)
 
     async def backoff(ctx, seconds):
-        ctx.credits_exhausted = True
+        nonlocal spent
+        spent = True
 
     async def no_events(ctx, event, data):
         pass
@@ -3297,5 +3306,8 @@ async def test_a_retry_after_backoff_is_not_made_once_the_balance_is_spent(monke
     monkeypatch.setattr(chat_runner, "_backoff", backoff)
     monkeypatch.setattr(chat_runner, "_emit", no_events)
     with pytest.raises(chat_runner.TurnOutOfCredits):
-        await chat_runner._call_model(ctx, {})
+        await chat_runner._call_model(ctx, {}, parent="toolu_1")
     assert attempts == 1
+    spent, attempts = False, 0
+    assert await chat_runner._call_model(ctx, {}) == "answered"
+    assert attempts == 2
