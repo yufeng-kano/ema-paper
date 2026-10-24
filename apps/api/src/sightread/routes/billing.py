@@ -364,4 +364,5 @@ async def me_fields(db: DbSession, settings: AppSettings, user_id: int) -> dict:
     return {
         "plan": FREE_PLAN_ID if plan.free else plan.id,
         "credits_remaining": balance.remaining,
+        "chat_min_credits": settings.chat_min_credits,
     }

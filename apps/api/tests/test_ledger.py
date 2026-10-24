@@ -352,6 +352,26 @@ async def test_a_send_without_the_minimum_balance_is_refused(make_client, tmp_pa
     assert (await client.get(f"/api/conversations/{conversation_id}")).json()["messages"] == []
 
 
+async def test_a_send_into_a_full_workspace_is_refused(make_client, tmp_path) -> None:
+    # One byte of storage: the seeded document alone fills it.
+    client = make_client(workspaces_dir=str(tmp_path / "workspaces"), free_storage_bytes=1)
+    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    user_id = (await client.get("/api/me")).json()["user"]["id"]
+    document_id = await _seed_document(client, user_id)
+    created = await client.post(
+        f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+    )
+    conversation_id = created.json()["id"]
+    sent = await client.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
+    )
+    assert sent.status_code == 409, sent.text
+    assert sent.json()["error"]["type"] == "storage_full"
+    # Refused before anything was queued or charged.
+    assert (await client.get(f"/api/conversations/{conversation_id}")).json()["messages"] == []
+    assert (await client.get("/api/billing")).json()["period"]["spent"] == 0
+
+
 @respx.mock
 @pytest.mark.parametrize("granted", [1, 6])
 async def test_a_turn_that_runs_out_of_credits_ends_with_its_answer_kept(
