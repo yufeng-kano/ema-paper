@@ -34,6 +34,7 @@ from sightread.errors import ApiError
 from sightread.jobs import chat_runner, chat_tools
 from sightread.jobs.queue import claim_next_turn, fail_turn
 from sightread.sandbox.client import ExecResult, SandboxClient
+from sightread.upstream.client import RateLimited
 from sightread.workspace import documents as workspace_documents
 from sightread.workspace import git
 from sightread.workspace.layout import user_root
@@ -3278,3 +3279,35 @@ def test_a_directory_view_is_bounded_like_every_tool_result(tmp_path) -> None:
     cut = chat_tools._listing(root, crowded, 200)
     assert len(cut) <= 200 and "omitted" in cut and "more entries" in cut
     assert cut.startswith("entry-000.txt")
+
+
+async def test_a_subagents_retry_is_not_made_once_the_allowance_is_used(monkeypatch) -> None:
+    """docs/billing.md § A chat turn: a subagent's call waiting out a 429 while another call
+    of the turn uses the allowance makes no further attempt; the turn's own call does."""
+    spent = False
+    ctx = SimpleNamespace(overdraft_spent=lambda: spent)
+    attempts = 0
+
+    async def stream_once(ctx, body, parent=None):
+        nonlocal attempts
+        attempts += 1
+        if attempts > 1:
+            return "answered"
+        raise RateLimited(retry_after=1)
+
+    async def backoff(ctx, seconds):
+        nonlocal spent
+        spent = True
+
+    async def no_events(ctx, event, data):
+        pass
+
+    monkeypatch.setattr(chat_runner, "_stream_once", stream_once)
+    monkeypatch.setattr(chat_runner, "_backoff", backoff)
+    monkeypatch.setattr(chat_runner, "_emit", no_events)
+    with pytest.raises(chat_runner.TurnOutOfCredits):
+        await chat_runner._call_model(ctx, {}, parent="toolu_1")
+    assert attempts == 1
+    spent, attempts = False, 0
+    assert await chat_runner._call_model(ctx, {}) == "answered"
+    assert attempts == 2

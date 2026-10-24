@@ -84,7 +84,8 @@ class TurnFailed(Exception):
 
 class TurnOutOfCredits(Exception):
     """The period's balance ran out mid-turn and the turn's last call, made with no tools
-    left to it, still asked for one (docs/billing.md § A chat turn)."""
+    left to it, still asked for one — or a subagent's retry found the allowance used, which
+    its run answers on its own (docs/billing.md § A chat turn)."""
 
 
 @dataclass
@@ -717,6 +718,11 @@ async def _call_model(
     ctx: TurnContext, body: dict, *, parent: str | None = None
 ) -> CompletedMessage:
     for attempt in range(MAX_ATTEMPTS):
+        if attempt and parent is not None and ctx.overdraft_spent():
+            # Another call of the turn used the allowance while this subagent's call waited
+            # to retry: no further attempt, the run reports what it has (docs/billing.md
+            # § A chat turn).
+            raise TurnOutOfCredits()
         try:
             return await _stream_once(ctx, body, parent=parent)
         except RateLimited as exc:

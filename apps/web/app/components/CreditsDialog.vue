@@ -18,9 +18,10 @@ const emit = defineEmits<{ close: [] }>()
 const { t, locale } = useI18n()
 const localePath = useLocalePath()
 
-/** An overdrawn period reads 0, never a negative balance (docs/billing.md § A chat turn). */
+/** An overdrawn period reads 0, never a negative balance (docs/billing.md § A chat turn);
+ *  what it is short is counted from the real one, which the overdraft is still owed from. */
 const remaining = computed(() => Math.max(0, props.refusal.remaining))
-const short = computed(() => Math.max(0, props.refusal.need - remaining.value))
+const short = computed(() => Math.max(0, props.refusal.need - props.refusal.remaining))
 
 /** The pricing page, where the plans are presented and the checkout starts. */
 function seePlans() {

@@ -362,6 +362,9 @@ async def run_subagent(
         }
         try:
             completed = await chat_runner._call_model(ctx, body, parent=tool_use_id)
+        except chat_runner.TurnOutOfCredits:
+            note = CREDITS_SPENT
+            break
         except PaymentRequired:
             return chat_tools.ToolOutcome(
                 "The subagent could not run: the upstream reported exhausted credits.",
