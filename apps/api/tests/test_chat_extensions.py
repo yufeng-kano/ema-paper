@@ -18,7 +18,7 @@ from sightread.agents import chat as chat_agent
 from sightread.agents import skills as skill_defs
 from sightread.agents import subagents as subagent_defs
 from sightread.db.models import Skill, UsageLog
-from sightread.jobs import chat_runner, chat_tools
+from sightread.jobs import chat_runner, chat_subagent, chat_tools
 from sightread.jobs.queue import claim_next_job
 from sightread.jobs.runner import run_job
 from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL
@@ -994,19 +994,21 @@ async def test_a_subagent_on_an_unpriced_model_never_calls_it(chat_client) -> No
 
 
 @respx.mock
-async def test_a_subagent_that_spends_the_balance_ends_the_turn(
+async def test_a_subagent_that_spends_the_balance_stops_and_the_turn_answers(
     make_client, tmp_path, monkeypatch
 ) -> None:
-    """docs/billing.md § A chat turn: the call that spends the balance is the turn's last,
-    a subagent's included — its result says so, and no call of the turn's own follows."""
+    """docs/billing.md § A chat turn: once a subagent's call spends the balance, its tool
+    calls past the allowance are not run, it reports what it has, and the turn's last call
+    goes with no tool left to it."""
     # Each stubbed call carries 105 tokens at US$1 per million: 3 credits for the first
-    # at US$0.00005 a credit, 5 for the two together. Four granted: the turn's own call
+    # at US$0.00005 a credit, 5 for two, 7 for three. Four granted: the turn's own call
     # leaves one, the subagent's call overdraws.
     client = await chatting_client(
         make_client(
             workspaces_dir=str(tmp_path / "workspaces"),
             free_credits_per_period=4,
             credit_usd="0.00005",
+            chat_overdraft_max_tool_calls=0,
         )
     )
     pages = fake_pages(monkeypatch)
@@ -1025,37 +1027,44 @@ async def test_a_subagent_that_spends_the_balance_ends_the_turn(
     main, sub = stub_messages(
         [
             one_call("call", "subagent", {"name": "quick", "task": "Read page 1."}),
-            ([{"type": "text", "text": "Never sent."}], "end_turn"),
+            ([{"type": "text", "text": "Here is what I have."}], "end_turn"),
         ],
         [
             one_call("p1", "view_page", {"page": 1}),
-            ([{"type": "text", "text": "Never sent either."}], "end_turn"),
+            ([{"type": "text", "text": "Never sent."}], "end_turn"),
         ],
     )
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="Read")
     await _run_queued_turn(client)
 
-    # One call each: the subagent's spent the balance, and neither made another.
-    assert (len(main), len(sub), pages) == (1, 1, [])
+    # The subagent made one call and ran none of its tools; the turn's second call is its
+    # last, with no tool left to it.
+    assert (len(main), len(sub), pages) == (2, 1, [])
+    assert "tool_choice" not in main[0]
+    assert main[1]["tool_choice"] == {"type": "none"}
     thread = (await client.get(f"/api/conversations/{conversation_id}")).json()
     [turn] = thread["turns"]
-    assert (turn["status"], turn["error"], turn["credits"]) == ("failed", "out_of_credits", 5)
+    assert (turn["status"], turn["credits"]) == ("succeeded", 7)
     result = thread["messages"][2]["content"][0]
-    assert result["is_error"] and result["content"] == chat_runner.OUT_OF_CREDITS
+    assert not result.get("is_error") and chat_subagent.CREDITS_SPENT in result["content"]
+    billing = (await client.get("/api/billing")).json()
+    assert (billing["period"]["spent"], billing["period"]["remaining"]) == (7, -3)
 
 
 @respx.mock
 async def test_a_write_waiting_when_a_subagent_spends_the_balance_is_not_started(
     make_client, tmp_path, monkeypatch
 ) -> None:
-    """docs/billing.md § A chat turn: a tool of the round not yet started when the balance
-    is spent answers an error result; the write already running finishes."""
+    """docs/billing.md § A chat turn: a tool of the round not yet started once the balance
+    is spent and the allowance used answers an error result; the write already running
+    finishes."""
     client = await chatting_client(
         make_client(
             workspaces_dir=str(tmp_path / "workspaces"),
             free_credits_per_period=4,
             credit_usd="0.00005",
+            chat_overdraft_max_tool_calls=0,
         )
     )
     created = await client.post(
@@ -1108,7 +1117,7 @@ async def test_a_write_waiting_when_a_subagent_spends_the_balance_is_not_started
                 ],
                 "tool_use",
             ),
-            ([{"type": "text", "text": "Never sent."}], "end_turn"),
+            ([{"type": "text", "text": "Wrote a.md."}], "end_turn"),
         ],
         [one_call("p1", "view_page", {"page": 1})],
     )
@@ -1116,18 +1125,19 @@ async def test_a_write_waiting_when_a_subagent_spends_the_balance_is_not_started
     await send(client, conversation_id, text="Write")
     await _run_queued_turn(client)
 
-    assert (len(main), len(sub), writes) == (1, 1, ["a.md"])
+    assert (len(main), len(sub), writes) == (2, 1, ["a.md"])
+    assert main[1]["tool_choice"] == {"type": "none"}
     thread = (await client.get(f"/api/conversations/{conversation_id}")).json()
     [turn] = thread["turns"]
-    assert (turn["status"], turn["error"]) == ("failed", "out_of_credits")
+    assert turn["status"] == "succeeded"
     results = thread["messages"][2]["content"]
-    assert [(block.get("is_error", False), block["content"]) for block in results] == [
-        (True, chat_runner.OUT_OF_CREDITS),
+    assert chat_subagent.CREDITS_SPENT in results[0]["content"]
+    assert [(block.get("is_error", False), block["content"]) for block in results[1:]] == [
         (False, "written"),
         (True, chat_runner.NOT_RUN_OUT_OF_CREDITS),
     ]
     billing = (await client.get("/api/billing")).json()
-    assert (billing["period"]["spent"], billing["period"]["remaining"]) == (5, -1)
+    assert (billing["period"]["spent"], billing["period"]["remaining"]) == (7, -3)
 
 
 @respx.mock
@@ -1191,7 +1201,6 @@ def test_a_skill_renders_its_arguments() -> None:
 
 
 def test_the_subagent_records_bound_a_long_input() -> None:
-    from sightread.jobs import chat_subagent
 
     # A long field is cut, so the step still reads as the call it was.
     write = {"command": "str_replace", "path": "/workspace/doc.md", "new_str": "x" * 5000}

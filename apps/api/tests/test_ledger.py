@@ -25,7 +25,7 @@ from sightread.db.models import (
     UsageLog,
     User,
 )
-from sightread.jobs import chat_runner
+from sightread.jobs import chat_runner, chat_tools
 from sightread.jobs.queue import claim_next_turn, fail_turn
 from sightread.workspace.layout import user_root
 from tests.conftest import CSRF_HEADERS, TEST_MODEL_PRICES
@@ -381,16 +381,21 @@ async def test_a_send_into_a_full_workspace_is_refused(make_client, tmp_path) ->
 
 @respx.mock
 @pytest.mark.parametrize("granted", [1, 6])
-async def test_a_turn_that_runs_out_of_credits_ends_with_its_answer_kept(
-    make_client, tmp_path, granted: int
+@pytest.mark.parametrize("last_stop", ["end_turn", "tool_use"])
+async def test_a_turn_that_runs_out_of_credits_finishes_within_the_allowance(
+    make_client, tmp_path, monkeypatch, granted: int, last_stop: str
 ) -> None:
+    """docs/billing.md § A chat turn: once the balance is spent the turn runs at most
+    `CHAT_OVERDRAFT_MAX_TOOL_CALLS` more tool calls, then its last call goes with no tool
+    left to it; a last call that still asks for one ends the turn `out_of_credits`."""
     # Each stubbed call carries 510 tokens at US$1 per million, which at US$0.0001 a
     # credit is 6 credits: the first call overdraws a period of one credit, and spends a
-    # period of six to exactly zero — the turn ends either way, before another call.
+    # period of six to exactly zero. Two calls are 11, rounded once for the turn.
     client = make_client(
         workspaces_dir=str(tmp_path / "workspaces"),
         free_credits_per_period=granted,
         credit_usd="0.0001",
+        chat_overdraft_max_tool_calls=2,
     )
     await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
     user_id = (await client.get("/api/me")).json()["user"]["id"]
@@ -404,23 +409,45 @@ async def test_a_turn_that_runs_out_of_credits_ends_with_its_answer_kept(
         f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
     )
     conversation_id = created.json()["id"]
+    seen: list[int] = []
+
+    async def view_page(paths, tool_input, **kwargs):
+        seen.append(tool_input["page"])
+        return chat_tools.ToolOutcome(f"Page {tool_input['page']}.")
+
+    monkeypatch.setattr(chat_tools, "view_page", view_page)
+    # Three calls in the round the balance ran out on: two run, the third is past the
+    # allowance.
     answers = iter(
         [
             assistant_turn(
-                [
-                    {"type": "text", "text": "Looking."},
-                    {"type": "tool_use", "id": "t1", "name": "view_page", "input": {"page": 1}},
+                [{"type": "text", "text": "Looking."}]
+                + [
+                    {
+                        "type": "tool_use",
+                        "id": f"t{page}",
+                        "name": "view_page",
+                        "input": {"page": page},
+                    }
+                    for page in (1, 2, 3)
                 ],
                 "tool_use",
             ),
-            assistant_turn([{"type": "text", "text": "Never sent."}], "end_turn"),
+            assistant_turn(
+                [{"type": "text", "text": "Page 1 says so."}]
+                + (
+                    [{"type": "tool_use", "id": "t4", "name": "view_page", "input": {"page": 4}}]
+                    if last_stop == "tool_use"
+                    else []
+                ),
+                last_stop,
+            ),
         ]
     )
-    calls = 0
+    requests: list[dict] = []
 
     def answer(request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
+        requests.append(json.loads(request.content))
         return httpx.Response(200, content=next(answers))
 
     respx.post(MESSAGES_URL).mock(side_effect=answer)
@@ -434,19 +461,22 @@ async def test_a_turn_that_runs_out_of_credits_ends_with_its_answer_kept(
     await chat_runner.run_turn(
         client.app.state.sessionmaker, settings, turn_id, asyncio.Semaphore(2)
     )
-    assert calls == 1
+    assert seen == [1, 2]
+    assert "tool_choice" not in requests[0]
+    assert requests[1]["tool_choice"] == {"type": "none"}
     thread = (await client.get(f"/api/conversations/{conversation_id}")).json()
     [turn] = thread["turns"]
-    assert (turn["status"], turn["error"], turn["credits"]) == ("failed", "out_of_credits", 6)
-    # The answer so far stays in the thread.
-    assert any(
-        block.get("text") == "Looking."
-        for message in thread["messages"]
-        for block in message["content"]
-    )
+    expected = ("succeeded", None) if last_stop == "end_turn" else ("failed", "out_of_credits")
+    assert (turn["status"], turn["error"], turn["credits"]) == (*expected, 11)
+    results = thread["messages"][2]["content"]
+    assert [block.get("is_error", False) for block in results] == [False, False, True]
+    assert results[2]["content"] == chat_runner.NOT_RUN_OUT_OF_CREDITS
+    # The last answer's text stays in the thread; a tool call it still made is dropped.
+    last = thread["messages"][3]["content"]
+    assert [block["type"] for block in last] == ["text"]
     billing = (await client.get("/api/billing")).json()
-    assert (billing["period"]["spent"], billing["period"]["remaining"]) == (6, granted - 6)
-    assert (await client.get("/api/me")).json()["credits_remaining"] == granted - 6
+    assert (billing["period"]["spent"], billing["period"]["remaining"]) == (11, granted - 11)
+    assert (await client.get("/api/me")).json()["credits_remaining"] == granted - 11
 
 
 async def test_a_turn_queued_before_the_workspace_filled_fails_storage_full(

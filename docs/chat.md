@@ -116,7 +116,7 @@ A **subagent** is a helper the agent starts on one task — check pages 1–12 a
 - **Proofreading.** Pieces translated apart come back with different renderings of one term — *locality* as 局部性 in one piece and 區域性 in the next, *hypervisor* translated in one and kept in English in another. Once every translator has reported, the agent compares the reports' `term → translation` lines, keeps one rendering per term — the reader's instructions decide, otherwise the most common — and changes the others to it, finding them with `grep` rather than reading the document whole. Each change is a `str_replace` on the translation's own line, never a replace-all: a term kept in English in a translation is the same word as the original above it, and the original is never touched. It fixes what else reads wrong in the translation lines it meets, and retranslates nothing.
 - **The answer.** The agent ends with a sentence or two on what was translated, the terms it made consistent and what was left. Each write is a revision with its own diff card, inside its subagent's card, reverted on its own.
 
-`CHAT_MAX_TOOL_CALLS_PER_TURN`, `CHAT_SUBAGENT_MAX_TOOL_CALLS` and `CHAT_TURN_TIMEOUT_SECONDS` are set so that a paper is one turn; a document too long for one is finished by running the command again.
+`CHAT_MAX_TOOL_CALLS_PER_TURN`, `CHAT_SUBAGENT_MAX_TOOL_CALLS` and `CHAT_TURN_TIMEOUT_SECONDS` are set so that a paper is one turn; a document too long for one is finished by running the command again. A turn whose credits run out mid-way gets only `CHAT_OVERDRAFT_MAX_TOOL_CALLS` more tool calls and then answers ([billing.md](./billing.md) § A chat turn), so a translation it cuts short is continued the same way, once the balance allows.
 
 ## What a user message carries
 
