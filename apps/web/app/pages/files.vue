@@ -271,15 +271,15 @@ if (revealId !== null) {
 onBeforeUnmount(() => clearTimeout(revealTimer))
 
 /** A folder deleted or trashed in another tab would otherwise leave this screen looking at
- *  nothing, and so would a `?folder` the library does not hold — checked as soon as there
- *  is a library, the one already in hand included. */
+ *  nothing, and so would a `?folder` the library does not hold, Back to a folder trashed
+ *  since included — checked whenever either moves, once there is a library. */
 watch(
-  folders,
-  (list) => {
+  [folders, currentFolder],
+  ([list, here]) => {
     if (!data.value) {
       return
     }
-    if (currentFolder.value !== null && !list.some((row) => row.id === currentFolder.value)) {
+    if (here !== null && !list.some((row) => row.id === here)) {
       currentFolder.value = null
       writeFolder(null, true)
     }
@@ -821,7 +821,9 @@ async function openDocQuery() {
   if (target) {
     await showResult(target)
   }
-  if (openDocument.value?.id !== id) {
+  // Only while the URL still asks for this one: a reader who has moved on meanwhile keeps
+  // what they opened.
+  if (openDocument.value?.id !== id && queryId(route.query.doc) === id) {
     writeQuery({ doc: undefined }, true)
   }
 }
