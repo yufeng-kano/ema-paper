@@ -1514,6 +1514,54 @@ async def test_a_fallback_answer_moves_the_conversation_to_its_model(chatting) -
     assert requests[1]["model"] == "claude-code/claude-fallback-9"
 
 
+@respx.mock
+async def test_an_answer_under_an_unpriced_name_is_kept_as_the_model_asked_for(
+    chatting,
+) -> None:
+    """A group alias the upstream answers under the target's own id (`claude-sonnet-5.5`
+    answered as `claude-sonnet-5-5`): following it would strand the conversation on a name
+    no turn may run, and bill the call nothing."""
+    document_id = chatting.document_id
+    conversation_id = (
+        await chatting.post(
+            f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    requests: list[dict] = []
+    turns = iter(
+        [
+            assistant_turn(
+                [{"type": "text", "text": "Hi."}], "end_turn", model="claude-unpriced-7"
+            ),
+            assistant_turn(
+                [{"type": "text", "text": "Again."}], "end_turn", model="claude-unpriced-7"
+            ),
+        ]
+    )
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, content=next(turns))
+
+    respx.post(MESSAGES_URL).mock(side_effect=answer)
+    for text in ("hi", "more"):
+        sent = await chatting.post(
+            f"/api/conversations/{conversation_id}/messages",
+            json={"text": text},
+            headers=CSRF_HEADERS,
+        )
+        assert sent.status_code == 202, sent.text
+        await _run_queued_turn(chatting)
+    assert [request["model"] for request in requests] == ["claude-code/claude-opus-5-5"] * 2
+    async with chatting.app.state.sessionmaker() as db:
+        assert (await db.get(Conversation, conversation_id)).model == "claude-code/claude-opus-5-5"
+        logged = (await db.execute(select(UsageLog.model))).scalars().all()
+    assert set(logged) == {"claude-code/claude-opus-5-5"}
+    turns_now = (await chatting.get(f"/api/conversations/{conversation_id}")).json()["turns"]
+    assert [turn["status"] for turn in turns_now] == ["succeeded", "succeeded"]
+    assert all(turn["credits"] > 0 for turn in turns_now)
+
+
 async def test_the_history_cap_counts_bytes_not_characters(chatting) -> None:
     settings = chatting.app.state.settings
     document_id = chatting.document_id
