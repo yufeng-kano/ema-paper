@@ -25,6 +25,11 @@ export default {
     language: 'Language',
     openMenu: 'Open menu',
     closeMenu: 'Close menu',
+    plan: 'Plan',
+    credits: 'Credits',
+    creditsLeft: '{n} left | {n} left',
+    upgrade: 'Upgrade',
+    billing: 'Billing',
   },
   settings: {
     title: 'Settings',

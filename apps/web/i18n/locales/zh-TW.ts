@@ -24,6 +24,11 @@ export default {
     language: '語言',
     openMenu: '開啟選單',
     closeMenu: '關閉選單',
+    plan: '方案',
+    credits: '點數',
+    creditsLeft: '剩 {n} 點',
+    upgrade: '升級方案',
+    billing: '帳單與方案',
   },
   settings: {
     title: '設定',
