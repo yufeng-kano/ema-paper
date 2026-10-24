@@ -447,9 +447,10 @@ def _known_agent(name: str) -> AgentDefinition:
 
 def _effective_model(settings: AppSettings, agent: str, row: AgentSetting | None) -> str | None:
     """The model the agent runs, as `GET /api/agents` answers it (docs/api.md): the
-    deployment's for parse and check, the reader's pick or the first offered for chat."""
+    deployment's for parse and check, the reader's pick for chat — null for the default,
+    the first of a list only the live catalog can say."""
     if agent == CHAT.name:
-        return chat_runner.chat_model(settings, row)
+        return row.model if row else None
     models = offered_models(settings, agent)
     return models[0] if models else None
 
@@ -527,7 +528,7 @@ async def list_agents(user: SessionUser, db: DbSession, settings: AppSettings):
 class AgentSettingsPut(BaseModel):
     """Partial update: only the fields present in the body change (docs/api.md)."""
 
-    # The chat agent's own: one of `CHAT_MODELS`, null its first (docs/api.md).
+    # The chat agent's own: one of the offered models, null their first (docs/api.md).
     model: str | None = Field(default=None, max_length=255)
     # Capped in the route, where the settings are (`SYSTEM_PROMPT_MAX_CHARS`).
     prompt: str | None = None
@@ -627,8 +628,10 @@ async def put_agent_settings(
     model: str | None = None
     if "model" in provided:
         model = (body.model or "").strip() or None
-        if model is not None and model not in settings.chat_model_list:
-            # The offered list is the operator's (docs/billing.md § Models).
+        if model is not None and model not in {
+            entry["id"] for entry in await agent_models(settings, CHAT.name)
+        }:
+            # The offered list, read live (docs/billing.md § Models).
             raise ApiError(400, "invalid_request", "That model is not one the chat agent offers")
     if body.effort is not None and body.effort not in EFFORT_LEVELS:
         raise ApiError(400, "invalid_request", "effort must be one of " + ", ".join(EFFORT_LEVELS))

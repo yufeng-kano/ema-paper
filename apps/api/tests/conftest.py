@@ -50,10 +50,11 @@ CSRF_HEADERS = {"X-Requested-With": "XMLHttpRequest"}
 KANO_BASE = "https://kano.test"
 KANO_CHAT_URL = f"{KANO_BASE}/openai/v1/chat/completions"
 KANO_MODELS_URL = f"{KANO_BASE}/openai/v1/models"
-# The operator's key, and what the deployment offers (docs/billing.md § Models).
+# The operator's key, the parse model, and what the stub catalog lists: the chat agent
+# offers the ones `TEST_MODEL_PRICES` prices, in its order (docs/billing.md § Models).
 KANO_API_KEY = "sk-kano-proxy-test-not-a-real-one"
 PARSE_MODEL = "vendor/vision-model"
-CHAT_MODELS = "claude-code/claude-opus-5-5,codex/gpt-5.5,vendor/chat-model"
+CATALOG_MODELS = "claude-code/claude-opus-5-5,codex/gpt-5.5,vendor/chat-model"
 
 DATABASE_URL = os.environ.get("TEST_DATABASE_URL") or os.environ.get("DATABASE_URL")
 
@@ -112,7 +113,6 @@ async def make_client(sessionmaker, tmp_path) -> AsyncIterator[Callable[..., Asy
                 "kano_proxy_base_url": KANO_BASE,
                 "kano_proxy_api_key": KANO_API_KEY,
                 "parse_model": PARSE_MODEL,
-                "chat_models": CHAT_MODELS,
                 # Every model a test turn runs on is priced, as the deployment requires
                 # of its offered models (docs/billing.md § Models): a flat list price so
                 # the credits a test sees are predictable. Tests of the arithmetic set
@@ -141,8 +141,8 @@ def client(make_client) -> AsyncClient:
 
 @pytest.fixture(autouse=True)
 def kano_catalog(request: pytest.FixtureRequest):
-    """Kano Proxy's catalog, listing every offered chat model: a conversation's first
-    message checks its model against it (docs/billing.md § Models). The router started
+    """Kano Proxy's catalog, listing `CATALOG_MODELS`: the chat agent's models are read
+    from it (docs/billing.md § Models). The router started
     first answers first, so a test that needs another catalog opts out with the
     `own_catalog` marker and stubs the URL itself; nothing else is mocked here, and an
     unstubbed request still fails (docs/testing.md)."""
@@ -152,7 +152,7 @@ def kano_catalog(request: pytest.FixtureRequest):
     router = respx.mock(assert_all_called=False)
     router.get(KANO_MODELS_URL).mock(
         return_value=httpx.Response(
-            200, json={"data": [{"id": model} for model in CHAT_MODELS.split(",")]}
+            200, json={"data": [{"id": model} for model in CATALOG_MODELS.split(",")]}
         )
     )
     with router:

@@ -17,12 +17,12 @@ from sqlalchemy import select
 from sightread.billing import pay
 from sightread.db.models import Checkout, Job, PayEvent, Subscription, utcnow
 from tests.conftest import (
-    CHAT_MODELS,
     CSRF_HEADERS,
     PAY_APP_ID,
     PAY_SETTINGS,
     PAY_URL,
     PAY_WEBHOOK_SECRET,
+    TEST_MODEL_PRICES,
     grant_plan,
 )
 from tests.test_chat import MESSAGES_URL, _seed_document, assistant_turn
@@ -555,7 +555,7 @@ async def test_the_public_catalog_is_cached_and_lists_what_is_on_sale(make_clien
         "max_jobs": 1,
     }
     assert body["rates"]["parse_per_page"] == 1
-    assert set(body["rates"]["chat"]) == set(CHAT_MODELS.split(","))
+    assert list(body["rates"]["chat"]) == list(json.loads(TEST_MODEL_PRICES))
     assert {"available": True, "plans": body["plans"]} == {
         "available": True,
         "plans": [

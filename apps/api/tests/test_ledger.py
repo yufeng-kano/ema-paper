@@ -4,6 +4,7 @@ idempotent settlement, the chat overdraft, the 402s, and what the payloads show.
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -257,7 +258,7 @@ async def test_a_plan_change_raises_the_grant_and_never_lowers_it(sessionmaker) 
 
 
 async def test_the_billing_route_and_me_show_the_plan_and_the_balance(make_client) -> None:
-    client = make_client(free_credits_per_period=150, chat_models="claude-opus-5-5")
+    client = make_client(free_credits_per_period=150)
     await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
     me = (await client.get("/api/me")).json()
     assert (me["plan"], me["credits_remaining"]) == ("free", 150)
@@ -279,9 +280,14 @@ async def test_the_billing_route_and_me_show_the_plan_and_the_balance(make_clien
         "remaining": 150,
     }
     assert billing["rates"]["parse_per_page"] == 1
-    # US$1 per million tokens at US$0.002 a credit: half a credit per 1K tokens.
-    assert billing["rates"]["chat"] == {
-        "claude-opus-5-5": {"input": 0.5, "cache_read": 0.5, "cache_write": 0.5, "output": 0.5}
+    # Every priced model, in the price table's order. US$1 per million tokens at US$0.002
+    # a credit: half a credit per 1K tokens.
+    assert list(billing["rates"]["chat"]) == list(json.loads(TEST_MODEL_PRICES))
+    assert billing["rates"]["chat"]["claude-opus-5-5"] == {
+        "input": 0.5,
+        "cache_read": 0.5,
+        "cache_write": 0.5,
+        "output": 0.5,
     }
     assert billing["checkout_available"] is False
     empty = (await client.get("/api/billing/entries")).json()

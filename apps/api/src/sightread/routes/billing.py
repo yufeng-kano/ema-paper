@@ -77,19 +77,17 @@ async def _on_sale(
 
 
 def rates(settings: AppSettings) -> dict:
-    """Credits per parsed page and per 1K tokens of each offered chat model, derived from
-    the operator's prices and the worth of a credit — never typed into the frontend."""
+    """Credits per parsed page and per 1K tokens of each priced model, in the price
+    table's order — the chat models among them (docs/billing.md § Models) — derived from
+    the operator's prices and the worth of a credit, never typed into the frontend."""
     return {
         "parse_per_page": settings.parse_credits_per_page,
         "chat": {
             model: {
                 field: float(value)
-                for field, value in settings.model_prices[model]
-                .per_thousand(settings.credit_usd)
-                .items()
+                for field, value in price.per_thousand(settings.credit_usd).items()
             }
-            for model in settings.chat_model_list
-            if model in settings.model_prices
+            for model, price in settings.model_prices.items()
         },
     }
 

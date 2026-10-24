@@ -135,15 +135,6 @@ class TurnContext:
 # --- loading -------------------------------------------------------------------------------
 
 
-def chat_model(settings: Settings, setting: AgentSetting | None) -> str | None:
-    """The model the chat agent runs: the reader's pick while `CHAT_MODELS` still offers
-    it, else the list's first entry, None with none offered (docs/billing.md § Models)."""
-    offered = settings.chat_model_list
-    if setting is not None and setting.model in offered:
-        return setting.model
-    return offered[0] if offered else None
-
-
 async def _load(
     sessionmaker: async_sessionmaker[AsyncSession],
     settings: Settings,
@@ -168,17 +159,15 @@ async def _load(
                 )
             )
         ).scalar_one_or_none()
-        # The conversation's model is the model of its first turn, whatever the Agent page
-        # says now: the stored thinking blocks carry its signatures (docs/chat.md).
-        model = conversation.model or chat_model(settings, setting)
+        # The conversation's model is the model of its first turn, fixed when that message
+        # was accepted, whatever the Agent page says now: the stored thinking blocks carry
+        # its signatures (docs/chat.md).
+        model = conversation.model
         if not model:
             raise TurnFailed("No chat model is offered on this deployment")
         if model not in settings.model_prices:
             # Never a call nobody priced (docs/billing.md § Models).
             raise TurnFailed("model_unpriced")
-        if conversation.model is None:
-            conversation.model = model
-            await db.commit()
         # The history is replayed whole on every call, images included: past the cap
         # a turn would load and serialize hundreds of megabytes in the worker before
         # the upstream could refuse the context (docs/chat.md § History). The send is

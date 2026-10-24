@@ -95,11 +95,10 @@ def test_an_offered_model_without_a_price_refuses_to_start() -> None:
         Settings(parse_model="gpt-6-luna", model_prices_json="{}")
     settings = Settings(
         parse_model="gpt-6-luna",
-        chat_models="gpt-6-luna, claude-opus-5-5,gpt-6-luna",
         model_prices_json=f'{{"gpt-6-luna": {LUNA}, "claude-opus-5-5": {OPUS}}}',
     )
-    assert settings.chat_model_list == ["gpt-6-luna", "claude-opus-5-5"]
-    assert settings.offered_models == {"gpt-6-luna", "claude-opus-5-5"}
+    # The chat models are priced by definition: only the parse pipeline's are required.
+    assert settings.offered_models == {"gpt-6-luna"}
     assert settings.model_prices["gpt-6-luna"] == ModelPrice(
         Decimal("0.10"), Decimal("0.01"), Decimal("0.10"), Decimal("0.50")
     )

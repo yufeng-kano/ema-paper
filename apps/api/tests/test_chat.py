@@ -146,12 +146,10 @@ async def chatting(make_client, tmp_path) -> AsyncClient:
     client = make_client(workspaces_dir=str(tmp_path / "workspaces"))
     await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
     user_id = (await client.get("/api/me")).json()["user"]["id"]
-    chosen = await client.put(
-        "/api/agents/chat/settings",
-        json={"model": "claude-code/claude-opus-5-5"},
-        headers=CSRF_HEADERS,
-    )
-    assert chosen.status_code == 200, chosen.text
+    # Stored as a save leaves it: a test with its own catalog stubs it only once it runs.
+    async with client.app.state.sessionmaker() as db:
+        db.add(AgentSetting(user_id=user_id, agent="chat", model="claude-code/claude-opus-5-5"))
+        await db.commit()
     client.document_id = await _seed_document(client, user_id)
     client.user_id = user_id
     return client
@@ -227,8 +225,8 @@ async def test_chat_settings_refuse_unoffered_models_and_validate_effort(chattin
 @pytest.mark.own_catalog
 @respx.mock
 async def test_the_chat_catalog_lists_the_offered_models_the_catalog_confirms(chatting) -> None:
-    """`CHAT_MODELS` in the operator's order, only those Kano Proxy still lists
-    (docs/api.md § GET /api/agents/{agent}/models)."""
+    """The priced models in the price table's order, only those Kano Proxy lists: a
+    catalog model nobody priced is not offered (docs/api.md § GET /api/agents/{agent}/models)."""
     ids = [
         "dgx/qwen3.8-flash-next",
         "codex/gpt-5.5",
@@ -443,17 +441,31 @@ async def test_a_refusal_fails_the_turn_and_a_cancel_stops_it(chatting) -> None:
 @pytest.mark.own_catalog
 @respx.mock
 async def test_a_first_message_needs_a_model_the_catalog_still_serves(chatting) -> None:
-    """The pick is in CHAT_MODELS but Kano Proxy dropped it: refused before it is fixed
-    on the conversation; a catalog that cannot be read is the upstream's failure."""
+    """The pick was offered when it was saved but Kano Proxy dropped it: refused before it
+    is fixed on the conversation; a catalog that cannot be read is the upstream's failure."""
     document_id = chatting.document_id
     conversation_id = (
         await chatting.post(
             f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
         )
     ).json()["id"]
+    both = [{"id": "claude-code/claude-opus-5-5"}, {"id": "codex/gpt-5.5"}]
+    respx.get(MODELS_URL).mock(return_value=httpx.Response(200, json={"data": both}))
+    picked = await chatting.put(
+        "/api/agents/chat/settings",
+        json={"model": "claude-code/claude-opus-5-5"},
+        headers=CSRF_HEADERS,
+    )
+    assert picked.status_code == 200, picked.text
     respx.get(MODELS_URL).mock(
         return_value=httpx.Response(200, json={"data": [{"id": "codex/gpt-5.5"}]})
     )
+    unoffered = await chatting.put(
+        "/api/agents/chat/settings",
+        json={"model": "claude-code/claude-opus-5-5"},
+        headers=CSRF_HEADERS,
+    )
+    assert unoffered.status_code == 400
     dropped = await chatting.post(
         f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
     )
@@ -474,10 +486,13 @@ async def test_a_first_message_needs_a_model_the_catalog_still_serves(chatting) 
 async def test_messages_need_an_offered_model_and_a_configured_kano_proxy(
     make_client, tmp_path
 ) -> None:
-    """A deployment offering no chat model, or no Kano Proxy, refuses the send with 503
-    before a turn exists (docs/agents.md § Enqueue rules)."""
+    """A deployment offering no chat model — no catalog model priced — or no Kano Proxy
+    refuses the send with 503 before a turn exists (docs/agents.md § Enqueue rules)."""
     document_id: int | None = None
-    for overrides in ({"chat_models": ""}, {"kano_proxy_api_key": ""}):
+    parse_only = json.dumps(
+        {"vendor/vision-model": {"input": 1, "cache_read": 1, "cache_write": 1, "output": 1}}
+    )
+    for overrides in ({"model_prices_json": parse_only}, {"kano_proxy_api_key": ""}):
         client = make_client(workspaces_dir=str(tmp_path / "ws"), **overrides)
         await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
         if document_id is None:
@@ -2565,7 +2580,8 @@ async def test_a_conversation_with_a_stored_model_keeps_it_whatever_the_page_say
     chatting,
 ) -> None:
     """The conversation's model is its first turn's; a fresh conversation starts on the
-    reader's pick, or the first offered when that pick is gone (docs/chat.md)."""
+    reader's pick, refused once that pick is gone, or on the first offered by default
+    (docs/chat.md, docs/agents.md)."""
     document_id = chatting.document_id
     conversation_id = (
         await chatting.post(
@@ -2589,6 +2605,14 @@ async def test_a_conversation_with_a_stored_model_keeps_it_whatever_the_page_say
             f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
         )
     ).json()["id"]
+    gone = await chatting.post(
+        f"/api/conversations/{fresh}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
+    )
+    assert gone.status_code == 400, gone.text
+    restored = await chatting.put(
+        "/api/agents/chat/settings", json={"model": None}, headers=CSRF_HEADERS
+    )
+    assert restored.status_code == 200, restored.text
     started = await chatting.post(
         f"/api/conversations/{fresh}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
     )

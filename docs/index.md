@@ -31,7 +31,7 @@ Hosted, multi-user **vision document parsing** service. Users sign in with Googl
 - **PDF engine:** Poppler CLI (`pdftoppm`, `pdfinfo`) via subprocess — never a linked PDF library. See [parsing.md](./parsing.md).
 - **Web:** Nuxt (latest stable) + TypeScript + `@nuxtjs/i18n` (en, zh-TW), pnpm.
 - **Data:** PostgreSQL only — relational state **and** job queue (`FOR UPDATE SKIP LOCKED`). No Redis, no message broker.
-- **Upstream:** Kano Proxy (`KANO_PROXY_BASE_URL`) on the operator's own key (`KANO_PROXY_API_KEY`, [auth.md](./auth.md) § 3); the models are the deployment's (`PARSE_MODEL`, `CHAT_MODELS`, …, [billing.md](./billing.md) § Models), the chat list checked against `{KANO_PROXY_BASE_URL}/openai/v1/models` live — never hard-coded in code. The chat agent speaks the Anthropic Messages API through Kano Proxy's `/anthropic/v1` route ([chat.md](./chat.md)).
+- **Upstream:** Kano Proxy (`KANO_PROXY_BASE_URL`) on the operator's own key (`KANO_PROXY_API_KEY`, [auth.md](./auth.md) § 3); the models are the deployment's (`PARSE_MODEL`, `MODEL_PRICES_JSON`, …, [billing.md](./billing.md) § Models), the chat list read from `{KANO_PROXY_BASE_URL}/openai/v1/models` live and kept to the priced ones — never hard-coded in code. The chat agent speaks the Anthropic Messages API through Kano Proxy's `/anthropic/v1` route ([chat.md](./chat.md)).
 - **Sandbox:** one Kata microVM per user, started by a separate runner service that alone holds the Docker socket; the user's workspace directory is the VM's `/workspace` ([sandbox.md](./sandbox.md), [workspace.md](./workspace.md)).
 - **Deploy:** docker-compose on a single server, Caddy for TLS + routing. Environments: local + production only.
 

@@ -39,7 +39,7 @@ from ..db.models import (
     utcnow,
 )
 from ..errors import ApiError
-from ..jobs import chat_events, chat_runner
+from ..jobs import chat_events
 from ..jobs.intake import insufficient_credits
 from ..jobs.queue import HISTORY_FULL, count_active_turns, enqueue_turn, history_bytes
 from ..parsing.attachments import prepared_path
@@ -367,9 +367,10 @@ async def _ready_to_chat(
     db: AsyncSession, settings: AppSettings, user_id: int, *, needs_model: bool
 ) -> tuple[AgentSetting | None, str | None]:
     """The enqueue rules of docs/agents.md, applied to the chat agent: its settings, and
-    the model the conversation starts on, one of `CHAT_MODELS` (docs/billing.md
-    § Models). A conversation that has its model already needs none: later turns use
-    the stored one, whatever the page says now (docs/chat.md § Conversations)."""
+    the model the conversation starts on, read from the offered list as it is now
+    (docs/billing.md § Models). A conversation that has its model already needs none:
+    later turns use the stored one, whatever the page says now (docs/chat.md
+    § Conversations)."""
     if not settings.kano_proxy_configured:
         raise ApiError(503, "upstream", "Kano Proxy is not configured on this deployment")
     setting = (
@@ -381,19 +382,19 @@ async def _ready_to_chat(
     ).scalar_one_or_none()
     if not needs_model:
         return setting, None
-    model = chat_runner.chat_model(settings, setting)
-    if model is None:
-        raise ApiError(503, "upstream", "No chat model is offered on this deployment")
-    # Against the live catalog, as the picker lists it: a model Kano Proxy no longer
-    # serves must not be fixed on a conversation for every later turn to fail on
-    # (docs/billing.md § Models).
-    if model not in {entry["id"] for entry in await agent_models(settings, CHAT.name)}:
+    # The live list, as the picker shows it: a model Kano Proxy no longer serves must not
+    # be fixed on a conversation for every later turn to fail on (docs/billing.md § Models).
+    offered = [entry["id"] for entry in await agent_models(settings, CHAT.name)]
+    picked = setting.model if setting is not None else None
+    if picked is not None and picked not in offered:
         raise ApiError(
             400,
             "invalid_request",
             "That model is no longer served: pick another on the Agent page",
         )
-    return setting, model
+    if not offered:
+        raise ApiError(503, "upstream", "No chat model is offered on this deployment")
+    return setting, picked or offered[0]
 
 
 @router.post(
