@@ -47,6 +47,7 @@ import { commandArguments, formatBytes, type AskOutcome, type AskRequest, type C
 import { nodesToMarkdown } from '~/lib/copy'
 import { formatCount } from '~/lib/format'
 import { SETTINGS_QUERY } from '~/lib/settings'
+import { turnErrorKey, turnErrorNeedsPlan } from '~/lib/turnError'
 import { ANSWER_DRAG_TYPE, BLOCK_DRAG_TYPE } from '~/lib/dnd'
 import {
   blockPlain,
@@ -1538,9 +1539,14 @@ onBeforeUnmount(() => {
           @toggle-edit="toggleEdit"
         />
 
-        <p v-else-if="item.kind === 'error'" class="turn-error" role="alert">
-          {{ item.text === 'out_of_credits' ? t('chat.outOfCredits') : t('chat.turnError', { error: item.text }) }}
-        </p>
+        <!-- The worker's text is for the log: the line says it in the reader's words and
+             keeps the original in the tooltip (docs/web.md § The agent panel). -->
+        <div v-else-if="item.kind === 'error'" class="turn-error-row">
+          <p class="turn-error" role="alert" :title="item.text">{{ t(turnErrorKey(item.text)) }}</p>
+          <UiButton v-if="turnErrorNeedsPlan(item.text)" size="sm" variant="secondary" @click="seePlans">
+            {{ t('credits.seePlans') }}
+          </UiButton>
+        </div>
         <p v-else-if="item.kind === 'cancelled'" class="turn-note">{{ t('chat.turnCancelled') }}</p>
         <p v-else-if="item.kind === 'working'" class="working">
           <UiSpinner :size="12" />
@@ -1987,7 +1993,15 @@ onBeforeUnmount(() => {
   font-size: var(--text-xs);
 }
 
+.turn-error-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
 .turn-error {
+  flex: 1 1 auto;
+  min-width: 0;
   color: var(--danger);
   font-size: var(--text-xs);
   line-height: 1.5;

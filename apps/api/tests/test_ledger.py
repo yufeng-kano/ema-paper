@@ -26,6 +26,7 @@ from sightread.db.models import (
 )
 from sightread.jobs import chat_runner
 from sightread.jobs.queue import claim_next_turn, fail_turn
+from sightread.workspace.layout import user_root
 from tests.conftest import CSRF_HEADERS, TEST_MODEL_PRICES
 from tests.test_chat import MESSAGES_URL, _seed_document, assistant_turn
 from tests.test_library import _read, _ready_to_parse, _upload
@@ -440,6 +441,34 @@ async def test_a_turn_that_runs_out_of_credits_ends_with_its_answer_kept(
     billing = (await client.get("/api/billing")).json()
     assert (billing["period"]["spent"], billing["period"]["remaining"]) == (6, granted - 6)
     assert (await client.get("/api/me")).json()["credits_remaining"] == granted - 6
+
+
+async def test_a_turn_queued_before_the_workspace_filled_fails_storage_full(
+    make_client, tmp_path
+) -> None:
+    client = make_client(workspaces_dir=str(tmp_path / "workspaces"), free_storage_bytes=1 << 20)
+    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    user_id = (await client.get("/api/me")).json()["user"]["id"]
+    document_id = await _seed_document(client, user_id)
+    created = await client.post(
+        f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+    )
+    conversation_id = created.json()["id"]
+    sent = await client.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
+    )
+    assert sent.status_code == 202, sent.text
+    # The workspace fills between the send and the turn's start.
+    settings = client.app.state.settings
+    (user_root(settings.workspaces_dir, user_id) / "big.bin").write_bytes(b"0" * (1 << 20))
+    async with client.app.state.sessionmaker() as db:
+        turn_id = await claim_next_turn(db, settings.max_chat_turns_per_user)
+    await chat_runner.run_turn(
+        client.app.state.sessionmaker, settings, turn_id, asyncio.Semaphore(2)
+    )
+    [turn] = (await client.get(f"/api/conversations/{conversation_id}")).json()["turns"]
+    # A token the panel words, never the backend's sentence.
+    assert (turn["status"], turn["error"]) == ("failed", "storage_full")
 
 
 async def _running_turn(sessionmaker, settings: Settings, user_id: int) -> tuple[int, uuid.UUID]:

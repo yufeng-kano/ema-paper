@@ -219,7 +219,11 @@ async def _load(
             # (docs/workspace.md § Quota).
             await ensure_within_quota(db, settings, turn.user_id, paths.root)
         except ApiError as exc:
-            raise TurnFailed(exc.message) from exc
+            # A full workspace is a state the reader can act on: a token the panel words,
+            # as `out_of_credits` is (docs/web.md § The agent panel).
+            raise TurnFailed(
+                "storage_full" if exc.error_type == "storage_full" else exc.message
+            ) from exc
 
     facts = document_facts(settings, job, paths)
     # `bash` only on a plan that grants it, and only with a runner (docs/billing.md).
