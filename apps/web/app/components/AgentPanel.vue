@@ -100,6 +100,10 @@ const modelInjected = computed(() => {
   return (models.value ?? []).some((model) => model.id === current) ? null : current
 })
 
+/** The chat agent's current model: the reader's pick, or with none the list's first —
+    the default only the live list can name (docs/billing.md § Models). */
+const modelChoice = computed(() => settings.value.model ?? models.value?.[0]?.id ?? '')
+
 async function applyModel(value: string) {
   modelPending.value = true
   modelsError.value = null
@@ -158,11 +162,11 @@ function onSectionSaved(agent: string, saved: SavedAgentSettings) {
         <UiField v-if="isChat" v-slot="{ id }" class="model" :label="t('agents.modelLabel')">
           <UiSelect
             :id="id"
-            :model-value="settings.model ?? ''"
+            :model-value="modelChoice"
             :disabled="modelPending || (!models && !settings.model)"
             @update:model-value="applyModel"
           >
-            <option v-if="!settings.model" value="">{{ t('agents.modelNone') }}</option>
+            <option v-if="!modelChoice" value="">{{ t('agents.modelNone') }}</option>
             <option v-if="modelInjected" :value="modelInjected">{{ modelInjected }}</option>
             <option v-for="model in models ?? []" :key="model.id" :value="model.id">
               {{ model.name ? `${model.name} · ${model.id}` : model.id }}

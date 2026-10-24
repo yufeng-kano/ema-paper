@@ -83,7 +83,8 @@ async def _read_body_capped(response: httpx.Response, max_bytes: int) -> bytes:
 def offered_models(settings: Settings, agent: str) -> list[str]:
     """The ids an agent may run, in the operator's order (docs/billing.md § Models): the
     parse agent its fixed model and the fallback, the check agent its own or the parse's,
-    the chat agent `CHAT_MODELS`. Empty when the deployment names none."""
+    the chat agent every priced model, before the live catalog narrows it. Empty when the
+    deployment names none."""
     if agent == PARSE.name:
         return list(
             dict.fromkeys(m for m in (settings.parse_model, settings.parse_fallback_model) if m)
@@ -91,14 +92,14 @@ def offered_models(settings: Settings, agent: str) -> list[str]:
     if agent == CHECK.name:
         return [settings.check_model or settings.parse_model] if settings.parse_model else []
     if agent == CHAT.name:
-        return settings.chat_model_list
+        return list(settings.model_prices)
     return []
 
 
 async def agent_models(settings: Settings, agent: str) -> list[dict]:
     """`GET /api/agents/{agent}/models` (docs/api.md): the parse and check agents' models
-    are configuration, answered as they are with no name; the chat agent's are the
-    `CHAT_MODELS` entries Kano Proxy's live catalog still lists, each with its name."""
+    are configuration, answered as they are with no name; the chat agent's are the priced
+    models Kano Proxy's live catalog lists, in the price table's order, each with its name."""
     offered = offered_models(settings, agent)
     if agent != CHAT.name:
         if not offered:

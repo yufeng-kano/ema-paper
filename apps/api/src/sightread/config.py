@@ -52,9 +52,8 @@ class Settings(BaseSettings):
     parse_model: str = ""
     check_model: str = ""
     parse_fallback_model: str = ""
-    # Comma-separated ids the chat agent offers; the first is the default.
-    chat_models: str = ""
-    # `{"<model>": {"input", "cache_read", "cache_write", "output"}}`, USD per 1M tokens.
+    # `{"<model>": {"input", "cache_read", "cache_write", "output"}}`, USD per 1M tokens. The
+    # chat agent offers the live catalog's models priced here, in this order.
     model_prices_json: str = "{}"
     # What one credit is worth in list-price USD, and the flat rates (docs/billing.md
     # § Credits).
@@ -279,15 +278,11 @@ class Settings(BaseSettings):
         )
 
     @property
-    def chat_model_list(self) -> list[str]:
-        """`CHAT_MODELS` as ids, in the operator's order, the first the default."""
-        return list(dict.fromkeys(m.strip() for m in self.chat_models.split(",") if m.strip()))
-
-    @property
     def offered_models(self) -> set[str]:
-        """Every model the deployment runs, each of which must be priced."""
+        """Every model the deployment runs on its own, each of which must be priced; the
+        chat models are priced by definition (docs/billing.md § Models)."""
         fixed = (self.parse_model, self.check_model, self.parse_fallback_model)
-        return {m.strip() for m in fixed if m.strip()} | set(self.chat_model_list)
+        return {m.strip() for m in fixed if m.strip()}
 
     @property
     def kano_pay_configured(self) -> bool:

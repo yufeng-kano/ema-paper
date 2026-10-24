@@ -77,7 +77,7 @@ async def test_the_parse_and_check_models_are_the_deployments(signed_in, make_cl
 @pytest.mark.own_catalog
 @respx.mock
 async def test_the_chat_models_are_the_offered_ones_the_catalog_still_lists(signed_in) -> None:
-    """`CHAT_MODELS` in the operator's order, each with the catalog's name, fetched with
+    """The priced models in the price table's order, each with the catalog's name, fetched with
     the operator's key — which no response carries (docs/api.md)."""
     route = respx.get(KANO_MODELS_URL).mock(side_effect=_models_ok)
 
@@ -134,7 +134,8 @@ async def test_an_oversized_model_list_is_an_upstream_error() -> None:
 
 async def test_only_the_chat_agent_takes_a_model_and_only_an_offered_one(signed_in) -> None:
     chat = (await _settings_of(signed_in, "chat"))["settings"]
-    assert chat["model"] == "claude-code/claude-opus-5-5"  # the first offered, by default
+    # The default, which only the live list can name: the panel shows its first.
+    assert chat["model"] is None
 
     picked = await signed_in.put(
         "/api/agents/chat/settings", json={"model": " vendor/chat-model "}, headers=CSRF_HEADERS
@@ -152,7 +153,7 @@ async def test_only_the_chat_agent_takes_a_model_and_only_an_offered_one(signed_
     restored = await signed_in.put(
         "/api/agents/chat/settings", json={"model": None}, headers=CSRF_HEADERS
     )
-    assert restored.json()["model"] == "claude-code/claude-opus-5-5"
+    assert restored.json()["model"] is None
 
     for agent in ("parse", "check"):
         refused = await signed_in.put(

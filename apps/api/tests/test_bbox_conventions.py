@@ -192,7 +192,6 @@ async def test_the_agents_payload_names_the_parse_models_convention(signed_in, m
 
     client = make_client(
         parse_model="anthropic/claude-sonnet-4-5",
-        chat_models="",
         model_prices_json=json.dumps(
             {
                 "anthropic/claude-sonnet-4-5": {

@@ -16,7 +16,7 @@ prompt_presets   id PK, user_id FK, agent, name, text TEXT, created_at, updated_
                  -- named prompts for one agent (agents.md); selecting one replaces that
                  -- agent's template entirely (docs/parsing.md § Prompts)
 agent_settings   (user_id FK, agent) PK,
-                 model NULL,                      -- chat: one of CHAT_MODELS; NULL = the
+                 model NULL,                      -- chat: an offered model; NULL = the
                                                   -- default (billing.md § Models). NULL on
                                                   -- parse and check, whose models are the
                                                   -- deployment's
