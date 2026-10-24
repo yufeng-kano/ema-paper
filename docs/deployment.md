@@ -64,6 +64,7 @@ docker compose -f docker-compose.production.yaml -f docker-compose.only-containe
 ```text
 <domain> {
   tls { issuer acme { disable_http_challenge } }   # validate over 443 (TLS-ALPN-01), never :80
+  header { defer; Strict-Transport-Security …; Content-Security-Policy …; … }   # § Security headers
   request_body { max_size 128MB }        # keep in sync with UPLOAD_MAX_BYTES
   @api path /healthz /v1/* /api/* /oauth/* /mcp /mcp/* /.well-known/*
   handle @api { reverse_proxy api:8000 }
@@ -76,6 +77,38 @@ docker compose -f docker-compose.production.yaml -f docker-compose.only-containe
 As built: the domain comes from `{$DOMAIN}` and the ACME contact from `{$ACME_EMAIL}` (both in `.env`, passed to the caddy service), the API proxy sets `flush_interval -1` (no response buffering, for SSE and MCP streams) and 30-minute read/write timeouts.
 
 Certificates are always this stack's own: the site block carries an explicit `tls { issuer acme { disable_http_challenge } }`, so validation is TLS-ALPN-01 over 443 and never HTTP-01 over 80. That holds for both deployments — standalone, where Caddy publishes 80 and 443 itself, and behind a front proxy, where only a passed-through 443 reaches it. Port 80 is therefore only ever an HTTP→HTTPS convenience, never a dependency.
+
+## Security headers
+
+Caddy sends the same security headers on every answer of the site, the API's and the web app's alike, so they are defined in one place: the `header` block of `deploy/caddy/Caddyfile`. The block is deferred, so each value replaces whatever the upstream sent (h3's defaults on a Nuxt error, for one) and every header goes out once. It also drops `Server` (uvicorn) and `X-Powered-By` (Nuxt).
+
+| Header | Value | Why |
+|--------|-------|-----|
+| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains` | The site is HTTPS only. No `preload`: that commits the parent domain and is slow to undo |
+| `Content-Security-Policy` | below | |
+| `X-Frame-Options` | `DENY` | No page is meant to be framed, the connector consent screen least of all (clickjacking). Older browsers' form of `frame-ancestors 'none'` |
+| `X-Content-Type-Options` | `nosniff` | Every file the API serves goes out with its declared type, never sniffed into script or HTML |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` | Another site sees the origin only, never a path or query of this one |
+| `Permissions-Policy` | `camera=(), microphone=(), geolocation=(), payment=(), usb=()` | Features the app never uses. The clipboard stays allowed: the viewer and chat copy |
+
+The policy, one line in the Caddyfile:
+
+```text
+default-src 'self'; script-src 'self' 'unsafe-inline';
+style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;
+font-src 'self' data: https://fonts.gstatic.com;
+img-src 'self' data: blob: https://*.googleusercontent.com;
+connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'
+```
+
+- `script-src 'unsafe-inline'`: Nuxt writes inline scripts into every page — the import map and `window.__NUXT__.config` — and their content changes with each build, so a hash list here would break on the next build. Scripts still load from this origin only. A strict policy (nonces from the Nitro renderer, hashes for the prerendered pages) is a separate step.
+- `style-src 'unsafe-inline'`: KaTeX sets math with `style` attributes, Nuxt inlines component styles, and the OAuth consent page carries its own `<style>`. Source Serif 4 comes from Google Fonts: the stylesheet from `fonts.googleapis.com`, the font files from `fonts.gstatic.com` ([web.md](./web.md) § Design system — Graphite). KaTeX's own fonts are bundled.
+- `img-src`: `https://*.googleusercontent.com` is the account's Google profile picture (Settings → Account), which loads from Google's own host. `blob:` is the composer's preview of a pasted or attached image (an object URL), `data:` inline images. A remote image in a document is not rendered (it stays text), so no other host is listed.
+- `connect-src 'self'`: the app calls only its own origin — `/api/*`, `/v1/*` and their SSE streams.
+- No `form-action`: the consent screen's form posts to `/oauth/authorize`, which redirects to the connector's `redirect_uri` — another origin, or `http://localhost` for a CLI client — and browsers hold that redirect to `form-action` too. Checkout and the portal are full-page navigations to Kano Pay, which no directive restricts.
+- No `Cross-Origin-Opener-Policy` or `Cross-Origin-Resource-Policy`: a connector opens the consent screen in a popup and keeps its handle, and a connector's page loads this site's icon from its own origin.
+
+`deploy/caddy/Caddyfile.local` sends the same headers except HSTS, which a browser ignores over plain HTTP, so a policy violation shows up in a local integration run before production. Change both together.
 
 ## Environment variables (`.env.example` / `.env.production.example` are the authoritative lists)
 
@@ -126,3 +159,5 @@ Kano Proxy (production): the operator's own project API key goes into `KANO_PROX
 `git pull && docker compose -f docker-compose.production.yaml up -d --build` on the server (append
 `-f docker-compose.only-container-network.yaml` on hosts with a front proxy — and keep appending it,
 since leaving it off republishes 80/443 and collides with whatever owns them). Tagged releases/CI can come later; keep root `package.json` version bumped per SemVer when tagging starts.
+
+`up -d` leaves an unchanged `caddy` container running, and the Caddyfile is bind-mounted as a single file: `git pull` writes it as a new file the running container never sees, so `caddy reload` would read the old one. A Caddyfile change therefore takes `docker compose … restart caddy` (same `-f` list), which mounts the new file. The restart drops open connections, SSE streams included.
