@@ -788,10 +788,10 @@ async function showResult(document: LibraryDocument) {
 
 /**
  * The open document in the URL (`?doc=<id>`, docs/web.md § Files). Opening one pushes an
- * entry, so Back closes the viewer; closing it here goes back over that entry rather than
- * adding another, or drops `doc` when the viewer was opened from the URL itself.
+ * entry, so Back closes the viewer; closing it here goes back when the entry before is this
+ * same place without the document, and drops `doc` otherwise — the viewer opened from the
+ * URL itself, or another entry (Settings over the viewer) pushed between.
  */
-let docPushed = false
 watch(
   () => openDocument.value?.id ?? null,
   (id) => {
@@ -799,10 +799,11 @@ watch(
       return
     }
     if (id !== null) {
-      docPushed = true
       writeQuery({ doc: String(id) }, false)
-    } else if (docPushed) {
-      docPushed = false
+      return
+    }
+    const without = router.resolve({ query: { ...route.query, doc: undefined } }).fullPath
+    if (router.options.history.state.back === without) {
       navigating = navigating.then(() => router.back())
     } else {
       writeQuery({ doc: undefined }, true)
@@ -833,7 +834,6 @@ watch(
   () => route.query.doc,
   (value) => {
     if (queryId(value) === null) {
-      docPushed = false
       openDocument.value = null
       return
     }

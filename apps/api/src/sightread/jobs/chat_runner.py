@@ -1127,26 +1127,29 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
             )
         )
 
+    async def write(index: int, block: dict) -> dict:
+        # Admitted when its turn at the gate has come, not while it waited: a write still
+        # waiting once the calls allowed after the credits ran out are used does not start;
+        # one already running finishes and commits as it would (docs/billing.md § A chat
+        # turn).
+        if not may_run(index):
+            return await _report_tool(
+                ctx,
+                str(block.get("id")),
+                block.get("name"),
+                chat_tools.ToolOutcome(NOT_RUN_OUT_OF_CREDITS, is_error=True),
+            )
+        return await _run_tool(ctx, block, malformed)
+
     async def writes() -> None:
         for index, block in enumerate(tool_uses):
             if block.get("name") in MUTATING_TOOLS:
-                if not may_run(index):
-                    # A write still waiting its turn once the calls allowed after the
-                    # credits ran out are used does not start; one already running
-                    # finishes and commits as it would (docs/billing.md § A chat turn).
-                    results[index] = await _report_tool(
-                        ctx,
-                        str(block.get("id")),
-                        block.get("name"),
-                        chat_tools.ToolOutcome(NOT_RUN_OUT_OF_CREDITS, is_error=True),
-                    )
-                    continue
                 # Stop means after the *current* call: a write not yet started — the
                 # first of the round included — is not started once the user cancelled.
                 results[index] = await run_writer(
                     ctx,
                     str(block.get("name")),
-                    lambda block=block: _run_tool(ctx, block, malformed),
+                    lambda index=index, block=block: write(index, block),
                 )
 
     # A task group: when the writes stop on a cancel, the reads still running are

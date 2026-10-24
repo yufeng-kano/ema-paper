@@ -251,21 +251,23 @@ async def _run_tools(
         )
 
     async def writes() -> None:
-        async def write(block: dict) -> dict:
-            # Reported inside the shielded writer: an `edit` the deadline interrupted is
-            # still announced before the terminal event.
+        async def write(index: int, block: dict) -> dict:
+            # Admitted when its turn at the gate has come, as the turn's own writes are
+            # (docs/billing.md § A chat turn). Reported inside the shielded writer: an
+            # `edit` the deadline interrupted is still announced before the terminal event.
+            if not may_run(index):
+                return await report(
+                    block,
+                    chat_tools.ToolOutcome(chat_runner.NOT_RUN_OUT_OF_CREDITS, is_error=True),
+                )
             return await report(block, await _run_one_guarded(ctx, definition, block, malformed))
 
         for index, block in enumerate(tool_uses):
             if _writes(definition, block):
-                if not may_run(index):
-                    results[index] = await report(
-                        block,
-                        chat_tools.ToolOutcome(chat_runner.NOT_RUN_OUT_OF_CREDITS, is_error=True),
-                    )
-                    continue
                 results[index] = await chat_runner.run_writer(
-                    ctx, str(block.get("name")), lambda block=block: write(block)
+                    ctx,
+                    str(block.get("name")),
+                    lambda index=index, block=block: write(index, block),
                 )
 
     # A task group: when the writes stop on a cancel, the reads still running are cancelled
