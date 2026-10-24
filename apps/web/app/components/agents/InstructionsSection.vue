@@ -249,11 +249,9 @@ const advancedOpen = ref(props.agent.settings.prompt !== null || props.agent.set
 .section-label {
   margin: 0;
   font-family: inherit;
-  font-size: var(--text-2xs);
+  font-size: var(--text-xs);
   font-weight: var(--weight-semibold);
-  letter-spacing: var(--tracking-label);
-  text-transform: uppercase;
-  color: var(--faint);
+  color: var(--muted);
 }
 
 /* A consequence the controls cannot show, in the cache line's voice. */

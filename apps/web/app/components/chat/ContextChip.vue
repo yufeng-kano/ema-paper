@@ -50,10 +50,10 @@ const emit = defineEmits<{ remove: [] }>()
   gap: var(--space-1);
   max-width: 100%;
   height: 24px;
-  padding: 0 6px;
-  border: 1px solid var(--edge);
-  border-radius: var(--radius);
-  background: var(--rail);
+  padding: 0 10px 0 8px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-full);
+  background: var(--fill);
   color: var(--ink-soft);
   font-size: var(--text-xs);
   line-height: 1;
@@ -100,10 +100,10 @@ const emit = defineEmits<{ remove: [] }>()
   justify-content: center;
   width: 20px;
   height: 20px;
-  margin: 0 -4px 0 -2px;
+  margin: 0 -6px 0 -2px;
   padding: 0;
   border: 0;
-  border-radius: var(--radius);
+  border-radius: var(--radius-full);
   background: transparent;
   color: var(--faint);
   cursor: pointer;
@@ -113,7 +113,7 @@ const emit = defineEmits<{ remove: [] }>()
 }
 
 .chip-drop:hover {
-  background: var(--rail-active);
+  background: var(--fill-strong);
   color: var(--ink);
 }
 

@@ -863,7 +863,7 @@ defineExpose({ addFiles, setQuote, focus, ask })
       <p class="menu-keys">{{ t('chat.commandKeys') }}</p>
     </div>
 
-    <!-- The one rounded control in the app besides the context menu. -->
+    <!-- The message field: what goes with the message, then its text, then the send. -->
     <div class="field" :class="{ disabled: running }">
       <!-- What goes with the message besides its text (docs/web.md § The agent panel,
            *Context chips*): the control that adds a section, the document the
@@ -1183,19 +1183,25 @@ defineExpose({ addFiles, setQuote, focus, ask })
 
 /* --- the field ------------------------------------------------------------------- */
 
+/* Paper on the agent's glass card, as the system's message field: a hairline, a faint
+   lift, the accent's ring while it has the caret. */
 .field {
   display: flex;
   flex-direction: column;
   gap: 6px;
   padding: var(--space-3) var(--space-2) var(--space-2) var(--space-3);
-  border: 1px solid var(--edge);
+  border: 1px solid var(--line-strong);
   border-radius: var(--radius-composer);
   background: var(--paper);
-  transition: border-color var(--duration-fast) var(--ease);
+  box-shadow: 0 1px 2px var(--glass-shadow);
+  transition:
+    border-color var(--duration-fast) var(--ease),
+    box-shadow var(--duration-fast) var(--ease);
 }
 
 .field:focus-within {
   border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-tint);
 }
 
 .field.disabled {
@@ -1222,9 +1228,9 @@ defineExpose({ addFiles, setQuote, focus, ask })
   width: 24px;
   height: 24px;
   padding: 0;
-  border: 1px solid var(--edge);
-  border-radius: var(--radius);
-  background: transparent;
+  border: 0;
+  border-radius: var(--radius-full);
+  background: var(--fill);
   color: var(--muted);
   cursor: pointer;
   transition:
@@ -1234,7 +1240,7 @@ defineExpose({ addFiles, setQuote, focus, ask })
 
 .context-add:hover:not(:disabled),
 .context-add[aria-expanded='true'] {
-  background: var(--rail);
+  background: var(--fill-strong);
   color: var(--ink);
 }
 
@@ -1263,7 +1269,7 @@ defineExpose({ addFiles, setQuote, focus, ask })
   margin: 0;
   padding: 0 var(--space-1) 0 var(--space-2);
   border-radius: var(--radius-full);
-  background: var(--rail);
+  background: var(--fill);
   color: var(--muted);
   font-size: var(--text-2xs);
 }
@@ -1308,7 +1314,7 @@ defineExpose({ addFiles, setQuote, focus, ask })
 .chip-drop:hover,
 .command-drop:hover,
 .file-drop:hover {
-  background: var(--rail-active);
+  background: var(--fill-strong);
 }
 
 .chip-drop :deep(svg),
@@ -1341,9 +1347,8 @@ defineExpose({ addFiles, setQuote, focus, ask })
   width: 56px;
   height: 56px;
   overflow: hidden;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--rail);
+  border-radius: var(--radius-md);
+  background: var(--fill);
   color: var(--faint);
 }
 
@@ -1395,8 +1400,8 @@ defineExpose({ addFiles, setQuote, focus, ask })
   max-width: 100%;
   height: 44px;
   padding: 0 var(--space-1) 0 6px;
-  border: 1px solid var(--edge);
-  border-radius: var(--radius);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
   background: var(--paper);
 }
 
@@ -1410,8 +1415,8 @@ defineExpose({ addFiles, setQuote, focus, ask })
   place-items: center;
   width: 30px;
   height: 30px;
-  border-radius: var(--radius);
-  background: var(--rail);
+  border-radius: var(--radius-sm);
+  background: var(--fill);
   color: var(--faint);
 }
 
@@ -1452,14 +1457,15 @@ defineExpose({ addFiles, setQuote, focus, ask })
 .file-drop {
   width: 24px;
   height: 24px;
-  border-radius: var(--radius);
 }
 
 .progress {
   display: block;
   height: 3px;
   margin-top: 3px;
-  background: var(--rail-active);
+  overflow: hidden;
+  border-radius: var(--radius-full);
+  background: var(--fill);
 }
 
 .progress.over {
@@ -1494,19 +1500,19 @@ defineExpose({ addFiles, setQuote, focus, ask })
   gap: var(--space-1);
   height: 24px;
   padding: 0 2px 0 var(--space-2);
-  border-radius: var(--radius);
-  background: var(--rail-active);
-  color: var(--ink);
+  border-radius: var(--radius-full);
+  background: var(--accent-tint);
+  color: var(--accent);
 }
 
 .command-drop {
   width: 20px;
   height: 20px;
-  border-radius: var(--radius);
+  color: currentcolor;
 }
 
 .command-drop:hover {
-  background: var(--edge);
+  background: var(--accent-tint);
 }
 
 .command-description {
@@ -1588,7 +1594,7 @@ defineExpose({ addFiles, setQuote, focus, ask })
 }
 
 .round.ghost:hover:not(:disabled) {
-  background: var(--rail);
+  background: var(--fill);
   color: var(--ink);
 }
 
@@ -1603,7 +1609,7 @@ defineExpose({ addFiles, setQuote, focus, ask })
 }
 
 .round.stop {
-  background: var(--rail-active);
+  background: var(--fill-strong);
   color: var(--ink);
 }
 

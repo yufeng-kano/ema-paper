@@ -223,6 +223,39 @@ defineProps<{ name: IconName }>()
       <path d="m18 15-6-6-6 6" />
     </template>
 
+    <!-- chevron-left: the result viewer's back button, which closes it. -->
+    <template v-else-if="name === 'chevron-left'">
+      <path d="m15 18-6-6 6-6" />
+    </template>
+
+    <!-- chevrons-up-down: the sidebar's account button, which opens a menu over itself. -->
+    <template v-else-if="name === 'chevrons-up-down'">
+      <path d="m7 15 5 5 5-5" />
+      <path d="m7 9 5-5 5 5" />
+    </template>
+
+    <!-- panel-left-close / panel-right-close: closing the reader's notes card (at the left)
+         and agent card (at the right). -->
+    <template v-else-if="name === 'panel-left-close'">
+      <rect width="18" height="18" x="3" y="3" rx="2" />
+      <path d="M9 3v18" />
+      <path d="m16 15-3-3 3-3" />
+    </template>
+
+    <template v-else-if="name === 'panel-right-close'">
+      <rect width="18" height="18" x="3" y="3" rx="2" />
+      <path d="M15 3v18" />
+      <path d="m8 9 3 3-3 3" />
+    </template>
+
+    <!-- square-pen: a new conversation, as the system's compose button draws it. -->
+    <template v-else-if="name === 'square-pen'">
+      <path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+      <path
+        d="M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z"
+      />
+    </template>
+
     <!-- search: find in the open document. -->
     <template v-else-if="name === 'search'">
       <circle cx="11" cy="11" r="7" />
@@ -475,7 +508,7 @@ defineProps<{ name: IconName }>()
       <path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2" />
       <circle cx="12" cy="7" r="4" />
     </template>
-    <!-- credit-card: the Billing section. -->
+    <!-- credit-card: Upgrade in the account menu. -->
     <template v-else-if="name === 'credit-card'">
       <rect x="2" y="5" width="20" height="14" rx="2" />
       <path d="M2 10h20" />

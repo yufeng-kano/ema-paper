@@ -2,13 +2,15 @@
 /**
  * The product mark and name, linking home — the same in both shells.
  *
- * The mark is the `scan-text` glyph reversed out of an accent square: the brand is the one
- * place besides data where the accent appears, and a monogram at this size was reading as a
- * stray pair of letters rather than as a mark.
+ * The mark is the `scan-text` glyph white on an app icon's rounded square, the accent lit
+ * from the top as the system's own icons are: the brand is the one place besides data and
+ * controls where the accent appears, and a monogram at this size was reading as a stray pair
+ * of letters rather than as a mark (docs/web.md § Design system).
  *
- * `size` is the sign-in page's larger cut. Everything else takes the sidebar's. Without
- * `to` — the sign-in page, where there is nowhere to go — it is a plain block rather than a
- * link to the page you are already on.
+ * `lg` is the sign-in page's app icon: the mark large over the name, as a product page
+ * introduces an app. Everything else takes the sidebar's cut. Without `to` — the sign-in
+ * page's hero, where there is nowhere to go — it is a plain block rather than a link to the
+ * page you are already on.
  */
 withDefaults(defineProps<{ to?: string; size?: 'md' | 'lg' }>(), {
   size: 'md',
@@ -41,6 +43,7 @@ const { t } = useI18n()
   flex-shrink: 0;
   font-family: var(--font-display);
   font-weight: var(--weight-semibold);
+  letter-spacing: -0.01em;
 }
 
 .brand.md {
@@ -49,38 +52,43 @@ const { t } = useI18n()
 }
 
 .brand.lg {
-  gap: var(--space-3);
-  font-size: var(--display-xs);
+  flex-direction: column;
+  gap: var(--space-4);
+  font-size: var(--display-sm);
 }
 
 .brand-mark {
   display: inline-grid;
   place-items: center;
   flex-shrink: 0;
-  background: var(--accent);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--accent) 72%, var(--accent-fg)), var(--accent));
+  box-shadow: inset 0 1px 0 var(--accent-highlight);
   color: var(--accent-fg);
 }
 
 .brand.md .brand-mark {
-  width: 26px;
-  height: 26px;
-  border-radius: var(--radius);
-}
-
-.brand.lg .brand-mark {
-  width: 36px;
-  height: 36px;
+  width: 28px;
+  height: 28px;
   border-radius: var(--radius-mark);
 }
 
+.brand.lg .brand-mark {
+  width: 80px;
+  height: 80px;
+  border-radius: var(--radius-xl);
+  box-shadow:
+    inset 0 1px 0 var(--accent-highlight),
+    0 8px 24px var(--glass-shadow);
+}
+
 .brand.md .brand-mark :deep(svg) {
-  width: 16px;
-  height: 16px;
+  width: 17px;
+  height: 17px;
 }
 
 .brand.lg .brand-mark :deep(svg) {
-  width: 22px;
-  height: 22px;
+  width: 46px;
+  height: 46px;
 }
 
 /* The wordmark never wraps — it is a name, and a two-line one reads as two words. */

@@ -16,11 +16,11 @@
 const props = withDefaults(
   defineProps<{
     variant?: 'primary' | 'secondary' | 'ghost' | 'danger'
-    /** 36px, 30px and 26px — the three control heights this design gives a button. */
-    size?: 'xs' | 'sm' | 'md'
-    /** Square button with an icon and no visible label — `label` becomes its accessible name. */
+    /** 44px (a toolbar's), 36px, 30px and 26px — the control heights a button takes. */
+    size?: 'xs' | 'sm' | 'md' | 'lg'
+    /** Round button with an icon and no visible label — `label` becomes its accessible name. */
     iconOnly?: boolean
-    /** Fills its container's width, for a rail's single primary action. */
+    /** Fills its container's width, for a sheet's single primary action. */
     block?: boolean
     loading?: boolean
     disabled?: boolean
@@ -91,21 +91,30 @@ const bindings = computed(() => {
   justify-content: center;
   gap: var(--space-2);
   border: 1px solid transparent;
-  border-radius: var(--radius);
+  /* A capsule, as the system draws a push button (docs/web.md § Design system). */
+  border-radius: var(--radius-full);
   font-weight: var(--weight-medium);
   white-space: nowrap;
   cursor: pointer;
-  /* Color and background only — this design has no hover elevation and no transforms
-     (docs/web.md § Design system). */
+  /* Color and background only — no hover elevation and no transforms (docs/web.md §
+     Design system). */
   transition:
     background var(--duration-fast) var(--ease),
     border-color var(--duration-fast) var(--ease),
     color var(--duration-fast) var(--ease);
 }
 
+/* The toolbar's size: a primary action beside the glass capsules. */
+.btn-lg {
+  height: var(--control-height-lg);
+  padding: 0 var(--space-5) 0 var(--space-4);
+  font-size: var(--text-base);
+  font-weight: var(--weight-semibold);
+}
+
 .btn-md {
   height: var(--control-height);
-  padding: 0 var(--space-3);
+  padding: 0 var(--space-4);
   font-size: var(--text-sm);
 }
 
@@ -117,13 +126,17 @@ const bindings = computed(() => {
 
 .btn-xs {
   height: var(--control-height-xs);
-  padding: 0 var(--space-2);
+  padding: 0 10px;
   font-size: var(--text-xs);
 }
 
 .btn-icon {
   padding: 0;
   aspect-ratio: 1;
+}
+
+.btn-icon.btn-lg {
+  width: var(--control-height-lg);
 }
 
 .btn-icon.btn-md {
@@ -138,14 +151,14 @@ const bindings = computed(() => {
   width: var(--control-height-xs);
 }
 
-/* Fills the rail it sits in — the primary action on a screen whose rail holds one. */
+/* Fills the column it sits in — a sheet's single primary action. */
 .btn-block {
   width: 100%;
 }
 
 .btn:disabled,
 .btn[aria-disabled='true'] {
-  opacity: 0.5;
+  opacity: 0.45;
   cursor: not-allowed;
   pointer-events: none;
 }
@@ -157,24 +170,27 @@ const bindings = computed(() => {
   cursor: progress;
 }
 
-/* The accent's one non-data use: the control that commits a change. */
+/* The control that commits: the accent, with the faint top highlight a filled system
+   button has. */
 .btn-primary {
   background: var(--accent);
   color: var(--accent-fg);
+  box-shadow: inset 0 1px 0 var(--accent-highlight);
 }
 
 .btn-primary:hover {
   background: var(--accent-hover);
 }
 
+/* The system's gray push button: a translucent fill, no border, so it reads the same on
+   paper, on a grouped list and on glass. */
 .btn-secondary {
-  background: var(--paper);
+  background: var(--fill);
   color: var(--ink);
-  border-color: var(--edge);
 }
 
 .btn-secondary:hover {
-  background: var(--rail);
+  background: var(--fill-strong);
 }
 
 .btn-ghost {
@@ -183,16 +199,15 @@ const bindings = computed(() => {
 }
 
 .btn-ghost:hover {
-  background: var(--rail);
+  background: var(--fill);
   color: var(--ink);
 }
 
-/* Destructive: the word in danger over a danger-edge hairline, never a filled red slab —
-   a revoke button sits in a table row and must not shout down the row it belongs to. */
+/* Destructive: the word in the system red on the gray fill — a revoke button sits in a
+   table row and must not shout down the row it belongs to. */
 .btn-danger {
-  background: var(--paper);
+  background: var(--fill);
   color: var(--danger);
-  border-color: var(--danger-edge);
 }
 
 .btn-danger:hover {
@@ -205,13 +220,18 @@ const bindings = computed(() => {
 
 .btn :deep(svg) {
   flex-shrink: 0;
-  width: 15px;
-  height: 15px;
+  width: 16px;
+  height: 16px;
+}
+
+.btn-lg :deep(svg) {
+  width: 18px;
+  height: 18px;
 }
 
 .btn-sm :deep(svg),
 .btn-xs :deep(svg) {
-  width: 13px;
-  height: 13px;
+  width: 14px;
+  height: 14px;
 }
 </style>

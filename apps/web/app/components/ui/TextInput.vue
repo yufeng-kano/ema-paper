@@ -63,6 +63,10 @@ defineEmits<{ 'update:modelValue': [string] }>()
   transition: border-color var(--duration-fast) var(--ease);
 }
 
+.control:hover:not(:disabled) {
+  border-color: var(--faint);
+}
+
 .control::placeholder {
   color: var(--faint);
 }
@@ -70,6 +74,7 @@ defineEmits<{ 'update:modelValue': [string] }>()
 /* Focus is the app's one ring, from main.css — nothing per-component. */
 .control:disabled {
   background: var(--paper-sunken);
+  border-color: var(--line);
   color: var(--muted);
   cursor: not-allowed;
 }

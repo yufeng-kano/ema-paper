@@ -420,67 +420,6 @@ export interface CreatedApiKey {
   key: string
 }
 
-/**
- * One bucket of `GET /api/usage`. Billed, estimated and unpriced cost never share a field
- * (docs/api.md § Usage aggregates): `cost` is billing only, which today means the
- * historical OpenRouter rows — nothing new is ever billed.
- */
-export interface UsageTotals {
-  calls: number
-  prompt_tokens: number
-  completion_tokens: number
-  cost: number
-  /** What Kano Proxy and connections with `report_cost` reported — an estimate, not a bill. */
-  estimated_cost: number
-  estimated_calls: number
-  /** Calls whose cost nobody reported; counted, never priced as 0. */
-  unpriced_calls: number
-  /** Prompt-cache reads and writes — chat rows only (docs/chat.md § Prompt caching). */
-  cache_read_tokens: number
-  cache_write_tokens: number
-}
-
-export interface UsageDay extends UsageTotals {
-  date: string
-  /** The agents that ran that day (`parse`, `chat`). */
-  agents: string[]
-}
-
-export interface UsageModel extends UsageTotals {
-  model: string
-}
-
-export interface UsageAgent extends UsageTotals {
-  agent: string
-}
-
-export interface UsageResponse {
-  days: number
-  per_day: UsageDay[]
-  per_model: UsageModel[]
-  per_agent: UsageAgent[]
-}
-
-/** One conversation's totals over the period (`GET /api/usage/conversations`). */
-export interface UsageConversation {
-  id: number
-  title: string | null
-  document_id: number | null
-  document_name: string | null
-  turns: number
-  prompt_tokens: number
-  cache_read_tokens: number
-  cache_write_tokens: number
-  completion_tokens: number
-  estimated_cost: number
-  estimated_calls: number
-  unpriced_calls: number
-}
-
-export interface UsageConversationsResponse {
-  conversations: UsageConversation[]
-}
-
 // --- workspace: content, notes, revisions (docs/workspace.md) ------------------
 
 /** The document's editable copy. `revision` is a content hash, not a commit id. */
@@ -1056,14 +995,6 @@ export function updateSubagent(
 
 export function deleteSubagent(name: string): Promise<void> {
   return request<undefined>('DELETE', `/api/subagents/${encodeURIComponent(name)}`)
-}
-
-export function getUsage(days: number): Promise<UsageResponse> {
-  return request('GET', `/api/usage?days=${days}`)
-}
-
-export function getUsageConversations(days: number): Promise<UsageConversationsResponse> {
-  return request('GET', `/api/usage/conversations?days=${days}`)
 }
 
 // --- sandbox (docs/sandbox.md) --------------------------------------------------

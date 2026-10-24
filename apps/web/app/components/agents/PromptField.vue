@@ -65,11 +65,9 @@ function onSaved(saved: SavedAgentSettings) {
 
 /* `UiField`'s label, for a control that is a button rather than a field. */
 .prompt-label {
-  font-size: var(--text-2xs);
+  font-size: var(--text-xs);
   font-weight: var(--weight-semibold);
-  letter-spacing: var(--tracking-label);
-  text-transform: uppercase;
-  color: var(--faint);
+  color: var(--muted);
 }
 
 .prompt-glyph {

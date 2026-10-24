@@ -151,6 +151,11 @@ function writeQuery(patch: Record<string, string | undefined>, replace: boolean)
 
 const currentFolder = ref<FolderId>(queryId(route.query.folder))
 const crumbs = computed(() => folderPath(folders.value, currentFolder.value))
+/** The large title: Home, then each folder down to the open one. */
+const crumbPath = computed(() => [
+  { id: null as FolderId, name: t('files.root') },
+  ...crumbs.value.map((folder) => ({ id: folder.id as FolderId, name: folder.name })),
+])
 
 /** The folder in the URL: a new history entry, or the current one replaced when the folder
  *  went away on its own. */
@@ -1511,7 +1516,7 @@ function announceSelection() {
 
 // --- the keys --------------------------------------------------------------
 
-/** The selection data region: both tabs and the list under them. */
+/** The region the keys belong to: the toolbar, the title and the list under them. */
 const region = ref<HTMLElement | null>(null)
 const listEl = ref<HTMLElement | null>(null)
 
@@ -2221,23 +2226,23 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
 </script>
 
 <template>
-  <UiScreen full>
-    <UiRegion>
-      <input
-        ref="fileInput"
-        class="sr-only"
-        type="file"
-        multiple
-        :accept="accept"
-        @change="onPicked"
-      >
-      <div ref="region" class="library" @pointerdown.capture="onPointerDown">
-        <div class="tabs" role="tablist" :aria-label="t('files.tabs')">
+  <div ref="region" class="library" @pointerdown.capture="onPointerDown">
+    <input
+      ref="fileInput"
+      class="sr-only"
+      type="file"
+      multiple
+      :accept="accept"
+      @change="onPicked"
+    >
+    <UiScreen>
+      <template #toolbar-start>
+        <UiSegmented glass role="tablist" :aria-label="t('files.tabs')">
           <button
             id="files-tab-files"
             type="button"
             role="tab"
-            class="tab"
+            class="segment"
             :class="{ active: view === 'files' }"
             :aria-selected="view === 'files'"
             aria-controls="files-panel"
@@ -2245,15 +2250,14 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
             @click="showView('files')"
             @keydown="onTabKeydown"
           >
-            <UiIcon name="files" />
-            <span>{{ t('files.tabFiles') }}</span>
+            {{ t('files.tabFiles') }}
           </button>
           <!-- Also a drop target: rows dragged here go to the Trash. -->
           <button
             id="files-tab-trash"
             type="button"
             role="tab"
-            class="tab"
+            class="segment"
             :class="{ active: view === 'trash', target: dropTarget === 'trash' }"
             :aria-selected="view === 'trash'"
             aria-controls="files-panel"
@@ -2263,342 +2267,352 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
             @dragover="onTrashTabDragOver"
             @drop="onTrashTabDrop"
           >
-            <UiIcon name="trash" />
-            <span>{{ t('files.tabTrash') }}</span>
+            {{ t('files.tabTrash') }}
             <span v-if="trashTotal" class="tab-count">{{ trashTotal }}</span>
           </button>
-        </div>
+        </UiSegmented>
+      </template>
 
-        <!-- The whole data region is a drop target for files from the desktop; the overlay
-             says which folder they would land in, and nothing else.
+      <!-- The list menu's commonest items, one press away (docs/web.md § Files). -->
+      <template #toolbar>
+        <template v-if="view === 'files'">
+          <UiCapsule :label="t('files.actions')">
+            <UiButton
+              variant="ghost"
+              icon-only
+              :label="t('files.newDocument')"
+              :disabled="busy"
+              @click="createEntry('file')"
+            >
+              <template #icon><UiIcon name="file-plus" /></template>
+            </UiButton>
+            <UiButton
+              variant="ghost"
+              icon-only
+              :label="t('files.newFolder')"
+              :disabled="busy"
+              @click="createEntry('folder')"
+            >
+              <template #icon><UiIcon name="folder-plus" /></template>
+            </UiButton>
+            <UiButton
+              variant="ghost"
+              icon-only
+              :label="t('common.refresh')"
+              :loading="pending"
+              @click="refresh"
+            >
+              <template #icon><UiIcon name="refresh" /></template>
+            </UiButton>
+          </UiCapsule>
+          <UiButton class="upload" variant="primary" size="lg" :label="t('files.upload')" @click="pickFiles(currentFolder)">
+            <template #icon><UiIcon name="upload" /></template>
+            <span class="upload-label">{{ t('files.upload') }}</span>
+          </UiButton>
+        </template>
+        <UiButton v-else variant="danger" size="lg" :disabled="!trashTotal || busy" @click="askEmpty">
+          {{ t('files.emptyTrash') }}
+        </UiButton>
+      </template>
 
-             It is also the open folder's own menu and the selection's keyboard home — which
-             is why it takes a tab stop: with no buttons left on the screen, this is where a
-             keyboard reaches Upload. -->
-        <div
-          id="files-panel"
-          ref="listEl"
-          class="contents"
-          :class="{ 'rows-target': rowsOverList }"
-          role="tabpanel"
-          :aria-labelledby="`files-tab-${view}`"
-          tabindex="0"
-          :aria-activedescendant="activeRow"
-          v-bind="press.on((at) => openListMenu(at))"
-          @click="onListClick"
-          @dragover="onListDragOver"
-          @drop.prevent="onListDrop"
-          @contextmenu.prevent="openListMenu({ x: $event.clientX, y: $event.clientY })"
-          @keydown="onListKeydown"
-        >
-          <UiPanel>
-            <template #title>
-              <!-- Each crumb is also a drop target: dropping a row on the folder you came
-                   from is how a file manager moves something back up a level. -->
-              <h2 v-if="view === 'files'" class="crumbs">
+      <!-- The open folder's breadcrumb is the screen's large title. Each crumb is also a drop
+           target: dropping a row on the folder you came from is how a file manager moves
+           something back up a level. -->
+      <template #title>
+        <UiPageHeader :title="view === 'trash' ? t('files.tabTrash') : undefined">
+          <template v-if="view === 'files'" #title>
+            <span class="crumbs">
+              <template v-for="(crumb, index) in crumbPath" :key="crumb.id ?? 'root'">
+                <UiIcon v-if="index" class="crumb-sep" name="chevron-right" />
                 <button
                   type="button"
                   class="crumb"
-                  :class="{ current: !crumbs.length, target: dropTarget === null }"
-                  :aria-current="!crumbs.length ? 'page' : undefined"
-                  @click="openCrumb(null)"
-                  @dragover="onTargetDragOver($event, null)"
-                  @drop="onTargetDrop(null, $event)"
+                  :class="{ current: index === crumbPath.length - 1, target: dropTarget === crumb.id }"
+                  :aria-current="index === crumbPath.length - 1 ? 'page' : undefined"
+                  @click="openCrumb(crumb.id)"
+                  @dragover="onTargetDragOver($event, crumb.id)"
+                  @drop="onTargetDrop(crumb.id, $event)"
                 >
-                  {{ t('files.root') }}
+                  {{ crumb.name }}
                 </button>
-                <template v-for="(crumb, index) in crumbs" :key="crumb.id">
-                  <UiIcon class="crumb-sep" name="chevron-right" />
-                  <button
-                    type="button"
-                    class="crumb"
-                    :class="{ current: index === crumbs.length - 1, target: dropTarget === crumb.id }"
-                    :aria-current="index === crumbs.length - 1 ? 'page' : undefined"
-                    @click="openCrumb(crumb.id)"
-                    @dragover="onTargetDragOver($event, crumb.id)"
-                    @drop="onTargetDrop(crumb.id, $event)"
-                  >
-                    {{ crumb.name }}
-                  </button>
-                </template>
-              </h2>
-              <h2 v-else class="crumbs">
-                <span class="crumb current">{{ t('files.tabTrash') }}</span>
-              </h2>
-            </template>
+              </template>
+            </span>
+          </template>
+          <span v-if="data" class="tabular">
+            {{
+              view === 'files'
+                ? selection.length > 1
+                  ? t('files.selectedCount', { selected: selection.length, n: rows.length })
+                  : t('files.itemCount', { n: rows.length }, rows.length)
+                : selection.length > 1
+                  ? t('files.selectedCount', { selected: selection.length, n: trashTotal })
+                  : t('files.itemCount', { n: trashTotal }, trashTotal)
+            }}
+          </span>
+        </UiPageHeader>
+      </template>
 
-            <template #meta>
-              <template v-if="view === 'files'">
-                <span v-if="data">
-                  {{
-                    selection.length > 1
-                      ? t('files.selectedCount', { selected: selection.length, n: rows.length })
-                      : t('files.itemCount', { n: rows.length }, rows.length)
-                  }}
-                </span>
-                <UiButton
-                  variant="ghost"
-                  size="xs"
-                  icon-only
-                  :label="t('common.refresh')"
-                  :loading="pending"
-                  @click="refresh"
+      <!-- The whole data region is a drop target for files from the desktop; the overlay
+           says which folder they would land in, and nothing else.
+
+           It is also the open folder's own menu and the selection's keyboard home — which
+           is why it takes a tab stop: this is where a keyboard reaches the list's menu. -->
+      <div
+        id="files-panel"
+        ref="listEl"
+        class="contents"
+        :class="{ 'rows-target': rowsOverList }"
+        role="tabpanel"
+        :aria-labelledby="`files-tab-${view}`"
+        tabindex="0"
+        :aria-activedescendant="activeRow"
+        v-bind="press.on((at) => openListMenu(at))"
+        @click="onListClick"
+        @dragover="onListDragOver"
+        @drop.prevent="onListDrop"
+        @contextmenu.prevent="openListMenu({ x: $event.clientX, y: $event.clientY })"
+        @keydown="onListKeydown"
+      >
+        <UiPanel>
+          <UiBanner v-if="errorMessage" class="state" tone="error">{{ errorMessage }}</UiBanner>
+          <UiBanner v-if="mutationError" class="state" tone="error">
+            {{ mutationError }}
+            <template #actions>
+              <UiButton variant="ghost" size="xs" @click="mutationError = null">
+                {{ t('common.close') }}
+              </UiButton>
+            </template>
+          </UiBanner>
+
+          <!-- The two deletes nothing can undo ask here, not in a dialog: nothing else on
+               the page is held up while the question stands. -->
+          <UiBanner v-if="view === 'trash' && confirming" class="state confirm" tone="error">
+            {{ confirmText }}
+            <template #actions>
+              <UiButton ref="confirmCancel" variant="ghost" size="xs" :disabled="busy" @click="cancelConfirm">
+                {{ t('common.cancel') }}
+              </UiButton>
+              <UiButton variant="danger" size="xs" :loading="busy" @click="confirmDelete">
+                {{ t('files.deleteForGood') }}
+              </UiButton>
+            </template>
+          </UiBanner>
+
+          <UiSkeleton v-if="!data && !errorMessage" class="state" :rows="6" />
+
+          <template v-else-if="data && view === 'files'">
+            <UiEmptyState
+              v-if="!rows.length"
+              :title="currentFolder === null ? t('files.empty') : t('files.emptyFolder')"
+            />
+
+            <UiDataTable
+              v-else
+              role="grid"
+              aria-multiselectable="true"
+              :columns="columns"
+              :rows="rows"
+              :row-key="(row) => row.key"
+              :row-attrs="rowAttrs"
+              :caption="t('files.headTitle')"
+            >
+              <template #cell-name="{ row }">
+                <span
+                  v-if="row.kind === 'upload'"
+                  class="entry pendingup"
+                  :title="row.upload.name"
                 >
-                  <template #icon><UiIcon name="refresh" /></template>
-                </UiButton>
-              </template>
-              <template v-else>
-                <span v-if="data">
-                  {{
-                    selection.length > 1
-                      ? t('files.selectedCount', { selected: selection.length, n: trashTotal })
-                      : t('files.itemCount', { n: trashTotal }, trashTotal)
-                  }}
+                  <UiSpinner />
+                  <span class="entry-name">{{ row.upload.name }}</span>
                 </span>
-                <UiButton variant="danger" size="xs" :disabled="!trashTotal || busy" @click="askEmpty">
-                  {{ t('files.emptyTrash') }}
-                </UiButton>
-              </template>
-            </template>
 
-            <UiBanner v-if="errorMessage" class="state" tone="error">{{ errorMessage }}</UiBanner>
-            <UiBanner v-if="mutationError" class="state" tone="error">
-              {{ mutationError }}
-              <template #actions>
-                <UiButton variant="ghost" size="xs" @click="mutationError = null">
-                  {{ t('common.close') }}
-                </UiButton>
-              </template>
-            </UiBanner>
-
-            <!-- The two deletes nothing can undo ask here, not in a dialog: nothing else on
-                 the page is held up while the question stands. -->
-            <UiBanner v-if="view === 'trash' && confirming" class="state confirm" tone="error">
-              {{ confirmText }}
-              <template #actions>
-                <UiButton ref="confirmCancel" variant="ghost" size="xs" :disabled="busy" @click="cancelConfirm">
-                  {{ t('common.cancel') }}
-                </UiButton>
-                <UiButton variant="danger" size="xs" :loading="busy" @click="confirmDelete">
-                  {{ t('files.deleteForGood') }}
-                </UiButton>
-              </template>
-            </UiBanner>
-
-            <UiSkeleton v-if="!data && !errorMessage" class="state" :rows="6" />
-
-            <template v-else-if="data && view === 'files'">
-              <UiEmptyState
-                v-if="!rows.length"
-                :title="currentFolder === null ? t('files.empty') : t('files.emptyFolder')"
-              />
-
-              <UiDataTable
-                v-else
-                role="grid"
-                aria-multiselectable="true"
-                :columns="columns"
-                :rows="rows"
-                :row-key="(row) => row.key"
-                :row-attrs="rowAttrs"
-                :caption="t('files.headTitle')"
-              >
-                <template #cell-name="{ row }">
-                  <span
-                    v-if="row.kind === 'upload'"
-                    class="entry pendingup"
-                    :title="row.upload.name"
-                  >
-                    <UiSpinner />
-                    <span class="entry-name">{{ row.upload.name }}</span>
+                <span
+                  v-else
+                  class="entry"
+                  :class="{ failed: row.kind === 'file' && row.document.status === 'failed' }"
+                  :title="row.kind === 'folder' ? row.folder.name : row.document.name"
+                >
+                  <UiIcon
+                    :class="{ 'folder-glyph': row.kind === 'folder' }"
+                    :name="row.kind === 'folder' ? 'folder' : row.document.kind === 'image' ? 'image' : 'file-text'"
+                  />
+                  <UiTextInput
+                    v-if="renaming?.key === row.key"
+                    ref="renameField"
+                    v-model="renaming.value"
+                    class="rename"
+                    :aria-label="t('files.nameLabel')"
+                    :maxlength="row.kind === 'folder' ? FOLDER_NAME_MAX : DOCUMENT_NAME_MAX"
+                    :readonly="renaming.busy"
+                    @keydown="onRenameKeydown"
+                    @blur="onRenameBlur"
+                    @click.stop
+                    @dblclick.stop
+                    @contextmenu.stop
+                  />
+                  <span v-else class="entry-name">
+                    {{ row.kind === 'folder' ? row.folder.name : row.document.name }}
                   </span>
+                </span>
+              </template>
 
-                  <span
-                    v-else
-                    class="entry"
-                    :class="{ failed: row.kind === 'file' && row.document.status === 'failed' }"
-                    :title="row.kind === 'folder' ? row.folder.name : row.document.name"
-                  >
-                    <UiIcon
-                      :name="row.kind === 'folder' ? 'folder' : row.document.kind === 'image' ? 'image' : 'file-text'"
-                    />
-                    <UiTextInput
-                      v-if="renaming?.key === row.key"
-                      ref="renameField"
-                      v-model="renaming.value"
-                      class="rename"
-                      :aria-label="t('files.nameLabel')"
-                      :maxlength="row.kind === 'folder' ? FOLDER_NAME_MAX : DOCUMENT_NAME_MAX"
-                      :readonly="renaming.busy"
-                      @keydown="onRenameKeydown"
-                      @blur="onRenameBlur"
-                      @click.stop
-                      @dblclick.stop
-                      @contextmenu.stop
-                    />
-                    <span v-else class="entry-name">
-                      {{ row.kind === 'folder' ? row.folder.name : row.document.name }}
-                    </span>
-                  </span>
-                </template>
-
-                <!-- A markdown document has no parse: no status, pages or size to report. A
-                     re-convert is what a parsed row says while it is on its way or failed:
-                     the version the document has opens all the same. -->
-                <template #cell-status="{ row }">
-                  <span v-if="row.kind === 'file' && row.document.reconvert" class="state-cell">
+              <!-- A markdown document has no parse: no status, pages or size to report. A
+                   re-convert is what a parsed row says while it is on its way or failed:
+                   the version the document has opens all the same. -->
+              <template #cell-status="{ row }">
+                <span v-if="row.kind === 'file' && row.document.reconvert" class="state-cell">
+                  <UiStatusDot
+                    v-if="row.document.reconvert.status === 'failed'"
+                    tone="danger"
+                    :label="t('files.reconvertFailed')"
+                  />
+                  <template v-else>
                     <UiStatusDot
-                      v-if="row.document.reconvert.status === 'failed'"
-                      tone="danger"
-                      :label="t('files.reconvertFailed')"
-                    />
-                    <template v-else>
-                      <UiStatusDot
-                        :tone="row.document.reconvert.status === 'queued' ? 'neutral' : 'info'"
-                        :label="t(row.document.reconvert.checking ? 'files.checking' : 'files.reconverting')"
-                      />
-                      <UiUsageBar
-                        v-if="row.document.reconvert.status === 'running'"
-                        class="meter"
-                        :share="parseProgress(row.document.reconvert)"
-                        :label="
-                          t('files.progress', {
-                            done: row.document.reconvert.pages_done,
-                            total: row.document.reconvert.page_count ?? 0,
-                          })
-                        "
-                      />
-                    </template>
-                  </span>
-                  <span v-else-if="row.kind === 'file' && row.document.status" class="state-cell">
-                    <!-- A failed parse says what a retry would send: its pages without a result;
-                         a running one past its last page, that it is being checked. -->
-                    <UiStatusDot
-                      :tone="STATUS_TONE[row.document.status]"
-                      :label="
-                        row.document.failed_pages
-                          ? t('files.failedPages', { n: row.document.failed_pages }, row.document.failed_pages)
-                          : row.document.checking
-                            ? t('files.checking')
-                            : t(`status.${row.document.status}`)
-                      "
+                      :tone="row.document.reconvert.status === 'queued' ? 'neutral' : 'info'"
+                      :label="t(row.document.reconvert.checking ? 'files.checking' : 'files.reconverting')"
                     />
                     <UiUsageBar
-                      v-if="row.document.status === 'running'"
+                      v-if="row.document.reconvert.status === 'running'"
                       class="meter"
-                      :share="parseProgress(row.document)"
+                      :share="parseProgress(row.document.reconvert)"
                       :label="
                         t('files.progress', {
-                          done: row.document.pages_done,
-                          total: row.document.page_count ?? 0,
+                          done: row.document.reconvert.pages_done,
+                          total: row.document.reconvert.page_count ?? 0,
                         })
                       "
                     />
-                  </span>
-                  <span v-else-if="row.kind === 'upload'" class="muted">
-                    {{ row.upload.state === 'uploading' ? t('files.uploading') : t('files.waiting') }}
-                  </span>
-                </template>
-
-                <template #cell-pages="{ row }">
-                  <template v-if="row.kind === 'file'">
-                    {{
-                      row.document.page_count
-                        ? `${row.document.pages_done}/${row.document.page_count}`
-                        : row.document.pages_done || ''
-                    }}
                   </template>
-                </template>
+                </span>
+                <span v-else-if="row.kind === 'file' && row.document.status" class="state-cell">
+                  <!-- A failed parse says what a retry would send: its pages without a result;
+                       a running one past its last page, that it is being checked. -->
+                  <UiStatusDot
+                    :tone="STATUS_TONE[row.document.status]"
+                    :label="
+                      row.document.failed_pages
+                        ? t('files.failedPages', { n: row.document.failed_pages }, row.document.failed_pages)
+                        : row.document.checking
+                          ? t('files.checking')
+                          : t(`status.${row.document.status}`)
+                    "
+                  />
+                  <UiUsageBar
+                    v-if="row.document.status === 'running'"
+                    class="meter"
+                    :share="parseProgress(row.document)"
+                    :label="
+                      t('files.progress', {
+                        done: row.document.pages_done,
+                        total: row.document.page_count ?? 0,
+                      })
+                    "
+                  />
+                </span>
+                <span v-else-if="row.kind === 'upload'" class="muted">
+                  {{ row.upload.state === 'uploading' ? t('files.uploading') : t('files.waiting') }}
+                </span>
+              </template>
 
-                <template #cell-size="{ row }">
-                  <span class="muted">
-                    <template v-if="row.kind === 'file' && row.document.size_bytes !== null">
-                      {{ formatBytes(row.document.size_bytes, locale) }}
-                    </template>
-                    <template v-else-if="row.kind === 'upload'">
-                      {{ formatBytes(row.upload.size, locale) }}
-                    </template>
+              <template #cell-pages="{ row }">
+                <template v-if="row.kind === 'file'">
+                  {{
+                    row.document.page_count
+                      ? `${row.document.pages_done}/${row.document.page_count}`
+                      : row.document.pages_done || ''
+                  }}
+                </template>
+              </template>
+
+              <template #cell-size="{ row }">
+                <span class="muted">
+                  <template v-if="row.kind === 'file' && row.document.size_bytes !== null">
+                    {{ formatBytes(row.document.size_bytes, locale) }}
+                  </template>
+                  <template v-else-if="row.kind === 'upload'">
+                    {{ formatBytes(row.upload.size, locale) }}
+                  </template>
+                </span>
+              </template>
+
+              <template #cell-added="{ row }">
+                <span class="muted">
+                  <template v-if="row.kind === 'folder'">
+                    {{ formatShortDateTime(row.folder.created_at, locale) }}
+                  </template>
+                  <template v-else-if="row.kind === 'file'">
+                    {{ formatShortDateTime(row.document.created_at, locale) }}
+                  </template>
+                </span>
+              </template>
+            </UiDataTable>
+          </template>
+
+          <template v-else-if="data">
+            <UiEmptyState v-if="!trashRows.length" :title="t('files.trashEmpty')" />
+
+            <UiDataTable
+              v-else
+              role="grid"
+              aria-multiselectable="true"
+              :columns="trashColumns"
+              :rows="trashRows"
+              :row-key="(row) => row.key"
+              :row-attrs="trashRowAttrs"
+              :caption="t('files.trashRegion')"
+            >
+              <template #cell-name="{ row }">
+                <span class="entry" :title="row.kind === 'folder' ? row.folder.name : row.document.name">
+                  <UiIcon
+                    :class="{ 'folder-glyph': row.kind === 'folder' }"
+                    :name="row.kind === 'folder' ? 'folder' : row.document.kind === 'image' ? 'image' : 'file-text'"
+                  />
+                  <span class="entry-name">{{ row.kind === 'folder' ? row.folder.name : row.document.name }}</span>
+                </span>
+              </template>
+
+              <template #cell-origin="{ row }">
+                <span
+                  class="entry origin"
+                  :title="originPath(row.kind === 'folder' ? row.folder.origin : row.document.origin)"
+                >
+                  <UiIcon name="folder" />
+                  <span class="entry-name">
+                    {{ originName(row.kind === 'folder' ? row.folder.origin : row.document.origin) }}
                   </span>
-                </template>
+                </span>
+              </template>
 
-                <template #cell-added="{ row }">
-                  <span class="muted">
-                    <template v-if="row.kind === 'folder'">
-                      {{ formatShortDateTime(row.folder.created_at, locale) }}
-                    </template>
-                    <template v-else-if="row.kind === 'file'">
-                      {{ formatShortDateTime(row.document.created_at, locale) }}
-                    </template>
-                  </span>
-                </template>
-              </UiDataTable>
-            </template>
+              <template #cell-size="{ row }">
+                <span class="muted">
+                  <template v-if="row.kind === 'folder'">
+                    {{ t('files.itemCount', { n: row.folder.items }, row.folder.items) }}
+                  </template>
+                  <template v-else-if="row.document.size_bytes !== null">
+                    {{ formatBytes(row.document.size_bytes, locale) }}
+                  </template>
+                </span>
+              </template>
 
-            <template v-else-if="data">
-              <UiEmptyState v-if="!trashRows.length" :title="t('files.trashEmpty')" />
+              <template #cell-trashed="{ row }">
+                <span class="muted">{{ formatShortDateTime(trashedAt(row), locale) }}</span>
+              </template>
+            </UiDataTable>
+          </template>
+        </UiPanel>
 
-              <UiDataTable
-                v-else
-                role="grid"
-                aria-multiselectable="true"
-                :columns="trashColumns"
-                :rows="trashRows"
-                :row-key="(row) => row.key"
-                :row-attrs="trashRowAttrs"
-                :caption="t('files.trashRegion')"
-              >
-                <template #cell-name="{ row }">
-                  <span class="entry" :title="row.kind === 'folder' ? row.folder.name : row.document.name">
-                    <UiIcon
-                      :name="row.kind === 'folder' ? 'folder' : row.document.kind === 'image' ? 'image' : 'file-text'"
-                    />
-                    <span class="entry-name">{{ row.kind === 'folder' ? row.folder.name : row.document.name }}</span>
-                  </span>
-                </template>
-
-                <template #cell-origin="{ row }">
-                  <span
-                    class="entry origin"
-                    :title="originPath(row.kind === 'folder' ? row.folder.origin : row.document.origin)"
-                  >
-                    <UiIcon name="folder" />
-                    <span class="entry-name">
-                      {{ originName(row.kind === 'folder' ? row.folder.origin : row.document.origin) }}
-                    </span>
-                  </span>
-                </template>
-
-                <template #cell-size="{ row }">
-                  <span class="muted">
-                    <template v-if="row.kind === 'folder'">
-                      {{ t('files.itemCount', { n: row.folder.items }, row.folder.items) }}
-                    </template>
-                    <template v-else-if="row.document.size_bytes !== null">
-                      {{ formatBytes(row.document.size_bytes, locale) }}
-                    </template>
-                  </span>
-                </template>
-
-                <template #cell-trashed="{ row }">
-                  <span class="muted">{{ formatShortDateTime(trashedAt(row), locale) }}</span>
-                </template>
-              </UiDataTable>
-            </template>
-          </UiPanel>
-
-          <!-- Where the files would land. A destination, not an instruction. -->
-          <div v-if="fileOverList" class="dropzone">
-            <div class="dropzone-mark">
-              <UiIcon name="folder-open" />
-              <span>{{ crumbs.length ? crumbs[crumbs.length - 1]!.name : t('files.root') }}</span>
-            </div>
+        <!-- Where the files would land. A destination, not an instruction. -->
+        <div v-if="fileOverList" class="dropzone">
+          <div class="dropzone-mark">
+            <UiIcon name="folder-open" />
+            <span>{{ crumbPath[crumbPath.length - 1]!.name }}</span>
           </div>
-
-          <PaneFoot :hint="false" :back="null" :note="note" @undo="stepHistory('undo')" @hold="holdNote" />
-          <p class="sr-only" role="status" aria-live="polite">{{ liveText }}</p>
         </div>
+
+        <PaneFoot :hint="false" :back="null" :note="note" @undo="stepHistory('undo')" @hold="holdNote" />
+        <p class="sr-only" role="status" aria-live="polite">{{ liveText }}</p>
       </div>
-    </UiRegion>
+    </UiScreen>
 
     <UiContextMenu
       v-if="menu"
@@ -2652,73 +2666,35 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
       :reconvert-note="reconvertNote"
       @close="openDocument = null"
     />
-  </UiScreen>
+  </div>
 </template>
 
 <style scoped>
-/* The tabs over the list, then the list: the list's row is the one that scrolls. */
+/* The page's one box: the screen fills it, and it is the region the keys belong to. */
 .library {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
 }
 
-/* --- Tabs ----------------------------------------------------------------- */
+/* --- Toolbar -------------------------------------------------------------- */
 
-/* Two words over a hairline, the open one inked and underlined: a tab is a place, not a
-   control to commit, so the accent stays out of it. */
-.tabs {
-  display: flex;
-  gap: var(--space-6);
-  padding: var(--space-6) var(--panel-x) 0;
-  border-bottom: 1px solid var(--line-soft);
-}
-
-.tab {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
-  height: var(--control-height);
-  margin-bottom: -1px;
-  padding: 0;
-  border: 0;
-  background: none;
+/* The Trash's count, a step quieter than its name. */
+.tab-count {
   color: var(--muted);
-  font: inherit;
-  font-size: var(--text-sm);
-  cursor: pointer;
-  transition:
-    color var(--duration-fast) var(--ease),
-    box-shadow var(--duration-fast) var(--ease);
-}
-
-.tab :deep(svg) {
-  width: 15px;
-  height: 15px;
-  flex-shrink: 0;
-}
-
-.tab:hover {
-  color: var(--ink);
-}
-
-.tab.active {
-  color: var(--ink);
-  font-weight: var(--weight-medium);
-  box-shadow: inset 0 -2px 0 var(--ink);
+  font-weight: var(--weight-normal);
+  font-variant-numeric: tabular-nums;
 }
 
 /* Lit only while rows are dragged over it — a drop target, so the accent, as a crumb's. */
-.tab.target {
-  color: var(--accent);
-  box-shadow: inset 0 -2px 0 var(--accent);
+.segmented .segment.target {
+  background: var(--accent);
+  color: var(--accent-fg);
 }
 
-.tab-count {
-  color: var(--faint);
-  font-weight: var(--weight-normal);
-  font-variant-numeric: tabular-nums;
+.segmented .segment.target .tab-count {
+  color: inherit;
 }
 
 /* The drop surface: it has to be the box the panel fills, so the overlay can cover exactly
@@ -2730,6 +2706,7 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
   grid-template-rows: minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
+  border-radius: var(--radius-lg);
 }
 
 .contents:focus-visible {
@@ -2739,7 +2716,7 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
 
 /* Rows from another folder over the list they would move into: its edge, as a drop target's. */
 .contents.rows-target {
-  box-shadow: inset 0 0 0 1px var(--accent);
+  box-shadow: inset 0 0 0 2px var(--accent);
 }
 
 .state {
@@ -2748,25 +2725,25 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
 
 /* --- Breadcrumb ----------------------------------------------------------- */
 
-/* The panel's heading, made of the places you can go back to. Same serif and size as any
-   other panel title — it is a title that happens to be clickable. */
+/* The large title, made of the places you can go back to: the open folder in the ink, the
+   ones above it muted, each a button and a drop target. */
 .crumbs {
   display: flex;
   align-items: center;
   gap: var(--space-1);
   min-width: 0;
   overflow: hidden;
-  font-size: var(--display-sm);
-  letter-spacing: normal;
 }
 
 .crumb {
+  min-width: 0;
   max-width: 22ch;
   padding: 0;
   border: none;
   background: none;
   color: var(--muted);
   font: inherit;
+  letter-spacing: inherit;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2775,14 +2752,13 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
 }
 
 .crumb:hover {
-  color: var(--accent);
-}
-
-.crumb.current {
   color: var(--ink);
 }
 
-span.crumb {
+.crumb.current {
+  flex-shrink: 0;
+  max-width: 100%;
+  color: var(--ink);
   cursor: default;
 }
 
@@ -2794,8 +2770,8 @@ span.crumb {
 }
 
 .crumb-sep {
-  width: 14px;
-  height: 14px;
+  width: 20px;
+  height: 20px;
   flex-shrink: 0;
   color: var(--faint);
 }
@@ -2808,7 +2784,7 @@ span.crumb {
 .entry {
   display: flex;
   align-items: center;
-  gap: var(--space-2);
+  gap: 10px;
   max-width: 100%;
   min-width: 0;
   color: var(--ink);
@@ -2823,10 +2799,15 @@ span.crumb {
 }
 
 .entry :deep(svg) {
-  width: 15px;
-  height: 15px;
+  width: 18px;
+  height: 18px;
   flex-shrink: 0;
-  color: var(--faint);
+  color: var(--muted);
+}
+
+/* Folders in the system blue, as Finder colours them. */
+.entry :deep(svg.folder-glyph) {
+  color: var(--accent);
 }
 
 .entry-name {
@@ -2874,10 +2855,25 @@ span.crumb {
   cursor: default;
 }
 
-/* The selected rows: the sidebar's current-row fill, never the accent — selecting commits
-   nothing (docs/web.md § Files). */
+/* The selected rows, as Finder draws them: the accent with white text while the list holds
+   focus, where the keys go; a neutral fill once focus is elsewhere — a dialog, the toolbar —
+   so the selection never vanishes (docs/web.md § Files). */
 .contents :deep(tr.selected) td {
   background: var(--rail-active);
+}
+
+.contents:focus-within :deep(tr.selected) td {
+  background: var(--accent);
+}
+
+.contents:focus-within :deep(tr.selected td),
+.contents:focus-within :deep(tr.selected td *:not(input)) {
+  color: var(--accent-fg);
+}
+
+/* A parse's meter on the accent: its fill would vanish into the row. */
+.contents:focus-within :deep(tr.selected .fill) {
+  background: var(--accent-fg);
 }
 
 /* The row `?document=` pointed at: lit on arrival, then fading back to an ordinary row. */
@@ -2886,15 +2882,15 @@ span.crumb {
 }
 
 .contents :deep(tr.revealed) td {
-  background: var(--rail-active);
+  background: var(--accent-tint);
 }
 
 /* A folder row lit up as a drop target. Inset, so accepting a drop does not move the row. */
 .contents :deep(tr.drop-target) td {
-  background: var(--rail-active);
+  background: var(--accent-tint);
   box-shadow:
-    inset 0 1px 0 var(--accent),
-    inset 0 -1px 0 var(--accent);
+    inset 0 2px 0 var(--accent),
+    inset 0 -2px 0 var(--accent);
 }
 
 /* --- Dropping files from the desktop -------------------------------------- */
@@ -2908,8 +2904,9 @@ span.crumb {
   /* Transparent to the pointer: the drop is handled by the region under it, and a solid
      overlay would swallow the `dragover` that keeps the drag alive. */
   pointer-events: none;
+  border: 2px dashed var(--accent);
+  border-radius: var(--radius-xl);
   background: var(--paper);
-  border: 1px dashed var(--accent);
 }
 
 .dropzone-mark {
@@ -2919,13 +2916,25 @@ span.crumb {
   gap: var(--space-3);
   color: var(--ink);
   font-size: var(--display-xs);
-  font-family: var(--font-display);
+  font-weight: var(--weight-semibold);
 }
 
 .dropzone-mark :deep(svg) {
-  width: 28px;
-  height: 28px;
+  width: 36px;
+  height: 36px;
   color: var(--accent);
+}
+
+/* The label goes before anything else does: under 800px the upload button is its glyph. */
+@media (max-width: 800px) {
+  .upload-label {
+    display: none;
+  }
+
+  .btn.upload {
+    width: var(--control-height-lg);
+    padding: 0;
+  }
 }
 
 @media (max-width: 900px) {

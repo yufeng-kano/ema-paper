@@ -92,14 +92,13 @@ const STATUS_TONE: Record<JobStatus, 'neutral' | 'info' | 'ok' | 'danger'> = {
 
 const STATUSES = ['succeeded', 'running', 'queued', 'failed'] as const
 
-/** The rail's tally. Every status is listed even at zero: an absent row would read as a
-    status this account cannot produce. */
+/** The tally beside the title: the statuses the last jobs are in, the ones with none left out. */
 const tally = computed(() =>
   STATUSES.map((status) => ({
     status,
     tone: STATUS_TONE[status],
     count: data.value?.jobs.filter((job) => job.status === status).length ?? 0,
-  })),
+  })).filter((row) => row.count > 0),
 )
 
 const columns = computed<TableColumn<JobSummary>[]>(() => [
@@ -263,113 +262,103 @@ async function showResult(job: JobSummary) {
 
 <template>
   <UiScreen>
-    <UiRail>
-      <UiPageHeader :eyebrow="t('history.recent', { limit: JOB_LIMIT })" :title="t('history.headTitle')" />
+    <template #toolbar>
+      <UiCapsule :label="t('history.headTitle')">
+        <UiButton variant="ghost" icon-only :label="t('common.refresh')" :loading="pending" @click="refreshAll">
+          <template #icon><UiIcon name="refresh" /></template>
+        </UiButton>
+      </UiCapsule>
+    </template>
 
-      <dl v-if="data" class="tally">
-        <div v-for="row in tally" :key="row.status" class="tally-row" :class="row.tone">
-          <dt>
-            <span class="dot" aria-hidden="true" />
-            {{ t(`status.${row.status}`) }}
-          </dt>
-          <dd class="tabular">{{ row.count }}</dd>
-        </div>
-      </dl>
-    </UiRail>
+    <!-- The tally beside the title: the statuses the last jobs ended in, failures in the
+         danger colour — the one a reader scans for. -->
+    <template #title>
+      <UiPageHeader :title="t('history.headTitle')">
+        <span>{{ t('history.recent', { limit: JOB_LIMIT }) }}</span>
+        <span v-for="row in tally" :key="row.status" class="tally tabular" :class="row.tone">
+          {{ t(`history.tally.${row.status}`, { n: row.count }, row.count) }}
+        </span>
+      </UiPageHeader>
+    </template>
 
-    <UiRegion>
-      <!--
-        One panel filling the region, rows scrolling inside it under a sticky header, so the
-        page itself never grows past the viewport.
+    <!--
+      One panel filling the region, rows scrolling inside it under a sticky header, so the
+      page itself never grows past the viewport.
 
-        A failed refresh keeps the rows it already has — the banner says what went wrong, and
-        blanking the page on top of that helps nobody.
-      -->
-      <UiPanel :title="t('history.listTitle')" lead>
-        <template #meta>
-          <span>{{ t('history.newestFirst') }}</span>
-          <UiButton
-            variant="ghost"
-            size="xs"
-            icon-only
-            :label="t('common.refresh')"
-            :loading="pending"
-            @click="refreshAll"
-          >
-            <template #icon><UiIcon name="refresh" /></template>
-          </UiButton>
+      A failed refresh keeps the rows it already has — the banner says what went wrong, and
+      blanking the page on top of that helps nobody.
+    -->
+    <UiPanel>
+      <UiBanner v-if="errorMessage" class="state" tone="error">{{ errorMessage }}</UiBanner>
+
+      <!-- Not just `!data`: a failed first load leaves data null with `pending` back to
+           false, and an animated skeleton beside a terminal error says the page is still
+           working when it has stopped. -->
+      <UiSkeleton v-if="!data && !errorMessage" class="state" :rows="6" />
+
+      <UiEmptyState
+        v-else-if="data && !data.jobs.length"
+        :title="t('history.empty')"
+        :body="t('history.emptyBody')"
+      />
+
+      <UiDataTable
+        v-else-if="data"
+        :columns="columns"
+        :rows="data.jobs"
+        :row-key="(job) => job.job_id"
+        :caption="t('history.listTitle')"
+        :row-attrs="rowAttrs"
+        :class="{ holding: press.holding.value }"
+      >
+        <!-- The filename is the affordance: it is the row's identity and the thing worth
+             opening, so it carries the underline rather than a separate icon button at the
+             far end of the row. -->
+        <template #cell-file="{ row }">
+          <!-- Not `cell-block`: its `display: block` would put the folder mark on a line of
+               its own. The name clips itself instead. -->
+          <div class="file-cell">
+            <button
+              type="button"
+              class="filename"
+              :class="{ failed: row.status === 'failed' }"
+              :title="row.filename"
+              @click="showResult(row)"
+            >
+              {{ row.filename }}
+            </button>
+            <!-- A fact about the row, not data: faint, and titled with where it lives. -->
+            <span
+              v-if="filedLabels.has(row.job_id)"
+              class="filed"
+              role="img"
+              :title="filedLabels.get(row.job_id)"
+              :aria-label="filedLabels.get(row.job_id)"
+            >
+              <UiIcon name="folder" />
+            </span>
+          </div>
         </template>
+        <template #cell-status="{ row }">
+          <UiStatusDot :tone="STATUS_TONE[row.status]" :label="t(`status.${row.status}`)" />
+        </template>
+        <template #cell-model="{ row }">
+          <span class="model mono">{{ row.model }}</span>
+        </template>
+        <template #cell-pages="{ row }">
+          {{ row.page_count ? `${row.pages_done}/${row.page_count}` : row.pages_done }}
+        </template>
+        <!-- What the parse cost; empty while its reservation is unsettled or for a job from
+             before the ledger (docs/billing.md § Routes). -->
+        <template #cell-credits="{ row }">
+          <span class="tabular">{{ row.credits == null ? '' : formatCount(row.credits, locale) }}</span>
+        </template>
+        <template #cell-created="{ row }">
+          <span class="created">{{ formatShortDateTime(row.created_at, locale) }}</span>
+        </template>
+      </UiDataTable>
+    </UiPanel>
 
-        <UiBanner v-if="errorMessage" class="state" tone="error">{{ errorMessage }}</UiBanner>
-
-          <!-- Not just `!data`: a failed first load leaves data null with `pending` back to
-             false, and an animated skeleton beside a terminal error says the page is still
-             working when it has stopped. -->
-        <UiSkeleton v-if="!data && !errorMessage" class="state" :rows="6" />
-
-        <UiEmptyState
-          v-else-if="data && !data.jobs.length"
-          :title="t('history.empty')"
-          :body="t('history.emptyBody')"
-        />
-
-        <UiDataTable
-          v-else-if="data"
-          :columns="columns"
-          :rows="data.jobs"
-          :row-key="(job) => job.job_id"
-          :caption="t('history.listTitle')"
-          :row-attrs="rowAttrs"
-          :class="{ holding: press.holding.value }"
-        >
-          <!-- The filename is the affordance: it is the row's identity and the thing worth
-               opening, so it carries the underline rather than a separate icon button at the
-               far end of the row. -->
-          <template #cell-file="{ row }">
-            <!-- Not `cell-block`: its `display: block` would put the folder mark on a line of
-                 its own. The name clips itself instead. -->
-            <div class="file-cell">
-              <button
-                type="button"
-                class="filename"
-                :class="{ failed: row.status === 'failed' }"
-                :title="row.filename"
-                @click="showResult(row)"
-              >
-                {{ row.filename }}
-              </button>
-              <!-- A fact about the row, not data: faint, and titled with where it lives. -->
-              <span
-                v-if="filedLabels.has(row.job_id)"
-                class="filed"
-                role="img"
-                :title="filedLabels.get(row.job_id)"
-                :aria-label="filedLabels.get(row.job_id)"
-              >
-                <UiIcon name="folder" />
-              </span>
-            </div>
-          </template>
-          <template #cell-status="{ row }">
-            <UiStatusDot :tone="STATUS_TONE[row.status]" :label="t(`status.${row.status}`)" />
-          </template>
-          <template #cell-model="{ row }">
-            <span class="model mono">{{ row.model }}</span>
-          </template>
-          <template #cell-pages="{ row }">
-            {{ row.page_count ? `${row.pages_done}/${row.page_count}` : row.pages_done }}
-          </template>
-          <!-- What the parse cost; empty while its reservation is unsettled or for a job from
-               before the ledger (docs/billing.md § Routes). -->
-          <template #cell-credits="{ row }">
-            <span class="tabular">{{ row.credits == null ? '' : formatCount(row.credits, locale) }}</span>
-          </template>
-          <template #cell-created="{ row }">
-            <span class="created">{{ formatShortDateTime(row.created_at, locale) }}</span>
-          </template>
-        </UiDataTable>
-      </UiPanel>
-    </UiRegion>
     <!-- A running job answers with its finished pages — a static snapshot here, since this
          page does not poll; reopening refreshes it (docs/api.md § Partial results). -->
     <ResultViewer
@@ -412,63 +401,15 @@ async function showResult(job: JobSummary) {
 </template>
 
 <style scoped>
-.tally {
-  display: flex;
-  flex-direction: column;
-  margin: 0;
+/* The tally beside the title, one status after another. */
+.tally::before {
+  content: '·';
+  margin-right: var(--space-3);
+  color: var(--muted);
 }
 
-.tally-row {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: var(--space-4);
-  padding: var(--space-3) 0;
-  border-top: 1px solid var(--line);
-}
-
-.tally-row:last-child {
-  border-bottom: 1px solid var(--line);
-}
-
-.tally-row dt {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
-  color: var(--ink);
-}
-
-.tally-row dd {
-  margin: 0;
-  font-family: var(--font-display);
-  font-size: var(--display-sm);
-  font-weight: var(--weight-semibold);
-}
-
-.dot {
-  width: 7px;
-  height: 7px;
-  flex-shrink: 0;
-  border-radius: var(--radius-full);
-  background: var(--queued);
-}
-
-.tally-row.ok .dot {
-  background: var(--accent);
-}
-
-.tally-row.info .dot {
-  background: var(--running);
-}
-
-/* Failed is the one state a reader scans for, so it colours the word and the figure too,
-   not only the dot. */
-.tally-row.danger .dot {
-  background: var(--danger);
-}
-
-.tally-row.danger dt,
-.tally-row.danger dd {
+/* Failed is the one state a reader scans for, so its count takes the danger colour. */
+.tally.danger {
   color: var(--danger);
 }
 
@@ -476,8 +417,8 @@ async function showResult(job: JobSummary) {
   margin-top: var(--space-4);
 }
 
-/* A link that happens to be a button: it opens a dialog, so it is a button, but it reads as
-   the filename it is with the underline this design gives a link. */
+/* A link that happens to be a button: it opens a dialog, so it is a button. It reads as the
+   filename it is, in the ink, and turns the link's accent under the pointer. */
 .filename {
   min-width: 0;
   overflow: hidden;
@@ -485,25 +426,20 @@ async function showResult(job: JobSummary) {
   white-space: nowrap;
   padding: 0;
   border: none;
-  border-bottom: 1px solid var(--edge);
   background: none;
   color: var(--ink);
   font: inherit;
   text-align: left;
   cursor: pointer;
-  transition:
-    color var(--duration-fast) var(--ease),
-    border-color var(--duration-fast) var(--ease);
+  transition: color var(--duration-fast) var(--ease);
 }
 
 .filename:hover {
   color: var(--accent);
-  border-color: var(--accent);
 }
 
 .filename.failed {
   color: var(--danger);
-  border-color: var(--danger-edge);
 }
 
 /* A held row is not selected: a long press that starts a text selection cannot become a

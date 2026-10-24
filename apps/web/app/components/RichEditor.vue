@@ -1436,7 +1436,6 @@ defineExpose({
 }
 
 .rich :deep(.md-table th p) {
-  text-transform: uppercase;
 }
 
 /* A formula is one object: it highlights as a whole and opens on a click. */

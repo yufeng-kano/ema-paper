@@ -39,6 +39,12 @@ const props = withDefaults(
      * are the two routes that would otherwise go around them.
      */
     busy?: boolean
+    /**
+     * The close drawn as a round back button at the header's left rather than an X at its
+     * right — the reader's, a screen you go back from rather than a box you dismiss
+     * (docs/web.md § Result viewer).
+     */
+    back?: boolean
   }>(),
   { size: 'sm' },
 )
@@ -149,7 +155,19 @@ onBeforeUnmount(() => {
         :aria-label="title"
         tabindex="-1"
       >
-        <header class="panel-head">
+        <header class="panel-head" :class="{ back }">
+          <UiButton
+            v-if="back"
+            class="panel-back"
+            variant="ghost"
+            size="lg"
+            icon-only
+            :disabled="busy"
+            :label="t('common.close')"
+            @click="emit('close')"
+          >
+            <template #icon><UiIcon name="chevron-left" /></template>
+          </UiButton>
           <div class="panel-heading">
             <slot name="title">
               <h2 class="panel-title">{{ title }}</h2>
@@ -158,8 +176,9 @@ onBeforeUnmount(() => {
           <div class="panel-actions">
             <slot name="actions" />
             <UiButton
+              v-if="!back"
               class="panel-close"
-              variant="ghost"
+              variant="secondary"
               size="sm"
               icon-only
               :disabled="busy"
@@ -206,9 +225,20 @@ onBeforeUnmount(() => {
   /* Never taller than the viewport: the body scrolls, the header and footer stay, so the
      confirm button is always reachable without hunting for it. */
   max-height: min(760px, calc(100dvh - var(--space-10)));
+  /* Solid, as a sheet is: a dialog is content, and glass is for what floats over content
+     (docs/web.md § Design system). Clipped to its corners so a body's own surface (the
+     settings dialog's section list) follows them. */
+  overflow: hidden;
   background: var(--paper);
-  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-xl);
   box-shadow: var(--shadow-dialog);
+  animation: rise var(--duration-slow) var(--ease-enter);
+}
+
+/* The panel takes focus on open only to hold it inside the dialog: it is the dialog, not a
+   control, and a ring around the whole sheet would say otherwise. */
+.panel:focus-visible {
+  outline: none;
 }
 
 .panel.sm {
@@ -235,7 +265,9 @@ onBeforeUnmount(() => {
 
 .panel.full {
   max-width: none;
-  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  animation: none;
 }
 
 .panel.tall.full {
@@ -263,8 +295,53 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: space-between;
   gap: var(--space-4);
-  padding: var(--space-5) var(--space-6);
-  border-bottom: 1px solid var(--line);
+  padding: var(--space-4) var(--space-4) var(--space-3) var(--space-6);
+}
+
+/*
+ * The reader's header: its controls float on the page, the back button at the left and the
+ * capsule at the right, with the title centred between them — centred on the window while
+ * the two sides leave it room, pushed off centre rather than under a control when they do
+ * not. Each side track is at least its own width.
+ */
+.panel-head.back {
+  display: grid;
+  grid-template-columns: minmax(max-content, 1fr) minmax(0, auto) minmax(max-content, 1fr);
+  padding: 14px var(--space-4) var(--space-4);
+}
+
+.panel-head.back .panel-heading {
+  text-align: center;
+}
+
+.panel-head.back .panel-actions {
+  justify-content: flex-end;
+}
+
+/* A round glass button, the only control on its side. */
+.panel-back {
+  justify-self: start;
+  background: var(--glass);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  box-shadow: var(--shadow-glass);
+  color: var(--ink);
+}
+
+.panel-back:hover {
+  background: var(--glass);
+  color: var(--accent);
+}
+
+.panel-back :deep(svg) {
+  width: 20px;
+  height: 20px;
+}
+
+@supports not (backdrop-filter: blur(1px)) {
+  .panel-back {
+    background: var(--paper);
+  }
 }
 
 .panel-heading {
@@ -278,8 +355,9 @@ onBeforeUnmount(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: var(--display-sm);
-  letter-spacing: normal;
+  font-size: var(--display-xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-heading);
 }
 
 .panel-actions {
@@ -289,11 +367,14 @@ onBeforeUnmount(() => {
   flex-shrink: 0;
 }
 
-/* The one glyph in the app that is bigger than its button's size class would give it: at
-   13px an X in a 30px box reads as a speck. */
+/* The sheet's close, as the system draws it: a gray disc with a small X. */
+.panel-close {
+  color: var(--muted);
+}
+
 .panel-close :deep(svg) {
-  width: 16px;
-  height: 16px;
+  width: 15px;
+  height: 15px;
 }
 
 .panel-body {
@@ -302,7 +383,7 @@ onBeforeUnmount(() => {
   min-width: 0;
   overflow: auto;
   overscroll-behavior: contain;
-  padding: var(--space-6);
+  padding: var(--space-2) var(--space-6) var(--space-6);
 }
 
 .panel.tall .panel-body {
@@ -317,13 +398,20 @@ onBeforeUnmount(() => {
   display: flex;
   justify-content: flex-end;
   gap: var(--space-2);
-  padding: var(--space-4) var(--space-6);
-  border-top: 1px solid var(--line);
+  padding: var(--space-3) var(--space-6) var(--space-5);
 }
 
 @keyframes fade {
   from {
     opacity: 0;
+  }
+}
+
+/* A sheet arrives: a few pixels of rise and scale, never a slide across the screen. */
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
   }
 }
 
@@ -342,8 +430,13 @@ onBeforeUnmount(() => {
     /* `dvh`, not `vh`: the dynamic viewport shrinks when the on-screen keyboard opens, so a
        focused field stays above it instead of being covered by it. */
     max-height: 92dvh;
-    border-bottom: none;
+    border-radius: var(--radius-xl) var(--radius-xl) 0 0;
     animation: sheet var(--duration-slow) var(--ease-enter);
+  }
+
+  .panel.full {
+    border-radius: 0;
+    animation: none;
   }
 
   .panel.tall {

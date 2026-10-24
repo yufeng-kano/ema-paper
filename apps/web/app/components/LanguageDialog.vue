@@ -54,23 +54,23 @@ const switchLocalePath = useSwitchLocalePath()
   align-items: center;
   gap: 0 var(--space-2);
   padding: var(--space-3) var(--space-4);
-  border-radius: var(--radius);
+  border-radius: var(--radius-lg);
   color: var(--ink);
   text-decoration: none;
   transition: background var(--duration-fast) var(--ease);
 }
 
 .option:hover {
-  background: var(--paper-sunken);
+  background: var(--fill-weak);
 }
 
-/* The one you are on: the same selected-row surface the nav and the tree use, not a colour
-   of its own. */
+/* The one you are on: the same fill the sidebar's open row has, not a colour of its own. */
 .option.current {
-  background: var(--rail-active);
+  background: var(--fill);
 }
 
 .native {
+  grid-column: 1;
   overflow: hidden;
   font-size: var(--text-base);
   text-overflow: ellipsis;
@@ -86,7 +86,10 @@ const switchLocalePath = useSwitchLocalePath()
   white-space: nowrap;
 }
 
+/* At the right of both lines: placed by hand, since an item with only a row would take the
+   first column and push the name out of it. */
 .mark {
+  grid-column: 2;
   grid-row: 1 / span 2;
   width: 15px;
   height: 15px;

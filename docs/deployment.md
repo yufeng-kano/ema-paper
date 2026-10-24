@@ -95,14 +95,14 @@ The policy, one line in the Caddyfile:
 
 ```text
 default-src 'self'; script-src 'self' 'unsafe-inline';
-style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;
-font-src 'self' data: https://fonts.gstatic.com;
+style-src 'self' 'unsafe-inline'; font-src 'self' data:;
 img-src 'self' data: blob: https://*.googleusercontent.com;
 connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'
 ```
 
 - `script-src 'unsafe-inline'`: Nuxt writes inline scripts into every page — the import map and `window.__NUXT__.config` — and their content changes with each build, so a hash list here would break on the next build. Scripts still load from this origin only. A strict policy (nonces from the Nitro renderer, hashes for the prerendered pages) is a separate step.
-- `style-src 'unsafe-inline'`: KaTeX sets math with `style` attributes, Nuxt inlines component styles, and the OAuth consent page carries its own `<style>`. Source Serif 4 comes from Google Fonts: the stylesheet from `fonts.googleapis.com`, the font files from `fonts.gstatic.com` ([web.md](./web.md) § Design system — Graphite). KaTeX's own fonts are bundled.
+- `style-src 'unsafe-inline'`: KaTeX sets math with `style` attributes, Nuxt inlines component styles, and the OAuth consent page carries its own `<style>`.
+- `font-src 'self' data:`: the app sets type in the system's own face ([web.md](./web.md) § Design system — light glass), so no font host is listed. KaTeX's fonts are bundled.
 - `img-src`: `https://*.googleusercontent.com` is the account's Google profile picture (Settings → Account), which loads from Google's own host. `blob:` is the composer's preview of a pasted or attached image (an object URL), `data:` inline images. A remote image in a document is not rendered (it stays text), so no other host is listed.
 - `connect-src 'self'`: the app calls only its own origin — `/api/*`, `/v1/*` and their SSE streams.
 - No `form-action`: the consent screen's form posts to `/oauth/authorize`, which redirects to the connector's `redirect_uri` — another origin, or `http://localhost` for a CLI client — and browsers hold that redirect to `form-action` too. Checkout and the portal are full-page navigations to Kano Pay, which no directive restricts.

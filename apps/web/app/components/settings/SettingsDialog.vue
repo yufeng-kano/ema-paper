@@ -43,7 +43,9 @@ function close() {
           :aria-current="section === entry.key ? 'page' : undefined"
           @click="open(entry.key)"
         >
-          <UiIcon :name="entry.icon" />
+          <span class="section-glyph" :style="{ background: `var(${entry.tint})` }" aria-hidden="true">
+            <UiIcon :name="entry.icon" />
+          </span>
           <span class="section-label">{{ t(`settings.sections.${entry.key}`) }}</span>
         </button>
       </nav>
@@ -51,11 +53,10 @@ function close() {
       <div class="column">
         <SettingsGeneralSection v-if="section === 'general'" />
         <SettingsAccountSection v-else-if="section === 'account'" />
-        <SettingsBillingSection v-else-if="section === 'billing'" />
+        <SettingsUsageSection v-else-if="section === 'usage'" />
         <SettingsAgentSection v-else-if="section === 'agent'" />
         <SettingsKeysSection v-else-if="section === 'keys'" />
         <SettingsMcpSection v-else-if="section === 'mcp'" />
-        <SettingsUsageSection v-else-if="section === 'usage'" />
       </div>
     </div>
   </UiModal>
@@ -69,6 +70,7 @@ function close() {
   grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
   height: 100%;
   min-height: 0;
+  border-top: 1px solid var(--line);
 }
 
 /* --- The section list -------------------------------------------------------- */
@@ -78,47 +80,61 @@ function close() {
   flex-direction: column;
   gap: 2px;
   min-height: 0;
-  padding: var(--space-5) var(--space-4);
+  padding: var(--space-3) var(--space-3);
   background: var(--rail);
   border-right: 1px solid var(--line);
   overflow-y: auto;
 }
 
-/* The sidebar's nav row, exactly: a fill and a weight step say "open", nothing else. */
+/* The sidebar's nav row: a fill and a weight step say "open", nothing else. */
 .section-item {
   display: flex;
   align-items: center;
   gap: 10px;
-  height: var(--control-height-sm);
-  padding: 0 var(--space-2) 0 10px;
+  height: var(--control-height);
+  padding: 0 var(--space-2);
   border: 0;
-  border-radius: var(--radius);
+  border-radius: var(--radius-md);
   background: transparent;
-  color: var(--muted);
+  color: var(--ink);
   font-size: var(--text-sm);
   text-align: left;
   white-space: nowrap;
   cursor: pointer;
-  transition:
-    background var(--duration-fast) var(--ease),
-    color var(--duration-fast) var(--ease);
+  transition: background var(--duration-fast) var(--ease);
 }
 
 .section-item:hover {
-  background: var(--rail-active);
-  color: var(--ink);
+  background: var(--fill-weak);
 }
 
 .section-item.active {
-  background: var(--rail-active);
-  color: var(--ink);
+  background: var(--fill);
   font-weight: var(--weight-semibold);
 }
 
-.section-item :deep(svg) {
+/* The glyph white on its section's own color, a small rounded square. */
+.section-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  border-radius: var(--radius-sm);
+  color: var(--accent-fg);
+  box-shadow: inset 0 1px 0 var(--accent-highlight);
+}
+
+.section-glyph :deep(svg) {
   width: 15px;
   height: 15px;
-  flex-shrink: 0;
+}
+
+.section-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* --- The content column ------------------------------------------------------- */
@@ -126,14 +142,14 @@ function close() {
 .column {
   min-width: 0;
   min-height: 0;
-  padding: var(--space-8) var(--space-10) var(--space-12);
+  padding: var(--space-6) var(--space-8) var(--space-12);
   overflow-y: auto;
   overscroll-behavior: contain;
 }
 
 /* The section's content is a reading column, not a full-width data region. */
 .column > :deep(.section) {
-  max-width: 760px;
+  max-width: 720px;
 }
 
 @media (max-width: 900px) {
@@ -147,7 +163,7 @@ function close() {
   .sections {
     flex-direction: row;
     gap: var(--space-1);
-    padding: var(--space-3) var(--space-3);
+    padding: var(--space-2) var(--space-3);
     border-right: 0;
     border-bottom: 1px solid var(--line);
     overflow-x: auto;
@@ -160,7 +176,7 @@ function close() {
   }
 
   .column {
-    padding: var(--space-6) var(--space-4) var(--space-10);
+    padding: var(--space-5) var(--space-4) var(--space-10);
   }
 }
 </style>

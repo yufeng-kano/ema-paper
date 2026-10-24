@@ -10,8 +10,9 @@
      inset rule rather than a border (a sticky cell's border scrolls away from the cell).
   3. Alignment — numeric columns are right-aligned with tabular numerals, header and cells
      together, declared once per column rather than re-specified per cell.
-  4. Rhythm — the first column sits flush with the panel's gutter and every column after it
-     takes the same left padding, so the eye has one left edge per column.
+  4. Rhythm — Finder's list: every row the same height, every cell set in from the row's
+     rounded ends by the same padding, every other row on its own faint fill, so the eye
+     follows a row across without a rule under each one.
 
   Cells render through a per-column slot named `cell-<key>`, falling back to the column's
   `value()`. A row can also carry attributes of its own through `rowAttrs` — what the file
@@ -91,44 +92,54 @@ defineSlots<Record<string, (props: { row: Row }) => unknown>>()
   top: 0;
   z-index: 1;
   height: var(--control-height-sm);
-  padding: 0;
+  padding: 0 var(--cell-x);
   text-align: left;
   vertical-align: middle;
-  font-size: var(--text-3xs);
-  font-weight: var(--weight-semibold);
-  text-transform: uppercase;
-  letter-spacing: var(--tracking-label);
-  color: var(--faint);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  color: var(--muted);
   /* Opaque, not translucent: rows scrolling under a semi-transparent header smear into the
-     labels. It inherits the panel's surface so a sunken panel's header matches it. */
-  background: inherit;
+     labels. Every list sits on paper. */
+  background: var(--paper);
   /* An inset shadow, not `border-bottom`: a sticky cell's border scrolls away independently
      of the cell itself, leaving the header floating unruled. */
-  box-shadow: inset 0 -1px 0 var(--line-strong);
+  box-shadow: inset 0 -1px 0 var(--line);
 }
 
 .table td {
-  padding: var(--cell-y) 0;
-  border-bottom: 1px solid var(--line-soft);
+  height: var(--row-height);
+  padding: 0 var(--cell-x);
   vertical-align: middle;
   color: var(--ink);
 }
 
 .table.tight td {
-  padding: var(--cell-y-tight) 0;
+  height: var(--row-height-tight);
 }
 
-/* Every column after the first is set in from the one before it; the first sits on the
-   panel's own gutter so the table has the same left edge as the heading above it. */
-.table th + th,
-.table td + td {
-  padding-left: var(--cell-x);
+/* A breath between the header's rule and the first row. */
+.table tbody tr:first-child td {
+  border-top: var(--space-1) solid transparent;
+  background-clip: padding-box;
 }
 
-/* The panel's bottom padding is the space under the table — a rule there would read as a
-   line under the panel rather than between two rows. */
-.table tbody tr:last-child td {
-  border-bottom: none;
+/* Every other row on a faint fill, its ends rounded, as Finder's list draws it. The parity
+   sits in `:where()` so it adds no weight: a caller's row states (Files' selection, drop
+   target) must win over the stripe on even rows too. */
+.table tbody tr:where(:nth-child(even)) td {
+  background: var(--row-alt);
+}
+
+.table td:first-child {
+  border-radius: var(--radius-md) 0 0 var(--radius-md);
+}
+
+.table td:last-child {
+  border-radius: 0 var(--radius-md) var(--radius-md) 0;
+}
+
+.table td:only-child {
+  border-radius: var(--radius-md);
 }
 
 /*

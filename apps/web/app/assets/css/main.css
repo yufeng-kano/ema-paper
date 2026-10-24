@@ -1,5 +1,6 @@
 /**
- * Graphite design tokens and the small set of genuinely global rules (docs/web.md).
+ * Design tokens of the light-glass system and the small set of genuinely global rules
+ * (docs/web.md § Design system).
  *
  * Everything visual is a token: color, spacing, radius, type, motion. A raw hex, a raw
  * `padding: 13px`, or a raw `font-size: 15px` inside a component is the same class of bug
@@ -12,97 +13,145 @@
  * Light and dark are both first-class: every color token below is one `light-dark()` pair,
  * resolved by `color-scheme` — the system's choice, or the one the reader pinned in the
  * settings dialog (`data-theme` on <html>) — and nothing outside this block names a color.
- * The light values are the design's own; the dark values are the same ramp inverted, since
- * the palette this system was handed is a light one.
+ * The light values are Apple's light appearance, the dark values its dark one: the same
+ * structure in both, not an inversion.
  */
 
 :root {
   color-scheme: light dark;
 
   /* --- Color: surfaces ----------------------------------------------------
-     Paper is the page and every control on it; sunken is the lower panel of a split
-     region; rail is the nav column and the viewer's page list; desk is what shows outside
-     the app frame. */
-  --paper: light-dark(#fcfcfd, #16191d);
-  --paper-sunken: light-dark(#f7f8f9, #121519);
-  --rail: light-dark(#f2f4f6, #1b1f24);
-  --rail-active: light-dark(#e6eaee, #272c33);
-  --desk: light-dark(#eceef0, #0e1114);
+     Paper is the window and every content surface on it; sunken is a grouped list, an
+     inline code span, a second panel; rail is a row's hover and the opaque fallback of the
+     glass panes; rail-active a selected row; desk is what shows outside the app frame. */
+  --paper: light-dark(#ffffff, #1c1c1e);
+  --paper-sunken: light-dark(#f5f5f7, #2c2c2e);
+  --rail: light-dark(#f2f2f5, #2c2c2e);
+  --rail-active: light-dark(#e8e8ed, #3a3a3c);
+  --desk: light-dark(#f5f5f7, #000000);
 
   /* --- Color: text --------------------------------------------------------
-     Four steps, each clearing WCAG AA (4.5:1) on --paper: ink for headings and primary
-     text, ink-soft for long-form body, muted for secondary, faint for the uppercase
-     labels and captions. */
-  --ink: light-dark(#15181c, #eef1f4);
-  --ink-soft: light-dark(#2f343a, #d3d8dd);
-  --muted: light-dark(#4b5157, #aeb6bd);
-  --faint: light-dark(#5c636a, #949ca4);
+     Four steps, each clearing WCAG AA (4.5:1) on --paper: ink for titles and primary text,
+     ink-soft for long-form body, muted for secondary, faint for captions and quiet glyphs. */
+  --ink: light-dark(#1d1d1f, #f5f5f7);
+  --ink-soft: light-dark(#333336, #e5e5ea);
+  --muted: light-dark(#6e6e73, #98989d);
+  --faint: light-dark(#76767b, #8e8e93);
 
   /* --- Color: rules -------------------------------------------------------
-     Structure is carried by hairlines, not by card outlines, so the ramp is finer than a
-     card system needs: line divides columns and panels, line-soft separates table rows,
-     line-strong underlines a sticky header and bounds a dialog, hair rules inside a panel,
-     edge is a control's own border. */
-  --line: light-dark(#e4e8ec, #272c32);
-  --line-soft: light-dark(#eaedf0, #23282e);
-  --line-strong: light-dark(#dfe3e7, #333941);
-  --hair: light-dark(#e0e5ea, #2c323a);
-  --edge: light-dark(#cdd3d9, #454c55);
+     Separators, the system's own grays: line between rows and regions, line-soft inside a
+     dense list, line-strong under a sticky header, hair inside a panel, edge a field's own
+     border. */
+  --line: light-dark(#e5e5ea, #38383a);
+  --line-soft: light-dark(#ededf0, #303032);
+  --line-strong: light-dark(#d2d2d7, #48484a);
+  --hair: light-dark(#e5e5ea, #38383a);
+  --edge: light-dark(#d2d2d7, #545458);
+
+  /* The system's translucent fills: behind a secondary button, a chip, a segmented
+     control's track, an icon button's hover. Translucent, so they read the same on paper,
+     on a grouped list and on glass. */
+  --fill-weak: light-dark(rgb(118 118 128 / 8%), rgb(118 118 128 / 16%));
+  --fill: light-dark(rgb(118 118 128 / 12%), rgb(118 118 128 / 24%));
+  --fill-strong: light-dark(rgb(118 118 128 / 20%), rgb(118 118 128 / 34%));
+  /* Every other row of a list, as Finder draws one. */
+  --row-alt: light-dark(#f7f7f9, rgb(255 255 255 / 3.5%));
 
   /* --- Color: accent ------------------------------------------------------
-     Data only. Cost figures, meters, the brand mark, primary buttons, the succeeded dot,
-     active page markers, the active locale's underline, focus rings. Never a heading,
-     never a border, never decoration (docs/web.md § Design system). */
-  --accent: light-dark(#17607d, #6aa9c4);
-  --accent-fg: light-dark(#fcfcfd, #10161a);
-  --accent-hover: light-dark(#124f68, #8bbed4);
+     The system blue marks what is chosen, pressed or about to be committed: primary
+     buttons, the selected row of a focused list, a toggle that is on, the sidebar's glyphs,
+     links, meters, focus rings. Never a heading, a border or body text (docs/web.md §
+     Design system). */
+  --accent: light-dark(#0071e3, #0a84ff);
+  --accent-fg: #ffffff;
+  --accent-hover: light-dark(#0077ed, #409cff);
+  /* A toggle that is on, a chosen option: the accent at a tint, the glyph in the accent. */
+  --accent-tint: light-dark(rgb(0 113 227 / 12%), rgb(10 132 255 / 22%));
+  /* The faint top highlight a filled system button carries. */
+  --accent-highlight: rgb(255 255 255 / 18%);
 
   /* --- Color: status ------------------------------------------------------
-     Succeeded is the accent itself — it is the only status that is also data. */
-  --running: #6f9ab1;
-  --queued: light-dark(#9aa3ab, #79828b);
-  --danger: light-dark(#a3341f, #e08b76);
-  --danger-edge: light-dark(#e0b6ac, #6d3628);
-  --danger-hover: light-dark(#f7f0ee, #221715);
+     Apple's status hues, each a dot beside a word, never the only signal. The danger red is
+     the system's high-contrast one, so its text clears AA on paper. */
+  --success: light-dark(#28a745, #30d158);
+  --running: light-dark(#0b8fc9, #64d2ff);
+  --queued: light-dark(#aeaeb2, #636366);
+  --danger: light-dark(#d70015, #ff6961);
+  --danger-edge: light-dark(#f2b8b5, #6b2a27);
+  --danger-hover: light-dark(rgb(215 0 21 / 8%), rgb(255 105 97 / 14%));
+  --danger-tint: light-dark(rgb(215 0 21 / 7%), rgb(255 105 97 / 12%));
 
   /* --- Color: find --------------------------------------------------------
      The result viewer's search. Every hit takes the accent as a wash and the one you are
      on takes it solid, because "where am I in 40 hits" is the question the bar exists to
-     answer. The accent is data here, not decoration: a hit is a position in a document. */
-  --find: light-dark(rgb(23 96 125 / 18%), rgb(106 169 196 / 26%));
-  --find-current: light-dark(#17607d, #6aa9c4);
-  --find-current-fg: light-dark(#fcfcfd, #10161a);
+     answer. */
+  --find: light-dark(rgb(0 113 227 / 18%), rgb(10 132 255 / 30%));
+  --find-current: light-dark(#0071e3, #0a84ff);
+  --find-current-fg: #ffffff;
   /* A heading an answer's section link scrolled to, washed for a moment so the eye lands
      on it (docs/web.md § The agent panel, *Section links*). */
-  --accent-wash: light-dark(rgb(23 96 125 / 9%), rgb(106 169 196 / 14%));
+  --accent-wash: light-dark(rgb(0 113 227 / 9%), rgb(10 132 255 / 16%));
   /* The result viewer's block selection: neutral, between rail and rail-active, because
      selecting blocks commits nothing and an accent wash already means a place the viewer
      led the reader to (docs/web.md § Design system). */
-  --block-selected: light-dark(#eef1f4, #21262c);
+  --block-selected: light-dark(#ececf0, #333335);
 
   /* --- Color: diff ---------------------------------------------------------
      The agent panel's edit cards: a removed line sits on the danger wash, an added one on
-     the accent wash — the same two hues the rest of the app already gives to "gone" and
-     "data", at a strength text stays readable on (docs/web.md § The agent panel). */
-  --diff-removed: light-dark(rgb(163 52 31 / 9%), rgb(224 139 118 / 14%));
-  --diff-added: light-dark(rgb(23 96 125 / 9%), rgb(106 169 196 / 14%));
+     the accent wash (docs/web.md § The agent panel). */
+  --diff-removed: light-dark(rgb(215 0 21 / 8%), rgb(255 105 97 / 14%));
+  --diff-added: light-dark(rgb(0 113 227 / 9%), rgb(10 132 255 / 16%));
+
+  /* --- Color: section tints ---------------------------------------------------
+     The settings dialog's section list: each glyph white on a small square of its own
+     system color, as the system's settings window draws its list. Decoration beside a
+     label, never the only signal. */
+  --tint-gray: light-dark(#8e8e93, #8e8e93);
+  --tint-blue: light-dark(#007aff, #0a84ff);
+  --tint-green: light-dark(#34c759, #30d158);
+  --tint-purple: light-dark(#af52de, #bf5af2);
+  --tint-orange: light-dark(#ff9500, #ff9f0a);
+  --tint-indigo: light-dark(#5856d6, #5e5ce6);
 
   /* --- Color: interaction -------------------------------------------------- */
-  --overlay: light-dark(rgb(21 24 28 / 42%), rgb(6 8 10 / 62%));
-  /* The only shadow in the system: dialogs, and the sidebar when it is a drawer. A shadow
-     is not a color, so its color is the token that switches with the theme. */
-  --shadow-dialog-color: light-dark(rgb(21 24 28 / 18%), rgb(0 0 0 / 55%));
-  --shadow-dialog: 0 24px 60px var(--shadow-dialog-color);
+  /* The chosen segment of a segmented control, raised off its track: white in light, a
+     lighter gray in dark, as the system draws it. */
+  --segment: light-dark(#ffffff, #636366);
+  --shadow-segment: 0 1px 3px rgb(0 0 0 / 12%), 0 0 0 0.5px rgb(0 0 0 / 4%);
+  /* The pill that resizes a reader card: quiet at rest, darker while held or focused. */
+  --grip: light-dark(rgb(60 60 67 / 28%), rgb(235 235 245 / 30%));
+  --grip-active: light-dark(rgb(60 60 67 / 60%), rgb(235 235 245 / 60%));
+  --overlay: light-dark(rgb(0 0 0 / 22%), rgb(0 0 0 / 50%));
+  --shadow-dialog-color: light-dark(rgb(0 0 0 / 18%), rgb(0 0 0 / 55%));
+  --shadow-dialog-edge: light-dark(rgb(0 0 0 / 8%), rgb(255 255 255 / 10%));
+  --shadow-dialog: 0 0 0 0.5px var(--shadow-dialog-edge), 0 24px 70px var(--shadow-dialog-color);
+
+  /* --- Glass ----------------------------------------------------------------
+     Liquid Glass, held back: only on what floats over the content — toolbar capsules and
+     round buttons, the selection toolbar, and (denser, as panes) the sidebar and the
+     reader's cards. Never on content, never glass on glass (docs/web.md § Design system).
+     Where `backdrop-filter` is unsupported the surfaces are opaque — see `@supports` below
+     each user. */
+  --glass: light-dark(rgb(255 255 255 / 72%), rgb(54 54 58 / 72%));
+  --glass-pane: light-dark(rgb(248 248 250 / 87%), rgb(36 36 38 / 88%));
+  --glass-blur: blur(24px) saturate(180%);
+  --glass-highlight: light-dark(rgb(255 255 255 / 85%), rgb(255 255 255 / 10%));
+  --glass-edge: light-dark(rgb(0 0 0 / 12%), rgb(255 255 255 / 14%));
+  --glass-shadow: light-dark(rgb(0 0 0 / 8%), rgb(0 0 0 / 40%));
+  --pane-edge: light-dark(rgb(0 0 0 / 8%), rgb(255 255 255 / 10%));
+  --pane-shadow: light-dark(rgb(0 0 0 / 10%), rgb(0 0 0 / 45%));
+  --shadow-glass:
+    inset 0 1px 0 var(--glass-highlight), 0 0 0 0.5px var(--glass-edge), 0 4px 14px var(--glass-shadow);
+  --shadow-pane:
+    inset 0 1px 0 var(--glass-highlight), 0 0 0 0.5px var(--pane-edge), 0 14px 40px var(--pane-shadow);
 
   /* --- The context menu ---------------------------------------------------
-     A floating surface, and the one thing in this design that is not flat paper: it is
-     translucent over whatever it covers, hairlined, and rounded, so it reads as hovering
-     above the page rather than cut into it. Its own tokens because nothing else in the app
-     is built this way (docs/web.md § Design system). */
-  --menu-surface: light-dark(rgb(252 252 253 / 98%), rgb(38 43 50 / 98%));
-  --menu-edge: light-dark(rgb(21 24 28 / 14%), rgb(255 255 255 / 12%));
-  --shadow-menu-near: light-dark(rgb(21 24 28 / 8%), rgb(0 0 0 / 40%));
-  --shadow-menu-far: light-dark(rgb(21 24 28 / 16%), rgb(0 0 0 / 50%));
+     The platform's menu: translucent over whatever it covers, hairlined and rounded, lifted
+     by a two-part shadow (docs/web.md § Design system). */
+  --menu-surface: light-dark(rgb(250 250 252 / 84%), rgb(44 44 46 / 86%));
+  --menu-edge: light-dark(rgb(0 0 0 / 10%), rgb(255 255 255 / 12%));
+  --shadow-menu-near: light-dark(rgb(0 0 0 / 8%), rgb(0 0 0 / 40%));
+  --shadow-menu-far: light-dark(rgb(0 0 0 / 14%), rgb(0 0 0 / 50%));
   --shadow-menu:
     0 1px 2px var(--shadow-menu-near), 0 12px 32px var(--shadow-menu-far);
 
@@ -124,61 +173,59 @@
   --space-14: 56px;
 
   /* --- Radius -------------------------------------------------------------
-     A sharp-cornered design: 3px on the things a finger presses, 4px on the sign-in brand
-     mark, and 0 — no token — on panels and dialogs. */
-  --radius: 3px;
-  --radius-mark: 4px;
+     Continuous rounded corners, concentric where one shape holds another: the smaller the
+     thing, the smaller its radius, and controls are capsules (docs/web.md § Design system). */
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius: 8px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 20px;
+  --radius-card: 28px;
   --radius-full: 999px;
-  /* The context menu is the exception the rest of the design does not make: a floating
-     surface is rounded, and its highlighted row is rounded inside it. */
-  --radius-menu: 10px;
-  --radius-menu-item: 6px;
-  /* The agent panel's composer: the one rounded control besides the menu — a field a
-     message is typed into reads as a message, not as a form row. */
-  --radius-composer: 18px;
+  /* The brand mark, an app icon's squircle at the sidebar's size. */
+  --radius-mark: 8px;
+  --radius-menu: 12px;
+  --radius-menu-item: 7px;
+  /* The agent panel's composer field. */
+  --radius-composer: 22px;
 
   /* --- Type ---------------------------------------------------------------
-     Two scales that do different jobs. The UI scale is dense — 10px is the smallest thing
-     that ships (table headers only), 13px is body and table cells. The display scale is
-     the serif: panel headings, metrics, page titles, and the result viewer's headings. */
+     The system font, at the sizes Apple's own web apps use: 14px for UI and table text,
+     12–13px for what is secondary, 11px the smallest thing that ships. */
   --text-3xs: 10px;
   --text-2xs: 11px;
   --text-xs: 12px;
-  --text-sm: 13px;
-  --text-base: 14px;
+  --text-sm: 14px;
+  --text-base: 15px;
+  --text-lg: 17px;
 
   /* The result viewer is the one surface in the app that is a document rather than an
-     interface: read continuously instead of scanned, so it gets its own two sizes rather
-     than borrowing a UI scale tuned for density (docs/web.md § Result viewer). */
-  --text-read: 16px;
-  --text-read-sm: 14px;
+     interface: read continuously instead of scanned, so it gets its own two sizes
+     (docs/web.md § Result viewer). */
+  --text-read: 17px;
+  --text-read-sm: 15px;
 
   --display-2xs: 15px;
   --display-xs: 17px;
   --display-sm: 20px;
   --display-md: 24px;
-  --display-lg: 30px;
+  --display-lg: 28px;
   --display-xl: 34px;
-  --display-2xl: 38px;
-  --display-3xl: 40px;
-  --display-4xl: 44px;
+  --display-2xl: 40px;
+  --display-3xl: 48px;
+  --display-4xl: 56px;
 
   --weight-normal: 400;
   --weight-medium: 500;
   --weight-semibold: 600;
+  --weight-bold: 700;
 
-  /* Negative tracking on the display sizes only — it hurts legibility at 13px. The two
-     positive steps are the uppercase labels, which need the opposite treatment. */
-  --tracking-tight: -0.02em;
+  /* Negative tracking on the display sizes only; text at UI size keeps the font's own. */
+  --tracking-tight: -0.022em;
   --tracking-heading: -0.015em;
-  --tracking-label: 0.1em;
-  --tracking-eyebrow: 0.12em;
-  --tracking-meta: 0.08em;
-  --tracking-facts: 0.14em;
 
-  /* --- Motion -------------------------------------------------------------
-     Color and background only. The design has no motion beyond that: no transforms, no
-     shadow changes, no hover elevation. */
+  /* --- Motion ------------------------------------------------------------- */
   --ease: cubic-bezier(0.33, 0, 0.2, 1);
   --ease-enter: cubic-bezier(0.24, 1, 0.32, 1);
   --ease-exit: cubic-bezier(0.64, 0, 0.8, 0);
@@ -187,39 +234,38 @@
   --duration-slow: 240ms;
 
   /* --- Layout --------------------------------------------------------------
-     Four control heights, every one of them a token: 36px for a primary control, 34px for
-     the sign-in dev button, 30px for nav items and small buttons, 26px for a table-row
-     button and a dialog close. A button beside an input must be the same box, and
-     per-control padding is what makes those drift apart. */
+     Five control heights, every one of them a token: 44px for a toolbar control, 36px for
+     a primary control, 34px for the sign-in dev button, 30px for small buttons and nav
+     items, 26px for a row's button and a gutter control. A button beside an input must be
+     the same box, and per-control padding is what makes those drift apart. */
+  --control-height-lg: 44px;
   --control-height: 36px;
   --control-height-md: 34px;
   --control-height-sm: 30px;
   --control-height-xs: 26px;
 
-  /* The signed-in sidebar's column, and the same value the drawer takes below the shell
-     breakpoint — one number so the two can never disagree. */
+  /* The signed-in sidebar's width, and the inset it floats at — the same value the drawer
+     takes below the shell breakpoint, so the two can never disagree. */
   --sidebar-width: 236px;
-  /* The narrative rail on every signed-in screen. Narrow enough to stay a margin note,
-     wide enough for a 38px figure. */
-  --rail-width: clamp(200px, 20vw, 320px);
-  --rail-pad-y: var(--space-10);
-  --rail-pad-x: var(--space-8);
-  /* The gutter every panel header and body share, so a heading sits over its own column. */
-  --panel-x: var(--space-8);
+  --sidebar-inset: var(--space-4);
+  /* The gutter a screen's title, toolbar and list share. */
+  --panel-x: var(--space-6);
 
-  /* Table rhythm. Two densities — the usage tables are tighter than the jobs and keys
-     tables — plus the left padding every column after the first takes. Tables live in one
-     component, but the rhythm is a system decision, so it is set here. */
-  --cell-y: 13px;
-  --cell-y-tight: 11px;
-  --cell-x: var(--space-6);
+  /* The list rhythm: a 40px row, cells set in from the row's rounded ends. Tables live in
+     one component, but the rhythm is a system decision, so it is set here. */
+  --row-height: 40px;
+  --row-height-tight: 34px;
+  --cell-y: 10px;
+  --cell-y-tight: 7px;
+  --cell-x: var(--space-3);
   /* Below this a table would wrap its cells, which breaks the row rhythm; it scrolls
      horizontally inside its panel instead. */
   --table-min: 720px;
 
-  --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
-    "Noto Sans TC", sans-serif;
-  --font-display: "Source Serif 4", Georgia, "Noto Serif TC", serif;
+  --font: -apple-system, BlinkMacSystemFont, system-ui, "Segoe UI", Roboto, "Helvetica Neue",
+    "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", sans-serif;
+  /* Titles are the same family: SF Pro picks its Display cut by size on its own. */
+  --font-display: var(--font);
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
 }
 
@@ -232,6 +278,7 @@
     --control-height-md: 44px;
     --control-height-sm: 38px;
     --control-height-xs: 32px;
+    --row-height: 44px;
   }
 }
 
@@ -256,23 +303,24 @@
 
 body {
   margin: 0;
-  background: var(--desk);
+  background: var(--paper);
   color: var(--ink);
   font-family: var(--font);
   font-size: var(--text-sm);
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
   -webkit-text-size-adjust: 100%;
 }
 
-/* Headings are the serif — that is the design's one structural typographic decision, so it
-   is made once here rather than per component. */
+/* Titles are bold and tightly tracked, as the system sets them — made once here rather than
+   per component. */
 h1,
 h2,
 h3 {
   margin: 0;
   font-family: var(--font-display);
-  font-weight: var(--weight-semibold);
+  font-weight: var(--weight-bold);
   line-height: 1.2;
   letter-spacing: var(--tracking-tight);
 }
@@ -295,18 +343,17 @@ a {
 }
 
 /* One focus convention for the whole app: a 2px accent ring, never removed, never replaced
-   per component. The accent is the only hue in this palette with the contrast to carry it. */
+   per component. The ring follows the element's own corners — a capsule's, a row's — so the
+   rule sets no radius of its own, which would square off whatever it lands on. */
 :focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
-  border-radius: var(--radius);
 }
 
-/* Scrollbars: thin and quiet, but always present so a scrollable region announces itself —
-   and this design has several of them per screen. */
+/* Scrollbars: thin and quiet, as the system's overlay bars are. */
 * {
   scrollbar-width: thin;
-  scrollbar-color: var(--edge) transparent;
+  scrollbar-color: var(--fill-strong) transparent;
 }
 
 *::-webkit-scrollbar {
@@ -319,7 +366,7 @@ a {
 }
 
 *::-webkit-scrollbar-thumb {
-  background: var(--edge);
+  background: var(--fill-strong);
   border: 3px solid transparent;
   background-clip: content-box;
   border-radius: var(--radius-full);
@@ -357,19 +404,16 @@ a {
   font-variant-numeric: tabular-nums;
 }
 
-/* The uppercase label that names a figure, a field or a section. It appears on every
-   screen, in the rail, in panel headers and inside the result viewer. `.sm` is the step
-   down the result viewer's page markers take. */
+/* The label that names a figure, a field or a group: sentence case, quiet, a step under the
+   text it labels — never tracked capitals. `.sm` is the step down. */
 .eyebrow {
-  font-size: var(--text-2xs);
+  font-size: var(--text-xs);
   font-weight: var(--weight-semibold);
-  letter-spacing: var(--tracking-eyebrow);
-  text-transform: uppercase;
-  color: var(--faint);
+  color: var(--muted);
 }
 
 .eyebrow.sm {
-  font-size: var(--text-3xs);
+  font-size: var(--text-2xs);
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -59,9 +59,12 @@ def _oauth_error(status_code: int, error: str, description: str) -> JSONResponse
 # before they trust us with an account, and a mark that arrives one request later (or not at
 # all, behind a strict connector CSP) is worse than no mark.
 MARK = (
-    "<svg class='mark' viewBox='0 0 32 32' width='28' height='28' aria-hidden='true'>"
-    "<rect width='32' height='32' rx='5' fill='#17607d'/>"
-    "<g fill='none' stroke='#fcfcfd' stroke-width='2.2' stroke-linecap='round'"
+    "<svg class='mark' viewBox='0 0 32 32' width='32' height='32' aria-hidden='true'>"
+    "<defs><linearGradient id='mark-fill' x1='0' y1='0' x2='0' y2='1'>"
+    "<stop offset='0' stop-color='#4799eb'/><stop offset='1' stop-color='#0071e3'/>"
+    "</linearGradient></defs>"
+    "<rect width='32' height='32' rx='9' fill='url(#mark-fill)'/>"
+    "<g fill='none' stroke='#ffffff' stroke-width='2.2' stroke-linecap='round'"
     " stroke-linejoin='round'>"
     "<path d='M8 11V9.5A1.5 1.5 0 0 1 9.5 8H11'/>"
     "<path d='M21 8h1.5A1.5 1.5 0 0 1 24 9.5V11'/>"
@@ -72,53 +75,53 @@ MARK = (
     "</svg>"
 )
 
-# The web app's Graphite tokens (apps/web/app/assets/css/main.css), narrowed to what one card
-# needs. Duplicated on purpose: FastAPI renders this page, so it cannot import the Nuxt
-# stylesheet, and pulling one in over the network would make consent depend on the web app
-# being up. The heading names Source Serif 4 without loading it — everything this page needs
-# ships in the document, so it renders in the Georgia fallback rather than blocking consent
-# on a font request a connector webview's CSP may refuse.
+# The web app's tokens (apps/web/app/assets/css/main.css), narrowed to what one card needs.
+# Duplicated on purpose: FastAPI renders this page, so it cannot import the Nuxt stylesheet,
+# and pulling one in over the network would make consent depend on the web app being up.
+# The face is the system's own, so nothing here waits on a font request a connector
+# webview's CSP may refuse.
 PAGE_STYLE = """
 :root{color-scheme:light dark;
---bg:#eceef0;--surface:#fcfcfd;--border:#e4e8ec;--text:#15181c;--muted:#4b5157;--faint:#5c636a;
---accent:#17607d;--accent-fg:#fcfcfd;--accent-hover:#124f68;--hover:#f2f4f6;
---edge:#cdd3d9}
+--bg:#f5f5f7;--surface:#ffffff;--sunken:#f5f5f7;--text:#1d1d1f;--muted:#6e6e73;
+--accent:#0071e3;--accent-fg:#ffffff;--accent-hover:#0077ed;
+--fill:rgb(118 118 128 / 12%);--fill-strong:rgb(118 118 128 / 20%);
+--edge:rgb(0 0 0 / 8%);--shadow:rgb(0 0 0 / 10%)}
 @media(prefers-color-scheme:dark){:root{
---bg:#0e1114;--surface:#16191d;--border:#272c32;--text:#eef1f4;--muted:#aeb6bd;--faint:#949ca4;
---accent:#6aa9c4;--accent-fg:#10161a;--accent-hover:#8bbed4;--hover:#1b1f24;
---edge:#454c55}}
+--bg:#000000;--surface:#1c1c1e;--sunken:#2c2c2e;--text:#f5f5f7;--muted:#98989d;
+--accent:#0a84ff;--accent-hover:#409cff;
+--fill:rgb(118 118 128 / 24%);--fill-strong:rgb(118 118 128 / 34%);
+--edge:rgb(255 255 255 / 10%);--shadow:rgb(0 0 0 / 45%)}}
 *{box-sizing:border-box}
 body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;
 background:var(--bg);color:var(--text);
-font:400 14px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,
-"Noto Sans TC",sans-serif;
+font:400 15px/1.5 -apple-system,BlinkMacSystemFont,system-ui,"Segoe UI",Roboto,
+"Helvetica Neue","PingFang TC","Noto Sans TC",sans-serif;
 -webkit-font-smoothing:antialiased}
-.card{width:100%;max-width:26rem;background:var(--surface);border:1px solid var(--border);
-padding:24px}
+.card{width:100%;max-width:26rem;padding:28px;border-radius:20px;background:var(--surface);
+box-shadow:0 0 0 .5px var(--edge),0 14px 40px var(--shadow)}
 .head{display:flex;align-items:center;gap:12px;margin-bottom:16px}
-.mark{flex:none;border-radius:5px}
-h1{margin:0;font-family:"Source Serif 4",Georgia,serif;font-size:20px;font-weight:600;
-letter-spacing:-0.02em}
+.mark{flex:none}
+h1{margin:0;font-size:20px;font-weight:600;letter-spacing:-0.01em}
 p{margin:0 0 12px}
 strong{font-weight:600}
 .note{color:var(--muted);font-size:13px}
-code{font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-background:var(--hover);border-radius:3px;padding:1px 5px}
+code{font:12px/1.5 ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+background:var(--fill);border-radius:4px;padding:1px 5px}
 /* The billing line is the one fact a user can be surprised by later, so it is set apart
    from the sentence above it rather than buried at the end of it. */
-.terms{margin:16px 0 0;padding:12px;border:1px solid var(--border);
+.terms{margin:16px 0 0;padding:12px 14px;border-radius:14px;background:var(--sunken);
 color:var(--muted);font-size:13px}
-.actions{display:flex;gap:8px;margin-top:20px}
-button{flex:1;height:36px;padding:0 14px;border-radius:3px;cursor:pointer;
+.actions{display:flex;gap:8px;margin-top:24px}
+button{flex:1;height:36px;padding:0 16px;border:0;border-radius:999px;cursor:pointer;
 font:500 14px/1 inherit;font-family:inherit;
-transition:background-color 120ms cubic-bezier(.72,0,.16,1),
-           border-color 120ms cubic-bezier(.72,0,.16,1)}
-@media(pointer:coarse){button{height:40px}}
-button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.approve{border:1px solid var(--accent);background:var(--accent);color:var(--accent-fg)}
-.approve:hover{background:var(--accent-hover);border-color:var(--accent-hover)}
-.deny{border:1px solid var(--edge);background:var(--surface);color:var(--text)}
-.deny:hover{background:var(--hover)}
+transition:background-color 120ms cubic-bezier(.33,0,.2,1)}
+@media(pointer:coarse){button{height:44px}}
+button:focus-visible{outline:3px solid color-mix(in srgb,var(--accent) 45%,transparent);
+outline-offset:1px}
+.approve{background:var(--accent);color:var(--accent-fg)}
+.approve:hover{background:var(--accent-hover)}
+.deny{background:var(--fill);color:var(--text)}
+.deny:hover{background:var(--fill-strong)}
 """
 
 

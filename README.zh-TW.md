@@ -31,7 +31,7 @@
 - **標準化圖表座標提取** — 自動輸出圖表邊界座標（`sightread://p{頁數}/{ymin},{xmin},{ymax},{xmax}`），便於下游 RAG 管道或應用程式精準裁切。
 - **使用自己的帳戶，零加價** — 透過 Kano Proxy 的授權畫面連結帳戶，或用自己的金鑰串接相容 OpenAI 的視覺端點，無訂閱加價或 Token 抽成。
 - **原生支援 AI Agent 與 MCP** — 內建支援 OAuth 2.1 的 Model Context Protocol (MCP) 伺服器，可無縫串接 Claude Desktop、Claude Code 與自動化 Agent。
-- **現代化檔案工作區** — 極簡石墨風格（Graphite）UI，支援多層資料夾、拖曳上傳、即時 SSE 進度串流與雙欄即時對照預覽。
+- **現代化檔案工作區** — Apple 風格介面，克制使用 Liquid Glass，支援多層資料夾、拖曳上傳、即時 SSE 進度串流與雙欄即時對照預覽。
 - **隱私安全優先** — 上傳的原始文件在隔離子程序中處理，任務完成後立即自磁碟永久清除。
 
 ---
@@ -110,7 +110,7 @@ curl -X POST http://localhost:8000/v1/parse \
 | **API 與資料平面** | FastAPI (Python 3.12, `uv`) | 高效能 REST 端點與 SSE 即時串流 |
 | **任務佇列** | PostgreSQL (`SKIP LOCKED`) | 高可靠事務型佇列，無需額外引入 Redis |
 | **PDF 渲染** | Poppler CLI (`pdftoppm`) | 隔離子程序渲染，無 AGPL 授權風險 |
-| **Web 工作區** | Nuxt (Vue 3) + Tailwind CSS | 極簡 Graphite 設計系統、檔案庫與多語系 |
+| **Web 工作區** | Nuxt (Vue 3)，手寫 CSS | 淺色玻璃設計系統、檔案庫與多語系 |
 | **邊緣反向代理** | Caddy | 自動 TLS 憑證管理與 SSE 串流代理 |
 
 ---

@@ -87,11 +87,9 @@ async function toggleAuto() {
 .section-label {
   margin: 0;
   font-family: inherit;
-  font-size: var(--text-2xs);
+  font-size: var(--text-xs);
   font-weight: var(--weight-semibold);
-  letter-spacing: var(--tracking-label);
-  text-transform: uppercase;
-  color: var(--faint);
+  color: var(--muted);
 }
 
 /* The picker and its switch on one row, wrapping on a narrow window. */
@@ -115,11 +113,9 @@ async function toggleAuto() {
 }
 
 .fact-label {
-  font-size: var(--text-2xs);
+  font-size: var(--text-xs);
   font-weight: var(--weight-semibold);
-  letter-spacing: var(--tracking-label);
-  text-transform: uppercase;
-  color: var(--faint);
+  color: var(--muted);
 }
 
 .fact-value {
@@ -136,15 +132,15 @@ async function toggleAuto() {
   color: var(--muted);
 }
 
-/* The memory section's switch: the words, then a square track whose knob says on or off. */
+/* The memory section's switch: the words, then the system's capsule switch. */
 .switch {
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
   height: var(--control-height-sm);
-  padding: 0 var(--space-1) 0 var(--space-2);
+  padding: 0 var(--space-1) 0 var(--space-3);
   border: 0;
-  border-radius: var(--radius);
+  border-radius: var(--radius-full);
   background: transparent;
   color: var(--ink);
   font-size: var(--text-sm);
@@ -153,7 +149,7 @@ async function toggleAuto() {
 }
 
 .switch:hover:not(:disabled) {
-  background: var(--rail);
+  background: var(--fill-weak);
 }
 
 /* Not disabled while it saves — a disabled button drops the keyboard's focus — only busy. */
@@ -170,34 +166,31 @@ async function toggleAuto() {
   position: relative;
   display: inline-block;
   flex-shrink: 0;
-  width: 30px;
-  height: 18px;
-  border: 1px solid var(--muted);
-  border-radius: var(--radius);
-  background: var(--paper);
-  transition:
-    background var(--duration-fast) var(--ease),
-    border-color var(--duration-fast) var(--ease);
+  width: 36px;
+  height: 22px;
+  border-radius: var(--radius-full);
+  background: var(--fill-strong);
+  transition: background var(--duration-fast) var(--ease);
 }
 
 .knob {
   position: absolute;
   top: 2px;
   left: 2px;
-  width: 12px;
-  height: 12px;
-  border-radius: 2px;
-  background: var(--muted);
+  width: 18px;
+  height: 18px;
+  border-radius: var(--radius-full);
+  background: var(--accent-fg);
+  box-shadow: var(--shadow-segment);
+  transition: left var(--duration-fast) var(--ease);
 }
 
 .switch[aria-checked='true'] .track {
-  border-color: var(--accent);
   background: var(--accent);
 }
 
 .switch[aria-checked='true'] .knob {
-  left: 14px;
-  background: var(--accent-fg);
+  left: 16px;
 }
 
 .note {

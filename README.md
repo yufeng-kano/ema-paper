@@ -31,7 +31,7 @@ Connect your Kano Proxy account in one click, or bring your own OpenAI-compatibl
 - **Normalized Figure Coordinates** — Returns visual figure boundaries as normalized `[ymin, xmin, ymax, xmax]` coordinates (`sightread://p{page}/{coords}`) for precise downstream cropping in RAG pipelines.
 - **Zero Markup / Your Own Account** — Connect Kano Proxy through its consent screen, or add any OpenAI-compatible vision endpoint with your own key. No middleman subscription fees or token markups.
 - **Built for AI Agents & MCP** — Native Model Context Protocol (MCP) server with OAuth 2.1 support for Claude Desktop, Claude Code, and autonomous agents.
-- **Modern Web Workspace** — Graphite-themed UI featuring nested folders, drag-and-drop uploads, live SSE progress streaming, and instant side-by-side previews.
+- **Modern Web Workspace** — an Apple-style UI with restrained Liquid Glass, featuring nested folders, drag-and-drop uploads, live SSE progress streaming, and instant side-by-side previews.
 - **Privacy by Default** — Uploaded source documents are processed in isolated subprocesses and purged from disk immediately once parsing completes.
 
 ---
@@ -110,7 +110,7 @@ Or connect it directly in Claude via the OAuth Custom Connector endpoint: `https
 | **API & Data Plane** | FastAPI (Python 3.12, `uv`) | High-performance REST endpoints and SSE streaming |
 | **Task Queue** | PostgreSQL (`SKIP LOCKED`) | Reliable transactional job queue without Redis |
 | **PDF Rendering** | Poppler CLI (`pdftoppm`) | Crash-isolated subprocess rendering (MIT-safe) |
-| **Web Interface** | Nuxt (Vue 3) + Tailwind CSS | Graphite design system, file workspace, i18n |
+| **Web Interface** | Nuxt (Vue 3), hand-rolled CSS | Light-glass design system, file workspace, i18n |
 | **Edge & Proxy** | Caddy | Automatic TLS certificates and SSE reverse proxy |
 
 ---

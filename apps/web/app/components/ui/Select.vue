@@ -36,7 +36,7 @@ defineEmits<{ 'update:modelValue': [string] }>()
   min-width: 0;
   max-width: 100%;
   height: var(--control-height);
-  padding: 0 var(--space-2);
+  padding: 0 var(--space-3);
   border: 1px solid var(--edge);
   border-radius: var(--radius);
   background: var(--paper);
@@ -44,6 +44,10 @@ defineEmits<{ 'update:modelValue': [string] }>()
   font-size: var(--text-sm);
   cursor: pointer;
   transition: border-color var(--duration-fast) var(--ease);
+}
+
+.control:hover:not(:disabled) {
+  border-color: var(--faint);
 }
 
 /* Focus is the app's one ring, from main.css — nothing per-component. */

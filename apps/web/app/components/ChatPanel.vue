@@ -103,6 +103,8 @@ const emit = defineEmits<{
   locate: [target: { label: string; anchor: string }]
   /** An answer block's *Add to notes*: its markdown, for the end of the notes. */
   'to-notes': [markdown: string]
+  /** The head's close: the viewer hides the card. */
+  close: []
 }>()
 
 const { t, locale } = useI18n()
@@ -1380,7 +1382,8 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="chat" @dragenter="onDragEnter" @dragover="onDragOver" @dragleave="onDragLeave" @drop="onDrop">
-    <!-- The conversation's name opens the document's list of them. -->
+    <!-- The conversation's name opens the document's list of them; at the right a new
+         conversation and the close (docs/web.md § The agent panel). -->
     <div class="head">
       <button
         ref="titleButton"
@@ -1394,6 +1397,12 @@ onBeforeUnmount(() => {
         <span class="title-text">{{ current ? title : t('chat.newConversation') }}</span>
         <UiIcon name="chevron-down" />
       </button>
+      <UiButton class="new" variant="ghost" icon-only :label="t('chat.newConversation')" @click="startConversation()">
+        <template #icon><UiIcon name="square-pen" /></template>
+      </UiButton>
+      <UiButton variant="ghost" icon-only :label="t('chat.closePanel')" @click="emit('close')">
+        <template #icon><UiIcon name="panel-right-close" /></template>
+      </UiButton>
     </div>
 
     <UiContextMenu
@@ -1679,33 +1688,46 @@ onBeforeUnmount(() => {
   height: 100%;
 }
 
-/* Ruled off from the thread, so the title reads as the column's heading rather than as the
-   answer's first line (docs/web.md § The agent panel). */
+/* The card's head, as tall as the notes card's: the title is the column's heading, in the
+   card's title size, and the two buttons sit at its right (docs/web.md § The agent panel). */
 .head {
+  display: flex;
+  align-items: center;
+  gap: 2px;
   flex-shrink: 0;
-  padding: var(--space-3);
-  border-bottom: 1px solid var(--line);
+  height: 56px;
+  padding: 0 10px 0 var(--space-2);
 }
 
 .title {
   display: inline-flex;
   align-items: center;
-  gap: var(--space-2);
+  gap: 6px;
+  min-width: 0;
   max-width: 100%;
-  height: var(--control-height-sm);
+  height: var(--control-height);
+  margin-right: auto;
   padding: 0 var(--space-3);
   border: 0;
-  border-radius: var(--radius);
+  border-radius: var(--radius-full);
   background: transparent;
   color: var(--ink);
-  font-size: var(--text-sm);
-  font-weight: var(--weight-medium);
+  font-size: var(--display-xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: -0.01em;
   cursor: pointer;
   transition: background var(--duration-fast) var(--ease);
 }
 
-.title:hover {
-  background: var(--rail);
+.title:hover,
+.title[aria-expanded='true'] {
+  background: var(--fill);
+}
+
+/* A new conversation is the head's one action in the accent; the close stays quiet. */
+.head .new,
+.head .new:hover {
+  color: var(--accent);
 }
 
 .title-text {
@@ -1735,7 +1757,7 @@ onBeforeUnmount(() => {
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
-  padding: var(--space-3) var(--space-5) var(--space-2);
+  padding: var(--space-1) var(--space-5) var(--space-3);
   scrollbar-width: none;
 }
 
@@ -1765,15 +1787,16 @@ onBeforeUnmount(() => {
   gap: 6px;
 }
 
+/* The reader's words in the accent bubble, as a message the reader sent. */
 .user {
-  max-width: 88%;
+  max-width: 78%;
   margin: 0;
-  padding: var(--space-2) var(--space-3);
-  border-radius: var(--radius);
-  background: var(--rail);
-  color: var(--ink);
+  padding: 9px 15px;
+  border-radius: var(--radius-xl);
+  background: var(--accent);
+  color: var(--accent-fg);
   font-size: var(--text-sm);
-  line-height: 1.55;
+  line-height: 1.5;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -1786,10 +1809,10 @@ onBeforeUnmount(() => {
 }
 
 .user-command {
-  padding: 1px 6px;
-  border-radius: var(--radius);
-  background: var(--rail-active);
-  color: var(--ink);
+  padding: 1px 8px;
+  border-radius: var(--radius-full);
+  background: var(--accent-highlight);
+  font-weight: var(--weight-medium);
 }
 
 .user-text {
@@ -1835,9 +1858,8 @@ onBeforeUnmount(() => {
   width: 72px;
   height: 72px;
   overflow: hidden;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--rail);
+  border-radius: var(--radius-lg);
+  background: var(--fill);
   color: var(--faint);
 }
 
@@ -1858,10 +1880,9 @@ onBeforeUnmount(() => {
   gap: 6px;
   max-width: 100%;
   height: 28px;
-  padding: 0 10px 0 var(--space-2);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--paper);
+  padding: 0 12px 0 10px;
+  border-radius: var(--radius-full);
+  background: var(--fill);
   color: var(--ink-soft);
   font-size: var(--text-xs);
 }
@@ -1945,11 +1966,11 @@ onBeforeUnmount(() => {
 }
 
 .answer-handle:hover {
-  background: var(--rail-active);
+  background: var(--fill);
 }
 
 .answer-handle.on {
-  background: var(--rail-active);
+  background: var(--fill);
   color: var(--ink);
 }
 
@@ -2059,9 +2080,9 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: var(--space-3);
   margin: var(--space-2) var(--space-4) 0;
-  padding: var(--space-3);
-  border: 1px solid var(--edge);
-  background: var(--rail);
+  padding: var(--space-3) var(--space-3) var(--space-3) var(--space-4);
+  border-radius: var(--radius-lg);
+  background: var(--fill-weak);
 }
 
 .send-block-text {
@@ -2100,8 +2121,10 @@ onBeforeUnmount(() => {
   font-size: var(--text-xs);
 }
 
-/* --- the reply toolbar: the context menu's radius, surface and shadow ------------------ */
+/* --- the reply toolbar: the document's selection capsule, on the menu's surface ---------- */
 
+/* Over the agent's glass card, so not glass itself: the menu's surface in the capsule's
+   shape (docs/web.md § Design system, *Glass is for what floats*). */
 .reply-toolbar {
   position: fixed;
   z-index: 90;
@@ -2109,7 +2132,7 @@ onBeforeUnmount(() => {
   gap: 2px;
   padding: var(--space-1);
   border: 1px solid var(--menu-edge);
-  border-radius: var(--radius-menu);
+  border-radius: var(--radius-full);
   background: var(--menu-surface);
   box-shadow: var(--shadow-menu);
   transform: translate(-50%, -100%);
@@ -2125,21 +2148,19 @@ onBeforeUnmount(() => {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  height: 28px;
-  padding: 0 10px 0 var(--space-2);
+  height: 30px;
+  padding: 0 12px 0 10px;
   border: 0;
-  border-radius: var(--radius-menu-item);
+  border-radius: var(--radius-full);
   background: transparent;
   color: var(--ink);
   font-size: var(--text-xs);
   cursor: pointer;
 }
 
-/* The accent fills the highlighted row, as in the context menu. */
 .reply-item:hover,
 .reply-item:focus-visible {
-  background: var(--accent);
-  color: var(--accent-fg);
+  background: var(--fill);
 }
 
 .reply-item :deep(svg) {

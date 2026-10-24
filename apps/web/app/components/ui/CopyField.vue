@@ -23,29 +23,27 @@ defineProps<{
 </template>
 
 <style scoped>
-/* Rule-bounded, not boxed: the value sits between two hairlines like every other row of
-   this design, with its copy button on the right. */
+/* A rounded well holding the value, its copy button at the right — the system's way of
+   showing a value to take away. */
 .copy-field {
   display: flex;
   align-items: center;
   gap: var(--space-4);
   min-width: 0;
-  padding: var(--space-4) 0;
-  border-top: 1px solid var(--hair);
-  border-bottom: 1px solid var(--hair);
+  padding: var(--space-2) var(--space-2) var(--space-2) var(--space-4);
+  border-radius: var(--radius-lg);
+  background: var(--paper-sunken);
 }
 
 .copy-field.emphasis {
-  border-color: var(--edge);
+  box-shadow: inset 0 0 0 1px var(--line-strong);
 }
 
 .copy-label {
   flex-shrink: 0;
-  color: var(--faint);
-  font-size: var(--text-2xs);
+  color: var(--muted);
+  font-size: var(--text-xs);
   font-weight: var(--weight-semibold);
-  letter-spacing: var(--tracking-label);
-  text-transform: uppercase;
 }
 
 .copy-value {

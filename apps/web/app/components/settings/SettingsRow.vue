@@ -1,7 +1,8 @@
 <script setup lang="ts">
 /**
- * One row of a settings section: a label and its one-line description at the left, the
- * control at the right, a hairline above (docs/web.md § Pages, `/settings/<section>`).
+ * One row of a settings group: a label and its one-line description at the left, the
+ * control at the right, a hairline between it and the row above (docs/web.md § Pages,
+ * `/settings/<section>`).
  *
  * The description says the consequence the control does not show by itself — where a
  * language applies, what signing out ends — and nothing else; a row with nothing to add
@@ -14,7 +15,7 @@ defineProps<{
 
 defineSlots<{
   /** The control. */
-  default: () => unknown
+  default?: () => unknown
   /** Under the control: a status or error line the row owns. */
   note?: () => unknown
 }>()
@@ -26,7 +27,7 @@ defineSlots<{
       <p class="label">{{ label }}</p>
       <p v-if="description" class="description">{{ description }}</p>
     </div>
-    <div class="control">
+    <div v-if="$slots.default" class="control">
       <slot />
     </div>
     <div v-if="$slots.note" class="note">
@@ -41,26 +42,29 @@ defineSlots<{
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: var(--space-2) var(--space-6);
-  padding: var(--space-5) 0;
-  border-bottom: 1px solid var(--hair);
+  min-height: 52px;
+  padding: var(--space-3) 0;
+}
+
+.row + .row {
+  border-top: 1px solid var(--line);
 }
 
 .text {
   display: grid;
-  gap: var(--space-1);
+  gap: 2px;
   min-width: 0;
 }
 
 .label {
   color: var(--ink);
-  font-size: var(--text-base);
-  font-weight: var(--weight-medium);
+  font-size: var(--text-sm);
 }
 
 .description {
   color: var(--muted);
-  font-size: var(--text-sm);
-  line-height: 1.6;
+  font-size: var(--text-xs);
+  line-height: 1.5;
 }
 
 .control {
@@ -72,6 +76,8 @@ defineSlots<{
 }
 
 .note {
+  display: grid;
+  gap: var(--space-2);
   grid-column: 1 / -1;
 }
 

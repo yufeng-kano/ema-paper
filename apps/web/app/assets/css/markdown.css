@@ -148,8 +148,6 @@
   text-align: left;
   font-size: var(--text-2xs);
   font-weight: var(--weight-semibold);
-  letter-spacing: var(--tracking-label);
-  text-transform: uppercase;
   color: var(--faint);
   border-bottom: 1px solid var(--line-soft);
 }
