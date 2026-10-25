@@ -31,6 +31,11 @@ describe('renamedTitle', () => {
     expect(renamedTitle(' Old ', 'Old')).toBeNull()
   })
 
+  it('takes out what the server would, so a blank-looking name changes nothing', () => {
+    expect(renamedTitle('​ ⁠​', 'Old')).toBeNull()
+    expect(renamedTitle('Ta​ble\u0007 2', 'Old')).toBe('Table 2')
+  })
+
   it('names an untitled conversation', () => {
     expect(renamedTitle('Notes', null)).toBe('Notes')
     expect(renamedTitle('Notes', '')).toBe('Notes')

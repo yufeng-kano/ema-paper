@@ -209,7 +209,6 @@ function toggleList(event: MouseEvent) {
   const top = under - card.top + 4
   // A click the keyboard made carries no pointer detail.
   list.value = { top, room: foot - card.top - top, fromKey: event.detail === 0 }
-  renameError.value = null
   if (!listPending.value) {
     void readConversations()
   }
@@ -239,6 +238,19 @@ watch(
   },
 )
 
+/** A refusal said in the list is not said again once it closes. One that lands while it is
+ *  closed — the click elsewhere that kept a name also closed it — is said over the thread
+ *  until the list next opens and says it there (docs/web.md § The agent panel). Run before
+ *  the list unmounts, so the rename its unmount sends is not cleared with it. */
+watch(
+  () => list.value !== null,
+  (open) => {
+    if (!open) {
+      renameError.value = null
+    }
+  },
+)
+
 async function pickConversation(id: number) {
   closeList(true)
   await select(id)
@@ -249,18 +261,30 @@ function newFromList() {
   newConversation()
 }
 
+/** Each conversation's renames, counted as one is sent and as it is answered: a record read
+ *  that began before either knows an older title than the row (`loadDetail`). */
+const renames = new Map<number, number>()
+
+function countRename(id: number) {
+  renames.set(id, (renames.get(id) ?? 0) + 1)
+}
+
 /** Shown at once, then as the server cleaned it; a refusal puts the old title back and says
- *  why in the list. The row keeps its place: a rename is not a thread continued. */
+ *  why in the list, or over the thread once the list has closed. The row keeps its place: a
+ *  rename is not a thread continued. */
 async function renameRow(id: number, name: string) {
   const before = conversations.value.find((row) => row.id === id)?.title ?? null
   renameError.value = null
   listChanged()
+  countRename(id)
   conversations.value = conversations.value.map((row) => (row.id === id ? { ...row, title: name } : row))
   try {
     const saved = await renameConversation(id, name)
     listChanged()
+    countRename(id)
     conversations.value = conversations.value.map((row) => (row.id === id ? { ...row, title: saved.title } : row))
   } catch (error) {
+    countRename(id)
     conversations.value = conversations.value.map((row) =>
       row.id === id && row.title === name ? { ...row, title: before } : row,
     )
@@ -319,6 +343,7 @@ let detailSeq = 0
 
 async function loadDetail(id: number) {
   const seq = ++detailSeq
+  const renamed = renames.get(id) ?? 0
   detailError.value = null
   detailPending.value = true
   try {
@@ -335,8 +360,12 @@ async function loadDetail(id: number) {
       // terminal events of earlier turns must not end the wait (docs/web.md).
       stream.expectTurn(live.id)
     }
+    // A rename sent or answered since this read began keeps its title: the read may predate it.
+    const fresh = (renames.get(id) ?? 0) === renamed
     conversations.value = conversations.value.map((row) =>
-      row.id === id ? { ...row, title: detail.conversation.title, updated_at: detail.conversation.updated_at } : row,
+      row.id === id
+        ? { ...row, title: fresh ? detail.conversation.title : row.title, updated_at: detail.conversation.updated_at }
+        : row,
     )
   } catch (error) {
     if (seq === detailSeq) {
@@ -1583,6 +1612,8 @@ onBeforeUnmount(() => {
     >
       <UiBanner v-if="listError" tone="error">{{ listError }}</UiBanner>
       <UiBanner v-else-if="detailError" tone="error">{{ detailError }}</UiBanner>
+      <!-- A rename refused once the list had closed: said here until the list opens again. -->
+      <UiBanner v-if="renameError && !list" tone="error">{{ t('chat.renameFailed', { error: renameError }) }}</UiBanner>
       <UiBanner v-if="cardError" tone="error">{{ cardError }}</UiBanner>
 
       <UiSkeleton v-if="detailPending && !items.length" :rows="3" />
