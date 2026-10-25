@@ -125,9 +125,21 @@ function onResize() {
   emit('close', false)
 }
 
+/** An Escape that reaches the document while it is open was pressed with focus on nothing —
+ *  a Retry that went as the list came back — and is still its own: the root says so
+ *  (`data-escape-owner`), so the viewer's dialog does not close under it. One pressed inside
+ *  it, in the row menu or in the rename field never gets here. */
+function onDocumentKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape') {
+    event.stopPropagation()
+    emit('close', true)
+  }
+}
+
 onMounted(async () => {
   window.addEventListener('pointerdown', onPointerDownOutside, true)
   window.addEventListener('resize', onResize)
+  document.addEventListener('keydown', onDocumentKeydown)
   await nextTick()
   const current = root.value?.querySelector<HTMLElement>('.row-open[aria-current="true"]') ?? null
   current?.scrollIntoView({ block: 'nearest' })
@@ -144,6 +156,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   window.removeEventListener('pointerdown', onPointerDownOutside, true)
   window.removeEventListener('resize', onResize)
+  document.removeEventListener('keydown', onDocumentKeydown)
   // Closed by a press elsewhere while a name was being typed: that press keeps it.
   endRename(true)
 })
@@ -225,9 +238,14 @@ function endRename(keep: boolean) {
 }
 
 /** Enter keeps it and Escape does not; both go back to the row, and neither reaches the
- *  popover. An Enter that confirms an input method's composition only confirms it. */
+ *  popover. An Enter or Escape that ends an input method's composition only ends it, and
+ *  goes no further either: the popover's Escape would close it and keep the half-typed name. */
 async function onRenameKeydown(event: KeyboardEvent) {
-  if (event.isComposing || event.keyCode === 229 || (event.key !== 'Enter' && event.key !== 'Escape')) {
+  if (event.isComposing || event.keyCode === 229) {
+    event.stopPropagation()
+    return
+  }
+  if (event.key !== 'Enter' && event.key !== 'Escape') {
     return
   }
   event.preventDefault()
@@ -255,6 +273,7 @@ function onRenameBlur() {
     ref="root"
     class="conversations"
     role="dialog"
+    data-escape-owner
     tabindex="-1"
     :aria-label="t('chat.conversations')"
     :style="{ top: `${top}px`, '--room': `${room}px` }"
@@ -462,7 +481,8 @@ function onRenameBlur() {
 }
 
 /* Drawn on the row under the pointer or holding focus — and on the one whose menu is open —
-   keeping its room either way, so a title does not re-cut as the pointer passes. */
+   keeping its room either way, so a title does not re-cut as the pointer passes. Faded
+   out rather than hidden, so a screen reader still finds it and Shift+Tab still stops on it. */
 .row-more {
   display: inline-flex;
   flex: none;
@@ -477,8 +497,9 @@ function onRenameBlur() {
   background: transparent;
   color: var(--faint);
   cursor: pointer;
-  visibility: hidden;
+  opacity: 0;
   transition:
+    opacity var(--duration-fast) var(--ease),
     background var(--duration-fast) var(--ease),
     color var(--duration-fast) var(--ease);
 }
@@ -486,13 +507,13 @@ function onRenameBlur() {
 .row:hover .row-more,
 .row:focus-within .row-more,
 .row-more[aria-expanded='true'] {
-  visibility: visible;
+  opacity: 1;
 }
 
 /* No hover to reveal it: always there. */
 @media (hover: none) {
   .row-more {
-    visibility: visible;
+    opacity: 1;
   }
 }
 
@@ -507,11 +528,12 @@ function onRenameBlur() {
   height: 15px;
 }
 
-.rename {
+/* Above the field's own height and padding, whichever stylesheet loads last; its type size,
+   16px under a coarse pointer, stays its own. */
+.row .rename {
   flex: 1 1 auto;
   height: var(--control-height-xs);
   padding: 0 var(--space-2);
-  font-size: var(--text-sm);
 }
 
 /* New conversation, under a hairline below the rows — alone when there are none. */
