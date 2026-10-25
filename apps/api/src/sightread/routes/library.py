@@ -17,7 +17,6 @@ import contextlib
 import logging
 import os
 import re
-import secrets
 import shutil
 import sys
 import unicodedata
@@ -78,7 +77,6 @@ from ..workspace import git, safe_io, trash
 from ..workspace.layout import (
     FILES_DIR,
     document_relative_dir,
-    files_root,
     path_segment,
     segment_name,
     trash_entry,
@@ -1344,6 +1342,9 @@ async def upload_document(
     # (docs/workspace.md § Files, § Quota).
     auto_convert = await parse_auto_convert(db, user_id)
     root = user_root(settings.workspaces_dir, user_id)
+    # What an upload the process died in left in the tree goes before the quota is
+    # measured, so it never counts against this one (docs/workspace.md § Files).
+    await asyncio.to_thread(workspace_documents.sweep_staged_uploads, root)
     limit = ledger.storage_limit(settings, await ledger.plan_of(db, settings, user_id))
     used = (await workspace_documents.measure_storage(db, settings, user_id, root)).total
     upload_dir = Path(settings.upload_dir)
@@ -1366,10 +1367,10 @@ async def upload_document(
             return staged(suffix, settings.upload_max_bytes, "UPLOAD_MAX_BYTES", UPLOAD_PARSE)
         if declared_length is not None and used + declared_length > limit:
             raise ApiError(409, "storage_full", STORAGE_FULL)
-        # Into the tree under a write-in-progress name, which history excludes and
-        # reconciliation leaves alone; moved into place once the row exists.
-        temp = files_root(root) / f"{safe_io.TEMP_PREFIX}{secrets.token_hex(8)}"
-        fd = safe_io.create_file(root, temp)
+        # Into the tree under the staging name, which history excludes and reconciliation
+        # leaves alone, its lock held through this descriptor until the file is in place
+        # or removed (docs/workspace.md § Files); moved into place once the row exists.
+        fd, temp = workspace_documents.stage_upload(root)
 
         def discard() -> None:
             with contextlib.suppress(OSError, safe_io.UnsafeEntry):
@@ -1420,8 +1421,12 @@ async def upload_document(
         )
     finally:
         # Whatever was not moved into place goes: a staged upload the parse copied, the
-        # temporary file of a filing that was refused.
+        # temporary file of a filing that was refused. The descriptor last: the lock a
+        # file's staging holds through it outlives the move into place (docs/workspace.md
+        # § Files).
         await asyncio.to_thread(part.sink.discard)
+        with contextlib.suppress(OSError):
+            os.close(part.sink.fd)
 
 
 async def file_parse(

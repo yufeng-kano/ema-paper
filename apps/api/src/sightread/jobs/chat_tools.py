@@ -263,19 +263,19 @@ def _edit_sync(
         return ToolOutcome(f"{vm_path} is not a plain file", is_error=True)
     except UnicodeDecodeError:
         return ToolOutcome(f"{vm_path} is not a text file", is_error=True)
-    if (
-        before is not None
-        and path.name not in git.RECORDED_NAMES
-        and len(before.encode()) > git.revision_max_file_bytes()
-    ):
-        # A file history never recorded — over the cap when it arrived — is not edited here
-        # either, however small the edit would leave it: that revision would read as its
-        # creation, and the card's Revert would delete it rather than put it back
-        # (docs/workspace.md § Revisions, docs/chat.md § Tools).
-        return ToolOutcome(
-            f"{vm_path} is too large for a revision to record, so it is not edited here; use bash",
-            is_error=True,
-        )
+    if before is not None and path.name not in git.RECORDED_NAMES:
+        held = before.encode()
+        if len(held) > git.revision_max_file_bytes() or not git.is_text(held):
+            # A file history never recorded — over the cap when it arrived, or binary by
+            # git's test (a NUL byte, which decodes as text all the same) — is not edited
+            # here either, whatever the edit would leave: that revision would read as its
+            # creation, and the card's Revert would delete it rather than put it back
+            # (docs/workspace.md § Revisions, docs/chat.md § Tools).
+            return ToolOutcome(
+                f"{vm_path} is binary or too large for a revision to record, "
+                "so it is not edited here; use bash",
+                is_error=True,
+            )
     if command == "create":
         new_text = tool_input.get("file_text")
         if not isinstance(new_text, str):
@@ -313,14 +313,18 @@ def _edit_sync(
         inserted = text_to_insert.split("\n")
         after = "\n".join(lines[:line] + inserted + lines[line:])
 
-    if len(after.encode()) > max_bytes:
+    result = after.encode()
+    if len(result) > max_bytes:
         return ToolOutcome(f"the result would make {vm_path} too large; use bash", is_error=True)
-    if path.name not in git.RECORDED_NAMES and len(after.encode()) > git.revision_max_file_bytes():
-        # A file history would not record — this large; a binary one the read above
-        # already refused — is not written here: an edit with no revision has no undo
-        # (docs/chat.md § Tools, docs/workspace.md § Revisions).
+    if path.name not in git.RECORDED_NAMES and (
+        len(result) > git.revision_max_file_bytes() or not git.is_text(result)
+    ):
+        # A file history would not record — this large, or binary — is not written here:
+        # an edit with no revision has no undo (docs/chat.md § Tools, docs/workspace.md
+        # § Revisions).
         return ToolOutcome(
-            f"{vm_path} would be too large for a revision to record; use bash", is_error=True
+            f"{vm_path} would be binary or too large for a revision to record; use bash",
+            is_error=True,
         )
     # The directories a create makes for its file, deepest first: removed with the file
     # when its revision cannot be recorded, so a failed create leaves no empty folder

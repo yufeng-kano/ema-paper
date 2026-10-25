@@ -11,12 +11,14 @@ from __future__ import annotations
 import asyncio
 import codecs
 import contextlib
+import fcntl
 import hashlib
 import json
 import logging
 import mimetypes
 import os
 import re
+import secrets
 import shutil
 import stat
 import uuid
@@ -486,7 +488,7 @@ async def materialize_document(
             # (docs/workspace.md § The Trash).
             await recover_trash(db, settings, document.user_id)
             if safe_io.entry_kind(root, paths.directory) == "none" and await asyncio.to_thread(
-                _trash_holds, root, document, folders
+                trash_holds, root, [document], folders
             ):
                 raise ApiError(
                     409,
@@ -1723,6 +1725,52 @@ def sweep_aside(root: Path, keep: Collection[str] = ()) -> int:
     return swept
 
 
+# The staging name of an upload streaming into the tree (docs/workspace.md § Files): a
+# write-in-progress name to history and reconciliation, the sweep's to tell apart.
+UPLOAD_STAGING_PREFIX = f"{safe_io.TEMP_PREFIX}upload-"
+
+
+def stage_upload(root: Path) -> tuple[int, Path]:
+    """A new file at the top of `files/` for an upload to stream into: a descriptor on it
+    and its staging name (docs/workspace.md § Files). Made under a plain write-in-progress
+    name, locked, and only then given the staging name, which it keeps until the caller
+    moves it into place or removes it — so a file under that name whose lock is free is
+    one an upload died in, and `sweep_staged_uploads` takes it. The lock lives with the
+    descriptor: the caller closes it last."""
+    files = files_root(root)
+    temp = files / f"{safe_io.TEMP_PREFIX}{secrets.token_hex(8)}"
+    fd = safe_io.create_file(root, temp)
+    staged = files / f"{UPLOAD_STAGING_PREFIX}{secrets.token_hex(8)}"
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        safe_io.rename(root, temp, staged)
+    except BaseException:
+        os.close(fd)
+        with contextlib.suppress(OSError, safe_io.UnsafeEntry):
+            safe_io.remove_file(root, temp)
+        raise
+    return fd, staged
+
+
+def sweep_staged_uploads(root: Path) -> int:
+    """Remove the staging files of uploads the process died in — at the top of `files/`,
+    under the staging name, with no upload holding their lock (docs/workspace.md § Files):
+    nobody's, counted against the quota and shown nowhere. Takes no workspace lock: the
+    file's own is the arbiter, and nothing but its upload names the file."""
+    files = files_root(root)
+    try:
+        entries = safe_io.list_dir(root, files)
+    except (OSError, safe_io.UnsafeEntry):
+        return 0
+    swept = 0
+    for name, is_dir in entries:
+        if is_dir or not name.startswith(UPLOAD_STAGING_PREFIX):
+            continue
+        with contextlib.suppress(OSError, safe_io.UnsafeEntry):
+            swept += safe_io.remove_unlocked_file(root, files / name)
+    return swept
+
+
 # --- the Trash ----------------------------------------------------------------------------
 
 # What the Trash names its entries: `trash_entry` (layout.py) in reverse.
@@ -1908,13 +1956,22 @@ async def recover_trash(db: AsyncSession, settings: Settings, user_id: int) -> i
     return moved
 
 
-def _trash_holds(root: Path, document: Document, by_id: dict[int, Folder]) -> bool:
-    """Whether the Trash holds an entry the document's directory may be in: its own, or a
-    folder's above it — what the repair rule could not return."""
+def trash_holds(root: Path, rows: Iterable[Document], by_id: Mapping[int, Folder]) -> set[int]:
+    """The ids among `rows` whose directory or file the Trash may hold: an entry of their
+    own, or of a folder above them — what the repair rule could not return, its place
+    taken (docs/workspace.md § The Trash). Asked of live rows after the rule ran."""
     names = {name for _kind, _row_id, name in _trash_entries(root)}
-    return trash_entry("document", document.id) in names or any(
-        trash_entry("folder", row.id) in names for row in folder_chain(by_id, document.folder_id)
-    )
+    if not names:
+        return set()
+    return {
+        row.id
+        for row in rows
+        if trash_entry("document", row.id) in names
+        or any(
+            trash_entry("folder", folder.id) in names
+            for folder in folder_chain(by_id, row.folder_id)
+        )
+    }
 
 
 async def held_in_trash(

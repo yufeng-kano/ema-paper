@@ -33,6 +33,8 @@ from .documents import (
     sweep_aside,
     sweep_orphaned_images,
     sweep_orphaned_originals,
+    sweep_staged_uploads,
+    trash_holds,
     trashed_folder_ids,
     user_folders,
 )
@@ -422,6 +424,13 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
             user_id,
             swept_images,
         )
+    swept_staging = await asyncio.to_thread(sweep_staged_uploads, root)
+    if swept_staging:
+        logger.warning(
+            "reconcile for user %d: removed %d staging file(s) of uploads that died",
+            user_id,
+            swept_staging,
+        )
     found, folders, plain = await asyncio.to_thread(_canonicalize_and_scan, root)
     asides = await asyncio.to_thread(_aside_documents, root)
     # A file row whose file is gone goes with it (docs/workspace.md § Files): while any
@@ -447,7 +456,8 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
     # Live rows only: a `.meta.json` under `files/` that names a document in the Trash —
     # copied out of the read-only Trash, brought back by a revert — is not that document,
     # and its row stays in the Trash (docs/workspace.md § The Trash).
-    trashed = trashed_folder_ids((await user_folders(db, user_id)).values())
+    by_id = await user_folders(db, user_id)
+    trashed = trashed_folder_ids(by_id.values())
     documents = {
         row.id: row
         for row in (await db.execute(select(Document).where(Document.user_id == user_id))).scalars()
@@ -603,8 +613,14 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
             )
         )
         file_changes += 1
-    for row in live_files.values():
-        if row.id not in present:
+    missing = [row for row in live_files.values() if row.id not in present]
+    # A file whose bytes wait in the Trash — an entry of its own, or of a folder above
+    # it, that the repair rule could not return because its place is taken — is not
+    # gone, and its row stays with them, as a document's does (docs/workspace.md § Files,
+    # § The Trash).
+    held = await asyncio.to_thread(trash_holds, root, missing, by_id) if missing else set()
+    for row in missing:
+        if row.id not in held:
             await db.delete(row)
             file_changes += 1
     updates: list[tuple[Document, int | None, str]] = []

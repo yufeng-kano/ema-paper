@@ -3,8 +3,9 @@
 Deleting the source at terminal state is the optimisation; this sweep is the guarantee.
 Every 15 minutes, inside the worker, it trashes anything under the upload directory older
 than `UPLOAD_MAX_AGE_SECONDS` (a day), whatever left it there — a crashed job, an
-abandoned upload, or a bug — and packs the workspaces' git histories (docs/workspace.md
-§ Revisions). It deletes for good what has been in the Trash longer than
+abandoned upload, or a bug — packs the workspaces' git histories (docs/workspace.md
+§ Revisions) and removes from each workspace the staging file of a file upload the API
+process died in (§ Files). It deletes for good what has been in the Trash longer than
 `TRASH_RETENTION_DAYS` (§ The Trash), deletes the finished parses the retention no longer
 keeps once they are `PARSE_RETENTION_DAYS` old, and finishes the account deletions a
 request left half done, from their markers (docs/auth.md § Deleting the account).
@@ -89,25 +90,39 @@ def discard_uploads(upload_dir: Path, stems: Collection[str]) -> bool:
     return removed
 
 
+def workspace_roots(workspaces_dir: Path) -> list[Path]:
+    """Every user's workspace root under `workspaces_dir`, by user id."""
+    try:
+        names = sorted((name for name in os.listdir(workspaces_dir) if name.isdigit()), key=int)
+    except OSError:
+        return []
+    return [workspaces_dir / name for name in names]
+
+
+async def sweep_staged_uploads(workspaces_dir: Path) -> int:
+    """Remove from each workspace the staging file of a file upload the API process died
+    in (docs/workspace.md § Files); returns how many went. No workspace lock: the file's
+    own lock tells an upload still streaming from one nobody holds."""
+    swept = 0
+    for root in workspace_roots(workspaces_dir):
+        swept += await asyncio.to_thread(workspace_documents.sweep_staged_uploads, root)
+    return swept
+
+
 async def pack_histories(workspaces_dir: Path, *, loose_objects: int) -> int:
     """Pack each workspace's git history holding `loose_objects` loose objects or more,
     under that workspace's lock (docs/workspace.md § Revisions); returns how many were
     packed. One whose lock is refused — a shell command still being recovered — or whose
     git fails waits for the next sweep."""
-    try:
-        names = sorted((name for name in os.listdir(workspaces_dir) if name.isdigit()), key=int)
-    except OSError:
-        return 0
     packed = 0
-    for name in names:
-        root = workspaces_dir / name
+    for root in workspace_roots(workspaces_dir):
         try:
             if await asyncio.to_thread(git.loose_objects, root) < loose_objects:
                 continue
             async with workspace_lock(root):
                 await asyncio.to_thread(git.pack, root)
         except (ApiError, git.GitError, OSError):
-            logger.warning("sweeper could not pack the history of workspace %s", name)
+            logger.warning("sweeper could not pack the history of workspace %s", root.name)
             continue
         packed += 1
     return packed
@@ -284,6 +299,9 @@ async def sweep_once(sessionmaker: async_sessionmaker[AsyncSession], settings: S
     )
     if packed:
         logger.info("sweeper packed the history of %d workspaces", packed)
+    staged = await sweep_staged_uploads(Path(settings.workspaces_dir))
+    if staged:
+        logger.info("sweeper removed the staging files of %d uploads that died", staged)
     expired = await expire_trash(sessionmaker, settings)
     if expired:
         logger.info("sweeper deleted %d items past their time in the Trash", expired)

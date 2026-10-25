@@ -19,7 +19,7 @@ from sqlalchemy import select
 
 from sightread.auth.sessions import SESSION_COOKIE, create_session
 from sightread.db.models import Document, Folder, Job, User
-from sightread.jobs import chat_tools
+from sightread.jobs import chat_tools, sweeper
 from sightread.workspace import documents as workspace_documents
 from sightread.workspace import git, safe_io
 from sightread.workspace.documents import original_of
@@ -656,6 +656,78 @@ async def test_reconciliation_leaves_a_trashed_file_in_the_trash(writer) -> None
     assert (writer.root / "files" / "notes.txt").read_bytes() == b"kept"
 
 
+async def test_a_file_the_trash_holds_keeps_its_row(writer) -> None:
+    """An interrupted Put Back whose place was taken meanwhile: the rows are live, the
+    bytes wait in the Trash, and the repair rule cannot return them. The rows are not
+    deleted as missing — the rule would then remove the bytes as nobody's."""
+    settings = writer.app.state.settings
+    shell = await _folder(writer, "Shell")
+    kept = await _kept(writer, "notes.txt", b"kept", "text/plain")
+    inside = await _upload(writer, "data.csv", b"a,b\n", "text/csv", shell["id"])
+    assert inside.status_code == 201, inside.text
+    trash = trash_root(writer.root)
+    trash.mkdir(parents=True, exist_ok=True)
+    (writer.root / "files" / "notes.txt").rename(trash / f"document-{kept['id']}")
+    (writer.root / "files" / "notes.txt").mkdir()
+    (writer.root / "files" / "Shell").rename(trash / f"folder-{shell['id']}")
+    (writer.root / "files" / "Shell").mkdir()
+
+    async def reconciled() -> list[tuple[int, str, int]]:
+        async with writer.app.state.sessionmaker() as db:
+            await reconcile_user(db, settings, writer.user_id)
+        rows = (await _read(writer))["documents"]
+        return sorted((row["id"], row["name"], row["size_bytes"]) for row in rows)
+
+    expected = sorted([(kept["id"], "notes.txt", 4), (inside.json()["id"], "data.csv", 4)])
+    assert await reconciled() == expected
+    assert (trash / f"document-{kept['id']}").read_bytes() == b"kept"
+    assert (trash / f"folder-{shell['id']}" / "data.csv").read_bytes() == b"a,b\n"
+    # The places freed: the rule brings both back, to the rows they kept.
+    (writer.root / "files" / "notes.txt").rmdir()
+    (writer.root / "files" / "Shell").rmdir()
+    assert await reconciled() == expected
+    assert (writer.root / "files" / "notes.txt").read_bytes() == b"kept"
+    assert (writer.root / "files" / "Shell" / "data.csv").read_bytes() == b"a,b\n"
+    assert list(trash.iterdir()) == []
+
+
+async def test_the_staging_file_of_an_upload_the_process_died_in_is_swept(
+    make_client, tmp_path
+) -> None:
+    client = make_client(workspaces_dir=str(tmp_path / "ws"), free_storage_bytes=1_000_000)
+    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    user_id = (await client.get("/api/me")).json()["user"]["id"]
+    settings = client.app.state.settings
+    root = user_root(settings.workspaces_dir, user_id)
+    (root / "files").mkdir(parents=True)
+    prefix = workspace_documents.UPLOAD_STAGING_PREFIX
+    # What a process that died mid-stream leaves: a staging file nobody holds, counted
+    # against the plan — here, more than all of it.
+    dead = root / "files" / f"{prefix}{'0' * 16}"
+    dead.write_bytes(b"x" * 2_000_000)
+    # One an upload still streams into holds its lock, as the route holds it.
+    fd, live = workspace_documents.stage_upload(root)
+    assert live.parent == root / "files" and live.name.startswith(prefix)
+    os.write(fd, b"half")
+    try:
+        # The next upload sweeps the dead one first and fits; the live one stays.
+        kept = await _upload(client, "small.bin", b"x" * 8, OCTET)
+        assert kept.status_code == 201, kept.text
+        assert not dead.exists() and live.is_file()
+        dead.write_bytes(b"x" * 16)
+        async with client.app.state.sessionmaker() as db:
+            await reconcile_user(db, settings, user_id)
+        assert not dead.exists() and live.is_file()
+        dead.write_bytes(b"x" * 16)
+        assert await sweeper.sweep_staged_uploads(Path(settings.workspaces_dir)) == 1
+        assert not dead.exists() and live.is_file()
+    finally:
+        os.close(fd)
+    # Its holder gone, the lock went with it: the next sweep takes the file.
+    assert await sweeper.sweep_staged_uploads(Path(settings.workspaces_dir)) == 1
+    assert sorted(path.name for path in (root / "files").iterdir()) == ["small.bin"]
+
+
 # --- revisions and the editor -------------------------------------------------------------
 
 
@@ -688,40 +760,42 @@ async def test_the_editor_writes_nothing_a_revision_could_not_record(tmp_path, m
     (root / "files" / "d").mkdir(parents=True)
     git.ensure_repo(root)
 
-    async def edit(path: str, text: str):
+    async def run(command: str, path: str, **fields):
         return await chat_tools.run_editor(
             root,
-            {"command": "create", "path": f"/workspace/{path}", "file_text": text},
+            {"command": command, "path": f"/workspace/{path}", **fields},
             "agent:1",
             max_chars=1000,
             max_bytes=1_000_000,
         )
 
-    refused = await edit("files/big.txt", "x" * 65)
+    refused = await run("create", "files/big.txt", file_text="x" * 65)
     assert refused.is_error and "revision" in refused.content
     assert not (root / "files" / "big.txt").exists()
-    allowed = await edit("files/small.txt", "x" * 10)
+    allowed = await run("create", "files/small.txt", file_text="x" * 10)
     assert not allowed.is_error, allowed.content
     assert allowed.edit is not None and allowed.edit["commit"]
     # A document's own file is recorded whatever its size.
-    own = await edit("files/d/doc.md", "x" * 65)
+    own = await run("create", "files/d/doc.md", file_text="x" * 65)
     assert not own.is_error, own.content
     assert (root / "files" / "d" / "doc.md").read_text() == "x" * 65
     # A file history never recorded — too large when it arrived — is not edited here
     # either, even into a size a revision would take: that revision would read as its
     # creation, and Revert would delete it.
     (root / "files" / "huge.txt").write_text("x" * 100)
-    shrunk = await chat_tools.run_editor(
-        root,
-        {
-            "command": "str_replace",
-            "path": "/workspace/files/huge.txt",
-            "old_str": "x" * 50,
-            "new_str": "",
-        },
-        "agent:1",
-        max_chars=1000,
-        max_bytes=1_000_000,
-    )
+    shrunk = await run("str_replace", "files/huge.txt", old_str="x" * 50, new_str="")
     assert shrunk.is_error and "revision" in shrunk.content
     assert (root / "files" / "huge.txt").read_text() == "x" * 100
+    # Binary by git's test, text to the decoder — a NUL byte: neither the file nor a
+    # result that holds one is written, for the same reason.
+    mixed = root / "files" / "mixed.txt"
+    mixed.write_bytes(b"hello\0world")
+    cleaned = await run("str_replace", "files/mixed.txt", old_str="\0", new_str="")
+    assert cleaned.is_error and "revision" in cleaned.content
+    assert mixed.read_bytes() == b"hello\0world"
+    nul = await run("create", "files/nul.txt", file_text="a\0b")
+    assert nul.is_error and "revision" in nul.content
+    assert not (root / "files" / "nul.txt").exists()
+    soiled = await run("insert", "files/small.txt", insert_line=0, insert_text="\0")
+    assert soiled.is_error and "revision" in soiled.content
+    assert (root / "files" / "small.txt").read_text() == "x" * 10

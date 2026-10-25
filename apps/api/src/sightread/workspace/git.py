@@ -56,6 +56,11 @@ RECORDED_NAMES = frozenset({DOC_FILE, NOTES_FILE, META_FILE})
 _TEXT_PROBE_BYTES = 8192
 
 
+def is_text(data: bytes) -> bool:
+    """Git's own test of a text file, on bytes in hand: no NUL byte in the first 8 KiB."""
+    return b"\0" not in data[:_TEXT_PROBE_BYTES]
+
+
 def revision_max_file_bytes() -> int:
     """The largest file a revision records (`REVISION_MAX_FILE_BYTES`)."""
     return int(get_settings().revision_max_file_bytes)
@@ -79,7 +84,7 @@ def recordable(root: Path, relative: Path, max_bytes: int) -> bool:
     if entry is None:
         return True
     try:
-        return b"\0" not in os.read(entry, _TEXT_PROBE_BYTES)
+        return is_text(os.read(entry, _TEXT_PROBE_BYTES))
     finally:
         os.close(entry)
 

@@ -147,10 +147,6 @@ class _Form:
     def on_end(self) -> None:
         self.ended = True
 
-    def close(self) -> None:
-        if self.part is not None:
-            os.close(self.part.sink.fd)
-
     def discard(self) -> None:
         if self.part is not None:
             with contextlib.suppress(OSError):
@@ -167,9 +163,11 @@ async def read_upload_form(
     """Read a `multipart/form-data` body from `stream` (already capped by the caller),
     writing the `file` part into the sink `open_sink(filename, content_type)` returns and
     keeping the other fields. Returns the fields and the file part, None when the body
-    carried none; the sink is closed either way, and taken back when the body could not
-    be read, ended before its closing boundary, or a cap refused it (400, 413 — raised
-    from inside the parse)."""
+    carried none, the sink's descriptor open still — the caller's to close once the file
+    is placed or discarded, so a lock it holds lasts until then (docs/workspace.md
+    § Files); the sink is closed and taken back when the body could not be read, ended
+    before its closing boundary, or a cap refused it (400, 413 — raised from inside the
+    parse)."""
     _kind, params = parse_options_header(headers.get("content-type", ""))
     boundary = params.get(b"boundary")
     if not boundary:
@@ -206,5 +204,4 @@ async def read_upload_form(
     except BaseException:
         form.discard()
         raise
-    form.close()
     return form.fields, form.part

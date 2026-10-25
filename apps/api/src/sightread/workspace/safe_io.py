@@ -10,6 +10,7 @@ before it is read or written: a plain file of a bounded size, or nothing.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import os
 import secrets
 import stat
@@ -312,6 +313,25 @@ def remove_file(root: Path, path: Path) -> bool:
         return True
     finally:
         os.close(fd)
+
+
+def remove_unlocked_file(root: Path, path: Path) -> bool:
+    """Unlink the plain file at `path` unless another descriptor holds its exclusive lock —
+    an upload still streaming into it (docs/workspace.md § Files): True when it went, False
+    when a holder has it or nothing plain is there. The lock is taken on a descriptor
+    opened without following anything and let go with it, after the unlink."""
+    try:
+        entry = _open_file(root, path, os.O_RDONLY)
+    except FileNotFoundError:
+        return False
+    try:
+        try:
+            fcntl.flock(entry, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return remove_file(root, path)
+    finally:
+        os.close(entry)
 
 
 def _open_dir(root: Path, path: Path) -> int:
