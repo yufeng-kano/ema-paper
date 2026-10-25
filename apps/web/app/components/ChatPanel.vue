@@ -193,7 +193,8 @@ const renameError = ref<string | null>(null)
 
 /** Measured from the card each time it opens: under the title, and down to the thread's
  *  foot, which leaves the composer's own top padding — 8px — above its field. The list is
- *  read again as it opens. */
+ *  read again as it opens, unless a read is already on its way: a second one would drop the
+ *  read the panel mounted with, and with it the conversation that read opens. */
 function toggleList(event: MouseEvent) {
   if (list.value) {
     list.value = null
@@ -209,7 +210,9 @@ function toggleList(event: MouseEvent) {
   // A click the keyboard made carries no pointer detail.
   list.value = { top, room: foot - card.top - top, fromKey: event.detail === 0 }
   renameError.value = null
-  void readConversations()
+  if (!listPending.value) {
+    void readConversations()
+  }
 }
 
 function closeList(refocus: boolean) {
