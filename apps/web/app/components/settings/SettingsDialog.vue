@@ -31,7 +31,7 @@ function close() {
 </script>
 
 <template>
-  <UiModal :title="t('settings.title')" size="lg" tall flush @close="close">
+  <UiModal :title="t('settings.title')" size="lg" tall flush above @close="close">
     <div class="sheet">
       <nav class="sections" :aria-label="t('settings.title')">
         <button

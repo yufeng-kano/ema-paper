@@ -69,7 +69,7 @@ from ..workspace.documents import (
     document_paths,
 )
 from .billing import me_fields
-from .chat import owned_document, turn_note
+from .chat import TITLE_MAX_CHARS, owned_document, turn_note
 from .library import figure_crop_response, partial_result
 
 router = APIRouter(prefix="/api", tags=["control"])
@@ -225,6 +225,8 @@ async def me(user: SessionUser, db: DbSession, settings: AppSettings):
             "sections_per_message": settings.chat_sections_per_message,
             "section_heading_max_chars": settings.chat_section_heading_max_chars,
             "selection_max_chars": settings.chat_selection_max_chars,
+            # A conversation's rename field (docs/chat.md § Conversations, turns, events).
+            "conversation_title_max_chars": TITLE_MAX_CHARS,
         },
     }
 

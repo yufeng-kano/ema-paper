@@ -8,6 +8,10 @@ import type { IconName } from './icons'
  */
 export const modalPanelKey: InjectionKey<Ref<HTMLElement | null>> = Symbol('modal-panel')
 
+/** Whether a dialog is inside one held above the screen's own dialogs (`UiModal`'s `above`):
+ *  a dialog opened from inside it stands over it rather than going under it. */
+export const modalAboveKey: InjectionKey<boolean> = Symbol('modal-above')
+
 /**
  * Where a context menu opens (docs/web.md § Files).
  *
@@ -129,6 +133,23 @@ export interface Rect {
   top: number
   right: number
   bottom: number
+}
+
+/**
+ * Which side of a line a surface hung from it opens on, inside the pane that scrolls them —
+ * the slash menu and the TeX field (docs/web.md § Editing): under the line, unless the pane
+ * has less room there than the surface `needs` and more over the line, where it then stands.
+ * With the room on that side, `gap` kept clear at the line and at the pane's edge.
+ */
+export function openSide(
+  line: Pick<Rect, 'top' | 'bottom'>,
+  pane: Pick<Rect, 'top' | 'bottom'>,
+  needs: number,
+  gap: number,
+): { above: boolean; room: number } {
+  const below = pane.bottom - line.bottom - 2 * gap
+  const above = line.top - pane.top - 2 * gap
+  return below < needs && above > below ? { above: true, room: above } : { above: false, room: below }
 }
 
 /**

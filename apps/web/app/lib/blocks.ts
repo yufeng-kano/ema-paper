@@ -11,6 +11,7 @@ import {
   firstWords,
   inlinePlain,
   sectionExtent,
+  type InlineOptions,
   type OutlineEntry,
   type PlacedBlock,
   type ResultBlock,
@@ -60,22 +61,23 @@ function cutWords(text: string, chars: number): string {
  * A block's name, as the handle's label and a drag's live region say it (docs/web.md § Editing,
  * *Moving blocks*): a formula by its kind — `Formula (1)` by its `\tag` — and anything else by
  * its words in the locale's quotation marks: a heading's text, other blocks' first words, a
- * figure's caption after *Figure*, an image's after *Image*.
+ * figure's caption after *Figure*, an image's after *Image*. `options` read the words as
+ * `inlinePlain` does: the notes name a section link by its label.
  */
-export function blockName(block: ResultBlock, text: NameText): string {
+export function blockName(block: ResultBlock, text: NameText, options?: InlineOptions): string {
   if (block.kind === 'math') {
     const tag = /\\tag\*?\{([^}]*)\}/.exec(block.text)?.[1]?.trim()
     return tag ? text.formulaTag(tag) : text.formula
   }
   if (block.kind === 'fig') {
-    const caption = block.caption ? inlinePlain(block.caption) : ''
+    const caption = block.caption ? inlinePlain(block.caption, options) : ''
     return caption ? text.figure(cutWords(firstWords(caption), NAME_CHARS)) : text.figureBare
   }
   if (block.kind === 'img') {
-    const caption = block.caption ? inlinePlain(block.caption) : ''
+    const caption = block.caption ? inlinePlain(block.caption, options) : ''
     return caption ? text.image(cutWords(firstWords(caption), NAME_CHARS)) : text.imageBare
   }
-  const words = blockPlain(block)
+  const words = blockPlain(block, options)
   if (block.kind === 'h2' || block.kind === 'h3') {
     return text.quoted(cutWords(words, HEADING_NAME_CHARS))
   }

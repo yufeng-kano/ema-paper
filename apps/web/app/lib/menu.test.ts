@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { heightAbove, placeMenu, placeSubmenu } from './menu'
+import { heightAbove, openSide, placeMenu, placeSubmenu } from './menu'
 
 const viewport = { width: 1000, height: 800 }
 const menu = { width: 200, height: 300 }
@@ -44,6 +44,30 @@ describe('placeMenu', () => {
     // A viewport smaller than the menu — flipping runs off the near edge, so the margin wins
     // and the far end is clipped. Showing the top of the menu beats starting it off-screen.
     expect(placeMenu({ x: 5, y: 5 }, menu, { width: 150, height: 150 })).toEqual({ x: 8, y: 8 })
+  })
+})
+
+describe('openSide', () => {
+  // A pane from 100 to 900, a line 20 high; 4 kept clear at the line and at the pane's edge.
+  const pane = { top: 100, bottom: 900 }
+
+  it('opens under the line where the pane has room there for all it needs', () => {
+    expect(openSide({ top: 400, bottom: 420 }, pane, 300, 4)).toEqual({ above: false, room: 472 })
+  })
+
+  it('stands over the line where the room under it is short and the room over it larger', () => {
+    // 900 - 780 - 8 = 112 under, 760 - 100 - 8 = 652 over.
+    expect(openSide({ top: 760, bottom: 780 }, pane, 300, 4)).toEqual({ above: true, room: 652 })
+  })
+
+  it('stays under the line when the room over it is no larger, short or not', () => {
+    // A pane too short for the surface on either side: under wins a tie.
+    expect(openSide({ top: 490, bottom: 510 }, pane, 600, 4)).toEqual({ above: false, room: 382 })
+    expect(openSide({ top: 140, bottom: 160 }, { top: 100, bottom: 300 }, 300, 4)).toEqual({ above: false, room: 132 })
+  })
+
+  it('opens under a line whose room there fits exactly what the surface needs', () => {
+    expect(openSide({ top: 760, bottom: 780 }, pane, 112, 4)).toEqual({ above: false, room: 112 })
   })
 })
 

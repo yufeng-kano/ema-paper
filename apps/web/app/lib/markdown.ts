@@ -1088,9 +1088,10 @@ export function plainText(segments: readonly InlineSegment[]): string {
     .join('')
 }
 
-/** A line of inline markdown as plain text, its spacing collapsed. */
-export function inlinePlain(text: string): string {
-  return plainText(parseInline(text)).replace(/\s+/g, ' ').trim()
+/** A line of inline markdown as plain text, its spacing collapsed; with `cites`, a section
+ *  link as its label, as the notes draw it (`InlineOptions`). */
+export function inlinePlain(text: string, options?: InlineOptions): string {
+  return plainText(parseInline(text, options)).replace(/\s+/g, ' ').trim()
 }
 
 // --- the document's sections ----------------------------------------------------------------
@@ -1221,33 +1222,36 @@ export function sectionSource(pages: readonly ResultPageBlocks[], pageIndex: num
 
 /** A block as the text it reads as: markdown removed, a formula as its TeX, a list's items, a
  *  table's cells and a quote's blocks one after another, spacing collapsed. A figure or an
- *  image is its caption; a comment and a rule are nothing. */
-export function blockPlain(block: ResultBlock): string {
+ *  image is its caption; a comment and a rule are nothing. `options` as `inlinePlain`'s. */
+export function blockPlain(block: ResultBlock, options?: InlineOptions): string {
   switch (block.kind) {
     case 'h2':
     case 'h3':
     case 'p':
-      return inlinePlain(block.text)
+      return inlinePlain(block.text, options)
     case 'list':
-      return block.items.map(inlinePlain).join(' ')
+      return block.items.map((item) => inlinePlain(item, options)).join(' ')
     case 'math':
     case 'code':
       return block.text.replace(/\s+/g, ' ').trim()
     case 'table':
       return [block.header, ...block.rows]
         .flat()
-        .map(inlinePlain)
+        .map((cell) => inlinePlain(cell, options))
         .filter(Boolean)
         .join(' ')
     case 'fig':
     case 'img':
-      return block.caption ? inlinePlain(block.caption) : ''
+      return block.caption ? inlinePlain(block.caption, options) : ''
     case 'toc':
       return block.entries
         .map((entry) => [inlinePlain(entry.title), entry.page === null ? '' : inlinePlain(entry.page)].filter(Boolean).join(' '))
         .join(' ')
     case 'quote':
-      return block.blocks.map(blockPlain).filter(Boolean).join(' ')
+      return block.blocks
+        .map((inner) => blockPlain(inner, options))
+        .filter(Boolean)
+        .join(' ')
     case 'comment':
     case 'hr':
       return ''

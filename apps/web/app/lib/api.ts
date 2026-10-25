@@ -161,6 +161,9 @@ export interface UploadLimits {
   sections_per_message?: number
   selection_max_chars?: number
   section_heading_max_chars?: number
+  /** A conversation's title, as a rename stores it (docs/chat.md § Conversations, turns,
+   *  events). Optional, as above. */
+  conversation_title_max_chars?: number
 }
 
 // --- memory (docs/chat.md § Memory) ----------------------------------------------------
@@ -1326,6 +1329,12 @@ export function conversationEventsUrl(id: number, after: number): string {
 
 export function cancelTurn(id: number): Promise<void> {
   return request<undefined>('POST', `/api/conversations/${id}/cancel`)
+}
+
+/** The reader's title for a thread; the answer is the title as the server cleaned it, and
+ *  the thread keeps its place in the list (docs/chat.md § Conversations, turns, events). */
+export function renameConversation(id: number, title: string): Promise<Conversation> {
+  return request('PUT', `/api/conversations/${id}`, { title })
 }
 
 export function deleteConversation(id: number): Promise<void> {

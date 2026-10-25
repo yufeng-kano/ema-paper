@@ -19,7 +19,7 @@ from pathlib import Path
 from fastapi import APIRouter, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, exists, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..agents import CHAT
@@ -104,10 +104,15 @@ async def owned_document(db: AsyncSession, user_id: int, document_id: int) -> Do
 @router.get("/library/documents/{document_id}/conversations")
 async def list_conversations(document_id: int, user: SessionUser, db: DbSession):
     document = await owned_document(db, user.id, document_id)
+    # Only threads with a message: an empty row is a first send that was refused, kept for
+    # its retry, and never a conversation to pick (docs/chat.md § Conversations).
     rows = (
         await db.execute(
             select(Conversation)
-            .where(Conversation.document_id == document.id)
+            .where(
+                Conversation.document_id == document.id,
+                exists().where(Message.conversation_id == Conversation.id),
+            )
             .order_by(Conversation.updated_at.desc())
         )
     ).scalars()
@@ -308,6 +313,32 @@ async def delete_conversation(conversation_id: int, user: SessionUser, db: DbSes
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+class ConversationRename(BaseModel):
+    title: str
+
+
+@router.put("/conversations/{conversation_id}", dependencies=[CsrfGuard])
+async def rename_conversation(
+    conversation_id: int, body: ConversationRename, user: SessionUser, db: DbSession
+):
+    """The reader's own title, one line like a memory's text. Written alone, with
+    `updated_at` kept as it was: the list orders by it, and a rename is not a thread
+    continued. A running turn does not refuse it — the runner never writes the title
+    (docs/chat.md § Conversations, turns, events)."""
+    row = await owned_conversation(db, user.id, conversation_id)
+    title = memory_defs.clean_text(body.title, single_line=True)[:TITLE_MAX_CHARS].strip()
+    if not title:
+        raise ApiError(400, "invalid_request", "A conversation needs a title")
+    await db.execute(
+        update(Conversation)
+        .where(Conversation.id == row.id)
+        .values(title=title, updated_at=Conversation.updated_at)
+    )
+    await db.commit()
+    await db.refresh(row)
+    return conversation_payload(row)
+
+
 class SectionIn(BaseModel):
     """A whole section the reader added by its heading: its markdown, or null for one past
     the selection cap, which the agent then reads from the document."""
@@ -426,8 +457,14 @@ async def post_message(
     # for the per-user cap, so two sends to different conversations cannot both slip under
     # it, then the conversation's for one turn at a time — always in that order.
     await db.execute(select(User.id).where(User.id == user.id).with_for_update())
+    # The title read under the lock too: a rename that landed after `row` was read must
+    # not be overwritten by the first line below.
     locked = (
-        await db.execute(select(Conversation.id).where(Conversation.id == row.id).with_for_update())
+        await db.execute(
+            select(Conversation.id, Conversation.title)
+            .where(Conversation.id == row.id)
+            .with_for_update()
+        )
     ).first()
     if locked is None:
         # Deleted while this send waited for the lock: a clean 404, not rows inserted
@@ -553,10 +590,11 @@ async def post_message(
     # keeps them for a new conversation.
     if await history_bytes(db, row.id) > settings.chat_history_max_bytes:
         raise ApiError(409, "invalid_request", HISTORY_FULL)
-    if not row.title:
+    if not locked.title:
         named = visible.strip() or (attachments[0][0].name if attachments else "")
         first_line = named.splitlines()[0] if named else ""
-        row.title = first_line[:TITLE_MAX_CHARS]
+        # Trimmed after the cut, as a rename is: a line cut at a space keeps none.
+        row.title = first_line[:TITLE_MAX_CHARS].strip()
     turn = await enqueue_turn(
         db,
         user_id=user.id,

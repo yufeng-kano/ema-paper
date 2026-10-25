@@ -502,6 +502,10 @@ async def test_a_trashed_files_conversation_takes_no_message(writer) -> None:
 
 
 async def test_a_copied_document_has_files_of_its_own(writer) -> None:
+    chosen = await writer.put(
+        "/api/agents/chat/settings", json={"model": "vendor/chat-model"}, headers=CSRF_HEADERS
+    )
+    assert chosen.status_code == 200, chosen.text
     papers = await _folder(writer, "Papers")
     other = await _folder(writer, "Other")
     uploaded = await _upload_markdown(writer, b"# Draft\n", name="draft.md", folder_id=papers["id"])
@@ -521,6 +525,13 @@ async def test_a_copied_document_has_files_of_its_own(writer) -> None:
         f"/api/library/documents/{source['id']}/conversations", headers=CSRF_HEADERS
     )
     assert talked.status_code == 201
+    # With a message: the list holds no empty conversation (docs/chat.md § Conversations).
+    said = await writer.post(
+        f"/api/conversations/{talked.json()['id']}/messages",
+        json={"text": "Summarize it"},
+        headers=CSRF_HEADERS,
+    )
+    assert said.status_code == 202, said.text
 
     duplicate = await _copy(writer, "documents", source["id"], papers["id"])
     assert duplicate.status_code == 201, duplicate.text
@@ -548,6 +559,8 @@ async def test_a_copied_document_has_files_of_its_own(writer) -> None:
     assert source_content.json()["markdown"] == "# Draft, edited\n"
     listed = await writer.get(f"/api/library/documents/{made['id']}/conversations")
     assert listed.json() == {"conversations": []}
+    kept = await writer.get(f"/api/library/documents/{source['id']}/conversations")
+    assert [row["id"] for row in kept.json()["conversations"]] == [talked.json()["id"]]
 
     # Into another folder, the name is free.
     elsewhere = (await _copy(writer, "documents", source["id"], other["id"])).json()

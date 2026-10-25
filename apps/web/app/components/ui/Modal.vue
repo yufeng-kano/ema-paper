@@ -19,7 +19,7 @@
  * is not inside the scrolling region at all. `overscroll-behavior: contain` on the panel
  * body stops a scroll that reaches its end from chaining anywhere.
  */
-import { modalPanelKey } from '~/lib/menu'
+import { modalAboveKey, modalPanelKey } from '~/lib/menu'
 
 const props = withDefaults(
   defineProps<{
@@ -45,6 +45,12 @@ const props = withDefaults(
      * (docs/web.md § Result viewer).
      */
     back?: boolean
+    /**
+     * Stays over the screen's own dialogs, also those that mount after it — the settings
+     * dialog, over the viewer a reload opens behind it (docs/web.md § Pages). Dialogs opened
+     * from inside it still stand over it.
+     */
+    above?: boolean
   }>(),
   { size: 'sm' },
 )
@@ -52,8 +58,22 @@ const props = withDefaults(
 const emit = defineEmits<{ close: [] }>()
 
 const { t } = useI18n()
+const overlay = ref<HTMLElement | null>(null)
 const panel = ref<HTMLElement | null>(null)
 provide(modalPanelKey, panel)
+const insideAbove = inject(modalAboveKey, false)
+provide(modalAboveKey, insideAbove || props.above)
+
+/** The dialog held above that this one, mounted after it and not inside it, must go under:
+ *  the first such overlay before this one on the page. */
+function heldAbove(): HTMLElement | null {
+  const own = overlay.value
+  if (!own || props.above || insideAbove) {
+    return null
+  }
+  const above = document.querySelector<HTMLElement>('body > [data-modal-above]')
+  return above && above.compareDocumentPosition(own) & Node.DOCUMENT_POSITION_FOLLOWING ? above : null
+}
 /** Restored on unmount, so closing a dialog does not dump focus on `<body>`. */
 let previouslyFocused: HTMLElement | null = null
 
@@ -81,7 +101,8 @@ function focusables(): HTMLElement[] {
  * settings dialog's confirmations, a prompt dialog inside it — and each listens on the
  * document, so without this the Escape that closes the top one would close every one
  * under it, and two focus traps would fight over Tab. The last of the overlays in document
- * order is the top one, since each is teleported after the ones before it; for Escape the
+ * order is the top one, since each is teleported after the ones before it — or put under one
+ * held `above`, which stays the later; for Escape the
  * overlays also count a menu and a drawer that owns the key (`data-escape-owner`), which
  * close themselves.
  */
@@ -129,6 +150,13 @@ function onKeydown(event: KeyboardEvent) {
 
 onMounted(async () => {
   document.addEventListener('keydown', onKeydown)
+  // Under a dialog held above, by the order on the page — the order `topmost` and the eye
+  // both go by — and leaving it the focus it holds.
+  const above = heldAbove()
+  if (above && overlay.value) {
+    document.body.insertBefore(overlay.value, above)
+    return
+  }
   previouslyFocused = document.activeElement as HTMLElement | null
   await nextTick()
   // The first field if there is one, else the panel — never the close button, which would
@@ -145,7 +173,13 @@ onBeforeUnmount(() => {
 
 <template>
   <Teleport to="body">
-    <div class="overlay" :class="{ full: size === 'full' }" @click.self="busy || emit('close')">
+    <div
+      ref="overlay"
+      class="overlay"
+      :class="{ full: size === 'full' }"
+      :data-modal-above="above ? '' : undefined"
+      @click.self="busy || emit('close')"
+    >
       <div
         ref="panel"
         class="panel"
