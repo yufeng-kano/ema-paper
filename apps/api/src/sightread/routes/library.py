@@ -1325,16 +1325,19 @@ async def upload_document(
     user_id = user.id
     if not request.headers.get("content-type", "").startswith("multipart/form-data"):
         raise ApiError(400, "invalid_request", "The upload must be multipart/form-data")
-    # Cheap rejection before a byte is read: the largest body any kind may send; each
-    # kind's own cap applies as its bytes arrive, and the capped stream below is what stops
-    # a request that declares no length, or an untrue one.
+    # Cheap rejection before a byte is read: the largest body any kind may send — the
+    # largest of the three caps, which a deployment may order as it likes; each kind's own
+    # cap applies as its bytes arrive, and the capped stream below is what stops a request
+    # that declares no length, or an untrue one.
+    outer_cap, outer_name = max(
+        (settings.file_max_bytes, "FILE_MAX_BYTES"),
+        (settings.upload_max_bytes, "UPLOAD_MAX_BYTES"),
+        (settings.content_max_bytes, "CONTENT_MAX_BYTES"),
+    )
     declared = request.headers.get("content-length", "")
     declared_length = int(declared) if declared.isdigit() else None
-    if (
-        declared_length is not None
-        and declared_length > settings.file_max_bytes + MULTIPART_ENVELOPE_BYTES
-    ):
-        raise ApiError(413, "invalid_request", "The upload exceeds FILE_MAX_BYTES")
+    if declared_length is not None and declared_length > outer_cap + MULTIPART_ENVELOPE_BYTES:
+        raise ApiError(413, "invalid_request", f"The upload exceeds {outer_name}")
 
     # Decided before the body: the parse agent's switch, and what the plan leaves for a
     # file — checked against the declared length before a byte of one is written
@@ -1376,11 +1379,7 @@ async def upload_document(
 
     fields, part = await read_upload_form(
         request.headers,
-        capped_stream(
-            request.stream(),
-            settings.file_max_bytes + MULTIPART_ENVELOPE_BYTES,
-            cap_name="FILE_MAX_BYTES",
-        ),
+        capped_stream(request.stream(), outer_cap + MULTIPART_ENVELOPE_BYTES, cap_name=outer_name),
         open_sink,
     )
     if part is None:

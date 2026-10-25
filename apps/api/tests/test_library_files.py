@@ -8,6 +8,7 @@ safety).
 
 from __future__ import annotations
 
+import os
 import uuid
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from sqlalchemy import select
 from sightread.auth.sessions import SESSION_COOKIE, create_session
 from sightread.db.models import Document, Folder, Job, User
 from sightread.jobs import chat_tools
+from sightread.workspace import documents as workspace_documents
 from sightread.workspace import git, safe_io
 from sightread.workspace.documents import original_of
 from sightread.workspace.layout import trash_root, user_root
@@ -382,7 +384,9 @@ async def test_a_file_the_plan_cannot_hold_is_refused_before_or_after_its_bytes(
         assert (await db.execute(select(Document))).scalars().all() == []
 
 
-async def test_a_file_past_the_cap_is_refused_while_it_streams(make_client, tmp_path) -> None:
+async def test_a_file_past_the_cap_is_refused_while_it_streams(
+    make_client, tmp_path, documents
+) -> None:
     client = make_client(workspaces_dir=str(tmp_path / "ws"), file_max_bytes=1024)
     await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
     user_id = (await client.get("/api/me")).json()["user"]["id"]
@@ -405,6 +409,56 @@ async def test_a_file_past_the_cap_is_refused_while_it_streams(make_client, tmp_
     kept = await _upload(client, "small.bin", b"x" * 1024, OCTET)
     assert kept.status_code == 201, kept.text
     assert (root / "files" / "small.bin").stat().st_size == 1024
+    # The caps are independent: a PDF converted on arrival is judged by its own, larger
+    # cap, never by the file's, however a deployment orders them.
+    pdf = documents["text_pdf"].read_bytes()
+    assert len(pdf) > 1024
+    parsed = await _upload(client, "paper.pdf", pdf, "application/pdf")
+    assert parsed.status_code == 201, parsed.text
+    assert parsed.json()["kind"] == "pdf"
+
+
+async def test_a_body_cut_off_or_with_headers_too_long_is_refused(writer) -> None:
+    boundary = "emapapertestboundary"
+    headers = {**CSRF_HEADERS, "Content-Type": f"multipart/form-data; boundary={boundary}"}
+
+    async def cut_off():
+        yield (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="file"; filename="cut.txt"\r\n'
+            "Content-Type: text/plain\r\n\r\nhello, wor"
+        ).encode()
+
+    # The stream ends inside the file part, no closing boundary: a part of the file is
+    # not the library's one copy of it.
+    refused = await writer.post("/api/library/documents", content=cut_off(), headers=headers)
+    assert refused.status_code == 400, refused.text
+    assert list((writer.root / "files").iterdir()) == []
+    async with writer.app.state.sessionmaker() as db:
+        assert (await db.execute(select(Document))).scalars().all() == []
+
+    def padded(extra: str):
+        async def body():
+            yield (
+                f"--{boundary}\r\n"
+                'Content-Disposition: form-data; name="file"; filename="padded.txt"\r\n'
+                f"{extra}\r\n"
+                "Content-Type: text/plain\r\n\r\nhello\r\n"
+                f"--{boundary}--\r\n"
+            ).encode()
+
+        return body()
+
+    # A part's headers are bounded before any is kept whole: one line past the parser's
+    # own limit, and six under it that together pass the part's budget.
+    one_long = "X-Pad: " + "p" * 8192
+    many = "\r\n".join(f"X-Pad-{n}: " + "p" * 4000 for n in range(6))
+    for extra in (one_long, many):
+        refused = await writer.post(
+            "/api/library/documents", content=padded(extra), headers=headers
+        )
+        assert refused.status_code == 400, refused.text
+    assert list((writer.root / "files").iterdir()) == []
 
 
 async def test_an_upload_without_a_file_part_or_with_two_is_refused(writer) -> None:
@@ -544,6 +598,51 @@ async def test_reconciliation_follows_a_file_the_shell_made_moved_and_removed(wr
     assert set(await rows()) == {".env"}
 
 
+async def test_reconciliation_puts_back_a_file_a_crashed_delete_left_aside(writer) -> None:
+    kept = await _kept(writer, "notes.txt", b"keep me\n", "text/plain")
+    settings = writer.app.state.settings
+    # The delete's first half alone — the file aside with its origin, the row untouched —
+    # is what a process that dies before the rows' commit leaves.
+    removal = await workspace_documents.remove_path(
+        settings, writer.user_id, Path("files/notes.txt")
+    )
+    assert removal is not None
+    assert not (writer.root / "files" / "notes.txt").exists()
+    async with writer.app.state.sessionmaker() as db:
+        await reconcile_user(db, settings, writer.user_id)
+    # Back where its row says, and the row kept: the tree is read again after a restore.
+    assert (writer.root / "files" / "notes.txt").read_bytes() == b"keep me\n"
+    assert [name for name in os.listdir(writer.root) if name.startswith(safe_io.TEMP_PREFIX)] == []
+    rows = (await _read(writer))["documents"]
+    assert [(row["id"], row["kind"], row["size_bytes"]) for row in rows] == [
+        (kept["id"], "file", 8)
+    ]
+
+
+async def test_reconciliation_sweeps_the_file_a_committed_conversion_left_aside(
+    writer, documents
+) -> None:
+    await _switch(writer, False)
+    png = documents["png"].read_bytes()
+    kept = await _kept(writer, "tiny.png", png, "image/png")
+    assert (await _convert(writer, kept["id"])).status_code == 200
+    settings = writer.app.state.settings
+    # The conversion's aside as a process that died after its commit leaves it: the file
+    # set aside with its origin, and a parse row standing at that path now.
+    (writer.root / "files" / "tiny.png").write_bytes(png)
+    removal = await workspace_documents.remove_path(
+        settings, writer.user_id, Path("files/tiny.png"), message="convert files/tiny.png"
+    )
+    assert removal is not None
+    async with writer.app.state.sessionmaker() as db:
+        await reconcile_user(db, settings, writer.user_id)
+    # Swept, not put back over the document's place.
+    assert not (writer.root / "files" / "tiny.png").exists()
+    assert [name for name in os.listdir(writer.root) if name.startswith(safe_io.TEMP_PREFIX)] == []
+    rows = (await _read(writer))["documents"]
+    assert [(row["id"], row["kind"]) for row in rows] == [(kept["id"], "image")]
+
+
 async def test_reconciliation_leaves_a_trashed_file_in_the_trash(writer) -> None:
     created = await _kept(writer, "notes.txt", b"kept", "text/plain")
     base = f"/api/library/documents/{created['id']}"
@@ -608,3 +707,21 @@ async def test_the_editor_writes_nothing_a_revision_could_not_record(tmp_path, m
     own = await edit("files/d/doc.md", "x" * 65)
     assert not own.is_error, own.content
     assert (root / "files" / "d" / "doc.md").read_text() == "x" * 65
+    # A file history never recorded — too large when it arrived — is not edited here
+    # either, even into a size a revision would take: that revision would read as its
+    # creation, and Revert would delete it.
+    (root / "files" / "huge.txt").write_text("x" * 100)
+    shrunk = await chat_tools.run_editor(
+        root,
+        {
+            "command": "str_replace",
+            "path": "/workspace/files/huge.txt",
+            "old_str": "x" * 50,
+            "new_str": "",
+        },
+        "agent:1",
+        max_chars=1000,
+        max_bytes=1_000_000,
+    )
+    assert shrunk.is_error and "revision" in shrunk.content
+    assert (root / "files" / "huge.txt").read_text() == "x" * 100

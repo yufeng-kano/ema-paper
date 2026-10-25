@@ -263,6 +263,19 @@ def _edit_sync(
         return ToolOutcome(f"{vm_path} is not a plain file", is_error=True)
     except UnicodeDecodeError:
         return ToolOutcome(f"{vm_path} is not a text file", is_error=True)
+    if (
+        before is not None
+        and path.name not in git.RECORDED_NAMES
+        and len(before.encode()) > git.revision_max_file_bytes()
+    ):
+        # A file history never recorded — over the cap when it arrived — is not edited here
+        # either, however small the edit would leave it: that revision would read as its
+        # creation, and the card's Revert would delete it rather than put it back
+        # (docs/workspace.md § Revisions, docs/chat.md § Tools).
+        return ToolOutcome(
+            f"{vm_path} is too large for a revision to record, so it is not edited here; use bash",
+            is_error=True,
+        )
     if command == "create":
         new_text = tool_input.get("file_text")
         if not isinstance(new_text, str):

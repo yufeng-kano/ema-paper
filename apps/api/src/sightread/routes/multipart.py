@@ -25,6 +25,10 @@ from ..errors import ApiError
 # A field of the form (`folder_id`) is a few characters; anything longer is not a field.
 FIELD_MAX_BYTES = 1024
 FIELDS_MAX = 16
+# The headers of one part — a disposition with a long encoded filename, a type — fit in a
+# few KiB: a budget per part, kept here beside the parser's own line limit, so what arrives
+# before a part's bytes have a place is never held whole in memory.
+HEADERS_MAX_BYTES = 16 * 1024
 UNREADABLE = "The multipart body could not be read"
 
 
@@ -64,22 +68,33 @@ class _Form:
         self._headers: dict[bytes, bytes] = {}
         self._header_name = bytearray()
         self._header_value = bytearray()
+        self._header_bytes = 0
         self._field_name: str | None = None
         self._field_data = bytearray()
         self._writing = False
+        # Set by the closing boundary: without it the body was cut off in flight.
+        self.ended = False
 
     def on_part_begin(self) -> None:
         self._headers = {}
         self._header_name = bytearray()
         self._header_value = bytearray()
+        self._header_bytes = 0
         self._field_name = None
         self._field_data = bytearray()
         self._writing = False
 
+    def _count_header(self, size: int) -> None:
+        self._header_bytes += size
+        if self._header_bytes > HEADERS_MAX_BYTES:
+            raise ApiError(400, "invalid_request", "A part of the upload has headers too long")
+
     def on_header_field(self, data: bytes, start: int, end: int) -> None:
+        self._count_header(end - start)
         self._header_name += data[start:end]
 
     def on_header_value(self, data: bytes, start: int, end: int) -> None:
+        self._count_header(end - start)
         self._header_value += data[start:end]
 
     def on_header_end(self) -> None:
@@ -129,6 +144,9 @@ class _Form:
         elif self._field_name is not None:
             self.fields[self._field_name] = bytes(self._field_data).decode(self.charset, "replace")
 
+    def on_end(self) -> None:
+        self.ended = True
+
     def close(self) -> None:
         if self.part is not None:
             os.close(self.part.sink.fd)
@@ -150,7 +168,8 @@ async def read_upload_form(
     writing the `file` part into the sink `open_sink(filename, content_type)` returns and
     keeping the other fields. Returns the fields and the file part, None when the body
     carried none; the sink is closed either way, and taken back when the body could not
-    be read or a cap refused it (400, 413 — raised from inside the parse)."""
+    be read, ended before its closing boundary, or a cap refused it (400, 413 — raised
+    from inside the parse)."""
     _kind, params = parse_options_header(headers.get("content-type", ""))
     boundary = params.get(b"boundary")
     if not boundary:
@@ -167,6 +186,7 @@ async def read_upload_form(
             "on_header_value": form.on_header_value,
             "on_header_end": form.on_header_end,
             "on_headers_finished": form.on_headers_finished,
+            "on_end": form.on_end,
         },
     )
     try:
@@ -175,6 +195,11 @@ async def read_upload_form(
         async for chunk in stream:
             await asyncio.to_thread(parser.write, chunk)
         await asyncio.to_thread(parser.finalize)
+        if not form.ended:
+            # The stream ended before the closing boundary — a body cut off in flight —
+            # which the parser's finalize does not say: what arrived is a part of the file,
+            # never the library's one copy of it.
+            raise ApiError(400, "invalid_request", UNREADABLE)
     except FormParserError as exc:
         form.discard()
         raise ApiError(400, "invalid_request", UNREADABLE) from exc

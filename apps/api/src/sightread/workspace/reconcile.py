@@ -256,11 +256,13 @@ def _restore_aside(root: Path, aside_dir: Path, target: Path) -> bool:
     return True
 
 
-async def _row_names(db: AsyncSession, user_id: int, origin: Path) -> bool:
-    """Whether a live folder or document row still places itself at `origin` (`files/…`):
-    what decides that an aside holding no document metadata goes back there rather than
-    being swept (docs/workspace.md § Revisions). A row in the Trash places nothing under
-    `files/`."""
+async def _row_names(db: AsyncSession, user_id: int, origin: Path, *, file: bool) -> bool:
+    """Whether a live row still places itself at `origin` (`files/…`) — a folder or a
+    document for a directory aside, a file row for a plain file aside (`file`): what decides
+    that an aside holding no document metadata goes back there rather than being swept
+    (docs/workspace.md § Revisions). A conversion committed leaves a parse where its file
+    stood, so the file it set aside is swept, never put back over the document; a row in
+    the Trash places nothing under `files/`."""
     segments = origin.parts[1:]
     if origin.parts[:1] != (FILES_DIR,) or not segments:
         return False
@@ -276,20 +278,24 @@ async def _row_names(db: AsyncSession, user_id: int, origin: Path) -> bool:
         ).all()
         match = next((row.id for row in folders if path_segment(row.name) == segment), None)
         if match is not None:
+            if file and index == len(segments) - 1:
+                return False  # a folder stands where the file did
             parent = match
             continue
         if index != len(segments) - 1:
             return False
         in_folder = Document.folder_id.is_(None) if parent is None else Document.folder_id == parent
-        names = (
+        rows = (
             await db.execute(
-                select(Document.name).where(
+                select(Document.name, Document.kind).where(
                     Document.user_id == user_id, in_folder, Document.trashed_at.is_(None)
                 )
             )
-        ).scalars()
-        return any(path_segment(name) == segment for name in names)
-    return True
+        ).all()
+        return any(
+            path_segment(row.name) == segment and (row.kind == FILE_KIND) == file for row in rows
+        )
+    return not file
 
 
 def _aside_origin(aside: Path, targets: dict[Path, Path]) -> Path | None:
@@ -466,7 +472,8 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
             # where it stood, and a row that still names that path brings it back whole
             # (docs/workspace.md § Revisions). Without one, the sweep takes it.
             origin = await asyncio.to_thread(aside_origin, root, name)
-            if origin is not None and await _row_names(db, user_id, origin):
+            is_file = await asyncio.to_thread(safe_io.entry_kind, root, root / name) == "file"
+            if origin is not None and await _row_names(db, user_id, origin, file=is_file):
                 if await asyncio.to_thread(_restore_aside, root, Path(name), origin):
                     restored += 1
                 else:
@@ -488,6 +495,10 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
             else:
                 keep.add(name)
     await asyncio.to_thread(sweep_aside, root, keep)
+    if restored:
+        # What came back stands in the tree now and in no scan taken before it did: the
+        # tree is read again, or a restored file's row would go as missing (§ Files).
+        found, folders, plain = await asyncio.to_thread(_canonicalize_and_scan, root)
     # One id in two places — `cp -r` carries `.meta.json` along — names no winner: the
     # row stays where it is, and the copies are the shell's to sort out.
     live_files = {row.id: row for row in documents.values() if row.kind == FILE_KIND}
