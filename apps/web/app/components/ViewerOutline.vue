@@ -94,11 +94,13 @@ function onEnterRegion() {
 }
 
 /** The pointer left the ticks, the panel and the column between them. Focus the panel held
- *  goes back to the button rather than to the page as the panel goes. */
-function onLeaveRegion() {
+ *  goes back to the button rather than to the page as the panel goes. A finger leaves each
+ *  time it lifts or starts scrolling the panel, so on a touch screen the panel closes as a
+ *  menu does instead: a press elsewhere, Escape or focus leaving. */
+function onLeaveRegion(event: PointerEvent) {
   clearTimeout(restTimer)
   clearTimeout(closeTimer)
-  if (open.value) {
+  if (open.value && event.pointerType !== 'touch') {
     closeTimer = setTimeout(() => hide(panel.value?.contains(document.activeElement) ?? false), CLOSE_MS)
   }
 }
