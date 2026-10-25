@@ -13,8 +13,9 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
+import respx
 from httpx import AsyncClient
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 
 from sightread.agents import PARSE
 from sightread.auth.api_keys import create_api_key
@@ -36,10 +37,11 @@ from sightread.jobs.queue import find_cached_job
 from sightread.jobs.sweeper import expire_trash, purge_parses
 from sightread.workspace.documents import original_of
 from sightread.workspace.layout import images_dir, results_root, trash_root, user_root
-from tests.conftest import CSRF_HEADERS, DATABASE_URL, KANO_BASE, PARSE_MODEL
+from tests.conftest import CSRF_HEADERS, DATABASE_URL, KANO_BASE, KANO_CHAT_URL, PARSE_MODEL
 from tests.test_document_images import _image, _insert
 from tests.test_library_trash import _document, _folder, _read, _trash, _write
 from tests.test_markdown_documents import _upload_markdown
+from tests.test_parse_end_to_end import _drain_queue, _vision_stub
 
 postgres_only = pytest.mark.skipif(
     not (DATABASE_URL or "").startswith("postgresql"),
@@ -412,6 +414,62 @@ async def test_the_dedup_cache_never_answers_with_a_parse_about_to_be_deleted(
         assert await find_cached_job(db, retention_days=1, **_key(user.id, "2" * 64)) is None
         assert (await find_cached_job(db, retention_days=1, **_key(user.id, "3" * 64))).id == filed
         assert (await find_cached_job(db, retention_days=0, **_key(user.id, "1" * 64))).id == late
+
+
+@postgres_only
+@respx.mock
+async def test_a_library_cache_hit_purged_before_it_is_filed_is_refused_plainly(
+    writer, documents, monkeypatch
+) -> None:
+    from sightread.routes import library
+
+    respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
+    settings = writer.app.state.settings
+    sessionmaker = writer.app.state.sessionmaker
+    body = documents["text_pdf"].read_bytes()
+
+    async def upload():
+        return await writer.post(
+            "/api/library/documents",
+            files={"file": ("text.pdf", body, "application/pdf")},
+            headers=CSRF_HEADERS,
+        )
+
+    assert (await upload()).status_code == 201
+    await _drain_queue(writer, sessionmaker)
+    async with sessionmaker() as db:
+        await db.execute(
+            update(Job).values(
+                finished_at=utcnow() - timedelta(days=settings.parse_retention_days + 10)
+            )
+        )
+        await db.commit()
+    submit = library.submit_parse
+
+    async def raced(*args, **kwargs):
+        # The cache answers with the parse only the file keeps; the file is deleted for
+        # good and the sweep purges the parse before the upload takes the workspace lock.
+        submission = await submit(*args, **kwargs)
+        assert submission.cached is not None
+        async with sessionmaker() as db:
+            await db.execute(delete(Document))
+            await db.commit()
+        assert await purge_parses(sessionmaker, settings) == 1
+        return submission
+
+    monkeypatch.setattr(library, "submit_parse", raced)
+    refused = await upload()
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["error"]["message"] == (
+        "The earlier parse of this file was just deleted; upload it again"
+    )
+    async with sessionmaker() as db:
+        assert (await db.execute(select(Document))).all() == []
+    assert [path.name for path in Path(settings.upload_dir).iterdir()] == []
+    # Uploaded again, it parses afresh.
+    monkeypatch.undo()
+    assert (await upload()).status_code == 201
 
 
 @postgres_only

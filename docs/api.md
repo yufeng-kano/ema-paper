@@ -42,7 +42,7 @@ The JSON form is held whole by `request.json()`, so the body-limit middleware gi
 
 A parse with any failed page is `failed` as a whole ([parsing.md](./parsing.md) § Vision-only conversion): `error` counts the failed pages and names their reasons, and there is no result to fetch. A new upload, or the same one with `force`, parses it again; the pages are retried alone only from the web library ([jobs.md](./jobs.md) § Retrying failed pages).
 
-A finished parse is kept `PARSE_RETENTION_DAYS` (30) days after it finished — longer only while a file in the web library names a parse of the same original — and then deleted with its result and crops ([jobs.md](./jobs.md) § Retention): from then on this route, `/result`, `/result.md` and `/events` answer **404** `No such job`, as for a job that never existed, and the same bytes uploaded again parse — and are charged — again. Save the result when it arrives.
+A finished parse is kept `PARSE_RETENTION_DAYS` (30) days after it finished — longer only while a file in the web library names a parse of the same original, or while an upload ticket that has not expired reads it — and then deleted with its result and crops ([jobs.md](./jobs.md) § Retention): from then on this route, `/result`, `/result.md` and `/events` answer **404** `No such job`, as for a job that never existed, and the same bytes uploaded again parse — and are charged — again. Save the result when it arrives.
 
 ### GET /v1/jobs/{id}/result — full result
 

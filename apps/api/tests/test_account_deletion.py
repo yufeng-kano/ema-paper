@@ -475,6 +475,28 @@ async def test_running_work_refuses_and_queued_work_goes_with_the_account(
         assert (await db.execute(select(ChatTurn))).all() == []
 
 
+@postgres_only
+async def test_a_queued_parse_takes_its_upload_with_the_account(
+    make_client, tmp_path, documents
+) -> None:
+    account = await _account(make_client, tmp_path)
+    uploaded = await account.post(
+        "/api/library/documents",
+        files={"file": ("tiny.png", documents["png"].read_bytes(), "image/png")},
+        headers=CSRF_HEADERS,
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    async with account.app.state.sessionmaker() as db:
+        job = (await db.execute(select(Job).where(Job.user_id == account.user_id))).scalar_one()
+    source = Path(job.source_path)
+    # Named for the job it became: how every removal of a job's uploads finds it.
+    assert (job.status, source.stem) == ("queued", str(job.id))
+    assert source.is_file()
+
+    assert (await _delete(account)).status_code == 204
+    assert not source.exists()
+
+
 @respx.mock
 async def test_a_sandbox_that_cannot_be_stopped_does_not_hold_the_deletion_up(
     make_client, tmp_path

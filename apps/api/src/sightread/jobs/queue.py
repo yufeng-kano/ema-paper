@@ -45,6 +45,7 @@ from ..db.models import (
     Job,
     JobPage,
     Message,
+    UploadTicket,
     utcnow,
 )
 from ..sandbox.client import SandboxClient, SandboxUnavailable
@@ -206,35 +207,46 @@ def dedup_key(
     ]
 
 
-def parse_kept(retention_days: int) -> ColumnElement[bool]:
+def parse_kept(retention_days: int, margin: timedelta = timedelta(0)) -> ColumnElement[bool]:
     """The parse retention's rule, written once (docs/jobs.md § Retention): a job is kept
     while it is queued or running, while it finished less than `retention_days` days ago
-    (a row from before `finished_at` was always written counts from its creation), or
-    while any document of its user — live or in the Trash — names a parse (its
-    `job_id` or its `reconvert_job_id`) of the same original. The last clause keeps a
-    document's own parse, its re-convert, and the earlier parses of its original the
-    figure route falls back on. The purge deletes the finished jobs it does not keep; the
-    dedup cache asks it with a day less (`find_cached_job`)."""
+    (a row from before `finished_at` was always written counts from its creation), while
+    any document of its user — live or in the Trash — names a parse (its `job_id` or its
+    `reconvert_job_id`) of the same original, or while an upload ticket that has not
+    expired names it. The document clause keeps a document's own parse, its re-convert,
+    and the earlier parses of its original the figure route falls back on; the ticket
+    clause keeps the job a spent ticket still reads, a cache hit's included.
+
+    `margin`: kept for at least that much longer — the age and the ticket clauses then
+    ask for that much more time left. The purge deletes the finished jobs kept with no
+    margin; the dedup cache asks with a day (`find_cached_job`)."""
     named = aliased(Job)
+    now = utcnow()
     return or_(
         Job.status.in_(("queued", "running")),
-        func.coalesce(Job.finished_at, Job.created_at) > utcnow() - timedelta(days=retention_days),
+        func.coalesce(Job.finished_at, Job.created_at)
+        > now - timedelta(days=retention_days) + margin,
         select(Document.id)
         .join(named, or_(named.id == Document.job_id, named.id == Document.reconvert_job_id))
         .where(Document.user_id == Job.user_id, named.sha256 == Job.sha256)
+        .exists(),
+        select(UploadTicket.id)
+        .where(UploadTicket.job_id == Job.id, UploadTicket.expires_at > now + margin)
         .exists(),
     )
 
 
 async def find_cached_job(db: AsyncSession, *, retention_days: int, **key) -> Job | None:
     """The dedup lookup: a succeeded job for this exact parse (docs/jobs.md § Dedup) that
-    the retention keeps for at least another day — named by a document's clause, or
-    finished less than `retention_days - 1` days ago, never by its age alone at 1 — so a
-    result handed out is never purged between the lookup and its use (§ Dedup margin).
-    With `retention_days` 0 nothing is purged, and any succeeded job answers."""
+    the retention keeps for at least another day — named by a document's clause,
+    finished less than `retention_days - 1` days ago (never by its age alone at 1), or
+    named by an upload ticket with a day left, which one living `UPLOAD_TICKET_TTL_SECONDS`
+    (an hour) never has — so a result handed out is never purged between the lookup and
+    its use (§ Dedup margin). With `retention_days` 0 nothing is purged, and any
+    succeeded job answers."""
     query = select(Job).where(*dedup_key(**key), Job.status == "succeeded")
     if retention_days > 0:
-        query = query.where(parse_kept(retention_days - 1))
+        query = query.where(parse_kept(retention_days, margin=timedelta(days=1)))
     return (await db.execute(query.order_by(Job.created_at.desc()).limit(1))).scalar_one_or_none()
 
 
@@ -332,10 +344,12 @@ async def enqueue_job(
     retain_source: bool = False,
     fallback_model: str | None = None,
     check: CheckTarget | None = None,
+    job_id: uuid.UUID | None = None,
 ) -> Job:
-    """Create the queued job row. The caller commits — creation and enqueue are one act."""
+    """Create the queued job row. The caller commits — creation and enqueue are one act.
+    `job_id` is the id the upload was named for, when it was."""
     job = Job(
-        id=uuid.uuid4(),
+        id=job_id if job_id is not None else uuid.uuid4(),
         user_id=user_id,
         agent=agent,
         kind=kind,

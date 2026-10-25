@@ -358,6 +358,8 @@ async def submit_parse(
 
     upload_dir = Path(settings.upload_dir)
     upload_dir.mkdir(parents=True, exist_ok=True)
+    # Named for the job it may become, so whatever removes a job's uploads by its id — the
+    # parse retention, deleting the account — finds it (docs/jobs.md § Retention).
     job_id = uuid.uuid4()
     stored = upload_dir / f"{job_id}{Path(filename).suffix.lower()[:16]}"
     size_bytes, sha256 = await store_upload(chunks, stored, settings.upload_max_bytes)
@@ -462,6 +464,7 @@ async def submit_parse(
         retain_source=retain_source,
         fallback_model=target.fallback_model,
         check=check_target,
+        job_id=job_id,
     )
     # The job's credits, reserved in the commit that queues it: a job the balance cannot
     # cover is never queued, and the upload is not kept for it.

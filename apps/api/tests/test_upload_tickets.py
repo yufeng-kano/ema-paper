@@ -6,18 +6,22 @@ No upstream traffic here either — the worker runs against the stubbed Kano Pro
 
 from __future__ import annotations
 
+import uuid
+from datetime import timedelta
 from pathlib import Path
 
 import httpx
 import pytest
 import respx
 from httpx import AsyncClient
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 
 from sightread.auth import upload_tickets
-from sightread.db.models import UploadTicket, User
+from sightread.db.models import Document, Job, UploadTicket, User, utcnow
+from sightread.jobs.sweeper import purge_parses
 from tests.conftest import KANO_CHAT_URL, mcp_running
 from tests.test_parse_end_to_end import MODEL, _authorize, _drain_queue, _vision_stub
+from tests.test_retention import postgres_only
 
 # The copy is part of the contract: it is the agent's only recovery hint (docs/auth.md § 5).
 EXPECTED_REJECTION = (
@@ -260,3 +264,49 @@ async def test_a_dedup_hit_binds_the_ticket_to_the_cached_job(
     result = await api_client.get(f"/v1/jobs/{job_id}/result", headers=_bearer(token))
     assert result.status_code == 200
     assert result.json()["markdown"]
+
+
+@postgres_only
+@respx.mock
+async def test_a_cache_hit_outlives_the_file_that_kept_it_while_its_ticket_reads_it(
+    api_client, sessionmaker, documents
+) -> None:
+    respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
+    settings = api_client.app.state.settings
+    first = await api_client.post(
+        "/v1/parse",
+        files={"file": ("text.pdf", documents["text_pdf"].read_bytes(), "application/pdf")},
+        data={"model": MODEL},
+    )
+    job_id = uuid.UUID(first.json()["job_id"])
+    await _drain_queue(api_client, sessionmaker)
+    # Past its retention, kept only by a file of the same original.
+    async with sessionmaker() as db:
+        user = (await db.execute(select(User))).scalars().one()
+        await db.execute(
+            update(Job)
+            .where(Job.id == job_id)
+            .values(finished_at=utcnow() - timedelta(days=settings.parse_retention_days + 10))
+        )
+        db.add(Document(user_id=user.id, job_id=job_id, name="text.pdf"))
+        await db.commit()
+    token = await _mint(api_client, sessionmaker)
+    cached = await _upload(api_client, token, documents["text_pdf"])
+    assert cached.status_code == 200, cached.text
+    assert cached.json()["meta"]["cached"] is True
+
+    # The file is deleted for good before the client fetches the result: the ticket still
+    # reads the job, so the sweep keeps it until the ticket expires.
+    async with sessionmaker() as db:
+        await db.execute(delete(Document).where(Document.job_id == job_id))
+        await db.commit()
+    assert await purge_parses(sessionmaker, settings) == 0
+    fetched = await api_client.get("/v1/jobs/last/result", headers=_bearer(token))
+    assert fetched.status_code == 200, fetched.text
+
+    async with sessionmaker() as db:
+        await db.execute(update(UploadTicket).values(expires_at=utcnow() - timedelta(seconds=1)))
+        await db.commit()
+    assert await purge_parses(sessionmaker, settings) == 1
+    async with sessionmaker() as db:
+        assert await db.get(Job, job_id) is None

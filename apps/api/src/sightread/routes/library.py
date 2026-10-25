@@ -1334,6 +1334,21 @@ async def upload_document(
     # one without the other (docs/workspace.md § Revisions, § Backups).
     root = user_root(settings.workspaces_dir, user_id)
     async with backup_shared(root), workspace_lock(root):
+        # A cache hit that only a file kept can have been purged since the lookup, that
+        # file deleted for good meanwhile (docs/jobs.md § Dedup margin); under this lock
+        # the purge waits. Said plainly, not as the name conflict the insert would make of
+        # a missing job.
+        if (
+            submission.cached is not None
+            and await db.scalar(select(Job.id).where(Job.id == job_id)) is None
+        ):
+            if submission.upload is not None:
+                submission.upload.unlink(missing_ok=True)
+            raise ApiError(
+                409,
+                "invalid_request",
+                "The earlier parse of this file was just deleted; upload it again",
+            )
         try:
             row = await land(folder_id)
         except ApiError as exc:
