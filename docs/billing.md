@@ -12,11 +12,12 @@ Two plans. Free is a platform policy, never a product at the payment provider; a
 | Credits per period | `FREE_CREDITS_PER_PERIOD` (150) | the plan's `credits` (5,000 in the launch configuration) |
 | Period | the UTC calendar month | the subscription's paid period, as Pay reports it |
 | Sandbox (`bash` in chat) | no | yes, the VM stops after 10 idle minutes (`SANDBOX_IDLE_SECONDS=600` on that deployment) |
-| Workspace storage | `FREE_STORAGE_BYTES` (50 MB) | the plan's `storageBytes` (10 GiB) |
+| Workspace storage | `FREE_STORAGE_BYTES` (512 MB) | the plan's `storageBytes` (10 GiB) |
 | Parses at once | `FREE_MAX_JOBS` (1) | the plan's `maxJobs` (3) |
 | Files | kept for as long as the account exists — **both** plans. Nothing is deleted when a period ends or a subscription lapses; a Free user over the storage cap can read and delete, not add ([workspace.md](./workspace.md) § Quota) |
 | REST API and MCP | yes | yes |
 
+- **Storage is set in decimal bytes.** The web app prints sizes 1000-based, as Finder does (`formatBytes`, [web.md](./web.md)), so a cap meant to read as a round number is one in decimal: `512000000` reads as *512 MB*, where `524288000` (500 MiB) would read as *524 MB* and `536870912` (512 MiB) as *537 MB*.
 - **Every user has Free**, from the moment the `users` row exists, with no row of its own: a user with no active subscription *is* on Free. Empty Kano Pay configuration must not break Free.
 - **Entitlements come from the plan the current period belongs to** (§ Periods): the storage cap, the concurrency cap and whether the chat agent gets `bash` are read from it wherever today's code reads `WORKSPACE_QUOTA_BYTES`, `MAX_JOBS_PER_USER` and `sandbox_configured`. A deployment with no runner (`SANDBOX_URL` empty) gives nobody `bash`, whatever the plan says.
 - **Without a sandbox the chat agent runs as it does today without one** (`TOOLS_WITHOUT_BASH`, [chat.md](./chat.md) § Tools): page and figure views, the editor, skills, subagents, memory and translation stay; only `bash` goes. Which of those Free should keep is still the operator's open question; the contract here is the current set.
@@ -155,7 +156,7 @@ The screens are specified in [web.md](./web.md) and the design in the project's 
 | `CREDIT_USD` | what one credit is worth in list-price USD (0.002) |
 | `PARSE_CREDITS_PER_PAGE` | credits per parsed page (1) |
 | `CHAT_MIN_CREDITS` | the balance a chat send needs (1) |
-| `FREE_CREDITS_PER_PERIOD`, `FREE_STORAGE_BYTES`, `FREE_MAX_JOBS` | the Free plan (150, 52428800, 1) |
+| `FREE_CREDITS_PER_PERIOD`, `FREE_STORAGE_BYTES`, `FREE_MAX_JOBS` | the Free plan (150, 512000000, 1) |
 | `KANO_PAY_URL`, `KANO_PAY_APP_ID`, `KANO_PAY_API_KEY`, `KANO_PAY_WEBHOOK_SECRET` | the Pay registration; all four set = Pay configured, otherwise every user is on Free and the billing section says checkout is not available |
 | `KANO_PAY_PLANS_JSON` | `[{"planId": "pro", "credits": 5000, "storageBytes": 10737418240, "sandbox": true, "maxJobs": 3}]` — what a paid plan grants; the price is Pay's |
 | `BILLING_REFRESH_SECONDS` | how often `GET /api/billing` may reconcile with Pay per user (120) |

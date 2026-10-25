@@ -140,10 +140,11 @@ def _page(title: str, body: str, status_code: int = 200) -> HTMLResponse:
             "<meta name='robots' content='noindex'>"
             # Named explicitly: this page is not Nuxt, so it inherits none of the web app's
             # head. Without these the client falls back to /favicon.ico and shows whatever
-            # icon it already associates with the parent domain.
-            "<link rel='icon' href='/favicon.svg' type='image/svg+xml'>"
-            "<link rel='icon' href='/favicon.ico' sizes='48x48'>"
-            "<link rel='apple-touch-icon' href='/apple-touch-icon.png'>"
+            # icon it already associates with the parent domain. `?v=` is the mark's
+            # version, kept in step with the web app's (apps/web/nuxt.config.ts).
+            "<link rel='icon' href='/favicon.svg?v=2' type='image/svg+xml'>"
+            "<link rel='icon' href='/favicon.ico?v=2' sizes='48x48'>"
+            "<link rel='apple-touch-icon' href='/apple-touch-icon.png?v=2'>"
             f"<title>{html.escape(title)}</title>"
             f"<style>{PAGE_STYLE}</style></head>"
             f"<body><main class='card'>"

@@ -353,15 +353,7 @@ onBeforeUnmount(() => {
   font-size: var(--text-xs);
   line-height: 1.5;
   outline: none;
-  backdrop-filter: blur(24px) saturate(180%);
-  -webkit-backdrop-filter: blur(24px) saturate(180%);
   animation: card-in var(--duration-fast) var(--ease-enter);
-}
-
-@supports not (backdrop-filter: blur(1px)) {
-  .card {
-    background: var(--paper);
-  }
 }
 
 @keyframes card-in {
@@ -443,7 +435,7 @@ onBeforeUnmount(() => {
 .entry-kind {
   padding: 1px 6px;
   border-radius: var(--radius);
-  background: var(--rail);
+  background: var(--fill);
   color: var(--ink-soft);
 }
 

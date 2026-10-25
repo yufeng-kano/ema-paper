@@ -62,7 +62,7 @@ class Settings(BaseSettings):
     chat_min_credits: int = 1
     # The Free plan (docs/billing.md § Plans).
     free_credits_per_period: int = 150
-    free_storage_bytes: int = 52_428_800
+    free_storage_bytes: int = 512_000_000
     free_max_jobs: int = 1
     # What the public policy pages print (docs/web.md § Pages): the support address and
     # who operates the service, served by `GET /api/site`; empty = not printed.

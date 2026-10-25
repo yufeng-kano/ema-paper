@@ -266,8 +266,7 @@ function pick(name: string) {
 }
 
 @supports not (backdrop-filter: blur(1px)) {
-  .toolbar,
-  .skills {
+  .toolbar {
     background: var(--paper);
   }
 }
@@ -340,8 +339,6 @@ function pick(name: string) {
   border-radius: var(--radius-menu);
   background: var(--menu-surface);
   box-shadow: var(--shadow-menu);
-  backdrop-filter: blur(24px) saturate(180%);
-  -webkit-backdrop-filter: blur(24px) saturate(180%);
   white-space: normal;
   transform-origin: top right;
   animation: toolbar-in var(--duration-fast) var(--ease-enter);

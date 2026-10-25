@@ -22,7 +22,7 @@ The origin spec (v0.1) is a reference, not a contract. Decisions that supersede 
 
 ## Tenants and trust model
 
-- **One upstream, the operator's.** Every model call runs on the operator's own Kano Proxy account ([auth.md](./auth.md) § 3); users bring no key. Under the subscription ([billing.md](./billing.md)) a user's spend is bounded by the credits their plan grants per period: Free (a small monthly grant, no sandbox, 50 MB) and Pro (a larger grant, the sandbox, 10 GiB), paid through Kano Pay. Files are kept on both plans for as long as the account exists.
+- **One upstream, the operator's.** Every model call runs on the operator's own Kano Proxy account ([auth.md](./auth.md) § 3); users bring no key. Under the subscription ([billing.md](./billing.md)) a user's spend is bounded by the credits their plan grants per period: Free (a small monthly grant, no sandbox, 512 MB) and Pro (a larger grant, the sandbox, 10 GiB), paid through Kano Pay. Files are kept on both plans for as long as the account exists.
 - Documents are untrusted input: parsing runs in short-lived subprocesses with timeouts; uploads are size- and page-capped.
 - Document content is sensitive: source files are short-lived, prompts/completions are never logged (nor are a failed database statement's bound values, which hold the same text), results are visible only to their owner.
 

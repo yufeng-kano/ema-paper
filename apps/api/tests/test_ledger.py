@@ -267,7 +267,7 @@ async def test_the_billing_route_and_me_show_the_plan_and_the_balance(make_clien
         "id": "free",
         "name": "free",
         "credits": 150,
-        "storage_bytes": 52_428_800,
+        "storage_bytes": 512_000_000,
         "sandbox": False,
         "max_jobs": 1,
     }

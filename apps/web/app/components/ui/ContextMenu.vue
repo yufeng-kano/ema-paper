@@ -478,19 +478,9 @@ function choose(item: MenuItem, event?: MouseEvent) {
   border: 1px solid var(--menu-edge);
   background: var(--menu-surface);
   box-shadow: var(--shadow-menu);
-  backdrop-filter: blur(24px) saturate(180%);
-  -webkit-backdrop-filter: blur(24px) saturate(180%);
   /* The pop: a menu appears, it does not fade in place. The origin is the corner the menu
      opened from, which `place()` sets — a flipped menu grows back towards the pointer. */
   animation: menu-in var(--duration-fast) var(--ease-enter);
-}
-
-/* Without blur support the translucency would leave text over text, so the surface goes
-   opaque instead. */
-@supports not (backdrop-filter: blur(1px)) {
-  .menu {
-    background: var(--paper);
-  }
 }
 
 @keyframes menu-in {
