@@ -97,8 +97,8 @@ const SAVE_DEBOUNCE_MS = 1200
 
 type SaveState = 'saved' | 'editing' | 'saving' | 'failed'
 
-/** Where the collapsed headings are remembered in the browser: per document on Files, per job
- *  on History (docs/web.md § Result viewer, *Outline, collapse and the way back*). */
+/** Where the collapsed headings are remembered in the browser, per document (docs/web.md
+ *  § Result viewer, *Outline, collapse and the way back*). */
 const FOLDS_KEY = 'sightread.viewer.folds'
 
 /** How long the status note shows, and how long one carrying *Undo* waits for the reader
@@ -119,9 +119,10 @@ const AUTOSCROLL_STEP_PX = 16
 const EXCERPTS_DEBOUNCE_MS = 300
 
 /** The gutter the outline needs left of the column: its ticks and about 40px past a heading's
- *  own controls — on Files the chevron and the handle, on History the chevron. */
+ *  own controls — the chevron and the handle once the copy is editable, the chevron alone
+ *  while it loads. */
 const OUTLINE_GUTTER_FILES_PX = 128
-const OUTLINE_GUTTER_HISTORY_PX = 100
+const OUTLINE_GUTTER_READ_ONLY_PX = 100
 /** The outline's room (`ViewerOutline`): its ticks run from this far under the pane's top
  *  down to this far above the pane's foot, or to 8px above the pieces at the foot wherever they
  *  stand (`footReach`) — and are centred in it. */
@@ -163,19 +164,18 @@ type Slot = { element: Element | null; atom: boolean }
  * A finished parse, as a document rather than as a blob of JSON — and, on Files, the
  * document's editable copy with its notes and the agent's thread beside it.
  *
- * The dialog is the reason a filename is a link on both screens that list parses — Files
- * and History: what a reader actually wants to check is whether the markdown came back
- * right, and a `<pre>` of the whole envelope makes that a reading exercise. The JSON is
- * still one tab away — it is the contract, and nothing here replaces it.
+ * The dialog is what opening a document on Files opens: what a reader actually wants to
+ * check is whether the markdown came back right, and a `<pre>` of the whole envelope makes
+ * that a reading exercise. The JSON is still one tab away — it is the contract, and nothing
+ * here replaces it.
  *
- * It takes a title and a job error rather than a job row, because the two callers hold
- * different shapes of the same thing: a `JobSummary` on History, a `LibraryDocument` on
- * Files. Neither is this component's business — it renders a result. Files also hands it
- * the document's id, which is what turns the viewer into an editor: the markdown tab then
- * shows the workspace copy (`GET …/content`, docs/web.md § Editing) rather than the parse
- * result, every block opens as its source on a click, saves are automatic, and the notes
- * and agent columns become available. History, with no document, keeps the read-only
- * viewer with the reading aids alone.
+ * It takes a title and a job error rather than the library's row, which is not this
+ * component's business — it renders a result. Files also hands it the document's id, which
+ * is what turns the viewer into an editor: the markdown tab then shows the workspace copy
+ * (`GET …/content`, docs/web.md § Editing) rather than the parse result, every block opens
+ * as its source on a click, saves are automatic, and the notes and agent columns become
+ * available. Until that copy has loaded, or when it cannot be read, the viewer is read-only,
+ * with the reading aids alone.
  *
  * The markdown tab is one continuous scroll, and **the document carries no page labels and
  * the viewer no page navigation**: what a reader checks is the transcription, and which page
@@ -214,8 +214,6 @@ const props = withDefaults(
     imageBase?: string | null
     /** The library document, when there is one: what makes the viewer editable. */
     documentId?: number | null
-    /** History's job, when there is no document: whose collapsed sections are remembered. */
-    jobId?: string | null
     /** A block link's anchor (`/files?document=…&block=…`): followed once the copy loads. */
     initialBlock?: string | null
     /** A markdown document: no parse result to wait for, its copy is the document
@@ -231,7 +229,6 @@ const props = withDefaults(
     figureBase: null,
     imageBase: null,
     documentId: null,
-    jobId: null,
     initialBlock: null,
     markdownDocument: false,
     reconvertNote: null,
@@ -1236,8 +1233,8 @@ const lineEditorRows = computed(() => Math.max(2, draft.value.split('\n').length
 
 // --- collapsed sections ------------------------------------------------------------------
 
-/** Whose folds the browser remembers: the document on Files, the job on History. */
-const foldId = computed(() => (props.documentId !== null ? `doc:${props.documentId}` : props.jobId ? `job:${props.jobId}` : null))
+/** Whose folds the browser remembers: the document's. */
+const foldId = computed(() => (props.documentId !== null ? `doc:${props.documentId}` : null))
 
 function readFolds(): FoldMemory {
   if (!import.meta.client) {
@@ -1326,7 +1323,7 @@ function rowIndexNear(page: number, index: number): number | null {
 
 /** The document loaded whole: a partial result lacks pages still to come. */
 const wholeDocument = computed(
-  () => (props.result !== null || props.markdownDocument) && !partial.value && (props.documentId === null || editable.value),
+  () => (props.result !== null || props.markdownDocument) && !partial.value && editable.value,
 )
 
 function onFindExpand(key: string) {
@@ -1346,8 +1343,8 @@ function toggleFold(key: string) {
   }
 }
 
-/** The fold note expands what it names; focus goes to the heading — its block on Files, its
- *  chevron on History — since the note goes away as it expands. */
+/** The fold note expands what it names; focus goes to the heading — its block once the copy
+ *  is editable, its chevron while it is read-only — since the note goes away as it expands. */
 function expandFromNote(key: string) {
   const at = afterCommit(parseKey(key))
   commitEdit()
@@ -1648,8 +1645,8 @@ function isHeading(block: ResultBlock): boolean {
   return block.kind === 'h2' || block.kind === 'h3'
 }
 
-/** Each block stays one tab stop on Files; on History a block takes focus only from the
- *  viewer, when the way back hands it over. */
+/** Each block stays one tab stop once the copy is editable; while it is read-only a block
+ *  takes focus only from the viewer, when the way back hands it over. */
 function blockTabindex(block: ResultBlock, pageIndex: number, index: number): number | undefined {
   if (block.kind === 'comment' || isEditing(pageIndex, index)) {
     return undefined
@@ -3346,7 +3343,7 @@ const showOutline = computed(
   () =>
     tab.value === 'markdown' &&
     outline.value.length >= 2 &&
-    gutter.value >= (editable.value ? OUTLINE_GUTTER_FILES_PX : OUTLINE_GUTTER_HISTORY_PX),
+    gutter.value >= (editable.value ? OUTLINE_GUTTER_FILES_PX : OUTLINE_GUTTER_READ_ONLY_PX),
 )
 
 /** The ticks run down to where the pieces at the pane's foot begin, never under them. */
@@ -5151,7 +5148,8 @@ watch(
 
 /* The chevron, in the gutter just left of the heading's text: drawn on hover or focus within
    the heading, always on a touch screen and always while collapsed, so a fold is never
-   invisible. Hidden by opacity, so it keeps its place in the tab order on History. */
+   invisible. Hidden by opacity, so it keeps its place in the tab order while the copy is
+   read-only. */
 .block-chevron {
   position: absolute;
   top: calc((var(--first-line) - 24px) / 2);

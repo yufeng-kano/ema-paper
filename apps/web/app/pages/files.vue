@@ -48,7 +48,6 @@ import {
   creditsRefusalOf,
   type CreditsRefusal,
   type JobResult,
-  type JobStatus,
   type LibraryDocument,
   type LibraryFolder,
   type TrashedDocument,
@@ -75,7 +74,6 @@ import {
   isPending,
   isReconverting,
   keyRange,
-  parseProgress,
   renameSelectionEnd,
   subtreeIds,
   typeAheadMatch,
@@ -232,8 +230,8 @@ function onTabKeydown(event: KeyboardEvent) {
 }
 
 /**
- * `/files?document=<id>` — History's *Show in Files* (docs/web.md § Files). Read once and
- * replaced away, so a refresh or a later visit opens at the top level as usual. With
+ * `/files?document=<id>` — a link to a file (docs/web.md § Files). Read once and replaced
+ * away, so a refresh or a later visit opens at the top level as usual. With
  * `&block=<anchor>` — a block's *Copy link to block* — the document opens too, scrolled to
  * that block.
  */
@@ -352,8 +350,6 @@ function trashedAt(row: TrashRow): string {
 
 const columns = computed<TableColumn<Row>[]>(() => [
   { key: 'name', header: t('files.columnName') },
-  { key: 'status', header: t('files.columnStatus'), width: '150px' },
-  { key: 'pages', header: t('files.columnPages'), numeric: true, width: '84px' },
   { key: 'size', header: t('files.columnSize'), numeric: true, width: '96px' },
   { key: 'added', header: t('files.columnAdded'), numeric: true, width: '148px' },
 ])
@@ -365,11 +361,51 @@ const trashColumns = computed<TableColumn<TrashRow>[]>(() => [
   { key: 'trashed', header: t('files.columnTrashed'), numeric: true, width: '168px' },
 ])
 
-const STATUS_TONE: Record<JobStatus, 'neutral' | 'info' | 'ok' | 'danger'> = {
-  queued: 'neutral',
-  running: 'info',
-  succeeded: 'ok',
-  failed: 'danger',
+/**
+ * What a document that is not simply ready says after its name: a spinner while its parse is
+ * in flight, the alert glyph when it failed, each with the words its tooltip and accessible
+ * name carry; a ready document, and a markdown document, say nothing (docs/web.md § Files).
+ * A re-convert is what a parsed row says while it is on its way or failed: the version the
+ * document has opens all the same.
+ */
+function documentState(document: LibraryDocument): { failed: boolean; label: string } | null {
+  const { reconvert } = document
+  if (reconvert) {
+    if (reconvert.status === 'failed') {
+      return { failed: true, label: t('files.reconvertFailed') }
+    }
+    return {
+      failed: false,
+      label: reconvert.checking ? t('files.checking') : withProgress(t('files.reconverting'), reconvert),
+    }
+  }
+  switch (document.status) {
+    case 'queued':
+      return { failed: false, label: t('status.queued') }
+    case 'running':
+      // A running parse past its last page is being checked before it opens.
+      return {
+        failed: false,
+        label: document.checking ? t('files.checking') : withProgress(t('files.converting'), document),
+      }
+    case 'failed':
+      // A failed parse says what a retry would send: its pages without a result.
+      return {
+        failed: true,
+        label: document.failed_pages
+          ? t('files.failedPages', { n: document.failed_pages }, document.failed_pages)
+          : t('status.failed'),
+      }
+    default:
+      return null
+  }
+}
+
+/** *Converting · 3 of 21 pages* — the pages once the parse has counted them. */
+function withProgress(state: string, job: Pick<LibraryDocument, 'page_count' | 'pages_done'>): string {
+  return job.page_count
+    ? `${state} · ${t('files.progress', { done: job.pages_done ?? 0, total: job.page_count })}`
+    : state
 }
 
 /** Where Put Back returns an item, as the column says it: the folder's name, or Home. */
@@ -559,6 +595,8 @@ const mutationError = ref<string | null>(null)
 /** The 402 of an upload: the dialog that says what the document needs (docs/web.md § Files). */
 const creditsRefusal = ref<CreditsRefusal | null>(null)
 const limits = computed(() => auth.me.value?.limits ?? null)
+/** How long the Trash keeps an item; 0 (or an older API's silence) keeps it until emptied. */
+const trashRetentionDays = computed(() => limits.value?.trash_retention_days ?? 0)
 /** Both lists: a file picker filters on either, and a system that types `.heic` as
  *  nothing at all would otherwise grey the file out. */
 const accept = computed(() =>
@@ -2349,6 +2387,12 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
                   : t('files.itemCount', { n: trashTotal }, trashTotal)
             }}
           </span>
+          <!-- A fact the list cannot show: the worker deletes an item for good once it has
+               been in the Trash this long (docs/workspace.md § The Trash). Nothing is said
+               where the Trash is never emptied (0), nor over an empty Trash. -->
+          <span v-if="data && view === 'trash' && trashTotal && trashRetentionDays">
+            {{ t('files.trashRetention', { n: trashRetentionDays }, trashRetentionDays) }}
+          </span>
         </UiPageHeader>
       </template>
 
@@ -2422,8 +2466,16 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
                   class="entry pendingup"
                   :title="row.upload.name"
                 >
-                  <UiSpinner />
+                  <UiIcon :name="row.upload.file.type.startsWith('image/') ? 'image' : 'file-text'" />
                   <span class="entry-name">{{ row.upload.name }}</span>
+                  <span
+                    class="entry-state"
+                    role="img"
+                    :title="t(row.upload.state === 'uploading' ? 'files.uploading' : 'files.waiting')"
+                    :aria-label="t(row.upload.state === 'uploading' ? 'files.uploading' : 'files.waiting')"
+                  >
+                    <UiSpinner />
+                  </span>
                 </span>
 
                 <span
@@ -2453,75 +2505,20 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
                   <span v-else class="entry-name">
                     {{ row.kind === 'folder' ? row.folder.name : row.document.name }}
                   </span>
+                  <!-- Only a document that is not simply ready says anything: what is in
+                       flight, or what failed. -->
+                  <span
+                    v-if="row.kind === 'file' && documentState(row.document)"
+                    class="entry-state"
+                    :class="{ failed: documentState(row.document)!.failed }"
+                    role="img"
+                    :title="documentState(row.document)!.label"
+                    :aria-label="documentState(row.document)!.label"
+                  >
+                    <UiIcon v-if="documentState(row.document)!.failed" name="circle-alert" />
+                    <UiSpinner v-else />
+                  </span>
                 </span>
-              </template>
-
-              <!-- A markdown document has no parse: no status, pages or size to report. A
-                   re-convert is what a parsed row says while it is on its way or failed:
-                   the version the document has opens all the same. -->
-              <template #cell-status="{ row }">
-                <span v-if="row.kind === 'file' && row.document.reconvert" class="state-cell">
-                  <UiStatusDot
-                    v-if="row.document.reconvert.status === 'failed'"
-                    tone="danger"
-                    :label="t('files.reconvertFailed')"
-                  />
-                  <template v-else>
-                    <UiStatusDot
-                      :tone="row.document.reconvert.status === 'queued' ? 'neutral' : 'info'"
-                      :label="t(row.document.reconvert.checking ? 'files.checking' : 'files.reconverting')"
-                    />
-                    <UiUsageBar
-                      v-if="row.document.reconvert.status === 'running'"
-                      class="meter"
-                      :share="parseProgress(row.document.reconvert)"
-                      :label="
-                        t('files.progress', {
-                          done: row.document.reconvert.pages_done,
-                          total: row.document.reconvert.page_count ?? 0,
-                        })
-                      "
-                    />
-                  </template>
-                </span>
-                <span v-else-if="row.kind === 'file' && row.document.status" class="state-cell">
-                  <!-- A failed parse says what a retry would send: its pages without a result;
-                       a running one past its last page, that it is being checked. -->
-                  <UiStatusDot
-                    :tone="STATUS_TONE[row.document.status]"
-                    :label="
-                      row.document.failed_pages
-                        ? t('files.failedPages', { n: row.document.failed_pages }, row.document.failed_pages)
-                        : row.document.checking
-                          ? t('files.checking')
-                          : t(`status.${row.document.status}`)
-                    "
-                  />
-                  <UiUsageBar
-                    v-if="row.document.status === 'running'"
-                    class="meter"
-                    :share="parseProgress(row.document)"
-                    :label="
-                      t('files.progress', {
-                        done: row.document.pages_done,
-                        total: row.document.page_count ?? 0,
-                      })
-                    "
-                  />
-                </span>
-                <span v-else-if="row.kind === 'upload'" class="muted">
-                  {{ row.upload.state === 'uploading' ? t('files.uploading') : t('files.waiting') }}
-                </span>
-              </template>
-
-              <template #cell-pages="{ row }">
-                <template v-if="row.kind === 'file'">
-                  {{
-                    row.document.page_count
-                      ? `${row.document.pages_done}/${row.document.page_count}`
-                      : row.document.pages_done || ''
-                  }}
-                </template>
               </template>
 
               <template #cell-size="{ row }">
@@ -2831,16 +2828,20 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
   padding: 0 var(--space-2);
 }
 
-.state-cell {
+/* The one glyph after a name that is not simply ready: smaller than the file's own, so it
+   reads as a mark on the name rather than a second file. */
+.entry-state {
   display: inline-flex;
-  align-items: center;
-  gap: var(--space-3);
+  flex-shrink: 0;
 }
 
-/* Short on purpose: it sits beside the word it qualifies, not instead of it. */
-.meter {
-  width: 44px;
-  flex-shrink: 0;
+.entry .entry-state :deep(svg) {
+  width: 14px;
+  height: 14px;
+}
+
+.entry .entry-state.failed :deep(svg) {
+  color: var(--danger);
 }
 
 .muted {
@@ -2870,11 +2871,6 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
 .contents:focus-within :deep(tr.selected td),
 .contents:focus-within :deep(tr.selected td *:not(input)) {
   color: var(--accent-fg);
-}
-
-/* A parse's meter on the accent: its fill would vanish into the row. */
-.contents:focus-within :deep(tr.selected .fill) {
-  background: var(--accent-fg);
 }
 
 /* The row `?document=` pointed at: lit on arrival, then fading back to an ordinary row. */

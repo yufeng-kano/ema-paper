@@ -289,8 +289,11 @@ async def pay_webhook(request: Request, db: DbSession, settings: AppSettings):
     subject = subscription.get("subjectId")
     user_id = int(subject) if isinstance(subject, str) and subject.isdigit() else None
     if user_id is None or await db.get(User, user_id) is None:
-        logger.warning("Kano Pay event %s names an unknown subject", event_id)
-        raise ApiError(404, "invalid_request", "Unknown subject")
+        # A deleted account's subscription still sends its ending events, and Pay retries
+        # a refused delivery for ever: acknowledged, nothing fetched or recorded
+        # (docs/auth.md § Deleting the account).
+        logger.info("Kano Pay event %s names a subject with no account", event_id)
+        return {}
     if await db.get(PayEvent, event_id) is not None:
         return {}
     try:

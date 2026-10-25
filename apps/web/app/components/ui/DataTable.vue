@@ -30,7 +30,7 @@ withDefaults(
     rowKey: (row: Row) => string
     /** Accessible caption. Visually hidden — the panel header carries the visible title. */
     caption: string
-    /** `tight` is the usage tables' denser row; `normal` is history, keys and files. */
+    /** `tight` is the usage tables' denser row; `normal` is keys and files. */
     density?: 'normal' | 'tight'
     /**
      * Extra attributes for one row's `<tr>` — `class`, `draggable`, `onDragover` and the

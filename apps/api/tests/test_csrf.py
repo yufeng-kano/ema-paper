@@ -15,6 +15,7 @@ MUTATIONS = [
     ("put", "/api/agents/chat/settings", {"model": None}),
     ("post", "/api/auth/logout", None),
     ("post", "/api/auth/dev-login", None),
+    ("delete", "/api/account", None),
 ]
 
 
@@ -32,4 +33,4 @@ async def test_mutations_require_the_custom_header(
 async def test_reads_do_not_require_the_custom_header(signed_in: AsyncClient) -> None:
     assert (await signed_in.get("/api/me")).status_code == 200
     assert (await signed_in.get("/api/keys")).status_code == 200
-    assert (await signed_in.get("/api/jobs")).status_code == 200
+    assert (await signed_in.get("/api/usage")).status_code == 200

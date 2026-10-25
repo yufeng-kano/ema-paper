@@ -94,15 +94,10 @@ async def run_worker(stop: asyncio.Event) -> None:
     upload_dir = Path(settings.upload_dir)
     upload_dir.mkdir(parents=True, exist_ok=True)
 
-    sweeper = asyncio.create_task(
-        sweep_forever(
-            upload_dir,
-            Path(settings.workspaces_dir),
-            stop,
-            max_age=settings.upload_max_age_seconds,
-            pack_loose_objects=settings.workspace_git_pack_loose_objects,
-        )
-    )
+    # The sweep reaches the database through this worker's own sessionmaker: the Trash's
+    # expiry, the parse retention and the account deletions it finishes (docs/jobs.md
+    # § Retention).
+    sweeper = asyncio.create_task(sweep_forever(sessionmaker, settings, stop))
     sandbox = SandboxClient(settings) if settings.sandbox_configured else None
     # Retried until it goes through: a database or runner blip at start must not leave
     # the turns a dead worker held unfinished until the next restart (docs/jobs.md).

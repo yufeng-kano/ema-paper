@@ -170,12 +170,12 @@ async def test_the_document_keeps_its_version_until_the_new_parse_succeeds(
         "files/mixed.pdf/doc.md",
     ]
     assert any(entry["message"] == "edit files/mixed.pdf/doc.md" for entry in revisions[1:])
-    # The new crops are in the shell's view, the earlier parse is still in History, and
-    # the copy of the original the run took is gone with it.
+    # The new crops are in the shell's view, the earlier parse is still kept — the
+    # retention's to delete (docs/jobs.md § Retention) — and the copy of the original the
+    # run took is gone with it.
     assert (_directory(library) / "figures" / "p1_0_0_1000_1000.png").is_file()
-    history = {job["job_id"] for job in (await library.get("/api/jobs")).json()["jobs"]}
-    assert {uploaded["job_id"], new_job} <= history
     async with sessionmaker() as db:
+        assert await db.get(Job, uuid.UUID(uploaded["job_id"])) is not None
         job = await db.get(Job, uuid.UUID(new_job))
     assert job.source_deleted_at is not None
     assert not Path(job.source_path).exists()
@@ -223,7 +223,7 @@ async def test_a_failed_reconvert_leaves_the_document_and_is_retried_or_dismisse
         sessionmaker, new_job
     )
 
-    # A second one that fails is dismissed: the pointer clears, the parse stays in History.
+    # A second one that fails is dismissed: the pointer clears, the parse row stays.
     respx.post(KANO_CHAT_URL).mock(side_effect=_upstream(fallback_fails=1))
     failed = (await _reconvert(library, uploaded["id"], model=FALLBACK)).json()["job_id"]
     await _drain_queue(library, sessionmaker)
@@ -232,8 +232,8 @@ async def test_a_failed_reconvert_leaves_the_document_and_is_retried_or_dismisse
     row = await _row(library, uploaded["id"])
     assert (row["job_id"], row["reconvert"]) == (new_job, None)
     assert (await _dismiss(library, uploaded["id"])).status_code == 404
-    history = {job["job_id"]: job for job in (await library.get("/api/jobs")).json()["jobs"]}
-    assert history[failed]["status"] == "failed"
+    async with sessionmaker() as db:
+        assert (await db.get(Job, uuid.UUID(failed))).status == "failed"
 
 
 @respx.mock
@@ -304,9 +304,9 @@ async def test_a_document_in_the_trash_keeps_its_version(library, sessionmaker, 
     )
     assert restored.status_code == 200, restored.text
     assert (await _content(library, uploaded["id"]))["markdown"] == before["markdown"]
-    # The new parse stays in History, to file from there.
-    history = {job["job_id"]: job for job in (await library.get("/api/jobs")).json()["jobs"]}
-    assert history[new_job]["status"] == "succeeded"
+    # The new parse is finished, and stays for the retention to delete.
+    async with sessionmaker() as db:
+        assert (await db.get(Job, uuid.UUID(new_job))).status == "succeeded"
 
 
 @respx.mock

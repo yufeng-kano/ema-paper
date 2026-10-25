@@ -46,13 +46,6 @@ defineProps<{ name: IconName }>()
       <path d="M18 17V9M13 17V5M8 17v-3" />
     </template>
 
-    <!-- history: a clock with a rewind arrow — the record of what already ran. -->
-    <template v-else-if="name === 'history'">
-      <path d="M3 12a9 9 0 1 0 3.13-6.82" />
-      <path d="M3 4.5V9h4.5" />
-      <path d="M12 7.5V12l3.5 2" />
-    </template>
-
     <!-- key-round (API keys): the bit end of a key. -->
     <template v-else-if="name === 'keys'">
       <path
@@ -300,6 +293,13 @@ defineProps<{ name: IconName }>()
     <!-- x, small: a tool call that failed, beside check for one that succeeded. -->
     <template v-else-if="name === 'x'">
       <path d="M18 6 6 18M6 6l12 12" />
+    </template>
+
+    <!-- circle-alert: a file that is not ready because something failed — its parse or its
+         re-convert — in the danger tone after its name (docs/web.md § Files). -->
+    <template v-else-if="name === 'circle-alert'">
+      <circle cx="12" cy="12" r="10" />
+      <path d="M12 8v4M12 16h.01" />
     </template>
 
     <!-- reply: answer one passage of an answer — the arrow turns back to it. -->

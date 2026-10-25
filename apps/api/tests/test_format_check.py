@@ -492,7 +492,7 @@ async def test_a_files_upload_opens_checked(library, sessionmaker, documents) ->
     root = user_root(library.app.state.settings.workspaces_dir, library.user_id)
     baseline = root / ".sightread" / "results" / uploaded["job_id"] / "result.md"
     assert baseline.read_text() == TRANSCRIPTION
-    # The API and History read the transcription.
+    # The result route reads the transcription.
     api_result = await library.get(f"/api/library/documents/{uploaded['id']}/result")
     assert api_result.json()["markdown"] == TRANSCRIPTION
 

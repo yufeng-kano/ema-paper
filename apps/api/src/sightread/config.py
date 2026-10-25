@@ -104,6 +104,9 @@ class Settings(BaseSettings):
     # How old an entry of the upload directory may grow before the sweeper takes it, an
     # unsent chat attachment's included (docs/jobs.md § Retention).
     upload_max_age_seconds: int = 86_400
+    # How many days a finished parse no file names is kept before the worker's sweep
+    # deletes it; 0 keeps every one (docs/jobs.md § Retention).
+    parse_retention_days: int = 30
     # Stored figure crops, kept with the result — outside the upload dir on purpose, so the
     # sweeper never touches them (docs/parsing.md § Figure crops).
     figures_dir: str = "/data/figures"
@@ -171,6 +174,9 @@ class Settings(BaseSettings):
     # How many loose objects a workspace's history may hold before the worker's sweep
     # packs it (docs/workspace.md § Revisions).
     workspace_git_pack_loose_objects: int = 100
+    # How many days an item stays in the Trash before the worker's sweep deletes it for
+    # good; 0 = never (docs/workspace.md § The Trash).
+    trash_retention_days: int = 30
     # The most of a git log the API reads to list revisions, and the paths it keeps per
     # revision; the rename and path lists a revert reads share the byte bound
     # (docs/workspace.md § Revisions).
@@ -247,7 +253,13 @@ class Settings(BaseSettings):
         self.kano_pay_url = self.kano_pay_url.strip().rstrip("/")
         if self.credit_usd <= 0:
             raise ValueError("CREDIT_USD must be positive")
-        for name in ("parse_credits_per_page", "chat_min_credits", "free_credits_per_period"):
+        for name in (
+            "parse_credits_per_page",
+            "chat_min_credits",
+            "free_credits_per_period",
+            "trash_retention_days",
+            "parse_retention_days",
+        ):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name.upper()} must be >= 0")
         if self.free_storage_bytes > self.workspace_quota_bytes:

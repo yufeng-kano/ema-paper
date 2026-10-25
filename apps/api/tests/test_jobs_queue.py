@@ -77,6 +77,7 @@ async def test_dedup_lookup_matches_the_full_key(sessionmaker) -> None:
             db, user_id=user.id, sha256="a" * 64, source_path="unused-a.pdf", **JOB_DEFAULTS
         )
         job.status = "succeeded"
+        job.finished_at = utcnow()
         await db.commit()
 
         key = {
@@ -89,22 +90,31 @@ async def test_dedup_lookup_matches_the_full_key(sessionmaker) -> None:
             "pages_spec": "",
             "prompt_sha256": "p" * 64,
         }
-        assert (await find_cached_job(db, **key)).id == job.id
-        assert await find_cached_job(db, **{**key, "sha256": "b" * 64}) is None
-        assert await find_cached_job(db, **{**key, "model": "other/model"}) is None
-        assert await find_cached_job(db, **{**key, "pages_spec": "1-2"}) is None
-        assert await find_cached_job(db, **{**key, "prompt_sha256": "q" * 64}) is None
+        assert (await find_cached_job(db, retention_days=30, **key)).id == job.id
+        assert await find_cached_job(db, retention_days=30, **{**key, "sha256": "b" * 64}) is None
+        assert (
+            await find_cached_job(db, retention_days=30, **{**key, "model": "other/model"}) is None
+        )
+        assert await find_cached_job(db, retention_days=30, **{**key, "pages_spec": "1-2"}) is None
+        assert (
+            await find_cached_job(db, retention_days=30, **{**key, "prompt_sha256": "q" * 64})
+            is None
+        )
         # A different upstream is a different parse, even for the same model id — and an
         # edited endpoint URL repoints what a connection id means, so it misses too.
-        assert await find_cached_job(db, **{**key, "connection_id": 12345}) is None
         assert (
-            await find_cached_job(db, **{**key, "connection_base_url": "https://new.example/v1"})
+            await find_cached_job(db, retention_days=30, **{**key, "connection_id": 12345}) is None
+        )
+        assert (
+            await find_cached_job(
+                db, retention_days=30, **{**key, "connection_base_url": "https://new.example/v1"}
+            )
             is None
         )
 
         other = await _user(db, "second@example.com")
         # Never across users, even for identical bytes (docs/jobs.md § Dedup).
-        assert await find_cached_job(db, **{**key, "user_id": other.id}) is None
+        assert await find_cached_job(db, retention_days=30, **{**key, "user_id": other.id}) is None
 
 
 async def test_dedup_never_crosses_agents_or_answers_from_openrouter_history(
@@ -124,6 +134,7 @@ async def test_dedup_never_crosses_agents_or_answers_from_openrouter_history(
             "pipeline_version": PARSE.pipeline_version,
             "pages_done": 2,
             "created_at": utcnow(),
+            "finished_at": utcnow(),
         }
         db.add(Job(**{**shared, "agent": "summarize"}))
         db.add(Job(**{**shared, "connection_base_url": None}))
@@ -139,10 +150,12 @@ async def test_dedup_never_crosses_agents_or_answers_from_openrouter_history(
             "pages_spec": "",
             "prompt_sha256": "p" * 64,
         }
-        assert await find_cached_job(db, **key) is None
+        assert await find_cached_job(db, retention_days=30, **key) is None
         # The historical row is there and would match an OpenRouter-era key: the snapshot
         # is exactly what keeps it out.
-        historical = await find_cached_job(db, **{**key, "connection_base_url": None})
+        historical = await find_cached_job(
+            db, retention_days=30, **{**key, "connection_base_url": None}
+        )
         assert historical is not None and historical.agent == "parse"
 
 
@@ -157,6 +170,7 @@ async def test_dedup_ignores_unfinished_jobs(sessionmaker) -> None:
         assert (
             await find_cached_job(
                 db,
+                retention_days=30,
                 user_id=user.id,
                 agent="parse",
                 sha256="c" * 64,

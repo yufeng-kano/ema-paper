@@ -1,4 +1,4 @@
-"""Usage aggregates and result serving (docs/api.md § Control plane).
+"""Usage aggregates (docs/api.md § Control plane).
 
 Nothing produces jobs or usage rows yet, so the rows are written directly — this is the
 shape the job runner will write in the next phase.
@@ -6,7 +6,6 @@ shape the job runner will write in the next phase.
 
 from __future__ import annotations
 
-import uuid
 from datetime import timedelta
 from decimal import Decimal
 
@@ -14,7 +13,7 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy.exc import IntegrityError
 
-from sightread.db.models import Job, Result, UsageLog, User, utcnow
+from sightread.db.models import UsageLog, User, utcnow
 
 
 async def test_usage_aggregates_per_day_and_per_model(signed_in: AsyncClient, sessionmaker) -> None:
@@ -151,57 +150,3 @@ async def test_an_unknown_cost_cannot_be_stored_as_zero(sessionmaker) -> None:
         )
         with pytest.raises(IntegrityError):
             await db.commit()
-
-
-async def test_job_history_and_result_serving(signed_in: AsyncClient, sessionmaker) -> None:
-    user_id = (await signed_in.get("/api/me")).json()["user"]["id"]
-    job_id = uuid.uuid4()
-
-    async with sessionmaker() as db:
-        db.add(
-            Job(
-                id=job_id,
-                user_id=user_id,
-                kind="pdf",
-                filename="paper.pdf",
-                media_type="application/pdf",
-                size_bytes=1024,
-                sha256="a" * 64,
-                pages_spec="",
-                agent="parse",
-                model="google/gemini-2.5-flash",
-                pipeline_version=1,
-                bbox_format="yxyx_norm1000",
-                status="succeeded",
-                pages_done=1,
-                page_count=1,
-                finished_at=utcnow(),
-            )
-        )
-        await db.flush()
-        db.add(
-            Result(
-                job_id=job_id,
-                markdown="# Title\n\n![fig1](sightread://p1/10,20,30,40)\nFigure 1: chart",
-                pages=[{"page": 1, "width_pt": 612, "height_pt": 792, "method": "vision"}],
-                figures=[{"id": "fig1", "page": 1, "bbox": [10, 20, 30, 40]}],
-                errors=[],
-                meta={"model": "google/gemini-2.5-flash", "bbox_format": "yxyx_norm1000"},
-            )
-        )
-        await db.commit()
-
-    listed = (await signed_in.get("/api/jobs")).json()["jobs"]
-    assert len(listed) == 1
-    assert listed[0]["job_id"] == str(job_id)
-    assert listed[0]["status"] == "succeeded"
-    assert listed[0]["agent"] == "parse"
-
-    result = await signed_in.get(f"/api/jobs/{job_id}/result")
-    assert result.status_code == 200
-    assert result.json()["figures"][0]["bbox"] == [10, 20, 30, 40]
-    assert result.json()["meta"]["bbox_format"] == "yxyx_norm1000"
-
-    missing = await signed_in.get(f"/api/jobs/{uuid.uuid4()}/result")
-    assert missing.status_code == 404
-    assert missing.json()["error"]["type"] == "invalid_request"

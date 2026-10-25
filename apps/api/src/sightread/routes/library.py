@@ -6,8 +6,8 @@ to `jobs.intake.submit_parse`, the same sequence `/v1/parse` runs
 (docs/project-structure.md § Boundaries).
 
 A document is an entry, not a second copy of a result: deleting one deletes the entry, and
-the job and its output stay in the parse history that billed for them (docs/database.md
-§ Rules).
+the job and its output then fall under the parse retention (docs/jobs.md § Retention),
+their usage and ledger rows outliving them (docs/database.md § Rules).
 """
 
 from __future__ import annotations
@@ -28,9 +28,8 @@ from fastapi import APIRouter, Request, Response, status
 from fastapi.responses import StreamingResponse
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field
-from sqlalchemy import ColumnElement, delete, func, select, update
+from sqlalchemy import ColumnElement, delete, func, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import iterate_in_threadpool
 from starlette.datastructures import FormData, UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser
@@ -39,8 +38,6 @@ from ..agents import PARSE
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
 from ..billing import ledger
 from ..db.models import (
-    ChatTurn,
-    Conversation,
     Document,
     Folder,
     Job,
@@ -68,9 +65,10 @@ from ..jobs.runner import partial_result_payload, result_payload
 from ..parsing.figures import crop_chunks, open_crop, parse_bbox_path
 from ..parsing.images import ImageError, normalize_image
 from ..workspace import documents as workspace_documents
-from ..workspace import safe_io
+from ..workspace import safe_io, trash
 from ..workspace.layout import document_relative_dir, path_segment, trash_entry, user_root
 from ..workspace.locks import backup_shared, workspace_lock
+from ..workspace.trash import commit_then_discard, lock_user, read_row, refuse_while_answering
 
 logger = logging.getLogger(__name__)
 
@@ -173,34 +171,6 @@ async def lock_job(db: DbSession, job_id: uuid.UUID) -> None:
     """Order filing against the worker's finalization of the parse: the worker reads the
     rows that keep the original under this lock (docs/jobs.md § Retention)."""
     await db.execute(select(Job.id).where(Job.id == job_id).with_for_update())
-
-
-async def lock_user(db: DbSession, user_id: int) -> None:
-    """Serialize this user's name decisions: the unique indexes cannot see across the
-    two tables, so two requests choosing a name for a folder and a file at once are
-    ordered here (docs/database.md)."""
-    await db.execute(select(User.id).where(User.id == user_id).with_for_update())
-
-
-async def refuse_while_answering(db: DbSession, user_id: int, document_ids) -> None:
-    """A document whose conversation has an unfinished turn cannot go: the worker would
-    carry on against rows and a directory that no longer exist (docs/chat.md). Decided
-    under the locks a send takes, in the same order — the user's row, then the
-    conversations' — so no turn can be queued between this check and the delete."""
-    await db.execute(select(User.id).where(User.id == user_id).with_for_update())
-    await db.execute(
-        select(Conversation.id).where(Conversation.document_id.in_(document_ids)).with_for_update()
-    )
-    busy = (
-        await db.execute(
-            select(ChatTurn.id)
-            .join(Conversation, Conversation.id == ChatTurn.conversation_id)
-            .where(Conversation.document_id.in_(document_ids), ChatTurn.finished_at.is_(None))
-            .limit(1)
-        )
-    ).first()
-    if busy is not None:
-        raise ApiError(409, "invalid_request", "A conversation about this file is still answering")
 
 
 async def owned_folder(db: DbSession, user_id: int, folder_id: int) -> Folder:
@@ -406,7 +376,7 @@ async def move_then_commit(
     except BaseException:
         if moved is not None:
             model, row_id, expected = landed
-            readable, row = await _read_row(db, model, row_id)
+            readable, row = await read_row(db, model, row_id)
             if not readable:
                 # Indeterminate is not a rollback: the files stay where they are rather
                 # than being moved away from a row that may now name them; the next
@@ -436,18 +406,6 @@ async def move_then_commit(
         raise
 
 
-async def _read_row(db: DbSession, model: type, row_id: int) -> tuple[bool, object | None]:
-    """The row as the database holds it after a commit that raised — read on a connection
-    of its own, since the request's may be the one that dropped. `(readable, row)`: a
-    read that fails says nothing about the commit, and the caller treats it so."""
-    try:
-        async with AsyncSession(bind=db.bind, expire_on_commit=False) as fresh:
-            return True, await fresh.get(model, row_id)
-    except Exception:  # noqa: BLE001 - the database is away
-        logger.exception("could not read row %s of %s after a failed commit", row_id, model)
-        return False, None
-
-
 async def commit_filing(
     db: DbSession,
     row: Document,
@@ -468,7 +426,7 @@ async def commit_filing(
         await db.commit()
         return row
     except Exception as exc:  # noqa: BLE001 - verified below, whatever raised
-        readable, landed = await _read_row(db, Document, row.id)
+        readable, landed = await read_row(db, Document, row.id)
         if readable and isinstance(landed, Document):
             logger.warning("the filing of document %d was committed despite the error", row.id)
             return landed
@@ -996,7 +954,7 @@ async def remove_then_commit(
     try:
         await db.commit()
     except BaseException:
-        readable, row = await _read_row(db, *gone)
+        readable, row = await read_row(db, *gone)
         if readable and row is None:
             logger.warning("the delete of %s was committed despite the error", relative)
             await _finish_delete(settings, user_id, relative, removal, document_ids)
@@ -1046,7 +1004,7 @@ async def stash_then_commit(
         await db.commit()
     except BaseException:
         if moved:
-            readable, row = await _read_row(db, *landed)
+            readable, row = await read_row(db, *landed)
             if not readable:
                 logger.error("the move of %s to the Trash raised and cannot be verified", relative)
             elif row is not None and row.trashed_at is not None:
@@ -1084,7 +1042,7 @@ async def put_back_then_move(
     try:
         await db.commit()
     except Exception as exc:  # noqa: BLE001 - verified below, whatever raised
-        readable, row = await _read_row(db, *landed)
+        readable, row = await read_row(db, *landed)
         with contextlib.suppress(Exception):
             await db.rollback()
         if readable and row is not None and row.trashed_at is None:
@@ -1108,44 +1066,6 @@ async def put_back_then_move(
     except Exception:  # noqa: BLE001 - the rows stand; the repair rule brings the files
         logger.exception("the files of %s stay in the Trash for now", relative)
     return answer
-
-
-async def commit_then_discard(
-    db: DbSession,
-    settings,
-    user_id: int,
-    entries: list[str],
-    document_ids: list[int],
-    *,
-    gone: tuple[type, int],
-) -> None:
-    """Rows deleted for good from the Trash commit first; their entries, originals and
-    images go after. A commit that raised is checked on a fresh connection: the row `gone`
-    names found deleted means it landed, and the cleanup runs as if acknowledged —
-    otherwise nothing on disk has changed. A process that dies in between leaves entries
-    with no rows, which the repair rule removes (docs/workspace.md § The Trash)."""
-    try:
-        await db.commit()
-    except BaseException:
-        readable, row = await _read_row(db, *gone)
-        if readable and row is None:
-            logger.warning("the delete of %s was committed despite the error", entries)
-            await _discard_for_good(settings, user_id, entries, document_ids)
-        raise
-    await _discard_for_good(settings, user_id, entries, document_ids)
-
-
-async def _discard_for_good(
-    settings, user_id: int, entries: list[str], document_ids: list[int]
-) -> None:
-    try:
-        await workspace_documents.discard_trash(settings, user_id, entries)
-    except Exception:  # noqa: BLE001 - the repair rule removes an entry with no row
-        logger.exception("could not remove %s from the Trash", entries)
-    try:
-        await workspace_documents.discard_originals(settings, user_id, document_ids)
-    except Exception:  # noqa: BLE001 - reconciliation sweeps an original with no row
-        logger.exception("could not discard the originals of %s", entries)
 
 
 @router.post("/documents/{document_id}/trash", dependencies=[CsrfGuard])
@@ -1273,37 +1193,10 @@ async def restore_folder(folder_id: int, user: SessionUser, db: DbSession, setti
 
 @router.delete("/trash", dependencies=[CsrfGuard], status_code=status.HTTP_204_NO_CONTENT)
 async def empty_trash(user: SessionUser, db: DbSession, settings: AppSettings) -> Response:
-    """Empty Trash: every item in it, for good — rows first, then their files
+    """Empty Trash: every item in it, for good — rows first, then their files. The same
+    function the worker's sweep runs, with a cutoff, for the Trash's expiry
     (docs/workspace.md § The Trash)."""
-    user_id = user.id
-    async with workspace_lock(user_root(settings.workspaces_dir, user_id)):
-        await workspace_documents.recover_trash(db, settings, user_id)
-        await lock_user(db, user_id)
-        folders = await workspace_documents.user_folders(db, user_id)
-        trashed = workspace_documents.trashed_folder_ids(folders.values())
-        documents = (
-            (await db.execute(select(Document).where(Document.user_id == user_id))).scalars().all()
-        )
-        doomed = [
-            document.id
-            for document in documents
-            if document.trashed_at is not None or document.folder_id in trashed
-        ]
-        roots: list[tuple[type, int]] = [
-            (Folder, row.id) for row in folders.values() if row.trashed_at is not None
-        ] + [(Document, row.id) for row in documents if row.trashed_at is not None]
-        if not roots:
-            return Response(status_code=status.HTTP_204_NO_CONTENT)
-        await refuse_while_answering(db, user_id, doomed)
-        await db.execute(
-            delete(Document).where(Document.user_id == user_id, Document.id.in_(doomed))
-        )
-        await db.execute(delete(Folder).where(Folder.user_id == user_id, Folder.id.in_(trashed)))
-        entries = [
-            trash_entry("folder" if model is Folder else "document", row_id)
-            for model, row_id in roots
-        ]
-        await commit_then_discard(db, settings, user_id, entries, doomed, gone=roots[0])
+    await trash.empty_trash(db, settings, user.id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -1314,11 +1207,6 @@ class DocumentUpdate(BaseModel):
     """Partial: only the fields present in the body change (docs/api.md)."""
 
     name: str | None = Field(default=None, min_length=1, max_length=DOCUMENT_NAME_MAX)
-    folder_id: int | None = None
-
-
-class DocumentFromJob(BaseModel):
-    job_id: uuid.UUID
     folder_id: int | None = None
 
 
@@ -1388,8 +1276,8 @@ async def upload_document(
             upload, filename, user_id=user_id, folder_id=folder_id, db=db, settings=settings
         )
     # The library name is decided before the parse is queued: a name that cleans to
-    # nothing is filed as `upload`, like a parse filed from the history, never a 400
-    # after a billed parse is already on its way (docs/api.md).
+    # nothing is filed as `upload`, never a 400 after a billed parse is already on its
+    # way (docs/api.md).
     try:
         wanted = clean_name(filename, DOCUMENT_NAME_MAX)
     except ApiError:
@@ -1595,106 +1483,6 @@ async def create_document(body: DocumentCreate, user: SessionUser, db: DbSession
     return document_payload(row, None)
 
 
-@router.post("/documents/from-job", dependencies=[CsrfGuard], status_code=status.HTTP_201_CREATED)
-async def file_job(body: DocumentFromJob, user: SessionUser, db: DbSession, settings: AppSettings):
-    """File a parse that is already in the history — no upload, no second parse.
-
-    How a result that came in over the API or the connector becomes a file
-    (docs/web.md § History). A failed job is refused: it has no result to open.
-    """
-    job = (
-        await db.execute(select(Job).where(Job.id == body.job_id, Job.user_id == user.id))
-    ).scalar_one_or_none()
-    if job is None:
-        raise ApiError(404, "invalid_request", "No such job")
-    if job.status == "failed":
-        raise ApiError(400, "invalid_request", "A failed parse has no result to file")
-    if body.folder_id is not None:
-        await live_folder(db, user.id, body.folder_id)
-
-    # Plain values, not attributes: a lost name race rolls back, which expires `job` and
-    # `user`, and an expired attribute cannot be lazily reloaded inside an async session.
-    user_id, folder_id, job_id = user.id, body.folder_id, job.id
-    # A filename made only of separators cleans to nothing; it is still a parse worth
-    # filing, under the same fallback an upload without a name gets.
-    try:
-        wanted = clean_name(job.filename, DOCUMENT_NAME_MAX)
-    except ApiError:
-        wanted = "upload"
-
-    async def taken() -> set[str]:
-        await lock_job(db, job_id)
-        # Decided again under the lock: a parse that failed since the check above has
-        # no result to file, and a row for it would stand against the 400 the route
-        # promises (docs/api.md).
-        current = (await db.execute(select(Job.status).where(Job.id == job_id))).scalar_one()
-        if current == "failed":
-            raise ApiError(400, "invalid_request", "A failed parse has no result to file")
-        # A parse still running keeps its upload for this row: the worker, which reads
-        # its recipients under this same row lock, either sees the row or finds the
-        # job marked for retention and leaves the upload for `inherit_original` to
-        # take — never a row filed between its look and its commit with nothing kept.
-        await db.execute(
-            update(Job)
-            .where(Job.id == job_id, Job.status.in_(("queued", "running")))
-            .values(retain_source=True)
-        )
-        return await sibling_names(db, user_id, folder_id)
-
-    # The row, its copy of the original and their commit under one hold of the workspace
-    # lock, the backup lock shared around it, as for an upload: no row without its
-    # original, in the database or in a snapshot (docs/workspace.md § Backups).
-    root = user_root(settings.workspaces_dir, user_id)
-    async with backup_shared(root), workspace_lock(root):
-        try:
-            row = await insert_named(
-                db,
-                user_id=user_id,
-                into=folder_id,
-                build=lambda name: Document(
-                    user_id=user_id, folder_id=folder_id, job_id=job_id, name=name
-                ),
-                taken=taken,
-                wanted=wanted,
-                limit=DOCUMENT_NAME_MAX,
-                message="A file with this name already exists here",
-                commit=False,
-            )
-        except ApiError:
-            # Same race as creating a folder: a destination deleted after the check above
-            # fails the foreign key, and that is a missing folder, not a name conflict.
-            if folder_id is None or await folder_exists(db, user_id, folder_id):
-                raise
-            raise ApiError(404, "invalid_request", "No such folder") from None
-        row_id = row.id
-        job = await job_of(db, job_id)
-        # The original went with the first document filed from this parse: this one
-        # takes a copy, so its pages render too (docs/workspace.md § Layout). A copy that
-        # fails takes the row with it: the transaction rolls back.
-        try:
-            filed = await workspace_documents.inherit_original(db, settings, row, job, locked=True)
-        except Exception as exc:
-            logger.exception("could not copy the original for document %d", row_id)
-            await db.rollback()
-            raise ApiError(
-                409, "invalid_request", "The original could not be copied; nothing was filed"
-            ) from exc
-        # A commit that raises is verified before it is reported, and a rollback takes
-        # the copy of the original back with it (docs/workspace.md).
-        relative = document_relative_dir(
-            await workspace_documents.folder_names(db, user_id, row.folder_id), row.name
-        )
-        row = await commit_filing(
-            db,
-            row,
-            what="The parse",
-            undo=lambda: workspace_documents.discard_adopted(settings, user_id, row_id, relative),
-        )
-        if not filed:
-            raise ApiError(404, "invalid_request", "The file was deleted while it was being filed")
-    return await read_document_payload(db, row)
-
-
 @router.put("/documents/{document_id}", dependencies=[CsrfGuard])
 async def update_document(
     document_id: int,
@@ -1754,7 +1542,8 @@ async def delete_document(
     document_id: int, user: SessionUser, db: DbSession, settings: AppSettings
 ) -> Response:
     """Delete Immediately: a live file, or one in the Trash, for good. The parse itself
-    stays in the history."""
+    is not deleted with it: it falls under the parse retention (docs/jobs.md
+    § Retention)."""
     user_id = user.id
     async with workspace_lock(user_root(settings.workspaces_dir, user_id)):
         await workspace_documents.recover_trash(db, settings, user_id)
@@ -2058,7 +1847,7 @@ async def retry_document(
         try:
             await db.commit()
         except Exception as exc:  # noqa: BLE001 - verified below, whatever raised
-            readable, landed = await _read_row(db, Job, job_id)
+            readable, landed = await read_row(db, Job, job_id)
             with contextlib.suppress(Exception):
                 await db.rollback()
             if readable and landed is not None and landed.source_path == str(copy):
@@ -2154,9 +1943,10 @@ async def reconvert_document(
 async def dismiss_reconvert(
     document_id: int, user: SessionUser, db: DbSession, settings: AppSettings
 ) -> Response:
-    """Dismiss a failed re-convert: the document stops pointing at it, and the parse
-    stays in History (docs/jobs.md § Re-converting a document). Under the workspace lock,
-    which a retry of it holds too."""
+    """Dismiss a failed re-convert: the document stops pointing at it, and the parse, of
+    the document's own original, is kept with it by the parse retention (docs/jobs.md
+    § Re-converting a document, § Retention). Under the workspace lock, which a retry of
+    it holds too."""
     async with workspace_lock(user_root(settings.workspaces_dir, user.id)):
         row = await live_document(db, user.id, document_id)
         if row.reconvert_job_id is None:
@@ -2297,9 +2087,9 @@ class FolderCopy(BaseModel):
 
 async def keep_parses(db: DbSession, jobs: list[Job]) -> None:
     """The job rows behind the documents a copy files, locked in one order, read again
-    under the lock and marked for retention while they run, as a filing from History
-    marks one: the worker finishing one meanwhile sees the new rows among its recipients
-    or leaves the upload for them (docs/jobs.md § Retention)."""
+    under the lock and marked for retention while they run, as the Files page's upload
+    marks its own: the worker finishing one meanwhile sees the new rows among its
+    recipients or leaves the upload for them (docs/jobs.md § Retention)."""
     for job in sorted(jobs, key=lambda job: str(job.id)):
         await lock_job(db, job.id)
         await db.refresh(job)
@@ -2367,7 +2157,7 @@ async def copy_then_commit(
     try:
         await db.commit()
     except Exception as exc:  # noqa: BLE001 - verified below, whatever raised
-        readable, row = await _read_row(db, *landed)
+        readable, row = await read_row(db, *landed)
         with contextlib.suppress(Exception):
             await db.rollback()
         if readable and row is not None:

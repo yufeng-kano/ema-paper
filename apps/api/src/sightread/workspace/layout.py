@@ -34,6 +34,9 @@ FIGURES_DIR = "figures"
 SOURCE_STEM = "source"
 SOURCES_SUFFIX = ".sources"
 IMAGES_SUFFIX = ".images"
+# A deleted account's marker, standing until the account's files are gone
+# (docs/auth.md § Deleting the account).
+DELETED_SUFFIX = ".deleted"
 LOCK_FILE = "lock"
 
 # What a document directory may not be called: the workspace's own names, git's, and
@@ -85,6 +88,13 @@ def images_dir(root: Path) -> Path:
     beside the originals and outside the mount for the same reason (docs/workspace.md
     § Inserted images). One directory per document, named by its id."""
     return root.parent / REPOS_DIR / f"{root.name}{IMAGES_SUFFIX}"
+
+
+def deletion_marker(workspaces_dir: str | Path, user_id: int) -> Path:
+    """`{WORKSPACES_DIR}/.repos/{user_id}.deleted`: written before a deleted account's rows
+    go, holding its job ids, and removed once its files are gone, so the worker's sweep
+    can finish what a process that died in between left (docs/workspace.md § Layout)."""
+    return Path(workspaces_dir) / REPOS_DIR / f"{user_id}{DELETED_SUFFIX}"
 
 
 def segment_name(segment: str) -> str:

@@ -306,7 +306,7 @@ async def test_a_notification_pay_cannot_confirm_is_left_for_its_retry(make_clie
 
 
 @respx.mock
-async def test_a_notification_that_is_not_about_a_user_of_this_app_is_refused(
+async def test_a_notification_that_is_not_about_a_user_of_this_app_records_nothing(
     make_client,
 ) -> None:
     client = make_client(**PAY_SETTINGS)
@@ -344,8 +344,12 @@ async def test_a_notification_that_is_not_about_a_user_of_this_app_is_refused(
     too_big = await _notify(client, b" " * (client.app.state.settings.kano_pay_event_max_bytes + 1))
 
     assert other_app.status_code == 400
-    assert unknown_subject.status_code == 404
-    assert not_a_subject.status_code == 404
+    # A subject with no account — a deleted one's subscription still sends its ending
+    # events — is acknowledged, or Pay would retry it for ever (docs/auth.md § Deleting
+    # the account); nothing is fetched or recorded.
+    assert (unknown_subject.status_code, unknown_subject.json()) == (200, {})
+    assert (not_a_subject.status_code, not_a_subject.json()) == (200, {})
+    assert await _events(client) == []
     assert not_json.status_code == 400
     assert no_id.status_code == 400
     assert too_big.status_code == 413

@@ -1532,3 +1532,117 @@ async def test_the_operator_upstream_migration_drops_the_keys_and_keeps_the_hist
             assert {row[1:] for row in rows} == {(None, None)}
     finally:
         await engine.dispose()
+
+
+PARSE_RETENTION = "e014be293754"
+RETENTION_INDEXES = {
+    "ix_documents_job_id",
+    "ix_usage_log_job_id",
+    "ix_documents_trashed_at",
+    "ix_folders_trashed_at",
+}
+
+
+async def _indexes(connection) -> set[str]:
+    return {row[0] for row in await connection.execute(text("SELECT indexname FROM pg_indexes"))}
+
+
+async def test_the_retention_migration_keeps_a_deleted_parses_ledger_entry(scratch_url) -> None:
+    """docs/database.md § Migrations: after the upgrade a parse's credit entry outlives its
+    job with `job_id` NULL, the period's `spent` unchanged, as its usage row does; a chat
+    entry still never names a job; the downgrade refuses while such an entry stands rather
+    than delete it from the billing record, and drops the indexes once it may go."""
+    _alembic(scratch_url, "upgrade", OPERATOR_UPSTREAM)
+    engine = create_async_engine(scratch_url)
+    parse, other = uuid.uuid4(), uuid.uuid4()
+    try:
+        async with engine.begin() as db:
+            await db.execute(
+                text(
+                    "INSERT INTO users (id, google_sub, email, created_at) "
+                    "VALUES (1, 'sub', 'r@example.com', now())"
+                )
+            )
+            for job_id in (parse, other):
+                await db.execute(
+                    text(
+                        "INSERT INTO jobs (id, user_id, agent, kind, filename, media_type, "
+                        "size_bytes, sha256, pages_spec, model, pipeline_version, bbox_format, "
+                        "status, pages_done, prompt_sha256, created_at, finished_at) VALUES "
+                        "(:id, 1, 'parse', 'pdf', 'a.pdf', 'application/pdf', 1, 'h', '', "
+                        "'vendor/m', 1, 'yxyx_norm1000', 'succeeded', 1, '', now(), now())"
+                    ),
+                    {"id": job_id},
+                )
+            await db.execute(
+                text(
+                    "INSERT INTO credit_periods (user_id, period_start, period_end, plan_id, "
+                    "granted, spent, created_at, updated_at) VALUES (1, '2026-10-01+00', "
+                    "'2026-11-01+00', NULL, 150, 3, now(), now())"
+                )
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO credit_entries (user_id, period_start, kind, state, amount, "
+                    "job_id, created_at, settled_at) VALUES (1, '2026-10-01+00', 'parse', "
+                    "'consumed', 3, :job, now(), now())"
+                ),
+                {"job": parse},
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO usage_log (user_id, job_id, agent, model, prompt_tokens, "
+                    "completion_tokens, cost_source, created_at) VALUES (1, :job, 'parse', "
+                    "'vendor/m', 10, 5, 'unknown', now())"
+                ),
+                {"job": parse},
+            )
+            assert not await _indexes(db) & RETENTION_INDEXES
+        _alembic(scratch_url, "upgrade", PARSE_RETENTION)
+        async with engine.begin() as db:
+            assert await _indexes(db) >= RETENTION_INDEXES
+            # The retention deletes the parse; what it cost stays, in the period and in
+            # the record.
+            await db.execute(text("DELETE FROM jobs WHERE id = :id"), {"id": parse})
+            entries = (
+                await db.execute(text("SELECT kind, state, amount, job_id FROM credit_entries"))
+            ).all()
+            assert entries == [("parse", "consumed", 3, None)]
+            spent = (await db.execute(text("SELECT spent FROM credit_periods"))).scalar()
+            assert spent == 3
+            usage = (await db.execute(text("SELECT job_id, prompt_tokens FROM usage_log"))).all()
+            assert usage == [(None, 10)]
+        async with engine.connect() as db:
+            # A chat entry still never names a job.
+            with pytest.raises(IntegrityError):
+                await db.execute(
+                    text(
+                        "INSERT INTO credit_entries (user_id, period_start, kind, state, "
+                        "amount, job_id, created_at) VALUES (1, '2026-10-01+00', 'chat', "
+                        "'reserved', 1, :job, now())"
+                    ),
+                    {"job": other},
+                )
+        with pytest.raises(subprocess.CalledProcessError) as refused:
+            _alembic(scratch_url, "downgrade", OPERATOR_UPSTREAM)
+        assert b"1 parse credit entries have no job" in refused.value.stderr
+        async with engine.begin() as db:
+            version = (await db.execute(text("SELECT version_num FROM alembic_version"))).scalar()
+            assert version == PARSE_RETENTION
+            await db.execute(text("DELETE FROM credit_entries"))
+        _alembic(scratch_url, "downgrade", OPERATOR_UPSTREAM)
+        async with engine.begin() as db:
+            assert not await _indexes(db) & RETENTION_INDEXES
+            # The cascade is back: a parse entry goes with its job again.
+            await db.execute(
+                text(
+                    "INSERT INTO credit_entries (user_id, period_start, kind, state, amount, "
+                    "job_id, created_at) VALUES (1, '2026-10-01+00', 'parse', 'reserved', 1, "
+                    ":job, now())"
+                ),
+                {"job": other},
+            )
+            await db.execute(text("DELETE FROM jobs WHERE id = :id"), {"id": other})
+            assert await _count(db, "credit_entries") == 0
+    finally:
+        await engine.dispose()

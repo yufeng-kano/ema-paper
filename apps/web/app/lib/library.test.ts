@@ -9,13 +9,11 @@ import {
   checkFailureReason,
   childFolders,
   documentsIn,
-  flattenTree,
   folderPath,
   isMarkdownUpload,
   isPending,
   isReconverting,
   keyRange,
-  parseProgress,
   renameSelectionEnd,
   subtreeIds,
   typeAheadMatch,
@@ -68,28 +66,6 @@ describe('childFolders', () => {
   it('treats null as the root rather than as a folder id', () => {
     expect(childFolders(TREE, null).map((row) => row.name)).toEqual(['Invoices', 'Receipts'])
     expect(childFolders(TREE, 1).map((row) => row.name)).toEqual(['2026'])
-  })
-})
-
-describe('flattenTree', () => {
-  it('shows only what is expanded, with a depth per row', () => {
-    const collapsed = flattenTree(TREE, new Set())
-    expect(collapsed.map((row) => row.folder.name)).toEqual(['Invoices', 'Receipts'])
-    expect(collapsed[0]!.hasChildren).toBe(true)
-    expect(collapsed[1]!.hasChildren).toBe(false)
-
-    const opened = flattenTree(TREE, new Set([1, 2]))
-    expect(opened.map((row) => [row.folder.name, row.depth])).toEqual([
-      ['Invoices', 0],
-      ['2026', 1],
-      ['Q1', 2],
-      ['Receipts', 0],
-    ])
-  })
-
-  it('does not open a folder whose parent is closed', () => {
-    const rows = flattenTree(TREE, new Set([2]))
-    expect(rows.map((row) => row.folder.name)).toEqual(['Invoices', 'Receipts'])
   })
 })
 
@@ -148,12 +124,6 @@ describe('parse state', () => {
     expect(isPending(document(1, 'a.pdf', null, { status: 'succeeded' }))).toBe(false)
     expect(isPending(document(1, 'a.pdf', null, { status: 'failed' }))).toBe(false)
   })
-
-  it('reports progress as a share, and zero before the page count is known', () => {
-    expect(parseProgress(document(1, 'a.pdf', null, { pages_done: 3, page_count: 12 }))).toBe(0.25)
-    expect(parseProgress(document(1, 'a.pdf', null, { pages_done: 0, page_count: null }))).toBe(0)
-    expect(parseProgress(document(1, 'a.pdf', null, { pages_done: 20, page_count: 10 }))).toBe(1)
-  })
 })
 
 describe('re-convert state', () => {
@@ -181,12 +151,6 @@ describe('re-convert state', () => {
     expect(isReconverting(document(1, 'a.pdf', null, { reconvert: null }))).toBe(false)
     // An older API sends no field at all.
     expect(isReconverting(document(1, 'a.pdf'))).toBe(false)
-  })
-
-  it('measures a re-convert by its own pages, not its document\'s', () => {
-    const row = document(1, 'a.pdf', null, { reconvert: reconvert() })
-    expect(parseProgress(row)).toBe(1)
-    expect(parseProgress(row.reconvert!)).toBe(0.25)
   })
 })
 

@@ -12,7 +12,7 @@ The product is **Ema Paper** (renamed from Sightread on 2026-10-23). The name is
 
 The origin spec (v0.1) is a reference, not a contract. Decisions that supersede it:
 
-1. **Not stateless.** Jobs, results, and usage live in PostgreSQL. Parse results (markdown + metadata) are kept indefinitely; **source files are deleted immediately** when a job reaches a terminal state (see [jobs.md](./jobs.md)).
+1. **Not stateless.** Jobs, results, and usage live in PostgreSQL. Parse results (markdown + metadata) are kept while a file in the reader's library names them, and otherwise `PARSE_RETENTION_DAYS` (30) days after the parse finishes; **source files are deleted immediately** when a job reaches a terminal state (see [jobs.md](./jobs.md) § Retention).
 2. **REST is the core; MCP is a thin shell** over the same service layer — a single `parse` tool that mints an upload ticket and returns `curl` commands; file bytes never travel through MCP. Requires the agent to have shell + network access ([mcp.md](./mcp.md)).
 3. **No `file path` source.** Hosted service accepts uploads (multipart) or base64 only — server paths would be an LFI.
 4. **Models are the operator's choice.** The operator fixes the parse model and offers a short list of chat models, each at its own credit rate ([billing.md](./billing.md) § Models, [agents.md](./agents.md)); the chat list is checked against Kano Proxy's live catalog, and bbox quality is the operator's responsibility ([parsing.md](./parsing.md)).
@@ -22,7 +22,7 @@ The origin spec (v0.1) is a reference, not a contract. Decisions that supersede 
 
 ## Tenants and trust model
 
-- **One upstream, the operator's.** Every model call runs on the operator's own Kano Proxy account ([auth.md](./auth.md) § 3); users bring no key. Under the subscription ([billing.md](./billing.md)) a user's spend is bounded by the credits their plan grants per period: Free (a small monthly grant, no sandbox, 512 MB) and Pro (a larger grant, the sandbox, 10 GB), paid through Kano Pay. Files are kept on both plans for as long as the account exists.
+- **One upstream, the operator's.** Every model call runs on the operator's own Kano Proxy account ([auth.md](./auth.md) § 3); users bring no key. Under the subscription ([billing.md](./billing.md)) a user's spend is bounded by the credits their plan grants per period: Free (a small monthly grant, no sandbox, 512 MB) and Pro (a larger grant, the sandbox, 10 GB), paid through Kano Pay. Files are kept on both plans for as long as the account exists, save what the reader moves to the Trash, deleted 30 days later; the reader deletes the account themselves, at once ([auth.md](./auth.md) § Deleting the account).
 - Documents are untrusted input: parsing runs in short-lived subprocesses with timeouts; uploads are size- and page-capped.
 - Document content is sensitive: source files are short-lived, prompts/completions are never logged (nor are a failed database statement's bound values, which hold the same text), results are visible only to their owner.
 

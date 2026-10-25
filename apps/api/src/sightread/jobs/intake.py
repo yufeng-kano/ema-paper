@@ -382,7 +382,7 @@ async def submit_parse(
     }
 
     if not force:
-        cached = await find_cached_job(db, **key)
+        cached = await find_cached_job(db, retention_days=settings.parse_retention_days, **key)
         result = (
             None
             if cached is None

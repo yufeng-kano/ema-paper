@@ -36,10 +36,8 @@ export const PUBLIC_PATHS = PUBLIC_PAGES.flatMap((page) => PAGE_LOCALES.map(({ p
  */
 export const DISALLOWED_PATHS = [
   '/files',
-  '/history',
   '/settings',
   '/zh-TW/files',
-  '/zh-TW/history',
   '/zh-TW/settings',
   '/api/auth/',
   '/v1/',

@@ -1,9 +1,9 @@
 /**
  * The result document, as blocks the viewer can render.
  *
- * `GET /api/jobs/{id}/result` hands back the whole document as one markdown string with
- * `<!-- page: N -->` markers between pages and `![figN](sightread://pN/…)` placeholders
- * where figures belong (docs/parsing.md § Page markers). The viewer needs it the other way
+ * `GET /api/library/documents/{id}/result` hands back the whole document as one markdown
+ * string with `<!-- page: N -->` markers between pages and `![figN](sightread://pN/…)`
+ * placeholders where figures belong (docs/parsing.md § Page markers). The viewer needs it the other way
  * round — ordered blocks grouped by page — so the split happens here, on the client, rather
  * than being asked of an API whose contract is the markdown itself.
  *

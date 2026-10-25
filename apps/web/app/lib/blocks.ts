@@ -335,8 +335,8 @@ export function changedBlocks(before: readonly PlacedBlock[], after: readonly Pl
 /** The most documents whose folds the browser keeps: `localStorage` is small, and shared. */
 export const FOLD_MEMORY_LIMIT = 100
 
-/** The folds remembered per document — `doc:<id>` on Files, `job:<id>` on History — with when
- *  each was last set, so the oldest are the ones let go. */
+/** The folds remembered per document — `doc:<id>` — with when each was last set, so the
+ *  oldest are the ones let go. */
 export type FoldMemory = Record<string, { slugs: string[]; at: number }>
 
 /** The remembered folds as stored: anything unreadable is nothing remembered. */

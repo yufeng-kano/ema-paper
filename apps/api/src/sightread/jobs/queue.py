@@ -14,11 +14,24 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import LargeBinary, Text, bindparam, cast, delete, func, select, text, update
+from sqlalchemy import (
+    ColumnElement,
+    LargeBinary,
+    Text,
+    bindparam,
+    cast,
+    delete,
+    func,
+    or_,
+    select,
+    text,
+    update,
+)
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
+from sqlalchemy.orm import aliased
 
 from ..agents import get_agent
 from ..billing import ledger
@@ -28,6 +41,7 @@ from ..db.models import (
     WORKER_GENERATION_SEQ,
     ChatTurn,
     Conversation,
+    Document,
     Job,
     JobPage,
     Message,
@@ -192,16 +206,36 @@ def dedup_key(
     ]
 
 
-async def find_cached_job(db: AsyncSession, **key) -> Job | None:
-    """The dedup lookup: a succeeded job for this exact parse (docs/jobs.md § Dedup)."""
-    return (
-        await db.execute(
-            select(Job)
-            .where(*dedup_key(**key), Job.status == "succeeded")
-            .order_by(Job.created_at.desc())
-            .limit(1)
-        )
-    ).scalar_one_or_none()
+def parse_kept(retention_days: int) -> ColumnElement[bool]:
+    """The parse retention's rule, written once (docs/jobs.md § Retention): a job is kept
+    while it is queued or running, while it finished less than `retention_days` days ago
+    (a row from before `finished_at` was always written counts from its creation), or
+    while any document of its user — live or in the Trash — names a parse (its
+    `job_id` or its `reconvert_job_id`) of the same original. The last clause keeps a
+    document's own parse, its re-convert, and the earlier parses of its original the
+    figure route falls back on. The purge deletes the finished jobs it does not keep; the
+    dedup cache asks it with a day less (`find_cached_job`)."""
+    named = aliased(Job)
+    return or_(
+        Job.status.in_(("queued", "running")),
+        func.coalesce(Job.finished_at, Job.created_at) > utcnow() - timedelta(days=retention_days),
+        select(Document.id)
+        .join(named, or_(named.id == Document.job_id, named.id == Document.reconvert_job_id))
+        .where(Document.user_id == Job.user_id, named.sha256 == Job.sha256)
+        .exists(),
+    )
+
+
+async def find_cached_job(db: AsyncSession, *, retention_days: int, **key) -> Job | None:
+    """The dedup lookup: a succeeded job for this exact parse (docs/jobs.md § Dedup) that
+    the retention keeps for at least another day — named by a document's clause, or
+    finished less than `retention_days - 1` days ago, never by its age alone at 1 — so a
+    result handed out is never purged between the lookup and its use (§ Dedup margin).
+    With `retention_days` 0 nothing is purged, and any succeeded job answers."""
+    query = select(Job).where(*dedup_key(**key), Job.status == "succeeded")
+    if retention_days > 0:
+        query = query.where(parse_kept(retention_days - 1))
+    return (await db.execute(query.order_by(Job.created_at.desc()).limit(1))).scalar_one_or_none()
 
 
 async def hold_dedup_key(db: AsyncSession, **key) -> None:

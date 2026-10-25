@@ -322,8 +322,7 @@ async def test_an_upload_reserves_its_pages_and_the_payloads_show_the_settled_co
     assert created.json()["credits"] is None  # reserved, not settled
     assert (await client.get("/api/me")).json()["credits_remaining"] == 4
     job_id = created.json()["job_id"]
-    listed = (await client.get("/api/jobs")).json()["jobs"]
-    assert listed[0]["credits"] is None
+    assert (await _read(client))["documents"][0]["credits"] is None
     entries = (await client.get("/api/billing/entries")).json()
     assert entries["per_agent"] == [{"agent": "parse", "credits": 1}]
     assert entries["per_day"][0]["parse"] == 1
@@ -332,7 +331,6 @@ async def test_an_upload_reserves_its_pages_and_the_payloads_show_the_settled_co
         await ledger.settle_parse(db, __import__("uuid").UUID(job_id), "succeeded")
         await db.commit()
     assert (await _read(client))["documents"][0]["credits"] == 1
-    assert (await client.get("/api/jobs")).json()["jobs"][0]["credits"] == 1
 
 
 async def test_a_send_without_the_minimum_balance_is_refused(make_client, tmp_path) -> None:

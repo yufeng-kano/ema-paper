@@ -3,9 +3,10 @@ import {
   ApiRequestError,
   createKey,
   creditsRefusalOf,
+  deleteAccount,
+  getLibrary,
   getMe,
   isDevLoginAvailable,
-  listJobs,
   putAgentSettings,
   putDocumentContent,
   renameConversation,
@@ -38,11 +39,11 @@ afterEach(() => {
 
 describe('request', () => {
   it('sends session credentials and no CSRF header on reads', async () => {
-    const fetchMock = stubFetch(Response.json({ jobs: [] }))
+    const fetchMock = stubFetch(Response.json({ folders: [], documents: [], trash: { folders: [], documents: [] } }))
 
-    await listJobs(50)
+    await getLibrary()
 
-    expect(fetchMock).toHaveBeenCalledWith('/api/jobs?limit=50', expect.anything())
+    expect(fetchMock).toHaveBeenCalledWith('/api/library', expect.anything())
     expect(lastInit(fetchMock).credentials).toBe('include')
     expect(lastInit(fetchMock).method).toBe('GET')
     expect(headersOf(fetchMock)['X-Requested-With']).toBeUndefined()
@@ -63,6 +64,17 @@ describe('request', () => {
     stubFetch(new Response(null, { status: 204 }))
 
     await expect(revokeKey(7)).resolves.toBeUndefined()
+  })
+
+  it('deletes the account as a mutation, with the CSRF header and no body', async () => {
+    const fetchMock = stubFetch(new Response(null, { status: 204 }))
+
+    await expect(deleteAccount()).resolves.toBeUndefined()
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/account', expect.anything())
+    expect(lastInit(fetchMock).method).toBe('DELETE')
+    expect(headersOf(fetchMock)['X-Requested-With']).toBe('fetch')
+    expect(lastInit(fetchMock).body).toBeUndefined()
   })
 
   it('raises the error envelope type and message', async () => {
@@ -90,7 +102,7 @@ describe('request', () => {
     )
     let caught: unknown
     try {
-      await listJobs(50)
+      await getLibrary()
     } catch (error) {
       caught = error
     }

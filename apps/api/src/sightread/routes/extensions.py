@@ -18,8 +18,9 @@ from ..agents import skills as skill_defs
 from ..agents import subagents as subagent_defs
 from ..agents.chat import SUBAGENT_TOOL_NAMES
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
-from ..db.models import Skill, Subagent, User, utcnow
+from ..db.models import Skill, Subagent, utcnow
 from ..errors import ApiError
+from ..workspace.trash import lock_user
 
 router = APIRouter(prefix="/api", tags=["extensions"])
 
@@ -130,19 +131,15 @@ async def list_skills(user: SessionUser, db: DbSession):
     return {"skills": [skill_payload(skill) for skill in resolved]}
 
 
-async def _lock_user(db: DbSession, user_id: int) -> None:
-    """The user's row, held until the create commits: two creations near the cap must not
-    both count below it (PostgreSQL; the SQLite fallback runs one request at a time), the
-    same lock the turn cap takes (docs/chat.md § Conversations)."""
-    await db.execute(select(User.id).where(User.id == user_id).with_for_update())
-
-
 @router.post("/skills", dependencies=[CsrfGuard], status_code=status.HTTP_201_CREATED)
 async def create_skill(body: SkillCreate, user: SessionUser, db: DbSession, settings: AppSettings):
     name = _checked_name(body.name)
     if name in skill_defs.BUILTIN_SKILL_NAMES:
         raise ApiError(409, "invalid_request", "That name belongs to a built-in skill")
-    await _lock_user(db, user.id)
+    # The user's row, held until the create commits: two creations near the cap must
+    # not both count below it (PostgreSQL; the SQLite fallback runs one request at a
+    # time), the same lock the turn cap takes (docs/chat.md § Conversations).
+    await lock_user(db, user.id)
     if await _skill_row(db, user.id, name) is not None:
         raise ApiError(409, "invalid_request", "A skill with this name already exists")
     own = (
@@ -329,7 +326,7 @@ async def create_subagent(
     name = _checked_name(body.name)
     if name in subagent_defs.BUILTIN_SUBAGENT_NAMES:
         raise ApiError(409, "invalid_request", "That name belongs to a built-in subagent")
-    await _lock_user(db, user.id)
+    await lock_user(db, user.id)
     if await _subagent_row(db, user.id, name) is not None:
         raise ApiError(409, "invalid_request", "A subagent with this name already exists")
     own = (
