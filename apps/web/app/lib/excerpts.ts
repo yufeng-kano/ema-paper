@@ -44,7 +44,7 @@ function blocksOf(markdown: string): ResultBlock[] {
 export function passageText(markdown: string): string {
   return passageKey(
     blocksOf(markdown)
-      .map(blockPlain)
+      .map((block) => blockPlain(block))
       .filter(Boolean)
       .join(' '),
   )

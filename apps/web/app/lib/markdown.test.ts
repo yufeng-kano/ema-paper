@@ -1228,7 +1228,7 @@ describe('blockPlain and firstWords', () => {
         '> quoted $y$',
       ].join('\n'),
     ).flatMap((page) => page.blocks)
-    expect(blocks.map(blockPlain)).toEqual(['Bold and x_1 text', 'one two', 'A B 1 2', 'Figure 1: curves', 'quoted y'])
+    expect(blocks.map((block) => blockPlain(block))).toEqual(['Bold and x_1 text', 'one two', 'A B 1 2', 'Figure 1: curves', 'quoted y'])
   })
 
   it('cuts to eight words, then to sixty characters', () => {
