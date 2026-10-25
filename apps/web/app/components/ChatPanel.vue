@@ -32,6 +32,7 @@ import {
   getConversation,
   listConversations,
   listMemories,
+  renameConversation,
   revertRevision,
   sendMessage,
   creditsRefusalOf,
@@ -45,6 +46,7 @@ import {
 } from '~/lib/api'
 import { blockName, type NameText } from '~/lib/blocks'
 import { commandArguments, formatBytes, type AskOutcome, type AskRequest, type ComposerPayload } from '~/lib/composer'
+import { byRecency } from '~/lib/conversations'
 import { nodesToMarkdown } from '~/lib/copy'
 import { formatCount } from '~/lib/format'
 import { turnErrorKey, turnErrorNeedsPlan } from '~/lib/turnError'
@@ -130,103 +132,154 @@ const creditsRefusal = ref<CreditsRefusal | null>(null)
 
 // --- conversations --------------------------------------------------------------
 
+/** The document's conversations that hold a message, the one continued last first: the
+ *  server lists no empty one (docs/web.md § The agent panel, *Conversations*). */
 const conversations = ref<Conversation[]>([])
-const conversationsError = ref<string | null>(null)
+const listError = ref<string | null>(null)
+const listPending = ref(false)
+/** Numbers the reads: only the latest may fill the list, and a change made here since — a
+ *  first send accepted, a rename, a delete — drops every read begun before it. */
+let listRequest = 0
+/** The open conversation; null is the draft, a new conversation nothing was sent to yet. */
 const currentId = ref<number | null>(null)
 const current = computed(
   () => conversations.value.find((row) => row.id === currentId.value) ?? null,
 )
 const title = computed(() => current.value?.title || t('chat.untitled'))
 
-function byRecency(rows: Conversation[]): Conversation[] {
-  return [...rows].sort((left, right) => right.updated_at.localeCompare(left.updated_at))
-}
-
-async function loadConversations() {
-  conversationsError.value = null
+async function readConversations() {
+  const request = ++listRequest
+  listPending.value = true
   try {
-    const rows = byRecency((await listConversations(props.documentId)).conversations)
-    conversations.value = rows
-    if (currentId.value === null && rows[0]) {
-      await select(rows[0].id)
+    const { conversations: rows } = await listConversations(props.documentId)
+    if (request === listRequest) {
+      conversations.value = byRecency(rows)
+      listError.value = null
     }
   } catch (error) {
-    conversationsError.value = await resolve(error)
+    if (request === listRequest) {
+      listError.value = await resolve(error)
+    }
+  } finally {
+    if (request === listRequest) {
+      listPending.value = false
+    }
   }
 }
 
-const menu = ref<Point | null>(null)
-/** Opened from the keyboard, so the first row takes the highlight (docs/web.md). */
-const menuFromKey = ref(false)
+/** The list was changed here: a read already on its way predates the change. */
+function listChanged() {
+  listRequest++
+  listPending.value = false
+}
+
+/** The panel opens on the conversation continued last, or on the draft when there is none —
+ *  unless the reader has sent from the draft meanwhile: a send on its way, or one refused
+ *  whose text waits in the composer for the draft's retry. */
+async function loadConversations() {
+  await readConversations()
+  const latest = conversations.value[0]
+  if (latest && currentId.value === null && !draftSending && draft === null) {
+    await select(latest.id)
+  }
+}
+
+const chatRoot = ref<HTMLElement | null>(null)
 const titleButton = ref<HTMLButtonElement | null>(null)
+/** The list open under the title: where it stands in the card, how far down it may reach,
+ *  and whether the keyboard opened it (its current row then takes focus). */
+const list = ref<{ top: number; room: number; fromKey: boolean } | null>(null)
+const renameError = ref<string | null>(null)
 
-const menuItems = computed<MenuItem[]>(() => [
-  ...conversations.value.map((row) => ({
-    key: String(row.id),
-    label: row.title || t('chat.untitled'),
-    checked: row.id === currentId.value,
-  })),
-  {
-    key: 'new',
-    label: t('chat.newConversation'),
-    icon: 'plus' as const,
-    separated: conversations.value.length > 0,
-  },
-  ...(current.value
-    ? [
-        {
-          key: 'delete',
-          label: t('common.delete'),
-          icon: 'trash' as const,
-          danger: true,
-          separated: true,
-        },
-      ]
-    : []),
-])
-
-function openMenu(event: MouseEvent) {
-  const box = titleButton.value?.getBoundingClientRect()
+/** Measured from the card each time it opens: under the title, and down to the thread's
+ *  foot, which leaves the composer's own top padding — 8px — above its field. The list is
+ *  read again as it opens. */
+function toggleList(event: MouseEvent) {
+  if (list.value) {
+    list.value = null
+    return
+  }
+  const card = chatRoot.value?.getBoundingClientRect()
+  const under = titleButton.value?.getBoundingClientRect().bottom
+  const foot = scroller.value?.getBoundingClientRect().bottom
+  if (!card || under === undefined || foot === undefined) {
+    return
+  }
+  const top = under - card.top + 4
   // A click the keyboard made carries no pointer detail.
-  menuFromKey.value = event.detail === 0
-  menu.value = box ? { x: box.left, y: box.bottom + 4 } : { x: 0, y: 0 }
+  list.value = { top, room: foot - card.top - top, fromKey: event.detail === 0 }
+  renameError.value = null
+  void readConversations()
 }
 
-async function onMenuSelect(key: string) {
-  menu.value = null
-  if (key === 'new') {
-    await startConversation()
-  } else if (key === 'delete') {
-    confirmingDelete.value = true
-  } else {
-    await select(Number(key))
+function closeList(refocus: boolean) {
+  list.value = null
+  if (refocus) {
+    titleButton.value?.focus()
   }
 }
 
-const confirmingDelete = ref(false)
+async function pickConversation(id: number) {
+  closeList(true)
+  await select(id)
+}
+
+function newFromList() {
+  list.value = null
+  newConversation()
+}
+
+/** Shown at once, then as the server cleaned it; a refusal puts the old title back and says
+ *  why in the list. The row keeps its place: a rename is not a thread continued. */
+async function renameRow(id: number, name: string) {
+  const before = conversations.value.find((row) => row.id === id)?.title ?? null
+  renameError.value = null
+  listChanged()
+  conversations.value = conversations.value.map((row) => (row.id === id ? { ...row, title: name } : row))
+  try {
+    const saved = await renameConversation(id, name)
+    listChanged()
+    conversations.value = conversations.value.map((row) => (row.id === id ? { ...row, title: saved.title } : row))
+  } catch (error) {
+    conversations.value = conversations.value.map((row) =>
+      row.id === id && row.title === name ? { ...row, title: before } : row,
+    )
+    renameError.value = await resolve(error)
+  }
+}
+
+/** The conversation the delete dialog asks about: any row's, from its menu. */
+const deleting = ref<Conversation | null>(null)
 const deletePending = ref(false)
 const deleteError = ref<string | null>(null)
 
+/** The list closes and focus waits on the title, where the dialog gives it back. */
+async function askDelete(row: Conversation) {
+  list.value = null
+  await nextTick()
+  titleButton.value?.focus()
+  deleteError.value = null
+  deleting.value = row
+}
+
 async function removeConversation() {
-  const id = currentId.value
-  if (id === null) {
+  const target = deleting.value
+  if (!target) {
     return
   }
   deletePending.value = true
   deleteError.value = null
   try {
-    await deleteConversation(id)
-    confirmingDelete.value = false
-    conversations.value = conversations.value.filter((row) => row.id !== id)
-    stream.close()
-    currentId.value = null
-    messages.value = []
-    turns.value = []
-    discardFrames()
-    card.value = null
-    const next = conversations.value[0]
-    if (next) {
-      await select(next.id)
+    await deleteConversation(target.id)
+    deleting.value = null
+    listChanged()
+    conversations.value = conversations.value.filter((row) => row.id !== target.id)
+    if (currentId.value === target.id) {
+      openDraft()
+      const next = conversations.value[0]
+      if (next) {
+        await select(next.id)
+      }
     }
   } catch (error) {
     deleteError.value = await resolve(error)
@@ -293,17 +346,40 @@ async function select(id: number) {
   await loadDetail(id)
 }
 
-async function startConversation() {
-  composerError.value = null
-  try {
-    const created = await createConversation(props.documentId)
-    conversations.value = [created, ...conversations.value]
-    await select(created.id)
-    return created.id
-  } catch (error) {
-    composerError.value = await resolve(error)
-    return null
+/** The conversation a refused first send made: empty, so never listed, and where the next
+ *  send from the draft goes rather than making another (docs/web.md § The agent panel). */
+let draft: Conversation | null = null
+/** A first send from the draft is on its way: the list read as the panel mounts must not
+ *  open another conversation over it. */
+let draftSending = false
+/** Counts the moves back to the draft: a first send accepted after one is not opened over
+ *  the draft the reader moved to. */
+let draftGeneration = 0
+
+/** Closes the open thread onto the draft. */
+function openDraft() {
+  draftGeneration++
+  stream.close()
+  currentId.value = null
+  detailSeq++
+  detailPending.value = false
+  detailError.value = null
+  messages.value = []
+  turns.value = []
+  discardFrames()
+  card.value = null
+  following = true
+}
+
+/** *New conversation* — the head's button, the list's foot, `/new` — makes nothing on the
+ *  server: it opens the draft, keeping whatever the composer holds. On the draft already, it
+ *  only focuses the composer. */
+function newConversation() {
+  if (currentId.value !== null) {
+    openDraft()
+    composerError.value = null
   }
+  composer.value?.focus()
 }
 
 onMounted(loadConversations)
@@ -906,21 +982,27 @@ function sentContent(payload: ComposerPayload): ContentBlock[] {
   return blocks
 }
 
-/** Posts the composer's message, opening a conversation first if none is. True once the
- *  server accepted it: the composer then clears what it sent. */
+/** Posts the composer's message. From the draft, the conversation is made first — or is the
+ *  one a refused first send made — and joins the list once its message is accepted. True once
+ *  the server accepted it: the composer then clears what it sent. */
 async function submit(payload: ComposerPayload): Promise<boolean> {
   if (running.value) {
     return false
   }
   composerError.value = null
+  const fromDraft = currentId.value === null
+  const generation = draftGeneration
   let id = currentId.value
-  if (id === null) {
-    id = await startConversation()
-    if (id === null) {
-      return false
-    }
+  let made: Conversation | null = null
+  if (fromDraft) {
+    draftSending = true
   }
   try {
+    if (id === null) {
+      made = draft ?? (await createConversation(props.documentId))
+      draft = made
+      id = made.id
+    }
     const { turn_id, message_id } = await sendMessage(id, {
       text: payload.text,
       ...(payload.selection ? { selection: payload.selection } : {}),
@@ -930,7 +1012,22 @@ async function submit(payload: ComposerPayload): Promise<boolean> {
       ...(payload.attachments.length ? { attachments: payload.attachments.map((entry) => entry.id) } : {}),
       locale: locale.value,
     })
-    if (currentId.value !== id) {
+    if (made) {
+      // It holds a message now, so it is listed — first, as the thread continued last — and
+      // the list is read again for the title its first message gave it.
+      const accepted = { ...made, updated_at: new Date().toISOString() }
+      draft = null
+      listChanged()
+      conversations.value = [accepted, ...conversations.value.filter((row) => row.id !== accepted.id)]
+      void readConversations()
+      if (currentId.value !== null || generation !== draftGeneration) {
+        // The reader opened another thread, or a new draft, while the send was in flight:
+        // the turn is this conversation's, shown when it is opened.
+        return true
+      }
+      currentId.value = id
+      stream.open(id, 0)
+    } else if (currentId.value !== id) {
       // The reader switched threads while the send was in flight: the turn belongs to
       // the thread it was sent to, which shows it when it is opened again. What was sent
       // was accepted there, so it is no draft of this thread.
@@ -972,6 +1069,10 @@ async function submit(payload: ComposerPayload): Promise<boolean> {
     }
     composerError.value = await resolve(error)
     return false
+  } finally {
+    if (fromDraft) {
+      draftSending = false
+    }
   }
 }
 
@@ -1381,7 +1482,14 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="chat" @dragenter="onDragEnter" @dragover="onDragOver" @dragleave="onDragLeave" @drop="onDrop">
+  <div
+    ref="chatRoot"
+    class="chat"
+    @dragenter="onDragEnter"
+    @dragover="onDragOver"
+    @dragleave="onDragLeave"
+    @drop="onDrop"
+  >
     <!-- The conversation's name opens the document's list of them; at the right a new
          conversation and the close (docs/web.md § The agent panel). -->
     <div class="head">
@@ -1389,15 +1497,15 @@ onBeforeUnmount(() => {
         ref="titleButton"
         type="button"
         class="title"
-        aria-haspopup="menu"
-        :aria-expanded="menu ? 'true' : 'false'"
+        aria-haspopup="dialog"
+        :aria-expanded="list ? 'true' : 'false'"
         :aria-label="t('chat.pick')"
-        @click="menu ? (menu = null) : openMenu($event)"
+        @click="toggleList"
       >
         <span class="title-text">{{ current ? title : t('chat.newConversation') }}</span>
         <UiIcon name="chevron-down" />
       </button>
-      <UiButton class="new" variant="ghost" icon-only :label="t('chat.newConversation')" @click="startConversation()">
+      <UiButton class="new" variant="ghost" icon-only :label="t('chat.newConversation')" @click="newConversation()">
         <template #icon><UiIcon name="square-pen" /></template>
       </UiButton>
       <UiButton variant="ghost" icon-only :label="t('chat.closePanel')" @click="emit('close')">
@@ -1405,14 +1513,24 @@ onBeforeUnmount(() => {
       </UiButton>
     </div>
 
-    <UiContextMenu
-      v-if="menu"
-      :at="menu"
-      :items="menuItems"
-      :label="t('chat.conversations')"
-      :focus-first="menuFromKey"
-      @select="onMenuSelect"
-      @close="menu = null"
+    <ChatConversationList
+      v-if="list"
+      :conversations="conversations"
+      :current-id="currentId"
+      :pending="listPending"
+      :error="listError"
+      :rename-error="renameError"
+      :top="list.top"
+      :room="list.room"
+      :title-max="limits?.conversation_title_max_chars"
+      :from-key="list.fromKey"
+      :anchor="titleButton"
+      @select="pickConversation"
+      @new="newFromList"
+      @rename="renameRow"
+      @delete="askDelete"
+      @retry="readConversations"
+      @close="closeList"
     />
 
     <UiContextMenu
@@ -1443,7 +1561,7 @@ onBeforeUnmount(() => {
       @scroll="onThreadScroll"
       @wheel.passive="onThreadWheel"
     >
-      <UiBanner v-if="conversationsError" tone="error">{{ conversationsError }}</UiBanner>
+      <UiBanner v-if="listError" tone="error">{{ listError }}</UiBanner>
       <UiBanner v-else-if="detailError" tone="error">{{ detailError }}</UiBanner>
       <UiBanner v-if="cardError" tone="error">{{ cardError }}</UiBanner>
 
@@ -1618,7 +1736,7 @@ onBeforeUnmount(() => {
       :submit="submit"
       :error="composerError"
       @stop="stop"
-      @new-conversation="startConversation"
+      @new-conversation="newConversation"
     />
 
     <ChatContextCard
@@ -1667,14 +1785,14 @@ onBeforeUnmount(() => {
     </Teleport>
 
     <UiConfirmDialog
-      v-if="confirmingDelete"
+      v-if="deleting"
       :title="t('chat.deleteConversation')"
-      :message="t('chat.deleteConfirm', { title })"
+      :message="t('chat.deleteConfirm', { title: deleting.title || t('chat.untitled') })"
       :confirm-label="t('common.delete')"
       :pending="deletePending"
       :error="deleteError"
       @confirm="removeConversation"
-      @cancel="confirmingDelete = false"
+      @cancel="deleting = null"
     />
   </div>
 </template>

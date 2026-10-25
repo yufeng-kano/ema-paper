@@ -8,6 +8,7 @@ import {
   listJobs,
   putAgentSettings,
   putDocumentContent,
+  renameConversation,
   revertRevision,
   revokeKey,
   sendMessage,
@@ -175,6 +176,17 @@ describe('workspace and chat routes', () => {
       expect.anything(),
     )
     expect(lastInit(fetchMock).method).toBe('POST')
+  })
+
+  it('renames a conversation with a PUT of its title alone', async () => {
+    const saved = { id: 3, title: 'Table 2', created_at: 'a', updated_at: 'b' }
+    const fetchMock = stubFetch(Response.json(saved))
+
+    await expect(renameConversation(3, 'Table 2')).resolves.toEqual(saved)
+    expect(fetchMock).toHaveBeenCalledWith('/api/conversations/3', expect.anything())
+    expect(lastInit(fetchMock).method).toBe('PUT')
+    expect(lastInit(fetchMock).body).toBe(JSON.stringify({ title: 'Table 2' }))
+    expect(headersOf(fetchMock)['X-Requested-With']).toBe('fetch')
   })
 
   it('builds the event stream URL from the last seen sequence', () => {
