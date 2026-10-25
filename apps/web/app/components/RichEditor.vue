@@ -2132,11 +2132,18 @@ defineExpose({
   height: 16px;
 }
 
+/* The layers drawn behind blocks — a unit's selection, the wash — belong to the editor's own
+   stacking context, not the block's: there they sit behind the whole block, its quote bar and
+   its heading's rule included, as the document's sit behind a block's wrapper. In the block's
+   own context they would paint over its border. */
+.rich :deep(.rich-doc) {
+  isolation: isolate;
+}
+
 /* A unit selected whole, or the one its menu holds: the document's selection, a layer behind
    its blocks that moves no text — an excerpt's two blocks joined into one layer. */
 .rich :deep(.rich-unit-selected) {
   position: relative;
-  isolation: isolate;
 }
 
 .rich :deep(.rich-unit-selected)::before {
@@ -2380,7 +2387,6 @@ defineExpose({
    behind the blocks, spread past them so it reads as a place. */
 .rich :deep(.rich-wash) {
   position: relative;
-  isolation: isolate;
 }
 
 .rich :deep(.rich-wash)::before {
