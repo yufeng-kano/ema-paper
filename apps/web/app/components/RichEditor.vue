@@ -195,14 +195,16 @@ function scrollParent(element: HTMLElement | null): HTMLElement | null {
 /** The gap between the field and its formula. */
 const MATH_GAP = 6
 
-/** The open field: its formula, the display field's rows as it opened (one more than the TeX's
- *  lines, three at least), and where it sits — `edge` from the root's top, or, `above` the
+/** The open field: its formula, the display field's rows as it opened (one more than the lines
+ *  the TeX wraps to, three at least), the text area's height where the room it opens into holds
+ *  it below its CSS cap, and where it sits — `edge` from the root's top, or, `above` the
  *  formula, from the root's bottom, so a field that grows grows away from the formula. */
 const math = ref<{
   pos: number
   display: boolean
   latex: string
   rows: number
+  cap: number | null
   above: boolean
   edge: number
   left: number
@@ -213,7 +215,8 @@ const mathInput = ref<HTMLInputElement | HTMLTextAreaElement | null>(null)
 /**
  * Opens the field under the formula, or above it where the pane has no room below for the
  * field at its tallest and more above — the slash menu's rule. The side is chosen here, once:
- * typing moves the field with its formula's edge but never flips it.
+ * typing moves the field with its formula's edge but never flips it. Where neither side has the
+ * room, the text area is held to the room it opens into, as the slash menu is.
  */
 async function openMath(target: MathTarget) {
   const box = root.value
@@ -225,6 +228,7 @@ async function openMath(target: MathTarget) {
     display: target.display,
     latex: target.latex,
     rows: Math.max(3, target.latex.split('\n').length + 1),
+    cap: null,
     above: false,
     edge: target.dom.getBoundingClientRect().bottom - box.getBoundingClientRect().top + MATH_GAP,
     left: 0,
@@ -236,12 +240,19 @@ async function openMath(target: MathTarget) {
   if (math.value !== open || !field || !input) {
     return
   }
-  fitMath()
+  fitMath(true)
   // At its tallest the field is as it is now, its text area grown to its cap (inline: none).
-  const cap = Number.parseFloat(getComputedStyle(input).maxHeight)
+  const style = getComputedStyle(input)
+  const cap = Number.parseFloat(style.maxHeight)
   const tallest = field.offsetHeight + (Number.isNaN(cap) ? 0 : Math.max(0, cap - input.offsetHeight))
   const pane = scrollParent(box)?.getBoundingClientRect() ?? { top: 0, bottom: window.innerHeight }
-  open.above = openSide(target.dom.getBoundingClientRect(), pane, tallest, MATH_GAP).above
+  const side = openSide(target.dom.getBoundingClientRect(), pane, tallest, MATH_GAP)
+  open.above = side.above
+  if (!Number.isNaN(cap) && side.room < tallest) {
+    // Three lines at least, past which it scrolls; the hint under it stays in the pane.
+    const least = 3 * Number.parseFloat(style.lineHeight) + Number.parseFloat(style.paddingTop) + Number.parseFloat(style.paddingBottom)
+    open.cap = Math.max(least, cap - (tallest - side.room))
+  }
   placeMath()
   await nextTick()
   if (math.value === open) {
@@ -267,22 +278,55 @@ function placeMath() {
     : Math.min(Math.max(0, rect.left - outer.left), Math.max(0, outer.width - (mathField.value?.offsetWidth ?? 0)))
 }
 
-/** A display formula's text area grows with its text to its CSS cap, past which it scrolls;
- *  `rows` is the least it shrinks to. Shrinking it to measure would clamp the pane's scroll
- *  where the field reaches past the pane's end, so both scroll offsets are put back. */
-function fitMath() {
+/** A display formula's text area grows with its text to its cap, past which it scrolls;
+ *  `rows` is the least it shrinks to — counted again as it opens, in the lines the TeX wraps
+ *  to, so a narrow field still opens with one empty line under its text. Shrinking it to
+ *  measure would clamp the pane's scroll where the field reaches past the pane's end, so both
+ *  scroll offsets are put back; it measures without its scrollbar, which would wrap the text
+ *  narrower than it is drawn. */
+function fitMath(opening = false) {
   const input = mathInput.value
-  if (!(input instanceof HTMLTextAreaElement)) {
+  const open = math.value
+  if (!(input instanceof HTMLTextAreaElement) || !open) {
     return
   }
   const pane = scrollParent(root.value) ?? document.scrollingElement
   const paneScrolled = pane?.scrollTop ?? 0
   const scrolled = input.scrollTop
+  input.style.overflowY = 'hidden'
+  if (opening) {
+    const style = getComputedStyle(input)
+    input.style.height = '0px'
+    const text = input.scrollHeight - Number.parseFloat(style.paddingTop) - Number.parseFloat(style.paddingBottom)
+    const lines = Math.round(text / Number.parseFloat(style.lineHeight))
+    if (lines + 1 > open.rows) {
+      open.rows = lines + 1
+      input.rows = open.rows
+    }
+  }
   input.style.height = 'auto'
   input.style.height = `${input.scrollHeight}px`
+  input.style.overflowY = ''
   input.scrollTop = scrolled
   if (pane) {
     pane.scrollTop = paneScrolled
+  }
+}
+
+/** A field its formula's growth took past the pane's edge comes back in: the pane scrolls by
+ *  what the field passes, never so far that its other edge leaves. */
+function revealMath() {
+  const field = mathField.value
+  const pane = scrollParent(root.value)
+  if (!field || !pane) {
+    return
+  }
+  const box = field.getBoundingClientRect()
+  const view = pane.getBoundingClientRect()
+  if (box.bottom > view.bottom) {
+    pane.scrollTop += Math.max(0, Math.min(box.bottom - view.bottom, box.top - view.top))
+  } else if (box.top < view.top) {
+    pane.scrollTop -= Math.max(0, Math.min(view.top - box.top, view.bottom - box.bottom))
   }
 }
 
@@ -296,6 +340,7 @@ function onMathInput() {
   editor.view.dispatch(editor.state.tr.setNodeMarkup(open.pos, undefined, { ...node.attrs, latex: open.latex }))
   fitMath()
   placeMath()
+  void nextTick(revealMath)
 }
 
 /** Closes the field; an emptied formula is deleted. `refocus` returns the caret to the
@@ -1924,6 +1969,7 @@ defineExpose({
         v-model="math.latex"
         class="math-input mono"
         :rows="math.rows"
+        :style="{ maxHeight: math.cap === null ? undefined : `${math.cap}px` }"
         spellcheck="false"
         :aria-label="t('viewer.mathSource')"
         @input="onMathInput"
@@ -2442,7 +2488,8 @@ defineExpose({
 }
 
 /* A display formula's text area grows with its text (`fitMath`) to twelve lines, or 40% of
-   the window where that is less, then scrolls. */
+   the window where that is less — or to the room it opens into, held there inline (`cap`) —
+   then scrolls. */
 .math-field.display .math-input {
   max-height: min(calc(12 * 1.6em + 2 * var(--space-1)), 40vh);
   overflow-y: auto;
