@@ -75,6 +75,13 @@ export default {
     signedOut: '登入階段已結束，請重新登入。',
     unexpected: '發生錯誤。',
   },
+  errorPage: {
+    notFoundTitle: '找不到頁面',
+    notFoundBody: '這個網址沒有頁面，可能是連結打錯了，或頁面已經搬走。',
+    failedTitle: '發生錯誤',
+    failedBody: '這個頁面無法顯示，請稍後再試。',
+    home: '回到 {name}',
+  },
   login: {
     seoTitle: 'Ema Paper — 將 PDF 與圖片解析成帶圖表座標的 Markdown',
     seoDescription:

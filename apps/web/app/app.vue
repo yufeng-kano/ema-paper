@@ -8,7 +8,7 @@ useHead(() => ({
   title: t('app.name'),
   htmlAttrs: { lang: localeHead.value.htmlAttrs?.lang },
   link: [...(localeHead.value.link || [])],
-  meta: [...(localeHead.value.meta || [])],
+  meta: [...(localeHead.value.meta || []), { property: 'og:site_name', content: t('app.name') }],
 }))
 </script>
 

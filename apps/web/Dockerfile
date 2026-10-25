@@ -11,6 +11,9 @@ WORKDIR /app
 # `nuxt prepare`, which needs nuxt.config.ts; the pnpm store cache keeps installs cheap.
 COPY . .
 RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install --frozen-lockfile
+# The public origin, fixed into the prerendered pages (docs/web.md § Search engines). Unset
+# keeps their links relative and the sitemap empty, as a local build has them.
+ARG WEB_URL
 RUN pnpm build
 
 FROM node:24-bookworm-slim AS runtime

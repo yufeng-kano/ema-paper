@@ -54,6 +54,8 @@ agent-sightread/
                               # own image; owns the Docker socket, nothing else does
     web/                      # Nuxt control plane (docs/web.md)
       app/ or src/            # Nuxt conventions; i18n/ catalog en + zh-TW
+      server/routes/          # robots.txt and sitemap.xml, prerendered; no API (docs/web.md § Search engines)
+      shared/                 # framework-free code nuxt.config.ts, the app and server/ all read
       package.json
       Dockerfile
   deploy/
