@@ -236,16 +236,22 @@ function placeMath() {
 }
 
 /** A display formula's text area grows with its text to its CSS cap, past which it scrolls;
- *  `rows` is the least it shrinks to. */
+ *  `rows` is the least it shrinks to. Shrinking it to measure would clamp the pane's scroll
+ *  where the field reaches past the pane's end, so both scroll offsets are put back. */
 function fitMath() {
   const input = mathInput.value
   if (!(input instanceof HTMLTextAreaElement)) {
     return
   }
+  const pane = scrollParent(root.value) ?? document.scrollingElement
+  const paneScrolled = pane?.scrollTop ?? 0
   const scrolled = input.scrollTop
   input.style.height = 'auto'
   input.style.height = `${input.scrollHeight}px`
   input.scrollTop = scrolled
+  if (pane) {
+    pane.scrollTop = paneScrolled
+  }
 }
 
 /** Every keystroke re-typesets the formula the field edits, and the field follows it. */
