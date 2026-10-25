@@ -50,6 +50,22 @@ export default {
       label: 'Language',
       description: 'The language of the interface.',
     },
+    reader: {
+      title: 'Reader',
+      notes: {
+        label: 'Notes width',
+        description: 'Width of the notes column when it opens.',
+      },
+      agent: {
+        label: 'Agent width',
+        description: 'Width of the agent column when it opens.',
+      },
+      narrow: 'Narrow',
+      standard: 'Standard',
+      wide: 'Wide',
+      dragged: 'Set by dragging. Pick a step to go back to a fixed width.',
+      foot: 'Applies when the columns sit side by side. A narrow window makes them narrower.',
+    },
     account: {
       signedInAs: 'Signed in as',
       signedInAsDescription: 'The Google account this session belongs to.',

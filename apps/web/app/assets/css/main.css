@@ -121,7 +121,8 @@
      lighter gray in dark, as the system draws it. */
   --segment: light-dark(#ffffff, #636366);
   --shadow-segment: 0 1px 3px rgb(0 0 0 / 12%), 0 0 0 0.5px rgb(0 0 0 / 4%);
-  /* The pill that resizes a reader card: quiet at rest, darker while held or focused. */
+  /* The pill that resizes a reader card: drawn at rest only on a touch screen, darker while
+     held or focused. */
   --grip: light-dark(rgb(60 60 67 / 28%), rgb(235 235 245 / 30%));
   --grip-active: light-dark(rgb(60 60 67 / 60%), rgb(235 235 245 / 60%));
   --overlay: light-dark(rgb(0 0 0 / 22%), rgb(0 0 0 / 50%));
