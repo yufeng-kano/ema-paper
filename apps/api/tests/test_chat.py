@@ -29,6 +29,7 @@ from sightread.db.models import (
     Message,
     Result,
     UsageLog,
+    User,
 )
 from sightread.errors import ApiError
 from sightread.jobs import chat_runner, chat_tools
@@ -3231,6 +3232,120 @@ async def test_an_accepted_message_moves_the_conversation_up_the_list(chatting) 
     ]
     # The second message changed neither title nor model; the timestamp moves all the same.
     assert after > before
+
+
+async def test_the_list_holds_only_conversations_with_a_message(chatting) -> None:
+    """A conversation is listed once it holds a message. An empty one — a first send that
+    was refused — stays readable by its id and takes the retry, but is no thread to pick
+    (docs/chat.md § Conversations, turns, events)."""
+    listing = f"/api/library/documents/{chatting.document_id}/conversations"
+    empty = (await chatting.post(listing, headers=CSRF_HEADERS)).json()["id"]
+    talked = (await chatting.post(listing, headers=CSRF_HEADERS)).json()["id"]
+    sent = await chatting.post(
+        f"/api/conversations/{talked}/messages", json={"text": "Summarize it"}, headers=CSRF_HEADERS
+    )
+    assert sent.status_code == 202, sent.text
+
+    listed = (await chatting.get(listing)).json()["conversations"]
+    assert [(row["id"], row["title"]) for row in listed] == [(talked, "Summarize it")]
+    assert (await chatting.get(f"/api/conversations/{empty}")).status_code == 200
+
+    # The retry lands on the empty row, which is listed from then on, first.
+    retried = await chatting.post(
+        f"/api/conversations/{empty}/messages", json={"text": "Again"}, headers=CSRF_HEADERS
+    )
+    assert retried.status_code == 202, retried.text
+    listed = (await chatting.get(listing)).json()["conversations"]
+    assert [row["id"] for row in listed] == [empty, talked]
+
+
+async def test_a_rename_is_one_clean_line_and_keeps_the_order(chatting) -> None:
+    """The reader's title: cleaned like a memory's text, cut at the cap `/api/me` hands the
+    field, never empty, and written without touching `updated_at`, so the thread keeps its
+    place in the list — a turn queued on it refuses nothing (docs/chat.md § Conversations)."""
+    listing = f"/api/library/documents/{chatting.document_id}/conversations"
+    ids = []
+    for text in ("Explain table 2\nin detail", "Summarize it"):
+        made = (await chatting.post(listing, headers=CSRF_HEADERS)).json()["id"]
+        sent = await chatting.post(
+            f"/api/conversations/{made}/messages", json={"text": text}, headers=CSRF_HEADERS
+        )
+        assert sent.status_code == 202, sent.text
+        ids.append(made)
+    first, second = ids
+    before = (await chatting.get(listing)).json()["conversations"]
+    assert [(row["id"], row["title"]) for row in before] == [
+        (second, "Summarize it"),
+        (first, "Explain table 2"),
+    ]
+    url = f"/api/conversations/{first}"
+
+    renamed = await chatting.put(
+        url, json={"title": "  Table\u200b 2,\n\tthe \x07baseline  "}, headers=CSRF_HEADERS
+    )
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["title"] == "Table 2, the baseline"
+    assert renamed.json()["updated_at"] == before[1]["updated_at"]
+    after = (await chatting.get(listing)).json()["conversations"]
+    assert [(row["id"], row["title"]) for row in after] == [
+        (second, "Summarize it"),
+        (first, "Table 2, the baseline"),
+    ]
+    assert after[1]["updated_at"] == before[1]["updated_at"]
+
+    limit = (await chatting.get("/api/me")).json()["limits"]["conversation_title_max_chars"]
+    capped = await chatting.put(url, json={"title": "x" * (limit + 20)}, headers=CSRF_HEADERS)
+    assert capped.status_code == 200, capped.text
+    assert capped.json()["title"] == "x" * limit
+
+    for blank in ("", " \n\t ", "\u200b"):
+        refused = await chatting.put(url, json={"title": blank}, headers=CSRF_HEADERS)
+        assert refused.status_code == 400, blank
+    assert (await chatting.put(url, json={}, headers=CSRF_HEADERS)).status_code == 422
+    assert (await chatting.put(url, json={"title": "Plain"})).status_code == 403
+    detail = (await chatting.get(url)).json()["conversation"]
+    assert detail["title"] == "x" * limit
+    assert detail["updated_at"] == before[1]["updated_at"]
+
+
+async def test_a_rename_reaches_only_the_callers_conversations(chatting) -> None:
+    async with chatting.app.state.sessionmaker() as db:
+        stranger = User(google_sub="stranger", email="stranger@example.com")
+        db.add(stranger)
+        await db.commit()
+        stranger_id = stranger.id
+    theirs_document = await _seed_document(chatting, stranger_id)
+    async with chatting.app.state.sessionmaker() as db:
+        theirs = Conversation(
+            user_id=stranger_id, document_id=theirs_document, title="Theirs", session="s"
+        )
+        db.add(theirs)
+        await db.commit()
+        theirs_id = theirs.id
+
+    refused = await chatting.put(
+        f"/api/conversations/{theirs_id}", json={"title": "Mine"}, headers=CSRF_HEADERS
+    )
+    assert refused.status_code == 404
+    async with chatting.app.state.sessionmaker() as db:
+        assert (await db.get(Conversation, theirs_id)).title == "Theirs"
+
+
+async def test_a_title_given_before_the_first_message_is_kept(chatting) -> None:
+    """The first message names only a conversation still untitled: read under the row lock
+    the send takes, so a rename that came first stands (docs/chat.md § Conversations)."""
+    listing = f"/api/library/documents/{chatting.document_id}/conversations"
+    made = (await chatting.post(listing, headers=CSRF_HEADERS)).json()["id"]
+    renamed = await chatting.put(
+        f"/api/conversations/{made}", json={"title": "Reading notes"}, headers=CSRF_HEADERS
+    )
+    assert renamed.status_code == 200, renamed.text
+    sent = await chatting.post(
+        f"/api/conversations/{made}/messages", json={"text": "Summarize it"}, headers=CSRF_HEADERS
+    )
+    assert sent.status_code == 202, sent.text
+    listed = (await chatting.get(listing)).json()["conversations"]
+    assert [(row["id"], row["title"]) for row in listed] == [(made, "Reading notes")]
 
 
 async def test_a_usage_row_is_written_through_a_cancel(monkeypatch) -> None:
