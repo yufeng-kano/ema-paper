@@ -1177,7 +1177,7 @@ const shownUnit = computed<number | null>(() => {
 function unitName(index: number): string {
   const unit = units.value[index]
   const block = unit && editor ? unitBlock(editor.state.doc, unit) : null
-  return block ? blockName(block, nameText.value) : t('viewer.block.kinds.p')
+  return block ? blockName(block, nameText.value, inlineOptions) : t('viewer.block.kinds.p')
 }
 
 const handleName = computed(() => (shownUnit.value === null ? '' : unitName(shownUnit.value)))
@@ -1481,7 +1481,7 @@ function onUnitDragStart(event: DragEvent) {
   const text = card?.querySelector('.drag-card-text')
   if (card && text) {
     const block = unitBlock(editor.state.doc, unit)
-    text.textContent = (block && blockPlain(block)) || handleName.value
+    text.textContent = (block && blockPlain(block, inlineOptions)) || handleName.value
     transfer.setDragImage(card, 12, 14)
   }
   setUnitLook({ from: unit.from, to: unit.to, look: 'moving' })

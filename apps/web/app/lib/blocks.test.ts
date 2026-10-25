@@ -21,7 +21,7 @@ import {
   translatable,
   type NameText,
 } from './blocks'
-import { documentOutline, moveBlocks, parseResultMarkdown, placedBlocks } from './markdown'
+import { blockPlain, documentOutline, moveBlocks, parseResultMarkdown, placedBlocks } from './markdown'
 
 const en: NameText = {
   formula: 'Formula',
@@ -70,6 +70,23 @@ describe('blockName', () => {
     expect(blockName(captioned!, en)).toBe('Image “The login screen”')
     expect(blockName(bare!, en)).toBe('Image')
     expect([captioned, bare].map((block) => translatable(block!))).toEqual([true, false])
+  })
+
+  it('names a section link by its label where the caller reads section links, as the notes do', () => {
+    const [lone, inText, quote] = blocks(
+      [
+        '[3.1 Problem Setup](#31-problem-setup)',
+        '',
+        'See also [3.3 Complexity](#33-complexity) for the cost.',
+        '',
+        '> Gates [3.2 分段門控](#32-分段門控) here',
+      ].join('\n'),
+    )
+    expect(blockName(lone!, en, { cites: true })).toBe('“3.1 Problem Setup”')
+    expect(blockName(inText!, en, { cites: true })).toBe('“See also 3.3 Complexity…”')
+    expect(blockPlain(quote!, { cites: true })).toBe('Gates 3.2 分段門控 here')
+    // Elsewhere a link stays the text it was.
+    expect(blockName(lone!, en)).toBe('“[3.1 Problem…”')
   })
 
   it('cuts words without spaces by length', () => {
