@@ -2136,8 +2136,6 @@ onBeforeUnmount(() => {
   background: var(--menu-surface);
   box-shadow: var(--shadow-menu);
   transform: translate(-50%, -100%);
-  backdrop-filter: blur(24px) saturate(180%);
-  -webkit-backdrop-filter: blur(24px) saturate(180%);
 }
 
 .reply-toolbar.below {

@@ -5,7 +5,9 @@
  * The mark is the `scan-text` glyph white on an app icon's rounded square, the accent lit
  * from the top as the system's own icons are: the brand is the one place besides data and
  * controls where the accent appears, and a monogram at this size was reading as a stray pair
- * of letters rather than as a mark (docs/web.md § Design system).
+ * of letters rather than as a mark (docs/web.md § Design system). Its blues are the light
+ * accent's in both appearances (`--mark-top`, `--mark-bottom`), the favicon's own, so the
+ * page and the browser tab show one icon.
  *
  * `lg` is the sign-in page's app icon: the mark large over the name, as a product page
  * introduces an app. Everything else takes the sidebar's cut. Without `to` — the sign-in
@@ -61,7 +63,7 @@ const { t } = useI18n()
   display: inline-grid;
   place-items: center;
   flex-shrink: 0;
-  background: linear-gradient(180deg, color-mix(in srgb, var(--accent) 72%, var(--accent-fg)), var(--accent));
+  background: linear-gradient(180deg, var(--mark-top), var(--mark-bottom));
   box-shadow: inset 0 1px 0 var(--accent-highlight);
   color: var(--accent-fg);
 }

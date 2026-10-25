@@ -11,8 +11,9 @@
   3. Alignment — numeric columns are right-aligned with tabular numerals, header and cells
      together, declared once per column rather than re-specified per cell.
   4. Rhythm — Finder's list: every row the same height, every cell set in from the row's
-     rounded ends by the same padding, every other row on its own faint fill, so the eye
-     follows a row across without a rule under each one.
+     rounded ends by the same padding, and no stripes or rules. A row is filled only while
+     the pointer is on it or when its caller marks it (Files' selection), so a fill always
+     means something.
 
   Cells render through a per-column slot named `cell-<key>`, falling back to the column's
   `value()`. A row can also carry attributes of its own through `rowAttrs` — what the file
@@ -123,11 +124,14 @@ defineSlots<Record<string, (props: { row: Row }) => unknown>>()
   background-clip: padding-box;
 }
 
-/* Every other row on a faint fill, its ends rounded, as Finder's list draws it. The parity
-   sits in `:where()` so it adds no weight: a caller's row states (Files' selection, drop
-   target) must win over the stripe on even rows too. */
-.table tbody tr:where(:nth-child(even)) td {
-  background: var(--row-alt);
+/* The row under the pointer, its ends rounded, so the eye can follow it across. Only where
+   the pointer hovers, since a tap would leave the row lit on a touch screen. `:hover` sits
+   in `:where()` so it adds no weight: a caller's row states (Files' selection, a drop
+   target) win over it. */
+@media (hover: hover) {
+  .table tbody tr:where(:hover) td {
+    background: var(--fill-weak);
+  }
 }
 
 .table td:first-child {

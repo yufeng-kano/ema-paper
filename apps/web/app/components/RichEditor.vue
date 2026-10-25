@@ -1641,7 +1641,7 @@ defineExpose({
 
 .math-input:focus-visible {
   outline: none;
-  background: var(--rail);
+  background: var(--fill-weak);
 }
 
 .math-hint {
@@ -1664,8 +1664,6 @@ defineExpose({
   border-radius: var(--radius-menu);
   background: var(--menu-surface);
   box-shadow: var(--shadow-menu);
-  backdrop-filter: blur(24px) saturate(180%);
-  -webkit-backdrop-filter: blur(24px) saturate(180%);
   font-family: var(--font);
   line-height: normal;
   white-space: normal;
@@ -1675,12 +1673,6 @@ defineExpose({
 
 .slash.above {
   transform-origin: bottom left;
-}
-
-@supports not (backdrop-filter: blur(1px)) {
-  .slash {
-    background: var(--paper);
-  }
 }
 
 @keyframes slash-in {

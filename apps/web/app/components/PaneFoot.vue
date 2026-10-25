@@ -111,15 +111,7 @@ defineExpose({ root })
   border-radius: var(--radius-menu);
   background: var(--menu-surface);
   box-shadow: var(--shadow-menu);
-  backdrop-filter: blur(24px) saturate(180%);
-  -webkit-backdrop-filter: blur(24px) saturate(180%);
   animation: foot-in var(--duration-fast) var(--ease-enter);
-}
-
-@supports not (backdrop-filter: blur(1px)) {
-  .surface {
-    background: var(--paper);
-  }
 }
 
 @keyframes foot-in {

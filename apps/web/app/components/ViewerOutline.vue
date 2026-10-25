@@ -261,15 +261,7 @@ onBeforeUnmount(() => {
   border-radius: var(--radius-menu);
   background: var(--menu-surface);
   box-shadow: var(--shadow-menu);
-  backdrop-filter: blur(24px) saturate(180%);
-  -webkit-backdrop-filter: blur(24px) saturate(180%);
   animation: panel-in var(--duration-fast) var(--ease-enter);
-}
-
-@supports not (backdrop-filter: blur(1px)) {
-  .panel {
-    background: var(--paper);
-  }
 }
 
 @keyframes panel-in {
@@ -311,7 +303,7 @@ onBeforeUnmount(() => {
 
 .row:hover,
 .row:focus-within {
-  background: var(--rail);
+  background: var(--fill-weak);
 }
 
 .row.current::before {
@@ -386,7 +378,7 @@ onBeforeUnmount(() => {
 }
 
 .row-act:hover {
-  background: var(--rail-active);
+  background: var(--fill);
   color: var(--ink);
 }
 

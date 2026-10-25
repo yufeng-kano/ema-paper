@@ -25,10 +25,14 @@ export default defineNuxtConfig({
       // The .ico is not decoration: clients that do not take SVG (and connector webviews
       // that just fetch /favicon.ico) fall back to whatever icon they already hold for the
       // parent domain when this 404s or answers a blank placeholder.
+      // `?v=` is the mark's version. Browsers keep a site's icon in a store of their own,
+      // apart from the HTTP cache, and fetch it again only when its URL changes; without it
+      // a tab went on showing the old mark beside the new one on the page. Raise it whenever
+      // the icons change, with the consent page's links (apps/api routes/oauth.py).
       link: [
-        { rel: 'icon', href: '/favicon.svg', type: 'image/svg+xml' },
-        { rel: 'icon', href: '/favicon.ico', sizes: '48x48' },
-        { rel: 'apple-touch-icon', href: '/apple-touch-icon.png' },
+        { rel: 'icon', href: '/favicon.svg?v=2', type: 'image/svg+xml' },
+        { rel: 'icon', href: '/favicon.ico?v=2', sizes: '48x48' },
+        { rel: 'apple-touch-icon', href: '/apple-touch-icon.png?v=2' },
       ],
     },
   },

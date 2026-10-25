@@ -135,7 +135,7 @@ def test_the_free_plan_is_policy_and_bounded_too() -> None:
     assert free.id == FREE_PLAN_ID and free.free
     assert (free.credits, free.storage_bytes, free.sandbox, free.max_jobs) == (
         150,
-        52_428_800,
+        512_000_000,
         False,
         1,
     )

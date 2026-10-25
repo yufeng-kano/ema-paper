@@ -550,7 +550,7 @@ async def test_the_public_catalog_is_cached_and_lists_what_is_on_sale(make_clien
     # page to read in one request.
     assert body["free"] == {
         "credits": 150,
-        "storage_bytes": 52_428_800,
+        "storage_bytes": 512_000_000,
         "sandbox": False,
         "max_jobs": 1,
     }
@@ -830,7 +830,7 @@ async def test_the_plan_sets_the_storage_the_usage_shows(make_client, tmp_path) 
     free = status["workspace"]["quota_bytes"]
     # Free gives no sandbox; the paid plan below does (docs/billing.md § Plans).
     assert status["granted"] is False
-    assert free == client.app.state.settings.free_storage_bytes == 52_428_800
+    assert free == client.app.state.settings.free_storage_bytes == 512_000_000
 
     await grant_plan(client.app.state.sessionmaker, user_id)
     paid = (await client.get("/api/sandbox")).json()

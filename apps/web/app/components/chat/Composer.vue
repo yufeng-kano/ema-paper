@@ -1099,8 +1099,6 @@ defineExpose({ addFiles, setQuote, focus, ask })
   border-radius: var(--radius-menu);
   background: var(--menu-surface);
   box-shadow: var(--shadow-menu);
-  backdrop-filter: blur(24px) saturate(180%);
-  -webkit-backdrop-filter: blur(24px) saturate(180%);
 }
 
 .menu-label {
