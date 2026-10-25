@@ -19,9 +19,10 @@ import { Superscript } from '@tiptap/extension-superscript'
 import { Table, TableCell, TableHeader, TableRow } from '@tiptap/extension-table'
 import { Placeholder } from '@tiptap/extensions'
 import StarterKit from '@tiptap/starter-kit'
-import { BLOCK_DRAG_TYPE } from './dnd'
+import { BLOCK_DRAG_TYPE, NOTES_BLOCK_DRAG_TYPE } from './dnd'
 import { inlinePlain, parseInline, parseResultMarkdown, type InlineSegment, type ResultBlock } from './markdown'
 import { renderTexHtml } from './math'
+import { UnitSelection } from './note-blocks'
 import { inlineMathAtEnd, sliceToMarkdown } from './richdoc'
 
 export type Point = { x: number; y: number }
@@ -86,6 +87,9 @@ export interface RichOptions {
     note: (block: Extract<ResultBlock, { kind: 'fig' | 'img' }>) => string | null
     pending: { figure: string; image: string }
   }
+  /** The notes' blocks move by a handle (docs/web.md § Notes): a unit selected or carried is
+   *  drawn as such. */
+  blocks?: boolean
 }
 
 /** Typesets into `dom`, falling back to the dollars-and-source the viewer falls back to. */
@@ -107,11 +111,15 @@ function typesetInto(dom: HTMLElement, latex: string, display: boolean): void {
  */
 const SourceAttributes = Extension.create({
   name: 'sourceAttributes',
-  // A drag of the viewer's blocks lands between blocks, where the editor draws its own line
-  // (`RichEditor`): the drop cursor, which marks a place in the text, is not drawn for it.
+  // A drag of the viewer's blocks, or of a notes block by its handle, lands between blocks,
+  // where the editor draws its own line (`RichEditor`): the drop cursor, which marks a place in
+  // the text, is not drawn for it.
   extendNodeSchema() {
     return {
-      disableDropCursor: (_view: unknown, _pos: unknown, event: DragEvent) => [...(event.dataTransfer?.types ?? [])].includes(BLOCK_DRAG_TYPE),
+      disableDropCursor: (_view: unknown, _pos: unknown, event: DragEvent) => {
+        const types = [...(event.dataTransfer?.types ?? [])]
+        return types.includes(BLOCK_DRAG_TYPE) || types.includes(NOTES_BLOCK_DRAG_TYPE)
+      },
     }
   },
   addGlobalAttributes() {
@@ -643,6 +651,75 @@ const Washes = Extension.create({
   },
 })
 
+/** A unit drawn as something other than text: selected while its menu is open, faded while it
+ *  is dragged. What a transaction's `unitLookKey` meta sets; null draws nothing. */
+export type UnitLook = { from: number; to: number; look: 'selected' | 'moving' } | null
+
+export const unitLookKey = new PluginKey<UnitLook>('unitLook')
+
+/**
+ * How the notes draw a unit taken whole (docs/web.md § Notes, *The notes' blocks have handles*):
+ * the unit selection, and the unit a menu or a drag holds, as node decorations on its top-level
+ * blocks — an excerpt's two drawn as one layer, joined where they meet.
+ */
+const NoteBlocks = Extension.create({
+  name: 'noteBlocks',
+  addProseMirrorPlugins() {
+    return [
+      new Plugin<UnitLook>({
+        key: unitLookKey,
+        state: {
+          init: () => null,
+          apply(tr, look) {
+            const meta = tr.getMeta(unitLookKey) as UnitLook | undefined
+            if (meta !== undefined) {
+              return meta
+            }
+            if (!look || !tr.docChanged) {
+              return look
+            }
+            const from = tr.mapping.map(look.from, 1)
+            const to = tr.mapping.map(look.to, -1)
+            return from < to ? { ...look, from, to } : null
+          },
+        },
+        props: {
+          decorations: (state) => {
+            const looks: NonNullable<UnitLook>[] = []
+            if (state.selection instanceof UnitSelection) {
+              looks.push({ from: state.selection.from, to: state.selection.to, look: 'selected' })
+            }
+            const held = unitLookKey.getState(state)
+            if (held) {
+              looks.push(held)
+            }
+            const decorations: Decoration[] = []
+            for (const { from, to, look } of looks) {
+              const blocks: { pos: number; end: number }[] = []
+              state.doc.forEach((node, pos) => {
+                if (pos >= from && pos + node.nodeSize <= to) {
+                  blocks.push({ pos, end: pos + node.nodeSize })
+                }
+              })
+              blocks.forEach(({ pos, end }, index) => {
+                let classes = `rich-unit-${look}`
+                if (index > 0) {
+                  classes += ' rich-unit-join-before'
+                }
+                if (index < blocks.length - 1) {
+                  classes += ' rich-unit-join-after'
+                }
+                decorations.push(Decoration.node(pos, end, { class: classes }))
+              })
+            }
+            return DecorationSet.create(state.doc, decorations)
+          },
+        },
+      }),
+    ]
+  },
+})
+
 /** Lists stay one level: Tab inside a list item does nothing rather than nest. */
 const FlatLists = Extension.create({
   name: 'flatLists',
@@ -686,6 +763,7 @@ export function richExtensions(options: RichOptions = {}): Extensions {
     SourceAttributes,
     FlatLists,
     Washes,
+    ...(options.blocks ? [NoteBlocks] : []),
     ...(options.placeholder ? [Placeholder.configure({ placeholder: options.placeholder })] : []),
   ]
 }

@@ -4386,7 +4386,9 @@ watch(
                   :links="notesLinks"
                   :figures="editorFigures"
                   :images="notesImages"
+                  blocks
                   @change="onNotesChange"
+                  @note="showNote($event, false)"
                 />
               </div>
             </aside>
@@ -5392,12 +5394,13 @@ watch(
   margin-left: var(--space-4);
 }
 
-/* The whole card under its head is the notes: a click below the last line still writes. */
+/* The whole card under its head is the notes: a click below the last line still writes. The
+   left padding is the gutter the blocks' handles sit in (docs/web.md § Notes). */
 .notes-view {
   flex: 1 1 auto;
   min-height: 0;
   width: 100%;
-  padding: var(--space-1) var(--space-5) var(--space-8);
+  padding: var(--space-1) var(--space-5) var(--space-8) var(--space-8);
   overflow: auto;
   overscroll-behavior: contain;
   scrollbar-width: none;

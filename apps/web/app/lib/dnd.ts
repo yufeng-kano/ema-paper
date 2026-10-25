@@ -31,6 +31,11 @@ export const BLOCK_DRAG_TYPE = 'application/x-sightread-blocks'
  *  one (docs/web.md § The agent panel, *An answer is blocks*). */
 export const ANSWER_DRAG_TYPE = 'application/x-sightread-answer'
 
+/** The type a block dragged by its handle within the notes carries, and nothing else that
+ *  another target would read: a move inside the notes, which only the notes take
+ *  (docs/web.md § Notes, *The notes' blocks have handles, and move by them*). */
+export const NOTES_BLOCK_DRAG_TYPE = 'application/x-sightread-notes-block'
+
 /** The type a drag of the library's own rows carries: what tells it from text or files
  *  dragged in from elsewhere, which carry the same `text/plain` (docs/web.md § Files,
  *  *Moving*). */

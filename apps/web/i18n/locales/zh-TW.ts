@@ -490,6 +490,7 @@ export default {
         quote: '引用',
         toc: '目錄',
         hr: '分隔線',
+        excerpt: '摘錄',
       },
       ask: {
         paragraph: '問 Agent 這一段',
@@ -508,6 +509,7 @@ export default {
       excerpt: '看筆記裡的摘錄',
       copy: '複製為 Markdown',
       link: '複製區塊連結',
+      locate: '在文件中顯示',
       turnInto: '轉換成…',
       moveUp: '上移',
       moveDown: '下移',

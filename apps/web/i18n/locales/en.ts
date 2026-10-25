@@ -503,6 +503,7 @@ export default {
         quote: 'Quote',
         toc: 'Contents',
         hr: 'Rule',
+        excerpt: 'Excerpt',
       },
       ask: {
         paragraph: 'Ask the agent about this paragraph',
@@ -521,6 +522,7 @@ export default {
       excerpt: 'See the excerpt in notes',
       copy: 'Copy as Markdown',
       link: 'Copy link to block',
+      locate: 'Locate in document',
       turnInto: 'Turn into…',
       moveUp: 'Move up',
       moveDown: 'Move down',

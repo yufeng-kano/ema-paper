@@ -26,24 +26,50 @@
  * or — in the notes — image files dropped between blocks (docs/web.md § Editing, *Images*):
  * each file is uploaded through the caller and lands as one block of its line. Given
  * `figures`, a figure or an image is drawn as itself rather than as its source.
+ *
+ * Given `blocks` — the notes card only — each top-level block, an excerpt's quote and link as
+ * one, has a handle in the left gutter: dragged, it moves the block within the notes; clicked,
+ * it opens the block's menu; and Escape selects the caret's block whole for the keyboard to
+ * move (docs/web.md § Notes, *The notes' blocks have handles, and move by them*).
  */
 import { Editor } from '@tiptap/core'
+import { closeHistory } from '@tiptap/pm/history'
 import { Slice, type Node as ProseNode } from '@tiptap/pm/model'
 import { NodeSelection, Selection, TextSelection, type Transaction } from '@tiptap/pm/state'
 import type { EditorView } from '@tiptap/pm/view'
+import { blockName, type NameText } from '~/lib/blocks'
 import { isImageFile, matchCommands } from '~/lib/composer'
-import { BLOCK_DRAG_TYPE, carriesFiles, claimDrag, droppedFiles, setDropEffect } from '~/lib/dnd'
+import { BLOCK_DRAG_TYPE, NOTES_BLOCK_DRAG_TYPE, carriesFiles, claimDrag, droppedFiles, setDropEffect } from '~/lib/dnd'
 import { droppedBlocksMarkdown } from '~/lib/excerpts'
 import type { IconName } from '~/lib/icons'
-import { nearestBlock, type PlaceNear } from '~/lib/markdown'
+import { blockPlain, nearestBlock, type PlaceNear, type ResultBlock } from '~/lib/markdown'
+import type { MenuItem, Point } from '~/lib/menu'
+import {
+  UnitSelection,
+  deleteUnit,
+  moveUnit,
+  movesNothing,
+  noteUnits,
+  slotAtY,
+  slotY,
+  stepSlot,
+  unitAtY,
+  unitBlock,
+  unitIndexAt,
+  unitMarkdown,
+  type NoteUnit,
+  type UnitBox,
+} from '~/lib/note-blocks'
 import {
   richExtensions,
+  unitLookKey,
   washKey,
   type Caret,
   type LeaveReason,
   type MathTarget,
   type RichOptions,
   type TextPoint,
+  type UnitLook,
   type WashMeta,
 } from '~/lib/rich-extensions'
 import { docToMarkdown, markdownToDoc, sliceToMarkdown } from '~/lib/richdoc'
@@ -100,6 +126,9 @@ const props = withDefaults(
        *  slot with no block of the editor's beside it. */
       outer?: PlaceNear | null
     }
+    /** The top-level blocks move by a handle, and Escape selects one whole — the notes card's
+     *  editor. Read once, as the editor is built. */
+    blocks?: boolean
   }>(),
   {
     variant: 'block',
@@ -115,6 +144,7 @@ const props = withDefaults(
     skills: undefined,
     figures: undefined,
     images: undefined,
+    blocks: false,
   },
 )
 
@@ -128,6 +158,9 @@ const emit = defineEmits<{
   'slash-open': []
   /** A skill picked from the slash menu, with the editor's markdown, the slash line gone. */
   'run-skill': [name: string, markdown: string]
+  /** What a block action on a unit says it did — *Moved*, *Copied* — for the owner's status
+   *  note (`blocks` only). */
+  note: [text: string]
 }>()
 
 const { t } = useI18n()
@@ -239,7 +272,7 @@ function onMathBlur(event: FocusEvent) {
   emit('leave', 'blur')
 }
 
-const { label: keyLabel } = useShortcuts()
+const { label: keyLabel, matches } = useShortcuts()
 
 // --- the slash menu --------------------------------------------------------------------
 
@@ -614,6 +647,9 @@ function onKey(event: KeyboardEvent): boolean {
   if (slash.value && onSlashKey(event)) {
     return true
   }
+  if (props.blocks && onUnitKey(event)) {
+    return true
+  }
   const { selection } = editor.state
   if (event.key === 'Enter' && selection instanceof NodeSelection) {
     const name = selection.node.type.name
@@ -938,6 +974,10 @@ function blockDropAt(y: number): { pos: number; replace: boolean; edge: number }
 }
 
 function onBlockDragOver(event: DragEvent) {
+  if (carriesUnit(event)) {
+    onUnitDragOver(event)
+    return
+  }
   const images = carriesImages(event)
   if ((!carriesBlocks(event) && !images) || !editor) {
     return
@@ -956,6 +996,7 @@ function onBlockDragOver(event: DragEvent) {
 function onBlockDragLeave(event: DragEvent) {
   if (!root.value?.contains(event.relatedTarget as Node | null)) {
     dropLine.value = null
+    unitDragSlot = null
   }
 }
 
@@ -967,6 +1008,10 @@ function clearDropLine() {
  *  left out, read through the viewer's parser and inserted whole. A copy — the document keeps
  *  its block — saved like any notes edit. */
 function onBlockDrop(event: DragEvent) {
+  if (carriesUnit(event)) {
+    onUnitDrop(event)
+    return
+  }
   const images = carriesImages(event)
   if ((!carriesBlocks(event) && !images) || !editor) {
     return
@@ -991,6 +1036,494 @@ function onBlockDrop(event: DragEvent) {
   view.dispatch(tr.scrollIntoView())
 }
 
+// --- the notes' blocks: a handle, its drag, its menu, the keyboard ------------------------------
+
+/** How long a press that closed the menu keeps the handle under it from opening it again. */
+const REOPEN_GUARD_MS = 300
+/** The handle's height, which centres it on its unit's first line, and how far past the first
+ *  or the last unit an end gap's drop line sits. */
+const HANDLE_HEIGHT = 24
+const SLOT_EDGE = 4
+
+/** The units, read again after every change to the text (docs/web.md § Notes, *The notes'
+ *  blocks have handles, and move by them*). Units are addressed by index, which every change
+ *  renews. */
+const units = shallowRef<NoteUnit[]>([])
+/** Where a handle is drawn: on the unit the pointer is level with; the one whose handle is
+ *  pressed — a drag starts only once the pointer has moved, often off the unit by then; the one
+ *  in the air; the one selected whole; and, on a touch screen, which has no hover, the caret's
+ *  while focus is in the notes. */
+const hoveredUnit = ref<number | null>(null)
+const pressedUnit = ref<number | null>(null)
+const draggedUnit = ref<number | null>(null)
+const selectedUnit = ref<number | null>(null)
+const caretUnit = ref<number | null>(null)
+const noHover = ref(false)
+const focusWithin = ref(false)
+/** The open menu: its unit by index and by where that unit started when it opened. */
+const unitMenu = ref<{ at: Point; index: number; from: number; header: string; items: MenuItem[]; fromKey: boolean } | null>(null)
+/** The unit a menu choice leaves focus on, by index. */
+let unitAfter: number | null = null
+let unitMenuClosedAt = 0
+let unitMenuClosedBy: EventTarget | null = null
+const unitHandle = ref<HTMLElement | null>(null)
+const handleTop = ref(0)
+const unitDragCard = ref<HTMLElement | null>(null)
+/** The gap a drag would land in, and what the live region says about it. */
+let unitDragSlot: number | null = null
+const unitLive = ref('')
+
+/** What a handle calls its unit, as the document's handles do. */
+const nameText = computed<NameText>(() => ({
+  formula: t('viewer.names.formula'),
+  formulaTag: (tag) => t('viewer.names.formulaTag', { tag }),
+  quoted: (words) => t('viewer.names.quoted', { words }),
+  figure: (words) => t('viewer.names.figure', { name: t('viewer.names.quoted', { words }) }),
+  figureBare: t('viewer.names.figureBare'),
+  image: (words) => t('viewer.names.image', { name: t('viewer.names.quoted', { words }) }),
+  imageBare: t('viewer.names.imageBare'),
+}))
+
+/** One handle at a time. An empty line and a comment have none. */
+const shownUnit = computed<number | null>(() => {
+  if (!props.blocks) {
+    return null
+  }
+  const index =
+    unitMenu.value?.index ??
+    draggedUnit.value ??
+    pressedUnit.value ??
+    (noHover.value ? null : hoveredUnit.value) ??
+    selectedUnit.value ??
+    (noHover.value && focusWithin.value ? caretUnit.value : null)
+  const unit = index === null ? undefined : units.value[index]
+  return unit && !unit.bare ? index : null
+})
+
+function unitName(index: number): string {
+  const unit = units.value[index]
+  const block = unit && editor ? unitBlock(editor.state.doc, unit) : null
+  return block ? blockName(block, nameText.value) : t('viewer.block.kinds.p')
+}
+
+const handleName = computed(() => (shownUnit.value === null ? '' : unitName(shownUnit.value)))
+
+/** Block kinds as the document's menu header names them. */
+function kindLabel(block: ResultBlock): string {
+  return t(`viewer.block.kinds.${block.kind === 'h2' || block.kind === 'h3' ? 'h' : block.kind}`)
+}
+
+/** Each unit's extent on screen, its first block's top to its last block's bottom. */
+function unitBoxes(): UnitBox[] {
+  const view = editor?.view
+  return units.value.map((unit) => {
+    const first = view?.nodeDOM(unit.starts[0]!)
+    const last = view?.nodeDOM(unit.starts[unit.starts.length - 1]!)
+    return {
+      top: first instanceof HTMLElement ? first.getBoundingClientRect().top : Infinity,
+      bottom: last instanceof HTMLElement ? last.getBoundingClientRect().bottom : -Infinity,
+    }
+  })
+}
+
+/** The handle level with its unit's first line — below a ruled heading's rule. */
+function placeHandle() {
+  const index = shownUnit.value
+  const unit = index === null ? undefined : units.value[index]
+  const dom = unit ? editor?.view.nodeDOM(unit.from) : null
+  if (!(dom instanceof HTMLElement) || !root.value) {
+    return
+  }
+  const style = getComputedStyle(dom)
+  const line = parseFloat(style.lineHeight)
+  const inset = (parseFloat(style.paddingTop) || 0) + (parseFloat(style.borderTopWidth) || 0)
+  const centring = Number.isFinite(line) ? Math.max(0, (line - HANDLE_HEIGHT) / 2) : 0
+  handleTop.value = dom.getBoundingClientRect().top - root.value.getBoundingClientRect().top + inset + centring
+}
+
+watch([shownUnit, units], placeHandle, { flush: 'post' })
+
+/** Read off the editor after every transaction: the units after a change to the text, which
+ *  also hides the handle until the pointer moves; the caret's unit and the one selected whole. */
+function syncUnits(tr: Transaction) {
+  if (!editor) {
+    return
+  }
+  if (tr.docChanged) {
+    units.value = noteUnits(tr.doc)
+    hoveredUnit.value = null
+  }
+  const { selection } = editor.state
+  caretUnit.value = unitIndexAt(units.value, selection.from)
+  selectedUnit.value = selection instanceof UnitSelection ? caretUnit.value : null
+}
+
+/** The unit the pointer is over or level with — in the gutter too; in the gap under a unit, that
+ *  unit — kept while the pointer is on the handle itself. */
+function onUnitPointerMove(event: PointerEvent) {
+  if (!props.blocks || event.pointerType === 'touch' || draggedUnit.value !== null) {
+    return
+  }
+  if (event.target instanceof Element && event.target.closest('.unit-handle')) {
+    return
+  }
+  hoveredUnit.value = unitAtY(unitBoxes(), event.clientY)
+  placeHandle()
+}
+
+function onUnitPointerLeave(event: PointerEvent) {
+  if (event.pointerType !== 'touch') {
+    hoveredUnit.value = null
+  }
+}
+
+function onUnitFocusIn() {
+  focusWithin.value = true
+}
+
+/** Focus leaving the notes puts a unit selection back as a caret — unless it went to the unit's
+ *  menu, or the window lost it and will give it back. */
+function onUnitFocusOut(event: FocusEvent) {
+  const next = event.relatedTarget as Node | null
+  if (root.value?.contains(next) || (next === null && !document.hasFocus())) {
+    return
+  }
+  focusWithin.value = false
+  if (!unitMenu.value) {
+    dropUnitSelection()
+  }
+}
+
+function onUnitHandlePress() {
+  pressedUnit.value = shownUnit.value
+  window.addEventListener('pointerup', releaseUnitHandle, { once: true })
+}
+
+function releaseUnitHandle() {
+  pressedUnit.value = null
+}
+
+/** A unit selection given back as a caret at the unit's start — focus leaving the notes, Escape
+ *  out of them — so no unseen selection is left for a key to act on. */
+function dropUnitSelection() {
+  const selection = editor?.state.selection
+  if (editor && selection instanceof UnitSelection) {
+    editor.view.dispatch(editor.state.tr.setSelection(Selection.findFrom(selection.$from, 1) ?? Selection.atStart(editor.state.doc)))
+  }
+}
+
+/** Focus into the notes at a unit: selected whole, or with the caret at its start. */
+function focusUnit(index: number, select: boolean) {
+  if (!editor) {
+    return
+  }
+  const unit = units.value[Math.min(index, units.value.length - 1)]
+  if (!unit) {
+    editor.view.focus()
+    return
+  }
+  const { doc } = editor.state
+  focusAt(select && !unit.bare ? UnitSelection.create(doc, unit) : (Selection.findFrom(doc.resolve(unit.from), 1) ?? Selection.atStart(doc)))
+}
+
+/** Moves a unit to a gap as one step of the editor's own history, and answers its index there. */
+function moveUnitTo(index: number, slot: number): number {
+  if (!editor || movesNothing(index, slot)) {
+    return index
+  }
+  const tr = closeHistory(editor.state.tr)
+  const at = moveUnit(tr, units.value, index, slot)
+  editor.view.dispatch(tr)
+  emit('note', t('viewer.note.moved'))
+  return unitIndexAt(units.value, at) ?? index
+}
+
+/** Deletes a unit as one step of the editor's history, and answers the index of the unit now
+ *  in its place. */
+function removeUnit(index: number): number {
+  if (!editor) {
+    return index
+  }
+  const tr = closeHistory(editor.state.tr)
+  deleteUnit(tr, units.value, index)
+  editor.view.dispatch(tr)
+  emit('note', t('viewer.note.deleted', { n: 1 }, 1))
+  return Math.min(index, units.value.length - 1)
+}
+
+async function copyUnit(unit: NoteUnit) {
+  if (!editor) {
+    return
+  }
+  try {
+    await navigator.clipboard.writeText(unitMarkdown(editor.state.doc, unit))
+    emit('note', t('viewer.note.copied'))
+  } catch {
+    emit('note', t('viewer.note.copyFailed'))
+  }
+}
+
+/** An excerpt's link while it is drawn as a chip: the one a click locates with. */
+function excerptChip(unit: NoteUnit): HTMLElement | null {
+  const line = unit.excerpt ? editor?.view.nodeDOM(unit.starts[1]!) : null
+  return line instanceof HTMLElement ? line.querySelector<HTMLElement>(':scope > .rich-link') : null
+}
+
+function setUnitLook(look: UnitLook) {
+  if (editor) {
+    editor.view.dispatch(editor.state.tr.setMeta(unitLookKey, look))
+  }
+}
+
+/**
+ * The handle's menu (docs/web.md § Notes, *The menu*), beside it and top-aligned with the unit,
+ * which takes the selection's look while it is open: *Locate in document* on an excerpt, the
+ * moves, the copy and the delete. Its first item is highlighted when the keyboard opened it.
+ */
+function openUnitMenu(index: number, fromKey: boolean) {
+  const unit = units.value[index]
+  const dom = unit ? editor?.view.nodeDOM(unit.from) : null
+  if (!editor || !unit || !(dom instanceof HTMLElement)) {
+    return
+  }
+  const block = unitBlock(editor.state.doc, unit)
+  const items: MenuItem[] = []
+  if (unit.excerpt) {
+    items.push({ key: 'locate', label: t('viewer.block.locate'), icon: 'locate', disabled: !excerptChip(unit) })
+  }
+  items.push(
+    {
+      key: 'up',
+      label: t('viewer.block.moveUp'),
+      icon: 'arrow-up',
+      shortcut: keyLabel('mod+shift+up'),
+      separated: unit.excerpt,
+      disabled: stepSlot(index, units.value.length, 'up') === null,
+    },
+    {
+      key: 'down',
+      label: t('viewer.block.moveDown'),
+      icon: 'arrow-down',
+      shortcut: keyLabel('mod+shift+down'),
+      disabled: stepSlot(index, units.value.length, 'down') === null,
+    },
+    { key: 'copy', label: t('viewer.block.copy'), icon: 'copy', separated: true },
+    { key: 'delete', label: t('viewer.block.delete'), icon: 'trash', danger: true, separated: true },
+  )
+  const handle = unitHandle.value?.getBoundingClientRect()
+  const top = dom.getBoundingClientRect()
+  unitMenu.value = {
+    at: { x: handle ? handle.right + 4 : top.left, y: top.top },
+    index,
+    from: unit.from,
+    header: unit.excerpt ? t('viewer.block.kinds.excerpt') : block ? kindLabel(block) : '',
+    items,
+    fromKey,
+  }
+  setUnitLook({ from: unit.from, to: unit.to, look: 'selected' })
+}
+
+function onUnitHandleClick(event: MouseEvent) {
+  const index = shownUnit.value
+  // The press that closed this menu is not a press to open it again.
+  const closedByThis =
+    performance.now() - unitMenuClosedAt < REOPEN_GUARD_MS &&
+    unitMenuClosedBy instanceof Node &&
+    Boolean(unitHandle.value?.contains(unitMenuClosedBy))
+  if (index !== null && !closedByThis) {
+    openUnitMenu(index, event.detail === 0)
+  }
+}
+
+function onUnitMenuSelect(choice: string) {
+  const menu = unitMenu.value
+  const unit = menu ? units.value[menu.index] : undefined
+  // The notes changed under the menu: what it named is no longer there to act on.
+  if (!menu || !unit || unit.from !== menu.from) {
+    return
+  }
+  unitAfter = menu.index
+  if (choice === 'locate') {
+    excerptChip(unit)?.click()
+  } else if (choice === 'up' || choice === 'down') {
+    const slot = stepSlot(menu.index, units.value.length, choice)
+    unitAfter = slot === null ? menu.index : moveUnitTo(menu.index, slot)
+  } else if (choice === 'copy') {
+    void copyUnit(unit)
+  } else if (choice === 'delete') {
+    unitAfter = removeUnit(menu.index)
+  }
+}
+
+/**
+ * Focus after the menu: on a choice or Escape, back into the notes at the unit acted on — after
+ * a delete the one now in its place — selected whole when the keyboard opened the menu, else
+ * with the caret at its start. After the menu's own restore, which would give focus to the
+ * handle. A press elsewhere, a scroll or Tab is the reader moving on: focus stays where they
+ * took it.
+ */
+function closeUnitMenu(cause?: Event) {
+  const menu = unitMenu.value
+  const after = unitAfter
+  unitMenu.value = null
+  unitAfter = null
+  unitMenuClosedAt = performance.now()
+  unitMenuClosedBy = cause?.target ?? null
+  if (!menu) {
+    return
+  }
+  setUnitLook(null)
+  if (cause && (!(cause instanceof KeyboardEvent) || cause.key === 'Tab')) {
+    dropUnitSelection()
+    return
+  }
+  void nextTick(() => focusUnit(after ?? menu.index, menu.fromKey))
+}
+
+/** A drag of this editor's own unit: the type alone could be another tab's notes. */
+function carriesUnit(event: DragEvent): boolean {
+  return draggedUnit.value !== null && [...(event.dataTransfer?.types ?? [])].includes(NOTES_BLOCK_DRAG_TYPE)
+}
+
+/** The drag carries its own type and no text, so no other target takes it; its picture is the
+ *  document's drag card, and the unit fades where it was. */
+function onUnitDragStart(event: DragEvent) {
+  const index = pressedUnit.value ?? shownUnit.value
+  const unit = index === null ? undefined : units.value[index]
+  const transfer = event.dataTransfer
+  if (!editor || !unit || !transfer) {
+    event.preventDefault()
+    return
+  }
+  draggedUnit.value = index
+  unitDragSlot = null
+  transfer.effectAllowed = 'move'
+  transfer.setData(NOTES_BLOCK_DRAG_TYPE, String(unit.from))
+  const card = unitDragCard.value
+  const text = card?.querySelector('.drag-card-text')
+  if (card && text) {
+    const block = unitBlock(editor.state.doc, unit)
+    text.textContent = (block && blockPlain(block)) || handleName.value
+    transfer.setDragImage(card, 12, 14)
+  }
+  setUnitLook({ from: unit.from, to: unit.to, look: 'moving' })
+}
+
+/** The gap the drop would land in, drawn as the document's drop line midway between two units;
+ *  the gaps either side of the unit itself would move nothing and draw none. A screen reader
+ *  hears the target as it changes. */
+function onUnitDragOver(event: DragEvent) {
+  const index = draggedUnit.value
+  const box = root.value
+  if (index === null || !editor || !box) {
+    return
+  }
+  claimDrag(event, 'block')
+  event.preventDefault()
+  const boxes = unitBoxes()
+  const slot = slotAtY(boxes, event.clientY)
+  if (movesNothing(index, slot)) {
+    setDropEffect(event, 'none')
+    dropLine.value = null
+    unitDragSlot = null
+    return
+  }
+  setDropEffect(event, 'move')
+  const frame = box.getBoundingClientRect()
+  const paper = editor.view.dom.getBoundingClientRect()
+  dropLine.value = { top: slotY(boxes, slot, SLOT_EDGE) - frame.top, left: paper.left - frame.left, width: paper.width }
+  if (slot !== unitDragSlot) {
+    unitDragSlot = slot
+    // Named by the unit before the gap; at the top, or after an empty line, by the one after it.
+    const after = slot === units.value.length || (slot > 0 && !units.value[slot - 1]!.bare)
+    unitLive.value = t(after ? 'viewer.block.dropAfter' : 'viewer.block.dropBefore', { name: unitName(after ? slot - 1 : slot) })
+  }
+}
+
+/** The drop moves the unit, and the caret lands at its start. */
+function onUnitDrop(event: DragEvent) {
+  event.preventDefault()
+  const index = draggedUnit.value
+  const slot = slotAtY(unitBoxes(), event.clientY)
+  endUnitDrag()
+  if (index !== null && !movesNothing(index, slot)) {
+    focusUnit(moveUnitTo(index, slot), false)
+  }
+}
+
+function endUnitDrag() {
+  if (draggedUnit.value !== null) {
+    setUnitLook(null)
+  }
+  draggedUnit.value = null
+  pressedUnit.value = null
+  unitDragSlot = null
+  dropLine.value = null
+}
+
+/** A drag that ended anywhere else gives focus back to the notes rather than to a handle that
+ *  is about to go. */
+function onUnitDragEnd() {
+  endUnitDrag()
+  if (document.activeElement === unitHandle.value) {
+    editor?.view.focus()
+  }
+}
+
+/**
+ * The units' keys (docs/web.md § Notes, *The keyboard*). Escape with a text caret selects the
+ * caret's unit whole. With a unit selected, ⌘⇧↑ and ⌘⇧↓ move it, ⌘/ (Shift+F10, the ContextMenu
+ * key) opens its menu, Delete deletes it, Enter puts the caret at its end, and Escape leaves as
+ * it did before — never ⌘⇧↑ or ⌘⇧↓ from a text caret, where macOS selects to the start or the
+ * end. True when the key is taken.
+ */
+function onUnitKey(event: KeyboardEvent): boolean {
+  if (!editor) {
+    return false
+  }
+  const { selection, doc } = editor.state
+  const plain = !event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey
+  if (!(selection instanceof UnitSelection)) {
+    const index = event.key === 'Escape' && plain ? unitIndexAt(units.value, selection.from) : null
+    if (index === null || units.value[index]!.bare) {
+      return false
+    }
+    // The editor's Escape, not the dialog's: the next one leaves.
+    event.stopPropagation()
+    hoveredUnit.value = null
+    focusUnit(index, true)
+    return true
+  }
+  const index = unitIndexAt(units.value, selection.from)
+  if (index === null) {
+    return false
+  }
+  const arrow = event.key === 'ArrowUp' ? 'up' : event.key === 'ArrowDown' ? 'down' : null
+  if (arrow && matches(event, `mod+shift+${arrow}`)) {
+    const slot = stepSlot(index, units.value.length, arrow)
+    if (slot !== null) {
+      focusUnit(moveUnitTo(index, slot), true)
+    }
+    return true
+  }
+  if (matches(event, 'mod+/') || (event.key === 'F10' && event.shiftKey) || event.key === 'ContextMenu') {
+    openUnitMenu(index, true)
+    return true
+  }
+  if ((event.key === 'Delete' || event.key === 'Backspace') && plain) {
+    focusUnit(removeUnit(index), true)
+    return true
+  }
+  if (event.key === 'Enter' && plain) {
+    focusAt(Selection.findFrom(doc.resolve(units.value[index]!.to), -1) ?? Selection.atEnd(doc))
+    return true
+  }
+  if (event.key === 'Escape') {
+    dropUnitSelection()
+  }
+  return false
+}
+
 onMounted(() => {
   window.addEventListener('dragend', clearDropLine)
   const element = mount.value
@@ -1004,6 +1537,7 @@ onMounted(() => {
       onEditMath: (target) => void openMath(target),
       links: props.links,
       figures: props.figures,
+      blocks: props.blocks,
     }),
     content: markdownToDoc(props.source, inlineOptions),
     editable: props.editable,
@@ -1043,15 +1577,20 @@ onMounted(() => {
         view.dispatch(view.state.tr.replaceSelection(pastedSlice(view, text, false)).scrollIntoView())
         return true
       },
-      // A drag of the viewer's blocks is the root's to land (`onBlockDrop`), never text dropped
-      // into the line under the pointer.
-      handleDrop: (_view, event) => carriesBlocks(event) || carriesImages(event),
+      // A drag of the viewer's blocks, or of a notes unit, is the root's to land (`onBlockDrop`),
+      // never text dropped into the line under the pointer.
+      handleDrop: (_view, event) => carriesBlocks(event) || carriesImages(event) || carriesUnit(event),
+      // Typing does nothing to a unit selected whole (docs/web.md § Notes, *The keyboard*).
+      handleTextInput: (view) => view.state.selection instanceof UnitSelection,
     },
     onTransaction: ({ transaction }) => {
       for (const slot of landing) {
         slot.pos = transaction.mapping.map(slot.pos)
       }
       syncSlash(transaction)
+      if (props.blocks) {
+        syncUnits(transaction)
+      }
     },
     onUpdate: ({ editor: current, transaction }) => {
       if (!transaction.docChanged) {
@@ -1086,6 +1625,10 @@ onMounted(() => {
   if (props.variant === 'block') {
     placeCaret(props.caret)
   }
+  if (props.blocks) {
+    units.value = noteUnits(editor.state.doc)
+    noHover.value = window.matchMedia('(hover: none)').matches
+  }
 })
 
 /** The notes file reloaded underneath (another tab, the agent, an excerpt): taken only when
@@ -1100,6 +1643,14 @@ watch(
     emitted = null
     trailing = /\n\s*$/.exec(source)?.[0] ?? ''
     closeSlash()
+    // What was open over the units closes, as the document's reload closes its own: the unit
+    // a menu or a drag named may have moved.
+    if (props.blocks) {
+      unitMenu.value = null
+      unitAfter = null
+      endUnitDrag()
+      setUnitLook(null)
+    }
     // Images still uploading keep their place by the blocks around it: the whole text is
     // replaced, which maps every position to its end (docs/web.md § Editing, *Images*).
     const places = [...landing].map((slot) => ({ slot, near: placeIn(editor!.state.doc, slot.pos) }))
@@ -1193,6 +1744,7 @@ onBeforeUnmount(() => {
   }
   clearTimeout(washTimer)
   window.removeEventListener('dragend', clearDropLine)
+  window.removeEventListener('pointerup', releaseUnitHandle)
   editor?.view.dom.removeEventListener('compositionend', onCompositionEnd)
   editor?.destroy()
   editor = null
@@ -1244,6 +1796,10 @@ defineExpose({
     @dragover="onBlockDragOver"
     @dragleave="onBlockDragLeave"
     @drop="onBlockDrop"
+    @pointermove="onUnitPointerMove"
+    @pointerleave="onUnitPointerLeave"
+    @focusin="onUnitFocusIn"
+    @focusout="onUnitFocusOut"
   >
     <div ref="mount" />
     <input
@@ -1364,6 +1920,49 @@ defineExpose({
         </div>
       </div>
     </div>
+
+    <!-- The notes' blocks (docs/web.md § Notes, *The notes' blocks have handles*). -->
+    <template v-if="blocks">
+      <!-- The gutter the notes card leaves: the pointer crossing it to a handle is still over
+           the editor, level with the unit it left. -->
+      <div class="unit-gutter" aria-hidden="true" />
+      <!-- A div, not a button: Firefox starts no drag from a button. -->
+      <div
+        v-if="shownUnit !== null"
+        ref="unitHandle"
+        role="button"
+        class="unit-handle"
+        :class="{ on: unitMenu !== null }"
+        :style="{ top: `${handleTop}px` }"
+        tabindex="-1"
+        draggable="true"
+        :aria-label="t('viewer.block.handle', { name: handleName })"
+        aria-haspopup="menu"
+        :aria-expanded="unitMenu ? 'true' : 'false'"
+        @pointerdown="onUnitHandlePress"
+        @click.stop="onUnitHandleClick"
+        @dragstart="onUnitDragStart"
+        @dragend="onUnitDragEnd"
+      >
+        <UiIcon name="grip-vertical" />
+      </div>
+      <!-- The drag's picture, written as the drag starts; never seen in place. -->
+      <div ref="unitDragCard" class="drag-card" aria-hidden="true">
+        <UiIcon name="grip-vertical" />
+        <span class="drag-card-text" />
+      </div>
+      <p class="sr-only" role="status" aria-live="polite">{{ unitLive }}</p>
+      <UiContextMenu
+        v-if="unitMenu"
+        :at="unitMenu.at"
+        :items="unitMenu.items"
+        :label="t('viewer.block.menu')"
+        :header="unitMenu.header"
+        :focus-first="unitMenu.fromKey"
+        @select="onUnitMenuSelect"
+        @close="closeUnitMenu"
+      />
+    </template>
   </div>
 </template>
 
@@ -1399,6 +1998,114 @@ defineExpose({
   border: 2px solid var(--accent);
   border-radius: 50%;
   background: var(--paper);
+}
+
+/* --- the notes' blocks (docs/web.md § Notes, *The notes' blocks have handles*) --------- */
+
+/* The 32px gutter the notes card leaves left of the text. */
+.unit-gutter {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: calc(-1 * var(--space-8));
+  width: var(--space-8);
+}
+
+/* The document's handle as an answer draws it: 20×24 in the gutter, 4px from the text. */
+.unit-handle {
+  position: absolute;
+  left: calc(-1 * var(--space-6));
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 24px;
+  border-radius: var(--radius);
+  color: var(--faint);
+  cursor: grab;
+  transition:
+    background var(--duration-fast) var(--ease),
+    color var(--duration-fast) var(--ease);
+}
+
+.unit-handle:hover {
+  background: var(--fill);
+}
+
+.unit-handle.on {
+  background: var(--fill);
+  color: var(--ink);
+}
+
+.unit-handle > :deep(svg) {
+  width: 16px;
+  height: 16px;
+}
+
+/* A unit selected whole, or the one its menu holds: the document's selection, a layer behind
+   its blocks that moves no text — an excerpt's two blocks joined into one layer. */
+.rich :deep(.rich-unit-selected) {
+  position: relative;
+  isolation: isolate;
+}
+
+.rich :deep(.rich-unit-selected)::before {
+  content: '';
+  position: absolute;
+  inset: calc(-1 * var(--space-1)) calc(-1 * var(--space-2));
+  z-index: -1;
+  border-radius: var(--radius);
+  background: var(--block-selected);
+  pointer-events: none;
+}
+
+.rich :deep(.rich-unit-join-after)::before {
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.rich :deep(.rich-unit-join-before)::before {
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+
+/* In the air, the unit stays where it was, faded. */
+.rich :deep(.rich-unit-moving) {
+  opacity: 0.4;
+}
+
+/* The drag's picture, as the document's: off screen until the browser takes it. */
+.drag-card {
+  position: fixed;
+  top: -1000px;
+  left: -1000px;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  max-width: 280px;
+  padding: var(--space-1) var(--space-3) var(--space-1) var(--space-2);
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
+  background: var(--paper);
+  box-shadow: var(--shadow-menu);
+  color: var(--ink);
+  font-size: var(--text-sm);
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.drag-card > :deep(svg) {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  color: var(--faint);
+}
+
+.drag-card-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* The editable surface draws nothing of its own: no border, no ring, no fill — the block is
