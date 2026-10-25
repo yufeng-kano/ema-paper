@@ -1,131 +1,40 @@
-# Ema Paper
+<p align="center">
+  <img src="./apps/web/public/favicon.svg" width="64" height="64" alt="" />
+</p>
+
+<h1 align="center">Ema Paper</h1>
 
 <p align="center">
-  <strong>Vision document parsing service: turn complex PDFs and images into structured Markdown with precise figure coordinates.</strong>
+  <strong>Turn PDFs and scans into text you can read, translate and ask about.</strong><br />
+  Upload a paper. Read it as clean text, with your notes and an AI agent beside it.
 </p>
 
 <p align="center">
-  <a href="./README.md">English</a> · <a href="./README.zh-TW.md">繁體中文</a>
+  <a href="https://ema-paper.yuufeng.com"><strong>Start free</strong></a>
+  ·
+  <a href="https://ema-paper.yuufeng.com/pricing">Pricing</a>
+  ·
+  <a href="./README.zh-TW.md">繁體中文</a>
 </p>
 
-<p align="center">
-  <img src="https://img.shields.io/badge/FastAPI-009688?style=flat-square&logo=fastapi&logoColor=white" alt="FastAPI" />
-  <img src="https://img.shields.io/badge/Nuxt-00DC82?style=flat-square&logo=nuxt&logoColor=white" alt="Nuxt" />
-  <img src="https://img.shields.io/badge/PostgreSQL-4169E1?style=flat-square&logo=postgresql&logoColor=white" alt="PostgreSQL" />
-  <img src="https://img.shields.io/badge/MCP-Claude_Connectors-17607d?style=flat-square" alt="MCP" />
-  <img src="https://img.shields.io/badge/Privacy-Zero_Disk_Retention-059669?style=flat-square" alt="Privacy" />
-  <img src="https://img.shields.io/badge/License-MIT-blue?style=flat-square" alt="License" />
-</p>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="./docs/assets/reader-en-dark.webp" />
+  <img src="./docs/assets/reader-en-light.webp" alt="A paper open in Ema Paper: reading notes on the left, the text with a formula and a table in the middle, the agent's answer on the right" />
+</picture>
+
+## What you get
+
+- **Clean text from every page**: columns, tables, formulas and scans, with each figure kept in place.
+- **Translation under each paragraph**: one command, `/translate`.
+- **An agent that sees the pages**: ask about a sentence, a section or the whole paper.
+- **Notes beside the paper**: excerpts and section links that jump back to the source.
+- **Every edit kept**: folders, a Trash, and a revision you can undo for every change.
+- **Works with Claude**: add the MCP connector, or call the REST API.
+
+## Pricing
+
+**Free to start**, with credits every month. The model is included: no API key to bring, no card to enter. [See plans](https://ema-paper.yuufeng.com/pricing)
 
 ---
 
-**Ema Paper** is a self-hosted, multi-user document parsing service designed for developers and AI agents. It transforms unstructured PDFs, scans, and images into clean, layout-preserving Markdown, extracting exact bounding box coordinates for figures and charts.
-
-Connect your Kano Proxy account in one click, or bring your own OpenAI-compatible vision endpoint. Every vision call runs on your own account with zero markup.
-
----
-
-## Key Features
-
-- **Vision-First Precision** — Accurately extracts multi-column text, dense tables, mathematical formulas, and diagrams that break traditional OCR engines.
-- **Normalized Figure Coordinates** — Returns visual figure boundaries as normalized `[ymin, xmin, ymax, xmax]` coordinates (`sightread://p{page}/{coords}`) for precise downstream cropping in RAG pipelines.
-- **Zero Markup / Your Own Account** — Connect Kano Proxy through its consent screen, or add any OpenAI-compatible vision endpoint with your own key. No middleman subscription fees or token markups.
-- **Built for AI Agents & MCP** — Native Model Context Protocol (MCP) server with OAuth 2.1 support for Claude Desktop, Claude Code, and autonomous agents.
-- **Modern Web Workspace** — an Apple-style UI with restrained Liquid Glass, featuring nested folders, drag-and-drop uploads, live SSE progress streaming, and instant side-by-side previews.
-- **Privacy by Default** — Uploaded source documents are processed in isolated subprocesses and purged from disk immediately once parsing completes.
-
----
-
-## How It Works
-
-<p align="center">
-  <img src="./docs/assets/how-it-works.svg" alt="How Ema Paper Works" width="100%" />
-</p>
-
-1. **Upload** a PDF, scan, or image via the Web UI, REST API, or Claude MCP tool.
-2. **Process** pages in parallel using isolated Poppler subprocesses and your configured vision model.
-3. **Receive** clean Markdown with embedded page markers (`<!-- page: N -->`) and figure coordinates.
-4. **Integrate** seamlessly into downstream RAG indexing, document search, or agent context.
-
----
-
-## Quick Start
-
-### 1. Launch with Docker Compose
-
-```bash
-cp .env.example .env
-docker compose up --build
-```
-
-| Service | URL | Notes |
-|---|---|---|
-| **Web Workspace** | `http://localhost:3000` | Full file library, the Agent page, and result viewer |
-| **REST API** | `http://localhost:8000` | Data plane (`/v1/*`) and MCP endpoint (`/mcp`) |
-
-> Set `AUTH_DEV_MODE=true` in `.env` to sign in locally without Google OAuth credentials.
-
----
-
-## Integrations
-
-### REST API
-
-```bash
-curl -X POST http://localhost:8000/v1/parse \
-  -H "Authorization: Bearer <YOUR_API_KEY>" \
-  -F "file=@financial-report.pdf" \
-  -F "model=<model-id-from-your-catalog>"
-```
-
-### Claude Desktop / MCP Configuration
-
-Add Ema Paper to your `claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "emapaper": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "mcp-remote",
-        "http://localhost:8000/mcp",
-        "--header",
-        "Authorization: Bearer <YOUR_API_KEY>"
-      ]
-    }
-  }
-}
-```
-
-Or connect it directly in Claude via the OAuth Custom Connector endpoint: `https://<your-domain>/mcp`.
-
----
-
-## Architecture & Stack
-
-| Layer | Technology | Purpose |
-|---|---|---|
-| **API & Data Plane** | FastAPI (Python 3.12, `uv`) | High-performance REST endpoints and SSE streaming |
-| **Task Queue** | PostgreSQL (`SKIP LOCKED`) | Reliable transactional job queue without Redis |
-| **PDF Rendering** | Poppler CLI (`pdftoppm`) | Crash-isolated subprocess rendering (MIT-safe) |
-| **Web Interface** | Nuxt (Vue 3), hand-rolled CSS | Light-glass design system, file workspace, i18n |
-| **Edge & Proxy** | Caddy | Automatic TLS certificates and SSE reverse proxy |
-
----
-
-## Documentation
-
-- [Product Overview & Design Goals](./docs/product.md)
-- [API Reference & Data Plane](./docs/api.md)
-- [MCP Server & Claude Connectors](./docs/mcp.md)
-- [Parsing Pipeline & Bounding Boxes](./docs/parsing.md)
-- [Deployment & Self-Hosting Guide](./docs/deployment.md)
-- [Full Documentation Map](./docs/index.md)
-
----
-
-## License
-
-[MIT](LICENSE)
+Run it yourself with the [self-hosting guide](./docs/self-hosting.md). MIT licensed.

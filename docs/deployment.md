@@ -1,6 +1,8 @@
 # Deployment
 
-Single server, docker-compose, Caddy in front. Environments: **local** and **production** only. Production host/DNS specifics stay out of tracked files (use `.local/` notes if needed; this repo is public).
+Single server, docker-compose, Caddy in front. Environments: **local** and **production** only. The step-by-step setup is [self-hosting.md](./self-hosting.md); this page is the reference behind it.
+
+Production host/DNS specifics stay out of tracked files (use `.local/` notes if needed; this repo is public). The README's links to the public site are the one exception: the site's address is what the product is reached at, not a detail of how it is deployed.
 
 ## Compose files
 
