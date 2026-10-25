@@ -222,6 +222,23 @@ function closeList(refocus: boolean) {
   }
 }
 
+/** The thread stops following while the list is open, as under a block's menu: a streamed
+ *  frame's scroll would close a row's menu. It follows again as the list closes if it did as
+ *  the list opened and the reader has not scrolled it since. */
+let followedUnderList: { top: number } | null = null
+watch(
+  () => list.value !== null,
+  (open) => {
+    const top = scroller.value?.scrollTop ?? 0
+    if (open) {
+      followedUnderList = following ? { top } : null
+      following = false
+    } else if (followedUnderList?.top === top) {
+      following = true
+    }
+  },
+)
+
 async function pickConversation(id: number) {
   closeList(true)
   await select(id)
