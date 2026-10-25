@@ -132,6 +132,23 @@ export interface Rect {
 }
 
 /**
+ * Which side of a line a surface hung from it opens on, inside the pane that scrolls them —
+ * the slash menu and the TeX field (docs/web.md § Editing): under the line, unless the pane
+ * has less room there than the surface `needs` and more over the line, where it then stands.
+ * With the room on that side, `gap` kept clear at the line and at the pane's edge.
+ */
+export function openSide(
+  line: Pick<Rect, 'top' | 'bottom'>,
+  pane: Pick<Rect, 'top' | 'bottom'>,
+  needs: number,
+  gap: number,
+): { above: boolean; room: number } {
+  const below = pane.bottom - line.bottom - 2 * gap
+  const above = line.top - pane.top - 2 * gap
+  return below < needs && above > below ? { above: true, room: above } : { above: false, room: below }
+}
+
+/**
  * Where a submenu opens (docs/web.md § Design system, *Primitives*): beside its parent menu,
  * top-aligned with the row it came from — to the right, or to the left where the viewport has
  * no room — and, where neither side has room (a phone), over the parent, `inset` down and in

@@ -14,7 +14,8 @@
  * whole file (`variant="notes"`), where section links are read and drawn as chips.
  *
  * Formulas stay typeset while they are edited: a click on one opens a small floating TeX
- * field under it, and every keystroke re-renders the formula above.
+ * field under it (over it where the pane has no room below), and every keystroke re-renders
+ * the formula.
  *
  * `/` in an empty top-level paragraph opens the slash menu (docs/web.md § Editing, *The slash
  * menu*): a listbox under the slash, inside the editor's root as the TeX field is, so focus
@@ -36,6 +37,7 @@ import { BLOCK_DRAG_TYPE, carriesFiles, claimDrag, droppedFiles, setDropEffect }
 import { droppedBlocksMarkdown } from '~/lib/excerpts'
 import type { IconName } from '~/lib/icons'
 import { nearestBlock, type PlaceNear } from '~/lib/markdown'
+import { openSide } from '~/lib/menu'
 import {
   richExtensions,
   washKey,
@@ -158,28 +160,95 @@ function scrollParent(element: HTMLElement | null): HTMLElement | null {
 
 // --- the TeX field -------------------------------------------------------------------
 
-const math = ref<{ pos: number; display: boolean; latex: string; top: number; left: number } | null>(null)
+/** The gap between the field and its formula. */
+const MATH_GAP = 6
+
+/** The open field: its formula, the display field's rows as it opened (one more than the TeX's
+ *  lines, three at least), and where it sits — `edge` from the root's top, or, `above` the
+ *  formula, from the root's bottom, so a field that grows grows away from the formula. */
+const math = ref<{
+  pos: number
+  display: boolean
+  latex: string
+  rows: number
+  above: boolean
+  edge: number
+  left: number
+} | null>(null)
+const mathField = ref<HTMLElement | null>(null)
 const mathInput = ref<HTMLInputElement | HTMLTextAreaElement | null>(null)
 
+/**
+ * Opens the field under the formula, or above it where the pane has no room below for the
+ * field at its tallest and more above — the slash menu's rule. The side is chosen here, once:
+ * typing moves the field with its formula's edge but never flips it.
+ */
 async function openMath(target: MathTarget) {
   const box = root.value
   if (!box || !props.editable) {
     return
   }
-  const outer = box.getBoundingClientRect()
-  const rect = target.dom.getBoundingClientRect()
   math.value = {
     pos: target.pos,
     display: target.display,
     latex: target.latex,
-    top: rect.bottom - outer.top + 6,
-    left: target.display ? 0 : Math.max(0, rect.left - outer.left),
+    rows: Math.max(3, target.latex.split('\n').length + 1),
+    above: false,
+    edge: target.dom.getBoundingClientRect().bottom - box.getBoundingClientRect().top + MATH_GAP,
+    left: 0,
   }
+  const open = math.value
   await nextTick()
-  mathInput.value?.focus()
+  const field = mathField.value
+  const input = mathInput.value
+  if (math.value !== open || !field || !input) {
+    return
+  }
+  fitMath()
+  // At its tallest the field is as it is now, its text area grown to its cap (inline: none).
+  const cap = Number.parseFloat(getComputedStyle(input).maxHeight)
+  const tallest = field.offsetHeight + (Number.isNaN(cap) ? 0 : Math.max(0, cap - input.offsetHeight))
+  const pane = scrollParent(box)?.getBoundingClientRect() ?? { top: 0, bottom: window.innerHeight }
+  open.above = openSide(target.dom.getBoundingClientRect(), pane, tallest, MATH_GAP).above
+  placeMath()
+  await nextTick()
+  if (math.value === open) {
+    input.focus()
+  }
 }
 
-/** Every keystroke re-typesets the formula above the field. */
+/** Puts the field against its formula's edge as the formula is drawn now — read again from
+ *  the editor, since a re-typeset can change its size. An inline formula's field starts at
+ *  its left edge, held inside the editor. */
+function placeMath() {
+  const open = math.value
+  const box = root.value
+  const dom = open && editor?.view.nodeDOM(open.pos)
+  if (!open || !box || !(dom instanceof HTMLElement)) {
+    return
+  }
+  const outer = box.getBoundingClientRect()
+  const rect = dom.getBoundingClientRect()
+  open.edge = open.above ? outer.bottom - rect.top + MATH_GAP : rect.bottom - outer.top + MATH_GAP
+  open.left = open.display
+    ? 0
+    : Math.min(Math.max(0, rect.left - outer.left), Math.max(0, outer.width - (mathField.value?.offsetWidth ?? 0)))
+}
+
+/** A display formula's text area grows with its text to its CSS cap, past which it scrolls;
+ *  `rows` is the least it shrinks to. */
+function fitMath() {
+  const input = mathInput.value
+  if (!(input instanceof HTMLTextAreaElement)) {
+    return
+  }
+  const scrolled = input.scrollTop
+  input.style.height = 'auto'
+  input.style.height = `${input.scrollHeight}px`
+  input.scrollTop = scrolled
+}
+
+/** Every keystroke re-typesets the formula the field edits, and the field follows it. */
 function onMathInput() {
   const open = math.value
   const node = open && editor?.state.doc.nodeAt(open.pos)
@@ -187,6 +256,8 @@ function onMathInput() {
     return
   }
   editor.view.dispatch(editor.state.tr.setNodeMarkup(open.pos, undefined, { ...node.attrs, latex: open.latex }))
+  fitMath()
+  placeMath()
 }
 
 /** Closes the field; an emptied formula is deleted. `refocus` returns the caret to the
@@ -386,10 +457,8 @@ async function placeSlash() {
   const coords = editor.view.coordsAtPos(Math.min(open.pos + 1, editor.state.doc.content.size))
   const outer = box.getBoundingClientRect()
   const region = scrollParent(box)?.getBoundingClientRect() ?? { top: 0, bottom: window.innerHeight }
-  const below = region.bottom - coords.bottom - 2 * SLASH_GAP
-  const above = coords.top - region.top - 2 * SLASH_GAP
-  const flip = below < Math.min(SLASH_MAX_HEIGHT, slashMenu.value.scrollHeight) && above > below
-  const maxHeight = Math.max(120, Math.min(SLASH_MAX_HEIGHT, flip ? above : below))
+  const { above: flip, room } = openSide(coords, region, Math.min(SLASH_MAX_HEIGHT, slashMenu.value.scrollHeight), SLASH_GAP)
+  const maxHeight = Math.max(120, Math.min(SLASH_MAX_HEIGHT, room))
   slashPlace.value = { ...slashPlace.value, maxHeight }
   await nextTick()
   const menu = slashMenu.value
@@ -1266,19 +1335,25 @@ defineExpose({
       aria-hidden="true"
       :style="{ top: `${dropLine.top}px`, left: `${dropLine.left}px`, width: `${dropLine.width}px` }"
     />
-    <!-- The TeX field: the context menu's floating surface, under the formula it edits. -->
+    <!-- The TeX field: the context menu's floating surface, under the formula it edits or
+         standing on its top. -->
     <div
       v-if="math"
+      ref="mathField"
       class="math-field"
       :class="{ display: math.display }"
-      :style="{ top: `${math.top}px`, left: `${math.left}px` }"
+      :style="{
+        top: math.above ? 'auto' : `${math.edge}px`,
+        bottom: math.above ? `${math.edge}px` : 'auto',
+        left: `${math.left}px`,
+      }"
     >
       <textarea
         v-if="math.display"
         ref="mathInput"
         v-model="math.latex"
         class="math-input mono"
-        rows="2"
+        :rows="math.rows"
         spellcheck="false"
         :aria-label="t('viewer.mathSource')"
         @input="onMathInput"
@@ -1639,6 +1714,13 @@ defineExpose({
   resize: none;
 }
 
+/* A display formula's text area grows with its text (`fitMath`) to twelve lines, or 40% of
+   the window where that is less, then scrolls. */
+.math-field.display .math-input {
+  max-height: min(calc(12 * 1.6em + 2 * var(--space-1)), 40vh);
+  overflow-y: auto;
+}
+
 .math-input:focus-visible {
   outline: none;
   background: var(--fill-weak);
@@ -1648,7 +1730,6 @@ defineExpose({
   padding: 0 var(--space-2);
   color: var(--faint);
   font-size: var(--text-2xs);
-  white-space: nowrap;
 }
 
 /* --- the slash menu: the menu surface, its rows the context menu's ------------------ */
