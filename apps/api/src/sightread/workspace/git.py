@@ -19,9 +19,14 @@ from pathlib import Path
 
 from ..config import get_settings
 from . import safe_io
-from .layout import EXCLUDE_PATHSPECS, EXCLUDE_RULES, git_dir
+from .layout import EXCLUDE_RULES, git_dir
 
 GIT = "git"
+
+# The workspace's exclusions as `ls-files` patterns: the lines of `info/exclude`.
+_EXCLUDES = tuple(
+    f"--exclude={line}" for line in EXCLUDE_RULES.splitlines() if line and not line.startswith("#")
+)
 
 
 def _timeout() -> float:
@@ -68,24 +73,37 @@ def _env() -> dict[str, str]:
     }
 
 
-def _git(root: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+def _argv(root: Path, args: tuple[str, ...]) -> list[str]:
     # The git directory is named on every call: a `.git` the shell plants in the work tree
-    # is never consulted, and no hook or config of the shell's runs here.
+    # is never consulted, and no hook or config of the shell's runs here. Git's own
+    # automatic gc is off: it would run detached after a commit, outside the workspace
+    # and backup locks the worker packs under (`pack`, docs/workspace.md § Revisions).
+    return [
+        GIT,
+        "-C",
+        str(root),
+        "--git-dir",
+        str(git_dir(root)),
+        "--work-tree",
+        str(root),
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "maintenance.auto=false",
+        *args,
+    ]
+
+
+def _run(
+    root: Path, args: tuple[str, ...], *, text: bool = True, stdin: bytes | None = None
+) -> subprocess.CompletedProcess:
     try:
-        proc = subprocess.run(  # noqa: S603 - fixed argv, no shell
-            [
-                GIT,
-                "-C",
-                str(root),
-                "--git-dir",
-                str(git_dir(root)),
-                "--work-tree",
-                str(root),
-                *args,
-            ],
+        return subprocess.run(  # noqa: S603 - fixed argv, no shell
+            _argv(root, args),
             env=_env(),
+            input=stdin,
             capture_output=True,
-            text=True,
+            text=text,
             timeout=_timeout(),
             check=False,
         )
@@ -96,9 +114,21 @@ def _git(root: Path, *args: str, check: bool = True) -> subprocess.CompletedProc
         with contextlib.suppress(OSError):
             (git_dir(root) / "index.lock").unlink()
         raise GitError(f"git {args[0]} timed out") from exc
+
+
+def _git(root: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    proc = _run(root, args)
     if check and proc.returncode != 0:
         raise GitError(proc.stderr.strip() or f"git {args[0]} failed")
     return proc
+
+
+def _git_raw(root: Path, *args: str, stdin: bytes | None = None) -> bytes:
+    """stdout as bytes, for paths: a shell can name a file anything, UTF-8 or not."""
+    proc = _run(root, args, text=False, stdin=stdin)
+    if proc.returncode != 0:
+        raise GitError(proc.stderr.decode(errors="replace").strip() or f"git {args[0]} failed")
+    return proc.stdout
 
 
 def ensure_repo(root: Path) -> None:
@@ -135,17 +165,42 @@ def _commit_staged(root: Path, author: str, message: str) -> str | None:
     return head(root)
 
 
-def _stage(root: Path, pathspec: str) -> subprocess.CompletedProcess[str]:
-    """Stage what `pathspec` matches, ignore rules notwithstanding: `--force`, since a
-    `.gitignore` a shell command writes into the tree must hide nothing from history.
-    The workspace's own exclusions are then taken back out of the index, to what the
-    head holds of them — nothing, they were never committed — so they alone stay out.
-    Two calls: git stages nothing for a `:(literal)` pathspec given beside exclusion
-    pathspecs (docs/workspace.md § Revisions)."""
-    proc = _git(root, "add", "-A", "--force", "--", pathspec, check=False)
-    if proc.returncode == 0:
-        _git(root, "reset", "-q", "--", *EXCLUDE_PATHSPECS)
-    return proc
+def _stage(root: Path, pathspec: str) -> None:
+    """Stage what `pathspec` matches by the workspace's own exclusions and no other ignore
+    rule (docs/workspace.md § Revisions): `ls-files` lists the changes and reads no
+    `.gitignore` unless asked, so one a shell command writes into the tree hides nothing
+    from history; and an excluded file is never hashed, so no copy of an original or a
+    crop lands in the object store. Tracked files first, their edits and deletions
+    through `add -u`, which takes up no untracked file, not even one under a file that
+    became a directory; then the untracked files outside the exclusions through
+    `update-index`, which skips a name the shell removed meanwhile rather than failing
+    the commit, and with `--replace` lets a file take a directory's place and back."""
+    listed = _git_raw(root, "ls-files", "-z", "--modified", "--deleted", "--", pathspec)
+    # A deleted file is listed as modified too.
+    names = dict.fromkeys(name for name in listed.split(b"\0") if name)
+    if names:
+        _git_raw(
+            root,
+            "add",
+            "-u",
+            "--pathspec-from-file=-",
+            "--pathspec-file-nul",
+            stdin=b"".join(b":(literal)" + name + b"\0" for name in names),
+        )
+    listed = _git_raw(root, "ls-files", "-z", "--others", *_EXCLUDES, "--", pathspec)
+    # A repository a shell command made inside the tree is listed as `dir/`: a gitlink.
+    names = dict.fromkeys(name.rstrip(b"/") for name in listed.split(b"\0") if name)
+    if names:
+        _git_raw(
+            root,
+            "update-index",
+            "--add",
+            "--remove",
+            "--replace",
+            "-z",
+            "--stdin",
+            stdin=b"".join(name + b"\0" for name in names),
+        )
 
 
 def commit_all(root: Path, author: str, message: str) -> str | None:
@@ -153,9 +208,7 @@ def commit_all(root: Path, author: str, message: str) -> str | None:
     changes nobody can name in advance — under the shell lock, so the dirt is all its.
     A failure anywhere leaves the index reset, never half-staged."""
     try:
-        staged = _stage(root, ".")
-        if staged.returncode != 0:
-            raise GitError(staged.stderr.strip() or "git add failed")
+        _stage(root, ".")
         return _commit_staged(root, author, message)
     except GitError:
         reset_index(root)
@@ -168,16 +221,14 @@ def commit_paths(root: Path, author: str, message: str, paths: list[Path]) -> st
     the tree never ride along (docs/workspace.md § Revisions)."""
     if not paths:
         return None
-    # One `add` per path: a pathspec that matches nothing (a moved-away directory that
-    # was never tracked) is skipped; any other failure to stage is an error, never a
-    # write reported done without its revision (docs/workspace.md § Revisions). On any
-    # failure the index is reset, so what was staged does not ride into the next commit,
-    # which commits the whole index.
+    # One staging per path: a path that matches nothing (a moved-away directory that was
+    # never tracked) stages nothing; any failure to stage is an error, never a write
+    # reported done without its revision (docs/workspace.md § Revisions). On any failure
+    # the index is reset, so what was staged does not ride into the next commit, which
+    # commits the whole index.
     try:
         for path in paths:
-            proc = _stage(root, _literal(path))
-            if proc.returncode != 0 and "did not match any files" not in proc.stderr:
-                raise GitError(f"git add failed for {path}: {proc.stderr.strip()}")
+            _stage(root, _literal(path))
         return _commit_staged(root, author, message)
     except GitError:
         reset_index(root)
@@ -195,6 +246,25 @@ def reset_index(root: Path) -> None:
     """Unstage everything, the tree untouched: what a failed commit left staged must not
     ride into the next path-scoped commit, which commits the whole index."""
     _git(root, "reset", "-q", check=False)
+
+
+def loose_objects(root: Path) -> int:
+    """How many objects the repository holds unpacked; 0 where there is none yet."""
+    if not (git_dir(root) / "HEAD").is_file():
+        return 0
+    for line in _git(root, "count-objects", "-v").stdout.splitlines():
+        key, _, value = line.partition(": ")
+        if key == "count":
+            return int(value)
+    return 0
+
+
+def pack(root: Path) -> None:
+    """Pack the history, a revision stored as a delta against a similar one rather than as
+    a whole compressed copy, and drop the objects no revision names (docs/workspace.md
+    § Revisions). Pruning at once is safe only under the workspace lock, which every
+    writer of the object store holds: nothing staged and not yet committed is in the way."""
+    _git(root, "gc", "--quiet", "--prune=now")
 
 
 def restore_paths(root: Path, paths: list[Path]) -> None:
@@ -335,7 +405,7 @@ def _git_bounded(root: Path, *args: str, max_bytes: int) -> tuple[int, bytes, bo
     than holding a worker thread and the workspace lock (docs/workspace.md)."""
     deadline = time.monotonic() + _timeout()
     with subprocess.Popen(  # noqa: S603 - fixed argv, no shell
-        [GIT, "-C", str(root), "--git-dir", str(git_dir(root)), "--work-tree", str(root), *args],
+        _argv(root, args),
         env=_env(),
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,

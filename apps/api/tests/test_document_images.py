@@ -16,7 +16,6 @@ import pytest
 from httpx import AsyncClient
 from PIL import Image
 
-from sightread.routes.chat import _workspace_usage
 from sightread.workspace.documents import sweep_orphaned_images
 from sightread.workspace.layout import images_dir, user_root
 from tests.conftest import CSRF_HEADERS
@@ -219,15 +218,24 @@ async def test_an_image_the_quota_has_no_room_for_is_refused(writer) -> None:
     assert not (images_dir(writer.root) / str(document_id)).exists()
 
 
-async def test_the_images_count_towards_the_workspace(writer) -> None:
+async def test_an_image_counts_towards_the_workspace_once(writer) -> None:
     document_id = await _document(writer)
-    await _insert(writer, document_id, _image("PNG"))
-    # The Usage page's line, read without asking the sandbox runner anything.
-    usage = _workspace_usage(writer.root, writer.app.state.settings.workspace_quota_bytes)
-    images = images_dir(writer.root) / str(document_id)
-    stored = sum(entry.stat().st_size for entry in images.iterdir())
-    assert {"path": "images/", "bytes": stored} in usage["breakdown"]
-    assert usage["bytes"] >= stored
+    # Its directory written first, so the image is all the insert adds.
+    assert (await writer.get(f"/api/library/documents/{document_id}/content")).status_code == 200
+
+    async def measured() -> tuple[int, int]:
+        workspace = (await writer.get("/api/sandbox")).json()["workspace"]
+        (row,) = (await writer.get("/api/library")).json()["documents"]
+        return workspace["files_bytes"], row["storage_bytes"]
+
+    files, share = await measured()
+    inserted = await _insert(writer, document_id, _image("PNG"))
+    assert inserted.status_code == 201, inserted.text
+    name = inserted.json()["path"].removeprefix("figures/")
+    stored = (images_dir(writer.root) / str(document_id) / name).stat().st_size
+    # The stored image counts, and its copy in the document's figures/ is the service's.
+    assert (writer.root / "files" / "Draft" / "figures" / name).is_file()
+    assert await measured() == (files + stored, share + stored)
 
 
 async def test_me_lists_what_an_image_may_be(writer) -> None:

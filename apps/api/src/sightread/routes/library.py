@@ -529,6 +529,7 @@ def document_payload(
     failed: dict[uuid.UUID, int] | None = None,
     reconvert: Job | None = None,
     credits: dict[uuid.UUID, int | None] | None = None,
+    storage: dict[int, int] | None = None,
 ) -> dict:
     """The row the file list draws: the entry, plus the live state of its parse and of
     its re-convert.
@@ -539,10 +540,12 @@ def document_payload(
     what a retry of each failed parse would send (`failed_page_counts`); `checking` says
     a running parse is past its last page and being checked; `reconvert` is the parse
     the row points at as its re-convert (docs/api.md); `credits` what each parse cost
-    (`ledger.credits_by_job`, docs/billing.md § Routes).
+    (`ledger.credits_by_job`, docs/billing.md § Routes); `storage` each document's share
+    of the storage (`StorageUsage.documents`), None where the workspace was not measured.
     """
     failed = failed or {}
     credits = credits or {}
+    storage_bytes = None if storage is None else storage.get(row.id, 0)
     if job is None:
         return {
             "id": row.id,
@@ -555,6 +558,7 @@ def document_payload(
             "page_count": None,
             "pages_done": None,
             "size_bytes": None,
+            "storage_bytes": storage_bytes,
             "error": None,
             "created_at": row.created_at,
             "finished_at": None,
@@ -574,6 +578,7 @@ def document_payload(
         "page_count": job.page_count,
         "pages_done": job.pages_done,
         "size_bytes": job.size_bytes,
+        "storage_bytes": storage_bytes,
         "error": job.error,
         "created_at": row.created_at,
         "finished_at": job.finished_at,
@@ -655,7 +660,7 @@ async def read_folders(db: DbSession, user_id: int):
 
 
 @router.get("")
-async def read_library(user: SessionUser, db: DbSession):
+async def read_library(user: SessionUser, db: DbSession, settings: AppSettings):
     """The whole library in one read — navigation between folders is then local.
 
     Both collections come from one snapshot. Under READ COMMITTED the two statements would
@@ -710,6 +715,26 @@ async def read_library(user: SessionUser, db: DbSession):
         if cursor is not None:
             items[cursor.id] = items.get(cursor.id, 0) + 1
 
+    # Each document's share of the storage, measured on the read (docs/web.md § Files).
+    try:
+        storage = (
+            await asyncio.to_thread(
+                workspace_documents.storage_usage,
+                user_root(settings.workspaces_dir, user_id),
+                Path(settings.figures_dir),
+                {row.id: row.job_id for row, _job in documents},
+                {
+                    row.id
+                    for row, _job in documents
+                    if row.trashed_at is not None or row.folder_id in trashed
+                },
+                whole=False,
+            )
+        ).documents
+    except OSError:
+        # A directory nested too deep to measure: the sizes are unknown, not the library.
+        storage = None
+
     def origin(parent_id: int | None) -> list[str]:
         place = nearest_live(by_id, parent_id)
         return [row.name for row in workspace_documents.folder_chain(by_id, place)]
@@ -720,7 +745,9 @@ async def read_library(user: SessionUser, db: DbSession):
     return {
         "folders": [folder_payload(row) for row in folders if row.id not in trashed],
         "documents": [
-            document_payload(row, job, failed, reconverts.get(row.reconvert_job_id), credits)
+            document_payload(
+                row, job, failed, reconverts.get(row.reconvert_job_id), credits, storage
+            )
             for row, job in documents
             if row.trashed_at is None and row.folder_id not in trashed
         ],
@@ -737,7 +764,7 @@ async def read_library(user: SessionUser, db: DbSession):
             "documents": [
                 {
                     **document_payload(
-                        row, job, failed, reconverts.get(row.reconvert_job_id), credits
+                        row, job, failed, reconverts.get(row.reconvert_job_id), credits, storage
                     ),
                     "trashed_at": row.trashed_at,
                     "origin": origin(row.folder_id),

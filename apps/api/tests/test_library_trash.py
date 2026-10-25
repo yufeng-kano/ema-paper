@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sightread.db.models import Document, Folder, Job, utcnow
 from sightread.jobs import runner
 from sightread.workspace import documents as workspace_documents
-from sightread.workspace import git
+from sightread.workspace import git, safe_io
 from sightread.workspace.documents import original_of, trash_home
 from sightread.workspace.layout import images_dir, sources_dir, trash_root, user_root
 from sightread.workspace.reconcile import reconcile_user
@@ -746,10 +746,25 @@ async def test_a_destination_trashed_after_the_check_takes_no_new_entry(
 
 
 async def test_the_status_route_counts_the_trash_on_its_own_line(writer) -> None:
-    from sightread.routes.chat import _workspace_usage
-
     document = await _document(writer, "draft.md", None, "# Draft\n")
+    before = (await writer.get("/api/sandbox")).json()["workspace"]
+    (live,) = (await writer.get("/api/library")).json()["documents"]
+    assert before["trash_bytes"] == 0 and live["storage_bytes"] > 0
     assert (await _trash(writer, "documents", document["id"])).status_code == 200
-    usage = _workspace_usage(writer.root, writer.app.state.settings.workspace_quota_bytes)
-    lines = {line["path"]: line["bytes"] for line in usage["breakdown"]}
-    assert lines["trash/"] > 0
+    after = (await writer.get("/api/sandbox")).json()["workspace"]
+    # The document's directory and its original move to the Trash's line, as one share.
+    (trashed,) = (await writer.get("/api/library")).json()["trash"]["documents"]
+    assert after["trash_bytes"] == trashed["storage_bytes"] == live["storage_bytes"]
+    assert after["files_bytes"] == before["files_bytes"] - live["storage_bytes"]
+    assert after["bytes"] == after["files_bytes"] + after["trash_bytes"] + after["history_bytes"]
+
+
+async def test_a_workspace_too_deep_to_measure_lists_its_documents_without_sizes(
+    writer, monkeypatch
+) -> None:
+    await _document(writer, "draft.md", None, "# Draft\n")
+    (writer.root / "files" / "a" / "b" / "c" / "d").mkdir(parents=True)
+    monkeypatch.setattr(safe_io, "DEPTH_MAX", 3)
+    (row,) = (await writer.get("/api/library")).json()["documents"]
+    assert row["storage_bytes"] is None
+    assert (await writer.get("/api/sandbox")).status_code == 409

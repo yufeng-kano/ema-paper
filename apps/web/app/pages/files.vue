@@ -2526,8 +2526,8 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
 
               <template #cell-size="{ row }">
                 <span class="muted">
-                  <template v-if="row.kind === 'file' && row.document.size_bytes !== null">
-                    {{ formatBytes(row.document.size_bytes, locale) }}
+                  <template v-if="row.kind === 'file' && typeof row.document.storage_bytes === 'number'">
+                    {{ formatBytes(row.document.storage_bytes, locale) }}
                   </template>
                   <template v-else-if="row.kind === 'upload'">
                     {{ formatBytes(row.upload.size, locale) }}
@@ -2588,8 +2588,8 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
                   <template v-if="row.kind === 'folder'">
                     {{ t('files.itemCount', { n: row.folder.items }, row.folder.items) }}
                   </template>
-                  <template v-else-if="row.document.size_bytes !== null">
-                    {{ formatBytes(row.document.size_bytes, locale) }}
+                  <template v-else-if="typeof row.document.storage_bytes === 'number'">
+                    {{ formatBytes(row.document.storage_bytes, locale) }}
                   </template>
                 </span>
               </template>

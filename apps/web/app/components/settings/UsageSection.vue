@@ -84,6 +84,22 @@ const storageShare = computed(() => {
   return workspace && workspace.quota_bytes > 0 ? Math.min(1, workspace.bytes / workspace.quota_bytes) : 0
 })
 
+/** What the used storage is made of, a part holding nothing left out (docs/web.md § Pages). */
+const storageParts = computed(() => {
+  const workspace = sandbox.value?.workspace
+  if (!workspace) {
+    return []
+  }
+  const parts = [
+    ['usage.storageFiles', workspace.files_bytes],
+    ['usage.storageTrash', workspace.trash_bytes],
+    ['usage.storageRevisions', workspace.history_bytes],
+  ] as const
+  return parts
+    .filter(([, bytes]) => bytes > 0)
+    .map(([key, bytes]) => t(key, { size: formatBytes(bytes, locale.value) }))
+})
+
 /** When the figures on screen were read: either read landing moves it. */
 const updatedAt = ref<Date | null>(null)
 watch([billing, sandbox], () => {
@@ -263,6 +279,13 @@ async function runSandboxAction(action: () => Promise<void>) {
                 })
               }}
             </p>
+            <!-- A line breaks between parts, never inside one. -->
+            <p v-if="storageParts.length" class="limit-line">
+              <template v-for="(part, index) in storageParts" :key="part">
+                {{ index ? ' · ' : '' }}
+                <span class="limit-part">{{ part }}</span>
+              </template>
+            </p>
           </div>
           <UiUsageBar class="limit-bar" :share="storageShare" :label="t('usage.storageMeter')" />
           <p class="limit-used tabular">{{ t('usage.used', { n: Math.round(storageShare * 100) }) }}</p>
@@ -424,6 +447,10 @@ async function runSandboxAction(action: () => Promise<void>) {
 .limit-line {
   color: var(--muted);
   font-size: var(--text-xs);
+}
+
+.limit-part {
+  white-space: nowrap;
 }
 
 .limit-used {
