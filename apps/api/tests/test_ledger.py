@@ -29,7 +29,7 @@ from sightread.jobs import chat_runner, chat_tools
 from sightread.jobs.queue import claim_next_turn, fail_turn
 from sightread.workspace.layout import user_root
 from tests.conftest import CSRF_HEADERS, TEST_MODEL_PRICES
-from tests.test_chat import MESSAGES_URL, _seed_document, assistant_turn
+from tests.test_chat import MESSAGES_URL, _seed_document, assistant_turn, sse
 from tests.test_library import _read, _ready_to_parse, _upload
 
 pytestmark = pytest.mark.usefixtures("documents")
@@ -477,6 +477,86 @@ async def test_a_turn_that_runs_out_of_credits_finishes_within_the_allowance(
     billing = (await client.get("/api/billing")).json()
     assert (billing["period"]["spent"], billing["period"]["remaining"]) == (11, granted - 11)
     assert (await client.get("/api/me")).json()["credits_remaining"] == granted - 11
+
+
+@respx.mock
+async def test_a_call_stopped_mid_stream_is_charged_for_what_it_streamed(
+    make_client, tmp_path, monkeypatch
+) -> None:
+    """docs/billing.md § A chat turn: a Stop pressed with the answer on screen, before its
+    stream ends, cuts the call short; the call is still charged — the input its
+    message_start reported and the output that streamed — though none of it is kept."""
+    monkeypatch.setattr(chat_runner, "CANCEL_POLL_SECONDS", 0.05)
+    client = make_client(workspaces_dir=str(tmp_path / "workspaces"), credit_usd="0.0001")
+    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    user_id = (await client.get("/api/me")).json()["user"]["id"]
+    await client.put(
+        "/api/agents/chat/settings",
+        json={"model": "claude-code/claude-opus-5-5"},
+        headers=CSRF_HEADERS,
+    )
+    document_id = await _seed_document(client, user_id)
+    created = await client.post(
+        f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
+    )
+    conversation_id = created.json()["id"]
+
+    async def answer_then_stop():
+        yield sse(
+            {
+                "type": "message_start",
+                "message": {
+                    "model": "claude-opus-5-5",
+                    "usage": {"input_tokens": 300, "cache_read_input_tokens": 200},
+                },
+            },
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            },
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "A" * 3000},
+            },
+        )
+        stopped = await client.post(
+            f"/api/conversations/{conversation_id}/cancel", headers=CSRF_HEADERS
+        )
+        assert stopped.status_code == 204
+        await asyncio.sleep(30)
+        yield b""  # pragma: no cover - the runner drops the stream first
+
+    respx.post(MESSAGES_URL).mock(return_value=httpx.Response(200, content=answer_then_stop()))
+    sent = await client.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
+    )
+    assert sent.status_code == 202, sent.text
+    settings = client.app.state.settings
+    async with client.app.state.sessionmaker() as db:
+        turn_id = await claim_next_turn(db, settings.max_chat_turns_per_user)
+    async with asyncio.timeout(5):
+        await chat_runner.run_turn(
+            client.app.state.sessionmaker, settings, turn_id, asyncio.Semaphore(2)
+        )
+    async with client.app.state.sessionmaker() as db:
+        [row] = (
+            (await db.execute(select(UsageLog).where(UsageLog.turn_id == turn_id))).scalars().all()
+        )
+    # 3,000 bytes streamed are 1,000 output tokens; the cost no figure covered is unknown.
+    assert (row.prompt_tokens, row.cache_read_tokens, row.completion_tokens) == (300, 200, 1000)
+    assert (row.model, row.cost, row.cost_source) == (
+        "claude-code/claude-opus-5-5",
+        None,
+        "unknown",
+    )
+    thread = (await client.get(f"/api/conversations/{conversation_id}")).json()
+    [turn] = thread["turns"]
+    # 1,500 tokens at US$1 per million and US$0.0001 a credit.
+    assert (turn["status"], turn["credits"]) == ("cancelled", 15)
+    assert [message["role"] for message in thread["messages"]] == ["user"]
+    assert (await client.get("/api/billing")).json()["period"]["spent"] == 15
 
 
 async def test_a_turn_queued_before_the_workspace_filled_fails_storage_full(

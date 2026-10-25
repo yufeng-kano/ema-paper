@@ -215,7 +215,7 @@ const questions = ['1', '2', '3', '4'] as const
             </tr>
             <tr>
               <td>{{ t('pricing.retryRow') }}</td>
-              <td class="num tabular">{{ t('pricing.nothing') }}</td>
+              <td class="num tabular">{{ t('pricing.perPage', { n: formatCount(parsePerPage, locale) }) }}</td>
             </tr>
             <tr>
               <td>{{ t('pricing.reconvertRow') }}</td>

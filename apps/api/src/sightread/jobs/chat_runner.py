@@ -41,7 +41,13 @@ from ..db.models import (
 )
 from ..errors import ApiError
 from ..sandbox.client import SandboxClient, SandboxUnavailable
-from ..upstream.anthropic import CompletedMessage, StreamEvent, stream_messages
+from ..upstream.anthropic import (
+    ChatUsage,
+    CompletedMessage,
+    StreamEvent,
+    StreamProgress,
+    stream_messages,
+)
 from ..upstream.client import (
     Connection,
     PaymentRequired,
@@ -525,15 +531,14 @@ async def _follow_model(ctx: TurnContext, model: str) -> None:
     ctx.conversation.model = model
 
 
-async def _record_usage(ctx: TurnContext, completed: CompletedMessage) -> None:
-    usage = completed.usage
+async def _record_usage(ctx: TurnContext, model: str, usage: ChatUsage) -> None:
     async with ctx.sessionmaker() as db:
         db.add(
             UsageLog(
                 user_id=ctx.turn.user_id,
                 turn_id=ctx.turn.id,
                 agent=CHAT.name,
-                model=completed.model or ctx.model,
+                model=model,
                 prompt_tokens=usage.input_tokens,
                 completion_tokens=usage.output_tokens,
                 cache_read_tokens=usage.cache_read_tokens,
@@ -552,12 +557,12 @@ async def _record_usage(ctx: TurnContext, completed: CompletedMessage) -> None:
         ctx.credits_exhausted = True
 
 
-async def _record_usage_settled(ctx: TurnContext, completed: CompletedMessage) -> None:
+async def _record_usage_settled(ctx: TurnContext, model: str, usage: ChatUsage) -> None:
     """The paid call reaches `usage_log` whether or not the turn is cancelled meanwhile:
     the write runs as a task of its own, and a cancel that lands during it waits for it
     to settle before it goes on — a cancelled or timed-out turn is billed all the same
     (docs/chat.md § Conversations, turns, events)."""
-    recording = asyncio.ensure_future(_record_usage(ctx, completed))
+    recording = asyncio.ensure_future(_record_usage(ctx, model, usage))
     try:
         await asyncio.shield(recording)
     except asyncio.CancelledError:
@@ -598,6 +603,7 @@ async def _stream_once(
 
     completed: CompletedMessage | None = None
     last_cancel_check = time.monotonic()
+    progress = StreamProgress()
     stream = stream_messages(
         ctx.connection,
         body,
@@ -606,6 +612,7 @@ async def _stream_once(
         line_max_bytes=ctx.settings.upstream_sse_line_max_bytes,
         blocks_max=ctx.settings.upstream_content_blocks_max,
         timeout=ctx.settings.chat_stream_timeout_seconds,
+        progress=progress,
     )
     # The stream is read by its own task into a queue, so a cancel is noticed on a timer
     # whether or not the upstream is sending anything: a silent generation is dropped as
@@ -674,6 +681,16 @@ async def _stream_once(
             reader.cancel()
         await asyncio.gather(reader, return_exceptions=True)
         await stream.aclose()
+        usage = progress.usage_so_far()
+        if completed is None and usage is not None:
+            # The call ended before its message_stop — a Stop, the turn's timeout, a stream
+            # that broke — and is billed for what it streamed, as the model it asked for
+            # (docs/chat.md § Conversations, turns, events). A write that fails is logged
+            # rather than raised over what ended the call.
+            try:
+                await _record_usage_settled(ctx, str(body["model"]), usage)
+            except Exception:
+                logger.exception("turn %s: the usage of a call cut short was lost", ctx.turn.id)
     await flush_text()
     await flush_thinking()
     if completed is None:
@@ -1181,7 +1198,7 @@ async def _loop(ctx: TurnContext) -> None:
         if since_marker >= CACHE_GUARD_EVERY:
             since_marker = 0
         completed = await _call_model(ctx, body)
-        await _record_usage_settled(ctx, completed)
+        await _record_usage_settled(ctx, completed.model or ctx.model, completed.usage)
         if await _cancelled(ctx):
             # Billed, but not kept: a cancelled turn leaves the history as it was.
             raise TurnCancelled()

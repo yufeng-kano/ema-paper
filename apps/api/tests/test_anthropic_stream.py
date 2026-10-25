@@ -5,13 +5,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from decimal import Decimal
 
 import httpx
 import pytest
 import respx
 
-from sightread.upstream.anthropic import CompletedMessage, StreamEvent, stream_messages
+from sightread.upstream.anthropic import (
+    CompletedMessage,
+    StreamEvent,
+    StreamProgress,
+    stream_messages,
+)
 from sightread.upstream.client import Connection, PaymentRequired, RateLimited, UpstreamError
 from tests.conftest import KANO_BASE
 
@@ -348,6 +354,88 @@ async def test_a_stop_reason_without_message_stop_is_an_early_close(key) -> None
     with pytest.raises(UpstreamError) as early:
         await collect(key, body)
     assert early.value.transient
+
+
+@respx.mock
+async def test_a_stream_cut_short_still_says_what_it_used(key) -> None:
+    """docs/chat.md § Conversations, turns, events: a call that ends before its
+    message_stop is billed on message_start's input figures and the output that streamed —
+    the count a message_delta reported, else one token per three bytes of UTF-8 — with
+    its cost unknown. Before message_start there is nothing to bill."""
+    body = {"model": "m", "messages": []}
+    started = [
+        {
+            "type": "message_start",
+            "message": {
+                "model": "m",
+                "usage": {
+                    "input_tokens": 900,
+                    "cache_read_input_tokens": 700,
+                    "cache_creation_input_tokens": 100,
+                    "cost": 0.01,
+                },
+            },
+        },
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "thinking", "thinking": ""},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": "Reading."},
+        },
+        {"type": "content_block_stop", "index": 0},
+        {"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}},
+        {
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {"type": "text_delta", "text": "表格"},
+        },
+        {"type": "content_block_stop", "index": 1},
+        {
+            "type": "content_block_start",
+            "index": 2,
+            "content_block": {"type": "tool_use", "id": "toolu_1", "name": "bash", "input": {}},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 2,
+            "delta": {"type": "input_json_delta", "partial_json": '{"comm'},
+        },
+    ]
+
+    async def cut_after(*events: dict) -> StreamProgress:
+        respx.post(MESSAGES_URL).mock(return_value=httpx.Response(200, content=sse(*events)))
+        progress = StreamProgress()
+        with pytest.raises(UpstreamError):
+            async for _ in stream_messages(key, body, progress=progress):
+                pass
+        return progress
+
+    usage = (await cut_after(*started)).usage_so_far()
+    assert usage is not None
+    assert (usage.input_tokens, usage.cache_read_tokens, usage.cache_write_tokens) == (
+        900,
+        700,
+        100,
+    )
+    # Eight bytes of thinking, six of text (two CJK characters), six of tool input.
+    assert usage.output_tokens == math.ceil((8 + 6 + 6) / 3)
+    assert (usage.cost, usage.cost_source) == (None, "unknown")
+
+    reported = await cut_after(
+        *started, {"type": "message_delta", "delta": {}, "usage": {"output_tokens": 42}}
+    )
+    assert reported.usage_so_far().output_tokens == 42
+
+    respx.post(MESSAGES_URL).mock(return_value=httpx.Response(503, json={}))
+    refused = StreamProgress()
+    with pytest.raises(UpstreamError):
+        async for _ in stream_messages(key, body, progress=refused):
+            pass
+    assert refused.usage_so_far() is None
 
 
 @respx.mock

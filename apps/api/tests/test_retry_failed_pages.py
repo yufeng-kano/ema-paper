@@ -21,7 +21,7 @@ from PIL import Image
 from sqlalchemy import select, update
 
 from sightread.auth.sessions import SESSION_COOKIE, create_session
-from sightread.db.models import Document, Job, JobPage, UsageLog, User
+from sightread.db.models import CreditPeriod, Document, Job, JobPage, UsageLog, User
 from sightread.workspace.documents import original_of
 from sightread.workspace.layout import user_root
 from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL
@@ -165,6 +165,60 @@ async def test_a_retry_sends_only_the_failed_pages_and_keeps_the_rest(
     assert original_of(root, uploaded["id"]) is not None
     # The 400 billed nothing; each answer is logged under the model that gave it.
     assert sorted(model for (model,) in usage) == [FALLBACK, MODEL, MODEL]
+
+
+@respx.mock
+async def test_a_retry_takes_the_credits_back_and_the_document_is_charged_once(
+    make_client, tmp_path, sessionmaker, documents
+) -> None:
+    """docs/billing.md § A parse: a failure releases the parse's credits, and a retry
+    reserves them again — refused 402, with nothing requeued, when the balance cannot
+    cover them — so a job that keeps failing costs nothing and the run that succeeds is
+    the one charge."""
+    client = make_client(
+        workspaces_dir=str(tmp_path / "ws"),
+        parse_fallback_model=FALLBACK,
+        free_credits_per_period=3,
+    )
+    await _ready_to_parse(client)
+    respx.post(KANO_CHAT_URL).mock(side_effect=Upstream({(MODEL, 2): lambda: httpx.Response(400)}))
+    uploaded = await _upload(client, documents["mixed_pdf"])
+    await _drain_queue(client, sessionmaker)
+
+    async def spent() -> int:
+        return (await client.get("/api/billing")).json()["period"]["spent"]
+
+    async def spend(credits: int) -> None:
+        async with sessionmaker() as db:
+            await db.execute(update(CreditPeriod).values(spent=credits))
+            await db.commit()
+
+    assert (await _row(client, uploaded["id"]))["status"] == "failed"
+    assert await spent() == 0
+    # A retry on the same model takes the three pages' credits back; failing again, it
+    # releases them again.
+    assert (await _retry(client, uploaded["id"])).status_code == 202
+    assert await spent() == 3
+    await _drain_queue(client, sessionmaker)
+    assert (await _row(client, uploaded["id"]))["status"] == "failed"
+    assert await spent() == 0
+
+    # With one credit spent elsewhere the balance cannot cover the parse: refused, and the
+    # job, its credits and the upload directory are as they were.
+    await spend(1)
+    refused = await _retry(client, uploaded["id"], model=FALLBACK)
+    assert refused.status_code == 402, refused.text
+    assert (refused.json()["error"]["need"], refused.json()["error"]["remaining"]) == (3, 2)
+    assert (await _row(client, uploaded["id"]))["status"] == "failed"
+    assert await spent() == 1
+    assert list(Path(client.app.state.settings.upload_dir).iterdir()) == []
+
+    await spend(0)
+    assert (await _retry(client, uploaded["id"], model=FALLBACK)).status_code == 202
+    await _drain_queue(client, sessionmaker)
+    row = await _row(client, uploaded["id"])
+    assert (row["status"], row["credits"]) == ("succeeded", 3)
+    assert await spent() == 3
 
 
 @respx.mock

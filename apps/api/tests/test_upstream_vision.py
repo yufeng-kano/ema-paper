@@ -273,6 +273,24 @@ async def test_every_call_carries_the_operator_key_and_asks_for_no_usage(key, do
 
 
 @respx.mock
+async def test_every_answer_is_capped_unless_the_cap_is_off(key, documents) -> None:
+    """docs/parsing.md § Upstream usage: a prompt asking for endless output costs at most
+    `VISION_MAX_OUTPUT_TOKENS` per call; 0 sends no cap."""
+    route = respx.post(KANO_CHAT_URL).mock(
+        return_value=httpx.Response(200, json=completion("# Page"))
+    )
+
+    await transcribe_page(key, "vendor/vision", PROMPT, documents["png"], 2)
+    await transcribe_page(
+        key, "vendor/vision", PROMPT, documents["png"], 2, max_output_tokens=2_000
+    )
+    await transcribe_page(key, "vendor/vision", PROMPT, documents["png"], 2, max_output_tokens=0)
+
+    sent = [json.loads(call.request.content) for call in route.calls]
+    assert [body.get("max_tokens") for body in sent] == [16_000, 2_000, None]
+
+
+@respx.mock
 async def test_a_non_object_completion_is_a_page_failure_not_a_crash(key, documents) -> None:
     """A `[]` body must surface as UpstreamError (a failed page), never an AttributeError
     that marks the whole job as an internal error."""
