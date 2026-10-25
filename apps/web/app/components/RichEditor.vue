@@ -1149,11 +1149,13 @@ function syncUnits(tr: Transaction) {
   if (!editor) {
     return
   }
+  // The editor's state, not the transaction's document: a plugin's appended transaction (a
+  // table fixed up) may have changed it further, and a move by stale positions cuts wrong.
+  const { selection, doc } = editor.state
   if (tr.docChanged) {
-    units.value = noteUnits(tr.doc)
+    units.value = noteUnits(doc)
     hoveredUnit.value = null
   }
-  const { selection } = editor.state
   caretUnit.value = unitIndexAt(units.value, selection.from)
   selectedUnit.value = selection instanceof UnitSelection ? caretUnit.value : null
 }
@@ -1397,6 +1399,8 @@ function onUnitDragStart(event: DragEvent) {
   }
   draggedUnit.value = index
   unitDragSlot = null
+  // Emptied, so a first target named as the last drag's last one is still heard.
+  unitLive.value = ''
   transfer.effectAllowed = 'move'
   transfer.setData(NOTES_BLOCK_DRAG_TYPE, String(unit.from))
   const card = unitDragCard.value
@@ -1488,10 +1492,12 @@ function onUnitKey(event: KeyboardEvent): boolean {
     if (index === null || units.value[index]!.bare) {
       return false
     }
-    // The editor's Escape, not the dialog's: the next one leaves.
+    // The editor's Escape, not the dialog's: the next one leaves. The caret's unit is on
+    // screen already, so nothing scrolls — scrolling to the selection's end would carry a tall
+    // list's top away from the reader.
     event.stopPropagation()
     hoveredUnit.value = null
-    focusUnit(index, true)
+    editor.view.dispatch(editor.state.tr.setSelection(UnitSelection.create(doc, units.value[index]!)))
     return true
   }
   const index = unitIndexAt(units.value, selection.from)
@@ -1514,8 +1520,11 @@ function onUnitKey(event: KeyboardEvent): boolean {
     focusUnit(removeUnit(index), true)
     return true
   }
-  if (event.key === 'Enter' && plain) {
-    focusAt(Selection.findFrom(doc.resolve(units.value[index]!.to), -1) ?? Selection.atEnd(doc))
+  // Every Enter: ⇧↵ and ⌘↵, a line break elsewhere, would put one in the unit's place.
+  if (event.key === 'Enter') {
+    if (plain) {
+      focusAt(Selection.findFrom(doc.resolve(units.value[index]!.to), -1) ?? Selection.atEnd(doc))
+    }
     return true
   }
   if (event.key === 'Escape') {
