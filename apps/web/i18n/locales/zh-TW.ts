@@ -49,6 +49,22 @@ export default {
       label: '語言',
       description: '介面使用的語言。',
     },
+    reader: {
+      title: '閱讀器',
+      notes: {
+        label: '筆記欄寬度',
+        description: '打開筆記時的寬度。',
+      },
+      agent: {
+        label: 'Agent 欄寬度',
+        description: '打開 Agent 時的寬度。',
+      },
+      narrow: '窄',
+      standard: '標準',
+      wide: '寬',
+      dragged: '已用拖移自訂。選一個檔位就會改回固定寬度。',
+      foot: '兩側欄並排時套用。視窗太窄時會自動縮小。',
+    },
     account: {
       signedInAs: '登入帳號',
       signedInAsDescription: '這個工作階段所屬的 Google 帳號。',

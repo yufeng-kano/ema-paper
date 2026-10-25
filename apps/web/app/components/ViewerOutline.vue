@@ -5,6 +5,11 @@
  * the document's shape and the reader's place in it, and — the pointer resting on it, or the
  * keyboard opening it — a panel listing every heading. It never takes width.
  *
+ * The ticks are centred in the room the pane gives them; the panel opens at their left with
+ * its top at the pane's top, where the side cards start, and ends at most where they end. The
+ * ticks and the panel are one hover region, the column between them included while the panel
+ * is open, and the pointer leaving it closes the panel after a short delay.
+ *
  * For the keyboard the ticks are one button. Focus on it opens nothing; Enter, Space or ↓
  * opens the panel with focus on the current row, Escape closes it back to the button, and
  * focus leaving the panel closes it.
@@ -16,9 +21,10 @@ const props = defineProps<{
   entries: readonly OutlineEntry[]
   /** The current section, by outline index; null above the first heading. */
   current: number | null
-  /** How tall the ticks may run, in pixels: down to where the pane's foot begins. */
-  room: number
-  /** How tall the panel may be: the pane's height below the outline's top. */
+  /** Where the ticks may run, in pixels from the pane's top: from `top`, `height` down to
+   *  where the pieces at the pane's foot begin. The ticks are centred in it. */
+  room: { top: number; height: number }
+  /** How tall the panel may be, from the pane's top: down to where the side cards end. */
   panelHeight: number
   /** The row actions — Files, once the document can be edited. */
   actions: boolean
@@ -37,8 +43,11 @@ const { t } = useI18n()
 /** How long the pointer rests on the ticks before the panel opens: a pointer only crossing
  *  the gutter on its way to a handle throws no panel over the text. */
 const REST_MS = 150
+/** How long the pointer may be off the ticks and the panel before the panel closes: the way
+ *  from one to the other, or a pointer overshooting the panel's edge, keeps it open. */
+const CLOSE_MS = 300
 
-const fit = computed(() => fitTicks(props.entries.map((entry) => entry.level), props.room))
+const fit = computed(() => fitTicks(props.entries.map((entry) => entry.level), props.room.height))
 const currentAt = computed(() => (fit.value ? currentTick(fit.value, props.current) : null))
 
 const open = ref(false)
@@ -46,6 +55,7 @@ const nav = ref<HTMLElement | null>(null)
 const button = ref<HTMLButtonElement | null>(null)
 const panel = ref<HTMLElement | null>(null)
 let restTimer: ReturnType<typeof setTimeout> | undefined
+let closeTimer: ReturnType<typeof setTimeout> | undefined
 
 async function show(focusRow: boolean) {
   open.value = true
@@ -60,6 +70,7 @@ async function show(focusRow: boolean) {
 
 function hide(refocus = false) {
   clearTimeout(restTimer)
+  clearTimeout(closeTimer)
   open.value = false
   if (refocus) {
     button.value?.focus()
@@ -68,11 +79,28 @@ function hide(refocus = false) {
 
 function onRest() {
   clearTimeout(restTimer)
-  restTimer = setTimeout(() => void show(false), REST_MS)
+  if (!open.value) {
+    restTimer = setTimeout(() => void show(false), REST_MS)
+  }
 }
 
 function onLeaveTicks() {
   clearTimeout(restTimer)
+}
+
+/** Back in the region before the delay ran out: the panel stays. */
+function onEnterRegion() {
+  clearTimeout(closeTimer)
+}
+
+/** The pointer left the ticks, the panel and the column between them. Focus the panel held
+ *  goes back to the button rather than to the page as the panel goes. */
+function onLeaveRegion() {
+  clearTimeout(restTimer)
+  clearTimeout(closeTimer)
+  if (open.value) {
+    closeTimer = setTimeout(() => hide(panel.value?.contains(document.activeElement) ?? false), CLOSE_MS)
+  }
 }
 
 function onButtonKey(event: KeyboardEvent) {
@@ -113,12 +141,22 @@ function onPointerDownOutside(event: PointerEvent) {
 onMounted(() => window.addEventListener('pointerdown', onPointerDownOutside, true))
 onBeforeUnmount(() => {
   clearTimeout(restTimer)
+  clearTimeout(closeTimer)
   window.removeEventListener('pointerdown', onPointerDownOutside, true)
 })
 </script>
 
 <template>
-  <nav ref="nav" class="outline" :aria-label="t('viewer.outline.nav')" @focusout="onFocusOut">
+  <nav
+    ref="nav"
+    class="outline"
+    :class="{ open }"
+    :style="{ height: `${room.top + room.height}px`, paddingTop: `${room.top}px` }"
+    :aria-label="t('viewer.outline.nav')"
+    @focusout="onFocusOut"
+    @pointerenter="onEnterRegion"
+    @pointerleave="onLeaveRegion"
+  >
     <button
       ref="button"
       type="button"
@@ -148,7 +186,6 @@ onBeforeUnmount(() => {
       ref="panel"
       class="panel"
       :style="{ maxHeight: `${panelHeight}px` }"
-      @pointerleave="hide()"
       @keydown="onPanelKey"
     >
       <p class="panel-head">{{ t('viewer.outline.title') }}</p>
@@ -196,16 +233,29 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+/* From the pane's top down to the end of the ticks' room, the ticks' width, the ticks centred
+   in the room under its top padding: no target of its own at rest, and the bridge between
+   the ticks and the panel while the panel is open. */
 .outline {
   position: absolute;
-  top: 64px;
+  top: 0;
   left: var(--space-2);
   z-index: 3;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  width: 24px;
+  pointer-events: none;
+}
+
+.outline.open {
+  pointer-events: auto;
 }
 
 /* The ticks' own box is what the pointer rests on — never the whole gutter. */
 .ticks {
   display: flex;
+  flex: none;
   flex-direction: column;
   align-items: center;
   width: 24px;
@@ -214,6 +264,7 @@ onBeforeUnmount(() => {
   border-radius: var(--radius);
   background: transparent;
   cursor: pointer;
+  pointer-events: auto;
 }
 
 .ticks.glyph {
@@ -248,11 +299,12 @@ onBeforeUnmount(() => {
   background: var(--ink);
 }
 
-/* The menu's floating surface, over the ticks. */
+/* The menu's floating surface, over the ticks at their left, its top the pane's top. */
 .panel {
   position: absolute;
   top: 0;
   left: 0;
+  pointer-events: auto;
   width: 264px;
   overflow-y: auto;
   overscroll-behavior: contain;
