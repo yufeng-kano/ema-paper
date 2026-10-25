@@ -66,9 +66,11 @@ docker compose -f docker-compose.production.yaml -f docker-compose.only-containe
 ```text
 <domain> {
   tls { issuer acme { disable_http_challenge } }   # validate over 443 (TLS-ALPN-01), never :80
-  header { defer; Strict-Transport-Security …; Content-Security-Policy …; … }   # § Security headers
+  header { defer; Strict-Transport-Security …; X-Content-Type-Options …; … }   # § Security headers
+  @notfile not path /api/library/documents/*/file   # the file route carries its own policy
+  header @notfile { defer; Content-Security-Policy …; X-Frame-Options DENY }
   @upload path /api/library/documents    # the web upload: a file of any kind
-  request_body @upload { max_size 2GB }  # keep in sync with FILE_MAX_BYTES
+  request_body @upload { max_size 2048MB }  # FILE_MAX_BYTES plus the multipart envelope
   @rest not path /api/library/documents
   request_body @rest { max_size 128MB }  # keep in sync with UPLOAD_MAX_BYTES
   @api path /healthz /v1/* /api/* /oauth/* /mcp /mcp/* /.well-known/*
@@ -113,7 +115,7 @@ connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'
 - No `form-action`: the consent screen's form posts to `/oauth/authorize`, which redirects to the connector's `redirect_uri` — another origin, or `http://localhost` for a CLI client — and browsers hold that redirect to `form-action` too. Checkout and the portal are full-page navigations to Kano Pay, which no directive restricts.
 - No `Cross-Origin-Opener-Policy` or `Cross-Origin-Resource-Policy`: a connector opens the consent screen in a popup and keeps its handle, and a connector's page loads this site's icon from its own origin.
 
-One route keeps a policy of its own: `GET /api/library/documents/{id}/file`, which serves the reader's files inline ([api.md](./api.md)), answers with `Content-Security-Policy: sandbox`, so that whatever a file is — an HTML or SVG file is sent as an attachment, but the header stands on every answer — it runs nothing with the session. The site's policy allows inline scripts and would replace it, so the Caddyfile's policy line carries a matcher that leaves that path out (`@notfile not path /api/library/documents/*/file`); the other headers of the block stay on every answer, the file route's included.
+One route keeps a policy of its own: `GET /api/library/documents/{id}/file`, which serves the reader's files inline ([api.md](./api.md)), answers with `Content-Security-Policy: sandbox` and `X-Frame-Options: DENY`, so that whatever a file is — an HTML or SVG file is sent as an attachment, but the headers stand on every answer — it runs nothing with the session; a PDF served inline is the one exception, since a browser's PDF viewer refuses a sandboxed frame: that answer carries `frame-ancestors 'self'` and `SAMEORIGIN`, so the file viewer's frame on this origin may show it and no other page may. The site's policy allows inline scripts and its frame header forbids every frame, and both would replace the route's, so the Caddyfile sends those two from a block with a matcher that leaves that path out (`header @notfile`, `@notfile not path /api/library/documents/*/file`); the other headers stay on every answer, the file route's included.
 
 `deploy/caddy/Caddyfile.local` sends the same headers except HSTS, which a browser ignores over plain HTTP, so a policy violation shows up in a local integration run before production. Change both together.
 

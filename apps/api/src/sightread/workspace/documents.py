@@ -14,6 +14,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import mimetypes
 import os
 import re
 import shutil
@@ -29,7 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..billing import ledger
 from ..config import Settings
-from ..db.models import Document, Folder, Job, Result, utcnow
+from ..db.models import MARKDOWN_KIND, Document, Folder, Job, Result, utcnow
 from ..errors import ApiError
 from . import git, safe_io
 from .layout import (
@@ -62,9 +63,8 @@ NOT_PLAIN = "The document's files are not regular files"
 TOO_LARGE = "The document file is too large to open"
 NOT_UTF8 = "The document file is not UTF-8 text"
 
-# A document with no parse behind it (docs/workspace.md § Markdown documents): what the
-# library calls its kind, and what an upload is recognised as one by.
-MARKDOWN_KIND = "markdown"
+# A document with no parse behind it (docs/workspace.md § Markdown documents): what an
+# upload is recognised as one by (its kind, `MARKDOWN_KIND`, is the row's).
 MARKDOWN_MEDIA_TYPE = "text/markdown"
 MARKDOWN_EXTENSIONS = (".md", ".markdown")
 # An inserted image's file name: the first 16 hex digits of its bytes' SHA-256, as it is
@@ -82,6 +82,36 @@ IMAGE_MEDIA_TYPES = (
 )
 IMAGE_FORMATS = ("PNG", "JPEG", "WEBP", "GIF", "HEIF")
 IMAGE_SUFFIX_MEDIA = {".png": "image/png", ".jpg": "image/jpeg"}
+
+# A file of the library (docs/workspace.md § Files) is served inline only when a browser
+# shows it safely on its own — an image, a video or audio file, a PDF, plain text — and as
+# an attachment otherwise: HTML, SVG and XML would run as a page of this origin.
+INLINE_MEDIA_PREFIXES = ("image/", "video/", "audio/")
+INLINE_MEDIA_TYPES = frozenset({"application/pdf", "text/plain"})
+ATTACHMENT_MEDIA_TYPES = frozenset({"image/svg+xml"})
+FALLBACK_MEDIA_TYPE = "application/octet-stream"
+_MEDIA_TYPE = re.compile(r"[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}")
+
+
+def file_media_type(name: str, declared: str | None = None) -> str:
+    """What a file's bytes are served as (docs/workspace.md § Files): the type the upload
+    declared when it is one and not a browser's shrug, else the one the extension says,
+    else octet-stream. Parameters are dropped; nothing is read from the bytes."""
+    candidate = (declared or "").split(";", 1)[0].strip().lower()
+    if candidate and candidate != FALLBACK_MEDIA_TYPE and _MEDIA_TYPE.fullmatch(candidate):
+        return candidate
+    # The suffix alone: `guess_type` reads its argument as a URL, and a name may hold a
+    # colon or a query mark.
+    guessed, _encoding = mimetypes.guess_type(f"x{Path(name).suffix.lower()}", strict=False)
+    guessed = (guessed or "").lower()
+    return guessed if _MEDIA_TYPE.fullmatch(guessed) else FALLBACK_MEDIA_TYPE
+
+
+def served_inline(media_type: str) -> bool:
+    """Whether the file route shows this type in the browser rather than download it."""
+    return media_type not in ATTACHMENT_MEDIA_TYPES and (
+        media_type in INLINE_MEDIA_TYPES or media_type.startswith(INLINE_MEDIA_PREFIXES)
+    )
 
 
 @dataclass(frozen=True)
@@ -771,6 +801,43 @@ async def adopt_markdown(
         raise
     finally:
         upload.unlink(missing_ok=True)
+
+
+def place_file(root: Path, temp: Path, relative: Path) -> None:
+    """An uploaded file from the temporary name it streamed to into its place in the tree,
+    `files/<folder>/<name>`, as the revision `upload <path>` — the one copy there is
+    (docs/workspace.md § Files). The caller holds the workspace lock and inserted the row.
+    Whatever sits at the destination already is a refusal, never overwritten; a move whose
+    revision cannot be recorded is undone, the upload back under its temporary name for
+    the caller to remove."""
+    git.ensure_repo(root)
+    target = root / relative
+    if safe_io.entry_kind(root, target) != "none":
+        raise ApiError(409, "invalid_request", "Something already sits where the file would go")
+    try:
+        safe_io.rename(root, temp, target)
+    except (safe_io.UnsafeEntry, OSError) as exc:
+        raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
+    try:
+        git.commit_paths(root, git.USER_AUTHOR, f"upload {relative}", [relative])
+    except git.GitError as exc:
+        with contextlib.suppress(OSError, safe_io.UnsafeEntry):
+            safe_io.rename(root, target, temp)
+        raise ApiError(
+            409, "invalid_request", "The upload could not be recorded; nothing was filed"
+        ) from exc
+
+
+async def discard_file(settings: Settings, user_id: int, relative: Path) -> None:
+    """The file of a filing whose row did not commit: removed again, as a revision of its
+    own, so no file stands for a row that is gone (docs/workspace.md § Files)."""
+    root = user_root(settings.workspaces_dir, user_id)
+
+    def _discard() -> None:
+        safe_io.remove_file(root, root / relative)
+        git.commit_paths(root, git.USER_AUTHOR, f"remove {relative}", [relative])
+
+    await asyncio.to_thread(_discard)
 
 
 def _keep_image(paths: DocumentPaths, document_id: int, prepared: Path) -> str:
@@ -1552,12 +1619,15 @@ def _remove_tree(root: Path, relative: Path, message: str) -> Removal | None:
     return Removal(commit, aside)
 
 
-async def remove_path(settings: Settings, user_id: int, relative: Path) -> Removal | None:
-    """Move a directory aside for a delete after the database did; the caller holds the
-    workspace lock. `discard_removed` deletes it once the rows are gone, `restore_removed`
-    brings it back should they stay."""
+async def remove_path(
+    settings: Settings, user_id: int, relative: Path, *, message: str | None = None
+) -> Removal | None:
+    """Move a directory — or a library file (docs/workspace.md § Files) — aside for a
+    delete after the database did; the caller holds the workspace lock. `discard_removed`
+    deletes it once the rows are gone, `restore_removed` brings it back should they stay.
+    `message` names the revision: `delete <path>` unless the caller says otherwise."""
     root = user_root(settings.workspaces_dir, user_id)
-    return await asyncio.to_thread(_remove_tree, root, relative, f"delete {relative}")
+    return await asyncio.to_thread(_remove_tree, root, relative, message or f"delete {relative}")
 
 
 async def discard_removed(settings: Settings, user_id: int, removal: Removal) -> None:
@@ -1632,16 +1702,19 @@ def sweep_aside(root: Path, keep: Collection[str] = ()) -> int:
     reconciliation restores instead (docs/workspace.md § Revisions)."""
     swept = 0
     entries = safe_io.list_dir(root, root)
-    present = {name for name, is_dir in entries if is_dir}
+    present = {name for name, _is_dir in entries if not name.endswith(ORIGIN_SUFFIX)}
     for name, is_dir in entries:
         if not name.startswith(safe_io.TEMP_PREFIX):
             continue
-        if is_dir and name not in keep:
-            with contextlib.suppress(OSError, safe_io.UnsafeEntry):
-                safe_io.remove_tree(root, root / name)
-                safe_io.remove_file(root, origin_marker(root, name))
-                swept += 1
-        elif not is_dir and name.endswith(ORIGIN_SUFFIX):
+        if not name.endswith(ORIGIN_SUFFIX):
+            # An aside: a directory, or the one file of a library file that a delete or a
+            # conversion moved out of the tree (docs/workspace.md § Files).
+            if name not in keep:
+                with contextlib.suppress(OSError, safe_io.UnsafeEntry):
+                    safe_io.remove_tree(root, root / name)
+                    safe_io.remove_file(root, origin_marker(root, name))
+                    swept += 1
+        elif not is_dir:
             # An origin whose aside is gone, or goes with this sweep.
             aside = name.removesuffix(ORIGIN_SUFFIX)
             if aside not in present or aside not in keep:
@@ -1892,6 +1965,9 @@ class CopiedDocument:
     inner: Path
     donors: tuple[int, ...]
     parsing: bool
+    # A file of the library: its bytes are copied and nothing is made for it
+    # (docs/workspace.md § Files).
+    file: bool = False
 
 
 @dataclass(frozen=True)
@@ -1935,7 +2011,7 @@ def _copy_files(
             raise ApiError(
                 409, "invalid_request", "The copy could not be made; nothing was copied"
             ) from exc
-    directories = {document.inner for document in documents}
+    directories = {document.inner for document in documents if not document.file}
     parsing = {document.inner for document in documents if document.parsing}
 
     def left_behind(inner: Path) -> bool:
@@ -1948,11 +2024,24 @@ def _copy_files(
         )
 
     try:
-        if safe_io.entry_kind(root, root / source) == "dir" and Path() not in parsing:
+        source_kind = safe_io.entry_kind(root, root / source)
+        if not folder and documents and documents[0].file:
+            # A file of the library on its own: its bytes under the new name, and nothing
+            # else to make — or nothing to copy (docs/workspace.md § Files).
+            if source_kind != "file":
+                raise ApiError(
+                    409,
+                    "invalid_request",
+                    "The file is missing from the workspace; nothing was copied",
+                )
+            safe_io.copy_file(root, root / source, root / target)
+        elif source_kind == "dir" and Path() not in parsing:
             safe_io.copy_tree(root, root / source, root / target, skip=left_behind)
         elif folder:
             safe_io.ensure_dir(root, root / target)
         for document in documents:
+            if document.file:
+                continue
             directory = root / target / document.inner
             if not document.parsing and safe_io.entry_kind(root, directory) == "dir":
                 safe_io.write_text(

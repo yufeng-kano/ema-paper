@@ -302,6 +302,13 @@ def _edit_sync(
 
     if len(after.encode()) > max_bytes:
         return ToolOutcome(f"the result would make {vm_path} too large; use bash", is_error=True)
+    if path.name not in git.RECORDED_NAMES and len(after.encode()) > git.revision_max_file_bytes():
+        # A file history would not record — this large; a binary one the read above
+        # already refused — is not written here: an edit with no revision has no undo
+        # (docs/chat.md § Tools, docs/workspace.md § Revisions).
+        return ToolOutcome(
+            f"{vm_path} would be too large for a revision to record; use bash", is_error=True
+        )
     # The directories a create makes for its file, deepest first: removed with the file
     # when its revision cannot be recorded, so a failed create leaves no empty folder
     # for the next reconciliation to record as a row (docs/workspace.md § Revisions).

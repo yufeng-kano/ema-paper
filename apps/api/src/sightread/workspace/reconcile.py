@@ -17,15 +17,17 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings
-from ..db.models import Document, Folder, User
+from ..db.models import FILE_KIND, Document, Folder, User
 from . import git, safe_io
 from .documents import (
+    ORIGIN_SUFFIX,
     aside_origin,
+    file_media_type,
     folder_names,
     recover_trash,
     sweep_aside,
@@ -55,6 +57,16 @@ class Found:
     document_id: int
     folder_segments: tuple[str, ...]
     name: str
+
+
+@dataclass(frozen=True)
+class FoundFile:
+    """A plain file directly in a folder — a file of the library (docs/workspace.md § Files):
+    where it sits, its canonical name and its size."""
+
+    folder_segments: tuple[str, ...]
+    name: str
+    size: int
 
 
 def _walk(root: Path, relative: Path):
@@ -107,6 +119,23 @@ def _canonicalize(root: Path) -> int:
             moved += [source, target]
             kept.append(target.name)
         dirs[:] = kept
+        for name in files:
+            # A file of the library under a name the shell gave it, by the same rule — a
+            # write in progress (`.sr-tmp-*`) is nobody's yet and stays (docs/workspace.md
+            # § Files).
+            if name.startswith(safe_io.TEMP_PREFIX) or is_canonical_segment(name):
+                continue
+            source = current / name
+            target = current / path_segment(name)
+            if safe_io.entry_kind(root, root / target) != "none":
+                logger.warning("reconcile: %s stays, %s is taken", source, target)
+                continue
+            try:
+                git.move(root, root / source, root / target)
+            except (safe_io.UnsafeEntry, OSError):
+                logger.warning("reconcile: %s could not be moved; left alone", source)
+                continue
+            moved += [source, target]
     if moved:
         # Only the moved paths: a shell may be running, with its own dirt in the tree.
         try:
@@ -123,19 +152,28 @@ def _canonicalize(root: Path) -> int:
     return len(moved) // 2
 
 
-def _scan(root: Path) -> tuple[list[Found], list[tuple[str, ...]]]:
-    """Every document directory under files/, by the id its `.meta.json` carries, and
-    every other directory — a folder, empty or not, which gets a row of its own whether
-    or not a document sits in it. Symlinks are not followed and not read: the tree the
-    host trusts is made of directories."""
+def _scan(root: Path) -> tuple[list[Found], list[tuple[str, ...]], list[FoundFile]]:
+    """Every document directory under files/, by the id its `.meta.json` carries; every
+    other directory — a folder, empty or not, which gets a row of its own whether or not a
+    document sits in it; and every plain file directly in a folder, a file of the library
+    (docs/workspace.md § Files). Symlinks are not followed and not read: the tree the
+    host trusts is made of directories and plain files. A write in progress (`.sr-tmp-*`)
+    is nobody's yet."""
     found: list[Found] = []
     folders: list[tuple[str, ...]] = []
+    plain: list[FoundFile] = []
     for current, dirs, files in _walk(root, Path(FILES_DIR)):
         dirs[:] = [name for name in dirs if is_canonical_segment(name)]
         if META_FILE not in files:
             parts = current.relative_to(FILES_DIR).parts
             if parts:
                 folders.append(parts)
+            for name in files:
+                if name.startswith(safe_io.TEMP_PREFIX) or not is_canonical_segment(name):
+                    continue
+                size = safe_io.file_size(root, root / current / name)
+                if size is not None:
+                    plain.append(FoundFile(parts, name, size))
             continue
         dirs[:] = []  # nothing beneath a document is a folder or a document
         document_id = _meta_id(root, current)
@@ -145,7 +183,7 @@ def _scan(root: Path) -> tuple[list[Found], list[tuple[str, ...]]]:
         if not parts:
             continue
         found.append(Found(document_id, tuple(parts[:-1]), parts[-1]))
-    return found, folders
+    return found, folders, plain
 
 
 def _meta_id(root: Path, directory: Path) -> int | None:
@@ -179,10 +217,12 @@ def _aside_documents(root: Path) -> dict[str, list[tuple[Path, int]]]:
     except (safe_io.UnsafeEntry, OSError):
         return asides
     for name, is_dir in entries:
-        if not (is_dir and name.startswith(safe_io.TEMP_PREFIX)):
+        if not name.startswith(safe_io.TEMP_PREFIX) or name.endswith(ORIGIN_SUFFIX):
             continue
         inside: list[tuple[Path, int]] = []
-        for current, dirs, files in _walk(root, Path(name)):
+        # A plain file aside is a library file a delete moved out of the tree: nothing
+        # inside it, its origin beside it says where it stood (docs/workspace.md § Files).
+        for current, dirs, files in _walk(root, Path(name)) if is_dir else ():
             if META_FILE not in files:
                 continue
             dirs[:] = []
@@ -267,7 +307,9 @@ def _aside_origin(aside: Path, targets: dict[Path, Path]) -> Path | None:
     return origin if origin is not None and origin.parts[0] == FILES_DIR else None
 
 
-def _canonicalize_and_scan(root: Path) -> tuple[list[Found], list[tuple[str, ...]]]:
+def _canonicalize_and_scan(
+    root: Path,
+) -> tuple[list[Found], list[tuple[str, ...]], list[FoundFile]]:
     git.ensure_repo(root)
     _canonicalize(root)
     return _scan(root)
@@ -374,9 +416,20 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
             user_id,
             swept_images,
         )
-    found, folders = await asyncio.to_thread(_canonicalize_and_scan, root)
+    found, folders, plain = await asyncio.to_thread(_canonicalize_and_scan, root)
     asides = await asyncio.to_thread(_aside_documents, root)
-    if not found and not folders and not asides:
+    # A file row whose file is gone goes with it (docs/workspace.md § Files): while any
+    # stands, the tree is compared to the rows even when it holds nothing.
+    file_rows = await db.scalar(
+        select(func.count())
+        .select_from(Document)
+        .where(
+            Document.user_id == user_id,
+            Document.kind == FILE_KIND,
+            Document.trashed_at.is_(None),
+        )
+    )
+    if not found and not folders and not asides and not plain and not file_rows:
         # Nothing to record and nothing aside: nothing to do, under the same lock a
         # delete holds, so none in flight is touched.
         await asyncio.to_thread(sweep_aside, root)
@@ -437,6 +490,7 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
     await asyncio.to_thread(sweep_aside, root, keep)
     # One id in two places — `cp -r` carries `.meta.json` along — names no winner: the
     # row stays where it is, and the copies are the shell's to sort out.
+    live_files = {row.id: row for row in documents.values() if row.kind == FILE_KIND}
     seen: dict[int, int] = {}
     for entry in found:
         seen[entry.document_id] = seen.get(entry.document_id, 0) + 1
@@ -471,10 +525,81 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
                 "/".join(segments),
                 nested,
             )
+    # The names the live document rows hold at each parent, as segments: a plain file
+    # under a document's name sits where its directory belongs, and is not a file of the
+    # library (docs/workspace.md § Files).
+    document_segments: dict[int | None, set[str]] = {}
+
+    async def taken_by_documents(parent: int | None) -> set[str]:
+        if parent not in document_segments:
+            rows = await db.execute(
+                select(Document.name).where(
+                    Document.user_id == user_id,
+                    Document.folder_id.is_(None)
+                    if parent is None
+                    else Document.folder_id == parent,
+                    Document.trashed_at.is_(None),
+                    Document.kind != FILE_KIND,
+                )
+            )
+            document_segments[parent] = {path_segment(name) for name in rows.scalars()}
+        return document_segments[parent]
+
+    # A plain file directly in a folder is a file of the library (docs/workspace.md
+    # § Files): its row is found by its place and name — a file carries no metadata with
+    # an id — made when there is none, its size refreshed when there is one, and removed
+    # when the file is gone, the one row reconciliation deletes.
+    by_place = {(row.folder_id, path_segment(row.name)): row for row in live_files.values()}
+    present: set[int] = set()
+    file_changes = 0
+    for plain_file in plain:
+        where = "/".join((*plain_file.folder_segments, plain_file.name))
+        try:
+            folder_id = await _folder_for(db, user_id, plain_file.folder_segments, cache, created)
+        except NestedInDocument as nested:
+            logger.warning(
+                "reconcile for user %d: file %s sits under document directory %s; not recorded",
+                user_id,
+                where,
+                nested,
+            )
+            continue
+        row = by_place.get((folder_id, plain_file.name))
+        if row is not None:
+            present.add(row.id)
+            if row.size_bytes != plain_file.size:
+                row.size_bytes = plain_file.size
+                file_changes += 1
+            continue
+        if plain_file.name in await taken_by_folders(folder_id) or plain_file.name in (
+            await taken_by_documents(folder_id)
+        ):
+            logger.warning(
+                "reconcile for user %d: file %s took a name a row holds there; not recorded",
+                user_id,
+                where,
+            )
+            continue
+        db.add(
+            Document(
+                user_id=user_id,
+                folder_id=folder_id,
+                job_id=None,
+                kind=FILE_KIND,
+                name=segment_name(plain_file.name)[:512],
+                media_type=file_media_type(plain_file.name),
+                size_bytes=plain_file.size,
+            )
+        )
+        file_changes += 1
+    for row in live_files.values():
+        if row.id not in present:
+            await db.delete(row)
+            file_changes += 1
     updates: list[tuple[Document, int | None, str]] = []
     for entry in found:
         row = documents.get(entry.document_id)
-        if row is None:
+        if row is None or row.kind == FILE_KIND:
             continue
         if seen[entry.document_id] > 1:
             logger.warning(
@@ -510,9 +635,14 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
             continue
         updates.append((row, folder_id, name[:512]))
     if not updates:
-        if created:
-            await db.commit()
-        return len(created) + restored
+        if created or file_changes:
+            try:
+                await db.commit()
+            except IntegrityError:
+                await db.rollback()
+                logger.warning("reconcile for user %d hit a name conflict; rows unchanged", user_id)
+                return restored
+        return len(created) + restored + file_changes
     # Two phases, so rows that trade places (a shell swapped two directories) never
     # meet the unique constraint on their way: every changing row first takes a name
     # nothing else holds, then its own (docs/workspace.md § The tree is the truth).
@@ -529,4 +659,4 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
         await db.rollback()
         logger.warning("reconcile for user %d hit a name conflict; rows unchanged", user_id)
         return restored
-    return len(updates) + len(created) + restored
+    return len(updates) + len(created) + restored + file_changes

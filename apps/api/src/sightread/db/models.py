@@ -174,6 +174,10 @@ class AgentSetting(Base):
     # The check agent's switch: check every Files upload before it opens (docs/parsing.md
     # § Format check).
     auto_check: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
+    # The parse agent's switch: a PDF or an image uploaded on the Files page is converted on
+    # arrival; off, it is kept as a file until the reader converts it (docs/workspace.md
+    # § Files).
+    auto_convert: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
 
     prompt_preset: Mapped[PromptPreset | None] = relationship(
         foreign_keys=[prompt_preset_id], lazy="selectin"
@@ -362,6 +366,13 @@ class Folder(Base):
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
 
 
+# Which of the three a library entry is (docs/database.md): a parse result, a markdown
+# document, or a file of any kind kept once in the tree (docs/workspace.md § Files).
+PARSE_KIND = "parse"
+MARKDOWN_KIND = "markdown"
+FILE_KIND = "file"
+
+
 class Document(Base):
     """One file in the library: a name, a place in the tree, and the parse behind it.
 
@@ -418,6 +429,13 @@ class Document(Base):
         ForeignKey("jobs.id", ondelete="CASCADE"), nullable=True
     )
     name: Mapped[str] = mapped_column(String(512))
+    # `parse`, `markdown` or `file` (docs/database.md): which routes answer for the row and
+    # what its directory — or its one file — holds.
+    kind: Mapped[str] = mapped_column(String(16), default=PARSE_KIND, server_default="parse")
+    # A file's own (docs/workspace.md § Files): what its bytes are served as, and its size
+    # in the tree as last reconciled; NULL on the other kinds.
+    media_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     trashed_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
     # The re-convert queued, running or failed: a new parse of the document's original that
     # becomes its parse once it succeeds (docs/jobs.md § Re-converting a document).
