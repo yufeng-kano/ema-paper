@@ -593,7 +593,8 @@ async def post_message(
     if not locked.title:
         named = visible.strip() or (attachments[0][0].name if attachments else "")
         first_line = named.splitlines()[0] if named else ""
-        row.title = first_line[:TITLE_MAX_CHARS]
+        # Trimmed after the cut, as a rename is: a line cut at a space keeps none.
+        row.title = first_line[:TITLE_MAX_CHARS].strip()
     turn = await enqueue_turn(
         db,
         user_id=user.id,

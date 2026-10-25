@@ -3348,6 +3348,23 @@ async def test_a_title_given_before_the_first_message_is_kept(chatting) -> None:
     assert [(row["id"], row["title"]) for row in listed] == [(made, "Reading notes")]
 
 
+async def test_a_first_line_cut_at_a_space_names_the_conversation_trimmed(chatting) -> None:
+    """The first line is cut at the title cap and trimmed after the cut, as a rename is: the
+    title never ends in the space the cut fell on (docs/chat.md § Conversations)."""
+    listing = f"/api/library/documents/{chatting.document_id}/conversations"
+    made = (await chatting.post(listing, headers=CSRF_HEADERS)).json()["id"]
+    limit = (await chatting.get("/api/me")).json()["limits"]["conversation_title_max_chars"]
+    line = "x" * (limit - 1) + " runs past the cap"
+    sent = await chatting.post(
+        f"/api/conversations/{made}/messages",
+        json={"text": f"{line}\nsecond line"},
+        headers=CSRF_HEADERS,
+    )
+    assert sent.status_code == 202, sent.text
+    listed = (await chatting.get(listing)).json()["conversations"]
+    assert [(row["id"], row["title"]) for row in listed] == [(made, "x" * (limit - 1))]
+
+
 async def test_a_usage_row_is_written_through_a_cancel(monkeypatch) -> None:
     """A cancel that lands while a call's usage row is being written waits for the write:
     the paid call reaches usage_log whether or not the turn survives it (docs/chat.md
