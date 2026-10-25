@@ -37,6 +37,7 @@ from .documents import (
 from .layout import (
     FILES_DIR,
     META_FILE,
+    META_MAX_BYTES,
     document_relative_dir,
     files_root,
     is_canonical_segment,
@@ -47,9 +48,6 @@ from .layout import (
 from .locks import workspace_lock
 
 logger = logging.getLogger(__name__)
-
-# A document's metadata is a few hundred bytes; anything larger is not ours.
-META_MAX_BYTES = 65_536
 
 
 @dataclass(frozen=True)
@@ -157,7 +155,16 @@ def _meta_id(root: Path, directory: Path) -> int | None:
     try:
         data = safe_io.read_bytes(root, root / directory / META_FILE, META_MAX_BYTES)
         return int(json.loads(data or b"")["document_id"])
-    except (safe_io.UnsafeEntry, safe_io.EntryTooLarge, OSError, ValueError, KeyError, TypeError):
+    except (
+        safe_io.UnsafeEntry,
+        safe_io.EntryTooLarge,
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        OverflowError,  # an id of 1e400
+        RecursionError,  # arrays nested deeper than the decoder goes
+    ):
         return None
 
 

@@ -438,3 +438,33 @@ async def test_a_figure_from_before_a_reconvert_keeps_its_crop(
     assert kept.status_code == 200
     assert kept.content == only_before.read_bytes()
     assert (await library.get(f"{base}/2/200,200,800,800")).status_code == 404
+
+
+@respx.mock
+async def test_a_reconvert_takes_the_earlier_parse_copies_out_of_the_directory(
+    library, sessionmaker, documents
+) -> None:
+    respx.post(KANO_CHAT_URL).mock(side_effect=_upstream())
+    uploaded = await _parsed(library, sessionmaker, documents)
+    figures_dir = Path(library.app.state.settings.figures_dir)
+    earlier = uuid.UUID(uploaded["job_id"])
+    kept = crop_path(figures_dir, earlier, 1, (0, 0, 1000, 1000))
+    # Two crops only the first parse made, copied in as materialization copies them; a
+    # command then wrote over the second copy.
+    dropped = crop_path(figures_dir, earlier, 2, (100, 100, 900, 900))
+    rewritten = crop_path(figures_dir, earlier, 3, (100, 100, 900, 900))
+    view = _directory(library) / "figures"
+    for crop in (dropped, rewritten):
+        crop.write_bytes(kept.read_bytes())
+        (view / crop.name).write_bytes(kept.read_bytes())
+    (view / rewritten.name).write_bytes(b"the agent's own picture")
+    (await _reconvert(library, uploaded["id"], model=FALLBACK)).raise_for_status()
+    await _drain_queue(library, sessionmaker)
+    assert (await _row(library, uploaded["id"]))["job_id"] != uploaded["job_id"]
+    # The new parse's crops are in the directory, the earlier parse's copy is not — the
+    # quota would count it, no longer the document's parse — and what a command wrote
+    # stays. The crops themselves stay with their parse (docs/jobs.md § Re-converting).
+    assert (view / kept.name).is_file()
+    assert not (view / dropped.name).exists()
+    assert (view / rewritten.name).read_bytes() == b"the agent's own picture"
+    assert dropped.is_file() and rewritten.is_file()

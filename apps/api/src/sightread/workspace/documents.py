@@ -17,8 +17,9 @@ import logging
 import os
 import re
 import shutil
+import stat
 import uuid
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -36,7 +37,9 @@ from .layout import (
     FIGURES_DIR,
     FILES_DIR,
     META_FILE,
+    META_MAX_BYTES,
     NOTES_FILE,
+    RESULTS_DIR,
     SIGHTREAD_DIR,
     SOURCE_STEM,
     TRASH_DIR,
@@ -371,6 +374,30 @@ def _materialize_files(
     return written
 
 
+def _drop_crops(
+    paths: DocumentPaths, figures_dir: Path, earlier: uuid.UUID, now: uuid.UUID
+) -> None:
+    """Once the document has taken a new parse, the earlier parse's crops the new one does
+    not hold leave its `figures/` (docs/jobs.md § Re-converting a document): the shell's
+    copies, each still the size of its crop. The crops themselves stay with that parse."""
+    crops = figures_dir / str(earlier)
+    if not crops.is_dir():
+        return
+    kept = figures_dir / str(now)
+    sizes = {
+        crop.name: crop.stat().st_size
+        for crop in crops.iterdir()
+        if crop.is_file() and not (kept / crop.name).exists()
+    }
+    stale = [
+        step.name
+        for step in safe_io.walk(paths.root, paths.figures, prune=lambda _parts: True)
+        if step.name is not None and sizes.get(step.name) == step.size
+    ]
+    for name in stale:
+        safe_io.remove_file(paths.root, paths.figures / name)
+
+
 def _copy_images(paths: DocumentPaths, document_id: int) -> None:
     """Each stored image the document directory's `figures/` lacks, copied in through a
     descriptor like a crop: the shell's view of what the text names."""
@@ -552,11 +579,9 @@ async def ensure_within_quota(
     § Quota, docs/billing.md § Plans). A walk of the tree: cheap at the sizes a quota
     allows, and only on growth."""
     limit = ledger.storage_limit(settings, await ledger.plan_of(db, settings, user_id))
-    used = await asyncio.to_thread(workspace_size, root)
+    used = (await measure_storage(db, settings, user_id, root)).total
     if used >= limit:
-        raise ApiError(
-            409, "storage_full", "The workspace is at its quota; free some space first"
-        )
+        raise ApiError(409, "storage_full", "The workspace is at its quota; free some space first")
 
 
 def _source_suffix(source: Path, kind: str) -> str:
@@ -1075,6 +1100,7 @@ async def take_reconvert(
                 await db.commit()
                 return False
             result = (await db.execute(select(Result).where(Result.job_id == job.id))).scalar_one()
+            earlier = document.job_id
             # The version it has, recorded, so the revision below is the change from it.
             paths = await materialize_document(db, settings, document, locked=True)
             await asyncio.to_thread(
@@ -1092,9 +1118,14 @@ async def take_reconvert(
             await db.rollback()
             raise
         try:
-            # The new parse's crops and `result.md`, as any materialization writes them;
-            # a copy that fails is finished by the next one.
-            await materialize_document(db, settings, document, locked=True)
+            # The new parse's crops and `result.md`, as any materialization writes them,
+            # then the earlier parse's copies out; a copy that fails is finished by the
+            # next one.
+            paths = await materialize_document(db, settings, document, locked=True)
+            if earlier is not None:
+                await asyncio.to_thread(
+                    _drop_crops, paths, Path(settings.figures_dir), earlier, job.id
+                )
         except Exception:  # noqa: BLE001 - the document took its parse; the copies can wait
             logger.exception("could not materialize document %d after its re-convert", document_id)
     return True
@@ -2034,27 +2065,160 @@ async def remove_copy(
     await asyncio.to_thread(_remove_copy, root, target, made, target_ids)
 
 
-def directory_size(root: Path, path: Path | None = None) -> int:
-    """Bytes under `path` (the whole user directory when None), walked through
-    descriptors that follow nothing, and no deeper than the walk's depth bound
-    (docs/workspace.md § Quota): a tree nested past it cannot be measured."""
+@dataclass(frozen=True)
+class StorageUsage:
+    """What a workspace holds against its plan's storage, each thing once
+    (docs/workspace.md § Quota): the files, the Trash, the history, and each document's
+    share of the first two — its directory, its original and its images."""
+
+    files: int
+    trash: int
+    history: int
+    documents: dict[int, int]
+
+    @property
+    def total(self) -> int:
+        return self.files + self.trash + self.history
+
+
+def _held(base: Path, *, by_directory: bool) -> tuple[dict[int, dict[str, int]], int]:
+    """The originals (`{id}.<ext>`, keyed by suffix) or the inserted images (`{id}/<name>`,
+    keyed by name) beside the git directory, by document id, and the bytes of anything
+    there no id owns: a staging file, a leftover the next reconciliation sweeps."""
+    held: dict[int, dict[str, int]] = {}
+    loose = 0
+    for step in safe_io.walk(base, base):
+        if step.name is None:
+            continue
+        if by_directory:
+            owner, key = (step.parts[0], step.name) if len(step.parts) == 1 else ("", "")
+        else:
+            stem, dot, ext = step.name.partition(".")
+            owner, key = (stem, f".{ext}") if dot and not step.parts else ("", "")
+        if owner.isdigit():
+            held.setdefault(int(owner), {})[key] = step.size
+        else:
+            loose += step.size
+    return held, loose
+
+
+def storage_usage(
+    root: Path,
+    figures_dir: Path,
+    jobs: Mapping[int, uuid.UUID | None],
+    trashed: Collection[int] = (),
+    *,
+    whole: bool = True,
+) -> StorageUsage:
+    """Measure the workspace (docs/workspace.md § Quota). `jobs` is every document of the
+    user's, by id, with the parse it names (None for a markdown document), `trashed` the
+    ones in the Trash. A directory whose `.meta.json` names one of them is that document's,
+    the first one found when two do; there the service's copies are not counted — a
+    `source.*` the size of the document's original with that extension, a file in its
+    `figures/` the size of the document's image of that name or of its parse's crop — so
+    each excuses one copy at most, wherever a shell writes `.meta.json` files.
+    `.sightread/results/` (the database's result, copied for the agent) is not counted
+    either. Without `whole` only the documents' shares are wanted, and the rest of the
+    tree and the history are not walked."""
+    originals, loose_originals = _held(sources_dir(root), by_directory=False)
+    images, loose_images = _held(images_dir(root), by_directory=True)
+    shares: dict[int, int] = {}
+    claimed: set[int] = set()
+    in_trash = set(trashed)
+
+    def crop_size(job_id: uuid.UUID | None, name: str) -> int | None:
+        if job_id is None:
+            return None
+        try:
+            crop = os.lstat(figures_dir / str(job_id) / name)
+        except OSError:
+            return None
+        return crop.st_size if stat.S_ISREG(crop.st_mode) else None
+
+    def documents_under(base: Path, *, trash: bool) -> int:
+        counted = 0
+        owners: dict[tuple[str, ...], int] = {}
+        for step in safe_io.walk(root, base):
+            parts = step.parts
+            if step.name is None:
+                try:
+                    meta = json.loads(safe_io.read_at(step.fd, META_FILE, META_MAX_BYTES) or b"")
+                    document_id = int(meta["document_id"])
+                except (ValueError, KeyError, TypeError, OverflowError, RecursionError):
+                    # Not a document's metadata: a command can write an id of 1e400, or
+                    # nest arrays deeper than the decoder goes.
+                    continue
+                if parts and document_id in jobs and document_id not in claimed:
+                    claimed.add(document_id)
+                    owners[parts] = document_id
+                    if trash:
+                        in_trash.add(document_id)
+                continue
+            if parts in owners and step.name.startswith(f"{SOURCE_STEM}."):
+                # The shell's copy of the original.
+                suffix = step.name[len(SOURCE_STEM) :]
+                if originals.get(owners[parts], {}).get(suffix) == step.size:
+                    continue
+            elif parts[-1:] == (FIGURES_DIR,) and parts[:-1] in owners:
+                # A copy of an inserted image, or of a crop of the document's parse.
+                owner = owners[parts[:-1]]
+                if step.size in (
+                    images.get(owner, {}).get(step.name),
+                    crop_size(jobs[owner], step.name),
+                ):
+                    continue
+            counted += step.size
+            # What a command made inside a document's directory is the document's own.
+            for depth in range(len(parts), 0, -1):
+                owner = owners.get(parts[:depth])
+                if owner is not None:
+                    shares[owner] = shares.get(owner, 0) + step.size
+                    break
+        return counted
+
+    files = documents_under(files_root(root), trash=False)
+    trash = documents_under(trash_root(root), trash=True)
+    history = 0
+    if whole:
+        skipped = {(FILES_DIR,), (SIGHTREAD_DIR, RESULTS_DIR), (SIGHTREAD_DIR, TRASH_DIR)}
+        files += sum(step.size for step in safe_io.walk(root, root, prune=skipped.__contains__))
+        history = safe_io.tree_size(git_dir(root), git_dir(root))
+    for held in (originals, images):
+        for document_id, entries in held.items():
+            size = sum(entries.values())
+            if document_id in jobs:
+                shares[document_id] = shares.get(document_id, 0) + size
+            if document_id in in_trash:
+                trash += size
+            else:
+                files += size
+    files += loose_originals + loose_images
+    return StorageUsage(files=files, trash=trash, history=history, documents=shares)
+
+
+async def measure_storage(
+    db: AsyncSession, settings: Settings, user_id: int, root: Path
+) -> StorageUsage:
+    """The user's storage against their rows: which directories are documents, the parse
+    each names, which are in the Trash (docs/workspace.md § Quota). A tree nested past the
+    walk's depth bound cannot be measured, and is refused rather than undercounted."""
+    rows = (
+        await db.execute(
+            select(Document.id, Document.job_id, Document.folder_id, Document.trashed_at).where(
+                Document.user_id == user_id
+            )
+        )
+    ).all()
+    gone = trashed_folder_ids((await user_folders(db, user_id)).values())
+    jobs = {row.id: row.job_id for row in rows}
+    trashed = {row.id for row in rows if row.trashed_at is not None or row.folder_id in gone}
     try:
-        return safe_io.tree_size(root, root if path is None else path)
+        return await asyncio.to_thread(
+            storage_usage, root, Path(settings.figures_dir), jobs, trashed
+        )
     except safe_io.TreeTooDeep as exc:
         raise ApiError(
             409,
             "invalid_request",
             "The workspace has a directory nested too deep to measure; delete it first",
         ) from exc
-
-
-def workspace_size(root: Path) -> int:
-    """What the user holds: the tree, the history, the originals and the inserted images
-    beside it (the git, sources and images directories are the service's own, outside the
-    mount, walked the same way from their own roots)."""
-    return (
-        directory_size(root)
-        + directory_size(git_dir(root))
-        + directory_size(sources_dir(root))
-        + directory_size(images_dir(root))
-    )

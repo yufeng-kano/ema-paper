@@ -168,6 +168,9 @@ class Settings(BaseSettings):
     revert_max_bytes: int = 64 * 1024 * 1024
     revert_max_paths: int = 2000
     workspace_git_timeout_seconds: int = 60
+    # How many loose objects a workspace's history may hold before the worker's sweep
+    # packs it (docs/workspace.md § Revisions).
+    workspace_git_pack_loose_objects: int = 100
     # The most of a git log the API reads to list revisions, and the paths it keeps per
     # revision; the rename and path lists a revert reads share the byte bound
     # (docs/workspace.md § Revisions).

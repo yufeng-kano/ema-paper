@@ -95,7 +95,13 @@ async def run_worker(stop: asyncio.Event) -> None:
     upload_dir.mkdir(parents=True, exist_ok=True)
 
     sweeper = asyncio.create_task(
-        sweep_forever(upload_dir, stop, max_age=settings.upload_max_age_seconds)
+        sweep_forever(
+            upload_dir,
+            Path(settings.workspaces_dir),
+            stop,
+            max_age=settings.upload_max_age_seconds,
+            pack_loose_objects=settings.workspace_git_pack_loose_objects,
+        )
     )
     sandbox = SandboxClient(settings) if settings.sandbox_configured else None
     # Retried until it goes through: a database or runner blip at start must not leave

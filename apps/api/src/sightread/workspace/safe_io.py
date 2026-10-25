@@ -13,6 +13,8 @@ import contextlib
 import os
 import secrets
 import stat
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 
 _DIR_FLAGS = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -430,22 +432,44 @@ def remove_empty_dir(root: Path, path: Path) -> bool:
         os.close(fd)
 
 
-def _dir_size(fd: int) -> int:
-    """An explicit stack, not recursion: a shell can nest directories deeper than the
+@dataclass(frozen=True)
+class Step:
+    """What `walk` passes over: a directory as it is entered (`name` None) or an entry in
+    it that is not a directory, with its size. `parts` are the directories from the
+    walk's top down to it, `fd` that directory's descriptor, open until the walk moves on."""
+
+    parts: tuple[str, ...]
+    name: str | None
+    size: int
+    fd: int
+
+
+def walk(
+    root: Path, path: Path, *, prune: Callable[[tuple[str, ...]], bool] | None = None
+) -> Iterator[Step]:
+    """Every directory under the one at `path`, itself first, as it is entered, and every
+    entry in them that is not a directory — each step through a descriptor opened without
+    following, so a link the shell plants is an entry of its own size, never a tree
+    elsewhere. Nothing when there is no plain directory at `path`; a directory `prune`
+    answers True for (by its parts) is not entered.
+
+    An explicit stack, not recursion: a shell can nest directories deeper than the
     interpreter's recursion limit. One open descriptor per level of depth, never one per
     sibling: a directory's entries are taken one at a time, and a child is opened only
-    when its turn comes, so a wide tree costs no more descriptors than a deep one.
-    `fd` is closed by the caller; children here."""
-    total = 0
-    # (directory, the names still to look at in it)
-    stack: list[tuple[int, list[str]]] = [(fd, _names(fd))]
+    when its turn comes, so a wide tree costs no more descriptors than a deep one."""
     try:
+        top = _open_dir(root, path)
+    except (UnsafeEntry, OSError):
+        return
+    # (directory, its parts, the names still to look at in it)
+    stack: list[tuple[int, tuple[str, ...], list[str]]] = [(top, (), _names(top))]
+    try:
+        yield Step((), None, 0, top)
         while stack:
-            current, names = stack[-1]
+            current, parts, names = stack[-1]
             if not names:
                 stack.pop()
-                if current != fd:
-                    os.close(current)
+                os.close(current)
                 continue
             name = names.pop()
             try:
@@ -453,7 +477,10 @@ def _dir_size(fd: int) -> int:
             except OSError:
                 continue
             if not stat.S_ISDIR(info.st_mode):
-                total += info.st_size  # a link counts as itself, never its target
+                yield Step(parts, name, info.st_size, current)
+                continue
+            inner = (*parts, name)
+            if prune is not None and prune(inner):
                 continue
             if len(stack) >= DEPTH_MAX:
                 # Bounded descriptors, and never a silent undercount past the bound.
@@ -462,13 +489,28 @@ def _dir_size(fd: int) -> int:
                 child = os.open(name, _OPEN_DIR_FLAGS, dir_fd=current)
             except OSError:
                 continue
-            stack.append((child, _names(child)))
-    except BaseException:
-        for pending, _names_left in stack:
-            if pending != fd:
-                os.close(pending)
-        raise
-    return total
+            stack.append((child, inner, _names(child)))
+            yield Step(inner, None, 0, child)
+    finally:
+        for pending, _parts, _names_left in stack:
+            os.close(pending)
+
+
+def read_at(fd: int, name: str, max_bytes: int) -> bytes | None:
+    """The plain file `name` in the directory `fd`, opened without following; None when
+    there is none, or it is not a plain file of at most `max_bytes`."""
+    try:
+        entry = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=fd)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(entry)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > max_bytes:
+            return None
+        data = os.read(entry, max_bytes + 1)
+    finally:
+        os.close(entry)
+    return data if len(data) <= max_bytes else None
 
 
 def _names(fd: int) -> list[str]:
@@ -479,14 +521,6 @@ def _names(fd: int) -> list[str]:
 
 
 def tree_size(root: Path, path: Path) -> int:
-    """Bytes under the directory at `path`, every step through a descriptor opened
-    without following: a link the shell plants is one entry, never a tree elsewhere.
-    Zero when there is no plain directory there."""
-    try:
-        fd = _open_dir(root, path)
-    except (UnsafeEntry, OSError):
-        return 0
-    try:
-        return _dir_size(fd)
-    finally:
-        os.close(fd)
+    """Bytes under the directory at `path` (`walk`): a link counts as itself, never its
+    target. Zero when there is no plain directory there."""
+    return sum(step.size for step in walk(root, path))

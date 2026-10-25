@@ -46,24 +46,15 @@ from ..parsing.attachments import prepared_path
 from ..sandbox.client import SandboxClient, SandboxUnavailable
 from ..upstream.client import agent_models
 from ..workspace.documents import (
+    StorageUsage,
     current_revision,
-    directory_size,
     ensure_within_quota,
     is_live,
     materialize_document,
+    measure_storage,
     user_folders,
-    workspace_size,
 )
-from ..workspace.layout import (
-    CACHE_DIR,
-    FILES_DIR,
-    SIGHTREAD_DIR,
-    git_dir,
-    images_dir,
-    sources_dir,
-    trash_root,
-    user_root,
-)
+from ..workspace.layout import user_root
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
@@ -807,28 +798,14 @@ async def conversation_events(
 # --- the sandbox --------------------------------------------------------------------------
 
 
-def _workspace_usage(root: Path, quota: int) -> dict:
-    breakdown = []
-    for name in (FILES_DIR, f"{SIGHTREAD_DIR}/results", CACHE_DIR):
-        size = directory_size(root, root / name)
-        if size:
-            breakdown.append({"path": f"{name}/", "bytes": size})
-    history = directory_size(git_dir(root))
-    if history:
-        breakdown.append({"path": "history/", "bytes": history})
-    originals = directory_size(sources_dir(root))
-    if originals:
-        breakdown.append({"path": "originals/", "bytes": originals})
-    images = directory_size(images_dir(root))
-    if images:
-        breakdown.append({"path": "images/", "bytes": images})
-    trash = directory_size(root, trash_root(root))
-    if trash:
-        breakdown.append({"path": "trash/", "bytes": trash})
+def workspace_payload(usage: StorageUsage, quota: int) -> dict:
+    """The workspace's storage as the status route answers with it (docs/api.md)."""
     return {
-        "bytes": workspace_size(root),
+        "bytes": usage.total,
         "quota_bytes": quota,
-        "breakdown": breakdown,
+        "files_bytes": usage.files,
+        "trash_bytes": usage.trash,
+        "history_bytes": usage.history,
     }
 
 
@@ -847,8 +824,8 @@ async def sandbox_status(user: SessionUser, db: DbSession, settings: AppSettings
         state = {"state": "unavailable", "last_used_at": None, "shells": 0, "uptime_seconds": 0}
     root = user_root(settings.workspaces_dir, user.id)
     plan = await ledger.plan_of(db, settings, user.id)
-    workspace = await asyncio.to_thread(
-        _workspace_usage, root, ledger.storage_limit(settings, plan)
+    workspace = workspace_payload(
+        await measure_storage(db, settings, user.id, root), ledger.storage_limit(settings, plan)
     )
     # Whether the plan gives the chat agent a sandbox at all; the runner's state above
     # says whether this deployment has one to give (docs/billing.md § Plans).

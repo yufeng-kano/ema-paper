@@ -624,10 +624,14 @@ export interface SandboxStatus {
   last_used_at: string | null
   shells: number
   uptime_seconds: number
+  /** `bytes` is what counts against `quota_bytes`: the files, the Trash and the history,
+   *  each original once and never the service's copies (docs/workspace.md § Quota). */
   workspace: {
     bytes: number
     quota_bytes: number
-    breakdown: { path: string; bytes: number }[]
+    files_bytes: number
+    trash_bytes: number
+    history_bytes: number
   }
 }
 
@@ -727,7 +731,12 @@ export interface LibraryDocument {
   model: string | null
   page_count: number | null
   pages_done: number | null
+  /** The upload; null for a markdown document. */
   size_bytes: number | null
+  /** What the document takes of the storage: its directory, its original and its images,
+   *  never the service's copies (docs/workspace.md § Quota). Null where the library read did
+   *  not measure it; optional so a page served by an older API still renders. */
+  storage_bytes?: number | null
   error: string | null
   created_at: string
   finished_at: string | null

@@ -17,13 +17,16 @@ from sqlalchemy import select
 from sightread.config import Settings
 from sightread.db.models import Document, Folder, Job, Result, User
 from sightread.errors import ApiError
+from sightread.jobs import sweeper
 from sightread.workspace import documents, git, reconcile, safe_io
 from sightread.workspace.layout import (
     git_dir,
+    images_dir,
     inside,
     is_canonical_segment,
     path_segment,
     segment_name,
+    sources_dir,
     user_root,
 )
 from tests.conftest import KANO_BASE, TEST_SECRET_KEY
@@ -1006,10 +1009,10 @@ def test_tree_sizes_never_follow_a_link(tmp_path) -> None:
     (elsewhere / "big.bin").write_bytes(b"y" * 100_000)
     (root / "files" / "link").symlink_to(elsewhere)
     (root / "link-dir").symlink_to(elsewhere)
-    assert documents.directory_size(root, root / "files") < 1_000
-    assert documents.directory_size(root) < 1_000
+    assert safe_io.tree_size(root, root / "files") < 1_000
+    assert documents.storage_usage(root, tmp_path / "figures", {}).total < 1_000
     # The linked directory itself is nothing to a walk, not a tree.
-    assert documents.directory_size(root, root / "link-dir") == 0
+    assert safe_io.tree_size(root, root / "link-dir") == 0
 
 
 def test_the_revision_log_is_bounded(tmp_path) -> None:
@@ -1079,9 +1082,8 @@ def test_tree_sizes_survive_a_very_deep_tree(tmp_path) -> None:
         os.close(fd)
     # Past the walk's depth bound, a size is refused rather than undercounted
     # (docs/workspace.md § Quota)...
-    with pytest.raises(ApiError) as refused:
-        documents.directory_size(root)
-    assert refused.value.status_code == 409
+    with pytest.raises(safe_io.TreeTooDeep):
+        documents.storage_usage(root, tmp_path / "figures", {})
     # ...and a removal goes through with a bounded set of descriptors however deep.
     import resource
 
@@ -1110,7 +1112,7 @@ def test_a_tree_within_the_depth_bound_is_measured(tmp_path) -> None:
         os.close(leaf)
     finally:
         os.close(fd)
-    assert documents.directory_size(root) == 10
+    assert documents.storage_usage(root, tmp_path / "figures", {}).files == 10
 
 
 def test_workspace_writes_wait_for_the_backup_lock(tmp_path) -> None:
@@ -1155,7 +1157,7 @@ def test_tree_sizes_survive_a_wide_tree_under_a_descriptor_limit(tmp_path) -> No
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     resource.setrlimit(resource.RLIMIT_NOFILE, (min(highest + 12, hard), hard))
     try:
-        assert documents.directory_size(root) == 200
+        assert documents.storage_usage(root, tmp_path / "figures", {}).files == 200
     finally:
         resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
 
@@ -2070,3 +2072,174 @@ async def test_a_revert_whose_reconciliation_fails_is_reported_as_reverted_and_f
         assert paths.relative == before.relative
         assert document.name == "paper.pdf"
         assert not after.directory.exists()
+
+
+# --- what the history stores, and what the quota counts -----------------------------------
+
+
+def _stored(root: Path, data: bytes) -> bool:
+    """Whether the repository holds a blob of these bytes, loose or packed."""
+    blob = git._git_raw(root, "hash-object", "--stdin", stdin=data).strip().decode()
+    return git._git(root, "cat-file", "-e", blob, check=False).returncode == 0
+
+
+def test_what_history_excludes_is_never_hashed_into_it(tmp_path) -> None:
+    root = tmp_path / "ws" / "20"
+    git.ensure_repo(root)
+    directory = root / "files" / "paper.pdf"
+    excluded = {
+        directory / "source.pdf": b"%PDF-1.4 the original",
+        directory / "figures" / "p1_0_0_1000_1000.png": b"a crop",
+        root / ".sightread" / "results" / "job" / "result.md": b"the result",
+        root / ".cache" / "pip" / "wheel": b"a package",
+    }
+    for path, data in excluded.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    (directory / "doc.md").write_text("# A\n")
+    assert git.commit_all(root, "agent:1", "bash: everything") is not None
+    (directory / "doc.md").write_text("# B\n")
+    (directory / "source.pdf").write_bytes(b"%PDF-1.5 a changed copy")
+    assert git.commit_paths(root, "user", "save", [Path("files/paper.pdf")]) is not None
+    # The texts are revisions. The excluded files were never staged, so not even an
+    # unreachable blob of theirs is left in the store (docs/workspace.md § Revisions).
+    assert _stored(root, b"# A\n") and _stored(root, b"# B\n")
+    assert not any(_stored(root, data) for data in excluded.values())
+    assert not _stored(root, b"%PDF-1.5 a changed copy")
+
+
+def test_staging_follows_deletions_and_swaps_between_files_and_directories(tmp_path) -> None:
+    root = tmp_path / "ws" / "21"
+    git.ensure_repo(root)
+    files = root / "files"
+    (files / "was-dir").mkdir(parents=True)
+    (files / "was-dir" / "inner.txt").write_text("inner")
+    (files / "was-file").write_text("file")
+    (files / "gone.txt").write_text("x")
+    (files / "doc").mkdir()
+    (files / "doc" / "doc.md").write_text("a")
+    assert git.commit_all(root, "agent:1", "seed") is not None
+    (files / "gone.txt").unlink()
+    (files / "was-file").unlink()
+    (files / "was-file").mkdir()
+    (files / "was-file" / "now.txt").write_text("now a directory")
+    shutil.rmtree(files / "was-dir")
+    (files / "was-dir").write_text("now a file")
+    assert git.commit_all(root, "agent:1", "swap") is not None
+    # A host write's path-scoped commit takes a swap as well.
+    shutil.rmtree(files / "doc")
+    (files / "doc").write_text("now a file")
+    assert git.commit_paths(root, "user", "swap", [Path("files/doc")]) is not None
+    assert git._git(root, "ls-files").stdout.split() == [
+        "files/doc",
+        "files/was-dir",
+        "files/was-file/now.txt",
+    ]
+    assert git._git(root, "status", "--porcelain").stdout == ""
+
+
+def test_packing_keeps_every_revision_and_drops_what_none_names(tmp_path) -> None:
+    root = tmp_path / "ws" / "22"
+    assert git.loose_objects(root) == 0  # no repository yet
+    git.ensure_repo(root)
+    for text in ("one", "two", "three"):
+        safe_io.write_text(root, root / "files" / "doc.md", text)
+        git.commit_all(root, "user", text)
+    # What staging used to leave behind: a blob no revision names.
+    garbage = git._git_raw(root, "hash-object", "-w", "--stdin", stdin=b"an original").strip()
+    assert git.loose_objects(root) > 0
+    git.pack(root)
+    assert git.loose_objects(root) == 0
+    assert git._git(root, "cat-file", "-e", garbage.decode(), check=False).returncode != 0
+    assert [revision.message for revision in git.log(root)][:3] == ["three", "two", "one"]
+    assert all(_stored(root, text.encode()) for text in ("one", "two", "three"))
+
+
+async def test_the_sweep_packs_only_the_histories_past_the_threshold(tmp_path) -> None:
+    workspaces = tmp_path / "ws"
+    busy, quiet = workspaces / "1", workspaces / "2"
+    for root, count in ((busy, 30), (quiet, 1)):
+        git.ensure_repo(root)
+        for index in range(count):
+            safe_io.write_text(root, root / "files" / f"f{index}.txt", str(index))
+        git.commit_all(root, "user", "seed")
+    (workspaces / "3").mkdir()  # a user with no history yet
+    (workspaces / "not-a-user").mkdir()
+    threshold = git.loose_objects(quiet) + 1
+    assert git.loose_objects(busy) >= threshold
+    assert await sweeper.pack_histories(workspaces, loose_objects=threshold) == 1
+    assert git.loose_objects(busy) == 0
+    assert git.loose_objects(quiet) == threshold - 1
+
+
+def test_storage_counts_each_original_once_and_never_the_service_copies(tmp_path) -> None:
+    root = tmp_path / "ws" / "23"
+    figures_dir = tmp_path / "figures"
+    job = uuid.uuid4()
+    git.ensure_repo(root)
+    original, image, crop = b"o" * 1000, b"i" * 300, b"c" * 200
+    sources_dir(root).mkdir(parents=True)
+    (sources_dir(root) / "1.pdf").write_bytes(original)
+    (sources_dir(root) / "2.md").write_bytes(b"m" * 40)
+    (images_dir(root) / "1").mkdir(parents=True)
+    (images_dir(root) / "1" / "img-0123456789abcdef.png").write_bytes(image)
+    (figures_dir / str(job)).mkdir(parents=True)
+    (figures_dir / str(job) / "p1_0_0_1000_1000.png").write_bytes(crop)
+
+    def directory(path: Path, document_id: int) -> int:
+        """A document directory as materialization writes it; returns its own bytes."""
+        (path / "figures").mkdir(parents=True)
+        (path / ".meta.json").write_text(json.dumps({"document_id": document_id}))
+        (path / "doc.md").write_bytes(b"d" * 50)
+        (path / "source.pdf").write_bytes(original)
+        (path / "figures" / "p1_0_0_1000_1000.png").write_bytes(crop)
+        (path / "figures" / "img-0123456789abcdef.png").write_bytes(image)
+        return (path / ".meta.json").stat().st_size + 50
+
+    own = directory(root / "files" / "Papers" / "paper.pdf", 1)
+    # A command copied the directory: the copies are the service's in one of the two only.
+    directory(root / "files" / "copy", 1)
+    # One naming no document of the user's excuses nothing.
+    stranger = directory(root / "files" / "stranger", 99)
+    (root / "files" / "loose.txt").write_bytes(b"l" * 5)
+    # Metadata a command made that no id comes out of is no document's.
+    (root / "files" / "deep").mkdir()
+    (root / "files" / "deep" / ".meta.json").write_bytes(b"[" * 60_000)
+    (root / "files" / "huge").mkdir()
+    (root / "files" / "huge" / ".meta.json").write_bytes(b'{"document_id": 1e400}')
+    (root / ".cache").mkdir()
+    (root / ".cache" / "pip").write_bytes(b"p" * 25)
+    (root / ".sightread" / "results" / str(job)).mkdir(parents=True)
+    (root / ".sightread" / "results" / str(job) / "result.md").write_bytes(b"r" * 999)
+    trashed = root / ".sightread" / "trash" / "document-2"
+    trashed.mkdir(parents=True)
+    (trashed / ".meta.json").write_text(json.dumps({"document_id": 2}))
+    (trashed / "doc.md").write_bytes(b"t" * 30)
+
+    usage = documents.storage_usage(root, figures_dir, {1: job, 2: None}, {2})
+    copies = len(original) + len(crop) + len(image)
+    held = len(original) + len(image)  # the original and the image, once
+    assert usage.documents == {1: own + held, 2: usage.trash}
+    assert usage.trash == (trashed / ".meta.json").stat().st_size + 30 + 40
+    # The directory the document claimed without its copies, the command's copy of it
+    # and the stranger whole, the rest of the tree (the results are the database's).
+    assert usage.files == own + (own + copies) + (stranger + copies) + (5 + 60_000 + 22 + 25) + held
+    assert usage.history == safe_io.tree_size(git_dir(root), git_dir(root)) > 0
+    assert usage.total == usage.files + usage.trash + usage.history
+    # The documents' shares alone: the same, without the rest of the tree or the history.
+    shares = documents.storage_usage(root, figures_dir, {1: job, 2: None}, {2}, whole=False)
+    assert (shares.documents, shares.history) == (usage.documents, 0)
+
+
+async def test_a_workspace_too_deep_to_measure_is_refused_not_undercounted(
+    sessionmaker, tmp_path, monkeypatch
+) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+        (paths.root / "files" / "a" / "b" / "c" / "d").mkdir(parents=True)
+        monkeypatch.setattr(safe_io, "DEPTH_MAX", 3)
+        with pytest.raises(ApiError) as refused:
+            await documents.measure_storage(db, settings, user.id, paths.root)
+        assert refused.value.status_code == 409
