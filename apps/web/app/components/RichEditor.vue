@@ -2377,8 +2377,8 @@ defineExpose({
 
 /* An excerpt's link sits just under its quote, its chip's glyph in line with the quote's
    text — the bar and the inset, less the chip's own margin and padding — so the two read as
-   one excerpt. */
-.rich :deep(.rich-doc > blockquote + p:has(> .rich-link:only-child, > .rich-link-text:only-child)) {
+   one excerpt. Marked from the document (`ExcerptLinks`). */
+.rich :deep(.rich-doc > .rich-excerpt-link) {
   margin-top: var(--space-1);
   padding-left: calc(2px + var(--space-3) - 8px);
 }

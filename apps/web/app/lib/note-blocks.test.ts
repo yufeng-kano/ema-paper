@@ -16,7 +16,7 @@ import {
   unitIndexAt,
   unitMarkdown,
 } from './note-blocks'
-import { richExtensions } from './rich-extensions'
+import { markExcerptLinks, richExtensions } from './rich-extensions'
 import { docToMarkdown, markdownToDoc, sliceToMarkdown } from './richdoc'
 
 const schema = getSchema(richExtensions({ links: { state: () => 'chip', locate: () => {} }, blocks: true }))
@@ -74,6 +74,16 @@ describe('the units', () => {
     expect(unitIndexAt(units, units[1]!.from)).toBe(1)
     expect(unitIndexAt(units, state.doc.content.size)).toBe(1)
     expect(unitIndexAt([], 0)).toBeNull()
+  })
+})
+
+describe("an excerpt's link line", () => {
+  it('is marked right after its quote, and nowhere else', () => {
+    const state = notes(`> first\n\n${EXCERPT}\n\n> passage\n\nSee [3.2 Attention](#32-attention) too.\n\n[3.2 Attention](#32-attention)`)
+    const excerpts = noteUnits(state.doc).filter((unit) => unit.excerpt)
+    expect(excerpts).toHaveLength(1)
+    const marked = markExcerptLinks(state.doc).find()
+    expect(marked.map((mark) => mark.from)).toEqual([excerpts[0]!.starts[1]])
   })
 })
 

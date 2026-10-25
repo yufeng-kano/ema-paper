@@ -27,7 +27,7 @@ export interface NoteUnit {
 
 /** A paragraph that is only one section link, spacing aside: an excerpt's link line, as the
  *  link's own node view reads it. */
-function isLinkLine(node: ProseNode): boolean {
+export function isLinkLine(node: ProseNode): boolean {
   if (node.type.name !== 'paragraph') {
     return false
   }

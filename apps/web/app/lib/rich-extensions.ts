@@ -10,6 +10,7 @@
  * block moves nothing on screen.
  */
 import { Extension, InputRule, Node, mergeAttributes, type Extensions, type JSONContent } from '@tiptap/core'
+import type { Node as ProseNode } from '@tiptap/pm/model'
 import { Plugin, PluginKey } from '@tiptap/pm/state'
 import { findWrapping } from '@tiptap/pm/transform'
 import { Decoration, DecorationSet } from '@tiptap/pm/view'
@@ -22,7 +23,7 @@ import StarterKit from '@tiptap/starter-kit'
 import { BLOCK_DRAG_TYPE, NOTES_BLOCK_DRAG_TYPE } from './dnd'
 import { inlinePlain, parseInline, parseResultMarkdown, type InlineSegment, type ResultBlock } from './markdown'
 import { renderTexHtml } from './math'
-import { UnitSelection } from './note-blocks'
+import { UnitSelection, isLinkLine } from './note-blocks'
 import { inlineMathAtEnd, sliceToMarkdown } from './richdoc'
 
 export type Point = { x: number; y: number }
@@ -657,6 +658,46 @@ export type UnitLook = { from: number; to: number; look: 'selected' | 'moving' }
 
 export const unitLookKey = new PluginKey<UnitLook>('unitLook')
 
+/** The excerpts' link lines, marked. */
+const excerptLinksKey = new PluginKey<DecorationSet>('excerptLinks')
+
+/** Every paragraph that is an excerpt's link line: right after a quote and only a section link,
+ *  the pairing `noteUnits` reads. */
+export function markExcerptLinks(doc: ProseNode): DecorationSet {
+  const marks: Decoration[] = []
+  let afterQuote = false
+  doc.forEach((node, pos) => {
+    if (afterQuote && isLinkLine(node)) {
+      marks.push(Decoration.node(pos, pos + node.nodeSize, { class: 'rich-excerpt-link' }))
+    }
+    afterQuote = node.type.name === 'blockquote'
+  })
+  return DecorationSet.create(doc, marks)
+}
+
+/**
+ * An excerpt's link line sits just under its quote (docs/web.md § Notes), which the style cannot
+ * tell from the page alone: the browser holds the link between ProseMirror's own separators,
+ * and a selector sees no text. So the line is read from the document and given a class.
+ */
+const ExcerptLinks = Extension.create({
+  name: 'excerptLinks',
+  addProseMirrorPlugins() {
+    return [
+      new Plugin<DecorationSet>({
+        key: excerptLinksKey,
+        state: {
+          init: (_, state) => markExcerptLinks(state.doc),
+          apply: (tr, set) => (tr.docChanged ? markExcerptLinks(tr.doc) : set),
+        },
+        props: {
+          decorations: (state) => excerptLinksKey.getState(state),
+        },
+      }),
+    ]
+  },
+})
+
 /**
  * How the notes draw a unit taken whole (docs/web.md § Notes, *The notes' blocks have handles*):
  * the unit selection, and the unit a menu or a drag holds, as node decorations on its top-level
@@ -758,7 +799,7 @@ export function richExtensions(options: RichOptions = {}): Extensions {
     inlineMath(options),
     blockMath(options),
     Quote,
-    ...(options.links ? [sectionLink(options)] : []),
+    ...(options.links ? [sectionLink(options), ExcerptLinks] : []),
     rawBlock(options),
     SourceAttributes,
     FlatLists,
