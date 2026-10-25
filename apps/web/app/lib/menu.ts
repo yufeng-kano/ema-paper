@@ -8,6 +8,10 @@ import type { IconName } from './icons'
  */
 export const modalPanelKey: InjectionKey<Ref<HTMLElement | null>> = Symbol('modal-panel')
 
+/** Whether a dialog is inside one held above the screen's own dialogs (`UiModal`'s `above`):
+ *  a dialog opened from inside it stands over it rather than going under it. */
+export const modalAboveKey: InjectionKey<boolean> = Symbol('modal-above')
+
 /**
  * Where a context menu opens (docs/web.md § Files).
  *
