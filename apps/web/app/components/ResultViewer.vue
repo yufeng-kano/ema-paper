@@ -3574,10 +3574,12 @@ function onResize(event: PointerEvent) {
   if (hidden !== dragHidden.value) {
     if (hidden) {
       holdFocus(hidden)
-    } else {
-      void giveFocusBack()
     }
     dragHidden.value = hidden
+    if (!hidden) {
+      // After the change, so its wait is for the render that shows the card again.
+      void giveFocusBack()
+    }
   }
   if (!hidden) {
     setColumnWidth(drag.column, width)
@@ -3594,6 +3596,8 @@ function holdFocus(column: Column) {
   heldFocus = card && active instanceof HTMLElement && card.contains(active) ? active : null
 }
 
+/** Called once the card is shown again in state: the wait is for the render that shows it,
+ *  since a card still hidden takes no focus. */
 async function giveFocusBack() {
   const held = heldFocus
   heldFocus = null
