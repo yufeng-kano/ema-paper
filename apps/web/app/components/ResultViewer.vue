@@ -3617,8 +3617,13 @@ function onResizeKey(event: KeyboardEvent, column: Column) {
     // The arrow moves the edge: away from the document widens the card. It stops at the
     // card's minimum: only a drag puts a card away.
     const outward = event.key === (column === 'notes' ? 'ArrowRight' : 'ArrowLeft')
-    setColumnWidth(column, columnWidth[column].value + (outward ? step : -step))
-    chooseWidth(column, columnWidth[column].value)
+    const before = columnWidth[column].value
+    setColumnWidth(column, before + (outward ? step : -step))
+    // A key that moves nothing — the edge already at a bound, its own or the window's —
+    // chooses nothing, as a press that drags nothing does not.
+    if (columnWidth[column].value !== before) {
+      chooseWidth(column, columnWidth[column].value)
+    }
   }
 }
 
