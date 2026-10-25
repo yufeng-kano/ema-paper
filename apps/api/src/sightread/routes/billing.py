@@ -292,7 +292,9 @@ async def pay_webhook(request: Request, db: DbSession, settings: AppSettings):
         # A deleted account's subscription still sends its ending events, and Pay retries
         # a refused delivery for ever: acknowledged, nothing fetched or recorded
         # (docs/auth.md § Deleting the account).
-        logger.info("Kano Pay event %s names a subject with no account", event_id)
+        # Logged as a warning: a deleted account's subscription that still bills is the
+        # operator's to cancel or refund in Pay.
+        logger.warning("Kano Pay event %s names a subject with no account", event_id)
         return {}
     if await db.get(PayEvent, event_id) is not None:
         return {}

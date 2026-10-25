@@ -85,6 +85,10 @@ class Settings(BaseSettings):
     # notification may carry.
     kano_pay_catalog_ttl_seconds: int = 300
     kano_pay_event_max_bytes: int = 65_536
+    # How long a checkout Pay opened can still be paid (Pay's session lifetime): an account
+    # is not deleted while one of its own is that young (docs/auth.md § Deleting the
+    # account).
+    kano_pay_checkout_lifetime_seconds: int = 86_400
 
     upload_max_bytes: int = 134_217_728
     page_cap: int = 500

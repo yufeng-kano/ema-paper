@@ -24,6 +24,7 @@ from sightread.db.models import (
     ApiKey,
     ChatAttachment,
     ChatTurn,
+    Checkout,
     Conversation,
     CreditEntry,
     CreditPeriod,
@@ -52,7 +53,7 @@ from tests.conftest import CSRF_HEADERS, DATABASE_URL, PARSE_MODEL, PAY_SETTINGS
 from tests.test_document_images import _image, _insert
 from tests.test_library_trash import _write
 from tests.test_markdown_documents import _upload_markdown
-from tests.test_pay import SUBSCRIPTIONS_URL, _event, _notify, canonical
+from tests.test_pay import SUBSCRIPTIONS_URL, _event, _notify, _version, canonical
 from tests.test_retention import _stranger
 
 postgres_only = pytest.mark.skipif(
@@ -336,6 +337,69 @@ async def test_pay_unreachable_refuses_only_an_account_with_a_subscription_on_re
     assert (await _delete(stranger)).status_code == 204
 
 
+@respx.mock
+async def test_a_renewal_written_while_the_request_waited_still_refuses(
+    make_client, tmp_path
+) -> None:
+    account = await _account(make_client, tmp_path, **PAY_SETTINGS)
+    uid = account.user_id
+    # Pay answered before the locks were taken; a notification wrote a newer version
+    # since. The write keeps the newer one, and the newer one decides.
+    await grant_plan(account.app.state.sessionmaker, uid, version=_version(5))
+    fetch = respx.get(f"{SUBSCRIPTIONS_URL}{uid}").mock(
+        return_value=httpx.Response(200, json=canonical(uid, version=2, cancel=True))
+    )
+    refused = await _delete(account)
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["error"]["type"] == "subscription_active"
+
+    # Pay with nothing for the subject while a row renews: the row still decides.
+    fetch.mock(return_value=httpx.Response(200, json={"subscription": None}))
+    refused = await _delete(account)
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["error"]["type"] == "subscription_active"
+    async with account.app.state.sessionmaker() as db:
+        assert await db.get(User, uid) is not None
+
+
+@respx.mock
+async def test_a_checkout_that_can_still_be_paid_refuses_until_it_cannot(
+    make_client, tmp_path
+) -> None:
+    account = await _account(make_client, tmp_path, **PAY_SETTINGS)
+    lapsed = await _stranger(make_client, tmp_path, **PAY_SETTINGS)
+    lifetime = account.app.state.settings.kano_pay_checkout_lifetime_seconds
+    fetch = respx.get(url__startswith=SUBSCRIPTIONS_URL).mock(
+        return_value=httpx.Response(200, json={"subscription": None})
+    )
+    async with account.app.state.sessionmaker() as db:
+        db.add(Checkout(user_id=account.user_id, plan_id="pro", idempotency_key="k_open"))
+        db.add(
+            Checkout(
+                user_id=lapsed.user_id,
+                plan_id="pro",
+                idempotency_key="k_lapsed",
+                created_at=utcnow() - timedelta(seconds=lifetime + 60),
+            )
+        )
+        await db.commit()
+
+    refused = await _delete(account)
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["error"] == {
+        "type": "checkout_open",
+        "message": "A checkout you started can still be paid",
+    }
+    # Past Pay's session lifetime it can no longer be paid: no obstacle.
+    assert (await _delete(lapsed)).status_code == 204
+
+    # Paid, and the subscription set to end: Pay's answer completes the checkout.
+    fetch.mock(
+        return_value=httpx.Response(200, json=canonical(account.user_id, version=2, cancel=True))
+    )
+    assert (await _delete(account)).status_code == 204
+
+
 async def test_without_pay_the_stored_subscription_decides(make_client, tmp_path) -> None:
     account = await _account(make_client, tmp_path)
     await grant_plan(account.app.state.sessionmaker, account.user_id)
@@ -460,3 +524,26 @@ async def test_the_sweep_finishes_a_deletion_whose_files_the_request_left(
     async with account.app.state.sessionmaker() as db:
         assert await db.get(User, stranger.user_id) is not None
     assert await finish_deletions(account.app.state.sessionmaker, settings) == 0
+
+
+async def test_an_unreadable_marker_still_finishes_the_directories(
+    make_client, tmp_path, monkeypatch
+) -> None:
+    from sightread.routes import control
+
+    account = await _account(make_client, tmp_path)
+    await _upload_markdown(account, b"# Note\n", name="note.md")
+    settings = account.app.state.settings
+
+    async def failing(*args, **kwargs):
+        raise OSError("disk unwell")
+
+    monkeypatch.setattr(control, "discard_account", failing)
+    assert (await _delete(account)).status_code == 204
+    monkeypatch.undo()
+    marker = deletion_marker(settings.workspaces_dir, account.user_id)
+    marker.write_text("")
+
+    assert await finish_deletions(account.app.state.sessionmaker, settings) == 1
+    assert not account.root.exists() and not git_dir(account.root).exists()
+    assert not marker.exists()

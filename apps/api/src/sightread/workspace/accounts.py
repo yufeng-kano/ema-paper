@@ -31,13 +31,22 @@ logger = logging.getLogger(__name__)
 
 
 def write_marker(workspaces_dir: str | Path, user_id: int, job_ids: list[uuid.UUID]) -> None:
-    """The marker, holding the account's job ids as JSON: written whole and renamed into
-    place, so a process killed mid-write leaves no half a list for the sweep to act on."""
+    """The marker, holding the account's job ids as JSON: written whole, flushed to disk
+    and renamed into place, the directory flushed after it — the rows' commit is durable,
+    so the marker must be before it, or a power cut could leave the sweep an empty one."""
     marker = deletion_marker(workspaces_dir, user_id)
     marker.parent.mkdir(parents=True, exist_ok=True)
     staging = marker.with_name(f"{marker.name}.tmp")
-    staging.write_text(json.dumps([str(job_id) for job_id in job_ids]))
+    with open(staging, "w") as handle:
+        handle.write(json.dumps([str(job_id) for job_id in job_ids]))
+        handle.flush()
+        os.fsync(handle.fileno())
     os.replace(staging, marker)
+    directory = os.open(marker.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def marked_users(workspaces_dir: str | Path) -> list[int]:
@@ -51,9 +60,15 @@ def marked_users(workspaces_dir: str | Path) -> list[int]:
 
 
 def read_marker(workspaces_dir: str | Path, user_id: int) -> list[uuid.UUID]:
-    """The job ids the marker holds."""
+    """The job ids the marker holds. One that cannot be read — a disk that lost it, a hand
+    that edited it — is logged and read as none: the account's directories do not depend
+    on them, and only its crops wait for a hand then (FileNotFoundError still raises)."""
     text = deletion_marker(workspaces_dir, user_id).read_text()
-    return [uuid.UUID(value) for value in json.loads(text)]
+    try:
+        return [uuid.UUID(value) for value in json.loads(text)]
+    except (ValueError, TypeError, AttributeError):
+        logger.warning("the deletion marker of user %d cannot be read; no job ids", user_id)
+        return []
 
 
 def discard_marker(workspaces_dir: str | Path, user_id: int) -> None:

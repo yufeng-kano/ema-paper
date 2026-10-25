@@ -412,3 +412,36 @@ async def test_the_dedup_cache_never_answers_with_a_parse_about_to_be_deleted(
         assert await find_cached_job(db, retention_days=1, **_key(user.id, "2" * 64)) is None
         assert (await find_cached_job(db, retention_days=1, **_key(user.id, "3" * 64))).id == filed
         assert (await find_cached_job(db, retention_days=0, **_key(user.id, "1" * 64))).id == late
+
+
+@postgres_only
+async def test_a_parse_whose_crops_will_not_go_stays_for_the_next_sweep(
+    writer, monkeypatch
+) -> None:
+    from sightread.jobs import sweeper
+
+    settings = writer.app.state.settings
+    async with writer.app.state.sessionmaker() as db:
+        stuck = await _parse(db, writer.user_id)
+        other = await _parse(db, writer.user_id)
+        await db.commit()
+    stuck_files = _leave_files(settings, writer.root, stuck)
+    remove = sweeper.discard_job_figures
+    monkeypatch.setattr(
+        sweeper,
+        "discard_job_figures",
+        lambda figures_dir, job_id: job_id != stuck and remove(figures_dir, job_id),
+    )
+
+    assert await purge_parses(writer.app.state.sessionmaker, settings) == 1
+
+    # The row is the only thing that names the crops: it stays, and its files with it.
+    async with writer.app.state.sessionmaker() as db:
+        assert await db.get(Job, stuck) is not None
+        assert await db.get(Job, other) is None
+    assert all(path.exists() for path in stuck_files)
+    monkeypatch.undo()
+    assert await purge_parses(writer.app.state.sessionmaker, settings) == 1
+    async with writer.app.state.sessionmaker() as db:
+        assert await db.get(Job, stuck) is None
+    assert not [path for path in stuck_files if path.exists()]

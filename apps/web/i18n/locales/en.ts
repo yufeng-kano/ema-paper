@@ -77,6 +77,7 @@ export default {
         'Your files and the Trash, your notes, conversations and memories, your API keys and connector access, and your usage and credits are deleted at once, and every device is signed out. This can’t be undone.',
       deleteConfirm: 'Type your email to confirm',
       subscriptionActive: 'Cancel your subscription first: Settings → Usage → Manage subscription.',
+      checkoutOpen: 'A checkout you started can still be paid. Try again once it has expired.',
     },
   },
   common: {
@@ -978,7 +979,7 @@ export default {
         'You can cancel at any time in the customer portal. A cancelled subscription runs to the end of the period you paid for, then the account is on Free with its files kept. Refunds follow the refund policy.',
       s6Title: 'Availability and changes to the service',
       s6Body:
-        '{name} is provided as is. We work to keep it available and your files intact, with backups, but we do not promise uninterrupted service, and we may change or retire features, models and limits. Your files stay as long as your account exists, with two exceptions: an item in the Trash is deleted for good 30 days after it was moved there, and a parse result that is not a file in Files — one made through the REST API or the connector — is deleted 30 days after the parse finishes.',
+        '{name} is provided as is. We work to keep it available and your files intact, with backups, but we do not promise uninterrupted service, and we may change or retire features, models and limits. Your files stay as long as your account exists, with two exceptions: an item in the Trash is deleted 30 days after it was moved there, and a parse result that is not a file in Files — one made through the REST API or the connector — is deleted 30 days after the parse finishes. Your documents’ revisions keep their earlier text, a deleted item’s included, until you delete the account.',
       s7Title: 'Liability',
       s7Body:
         'To the extent the law allows, we are not liable for indirect or consequential loss, for the content a model produces, or for what you do with it, and our liability to you is limited to what you paid us in the twelve months before the claim.',
@@ -1002,7 +1003,7 @@ export default {
         "The model providers: the pages, text and messages you parse or discuss are sent to the provider of the model that runs, through the operator's own Kano Proxy account, under that provider's terms for API use.\n\nDodo Payments, through Kano Pay, for checkout, invoices, tax and the customer portal: your email address and the subscription, never your documents.\n\nGoogle, for sign-in.\n\nNo one else, except where the law requires it.",
       s4Title: 'How long we keep it',
       s4Body:
-        'Your documents, with the parse results they were made from, your notes and your conversations stay as long as your account exists, on every plan. Two things go sooner: an item in the Trash is deleted for good 30 days after it was moved there, and a parse result that is not a file in Files — one made through the REST API or the connector — is deleted 30 days after the parse finishes. The source file of a parse made through the API or the connector is deleted when its job ends; a document in your library keeps its original, so it can be parsed again. Usage and credit records are kept as the billing record of the account.\n\nYou can delete your account yourself, in Settings → Account. It is removed at once, with everything in it, and leaves our backups as those rotate, within seven days; anything else you delete leaves them the same way. Questions go to the support address below.',
+        'Your documents, with the parse results they were made from, your notes and your conversations stay as long as your account exists, on every plan. Two things go sooner: an item in the Trash is deleted 30 days after it was moved there, and a parse result that is not a file in Files — one made through the REST API or the connector — is deleted 30 days after the parse finishes. Your documents’ revisions keep their earlier text, a deleted item’s included, until the account is deleted. The source file of a parse made through the API or the connector is deleted when its job ends; a document in your library keeps its original, so it can be parsed again. Usage and credit records are kept as the billing record of the account.\n\nYou can delete your account yourself, in Settings → Account. It is removed at once, with everything in it, revisions included, and leaves our daily backups as they rotate out, about a week later; anything else you delete leaves them the same way. Questions go to the support address below.',
       s5Title: 'Cookies',
       s5Body: 'One cookie, for the session that keeps you signed in. Your theme and language choices are stored in your browser.',
       s6Title: 'Security',

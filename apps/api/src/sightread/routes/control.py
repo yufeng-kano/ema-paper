@@ -281,9 +281,11 @@ async def delete_account(
                 ) from unreachable
             subscription = None
         else:
-            subscription = canonical
             if canonical is not None:
                 await pay.apply_canonical(db, user_id, canonical)
+            # The newer of Pay's answer and what a notification wrote while this request
+            # waited for the locks: the write keeps whichever version is newer.
+            subscription = await db.get(Subscription, user_id, populate_existing=True)
         if (
             subscription is not None
             and subscription.status not in ENDED_STATUSES
@@ -292,6 +294,19 @@ async def delete_account(
             # What Pay answered stays written, as a refresh would have left it.
             await db.commit()
             raise ApiError(409, "subscription_active", "Cancel your subscription first")
+        # A checkout still open can be paid after the account is gone, and Pay would start
+        # a subscription for a subject no one can sign in as again: the account waits
+        # until it can no longer be paid. Pay's answer above completes a paid one.
+        checkout = await db.get(Checkout, user_id, populate_existing=True)
+        if (
+            settings.kano_pay_configured
+            and checkout is not None
+            and checkout.completed_at is None
+            and checkout.created_at
+            > utcnow() - timedelta(seconds=settings.kano_pay_checkout_lifetime_seconds)
+        ):
+            await db.commit()
+            raise ApiError(409, "checkout_open", "A checkout you started can still be paid")
 
         # Queued work is locked, so the claims' SKIP LOCKED passes it by, and goes with
         # the account; running work would go on writing files and usage as it goes.

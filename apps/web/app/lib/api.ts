@@ -20,6 +20,7 @@ export type ApiErrorType =
   | 'checkout_unavailable'
   | 'pay_unavailable'
   | 'subscription_active'
+  | 'checkout_open'
   | 'upstream'
   | 'internal'
 

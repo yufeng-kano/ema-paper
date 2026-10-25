@@ -15,6 +15,7 @@ const { t } = useI18n()
 const auth = useAuth()
 const localePath = useLocalePath()
 const { resolve } = useApiError()
+const router = useRouter()
 
 const user = computed(() => auth.me.value?.user ?? null)
 const name = computed(() => user.value?.name?.trim() || user.value?.email || '')
@@ -59,17 +60,26 @@ async function confirmDelete() {
   }
   deleting.value = true
   deleteError.value = null
+  // Back would close the settings dialog, and this one with it, while the request runs: a
+  // refusal would go unseen, and a deletion would land after the reader had left.
+  let release: (() => void) | null = router.beforeEach(() => false)
   try {
     await deleteAccount()
+    release()
+    release = null
     // The answer already cleared the cookie; the page lets go of the session as Sign out does.
     auth.clearSession()
     await navigateTo(localePath('/'))
   } catch (error) {
-    deleteError.value =
-      error instanceof ApiRequestError && error.type === 'subscription_active'
-        ? t('settings.account.subscriptionActive')
-        : await resolve(error)
+    if (error instanceof ApiRequestError && error.type === 'subscription_active') {
+      deleteError.value = t('settings.account.subscriptionActive')
+    } else if (error instanceof ApiRequestError && error.type === 'checkout_open') {
+      deleteError.value = t('settings.account.checkoutOpen')
+    } else {
+      deleteError.value = await resolve(error)
+    }
   } finally {
+    release?.()
     deleting.value = false
   }
 }

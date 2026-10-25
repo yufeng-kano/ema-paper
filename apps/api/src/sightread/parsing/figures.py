@@ -102,17 +102,28 @@ def crop_chunks(handle: BinaryIO) -> Iterator[bytes]:
             yield chunk
 
 
-def discard_job_figures(figures_dir: Path, job_id: uuid.UUID) -> None:
-    """Remove one job's crop directory, and every attempt directory of it still standing.
+def discard_job_figures(figures_dir: Path, job_id: uuid.UUID) -> bool:
+    """Remove one job's crop directory, and every attempt directory of it still standing;
+    False, logged, when one could not be removed — a caller that deletes the job for good
+    keeps it then, so the next sweep tries again (docs/jobs.md § Retention).
 
     Crops live exactly as long as something references them (docs/jobs.md § Retention): a
     job that fails wrote no result, and a requeued job reparses from scratch — either way
     the crops of the abandoned attempt must go with it, or a reparse whose transcription
     emits different boxes would leave the first attempt's files answering figure routes.
     """
-    shutil.rmtree(figures_dir / str(job_id), ignore_errors=True)
-    for attempt in figures_dir.glob(f"{job_id}.*"):
-        shutil.rmtree(attempt, ignore_errors=True)
+    failed = False
+
+    def note(_function, _path, error: BaseException) -> None:
+        nonlocal failed
+        if not isinstance(error, FileNotFoundError):
+            failed = True
+
+    for target in (figures_dir / str(job_id), *figures_dir.glob(f"{job_id}.*")):
+        shutil.rmtree(target, onexc=note)
+    if failed:
+        logger.warning("could not remove every crop directory of job %s", job_id)
+    return not failed
 
 
 def publish_job_figures(figures_dir: Path, job_id: uuid.UUID, attempt: Path) -> None:

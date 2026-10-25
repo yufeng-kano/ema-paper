@@ -31,7 +31,8 @@ agent-sightread/
         workspace/            # the per-user file tree and its git revisions
                               # (docs/workspace.md): layout.py, git.py, documents.py,
                               # reconcile.py, trash.py (deleting for good: Empty Trash
-                              # and the Trash's expiry, one function)
+                              # and the Trash's expiry, one function), accounts.py (a
+                              # deleted account's marker and files)
         sandbox/              # client.py: the HTTP client of the sandbox runner
         upstream/             # anthropic.py (Messages API over Kano Proxy, streaming,
                               # tools — the chat agent's client, docs/chat.md);

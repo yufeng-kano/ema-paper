@@ -184,17 +184,24 @@ async def purge_parses(sessionmaker: async_sessionmaker[AsyncSession], settings:
                         )
                     ).scalars()
                 )
-                if not doomed:
+                # A job whose crops will not go stays, for the next sweep to try again: its
+                # row is the only thing that names them.
+                gone = [
+                    job_id
+                    for job_id in doomed
+                    if await asyncio.to_thread(
+                        discard_job_figures, Path(settings.figures_dir), job_id
+                    )
+                ]
+                if not gone:
                     continue
-                for job_id in doomed:
-                    await asyncio.to_thread(discard_job_figures, Path(settings.figures_dir), job_id)
-                await workspace_documents.discard_results(settings, user_id, doomed)
+                await workspace_documents.discard_results(settings, user_id, gone)
                 await asyncio.to_thread(
-                    discard_uploads, Path(settings.upload_dir), {str(job_id) for job_id in doomed}
+                    discard_uploads, Path(settings.upload_dir), {str(job_id) for job_id in gone}
                 )
-                await db.execute(delete(Job).where(Job.id.in_(doomed)))
+                await db.execute(delete(Job).where(Job.id.in_(gone)))
                 await db.commit()
-            purged += len(doomed)
+            purged += len(gone)
         except ApiError as exc:
             # The workspace recovering from an unconfirmed shell command.
             logger.warning("the parses of user %d wait for the next sweep: %s", user_id, exc)
@@ -217,7 +224,8 @@ async def discard_account(
     returns whether everything went. The caller holds the user's workspace lock."""
     removed = await asyncio.to_thread(accounts.discard_workspace, settings.workspaces_dir, user_id)
     for job_id in job_ids:
-        await asyncio.to_thread(discard_job_figures, Path(settings.figures_dir), job_id)
+        crops = await asyncio.to_thread(discard_job_figures, Path(settings.figures_dir), job_id)
+        removed = crops and removed
     stems = {str(job_id) for job_id in job_ids} | {
         f"{FILE_PREFIX}{attachment_id}" for attachment_id in attachment_ids
     }
