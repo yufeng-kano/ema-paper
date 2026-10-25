@@ -602,6 +602,9 @@ const mutationError = ref<string | null>(null)
 /** The 402 of an upload: the dialog that says what the document needs (docs/web.md § Files). */
 const creditsRefusal = ref<CreditsRefusal | null>(null)
 const limits = computed(() => auth.me.value?.limits ?? null)
+/** The parse agent's switch: on, a PDF or an image is parsed and capped as a parse; off,
+ *  kept and capped as a file (docs/web.md § Files). The switch in Settings writes it here. */
+const autoConvert = computed(() => auth.me.value?.auto_convert ?? true)
 /** How long the Trash keeps an item; 0 (or an older API's silence) keeps it until emptied. */
 const trashRetentionDays = computed(() => limits.value?.trash_retention_days ?? 0)
 /** The 409 of an upload past the plan's storage: a banner with the way to more of it
@@ -651,12 +654,12 @@ function rejected(file: File): string | null {
   // Size is the one refusal: every kind of file is kept (docs/web.md § Files). The cap is
   // the one intake applies to this file — a markdown document's, a parse's, a file's —
   // judged the way intake judges it, media type then extension (`lib/library.ts`).
-  const max = uploadCap(file, limits.value)
+  const max = uploadCap(file, limits.value, autoConvert.value)
   if (max === null || file.size <= max) {
     return null
   }
   const limit = formatBytes(max, locale.value)
-  const kept = !isMarkdownUpload(file, limits.value) && !acceptsUpload(file, limits.value)
+  const kept = !isMarkdownUpload(file, limits.value) && !(autoConvert.value && acceptsUpload(file, limits.value))
   return t(kept ? 'files.tooLargeFile' : 'files.tooLarge', { name: file.name, limit })
 }
 

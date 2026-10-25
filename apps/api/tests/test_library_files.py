@@ -244,7 +244,11 @@ async def test_the_file_route_is_the_owners_and_a_documents_is_not_a_file(
 async def test_the_switch_keeps_a_pdf_as_a_file_and_this_origin_may_frame_it(
     writer, documents
 ) -> None:
+    # On until the reader turns it off, and `GET /api/me` says which, so the Files page
+    # applies the cap the server will (docs/web.md § Files).
+    assert (await writer.get("/api/me")).json()["auto_convert"] is True
     await _switch(writer, False)
+    assert (await writer.get("/api/me")).json()["auto_convert"] is False
     pdf = documents["text_pdf"].read_bytes()
     kept = await _kept(writer, "paper.pdf", pdf, "application/pdf")
     assert (kept["media_type"], kept["job_id"], kept["size_bytes"]) == (
@@ -283,6 +287,7 @@ async def test_the_switch_keeps_a_pdf_as_a_file_and_this_origin_may_frame_it(
     # Back on, the same upload is a parse — under the next free name, since the file
     # holds this one (docs/workspace.md § Names).
     await _switch(writer, True)
+    assert (await writer.get("/api/me")).json()["auto_convert"] is True
     converted = await _upload(writer, "paper.pdf", pdf, "application/pdf")
     assert converted.status_code == 201, converted.text
     assert (converted.json()["kind"], converted.json()["name"]) == ("pdf", "paper (2).pdf")

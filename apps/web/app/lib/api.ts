@@ -327,6 +327,10 @@ export interface MeResponse {
   credits_remaining: number
   /** The balance a chat send needs (`CHAT_MIN_CREDITS`). */
   chat_min_credits: number
+  /** The parse agent's switch (docs/agents.md): whether a PDF or an image uploaded on Files
+   *  is converted on arrival — which decides the cap the page applies to it (docs/web.md
+   *  § Files). Optional so a page served by an older API still renders. */
+  auto_convert?: boolean
 }
 
 // --- billing (docs/billing.md § Routes) --------------------------------------------

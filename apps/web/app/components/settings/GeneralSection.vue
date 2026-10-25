@@ -21,6 +21,7 @@ const switchLocalePath = useSwitchLocalePath()
 const { theme, set } = useTheme()
 const { chosenWidth, chooseWidth } = useViewerLayout()
 const { resolve } = useApiError()
+const auth = useAuth()
 
 const THEME_ICONS: Record<Theme, IconName> = { system: 'monitor', light: 'sun', dark: 'moon' }
 
@@ -63,6 +64,10 @@ async function toggleConvert(next: boolean) {
   try {
     const { bbox, ...settings } = await putAgentSettings(PARSE_AGENT, { auto_convert: next })
     parseAgent.value = { ...agent, settings, bbox }
+    // The Files page reads the switch from the session (`GET /api/me`), so it follows at once.
+    if (auth.me.value) {
+      auth.me.value = { ...auth.me.value, auto_convert: settings.auto_convert ?? next }
+    }
   } catch (failure) {
     convertError.value = await resolve(failure)
   } finally {

@@ -79,6 +79,7 @@ from ..workspace.locks import workspace_lock
 from ..workspace.trash import lock_user
 from .billing import me_fields
 from .chat import TITLE_MAX_CHARS, owned_document, turn_note
+from .library import parse_auto_convert
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +202,10 @@ async def me(user: SessionUser, db: DbSession, settings: AppSettings):
         # The plan and the balance, so the shell shows them without a second request
         # (docs/billing.md § Routes).
         **await me_fields(db, settings, user.id),
+        # The parse agent's switch, so the Files page applies to a PDF or an image the cap
+        # the server will: a parse's while it converts them, a file's while it keeps them
+        # (docs/web.md § Files).
+        "auto_convert": await parse_auto_convert(db, user.id),
         # What the upload UI is allowed to send, from the server's own configuration —
         # a limit written twice is a limit that drifts (docs/api.md § Limits).
         "limits": {

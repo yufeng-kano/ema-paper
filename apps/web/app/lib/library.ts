@@ -199,18 +199,24 @@ export function typeAheadMatch(rows: { key: string; name: string }[], typed: str
 
 /**
  * The cap intake applies to this file, from the server's own numbers (`GET /api/me`
- * § limits): a markdown document's, a parse's for a PDF or an image, a file's for anything
- * else — which cap, never whether it is taken, since every kind is (docs/web.md § Files).
- * Null while the limits have not arrived, or where an older API names none.
+ * § limits): a markdown document's, a parse's for a PDF or an image while the parse agent
+ * converts them (`autoConvert`, its switch), a file's for anything else — the PDF or image
+ * kept as a file included. Which cap, never whether it is taken, since every kind is
+ * (docs/web.md § Files). Null while the limits have not arrived, or where an older API
+ * names none.
  */
-export function uploadCap(file: { name: string; type: string }, limits: UploadLimits | null): number | null {
+export function uploadCap(
+  file: { name: string; type: string },
+  limits: UploadLimits | null,
+  autoConvert = true,
+): number | null {
   if (!limits) {
     return null
   }
   if (isMarkdownUpload(file, limits)) {
     return limits.markdown_max_bytes ?? null
   }
-  if (acceptsUpload(file, limits)) {
+  if (autoConvert && acceptsUpload(file, limits)) {
     return limits.upload_max_bytes
   }
   return limits.file_max_bytes ?? null

@@ -297,6 +297,13 @@ describe('uploadCap', () => {
     expect(uploadCap({ name: 'mystery', type: '' }, limits)).toBe(5000)
   })
 
+  it('caps a PDF or an image as a file while the parse agent keeps them', () => {
+    expect(uploadCap({ name: 'paper.pdf', type: 'application/pdf' }, limits, false)).toBe(5000)
+    expect(uploadCap({ name: 'scan.jpg', type: 'image/jpeg' }, limits, false)).toBe(5000)
+    // Markdown is never parsed: the switch changes nothing for it.
+    expect(uploadCap({ name: 'notes.md', type: '' }, limits, false)).toBe(100)
+  })
+
   it('names no cap while the limits are loading, or where an older API has none', () => {
     expect(uploadCap({ name: 'demo.mov', type: 'video/quicktime' }, null)).toBeNull()
     expect(uploadCap({ name: 'demo.mov', type: 'video/quicktime' }, { ...limits, file_max_bytes: undefined })).toBeNull()
