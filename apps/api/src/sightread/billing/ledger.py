@@ -122,6 +122,32 @@ async def period_row(
     return row, period
 
 
+async def _take(
+    db: AsyncSession,
+    settings: Settings,
+    user_id: int,
+    amount: int,
+    need: int,
+    now: datetime | None,
+) -> Period:
+    """Add `amount` to the current period's `spent`, refusing when the balance is under
+    `need`. One conditional UPDATE is the guard (docs/billing.md § The ledger)."""
+    row, period = await period_row(db, settings, user_id, now)
+    taken = await db.execute(
+        update(CreditPeriod)
+        .where(
+            CreditPeriod.user_id == user_id,
+            CreditPeriod.period_start == period.start,
+            CreditPeriod.granted - CreditPeriod.spent >= need,
+        )
+        .values(spent=CreditPeriod.spent + amount, updated_at=utcnow())
+    )
+    await db.refresh(row)
+    if taken.rowcount != 1:
+        raise InsufficientCredits(need, row.granted - row.spent, period.end)
+    return period
+
+
 async def reserve(
     db: AsyncSession,
     settings: Settings,
@@ -136,22 +162,9 @@ async def reserve(
     now: datetime | None = None,
 ) -> CreditEntry:
     """Reserve `amount` credits of the current period for a job or a turn, refusing when
-    the balance is under `max(amount, minimum)`. One conditional UPDATE is the guard
-    (docs/billing.md § The ledger); the entry is inserted in the same transaction."""
-    row, period = await period_row(db, settings, user_id, now)
-    need = max(amount, minimum)
-    taken = await db.execute(
-        update(CreditPeriod)
-        .where(
-            CreditPeriod.user_id == user_id,
-            CreditPeriod.period_start == period.start,
-            CreditPeriod.granted - CreditPeriod.spent >= need,
-        )
-        .values(spent=CreditPeriod.spent + amount, updated_at=utcnow())
-    )
-    if taken.rowcount != 1:
-        await db.refresh(row)
-        raise InsufficientCredits(need, row.granted - row.spent, period.end)
+    the balance is under `max(amount, minimum)`; the entry is inserted in the same
+    transaction."""
+    period = await _take(db, settings, user_id, amount, max(amount, minimum), now)
     entry = CreditEntry(
         user_id=user_id,
         period_start=period.start,
@@ -164,8 +177,28 @@ async def reserve(
     )
     db.add(entry)
     await db.flush()
-    await db.refresh(row)
     return entry
+
+
+async def reserve_again(
+    db: AsyncSession, settings: Settings, job_id: uuid.UUID, now: datetime | None = None
+) -> None:
+    """A retry takes back the credits its job's failure released, from the current period
+    and dated now, so a document is charged once, by the run that delivers it
+    (docs/billing.md § A parse). A job with no entry — queued before the ledger — or one
+    not released is left as it is."""
+    entry = (
+        await db.execute(select(CreditEntry).where(CreditEntry.job_id == job_id).with_for_update())
+    ).scalar_one_or_none()
+    if entry is None or entry.state != RELEASED:
+        return
+    now = now or utcnow()
+    period = await _take(db, settings, entry.user_id, entry.amount, entry.amount, now)
+    entry.period_start = period.start
+    entry.state = RESERVED
+    entry.created_at = now
+    entry.settled_at = None
+    await db.flush()
 
 
 async def _move_spent(db: AsyncSession, entry: CreditEntry, delta: int) -> None:

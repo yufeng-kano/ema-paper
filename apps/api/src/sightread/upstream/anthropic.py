@@ -10,6 +10,7 @@ raises so the runner's failure policy has one vocabulary.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -37,6 +38,9 @@ STREAM_TIMEOUT_SECONDS = 600.0
 # the second is refused outright. The runner passes the deployment's values.
 DEFAULT_SSE_LINE_MAX_BYTES = 4 * 1024 * 1024
 DEFAULT_CONTENT_BLOCKS_MAX = 4096
+# The output of a call cut short is estimated from what streamed, one token per this many
+# bytes of UTF-8 (docs/chat.md § Conversations, turns, events).
+ESTIMATED_BYTES_PER_TOKEN = 3
 # The error types the Messages API documents; anything else is reported as "error".
 KNOWN_ERROR_TYPES = frozenset(
     {
@@ -86,6 +90,37 @@ class CompletedMessage:
     # Tool-use blocks whose input never parsed: the runner answers them with an error
     # result rather than running something half-formed.
     malformed_tool_uses: set[str] = field(default_factory=set)
+
+
+@dataclass
+class StreamProgress:
+    """What a stream has reported and sent so far, kept as it arrives: the bill of a call
+    that ends before its `message_stop` — a Stop, the turn's timeout, a stream that broke
+    (docs/chat.md § Conversations, turns, events)."""
+
+    started: bool = False
+    # message_start's usage, with the input figures a message_delta reported since.
+    usage: dict = field(default_factory=dict)
+    # The output tokens a message_delta reported; 0 until one does.
+    output_tokens: int = 0
+    # UTF-8 bytes of the text, thinking and tool input streamed so far.
+    output_bytes: int = 0
+
+    def usage_so_far(self) -> ChatUsage | None:
+        """None before message_start: nothing was generated the runner can know of. The
+        output is the reported count, else the estimate; the cost is unknown, since no
+        figure covers the call as it was cut."""
+        if not self.started:
+            return None
+        return ChatUsage(
+            input_tokens=_int(self.usage.get("input_tokens")),
+            output_tokens=self.output_tokens
+            or math.ceil(self.output_bytes / ESTIMATED_BYTES_PER_TOKEN),
+            cache_read_tokens=_int(self.usage.get("cache_read_input_tokens")),
+            cache_write_tokens=_int(self.usage.get("cache_creation_input_tokens")),
+            cost=None,
+            cost_source=COST_SOURCE_UNKNOWN,
+        )
 
 
 def _int(value: object) -> int:
@@ -214,10 +249,15 @@ async def stream_messages(
     line_max_bytes: int = DEFAULT_SSE_LINE_MAX_BYTES,
     blocks_max: int = DEFAULT_CONTENT_BLOCKS_MAX,
     timeout: float = STREAM_TIMEOUT_SECONDS,
+    progress: StreamProgress | None = None,
 ) -> AsyncIterator[StreamEvent | CompletedMessage]:
     """Stream one Messages request. Yields `StreamEvent`s, then exactly one
     `CompletedMessage` last — unless the upstream fails, in which case it raises. The
-    bounds are the deployment's (`UPSTREAM_*`, docs/chat.md § Upstream)."""
+    bounds are the deployment's (`UPSTREAM_*`, docs/chat.md § Upstream). `progress`, when
+    given, follows the stream as it arrives, so a caller that drops it still knows what
+    the call used."""
+    if progress is None:
+        progress = StreamProgress()
     headers = {
         "Authorization": f"Bearer {connection.api_key}",
         "x-api-key": connection.api_key,
@@ -235,8 +275,6 @@ async def stream_messages(
     stop_reason: str | None = None
     stop_details: dict | None = None
     model: str | None = None
-    start_usage: dict = {}
-    output_tokens = 0
     finished = False
 
     try:
@@ -255,7 +293,8 @@ async def stream_messages(
                 if kind == "message_start":
                     message = data.get("message") or {}
                     model = message.get("model") if isinstance(message.get("model"), str) else None
-                    start_usage = message.get("usage") or {}
+                    progress.started = True
+                    progress.usage = message.get("usage") or {}
                 elif kind == "content_block_start":
                     index = _index(data)
                     # Blocks arrive in order, each exactly the next one; an index that
@@ -291,10 +330,12 @@ async def stream_messages(
                     if delta_type == "text_delta":
                         text = str(delta.get("text") or "")
                         block["text"] = block.get("text", "") + text
+                        progress.output_bytes += len(text.encode())
                         yield StreamEvent("text_delta", index, text=text)
                     elif delta_type == "thinking_delta":
                         text = str(delta.get("thinking") or "")
                         block["thinking"] = block.get("thinking", "") + text
+                        progress.output_bytes += len(text.encode())
                         if text:
                             yield StreamEvent("thinking_delta", index, text=text)
                     elif delta_type == "signature_delta":
@@ -302,9 +343,9 @@ async def stream_messages(
                             delta.get("signature") or ""
                         )
                     elif delta_type == "input_json_delta":
-                        partial_json.setdefault(index, []).append(
-                            str(delta.get("partial_json") or "")
-                        )
+                        partial = str(delta.get("partial_json") or "")
+                        partial_json.setdefault(index, []).append(partial)
+                        progress.output_bytes += len(partial.encode())
                 elif kind == "content_block_stop":
                     index = _index(data)
                     if index >= len(blocks):
@@ -331,7 +372,9 @@ async def stream_messages(
                     if isinstance(delta.get("stop_details"), dict):
                         stop_details = delta["stop_details"]
                     usage = data.get("usage") or {}
-                    output_tokens = _int(usage.get("output_tokens")) or output_tokens
+                    progress.output_tokens = (
+                        _int(usage.get("output_tokens")) or progress.output_tokens
+                    )
                     # Some servers report the final input figures here as well.
                     for key in (
                         "input_tokens",
@@ -340,7 +383,7 @@ async def stream_messages(
                         "cost",
                     ):
                         if key in usage:
-                            start_usage[key] = usage[key]
+                            progress.usage[key] = usage[key]
                 elif kind == "message_stop":
                     finished = True
                 elif kind == "error":
@@ -370,7 +413,7 @@ async def stream_messages(
         content=[block for block in blocks if block],
         stop_reason=stop_reason,
         stop_details=stop_details,
-        usage=_usage(start_usage, output_tokens=output_tokens),
+        usage=_usage(progress.usage, output_tokens=progress.output_tokens),
         model=model,
         malformed_tool_uses=malformed,
     )

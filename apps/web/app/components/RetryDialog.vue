@@ -4,19 +4,23 @@
  * dialog lists the pages a retry would send — each as the original shows it, with why it
  * failed and on which model — the model to send them to, and the retry itself.
  *
- * Only the pages without a result go; the ones that succeeded are kept and not paid for
- * again. A parse that failed only its format check has every page: its retry sends none, so
- * the dialog asks for no model and is titled for the whole document. The page opens the
- * document by itself once the retry has every page and its check. A failed re-convert's
- * retry — its document carries it as `reconvert` — replaces the version the document has
- * instead, which opens all along (docs/jobs.md § Re-converting a document).
+ * Only the pages without a result go; the ones that succeeded are kept. The retry reserves
+ * the parse's credits again, charged only if it succeeds, and a balance that cannot cover
+ * them is the credits dialog's to say (docs/billing.md § A parse). A parse that failed only
+ * its format check has every page: its retry sends none, so the dialog asks for no model
+ * and is titled for the whole document. The page opens the document by itself once the
+ * retry has every page and its check. A failed re-convert's retry — its document carries
+ * it as `reconvert` — replaces the version the document has instead, which opens all along
+ * (docs/jobs.md § Re-converting a document).
  */
 import {
+  creditsRefusalOf,
   getDocumentPages,
   listAgentModels,
   listAgents,
   retryDocument,
   type ConnectionModel,
+  type CreditsRefusal,
   type DocumentPage,
   type LibraryDocument,
 } from '~/lib/api'
@@ -27,7 +31,7 @@ const CHECK_AGENT = 'check'
 
 const props = defineProps<{ document: LibraryDocument }>()
 
-const emit = defineEmits<{ close: []; retried: [] }>()
+const emit = defineEmits<{ close: []; retried: []; refused: [refusal: CreditsRefusal] }>()
 
 const { t } = useI18n()
 const { resolve } = useApiError()
@@ -129,6 +133,11 @@ async function retry() {
     await retryDocument(props.document.id, missing.value.length ? model.value || null : null)
     emit('retried')
   } catch (error) {
+    const refusal = creditsRefusalOf(error)
+    if (refusal) {
+      emit('refused', refusal)
+      return
+    }
     retryError.value = await resolve(error)
   } finally {
     busy.value = false
@@ -185,6 +194,7 @@ async function retry() {
           t(replacing ? 'files.retry.noteReconvertWhole' : checkOn ? 'files.retry.noteCheck' : 'files.retry.noteWhole')
         }}
       </p>
+      <p class="note">{{ t('files.retry.charge') }}</p>
       <UiBanner v-if="retryError" tone="error">{{ retryError }}</UiBanner>
     </div>
 

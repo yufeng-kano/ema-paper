@@ -57,6 +57,7 @@ from ..jobs.intake import (
     capped_stream,
     checked_parse_model,
     file_chunks,
+    insufficient_credits,
     resolve_check,
     store_upload,
     submit_parse,
@@ -1984,6 +1985,9 @@ async def retry_document(
         model = checked_parse_model(settings, model)
     root = user_root(settings.workspaces_dir, user.id)
     async with workspace_lock(root):
+        # The user's row before the job's, the one order (docs/workspace.md § Revisions):
+        # the retry takes the job's credits back under it (docs/billing.md § A parse).
+        await db.execute(select(User.id).where(User.id == user.id).with_for_update())
         row = await live_document(db, user.id, document_id)
         if row.job_id is None:
             raise ApiError(404, "invalid_request", "A markdown document has no parse to retry")
@@ -2001,6 +2005,13 @@ async def retry_document(
                 "invalid_request",
                 "This document kept no original to parse again; upload the file again",
             )
+        try:
+            # The credits the failure released, reserved again for this run: the
+            # document is charged once, by the run that delivers it (docs/billing.md
+            # § A parse). Taken before the copy, so a refusal costs no copy either.
+            await ledger.reserve_again(db, settings, job.id)
+        except ledger.InsufficientCredits as exc:
+            raise insufficient_credits(exc) from exc
         upload_dir = Path(settings.upload_dir)
         upload_dir.mkdir(parents=True, exist_ok=True)
         copy = upload_dir / f"{job.id}.retry-{uuid.uuid4().hex[:12]}{original.suffix}"

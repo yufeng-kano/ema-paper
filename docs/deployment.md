@@ -129,7 +129,7 @@ connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'
 | `SUPPORT_EMAIL`, `OPERATOR_NAME` | the address the public Terms, Privacy and Refund pages name for questions, deletion and refund requests, and the name of who operates the service; both served by `GET /api/site`, either empty = the pages print no such line ([web.md](./web.md) § Pages). Dodo's site review needs the address |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | OIDC |
 | `AUTH_DEV_MODE` | local only; absent from `.env.production.example` |
-| `UPLOAD_MAX_BYTES`, `PAGE_CAP`, `MAX_JOBS_PER_USER`, `UPLOAD_RETRY_WINDOW_SECONDS`, `VISION_CONCURRENCY_PER_JOB`, `RENDER_WORKERS` | defaults in [api.md](./api.md) / [jobs.md](./jobs.md) |
+| `UPLOAD_MAX_BYTES`, `PAGE_CAP`, `MAX_JOBS_PER_USER`, `UPLOAD_RETRY_WINDOW_SECONDS`, `VISION_CONCURRENCY_PER_JOB`, `VISION_MAX_OUTPUT_TOKENS`, `RENDER_WORKERS` | defaults in [api.md](./api.md) / [jobs.md](./jobs.md) |
 | `UPLOAD_DIR` | `/data/uploads` in containers |
 | `WORKSPACES_HOST_DIR` / `WORKSPACES_DIR` | the per-user workspaces: the host directory compose bind-mounts, and where the containers see it (`/data/workspaces`). The runner is given the host path (`SANDBOX_WORKSPACES_DIR`) because it hands it to `docker run` ([workspace.md](./workspace.md), [sandbox.md](./sandbox.md)) |
 | `WORKSPACE_QUOTA_BYTES` | the ceiling every plan's storage, Free's included, must fit under (default 10 GiB); the UI shows and the API enforces the user's plan's cap ([billing.md](./billing.md) § Plans) |

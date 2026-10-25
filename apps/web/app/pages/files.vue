@@ -2629,6 +2629,7 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
       :key="retrying.id"
       :document="retrying"
       @retried="onRetried"
+      @refused="creditsRefusal = $event; retrying = null"
       @close="retrying = null"
     />
 

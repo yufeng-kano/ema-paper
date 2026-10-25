@@ -382,7 +382,7 @@ async def run_subagent(
         # conversation's (docs/chat.md § Subagents).
         if not completed.model:
             completed.model = model
-        await chat_runner._record_usage_settled(ctx, completed)
+        await chat_runner._record_usage_settled(ctx, completed.model, completed.usage)
         if await chat_runner._cancelled(ctx):
             raise chat_runner.TurnCancelled()
         if completed.model and completed.model != model:

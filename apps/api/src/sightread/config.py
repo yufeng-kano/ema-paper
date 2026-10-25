@@ -96,6 +96,9 @@ class Settings(BaseSettings):
     # recently (docs/jobs.md § Dedup).
     upload_retry_window_seconds: int = 60
     vision_concurrency_per_job: int = 8
+    # The tokens one vision call's answer may take; 0 sends no cap (docs/parsing.md
+    # § Upstream usage).
+    vision_max_output_tokens: int = 16_000
     render_workers: int = 0  # 0 means "CPU count", resolved by the worker
     upload_dir: str = "/data/uploads"
     # How old an entry of the upload directory may grow before the sweeper takes it, an

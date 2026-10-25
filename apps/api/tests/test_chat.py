@@ -3243,13 +3243,13 @@ async def test_a_usage_row_is_written_through_a_cancel(monkeypatch) -> None:
     release = asyncio.Event()
     recorded: list[str] = []
 
-    async def slow_record(ctx, completed):
+    async def slow_record(ctx, model, usage):
         started.set()
         await release.wait()
-        recorded.append(completed)
+        recorded.append(usage)
 
     monkeypatch.setattr(chat_runner, "_record_usage", slow_record)
-    task = asyncio.create_task(chat_runner._record_usage_settled(None, "the call"))
+    task = asyncio.create_task(chat_runner._record_usage_settled(None, "claude-x", "the call"))
     await started.wait()
     task.cancel()
     await asyncio.sleep(0)

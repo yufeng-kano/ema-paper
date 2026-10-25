@@ -28,6 +28,8 @@ CHAT_TIMEOUT_SECONDS = 180.0
 # Fallback body cap when a caller has no Settings at hand; the deployed value is
 # UPSTREAM_RESPONSE_MAX_BYTES (config.py), threaded in by control routes and the worker.
 DEFAULT_RESPONSE_MAX_BYTES = 33_554_432
+# Likewise the answer's token cap; the deployed value is VISION_MAX_OUTPUT_TOKENS.
+DEFAULT_MAX_OUTPUT_TOKENS = 16_000
 
 DATA_URL_MEDIA_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}
 
@@ -347,7 +349,12 @@ def _raise_for_error_payload(payload: dict) -> None:
 
 
 async def _chat_with_image(
-    connection: Connection, model: str, prompt: str, image: Path, max_bytes: int
+    connection: Connection,
+    model: str,
+    prompt: str,
+    image: Path,
+    max_bytes: int,
+    max_output_tokens: int,
 ) -> tuple[str, Usage]:
     body: dict = {
         "model": model,
@@ -361,6 +368,10 @@ async def _chat_with_image(
             }
         ],
     }
+    if max_output_tokens > 0:
+        # A prompt asking for endless output costs at most this per call; the answer that
+        # reaches it is a page cut off (docs/parsing.md § Upstream usage).
+        body["max_tokens"] = max_output_tokens
     try:
         async with (
             httpx.AsyncClient(timeout=CHAT_TIMEOUT_SECONDS) as client,
@@ -415,6 +426,7 @@ async def transcribe_page(
     *,
     convention: BboxConvention = bbox.DEFAULT,
     max_response_bytes: int = DEFAULT_RESPONSE_MAX_BYTES,
+    max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
 ) -> PageTranscription:
     """Transcribe one rendered page. The answer's figure placeholders come back in the
     stored contract, whatever convention the model was asked for (agents/bbox.py).
@@ -429,7 +441,9 @@ async def transcribe_page(
         .replace("{page}", str(page_no))
         .replace("{bbox_format}", convention.format)
     )
-    text, usage = await _chat_with_image(connection, model, prompt, image, max_response_bytes)
+    text, usage = await _chat_with_image(
+        connection, model, prompt, image, max_response_bytes, max_output_tokens
+    )
     markdown = bbox.canonicalize(_unwrap_answer(text), convention, width_px, height_px)
     return PageTranscription(markdown=markdown, usage=usage)
 
@@ -441,9 +455,12 @@ async def ask_about_page(
     image: Path,
     *,
     max_response_bytes: int = DEFAULT_RESPONSE_MAX_BYTES,
+    max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
 ) -> PageTranscription:
     """One more question about a page image, the figure check's (docs/parsing.md § Figure
     check), on the same wire as its transcription. The answer's text comes back as it is,
     in the shape a transcription has, so the runner's failure policy reads both alike."""
-    text, usage = await _chat_with_image(connection, model, prompt, image, max_response_bytes)
+    text, usage = await _chat_with_image(
+        connection, model, prompt, image, max_response_bytes, max_output_tokens
+    )
     return PageTranscription(markdown=text, usage=usage)

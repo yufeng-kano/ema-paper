@@ -183,6 +183,8 @@ class RunState:
     job_id: str = ""
     # UPSTREAM_RESPONSE_MAX_BYTES, carried here so page tasks need no Settings.
     max_response_bytes: int = 33_554_432
+    # VISION_MAX_OUTPUT_TOKENS, likewise (docs/parsing.md § Upstream usage).
+    max_output_tokens: int = 16_000
     payment_failures: int = 0
     # This job's own directory under FIGURES_DIR; None turns crop persistence off
     # (docs/parsing.md § Figure crops).
@@ -381,6 +383,7 @@ async def _transcribe(
                     page_no,
                     convention=convention,
                     max_response_bytes=state.max_response_bytes,
+                    max_output_tokens=state.max_output_tokens,
                 ),
             )
         finally:
@@ -445,6 +448,7 @@ async def _check_figures(
                         check_prompt(boxes, convention, sent.width_px, sent.height_px),
                         marked,
                         max_response_bytes=state.max_response_bytes,
+                        max_output_tokens=state.max_output_tokens,
                     ),
                 )
             finally:
@@ -1184,6 +1188,7 @@ async def run_job(
         budget=VisionBudget(settings.vision_concurrency_per_job),
         job_id=str(job.id),
         max_response_bytes=settings.upstream_response_max_bytes,
+        max_output_tokens=settings.vision_max_output_tokens,
         figures_dir=figures_root / attempt,
         figures_per_page=settings.figures_per_page_max,
         figure_check_rounds=settings.figure_check_rounds,
