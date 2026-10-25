@@ -3570,9 +3570,36 @@ function onResize(event: PointerEvent) {
   const width = drag.width + (drag.column === 'notes' ? moved : -moved)
   // Below half its minimum the card goes, live, and the document takes its room; dragged
   // back past that line it returns at its minimum.
-  dragHidden.value = collapses(drag.column, width) ? drag.column : null
-  if (!dragHidden.value) {
+  const hidden = collapses(drag.column, width) ? drag.column : null
+  if (hidden !== dragHidden.value) {
+    if (hidden) {
+      holdFocus(hidden)
+    } else {
+      void giveFocusBack()
+    }
+    dragHidden.value = hidden
+  }
+  if (!hidden) {
     setColumnWidth(drag.column, width)
+  }
+}
+
+/** What held focus in the card a drag hid: hiding a card drops its focus to the page, where
+ *  the next Escape would close the viewer, so it is given back as the card returns. */
+let heldFocus: HTMLElement | null = null
+
+function holdFocus(column: Column) {
+  const card = columnsBox.value?.querySelector(`aside.${column}`)
+  const active = document.activeElement
+  heldFocus = card && active instanceof HTMLElement && card.contains(active) ? active : null
+}
+
+async function giveFocusBack() {
+  const held = heldFocus
+  heldFocus = null
+  await nextTick()
+  if (held?.isConnected && (!document.activeElement || document.activeElement === document.body)) {
+    held.focus({ preventScroll: true })
   }
 }
 
@@ -3593,6 +3620,8 @@ function endResize() {
   const hidden = dragHidden.value === drag.column
   stopResize()
   if (hidden) {
+    // Closed, as its close button closes it: the toggle takes the focus (`closeColumn`).
+    heldFocus = null
     void closeColumn(drag.column)
   } else if (columnWidth[drag.column].value !== drag.width) {
     chooseWidth(drag.column, columnWidth[drag.column].value)
@@ -3603,8 +3632,12 @@ function endResize() {
 function cancelResize() {
   const drag = resizing.value
   if (drag) {
+    const hidden = dragHidden.value === drag.column
     stopResize()
     columnWidth[drag.column].value = drag.width
+    if (hidden) {
+      void giveFocusBack()
+    }
   }
 }
 
