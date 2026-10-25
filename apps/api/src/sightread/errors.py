@@ -24,6 +24,8 @@ ErrorType = Literal[
     "storage_full",
     "checkout_unavailable",
     "pay_unavailable",
+    "subscription_active",
+    "checkout_open",
     "upstream",
     "internal",
 ]

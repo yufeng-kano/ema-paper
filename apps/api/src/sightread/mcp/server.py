@@ -59,7 +59,7 @@ NOTES = (
     "`meta.job_id`). A dedup hit ends the stream at once. The ticket is good for one "
     "upload and then only for reading the job it created: once it is spent or expired, "
     "call `parse` again for a fresh one and re-upload the same file — the cached result "
-    "comes back instantly."
+    "comes back instantly while the parse is kept."
 )
 
 # The authenticated user for the request being served. Set by the ASGI guard below and read
@@ -129,7 +129,15 @@ def build_server(app: FastAPI) -> MCPServer:
                 f'f=doc.pdf; curl -s {auth} {base}/v1/jobs/last/result -o "${{f%.*}}.meta.json"'
             ),
             "status": f"curl -s {auth} {base}/v1/jobs/last",
-            "notes": NOTES,
+            # A connector's parse is in no library, so the retention deletes it; how soon
+            # is the deployment's own setting (docs/mcp.md § The one tool, docs/jobs.md
+            # § Retention).
+            "notes": (
+                NOTES
+                if settings.parse_retention_days == 0
+                else f"{NOTES} A parse is kept {settings.parse_retention_days} days after it "
+                "finishes and then deleted: the .md you landed is the copy that lasts."
+            ),
         }
 
     return server

@@ -1605,32 +1605,6 @@ async def test_a_materialization_whose_commit_fails_is_written_again(
         assert git.log(paths.root)[0].message.startswith("materialize")
 
 
-async def test_inheriting_an_original_notices_a_row_deleted_meanwhile(
-    sessionmaker, tmp_path
-) -> None:
-    settings = _settings(tmp_path)
-    async with sessionmaker() as db:
-        user, first = await _seed(db)
-        job = (await db.execute(select(Job).where(Job.id == first.job_id))).scalar_one()
-        root = user_root(settings.workspaces_dir, user.id)
-        upload = tmp_path / "upload.pdf"
-        upload.write_bytes(b"%PDF-1.4")
-        documents.keep_source(root, Path("files/Papers/paper.pdf"), upload, document_id=first.id)
-        second = Document(
-            user_id=user.id, folder_id=first.folder_id, job_id=first.job_id, name="again.pdf"
-        )
-        db.add(second)
-        await db.commit()
-        second_id = second.id
-        # Another tab deleted the new row before the copy took the lock.
-        async with sessionmaker() as other:
-            await other.delete(await other.get(Document, second_id))
-            await other.commit()
-        assert await documents.inherit_original(db, settings, second, job) is False
-        assert documents.original_of(root, second_id) is None
-        assert documents.original_of(root, first.id) is not None
-
-
 async def test_reconcile_records_an_empty_folder_the_shell_made(sessionmaker, tmp_path) -> None:
     settings = _settings(tmp_path)
     async with sessionmaker() as db:

@@ -132,7 +132,9 @@ async def test_parse_mints_a_ticket_and_ready_to_run_commands(api_client, sessio
         "sightread://pPAGE/YMIN,XMIN,YMAX,XMAX",
     ):
         assert fragment in payload["notes"]
-    assert "cached result comes back instantly" in payload["notes"]
+    assert "cached result comes back instantly while the parse is kept" in payload["notes"]
+    # The parse is deleted after the retention: the landed file is what lasts.
+    assert "kept 30 days after it finishes and then deleted" in payload["notes"]
     # Profiles are gone; an agent told to send one would get a silently ignored field.
     assert "profile" not in payload["notes"]
 

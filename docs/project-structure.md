@@ -30,7 +30,9 @@ agent-sightread/
                               # attachments.py (the chat composer's files, prepared)
         workspace/            # the per-user file tree and its git revisions
                               # (docs/workspace.md): layout.py, git.py, documents.py,
-                              # reconcile.py
+                              # reconcile.py, trash.py (deleting for good: Empty Trash
+                              # and the Trash's expiry, one function), accounts.py (a
+                              # deleted account's marker and files)
         sandbox/              # client.py: the HTTP client of the sandbox runner
         upstream/             # anthropic.py (Messages API over Kano Proxy, streaming,
                               # tools — the chat agent's client, docs/chat.md);
@@ -74,6 +76,7 @@ agent-sightread/
 - `routes/*` and `mcp/*` are thin: validation + auth + calls into `jobs`/`parsing` services. MCP owns zero business logic. `jobs/intake.py` is the shared sequence **all three** entry points run (store → hash → probe → dedup → enqueue), so REST, MCP and the web library's upload cannot drift apart — `routes/library.py` adds a name and a folder to the job that sequence returns, nothing more.
 - `parsing/poppler.py` is the **only** place that spawns Poppler; everything else consumes its typed results. No PDF library imports anywhere (AGPL ban, [parsing.md](./parsing.md)).
 - `upstream/` is the only package that talks to the upstream, Kano Proxy on the operator's key: `client.py` for vision calls and the catalog, `anthropic.py` for the chat and check agents' Messages API calls — the only modules that ever read `KANO_PROXY_API_KEY`.
+- Nothing in `jobs/` or `workspace/` imports from `routes/`: what a route and the worker both run — *Empty Trash* and the Trash's expiry, the locks and the commit-then-discard they share — lives in `workspace/`, and the routes import it from there.
 - `workspace/` is the only package that touches `WORKSPACES_DIR` and the only one that runs git; `sandbox/client.py` is the only module that calls the runner. The runner (`apps/sandbox`) is the only process with the Docker socket.
 - `agents/` defines agents and nothing else: no HTTP, no database. Runners and settings consume its definitions ([agents.md](./agents.md)).
 - `jobs/queue.py` is the only module that knows the queue is Postgres.

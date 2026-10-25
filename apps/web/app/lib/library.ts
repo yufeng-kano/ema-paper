@@ -19,13 +19,6 @@ export type FolderId = number | null
 export const FOLDER_NAME_MAX = 255
 export const DOCUMENT_NAME_MAX = 512
 
-/** One line of the rail's tree: the folder, how deep it sits, and whether it opens. */
-export interface TreeRow {
-  folder: LibraryFolder
-  depth: number
-  hasChildren: boolean
-}
-
 /**
  * Names sort the way a file manager sorts them: case-insensitively, and with runs of
  * digits compared as numbers so "Page 2" precedes "Page 10".
@@ -43,31 +36,7 @@ export function documentsIn(documents: LibraryDocument[], folder: FolderId): Lib
 }
 
 /**
- * The tree as a flat list of rows — the shape a rail can render and a keyboard can walk.
- *
- * A collapsed folder contributes its own row and nothing below it, which is what makes
- * `expanded` the only state the tree needs.
- */
-export function flattenTree(
-  folders: LibraryFolder[],
-  expanded: ReadonlySet<number>,
-  parent: FolderId = null,
-  depth = 0,
-): TreeRow[] {
-  const rows: TreeRow[] = []
-  for (const folder of childFolders(folders, parent)) {
-    const children = childFolders(folders, folder.id)
-    rows.push({ folder, depth, hasChildren: children.length > 0 })
-    if (expanded.has(folder.id)) {
-      rows.push(...flattenTree(folders, expanded, folder.id, depth + 1))
-    }
-  }
-  return rows
-}
-
-/**
- * The path from the root down to `id`, root first — the breadcrumb, and the set of folders
- * that must be expanded for the open one to be visible.
+ * The path from the root down to `id`, root first — the breadcrumb.
  *
  * The `seen` guard is not paranoia about the server: it is what stops a cycle that should
  * be impossible from hanging the page instead of showing a short path.
@@ -130,15 +99,6 @@ export function isPending(document: LibraryDocument): boolean {
  *  § Re-converting a document). */
 export function isReconverting(document: LibraryDocument): boolean {
   return !!document.reconvert && document.reconvert.status !== 'failed'
-}
-
-/** 0..1 of the pages that came back, for the meter on a running row — its parse's, or its
- *  re-convert's. */
-export function parseProgress(document: Pick<LibraryDocument, 'page_count' | 'pages_done'>): number {
-  if (!document.page_count || document.pages_done === null) {
-    return 0
-  }
-  return Math.min(1, Math.max(0, document.pages_done / document.page_count))
 }
 
 /** How many pages the retry dialog draws; the rest are a count (docs/web.md § Files). */

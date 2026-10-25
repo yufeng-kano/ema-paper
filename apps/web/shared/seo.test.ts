@@ -51,7 +51,7 @@ describe('robots.txt', () => {
 
   it('keeps crawlers off the authed pages and the sign-in redirect, in both locales', () => {
     const rules = disallowed(robotsTxt(ORIGIN))
-    for (const path of ['/files', '/history', '/settings/usage', '/zh-TW/files', '/zh-TW/settings/keys', '/api/auth/login']) {
+    for (const path of ['/files', '/settings/usage', '/zh-TW/files', '/zh-TW/settings/keys', '/api/auth/login']) {
       expect(rules.some((rule) => path.startsWith(rule))).toBe(true)
     }
   })

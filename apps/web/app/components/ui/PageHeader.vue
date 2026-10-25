@@ -4,16 +4,16 @@
  *
  * The title is the screen's name in the system's large-title style — or, through the
  * `title` slot, something made of more than a string, as the file library's breadcrumb is;
- * the default slot is the quiet line beside it on the same baseline — a count, a tally —
- * never a sentence explaining what the screen is for (docs/web.md § Design system, *The
- * frame*).
+ * the default slot is the quiet line beside it on the same baseline — a count, a tally, a
+ * fact about the list — never a sentence explaining what the screen is for (docs/web.md
+ * § Design system, *The frame*).
  */
 defineProps<{ title?: string }>()
 
 defineSlots<{
   /** In place of the title's text: a breadcrumb. */
   title?: () => unknown
-  /** Beside the title: a count or a tally, in the muted color. */
+  /** Beside the title: a count, a tally or a fact about the list, in the muted color. */
   default?: () => unknown
 }>()
 </script>

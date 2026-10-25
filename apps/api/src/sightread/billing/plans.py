@@ -12,6 +12,8 @@ from ..db.models import Subscription
 
 FREE_PLAN_ID = "free"
 PAID_STATUSES = frozenset({"active", "trialing"})
+# A subscription in one of these renews no more, whatever `cancel_at_period_end` says.
+ENDED_STATUSES = frozenset({"canceled", "expired", "failed"})
 
 
 @dataclass(frozen=True)

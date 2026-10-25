@@ -666,59 +666,6 @@ def copy_original(root: Path, source_id: int, target_id: int) -> bool:
     return True
 
 
-async def inherit_original(
-    db: AsyncSession, settings: Settings, document: Document, job: Job, *, locked: bool = False
-) -> bool:
-    """A parse filed again from the History page: its upload went to the first document
-    filed from it, so the new one takes a copy of that original — from any document of
-    the parse that holds one — and, when none does but the upload is still there (the
-    worker left it for a row that had not landed), takes the upload as `adopt_source`
-    does (docs/workspace.md § Layout). False when the row is gone by the time the lock
-    is held: another tab deleted it, and no original is kept under an id with no row."""
-    root = user_root(settings.workspaces_dir, document.user_id)
-    # The siblings, the quota and the copy under the workspace lock, as retention takes
-    # them: a delete of the last sibling holds the same lock, so it cannot take the
-    # original away between the look and the copy, and two filings at once cannot both
-    # measure the room and both take it (§ Quota). `locked`: the caller holds it.
-    async with contextlib.nullcontext() if locked else workspace_lock(root):
-        try:
-            await db.refresh(document)
-        except InvalidRequestError:
-            return False  # deleted since it was filed; a delete holds this lock
-        if original_of(root, document.id) is not None:
-            # Retention got here first: the row was among the recipients it read.
-            return True
-        siblings = list(
-            (
-                await db.execute(
-                    select(Document.id)
-                    .where(Document.job_id == job.id, Document.id != document.id)
-                    .order_by(Document.id)
-                )
-            ).scalars()
-        )
-        if siblings:
-            try:
-                await ensure_within_quota(db, settings, document.user_id, root)
-            except ApiError:
-                logger.warning(
-                    "workspace of user %d is at its quota; document %d keeps no original",
-                    document.user_id,
-                    document.id,
-                )
-                return True
-            for sibling_id in siblings:
-                if await asyncio.to_thread(copy_original, root, sibling_id, document.id):
-                    return True
-    try:
-        # No commit of its own: the filing commits the row and the job together, through
-        # the verified commit every filing takes (docs/workspace.md § Revisions).
-        await adopt_source(db, settings, document, job, locked=locked, commit=False)
-    except InvalidRequestError:
-        return False
-    return True
-
-
 def _discard_originals(root: Path, document_ids: list[int]) -> None:
     for document_id in document_ids:
         while (original := original_of(root, document_id)) is not None:
@@ -742,7 +689,6 @@ async def adopt_source(
     *,
     upload: Path | None = None,
     locked: bool = False,
-    commit: bool = True,
 ) -> None:
     """The library row arrived after its parse finished, so the worker found no document
     to keep the upload for and left it in place — or the parse was answered from the
@@ -750,9 +696,7 @@ async def adopt_source(
     for itself (docs/jobs.md § Retention): take it now. A copy that fails, or that the
     quota refuses (`ApiError`, 409), leaves nothing behind — the original and the shell's
     copy go — since the caller rolls the row back and no file may stay for a row that is
-    gone (docs/workspace.md § Layout). `locked`: the caller holds the workspace lock.
-    `commit`: whether the job's `source_deleted_at` is committed here; a filing passes
-    False and commits the row and the job together, through its own verified commit."""
+    gone (docs/workspace.md § Layout). `locked`: the caller holds the workspace lock."""
     if upload is not None:
         source = upload
     else:
@@ -799,8 +743,7 @@ async def adopt_source(
             raise
     if upload is None:
         job.source_deleted_at = utcnow()
-        if commit:
-            await db.commit()
+        await db.commit()
 
 
 def _keep_markdown(root: Path, upload: Path, document_id: int) -> None:
@@ -1918,6 +1861,18 @@ async def discard_trash(settings: Settings, user_id: int, names: Iterable[str]) 
     """The entries of items deleted for good, once their rows are gone."""
     root = user_root(settings.workspaces_dir, user_id)
     await asyncio.to_thread(_discard_entries, root, list(names))
+
+
+def _discard_results(root: Path, job_ids: list[uuid.UUID]) -> None:
+    for job_id in job_ids:
+        safe_io.remove_tree(root, results_root(root) / str(job_id))
+
+
+async def discard_results(settings: Settings, user_id: int, job_ids: Iterable[uuid.UUID]) -> None:
+    """The workspace copies, `.sightread/results/{job_id}/`, of parses the retention
+    deletes (docs/jobs.md § Retention). The caller holds the workspace lock."""
+    root = user_root(settings.workspaces_dir, user_id)
+    await asyncio.to_thread(_discard_results, root, list(job_ids))
 
 
 # --- copies -------------------------------------------------------------------------------

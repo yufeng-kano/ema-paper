@@ -2021,11 +2021,15 @@ async def test_a_shell_revision_beyond_the_document_waits_for_every_turn(chattin
     settings = chatting.app.state.settings
     async with chatting.app.state.sessionmaker() as db:
         first = await db.get(Document, first_id)
-        job_id = first.job_id
+        job_id, folder_id = first.job_id, first.folder_id
+    # A copy: a second document on the same parse.
     second = await chatting.post(
-        "/api/library/documents/from-job", json={"job_id": str(job_id)}, headers=CSRF_HEADERS
+        f"/api/library/documents/{first_id}/copy",
+        json={"folder_id": folder_id},
+        headers=CSRF_HEADERS,
     )
     assert second.status_code == 201, second.text
+    assert second.json()["job_id"] == str(job_id)
     second_id = second.json()["id"]
     async with chatting.app.state.sessionmaker() as db:
         paths_a = await workspace_documents.materialize_document(

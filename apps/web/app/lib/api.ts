@@ -19,6 +19,8 @@ export type ApiErrorType =
   | 'insufficient_credits'
   | 'checkout_unavailable'
   | 'pay_unavailable'
+  | 'subscription_active'
+  | 'checkout_open'
   | 'upstream'
   | 'internal'
 
@@ -164,6 +166,10 @@ export interface UploadLimits {
   /** A conversation's title, as a rename stores it (docs/chat.md § Conversations, turns,
    *  events). Optional, as above. */
   conversation_title_max_chars?: number
+  /** How many days the Trash keeps an item before the worker deletes it for good; 0 never
+   *  does (docs/workspace.md § The Trash). Optional only so a page served by an older API
+   *  still renders. */
+  trash_retention_days?: number
 }
 
 // --- memory (docs/chat.md § Memory) ----------------------------------------------------
@@ -640,22 +646,6 @@ export interface SandboxStatus {
 
 export type JobStatus = 'queued' | 'running' | 'succeeded' | 'failed'
 
-export interface JobSummary {
-  job_id: string
-  status: JobStatus
-  filename: string
-  kind: string
-  agent: string
-  model: string
-  page_count: number | null
-  pages_done: number
-  error: string | null
-  created_at: string
-  finished_at: string | null
-  /** What the parse cost (docs/billing.md § Routes); null while reserved and unsettled. */
-  credits?: number | null
-}
-
 export interface ResultPage {
   page: number
   /** Absent on a partial result's pages — only the final outcome knows the dimensions. */
@@ -877,6 +867,12 @@ export function logout(): Promise<void> {
   return request<undefined>('POST', '/api/auth/logout')
 }
 
+/** The account and everything in it, at once; the answer clears the session cookie
+ *  (docs/auth.md § Deleting the account). */
+export function deleteAccount(): Promise<void> {
+  return request<undefined>('DELETE', '/api/account')
+}
+
 export function devLogin(): Promise<{ user: { id: number; email: string } }> {
   return request('POST', '/api/auth/dev-login')
 }
@@ -1048,14 +1044,6 @@ export function resetSandbox(): Promise<void> {
   return request<undefined>('POST', '/api/sandbox/reset')
 }
 
-export function listJobs(limit: number): Promise<{ jobs: JobSummary[] }> {
-  return request('GET', `/api/jobs?limit=${limit}`)
-}
-
-export function getJobResult(jobId: string): Promise<JobResult> {
-  return request('GET', `/api/jobs/${jobId}/result`)
-}
-
 // --- file library (docs/web.md § Files) ------------------------------------
 
 export function getLibrary(): Promise<LibraryResponse> {
@@ -1127,15 +1115,6 @@ export function createDocument(body: { name: string; folder_id: number | null })
   return request('POST', '/api/library/documents/new', body)
 }
 
-/** File a parse that is already in the history — no upload, no second parse
- *  (docs/web.md § History). */
-export function fileJob(jobId: string, folderId: number | null): Promise<LibraryDocument> {
-  return request('POST', '/api/library/documents/from-job', {
-    job_id: jobId,
-    folder_id: folderId,
-  })
-}
-
 export function updateDocument(
   id: number,
   body: Partial<{ name: string; folder_id: number | null }>,
@@ -1143,7 +1122,8 @@ export function updateDocument(
   return request('PUT', `/api/library/documents/${id}`, body)
 }
 
-/** Delete Immediately: a live file or one in the Trash, for good. The parse stays in History. */
+/** Delete Immediately: a live file or one in the Trash, for good. Its parse is then kept as
+ *  any parse no file names is (docs/jobs.md § Retention). */
 export function deleteDocument(id: number): Promise<void> {
   return request<undefined>('DELETE', `/api/library/documents/${id}`)
 }
@@ -1187,7 +1167,8 @@ export function reconvertDocument(id: number, model: string | null): Promise<{ j
   return request('POST', `/api/library/documents/${id}/reconvert`, { model })
 }
 
-/** A failed re-convert let go: the document stops pointing at it; the parse stays in History. */
+/** A failed re-convert let go: the document stops pointing at it, and the parse is kept as
+ *  any parse no file names is (docs/jobs.md § Retention). */
 export function dismissReconvert(id: number): Promise<void> {
   return request<undefined>('DELETE', `/api/library/documents/${id}/reconvert`)
 }

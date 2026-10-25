@@ -290,7 +290,9 @@ class JobPage(Base):
 
 
 class Result(Base):
-    """Parsed output, kept indefinitely; document bytes are never stored (docs/database.md)."""
+    """Parsed output, kept as long as its job — `PARSE_RETENTION_DAYS` after the parse
+    finished, or while a document names a parse of that original (docs/jobs.md
+    § Retention); document bytes are never stored (docs/database.md)."""
 
     __tablename__ = "results"
 
@@ -340,6 +342,13 @@ class Folder(Base):
             postgresql_where=text("parent_id IS NULL AND trashed_at IS NULL"),
             sqlite_where=text("parent_id IS NULL AND trashed_at IS NULL"),
         ),
+        # What the Trash's expiry reads (docs/workspace.md § The Trash).
+        Index(
+            "ix_folders_trashed_at",
+            "trashed_at",
+            postgresql_where=text("trashed_at IS NOT NULL"),
+            sqlite_where=text("trashed_at IS NOT NULL"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -357,10 +366,10 @@ class Document(Base):
     """One file in the library: a name, a place in the tree, and the parse behind it.
 
     A document is an entry, never a second copy of the output — the markdown lives in
-    `results`, keyed by `job_id`. Deleting one deletes the entry only; the job stays in the
-    parse history and its usage rows stay with it (docs/database.md § Rules). `job_id` NULL
-    is a markdown document: no parse, its baseline its original (docs/workspace.md
-    § Markdown documents). `trashed_at` as for a folder.
+    `results`, keyed by `job_id`. Deleting one deletes the entry only; the job then falls
+    under the parse retention, and its usage rows outlive it (docs/database.md § Rules).
+    `job_id` NULL is a markdown document: no parse, its baseline its original
+    (docs/workspace.md § Markdown documents). `trashed_at` as for a folder.
     """
 
     __tablename__ = "documents"
@@ -383,11 +392,20 @@ class Document(Base):
             sqlite_where=text("folder_id IS NULL AND trashed_at IS NULL"),
         ),
         Index("ix_documents_user_created", "user_id", "created_at"),
+        # The parse retention's keep rule and a job delete's cascade read it
+        # (docs/jobs.md § Retention).
+        Index("ix_documents_job_id", "job_id"),
         Index(
             "ix_documents_reconvert_job_id",
             "reconvert_job_id",
             postgresql_where=text("reconvert_job_id IS NOT NULL"),
             sqlite_where=text("reconvert_job_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_documents_trashed_at",
+            "trashed_at",
+            postgresql_where=text("trashed_at IS NOT NULL"),
+            sqlite_where=text("trashed_at IS NOT NULL"),
         ),
     )
 
@@ -423,6 +441,8 @@ class UsageLog(Base):
     __tablename__ = "usage_log"
     __table_args__ = (
         Index("ix_usage_log_user_created", "user_id", "created_at"),
+        # A job delete's SET NULL reads it (docs/jobs.md § Retention).
+        Index("ix_usage_log_job_id", "job_id"),
         # An unknown cost is NULL and only an unknown cost is: a call nobody priced must
         # never be summed as a free one (docs/database.md).
         CheckConstraint(
@@ -803,9 +823,9 @@ class CreditEntry(Base):
         CheckConstraint(
             "state IN ('reserved', 'consumed', 'released')", name="ck_credit_entries_state"
         ),
-        CheckConstraint(
-            "(kind = 'parse') = (job_id IS NOT NULL)", name="ck_credit_entries_parse_job"
-        ),
+        # A parse entry outlives its job (the retention sets this NULL); a chat entry
+        # never has one.
+        CheckConstraint("kind = 'parse' OR job_id IS NULL", name="ck_credit_entries_parse_job"),
         # A chat entry outlives its turn (a deleted conversation sets this NULL); a parse
         # entry never has one.
         CheckConstraint("kind = 'chat' OR turn_id IS NULL", name="ck_credit_entries_turn_kind"),
@@ -819,7 +839,7 @@ class CreditEntry(Base):
     state: Mapped[str] = mapped_column(String(8))  # reserved | consumed | released
     amount: Mapped[int] = mapped_column(Integer)
     job_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("jobs.id", ondelete="CASCADE"), unique=True, nullable=True
+        ForeignKey("jobs.id", ondelete="SET NULL"), unique=True, nullable=True
     )
     turn_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("chat_turns.id", ondelete="SET NULL"), unique=True, nullable=True

@@ -8,8 +8,8 @@ export const LEGAL_DOCS = ['terms', 'privacy', 'refund'] as const
 export type LegalDoc = (typeof LEGAL_DOCS)[number]
 
 export const LEGAL_UPDATED: Record<LegalDoc, string> = {
-  terms: '2026-10-23',
-  privacy: '2026-10-23',
+  terms: '2026-10-25',
+  privacy: '2026-10-25',
   refund: '2026-10-23',
 }
 

@@ -8,6 +8,8 @@ PostgreSQL 16+. Schema changes **only** via Alembic migrations under `apps/api/m
 users            id PK, google_sub UNIQUE, email, name,
                  picture NULL,                    -- Google avatar URL, refreshed each sign-in
                  created_at
+                 -- deleting the row is deleting the account (see Rules): every table
+                 -- below with a user_id cascades from it, pay_events keep theirs as NULL
 sessions         id PK, user_id FK, token_hash UNIQUE, created_at, expires_at
 api_keys         id PK, user_id FK, name, key_hash UNIQUE, prefix, created_at,
                  last_used_at, revoked_at NULL
@@ -84,6 +86,10 @@ jobs             id UUID PK, user_id FK, agent, kind pdf|image, filename, media_
                                                   -- fence every write to a running job
                                                   -- carries (jobs.md § Queue)
                  created_at, started_at, finished_at
+                                                  -- a finished parse no document and no
+                                                  -- unexpired upload ticket keeps is
+                                                  -- deleted PARSE_RETENTION_DAYS after
+                                                  -- finished_at (jobs.md § Retention)
                  INDEX (status, created_at)                                  -- queue claim
                  INDEX (user_id, agent, sha256, model, connection_id, pages_spec,
                         prompt_sha256, pipeline_version)
@@ -119,11 +125,17 @@ folders          id PK, user_id FK, parent_id FK folders NULL, name,
                  UNIQUE (user_id, parent_id, name) WHERE trashed_at IS NULL
                  UNIQUE (user_id, name) WHERE parent_id IS NULL AND trashed_at IS NULL
                                                   -- the root level
+                 INDEX (trashed_at) WHERE trashed_at IS NOT NULL
+                                                  -- what the Trash's expiry reads
+                                                  -- (workspace.md § The Trash)
                  -- the web file library's directories; parent_id NULL = root,
                  -- ON DELETE CASCADE on the self-reference, so deleting a folder
                  -- takes its subtree with it. A folder in the Trash keeps its
                  -- parent_id: the place Put Back returns it to
 documents        id PK, user_id FK, folder_id FK folders NULL, job_id FK jobs NULL,
+                                                  -- ON DELETE CASCADE, which the retention
+                                                  -- never sets off: it keeps every job a
+                                                  -- document names (jobs.md § Retention)
                  name, trashed_at NULL,           -- as for folders
                  reconvert_job_id FK jobs NULL,   -- the re-convert queued, running or
                                                   -- failed (docs/jobs.md § Re-converting
@@ -132,7 +144,11 @@ documents        id PK, user_id FK, folder_id FK folders NULL, job_id FK jobs NU
                  UNIQUE (user_id, folder_id, name) WHERE trashed_at IS NULL
                  UNIQUE (user_id, name) WHERE folder_id IS NULL AND trashed_at IS NULL
                  INDEX (user_id, created_at)
+                 INDEX (job_id)                   -- the retention's keep rule and a job
+                                                  -- delete's foreign-key action read it
                  INDEX (reconvert_job_id) WHERE reconvert_job_id IS NOT NULL
+                 INDEX (trashed_at) WHERE trashed_at IS NOT NULL
+                                                  -- as for folders
                  -- one row = one file in the library: a parse result, or (job_id
                  -- NULL) a markdown document, uploaded as .md or written new
                  -- (docs/web.md § Files). folder_id NULL = root
@@ -151,6 +167,7 @@ usage_log        id PK, user_id FK, job_id FK NULL, turn_id FK chat_turns NULL,
                                                   -- nobody (parsing.md § Upstream usage)
                  created_at
                  INDEX (user_id, created_at)
+                 INDEX (job_id)                   -- a job delete's SET NULL reads it
                  CHECK (cost_source IN (...) AND (cost_source = 'unknown') = (cost IS NULL))
 conversations    id PK, user_id FK, document_id FK documents, title, session,
                  model NULL, memory_ids JSONB NULL, created_at, updated_at
@@ -230,7 +247,9 @@ upload_tickets   id PK, user_id FK, token_hash UNIQUE, prefix, job_id FK NULL,
                  created_at, expires_at, spent_at NULL
                  INDEX (user_id, created_at)                                 -- mint rate limit
                  -- single-use upload credential minted by the MCP `parse` tool
-                 -- (auth.md § 5); job_id set when the upload spends the ticket
+                 -- (auth.md § 5); job_id set when the upload spends the ticket,
+                 -- ON DELETE SET NULL; a ticket not yet expired keeps its job from
+                 -- the parse retention (jobs.md § Retention)
 oauth_clients    client_id PK, client_name, redirect_uris JSONB, created_at
 oauth_grants     id PK, client_id FK, user_id FK, kind code|access|refresh,
                  token_hash UNIQUE, pkce_challenge NULL, redirect_uri NULL,
@@ -263,18 +282,18 @@ credit_periods   (user_id FK, period_start) PK, period_end, plan_id NULL,
                  -- = Free
 credit_entries   id PK, user_id FK, period_start,
                  kind parse|chat, state reserved|consumed|released,
-                 amount INT, job_id FK jobs NULL UNIQUE,
+                 amount INT, job_id FK jobs ON DELETE SET NULL, NULL UNIQUE,
                  turn_id FK chat_turns ON DELETE SET NULL, NULL UNIQUE,
                  model NULL, created_at, settled_at NULL
                  INDEX (user_id, created_at)
-                 CHECK (amount >= 0), CHECK ((kind = 'parse') = (job_id IS NOT NULL)),
+                 CHECK (amount >= 0), CHECK (kind = 'parse' OR job_id IS NULL),
                  CHECK (kind = 'chat' OR turn_id IS NULL)
                  -- what a parse or a turn cost (billing.md § The ledger): one entry per
                  -- job, reserved at enqueue and settled at the terminal state; one per
-                 -- turn, its amount raised as the turn runs. ON DELETE CASCADE from the
-                 -- job, which is only deleted with its user; a conversation the reader
-                 -- deletes takes its turns and leaves their entries with turn_id NULL,
-                 -- so the balance and its record keep agreeing
+                 -- turn, its amount raised as the turn runs. A parse the retention
+                 -- deletes (jobs.md § Retention) leaves its entry with job_id NULL, and
+                 -- a conversation the reader deletes takes its turns and leaves their
+                 -- entries with turn_id NULL, so the balance and its record keep agreeing
 ```
 
 ## Rules
@@ -289,7 +308,8 @@ credit_entries   id PK, user_id FK, period_start,
 - **The format check migration** (`format check`) added `agent_settings.auto_check` (true), `jobs.check_model`, `check_effort` and `check_prompt` (NULL: no check) and `results.reading_markdown` (NULL: not checked). No row is rewritten: a job queued before it runs unchecked, and a result written before it has no reading copy. Its downgrade drops the five columns.
 - **The figure check migration** (`figure check`) added `job_pages.figures` (NULL: no check). No row is rewritten: a page kept from before it keeps no statuses, and its figures carry no `check`. Its downgrade drops the column.
 - **The ledger migration** (`credit entries outlive turns`) changed `credit_entries.turn_id` from `ON DELETE CASCADE` to `ON DELETE SET NULL` and replaced the check that a chat entry has a turn with one that a parse entry has none: a conversation deleted by its reader takes its turns and leaves their entries behind, still counted in the period and in `/api/billing/entries`. No row is rewritten. Its downgrade restores the cascade and refuses while any chat entry has no turn, naming the count — those entries would otherwise have to be deleted from the billing record.
-- **The re-convert migration** (`reconvert documents`) added `documents.reconvert_job_id` (NULL: no re-convert) and its partial index. No row is rewritten. Its downgrade drops both: a re-convert still running then finishes as a parse in History that no document takes.
+- **The parse retention migration** (`parse retention and account deletion`) did the same for `credit_entries.job_id`: `fk_credit_entries_job_id_jobs` went from `ON DELETE CASCADE` to `ON DELETE SET NULL`, and `ck_credit_entries_parse_job`, which held that an entry has a job exactly when it is a parse, became the check that a chat entry has no job (`kind = 'parse' OR job_id IS NULL`): a parse the retention deletes ([jobs.md](./jobs.md) § Retention) leaves its entry behind, still counted in its period and in `/api/billing/entries`. It added the indexes the purge and a job's foreign-key actions read, `ix_documents_job_id` and `ix_usage_log_job_id`, and the partial `ix_documents_trashed_at` and `ix_folders_trashed_at` (`WHERE trashed_at IS NOT NULL`) the Trash's expiry reads. No row is rewritten and none is deleted: the parses already past their time go at the first sweep after the deploy. Its downgrade drops the four indexes, restores the cascade and the old check, and refuses while any parse entry has no job, naming the count — those entries would otherwise have to be deleted from the billing record.
+- **The re-convert migration** (`reconvert documents`) added `documents.reconvert_job_id` (NULL: no re-convert) and its partial index. No row is rewritten. Its downgrade drops both: a re-convert still running then finishes as a parse no document takes, which the retention deletes in its time.
 - **The markdown documents migration** (`markdown documents`) dropped NOT NULL from `documents.job_id` and nothing else: every existing row keeps its job, and no row is rewritten. Its downgrade refuses while any document has no job, naming the count — restoring NOT NULL would otherwise have to delete the reader's markdown documents and their conversations with them. Delete them first, deliberately, if the downgrade is really wanted.
 - **The trash migration** (`library trash`) added `folders.trashed_at` and `documents.trashed_at`, NULL on every existing row — nothing is in the Trash — and narrowed the two name constraints and the two root-level indexes to the rows not in the Trash (`uq_folders_parent_name` and `uq_documents_folder_name` were constraints and became partial unique indexes under the same names). Its downgrade refuses while anything is in the Trash, naming the count: restoring the full constraints would have to pick which of two same-named rows survives. Empty the Trash first, deliberately, if the downgrade is really wanted.
 - **The built-in subagent removal** (`remove three built-in subagents`) deleted every `subagents` row named `verifier`, `reader` or `translation-checker`: the readers' edits of built-ins that left the code, which would otherwise have stayed on as subagents of their own ([chat.md](./chat.md) § Subagents). Its downgrade restores none of them; the built-ins come back with the code they belong to, unedited.
@@ -301,11 +321,12 @@ credit_entries   id PK, user_id FK, period_start,
   - `jobs.profile` and `jobs.profile_version` were dropped rather than kept as history. Nothing reads them once profiles are gone: the dedup key no longer has them, and a historical job's profile is still recorded where a reader sees it, in its stored result's `meta.profile`. Old OpenRouter jobs keep `connection_id` and `connection_base_url` NULL, which no new job ever has, so they can never answer a new upload ([jobs.md](./jobs.md) § Dedup).
 - **The upstream key is read at run time**, never snapshotted onto a job: the worker presents `KANO_PROXY_API_KEY` as configured when the job runs, so a rotated key applies to queued work. The model is snapshotted onto `jobs.model` at enqueue, like every other parse parameter. The dedup cache is protected separately by the `connection_base_url` snapshot ([jobs.md](./jobs.md) § Dedup).
 - `jobs.connection_id` is **history**: the provider connection a job of an earlier release ran on, kept so a result parsed through another endpoint never answers a Kano Proxy dedup lookup (the key keeps the column), and so a job still queued on one fails when the worker takes it ("the provider connection for this job no longer exists") rather than run on the operator's key. It never had a foreign key — the upstream a job ran on is immutable — and no new job sets it. `jobs.source_job_id` follows the same no-FK rule for the same reason.
-- **A usage row's cost is only as good as its source.** `cost_source` is written with the row and never revised: `openrouter` is billing, `estimated` is what the endpoint said the call cost, `unknown` has `cost` NULL. The migration that added the column backfilled it from the job each row belongs to — rows of a job with a `connection_id` became `unknown` with `cost` NULL (their reported cost had been discarded and 0 recorded in its place, which was never a price), every other row `openrouter` with its cost untouched. Rows with no job left (`job_id` NULL) count as `openrouter`: jobs are only ever deleted with their user, and the user's usage goes with them. Since OpenRouter was removed no new row is `openrouter`; the historical ones stay readable and keep counting as billed. `provider_connections.report_cost` follows the URL and key rule above — the worker reads it when the job runs, so toggling it affects calls made from then on, including jobs already queued, and never rewrites rows already recorded. Usage per agent is read through the job (`usage_log.job_id → jobs.agent`).
-- **A document is a library entry, not a second copy of the result.** `documents` names a parse and places it in a folder; the markdown lives in `results` exactly once, keyed by the job that produced it. A markdown document has no parse: `job_id` is NULL, and its baseline is the `.md` it was uploaded as, kept as its original, or nothing for one written new ([workspace.md](./workspace.md) § Markdown documents). Nothing in the database tells the two apart but `job_id`. Deleting a document deletes the entry only — the job stays in the parse history and its `usage_log` rows stay, because they are the billing record of something that really ran. Deleting a folder cascades to its subfolders and their documents, the way removing a directory does.
-- **The Trash is a column, not a table.** Putting a folder or a document in the Trash sets its `trashed_at` and nothing else: the row keeps its place (`parent_id`, `folder_id`) and its name, which is where *Put Back* returns it, and everything under a trashed folder is in the Trash with it without a write of its own. So *live* is computed, not stored — a folder is live when neither it nor any folder above it has `trashed_at`, a document when it has none and its folder (if any) is live — and every route of the library, the reader and the agent answers 404 for what is not live ([workspace.md](./workspace.md) § The Trash). Names are unique among the live rows only: the unique indexes carry `WHERE trashed_at IS NULL`, so a trashed `report.pdf` does not keep its folder from taking a new one, and Put Back resolves the collision the way a move does, with ` (2)`. A row inside a trashed folder still holds its name there, which nothing can contest: a trashed folder takes no new entries. That is decided again under the user's row lock, which a move to the Trash takes too: a folder or a file created while its destination goes to the Trash either lands first and goes with it, or is refused (404) — an upload whose parse is already under way lands at the top level instead, since the parse is not undone. An item trashed on its own stays its own entry in the Trash when a folder above it is trashed later. Deleting a row for good — from the Trash, or a live one deleted immediately — takes its own subtree only: an item inside it that was trashed separately is moved up to the deleted folder's parent first, so the cascade cannot take it, and it stays in the Trash. Nothing in the database empties the Trash by itself; the reader does.
+- **A usage row's cost is only as good as its source.** `cost_source` is written with the row and never revised: `openrouter` is billing, `estimated` is what the endpoint said the call cost, `unknown` has `cost` NULL. The migration that added the column backfilled it from the job each row belongs to — rows of a job with a `connection_id` became `unknown` with `cost` NULL (their reported cost had been discarded and 0 recorded in its place, which was never a price), every other row `openrouter` with its cost untouched. Rows with no job left (`job_id` NULL) count as `openrouter`: jobs were only ever deleted with their user then, and the user's usage went with them. A row whose job the retention deletes since ([jobs.md](./jobs.md) § Retention) keeps the `cost_source` and the `agent` it was written with. Since OpenRouter was removed no new row is `openrouter`; the historical ones stay readable and keep counting as billed. `provider_connections.report_cost` follows the URL and key rule above — the worker reads it when the job runs, so toggling it affects calls made from then on, including jobs already queued, and never rewrites rows already recorded. Usage per agent is read from the row's own `agent` (below), so a row whose job is gone still counts under its agent.
+- **A document is a library entry, not a second copy of the result.** `documents` names a parse and places it in a folder; the markdown lives in `results` exactly once, keyed by the job that produced it. A markdown document has no parse: `job_id` is NULL, and its baseline is the `.md` it was uploaded as, kept as its original, or nothing for one written new ([workspace.md](./workspace.md) § Markdown documents). Nothing in the database tells the two apart but `job_id`. Deleting a document deletes the entry only; its parse then falls under the retention ([jobs.md](./jobs.md) § Retention) — kept while any document of the user names a parse of the same original or an upload ticket that has not expired names it, else deleted `PARSE_RETENTION_DAYS` after it finished — and its `usage_log` rows and its ledger entry outlive it with `job_id` NULL, because they are the billing record of something that really ran. Deleting a folder cascades to its subfolders and their documents, the way removing a directory does.
+- **The Trash is a column, not a table.** Putting a folder or a document in the Trash sets its `trashed_at` and nothing else: the row keeps its place (`parent_id`, `folder_id`) and its name, which is where *Put Back* returns it, and everything under a trashed folder is in the Trash with it without a write of its own. So *live* is computed, not stored — a folder is live when neither it nor any folder above it has `trashed_at`, a document when it has none and its folder (if any) is live — and every route of the library, the reader and the agent answers 404 for what is not live ([workspace.md](./workspace.md) § The Trash). Names are unique among the live rows only: the unique indexes carry `WHERE trashed_at IS NULL`, so a trashed `report.pdf` does not keep its folder from taking a new one, and Put Back resolves the collision the way a move does, with ` (2)`. A row inside a trashed folder still holds its name there, which nothing can contest: a trashed folder takes no new entries. That is decided again under the user's row lock, which a move to the Trash takes too: a folder or a file created while its destination goes to the Trash either lands first and goes with it, or is refused (404) — an upload whose parse is already under way lands at the top level instead, since the parse is not undone. An item trashed on its own stays its own entry in the Trash when a folder above it is trashed later. Deleting a row for good — from the Trash, or a live one deleted immediately — takes its own subtree only: an item inside it that was trashed separately is moved up to the deleted folder's parent first, so the cascade cannot take it, and it stays in the Trash. The Trash is emptied by the reader — *Delete Immediately*, *Empty Trash* — and by the worker's sweep, which deletes for good, the way *Delete Immediately* does, every item whose own `trashed_at` is older than `TRASH_RETENTION_DAYS` (30; 0 = never), reading the partial `trashed_at` indexes ([workspace.md](./workspace.md) § The Trash). An expired folder takes its whole subtree, and nothing in it outlives it: an item trashed on its own inside it was trashed earlier, nothing inside a trashed folder being trashable, so it has expired too.
 - **The root level needs its own unique index.** `folders.parent_id` and `documents.folder_id` are NULL at the root, and PostgreSQL treats NULLs as distinct in a unique constraint, so `UNIQUE (user_id, parent_id, name)` would not stop two root folders called "Invoices". The partial indexes above close that. The application checks the same thing before writing, which is what turns a collision into `report (2).pdf` instead of a 409 — and it checks across both tables: a folder and a document in one parent cannot share a name, because the workspace gives each name one directory ([workspace.md](./workspace.md) § Layout). The indexes cannot express that, so the name is chosen under a lock on the user's row.
-- `results` holds parsed **output** (kept indefinitely); the DB never stores document bytes. `jobs.source_path` points at a temp file that is deleted at terminal state unless the job belongs to a library document, in which case the worker moves it into the document's workspace directory ([workspace.md](./workspace.md)).
+- **Deleting a user is deleting the account** ([auth.md](./auth.md) § Deleting the account): one `DELETE` of the `users` row, under its row lock, and every table with a `user_id` cascades from it — sessions, API keys, OAuth grants, upload tickets, agent settings, prompt presets, skills, subagents, memories, chat attachments, folders, documents, conversations with their messages, turns and events, jobs with their pages and results, `usage_log`, subscriptions, checkouts, credit periods and credit entries. `pay_events` keep their rows with `user_id` NULL — the record of an event outlives the user it was about — and `oauth_clients`, which belong to no user, stay. PostgreSQL never reuses an id, so the same Google account signing in later is a new row: a new, empty account, on Free from zero.
+- `results` holds parsed **output**, kept as long as its job (`PARSE_RETENTION_DAYS` after the parse finishes, or while a document names a parse of that original or an upload ticket that has not expired names the job, [jobs.md](./jobs.md) § Retention); the DB never stores document bytes. `jobs.source_path` points at a temp file that is deleted at terminal state unless the job belongs to a library document, in which case the worker moves it into the document's workspace directory ([workspace.md](./workspace.md)).
 - **A document's editable content is a file, not a column.** `doc.md` and `notes.md` live in the user's workspace and their history is that workspace's git log; `documents` keeps the entry, the parse behind it and its place in the tree, and the workspace is reconciled to it after every chat turn ([workspace.md](./workspace.md) § The tree is the truth).
 - `usage_log.agent` is written with the row (`parse` or `chat`) and was backfilled from `jobs.agent`; rows with no job and no turn are historical and count as `parse`. Chat rows carry `turn_id` and the cache token columns; parse rows carry `job_id` and zeros.
 - Job claiming and per-user caps: exact queries in [jobs.md](./jobs.md).

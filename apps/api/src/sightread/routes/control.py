@@ -6,15 +6,16 @@ SameSite=Lax), enforced by `require_csrf_header`.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
-import uuid
 from datetime import timedelta
 
 from authlib.integrations.starlette_client import OAuthError
 from fastapi import APIRouter, Query, Request, Response, status
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import case, func, select
+from sqlalchemy import case, delete, func, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
 
@@ -34,7 +35,8 @@ from ..auth.oidc import (
     upsert_user,
 )
 from ..auth.sessions import SESSION_COOKIE, SESSION_TTL, create_session, delete_session
-from ..billing import ledger
+from ..billing import ledger, pay
+from ..billing.plans import ENDED_STATUSES
 from ..db.models import (
     COST_SOURCE_ESTIMATED,
     COST_SOURCE_OPENROUTER,
@@ -43,14 +45,16 @@ from ..db.models import (
     EFFORT_LEVELS,
     AgentSetting,
     ApiKey,
+    ChatAttachment,
     ChatTurn,
+    Checkout,
     Conversation,
     Document,
     Job,
     PromptPreset,
-    Result,
     Skill,
     Subagent,
+    Subscription,
     UsageLog,
     User,
     utcnow,
@@ -58,19 +62,25 @@ from ..db.models import (
 from ..errors import ApiError
 from ..jobs import chat_memory, chat_runner
 from ..jobs.intake import PDF_MEDIA_TYPE
-from ..jobs.runner import result_payload
+from ..jobs.sweeper import discard_account
 from ..parsing.attachments import ATTACHMENT_EXTENSIONS
 from ..parsing.images import ACCEPTED_IMAGE_TYPES
+from ..sandbox.client import SandboxClient, SandboxUnavailable
 from ..upstream.client import agent_models, offered_models
+from ..workspace import accounts
 from ..workspace.documents import (
     IMAGE_MEDIA_TYPES,
     MARKDOWN_EXTENSIONS,
     MARKDOWN_MEDIA_TYPE,
     document_paths,
 )
+from ..workspace.layout import user_root
+from ..workspace.locks import workspace_lock
+from ..workspace.trash import lock_user
 from .billing import me_fields
 from .chat import TITLE_MAX_CHARS, owned_document, turn_note
-from .library import figure_crop_response, partial_result
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["control"])
 
@@ -227,8 +237,141 @@ async def me(user: SessionUser, db: DbSession, settings: AppSettings):
             "selection_max_chars": settings.chat_selection_max_chars,
             # A conversation's rename field (docs/chat.md § Conversations, turns, events).
             "conversation_title_max_chars": TITLE_MAX_CHARS,
+            # How long the Trash keeps an item, which its tab states; 0 = never emptied by
+            # itself (docs/workspace.md § The Trash).
+            "trash_retention_days": settings.trash_retention_days,
         },
     }
+
+
+@router.delete("/account", dependencies=[CsrfGuard], status_code=status.HTTP_204_NO_CONTENT)
+async def delete_account(
+    request: Request, user: SessionUser, db: DbSession, settings: AppSettings
+) -> Response:
+    """Delete the signed-in account and everything of it, at once and for good
+    (docs/auth.md § Deleting the account): refused while a subscription still renews or
+    while a parse or an answer runs; otherwise the rows go in one commit, the files after
+    it, and the session cookie is cleared."""
+    user_id = user.id
+    # Kano Pay has no cancel endpoint and a later account is a new subject: a subscription
+    # left renewing could never be cancelled from here again. Pay's own answer, so a
+    # cancellation made a minute ago counts — asked before any lock is taken, so no row
+    # waits on the network — and written back under the user's lock as the webhook writes
+    # it; the stored row when Pay is not configured.
+    canonical: pay.PaySubscription | None = None
+    unreachable: Exception | None = None
+    if settings.kano_pay_configured:
+        try:
+            canonical = await pay.PayClient(settings).subscription(str(user_id))
+        except (pay.PayUnavailable, pay.PayRefused) as exc:
+            unreachable = exc
+    async with workspace_lock(user_root(settings.workspaces_dir, user_id)):
+        await lock_user(db, user_id)
+
+        if not settings.kano_pay_configured:
+            subscription = await db.get(Subscription, user_id)
+        elif unreachable is not None:
+            held = await db.get(Subscription, user_id) or await db.get(Checkout, user_id)
+            if held is not None:
+                logger.warning(
+                    "account %d: the subscription fetch failed: %s", user_id, unreachable
+                )
+                raise ApiError(
+                    503, "pay_unavailable", "The payment service is unavailable; try again"
+                ) from unreachable
+            subscription = None
+        else:
+            if canonical is not None:
+                await pay.apply_canonical(db, user_id, canonical)
+            # The newer of Pay's answer and what a notification wrote while this request
+            # waited for the locks: the write keeps whichever version is newer.
+            subscription = await db.get(Subscription, user_id, populate_existing=True)
+        if (
+            subscription is not None
+            and subscription.status not in ENDED_STATUSES
+            and not subscription.cancel_at_period_end
+        ):
+            # What Pay answered stays written, as a refresh would have left it.
+            await db.commit()
+            raise ApiError(409, "subscription_active", "Cancel your subscription first")
+        # A checkout still open can be paid after the account is gone, and Pay would start
+        # a subscription for a subject no one can sign in as again: the account waits
+        # until it can no longer be paid. Pay's answer above completes a paid one.
+        checkout = await db.get(Checkout, user_id, populate_existing=True)
+        if (
+            settings.kano_pay_configured
+            and checkout is not None
+            and checkout.completed_at is None
+            and checkout.created_at
+            > utcnow() - timedelta(seconds=settings.kano_pay_checkout_lifetime_seconds)
+        ):
+            await db.commit()
+            raise ApiError(409, "checkout_open", "A checkout you started can still be paid")
+
+        # Queued work is locked, so the claims' SKIP LOCKED passes it by, and goes with
+        # the account; running work would go on writing files and usage as it goes.
+        await db.execute(
+            select(Job.id).where(Job.user_id == user_id, Job.status == "queued").with_for_update()
+        )
+        await db.execute(
+            select(ChatTurn.id)
+            .where(
+                ChatTurn.user_id == user_id,
+                ChatTurn.status == "queued",
+                ChatTurn.finished_at.is_(None),
+            )
+            .with_for_update()
+        )
+        running_job = await db.scalar(
+            select(Job.id).where(Job.user_id == user_id, Job.status == "running").limit(1)
+        )
+        # Running, or cancelled and not yet wound down by the worker.
+        running_turn = await db.scalar(
+            select(ChatTurn.id)
+            .where(
+                ChatTurn.user_id == user_id,
+                ChatTurn.finished_at.is_(None),
+                ChatTurn.status != "queued",
+            )
+            .limit(1)
+        )
+        if running_job is not None or running_turn is not None:
+            raise ApiError(
+                409,
+                "invalid_request",
+                "A parse or an answer is still running; try again when it finishes",
+            )
+
+        # The VM's only storage is the directory removed below; a runner that cannot stop
+        # it does not hold the deletion up.
+        if settings.sandbox_configured:
+            try:
+                await SandboxClient(settings).stop(user_id)
+            except SandboxUnavailable:
+                logger.warning("account %d: the sandbox could not be stopped", user_id)
+
+        job_ids = list((await db.execute(select(Job.id).where(Job.user_id == user_id))).scalars())
+        attachment_ids = list(
+            (
+                await db.execute(select(ChatAttachment.id).where(ChatAttachment.user_id == user_id))
+            ).scalars()
+        )
+        # What the worker's sweep needs to finish the files should this process die
+        # after the commit.
+        await asyncio.to_thread(accounts.write_marker, settings.workspaces_dir, user_id, job_ids)
+        await db.execute(delete(User).where(User.id == user_id))
+        await db.commit()
+
+        # The rows are gone: a file that will not go is logged, and the sweep finishes it.
+        try:
+            await discard_account(settings, user_id, job_ids, attachment_ids)
+        except Exception:  # noqa: BLE001 - the account is deleted either way
+            logger.exception("account %d: its files wait for the sweep", user_id)
+
+    request.app.state.pay_refreshed.pop(user_id, None)
+    response = Response(status_code=status.HTTP_204_NO_CONTENT)
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return response
 
 
 # --- API keys -------------------------------------------------------------------------
@@ -928,74 +1071,3 @@ async def usage_per_conversation(
             for row in rows
         ]
     }
-
-
-# --- job history ----------------------------------------------------------------------
-
-
-@router.get("/jobs")
-async def list_jobs(user: SessionUser, db: DbSession, limit: int = Query(default=50, ge=1, le=200)):
-    rows = (
-        (
-            await db.execute(
-                select(Job)
-                .where(Job.user_id == user.id)
-                .order_by(Job.created_at.desc())
-                .limit(limit)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    credits = await ledger.credits_by_job(db, [row.id for row in rows])
-    return {
-        "jobs": [
-            {
-                "job_id": str(row.id),
-                "agent": row.agent,
-                "status": row.status,
-                "filename": row.filename,
-                "kind": row.kind,
-                "model": row.model,
-                "page_count": row.page_count,
-                "pages_done": row.pages_done,
-                "error": row.error,
-                "created_at": row.created_at,
-                "finished_at": row.finished_at,
-                # What the parse cost (docs/billing.md § Routes).
-                "credits": credits.get(row.id),
-            }
-            for row in rows
-        ]
-    }
-
-
-async def owned_job(db: DbSession, user_id: int, job_id: uuid.UUID) -> Job:
-    job = (
-        await db.execute(select(Job).where(Job.id == job_id, Job.user_id == user_id))
-    ).scalar_one_or_none()
-    if job is None:
-        raise ApiError(404, "invalid_request", "No such job")
-    return job
-
-
-@router.get("/jobs/{job_id}/result")
-async def job_result(job_id: uuid.UUID, user: SessionUser, db: DbSession):
-    job = await owned_job(db, user.id, job_id)
-    result = (await db.execute(select(Result).where(Result.job_id == job_id))).scalar_one_or_none()
-    if result is not None:
-        return result_payload(result)
-    # A running job answers with its finished pages (docs/api.md § Partial results).
-    return await partial_result(db, job)
-
-
-@router.get("/jobs/{job_id}/figures/{page}/{bbox}")
-async def job_figure(
-    job_id: uuid.UUID,
-    page: int,
-    bbox: str,
-    user: SessionUser,
-    db: DbSession,
-    settings: AppSettings,
-):
-    return await figure_crop_response(settings, await owned_job(db, user.id, job_id), page, bbox)

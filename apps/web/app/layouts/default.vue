@@ -28,14 +28,11 @@ const localePath = useLocalePath()
 const auth = useAuth()
 
 /**
- * The two screens that are the work. Everything configured once — the agent, keys, the
- * connector, usage, theme, the account — is a section of the settings dialog behind the
- * account menu, so the nav never fills with things opened twice a month (docs/web.md § Pages).
+ * The screen that is the work. Everything configured once — the agent, keys, the connector,
+ * usage, theme, the account — is a section of the settings dialog behind the account menu,
+ * so the nav never fills with things opened twice a month (docs/web.md § Pages).
  */
-const NAV = [
-  { icon: 'files', to: '/files', label: 'nav.files' },
-  { icon: 'history', to: '/history', label: 'nav.history' },
-] as const
+const NAV = [{ icon: 'files', to: '/files', label: 'nav.files' }] as const
 
 /** The signed-in identity: the name when Google sent one, the address otherwise. */
 const account = computed(() => auth.me.value?.user.name?.trim() || auth.me.value?.user.email || '')

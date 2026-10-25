@@ -74,10 +74,8 @@ export default defineNuxtConfig({
     '/sitemap.xml': { prerender: true },
     // Control-plane pages are per-user and session-authenticated: client-rendered only.
     '/files': { ssr: false },
-    '/history': { ssr: false },
     '/settings/**': { ssr: false },
     '/zh-TW/files': { ssr: false },
-    '/zh-TW/history': { ssr: false },
     '/zh-TW/settings/**': { ssr: false },
     // The four screens that became sections of the settings dialog (docs/web.md § Pages):
     // a bookmark of the old path lands on its section, through the `/settings/<section>`
@@ -90,6 +88,10 @@ export default defineNuxtConfig({
     '/zh-TW/keys': { redirect: '/zh-TW/settings/keys' },
     '/zh-TW/connect': { redirect: '/zh-TW/settings/mcp' },
     '/zh-TW/dashboard': { redirect: '/zh-TW/settings/usage' },
+    // History, the list of every parse, was removed (docs/web.md § Pages): a bookmark of it
+    // lands on Files.
+    '/history': { redirect: '/files' },
+    '/zh-TW/history': { redirect: '/zh-TW/files' },
   },
 
   nitro: {
