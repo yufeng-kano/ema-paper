@@ -76,6 +76,13 @@ export default {
     signedOut: 'Your session has ended. Sign in again to continue.',
     unexpected: 'Something went wrong.',
   },
+  errorPage: {
+    notFoundTitle: 'Page not found',
+    notFoundBody: 'Nothing lives at this address. The link may be mistyped, or the page may have moved.',
+    failedTitle: 'Something went wrong',
+    failedBody: 'This page could not be shown. Try again in a moment.',
+    home: 'Back to {name}',
+  },
   login: {
     seoTitle: 'Ema Paper — parse PDFs and images into markdown with figure coordinates',
     seoDescription:

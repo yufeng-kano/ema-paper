@@ -136,6 +136,11 @@ services:
   web:
     build:
       context: ./apps/web
+      args:
+        # The public pages are prerendered by the build, so their absolute links, robots.txt
+        # and the sitemap take the origin here (docs/web.md § Search engines). A changed
+        # WEB_URL needs the image rebuilt.
+        WEB_URL: ${WEB_URL:?WEB_URL is required}
     container_name: sightread-web
     restart: unless-stopped
     depends_on:

@@ -1,6 +1,13 @@
 // Nuxt control plane (docs/web.md). The app only ever uses relative URLs: in production
 // Caddy routes /api/*, /v1/* to FastAPI and everything else here; in development the
 // nitro dev proxy below reproduces that same-origin split so session cookies work.
+import { PUBLIC_PATHS } from './shared/seo'
+
+// The public origin (docs/web.md § Search engines). The public pages are prerendered by this
+// build, so their absolute links are fixed here, not when they are served: the production
+// compose file passes WEB_URL to the image's build. Empty (a local build) keeps them relative.
+const siteUrl = (process.env.WEB_URL ?? '').replace(/\/+$/, '')
+
 export default defineNuxtConfig({
   modules: ['@nuxtjs/i18n', '@nuxt/eslint'],
   compatibilityDate: '2025-08-20',
@@ -8,6 +15,14 @@ export default defineNuxtConfig({
   // KaTeX's stylesheet ships with the package (fonts bundled by the build) — the result
   // viewer's math depends on nothing remote (docs/web.md § Result viewer).
   css: ['~/assets/css/main.css', '~/assets/css/markdown.css', 'katex/dist/katex.min.css'],
+  // This file reads WEB_URL from the build's environment, so its own type check needs Node's types.
+  typescript: {
+    nodeTsConfig: { compilerOptions: { types: ['node'] } },
+  },
+
+  runtimeConfig: {
+    public: { siteUrl },
+  },
 
   app: {
     head: {
@@ -40,6 +55,8 @@ export default defineNuxtConfig({
   i18n: {
     defaultLocale: 'en',
     strategy: 'prefix_except_default',
+    // Makes every canonical, hreflang and og:url link absolute; Google ignores a relative hreflang.
+    baseUrl: siteUrl,
     // Locale lives in the URL, so no cookie or Accept-Language redirect guessing.
     detectBrowserLanguage: false,
     locales: [
@@ -49,18 +66,12 @@ export default defineNuxtConfig({
   },
 
   routeRules: {
-    // The landing page is the SEO surface: prerendered HTML in both locales.
-    '/': { prerender: true },
-    '/zh-TW': { prerender: true },
-    '/pricing': { prerender: true },
-    '/zh-TW/pricing': { prerender: true },
-    // The policy pages Dodo's site review reads (docs/billing.md § Transition, step 6).
-    '/terms': { prerender: true },
-    '/zh-TW/terms': { prerender: true },
-    '/privacy': { prerender: true },
-    '/zh-TW/privacy': { prerender: true },
-    '/refund': { prerender: true },
-    '/zh-TW/refund': { prerender: true },
+    // The public pages — the landing page, pricing and the policy pages — are prerendered HTML
+    // in both locales, from the same list the sitemap gives (shared/seo.ts).
+    ...Object.fromEntries(PUBLIC_PATHS.map((path) => [path, { prerender: true }])),
+    // What crawlers read beside the pages, built from the same origin.
+    '/robots.txt': { prerender: true },
+    '/sitemap.xml': { prerender: true },
     // Control-plane pages are per-user and session-authenticated: client-rendered only.
     '/files': { ssr: false },
     '/history': { ssr: false },

@@ -64,7 +64,7 @@ MODEL_PRICES_JSON='{"<vision-model-id>": {"input": <usd>, "cache_read": <usd>, "
    | Variable | Value |
    |---|---|
    | `DOMAIN`, `ACME_EMAIL` | the host Caddy serves, and the Let's Encrypt contact |
-   | `APP_URL`, `WEB_URL` | `https://<domain>`, both |
+   | `APP_URL`, `WEB_URL` | `https://<domain>`, both. `WEB_URL` is built into the public pages, so changing it later needs `--build` |
    | `SECRET_KEY` | a long random string, e.g. `openssl rand -hex 32`. Never the local one |
    | `POSTGRES_PASSWORD` | a new password, also written into `DATABASE_URL` |
    | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | an OAuth client with redirect URI `https://<domain>/api/auth/callback` and origin `https://<domain>` |

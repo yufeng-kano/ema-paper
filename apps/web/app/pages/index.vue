@@ -35,6 +35,20 @@ useSeoMeta({
   twitterCard: 'summary',
 })
 
+// The site's name in search results (docs/web.md § Search engines): one `WebSite` object on
+// both home pages, written only when the build knows the origin its `url` needs.
+const { siteUrl } = useRuntimeConfig().public
+if (siteUrl) {
+  useHead({
+    script: [
+      {
+        type: 'application/ld+json',
+        textContent: { '@context': 'https://schema.org', '@type': 'WebSite', name: t('app.name'), url: `${siteUrl}/` },
+      },
+    ],
+  })
+}
+
 const devLoginAvailable = ref(false)
 const devLoginError = ref<string | null>(null)
 const signingIn = ref(false)
