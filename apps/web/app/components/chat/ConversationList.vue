@@ -52,10 +52,10 @@ const { t } = useI18n()
 
 const root = ref<HTMLElement | null>(null)
 
+/** The scrolling part has something to hold: rows, *Loading…*, or why they could not be read. */
+const rowsShown = computed(() => props.conversations.length > 0 || props.pending || props.error !== null)
 /** Nothing above the foot: no row, nothing loading, no line to say. */
-const alone = computed(
-  () => !props.conversations.length && !props.pending && !props.error && !props.renameError,
-)
+const alone = computed(() => !rowsShown.value && !props.renameError)
 
 function label(row: Conversation): string {
   return row.title || t('chat.untitled')
@@ -126,7 +126,7 @@ function onResize() {
 }
 
 /** An Escape that reaches the document while it is open was pressed with focus on nothing —
- *  a Retry that went as the list came back — and is still its own: the root says so
+ *  a row that went as the list was read again — and is still its own: the root says so
  *  (`data-escape-owner`), so the viewer's dialog does not close under it. One pressed inside
  *  it, in the row menu or in the rename field never gets here. */
 function onDocumentKeydown(event: KeyboardEvent) {
@@ -135,6 +135,18 @@ function onDocumentKeydown(event: KeyboardEvent) {
     emit('close', true)
   }
 }
+
+/** A Retry that brought the list back goes with the failure it stood in, and focus would fall
+ *  to the page, out of reach of the arrows: the popover takes it, as when it opened. */
+watch(
+  () => props.error,
+  (error, before) => {
+    if (before && !error && (document.activeElement === null || document.activeElement === document.body)) {
+      root.value?.focus()
+    }
+  },
+  { flush: 'post' },
+)
 
 onMounted(async () => {
   window.addEventListener('pointerdown', onPointerDownOutside, true)
@@ -280,15 +292,12 @@ function onRenameBlur() {
     @keydown="onKeydown"
     @focusout="onFocusOut"
   >
-    <div v-if="!alone" class="body">
+    <div v-if="rowsShown" class="body">
       <p v-if="pending && !conversations.length" class="status">{{ t('common.loading') }}</p>
       <div v-if="error" class="status failed" role="alert">
         <span>{{ error }}</span>
         <UiButton size="xs" variant="ghost" @click="emit('retry')">{{ t('common.retry') }}</UiButton>
       </div>
-      <p v-if="renameError" class="status failed" role="alert">
-        {{ t('chat.renameFailed', { error: renameError }) }}
-      </p>
       <ul v-if="conversations.length" class="rows">
         <li
           v-for="row in conversations"
@@ -334,6 +343,10 @@ function onRenameBlur() {
         </li>
       </ul>
     </div>
+    <!-- Out of the rows' scroll, so it shows whichever row was renamed. -->
+    <p v-if="renameError" class="status failed rename-failed" role="alert">
+      {{ t('chat.renameFailed', { error: renameError }) }}
+    </p>
     <!-- Fixed at the foot, under the rows however many there are. -->
     <div class="foot" :class="{ alone }">
       <button type="button" class="row-open" @click="emit('new')">
@@ -411,6 +424,11 @@ function onRenameBlur() {
 
 .status.failed {
   color: var(--danger);
+}
+
+/* Under the rows, out of their scroll, above the foot's hairline. */
+.rename-failed {
+  flex: none;
 }
 
 .rows {
