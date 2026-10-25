@@ -123,8 +123,8 @@ const EXCERPTS_DEBOUNCE_MS = 300
 const OUTLINE_GUTTER_FILES_PX = 128
 const OUTLINE_GUTTER_HISTORY_PX = 100
 /** The outline's room (`ViewerOutline`): its ticks run from this far under the pane's top
- *  down to this far above the pane's foot, or to 8px above the pieces at the foot, which stand
- *  this far up themselves — and are centred in it. */
+ *  down to this far above the pane's foot, or to 8px above the pieces at the foot wherever they
+ *  stand (`footReach`) — and are centred in it. */
 const OUTLINE_INSET_PX = 24
 
 /** How far under the pane's top a located heading lands: the line above it shows. */
@@ -3284,7 +3284,9 @@ const paneHeight = ref(0)
 /** The room left of the column: what the outline needs beside a heading's own controls. */
 const gutter = ref(0)
 const paneFoot = ref<{ root: HTMLElement | null } | null>(null)
-const footHeight = ref(0)
+/** How far up from the pane's foot its pieces reach: their height and what they stand on,
+ *  which is less under the hint bar (`PaneFoot`); 0 with none. */
+const footReach = ref(0)
 /** The current section, by outline index. */
 const currentHeading = ref<number | null>(null)
 let paneObserver: ResizeObserver | null = null
@@ -3308,17 +3310,30 @@ watch(paneEl, (pane) => {
   }
 })
 
+function measureFoot() {
+  const root = paneFoot.value?.root
+  if (!root?.offsetHeight) {
+    footReach.value = 0
+    return
+  }
+  const stands = Number.parseFloat(getComputedStyle(root).bottom)
+  footReach.value = root.offsetHeight + (Number.isNaN(stands) ? OUTLINE_INSET_PX : stands)
+}
+
 watch(
   () => paneFoot.value?.root ?? null,
   (root) => {
     footObserver?.disconnect()
     footObserver = null
     if (root) {
-      footObserver = new ResizeObserver(() => (footHeight.value = root.offsetHeight))
+      footObserver = new ResizeObserver(measureFoot)
       footObserver.observe(root)
     }
   },
 )
+// The hint bar stands lower than the other pieces: its coming or going moves the foot even
+// where its size does not change.
+watch(showHint, measureFoot, { flush: 'post' })
 
 watch(pages, () => {
   void nextTick(() => {
@@ -3336,7 +3351,7 @@ const showOutline = computed(
 
 /** The ticks run down to where the pieces at the pane's foot begin, never under them. */
 const outlineRoom = computed(() => {
-  const bottom = paneHeight.value - OUTLINE_INSET_PX - (footHeight.value ? footHeight.value + 8 : 0)
+  const bottom = paneHeight.value - (footReach.value ? footReach.value + 8 : OUTLINE_INSET_PX)
   return { top: OUTLINE_INSET_PX, height: Math.max(0, bottom - OUTLINE_INSET_PX) }
 })
 /** The panel opens at the pane's top, which is the cards' top, and ends at most where they
