@@ -2,7 +2,7 @@
 
 ## What it is
 
-Ema Paper is a hosted, multi-user document-understanding service: PDF and image in, markdown with figure coordinate placeholders out. It descends from the "sightread MCP" spec (vision-based extraction, coordinates-not-crops) but is deliberately a **platform**, not a stateless tool.
+Ema Paper is a hosted, multi-user document-understanding service: PDF and image in, markdown with figure coordinate placeholders out. It descends from the "sightread MCP" spec (vision-based extraction, coordinates-not-crops) but is deliberately a **platform**, not a stateless tool. Since 2026-10-25 it is also where the reader keeps the rest of their files: a file of any kind is uploaded once and stored once, in the same tree the chat agent works in, and converted into a document when it is a PDF or an image the reader wants read ([workspace.md](./workspace.md) § Files).
 
 ## Name
 

@@ -8,7 +8,10 @@ import {
   canMoveFolder,
   checkFailureReason,
   childFolders,
+  documentGlyph,
   documentsIn,
+  fileKind,
+  filePreview,
   folderPath,
   isMarkdownUpload,
   isPending,
@@ -17,6 +20,7 @@ import {
   renameSelectionEnd,
   subtreeIds,
   typeAheadMatch,
+  uploadCap,
 } from './library'
 
 function folder(id: number, name: string, parent_id: number | null = null): LibraryFolder {
@@ -173,7 +177,7 @@ describe('acceptsUpload', () => {
     expect(acceptsUpload({ name: 'scan.HEIC', type: 'application/octet-stream' }, limits)).toBe(true)
   })
 
-  it('refuses what the server would refuse', () => {
+  it('leaves what the server would keep as a file', () => {
     expect(acceptsUpload({ name: 'notes.txt', type: 'text/plain' }, limits)).toBe(false)
     expect(acceptsUpload({ name: 'notes', type: '' }, limits)).toBe(false)
   })
@@ -270,5 +274,107 @@ describe('checkFailureReason', () => {
     )
     expect(checkFailureReason('1 of 3 pages failed (page 2: blocked)')).toBeNull()
     expect(checkFailureReason(null)).toBeNull()
+  })
+})
+
+describe('uploadCap', () => {
+  const limits: UploadLimits = {
+    upload_max_bytes: 1000,
+    page_cap: 500,
+    accepted_media_types: ['application/pdf', 'image/jpeg', 'text/markdown'],
+    accepted_extensions: ['.pdf', '.jpg', '.md'],
+    markdown_media_types: ['text/markdown'],
+    markdown_extensions: ['.md'],
+    markdown_max_bytes: 100,
+    file_max_bytes: 5000,
+    prompt_max_chars: 8000,
+  }
+
+  it('applies the cap intake applies: markdown, a parse, or a file kept as it is', () => {
+    expect(uploadCap({ name: 'notes.md', type: '' }, limits)).toBe(100)
+    expect(uploadCap({ name: 'paper.pdf', type: 'application/pdf' }, limits)).toBe(1000)
+    expect(uploadCap({ name: 'demo.mov', type: 'video/quicktime' }, limits)).toBe(5000)
+    expect(uploadCap({ name: 'mystery', type: '' }, limits)).toBe(5000)
+  })
+
+  it('caps a PDF or an image as a file while the parse agent keeps them', () => {
+    expect(uploadCap({ name: 'paper.pdf', type: 'application/pdf' }, limits, false)).toBe(5000)
+    expect(uploadCap({ name: 'scan.jpg', type: 'image/jpeg' }, limits, false)).toBe(5000)
+    // Markdown is never parsed: the switch changes nothing for it.
+    expect(uploadCap({ name: 'notes.md', type: '' }, limits, false)).toBe(100)
+  })
+
+  it('names no cap while the limits are loading, or where an older API has none', () => {
+    expect(uploadCap({ name: 'demo.mov', type: 'video/quicktime' }, null)).toBeNull()
+    expect(uploadCap({ name: 'demo.mov', type: 'video/quicktime' }, { ...limits, file_max_bytes: undefined })).toBeNull()
+  })
+})
+
+describe('fileKind', () => {
+  it('names a file by its type, then by its extension', () => {
+    expect(fileKind({ name: 'photo.jpg', media_type: 'image/jpeg' })).toEqual({ key: 'image', format: 'JPEG', glyph: 'image' })
+    expect(fileKind({ name: 'demo.mov', media_type: 'video/quicktime' })).toEqual({
+      key: 'video',
+      format: 'QuickTime',
+      glyph: 'film',
+    })
+    expect(fileKind({ name: 'clip.mp4', media_type: 'video/mp4' }).format).toBe('MPEG-4')
+    expect(fileKind({ name: 'raw.cr2', media_type: 'image/x-canon-cr2' }).format).toBe('CR2')
+    expect(fileKind({ name: 'song.flac', media_type: 'audio/flac' })).toEqual({ key: 'audio', format: 'FLAC', glyph: 'music' })
+    expect(fileKind({ name: 'paper.pdf', media_type: 'application/pdf' })).toEqual({ key: 'pdf', format: 'PDF', glyph: 'file-text' })
+    expect(fileKind({ name: 'paper.PDF', media_type: 'application/octet-stream' }).key).toBe('pdf')
+  })
+
+  it('knows the office suites and the archives', () => {
+    expect(
+      fileKind({ name: 'q1.xlsx', media_type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }),
+    ).toEqual({ key: 'spreadsheet', format: 'Excel', glyph: 'sheet' })
+    expect(fileKind({ name: 'talk.key', media_type: 'application/octet-stream' })).toEqual({
+      key: 'presentation',
+      format: 'Keynote',
+      glyph: 'presentation',
+    })
+    expect(fileKind({ name: 'memo.docx', media_type: '' })).toEqual({ key: 'word', format: 'Word', glyph: 'file-text' })
+    expect(fileKind({ name: 'site.tgz', media_type: 'application/octet-stream' })).toEqual({
+      key: 'archive',
+      format: 'gzip',
+      glyph: 'archive',
+    })
+  })
+
+  it('falls back to the extension, and to a plain file without one', () => {
+    expect(fileKind({ name: 'data.csv', media_type: 'text/csv' })).toEqual({ key: 'file', format: 'CSV', glyph: 'file' })
+    expect(fileKind({ name: 'Makefile', media_type: 'application/octet-stream' })).toEqual({ key: 'plain', format: '', glyph: 'file' })
+    expect(fileKind({ name: '.env', media_type: null })).toEqual({ key: 'plain', format: '', glyph: 'file' })
+    // A name that is also a property of every object is a name, not a lookup.
+    expect(fileKind({ name: 'x.constructor', media_type: '' })).toEqual({ key: 'file', format: 'CONSTRUCTOR', glyph: 'file' })
+  })
+
+  it('names every kind in both languages', () => {
+    for (const key of ['pdf', 'image', 'video', 'audio', 'spreadsheet', 'presentation', 'word', 'archive', 'file', 'plain']) {
+      expect(en.files.kinds).toHaveProperty(key)
+      expect(zhTW.files.kinds).toHaveProperty(key)
+    }
+  })
+})
+
+describe('documentGlyph and filePreview', () => {
+  it('draws a document by what it came from and a file by its type', () => {
+    expect(documentGlyph(document(1, 'a.pdf'))).toBe('file-text')
+    expect(documentGlyph(document(1, 'a.png', null, { kind: 'image' }))).toBe('image')
+    expect(documentGlyph(document(1, 'a.md', null, { kind: 'markdown' }))).toBe('file-text')
+    expect(documentGlyph(document(1, 'a.zip', null, { kind: 'file', media_type: 'application/zip' }))).toBe('archive')
+    expect(documentGlyph(document(1, 'a.mov', null, { kind: 'file', media_type: 'video/quicktime' }))).toBe('film')
+  })
+
+  it('previews only what a browser shows safely, and never an SVG', () => {
+    expect(filePreview('image/png')).toBe('image')
+    expect(filePreview('image/svg+xml')).toBe('none')
+    expect(filePreview('video/mp4')).toBe('video')
+    expect(filePreview('audio/mpeg')).toBe('audio')
+    expect(filePreview('application/pdf')).toBe('pdf')
+    expect(filePreview('text/plain')).toBe('text')
+    expect(filePreview('application/zip')).toBe('none')
+    expect(filePreview(null)).toBe('none')
   })
 })

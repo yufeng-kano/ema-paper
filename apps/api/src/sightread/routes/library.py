@@ -18,26 +18,32 @@ import logging
 import os
 import re
 import shutil
+import sys
 import unicodedata
+import urllib.parse
 import uuid
 import warnings
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
 
-from fastapi import APIRouter, Request, Response, status
+from fastapi import APIRouter, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field
 from sqlalchemy import ColumnElement, delete, func, select
 from sqlalchemy.exc import IntegrityError
 from starlette.concurrency import iterate_in_threadpool
-from starlette.datastructures import FormData, UploadFile
+from starlette.datastructures import UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser
 
 from ..agents import PARSE
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
 from ..billing import ledger
 from ..db.models import (
+    FILE_KIND,
+    MARKDOWN_KIND,
+    PARSE_KIND,
+    AgentSetting,
     Document,
     Folder,
     Job,
@@ -51,11 +57,13 @@ from ..jobs import events
 from ..jobs.chat_tools import PageUnavailable, original_page_png
 from ..jobs.intake import (
     MULTIPART_ENVELOPE_BYTES,
+    UPLOAD_CHUNK_BYTES,
     capped_stream,
     checked_parse_model,
     file_chunks,
     insufficient_credits,
     resolve_check,
+    resolve_kind,
     store_upload,
     submit_parse,
     upload_chunks,
@@ -65,10 +73,18 @@ from ..jobs.runner import partial_result_payload, result_payload
 from ..parsing.figures import crop_chunks, open_crop, parse_bbox_path
 from ..parsing.images import ImageError, normalize_image
 from ..workspace import documents as workspace_documents
-from ..workspace import safe_io, trash
-from ..workspace.layout import document_relative_dir, path_segment, trash_entry, user_root
+from ..workspace import git, safe_io, trash
+from ..workspace.layout import (
+    FILES_DIR,
+    document_relative_dir,
+    path_segment,
+    segment_name,
+    trash_entry,
+    user_root,
+)
 from ..workspace.locks import backup_shared, workspace_lock
 from ..workspace.trash import commit_then_discard, lock_user, read_row, refuse_while_answering
+from .multipart import Sink, read_upload_form
 
 logger = logging.getLogger(__name__)
 
@@ -208,6 +224,17 @@ async def live_document(db: DbSession, user_id: int, document_id: int) -> Docume
     writes or moves one takes (docs/api.md)."""
     row = await owned_document(db, user_id, document_id)
     if not workspace_documents.is_live(row, await workspace_documents.user_folders(db, user_id)):
+        raise ApiError(404, "invalid_request", "No such document")
+    return row
+
+
+async def live_text_document(db: DbSession, user_id: int, document_id: int) -> Document:
+    """A live document that is a parse or a markdown document: what the routes of a
+    document's own take — its content, result, revisions, pages, figures, images, retry
+    and re-convert — since a file of the library has none of those (docs/workspace.md
+    § Files); 404 for one, as for nothing."""
+    row = await live_document(db, user_id, document_id)
+    if row.kind == FILE_KIND:
         raise ApiError(404, "invalid_request", "No such document")
     return row
 
@@ -504,6 +531,30 @@ def document_payload(
     failed = failed or {}
     credits = credits or {}
     storage_bytes = None if storage is None else storage.get(row.id, 0)
+    if row.kind == FILE_KIND:
+        # A file kept as it is (docs/workspace.md § Files): no parse to report on; its
+        # size is its share of the storage, the one copy counted once.
+        return {
+            "id": row.id,
+            "folder_id": row.folder_id,
+            "name": row.name,
+            "job_id": None,
+            "status": None,
+            "kind": FILE_KIND,
+            "media_type": row.media_type,
+            "model": None,
+            "page_count": None,
+            "pages_done": None,
+            "size_bytes": row.size_bytes,
+            "storage_bytes": row.size_bytes,
+            "error": None,
+            "created_at": row.created_at,
+            "finished_at": None,
+            "failed_pages": None,
+            "checking": False,
+            "reconvert": None,
+            "credits": None,
+        }
     if job is None:
         return {
             "id": row.id,
@@ -511,7 +562,8 @@ def document_payload(
             "name": row.name,
             "job_id": None,
             "status": None,
-            "kind": workspace_documents.MARKDOWN_KIND,
+            "kind": MARKDOWN_KIND,
+            "media_type": None,
             "model": None,
             "page_count": None,
             "pages_done": None,
@@ -532,6 +584,7 @@ def document_payload(
         "job_id": str(row.job_id),
         "status": job.status,
         "kind": job.kind,
+        "media_type": None,
         "model": job.model,
         "page_count": job.page_count,
         "pages_done": job.pages_done,
@@ -1215,10 +1268,10 @@ class DocumentCreate(BaseModel):
     folder_id: int | None = None
 
 
-def form_folder_id(form: FormData) -> int | None:
+def form_folder_id(fields: Mapping[str, str]) -> int | None:
     """`folder_id` as a multipart field: absent or empty means the root."""
-    raw = form.get("folder_id")
-    if not isinstance(raw, str) or not raw.strip():
+    raw = fields.get("folder_id")
+    if raw is None or not raw.strip():
         return None
     try:
         return int(raw)
@@ -1226,55 +1279,170 @@ def form_folder_id(form: FormData) -> int | None:
         raise ApiError(400, "invalid_request", "'folder_id' must be a folder id") from exc
 
 
+async def parse_auto_convert(db: DbSession, user_id: int) -> bool:
+    """The parse agent's switch (docs/agents.md § Per-agent settings): a PDF or an image
+    uploaded on the Files page is converted on arrival unless the reader turned it off."""
+    value = await db.scalar(
+        select(AgentSetting.auto_convert).where(
+            AgentSetting.user_id == user_id, AgentSetting.agent == PARSE.name
+        )
+    )
+    return True if value is None else bool(value)
+
+
+def parse_accepts(filename: str, media_type: str) -> bool:
+    """Whether intake would parse this upload: a PDF or an image (`resolve_kind`)."""
+    try:
+        resolve_kind(filename, media_type)
+    except ApiError:
+        return False
+    return True
+
+
+# What an upload is filed as, decided from its name and type before its bytes land
+# (docs/api.md § `POST /api/library/documents`).
+UPLOAD_MARKDOWN, UPLOAD_PARSE, UPLOAD_FILE = "markdown", "parse", "file"
+STORAGE_FULL = "The workspace is at its quota; free some space first"
+
+
 @router.post("/documents", dependencies=[CsrfGuard], status_code=status.HTTP_201_CREATED)
 async def upload_document(
     request: Request, user: SessionUser, db: DbSession, settings: AppSettings
 ):
-    """The web upload: multipart `file` (+ optional `folder_id`) → a parse and a file.
+    """The web upload: multipart `file` (+ optional `folder_id`) → a parse and a document,
+    a markdown document, or a file kept as it is (docs/api.md § `POST /api/library/documents`).
 
-    Transport only. The bytes stream to disk through `jobs.intake`, exactly as they do for
-    `POST /v1/parse`; what this route adds is the name and the place (docs/api.md § Why the
-    web upload is a control-plane route).
+    The body is read as it arrives (`routes.multipart`): what the file part is decides
+    where its bytes stream to before the first of them lands — a PDF or an image the parse
+    agent converts, and a markdown file, to the upload directory under their own caps, as
+    for `POST /v1/parse`; anything else straight into the user's tree under
+    `FILE_MAX_BYTES`, the one copy there will be (docs/workspace.md § Files).
     """
     # A primitive copy: a retry inside `insert_named` follows a rollback, which expires
     # the row behind `user`, and an expired attribute cannot be loaded here.
     user_id = user.id
     if not request.headers.get("content-type", "").startswith("multipart/form-data"):
         raise ApiError(400, "invalid_request", "The upload must be multipart/form-data")
-    # Cheap rejection before a byte is read; the capped stream below is what stops a
-    # request that declares no length, or an untrue one.
-    declared_length = request.headers.get("content-length", "")
-    if declared_length.isdigit() and int(declared_length) > settings.upload_max_bytes * 2:
-        raise ApiError(413, "invalid_request", "The upload exceeds UPLOAD_MAX_BYTES")
+    # Cheap rejection before a byte is read: the largest body any kind may send — the
+    # largest of the three caps, which a deployment may order as it likes; each kind's own
+    # cap applies as its bytes arrive, and the capped stream below is what stops a request
+    # that declares no length, or an untrue one.
+    outer_cap, outer_name = max(
+        (settings.file_max_bytes, "FILE_MAX_BYTES"),
+        (settings.upload_max_bytes, "UPLOAD_MAX_BYTES"),
+        (settings.content_max_bytes, "CONTENT_MAX_BYTES"),
+    )
+    declared = request.headers.get("content-length", "")
+    declared_length = int(declared) if declared.isdigit() else None
+    if declared_length is not None and declared_length > outer_cap + MULTIPART_ENVELOPE_BYTES:
+        raise ApiError(413, "invalid_request", f"The upload exceeds {outer_name}")
 
-    # The parser reads a bounded stream rather than the unbounded one `request.form()`
-    # hands it: it spools every file part to disk as that part arrives, so without this a
-    # chunked request could fill the upload directory long before `store_upload` sees a
-    # byte of it.
-    try:
-        form = await MultiPartParser(
-            request.headers,
-            capped_stream(request.stream(), settings.upload_max_bytes + MULTIPART_ENVELOPE_BYTES),
-        ).parse()
-    except MultiPartException as exc:
-        raise ApiError(400, "invalid_request", "The multipart body could not be read") from exc
+    # Decided before the body: the parse agent's switch, and what the plan leaves for a
+    # file — checked against the declared length before a byte of one is written
+    # (docs/workspace.md § Files, § Quota).
+    auto_convert = await parse_auto_convert(db, user_id)
+    root = user_root(settings.workspaces_dir, user_id)
+    # What an upload the process died in left in the tree goes before the quota is
+    # measured, so it never counts against this one (docs/workspace.md § Files).
+    await asyncio.to_thread(workspace_documents.sweep_staged_uploads, root)
+    limit = ledger.storage_limit(settings, await ledger.plan_of(db, settings, user_id))
+    used = (await workspace_documents.measure_storage(db, settings, user_id, root)).total
+    upload_dir = Path(settings.upload_dir)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread(git.ensure_repo, root)
 
-    upload = form.get("file")
-    if not isinstance(upload, UploadFile):
+    def staged(suffix: str, max_bytes: int, cap_name: str, kind: str) -> Sink:
+        path = upload_dir / f"{uuid.uuid4().hex}{suffix}"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+        return Sink(fd, path, max_bytes, cap_name, kind, lambda: path.unlink(missing_ok=True))
+
+    def open_sink(filename: str, content_type: str) -> Sink:
+        suffix = Path(filename).suffix.lower()[:16]
+        if (
+            content_type.split(";", 1)[0].strip() == workspace_documents.MARKDOWN_MEDIA_TYPE
+            or suffix in workspace_documents.MARKDOWN_EXTENSIONS
+        ):
+            return staged(".md", settings.content_max_bytes, "CONTENT_MAX_BYTES", UPLOAD_MARKDOWN)
+        if auto_convert and parse_accepts(filename, content_type):
+            return staged(suffix, settings.upload_max_bytes, "UPLOAD_MAX_BYTES", UPLOAD_PARSE)
+        if declared_length is not None and used + declared_length > limit:
+            raise ApiError(409, "storage_full", STORAGE_FULL)
+        # Into the tree under the staging name, which history excludes and reconciliation
+        # leaves alone, its lock held through this descriptor until the file is in place
+        # or removed (docs/workspace.md § Files); moved into place once the row exists.
+        fd, temp = workspace_documents.stage_upload(root)
+
+        def discard() -> None:
+            with contextlib.suppress(OSError, safe_io.UnsafeEntry):
+                safe_io.remove_file(root, temp)
+
+        return Sink(fd, temp, settings.file_max_bytes, "FILE_MAX_BYTES", UPLOAD_FILE, discard)
+
+    fields, part = await read_upload_form(
+        request.headers,
+        capped_stream(request.stream(), outer_cap + MULTIPART_ENVELOPE_BYTES, cap_name=outer_name),
+        open_sink,
+    )
+    if part is None:
         raise ApiError(400, "invalid_request", "Multipart requests need a 'file' part")
-    folder_id = form_folder_id(form)
-    if folder_id is not None:
-        await live_folder(db, user_id, folder_id)
-
-    filename = upload.filename or "upload"
-    media_type = upload.content_type or ""
-    if (
-        media_type == workspace_documents.MARKDOWN_MEDIA_TYPE
-        or Path(filename).suffix.lower() in workspace_documents.MARKDOWN_EXTENSIONS
-    ):
-        return await file_markdown(
-            upload, filename, user_id=user_id, folder_id=folder_id, db=db, settings=settings
+    try:
+        folder_id = form_folder_id(fields)
+        if folder_id is not None:
+            await live_folder(db, user_id, folder_id)
+        filename = part.filename or "upload"
+        if part.sink.kind == UPLOAD_MARKDOWN:
+            return await file_markdown(
+                part.sink.path,
+                filename,
+                user_id=user_id,
+                folder_id=folder_id,
+                db=db,
+                settings=settings,
+            )
+        if part.sink.kind == UPLOAD_PARSE:
+            return await file_parse(
+                part.sink.path,
+                filename,
+                part.content_type,
+                user=user,
+                folder_id=folder_id,
+                db=db,
+                settings=settings,
+            )
+        return await file_upload(
+            part.sink.path,
+            filename,
+            part.content_type,
+            part.size,
+            user_id=user_id,
+            folder_id=folder_id,
+            db=db,
+            settings=settings,
         )
+    finally:
+        # Whatever was not moved into place goes: a staged upload the parse copied, the
+        # temporary file of a filing that was refused. The descriptor last: the lock a
+        # file's staging holds through it outlives the move into place (docs/workspace.md
+        # § Files).
+        await asyncio.to_thread(part.sink.discard)
+        with contextlib.suppress(OSError):
+            os.close(part.sink.fd)
+
+
+async def file_parse(
+    path: Path,
+    filename: str,
+    media_type: str,
+    *,
+    user: User,
+    folder_id: int | None,
+    db: DbSession,
+    settings: AppSettings,
+) -> dict:
+    """A PDF or an image the parse agent converts on arrival: the parse queued from the
+    staged upload by the same `jobs.intake` sequence `POST /v1/parse` runs, then the row
+    naming it (docs/api.md § Why the web upload is a control-plane route)."""
+    user_id = user.id
     # The library name is decided before the parse is queued: a name that cleans to
     # nothing is filed as `upload`, never a 400 after a billed parse is already on its
     # way (docs/api.md).
@@ -1286,7 +1454,7 @@ async def upload_document(
         db,
         settings,
         user=user,
-        chunks=upload_chunks(upload),
+        chunks=file_chunks(path),
         media_type=media_type,
         filename=filename,
         # The browser cannot tell a lost response from a lost request, so its retry of an
@@ -1319,7 +1487,9 @@ async def upload_document(
             db,
             user_id=user_id,
             into=place,
-            build=lambda name: Document(user_id=user_id, folder_id=place, job_id=job_id, name=name),
+            build=lambda name: Document(
+                user_id=user_id, folder_id=place, job_id=job_id, kind=PARSE_KIND, name=name
+            ),
             taken=taken,
             wanted=wanted,
             limit=DOCUMENT_NAME_MAX,
@@ -1396,7 +1566,7 @@ async def upload_document(
 
 
 async def file_markdown(
-    upload: UploadFile,
+    staged: Path,
     filename: str,
     *,
     user_id: int,
@@ -1405,68 +1575,147 @@ async def file_markdown(
     settings: AppSettings,
 ) -> dict:
     """A `.md` upload: no parse, a markdown document whose original is the file
-    (docs/workspace.md § Markdown documents). Staged and checked before any row exists,
-    under the cap a `doc.md` is read under anyway."""
+    (docs/workspace.md § Markdown documents). Staged under the cap a `doc.md` is read
+    under and checked before any row exists; the caller removes what is left of the
+    staged file."""
     try:
         wanted = clean_name(filename, DOCUMENT_NAME_MAX)
     except ApiError:
         wanted = "upload"
-    upload_dir = Path(settings.upload_dir)
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    staged = upload_dir / f"{uuid.uuid4().hex}.md"
-    await store_upload(
-        upload_chunks(upload), staged, settings.content_max_bytes, cap_name="CONTENT_MAX_BYTES"
-    )
-    try:
-        if not await asyncio.to_thread(workspace_documents.is_utf8_file, staged):
-            raise ApiError(400, "invalid_request", "A markdown file must be UTF-8 text")
-        root = user_root(settings.workspaces_dir, user_id)
-        # The row, its original and their commit under one hold of the workspace lock, the
-        # backup lock shared around it, as for a parse's upload (docs/workspace.md § Backups).
-        async with backup_shared(root), workspace_lock(root):
-            try:
-                row = await insert_named(
-                    db,
-                    user_id=user_id,
-                    into=folder_id,
-                    build=lambda name: Document(
-                        user_id=user_id, folder_id=folder_id, job_id=None, name=name
-                    ),
-                    taken=lambda: sibling_names(db, user_id, folder_id),
-                    wanted=wanted,
-                    limit=DOCUMENT_NAME_MAX,
-                    message="A file with this name already exists here",
-                    commit=False,
-                )
-            except ApiError:
-                if folder_id is None or await folder_exists(db, user_id, folder_id):
-                    raise
-                raise ApiError(404, "invalid_request", "No such folder") from None
-            row_id = row.id
-            try:
-                await workspace_documents.adopt_markdown(db, settings, row, staged)
-            except ApiError:
-                await db.rollback()
-                raise
-            except Exception as exc:
-                logger.exception("could not keep the upload for document %d", row_id)
-                await db.rollback()
-                raise ApiError(
-                    409, "invalid_request", "The upload could not be kept; nothing was filed"
-                ) from exc
-            relative = document_relative_dir(
-                await workspace_documents.folder_names(db, user_id, row.folder_id), row.name
-            )
-            row = await commit_filing(
+    if not await asyncio.to_thread(workspace_documents.is_utf8_file, staged):
+        raise ApiError(400, "invalid_request", "A markdown file must be UTF-8 text")
+    root = user_root(settings.workspaces_dir, user_id)
+    # The row, its original and their commit under one hold of the workspace lock, the
+    # backup lock shared around it, as for a parse's upload (docs/workspace.md § Backups).
+    async with backup_shared(root), workspace_lock(root):
+        try:
+            row = await insert_named(
                 db,
-                row,
-                what="The upload",
-                undo=lambda: workspace_documents.discard_adopted(
-                    settings, user_id, row_id, relative
+                user_id=user_id,
+                into=folder_id,
+                build=lambda name: Document(
+                    user_id=user_id, folder_id=folder_id, job_id=None, kind=MARKDOWN_KIND, name=name
                 ),
+                taken=lambda: sibling_names(db, user_id, folder_id),
+                wanted=wanted,
+                limit=DOCUMENT_NAME_MAX,
+                message="A file with this name already exists here",
+                commit=False,
             )
-    finally:
-        staged.unlink(missing_ok=True)
+        except ApiError:
+            if folder_id is None or await folder_exists(db, user_id, folder_id):
+                raise
+            raise ApiError(404, "invalid_request", "No such folder") from None
+        row_id = row.id
+        try:
+            await workspace_documents.adopt_markdown(db, settings, row, staged)
+        except ApiError:
+            await db.rollback()
+            raise
+        except Exception as exc:
+            logger.exception("could not keep the upload for document %d", row_id)
+            await db.rollback()
+            raise ApiError(
+                409, "invalid_request", "The upload could not be kept; nothing was filed"
+            ) from exc
+        relative = document_relative_dir(
+            await workspace_documents.folder_names(db, user_id, row.folder_id), row.name
+        )
+        row = await commit_filing(
+            db,
+            row,
+            what="The upload",
+            undo=lambda: workspace_documents.discard_adopted(settings, user_id, row_id, relative),
+        )
+    return document_payload(row, None)
+
+
+async def file_upload(
+    temp: Path,
+    filename: str,
+    declared_type: str,
+    size: int,
+    *,
+    user_id: int,
+    folder_id: int | None,
+    db: DbSession,
+    settings: AppSettings,
+) -> dict:
+    """A file of any other kind, kept as it is (docs/workspace.md § Files): its bytes are in
+    the tree already, under a write-in-progress name; the row and the move into place
+    under one hold of the workspace lock, the row committed last, as a markdown filing
+    is — no entry without its file, no file without its entry."""
+    try:
+        wanted = clean_name(filename, DOCUMENT_NAME_MAX)
+    except ApiError:
+        wanted = "upload"
+    media_type = workspace_documents.file_media_type(filename, declared_type)
+    root = user_root(settings.workspaces_dir, user_id)
+    async with backup_shared(root), workspace_lock(root):
+        # The bytes once they are there, counted with the tree they now sit in (§ Quota).
+        limit = ledger.storage_limit(settings, await ledger.plan_of(db, settings, user_id))
+        used = (await workspace_documents.measure_storage(db, settings, user_id, root)).total
+        if used > limit:
+            raise ApiError(409, "storage_full", STORAGE_FULL)
+        directory = (
+            await folder_relative_dir(db, user_id, folder_id)
+            if folder_id is not None
+            else Path(FILES_DIR)
+        )
+
+        async def taken() -> set[str]:
+            # The rows' names, and the names on disk: a file the shell made under the
+            # wanted name, with no row yet, would otherwise be overwritten by the move.
+            names = await sibling_names(db, user_id, folder_id)
+            try:
+                entries = await asyncio.to_thread(safe_io.list_dir, root, root / directory)
+            except (safe_io.UnsafeEntry, OSError):
+                return names
+            return names | {segment_name(name) for name, _is_dir in entries}
+
+        try:
+            row = await insert_named(
+                db,
+                user_id=user_id,
+                into=folder_id,
+                build=lambda name: Document(
+                    user_id=user_id,
+                    folder_id=folder_id,
+                    job_id=None,
+                    kind=FILE_KIND,
+                    name=name,
+                    media_type=media_type,
+                    size_bytes=size,
+                ),
+                taken=taken,
+                wanted=wanted,
+                limit=DOCUMENT_NAME_MAX,
+                message="A file with this name already exists here",
+                commit=False,
+            )
+        except ApiError:
+            if folder_id is None or await folder_exists(db, user_id, folder_id):
+                raise
+            raise ApiError(404, "invalid_request", "No such folder") from None
+        row_id = row.id
+        relative = await document_relative(db, row)
+        try:
+            await asyncio.to_thread(workspace_documents.place_file, root, temp, relative)
+        except ApiError:
+            await db.rollback()
+            raise
+        except Exception as exc:
+            logger.exception("could not keep the upload for document %d", row_id)
+            await db.rollback()
+            raise ApiError(
+                409, "invalid_request", "The upload could not be kept; nothing was filed"
+            ) from exc
+        row = await commit_filing(
+            db,
+            row,
+            what="The upload",
+            undo=lambda: workspace_documents.discard_file(settings, user_id, relative),
+        )
     return document_payload(row, None)
 
 
@@ -1484,7 +1733,7 @@ async def create_document(body: DocumentCreate, user: SessionUser, db: DbSession
             user_id=user_id,
             into=folder_id,
             build=lambda name: Document(
-                user_id=user_id, folder_id=folder_id, job_id=None, name=name
+                user_id=user_id, folder_id=folder_id, job_id=None, kind=MARKDOWN_KIND, name=name
             ),
             taken=lambda: sibling_names(db, user_id, folder_id),
             wanted=clean_name(body.name, DOCUMENT_NAME_MAX),
@@ -1607,7 +1856,7 @@ async def take_pending_reconvert(db: DbSession, settings: AppSettings, row: Docu
 async def document_result(
     document_id: int, user: SessionUser, db: DbSession, settings: AppSettings
 ):
-    row = await live_document(db, user.id, document_id)
+    row = await live_text_document(db, user.id, document_id)
     row = await take_pending_reconvert(db, settings, row)
     if row.job_id is None:
         raise ApiError(404, "invalid_request", "A markdown document has no parse result")
@@ -1680,7 +1929,7 @@ async def document_figure(
     db: DbSession,
     settings: AppSettings,
 ):
-    row = await live_document(db, user.id, document_id)
+    row = await live_text_document(db, user.id, document_id)
     if row.job_id is None:
         raise ApiError(404, "invalid_request", "No such figure")
     job = await job_of(db, row.job_id)
@@ -1720,7 +1969,7 @@ async def document_pages(document_id: int, user: SessionUser, db: DbSession):
     (docs/api.md): the document's parse, or its failed re-convert, since that is what a
     retry would send. A page with no row is `pending`: queued, running, or never reached
     before a failure that ended the job."""
-    row = await live_document(db, user.id, document_id)
+    row = await live_text_document(db, user.id, document_id)
     if row.job_id is None:
         raise ApiError(404, "invalid_request", "A markdown document has no pages")
     job = await job_of(db, row.job_id)
@@ -1757,7 +2006,7 @@ async def document_page_image(
     """One page of the document's original as a PNG, for the retry dialog: drawn the way
     the chat agent's `view_page` draws it, smaller, a few at a time per process
     (docs/api.md § Limits). Never cached, as a crop is not."""
-    row = await live_document(db, user.id, document_id)
+    row = await live_text_document(db, user.id, document_id)
     if row.job_id is None:
         raise ApiError(404, "invalid_request", "A markdown document has no pages")
     job = await job_of(db, row.job_id)
@@ -1819,7 +2068,7 @@ async def retry_document(
         # The user's row before the job's, the one order (docs/workspace.md § Revisions):
         # the retry takes the job's credits back under it (docs/billing.md § A parse).
         await db.execute(select(User.id).where(User.id == user.id).with_for_update())
-        row = await live_document(db, user.id, document_id)
+        row = await live_text_document(db, user.id, document_id)
         if row.job_id is None:
             raise ApiError(404, "invalid_request", "A markdown document has no parse to retry")
         await lock_job(db, row.job_id)
@@ -1911,7 +2160,7 @@ async def reconvert_document(
     model = (body.model or "").strip() or None
     root = user_root(settings.workspaces_dir, user.id)
     async with workspace_lock(root):
-        row = await live_document(db, user.id, document_id)
+        row = await live_text_document(db, user.id, document_id)
         if row.job_id is None:
             raise ApiError(404, "invalid_request", "A markdown document has no parse to re-convert")
         job = await job_of(db, row.job_id)
@@ -1963,7 +2212,7 @@ async def dismiss_reconvert(
     § Re-converting a document, § Retention). Under the workspace lock, which a retry of
     it holds too."""
     async with workspace_lock(user_root(settings.workspaces_dir, user.id)):
-        row = await live_document(db, user.id, document_id)
+        row = await live_text_document(db, user.id, document_id)
         if row.reconvert_job_id is None:
             raise ApiError(404, "invalid_request", "The document has no re-convert")
         if (await job_of(db, row.reconvert_job_id)).status != "failed":
@@ -2041,7 +2290,7 @@ async def upload_image(request: Request, user: SessionUser, db: DbSession, setti
         document_id = form.get("document_id")
         if not isinstance(document_id, str) or not document_id.isdigit():
             raise ApiError(400, "invalid_request", "Multipart requests need a 'document_id' part")
-        row = await live_document(db, user.id, int(document_id))
+        row = await live_text_document(db, user.id, int(document_id))
         upload_dir = Path(settings.upload_dir)
         upload_dir.mkdir(parents=True, exist_ok=True)
         stem = uuid.uuid4().hex
@@ -2071,7 +2320,7 @@ async def upload_image(request: Request, user: SessionUser, db: DbSession, setti
 async def document_image(
     document_id: int, name: str, user: SessionUser, db: DbSession, settings: AppSettings
 ):
-    row = await live_document(db, user.id, document_id)
+    row = await live_text_document(db, user.id, document_id)
     root = user_root(settings.workspaces_dir, row.user_id)
     image = workspace_documents.image_of(root, row.id, name)
     if image is None:
@@ -2087,6 +2336,267 @@ async def document_image(
         media_type=workspace_documents.IMAGE_SUFFIX_MEDIA[image.suffix],
         headers={"Cache-Control": "private, no-store", "Content-Length": str(size)},
     )
+
+
+# --- files kept as they are (docs/workspace.md § Files) -------------------------------------
+
+
+def content_disposition(disposition: str, name: str) -> str:
+    """`inline` or `attachment` with the file's name: in ASCII for every client, and whole
+    in UTF-8 (RFC 6266) for the ones that read it."""
+    fallback = re.sub(r"[^\x20-\x7e]|[\"\\\\]", "_", name).strip() or "file"
+    encoded = urllib.parse.quote(name, safe="")
+    return f"{disposition}; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
+
+
+def parse_range(header: str, size: int) -> tuple[int, int] | None:
+    """One `bytes=` range of a file of `size` bytes as (first, last), or None for a header
+    that is not one such range — answered whole, as the specification allows; one past
+    the end is unsatisfiable (416)."""
+    match = re.fullmatch(r"\s*bytes=(\d*)-(\d*)\s*", header)
+    if match is None or not (match[1] or match[2]):
+        return None
+    past = ApiError(
+        416,
+        "invalid_request",
+        "The range is past the end of the file",
+        headers={"Content-Range": f"bytes */{size}"},
+    )
+    if match[1]:
+        first = int(match[1])
+        last = min(int(match[2]), size - 1) if match[2] else size - 1
+        if first >= size or first > last:
+            raise past
+        return first, last
+    suffix = int(match[2])
+    if suffix == 0 or size == 0:
+        raise past
+    return max(0, size - suffix), size - 1
+
+
+def file_security_headers(media_type: str, inline: bool) -> dict[str, str]:
+    """The file route's own policy (docs/api.md): sandboxed, so nothing served from the
+    tree runs as this origin — except a PDF shown inline, which a browser's viewer will
+    not open in a sandbox: that one may be framed by this origin alone."""
+    if inline and media_type == "application/pdf":
+        return {
+            "Content-Security-Policy": "frame-ancestors 'self'",
+            "X-Frame-Options": "SAMEORIGIN",
+        }
+    return {"Content-Security-Policy": "sandbox", "X-Frame-Options": "DENY"}
+
+
+def open_file_chunks(entry: int, first: int, last: int):
+    """The bytes `first`..`last` of the open file `entry`, in chunks; the descriptor is
+    closed when the stream ends, however it ends."""
+    try:
+        os.lseek(entry, first, os.SEEK_SET)
+        remaining = last - first + 1
+        while remaining > 0:
+            chunk = os.read(entry, min(safe_io.READ_CHUNK, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
+    finally:
+        os.close(entry)
+
+
+@router.get("/documents/{document_id}/file")
+async def document_file(
+    document_id: int,
+    request: Request,
+    user: SessionUser,
+    db: DbSession,
+    settings: AppSettings,
+    download: bool = Query(default=False),
+):
+    """A file's bytes, the one copy, read from the tree (docs/api.md): inline for what a
+    browser shows safely on its own, an attachment otherwise or on `?download=1`; one
+    `Range` answered with 206; always under a content security policy of its own, which
+    the Caddyfile leaves in place (docs/deployment.md § Security headers). Read without
+    the workspace lock — a download of a video must not hold the shell for its length —
+    through a descriptor opened along the path's components without following anything;
+    what it then streams is whatever the file holds while it is read."""
+    row = await live_document(db, user.id, document_id)
+    if row.kind != FILE_KIND:
+        raise ApiError(404, "invalid_request", "No such file")
+    root = user_root(settings.workspaces_dir, row.user_id)
+    relative = await document_relative(db, row)
+    try:
+        entry = await asyncio.to_thread(safe_io.open_for_read, root, root / relative, sys.maxsize)
+    except (safe_io.UnsafeEntry, OSError) as exc:
+        raise ApiError(409, "invalid_request", workspace_documents.NOT_PLAIN) from exc
+    if entry is None:
+        raise ApiError(404, "invalid_request", "The file is missing from the workspace")
+    try:
+        size = os.fstat(entry).st_size
+        media_type = row.media_type or workspace_documents.file_media_type(row.name)
+        inline = workspace_documents.served_inline(media_type) and not download
+        first, last = 0, size - 1
+        status_code = status.HTTP_200_OK
+        wanted = parse_range(request.headers.get("range", ""), size)
+        if wanted is not None:
+            first, last = wanted
+            status_code = status.HTTP_206_PARTIAL_CONTENT
+    except BaseException:
+        os.close(entry)
+        raise
+    headers = {
+        "Content-Disposition": content_disposition("inline" if inline else "attachment", row.name),
+        "Content-Length": str(max(last - first + 1, 0)),
+        "Accept-Ranges": "bytes",
+        # Never cached, as a crop is not: a cached file would outlive a sign-out.
+        "Cache-Control": "private, no-store",
+        "X-Content-Type-Options": "nosniff",
+        **file_security_headers(media_type, inline),
+    }
+    if status_code == status.HTTP_206_PARTIAL_CONTENT:
+        headers["Content-Range"] = f"bytes {first}-{last}/{size}"
+    return StreamingResponse(
+        iterate_in_threadpool(open_file_chunks(entry, first, last)),
+        status_code=status_code,
+        media_type=media_type,
+        headers=headers,
+    )
+
+
+class DocumentConvert(BaseModel):
+    model: str | None = Field(default=None, max_length=255)
+
+
+async def fd_chunks(entry: int) -> AsyncIterator[bytes]:
+    """An open file in chunks, as intake streams an upload."""
+    while chunk := await asyncio.to_thread(os.read, entry, UPLOAD_CHUNK_BYTES):
+        yield chunk
+
+
+@router.post("/documents/{document_id}/convert", dependencies=[CsrfGuard])
+async def convert_document(
+    document_id: int,
+    body: DocumentConvert,
+    user: SessionUser,
+    db: DbSession,
+    settings: AppSettings,
+):
+    """A PDF or an image kept as a file becomes a document (docs/jobs.md § Converting a
+    file). The parse is queued from the file as a Files upload's is — the credits
+    reserved, the per-user cap and the dedup cache applied, the file read in place and
+    copied into the upload directory as the job's source — then, under the same hold of
+    the workspace lock, the file moves aside out of the tree and the row becomes a parse
+    naming the job, its id, name and place kept. A row that does not commit brings the
+    file back; the worker files the source as the document's original when the parse
+    ends (§ Retention)."""
+    model = (body.model or "").strip() or None
+    user_id = user.id
+    root = user_root(settings.workspaces_dir, user_id)
+    async with backup_shared(root), workspace_lock(root):
+        await workspace_documents.recover_trash(db, settings, user_id)
+        row = await live_document(db, user_id, document_id)
+        if row.kind != FILE_KIND:
+            raise ApiError(404, "invalid_request", "No such file")
+        try:
+            _kind, media_type = resolve_kind(row.name, row.media_type or "")
+        except ApiError as exc:
+            raise ApiError(
+                409, "not_convertible", "Only a PDF or an image can be converted into a document"
+            ) from exc
+        relative = await document_relative(db, row)
+        try:
+            entry = await asyncio.to_thread(
+                safe_io.open_for_read, root, root / relative, settings.upload_max_bytes
+            )
+        except safe_io.EntryTooLarge as exc:
+            raise ApiError(413, "invalid_request", "The file exceeds UPLOAD_MAX_BYTES") from exc
+        except (safe_io.UnsafeEntry, OSError) as exc:
+            raise ApiError(409, "invalid_request", workspace_documents.NOT_PLAIN) from exc
+        if entry is None:
+            raise ApiError(409, "invalid_request", "The file is missing from the workspace")
+        try:
+            submission = await submit_parse(
+                db,
+                settings,
+                user=user,
+                chunks=fd_chunks(entry),
+                media_type=media_type,
+                filename=row.name,
+                model=model,
+                reuse_in_flight=True,
+                retain_source=True,
+                check=True,
+            )
+        finally:
+            os.close(entry)
+        job_id = submission.job.id if submission.job is not None else submission.cached.job_id
+        if (
+            submission.cached is not None
+            and await db.scalar(select(Job.id).where(Job.id == job_id)) is None
+        ):
+            # The purged-cache race a Files upload meets (docs/jobs.md § Dedup margin).
+            if submission.upload is not None:
+                submission.upload.unlink(missing_ok=True)
+            raise ApiError(
+                409, "invalid_request", "The earlier parse of this file was just deleted; try again"
+            )
+        # The parse is committed; the row, read again, becomes its document.
+        await db.refresh(row)
+        row_id = row.id
+        row.job_id = job_id
+        row.kind = PARSE_KIND
+        row.media_type = None
+        row.size_bytes = None
+        await db.flush()
+        job = await job_of(db, job_id)
+        # The file out of the tree, aside, as a delete moves a directory: back should the
+        # row not commit, gone once it has (docs/workspace.md § Files).
+        removal = await workspace_documents.remove_path(
+            settings, user_id, relative, message=f"convert {relative}"
+        )
+        adopted = False
+        try:
+            # A cache hit or a parse joined in flight hands this row the fresh copy as its
+            # original now; a parse just queued has the worker file it (§ Retention).
+            await workspace_documents.adopt_source(
+                db, settings, row, job, upload=submission.upload, locked=True
+            )
+            adopted = True
+            await db.commit()
+        except BaseException as exc:
+            readable, landed = await read_row(db, Document, row_id)
+            if readable and isinstance(landed, Document) and landed.job_id == job_id:
+                logger.warning(
+                    "the conversion of document %d was committed despite the error", row_id
+                )
+                row = landed
+            else:
+                with contextlib.suppress(Exception):
+                    await db.rollback()
+                if adopted:
+                    with contextlib.suppress(Exception):
+                        await workspace_documents.discard_adopted(
+                            settings, user_id, row_id, relative
+                        )
+                if removal is not None:
+                    try:
+                        await workspace_documents.restore_removed(
+                            settings, user_id, relative, removal
+                        )
+                    except Exception:  # noqa: BLE001 - the file waits aside, whole
+                        logger.exception(
+                            "could not bring %s back after a failed conversion", relative
+                        )
+                if isinstance(exc, ApiError):
+                    raise
+                logger.exception("document %d could not be converted", row_id)
+                raise ApiError(
+                    409, "invalid_request", "The file could not be converted; nothing was changed"
+                ) from exc
+        if removal is not None:
+            try:
+                await workspace_documents.discard_removed(settings, user_id, removal)
+            except Exception:  # noqa: BLE001 - the next reconciliation sweeps it
+                logger.exception("could not discard %s set aside by a conversion", relative)
+    return await read_document_payload(db, row)
 
 
 # --- copies -------------------------------------------------------------------------------
@@ -2144,6 +2654,7 @@ def copied(
         inner=inner,
         donors=(source.id, *(other for other in others if other not in (source.id, target.id))),
         parsing=job is not None and job.status in ("queued", "running"),
+        file=source.kind == FILE_KIND,
     )
 
 
@@ -2234,6 +2745,9 @@ async def copy_document(
             user_id=user_id,
             folder_id=folder_id,
             job_id=source.job_id,
+            kind=source.kind,
+            media_type=source.media_type,
+            size_bytes=source.size_bytes,
             name=free_name(taken, source.name, DOCUMENT_NAME_MAX),
         )
         db.add(row)
@@ -2331,6 +2845,9 @@ async def copy_folder(
                 user_id=user_id,
                 folder_id=mapping[document.folder_id],
                 job_id=document.job_id,
+                kind=document.kind,
+                media_type=document.media_type,
+                size_bytes=document.size_bytes,
                 name=document.name,
             )
             db.add(made)
@@ -2397,7 +2914,7 @@ class NotesPut(BaseModel):
 async def document_content(
     document_id: int, user: SessionUser, db: DbSession, settings: AppSettings
 ):
-    row = await live_document(db, user.id, document_id)
+    row = await live_text_document(db, user.id, document_id)
     row = await take_pending_reconvert(db, settings, row)
     content = await workspace_documents.read_content(db, settings, row)
     return {
@@ -2413,7 +2930,7 @@ async def document_content(
 async def put_document_content(
     document_id: int, body: ContentPut, user: SessionUser, db: DbSession, settings: AppSettings
 ):
-    row = await live_document(db, user.id, document_id)
+    row = await live_text_document(db, user.id, document_id)
     revision = await workspace_documents.write_content(
         db, settings, row, markdown=body.markdown, base_revision=body.base_revision
     )
@@ -2424,7 +2941,7 @@ async def put_document_content(
 async def put_document_notes(
     document_id: int, body: NotesPut, user: SessionUser, db: DbSession, settings: AppSettings
 ):
-    row = await live_document(db, user.id, document_id)
+    row = await live_text_document(db, user.id, document_id)
     revision = await workspace_documents.write_notes(
         db, settings, row, text=body.text, base_revision=body.base_revision
     )
@@ -2435,7 +2952,7 @@ async def put_document_notes(
 async def document_revisions(
     document_id: int, user: SessionUser, db: DbSession, settings: AppSettings
 ):
-    row = await live_document(db, user.id, document_id)
+    row = await live_text_document(db, user.id, document_id)
     history = await workspace_documents.revisions(db, settings, row)
     return {
         "revisions": [
@@ -2459,7 +2976,7 @@ async def revert_document_revision(
     db: DbSession,
     settings: AppSettings,
 ):
-    row = await live_document(db, user.id, document_id)
+    row = await live_text_document(db, user.id, document_id)
     if not re.fullmatch(r"[0-9a-f]{7,40}", commit):
         raise ApiError(404, "invalid_request", "No such revision")
     # The workspace lock first, then the rows — the order every mutation takes. A shell

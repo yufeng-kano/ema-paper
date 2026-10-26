@@ -1646,3 +1646,102 @@ async def test_the_retention_migration_keeps_a_deleted_parses_ledger_entry(scrat
             assert await _count(db, "credit_entries") == 0
     finally:
         await engine.dispose()
+
+
+LIBRARY_FILES = "da765b0142af"
+
+
+async def test_the_library_files_migration_tells_the_kinds_apart_and_guards_the_files(
+    scratch_url,
+) -> None:
+    """docs/database.md § Migrations: every row keeps what it was — a parse, or a markdown
+    document — under `kind`, the new columns empty, the parse agent's switch on; the
+    downgrade refuses while a file is kept in the library, since without `kind` its row
+    would read as a markdown document with no text anywhere."""
+    _alembic(scratch_url, "upgrade", PARSE_RETENTION)
+    engine = create_async_engine(scratch_url)
+    parse = uuid.uuid4()
+    try:
+        async with engine.begin() as db:
+            await db.execute(
+                text(
+                    "INSERT INTO users (id, google_sub, email, created_at) "
+                    "VALUES (1, 'sub', 'r@example.com', now())"
+                )
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO jobs (id, user_id, agent, kind, filename, media_type, "
+                    "size_bytes, sha256, pages_spec, model, pipeline_version, bbox_format, "
+                    "status, pages_done, prompt_sha256, created_at, finished_at) VALUES "
+                    "(:id, 1, 'parse', 'pdf', 'a.pdf', 'application/pdf', 1, 'h', '', "
+                    "'vendor/m', 1, 'yxyx_norm1000', 'succeeded', 1, '', now(), now())"
+                ),
+                {"id": parse},
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO documents (id, user_id, folder_id, job_id, name, created_at, "
+                    "updated_at) VALUES (1, 1, NULL, :job, 'paper.pdf', now(), now()), "
+                    "(2, 1, NULL, NULL, 'notes.md', now(), now())"
+                ),
+                {"job": parse},
+            )
+            await db.execute(
+                text("INSERT INTO agent_settings (user_id, agent, model) VALUES (1, 'parse', NULL)")
+            )
+        _alembic(scratch_url, "upgrade", LIBRARY_FILES)
+        async with engine.begin() as db:
+            rows = (
+                await db.execute(
+                    text("SELECT id, kind, media_type, size_bytes FROM documents ORDER BY id")
+                )
+            ).all()
+            assert rows == [(1, "parse", None, None), (2, "markdown", None, None)]
+            assert (await db.execute(text("SELECT auto_convert FROM agent_settings"))).scalar()
+            # A file names its type and size; a row that says nothing is a parse.
+            await db.execute(
+                text(
+                    "INSERT INTO documents (id, user_id, folder_id, job_id, name, kind, "
+                    "media_type, size_bytes, created_at, updated_at) VALUES (3, 1, NULL, NULL, "
+                    "'clip.mov', 'file', 'video/quicktime', 3000000000, now(), now())"
+                )
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO documents (id, user_id, folder_id, job_id, name, created_at, "
+                    "updated_at) VALUES (4, 1, NULL, :job, 'b.pdf', now(), now())"
+                ),
+                {"job": parse},
+            )
+            kinds = (await db.execute(text("SELECT id, kind FROM documents ORDER BY id"))).all()
+            assert kinds == [(1, "parse"), (2, "markdown"), (3, "file"), (4, "parse")]
+        with pytest.raises(subprocess.CalledProcessError) as refused:
+            _alembic(scratch_url, "downgrade", PARSE_RETENTION)
+        assert b"1 file(s) are kept in the library" in refused.value.stderr
+        async with engine.begin() as db:
+            version = (await db.execute(text("SELECT version_num FROM alembic_version"))).scalar()
+            assert version == LIBRARY_FILES
+            await db.execute(text("DELETE FROM documents WHERE id = 3"))
+        _alembic(scratch_url, "downgrade", PARSE_RETENTION)
+        async with engine.begin() as db:
+            columns = {
+                (table, column)
+                for table, column in (
+                    await db.execute(
+                        text(
+                            "SELECT table_name, column_name FROM information_schema.columns "
+                            "WHERE table_name IN ('documents', 'agent_settings')"
+                        )
+                    )
+                ).all()
+            }
+            assert not columns & {
+                ("documents", "kind"),
+                ("documents", "media_type"),
+                ("documents", "size_bytes"),
+                ("agent_settings", "auto_convert"),
+            }
+            assert (await db.execute(text("SELECT count(*) FROM documents"))).scalar() == 3
+    finally:
+        await engine.dispose()

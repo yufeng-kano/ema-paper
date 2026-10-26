@@ -525,6 +525,51 @@ defineProps<{ name: IconName }>()
       <rect x="2" y="3" width="20" height="14" rx="2" />
       <path d="M8 21h8M12 17v4" />
     </template>
+    <!-- file: a file kept as it is, of no kind the list draws on its own. -->
+    <template v-else-if="name === 'file'">
+      <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" />
+      <path d="M14 2v4a2 2 0 0 0 2 2h4" />
+    </template>
+
+    <!-- film: a video file. -->
+    <template v-else-if="name === 'film'">
+      <rect x="3" y="3" width="18" height="18" rx="2" />
+      <path d="M7 3v18M17 3v18M3 7.5h4M3 12h18M3 16.5h4M17 7.5h4M17 16.5h4" />
+    </template>
+
+    <!-- music: an audio file. -->
+    <template v-else-if="name === 'music'">
+      <path d="M9 18V5l12-2v13" />
+      <circle cx="6" cy="18" r="3" />
+      <circle cx="18" cy="16" r="3" />
+    </template>
+
+    <!-- sheet: a spreadsheet. -->
+    <template v-else-if="name === 'sheet'">
+      <rect x="3" y="3" width="18" height="18" rx="2" />
+      <path d="M3 9h18M3 15h18M9 9v12M15 9v12" />
+    </template>
+
+    <!-- presentation: a slide deck. -->
+    <template v-else-if="name === 'presentation'">
+      <path d="M2 3h20" />
+      <path d="M21 3v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V3" />
+      <path d="m7 21 5-5 5 5" />
+    </template>
+
+    <!-- archive: a compressed file. -->
+    <template v-else-if="name === 'archive'">
+      <rect x="2" y="3" width="20" height="5" rx="1" />
+      <path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8" />
+      <path d="M10 12h4" />
+    </template>
+
+    <!-- download: the file's bytes, saved. -->
+    <template v-else-if="name === 'download'">
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+      <path d="m7 10 5 5 5-5M12 15V3" />
+    </template>
+
     <!-- check: the confirmation a copy swaps to. -->
     <template v-else>
       <path d="M20 6 9 17l-5-5" />

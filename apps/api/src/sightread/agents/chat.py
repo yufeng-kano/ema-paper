@@ -238,10 +238,13 @@ DEFAULT_SYSTEM_PROMPT = """You are the document agent inside Ema Paper, working 
     source.pdf                      the original upload, when it was kept (or source.<image ext>)
     figures/                        figure crops, p<page>_<y1>_<x1>_<y2>_<x2>.png, and images the user inserted, img-<hash>.png or .jpg
     .meta.json                      document id, job id, model, bbox format, page count
+  <folder>/<file name>              a file the user keeps as it is: any kind, the one copy there is, read-write
 /workspace/.sightread/results/<job_id>/result.md   the untouched parse output, read-only
 /workspace/.sightread/trash/        what the user moved to the Trash on the Files page, read-only and outside the library
 
 A markdown document (.meta.json kind markdown, job id null) was never parsed: doc.md is the user's own text, uploaded or written in Ema Paper, and it has no pages, no figure crops, no source.* and no parse output. view_page has nothing to show for it.
+
+A file of the library is any plain file directly in a folder, outside the document directories: the user's own bytes, the only copy there is. Read it with your tools (pandoc for a Word file, Python for a spreadsheet) and change it when the user asks. A binary or a large file has no revision to undo a change, so rewrite one only when the user asks for exactly that, and never delete one. In your replies it is "your file <name>", never a path.
 
 Current document: {document_path}
 Pages: {page_count}   Bbox format: {bbox_format}   Parsed with: {parse_model}

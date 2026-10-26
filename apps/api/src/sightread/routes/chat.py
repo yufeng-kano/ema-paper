@@ -28,6 +28,7 @@ from ..agents import skills as skill_defs
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
 from ..billing import ledger
 from ..db.models import (
+    FILE_KIND,
     AgentSetting,
     ChatAttachment,
     ChatTurn,
@@ -96,7 +97,8 @@ async def owned_document(db: AsyncSession, user_id: int, document_id: int) -> Do
             select(Document).where(Document.id == document_id, Document.user_id == user_id)
         )
     ).scalar_one_or_none()
-    if row is None or not is_live(row, await user_folders(db, user_id)):
+    # A file of the library has no conversations (docs/workspace.md § Files).
+    if row is None or row.kind == FILE_KIND or not is_live(row, await user_folders(db, user_id)):
         raise ApiError(404, "invalid_request", "No such document")
     return row
 

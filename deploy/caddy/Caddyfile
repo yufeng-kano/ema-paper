@@ -19,22 +19,36 @@
 
 	# Security headers on every answer, the API's and the web app's alike (docs/deployment.md
 	# § Security headers, which explains each CSP source). Deferred, so each value replaces
-	# whatever the upstream sent. Caddyfile.local carries the same block without HSTS.
+	# whatever the upstream sent. Caddyfile.local carries the same blocks without HSTS.
 	header {
 		defer
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"
-		Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob: https://*.googleusercontent.com; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
-		X-Frame-Options DENY
 		X-Content-Type-Options nosniff
 		Referrer-Policy strict-origin-when-cross-origin
 		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
 		-Server
 		-X-Powered-By
 	}
+	# The policy and the frame header on every answer but the file route's, which carries
+	# its own (docs/api.md § GET /api/library/documents/{id}/file): a file served from the
+	# tree runs nothing with the session, and the site's policy would replace that.
+	@notfile not path /api/library/documents/*/file
+	header @notfile {
+		defer
+		Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob: https://*.googleusercontent.com; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+		X-Frame-Options DENY
+	}
 
-	# Keep in sync with UPLOAD_MAX_BYTES (docs/api.md § Limits): the app enforces the same
-	# cap while streaming, this stops an oversized body before it reaches Python.
-	request_body {
+	# Body caps per route (docs/deployment.md § Caddy routing). The web upload carries a
+	# file of any kind: FILE_MAX_BYTES plus the multipart envelope. Everything else keeps
+	# UPLOAD_MAX_BYTES. Keep both in sync with .env: the app enforces the same caps while
+	# streaming, these stop an oversized body before it reaches Python.
+	@upload path /api/library/documents
+	request_body @upload {
+		max_size 2048MB
+	}
+	@rest not path /api/library/documents
+	request_body @rest {
 		max_size 128MB
 	}
 

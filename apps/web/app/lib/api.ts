@@ -94,6 +94,9 @@ export interface AgentSettings {
   /** `check` only: whether a Files upload is checked before it opens (docs/parsing.md
    *  § Format check). */
   auto_check?: boolean
+  /** `parse` only: whether an uploaded PDF or image is converted on arrival; off, it is
+   *  kept as a file and converted from its menu (docs/workspace.md § Files). */
+  auto_convert?: boolean
 }
 
 /**
@@ -134,6 +137,9 @@ export interface ConnectionModel {
  *  one set of numbers. */
 export interface UploadLimits {
   upload_max_bytes: number
+  /** The cap of a file kept as it is (docs/api.md § Limits); optional so a page served
+   *  by an older API still renders. */
+  file_max_bytes?: number
   page_cap: number
   accepted_media_types: string[]
   /** What intake accepts by extension when the browser reports a generic media type. */
@@ -321,6 +327,10 @@ export interface MeResponse {
   credits_remaining: number
   /** The balance a chat send needs (`CHAT_MIN_CREDITS`). */
   chat_min_credits: number
+  /** The parse agent's switch (docs/agents.md): whether a PDF or an image uploaded on Files
+   *  is converted on arrival — which decides the cap the page applies to it (docs/web.md
+   *  § Files). Optional so a page served by an older API still renders. */
+  auto_convert?: boolean
 }
 
 // --- billing (docs/billing.md § Routes) --------------------------------------------
@@ -712,7 +722,8 @@ export interface LibraryFolder {
 /**
  * One file: the entry, plus the live state of the parse behind it. The two travel together
  * so a row renders — name, status, progress — from a single `GET /api/library`. A markdown
- * document (`kind` `markdown`) has no parse: every parse field is null (docs/api.md).
+ * document (`kind` `markdown`) has no parse: every parse field is null; nor has a file kept
+ * as it is (`kind` `file`), which carries its `media_type` instead (docs/api.md).
  */
 export interface LibraryDocument {
   id: number
@@ -726,6 +737,10 @@ export interface LibraryDocument {
   pages_done: number | null
   /** The upload; null for a markdown document. */
   size_bytes: number | null
+  /** A file kept as it is: its media type, as intake decided it (docs/workspace.md
+   *  § Files); null for a document. Optional so a page served by an older API still
+   *  renders. */
+  media_type?: string | null
   /** What the document takes of the storage: its directory, its original and its images,
    *  never the service's copies (docs/workspace.md § Quota). Null where the library read did
    *  not measure it; optional so a page served by an older API still renders. */
@@ -1171,6 +1186,19 @@ export function reconvertDocument(id: number, model: string | null): Promise<{ j
  *  any parse no file names is (docs/jobs.md § Retention). */
 export function dismissReconvert(id: number): Promise<void> {
   return request<undefined>('DELETE', `/api/library/documents/${id}/reconvert`)
+}
+
+/** A file kept as it is becomes a document: a parse of it on `model` — null runs it on the
+ *  parse agent's own — in its place and under its name (docs/jobs.md § Converting a file).
+ *  Answers the document as the library now lists it, queued. */
+export function convertDocument(id: number, model: string | null): Promise<LibraryDocument> {
+  return request('POST', `/api/library/documents/${id}/convert`, { model })
+}
+
+/** Where a file's bytes are read from — inline for what a browser shows safely, as a save
+ *  with `download` (docs/api.md § `GET /api/library/documents/{id}/file`). */
+export function documentFileUrl(id: number, download = false): string {
+  return `/api/library/documents/${id}/file${download ? '?download=1' : ''}`
 }
 
 // --- workspace: content, notes, revisions (docs/web.md § Editing) -------------------

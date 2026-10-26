@@ -79,6 +79,7 @@ from ..workspace.locks import workspace_lock
 from ..workspace.trash import lock_user
 from .billing import me_fields
 from .chat import TITLE_MAX_CHARS, owned_document, turn_note
+from .library import parse_auto_convert
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +202,10 @@ async def me(user: SessionUser, db: DbSession, settings: AppSettings):
         # The plan and the balance, so the shell shows them without a second request
         # (docs/billing.md § Routes).
         **await me_fields(db, settings, user.id),
+        # The parse agent's switch, so the Files page applies to a PDF or an image the cap
+        # the server will: a parse's while it converts them, a file's while it keeps them
+        # (docs/web.md § Files).
+        "auto_convert": await parse_auto_convert(db, user.id),
         # What the upload UI is allowed to send, from the server's own configuration —
         # a limit written twice is a limit that drifts (docs/api.md § Limits).
         "limits": {
@@ -240,6 +245,8 @@ async def me(user: SessionUser, db: DbSession, settings: AppSettings):
             # How long the Trash keeps an item, which its tab states; 0 = never emptied by
             # itself (docs/workspace.md § The Trash).
             "trash_retention_days": settings.trash_retention_days,
+            # The most a file of any other kind may be (docs/workspace.md § Files).
+            "file_max_bytes": settings.file_max_bytes,
         },
     }
 
@@ -618,6 +625,9 @@ def _agent_settings_payload(settings: AppSettings, agent: str, row: AgentSetting
         # fact — and whether it goes there on its own (docs/parsing.md § Fallback model).
         "fallback_model": (settings.parse_fallback_model or None) if agent == PARSE.name else None,
         "auto_fallback": bool(row.auto_fallback) if row else False,
+        # And whether a PDF or an image uploaded on the Files page is converted on arrival
+        # (docs/workspace.md § Files).
+        "auto_convert": row.auto_convert if row and row.auto_convert is not None else True,
         # The check agent's own: whether a Files upload is checked before it opens
         # (docs/parsing.md § Format check).
         "auto_check": row.auto_check if row and row.auto_check is not None else True,
@@ -689,6 +699,7 @@ class AgentSettingsPut(BaseModel):
     memory_paused: bool | None = None
     # The parse agent's own (docs/agents.md).
     auto_fallback: bool | None = None
+    auto_convert: bool | None = None
     # The check agent's own (docs/agents.md).
     auto_check: bool | None = None
 
@@ -702,6 +713,7 @@ SETTING_OWNERS: dict[str, tuple[str, ...]] = {
     "memory_auto": (CHAT.name,),
     "memory_paused": (CHAT.name,),
     "auto_fallback": (PARSE.name,),
+    "auto_convert": (PARSE.name,),
     "auto_check": (CHECK.name,),
 }
 # A language tag, as the composer's locale is one (docs/api.md).
@@ -747,7 +759,7 @@ async def put_agent_settings(
         raise ApiError(
             400, "invalid_request", f"The {agent.name} agent takes no {', '.join(foreign)}"
         )
-    for switch in ("memory_auto", "memory_paused", "auto_fallback", "auto_check"):
+    for switch in ("memory_auto", "memory_paused", "auto_fallback", "auto_convert", "auto_check"):
         if switch in provided and getattr(body, switch) is None:
             raise ApiError(400, "invalid_request", f"{switch} is true or false")
     instructions = (
@@ -804,6 +816,8 @@ async def put_agent_settings(
         row.model = model
     if "auto_fallback" in provided:
         row.auto_fallback = bool(body.auto_fallback)
+    if "auto_convert" in provided:
+        row.auto_convert = bool(body.auto_convert)
     if "auto_check" in provided:
         row.auto_check = bool(body.auto_check)
     if "prompt" in provided or "prompt_preset_id" in provided:

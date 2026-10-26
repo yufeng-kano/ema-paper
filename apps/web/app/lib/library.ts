@@ -11,6 +11,7 @@
  * treating it as an id would mean inventing a folder the server does not have.
  */
 import type { LibraryDocument, LibraryFolder, UploadLimits } from '~/lib/api'
+import type { IconName } from '~/lib/icons'
 
 export type FolderId = number | null
 
@@ -126,8 +127,9 @@ export function checkFailureReason(error: string | null): string | null {
 }
 
 /**
- * Whether the upload endpoint would take this file, judged by the server's own two lists
- * (`GET /api/me` § limits).
+ * Whether intake would parse this file — a PDF or an image — judged by the server's own two
+ * lists (`GET /api/me` § limits). Any other file is taken too, and kept as it is
+ * (docs/web.md § Files); this decides the cap, the glyph and whether it converts.
  *
  * The extension is not a fallback for tidiness: a browser reports a generic type — or none
  * at all — for a file it has no association for, which is routine for `.heic` and for
@@ -193,4 +195,220 @@ export function keyRange(keys: string[], from: string, to: string): string[] {
 export function typeAheadMatch(rows: { key: string; name: string }[], typed: string): string | null {
   const prefix = typed.toLocaleLowerCase()
   return rows.find((row) => row.name.toLocaleLowerCase().startsWith(prefix))?.key ?? null
+}
+
+/**
+ * The cap intake applies to this file, from the server's own numbers (`GET /api/me`
+ * § limits): a markdown document's, a parse's for a PDF or an image while the parse agent
+ * converts them (`autoConvert`, its switch), a file's for anything else — the PDF or image
+ * kept as a file included. Which cap, never whether it is taken, since every kind is
+ * (docs/web.md § Files). Null while the limits have not arrived, or where an older API
+ * names none.
+ */
+export function uploadCap(
+  file: { name: string; type: string },
+  limits: UploadLimits | null,
+  autoConvert = true,
+): number | null {
+  if (!limits) {
+    return null
+  }
+  if (isMarkdownUpload(file, limits)) {
+    return limits.markdown_max_bytes ?? null
+  }
+  if (autoConvert && acceptsUpload(file, limits)) {
+    return limits.upload_max_bytes
+  }
+  return limits.file_max_bytes ?? null
+}
+
+/** The glyph before a file's name, by its type (docs/web.md § Files, *Four columns*). */
+export type FileGlyph = 'file' | 'file-text' | 'image' | 'film' | 'music' | 'sheet' | 'presentation' | 'archive'
+
+/**
+ * What a file is, in the terms the Kind column and the glyph use: the catalog key that
+ * names its kind (`files.kinds.<key>`) and the format's name for the key's `{format}` —
+ * *JPEG image*, *Excel spreadsheet*, *ZIP archive*, else *<EXT> file*.
+ */
+export interface FileKind {
+  key: 'pdf' | 'image' | 'video' | 'audio' | 'spreadsheet' | 'presentation' | 'word' | 'archive' | 'file' | 'plain'
+  format: string
+  glyph: FileGlyph
+}
+
+type MediaKind = 'image' | 'video' | 'audio'
+
+/** The names of the common media subtypes where the subtype is not already the name. */
+const FORMAT_NAMES = new Map<string, string>([
+  ['jpeg', 'JPEG'],
+  ['png', 'PNG'],
+  ['gif', 'GIF'],
+  ['webp', 'WebP'],
+  ['heic', 'HEIC'],
+  ['heif', 'HEIF'],
+  ['avif', 'AVIF'],
+  ['tiff', 'TIFF'],
+  ['bmp', 'BMP'],
+  ['svg+xml', 'SVG'],
+  ['mp4', 'MPEG-4'],
+  ['quicktime', 'QuickTime'],
+  ['webm', 'WebM'],
+  ['x-matroska', 'Matroska'],
+  ['mpeg', 'MPEG'],
+  ['x-msvideo', 'AVI'],
+  ['mp3', 'MP3'],
+  ['wav', 'WAV'],
+  ['x-wav', 'WAV'],
+  ['flac', 'FLAC'],
+  ['x-flac', 'FLAC'],
+  ['aac', 'AAC'],
+  ['ogg', 'Ogg'],
+  ['x-m4a', 'M4A'],
+  ['mp4a', 'M4A'],
+])
+
+type OfficeKind = { key: 'spreadsheet' | 'presentation' | 'word'; format: string }
+
+const EXCEL: OfficeKind = { key: 'spreadsheet', format: 'Excel' }
+const NUMBERS: OfficeKind = { key: 'spreadsheet', format: 'Numbers' }
+const ODS: OfficeKind = { key: 'spreadsheet', format: 'OpenDocument' }
+const POWERPOINT: OfficeKind = { key: 'presentation', format: 'PowerPoint' }
+const KEYNOTE: OfficeKind = { key: 'presentation', format: 'Keynote' }
+const ODP: OfficeKind = { key: 'presentation', format: 'OpenDocument' }
+const WORD: OfficeKind = { key: 'word', format: 'Word' }
+const PAGES: OfficeKind = { key: 'word', format: 'Pages' }
+const ODT: OfficeKind = { key: 'word', format: 'OpenDocument' }
+
+/** Office documents by media type, then by extension: the suite's name is the one a reader
+ *  knows, and a browser types these generically as often as not. */
+const OFFICE = new Map<string, OfficeKind>([
+  ['application/vnd.ms-excel', EXCEL],
+  ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', EXCEL],
+  ['application/vnd.apple.numbers', NUMBERS],
+  ['application/vnd.oasis.opendocument.spreadsheet', ODS],
+  ['application/vnd.ms-powerpoint', POWERPOINT],
+  ['application/vnd.openxmlformats-officedocument.presentationml.presentation', POWERPOINT],
+  ['application/vnd.apple.keynote', KEYNOTE],
+  ['application/vnd.oasis.opendocument.presentation', ODP],
+  ['application/msword', WORD],
+  ['application/vnd.openxmlformats-officedocument.wordprocessingml.document', WORD],
+  ['application/vnd.apple.pages', PAGES],
+  ['application/vnd.oasis.opendocument.text', ODT],
+  ['xls', EXCEL],
+  ['xlsx', EXCEL],
+  ['xlsm', EXCEL],
+  ['numbers', NUMBERS],
+  ['ods', ODS],
+  ['ppt', POWERPOINT],
+  ['pptx', POWERPOINT],
+  ['key', KEYNOTE],
+  ['odp', ODP],
+  ['doc', WORD],
+  ['docx', WORD],
+  ['pages', PAGES],
+  ['odt', ODT],
+])
+
+/** Archives by media type, then by extension. */
+const ARCHIVES = new Map<string, string>([
+  ['application/zip', 'ZIP'],
+  ['application/x-zip-compressed', 'ZIP'],
+  ['application/x-7z-compressed', '7-Zip'],
+  ['application/vnd.rar', 'RAR'],
+  ['application/x-rar-compressed', 'RAR'],
+  ['application/x-tar', 'tar'],
+  ['application/gzip', 'gzip'],
+  ['application/x-gzip', 'gzip'],
+  ['application/x-bzip2', 'bzip2'],
+  ['application/x-xz', 'xz'],
+  ['zip', 'ZIP'],
+  ['7z', '7-Zip'],
+  ['rar', 'RAR'],
+  ['tar', 'tar'],
+  ['gz', 'gzip'],
+  ['tgz', 'gzip'],
+  ['bz2', 'bzip2'],
+  ['xz', 'xz'],
+])
+
+const GLYPHS: Readonly<Record<FileKind['key'], FileGlyph>> = {
+  pdf: 'file-text',
+  image: 'image',
+  video: 'film',
+  audio: 'music',
+  spreadsheet: 'sheet',
+  presentation: 'presentation',
+  word: 'file-text',
+  archive: 'archive',
+  file: 'file',
+  plain: 'file',
+}
+
+/** The extension, lower-cased and without its dot; a leading dot is a name, not an extension. */
+function extensionOf(name: string): string {
+  const dot = name.lastIndexOf('.')
+  return dot <= 0 ? '' : name.slice(dot + 1).toLowerCase()
+}
+
+/**
+ * What a file kept as it is is — by its media type first, as intake stored it, then by its
+ * extension, since a browser types what it has no association for as nothing at all.
+ */
+export function fileKind(file: { name: string; media_type?: string | null }): FileKind {
+  const type = (file.media_type ?? '').toLowerCase()
+  const slash = type.indexOf('/')
+  const top = slash === -1 ? '' : type.slice(0, slash)
+  const subtype = slash === -1 ? '' : type.slice(slash + 1)
+  const extension = extensionOf(file.name)
+  if (type === 'application/pdf' || extension === 'pdf') {
+    return { key: 'pdf', format: 'PDF', glyph: GLYPHS.pdf }
+  }
+  if (top === 'image' || top === 'video' || top === 'audio') {
+    const media: MediaKind = top
+    return { key: media, format: FORMAT_NAMES.get(subtype) ?? (extension || subtype).toUpperCase(), glyph: GLYPHS[media] }
+  }
+  const office = OFFICE.get(type) ?? OFFICE.get(extension)
+  if (office) {
+    return { ...office, glyph: GLYPHS[office.key] }
+  }
+  const archive = ARCHIVES.get(type) ?? ARCHIVES.get(extension)
+  if (archive) {
+    return { key: 'archive', format: archive, glyph: GLYPHS.archive }
+  }
+  return extension
+    ? { key: 'file', format: extension.toUpperCase(), glyph: GLYPHS.file }
+    : { key: 'plain', format: '', glyph: GLYPHS.plain }
+}
+
+/** The glyph before a row's name: a document's by what it was converted from, a file's by
+ *  its type (docs/web.md § Files, *Four columns*). */
+export function documentGlyph(document: { kind: string; name: string; media_type?: string | null }): IconName {
+  if (document.kind === 'file') {
+    return fileKind(document).glyph
+  }
+  return document.kind === 'image' ? 'image' : 'file-text'
+}
+
+/** What the file viewer shows of a file by itself: what a browser renders safely on its own
+ *  and the file route serves inline (docs/api.md § `GET /api/library/documents/{id}/file`).
+ *  An SVG is served as a download, so it has none. */
+export type FilePreview = 'image' | 'video' | 'audio' | 'pdf' | 'text' | 'none'
+
+export function filePreview(mediaType: string | null | undefined): FilePreview {
+  const type = (mediaType ?? '').toLowerCase()
+  if (type === 'image/svg+xml') {
+    return 'none'
+  }
+  for (const media of ['image', 'video', 'audio'] as const) {
+    if (type.startsWith(`${media}/`)) {
+      return media
+    }
+  }
+  if (type === 'application/pdf') {
+    return 'pdf'
+  }
+  if (type === 'text/plain') {
+    return 'text'
+  }
+  return 'none'
 }

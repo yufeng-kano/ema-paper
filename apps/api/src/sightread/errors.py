@@ -22,6 +22,7 @@ ErrorType = Literal[
     "payment",
     "insufficient_credits",
     "storage_full",
+    "not_convertible",
     "checkout_unavailable",
     "pay_unavailable",
     "subscription_active",

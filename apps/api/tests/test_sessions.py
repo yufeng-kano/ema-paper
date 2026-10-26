@@ -33,7 +33,14 @@ async def test_dev_login_round_trip(client: AsyncClient) -> None:
     assert me.status_code == 200
     body = me.json()
     assert body["user"]["email"] == "dev@localhost"
-    assert set(body) == {"user", "limits", "plan", "credits_remaining", "chat_min_credits"}
+    assert set(body) == {
+        "user",
+        "limits",
+        "plan",
+        "credits_remaining",
+        "chat_min_credits",
+        "auto_convert",
+    }
 
     logout = await client.post("/api/auth/logout", headers=CSRF_HEADERS)
     assert logout.status_code == 204

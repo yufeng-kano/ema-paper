@@ -91,6 +91,9 @@ class Settings(BaseSettings):
     kano_pay_checkout_lifetime_seconds: int = 86_400
 
     upload_max_bytes: int = 134_217_728
+    # A file of any other kind uploaded to the library, kept once in the tree
+    # (docs/workspace.md § Files): the most it may be. Caddy caps that one route to match.
+    file_max_bytes: int = 2_000_000_000
     page_cap: int = 500
     max_jobs_per_user: int = 2
     # The `Retry-After` a refused parse (429, the per-user job cap) tells the client.
@@ -140,6 +143,9 @@ class Settings(BaseSettings):
     workspace_quota_bytes: int = 10_737_418_240
     # The largest document file the API opens; the shell can write anything.
     content_max_bytes: int = 8_388_608
+    # The largest file a revision records; a larger or a binary one is kept in the tree but
+    # not in history (docs/workspace.md § Revisions).
+    revision_max_file_bytes: int = 1_048_576
     # An image inserted into a document: the upload's cap, and the long edge it is kept at
     # (docs/workspace.md § Inserted images).
     document_image_max_bytes: int = 20 * 1024 * 1024

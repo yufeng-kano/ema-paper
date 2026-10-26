@@ -46,6 +46,7 @@ import {
   updateFolder,
   uploadDocument,
   creditsRefusalOf,
+  documentFileUrl,
   type CreditsRefusal,
   type JobResult,
   type LibraryDocument,
@@ -62,12 +63,14 @@ import {
   setDropEffect,
 } from '~/lib/dnd'
 import { formatBytes, formatShortDateTime } from '~/lib/format'
+import type { IconName } from '~/lib/icons'
 import type { MenuItem, Point } from '~/lib/menu'
 import {
   acceptsUpload,
   childFolders,
   DOCUMENT_NAME_MAX,
   FOLDER_NAME_MAX,
+  documentGlyph,
   documentsIn,
   folderPath,
   isMarkdownUpload,
@@ -77,6 +80,7 @@ import {
   renameSelectionEnd,
   subtreeIds,
   typeAheadMatch,
+  uploadCap,
   type FolderId,
 } from '~/lib/library'
 import type { TableColumn } from '~/lib/table'
@@ -104,6 +108,8 @@ const { t, locale } = useI18n()
 const auth = useAuth()
 const { resolve } = useApiError()
 const { apple, label, matches } = useShortcuts()
+const localePath = useLocalePath()
+const kindLabel = useKindLabel()
 const { data, pending, errorMessage, refresh } = useAuthedData(() => getLibrary())
 
 const folders = computed<LibraryFolder[]>(() => data.value?.folders ?? [])
@@ -350,6 +356,7 @@ function trashedAt(row: TrashRow): string {
 
 const columns = computed<TableColumn<Row>[]>(() => [
   { key: 'name', header: t('files.columnName') },
+  { key: 'kind', header: t('files.columnKind'), width: '200px' },
   { key: 'size', header: t('files.columnSize'), numeric: true, width: '96px' },
   { key: 'added', header: t('files.columnAdded'), numeric: true, width: '148px' },
 ])
@@ -595,15 +602,28 @@ const mutationError = ref<string | null>(null)
 /** The 402 of an upload: the dialog that says what the document needs (docs/web.md § Files). */
 const creditsRefusal = ref<CreditsRefusal | null>(null)
 const limits = computed(() => auth.me.value?.limits ?? null)
+/** The parse agent's switch: on, a PDF or an image is parsed and capped as a parse; off,
+ *  kept and capped as a file (docs/web.md § Files). The switch in Settings writes it here. */
+const autoConvert = computed(() => auth.me.value?.auto_convert ?? true)
 /** How long the Trash keeps an item; 0 (or an older API's silence) keeps it until emptied. */
 const trashRetentionDays = computed(() => limits.value?.trash_retention_days ?? 0)
-/** Both lists: a file picker filters on either, and a system that types `.heic` as
- *  nothing at all would otherwise grey the file out. */
-const accept = computed(() =>
-  limits.value
-    ? [...limits.value.accepted_media_types, ...limits.value.accepted_extensions].join(',')
-    : '',
-)
+/** The 409 of an upload past the plan's storage: a banner with the way to more of it
+ *  (docs/web.md § Files). */
+const storageFull = ref(false)
+
+/** The glyph of a row still going up: what the file is, by its type (`fileKind`). */
+function uploadGlyph(upload: PendingUpload): IconName {
+  return documentGlyph({ kind: 'file', name: upload.name, media_type: upload.file.type })
+}
+
+/** Whether Convert to document is offered: a file kept as it is that intake would parse —
+ *  a PDF or an image (docs/web.md § Files). */
+function convertible(document: LibraryDocument): boolean {
+  return (
+    document.kind === 'file' &&
+    acceptsUpload({ name: document.name, type: document.media_type ?? '' }, limits.value)
+  )
+}
 
 let nextLocalId = 1
 let draining = false
@@ -631,17 +651,16 @@ function onPicked(event: Event) {
  * (`GET /api/me` § limits) — an upload that cannot succeed should not spend the upload.
  */
 function rejected(file: File): string | null {
-  // A markdown file is not parsed; its cap is the one its text is read under.
-  const max = isMarkdownUpload(file, limits.value) ? limits.value?.markdown_max_bytes : limits.value?.upload_max_bytes
-  if (max && file.size > max) {
-    return t('files.tooLarge', { name: file.name, limit: formatBytes(max, locale.value) })
+  // Size is the one refusal: every kind of file is kept (docs/web.md § Files). The cap is
+  // the one intake applies to this file — a markdown document's, a parse's, a file's —
+  // judged the way intake judges it, media type then extension (`lib/library.ts`).
+  const max = uploadCap(file, limits.value, autoConvert.value)
+  if (max === null || file.size <= max) {
+    return null
   }
-  // Judged the way intake judges it — media type, then extension — so this page never
-  // refuses a file the API would have taken (`lib/library.ts`).
-  if (!acceptsUpload(file, limits.value)) {
-    return t('files.unsupported', { name: file.name })
-  }
-  return null
+  const limit = formatBytes(max, locale.value)
+  const kept = !isMarkdownUpload(file, limits.value) && !(autoConvert.value && acceptsUpload(file, limits.value))
+  return t(kept ? 'files.tooLargeFile' : 'files.tooLarge', { name: file.name, limit })
 }
 
 function addToQueue(files: File[], folderId: FolderId) {
@@ -713,6 +732,12 @@ async function drain() {
         const refusal = creditsRefusalOf(error)
         if (refusal) {
           creditsRefusal.value = refusal
+          continue
+        }
+        // Past the plan's storage: nothing was stored, and the banner says where more of
+        // it comes from (docs/web.md § Files).
+        if (api?.type === 'storage_full') {
+          storageFull.value = true
           continue
         }
         mutationError.value = await resolve(error)
@@ -822,8 +847,9 @@ async function showResult(document: LibraryDocument) {
     return
   }
   openDocument.value = document
-  // A markdown document has no result: the viewer reads its copy (docs/web.md § Files).
-  if (document.kind === 'markdown' || results.has(document.id)) {
+  // A markdown document has no result: the viewer reads its copy; nor has a file kept as
+  // it is: its viewer shows the file itself (docs/web.md § Files).
+  if (document.kind === 'markdown' || document.kind === 'file' || results.has(document.id)) {
     return
   }
   await fetchResult(document)
@@ -966,6 +992,83 @@ function reconvertRetry(document: LibraryDocument): LibraryDocument {
 async function onReconvertStarted() {
   reconverting.value = null
   await refresh()
+}
+
+// --- files kept as they are --------------------------------------------------------------
+
+/** The file whose Convert to document… dialog is open (docs/web.md § Files). */
+const converting = ref<LibraryDocument | null>(null)
+
+/** Converted: the row is a parse from the next read on, and the document opens by itself
+ *  when the parse succeeds, as a single upload does. */
+async function onConverted(id: number) {
+  converting.value = null
+  if (openDocument.value?.id === id) {
+    openDocument.value = null
+  }
+  autoPreviewFor = id
+  await refresh()
+}
+
+/** Where the open file is, Home first — the file viewer's *Location*. */
+const openLocation = computed(() => {
+  const open = openDocument.value
+  if (!open) {
+    return ''
+  }
+  return [t('files.root'), ...folderPath(folders.value, open.folder_id).map((folder) => folder.name)].join(' › ')
+})
+
+/** The file's bytes, saved: the browser takes `?download=1` to the disk (docs/api.md). */
+function downloadEntry(id: number) {
+  const anchor = window.document.createElement('a')
+  anchor.href = documentFileUrl(id, true)
+  anchor.download = ''
+  anchor.click()
+}
+
+/** The open file as an entry of the list, for the viewer's menu to act on. */
+function viewerEntry(): Entry | null {
+  const open = openDocument.value
+  return open ? { kind: 'file', id: open.id, key: `file-${open.id}`, name: open.name } : null
+}
+
+/** Show in Files: the viewer closes on the file's row, selected and in view. */
+async function showOpenInFiles() {
+  const open = openDocument.value
+  if (!open) {
+    return
+  }
+  openDocument.value = null
+  showView('files')
+  openFolder(open.folder_id)
+  await nextTick()
+  selectOnly(`file-${open.id}`)
+  scrollToRow(`file-${open.id}`)
+}
+
+async function renameOpen() {
+  const entry = viewerEntry()
+  if (!entry) {
+    return
+  }
+  await showOpenInFiles()
+  startRename(entry.key)
+}
+
+function duplicateOpen() {
+  const entry = viewerEntry()
+  const into = openDocument.value?.folder_id ?? null
+  if (entry) {
+    void copyInto([entry], into)
+  }
+}
+
+function trashOpen() {
+  const entry = viewerEntry()
+  if (entry) {
+    void trashItems([entry])
+  }
 }
 
 // --- file operations -------------------------------------------------------
@@ -1814,6 +1917,10 @@ const menuItems = computed<MenuItem[]>(() => {
             // A parse opens only once every page has succeeded (docs/web.md § Files).
             disabled: !!parse && isPending(parse),
           },
+          // A file kept as it is: its bytes, saved (docs/web.md § Files).
+          ...(parse?.kind === 'file'
+            ? [{ key: 'download', label: t('files.download'), icon: 'download' as const }]
+            : []),
           // With no page missing (its format check failed), the retry is of the whole document.
           ...(parse?.status === 'failed'
             ? [
@@ -1839,6 +1946,10 @@ const menuItems = computed<MenuItem[]>(() => {
             ? [{ key: 'reconvert', label: t('files.reconvert'), icon: 'refresh' as const }]
             : []),
           { key: 'rename', label: t('files.rename'), icon: 'edit' as const, shortcut: label(apple ? 'enter' : 'f2') },
+          // A PDF or an image kept as a file becomes a document from here (docs/web.md § Files).
+          ...(parse && convertible(parse)
+            ? [{ key: 'convert', label: t('files.convert'), icon: 'scan-text' as const, separated: true }]
+            : []),
         ]
       : []),
     { key: 'copy', label: t('files.copy'), icon: 'copy', separated: !!one, shortcut: label('mod+c') },
@@ -1878,6 +1989,15 @@ function runMenu(action: string) {
       return items[0] && openEntry(items[0].key)
     case 'rename':
       return items[0] && startRename(items[0].key)
+    case 'download':
+      return items[0] && downloadEntry(items[0].id)
+    case 'convert': {
+      const document = items[0] && documents.value.find((row) => row.id === items[0]!.id)
+      if (document) {
+        converting.value = document
+      }
+      return
+    }
     case 'reconvert':
     case 'retryReconvert':
     case 'dismissReconvert': {
@@ -2270,7 +2390,6 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
       class="sr-only"
       type="file"
       multiple
-      :accept="accept"
       @change="onPicked"
     >
     <UiScreen>
@@ -2427,6 +2546,17 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
               </UiButton>
             </template>
           </UiBanner>
+          <UiBanner v-if="storageFull" class="state" tone="error">
+            {{ t('files.storageFull') }}
+            <template #actions>
+              <UiButton variant="ghost" size="xs" :to="localePath('/pricing')">
+                {{ t('credits.seePlans') }}
+              </UiButton>
+              <UiButton variant="ghost" size="xs" @click="storageFull = false">
+                {{ t('common.close') }}
+              </UiButton>
+            </template>
+          </UiBanner>
 
           <!-- The two deletes nothing can undo ask here, not in a dialog: nothing else on
                the page is held up while the question stands. -->
@@ -2466,7 +2596,7 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
                   class="entry pendingup"
                   :title="row.upload.name"
                 >
-                  <UiIcon :name="row.upload.file.type.startsWith('image/') ? 'image' : 'file-text'" />
+                  <UiIcon :name="uploadGlyph(row.upload)" />
                   <span class="entry-name">{{ row.upload.name }}</span>
                   <span
                     class="entry-state"
@@ -2486,7 +2616,7 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
                 >
                   <UiIcon
                     :class="{ 'folder-glyph': row.kind === 'folder' }"
-                    :name="row.kind === 'folder' ? 'folder' : row.document.kind === 'image' ? 'image' : 'file-text'"
+                    :name="row.kind === 'folder' ? 'folder' : documentGlyph(row.document)"
                   />
                   <UiTextInput
                     v-if="renaming?.key === row.key"
@@ -2518,6 +2648,16 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
                     <UiIcon v-if="documentState(row.document)!.failed" name="circle-alert" />
                     <UiSpinner v-else />
                   </span>
+                </span>
+              </template>
+
+              <!-- What a row is, in words: a document by what it was converted from, a file by
+                   its type (docs/web.md § Files, *Four columns*). A row still going up says
+                   nothing yet: what it lands as is the server's to decide. -->
+              <template #cell-kind="{ row }">
+                <span class="muted">
+                  <template v-if="row.kind === 'folder'">{{ t('files.kinds.folder') }}</template>
+                  <template v-else-if="row.kind === 'file'">{{ kindLabel(row.document) }}</template>
                 </span>
               </template>
 
@@ -2562,7 +2702,7 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
                 <span class="entry" :title="row.kind === 'folder' ? row.folder.name : row.document.name">
                   <UiIcon
                     :class="{ 'folder-glyph': row.kind === 'folder' }"
-                    :name="row.kind === 'folder' ? 'folder' : row.document.kind === 'image' ? 'image' : 'file-text'"
+                    :name="row.kind === 'folder' ? 'folder' : documentGlyph(row.document)"
                   />
                   <span class="entry-name">{{ row.kind === 'folder' ? row.folder.name : row.document.name }}</span>
                 </span>
@@ -2638,6 +2778,15 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
       @close="reconverting = null"
     />
 
+    <ConvertDialog
+      v-if="converting"
+      :key="converting.id"
+      :document="converting"
+      @converted="onConverted"
+      @refused="creditsRefusal = $event; converting = null"
+      @close="converting = null"
+    />
+
     <CreditsDialog
       v-if="creditsRefusal"
       :refusal="creditsRefusal"
@@ -2645,11 +2794,26 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
       @close="creditsRefusal = null"
     />
 
-    <!-- Keyed per document, and per parse: reopening on another file, or a re-convert taken
-         in, resets scroll and page state and reads the copy again. Only a finished parse
-         opens, so `pending` is its one read of the result. -->
+    <!-- A file kept as it is opens in its own viewer: the file itself, no result to read
+         (docs/web.md § Files). A document's is keyed per document, and per parse: reopening
+         on another file, or a re-convert taken in, resets scroll and page state and reads
+         the copy again. Only a finished parse opens, so `pending` is its one read of the
+         result. -->
+    <FileViewer
+      v-if="openDocument && openDocument.kind === 'file'"
+      :key="openDocument.id"
+      :document="openDocument"
+      :location="openLocation"
+      :convertible="convertible(openDocument)"
+      @close="openDocument = null"
+      @convert="converting = openDocument"
+      @rename="renameOpen"
+      @duplicate="duplicateOpen"
+      @show="showOpenInFiles"
+      @trash="trashOpen"
+    />
     <ResultViewer
-      v-if="openDocument"
+      v-else-if="openDocument"
       :key="`${openDocument.id}:${openDocument.job_id}`"
       :title="openDocument.name"
       :error="openDocument.error"

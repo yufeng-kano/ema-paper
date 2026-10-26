@@ -19,7 +19,7 @@ from pathlib import Path
 
 from ..config import get_settings
 from . import safe_io
-from .layout import EXCLUDE_RULES, git_dir
+from .layout import DOC_FILE, EXCLUDE_RULES, META_FILE, NOTES_FILE, git_dir
 
 GIT = "git"
 
@@ -48,6 +48,45 @@ def _log_files_max() -> int:
 # The identities commits carry. An agent commit names its conversation in the author.
 USER_AUTHOR = "user"
 AGENT_AUTHOR_PREFIX = "agent:"
+
+# What a revision records of a file that is not a document's own: text, and no more than
+# `REVISION_MAX_FILE_BYTES` of it (docs/workspace.md § Revisions). A document's own files
+# are recorded whatever they hold.
+RECORDED_NAMES = frozenset({DOC_FILE, NOTES_FILE, META_FILE})
+_TEXT_PROBE_BYTES = 8192
+
+
+def is_text(data: bytes) -> bool:
+    """Git's own test of a text file, on bytes in hand: no NUL byte in the first 8 KiB."""
+    return b"\0" not in data[:_TEXT_PROBE_BYTES]
+
+
+def revision_max_file_bytes() -> int:
+    """The largest file a revision records (`REVISION_MAX_FILE_BYTES`)."""
+    return int(get_settings().revision_max_file_bytes)
+
+
+def recordable(root: Path, relative: Path, max_bytes: int) -> bool:
+    """Whether history takes the file at `relative`: a document's own file always; any
+    other only when it is text — no NUL byte in its first 8 KiB — and no larger than
+    `REVISION_MAX_FILE_BYTES`, so a video or an archive kept in the library never lands in
+    the object store, and a change to one has no revision (docs/workspace.md § Revisions,
+    § Files). A path with nothing plain at it — a deletion to record, a link, a gitlink —
+    is git's to judge, as before."""
+    if relative.name in RECORDED_NAMES:
+        return True
+    try:
+        entry = safe_io.open_for_read(root, root / relative, max_bytes)
+    except safe_io.EntryTooLarge:
+        return False
+    except (safe_io.UnsafeEntry, OSError):
+        return True
+    if entry is None:
+        return True
+    try:
+        return is_text(os.read(entry, _TEXT_PROBE_BYTES))
+    finally:
+        os.close(entry)
 
 
 class GitError(Exception):
@@ -176,8 +215,14 @@ def _stage(root: Path, pathspec: str) -> None:
     `update-index`, which skips a name the shell removed meanwhile rather than failing
     the commit, and with `--replace` lets a file take a directory's place and back."""
     listed = _git_raw(root, "ls-files", "-z", "--modified", "--deleted", "--", pathspec)
-    # A deleted file is listed as modified too.
-    names = dict.fromkeys(name for name in listed.split(b"\0") if name)
+    # A deleted file is listed as modified too. A file history does not record — binary,
+    # or past `REVISION_MAX_FILE_BYTES` — is left out of both lists (`recordable`).
+    cap = revision_max_file_bytes()
+    names = dict.fromkeys(
+        name
+        for name in listed.split(b"\0")
+        if name and recordable(root, Path(os.fsdecode(name)), cap)
+    )
     if names:
         _git_raw(
             root,
@@ -189,7 +234,11 @@ def _stage(root: Path, pathspec: str) -> None:
         )
     listed = _git_raw(root, "ls-files", "-z", "--others", *_EXCLUDES, "--", pathspec)
     # A repository a shell command made inside the tree is listed as `dir/`: a gitlink.
-    names = dict.fromkeys(name.rstrip(b"/") for name in listed.split(b"\0") if name)
+    names = dict.fromkeys(
+        name.rstrip(b"/")
+        for name in listed.split(b"\0")
+        if name and recordable(root, Path(os.fsdecode(name.rstrip(b"/"))), cap)
+    )
     if names:
         _git_raw(
             root,

@@ -10,6 +10,7 @@ before it is read or written: a plain file of a bounded size, or nothing.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import os
 import secrets
 import stat
@@ -258,6 +259,46 @@ def write_from(root: Path, path: Path, reader, *, chunk: int = READ_CHUNK) -> No
     _write_atomic(root, path, fill, exist_ok=True)
 
 
+def create_file(root: Path, path: Path, mode: int = 0o644) -> int:
+    """A descriptor on a new plain file at `path`, created beneath `root` through the
+    directory descriptors above it (made on the way when missing) and never over anything
+    that is there: what an upload streams into as it arrives (docs/workspace.md § Files)."""
+    fd, name = _descend(root, path, create=True)
+    try:
+        return os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            mode,
+            dir_fd=fd,
+        )
+    finally:
+        os.close(fd)
+
+
+def copy_file(root: Path, source: Path, target: Path) -> None:
+    """Copy the plain file at `source` to `target`, both beneath `root`, through descriptors
+    that follow nothing; the target lands whole or not at all."""
+    entry = _open_file(root, source, os.O_RDONLY)
+    with os.fdopen(entry, "rb") as reader:
+        write_from(root, target, reader)
+
+
+def file_size(root: Path, path: Path) -> int | None:
+    """The size of the plain file at `path`, looked at without following anything; None
+    when there is no plain file there."""
+    try:
+        fd, name = _descend(root, path)
+    except (UnsafeEntry, FileNotFoundError):
+        return None
+    try:
+        info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return info.st_size if stat.S_ISREG(info.st_mode) else None
+
+
 def remove_file(root: Path, path: Path) -> bool:
     """Unlink the plain file at `path`; False when there was nothing. A link is unlinked
     as itself, never its target; a directory is left alone."""
@@ -272,6 +313,25 @@ def remove_file(root: Path, path: Path) -> bool:
         return True
     finally:
         os.close(fd)
+
+
+def remove_unlocked_file(root: Path, path: Path) -> bool:
+    """Unlink the plain file at `path` unless another descriptor holds its exclusive lock —
+    an upload still streaming into it (docs/workspace.md § Files): True when it went, False
+    when a holder has it or nothing plain is there. The lock is taken on a descriptor
+    opened without following anything and let go with it, after the unlink."""
+    try:
+        entry = _open_file(root, path, os.O_RDONLY)
+    except FileNotFoundError:
+        return False
+    try:
+        try:
+            fcntl.flock(entry, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return remove_file(root, path)
+    finally:
+        os.close(entry)
 
 
 def _open_dir(root: Path, path: Path) -> int:
