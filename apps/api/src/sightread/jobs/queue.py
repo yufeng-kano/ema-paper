@@ -38,6 +38,7 @@ from ..billing import ledger
 from ..billing.plans import PAID_STATUSES
 from ..config import Settings
 from ..db.models import (
+    COMPACTION_TURNS,
     MESSAGE_TURN,
     WORKER_GENERATION_SEQ,
     ChatTurn,
@@ -632,12 +633,20 @@ HISTORY_FULL = (
 )
 
 
-async def history_bytes(db: AsyncSession, conversation_id: int, *, since: int | None = None) -> int:
-    """The stored size of a conversation's messages, in bytes as the cap is: PostgreSQL's
+async def history_bytes(
+    db: AsyncSession,
+    conversation_id: int,
+    *,
+    since: int | None = None,
+    turn_id: uuid.UUID | None = None,
+) -> int:
+    """The stored size of what a turn replays, in bytes as the cap is: PostgreSQL's
     `length` counts characters, and a history of non-ASCII text would reach four times
     the cap before refusal (docs/chat.md § History is append-only). With `since`, the
-    summary row a compaction left, only the rows from it on — what a turn replays
-    (docs/chat.md § Compaction)."""
+    summary row a compaction left, only the rows from it on; and never the rows of a
+    compaction turn — a failed or cancelled attempt's instruction, answer and tool
+    results, stored but never sent — but that row and the rows of `turn_id`, the
+    compaction being loaded, as the runner replays them (docs/chat.md § Compaction)."""
     as_text = cast(Message.content, Text)
     size = (
         func.octet_length(as_text)
@@ -649,7 +658,15 @@ async def history_bytes(db: AsyncSession, conversation_id: int, *, since: int | 
     )
     if since is not None:
         query = query.where(Message.id >= since)
-    return (await db.execute(query)).scalar_one()
+    compactions = select(ChatTurn.id).where(
+        ChatTurn.conversation_id == conversation_id, ChatTurn.kind.in_(COMPACTION_TURNS)
+    )
+    if turn_id is not None:
+        compactions = compactions.where(ChatTurn.id != turn_id)
+    replayed = [Message.turn_id.is_(None), Message.turn_id.notin_(compactions)]
+    if since is not None:
+        replayed.append(Message.id == since)
+    return (await db.execute(query.where(or_(*replayed)))).scalar_one()
 
 
 async def count_active_turns(db: AsyncSession, user_id: int) -> int:

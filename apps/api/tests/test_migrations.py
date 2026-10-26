@@ -1884,9 +1884,23 @@ async def test_the_compaction_migration_leaves_every_row_as_a_message_turn(scrat
                     "now(), now())"
                 )
             )
+            # Skills named after the composer's commands, and one whose name the rename
+            # would otherwise take.
+            await db.execute(
+                text(
+                    "INSERT INTO skills (user_id, name, description, argument_hint, body, "
+                    "created_at, updated_at) VALUES "
+                    "(1, 'compact', '', '', 'x', now(), now()), "
+                    "(1, 'compact-2', '', '', 'y', now(), now()), "
+                    "(1, 'new', '', '', 'z', now(), now()), "
+                    "(1, 'mine', '', '', 'w', now(), now())"
+                )
+            )
         _alembic(scratch_url, "upgrade", COMPACTION)
         async with engine.begin() as db:
             assert (await db.execute(text("SELECT kind FROM chat_turns"))).scalar() == "message"
+            names = (await db.execute(text("SELECT name, body FROM skills ORDER BY body"))).all()
+            assert names == [("mine", "w"), ("compact-3", "x"), ("compact-2", "y"), ("new-2", "z")]
             switches = (
                 await db.execute(text("SELECT agent, idle_compact FROM agent_settings ORDER BY 1"))
             ).all()

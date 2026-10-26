@@ -7,10 +7,14 @@ idle compaction is on unless the reader turns it off), and on `conversations` th
 row the replay starts from — no foreign key, since a message goes only with its
 conversation), `context_tokens` and `cache_warm_until`
 (what the last model call replayed and when the cache it touched expires), with the partial
-index the idle compaction pass reads. No row is read or rewritten: an open conversation goes
-on as it was, takes its memory file snapshot at its next turn, and is first measured by its
-next model call. The downgrade drops the columns and the index; a conversation compacted
-meanwhile then replays its whole history again, the summary row among it.
+index the idle compaction pass reads. The only rows rewritten are skills named `new` or
+`compact`, the composer's own commands from this version on (docs/chat.md § Skills): each is
+renamed to the next free `name-2`, `name-3`…, so `/compact` never runs a skill in the
+runner's place and the skill stays the reader's. Otherwise no row is read or rewritten: an
+open conversation goes on as it was, takes its memory file snapshot at its next turn, and
+is first measured by its next model call. The downgrade drops the columns and the index
+and leaves the new names; a conversation compacted meanwhile then replays its whole history
+again, the summary row among it.
 
 Revision ID: d78cf7a42eea
 Revises: 8d1142bbd272
@@ -53,6 +57,31 @@ def upgrade() -> None:
         postgresql_where=sa.text("cache_warm_until IS NOT NULL"),
         sqlite_where=sa.text("cache_warm_until IS NOT NULL"),
     )
+    # Skills named after the composer's own commands, reserved from this version on: the
+    # next free `name-2`, `name-3`… of that reader (the names, not the app's constant, so
+    # the migration reads the same whatever the code says later).
+    skills = sa.table(
+        "skills",
+        sa.column("id", sa.Integer),
+        sa.column("user_id", sa.Integer),
+        sa.column("name", sa.String),
+    )
+    bind = op.get_bind()
+    clashing = bind.execute(
+        sa.select(skills.c.id, skills.c.user_id, skills.c.name)
+        .where(skills.c.name.in_(["compact", "new"]))
+        .order_by(skills.c.id)
+    ).all()
+    for skill_id, user_id, name in clashing:
+        taken = set(
+            bind.execute(sa.select(skills.c.name).where(skills.c.user_id == user_id)).scalars()
+        )
+        suffix = 2
+        while f"{name}-{suffix}" in taken:
+            suffix += 1
+        bind.execute(
+            sa.update(skills).where(skills.c.id == skill_id).values(name=f"{name}-{suffix}")
+        )
 
 
 def downgrade() -> None:

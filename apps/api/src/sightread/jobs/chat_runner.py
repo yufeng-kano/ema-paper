@@ -242,7 +242,9 @@ async def _load(
         # the upstream could refuse the context (docs/chat.md § History). The send is
         # refused past it too; this catches a turn queued before the history crossed it.
         if (
-            await history_bytes(db, conversation.id, since=conversation.compacted_message_id)
+            await history_bytes(
+                db, conversation.id, since=conversation.compacted_message_id, turn_id=turn.id
+            )
             > settings.chat_history_max_bytes
         ):
             raise TurnFailed(HISTORY_FULL)

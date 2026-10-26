@@ -14,9 +14,10 @@ import httpx
 import pytest
 import respx
 from httpx import AsyncClient
-from sqlalchemy import select, update
+from sqlalchemy import Text, cast, func, select, update
 
 from sightread.agents import chat as chat_agent
+from sightread.agents import skills as skill_defs
 from sightread.billing.credits import parse_model_prices
 from sightread.db.models import (
     COMPACT_TURN,
@@ -29,6 +30,7 @@ from sightread.db.models import (
     Message,
 )
 from sightread.jobs import chat_compact, chat_runner
+from sightread.jobs.queue import history_bytes
 from sightread.upstream.anthropic import ChatUsage
 from sightread.workspace import git
 from sightread.workspace.layout import user_root
@@ -214,6 +216,99 @@ async def test_a_compaction_that_answers_nothing_fails_and_is_not_replayed(chat_
     assert [message["role"] for message in replay] == ["user", "assistant", "user"]
     assert texts(replay[0]["content"])[0] == "hello there"
     assert texts(replay[2]["content"])[0] == "still here"
+
+
+@respx.mock
+async def test_an_abandoned_compaction_fills_no_history_cap(chat_client) -> None:
+    """The cap measures what a turn replays: a failed compaction's instruction and answer
+    are stored, not sent, so they count for nothing — the row the boundary names and the
+    rows of the compaction being loaded do (docs/chat.md § Compaction, § History is
+    append-only)."""
+    client = chat_client
+    stub_messages([DONE, ([], "end_turn"), SUMMARY, DONE, ([], "end_turn")])
+    conversation_id = await new_conversation(client)
+    await send(client, conversation_id, text="hello there")
+    await _run_queued_turn(client)
+    async with client.app.state.sessionmaker() as db:
+        before = await history_bytes(db, conversation_id)
+    assert before > 0
+
+    await send(client, conversation_id, text="", command="compact")
+    await _run_queued_turn(client)
+    failed = (await turns_of(client, conversation_id))[1]
+    assert failed.status == "failed"
+    async with client.app.state.sessionmaker() as db:
+        assert await history_bytes(db, conversation_id) == before
+        # Loaded as the attempt itself, its own instruction counts.
+        assert await history_bytes(db, conversation_id, turn_id=failed.id) > before
+
+    await send(client, conversation_id, text="", command="compact")
+    await _run_queued_turn(client)
+    boundary = (await conversation_row(client, conversation_id)).compacted_message_id
+    assert boundary is not None
+    async with client.app.state.sessionmaker() as db:
+        summary_alone = await history_bytes(db, conversation_id, since=boundary)
+        # The summary row's own bytes: the compaction's other rows come before the boundary.
+        summary_row = (
+            await db.execute(
+                select(func.octet_length(cast(Message.content, Text))).where(Message.id == boundary)
+            )
+        ).scalar_one()
+    assert summary_alone == summary_row > 0
+
+    await send(client, conversation_id, text="go on")
+    await _run_queued_turn(client)
+    async with client.app.state.sessionmaker() as db:
+        continued = await history_bytes(db, conversation_id, since=boundary)
+    assert continued > summary_alone
+
+    await send(client, conversation_id, text="", command="compact")
+    await _run_queued_turn(client)
+    turns = await turns_of(client, conversation_id)
+    assert [turn.status for turn in turns] == [
+        "succeeded",
+        "failed",
+        "succeeded",
+        "succeeded",
+        "failed",
+    ]
+    async with client.app.state.sessionmaker() as db:
+        # The second failed attempt adds nothing after the boundary either; loaded as
+        # itself, it would.
+        assert await history_bytes(db, conversation_id, since=boundary) == continued
+        assert (
+            await history_bytes(db, conversation_id, since=boundary, turn_id=turns[4].id)
+            > continued
+        )
+
+
+async def test_the_composers_commands_are_no_skill_names(chat_client) -> None:
+    """`new` and `compact` are the composer's own: a skill is neither created under them nor
+    renamed to them, so `/compact` never runs a skill in the runner's place (docs/chat.md
+    § Skills)."""
+    assert chat_agent.COMPACT_COMMAND in skill_defs.COMPOSER_COMMANDS
+    for name in sorted(skill_defs.COMPOSER_COMMANDS):
+        refused = await chat_client.post(
+            "/api/skills",
+            json={"name": name, "description": "x", "body": "x"},
+            headers=CSRF_HEADERS,
+        )
+        assert refused.status_code == 400, refused.text
+        assert "composer" in refused.text
+    created = await chat_client.post(
+        "/api/skills",
+        json={"name": "squash", "description": "x", "body": "x"},
+        headers=CSRF_HEADERS,
+    )
+    assert created.status_code == 201, created.text
+    renamed = await chat_client.put(
+        "/api/skills/squash", json={"name": "compact"}, headers=CSRF_HEADERS
+    )
+    assert renamed.status_code == 400, renamed.text
+    kept = await chat_client.put(
+        "/api/skills/squash", json={"name": "squash-2"}, headers=CSRF_HEADERS
+    )
+    assert kept.status_code == 200, kept.text
 
 
 @respx.mock
