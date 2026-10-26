@@ -2,7 +2,7 @@
 
 ## Cost safety — users' upstream keys are real money
 
-- Tests **never** call Kano Proxy, a provider connection, or any live LLM. All upstream HTTP — vision calls, Messages API streams, the model catalog and every Kano Pay call ([billing.md](./billing.md) § Kano Pay) — is stubbed (`respx` over httpx). The sandbox runner is stubbed the same way from the API's side, and tested on its own with the `local` backend (a bash process in a temp dir), never with Docker. CI must pass with no network.
+- Tests **never** call Kano Proxy, a provider connection, or any live LLM. All upstream HTTP — vision calls, Messages API streams, the model catalog, every Kano Pay call ([billing.md](./billing.md) § Kano Pay) and the chat agent's web tools (Brave, OpenAlex, every URL it reads or downloads, [chat.md](./chat.md) § Tools; the tests resolve a host to a fixed public address and stub the connection to it) — is stubbed (`respx` over httpx). The sandbox runner is stubbed the same way from the API's side, and tested on its own with the `local` backend (a bash process in a temp dir), never with Docker. CI must pass with no network.
 - A live smoke test requires the operator's explicit per-instance approval: one tiny document, one cheap model, never a loop or sweep.
 
 ## Backend (`apps/api`)

@@ -661,10 +661,10 @@ def _bbox_payload(settings: AppSettings, agent: str, row: AgentSetting | None) -
     return {"family": convention.family, "format": convention.format}
 
 
-def _agent_tools(name: str, shell: bool) -> list[str]:
+def _agent_tools(name: str, shell: bool, settings: AppSettings) -> list[str]:
     if name != CHAT.name:
         return []
-    return [str(tool["name"]) for tool in chat_runner.turn_tools(shell)]
+    return [str(tool["name"]) for tool in chat_runner.turn_tools(shell, settings)]
 
 
 @router.get("/agents")
@@ -691,7 +691,7 @@ async def list_agents(user: SessionUser, db: DbSession, settings: AppSettings):
                 # The tools this deployment really gives this user's agent: `bash` only
                 # on a plan that grants it, with a sandbox runner configured
                 # (docs/chat.md § Tools, docs/billing.md § Plans).
-                "tools": _agent_tools(agent.name, shell),
+                "tools": _agent_tools(agent.name, shell, settings),
                 "settings": _agent_settings_payload(settings, agent.name, rows.get(agent.name)),
                 # A fact about the model, not a setting: the coordinate convention the
                 # pipeline will ask it for (docs/parsing.md § Coordinate conventions).
@@ -921,7 +921,7 @@ async def chat_agent_context(
         )
     )
     shell = ledger.sandbox_granted(settings, await ledger.plan_of(db, settings, user.id))
-    tools = [str(tool["name"]) for tool in chat_runner.turn_tools(shell)]
+    tools = [str(tool["name"]) for tool in chat_runner.turn_tools(shell, settings)]
     parts = chat_agent.system_parts(
         # Without a document the template keeps its tokens, its tool lines filtered as a
         # turn's would be.

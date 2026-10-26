@@ -233,6 +233,28 @@ class Settings(BaseSettings):
     # a user message carries); each is capped like the selection, its heading on its own.
     chat_sections_per_message: int = 4
     chat_section_heading_max_chars: int = 512
+    # The chat agent's web tools, run on the worker (docs/chat.md § Tools): the switch, the
+    # keys `web_search` (Brave) and `search_papers` (OpenAlex) run on — each tool absent
+    # while its key is empty — and what a web search costs the reader on top of the turn's
+    # tokens (docs/billing.md § A chat turn).
+    chat_web_access: bool = True
+    brave_search_api_key: str = ""
+    openalex_api_key: str = ""
+    web_search_credits: int = 3
+    # Per turn, and per UTC day: the two searches for the whole deployment (the operator's
+    # bill and OpenAlex budget), downloads per user.
+    web_search_max_per_turn: int = 10
+    web_search_max_per_day: int = 2000
+    paper_search_max_per_turn: int = 10
+    paper_search_max_per_day: int = 1000
+    read_url_max_per_turn: int = 30
+    download_max_per_day: int = 20
+    # How much of a page `read_url` reads, the largest download (`file_max_bytes` caps it
+    # too), and how long a search or read, and a download, may take.
+    read_url_max_bytes: int = 5 * 1024 * 1024
+    download_max_bytes: int = 100_000_000
+    web_tool_timeout_seconds: float = 30.0
+    download_timeout_seconds: float = 120.0
 
     # The sandbox runner (docs/sandbox.md). Empty URL = no sandbox: the chat agent runs
     # without its bash tool. The token is what api and worker present to the runner.
@@ -272,9 +294,24 @@ class Settings(BaseSettings):
             "free_credits_per_period",
             "trash_retention_days",
             "parse_retention_days",
+            "web_search_credits",
+            "web_search_max_per_turn",
+            "web_search_max_per_day",
+            "paper_search_max_per_turn",
+            "paper_search_max_per_day",
+            "read_url_max_per_turn",
+            "download_max_per_day",
         ):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name.upper()} must be >= 0")
+        for name in (
+            "read_url_max_bytes",
+            "download_max_bytes",
+            "web_tool_timeout_seconds",
+            "download_timeout_seconds",
+        ):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name.upper()} must be positive")
         if self.free_storage_bytes > self.workspace_quota_bytes:
             raise ValueError("FREE_STORAGE_BYTES exceeds WORKSPACE_QUOTA_BYTES")
         if self.free_max_jobs > self.max_jobs_per_user:

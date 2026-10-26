@@ -555,6 +555,29 @@ class ChatTurn(Base):
     finished_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
 
 
+class ChatToolCall(Base):
+    """One web tool call of a turn that was answered or kept a file — `web_search`,
+    `search_papers`, `download_file` — what the per-day caps count and what a turn's web
+    searches are charged from (docs/chat.md § Tools, docs/billing.md § A chat turn). A
+    deleted turn keeps its rows for the day's count, as a purged parse keeps its entry."""
+
+    __tablename__ = "chat_tool_calls"
+    __table_args__ = (
+        # The deployment's per-day caps, a user's per-day cap, and the turn's settlement.
+        Index("ix_chat_tool_calls_tool_created", "tool", "created_at"),
+        Index("ix_chat_tool_calls_user_tool_created", "user_id", "tool", "created_at"),
+        Index("ix_chat_tool_calls_turn_id", "turn_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    turn_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("chat_turns.id", ondelete="SET NULL"), nullable=True
+    )
+    tool: Mapped[str] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
+
+
 class Message(Base):
     """A turn of a conversation: content blocks exactly as exchanged with the model, so
     every later request replays them verbatim (docs/chat.md § History is append-only)."""

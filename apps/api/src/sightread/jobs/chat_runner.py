@@ -11,13 +11,15 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from sqlalchemy import select, update
+import httpx
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ..agents import CHAT
@@ -29,6 +31,7 @@ from ..config import Settings
 from ..db.models import (
     EFFORT_DEFAULT,
     AgentSetting,
+    ChatToolCall,
     ChatTurn,
     Conversation,
     Document,
@@ -55,16 +58,25 @@ from ..upstream.client import (
     UpstreamError,
     kano_connection,
 )
-from ..workspace import git
+from ..workspace import filing, git, safe_io
 from ..workspace.documents import (
     MARKDOWN_KIND,
     DocumentPaths,
     ensure_within_quota,
+    folder_names,
     materialize_document,
+    measure_storage,
+    stage_upload,
 )
-from ..workspace.locks import clear_writing, mark_writing, shell_lock, workspace_lock
+from ..workspace.locks import (
+    backup_shared,
+    clear_writing,
+    mark_writing,
+    shell_lock,
+    workspace_lock,
+)
 from ..workspace.reconcile import reconcile_locked, reconcile_user
-from . import chat_events, chat_memory, chat_subagent, chat_tools
+from . import chat_events, chat_memory, chat_subagent, chat_tools, chat_web
 from .queue import HISTORY_FULL, history_bytes
 
 logger = logging.getLogger(__name__)
@@ -140,6 +152,9 @@ class TurnContext:
     # (docs/billing.md § A chat turn).
     credits_exhausted: bool = False
     overdraft_tool_calls: int = 0
+    # How many calls of each web tool the turn has started, against its per-turn caps
+    # (docs/chat.md § Tools).
+    web_calls: dict[str, int] = field(default_factory=dict)
 
     def overdraft_spent(self) -> bool:
         """The credits ran out and the tool calls allowed after them are used."""
@@ -256,7 +271,7 @@ async def _load(
     # `bash` only on a plan that grants it, and only with a runner (docs/billing.md).
     shell = ledger.sandbox_granted(settings, plan)
     sandbox = SandboxClient(settings) if shell else None
-    tools = turn_tools(shell)
+    tools = turn_tools(shell, settings)
     # The prompt, then a legacy preset, the reader's instructions, the catalogue — read
     # per turn like the prompt, so an edit on the Agent page misses the cache once — and
     # the memory block last (docs/chat.md § Prompt caching).
@@ -308,11 +323,19 @@ def document_facts(settings: Settings, job: Job | None, paths: DocumentPaths) ->
     }
 
 
-def turn_tools(shell: bool) -> list[dict]:
+def turn_tools(shell: bool, settings: Settings) -> list[dict]:
     """The tools a turn declares: every one, in its fixed order, but `bash` only where the
-    plan grants a shell and a sandbox runner exists — a tool the harness cannot run is
-    not offered (docs/sandbox.md, docs/billing.md § Plans)."""
-    return list(chat_agent.TOOLS if shell else chat_agent.TOOLS_WITHOUT_BASH)
+    plan grants a shell and a sandbox runner exists, and the web tools only where the
+    deployment can run them — a tool the harness cannot run is not offered
+    (docs/sandbox.md, docs/billing.md § Plans, docs/chat.md § Tools)."""
+    return [
+        *(chat_agent.TOOLS if shell else chat_agent.TOOLS_WITHOUT_BASH),
+        *chat_agent.web_tools(
+            enabled=settings.chat_web_access,
+            brave=bool(settings.brave_search_api_key),
+            openalex=bool(settings.openalex_api_key),
+        ),
+    ]
 
 
 def turn_catalogue(
@@ -562,13 +585,52 @@ async def _record_usage_settled(ctx: TurnContext, model: str, usage: ChatUsage) 
     the write runs as a task of its own, and a cancel that lands during it waits for it
     to settle before it goes on — a cancelled or timed-out turn is billed all the same
     (docs/chat.md § Conversations, turns, events)."""
-    recording = asyncio.ensure_future(_record_usage(ctx, model, usage))
+    await _settled(_record_usage(ctx, model, usage))
+
+
+async def _settled(recording: Awaitable[None]) -> None:
+    """Run a record to its end whatever cancels the caller meanwhile."""
+    task = asyncio.ensure_future(recording)
     try:
-        await asyncio.shield(recording)
+        await asyncio.shield(task)
     except asyncio.CancelledError:
         with contextlib.suppress(Exception):
-            await asyncio.shield(recording)
+            await asyncio.shield(task)
         raise
+
+
+async def _record_tool_call(ctx: TurnContext, tool: str, *, settle: bool) -> None:
+    """A web tool call that was answered or kept a file, as a `chat_tool_calls` row — what
+    the per-day caps count — and, for a web search, the turn re-priced in the same commit
+    so the search is charged the moment it is answered (docs/chat.md § Tools,
+    docs/billing.md § A chat turn). Shielded like a usage row: a Stop right after the
+    search does not make it free."""
+
+    async def record() -> None:
+        async with ctx.sessionmaker() as db:
+            db.add(ChatToolCall(user_id=ctx.turn.user_id, turn_id=ctx.turn.id, tool=tool))
+            await db.flush()
+            remaining = await ledger.settle_chat(db, ctx.settings, ctx.turn.id) if settle else None
+            await db.commit()
+        if remaining is not None and remaining <= 0:
+            ctx.credits_exhausted = True
+
+    await _settled(record())
+
+
+async def _calls_today(ctx: TurnContext, tool: str, *, user_id: int | None = None) -> int:
+    """How many calls of `tool` were recorded since the UTC day began — the deployment's
+    together, or one user's (docs/chat.md § Tools)."""
+    start = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    query = (
+        select(func.count())
+        .select_from(ChatToolCall)
+        .where(ChatToolCall.tool == tool, ChatToolCall.created_at >= start)
+    )
+    if user_id is not None:
+        query = query.where(ChatToolCall.user_id == user_id)
+    async with ctx.sessionmaker() as db:
+        return int((await db.execute(query)).scalar_one())
 
 
 # --- one model call ----------------------------------------------------------------------------
@@ -822,6 +884,8 @@ async def _run_tool_unguarded(
         outcome = await chat_subagent.run_subagent(ctx, tool_use_id, tool_input)
     elif name == "memory":
         return await _run_memory(ctx, tool_use_id, tool_input, admit)
+    elif name in WEB_READ_TOOLS:
+        outcome = await _run_web_read(ctx, name, tool_input)
     else:
         outcome = chat_tools.ToolOutcome(f"unknown tool {name!r}", is_error=True)
     if admit is not None:
@@ -880,6 +944,8 @@ async def run_mutating(ctx: TurnContext, name: str, tool_input: dict) -> chat_to
     editor on the host, each write a revision (docs/chat.md § Tools)."""
     max_chars = ctx.settings.chat_tool_result_max_chars
     author = f"{git.AGENT_AUTHOR_PREFIX}{ctx.conversation.id}"
+    if name == "download_file":
+        return await _run_download(ctx, tool_input)
     if name != "bash":
         return await chat_tools.run_editor(
             ctx.paths.root,
@@ -1035,7 +1101,11 @@ async def _report_tool(
     return result
 
 
-MUTATING_TOOLS = frozenset({"bash", "str_replace_based_edit_tool"})
+MUTATING_TOOLS = frozenset({"bash", "str_replace_based_edit_tool", "download_file"})
+# The web tools that run with the reads (docs/chat.md § Tools).
+WEB_READ_TOOLS = frozenset({"web_search", "search_papers", "read_url"})
+# Tools that return no image: a spent image budget is no reason to refuse them.
+NO_IMAGE_TOOLS = frozenset({"memory", *WEB_READ_TOOLS})
 # Read-only tools of one round in flight together.
 READ_CONCURRENCY = 4
 IMAGE_BUDGET_SPENT = "This round's image budget is spent; ask for fewer pages or figures at a time."
@@ -1110,9 +1180,10 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
                 if stopped.is_set() or await _cancelled(ctx):
                     stopped.set()
                     return
-                # `memory` returns no image, so a spent budget is no reason to refuse it:
-                # a reader's "remember this" late in a page-by-page check still lands.
-                refusal = exhausted() if block.get("name") != "memory" else None
+                # `memory` and the web reads return no image, so a spent budget is no
+                # reason to refuse them: a reader's "remember this" late in a page-by-page
+                # check still lands.
+                refusal = exhausted() if block.get("name") not in NO_IMAGE_TOOLS else None
                 if refusal is None and not may_run(index):
                     # The credits ran out and the calls allowed after them are used: a
                     # read not yet started is not started (docs/billing.md § A chat turn).
@@ -1180,6 +1251,179 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
     if stopped.is_set():
         raise TurnCancelled()
     return [results[index] for index in range(len(tool_uses))]
+
+
+# --- the web tools ------------------------------------------------------------------------------
+
+NO_CREDITS_FOR_SEARCH = (
+    "The web search was not run: the account's credits are spent, and a search would cost "
+    "more. Answer with what you have."
+)
+WEB_TOOL_TITLES = {
+    "web_search": "web searches",
+    "search_papers": "paper searches",
+    "read_url": "URL reads",
+    "download_file": "downloads",
+}
+
+
+def _turn_cap(ctx: TurnContext, name: str, limit: int) -> bool:
+    """Count the call against the turn's cap for its tool; False once the cap is reached.
+    No await between the check and the count, so the calls of one round never overrun it
+    (docs/chat.md § Tools)."""
+    made = ctx.web_calls.get(name, 0)
+    if made >= limit:
+        return False
+    ctx.web_calls[name] = made + 1
+    return True
+
+
+def _turn_cap_reached(name: str, limit: int) -> chat_tools.ToolOutcome:
+    return chat_tools.ToolOutcome(
+        f"This turn has made its {limit} {WEB_TOOL_TITLES[name]}; answer with what you have.",
+        is_error=True,
+    )
+
+
+def _day_cap_reached(name: str, *, per_user: bool) -> chat_tools.ToolOutcome:
+    whose = "the user's" if per_user else "this deployment's"
+    return chat_tools.ToolOutcome(
+        f"Today's limit on {WEB_TOOL_TITLES[name]} ({whose}) is reached; try again tomorrow.",
+        is_error=True,
+    )
+
+
+def _string_input(tool_input: dict, key: str) -> str:
+    value = tool_input.get(key)
+    return value if isinstance(value, str) else ""
+
+
+async def _run_web_read(ctx: TurnContext, name: str, tool_input: dict) -> chat_tools.ToolOutcome:
+    """One `web_search`, `search_papers` or `read_url` call: its caps, the call, and — for
+    a search that was answered — its record, a web search charged with it (docs/chat.md
+    § Tools)."""
+    settings = ctx.settings
+    if name == "web_search":
+        if not settings.brave_search_api_key:
+            return chat_tools.ToolOutcome("No web search on this deployment.", is_error=True)
+        if ctx.credits_exhausted:
+            return chat_tools.ToolOutcome(NO_CREDITS_FOR_SEARCH, is_error=True)
+        if await _calls_today(ctx, name) >= settings.web_search_max_per_day:
+            return _day_cap_reached(name, per_user=False)
+        if not _turn_cap(ctx, name, settings.web_search_max_per_turn):
+            return _turn_cap_reached(name, settings.web_search_max_per_turn)
+        outcome = await chat_web.web_search(
+            _string_input(tool_input, "query"),
+            api_key=settings.brave_search_api_key,
+            timeout=settings.web_tool_timeout_seconds,
+        )
+        if not outcome.is_error:
+            await _record_tool_call(ctx, name, settle=True)
+        return outcome
+    if name == "search_papers":
+        if not settings.openalex_api_key:
+            return chat_tools.ToolOutcome("No paper search on this deployment.", is_error=True)
+        if await _calls_today(ctx, name) >= settings.paper_search_max_per_day:
+            return _day_cap_reached(name, per_user=False)
+        if not _turn_cap(ctx, name, settings.paper_search_max_per_turn):
+            return _turn_cap_reached(name, settings.paper_search_max_per_turn)
+        outcome = await chat_web.search_papers(
+            _string_input(tool_input, "query"),
+            api_key=settings.openalex_api_key,
+            timeout=settings.web_tool_timeout_seconds,
+        )
+        if not outcome.is_error:
+            await _record_tool_call(ctx, name, settle=False)
+        return outcome
+    if not _turn_cap(ctx, name, settings.read_url_max_per_turn):
+        return _turn_cap_reached(name, settings.read_url_max_per_turn)
+    return await chat_web.read_url(
+        _string_input(tool_input, "url"),
+        max_bytes=settings.read_url_max_bytes,
+        max_chars=settings.chat_tool_result_max_chars,
+        timeout=settings.web_tool_timeout_seconds,
+        pdf_timeout=settings.chat_attachment_pdf_timeout_seconds,
+    )
+
+
+async def _run_download(ctx: TurnContext, tool_input: dict) -> chat_tools.ToolOutcome:
+    """One `download_file` call, a write of the turn: the bytes streamed to a staging file
+    at the top of `files/` within the storage the quota leaves, then filed under the
+    workspace lock exactly as an upload is — the folders the call names made where missing
+    (docs/chat.md § Tools, docs/workspace.md § Files)."""
+    settings = ctx.settings
+    user_id = ctx.turn.user_id
+    root = ctx.paths.root
+    url = _string_input(tool_input, "url").strip()
+    if not url:
+        return chat_tools.ToolOutcome("The URL is empty.", is_error=True)
+    if await _calls_today(ctx, "download_file", user_id=user_id) >= settings.download_max_per_day:
+        return _day_cap_reached("download_file", per_user=True)
+    # The room the quota leaves, read before a byte lands; the filing checks the bytes again.
+    async with ctx.sessionmaker() as db:
+        limit = ledger.storage_limit(settings, await ledger.plan_of(db, settings, user_id))
+        used = (await measure_storage(db, settings, user_id, root)).total
+    if used >= limit:
+        return chat_tools.ToolOutcome(
+            "The user's storage is full; nothing was downloaded.", is_error=True
+        )
+    fd, temp = await asyncio.to_thread(stage_upload, root)
+    try:
+        try:
+            got = await chat_web.download(
+                url,
+                fd,
+                max_bytes=min(settings.download_max_bytes, settings.file_max_bytes),
+                room=limit - used,
+                timeout=settings.download_timeout_seconds,
+            )
+        except chat_web.FetchRefused as exc:
+            return chat_tools.ToolOutcome(str(exc), is_error=True)
+        except (httpx.HTTPError, TimeoutError) as exc:
+            logger.info("download_file could not fetch: %s", exc.__class__.__name__)
+            return chat_tools.ToolOutcome("The file could not be fetched in time.", is_error=True)
+        if got.size == 0:
+            return chat_tools.ToolOutcome(
+                "The URL answered an empty body; nothing was kept.", is_error=True
+            )
+        wanted = _string_input(tool_input, "name").strip() or got.filename
+        filename = chat_web.with_extension(wanted, got.media_type)
+        segments = [part for part in _string_input(tool_input, "folder").split("/") if part.strip()]
+        try:
+            async with backup_shared(root), workspace_lock(root), ctx.sessionmaker() as db:
+                folder_id = await filing.ensure_folders(db, settings, user_id, segments)
+                row = await filing.keep_file(
+                    db,
+                    settings,
+                    user_id=user_id,
+                    folder_id=folder_id,
+                    temp=temp,
+                    filename=filename,
+                    declared_type=got.media_type,
+                    size=got.size,
+                    what="The download",
+                    revision="download",
+                )
+                place = await folder_names(db, user_id, folder_id)
+        except ApiError as exc:
+            if exc.error_type == "storage_full":
+                return chat_tools.ToolOutcome(
+                    "The user's storage is full; the file was not kept.", is_error=True
+                )
+            return chat_tools.ToolOutcome(f"The file was not kept: {exc.message}", is_error=True)
+    finally:
+        # Whatever was not moved into place goes; the descriptor last, since the staging
+        # file's lock lives with it (docs/workspace.md § Files).
+        with contextlib.suppress(OSError, safe_io.UnsafeEntry):
+            await asyncio.to_thread(safe_io.remove_file, root, temp)
+        with contextlib.suppress(OSError):
+            os.close(fd)
+    await _record_tool_call(ctx, "download_file", settle=False)
+    where = "/".join(place) if place else "the top level of the user's files"
+    return chat_tools.ToolOutcome(
+        f"Kept {row.name} ({row.size_bytes:,} bytes, {row.media_type}) in {where}. "
+        f"Tell the user it is their file {row.name}."
+    )
 
 
 # --- the loop ---------------------------------------------------------------------------------
