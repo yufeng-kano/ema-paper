@@ -80,7 +80,7 @@ import {
 } from '~/lib/markdown'
 import type { MenuFact, MenuItem, Point } from '~/lib/menu'
 import type { Caret, LeaveReason, RichOptions, SectionLinkState, SectionLinkTarget, TextPoint } from '~/lib/rich-extensions'
-import { blockIndexAt, blockKindName, captionLine, convertBlock, type BlockKindName } from '~/lib/richdoc'
+import { TURN_KINDS, blockIndexAt, blockKindName, captionLine, convertBlock, type BlockKindName } from '~/lib/richdoc'
 import { SLASH_CONVERSIONS, skillIcon, type SlashSkill } from '~/lib/slash'
 
 /** The document pane never gets narrower than this to make room for a dragged column. */
@@ -138,9 +138,6 @@ const FADE_MS = 240
 
 /** A press on a handle that closed that handle's own menu: its click must not open it again. */
 const REOPEN_GUARD_MS = 300
-
-/** What *Turn into…* offers, in the submenu's order (docs/web.md § Editing). */
-const TURN_KINDS: readonly BlockKindName[] = ['paragraph', 'heading', 'subheading', 'bulleted', 'numbered', 'quote', 'formula', 'code']
 
 /** A run of visible rows, by index into the rows. */
 type RowRange = { from: number; to: number }
@@ -2775,6 +2772,15 @@ async function askAgent(request: AskRequest, focusKey: string | null) {
   if (outcome !== 'focused' && focus !== null) {
     focusBlock(focus)
   }
+  return outcome
+}
+
+/** *Ask the agent* from a notes block's menu (docs/web.md § Notes, *The menu*): the unit's
+ *  markdown as the selection; the notes take focus back when the composer did not take it. */
+async function onNotesAsk(markdown: string, refocus: () => void) {
+  if ((await askAgent({ selection: markdown }, null)) !== 'focused') {
+    refocus()
+  }
 }
 
 /** A skill picked from the slash menu, with the editor's text as the passage. */
@@ -4527,6 +4533,7 @@ watch(
                   :images="notesImages"
                   blocks
                   @change="onNotesChange"
+                  @ask="onNotesAsk"
                   @note="showNote($event, false)"
                 />
               </div>

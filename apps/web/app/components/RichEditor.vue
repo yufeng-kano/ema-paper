@@ -47,10 +47,12 @@ import { blockPlain, nearestBlock, type PlaceNear, type ResultBlock } from '~/li
 import { openSide, type MenuItem, type Point } from '~/lib/menu'
 import {
   UnitSelection,
+  convertUnit,
   deleteUnit,
   moveUnit,
   movesNothing,
   noteUnits,
+  sectionMarkdown,
   slotAtY,
   slotY,
   stepSlot,
@@ -73,7 +75,7 @@ import {
   type UnitLook,
   type WashMeta,
 } from '~/lib/rich-extensions'
-import { docToMarkdown, markdownToDoc, sliceToMarkdown } from '~/lib/richdoc'
+import { TURN_KINDS, blockKindName, docToMarkdown, markdownToDoc, sliceToMarkdown, type BlockKindName } from '~/lib/richdoc'
 import {
   SLASH_CONVERSIONS,
   matchSlash,
@@ -162,6 +164,9 @@ const emit = defineEmits<{
   /** What a block action on a unit says it did — *Moved*, *Copied* — for the owner's status
    *  note (`blocks` only). */
   note: [text: string]
+  /** *Ask the agent* on a unit (`blocks` only): what to ask about, as markdown, and the way
+   *  back — focus to the unit — for when the composer does not take focus. */
+  ask: [markdown: string, refocus: () => void]
 }>()
 
 const { t } = useI18n()
@@ -1185,6 +1190,8 @@ const unitMenu = ref<{ at: Point; index: number; from: number; header: string; i
 let unitAfter: number | null = null
 let unitMenuClosedAt = 0
 let unitMenuClosedBy: EventTarget | null = null
+/** *Ask* is taking focus to the composer: the menu's close leaves it there. */
+let unitFocusLeft = false
 const unitHandle = ref<HTMLElement | null>(null)
 const handleTop = ref(0)
 const unitDragCard = ref<HTMLElement | null>(null)
@@ -1359,6 +1366,21 @@ function moveUnitTo(index: number, slot: number): number {
   return unitIndexAt(units.value, at) ?? index
 }
 
+/** Turns a unit into another kind as one step of the editor's own history, and answers the
+ *  index of the first block it became — the unit's own when nothing was turned. */
+function turnUnit(index: number, to: BlockKindName): number {
+  if (!editor) {
+    return index
+  }
+  const tr = closeHistory(editor.state.tr)
+  const at = convertUnit(tr, units.value, index, to, inlineOptions)
+  if (at === null) {
+    return index
+  }
+  editor.view.dispatch(tr)
+  return unitIndexAt(units.value, at) ?? index
+}
+
 /** Deletes a unit as one step of the editor's history, and answers the index of the unit now
  *  in its place. */
 function removeUnit(index: number): number {
@@ -1396,10 +1418,30 @@ function setUnitLook(look: UnitLook) {
   }
 }
 
+/** What *Ask the agent* says it asks about, as the document's menu says it. */
+function askWhich(unit: NoteUnit, block: ResultBlock | null): string {
+  if (unit.excerpt) {
+    return 'excerpt'
+  }
+  switch (block?.kind) {
+    case 'p':
+      return 'paragraph'
+    case 'h2':
+    case 'h3':
+      return 'section'
+    case 'math':
+      return 'formula'
+    default:
+      return 'block'
+  }
+}
+
 /**
  * The handle's menu (docs/web.md § Notes, *The menu*), beside it and top-aligned with the unit,
- * which takes the selection's look while it is open: *Locate in document* on an excerpt, the
- * moves, the copy and the delete. Its first item is highlighted when the keyboard opened it.
+ * which takes the selection's look while it is open: the document's menu in its groups, less
+ * what has no meaning in the notes — *Ask the agent*; *Locate in document* on an excerpt and
+ * the copy; *Turn into…*, the moves; the delete. Its first item is highlighted when the
+ * keyboard opened it.
  */
 function openUnitMenu(index: number, fromKey: boolean) {
   const unit = units.value[index]
@@ -1408,17 +1450,32 @@ function openUnitMenu(index: number, fromKey: boolean) {
     return
   }
   const block = unitBlock(editor.state.doc, unit)
-  const items: MenuItem[] = []
+  const kind = block ? blockKindName(block) : null
+  const items: MenuItem[] = [{ key: 'ask', label: t(`viewer.block.ask.${askWhich(unit, block)}`), icon: 'message-circle' }]
   if (unit.excerpt) {
-    items.push({ key: 'locate', label: t('viewer.block.locate'), icon: 'locate', disabled: !excerptChip(unit) })
+    items.push({ key: 'locate', label: t('viewer.block.locate'), icon: 'locate', separated: true, disabled: !excerptChip(unit) })
   }
   items.push(
+    { key: 'copy', label: t('viewer.block.copy'), icon: 'copy', separated: !unit.excerpt },
+    {
+      key: 'turn',
+      label: t('viewer.block.turnInto'),
+      icon: 'repeat',
+      separated: true,
+      disabled: unit.excerpt || kind === null,
+      children: TURN_KINDS.map((to) => ({
+        key: `turn:${to}`,
+        label: t(`viewer.convert.${to}`),
+        checked: kind === to,
+        shortcut: SLASH_CONVERSIONS.find((item) => item.key === to)?.markdown || undefined,
+        shortcutMono: true,
+      })),
+    },
     {
       key: 'up',
       label: t('viewer.block.moveUp'),
       icon: 'arrow-up',
       shortcut: keyLabel('mod+shift+up'),
-      separated: unit.excerpt,
       disabled: stepSlot(index, units.value.length, 'up') === null,
     },
     {
@@ -1428,7 +1485,6 @@ function openUnitMenu(index: number, fromKey: boolean) {
       shortcut: keyLabel('mod+shift+down'),
       disabled: stepSlot(index, units.value.length, 'down') === null,
     },
-    { key: 'copy', label: t('viewer.block.copy'), icon: 'copy', separated: true },
     { key: 'delete', label: t('viewer.block.delete'), icon: 'trash', danger: true, separated: true },
   )
   const handle = unitHandle.value?.getBoundingClientRect()
@@ -1460,12 +1516,25 @@ function onUnitMenuSelect(choice: string) {
   const menu = unitMenu.value
   const unit = menu ? units.value[menu.index] : undefined
   // The notes changed under the menu: what it named is no longer there to act on.
-  if (!menu || !unit || unit.from !== menu.from) {
+  if (!editor || !menu || !unit || unit.from !== menu.from) {
     return
   }
   unitAfter = menu.index
-  if (choice === 'locate') {
+  if (choice === 'ask') {
+    // The composer takes focus; the way back finds the unit again by where it started, for
+    // when a running turn leaves the ask waiting and focus with the notes.
+    unitFocusLeft = true
+    const { from, fromKey } = menu
+    emit('ask', sectionMarkdown(editor.state.doc, units.value, menu.index), () => {
+      const index = unitIndexAt(units.value, from)
+      if (index !== null) {
+        focusUnit(index, fromKey)
+      }
+    })
+  } else if (choice === 'locate') {
     excerptChip(unit)?.click()
+  } else if (choice.startsWith('turn:')) {
+    unitAfter = turnUnit(menu.index, choice.slice('turn:'.length) as BlockKindName)
   } else if (choice === 'up' || choice === 'down') {
     const slot = stepSlot(menu.index, units.value.length, choice)
     unitAfter = slot === null ? menu.index : moveUnitTo(menu.index, slot)
@@ -1486,15 +1555,17 @@ function onUnitMenuSelect(choice: string) {
 function closeUnitMenu(cause?: Event) {
   const menu = unitMenu.value
   const after = unitAfter
+  const left = unitFocusLeft
   unitMenu.value = null
   unitAfter = null
+  unitFocusLeft = false
   unitMenuClosedAt = performance.now()
   unitMenuClosedBy = cause?.target ?? null
   if (!menu) {
     return
   }
   setUnitLook(null)
-  if (cause && (!(cause instanceof KeyboardEvent) || cause.key === 'Tab')) {
+  if (left || (cause && (!(cause instanceof KeyboardEvent) || cause.key === 'Tab'))) {
     dropUnitSelection()
     return
   }

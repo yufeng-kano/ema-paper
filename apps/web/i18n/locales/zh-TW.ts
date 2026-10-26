@@ -567,6 +567,7 @@ export default {
         formula: '問 Agent 這個公式',
         block: '問 Agent 這一塊',
         blocks: '問 Agent 這些區塊',
+        excerpt: '問 Agent 這段摘錄',
       },
       translate: {
         paragraph: '翻譯這一段',
