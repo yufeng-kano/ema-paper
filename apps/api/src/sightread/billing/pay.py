@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings
 from ..db.models import Checkout, CreditPack, PackCheckout, Subscription, utcnow
+from .ledger import lock_packs
 from .plans import PAID_STATUSES
 
 logger = logging.getLogger(__name__)
@@ -454,8 +455,12 @@ async def apply_purchases(
     commits. Returns whether anything was written."""
     written = False
     checkout = await db.get(PackCheckout, user_id)
+    # The user's packs, locked in the ledger's order before any is written (docs/billing.md
+    # § The ledger): a settlement spilling into them meanwhile waits or is waited for,
+    # never both.
+    packs = {pack.id: pack for pack in await lock_packs(db, CreditPack.user_id == user_id)}
     for purchase in purchases:
-        row = await db.get(CreditPack, purchase.purchase_id, with_for_update=True)
+        row = packs.get(purchase.purchase_id) or await db.get(CreditPack, purchase.purchase_id)
         if row is None:
             config = settings.packs.get(purchase.pack_id)
             if config is None:

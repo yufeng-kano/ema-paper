@@ -199,9 +199,10 @@ async def period_row(
     return row, period
 
 
-async def _lock_packs(db: AsyncSession, *where) -> list[CreditPack]:
-    """Pack rows locked in one statement, the one that expires first ahead: the ledger's
-    one order for them, after the period row (docs/billing.md § The ledger)."""
+async def lock_packs(db: AsyncSession, *where) -> list[CreditPack]:
+    """Pack rows locked in one statement, the one that expires first ahead: the one order
+    for them, after the period row, for every path that writes packs — the ledger's and
+    the Pay adapter's (docs/billing.md § The ledger)."""
     return list(
         (
             await db.execute(
@@ -216,7 +217,7 @@ async def _lock_packs(db: AsyncSession, *where) -> list[CreditPack]:
 
 async def _active_packs(db: AsyncSession, user_id: int, now: datetime) -> list[CreditPack]:
     """The packs a charge may take from, locked (docs/billing.md § Top-up packs)."""
-    return await _lock_packs(
+    return await lock_packs(
         db,
         CreditPack.user_id == user_id,
         CreditPack.status == PACK_PAID,
@@ -383,7 +384,7 @@ async def _give_back(db: AsyncSession, entry: CreditEntry) -> None:
     await _move_spent(db, entry, -(entry.amount - sum(shares.values())))
     if not shares:
         return
-    for pack in await _lock_packs(db, CreditPack.id.in_(list(shares))):
+    for pack in await lock_packs(db, CreditPack.id.in_(list(shares))):
         await db.execute(
             update(CreditPack)
             .where(CreditPack.id == pack.id)
