@@ -637,6 +637,25 @@ def original_of(root: Path, document_id: int) -> Path | None:
     return None
 
 
+def kept_originals(root: Path) -> set[int]:
+    """The ids of the documents whose original is kept (`original_of`), from one listing
+    of the originals' directory: what the library read reports as `original`
+    (docs/api.md § GET /api/library)."""
+    directory = sources_dir(root)
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return set()
+    kept: set[int] = set()
+    for name in names:
+        stem, dot, _ext = name.partition(".")
+        if dot and stem.isdigit():
+            candidate = directory / name
+            if candidate.is_file() and not candidate.is_symlink():
+                kept.add(int(stem))
+    return kept
+
+
 def _copy_source(root: Path, directory: Path, original: Path) -> Path:
     """The shell's copy of the original, `source.<ext>` in the document directory —
     written through a descriptor opened without following anything, like every

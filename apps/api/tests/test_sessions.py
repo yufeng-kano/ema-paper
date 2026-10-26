@@ -40,6 +40,7 @@ async def test_dev_login_round_trip(client: AsyncClient) -> None:
         "credits_remaining",
         "chat_min_credits",
         "auto_convert",
+        "default_view",
     }
 
     logout = await client.post("/api/auth/logout", headers=CSRF_HEADERS)

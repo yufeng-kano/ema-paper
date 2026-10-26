@@ -95,3 +95,4 @@ export type IconName =
   | 'presentation'
   | 'archive'
   | 'download'
+  | 'sliders-horizontal'

@@ -1745,3 +1745,94 @@ async def test_the_library_files_migration_tells_the_kinds_apart_and_guards_the_
             assert (await db.execute(text("SELECT count(*) FROM documents"))).scalar() == 3
     finally:
         await engine.dispose()
+
+
+READER_VIEWS = "283c259880d3"
+
+
+async def test_the_reader_views_migration_turns_converting_off_and_adds_the_views(
+    scratch_url,
+) -> None:
+    """The switch everyone had on by default goes off for everyone; the two view columns
+    arrive on their defaults; the downgrade drops them and leaves the switch off."""
+    _alembic(scratch_url, "upgrade", LIBRARY_FILES)
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.begin() as db:
+            await db.execute(
+                text(
+                    "INSERT INTO users (id, google_sub, email, created_at) "
+                    "VALUES (1, 'sub', 'r@example.com', now()), (2, 'sub2', 's@example.com', now())"
+                )
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO agent_settings (user_id, agent, model, auto_convert) VALUES "
+                    "(1, 'parse', NULL, true), (2, 'parse', NULL, false), (1, 'chat', NULL, true)"
+                )
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO documents (id, user_id, folder_id, job_id, name, kind, "
+                    "created_at, updated_at) VALUES (1, 1, NULL, NULL, 'notes.md', 'markdown', "
+                    "now(), now())"
+                )
+            )
+        _alembic(scratch_url, "upgrade", READER_VIEWS)
+        async with engine.begin() as db:
+            switches = (
+                await db.execute(
+                    text("SELECT user_id, agent, auto_convert FROM agent_settings ORDER BY 1, 2")
+                )
+            ).all()
+            assert switches == [(1, "chat", False), (1, "parse", False), (2, "parse", False)]
+            views = (await db.execute(text("SELECT id, default_view FROM users ORDER BY id"))).all()
+            assert views == [(1, "markdown"), (2, "markdown")]
+            assert (await db.execute(text("SELECT view FROM documents"))).scalar() is None
+            # A row written without the switch is off, as the model would write it.
+            await db.execute(
+                text("INSERT INTO agent_settings (user_id, agent, model) VALUES (2, 'chat', NULL)")
+            )
+            assert not (
+                await db.execute(
+                    text(
+                        "SELECT auto_convert FROM agent_settings"
+                        " WHERE user_id = 2 AND agent = 'chat'"
+                    )
+                )
+            ).scalar()
+            await db.execute(
+                text(
+                    "INSERT INTO users (id, google_sub, email, created_at)"
+                    " VALUES (3, 'sub3', 't@example.com', now())"
+                )
+            )
+            assert (
+                await db.execute(text("SELECT default_view FROM users WHERE id = 3"))
+            ).scalar() == "markdown"
+        _alembic(scratch_url, "downgrade", LIBRARY_FILES)
+        async with engine.begin() as db:
+            columns = {
+                (table, column)
+                for table, column in (
+                    await db.execute(
+                        text(
+                            "SELECT table_name, column_name FROM information_schema.columns "
+                            "WHERE table_name IN ('documents', 'users')"
+                        )
+                    )
+                ).all()
+            }
+            assert not columns & {("documents", "view"), ("users", "default_view")}
+            # The rows stay as the upgrade left them; only the default comes back.
+            assert not (
+                await db.execute(text("SELECT bool_or(auto_convert) FROM agent_settings"))
+            ).scalar()
+            await db.execute(
+                text("INSERT INTO agent_settings (user_id, agent, model) VALUES (3, 'parse', NULL)")
+            )
+            assert (
+                await db.execute(text("SELECT auto_convert FROM agent_settings WHERE user_id = 3"))
+            ).scalar()
+    finally:
+        await engine.dispose()

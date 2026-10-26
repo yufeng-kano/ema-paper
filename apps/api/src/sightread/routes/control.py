@@ -41,6 +41,7 @@ from ..db.models import (
     COST_SOURCE_ESTIMATED,
     COST_SOURCE_OPENROUTER,
     COST_SOURCE_UNKNOWN,
+    DOCUMENT_VIEWS,
     EFFORT_DEFAULT,
     EFFORT_LEVELS,
     AgentSetting,
@@ -206,6 +207,9 @@ async def me(user: SessionUser, db: DbSession, settings: AppSettings):
         # the server will: a parse's while it converts them, a file's while it keeps them
         # (docs/web.md § Files).
         "auto_convert": await parse_auto_convert(db, user.id),
+        # Which view a converted PDF or image opens on the first time it is read
+        # (docs/web.md § Result viewer, *Original and Markdown*).
+        "default_view": user.default_view,
         # What the upload UI is allowed to send, from the server's own configuration —
         # a limit written twice is a limit that drifts (docs/api.md § Limits).
         "limits": {
@@ -249,6 +253,24 @@ async def me(user: SessionUser, db: DbSession, settings: AppSettings):
             "file_max_bytes": settings.file_max_bytes,
         },
     }
+
+
+class PreferencesPut(BaseModel):
+    default_view: str = Field(max_length=16)
+
+
+@router.put("/me/preferences", dependencies=[CsrfGuard])
+async def put_preferences(body: PreferencesPut, user: SessionUser, db: DbSession):
+    """The reader's own preferences (docs/api.md): which view a converted PDF or image
+    opens on the first time it is read (docs/web.md § Result viewer, *Original and
+    Markdown*)."""
+    if body.default_view not in DOCUMENT_VIEWS:
+        raise ApiError(400, "invalid_request", "default_view is original or markdown")
+    await db.execute(
+        sa_update(User).where(User.id == user.id).values(default_view=body.default_view)
+    )
+    await db.commit()
+    return {"default_view": body.default_view}
 
 
 @router.delete("/account", dependencies=[CsrfGuard], status_code=status.HTTP_204_NO_CONTENT)
@@ -625,9 +647,9 @@ def _agent_settings_payload(settings: AppSettings, agent: str, row: AgentSetting
         # fact — and whether it goes there on its own (docs/parsing.md § Fallback model).
         "fallback_model": (settings.parse_fallback_model or None) if agent == PARSE.name else None,
         "auto_fallback": bool(row.auto_fallback) if row else False,
-        # And whether a PDF or an image uploaded on the Files page is converted on arrival
-        # (docs/workspace.md § Files).
-        "auto_convert": row.auto_convert if row and row.auto_convert is not None else True,
+        # And whether a PDF or an image uploaded on the Files page is converted on arrival:
+        # off unless the reader turned it on (docs/workspace.md § Files).
+        "auto_convert": bool(row.auto_convert) if row else False,
         # The check agent's own: whether a Files upload is checked before it opens
         # (docs/parsing.md § Format check).
         "auto_check": row.auto_check if row and row.auto_check is not None else True,

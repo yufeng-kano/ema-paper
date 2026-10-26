@@ -10,7 +10,7 @@
  * `null` is the root everywhere. It is not a folder row, it is the absence of a parent, and
  * treating it as an id would mean inventing a folder the server does not have.
  */
-import type { LibraryDocument, LibraryFolder, UploadLimits } from '~/lib/api'
+import type { DocumentView, LibraryDocument, LibraryFolder, UploadLimits } from '~/lib/api'
 import type { IconName } from '~/lib/icons'
 
 export type FolderId = number | null
@@ -208,7 +208,7 @@ export function typeAheadMatch(rows: { key: string; name: string }[], typed: str
 export function uploadCap(
   file: { name: string; type: string },
   limits: UploadLimits | null,
-  autoConvert = true,
+  autoConvert = false,
 ): number | null {
   if (!limits) {
     return null
@@ -380,6 +380,18 @@ export function fileKind(file: { name: string; media_type?: string | null }): Fi
     : { key: 'plain', format: '', glyph: GLYPHS.plain }
 }
 
+/** The format of a parsed image, for its Kind (*PNG image*): its row carries no media type,
+ *  so the name's extension — what the upload had — says it; empty where the name says
+ *  nothing. */
+export function imageFormat(name: string): string {
+  const extension = extensionOf(name)
+  if (!extension) {
+    return ''
+  }
+  const kind = fileKind({ name, media_type: `image/${extension === 'jpg' ? 'jpeg' : extension}` })
+  return kind.key === 'image' ? kind.format : ''
+}
+
 /** The glyph before a row's name: a document's by what it was converted from, a file's by
  *  its type (docs/web.md § Files, *Four columns*). */
 export function documentGlyph(document: { kind: string; name: string; media_type?: string | null }): IconName {
@@ -387,6 +399,38 @@ export function documentGlyph(document: { kind: string; name: string; media_type
     return fileKind(document).glyph
   }
   return document.kind === 'image' ? 'image' : 'file-text'
+}
+
+/** What a row's original is, as the result viewer's Original view shows it: a PDF in the
+ *  browser's own viewer, an image as a picture (docs/web.md § Result viewer, *Original and
+ *  Markdown*) — a parsed document by what it was converted from, a file kept as it is by its
+ *  type; null for a markdown document and for any other file, which the file viewer shows. */
+export function originalKind(document: { kind: string; media_type?: string | null }): 'pdf' | 'image' | null {
+  if (document.kind === 'file') {
+    const preview = filePreview(document.media_type)
+    return preview === 'pdf' || preview === 'image' ? preview : null
+  }
+  return document.kind === 'pdf' || document.kind === 'image' ? document.kind : null
+}
+
+/**
+ * The view a row's viewer opens on (docs/web.md § Result viewer, *Original and Markdown*): a
+ * file kept as it is has its original alone; a converted document opens on the view it was
+ * last read in, or on the reader's default until it was switched once — and on Markdown
+ * whatever was remembered where its original was not kept. A markdown document has
+ * Markdown alone.
+ */
+export function initialView(
+  document: { kind: string; view?: DocumentView | null; original?: boolean | null },
+  defaultView: DocumentView,
+): DocumentView {
+  if (document.kind === 'file') {
+    return 'original'
+  }
+  if (document.kind === 'markdown' || document.original === false) {
+    return 'markdown'
+  }
+  return document.view ?? defaultView
 }
 
 /** What the file viewer shows of a file by itself: what a browser renders safely on its own

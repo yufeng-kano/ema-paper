@@ -569,6 +569,11 @@ defineProps<{ name: IconName }>()
       <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
       <path d="m7 10 5 5 5-5M12 15V3" />
     </template>
+    <!-- sliders-horizontal: the Preferences section. -->
+    <template v-else-if="name === 'sliders-horizontal'">
+      <path d="M21 4h-7M10 4H3M21 12h-9M8 12H3M21 20h-5M12 20H3" />
+      <path d="M14 2v4M8 10v4M16 18v4" />
+    </template>
 
     <!-- check: the confirmation a copy swaps to. -->
     <template v-else>

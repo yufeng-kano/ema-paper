@@ -52,6 +52,7 @@ function close() {
 
       <div class="column">
         <SettingsGeneralSection v-if="section === 'general'" />
+        <SettingsPreferencesSection v-else-if="section === 'preferences'" />
         <SettingsAccountSection v-else-if="section === 'account'" />
         <SettingsUsageSection v-else-if="section === 'usage'" />
         <SettingsAgentSection v-else-if="section === 'agent'" />

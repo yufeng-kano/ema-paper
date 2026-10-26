@@ -115,6 +115,7 @@
   --tint-purple: light-dark(#af52de, #bf5af2);
   --tint-orange: light-dark(#ff9500, #ff9f0a);
   --tint-indigo: light-dark(#5856d6, #5e5ce6);
+  --tint-teal: light-dark(#30b0c7, #40cbe0);
 
   /* --- Color: interaction -------------------------------------------------- */
   /* The chosen segment of a segmented control, raised off its track: white in light, a

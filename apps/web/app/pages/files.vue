@@ -47,7 +47,10 @@ import {
   uploadDocument,
   creditsRefusalOf,
   documentFileUrl,
+  documentOriginalUrl,
+  putDocumentView,
   type CreditsRefusal,
+  type DocumentView,
   type JobResult,
   type LibraryDocument,
   type LibraryFolder,
@@ -64,7 +67,7 @@ import {
 } from '~/lib/dnd'
 import { formatBytes, formatShortDateTime } from '~/lib/format'
 import type { IconName } from '~/lib/icons'
-import type { MenuItem, Point } from '~/lib/menu'
+import type { MenuFact, MenuItem, Point } from '~/lib/menu'
 import {
   acceptsUpload,
   childFolders,
@@ -73,10 +76,12 @@ import {
   documentGlyph,
   documentsIn,
   folderPath,
+  initialView,
   isMarkdownUpload,
   isPending,
   isReconverting,
   keyRange,
+  originalKind,
   renameSelectionEnd,
   subtreeIds,
   typeAheadMatch,
@@ -602,9 +607,13 @@ const mutationError = ref<string | null>(null)
 /** The 402 of an upload: the dialog that says what the document needs (docs/web.md § Files). */
 const creditsRefusal = ref<CreditsRefusal | null>(null)
 const limits = computed(() => auth.me.value?.limits ?? null)
-/** The parse agent's switch: on, a PDF or an image is parsed and capped as a parse; off,
- *  kept and capped as a file (docs/web.md § Files). The switch in Settings writes it here. */
-const autoConvert = computed(() => auth.me.value?.auto_convert ?? true)
+/** The parse agent's switch: on, a PDF or an image is parsed and capped as a parse; off —
+ *  as it is unless the reader turned it on — kept and capped as a file (docs/web.md
+ *  § Files). The switch in Settings › Preferences writes it here. */
+const autoConvert = computed(() => auth.me.value?.auto_convert ?? false)
+/** The view a converted PDF or image opens on until it was switched once (Settings ›
+ *  Preferences, docs/web.md § Result viewer, *Original and Markdown*). */
+const defaultView = computed<DocumentView>(() => auth.me.value?.default_view ?? 'markdown')
 /** How long the Trash keeps an item; 0 (or an older API's silence) keeps it until emptied. */
 const trashRetentionDays = computed(() => limits.value?.trash_retention_days ?? 0)
 /** The 409 of an upload past the plan's storage: a banner with the way to more of it
@@ -998,6 +1007,54 @@ async function onReconvertStarted() {
 
 /** The file whose Convert to document… dialog is open (docs/web.md § Files). */
 const converting = ref<LibraryDocument | null>(null)
+/** Markdown when the dialog opened from the viewer's menu — the view the document then
+ *  opens on; null from the row's menu, which leaves the reader's default to decide. */
+const convertingView = ref<DocumentView | null>(null)
+
+/** *Markdown* chosen on a PDF or an image not yet converted: the conversion, asked over the
+ *  viewer (docs/web.md § Result viewer, *Original and Markdown*). */
+function convertOpen() {
+  convertingView.value = 'markdown'
+  converting.value = openDocument.value
+}
+
+/** The view the reader switched the open document to, remembered for its next opening
+ *  (`PUT …/view`); the row follows at once, so reopening before the next read agrees. */
+async function recordView(document: LibraryDocument, view: DocumentView) {
+  document.view = view
+  try {
+    await putDocumentView(document.id, view)
+  } catch (error) {
+    mutationError.value = await resolve(error)
+  }
+}
+
+/** The open row's original for the viewer's Original view: a file kept as it is from
+ *  `…/file`, a parsed document from `…/original` where it was kept; null otherwise. */
+const openOriginal = computed(() => {
+  const open = openDocument.value
+  const kind = open ? originalKind(open) : null
+  if (!open || !kind || (open.kind !== 'file' && open.original === false)) {
+    return null
+  }
+  return { url: open.kind === 'file' ? documentFileUrl(open.id) : documentOriginalUrl(open.id), kind }
+})
+
+/** The open file's facts for the viewer's More menu while it is not converted: what the
+ *  file viewer's menu says of any file. */
+const openFileFacts = computed<MenuFact[]>(() => {
+  const open = openDocument.value
+  if (!open) {
+    return []
+  }
+  const size = open.size_bytes === null ? null : formatBytes(open.size_bytes, locale.value)
+  return [
+    { label: t('viewer.file.kind'), value: kindLabel(open) },
+    ...(size ? [{ label: t('viewer.file.size'), value: size }] : []),
+    { label: t('viewer.file.added'), value: formatShortDateTime(open.created_at, locale.value) },
+    { label: t('viewer.file.location'), value: openLocation.value },
+  ]
+})
 
 /** Converted: the row is a parse from the next read on, and the document opens by itself
  *  when the parse succeeds, as a single upload does. */
@@ -1994,6 +2051,7 @@ function runMenu(action: string) {
     case 'convert': {
       const document = items[0] && documents.value.find((row) => row.id === items[0]!.id)
       if (document) {
+        convertingView.value = null
         converting.value = document
       }
       return
@@ -2782,6 +2840,7 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
       v-if="converting"
       :key="converting.id"
       :document="converting"
+      :view="convertingView"
       @converted="onConverted"
       @refused="creditsRefusal = $event; converting = null"
       @close="converting = null"
@@ -2794,19 +2853,18 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
       @close="creditsRefusal = null"
     />
 
-    <!-- A file kept as it is opens in its own viewer: the file itself, no result to read
-         (docs/web.md § Files). A document's is keyed per document, and per parse: reopening
-         on another file, or a re-convert taken in, resets scroll and page state and reads
-         the copy again. Only a finished parse opens, so `pending` is its one read of the
-         result. -->
+    <!-- A file that is neither a PDF nor an image opens in its own viewer: the file itself,
+         no result to read (docs/web.md § Files). A PDF or an image opens in the result
+         viewer whether it is converted or not — on its original alone until it is. A
+         document's is keyed per document, and per parse: reopening on another file, or a
+         re-convert taken in, resets scroll and page state and reads the copy again. Only a
+         finished parse opens, so `pending` is its one read of the result. -->
     <FileViewer
-      v-if="openDocument && openDocument.kind === 'file'"
+      v-if="openDocument && openDocument.kind === 'file' && !originalKind(openDocument)"
       :key="openDocument.id"
       :document="openDocument"
       :location="openLocation"
-      :convertible="convertible(openDocument)"
       @close="openDocument = null"
-      @convert="converting = openDocument"
       @rename="renameOpen"
       @duplicate="duplicateOpen"
       @show="showOpenInFiles"
@@ -2822,10 +2880,16 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
       :error-message="resultErrors.get(openDocument.id) ?? null"
       :figure-base="openDocument.kind === 'markdown' ? null : `/api/library/documents/${openDocument.id}/figures`"
       :image-base="`/api/library/documents/${openDocument.id}/images`"
-      :document-id="openDocument.id"
+      :document-id="openDocument.kind === 'file' ? null : openDocument.id"
       :markdown-document="openDocument.kind === 'markdown'"
       :initial-block="linkedBlock?.id === openDocument.id ? linkedBlock.anchor : null"
       :reconvert-note="reconvertNote"
+      :initial-view="initialView(openDocument, defaultView)"
+      :original="openOriginal"
+      :converted="openDocument.kind !== 'file'"
+      :facts="openDocument.kind === 'file' ? openFileFacts : []"
+      @view="recordView(openDocument, $event)"
+      @convert="convertOpen"
       @close="openDocument = null"
     />
   </div>
