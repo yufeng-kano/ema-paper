@@ -142,6 +142,102 @@ MEMORY_TOOL = {
     },
     "strict": True,
 }
+# The web tools, run on the worker — never in the VM — and offered only where the
+# deployment can run them: the two searches with their keys, all four behind one switch
+# (docs/chat.md § Tools). Declared after `memory`, so a deployment that turns one on
+# costs the cached prefix nothing before it.
+WEB_SEARCH_TOOL = {
+    "name": "web_search",
+    "description": (
+        "Search the web (Brave): up to ten results, each its title, URL, snippet and age. "
+        "Costs the user credits on every call, so one well-phrased query beats several "
+        "guesses, and nothing the document itself answers is searched. Read a result's page "
+        "with read_url before relying on its snippet."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {"query": {"type": "string", "description": "The search query"}},
+        "required": ["query"],
+        "additionalProperties": False,
+    },
+    "strict": True,
+}
+SEARCH_PAPERS_TOOL = {
+    "name": "search_papers",
+    "description": (
+        "Search scholarly works (OpenAlex): ten by relevance, each its title, year, first "
+        "authors, venue, DOI, citation count and — where there is one — the URL of its "
+        "open-access PDF, which download_file can take. Free. Search by what the user is "
+        "after, not by a title guessed."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {"query": {"type": "string", "description": "Title words, topic or authors"}},
+        "required": ["query"],
+        "additionalProperties": False,
+    },
+    "strict": True,
+}
+READ_URL_TOOL = {
+    "name": "read_url",
+    "description": (
+        "Read one http(s) URL as text: an HTML page as its text, a PDF as its text layer, "
+        "a text file as it is; long content is cut in the middle. Free. Not for a file "
+        "the user wants kept: download_file is."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {"url": {"type": "string", "description": "The http or https URL"}},
+        "required": ["url"],
+        "additionalProperties": False,
+    },
+    "strict": True,
+}
+DOWNLOAD_FILE_TOOL = {
+    "name": "download_file",
+    "description": (
+        "Download one URL into the user's files, exactly as an upload of theirs: `folder` "
+        "is a path of folder names ('Papers/2024'; '' for the top level), made where "
+        "missing; `name` the file name to keep it under, or '' for the server's own name. "
+        "A taken name gets ' (2)'. Nothing is converted: a PDF stays a file until the user "
+        "asks for Markdown. Only when the user asked for the paper or file to be kept."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "The http or https URL of the file"},
+            "folder": {
+                "type": "string",
+                "description": "Folder path under the user's files, '' for the top level",
+            },
+            "name": {"type": "string", "description": "File name with its extension, or ''"},
+        },
+        "required": ["url", "folder", "name"],
+        "additionalProperties": False,
+    },
+    "strict": True,
+}
+WEB_TOOLS: tuple[dict, ...] = (
+    WEB_SEARCH_TOOL,
+    SEARCH_PAPERS_TOOL,
+    READ_URL_TOOL,
+    DOWNLOAD_FILE_TOOL,
+)
+WEB_TOOL_NAMES: tuple[str, ...] = tuple(tool["name"] for tool in WEB_TOOLS)
+
+
+def web_tools(*, enabled: bool, brave: bool, openalex: bool) -> tuple[dict, ...]:
+    """The web tools a deployment offers: none with the switch off, the searches only with
+    their keys — a tool the harness cannot run is not declared (docs/chat.md § Tools)."""
+    if not enabled:
+        return ()
+    return tuple(
+        tool
+        for tool in WEB_TOOLS
+        if (tool is not WEB_SEARCH_TOOL or brave) and (tool is not SEARCH_PAPERS_TOOL or openalex)
+    )
+
+
 # `memory` came last, so every tool before it kept its place in the cached prefix.
 TOOLS: tuple[dict, ...] = (
     BASH_TOOL,
@@ -266,6 +362,10 @@ doc.md keeps these shapes; never remove or reorder them unless asked:
 - view_page: the rendered image of one page of the original. Use it before changing any number, formula, table cell or name, and whenever the transcription reads oddly. The page is the truth; doc.md is a transcription of it.
 - view_figure: one figure crop at full resolution.
 - memory: save, update or forget one of the user's memories; the Memory section at the end says when.
+- web_search: the web, ten results with their URLs. Costs the user credits per call: search when the answer needs what the document does not hold or what is newer than it, with one well-phrased query rather than several guesses, and never for what the document itself answers. Say where each fact came from, with its URL.
+- search_papers: scholarly works by relevance, with DOI, citations and an open-access PDF URL where there is one. Free. Search by what the user is after, not by a title you guessed.
+- read_url: one page or PDF as text. Read a page before relying on a search snippet.
+- download_file: keep one URL as a file of the user's — only when the user asked for the paper or the file to be kept — into the folder they named, else the one this document sits in. Then say what was kept and where, as "your file NAME", never a path.
 
 # How to work
 
@@ -306,8 +406,12 @@ _TOKEN_RE = re.compile("|".join(re.escape(token) for token in PROMPT_TOKENS))
 
 
 # A tool's line in the prompt's tool list: dropped when the tool is not enabled for the
-# turn (no sandbox runner, no `bash`), so the model is never told of a shell it lacks.
-_TOOL_LINE_RE = re.compile(r"^- (bash|str_replace_based_edit_tool|view_page|view_figure|memory):")
+# turn (no sandbox runner, no `bash`; no key, no `web_search`), so the model is never told
+# of a tool it lacks.
+_TOOL_LINE_RE = re.compile(
+    r"^- (bash|str_replace_based_edit_tool|view_page|view_figure|memory"
+    r"|web_search|search_papers|read_url|download_file):"
+)
 
 
 # What the VM can reach, by the runner's `SANDBOX_NETWORK` (docs/sandbox.md § Isolation):

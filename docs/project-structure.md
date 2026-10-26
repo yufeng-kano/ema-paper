@@ -32,7 +32,9 @@ agent-sightread/
                               # (docs/workspace.md): layout.py, git.py, documents.py,
                               # reconcile.py, trash.py (deleting for good: Empty Trash
                               # and the Trash's expiry, one function), accounts.py (a
-                              # deleted account's marker and files)
+                              # deleted account's marker and files), filing.py (names,
+                              # the suffixed insert and the filing of a file — what the
+                              # upload route and the agent's download share)
         sandbox/              # client.py: the HTTP client of the sandbox runner
         upstream/             # anthropic.py (Messages API over Kano Proxy, streaming,
                               # tools — the chat agent's client, docs/chat.md);
@@ -45,7 +47,9 @@ agent-sightread/
                               # check.py (the check agent's loop, inside a parse's run),
                               # chat_subagent.py (a subagent's nested loop),
                               # chat_tools.py, chat_events.py (the conversation stream),
-                              # chat_memory.py (a turn's memory snapshot, the memory tool)
+                              # chat_memory.py (a turn's memory snapshot, the memory tool),
+                              # chat_web.py (the web tools: Brave search, OpenAlex, the
+                              # guarded fetch, reading a URL, downloading into Files)
         mcp/                  # server.py: thin shell over the service layer (docs/mcp.md)
         worker.py             # `python -m sightread.worker`
       migrations/             # Alembic

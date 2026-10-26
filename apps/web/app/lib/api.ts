@@ -375,6 +375,8 @@ export interface ChatRate {
 
 export interface BillingRates {
   parse_per_page: number
+  /** Credits one `web_search` call by the agent costs; null where the deployment offers none. */
+  web_search_per_call: number | null
   chat: Record<string, ChatRate>
 }
 

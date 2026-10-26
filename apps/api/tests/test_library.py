@@ -769,10 +769,10 @@ async def test_a_parent_deleted_during_the_insert_is_a_404_not_a_500(
     from sqlalchemy import delete
 
     from sightread.db.models import Folder
-    from sightread.routes import library as routes
+    from sightread.workspace import filing
 
     parent = await _folder(library, "Doomed")
-    real = routes.sibling_names
+    real = filing.sibling_names
     pulled = False
 
     async def pulling(db, user_id, parent_id, **kwargs):
@@ -784,7 +784,7 @@ async def test_a_parent_deleted_during_the_insert_is_a_404_not_a_500(
                 await other.commit()
         return await real(db, user_id, parent_id, **kwargs)
 
-    monkeypatch.setattr(routes, "sibling_names", pulling)
+    monkeypatch.setattr(filing, "sibling_names", pulling)
     response = await library.post(
         "/api/library/folders",
         json={"name": "Inside", "parent_id": parent["id"]},

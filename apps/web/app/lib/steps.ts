@@ -23,6 +23,10 @@ export type StepKind =
   | 'figure'
   | 'skill'
   | 'subagent'
+  | 'web'
+  | 'papers'
+  | 'fetch'
+  | 'download'
   | 'tool'
 
 export interface Step {
@@ -50,10 +54,14 @@ export const SUMMARY_ORDER: readonly StepKind[] = [
   'figure',
   'skill',
   'subagent',
+  'web',
+  'papers',
+  'fetch',
   'run',
   'restart',
   'edit',
   'create',
+  'download',
   'tool',
 ]
 
@@ -365,6 +373,15 @@ export function readStep(name: string, input: Record<string, unknown>): Step {
       return { kind: 'skill', target: text(input.name) }
     case 'subagent':
       return { kind: 'subagent', target: text(input.name) }
+    case 'web_search':
+      return { kind: 'web', target: text(input.query) }
+    case 'search_papers':
+      return { kind: 'papers', target: text(input.query) }
+    case 'read_url':
+      return { kind: 'fetch', target: text(input.url) }
+    case 'download_file':
+      // The name the call asked for, else its URL: what the reader will find in Files.
+      return { kind: 'download', target: text(input.name) || text(input.url) }
     default:
       return { kind: 'tool', target: name }
   }

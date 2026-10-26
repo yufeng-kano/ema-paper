@@ -131,6 +131,13 @@ def rates(settings: AppSettings) -> dict:
     the operator's prices and the worth of a credit, never typed into the frontend."""
     return {
         "parse_per_page": settings.parse_credits_per_page,
+        # What a web search by the agent costs, null where the deployment offers none
+        # (docs/chat.md § Tools, docs/billing.md § Routes).
+        "web_search_per_call": (
+            settings.web_search_credits
+            if settings.chat_web_access and settings.brave_search_api_key
+            else None
+        ),
         "chat": {
             model: {
                 field: float(value)

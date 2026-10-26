@@ -2891,6 +2891,7 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
       :facts="openDocument.kind === 'file' ? openFileFacts : []"
       @view="recordView(openDocument, $event)"
       @convert="convertOpen"
+      @filed="refresh()"
       @close="openDocument = null"
     />
   </div>

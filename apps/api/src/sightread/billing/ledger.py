@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings
 from ..db.models import (
+    ChatToolCall,
     CreditEntry,
     CreditPack,
     CreditPackEntry,
@@ -441,6 +442,10 @@ async def _spill(db: AsyncSession, entry: CreditEntry, delta: int, now: datetime
     await _move_spent(db, entry, into_period + rest)
 
 
+# The web tool charged per call (docs/billing.md § A chat turn).
+WEB_SEARCH_TOOL = "web_search"
+
+
 async def settle_chat(db: AsyncSession, settings: Settings, turn_id: uuid.UUID) -> int | None:
     """Re-price a turn from every `usage_log` row it has so far — subagent calls carry its
     id and count with it — rounded up once over the whole turn, and move the difference
@@ -482,7 +487,18 @@ async def settle_chat(db: AsyncSession, settings: Settings, turn_id: uuid.UUID) 
             cache_read_tokens=int(cache_read or 0),
             cache_write_tokens=int(cache_write or 0),
         )
-    amount = credits_for_usd(usd, settings.credit_usd) if rows else 0
+    # A web search is a flat price on top of the tokens, from the turn's own rows, added
+    # after the tokens' rounding (docs/billing.md § A chat turn).
+    searches = (
+        await db.execute(
+            select(func.count())
+            .select_from(ChatToolCall)
+            .where(ChatToolCall.turn_id == turn_id, ChatToolCall.tool == WEB_SEARCH_TOOL)
+        )
+    ).scalar_one()
+    amount = (credits_for_usd(usd, settings.credit_usd) if rows else 0) + (
+        int(searches) * settings.web_search_credits
+    )
     now = utcnow()
     if entry.state == RESERVED:
         delta = amount - entry.amount
