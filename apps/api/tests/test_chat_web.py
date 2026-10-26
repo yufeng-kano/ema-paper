@@ -6,8 +6,11 @@ fixed public address and `respx` answers the connection to it."""
 
 from __future__ import annotations
 
+import gzip
 import logging
+import os
 import socket
+import tracemalloc
 
 import httpx
 import respx
@@ -840,3 +843,87 @@ async def test_httpx_request_logs_carry_no_query(monkeypatch, caplog) -> None:
     lines = [record.getMessage() for record in caplog.records if record.name == "httpx"]
     assert lines and all("secret-signature" not in line for line in lines)
     assert any("https://1.2.3.4/signed.txt" in line for line in lines)
+
+
+@respx.mock
+async def test_a_gzipped_body_is_inflated_a_bounded_piece_at_a_time(tmp_path, monkeypatch) -> None:
+    """docs/chat.md § Tools: a gzipped page reads as its text; a gzip bomb reaches the byte
+    cap through no more memory than one piece; a body encoded some other way is refused;
+    a download keeps the inflated bytes and counts them."""
+    fake_resolver(monkeypatch)
+    page = b"<html><head><title>Zipped</title></head><body><p>Small words.</p></body></html>"
+    respx.get(host=PUBLIC_IP, path="/zipped").mock(
+        return_value=httpx.Response(
+            200,
+            headers={"content-type": "text/html", "content-encoding": "gzip"},
+            content=gzip.compress(page),
+        )
+    )
+    outcome = await chat_web.read_url(
+        "https://example.org/zipped", max_bytes=100_000, max_chars=20_000, timeout=5, pdf_timeout=5
+    )
+    assert outcome.content == "Zipped\nhttps://example.org/zipped\n\nSmall words."
+
+    bomb = gzip.compress(b"a" * 20_000_000)  # about twenty kilobytes on the wire
+    assert len(bomb) < 50_000
+
+    class Wire(httpx.AsyncByteStream):
+        """The bomb as a server would send it, in small raw chunks — straight to the reader,
+        past `respx`, which reads a mocked body whole (and inflates it) before answering."""
+
+        async def __aiter__(self):
+            for start in range(0, len(bomb), 4096):
+                yield bomb[start : start + 4096]
+
+        async def aclose(self) -> None:
+            pass
+
+    tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        data, cut = await chat_web.read_capped(
+            httpx.Response(200, headers={"content-encoding": "gzip"}, stream=Wire()), 1000
+        )
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert (data, cut) == (b"a" * 1000, True)
+    assert peak < 2 * 1024 * 1024
+
+    respx.get(host=PUBLIC_IP, path="/bomb").mock(
+        return_value=httpx.Response(
+            200, headers={"content-type": "text/plain", "content-encoding": "gzip"}, content=bomb
+        )
+    )
+    bombed = await chat_web.read_url(
+        "https://example.org/bomb", max_bytes=1000, max_chars=20_000, timeout=5, pdf_timeout=5
+    )
+    assert bombed.is_error is False
+    assert bombed.content.endswith("[... the content goes on past what was read ...]")
+
+    respx.get(host=PUBLIC_IP, path="/brotli").mock(
+        return_value=httpx.Response(
+            200, headers={"content-type": "text/plain", "content-encoding": "br"}, content=b"x"
+        )
+    )
+    refused = await chat_web.read_url(
+        "https://example.org/brotli", max_bytes=1000, max_chars=20_000, timeout=5, pdf_timeout=5
+    )
+    assert refused.is_error is True and "encoded as br" in refused.content
+
+    respx.get(host=PUBLIC_IP, path="/zipped.txt").mock(
+        return_value=httpx.Response(
+            200,
+            headers={"content-type": "text/plain", "content-encoding": "gzip"},
+            content=gzip.compress(b"y" * 150_000),
+        )
+    )
+    fd = os.open(tmp_path / "kept", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        got = await chat_web.download(
+            "https://example.org/zipped.txt", fd, max_bytes=1_000_000, room=1_000_000, timeout=5
+        )
+    finally:
+        os.close(fd)
+    assert (got.size, got.filename, got.media_type) == (150_000, "zipped.txt", "text/plain")
+    assert (tmp_path / "kept").read_bytes() == b"y" * 150_000

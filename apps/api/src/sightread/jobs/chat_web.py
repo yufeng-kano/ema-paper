@@ -20,6 +20,7 @@ import re
 import socket
 import tempfile
 import urllib.parse
+import zlib
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from email.message import Message
@@ -160,7 +161,10 @@ async def fetch(url: str, *, timeout: float) -> AsyncIterator[tuple[httpx.Respon
     async with (
         asyncio.timeout(timeout),
         httpx.AsyncClient(
-            timeout=timeout, follow_redirects=False, headers={"User-Agent": USER_AGENT}
+            timeout=timeout,
+            follow_redirects=False,
+            # Only gzip is asked for: `iter_body` inflates it a bounded piece at a time.
+            headers={"User-Agent": USER_AGENT, "Accept-Encoding": "gzip"},
         ) as client,
     ):
         current = url
@@ -197,12 +201,48 @@ def media_type_of(response: httpx.Response) -> tuple[str, str | None]:
     return message.get_content_type().lower(), message.get_param("charset")
 
 
+async def iter_body(response: httpx.Response) -> AsyncIterator[bytes]:
+    """The body as the server meant it, in pieces of at most `CHUNK_BYTES`: the wire's
+    bytes as they are, or — where the server gzipped them — inflated here a bounded piece
+    at a time. httpx's own decoding inflates each raw chunk whole before handing any of it
+    over, and a few compressed kilobytes can stand for gigabytes; this way no caller's cap
+    is reached through more memory than one piece (docs/chat.md § Tools). Only gzip is
+    asked for; a body the server encoded some other way anyway is refused."""
+    encodings = [
+        part.strip().lower()
+        for part in response.headers.get("content-encoding", "").split(",")
+        if part.strip()
+    ]
+    if not encodings or encodings == ["identity"]:
+        async for chunk in response.aiter_raw(CHUNK_BYTES):
+            yield chunk
+        return
+    if encodings not in (["gzip"], ["x-gzip"]):
+        raise FetchRefused(
+            f"The server sent content encoded as {', '.join(encodings)}, which is not read."
+        )
+    inflater = zlib.decompressobj(wbits=zlib.MAX_WBITS | 16)
+    try:
+        async for raw in response.aiter_raw(CHUNK_BYTES):
+            piece = inflater.decompress(raw, CHUNK_BYTES)
+            while True:
+                if piece:
+                    yield piece
+                if not inflater.unconsumed_tail:
+                    break
+                piece = inflater.decompress(inflater.unconsumed_tail, CHUNK_BYTES)
+        if tail := inflater.flush():
+            yield tail
+    except zlib.error as exc:
+        raise FetchRefused("The server's gzip could not be read.") from exc
+
+
 async def read_capped(response: httpx.Response, max_bytes: int) -> tuple[bytes, bool]:
     """Up to `max_bytes` of the body, and whether it went on past them — the connection is
     then closed rather than drained."""
     pieces: list[bytes] = []
     size = 0
-    async for chunk in response.aiter_bytes(CHUNK_BYTES):
+    async for chunk in iter_body(response):
         # One byte past the cap says the body goes on; nothing more is read or held.
         pieces.append(chunk[: max_bytes + 1 - size])
         size += len(pieces[-1])
@@ -542,7 +582,7 @@ async def download(
         if declared and declared.isdigit() and int(declared) > cap:
             raise FetchRefused(_too_large(int(declared), max_bytes, room))
         size = 0
-        async for chunk in response.aiter_bytes(CHUNK_BYTES):
+        async for chunk in iter_body(response):
             size += len(chunk)
             if size > cap:
                 raise FetchRefused(_too_large(size, max_bytes, room))
