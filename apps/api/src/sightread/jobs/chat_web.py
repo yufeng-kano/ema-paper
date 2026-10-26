@@ -190,6 +190,13 @@ async def fetch(url: str, *, timeout: float) -> AsyncIterator[tuple[httpx.Respon
         raise FetchRefused("Too many redirects.")
 
 
+def shown(url: str) -> str:
+    """A URL as a result or an error names it: scheme, host and path, no query and no
+    fragment — a signed URL's signature, a token in its query, stays out of what the
+    model is told and the conversation keeps, as it stays out of the log."""
+    return str(httpx.URL(url).copy_with(query=None, fragment=None))
+
+
 def media_type_of(response: httpx.Response) -> tuple[str, str | None]:
     """The response's media type and charset, lower-cased, parameters dropped — the type
     empty where the server sent none, not the `text/plain` the parser would assume."""
@@ -480,7 +487,7 @@ async def read_url(
         async with fetch(url, timeout=timeout) as (response, final_url):
             if response.status_code >= 400:
                 return ToolOutcome(
-                    f"{final_url} answered HTTP {response.status_code}.", is_error=True
+                    f"{shown(final_url)} answered HTTP {response.status_code}.", is_error=True
                 )
             media_type, charset = media_type_of(response)
             if media_type and not (
@@ -512,8 +519,9 @@ async def read_url(
     else:
         title, text = "", _decode(data, charset)
     if not text.strip():
-        return ToolOutcome(f"{final_url} has no text to read.", is_error=True)
-    head = f"{title[:TITLE_MAX_CHARS]}\n{final_url}\n\n" if title else f"{final_url}\n\n"
+        return ToolOutcome(f"{shown(final_url)} has no text to read.", is_error=True)
+    source = shown(final_url)
+    head = f"{title[:TITLE_MAX_CHARS]}\n{source}\n\n" if title else f"{source}\n\n"
     result = truncate(head + text, max_chars)
     if cut and len(result) == len(head) + len(text):
         result += "\n\n[... the content goes on past what was read ...]"
@@ -586,7 +594,7 @@ async def download(
     cap = min(max_bytes, room)
     async with fetch(url, timeout=timeout) as (response, final_url):
         if response.status_code >= 400:
-            raise FetchRefused(f"{final_url} answered HTTP {response.status_code}.")
+            raise FetchRefused(f"{shown(final_url)} answered HTTP {response.status_code}.")
         declared = response.headers.get("content-length")
         if declared and declared.isdigit() and int(declared) > cap:
             raise FetchRefused(_too_large(int(declared), max_bytes, room))

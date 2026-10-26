@@ -946,3 +946,48 @@ async def test_a_gzipped_body_is_inflated_a_bounded_piece_at_a_time(tmp_path, mo
         os.close(fd)
     assert (got.size, got.filename, got.media_type) == (150_000, "zipped.txt", "text/plain")
     assert (tmp_path / "kept").read_bytes() == b"y" * 150_000
+
+
+@respx.mock
+async def test_a_signed_urls_query_never_reaches_a_result(tmp_path, monkeypatch) -> None:
+    """docs/chat.md § Tools: a result or an error names a URL without its query — a signed
+    URL's signature, or one a redirect led to, stays out of what the model is told."""
+    fake_resolver(monkeypatch)
+    respx.get(host=PUBLIC_IP, path="/gone.txt").mock(return_value=httpx.Response(404))
+    respx.get(host=PUBLIC_IP, path="/hop").mock(
+        return_value=httpx.Response(
+            302, headers={"location": "https://example.org/page.html?token=secret-token"}
+        )
+    )
+    respx.get(host=PUBLIC_IP, path="/page.html").mock(
+        return_value=httpx.Response(
+            200,
+            headers={"content-type": "text/html"},
+            content=b"<html><head><title>Page</title></head><body>Words.</body></html>",
+        )
+    )
+    missing = await chat_web.read_url(
+        "https://example.org/gone.txt?X-Amz-Signature=secret-signature",
+        max_bytes=1000,
+        max_chars=20_000,
+        timeout=5,
+        pdf_timeout=5,
+    )
+    assert missing.is_error and missing.content == "https://example.org/gone.txt answered HTTP 404."
+    hopped = await chat_web.read_url(
+        "https://example.org/hop", max_bytes=1000, max_chars=20_000, timeout=5, pdf_timeout=5
+    )
+    assert hopped.content == "Page\nhttps://example.org/page.html\n\nWords."
+    fd = os.open(tmp_path / "kept", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with pytest.raises(chat_web.FetchRefused) as refused:
+            await chat_web.download(
+                "https://example.org/gone.txt?X-Amz-Signature=secret-signature",
+                fd,
+                max_bytes=1000,
+                room=1000,
+                timeout=5,
+            )
+    finally:
+        os.close(fd)
+    assert str(refused.value) == "https://example.org/gone.txt answered HTTP 404."
