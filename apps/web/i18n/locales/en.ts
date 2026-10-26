@@ -487,6 +487,7 @@ export default {
       markdown: 'Markdown',
     },
     noOriginal: 'The original was not kept',
+    notConvertible: 'This format cannot be converted',
     empty: 'Nothing to show yet.',
     emptyBody: 'This job has not produced any markdown.',
     degraded: 'Incomplete: {count} of this document’s pages failed to parse and are missing below (page {pages}).',

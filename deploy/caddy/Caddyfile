@@ -29,10 +29,11 @@
 		-Server
 		-X-Powered-By
 	}
-	# The policy and the frame header on every answer but the file route's, which carries
-	# its own (docs/api.md § GET /api/library/documents/{id}/file): a file served from the
-	# tree runs nothing with the session, and the site's policy would replace that.
-	@notfile not path /api/library/documents/*/file
+	# The policy and the frame header on every answer but the file routes', which carry
+	# their own (docs/api.md § GET /api/library/documents/{id}/file and …/original): a file
+	# served from the tree runs nothing with the session, and the site's policy would
+	# replace that — its frame header would keep a PDF out of the viewer's frame.
+	@notfile not path /api/library/documents/*/file /api/library/documents/*/original
 	header @notfile {
 		defer
 		Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob: https://*.googleusercontent.com; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"

@@ -11,7 +11,7 @@ http://localhost:8080 {
 		-Server
 		-X-Powered-By
 	}
-	@notfile not path /api/library/documents/*/file
+	@notfile not path /api/library/documents/*/file /api/library/documents/*/original
 	header @notfile {
 		defer
 		Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob: https://*.googleusercontent.com; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"

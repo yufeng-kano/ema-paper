@@ -475,6 +475,7 @@ export default {
       markdown: 'Markdown',
     },
     noOriginal: '沒有保留原檔',
+    notConvertible: '這種格式無法轉換成文件',
     empty: '目前沒有可顯示的內容。',
     emptyBody: '這筆工作沒有產出 Markdown。',
     degraded: '內容不完整：這份文件有 {count} 頁解析失敗，未包含在下方（第 {pages} 頁）。',

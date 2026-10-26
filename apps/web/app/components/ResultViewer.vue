@@ -238,6 +238,10 @@ const props = withDefaults(
     /** The row's facts for the More menu while the file is not converted: kind, size, date
      *  added, location. */
     facts?: MenuFact[]
+    /** Whether a file not yet converted can be — the parse agent accepts PDFs and JPEG, PNG,
+     *  WebP and HEIC images (`accepted_media_types`); false leaves *Markdown* disabled with
+     *  the reason under it. */
+    convertible?: boolean
   }>(),
   {
     error: null,
@@ -252,6 +256,7 @@ const props = withDefaults(
     original: null,
     converted: true,
     facts: () => [],
+    convertible: true,
   },
 )
 
@@ -271,8 +276,11 @@ const auth = useAuth()
 const { notesOpen, agentOpen, chosenWidth, chooseWidth } = useViewerLayout()
 
 /** The view: the document, or the original (docs/web.md § Result viewer, *Original and
- *  Markdown*) — the latter only where there is one to show. */
-const tab = ref<DocumentView>(props.initialView === 'original' && props.original ? 'original' : 'markdown')
+ *  Markdown*) — the latter only where there is one to show, and never for a block link,
+ *  which names a place in the document. */
+const tab = ref<DocumentView>(
+  props.initialView === 'original' && props.original && !props.initialBlock ? 'original' : 'markdown',
+)
 
 /** A running job's snapshot: pages keep arriving under this one (docs/api.md § Partial). */
 const partial = computed(() => props.result?.meta.partial === true)
@@ -3856,12 +3864,20 @@ const moreItems = computed<MenuItem[]>(() => [
     description: props.original ? undefined : t('viewer.noOriginal'),
     separated: moreFacts.value.length > 0,
   },
-  { key: 'markdown', label: t('viewer.view.markdown'), checked: tab.value === 'markdown' },
+  {
+    key: 'markdown',
+    label: t('viewer.view.markdown'),
+    checked: tab.value === 'markdown',
+    disabled: !props.converted && !props.convertible,
+    description: props.converted || props.convertible ? undefined : t('viewer.notConvertible'),
+  },
 ])
 
 function onMoreSelect(key: string) {
   if (key === 'markdown' && !props.converted) {
-    emit('convert')
+    if (props.convertible) {
+      emit('convert')
+    }
     return
   }
   if ((key !== 'original' && key !== 'markdown') || key === tab.value || (key === 'original' && !props.original)) {

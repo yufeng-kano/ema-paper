@@ -2887,6 +2887,7 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
       :initial-view="initialView(openDocument, defaultView)"
       :original="openOriginal"
       :converted="openDocument.kind !== 'file'"
+      :convertible="openDocument.kind !== 'file' || convertible(openDocument)"
       :facts="openDocument.kind === 'file' ? openFileFacts : []"
       @view="recordView(openDocument, $event)"
       @convert="convertOpen"
