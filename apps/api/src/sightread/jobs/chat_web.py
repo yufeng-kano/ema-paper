@@ -33,9 +33,10 @@ from .chat_tools import ToolOutcome, truncate
 
 logger = logging.getLogger(__name__)
 
-BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
-OPENALEX_WORKS_URL = "https://api.openalex.org/works"
 RESULTS_PER_SEARCH = 10
+# A page's title, which heads what `read_url` answers, is one line of it at most: the
+# result's cap then holds for the whole result, the title included.
+TITLE_MAX_CHARS = 300
 MAX_REDIRECTS = 5
 # Read in pieces: a page or a file streams through a bounded buffer, never whole in memory
 # past its cap (docs/chat.md § Tools).
@@ -158,8 +159,11 @@ async def fetch(url: str, *, timeout: float) -> AsyncIterator[tuple[httpx.Respon
 
 
 def media_type_of(response: httpx.Response) -> tuple[str, str | None]:
-    """The response's media type and charset, lower-cased, parameters dropped."""
+    """The response's media type and charset, lower-cased, parameters dropped — the type
+    empty where the server sent none, not the `text/plain` the parser would assume."""
     header = response.headers.get("content-type", "")
+    if not header.strip():
+        return "", None
     message = Message()
     message["content-type"] = header
     return message.get_content_type().lower(), message.get_param("charset")
@@ -212,7 +216,7 @@ def _search_client(timeout: float) -> httpx.AsyncClient:
     return httpx.AsyncClient(timeout=timeout, headers={"User-Agent": USER_AGENT})
 
 
-async def web_search(query: str, *, api_key: str, timeout: float) -> ToolOutcome:
+async def web_search(query: str, *, url: str, api_key: str, timeout: float) -> ToolOutcome:
     """The Brave Search API: ten web results as text — title, URL, snippet, age. An error
     outcome is never charged: the runner records a call only for a result (docs/chat.md
     § Tools)."""
@@ -222,7 +226,7 @@ async def web_search(query: str, *, api_key: str, timeout: float) -> ToolOutcome
     try:
         async with asyncio.timeout(timeout), _search_client(timeout) as client:
             response = await client.get(
-                BRAVE_SEARCH_URL,
+                url,
                 params={"q": query[:400], "count": RESULTS_PER_SEARCH},
                 headers={"Accept": "application/json", "X-Subscription-Token": api_key},
             )
@@ -262,7 +266,7 @@ def _authors(work: dict) -> str:
     return ", ".join(names[:3]) + (" et al." if len(names) > 3 else "")
 
 
-async def search_papers(query: str, *, api_key: str, timeout: float) -> ToolOutcome:
+async def search_papers(query: str, *, url: str, api_key: str, timeout: float) -> ToolOutcome:
     """OpenAlex works by relevance: title, year, authors, venue, DOI, citations and the
     open-access PDF's URL where OpenAlex knows one (docs/chat.md § Tools)."""
     query = query.strip()
@@ -280,7 +284,7 @@ async def search_papers(query: str, *, api_key: str, timeout: float) -> ToolOutc
     try:
         async with asyncio.timeout(timeout), _search_client(timeout) as client:
             response = await client.get(
-                OPENALEX_WORKS_URL, params=params, headers={"Authorization": f"Bearer {api_key}"}
+                url, params=params, headers={"Authorization": f"Bearer {api_key}"}
             )
     except (httpx.HTTPError, TimeoutError) as exc:
         logger.warning("OpenAlex did not answer: %s", exc.__class__.__name__)
@@ -402,7 +406,7 @@ async def read_url(
                     f"{final_url} answered HTTP {response.status_code}.", is_error=True
                 )
             media_type, charset = media_type_of(response)
-            if not (
+            if media_type and not (
                 media_type == PDF_MEDIA_TYPE
                 or media_type.startswith("text/")
                 or media_type in TEXT_MEDIA_TYPES
@@ -416,6 +420,9 @@ async def read_url(
     except (httpx.HTTPError, TimeoutError) as exc:
         logger.info("read_url could not fetch: %s", exc.__class__.__name__)
         return ToolOutcome("The URL could not be fetched in time.", is_error=True)
+    if not media_type:
+        # The server said nothing: a PDF by its magic, else text.
+        media_type = PDF_MEDIA_TYPE if data.startswith(b"%PDF-") else "text/plain"
     if media_type == PDF_MEDIA_TYPE:
         title = ""
         try:
@@ -429,11 +436,11 @@ async def read_url(
         title, text = "", _decode(data, charset)
     if not text.strip():
         return ToolOutcome(f"{final_url} has no text to read.", is_error=True)
-    head = f"{title}\n{final_url}\n\n" if title else f"{final_url}\n\n"
-    body = truncate(text, max(max_chars - len(head), 0))
-    if cut and len(body) == len(text):
-        body += "\n\n[... the content goes on past what was read ...]"
-    return ToolOutcome(head + body)
+    head = f"{title[:TITLE_MAX_CHARS]}\n{final_url}\n\n" if title else f"{final_url}\n\n"
+    result = truncate(head + text, max_chars)
+    if cut and len(result) == len(head) + len(text):
+        result += "\n\n[... the content goes on past what was read ...]"
+    return ToolOutcome(result)
 
 
 async def _pdf_text(data: bytes, *, max_chars: int, timeout: float) -> tuple[str, bool]:
@@ -516,7 +523,11 @@ async def download(
         return Downloaded(
             size=size,
             filename=server_filename(response, final_url),
-            media_type=media_type if media_type != "application/octet-stream" else None,
+            # None where the server said nothing, or only octet-stream: the name's
+            # extension decides then, as it does for an upload (docs/workspace.md § Files).
+            media_type=media_type
+            if media_type and media_type != "application/octet-stream"
+            else None,
         )
 
 

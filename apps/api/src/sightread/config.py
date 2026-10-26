@@ -240,6 +240,10 @@ class Settings(BaseSettings):
     chat_web_access: bool = True
     brave_search_api_key: str = ""
     openalex_api_key: str = ""
+    # The endpoints the two searches call: a deployment may point them at a mirror or
+    # a proxy of its own.
+    brave_search_url: str = "https://api.search.brave.com/res/v1/web/search"
+    openalex_works_url: str = "https://api.openalex.org/works"
     web_search_credits: int = 3
     # Per turn, and per UTC day: the two searches for the whole deployment (the operator's
     # bill and OpenAlex budget), downloads per user.
@@ -286,6 +290,8 @@ class Settings(BaseSettings):
         # snapshot included (docs/jobs.md § Dedup).
         self.kano_proxy_base_url = self.kano_proxy_base_url.strip().rstrip("/")
         self.kano_pay_url = self.kano_pay_url.strip().rstrip("/")
+        self.brave_search_url = self.brave_search_url.strip()
+        self.openalex_works_url = self.openalex_works_url.strip()
         if self.credit_usd <= 0:
             raise ValueError("CREDIT_USD must be positive")
         for name in (

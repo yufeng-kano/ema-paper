@@ -2,7 +2,7 @@
 docs/workspace.md § Files): a web search charged per call, a paper search, a URL read as
 text and a download filed as an upload is — every fetch under the guard, every upstream
 stubbed (docs/testing.md). No test reaches the network: the resolver answers a
-documentation address and `respx` answers the connection to it."""
+fixed public address and `respx` answers the connection to it."""
 
 from __future__ import annotations
 
@@ -682,3 +682,134 @@ async def test_a_download_the_quota_cannot_hold_is_refused(
     names = {name for name, _ in safe_io.list_dir(root, root / "files")}
     assert "f.txt" not in names and not [name for name in names if name.startswith(".sr-tmp")]
     assert await recorded(client, "download_file") == 0
+
+
+@respx.mock
+async def test_a_web_tool_the_turn_does_not_declare_is_never_run(
+    make_client, tmp_path, monkeypatch
+) -> None:
+    """docs/chat.md § Tools: with `CHAT_WEB_ACCESS` off the tools are not declared, and a
+    call to one all the same — a history that still names it, a model's guess — answers an
+    error without a fetch, a record or a charge."""
+    fake_resolver(monkeypatch)
+    client = await web_client(make_client, tmp_path, chat_web_access=False)
+    page = respx.get(host=PUBLIC_IP, path="/p").mock(
+        return_value=httpx.Response(200, headers={"content-type": "text/plain"}, content=b"p")
+    )
+    brave = respx.get(host="api.search.brave.com", path="/res/v1/web/search").mock(
+        return_value=httpx.Response(200, json=brave_results("One"))
+    )
+    stub_messages(
+        [
+            one_call("r1", "read_url", {"url": "https://example.org/p"}),
+            one_call("s1", "web_search", {"query": "anything"}),
+            one_call(
+                "d1",
+                "download_file",
+                {"url": "https://example.org/p", "folder": "", "name": "p.txt"},
+            ),
+            ([{"type": "text", "text": "Done."}], "end_turn"),
+        ]
+    )
+    conversation_id = await new_conversation(client)
+    await send(client, conversation_id, text="Try the web")
+    await _run_queued_turn(client)
+    assert [
+        (result["is_error"], result["output"])
+        for result in await tool_results(client, conversation_id)
+    ] == [
+        (True, "'read_url' is not one of this turn's tools"),
+        (True, "'web_search' is not one of this turn's tools"),
+        (True, "'download_file' is not one of this turn's tools"),
+    ]
+    assert page.call_count == 0 and brave.call_count == 0
+    assert await recorded(client, "web_search") == 0
+    assert await recorded(client, "download_file") == 0
+    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
+    assert "p.txt" not in {name for name, _ in safe_io.list_dir(root, root / "files")}
+    assert await turn_credits(client, conversation_id) == ("succeeded", 1)
+
+
+@respx.mock
+async def test_read_url_bounds_the_title_and_caps_the_whole_result(tmp_path, monkeypatch) -> None:
+    """The title is one line at most and the cap holds for the whole result, so a page
+    whose title alone would fill it still answers its text; a response without a type is
+    read as text, or as a PDF by its magic."""
+    fake_resolver(monkeypatch)
+    page = (
+        "<html><head><title>" + "t" * 25_000 + "</title></head>"
+        "<body><p>The body is here.</p></body></html>"
+    )
+    respx.get(host=PUBLIC_IP, path="/titled").mock(
+        return_value=httpx.Response(
+            200, headers={"content-type": "text/html"}, content=page.encode()
+        )
+    )
+    outcome = await chat_web.read_url(
+        "https://example.org/titled", max_bytes=100_000, max_chars=20_000, timeout=5, pdf_timeout=5
+    )
+    assert outcome.is_error is False
+    title, rest = outcome.content.split("\n", 1)
+    assert title == "t" * chat_web.TITLE_MAX_CHARS
+    assert rest.startswith("https://example.org/titled\n\n") and "The body is here." in rest
+    small = await chat_web.read_url(
+        "https://example.org/titled", max_bytes=100_000, max_chars=100, timeout=5, pdf_timeout=5
+    )
+    assert small.is_error is False and len(small.content) <= 100
+
+    respx.get(host=PUBLIC_IP, path="/untyped").mock(
+        return_value=httpx.Response(200, content=b"plain words")
+    )
+    untyped = await chat_web.read_url(
+        "https://example.org/untyped", max_bytes=1000, max_chars=20_000, timeout=5, pdf_timeout=5
+    )
+    assert untyped.is_error is False and untyped.content.endswith("plain words")
+    pdf = build_text_layer_pdf(tmp_path / "paper.pdf").read_bytes()
+    respx.get(host=PUBLIC_IP, path="/untyped.pdf").mock(
+        return_value=httpx.Response(200, content=pdf)
+    )
+    as_pdf = await chat_web.read_url(
+        "https://example.org/untyped.pdf",
+        max_bytes=100_000,
+        max_chars=20_000,
+        timeout=5,
+        pdf_timeout=5,
+    )
+    assert as_pdf.is_error is False and "<html" not in as_pdf.content
+    assert as_pdf.content.strip() != "https://example.org/untyped.pdf"
+
+
+@respx.mock
+async def test_a_download_without_a_content_type_takes_the_names_type(
+    make_client, tmp_path, monkeypatch
+) -> None:
+    """docs/workspace.md § Files: a server that says nothing about the type leaves it to the
+    name's extension, as a browser's shrug on an upload does — never `text/plain`."""
+    fake_resolver(monkeypatch)
+    client = await web_client(make_client, tmp_path)
+    pdf = build_text_layer_pdf(tmp_path / "paper.pdf").read_bytes()
+    assert chat_web.media_type_of(httpx.Response(200, content=pdf)) == ("", None)
+    respx.get(host=PUBLIC_IP, path="/paper.pdf").mock(return_value=httpx.Response(200, content=pdf))
+    stub_messages(
+        [
+            one_call(
+                "d1",
+                "download_file",
+                {"url": "https://example.org/paper.pdf", "folder": "", "name": ""},
+            ),
+            ([{"type": "text", "text": "Kept."}], "end_turn"),
+        ]
+    )
+    conversation_id = await new_conversation(client)
+    await send(client, conversation_id, text="Keep it")
+    await _run_queued_turn(client)
+    [result] = await tool_results(client, conversation_id)
+    assert result["is_error"] is False
+    assert result["output"].startswith(f"Kept paper.pdf ({len(pdf):,} bytes, application/pdf)")
+    async with client.app.state.sessionmaker() as db:
+        row = (
+            await db.execute(
+                select(Document).where(Document.kind == "file", Document.name == "paper.pdf")
+            )
+        ).scalar_one()
+    assert row.media_type == "application/pdf"

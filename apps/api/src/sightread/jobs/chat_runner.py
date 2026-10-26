@@ -858,6 +858,11 @@ async def _run_tool_unguarded(
         outcome = chat_tools.ToolOutcome(
             "The tool input was not valid JSON; send it again.", is_error=True
         )
+    elif name in chat_agent.WEB_TOOL_NAMES and all(tool.get("name") != name for tool in ctx.tools):
+        # Switched off (`CHAT_WEB_ACCESS`) or without its key, the tool is not this
+        # turn's, whatever the conversation's history still names: never run
+        # (docs/chat.md § Tools).
+        outcome = chat_tools.ToolOutcome(f"{name!r} is not one of this turn's tools", is_error=True)
     elif name in MUTATING_TOOLS:
         outcome = await run_mutating(ctx, name, tool_input)
     elif name == "view_page":
@@ -1314,6 +1319,7 @@ async def _run_web_read(ctx: TurnContext, name: str, tool_input: dict) -> chat_t
             return _turn_cap_reached(name, settings.web_search_max_per_turn)
         outcome = await chat_web.web_search(
             _string_input(tool_input, "query"),
+            url=settings.brave_search_url,
             api_key=settings.brave_search_api_key,
             timeout=settings.web_tool_timeout_seconds,
         )
@@ -1329,6 +1335,7 @@ async def _run_web_read(ctx: TurnContext, name: str, tool_input: dict) -> chat_t
             return _turn_cap_reached(name, settings.paper_search_max_per_turn)
         outcome = await chat_web.search_papers(
             _string_input(tool_input, "query"),
+            url=settings.openalex_works_url,
             api_key=settings.openalex_api_key,
             timeout=settings.web_tool_timeout_seconds,
         )
