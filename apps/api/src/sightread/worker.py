@@ -20,6 +20,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from .config import get_settings
 from .db.session import create_engine, create_sessionmaker
 from .jobs import chat_web
+from .jobs.chat_compact import idle_compact_forever
 from .jobs.chat_runner import run_turn
 from .jobs.queue import (
     claim_next_job,
@@ -99,6 +100,8 @@ async def run_worker(stop: asyncio.Event) -> None:
     # expiry, the parse retention and the account deletions it finishes (docs/jobs.md
     # § Retention).
     sweeper = asyncio.create_task(sweep_forever(sessionmaker, settings, stop))
+    # And the idle compaction pass beside it (docs/chat.md § Compaction).
+    compactor = asyncio.create_task(idle_compact_forever(sessionmaker, settings, stop))
     sandbox = SandboxClient(settings) if settings.sandbox_configured else None
     # Retried until it goes through: a database or runner blip at start must not leave
     # the turns a dead worker held unfinished until the next restart (docs/jobs.md).
@@ -247,7 +250,8 @@ async def run_worker(stop: asyncio.Event) -> None:
                     logger.exception("could not fail job %s", job_id)
     finally:
         sweeper.cancel()
-        await asyncio.gather(sweeper, return_exceptions=True)
+        compactor.cancel()
+        await asyncio.gather(sweeper, compactor, return_exceptions=True)
         if lock_watch is not None:
             lock_watch.cancel()
             await asyncio.gather(lock_watch, return_exceptions=True)

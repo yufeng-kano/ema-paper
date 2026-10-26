@@ -25,6 +25,11 @@ from ..workspace.trash import lock_user
 router = APIRouter(prefix="/api", tags=["extensions"])
 
 
+COMPOSER_COMMAND_TAKEN = (
+    "That name is one of the composer's own commands (/new, /compact); choose another"
+)
+
+
 def _checked_name(raw: str) -> str:
     name = raw.strip()
     if not skill_defs.NAME_PATTERN.fullmatch(name):
@@ -136,6 +141,8 @@ async def create_skill(body: SkillCreate, user: SessionUser, db: DbSession, sett
     name = _checked_name(body.name)
     if name in skill_defs.BUILTIN_SKILL_NAMES:
         raise ApiError(409, "invalid_request", "That name belongs to a built-in skill")
+    if name in skill_defs.COMPOSER_COMMANDS:
+        raise ApiError(400, "invalid_request", COMPOSER_COMMAND_TAKEN)
     # The user's row, held until the create commits: two creations near the cap must
     # not both count below it (PostgreSQL; the SQLite fallback runs one request at a
     # time), the same lock the turn cap takes (docs/chat.md § Conversations).
@@ -195,6 +202,8 @@ async def update_skill(
         if new_name != name:
             if new_name in skill_defs.BUILTIN_SKILL_NAMES:
                 raise ApiError(409, "invalid_request", "That name belongs to a built-in skill")
+            if new_name in skill_defs.COMPOSER_COMMANDS:
+                raise ApiError(400, "invalid_request", COMPOSER_COMMAND_TAKEN)
             if await _skill_row(db, user.id, new_name) is not None:
                 raise ApiError(409, "invalid_request", "A skill with this name already exists")
     values = _checked_skill_values({**_skill_values(row), **provided}, settings)

@@ -29,7 +29,9 @@ from ..agents import subagents as subagent_defs
 from ..billing import ledger
 from ..config import Settings
 from ..db.models import (
+    COMPACTION_TURNS,
     EFFORT_DEFAULT,
+    IDLE_COMPACT_TURN,
     AgentSetting,
     ChatToolCall,
     ChatTurn,
@@ -75,8 +77,10 @@ from ..workspace.locks import (
     shell_lock,
     workspace_lock,
 )
+from ..workspace.memory_file import memory_file_text
 from ..workspace.reconcile import reconcile_locked, reconcile_user
 from . import chat_events, chat_memory, chat_subagent, chat_tools, chat_web
+from .chat_compact import SUMMARY_CONTEXT
 from .queue import HISTORY_FULL, history_bytes
 
 logger = logging.getLogger(__name__)
@@ -104,6 +108,16 @@ class TurnOutOfCredits(Exception):
     """The period's balance ran out mid-turn and the turn's last call, made with no tools
     left to it, still asked for one — or a subagent's retry found the allowance used, which
     its run answers on its own (docs/billing.md § A chat turn)."""
+
+
+@dataclass(frozen=True)
+class Compacted:
+    """What a compaction stored: its summary row, and the memory file as it read it then.
+    The boundary and the snapshot the turn's finish sets, with the terminal state
+    (docs/chat.md § Compaction)."""
+
+    message_id: int
+    memory_file: str
 
 
 @dataclass
@@ -155,6 +169,8 @@ class TurnContext:
     # How many calls of each web tool the turn has started, against its per-turn caps
     # (docs/chat.md § Tools).
     web_calls: dict[str, int] = field(default_factory=dict)
+    # A compaction's summary once stored, for the finish that makes it the boundary.
+    compacted: Compacted | None = None
 
     def overdraft_spent(self) -> bool:
         """The credits ran out and the tool calls allowed after them are used."""
@@ -225,7 +241,12 @@ async def _load(
         # a turn would load and serialize hundreds of megabytes in the worker before
         # the upstream could refuse the context (docs/chat.md § History). The send is
         # refused past it too; this catches a turn queued before the history crossed it.
-        if await history_bytes(db, conversation.id) > settings.chat_history_max_bytes:
+        if (
+            await history_bytes(
+                db, conversation.id, since=conversation.compacted_message_id, turn_id=turn.id
+            )
+            > settings.chat_history_max_bytes
+        ):
             raise TurnFailed(HISTORY_FULL)
         connection = kano_connection(settings, anthropic=True)
         if connection is None:
@@ -243,6 +264,14 @@ async def _load(
         subagents = subagent_defs.resolve_subagents(
             (await db.execute(select(Subagent).where(Subagent.user_id == turn.user_id))).scalars()
         )
+        # The memory file as the conversation's first turn finds it, stored with this
+        # commit like the memory snapshot and read from there by every later turn, so the
+        # agent's own writes never cost the conversation its cache (docs/chat.md § Memory,
+        # *The memory file*). Before the session writes anything: the read takes the
+        # workspace lock, which is taken with no row locked, the order every workspace
+        # mutation keeps (docs/workspace.md § Revisions).
+        if conversation.memory_file is None:
+            conversation.memory_file = await memory_file_text(settings, turn.user_id)
         # The memory block: the conversation's snapshot, taken by its first turn and stored
         # with this commit, rendered from the rows as they are now (docs/chat.md § Memory).
         memory = await chat_memory.load_turn_memory(
@@ -286,6 +315,9 @@ async def _load(
         instructions=instructions,
         catalogue=turn_catalogue(skills, subagents),
         memory=memory.block,
+        memory_file=chat_agent.render_memory_file(
+            conversation.memory_file, settings.chat_memory_file_max_chars
+        ),
     )
 
     return TurnContext(
@@ -407,15 +439,34 @@ def repaired(messages: list[dict]) -> list[dict]:
 
 
 async def _history(ctx: TurnContext) -> list[dict]:
+    """The messages the call replays: from the summary row of the last compaction on, when
+    there was one, and without the rows of any other compaction turn — a failed or
+    cancelled attempt's instruction, tool calls and whatever summary it stored before it
+    ended — but the one row the boundary names (docs/chat.md § Compaction)."""
     async with ctx.sessionmaker() as db:
-        rows = (
-            await db.execute(
-                select(Message)
-                .where(Message.conversation_id == ctx.conversation.id)
-                .order_by(Message.id)
-            )
-        ).scalars()
-        return repaired([{"role": row.role, "content": _api_blocks(row.content)} for row in rows])
+        query = select(Message).where(Message.conversation_id == ctx.conversation.id)
+        boundary = ctx.conversation.compacted_message_id
+        if boundary is not None:
+            query = query.where(Message.id >= boundary)
+        rows = (await db.execute(query.order_by(Message.id))).scalars().all()
+        compactions = set(
+            (
+                await db.execute(
+                    select(ChatTurn.id).where(
+                        ChatTurn.conversation_id == ctx.conversation.id,
+                        ChatTurn.kind.in_(COMPACTION_TURNS),
+                        ChatTurn.id != ctx.turn.id,
+                    )
+                )
+            ).scalars()
+        )
+        return repaired(
+            [
+                {"role": row.role, "content": _api_blocks(row.content)}
+                for row in rows
+                if row.turn_id not in compactions or row.id == boundary
+            ]
+        )
 
 
 # The keys a stored block carries for the web app and the API never sees: the context
@@ -554,7 +605,12 @@ async def _follow_model(ctx: TurnContext, model: str) -> None:
     ctx.conversation.model = model
 
 
-async def _record_usage(ctx: TurnContext, model: str, usage: ChatUsage) -> None:
+async def _record_usage(
+    ctx: TurnContext, model: str, usage: ChatUsage, *, conversation: bool = False
+) -> None:
+    """The call's usage row and the turn's settlement; with `conversation`, a call of the
+    conversation's own — not a subagent's — which also records what the next call will
+    replay and when the cache it touched expires (docs/chat.md § Compaction)."""
     async with ctx.sessionmaker() as db:
         db.add(
             UsageLog(
@@ -571,6 +627,23 @@ async def _record_usage(ctx: TurnContext, model: str, usage: ChatUsage) -> None:
             )
         )
         await db.flush()
+        if conversation:
+            context_tokens = (
+                usage.input_tokens
+                + usage.cache_read_tokens
+                + usage.cache_write_tokens
+                + usage.output_tokens
+            )
+            warm_until = utcnow() + chat_agent.CACHE_TTL_DELTA if usage.cached else None
+            await db.execute(
+                update(Conversation)
+                .where(Conversation.id == ctx.conversation.id)
+                .values(
+                    context_tokens=context_tokens,
+                    cache_warm_until=warm_until,
+                    **_keep_place(ctx.turn.kind),
+                )
+            )
         # The turn re-priced from the same rows, in the same commit: Usage and the ledger
         # agree by construction (docs/billing.md § A chat turn).
         remaining = await ledger.settle_chat(db, ctx.settings, ctx.turn.id)
@@ -580,12 +653,14 @@ async def _record_usage(ctx: TurnContext, model: str, usage: ChatUsage) -> None:
         ctx.credits_exhausted = True
 
 
-async def _record_usage_settled(ctx: TurnContext, model: str, usage: ChatUsage) -> None:
+async def _record_usage_settled(
+    ctx: TurnContext, model: str, usage: ChatUsage, *, conversation: bool = False
+) -> None:
     """The paid call reaches `usage_log` whether or not the turn is cancelled meanwhile:
     the write runs as a task of its own, and a cancel that lands during it waits for it
     to settle before it goes on — a cancelled or timed-out turn is billed all the same
     (docs/chat.md § Conversations, turns, events)."""
-    await _settled(_record_usage(ctx, model, usage))
+    await _settled(_record_usage(ctx, model, usage, conversation=conversation))
 
 
 async def _settled(recording: Awaitable[None]) -> None:
@@ -750,7 +825,9 @@ async def _stream_once(
             # (docs/chat.md § Conversations, turns, events). A write that fails is logged
             # rather than raised over what ended the call.
             try:
-                await _record_usage_settled(ctx, str(body["model"]), usage)
+                await _record_usage_settled(
+                    ctx, str(body["model"]), usage, conversation=parent is None
+                )
             except Exception:
                 logger.exception("turn %s: the usage of a call cut short was lost", ctx.turn.id)
     await flush_text()
@@ -1122,6 +1199,10 @@ NOT_RUN_OUT_OF_CREDITS = (
     "This tool was not run: the account's credits are spent and the tool calls left to this "
     "turn are used. Answer with what you have."
 )
+NOT_RUN_COMPACT_ALLOWANCE = (
+    "This tool was not run: the compaction's allowance of tool calls is used. Write the "
+    "summary now."
+)
 
 
 def _image_bytes(result: dict) -> int:
@@ -1136,13 +1217,26 @@ def _image_bytes(result: dict) -> int:
     )
 
 
-async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str]) -> list[dict]:
+async def _run_tools(
+    ctx: TurnContext, tool_uses: list[dict], malformed: set[str], *, room: int | None = None
+) -> list[dict]:
     """The results of one round, in the order the calls were made. Reads run together;
     the tools that write the tree run one after another, because each commits whatever is
-    dirty and two in flight would file one's changes under the other (docs/chat.md § Tools)."""
+    dirty and two in flight would file one's changes under the other (docs/chat.md § Tools).
+    `room` is how many of the round a compaction turn's allowance leaves: the rest are
+    answered, not run (docs/chat.md § Compaction)."""
     results: dict[int, dict] = {}
     stopped = asyncio.Event()
-    may_run = ctx.round_admission(len(tool_uses))
+    # The credits admit only the calls the allowance leaves: the rest are refused before
+    # the credits are asked, so a refused call spends no overdraft allowance.
+    may_run = ctx.round_admission(len(tool_uses) if room is None else min(len(tool_uses), room))
+
+    def refused(index: int) -> str | None:
+        """Why the call is not run, or None when it runs: past the compaction's allowance,
+        or past the credits and the calls allowed after them."""
+        if room is not None and index >= room:
+            return NOT_RUN_COMPACT_ALLOWANCE
+        return None if may_run(index) else NOT_RUN_OUT_OF_CREDITS
 
     async def reads() -> None:
         # A few at a time, against one image budget for the round: fifty page renders at
@@ -1189,14 +1283,15 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
                 # reason to refuse them: a reader's "remember this" late in a page-by-page
                 # check still lands.
                 refusal = exhausted() if block.get("name") not in NO_IMAGE_TOOLS else None
-                if refusal is None and not may_run(index):
-                    # The credits ran out and the calls allowed after them are used: a
-                    # read not yet started is not started (docs/billing.md § A chat turn).
+                if refusal is None and (why := refused(index)) is not None:
+                    # The credits ran out and the calls allowed after them are used, or
+                    # the compaction's allowance is: a read not yet started is not
+                    # started (docs/billing.md § A chat turn).
                     results[index] = await _report_tool(
                         ctx,
                         str(block.get("id")),
                         block.get("name"),
-                        chat_tools.ToolOutcome(NOT_RUN_OUT_OF_CREDITS, is_error=True),
+                        chat_tools.ToolOutcome(why, is_error=True),
                     )
                     return
                 if refusal is not None:
@@ -1225,12 +1320,12 @@ async def _run_tools(ctx: TurnContext, tool_uses: list[dict], malformed: set[str
         # waiting once the calls allowed after the credits ran out are used does not start;
         # one already running finishes and commits as it would (docs/billing.md § A chat
         # turn).
-        if not may_run(index):
+        if (why := refused(index)) is not None:
             return await _report_tool(
                 ctx,
                 str(block.get("id")),
                 block.get("name"),
-                chat_tools.ToolOutcome(NOT_RUN_OUT_OF_CREDITS, is_error=True),
+                chat_tools.ToolOutcome(why, is_error=True),
             )
         return await _run_tool(ctx, block, malformed)
 
@@ -1439,17 +1534,24 @@ async def _run_download(ctx: TurnContext, tool_input: dict) -> chat_tools.ToolOu
 async def _loop(ctx: TurnContext) -> None:
     messages = await _history(ctx)
     since_marker = 0
+    compaction = ctx.turn.kind in COMPACTION_TURNS
     while True:
         if await _cancelled(ctx):
             raise TurnCancelled()
         # The credits ran out and the tool calls allowed after them are used: this call is
         # the turn's last, and answers with what the turn has (docs/billing.md § A chat turn).
-        final = ctx.overdraft_spent()
+        # A compaction turn's last call comes once its own allowance of tool calls is used:
+        # it answers with the summary (docs/chat.md § Compaction).
+        final = ctx.overdraft_spent() or (
+            compaction and ctx.tool_calls >= ctx.settings.chat_compact_max_tool_calls
+        )
         body = build_request(ctx, messages, since_marker=since_marker, final=final)
         if since_marker >= CACHE_GUARD_EVERY:
             since_marker = 0
         completed = await _call_model(ctx, body)
-        await _record_usage_settled(ctx, completed.model or ctx.model, completed.usage)
+        await _record_usage_settled(
+            ctx, completed.model or ctx.model, completed.usage, conversation=True
+        )
         if await _cancelled(ctx):
             # Billed, but not kept: a cancelled turn leaves the history as it was.
             raise TurnCancelled()
@@ -1483,7 +1585,7 @@ async def _loop(ctx: TurnContext) -> None:
         elif followed is not None:
             await _follow_model(ctx, followed)
 
-        if final and completed.stop_reason == "tool_use":
+        if final and completed.stop_reason == "tool_use" and ctx.overdraft_spent():
             # Kept and billed: the answer so far stays in the thread, and no tool runs on
             # a balance that is gone (docs/billing.md § A chat turn).
             raise TurnOutOfCredits()
@@ -1491,19 +1593,30 @@ async def _loop(ctx: TurnContext) -> None:
             raise TurnFailed("The model declined this request")
         if completed.stop_reason == "max_tokens":
             raise TurnFailed("The answer reached the output limit before it was complete")
-        if completed.stop_reason in ("end_turn", "stop_sequence"):
+        if completed.stop_reason in ("end_turn", "stop_sequence") or (
+            final and completed.stop_reason == "tool_use"
+        ):
+            if compaction:
+                # The answer is the summary every later turn replays in place of the
+                # history (docs/chat.md § Compaction).
+                await _store_summary(ctx, content)
             return
         if completed.stop_reason != "tool_use" or not tool_uses:
             raise TurnFailed(f"The model stopped unexpectedly ({completed.stop_reason})")
         if await _cancelled(ctx):
             raise TurnCancelled()
 
+        room = len(tool_uses)
+        if compaction:
+            # What the compaction's allowance leaves this round: the first calls run, the
+            # rest are answered, so no round overruns it (docs/chat.md § Compaction).
+            room = max(0, ctx.settings.chat_compact_max_tool_calls - ctx.tool_calls)
         ctx.tool_calls += len(tool_uses)
         if ctx.tool_calls > ctx.settings.chat_max_tool_calls_per_turn:
             raise TurnFailed(
                 f"The turn made more than {ctx.settings.chat_max_tool_calls_per_turn} tool calls"
             )
-        results = await _run_tools(ctx, tool_uses, completed.malformed_tool_uses)
+        results = await _run_tools(ctx, tool_uses, completed.malformed_tool_uses, room=room)
         # Every result in one user message, in the order the calls were made
         # (docs/chat.md § Tools).
         await _store(ctx, "user", list(results))
@@ -1512,16 +1625,63 @@ async def _loop(ctx: TurnContext) -> None:
         since_marker += len(results)
 
 
+async def _store_summary(ctx: TurnContext, content: list[dict]) -> None:
+    """The compaction's summary as the user message the replay starts from, stored as any
+    message is: the turn's finish makes it the boundary, in the commit that ends the turn
+    as succeeded (`_finish`), so a cancel or a worker's death that lands between leaves a
+    turn that set nothing and a row no replay reads. The memory file is read here, before
+    that commit, for the snapshot the finish stores (docs/chat.md § Compaction)."""
+    summary = "\n\n".join(
+        block["text"]
+        for block in content
+        if block.get("type") == "text" and isinstance(block.get("text"), str)
+    ).strip()
+    if not summary:
+        raise TurnFailed("compact_empty")
+    memory_file = await memory_file_text(ctx.settings, ctx.turn.user_id)
+    async with ctx.sessionmaker() as db:
+        await _still_ours(db, ctx)
+        row = Message(
+            conversation_id=ctx.conversation.id,
+            role="user",
+            content=[
+                {
+                    "type": "text",
+                    "text": chat_agent.render_summary(summary),
+                    "context": SUMMARY_CONTEXT,
+                }
+            ],
+            turn_id=ctx.turn.id,
+        )
+        db.add(row)
+        await db.flush()
+        message_id = row.id
+        await db.commit()
+    ctx.compacted = Compacted(message_id, memory_file)
+
+
+def _keep_place(kind: str) -> dict:
+    """The `updated_at` an idle compaction's writes leave as it was: the list orders by it,
+    and the worker compacting on its own is no thread continued (docs/chat.md
+    § Compaction, *Idle compaction*). Every other turn's writes move it, as its finish does."""
+    if kind == IDLE_COMPACT_TURN:
+        return {"updated_at": Conversation.updated_at}
+    return {}
+
+
 async def _finish(
     sessionmaker: async_sessionmaker[AsyncSession],
     turn_id: uuid.UUID,
     *,
     status: str,
     error: str | None = None,
+    compacted: Compacted | None = None,
 ) -> None:
     """The terminal state and its event in one commit, so a stream that sees the turn
     stop always finds the event that says how. A turn the user cancelled stays
-    cancelled whatever the loop concluded."""
+    cancelled whatever the loop concluded. A compaction's boundary (`compacted`) is set
+    in the same commit, and only by a turn that ends succeeded: one that ends any other
+    way set nothing, whatever it stored (docs/chat.md § Compaction)."""
     async with sessionmaker() as db:
         turn = await db.get(ChatTurn, turn_id)
         if turn is None:
@@ -1542,10 +1702,31 @@ async def _finish(
         turn.error = error
         turn.finished_at = utcnow()
         await ledger.close_chat(db, turn.id)
+        # The list orders by `updated_at`: a thread continued moves, one the worker
+        # compacted on its own does not (docs/chat.md § Compaction).
+        values: dict = (
+            {"updated_at": utcnow()} if turn.kind != IDLE_COMPACT_TURN else _keep_place(turn.kind)
+        )
+        if status == "succeeded" and compacted is not None:
+            # The boundary; the memory snapshots taken again — the history that held the
+            # agent's writes is no longer sent — and the context size and the cache clock
+            # cleared: what the next call replays is the summary, whose size only that
+            # call reports, cached by none before it (docs/chat.md § Compaction).
+            values.update(
+                compacted_message_id=compacted.message_id,
+                memory_ids=None,
+                memory_file=compacted.memory_file,
+                context_tokens=None,
+                cache_warm_until=None,
+            )
+        elif turn.kind in COMPACTION_TURNS:
+            # A compaction that ended any other way: the clock its own calls set is
+            # cleared too, or the idle pass would queue another paid attempt at what just
+            # failed within the hour; the next message's call sets it again (docs/chat.md
+            # § Compaction, *Idle compaction*).
+            values["cache_warm_until"] = None
         await db.execute(
-            update(Conversation)
-            .where(Conversation.id == turn.conversation_id)
-            .values(updated_at=utcnow())
+            update(Conversation).where(Conversation.id == turn.conversation_id).values(**values)
         )
         if status == "succeeded":
             await chat_events.append(db, turn.conversation_id, turn.id, chat_events.TURN_DONE, {})
@@ -1619,7 +1800,12 @@ async def run_turn(
     await _emit(
         ctx,
         chat_events.TURN_START,
-        {"model": ctx.model, "instructions": ctx.instructions, "memory_ids": ctx.memory_ids},
+        {
+            "model": ctx.model,
+            "kind": ctx.turn.kind,
+            "instructions": ctx.instructions,
+            "memory_ids": ctx.memory_ids,
+        },
     )
     try:
         async with asyncio.timeout(settings.chat_turn_timeout_seconds):
@@ -1656,7 +1842,7 @@ async def run_turn(
         await _settle_writers(ctx)
         await _finish(sessionmaker, turn_id, status="failed", error="internal error")
     else:
-        await _finish(sessionmaker, turn_id, status="succeeded")
+        await _finish(sessionmaker, turn_id, status="succeeded", compacted=ctx.compacted)
     finally:
         # The shell may have moved things: bring the library in line (docs/workspace.md).
         try:

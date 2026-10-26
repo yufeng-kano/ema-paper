@@ -12,6 +12,7 @@ Every user owns one directory on the server, `{WORKSPACES_DIR}/{user_id}/`. It i
 ├── .sightread/                        read-only in the VM
 │   ├── results/{job_id}/result.md     the untouched parse output, written once, never edited; removed with its parse (jobs.md § Retention)
 │   └── trash/                         the Trash (§ The Trash): document-<id>/, folder-<id>/, as they left files/
+├── memory.md                          the chat agent's notes across conversations, written by the agent and on the Agent page; a revision like any text (chat.md § Memory, *The memory file*)
 └── files/                             one-to-one with the Files page's folder tree
     └── <folder>/<subfolder>/
         ├── <file name>                a file of any kind: the upload itself, the one copy there is (§ Files)

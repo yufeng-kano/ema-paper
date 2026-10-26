@@ -12,7 +12,7 @@
  * changed or forgot, and what it was given beyond the document — is read from them for
  * every turn, stored or live, since the panel replays a conversation's events from 0.
  */
-import type { ChatEvent, ChatMessage, ChatTurn, ContentBlock, Memory, MemorySnapshot, SubagentRecord } from './api'
+import type { ChatEvent, ChatMessage, ChatTurn, ContentBlock, Memory, MemorySnapshot, SubagentRecord, TurnKind } from './api'
 import { addedLines, diffFromInput, groupRuns, parseDiff, readStep, resultText, type DiffLine, type Step } from './steps'
 
 /** The chat agent's editor tool and the commands of it that write (docs/chat.md § Tools). */
@@ -26,6 +26,28 @@ export const MEMORY_TOOL = 'memory'
 /** A turn the backend has not finished: queued, running, or cancelled and still winding
  *  down a tool call — `finished_at` says, not the status (docs/chat.md § Conversations). */
 export const isLive = (turn: ChatTurn): boolean => turn.finished_at === null
+
+/** The turns that compact the conversation rather than answer a message (docs/chat.md
+ *  § Compaction): the reader's `/compact` and the worker's idle pass. */
+export const COMPACTION_KINDS: ReadonlySet<TurnKind> = new Set(['compact', 'idle_compact'])
+/** The marker of the summary row a compaction leaves, and the command's line as the
+ *  reader's message carries it. */
+export const SUMMARY_CONTEXT = 'summary'
+const COMPACT_LINE = '/compact'
+
+/** A turn's kind: the record's, else what its `turn_start` said, else a message turn — a
+ *  turn from before kinds existed, or one the panel pushed as it sent. */
+export function turnKind(turn: ChatTurn | undefined, group: readonly ChatEvent[] | undefined): TurnKind {
+  if (turn?.kind) {
+    return turn.kind
+  }
+  for (const event of group ?? []) {
+    if (event.event === 'turn_start' && event.kind) {
+      return event.kind
+    }
+  }
+  return 'message'
+}
 
 export interface EditCard {
   /** The tool call that made it — the card's identity across reloads. */
@@ -151,6 +173,12 @@ export type ThreadItem =
   | { kind: 'error'; key: string; text: string }
   | { kind: 'cancelled'; key: string }
   | { kind: 'working'; key: string }
+  /** A compaction turn in flight: the thread ends in *Compacting the conversation…*, its
+   *  steps shown above as any turn's (docs/web.md § The agent panel). */
+  | { kind: 'compacting'; key: string }
+  /** A compaction done: the divider everything above is dimmed under, with the focus the
+   *  reader gave and the summary the turn stored behind *View summary*. */
+  | { kind: 'compact'; key: string; turnId: string; focus: string | null; summary: string }
 
 export interface ThreadInput {
   turns: readonly ChatTurn[]
@@ -163,6 +191,9 @@ export interface Thread {
   items: ThreadItem[]
   /** The turns still in flight: the composer waits while there is one. */
   liveTurns: string[]
+  /** The index of the latest compaction divider: every item before it is dimmed, since the
+   *  agent no longer sees what it summarized; -1 while there is none. */
+  dimBefore: number
 }
 
 function lineOf(value: unknown): string {
@@ -201,6 +232,23 @@ export function sectionsOf(blocks: readonly ContentBlock[]): string[] {
 
 export function isToolResultOnly(blocks: readonly ContentBlock[]): boolean {
   return blocks.length > 0 && blocks.every((block) => block.type === 'tool_result')
+}
+
+/** The summary row a compaction stored: a user message whose first block carries the
+ *  marker (docs/chat.md § Compaction, *What it leaves*). */
+export function isSummary(blocks: readonly ContentBlock[]): boolean {
+  const first = blocks[0]
+  return first?.type === 'text' && first.context === SUMMARY_CONTEXT
+}
+
+/** The focus the reader gave `/compact`, from the message's line; null for none, or for
+ *  the worker's own compaction, which carries no line. */
+export function compactFocus(blocks: readonly ContentBlock[]): string | null {
+  const line = textOf(blocks)
+  if (!line.startsWith(COMPACT_LINE)) {
+    return null
+  }
+  return line.slice(COMPACT_LINE.length).trim() || null
 }
 
 /** The turns in order — those the record lists (oldest first, as the API sends them), then
@@ -348,9 +396,14 @@ export function buildThread(input: ThreadInput): Thread {
     const assistants = own.filter((message) => message.role === 'assistant')
     const prefix = `t${turnId}`
     const flat: Flat[] = []
+    // A compaction draws no bubble and no answer: its message is the instruction, its text
+    // the summary the divider holds (docs/web.md § The agent panel, *Compaction in the thread*).
+    const compaction = COMPACTION_KINDS.has(turnKind(turn, group))
 
-    const typed = own.filter((message) => message.role === 'user' && !isToolResultOnly(message.content))
-    const user = userItem(prefix, typed)
+    const typed = own.filter(
+      (message) => message.role === 'user' && !isToolResultOnly(message.content) && !isSummary(message.content),
+    )
+    const user = compaction ? null : userItem(prefix, typed)
     if (user) {
       flat.push(user)
     }
@@ -486,7 +539,7 @@ export function buildThread(input: ThreadInput): Thread {
       let text = ''
       let textKey = 0
       const flushText = () => {
-        if (text.trim()) {
+        if (text.trim() && !compaction) {
           flat.push({ kind: 'text', key: `${prefix}-live-${textKey}`, text: text.trim() })
         }
         text = ''
@@ -520,7 +573,9 @@ export function buildThread(input: ThreadInput): Thread {
         message.content.forEach((block, position) => {
           const at = `${round}-${position}`
           if (block.type === 'text' && blockText(block).trim()) {
-            flat.push({ kind: 'text', key: `${prefix}-text-${at}`, text: blockText(block).trim() })
+            if (!compaction) {
+              flat.push({ kind: 'text', key: `${prefix}-text-${at}`, text: blockText(block).trim() })
+            }
           } else if (block.type === 'thinking' && block.thinking.trim()) {
             flat.push({ kind: 'step', item: { type: 'note', key: `${prefix}-think-${at}`, text: block.thinking.trim() } })
           } else if (block.type === 'tool_use') {
@@ -586,6 +641,19 @@ export function buildThread(input: ThreadInput): Thread {
       flat.push({ kind: 'error', key: `${prefix}-error`, text: streamError.error })
     } else if (turn?.error) {
       flat.push({ kind: 'error', key: `${prefix}-error`, text: turn.error })
+    } else if (compaction && done) {
+      // Done without an error: the summary it stored, under the divider. A record that
+      // holds none yet (the turn ended, the reload has not landed) draws nothing.
+      const summary = own.find((message) => message.role === 'user' && isSummary(message.content))
+      if (summary) {
+        flat.push({
+          kind: 'compact',
+          key: `${prefix}-compact`,
+          turnId,
+          focus: typed.length ? compactFocus(typed[0]!.content) : null,
+          summary: textOf(summary.content.map((block) => ({ ...block, context: undefined }) as ContentBlock)),
+        })
+      }
     }
 
     const grouped = groupRuns<Flat, ThreadItem>(
@@ -613,14 +681,23 @@ export function buildThread(input: ThreadInput): Thread {
         }
       })
       const last = grouped[grouped.length - 1]
-      if (last?.kind !== 'steps' && !(last?.kind === 'subagent' && last.card.status === 'running')) {
+      if (compaction) {
+        // The thread ends in the compaction's own line, whatever step it is on.
+        grouped.push({ kind: 'compacting', key: `${prefix}-compacting` })
+      } else if (last?.kind !== 'steps' && !(last?.kind === 'subagent' && last.card.status === 'running')) {
         grouped.push({ kind: 'working', key: `${prefix}-working` })
       }
     }
     items.push(...grouped)
   }
 
-  return { items, liveTurns }
+  let dimBefore = -1
+  items.forEach((item, index) => {
+    if (item.kind === 'compact') {
+      dimBefore = index
+    }
+  })
+  return { items, liveTurns, dimBefore }
 }
 
 /**

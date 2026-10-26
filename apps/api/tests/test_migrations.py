@@ -1836,3 +1836,144 @@ async def test_the_reader_views_migration_turns_converting_off_and_adds_the_view
             ).scalar()
     finally:
         await engine.dispose()
+
+
+CHAT_TOOL_CALLS = "8d1142bbd272"
+COMPACTION = "d78cf7a42eea"
+
+
+async def test_the_compaction_migration_leaves_every_row_as_a_message_turn(scratch_url) -> None:
+    """Every turn that came before is a message turn, every reader has idle compaction on,
+    every conversation has no summary, no context and no clock; the downgrade drops the
+    columns and the partial index and keeps the rows (docs/database.md)."""
+    _alembic(scratch_url, "upgrade", CHAT_TOOL_CALLS)
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.begin() as db:
+            await db.execute(
+                text(
+                    "INSERT INTO users (id, google_sub, email, created_at) "
+                    "VALUES (1, 'sub', 'r@example.com', now())"
+                )
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO agent_settings (user_id, agent, model) VALUES "
+                    "(1, 'chat', 'm'), (1, 'parse', NULL)"
+                )
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO documents (id, user_id, folder_id, job_id, name, kind, "
+                    "created_at, updated_at) VALUES (1, 1, NULL, NULL, 'notes.md', 'markdown', "
+                    "now(), now())"
+                )
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO conversations (id, user_id, document_id, title, session, "
+                    "model, created_at, updated_at) VALUES (1, 1, 1, 'Thread', 's', 'm', "
+                    "now(), now())"
+                )
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO chat_turns (id, user_id, conversation_id, message_id, status, "
+                    "locale, created_at, finished_at) VALUES "
+                    "('22222222-2222-2222-2222-222222222222', 1, 1, 1, 'succeeded', 'en', "
+                    "now(), now())"
+                )
+            )
+            # Skills named after the composer's commands, and one whose name the rename
+            # would otherwise take.
+            await db.execute(
+                text(
+                    "INSERT INTO skills (user_id, name, description, argument_hint, body, "
+                    "created_at, updated_at) VALUES "
+                    "(1, 'compact', '', '', 'x', now(), now()), "
+                    "(1, 'compact-2', '', '', 'y', now(), now()), "
+                    "(1, 'new', '', '', 'z', now(), now()), "
+                    "(1, 'mine', '', '', 'w', now(), now())"
+                )
+            )
+        _alembic(scratch_url, "upgrade", COMPACTION)
+        async with engine.begin() as db:
+            assert (await db.execute(text("SELECT kind FROM chat_turns"))).scalar() == "message"
+            names = (await db.execute(text("SELECT name, body FROM skills ORDER BY body"))).all()
+            assert names == [("mine", "w"), ("compact-3", "x"), ("compact-2", "y"), ("new-2", "z")]
+            switches = (
+                await db.execute(text("SELECT agent, idle_compact FROM agent_settings ORDER BY 1"))
+            ).all()
+            assert switches == [("chat", True), ("parse", True)]
+            assert (
+                await db.execute(
+                    text(
+                        "SELECT memory_file, compacted_message_id, context_tokens, "
+                        "cache_warm_until FROM conversations"
+                    )
+                )
+            ).one() == (None, None, None, None)
+            # A turn written without a kind is a message turn, as the model would write it.
+            await db.execute(
+                text(
+                    "INSERT INTO chat_turns (id, user_id, conversation_id, message_id, status, "
+                    "locale, created_at) VALUES "
+                    "('33333333-3333-3333-3333-333333333333', 1, 1, 2, 'queued', 'en', now())"
+                )
+            )
+            assert (
+                await db.execute(
+                    text(
+                        "SELECT kind FROM chat_turns "
+                        "WHERE id = '33333333-3333-3333-3333-333333333333'"
+                    )
+                )
+            ).scalar() == "message"
+            index = (
+                await db.execute(
+                    text(
+                        "SELECT indexdef FROM pg_indexes "
+                        "WHERE indexname = 'ix_conversations_cache_warm_until'"
+                    )
+                )
+            ).scalar()
+            assert index is not None and "cache_warm_until IS NOT NULL" in index
+            await db.execute(
+                text(
+                    "UPDATE conversations SET compacted_message_id = 7, context_tokens = 120000, "
+                    "cache_warm_until = now(), memory_file = 'notes' WHERE id = 1"
+                )
+            )
+        _alembic(scratch_url, "downgrade", CHAT_TOOL_CALLS)
+        async with engine.begin() as db:
+            columns = {
+                (table, column)
+                for table, column in (
+                    await db.execute(
+                        text(
+                            "SELECT table_name, column_name FROM information_schema.columns "
+                            "WHERE table_name IN ('conversations', 'chat_turns', 'agent_settings')"
+                        )
+                    )
+                ).all()
+            }
+            assert not columns & {
+                ("conversations", "memory_file"),
+                ("conversations", "compacted_message_id"),
+                ("conversations", "context_tokens"),
+                ("conversations", "cache_warm_until"),
+                ("chat_turns", "kind"),
+                ("agent_settings", "idle_compact"),
+            }
+            assert (
+                await db.execute(
+                    text(
+                        "SELECT count(*) FROM pg_indexes "
+                        "WHERE indexname = 'ix_conversations_cache_warm_until'"
+                    )
+                )
+            ).scalar() == 0
+            assert await _count(db, "chat_turns") == 2
+            assert await _count(db, "conversations") == 1
+    finally:
+        await engine.dispose()

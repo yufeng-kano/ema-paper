@@ -30,6 +30,7 @@ import {
   getMe,
   getSandbox,
   getConversation,
+  listAgents,
   listConversations,
   listMemories,
   renameConversation,
@@ -37,6 +38,7 @@ import {
   sendMessage,
   creditsRefusalOf,
   type CreditsRefusal,
+  type AgentSettings,
   type ChatEvent,
   type ChatMessage,
   type ChatTurn,
@@ -45,7 +47,8 @@ import {
   type Memory,
 } from '~/lib/api'
 import { blockName, type NameText } from '~/lib/blocks'
-import { commandArguments, formatBytes, type AskOutcome, type AskRequest, type ComposerPayload } from '~/lib/composer'
+import { COMPACT_COMMAND, commandArguments, formatBytes, type AskOutcome, type AskRequest, type ComposerPayload } from '~/lib/composer'
+import { idleReloadDelay } from '~/lib/context'
 import { byRecency } from '~/lib/conversations'
 import { nodesToMarkdown } from '~/lib/copy'
 import { formatCount, formatDate } from '~/lib/format'
@@ -365,10 +368,9 @@ async function loadDetail(id: number) {
     }
     // A rename sent or answered since this read began keeps its title: the read may predate it.
     const fresh = (renames.get(id) ?? 0) === renamed
+    // The payload whole — the ring reads its context and clock from the row.
     conversations.value = conversations.value.map((row) =>
-      row.id === id
-        ? { ...row, title: fresh ? detail.conversation.title : row.title, updated_at: detail.conversation.updated_at }
-        : row,
+      row.id === id ? { ...row, ...detail.conversation, title: fresh ? detail.conversation.title : row.title } : row,
     )
   } catch (error) {
     if (seq === detailSeq) {
@@ -547,6 +549,55 @@ onMounted(loadMemories)
  *  keeps the panel mounted, so the change is read here rather than on a remount. */
 const { version: contextVersion } = useAgentContextVersion()
 watch(contextVersion, () => void memoriesChanged())
+
+// --- the model pill and the context ring (docs/web.md § The agent panel) ---------------
+
+/** The chat agent's settings — its model, effort and the idle-compaction switch — as last
+ *  read; read again whenever the Agent page saves. */
+const agentSettings = ref<AgentSettings | null>(null)
+let agentSettingsRequest = 0
+
+async function loadAgentSettings() {
+  const request = ++agentSettingsRequest
+  try {
+    const { agents } = await listAgents()
+    const chat = agents.find((agent) => agent.name === 'chat')
+    if (request === agentSettingsRequest && chat) {
+      agentSettings.value = chat.settings
+    }
+  } catch {
+    // The pill then names the conversation's model alone; a pick reads the answer.
+  }
+}
+
+onMounted(loadAgentSettings)
+watch(contextVersion, () => void loadAgentSettings())
+
+function onAgentSaved(settings: AgentSettings) {
+  agentSettingsRequest++
+  agentSettings.value = settings
+}
+
+/** The open conversation moved to another model: its row as the server answered. */
+function onConversationMoved(moved: Conversation) {
+  listChanged()
+  conversations.value = conversations.value.map((row) => (row.id === moved.id ? { ...row, ...moved } : row))
+}
+
+function onExtrasError(message: string) {
+  composerError.value = message
+}
+
+/** **Compact now**: the conversation open, no turn in flight, an answer since the last
+ *  summary (docs/chat.md § Compaction). */
+const canCompact = computed(() => current.value !== null && !running.value && current.value.compactable === true)
+
+function compactNow() {
+  if (!canCompact.value) {
+    return
+  }
+  void submit({ text: '', selection: null, sections: [], quote: null, command: COMPACT_COMMAND, attachments: [] })
+}
 
 /** The floating card a memory line's **View** or a part of the *Used* line opened, and the
  *  control that opened it — where it stands, and where focus goes back to. */
@@ -772,6 +823,49 @@ watch(running, (now, before) => {
   }
 })
 
+// --- discovering an idle compaction (docs/web.md § The agent panel) ----------------------
+
+/** The worker compacts an idle conversation before its cache expires, and the stream is
+ *  closed while nothing runs, so the panel would not hear of the turn: the open
+ *  conversation is read again as the worker's window opens and every minute inside it
+ *  (`idleReloadDelay`), and the turn the record then lists is followed like a reader's. */
+let idleReload: ReturnType<typeof setTimeout> | null = null
+
+function scheduleIdleReload() {
+  if (idleReload !== null) {
+    clearTimeout(idleReload)
+    idleReload = null
+  }
+  const id = currentId.value
+  if (id === null || running.value || agentSettings.value?.idle_compact === false) {
+    return
+  }
+  const delay = idleReloadDelay(current.value, limits.value?.idle_compact_lead_seconds ?? 0, Date.now())
+  if (delay === null) {
+    return
+  }
+  idleReload = setTimeout(() => {
+    idleReload = null
+    if (currentId.value === id && !running.value) {
+      // Read again after the read: the clock may stand as it did, which the watch
+      // below would not see.
+      void loadDetail(id).then(scheduleIdleReload)
+    }
+  }, delay)
+}
+
+watch(
+  () => [
+    currentId.value,
+    current.value?.cache_warm_until,
+    running.value,
+    agentSettings.value?.idle_compact,
+    limits.value?.idle_compact_lead_seconds,
+  ],
+  scheduleIdleReload,
+  { immediate: true },
+)
+
 const sendBlock = computed<'credits' | 'storage' | null>(() => {
   const me = auth.me.value
   if (me && me.credits_remaining < me.chat_min_credits) {
@@ -934,6 +1028,16 @@ function imageSource(item: UserItem, attachment: UserAttachment): string | null 
 const openGroups = reactive(new Map<string, boolean>())
 const openSteps = reactive(new Set<string>())
 const openCards = reactive(new Map<string, boolean>())
+/** The compaction dividers whose summary is open, by item key. */
+const summaryOpen = reactive(new Set<string>())
+
+function toggleSummary(key: string) {
+  if (summaryOpen.has(key)) {
+    summaryOpen.delete(key)
+  } else {
+    summaryOpen.add(key)
+  }
+}
 
 function groupOpen(item: StepsItem): boolean {
   return openGroups.get(item.key) ?? item.live
@@ -1068,7 +1172,7 @@ function sentContent(payload: ComposerPayload): ContentBlock[] {
   if (payload.quote) {
     blocks.push({ type: 'text', text: payload.quote, context: 'quote' })
   }
-  if (payload.command) {
+  if (payload.command && payload.command !== COMPACT_COMMAND) {
     blocks.push({ type: 'text', text: '', context: 'skill', skill: payload.command })
   }
   return blocks
@@ -1144,7 +1248,17 @@ async function submit(payload: ComposerPayload): Promise<boolean> {
         created_at: new Date().toISOString(),
       },
     ]
-    turns.value = [...turns.value, { id: turn_id, status: 'queued', error: null, finished_at: null }]
+    turns.value = [
+      ...turns.value,
+      // Its kind from the send: a compaction draws no bubble (docs/web.md § The agent panel).
+      {
+        id: turn_id,
+        kind: payload.command === COMPACT_COMMAND ? 'compact' : 'message',
+        status: 'queued',
+        error: null,
+        finished_at: null,
+      },
+    ]
     stream.expectTurn(turn_id)
     return true
   } catch (error) {
@@ -1160,6 +1274,11 @@ async function submit(payload: ComposerPayload): Promise<boolean> {
       return false
     }
     composerError.value = await resolve(error)
+    if (error instanceof ApiRequestError && error.status === 409 && id !== null && currentId.value === id) {
+      // A turn the panel did not know of — the worker's idle compaction, or a send from
+      // another tab — may be the one in the way: the record says, and is followed.
+      void loadDetail(id)
+    }
     return false
   } finally {
     if (fromDraft) {
@@ -1560,6 +1679,9 @@ onBeforeUnmount(() => {
   if (flushTimer !== null) {
     clearTimeout(flushTimer)
   }
+  if (idleReload !== null) {
+    clearTimeout(idleReload)
+  }
   if (ticker !== null) {
     clearInterval(ticker)
   }
@@ -1662,9 +1784,10 @@ onBeforeUnmount(() => {
       <UiSkeleton v-if="detailPending && !items.length" :rows="3" />
       <p v-else-if="!items.length" class="empty">{{ t('chat.empty') }}</p>
 
-      <template v-for="item in items" :key="item.key">
-        <!-- The reader's turn: right-aligned, what went with it above the bubble. -->
-        <div v-if="item.kind === 'user'" class="user-row">
+      <template v-for="(item, position) in items" :key="item.key">
+        <!-- The reader's turn: right-aligned, what went with it above the bubble. Everything
+             above the latest compaction divider is dimmed: the agent no longer sees it. -->
+        <div v-if="item.kind === 'user'" class="user-row" :class="{ dimmed: position < thread.dimBefore }">
           <div v-if="item.attachments.length" class="user-attachments">
             <template v-for="attachment in item.attachments" :key="attachment.key">
               <span
@@ -1705,7 +1828,7 @@ onBeforeUnmount(() => {
         </div>
 
         <!-- An answer: its section links are chips that scroll the document there. -->
-        <div v-else-if="item.kind === 'text'" class="assistant md-message md-side">
+        <div v-else-if="item.kind === 'text'" class="assistant md-message md-side" :class="{ dimmed: position < thread.dimBefore }">
           <template v-for="(block, index) in messageBlocks(item.text)" :key="index">
             <!-- A comment draws nothing, and takes no wrapper that would count as a block. -->
             <div v-if="block.kind !== 'comment'" class="answer-block" :data-answer-block="`${item.key}:${index}`">
@@ -1736,6 +1859,7 @@ onBeforeUnmount(() => {
 
         <ChatMemoryLine
           v-else-if="item.kind === 'memory'"
+          :class="{ dimmed: position < thread.dimBefore }"
           :line="item.line"
           :memories="shownMemories"
           :conversation-id="currentId"
@@ -1747,7 +1871,7 @@ onBeforeUnmount(() => {
 
         <!-- Under a finished turn's last answer: what it used, and the control that copies
              it whole, as its markdown. -->
-        <div v-else-if="item.kind === 'foot'" class="answer-foot">
+        <div v-else-if="item.kind === 'foot'" class="answer-foot" :class="{ dimmed: position < thread.dimBefore }">
           <UiCopyButton :text="item.text" size="xs" :label="t('chat.copyAnswer')" />
           <!-- The turn's credits: a cost figure, so in the accent (docs/web.md § The agent panel). -->
           <span v-if="turnCredits(item.turnId) !== null" class="answer-credits tabular">
@@ -1763,6 +1887,7 @@ onBeforeUnmount(() => {
 
         <ChatStepGroup
           v-else-if="item.kind === 'steps'"
+          :class="{ dimmed: position < thread.dimBefore }"
           :steps="item.steps"
           :live="item.live"
           :open="groupOpen(item)"
@@ -1776,6 +1901,7 @@ onBeforeUnmount(() => {
 
         <ChatSubagentCard
           v-else-if="item.kind === 'subagent'"
+          :class="{ dimmed: position < thread.dimBefore }"
           :card="item.card"
           :open="cardOpen(item)"
           :started-at="subagentSeen.get(item.card.id) ?? null"
@@ -1790,17 +1916,49 @@ onBeforeUnmount(() => {
 
         <!-- The worker's text is for the log: the line says it in the reader's words and
              keeps the original in the tooltip (docs/web.md § The agent panel). -->
-        <div v-else-if="item.kind === 'error'" class="turn-error-row">
+        <div v-else-if="item.kind === 'error'" class="turn-error-row" :class="{ dimmed: position < thread.dimBefore }">
           <p class="turn-error" role="alert" :title="item.text">{{ t(turnErrorKey(item.text)) }}</p>
           <UiButton v-if="errorNeedsPlan(item.text)" size="sm" variant="secondary" @click="seePlans">
             {{ t('credits.seePlans') }}
           </UiButton>
         </div>
-        <p v-else-if="item.kind === 'cancelled'" class="turn-note">{{ t('chat.turnCancelled') }}</p>
+        <p v-else-if="item.kind === 'cancelled'" class="turn-note" :class="{ dimmed: position < thread.dimBefore }">
+          {{ t('chat.turnCancelled') }}
+        </p>
         <p v-else-if="item.kind === 'working'" class="working">
           <UiSpinner :size="12" />
           <span>{{ t('chat.working') }}</span>
         </p>
+        <p v-else-if="item.kind === 'compacting'" class="working">
+          <UiSpinner :size="12" />
+          <span>{{ t('chat.compacting') }}</span>
+        </p>
+
+        <!-- A compaction done: the divider, its summary behind *View summary*, and the
+             turn's credits as under an answer (docs/web.md § The agent panel). -->
+        <div v-else-if="item.kind === 'compact'" class="compact" :class="{ dimmed: position < thread.dimBefore }">
+          <div class="compact-rule">
+            <span class="compact-label">
+              {{ t('chat.compacted') }}<template v-if="item.focus"> · {{ item.focus }}</template>
+            </span>
+            <button
+              type="button"
+              class="compact-view"
+              :aria-expanded="summaryOpen.has(item.key) ? 'true' : 'false'"
+              @click="toggleSummary(item.key)"
+            >
+              {{ summaryOpen.has(item.key) ? t('chat.hideSummary') : t('chat.viewSummary') }}
+            </button>
+          </div>
+          <span v-if="turnCredits(item.turnId) !== null" class="answer-credits tabular">
+            {{ t('credits.n', { n: formatCount(turnCredits(item.turnId)!, locale) }, turnCredits(item.turnId)!) }}
+          </span>
+          <div v-if="summaryOpen.has(item.key)" class="compact-summary md-message md-side">
+            <template v-for="(block, blockIndex) in messageBlocks(item.summary)" :key="blockIndex">
+              <MdBlock v-if="block.kind !== 'comment'" :block="block" :cite="resolveCite" />
+            </template>
+          </div>
+        </div>
       </template>
     </div>
 
@@ -1833,9 +1991,29 @@ onBeforeUnmount(() => {
       :section-source="sectionSourceOf"
       :submit="submit"
       :error="composerError"
+      :conversation-open="currentId !== null"
       @stop="stop"
       @new-conversation="newConversation"
-    />
+    >
+      <template #foot>
+        <ChatModelPill
+          :conversation="current"
+          :settings="agentSettings"
+          :running="running"
+          @saved="onAgentSaved"
+          @moved="onConversationMoved"
+          @error="onExtrasError"
+        />
+        <ChatContextRing
+          :conversation="current"
+          :settings="agentSettings"
+          :can-compact="canCompact"
+          @saved="onAgentSaved"
+          @compact="compactNow"
+          @error="onExtrasError"
+        />
+      </template>
+    </ChatComposer>
 
     <ChatContextCard
       v-if="card"
@@ -2277,6 +2455,83 @@ onBeforeUnmount(() => {
   color: var(--faint);
   font-size: var(--text-xs);
   line-height: 1.5;
+}
+
+/* Above the latest compaction divider: still there to read, no longer what the agent sees. */
+.thread > .dimmed {
+  opacity: 0.55;
+}
+
+/* --- a compaction's divider: a hairline with its words, the summary under it ----------- */
+
+.compact {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.compact-rule {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  color: var(--faint);
+  font-size: var(--text-xs);
+}
+
+.compact-rule::before,
+.compact-rule::after {
+  content: '';
+  flex: 1 1 auto;
+  height: 1px;
+  background: var(--hair);
+}
+
+.compact-label {
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* A text button: the muted words with a quiet underline, ink on hover. */
+.compact-view {
+  flex-shrink: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  text-decoration: underline;
+  text-decoration-color: var(--edge);
+  text-underline-offset: 3px;
+  cursor: pointer;
+  transition: color var(--duration-fast) var(--ease);
+}
+
+.compact-view:hover {
+  color: var(--ink);
+  text-decoration-color: currentcolor;
+}
+
+.compact > .answer-credits {
+  align-self: center;
+}
+
+/* The summary as an answer is drawn, on the sunken surface. */
+.compact-summary {
+  --block-heading: var(--display-xs);
+  --block-subheading: var(--text-base);
+  --block-text: var(--text-sm);
+  --block-text-sm: var(--text-xs);
+
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius);
+  background: var(--rail);
 }
 
 .working {

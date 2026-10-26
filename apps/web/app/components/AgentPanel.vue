@@ -141,6 +141,29 @@ async function applyEffort(value: string) {
   }
 }
 
+// --- idle compaction (chat only) -------------------------------------------------
+
+/** Whether the worker compacts the reader's long conversations before their cache expires
+ *  (docs/chat.md § Compaction, *Idle compaction*): on unless turned off. */
+const idleOn = computed(() => settings.value.idle_compact ?? true)
+const idlePending = ref(false)
+const idleError = ref<string | null>(null)
+
+async function applyIdleCompact(value: boolean) {
+  if (idlePending.value) {
+    return
+  }
+  idlePending.value = true
+  idleError.value = null
+  try {
+    emit('saved', props.agent.name, await putAgentSettings(props.agent.name, { idle_compact: value }))
+  } catch (error) {
+    idleError.value = await resolve(error)
+  } finally {
+    idlePending.value = false
+  }
+}
+
 // --- prompt ---------------------------------------------------------------------
 
 /** The prompt dialog answers for the agent it was opened on. */
@@ -195,8 +218,22 @@ function onSectionSaved(agent: string, saved: SavedAgentSettings) {
       </div>
       <p v-if="convention" class="convention mono reveal">{{ convention }}</p>
       <p v-if="isChat" class="note">{{ t('agents.cacheNote') }}</p>
+      <!-- The idle-compaction switch, after the cache line (docs/web.md § Pages). -->
+      <template v-if="isChat">
+        <div class="switch-line">
+          <UiSwitch
+            :model-value="idleOn"
+            :label="t('agents.idleCompact.label')"
+            :busy="idlePending"
+            @update:model-value="applyIdleCompact"
+          />
+          <span class="switch-words">{{ t('agents.idleCompact.label') }}</span>
+        </div>
+        <p class="note">{{ t('agents.idleCompact.note') }}</p>
+      </template>
       <UiBanner v-if="modelsError" class="row-banner" tone="error">{{ modelsError }}</UiBanner>
       <UiBanner v-if="effortError" class="row-banner" tone="error">{{ effortError }}</UiBanner>
+      <UiBanner v-if="idleError" class="row-banner" tone="error">{{ idleError }}</UiBanner>
     </div>
 
     <template v-if="!isChat">
@@ -217,6 +254,7 @@ function onSectionSaved(agent: string, saved: SavedAgentSettings) {
         @saved="onSectionSaved"
       />
       <AgentsMemorySection :agent="agent" @saved="onSectionSaved" />
+      <AgentsMemoryFileSection />
 
       <!-- Tools: read-only facts. The sandbox's state is on the Usage page. ---------- -->
       <div class="row">
@@ -330,6 +368,18 @@ function onSectionSaved(agent: string, saved: SavedAgentSettings) {
   margin: 0;
   color: var(--muted);
   font-size: var(--text-xs);
+}
+
+/* A switch beside its words, under the cache line. */
+.switch-line {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.switch-words {
+  font-size: var(--text-sm);
 }
 
 /* The tools row has the field label's treatment with no control under it. */

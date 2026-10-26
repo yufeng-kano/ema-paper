@@ -23,12 +23,22 @@ from sqlalchemy import delete, exists, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..agents import CHAT
+from ..agents import chat as chat_agent
 from ..agents import memory as memory_defs
 from ..agents import skills as skill_defs
+from ..agents.chat import (  # noqa: F401 - re-exported: the context route and the tests read them here
+    ANSWER_LANGUAGE_RULE,
+    TRANSLATION_LANGUAGE_RULE,
+    TURN_CONTEXT,
+    turn_note,
+)
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
 from ..billing import ledger
+from ..billing.credits import credits_for_usd
 from ..db.models import (
+    COMPACT_TURN,
     FILE_KIND,
+    MESSAGE_TURN,
     AgentSetting,
     ChatAttachment,
     ChatTurn,
@@ -40,7 +50,7 @@ from ..db.models import (
     utcnow,
 )
 from ..errors import ApiError
-from ..jobs import chat_events
+from ..jobs import chat_compact, chat_events
 from ..jobs.intake import insufficient_credits
 from ..jobs.queue import HISTORY_FULL, count_active_turns, enqueue_turn, history_bytes
 from ..parsing.attachments import prepared_path
@@ -66,11 +76,32 @@ TITLE_MAX_CHARS = 80
 # --- conversations -------------------------------------------------------------------------
 
 
-def conversation_payload(row: Conversation) -> dict:
+def conversation_payload(row: Conversation, settings: AppSettings, *, compactable: bool) -> dict:
+    """The conversation as the list and the detail give it, with what the panel's ring
+    reads: the context the last call replayed, the model's window, when the cache
+    expires and what a cold re-read would cost (docs/chat.md § Compaction)."""
+    price = settings.model_prices.get(row.model) if row.model else None
+    recache = None
+    if price is not None and row.context_tokens:
+        recache = credits_for_usd(
+            price.usd(prompt_tokens=0, completion_tokens=0, cache_write_tokens=row.context_tokens),
+            settings.credit_usd,
+        )
     return {
         "id": row.id,
         "title": row.title,
         "document_id": row.document_id,
+        "model": row.model,
+        "compacted_message_id": row.compacted_message_id,
+        "compactable": compactable,
+        "context_tokens": row.context_tokens,
+        "context_window": (
+            price.context
+            if price is not None and price.context
+            else settings.chat_context_window_tokens
+        ),
+        "cache_warm_until": row.cache_warm_until,
+        "recache_credits": recache,
         "created_at": row.created_at,
         "updated_at": row.updated_at,
     }
@@ -104,21 +135,32 @@ async def owned_document(db: AsyncSession, user_id: int, document_id: int) -> Do
 
 
 @router.get("/library/documents/{document_id}/conversations")
-async def list_conversations(document_id: int, user: SessionUser, db: DbSession):
+async def list_conversations(
+    document_id: int, user: SessionUser, db: DbSession, settings: AppSettings
+):
     document = await owned_document(db, user.id, document_id)
     # Only threads with a message: an empty row is a first send that was refused, kept for
     # its retry, and never a conversation to pick (docs/chat.md § Conversations).
     rows = (
-        await db.execute(
-            select(Conversation)
-            .where(
-                Conversation.document_id == document.id,
-                exists().where(Message.conversation_id == Conversation.id),
+        (
+            await db.execute(
+                select(Conversation)
+                .where(
+                    Conversation.document_id == document.id,
+                    exists().where(Message.conversation_id == Conversation.id),
+                )
+                .order_by(Conversation.updated_at.desc())
             )
-            .order_by(Conversation.updated_at.desc())
         )
-    ).scalars()
-    return {"conversations": [conversation_payload(row) for row in rows]}
+        .scalars()
+        .all()
+    )
+    compactable = await chat_compact.compactable_ids(db, [row.id for row in rows])
+    return {
+        "conversations": [
+            conversation_payload(row, settings, compactable=row.id in compactable) for row in rows
+        ]
+    }
 
 
 @router.post(
@@ -147,7 +189,7 @@ async def create_conversation(
     )
     db.add(row)
     await db.commit()
-    return conversation_payload(row)
+    return conversation_payload(row, settings, compactable=False)
 
 
 # What the stored selection block says before the passage (docs/chat.md § Prompt caching).
@@ -157,37 +199,7 @@ QUOTE_PREFIX = "The user is replying to this passage of your earlier answer:\n\n
 ATTACHMENT_EXPIRED = "An attachment is no longer available; attach it again"
 
 
-# The per-turn context block (docs/chat.md § Prompt caching): what the model must know
-# about this message and may not learn from the cached prefix.
-TURN_CONTEXT = "turn"
 SECTION_CONTEXT = "section"
-# What each language line of the turn block says beside the tag: the rule travels with the
-# line, not with a prompt or a skill the reader may have replaced (docs/chat.md
-# § Instructions).
-ANSWER_LANGUAGE_RULE = "(the reader's choice: answer in it, whatever the locale)"
-TRANSLATION_LANGUAGE_RULE = "(the reader's choice: translate into it unless told otherwise)"
-
-
-def turn_note(
-    revision: str | None,
-    locale: str,
-    answer_language: str | None,
-    translate_language: str | None,
-) -> str:
-    """The turn block: the document's revision, the reader's locale and the languages the
-    reader chose on the Agent page, each line only when chosen and stating its own rule, so
-    it holds under a replaced or migrated prompt and an edited `translate` (docs/chat.md
-    § Instructions)."""
-    lines = [
-        "Context for this message:",
-        f"- document revision: {revision or 'unknown'}",
-        f"- reader locale: {locale}",
-    ]
-    if answer_language:
-        lines.append(f"- answer language: {answer_language} {ANSWER_LANGUAGE_RULE}")
-    if translate_language:
-        lines.append(f"- translation language: {translate_language} {TRANSLATION_LANGUAGE_RULE}")
-    return "\n".join(lines)
 
 
 def section_text(heading: str, text: str | None) -> str:
@@ -238,15 +250,17 @@ def display_content(content: list) -> list:
             shown.append(
                 {"type": "text", "context": "attachment", "attachment": block.get("attachment")}
             )
-        elif marker == TURN_CONTEXT:
-            continue  # the model's context, nothing the thread shows
+        elif marker in (TURN_CONTEXT, chat_compact.COMPACT_CONTEXT):
+            continue  # the model's context and the compaction instruction: nothing the thread shows
         else:
             shown.append(block)
     return shown
 
 
 @router.get("/conversations/{conversation_id}")
-async def read_conversation(conversation_id: int, user: SessionUser, db: DbSession):
+async def read_conversation(
+    conversation_id: int, user: SessionUser, db: DbSession, settings: AppSettings
+):
     row = await owned_conversation(db, user.id, conversation_id)
     messages = (
         await db.execute(
@@ -266,7 +280,9 @@ async def read_conversation(conversation_id: int, user: SessionUser, db: DbSessi
     )
     credits = await ledger.credits_by_turn(db, [turn.id for turn in turns])
     return {
-        "conversation": conversation_payload(row),
+        "conversation": conversation_payload(
+            row, settings, compactable=await chat_compact.compactable(db, row.id)
+        ),
         "messages": [
             {
                 "id": message.id,
@@ -280,6 +296,8 @@ async def read_conversation(conversation_id: int, user: SessionUser, db: DbSessi
         "turns": [
             {
                 "id": str(turn.id),
+                # A user message's, or a compaction's (docs/chat.md § Compaction).
+                "kind": turn.kind,
                 "status": turn.status,
                 "error": turn.error,
                 # Null while the turn is unfinished, whatever its status says: a cancel
@@ -315,30 +333,60 @@ async def delete_conversation(conversation_id: int, user: SessionUser, db: DbSes
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-class ConversationRename(BaseModel):
-    title: str
+class ConversationUpdate(BaseModel):
+    """A rename, a move to another model, or both (docs/api.md)."""
+
+    title: str | None = None
+    model: str | None = Field(default=None, max_length=255)
 
 
 @router.put("/conversations/{conversation_id}", dependencies=[CsrfGuard])
-async def rename_conversation(
-    conversation_id: int, body: ConversationRename, user: SessionUser, db: DbSession
+async def update_conversation(
+    conversation_id: int,
+    body: ConversationUpdate,
+    user: SessionUser,
+    db: DbSession,
+    settings: AppSettings,
 ):
-    """The reader's own title, one line like a memory's text. Written alone, with
-    `updated_at` kept as it was: the list orders by it, and a rename is not a thread
-    continued. A running turn does not refuse it — the runner never writes the title
-    (docs/chat.md § Conversations, turns, events)."""
+    """The reader's own title, one line like a memory's text, and the model the
+    conversation's later turns run on. Written with `updated_at` kept as it was: the list
+    orders by it, and neither is a thread continued. A running turn does not refuse the
+    title — the runner never writes it — and refuses the model (**409**): the turn in flight
+    replays and stores blocks under the model it started on (docs/chat.md § History is
+    append-only)."""
+    provided = body.model_fields_set
+    if "title" not in provided and "model" not in provided:
+        raise ApiError(400, "invalid_request", "Send a title or a model")
     row = await owned_conversation(db, user.id, conversation_id)
-    title = memory_defs.clean_text(body.title, single_line=True)[:TITLE_MAX_CHARS].strip()
-    if not title:
-        raise ApiError(400, "invalid_request", "A conversation needs a title")
-    await db.execute(
-        update(Conversation)
-        .where(Conversation.id == row.id)
-        .values(title=title, updated_at=Conversation.updated_at)
-    )
+    values: dict = {"updated_at": Conversation.updated_at}
+    if "title" in provided:
+        title = memory_defs.clean_text(body.title or "", single_line=True)[:TITLE_MAX_CHARS].strip()
+        if not title:
+            raise ApiError(400, "invalid_request", "A conversation needs a title")
+        values["title"] = title
+    if "model" in provided:
+        model = (body.model or "").strip()
+        # The offered list, read live (docs/billing.md § Models).
+        if model not in {entry["id"] for entry in await agent_models(settings, CHAT.name)}:
+            raise ApiError(400, "invalid_request", "That model is not one the chat agent offers")
+        # Under the conversation's lock, as a send decides: no turn may start under the move.
+        await db.execute(select(Conversation.id).where(Conversation.id == row.id).with_for_update())
+        if await _active_turn(db, row.id) is not None:
+            raise ApiError(
+                409,
+                "invalid_request",
+                "This conversation is still answering; wait for it to finish",
+            )
+        if model != row.model:
+            # The new model has no cache of this history (docs/chat.md § Compaction).
+            values["model"] = model
+            values["cache_warm_until"] = None
+    await db.execute(update(Conversation).where(Conversation.id == row.id).values(**values))
     await db.commit()
     await db.refresh(row)
-    return conversation_payload(row)
+    return conversation_payload(
+        row, settings, compactable=await chat_compact.compactable(db, row.id)
+    )
 
 
 class SectionIn(BaseModel):
@@ -494,12 +542,27 @@ async def post_message(
         raise ApiError(409, "invalid_request", "This conversation is still answering")
     # Under the conversation's lock: a history past the cap takes no further message, or
     # capped-size sends would grow it without end while every turn on it failed
-    # (docs/chat.md § History is append-only).
-    if await history_bytes(db, row.id) > settings.chat_history_max_bytes:
+    # (docs/chat.md § History is append-only). What a turn replays: from the last
+    # compaction's summary on (docs/chat.md § Compaction).
+    if (
+        await history_bytes(db, row.id, since=row.compacted_message_id)
+        > settings.chat_history_max_bytes
+    ):
         raise ApiError(409, "invalid_request", HISTORY_FULL)
 
+    # The reader's `/compact`: the runner's own command, never a skill's name
+    # (docs/chat.md § Compaction).
+    compact = command == chat_agent.COMPACT_COMMAND
+    if compact:
+        if attachment_ids:
+            raise ApiError(400, "invalid_request", "/compact takes no attachments")
+        if not await chat_compact.compactable(db, row.id):
+            raise ApiError(
+                400, "nothing_to_compact", "There is nothing to compact in this conversation"
+            )
+
     skill = None
-    if command is not None:
+    if command is not None and not compact:
         rows = (await db.execute(select(Skill).where(Skill.user_id == user.id))).scalars().all()
         skill = next(
             (
@@ -521,11 +584,18 @@ async def post_message(
     if skill is not None:
         arguments = body.text.strip()
         visible = f"/{skill.name}" + (f" {arguments}" if arguments else "")
+    elif compact:
+        focus = body.text.strip()
+        visible = f"/{chat_agent.COMPACT_COMMAND}" + (f" {focus}" if focus else "")
     else:
         visible = body.text
     if visible.strip():
         content.append({"type": "text", "text": visible})
-    selection = (body.selection or "").strip()
+    # A compaction carries the instruction and the turn block, nothing else: the selection
+    # the composer read as the command was sent is not what it is about.
+    selection = (body.selection or "").strip() if not compact else ""
+    if compact:
+        sections = []
     if selection:
         # Marked as ours: the runner strips the marker before the block goes upstream,
         # and the thread shows a note rather than the scaffolding (docs/chat.md).
@@ -545,9 +615,17 @@ async def post_message(
                 "section": heading,
             }
         )
-    quote = (body.quote or "").strip()
+    quote = (body.quote or "").strip() if not compact else ""
     if quote:
         content.append({"type": "text", "text": f"{QUOTE_PREFIX}{quote}", "context": "quote"})
+    if compact:
+        content.append(
+            {
+                "type": "text",
+                "text": chat_agent.compact_instruction(body.text),
+                "context": chat_compact.COMPACT_CONTEXT,
+            }
+        )
     if skill is not None:
         rendered = skill_defs.render_skill(skill.body, body.text)
         # Sent with a selection or sections, the command runs on them alone. The range is
@@ -590,9 +668,12 @@ async def post_message(
     # carry a history from under the cap to past it, and the turn would then fail before
     # its first call with the attachments spent. Refused here instead, so the rollback
     # keeps them for a new conversation.
-    if await history_bytes(db, row.id) > settings.chat_history_max_bytes:
+    if (
+        await history_bytes(db, row.id, since=row.compacted_message_id)
+        > settings.chat_history_max_bytes
+    ):
         raise ApiError(409, "invalid_request", HISTORY_FULL)
-    if not locked.title:
+    if not locked.title and not compact:
         named = visible.strip() or (attachments[0][0].name if attachments else "")
         first_line = named.splitlines()[0] if named else ""
         # Trimmed after the cut, as a rename is: a line cut at a space keeps none.
@@ -603,6 +684,7 @@ async def post_message(
         conversation_id=row.id,
         message_id=message.id,
         locale=body.locale,
+        kind=COMPACT_TURN if compact else MESSAGE_TURN,
     )
     # The turn's entry, under the user's row lock taken above: a send needs the minimum
     # balance, and what the turn costs is settled on it as it runs (docs/billing.md
