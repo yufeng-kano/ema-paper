@@ -329,8 +329,13 @@ export interface MeResponse {
   chat_min_credits: number
   /** The parse agent's switch (docs/agents.md): whether a PDF or an image uploaded on Files
    *  is converted on arrival — which decides the cap the page applies to it (docs/web.md
-   *  § Files). Optional so a page served by an older API still renders. */
+   *  § Files). Off where it is unset; optional so a page served by an older API still
+   *  renders. */
   auto_convert?: boolean
+  /** The view a converted PDF or image opens on the first time it is read (docs/web.md
+   *  § Result viewer, *Original and Markdown*); Markdown where unset. Optional so a page
+   *  served by an older API still renders. */
+  default_view?: DocumentView
 }
 
 // --- billing (docs/billing.md § Routes) --------------------------------------------
@@ -719,6 +724,9 @@ export interface LibraryFolder {
   updated_at: string
 }
 
+/** The two views of a PDF or an image (docs/web.md § Result viewer, *Original and Markdown*). */
+export type DocumentView = 'original' | 'markdown'
+
 /**
  * One file: the entry, plus the live state of the parse behind it. The two travel together
  * so a row renders — name, status, progress — from a single `GET /api/library`. A markdown
@@ -760,6 +768,14 @@ export interface LibraryDocument {
   /** What the parse cost once settled; null while its reservation is pending, which is
    *  the whole of a queued or running parse (docs/billing.md § Routes). */
   credits?: number | null
+  /** The view the document was last read in (`PUT …/view`); null until it was switched
+   *  once, when the reader's `default_view` decides (docs/web.md § Result viewer, *Original
+   *  and Markdown*). Optional so a page served by an older API still renders. */
+  view?: DocumentView | null
+  /** A parsed document: whether its original is kept, for the Original view (`…/original`);
+   *  null for a file or a markdown document, and where the library read did not look.
+   *  Optional so a page served by an older API still renders. */
+  original?: boolean | null
 }
 
 /**
@@ -1190,15 +1206,39 @@ export function dismissReconvert(id: number): Promise<void> {
 
 /** A file kept as it is becomes a document: a parse of it on `model` — null runs it on the
  *  parse agent's own — in its place and under its name (docs/jobs.md § Converting a file).
- *  Answers the document as the library now lists it, queued. */
-export function convertDocument(id: number, model: string | null): Promise<LibraryDocument> {
-  return request('POST', `/api/library/documents/${id}/convert`, { model })
+ *  `view` is the view the document opens on when the parse succeeds, remembered as if the
+ *  reader had switched to it; null leaves the reader's default to decide. Answers the
+ *  document as the library now lists it, queued. */
+export function convertDocument(
+  id: number,
+  model: string | null,
+  view: DocumentView | null = null,
+): Promise<LibraryDocument> {
+  return request('POST', `/api/library/documents/${id}/convert`, { model, view })
 }
 
 /** Where a file's bytes are read from — inline for what a browser shows safely, as a save
  *  with `download` (docs/api.md § `GET /api/library/documents/{id}/file`). */
 export function documentFileUrl(id: number, download = false): string {
   return `/api/library/documents/${id}/file${download ? '?download=1' : ''}`
+}
+
+/** A parsed document's original, inline, for the Original view (docs/api.md
+ *  § `GET /api/library/documents/{id}/original`). */
+export function documentOriginalUrl(id: number): string {
+  return `/api/library/documents/${id}/original`
+}
+
+/** The view the reader switched a document to, remembered for its next opening
+ *  (docs/api.md § `PUT /api/library/documents/{id}/view`). */
+export function putDocumentView(id: number, view: DocumentView): Promise<void> {
+  return request<undefined>('PUT', `/api/library/documents/${id}/view`, { view })
+}
+
+/** The reader's preferences (docs/api.md § `PUT /api/me/preferences`): the view a converted
+ *  PDF or image opens on the first time. */
+export function putPreferences(body: { default_view: DocumentView }): Promise<{ default_view: DocumentView }> {
+  return request('PUT', '/api/me/preferences', body)
 }
 
 // --- workspace: content, notes, revisions (docs/web.md § Editing) -------------------

@@ -49,7 +49,14 @@ from sightread.workspace.layout import (
     sources_dir,
     user_root,
 )
-from tests.conftest import CSRF_HEADERS, DATABASE_URL, PARSE_MODEL, PAY_SETTINGS, grant_plan
+from tests.conftest import (
+    CSRF_HEADERS,
+    DATABASE_URL,
+    PARSE_MODEL,
+    PAY_SETTINGS,
+    convert_on_upload,
+    grant_plan,
+)
 from tests.test_document_images import _image, _insert
 from tests.test_library_trash import _write
 from tests.test_markdown_documents import _upload_markdown
@@ -480,6 +487,7 @@ async def test_a_queued_parse_takes_its_upload_with_the_account(
     make_client, tmp_path, documents
 ) -> None:
     account = await _account(make_client, tmp_path)
+    await convert_on_upload(account)
     uploaded = await account.post(
         "/api/library/documents",
         files={"file": ("tiny.png", documents["png"].read_bytes(), "image/png")},

@@ -31,6 +31,7 @@ export default {
     title: 'Settings',
     sections: {
       general: 'General',
+      preferences: 'Preferences',
       account: 'Account',
       agent: 'Agent',
       keys: 'API keys',
@@ -65,13 +66,19 @@ export default {
       dragged: 'Set by dragging. Pick a step to go back to a fixed width.',
       foot: 'Applies when the columns sit side by side. A narrow window makes them narrower.',
     },
-    files: {
-      title: 'Files',
+    preferences: {
+      title: 'PDFs and images',
       autoConvert: {
-        label: 'Convert PDFs and images on upload',
-        description: 'Off, they are kept as files and converted from their menu when you ask.',
+        label: 'Convert on upload',
+        description: 'Off, a PDF or an image is kept as it is and converted when you ask for Markdown.',
       },
-      foot: 'Every other kind of file is kept as it is and never converted.',
+      defaultView: {
+        label: 'Open on',
+        description: 'The view a converted PDF or image opens on the first time.',
+        original: 'Original',
+        markdown: 'Markdown',
+      },
+      foot: 'A document remembers the view it was last read in, so the default only decides the first time. Every other kind of file is kept as it is and never converted.',
     },
     account: {
       signedInAs: 'Signed in as',
@@ -381,10 +388,8 @@ export default {
     columnKind: 'Kind',
     kinds: {
       folder: 'Folder',
-      documentPdf: 'Document (PDF, converted)',
-      documentImage: 'Document (image, converted)',
-      documentMarkdown: 'Document (Markdown)',
-      pdf: 'PDF file (not converted)',
+      markdown: 'Markdown document',
+      pdf: 'PDF document',
       image: '{format} image',
       video: '{format} video',
       audio: '{format} audio',
@@ -478,13 +483,14 @@ export default {
   },
   viewer: {
     view: {
+      original: 'Original',
       markdown: 'Markdown',
-      json: 'JSON',
     },
+    noOriginal: 'The original was not kept',
+    notConvertible: 'This format cannot be converted',
     empty: 'Nothing to show yet.',
-    emptyBody: 'This job has not produced any markdown — check the JSON view for what came back.',
-    degraded:
-      'Incomplete: {count} of this document’s pages failed to parse and are missing below (page {pages}). The JSON view carries the reason.',
+    emptyBody: 'This job has not produced any markdown.',
+    degraded: 'Incomplete: {count} of this document’s pages failed to parse and are missing below (page {pages}).',
     find: 'Find in document',
     tools: 'Reader tools',
     findLabel: 'Find',
@@ -496,7 +502,6 @@ export default {
       details: 'File details',
       download: 'Download',
       downloadSize: 'Download ({size})',
-      convert: 'Convert to document',
       showInFiles: 'Show in Files',
       kind: 'Kind',
       size: 'Size',

@@ -10,6 +10,7 @@ import {
   putDocumentContent,
   putDocumentNotes,
   uploadDocumentImage,
+  type DocumentView,
   type JobResult,
   type Skill,
 } from '~/lib/api'
@@ -161,13 +162,14 @@ type Slot = { element: Element | null; atom: boolean }
 
 <script setup lang="ts">
 /**
- * A finished parse, as a document rather than as a blob of JSON — and, on Files, the
- * document's editable copy with its notes and the agent's thread beside it.
+ * A finished parse, as a document — and, on Files, the document's editable copy with its
+ * notes and the agent's thread beside it, and the file it was made from as the *Original*
+ * view.
  *
  * The dialog is what opening a document on Files opens: what a reader actually wants to
- * check is whether the markdown came back right, and a `<pre>` of the whole envelope makes
- * that a reading exercise. The JSON is still one tab away — it is the contract, and nothing
- * here replaces it.
+ * check is whether the markdown came back right, against the original where it matters. A
+ * PDF or an image not yet converted opens here too, on its original alone, and is converted
+ * when the reader asks for Markdown (docs/web.md § Result viewer, *Original and Markdown*).
  *
  * It takes a title and a job error rather than the library's row, which is not this
  * component's business — it renders a result. Files also hands it the document's id, which
@@ -184,7 +186,7 @@ type Slot = { element: Element | null; atom: boolean }
  * finds a passage with Find, the outline and the way back (docs/web.md § Result viewer).
  *
  * The header is the filename and its controls. What the parse was — model, pages, bbox
- * format — and the JSON view sit in the More menu: read once, not every time the document
+ * format — and the two views sit in the More menu: read once, not every time the document
  * is open.
  *
  * The find bar, the outline, the selection toolbar and the pieces at the pane's foot **float
@@ -222,6 +224,24 @@ const props = withDefaults(
     /** Said under the header while the document is being re-converted: what happens to the
      *  version open now (docs/web.md § Files). */
     reconvertNote?: string | null
+    /** The view the viewer opens on (docs/web.md § Result viewer, *Original and Markdown*):
+     *  what the row remembers, or the reader's default — Files decides (`initialView`). */
+    initialView?: DocumentView
+    /** The original, for the Original view: where its bytes are read from and what it is —
+     *  a PDF in a frame, an image as a picture. Null where none is kept: *Original* in the
+     *  menu is then disabled, with the reason under it. */
+    original?: { url: string; kind: 'pdf' | 'image' } | null
+    /** False for a PDF or an image not yet converted: the viewer has its original alone,
+     *  the More menu holds `facts` instead of the parse's, and *Markdown* there asks for the
+     *  conversion (`convert`) rather than switching. */
+    converted?: boolean
+    /** The row's facts for the More menu while the file is not converted: kind, size, date
+     *  added, location. */
+    facts?: MenuFact[]
+    /** Whether a file not yet converted can be — the parse agent accepts PDFs and JPEG, PNG,
+     *  WebP and HEIC images (`accepted_media_types`); false leaves *Markdown* disabled with
+     *  the reason under it. */
+    convertible?: boolean
   }>(),
   {
     error: null,
@@ -232,10 +252,21 @@ const props = withDefaults(
     initialBlock: null,
     markdownDocument: false,
     reconvertNote: null,
+    initialView: 'markdown',
+    original: null,
+    converted: true,
+    facts: () => [],
+    convertible: true,
   },
 )
 
-const emit = defineEmits<{ close: [] }>()
+const emit = defineEmits<{
+  close: []
+  /** The reader switched a converted document's view: what it opens on next time. */
+  view: [view: DocumentView]
+  /** *Markdown* chosen on a file not yet converted: the conversion is asked for. */
+  convert: []
+}>()
 
 const { t } = useI18n()
 const { resolve } = useApiError()
@@ -244,7 +275,12 @@ const { apple, label: keyLabel, matches } = useShortcuts()
 const auth = useAuth()
 const { notesOpen, agentOpen, chosenWidth, chooseWidth } = useViewerLayout()
 
-const tab = ref<'markdown' | 'json'>('markdown')
+/** The view: the document, or the original (docs/web.md § Result viewer, *Original and
+ *  Markdown*) — the latter only where there is one to show, and never for a block link,
+ *  which names a place in the document. */
+const tab = ref<DocumentView>(
+  props.initialView === 'original' && props.original && !props.initialBlock ? 'original' : 'markdown',
+)
 
 /** A running job's snapshot: pages keep arriving under this one (docs/api.md § Partial). */
 const partial = computed(() => props.result?.meta.partial === true)
@@ -3693,7 +3729,7 @@ async function openFind() {
  * Ctrl/Cmd+F, taken from the browser while this dialog is open. The document is a scroll
  * region inside an overlay, and the native find bar cannot usefully reach into it — it
  * matches text the reader cannot see and scrolls the page behind the dialog. Only on the
- * markdown tab: the JSON tab is a `<pre>` the browser searches perfectly well.
+ * Markdown view: the original is the browser's own viewer, which brings its own find.
  *
  * And ⌘[ (Ctrl+[ elsewhere), the way back — taken for as long as the Markdown view shows, pill
  * or not: on Apple platforms it is the browser's Back, and a reader who has learned the key
@@ -3721,16 +3757,16 @@ function onDocumentKey(event: KeyboardEvent) {
   }
 }
 
-/** Where the reader was when they left for JSON: the document is remounted on the way back
- *  and would otherwise open at the top. */
+/** Where the reader was when they left for the original: the document is remounted on the
+ *  way back and would otherwise open at the top. */
 let documentScroll = 0
 
-/** The find bar belongs to the document, so leaving the document for the JSON view closes
- *  it rather than leaving it hanging over JSON; an open block is written back first, and
- *  everything the Markdown view adds goes with it. The watcher runs before the DOM changes,
- *  so the old document is still there to measure. */
+/** The find bar belongs to the document, so leaving the document for the original closes
+ *  it rather than leaving it hanging over the original; an open block is written back
+ *  first, and everything the Markdown view adds goes with it. The watcher runs before the
+ *  DOM changes, so the old document is still there to measure. */
 watch(tab, async (view) => {
-  if (view === 'json') {
+  if (view === 'original') {
     documentScroll = scroller.value?.scrollTop ?? 0
     findOpen.value = false
     commitEdit()
@@ -3808,21 +3844,49 @@ const parseFacts = computed<MenuFact[]>(() => {
   return facts
 })
 
-/** The two views, as a pair of choices: the JSON view is the contract a developer checks
- *  now and then, not a mode to flip while reading. */
+/** The facts over the views: the parse's, or the row's while the file is not converted. */
+const moreFacts = computed<MenuFact[]>(() => (props.converted ? parseFacts.value : props.facts))
+
+/** Whether More has what its menu is made of: the result, for a converted document — a menu
+ *  that grew under the pointer when the facts arrived would no longer fit where it was
+ *  placed — and, for a file not yet converted, its row's facts, which it has at once. */
+const moreReady = computed(() => (props.converted ? props.result !== null : true))
+
+/** The two views, as a pair of choices (docs/web.md § Result viewer, *Original and
+ *  Markdown*): Original is disabled where no original was kept, with the reason under it;
+ *  Markdown, on a file not yet converted, is the conversion. */
 const moreItems = computed<MenuItem[]>(() => [
+  {
+    key: 'original',
+    label: t('viewer.view.original'),
+    checked: tab.value === 'original',
+    disabled: !props.original,
+    description: props.original ? undefined : t('viewer.noOriginal'),
+    separated: moreFacts.value.length > 0,
+  },
   {
     key: 'markdown',
     label: t('viewer.view.markdown'),
     checked: tab.value === 'markdown',
-    separated: parseFacts.value.length > 0,
+    disabled: !props.converted && !props.convertible,
+    description: props.converted || props.convertible ? undefined : t('viewer.notConvertible'),
   },
-  { key: 'json', label: t('viewer.view.json'), checked: tab.value === 'json' },
 ])
 
 function onMoreSelect(key: string) {
-  if (key === 'markdown' || key === 'json') {
-    tab.value = key
+  if (key === 'markdown' && !props.converted) {
+    if (props.convertible) {
+      emit('convert')
+    }
+    return
+  }
+  if ((key !== 'original' && key !== 'markdown') || key === tab.value || (key === 'original' && !props.original)) {
+    return
+  }
+  tab.value = key
+  // The view the reader switched to is the one the document opens on next time.
+  if (props.converted) {
+    emit('view', key)
   }
 }
 
@@ -4188,12 +4252,10 @@ function onCopy(event: ClipboardEvent) {
   event.clipboardData.setData('text/plain', text)
 }
 
-const json = computed(() => (props.result ? JSON.stringify(props.result, null, 2) : ''))
-
 /**
  * Pages the pipeline could not transcribe. A job with some pages failed still finishes as
  * `succeeded` and simply omits them from the markdown (docs/jobs.md), so without this the
- * document reads as complete and the only evidence is in the JSON tab.
+ * document reads as complete.
  */
 const failedPages = computed(() => props.result?.errors ?? [])
 
@@ -4306,7 +4368,7 @@ watch(
     <template #actions>
       <!-- The switches for the markdown view, then More: one glass capsule, each button
            named by its label (docs/web.md § Result viewer). None of the switches means
-           anything over JSON. -->
+           anything over the original. -->
       <UiCapsule :label="t('viewer.tools')">
         <template v-if="tab === 'markdown'">
           <UiButton
@@ -4343,13 +4405,14 @@ watch(
           <span class="capsule-rule" aria-hidden="true" />
         </template>
 
-        <!-- What the parse was, and the JSON view: read now and then, so one press away
-             rather than on the header for good. Both are the result, so More waits for it. -->
+        <!-- What the parse was, and the two views: read now and then, so one press away
+             rather than on the header for good. The facts are the result, so More waits for
+             it — a file not yet converted has its facts from its row, and waits for nothing. -->
         <UiButton
           variant="ghost"
           icon-only
           :label="t('viewer.more')"
-          :disabled="!result"
+          :disabled="!moreReady"
           aria-haspopup="menu"
           :aria-expanded="moreMenu ? 'true' : 'false'"
           @click="toggleMore"
@@ -4362,8 +4425,8 @@ watch(
         :at="moreMenu"
         :items="moreItems"
         :label="t('viewer.more')"
-        :header="parseFacts.length ? t('viewer.details') : undefined"
-        :facts="parseFacts"
+        :header="moreFacts.length ? t(converted ? 'viewer.details' : 'viewer.file.details') : undefined"
+        :facts="moreFacts"
         :focus-first="moreFromKey"
         @select="onMoreSelect"
         @close="closeMore"
@@ -4371,12 +4434,17 @@ watch(
     </template>
 
     <div class="body">
-      <UiBanner v-if="error" class="state" tone="error">{{ error }}</UiBanner>
+      <!-- The original: the file itself, whatever the parse made of it — a PDF in the
+           browser's own viewer, an image as a picture (docs/web.md § Result viewer,
+           *Original and Markdown*). -->
+      <div v-if="tab === 'original' && original" class="original" :class="original.kind">
+        <iframe v-if="original.kind === 'pdf'" class="original-frame" :src="original.url" :title="title" />
+        <img v-else class="original-image" :src="original.url" :alt="title">
+      </div>
+
+      <UiBanner v-else-if="error" class="state" tone="error">{{ error }}</UiBanner>
       <UiBanner v-else-if="errorMessage" class="state" tone="error">{{ errorMessage }}</UiBanner>
       <UiSkeleton v-else-if="pending" class="state" :rows="5" />
-
-      <!-- The parse result, always: the contract, whatever the copy has become. -->
-      <pre v-else-if="tab === 'json'" class="json mono">{{ json }}</pre>
 
       <UiSkeleton v-else-if="awaitingContent" class="state" :rows="5" />
       <!-- A markdown document is its copy alone: one that cannot be read has nothing
@@ -5505,19 +5573,37 @@ watch(
   margin-right: var(--space-4);
 }
 
-/* --- JSON view ------------------------------------------------------------ */
+/* --- Original view -------------------------------------------------------- */
 
-/* The contract, not a document: it keeps its own line breaks and scrolls both ways rather
-   than being re-wrapped into something that no longer matches the response. */
-.json {
-  margin: 0;
+/* The file itself: a PDF's frame fills the body, since the browser's viewer brings its own
+   chrome; a picture is centred, scrolling where it is taller than the window. */
+.original {
+  display: grid;
+  place-items: center;
   height: 100%;
+  min-height: 0;
+  padding: var(--space-4);
   overflow: auto;
-  padding: var(--space-6);
-  background: var(--paper-sunken);
-  color: var(--muted);
-  line-height: 1.7;
-  white-space: pre;
+}
+
+.original.pdf {
+  display: block;
+  padding: 0;
+  overflow: hidden;
+}
+
+.original-frame {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+}
+
+.original-image {
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: var(--radius-card);
+  object-fit: contain;
 }
 
 /* A percentage column needs a floor: below the shell breakpoint 70% of the pane is a

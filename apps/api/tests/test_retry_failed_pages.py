@@ -24,7 +24,7 @@ from sightread.auth.sessions import SESSION_COOKIE, create_session
 from sightread.db.models import CreditPeriod, Document, Job, JobPage, UsageLog, User
 from sightread.workspace.documents import original_of
 from sightread.workspace.layout import user_root
-from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL
+from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, convert_on_upload
 from tests.test_library import MODEL, _ready_to_parse
 from tests.test_library_trash import _fail_next_commit
 from tests.test_parse_end_to_end import VISION_MARKDOWN, _drain_queue
@@ -69,6 +69,7 @@ async def library(make_client, tmp_path) -> AsyncClient:
 
 
 async def _upload(client: AsyncClient, path: Path, media_type: str = "application/pdf") -> dict:
+    await convert_on_upload(client)
     response = await client.post(
         "/api/library/documents",
         files={"file": (path.name, path.read_bytes(), media_type)},

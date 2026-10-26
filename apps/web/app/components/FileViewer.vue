@@ -1,13 +1,14 @@
 <script setup lang="ts">
 /**
  * The file viewer (docs/web.md § Files): the result viewer's shell with the document's
- * panes left out. The way back and the name, with its kind and size, at the left; at the
- * right Download, Convert to document (a PDF or an image only) and More, whose menu opens
- * on the file's facts over Rename, Duplicate, Show in Files and Move to Trash. The body is
- * what a browser shows safely on its own, from `…/file` (docs/api.md): an image, a video or
- * audio file with the browser's controls, a PDF in the browser's own viewer, plain text in
- * a monospace pane; for anything else a sheet with the file's glyph, name, kind and size,
- * that there is no preview, that the agent can still read it, and Download.
+ * panes left out, for every file that is neither a PDF nor an image — those open in the
+ * result viewer on their original. The way back and the name, with its kind and size, at
+ * the left; at the right Download and More, whose menu opens on the file's facts over
+ * Rename, Duplicate, Show in Files and Move to Trash. The body is what a browser shows
+ * safely on its own, from `…/file` (docs/api.md): a video or audio file with the browser's
+ * controls, plain text in a monospace pane; for anything else a sheet with the file's
+ * glyph, name, kind and size, that there is no preview, that the agent can still read it,
+ * and Download.
  */
 import type { ComponentPublicInstance } from 'vue'
 import { documentFileUrl, type LibraryDocument } from '~/lib/api'
@@ -22,13 +23,10 @@ const props = defineProps<{
   document: LibraryDocument
   /** Where the file is, Home first, as the facts say it. */
   location: string
-  /** Whether Convert to document is offered: a PDF or an image intake would parse. */
-  convertible: boolean
 }>()
 
 const emit = defineEmits<{
   close: []
-  convert: []
   rename: []
   duplicate: []
   show: []
@@ -135,15 +133,6 @@ function onMoreSelect(key: string) {
       <UiCapsule :label="t('viewer.file.tools')">
         <UiButton variant="ghost" icon-only :label="t('viewer.file.download')" :href="downloadUrl">
           <template #icon><UiIcon name="download" /></template>
-        </UiButton>
-        <UiButton
-          v-if="convertible"
-          variant="ghost"
-          icon-only
-          :label="t('viewer.file.convert')"
-          @click="emit('convert')"
-        >
-          <template #icon><UiIcon name="scan-text" /></template>
         </UiButton>
         <UiButton
           ref="moreButton"

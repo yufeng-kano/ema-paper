@@ -45,6 +45,17 @@ from tests.fixtures.documents import (
 TEST_SECRET_KEY = "test-secret-key-not-a-real-one"
 CSRF_HEADERS = {"X-Requested-With": "XMLHttpRequest"}
 
+
+async def convert_on_upload(client: AsyncClient) -> None:
+    """Turn the parse agent's `auto_convert` on for the signed-in user: off by default
+    since 2026-10-26, so a Files upload of a PDF or an image is kept as a file unless a test
+    asks for the parse (docs/agents.md)."""
+    saved = await client.put(
+        "/api/agents/parse/settings", json={"auto_convert": True}, headers=CSRF_HEADERS
+    )
+    assert saved.status_code == 200, saved.text
+
+
 # A Kano Proxy that only exists inside respx: no test ever reaches a real one
 # (docs/testing.md § Cost safety).
 KANO_BASE = "https://kano.test"

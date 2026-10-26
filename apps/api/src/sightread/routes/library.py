@@ -23,7 +23,7 @@ import unicodedata
 import urllib.parse
 import uuid
 import warnings
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapping
 from pathlib import Path
 
 from fastapi import APIRouter, Query, Request, Response, status
@@ -40,8 +40,10 @@ from ..agents import PARSE
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
 from ..billing import ledger
 from ..db.models import (
+    DOCUMENT_VIEWS,
     FILE_KIND,
     MARKDOWN_KIND,
+    ORIGINAL_VIEW,
     PARSE_KIND,
     AgentSetting,
     Document,
@@ -515,9 +517,10 @@ def document_payload(
     reconvert: Job | None = None,
     credits: dict[uuid.UUID, int | None] | None = None,
     storage: dict[int, int] | None = None,
+    originals: Collection[int] | None = None,
 ) -> dict:
     """The row the file list draws: the entry, plus the live state of its parse and of
-    its re-convert.
+    its re-convert, the view it was last read in and whether its original is kept.
 
     Joined rather than fetched per row, so one `GET /api/library` renders every name,
     status and progress bar the page needs (docs/web.md § Files). A markdown document
@@ -526,7 +529,9 @@ def document_payload(
     a running parse is past its last page and being checked; `reconvert` is the parse
     the row points at as its re-convert (docs/api.md); `credits` what each parse cost
     (`ledger.credits_by_job`, docs/billing.md § Routes); `storage` each document's share
-    of the storage (`StorageUsage.documents`), None where the workspace was not measured.
+    of the storage (`StorageUsage.documents`), None where the workspace was not measured;
+    `originals` the ids whose original upload is kept (`kept_originals`), None where it
+    was not looked up — a parse's `original` is then null (docs/api.md).
     """
     failed = failed or {}
     credits = credits or {}
@@ -554,6 +559,8 @@ def document_payload(
             "checking": False,
             "reconvert": None,
             "credits": None,
+            "view": row.view,
+            "original": None,
         }
     if job is None:
         return {
@@ -576,6 +583,8 @@ def document_payload(
             "checking": False,
             "reconvert": None,
             "credits": None,
+            "view": row.view,
+            "original": None,
         }
     return {
         "id": row.id,
@@ -596,6 +605,10 @@ def document_payload(
         "failed_pages": failed.get(job.id),
         "checking": is_checking(job),
         "credits": credits.get(job.id),
+        "view": row.view,
+        # Whether `…/original` answers: known from one listing on the library read, not
+        # looked up by the one-row answers (docs/api.md).
+        "original": (row.id in originals) if originals is not None else None,
         "reconvert": (
             None
             if reconvert is None
@@ -648,17 +661,24 @@ async def job_of(db: DbSession, job_id: uuid.UUID) -> Job:
     return job
 
 
-async def read_document_payload(db: DbSession, row: Document) -> dict:
-    """One row's payload, its parse and its re-convert read for it."""
+async def read_document_payload(db: DbSession, settings: AppSettings, row: Document) -> dict:
+    """One row's payload, its parse and its re-convert read for it, and whether its
+    original is kept."""
     job = await job_of(db, row.job_id) if row.job_id is not None else None
     reconvert = await job_of(db, row.reconvert_job_id) if row.reconvert_job_id is not None else None
     jobs = [job, reconvert]
+    originals: set[int] = set()
+    if job is not None:
+        root = user_root(settings.workspaces_dir, row.user_id)
+        if await asyncio.to_thread(workspace_documents.original_of, root, row.id) is not None:
+            originals.add(row.id)
     return document_payload(
         row,
         job,
         await failed_page_counts(db, jobs),
         reconvert,
         await ledger.credits_by_job(db, [one.id for one in jobs if one is not None]),
+        originals=originals,
     )
 
 
@@ -745,6 +765,10 @@ async def read_library(user: SessionUser, db: DbSession, settings: AppSettings):
     except OSError:
         # A directory nested too deep to measure: the sizes are unknown, not the library.
         storage = None
+    # Which parses can be read on their original (docs/api.md).
+    originals = await asyncio.to_thread(
+        workspace_documents.kept_originals, user_root(settings.workspaces_dir, user_id)
+    )
 
     def origin(parent_id: int | None) -> list[str]:
         place = nearest_live(by_id, parent_id)
@@ -757,7 +781,13 @@ async def read_library(user: SessionUser, db: DbSession, settings: AppSettings):
         "folders": [folder_payload(row) for row in folders if row.id not in trashed],
         "documents": [
             document_payload(
-                row, job, failed, reconverts.get(row.reconvert_job_id), credits, storage
+                row,
+                job,
+                failed,
+                reconverts.get(row.reconvert_job_id),
+                credits,
+                storage,
+                originals,
             )
             for row, job in documents
             if row.trashed_at is None and row.folder_id not in trashed
@@ -775,7 +805,13 @@ async def read_library(user: SessionUser, db: DbSession, settings: AppSettings):
             "documents": [
                 {
                     **document_payload(
-                        row, job, failed, reconverts.get(row.reconvert_job_id), credits, storage
+                        row,
+                        job,
+                        failed,
+                        reconverts.get(row.reconvert_job_id),
+                        credits,
+                        storage,
+                        originals,
                     ),
                     "trashed_at": row.trashed_at,
                     "origin": origin(row.folder_id),
@@ -1145,7 +1181,7 @@ async def trash_document(document_id: int, user: SessionUser, db: DbSession, set
             trash_entry("document", row.id),
             landed=(Document, row.id),
         )
-    return {**(await read_document_payload(db, row)), "trashed_at": row.trashed_at}
+    return {**(await read_document_payload(db, settings, row)), "trashed_at": row.trashed_at}
 
 
 @router.post("/folders/{folder_id}/trash", dependencies=[CsrfGuard])
@@ -1206,7 +1242,7 @@ async def restore_document(
             )
             or row
         )
-    return await read_document_payload(db, row)
+    return await read_document_payload(db, settings, row)
 
 
 @router.post("/folders/{folder_id}/restore", dependencies=[CsrfGuard])
@@ -1281,13 +1317,14 @@ def form_folder_id(fields: Mapping[str, str]) -> int | None:
 
 async def parse_auto_convert(db: DbSession, user_id: int) -> bool:
     """The parse agent's switch (docs/agents.md § Per-agent settings): a PDF or an image
-    uploaded on the Files page is converted on arrival unless the reader turned it off."""
+    uploaded on the Files page is kept as it is unless the reader turned converting on
+    arrival on."""
     value = await db.scalar(
         select(AgentSetting.auto_convert).where(
             AgentSetting.user_id == user_id, AgentSetting.agent == PARSE.name
         )
     )
-    return True if value is None else bool(value)
+    return bool(value)
 
 
 def parse_accepts(filename: str, media_type: str) -> bool:
@@ -1562,7 +1599,7 @@ async def file_parse(
             what="The upload",
             undo=lambda: workspace_documents.discard_adopted(settings, user_id, row_id, relative),
         )
-    return await read_document_payload(db, row)
+    return await read_document_payload(db, settings, row)
 
 
 async def file_markdown(
@@ -1796,7 +1833,7 @@ async def _update_document_locked(
     after = await document_relative(db, row)
     landed = (Document, row.id, {"folder_id": row.folder_id, "name": row.name})
     await move_then_commit(db, settings, user.id, before, after, landed=landed)
-    return await read_document_payload(db, row)
+    return await read_document_payload(db, settings, row)
 
 
 @router.delete(
@@ -2402,6 +2439,43 @@ def open_file_chunks(entry: int, first: int, last: int):
         os.close(entry)
 
 
+def file_response(
+    entry: int, request: Request, *, name: str, media_type: str, inline: bool
+) -> StreamingResponse:
+    """The open file `entry` as `…/file` and `…/original` answer it (docs/api.md): inline
+    or as an attachment, one `Range` answered with 206, a security policy of its own,
+    never cached. The descriptor is closed when the stream ends — or here, when nothing
+    streams."""
+    try:
+        size = os.fstat(entry).st_size
+        first, last = 0, size - 1
+        status_code = status.HTTP_200_OK
+        wanted = parse_range(request.headers.get("range", ""), size)
+        if wanted is not None:
+            first, last = wanted
+            status_code = status.HTTP_206_PARTIAL_CONTENT
+    except BaseException:
+        os.close(entry)
+        raise
+    headers = {
+        "Content-Disposition": content_disposition("inline" if inline else "attachment", name),
+        "Content-Length": str(max(last - first + 1, 0)),
+        "Accept-Ranges": "bytes",
+        # Never cached, as a crop is not: a cached file would outlive a sign-out.
+        "Cache-Control": "private, no-store",
+        "X-Content-Type-Options": "nosniff",
+        **file_security_headers(media_type, inline),
+    }
+    if status_code == status.HTTP_206_PARTIAL_CONTENT:
+        headers["Content-Range"] = f"bytes {first}-{last}/{size}"
+    return StreamingResponse(
+        iterate_in_threadpool(open_file_chunks(entry, first, last)),
+        status_code=status_code,
+        media_type=media_type,
+        headers=headers,
+    )
+
+
 @router.get("/documents/{document_id}/file")
 async def document_file(
     document_id: int,
@@ -2429,40 +2503,90 @@ async def document_file(
         raise ApiError(409, "invalid_request", workspace_documents.NOT_PLAIN) from exc
     if entry is None:
         raise ApiError(404, "invalid_request", "The file is missing from the workspace")
+    media_type = row.media_type or workspace_documents.file_media_type(row.name)
+    inline = workspace_documents.served_inline(media_type) and not download
+    return file_response(entry, request, name=row.name, media_type=media_type, inline=inline)
+
+
+@router.get("/documents/{document_id}/original")
+async def document_original(
+    document_id: int,
+    request: Request,
+    user: SessionUser,
+    db: DbSession,
+    settings: AppSettings,
+):
+    """A parsed document's original upload, kept beside the git directory, served as a
+    file is — inline, one `Range` answered, the same security headers, never cached — for
+    the result viewer's Original view (docs/api.md). 404 for a markdown document, for a
+    file, whose bytes are `…/file`, and for a parse whose original was not kept."""
+    row = await live_document(db, user.id, document_id)
+    if row.job_id is None:
+        raise ApiError(404, "invalid_request", "No such original")
+    job = await job_of(db, row.job_id)
+    root = user_root(settings.workspaces_dir, row.user_id)
+    source = await asyncio.to_thread(workspace_documents.original_of, root, row.id)
+    if source is None:
+        raise ApiError(404, "invalid_request", "This document kept no original")
     try:
-        size = os.fstat(entry).st_size
-        media_type = row.media_type or workspace_documents.file_media_type(row.name)
-        inline = workspace_documents.served_inline(media_type) and not download
-        first, last = 0, size - 1
-        status_code = status.HTTP_200_OK
-        wanted = parse_range(request.headers.get("range", ""), size)
-        if wanted is not None:
-            first, last = wanted
-            status_code = status.HTTP_206_PARTIAL_CONTENT
-    except BaseException:
-        os.close(entry)
-        raise
-    headers = {
-        "Content-Disposition": content_disposition("inline" if inline else "attachment", row.name),
-        "Content-Length": str(max(last - first + 1, 0)),
-        "Accept-Ranges": "bytes",
-        # Never cached, as a crop is not: a cached file would outlive a sign-out.
-        "Cache-Control": "private, no-store",
-        "X-Content-Type-Options": "nosniff",
-        **file_security_headers(media_type, inline),
-    }
-    if status_code == status.HTTP_206_PARTIAL_CONTENT:
-        headers["Content-Range"] = f"bytes {first}-{last}/{size}"
-    return StreamingResponse(
-        iterate_in_threadpool(open_file_chunks(entry, first, last)),
-        status_code=status_code,
-        media_type=media_type,
-        headers=headers,
+        entry = await asyncio.to_thread(os.open, source, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as exc:
+        raise ApiError(404, "invalid_request", "This document kept no original") from exc
+    return file_response(
+        entry,
+        request,
+        name=row.name,
+        media_type=job.media_type,
+        inline=workspace_documents.served_inline(job.media_type),
     )
+
+
+def checked_view(value: str | None) -> str | None:
+    """A view's name — `original` or `markdown` — or None for none; 400 otherwise."""
+    if value is None:
+        return None
+    if value not in DOCUMENT_VIEWS:
+        raise ApiError(400, "invalid_request", "view is original or markdown")
+    return value
+
+
+class DocumentView(BaseModel):
+    view: str = Field(max_length=16)
+
+
+@router.put(
+    "/documents/{document_id}/view",
+    dependencies=[CsrfGuard],
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def put_document_view(
+    document_id: int, body: DocumentView, user: SessionUser, db: DbSession
+) -> Response:
+    """The view the reader just switched a PDF or an image to, remembered on the row so
+    the document opens on it next time (docs/web.md § Result viewer, *Original and
+    Markdown*). Without the workspace lock: the row changes, nothing in the tree does. A
+    document with one view takes none (docs/api.md)."""
+    view = checked_view(body.view)
+    row = await live_document(db, user.id, document_id)
+    if row.kind == MARKDOWN_KIND:
+        raise ApiError(400, "invalid_request", "A markdown document has one view")
+    if row.kind == FILE_KIND:
+        try:
+            resolve_kind(row.name, row.media_type or "")
+        except ApiError as exc:
+            raise ApiError(400, "invalid_request", "This file has one view") from exc
+        if view != ORIGINAL_VIEW:
+            raise ApiError(400, "invalid_request", "Convert the file to read it as Markdown")
+    row.view = view
+    await db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 class DocumentConvert(BaseModel):
     model: str | None = Field(default=None, max_length=255)
+    # The view the document opens on once converted: the result viewer names `markdown`
+    # when the reader asked for it there (docs/api.md).
+    view: str | None = Field(default=None, max_length=16)
 
 
 async def fd_chunks(entry: int) -> AsyncIterator[bytes]:
@@ -2488,6 +2612,7 @@ async def convert_document(
     file back; the worker files the source as the document's original when the parse
     ends (§ Retention)."""
     model = (body.model or "").strip() or None
+    view = checked_view(body.view)
     user_id = user.id
     root = user_root(settings.workspaces_dir, user_id)
     async with backup_shared(root), workspace_lock(root):
@@ -2545,6 +2670,8 @@ async def convert_document(
         row.kind = PARSE_KIND
         row.media_type = None
         row.size_bytes = None
+        if view is not None:
+            row.view = view
         await db.flush()
         job = await job_of(db, job_id)
         # The file out of the tree, aside, as a delete moves a directory: back should the
@@ -2596,7 +2723,7 @@ async def convert_document(
                 await workspace_documents.discard_removed(settings, user_id, removal)
             except Exception:  # noqa: BLE001 - the next reconciliation sweeps it
                 logger.exception("could not discard %s set aside by a conversion", relative)
-    return await read_document_payload(db, row)
+    return await read_document_payload(db, settings, row)
 
 
 # --- copies -------------------------------------------------------------------------------
@@ -2765,7 +2892,7 @@ async def copy_document(
         )
     # A commit that raised and landed answers with the row as committed: the request's
     # session rolled back.
-    return await read_document_payload(db, landed or row)
+    return await read_document_payload(db, settings, landed or row)
 
 
 @router.post(

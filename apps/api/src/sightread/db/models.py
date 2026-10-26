@@ -69,6 +69,13 @@ class Base(DeclarativeBase):
     pass
 
 
+# The views a PDF or an image is read in (docs/web.md § Result viewer, *Original and
+# Markdown*): the file itself, or the document made of it.
+ORIGINAL_VIEW = "original"
+MARKDOWN_VIEW = "markdown"
+DOCUMENT_VIEWS = frozenset({ORIGINAL_VIEW, MARKDOWN_VIEW})
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -78,6 +85,11 @@ class User(Base):
     name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # Google avatar URL, refreshed on each sign-in (docs/auth.md § 1).
     picture: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    # Which view a converted PDF or image opens on the first time it is read — `original`
+    # or `markdown` (docs/web.md § Result viewer, *Original and Markdown*).
+    default_view: Mapped[str] = mapped_column(
+        String(16), default=MARKDOWN_VIEW, server_default=text("'markdown'")
+    )
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
 
 
@@ -175,9 +187,9 @@ class AgentSetting(Base):
     # § Format check).
     auto_check: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
     # The parse agent's switch: a PDF or an image uploaded on the Files page is converted on
-    # arrival; off, it is kept as a file until the reader converts it (docs/workspace.md
-    # § Files).
-    auto_convert: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
+    # arrival; off — the default since 2026-10-26 — it is kept as a file until the reader
+    # asks for Markdown (docs/workspace.md § Files).
+    auto_convert: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
 
     prompt_preset: Mapped[PromptPreset | None] = relationship(
         foreign_keys=[prompt_preset_id], lazy="selectin"
@@ -436,6 +448,9 @@ class Document(Base):
     # in the tree as last reconciled; NULL on the other kinds.
     media_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
     size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # The view the reader last switched a PDF or an image to — `original` or `markdown`;
+    # NULL while never switched (docs/web.md § Result viewer, *Original and Markdown*).
+    view: Mapped[str | None] = mapped_column(String(16), nullable=True)
     trashed_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
     # The re-convert queued, running or failed: a new parse of the document's original that
     # becomes its parse once it succeeds (docs/jobs.md § Re-converting a document).

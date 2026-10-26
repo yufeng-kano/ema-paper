@@ -37,7 +37,14 @@ from sightread.jobs.queue import find_cached_job
 from sightread.jobs.sweeper import expire_trash, purge_parses
 from sightread.workspace.documents import original_of
 from sightread.workspace.layout import images_dir, results_root, trash_root, user_root
-from tests.conftest import CSRF_HEADERS, DATABASE_URL, KANO_BASE, KANO_CHAT_URL, PARSE_MODEL
+from tests.conftest import (
+    CSRF_HEADERS,
+    DATABASE_URL,
+    KANO_BASE,
+    KANO_CHAT_URL,
+    PARSE_MODEL,
+    convert_on_upload,
+)
 from tests.test_document_images import _image, _insert
 from tests.test_library_trash import _document, _folder, _read, _trash, _write
 from tests.test_markdown_documents import _upload_markdown
@@ -427,6 +434,7 @@ async def test_a_library_cache_hit_purged_before_it_is_filed_is_refused_plainly(
     settings = writer.app.state.settings
     sessionmaker = writer.app.state.sessionmaker
     body = documents["text_pdf"].read_bytes()
+    await convert_on_upload(writer)
 
     async def upload():
         return await writer.post(

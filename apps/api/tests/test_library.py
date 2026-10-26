@@ -20,13 +20,14 @@ from sightread.auth.sessions import SESSION_COOKIE, create_session
 from sightread.db.models import Document, Job, JobPage, Result, User
 from sightread.routes.library import DOCUMENT_NAME_MAX, clean_name, free_name
 from sightread.workspace.layout import user_root
-from tests.conftest import CSRF_HEADERS, DATABASE_URL
+from tests.conftest import CSRF_HEADERS, DATABASE_URL, convert_on_upload
 
 MODEL = "vendor/vision-model"
 
 
 async def _ready_to_parse(client: AsyncClient) -> None:
     assert (await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)).status_code == 200
+    await convert_on_upload(client)
 
 
 @pytest.fixture
@@ -53,6 +54,7 @@ async def _upload(
     name: str = "tiny.png",
     folder_id: int | None = None,
 ) -> httpx.Response:
+    await convert_on_upload(client)
     return await client.post(
         "/api/library/documents",
         files={"file": (name, documents["png"].read_bytes(), "image/png")},

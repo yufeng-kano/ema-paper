@@ -23,7 +23,7 @@ from sightread.jobs import chat_tools, sweeper
 from sightread.workspace import documents as workspace_documents
 from sightread.workspace import git, safe_io
 from sightread.workspace.documents import original_of
-from sightread.workspace.layout import trash_root, user_root
+from sightread.workspace.layout import sources_dir, trash_root, user_root
 from sightread.workspace.reconcile import reconcile_user
 from tests.conftest import CSRF_HEADERS
 from tests.test_library import _upload_markdown
@@ -246,10 +246,8 @@ async def test_the_file_route_is_the_owners_and_a_documents_is_not_a_file(
 async def test_the_switch_keeps_a_pdf_as_a_file_and_this_origin_may_frame_it(
     writer, documents
 ) -> None:
-    # On until the reader turns it off, and `GET /api/me` says which, so the Files page
-    # applies the cap the server will (docs/web.md § Files).
-    assert (await writer.get("/api/me")).json()["auto_convert"] is True
-    await _switch(writer, False)
+    # Off until the reader turns it on (since 2026-10-26), and `GET /api/me` says which,
+    # so the Files page applies the cap the server will (docs/web.md § Files).
     assert (await writer.get("/api/me")).json()["auto_convert"] is False
     pdf = documents["text_pdf"].read_bytes()
     kept = await _kept(writer, "paper.pdf", pdf, "application/pdf")
@@ -328,6 +326,9 @@ async def test_a_kept_image_is_converted_into_a_document_on_request(writer, docu
     assert [(row["id"], row["kind"], row["status"]) for row in listed] == [
         (kept["id"], "image", "queued")
     ]
+    # No view was named: the document opens on the reader's default; a parse says
+    # whether its original is kept, which a queued one's is not yet (docs/api.md).
+    assert (listed[0]["view"], listed[0]["original"]) == (None, False)
 
 
 async def test_only_a_pdf_or_an_image_converts(writer) -> None:
@@ -338,6 +339,9 @@ async def test_only_a_pdf_or_an_image_converts(writer) -> None:
     assert (writer.root / "files" / "archive.zip").is_file()
     markdown = (await _upload_markdown(writer)).json()
     assert (await _convert(writer, markdown["id"])).status_code == 404
+    # Neither has a second view to remember (docs/api.md § PUT …/view).
+    for document_id in (zipped["id"], markdown["id"]):
+        assert (await _view(writer, document_id, "original")).status_code == 400
     # A file in the Trash is not there to convert.
     trashed = await writer.post(
         f"/api/library/documents/{zipped['id']}/trash", headers=CSRF_HEADERS
@@ -411,6 +415,7 @@ async def test_a_file_past_the_cap_is_refused_while_it_streams(
     assert (root / "files" / "small.bin").stat().st_size == 1024
     # The caps are independent: a PDF converted on arrival is judged by its own, larger
     # cap, never by the file's, however a deployment orders them.
+    await _switch(client, True)
     pdf = documents["text_pdf"].read_bytes()
     assert len(pdf) > 1024
     parsed = await _upload(client, "paper.pdf", pdf, "application/pdf")
@@ -799,3 +804,108 @@ async def test_the_editor_writes_nothing_a_revision_could_not_record(tmp_path, m
     soiled = await run("insert", "files/small.txt", insert_line=0, insert_text="\0")
     assert soiled.is_error and "revision" in soiled.content
     assert (root / "files" / "small.txt").read_text() == "x" * 10
+
+
+async def _view(client: AsyncClient, document_id: int, view: str) -> httpx.Response:
+    return await client.put(
+        f"/api/library/documents/{document_id}/view", json={"view": view}, headers=CSRF_HEADERS
+    )
+
+
+# --- the views -----------------------------------------------------------------------------
+
+
+async def test_a_file_remembers_the_view_it_was_read_in_and_the_conversion_names_one(
+    writer, documents
+) -> None:
+    """A PDF or an image is one item, converted or not; the row says which view the reader
+    last switched it to (docs/web.md § Result viewer, *Original and Markdown*)."""
+    kept = await _kept(writer, "paper.pdf", documents["text_pdf"].read_bytes(), "application/pdf")
+    assert (kept["view"], kept["original"]) == (None, None)
+    # A file kept as it is has its original alone: Markdown is what converts it.
+    assert (await _view(writer, kept["id"], "markdown")).status_code == 400
+    assert (await _view(writer, kept["id"], "json")).status_code == 400
+    assert (await _view(writer, kept["id"], "original")).status_code == 204
+    listed = (await _read(writer))["documents"]
+    assert [(row["id"], row["view"]) for row in listed] == [(kept["id"], "original")]
+    # A view the conversion cannot take is refused whole: the file stays a file.
+    refused = await _convert(writer, kept["id"], view="json")
+    assert refused.status_code == 400, refused.text
+    assert (writer.root / "files" / "paper.pdf").is_file()
+    # The result viewer's *Markdown* converts and names the view the document opens on.
+    converted = await _convert(writer, kept["id"], view="markdown")
+    assert converted.status_code == 200, converted.text
+    assert (converted.json()["kind"], converted.json()["view"]) == ("pdf", "markdown")
+    # A parse takes either view.
+    assert (await _view(writer, kept["id"], "original")).status_code == 204
+    async with writer.app.state.sessionmaker() as db:
+        assert (await db.get(Document, kept["id"])).view == "original"
+    # Not for a document in the Trash.
+    trashed = await writer.post(f"/api/library/documents/{kept['id']}/trash", headers=CSRF_HEADERS)
+    assert trashed.status_code == 200, trashed.text
+    assert (await _view(writer, kept["id"], "markdown")).status_code == 404
+
+
+async def test_a_parsed_documents_original_is_served_for_the_original_view(
+    writer, documents
+) -> None:
+    """`GET …/original` is the kept upload, served as a file is (docs/api.md)."""
+    png = documents["png"].read_bytes()
+    kept = await _kept(writer, "tiny.png", png, "image/png")
+    # A file's bytes are `…/file`, never here.
+    assert (await writer.get(f"/api/library/documents/{kept['id']}/original")).status_code == 404
+    converted = await _convert(writer, kept["id"])
+    assert converted.status_code == 200, converted.text
+    url = f"/api/library/documents/{kept['id']}/original"
+    # Queued: the worker has not filed the original yet.
+    missing = await writer.get(url)
+    assert missing.status_code == 404, missing.text
+    assert "kept no original" in missing.json()["error"]["message"]
+    # Filed, as the worker files it at the parse's end (docs/workspace.md § Layout).
+    directory = sources_dir(writer.root)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"{kept['id']}.png").write_bytes(png)
+    listed = (await _read(writer))["documents"]
+    assert [(row["id"], row["original"]) for row in listed] == [(kept["id"], True)]
+    shown = await writer.get(url)
+    assert shown.status_code == 200, shown.text
+    assert shown.content == png
+    assert shown.headers["content-type"] == "image/png"
+    assert shown.headers["content-disposition"].startswith("inline;")
+    assert shown.headers["content-security-policy"] == "sandbox"
+    assert shown.headers["cache-control"] == "private, no-store"
+    part = await writer.get(url, headers={"Range": "bytes=0-3"})
+    assert part.status_code == 206 and part.content == png[:4]
+    assert part.headers["content-range"] == f"bytes 0-3/{len(png)}"
+    # A one-row answer looks its own original up.
+    renamed = await writer.put(
+        f"/api/library/documents/{kept['id']}", json={"name": "tiny2.png"}, headers=CSRF_HEADERS
+    )
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["original"] is True
+    # A markdown document has no original, and nothing is served for another's.
+    markdown = (await _upload_markdown(writer)).json()
+    assert (
+        await writer.get(f"/api/library/documents/{markdown['id']}/original")
+    ).status_code == 404
+    assert markdown["original"] is None
+    signed_out = httpx.AsyncClient(transport=writer._transport, base_url=writer.base_url)
+    assert (await signed_out.get(url)).status_code == 401
+
+
+async def test_the_default_view_is_the_readers_preference(writer) -> None:
+    """Which view a converted document opens on the first time: Markdown unless the reader
+    changes it (docs/api.md § PUT /api/me/preferences)."""
+    assert (await writer.get("/api/me")).json()["default_view"] == "markdown"
+    saved = await writer.put(
+        "/api/me/preferences", json={"default_view": "original"}, headers=CSRF_HEADERS
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json() == {"default_view": "original"}
+    assert (await writer.get("/api/me")).json()["default_view"] == "original"
+    for wrong in ("json", "", None):
+        refused = await writer.put(
+            "/api/me/preferences", json={"default_view": wrong}, headers=CSRF_HEADERS
+        )
+        assert refused.status_code in (400, 422), (wrong, refused.text)
+    assert (await writer.get("/api/me")).json()["default_view"] == "original"

@@ -30,6 +30,7 @@ export default {
     title: '設定',
     sections: {
       general: '一般',
+      preferences: '偏好設定',
       account: '帳戶',
       agent: 'Agent',
       keys: 'API 金鑰',
@@ -64,13 +65,19 @@ export default {
       dragged: '已用拖移自訂。選一個檔位就會改回固定寬度。',
       foot: '兩側欄並排時套用。視窗太窄時會自動縮小。',
     },
-    files: {
-      title: '檔案',
+    preferences: {
+      title: 'PDF 與圖片',
       autoConvert: {
-        label: '上傳 PDF 與圖片時自動轉換成文件',
-        description: '關閉時會以檔案保存，之後可從選單手動轉換。',
+        label: '上傳時自動轉換成文件',
+        description: '關閉時以原檔保存，等你選擇 Markdown 時才轉換。',
       },
-      foot: '其他種類的檔案一律原樣保存，不會轉換。',
+      defaultView: {
+        label: '預設檢視',
+        description: '已轉換的 PDF 或圖片第一次打開時顯示的檢視。',
+        original: '原檔',
+        markdown: 'Markdown',
+      },
+      foot: '每份文件會記住上次閱讀的檢視，預設值只決定第一次。其他種類的檔案一律原樣保存，不會轉換。',
     },
     account: {
       signedInAs: '登入帳號',
@@ -372,10 +379,8 @@ export default {
     columnKind: '種類',
     kinds: {
       folder: '資料夾',
-      documentPdf: '文件（由 PDF 轉換）',
-      documentImage: '文件（由圖片轉換）',
-      documentMarkdown: '文件（Markdown）',
-      pdf: 'PDF 檔案（未轉換）',
+      markdown: 'Markdown 文件',
+      pdf: 'PDF 文件',
       image: '{format} 圖片',
       video: '{format} 影片',
       audio: '{format} 音訊',
@@ -466,12 +471,14 @@ export default {
   },
   viewer: {
     view: {
+      original: '原檔',
       markdown: 'Markdown',
-      json: 'JSON',
     },
+    noOriginal: '沒有保留原檔',
+    notConvertible: '這種格式無法轉換成文件',
     empty: '目前沒有可顯示的內容。',
-    emptyBody: '這筆工作沒有產出 Markdown — 可切換到 JSON 檢視查看回傳內容。',
-    degraded: '內容不完整：這份文件有 {count} 頁解析失敗，未包含在下方（第 {pages} 頁）。失敗原因可在 JSON 檢視查看。',
+    emptyBody: '這筆工作沒有產出 Markdown。',
+    degraded: '內容不完整：這份文件有 {count} 頁解析失敗，未包含在下方（第 {pages} 頁）。',
     find: '在文件中尋找',
     tools: '閱讀工具',
     findLabel: '搜尋',
@@ -483,7 +490,6 @@ export default {
       details: '檔案資訊',
       download: '下載',
       downloadSize: '下載（{size}）',
-      convert: '轉換成文件',
       showInFiles: '在檔案中顯示',
       kind: '種類',
       size: '大小',

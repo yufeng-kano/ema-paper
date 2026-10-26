@@ -13,10 +13,13 @@ import {
   fileKind,
   filePreview,
   folderPath,
+  imageFormat,
+  initialView,
   isMarkdownUpload,
   isPending,
   isReconverting,
   keyRange,
+  originalKind,
   renameSelectionEnd,
   subtreeIds,
   typeAheadMatch,
@@ -291,15 +294,16 @@ describe('uploadCap', () => {
   }
 
   it('applies the cap intake applies: markdown, a parse, or a file kept as it is', () => {
-    expect(uploadCap({ name: 'notes.md', type: '' }, limits)).toBe(100)
-    expect(uploadCap({ name: 'paper.pdf', type: 'application/pdf' }, limits)).toBe(1000)
-    expect(uploadCap({ name: 'demo.mov', type: 'video/quicktime' }, limits)).toBe(5000)
-    expect(uploadCap({ name: 'mystery', type: '' }, limits)).toBe(5000)
+    expect(uploadCap({ name: 'notes.md', type: '' }, limits, true)).toBe(100)
+    expect(uploadCap({ name: 'paper.pdf', type: 'application/pdf' }, limits, true)).toBe(1000)
+    expect(uploadCap({ name: 'demo.mov', type: 'video/quicktime' }, limits, true)).toBe(5000)
+    expect(uploadCap({ name: 'mystery', type: '' }, limits, true)).toBe(5000)
   })
 
-  it('caps a PDF or an image as a file while the parse agent keeps them', () => {
+  it('caps a PDF or an image as a file while the parse agent keeps them, which it does unless asked', () => {
     expect(uploadCap({ name: 'paper.pdf', type: 'application/pdf' }, limits, false)).toBe(5000)
     expect(uploadCap({ name: 'scan.jpg', type: 'image/jpeg' }, limits, false)).toBe(5000)
+    expect(uploadCap({ name: 'paper.pdf', type: 'application/pdf' }, limits)).toBe(5000)
     // Markdown is never parsed: the switch changes nothing for it.
     expect(uploadCap({ name: 'notes.md', type: '' }, limits, false)).toBe(100)
   })
@@ -350,8 +354,15 @@ describe('fileKind', () => {
     expect(fileKind({ name: 'x.constructor', media_type: '' })).toEqual({ key: 'file', format: 'CONSTRUCTOR', glyph: 'file' })
   })
 
+  it('names a parsed image by its extension, which is all its row has', () => {
+    expect(imageFormat('scan.png')).toBe('PNG')
+    expect(imageFormat('photo.JPG')).toBe('JPEG')
+    expect(imageFormat('photo.jpeg')).toBe('JPEG')
+    expect(imageFormat('Old scan')).toBe('')
+  })
+
   it('names every kind in both languages', () => {
-    for (const key of ['pdf', 'image', 'video', 'audio', 'spreadsheet', 'presentation', 'word', 'archive', 'file', 'plain']) {
+    for (const key of ['markdown', 'pdf', 'image', 'video', 'audio', 'spreadsheet', 'presentation', 'word', 'archive', 'file', 'plain']) {
       expect(en.files.kinds).toHaveProperty(key)
       expect(zhTW.files.kinds).toHaveProperty(key)
     }
@@ -376,5 +387,31 @@ describe('documentGlyph and filePreview', () => {
     expect(filePreview('text/plain')).toBe('text')
     expect(filePreview('application/zip')).toBe('none')
     expect(filePreview(null)).toBe('none')
+  })
+})
+
+describe('originalKind and initialView', () => {
+  it('shows a PDF or an image as its original, converted or not, and nothing else', () => {
+    expect(originalKind(document(1, 'a.pdf'))).toBe('pdf')
+    expect(originalKind(document(1, 'a.png', null, { kind: 'image' }))).toBe('image')
+    expect(originalKind(document(1, 'a.pdf', null, { kind: 'file', media_type: 'application/pdf' }))).toBe('pdf')
+    expect(originalKind(document(1, 'a.jpg', null, { kind: 'file', media_type: 'image/jpeg' }))).toBe('image')
+    // An SVG is served as a download, so there is nothing to show of it.
+    expect(originalKind(document(1, 'a.svg', null, { kind: 'file', media_type: 'image/svg+xml' }))).toBeNull()
+    expect(originalKind(document(1, 'a.mov', null, { kind: 'file', media_type: 'video/quicktime' }))).toBeNull()
+    expect(originalKind(document(1, 'a.md', null, { kind: 'markdown' }))).toBeNull()
+  })
+
+  it('opens a file on its original, a document on what it remembers, else on the default', () => {
+    expect(initialView(document(1, 'a.pdf', null, { kind: 'file', media_type: 'application/pdf' }), 'markdown')).toBe('original')
+    expect(initialView(document(1, 'a.pdf', null, { view: 'original', original: true }), 'markdown')).toBe('original')
+    expect(initialView(document(1, 'a.pdf', null, { view: 'markdown', original: true }), 'original')).toBe('markdown')
+    expect(initialView(document(1, 'a.pdf', null, { view: null, original: true }), 'original')).toBe('original')
+    expect(initialView(document(1, 'a.pdf'), 'markdown')).toBe('markdown')
+  })
+
+  it('opens on Markdown whatever was remembered where the original was not kept, and always for markdown', () => {
+    expect(initialView(document(1, 'a.pdf', null, { view: 'original', original: false }), 'original')).toBe('markdown')
+    expect(initialView(document(1, 'a.md', null, { kind: 'markdown', view: 'original' }), 'original')).toBe('markdown')
   })
 })

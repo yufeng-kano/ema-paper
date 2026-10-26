@@ -9,6 +9,7 @@ import type { IconName } from './icons'
  */
 export const SETTINGS_SECTIONS = [
   { key: 'general', icon: 'settings', tint: '--tint-gray' },
+  { key: 'preferences', icon: 'sliders-horizontal', tint: '--tint-teal' },
   { key: 'account', icon: 'user', tint: '--tint-blue' },
   { key: 'usage', icon: 'dashboard', tint: '--tint-green' },
   { key: 'agent', icon: 'agent', tint: '--tint-purple' },
