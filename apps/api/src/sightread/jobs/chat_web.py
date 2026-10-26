@@ -221,20 +221,29 @@ async def iter_body(response: httpx.Response) -> AsyncIterator[bytes]:
         raise FetchRefused(
             f"The server sent content encoded as {', '.join(encodings)}, which is not read."
         )
-    inflater = zlib.decompressobj(wbits=zlib.MAX_WBITS | 16)
+    # One inflater per gzip member — gzip allows them concatenated — and none between
+    # members: bytes that follow a member's end are the next member's or junk, never
+    # held unread. Each raw chunk is inflated in pieces of at most `CHUNK_BYTES`.
+    inflater: zlib._Decompress | None = None
     try:
         async for raw in response.aiter_raw(CHUNK_BYTES):
-            piece = inflater.decompress(raw, CHUNK_BYTES)
-            while True:
+            pending = raw
+            while pending:
+                if inflater is None:
+                    inflater = zlib.decompressobj(wbits=zlib.MAX_WBITS | 16)
+                piece = inflater.decompress(pending, CHUNK_BYTES)
                 if piece:
                     yield piece
-                if not inflater.unconsumed_tail:
-                    break
-                piece = inflater.decompress(inflater.unconsumed_tail, CHUNK_BYTES)
-        if tail := inflater.flush():
-            yield tail
+                if inflater.eof:
+                    pending = inflater.unused_data
+                    inflater = None
+                else:
+                    pending = inflater.unconsumed_tail
     except zlib.error as exc:
         raise FetchRefused("The server's gzip could not be read.") from exc
+    if inflater is not None:
+        # The body ended inside a member: what was inflated is not the whole of it.
+        raise FetchRefused("The server's gzip ended before its end; nothing was kept.")
 
 
 async def read_capped(response: httpx.Response, max_bytes: int) -> tuple[bytes, bool]:

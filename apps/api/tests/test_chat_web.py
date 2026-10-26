@@ -13,6 +13,7 @@ import socket
 import tracemalloc
 
 import httpx
+import pytest
 import respx
 from sqlalchemy import select
 
@@ -868,12 +869,15 @@ async def test_a_gzipped_body_is_inflated_a_bounded_piece_at_a_time(tmp_path, mo
     assert len(bomb) < 50_000
 
     class Wire(httpx.AsyncByteStream):
-        """The bomb as a server would send it, in small raw chunks — straight to the reader,
+        """A body as a server would send it, in small raw chunks — straight to the reader,
         past `respx`, which reads a mocked body whole (and inflates it) before answering."""
 
+        def __init__(self, data: bytes) -> None:
+            self.data = data
+
         async def __aiter__(self):
-            for start in range(0, len(bomb), 4096):
-                yield bomb[start : start + 4096]
+            for start in range(0, len(self.data), 4096):
+                yield self.data[start : start + 4096]
 
         async def aclose(self) -> None:
             pass
@@ -882,7 +886,7 @@ async def test_a_gzipped_body_is_inflated_a_bounded_piece_at_a_time(tmp_path, mo
     try:
         tracemalloc.reset_peak()
         data, cut = await chat_web.read_capped(
-            httpx.Response(200, headers={"content-encoding": "gzip"}, stream=Wire()), 1000
+            httpx.Response(200, headers={"content-encoding": "gzip"}, stream=Wire(bomb)), 1000
         )
         _current, peak = tracemalloc.get_traced_memory()
     finally:
@@ -900,6 +904,21 @@ async def test_a_gzipped_body_is_inflated_a_bounded_piece_at_a_time(tmp_path, mo
     )
     assert bombed.is_error is False
     assert bombed.content.endswith("[... the content goes on past what was read ...]")
+
+    async def inflated(body: bytes) -> tuple[bytes, bool]:
+        return await chat_web.read_capped(
+            httpx.Response(200, headers={"content-encoding": "gzip"}, stream=Wire(body)),
+            1_000_000,
+        )
+
+    # Concatenated members read as gzip reads them; a member followed by junk, or by a body
+    # that is no member, is refused rather than held unread; a stream that ends inside a
+    # member is refused rather than kept short.
+    assert await inflated(gzip.compress(b"ab") + gzip.compress(b"cd")) == (b"abcd", False)
+    with pytest.raises(chat_web.FetchRefused, match="could not be read"):
+        await inflated(gzip.compress(b"ab") + b"\0" * 300_000)
+    with pytest.raises(chat_web.FetchRefused, match="ended before its end"):
+        await inflated(gzip.compress(b"payload")[:-10])
 
     respx.get(host=PUBLIC_IP, path="/brotli").mock(
         return_value=httpx.Response(
