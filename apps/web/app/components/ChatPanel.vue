@@ -776,9 +776,21 @@ function seePlans() {
  *  packs); the notice then names when the period resets. */
 const canTopUp = computed(() => auth.me.value?.pack_checkout_available === true)
 const topUp = reactive(useTopUp())
+// The pack is read from the catalog when the notice first stands for such a reader; the
+// notice offers it only once the catalog answered with one — Pay's checkout may be closed.
+watch(
+  () => sendBlock.value === 'credits' && canTopUp.value,
+  (offered) => {
+    if (offered && !topUp.loaded) {
+      void topUp.load()
+    }
+  },
+  { immediate: true },
+)
+const offersPack = computed(() => canTopUp.value && topUp.pack !== null)
 const creditsNotice = computed(() => {
   const me = auth.me.value
-  return canTopUp.value && me?.period_end
+  return offersPack.value && me?.period_end
     ? t('chat.blockedCreditsPack', { date: formatDate(me.period_end, locale.value) })
     : t('chat.blockedCredits')
 })
@@ -1784,7 +1796,7 @@ onBeforeUnmount(() => {
         }}
         <template v-if="topUp.error"> {{ topUp.error }}</template>
       </p>
-      <UiButton v-if="sendBlock === 'credits' && canTopUp" size="sm" :loading="topUp.buying" @click="topUp.buy">
+      <UiButton v-if="sendBlock === 'credits' && offersPack" size="sm" :loading="topUp.buying" @click="topUp.buy">
         {{ t('usage.topUp') }}
       </UiButton>
       <UiButton v-else size="sm" @click="seePlans">{{ t('credits.seePlans') }}</UiButton>

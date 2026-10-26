@@ -20,7 +20,10 @@ export function useTopUp() {
 
   async function load(): Promise<CatalogPack | null> {
     try {
-      pack.value = (await getBillingCatalog()).packs[0] ?? null
+      // A pack is for sale only while Pay's checkout is open (`available`): with it
+      // closed the catalog still lists the packs, and a checkout would be refused.
+      const catalog = await getBillingCatalog()
+      pack.value = catalog.available ? (catalog.packs[0] ?? null) : null
     } catch {
       pack.value = null
     } finally {
