@@ -80,6 +80,49 @@ def parse_plans(raw: str, *, storage_ceiling: int, jobs_ceiling: int) -> dict[st
     return plans
 
 
+@dataclass(frozen=True)
+class Pack:
+    """What a top-up pack grants (docs/billing.md § Top-up packs): `id` is Pay's packId,
+    `credits` valid for `valid_days` from the day the pack was paid."""
+
+    id: str
+    credits: int
+    valid_days: int
+
+
+def parse_packs(raw: str) -> dict[str, Pack]:
+    """`KANO_PAY_PACKS_JSON`: `[{"packId", "credits", "validDays"}]`. Empty = no pack is
+    sold; the price is Pay's (docs/billing.md § Top-up packs)."""
+    try:
+        data = json.loads(raw or "[]")
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"KANO_PAY_PACKS_JSON is not JSON: {exc.msg}") from exc
+    if not isinstance(data, list):
+        raise ValueError("KANO_PAY_PACKS_JSON must be a list of packs")
+    packs: dict[str, Pack] = {}
+    for entry in data:
+        if not isinstance(entry, dict):
+            raise ValueError("KANO_PAY_PACKS_JSON: each pack must be an object")
+        pack_id = entry.get("packId")
+        if not isinstance(pack_id, str) or not pack_id.strip() or len(pack_id.strip()) > 64:
+            raise ValueError(
+                "KANO_PAY_PACKS_JSON: packId must be a non-empty string of at most 64 characters"
+            )
+        pack_id = pack_id.strip()
+        if pack_id in packs:
+            raise ValueError(f"KANO_PAY_PACKS_JSON: pack {pack_id!r} listed twice")
+        counts = {}
+        for field in ("credits", "validDays"):
+            value = entry.get(field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(
+                    f"KANO_PAY_PACKS_JSON: {pack_id!r}.{field} must be an integer >= 1"
+                )
+            counts[field] = value
+        packs[pack_id] = Pack(id=pack_id, credits=counts["credits"], valid_days=counts["validDays"])
+    return packs
+
+
 def month_bounds(now: datetime) -> tuple[datetime, datetime]:
     """The UTC calendar month holding `now`: Free's period."""
     now = now.astimezone(UTC)

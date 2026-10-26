@@ -39,6 +39,17 @@ export function formatMinorAmount(amount: string, currency: string, locale: stri
   return format.format(Number(amount) / 10 ** digits)
 }
 
+/**
+ * A top-up pack's validity as the pages say it (docs/billing.md § Top-up packs): a whole number
+ * of months when `KANO_PAY_PACKS_JSON`'s days are one — 365 reads *12 months*, 90 *3 months* —
+ * else the days as configured, so no page rounds a number the operator did not choose.
+ */
+export function packValidity(days: number): { unit: 'months' | 'days'; n: number } {
+  const month = 30.44
+  const months = Math.round(days / month)
+  return months > 0 && Math.abs(months * month - days) <= 2 ? { unit: 'months', n: months } : { unit: 'days', n: days }
+}
+
 export function formatCount(value: number, locale: string): string {
   return new Intl.NumberFormat(locale).format(value)
 }

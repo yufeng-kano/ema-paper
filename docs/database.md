@@ -315,6 +315,24 @@ credit_entries   id PK, user_id FK, period_start,
                  -- deletes (jobs.md § Retention) leaves its entry with job_id NULL, and
                  -- a conversation the reader deletes takes its turns and leaves their
                  -- entries with turn_id NULL, so the balance and its record keep agreeing
+credit_packs     id PK,                           -- Pay's purchaseId
+                 user_id FK, pack_id, credits INT, spent INT,
+                 status paid|refunded, purchased_at, expires_at,
+                 version BIGINT,                  -- Pay's version (ms); older is ignored
+                 created_at, updated_at
+                 INDEX (user_id, expires_at)
+                 CHECK (credits >= 0), CHECK (spent >= 0), CHECK (expires_at > purchased_at)
+                 -- a top-up pack bought on Pro (billing.md § Top-up packs): credits from
+                 -- the pack's configuration when it was paid, spent as charges take from it
+                 -- once the period's grant is gone; counts while paid and unexpired
+credit_pack_entries (entry_id FK credit_entries, pack_id FK credit_packs) PK, amount INT
+                 CHECK (amount >= 0)
+                 -- how much of an entry's amount each pack covered, so a release, a retry
+                 -- or a settlement moves exactly that back or forward
+pack_checkouts   user_id PK/FK, pack_id, idempotency_key UNIQUE,
+                 purchase_id UNIQUE NULL, created_at, completed_at NULL
+                 -- the one pack checkout a user may have open, keyed as `checkouts` is;
+                 -- purchase_id is Pay's purchaseId once Pay answered
 ```
 
 ## Rules
@@ -330,6 +348,7 @@ credit_entries   id PK, user_id FK, period_start,
 - **The figure check migration** (`figure check`) added `job_pages.figures` (NULL: no check). No row is rewritten: a page kept from before it keeps no statuses, and its figures carry no `check`. Its downgrade drops the column.
 - **The ledger migration** (`credit entries outlive turns`) changed `credit_entries.turn_id` from `ON DELETE CASCADE` to `ON DELETE SET NULL` and replaced the check that a chat entry has a turn with one that a parse entry has none: a conversation deleted by its reader takes its turns and leaves their entries behind, still counted in the period and in `/api/billing/entries`. No row is rewritten. Its downgrade restores the cascade and refuses while any chat entry has no turn, naming the count — those entries would otherwise have to be deleted from the billing record.
 - **The library files migration** (`library files`) added `documents.kind` — `parse`, `markdown` or `file`; NOT NULL, default `parse` — backfilled from `job_id` (a row with a job is a `parse`, one without a `markdown`), `documents.media_type` and `documents.size_bytes` (NULL on every existing row: only a file carries them) and `agent_settings.auto_convert` (true). No row is rewritten otherwise. Its downgrade refuses while any row is a file, naming the count — without `kind` those rows would read as markdown documents whose text no route could find — and otherwise drops the four columns.
+- **The credit packs migration** (`credit packs`) created `credit_packs`, `credit_pack_entries` and `pack_checkouts`, empty, with their constraints and indexes ([billing.md](./billing.md) § The ledger). No existing row is read or rewritten: nothing changes for a user until a pack is bought. Its downgrade drops the three tables and nothing else — packs already bought are lost with them, so it is not run on a database that sold one.
 - **The reader views migration** (`reader views`) added `users.default_view` (`markdown` on every row) and `documents.view` (NULL on every row), and turned `agent_settings.auto_convert` off: its default became `false` and every existing row was set to `false` — the switch had been on for everyone as the default the library files migration gave it, and since 2026-10-26 an uploaded PDF or image is kept as it is until the reader asks for Markdown ([web.md](./web.md) § Files). Its downgrade drops the two columns and restores the default of `true`; the rows stay off.
 - **The parse retention migration** (`parse retention and account deletion`) did the same for `credit_entries.job_id`: `fk_credit_entries_job_id_jobs` went from `ON DELETE CASCADE` to `ON DELETE SET NULL`, and `ck_credit_entries_parse_job`, which held that an entry has a job exactly when it is a parse, became the check that a chat entry has no job (`kind = 'parse' OR job_id IS NULL`): a parse the retention deletes ([jobs.md](./jobs.md) § Retention) leaves its entry behind, still counted in its period and in `/api/billing/entries`. It added the indexes the purge and a job's foreign-key actions read, `ix_documents_job_id` and `ix_usage_log_job_id`, and the partial `ix_documents_trashed_at` and `ix_folders_trashed_at` (`WHERE trashed_at IS NOT NULL`) the Trash's expiry reads. No row is rewritten and none is deleted: the parses already past their time go at the first sweep after the deploy. Its downgrade drops the four indexes, restores the cascade and the old check, and refuses while any parse entry has no job, naming the count — those entries would otherwise have to be deleted from the billing record.
 - **The re-convert migration** (`reconvert documents`) added `documents.reconvert_job_id` (NULL: no re-convert) and its partial index. No row is rewritten. Its downgrade drops both: a re-convert still running then finishes as a parse no document takes, which the retention deletes in its time.

@@ -38,7 +38,9 @@ async def test_dev_login_round_trip(client: AsyncClient) -> None:
         "limits",
         "plan",
         "credits_remaining",
+        "period_end",
         "chat_min_credits",
+        "pack_checkout_available",
         "auto_convert",
         "default_view",
     }

@@ -7,9 +7,10 @@
 
 /**
  * The public pages, as the default locale has them: the landing page (the SEO surface),
- * pricing, and the policy pages Dodo's site review reads (docs/billing.md § Transition, step 6).
+ * pricing, the rates, and the policy pages Dodo's site review reads (docs/billing.md
+ * § Transition, step 6).
  */
-export const PUBLIC_PAGES = ['/', '/pricing', '/terms', '/privacy', '/refund'] as const
+export const PUBLIC_PAGES = ['/', '/pricing', '/rates', '/terms', '/privacy', '/refund'] as const
 
 /**
  * The locales as `hreflang` names them, with the prefix their pages live under — none for the
