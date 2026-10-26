@@ -80,3 +80,28 @@ export function cacheState(
   }
   return conversation.context_tokens == null ? null : { kind: 'none' }
 }
+
+/** The worker's sweep looks every minute; a reload inside the window waits that long. */
+export const IDLE_RELOAD_POLL_MS = 60_000
+/** Past the window's opening before the first reload: the sweep that opens it has run. */
+export const IDLE_RELOAD_GRACE_MS = 5_000
+
+/**
+ * When the panel next reads the open conversation to discover an idle compaction the
+ * worker may have queued (docs/web.md § The agent panel, *The model pill and the context
+ * ring*): the worker takes a conversation once its `cache_warm_until` falls within
+ * `leadSeconds`, so the panel reads it as that window opens and then every minute, until
+ * the clock has passed by a minute; null while there is no clock, and once that has.
+ */
+export function idleReloadDelay(
+  conversation: Pick<Conversation, 'cache_warm_until'> | null | undefined,
+  leadSeconds: number,
+  now: number,
+): number | null {
+  const until = conversation?.cache_warm_until ? Date.parse(conversation.cache_warm_until) : Number.NaN
+  if (Number.isNaN(until) || now >= until + IDLE_RELOAD_POLL_MS) {
+    return null
+  }
+  const opens = until - leadSeconds * 1000 + IDLE_RELOAD_GRACE_MS
+  return now < opens ? opens - now : IDLE_RELOAD_POLL_MS
+}

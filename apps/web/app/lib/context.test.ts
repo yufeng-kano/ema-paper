@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest'
-import { cacheState, contextFill, contextLine, formatTokens, ringLevel } from './context'
+import {
+  IDLE_RELOAD_GRACE_MS,
+  IDLE_RELOAD_POLL_MS,
+  cacheState,
+  contextFill,
+  contextLine,
+  formatTokens,
+  idleReloadDelay,
+  ringLevel,
+} from './context'
 
 const NOW = Date.parse('2026-10-26T12:00:00Z')
 
@@ -57,5 +66,34 @@ describe('cacheState', () => {
     expect(cacheState({ context_tokens: null, cache_warm_until: null, recache_credits: null }, NOW)).toBeNull()
     expect(cacheState(null, NOW)).toBeNull()
     expect(cacheState({ context_tokens: 5, cache_warm_until: 'not a date', recache_credits: null }, NOW)).toEqual({ kind: 'none' })
+  })
+})
+
+describe('idleReloadDelay', () => {
+  const lead = 360
+  const warm = { cache_warm_until: '2026-10-26T12:42:00Z' }
+  const until = Date.parse(warm.cache_warm_until)
+
+  it('waits for the window the worker takes the conversation in to open', () => {
+    expect(idleReloadDelay(warm, lead, NOW)).toBe(until - lead * 1000 - NOW + IDLE_RELOAD_GRACE_MS)
+    // Just before the window: the grace alone.
+    expect(idleReloadDelay(warm, lead, until - lead * 1000)).toBe(IDLE_RELOAD_GRACE_MS)
+  })
+
+  it('reads again every minute inside the window, until the clock has passed by one', () => {
+    expect(idleReloadDelay(warm, lead, until - lead * 1000 + IDLE_RELOAD_GRACE_MS)).toBe(IDLE_RELOAD_POLL_MS)
+    expect(idleReloadDelay(warm, lead, until - 1000)).toBe(IDLE_RELOAD_POLL_MS)
+    expect(idleReloadDelay(warm, lead, until + IDLE_RELOAD_POLL_MS - 1)).toBe(IDLE_RELOAD_POLL_MS)
+    expect(idleReloadDelay(warm, lead, until + IDLE_RELOAD_POLL_MS)).toBeNull()
+  })
+
+  it('has nothing to wait for without a clock', () => {
+    expect(idleReloadDelay({ cache_warm_until: null }, lead, NOW)).toBeNull()
+    expect(idleReloadDelay({ cache_warm_until: 'not a date' }, lead, NOW)).toBeNull()
+    expect(idleReloadDelay(null, lead, NOW)).toBeNull()
+  })
+
+  it('reads as the clock passes when the server names no lead', () => {
+    expect(idleReloadDelay(warm, 0, NOW)).toBe(until - NOW + IDLE_RELOAD_GRACE_MS)
   })
 })

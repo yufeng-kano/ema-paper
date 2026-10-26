@@ -802,6 +802,96 @@ async def test_the_idle_pass_leaves_what_is_not_due_and_what_it_may_not_touch(
     assert await message_count(due) == count
 
 
+@respx.mock
+async def test_a_failed_compaction_leaves_no_clock(chat_client) -> None:
+    """A compaction that fails after a cached call — the worker's or the reader's — ends with
+    `cache_warm_until` cleared: the clock its own call set would otherwise have the idle
+    pass queue another paid attempt at what just failed, within the hour (docs/chat.md
+    § Compaction, *Idle compaction*)."""
+    client = chat_client
+    settings = client.app.state.settings
+    sessionmaker = client.app.state.sessionmaker
+    native = {
+        "input_tokens": 10,
+        "cache_read_input_tokens": 90,
+        "cache_creation_input_tokens": 0,
+        "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 0},
+    }
+    answers = iter(
+        [
+            cached_stream(DONE[0], "end_turn", native),
+            # The compactions answer nothing, with the cache read: `compact_empty`.
+            cached_stream([], "end_turn", native),
+            cached_stream([], "end_turn", native),
+        ]
+    )
+    respx.post(MESSAGES_URL).mock(
+        side_effect=lambda request: httpx.Response(200, content=next(answers))
+    )
+    conversation_id = await new_conversation(client)
+    await send(client, conversation_id, text="hello")
+    await _run_queued_turn(client)
+    assert (await conversation_row(client, conversation_id)).cache_warm_until is not None
+
+    await set_clock(
+        client,
+        conversation_id,
+        warm_for=settings.chat_idle_compact_lead_seconds - 10,
+        tokens=settings.chat_idle_compact_min_tokens,
+    )
+    assert await chat_compact.idle_compact_once(sessionmaker, settings) == 1
+    await _run_queued_turn(client)
+    turns = await turns_of(client, conversation_id)
+    assert (turns[1].kind, turns[1].status, turns[1].error) == (
+        IDLE_COMPACT_TURN,
+        "failed",
+        "compact_empty",
+    )
+    row = await conversation_row(client, conversation_id)
+    assert row.cache_warm_until is None
+    assert row.compacted_message_id is None
+
+    await send(client, conversation_id, text="", command="compact")
+    await _run_queued_turn(client)
+    turns = await turns_of(client, conversation_id)
+    assert (turns[2].kind, turns[2].status) == (COMPACT_TURN, "failed")
+    assert (await conversation_row(client, conversation_id)).cache_warm_until is None
+
+
+@respx.mock
+async def test_the_idle_pass_reads_the_conversation_again_under_its_lock(chat_client) -> None:
+    """The row the pass loads before it locks may be stale once it holds the lock — a
+    turn's end or a move to another model cleared the clock meanwhile: it is read again
+    under the lock, columns included, where the session would otherwise hand back the row
+    as first loaded and queue a compaction the clock no longer calls for (docs/chat.md
+    § Compaction, *Idle compaction*)."""
+    client = chat_client
+    settings = client.app.state.settings
+    sessionmaker = client.app.state.sessionmaker
+    stub_messages([DONE])
+    conversation_id = await new_conversation(client)
+    await send(client, conversation_id, text="hello")
+    await _run_queued_turn(client)
+    await set_clock(
+        client,
+        conversation_id,
+        warm_for=settings.chat_idle_compact_lead_seconds - 10,
+        tokens=settings.chat_idle_compact_min_tokens,
+    )
+    async with sessionmaker() as db:
+        loaded = await db.get(Conversation, conversation_id)
+        assert loaded is not None and loaded.cache_warm_until is not None
+        async with sessionmaker() as other:
+            await other.execute(
+                update(Conversation)
+                .where(Conversation.id == conversation_id)
+                .values(cache_warm_until=None, updated_at=Conversation.updated_at)
+            )
+            await other.commit()
+        assert not await chat_compact.try_idle_compaction(db, settings, conversation_id)
+    assert [turn.kind for turn in await turns_of(client, conversation_id)] == [MESSAGE_TURN]
+
+
 # --- the memory file ------------------------------------------------------------------------
 
 
@@ -811,13 +901,20 @@ async def test_the_memory_file_is_read_and_written_on_the_agent_page(make_client
     own with one trailing newline, capped, and refused while a turn of theirs is unfinished
     (docs/api.md, docs/chat.md § Memory *The memory file*)."""
     client = await chatting_client(
-        make_client(workspaces_dir=str(tmp_path / "workspaces"), chat_memory_file_max_chars=40)
+        make_client(
+            workspaces_dir=str(tmp_path / "workspaces"),
+            chat_memory_file_max_chars=40,
+            chat_idle_compact_lead_seconds=123,
+        )
     )
     url = "/api/agents/chat/memory-file"
     empty = await client.get(url)
     assert empty.status_code == 200, empty.text
     assert empty.json() == {"text": "", "max_chars": 40}
-    assert (await client.get("/api/me")).json()["limits"]["memory_file_max_chars"] == 40
+    limits = (await client.get("/api/me")).json()["limits"]
+    assert limits["memory_file_max_chars"] == 40
+    # The panel reads the open conversation again as the worker's window opens (docs/web.md).
+    assert limits["idle_compact_lead_seconds"] == 123
 
     saved = await client.put(url, json={"text": "## Style\n\n- Tables​ "}, headers=CSRF_HEADERS)
     assert saved.status_code == 200, saved.text

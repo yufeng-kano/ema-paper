@@ -179,6 +179,9 @@ export interface UploadLimits {
   /** The chat agent's memory file, as the Agent page's editor caps it (docs/chat.md
    *  § Memory, *The memory file*). Optional, as above. */
   memory_file_max_chars?: number
+  /** How long before a conversation's cache expires the worker may compact it
+   *  (docs/chat.md § Compaction, *Idle compaction*). */
+  idle_compact_lead_seconds?: number
   /** How many days the Trash keeps an item before the worker deletes it for good; 0 never
    *  does (docs/workspace.md § The Trash). Optional only so a page served by an older API
    *  still renders. */

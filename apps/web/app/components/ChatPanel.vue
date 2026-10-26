@@ -48,6 +48,7 @@ import {
 } from '~/lib/api'
 import { blockName, type NameText } from '~/lib/blocks'
 import { COMPACT_COMMAND, commandArguments, formatBytes, type AskOutcome, type AskRequest, type ComposerPayload } from '~/lib/composer'
+import { idleReloadDelay } from '~/lib/context'
 import { byRecency } from '~/lib/conversations'
 import { nodesToMarkdown } from '~/lib/copy'
 import { formatCount, formatDate } from '~/lib/format'
@@ -822,6 +823,49 @@ watch(running, (now, before) => {
   }
 })
 
+// --- discovering an idle compaction (docs/web.md § The agent panel) ----------------------
+
+/** The worker compacts an idle conversation before its cache expires, and the stream is
+ *  closed while nothing runs, so the panel would not hear of the turn: the open
+ *  conversation is read again as the worker's window opens and every minute inside it
+ *  (`idleReloadDelay`), and the turn the record then lists is followed like a reader's. */
+let idleReload: ReturnType<typeof setTimeout> | null = null
+
+function scheduleIdleReload() {
+  if (idleReload !== null) {
+    clearTimeout(idleReload)
+    idleReload = null
+  }
+  const id = currentId.value
+  if (id === null || running.value || agentSettings.value?.idle_compact === false) {
+    return
+  }
+  const delay = idleReloadDelay(current.value, limits.value?.idle_compact_lead_seconds ?? 0, Date.now())
+  if (delay === null) {
+    return
+  }
+  idleReload = setTimeout(() => {
+    idleReload = null
+    if (currentId.value === id && !running.value) {
+      // Read again after the read: the clock may stand as it did, which the watch
+      // below would not see.
+      void loadDetail(id).then(scheduleIdleReload)
+    }
+  }, delay)
+}
+
+watch(
+  () => [
+    currentId.value,
+    current.value?.cache_warm_until,
+    running.value,
+    agentSettings.value?.idle_compact,
+    limits.value?.idle_compact_lead_seconds,
+  ],
+  scheduleIdleReload,
+  { immediate: true },
+)
+
 const sendBlock = computed<'credits' | 'storage' | null>(() => {
   const me = auth.me.value
   if (me && me.credits_remaining < me.chat_min_credits) {
@@ -1230,6 +1274,11 @@ async function submit(payload: ComposerPayload): Promise<boolean> {
       return false
     }
     composerError.value = await resolve(error)
+    if (error instanceof ApiRequestError && error.status === 409 && id !== null && currentId.value === id) {
+      // A turn the panel did not know of — the worker's idle compaction, or a send from
+      // another tab — may be the one in the way: the record says, and is followed.
+      void loadDetail(id)
+    }
     return false
   } finally {
     if (fromDraft) {
@@ -1629,6 +1678,9 @@ onMounted(() => {
 onBeforeUnmount(() => {
   if (flushTimer !== null) {
     clearTimeout(flushTimer)
+  }
+  if (idleReload !== null) {
+    clearTimeout(idleReload)
   }
   if (ticker !== null) {
     clearInterval(ticker)

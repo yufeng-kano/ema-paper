@@ -125,14 +125,19 @@ async def try_idle_compaction(
         return False
     # The user's row, then the conversation's: the send's order (docs/chat.md).
     await db.execute(select(User.id).where(User.id == row.user_id).with_for_update())
+    # Read again under the lock, the row's columns included (`populate_existing`: the
+    # session would otherwise hand back the identity it loaded above, as it was): a turn
+    # or a move to another model may have cleared the clock meanwhile.
     row = (
         await db.execute(
-            select(Conversation).where(Conversation.id == conversation_id).with_for_update()
+            select(Conversation)
+            .where(Conversation.id == conversation_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
     if row is None:
         return False
-    # Read again under the lock: a turn may have moved the clock meanwhile.
     if (
         row.cache_warm_until is None
         or row.cache_warm_until > now + lead

@@ -250,6 +250,9 @@ async def me(user: SessionUser, db: DbSession, settings: AppSettings):
             "conversation_title_max_chars": TITLE_MAX_CHARS,
             # The Agent page's memory file editor (docs/chat.md § Memory, *The memory file*).
             "memory_file_max_chars": settings.chat_memory_file_max_chars,
+            # When the idle pass may queue a compaction of an open conversation, for the
+            # panel to read it again then (docs/web.md § The agent panel).
+            "idle_compact_lead_seconds": settings.chat_idle_compact_lead_seconds,
             # How long the Trash keeps an item, which its tab states; 0 = never emptied by
             # itself (docs/workspace.md § The Trash).
             "trash_retention_days": settings.trash_retention_days,

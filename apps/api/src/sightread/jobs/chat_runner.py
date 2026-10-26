@@ -1719,6 +1719,12 @@ async def _finish(
                 context_tokens=None,
                 cache_warm_until=None,
             )
+        elif turn.kind in COMPACTION_TURNS:
+            # A compaction that ended any other way: the clock its own calls set is
+            # cleared too, or the idle pass would queue another paid attempt at what just
+            # failed within the hour; the next message's call sets it again (docs/chat.md
+            # § Compaction, *Idle compaction*).
+            values["cache_warm_until"] = None
         await db.execute(
             update(Conversation).where(Conversation.id == turn.conversation_id).values(**values)
         )
