@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   acceptList,
+  builtinCommands,
   commandArguments,
   commandQuery,
   extensionOf,
@@ -132,5 +133,17 @@ describe('passageTooLong', () => {
   it('holds nothing without a passage or without a cap from the server', () => {
     expect(passageTooLong(null, 12)).toBe(false)
     expect(passageTooLong('x'.repeat(600), undefined)).toBe(false)
+  })
+})
+
+describe('builtinCommands', () => {
+  const words = { newDescription: 'New', compactDescription: 'Compact', compactHint: '[focus]' }
+
+  it('offers /compact only with a conversation open, never on the draft', () => {
+    expect(builtinCommands(false, words).map((option) => option.name)).toEqual(['new'])
+    expect(builtinCommands(true, words)).toEqual([
+      { name: 'new', description: 'New', hint: '', group: 'builtin' },
+      { name: 'compact', description: 'Compact', hint: '[focus]', group: 'builtin' },
+    ])
   })
 })

@@ -3311,7 +3311,8 @@ async def test_a_rename_is_one_clean_line_and_keeps_the_order(chatting) -> None:
     for blank in ("", " \n\t ", "\u200b"):
         refused = await chatting.put(url, json={"title": blank}, headers=CSRF_HEADERS)
         assert refused.status_code == 400, blank
-    assert (await chatting.put(url, json={}, headers=CSRF_HEADERS)).status_code == 422
+    # Neither field: refused as the request it is (docs/api.md).
+    assert (await chatting.put(url, json={}, headers=CSRF_HEADERS)).status_code == 400
     assert (await chatting.put(url, json={"title": "Plain"})).status_code == 403
     detail = (await chatting.get(url)).json()["conversation"]
     assert detail["title"] == "x" * limit
@@ -3385,7 +3386,7 @@ async def test_a_usage_row_is_written_through_a_cancel(monkeypatch) -> None:
     release = asyncio.Event()
     recorded: list[str] = []
 
-    async def slow_record(ctx, model, usage):
+    async def slow_record(ctx, model, usage, *, conversation=False):
         started.set()
         await release.wait()
         recorded.append(usage)

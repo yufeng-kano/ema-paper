@@ -127,7 +127,7 @@ class Settings(BaseSettings):
     # (docs/parsing.md § Figure check).
     figure_check_rounds: int = 2
     # Cap on a user's custom system prompt (docs/api.md § Limits).
-    system_prompt_max_chars: int = 8000
+    system_prompt_max_chars: int = 12_000
     # Cap on any upstream response body — a user-controlled endpoint must not be able to
     # exhaust memory with an unbounded reply (docs/parsing.md § Upstream usage).
     upstream_response_max_bytes: int = 33_554_432
@@ -229,6 +229,20 @@ class Settings(BaseSettings):
     chat_memory_max_chars: int = 500
     chat_memories_max: int = 200
     chat_memory_block_max_chars: int = 12_000
+    # How much of the agent's memory file a conversation reads into its system prompt
+    # (docs/chat.md § Memory, *The memory file*).
+    chat_memory_file_max_chars: int = 16_000
+    # Compaction (docs/chat.md § Compaction): the context a conversation must have reached
+    # for the worker to compact it before its cache expires, how long before the expiry
+    # it is enqueued, how often the worker looks, and the tool calls a compaction turn
+    # may make (to bring memory.md up to date) before it answers.
+    chat_idle_compact_min_tokens: int = 100_000
+    chat_idle_compact_lead_seconds: int = 360
+    chat_idle_compact_sweep_seconds: float = 60.0
+    chat_compact_max_tool_calls: int = 8
+    # The context window the chat panel's ring measures a conversation against when
+    # `MODEL_PRICES_JSON` names no `context` for its model.
+    chat_context_window_tokens: int = 200_000
     # Whole sections the reader adds to one message by their heading (docs/chat.md § What
     # a user message carries); each is capped like the selection, its heading on its own.
     chat_sections_per_message: int = 4
@@ -307,6 +321,9 @@ class Settings(BaseSettings):
             "paper_search_max_per_day",
             "read_url_max_per_turn",
             "download_max_per_day",
+            "chat_idle_compact_min_tokens",
+            "chat_idle_compact_lead_seconds",
+            "chat_compact_max_tool_calls",
         ):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name.upper()} must be >= 0")
@@ -315,6 +332,9 @@ class Settings(BaseSettings):
             "download_max_bytes",
             "web_tool_timeout_seconds",
             "download_timeout_seconds",
+            "chat_idle_compact_sweep_seconds",
+            "chat_memory_file_max_chars",
+            "chat_context_window_tokens",
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name.upper()} must be positive")

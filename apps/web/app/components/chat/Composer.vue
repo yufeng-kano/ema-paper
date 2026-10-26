@@ -14,11 +14,13 @@
 import { deleteAttachment, listSkills, uploadAttachment, type AttachmentUpload, type UploadLimits } from '~/lib/api'
 import {
   acceptList,
+  builtinCommands,
   commandQuery,
   extensionOf,
   formatBytes,
   isImageFile,
   matchCommands,
+  NEW_COMMAND,
   passageTooLong,
   refuseAttachment,
   sectionHeading,
@@ -51,6 +53,9 @@ const props = defineProps<{
   /** Posts the message; true once the server accepted it. */
   submit: (payload: ComposerPayload) => Promise<boolean>
   error: string | null
+  /** A conversation is open, as against the draft: `/compact` is offered (docs/web.md
+   *  § The agent panel, *Commands*). */
+  conversationOpen: boolean
 }>()
 
 const emit = defineEmits<{ stop: []; 'new-conversation': [] }>()
@@ -355,7 +360,14 @@ const menuOpen = computed(
 )
 const matches = computed(() => {
   const found = matchCommands(
-    [...skills.value, { name: 'new', description: t('chat.commandNew'), hint: '', group: 'builtin' }],
+    [
+      ...skills.value,
+      ...builtinCommands(props.conversationOpen, {
+        newDescription: t('chat.commandNew'),
+        compactDescription: t('chat.commandCompact'),
+        compactHint: t('chat.commandCompactHint'),
+      }),
+    ],
     query.value ?? '',
   )
   // Grouped as the menu draws them: the skills, then the conversation's own.
@@ -417,11 +429,12 @@ function openCommands() {
 
 function pick(option: CommandOption) {
   menuForced.value = false
-  if (option.group === 'builtin') {
+  if (option.group === 'builtin' && option.name === NEW_COMMAND) {
     draft.value = ''
     emit('new-conversation')
     return
   }
+  // A skill, or `/compact`: a chip, the textarea taking its arguments.
   command.value = option
   // The `/term` typed was the command; a draft the command control opened over stays as
   // its arguments.
@@ -1046,6 +1059,10 @@ defineExpose({ addFiles, setQuote, focus, ask })
             <UiIcon name="square-slash" />
           </button>
         </div>
+        <!-- The model pill and the context ring: the panel's, drawn here in the foot. -->
+        <div class="field-extras">
+          <slot name="foot" />
+        </div>
         <button
           v-if="running"
           type="button"
@@ -1552,13 +1569,30 @@ defineExpose({ addFiles, setQuote, focus, ask })
 .field-foot {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: var(--space-2);
 }
 
 .field-tools {
   display: flex;
+  flex-shrink: 0;
   gap: 2px;
   margin-left: calc(var(--space-1) * -1);
+}
+
+/* Between the tools and the send button, taking what room the row has: the pill cuts its
+   name rather than pushing the send button out. */
+.field-extras {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.round.send,
+.round.stop {
+  flex-shrink: 0;
+  margin-left: auto;
 }
 
 .round {

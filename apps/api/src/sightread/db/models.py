@@ -178,6 +178,9 @@ class AgentSetting(Base):
     memory_paused: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default=text("false")
     )
+    # The chat agent's idle compaction: the worker compacts the user's long conversations
+    # before their prompt cache expires (docs/chat.md § Compaction).
+    idle_compact: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
     # The parse agent's switch: a blocked page goes to `PARSE_FALLBACK_MODEL` on its own
     # (docs/parsing.md § Fallback model).
     auto_fallback: Mapped[bool] = mapped_column(
@@ -511,7 +514,16 @@ class Conversation(Base):
     """One thread of the chat agent about one document (docs/chat.md)."""
 
     __tablename__ = "conversations"
-    __table_args__ = (Index("ix_conversations_document_updated", "document_id", "updated_at"),)
+    __table_args__ = (
+        Index("ix_conversations_document_updated", "document_id", "updated_at"),
+        # What the idle compaction pass reads (docs/chat.md § Compaction).
+        Index(
+            "ix_conversations_cache_warm_until",
+            "cache_warm_until",
+            postgresql_where=text("cache_warm_until IS NOT NULL"),
+            sqlite_where=text("cache_warm_until IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
@@ -525,8 +537,30 @@ class Conversation(Base):
     # The ids of the memories its first turn loaded, in the order they are rendered; NULL
     # until a turn took the snapshot (docs/chat.md § Memory).
     memory_ids: Mapped[list | None] = mapped_column(JSON_COLUMN, nullable=True)
+    # The snapshot of the agent's memory file its first turn took, taken again by a
+    # compaction; NULL until a turn took one, '' for a file that was empty or missing
+    # (docs/chat.md § Memory, *The memory file*).
+    memory_file: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The summary row the replay starts from; NULL while the conversation was never
+    # compacted. No foreign key: a message goes only with its conversation, and a key
+    # back to `messages` would close a cycle every DDL tool would have to break
+    # (docs/chat.md § Compaction).
+    compacted_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # What the last model call replayed and produced, and when the prompt cache it touched
+    # expires; NULL before the first call, after a compaction, and when the call reached
+    # no cache (docs/chat.md § Compaction).
+    context_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cache_warm_until: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
+
+
+# A turn's kinds: a user message answered, the reader's `/compact`, the worker's idle
+# compaction (docs/chat.md § Compaction).
+MESSAGE_TURN = "message"
+COMPACT_TURN = "compact"
+IDLE_COMPACT_TURN = "idle_compact"
+COMPACTION_TURNS = frozenset({COMPACT_TURN, IDLE_COMPACT_TURN})
 
 
 class ChatTurn(Base):
@@ -546,6 +580,10 @@ class ChatTurn(Base):
     # The user message this turn answers. No FK the other way: messages.turn_id names the
     # turn that produced an assistant message.
     message_id: Mapped[int] = mapped_column(Integer)
+    # message | compact | idle_compact (docs/chat.md § Compaction).
+    kind: Mapped[str] = mapped_column(
+        String(16), default=MESSAGE_TURN, server_default=text("'message'")
+    )
     status: Mapped[str] = mapped_column(String(16))  # queued|running|succeeded|failed|cancelled
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     # The web app's locale when the message was sent: the language the turn answers in.

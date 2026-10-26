@@ -485,9 +485,11 @@ async def test_the_agent_prompt_replaces_the_default_and_excludes_a_preset(signe
         reset = await signed_in.put(
             "/api/agents/chat/settings", json={"prompt": text}, headers=CSRF_HEADERS
         )
+        assert reset.status_code == 200, reset.text
         assert reset.json()["prompt"] is None
+    cap = signed_in.app.state.settings.system_prompt_max_chars
     too_long = await signed_in.put(
-        "/api/agents/chat/settings", json={"prompt": "x" * 8001}, headers=CSRF_HEADERS
+        "/api/agents/chat/settings", json={"prompt": "x" * (cap + 1)}, headers=CSRF_HEADERS
     )
     assert too_long.status_code == 400
 

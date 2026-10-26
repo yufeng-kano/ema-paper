@@ -88,6 +88,9 @@ export interface AgentSettings {
   /** `chat` only: the memory switches (docs/chat.md § Memory). */
   memory_auto?: boolean
   memory_paused?: boolean
+  /** `chat` only: whether the worker compacts a long conversation before its prompt cache
+   *  expires (docs/chat.md § Compaction, *Idle compaction*); on by default. */
+  idle_compact?: boolean
   /** `parse` only: the deployment's fallback model, a fact (null: none), and whether a
    *  blocked page goes there on its own (docs/parsing.md § Fallback model). */
   fallback_model?: string | null
@@ -173,6 +176,9 @@ export interface UploadLimits {
   /** A conversation's title, as a rename stores it (docs/chat.md § Conversations, turns,
    *  events). Optional, as above. */
   conversation_title_max_chars?: number
+  /** The chat agent's memory file, as the Agent page's editor caps it (docs/chat.md
+   *  § Memory, *The memory file*). Optional, as above. */
+  memory_file_max_chars?: number
   /** How many days the Trash keeps an item before the worker deletes it for good; 0 never
    *  does (docs/workspace.md § The Trash). Optional only so a page served by an older API
    *  still renders. */
@@ -223,7 +229,7 @@ export interface MemoryFields {
 
 // --- what the chat agent receives (docs/api.md, GET /api/agents/chat/context) -------------
 
-export type AgentContextPartKind = 'prompt' | 'preset' | 'instructions' | 'catalogue' | 'memory'
+export type AgentContextPartKind = 'prompt' | 'preset' | 'instructions' | 'catalogue' | 'memory_file' | 'memory'
 
 export interface AgentContextPart {
   kind: AgentContextPartKind
@@ -525,6 +531,20 @@ export interface Conversation {
   title: string | null
   created_at: string
   updated_at: string
+  /** The model its later turns run on; null until the first turn chose one. Optional only
+   *  so a page served by an older API still renders (docs/chat.md § Conversations). */
+  model?: string | null
+  /** What the panel's context ring reads (docs/chat.md § Compaction, *The cache clock and
+   *  the context*): the summary row the replay starts from, whether there is an answer to
+   *  compact since it, the tokens the last call replayed (null after a compaction, until
+   *  the next call), the model's window, when the prompt cache expires (null when the last
+   *  call wrote none) and what a cold re-read would cost. */
+  compacted_message_id?: number | null
+  compactable?: boolean
+  context_tokens?: number | null
+  context_window?: number
+  cache_warm_until?: string | null
+  recache_credits?: number | null
 }
 
 export interface ConversationDetail extends Conversation {
@@ -602,8 +622,14 @@ export interface ChatMessage {
 
 export type TurnStatus = 'queued' | 'running' | 'done' | 'failed' | 'cancelled' | string
 
+/** A user message's turn, or a compaction the reader asked for or the worker ran on its
+ *  own (docs/chat.md § Compaction). */
+export type TurnKind = 'message' | 'compact' | 'idle_compact' | string
+
 export interface ChatTurn {
   id: string
+  /** Absent from a record served by an older API: a message turn. */
+  kind?: TurnKind
   status: TurnStatus
   error: string | null
   /** What the turn cost, once settled; null while unsettled, absent from a record served by
@@ -638,6 +664,8 @@ type ChatEventData =
   | {
       event: 'turn_start'
       model: string
+      /** The turn's kind (docs/chat.md § Compaction); absent on turns from before it. */
+      kind?: TurnKind
       /** Whether the turn had the reader's instructions, and the memories it loaded
        *  (docs/chat.md § Memory). Absent on turns from before both existed. */
       instructions?: boolean
@@ -1443,7 +1471,29 @@ export function cancelTurn(id: number): Promise<void> {
 /** The reader's title for a thread; the answer is the title as the server cleaned it, and
  *  the thread keeps its place in the list (docs/chat.md § Conversations, turns, events). */
 export function renameConversation(id: number, title: string): Promise<Conversation> {
-  return request('PUT', `/api/conversations/${id}`, { title })
+  return updateConversation(id, { title })
+}
+
+/** A rename, a move to another model for the conversation's later turns, or both: 400 for a
+ *  model the chat agent does not offer, 409 for a move while a turn of it is unfinished
+ *  (docs/api.md). The answer is the conversation as the list gives it. */
+export function updateConversation(
+  id: number,
+  body: { title?: string; model?: string },
+): Promise<Conversation> {
+  return request('PUT', `/api/conversations/${id}`, body)
+}
+
+/** The chat agent's memory file as it is now, and how much of it a turn reads (docs/chat.md
+ *  § Memory, *The memory file*). */
+export function getMemoryFile(): Promise<{ text: string; max_chars: number }> {
+  return request('GET', '/api/agents/chat/memory-file')
+}
+
+/** Saves the memory file as a revision of the reader's own: 400 past `max_chars`, 409 while
+ *  a turn of the reader is unfinished. The answer is the text as stored. */
+export function putMemoryFile(text: string): Promise<{ text: string }> {
+  return request('PUT', '/api/agents/chat/memory-file', { text })
 }
 
 export function deleteConversation(id: number): Promise<void> {

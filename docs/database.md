@@ -28,6 +28,10 @@ agent_settings   (user_id FK, agent) PK,
                                                   -- deployment's
                  effort low|medium|high|xhigh|max NOT NULL DEFAULT 'medium',
                                                   -- the chat agent's reasoning depth
+                 idle_compact BOOLEAN NOT NULL DEFAULT true,
+                                                  -- chat: the worker compacts the user's
+                                                  -- long conversations before their cache
+                                                  -- expires (chat.md § Compaction)
                  prompt TEXT NULL,                -- the user's own template; NULL = the
                                                   -- agent's default (agents.md)
                  prompt_preset_id FK NULL,        -- prompt_presets, the legacy selection;
@@ -191,14 +195,28 @@ usage_log        id PK, user_id FK, job_id FK NULL, turn_id FK chat_turns NULL,
                  INDEX (job_id)                   -- a job delete's SET NULL reads it
                  CHECK (cost_source IN (...) AND (cost_source = 'unknown') = (cost IS NULL))
 conversations    id PK, user_id FK, document_id FK documents, title, session,
-                 model NULL, memory_ids JSONB NULL, created_at, updated_at
+                 model NULL, memory_ids JSONB NULL, memory_file TEXT NULL,
+                 compacted_message_id NULL,          -- a messages.id, no FK (below)
+                 context_tokens NULL, cache_warm_until NULL, created_at, updated_at
                  INDEX (document_id, updated_at)
+                 INDEX (cache_warm_until) WHERE cache_warm_until IS NOT NULL
                  -- one thread of the chat agent about one document (chat.md);
                  -- `session` names its shell in the user's sandbox; `model` is
                  -- set by the first turn and kept: the stored thinking blocks
                  -- belong to it (chat.md § History); `memory_ids` is the memory
                  -- snapshot its first turn took, in render order, NULL until a
-                 -- turn took one (chat.md § Memory)
+                 -- turn took one (chat.md § Memory); `memory_file` the snapshot of
+                 -- memory.md its first turn took, NULL until then, '' for none,
+                 -- taken again by a compaction (chat.md § Memory, *The memory
+                 -- file*); `compacted_message_id` the summary row the replay
+                 -- starts from, NULL while never compacted — no foreign key:
+                 -- a message goes only with its conversation, and a key back
+                 -- to `messages` would close a cycle every DDL tool would have
+                 -- to break; `context_tokens`
+                 -- what the last model call replayed and produced, and
+                 -- `cache_warm_until` when the prompt cache it touched expires —
+                 -- what the idle compaction pass reads through the partial
+                 -- index (chat.md § Compaction)
 messages         id PK, conversation_id FK, role user|assistant, content JSONB,
                  turn_id FK chat_turns NULL, created_at
                  INDEX (conversation_id, id)
@@ -210,6 +228,7 @@ messages         id PK, conversation_id FK, role user|assistant, content JSONB,
                  -- id — the library and the workspace keep one namespace per level
                  -- (workspace.md § Layout)
 chat_turns       id UUID PK, user_id FK, conversation_id FK, message_id FK messages,
+                 kind message|compact|idle_compact NOT NULL DEFAULT 'message',
                  status queued|running|succeeded|failed|cancelled, error NULL,
                  locale, created_at, started_at NULL, finished_at NULL
                  INDEX (status, created_at)
@@ -217,7 +236,9 @@ chat_turns       id UUID PK, user_id FK, conversation_id FK, message_id FK messa
                                                   -- the stream's "is a turn unfinished"
                                                   -- poll, sends, cancels and deletes all
                                                   -- ask by conversation
-                 -- the chat agent's queue, one row per user message, claimed like jobs
+                 -- the chat agent's queue, one row per user message — or per
+                 -- compaction, `kind` saying which (chat.md § Compaction) —
+                 -- claimed like jobs
 chat_events      id PK, conversation_id FK, turn_id FK, seq, event, data JSONB,
                  created_at
                  UNIQUE (conversation_id, seq)
@@ -359,6 +380,7 @@ pack_checkouts   user_id PK/FK, pack_id, idempotency_key UNIQUE,
 - **The ledger migration** (`credit entries outlive turns`) changed `credit_entries.turn_id` from `ON DELETE CASCADE` to `ON DELETE SET NULL` and replaced the check that a chat entry has a turn with one that a parse entry has none: a conversation deleted by its reader takes its turns and leaves their entries behind, still counted in the period and in `/api/billing/entries`. No row is rewritten. Its downgrade restores the cascade and refuses while any chat entry has no turn, naming the count — those entries would otherwise have to be deleted from the billing record.
 - **The library files migration** (`library files`) added `documents.kind` — `parse`, `markdown` or `file`; NOT NULL, default `parse` — backfilled from `job_id` (a row with a job is a `parse`, one without a `markdown`), `documents.media_type` and `documents.size_bytes` (NULL on every existing row: only a file carries them) and `agent_settings.auto_convert` (true). No row is rewritten otherwise. Its downgrade refuses while any row is a file, naming the count — without `kind` those rows would read as markdown documents whose text no route could find — and otherwise drops the four columns.
 - **The chat tool calls migration** (`chat tool calls`) created `chat_tool_calls`, empty, with its indexes; no existing row is read or rewritten, and nothing reads it until a turn makes a web tool call ([chat.md](./chat.md) § Tools). Its downgrade drops the table — the day's counts and the record behind the searches already charged are lost with it, the entries themselves not.
+- **The compaction migration** (`conversation compaction and memory file`) added `chat_turns.kind` (`message` on every row), `agent_settings.idle_compact` (`true` on every row: idle compaction is on unless the reader turns it off), and on `conversations` the nullable `memory_file`, `compacted_message_id` (a message id without a foreign key, since a message goes only with its conversation), `context_tokens` and `cache_warm_until`, NULL on every row, with the partial index the idle compaction pass reads ([chat.md](./chat.md) § Compaction, § Memory). No row is read or rewritten: an open conversation goes on as it was, takes its memory file snapshot at its next turn, and is first measured by its next model call. Its downgrade drops the columns and the index; a conversation compacted meanwhile then replays its whole history again, the summary row among it.
 - **The credit packs migration** (`credit packs`) created `credit_packs`, `credit_pack_entries` and `pack_checkouts`, empty, with their constraints and indexes ([billing.md](./billing.md) § The ledger). No existing row is read or rewritten: nothing changes for a user until a pack is bought. Its downgrade drops the three tables and nothing else — packs already bought are lost with them, so it is not run on a database that sold one.
 - **The reader views migration** (`reader views`) added `users.default_view` (`markdown` on every row) and `documents.view` (NULL on every row), and turned `agent_settings.auto_convert` off: its default became `false` and every existing row was set to `false` — the switch had been on for everyone as the default the library files migration gave it, and since 2026-10-26 an uploaded PDF or image is kept as it is until the reader asks for Markdown ([web.md](./web.md) § Files). Its downgrade drops the two columns and restores the default of `true`; the rows stay off.
 - **The parse retention migration** (`parse retention and account deletion`) did the same for `credit_entries.job_id`: `fk_credit_entries_job_id_jobs` went from `ON DELETE CASCADE` to `ON DELETE SET NULL`, and `ck_credit_entries_parse_job`, which held that an entry has a job exactly when it is a parse, became the check that a chat entry has no job (`kind = 'parse' OR job_id IS NULL`): a parse the retention deletes ([jobs.md](./jobs.md) § Retention) leaves its entry behind, still counted in its period and in `/api/billing/entries`. It added the indexes the purge and a job's foreign-key actions read, `ix_documents_job_id` and `ix_usage_log_job_id`, and the partial `ix_documents_trashed_at` and `ix_folders_trashed_at` (`WHERE trashed_at IS NOT NULL`) the Trash's expiry reads. No row is rewritten and none is deleted: the parses already past their time go at the first sweep after the deploy. Its downgrade drops the four indexes, restores the cascade and the old check, and refuses while any parse entry has no job, naming the count — those entries would otherwise have to be deleted from the billing record.

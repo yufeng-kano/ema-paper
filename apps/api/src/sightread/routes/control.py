@@ -63,6 +63,7 @@ from ..db.models import (
 from ..errors import ApiError
 from ..jobs import chat_memory, chat_runner
 from ..jobs.intake import PDF_MEDIA_TYPE
+from ..jobs.queue import count_active_turns
 from ..jobs.sweeper import discard_account
 from ..parsing.attachments import ATTACHMENT_EXTENSIONS
 from ..parsing.images import ACCEPTED_IMAGE_TYPES
@@ -77,6 +78,7 @@ from ..workspace.documents import (
 )
 from ..workspace.layout import user_root
 from ..workspace.locks import workspace_lock
+from ..workspace.memory_file import memory_file_text, write_memory_file
 from ..workspace.trash import lock_user
 from .billing import me_fields
 from .chat import TITLE_MAX_CHARS, owned_document, turn_note
@@ -246,6 +248,8 @@ async def me(user: SessionUser, db: DbSession, settings: AppSettings):
             "selection_max_chars": settings.chat_selection_max_chars,
             # A conversation's rename field (docs/chat.md § Conversations, turns, events).
             "conversation_title_max_chars": TITLE_MAX_CHARS,
+            # The Agent page's memory file editor (docs/chat.md § Memory, *The memory file*).
+            "memory_file_max_chars": settings.chat_memory_file_max_chars,
             # How long the Trash keeps an item, which its tab states; 0 = never emptied by
             # itself (docs/workspace.md § The Trash).
             "trash_retention_days": settings.trash_retention_days,
@@ -643,6 +647,9 @@ def _agent_settings_payload(settings: AppSettings, agent: str, row: AgentSetting
         "translate_language": row.translate_language if row else None,
         "memory_auto": row.memory_auto if row and row.memory_auto is not None else True,
         "memory_paused": bool(row.memory_paused) if row else False,
+        # And whether the worker compacts the reader's long conversations before their
+        # cache expires (docs/chat.md § Compaction).
+        "idle_compact": row.idle_compact if row and row.idle_compact is not None else True,
         # The parse agent's own: the model a blocked page goes to — the deployment's, a
         # fact — and whether it goes there on its own (docs/parsing.md § Fallback model).
         "fallback_model": (settings.parse_fallback_model or None) if agent == PARSE.name else None,
@@ -719,6 +726,7 @@ class AgentSettingsPut(BaseModel):
     translate_language: str | None = None
     memory_auto: bool | None = None
     memory_paused: bool | None = None
+    idle_compact: bool | None = None
     # The parse agent's own (docs/agents.md).
     auto_fallback: bool | None = None
     auto_convert: bool | None = None
@@ -734,6 +742,7 @@ SETTING_OWNERS: dict[str, tuple[str, ...]] = {
     "translate_language": (CHAT.name,),
     "memory_auto": (CHAT.name,),
     "memory_paused": (CHAT.name,),
+    "idle_compact": (CHAT.name,),
     "auto_fallback": (PARSE.name,),
     "auto_convert": (PARSE.name,),
     "auto_check": (CHECK.name,),
@@ -781,7 +790,14 @@ async def put_agent_settings(
         raise ApiError(
             400, "invalid_request", f"The {agent.name} agent takes no {', '.join(foreign)}"
         )
-    for switch in ("memory_auto", "memory_paused", "auto_fallback", "auto_convert", "auto_check"):
+    for switch in (
+        "memory_auto",
+        "memory_paused",
+        "idle_compact",
+        "auto_fallback",
+        "auto_convert",
+        "auto_check",
+    ):
         if switch in provided and getattr(body, switch) is None:
             raise ApiError(400, "invalid_request", f"{switch} is true or false")
     instructions = (
@@ -792,15 +808,16 @@ async def put_agent_settings(
     prompt: str | None = None
     if "prompt" in provided:
         prompt = (body.prompt or "").strip() or None
+        # The default stored as no prompt, so a later default reaches it — before the cap,
+        # which is the reader's own prompt's, not the default's.
+        if prompt == agent.default_prompt_template.strip():
+            prompt = None
         if prompt is not None and len(prompt) > settings.system_prompt_max_chars:
             raise ApiError(
                 400,
                 "invalid_request",
                 f"The prompt exceeds {settings.system_prompt_max_chars} characters",
             )
-        # The default stored as no prompt, so a later default reaches it.
-        if prompt == agent.default_prompt_template.strip():
-            prompt = None
     if prompt is not None and body.prompt_preset_id is not None:
         # The two exclude each other (docs/agents.md § Per-agent settings).
         raise ApiError(400, "invalid_request", "Send either prompt or prompt_preset_id")
@@ -858,6 +875,8 @@ async def put_agent_settings(
         row.memory_auto = bool(body.memory_auto)
     if "memory_paused" in provided:
         row.memory_paused = bool(body.memory_paused)
+    if "idle_compact" in provided:
+        row.idle_compact = bool(body.idle_compact)
     try:
         await db.commit()
     except IntegrityError as exc:
@@ -932,6 +951,10 @@ async def chat_agent_context(
         instructions=setting.instructions if setting else None,
         catalogue=chat_runner.turn_catalogue(skills, subagents),
         memory=memory_defs.render_memory_block(loaded, auto=auto, paused=paused),
+        # The memory file as a new conversation would read it (docs/chat.md § Memory).
+        memory_file=chat_agent.render_memory_file(
+            await memory_file_text(settings, user.id), settings.chat_memory_file_max_chars
+        ),
     )
     extras = {
         "prompt": {"own": own_prompt is not None},
@@ -960,6 +983,51 @@ async def chat_agent_context(
         "turn": {"text": turn, "chars": len(turn)},
         "facts": facts,
     }
+
+
+@router.get("/agents/chat/memory-file")
+async def read_memory_file(user: SessionUser, settings: AppSettings):
+    """The chat agent's memory file as it is now, and how much of it a turn reads
+    (docs/chat.md § Memory, *The memory file*)."""
+    return {
+        "text": await memory_file_text(settings, user.id),
+        "max_chars": settings.chat_memory_file_max_chars,
+    }
+
+
+class MemoryFilePut(BaseModel):
+    text: str
+
+
+@router.put("/agents/chat/memory-file", dependencies=[CsrfGuard])
+async def put_memory_file(
+    body: MemoryFilePut, user: SessionUser, db: DbSession, settings: AppSettings
+):
+    """The reader's own text, written as a revision of theirs under the workspace lock —
+    taken first, then the user's row, the order every workspace mutation takes — and
+    refused while any turn of the reader is unfinished, since a turn may be writing it
+    (docs/chat.md § Memory, *The memory file*)."""
+    text = memory_defs.clean_text(body.text, single_line=False)
+    if len(text) > settings.chat_memory_file_max_chars:
+        raise ApiError(
+            400,
+            "invalid_request",
+            f"The memory file exceeds {settings.chat_memory_file_max_chars} characters",
+        )
+    stored = f"{text}\n" if text else ""
+    root = user_root(settings.workspaces_dir, user.id)
+    async with workspace_lock(root):
+        # The send's lock: no turn is queued under the decision below.
+        await db.execute(select(User.id).where(User.id == user.id).with_for_update())
+        if await count_active_turns(db, user.id):
+            raise ApiError(
+                409,
+                "invalid_request",
+                "A conversation is still answering; wait for it to finish before saving",
+            )
+        await asyncio.to_thread(write_memory_file, root, stored, settings.content_max_bytes)
+        await db.commit()
+    return {"text": stored}
 
 
 @router.get("/agents/{agent_name}/models")

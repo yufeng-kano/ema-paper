@@ -751,6 +751,7 @@ async def test_the_instructions_follow_the_prompt_and_preset_verbatim(chat_clien
     start = turn_starts(await replayed_events(client, conversation_id))[0]
     assert start == {
         "model": "claude-code/claude-opus-5-5",
+        "kind": "message",
         "instructions": True,
         "memory_ids": [],
         "turn_id": start["turn_id"],

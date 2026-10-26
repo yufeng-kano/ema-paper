@@ -66,6 +66,15 @@ class ChatUsage:
     # None exactly when `cost_source` is unknown (docs/parsing.md § Upstream usage).
     cost: Decimal | None
     cost_source: str
+    # Whether the usage came from the Anthropic API itself, which reports a `cache_creation`
+    # object — the one usage whose cache figures speak of the 1-hour prompt cache; a
+    # conversion path reports none (docs/chat.md § Compaction).
+    cache_native: bool = False
+
+    @property
+    def cached(self) -> bool:
+        """The call read or wrote the prompt cache of the Anthropic API."""
+        return self.cache_native and (self.cache_read_tokens > 0 or self.cache_write_tokens > 0)
 
 
 @dataclass(frozen=True)
@@ -120,6 +129,7 @@ class StreamProgress:
             cache_write_tokens=_int(self.usage.get("cache_creation_input_tokens")),
             cost=None,
             cost_source=COST_SOURCE_UNKNOWN,
+            cache_native=isinstance(self.usage.get("cache_creation"), dict),
         )
 
 
@@ -153,6 +163,7 @@ def _usage(raw: dict, *, output_tokens: int) -> ChatUsage:
         cache_write_tokens=_int(raw.get("cache_creation_input_tokens")),
         cost=cost,
         cost_source=source,
+        cache_native=isinstance(raw.get("cache_creation"), dict),
     )
 
 
@@ -380,6 +391,7 @@ async def stream_messages(
                         "input_tokens",
                         "cache_read_input_tokens",
                         "cache_creation_input_tokens",
+                        "cache_creation",
                         "cost",
                     ):
                         if key in usage:
