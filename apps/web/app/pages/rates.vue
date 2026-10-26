@@ -188,7 +188,10 @@ function rate(value: number): string {
     0 4px 14px var(--glass-shadow);
 }
 
+/* Narrower than the page tables: five short columns of figures, inside the reading column. */
 .rates-sheet {
+  --table-min: 32rem;
+
   overflow-x: auto;
   overscroll-behavior-x: contain;
   padding: var(--space-2) var(--space-3);
