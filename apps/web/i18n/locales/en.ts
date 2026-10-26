@@ -579,6 +579,7 @@ export default {
         formula: 'Ask the agent about this formula',
         block: 'Ask the agent about this block',
         blocks: 'Ask the agent about these blocks',
+        excerpt: 'Ask the agent about this excerpt',
       },
       translate: {
         paragraph: 'Translate this paragraph',

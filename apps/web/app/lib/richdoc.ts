@@ -603,6 +603,9 @@ export function inlineMathAtEnd(text: string): { index: number; tex: string } | 
 /** What *Turn into…* offers (docs/web.md § Editing, *Turning a block into another*). */
 export type BlockKindName = 'paragraph' | 'heading' | 'subheading' | 'bulleted' | 'numbered' | 'quote' | 'formula' | 'code'
 
+/** The submenu's kinds, in its order — the document's block menu and the notes' alike. */
+export const TURN_KINDS: readonly BlockKindName[] = ['paragraph', 'heading', 'subheading', 'bulleted', 'numbered', 'quote', 'formula', 'code']
+
 /** A block's kind as *Turn into…* names it, or null for the kinds that cannot be turned — a
  *  figure, a table, a contents run, a comment. A `#` heading is a *Heading*. */
 export function blockKindName(block: ResultBlock): BlockKindName | null {

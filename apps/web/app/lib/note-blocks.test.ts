@@ -4,10 +4,12 @@ import { EditorState, TextSelection } from '@tiptap/pm/state'
 import { describe, expect, it } from 'vitest'
 import {
   UnitSelection,
+  convertUnit,
   deleteUnit,
   moveUnit,
   movesNothing,
   noteUnits,
+  sectionMarkdown,
   slotAtY,
   slotY,
   stepSlot,
@@ -162,6 +164,62 @@ describe('a move', () => {
     expect(written(state)).toBe('Two\n\nOne\n\nThree')
     undo(state, (next) => (state = state.apply(next)))
     expect(written(state)).toBe('One\n\nTwo\n\nThree')
+  })
+})
+
+describe('a conversion', () => {
+  it('turns a unit as the document turns a block, in its place, the rest keeping its bytes', () => {
+    const state = notes('Intro\n\nA *thought* here.\n\n- *kept* as written')
+    const tr = state.tr
+    const at = convertUnit(tr, noteUnits(state.doc), 1, 'heading', { cites: true })
+    const after = state.apply(tr)
+    expect(written(after)).toBe('Intro\n\n## A *thought* here.\n\n- *kept* as written')
+    expect(unitIndexAt(noteUnits(after.doc), at!)).toBe(1)
+  })
+
+  it('leaves a list turned into paragraphs as one unit per item, the first in its place', () => {
+    const state = notes('- one\n- two\n\nAfter.')
+    const tr = state.tr
+    expect(convertUnit(tr, noteUnits(state.doc), 0, 'paragraph', { cites: true })).toBe(0)
+    const after = state.apply(tr)
+    expect(written(after)).toBe('one\n\ntwo\n\nAfter.')
+    expect(noteUnits(after.doc)).toHaveLength(3)
+  })
+
+  it('turns nothing on an excerpt, a table or the kind the unit already is', () => {
+    const state = notes(`${EXCERPT}\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\nPlain.`)
+    const units = noteUnits(state.doc)
+    expect(units).toHaveLength(3)
+    expect(convertUnit(state.tr, units, 0, 'paragraph', { cites: true })).toBeNull()
+    expect(convertUnit(state.tr, units, 1, 'heading', { cites: true })).toBeNull()
+    expect(convertUnit(state.tr, units, 2, 'paragraph', { cites: true })).toBeNull()
+  })
+
+  it('is one step of the editor history: one undo puts it back', () => {
+    const before = notes('One\n\nTwo')
+    const tr = closeHistory(before.tr)
+    convertUnit(tr, noteUnits(before.doc), 1, 'quote', { cites: true })
+    let state = before.apply(tr)
+    expect(written(state)).toBe('One\n\n> Two')
+    undo(state, (next) => (state = state.apply(next)))
+    expect(written(state)).toBe('One\n\nTwo')
+  })
+})
+
+describe('what a unit asks about', () => {
+  it("is a heading with its section, to the next heading of its level or a higher one", () => {
+    const state = notes('## A\n\nUnder A.\n\n### A.1\n\nDeeper.\n\n## B\n\nUnder B.')
+    const units = noteUnits(state.doc)
+    expect(sectionMarkdown(state.doc, units, 0)).toBe('## A\n\nUnder A.\n\n### A.1\n\nDeeper.')
+    expect(sectionMarkdown(state.doc, units, 2)).toBe('### A.1\n\nDeeper.')
+    expect(sectionMarkdown(state.doc, units, 4)).toBe('## B\n\nUnder B.')
+  })
+
+  it('is any other unit on its own — an excerpt as its quote and link line', () => {
+    const state = notes(`## A\n\nUnder A.\n\n${EXCERPT}`)
+    const units = noteUnits(state.doc)
+    expect(sectionMarkdown(state.doc, units, 1)).toBe('Under A.')
+    expect(sectionMarkdown(state.doc, units, 2)).toBe(EXCERPT)
   })
 })
 
