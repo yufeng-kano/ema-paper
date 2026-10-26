@@ -6,6 +6,7 @@ only inside respx."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -21,6 +22,7 @@ from sightread.billing.plans import Pack, parse_packs
 from sightread.db.models import (
     ChatTurn,
     Conversation,
+    CreditEntry,
     CreditPack,
     CreditPackEntry,
     Document,
@@ -289,6 +291,93 @@ async def test_a_turn_spills_into_the_packs_before_the_overdraft(sessionmaker) -
             )
     assert (balance.remaining, balance.packs_remaining, balance.available) == (-1, 0, 0)
     assert (refused.value.need, refused.value.remaining) == (1, 0)
+
+
+async def test_two_turns_settling_at_once_share_the_period_before_the_pack(sessionmaker) -> None:
+    """The period row is locked before its balance is read: a turn settling while another
+    turn's settlement is open takes only what that one left of the period and spills the
+    rest into the pack, instead of both charging the period from the same stale remainder
+    (docs/billing.md § The ledger)."""
+    settings = settings_with(free_credits_per_period=10, credit_usd="0.001")
+    user_id = await _user(sessionmaker)
+    pack = await _pack(sessionmaker, user_id, credits=20)
+    async with sessionmaker() as db:
+        document = Document(user_id=user_id, name="d.md")
+        db.add(document)
+        await db.flush()
+        conversation = Conversation(user_id=user_id, document_id=document.id, session="s")
+        db.add(conversation)
+        await db.flush()
+        turn_ids = []
+        for message_id in (1, 2):
+            turn = ChatTurn(
+                user_id=user_id,
+                conversation_id=conversation.id,
+                message_id=message_id,
+                status="running",
+            )
+            db.add(turn)
+            await db.flush()
+            await ledger.reserve(
+                db,
+                settings,
+                user_id=user_id,
+                kind=ledger.CHAT,
+                amount=0,
+                turn_id=turn.id,
+                minimum=1,
+            )
+            turn_ids.append(turn.id)
+        await db.commit()
+
+    async def settle(db, turn_id: uuid.UUID) -> int | None:
+        # 8,000 tokens at US$1 per million = US$0.008: 8 credits a turn.
+        db.add(
+            UsageLog(
+                user_id=user_id,
+                turn_id=turn_id,
+                agent="chat",
+                model="m",
+                prompt_tokens=4000,
+                completion_tokens=4000,
+                cost_source="unknown",
+            )
+        )
+        await db.flush()
+        return await ledger.settle_chat(db, settings, turn_id)
+
+    async def second() -> int | None:
+        async with sessionmaker() as db:
+            left = await settle(db, turn_ids[1])
+            await db.commit()
+            return left
+
+    async with sessionmaker() as first:
+        # 8 of the period's 10; the pack's 20 untouched: 22 left to the turn.
+        assert await settle(first, turn_ids[0]) == 22
+        # The second turn settles while the first's settlement is still open: it waits
+        # for the period row, then takes the 2 the first left of it and 6 of the pack.
+        waiting = asyncio.ensure_future(second())
+        await asyncio.sleep(0.3)
+        assert not waiting.done()
+        await first.commit()
+    assert await waiting == 14
+    assert (await _period(sessionmaker, user_id)).spent == 10
+    assert await _spent(sessionmaker, pack) == 6
+    async with sessionmaker() as db:
+        entries = (
+            (
+                await db.execute(
+                    select(CreditEntry)
+                    .where(CreditEntry.turn_id.in_(turn_ids))
+                    .order_by(CreditEntry.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert [entry.amount for entry in entries] == [8, 8]
+    assert [await _shares(sessionmaker, entry.id) for entry in entries] == [{}, {pack: 6}]
 
 
 async def test_an_expired_or_refunded_pack_counts_nothing(sessionmaker) -> None:

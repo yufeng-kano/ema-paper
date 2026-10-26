@@ -199,22 +199,28 @@ async def period_row(
     return row, period
 
 
-async def _active_packs(db: AsyncSession, user_id: int, now: datetime) -> list[CreditPack]:
-    """The packs a charge may take from, locked, the one that expires first ahead
-    (docs/billing.md § Top-up packs)."""
+async def _lock_packs(db: AsyncSession, *where) -> list[CreditPack]:
+    """Pack rows locked in one statement, the one that expires first ahead: the ledger's
+    one order for them, after the period row (docs/billing.md § The ledger)."""
     return list(
         (
             await db.execute(
                 select(CreditPack)
-                .where(
-                    CreditPack.user_id == user_id,
-                    CreditPack.status == PACK_PAID,
-                    CreditPack.expires_at > now,
-                )
+                .where(*where)
                 .order_by(CreditPack.expires_at, CreditPack.id)
                 .with_for_update()
             )
         ).scalars()
+    )
+
+
+async def _active_packs(db: AsyncSession, user_id: int, now: datetime) -> list[CreditPack]:
+    """The packs a charge may take from, locked (docs/billing.md § Top-up packs)."""
+    return await _lock_packs(
+        db,
+        CreditPack.user_id == user_id,
+        CreditPack.status == PACK_PAID,
+        CreditPack.expires_at > now,
     )
 
 
@@ -247,6 +253,10 @@ async def _take(
     § The ledger, § Top-up packs)."""
     now = now or utcnow()
     row, period = await period_row(db, settings, user_id, now)
+    # The period row's lock before the packs', as every path takes them (docs/billing.md
+    # § The ledger): a settlement running beside this charge waits here or is waited for,
+    # never both.
+    await db.refresh(row, with_for_update=True)
     packs = await _active_packs(db, user_id, now)
     period_left = max(0, row.granted - row.spent)
     available = period_left + sum(_left(pack) for pack in packs)
@@ -362,23 +372,24 @@ async def _move_spent(db: AsyncSession, entry: CreditEntry, delta: int) -> None:
 
 async def _give_back(db: AsyncSession, entry: CreditEntry) -> None:
     """A release restores each share where it came from: a pack's to that pack, expired
-    or not, and the rest to the period (docs/billing.md § Top-up packs)."""
-    shares = (
-        (await db.execute(select(CreditPackEntry).where(CreditPackEntry.entry_id == entry.id)))
-        .scalars()
-        .all()
-    )
-    from_packs = 0
-    for share in shares:
+    or not, and the rest to the period — the period row first, then the packs in their
+    one order (docs/billing.md § Top-up packs, § The ledger)."""
+    shares = {
+        share.pack_id: share.amount
+        for share in (
+            await db.execute(select(CreditPackEntry).where(CreditPackEntry.entry_id == entry.id))
+        ).scalars()
+    }
+    await _move_spent(db, entry, -(entry.amount - sum(shares.values())))
+    if not shares:
+        return
+    for pack in await _lock_packs(db, CreditPack.id.in_(list(shares))):
         await db.execute(
             update(CreditPack)
-            .where(CreditPack.id == share.pack_id)
-            .values(spent=CreditPack.spent - share.amount, updated_at=utcnow())
+            .where(CreditPack.id == pack.id)
+            .values(spent=CreditPack.spent - shares[pack.id], updated_at=utcnow())
         )
-        from_packs += share.amount
-    if shares:
-        await db.execute(delete(CreditPackEntry).where(CreditPackEntry.entry_id == entry.id))
-    await _move_spent(db, entry, -(entry.amount - from_packs))
+    await db.execute(delete(CreditPackEntry).where(CreditPackEntry.entry_id == entry.id))
 
 
 async def settle_parse(db: AsyncSession, job_id: uuid.UUID, status: str) -> None:
@@ -408,7 +419,9 @@ async def _spill(db: AsyncSession, entry: CreditEntry, delta: int, now: datetime
     the overdraft (docs/billing.md § A chat turn, § Top-up packs)."""
     period = await db.get(CreditPeriod, (entry.user_id, entry.period_start))
     if period is not None:
-        await db.refresh(period)
+        # Locked before its balance is read, so two turns of one user settling at once
+        # see what the other left, and before the packs, as a charge locks them.
+        await db.refresh(period, with_for_update=True)
     into_period = min(delta, max(0, period.granted - period.spent)) if period else 0
     rest = delta - into_period
     packs = await _active_packs(db, entry.user_id, now) if rest > 0 else []
