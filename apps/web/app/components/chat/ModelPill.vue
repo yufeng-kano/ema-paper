@@ -158,10 +158,13 @@ async function onSelect(key: string) {
   try {
     if (key.startsWith(MODEL_KEY)) {
       const id = key.slice(MODEL_KEY.length)
+      // The conversation the pick was made in, decided before the save: the reader may
+      // open another while it is answered, and the pick said nothing about that one.
+      const target = props.conversation
+      const moves = target !== null && !props.running && target.model !== id
       emit('saved', await putAgentSettings(CHAT_AGENT, { model: id }))
-      const open = props.conversation
-      if (open && !props.running && open.model !== id) {
-        emit('moved', await updateConversation(open.id, { model: id }))
+      if (moves && target) {
+        emit('moved', await updateConversation(target.id, { model: id }))
       }
     } else if (key.startsWith(EFFORT_KEY)) {
       emit('saved', await putAgentSettings(CHAT_AGENT, { effort: key.slice(EFFORT_KEY.length) as AgentEffort }))

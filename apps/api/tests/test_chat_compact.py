@@ -5,6 +5,7 @@ reaches the network (docs/testing.md § Cost safety)."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -27,16 +28,17 @@ from sightread.db.models import (
     CreditPeriod,
     Message,
 )
-from sightread.jobs import chat_compact
+from sightread.jobs import chat_compact, chat_runner
 from sightread.upstream.anthropic import ChatUsage
 from sightread.workspace import git
 from sightread.workspace.layout import user_root
+from sightread.workspace.locks import mark_writing, workspace_lock
+from sightread.workspace.memory_file import memory_file_text
 from tests.conftest import CSRF_HEADERS
 from tests.test_chat import MESSAGES_URL, _run_queued_turn, sse
 from tests.test_chat_extensions import (
     chatting_client,
     new_conversation,
-    one_call,
     replayed_events,
     send,
     stub_messages,
@@ -218,24 +220,43 @@ async def test_a_compaction_that_answers_nothing_fails_and_is_not_replayed(chat_
 async def test_a_compaction_updates_the_memory_file_within_its_own_allowance(
     make_client, tmp_path
 ) -> None:
-    """The compaction may call tools up to `CHAT_COMPACT_MAX_TOOL_CALLS`; the call after
-    the cap takes no tool, and its text is the summary. A file the agent wrote to
-    `/workspace/memory.md` is the snapshot the compacted conversation goes on with, and the
-    next turn's system prompt carries it (docs/chat.md § Compaction, § Memory)."""
+    """The compaction may call tools up to `CHAT_COMPACT_MAX_TOOL_CALLS`, counted across
+    its rounds: a round that asks for more runs the first of them and answers the rest
+    with an error, and the call after the cap takes no tool — its text is the summary. A
+    file the agent wrote to `/workspace/memory.md` is the snapshot the compacted
+    conversation goes on with, and the next turn's system prompt carries it (docs/chat.md
+    § Compaction, § Memory)."""
     client = await chatting_client(
         make_client(workspaces_dir=str(tmp_path / "workspaces"), chat_compact_max_tool_calls=1)
     )
     main, _ = stub_messages(
         [
             DONE,
-            one_call(
-                "e1",
-                "str_replace_based_edit_tool",
-                {
-                    "command": "create",
-                    "path": "/workspace/memory.md",
-                    "file_text": "## Conventions\n\n- Tables, never lists\n",
-                },
+            (
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "e1",
+                        "name": "str_replace_based_edit_tool",
+                        "input": {
+                            "command": "create",
+                            "path": "/workspace/memory.md",
+                            "file_text": "## Conventions\n\n- Tables, never lists\n",
+                        },
+                    },
+                    # Past the allowance in the same round: answered, never run.
+                    {
+                        "type": "tool_use",
+                        "id": "e2",
+                        "name": "str_replace_based_edit_tool",
+                        "input": {
+                            "command": "create",
+                            "path": "/workspace/notes.md",
+                            "file_text": "never written\n",
+                        },
+                    },
+                ],
+                "tool_use",
             ),
             SUMMARY,
             DONE,
@@ -250,8 +271,15 @@ async def test_a_compaction_updates_the_memory_file_within_its_own_allowance(
     await _run_queued_turn(client)
     assert "tool_choice" not in main[1]
     assert main[2]["tool_choice"] == {"type": "none"}
+    results = main[2]["messages"][-1]["content"]
+    assert [(block["tool_use_id"], block.get("is_error", False)) for block in results] == [
+        ("e1", False),
+        ("e2", True),
+    ]
+    assert results[1]["content"] == chat_runner.NOT_RUN_COMPACT_ALLOWANCE
     root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
     assert (root / "memory.md").read_text() == "## Conventions\n\n- Tables, never lists\n"
+    assert not (root / "notes.md").exists()
     assert [revision.message for revision in git.log(root, Path("memory.md"))] == [
         "create /workspace/memory.md"
     ]
@@ -272,6 +300,77 @@ async def test_a_compaction_updates_the_memory_file_within_its_own_allowance(
     )
     assert memory_file == chat_agent.MEMORY_FILE_INTRO + "## Conventions\n\n- Tables, never lists"
     assert kinds.index("# Memory file") == kinds.index("# Memory") - 1
+
+
+@respx.mock
+async def test_a_cancel_after_the_summary_is_stored_sets_no_boundary(
+    chat_client, monkeypatch
+) -> None:
+    """The boundary is set with the terminal state: a cancel that lands once the summary
+    row is stored but before the turn's finish ends a cancelled turn that set nothing, and
+    the row it left is replayed by no later turn (docs/chat.md § Compaction)."""
+    main, _ = stub_messages([DONE, SUMMARY, DONE])
+    conversation_id = await new_conversation(chat_client)
+    await send(chat_client, conversation_id, text="use tables")
+    await _run_queued_turn(chat_client)
+
+    store = chat_runner._store_summary
+
+    async def store_then_cancel(ctx, content) -> None:
+        await store(ctx, content)
+        async with chat_client.app.state.sessionmaker() as db:
+            turn = await db.get(ChatTurn, ctx.turn.id)
+            turn.status = "cancelled"
+            await db.commit()
+
+    monkeypatch.setattr(chat_runner, "_store_summary", store_then_cancel)
+    await send(chat_client, conversation_id, text="", command="compact")
+    await _run_queued_turn(chat_client)
+    row = await conversation_row(chat_client, conversation_id)
+    assert row.compacted_message_id is None
+    turns = (await detail(chat_client, conversation_id))["turns"]
+    assert [(turn["kind"], turn["status"]) for turn in turns] == [
+        (MESSAGE_TURN, "succeeded"),
+        (COMPACT_TURN, "cancelled"),
+    ]
+    async with chat_client.app.state.sessionmaker() as db:
+        stored = (
+            (
+                await db.execute(
+                    select(Message.content)
+                    .where(Message.conversation_id == conversation_id)
+                    .order_by(Message.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert chat_compact.is_summary(stored[-1])
+
+    monkeypatch.setattr(chat_runner, "_store_summary", store)
+    await send(chat_client, conversation_id, text="go on")
+    await _run_queued_turn(chat_client)
+    # The first turn's exchange and the new message: nothing of the cancelled compaction.
+    assert [message["role"] for message in main[2]["messages"]] == ["user", "assistant", "user"]
+    assert "## Requests" not in json.dumps(main[2]["messages"])
+
+
+async def test_the_memory_file_is_read_under_the_workspace_lock(chat_client) -> None:
+    """A snapshot waits for the workspace lock a shell command of another conversation
+    holds for its whole run, so the file is never read half-written; a dead worker's
+    writing marker is no writer in flight and refuses no read (docs/chat.md § Memory,
+    *The memory file*)."""
+    settings = chat_client.app.state.settings
+    root = user_root(settings.workspaces_dir, chat_client.user_id)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "memory.md").write_text("notes\n")
+    async with workspace_lock(root):
+        reading = asyncio.create_task(memory_file_text(settings, chat_client.user_id))
+        await asyncio.sleep(0.05)
+        assert not reading.done()
+    assert await reading == "notes\n"
+    mark_writing(root, 1, "dead")
+    assert await memory_file_text(settings, chat_client.user_id) == "notes\n"
 
 
 # --- the cache clock ------------------------------------------------------------------------

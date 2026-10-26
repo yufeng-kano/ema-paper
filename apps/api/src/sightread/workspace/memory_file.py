@@ -15,6 +15,7 @@ from ..config import Settings
 from ..errors import ApiError
 from . import git, safe_io
 from .layout import user_root
+from .locks import workspace_lock
 
 MEMORY_FILE = "memory.md"
 NOT_PLAIN = "The memory file is not a plain text file"
@@ -32,12 +33,17 @@ def read_memory_file(root: Path, max_bytes: int) -> str:
 
 
 async def memory_file_text(settings: Settings, user_id: int) -> str:
-    """The file as it is now, read off the thread; a workspace that does not exist yet has
-    none."""
+    """The file as it is now, read off the thread under the workspace lock: a shell command
+    of another conversation writing it in place holds that lock for the command's whole
+    run, so the file is never read half-written. The caller holds no database row lock,
+    the order every workspace mutation keeps (docs/workspace.md § Revisions). A standing
+    writing marker is a dead worker's — no writer in flight — and refuses no read. A
+    workspace that does not exist yet has none."""
     root = user_root(settings.workspaces_dir, user_id)
     if not root.is_dir():
         return ""
-    return await asyncio.to_thread(read_memory_file, root, settings.content_max_bytes)
+    async with workspace_lock(root, recovering=True):
+        return await asyncio.to_thread(read_memory_file, root, settings.content_max_bytes)
 
 
 def write_memory_file(root: Path, text: str, max_bytes: int) -> None:
