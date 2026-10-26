@@ -6,6 +6,7 @@ fixed public address and `respx` answers the connection to it."""
 
 from __future__ import annotations
 
+import logging
 import socket
 
 import httpx
@@ -813,3 +814,29 @@ async def test_a_download_without_a_content_type_takes_the_names_type(
             )
         ).scalar_one()
     assert row.media_type == "application/pdf"
+
+
+@respx.mock
+async def test_httpx_request_logs_carry_no_query(monkeypatch, caplog) -> None:
+    """docs/chat.md § Tools: a fetched URL's query — a presigned signature, a token — never
+    reaches the worker's log; httpx's request line keeps the host and the path alone."""
+    fake_resolver(monkeypatch)
+    respx.get(host=PUBLIC_IP, path="/signed.txt").mock(
+        return_value=httpx.Response(200, headers={"content-type": "text/plain"}, content=b"ok")
+    )
+    chat_web.redact_request_logs()
+    try:
+        with caplog.at_level(logging.INFO, logger="httpx"):
+            outcome = await chat_web.read_url(
+                "https://example.org/signed.txt?X-Amz-Signature=secret-signature#frag",
+                max_bytes=1000,
+                max_chars=20_000,
+                timeout=5,
+                pdf_timeout=5,
+            )
+    finally:
+        logging.getLogger("httpx").removeFilter(chat_web.QUERY_REDACTOR)
+    assert outcome.is_error is False
+    lines = [record.getMessage() for record in caplog.records if record.name == "httpx"]
+    assert lines and all("secret-signature" not in line for line in lines)
+    assert any("https://1.2.3.4/signed.txt" in line for line in lines)

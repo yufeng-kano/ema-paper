@@ -19,6 +19,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from .config import get_settings
 from .db.session import create_engine, create_sessionmaker
+from .jobs import chat_web
 from .jobs.chat_runner import run_turn
 from .jobs.queue import (
     claim_next_job,
@@ -257,6 +258,8 @@ async def run_worker(stop: asyncio.Event) -> None:
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    # A fetched URL's query — a signature, a token — never reaches the log (docs/chat.md).
+    chat_web.redact_request_logs()
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for signal_name in (signal.SIGINT, signal.SIGTERM):

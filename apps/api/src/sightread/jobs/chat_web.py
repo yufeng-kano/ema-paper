@@ -56,6 +56,34 @@ class FetchRefused(Exception):
     """The guard, a cap or the server refused the fetch; the message is the tool's answer."""
 
 
+# --- the logs -------------------------------------------------------------------------------
+
+
+class _QueryRedactor(logging.Filter):
+    """httpx logs every request's URL at INFO, and a URL `read_url` or `download_file`
+    fetches — or is redirected to — may carry its credential in the query, a presigned
+    signature or an access token: the query and the fragment leave every URL in those
+    records before they are written (docs/chat.md § Tools)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple) and any(
+            isinstance(arg, httpx.URL) for arg in record.args
+        ):
+            record.args = tuple(
+                arg.copy_with(query=None, fragment=None) if isinstance(arg, httpx.URL) else arg
+                for arg in record.args
+            )
+        return True
+
+
+QUERY_REDACTOR = _QueryRedactor()
+
+
+def redact_request_logs() -> None:
+    """Put the redaction on httpx's logger: once per process, before the first fetch."""
+    logging.getLogger("httpx").addFilter(QUERY_REDACTOR)
+
+
 # --- the guard ------------------------------------------------------------------------------
 
 

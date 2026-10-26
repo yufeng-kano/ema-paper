@@ -101,6 +101,9 @@ const props = defineProps<{
 const emit = defineEmits<{
   /** The document's files changed on disk — an edit landed, or a revert — so reload them. */
   changed: []
+  /** The agent kept a file in Files — a `download_file` result that was not an error — so
+   *  the library behind the viewer reads itself again. */
+  filed: []
   /** An answer's section link was clicked: scroll the document to that heading. */
   locate: [target: { label: string; anchor: string }]
   /** An answer block's *Add to notes*: its markdown, for the end of the notes. */
@@ -594,6 +597,10 @@ let flushTimer: ReturnType<typeof setTimeout> | null = null
  *  the viewer must reload. Decided as the frame arrives — an `edit` and the `turn_done`
  *  behind it can share a batch, by which time the stream no longer counts as active. */
 let liveEdit = false
+/** A `download_file` result that kept a file arrived since the last flush: the Files page
+ *  behind the viewer must read its library again. A replayed one asks for a read too —
+ *  one request, never wrong. */
+let filed = false
 
 /** Forget every frame, shown or still queued: the thread they belong to is gone. */
 function discardFrames() {
@@ -603,6 +610,7 @@ function discardFrames() {
   }
   pendingFrames = []
   liveEdit = false
+  filed = false
   events.value = []
 }
 
@@ -629,6 +637,10 @@ function flushFrames() {
     liveEdit = false
     emit('changed')
   }
+  if (filed) {
+    filed = false
+    emit('filed')
+  }
   // A memory saved, changed or forgotten: its line's state is read from the list.
   if (endedBefore) {
     const endedNow = endedTurns()
@@ -654,6 +666,13 @@ const stream = useConversationStream(
       // Every edit frame reloads the document, replayed ones included: the content was
       // fetched on its own, and nothing says the edit came before it (docs/web.md).
       liveEdit = true
+    }
+    if (
+      frame.event.event === 'tool_result' &&
+      frame.event.name === 'download_file' &&
+      !frame.event.is_error
+    ) {
+      filed = true
     }
     pendingFrames.push(frame)
     if (flushTimer === null) {

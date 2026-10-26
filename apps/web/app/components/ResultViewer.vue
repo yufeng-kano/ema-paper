@@ -266,6 +266,8 @@ const emit = defineEmits<{
   view: [view: DocumentView]
   /** *Markdown* chosen on a file not yet converted: the conversion is asked for. */
   convert: []
+  /** The agent kept a file in Files: the page behind the viewer reads its library again. */
+  filed: []
 }>()
 
 const { t } = useI18n()
@@ -4896,6 +4898,7 @@ watch(
               :document-pages="documentPages"
               :current-section="currentSection"
               @changed="loadContent()"
+              @filed="emit('filed')"
               @locate="locateSection"
               @to-notes="addToNotes"
               @close="agentOpen = false"
