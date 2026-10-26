@@ -19,6 +19,7 @@ export type ApiErrorType =
   | 'insufficient_credits'
   | 'checkout_unavailable'
   | 'pay_unavailable'
+  | 'plan_required'
   | 'subscription_active'
   | 'checkout_open'
   | 'upstream'
@@ -327,6 +328,13 @@ export interface MeResponse {
   credits_remaining: number
   /** The balance a chat send needs (`CHAT_MIN_CREDITS`). */
   chat_min_credits: number
+  /** When the period resets, which the composer's notice says (docs/billing.md § Periods).
+   *  Optional so a page served by an older API still renders. */
+  period_end?: string
+  /** Whether a top-up pack can be offered: Pay configured, a pack configured and a paid
+   *  plan's period (docs/billing.md § Top-up packs); the catalog says whether one is on sale.
+   *  Optional so a page served by an older API still renders. */
+  pack_checkout_available?: boolean
   /** The parse agent's switch (docs/agents.md): whether a PDF or an image uploaded on Files
    *  is converted on arrival — which decides the cap the page applies to it (docs/web.md
    *  § Files). Off where it is unset; optional so a page served by an older API still
@@ -370,12 +378,42 @@ export interface BillingRates {
   chat: Record<string, ChatRate>
 }
 
+/** One top-up pack the reader bought (docs/billing.md § Top-up packs): `remaining` is 0 and
+ *  `active` false once it is refunded or expired. */
+export interface BillingPack {
+  id: string
+  pack_id: string
+  credits: number
+  spent: number
+  remaining: number
+  status: 'paid' | 'refunded'
+  active: boolean
+  purchased_at: string
+  expires_at: string
+}
+
+export interface BillingPacks {
+  /** What the active packs have left together. */
+  remaining: number
+  /** The earliest expiry among the active packs with credits left; null without one. */
+  expires_at: string | null
+  /** Every pack ever bought, newest first. */
+  items: BillingPack[]
+}
+
 export interface BillingResponse {
   plan: BillingPlan
   subscription: BillingSubscription | null
   period: { start: string; end: string; granted: number; spent: number; remaining: number }
+  packs: BillingPacks
+  /** The balance a charge is measured against: the period's, 0 when overdrawn, plus the
+   *  active packs' (docs/billing.md § Top-up packs). */
+  credits_available: number
   rates: BillingRates
   checkout_available: boolean
+  /** Whether this reader can buy a pack now: Pay reachable with its checkout open, a pack on
+   *  sale, and a paid plan's period. */
+  pack_checkout_available: boolean
   pay_reachable: boolean | null
 }
 
@@ -393,9 +431,23 @@ export interface CatalogPlan {
   max_jobs: number
 }
 
+/** A top-up pack on sale: Pay's price and this deployment's credits and validity
+ *  (docs/billing.md § Top-up packs). */
+export interface CatalogPack {
+  pack_id: string
+  name: string
+  /** The amount in the currency's minor unit, as Pay gives it. */
+  amount: string
+  currency: string
+  credits: number
+  valid_days: number
+}
+
 export interface CatalogResponse {
   available: boolean
   plans: CatalogPlan[]
+  /** Empty when Pay is unconfigured or unreachable, or sells no pack configured here. */
+  packs: CatalogPack[]
   free: { credits: number; storage_bytes: number; sandbox: boolean; max_jobs: number }
   rates: BillingRates
 }
@@ -1054,6 +1106,12 @@ export function getSite(): Promise<SiteInfo> {
 /** Pay's checkout page for the plan — the browser goes there (docs/billing.md § Kano Pay). */
 export function createCheckout(planId: string): Promise<{ url: string }> {
   return request('POST', '/api/billing/checkout', { plan_id: planId })
+}
+
+/** Pay's checkout page for a top-up pack — the browser goes there; 409 `plan_required` on
+ *  Free (docs/billing.md § Top-up packs). */
+export function createPackCheckout(packId: string): Promise<{ url: string }> {
+  return request('POST', '/api/billing/packs/checkout', { pack_id: packId })
 }
 
 /** Pay's customer portal: payment method, invoices, cancelling. */

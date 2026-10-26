@@ -1,7 +1,7 @@
 <script setup lang="ts">
 /**
  * The footer of the public pages (docs/web.md § Pages): the copyright, the links to the
- * pricing page and the three policy pages, and the locale links. Each locale option is
+ * pricing page, the rates page and the three policy pages, and the locale links. Each locale option is
  * written in its own language, so it is legible whichever catalog is loaded, and every link
  * is real — the locale lives in the URL, so a choice is bookmarkable and works without
  * JavaScript on a prerendered page.
@@ -13,7 +13,7 @@ const switchLocalePath = useSwitchLocalePath()
 /** A string, not a number: the interpolator runs numbers through `Intl.NumberFormat`, which
  *  would print the year with a thousands separator. */
 const year = String(new Date().getFullYear())
-const pages = ['pricing', 'terms', 'privacy', 'refund'] as const
+const pages = ['pricing', 'rates', 'terms', 'privacy', 'refund'] as const
 </script>
 
 <template>

@@ -2,14 +2,15 @@
 /**
  * The public pricing page (docs/web.md § Pages, `/pricing`; the contract is
  * docs/billing.md): the plans from `GET /api/billing/catalog`, read when the page opens, and
- * how credits work. No price and no plan is typed here: Free is the catalog's `free`, a
- * paid plan is on sale only when Pay prices it, and the rates are the deployment's.
+ * how credits work, the top-up pack when the catalog sells one, and the questions. No price
+ * and no plan is typed here: Free is the catalog's `free`, a paid plan is on sale only when
+ * Pay prices it, a pack likewise, and the rates are the deployment's.
  *
  * Prerendered in both locales like the sign-in page, and full-bleed like it: a visitor
  * lands here signed out, and a signed-in reader is not sent away.
  */
 import { createCheckout, getBillingCatalog, type CatalogPlan, type CatalogResponse } from '~/lib/api'
-import { formatBytes, formatCount, formatMinorAmount } from '~/lib/format'
+import { formatBytes, formatCount, formatMinorAmount, packValidity } from '~/lib/format'
 import { SETTINGS_QUERY, keepAfterSignIn } from '~/lib/settings'
 import type { TableColumn } from '~/lib/table'
 
@@ -41,6 +42,22 @@ onMounted(async () => {
 
 /** Null until the catalog answers: no rate is ever assumed (docs/web.md § Rules). */
 const parsePerPage = computed(() => catalog.value?.rates.parse_per_page ?? null)
+
+// --- the top-up pack ----------------------------------------------------------------------
+
+/** The first pack on sale, or null: the pack card, the paid card's line and the fifth
+ *  question stand only then (docs/billing.md § Top-up packs). No button here: a pack is
+ *  bought where the reader is signed in, the Usage section or the credits dialog. */
+const pack = computed(() => catalog.value?.packs[0] ?? null)
+const packPrice = computed(() => (pack.value ? formatMinorAmount(pack.value.amount, pack.value.currency, locale.value) : ''))
+/** `12 months`, or the days when the validity is not a whole number of months. */
+const validity = computed(() => {
+  if (!pack.value) {
+    return ''
+  }
+  const { unit, n } = packValidity(pack.value.valid_days)
+  return t(`topUp.${unit}`, { n: formatCount(n, locale.value) }, n)
+})
 
 /** `per month`, `per year`, or `per 3 months` — as Pay reports the cycle. */
 function cycleOf(plan: CatalogPlan): string {
@@ -113,7 +130,8 @@ function rate(value: number): string {
   return new Intl.NumberFormat(locale.value, { maximumFractionDigits: 3 }).format(value)
 }
 
-const questions = ['1', '2', '3', '4'] as const
+/** The fifth question is the pack's, asked only while one is on sale. */
+const questions = computed(() => (pack.value ? ['1', '2', '3', '4', '5'] : ['1', '2', '3', '4']))
 </script>
 
 <template>
@@ -161,6 +179,7 @@ const questions = ['1', '2', '3', '4'] as const
               <p class="for">{{ t('pricing.paidFor') }}</p>
               <ul class="gives">
                 <li>{{ t('pricing.creditsPerCycle', { n: formatCount(plan.credits, locale), cycle: cycleOf(plan) }, plan.credits) }}</li>
+                <li v-if="pack">{{ t('pricing.topUpGives') }}</li>
                 <li>{{ t('pricing.storageKept', { size: formatBytes(plan.storage_bytes, locale) }) }}</li>
                 <li>{{ t('pricing.jobsAtOnce', { n: formatCount(plan.max_jobs, locale) }, plan.max_jobs) }}</li>
                 <li>{{ t('pricing.api') }}</li>
@@ -195,10 +214,27 @@ const questions = ['1', '2', '3', '4'] as const
         </template>
       </section>
 
+      <!-- The pack, when the catalog sells one: Pay's price, this deployment's credits and
+           validity, and where a Pro reader buys it. -->
+      <section v-if="pack" class="pack-section" :aria-label="t('pricing.packEyebrow')">
+        <article class="plan pack">
+          <p class="eyebrow accent">{{ t('pricing.packEyebrow') }}</p>
+          <p class="for">{{ t('pricing.packFor') }}</p>
+          <p class="price">{{ t('pricing.packCredits', { n: formatCount(pack.credits, locale) }, pack.credits) }}</p>
+          <p class="pack-price">{{ t('pricing.packPrice', { price: packPrice }) }}</p>
+          <ul class="gives">
+            <li>{{ t('pricing.packValid', { validity }) }}</li>
+            <li>{{ t('pricing.packAfterPlan') }}</li>
+            <li>{{ t('pricing.packRefund') }}</li>
+          </ul>
+          <p class="pack-how">{{ t('pricing.packHow') }}</p>
+        </article>
+      </section>
+
       <section class="how">
         <div class="how-head">
           <h2 class="section-title">{{ t('pricing.howTitle') }}</h2>
-          <p class="section-lede">{{ t('pricing.howLede') }}</p>
+          <p class="section-lede">{{ pack ? t('pricing.howLedePack', { validity }) : t('pricing.howLede') }}</p>
         </div>
         <UiSkeleton v-if="parsePerPage === null && !loadError" class="sheet" :rows="4" />
         <table v-else-if="parsePerPage !== null" class="how-table sheet">
@@ -223,7 +259,10 @@ const questions = ['1', '2', '3', '4'] as const
             </tr>
             <tr>
               <td>{{ t('pricing.chatRow') }}</td>
-              <td class="num">{{ t('pricing.chatRate') }}</td>
+              <td class="num">
+                {{ t('pricing.chatRate') }}
+                <NuxtLink class="rates-link" :to="localePath('/rates')">{{ t('pricing.ratesLink') }}</NuxtLink>
+              </td>
             </tr>
           </tbody>
         </table>
@@ -257,7 +296,7 @@ const questions = ['1', '2', '3', '4'] as const
         <dl class="questions">
           <div v-for="q in questions" :key="q" class="question">
             <dt>{{ t(`pricing.q${q}`) }}</dt>
-            <dd>{{ t(`pricing.a${q}`) }}</dd>
+            <dd>{{ t(`pricing.a${q}`, { validity }) }}</dd>
           </div>
         </dl>
       </section>
@@ -428,6 +467,38 @@ const questions = ['1', '2', '3', '4'] as const
   color: var(--muted);
   font-size: var(--text-sm);
   text-align: center;
+}
+
+/* The pack: one card at the plans' width, centered under them. */
+.pack-section {
+  display: grid;
+  justify-items: center;
+}
+
+.plan.pack {
+  width: 100%;
+  max-width: 448px;
+}
+
+.pack-price {
+  color: var(--muted);
+  font-size: var(--text-base);
+}
+
+.pack-how {
+  margin-top: auto;
+  color: var(--muted);
+  font-size: var(--text-sm);
+  line-height: 1.6;
+}
+
+.rates-link {
+  color: var(--accent);
+}
+
+.rates-link:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 
 .how,

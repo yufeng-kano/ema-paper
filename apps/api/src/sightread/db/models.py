@@ -880,3 +880,64 @@ class CreditEntry(Base):
     model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     settled_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
+
+
+class CreditPack(Base):
+    """A top-up pack bought on Pro, written from Pay's canonical purchase (docs/billing.md
+    § Top-up packs): credits valid until `expires_at`, spent once the period's grant is."""
+
+    __tablename__ = "credit_packs"
+    __table_args__ = (
+        Index("ix_credit_packs_user_expires", "user_id", "expires_at"),
+        CheckConstraint("credits >= 0", name="ck_credit_packs_credits"),
+        CheckConstraint("spent >= 0", name="ck_credit_packs_spent"),
+        CheckConstraint("expires_at > purchased_at", name="ck_credit_packs_validity"),
+        CheckConstraint("status IN ('paid', 'refunded')", name="ck_credit_packs_status"),
+    )
+
+    # Pay's purchaseId.
+    id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    pack_id: Mapped[str] = mapped_column(String(64))
+    credits: Mapped[int] = mapped_column(Integer)
+    spent: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    status: Mapped[str] = mapped_column(String(16))  # paid | refunded
+    purchased_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ)
+    expires_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ)
+    # Pay's version (milliseconds): an update carrying an older one is ignored.
+    version: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
+
+
+class CreditPackEntry(Base):
+    """How much of an entry's amount one pack covered (docs/billing.md § The ledger), so a
+    release, a retry or a settlement moves exactly that back or forward."""
+
+    __tablename__ = "credit_pack_entries"
+    __table_args__ = (CheckConstraint("amount >= 0", name="ck_credit_pack_entries_amount"),)
+
+    entry_id: Mapped[int] = mapped_column(
+        ForeignKey("credit_entries.id", ondelete="CASCADE"), primary_key=True
+    )
+    pack_id: Mapped[str] = mapped_column(
+        ForeignKey("credit_packs.id", ondelete="CASCADE"), primary_key=True
+    )
+    amount: Mapped[int] = mapped_column(Integer)
+
+
+class PackCheckout(Base):
+    """The one pack checkout a user may have open, keyed as `checkouts` is: the key is
+    written before Pay is called (docs/billing.md § Kano Pay, *Pack checkout*)."""
+
+    __tablename__ = "pack_checkouts"
+
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    pack_id: Mapped[str] = mapped_column(String(64))
+    idempotency_key: Mapped[str] = mapped_column(String(128), unique=True)
+    # Pay's purchaseId, once Pay answered.
+    purchase_id: Mapped[str | None] = mapped_column(String(255), unique=True, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)

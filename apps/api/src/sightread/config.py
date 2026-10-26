@@ -10,7 +10,7 @@ from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .billing.credits import ModelPrice, parse_model_prices
-from .billing.plans import FREE_PLAN_ID, Plan, parse_plans
+from .billing.plans import FREE_PLAN_ID, Pack, Plan, parse_packs, parse_plans
 
 # Only ever used when APP_ENV=local and SECRET_KEY is unset, so `uv run uvicorn` works
 # without a .env file. Production refuses to start without a real SECRET_KEY.
@@ -76,6 +76,9 @@ class Settings(BaseSettings):
     kano_pay_webhook_secret: str = ""
     # `[{"planId", "credits", "storageBytes", "sandbox", "maxJobs"}]`; prices are Pay's.
     kano_pay_plans_json: str = "[]"
+    # `[{"packId", "credits", "validDays"}]`: what a top-up pack grants, Pro only; prices
+    # are Pay's (docs/billing.md § Top-up packs). Empty = no pack is sold.
+    kano_pay_packs_json: str = "[]"
     billing_refresh_seconds: int = 120
     # Each call to Pay's App API, and how far a notification's timestamp may be from
     # ours before it is refused as a replay.
@@ -283,6 +286,7 @@ class Settings(BaseSettings):
         if unpriced:
             raise ValueError(f"MODEL_PRICES_JSON prices none of: {', '.join(sorted(unpriced))}")
         self.plans  # noqa: B018 - validated for its errors
+        self.packs  # noqa: B018 - validated for its errors
         return self
 
     @cached_property
@@ -297,6 +301,11 @@ class Settings(BaseSettings):
             storage_ceiling=self.workspace_quota_bytes,
             jobs_ceiling=self.max_jobs_per_user,
         )
+
+    @cached_property
+    def packs(self) -> dict[str, Pack]:
+        """The top-up packs, by Pay's pack id (docs/billing.md § Top-up packs)."""
+        return parse_packs(self.kano_pay_packs_json)
 
     @property
     def free_plan(self) -> Plan:

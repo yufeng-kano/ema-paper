@@ -48,7 +48,7 @@ import { blockName, type NameText } from '~/lib/blocks'
 import { commandArguments, formatBytes, type AskOutcome, type AskRequest, type ComposerPayload } from '~/lib/composer'
 import { byRecency } from '~/lib/conversations'
 import { nodesToMarkdown } from '~/lib/copy'
-import { formatCount } from '~/lib/format'
+import { formatCount, formatDate } from '~/lib/format'
 import { turnErrorKey, turnErrorNeedsPlan } from '~/lib/turnError'
 import { ANSWER_DRAG_TYPE, BLOCK_DRAG_TYPE } from '~/lib/dnd'
 import {
@@ -770,6 +770,18 @@ const localePath = useLocalePath()
 function seePlans() {
   void navigateTo(localePath('/pricing'))
 }
+
+/** A reader who can buy a top-up pack (`pack_checkout_available`, `GET /api/me`) is offered
+ *  it in the notice instead of the plans, its checkout in this tab (docs/billing.md § Top-up
+ *  packs); the notice then names when the period resets. */
+const canTopUp = computed(() => auth.me.value?.pack_checkout_available === true)
+const topUp = reactive(useTopUp())
+const creditsNotice = computed(() => {
+  const me = auth.me.value
+  return canTopUp.value && me?.period_end
+    ? t('chat.blockedCreditsPack', { date: formatDate(me.period_end, locale.value) })
+    : t('chat.blockedCredits')
+})
 
 /** A failed turn's *See plans*, unless the notice above the composer stands for the same
  *  cause and carries it already: one cause, one See plans (docs/web.md § The agent panel). */
@@ -1765,13 +1777,17 @@ onBeforeUnmount(() => {
       <p class="send-block-text">
         {{
           sendBlock === 'credits'
-            ? t('chat.blockedCredits')
+            ? creditsNotice
             : storage
               ? t('chat.blockedStorage', { used: formatBytes(storage.bytes), quota: formatBytes(storage.quota) })
               : t('chat.blockedStorageBare')
         }}
+        <template v-if="topUp.error"> {{ topUp.error }}</template>
       </p>
-      <UiButton size="sm" @click="seePlans">{{ t('credits.seePlans') }}</UiButton>
+      <UiButton v-if="sendBlock === 'credits' && canTopUp" size="sm" :loading="topUp.buying" @click="topUp.buy">
+        {{ t('usage.topUp') }}
+      </UiButton>
+      <UiButton v-else size="sm" @click="seePlans">{{ t('credits.seePlans') }}</UiButton>
     </div>
 
     <ChatComposer

@@ -14,15 +14,15 @@ import hmac
 import logging
 import re
 import time
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings
-from ..db.models import Checkout, Subscription, utcnow
+from ..db.models import Checkout, CreditPack, PackCheckout, Subscription, utcnow
 from .plans import PAID_STATUSES
 
 logger = logging.getLogger(__name__)
@@ -40,7 +40,11 @@ STATUSES = frozenset(
         "failed",
     }
 )
+# A purchase is listed once paid, and stays listed refunded (kano-pay § Purchase payload).
+PURCHASE_STATUSES = frozenset({"paid", "refunded"})
 _ID = re.compile(r"^[A-Za-z0-9_.-]{1,255}$")
+_AMOUNT = re.compile(r"^\d{1,12}$")
+_CURRENCY = re.compile(r"^[A-Z]{3}$")
 _SIGNATURE = re.compile(r"^ts=(\d{1,20});h1=([0-9a-f]{64})$")
 
 
@@ -70,6 +74,20 @@ class PaySubscription:
 
 
 @dataclass(frozen=True)
+class PayPurchase:
+    """One of the subject's paid or refunded purchases, as Pay lists them
+    (docs/billing.md § Kano Pay, *Purchase notifications*)."""
+
+    purchase_id: str
+    pack_id: str
+    status: str
+    paid_at: datetime
+    version: int
+    amount: str | None
+    currency: str | None
+
+
+@dataclass(frozen=True)
 class CatalogPlan:
     plan_id: str
     product_id: str
@@ -80,9 +98,19 @@ class CatalogPlan:
 
 
 @dataclass(frozen=True)
+class CatalogPack:
+    pack_id: str
+    product_id: str
+    name: str
+    amount: str
+    currency: str
+
+
+@dataclass(frozen=True)
 class Catalog:
     checkout_enabled: bool
     plans: dict[str, CatalogPlan]
+    packs: dict[str, CatalogPack] = field(default_factory=dict)
 
 
 def _str(data: dict, key: str, *, pattern: re.Pattern[str] | None = _ID) -> str:
@@ -135,6 +163,34 @@ def parse_subscription(data: object, app_id: str, subject: str) -> PaySubscripti
         period_end=period_end,
         cancel_at_period_end=cancel,
         version=version,
+    )
+
+
+def parse_purchase(data: object, app_id: str, subject: str) -> PayPurchase:
+    """Pay's purchase payload (`kano-pay/docs/integrating-apps.md` § Purchase payload),
+    re-validated: this App's and this subject's, paid or refunded, with a paid time."""
+    if not isinstance(data, dict):
+        raise PayUnavailable("Kano Pay's purchase is not an object")
+    if data.get("appId") != app_id or data.get("subjectId") != subject:
+        raise PayUnavailable("Kano Pay's purchase names another App or subject")
+    status = _str(data, "status")
+    if status not in PURCHASE_STATUSES:
+        raise PayUnavailable(f"Kano Pay's purchase has an unknown status {status!r}")
+    version = data.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+        raise PayUnavailable("Kano Pay's purchase carries no valid version")
+    pack_id = data.get("packId")
+    if not isinstance(pack_id, str) or not 0 < len(pack_id) <= 64:
+        raise PayUnavailable("Kano Pay's purchase carries no valid packId")
+    amount, currency = data.get("amount"), data.get("currency")
+    return PayPurchase(
+        purchase_id=_str(data, "purchaseId"),
+        pack_id=pack_id,
+        status=status,
+        paid_at=_millis(data, "paidAt"),
+        version=version,
+        amount=amount if isinstance(amount, str) and _AMOUNT.match(amount) else None,
+        currency=currency if isinstance(currency, str) and _CURRENCY.match(currency) else None,
     )
 
 
@@ -214,6 +270,30 @@ class PayClient:
             raise PayUnavailable("Kano Pay's checkout URL is not on Pay's origin")
         return url, _str(data, "transactionId")
 
+    async def purchases(self, subject: str) -> list[PayPurchase]:
+        """The subject's paid and refunded purchases, oldest first, each re-validated."""
+        data = await self._request("GET", f"/v1/purchases/{subject}")
+        rows = data.get("purchases")
+        if not isinstance(rows, list):
+            raise PayUnavailable("Kano Pay's purchases are not a list")
+        return [parse_purchase(row, self.app_id, subject) for row in rows]
+
+    async def create_purchase(
+        self, subject: str, pack_id: str, idempotency_key: str
+    ) -> tuple[str, str]:
+        """`(checkoutUrl, purchaseId)` of a pack's checkout: the URL validated to Pay's
+        own origin (docs/billing.md § Kano Pay, *Pack checkout*)."""
+        data = await self._request(
+            "POST",
+            "/v1/purchases",
+            json={"subjectId": subject, "packId": pack_id},
+            headers={"Idempotency-Key": idempotency_key},
+        )
+        url = _str(data, "checkoutUrl", pattern=None)
+        if not _own_origin(url, self.url):
+            raise PayUnavailable("Kano Pay's checkout URL is not on Pay's origin")
+        return url, _str(data, "purchaseId")
+
     async def portal(self, subject: str) -> str:
         data = await self._request("POST", "/v1/portal", json={"subjectId": subject})
         url = _str(data, "url", pattern=None)
@@ -246,7 +326,24 @@ class PayClient:
                 # One malformed entry leaves the catalog; it does not hide the others.
                 continue
             plans[plan.plan_id] = plan
-        return Catalog(checkout_enabled=data.get("checkoutEnabled") is True, plans=plans)
+        packs: dict[str, CatalogPack] = {}
+        for entry in data.get("packs") or []:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                pack = CatalogPack(
+                    pack_id=_str(entry, "packId"),
+                    product_id=_str(entry, "productId"),
+                    name=_str(entry, "name", pattern=None),
+                    amount=_str(entry, "amount", pattern=_AMOUNT),
+                    currency=_str(entry, "currency", pattern=_CURRENCY),
+                )
+            except PayUnavailable:
+                continue
+            packs[pack.pack_id] = pack
+        return Catalog(
+            checkout_enabled=data.get("checkoutEnabled") is True, plans=plans, packs=packs
+        )
 
 
 class CatalogCache:
@@ -274,6 +371,11 @@ def on_sale(settings: Settings, catalog: Catalog) -> dict[str, CatalogPlan]:
     """The plans both configured here and priced at Pay: only that intersection is on
     sale (docs/billing.md § Plans)."""
     return {plan_id: plan for plan_id, plan in catalog.plans.items() if plan_id in settings.plans}
+
+
+def packs_on_sale(settings: Settings, catalog: Catalog) -> dict[str, CatalogPack]:
+    """The packs both configured here and priced at Pay (docs/billing.md § Top-up packs)."""
+    return {pack_id: pack for pack_id, pack in catalog.packs.items() if pack_id in settings.packs}
 
 
 def sign(secret: str, timestamp: int, raw: bytes) -> str:
@@ -335,5 +437,67 @@ async def apply_canonical(db: AsyncSession, user_id: int, canonical: PaySubscrip
         and checkout.created_at <= datetime.fromtimestamp(canonical.version / 1000, tz=UTC)
     ):
         checkout.completed_at = utcnow()
+        await db.flush()
+    return written
+
+
+async def apply_purchases(
+    db: AsyncSession, settings: Settings, user_id: int, purchases: list[PayPurchase]
+) -> bool:
+    """What Pay's canonical purchases change here, whichever way they arrived — the
+    webhook or a refresh (docs/billing.md § Kano Pay, *Purchase notifications*): a
+    `credit_packs` row created for a purchase not yet known, with the credits and the
+    validity its pack is configured with now; an existing row's status following Pay's
+    only when Pay's version is newer, never backwards, its credits never lowered; the
+    pack checkout the purchase came from marked completed. A pack this deployment does
+    not configure is logged and skipped. The caller holds the user's row lock and
+    commits. Returns whether anything was written."""
+    written = False
+    checkout = await db.get(PackCheckout, user_id)
+    for purchase in purchases:
+        row = await db.get(CreditPack, purchase.purchase_id, with_for_update=True)
+        if row is None:
+            config = settings.packs.get(purchase.pack_id)
+            if config is None:
+                logger.warning(
+                    "Kano Pay purchase %s is of a pack this deployment does not configure: %s",
+                    purchase.purchase_id,
+                    purchase.pack_id,
+                )
+                continue
+            db.add(
+                CreditPack(
+                    id=purchase.purchase_id,
+                    user_id=user_id,
+                    pack_id=purchase.pack_id,
+                    credits=config.credits,
+                    status=purchase.status,
+                    purchased_at=purchase.paid_at,
+                    expires_at=purchase.paid_at + timedelta(days=config.valid_days),
+                    version=purchase.version,
+                )
+            )
+            written = True
+        elif row.user_id != user_id:
+            logger.warning("Kano Pay purchase %s belongs to another user", purchase.purchase_id)
+            continue
+        elif purchase.version > row.version:
+            row.status = purchase.status
+            row.version = purchase.version
+            row.updated_at = utcnow()
+            written = True
+        if (
+            checkout is not None
+            and checkout.completed_at is None
+            and (
+                checkout.purchase_id == purchase.purchase_id
+                # Pay answered, the app did not get to keep the id: the purchase paid
+                # after the checkout opened is the one it started.
+                or (checkout.purchase_id is None and purchase.paid_at >= checkout.created_at)
+            )
+        ):
+            checkout.completed_at = utcnow()
+            written = True
+    if written:
         await db.flush()
     return written

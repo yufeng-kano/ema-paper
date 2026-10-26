@@ -1,6 +1,7 @@
-"""Control plane `/api/billing` — the plan, the period's balance and the rates, the Usage
-tab's credits view, and the Kano Pay surface: checkout, portal, the public catalog and
-the signed webhook (docs/billing.md § Kano Pay, § Routes).
+"""Control plane `/api/billing` — the plan, the period's balance, the top-up packs and
+the rates, the Usage tab's credits view, and the Kano Pay surface: checkout (a plan's or a
+pack's), portal, the public catalog and the signed webhook (docs/billing.md § Kano Pay,
+§ Routes).
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ import logging
 import secrets
 import time
 from datetime import timedelta
+from typing import NamedTuple
 
 from fastapi import APIRouter, Query, Request, Response
 from pydantic import BaseModel
@@ -18,7 +20,16 @@ from sqlalchemy import case, func, select
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
 from ..billing import ledger, pay
 from ..billing.plans import FREE_PLAN_ID
-from ..db.models import Checkout, CreditEntry, PayEvent, Subscription, User, utcnow
+from ..db.models import (
+    Checkout,
+    CreditEntry,
+    CreditPack,
+    PackCheckout,
+    PayEvent,
+    Subscription,
+    User,
+    utcnow,
+)
 from ..errors import ApiError
 
 logger = logging.getLogger(__name__)
@@ -29,17 +40,46 @@ class CheckoutRequest(BaseModel):
     plan_id: str
 
 
+class PackCheckoutRequest(BaseModel):
+    pack_id: str
+
+
+class Sale(NamedTuple):
+    """Pay's `checkoutEnabled`, and the plans and the packs both configured here and
+    priced there (docs/billing.md § Plans, § Top-up packs)."""
+
+    enabled: bool
+    plans: dict[str, pay.CatalogPlan]
+    packs: dict[str, pay.CatalogPack]
+
+
 def _catalog_cache(request: Request) -> pay.CatalogCache:
     return request.app.state.pay_catalog
+
+
+async def _may_have_purchases(db: DbSession, user_id: int) -> bool:
+    """Whether Pay may list purchases worth fetching for the user: a pack checkout still
+    open here, or a paid pack whose refund would arrive the same way. A user with neither
+    costs the refresh no second call (docs/billing.md § Kano Pay, *Refresh*)."""
+    checkout = await db.get(PackCheckout, user_id)
+    if checkout is not None and checkout.completed_at is None:
+        return True
+    paid = await db.execute(
+        select(CreditPack.id)
+        .where(CreditPack.user_id == user_id, CreditPack.status == ledger.PACK_PAID)
+        .limit(1)
+    )
+    return paid.first() is not None
 
 
 async def _refresh(
     request: Request, db: DbSession, settings: AppSettings, user_id: int
 ) -> bool | None:
-    """Reconcile the user's row with Pay at most once per `BILLING_REFRESH_SECONDS` — the
-    same fetch the webhook makes — so a missed notification is recovered on the next
+    """Reconcile the user's rows with Pay at most once per `BILLING_REFRESH_SECONDS` — the
+    same fetches the webhook makes, the subscription and, for a user who bought or is
+    buying a pack, the purchases — so a missed notification is recovered on the next
     visit. None: Pay is not configured; False: Pay could not be reached, and the stored
-    row stays as it is (docs/billing.md § Kano Pay)."""
+    rows stay as they are (docs/billing.md § Kano Pay)."""
     if not settings.kano_pay_configured:
         return None
     stamps: dict[int, float] = request.app.state.pay_refreshed
@@ -47,25 +87,30 @@ async def _refresh(
     last = stamps.get(user_id)
     if last is not None and now - last < settings.billing_refresh_seconds:
         return True
+    client = pay.PayClient(settings)
     try:
-        canonical = await pay.PayClient(settings).subscription(str(user_id))
+        canonical = await client.subscription(str(user_id))
+        purchases = (
+            await client.purchases(str(user_id)) if await _may_have_purchases(db, user_id) else []
+        )
     except (pay.PayUnavailable, pay.PayRefused) as exc:
         logger.warning("billing refresh of user %d failed: %s", user_id, exc)
         return False
-    if canonical is not None:
-        # The same write the webhook makes, under the same lock.
+    if canonical is not None or purchases:
+        # The same writes the webhook makes, under the same lock.
         await db.execute(select(User.id).where(User.id == user_id).with_for_update())
-        await pay.apply_canonical(db, user_id, canonical)
+        if canonical is not None:
+            await pay.apply_canonical(db, user_id, canonical)
+        if purchases:
+            await pay.apply_purchases(db, settings, user_id, purchases)
         await db.commit()
     stamps[user_id] = now
     return True
 
 
-async def _on_sale(
-    request: Request, settings: AppSettings
-) -> tuple[bool, dict[str, pay.CatalogPlan]] | None:
-    """Pay's `checkoutEnabled` and the plans on sale, from the shared cache; None when
-    Pay is unconfigured or unreachable."""
+async def _on_sale(request: Request, settings: AppSettings) -> Sale | None:
+    """What is on sale, from the shared catalog cache; None when Pay is unconfigured or
+    unreachable."""
     if not settings.kano_pay_configured:
         return None
     try:
@@ -73,7 +118,11 @@ async def _on_sale(
     except (pay.PayUnavailable, pay.PayRefused) as exc:
         logger.warning("Kano Pay catalog unavailable: %s", exc)
         return None
-    return catalog.checkout_enabled, pay.on_sale(settings, catalog)
+    return Sale(
+        catalog.checkout_enabled,
+        pay.on_sale(settings, catalog),
+        pay.packs_on_sale(settings, catalog),
+    )
 
 
 def rates(settings: AppSettings) -> dict:
@@ -126,19 +175,45 @@ async def billing(request: Request, user: SessionUser, db: DbSession, settings: 
             "spent": balance.spent,
             "remaining": balance.remaining,
         },
+        # Every pack ever bought, newest first; the totals count the active ones only
+        # (docs/billing.md § Top-up packs).
+        "packs": {
+            "remaining": balance.packs_remaining,
+            "expires_at": balance.packs_expire_at,
+            "items": [
+                {
+                    "id": pack.id,
+                    "pack_id": pack.pack_id,
+                    "credits": pack.credits,
+                    "spent": pack.spent,
+                    "remaining": pack.remaining,
+                    "status": pack.status,
+                    "active": pack.active,
+                    "purchased_at": pack.purchased_at,
+                    "expires_at": pack.expires_at,
+                }
+                for pack in balance.packs
+            ],
+        },
+        "credits_available": balance.available,
         "rates": rates(settings),
         # On sale: Pay configured and reachable, its checkout open, and at least one plan
         # both configured here and priced there (docs/billing.md § Plans).
-        "checkout_available": bool(sale is not None and sale[0] and sale[1]),
+        "checkout_available": bool(sale is not None and sale.enabled and sale.plans),
+        # A pack: the same, a pack on sale, and a current period that is a paid plan's.
+        "pack_checkout_available": bool(
+            sale is not None and sale.enabled and sale.packs and not plan.free
+        ),
         "pay_reachable": reachable,
     }
 
 
 @router.get("/catalog")
 async def catalog(request: Request, response: Response, settings: AppSettings):
-    """Public: the plans on sale with Pay's prices and this deployment's grants, the Free
-    plan and the credit rates, cached for five minutes; unconfigured or unreachable Pay
-    answers `available: false` with no plans, never an error (docs/billing.md § Kano Pay)."""
+    """Public: the plans and the packs on sale with Pay's prices and this deployment's
+    grants, the Free plan and the credit rates, cached for five minutes; unconfigured or
+    unreachable Pay answers `available: false` with no plans and no packs, never an error
+    (docs/billing.md § Kano Pay)."""
     # The deployment's own side of the page: the Free plan and the rates, which Pay has no
     # say in, answered whether or not Pay is.
     free = settings.free_plan
@@ -154,11 +229,10 @@ async def catalog(request: Request, response: Response, settings: AppSettings):
     sale = await _on_sale(request, settings)
     if sale is None:
         response.headers["Cache-Control"] = "no-store"
-        return {"available": False, "plans": [], **ours}
-    enabled, plans = sale
+        return {"available": False, "plans": [], "packs": [], **ours}
     response.headers["Cache-Control"] = f"public, max-age={settings.kano_pay_catalog_ttl_seconds}"
     return {
-        "available": enabled and bool(plans),
+        "available": sale.enabled and bool(sale.plans),
         **ours,
         "plans": [
             {
@@ -172,7 +246,18 @@ async def catalog(request: Request, response: Response, settings: AppSettings):
                 "sandbox": settings.plans[plan.plan_id].sandbox,
                 "max_jobs": settings.plans[plan.plan_id].max_jobs,
             }
-            for plan in plans.values()
+            for plan in sale.plans.values()
+        ],
+        "packs": [
+            {
+                "pack_id": pack.pack_id,
+                "name": pack.name,
+                "amount": pack.amount,
+                "currency": pack.currency,
+                "credits": settings.packs[pack.pack_id].credits,
+                "valid_days": settings.packs[pack.pack_id].valid_days,
+            }
+            for pack in sale.packs.values()
         ],
     }
 
@@ -200,8 +285,7 @@ async def checkout(
     sale = await _on_sale(request, settings)
     if sale is None:
         raise ApiError(503, "pay_unavailable", "The payment service is unavailable; try again")
-    enabled, plans = sale
-    if not enabled or plan_id not in plans:
+    if not sale.enabled or plan_id not in sale.plans:
         raise ApiError(409, "checkout_unavailable", "This plan is not on sale")
     await db.execute(select(User.id).where(User.id == user.id).with_for_update())
     row = await db.get(Checkout, user.id)
@@ -233,6 +317,60 @@ async def checkout(
     return {"url": url}
 
 
+@router.post("/packs/checkout", dependencies=[CsrfGuard])
+async def pack_checkout(
+    body: PackCheckoutRequest,
+    request: Request,
+    user: SessionUser,
+    db: DbSession,
+    settings: AppSettings,
+):
+    """A Pay checkout for a top-up pack on sale, for a user whose current period is a
+    paid plan's; the `pack_checkouts` row and its idempotency key are taken as a plan's
+    checkout takes `checkouts` (docs/billing.md § Top-up packs, § Kano Pay *Pack
+    checkout*)."""
+    pack_id = body.pack_id.strip()
+    balance = await ledger.read_balance(db, settings, user.id)
+    if balance.period.plan.free:
+        raise ApiError(409, "plan_required", "Top-up packs are for paid plans")
+    sale = await _on_sale(request, settings)
+    if sale is None:
+        raise ApiError(503, "pay_unavailable", "The payment service is unavailable; try again")
+    if not sale.enabled or pack_id not in sale.packs:
+        raise ApiError(409, "checkout_unavailable", "This pack is not on sale")
+    await db.execute(select(User.id).where(User.id == user.id).with_for_update())
+    row = await db.get(PackCheckout, user.id)
+    if (
+        row is None
+        or row.pack_id != pack_id
+        or row.completed_at is not None
+        # Its purchase is already on the books: a completed checkout whatever the row says.
+        or (row.purchase_id is not None and await db.get(CreditPack, row.purchase_id) is not None)
+    ):
+        key = secrets.token_urlsafe(32)
+        if row is None:
+            row = PackCheckout(user_id=user.id, pack_id=pack_id, idempotency_key=key)
+            db.add(row)
+        else:
+            row.pack_id = pack_id
+            row.idempotency_key = key
+            row.purchase_id = None
+            row.completed_at = None
+            row.created_at = utcnow()
+    key = row.idempotency_key
+    await db.commit()
+    try:
+        url, purchase_id = await pay.PayClient(settings).create_purchase(str(user.id), pack_id, key)
+    except (pay.PayUnavailable, pay.PayRefused) as exc:
+        logger.warning("pack checkout of user %d failed: %s", user.id, exc)
+        raise _unavailable(exc) from exc
+    row = await db.get(PackCheckout, user.id)
+    if row is not None and row.idempotency_key == key:
+        row.purchase_id = purchase_id
+        await db.commit()
+    return {"url": url}
+
+
 @router.post("/portal", dependencies=[CsrfGuard])
 async def portal(user: SessionUser, db: DbSession, settings: AppSettings):
     """Pay's customer portal, fresh every time, for a user who has a subscription of
@@ -252,9 +390,10 @@ async def portal(user: SessionUser, db: DbSession, settings: AppSettings):
 @router.post("/pay-webhook")
 async def pay_webhook(request: Request, db: DbSession, settings: AppSettings):
     """A signed notification is a hint, never data: verified, read for its id, type and
-    subject, then the subscription is fetched from Pay and written from that answer. The
-    event id and the write land in one commit, so a repeated delivery changes nothing;
-    2xx only once they are committed (docs/billing.md § Kano Pay)."""
+    subject — and the purchase id of a `purchase.updated` — then the subscription, or the
+    purchases, are fetched from Pay and written from that answer. The event id and the
+    write land in one commit, so a repeated delivery changes nothing; 2xx only once they
+    are committed (docs/billing.md § Kano Pay)."""
     if not settings.kano_pay_configured:
         raise ApiError(503, "pay_unavailable", "Billing is not configured")
     raw = await request.body()
@@ -272,21 +411,29 @@ async def pay_webhook(request: Request, db: DbSession, settings: AppSettings):
         event = json.loads(raw)
     except ValueError:
         raise ApiError(400, "invalid_request", "Invalid event") from None
-    subscription = event.get("subscription") if isinstance(event, dict) else None
-    event_id = event.get("id") if isinstance(event, dict) else None
-    event_type = event.get("type") if isinstance(event, dict) else None
+    if not isinstance(event, dict):
+        raise ApiError(400, "invalid_request", "Invalid event")
+    subscription = event.get("subscription")
+    purchase = event.get("purchase")
+    event_id = event.get("id")
+    event_type = event.get("type")
     if (
-        not isinstance(subscription, dict)
+        # Exactly one of the two: a notification is a subscription's or a purchase's.
+        isinstance(subscription, dict) == isinstance(purchase, dict)
         or not isinstance(event_id, str)
         or not pay._ID.match(event_id)
         or not isinstance(event_type, str)
         or not 0 < len(event_type) <= 64
     ):
         raise ApiError(400, "invalid_request", "Invalid event")
-    if subscription.get("appId") != settings.kano_pay_app_id:
+    named = subscription if isinstance(subscription, dict) else purchase
+    purchase_id = named.get("purchaseId") if named is purchase else None
+    if named is purchase and (not isinstance(purchase_id, str) or not pay._ID.match(purchase_id)):
+        raise ApiError(400, "invalid_request", "Invalid event")
+    if named.get("appId") != settings.kano_pay_app_id:
         logger.warning("Kano Pay event %s names another App", event_id)
         raise ApiError(400, "invalid_request", "Invalid event")
-    subject = subscription.get("subjectId")
+    subject = named.get("subjectId")
     user_id = int(subject) if isinstance(subject, str) and subject.isdigit() else None
     if user_id is None or await db.get(User, user_id) is None:
         # A deleted account's subscription still sends its ending events, and Pay retries
@@ -298,21 +445,32 @@ async def pay_webhook(request: Request, db: DbSession, settings: AppSettings):
         return {}
     if await db.get(PayEvent, event_id) is not None:
         return {}
+    client = pay.PayClient(settings)
+    canonical: pay.PaySubscription | None = None
+    purchases: list[pay.PayPurchase] = []
     try:
-        canonical = await pay.PayClient(settings).subscription(str(user_id))
+        if named is subscription:
+            canonical = await client.subscription(str(user_id))
+        else:
+            purchases = await client.purchases(str(user_id))
     except (pay.PayUnavailable, pay.PayRefused) as exc:
         logger.warning("Kano Pay event %s: canonical fetch failed: %s", event_id, exc)
         raise ApiError(503, "pay_unavailable", "Retry this notification") from exc
-    if canonical is None:
-        # Pay has no subscription for the subject yet: nothing to write, and the event
-        # is not recorded, so Pay's retry lands once there is one.
+    if (named is subscription and canonical is None) or (
+        named is purchase and all(row.purchase_id != purchase_id for row in purchases)
+    ):
+        # Pay does not list what the event names yet: nothing to write, and the event is
+        # not recorded, so Pay's retry lands once it does.
         raise ApiError(503, "pay_unavailable", "Retry this notification")
     await db.execute(select(User.id).where(User.id == user_id).with_for_update())
     if await db.get(PayEvent, event_id) is not None:
         await db.rollback()
         return {}
     db.add(PayEvent(id=event_id, type=event_type, user_id=user_id))
-    await pay.apply_canonical(db, user_id, canonical)
+    if canonical is not None:
+        await pay.apply_canonical(db, user_id, canonical)
+    if purchases:
+        await pay.apply_purchases(db, settings, user_id, purchases)
     await db.commit()
     request.app.state.pay_refreshed[user_id] = time.monotonic()
     return {}
@@ -360,12 +518,18 @@ async def entries(user: SessionUser, db: DbSession, days: int = Query(default=30
 
 
 async def me_fields(db: DbSession, settings: AppSettings, user_id: int) -> dict:
-    """What `GET /api/me` adds for the shell: the plan and the balance (docs/billing.md
-    § Routes)."""
+    """What `GET /api/me` adds for the shell: the plan, the balance a charge is measured
+    against, when the period resets, and whether a pack can be offered — Pay configured, a
+    pack configured and a paid plan's period, without the catalog read `GET /api/billing`
+    makes (docs/billing.md § Routes)."""
     balance = await ledger.read_balance(db, settings, user_id)
     plan = balance.period.plan
     return {
         "plan": FREE_PLAN_ID if plan.free else plan.id,
-        "credits_remaining": balance.remaining,
+        "credits_remaining": balance.available,
+        "period_end": balance.period.end,
         "chat_min_credits": settings.chat_min_credits,
+        "pack_checkout_available": bool(
+            settings.kano_pay_configured and settings.packs and not plan.free
+        ),
     }

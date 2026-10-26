@@ -8,9 +8,9 @@ export const LEGAL_DOCS = ['terms', 'privacy', 'refund'] as const
 export type LegalDoc = (typeof LEGAL_DOCS)[number]
 
 export const LEGAL_UPDATED: Record<LegalDoc, string> = {
-  terms: '2026-10-25',
+  terms: '2026-10-26',
   privacy: '2026-10-25',
-  refund: '2026-10-23',
+  refund: '2026-10-26',
 }
 
 /** The numbered section keys a catalog holds for a document, in order. */

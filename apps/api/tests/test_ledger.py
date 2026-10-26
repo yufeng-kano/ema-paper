@@ -220,9 +220,12 @@ async def test_a_chat_overdraft_is_not_carried_into_the_next_period(sessionmaker
             await db.flush()
             remaining = await ledger.settle_chat(db, settings, turn_id)
         await db.commit()
-    assert remaining == 1 - 6
+    # Settlement answers what a charge could still be measured against — nothing, never a
+    # negative number — while the period itself is in the red.
+    assert remaining == 0
     async with sessionmaker() as db:
-        assert await ledger.settle_chat(db, settings, turn_id) == -5  # the same rows: no move
+        assert (await ledger.read_balance(db, settings, user_id)).remaining == 1 - 6
+        assert await ledger.settle_chat(db, settings, turn_id) == 0  # the same rows: no move
         await ledger.close_chat(db, turn_id)
         await db.commit()
         assert await ledger.credits_by_turn(db, [turn_id]) == {turn_id: 6}
@@ -236,7 +239,8 @@ async def test_a_chat_overdraft_is_not_carried_into_the_next_period(sessionmaker
             await ledger.reserve(
                 db, settings, user_id=user_id, kind=ledger.CHAT, amount=0, turn_id=None, minimum=1
             )
-    assert (refused.value.need, refused.value.remaining) == (1, -5)
+    # The refusal names what is available — nothing — not the period's debt.
+    assert (refused.value.need, refused.value.remaining) == (1, 0)
 
 
 async def test_a_plan_change_raises_the_grant_and_never_lowers_it(sessionmaker) -> None:
@@ -474,7 +478,9 @@ async def test_a_turn_that_runs_out_of_credits_finishes_within_the_allowance(
     assert [block["type"] for block in last] == ["text"]
     billing = (await client.get("/api/billing")).json()
     assert (billing["period"]["spent"], billing["period"]["remaining"]) == (11, granted - 11)
-    assert (await client.get("/api/me")).json()["credits_remaining"] == granted - 11
+    # The shell's figure is what a charge could still take — nothing — never the debt.
+    assert billing["credits_available"] == 0
+    assert (await client.get("/api/me")).json()["credits_remaining"] == 0
 
 
 @respx.mock

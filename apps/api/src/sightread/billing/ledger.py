@@ -1,7 +1,8 @@
 """The credit ledger (docs/billing.md § The ledger): the period row a charge belongs to,
-reservations, settlements, and what the payloads show. Every write here runs inside the
-caller's transaction, under the user's row lock the caller already holds, and touches the
-period row and the entry together, so `credit_periods.spent` and `credit_entries` agree.
+the top-up packs beside it, reservations, settlements, and what the payloads show. Every
+write here runs inside the caller's transaction, under the user's row lock the caller
+already holds, and touches the period row, the packs and the entry together, so
+`credit_periods.spent`, `credit_packs.spent` and `credit_entries` agree.
 """
 
 from __future__ import annotations
@@ -11,12 +12,20 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings
-from ..db.models import CreditEntry, CreditPeriod, Subscription, UsageLog, utcnow
+from ..db.models import (
+    CreditEntry,
+    CreditPack,
+    CreditPackEntry,
+    CreditPeriod,
+    Subscription,
+    UsageLog,
+    utcnow,
+)
 from .credits import credits_for_usd
 from .plans import Period, Plan, current_period
 
@@ -25,10 +34,12 @@ logger = logging.getLogger(__name__)
 PARSE = "parse"
 CHAT = "chat"
 RESERVED, CONSUMED, RELEASED = "reserved", "consumed", "released"
+PACK_PAID, PACK_REFUNDED = "paid", "refunded"
 
 
 class InsufficientCredits(Exception):
-    """The balance cannot cover the charge (docs/billing.md § Refusals)."""
+    """The balance — the period's and the active packs' together — cannot cover the
+    charge (docs/billing.md § Refusals)."""
 
     def __init__(self, need: int, remaining: int, period_end: datetime) -> None:
         super().__init__("Not enough credits")
@@ -38,29 +49,95 @@ class InsufficientCredits(Exception):
 
 
 @dataclass(frozen=True)
+class PackBalance:
+    """One top-up pack as the balance sees it (docs/billing.md § Top-up packs)."""
+
+    id: str
+    pack_id: str
+    credits: int
+    spent: int
+    status: str
+    purchased_at: datetime
+    expires_at: datetime
+    active: bool
+
+    @property
+    def remaining(self) -> int:
+        """What the pack still gives: nothing once refunded or expired."""
+        return max(0, self.credits - self.spent) if self.active else 0
+
+
+@dataclass(frozen=True)
 class Balance:
     period: Period
     granted: int
     spent: int
+    # Every pack the user bought, newest first.
+    packs: tuple[PackBalance, ...] = ()
 
     @property
     def remaining(self) -> int:
+        """The period's own balance, negative in an overdraft."""
         return self.granted - self.spent
+
+    @property
+    def packs_remaining(self) -> int:
+        return sum(pack.remaining for pack in self.packs)
+
+    @property
+    def available(self) -> int:
+        """What a charge is measured against: the period's remaining, 0 when overdrawn,
+        plus every active pack's (docs/billing.md § Top-up packs)."""
+        return max(0, self.remaining) + self.packs_remaining
+
+    @property
+    def packs_expire_at(self) -> datetime | None:
+        """The earliest expiry among the active packs with credits left."""
+        dates = [pack.expires_at for pack in self.packs if pack.remaining > 0]
+        return min(dates) if dates else None
+
+
+def pack_active(pack: CreditPack, now: datetime) -> bool:
+    """A pack counts while it is paid and not yet expired (docs/billing.md § Top-up packs)."""
+    return pack.status == PACK_PAID and pack.expires_at > now
+
+
+def _pack_balance(pack: CreditPack, now: datetime) -> PackBalance:
+    return PackBalance(
+        id=pack.id,
+        pack_id=pack.pack_id,
+        credits=pack.credits,
+        spent=pack.spent,
+        status=pack.status,
+        purchased_at=pack.purchased_at,
+        expires_at=pack.expires_at,
+        active=pack_active(pack, now),
+    )
 
 
 async def read_balance(
     db: AsyncSession, settings: Settings, user_id: int, now: datetime | None = None
 ) -> Balance:
-    """The current period and its balance, without writing: a period never used has no
-    row and its whole grant left."""
+    """The current period, its balance and the packs, without writing: a period never
+    used has no row and its whole grant left."""
     now = now or utcnow()
     period = current_period(
         await db.get(Subscription, user_id), settings.plans, settings.free_plan, now
     )
     row = await db.get(CreditPeriod, (user_id, period.start))
+    packs = tuple(
+        _pack_balance(pack, now)
+        for pack in (
+            await db.execute(
+                select(CreditPack)
+                .where(CreditPack.user_id == user_id)
+                .order_by(CreditPack.purchased_at.desc(), CreditPack.id)
+            )
+        ).scalars()
+    )
     if row is None:
-        return Balance(period, period.plan.credits, 0)
-    return Balance(period, max(row.granted, period.plan.credits), row.spent)
+        return Balance(period, period.plan.credits, 0, packs)
+    return Balance(period, max(row.granted, period.plan.credits), row.spent, packs)
 
 
 async def plan_of(db: AsyncSession, settings: Settings, user_id: int) -> Plan:
@@ -122,6 +199,40 @@ async def period_row(
     return row, period
 
 
+async def _active_packs(db: AsyncSession, user_id: int, now: datetime) -> list[CreditPack]:
+    """The packs a charge may take from, locked, the one that expires first ahead
+    (docs/billing.md § Top-up packs)."""
+    return list(
+        (
+            await db.execute(
+                select(CreditPack)
+                .where(
+                    CreditPack.user_id == user_id,
+                    CreditPack.status == PACK_PAID,
+                    CreditPack.expires_at > now,
+                )
+                .order_by(CreditPack.expires_at, CreditPack.id)
+                .with_for_update()
+            )
+        ).scalars()
+    )
+
+
+def _left(pack: CreditPack) -> int:
+    return max(0, pack.credits - pack.spent)
+
+
+async def _take_from_pack(db: AsyncSession, pack: CreditPack, share: int) -> bool:
+    """One pack's conditional UPDATE: the share is taken only if it is still there."""
+    taken = await db.execute(
+        update(CreditPack)
+        .where(CreditPack.id == pack.id, CreditPack.credits - CreditPack.spent >= share)
+        .values(spent=CreditPack.spent + share, updated_at=utcnow())
+    )
+    await db.refresh(pack)
+    return taken.rowcount == 1
+
+
 async def _take(
     db: AsyncSession,
     settings: Settings,
@@ -129,23 +240,56 @@ async def _take(
     amount: int,
     need: int,
     now: datetime | None,
-) -> Period:
-    """Add `amount` to the current period's `spent`, refusing when the balance is under
-    `need`. One conditional UPDATE is the guard (docs/billing.md § The ledger)."""
+) -> tuple[Period, list[tuple[str, int]]]:
+    """Take `amount` from the current period first and the active packs after, in the
+    order they expire, refusing when what is available is under `need`. Conditional
+    UPDATEs are the guards; returns the period and each pack's share (docs/billing.md
+    § The ledger, § Top-up packs)."""
+    now = now or utcnow()
     row, period = await period_row(db, settings, user_id, now)
-    taken = await db.execute(
-        update(CreditPeriod)
-        .where(
-            CreditPeriod.user_id == user_id,
-            CreditPeriod.period_start == period.start,
-            CreditPeriod.granted - CreditPeriod.spent >= need,
+    packs = await _active_packs(db, user_id, now)
+    period_left = max(0, row.granted - row.spent)
+    available = period_left + sum(_left(pack) for pack in packs)
+    if available < need:
+        raise InsufficientCredits(need, available, period.end)
+    from_period = min(amount, period_left)
+    if from_period:
+        taken = await db.execute(
+            update(CreditPeriod)
+            .where(
+                CreditPeriod.user_id == user_id,
+                CreditPeriod.period_start == period.start,
+                CreditPeriod.granted - CreditPeriod.spent >= from_period,
+            )
+            .values(spent=CreditPeriod.spent + from_period, updated_at=utcnow())
         )
-        .values(spent=CreditPeriod.spent + amount, updated_at=utcnow())
-    )
-    await db.refresh(row)
-    if taken.rowcount != 1:
-        raise InsufficientCredits(need, row.granted - row.spent, period.end)
-    return period
+        await db.refresh(row)
+        if taken.rowcount != 1:
+            raise InsufficientCredits(need, max(0, row.granted - row.spent), period.end)
+    shares: list[tuple[str, int]] = []
+    rest = amount - from_period
+    for pack in packs:
+        if rest <= 0:
+            break
+        share = min(rest, _left(pack))
+        if share <= 0:
+            continue
+        if not await _take_from_pack(db, pack, share):
+            raise InsufficientCredits(need, available, period.end)
+        shares.append((pack.id, share))
+        rest -= share
+    if rest > 0:  # pragma: no cover - the rows are locked above; a guard only
+        raise InsufficientCredits(need, available, period.end)
+    return period, shares
+
+
+async def _record_shares(
+    db: AsyncSession, entry: CreditEntry, shares: list[tuple[str, int]]
+) -> None:
+    for pack_id, share in shares:
+        db.add(CreditPackEntry(entry_id=entry.id, pack_id=pack_id, amount=share))
+    if shares:
+        await db.flush()
 
 
 async def reserve(
@@ -161,10 +305,10 @@ async def reserve(
     minimum: int = 0,
     now: datetime | None = None,
 ) -> CreditEntry:
-    """Reserve `amount` credits of the current period for a job or a turn, refusing when
-    the balance is under `max(amount, minimum)`; the entry is inserted in the same
-    transaction."""
-    period = await _take(db, settings, user_id, amount, max(amount, minimum), now)
+    """Reserve `amount` credits of the current period — and the packs after it — for a
+    job or a turn, refusing when the balance is under `max(amount, minimum)`; the entry
+    and the packs' shares are inserted in the same transaction."""
+    period, shares = await _take(db, settings, user_id, amount, max(amount, minimum), now)
     entry = CreditEntry(
         user_id=user_id,
         period_start=period.start,
@@ -177,6 +321,7 @@ async def reserve(
     )
     db.add(entry)
     await db.flush()
+    await _record_shares(db, entry, shares)
     return entry
 
 
@@ -184,21 +329,23 @@ async def reserve_again(
     db: AsyncSession, settings: Settings, job_id: uuid.UUID, now: datetime | None = None
 ) -> None:
     """A retry takes back the credits its job's failure released, from the current period
-    and dated now, so a document is charged once, by the run that delivers it
-    (docs/billing.md § A parse). A job with no entry — queued before the ledger — or one
-    not released is left as it is."""
+    and the packs as they stand now, dated now, so a document is charged once, by the run
+    that delivers it (docs/billing.md § A parse). A job with no entry — queued before the
+    ledger — or one not released is left as it is."""
     entry = (
         await db.execute(select(CreditEntry).where(CreditEntry.job_id == job_id).with_for_update())
     ).scalar_one_or_none()
     if entry is None or entry.state != RELEASED:
         return
     now = now or utcnow()
-    period = await _take(db, settings, entry.user_id, entry.amount, entry.amount, now)
+    period, shares = await _take(db, settings, entry.user_id, entry.amount, entry.amount, now)
     entry.period_start = period.start
     entry.state = RESERVED
     entry.created_at = now
     entry.settled_at = None
+    await db.execute(delete(CreditPackEntry).where(CreditPackEntry.entry_id == entry.id))
     await db.flush()
+    await _record_shares(db, entry, shares)
 
 
 async def _move_spent(db: AsyncSession, entry: CreditEntry, delta: int) -> None:
@@ -211,6 +358,27 @@ async def _move_spent(db: AsyncSession, entry: CreditEntry, delta: int) -> None:
             )
             .values(spent=CreditPeriod.spent + delta, updated_at=utcnow())
         )
+
+
+async def _give_back(db: AsyncSession, entry: CreditEntry) -> None:
+    """A release restores each share where it came from: a pack's to that pack, expired
+    or not, and the rest to the period (docs/billing.md § Top-up packs)."""
+    shares = (
+        (await db.execute(select(CreditPackEntry).where(CreditPackEntry.entry_id == entry.id)))
+        .scalars()
+        .all()
+    )
+    from_packs = 0
+    for share in shares:
+        await db.execute(
+            update(CreditPack)
+            .where(CreditPack.id == share.pack_id)
+            .values(spent=CreditPack.spent - share.amount, updated_at=utcnow())
+        )
+        from_packs += share.amount
+    if shares:
+        await db.execute(delete(CreditPackEntry).where(CreditPackEntry.entry_id == entry.id))
+    await _move_spent(db, entry, -(entry.amount - from_packs))
 
 
 async def settle_parse(db: AsyncSession, job_id: uuid.UUID, status: str) -> None:
@@ -229,16 +397,42 @@ async def settle_parse(db: AsyncSession, job_id: uuid.UUID, status: str) -> None
         entry.state = CONSUMED
     else:
         entry.state = RELEASED
-        await _move_spent(db, entry, -entry.amount)
+        await _give_back(db, entry)
     entry.settled_at = utcnow()
     await db.flush()
 
 
+async def _spill(db: AsyncSession, entry: CreditEntry, delta: int, now: datetime) -> None:
+    """A turn's further cost goes into its period up to what that has left, then into the
+    active packs in the order they expire, and only then into the period past its grant —
+    the overdraft (docs/billing.md § A chat turn, § Top-up packs)."""
+    period = await db.get(CreditPeriod, (entry.user_id, entry.period_start))
+    if period is not None:
+        await db.refresh(period)
+    into_period = min(delta, max(0, period.granted - period.spent)) if period else 0
+    rest = delta - into_period
+    packs = await _active_packs(db, entry.user_id, now) if rest > 0 else []
+    for pack in packs:
+        if rest <= 0:
+            break
+        share = min(rest, _left(pack))
+        if share <= 0 or not await _take_from_pack(db, pack, share):
+            continue
+        recorded = await db.get(CreditPackEntry, (entry.id, pack.id))
+        if recorded is None:
+            db.add(CreditPackEntry(entry_id=entry.id, pack_id=pack.id, amount=share))
+        else:
+            recorded.amount += share
+        rest -= share
+    await _move_spent(db, entry, into_period + rest)
+
+
 async def settle_chat(db: AsyncSession, settings: Settings, turn_id: uuid.UUID) -> int | None:
     """Re-price a turn from every `usage_log` row it has so far — subagent calls carry its
-    id and count with it — rounded up once over the whole turn, and move the period's
-    `spent` by the difference. Returns the period's remaining balance, negative in an
-    overdraft; None when the turn has no entry (docs/billing.md § A chat turn)."""
+    id and count with it — rounded up once over the whole turn, and move the difference
+    into the period, the packs, then the overdraft. Returns what is left to the turn —
+    the period's remaining, 0 when overdrawn, plus the active packs' — or None when the
+    turn has no entry (docs/billing.md § A chat turn)."""
     entry = (
         await db.execute(
             select(CreditEntry).where(CreditEntry.turn_id == turn_id).with_for_update()
@@ -275,15 +469,21 @@ async def settle_chat(db: AsyncSession, settings: Settings, turn_id: uuid.UUID) 
             cache_write_tokens=int(cache_write or 0),
         )
     amount = credits_for_usd(usd, settings.credit_usd) if rows else 0
+    now = utcnow()
     if entry.state == RESERVED:
-        await _move_spent(db, entry, amount - entry.amount)
+        delta = amount - entry.amount
+        if delta > 0:
+            await _spill(db, entry, delta, now)
+        elif delta < 0:  # pragma: no cover - a turn's cost never falls; a guard only
+            await _move_spent(db, entry, delta)
         entry.amount = amount
         await db.flush()
     period = await db.get(CreditPeriod, (entry.user_id, entry.period_start))
     if period is None:  # pragma: no cover - the entry's period row outlives it
         return None
     await db.refresh(period)
-    return period.granted - period.spent
+    packs = await _active_packs(db, entry.user_id, now)
+    return max(0, period.granted - period.spent) + sum(_left(pack) for pack in packs)
 
 
 async def close_chat(db: AsyncSession, turn_id: uuid.UUID) -> None:
