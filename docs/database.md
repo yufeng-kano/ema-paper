@@ -7,6 +7,10 @@ PostgreSQL 16+. Schema changes **only** via Alembic migrations under `apps/api/m
 ```text
 users            id PK, google_sub UNIQUE, email, name,
                  picture NULL,                    -- Google avatar URL, refreshed each sign-in
+                 default_view VARCHAR(16) NOT NULL DEFAULT 'markdown',
+                                                  -- original | markdown: the view a converted
+                                                  -- PDF or image opens on the first time
+                                                  -- (web.md § Result viewer)
                  created_at
                  -- deleting the row is deleting the account (see Rules): every table
                  -- below with a user_id cascades from it, pay_events keep theirs as NULL
@@ -43,9 +47,10 @@ agent_settings   (user_id FK, agent) PK,
                  auto_check BOOL NOT NULL DEFAULT true,
                                                   -- check: check every Files upload before
                                                   -- it opens (parsing.md § Format check)
-                 auto_convert BOOL NOT NULL DEFAULT true
+                 auto_convert BOOL NOT NULL DEFAULT false
                                                   -- parse: convert an uploaded PDF or image
-                                                  -- on arrival; off keeps it as a file
+                                                  -- on arrival; off (the default since
+                                                  -- 2026-10-26) keeps it as a file
                                                   -- (workspace.md § Files)
                  -- one row per user and agent (agents.md); no row means every column's
                  -- default. Both FKs ON DELETE SET NULL; deleting a connection also clears
@@ -149,6 +154,9 @@ documents        id PK, user_id FK, folder_id FK folders NULL, job_id FK jobs NU
                                                   -- as, from its name; NULL otherwise
                  size_bytes BIGINT NULL,          -- file: its size in the tree, refreshed
                                                   -- by reconciliation; NULL otherwise
+                 view VARCHAR(16) NULL,           -- original | markdown: the view the reader
+                                                  -- last switched a PDF or image to; NULL
+                                                  -- never (web.md § Result viewer)
                  reconvert_job_id FK jobs NULL,   -- the re-convert queued, running or
                                                   -- failed (docs/jobs.md § Re-converting
                                                   -- a document); ON DELETE SET NULL
@@ -322,6 +330,7 @@ credit_entries   id PK, user_id FK, period_start,
 - **The figure check migration** (`figure check`) added `job_pages.figures` (NULL: no check). No row is rewritten: a page kept from before it keeps no statuses, and its figures carry no `check`. Its downgrade drops the column.
 - **The ledger migration** (`credit entries outlive turns`) changed `credit_entries.turn_id` from `ON DELETE CASCADE` to `ON DELETE SET NULL` and replaced the check that a chat entry has a turn with one that a parse entry has none: a conversation deleted by its reader takes its turns and leaves their entries behind, still counted in the period and in `/api/billing/entries`. No row is rewritten. Its downgrade restores the cascade and refuses while any chat entry has no turn, naming the count — those entries would otherwise have to be deleted from the billing record.
 - **The library files migration** (`library files`) added `documents.kind` — `parse`, `markdown` or `file`; NOT NULL, default `parse` — backfilled from `job_id` (a row with a job is a `parse`, one without a `markdown`), `documents.media_type` and `documents.size_bytes` (NULL on every existing row: only a file carries them) and `agent_settings.auto_convert` (true). No row is rewritten otherwise. Its downgrade refuses while any row is a file, naming the count — without `kind` those rows would read as markdown documents whose text no route could find — and otherwise drops the four columns.
+- **The reader views migration** (`reader views`) added `users.default_view` (`markdown` on every row) and `documents.view` (NULL on every row), and turned `agent_settings.auto_convert` off: its default became `false` and every existing row was set to `false` — the switch had been on for everyone as the default the library files migration gave it, and since 2026-10-26 an uploaded PDF or image is kept as it is until the reader asks for Markdown ([web.md](./web.md) § Files). Its downgrade drops the two columns and restores the default of `true`; the rows stay off.
 - **The parse retention migration** (`parse retention and account deletion`) did the same for `credit_entries.job_id`: `fk_credit_entries_job_id_jobs` went from `ON DELETE CASCADE` to `ON DELETE SET NULL`, and `ck_credit_entries_parse_job`, which held that an entry has a job exactly when it is a parse, became the check that a chat entry has no job (`kind = 'parse' OR job_id IS NULL`): a parse the retention deletes ([jobs.md](./jobs.md) § Retention) leaves its entry behind, still counted in its period and in `/api/billing/entries`. It added the indexes the purge and a job's foreign-key actions read, `ix_documents_job_id` and `ix_usage_log_job_id`, and the partial `ix_documents_trashed_at` and `ix_folders_trashed_at` (`WHERE trashed_at IS NOT NULL`) the Trash's expiry reads. No row is rewritten and none is deleted: the parses already past their time go at the first sweep after the deploy. Its downgrade drops the four indexes, restores the cascade and the old check, and refuses while any parse entry has no job, naming the count — those entries would otherwise have to be deleted from the billing record.
 - **The re-convert migration** (`reconvert documents`) added `documents.reconvert_job_id` (NULL: no re-convert) and its partial index. No row is rewritten. Its downgrade drops both: a re-convert still running then finishes as a parse no document takes, which the retention deletes in its time.
 - **The markdown documents migration** (`markdown documents`) dropped NOT NULL from `documents.job_id` and nothing else: every existing row keeps its job, and no row is rewritten. Its downgrade refuses while any document has no job, naming the count — restoring NOT NULL would otherwise have to delete the reader's markdown documents and their conversations with them. Delete them first, deliberately, if the downgrade is really wanted.
