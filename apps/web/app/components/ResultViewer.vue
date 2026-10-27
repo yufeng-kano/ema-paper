@@ -5043,8 +5043,7 @@ watch(
    to click between them. The scrollbar is hidden on this region, as on the two columns
    beside it; it still scrolls. The located passage's wash fades by this property (below).
    `--page-width` is the column's share of the pane, the rest being the body margins the
-   reader chose in Settings (docs/web.md § Body margins): 70% until chosen. None keeps 16px
-   a side, which with the padding is the 56px a heading's handle sits out on Files. */
+   reader chose in Settings (docs/web.md § Body margins): 70% until chosen. */
 .document {
   --block-heading: var(--display-lg);
   --block-subheading: var(--display-sm);
@@ -5073,8 +5072,25 @@ watch(
   --locate-fade: 1;
 }
 
+/* None: the whole pane, with the side padding the stacked layout keeps (below) — the one
+   slot a heading's chevron and handle then share, by the same rules. */
 .document[data-margin='none'] {
-  --page-width: calc(100% - 32px);
+  --page-width: 100%;
+  padding-inline: var(--space-8);
+}
+
+.document[data-margin='none'].files .block[data-kind='h2'] > .block-handle,
+.document[data-margin='none'].files .block[data-kind='h3'] > .block-handle {
+  left: -28px;
+}
+
+.document[data-margin='none'].files .block:is([data-kind='h2'], [data-kind='h3']):not(.open, .selected, .moving) > .block-handle:not(.on) {
+  display: none;
+}
+
+.document[data-margin='none'].files .block:is(.open, .selected, .moving) > .block-chevron,
+.document[data-margin='none'].files .block-handle.on ~ .block-chevron {
+  display: none;
 }
 
 .document[data-margin='narrow'] {
