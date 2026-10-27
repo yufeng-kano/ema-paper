@@ -53,19 +53,14 @@ export default {
     },
     reader: {
       title: 'Reader',
-      notes: {
-        label: 'Notes width',
-        description: 'Width of the notes column when it opens.',
-      },
-      agent: {
-        label: 'Agent width',
-        description: 'Width of the agent column when it opens.',
+      margins: {
+        label: 'Body margins',
+        description: 'The room left at each side of the text.',
       },
       narrow: 'Narrow',
       standard: 'Standard',
       wide: 'Wide',
-      dragged: 'Set by dragging. Pick a step to go back to a fixed width.',
-      foot: 'Applies when the columns sit side by side. A narrow window makes them narrower.',
+      foot: 'A narrow window gives the text its whole width.',
     },
     preferences: {
       title: 'PDFs and images',

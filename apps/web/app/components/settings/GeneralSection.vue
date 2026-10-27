@@ -1,31 +1,26 @@
 <script setup lang="ts">
 /**
  * General (docs/web.md § Pages, `/settings/<section>`): the theme, the language and the
- * reader's column widths.
+ * reader's body margins.
  *
  * Theme is a three-way segmented control, kept in `localStorage` by `useTheme`. Language is
  * a native select whose change is navigation — the locale lives in the URL — so it goes
- * through `switchLocalePath` and keeps the reader on this section. The widths are the result
- * viewer's own state (`useViewerLayout`), so a viewer on screen follows a step at once
- * (docs/web.md § Result viewer, *Column widths*).
+ * through `switchLocalePath` and keeps the reader on this section. The margins are the
+ * result viewer's own state (`useViewerLayout`), so a viewer on screen follows a step at
+ * once (docs/web.md § Result viewer, *Body margins*).
  */
 import { THEMES, type Theme } from '~/composables/useTheme'
-import { COLUMN_WIDTHS, WIDTH_STEPS, widthStep } from '~/lib/columns'
+import { PAPER_MARGINS } from '~/composables/useViewerLayout'
 import type { IconName } from '~/lib/icons'
 
 const { t, locale, locales } = useI18n()
 const switchLocalePath = useSwitchLocalePath()
 const { theme, set } = useTheme()
-const { chosenWidth, chooseWidth } = useViewerLayout()
+const { paperMargin } = useViewerLayout()
 
 const THEME_ICONS: Record<Theme, IconName> = { system: 'monitor', light: 'sun', dark: 'moon' }
 
 const languageId = useId()
-
-/** Which step each card's chosen width is — never the width a narrow window draws it at —
- *  or null after a drag left it between them. */
-const notesStep = computed(() => widthStep('notes', chosenWidth.notes))
-const agentStep = computed(() => widthStep('agent', chosenWidth.agent))
 
 function switchLanguage(code: string) {
   if (code !== locale.value) {
@@ -66,40 +61,17 @@ function switchLanguage(code: string) {
     </SettingsGroup>
 
     <SettingsGroup :title="t('settings.reader.title')">
-      <SettingsRow
-        :label="t('settings.reader.notes.label')"
-        :description="notesStep ? t('settings.reader.notes.description') : t('settings.reader.dragged')"
-      >
-        <UiSegmented role="radiogroup" :aria-label="t('settings.reader.notes.label')">
+      <SettingsRow :label="t('settings.reader.margins.label')" :description="t('settings.reader.margins.description')">
+        <UiSegmented role="radiogroup" :aria-label="t('settings.reader.margins.label')">
           <button
-            v-for="step in WIDTH_STEPS"
+            v-for="step in PAPER_MARGINS"
             :key="step"
             type="button"
             role="radio"
             class="segment"
-            :class="{ active: notesStep === step }"
-            :aria-checked="notesStep === step"
-            @click="chooseWidth('notes', COLUMN_WIDTHS.notes.steps[step])"
-          >
-            {{ t(`settings.reader.${step}`) }}
-          </button>
-        </UiSegmented>
-      </SettingsRow>
-
-      <SettingsRow
-        :label="t('settings.reader.agent.label')"
-        :description="agentStep ? t('settings.reader.agent.description') : t('settings.reader.dragged')"
-      >
-        <UiSegmented role="radiogroup" :aria-label="t('settings.reader.agent.label')">
-          <button
-            v-for="step in WIDTH_STEPS"
-            :key="step"
-            type="button"
-            role="radio"
-            class="segment"
-            :class="{ active: agentStep === step }"
-            :aria-checked="agentStep === step"
-            @click="chooseWidth('agent', COLUMN_WIDTHS.agent.steps[step])"
+            :class="{ active: paperMargin === step }"
+            :aria-checked="paperMargin === step"
+            @click="paperMargin = step"
           >
             {{ t(`settings.reader.${step}`) }}
           </button>
