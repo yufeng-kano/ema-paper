@@ -5043,7 +5043,8 @@ watch(
    to click between them. The scrollbar is hidden on this region, as on the two columns
    beside it; it still scrolls. The located passage's wash fades by this property (below).
    `--page-width` is the column's share of the pane, the rest being the body margins the
-   reader chose in Settings (docs/web.md § Body margins): 70% until chosen. */
+   reader chose in Settings (docs/web.md § Body margins): 70% until chosen. None keeps 16px
+   a side, which with the padding is the 56px a heading's handle sits out on Files. */
 .document {
   --block-heading: var(--display-lg);
   --block-subheading: var(--display-sm);
@@ -5072,12 +5073,20 @@ watch(
   --locate-fade: 1;
 }
 
+.document[data-margin='none'] {
+  --page-width: calc(100% - 32px);
+}
+
 .document[data-margin='narrow'] {
-  --page-width: 86%;
+  --page-width: 85%;
 }
 
 .document[data-margin='wide'] {
-  --page-width: 54%;
+  --page-width: 55%;
+}
+
+.document[data-margin='widest'] {
+  --page-width: 40%;
 }
 
 /* The column, centered in the pane. The page boundary carries no rule and no label: it is

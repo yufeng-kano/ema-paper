@@ -57,9 +57,11 @@ export default {
         label: 'Body margins',
         description: 'The room left at each side of the text.',
       },
+      none: 'None',
       narrow: 'Narrow',
       standard: 'Standard',
       wide: 'Wide',
+      widest: 'Widest',
       foot: 'A narrow window gives the text its whole width.',
     },
     preferences: {
