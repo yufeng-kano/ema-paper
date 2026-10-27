@@ -90,6 +90,10 @@ class User(Base):
     default_view: Mapped[str] = mapped_column(
         String(16), default=MARKDOWN_VIEW, server_default=text("'markdown'")
     )
+    # Refused redeem-code attempts in the window that `redeem_failed_at` opened
+    # (docs/billing.md § Redeem codes).
+    redeem_failures: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    redeem_failed_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
 
 
@@ -944,8 +948,9 @@ class CreditEntry(Base):
 
 
 class CreditPack(Base):
-    """A top-up pack bought on Pro, written from Pay's canonical purchase (docs/billing.md
-    § Top-up packs): credits valid until `expires_at`, spent once the period's grant is."""
+    """A top-up pack bought on Pro, written from Pay's canonical purchase, or granted by a
+    redeem code (docs/billing.md § Top-up packs, § Redeem codes): credits valid until
+    `expires_at`, spent once the period's grant is."""
 
     __tablename__ = "credit_packs"
     __table_args__ = (
@@ -954,9 +959,10 @@ class CreditPack(Base):
         CheckConstraint("spent >= 0", name="ck_credit_packs_spent"),
         CheckConstraint("expires_at > purchased_at", name="ck_credit_packs_validity"),
         CheckConstraint("status IN ('paid', 'refunded')", name="ck_credit_packs_status"),
+        CheckConstraint("source IN ('pay', 'code')", name="ck_credit_packs_source"),
     )
 
-    # Pay's purchaseId.
+    # Pay's purchaseId, or `redeem-<redemption id>` for a code's credits.
     id: Mapped[str] = mapped_column(String(255), primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     pack_id: Mapped[str] = mapped_column(String(64))
@@ -967,6 +973,12 @@ class CreditPack(Base):
     expires_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ)
     # Pay's version (milliseconds): an update carrying an older one is ignored.
     version: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+    # `pay`: bought, Pay's to refund; `code`: a redeem code's grant, which nothing refunds
+    # and the webhook and the refresh never touch (docs/billing.md § Redeem codes).
+    source: Mapped[str] = mapped_column(String(8), default="pay", server_default=text("'pay'"))
+    redemption_id: Mapped[int | None] = mapped_column(
+        ForeignKey("redemptions.id", ondelete="SET NULL"), unique=True, nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
 
@@ -1002,3 +1014,66 @@ class PackCheckout(Base):
     purchase_id: Mapped[str | None] = mapped_column(String(255), unique=True, nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
+
+
+class RedeemCode(Base):
+    """A code the operator hands out (docs/billing.md § Redeem codes): credits kept as a
+    pack once redeemed, or days of a paid plan banked on `plan_grants`. No user_id: a
+    code outlives every account that used it."""
+
+    __tablename__ = "redeem_codes"
+    __table_args__ = (
+        CheckConstraint("kind IN ('credits', 'plan')", name="ck_redeem_codes_kind"),
+        CheckConstraint("max_uses >= 1", name="ck_redeem_codes_max_uses"),
+        CheckConstraint("uses >= 0", name="ck_redeem_codes_uses"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # The random characters as printed, without the prefix; never logged.
+    code: Mapped[str] = mapped_column(String(64), unique=True)
+    kind: Mapped[str] = mapped_column(String(16))  # credits | plan
+    credits: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    valid_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    plan_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_uses: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    uses: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    redeem_by: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
+    # The operator's note, never shown to a user.
+    label: Mapped[str] = mapped_column(String(255), default="", server_default=text("''"))
+    disabled_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
+
+
+class Redemption(Base):
+    """One user's use of one code, with what it granted as the code stood then
+    (docs/billing.md § Redeem codes)."""
+
+    __tablename__ = "redemptions"
+    __table_args__ = (UniqueConstraint("code_id", "user_id", name="uq_redemptions_code_user"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    code_id: Mapped[int] = mapped_column(ForeignKey("redeem_codes.id", ondelete="CASCADE"))
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(16))
+    credits: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    plan_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    redeemed_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
+
+
+class PlanGrant(Base):
+    """The user's bank of granted days and, while one runs, the open granted period
+    (docs/billing.md § Periods, *Granted days*)."""
+
+    __tablename__ = "plan_grants"
+    __table_args__ = (CheckConstraint("days_banked >= 0", name="ck_plan_grants_days"),)
+
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    plan_id: Mapped[str] = mapped_column(String(64))
+    days_banked: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    period_start: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
+    period_end: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)

@@ -282,7 +282,9 @@ async def test_the_billing_route_and_me_show_the_plan_and_the_balance(make_clien
         "granted": 150,
         "spent": 0,
         "remaining": 150,
+        "source": "free",
     }
+    assert (billing["plan_grant"], billing["redemptions"]) == (None, [])
     assert billing["rates"]["parse_per_page"] == 1
     # Every priced model, in the price table's order. US$1 per million tokens at US$0.002
     # a credit: half a credit per 1K tokens.

@@ -92,6 +92,14 @@ class Settings(BaseSettings):
     # is not deleted while one of its own is that young (docs/auth.md § Deleting the
     # account).
     kano_pay_checkout_lifetime_seconds: int = 86_400
+    # Redeem codes (docs/billing.md § Redeem codes): the prefix a code is printed and typed
+    # with, how many random characters follow it, how many days one granted period of a
+    # paid plan runs, and the refused attempts a user may make in the window before 429.
+    redeem_code_prefix: str = "EMA"
+    redeem_code_chars: int = 12
+    grant_period_days: int = 30
+    redeem_max_failures: int = 10
+    redeem_failure_window_seconds: int = 3600
 
     upload_max_bytes: int = 134_217_728
     # A file of any other kind uploaded to the library, kept once in the tree
@@ -335,9 +343,16 @@ class Settings(BaseSettings):
             "chat_idle_compact_sweep_seconds",
             "chat_memory_file_max_chars",
             "chat_context_window_tokens",
+            "redeem_code_chars",
+            "grant_period_days",
+            "redeem_max_failures",
+            "redeem_failure_window_seconds",
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name.upper()} must be positive")
+        self.redeem_code_prefix = self.redeem_code_prefix.strip().upper()
+        if self.redeem_code_prefix and not self.redeem_code_prefix.isalnum():
+            raise ValueError("REDEEM_CODE_PREFIX must be letters and digits only")
         if self.free_storage_bytes > self.workspace_quota_bytes:
             raise ValueError("FREE_STORAGE_BYTES exceeds WORKSPACE_QUOTA_BYTES")
         if self.free_max_jobs > self.max_jobs_per_user:

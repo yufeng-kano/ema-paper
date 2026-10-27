@@ -25,7 +25,7 @@ One worker process runs one job at a time — concurrency inside a job is the pa
 - `VISION_CONCURRENCY_PER_JOB` = 8 concurrent upstream calls.
 - `RENDER_WORKERS` = CPU count (env-overridable) concurrent Poppler subprocesses per worker.
 
-Fairness: the claim query above is FIFO; the per-user cap is enforced at claim time too (skip a queued job whose user already has their cap running), and the claim reads the cap from the user's `subscriptions` row as it stands then — a paid period that lapsed between intake and claim runs the queued jobs one at a time, as Free does — under `MAX_JOBS_PER_USER`.
+Fairness: the claim query above is FIFO; the per-user cap is enforced at claim time too (skip a queued job whose user already has their cap running), and the claim reads the cap from the user's `subscriptions` row as it stands then, or — with no paid period running — from the open granted period of their `plan_grants` row ([billing.md](./billing.md) § Periods, *Granted days*): a paid or granted period that lapsed between intake and claim runs the queued jobs one at a time, as Free does — under `MAX_JOBS_PER_USER`.
 
 ## Progress
 

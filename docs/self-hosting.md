@@ -100,6 +100,23 @@ The router must pass TLS through untouched (SNI passthrough). Caddy still termin
 - **Paid plans go through Kano Pay**, a separate payment service ([billing.md](./billing.md) § Kano Pay). With the four `KANO_PAY_*` values empty, nobody can check out and Free keeps working.
 - **The sandbox comes with a paid plan.** It gives the chat agent `bash` in one Kata microVM per user, and needs a host with `/dev/kvm` and the Kata runtime ([sandbox.md](./sandbox.md) § Operations). A deployment without paid plans sets `SANDBOX_URL=` (empty): the agent then works without `bash`, and everything else stays.
 
+### Redeem codes
+
+A redeem code gives an account credits, or days of a paid plan, without Kano Pay ([billing.md](./billing.md) § Redeem codes) — a gift to a user, a launch campaign, or the way a private deployment hands out a paid plan's storage and sandbox with Pay left unconfigured. Codes are made on the server, in the api container; there is no page for them:
+
+```sh
+# 100 codes of 500 credits, valid a year once redeemed, redeemable until the end of 2026
+docker compose exec api python -m sightread.codes create --credits 500 --valid-days 365 \
+    --count 100 --redeem-by 2026-12-31 --label "launch"
+# one code anyone may use 200 times, 30 days of the plan "pro" each
+docker compose exec api python -m sightread.codes create --plan pro --days 30 --uses 200 --label "beta"
+docker compose exec api python -m sightread.codes list            # live codes and their uses
+docker compose exec api python -m sightread.codes list --all      # disabled and exhausted ones too
+docker compose exec api python -m sightread.codes disable EMA-XXXX-XXXX-XXXX
+```
+
+`create` prints each code once, as a user types it (`EMA-XXXX-XXXX-XXXX`; the prefix is `REDEEM_CODE_PREFIX`); `--uses` is how many accounts may redeem one code (1 unless given), and a plan must be one of `KANO_PAY_PLANS_JSON` or the command refuses. A user redeems a code in the settings dialog's Usage section. Granted days are spent only while no subscription pays for the account, and a code's credits are never refunded.
+
 ## Connect your tools
 
 - **REST API.** Create a key in Settings → API keys, then:

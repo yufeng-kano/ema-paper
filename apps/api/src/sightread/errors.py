@@ -28,6 +28,11 @@ ErrorType = Literal[
     "pay_unavailable",
     "subscription_active",
     "checkout_open",
+    "code_invalid",
+    "code_expired",
+    "code_exhausted",
+    "code_redeemed",
+    "code_plan_conflict",
     "upstream",
     "internal",
 ]
