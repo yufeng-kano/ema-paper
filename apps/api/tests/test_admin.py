@@ -1290,6 +1290,8 @@ CONSOLE_MUTATIONS = [
     ("post", "/api/admin/codes", {"kind": "credits", "credits": 5}),
     ("post", "/api/admin/codes/{code}/disable", None),
     ("post", "/api/admin/jobs/{job}/requeue", None),
+    ("put", "/api/admin/settings/{key}", {"value": "0.004"}),
+    ("delete", "/api/admin/settings/{key}", None),
 ]
 
 
@@ -1322,7 +1324,9 @@ async def test_console_mutations_require_the_custom_header(
     owner = await _owner(make_client)
     group = await _group(owner, "target", [])
     outsider = await _account(make_client, "outsider@example.test")
-    url = path.format(group=group["id"], user=owner.user_id, code=1, job=uuid.uuid4())
+    url = path.format(
+        group=group["id"], user=owner.user_id, code=1, job=uuid.uuid4(), key="CREDIT_USD"
+    )
     start = await _last_audit_id(owner)
 
     response = await owner.request(method, url, json=body)

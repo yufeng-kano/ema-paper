@@ -527,6 +527,9 @@ class Conversation(Base):
             postgresql_where=text("cache_warm_until IS NOT NULL"),
             sqlite_where=text("cache_warm_until IS NOT NULL"),
         ),
+        # What the settings page counts when a price would be removed (docs/admin.md
+        # § Settings).
+        Index("ix_conversations_model", "model"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -1153,7 +1156,7 @@ class AuditLog(Base):
     # What the route required; NULL for a sign-in's owner join.
     permission: Mapped[str | None] = mapped_column(String(32), nullable=True)
     action: Mapped[str] = mapped_column(String(64))  # <area>.<verb>
-    target_type: Mapped[str] = mapped_column(String(32))  # group | user
+    target_type: Mapped[str] = mapped_column(String(32))  # group | user | setting
     # No foreign key: a record outlives what it names.
     target_id: Mapped[str] = mapped_column(String(64))
     # A side with nothing is SQL NULL (docs/admin.md § The audit log): `none_as_null`, or a
@@ -1166,3 +1169,19 @@ class AuditLog(Base):
     )
     ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
+
+
+class RuntimeSetting(Base):
+    """One setting of `.env` the operator console overrides (docs/admin.md § Settings): a
+    key without a row is `.env`'s. `value` is the text `.env` would hold, kept as a JSON
+    string — never the JSON it may contain, whose key order `jsonb` would not keep."""
+
+    __tablename__ = "runtime_settings"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(JSON_COLUMN)
+    # Who stored it; NULL once that account is deleted.
+    updated_by: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)

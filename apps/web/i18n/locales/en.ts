@@ -1166,6 +1166,7 @@ export default {
       usage: 'Usage',
       groups: 'Groups',
       audit: 'Audit',
+      settings: 'Settings',
     },
     accountId: 'Account {id}',
     deletedAccount: 'Deleted account',
@@ -1443,6 +1444,122 @@ export default {
       builtinNote:
         '{name} is the built-in group: it has every permission, can’t be deleted or have its permissions changed, and keeps its last member. Its first members come from OWNER_EMAILS in the server’s .env.',
     },
+    settings: {
+      title: 'Settings',
+      subtitle:
+        'Blue labels are database values, overriding .env · changes apply within {n} second, no restart | Blue labels are database values, overriding .env · changes apply within {n} seconds, no restart',
+      ignored:
+        'The database’s settings no longer fit .env, so .env alone is in effect: {message}. Change or restore the settings below.',
+      groups: {
+        models: 'Models',
+        credits: 'Credits',
+        free: 'Free plan',
+        prices: 'Prices',
+        plans: 'Plans',
+        packs: 'Packs',
+        keys: 'Keys',
+      },
+      keys: {
+        PARSE_MODEL: 'Parse model',
+        CHECK_MODEL: 'Check model',
+        PARSE_FALLBACK_MODEL: 'Fallback model',
+        MODEL_PRICES_JSON: 'Model prices',
+        CREDIT_USD: 'Credit value',
+        PARSE_CREDITS_PER_PAGE: 'Credits per parsed page',
+        CHAT_MIN_CREDITS: 'Balance a chat message needs',
+        FREE_CREDITS_PER_PERIOD: 'Credits each month',
+        FREE_STORAGE_BYTES: 'Storage',
+        FREE_MAX_JOBS: 'Parses at once',
+        KANO_PAY_PLANS_JSON: 'Paid plans',
+        KANO_PAY_PACKS_JSON: 'Top-up packs',
+      },
+      notes: {
+        PARSE_MODEL: 'Every parse runs on it. Empty refuses parses.',
+        CHECK_MODEL: 'Checks each parse’s format. Empty uses the parse model.',
+        PARSE_FALLBACK_MODEL: 'Where a blocked page goes. Empty means no fallback.',
+        MODEL_PRICES_JSON:
+          'US$ per 1M tokens, in the order the chat agent offers the models; the first is the default.',
+        CREDIT_USD: '1 credit is {usd} of model cost.',
+        PARSE_CREDITS_PER_PAGE: 'Reserved when a parse is queued, given back if it fails.',
+        CHAT_MIN_CREDITS: 'A chat message is refused below this balance.',
+        FREE_CREDITS_PER_PERIOD: 'Given again each UTC month.',
+        FREE_STORAGE_BYTES: 'At most {size}, WORKSPACE_QUOTA_BYTES.',
+        FREE_MAX_JOBS: 'At most {n}, MAX_JOBS_PER_USER.',
+        KANO_PAY_PLANS_JSON: 'What each plan grants; Kano Pay sets its price.',
+        KANO_PAY_PACKS_JSON: 'What each pack grants; Kano Pay sets its price.',
+      },
+      sources: {
+        env: '.env',
+        database: 'Database',
+      },
+      envValue: '.env: {value}',
+      empty: 'Empty',
+      changedBy: '{name} · {date}',
+      raw: 'This text isn’t a table the page can show, so here it is as it stands.',
+      edit: 'Edit',
+      editNamed: 'Edit {name}',
+      restore: 'Restore to .env',
+      restoreNamed: 'Restore {name} to .env',
+      prices: {
+        model: 'Model',
+        input: 'Input',
+        output: 'Output',
+        cacheRead: 'Cache read',
+        cacheWrite: 'Cache write',
+      },
+      plans: {
+        plan: 'Plan',
+        credits: 'Credits',
+        storage: 'Storage',
+        jobs: 'Parses at once',
+        sandbox: 'Sandbox',
+        yes: 'Yes',
+        no: 'No',
+        none: 'No paid plan',
+      },
+      packs: {
+        pack: 'Pack',
+        credits: 'Credits',
+        validFor: 'Valid for',
+        days: '{n} day | {n} days',
+        none: 'No pack is sold',
+      },
+      secretSet: 'Set',
+      secretUnset: 'Not set',
+      secretsNote:
+        'Only whether each is set is shown, never its value. A key is changed in the server’s .env, then the container is recreated.',
+      editTitle: 'Edit {name}',
+      value: 'Value',
+      envNow: 'In .env: {value}',
+      save: 'Save',
+      restoreTitle: 'Restore {name} to .env?',
+      restoreBody: 'The database’s value goes, and the setting is .env’s again:',
+      impactTitle: 'This change takes away what accounts use',
+      impactBody: 'Once confirmed, it applies at once:',
+      removedModels: 'No longer priced: {list}',
+      removedPlans: 'Plans removed: {list}',
+      removedPacks: 'Packs removed: {list}',
+      impact: {
+        conversations:
+          '{n} conversation fails at its next message until it moves to another model | {n} conversations fail at their next message until they move to another model',
+        chat_settings:
+          '{n} account’s chat agent is set to a removed model | {n} accounts’ chat agents are set to a removed model',
+        subagents: '{n} subagent names a removed model | {n} subagents name a removed model',
+        subscriptions: '{n} subscription falls to Free at once | {n} subscriptions fall to Free at once',
+        day_banks:
+          '{n} account’s granted days wait unused | {n} accounts’ granted days wait unused',
+        plan_codes: '{n} live redeem code is refused | {n} live redeem codes are refused',
+        plan_checkouts:
+          '{n} open plan checkout leaves its payer on Free when paid | {n} open plan checkouts leave their payers on Free when paid',
+        pack_checkouts:
+          '{n} open pack checkout adds no credits when paid | {n} open pack checkouts add no credits when paid',
+        free_accounts:
+          '{n} account on Free gets the smaller allowance | {n} accounts on Free get the smaller allowance',
+      },
+      saveAnyway: 'Save anyway',
+      restoreAnyway: 'Restore anyway',
+      back: 'Back',
+    },
     audit: {
       title: 'Audit',
       count: '{n} record | {n} records',
@@ -1464,6 +1581,10 @@ export default {
       noMatch: 'No records match',
       // By the action's own name: `<area>.<verb>`.
       actions: {
+        settings: {
+          update: 'Changed a setting',
+          reset: 'Restored a setting to .env',
+        },
         users: {
           grant_credits: 'Granted credits',
           grant_days: 'Granted days of a plan',
@@ -1485,6 +1606,7 @@ export default {
         },
       },
       targets: {
+        setting: 'Setting',
         user: 'Account',
         group: 'Group',
         code: 'Redeem code',

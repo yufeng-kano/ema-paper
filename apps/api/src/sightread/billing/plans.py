@@ -14,6 +14,10 @@ FREE_PLAN_ID = "free"
 PAID_STATUSES = frozenset({"active", "trialing"})
 # A subscription in one of these renews no more, whatever `cancel_at_period_end` says.
 ENDED_STATUSES = frozenset({"canceled", "expired", "failed"})
+# The most credits one setting may name: the ledger's credits are 32-bit integers
+# (`credit_periods.granted`, `credit_entries.amount`, `credit_packs.credits`), and a larger
+# number would fail every charge it reaches (docs/billing.md § Configuration).
+CREDITS_MAX = 2_147_483_647
 
 
 @dataclass(frozen=True)
@@ -61,6 +65,10 @@ def parse_plans(raw: str, *, storage_ceiling: int, jobs_ceiling: int) -> dict[st
                     f"KANO_PAY_PLANS_JSON: {plan_id!r}.{field} must be an integer >= 0"
                 )
             counts[field] = value
+        if counts["credits"] > CREDITS_MAX:
+            raise ValueError(
+                f"KANO_PAY_PLANS_JSON: {plan_id!r}.credits must be at most {CREDITS_MAX}"
+            )
         sandbox = entry.get("sandbox", False)
         if not isinstance(sandbox, bool):
             raise ValueError(f"KANO_PAY_PLANS_JSON: {plan_id!r}.sandbox must be true or false")
@@ -119,6 +127,10 @@ def parse_packs(raw: str) -> dict[str, Pack]:
                     f"KANO_PAY_PACKS_JSON: {pack_id!r}.{field} must be an integer >= 1"
                 )
             counts[field] = value
+        if counts["credits"] > CREDITS_MAX:
+            raise ValueError(
+                f"KANO_PAY_PACKS_JSON: {pack_id!r}.credits must be at most {CREDITS_MAX}"
+            )
         packs[pack_id] = Pack(id=pack_id, credits=counts["credits"], valid_days=counts["validDays"])
     return packs
 

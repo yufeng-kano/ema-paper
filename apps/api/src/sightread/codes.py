@@ -19,6 +19,7 @@ from .billing import codes
 from .config import Settings, get_settings
 from .db.models import RedeemCode
 from .db.session import create_engine, create_sessionmaker
+from .runtime_settings import RuntimeSettings
 
 
 def _redeem_by(value: str) -> datetime:
@@ -139,10 +140,13 @@ async def run(args: argparse.Namespace, settings: Settings, db: AsyncSession) ->
 
 async def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    settings = get_settings()
-    engine = create_engine(settings.database_url)
+    base = get_settings()
+    engine = create_engine(base.database_url)
     sessionmaker: async_sessionmaker[AsyncSession] = create_sessionmaker(engine)
     try:
+        # The plans the console's Settings page may have stored over `.env`, so the CLI
+        # and the console agree on which a code may give (docs/admin.md § Settings).
+        settings = await RuntimeSettings(lambda: base, lambda: sessionmaker).current()
         async with sessionmaker() as db:
             return await run(args, settings, db)
     finally:

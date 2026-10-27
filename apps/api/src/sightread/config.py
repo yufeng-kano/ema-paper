@@ -10,7 +10,7 @@ from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .billing.credits import ModelPrice, parse_model_prices
-from .billing.plans import FREE_PLAN_ID, Pack, Plan, parse_packs, parse_plans
+from .billing.plans import CREDITS_MAX, FREE_PLAN_ID, Pack, Plan, parse_packs, parse_plans
 
 # Only ever used when APP_ENV=local and SECRET_KEY is unset, so `uv run uvicorn` works
 # without a .env file. Production refuses to start without a real SECRET_KEY.
@@ -86,6 +86,9 @@ class Settings(BaseSettings):
     free_credits_per_period: int = 150
     free_storage_bytes: int = 512_000_000
     free_max_jobs: int = 1
+    # How long the API, the worker and the CLI keep the settings the database overrides
+    # before reading its rows again (docs/admin.md § Settings).
+    runtime_settings_cache_seconds: int = 30
     # What the public policy pages print (docs/web.md § Pages): the support address and
     # who operates the service, served by `GET /api/site`; empty = not printed.
     support_email: str = ""
@@ -345,6 +348,8 @@ class Settings(BaseSettings):
             "parse_credits_per_page",
             "chat_min_credits",
             "free_credits_per_period",
+            "free_storage_bytes",
+            "free_max_jobs",
             "trash_retention_days",
             "parse_retention_days",
             "web_search_credits",
@@ -368,6 +373,7 @@ class Settings(BaseSettings):
             "chat_idle_compact_sweep_seconds",
             "chat_memory_file_max_chars",
             "chat_context_window_tokens",
+            "runtime_settings_cache_seconds",
             "redeem_code_chars",
             "grant_period_days",
             "redeem_max_failures",
@@ -405,6 +411,9 @@ class Settings(BaseSettings):
             raise ValueError("FREE_STORAGE_BYTES exceeds WORKSPACE_QUOTA_BYTES")
         if self.free_max_jobs > self.max_jobs_per_user:
             raise ValueError("FREE_MAX_JOBS exceeds MAX_JOBS_PER_USER")
+        for name in ("parse_credits_per_page", "chat_min_credits", "free_credits_per_period"):
+            if getattr(self, name) > CREDITS_MAX:
+                raise ValueError(f"{name.upper()} must be at most {CREDITS_MAX}")
         # Parsed once, at start: a malformed table or an offered model nobody priced
         # refuses to start rather than running a model for free (docs/billing.md § Models).
         prices = self.model_prices

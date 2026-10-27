@@ -8,7 +8,7 @@
  * what a page offers, so an operator is not handed a control the API would refuse. Code
  * compares permission strings and the `builtin` flag — never a group's name.
  */
-import { ApiRequestError, type AdminCodesCreated } from './api'
+import { ApiRequestError, type AdminCodesCreated, type AdminSettingImpact } from './api'
 import type { CostDay } from './chart'
 import type { IconName } from './icons'
 
@@ -60,6 +60,7 @@ export const CONSOLE_PAGES: readonly ConsolePage[] = [
   { area: 'jobs', path: '/admin/usage', icon: 'dashboard', label: 'admin.nav.usage' },
   { area: 'groups', path: '/admin/groups', icon: 'users-round', label: 'admin.nav.groups' },
   { area: 'audit', path: '/admin/audit', icon: 'scroll-text', label: 'admin.nav.audit' },
+  { area: 'settings', path: '/admin/settings', icon: 'settings', label: 'admin.nav.settings' },
 ]
 
 /** Whether a permission list holds `<area>.<level>`. */
@@ -492,4 +493,177 @@ export function costDays(
       others: top ? cost - top.estimated_cost : 0,
     }
   })
+}
+
+// --- settings -------------------------------------------------------------------------
+
+/**
+ * The settings page's groups (docs/admin.md § Pages, *Settings*): which keys of
+ * `GET /api/admin/settings` each shows, in the page's two columns. The keys are the API's
+ * contract, as `.env` names them; their values are only ever the API's.
+ */
+export const SETTING_GROUPS = [
+  { key: 'models', column: 'start', settings: ['PARSE_MODEL', 'CHECK_MODEL', 'PARSE_FALLBACK_MODEL'] },
+  { key: 'credits', column: 'start', settings: ['CREDIT_USD', 'PARSE_CREDITS_PER_PAGE', 'CHAT_MIN_CREDITS'] },
+  { key: 'free', column: 'start', settings: ['FREE_CREDITS_PER_PERIOD', 'FREE_STORAGE_BYTES', 'FREE_MAX_JOBS'] },
+  { key: 'prices', column: 'end', settings: ['MODEL_PRICES_JSON'] },
+  { key: 'plans', column: 'end', settings: ['KANO_PAY_PLANS_JSON'] },
+  { key: 'packs', column: 'end', settings: ['KANO_PAY_PACKS_JSON'] },
+] as const
+
+/** A setting whose text is a JSON table: edited in a text area. */
+export function isJsonSetting(key: string): boolean {
+  return key.endsWith('_JSON')
+}
+
+/** Whether a parsed JSON value has an object key JavaScript would move to the front — an
+ *  array index like `"7"` — or a number past what a double holds exactly. */
+function reordersOrRounds(node: unknown): boolean {
+  if (Array.isArray(node)) {
+    return node.some(reordersOrRounds)
+  }
+  if (node && typeof node === 'object') {
+    return Object.entries(node).some(([key, child]) => /^(0|[1-9]\d*)$/.test(key) || reordersOrRounds(child))
+  }
+  return typeof node === 'number' && Number.isInteger(node) && !Number.isSafeInteger(node)
+}
+
+/**
+ * A setting's text as the edit dialog opens it: a JSON table pretty-printed, its keys in
+ * their order — `MODEL_PRICES_JSON`'s order is the chat agent's model order — and anything
+ * else, or a table that printing would reorder or round, as it is.
+ */
+export function editableText(value: string): string {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(value)
+  } catch {
+    return value
+  }
+  if (!parsed || typeof parsed !== 'object' || reordersOrRounds(parsed)) {
+    return value
+  }
+  return JSON.stringify(parsed, null, 2)
+}
+
+function parsedJson(value: string): unknown {
+  try {
+    return JSON.parse(value.trim() || 'null')
+  } catch {
+    return undefined
+  }
+}
+
+export interface PriceRow {
+  model: string
+  input: string
+  output: string
+  cache_read: string
+  cache_write: string
+}
+
+/** `MODEL_PRICES_JSON` as the page's table, in its order; null when the text is not one. */
+export function priceRows(value: string): PriceRow[] | null {
+  const table = parsedJson(value)
+  if (!table || typeof table !== 'object' || Array.isArray(table)) {
+    return null
+  }
+  const rows: PriceRow[] = []
+  for (const [model, entry] of Object.entries(table)) {
+    if (!entry || typeof entry !== 'object') {
+      return null
+    }
+    const price = entry as Record<string, unknown>
+    rows.push({
+      model,
+      input: String(price.input ?? ''),
+      output: String(price.output ?? ''),
+      cache_read: String(price.cache_read ?? ''),
+      cache_write: String(price.cache_write ?? ''),
+    })
+  }
+  return rows
+}
+
+export interface PlanRow {
+  id: string
+  credits: number
+  storageBytes: number
+  maxJobs: number
+  sandbox: boolean
+}
+
+export interface PackRow {
+  id: string
+  credits: number
+  validDays: number
+}
+
+/** A JSON list of objects, each with a string at `idField`; null for anything else. Empty
+ *  text is the empty list, as the API reads it. */
+function entries(value: string, idField: string): Record<string, unknown>[] | null {
+  const list = value.trim() ? parsedJson(value) : []
+  if (!Array.isArray(list)) {
+    return null
+  }
+  const objects = list.filter((entry): entry is Record<string, unknown> => !!entry && typeof entry === 'object')
+  return objects.length === list.length && objects.every((entry) => typeof entry[idField] === 'string')
+    ? objects
+    : null
+}
+
+/** `KANO_PAY_PLANS_JSON` as the page's table; null when the text is not one. */
+export function planRows(value: string): PlanRow[] | null {
+  return (
+    entries(value, 'planId')?.map((entry) => ({
+      id: entry.planId as string,
+      credits: Number(entry.credits),
+      storageBytes: Number(entry.storageBytes),
+      maxJobs: Number(entry.maxJobs),
+      sandbox: entry.sandbox === true,
+    })) ?? null
+  )
+}
+
+/** `KANO_PAY_PACKS_JSON` as the page's table; null when the text is not one. */
+export function packRows(value: string): PackRow[] | null {
+  return (
+    entries(value, 'packId')?.map((entry) => ({
+      id: entry.packId as string,
+      credits: Number(entry.credits),
+      validDays: Number(entry.validDays),
+    })) ?? null
+  )
+}
+
+/** What a change takes away, by kind, in the order the confirmation lists them
+ *  (docs/admin.md § Settings, *Confirmed when it takes away*). */
+export const IMPACT_KINDS = [
+  'conversations',
+  'chat_settings',
+  'subagents',
+  'subscriptions',
+  'day_banks',
+  'plan_codes',
+  'plan_checkouts',
+  'pack_checkouts',
+  'free_accounts',
+] as const
+
+/** A settings change's 409 `impact`: what it removes and how much uses it; null for any
+ *  other failure. */
+export function settingImpact(error: unknown): AdminSettingImpact | null {
+  if (!(error instanceof ApiRequestError) || error.type !== 'admin_conflict' || error.details.reason !== 'impact') {
+    return null
+  }
+  const impact = error.details.impact as AdminSettingImpact | undefined
+  return impact && typeof impact === 'object' && impact.counts && impact.removed ? impact : null
+}
+
+/** The confirmation's lines: each kind the change touches, with its count. */
+export function impactLines(impact: AdminSettingImpact): { kind: (typeof IMPACT_KINDS)[number]; n: number }[] {
+  return IMPACT_KINDS.filter((kind) => (impact.counts[kind] ?? 0) > 0).map((kind) => ({
+    kind,
+    n: impact.counts[kind] ?? 0,
+  }))
 }

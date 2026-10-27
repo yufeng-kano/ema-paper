@@ -31,6 +31,7 @@ from .routes import (
     oauth,
     v1,
 )
+from .runtime_settings import RuntimeSettings
 
 # Signed cookie holding only the transient OIDC state/PKCE verifier during a login
 # round trip. The durable credential is the server-side session row.
@@ -57,6 +58,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="Ema Paper", lifespan=lifespan)
     app.state.settings = settings
+    # The settings requests run on: these, with the database's overrides on top, read
+    # through the sessionmaker the lifespan makes (docs/admin.md § Settings).
+    app.state.runtime_settings = RuntimeSettings(
+        lambda: app.state.settings, lambda: app.state.sessionmaker
+    )
     app.state.oauth = build_oauth(settings)
     # Pay's catalog, shared by the public route and the billing view, and when each
     # user's row was last reconciled with Pay (docs/billing.md § Kano Pay).
