@@ -29,6 +29,10 @@ agent-sightread/
                               # groups.py (the built-in group, the sign-in owner join,
                               # members, the no-escalation checks), audit.py (the one
                               # helper that writes an audit row in the caller's transaction),
+                              # grants.py (an operator's grant of credits or days to an
+                              # account, through billing/ledger.py),
+                              # codes.py (creating and disabling redeem codes through
+                              # billing/codes.py, each with its audit row),
                               # jobs.py (a stuck job's requeue, the overview's checks of
                               # Kano Proxy and Kano Pay)
         billing/              # plans, periods and credit arithmetic (docs/billing.md):

@@ -102,7 +102,7 @@ The router must pass TLS through untouched (SNI passthrough). Caddy still termin
 
 ### Redeem codes
 
-A redeem code gives an account credits, or days of a paid plan, without Kano Pay ([billing.md](./billing.md) § Redeem codes) — a gift to a user, a launch campaign, or the way a private deployment hands out a paid plan's storage and sandbox with Pay left unconfigured. Codes are made on the server, in the api container; there is no page for them:
+A redeem code gives an account credits, or days of a paid plan, without Kano Pay ([billing.md](./billing.md) § Redeem codes) — a gift to a user, a launch campaign, or the way a private deployment hands out a paid plan's storage and sandbox with Pay left unconfigured. Codes are made on the operator console's *Redeem codes* page (§ The operator console), or on the server, in the api container, with the CLI — the same rules, the same codes:
 
 ```sh
 # 100 codes of 500 credits, valid a year once redeemed, redeemable until the end of 2026
@@ -115,11 +115,11 @@ docker compose exec api python -m sightread.codes list --all      # disabled and
 docker compose exec api python -m sightread.codes disable EMA-XXXX-XXXX-XXXX
 ```
 
-`create` prints each code once, as a user types it (`EMA-XXXX-XXXX-XXXX`; the prefix is `REDEEM_CODE_PREFIX`); `--uses` is how many accounts may redeem one code (1 unless given), and a plan must be one of `KANO_PAY_PLANS_JSON` or the command refuses. A user redeems a code in the settings dialog's Usage section. Granted days are spent only while no subscription pays for the account, and a code's credits are never refunded.
+`create` prints each code once, as a user types it (`EMA-XXXX-XXXX-XXXX`; the prefix is `REDEEM_CODE_PREFIX`); `--uses` is how many accounts may redeem one code (1 unless given), `--valid-days` and `--days` are at most 36,500, a plan must be one of `KANO_PAY_PLANS_JSON`, `--redeem-by` cannot be a day already past (UTC), and one batch holds at most `REDEEM_CODES_MAX_COUNT` (1000) codes, or the command refuses. The console shows a code in full only once, when it creates it; `list` here prints every code whole, which is how to read back one whose dialog was closed. A plan code whose plan was taken out of `KANO_PAY_PLANS_JSON` lists as `plan missing` and is refused to users until the plan is back. A user redeems a code in the settings dialog's Usage section. Granted days are spent only while no subscription pays for the account, and a code's credits are never refunded.
 
 ## The operator console
 
-The console is your own pages inside the app — today *Overview*, *Jobs* and *Usage*, to see whether the worker runs, put a stuck job back in the queue and see what the model calls cost, *Groups*, to give other people access, and *Audit*, the record of every change made there ([admin.md](./admin.md)). It does not exist until you name its first owner. Put your Google address in `.env`:
+The console is your own pages inside the app — today *Overview*, *Jobs* and *Usage*, to see whether the worker runs, put a stuck job back in the queue and see what the model calls cost, *Users*, to look an account up and give it credits or days, *Redeem codes*, *Groups*, to give other people access, and *Audit*, the record of every change made there ([admin.md](./admin.md)). It does not exist until you name its first owner. Put your Google address in `.env`:
 
 ```sh
 OWNER_EMAILS=you@example.com    # comma-separated for several; empty = no console
@@ -134,7 +134,7 @@ docker compose -f docker-compose.production.yaml up -d --no-deps api
 
 Sign in with that Google account (or sign out and in again): the account menu now has *Admin console*. The address joins the built-in `owner` group, which holds every permission, at a sign-in whose address Google has verified; taking it out of `OWNER_EMAILS` later removes no one — an owner does that on the Groups page. The console asks for a fresh sign-in once a session is older than `ADMIN_REAUTH_HOURS` (12). Locally, `OWNER_EMAILS=dev@localhost` makes the dev login an owner.
 
-Redeem codes are still made with `python -m sightread.codes` (§ Redeem codes); the CLI needs no console and keeps working beside it.
+The *Redeem codes* page creates, lists and disables codes by the same rules as `python -m sightread.codes` (§ Redeem codes); the CLI needs no console and keeps working beside it.
 
 ## Connect your tools
 

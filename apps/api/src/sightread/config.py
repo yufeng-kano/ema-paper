@@ -48,6 +48,12 @@ class Settings(BaseSettings):
     owner_emails: str = ""
     admin_reauth_hours: int = 12
     admin_page_size: int = 50
+    # A grant from the console's Users page (docs/admin.md § Users and grants): how many
+    # days granted credits are valid unless the operator picks another number, and the most
+    # one grant may give — credits, and days of a plan or of a credit grant's validity.
+    admin_grant_valid_days: int = 365
+    admin_grant_max_credits: int = 1_000_000
+    admin_grant_max_days: int = 3650
 
     # The console's jobs and usage (docs/admin.md § Overview, jobs and usage): how long the
     # overview waits for each of Kano Proxy's and Kano Pay's catalogs, the most days one read
@@ -116,6 +122,9 @@ class Settings(BaseSettings):
     grant_period_days: int = 30
     redeem_max_failures: int = 10
     redeem_failure_window_seconds: int = 3600
+    # The most codes one create makes, in the console and with the CLI, 1 to 10,000
+    # (docs/admin.md § Redeem codes).
+    redeem_codes_max_count: int = 1000
 
     upload_max_bytes: int = 134_217_728
     # A file of any other kind uploaded to the library, kept once in the tree
@@ -370,6 +379,18 @@ class Settings(BaseSettings):
                 raise ValueError(f"{name.upper()} must be positive")
         if not 1 <= self.admin_page_size <= 500:
             raise ValueError("ADMIN_PAGE_SIZE must be between 1 and 500")
+        # A pack's `credits` is a 32-bit integer; a century of days keeps every date a grant
+        # reaches one PostgreSQL and Python can hold.
+        if not 1 <= self.admin_grant_max_credits <= 2_147_483_647:
+            raise ValueError("ADMIN_GRANT_MAX_CREDITS must be between 1 and 2147483647")
+        if not 1 <= self.admin_grant_max_days <= 36_500:
+            raise ValueError("ADMIN_GRANT_MAX_DAYS must be between 1 and 36500")
+        if not 1 <= self.admin_grant_valid_days <= self.admin_grant_max_days:
+            raise ValueError("ADMIN_GRANT_VALID_DAYS must be between 1 and ADMIN_GRANT_MAX_DAYS")
+        # One batch is checked for taken codes in one query, a parameter per code, and the
+        # PostgreSQL driver takes at most 32,767 of them.
+        if not 1 <= self.redeem_codes_max_count <= 10_000:
+            raise ValueError("REDEEM_CODES_MAX_COUNT must be between 1 and 10000")
         # The Usage page offers 7, 30 and 90 days; a smaller cap would refuse its own presets.
         if self.admin_usage_max_days < 90:
             raise ValueError("ADMIN_USAGE_MAX_DAYS must be at least 90")

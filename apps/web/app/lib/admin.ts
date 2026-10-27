@@ -8,7 +8,7 @@
  * what a page offers, so an operator is not handed a control the API would refuse. Code
  * compares permission strings and the `builtin` flag — never a group's name.
  */
-import { ApiRequestError } from './api'
+import { ApiRequestError, type AdminCodesCreated } from './api'
 import type { CostDay } from './chart'
 import type { IconName } from './icons'
 
@@ -49,11 +49,13 @@ export interface ConsolePage {
 
 /**
  * The console's pages in nav order — the order the sidebar lists them and `/admin` picks the
- * first readable one from. Later steps put theirs in front of these (docs/admin.md § Roadmap).
+ * first readable one from. Later steps add theirs in their places (docs/admin.md § Roadmap).
  */
 export const CONSOLE_PAGES: readonly ConsolePage[] = [
   // `/admin` itself is the Overview, `jobs.read`'s like Jobs and Usage (docs/admin.md § Pages).
   { area: 'jobs', path: '/admin', icon: 'layout-grid', label: 'admin.nav.overview' },
+  { area: 'users', path: '/admin/users', icon: 'user', label: 'admin.nav.users' },
+  { area: 'codes', path: '/admin/codes', icon: 'ticket', label: 'admin.nav.codes' },
   { area: 'jobs', path: '/admin/jobs', icon: 'list-checks', label: 'admin.nav.jobs' },
   { area: 'jobs', path: '/admin/usage', icon: 'dashboard', label: 'admin.nav.usage' },
   { area: 'groups', path: '/admin/groups', icon: 'users-round', label: 'admin.nav.groups' },
@@ -191,6 +193,69 @@ export function canRenameGroup(held: readonly string[], group: GroupFacts): bool
   return !group.builtin && can(held, 'groups', 'write')
 }
 
+// --- redeem codes -----------------------------------------------------------------------
+
+/** The created codes' CSV columns (docs/admin.md § Pages, *Redeem codes*): the stored
+ *  fields by name, so a plan code's row keeps its plan and no column means two things. */
+export const CODES_CSV_COLUMNS = [
+  'code',
+  'kind',
+  'credits',
+  'valid_days',
+  'plan_id',
+  'days',
+  'max_uses',
+  'redeem_by',
+  'label',
+] as const
+
+/**
+ * The created codes as a CSV file's text: a header row, then a row per code with the batch's
+ * fields — `redeem_by` as its UTC date, empty for none — fields quoted where they hold a
+ * comma, a quote or a line break (RFC 4180, CRLF rows). It begins with a byte-order mark, so
+ * a spreadsheet reads a label in Chinese as UTF-8. Built in the browser from the create
+ * answer; nothing is stored.
+ */
+export function codesCsv(created: AdminCodesCreated): string {
+  const field = (value: string | number | null) => {
+    const text = value === null ? '' : String(value)
+    return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text
+  }
+  const rows = created.codes.map((item) =>
+    [
+      item.code,
+      created.kind,
+      created.credits,
+      created.valid_days,
+      created.plan_id,
+      created.days,
+      created.max_uses,
+      created.redeem_by ? created.redeem_by.slice(0, 10) : null,
+      created.label,
+    ]
+      .map(field)
+      .join(','),
+  )
+  return `\uFEFF${[CODES_CSV_COLUMNS.join(','), ...rows].join('\r\n')}\r\n`
+}
+
+/** A code's redeem-by date as the pages print it: the UTC day, which is the one it counts
+ *  to the end of — local time would print the next day east of Greenwich. */
+export function formatRedeemBy(iso: string, locale: string): string {
+  return new Intl.DateTimeFormat(locale, { dateStyle: 'medium', timeZone: 'UTC' }).format(new Date(iso))
+}
+
+/** How many days ahead an active code's last day comes for the list to say so. */
+export const CODE_CLOSING_DAYS = 7
+
+/** Whole UTC days from today to a code's last day: 0 on that day itself, negative after. */
+export function daysUntil(iso: string, now: Date): number {
+  const end = new Date(iso)
+  const last = Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), end.getUTCDate())
+  const today = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
+  return Math.round((last - today) / 86_400_000)
+}
+
 // --- the route query ------------------------------------------------------------------
 
 /** The highest `?page=` the API takes (docs/admin.md § Routes). */
@@ -214,6 +279,16 @@ export function idOf(value: unknown): number | null {
 /** The audit filter's area from the query: one the filter offers, else null (all). */
 export function auditAreaOf(value: unknown): AdminArea | null {
   return AUDIT_FILTER_AREAS.find((area) => area === value) ?? null
+}
+
+// --- users and grants -----------------------------------------------------------------
+
+/** A grant's number as typed (docs/admin.md § Users and grants): a whole number from 1 to
+ *  `max`, the API's cap, else null — and the dialog's button stays off. */
+export function grantNumber(text: string, max: number): number | null {
+  const typed = text.trim()
+  const value = /^\d+$/.test(typed) ? Number(typed) : NaN
+  return Number.isSafeInteger(value) && value >= 1 && value <= max ? value : null
 }
 
 // --- refusals -------------------------------------------------------------------------

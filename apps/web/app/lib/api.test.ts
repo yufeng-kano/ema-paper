@@ -2,16 +2,19 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   ApiRequestError,
   addAdminGroupMember,
+  createAdminCodes,
   createAdminGroup,
   createKey,
   creditsRefusalOf,
   deleteAccount,
   deleteAdminGroup,
+  disableAdminCode,
   getAdminMe,
   getLibrary,
   getMe,
   isDevLoginAvailable,
   listAdminAudit,
+  listAdminCodes,
   putAgentSettings,
   putDocumentContent,
   removeAdminGroupMember,
@@ -312,6 +315,36 @@ describe('the operator console', () => {
       '/api/admin/audit?page=1&area=groups&q=a%2Bb%40example.com',
       expect.anything(),
     )
+  })
+
+  it('pages the redeem codes, sending only the filters that are set, encoded', async () => {
+    const page = { items: [], total: 0, page: 1, page_size: 50 }
+    const fetchMock = stubFetch(Response.json(page), Response.json(page))
+
+    await listAdminCodes({ page: 1 })
+    expect(fetchMock).toHaveBeenLastCalledWith('/api/admin/codes?page=1', expect.anything())
+
+    await listAdminCodes({ page: 3, status: 'all', q: 'launch & vip' })
+    expect(fetchMock).toHaveBeenLastCalledWith('/api/admin/codes?page=3&status=all&q=launch+%26+vip', expect.anything())
+    expect(headersOf(fetchMock)['X-Requested-With']).toBeUndefined()
+  })
+
+  it('creates and disables codes as mutations, with the CSRF header', async () => {
+    const body = { kind: 'credits' as const, credits: 500, valid_days: 365, count: 2, max_uses: 1, label: 'launch' }
+    const fetchMock = stubFetch(Response.json({ codes: [] }, { status: 201 }), Response.json({ id: 7 }))
+
+    await createAdminCodes(body)
+    expect(fetchMock).toHaveBeenLastCalledWith('/api/admin/codes', expect.anything())
+    expect(lastInit(fetchMock).method).toBe('POST')
+    expect(lastInit(fetchMock).body).toBe(JSON.stringify(body))
+
+    await disableAdminCode(7)
+    expect(fetchMock).toHaveBeenLastCalledWith('/api/admin/codes/7/disable', expect.anything())
+    expect(lastInit(fetchMock).method).toBe('POST')
+
+    for (const [, init] of fetchMock.mock.calls) {
+      expect((init?.headers as Record<string, string>)['X-Requested-With']).toBe('fetch')
+    }
   })
 
   it('keeps the reason of a console conflict beside its message', async () => {

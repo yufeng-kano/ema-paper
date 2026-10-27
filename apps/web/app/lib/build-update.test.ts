@@ -54,15 +54,26 @@ describe('createBuildUpdate', () => {
     expect(reload).toHaveBeenCalledOnce()
   })
 
-  it('turns a navigation into a full load of its target, holds or not', () => {
+  it('leaves a navigation on the current build alone', () => {
     const { update, reload } = setup()
     expect(update.navigate('/keys')).toBe(false)
-
-    update.hold()
-    update.markOutdated()
     expect(reload).not.toHaveBeenCalled()
+  })
+
+  it('leaves a navigation under a hold to the page, and reloads on the release', () => {
+    const { update, reload } = setup()
+    const shown = update.hold()
+    update.markOutdated()
+    // The page that holds may refuse the navigation (the created codes refuse Back): no
+    // reload may take what it shows.
+    expect(update.navigate('/admin/groups')).toBe(false)
+    expect(reload).not.toHaveBeenCalled()
+
+    shown()
+    expect(reload).toHaveBeenCalledExactlyOnceWith(undefined)
+    // The load is under way: a navigation now is dropped for it, not a second load.
     expect(update.navigate('/keys')).toBe(true)
-    expect(reload).toHaveBeenCalledExactlyOnceWith('/keys')
+    expect(reload).toHaveBeenCalledOnce()
   })
 
   it('reloads once however many triggers arrive', async () => {
