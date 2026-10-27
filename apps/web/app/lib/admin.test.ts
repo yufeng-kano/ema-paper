@@ -14,9 +14,14 @@ import {
   canRenameGroup,
   canToggle,
   changedPermissions,
+  CODE_CLOSING_DAYS,
+  CODES_CSV_COLUMNS,
+  codesCsv,
   conflictKey,
   consoleDestination,
+  daysUntil,
   firstReadableArea,
+  formatRedeemBy,
   idOf,
   isGroupName,
   navEntries,
@@ -66,13 +71,13 @@ describe('what a permission list shows', () => {
   })
 
   it("lists only the console pages whose area it can read, in nav order", () => {
-    expect(navEntries(ALL).map((page) => page.area)).toEqual(['groups', 'audit'])
+    expect(navEntries(ALL).map((page) => page.area)).toEqual(['codes', 'groups', 'audit'])
     expect(navEntries(['audit.read']).map((page) => page.path)).toEqual(['/admin/audit'])
-    expect(navEntries(['codes.read', 'jobs.read'])).toEqual([])
+    expect(navEntries(['codes.read', 'jobs.read']).map((page) => page.path)).toEqual(['/admin/codes'])
   })
 
   it('sends /admin to the first page it can read', () => {
-    expect(firstReadableArea(ALL)?.path).toBe('/admin/groups')
+    expect(firstReadableArea(ALL)?.path).toBe('/admin/codes')
     expect(firstReadableArea(['audit.read'])?.path).toBe('/admin/audit')
     expect(consoleDestination(['audit.read', 'groups.read'], null)).toBe('/admin/groups')
   })
@@ -82,7 +87,8 @@ describe('what a permission list shows', () => {
     expect(consoleDestination(['audit.read'], 'groups')).toBe('/admin/audit')
     // An account in no group, and one whose areas' pages come in later steps.
     expect(consoleDestination([], null)).toBeNull()
-    expect(consoleDestination(['codes.read', 'users.write'], 'groups')).toBeNull()
+    expect(consoleDestination(['users.write', 'jobs.read'], 'groups')).toBeNull()
+    expect(consoleDestination(['codes.read', 'users.write'], 'groups')).toBe('/admin/codes')
   })
 
   it("reads a page's area meta, and nothing else", () => {
@@ -224,6 +230,64 @@ describe('a failed console request', () => {
     expect(conflictKey('name_taken')).toBe('admin.conflicts.name_taken')
     expect(conflictKey('something_new')).toBeNull()
     expect(conflictKey(null)).toBeNull()
+  })
+})
+
+describe('the created codes', () => {
+  const created = {
+    codes: [
+      { id: 7, code: 'EMA-AAAA-BBBB-CCCC' },
+      { id: 8, code: 'EMA-DDDD-EEEE-FFFF' },
+    ],
+    kind: 'credits' as const,
+    credits: 500,
+    valid_days: 365,
+    plan_id: null,
+    days: null,
+    max_uses: 1,
+    redeem_by: '2026-12-31T23:59:59+00:00',
+    label: 'Launch, "VIP"',
+  }
+
+  it('writes a CSV a spreadsheet opens: BOM, a header, a CRLF row per code', () => {
+    const csv = codesCsv(created)
+    expect(csv.startsWith('\uFEFF')).toBe(true)
+    expect(csv.slice(1).split('\r\n')).toEqual([
+      CODES_CSV_COLUMNS.join(','),
+      'EMA-AAAA-BBBB-CCCC,credits,500,365,,,1,2026-12-31,"Launch, ""VIP"""',
+      'EMA-DDDD-EEEE-FFFF,credits,500,365,,,1,2026-12-31,"Launch, ""VIP"""',
+      '',
+    ])
+  })
+
+  it("leaves the other kind's fields and a missing date empty, and quotes a line break", () => {
+    const plan = {
+      ...created,
+      codes: [{ id: 9, code: 'EMA-GGGG-HHHH-JJJJ' }],
+      kind: 'plan' as const,
+      credits: null,
+      valid_days: null,
+      plan_id: 'pro',
+      days: 30,
+      max_uses: 5,
+      redeem_by: null,
+      label: 'two\nlines',
+    }
+    expect(codesCsv(plan).split('\r\n')[1]).toBe('EMA-GGGG-HHHH-JJJJ,plan,,,pro,30,5,,"two\nlines"')
+  })
+})
+
+describe("a code's last day", () => {
+  it('prints the UTC day it counts to the end of, wherever the reader is', () => {
+    expect(formatRedeemBy('2026-12-31T23:59:59+00:00', 'en')).toBe('Dec 31, 2026')
+  })
+
+  it('counts whole UTC days to it, 0 on the day itself', () => {
+    const end = '2026-11-03T23:59:59+00:00'
+    expect(daysUntil(end, new Date('2026-11-03T00:00:01Z'))).toBe(0)
+    expect(daysUntil(end, new Date('2026-11-02T23:59:59Z'))).toBe(1)
+    expect(daysUntil(end, new Date('2026-10-27T12:00:00Z'))).toBe(CODE_CLOSING_DAYS)
+    expect(daysUntil(end, new Date('2026-11-04T00:00:00Z'))).toBe(-1)
   })
 })
 

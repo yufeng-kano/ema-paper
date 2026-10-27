@@ -108,6 +108,9 @@ class Settings(BaseSettings):
     grant_period_days: int = 30
     redeem_max_failures: int = 10
     redeem_failure_window_seconds: int = 3600
+    # The most codes one create makes, in the console and with the CLI, 1 to 10,000
+    # (docs/admin.md § Redeem codes).
+    redeem_codes_max_count: int = 1000
 
     upload_max_bytes: int = 134_217_728
     # A file of any other kind uploaded to the library, kept once in the tree
@@ -361,6 +364,10 @@ class Settings(BaseSettings):
                 raise ValueError(f"{name.upper()} must be positive")
         if not 1 <= self.admin_page_size <= 500:
             raise ValueError("ADMIN_PAGE_SIZE must be between 1 and 500")
+        # One batch is checked for taken codes in one query, a parameter per code, and the
+        # PostgreSQL driver takes at most 32,767 of them.
+        if not 1 <= self.redeem_codes_max_count <= 10_000:
+            raise ValueError("REDEEM_CODES_MAX_COUNT must be between 1 and 10000")
         self.redeem_code_prefix = self.redeem_code_prefix.strip().upper()
         if self.redeem_code_prefix and not self.redeem_code_prefix.isalnum():
             raise ValueError("REDEEM_CODE_PREFIX must be letters and digits only")

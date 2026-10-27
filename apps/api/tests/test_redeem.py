@@ -14,7 +14,7 @@ import httpx
 import pytest
 import respx
 from httpx import AsyncClient
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 
 from sightread import codes as cli
 from sightread.billing import codes, ledger
@@ -84,6 +84,7 @@ async def _code(sessionmaker, settings, **grant) -> str:
             label=grant.pop("label", ""),
             **grant,
         )
+        await db.commit()
         return codes.display(rows[0].code, settings.redeem_code_prefix)
 
 
@@ -253,17 +254,28 @@ async def test_a_code_that_is_unknown_disabled_or_past_its_date_is_refused(
     assert (await _redeem(client, "x" * 65)).status_code == 422
     disabled = await _code(sessionmaker, settings, credits=5, valid_days=10)
     async with sessionmaker() as db:
-        assert (await codes.disable(db, settings, disabled)) is not None
-        assert (await codes.disable(db, settings, "EMA-AAAA-AAAA-AAAA")) is None
+        row, done = await codes.disable(db, settings, disabled)
+        assert row is not None and done
+        assert (await codes.disable(db, settings, "EMA-AAAA-AAAA-AAAA")) == (None, False)
+        await db.commit()
     answer = await _redeem(client, disabled)
     assert (answer.status_code, answer.json()["error"]["type"]) == (404, "code_invalid")
+    # A code is never made past its date (create_codes refuses one): this one's day passed
+    # after it was made.
     expired = await _code(
         sessionmaker,
         settings,
         credits=5,
         valid_days=10,
-        redeem_by=datetime.now(UTC) - timedelta(days=1),
+        redeem_by=datetime.now(UTC) + timedelta(days=1),
     )
+    async with sessionmaker() as db:
+        await db.execute(
+            update(RedeemCode)
+            .where(RedeemCode.code == codes.normalize(expired, settings.redeem_code_prefix))
+            .values(redeem_by=datetime.now(UTC) - timedelta(days=1))
+        )
+        await db.commit()
     answer = await _redeem(client, expired)
     assert (answer.status_code, answer.json()["error"]["type"]) == (409, "code_expired")
     # Nothing was granted or recorded.

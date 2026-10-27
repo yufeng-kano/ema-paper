@@ -2,12 +2,15 @@
 /**
  * Text input. Pairs with `UiField`, which supplies `id` and `describedBy` through its slot
  * props. Height comes from `--control-height` so it matches any button on its row.
+ *
+ * `number` and `date` keep the value a string, as the browser hands it over: the caller
+ * reads the number or the date out of it. `min`, `max` and `step` are the platform's.
  */
 withDefaults(
   defineProps<{
     modelValue: string
     id?: string
-    type?: 'text' | 'password' | 'email'
+    type?: 'text' | 'password' | 'email' | 'number' | 'date'
     placeholder?: string
     describedBy?: string
     invalid?: boolean
@@ -16,6 +19,9 @@ withDefaults(
     maxlength?: number
     autocomplete?: string
     mono?: boolean
+    min?: number | string
+    max?: number | string
+    step?: number
   }>(),
   {
     type: 'text',
@@ -24,6 +30,9 @@ withDefaults(
     placeholder: undefined,
     describedBy: undefined,
     maxlength: undefined,
+    min: undefined,
+    max: undefined,
+    step: undefined,
   },
 )
 
@@ -41,6 +50,10 @@ defineEmits<{ 'update:modelValue': [string] }>()
     :disabled="disabled"
     :required="required"
     :maxlength="maxlength"
+    :min="min"
+    :max="max"
+    :step="step"
+    :inputmode="type === 'number' ? 'numeric' : undefined"
     :autocomplete="autocomplete"
     :aria-describedby="describedBy"
     :aria-invalid="invalid || undefined"

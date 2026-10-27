@@ -1,6 +1,8 @@
 """`python -m sightread.codes`: the operator's redeem codes — `create`, `list`, `disable`
 (docs/self-hosting.md § Redeem codes, docs/billing.md § Redeem codes). Runs in the api
-container against the deployment's database; there is no page for it.
+container against the deployment's database, beside the console's Redeem codes page,
+which calls the same functions (docs/admin.md § Redeem codes); this commits what they
+write itself.
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ def _redeem_by(value: str) -> datetime:
         day = date.fromisoformat(value)
     except ValueError:
         raise argparse.ArgumentTypeError("expected a date as YYYY-MM-DD") from None
-    return datetime.combine(day, datetime.max.time().replace(microsecond=0), UTC)
+    return codes.end_of_utc_day(day)
 
 
 def _positive(value: str) -> int:
@@ -44,7 +46,10 @@ def build_parser() -> argparse.ArgumentParser:
     grant.add_argument("--credits", type=_positive, help="credits each code gives")
     grant.add_argument("--plan", help="the plan (of KANO_PAY_PLANS_JSON) each code gives days of")
     create.add_argument(
-        "--valid-days", type=_positive, default=365, help="how long the credits last (365)"
+        "--valid-days",
+        type=_positive,
+        default=codes.DEFAULT_VALID_DAYS,
+        help=f"how long the credits last ({codes.DEFAULT_VALID_DAYS})",
     )
     create.add_argument("--days", type=_positive, help="days of the plan each code gives")
     create.add_argument("--count", type=_positive, default=1, help="how many codes (1)")
@@ -72,14 +77,15 @@ def _grant(row: RedeemCode) -> str:
     return f"{row.days} days of {row.plan_id}"
 
 
-def _state(row: RedeemCode, now: datetime) -> str:
-    if row.disabled_at is not None:
-        return "disabled"
-    if row.redeem_by is not None and now > row.redeem_by:
-        return "expired"
-    if row.uses >= row.max_uses:
-        return "used up"
-    return "live"
+# `codes.status` in the words this prints: the console's `active`, `used_up` and
+# `plan_missing` are `live`, `used up` and `plan missing` here.
+_STATUS_WORDS = {
+    codes.ACTIVE: "live",
+    codes.DISABLED: "disabled",
+    codes.EXPIRED: "expired",
+    codes.USED_UP: "used up",
+    codes.PLAN_MISSING: "plan missing",
+}
 
 
 async def run(args: argparse.Namespace, settings: Settings, db: AsyncSession) -> int:
@@ -105,6 +111,7 @@ async def run(args: argparse.Namespace, settings: Settings, db: AsyncSession) ->
         except ValueError as exc:
             print(str(exc), file=sys.stderr)
             return 2
+        await db.commit()
         for row in rows:
             print(codes.display(row.code, prefix))
         return 0
@@ -112,7 +119,7 @@ async def run(args: argparse.Namespace, settings: Settings, db: AsyncSession) ->
         now = datetime.now(UTC)
         rows = (await db.execute(select(RedeemCode).order_by(RedeemCode.id))).scalars()
         for row in rows:
-            state = _state(row, now)
+            state = _STATUS_WORDS[codes.status(row, now, settings.plans)]
             if state != "live" and not args.all:
                 continue
             until = row.redeem_by.date().isoformat() if row.redeem_by else "-"
@@ -121,10 +128,11 @@ async def run(args: argparse.Namespace, settings: Settings, db: AsyncSession) ->
                 f"\t{until}\t{state}\t{row.label}"
             )
         return 0
-    row = await codes.disable(db, settings, args.code)
+    row, _ = await codes.disable(db, settings, args.code)
     if row is None:
         print("no such code", file=sys.stderr)
         return 1
+    await db.commit()
     print(f"disabled {codes.display(row.code, prefix)}")
     return 0
 

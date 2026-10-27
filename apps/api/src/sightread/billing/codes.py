@@ -1,6 +1,10 @@
 """Redeem codes (docs/billing.md § Redeem codes): what a code looks like, how a typed one
 is read, and the one transaction that redeems it — credits kept as a pack that was not
 bought, or days of a paid plan banked on `plan_grants`. The code itself is never logged.
+
+Creating and disabling are shared by the operator's two doors, `python -m sightread.codes`
+and the console (docs/admin.md § Redeem codes): they write into the caller's transaction
+and never commit — the CLI commits itself, the console together with its audit row.
 """
 
 from __future__ import annotations
@@ -9,10 +13,11 @@ import logging
 import math
 import re
 import secrets
+from collections.abc import Collection
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import ColumnElement, and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings
@@ -24,6 +29,29 @@ from .plans import GRANT
 logger = logging.getLogger(__name__)
 
 CREDITS, PLAN = "credits", "plan"
+# What a code is now (`status`): the console's words. The CLI prints `live` for the first,
+# `used up` and `plan missing` for the last two.
+ACTIVE, DISABLED, EXPIRED, USED_UP, PLAN_MISSING = (
+    "active",
+    "disabled",
+    "expired",
+    "used_up",
+    "plan_missing",
+)
+# How long a credits code's credits last once redeemed, unless the operator says.
+DEFAULT_VALID_DAYS = 365
+# What the integer columns hold: a count, a use or credits past it are refused before the
+# insert would fail on it.
+INT_MAX = 2**31 - 1
+# The most `valid_days` and `days` a code gives: a hundred years. Redeeming works dates out
+# of them — `now + valid_days` for a pack, a granted period's end — which a Python date
+# holds only to the year 9999, and banks days in a 32-bit column.
+MAX_DAYS = 36_500
+# A masked code keeps at least this many characters hidden: 32⁸ ≈ 10¹² possibilities, past
+# guessing under the attempt cap, whatever `REDEEM_CODE_CHARS` is.
+MASK_HIDDEN_CHARS = 8
+# `redeem_codes.label`.
+LABEL_MAX_CHARS = 255
 # 32 letters: no 0, O, 1 or I, so a printed code reads back the same.
 ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 # `credit_packs.pack_id` of a code's credits: not a pack of `KANO_PAY_PACKS_JSON`.
@@ -49,6 +77,47 @@ def display(code: str, prefix: str) -> str:
     """A code as it is printed and typed: the prefix, then groups of four."""
     groups = [code[i : i + 4] for i in range(0, len(code), 4)]
     return "-".join(([prefix] if prefix else []) + groups)
+
+
+def mask(code: str, prefix: str) -> str:
+    """A code as the console shows it after creation (docs/admin.md § Redeem codes): the
+    prefix and the first group of four while `MASK_HIDDEN_CHARS` stay hidden, every other
+    character a `•` — `EMA-7K2Q-••••-••••` for twelve. A shorter code shows none of it."""
+    groups = [code[i : i + 4] for i in range(0, len(code), 4)]
+    shown = groups[:1] if len(code) - 4 >= MASK_HIDDEN_CHARS else []
+    hidden = ["•" * len(group) for group in groups[len(shown) :]]
+    return "-".join(([prefix] if prefix else []) + shown + hidden)
+
+
+def end_of_utc_day(day: date) -> datetime:
+    """A redeem-by date as stored: the code can be redeemed until the last second of that
+    UTC day."""
+    return datetime.combine(day, time(23, 59, 59), UTC)
+
+
+def status(row: RedeemCode, now: datetime, plans: Collection[str]) -> str:
+    """What a code is now, in the order `redeem` refuses in: disabled, expired (past
+    `redeem_by`), used up (`uses` reached `max_uses`), plan missing (a plan code whose plan
+    `plans` — the configured ids — no longer names), else active — redeemable."""
+    if row.disabled_at is not None:
+        return DISABLED
+    if row.redeem_by is not None and now > row.redeem_by:
+        return EXPIRED
+    if row.uses >= row.max_uses:
+        return USED_UP
+    if row.kind == PLAN and row.plan_id not in plans:
+        return PLAN_MISSING
+    return ACTIVE
+
+
+def is_active(now: datetime, plans: Collection[str]) -> ColumnElement[bool]:
+    """`status(row, now, plans) == ACTIVE`, as SQL, for a list of the active codes."""
+    return and_(
+        RedeemCode.disabled_at.is_(None),
+        or_(RedeemCode.redeem_by.is_(None), RedeemCode.redeem_by >= now),
+        RedeemCode.uses < RedeemCode.max_uses,
+        or_(RedeemCode.kind != PLAN, RedeemCode.plan_id.in_(list(plans))),
+    )
 
 
 @dataclass(frozen=True)
@@ -213,10 +282,37 @@ async def create_codes(
     plan_id: str | None = None,
     days: int | None = None,
 ) -> list[RedeemCode]:
-    """`count` fresh codes of one grant, written and committed (docs/billing.md § Redeem
-    codes). A plan code names a plan of `KANO_PAY_PLANS_JSON` or is refused."""
+    """`count` fresh codes of one grant, written into the caller's transaction and flushed,
+    so they have their ids; the caller commits (docs/billing.md § Redeem codes).
+
+    The batch is checked first, for the CLI and the console alike, and refused with a
+    `ValueError` naming the rule: a known kind; `count`, `max_uses` and the kind's amounts
+    present, from 1 — and up to the integer columns, the days up to `MAX_DAYS`; a plan of
+    `KANO_PAY_PLANS_JSON`; a label the column holds; a `redeem_by` not already past; at
+    most `REDEEM_CODES_MAX_COUNT` codes. The other kind's fields are ignored."""
+    if kind not in (CREDITS, PLAN):
+        raise ValueError(f"kind must be {CREDITS} or {PLAN}")
+    if not 1 <= count <= settings.redeem_codes_max_count:
+        raise ValueError(
+            f"count must be from 1 to {settings.redeem_codes_max_count} (REDEEM_CODES_MAX_COUNT)"
+        )
+    # Each field with the most it takes.
+    if kind == CREDITS:
+        amounts = {"credits": (credits, INT_MAX), "valid_days": (valid_days, MAX_DAYS)}
+    else:
+        amounts = {"days": (days, MAX_DAYS)}
+    for name, (value, most) in {"max_uses": (max_uses, INT_MAX), **amounts}.items():
+        if value is None or not 1 <= value <= most:
+            raise ValueError(f"{name} must be a whole number from 1 to {most}")
     if kind == PLAN and plan_id not in settings.plans:
         raise ValueError(f"plan {plan_id!r} is not in KANO_PAY_PLANS_JSON")
+    if len(label) > LABEL_MAX_CHARS:
+        raise ValueError(f"label must be at most {LABEL_MAX_CHARS} characters")
+    if redeem_by is not None and redeem_by.tzinfo is None:
+        raise ValueError("redeem_by must carry its time zone")
+    # A code born expired would be handed out and refused to everyone who types it.
+    if redeem_by is not None and redeem_by < utcnow():
+        raise ValueError("redeem_by must be today or later (UTC)")
     rows: list[RedeemCode] = []
     while len(rows) < count:
         fresh = {generate(settings.redeem_code_chars) for _ in range(count - len(rows))}
@@ -238,20 +334,30 @@ async def create_codes(
                 )
             )
     db.add_all(rows)
-    await db.commit()
+    await db.flush()
     return rows
 
 
-async def disable(db: AsyncSession, settings: Settings, typed: str) -> RedeemCode | None:
-    """Disable a code: dead from now on, its redemptions kept. None when there is no such
-    code."""
+async def _disable(db: AsyncSession, which: ColumnElement[bool]) -> tuple[RedeemCode | None, bool]:
+    row = (await db.execute(select(RedeemCode).where(which).with_for_update())).scalar_one_or_none()
+    if row is None or row.disabled_at is not None:
+        return row, False
+    row.disabled_at = utcnow()
+    await db.flush()
+    return row, True
+
+
+async def disable(
+    db: AsyncSession, settings: Settings, typed: str
+) -> tuple[RedeemCode | None, bool]:
+    """Disable a code by its printed form, as the CLI does: dead from now on, its
+    redemptions kept. Written into the caller's transaction under the code's row lock and
+    not committed. Returns the code — None when there is no such code — and whether this
+    disabled it: one already disabled is left as it is."""
     code = normalize(typed, settings.redeem_code_prefix)
-    row = (
-        await db.execute(select(RedeemCode).where(RedeemCode.code == code).with_for_update())
-    ).scalar_one_or_none()
-    if row is None:
-        return None
-    if row.disabled_at is None:
-        row.disabled_at = utcnow()
-        await db.commit()
-    return row
+    return await _disable(db, RedeemCode.code == code)
+
+
+async def disable_by_id(db: AsyncSession, code_id: int) -> tuple[RedeemCode | None, bool]:
+    """`disable`, by the code's id, as the console does."""
+    return await _disable(db, RedeemCode.id == code_id)
