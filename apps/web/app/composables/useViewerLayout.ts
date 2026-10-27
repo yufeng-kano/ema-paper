@@ -15,8 +15,9 @@ import { clampWidth, storedWidth, type Column } from '~/lib/columns'
 const LAYOUT_KEY = 'sightread.viewer.layout'
 
 /** The room left at each side of the body text, as Settings offers it: the document column
- *  is 86%, 70% or 54% of its pane (the viewer's `--page-width`). */
-export const PAPER_MARGINS = ['narrow', 'standard', 'wide'] as const
+ *  is the whole pane less 16px a side, then 85%, 70%, 55% or 40% of it (the viewer's
+ *  `--page-width`). */
+export const PAPER_MARGINS = ['none', 'narrow', 'standard', 'wide', 'widest'] as const
 export type PaperMargin = (typeof PAPER_MARGINS)[number]
 
 type Layout = { notes: boolean; agent: boolean; notesWidth: number; agentWidth: number; paperMargin: PaperMargin }

@@ -56,9 +56,11 @@ export default {
         label: '內文左右間距',
         description: '內文兩側留白的多寡。',
       },
+      none: '無',
       narrow: '窄',
       standard: '標準',
       wide: '寬',
+      widest: '最寬',
       foot: '視窗太窄時內文會占滿整個寬度。',
     },
     preferences: {
