@@ -1897,3 +1897,134 @@ export function createAdminCodes(body: AdminCodesCreate): Promise<AdminCodesCrea
 export function disableAdminCode(id: number): Promise<AdminCode> {
   return request('POST', `/api/admin/codes/${id}/disable`)
 }
+
+// --- operator console: overview, jobs and usage (docs/admin.md § Overview, jobs and usage) ---
+
+/** `usage_log` summed (docs/api.md § Usage aggregates): billed `cost`, `estimated_cost` and
+ *  the calls nobody priced kept apart, never added together. */
+export interface AdminUsageFigures {
+  calls: number
+  prompt_tokens: number
+  completion_tokens: number
+  cost: number
+  estimated_cost: number
+  estimated_calls: number
+  unpriced_calls: number
+  cache_read_tokens: number
+  cache_write_tokens: number
+}
+
+/** Whether a worker runs, as the worker lock says: `since` and `generation` only while
+ *  `running` (`generation` null also before any worker took one); `unknown` off PostgreSQL. */
+export interface AdminWorker {
+  state: 'running' | 'stopped' | 'unknown'
+  since: string | null
+  generation: number | null
+}
+
+export type AdminJobStatus = 'queued' | 'running' | 'succeeded' | 'failed'
+
+/** A job as the console shows it: never its file name, prompt or pages' text. */
+export interface AdminJob {
+  id: string
+  created_at: string
+  started_at: string | null
+  finished_at: string | null
+  user_id: number
+  /** The account's address, only for a caller who also holds `users.read`. */
+  email: string | null
+  status: AdminJobStatus
+  /** The pages it selected; null while the document's page count is unknown. */
+  pages: number | null
+  pages_done: number
+  /** The retry's model when a retry named one, else the job's. */
+  model: string
+  /** A failed job's reason, in the runner's fixed phrases. */
+  error: string | null
+  worker_generation: number | null
+  /** A running job no live worker drives: what a requeue takes. */
+  stuck: boolean
+}
+
+export interface AdminJobsResponse extends AdminList<AdminJob> {
+  /** Every job on record by status, whatever the filter. */
+  counts: Record<AdminJobStatus, number>
+  worker: AdminWorker
+}
+
+/** A connection the overview checked: `message` only when `failed`, the figures only when
+ *  `ok`. */
+export interface AdminKanoProxyStatus {
+  state: 'ok' | 'unconfigured' | 'failed'
+  message: string | null
+  models: number | null
+  priced: number | null
+  parse_model: string | null
+}
+
+export interface AdminKanoPayStatus {
+  state: 'ok' | 'unconfigured' | 'failed'
+  message: string | null
+  checkout_enabled: boolean | null
+  plans: number | null
+  packs: number | null
+}
+
+export interface AdminOverviewResponse {
+  /** Today's UTC date, the day `usage` covers so far. */
+  day: string
+  accounts: number
+  jobs: {
+    queued: number
+    running: number
+    /** Null while the worker's state is unknown. */
+    stuck: number | null
+    /** The oldest queued job's `created_at`, which a retry or a requeue keeps. */
+    oldest_queued_at: string | null
+    /** Failed in the last `failed_hours`. */
+    failed: number
+    failed_hours: number
+    last_failed_at: string | null
+  }
+  worker: AdminWorker
+  usage: {
+    models: (AdminUsageFigures & { model: string })[]
+    totals: AdminUsageFigures
+  }
+  connections: { kano_proxy: AdminKanoProxyStatus; kano_pay: AdminKanoPayStatus }
+  /** The ten newest audit records, only for a caller who also holds `audit.read`. */
+  audit?: AuditEntry[]
+}
+
+export interface AdminUsageResponse {
+  from: string
+  to: string
+  /** One per UTC day and model with a call, the newest day first, then by model. */
+  rows: (AdminUsageFigures & { date: string; model: string })[]
+  totals: AdminUsageFigures
+}
+
+export function getAdminOverview(): Promise<AdminOverviewResponse> {
+  return request('GET', '/api/admin/overview')
+}
+
+/** Newest first; `status` keeps one status. */
+export function listAdminJobs(query: { page: number; status?: AdminJobStatus }): Promise<AdminJobsResponse> {
+  const params = new URLSearchParams({ page: String(query.page) })
+  if (query.status) {
+    params.set('status', query.status)
+  }
+  return request('GET', `/api/admin/jobs?${params}`)
+}
+
+/** A stuck job back in the queue; 409 `admin_conflict` (`not_running`, `not_stuck`,
+ *  `worker_unknown`) for any other, 404 for one gone. */
+export function requeueAdminJob(id: string): Promise<AdminJob> {
+  return request('POST', `/api/admin/jobs/${encodeURIComponent(id)}/requeue`)
+}
+
+/** Per UTC day and model, `from` to `to` both included (`YYYY-MM-DD`). */
+export function getAdminUsage(range: { from: string; to: string }): Promise<AdminUsageResponse> {
+  const params = new URLSearchParams({ from: range.from, to: range.to })
+  return request('GET', `/api/admin/usage?${params}`)
+}

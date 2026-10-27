@@ -602,6 +602,23 @@ defineProps<{ name: IconName }>()
       <path d="M13 11v2" />
     </template>
 
+    <!-- layout-grid: the console's Overview — the deployment at a glance. -->
+    <template v-else-if="name === 'layout-grid'">
+      <rect width="7" height="7" x="3" y="3" rx="1" />
+      <rect width="7" height="7" x="14" y="3" rx="1" />
+      <rect width="7" height="7" x="14" y="14" rx="1" />
+      <rect width="7" height="7" x="3" y="14" rx="1" />
+    </template>
+
+    <!-- list-checks: the console's Jobs — the queue, row by row. -->
+    <template v-else-if="name === 'list-checks'">
+      <path d="M13 5h8" />
+      <path d="M13 12h8" />
+      <path d="M13 19h8" />
+      <path d="m3 17 2 2 4-4" />
+      <path d="m3 7 2 2 4-4" />
+    </template>
+
     <!-- check: the confirmation a copy swaps to. -->
     <template v-else>
       <path d="M20 6 9 17l-5-5" />

@@ -510,6 +510,68 @@ async def release_worker_lock(connection: AsyncConnection) -> None:
         await connection.close()
 
 
+# The worker lock as `pg_locks` lists it: an advisory lock taken on one bigint shows its
+# high 32 bits as `classid`, its low 32 bits as `objid`, and `objsubid` 1 (a lock taken on
+# two int4s shows 2). The dedup lock's keys are int4 hashes widened to bigint, whose
+# `classid` is 0 or 4294967295, so the full key is what tells the two apart.
+WORKER_LOCK_CLASSID = WORKER_LOCK_KEY >> 32
+WORKER_LOCK_OBJID = WORKER_LOCK_KEY & 0xFFFF_FFFF
+
+
+@dataclass(frozen=True)
+class WorkerStatus:
+    """Whether a worker runs, as the worker lock says (docs/jobs.md § Queue): `running`
+    while a session holds it — `since` that session's start, `generation` the live
+    generation, None before any worker took one — `stopped` while none does, and
+    `unknown` off PostgreSQL, which has no lock to read."""
+
+    state: str
+    since: datetime | None = None
+    generation: int | None = None
+
+
+async def worker_status(db: AsyncSession) -> WorkerStatus:
+    """Read whether the worker runs, for the operator console: `pg_locks` and the
+    generation sequence only. Never `pg_try_advisory_lock` — a probe that found the
+    worker down would hold the lock itself, and a session lock left on a pooled API
+    connection would keep every worker from starting — and never `nextval`, which would
+    use a generation up."""
+    if db.get_bind().dialect.name != "postgresql":
+        return WorkerStatus("unknown")
+    holder = (
+        await db.execute(
+            text(
+                "SELECT a.backend_start FROM pg_locks l"
+                " LEFT JOIN pg_stat_activity a ON a.pid = l.pid"
+                " WHERE l.locktype = 'advisory' AND l.granted"
+                " AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())"
+                " AND l.classid::bigint = :classid AND l.objid::bigint = :objid"
+                " AND l.objsubid = 1"
+            ),
+            {"classid": WORKER_LOCK_CLASSID, "objid": WORKER_LOCK_OBJID},
+        )
+    ).first()
+    if holder is None:
+        return WorkerStatus("stopped")
+    # `is_called` false: the sequence has handed out nothing yet, so no worker has a
+    # generation — the one holding the lock is about to take the first.
+    last_value, is_called = (
+        await db.execute(text("SELECT last_value, is_called FROM worker_generation_seq"))
+    ).one()
+    return WorkerStatus("running", holder.backend_start, int(last_value) if is_called else None)
+
+
+def job_is_stuck(job: Job, worker: WorkerStatus) -> bool:
+    """A `running` job no live worker drives: the worker is stopped, or runs with another
+    generation than the job's — a job a dead or stale worker left, which only a worker's
+    start-up or the console puts back (docs/jobs.md § Queue). Never one the live worker
+    runs, and nothing while the worker's state is unknown."""
+    return job.status == "running" and (
+        worker.state == "stopped"
+        or (worker.state == "running" and job.worker_generation != worker.generation)
+    )
+
+
 async def requeue_orphaned_jobs(db: AsyncSession) -> list[uuid.UUID]:
     """Every job still `running` when a worker starts goes back to the queue: the
     deployment has one worker, so a job nobody is driving is one a dead worker held,
@@ -538,7 +600,9 @@ async def _keep_succeeded_pages(db: AsyncSession, job_id: uuid.UUID) -> None:
     )
 
 
-async def requeue_job(db: AsyncSession, job_id: uuid.UUID, generation: int | None = None) -> bool:
+async def requeue_job(
+    db: AsyncSession, job_id: uuid.UUID, generation: int | None = None, *, commit: bool = True
+) -> bool:
     """Put an interrupted job back on the queue, keeping the pages it finished.
 
     The next attempt transcribes only the pages without a succeeded row — a page the
@@ -548,7 +612,8 @@ async def requeue_job(db: AsyncSession, job_id: uuid.UUID, generation: int | Non
     stays as it is, its pages and crops with it; or, with `generation`, when the row no
     longer holds the caller's: a worker that lost the lock must not put back a job the
     replacement has taken (docs/jobs.md § Queue). A worker starting requeues without
-    one, since every `running` row is then a dead worker's.
+    one, since every `running` row is then a dead worker's. `commit=False` leaves the
+    commit to the caller: the console's requeue commits it with its audit row.
     """
     owned = [Job.worker_generation == generation] if generation is not None else []
     requeued = (
@@ -560,7 +625,8 @@ async def requeue_job(db: AsyncSession, job_id: uuid.UUID, generation: int | Non
     ).rowcount > 0
     if requeued:
         await _keep_succeeded_pages(db, job_id)
-    await db.commit()
+    if commit:
+        await db.commit()
     return requeued
 
 

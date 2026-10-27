@@ -9,18 +9,21 @@ a document, a note, a conversation or any other content of an account.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
-from datetime import date, datetime
+from dataclasses import asdict
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Body, Depends, Path, Query, Response, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from sqlalchemy import String, and_, cast, distinct, func, or_, select
+from sqlalchemy import String, and_, case, cast, distinct, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from ..admin import codes as admin_codes
 from ..admin import grants, groups
+from ..admin import jobs as admin_jobs
 from ..admin.deps import (
     ConsoleSession,
     Operator,
@@ -34,6 +37,9 @@ from ..billing import codes, ledger
 from ..billing.plans import FREE_PLAN_ID, PAID_STATUSES
 from ..config import Settings
 from ..db.models import (
+    COST_SOURCE_ESTIMATED,
+    COST_SOURCE_OPENROUTER,
+    COST_SOURCE_UNKNOWN,
     AuditLog,
     Group,
     GroupMember,
@@ -42,12 +48,15 @@ from ..db.models import (
     RedeemCode,
     Redemption,
     Subscription,
+    UsageLog,
     User,
     utcnow,
 )
 from ..errors import ApiError
+from ..jobs import queue
 from ..workspace.documents import measure_storage
 from ..workspace.layout import user_root
+from .control import usage_totals
 
 router = APIRouter(
     prefix="/api/admin", tags=["admin"], dependencies=[Depends(require_console_session)]
@@ -436,6 +445,8 @@ async def grant_to_user(
 
 CodesReader = Annotated[Operator, Depends(require_permission("codes.read"))]
 CodesWriter = Annotated[Operator, Depends(require_permission("codes.write"))]
+JobsReader = Annotated[Operator, Depends(require_permission("jobs.read"))]
+JobsWriter = Annotated[Operator, Depends(require_permission("jobs.write"))]
 
 
 async def _code_payloads(
@@ -610,6 +621,248 @@ async def disable_code(code_id: int, operator: CodesWriter, db: DbSession, setti
     row = await admin_codes.disable_code(db, operator, code_id)
     await db.commit()
     return (await _code_payloads(db, settings, [row]))[0]
+
+
+# --- overview, jobs and usage --------------------------------------------------------
+
+JobsReader = Annotated[Operator, Depends(require_permission("jobs.read"))]
+JobsWriter = Annotated[Operator, Depends(require_permission("jobs.write"))]
+
+JOB_STATUSES = ("queued", "running", "succeeded", "failed")
+# The newest audit records the overview shows, to a caller who holds `audit.read`: the audit
+# list's first page, so `ADMIN_PAGE_SIZE` caps them as it caps every console read.
+OVERVIEW_AUDIT_RECORDS = 10
+
+# `usage_log` summed as `usage_totals` reads it (docs/api.md § Usage aggregates): billed,
+# estimated and unpriced cost kept apart — an estimate is never added to a billed amount,
+# and a call nobody priced is counted, never priced at 0.
+USAGE_FIGURES = (
+    func.count(),
+    func.sum(UsageLog.prompt_tokens),
+    func.sum(UsageLog.completion_tokens),
+    func.sum(case((UsageLog.cost_source == COST_SOURCE_OPENROUTER, UsageLog.cost))),
+    func.sum(case((UsageLog.cost_source == COST_SOURCE_ESTIMATED, UsageLog.cost))),
+    func.count(case((UsageLog.cost_source == COST_SOURCE_ESTIMATED, 1))),
+    func.count(case((UsageLog.cost_source == COST_SOURCE_UNKNOWN, 1))),
+    func.sum(UsageLog.cache_read_tokens),
+    func.sum(UsageLog.cache_write_tokens),
+)
+
+
+def _job_payload(job: Job, email: str | None, worker: queue.WorkerStatus) -> dict:
+    """`<job>`: when, whose, how far, on what model, how it ended and why — the runner's
+    fixed phrases, never the document — and whether a requeue would take it. Never the
+    file's name, the prompt or a page's text."""
+    # `page_count` is the document's; `pages_spec` picks among them ("" is all). A spec the
+    # document cannot satisfy — a job the runner fails for it — counts no pages.
+    try:
+        pages = (
+            None
+            if job.page_count is None
+            else len(queue.parse_pages_spec(job.pages_spec, job.page_count))
+        )
+    except ValueError:
+        pages = None
+    return {
+        "id": job.id,
+        "created_at": job.created_at,
+        "started_at": job.started_at,
+        "finished_at": job.finished_at,
+        "user_id": job.user_id,
+        "email": email,
+        "status": job.status,
+        "pages": pages,
+        "pages_done": job.pages_done,
+        "model": job.retry_model or job.model,
+        "error": job.error,
+        "worker_generation": job.worker_generation,
+        "stuck": queue.job_is_stuck(job, worker),
+    }
+
+
+@router.get("/overview")
+async def overview(operator: JobsReader, db: DbSession, settings: AppSettings):
+    """What the deployment is doing (docs/admin.md § Overview, jobs and usage): the jobs
+    waiting, running and lately failed, the worker, today's usage (the UTC day so far), the
+    accounts, Kano Proxy and Kano Pay — and the newest audit records, only for a caller
+    who also holds `audit.read`."""
+    now = utcnow()
+    window = settings.admin_failed_window_hours
+    today = datetime.combine(now.date(), time.min, UTC)
+    # The oldest queued job's `created_at`: its age, which a reader's retry and a requeue
+    # keep, not how long it has waited this time (docs/admin.md).
+    queued, oldest_queued = (
+        await db.execute(
+            select(func.count(), func.min(Job.created_at)).where(Job.status == "queued")
+        )
+    ).one()
+    running = list(await db.scalars(select(Job).where(Job.status == "running")))
+    failed, last_failed = (
+        await db.execute(
+            select(func.count(), func.max(Job.finished_at)).where(
+                Job.status == "failed",
+                Job.finished_at >= now - timedelta(hours=window),
+            )
+        )
+    ).one()
+    worker = await queue.worker_status(db)
+    models = (
+        await db.execute(
+            select(UsageLog.model, *USAGE_FIGURES)
+            .where(UsageLog.created_at >= today)
+            .group_by(UsageLog.model)
+            .order_by(UsageLog.model)
+        )
+    ).all()
+    totals = (await db.execute(select(*USAGE_FIGURES).where(UsageLog.created_at >= today))).one()
+    accounts = await db.scalar(select(func.count()).select_from(User))
+    newest = None
+    if "audit.read" in operator.permissions:
+        newest = await list_audit(
+            operator,
+            db,
+            settings,
+            page=1,
+            page_size=OVERVIEW_AUDIT_RECORDS,
+            area=None,
+            q="",
+        )
+    # Unknown off PostgreSQL, where no lock says whether a worker runs.
+    stuck = None
+    if worker.state != "unknown":
+        stuck = sum(queue.job_is_stuck(job, worker) for job in running)
+    # Every database read is done, so one that failed has answered without asking a catalog;
+    # and the session's connection goes back to the pool before the probes, so a slow
+    # upstream holds none. The two run together, each bounded by ADMIN_PROBE_TIMEOUT_SECONDS
+    # and answering its own failure, never raising.
+    await db.close()
+    kano_proxy, kano_pay = await asyncio.gather(
+        admin_jobs.kano_proxy_status(settings), admin_jobs.kano_pay_status(settings)
+    )
+    answer = {
+        "day": now.date(),
+        "accounts": accounts,
+        "jobs": {
+            "queued": queued,
+            "running": len(running),
+            "stuck": stuck,
+            "oldest_queued_at": oldest_queued,
+            "failed": failed,
+            "failed_hours": window,
+            "last_failed_at": last_failed,
+        },
+        "worker": asdict(worker),
+        "usage": {
+            "models": [{"model": row[0], **usage_totals(row[1:])} for row in models],
+            "totals": usage_totals(totals),
+        },
+        "connections": {"kano_proxy": kano_proxy, "kano_pay": kano_pay},
+    }
+    if newest is not None:
+        answer["audit"] = newest["items"]
+    return answer
+
+
+@router.get("/jobs")
+async def list_jobs(
+    operator: JobsReader,
+    db: DbSession,
+    settings: AppSettings,
+    page: int = Query(default=1, ge=1, le=PAGE_MAX),
+    page_size: int | None = Query(default=None, ge=1),
+    status_filter: str | None = Query(default=None, alias="status"),
+):
+    """The jobs on record, newest first, `ADMIN_PAGE_SIZE` a page unless the query asks for
+    fewer; `status` keeps one status. Beside the page, every status's count and the
+    worker's state. The account's address only to a caller who also holds `users.read`."""
+    if status_filter is not None and status_filter not in JOB_STATUSES:
+        raise ApiError(422, "invalid_request", f"status: one of {', '.join(JOB_STATUSES)}")
+    size = min(page_size or settings.admin_page_size, settings.admin_page_size)
+    filters = [] if status_filter is None else [Job.status == status_filter]
+    total = await db.scalar(select(func.count()).select_from(Job).where(*filters))
+    rows = (
+        await db.execute(
+            select(Job, User.email)
+            .join(User, User.id == Job.user_id)
+            .where(*filters)
+            .order_by(Job.created_at.desc(), Job.id.desc())
+            .limit(size)
+            .offset((page - 1) * size)
+        )
+    ).all()
+    counts = dict((await db.execute(select(Job.status, func.count()).group_by(Job.status))).all())
+    worker = await queue.worker_status(db)
+    # An account's address is the users area's to show; without it the page names the id.
+    emails = "users.read" in operator.permissions
+    return {
+        "items": [_job_payload(job, email if emails else None, worker) for job, email in rows],
+        "total": total,
+        "page": page,
+        "page_size": size,
+        "counts": {job_status: counts.get(job_status, 0) for job_status in JOB_STATUSES},
+        "worker": asdict(worker),
+    }
+
+
+@router.post("/jobs/{job_id}/requeue", dependencies=[CsrfGuard])
+async def requeue_stuck_job(
+    job_id: uuid.UUID, operator: JobsWriter, db: DbSession, settings: AppSettings
+):
+    """A stuck job back in the queue, with its audit row in the same commit; anything
+    else 404 or 409 `admin_conflict` (docs/admin.md § Overview, jobs and usage)."""
+    job = await admin_jobs.requeue(db, settings, operator, job_id)
+    await db.commit()
+    email = (
+        await db.scalar(select(User.email).where(User.id == job.user_id))
+        if "users.read" in operator.permissions
+        else None
+    )
+    return _job_payload(job, email, await queue.worker_status(db))
+
+
+@router.get("/usage")
+async def usage(
+    operator: JobsReader,
+    db: DbSession,
+    settings: AppSettings,
+    first: Annotated[date, Query(alias="from")],
+    last: Annotated[date, Query(alias="to")],
+):
+    """`usage_log` per UTC day and model from `from` to `to`, both included, the newest
+    day first, with the range's totals — every account's calls, of every agent."""
+    if first > last:
+        raise ApiError(422, "invalid_request", "from: a date no later than to")
+    if (last - first).days + 1 > settings.admin_usage_max_days:
+        raise ApiError(
+            422,
+            "invalid_request",
+            f"The range spans more than {settings.admin_usage_max_days} days",
+        )
+    # Aware UTC bounds (the column refuses naive ones); the database session is pinned to
+    # UTC, so `date()` is the UTC day on PostgreSQL and SQLite alike.
+    window = (
+        UsageLog.created_at >= datetime.combine(first, time.min, UTC),
+        UsageLog.created_at <= datetime.combine(last, time.max, UTC),
+    )
+    day = func.date(UsageLog.created_at)
+    rows = (
+        await db.execute(
+            select(day, UsageLog.model, *USAGE_FIGURES)
+            .where(*window)
+            .group_by(day, UsageLog.model)
+            .order_by(day.desc(), UsageLog.model)
+        )
+    ).all()
+    totals = (await db.execute(select(*USAGE_FIGURES).where(*window))).one()
+    return {
+        "from": first,
+        "to": last,
+        # PostgreSQL answers a date, SQLite a string.
+        "rows": [
+            {"date": str(row[0])[:10], "model": row[1], **usage_totals(row[2:])} for row in rows
+        ],
+        "totals": usage_totals(totals),
+    }
 
 
 # --- groups ---------------------------------------------------------------------------
