@@ -9,6 +9,7 @@
  * compares permission strings and the `builtin` flag — never a group's name.
  */
 import { ApiRequestError } from './api'
+import type { CostDay } from './chart'
 import type { IconName } from './icons'
 
 export type AdminLevel = 'read' | 'write'
@@ -51,6 +52,10 @@ export interface ConsolePage {
  * first readable one from. Later steps put theirs in front of these (docs/admin.md § Roadmap).
  */
 export const CONSOLE_PAGES: readonly ConsolePage[] = [
+  // `/admin` itself is the Overview, `jobs.read`'s like Jobs and Usage (docs/admin.md § Pages).
+  { area: 'jobs', path: '/admin', icon: 'layout-grid', label: 'admin.nav.overview' },
+  { area: 'jobs', path: '/admin/jobs', icon: 'list-checks', label: 'admin.nav.jobs' },
+  { area: 'jobs', path: '/admin/usage', icon: 'dashboard', label: 'admin.nav.usage' },
   { area: 'groups', path: '/admin/groups', icon: 'users-round', label: 'admin.nav.groups' },
   { area: 'audit', path: '/admin/audit', icon: 'scroll-text', label: 'admin.nav.audit' },
 ]
@@ -82,9 +87,11 @@ export function areaOf(value: unknown): AdminArea | null {
 }
 
 /**
- * Where a visit to a console page lands (docs/admin.md § Pages): the page itself when its
- * area is readable, else the first readable page, and null — the Not Found page — when the
- * account can read none. `/admin`, which has no area, always replaces itself.
+ * Where a visit to a console page lands (docs/admin.md § Pages): the area's first page when
+ * its area is readable — the `admin` middleware then leaves the page where it is — else the
+ * first readable page, and null — the Not Found page — when the account can read none. `/admin`
+ * is the Overview, a `jobs` page, so an account without `jobs.read` is sent on from it; a page
+ * with no area always is.
  */
 export function consoleDestination(permissions: readonly string[], area: AdminArea | null): string | null {
   const first = firstReadableArea(permissions)
@@ -256,4 +263,158 @@ const CONFLICT_REASONS = ['name_taken', 'builtin', 'last_owner', 'email_ambiguou
 /** The catalog key for a conflict's reason, or null for one the catalog does not word. */
 export function conflictKey(reason: string | null): string | null {
   return CONFLICT_REASONS.find((known) => known === reason) ? `admin.conflicts.${reason}` : null
+}
+
+// --- jobs and usage -------------------------------------------------------------------
+
+/** A job's statuses, in the order the Jobs filter offers them (docs/admin.md § Routes). */
+export const JOB_STATUSES = ['queued', 'running', 'failed', 'succeeded'] as const
+
+export type JobStatus = (typeof JOB_STATUSES)[number]
+
+/** The Jobs filter's status from the query (`?status=`): one of the four, else null (all). */
+export function jobStatusOf(value: unknown): JobStatus | null {
+  return JOB_STATUSES.find((status) => status === value) ?? null
+}
+
+/** The reasons a requeue's `admin_conflict` names (docs/admin.md § Refusals). */
+const REQUEUE_REASONS = ['not_running', 'not_stuck', 'worker_unknown'] as const
+
+/** The catalog key for a requeue refusal's reason, or null for one the catalog does not word. */
+export function requeueRefusalKey(reason: string | null): string | null {
+  return REQUEUE_REASONS.find((known) => known === reason) ? `admin.jobs.refusals.${reason}` : null
+}
+
+/**
+ * How long since something, in its largest whole unit — seconds under a minute, minutes under
+ * an hour, hours under two days, days after — in the reader's locale: *4 min*, *3 hr*. Never
+ * negative: a clock a little ahead of the server's reads as 0 seconds.
+ */
+export function formatElapsed(milliseconds: number, locale: string): string {
+  const seconds = Math.max(0, Math.floor(milliseconds / 1000))
+  const [unit, n] =
+    seconds < 60
+      ? (['second', seconds] as const)
+      : seconds < 3600
+        ? (['minute', Math.floor(seconds / 60)] as const)
+        : seconds < 48 * 3600
+          ? (['hour', Math.floor(seconds / 3600)] as const)
+          : (['day', Math.floor(seconds / 86400)] as const)
+  return new Intl.NumberFormat(locale, { style: 'unit', unit, unitDisplay: 'short' }).format(n)
+}
+
+/**
+ * A cost in US dollars, as `usage_log` records it: two decimals, and up to four for an amount
+ * under a cent, so a day of cheap calls does not read as $0.00.
+ */
+export function formatUsd(value: number, locale: string): string {
+  const small = value !== 0 && Math.abs(value) < 0.01
+  return new Intl.NumberFormat(locale, {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: 2,
+    maximumFractionDigits: small ? 4 : 2,
+  }).format(value)
+}
+
+/**
+ * The Usage page's ranges, in UTC days up to today, and the one it opens on. The API refuses
+ * a range over `ADMIN_USAGE_MAX_DAYS`, which it never lets under 90, so each one fits.
+ */
+export const USAGE_PRESETS = [7, 30, 90] as const
+export const USAGE_DEFAULT_DAYS = 30
+
+export interface DayRange {
+  /** `YYYY-MM-DD`, UTC, both included. */
+  from: string
+  to: string
+}
+
+/** A moment's UTC day, `YYYY-MM-DD`. */
+export function utcDay(at: Date): string {
+  return at.toISOString().slice(0, 10)
+}
+
+/** A `YYYY-MM-DD` that names a real day, else null: what the query's `from` and `to` take. */
+export function dayOf(value: unknown): string | null {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    return null
+  }
+  const at = new Date(`${value}T00:00:00Z`)
+  return !Number.isNaN(at.getTime()) && utcDay(at) === value ? value : null
+}
+
+/** The day `n` days after `day` (before it for a negative `n`). */
+export function addDays(day: string, n: number): string {
+  const at = new Date(`${day}T00:00:00Z`)
+  at.setUTCDate(at.getUTCDate() + n)
+  return utcDay(at)
+}
+
+/** The `days` UTC days that end with `today`. */
+export function presetRange(days: number, today: string): DayRange {
+  return { from: addDays(today, -(days - 1)), to: today }
+}
+
+/**
+ * The Usage range from the query (`?from=&to=`): both as given when both are days — a range
+ * the API refuses, backwards or too long, is the API's to say — else the last
+ * `USAGE_DEFAULT_DAYS` days.
+ */
+export function usageRangeOf(query: { from?: unknown; to?: unknown }, today: string): DayRange {
+  const from = dayOf(query.from)
+  const to = dayOf(query.to)
+  return from && to ? { from, to } : presetRange(USAGE_DEFAULT_DAYS, today)
+}
+
+/** The preset a range is, or null — a range from a link selects no segment. */
+export function presetOf(range: DayRange, today: string): number | null {
+  return USAGE_PRESETS.find((days) => {
+    const preset = presetRange(days, today)
+    return preset.from === range.from && preset.to === range.to
+  }) ?? null
+}
+
+/** Every day from `from` to `to`, oldest first: the chart's days, one a point, a day without
+ *  calls at $0. Empty for a backwards range. */
+export function daysOf(range: DayRange): string[] {
+  const days: string[] = []
+  for (let day = range.from; day <= range.to; day = addDays(day, 1)) {
+    days.push(day)
+  }
+  return days
+}
+
+/** A UTC day as the reader's locale writes it — the medium date, or month and day alone for
+ *  the chart's axis — read in UTC, so no timezone moves it to the day before. */
+export function formatUtcDay(day: string, locale: string, short = false): string {
+  const options: Intl.DateTimeFormatOptions = short
+    ? { month: 'numeric', day: 'numeric', timeZone: 'UTC' }
+    : { dateStyle: 'medium', timeZone: 'UTC' }
+  return new Intl.DateTimeFormat(locale, options).format(new Date(`${day}T00:00:00Z`))
+}
+
+/**
+ * The chart's days from the usage rows: every day of `days`, its estimated cost summed over
+ * its models — a day without a row at $0 — with the model that cost most and the rest
+ * together. The estimate, as the page's *Cost* is (docs/admin.md § Overview, jobs and usage).
+ */
+export function costDays(
+  days: readonly string[],
+  rows: readonly { date: string; model: string; estimated_cost: number }[],
+): CostDay[] {
+  return days.map((day) => {
+    const models = rows.filter((row) => row.date === day && row.estimated_cost > 0)
+    const cost = models.reduce((sum, row) => sum + row.estimated_cost, 0)
+    const top = models.reduce<(typeof models)[number] | null>(
+      (best, row) => (!best || row.estimated_cost > best.estimated_cost ? row : best),
+      null,
+    )
+    return {
+      day,
+      cost,
+      top: top ? { model: top.model, cost: top.estimated_cost } : null,
+      others: top ? cost - top.estimated_cost : 0,
+    }
+  })
 }

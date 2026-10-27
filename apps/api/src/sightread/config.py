@@ -49,6 +49,14 @@ class Settings(BaseSettings):
     admin_reauth_hours: int = 12
     admin_page_size: int = 50
 
+    # The console's jobs and usage (docs/admin.md § Overview, jobs and usage): how long the
+    # overview waits for each of Kano Proxy's and Kano Pay's catalogs, the most days one read
+    # of the usage may span — never under the Usage page's longest range, 90 days — and how
+    # many hours back the overview counts failed jobs.
+    admin_probe_timeout_seconds: float = 5
+    admin_usage_max_days: int = 366
+    admin_failed_window_hours: int = 24
+
     # Kano Proxy, the only upstream (docs/auth.md § 3): the origin only — vision calls go
     # to `{origin}/openai/v1`, chat to `{origin}/anthropic/v1` — and the operator's own key,
     # presented on every upstream call. Either empty = no upstream, 503 `upstream`.
@@ -356,11 +364,16 @@ class Settings(BaseSettings):
             "redeem_max_failures",
             "redeem_failure_window_seconds",
             "admin_reauth_hours",
+            "admin_probe_timeout_seconds",
+            "admin_failed_window_hours",
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name.upper()} must be positive")
         if not 1 <= self.admin_page_size <= 500:
             raise ValueError("ADMIN_PAGE_SIZE must be between 1 and 500")
+        # The Usage page offers 7, 30 and 90 days; a smaller cap would refuse its own presets.
+        if self.admin_usage_max_days < 90:
+            raise ValueError("ADMIN_USAGE_MAX_DAYS must be at least 90")
         self.redeem_code_prefix = self.redeem_code_prefix.strip().upper()
         if self.redeem_code_prefix and not self.redeem_code_prefix.isalnum():
             raise ValueError("REDEEM_CODE_PREFIX must be letters and digits only")

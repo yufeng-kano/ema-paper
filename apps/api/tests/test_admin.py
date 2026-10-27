@@ -1282,6 +1282,7 @@ CONSOLE_MUTATIONS = [
     ("delete", "/api/admin/groups/{group}", None),
     ("post", "/api/admin/groups/{group}/members", {"user_id": 1}),
     ("delete", "/api/admin/groups/{group}/members/{user}", None),
+    ("post", "/api/admin/jobs/{job}/requeue", None),
 ]
 
 
@@ -1296,7 +1297,12 @@ def test_every_console_mutation_is_listed_and_guarded() -> None:
             calls = [dependency.call for dependency in route.dependant.dependencies]
             assert require_csrf_header in calls, route.path
     assert mutations == {
-        (method, path.replace("{group}", "{group_id}").replace("{user}", "{user_id}"))
+        (
+            method,
+            path.replace("{group}", "{group_id}")
+            .replace("{user}", "{user_id}")
+            .replace("{job}", "{job_id}"),
+        )
         for method, path, _ in CONSOLE_MUTATIONS
     }
 
@@ -1308,7 +1314,7 @@ async def test_console_mutations_require_the_custom_header(
     owner = await _owner(make_client)
     group = await _group(owner, "target", [])
     outsider = await _account(make_client, "outsider@example.test")
-    url = path.format(group=group["id"], user=owner.user_id)
+    url = path.format(group=group["id"], user=owner.user_id, job=uuid.uuid4())
     start = await _last_audit_id(owner)
 
     response = await owner.request(method, url, json=body)

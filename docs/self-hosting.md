@@ -119,7 +119,7 @@ docker compose exec api python -m sightread.codes disable EMA-XXXX-XXXX-XXXX
 
 ## The operator console
 
-The console is your own pages inside the app — today *Groups*, to give other people access, and *Audit*, the record of every change made there ([admin.md](./admin.md)). It does not exist until you name its first owner. Put your Google address in `.env`:
+The console is your own pages inside the app — today *Overview*, *Jobs* and *Usage*, to see whether the worker runs, put a stuck job back in the queue and see what the model calls cost, *Groups*, to give other people access, and *Audit*, the record of every change made there ([admin.md](./admin.md)). It does not exist until you name its first owner. Put your Google address in `.env`:
 
 ```sh
 OWNER_EMAILS=you@example.com    # comma-separated for several; empty = no console

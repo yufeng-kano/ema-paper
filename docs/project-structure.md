@@ -28,7 +28,9 @@ agent-sightread/
                               # deps.py (require_console_session, require_permission),
                               # groups.py (the built-in group, the sign-in owner join,
                               # members, the no-escalation checks), audit.py (the one
-                              # helper that writes an audit row in the caller's transaction)
+                              # helper that writes an audit row in the caller's transaction),
+                              # jobs.py (a stuck job's requeue, the overview's checks of
+                              # Kano Proxy and Kano Pay)
         billing/              # plans, periods and credit arithmetic (docs/billing.md):
                               # credits.py prices a parse and a turn, plans.py reads the
                               # plans and decides the current period; pure, no HTTP
@@ -71,6 +73,7 @@ agent-sightread/
                               # the operator console (docs/admin.md): pages/admin/,
                               # middleware/admin.ts, composables/useAdminConsole.ts,
                               # lib/admin.ts (pure: areas, nav, permission checks; vitest),
+                              # lib/chart.ts (the usage chart's geometry; vitest),
                               # components/admin/
       server/routes/          # robots.txt and sitemap.xml, prerendered; no API (docs/web.md § Search engines)
       shared/                 # framework-free code nuxt.config.ts, the app and server/ all read
@@ -96,5 +99,5 @@ agent-sightread/
 - `workspace/` is the only package that touches `WORKSPACES_DIR` and the only one that runs git; `sandbox/client.py` is the only module that calls the runner. The runner (`apps/sandbox`) is the only process with the Docker socket.
 - `agents/` defines agents and nothing else: no HTTP, no database. Runners and settings consume its definitions ([agents.md](./agents.md)).
 - `jobs/queue.py` is the only module that knows the queue is Postgres.
-- `admin/` is the only package that decides a console permission or writes `groups`, `group_members` and `audit_log`; `routes/admin.py` is thin over it, and the Google callback and the dev login call `admin/groups.py` for the owner join. Every console mutation writes its audit row through `admin/audit.py` before the route's one commit. Nothing outside it compares a group's name.
+- `admin/` is the only package that decides a console permission or writes `groups`, `group_members` and `audit_log`; `routes/admin.py` is thin over it, and the Google callback and the dev login call `admin/groups.py` for the owner join. Every console mutation writes its audit row through `admin/audit.py` before the route's one commit. Nothing outside it compares a group's name. Whether the worker runs and what a requeue does stay in `jobs/queue.py`, the one module that knows the queue is PostgreSQL: `admin/jobs.py` calls it, and reads the worker lock only through it.
 - Web: pages thin, logic in composables; API access through one typed client module. The console's permission logic is the pure `app/lib/admin.ts`, so it is tested without a DOM; its pages read permissions from `useAdminConsole` only.
