@@ -10,15 +10,16 @@ a document, a note, a conversation or any other content of an account.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Body, Depends, Path, Query, Response, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from sqlalchemy import String, and_, cast, func, or_, select
+from sqlalchemy import String, and_, cast, distinct, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
+from ..admin import codes as admin_codes
 from ..admin import grants, groups
 from ..admin.deps import (
     ConsoleSession,
@@ -29,7 +30,7 @@ from ..admin.deps import (
 )
 from ..admin.permissions import ALL_PERMISSIONS, AREAS, normalize
 from ..auth.deps import AppSettings, CsrfGuard, DbSession
-from ..billing import ledger
+from ..billing import codes, ledger
 from ..billing.plans import FREE_PLAN_ID, PAID_STATUSES
 from ..config import Settings
 from ..db.models import (
@@ -38,6 +39,8 @@ from ..db.models import (
     GroupMember,
     Job,
     PlanGrant,
+    RedeemCode,
+    Redemption,
     Subscription,
     User,
     utcnow,
@@ -427,6 +430,186 @@ async def grant_to_user(
         "day_bank": grants.day_bank(decided.grant),
         "period": grants.period_summary(decided.period),
     }
+
+
+# --- redeem codes ---------------------------------------------------------------------
+
+CodesReader = Annotated[Operator, Depends(require_permission("codes.read"))]
+CodesWriter = Annotated[Operator, Depends(require_permission("codes.write"))]
+
+
+async def _code_payloads(
+    db: AsyncSession, settings: Settings, rows: list[RedeemCode]
+) -> list[dict]:
+    """`<code>`: masked — the plaintext is the create answer's alone — with its status now
+    and who disabled it, the actor of its newest `codes.disable` record (null for a code
+    disabled with the CLI, which records nothing, and for a deleted account)."""
+    now = utcnow()
+    disabled = [str(row.id) for row in rows if row.disabled_at is not None]
+    newest = (
+        select(AuditLog.target_id, func.max(AuditLog.id).label("id"))
+        .where(
+            AuditLog.target_type == "code",
+            AuditLog.target_id.in_(disabled),
+            AuditLog.action == "codes.disable",
+        )
+        .group_by(AuditLog.target_id)
+        .subquery()
+    )
+    disablers = {
+        int(target_id): {"id": user_id, "name": name}
+        for target_id, user_id, name in (
+            await db.execute(
+                select(newest.c.target_id, User.id, User.name)
+                .select_from(newest)
+                .join(AuditLog, AuditLog.id == newest.c.id)
+                .join(User, User.id == AuditLog.actor_id)
+            )
+        ).all()
+    }
+    return [
+        {
+            "id": row.id,
+            "masked": codes.mask(row.code, settings.redeem_code_prefix),
+            "kind": row.kind,
+            "credits": row.credits,
+            "valid_days": row.valid_days,
+            "plan_id": row.plan_id,
+            "days": row.days,
+            "uses": row.uses,
+            "max_uses": row.max_uses,
+            "redeem_by": row.redeem_by,
+            "label": row.label,
+            "status": codes.status(row, now, settings.plans),
+            "created_at": row.created_at,
+            "disabled_at": row.disabled_at,
+            "disabled_by": disablers.get(row.id),
+        }
+        for row in rows
+    ]
+
+
+@router.get("/codes")
+async def list_codes(
+    operator: CodesReader,
+    db: DbSession,
+    settings: AppSettings,
+    page: int = Query(default=1, ge=1, le=PAGE_MAX),
+    page_size: int | None = Query(default=None, ge=1),
+    status_filter: str = Query(default="active", alias="status"),
+    q: str = "",
+):
+    """Newest first, `ADMIN_PAGE_SIZE` a page unless the query asks for fewer. `status`
+    `active` keeps the codes redeemable now, `all` every one; `q` a label containing it in
+    any letter case — never the code, which a search would give away a character at a
+    time. Beside the page, the title's figures and what the create dialog is drawn from."""
+    if status_filter not in ("active", "all"):
+        raise ApiError(422, "invalid_request", "status: one of active, all")
+    size = min(page_size or settings.admin_page_size, settings.admin_page_size)
+    now = utcnow()
+    active = codes.is_active(now, settings.plans)
+    filters = []
+    if status_filter == "active":
+        filters.append(active)
+    needle = q.strip()
+    if needle:
+        filters.append(RedeemCode.label.icontains(needle, autoescape=True))
+    total = await db.scalar(select(func.count()).select_from(RedeemCode).where(*filters))
+    rows = list(
+        await db.scalars(
+            select(RedeemCode)
+            .where(*filters)
+            .order_by(RedeemCode.id.desc())
+            .limit(size)
+            .offset((page - 1) * size)
+        )
+    )
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return {
+        "items": await _code_payloads(db, settings, rows),
+        "total": total,
+        "page": page,
+        "page_size": size,
+        "summary": {
+            "active": await db.scalar(select(func.count()).select_from(RedeemCode).where(active)),
+            "labels": await db.scalar(
+                select(func.count(distinct(RedeemCode.label))).where(active, RedeemCode.label != "")
+            ),
+            "redeemed_this_month": await db.scalar(
+                select(func.count())
+                .select_from(Redemption)
+                .where(Redemption.redeemed_at >= month_start)
+            ),
+        },
+        "create": {
+            "plans": list(settings.plans),
+            "max_count": settings.redeem_codes_max_count,
+            "max_days": codes.MAX_DAYS,
+            "valid_days": codes.DEFAULT_VALID_DAYS,
+            "credit_usd": str(settings.credit_usd),
+        },
+    }
+
+
+class CodesCreate(BaseModel):
+    """`python -m sightread.codes create`'s fields: `kind` for `--credits` or `--plan`,
+    `max_uses` for `--uses`, `redeem_by` a date. Their rules are `create_codes`', which the
+    CLI shares (docs/admin.md § Redeem codes)."""
+
+    kind: str
+    credits: int | None = None
+    valid_days: int = codes.DEFAULT_VALID_DAYS
+    plan_id: str | None = None
+    days: int | None = None
+    count: int = 1
+    max_uses: int = 1
+    redeem_by: date | None = None
+    label: str = ""
+
+
+@router.post("/codes", dependencies=[CsrfGuard], status_code=status.HTTP_201_CREATED)
+async def create_codes(
+    body: CodesCreate, operator: CodesWriter, db: DbSession, settings: AppSettings
+):
+    """The one answer that holds the codes in plaintext, as printed."""
+    rows = await admin_codes.create_codes(
+        db,
+        operator,
+        settings,
+        kind=body.kind,
+        count=body.count,
+        max_uses=body.max_uses,
+        redeem_by=None if body.redeem_by is None else codes.end_of_utc_day(body.redeem_by),
+        label=body.label,
+        credits=body.credits,
+        valid_days=body.valid_days,
+        plan_id=body.plan_id,
+        days=body.days,
+    )
+    await db.commit()
+    first = rows[0]
+    return {
+        "codes": [
+            {"id": row.id, "code": codes.display(row.code, settings.redeem_code_prefix)}
+            for row in rows
+        ],
+        "kind": first.kind,
+        "credits": first.credits,
+        "valid_days": first.valid_days,
+        "plan_id": first.plan_id,
+        "days": first.days,
+        "max_uses": first.max_uses,
+        "redeem_by": first.redeem_by,
+        "label": first.label,
+    }
+
+
+@router.post("/codes/{code_id}/disable", dependencies=[CsrfGuard])
+async def disable_code(code_id: int, operator: CodesWriter, db: DbSession, settings: AppSettings):
+    """The code, disabled; one already disabled as it is, nothing recorded."""
+    row = await admin_codes.disable_code(db, operator, code_id)
+    await db.commit()
+    return (await _code_payloads(db, settings, [row]))[0]
 
 
 # --- groups ---------------------------------------------------------------------------

@@ -3,9 +3,10 @@
  *
  * The authed pages are client-rendered and stay open for days, so a deploy reaches them
  * only when something reloads the page. This is the decision of *when* that is free: at
- * once when the page is idle, on the next navigation, or when the page lets go of its last
- * hold. It knows nothing of Nuxt or the DOM — the plugin supplies the three effects — so it
- * runs in the framework-free node suite (docs/testing.md).
+ * once when the page is idle, or when the page lets go of its last hold — a navigation
+ * under a hold included, since the page may refuse it. It knows nothing of Nuxt or the
+ * DOM — the plugin supplies the three effects — so it runs in the framework-free node
+ * suite (docs/testing.md).
  */
 
 export interface BuildUpdateDeps {
@@ -24,7 +25,8 @@ export interface BuildUpdate {
   markOutdated: () => void
   /** "Not now": no reload until the returned release is called. Releasing twice is one release. */
   hold: () => () => void
-  /** A route navigation to `path`: true when it was turned into a full load of that path. */
+  /** A route navigation to `path`: true when it was turned into a full load of that path —
+   *  never while something holds. */
   navigate: (path: string) => boolean
   isOutdated: () => boolean
 }
@@ -79,8 +81,14 @@ export function createBuildUpdate(deps: BuildUpdateDeps): BuildUpdate {
       }
     },
     navigate(path) {
-      // A navigation abandons the page's state anyway, so holds do not apply to it.
-      if (!outdated) {
+      // A hold applies here too: the page may refuse the navigation and keep what it holds
+      // (the console's created codes refuse Back), so this does not turn it into a load, and
+      // the reload follows the last release — a page that is left releases its holds as it
+      // unmounts. Only this decision is ours: once Nuxt's own periodic check has found the
+      // new build, Nuxt's chunk-reload plugin loads every navigation that goes on in full,
+      // hold or not, so only a navigation the page refuses keeps what it holds. With nothing
+      // held an outdated page is already reloading, and the navigation gives way to that load.
+      if (!outdated || holds > 0) {
         return false
       }
       reload(path)

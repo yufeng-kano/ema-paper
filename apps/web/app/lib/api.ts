@@ -1809,3 +1809,91 @@ export function listAdminAudit(query: { page: number; area?: string; q?: string 
   }
   return request('GET', `/api/admin/audit?${params}`)
 }
+
+// --- operator console: redeem codes (docs/admin.md § Redeem codes) -----------------------
+
+/** What a code is now: disabled, else expired (past `redeem_by`), else used up, else plan
+ *  missing (a plan code whose plan is no longer configured), else active. */
+export type AdminCodeStatus = 'active' | 'disabled' | 'expired' | 'used_up' | 'plan_missing'
+
+/** One redeem code as the console lists it: masked — the prefix and the first group, or
+ *  none of a short code — and never whole. The fields of the other kind are null. */
+export interface AdminCode {
+  id: number
+  masked: string
+  kind: 'credits' | 'plan'
+  credits: number | null
+  valid_days: number | null
+  plan_id: string | null
+  days: number | null
+  uses: number
+  max_uses: number
+  /** The last second, UTC, it can be redeemed; null for no end. */
+  redeem_by: string | null
+  label: string
+  status: AdminCodeStatus
+  created_at: string
+  disabled_at: string | null
+  /** Who disabled it in the console; null for one disabled with the CLI, or once that
+   *  account is deleted. */
+  disabled_by: AdminPerson | null
+}
+
+/** `GET /api/admin/codes`: a page of codes, the title's figures, and what the create dialog
+ *  is drawn from — the configured plans, `REDEEM_CODES_MAX_COUNT`, the most days a code
+ *  gives, the CLI's default validity and `CREDIT_USD` as a decimal string. */
+export interface AdminCodesList extends AdminList<AdminCode> {
+  summary: { active: number; labels: number; redeemed_this_month: number }
+  create: { plans: string[]; max_count: number; max_days: number; valid_days: number; credit_usd: string }
+}
+
+/** `python -m sightread.codes create`'s fields: `kind` for `--credits` or `--plan`,
+ *  `max_uses` for `--uses`, `redeem_by` a date, `YYYY-MM-DD`. */
+export interface AdminCodesCreate {
+  kind: 'credits' | 'plan'
+  credits?: number
+  valid_days?: number
+  plan_id?: string
+  days?: number
+  count: number
+  max_uses: number
+  redeem_by?: string
+  label: string
+}
+
+/** The one answer that holds the codes in plaintext, as printed; the batch's fields as
+ *  stored. */
+export interface AdminCodesCreated {
+  codes: { id: number; code: string }[]
+  kind: 'credits' | 'plan'
+  credits: number | null
+  valid_days: number | null
+  plan_id: string | null
+  days: number | null
+  max_uses: number
+  redeem_by: string | null
+  label: string
+}
+
+/** Newest first. `status` `all` lists every code, else only those redeemable now; `q` a
+ *  label containing it, in any letter case. */
+export function listAdminCodes(query: { page: number; status?: 'all'; q?: string }): Promise<AdminCodesList> {
+  const params = new URLSearchParams({ page: String(query.page) })
+  if (query.status) {
+    params.set('status', query.status)
+  }
+  if (query.q) {
+    params.set('q', query.q)
+  }
+  return request('GET', `/api/admin/codes?${params}`)
+}
+
+/** 201 with the codes in plaintext; 422 for a batch outside the rules the CLI shares. */
+export function createAdminCodes(body: AdminCodesCreate): Promise<AdminCodesCreated> {
+  return request('POST', '/api/admin/codes', body)
+}
+
+/** The code, disabled; one already disabled as it is. */
+export function disableAdminCode(id: number): Promise<AdminCode> {
+  return request('POST', `/api/admin/codes/${id}/disable`)
+}
