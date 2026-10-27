@@ -1516,7 +1516,7 @@ export default {
         chat_settings: '{n} 個帳戶的對話代理設成了被移除的模型',
         subagents: '{n} 個子代理指定了被移除的模型',
         subscriptions: '{n} 個訂閱會立刻變回 Free',
-        day_banks: '{n} 個有贈送天數的帳戶改用 Free：進行中的期間照樣倒數，存著的天數先擱著',
+        day_banks: '{n} 個帳戶有被移除方案的贈送天數：進行中的期間改用 Free 照樣倒數，存著的天數先擱著',
         plan_codes: '{n} 組還能用的兌換碼會被拒絕',
         plan_checkouts: '{n} 筆還沒付款的方案結帳，付款後仍會停在 Free',
         pack_checkouts: '{n} 筆還沒付款的加購結帳，付款後不會加點',

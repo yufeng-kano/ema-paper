@@ -79,7 +79,7 @@ export function navEntries(permissions: readonly string[]): ConsolePage[] {
 }
 
 /** The first console page, in nav order, whose area the list can read; null when it reads
- *  none — an account in no group. */
+ *  none — an account in no group, or only in groups that grant no `.read`. */
 export function firstReadableArea(permissions: readonly string[]): ConsolePage | null {
   return navEntries(permissions)[0] ?? null
 }

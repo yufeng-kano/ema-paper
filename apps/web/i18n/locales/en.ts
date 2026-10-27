@@ -1547,7 +1547,7 @@ export default {
         subagents: '{n} subagent names a removed model | {n} subagents name a removed model',
         subscriptions: '{n} subscription falls to Free at once | {n} subscriptions fall to Free at once',
         day_banks:
-          '{n} account with granted days falls to Free: a running period keeps counting down, banked days wait | {n} accounts with granted days fall to Free: a running period keeps counting down, banked days wait',
+          '{n} account holds granted days of a removed plan: a running period counts down on Free, banked days wait | {n} accounts hold granted days of a removed plan: a running period counts down on Free, banked days wait',
         plan_codes: '{n} live redeem code is refused | {n} live redeem codes are refused',
         plan_checkouts:
           '{n} open plan checkout leaves its payer on Free when paid | {n} open plan checkouts leave their payers on Free when paid',

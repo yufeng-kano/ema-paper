@@ -21,6 +21,7 @@ import pytest
 import respx
 from sqlalchemy import func, select
 from sqlalchemy import text as sql
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from sightread import codes as codes_cli
 from sightread import runtime_settings, worker
@@ -37,6 +38,7 @@ from sightread.db.models import (
     User,
     utcnow,
 )
+from sightread.db.session import create_sessionmaker
 from sightread.jobs import chat_compact, chat_runner
 from sightread.jobs.queue import claim_next_turn
 from sightread.runtime_settings import OVERRIDABLE, RuntimeSettings, effective
@@ -288,13 +290,20 @@ async def test_a_request_reads_on_its_own_session_and_goes_on_after_a_failed_rea
     def no_second_session():
         raise AssertionError("a request's read asked the pool for another session")
 
+    async with sessionmaker() as db:
+        db.add(User(google_sub="sub-reader", email="reader@example.com"))
+        await db.commit()
+
     runtime = RuntimeSettings(lambda: base, no_second_session)
     async with sessionmaker() as db:
+        # Loaded first, as the sign-in dependencies load the account and its session.
+        user = await db.scalar(select(User).where(User.google_sub == "sub-reader"))
         read = await runtime.current(db)
         assert read.chat_min_credits == 4
 
-        # A read that fails leaves the request's session usable, as PostgreSQL would not
-        # after a failed statement in its transaction.
+        # A read that fails leaves the request's session usable — PostgreSQL refuses every
+        # later statement of a transaction one failed in — and what it loaded unexpired:
+        # an expired attribute would be loaded again, which async access refuses.
         execute = db.execute
         broken = [True]
 
@@ -307,7 +316,38 @@ async def test_a_request_reads_on_its_own_session_and_goes_on_after_a_failed_rea
         monkeypatch.setattr(db, "execute", failing)
         clock[0] += 60
         assert await runtime.current(db) is read
-        assert await db.scalar(select(func.count()).select_from(User)) is not None
+        assert user.email == "reader@example.com"
+        assert await db.scalar(select(func.count()).select_from(User)) == 1
+
+
+async def test_a_request_connects_before_it_waits_for_the_read(sessionmaker, monkeypatch) -> None:
+    monkeypatch.setattr(runtime_settings, "time", SimpleNamespace(monotonic=lambda: 1000.0))
+    await _store(sessionmaker, "CHAT_MIN_CREDITS", "4")
+    base = _base()
+    # A pool of one connection, which a request already holds.
+    engine = create_async_engine(
+        sessionmaker.kw["bind"].url, pool_size=1, max_overflow=0, pool_timeout=5
+    )
+    small = create_sessionmaker(engine)
+    runtime = RuntimeSettings(lambda: base, lambda: small)
+    try:
+        async with small() as holding, small() as unconnected:
+            await holding.connection()
+            # A request with no connection yet asks first: it waits for the pool, not
+            # holding the lock while it does, so the request holding the connection reads.
+            first = asyncio.create_task(runtime.current(unconnected))
+            try:
+                await asyncio.sleep(0.1)
+                read = await asyncio.wait_for(runtime.current(holding), timeout=2)
+                assert read.chat_min_credits == 4
+                await holding.close()
+                assert await asyncio.wait_for(first, timeout=2) is read
+            finally:
+                first.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await first
+    finally:
+        await engine.dispose()
 
 
 async def test_rows_that_no_longer_fit_env_leave_env_alone_in_effect(

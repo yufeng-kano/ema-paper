@@ -10,6 +10,7 @@ all the settings in effect are the very object the process started with.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections.abc import Callable
@@ -78,12 +79,13 @@ class RuntimeSettings:
     `base` and `sessionmaker` are asked for at each read, not at construction: the API's
     sessionmaker exists only once its lifespan starts, and tests replace both. One read
     runs at a time; whoever asks meanwhile waits for its answer. A request passes its own
-    session, and the read runs on it: the requests waiting meanwhile each hold a
-    connection of the pool, so a read that asked the pool for another could wait out its
-    timeout with all of them. The worker and the CLI pass none and read on a session of
-    their own. It never raises: a database it cannot read keeps the settings last read
-    (`.env`'s before any), and rows that no longer fit `.env` leave `.env` alone in effect,
-    with the checks' message in `ignored` for the settings page."""
+    session, connected before it waits for the lock, and the read runs on it: the requests
+    waiting meanwhile each hold a connection of the pool, so a read that asked the pool for
+    one under the lock could wait out its timeout with all of them. The worker and the CLI
+    pass none and read on a session of their own. It never raises: a database it cannot
+    read keeps the settings last read (`.env`'s before any), and rows that no longer fit
+    `.env` leave `.env` alone in effect, with the checks' message in `ignored` for the
+    settings page."""
 
     def __init__(
         self,
@@ -105,6 +107,11 @@ class RuntimeSettings:
         base = self._base()
         if self._built_on is base and time.monotonic() < self._expires:
             return self._value
+        if db is not None:
+            # A database it cannot connect to is the read's to report, and leaves the
+            # session usable.
+            with contextlib.suppress(Exception):
+                await db.connection()
         async with self._lock:
             base = self._base()
             if self._built_on is not base or time.monotonic() >= self._expires:
@@ -124,13 +131,12 @@ class RuntimeSettings:
         )
         try:
             if db is not None:
-                try:
+                # In a savepoint: a failed read is undone alone, leaving the request's
+                # transaction usable — PostgreSQL refuses every later statement of one a
+                # statement failed in — and what it loaded before, such as the signed-in
+                # account, unexpired.
+                async with db.begin_nested():
                     rows = (await db.execute(statement)).all()
-                except Exception:
-                    # PostgreSQL refuses every later statement of a transaction one of them
-                    # failed in: the request goes on in a fresh one.
-                    await db.rollback()
-                    raise
             else:
                 async with self._sessionmaker()() as own:
                     rows = (await own.execute(statement)).all()
