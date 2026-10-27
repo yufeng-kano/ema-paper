@@ -51,6 +51,7 @@ export interface ConsolePage {
  * first readable one from. Later steps put theirs in front of these (docs/admin.md § Roadmap).
  */
 export const CONSOLE_PAGES: readonly ConsolePage[] = [
+  { area: 'users', path: '/admin/users', icon: 'user', label: 'admin.nav.users' },
   { area: 'groups', path: '/admin/groups', icon: 'users-round', label: 'admin.nav.groups' },
   { area: 'audit', path: '/admin/audit', icon: 'scroll-text', label: 'admin.nav.audit' },
 ]
@@ -207,6 +208,16 @@ export function idOf(value: unknown): number | null {
 /** The audit filter's area from the query: one the filter offers, else null (all). */
 export function auditAreaOf(value: unknown): AdminArea | null {
   return AUDIT_FILTER_AREAS.find((area) => area === value) ?? null
+}
+
+// --- users and grants -----------------------------------------------------------------
+
+/** A grant's number as typed (docs/admin.md § Users and grants): a whole number from 1 to
+ *  `max`, the API's cap, else null — and the dialog's button stays off. */
+export function grantNumber(text: string, max: number): number | null {
+  const typed = text.trim()
+  const value = /^\d+$/.test(typed) ? Number(typed) : NaN
+  return Number.isSafeInteger(value) && value >= 1 && value <= max ? value : null
 }
 
 // --- refusals -------------------------------------------------------------------------

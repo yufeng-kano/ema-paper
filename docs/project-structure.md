@@ -28,7 +28,9 @@ agent-sightread/
                               # deps.py (require_console_session, require_permission),
                               # groups.py (the built-in group, the sign-in owner join,
                               # members, the no-escalation checks), audit.py (the one
-                              # helper that writes an audit row in the caller's transaction)
+                              # helper that writes an audit row in the caller's transaction),
+                              # grants.py (an operator's grant of credits or days to an
+                              # account, through billing/ledger.py)
         billing/              # plans, periods and credit arithmetic (docs/billing.md):
                               # credits.py prices a parse and a turn, plans.py reads the
                               # plans and decides the current period; pure, no HTTP
