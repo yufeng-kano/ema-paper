@@ -19,7 +19,8 @@ from types import SimpleNamespace
 import httpx
 import pytest
 import respx
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy import text as sql
 
 from sightread import codes as codes_cli
 from sightread import runtime_settings, worker
@@ -274,6 +275,39 @@ async def test_an_unreadable_database_keeps_the_last_settings_and_logs_once(
     # Before any good read, `.env`'s.
     fresh = RuntimeSettings(lambda: base, flaky)
     assert await fresh.current() is base
+
+
+async def test_a_request_reads_on_its_own_session_and_goes_on_after_a_failed_read(
+    sessionmaker, monkeypatch
+) -> None:
+    clock = [1000.0]
+    monkeypatch.setattr(runtime_settings, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    await _store(sessionmaker, "CHAT_MIN_CREDITS", "4")
+    base = _base()
+
+    def no_second_session():
+        raise AssertionError("a request's read asked the pool for another session")
+
+    runtime = RuntimeSettings(lambda: base, no_second_session)
+    async with sessionmaker() as db:
+        read = await runtime.current(db)
+        assert read.chat_min_credits == 4
+
+        # A read that fails leaves the request's session usable, as PostgreSQL would not
+        # after a failed statement in its transaction.
+        execute = db.execute
+        broken = [True]
+
+        async def failing(statement, *args, **kwargs):
+            if broken[0]:
+                broken[0] = False
+                return await execute(sql("SELECT * FROM no_such_table"))
+            return await execute(statement, *args, **kwargs)
+
+        monkeypatch.setattr(db, "execute", failing)
+        clock[0] += 60
+        assert await runtime.current(db) is read
+        assert await db.scalar(select(func.count()).select_from(User)) is not None
 
 
 async def test_rows_that_no_longer_fit_env_leave_env_alone_in_effect(

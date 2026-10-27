@@ -1203,7 +1203,6 @@ async def put_setting(
     body: SettingChange,
     operator: SettingsWriter,
     db: DbSession,
-    settings: AppSettings,
     request: Request,
 ):
     """Store a value over `.env`'s, checked as at start: 422 in the checks' words, 409
@@ -1217,7 +1216,7 @@ async def put_setting(
         key,
         body.value,
         confirm=body.confirm,
-        free_accounts=_on_plan(settings, FREE_PLAN_ID, utcnow()),
+        free_accounts=lambda effective: _on_plan(effective, FREE_PLAN_ID, utcnow()),
     )
     if changed:
         await db.commit()
@@ -1230,7 +1229,6 @@ async def reset_setting(
     key: str,
     operator: SettingsWriter,
     db: DbSession,
-    settings: AppSettings,
     request: Request,
     body: SettingReset | None = None,
 ):
@@ -1244,7 +1242,7 @@ async def reset_setting(
         key,
         None,
         confirm=body is not None and body.confirm,
-        free_accounts=_on_plan(settings, FREE_PLAN_ID, utcnow()),
+        free_accounts=lambda effective: _on_plan(effective, FREE_PLAN_ID, utcnow()),
     )
     if changed:
         await db.commit()

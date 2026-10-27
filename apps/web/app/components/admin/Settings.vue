@@ -140,7 +140,7 @@ function onSaved(settings: AdminSettingsResponse) {
     </UiPanel>
 
     <AdminSettingDialog
-      v-if="dialog && canWrite"
+      v-if="dialog"
       :key="`${dialog.mode}-${dialog.setting.key}`"
       :setting="dialog.setting"
       :mode="dialog.mode"

@@ -22,11 +22,12 @@ from .upload_tickets import TICKET_PREFIX
 DbSession = Annotated[AsyncSession, Depends(db_session)]
 
 
-async def get_settings_from_app(request: Request) -> Settings:
+async def get_settings_from_app(request: Request, db: DbSession) -> Settings:
     """The settings in effect: `.env`'s with the database's overrides on top, read once
     per request — FastAPI caches a dependency's answer within one — so a request runs on
-    one snapshot from start to end (docs/admin.md § Settings)."""
-    return await request.app.state.runtime_settings.current()
+    one snapshot from start to end (docs/admin.md § Settings). The rows are read on the
+    request's own session, the same one its routes get, never a second connection."""
+    return await request.app.state.runtime_settings.current(db)
 
 
 AppSettings = Annotated[Settings, Depends(get_settings_from_app)]

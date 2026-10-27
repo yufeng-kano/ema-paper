@@ -77,10 +77,13 @@ class RuntimeSettings:
 
     `base` and `sessionmaker` are asked for at each read, not at construction: the API's
     sessionmaker exists only once its lifespan starts, and tests replace both. One read
-    runs at a time; whoever asks meanwhile waits for its answer. It never raises: a
-    database it cannot read keeps the settings last read (`.env`'s before any), and rows
-    that no longer fit `.env` leave `.env` alone in effect, with the checks' message in
-    `ignored` for the settings page."""
+    runs at a time; whoever asks meanwhile waits for its answer. A request passes its own
+    session, and the read runs on it: the requests waiting meanwhile each hold a
+    connection of the pool, so a read that asked the pool for another could wait out its
+    timeout with all of them. The worker and the CLI pass none and read on a session of
+    their own. It never raises: a database it cannot read keeps the settings last read
+    (`.env`'s before any), and rows that no longer fit `.env` leave `.env` alone in effect,
+    with the checks' message in `ignored` for the settings page."""
 
     def __init__(
         self,
@@ -98,14 +101,14 @@ class RuntimeSettings:
         self._read_failed = False
         self.ignored: str | None = None
 
-    async def current(self) -> Settings:
+    async def current(self, db: AsyncSession | None = None) -> Settings:
         base = self._base()
         if self._built_on is base and time.monotonic() < self._expires:
             return self._value
         async with self._lock:
             base = self._base()
             if self._built_on is not base or time.monotonic() >= self._expires:
-                await self._read(base)
+                await self._read(base, db)
             return self._value
 
     def invalidate(self) -> None:
@@ -114,17 +117,23 @@ class RuntimeSettings:
         self._expires = 0.0
         self._generation += 1
 
-    async def _read(self, base: Settings) -> None:
+    async def _read(self, base: Settings, db: AsyncSession | None) -> None:
         generation = self._generation
+        statement = select(RuntimeSetting.key, RuntimeSetting.value).where(
+            RuntimeSetting.key.in_(OVERRIDABLE)
+        )
         try:
-            async with self._sessionmaker()() as db:
-                rows = (
-                    await db.execute(
-                        select(RuntimeSetting.key, RuntimeSetting.value).where(
-                            RuntimeSetting.key.in_(OVERRIDABLE)
-                        )
-                    )
-                ).all()
+            if db is not None:
+                try:
+                    rows = (await db.execute(statement)).all()
+                except Exception:
+                    # PostgreSQL refuses every later statement of a transaction one of them
+                    # failed in: the request goes on in a fresh one.
+                    await db.rollback()
+                    raise
+            else:
+                async with self._sessionmaker()() as own:
+                    rows = (await own.execute(statement)).all()
         except Exception:  # noqa: BLE001 - a settings read never fails a request
             if not self._read_failed:
                 logger.warning(

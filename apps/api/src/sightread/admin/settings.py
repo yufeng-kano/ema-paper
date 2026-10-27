@@ -38,6 +38,8 @@ from ..runtime_settings import OVERRIDABLE, effective, validation_message
 from . import audit
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from sqlalchemy.sql import ColumnElement
 
     from .deps import Operator
@@ -195,14 +197,16 @@ async def change(
     value: str | None,
     *,
     confirm: bool,
-    free_accounts: ColumnElement[bool],
+    free_accounts: Callable[[Settings], ColumnElement[bool]],
 ) -> bool:
     """Store `value` for `key`, or restore the key to `.env` when `value` is None, with its
     record, in the caller's transaction. False, and nothing written, when it changes
     nothing. 422 when the settings it makes fail the start checks — in the checks' words,
     never the settings' — except a restore while the stored values already fail them, and
     409 `impact` when it takes away what accounts have and
-    `confirm` is not set."""
+    `confirm` is not set. `free_accounts` says which accounts are on Free under the
+    settings it is given: it is asked with what is in effect once the rows are read under
+    the lock, never with a copy taken before."""
     if key not in OVERRIDABLE:
         raise ApiError(422, "invalid_request", f"key: one of {', '.join(OVERRIDABLE)}")
     if db.get_bind().dialect.name == "postgresql":
@@ -241,7 +245,7 @@ async def change(
         if value is not None or not ignored:
             raise ApiError(422, "invalid_request", validation_message(exc)) from None
         after = base
-    taken = await impact(db, before, after, free_accounts)
+    taken = await impact(db, before, after, free_accounts(before))
     if taken is not None and not confirm:
         raise ApiError(
             409,
