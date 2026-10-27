@@ -1,7 +1,8 @@
 """Redeem codes (docs/billing.md § Redeem codes, § Periods *Granted days*): how a typed
 code is read, the period resolution with a bank of granted days, the redeem route and its
-refusals, the attempt cap, what the views show, and the operator's CLI. Pay is never
-configured here: a plan code works without it."""
+refusals, the attempt cap, what the views show, the worker's cap on granted days, and the
+operator's CLI. Pay is configured only where its webhook meets a granted period: a plan
+code works without it."""
 
 from __future__ import annotations
 
@@ -9,7 +10,9 @@ import json
 import re
 from datetime import UTC, datetime, timedelta
 
+import httpx
 import pytest
+import respx
 from httpx import AsyncClient
 from sqlalchemy import delete, select
 
@@ -26,15 +29,18 @@ from sightread.billing.plans import (
 from sightread.db.models import (
     CreditPack,
     CreditPeriod,
+    Job,
     PlanGrant,
     RedeemCode,
     Subscription,
     User,
 )
 from sightread.errors import ApiError
-from tests.conftest import CSRF_HEADERS, PRO_PLANS_JSON, grant_plan
+from tests.conftest import CSRF_HEADERS, PAY_SETTINGS, PRO_PLANS_JSON, grant_plan
 from tests.test_billing import _subscription
 from tests.test_ledger import _user, settings_with
+from tests.test_library import MODEL
+from tests.test_pay import CATALOG_URL, SUBSCRIPTIONS_URL, _event, _notify, canonical, catalog
 
 PLANS = {**{"kano_pay_plans_json": PRO_PLANS_JSON}}
 TWO_PLANS_JSON = json.dumps(
@@ -410,6 +416,35 @@ async def test_days_wait_under_a_paid_subscription_and_a_paid_period_cuts_an_ope
         assert (cut.plan_id, cut.granted, cut.spent) == ("pro", 5000, 1)
 
 
+@respx.mock
+async def test_pays_subscription_banks_the_granted_days_it_starts_inside(
+    make_client, sessionmaker
+) -> None:
+    """A reader on granted days subscribes: the webhook that stores the subscription cuts
+    the open granted period and banks its whole days then — no charge needed, so a reader
+    who never parses again still has the days when the subscription lapses."""
+    client = make_client(**PAY_SETTINGS, grant_period_days=30)
+    user_id = await _signed_in(client)
+    settings = client.app.state.settings
+    code = await _code(sessionmaker, settings, plan_id="pro", days=30)
+    assert (await _redeem(client, code)).json()["period_end"] is not None
+    respx.get(f"{SUBSCRIPTIONS_URL}{user_id}").mock(
+        return_value=httpx.Response(200, json=canonical(user_id))
+    )
+    assert (await _notify(client, _event(user_id))).status_code == 200
+    async with sessionmaker() as db:
+        grant = await db.get(PlanGrant, user_id)
+        assert (grant.days_banked, grant.period_start, grant.period_end) == (30, None, None)
+        subscription = await db.get(Subscription, user_id)
+        assert subscription.plan_id == "pro"
+    respx.get(CATALOG_URL).mock(return_value=httpx.Response(200, json=catalog()))
+    billing = (await client.get("/api/billing")).json()
+    assert (billing["period"]["source"], billing["plan_grant"]["days_banked"]) == (
+        "subscription",
+        30,
+    )
+
+
 async def test_a_code_of_another_plan_than_the_banks_is_refused(make_client, sessionmaker) -> None:
     client = make_client(kano_pay_plans_json=TWO_PLANS_JSON)
     await _signed_in(client)
@@ -434,6 +469,66 @@ async def test_a_code_of_another_plan_than_the_banks_is_refused(make_client, ses
                 plan_id="max",
                 days=30,
             )
+
+
+# --- the worker's cap --------------------------------------------------------------------
+
+
+async def test_the_claim_counts_an_open_granted_period_as_the_plan(
+    make_client, sessionmaker
+) -> None:
+    """Three queued parses: a Free reader's run one at a time; on granted days the plan's
+    two run, as on a paid period; the granted period over, one at a time again."""
+    from sightread.jobs.queue import claim_next_job
+
+    client = make_client(**PLANS, grant_period_days=30)
+    user_id = await _signed_in(client)
+    settings = client.app.state.settings
+    async with sessionmaker() as db:
+        for index in range(3):
+            db.add(
+                Job(
+                    user_id=user_id,
+                    kind="pdf",
+                    filename=f"queued-{index}.pdf",
+                    media_type="application/pdf",
+                    size_bytes=10,
+                    sha256=str(index) * 64,
+                    pages_spec="",
+                    model=MODEL,
+                    agent="parse",
+                    pipeline_version=1,
+                    bbox_format="yxyx_norm1000",
+                    status="queued",
+                    page_count=1,
+                )
+            )
+        await db.commit()
+
+    async def claim():
+        async with sessionmaker() as db:
+            return await claim_next_job(db, 2, plan_jobs={"pro": 2}, free_max_jobs=1)
+
+    assert await claim() is not None
+    assert await claim() is None  # Free: one running, the second waits
+
+    # Redeemed with nothing else paying, the granted period opens — and the redemption
+    # writes it, so the claim's own read of `plan_grants` sees it.
+    code = await _code(sessionmaker, settings, plan_id="pro", days=30)
+    assert (await _redeem(client, code)).json()["period_end"] is not None
+    assert await claim() is not None  # the granted plan's two
+    assert await claim() is None  # the ceiling and the plan alike
+
+    # The granted period over, the row grants nothing: back to one at a time.
+    async with sessionmaker() as db:
+        for job in (await db.execute(select(Job).where(Job.user_id == user_id))).scalars():
+            if job.status == "running":
+                job.status = "queued"
+        grant = await db.get(PlanGrant, user_id)
+        grant.period_end = datetime.now(UTC) - timedelta(seconds=1)
+        await db.commit()
+    assert await claim() is not None
+    assert await claim() is None
 
 
 # --- the CLI ------------------------------------------------------------------------------

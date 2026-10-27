@@ -73,8 +73,9 @@ UNSETTLED_REVISION_MESSAGE = "bash: recovered after an unconfirmed command"
 
 # PostgreSQL claim (docs/jobs.md). The correlated count applies the per-user running cap
 # to the same scan that picks the oldest queued job: the user's plan's parses at once —
-# their paid `subscriptions` row as it stands now, joined to `:plan_jobs` (`{plan id:
-# maxJobs}`), Free's `:free_max_jobs` otherwise — under the deployment's
+# their paid `subscriptions` row as it stands now, else the open granted period of their
+# `plan_grants` row (docs/billing.md § Periods, *Granted days*), joined to `:plan_jobs`
+# (`{plan id: maxJobs}`), Free's `:free_max_jobs` otherwise — under the deployment's
 # `:max_jobs_per_user` (docs/billing.md § Plans). The generation is the claimer's fence
 # on every later write to the row.
 CLAIM_SQL = text(
@@ -94,6 +95,10 @@ CLAIM_SQL = text(
               SELECT (CAST(:plan_jobs AS jsonb) ->> s.plan_id)::int FROM subscriptions s
               WHERE s.user_id = j.user_id AND s.status IN :paid_statuses
                 AND s.period_start <= :now AND :now < s.period_end
+            ),
+            (
+              SELECT (CAST(:plan_jobs AS jsonb) ->> g.plan_id)::int FROM plan_grants g
+              WHERE g.user_id = j.user_id AND g.period_end IS NOT NULL AND :now < g.period_end
             ),
             :free_max_jobs
           )
@@ -124,6 +129,10 @@ CLAIM_SQL_SQLITE_SELECT = text(
             SELECT json_extract(:plan_jobs, '$."' || s.plan_id || '"') FROM subscriptions s
             WHERE s.user_id = j.user_id AND s.status IN :paid_statuses
               AND s.period_start <= :now AND :now < s.period_end
+          ),
+          (
+            SELECT json_extract(:plan_jobs, '$."' || g.plan_id || '"') FROM plan_grants g
+            WHERE g.user_id = j.user_id AND g.period_end IS NOT NULL AND :now < g.period_end
           ),
           :free_max_jobs
         )
@@ -393,8 +402,9 @@ async def claim_next_job(
     free_max_jobs: int | None = None,
 ) -> uuid.UUID | None:
     """Claim the oldest queued job whose user is under their running cap, or None: the
-    plan's parses at once (`plan_jobs` by plan id for a paid period, `free_max_jobs`
-    otherwise; the ceiling alone when neither is given) under `max_jobs_per_user`. A
+    plan's parses at once (`plan_jobs` by plan id for a paid period or an open granted
+    one, `free_max_jobs` otherwise; the ceiling alone when neither is given) under
+    `max_jobs_per_user`. A
     user in `excluded_users` — one whose orphaned turn the worker could not stop yet —
     gets no parse run, since its finish writes that user's tree (docs/jobs.md § Chat
     turns). `generation` is the claimer's (`next_worker_generation`), written on the

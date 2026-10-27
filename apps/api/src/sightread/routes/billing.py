@@ -112,6 +112,10 @@ async def _refresh(
         await db.execute(select(User.id).where(User.id == user_id).with_for_update())
         if canonical is not None:
             await pay.apply_canonical(db, user_id, canonical)
+            # A subscription that began inside a granted period cuts it: written here,
+            # under the lock, so the days are banked whether or not a charge follows
+            # (docs/billing.md § Periods, *Granted days*).
+            await ledger.settle_period(db, settings, user_id)
         if purchases:
             await pay.apply_purchases(db, settings, user_id, purchases)
         await db.commit()
@@ -539,6 +543,9 @@ async def pay_webhook(request: Request, db: DbSession, settings: AppSettings):
     db.add(PayEvent(id=event_id, type=event_type, user_id=user_id))
     if canonical is not None:
         await pay.apply_canonical(db, user_id, canonical)
+        # The cut of a granted period the subscription began inside, as the refresh
+        # writes it (docs/billing.md § Periods, *Granted days*).
+        await ledger.settle_period(db, settings, user_id)
     if purchases:
         await pay.apply_purchases(db, settings, user_id, purchases)
     await db.commit()
