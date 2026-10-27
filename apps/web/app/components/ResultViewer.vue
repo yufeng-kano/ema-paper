@@ -2516,6 +2516,8 @@ function endDrag() {
 // --- the selection toolbar ------------------------------------------------------------------
 
 interface ToolbarState {
+  /** The surface the selection is on: the document pane or the notes card. */
+  where: 'document' | 'notes'
   first: ToolbarRect
   last: ToolbarRect
   bounds: ToolbarRect
@@ -2524,9 +2526,11 @@ interface ToolbarState {
 
 const toolbar = ref<ToolbarState | null>(null)
 const paneEl = ref<HTMLElement | null>(null)
-/** A press in the pane is down: the toolbar waits for its release (docs/web.md § Editing,
- *  *When it shows*). */
-let paneHeld = false
+/** The notes under the card's head, which the notes' toolbar is positioned against. */
+const notesBody = ref<HTMLElement | null>(null)
+/** A press on a surface — the document pane or the notes card — is down: the toolbar waits
+ *  for its release (docs/web.md § Editing, *When it shows*). */
+let surfaceHeld = false
 let toolbarTimer: ReturnType<typeof setTimeout> | undefined
 let toolbarFrame = 0
 /** A coarse pointer: the toolbar sits under the selection, where the platform's callout is not. */
@@ -2537,27 +2541,30 @@ function onCoarseChange(change: MediaQueryListEvent) {
   coarse.value = change.matches
 }
 
-function onPanePointerDown(event: PointerEvent) {
-  if (event.target instanceof Element && event.target.closest('[role="toolbar"]')) {
+/** A primary press on a surface hides the toolbar and holds it until the release. A press on
+ *  the toolbar itself is its own, and a press with another button — a right click, for the
+ *  browser's menu — neither hides nor holds it (docs/web.md § Editing, *When it shows*). */
+function onSurfacePointerDown(event: PointerEvent) {
+  if (event.button !== 0 || (event.target instanceof Element && event.target.closest('[role="toolbar"]'))) {
     return
   }
-  paneHeld = true
+  surfaceHeld = true
   clearTimeout(toolbarTimer)
   toolbar.value = null
 }
 
 function onWindowPointerUp() {
   forgetChromePress()
-  if (!paneHeld) {
+  if (!surfaceHeld) {
     return
   }
-  paneHeld = false
+  surfaceHeld = false
   // After the release's own work: a drag over rendered blocks opens an editor on mouseup.
   void nextTick(() => requestAnimationFrame(readToolbar))
 }
 
 function onSelectionChange() {
-  if (paneHeld) {
+  if (surfaceHeld) {
     return
   }
   clearTimeout(toolbarTimer)
@@ -2580,19 +2587,22 @@ function blockOfNode(node: Node): string | null {
   return block && scroller.value?.contains(block) ? (block.dataset.block ?? null) : null
 }
 
-/** Shows the toolbar over a non-collapsed selection in the pane — in the open editor or over
- *  rendered blocks — or hides it. Files only, and only the Markdown view. */
+/** Shows the toolbar over a non-collapsed selection on one of its surfaces — the document
+ *  pane on the Markdown view, in the open editor or over rendered blocks, or the notes card on
+ *  either view (docs/web.md § Editing, *The notes have it too*) — or hides it. Files only. */
 function readToolbar() {
   const selection = window.getSelection()
-  const box = scroller.value
-  const pane = paneEl.value
-  if (!editable.value || tab.value !== 'markdown' || !selection || selection.isCollapsed || !selection.rangeCount || !box || !pane) {
+  if (!editable.value || !selection || selection.isCollapsed || !selection.rangeCount) {
     toolbar.value = null
     return
   }
   const firstRange = selection.getRangeAt(0)
   const lastRange = selection.getRangeAt(selection.rangeCount - 1)
-  if (!box.contains(firstRange.commonAncestorContainer) || !box.contains(lastRange.commonAncestorContainer)) {
+  const holds = (box: HTMLElement | null) =>
+    box !== null && box.contains(firstRange.commonAncestorContainer) && box.contains(lastRange.commonAncestorContainer)
+  const where = tab.value === 'markdown' && holds(scroller.value) ? 'document' : holds(notesBody.value) ? 'notes' : null
+  const surface = where === 'document' ? paneEl.value : where === 'notes' ? notesBody.value : null
+  if (!where || !surface) {
     toolbar.value = null
     return
   }
@@ -2603,10 +2613,11 @@ function readToolbar() {
     return
   }
   toolbar.value = {
+    where,
     first: screenRect(first),
     last: screenRect(last),
-    bounds: screenRect(pane.getBoundingClientRect()),
-    translate: translateSkill.value && selectionTranslates(selection),
+    bounds: screenRect(surface.getBoundingClientRect()),
+    translate: where === 'document' && translateSkill.value && selectionTranslates(selection),
   }
 }
 
@@ -2688,7 +2699,30 @@ function onToolbarSkill(name: string) {
   void askAgent({ selection: passage.markdown, command: name, send: true }, blockKey(passage.at))
 }
 
-/** The toolbar follows its selection as the pane scrolls. */
+/** The notes' toolbar (docs/web.md § Editing, *The notes have it too*): the notes editor's
+ *  selection as markdown, asked about or copied. Focus stays in the notes when a running turn
+ *  leaves the composer unfocused, since the toolbar took none. */
+function onNotesToolbarAction(action: 'ask' | 'copy') {
+  const markdown = notesEditor.value?.selectedMarkdown()?.markdown
+  if (!markdown) {
+    return
+  }
+  if (action === 'copy') {
+    void writeClipboard(markdown, t('viewer.note.copied'))
+    return
+  }
+  toolbar.value = null
+  void askAgent({ selection: markdown }, null)
+}
+
+/** The notes closed: a toolbar over them has nothing to stand over. */
+watch(notesOpen, (open) => {
+  if (!open && toolbar.value?.where === 'notes') {
+    toolbar.value = null
+  }
+})
+
+/** The toolbar follows its selection as its surface scrolls or is resized. */
 function repositionToolbar() {
   if (toolbar.value && !toolbarFrame) {
     toolbarFrame = requestAnimationFrame(() => {
@@ -3346,6 +3380,7 @@ watch(paneEl, (pane) => {
     paneObserver = new ResizeObserver(() => {
       paneHeight.value = pane.clientHeight
       measureGutter()
+      repositionToolbar()
     })
     paneObserver.observe(pane)
   }
@@ -3796,7 +3831,9 @@ function closeOverBlocks() {
   blockMenu.value = null
   menuHandleKey.value = null
   menuAfter = null
-  toolbar.value = null
+  if (toolbar.value?.where === 'document') {
+    toolbar.value = null
+  }
   endDrag()
 }
 
@@ -4038,7 +4075,7 @@ function scheduleWaitingImages() {
   }
   waitingTimer = setTimeout(() => {
     waitingTimer = undefined
-    if (!closed && !editing.value && !dragRun && !blockMenu.value && !toolbar.value) {
+    if (!closed && !editing.value && !dragRun && !blockMenu.value && toolbar.value?.where !== 'document') {
       landWaitingImages()
     }
   }, 0)
@@ -4516,6 +4553,7 @@ watch(
               class="notes card"
               :style="{ '--column-width': `${columnWidth.notes.value}px` }"
               :aria-label="t('viewer.notesLabel')"
+              @pointerdown="onSurfacePointerDown"
             >
               <header class="card-head">
                 <h3 class="card-title">{{ t('viewer.notesLabel') }}</h3>
@@ -4523,20 +4561,37 @@ watch(
                   <template #icon><UiIcon name="panel-left-close" /></template>
                 </UiButton>
               </header>
-              <div class="notes-view md-side" @click="onNotesClick">
-                <RichEditor
-                  ref="notesEditor"
-                  variant="notes"
-                  :source="notes"
-                  :placeholder="t('viewer.notesPlaceholder')"
-                  :label="t('viewer.notesLabel')"
-                  :links="notesLinks"
-                  :figures="editorFigures"
-                  :images="notesImages"
-                  blocks
-                  @change="onNotesChange"
-                  @ask="onNotesAsk"
-                  @note="showNote($event, false)"
+              <!-- The notes and, over them, their selection toolbar — positioned against this
+                   box, never laid out in the scroller (docs/web.md § Editing, *The notes have
+                   it too*). -->
+              <div ref="notesBody" class="notes-body">
+                <div class="notes-view md-side" @click="onNotesClick" @scroll.passive="repositionToolbar">
+                  <RichEditor
+                    ref="notesEditor"
+                    variant="notes"
+                    :source="notes"
+                    :placeholder="t('viewer.notesPlaceholder')"
+                    :label="t('viewer.notesLabel')"
+                    :links="notesLinks"
+                    :figures="editorFigures"
+                    :images="notesImages"
+                    blocks
+                    @change="onNotesChange"
+                    @ask="onNotesAsk"
+                    @note="showNote($event, false)"
+                  />
+                </div>
+                <ViewerToolbar
+                  v-if="toolbar?.where === 'notes'"
+                  :first="toolbar.first"
+                  :last="toolbar.last"
+                  :bounds="toolbar.bounds"
+                  :coarse="coarse"
+                  :skills="[]"
+                  :quote="false"
+                  solid
+                  @ask="onNotesToolbarAction('ask')"
+                  @copy="onNotesToolbarAction('copy')"
                 />
               </div>
             </aside>
@@ -4565,7 +4620,7 @@ watch(
             ref="paneEl"
             class="pane"
             @keydown.capture="onPaneKey"
-            @pointerdown="onPanePointerDown"
+            @pointerdown="onSurfacePointerDown"
             @dragover="onPaneDragOver"
             @drop="onPaneDrop"
           >
@@ -4832,7 +4887,7 @@ watch(
             />
 
             <ViewerToolbar
-              v-if="toolbar && tab === 'markdown'"
+              v-if="toolbar?.where === 'document' && tab === 'markdown'"
               :first="toolbar.first"
               :last="toolbar.last"
               :bounds="toolbar.bounds"
@@ -5588,6 +5643,15 @@ watch(
   --rich-gap: var(--space-3);
 
   margin-left: var(--space-4);
+}
+
+/* The notes under the card's head, which their selection toolbar is positioned against. */
+.notes-body {
+  position: relative;
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
 }
 
 /* The whole card under its head is the notes: a click below the last line still writes. The
