@@ -272,7 +272,7 @@ const { resolve } = useApiError()
 const localePath = useLocalePath()
 const { apple, label: keyLabel, matches } = useShortcuts()
 const auth = useAuth()
-const { notesOpen, agentOpen, chosenWidth, chooseWidth } = useViewerLayout()
+const { notesOpen, agentOpen, chosenWidth, chooseWidth, paperMargin } = useViewerLayout()
 
 /** The view: the document, or the original (docs/web.md § Result viewer, *Original and
  *  Markdown*) — the latter only where there is one to show, and never for a block link,
@@ -4582,6 +4582,7 @@ watch(
               ref="scroller"
               class="document"
               :class="{ files: documentId !== null, 'locate-fading': locateFading }"
+              :data-margin="paperMargin"
               @copy="onCopy"
               @mousedown.capture="forgetPress"
               @mouseup="editable && onBlockClick()"
@@ -5040,12 +5041,15 @@ watch(
 
 /* One continuous scroll of the whole document: a reader comparing two pages should not have
    to click between them. The scrollbar is hidden on this region, as on the two columns
-   beside it; it still scrolls. The located passage's wash fades by this property (below). */
+   beside it; it still scrolls. The located passage's wash fades by this property (below).
+   `--page-width` is the column's share of the pane, the rest being the body margins the
+   reader chose in Settings (docs/web.md § Body margins): 70% until chosen. */
 .document {
   --block-heading: var(--display-lg);
   --block-subheading: var(--display-sm);
   --block-text: var(--text-read);
   --block-text-sm: var(--text-read-sm);
+  --page-width: 70%;
 
   min-width: 0;
   min-height: 0;
@@ -5068,11 +5072,19 @@ watch(
   --locate-fade: 1;
 }
 
+.document[data-margin='narrow'] {
+  --page-width: 86%;
+}
+
+.document[data-margin='wide'] {
+  --page-width: 54%;
+}
+
 /* The column, centered in the pane. The page boundary carries no rule and no label: it is
    the grouping the data has, not a division the reader is asked to see, so consecutive pages
    are separated by exactly the gap the blocks inside one page already keep. */
 .page {
-  width: 70%;
+  width: var(--page-width);
   margin-inline: auto;
 }
 
@@ -5616,10 +5628,10 @@ watch(
   object-fit: contain;
 }
 
-/* A percentage column needs a floor: below the shell breakpoint 70% of the pane is a
-   gutter wider than the text it frames. The side columns stack under the document there,
-   each keeping its own scroll. The gutter is the 40px padding: room for a handle or a
-   chevron, not both, so on Files a heading's two take turns in one slot. */
+/* A percentage column needs a floor: below the shell breakpoint the chosen share of the
+   pane is a gutter wider than the text it frames. The side columns stack under the document
+   there, each keeping its own scroll. The gutter is the 40px padding: room for a handle or
+   a chevron, not both, so on Files a heading's two take turns in one slot. */
 @media (max-width: 900px) {
   .page,
   .page-skeleton {

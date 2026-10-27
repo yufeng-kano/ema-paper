@@ -52,19 +52,14 @@ export default {
     },
     reader: {
       title: '閱讀器',
-      notes: {
-        label: '筆記欄寬度',
-        description: '打開筆記時的寬度。',
-      },
-      agent: {
-        label: 'Agent 欄寬度',
-        description: '打開 Agent 時的寬度。',
+      margins: {
+        label: '內文左右間距',
+        description: '內文兩側留白的多寡。',
       },
       narrow: '窄',
       standard: '標準',
       wide: '寬',
-      dragged: '已用拖移自訂。選一個檔位就會改回固定寬度。',
-      foot: '兩側欄並排時套用。視窗太窄時會自動縮小。',
+      foot: '視窗太窄時內文會占滿整個寬度。',
     },
     preferences: {
       title: 'PDF 與圖片',

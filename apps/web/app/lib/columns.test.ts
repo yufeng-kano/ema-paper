@@ -1,16 +1,13 @@
 import { describe, expect, it } from 'vitest'
-import { COLUMN_WIDTHS, WIDTH_STEPS, clampWidth, collapses, storedWidth, widthStep } from './columns'
+import { COLUMN_WIDTHS, clampWidth, collapses, storedWidth } from './columns'
 
 describe('column widths', () => {
-  it('keeps every step inside its card’s clamp, Standard being the default', () => {
+  it('keeps every default inside its card’s clamp', () => {
     for (const column of ['notes', 'agent'] as const) {
-      const { initial, min, max, steps } = COLUMN_WIDTHS[column]
-      expect(steps.standard).toBe(initial)
-      for (const step of WIDTH_STEPS) {
-        expect(clampWidth(column, steps[step])).toBe(steps[step])
-        expect(steps[step]).toBeGreaterThanOrEqual(min)
-        expect(steps[step]).toBeLessThanOrEqual(max)
-      }
+      const { initial, min, max } = COLUMN_WIDTHS[column]
+      expect(clampWidth(column, initial)).toBe(initial)
+      expect(initial).toBeGreaterThanOrEqual(min)
+      expect(initial).toBeLessThanOrEqual(max)
     }
   })
 
@@ -34,14 +31,5 @@ describe('column widths', () => {
     expect(collapses('agent', 149)).toBe(true)
     expect(collapses('agent', 150)).toBe(false)
     expect(collapses('agent', -40)).toBe(true)
-  })
-
-  it('names the step a chosen width is, and none for a dragged one', () => {
-    expect(widthStep('notes', 280)).toBe('narrow')
-    expect(widthStep('notes', 440)).toBe('wide')
-    expect(widthStep('agent', 300)).toBe('narrow')
-    expect(widthStep('agent', 360)).toBe('standard')
-    expect(widthStep('agent', 320)).toBeNull()
-    expect(widthStep('notes', 336)).toBeNull()
   })
 })
