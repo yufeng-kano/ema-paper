@@ -6,6 +6,7 @@ agent-sightread/
     api/                      # FastAPI app + worker (one uv project, one image)
       src/sightread/
         main.py               # FastAPI wiring: /v1, /api, /oauth, /mcp, /.well-known
+                              # (/api/admin mounted only while OWNER_EMAILS names one)
         config.py             # env settings (pydantic-settings)
         db/                   # engine, models, session helpers
         auth/                 # oidc.py, sessions.py, api_keys.py, oauth_as.py, crypto.py
@@ -14,13 +15,20 @@ agent-sightread/
                               # chat.py (/api/conversations, /api/sandbox),
                               # attachments.py (/api/attachments), extensions.py
                               # (/api/skills, /api/subagents), memories.py
-                              # (/api/memories), oauth.py
+                              # (/api/memories), oauth.py, admin.py (/api/admin —
+                              # the operator console, docs/admin.md)
         agents/               # the agent registry (docs/agents.md); parse.py holds the
                               # parse agent's definition: default prompt, pipeline version;
                               # chat.py the chat agent's system prompt and tool definitions;
                               # skills.py and subagents.py the built-in skills and subagents;
                               # memory.py the memory block, its selection and text cleaning;
                               # check.py the check agent's prompt and tools
+        admin/                # the operator console (docs/admin.md): permissions.py
+                              # (ALL_PERMISSIONS, the areas, normalizing a group's list),
+                              # deps.py (require_console_session, require_permission),
+                              # groups.py (the built-in group, the sign-in owner join,
+                              # members, the no-escalation checks), audit.py (the one
+                              # helper that writes an audit row in the caller's transaction)
         billing/              # plans, periods and credit arithmetic (docs/billing.md):
                               # credits.py prices a parse and a turn, plans.py reads the
                               # plans and decides the current period; pure, no HTTP
@@ -60,6 +68,10 @@ agent-sightread/
                               # own image; owns the Docker socket, nothing else does
     web/                      # Nuxt control plane (docs/web.md)
       app/ or src/            # Nuxt conventions; i18n/ catalog en + zh-TW
+                              # the operator console (docs/admin.md): pages/admin/,
+                              # middleware/admin.ts, composables/useAdminConsole.ts,
+                              # lib/admin.ts (pure: areas, nav, permission checks; vitest),
+                              # components/admin/
       server/routes/          # robots.txt and sitemap.xml, prerendered; no API (docs/web.md § Search engines)
       shared/                 # framework-free code nuxt.config.ts, the app and server/ all read
       package.json
@@ -84,4 +96,5 @@ agent-sightread/
 - `workspace/` is the only package that touches `WORKSPACES_DIR` and the only one that runs git; `sandbox/client.py` is the only module that calls the runner. The runner (`apps/sandbox`) is the only process with the Docker socket.
 - `agents/` defines agents and nothing else: no HTTP, no database. Runners and settings consume its definitions ([agents.md](./agents.md)).
 - `jobs/queue.py` is the only module that knows the queue is Postgres.
-- Web: pages thin, logic in composables; API access through one typed client module.
+- `admin/` is the only package that decides a console permission or writes `groups`, `group_members` and `audit_log`; `routes/admin.py` is thin over it, and the Google callback and the dev login call `admin/groups.py` for the owner join. Every console mutation writes its audit row through `admin/audit.py` before the route's one commit. Nothing outside it compares a group's name.
+- Web: pages thin, logic in composables; API access through one typed client module. The console's permission logic is the pure `app/lib/admin.ts`, so it is tested without a DOM; its pages read permissions from `useAdminConsole` only.

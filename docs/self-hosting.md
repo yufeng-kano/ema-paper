@@ -117,6 +117,25 @@ docker compose exec api python -m sightread.codes disable EMA-XXXX-XXXX-XXXX
 
 `create` prints each code once, as a user types it (`EMA-XXXX-XXXX-XXXX`; the prefix is `REDEEM_CODE_PREFIX`); `--uses` is how many accounts may redeem one code (1 unless given), and a plan must be one of `KANO_PAY_PLANS_JSON` or the command refuses. A user redeems a code in the settings dialog's Usage section. Granted days are spent only while no subscription pays for the account, and a code's credits are never refunded.
 
+## The operator console
+
+The console is your own pages inside the app — today *Groups*, to give other people access, and *Audit*, the record of every change made there ([admin.md](./admin.md)). It does not exist until you name its first owner. Put your Google address in `.env`:
+
+```sh
+OWNER_EMAILS=you@example.com    # comma-separated for several; empty = no console
+```
+
+Then recreate the api container so it reads the file again — `restart` would keep the old environment:
+
+```bash
+docker compose -f docker-compose.production.yaml up -d --no-deps api
+# behind a front proxy: add -f docker-compose.only-container-network.yaml, as always
+```
+
+Sign in with that Google account (or sign out and in again): the account menu now has *Admin console*. The address joins the built-in `owner` group, which holds every permission, at a sign-in whose address Google has verified; taking it out of `OWNER_EMAILS` later removes no one — an owner does that on the Groups page. The console asks for a fresh sign-in once a session is older than `ADMIN_REAUTH_HOURS` (12). Locally, `OWNER_EMAILS=dev@localhost` makes the dev login an owner.
+
+Redeem codes are still made with `python -m sightread.codes` (§ Redeem codes); the CLI needs no console and keeps working beside it.
+
 ## Connect your tools
 
 - **REST API.** Create a key in Settings → API keys, then:

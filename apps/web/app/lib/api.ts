@@ -17,6 +17,7 @@ export type ApiErrorType =
   | 'rate_limit'
   | 'payment'
   | 'insufficient_credits'
+  | 'not_convertible'
   | 'checkout_unavailable'
   | 'pay_unavailable'
   | 'plan_required'
@@ -27,6 +28,11 @@ export type ApiErrorType =
   | 'code_exhausted'
   | 'code_redeemed'
   | 'code_plan_conflict'
+  // The operator console's own (docs/admin.md § Refusals): a missing permission, a session
+  // past the console's window, and a rule of the console, which `details.reason` names.
+  | 'permission_denied'
+  | 'reauth_required'
+  | 'admin_conflict'
   | 'upstream'
   | 'internal'
 
@@ -358,6 +364,10 @@ export interface MeResponse {
    *  § Result viewer, *Original and Markdown*); Markdown where unset. Optional so a page
    *  served by an older API still renders. */
   default_view?: DocumentView
+  /** Whether to offer the operator console: it is on and the account holds one of its
+   *  permissions (docs/admin.md § Signing in). Optional so a page served by an older API
+   *  still renders — without it the account menu has no *Admin console*. */
+  console?: boolean
 }
 
 // --- billing (docs/billing.md § Routes) --------------------------------------------
@@ -1559,4 +1569,153 @@ export function putMemoryFile(text: string): Promise<{ text: string }> {
 
 export function deleteConversation(id: number): Promise<void> {
   return request<undefined>('DELETE', `/api/conversations/${id}`)
+}
+
+// --- operator console (docs/admin.md § Routes) ---------------------------------------
+
+/** Who did something, as the console names them: the account's id and name. */
+export interface AdminPerson {
+  id: number
+  name: string | null
+}
+
+/** `GET /api/admin/me`: the caller's permissions, in `ALL_PERMISSIONS` order — every one for
+ *  an owner, none for an account in no group — and whether the session is past the console's
+ *  window of `reauth_hours` (`ADMIN_REAUTH_HOURS`). Never a 403. */
+export interface AdminMe {
+  user: { id: number; email: string; name: string | null; picture: string | null }
+  permissions: string[]
+  reauth_required: boolean
+  reauth_hours: number
+}
+
+/** One area of the permission matrix and its levels: `["read", "write"]`, or `["read"]`
+ *  for `audit`, whose records are never changed. */
+export interface AdminAreaLevels {
+  key: string
+  levels: string[]
+}
+
+export interface AdminGroup {
+  id: number
+  name: string
+  builtin: boolean
+  /** What the group gives: every permission for the built-in group, whatever it stores. */
+  permissions: string[]
+  /** The row's own list — `[]` on the built-in group. */
+  stored_permissions: string[]
+  member_count: number
+  /** When it was created or its name or permissions last changed, and who did it — null for
+   *  the built-in group, which no one edits, and once that account is deleted. */
+  updated_at: string
+  updated_by: AdminPerson | null
+}
+
+export interface AdminGroupsResponse {
+  /** The built-in group first, then by name. */
+  groups: AdminGroup[]
+  /** Every permission there is, in order. */
+  permissions: string[]
+  /** The areas, in order, which the matrix is drawn from. */
+  areas: AdminAreaLevels[]
+}
+
+export interface AdminMember {
+  user_id: number
+  email: string
+  name: string | null
+  added_at: string
+  /** The member themselves for a sign-in's owner join; null once the account that added
+   *  them is deleted. */
+  added_by: AdminPerson | null
+}
+
+export interface AdminGroupDetail {
+  group: AdminGroup
+  /** In the order they joined. */
+  members: AdminMember[]
+}
+
+/** One page of a console list: `page` counts from 1, `total` counts every row. */
+export interface AdminList<T> {
+  items: T[]
+  total: number
+  page: number
+  page_size: number
+}
+
+/** One record of the audit log. `before` and `after` are JSON as stored: ids, amounts,
+ *  flags, permission strings, a group's name — never an address or a person's name. */
+export interface AuditEntry {
+  id: number
+  created_at: string
+  /** Null once that account is deleted. */
+  actor: { id: number; email: string; name: string | null } | null
+  /** Null for a sign-in's owner join, which no permission allowed. */
+  permission: string | null
+  action: string
+  target_type: string
+  target_id: string
+  /** A user target's address or a group target's name, read now; null once it is gone. */
+  target_label: string | null
+  before: unknown
+  after: unknown
+  ip: string | null
+}
+
+export function getAdminMe(): Promise<AdminMe> {
+  return request('GET', '/api/admin/me')
+}
+
+export function listAdminGroups(): Promise<AdminGroupsResponse> {
+  return request('GET', '/api/admin/groups')
+}
+
+export function getAdminGroup(id: number): Promise<AdminGroupDetail> {
+  return request('GET', `/api/admin/groups/${id}`)
+}
+
+/** 201 with the new group; 409 `admin_conflict` (`name_taken`) for a name in use. */
+export function createAdminGroup(body: { name: string; permissions: string[] }): Promise<AdminGroup> {
+  return request('POST', '/api/admin/groups', body)
+}
+
+/**
+ * A new name, or a new permission list: `permissions` the whole new list, which the server
+ * normalizes, and `based_on` the list it was edited from — the group's `permissions` as last
+ * read — so a list changed meanwhile answers 409 `admin_conflict` (`stale`) instead of being
+ * overwritten.
+ */
+export function updateAdminGroup(
+  id: number,
+  body: { name: string } | { permissions: string[]; based_on: string[] },
+): Promise<AdminGroup> {
+  return request('PATCH', `/api/admin/groups/${id}`, body)
+}
+
+export function deleteAdminGroup(id: number): Promise<void> {
+  return request<undefined>('DELETE', `/api/admin/groups/${id}`)
+}
+
+/** By address — matched in any letter case — or by account id. 201 for a new member, 200 for
+ *  one already in the group; 404 when no account has that address. */
+export function addAdminGroupMember(id: number, who: { email: string } | { user_id: number }): Promise<AdminMember> {
+  return request('POST', `/api/admin/groups/${id}/members`, who)
+}
+
+export function removeAdminGroupMember(id: number, userId: number): Promise<void> {
+  return request<undefined>('DELETE', `/api/admin/groups/${id}/members/${userId}`)
+}
+
+/** Newest first. `area` keeps the actions of one area; `q` an actor's address or name, a
+ *  user target's address, or a target id. */
+export function listAdminAudit(query: { page: number; area?: string; q?: string }): Promise<AdminList<AuditEntry>> {
+  const params = new URLSearchParams({ page: String(query.page) })
+  if (query.area) {
+    params.set('area', query.area)
+  }
+  if (query.q) {
+    params.set('q', query.q)
+  }
+  return request('GET', `/api/admin/audit?${params}`)
 }

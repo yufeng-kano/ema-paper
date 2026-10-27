@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import type { ComponentPublicInstance } from 'vue'
+import { navEntries } from '~/lib/admin'
 import type { MenuItem, Point } from '~/lib/menu'
 import { SETTINGS_QUERY, settingsSectionOf } from '~/lib/settings'
 
@@ -13,10 +14,16 @@ import { SETTINGS_QUERY, settingsSectionOf } from '~/lib/settings'
  *
  * The account row is the session's own menu: the avatar-and-name button opens `UiContextMenu`
  * — the same floating surface the library's right-click opens — headed by the address that is
- * signed in, holding Upgrade (or Usage), Settings, Language, and sign-out below a rule.
+ * signed in, holding Upgrade (or Usage), Settings, Language, Admin console for an operator,
+ * and sign-out below a rule.
  * Everything the account is, in one place, the way a desktop app's account menu holds it.
  * Language is a row rather than a submenu: it opens `LanguageDialog` (docs/web.md § The
  * account menu).
+ *
+ * Under `/admin` the frame is the operator console's: the nav lists the console's pages the
+ * account can read, under a line naming the console with the way back to Files, and
+ * everything else stays — one layout, so the account menu, the drawer and the dialogs are
+ * the same code (docs/web.md § Design system, *The frame*; docs/admin.md § Pages).
  *
  * Below 900px the sidebar becomes a drawer behind a menu button. No icon rail and no bottom
  * tab bar: the labels are doing the work, and a tab bar would spend the scarcest axis on a
@@ -33,6 +40,15 @@ const auth = useAuth()
  * so the nav never fills with things opened twice a month (docs/web.md § Pages).
  */
 const NAV = [{ icon: 'files', to: '/files', label: 'nav.files' }] as const
+
+/** Whether a console page is open: then the nav is the console's. */
+const inConsole = computed(() => {
+  const base = localePath('/admin')
+  return route.path === base || route.path.startsWith(`${base}/`)
+})
+const adminConsole = useAdminConsole()
+/** The console's pages the account can read, in nav order (`app/lib/admin.ts`). */
+const consoleNav = computed(() => navEntries(adminConsole.permissions.value))
 
 /** The signed-in identity: the name when Google sent one, the address otherwise. */
 const account = computed(() => auth.me.value?.user.name?.trim() || auth.me.value?.user.email || '')
@@ -89,6 +105,11 @@ const accountItems = computed<MenuItem[]>(() => [
     : []),
   { key: 'settings', label: t('nav.settings'), icon: 'settings' },
   { key: 'language', label: t('nav.language'), icon: 'globe' },
+  // Only for an account that holds a console permission while the console is on; a link,
+  // so following it is the navigation (docs/web.md § The account menu).
+  ...(auth.me.value?.console
+    ? [{ key: 'admin', label: t('nav.admin'), icon: 'shield' as const, to: localePath('/admin') }]
+    : []),
   { key: 'signOut', label: t('nav.signOut'), icon: 'sign-out', separated: true },
 ])
 
@@ -216,7 +237,27 @@ async function signOut() {
         </UiButton>
       </div>
 
-      <nav class="nav" :aria-label="t('nav.primary')">
+      <!-- The console's nav: its name with the way back, then its pages. -->
+      <template v-if="inConsole">
+        <div class="console-head">
+          <span class="console-title">{{ t('admin.title') }}</span>
+          <NuxtLink class="console-back" :to="localePath('/files')">{{ t('admin.backToFiles') }}</NuxtLink>
+        </div>
+        <nav class="nav" :aria-label="t('admin.navLabel')">
+          <NuxtLink
+            v-for="item in consoleNav"
+            :key="item.path"
+            class="nav-item"
+            :to="localePath(item.path)"
+            active-class="active"
+          >
+            <UiIcon :name="item.icon" />
+            <span class="nav-label">{{ t(item.label) }}</span>
+          </NuxtLink>
+        </nav>
+      </template>
+
+      <nav v-else class="nav" :aria-label="t('nav.primary')">
         <NuxtLink
           v-for="item in NAV"
           :key="item.to"
@@ -377,6 +418,35 @@ async function signOut() {
    outranks `UiButton`'s own `display` without depending on stylesheet order. */
 .sidebar-head .drawer-close {
   display: none;
+}
+
+/* Under /admin: the console's name, quiet, with the way back at its right. */
+.console-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: 0 var(--space-3) var(--space-2);
+}
+
+.console-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+}
+
+.console-back {
+  flex-shrink: 0;
+  color: var(--accent);
+  font-size: var(--text-xs);
+}
+
+.console-back:hover {
+  color: var(--accent-hover);
 }
 
 .nav {
