@@ -21,10 +21,10 @@ from sqlalchemy import ColumnElement, and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings
-from ..db.models import CreditPack, PlanGrant, RedeemCode, Redemption, User, utcnow
+from ..db.models import CreditPack, RedeemCode, Redemption, User, utcnow
 from ..errors import ApiError
 from . import ledger
-from .plans import GRANT
+from .plans import GRANT, Decision
 
 logger = logging.getLogger(__name__)
 
@@ -184,7 +184,7 @@ async def redeem(
         else None
     )
     refusal = _refusal(row, now)
-    grant: PlanGrant | None = None
+    decided: Decision | None = None
     if refusal is None:
         if row.kind == PLAN and row.plan_id not in settings.plans:
             # Created for a plan the deployment no longer configures: inert, so not given.
@@ -199,15 +199,12 @@ async def redeem(
         ).first() is not None:
             refusal = ApiError(409, "code_redeemed", "You have already redeemed this code")
         elif row.kind == PLAN:
-            # The bank as it stands now — a period that ran out closed first — holds one
-            # plan: another plan's days cannot join it.
-            await ledger.settle_period(db, settings, user_id, now)
-            grant = await db.get(PlanGrant, user_id)
-            if (
-                grant is not None
-                and grant.plan_id != row.plan_id
-                and (grant.days_banked > 0 or grant.period_start is not None)
-            ):
+            # The days go into the bank by the one rule an operator's grant follows too;
+            # opens the granted period at once when no paid period covers now. Another
+            # plan's days are refused before anything of them is written.
+            try:
+                decided = await ledger.bank_days(db, settings, user_id, row.plan_id, row.days, now)
+            except ledger.PlanConflict:
                 refusal = ApiError(
                     409, "code_plan_conflict", "This code is for another plan than your days"
                 )
@@ -249,15 +246,6 @@ async def redeem(
         db.add(pack)
         await db.commit()
         return Redeemed(CREDITS, credits=row.credits, expires_at=pack.expires_at)
-    if grant is None:
-        grant = PlanGrant(user_id=user_id, plan_id=row.plan_id, days_banked=0)
-        db.add(grant)
-    grant.plan_id = row.plan_id
-    grant.days_banked += row.days
-    grant.updated_at = now
-    await db.flush()
-    # Opens the granted period at once when no paid period covers now.
-    decided = await ledger.settle_period(db, settings, user_id, now)
     await db.commit()
     return Redeemed(
         PLAN,

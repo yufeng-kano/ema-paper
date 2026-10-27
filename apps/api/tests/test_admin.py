@@ -1277,6 +1277,11 @@ async def test_no_route_updates_or_deletes_a_record(make_client) -> None:
 
 
 CONSOLE_MUTATIONS = [
+    (
+        "post",
+        "/api/admin/users/{user}/grants",
+        {"kind": "credits", "credits": 1, "request_id": "00000000-0000-4000-8000-000000000001"},
+    ),
     ("post", "/api/admin/groups", {"name": "csrf", "permissions": []}),
     ("patch", "/api/admin/groups/{group}", {"name": "csrf"}),
     ("delete", "/api/admin/groups/{group}", None),

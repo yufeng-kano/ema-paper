@@ -22,6 +22,7 @@ import {
   daysUntil,
   firstReadableArea,
   formatRedeemBy,
+  grantNumber,
   idOf,
   isGroupName,
   navEntries,
@@ -71,13 +72,14 @@ describe('what a permission list shows', () => {
   })
 
   it("lists only the console pages whose area it can read, in nav order", () => {
-    expect(navEntries(ALL).map((page) => page.area)).toEqual(['codes', 'groups', 'audit'])
+    expect(navEntries(ALL).map((page) => page.area)).toEqual(['users', 'codes', 'groups', 'audit'])
     expect(navEntries(['audit.read']).map((page) => page.path)).toEqual(['/admin/audit'])
+    expect(navEntries(['users.read', 'users.write']).map((page) => page.path)).toEqual(['/admin/users'])
     expect(navEntries(['codes.read', 'jobs.read']).map((page) => page.path)).toEqual(['/admin/codes'])
   })
 
   it('sends /admin to the first page it can read', () => {
-    expect(firstReadableArea(ALL)?.path).toBe('/admin/codes')
+    expect(firstReadableArea(ALL)?.path).toBe('/admin/users')
     expect(firstReadableArea(['audit.read'])?.path).toBe('/admin/audit')
     expect(consoleDestination(['audit.read', 'groups.read'], null)).toBe('/admin/groups')
   })
@@ -203,6 +205,20 @@ describe('the route query', () => {
     expect(auditAreaOf('codes')).toBe('codes')
     expect(auditAreaOf('audit')).toBeNull()
     expect(auditAreaOf('nope')).toBeNull()
+  })
+})
+
+describe("a grant's numbers", () => {
+  it('takes a whole number from 1 to the cap, typed with spaces around it', () => {
+    expect(grantNumber('500', 1000)).toBe(500)
+    expect(grantNumber(' 1000 ', 1000)).toBe(1000)
+    expect(grantNumber('1', 1)).toBe(1)
+  })
+
+  it('refuses nothing, zero, a fraction, a sign, an exponent and anything past the cap', () => {
+    for (const typed of ['', ' ', '0', '1.5', '-3', '+3', '1e3', '12a', '1001', '99999999999999999999']) {
+      expect(grantNumber(typed, 1000)).toBeNull()
+    }
   })
 })
 

@@ -37,8 +37,14 @@ PARSE = "parse"
 CHAT = "chat"
 RESERVED, CONSUMED, RELEASED = "reserved", "consumed", "released"
 PACK_PAID, PACK_REFUNDED = "paid", "refunded"
-# Where a pack came from: Pay, or a redeem code (docs/billing.md § Redeem codes).
-PACK_SOURCE_PAY, PACK_SOURCE_CODE = "pay", "code"
+# Where a pack came from: Pay, a redeem code, or an operator's grant in the console
+# (docs/billing.md § Redeem codes, § Operator grants).
+PACK_SOURCE_PAY, PACK_SOURCE_CODE, PACK_SOURCE_GRANT = "pay", "code", "grant"
+
+
+class PlanConflict(Exception):
+    """The bank holds days of another plan, or runs another plan's period: one plan per
+    bank (docs/billing.md § Periods, *Granted days*)."""
 
 
 class InsufficientCredits(Exception):
@@ -174,6 +180,35 @@ async def settle_period(
         row.updated_at = now
         await db.flush()
     return decided
+
+
+async def bank_days(
+    db: AsyncSession, settings: Settings, user_id: int, plan_id: str, days: int, now: datetime
+) -> Decision:
+    """Add `days` of `plan_id` to the user's bank — a plan code's days or an operator's
+    grant, one rule for both (docs/billing.md § Periods, *Granted days*, § Operator
+    grants) — for a caller that holds the user's row lock and commits. The bank as it
+    stands now, a period that ran out closed first, holds one plan: days of another raise
+    `PlanConflict` before anything of them is written. Then the period is decided again,
+    which opens a granted period at once when no paid one covers `now`; under a paid
+    subscription the days wait."""
+    await settle_period(db, settings, user_id, now)
+    row = await db.get(PlanGrant, user_id)
+    if (
+        row is not None
+        and row.plan_id != plan_id
+        and (row.days_banked > 0 or row.period_start is not None)
+    ):
+        raise PlanConflict
+    if row is None:
+        row = PlanGrant(user_id=user_id, plan_id=plan_id, days_banked=0)
+        db.add(row)
+    row.plan_id = plan_id
+    row.days_banked += days
+    row.updated_at = now
+    # Written before the decision, which reads the row again under the lock.
+    await db.flush()
+    return await settle_period(db, settings, user_id, now)
 
 
 async def read_balance(

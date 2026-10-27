@@ -9,17 +9,18 @@ a document, a note, a conversation or any other content of an account.
 
 from __future__ import annotations
 
-from datetime import date
-from typing import Annotated
+import uuid
+from datetime import date, datetime
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, Query, Response, status
+from fastapi import APIRouter, Body, Depends, Path, Query, Response, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import String, and_, cast, distinct, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from ..admin import codes as admin_codes
-from ..admin import groups
+from ..admin import grants, groups
 from ..admin.deps import (
     ConsoleSession,
     Operator,
@@ -29,15 +30,31 @@ from ..admin.deps import (
 )
 from ..admin.permissions import ALL_PERMISSIONS, AREAS, normalize
 from ..auth.deps import AppSettings, CsrfGuard, DbSession
-from ..billing import codes
+from ..billing import codes, ledger
+from ..billing.plans import FREE_PLAN_ID, PAID_STATUSES
 from ..config import Settings
-from ..db.models import AuditLog, Group, GroupMember, RedeemCode, Redemption, User, utcnow
+from ..db.models import (
+    AuditLog,
+    Group,
+    GroupMember,
+    Job,
+    PlanGrant,
+    RedeemCode,
+    Redemption,
+    Subscription,
+    User,
+    utcnow,
+)
 from ..errors import ApiError
+from ..workspace.documents import measure_storage
+from ..workspace.layout import user_root
 
 router = APIRouter(
     prefix="/api/admin", tags=["admin"], dependencies=[Depends(require_console_session)]
 )
 
+UsersReader = Annotated[Operator, Depends(require_permission("users.read"))]
+UsersWriter = Annotated[Operator, Depends(require_permission("users.write"))]
 GroupsReader = Annotated[Operator, Depends(require_permission("groups.read"))]
 GroupsWriter = Annotated[Operator, Depends(require_permission("groups.write"))]
 AuditReader = Annotated[Operator, Depends(require_permission("audit.read"))]
@@ -48,6 +65,13 @@ GROUP_NAME_MAX_CHARS = 32
 # The highest `?page=` a list takes (docs/admin.md § Routes): its offset, at the largest
 # page size, stays well inside the 64-bit integer PostgreSQL's OFFSET takes.
 PAGE_MAX = 2**31 - 1
+# The highest account id a users route takes: `users.id` is a 32-bit integer, and a larger
+# id would fail in the database instead of finding no account (docs/admin.md § Routes).
+USER_ID_MAX = 2**31 - 1
+# How many of an account's newest jobs its page lists (docs/admin.md § Users and grants).
+RECENT_JOBS = 5
+# A grant's `reason`, the operator's note (docs/admin.md § Users and grants).
+GRANT_REASON_MAX_CHARS = 200
 
 
 @router.get("/me")
@@ -60,6 +84,351 @@ async def console_me(operator: ConsoleSession, settings: AppSettings):
         "permissions": list(operator.permissions),
         "reauth_required": reauth_due(operator, settings),
         "reauth_hours": settings.admin_reauth_hours,
+    }
+
+
+# --- users and grants -----------------------------------------------------------------
+
+
+def _on_plan(settings: Settings, plan_id: str, now: datetime):
+    """The accounts whose current period at `now` is `plan_id`'s, as SQL — the period
+    decision (`plans.resolve_period`) read over every account at once: a paid
+    subscription running now on a configured plan, else the granted days of a configured
+    plan, running or waiting in the bank, else Free."""
+    configured = list(settings.plans)
+    paid = select(Subscription.user_id).where(
+        Subscription.status.in_(PAID_STATUSES),
+        Subscription.period_start <= now,
+        Subscription.period_end > now,
+        Subscription.plan_id.in_(configured),
+    )
+    granted = select(PlanGrant.user_id).where(
+        PlanGrant.plan_id.in_(configured),
+        or_(PlanGrant.period_end > now, PlanGrant.days_banked > 0),
+    )
+    if plan_id == FREE_PLAN_ID:
+        return and_(User.id.not_in(paid), User.id.not_in(granted))
+    return or_(
+        User.id.in_(paid.where(Subscription.plan_id == plan_id)),
+        and_(User.id.not_in(paid), User.id.in_(granted.where(PlanGrant.plan_id == plan_id))),
+    )
+
+
+@router.get("/users")
+async def list_users(
+    operator: UsersReader,
+    db: DbSession,
+    settings: AppSettings,
+    page: int = Query(default=1, ge=1, le=PAGE_MAX),
+    page_size: int | None = Query(default=None, ge=1),
+    q: str = "",
+    plan: str | None = None,
+):
+    """Newest sign-up first, `ADMIN_PAGE_SIZE` a page unless the query asks for fewer.
+    `q` keeps the accounts whose address or name contains it in any letter case; `plan`
+    those whose current period is that plan's. Each row's storage is measured now, one
+    after another; one that cannot be measured reads null."""
+    plan_ids = [FREE_PLAN_ID, *settings.plans]
+    if plan is not None and plan not in plan_ids:
+        raise ApiError(422, "invalid_request", f"plan: one of {', '.join(plan_ids)}")
+    size = min(page_size or settings.admin_page_size, settings.admin_page_size)
+    now = utcnow()
+    filters = []
+    needle = q.strip()
+    if needle:
+        filters.append(
+            or_(
+                User.email.icontains(needle, autoescape=True),
+                User.name.icontains(needle, autoescape=True),
+            )
+        )
+    if plan is not None:
+        filters.append(_on_plan(settings, plan, now))
+    total = await db.scalar(select(func.count()).select_from(User).where(*filters))
+    rows = list(
+        await db.scalars(
+            select(User)
+            .where(*filters)
+            .order_by(User.created_at.desc(), User.id.desc())
+            .limit(size)
+            .offset((page - 1) * size)
+        )
+    )
+    jobs = dict(
+        (
+            await db.execute(
+                select(Job.user_id, func.count())
+                .where(Job.user_id.in_([user.id for user in rows]))
+                .group_by(Job.user_id)
+            )
+        ).all()
+    )
+    items = []
+    for user in rows:
+        balance = await ledger.read_balance(db, settings, user.id, now)
+        try:
+            usage = await measure_storage(
+                db, settings, user.id, user_root(settings.workspaces_dir, user.id)
+            )
+            storage = usage.total
+        except (ApiError, OSError):
+            storage = None
+        items.append(
+            {
+                "id": user.id,
+                "email": user.email,
+                "name": user.name,
+                "plan": {"id": balance.period.plan.id, "source": balance.period.source},
+                "credits_available": balance.available,
+                "storage_bytes": storage,
+                "jobs": jobs.get(user.id, 0),
+                "created_at": user.created_at,
+            }
+        )
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": size,
+        "plans": [
+            {
+                "id": plan_id,
+                "accounts": await db.scalar(
+                    select(func.count()).select_from(User).where(_on_plan(settings, plan_id, now))
+                ),
+            }
+            for plan_id in plan_ids
+        ],
+        "grant": {
+            "credit_usd": float(settings.credit_usd),
+            "valid_days": settings.admin_grant_valid_days,
+            "max_credits": settings.admin_grant_max_credits,
+            "max_days": settings.admin_grant_max_days,
+        },
+    }
+
+
+@router.get("/users/{user_id}")
+async def get_user(
+    user_id: Annotated[int, Path(ge=1, le=USER_ID_MAX)],
+    operator: UsersReader,
+    db: DbSession,
+    settings: AppSettings,
+):
+    """What the account has, never what it wrote: no route here returns a page of a
+    result, a document, a note or a conversation."""
+    user = await db.get(User, user_id)
+    if user is None:
+        raise ApiError(404, "invalid_request", "No such account")
+    now = utcnow()
+    balance = await ledger.read_balance(db, settings, user.id, now)
+    period = balance.period
+    subscription = await db.get(Subscription, user.id)
+    # By source: the period's, then the packs bought, redeemed and granted, each with its
+    # earliest expiry among the packs that still hold credits. Not the order a charge takes
+    # them in, which is the period's first and then every pack by expiry, whatever its
+    # source (docs/billing.md § Top-up packs).
+    period_left = max(0, balance.remaining)
+    sources = [
+        {
+            "source": "period",
+            "remaining": period_left,
+            "expires_at": period.end if period_left > 0 else None,
+        }
+    ]
+    for source in (ledger.PACK_SOURCE_PAY, ledger.PACK_SOURCE_CODE, ledger.PACK_SOURCE_GRANT):
+        held = [pack for pack in balance.packs if pack.source == source and pack.remaining > 0]
+        sources.append(
+            {
+                "source": source,
+                "remaining": sum(pack.remaining for pack in held),
+                "expires_at": min((pack.expires_at for pack in held), default=None),
+            }
+        )
+    try:
+        usage = await measure_storage(
+            db, settings, user.id, user_root(settings.workspaces_dir, user.id)
+        )
+        storage = {
+            "bytes": usage.total,
+            "quota_bytes": ledger.storage_limit(settings, period.plan),
+        }
+    except (ApiError, OSError):
+        storage = None
+    # The columns the page shows, named one by one: a job's prompt, error and pages are
+    # never read here.
+    recent = (
+        await db.execute(
+            select(
+                Job.id,
+                Job.filename,
+                Job.status,
+                Job.page_count,
+                Job.pages_done,
+                Job.created_at,
+                Job.finished_at,
+            )
+            .where(Job.user_id == user.id)
+            .order_by(Job.created_at.desc(), Job.id)
+            .limit(RECENT_JOBS)
+        )
+    ).all()
+    member_of = None
+    if "groups.read" in operator.permissions:
+        member_of = [
+            {"id": group_id, "name": name, "builtin": builtin}
+            for group_id, name, builtin in (
+                await db.execute(
+                    select(Group.id, Group.name, Group.builtin)
+                    .join(GroupMember, GroupMember.group_id == Group.id)
+                    .where(GroupMember.user_id == user.id)
+                    .order_by(Group.builtin.desc(), Group.name)
+                )
+            ).all()
+        ]
+    return {
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "name": user.name,
+            "created_at": user.created_at,
+        },
+        "plan": {
+            "id": period.plan.id,
+            "source": period.source,
+            "start": period.start,
+            "end": period.end,
+        },
+        "subscription": None
+        if subscription is None
+        else {
+            "status": subscription.status,
+            "plan_id": subscription.plan_id,
+            "period_end": subscription.period_end,
+            "cancel_at_period_end": subscription.cancel_at_period_end,
+        },
+        "credits": {"available": balance.available, "sources": sources},
+        "day_bank": grants.day_bank(balance.grant),
+        "storage": storage,
+        "jobs": {
+            "total": await db.scalar(
+                select(func.count()).select_from(Job).where(Job.user_id == user.id)
+            ),
+            "recent": [
+                {
+                    "id": job.id,
+                    "filename": job.filename,
+                    "status": job.status,
+                    "page_count": job.page_count,
+                    "pages_done": job.pages_done,
+                    "created_at": job.created_at,
+                    "finished_at": job.finished_at,
+                }
+                for job in recent
+            ],
+        },
+        "groups": member_of,
+    }
+
+
+class CreditGrant(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    kind: Literal["credits"]
+    credits: int = Field(ge=1)
+    valid_days: int | None = Field(default=None, ge=1)
+    request_id: uuid.UUID
+    reason: str | None = Field(default=None, max_length=GRANT_REASON_MAX_CHARS)
+
+    @field_validator("reason")
+    @classmethod
+    def _none_when_empty(cls, value: str | None) -> str | None:
+        return value or None
+
+
+class DayGrant(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    kind: Literal["days"]
+    plan: str = Field(min_length=1)
+    days: int = Field(ge=1)
+    request_id: uuid.UUID
+    reason: str | None = Field(default=None, max_length=GRANT_REASON_MAX_CHARS)
+
+    @field_validator("reason")
+    @classmethod
+    def _none_when_empty(cls, value: str | None) -> str | None:
+        return value or None
+
+
+@router.post(
+    "/users/{user_id}/grants", dependencies=[CsrfGuard], status_code=status.HTTP_201_CREATED
+)
+async def grant_to_user(
+    user_id: Annotated[int, Path(ge=1, le=USER_ID_MAX)],
+    body: Annotated[CreditGrant | DayGrant, Body(discriminator="kind")],
+    operator: UsersWriter,
+    db: DbSession,
+    settings: AppSettings,
+    response: Response,
+):
+    """Credits or days of a paid plan, through the ledger, the grant and its record in one
+    transaction. 200, and nothing written, for a `request_id` sent again."""
+    if isinstance(body, CreditGrant):
+        if body.credits > settings.admin_grant_max_credits:
+            raise ApiError(
+                422,
+                "invalid_request",
+                f"credits: from 1 to {settings.admin_grant_max_credits}",
+            )
+        valid_days = body.valid_days or settings.admin_grant_valid_days
+        if valid_days > settings.admin_grant_max_days:
+            raise ApiError(
+                422, "invalid_request", f"valid_days: from 1 to {settings.admin_grant_max_days}"
+            )
+        pack, available, made = await grants.grant_credits(
+            db,
+            settings,
+            operator,
+            user_id,
+            credits=body.credits,
+            valid_days=valid_days,
+            request_id=body.request_id,
+            reason=body.reason,
+        )
+        await db.commit()
+        if not made:
+            response.status_code = status.HTTP_200_OK
+        return {
+            "kind": "credits",
+            "pack": {"id": pack.id, "credits": pack.credits, "expires_at": pack.expires_at},
+            "credits_available": available,
+        }
+    if body.plan not in settings.plans:
+        raise ApiError(
+            422, "invalid_request", f"plan: one of {', '.join(settings.plans) or 'none'}"
+        )
+    if body.days > settings.admin_grant_max_days:
+        raise ApiError(422, "invalid_request", f"days: from 1 to {settings.admin_grant_max_days}")
+    plan_id, days, decided, made = await grants.grant_days(
+        db,
+        settings,
+        operator,
+        user_id,
+        plan_id=body.plan,
+        days=body.days,
+        request_id=body.request_id,
+        reason=body.reason,
+    )
+    await db.commit()
+    if not made:
+        response.status_code = status.HTTP_200_OK
+    return {
+        "kind": "days",
+        "plan": plan_id,
+        "days": days,
+        "day_bank": grants.day_bank(decided.grant),
+        "period": grants.period_summary(decided.period),
     }
 
 
