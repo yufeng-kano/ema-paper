@@ -96,3 +96,6 @@ export type IconName =
   | 'archive'
   | 'download'
   | 'sliders-horizontal'
+  | 'shield'
+  | 'users-round'
+  | 'scroll-text'

@@ -19,6 +19,7 @@ from sqlalchemy import case, delete, func, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
 
+from ..admin.groups import join_owner_group, permissions_of
 from ..agents import AGENTS, CHAT, CHECK, PARSE, AgentDefinition, get_agent
 from ..agents import chat as chat_agent
 from ..agents import memory as memory_defs
@@ -140,6 +141,15 @@ async def callback(request: Request, db: DbSession, settings: AppSettings):
         db, claims["sub"], claims["email"], claims.get("name"), claims.get("picture")
     )
     session_token = await create_session(db, user)
+    # An `OWNER_EMAILS` address joins the console's owner group, provided Google verified
+    # it, in the same commit as the session (docs/admin.md § Groups).
+    await join_owner_group(
+        db,
+        settings,
+        user,
+        verified=claims.get("email_verified") is True,
+        ip=request.client.host if request.client else None,
+    )
     await db.commit()
 
     # A connector flow parks the authorize request that sent the user here; only a path on
@@ -169,10 +179,19 @@ async def logout(request: Request, db: DbSession) -> Response:
 
 
 @dev_router.post("/auth/dev-login", dependencies=[CsrfGuard])
-async def dev_login(db: DbSession):
-    """Local-only shortcut so the stack is demoable without Google credentials."""
+async def dev_login(request: Request, db: DbSession, settings: AppSettings):
+    """Local-only shortcut so the stack is demoable without Google credentials. Its
+    address counts as verified, so `OWNER_EMAILS=dev@localhost` makes it an owner
+    (docs/auth.md § 1)."""
     user = await upsert_user(db, DEV_USER_SUB, DEV_USER_EMAIL, "Local Developer")
     session_token = await create_session(db, user)
+    await join_owner_group(
+        db,
+        settings,
+        user,
+        verified=True,
+        ip=request.client.host if request.client else None,
+    )
     await db.commit()
     response = JSONResponse({"user": {"id": user.id, "email": user.email}})
     set_session_cookie(response, session_token)
@@ -212,6 +231,10 @@ async def me(user: SessionUser, db: DbSession, settings: AppSettings):
         # Which view a converted PDF or image opens on the first time it is read
         # (docs/web.md § Result viewer, *Original and Markdown*).
         "default_view": user.default_view,
+        # Whether the account menu offers the operator console: it is on and the account
+        # holds any of its permissions — no re-login window here (docs/admin.md § Signing
+        # in).
+        "console": settings.console_enabled and bool(await permissions_of(db, user.id)),
         # What the upload UI is allowed to send, from the server's own configuration —
         # a limit written twice is a limit that drifts (docs/api.md § Limits).
         "limits": {

@@ -1,0 +1,259 @@
+/**
+ * The operator console's permission logic, framework-free (docs/admin.md § Permissions,
+ * § Groups, § Pages): the areas and their levels, the console's pages in nav order, what a
+ * permission list lets an account see and touch, the permission matrix's rules, the group
+ * name rule, and what a failed console request means for the page.
+ *
+ * Every rule here is the server's too, and the server is what enforces it: these only decide
+ * what a page offers, so an operator is not handed a control the API would refuse. Code
+ * compares permission strings and the `builtin` flag — never a group's name.
+ */
+import { ApiRequestError } from './api'
+import type { IconName } from './icons'
+
+export type AdminLevel = 'read' | 'write'
+
+/**
+ * The areas, in the order the API's `ALL_PERMISSIONS` lists them, with their levels: two
+ * strings per area, `<area>.read` and `<area>.write`, except `audit`, whose records are never
+ * changed. A new area is a line here, its two strings in the API and its words in both
+ * catalogs (`admin.areas`, `admin.permissions`).
+ */
+export const ADMIN_AREAS = [
+  { key: 'users', levels: ['read', 'write'] },
+  { key: 'codes', levels: ['read', 'write'] },
+  { key: 'jobs', levels: ['read', 'write'] },
+  { key: 'groups', levels: ['read', 'write'] },
+  { key: 'audit', levels: ['read'] },
+  { key: 'settings', levels: ['read', 'write'] },
+] as const satisfies readonly { key: string; levels: readonly AdminLevel[] }[]
+
+export type AdminArea = (typeof ADMIN_AREAS)[number]['key']
+
+/** The areas the audit log's filter offers: those with a write, the only ones that change
+ *  anything (docs/admin.md § Pages, *Audit*). */
+export const AUDIT_FILTER_AREAS: readonly AdminArea[] = ADMIN_AREAS.filter((area) =>
+  (area.levels as readonly AdminLevel[]).includes('write'),
+).map((area) => area.key)
+
+export interface ConsolePage {
+  /** The area whose `read` shows the page. */
+  area: AdminArea
+  /** Without the locale prefix: callers pass it through `localePath`. */
+  path: string
+  icon: IconName
+  /** Catalog key of the nav entry. */
+  label: string
+}
+
+/**
+ * The console's pages in nav order — the order the sidebar lists them and `/admin` picks the
+ * first readable one from. Later steps put theirs in front of these (docs/admin.md § Roadmap).
+ */
+export const CONSOLE_PAGES: readonly ConsolePage[] = [
+  { area: 'groups', path: '/admin/groups', icon: 'users-round', label: 'admin.nav.groups' },
+  { area: 'audit', path: '/admin/audit', icon: 'scroll-text', label: 'admin.nav.audit' },
+]
+
+/** Whether a permission list holds `<area>.<level>`. */
+export function can(permissions: readonly string[], area: AdminArea, level: AdminLevel): boolean {
+  return permissions.includes(`${area}.${level}`)
+}
+
+/** The areas whose `read` the list holds, in area order. */
+export function visibleAreas(permissions: readonly string[]): AdminArea[] {
+  return ADMIN_AREAS.filter((area) => can(permissions, area.key, 'read')).map((area) => area.key)
+}
+
+/** The sidebar's console entries: the pages whose area the list can read. */
+export function navEntries(permissions: readonly string[]): ConsolePage[] {
+  return CONSOLE_PAGES.filter((page) => can(permissions, page.area, 'read'))
+}
+
+/** The first console page, in nav order, whose area the list can read; null when it reads
+ *  none — an account in no group, or one whose areas' pages come later. */
+export function firstReadableArea(permissions: readonly string[]): ConsolePage | null {
+  return navEntries(permissions)[0] ?? null
+}
+
+/** The area a page's `adminArea` meta names; null for anything else (`/admin` itself). */
+export function areaOf(value: unknown): AdminArea | null {
+  return ADMIN_AREAS.find((area) => area.key === value)?.key ?? null
+}
+
+/**
+ * Where a visit to a console page lands (docs/admin.md § Pages): the page itself when its
+ * area is readable, else the first readable page, and null — the Not Found page — when the
+ * account can read none. `/admin`, which has no area, always replaces itself.
+ */
+export function consoleDestination(permissions: readonly string[], area: AdminArea | null): string | null {
+  const first = firstReadableArea(permissions)
+  if (!first) {
+    return null
+  }
+  const own = area ? CONSOLE_PAGES.find((page) => page.area === area) : undefined
+  return own && can(permissions, own.area, 'read') ? own.path : first.path
+}
+
+// --- groups ---------------------------------------------------------------------------
+
+/** A group's name (docs/admin.md § Groups): 1–32 of `a`–`z`, `0`–`9`, `_` and `-`, starting
+ *  with a letter or a digit. Uniqueness is the server's to say. */
+export const GROUP_NAME_MAX = 32
+
+export function isGroupName(name: string): boolean {
+  return name.length <= GROUP_NAME_MAX && /^[a-z0-9][a-z0-9_-]*$/.test(name)
+}
+
+/**
+ * A group's list after one tick or untick, as the matrix sends it: ticking a write ticks its
+ * read, unticking a read unticks its write — write includes read — and the list is kept in
+ * the API's permission order (`order`), as the server stores it.
+ */
+export function toggledPermissions(
+  current: readonly string[],
+  area: string,
+  level: AdminLevel,
+  on: boolean,
+  order: readonly string[],
+): string[] {
+  const next = new Set(current)
+  if (on) {
+    next.add(`${area}.${level}`)
+    if (level === 'write') {
+      next.add(`${area}.read`)
+    }
+  } else {
+    next.delete(`${area}.${level}`)
+    if (level === 'read') {
+      next.delete(`${area}.write`)
+    }
+  }
+  return order.filter((permission) => next.has(permission))
+}
+
+/** What a change hands out or takes away: the permissions in one list and not the other. */
+export function changedPermissions(before: readonly string[], after: readonly string[]): string[] {
+  return [...before.filter((p) => !after.includes(p)), ...after.filter((p) => !before.includes(p))]
+}
+
+interface GroupFacts {
+  builtin: boolean
+  /** The effective list: every permission for the built-in group. */
+  permissions: readonly string[]
+}
+
+/**
+ * Whether the operator may tick or untick one cell of a group's matrix: `groups.write`, never
+ * on the built-in group, never on a group that gives a permission the operator does not hold —
+ * a stronger group keeps its list — and only when everything the click would change — the
+ * cell, and the read or write it brings along — is held by the operator (docs/admin.md
+ * § Permissions, *No escalation*).
+ */
+export function canToggle(
+  held: readonly string[],
+  group: GroupFacts,
+  area: string,
+  level: AdminLevel,
+  order: readonly string[],
+): boolean {
+  if (group.builtin || !can(held, 'groups', 'write')) {
+    return false
+  }
+  if (!group.permissions.every((permission) => held.includes(permission))) {
+    return false
+  }
+  const on = !group.permissions.includes(`${area}.${level}`)
+  const changed = changedPermissions(group.permissions, toggledPermissions(group.permissions, area, level, on, order))
+  return changed.length > 0 && changed.every((permission) => held.includes(permission))
+}
+
+/** Adding and removing members: `groups.write` and every permission the group gives — so the
+ *  built-in group's members are managed only by someone holding every permission. */
+export function canManageMembers(held: readonly string[], group: GroupFacts): boolean {
+  return can(held, 'groups', 'write') && group.permissions.every((permission) => held.includes(permission))
+}
+
+/** Deleting: never the built-in group, and only by someone holding everything it gives. */
+export function canDeleteGroup(held: readonly string[], group: GroupFacts): boolean {
+  return !group.builtin && canManageMembers(held, group)
+}
+
+/** Renaming needs `groups.write` alone — a name grants nothing — and never the built-in group. */
+export function canRenameGroup(held: readonly string[], group: GroupFacts): boolean {
+  return !group.builtin && can(held, 'groups', 'write')
+}
+
+// --- the route query ------------------------------------------------------------------
+
+/** The highest `?page=` the API takes (docs/admin.md § Routes). */
+export const PAGE_MAX = 2 ** 31 - 1
+
+/** A page number from the query: a whole number from 1, else 1. */
+export function pageOf(value: unknown): number {
+  const page = typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : NaN
+  if (!Number.isSafeInteger(page) || page < 1) return 1
+  // A page past the API's bound asks for the bound, which the list then replaces with its
+  // last page, as for any page past the end.
+  return Math.min(page, PAGE_MAX)
+}
+
+/** A row id from the query (`?group=`): a positive whole number, else null. */
+export function idOf(value: unknown): number | null {
+  const id = typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : NaN
+  return Number.isSafeInteger(id) && id >= 1 ? id : null
+}
+
+/** The audit filter's area from the query: one the filter offers, else null (all). */
+export function auditAreaOf(value: unknown): AdminArea | null {
+  return AUDIT_FILTER_AREAS.find((area) => area === value) ?? null
+}
+
+// --- refusals -------------------------------------------------------------------------
+
+/**
+ * What a failed console request means for the page (docs/admin.md § Pages, *Errors*):
+ * `signedOut` — the session is gone, handled as everywhere; `reauth` — the full-panel
+ * *Sign in again* state; `denied` — permissions changed, re-read them and say so where the
+ * action was taken; `conflict` — a rule of the console, worded from its `reason`;
+ * `notFound` — what the path or the address named does not exist, or the console is off;
+ * `other` — the backend's own message.
+ */
+export type AdminFailure =
+  | { kind: 'signedOut' }
+  | { kind: 'reauth' }
+  | { kind: 'denied' }
+  | { kind: 'conflict'; reason: string | null }
+  | { kind: 'notFound' }
+  | { kind: 'other' }
+
+export function adminFailure(error: unknown): AdminFailure {
+  if (!(error instanceof ApiRequestError)) {
+    return { kind: 'other' }
+  }
+  if (error.status === 401) {
+    return { kind: 'signedOut' }
+  }
+  if (error.type === 'reauth_required') {
+    return { kind: 'reauth' }
+  }
+  if (error.type === 'permission_denied') {
+    return { kind: 'denied' }
+  }
+  if (error.type === 'admin_conflict') {
+    return { kind: 'conflict', reason: typeof error.details.reason === 'string' ? error.details.reason : null }
+  }
+  if (error.status === 404) {
+    return { kind: 'notFound' }
+  }
+  return { kind: 'other' }
+}
+
+/** The reasons this step's `admin_conflict` names; a page says any other in the server's
+ *  words (docs/admin.md § Refusals). */
+const CONFLICT_REASONS = ['name_taken', 'builtin', 'last_owner', 'email_ambiguous', 'stale'] as const
+
+/** The catalog key for a conflict's reason, or null for one the catalog does not word. */
+export function conflictKey(reason: string | null): string | null {
+  return CONFLICT_REASONS.find((known) => known === reason) ? `admin.conflicts.${reason}` : null
+}

@@ -19,6 +19,11 @@
   `value()`. A row can also carry attributes of its own through `rowAttrs` — what the file
   library needs to make rows draggable and folder rows droppable, without a second table
   living on that page.
+
+  A row the caller says is open (`open`) is followed by its **detail row**: one cell across
+  every column, on the sunken surface with the row above it, filled from the `detail` slot —
+  the audit log's before and after. The open row carries `aria-expanded`; opening and closing
+  it, by a click or the keyboard, is the caller's, through `rowAttrs`.
 -->
 <script setup lang="ts" generic="Row">
 import type { TableColumn } from '~/lib/table'
@@ -38,8 +43,13 @@ withDefaults(
      * with this component's own rather than replacing it.
      */
     rowAttrs?: (row: Row) => Record<string, unknown>
+    /**
+     * Which rows are open: each is followed by its detail row (the `detail` slot) and
+     * carries `aria-expanded`. Without it no row opens and none carries the attribute.
+     */
+    open?: (row: Row) => boolean
   }>(),
-  { density: 'normal', rowAttrs: undefined },
+  { density: 'normal', rowAttrs: undefined, open: undefined },
 )
 
 defineSlots<Record<string, (props: { row: Row }) => unknown>>()
@@ -63,15 +73,26 @@ defineSlots<Record<string, (props: { row: Row }) => unknown>>()
       </tr>
     </thead>
     <tbody>
-      <tr v-for="row in rows" :key="rowKey(row)" v-bind="rowAttrs?.(row)">
-        <td
-          v-for="column in columns"
-          :key="column.key"
-          :class="{ numeric: column.numeric, end: column.align === 'end' }"
+      <template v-for="row in rows" :key="rowKey(row)">
+        <tr
+          v-bind="rowAttrs?.(row)"
+          :class="{ 'is-open': open?.(row) }"
+          :aria-expanded="open ? open(row) : undefined"
         >
-          <slot :name="`cell-${column.key}`" :row="row">{{ column.value?.(row) ?? '' }}</slot>
-        </td>
-      </tr>
+          <td
+            v-for="column in columns"
+            :key="column.key"
+            :class="{ numeric: column.numeric, end: column.align === 'end' }"
+          >
+            <slot :name="`cell-${column.key}`" :row="row">{{ column.value?.(row) ?? '' }}</slot>
+          </td>
+        </tr>
+        <tr v-if="open?.(row)" class="detail-row">
+          <td :colspan="columns.length">
+            <slot name="detail" :row="row" />
+          </td>
+        </tr>
+      </template>
     </tbody>
   </table>
 </template>
@@ -129,7 +150,7 @@ defineSlots<Record<string, (props: { row: Row }) => unknown>>()
    in `:where()` so it adds no weight: a caller's row states (Files' selection, a drop
    target) win over it. */
 @media (hover: hover) {
-  .table tbody tr:where(:hover) td {
+  .table tbody tr:where(:not(.detail-row):hover) td {
     background: var(--fill-weak);
   }
 }
@@ -144,6 +165,28 @@ defineSlots<Record<string, (props: { row: Row }) => unknown>>()
 
 .table td:only-child {
   border-radius: var(--radius-md);
+}
+
+/* An open row and its detail read as one piece on the sunken surface: square where they
+   meet, rounded at the outer corners. */
+.table tbody tr.is-open td {
+  background: var(--paper-sunken);
+}
+
+.table tbody tr.is-open td:first-child {
+  border-bottom-left-radius: 0;
+}
+
+.table tbody tr.is-open td:last-child {
+  border-bottom-right-radius: 0;
+}
+
+.table tbody tr.detail-row td {
+  height: auto;
+  padding: var(--space-1) var(--cell-x) var(--space-3);
+  border-radius: 0 0 var(--radius-md) var(--radius-md);
+  background: var(--paper-sunken);
+  white-space: normal;
 }
 
 /*

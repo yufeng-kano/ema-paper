@@ -41,6 +41,14 @@ class Settings(BaseSettings):
 
     auth_dev_mode: bool = False
 
+    # The operator console (docs/admin.md): the Google addresses that join its built-in
+    # owner group when they sign in with the address verified, comma-separated, in any
+    # letter case — empty = no console, `/api/admin` not mounted; how many hours after a
+    # sign-in a session may still use it; and the rows one page of its lists holds.
+    owner_emails: str = ""
+    admin_reauth_hours: int = 12
+    admin_page_size: int = 50
+
     # Kano Proxy, the only upstream (docs/auth.md § 3): the origin only — vision calls go
     # to `{origin}/openai/v1`, chat to `{origin}/anthropic/v1` — and the operator's own key,
     # presented on every upstream call. Either empty = no upstream, 503 `upstream`.
@@ -347,9 +355,12 @@ class Settings(BaseSettings):
             "grant_period_days",
             "redeem_max_failures",
             "redeem_failure_window_seconds",
+            "admin_reauth_hours",
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name.upper()} must be positive")
+        if not 1 <= self.admin_page_size <= 500:
+            raise ValueError("ADMIN_PAGE_SIZE must be between 1 and 500")
         self.redeem_code_prefix = self.redeem_code_prefix.strip().upper()
         if self.redeem_code_prefix and not self.redeem_code_prefix.isalnum():
             raise ValueError("REDEEM_CODE_PREFIX must be letters and digits only")
@@ -415,6 +426,19 @@ class Settings(BaseSettings):
     def dev_login_enabled(self) -> bool:
         """`POST /api/auth/dev-login` exists only under both conditions (docs/auth.md)."""
         return self.app_env == "local" and self.auth_dev_mode
+
+    @property
+    def owner_email_set(self) -> frozenset[str]:
+        """`OWNER_EMAILS`, each address trimmed and lower-cased, empty items dropped."""
+        return frozenset(
+            item.strip().lower() for item in self.owner_emails.split(",") if item.strip()
+        )
+
+    @property
+    def console_enabled(self) -> bool:
+        """The operator console exists only while `OWNER_EMAILS` names an address
+        (docs/admin.md § Off until configured)."""
+        return bool(self.owner_email_set)
 
     @property
     def google_oidc_configured(self) -> bool:

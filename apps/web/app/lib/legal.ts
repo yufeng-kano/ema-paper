@@ -9,7 +9,7 @@ export type LegalDoc = (typeof LEGAL_DOCS)[number]
 
 export const LEGAL_UPDATED: Record<LegalDoc, string> = {
   terms: '2026-10-26',
-  privacy: '2026-10-25',
+  privacy: '2026-10-27',
   refund: '2026-10-26',
 }
 

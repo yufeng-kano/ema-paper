@@ -25,6 +25,7 @@ The origin spec (v0.1) is a reference, not a contract. Decisions that supersede 
 - **One upstream, the operator's.** Every model call runs on the operator's own Kano Proxy account ([auth.md](./auth.md) § 3); users bring no key. Under the subscription ([billing.md](./billing.md)) a user's spend is bounded by the credits their plan grants per period: Free (a small monthly grant, no sandbox, 512 MB) and Pro (a larger grant, the sandbox, 10 GB), paid through Kano Pay. Files are kept on both plans for as long as the account exists, save what the reader moves to the Trash, deleted 30 days later; the reader deletes the account themselves, at once ([auth.md](./auth.md) § Deleting the account).
 - Documents are untrusted input: parsing runs in short-lived subprocesses with timeouts; uploads are size- and page-capped.
 - Document content is sensitive: source files are short-lived, prompts/completions are never logged (nor are a failed database statement's bound values, which hold the same text), results are visible only to their owner.
+- **Operators see metadata, never content** (since 2026-10-27, [admin.md](./admin.md) § What an operator sees). The operator, and whoever the operator gives the console to, can see an account's address and name, plan, credits, storage and what it ran — file names, pages, status, usage — and change only through audited routes; no route shows them a document, a note or a conversation, and none signs them in as a user. The Privacy page says so.
 
 ## Non-goals
 

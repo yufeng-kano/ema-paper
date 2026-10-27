@@ -1977,3 +1977,110 @@ async def test_the_compaction_migration_leaves_every_row_as_a_message_turn(scrat
             assert await _count(db, "conversations") == 1
     finally:
         await engine.dispose()
+
+
+REDEEM_CODES = "fa9aedf01cfd"
+OPERATOR_CONSOLE = "52a2cf52bf36"
+CONSOLE_TABLES = ("groups", "group_members", "audit_log")
+
+
+async def test_the_operator_console_migration_seeds_the_owner_group_and_touches_nothing(
+    scratch_url,
+) -> None:
+    """Over existing users and sessions, which it leaves as they are, it creates the three
+    tables and one row, the built-in group; one built-in group only; a deleted account
+    takes its memberships and leaves its records with `actor_id` NULL; the downgrade drops
+    the three tables (docs/database.md § Rules, docs/admin.md § Acceptance)."""
+    _alembic(scratch_url, "upgrade", REDEEM_CODES)
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.begin() as db:
+            await db.execute(
+                text(
+                    "INSERT INTO users (id, google_sub, email, name, created_at) VALUES "
+                    "(1, 'sub-1', 'owner@example.com', 'Owner', now()), "
+                    "(2, 'sub-2', 'member@example.com', 'Member', now())"
+                )
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO sessions (user_id, token_hash, created_at, expires_at) "
+                    "VALUES (1, 'hash', now() - interval '1 hour', now() + interval '1 day')"
+                )
+            )
+        _alembic(scratch_url, "upgrade", OPERATOR_CONSOLE)
+        async with engine.begin() as db:
+            seeded = (
+                await db.execute(
+                    text("SELECT id, name, permissions = '[]'::jsonb, builtin FROM groups")
+                )
+            ).all()
+            assert [tuple(row)[1:] for row in seeded] == [("owner", True, True)]
+            owner_group = seeded[0][0]
+            assert await _count(db, "group_members") == 0
+            assert await _count(db, "audit_log") == 0
+            assert await _count(db, "users") == 2
+            assert await _count(db, "sessions") == 1
+            index = (
+                await db.execute(
+                    text("SELECT indexdef FROM pg_indexes WHERE indexname = 'uq_groups_builtin'")
+                )
+            ).scalar()
+            assert index is not None and "UNIQUE" in index and "WHERE builtin" in index
+            await db.execute(
+                text(
+                    "INSERT INTO group_members (group_id, user_id, added_by, added_at) VALUES "
+                    "(:group, 1, 1, now()), (:group, 2, 1, now())"
+                ),
+                {"group": owner_group},
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO audit_log (actor_id, permission, action, target_type, "
+                    "target_id, before, after, ip, created_at) VALUES (1, 'groups.write', "
+                    "'groups.add_member', 'user', '2', NULL, :after, '127.0.0.1', now())"
+                ),
+                {"after": '{"group_id": 1, "group": "owner"}'},
+            )
+            # A group is not built in unless it says so.
+            await db.execute(
+                text(
+                    "INSERT INTO groups (name, permissions, created_at, updated_at) "
+                    "VALUES ('ops', '[\"audit.read\"]', now(), now())"
+                )
+            )
+        for statement in (
+            # A second built-in group, under any name.
+            "INSERT INTO groups (name, permissions, builtin, created_at, updated_at) "
+            "VALUES ('second', '[]', true, now(), now())",
+            # A taken name.
+            "INSERT INTO groups (name, permissions, created_at, updated_at) "
+            "VALUES ('ops', '[]', now(), now())",
+        ):
+            async with engine.connect() as db:
+                with pytest.raises(IntegrityError):
+                    await db.execute(text(statement))
+        async with engine.begin() as db:
+            # The account that added a member goes: its own membership with it, the one
+            # it added kept with added_by NULL, its record kept with actor_id NULL.
+            await db.execute(text("DELETE FROM users WHERE id = 1"))
+            members = (await db.execute(text("SELECT user_id, added_by FROM group_members"))).all()
+            assert [tuple(row) for row in members] == [(2, None)]
+            record = (await db.execute(text("SELECT actor_id, target_id FROM audit_log"))).one()
+            assert tuple(record) == (None, "2")
+            # A deleted group takes its memberships.
+            await db.execute(text("DELETE FROM groups WHERE id = :group"), {"group": owner_group})
+            assert await _count(db, "group_members") == 0
+        _alembic(scratch_url, "downgrade", REDEEM_CODES)
+        async with engine.connect() as db:
+            names = {
+                row[0]
+                for row in await db.execute(
+                    text("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
+                )
+            }
+            assert await _count(db, "users") == 1
+        assert not names & set(CONSOLE_TABLES)
+        assert {"users", "sessions", "redeem_codes"} <= names
+    finally:
+        await engine.dispose()

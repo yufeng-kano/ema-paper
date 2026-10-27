@@ -33,6 +33,11 @@ ErrorType = Literal[
     "code_exhausted",
     "code_redeemed",
     "code_plan_conflict",
+    # The operator console's own three, answered only under `/api/admin` (docs/admin.md
+    # § Refusals): `admin_conflict` names its rule in `reason` beside `message`.
+    "permission_denied",
+    "reauth_required",
+    "admin_conflict",
     "upstream",
     "internal",
 ]
@@ -73,9 +78,10 @@ class ApiError(Exception):
         self.error_type = error_type
         self.message = message
         self.headers = headers
-        # Extra fields inside `error`, for the one refusal a client acts on by number:
-        # `insufficient_credits` carries `need`, `remaining` and `period_end`
-        # (docs/billing.md § Refusals).
+        # Extra fields inside `error`, for a refusal a client acts on by more than its
+        # type: `insufficient_credits` carries `need`, `remaining` and `period_end`
+        # (docs/billing.md § Refusals), `admin_conflict` its `reason` (docs/admin.md
+        # § Refusals).
         self.details = details
 
 

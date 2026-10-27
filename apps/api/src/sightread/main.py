@@ -1,4 +1,5 @@
-"""FastAPI wiring: `/api` (control plane, including `/api/library`), `/v1` (data plane),
+"""FastAPI wiring: `/api` (control plane, including `/api/library`, and `/api/admin` while
+the operator console is configured), `/v1` (data plane),
 `/oauth` plus `/.well-known/*` (authorization server) and `/mcp` (MCP shell) — one app, one
 process.
 """
@@ -19,6 +20,7 @@ from .db.session import create_engine, create_sessionmaker
 from .errors import install_error_handlers
 from .mcp import mcp_session_manager, mount_mcp
 from .routes import (
+    admin,
     attachments,
     billing,
     chat,
@@ -85,6 +87,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(billing.router)
     if settings.dev_login_enabled:
         app.include_router(control.dev_router)
+    # The operator console exists only while OWNER_EMAILS names an address; otherwise
+    # every /api/admin path is the 404 of a path that does not exist (docs/admin.md).
+    if settings.console_enabled:
+        app.include_router(admin.router)
     app.include_router(library.router)
     app.include_router(chat.router)
     app.include_router(attachments.router)

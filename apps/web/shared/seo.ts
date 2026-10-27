@@ -30,16 +30,18 @@ function localized(page: string, prefix: string): string {
 export const PUBLIC_PATHS = PUBLIC_PAGES.flatMap((page) => PAGE_LOCALES.map(({ prefix }) => localized(page, prefix)))
 
 /**
- * Kept off every crawler: the authed pages in each locale (client-rendered shells that send a
- * signed-out visitor to sign in), the sign-in redirect, the data plane, the authorization
- * server and the MCP endpoint. The rest of `/api/` stays open: the pricing and policy pages
- * render from `/api/billing/catalog` and `/api/site`.
+ * Kept off every crawler: the authed pages in each locale, the operator console's included
+ * (client-rendered shells that send a signed-out visitor to sign in), the sign-in redirect,
+ * the data plane, the authorization server and the MCP endpoint. The rest of `/api/` stays
+ * open: the pricing and policy pages render from `/api/billing/catalog` and `/api/site`.
  */
 export const DISALLOWED_PATHS = [
   '/files',
   '/settings',
+  '/admin',
   '/zh-TW/files',
   '/zh-TW/settings',
+  '/zh-TW/admin',
   '/api/auth/',
   '/v1/',
   '/oauth/',

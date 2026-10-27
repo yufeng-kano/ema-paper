@@ -1077,3 +1077,89 @@ class PlanGrant(Base):
     period_start: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
     period_end: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
+
+
+class Group(Base):
+    """A group of the operator console: binds people to permission strings (docs/admin.md
+    § Groups). Code reads `permissions` and `builtin`, never `name`. The one built-in
+    group holds every permission whatever its stored list, which is kept empty."""
+
+    __tablename__ = "groups"
+    __table_args__ = (
+        UniqueConstraint("name", name="uq_groups_name"),
+        # One built-in group: the owner group (docs/database.md).
+        Index(
+            "uq_groups_builtin",
+            "builtin",
+            unique=True,
+            postgresql_where=text("builtin"),
+            sqlite_where=text("builtin"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(32))
+    # Normalized permission strings in `ALL_PERMISSIONS` order (docs/admin.md
+    # § Permissions); a JSON column, so it is reassigned whole, never mutated in place.
+    permissions: Mapped[list] = mapped_column(JSON_COLUMN, default=list)
+    builtin: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
+
+
+class GroupMember(Base):
+    """One person in one group. A deleted group or account takes its memberships; the
+    one who added it may go and leave the row (docs/admin.md § Groups)."""
+
+    __tablename__ = "group_members"
+
+    group_id: Mapped[int] = mapped_column(
+        ForeignKey("groups.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True, index=True
+    )
+    # The member themselves for a sign-in's owner join.
+    added_by: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    added_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
+
+
+class AuditLog(Base):
+    """One change made through the operator console, written in the change's own
+    transaction and never updated or deleted (docs/admin.md § The audit log). `before` and
+    `after` hold ids, amounts, flags, permission strings and group names — never an
+    address, a person's name, content or a secret."""
+
+    __tablename__ = "audit_log"
+    __table_args__ = (
+        Index("ix_audit_log_created_at", "created_at"),
+        Index("ix_audit_log_actor_created", "actor_id", "created_at"),
+        Index("ix_audit_log_target", "target_type", "target_id"),
+    )
+
+    # BIGINT on PostgreSQL; SQLite numbers a row only through an INTEGER primary key.
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer(), "sqlite"), primary_key=True
+    )
+    # The record outlives the account that made the change.
+    actor_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    # What the route required; NULL for a sign-in's owner join.
+    permission: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    action: Mapped[str] = mapped_column(String(64))  # <area>.<verb>
+    target_type: Mapped[str] = mapped_column(String(32))  # group | user
+    # No foreign key: a record outlives what it names.
+    target_id: Mapped[str] = mapped_column(String(64))
+    # A side with nothing is SQL NULL (docs/admin.md § The audit log): `none_as_null`, or a
+    # JSON column writes Python None as the JSON value `null`.
+    before: Mapped[dict | None] = mapped_column(
+        JSONB(none_as_null=True).with_variant(JSON(none_as_null=True), "sqlite"), nullable=True
+    )
+    after: Mapped[dict | None] = mapped_column(
+        JSONB(none_as_null=True).with_variant(JSON(none_as_null=True), "sqlite"), nullable=True
+    )
+    ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
