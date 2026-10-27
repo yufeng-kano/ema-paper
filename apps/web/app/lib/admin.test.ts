@@ -5,6 +5,8 @@ import {
   ADMIN_AREAS,
   AUDIT_FILTER_AREAS,
   CONSOLE_PAGES,
+  IMPACT_KINDS,
+  SETTING_GROUPS,
   addDays,
   adminFailure,
   areaOf,
@@ -20,6 +22,7 @@ import {
   codesCsv,
   conflictKey,
   consoleDestination,
+  editableText,
   costDays,
   dayOf,
   daysOf,
@@ -31,11 +34,17 @@ import {
   formatUtcDay,
   grantNumber,
   idOf,
+  impactLines,
   isGroupName,
+  isJsonSetting,
   jobStatusOf,
   navEntries,
+  packRows,
   pageOf,
   PAGE_MAX,
+  planRows,
+  priceRows,
+  settingImpact,
   presetOf,
   presetRange,
   requeueRefusalKey,
@@ -93,6 +102,7 @@ describe('what a permission list shows', () => {
       '/admin/usage',
       '/admin/groups',
       '/admin/audit',
+      '/admin/settings',
     ])
     expect(navEntries(['audit.read']).map((page) => page.path)).toEqual(['/admin/audit'])
     expect(navEntries(['users.read', 'users.write']).map((page) => page.path)).toEqual(['/admin/users'])
@@ -108,9 +118,10 @@ describe('what a permission list shows', () => {
   it('keeps a readable page, replaces an unreadable one, and finds nothing for no page', () => {
     expect(consoleDestination(['audit.read', 'groups.read'], 'audit')).toBe('/admin/audit')
     expect(consoleDestination(['audit.read'], 'groups')).toBe('/admin/audit')
-    // An account in no group, and one whose areas' pages come in later steps.
+    // An account in no group, and one holding a write alone (the API always adds its read).
     expect(consoleDestination([], null)).toBeNull()
-    expect(consoleDestination(['users.write', 'settings.read'], 'groups')).toBeNull()
+    expect(consoleDestination(['users.write'], 'groups')).toBeNull()
+    expect(consoleDestination(['users.write', 'settings.read'], 'groups')).toBe('/admin/settings')
     expect(consoleDestination(['codes.read', 'users.write'], 'groups')).toBe('/admin/codes')
   })
 
@@ -487,6 +498,110 @@ describe('jobs and usage', () => {
       }
       expect(typeof lookup(catalog, 'admin.audit.actions.jobs.requeue')).toBe('string')
       expect(typeof lookup(catalog, 'admin.audit.targets.job')).toBe('string')
+    }
+  })
+})
+
+describe('the settings page', () => {
+  const PRICES =
+    '{"vendor/zeta": {"input": 1, "cache_read": 0.1, "cache_write": 1.25, "output": "5"}, "vendor/alpha": {"input": 2, "cache_read": 0.2, "cache_write": 2.5, "output": 10}}'
+
+  it('shows the API’s twelve keys, each in one group', () => {
+    const keys = SETTING_GROUPS.flatMap((group) => [...group.settings])
+    expect(keys).toEqual([
+      'PARSE_MODEL',
+      'CHECK_MODEL',
+      'PARSE_FALLBACK_MODEL',
+      'CREDIT_USD',
+      'PARSE_CREDITS_PER_PAGE',
+      'CHAT_MIN_CREDITS',
+      'FREE_CREDITS_PER_PERIOD',
+      'FREE_STORAGE_BYTES',
+      'FREE_MAX_JOBS',
+      'MODEL_PRICES_JSON',
+      'KANO_PAY_PLANS_JSON',
+      'KANO_PAY_PACKS_JSON',
+    ])
+    expect(keys.filter(isJsonSetting)).toEqual(['MODEL_PRICES_JSON', 'KANO_PAY_PLANS_JSON', 'KANO_PAY_PACKS_JSON'])
+  })
+
+  it('pretty-prints a table for editing with its keys in their order', () => {
+    const text = editableText(PRICES)
+    expect(text.split('\n')[1]).toBe('  "vendor/zeta": {')
+    expect(Object.keys(JSON.parse(text))).toEqual(['vendor/zeta', 'vendor/alpha'])
+    expect(JSON.parse(text)).toEqual(JSON.parse(PRICES))
+  })
+
+  it('leaves as it is what printing would reorder or round, and what is not a table', () => {
+    // JavaScript moves an index-like key to the front of an object.
+    const indexed = '{"b": {"input": 1}, "7": {"input": 2}}'
+    expect(editableText(indexed)).toBe(indexed)
+    const huge = '[{"planId": "pro", "storageBytes": 123456789012345678}]'
+    expect(editableText(huge)).toBe(huge)
+    expect(editableText('{not json')).toBe('{not json')
+    expect(editableText('0.002')).toBe('0.002')
+    expect(editableText('vendor/model')).toBe('vendor/model')
+  })
+
+  it('reads the price table in its order, and nothing that is not one', () => {
+    expect(priceRows(PRICES)).toEqual([
+      { model: 'vendor/zeta', input: '1', output: '5', cache_read: '0.1', cache_write: '1.25' },
+      { model: 'vendor/alpha', input: '2', output: '10', cache_read: '0.2', cache_write: '2.5' },
+    ])
+    expect(priceRows('{}')).toEqual([])
+    expect(priceRows('[]')).toBeNull()
+    expect(priceRows('{"m": 1}')).toBeNull()
+    expect(priceRows('nope')).toBeNull()
+  })
+
+  it('reads the plans and the packs, an empty text as none', () => {
+    expect(
+      planRows('[{"planId": "pro", "credits": 5000, "storageBytes": 10000000000, "sandbox": true, "maxJobs": 3}]'),
+    ).toEqual([{ id: 'pro', credits: 5000, storageBytes: 10000000000, maxJobs: 3, sandbox: true }])
+    expect(planRows('')).toEqual([])
+    expect(planRows('[{"credits": 1}]')).toBeNull()
+    expect(planRows('{"planId": "pro"}')).toBeNull()
+    expect(packRows('[{"packId": "credits", "credits": 2000, "validDays": 365}]')).toEqual([
+      { id: 'credits', credits: 2000, validDays: 365 },
+    ])
+    expect(packRows('[]')).toEqual([])
+    expect(packRows('[1]')).toBeNull()
+  })
+
+  it('finds the impact of a 409 and lists its counts in order, leaving every other failure', () => {
+    const impact = {
+      removed: { models: ['m'], plans: [], packs: [] },
+      counts: { chat_settings: 2, conversations: 5, unknown_kind: 1 },
+    }
+    const asked = new ApiRequestError(409, 'admin_conflict', 'Confirm', { reason: 'impact', impact })
+    expect(settingImpact(asked)).toEqual(impact)
+    expect(impactLines(impact)).toEqual([
+      { kind: 'conversations', n: 5 },
+      { kind: 'chat_settings', n: 2 },
+    ])
+    expect(settingImpact(new ApiRequestError(409, 'admin_conflict', 'Taken', { reason: 'stale' }))).toBeNull()
+    expect(settingImpact(new ApiRequestError(422, 'invalid_request', 'CREDIT_USD must be positive'))).toBeNull()
+    expect(settingImpact(new Error('offline'))).toBeNull()
+  })
+
+  it('words every group, key, note and impact in both catalogs', () => {
+    const lookup = (catalog: unknown, path: string): unknown =>
+      path.split('.').reduce<unknown>((node, key) => (node as Record<string, unknown> | undefined)?.[key], catalog)
+    for (const catalog of [en, zhTW]) {
+      for (const group of SETTING_GROUPS) {
+        expect(typeof lookup(catalog, `admin.settings.groups.${group.key}`)).toBe('string')
+        for (const key of group.settings) {
+          expect(typeof lookup(catalog, `admin.settings.keys.${key}`)).toBe('string')
+          expect(typeof lookup(catalog, `admin.settings.notes.${key}`)).toBe('string')
+        }
+      }
+      for (const kind of IMPACT_KINDS) {
+        expect(typeof lookup(catalog, `admin.settings.impact.${kind}`)).toBe('string')
+      }
+      for (const action of ['update', 'reset']) {
+        expect(typeof lookup(catalog, `admin.audit.actions.settings.${action}`)).toBe('string')
+      }
+      expect(typeof lookup(catalog, 'admin.audit.targets.setting')).toBe('string')
     }
   })
 })

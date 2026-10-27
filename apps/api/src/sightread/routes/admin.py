@@ -15,7 +15,7 @@ from dataclasses import asdict
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Body, Depends, Path, Query, Response, status
+from fastapi import APIRouter, Body, Depends, Path, Query, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import String, and_, case, cast, distinct, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,6 +24,7 @@ from sqlalchemy.orm import aliased
 from ..admin import codes as admin_codes
 from ..admin import grants, groups
 from ..admin import jobs as admin_jobs
+from ..admin import settings as admin_settings
 from ..admin.deps import (
     ConsoleSession,
     Operator,
@@ -1167,3 +1168,83 @@ async def list_audit(
         "page": page,
         "page_size": size,
     }
+
+
+# --- settings ---------------------------------------------------------------------------
+
+SettingsReader = Annotated[Operator, Depends(require_permission("settings.read"))]
+SettingsWriter = Annotated[Operator, Depends(require_permission("settings.write"))]
+
+
+class SettingChange(BaseModel):
+    """A value for one key, the text `.env` would hold, trimmed; `confirm` once the
+    operator has seen what it takes away (docs/admin.md § Settings)."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    value: str = Field(max_length=admin_settings.VALUE_MAX_CHARS)
+    confirm: bool = False
+
+
+class SettingReset(BaseModel):
+    confirm: bool = False
+
+
+@router.get("/settings")
+async def list_settings(operator: SettingsReader, db: DbSession, request: Request):
+    """The twelve settings the database may override, where each comes from, and whether
+    each secret of `.env` is set — never its value."""
+    return await admin_settings.payload(db, request.app.state.settings)
+
+
+@router.put("/settings/{key}", dependencies=[CsrfGuard])
+async def put_setting(
+    key: str,
+    body: SettingChange,
+    operator: SettingsWriter,
+    db: DbSession,
+    request: Request,
+):
+    """Store a value over `.env`'s, checked as at start: 422 in the checks' words, 409
+    `impact` until confirmed when it takes away what accounts have. A value the key
+    already holds writes nothing."""
+    base = request.app.state.settings
+    changed = await admin_settings.change(
+        db,
+        base,
+        operator,
+        key,
+        body.value,
+        confirm=body.confirm,
+        free_accounts=lambda effective: _on_plan(effective, FREE_PLAN_ID, utcnow()),
+    )
+    if changed:
+        await db.commit()
+        request.app.state.runtime_settings.invalidate()
+    return await admin_settings.payload(db, base)
+
+
+@router.delete("/settings/{key}", dependencies=[CsrfGuard])
+async def reset_setting(
+    key: str,
+    operator: SettingsWriter,
+    db: DbSession,
+    request: Request,
+    body: SettingReset | None = None,
+):
+    """Restore a key to `.env`: its row deleted, checked and confirmed as a change is. A
+    key the database does not override writes nothing."""
+    base = request.app.state.settings
+    changed = await admin_settings.change(
+        db,
+        base,
+        operator,
+        key,
+        None,
+        confirm=body is not None and body.confirm,
+        free_accounts=lambda effective: _on_plan(effective, FREE_PLAN_ID, utcnow()),
+    )
+    if changed:
+        await db.commit()
+        request.app.state.runtime_settings.invalidate()
+    return await admin_settings.payload(db, base)

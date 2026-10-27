@@ -2028,3 +2028,47 @@ export function getAdminUsage(range: { from: string; to: string }): Promise<Admi
   const params = new URLSearchParams({ from: range.from, to: range.to })
   return request('GET', `/api/admin/usage?${params}`)
 }
+
+/** One setting the database may override (docs/admin.md § Routes, `<setting>`): its text in
+ *  effect, where that comes from, `.env`'s text beside it, and who stored it when. */
+export interface AdminSetting {
+  key: string
+  value: string
+  source: 'database' | 'env'
+  env_value: string
+  updated_at: string | null
+  updated_by: AdminPerson | null
+}
+
+/** `GET /api/admin/settings`: the twelve, whether each secret is set — never its value —
+ *  the checks' message while the stored values no longer fit `.env`, how long a change takes
+ *  to reach the worker, and `.env`'s ceilings. */
+export interface AdminSettingsResponse {
+  settings: AdminSetting[]
+  secrets: { key: string; set: boolean }[]
+  ignored: string | null
+  cache_seconds: number
+  ceilings: { WORKSPACE_QUOTA_BYTES: number; MAX_JOBS_PER_USER: number }
+}
+
+/** A 409 `impact`'s `impact`: what a change removes, and of what uses it, the counts above 0
+ *  by kind. */
+export interface AdminSettingImpact {
+  removed: { models: string[]; plans: string[]; packs: string[] }
+  counts: Partial<Record<string, number>>
+}
+
+export function getAdminSettings(): Promise<AdminSettingsResponse> {
+  return request('GET', '/api/admin/settings')
+}
+
+/** Stores `value` over `.env`'s: 422 in the start checks' words, 409 `admin_conflict`
+ *  (`impact`) until `confirm` when it takes away what accounts have. */
+export function putAdminSetting(key: string, value: string, confirm = false): Promise<AdminSettingsResponse> {
+  return request('PUT', `/api/admin/settings/${encodeURIComponent(key)}`, { value, confirm })
+}
+
+/** Restores the key to `.env`, checked and confirmed as a change is. */
+export function resetAdminSetting(key: string, confirm = false): Promise<AdminSettingsResponse> {
+  return request('DELETE', `/api/admin/settings/${encodeURIComponent(key)}`, { confirm })
+}

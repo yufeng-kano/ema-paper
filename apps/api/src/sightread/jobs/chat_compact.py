@@ -30,6 +30,7 @@ from ..db.models import (
     utcnow,
 )
 from ..errors import ApiError
+from ..runtime_settings import RuntimeSettings
 from ..workspace.documents import current_revision, ensure_within_quota, is_live, user_folders
 from ..workspace.layout import user_root
 from .queue import count_active_turns, enqueue_turn, history_bytes
@@ -267,11 +268,15 @@ async def idle_compact_once(
 
 
 async def idle_compact_forever(
-    sessionmaker: async_sessionmaker[AsyncSession], settings: Settings, stop: asyncio.Event
+    sessionmaker: async_sessionmaker[AsyncSession],
+    runtime: RuntimeSettings,
+    stop: asyncio.Event,
 ) -> None:
-    """Look every `CHAT_IDLE_COMPACT_SWEEP_SECONDS` until the worker shuts down; a pass that
-    raises past its own guards is logged, and the next runs on schedule."""
+    """Look every `CHAT_IDLE_COMPACT_SWEEP_SECONDS` until the worker shuts down, each pass on
+    the settings in effect as it starts (docs/admin.md § Settings); a pass that raises past
+    its own guards is logged, and the next runs on schedule."""
     while not stop.is_set():
+        settings = await runtime.current()
         try:
             enqueued = await idle_compact_once(sessionmaker, settings)
             if enqueued:

@@ -2143,3 +2143,99 @@ async def test_the_console_grants_migration_widens_the_pack_source_and_keeps_eve
         _alembic(scratch_url, "upgrade", "head")
     finally:
         await engine.dispose()
+
+
+RUNTIME_SETTINGS = "acaa414338bb"
+
+
+async def test_the_runtime_settings_migration_adds_an_empty_table_and_touches_nothing(
+    scratch_url,
+) -> None:
+    """Over existing users, conversations and records, which it leaves as they are, it
+    creates `runtime_settings`, empty, and the index on `conversations.model`; a stored
+    setting keeps its text, key order included; deleting the account that stored it sets
+    `updated_by` NULL; the downgrade drops both (docs/database.md § Rules, docs/admin.md
+    § Acceptance)."""
+    _alembic(scratch_url, "upgrade", CONSOLE_GRANTS)
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.begin() as db:
+            await db.execute(
+                text(
+                    "INSERT INTO users (id, google_sub, email, name, created_at) VALUES "
+                    "(1, 'sub-1', 'owner@example.com', 'Owner', now()), "
+                    "(2, 'sub-2', 'reader@example.com', 'Reader', now())"
+                )
+            )
+            document_id = (
+                await db.execute(
+                    text(
+                        "INSERT INTO documents (user_id, folder_id, job_id, kind, name, "
+                        "created_at, updated_at) VALUES (2, NULL, NULL, 'markdown', "
+                        "'notes.md', now(), now()) RETURNING id"
+                    )
+                )
+            ).scalar_one()
+            await db.execute(
+                text(
+                    "INSERT INTO conversations (user_id, document_id, title, session, model, "
+                    "created_at, updated_at) VALUES (2, :document, 'Thread', 's', 'm', "
+                    "now(), now())"
+                ),
+                {"document": document_id},
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO audit_log (actor_id, permission, action, target_type, "
+                    "target_id, before, after, ip, created_at) VALUES (1, 'users.write', "
+                    "'users.grant_credits', 'user', '2', NULL, :after, NULL, now())"
+                ),
+                {"after": '{"credits": 5}'},
+            )
+        _alembic(scratch_url, "upgrade", RUNTIME_SETTINGS)
+        async with engine.begin() as db:
+            assert await _count(db, "runtime_settings") == 0
+            assert await _count(db, "users") == 2
+            assert await _count(db, "conversations") == 1
+            assert await _count(db, "audit_log") == 1
+            index = (
+                await db.execute(
+                    text(
+                        "SELECT indexdef FROM pg_indexes WHERE indexname = 'ix_conversations_model'"
+                    )
+                )
+            ).scalar()
+            assert index is not None and "(model)" in index
+            prices = '{"z-model": {"input": 1}, "a-model": {"input": 2}}'
+            await db.execute(
+                text(
+                    "INSERT INTO runtime_settings (key, value, updated_by, updated_at) "
+                    "VALUES ('MODEL_PRICES_JSON', to_jsonb(CAST(:value AS text)), 1, now())"
+                ),
+                {"value": prices},
+            )
+            stored = (
+                await db.execute(text("SELECT value #>> '{}' FROM runtime_settings"))
+            ).scalar_one()
+            assert stored == prices
+            await db.execute(text("DELETE FROM users WHERE id = 1"))
+            row = (await db.execute(text("SELECT key, updated_by FROM runtime_settings"))).one()
+            assert tuple(row) == ("MODEL_PRICES_JSON", None)
+        _alembic(scratch_url, "downgrade", CONSOLE_GRANTS)
+        async with engine.connect() as db:
+            names = {
+                row[0]
+                for row in await db.execute(
+                    text("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
+                )
+            }
+            index = (
+                await db.execute(
+                    text("SELECT 1 FROM pg_indexes WHERE indexname = 'ix_conversations_model'")
+                )
+            ).scalar()
+            assert await _count(db, "conversations") == 1
+        assert "runtime_settings" not in names and index is None
+        _alembic(scratch_url, "upgrade", "head")
+    finally:
+        await engine.dispose()
