@@ -149,7 +149,7 @@ function jobLine(job: AdminUserDetail['jobs']['recent'][number]): string {
       <ul v-if="detail.jobs.recent.length" class="jobs">
         <li v-for="job in detail.jobs.recent" :key="job.id" class="job">
           <UiStatusDot :tone="jobTone(job.status)" :label="jobStatus(job.status)" />
-          <span class="file cell-block">{{ job.filename }}</span>
+          <span class="file" :title="job.filename">{{ job.filename }}</span>
           <span class="muted tabular">{{ jobLine(job) }}</span>
         </li>
       </ul>
@@ -288,6 +288,7 @@ function jobLine(job: AdminUserDetail['jobs']['recent'][number]): string {
 .groups {
   display: grid;
   gap: var(--space-2);
+  min-width: 0;
   margin: 0;
   padding: 0;
   list-style: none;
@@ -300,7 +301,13 @@ function jobLine(job: AdminUserDetail['jobs']['recent'][number]): string {
   font-size: var(--text-sm);
 }
 
+/* One line, whole in its tooltip: a name with no break in it would otherwise widen every
+   grid track up to the panel and run past it. */
 .file {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-weight: var(--weight-medium);
 }
 

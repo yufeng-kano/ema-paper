@@ -272,7 +272,13 @@ onMounted(refresh)
 
 /** The grant dialog, opened on credits or on days. */
 const grantKind = ref<'credits' | 'days' | null>(null)
-const groupDialog = ref(false)
+/** *Add to group*'s groups, taken as it opens and null while it is closed: a 403 that takes
+ *  `groups.write` away empties `joinable`, and the dialog must stay to say why. */
+const groupChoices = shallowRef<AdminGroup[] | null>(null)
+
+watch(chosenId, () => {
+  groupChoices.value = null
+})
 
 async function onGranted() {
   grantKind.value = null
@@ -280,7 +286,7 @@ async function onGranted() {
 }
 
 async function onAdded() {
-  groupDialog.value = false
+  groupChoices.value = null
   if (chosenId.value !== null) {
     await loadDetail(chosenId.value)
   }
@@ -406,7 +412,7 @@ async function onAdded() {
             :can-grant-days="paidPlans.length > 0"
             :can-add-to-group="canAddToGroups && joinable.length > 0"
             @grant="grantKind = $event"
-            @add-to-group="groupDialog = true"
+            @add-to-group="groupChoices = joinable"
           />
         </aside>
       </div>
@@ -423,10 +429,10 @@ async function onAdded() {
       @granted="onGranted"
     />
     <AdminAddToGroupDialog
-      v-if="groupDialog && shown && joinable.length"
+      v-if="groupChoices && shown"
       :user="shown.user"
-      :groups="joinable"
-      @close="groupDialog = false"
+      :groups="groupChoices"
+      @close="groupChoices = null"
       @added="onAdded"
     />
   </UiScreen>
