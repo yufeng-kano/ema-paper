@@ -1131,7 +1131,8 @@ async def test_the_log_is_newest_first_paged_and_filtered(make_client) -> None:
         make_client, "Member.Person@example.test", "Member Person", admin_page_size=3
     )
     ops = await _group(owner, "ops", ["audit.read"])
-    for name in ("b1", "b2", "b3"):
+    # No digit in these names: the id search below must match the id alone.
+    for name in ("ba", "bb", "bc"):
         await _group(owner, name, [])
     await _add(owner, ops["id"], user_id=member.user_id)
     # Six rows: the owner's join, four creations, one membership.
@@ -1157,7 +1158,7 @@ async def test_the_log_is_newest_first_paged_and_filtered(make_client) -> None:
         "after": {"group_id": ops["id"], "group": "ops"},
         "ip": "127.0.0.1",
     }
-    assert first["items"][1]["target_label"] == "b3"
+    assert first["items"][1]["target_label"] == "bc"
     second = (await owner.get("/api/admin/audit", params={"page": 2})).json()
     assert [item["action"] for item in second["items"]] == [
         "groups.create",
