@@ -86,6 +86,10 @@ agent-sightread/
   deploy/
     caddy/Caddyfile           # production routing + TLS
     sandbox-image/Dockerfile  # what runs inside a user's VM: uv, poppler, rg, jq, pandoc…
+    deploy.sh                 # the release, run on the server (POSIX sh): dump, fast-forward
+                              # to origin/main, build, wait for running work, swap, health
+                              # checks, rollback printed; run again, it finishes an unfinished
+                              # deploy (docs/deployment.md § Release flow)
   docs/
   docker-compose.yaml             # local full stack (pg + api + worker + web), HTTP, ports exposed
   docker-compose.production.yaml  # standalone file (-f): caddy/TLS, backups; NOT an override merge

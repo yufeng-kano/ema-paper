@@ -227,6 +227,14 @@ services:
             rm -rf "$$old"
             echo "backup: rotated out $$old"
           done
+          # The deploy script's database dumps (deploy/deploy.sh) sit beside the stamps and
+          # are kept by count; any seven days old or older goes here, a temporary an
+          # interrupted dump left included, so what a reader deleted leaves them within the
+          # same week as the stamps (docs/deployment.md).
+          find /backups -maxdepth 1 -name 'predeploy-*' -mtime +6 | while read -r old; do
+            rm -f "$$old"
+            echo "backup: deleted $$old"
+          done
           sleep 86400
         done
 

@@ -23,3 +23,4 @@
 ## Lint/format
 
 - Python: `uv run ruff check` + `ruff format --check`. TypeScript: eslint + prettier per Nuxt defaults.
+- Shell: `deploy/deploy.sh` passes `sh -n deploy/deploy.sh` and shellcheck (`uvx --from shellcheck-py shellcheck deploy/deploy.sh`), every warning fixed or its disable justified on the line. It is never tried on a server: a dry run puts stub `docker` and `curl` commands first on `PATH` in a scratch checkout whose `origin` is a local bare repository. The parts of it the suite runs are its two queries, in `tests/test_deploy_script.py` on PostgreSQL: the in-flight one against the real tables, with and without a session named `pg_dump` open, so a renamed column fails a test rather than step 5; and the worker-lock one while `try_worker_lock` holds the lock and after it is released, so a changed `WORKER_LOCK_KEY` fails a test rather than a deploy's health check.

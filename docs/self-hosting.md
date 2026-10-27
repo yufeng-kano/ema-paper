@@ -165,8 +165,14 @@ The *Redeem codes* page creates, lists and disables codes by the same rules as `
 
 ## Keep it running
 
-- **Update:** `git pull`, then the same `docker compose -f … up -d --build` you started with. A changed Caddyfile also needs `docker compose -f … restart caddy` ([deployment.md](./deployment.md) § Release flow).
-- **Back up:** the `backup` service writes the database dump, the figure crops and every workspace into `./backups/<stamp>/` once a day and keeps the newest seven. Copy them off the server, and test a restore before you rely on it ([deployment.md](./deployment.md) § Compose files).
+- **Update:** run `deploy/deploy.sh` in the checkout on the server, inside `tmux` or `screen` so that a dropped connection does not stop it. It dumps the database, fast-forwards to `origin/main` (and refuses anything else), builds, waits for running parses and chat turns to finish, swaps the containers and checks them; when a step fails it stops there and prints the commands that roll it back, and runs none of them — or, once the cause is fixed, run it again and it finishes the deploy. Give it the commit you reviewed, `deploy/deploy.sh <sha>`, and it deploys that commit or nothing. Behind a front proxy, name both compose files first, in your shell profile for instance — a `COMPOSE_FILE` line in `.env` does not count, and the script stops until this is set ([deployment.md](./deployment.md) § Release flow has the other settings, and how a checkout older than the script runs its first deploy):
+
+  ```bash
+  export DEPLOY_COMPOSE_FILES=docker-compose.production.yaml:docker-compose.only-container-network.yaml
+  ```
+
+  If it says `backups/` is not writable, Docker created that folder as root: `sudo chown $USER backups`, once. By hand, an update is `git pull`, then the same `docker compose -f … up -d --build` you started with, and `docker compose -f … restart caddy` after a Caddyfile change.
+- **Back up:** the `backup` service writes the database dump, the figure crops and every workspace into `./backups/<stamp>/` once a day and keeps the newest seven. Copy them off the server, and test a restore before you rely on it ([deployment.md](./deployment.md) § Compose files). Each deploy also leaves a dump of the database, `./backups/predeploy-*.dump`, for its rollback; the daily pass deletes those after a week.
 - **Logs:** `docker logs -f sightread-api`, and likewise `sightread-worker`, `sightread-web` and `sightread-caddy`.
 
 ## Develop
