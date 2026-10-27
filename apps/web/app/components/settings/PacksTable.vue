@@ -2,8 +2,9 @@
 /**
  * The packs a reader bought or redeemed, newest first, as the Usage section and its packs
  * dialog list them (docs/web.md § Pages, *Extra credits*): the pack — a dot, lit while it
- * still gives credits, over the day it was bought and the day it expires — what it is, a
- * top-up pack or a redeem code's credits (docs/billing.md § Redeem codes), then what it was
+ * still gives credits, over the day it came and the day it expires — what it is, a
+ * top-up pack, a redeem code's credits (docs/billing.md § Redeem codes) or an operator's
+ * grant (docs/billing.md § Operator grants), then what it was
  * granted, what was spent from it and what is left, in words for a refunded or expired one
  * (docs/billing.md § Top-up packs).
  */
@@ -22,6 +23,23 @@ const columns = computed<TableColumn<BillingPack>[]>(() => [
   { key: 'spent', header: t('usage.columnSpent'), numeric: true },
   { key: 'remaining', header: t('usage.columnLeft'), numeric: true },
 ])
+
+/** What a pack is, by where its credits came from; bought where the API does not say. */
+function packItem(pack: BillingPack): string {
+  if (pack.source === 'code') {
+    return t('usage.itemCode')
+  }
+  return pack.source === 'grant' ? t('usage.itemGrant') : t('usage.itemPack')
+}
+
+/** The day a pack came, in the words of where it came from: bought, redeemed or granted. */
+function packDate(pack: BillingPack): string {
+  const date = formatDate(pack.purchased_at, locale.value)
+  if (pack.source === 'code') {
+    return t('usage.packRedeemed', { date })
+  }
+  return pack.source === 'grant' ? t('usage.packAdded', { date }) : t('usage.packPurchased', { date })
+}
 
 /** What a pack has left — in words for one that gives nothing any more. */
 function packLeft(pack: BillingPack): string {
@@ -44,12 +62,12 @@ function packLeft(pack: BillingPack): string {
       <span class="pack">
         <span class="dot" :class="{ active: row.active }" aria-hidden="true" />
         <span class="dates">
-          <span>{{ t('usage.packPurchased', { date: formatDate(row.purchased_at, locale) }) }}</span>
+          <span>{{ packDate(row) }}</span>
           <span class="expiry">{{ t('usage.packExpires', { date: formatDate(row.expires_at, locale) }) }}</span>
         </span>
       </span>
     </template>
-    <template #cell-item="{ row }">{{ row.source === 'code' ? t('usage.itemCode') : t('usage.itemPack') }}</template>
+    <template #cell-item="{ row }">{{ packItem(row) }}</template>
     <template #cell-credits="{ row }">{{ formatCount(row.credits, locale) }}</template>
     <template #cell-spent="{ row }">{{ formatCount(row.spent, locale) }}</template>
     <template #cell-remaining="{ row }">

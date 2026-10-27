@@ -404,8 +404,9 @@ export interface BillingRates {
   chat: Record<string, ChatRate>
 }
 
-/** One top-up pack the reader bought, or a redeem code's credits (docs/billing.md § Top-up
- *  packs, § Redeem codes): `remaining` is 0 and `active` false once it is refunded or expired. */
+/** One top-up pack the reader bought, a redeem code's credits, or an operator's grant
+ *  (docs/billing.md § Top-up packs, § Redeem codes, § Operator grants): `remaining` is 0 and
+ *  `active` false once it is refunded or expired. */
 export interface BillingPack {
   id: string
   pack_id: string
@@ -416,9 +417,9 @@ export interface BillingPack {
   active: boolean
   purchased_at: string
   expires_at: string
-  /** Bought from Pay, or granted by a redeem code. Optional so a page served by an older
-   *  API still renders: bought where unset. */
-  source?: 'pay' | 'code'
+  /** Bought from Pay, granted by a redeem code, or granted by an operator in the console.
+   *  Optional so a page served by an older API still renders: bought where unset. */
+  source?: 'pay' | 'code' | 'grant'
   redemption_id?: number | null
 }
 
@@ -1663,8 +1664,97 @@ export interface AuditEntry {
   ip: string | null
 }
 
+/** One account in the console's list (docs/admin.md § Users and grants). */
+export interface AdminUser {
+  id: number
+  email: string
+  name: string | null
+  /** `free` or a configured plan's id, and what pays for the current period. */
+  plan: { id: string; source: 'subscription' | 'grant' | 'free' }
+  /** The period's and the active packs' together: what a charge is measured against. */
+  credits_available: number
+  /** Null when the workspace cannot be measured. */
+  storage_bytes: number | null
+  /** The jobs on record. */
+  jobs: number
+  created_at: string
+}
+
+/** What the grant dialog needs to know of the deployment: `credit_usd` the model cost one
+ *  credit stands for, the default validity, and the caps. */
+export interface AdminGrantFacts {
+  credit_usd: number
+  valid_days: number
+  max_credits: number
+  max_days: number
+}
+
+export interface AdminUsersResponse extends AdminList<AdminUser> {
+  /** `free` first, then the configured plans, each with how many accounts are on it now —
+   *  whatever the search and the filter say. */
+  plans: { id: string; accounts: number }[]
+  grant: AdminGrantFacts
+}
+
+/** One account's page: what it has, never what it wrote. */
+export interface AdminUserDetail {
+  user: { id: number; email: string; name: string | null; created_at: string }
+  plan: { id: string; source: 'subscription' | 'grant' | 'free'; start: string; end: string }
+  subscription: { status: string; plan_id: string; period_end: string; cancel_at_period_end: boolean } | null
+  /** `sources` always the four, by source — not the order a charge takes them, which is the
+   *  period first, then every pack by expiry; `expires_at` null for one that holds nothing. */
+  credits: {
+    available: number
+    sources: { source: 'period' | 'pay' | 'code' | 'grant'; remaining: number; expires_at: string | null }[]
+  }
+  day_bank: { plan_id: string; days_banked: number; period_start: string | null; period_end: string | null } | null
+  storage: { bytes: number; quota_bytes: number } | null
+  jobs: {
+    total: number
+    /** The five newest: the file's name, the pages and the status — no content. */
+    recent: {
+      id: string
+      filename: string
+      status: string
+      page_count: number | null
+      pages_done: number
+      created_at: string
+      finished_at: string | null
+    }[]
+  }
+  /** Null without `groups.read`. */
+  groups: { id: number; name: string; builtin: boolean }[] | null
+}
+
+/** A grant: credits as a pack, or days of a paid plan, each with the dialog's `request_id`. */
+export type AdminGrant =
+  | { kind: 'credits'; credits: number; valid_days: number; request_id: string; reason?: string }
+  | { kind: 'days'; plan: string; days: number; request_id: string; reason?: string }
+
 export function getAdminMe(): Promise<AdminMe> {
   return request('GET', '/api/admin/me')
+}
+
+/** Newest sign-up first. `plan` keeps the accounts on one plan; `q` an address or a name. */
+export function listAdminUsers(query: { page: number; plan?: string; q?: string }): Promise<AdminUsersResponse> {
+  const params = new URLSearchParams({ page: String(query.page) })
+  if (query.plan) {
+    params.set('plan', query.plan)
+  }
+  if (query.q) {
+    params.set('q', query.q)
+  }
+  return request('GET', `/api/admin/users?${params}`)
+}
+
+export function getAdminUser(id: number): Promise<AdminUserDetail> {
+  return request('GET', `/api/admin/users/${id}`)
+}
+
+/** 201 for the grant; 200, nothing added, for a `request_id` this account's grant already
+ *  has; 409 `admin_conflict` (`plan_conflict`) for days of another plan than its bank holds. */
+export function grantAdminUser(id: number, grant: AdminGrant): Promise<unknown> {
+  return request('POST', `/api/admin/users/${id}/grants`, grant)
 }
 
 export function listAdminGroups(): Promise<AdminGroupsResponse> {

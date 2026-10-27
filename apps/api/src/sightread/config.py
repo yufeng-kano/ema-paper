@@ -48,6 +48,12 @@ class Settings(BaseSettings):
     owner_emails: str = ""
     admin_reauth_hours: int = 12
     admin_page_size: int = 50
+    # A grant from the console's Users page (docs/admin.md § Users and grants): how many
+    # days granted credits are valid unless the operator picks another number, and the most
+    # one grant may give — credits, and days of a plan or of a credit grant's validity.
+    admin_grant_valid_days: int = 365
+    admin_grant_max_credits: int = 1_000_000
+    admin_grant_max_days: int = 3650
 
     # Kano Proxy, the only upstream (docs/auth.md § 3): the origin only — vision calls go
     # to `{origin}/openai/v1`, chat to `{origin}/anthropic/v1` — and the operator's own key,
@@ -361,6 +367,14 @@ class Settings(BaseSettings):
                 raise ValueError(f"{name.upper()} must be positive")
         if not 1 <= self.admin_page_size <= 500:
             raise ValueError("ADMIN_PAGE_SIZE must be between 1 and 500")
+        # A pack's `credits` is a 32-bit integer; a century of days keeps every date a grant
+        # reaches one PostgreSQL and Python can hold.
+        if not 1 <= self.admin_grant_max_credits <= 2_147_483_647:
+            raise ValueError("ADMIN_GRANT_MAX_CREDITS must be between 1 and 2147483647")
+        if not 1 <= self.admin_grant_max_days <= 36_500:
+            raise ValueError("ADMIN_GRANT_MAX_DAYS must be between 1 and 36500")
+        if not 1 <= self.admin_grant_valid_days <= self.admin_grant_max_days:
+            raise ValueError("ADMIN_GRANT_VALID_DAYS must be between 1 and ADMIN_GRANT_MAX_DAYS")
         self.redeem_code_prefix = self.redeem_code_prefix.strip().upper()
         if self.redeem_code_prefix and not self.redeem_code_prefix.isalnum():
             raise ValueError("REDEEM_CODE_PREFIX must be letters and digits only")

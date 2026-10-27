@@ -948,9 +948,10 @@ class CreditEntry(Base):
 
 
 class CreditPack(Base):
-    """A top-up pack bought on Pro, written from Pay's canonical purchase, or granted by a
-    redeem code (docs/billing.md § Top-up packs, § Redeem codes): credits valid until
-    `expires_at`, spent once the period's grant is."""
+    """A top-up pack bought on Pro, written from Pay's canonical purchase, granted by a
+    redeem code, or granted by an operator in the console (docs/billing.md § Top-up packs,
+    § Redeem codes, § Operator grants): credits valid until `expires_at`, spent once the
+    period's grant is."""
 
     __tablename__ = "credit_packs"
     __table_args__ = (
@@ -959,10 +960,11 @@ class CreditPack(Base):
         CheckConstraint("spent >= 0", name="ck_credit_packs_spent"),
         CheckConstraint("expires_at > purchased_at", name="ck_credit_packs_validity"),
         CheckConstraint("status IN ('paid', 'refunded')", name="ck_credit_packs_status"),
-        CheckConstraint("source IN ('pay', 'code')", name="ck_credit_packs_source"),
+        CheckConstraint("source IN ('pay', 'code', 'grant')", name="ck_credit_packs_source"),
     )
 
-    # Pay's purchaseId, or `redeem-<redemption id>` for a code's credits.
+    # Pay's purchaseId, `redeem-<redemption id>` for a code's credits, or
+    # `grant-<request id>` for an operator's grant.
     id: Mapped[str] = mapped_column(String(255), primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     pack_id: Mapped[str] = mapped_column(String(64))
@@ -973,8 +975,9 @@ class CreditPack(Base):
     expires_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ)
     # Pay's version (milliseconds): an update carrying an older one is ignored.
     version: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
-    # `pay`: bought, Pay's to refund; `code`: a redeem code's grant, which nothing refunds
-    # and the webhook and the refresh never touch (docs/billing.md § Redeem codes).
+    # `pay`: bought, Pay's to refund; `code`: a redeem code's grant, and `grant`: an
+    # operator's, which nothing refunds and the webhook and the refresh never touch
+    # (docs/billing.md § Redeem codes, § Operator grants).
     source: Mapped[str] = mapped_column(String(8), default="pay", server_default=text("'pay'"))
     redemption_id: Mapped[int | None] = mapped_column(
         ForeignKey("redemptions.id", ondelete="SET NULL"), unique=True, nullable=True
