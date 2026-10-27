@@ -48,6 +48,20 @@ class Settings(BaseSettings):
     owner_emails: str = ""
     admin_reauth_hours: int = 12
     admin_page_size: int = 50
+    # A grant from the console's Users page (docs/admin.md § Users and grants): how many
+    # days granted credits are valid unless the operator picks another number, and the most
+    # one grant may give — credits, and days of a plan or of a credit grant's validity.
+    admin_grant_valid_days: int = 365
+    admin_grant_max_credits: int = 1_000_000
+    admin_grant_max_days: int = 3650
+
+    # The console's jobs and usage (docs/admin.md § Overview, jobs and usage): how long the
+    # overview waits for each of Kano Proxy's and Kano Pay's catalogs, the most days one read
+    # of the usage may span — never under the Usage page's longest range, 90 days — and how
+    # many hours back the overview counts failed jobs, a year at most.
+    admin_probe_timeout_seconds: float = 5
+    admin_usage_max_days: int = 366
+    admin_failed_window_hours: int = 24
 
     # Kano Proxy, the only upstream (docs/auth.md § 3): the origin only — vision calls go
     # to `{origin}/openai/v1`, chat to `{origin}/anthropic/v1` — and the operator's own key,
@@ -108,6 +122,9 @@ class Settings(BaseSettings):
     grant_period_days: int = 30
     redeem_max_failures: int = 10
     redeem_failure_window_seconds: int = 3600
+    # The most codes one create makes, in the console and with the CLI, 1 to 10,000
+    # (docs/admin.md § Redeem codes).
+    redeem_codes_max_count: int = 1000
 
     upload_max_bytes: int = 134_217_728
     # A file of any other kind uploaded to the library, kept once in the tree
@@ -356,11 +373,31 @@ class Settings(BaseSettings):
             "redeem_max_failures",
             "redeem_failure_window_seconds",
             "admin_reauth_hours",
+            "admin_probe_timeout_seconds",
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name.upper()} must be positive")
         if not 1 <= self.admin_page_size <= 500:
             raise ValueError("ADMIN_PAGE_SIZE must be between 1 and 500")
+        # A pack's `credits` is a 32-bit integer; a century of days keeps every date a grant
+        # reaches one PostgreSQL and Python can hold.
+        if not 1 <= self.admin_grant_max_credits <= 2_147_483_647:
+            raise ValueError("ADMIN_GRANT_MAX_CREDITS must be between 1 and 2147483647")
+        if not 1 <= self.admin_grant_max_days <= 36_500:
+            raise ValueError("ADMIN_GRANT_MAX_DAYS must be between 1 and 36500")
+        if not 1 <= self.admin_grant_valid_days <= self.admin_grant_max_days:
+            raise ValueError("ADMIN_GRANT_VALID_DAYS must be between 1 and ADMIN_GRANT_MAX_DAYS")
+        # One batch is checked for taken codes in one query, a parameter per code, and the
+        # PostgreSQL driver takes at most 32,767 of them.
+        if not 1 <= self.redeem_codes_max_count <= 10_000:
+            raise ValueError("REDEEM_CODES_MAX_COUNT must be between 1 and 10000")
+        # The Usage page offers 7, 30 and 90 days; a smaller cap would refuse its own presets.
+        if self.admin_usage_max_days < 90:
+            raise ValueError("ADMIN_USAGE_MAX_DAYS must be at least 90")
+        # A year at most: a far larger window starts before the first date Python can
+        # hold, and every overview read would fail computing it.
+        if not 1 <= self.admin_failed_window_hours <= 8760:
+            raise ValueError("ADMIN_FAILED_WINDOW_HOURS must be between 1 and 8760")
         self.redeem_code_prefix = self.redeem_code_prefix.strip().upper()
         if self.redeem_code_prefix and not self.redeem_code_prefix.isalnum():
             raise ValueError("REDEEM_CODE_PREFIX must be letters and digits only")

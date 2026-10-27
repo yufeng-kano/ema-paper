@@ -404,8 +404,9 @@ export interface BillingRates {
   chat: Record<string, ChatRate>
 }
 
-/** One top-up pack the reader bought, or a redeem code's credits (docs/billing.md § Top-up
- *  packs, § Redeem codes): `remaining` is 0 and `active` false once it is refunded or expired. */
+/** One top-up pack the reader bought, a redeem code's credits, or an operator's grant
+ *  (docs/billing.md § Top-up packs, § Redeem codes, § Operator grants): `remaining` is 0 and
+ *  `active` false once it is refunded or expired. */
 export interface BillingPack {
   id: string
   pack_id: string
@@ -416,9 +417,9 @@ export interface BillingPack {
   active: boolean
   purchased_at: string
   expires_at: string
-  /** Bought from Pay, or granted by a redeem code. Optional so a page served by an older
-   *  API still renders: bought where unset. */
-  source?: 'pay' | 'code'
+  /** Bought from Pay, granted by a redeem code, or granted by an operator in the console.
+   *  Optional so a page served by an older API still renders: bought where unset. */
+  source?: 'pay' | 'code' | 'grant'
   redemption_id?: number | null
 }
 
@@ -1663,8 +1664,97 @@ export interface AuditEntry {
   ip: string | null
 }
 
+/** One account in the console's list (docs/admin.md § Users and grants). */
+export interface AdminUser {
+  id: number
+  email: string
+  name: string | null
+  /** `free` or a configured plan's id, and what pays for the current period. */
+  plan: { id: string; source: 'subscription' | 'grant' | 'free' }
+  /** The period's and the active packs' together: what a charge is measured against. */
+  credits_available: number
+  /** Null when the workspace cannot be measured. */
+  storage_bytes: number | null
+  /** The jobs on record. */
+  jobs: number
+  created_at: string
+}
+
+/** What the grant dialog needs to know of the deployment: `credit_usd` the model cost one
+ *  credit stands for, the default validity, and the caps. */
+export interface AdminGrantFacts {
+  credit_usd: number
+  valid_days: number
+  max_credits: number
+  max_days: number
+}
+
+export interface AdminUsersResponse extends AdminList<AdminUser> {
+  /** `free` first, then the configured plans, each with how many accounts are on it now —
+   *  whatever the search and the filter say. */
+  plans: { id: string; accounts: number }[]
+  grant: AdminGrantFacts
+}
+
+/** One account's page: what it has, never what it wrote. */
+export interface AdminUserDetail {
+  user: { id: number; email: string; name: string | null; created_at: string }
+  plan: { id: string; source: 'subscription' | 'grant' | 'free'; start: string; end: string }
+  subscription: { status: string; plan_id: string; period_end: string; cancel_at_period_end: boolean } | null
+  /** `sources` always the four, by source — not the order a charge takes them, which is the
+   *  period first, then every pack by expiry; `expires_at` null for one that holds nothing. */
+  credits: {
+    available: number
+    sources: { source: 'period' | 'pay' | 'code' | 'grant'; remaining: number; expires_at: string | null }[]
+  }
+  day_bank: { plan_id: string; days_banked: number; period_start: string | null; period_end: string | null } | null
+  storage: { bytes: number; quota_bytes: number } | null
+  jobs: {
+    total: number
+    /** The five newest: the file's name, the pages and the status — no content. */
+    recent: {
+      id: string
+      filename: string
+      status: string
+      page_count: number | null
+      pages_done: number
+      created_at: string
+      finished_at: string | null
+    }[]
+  }
+  /** Null without `groups.read`. */
+  groups: { id: number; name: string; builtin: boolean }[] | null
+}
+
+/** A grant: credits as a pack, or days of a paid plan, each with the dialog's `request_id`. */
+export type AdminGrant =
+  | { kind: 'credits'; credits: number; valid_days: number; request_id: string; reason?: string }
+  | { kind: 'days'; plan: string; days: number; request_id: string; reason?: string }
+
 export function getAdminMe(): Promise<AdminMe> {
   return request('GET', '/api/admin/me')
+}
+
+/** Newest sign-up first. `plan` keeps the accounts on one plan; `q` an address or a name. */
+export function listAdminUsers(query: { page: number; plan?: string; q?: string }): Promise<AdminUsersResponse> {
+  const params = new URLSearchParams({ page: String(query.page) })
+  if (query.plan) {
+    params.set('plan', query.plan)
+  }
+  if (query.q) {
+    params.set('q', query.q)
+  }
+  return request('GET', `/api/admin/users?${params}`)
+}
+
+export function getAdminUser(id: number): Promise<AdminUserDetail> {
+  return request('GET', `/api/admin/users/${id}`)
+}
+
+/** 201 for the grant; 200, nothing added, for a `request_id` this account's grant already
+ *  has; 409 `admin_conflict` (`plan_conflict`) for days of another plan than its bank holds. */
+export function grantAdminUser(id: number, grant: AdminGrant): Promise<unknown> {
+  return request('POST', `/api/admin/users/${id}/grants`, grant)
 }
 
 export function listAdminGroups(): Promise<AdminGroupsResponse> {
@@ -1718,4 +1808,223 @@ export function listAdminAudit(query: { page: number; area?: string; q?: string 
     params.set('q', query.q)
   }
   return request('GET', `/api/admin/audit?${params}`)
+}
+
+// --- operator console: redeem codes (docs/admin.md § Redeem codes) -----------------------
+
+/** What a code is now: disabled, else expired (past `redeem_by`), else used up, else plan
+ *  missing (a plan code whose plan is no longer configured), else active. */
+export type AdminCodeStatus = 'active' | 'disabled' | 'expired' | 'used_up' | 'plan_missing'
+
+/** One redeem code as the console lists it: masked — the prefix and the first group, or
+ *  none of a short code — and never whole. The fields of the other kind are null. */
+export interface AdminCode {
+  id: number
+  masked: string
+  kind: 'credits' | 'plan'
+  credits: number | null
+  valid_days: number | null
+  plan_id: string | null
+  days: number | null
+  uses: number
+  max_uses: number
+  /** The last second, UTC, it can be redeemed; null for no end. */
+  redeem_by: string | null
+  label: string
+  status: AdminCodeStatus
+  created_at: string
+  disabled_at: string | null
+  /** Who disabled it in the console; null for one disabled with the CLI, or once that
+   *  account is deleted. */
+  disabled_by: AdminPerson | null
+}
+
+/** `GET /api/admin/codes`: a page of codes, the title's figures, and what the create dialog
+ *  is drawn from — the configured plans, `REDEEM_CODES_MAX_COUNT`, the most days a code
+ *  gives, the CLI's default validity and `CREDIT_USD` as a decimal string. */
+export interface AdminCodesList extends AdminList<AdminCode> {
+  summary: { active: number; labels: number; redeemed_this_month: number }
+  create: { plans: string[]; max_count: number; max_days: number; valid_days: number; credit_usd: string }
+}
+
+/** `python -m sightread.codes create`'s fields: `kind` for `--credits` or `--plan`,
+ *  `max_uses` for `--uses`, `redeem_by` a date, `YYYY-MM-DD`. */
+export interface AdminCodesCreate {
+  kind: 'credits' | 'plan'
+  credits?: number
+  valid_days?: number
+  plan_id?: string
+  days?: number
+  count: number
+  max_uses: number
+  redeem_by?: string
+  label: string
+}
+
+/** The one answer that holds the codes in plaintext, as printed; the batch's fields as
+ *  stored. */
+export interface AdminCodesCreated {
+  codes: { id: number; code: string }[]
+  kind: 'credits' | 'plan'
+  credits: number | null
+  valid_days: number | null
+  plan_id: string | null
+  days: number | null
+  max_uses: number
+  redeem_by: string | null
+  label: string
+}
+
+/** Newest first. `status` `all` lists every code, else only those redeemable now; `q` a
+ *  label containing it, in any letter case. */
+export function listAdminCodes(query: { page: number; status?: 'all'; q?: string }): Promise<AdminCodesList> {
+  const params = new URLSearchParams({ page: String(query.page) })
+  if (query.status) {
+    params.set('status', query.status)
+  }
+  if (query.q) {
+    params.set('q', query.q)
+  }
+  return request('GET', `/api/admin/codes?${params}`)
+}
+
+/** 201 with the codes in plaintext; 422 for a batch outside the rules the CLI shares. */
+export function createAdminCodes(body: AdminCodesCreate): Promise<AdminCodesCreated> {
+  return request('POST', '/api/admin/codes', body)
+}
+
+/** The code, disabled; one already disabled as it is. */
+export function disableAdminCode(id: number): Promise<AdminCode> {
+  return request('POST', `/api/admin/codes/${id}/disable`)
+}
+
+// --- operator console: overview, jobs and usage (docs/admin.md § Overview, jobs and usage) ---
+
+/** `usage_log` summed (docs/api.md § Usage aggregates): billed `cost`, `estimated_cost` and
+ *  the calls nobody priced kept apart, never added together. */
+export interface AdminUsageFigures {
+  calls: number
+  prompt_tokens: number
+  completion_tokens: number
+  cost: number
+  estimated_cost: number
+  estimated_calls: number
+  unpriced_calls: number
+  cache_read_tokens: number
+  cache_write_tokens: number
+}
+
+/** Whether a worker runs, as the worker lock says: `since` and `generation` only while
+ *  `running` (`generation` null also before any worker took one); `unknown` off PostgreSQL. */
+export interface AdminWorker {
+  state: 'running' | 'stopped' | 'unknown'
+  since: string | null
+  generation: number | null
+}
+
+export type AdminJobStatus = 'queued' | 'running' | 'succeeded' | 'failed'
+
+/** A job as the console shows it: never its file name, prompt or pages' text. */
+export interface AdminJob {
+  id: string
+  created_at: string
+  started_at: string | null
+  finished_at: string | null
+  user_id: number
+  /** The account's address, only for a caller who also holds `users.read`. */
+  email: string | null
+  status: AdminJobStatus
+  /** The pages it selected; null while the document's page count is unknown. */
+  pages: number | null
+  pages_done: number
+  /** The retry's model when a retry named one, else the job's. */
+  model: string
+  /** A failed job's reason, in the runner's fixed phrases. */
+  error: string | null
+  worker_generation: number | null
+  /** A running job no live worker drives: what a requeue takes. */
+  stuck: boolean
+}
+
+export interface AdminJobsResponse extends AdminList<AdminJob> {
+  /** Every job on record by status, whatever the filter. */
+  counts: Record<AdminJobStatus, number>
+  worker: AdminWorker
+}
+
+/** A connection the overview checked: `message` only when `failed`, the figures only when
+ *  `ok`. */
+export interface AdminKanoProxyStatus {
+  state: 'ok' | 'unconfigured' | 'failed'
+  message: string | null
+  models: number | null
+  priced: number | null
+  parse_model: string | null
+}
+
+export interface AdminKanoPayStatus {
+  state: 'ok' | 'unconfigured' | 'failed'
+  message: string | null
+  checkout_enabled: boolean | null
+  plans: number | null
+  packs: number | null
+}
+
+export interface AdminOverviewResponse {
+  /** Today's UTC date, the day `usage` covers so far. */
+  day: string
+  accounts: number
+  jobs: {
+    queued: number
+    running: number
+    /** Null while the worker's state is unknown. */
+    stuck: number | null
+    /** The oldest queued job's `created_at`, which a retry or a requeue keeps. */
+    oldest_queued_at: string | null
+    /** Failed in the last `failed_hours`. */
+    failed: number
+    failed_hours: number
+    last_failed_at: string | null
+  }
+  worker: AdminWorker
+  usage: {
+    models: (AdminUsageFigures & { model: string })[]
+    totals: AdminUsageFigures
+  }
+  connections: { kano_proxy: AdminKanoProxyStatus; kano_pay: AdminKanoPayStatus }
+  /** The ten newest audit records, only for a caller who also holds `audit.read`. */
+  audit?: AuditEntry[]
+}
+
+export interface AdminUsageResponse {
+  from: string
+  to: string
+  /** One per UTC day and model with a call, the newest day first, then by model. */
+  rows: (AdminUsageFigures & { date: string; model: string })[]
+  totals: AdminUsageFigures
+}
+
+export function getAdminOverview(): Promise<AdminOverviewResponse> {
+  return request('GET', '/api/admin/overview')
+}
+
+/** Newest first; `status` keeps one status. */
+export function listAdminJobs(query: { page: number; status?: AdminJobStatus }): Promise<AdminJobsResponse> {
+  const params = new URLSearchParams({ page: String(query.page) })
+  if (query.status) {
+    params.set('status', query.status)
+  }
+  return request('GET', `/api/admin/jobs?${params}`)
+}
+
+/** A stuck job back in the queue; 409 `admin_conflict` (`not_running`, `not_stuck`,
+ *  `worker_unknown`) for any other, 404 for one gone. */
+export function requeueAdminJob(id: string): Promise<AdminJob> {
+  return request('POST', `/api/admin/jobs/${encodeURIComponent(id)}/requeue`)
+}
+
+/** Per UTC day and model, `from` to `to` both included (`YYYY-MM-DD`). */
+export function getAdminUsage(range: { from: string; to: string }): Promise<AdminUsageResponse> {
+  const params = new URLSearchParams({ from: range.from, to: range.to })
+  return request('GET', `/api/admin/usage?${params}`)
 }

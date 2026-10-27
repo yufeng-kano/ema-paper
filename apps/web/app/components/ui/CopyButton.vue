@@ -7,7 +7,8 @@
  *
  * `labelled` shows the word beside the glyph — for the two places the design puts Copy on
  * its own in a panel header or beside an endpoint, where an unlabelled square would be an
- * unexplained button rather than an obvious action on the value next to it.
+ * unexplained button rather than an obvious action on the value next to it. The word is
+ * `label` when one is given — *Copy all* over the console's created codes — else *Copy*.
  */
 const props = withDefaults(
   defineProps<{
@@ -15,7 +16,8 @@ const props = withDefaults(
     variant?: 'secondary' | 'ghost'
     size?: 'xs' | 'sm' | 'md'
     labelled?: boolean
-    /** The icon-only control's name, for a value its glyph alone does not say. */
+    /** The icon-only control's name, for a value its glyph alone does not say; with
+     *  `labelled`, the word shown. */
     label?: string
   }>(),
   { variant: 'ghost', size: 'md', label: undefined },
@@ -53,7 +55,7 @@ onUnmounted(() => clearTimeout(resetTimer))
       @click="copy"
     >
       <template #icon><UiIcon :name="copied ? 'check' : 'copy'" /></template>
-      <template v-if="labelled">{{ copied ? t('common.copied') : t('common.copy') }}</template>
+      <template v-if="labelled">{{ copied ? t('common.copied') : (label ?? t('common.copy')) }}</template>
     </UiButton>
     <span class="sr-only" role="status" aria-live="polite">{{ copied ? t('common.copied') : '' }}</span>
   </span>

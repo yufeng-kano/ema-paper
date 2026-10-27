@@ -46,6 +46,12 @@ const props = withDefaults(
      */
     back?: boolean
     /**
+     * No close button, and Escape and the scrim do nothing: the footer's button is the only
+     * way out — for what a stray key must not lose, the console's codes shown once
+     * (docs/admin.md § Pages, *Redeem codes*).
+     */
+    persistent?: boolean
+    /**
      * Stays over the screen's own dialogs, also those that mount after it — the settings
      * dialog, over the viewer a reload opens behind it (docs/web.md § Pages). Dialogs opened
      * from inside it still stand over it.
@@ -117,7 +123,7 @@ function onKeydown(event: KeyboardEvent) {
       return
     }
     event.stopPropagation()
-    if (!props.busy) {
+    if (!props.busy && !props.persistent) {
       emit('close')
     }
     return
@@ -178,7 +184,7 @@ onBeforeUnmount(() => {
       class="overlay"
       :class="{ full: size === 'full' }"
       :data-modal-above="above ? '' : undefined"
-      @click.self="busy || emit('close')"
+      @click.self="busy || persistent || emit('close')"
     >
       <div
         ref="panel"
@@ -210,7 +216,7 @@ onBeforeUnmount(() => {
           <div class="panel-actions">
             <slot name="actions" />
             <UiButton
-              v-if="!back"
+              v-if="!back && !persistent"
               class="panel-close"
               variant="secondary"
               size="sm"

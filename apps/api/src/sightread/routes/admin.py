@@ -9,15 +9,21 @@ a document, a note, a conversation or any other content of an account.
 
 from __future__ import annotations
 
-from typing import Annotated
+import asyncio
+import uuid
+from dataclasses import asdict
+from datetime import UTC, date, datetime, time, timedelta
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, Query, Response, status
+from fastapi import APIRouter, Body, Depends, Path, Query, Response, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from sqlalchemy import String, and_, cast, func, or_, select
+from sqlalchemy import String, and_, case, cast, distinct, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-from ..admin import groups
+from ..admin import codes as admin_codes
+from ..admin import grants, groups
+from ..admin import jobs as admin_jobs
 from ..admin.deps import (
     ConsoleSession,
     Operator,
@@ -27,13 +33,37 @@ from ..admin.deps import (
 )
 from ..admin.permissions import ALL_PERMISSIONS, AREAS, normalize
 from ..auth.deps import AppSettings, CsrfGuard, DbSession
-from ..db.models import AuditLog, Group, GroupMember, User
+from ..billing import codes, ledger
+from ..billing.plans import FREE_PLAN_ID, PAID_STATUSES
+from ..config import Settings
+from ..db.models import (
+    COST_SOURCE_ESTIMATED,
+    COST_SOURCE_OPENROUTER,
+    COST_SOURCE_UNKNOWN,
+    AuditLog,
+    Group,
+    GroupMember,
+    Job,
+    PlanGrant,
+    RedeemCode,
+    Redemption,
+    Subscription,
+    UsageLog,
+    User,
+    utcnow,
+)
 from ..errors import ApiError
+from ..jobs import queue
+from ..workspace.documents import measure_storage
+from ..workspace.layout import user_root
+from .control import usage_totals
 
 router = APIRouter(
     prefix="/api/admin", tags=["admin"], dependencies=[Depends(require_console_session)]
 )
 
+UsersReader = Annotated[Operator, Depends(require_permission("users.read"))]
+UsersWriter = Annotated[Operator, Depends(require_permission("users.write"))]
 GroupsReader = Annotated[Operator, Depends(require_permission("groups.read"))]
 GroupsWriter = Annotated[Operator, Depends(require_permission("groups.write"))]
 AuditReader = Annotated[Operator, Depends(require_permission("audit.read"))]
@@ -44,6 +74,13 @@ GROUP_NAME_MAX_CHARS = 32
 # The highest `?page=` a list takes (docs/admin.md § Routes): its offset, at the largest
 # page size, stays well inside the 64-bit integer PostgreSQL's OFFSET takes.
 PAGE_MAX = 2**31 - 1
+# The highest account id a users route takes: `users.id` is a 32-bit integer, and a larger
+# id would fail in the database instead of finding no account (docs/admin.md § Routes).
+USER_ID_MAX = 2**31 - 1
+# How many of an account's newest jobs its page lists (docs/admin.md § Users and grants).
+RECENT_JOBS = 5
+# A grant's `reason`, the operator's note (docs/admin.md § Users and grants).
+GRANT_REASON_MAX_CHARS = 200
 
 
 @router.get("/me")
@@ -56,6 +93,775 @@ async def console_me(operator: ConsoleSession, settings: AppSettings):
         "permissions": list(operator.permissions),
         "reauth_required": reauth_due(operator, settings),
         "reauth_hours": settings.admin_reauth_hours,
+    }
+
+
+# --- users and grants -----------------------------------------------------------------
+
+
+def _on_plan(settings: Settings, plan_id: str, now: datetime):
+    """The accounts whose current period at `now` is `plan_id`'s, as SQL — the period
+    decision (`plans.resolve_period`) read over every account at once: a paid
+    subscription running now on a configured plan, else the granted days of a configured
+    plan, running or waiting in the bank, else Free."""
+    configured = list(settings.plans)
+    paid = select(Subscription.user_id).where(
+        Subscription.status.in_(PAID_STATUSES),
+        Subscription.period_start <= now,
+        Subscription.period_end > now,
+        Subscription.plan_id.in_(configured),
+    )
+    granted = select(PlanGrant.user_id).where(
+        PlanGrant.plan_id.in_(configured),
+        or_(PlanGrant.period_end > now, PlanGrant.days_banked > 0),
+    )
+    if plan_id == FREE_PLAN_ID:
+        return and_(User.id.not_in(paid), User.id.not_in(granted))
+    return or_(
+        User.id.in_(paid.where(Subscription.plan_id == plan_id)),
+        and_(User.id.not_in(paid), User.id.in_(granted.where(PlanGrant.plan_id == plan_id))),
+    )
+
+
+@router.get("/users")
+async def list_users(
+    operator: UsersReader,
+    db: DbSession,
+    settings: AppSettings,
+    page: int = Query(default=1, ge=1, le=PAGE_MAX),
+    page_size: int | None = Query(default=None, ge=1),
+    q: str = "",
+    plan: str | None = None,
+):
+    """Newest sign-up first, `ADMIN_PAGE_SIZE` a page unless the query asks for fewer.
+    `q` keeps the accounts whose address or name contains it in any letter case; `plan`
+    those whose current period is that plan's. Each row's storage is measured now, one
+    after another; one that cannot be measured reads null."""
+    plan_ids = [FREE_PLAN_ID, *settings.plans]
+    if plan is not None and plan not in plan_ids:
+        raise ApiError(422, "invalid_request", f"plan: one of {', '.join(plan_ids)}")
+    size = min(page_size or settings.admin_page_size, settings.admin_page_size)
+    now = utcnow()
+    filters = []
+    needle = q.strip()
+    if needle:
+        filters.append(
+            or_(
+                User.email.icontains(needle, autoescape=True),
+                User.name.icontains(needle, autoescape=True),
+            )
+        )
+    if plan is not None:
+        filters.append(_on_plan(settings, plan, now))
+    total = await db.scalar(select(func.count()).select_from(User).where(*filters))
+    rows = list(
+        await db.scalars(
+            select(User)
+            .where(*filters)
+            .order_by(User.created_at.desc(), User.id.desc())
+            .limit(size)
+            .offset((page - 1) * size)
+        )
+    )
+    jobs = dict(
+        (
+            await db.execute(
+                select(Job.user_id, func.count())
+                .where(Job.user_id.in_([user.id for user in rows]))
+                .group_by(Job.user_id)
+            )
+        ).all()
+    )
+    items = []
+    for user in rows:
+        balance = await ledger.read_balance(db, settings, user.id, now)
+        try:
+            usage = await measure_storage(
+                db, settings, user.id, user_root(settings.workspaces_dir, user.id)
+            )
+            storage = usage.total
+        except (ApiError, OSError):
+            storage = None
+        items.append(
+            {
+                "id": user.id,
+                "email": user.email,
+                "name": user.name,
+                "plan": {"id": balance.period.plan.id, "source": balance.period.source},
+                "credits_available": balance.available,
+                "storage_bytes": storage,
+                "jobs": jobs.get(user.id, 0),
+                "created_at": user.created_at,
+            }
+        )
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": size,
+        "plans": [
+            {
+                "id": plan_id,
+                "accounts": await db.scalar(
+                    select(func.count()).select_from(User).where(_on_plan(settings, plan_id, now))
+                ),
+            }
+            for plan_id in plan_ids
+        ],
+        "grant": {
+            "credit_usd": float(settings.credit_usd),
+            "valid_days": settings.admin_grant_valid_days,
+            "max_credits": settings.admin_grant_max_credits,
+            "max_days": settings.admin_grant_max_days,
+        },
+    }
+
+
+@router.get("/users/{user_id}")
+async def get_user(
+    user_id: Annotated[int, Path(ge=1, le=USER_ID_MAX)],
+    operator: UsersReader,
+    db: DbSession,
+    settings: AppSettings,
+):
+    """What the account has, never what it wrote: no route here returns a page of a
+    result, a document, a note or a conversation."""
+    user = await db.get(User, user_id)
+    if user is None:
+        raise ApiError(404, "invalid_request", "No such account")
+    now = utcnow()
+    balance = await ledger.read_balance(db, settings, user.id, now)
+    period = balance.period
+    subscription = await db.get(Subscription, user.id)
+    # By source: the period's, then the packs bought, redeemed and granted, each with its
+    # earliest expiry among the packs that still hold credits. Not the order a charge takes
+    # them in, which is the period's first and then every pack by expiry, whatever its
+    # source (docs/billing.md § Top-up packs).
+    period_left = max(0, balance.remaining)
+    sources = [
+        {
+            "source": "period",
+            "remaining": period_left,
+            "expires_at": period.end if period_left > 0 else None,
+        }
+    ]
+    for source in (ledger.PACK_SOURCE_PAY, ledger.PACK_SOURCE_CODE, ledger.PACK_SOURCE_GRANT):
+        held = [pack for pack in balance.packs if pack.source == source and pack.remaining > 0]
+        sources.append(
+            {
+                "source": source,
+                "remaining": sum(pack.remaining for pack in held),
+                "expires_at": min((pack.expires_at for pack in held), default=None),
+            }
+        )
+    try:
+        usage = await measure_storage(
+            db, settings, user.id, user_root(settings.workspaces_dir, user.id)
+        )
+        storage = {
+            "bytes": usage.total,
+            "quota_bytes": ledger.storage_limit(settings, period.plan),
+        }
+    except (ApiError, OSError):
+        storage = None
+    # The columns the page shows, named one by one: a job's prompt, error and pages are
+    # never read here.
+    recent = (
+        await db.execute(
+            select(
+                Job.id,
+                Job.filename,
+                Job.status,
+                Job.page_count,
+                Job.pages_done,
+                Job.created_at,
+                Job.finished_at,
+            )
+            .where(Job.user_id == user.id)
+            .order_by(Job.created_at.desc(), Job.id)
+            .limit(RECENT_JOBS)
+        )
+    ).all()
+    member_of = None
+    if "groups.read" in operator.permissions:
+        member_of = [
+            {"id": group_id, "name": name, "builtin": builtin}
+            for group_id, name, builtin in (
+                await db.execute(
+                    select(Group.id, Group.name, Group.builtin)
+                    .join(GroupMember, GroupMember.group_id == Group.id)
+                    .where(GroupMember.user_id == user.id)
+                    .order_by(Group.builtin.desc(), Group.name)
+                )
+            ).all()
+        ]
+    return {
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "name": user.name,
+            "created_at": user.created_at,
+        },
+        "plan": {
+            "id": period.plan.id,
+            "source": period.source,
+            "start": period.start,
+            "end": period.end,
+        },
+        "subscription": None
+        if subscription is None
+        else {
+            "status": subscription.status,
+            "plan_id": subscription.plan_id,
+            "period_end": subscription.period_end,
+            "cancel_at_period_end": subscription.cancel_at_period_end,
+        },
+        "credits": {"available": balance.available, "sources": sources},
+        "day_bank": grants.day_bank(balance.grant),
+        "storage": storage,
+        "jobs": {
+            "total": await db.scalar(
+                select(func.count()).select_from(Job).where(Job.user_id == user.id)
+            ),
+            "recent": [
+                {
+                    "id": job.id,
+                    "filename": job.filename,
+                    "status": job.status,
+                    "page_count": job.page_count,
+                    "pages_done": job.pages_done,
+                    "created_at": job.created_at,
+                    "finished_at": job.finished_at,
+                }
+                for job in recent
+            ],
+        },
+        "groups": member_of,
+    }
+
+
+class CreditGrant(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    kind: Literal["credits"]
+    credits: int = Field(ge=1)
+    valid_days: int | None = Field(default=None, ge=1)
+    request_id: uuid.UUID
+    reason: str | None = Field(default=None, max_length=GRANT_REASON_MAX_CHARS)
+
+    @field_validator("reason")
+    @classmethod
+    def _none_when_empty(cls, value: str | None) -> str | None:
+        return value or None
+
+
+class DayGrant(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    kind: Literal["days"]
+    plan: str = Field(min_length=1)
+    days: int = Field(ge=1)
+    request_id: uuid.UUID
+    reason: str | None = Field(default=None, max_length=GRANT_REASON_MAX_CHARS)
+
+    @field_validator("reason")
+    @classmethod
+    def _none_when_empty(cls, value: str | None) -> str | None:
+        return value or None
+
+
+@router.post(
+    "/users/{user_id}/grants", dependencies=[CsrfGuard], status_code=status.HTTP_201_CREATED
+)
+async def grant_to_user(
+    user_id: Annotated[int, Path(ge=1, le=USER_ID_MAX)],
+    body: Annotated[CreditGrant | DayGrant, Body(discriminator="kind")],
+    operator: UsersWriter,
+    db: DbSession,
+    settings: AppSettings,
+    response: Response,
+):
+    """Credits or days of a paid plan, through the ledger, the grant and its record in one
+    transaction. 200, and nothing written, for a `request_id` sent again."""
+    if isinstance(body, CreditGrant):
+        if body.credits > settings.admin_grant_max_credits:
+            raise ApiError(
+                422,
+                "invalid_request",
+                f"credits: from 1 to {settings.admin_grant_max_credits}",
+            )
+        valid_days = body.valid_days or settings.admin_grant_valid_days
+        if valid_days > settings.admin_grant_max_days:
+            raise ApiError(
+                422, "invalid_request", f"valid_days: from 1 to {settings.admin_grant_max_days}"
+            )
+        pack, available, made = await grants.grant_credits(
+            db,
+            settings,
+            operator,
+            user_id,
+            credits=body.credits,
+            valid_days=valid_days,
+            request_id=body.request_id,
+            reason=body.reason,
+        )
+        await db.commit()
+        if not made:
+            response.status_code = status.HTTP_200_OK
+        return {
+            "kind": "credits",
+            "pack": {"id": pack.id, "credits": pack.credits, "expires_at": pack.expires_at},
+            "credits_available": available,
+        }
+    if body.plan not in settings.plans:
+        raise ApiError(
+            422, "invalid_request", f"plan: one of {', '.join(settings.plans) or 'none'}"
+        )
+    if body.days > settings.admin_grant_max_days:
+        raise ApiError(422, "invalid_request", f"days: from 1 to {settings.admin_grant_max_days}")
+    plan_id, days, decided, made = await grants.grant_days(
+        db,
+        settings,
+        operator,
+        user_id,
+        plan_id=body.plan,
+        days=body.days,
+        request_id=body.request_id,
+        reason=body.reason,
+    )
+    await db.commit()
+    if not made:
+        response.status_code = status.HTTP_200_OK
+    return {
+        "kind": "days",
+        "plan": plan_id,
+        "days": days,
+        "day_bank": grants.day_bank(decided.grant),
+        "period": grants.period_summary(decided.period),
+    }
+
+
+# --- redeem codes ---------------------------------------------------------------------
+
+CodesReader = Annotated[Operator, Depends(require_permission("codes.read"))]
+CodesWriter = Annotated[Operator, Depends(require_permission("codes.write"))]
+JobsReader = Annotated[Operator, Depends(require_permission("jobs.read"))]
+JobsWriter = Annotated[Operator, Depends(require_permission("jobs.write"))]
+
+
+async def _code_payloads(
+    db: AsyncSession, settings: Settings, rows: list[RedeemCode]
+) -> list[dict]:
+    """`<code>`: masked — the plaintext is the create answer's alone — with its status now
+    and who disabled it, the actor of its newest `codes.disable` record (null for a code
+    disabled with the CLI, which records nothing, and for a deleted account)."""
+    now = utcnow()
+    disabled = [str(row.id) for row in rows if row.disabled_at is not None]
+    newest = (
+        select(AuditLog.target_id, func.max(AuditLog.id).label("id"))
+        .where(
+            AuditLog.target_type == "code",
+            AuditLog.target_id.in_(disabled),
+            AuditLog.action == "codes.disable",
+        )
+        .group_by(AuditLog.target_id)
+        .subquery()
+    )
+    disablers = {
+        int(target_id): {"id": user_id, "name": name}
+        for target_id, user_id, name in (
+            await db.execute(
+                select(newest.c.target_id, User.id, User.name)
+                .select_from(newest)
+                .join(AuditLog, AuditLog.id == newest.c.id)
+                .join(User, User.id == AuditLog.actor_id)
+            )
+        ).all()
+    }
+    return [
+        {
+            "id": row.id,
+            "masked": codes.mask(row.code, settings.redeem_code_prefix),
+            "kind": row.kind,
+            "credits": row.credits,
+            "valid_days": row.valid_days,
+            "plan_id": row.plan_id,
+            "days": row.days,
+            "uses": row.uses,
+            "max_uses": row.max_uses,
+            "redeem_by": row.redeem_by,
+            "label": row.label,
+            "status": codes.status(row, now, settings.plans),
+            "created_at": row.created_at,
+            "disabled_at": row.disabled_at,
+            "disabled_by": disablers.get(row.id),
+        }
+        for row in rows
+    ]
+
+
+@router.get("/codes")
+async def list_codes(
+    operator: CodesReader,
+    db: DbSession,
+    settings: AppSettings,
+    page: int = Query(default=1, ge=1, le=PAGE_MAX),
+    page_size: int | None = Query(default=None, ge=1),
+    status_filter: str = Query(default="active", alias="status"),
+    q: str = "",
+):
+    """Newest first, `ADMIN_PAGE_SIZE` a page unless the query asks for fewer. `status`
+    `active` keeps the codes redeemable now, `all` every one; `q` a label containing it in
+    any letter case — never the code, which a search would give away a character at a
+    time. Beside the page, the title's figures and what the create dialog is drawn from."""
+    if status_filter not in ("active", "all"):
+        raise ApiError(422, "invalid_request", "status: one of active, all")
+    size = min(page_size or settings.admin_page_size, settings.admin_page_size)
+    now = utcnow()
+    active = codes.is_active(now, settings.plans)
+    filters = []
+    if status_filter == "active":
+        filters.append(active)
+    needle = q.strip()
+    if needle:
+        filters.append(RedeemCode.label.icontains(needle, autoescape=True))
+    total = await db.scalar(select(func.count()).select_from(RedeemCode).where(*filters))
+    rows = list(
+        await db.scalars(
+            select(RedeemCode)
+            .where(*filters)
+            .order_by(RedeemCode.id.desc())
+            .limit(size)
+            .offset((page - 1) * size)
+        )
+    )
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return {
+        "items": await _code_payloads(db, settings, rows),
+        "total": total,
+        "page": page,
+        "page_size": size,
+        "summary": {
+            "active": await db.scalar(select(func.count()).select_from(RedeemCode).where(active)),
+            "labels": await db.scalar(
+                select(func.count(distinct(RedeemCode.label))).where(active, RedeemCode.label != "")
+            ),
+            "redeemed_this_month": await db.scalar(
+                select(func.count())
+                .select_from(Redemption)
+                .where(Redemption.redeemed_at >= month_start)
+            ),
+        },
+        "create": {
+            "plans": list(settings.plans),
+            "max_count": settings.redeem_codes_max_count,
+            "max_days": codes.MAX_DAYS,
+            "valid_days": codes.DEFAULT_VALID_DAYS,
+            "credit_usd": str(settings.credit_usd),
+        },
+    }
+
+
+class CodesCreate(BaseModel):
+    """`python -m sightread.codes create`'s fields: `kind` for `--credits` or `--plan`,
+    `max_uses` for `--uses`, `redeem_by` a date. Their rules are `create_codes`', which the
+    CLI shares (docs/admin.md § Redeem codes)."""
+
+    kind: str
+    credits: int | None = None
+    valid_days: int = codes.DEFAULT_VALID_DAYS
+    plan_id: str | None = None
+    days: int | None = None
+    count: int = 1
+    max_uses: int = 1
+    redeem_by: date | None = None
+    label: str = ""
+
+
+@router.post("/codes", dependencies=[CsrfGuard], status_code=status.HTTP_201_CREATED)
+async def create_codes(
+    body: CodesCreate, operator: CodesWriter, db: DbSession, settings: AppSettings
+):
+    """The one answer that holds the codes in plaintext, as printed."""
+    rows = await admin_codes.create_codes(
+        db,
+        operator,
+        settings,
+        kind=body.kind,
+        count=body.count,
+        max_uses=body.max_uses,
+        redeem_by=None if body.redeem_by is None else codes.end_of_utc_day(body.redeem_by),
+        label=body.label,
+        credits=body.credits,
+        valid_days=body.valid_days,
+        plan_id=body.plan_id,
+        days=body.days,
+    )
+    await db.commit()
+    first = rows[0]
+    return {
+        "codes": [
+            {"id": row.id, "code": codes.display(row.code, settings.redeem_code_prefix)}
+            for row in rows
+        ],
+        "kind": first.kind,
+        "credits": first.credits,
+        "valid_days": first.valid_days,
+        "plan_id": first.plan_id,
+        "days": first.days,
+        "max_uses": first.max_uses,
+        "redeem_by": first.redeem_by,
+        "label": first.label,
+    }
+
+
+@router.post("/codes/{code_id}/disable", dependencies=[CsrfGuard])
+async def disable_code(code_id: int, operator: CodesWriter, db: DbSession, settings: AppSettings):
+    """The code, disabled; one already disabled as it is, nothing recorded."""
+    row = await admin_codes.disable_code(db, operator, code_id)
+    await db.commit()
+    return (await _code_payloads(db, settings, [row]))[0]
+
+
+# --- overview, jobs and usage --------------------------------------------------------
+
+JobsReader = Annotated[Operator, Depends(require_permission("jobs.read"))]
+JobsWriter = Annotated[Operator, Depends(require_permission("jobs.write"))]
+
+JOB_STATUSES = ("queued", "running", "succeeded", "failed")
+# The newest audit records the overview shows, to a caller who holds `audit.read`: the audit
+# list's first page, so `ADMIN_PAGE_SIZE` caps them as it caps every console read.
+OVERVIEW_AUDIT_RECORDS = 10
+
+# `usage_log` summed as `usage_totals` reads it (docs/api.md § Usage aggregates): billed,
+# estimated and unpriced cost kept apart — an estimate is never added to a billed amount,
+# and a call nobody priced is counted, never priced at 0.
+USAGE_FIGURES = (
+    func.count(),
+    func.sum(UsageLog.prompt_tokens),
+    func.sum(UsageLog.completion_tokens),
+    func.sum(case((UsageLog.cost_source == COST_SOURCE_OPENROUTER, UsageLog.cost))),
+    func.sum(case((UsageLog.cost_source == COST_SOURCE_ESTIMATED, UsageLog.cost))),
+    func.count(case((UsageLog.cost_source == COST_SOURCE_ESTIMATED, 1))),
+    func.count(case((UsageLog.cost_source == COST_SOURCE_UNKNOWN, 1))),
+    func.sum(UsageLog.cache_read_tokens),
+    func.sum(UsageLog.cache_write_tokens),
+)
+
+
+def _job_payload(job: Job, email: str | None, worker: queue.WorkerStatus) -> dict:
+    """`<job>`: when, whose, how far, on what model, how it ended and why — the runner's
+    fixed phrases, never the document — and whether a requeue would take it. Never the
+    file's name, the prompt or a page's text."""
+    # `page_count` is the document's; `pages_spec` picks among them ("" is all). A spec the
+    # document cannot satisfy — a job the runner fails for it — counts no pages.
+    try:
+        pages = (
+            None
+            if job.page_count is None
+            else len(queue.parse_pages_spec(job.pages_spec, job.page_count))
+        )
+    except ValueError:
+        pages = None
+    return {
+        "id": job.id,
+        "created_at": job.created_at,
+        "started_at": job.started_at,
+        "finished_at": job.finished_at,
+        "user_id": job.user_id,
+        "email": email,
+        "status": job.status,
+        "pages": pages,
+        "pages_done": job.pages_done,
+        "model": job.retry_model or job.model,
+        "error": job.error,
+        "worker_generation": job.worker_generation,
+        "stuck": queue.job_is_stuck(job, worker),
+    }
+
+
+@router.get("/overview")
+async def overview(operator: JobsReader, db: DbSession, settings: AppSettings):
+    """What the deployment is doing (docs/admin.md § Overview, jobs and usage): the jobs
+    waiting, running and lately failed, the worker, today's usage (the UTC day so far), the
+    accounts, Kano Proxy and Kano Pay — and the newest audit records, only for a caller
+    who also holds `audit.read`."""
+    now = utcnow()
+    window = settings.admin_failed_window_hours
+    today = datetime.combine(now.date(), time.min, UTC)
+    # The oldest queued job's `created_at`: its age, which a reader's retry and a requeue
+    # keep, not how long it has waited this time (docs/admin.md).
+    queued, oldest_queued = (
+        await db.execute(
+            select(func.count(), func.min(Job.created_at)).where(Job.status == "queued")
+        )
+    ).one()
+    running = list(await db.scalars(select(Job).where(Job.status == "running")))
+    failed, last_failed = (
+        await db.execute(
+            select(func.count(), func.max(Job.finished_at)).where(
+                Job.status == "failed",
+                Job.finished_at >= now - timedelta(hours=window),
+            )
+        )
+    ).one()
+    worker = await queue.worker_status(db)
+    models = (
+        await db.execute(
+            select(UsageLog.model, *USAGE_FIGURES)
+            .where(UsageLog.created_at >= today)
+            .group_by(UsageLog.model)
+            .order_by(UsageLog.model)
+        )
+    ).all()
+    totals = (await db.execute(select(*USAGE_FIGURES).where(UsageLog.created_at >= today))).one()
+    accounts = await db.scalar(select(func.count()).select_from(User))
+    newest = None
+    if "audit.read" in operator.permissions:
+        newest = await list_audit(
+            operator,
+            db,
+            settings,
+            page=1,
+            page_size=OVERVIEW_AUDIT_RECORDS,
+            area=None,
+            q="",
+        )
+    # Unknown off PostgreSQL, where no lock says whether a worker runs.
+    stuck = None
+    if worker.state != "unknown":
+        stuck = sum(queue.job_is_stuck(job, worker) for job in running)
+    # Every database read is done, so one that failed has answered without asking a catalog;
+    # and the session's connection goes back to the pool before the probes, so a slow
+    # upstream holds none. The two run together, each bounded by ADMIN_PROBE_TIMEOUT_SECONDS
+    # and answering its own failure, never raising.
+    await db.close()
+    kano_proxy, kano_pay = await asyncio.gather(
+        admin_jobs.kano_proxy_status(settings), admin_jobs.kano_pay_status(settings)
+    )
+    answer = {
+        "day": now.date(),
+        "accounts": accounts,
+        "jobs": {
+            "queued": queued,
+            "running": len(running),
+            "stuck": stuck,
+            "oldest_queued_at": oldest_queued,
+            "failed": failed,
+            "failed_hours": window,
+            "last_failed_at": last_failed,
+        },
+        "worker": asdict(worker),
+        "usage": {
+            "models": [{"model": row[0], **usage_totals(row[1:])} for row in models],
+            "totals": usage_totals(totals),
+        },
+        "connections": {"kano_proxy": kano_proxy, "kano_pay": kano_pay},
+    }
+    if newest is not None:
+        answer["audit"] = newest["items"]
+    return answer
+
+
+@router.get("/jobs")
+async def list_jobs(
+    operator: JobsReader,
+    db: DbSession,
+    settings: AppSettings,
+    page: int = Query(default=1, ge=1, le=PAGE_MAX),
+    page_size: int | None = Query(default=None, ge=1),
+    status_filter: str | None = Query(default=None, alias="status"),
+):
+    """The jobs on record, newest first, `ADMIN_PAGE_SIZE` a page unless the query asks for
+    fewer; `status` keeps one status. Beside the page, every status's count and the
+    worker's state. The account's address only to a caller who also holds `users.read`."""
+    if status_filter is not None and status_filter not in JOB_STATUSES:
+        raise ApiError(422, "invalid_request", f"status: one of {', '.join(JOB_STATUSES)}")
+    size = min(page_size or settings.admin_page_size, settings.admin_page_size)
+    filters = [] if status_filter is None else [Job.status == status_filter]
+    total = await db.scalar(select(func.count()).select_from(Job).where(*filters))
+    rows = (
+        await db.execute(
+            select(Job, User.email)
+            .join(User, User.id == Job.user_id)
+            .where(*filters)
+            .order_by(Job.created_at.desc(), Job.id.desc())
+            .limit(size)
+            .offset((page - 1) * size)
+        )
+    ).all()
+    counts = dict((await db.execute(select(Job.status, func.count()).group_by(Job.status))).all())
+    worker = await queue.worker_status(db)
+    # An account's address is the users area's to show; without it the page names the id.
+    emails = "users.read" in operator.permissions
+    return {
+        "items": [_job_payload(job, email if emails else None, worker) for job, email in rows],
+        "total": total,
+        "page": page,
+        "page_size": size,
+        "counts": {job_status: counts.get(job_status, 0) for job_status in JOB_STATUSES},
+        "worker": asdict(worker),
+    }
+
+
+@router.post("/jobs/{job_id}/requeue", dependencies=[CsrfGuard])
+async def requeue_stuck_job(
+    job_id: uuid.UUID, operator: JobsWriter, db: DbSession, settings: AppSettings
+):
+    """A stuck job back in the queue, with its audit row in the same commit; anything
+    else 404 or 409 `admin_conflict` (docs/admin.md § Overview, jobs and usage)."""
+    job = await admin_jobs.requeue(db, settings, operator, job_id)
+    await db.commit()
+    email = (
+        await db.scalar(select(User.email).where(User.id == job.user_id))
+        if "users.read" in operator.permissions
+        else None
+    )
+    return _job_payload(job, email, await queue.worker_status(db))
+
+
+@router.get("/usage")
+async def usage(
+    operator: JobsReader,
+    db: DbSession,
+    settings: AppSettings,
+    first: Annotated[date, Query(alias="from")],
+    last: Annotated[date, Query(alias="to")],
+):
+    """`usage_log` per UTC day and model from `from` to `to`, both included, the newest
+    day first, with the range's totals — every account's calls, of every agent."""
+    if first > last:
+        raise ApiError(422, "invalid_request", "from: a date no later than to")
+    if (last - first).days + 1 > settings.admin_usage_max_days:
+        raise ApiError(
+            422,
+            "invalid_request",
+            f"The range spans more than {settings.admin_usage_max_days} days",
+        )
+    # Aware UTC bounds (the column refuses naive ones); the database session is pinned to
+    # UTC, so `date()` is the UTC day on PostgreSQL and SQLite alike.
+    window = (
+        UsageLog.created_at >= datetime.combine(first, time.min, UTC),
+        UsageLog.created_at <= datetime.combine(last, time.max, UTC),
+    )
+    day = func.date(UsageLog.created_at)
+    rows = (
+        await db.execute(
+            select(day, UsageLog.model, *USAGE_FIGURES)
+            .where(*window)
+            .group_by(day, UsageLog.model)
+            .order_by(day.desc(), UsageLog.model)
+        )
+    ).all()
+    totals = (await db.execute(select(*USAGE_FIGURES).where(*window))).one()
+    return {
+        "from": first,
+        "to": last,
+        # PostgreSQL answers a date, SQLite a string.
+        "rows": [
+            {"date": str(row[0])[:10], "model": row[1], **usage_totals(row[2:])} for row in rows
+        ],
+        "totals": usage_totals(totals),
     }
 
 

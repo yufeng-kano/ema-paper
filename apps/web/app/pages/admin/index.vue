@@ -1,16 +1,14 @@
 <script setup lang="ts">
 /**
- * `/admin` (docs/admin.md § Pages): never shown itself — the `admin` middleware replaces it
- * with the first console page the account can read, or the Not Found page when it can read
- * none. Until the console has an overview of its own, this is only that hop — or, when the
- * console's own read failed, *Couldn't open the admin console*, whose *Retry* makes it again.
+ * `/admin` (docs/admin.md § Pages): the console's *Overview*, `jobs.read` — the first entry of
+ * the nav. The `admin` middleware sends an account without `jobs.read` on to the first console
+ * page it can read, or to the Not Found page when it can read none.
  */
-definePageMeta({ middleware: ['authed', 'admin'] })
-
-const { unavailable } = useAdminConsole()
+definePageMeta({ middleware: ['authed', 'admin'], adminArea: 'jobs' })
 </script>
 
 <template>
-  <AdminUnavailable v-if="unavailable" />
-  <div v-else />
+  <AdminPage area="jobs">
+    <AdminOverview />
+  </AdminPage>
 </template>

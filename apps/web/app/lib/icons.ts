@@ -99,3 +99,6 @@ export type IconName =
   | 'shield'
   | 'users-round'
   | 'scroll-text'
+  | 'ticket'
+  | 'layout-grid'
+  | 'list-checks'

@@ -19,7 +19,7 @@ def record(
     permission: str | None,
     action: str,
     target_type: str,
-    target_id: int,
+    target_id: int | str,
     before: dict | None,
     after: dict | None,
     ip: str | None,

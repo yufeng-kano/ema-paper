@@ -2084,3 +2084,62 @@ async def test_the_operator_console_migration_seeds_the_owner_group_and_touches_
         assert {"users", "sessions", "redeem_codes"} <= names
     finally:
         await engine.dispose()
+
+
+CONSOLE_GRANTS = "d632652e713f"
+
+
+async def test_the_console_grants_migration_widens_the_pack_source_and_keeps_every_pack(
+    scratch_url,
+) -> None:
+    """Over a bought and a redeemed pack, which it leaves as they are, the check on
+    `credit_packs.source` takes `grant` too and still nothing else; the downgrade refuses
+    while a granted pack exists, and narrows the check once none does (docs/database.md
+    § Rules, docs/admin.md § Acceptance)."""
+    _alembic(scratch_url, "upgrade", OPERATOR_CONSOLE)
+    engine = create_async_engine(scratch_url)
+    pack = (
+        "INSERT INTO credit_packs (id, user_id, pack_id, credits, spent, status, "
+        "purchased_at, expires_at, version, source, created_at, updated_at) VALUES "
+        "(:id, 1, :pack, 5, 0, 'paid', now(), now() + interval '1 year', 0, :source, "
+        "now(), now())"
+    )
+    try:
+        async with engine.begin() as db:
+            await db.execute(
+                text(
+                    "INSERT INTO users (id, google_sub, email, created_at) "
+                    "VALUES (1, 'sub-1', 'a@example.com', now())"
+                )
+            )
+            await db.execute(text(pack), {"id": "pur_1", "pack": "credits", "source": "pay"})
+            await db.execute(text(pack), {"id": "redeem-1", "pack": "code", "source": "code"})
+        # Refused before the upgrade.
+        async with engine.connect() as db:
+            with pytest.raises(IntegrityError):
+                await db.execute(text(pack), {"id": "grant-a", "pack": "grant", "source": "grant"})
+        _alembic(scratch_url, "upgrade", CONSOLE_GRANTS)
+        async with engine.begin() as db:
+            rows = (await db.execute(text("SELECT id, source FROM credit_packs ORDER BY id"))).all()
+            assert [tuple(row) for row in rows] == [("pur_1", "pay"), ("redeem-1", "code")]
+            await db.execute(text(pack), {"id": "grant-a", "pack": "grant", "source": "grant"})
+        async with engine.connect() as db:
+            with pytest.raises(IntegrityError):
+                await db.execute(text(pack), {"id": "gift-a", "pack": "gift", "source": "gift"})
+
+        with pytest.raises(subprocess.CalledProcessError) as refused:
+            _alembic(scratch_url, "downgrade", OPERATOR_CONSOLE)
+        assert b"1 credit pack(s) were granted from the operator console" in refused.value.stderr
+        async with engine.begin() as db:
+            version = (await db.execute(text("SELECT version_num FROM alembic_version"))).scalar()
+            assert version == CONSOLE_GRANTS
+            assert await _count(db, "credit_packs") == 3
+            await db.execute(text("DELETE FROM credit_packs WHERE source = 'grant'"))
+        _alembic(scratch_url, "downgrade", OPERATOR_CONSOLE)
+        async with engine.connect() as db:
+            assert await _count(db, "credit_packs") == 2
+            with pytest.raises(IntegrityError):
+                await db.execute(text(pack), {"id": "grant-b", "pack": "grant", "source": "grant"})
+        _alembic(scratch_url, "upgrade", "head")
+    finally:
+        await engine.dispose()

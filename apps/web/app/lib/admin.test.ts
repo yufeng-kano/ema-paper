@@ -5,6 +5,7 @@ import {
   ADMIN_AREAS,
   AUDIT_FILTER_AREAS,
   CONSOLE_PAGES,
+  addDays,
   adminFailure,
   areaOf,
   auditAreaOf,
@@ -14,15 +15,33 @@ import {
   canRenameGroup,
   canToggle,
   changedPermissions,
+  CODE_CLOSING_DAYS,
+  CODES_CSV_COLUMNS,
+  codesCsv,
   conflictKey,
   consoleDestination,
+  costDays,
+  dayOf,
+  daysOf,
+  daysUntil,
   firstReadableArea,
+  formatElapsed,
+  formatRedeemBy,
+  formatUsd,
+  formatUtcDay,
+  grantNumber,
   idOf,
   isGroupName,
+  jobStatusOf,
   navEntries,
   pageOf,
   PAGE_MAX,
+  presetOf,
+  presetRange,
+  requeueRefusalKey,
   toggledPermissions,
+  usageRangeOf,
+  utcDay,
   visibleAreas,
 } from './admin'
 import { ApiRequestError } from './api'
@@ -66,13 +85,22 @@ describe('what a permission list shows', () => {
   })
 
   it("lists only the console pages whose area it can read, in nav order", () => {
-    expect(navEntries(ALL).map((page) => page.area)).toEqual(['groups', 'audit'])
+    expect(navEntries(ALL).map((page) => page.path)).toEqual([
+      '/admin',
+      '/admin/users',
+      '/admin/codes',
+      '/admin/jobs',
+      '/admin/usage',
+      '/admin/groups',
+      '/admin/audit',
+    ])
     expect(navEntries(['audit.read']).map((page) => page.path)).toEqual(['/admin/audit'])
-    expect(navEntries(['codes.read', 'jobs.read'])).toEqual([])
+    expect(navEntries(['users.read', 'users.write']).map((page) => page.path)).toEqual(['/admin/users'])
+    expect(navEntries(['codes.read']).map((page) => page.path)).toEqual(['/admin/codes'])
   })
 
   it('sends /admin to the first page it can read', () => {
-    expect(firstReadableArea(ALL)?.path).toBe('/admin/groups')
+    expect(firstReadableArea(ALL)?.path).toBe('/admin')
     expect(firstReadableArea(['audit.read'])?.path).toBe('/admin/audit')
     expect(consoleDestination(['audit.read', 'groups.read'], null)).toBe('/admin/groups')
   })
@@ -82,7 +110,23 @@ describe('what a permission list shows', () => {
     expect(consoleDestination(['audit.read'], 'groups')).toBe('/admin/audit')
     // An account in no group, and one whose areas' pages come in later steps.
     expect(consoleDestination([], null)).toBeNull()
-    expect(consoleDestination(['codes.read', 'users.write'], 'groups')).toBeNull()
+    expect(consoleDestination(['users.write', 'settings.read'], 'groups')).toBeNull()
+    expect(consoleDestination(['codes.read', 'users.write'], 'groups')).toBe('/admin/codes')
+  })
+
+  it('opens /admin as the Overview with jobs.read, and sends anyone else on from it', () => {
+    // `/admin` is a `jobs` page: the middleware leaves it while `jobs.read` is held.
+    expect(consoleDestination(['jobs.read'], 'jobs')).toBe('/admin')
+    expect(consoleDestination(['jobs.read', 'groups.read'], 'groups')).toBe('/admin/groups')
+    // Without it, to the first page that can be read — never back to `/admin`.
+    expect(consoleDestination(['groups.read', 'audit.read'], 'jobs')).toBe('/admin/groups')
+    expect(consoleDestination(['jobs.write'], 'jobs')).toBeNull()
+    // Overview, Jobs and Usage come before Groups, `jobs.read` alone showing all three.
+    expect(navEntries(['jobs.read']).map((page) => [page.path, page.icon])).toEqual([
+      ['/admin', 'layout-grid'],
+      ['/admin/jobs', 'list-checks'],
+      ['/admin/usage', 'dashboard'],
+    ])
   })
 
   it("reads a page's area meta, and nothing else", () => {
@@ -200,6 +244,20 @@ describe('the route query', () => {
   })
 })
 
+describe("a grant's numbers", () => {
+  it('takes a whole number from 1 to the cap, typed with spaces around it', () => {
+    expect(grantNumber('500', 1000)).toBe(500)
+    expect(grantNumber(' 1000 ', 1000)).toBe(1000)
+    expect(grantNumber('1', 1)).toBe(1)
+  })
+
+  it('refuses nothing, zero, a fraction, a sign, an exponent and anything past the cap', () => {
+    for (const typed of ['', ' ', '0', '1.5', '-3', '+3', '1e3', '12a', '1001', '99999999999999999999']) {
+      expect(grantNumber(typed, 1000)).toBeNull()
+    }
+  })
+})
+
 describe('a failed console request', () => {
   const failed = (status: number, type: ConstructorParameters<typeof ApiRequestError>[1], details = {}) =>
     adminFailure(new ApiRequestError(status, type, 'message', details))
@@ -224,6 +282,64 @@ describe('a failed console request', () => {
     expect(conflictKey('name_taken')).toBe('admin.conflicts.name_taken')
     expect(conflictKey('something_new')).toBeNull()
     expect(conflictKey(null)).toBeNull()
+  })
+})
+
+describe('the created codes', () => {
+  const created = {
+    codes: [
+      { id: 7, code: 'EMA-AAAA-BBBB-CCCC' },
+      { id: 8, code: 'EMA-DDDD-EEEE-FFFF' },
+    ],
+    kind: 'credits' as const,
+    credits: 500,
+    valid_days: 365,
+    plan_id: null,
+    days: null,
+    max_uses: 1,
+    redeem_by: '2026-12-31T23:59:59+00:00',
+    label: 'Launch, "VIP"',
+  }
+
+  it('writes a CSV a spreadsheet opens: BOM, a header, a CRLF row per code', () => {
+    const csv = codesCsv(created)
+    expect(csv.startsWith('\uFEFF')).toBe(true)
+    expect(csv.slice(1).split('\r\n')).toEqual([
+      CODES_CSV_COLUMNS.join(','),
+      'EMA-AAAA-BBBB-CCCC,credits,500,365,,,1,2026-12-31,"Launch, ""VIP"""',
+      'EMA-DDDD-EEEE-FFFF,credits,500,365,,,1,2026-12-31,"Launch, ""VIP"""',
+      '',
+    ])
+  })
+
+  it("leaves the other kind's fields and a missing date empty, and quotes a line break", () => {
+    const plan = {
+      ...created,
+      codes: [{ id: 9, code: 'EMA-GGGG-HHHH-JJJJ' }],
+      kind: 'plan' as const,
+      credits: null,
+      valid_days: null,
+      plan_id: 'pro',
+      days: 30,
+      max_uses: 5,
+      redeem_by: null,
+      label: 'two\nlines',
+    }
+    expect(codesCsv(plan).split('\r\n')[1]).toBe('EMA-GGGG-HHHH-JJJJ,plan,,,pro,30,5,,"two\nlines"')
+  })
+})
+
+describe("a code's last day", () => {
+  it('prints the UTC day it counts to the end of, wherever the reader is', () => {
+    expect(formatRedeemBy('2026-12-31T23:59:59+00:00', 'en')).toBe('Dec 31, 2026')
+  })
+
+  it('counts whole UTC days to it, 0 on the day itself', () => {
+    const end = '2026-11-03T23:59:59+00:00'
+    expect(daysUntil(end, new Date('2026-11-03T00:00:01Z'))).toBe(0)
+    expect(daysUntil(end, new Date('2026-11-02T23:59:59Z'))).toBe(1)
+    expect(daysUntil(end, new Date('2026-10-27T12:00:00Z'))).toBe(CODE_CLOSING_DAYS)
+    expect(daysUntil(end, new Date('2026-11-04T00:00:00Z'))).toBe(-1)
   })
 })
 
@@ -266,5 +382,111 @@ describe('the console catalog', () => {
       .join('')
     // Simplified forms of characters this copy uses: 后台组权限录删设户证 …
     expect(text).not.toMatch(/[后组权录删设户证们这个时为对应开关们]/)
+  })
+})
+
+describe('jobs and usage', () => {
+  it('reads a job status from the query, or all', () => {
+    expect(jobStatusOf('running')).toBe('running')
+    expect(jobStatusOf('succeeded')).toBe('succeeded')
+    for (const value of ['cancelled', '', undefined, ['failed']]) {
+      expect(jobStatusOf(value)).toBeNull()
+    }
+  })
+
+  it("words a requeue's refusals it knows, and leaves the rest to the server", () => {
+    expect(requeueRefusalKey('not_stuck')).toBe('admin.jobs.refusals.not_stuck')
+    expect(requeueRefusalKey('name_taken')).toBeNull()
+    expect(requeueRefusalKey(null)).toBeNull()
+  })
+
+  it('says how long in its largest whole unit', () => {
+    expect(formatElapsed(42_000, 'en')).toBe('42 sec')
+    expect(formatElapsed(4 * 60_000 + 59_000, 'en')).toBe('4 min')
+    expect(formatElapsed(47 * 3_600_000, 'en')).toBe('47 hr')
+    expect(formatElapsed(49 * 3_600_000, 'en')).toBe('2 days')
+    expect(formatElapsed(-5_000, 'en')).toBe('0 sec')
+  })
+
+  it('writes a cost in dollars, an amount under a cent with four decimals', () => {
+    expect(formatUsd(4.123, 'en')).toBe('$4.12')
+    expect(formatUsd(0, 'en')).toBe('$0.00')
+    expect(formatUsd(0.0042, 'en')).toBe('$0.0042')
+    expect(formatUsd(0.05, 'en')).toBe('$0.05')
+  })
+
+  it('reads a UTC day, and only a real one', () => {
+    expect(utcDay(new Date('2026-03-14T23:59:30Z'))).toBe('2026-03-14')
+    expect(utcDay(new Date('2026-03-15T00:00:30+01:00'))).toBe('2026-03-14')
+    expect(dayOf('2026-02-28')).toBe('2026-02-28')
+    for (const value of ['2026-02-30', '2026-13-01', '2026-3-1', '', undefined, ['2026-03-01']]) {
+      expect(dayOf(value)).toBeNull()
+    }
+  })
+
+  it('counts the presets in UTC days up to today, across a month and a leap day', () => {
+    expect(addDays('2028-03-01', -1)).toBe('2028-02-29')
+    expect(presetRange(7, '2026-03-03')).toEqual({ from: '2026-02-25', to: '2026-03-03' })
+    expect(presetRange(30, '2026-10-27')).toEqual({ from: '2026-09-28', to: '2026-10-27' })
+  })
+
+  it('takes the range from the query, else the last 30 days, and names its preset', () => {
+    const today = '2026-10-27'
+    expect(usageRangeOf({}, today)).toEqual({ from: '2026-09-28', to: today })
+    expect(usageRangeOf({ from: '2026-10-01' }, today)).toEqual({ from: '2026-09-28', to: today })
+    expect(usageRangeOf({ from: '2026-10-01', to: 'x' }, today)).toEqual({ from: '2026-09-28', to: today })
+    // Backwards or long, as given: the API says why it refuses.
+    expect(usageRangeOf({ from: '2026-10-05', to: '2026-10-01' }, today)).toEqual({
+      from: '2026-10-05',
+      to: '2026-10-01',
+    })
+    expect(presetOf({ from: '2026-10-21', to: today }, today)).toBe(7)
+    expect(presetOf({ from: '2026-07-30', to: today }, today)).toBe(90)
+    expect(presetOf({ from: '2026-10-01', to: '2026-10-07' }, today)).toBeNull()
+  })
+
+  it('writes a UTC day as that day, whatever the timezone', () => {
+    expect(formatUtcDay('2026-03-01', 'en')).toBe('Mar 1, 2026')
+    expect(formatUtcDay('2026-03-01', 'en', true)).toBe('3/1')
+    expect(formatUtcDay('2026-03-01', 'zh-TW')).toBe('2026年3月1日')
+  })
+
+  it("lists a range's days, oldest first, and none for a backwards one", () => {
+    expect(daysOf({ from: '2026-02-27', to: '2026-03-02' })).toEqual([
+      '2026-02-27',
+      '2026-02-28',
+      '2026-03-01',
+      '2026-03-02',
+    ])
+    expect(daysOf({ from: '2026-03-02', to: '2026-03-01' })).toEqual([])
+  })
+
+  it("sums each day's estimated cost, a day without calls at $0, with its costliest model", () => {
+    const rows = [
+      { date: '2026-03-02', model: 'vendor/a', estimated_cost: 0.5 },
+      { date: '2026-03-02', model: 'vendor/b', estimated_cost: 1.25 },
+      { date: '2026-03-02', model: 'vendor/c', estimated_cost: 0.25 },
+      { date: '2026-03-01', model: 'vendor/unpriced', estimated_cost: 0 },
+    ]
+    expect(costDays(['2026-02-28', '2026-03-01', '2026-03-02'], rows)).toEqual([
+      { day: '2026-02-28', cost: 0, top: null, others: 0 },
+      { day: '2026-03-01', cost: 0, top: null, others: 0 },
+      { day: '2026-03-02', cost: 2, top: { model: 'vendor/b', cost: 1.25 }, others: 0.75 },
+    ])
+  })
+
+  it('words every job status and every requeue refusal, in both catalogs', () => {
+    const lookup = (catalog: unknown, path: string): unknown =>
+      path.split('.').reduce<unknown>((node, key) => (node as Record<string, unknown> | undefined)?.[key], catalog)
+    for (const catalog of [en, zhTW]) {
+      for (const status of ['queued', 'running', 'failed', 'succeeded']) {
+        expect(typeof lookup(catalog, `admin.jobs.statuses.${status}`)).toBe('string')
+      }
+      for (const reason of ['not_running', 'not_stuck', 'worker_unknown']) {
+        expect(typeof lookup(catalog, requeueRefusalKey(reason)!)).toBe('string')
+      }
+      expect(typeof lookup(catalog, 'admin.audit.actions.jobs.requeue')).toBe('string')
+      expect(typeof lookup(catalog, 'admin.audit.targets.job')).toBe('string')
+    }
   })
 })
