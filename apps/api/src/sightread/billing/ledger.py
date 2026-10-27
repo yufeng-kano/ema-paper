@@ -23,12 +23,14 @@ from ..db.models import (
     CreditPack,
     CreditPackEntry,
     CreditPeriod,
+    PlanGrant,
     Subscription,
     UsageLog,
+    User,
     utcnow,
 )
 from .credits import credits_for_usd
-from .plans import Period, Plan, current_period
+from .plans import Decision, Grant, Period, Plan, resolve_period
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +38,8 @@ PARSE = "parse"
 CHAT = "chat"
 RESERVED, CONSUMED, RELEASED = "reserved", "consumed", "released"
 PACK_PAID, PACK_REFUNDED = "paid", "refunded"
+# Where a pack came from: Pay, or a redeem code (docs/billing.md § Redeem codes).
+PACK_SOURCE_PAY, PACK_SOURCE_CODE = "pay", "code"
 
 
 class InsufficientCredits(Exception):
@@ -61,6 +65,8 @@ class PackBalance:
     purchased_at: datetime
     expires_at: datetime
     active: bool
+    source: str = PACK_SOURCE_PAY
+    redemption_id: int | None = None
 
     @property
     def remaining(self) -> int:
@@ -73,8 +79,10 @@ class Balance:
     period: Period
     granted: int
     spent: int
-    # Every pack the user bought, newest first.
+    # Every pack the user bought or redeemed, newest first.
     packs: tuple[PackBalance, ...] = ()
+    # The bank of granted days, None for a user who never redeemed any.
+    grant: Grant | None = None
 
     @property
     def remaining(self) -> int:
@@ -113,18 +121,66 @@ def _pack_balance(pack: CreditPack, now: datetime) -> PackBalance:
         purchased_at=pack.purchased_at,
         expires_at=pack.expires_at,
         active=pack_active(pack, now),
+        source=pack.source,
+        redemption_id=pack.redemption_id,
     )
+
+
+def _grant_of(row: PlanGrant | None) -> Grant | None:
+    if row is None:
+        return None
+    return Grant(row.plan_id, row.days_banked, row.period_start, row.period_end)
+
+
+async def decide_period(
+    db: AsyncSession, settings: Settings, user_id: int, now: datetime | None = None
+) -> tuple[Decision, bool]:
+    """The period a read or a charge at `now` belongs to, and whether the bank of granted
+    days moved to decide it (docs/billing.md § Periods, *Granted days*). A move — a
+    granted period opened or cut — is made under the user's row lock, from the rows as
+    they are once it is held, and flushed: a charge already holds the lock and commits
+    with its entry, a read commits it itself, so what the screen says is what the next
+    charge uses."""
+    now = now or utcnow()
+    subscription = await db.get(Subscription, user_id)
+    row = await db.get(PlanGrant, user_id)
+    grant = _grant_of(row)
+    decided = resolve_period(
+        subscription, grant, settings.plans, settings.free_plan, now, settings.grant_period_days
+    )
+    if row is None or decided.grant == grant:
+        return decided, False
+    await db.execute(select(User.id).where(User.id == user_id).with_for_update())
+    await db.refresh(row)
+    if subscription is not None:
+        await db.refresh(subscription)
+    else:
+        subscription = await db.get(Subscription, user_id)
+    grant = _grant_of(row)
+    decided = resolve_period(
+        subscription, grant, settings.plans, settings.free_plan, now, settings.grant_period_days
+    )
+    if decided.grant == grant:  # pragma: no cover - moved meanwhile by the lock's holder
+        return decided, False
+    row.plan_id = decided.grant.plan_id
+    row.days_banked = decided.grant.days_banked
+    row.period_start = decided.grant.period_start
+    row.period_end = decided.grant.period_end
+    row.updated_at = now
+    await db.flush()
+    return decided, True
 
 
 async def read_balance(
     db: AsyncSession, settings: Settings, user_id: int, now: datetime | None = None
 ) -> Balance:
-    """The current period, its balance and the packs, without writing: a period never
-    used has no row and its whole grant left."""
+    """The current period, its balance and the packs: a period never used has no row and
+    its whole grant left. The one write is the bank's move, committed here (`decide_period`)."""
     now = now or utcnow()
-    period = current_period(
-        await db.get(Subscription, user_id), settings.plans, settings.free_plan, now
-    )
+    decided, moved = await decide_period(db, settings, user_id, now)
+    if moved:
+        await db.commit()
+    period = decided.period
     row = await db.get(CreditPeriod, (user_id, period.start))
     packs = tuple(
         _pack_balance(pack, now)
@@ -137,17 +193,17 @@ async def read_balance(
         ).scalars()
     )
     if row is None:
-        return Balance(period, period.plan.credits, 0, packs)
-    return Balance(period, max(row.granted, period.plan.credits), row.spent, packs)
+        return Balance(period, period.credits, 0, packs, decided.grant)
+    return Balance(period, max(row.granted, period.credits), row.spent, packs, decided.grant)
 
 
 async def plan_of(db: AsyncSession, settings: Settings, user_id: int) -> Plan:
     """The plan the user's current period belongs to, which is where their entitlements
     come from (docs/billing.md § Plans): the storage cap, the concurrency cap and
-    whether the chat agent gets `bash`."""
-    return current_period(
-        await db.get(Subscription, user_id), settings.plans, settings.free_plan, utcnow()
-    ).plan
+    whether the chat agent gets `bash`. A move of the bank is flushed, not committed:
+    the caller's transaction carries it, or the next read does."""
+    decided, _ = await decide_period(db, settings, user_id)
+    return decided.period.plan
 
 
 def storage_limit(settings: Settings, plan: Plan) -> int:
@@ -171,9 +227,8 @@ async def period_row(
     """The period row a charge at `now` lands in, created on first use; a plan change
     raises its grant and never lowers it (docs/billing.md § Periods)."""
     now = now or utcnow()
-    period = current_period(
-        await db.get(Subscription, user_id), settings.plans, settings.free_plan, now
-    )
+    decided, _ = await decide_period(db, settings, user_id, now)
+    period = decided.period
     plan_id = None if period.plan.free else period.plan.id
     row = await db.get(CreditPeriod, (user_id, period.start))
     if row is None:
@@ -182,7 +237,7 @@ async def period_row(
             period_start=period.start,
             period_end=period.end,
             plan_id=plan_id,
-            granted=period.plan.credits,
+            granted=period.credits,
         )
         try:
             async with db.begin_nested():
@@ -193,8 +248,8 @@ async def period_row(
             row = await db.get(CreditPeriod, (user_id, period.start))
             if row is None:  # pragma: no cover - the conflict was that row's insert
                 raise
-    if row.granted < period.plan.credits:
-        row.granted = period.plan.credits
+    if row.granted < period.credits:
+        row.granted = period.credits
         row.plan_id = plan_id
         await db.flush()
     return row, period

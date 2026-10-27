@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from ..db.models import Subscription
 
@@ -135,11 +135,117 @@ def month_bounds(now: datetime) -> tuple[datetime, datetime]:
     return start, end
 
 
+# What a period is (docs/billing.md § Periods): a Pay subscription's, one of granted days,
+# or Free's month.
+SUBSCRIPTION, GRANT, FREE = "subscription", "grant", "free"
+
+
 @dataclass(frozen=True)
 class Period:
     start: datetime
     end: datetime
     plan: Plan
+    # What the period grants: the plan's credits, pro-rated for a granted period shorter
+    # than `GRANT_PERIOD_DAYS` (docs/billing.md § Periods, *Granted days*).
+    credits: int
+    source: str = SUBSCRIPTION
+
+
+@dataclass(frozen=True)
+class Grant:
+    """The bank of granted days as `plan_grants` holds it (docs/billing.md § Periods,
+    *Granted days*): whose days, how many wait, and the open granted period if one runs."""
+
+    plan_id: str
+    days_banked: int
+    period_start: datetime | None = None
+    period_end: datetime | None = None
+
+    @property
+    def open(self) -> bool:
+        return self.period_start is not None and self.period_end is not None
+
+
+@dataclass(frozen=True)
+class Decision:
+    """A period decided at `now`, and what the bank should read after the decision — the
+    same object when nothing moved."""
+
+    period: Period
+    grant: Grant | None
+
+
+def grant_credits(plan: Plan, days: int, period_days: int) -> int:
+    """A granted period's credits: the plan's for `period_days` days, pro-rated upwards
+    for fewer (docs/billing.md § Periods, *Granted days*)."""
+    return -(-plan.credits * days // period_days)
+
+
+def _paid(subscription: Subscription | None, plans: dict[str, Plan], now: datetime) -> bool:
+    return (
+        subscription is not None
+        and subscription.status in PAID_STATUSES
+        and subscription.period_start <= now < subscription.period_end
+        and subscription.plan_id in plans
+    )
+
+
+def resolve_period(
+    subscription: Subscription | None,
+    grant: Grant | None,
+    plans: dict[str, Plan],
+    free: Plan,
+    now: datetime,
+    period_days: int,
+) -> Decision:
+    """Which period a charge at `now` belongs to (docs/billing.md § Periods): the paid one
+    while the subscription is active or trialing, inside its period and on a plan the
+    deployment knows; else the open granted period, or one opened now from the bank; Free's
+    month otherwise. Read at every charge and every read: nothing waits for a webhook to
+    expire access, and the bank moves here — a granted period a paid one started inside
+    is cut where the paid one begins and its whole days left go back to the bank; one
+    that ran out closes; one is opened from the bank when nothing else pays."""
+    paid = _paid(subscription, plans, now)
+    if grant is not None and grant.open:
+        if paid and subscription.period_start < grant.period_end:
+            cut = max(grant.period_start, subscription.period_start)
+            days_back = max(0, (grant.period_end - cut).days)
+            grant = Grant(grant.plan_id, grant.days_banked + days_back)
+        elif grant.period_end <= now:
+            grant = Grant(grant.plan_id, grant.days_banked)
+    if paid:
+        plan = plans[subscription.plan_id]
+        return Decision(
+            Period(
+                subscription.period_start, subscription.period_end, plan, plan.credits, SUBSCRIPTION
+            ),
+            grant,
+        )
+    if grant is not None and grant.plan_id in plans:
+        plan = plans[grant.plan_id]
+        # An open period runs until its end, whatever a clock a moment behind the one that
+        # opened it says of its start.
+        if grant.open and now < grant.period_end:
+            days = (grant.period_end - grant.period_start).days
+            return Decision(
+                Period(
+                    grant.period_start,
+                    grant.period_end,
+                    plan,
+                    grant_credits(plan, days, period_days),
+                    GRANT,
+                ),
+                grant,
+            )
+        if grant.days_banked > 0:
+            days = min(grant.days_banked, period_days)
+            opened = Grant(grant.plan_id, grant.days_banked - days, now, now + timedelta(days=days))
+            return Decision(
+                Period(now, opened.period_end, plan, grant_credits(plan, days, period_days), GRANT),
+                opened,
+            )
+    start, end = month_bounds(now)
+    return Decision(Period(start, end, free, free.credits, FREE), grant)
 
 
 def current_period(
@@ -148,18 +254,5 @@ def current_period(
     free: Plan,
     now: datetime,
 ) -> Period:
-    """Which period a charge at `now` belongs to (docs/billing.md § Periods): the paid one
-    while the subscription is active or trialing, inside its period and on a plan the
-    deployment knows; Free's month otherwise. Read at every charge: nothing waits for a
-    webhook to expire access."""
-    if (
-        subscription is not None
-        and subscription.status in PAID_STATUSES
-        and subscription.period_start <= now < subscription.period_end
-        and subscription.plan_id in plans
-    ):
-        return Period(
-            subscription.period_start, subscription.period_end, plans[subscription.plan_id]
-        )
-    start, end = month_bounds(now)
-    return Period(start, end, free)
+    """The period of a user with no granted days: the paid one or Free's month."""
+    return resolve_period(subscription, None, plans, free, now, 1).period

@@ -11,6 +11,9 @@ users            id PK, google_sub UNIQUE, email, name,
                                                   -- original | markdown: the view a converted
                                                   -- PDF or image opens on the first time
                                                   -- (web.md § Result viewer)
+                 redeem_failures INT NOT NULL DEFAULT 0, redeem_failed_at NULL,
+                                                  -- refused redeem-code attempts in the
+                                                  -- window (billing.md § Redeem codes)
                  created_at
                  -- deleting the row is deleting the account (see Rules): every table
                  -- below with a user_id cascades from it, pay_events keep theirs as NULL
@@ -346,13 +349,16 @@ credit_entries   id PK, user_id FK, period_start,
                  -- deletes (jobs.md § Retention) leaves its entry with job_id NULL, and
                  -- a conversation the reader deletes takes its turns and leaves their
                  -- entries with turn_id NULL, so the balance and its record keep agreeing
-credit_packs     id PK,                           -- Pay's purchaseId
+credit_packs     id PK,                           -- Pay's purchaseId, or redeem-<redemption id>
                  user_id FK, pack_id, credits INT, spent INT,
                  status paid|refunded, purchased_at, expires_at,
                  version BIGINT,                  -- Pay's version (ms); older is ignored
+                 source pay|code,                 -- bought, or granted by a redeem code
+                 redemption_id FK redemptions ON DELETE SET NULL, NULL UNIQUE,
                  created_at, updated_at
                  INDEX (user_id, expires_at)
                  CHECK (credits >= 0), CHECK (spent >= 0), CHECK (expires_at > purchased_at)
+                 CHECK (source IN ('pay', 'code'))
                  -- a top-up pack bought on Pro (billing.md § Top-up packs): credits from
                  -- the pack's configuration when it was paid, spent as charges take from it
                  -- once the period's grant is gone; counts while paid and unexpired
@@ -364,6 +370,26 @@ pack_checkouts   user_id PK/FK, pack_id, idempotency_key UNIQUE,
                  purchase_id UNIQUE NULL, created_at, completed_at NULL
                  -- the one pack checkout a user may have open, keyed as `checkouts` is;
                  -- purchase_id is Pay's purchaseId once Pay answered
+redeem_codes     id PK, code UNIQUE,              -- the random characters, no prefix
+                 kind credits|plan, credits INT NULL, valid_days INT NULL,
+                 plan_id NULL, days INT NULL,     -- a plan code: whose days, how many
+                 max_uses INT, uses INT, redeem_by NULL, label, disabled_at NULL,
+                 created_at
+                 CHECK (kind IN ('credits', 'plan')), CHECK (max_uses >= 1),
+                 CHECK (uses >= 0)
+                 -- a code the operator hands out (billing.md § Redeem codes); no user_id:
+                 -- it outlives every account that used it
+redemptions      id PK, code_id FK redeem_codes, user_id FK, kind, credits INT NULL,
+                 plan_id NULL, days INT NULL,     -- what the code granted, as it stood then
+                 redeemed_at
+                 INDEX (user_id)
+                 UNIQUE (code_id, user_id)        -- one redemption per user per code
+plan_grants      user_id PK/FK, plan_id, days_banked INT,
+                 period_start NULL, period_end NULL,
+                                                  -- the open granted period, when one runs
+                 updated_at
+                 CHECK (days_banked >= 0)
+                 -- the bank of granted days (billing.md § Periods, Granted days)
 ```
 
 ## Rules
@@ -381,6 +407,7 @@ pack_checkouts   user_id PK/FK, pack_id, idempotency_key UNIQUE,
 - **The library files migration** (`library files`) added `documents.kind` — `parse`, `markdown` or `file`; NOT NULL, default `parse` — backfilled from `job_id` (a row with a job is a `parse`, one without a `markdown`), `documents.media_type` and `documents.size_bytes` (NULL on every existing row: only a file carries them) and `agent_settings.auto_convert` (true). No row is rewritten otherwise. Its downgrade refuses while any row is a file, naming the count — without `kind` those rows would read as markdown documents whose text no route could find — and otherwise drops the four columns.
 - **The chat tool calls migration** (`chat tool calls`) created `chat_tool_calls`, empty, with its indexes; no existing row is read or rewritten, and nothing reads it until a turn makes a web tool call ([chat.md](./chat.md) § Tools). Its downgrade drops the table — the day's counts and the record behind the searches already charged are lost with it, the entries themselves not.
 - **The compaction migration** (`conversation compaction and memory file`) added `chat_turns.kind` (`message` on every row), `agent_settings.idle_compact` (`true` on every row: idle compaction is on unless the reader turns it off), and on `conversations` the nullable `memory_file`, `compacted_message_id` (a message id without a foreign key, since a message goes only with its conversation), `context_tokens` and `cache_warm_until`, NULL on every row, with the partial index the idle compaction pass reads ([chat.md](./chat.md) § Compaction, § Memory). The only rows rewritten are skills named `new` or `compact`, the composer's own commands from this version on ([chat.md](./chat.md) § Skills): each is renamed to the next free `name-2`, `name-3`… of its reader. Otherwise no row is read or rewritten: an open conversation goes on as it was, takes its memory file snapshot at its next turn, and is first measured by its next model call. Its downgrade drops the columns and the index and leaves the new names; a conversation compacted meanwhile then replays its whole history again, the summary row among it.
+- **The redeem codes migration** (`redeem codes`) created `redeem_codes`, `redemptions` and `plan_grants`, empty, added `source` (default `pay`) and `redemption_id` to `credit_packs` and `redeem_failures` (default 0) and `redeem_failed_at` to `users` ([billing.md](./billing.md) § Redeem codes). Every existing pack reads as bought and every user as never having tried a code; nothing else is read or rewritten. Its downgrade drops the three tables and the four columns — codes and their redemptions are lost with them, and a redeemed pack's row stays as a bought one's, so it is not run on a database that redeemed one.
 - **The credit packs migration** (`credit packs`) created `credit_packs`, `credit_pack_entries` and `pack_checkouts`, empty, with their constraints and indexes ([billing.md](./billing.md) § The ledger). No existing row is read or rewritten: nothing changes for a user until a pack is bought. Its downgrade drops the three tables and nothing else — packs already bought are lost with them, so it is not run on a database that sold one.
 - **The reader views migration** (`reader views`) added `users.default_view` (`markdown` on every row) and `documents.view` (NULL on every row), and turned `agent_settings.auto_convert` off: its default became `false` and every existing row was set to `false` — the switch had been on for everyone as the default the library files migration gave it, and since 2026-10-26 an uploaded PDF or image is kept as it is until the reader asks for Markdown ([web.md](./web.md) § Files). Its downgrade drops the two columns and restores the default of `true`; the rows stay off.
 - **The parse retention migration** (`parse retention and account deletion`) did the same for `credit_entries.job_id`: `fk_credit_entries_job_id_jobs` went from `ON DELETE CASCADE` to `ON DELETE SET NULL`, and `ck_credit_entries_parse_job`, which held that an entry has a job exactly when it is a parse, became the check that a chat entry has no job (`kind = 'parse' OR job_id IS NULL`): a parse the retention deletes ([jobs.md](./jobs.md) § Retention) leaves its entry behind, still counted in its period and in `/api/billing/entries`. It added the indexes the purge and a job's foreign-key actions read, `ix_documents_job_id` and `ix_usage_log_job_id`, and the partial `ix_documents_trashed_at` and `ix_folders_trashed_at` (`WHERE trashed_at IS NOT NULL`) the Trash's expiry reads. No row is rewritten and none is deleted: the parses already past their time go at the first sweep after the deploy. Its downgrade drops the four indexes, restores the cascade and the old check, and refuses while any parse entry has no job, naming the count — those entries would otherwise have to be deleted from the billing record.

@@ -22,6 +22,11 @@ export type ApiErrorType =
   | 'plan_required'
   | 'subscription_active'
   | 'checkout_open'
+  | 'code_invalid'
+  | 'code_expired'
+  | 'code_exhausted'
+  | 'code_redeemed'
+  | 'code_plan_conflict'
   | 'upstream'
   | 'internal'
 
@@ -389,8 +394,8 @@ export interface BillingRates {
   chat: Record<string, ChatRate>
 }
 
-/** One top-up pack the reader bought (docs/billing.md § Top-up packs): `remaining` is 0 and
- *  `active` false once it is refunded or expired. */
+/** One top-up pack the reader bought, or a redeem code's credits (docs/billing.md § Top-up
+ *  packs, § Redeem codes): `remaining` is 0 and `active` false once it is refunded or expired. */
 export interface BillingPack {
   id: string
   pack_id: string
@@ -401,6 +406,10 @@ export interface BillingPack {
   active: boolean
   purchased_at: string
   expires_at: string
+  /** Bought from Pay, or granted by a redeem code. Optional so a page served by an older
+   *  API still renders: bought where unset. */
+  source?: 'pay' | 'code'
+  redemption_id?: number | null
 }
 
 export interface BillingPacks {
@@ -408,15 +417,50 @@ export interface BillingPacks {
   remaining: number
   /** The earliest expiry among the active packs with credits left; null without one. */
   expires_at: string | null
-  /** Every pack ever bought, newest first. */
+  /** Every pack ever bought or redeemed, newest first. */
   items: BillingPack[]
+}
+
+/** What a period is (docs/billing.md § Periods): a Pay subscription's, redeemed days of a
+ *  paid plan, or Free's month. */
+export type PeriodSource = 'subscription' | 'grant' | 'free'
+
+/** The bank of redeemed days and, while one runs, its open period (docs/billing.md
+ *  § Periods, *Granted days*). */
+export interface BillingPlanGrant {
+  plan_id: string
+  days_banked: number
+  period_start: string | null
+  period_end: string | null
+}
+
+/** One code the reader redeemed (docs/billing.md § Redeem codes). */
+export interface BillingRedemption {
+  id: number
+  kind: 'credits' | 'plan'
+  credits: number | null
+  plan_id: string | null
+  days: number | null
+  redeemed_at: string
 }
 
 export interface BillingResponse {
   plan: BillingPlan
   subscription: BillingSubscription | null
-  period: { start: string; end: string; granted: number; spent: number; remaining: number }
+  period: {
+    start: string
+    end: string
+    granted: number
+    spent: number
+    remaining: number
+    /** Optional so a page served by an older API still renders. */
+    source?: PeriodSource
+  }
   packs: BillingPacks
+  /** Null for a reader who never redeemed days; optional so a page served by an older API
+   *  still renders. */
+  plan_grant?: BillingPlanGrant | null
+  redemptions?: BillingRedemption[]
   /** The balance a charge is measured against: the period's, 0 when overdrawn, plus the
    *  active packs' (docs/billing.md § Top-up packs). */
   credits_available: number
@@ -1150,6 +1194,20 @@ export function createPackCheckout(packId: string): Promise<{ url: string }> {
 /** Pay's customer portal: payment method, invoices, cancelling. */
 export function createPortal(): Promise<{ url: string }> {
   return request('POST', '/api/billing/portal', {})
+}
+
+/** What a redeem code granted (docs/billing.md § Redeem codes): credits as a pack, valid
+ *  until `expires_at`; or days of a plan — `period_end` the open granted period's end, null
+ *  while a paid subscription runs and the days wait in the bank (`days_banked`). */
+export type RedeemResult =
+  | { kind: 'credits'; credits: number; expires_at: string }
+  | { kind: 'plan'; plan_id: string; days: number; days_banked: number; period_end: string | null }
+
+/** Redeem a code as typed; the server drops case, spaces and hyphens. 404 `code_invalid`,
+ *  409 `code_expired` / `code_exhausted` / `code_redeemed` / `code_plan_conflict`, 429
+ *  `rate_limit` (docs/billing.md § Refusals). */
+export function redeemCode(code: string): Promise<RedeemResult> {
+  return request('POST', '/api/billing/redeem', { code })
 }
 
 export function getSandbox(): Promise<SandboxStatus> {

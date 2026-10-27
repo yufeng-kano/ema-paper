@@ -7,8 +7,9 @@
  * packs' balance, the newest packs with every one in a dialog, and *Top up*, which opens
  * the pack's dialog before Pay's checkout — docs/billing.md § Top-up packs), one line on
  * the rates with the way to the rates page (no table here, since 2026-10-26), and the
- * sandbox the plan gives. Every figure is the API's: the section never names a price or a
- * plan the API did not.
+ * sandbox the plan gives. Redeemed days of a plan are said under the plan, and the plan's foot
+ * ends in the way to the redeem dialog, Free or paid (docs/billing.md § Redeem codes). Every
+ * figure is the API's: the section never names a price or a plan the API did not.
  */
 import {
   createCheckout,
@@ -71,11 +72,31 @@ const subscriptionLine = computed(() => {
   return subscription.cancel_at_period_end ? t('usage.cancelAtEnd', { date: end }) : t('usage.renews', { date: end })
 })
 
+/** Redeemed days under the plan (docs/billing.md § Periods, *Granted days*): the open granted
+ *  period and how many days follow it, or how many wait while a paid subscription runs. */
+const grantedLine = computed(() => {
+  const grant = billing.value?.plan_grant
+  if (!billing.value || !grant) {
+    return null
+  }
+  const more = formatCount(grant.days_banked, locale.value)
+  if (billing.value.period.source === 'grant' && grant.period_end) {
+    const runs = t('usage.grantedRuns', { plan: grant.plan_id, date: formatDate(grant.period_end, locale.value) })
+    return grant.days_banked > 0 ? `${runs} ${t('usage.grantedMore', { n: more }, grant.days_banked)}` : runs
+  }
+  return grant.days_banked > 0 ? t('usage.grantedBanked', { plan: grant.plan_id, n: more }, grant.days_banked) : null
+})
+
+const redeeming = ref(false)
+
 // --- the top-up packs --------------------------------------------------------------------
 
-/** A paid plan's period: the only one the packs' group is for (docs/billing.md § Top-up
- *  packs) — the Free screens do not change. */
+/** A paid plan's period: the one a pack can be bought in (docs/billing.md § Top-up packs). */
 const paid = computed(() => billing.value !== null && billing.value.plan.id !== 'free')
+
+/** The extra credits group stands on a paid plan's period, packs or none, and for any reader
+ *  holding one — a Free reader who redeemed credits (docs/billing.md § Redeem codes). */
+const extras = computed(() => paid.value || (billing.value?.packs.items.length ?? 0) > 0)
 
 /** The pack the catalog lists, read once the group appears — on sale or not, so the line
  *  under the heading says what a pack is while Pay's checkout is still closed. */
@@ -247,26 +268,24 @@ async function runSandboxAction(action: () => Promise<void>) {
             <UiButton v-if="billing.subscription" variant="secondary" :loading="acting" @click="manage">
               {{ t('usage.manage') }}
             </UiButton>
-            <UiButton v-if="free && billing.checkout_available" :loading="acting" @click="upgrade">
-              {{ t('usage.upgrade') }}
+            <!-- The same checkout: *Upgrade* on Free, *Subscribe* on redeemed days, whose rest
+                 waits for the subscription to end (docs/billing.md § Periods, *Granted days*). -->
+            <UiButton v-if="!billing.subscription && billing.checkout_available" :loading="acting" @click="upgrade">
+              {{ free ? t('usage.upgrade') : t('usage.subscribe') }}
             </UiButton>
           </div>
         </div>
-        <template
-          v-if="
-            subscriptionLine ||
-            billing.subscription ||
-            !billing.checkout_available ||
-            billing.pay_reachable === false ||
-            actionError
-          "
-          #foot
-        >
+        <template #foot>
           <p v-if="subscriptionLine">{{ subscriptionLine }}</p>
+          <p v-if="grantedLine">{{ grantedLine }}</p>
           <p v-if="billing.subscription">{{ t('usage.manageNote') }}</p>
           <p v-else-if="!billing.checkout_available">{{ t('usage.notOnSale') }}</p>
           <p v-if="billing.pay_reachable === false">{{ t('usage.payBehind') }}</p>
           <UiBanner v-if="actionError" tone="error">{{ actionError }}</UiBanner>
+          <p>
+            {{ t('usage.redeemPrompt') }}
+            <button type="button" class="redeem-link" @click="redeeming = true">{{ t('usage.redeemLink') }}</button>
+          </p>
         </template>
       </SettingsGroup>
 
@@ -331,11 +350,12 @@ async function runSandboxAction(action: () => Promise<void>) {
         </template>
       </SettingsGroup>
 
-      <!-- The packs, on a paid plan, bought or not: what they hold together, the newest few
-           (every one in a dialog), and the way to buy one — a dialog before Pay's checkout
-           (docs/web.md § Pages). The table brings its own surface; the empty row takes the box. -->
+      <!-- The extra credits — packs bought and codes redeemed — on a paid plan or once there is
+           one: what they hold together, the newest few (every one in a dialog), and the way to
+           buy one — a dialog before Pay's checkout (docs/web.md § Pages). The table brings its
+           own surface; the empty row takes the box. -->
       <SettingsGroup
-        v-if="paid"
+        v-if="extras"
         :title="t('usage.packs')"
         :description="packsLine"
         :plain="billing.packs.items.length > 0"
@@ -364,7 +384,7 @@ async function runSandboxAction(action: () => Promise<void>) {
             <UiButton v-if="billing.pack_checkout_available" variant="primary" @click="toppingUp = true">
               {{ t('usage.topUp') }}
             </UiButton>
-            <p v-else class="packs-closed">{{ t('usage.packsNotOnSale') }}</p>
+            <p v-else-if="paid" class="packs-closed">{{ t('usage.packsNotOnSale') }}</p>
           </div>
         </template>
       </SettingsGroup>
@@ -418,6 +438,7 @@ async function runSandboxAction(action: () => Promise<void>) {
     </template>
 
     <SettingsTopUpDialog v-if="toppingUp" @close="toppingUp = false" />
+    <SettingsRedeemDialog v-if="redeeming" @close="redeeming = false" @redeemed="reload" />
     <SettingsPacksDialog v-if="showingAllPacks && billing" :packs="billing.packs" @close="showingAllPacks = false" />
 
     <UiConfirmDialog
@@ -472,6 +493,21 @@ async function runSandboxAction(action: () => Promise<void>) {
   flex-shrink: 0;
   flex-wrap: wrap;
   gap: var(--space-2);
+}
+
+/* The way to the redeem dialog, in the foot's own line. */
+.redeem-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+}
+
+.redeem-link:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 
 /* --- The usage limits ----------------------------------------------------------- */

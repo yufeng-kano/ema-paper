@@ -14,11 +14,11 @@ from datetime import timedelta
 from typing import NamedTuple
 
 from fastapi import APIRouter, Query, Request, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import case, func, select
 
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
-from ..billing import ledger, pay
+from ..billing import codes, ledger, pay
 from ..billing.plans import FREE_PLAN_ID
 from ..db.models import (
     Checkout,
@@ -26,6 +26,7 @@ from ..db.models import (
     CreditPack,
     PackCheckout,
     PayEvent,
+    Redemption,
     Subscription,
     User,
     utcnow,
@@ -42,6 +43,11 @@ class CheckoutRequest(BaseModel):
 
 class PackCheckoutRequest(BaseModel):
     pack_id: str
+
+
+class RedeemRequest(BaseModel):
+    # As typed; case, spaces and hyphens are dropped before the lookup.
+    code: str = Field(max_length=64)
 
 
 class Sale(NamedTuple):
@@ -66,7 +72,12 @@ async def _may_have_purchases(db: DbSession, user_id: int) -> bool:
         return True
     paid = await db.execute(
         select(CreditPack.id)
-        .where(CreditPack.user_id == user_id, CreditPack.status == ledger.PACK_PAID)
+        .where(
+            CreditPack.user_id == user_id,
+            CreditPack.status == ledger.PACK_PAID,
+            # A code's credits are not Pay's to refund (docs/billing.md § Redeem codes).
+            CreditPack.source == ledger.PACK_SOURCE_PAY,
+        )
         .limit(1)
     )
     return paid.first() is not None
@@ -155,6 +166,13 @@ async def billing(request: Request, user: SessionUser, db: DbSession, settings: 
     balance = await ledger.read_balance(db, settings, user.id)
     plan = balance.period.plan
     subscription = await db.get(Subscription, user.id)
+    redemptions = (
+        await db.execute(
+            select(Redemption)
+            .where(Redemption.user_id == user.id)
+            .order_by(Redemption.redeemed_at.desc(), Redemption.id.desc())
+        )
+    ).scalars()
     return {
         "plan": {
             "id": plan.id,
@@ -181,9 +199,11 @@ async def billing(request: Request, user: SessionUser, db: DbSession, settings: 
             "granted": balance.granted,
             "spent": balance.spent,
             "remaining": balance.remaining,
+            # A subscription's, granted days', or Free's month (docs/billing.md § Periods).
+            "source": balance.period.source,
         },
-        # Every pack ever bought, newest first; the totals count the active ones only
-        # (docs/billing.md § Top-up packs).
+        # Every pack ever bought or redeemed, newest first; the totals count the active
+        # ones only (docs/billing.md § Top-up packs, § Redeem codes).
         "packs": {
             "remaining": balance.packs_remaining,
             "expires_at": balance.packs_expire_at,
@@ -198,10 +218,36 @@ async def billing(request: Request, user: SessionUser, db: DbSession, settings: 
                     "active": pack.active,
                     "purchased_at": pack.purchased_at,
                     "expires_at": pack.expires_at,
+                    "source": pack.source,
+                    "redemption_id": pack.redemption_id,
                 }
                 for pack in balance.packs
             ],
         },
+        # The bank of granted days and its open period, null for a user who never
+        # redeemed days (docs/billing.md § Periods, *Granted days*).
+        "plan_grant": (
+            None
+            if balance.grant is None
+            else {
+                "plan_id": balance.grant.plan_id,
+                "days_banked": balance.grant.days_banked,
+                "period_start": balance.grant.period_start,
+                "period_end": balance.grant.period_end,
+            }
+        ),
+        # Every code this user redeemed, newest first (docs/billing.md § Redeem codes).
+        "redemptions": [
+            {
+                "id": row.id,
+                "kind": row.kind,
+                "credits": row.credits,
+                "plan_id": row.plan_id,
+                "days": row.days,
+                "redeemed_at": row.redeemed_at,
+            }
+            for row in redemptions
+        ],
         "credits_available": balance.available,
         "rates": rates(settings),
         # On sale: Pay configured and reachable, its checkout open, and at least one plan
@@ -376,6 +422,23 @@ async def pack_checkout(
         row.purchase_id = purchase_id
         await db.commit()
     return {"url": url}
+
+
+@router.post("/redeem", dependencies=[CsrfGuard])
+async def redeem(body: RedeemRequest, user: SessionUser, db: DbSession, settings: AppSettings):
+    """A redeem code's grant: credits as a pack, or days of a paid plan banked and, when
+    nothing else pays now, started at once (docs/billing.md § Redeem codes, § Refusals).
+    The code typed is never logged, refused or not."""
+    granted = await codes.redeem(db, settings, user.id, body.code)
+    if granted.kind == codes.CREDITS:
+        return {"kind": codes.CREDITS, "credits": granted.credits, "expires_at": granted.expires_at}
+    return {
+        "kind": codes.PLAN,
+        "plan_id": granted.plan_id,
+        "days": granted.days,
+        "days_banked": granted.days_banked,
+        "period_end": granted.period_end,
+    }
 
 
 @router.post("/portal", dependencies=[CsrfGuard])

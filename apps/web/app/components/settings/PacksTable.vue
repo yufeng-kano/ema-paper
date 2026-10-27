@@ -1,9 +1,10 @@
 <script setup lang="ts">
 /**
- * The packs a reader bought, newest first, as the Usage section and its packs dialog list
- * them (docs/web.md § Pages, *Top-up credits*): the pack — a dot, lit while it still gives
- * credits, over the day it was bought and the day it expires — then what it was granted,
- * what was spent from it and what is left, in words for a refunded or expired one
+ * The packs a reader bought or redeemed, newest first, as the Usage section and its packs
+ * dialog list them (docs/web.md § Pages, *Extra credits*): the pack — a dot, lit while it
+ * still gives credits, over the day it was bought and the day it expires — what it is, a
+ * top-up pack or a redeem code's credits (docs/billing.md § Redeem codes), then what it was
+ * granted, what was spent from it and what is left, in words for a refunded or expired one
  * (docs/billing.md § Top-up packs).
  */
 import type { BillingPack } from '~/lib/api'
@@ -16,6 +17,7 @@ const { t, locale } = useI18n()
 
 const columns = computed<TableColumn<BillingPack>[]>(() => [
   { key: 'pack', header: t('usage.columnPack') },
+  { key: 'item', header: t('usage.columnItem') },
   { key: 'credits', header: t('usage.columnGranted'), numeric: true },
   { key: 'spent', header: t('usage.columnSpent'), numeric: true },
   { key: 'remaining', header: t('usage.columnLeft'), numeric: true },
@@ -47,6 +49,7 @@ function packLeft(pack: BillingPack): string {
         </span>
       </span>
     </template>
+    <template #cell-item="{ row }">{{ row.source === 'code' ? t('usage.itemCode') : t('usage.itemPack') }}</template>
     <template #cell-credits="{ row }">{{ formatCount(row.credits, locale) }}</template>
     <template #cell-spent="{ row }">{{ formatCount(row.spent, locale) }}</template>
     <template #cell-remaining="{ row }">
