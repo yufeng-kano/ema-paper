@@ -476,6 +476,11 @@ async def test_a_value_stored_applies_at_once_and_is_recorded(make_client) -> No
             '[{"packId": "credits", "credits": 21474836470, "validDays": 365}]',
             "KANO_PAY_PACKS_JSON: 'credits'.credits must be at most 2147483647",
         ),
+        (
+            "KANO_PAY_PACKS_JSON",
+            '[{"packId": "credits", "credits": 2000, "validDays": 36501}]',
+            "KANO_PAY_PACKS_JSON: 'credits'.validDays must be at most 36500",
+        ),
     ],
 )
 async def test_a_change_the_start_checks_refuse_is_422_in_their_words_alone(

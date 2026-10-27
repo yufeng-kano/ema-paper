@@ -65,6 +65,7 @@ def test_the_packs_configuration_is_validated() -> None:
         '[{"packId": "a", "credits": 0, "validDays": 1}]',
         '[{"packId": "a", "credits": 1, "validDays": "7"}]',
         '[{"packId": "a", "credits": true, "validDays": 1}]',
+        '[{"packId": "a", "credits": 1, "validDays": 36501}]',
         '[{"packId": "a", "credits": 1, "validDays": 1}, '
         '{"packId": "a", "credits": 2, "validDays": 1}]',
     ):

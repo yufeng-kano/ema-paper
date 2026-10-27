@@ -18,6 +18,9 @@ ENDED_STATUSES = frozenset({"canceled", "expired", "failed"})
 # (`credit_periods.granted`, `credit_entries.amount`, `credit_packs.credits`), and a larger
 # number would fail every charge it reaches (docs/billing.md § Configuration).
 CREDITS_MAX = 2_147_483_647
+# The longest a pack may last: a century keeps `paid_at + validDays` a date PostgreSQL and
+# Python can hold.
+PACK_VALID_DAYS_MAX = 36_500
 
 
 @dataclass(frozen=True)
@@ -130,6 +133,10 @@ def parse_packs(raw: str) -> dict[str, Pack]:
         if counts["credits"] > CREDITS_MAX:
             raise ValueError(
                 f"KANO_PAY_PACKS_JSON: {pack_id!r}.credits must be at most {CREDITS_MAX}"
+            )
+        if counts["validDays"] > PACK_VALID_DAYS_MAX:
+            raise ValueError(
+                f"KANO_PAY_PACKS_JSON: {pack_id!r}.validDays must be at most {PACK_VALID_DAYS_MAX}"
             )
         packs[pack_id] = Pack(id=pack_id, credits=counts["credits"], valid_days=counts["validDays"])
     return packs
