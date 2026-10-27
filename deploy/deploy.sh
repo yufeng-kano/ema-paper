@@ -58,8 +58,14 @@ main() {
   else
     unset COMPOSE_PROJECT_NAME
   fi
-  # The same, spelled out for the commands a failure prints.
-  compose_cmd="docker compose"
+  # The same, spelled out for the commands a failure prints. Those run in the operator's
+  # shell: with no project named, they clear COMPOSE_PROJECT_NAME as this script did, or
+  # one exported there for another stack would take them, `dropdb` included, to it.
+  if [ -n "$compose_project" ]; then
+    compose_cmd="docker compose"
+  else
+    compose_cmd="env -u COMPOSE_PROJECT_NAME docker compose"
+  fi
   old_ifs=$IFS
   IFS=:
   for file in $compose_files; do
@@ -77,6 +83,14 @@ main() {
     checkout=$(git rev-parse --show-toplevel)
   fi
   cd "$checkout"
+  # Compose would read a COMPOSE_FILE line of .env, but the export above replaces it: a
+  # host that keeps its files there (a front proxy's overlay, say) would lose them here.
+  if [ -z "${DEPLOY_COMPOSE_FILES:-}" ] && [ -f .env ] &&
+    grep -Eq '^[[:space:]]*(export[[:space:]]+)?COMPOSE_FILE[[:space:]]*=' .env; then
+    echo ".env sets COMPOSE_FILE, which this script replaces with DEPLOY_COMPOSE_FILES" >&2
+    echo "(docker-compose.production.yaml when unset): set DEPLOY_COMPOSE_FILES to the same files" >&2
+    exit 2
+  fi
   # Written before the merge, deleted once the health checks pass: while it stands, the
   # deploy it names has not finished, and the next run finishes it (preflight below).
   unfinished="$(git rev-parse --git-dir)/sightread-deploy-unfinished"
@@ -88,6 +102,7 @@ main() {
   old=''
   dump=''
   old_revision=''
+  applied=''
   migrations_changed=0
   caddy_changed=0
   sandbox_changed=0
@@ -100,6 +115,35 @@ main() {
   trap 'exit 129' HUP
 
   echo "== $step"
+  if [ -f "$unfinished" ]; then
+    # The merge has moved HEAD already: the deploy counts from where it started, and its
+    # way back is the one it noted. Read first, so that whatever fails from here prints it.
+    {
+      read -r old
+      read -r old_revision
+      read -r dump
+    } <"$unfinished" || true
+    if ! git merge-base --is-ancestor "$old" HEAD 2>/dev/null; then
+      echo "$unfinished names a deploy from '$old' that did not finish, and HEAD is not that" >&2
+      echo "commit or past it: the checkout was moved by hand. Once the containers run HEAD," >&2
+      echo "delete that file and run this again." >&2
+      exit 1
+    fi
+    echo "a deploy from $old did not finish: this run finishes it (its note: $unfinished)"
+    # It may have swapped, so a failure prints the whole way back for what it brought,
+    # the VM image included, built or not: building the old one again is harmless.
+    stage=swapped
+    applied=$(git diff --name-only "$old" HEAD)
+    if printf '%s\n' "$applied" | grep -q '^apps/api/migrations/'; then
+      migrations_changed=1
+    fi
+    if printf '%s\n' "$applied" | grep -qxF 'deploy/caddy/Caddyfile'; then
+      caddy_changed=1
+    fi
+    if printf '%s\n' "$applied" | grep -q '^deploy/sandbox-image/'; then
+      sandbox_built=1
+    fi
+  fi
   if [ -n "$(git status --porcelain)" ]; then
     echo "the working tree is not clean; a deploy starts from a clean checkout:" >&2
     git status --short >&2
@@ -130,22 +174,7 @@ main() {
     echo "$wanted is not origin/main's head ($target); refusing" >&2
     exit 1
   fi
-  if [ -f "$unfinished" ]; then
-    # The merge has moved HEAD already: the deploy counts from where it started, and its
-    # way back is the one it noted.
-    {
-      read -r old
-      read -r old_revision
-      read -r dump
-    } <"$unfinished" || true
-    if ! git merge-base --is-ancestor "$old" HEAD 2>/dev/null; then
-      echo "$unfinished names a deploy from '$old' that did not finish, and HEAD is not that" >&2
-      echo "commit or past it: the checkout was moved by hand. Once the containers run HEAD," >&2
-      echo "delete that file and run this again." >&2
-      exit 1
-    fi
-    echo "a deploy from $old did not finish: this run finishes it (its note: $unfinished)"
-  else
+  if [ -z "$old" ]; then
     old=$(git rev-parse HEAD)
     if [ "$old" = "$target" ]; then
       echo "HEAD is already origin/main's head ($target): nothing to deploy"
@@ -158,7 +187,11 @@ main() {
     exit 1
   fi
   echo "deploying $old -> $target to https://$domain"
-  changed=$(git diff --name-only "$old" "$target")
+  # Of an unfinished deploy, what it applied (old to HEAD) counts with what is left (HEAD to
+  # the target): a target that reverts it must still take back its schema, the Caddyfile
+  # caddy mounted and the VM image. On a fresh run HEAD is old, and this is old to target.
+  remaining=$(git diff --name-only HEAD "$target")
+  changed=$(printf '%s\n%s\n' "$applied" "$remaining" | sed '/^$/d' | sort -u)
   echo "changed paths:"
   printf '%s\n' "$changed" | sed 's/^/  /'
   if printf '%s\n' "$changed" | grep -q '^apps/api/migrations/'; then
@@ -174,10 +207,6 @@ main() {
   if printf '%s\n' "$changed" | grep -qxF '.env.production.example'; then
     echo "note: .env.production.example changed; compare it with .env for new settings"
   fi
-  if [ -f "$unfinished" ]; then
-    # The unfinished deploy may have swapped: a failure from here prints the whole way back.
-    stage=swapped
-  fi
 
   step='2/7 database dump'
   echo "== $step"
@@ -185,9 +214,17 @@ main() {
   revision=$(docker compose exec -T pg sh -c 'psql -X -q -tA -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT version_num FROM alembic_version"')
   if [ -n "$old_revision" ] && [ "$revision" != "$old_revision" ]; then
     # The unfinished deploy migrated the database: a dump taken now would hold the new
-    # schema, so the one it took before stays the way back.
-    echo "the database moved to revision $revision in the unfinished deploy; the way back stays"
-    echo "$dump, taken at revision $old_revision"
+    # schema, so the one it took before stays the way back, and the way back takes the
+    # schema back whatever the paths say (a target that reverts the migration among them).
+    migrations_changed=1
+    if [ -f "$dump" ]; then
+      echo "the database moved to revision $revision in the unfinished deploy; the way back stays"
+      echo "$dump, taken at revision $old_revision"
+    else
+      # The daily backup pass deletes pre-deploy dumps seven days old.
+      echo "warning: the database moved to revision $revision in the unfinished deploy, and its"
+      echo "dump, $dump, is gone: no dump of revision $old_revision is left to restore"
+    fi
   else
     new_dump="backups/predeploy-$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse --short=12 "$old").dump"
     # Readable by its owner alone (every session, key hash and encrypted credential is in
@@ -240,25 +277,35 @@ main() {
   echo "== $step"
   # Recreating the worker requeues a running parse, keeping its finished pages, and fails a
   # running chat turn with "worker stopped" (docs/jobs.md § Chat turns): wait for both.
+  # When the deploy migrates, a database dump running (the daily backup pass's, say) is
+  # waited for too: its lock on every table would keep the migration's ALTER TABLE waiting
+  # past the api's healthcheck.
   # Counted right before the swap, so work that started during the build counts too.
+  # tests/test_deploy_script.py runs this query.
   deadline=$(($(date +%s) + drain_seconds))
   while :; do
     # shellcheck disable=SC2016 # $POSTGRES_USER and $POSTGRES_DB expand inside the pg container
-    counts=$(docker compose exec -T pg sh -c 'psql -X -q -tA -F " " -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <<'SQL'
+    counts=$(docker compose exec -T pg sh -c 'psql -X -q -tA -F " " -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <<'IN_FLIGHT_SQL'
 SELECT (SELECT count(*) FROM jobs WHERE status = 'running'),
-       (SELECT count(*) FROM chat_turns WHERE status <> 'queued' AND finished_at IS NULL);
-SQL
+       (SELECT count(*) FROM chat_turns WHERE status <> 'queued' AND finished_at IS NULL),
+       (SELECT count(*) FROM pg_stat_activity
+         WHERE application_name = 'pg_dump' AND datname = current_database());
+IN_FLIGHT_SQL
     )
-    running_jobs=${counts%% *}
-    running_turns=${counts#* }
-    if [ "$running_jobs" = 0 ] && [ "$running_turns" = 0 ]; then
-      echo "no parse or chat turn running"
+    read -r running_jobs running_turns running_dumps <<EOF
+$counts
+EOF
+    if [ "$migrations_changed" = 0 ]; then
+      running_dumps=0
+    fi
+    if [ "$running_jobs" = 0 ] && [ "$running_turns" = 0 ] && [ "$running_dumps" = 0 ]; then
+      echo "no parse or chat turn running, and no database dump holding back a migration"
       break
     fi
-    echo "running: $running_jobs parse(s), $running_turns chat turn(s)"
+    echo "running: $running_jobs parse(s), $running_turns chat turn(s), $running_dumps database dump(s)"
     if [ "$(date +%s)" -ge "$deadline" ]; then
       if [ -t 0 ]; then
-        printf 'Still running after %ss. Deploy anyway? A running parse goes back to the queue; a running chat turn fails. [y/N] ' "$drain_seconds"
+        printf 'Still running after %ss. Deploy anyway? A running parse goes back to the queue; a running chat turn fails; a running dump may keep the migration waiting past the api healthcheck. [y/N] ' "$drain_seconds"
         read -r answer || answer=''
         case $answer in
           y | Y | yes) break ;;
@@ -386,16 +433,26 @@ report_failure() {
   This deploy brought migrations, and old code cannot start on a newer schema. If the
   database is past revision $old_revision, where it was before
   ($compose_cmd run --rm --no-deps api alembic current), stop the new code and take
-  it back, EITHER with the new image's downgrade (some downgrades refuse by design):
+  it back with the new image's downgrade (some downgrades refuse by design):
     $compose_cmd stop api worker
     $compose_cmd run --rm --no-deps api alembic downgrade $old_revision
-  OR by restoring the pre-deploy dump into an empty database, which loses every write
-  made since it was taken:
+EOF
+    if [ -f "$dump" ]; then
+      cat <<EOF
+  OR instead restore the pre-deploy dump into an empty database, which loses every
+  write made since it was taken:
     $compose_cmd stop api worker backup
     $compose_cmd exec -T pg sh -c 'dropdb --force -U "\$POSTGRES_USER" "\$POSTGRES_DB" && createdb -U "\$POSTGRES_USER" "\$POSTGRES_DB"'
     $compose_cmd exec -T pg sh -c 'pg_restore -U "\$POSTGRES_USER" -d "\$POSTGRES_DB"' < $dump
-  Then:
 EOF
+    else
+      cat <<EOF
+  The pre-deploy dump, $dump, is gone (the daily backup pass deletes them
+  at seven days): the downgrade is the way back, or a daily stamp in backups/ from
+  before the deploy (docs/deployment.md § Compose files).
+EOF
+    fi
+    echo "  Then:"
   fi
   echo "  git reset --keep $old"
   # The build may have tagged images with the new code, which a later `up` would start;
@@ -407,7 +464,11 @@ EOF
   if [ "$sandbox_built" = 1 ]; then
     echo "  docker build -t <the SANDBOX_IMAGE of .env> deploy/sandbox-image"
   fi
-  echo "The pre-deploy dump: $dump"
+  if [ -f "$dump" ]; then
+    echo "The pre-deploy dump: $dump"
+  else
+    echo "The pre-deploy dump, $dump, is gone."
+  fi
 } >&2
 
 main "$@"
