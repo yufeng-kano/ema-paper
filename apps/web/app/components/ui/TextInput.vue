@@ -3,14 +3,18 @@
  * Text input. Pairs with `UiField`, which supplies `id` and `describedBy` through its slot
  * props. Height comes from `--control-height` so it matches any button on its row.
  *
- * `number` and `date` keep the value a string, as the browser hands it over: the caller
- * reads the number or the date out of it. `min`, `max` and `step` are the platform's.
+ * `date` keeps the value a string, as the browser hands it over (`YYYY-MM-DD`); `min` and
+ * `max` are the platform's. A whole number is a text field with `inputmode="numeric"` (the
+ * numeric keypad), not `type="number"`: a number field hands over an empty string for what
+ * it cannot parse (`-`, `1e`, `abc`), and the caller could not tell it from an empty field
+ * to say what is wrong. The caller reads the number out of the text.
  */
 withDefaults(
   defineProps<{
     modelValue: string
     id?: string
-    type?: 'text' | 'password' | 'email' | 'number' | 'date'
+    type?: 'text' | 'password' | 'email' | 'date'
+    inputmode?: 'numeric'
     placeholder?: string
     describedBy?: string
     invalid?: boolean
@@ -19,20 +23,19 @@ withDefaults(
     maxlength?: number
     autocomplete?: string
     mono?: boolean
-    min?: number | string
-    max?: number | string
-    step?: number
+    min?: string
+    max?: string
   }>(),
   {
     type: 'text',
     autocomplete: 'off',
     id: undefined,
+    inputmode: undefined,
     placeholder: undefined,
     describedBy: undefined,
     maxlength: undefined,
     min: undefined,
     max: undefined,
-    step: undefined,
   },
 )
 
@@ -52,8 +55,7 @@ defineEmits<{ 'update:modelValue': [string] }>()
     :maxlength="maxlength"
     :min="min"
     :max="max"
-    :step="step"
-    :inputmode="type === 'number' ? 'numeric' : undefined"
+    :inputmode="inputmode"
     :autocomplete="autocomplete"
     :aria-describedby="describedBy"
     :aria-invalid="invalid || undefined"

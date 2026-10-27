@@ -359,5 +359,9 @@ async def disable(
 
 
 async def disable_by_id(db: AsyncSession, code_id: int) -> tuple[RedeemCode | None, bool]:
-    """`disable`, by the code's id, as the console does."""
+    """`disable`, by the code's id, as the console does. An id the column cannot hold
+    names no code: None, without asking the database, whose driver would refuse to send
+    it."""
+    if not 1 <= code_id <= INT_MAX:
+        return None, False
     return await _disable(db, RedeemCode.id == code_id)

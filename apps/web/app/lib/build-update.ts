@@ -4,8 +4,9 @@
  * The authed pages are client-rendered and stay open for days, so a deploy reaches them
  * only when something reloads the page. This is the decision of *when* that is free: at
  * once when the page is idle, or when the page lets go of its last hold — a navigation
- * under a hold included, since the page may refuse it. It knows nothing of Nuxt or the DOM — the plugin supplies the three effects — so it
- * runs in the framework-free node suite (docs/testing.md).
+ * under a hold included, since the page may refuse it. It knows nothing of Nuxt or the
+ * DOM — the plugin supplies the three effects — so it runs in the framework-free node
+ * suite (docs/testing.md).
  */
 
 export interface BuildUpdateDeps {
@@ -81,10 +82,12 @@ export function createBuildUpdate(deps: BuildUpdateDeps): BuildUpdate {
     },
     navigate(path) {
       // A hold applies here too: the page may refuse the navigation and keep what it holds
-      // (the console's created codes refuse Back), so it goes on as a client-side one or not
-      // at all, and the reload follows the last release — a page that is left releases its
-      // holds as it unmounts. With nothing held an outdated page is already reloading, and
-      // the navigation gives way to that load.
+      // (the console's created codes refuse Back), so this does not turn it into a load, and
+      // the reload follows the last release — a page that is left releases its holds as it
+      // unmounts. Only this decision is ours: once Nuxt's own periodic check has found the
+      // new build, Nuxt's chunk-reload plugin loads every navigation that goes on in full,
+      // hold or not, so only a navigation the page refuses keeps what it holds. With nothing
+      // held an outdated page is already reloading, and the navigation gives way to that load.
       if (!outdated || holds > 0) {
         return false
       }

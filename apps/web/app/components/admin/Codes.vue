@@ -234,6 +234,13 @@ const createOpen = ref(false)
 /** The answer that holds the codes in plaintext: kept only while its dialog is open. */
 const created = shallowRef<AdminCodesCreated | null>(null)
 
+// The create dialog's build hold goes as it closes, and the created dialog's comes as it
+// opens — after, in the same render — so a reload that waited on the request would land
+// between them and take the codes. This watcher runs before that render (a pre-flush
+// watcher of this component), so the hand-off is never unheld. The created dialog's own
+// hold stays the last to go on Done, after its `beforeunload` prompt is gone.
+useBuildHold(() => created.value !== null)
+
 function onCreated(answer: AdminCodesCreated) {
   createOpen.value = false
   created.value = answer

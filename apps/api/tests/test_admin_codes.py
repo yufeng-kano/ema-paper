@@ -467,8 +467,10 @@ async def test_disabling_records_once_and_the_code_stops_working(make_client) ->
     again = await owner.post(path, headers=CSRF_HEADERS)
     assert again.status_code == 200 and again.json()["disabled_at"] == item["disabled_at"]
     assert len(await _audit(owner, start)) == 1
-    missing = await owner.post(f"{CODES}/{created['id'] + 100}/disable", headers=CSRF_HEADERS)
-    assert missing.status_code == 404 and _error(missing)["type"] == "invalid_request"
+    # An id past the column's integer is as unknown as any other, not a driver error.
+    for unknown in (created["id"] + 100, 2**31, 10**20):
+        missing = await owner.post(f"{CODES}/{unknown}/disable", headers=CSRF_HEADERS)
+        assert missing.status_code == 404 and _error(missing)["type"] == "invalid_request"
     assert len(await _audit(owner, start)) == 1
 
     redeemed = await owner.post(
