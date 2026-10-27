@@ -22,7 +22,7 @@ const { explain } = useAdminFailure()
 const data = shallowRef<AdminOverviewResponse | null>(null)
 const pending = ref(false)
 const error = ref<string | null>(null)
-/** When the figures were read: *updated {time}*, and what *waiting* counts to. */
+/** When the figures were read: *updated {time}*, and what the oldest job's age counts to. */
 const readAt = ref(Date.now())
 let seq = 0
 
@@ -234,7 +234,7 @@ function usageRowAttrs(row: UsageRow): Record<string, unknown> {
             <p class="tile-foot">
               {{
                 data.jobs.oldest_queued_at
-                  ? t('admin.overview.oldestWaiting', {
+                  ? t('admin.overview.oldestCreated', {
                       duration: formatElapsed(readAt - new Date(data.jobs.oldest_queued_at).getTime(), locale),
                     })
                   : t('admin.overview.nothingWaiting')
@@ -257,7 +257,7 @@ function usageRowAttrs(row: UsageRow): Record<string, unknown> {
             </p>
           </div>
           <div class="tile">
-            <p class="tile-label">{{ t('admin.overview.failed', { n: data.jobs.failed_hours }) }}</p>
+            <p class="tile-label">{{ t('admin.overview.failed', { n: data.jobs.failed_hours }, data.jobs.failed_hours) }}</p>
             <p class="tile-value tabular">{{ count(data.jobs.failed) }}</p>
             <p class="tile-foot">
               <template v-if="data.jobs.failed && data.jobs.last_failed_at">

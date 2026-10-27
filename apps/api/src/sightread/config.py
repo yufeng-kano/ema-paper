@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     # The console's jobs and usage (docs/admin.md § Overview, jobs and usage): how long the
     # overview waits for each of Kano Proxy's and Kano Pay's catalogs, the most days one read
     # of the usage may span — never under the Usage page's longest range, 90 days — and how
-    # many hours back the overview counts failed jobs.
+    # many hours back the overview counts failed jobs, a year at most.
     admin_probe_timeout_seconds: float = 5
     admin_usage_max_days: int = 366
     admin_failed_window_hours: int = 24
@@ -365,7 +365,6 @@ class Settings(BaseSettings):
             "redeem_failure_window_seconds",
             "admin_reauth_hours",
             "admin_probe_timeout_seconds",
-            "admin_failed_window_hours",
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name.upper()} must be positive")
@@ -374,6 +373,10 @@ class Settings(BaseSettings):
         # The Usage page offers 7, 30 and 90 days; a smaller cap would refuse its own presets.
         if self.admin_usage_max_days < 90:
             raise ValueError("ADMIN_USAGE_MAX_DAYS must be at least 90")
+        # A year at most: a far larger window starts before the first date Python can
+        # hold, and every overview read would fail computing it.
+        if not 1 <= self.admin_failed_window_hours <= 8760:
+            raise ValueError("ADMIN_FAILED_WINDOW_HOURS must be between 1 and 8760")
         self.redeem_code_prefix = self.redeem_code_prefix.strip().upper()
         if self.redeem_code_prefix and not self.redeem_code_prefix.isalnum():
             raise ValueError("REDEEM_CODE_PREFIX must be letters and digits only")

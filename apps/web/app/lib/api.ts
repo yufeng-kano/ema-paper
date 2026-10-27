@@ -1801,6 +1801,7 @@ export interface AdminOverviewResponse {
     running: number
     /** Null while the worker's state is unknown. */
     stuck: number | null
+    /** The oldest queued job's `created_at`, which a retry or a requeue keeps. */
     oldest_queued_at: string | null
     /** Failed in the last `failed_hours`. */
     failed: number

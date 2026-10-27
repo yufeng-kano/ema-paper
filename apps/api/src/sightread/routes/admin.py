@@ -143,6 +143,8 @@ async def overview(operator: JobsReader, db: DbSession, settings: AppSettings):
     now = utcnow()
     window = settings.admin_failed_window_hours
     today = datetime.combine(now.date(), time.min, UTC)
+    # The oldest queued job's `created_at`: its age, which a reader's retry and a requeue
+    # keep, not how long it has waited this time (docs/admin.md).
     queued, oldest_queued = (
         await db.execute(
             select(func.count(), func.min(Job.created_at)).where(Job.status == "queued")
@@ -168,8 +170,26 @@ async def overview(operator: JobsReader, db: DbSession, settings: AppSettings):
     ).all()
     totals = (await db.execute(select(*USAGE_FIGURES).where(UsageLog.created_at >= today))).one()
     accounts = await db.scalar(select(func.count()).select_from(User))
-    # After the database, so a read that fails leaves no request running; together, each
-    # bounded by ADMIN_PROBE_TIMEOUT_SECONDS and answering its own failure, never raising.
+    newest = None
+    if "audit.read" in operator.permissions:
+        newest = await list_audit(
+            operator,
+            db,
+            settings,
+            page=1,
+            page_size=OVERVIEW_AUDIT_RECORDS,
+            area=None,
+            q="",
+        )
+    # Unknown off PostgreSQL, where no lock says whether a worker runs.
+    stuck = None
+    if worker.state != "unknown":
+        stuck = sum(queue.job_is_stuck(job, worker) for job in running)
+    # Every database read is done, so one that failed has answered without asking a catalog;
+    # and the session's connection goes back to the pool before the probes, so a slow
+    # upstream holds none. The two run together, each bounded by ADMIN_PROBE_TIMEOUT_SECONDS
+    # and answering its own failure, never raising.
+    await db.close()
     kano_proxy, kano_pay = await asyncio.gather(
         admin_jobs.kano_proxy_status(settings), admin_jobs.kano_pay_status(settings)
     )
@@ -179,10 +199,7 @@ async def overview(operator: JobsReader, db: DbSession, settings: AppSettings):
         "jobs": {
             "queued": queued,
             "running": len(running),
-            # Unknown off PostgreSQL, where no lock says whether a worker runs.
-            "stuck": None
-            if worker.state == "unknown"
-            else sum(queue.job_is_stuck(job, worker) for job in running),
+            "stuck": stuck,
             "oldest_queued_at": oldest_queued,
             "failed": failed,
             "failed_hours": window,
@@ -195,16 +212,7 @@ async def overview(operator: JobsReader, db: DbSession, settings: AppSettings):
         },
         "connections": {"kano_proxy": kano_proxy, "kano_pay": kano_pay},
     }
-    if "audit.read" in operator.permissions:
-        newest = await list_audit(
-            operator,
-            db,
-            settings,
-            page=1,
-            page_size=OVERVIEW_AUDIT_RECORDS,
-            area=None,
-            q="",
-        )
+    if newest is not None:
         answer["audit"] = newest["items"]
     return answer
 

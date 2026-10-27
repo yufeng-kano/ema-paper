@@ -17,9 +17,11 @@ import respx
 from httpx import AsyncClient
 from sqlalchemy import select, text
 
+from sightread.admin import jobs as admin_jobs
 from sightread.config import Settings
 from sightread.db.models import AuditLog, CreditEntry, Job, JobPage, UsageLog, utcnow
 from sightread.jobs import queue
+from sightread.routes import admin as admin_routes
 from tests.conftest import CSRF_HEADERS, KANO_API_KEY, KANO_MODELS_URL, PAY_SETTINGS
 from tests.test_admin import (
     OWNERS,
@@ -79,10 +81,14 @@ def test_the_probe_timeout_the_usage_range_and_the_failed_window_are_validated()
     assert Settings().admin_failed_window_hours == 24
     # The Usage page's longest preset, 90 days, is the least cap that refuses none of them.
     assert Settings(admin_usage_max_days=90).admin_usage_max_days == 90
+    assert Settings(admin_failed_window_hours=8760).admin_failed_window_hours == 8760
     for bad in (
         {"admin_probe_timeout_seconds": 0},
         {"admin_usage_max_days": 89},
         {"admin_failed_window_hours": 0},
+        # A window that reaches back past year 1 would fail every overview read.
+        {"admin_failed_window_hours": 8761},
+        {"admin_failed_window_hours": 999_999_999},
     ):
         with pytest.raises(ValueError):
             Settings(**bad)
@@ -672,6 +678,36 @@ async def test_the_overview_shows_the_ten_newest_records_and_no_more_than_a_page
     small = await _owner(make_client, admin_page_size=3)
     audit = (await small.get("/api/admin/overview")).json()["audit"]
     assert [entry["id"] for entry in audit] == newest[:3]
+
+
+async def test_every_database_read_comes_before_the_catalogs(make_client, monkeypatch) -> None:
+    """The newest audit records are read with the rest, before Kano Proxy and Kano Pay are
+    asked, and no pool connection is held while they are: a read that fails answers without
+    asking either."""
+    owner = await _owner(make_client)
+    engine = owner.app.state.sessionmaker.kw["bind"]
+    held: list[int] = []
+
+    async def probe(settings: Settings) -> dict:
+        held.append(engine.pool.checkedout())
+        return {"state": "unconfigured"}
+
+    monkeypatch.setattr(admin_jobs, "kano_proxy_status", probe)
+    monkeypatch.setattr(admin_jobs, "kano_pay_status", probe)
+    response = await owner.get("/api/admin/overview")
+    assert response.status_code == 200, response.text
+    # The owner holds `audit.read`, and joining the owner group wrote a record.
+    assert response.json()["audit"]
+    assert held == [0, 0]
+
+    async def broken(*args, **kwargs) -> dict:
+        raise RuntimeError("the connection dropped")
+
+    monkeypatch.setattr(admin_routes, "list_audit", broken)
+    held.clear()
+    with pytest.raises(RuntimeError, match="the connection dropped"):
+        await owner.get("/api/admin/overview")
+    assert held == []
 
 
 async def test_the_overview_reports_both_connections(make_client) -> None:

@@ -52,7 +52,7 @@ function goToPage(next: number) {
 const data = shallowRef<AdminJobsResponse | null>(null)
 const pending = ref(false)
 const error = ref<string | null>(null)
-/** When the list was read: what *waiting {duration}* counts to. */
+/** When the list was read: what *created {duration} ago* counts to. */
 const readAt = ref(Date.now())
 /** Only the newest read may write. */
 let seq = 0
@@ -136,12 +136,13 @@ const TONES: Record<JobStatus, 'ok' | 'danger' | 'info' | 'neutral'> = {
   failed: 'danger',
 }
 
-/** What follows a row's status: how long a queued job has waited, a running one's
- *  generation, or that it is stuck. */
+/** What follows a row's status: a queued job's age — from `created_at`, which a retry or
+ *  a requeue keeps, so not how long it has waited — a running one's generation, or that it
+ *  is stuck. */
 function statusNote(job: AdminJob): string | null {
   if (job.status === 'queued') {
-    const waited = readAt.value - new Date(job.created_at).getTime()
-    return t('admin.jobs.waiting', { duration: formatElapsed(waited, locale.value) })
+    const age = readAt.value - new Date(job.created_at).getTime()
+    return t('admin.jobs.created', { duration: formatElapsed(age, locale.value) })
   }
   if (job.status === 'running') {
     if (job.stuck) {
