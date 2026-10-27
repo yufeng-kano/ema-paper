@@ -26,7 +26,6 @@ from ..db.models import (
     PlanGrant,
     Subscription,
     UsageLog,
-    User,
     utcnow,
 )
 from .credits import credits_for_usd
@@ -134,52 +133,56 @@ def _grant_of(row: PlanGrant | None) -> Grant | None:
 
 async def decide_period(
     db: AsyncSession, settings: Settings, user_id: int, now: datetime | None = None
-) -> tuple[Decision, bool]:
-    """The period a read or a charge at `now` belongs to, and whether the bank of granted
-    days moved to decide it (docs/billing.md § Periods, *Granted days*). A move — a
-    granted period opened or cut — is made under the user's row lock, from the rows as
-    they are once it is held, and flushed: a charge already holds the lock and commits
-    with its entry, a read commits it itself, so what the screen says is what the next
-    charge uses."""
+) -> Decision:
+    """The period a read or a charge at `now` belongs to, decided from the rows as the
+    session has them, nothing written (docs/billing.md § Periods, *Granted days*): a read
+    shows what the next charge will persist, and takes no lock for it."""
+    return resolve_period(
+        await db.get(Subscription, user_id),
+        _grant_of(await db.get(PlanGrant, user_id)),
+        settings.plans,
+        settings.free_plan,
+        now or utcnow(),
+        settings.grant_period_days,
+    )
+
+
+async def settle_period(
+    db: AsyncSession, settings: Settings, user_id: int, now: datetime | None = None
+) -> Decision:
+    """The same decision, its move of the bank — a granted period opened or cut — written,
+    for a caller that holds the user's row lock: a charge or a redemption. The rows are
+    read again under the lock, so a bank another transaction just moved is not written
+    over; the caller's commit carries the move (docs/billing.md § Periods, *Granted
+    days*). Nothing locks the user here: the lock is the caller's, taken in its own order."""
     now = now or utcnow()
     subscription = await db.get(Subscription, user_id)
-    row = await db.get(PlanGrant, user_id)
-    grant = _grant_of(row)
-    decided = resolve_period(
-        subscription, grant, settings.plans, settings.free_plan, now, settings.grant_period_days
-    )
-    if row is None or decided.grant == grant:
-        return decided, False
-    await db.execute(select(User.id).where(User.id == user_id).with_for_update())
-    await db.refresh(row)
     if subscription is not None:
         await db.refresh(subscription)
-    else:
-        subscription = await db.get(Subscription, user_id)
+    row = await db.get(PlanGrant, user_id)
+    if row is not None:
+        await db.refresh(row)
     grant = _grant_of(row)
     decided = resolve_period(
         subscription, grant, settings.plans, settings.free_plan, now, settings.grant_period_days
     )
-    if decided.grant == grant:  # pragma: no cover - moved meanwhile by the lock's holder
-        return decided, False
-    row.plan_id = decided.grant.plan_id
-    row.days_banked = decided.grant.days_banked
-    row.period_start = decided.grant.period_start
-    row.period_end = decided.grant.period_end
-    row.updated_at = now
-    await db.flush()
-    return decided, True
+    if row is not None and decided.grant != grant:
+        row.plan_id = decided.grant.plan_id
+        row.days_banked = decided.grant.days_banked
+        row.period_start = decided.grant.period_start
+        row.period_end = decided.grant.period_end
+        row.updated_at = now
+        await db.flush()
+    return decided
 
 
 async def read_balance(
     db: AsyncSession, settings: Settings, user_id: int, now: datetime | None = None
 ) -> Balance:
-    """The current period, its balance and the packs: a period never used has no row and
-    its whole grant left. The one write is the bank's move, committed here (`decide_period`)."""
+    """The current period, its balance and the packs, without writing: a period never
+    used has no row and its whole grant left."""
     now = now or utcnow()
-    decided, moved = await decide_period(db, settings, user_id, now)
-    if moved:
-        await db.commit()
+    decided = await decide_period(db, settings, user_id, now)
     period = decided.period
     row = await db.get(CreditPeriod, (user_id, period.start))
     packs = tuple(
@@ -200,10 +203,8 @@ async def read_balance(
 async def plan_of(db: AsyncSession, settings: Settings, user_id: int) -> Plan:
     """The plan the user's current period belongs to, which is where their entitlements
     come from (docs/billing.md § Plans): the storage cap, the concurrency cap and
-    whether the chat agent gets `bash`. A move of the bank is flushed, not committed:
-    the caller's transaction carries it, or the next read does."""
-    decided, _ = await decide_period(db, settings, user_id)
-    return decided.period.plan
+    whether the chat agent gets `bash`. Read, never written: no lock is taken."""
+    return (await decide_period(db, settings, user_id)).period.plan
 
 
 def storage_limit(settings: Settings, plan: Plan) -> int:
@@ -225,10 +226,10 @@ async def period_row(
     db: AsyncSession, settings: Settings, user_id: int, now: datetime | None = None
 ) -> tuple[CreditPeriod, Period]:
     """The period row a charge at `now` lands in, created on first use; a plan change
-    raises its grant and never lowers it (docs/billing.md § Periods)."""
+    raises its grant and never lowers it (docs/billing.md § Periods). The caller holds the
+    user's row lock, under which the bank's move, if any, is written (`settle_period`)."""
     now = now or utcnow()
-    decided, _ = await decide_period(db, settings, user_id, now)
-    period = decided.period
+    period = (await settle_period(db, settings, user_id, now)).period
     plan_id = None if period.plan.free else period.plan.id
     row = await db.get(CreditPeriod, (user_id, period.start))
     if row is None:

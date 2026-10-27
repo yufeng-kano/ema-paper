@@ -83,7 +83,17 @@ async def redeem(
     code row locked and checked, the redemption written and the grant made; committed
     here, the refusal's count included (docs/billing.md § Redeem codes)."""
     now = now or utcnow()
-    user = (await db.execute(select(User).where(User.id == user_id).with_for_update())).scalar_one()
+    user = (
+        await db.execute(
+            select(User)
+            .where(User.id == user_id)
+            .with_for_update()
+            # The session's `User` was loaded by the request's authentication, before this
+            # lock: its counters are read again under it, so overlapping attempts count
+            # each other.
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
     window = timedelta(seconds=settings.redeem_failure_window_seconds)
     in_window = user.redeem_failed_at is not None and now - user.redeem_failed_at < window
     if in_window and user.redeem_failures >= settings.redeem_max_failures:
@@ -122,7 +132,7 @@ async def redeem(
         elif row.kind == PLAN:
             # The bank as it stands now — a period that ran out closed first — holds one
             # plan: another plan's days cannot join it.
-            await ledger.decide_period(db, settings, user_id, now)
+            await ledger.settle_period(db, settings, user_id, now)
             grant = await db.get(PlanGrant, user_id)
             if (
                 grant is not None
@@ -178,7 +188,7 @@ async def redeem(
     grant.updated_at = now
     await db.flush()
     # Opens the granted period at once when no paid period covers now.
-    decided, _ = await ledger.decide_period(db, settings, user_id, now)
+    decided = await ledger.settle_period(db, settings, user_id, now)
     await db.commit()
     return Redeemed(
         PLAN,

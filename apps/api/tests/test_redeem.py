@@ -365,16 +365,29 @@ async def test_days_wait_under_a_paid_subscription_and_a_paid_period_cuts_an_ope
     assert billing["period"]["source"] == "subscription"
     assert billing["plan_grant"]["days_banked"] == 30
     assert billing["plan_grant"]["period_start"] is None
-    # The subscription lapses: the next read opens the bank's days.
+    # The subscription lapses: a read shows the bank's days opened, and writes nothing —
+    # the first charge persists the period it computed (docs/billing.md § Periods).
     async with sessionmaker() as db:
         await db.execute(delete(Subscription).where(Subscription.user_id == user_id))
         await db.commit()
     billing = (await client.get("/api/billing")).json()
     assert (billing["period"]["source"], billing["plan_grant"]["days_banked"]) == ("grant", 0)
-    opened_start = datetime.fromisoformat(billing["plan_grant"]["period_start"])
-    # Subscribed again, since yesterday: the open granted period is cut at the paid
-    # one's start and its whole days go back — one read says so, and the next charge
-    # agrees with it.
+    assert billing["plan_grant"]["period_end"] is not None
+    async with sessionmaker() as db:
+        grant = await db.get(PlanGrant, user_id)
+        assert (grant.days_banked, grant.period_start) == (30, None)
+        entry = await ledger.reserve(db, settings, user_id=user_id, kind=ledger.PARSE, amount=1)
+        await db.commit()
+        await db.refresh(grant)
+        assert (grant.days_banked, grant.period_start, grant.period_end) == (
+            0,
+            entry.period_start,
+            entry.period_start + timedelta(days=30),
+        )
+        opened_start = grant.period_start
+    # Subscribed again, since yesterday: the open granted period is cut at the paid one's
+    # start and its whole days go back — a read says so, the next charge writes it, and
+    # the cut period's row keeps what it was charged.
     await grant_plan(sessionmaker, user_id, version=2)
     billing = (await client.get("/api/billing")).json()
     assert (billing["period"]["source"], billing["plan"]["id"]) == ("subscription", "pro")
@@ -386,15 +399,15 @@ async def test_days_wait_under_a_paid_subscription_and_a_paid_period_cuts_an_ope
     }
     async with sessionmaker() as db:
         grant = await db.get(PlanGrant, user_id)
-        assert (grant.days_banked, grant.period_start) == (30, None)
+        assert (grant.days_banked, grant.period_start) == (0, opened_start)
         entry = await ledger.reserve(db, settings, user_id=user_id, kind=ledger.PARSE, amount=1)
         await db.commit()
+        await db.refresh(grant)
+        assert (grant.days_banked, grant.period_start, grant.period_end) == (30, None, None)
         subscription = await db.get(Subscription, user_id)
         assert entry.period_start == subscription.period_start
-        row = await db.get(CreditPeriod, (user_id, entry.period_start))
-        assert (row.plan_id, row.period_end) == ("pro", subscription.period_end)
-        # The cut granted period's row, if it had one, is left as it is; none was used.
-        assert await db.get(CreditPeriod, (user_id, opened_start)) is None
+        cut = await db.get(CreditPeriod, (user_id, opened_start))
+        assert (cut.plan_id, cut.granted, cut.spent) == ("pro", 5000, 1)
 
 
 async def test_a_code_of_another_plan_than_the_banks_is_refused(make_client, sessionmaker) -> None:

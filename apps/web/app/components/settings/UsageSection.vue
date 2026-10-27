@@ -40,6 +40,13 @@ const {
 
 const free = computed(() => billing.value?.plan.id === 'free')
 
+/** Whether a Pay subscription pays for the current period: the period says, not the row —
+ *  a lapsed subscriber's row stands while their period is Free's or redeemed days'
+ *  (docs/billing.md § Periods). */
+const subscribed = computed(
+  () => (billing.value?.period.source ?? (billing.value?.subscription ? 'subscription' : 'free')) === 'subscription',
+)
+
 const planName = computed(() => {
   const plan = billing.value?.plan
   return !plan ? '' : plan.id === 'free' ? t('usage.free') : plan.name
@@ -270,7 +277,7 @@ async function runSandboxAction(action: () => Promise<void>) {
             </UiButton>
             <!-- The same checkout: *Upgrade* on Free, *Subscribe* on redeemed days, whose rest
                  waits for the subscription to end (docs/billing.md § Periods, *Granted days*). -->
-            <UiButton v-if="!billing.subscription && billing.checkout_available" :loading="acting" @click="upgrade">
+            <UiButton v-if="!subscribed && billing.checkout_available" :loading="acting" @click="upgrade">
               {{ free ? t('usage.upgrade') : t('usage.subscribe') }}
             </UiButton>
           </div>
