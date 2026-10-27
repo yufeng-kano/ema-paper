@@ -62,12 +62,14 @@ Per 1K tokens, and what the measured average turn comes to; the parse rate is th
 | Model | input | cache read | cache write | output | ≈ per turn |
 |---|---|---|---|---|---|
 | `gpt-6-luna` | 0.05 | 0.005 | 0.05 | 0.25 | 2 |
+| `deepseek-v4.1-flash` | 0.15 | 0.003 | 0.15 | 0.6 | 4 |
+| `gemini-3.8-flash` | 0.75 | 0.075 | 0.75 | 3.75 | 27 |
 | `claude-sonnet-5-5` | 1 | 0.05 | 1.25 | 5 | 34 |
 | `gpt-6-sol` | 1 | 0.1 | 1 | 5 | 36 |
 | `gpt-5.6-terra` | 1 | 0.1 | 1 | 6 | 39 |
 | `claude-opus-5-5` | 2 | 0.1 | 2.5 | 10 | 68 |
 
-Those are `MODEL_PRICES_JSON` values divided by `CREDIT_USD`; the table is an illustration, the configuration is the truth. A web search is `WEB_SEARCH_CREDITS` (3) per call on top, the same on every model. OpenAI bills input past 272K tokens at twice the rate; the proxy's usage report does not say which tokens those were, so this service prices every token at the base rate and the operator carries the difference on the rare long turn.
+Those are `MODEL_PRICES_JSON` values divided by `CREDIT_USD`; the table is an illustration, the configuration is the truth. `gemini-3.8-flash` and `deepseek-v4.1-flash` (added 2026-10-27) are priced at their regular list rates — not Google's 2026 launch price, not DeepSeek's off-peak rate — and neither charges a cache write, so their cache-write rate is the input rate and is never reached ([chat.md](./chat.md) § Upstream). A web search is `WEB_SEARCH_CREDITS` (3) per call on top, the same on every model. OpenAI bills input past 272K tokens at twice the rate; the proxy's usage report does not say which tokens those were, so this service prices every token at the base rate and the operator carries the difference on the rare long turn.
 
 ### Periods
 
