@@ -310,6 +310,11 @@ class Settings(BaseSettings):
     download_max_bytes: int = 100_000_000
     web_tool_timeout_seconds: float = 30.0
     download_timeout_seconds: float = 120.0
+    # `convert_file`: a kept PDF or image converted into a document inside the turn — how
+    # many per turn, and how long the turn waits for the parse before putting it back on
+    # the queue for the worker (docs/chat.md § Tools, *A conversion runs inside the turn*).
+    convert_file_max_per_turn: int = 5
+    convert_file_timeout_seconds: float = 900.0
 
     # The sandbox runner (docs/sandbox.md). Empty URL = no sandbox: the chat agent runs
     # without its bash tool. The token is what api and worker present to the runner.
@@ -360,6 +365,7 @@ class Settings(BaseSettings):
             "paper_search_max_per_day",
             "read_url_max_per_turn",
             "download_max_per_day",
+            "convert_file_max_per_turn",
             "chat_idle_compact_min_tokens",
             "chat_idle_compact_lead_seconds",
             "chat_compact_max_tool_calls",
@@ -381,6 +387,7 @@ class Settings(BaseSettings):
             "redeem_failure_window_seconds",
             "admin_reauth_hours",
             "admin_probe_timeout_seconds",
+            "convert_file_timeout_seconds",
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name.upper()} must be positive")

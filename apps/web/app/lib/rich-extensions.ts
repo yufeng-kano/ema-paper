@@ -457,6 +457,7 @@ function drawSegments(into: HTMLElement, segments: readonly InlineSegment[]): vo
         into.append(' ')
         break
       case 'cite':
+      case 'link':
         drawSegments(into, segment.segments)
         break
       default: {

@@ -102,7 +102,7 @@ const reportBlocks = computed(() =>
       <div v-if="card.report" class="report" :class="{ failed: card.status === 'error' }">
         <span class="report-label">{{ t('chat.subagentReport') }}</span>
         <div class="report-body">
-          <MdBlock v-for="(block, index) in reportBlocks" :key="index" :block="block" />
+          <MdBlock v-for="(block, index) in reportBlocks" :key="index" :block="block" links />
         </div>
       </div>
     </div>

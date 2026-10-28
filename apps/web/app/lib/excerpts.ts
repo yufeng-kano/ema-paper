@@ -21,6 +21,7 @@ import {
   parseResultMarkdown,
   passageKey,
   placedBlocks,
+  readBlockAnchor,
   resolveAnchor,
   sectionExtent,
   type BlockAt,
@@ -436,7 +437,7 @@ export function linkResolves(
   }
   if (link.anchor.includes('~')) {
     // A block reference: it leads wherever its anchor resolves to.
-    return resolveAnchor(pages, decodeBlockAnchor(link.anchor), outline) !== null
+    return resolveAnchor(pages, readBlockAnchor(link.anchor), outline) !== null
   }
   const heading = findHeading(outline, link.label, link.anchor)
   return heading !== null || (link.passage !== null && locatePassage(pages, link.passage, null) !== null)

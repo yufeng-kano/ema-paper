@@ -317,6 +317,7 @@ async def test_a_turn_edits_the_document_and_streams_its_events(chatting, monkey
         "memory",
         "read_url",
         "download_file",
+        "convert_file",
     ]  # no sandbox configured → no bash; no keys → no searches (docs/chat.md § Tools)
     assert first["system"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
     assert first["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
@@ -1315,6 +1316,7 @@ async def test_the_agent_page_lists_only_the_tools_the_deployment_has(
         "memory",
         "read_url",
         "download_file",
+        "convert_file",
     ]
     bare = make_client(workspaces_dir=str(tmp_path / "ws2"), sandbox_url="")
     await bare.post("/api/auth/dev-login", headers=CSRF_HEADERS)
@@ -1332,6 +1334,7 @@ async def test_the_agent_page_lists_only_the_tools_the_deployment_has(
         "memory",
         "read_url",
         "download_file",
+        "convert_file",
     ]
 
 

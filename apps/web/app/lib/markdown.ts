@@ -622,6 +622,11 @@ export type InlineSegment =
    *  docs/web.md § The agent panel, *Section links*). `segments` is its text as drawn,
    *  `label` that text with the markdown removed, `anchor` what follows the `#`. */
   | { kind: 'cite'; segments: InlineSegment[]; label: string; anchor: string; src: string }
+  /** An answer's link to the web — `[MoCo](https://arxiv.org/abs/1911.05722)`, a bare
+   *  `https://…` in its text, or one in angle brackets — read only when the caller asks for
+   *  it (`links`, docs/web.md § The agent panel, *Links*). `href` is the target, `http` or
+   *  `https` only; `segments` is its text as drawn. */
+  | { kind: 'link'; segments: InlineSegment[]; href: string; src: string }
 
 /** Whether a section link's heading is still in the document: a link that answers yes is
  *  drawn as a chip, one that answers no as its plain text. */
@@ -632,6 +637,9 @@ export interface InlineOptions {
   /** Section links, which only an answer of the agent panel writes; everywhere else a
    *  link stays the text it was (docs/web.md § Result viewer, *Inline markdown*). */
   cites?: boolean
+  /** Links to the web — `[text](https://…)` and bare addresses — which the agent panel's
+   *  answers alone draw as links (docs/web.md § The agent panel, *Links*). */
+  links?: boolean
 }
 
 /**
@@ -738,9 +746,12 @@ export function isEscaped(text: string, index: number): boolean {
 /**
  * A section link: a non-blank text in brackets — escaped brackets and code allowed inside,
  * bare ones not — then `(#anchor)` or `(doc.md#anchor)`, the anchor free of spaces and
- * parentheses. Any other target (`https://…`, `notes.md#x`, `#a b`) is not one.
+ * parentheses. A block anchor — one holding `~` (docs/web.md § Files, *A block can be linked
+ * to*) — may carry its words after the `~` as the agent writes them, spaces and balanced
+ * parentheses included (`#3-method~Figure 3: Results (ours)`), as well as escaped the way an
+ * address carries them. Any other target (`https://…`, `notes.md#x`, `#a b`) is not one.
  */
-const CITE_AT = /^\[((?:\\[\s\S]|[^[\]\\\n])+)\]\((?:doc\.md)?#([^\s()]*)\)/
+const CITE_AT = /^\[((?:\\[\s\S]|[^[\]\\\n])+)\]\((?:doc\.md)?#([^\s()]*(?:~(?:[^()\n]|\([^()\n]*\))*)?)\)/
 
 /** The section link opening at `index`, or null. Its text is read like any other inline
  *  run — math and emphasis drawn — but holds no link of its own. */
@@ -758,13 +769,80 @@ function citeAt(text: string, index: number): { segment: InlineSegment; length: 
 }
 
 /**
+ * A link to the web: a non-blank text in brackets, as a section link's, then an `http://` or
+ * `https://` target in parentheses — balanced parentheses allowed inside it, as an encyclopedia
+ * address has them — and an optional quoted title. Any other scheme (`javascript:`, `mailto:`,
+ * a relative path) is not one and stays the text it was.
+ */
+const LINK_AT = /^\[((?:\\[\s\S]|[^[\]\\\n])+)\]\((https?:\/\/(?:[^\s()<>]|\([^\s()<>]*\))+)(?:\s+"[^"\n]*")?\)/
+/** A bare address in the text, as far as the next space or angle bracket; `autolinkAt` cuts
+ *  what trails it. */
+const URL_AT = /^https?:\/\/[^\s<>]+/
+/** An address in angle brackets, `<https://…>`: the brackets are the link's syntax, not text. */
+const ANGLE_LINK_AT = /^<(https?:\/\/[^\s<>]+)>/
+/** What a bare address never ends with: GFM's trailing punctuation, and quotes. */
+const URL_TRAIL = /[?!.,:*_~'"]$/
+
+/** The link to the web opening at `index`, or null. Its text is read like any other inline
+ *  run — math and emphasis drawn — but holds no link of its own. */
+function linkAt(text: string, index: number): { segment: InlineSegment; length: number } | null {
+  const match = LINK_AT.exec(text.slice(index))
+  const label = match?.[1] ?? ''
+  if (!match || !label.trim()) {
+    return null
+  }
+  return {
+    segment: { kind: 'link', segments: parseInline(label), href: match[2] ?? '', src: match[0] },
+    length: match[0].length,
+  }
+}
+
+/**
+ * The bare address starting at `index`, or null: one that begins where no word does and is
+ * not a bracketed construct's destination, read as GFM's autolinks are — trailing punctuation
+ * left out, and a closing parenthesis the address did not open left to the sentence, so
+ * `(see https://example.org/a)` links `…/a` alone.
+ */
+function autolinkAt(text: string, index: number): { segment: InlineSegment; length: number } | null {
+  if (index > 0 && WORD_CHAR.test(text[index - 1] ?? '')) {
+    return null
+  }
+  // The destination of a bracketed construct the scan did not read as a link — an image's,
+  // a blank-texted link's — is that construct's, not an address of its own.
+  if (text.slice(Math.max(0, index - 2), index) === '](') {
+    return null
+  }
+  const match = URL_AT.exec(text.slice(index))
+  if (!match) {
+    return null
+  }
+  let href = match[0]
+  for (;;) {
+    if (URL_TRAIL.test(href)) {
+      href = href.slice(0, -1)
+      continue
+    }
+    if (href.endsWith(')') && href.split(')').length > href.split('(').length) {
+      href = href.slice(0, -1)
+      continue
+    }
+    break
+  }
+  if (!/^https?:\/\/[^\s/]/.test(href)) {
+    return null
+  }
+  return { segment: { kind: 'link', segments: [{ kind: 'text', text: href }], href, src: href }, length: href.length }
+}
+
+/**
  * Parses the styled-inline shapes — emphasis, code, `<br>`, `<sup>`/`<sub>` and, when asked,
- * section links — inside one math-free run of text. Recursive for nesting (`_**Abstract**_`
+ * section links and links to the web — inside one math-free run of text. Recursive for nesting (`_**Abstract**_`
  * is an `em` holding a `strong`); anything that fails a marker's rules stays literal text,
  * which is also the wrong-guess fallback: visible markers beat text silently bolded.
  */
 function parseStyled(text: string, options?: InlineOptions): InlineSegment[] {
   const cites = options?.cites === true
+  const links = options?.links === true
   const segments: InlineSegment[] = []
   let cursor = 0
   let scan = 0
@@ -799,7 +877,15 @@ function parseStyled(text: string, options?: InlineOptions): InlineSegment[] {
 
   while (scan < text.length) {
     const char = text[scan]
-    if (char !== '*' && char !== '_' && char !== '`' && char !== '<' && char !== '\\' && !(cites && char === '[')) {
+    if (
+      char !== '*' &&
+      char !== '_' &&
+      char !== '`' &&
+      char !== '<' &&
+      char !== '\\' &&
+      !((cites || links) && char === '[') &&
+      !(links && char === 'h')
+    ) {
       scan += 1
       continue
     }
@@ -820,9 +906,20 @@ function parseStyled(text: string, options?: InlineOptions): InlineSegment[] {
       continue
     }
     if (char === '[') {
-      const cite = citeAt(text, scan)
-      if (cite) {
-        push(cite.segment, cite.length)
+      // An image's bracket (`![alt](https://…)`) opens no link: the line stays as written.
+      const image = scan > 0 && text[scan - 1] === '!' && !isEscaped(text, scan - 1)
+      const link = (cites ? citeAt(text, scan) : null) ?? (links && !image ? linkAt(text, scan) : null)
+      if (link) {
+        push(link.segment, link.length)
+        continue
+      }
+      scan += 1
+      continue
+    }
+    if (char === 'h') {
+      const link = autolinkAt(text, scan)
+      if (link) {
+        push(link.segment, link.length)
         continue
       }
       scan += 1
@@ -830,6 +927,12 @@ function parseStyled(text: string, options?: InlineOptions): InlineSegment[] {
     }
     const rest = text.slice(scan)
     if (char === '<') {
+      const angle = links ? ANGLE_LINK_AT.exec(rest) : null
+      if (angle) {
+        const href = angle[1] ?? ''
+        push({ kind: 'link', segments: [{ kind: 'text', text: href }], href, src: angle[0] }, angle[0].length)
+        continue
+      }
       const br = BR_AT.exec(rest)
       if (br) {
         push({ kind: 'br', src: br[0] }, br[0].length)
@@ -963,7 +1066,13 @@ function restoreMath(segments: readonly InlineSegment[], maths: readonly MathSou
       if (last < segment.text.length) {
         restored.push({ kind: 'text', text: segment.text.slice(last) })
       }
-    } else if (segment.kind === 'strong' || segment.kind === 'em' || segment.kind === 'sup' || segment.kind === 'sub') {
+    } else if (
+      segment.kind === 'strong' ||
+      segment.kind === 'em' ||
+      segment.kind === 'sup' ||
+      segment.kind === 'sub' ||
+      segment.kind === 'link'
+    ) {
       restored.push({ ...segment, segments: restoreMath(segment.segments, maths), src: restoreSource(segment.src, maths) })
     } else if (segment.kind === 'cite') {
       // The scan steps over a link it can read, but `[The $[0,1]$ interval](#…)` reads only
@@ -990,8 +1099,8 @@ function restoreMath(segments: readonly InlineSegment[], maths: readonly MathSou
  * with each formula standing in as one opaque run, so `$a_{1}$` stays out of the
  * underscore-emphasis rules while a caption bolded around its formulas still reads bold.
  *
- * `cites` reads section links as well (`InlineOptions`); without it a link is the text it
- * always was.
+ * `cites` reads section links as well, and `links` links to the web (`InlineOptions`);
+ * without them a link is the text it always was.
  */
 export function parseInline(text: string, options?: InlineOptions): InlineSegment[] {
   const spans: { at: number; length: number; tex: string }[] = []
@@ -1008,13 +1117,17 @@ export function parseInline(text: string, options?: InlineOptions): InlineSegmen
     // literal character (the same rule parseStyled applies), so it must not open a span
     // here and swallow a real formula behind it.
     const tick = text.indexOf('`', scan)
-    // A section link before the next dollar is stepped over whole too: its text may hold
-    // math of its own (`[3.1 The $\epsilon$-greedy policy](#…)`), which parseStyled reads
-    // with the link rather than splitting the link around it.
-    const bracket = options?.cites && open !== -1 ? text.indexOf('[', scan) : -1
+    // A section link — or a link to the web — before the next dollar is stepped over whole
+    // too: its text may hold math of its own (`[3.1 The $\epsilon$-greedy policy](#…)`),
+    // which parseStyled reads with the link rather than splitting the link around it.
+    const bracket = (options?.cites || options?.links) && open !== -1 ? text.indexOf('[', scan) : -1
     if (bracket !== -1 && bracket < open && (tick === -1 || bracket < tick)) {
-      const cite = isEscaped(text, bracket) ? null : citeAt(text, bracket)
-      scan = bracket + (cite ? cite.length : 1)
+      // An image's bracket opens no link here either, so its alt text's math is collected.
+      const image = bracket > 0 && text[bracket - 1] === '!' && !isEscaped(text, bracket - 1)
+      const link = isEscaped(text, bracket)
+        ? null
+        : ((options?.cites ? citeAt(text, bracket) : null) ?? (options?.links && !image ? linkAt(text, bracket) : null))
+      scan = bracket + (link ? link.length : 1)
       continue
     }
     if (tick !== -1 && (open === -1 || tick < open)) {
@@ -1539,16 +1652,31 @@ export function decodeBlockAnchor(anchor: string): string {
 }
 
 /**
+ * A block anchor as an answer or the notes wrote it, read back: the address form — `+` for
+ * spaces, percent-escapes — decoded; one carrying its words as they are, spaces included, as
+ * the agent writes a figure's (docs/chat.md § System prompt), taken as written, so a `+` in
+ * those words stays one.
+ */
+export function readBlockAnchor(anchor: string): string {
+  return /\s/.test(anchor) ? anchor : decodeBlockAnchor(anchor)
+}
+
+/**
  * Where a block link leads: the first block in its section whose text starts with its words,
  * else such a block anywhere, else the section's heading, else null — the top of the document.
  * Compared as a located passage is, spacing ignored; a link survives edits above it and a
- * block moved to another section.
+ * block moved to another section. A caller that keeps the outline and the placed blocks —
+ * the agent panel, resolving a chip on every render — hands them in.
  */
-export function resolveAnchor(pages: readonly ResultPageBlocks[], anchor: string, outline: readonly OutlineEntry[] = documentOutline(pages)): BlockAt | null {
+export function resolveAnchor(
+  pages: readonly ResultPageBlocks[],
+  anchor: string,
+  outline: readonly OutlineEntry[] = documentOutline(pages),
+  placed: readonly PlacedBlock[] = placedBlocks(pages),
+): BlockAt | null {
   const tilde = anchor.indexOf('~')
   const slug = (tilde === -1 ? anchor : anchor.slice(0, tilde)).trim().toLowerCase()
   const key = tilde === -1 ? '' : passageKey(anchor.slice(tilde + 1))
-  const placed = placedBlocks(pages)
   const heading = slug ? outline.find((entry) => entry.slug === slug) : undefined
   const headingAt = heading ? placed.findIndex((entry) => entry.page === heading.page && entry.index === heading.index) : -1
   const position = (index: number): BlockAt => ({ page: placed[index]!.page, index: placed[index]!.index })

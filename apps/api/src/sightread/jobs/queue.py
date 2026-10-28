@@ -438,6 +438,22 @@ async def claim_next_job(
     return job_id if updated.rowcount == 1 else None
 
 
+async def claim_job(db: AsyncSession, job_id: uuid.UUID, generation: int | None) -> bool:
+    """Claim one queued job by its id — the conversion a chat turn asked for, which the
+    turn drives itself since the worker is busy with the turn (docs/chat.md § Tools,
+    *A conversion runs inside the turn*): `queued` to `running` with the claimer's
+    generation, as `claim_next_job` claims. False when the job was no longer queued."""
+    claimed = (
+        await db.execute(
+            update(Job)
+            .where(Job.id == job_id, Job.status == "queued")
+            .values(status="running", started_at=utcnow(), worker_generation=generation)
+        )
+    ).rowcount == 1
+    await db.commit()
+    return claimed
+
+
 async def next_worker_generation(db: AsyncSession) -> int:
     """The generation a worker takes with the worker lock and writes on every job it
     claims (docs/jobs.md § Queue). PostgreSQL: the next value of a sequence, so no two

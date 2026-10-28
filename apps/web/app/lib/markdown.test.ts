@@ -11,6 +11,7 @@ import {
   headingSlug,
   imageLine,
   inlinePlain,
+  readBlockAnchor,
   insertBlocks,
   moveBlocks,
   parseInline,
@@ -1081,6 +1082,128 @@ describe('section links', () => {
     ])
     expect(parseInline('[a \\] b](#a-b)', { cites: true })).toMatchObject([{ kind: 'cite', label: 'a ] b' }])
   })
+
+  it('reads a block anchor with its words as the agent writes them, spaces and parentheses included', () => {
+    const figure = '[Figure 3: Overview](#3-method~Figure 3: Overview of the method)'
+    expect(parseInline(`See ${figure}.`, { cites: true })).toMatchObject([
+      { kind: 'text', text: 'See ' },
+      { kind: 'cite', label: 'Figure 3: Overview', anchor: '3-method~Figure 3: Overview of the method', src: figure },
+      { kind: 'text', text: '.' },
+    ])
+    expect(parseInline('[Fig. 2](#3-method~Figure 2: (a) Results (ours))', { cites: true })).toMatchObject([
+      { kind: 'cite', anchor: '3-method~Figure 2: (a) Results (ours)' },
+    ])
+    expect(parseInline('[Fig. 2](#3-method~Figure+2%3A+Results)', { cites: true })).toMatchObject([
+      { kind: 'cite', anchor: '3-method~Figure+2%3A+Results' },
+    ])
+    // An unbalanced parenthesis ends the link where markdown ends it: no anchor is read.
+    expect(parseInline('[Fig. 2](#3-method~Figure 2: (a))) tail', { cites: true })).toMatchObject([
+      { kind: 'cite', anchor: '3-method~Figure 2: (a)' },
+      { kind: 'text', text: ') tail' },
+    ])
+  })
+})
+
+describe('links to the web', () => {
+  const moco = '[MoCo](https://arxiv.org/abs/1911.05722)'
+
+  it('reads a markdown link to the web only when asked to', () => {
+    expect(parseInline(`See ${moco}.`)).toEqual([{ kind: 'text', text: `See ${moco}.` }])
+    expect(parseInline(`See ${moco}.`, { cites: true })).toEqual([{ kind: 'text', text: `See ${moco}.` }])
+    expect(parseInline(`See ${moco}.`, { links: true })).toEqual([
+      { kind: 'text', text: 'See ' },
+      { kind: 'link', segments: [{ kind: 'text', text: 'MoCo' }], href: 'https://arxiv.org/abs/1911.05722', src: moco },
+      { kind: 'text', text: '.' },
+    ])
+    expect(inlinePlain(`See ${moco}.`, { links: true })).toBe('See MoCo.')
+  })
+
+  it('reads a link with a title, balanced parentheses in its address, and markdown in its text', () => {
+    expect(parseInline('[a](https://example.org/x "Title")', { links: true })).toMatchObject([
+      { kind: 'link', href: 'https://example.org/x', src: '[a](https://example.org/x "Title")' },
+    ])
+    expect(parseInline('[Foo](https://en.wikipedia.org/wiki/Foo_(bar))', { links: true })).toMatchObject([
+      { kind: 'link', href: 'https://en.wikipedia.org/wiki/Foo_(bar)' },
+    ])
+    expect(parseInline('[**MoCo** v2 and $x$](https://example.org)', { links: true })).toMatchObject([
+      {
+        kind: 'link',
+        href: 'https://example.org',
+        segments: [
+          { kind: 'strong', segments: [{ kind: 'text', text: 'MoCo' }] },
+          { kind: 'text', text: ' v2 and ' },
+          { kind: 'math', tex: 'x' },
+        ],
+        src: '[**MoCo** v2 and $x$](https://example.org)',
+      },
+    ])
+    expect(parseInline(`**${moco}**`, { links: true })).toMatchObject([
+      { kind: 'strong', segments: [{ kind: 'link', href: 'https://arxiv.org/abs/1911.05722' }] },
+    ])
+  })
+
+  it('leaves every other target, an image and an escaped bracket the text they were', () => {
+    for (const text of [
+      '[x](javascript:alert(1))',
+      '[x](mailto:someone@example.org)',
+      '[x](notes.md)',
+      '[x](/files)',
+      '[x](ftp://example.org)',
+      '[ ](https://example.org)',
+      '![alt](https://example.org/i.png)',
+      `\\${moco}`,
+      '`[x](https://example.org)`',
+    ]) {
+      expect(parseInline(text, { links: true }).some((segment) => segment.kind === 'link')).toBe(false)
+    }
+  })
+
+  it('links a bare address, ended before trailing punctuation and a parenthesis it did not open', () => {
+    expect(parseInline('Read https://example.org/a/b?x=1, then stop.', { links: true })).toEqual([
+      { kind: 'text', text: 'Read ' },
+      { kind: 'link', segments: [{ kind: 'text', text: 'https://example.org/a/b?x=1' }], href: 'https://example.org/a/b?x=1', src: 'https://example.org/a/b?x=1' },
+      { kind: 'text', text: ', then stop.' },
+    ])
+    expect(parseInline('(see https://en.wikipedia.org/wiki/Foo_(bar)).', { links: true })).toMatchObject([
+      { kind: 'text', text: '(see ' },
+      { kind: 'link', href: 'https://en.wikipedia.org/wiki/Foo_(bar)' },
+      { kind: 'text', text: ').' },
+    ])
+    expect(parseInline('at http://example.org.', { links: true })).toMatchObject([
+      { kind: 'text', text: 'at ' },
+      { kind: 'link', href: 'http://example.org' },
+      { kind: 'text', text: '.' },
+    ])
+    expect(parseInline('<https://example.org>', { links: true })).toEqual([
+      { kind: 'link', segments: [{ kind: 'text', text: 'https://example.org' }], href: 'https://example.org', src: '<https://example.org>' },
+    ])
+    expect(parseInline('a_b https://example.org/a_b_c and *https://example.org/e*', { links: true })).toMatchObject([
+      { kind: 'text', text: 'a_b ' },
+      { kind: 'link', href: 'https://example.org/a_b_c' },
+      { kind: 'text', text: ' and ' },
+      { kind: 'em', segments: [{ kind: 'link', href: 'https://example.org/e' }] },
+    ])
+  })
+
+  it('reads no address glued to a word, none without a host, and none without the option', () => {
+    expect(parseInline('xhttps://example.org https:// https://.', { links: true })).toEqual([
+      { kind: 'text', text: 'xhttps://example.org https:// https://.' },
+    ])
+    expect(parseInline('Read https://example.org now')).toEqual([{ kind: 'text', text: 'Read https://example.org now' }])
+  })
+
+  it('reads a section link and a web link side by side, and an address inside a link as its target alone', () => {
+    expect(parseInline('[3.2 Attention](#32-attention) and [site](https://example.org)', { cites: true, links: true })).toMatchObject([
+      { kind: 'cite', anchor: '32-attention' },
+      { kind: 'text', text: ' and ' },
+      { kind: 'link', href: 'https://example.org' },
+    ])
+    expect(parseInline('[https://example.org](https://example.org)', { links: true })).toMatchObject([
+      { kind: 'link', href: 'https://example.org', segments: [{ kind: 'text', text: 'https://example.org' }] },
+    ])
+    // The link's own `[` is a section link's first: not a web link when the section link reads.
+    expect(parseInline('[site](https://example.org)', { cites: true })).toEqual([{ kind: 'text', text: '[site](https://example.org)' }])
+  })
 })
 
 describe('documentOutline and findHeading', () => {
@@ -1340,6 +1463,13 @@ describe('block anchors', () => {
     expect(decodeBlockAnchor('a~Let%20%28x%29%20be')).toBe('a~Let (x) be')
     expect(decodeBlockAnchor('a~100%')).toBe('a~100%')
     expect(resolveAnchor(pages, decodeBlockAnchor('32-attention~An+attention+function'))).toEqual({ page: 0, index: 2 })
+  })
+
+  it('reads an anchor the agent wrote with its spaces as written, and an address’s escapes decoded', () => {
+    expect(readBlockAnchor('32-attention~An+attention+function')).toBe('32-attention~An attention function')
+    expect(readBlockAnchor('32-attention~An attention function')).toBe('32-attention~An attention function')
+    expect(readBlockAnchor('a~CLIP+LoRA works')).toBe('a~CLIP+LoRA works')
+    expect(resolveAnchor(pages, readBlockAnchor('32-attention~An attention function can be'))).toEqual({ page: 0, index: 2 })
   })
 
   it('survives the block moving to another section', () => {

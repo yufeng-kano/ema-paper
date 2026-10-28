@@ -22,7 +22,8 @@
  *
  * `cite` is the agent panel's alone: given, an answer's links to the document's sections
  * are read and drawn as chips — those whose heading it says the document still has
- * (docs/web.md § The agent panel, *Section links*).
+ * (docs/web.md § The agent panel, *Section links*). So is `links`: given, an answer's links
+ * to the web are drawn as links (*Links*).
  */
 import type { CiteResolver, ResultBlock } from '~/lib/markdown'
 
@@ -31,6 +32,7 @@ const props = defineProps<{
   figureUrl?: string | null
   figureNote?: string | null
   cite?: CiteResolver
+  links?: boolean
 }>()
 
 const emit = defineEmits<{ 'figure-error': [] }>()
@@ -50,12 +52,12 @@ const figureSource = computed(() => {
 
 <template>
   <h3 v-if="block.kind === 'h2'" class="md-h2" :data-level="block.level">
-    <MdInline :text="block.text" :cite="cite" />
+    <MdInline :text="block.text" :cite="cite" :links="links" />
   </h3>
   <h4 v-else-if="block.kind === 'h3'" class="md-h3" :data-level="block.level">
-    <MdInline :text="block.text" :cite="cite" />
+    <MdInline :text="block.text" :cite="cite" :links="links" />
   </h4>
-  <p v-else-if="block.kind === 'p'" class="md-p"><MdInline :text="block.text" :cite="cite" /></p>
+  <p v-else-if="block.kind === 'p'" class="md-p"><MdInline :text="block.text" :cite="cite" :links="links" /></p>
 
   <!-- KaTeX-typeset, falling back to the verbatim source when it cannot parse. -->
   <MdMath v-else-if="block.kind === 'math'" :tex="block.text" />
@@ -75,7 +77,7 @@ const figureSource = computed(() => {
     :start="block.start"
   >
     <li v-for="(item, itemIndex) in block.items" :key="itemIndex">
-      <MdInline :text="item" :cite="cite" />
+      <MdInline :text="item" :cite="cite" :links="links" />
     </li>
   </component>
 
@@ -86,14 +88,14 @@ const figureSource = computed(() => {
       <thead>
         <tr>
           <th v-for="(cell, column) in block.header" :key="column" scope="col">
-            <MdInline :text="cell" :cite="cite" />
+            <MdInline :text="cell" :cite="cite" :links="links" />
           </th>
         </tr>
       </thead>
       <tbody>
         <tr v-for="(row, rowIndex) in block.rows" :key="rowIndex">
           <td v-for="(cell, column) in row" :key="column">
-            <MdInline :text="cell" :cite="cite" />
+            <MdInline :text="cell" :cite="cite" :links="links" />
           </td>
         </tr>
       </tbody>
@@ -104,7 +106,7 @@ const figureSource = computed(() => {
        column instead of wrapping; its `data-src` is the dots the line carried. -->
   <div v-else-if="block.kind === 'toc'" class="md-toc">
     <p v-for="(entry, entryIndex) in block.entries" :key="entryIndex" class="md-toc-row">
-      <span class="md-toc-title"><MdInline :text="entry.title" :cite="cite" /></span>
+      <span class="md-toc-title"><MdInline :text="entry.title" :cite="cite" :links="links" /></span>
       <template v-if="entry.page !== null">
         <span
           class="md-toc-leader"
@@ -118,7 +120,7 @@ const figureSource = computed(() => {
   </div>
 
   <blockquote v-else-if="block.kind === 'quote'" class="md-quote">
-    <MdBlock v-for="(inner, innerIndex) in block.blocks" :key="innerIndex" :block="inner" :cite="cite" />
+    <MdBlock v-for="(inner, innerIndex) in block.blocks" :key="innerIndex" :block="inner" :cite="cite" :links="links" />
   </blockquote>
 
   <!-- The stored crop when one exists; the dashed frame when it does not. `data-md` is
@@ -140,7 +142,7 @@ const figureSource = computed(() => {
     <!-- Only the caption the page carried: the generated `figN` name and the bbox are how
          a crop is addressed, not something a reader was asked to read. -->
     <figcaption v-if="block.caption" class="figure-caption">
-      <MdInline :text="block.caption" :cite="cite" />
+      <MdInline :text="block.caption" :cite="cite" :links="links" />
     </figcaption>
   </figure>
 
@@ -159,7 +161,7 @@ const figureSource = computed(() => {
       <span>{{ t('viewer.imagePending') }}</span>
     </div>
     <figcaption v-if="block.caption" class="figure-caption">
-      <MdInline :text="block.caption" :cite="cite" />
+      <MdInline :text="block.caption" :cite="cite" :links="links" />
     </figcaption>
   </figure>
 </template>

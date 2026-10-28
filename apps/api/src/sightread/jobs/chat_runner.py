@@ -31,6 +31,7 @@ from ..config import Settings
 from ..db.models import (
     COMPACTION_TURNS,
     EFFORT_DEFAULT,
+    FILE_KIND,
     IDLE_COMPACT_TURN,
     AgentSetting,
     ChatToolCall,
@@ -42,9 +43,11 @@ from ..db.models import (
     Skill,
     Subagent,
     UsageLog,
+    User,
     utcnow,
 )
 from ..errors import ApiError
+from ..parsing.figures import discard_job_figures
 from ..sandbox.client import SandboxClient, SandboxUnavailable
 from ..upstream.anthropic import (
     ChatUsage,
@@ -66,10 +69,15 @@ from ..workspace.documents import (
     DocumentPaths,
     ensure_within_quota,
     folder_names,
+    is_live,
     materialize_document,
     measure_storage,
+    recover_trash,
     stage_upload,
+    trashed_folder_ids,
+    user_folders,
 )
+from ..workspace.layout import DOC_FILE
 from ..workspace.locks import (
     backup_shared,
     clear_writing,
@@ -81,7 +89,9 @@ from ..workspace.memory_file import memory_file_text
 from ..workspace.reconcile import reconcile_locked, reconcile_user
 from . import chat_events, chat_memory, chat_subagent, chat_tools, chat_web
 from .chat_compact import SUMMARY_CONTEXT
-from .queue import HISTORY_FULL, history_bytes
+from .intake import convert_kept_file
+from .queue import HISTORY_FULL, claim_job, history_bytes, requeue_job
+from .runner import fail_job, run_job
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +181,14 @@ class TurnContext:
     web_calls: dict[str, int] = field(default_factory=dict)
     # A compaction's summary once stored, for the finish that makes it the boundary.
     compacted: Compacted | None = None
+    # The worker's generation, which a parse the turn drives itself is claimed with
+    # (docs/chat.md § Tools, *A conversion runs inside the turn*); and that parse's task
+    # while it runs, which the end of the turn cancels rather than waits out.
+    generation: int | None = None
+    inline_parse: asyncio.Task | None = None
+    # Set when the turn ends around a conversion: the wait on the run and the poll of a
+    # job not yet claimed both stop at it.
+    convert_stop: asyncio.Event = field(default_factory=asyncio.Event)
 
     def overdraft_spent(self) -> bool:
         """The credits ran out and the tool calls allowed after them are used."""
@@ -209,6 +227,7 @@ async def _load(
     settings: Settings,
     turn_id: uuid.UUID,
     render_slots: asyncio.Semaphore,
+    generation: int | None = None,
 ) -> TurnContext:
     async with sessionmaker() as db:
         turn = await db.get(ChatTurn, turn_id)
@@ -335,6 +354,7 @@ async def _load(
         tools=tools,
         sandbox=sandbox,
         render_slots=render_slots,
+        generation=generation,
         skills={skill.name: skill for skill in skills},
         subagents={subagent.name: subagent for subagent in subagents},
         facts=facts,
@@ -367,6 +387,7 @@ def turn_tools(shell: bool, settings: Settings) -> list[dict]:
             brave=bool(settings.brave_search_api_key),
             openalex=bool(settings.openalex_api_key),
         ),
+        *chat_agent.convert_tools(parse=bool(settings.parse_model)),
     ]
 
 
@@ -935,10 +956,10 @@ async def _run_tool_unguarded(
         outcome = chat_tools.ToolOutcome(
             "The tool input was not valid JSON; send it again.", is_error=True
         )
-    elif name in chat_agent.WEB_TOOL_NAMES and all(tool.get("name") != name for tool in ctx.tools):
-        # Switched off (`CHAT_WEB_ACCESS`) or without its key, the tool is not this
-        # turn's, whatever the conversation's history still names: never run
-        # (docs/chat.md § Tools).
+    elif name in UNDECLARABLE_TOOLS and all(tool.get("name") != name for tool in ctx.tools):
+        # Switched off (`CHAT_WEB_ACCESS`), without its key, or without a parse model,
+        # the tool is not this turn's, whatever the conversation's history still names:
+        # never run (docs/chat.md § Tools).
         outcome = chat_tools.ToolOutcome(f"{name!r} is not one of this turn's tools", is_error=True)
     elif name in MUTATING_TOOLS:
         outcome = await run_mutating(ctx, name, tool_input)
@@ -1028,6 +1049,8 @@ async def run_mutating(ctx: TurnContext, name: str, tool_input: dict) -> chat_to
     author = f"{git.AGENT_AUTHOR_PREFIX}{ctx.conversation.id}"
     if name == "download_file":
         return await _run_download(ctx, tool_input)
+    if name == "convert_file":
+        return await _run_convert(ctx, tool_input)
     if name != "bash":
         return await chat_tools.run_editor(
             ctx.paths.root,
@@ -1183,7 +1206,10 @@ async def _report_tool(
     return result
 
 
-MUTATING_TOOLS = frozenset({"bash", "str_replace_based_edit_tool", "download_file"})
+MUTATING_TOOLS = frozenset({"bash", "str_replace_based_edit_tool", "download_file", "convert_file"})
+# The tools a deployment may not declare — the web tools and `convert_file` — which a
+# history may still name (docs/chat.md § Tools).
+UNDECLARABLE_TOOLS = frozenset({*chat_agent.WEB_TOOL_NAMES, "convert_file"})
 # The web tools that run with the reads (docs/chat.md § Tools).
 WEB_READ_TOOLS = frozenset({"web_search", "search_papers", "read_url"})
 # Tools that return no image: a spent image budget is no reason to refuse them.
@@ -1364,6 +1390,7 @@ WEB_TOOL_TITLES = {
     "search_papers": "paper searches",
     "read_url": "URL reads",
     "download_file": "downloads",
+    "convert_file": "conversions",
 }
 
 
@@ -1526,6 +1553,262 @@ async def _run_download(ctx: TurnContext, tool_input: dict) -> chat_tools.ToolOu
         f"Kept {row.name} ({row.size_bytes:,} bytes, {row.media_type}) in {where}. "
         f"Tell the user it is their file {row.name}."
     )
+
+
+# --- converting a kept file ----------------------------------------------------------------------
+
+NO_CREDITS_FOR_CONVERSION = (
+    "The conversion was not run: the account's credits are spent, and a conversion would "
+    "cost more. Answer with what you have."
+)
+# How often a turn driving a parse looks for a Stop (docs/chat.md § Tools).
+CONVERT_POLL_SECONDS = 2.0
+VM_FILES = chat_tools.VM_ROOT / "files"
+
+
+def _library_segments(raw: str) -> list[str] | None:
+    """The folders and the name a `convert_file` path names, as the Files page shows them
+    (`Papers/2017/attention.pdf`) or under `/workspace/files/`; None for a path that names
+    nothing, or one with a `.` or `..` component."""
+    text = raw.strip().replace("\\", "/")
+    prefix = f"{VM_FILES.as_posix()}/"
+    if text.startswith(prefix):
+        text = text[len(prefix) :]
+    segments = [part.strip() for part in text.split("/") if part.strip()]
+    if not segments or any(part in (".", "..") for part in segments):
+        return None
+    return segments
+
+
+async def _folder_by_path(
+    db: AsyncSession, user_id: int, names: list[str]
+) -> tuple[bool, int | None]:
+    """The live folder a path of names leads to, as `filing.ensure_folders` finds one but
+    making none: `(found, folder id)`, the id None for the top level."""
+    folders = await user_folders(db, user_id)
+    trashed = trashed_folder_ids(folders.values())
+    parent_id: int | None = None
+    for name in names:
+        found = next(
+            (
+                folder
+                for folder in folders.values()
+                if folder.parent_id == parent_id
+                and folder.name == name
+                and folder.id not in trashed
+            ),
+            None,
+        )
+        if found is None:
+            return False, None
+        parent_id = found.id
+    return True, parent_id
+
+
+async def _run_convert(ctx: TurnContext, tool_input: dict) -> chat_tools.ToolOutcome:
+    """One `convert_file` call, a write of the turn: the file becomes a document exactly as
+    the Files page converts one, and the parse is then driven inside the turn (docs/chat.md
+    § Tools, *A conversion runs inside the turn*; docs/jobs.md § Converting a file)."""
+    settings = ctx.settings
+    user_id = ctx.turn.user_id
+    root = ctx.paths.root
+    segments = _library_segments(_string_input(tool_input, "path"))
+    if segments is None:
+        return chat_tools.ToolOutcome(
+            "The path names no file: give the file's folders and name under the user's "
+            "files, as in 'Papers/2017/attention.pdf'.",
+            is_error=True,
+        )
+    if ctx.credits_exhausted:
+        return chat_tools.ToolOutcome(NO_CREDITS_FOR_CONVERSION, is_error=True)
+    if not _turn_cap(ctx, "convert_file", settings.convert_file_max_per_turn):
+        return _turn_cap_reached("convert_file", settings.convert_file_max_per_turn)
+    *folders, name = segments
+    shown_path = "/".join(segments)
+    shown_doc = (VM_FILES / shown_path / DOC_FILE).as_posix()
+    try:
+        async with backup_shared(root), workspace_lock(root), ctx.sessionmaker() as db:
+            await recover_trash(db, settings, user_id)
+            found, folder_id = await _folder_by_path(db, user_id, folders)
+            row = None
+            if found:
+                # What is in the Trash takes no name (docs/workspace.md § Files): a trashed
+                # row of the same name and place is not the file named.
+                row = (
+                    await db.execute(
+                        select(Document).where(
+                            Document.user_id == user_id,
+                            Document.name == name,
+                            Document.trashed_at.is_(None),
+                            Document.folder_id == folder_id
+                            if folder_id is not None
+                            else Document.folder_id.is_(None),
+                        )
+                    )
+                ).scalar_one_or_none()
+            if row is None or not is_live(row, await user_folders(db, user_id)):
+                return chat_tools.ToolOutcome(
+                    f"No file at {shown_path} in the user's files.", is_error=True
+                )
+            row_id = row.id
+            converted_here = row.kind == FILE_KIND
+            if converted_here:
+                user = await db.get(User, user_id)
+                if user is None:
+                    return chat_tools.ToolOutcome("The user no longer exists.", is_error=True)
+                row = await convert_kept_file(db, settings, user=user, row=row)
+            job = await db.get(Job, row.job_id) if row.job_id is not None else None
+            if job is None or (job.status == "succeeded" and not converted_here):
+                # A document already — a markdown one has no parse at all.
+                return chat_tools.ToolOutcome(
+                    f"{shown_path} is a document already: read {shown_doc}.", is_error=True
+                )
+            if job.status == "failed":
+                return chat_tools.ToolOutcome(
+                    f"The conversion of {shown_path} failed earlier: "
+                    f"{job.error or 'the parse failed'}. The user can retry it from the Files "
+                    "page.",
+                    is_error=True,
+                )
+            # A document whose parse still waits — an upload converting on arrival, queued
+            # behind this turn — is driven below as this call's own conversion would be; a
+            # job already at its end answered from the cache: this call charged nothing.
+            job_id = job.id
+            converted_earlier = converted_here and job.status == "succeeded"
+    except ApiError as exc:
+        return chat_tools.ToolOutcome(
+            f"{shown_path} was not converted: {exc.message}", is_error=True
+        )
+    if converted_here:
+        await _record_tool_call(ctx, "convert_file", settle=False)
+    job = await _drive_parse(ctx, job_id)
+    if job is None:
+        if ctx.convert_stop.is_set() or await _cancelled(ctx):
+            return chat_tools.ToolOutcome(
+                f"The conversion of {shown_path} was interrupted with this turn and goes on "
+                "after it: the document opens in Files when it is done, charged once.",
+                is_error=True,
+            )
+        return chat_tools.ToolOutcome(
+            f"The conversion of {shown_path} is not finished after "
+            f"{int(settings.convert_file_timeout_seconds)} seconds and goes on after this "
+            "turn: the document opens in Files when it is done, charged once. Read it in a "
+            "later turn.",
+            is_error=True,
+        )
+    if job.status != "succeeded":
+        return chat_tools.ToolOutcome(
+            f"The conversion of {shown_path} failed: {job.error or 'the parse failed'}. Its "
+            "credits were released; the user can retry it from the Files page.",
+            is_error=True,
+        )
+    async with ctx.sessionmaker() as db:
+        row = await db.get(Document, row_id)
+        if row is None:
+            return chat_tools.ToolOutcome(f"{shown_path} is gone.", is_error=True)
+        try:
+            # Done by the finish of a parse the turn drove; a cache hit's document is
+            # written here, as a reader's first open would write it.
+            paths = await materialize_document(db, settings, row)
+        except ApiError as exc:
+            return chat_tools.ToolOutcome(
+                f"The document of {shown_path} could not be written: {exc.message}",
+                is_error=True,
+            )
+        credits = (await ledger.credits_by_job(db, [job.id])).get(job.id)
+    doc_path = (chat_tools.VM_ROOT / paths.relative.as_posix() / DOC_FILE).as_posix()
+    cost = (
+        "no credits: the same file was converted before"
+        if converted_earlier
+        else f"{credits:,} credits"
+        if credits is not None
+        else "no credits"
+    )
+    pages = job.page_count or 0
+    return chat_tools.ToolOutcome(
+        f"Converted {row.name} ({pages} page{'s' if pages != 1 else ''}, {cost}) into a "
+        f"document at {doc_path}; read it with str_replace_based_edit_tool. Tell the user "
+        f"it is their document {row.name}."
+    )
+
+
+async def _drive_parse(ctx: TurnContext, job_id: uuid.UUID) -> Job | None:
+    """The job a conversion queued, driven to its end inside the turn: claimed as the
+    worker would claim it and run with the parse runner, or — already running, a stale
+    worker's — waited for; a job the dedup reuse found already queued is claimed the
+    same way. None when the wait ended before the job did — the tool's timeout, a Stop,
+    the end of the turn — with the job put back on the queue keeping its finished pages,
+    for the worker to take after the turn (docs/chat.md § Tools, *A conversion runs
+    inside the turn*)."""
+    settings = ctx.settings
+    deadline = time.monotonic() + settings.convert_file_timeout_seconds
+    while True:
+        async with ctx.sessionmaker() as db:
+            job = await db.get(Job, job_id)
+            if job is None:
+                return None
+            if job.status in ("succeeded", "failed"):
+                return job
+            claimed = job.status == "queued" and await claim_job(db, job_id, ctx.generation)
+        if not claimed:
+            # Another worker's — a stale one still holding it — or claimed and finished
+            # between the two reads: looked at again, within the same bounds, and no longer
+            # once the turn is ending around this call.
+            if time.monotonic() >= deadline or ctx.convert_stop.is_set() or await _cancelled(ctx):
+                return None
+            await asyncio.sleep(CONVERT_POLL_SECONDS)
+            continue
+        run = asyncio.create_task(
+            run_job(ctx.sessionmaker, settings, job_id, ctx.render_slots, ctx.generation)
+        )
+        ctx.inline_parse = run
+        try:
+            finished = await _await_inline_parse(ctx, run, deadline)
+        finally:
+            ctx.inline_parse = None
+        if finished and run.exception() is not None:
+            # As the worker loop answers for a run that raised past the runner: failed,
+            # never requeued, since the parse ran and billed (docs/jobs.md § Queue).
+            logger.error("job %s raised past its runner", job_id, exc_info=run.exception())
+            try:
+                await fail_job(ctx.sessionmaker, settings, job_id, "internal error", ctx.generation)
+            except Exception:  # noqa: BLE001 - the next worker start requeues what stays running
+                logger.exception("could not fail job %s", job_id)
+            continue
+        if finished:
+            continue
+        async with ctx.sessionmaker() as db:
+            requeued = await requeue_job(db, job_id, ctx.generation)
+        if requeued:
+            # This attempt's crops go with it, as on a worker's shutdown (docs/jobs.md).
+            discard_job_figures(Path(settings.figures_dir), job_id)
+            logger.info("job %s put back on the queue by the turn that drove it", job_id)
+            return None
+        # Finished before the cancel landed: its state is read on the next pass.
+
+
+async def _await_inline_parse(ctx: TurnContext, run: asyncio.Task, deadline: float) -> bool:
+    """Wait for the parse the turn drives: True once it has run to its end, False when
+    the deadline passed, the user pressed Stop, or the end of the turn asked for it or
+    cancelled it — the run cancelled and gathered either way, so the caller can put the
+    job back."""
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            done, _ = await asyncio.wait({run}, timeout=min(CONVERT_POLL_SECONDS, remaining))
+            if done:
+                return not run.cancelled()
+            if ctx.convert_stop.is_set() or await _cancelled(ctx):
+                break
+    except asyncio.CancelledError:
+        run.cancel()
+        await asyncio.gather(run, return_exceptions=True)
+        raise
+    run.cancel()
+    await asyncio.gather(run, return_exceptions=True)
+    return False
 
 
 # --- the loop ---------------------------------------------------------------------------------
@@ -1759,6 +2042,14 @@ async def _settle_writer(ctx: TurnContext, writer: asyncio.Future, tool: str | N
     too — rather than the turn being finished over a write still in flight."""
     if writer.done():
         return
+    if tool == "convert_file":
+        # A parse the turn drives is not waited out: stopped, it goes back on the queue
+        # keeping its pages, and the worker takes it after the turn (docs/chat.md § Tools,
+        # *A conversion runs inside the turn*) — the wait on it ends at the event, and so
+        # does the poll of a job not yet claimed.
+        ctx.convert_stop.set()
+        if ctx.inline_parse is not None and not ctx.inline_parse.done():
+            ctx.inline_parse.cancel()
     # The command's own timeout, the time the runner client allows a reply past it, and
     # the margin for the commit and reconciliation that follow (docs/chat.md § Tools).
     grace = (
@@ -1787,10 +2078,13 @@ async def run_turn(
     settings: Settings,
     turn_id: uuid.UUID,
     render_slots: asyncio.Semaphore,
+    generation: int | None = None,
 ) -> None:
-    """Drive one claimed turn to a terminal state. Never raises for the turn's own faults."""
+    """Drive one claimed turn to a terminal state. Never raises for the turn's own faults.
+    `generation` is the worker's, for a parse the turn drives itself (docs/chat.md
+    § Tools, *A conversion runs inside the turn*)."""
     try:
-        ctx = await _load(sessionmaker, settings, turn_id, render_slots)
+        ctx = await _load(sessionmaker, settings, turn_id, render_slots, generation)
     except TurnFailed as exc:
         await _finish(sessionmaker, turn_id, status="failed", error=str(exc))
         return

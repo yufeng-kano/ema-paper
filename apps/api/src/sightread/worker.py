@@ -211,7 +211,7 @@ async def run_worker(stop: asyncio.Event) -> None:
                     snapshot = await runtime.current()
                 logger.info("running chat turn %s", turn_id)
                 running = asyncio.create_task(
-                    run_turn(sessionmaker, snapshot, turn_id, render_slots)
+                    run_turn(sessionmaker, snapshot, turn_id, render_slots, generation)
                 )
                 shutdown = asyncio.create_task(stop.wait())
                 done, _ = await asyncio.wait(

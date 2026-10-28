@@ -42,6 +42,7 @@ import {
   packRows,
   pageOf,
   PAGE_MAX,
+  planLabel,
   planRows,
   priceRows,
   settingImpact,
@@ -293,6 +294,14 @@ describe('a failed console request', () => {
     expect(conflictKey('name_taken')).toBe('admin.conflicts.name_taken')
     expect(conflictKey('something_new')).toBeNull()
     expect(conflictKey(null)).toBeNull()
+  })
+})
+
+describe('planLabel', () => {
+  it('writes a plan id the way the product names the plan', () => {
+    expect(planLabel('pro')).toBe('Pro')
+    expect(planLabel('free')).toBe('Free')
+    expect(planLabel('')).toBe('')
   })
 })
 

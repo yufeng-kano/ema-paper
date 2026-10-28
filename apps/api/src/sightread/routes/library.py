@@ -22,7 +22,7 @@ import sys
 import urllib.parse
 import uuid
 import warnings
-from collections.abc import AsyncIterator, Collection, Mapping
+from collections.abc import Collection, Mapping
 from pathlib import Path
 
 from fastapi import APIRouter, Query, Request, Response, status
@@ -58,9 +58,9 @@ from ..jobs import events
 from ..jobs.chat_tools import PageUnavailable, original_page_png
 from ..jobs.intake import (
     MULTIPART_ENVELOPE_BYTES,
-    UPLOAD_CHUNK_BYTES,
     capped_stream,
     checked_parse_model,
+    convert_kept_file,
     file_chunks,
     insufficient_credits,
     resolve_check,
@@ -2321,12 +2321,6 @@ class DocumentConvert(BaseModel):
     view: str | None = Field(default=None, max_length=16)
 
 
-async def fd_chunks(entry: int) -> AsyncIterator[bytes]:
-    """An open file in chunks, as intake streams an upload."""
-    while chunk := await asyncio.to_thread(os.read, entry, UPLOAD_CHUNK_BYTES):
-        yield chunk
-
-
 @router.post("/documents/{document_id}/convert", dependencies=[CsrfGuard])
 async def convert_document(
     document_id: int,
@@ -2352,109 +2346,7 @@ async def convert_document(
         row = await live_document(db, user_id, document_id)
         if row.kind != FILE_KIND:
             raise ApiError(404, "invalid_request", "No such file")
-        try:
-            _kind, media_type = resolve_kind(row.name, row.media_type or "")
-        except ApiError as exc:
-            raise ApiError(
-                409, "not_convertible", "Only a PDF or an image can be converted into a document"
-            ) from exc
-        relative = await document_relative(db, row)
-        try:
-            entry = await asyncio.to_thread(
-                safe_io.open_for_read, root, root / relative, settings.upload_max_bytes
-            )
-        except safe_io.EntryTooLarge as exc:
-            raise ApiError(413, "invalid_request", "The file exceeds UPLOAD_MAX_BYTES") from exc
-        except (safe_io.UnsafeEntry, OSError) as exc:
-            raise ApiError(409, "invalid_request", workspace_documents.NOT_PLAIN) from exc
-        if entry is None:
-            raise ApiError(409, "invalid_request", "The file is missing from the workspace")
-        try:
-            submission = await submit_parse(
-                db,
-                settings,
-                user=user,
-                chunks=fd_chunks(entry),
-                media_type=media_type,
-                filename=row.name,
-                model=model,
-                reuse_in_flight=True,
-                retain_source=True,
-                check=True,
-            )
-        finally:
-            os.close(entry)
-        job_id = submission.job.id if submission.job is not None else submission.cached.job_id
-        if (
-            submission.cached is not None
-            and await db.scalar(select(Job.id).where(Job.id == job_id)) is None
-        ):
-            # The purged-cache race a Files upload meets (docs/jobs.md § Dedup margin).
-            if submission.upload is not None:
-                submission.upload.unlink(missing_ok=True)
-            raise ApiError(
-                409, "invalid_request", "The earlier parse of this file was just deleted; try again"
-            )
-        # The parse is committed; the row, read again, becomes its document.
-        await db.refresh(row)
-        row_id = row.id
-        row.job_id = job_id
-        row.kind = PARSE_KIND
-        row.media_type = None
-        row.size_bytes = None
-        if view is not None:
-            row.view = view
-        await db.flush()
-        job = await job_of(db, job_id)
-        # The file out of the tree, aside, as a delete moves a directory: back should the
-        # row not commit, gone once it has (docs/workspace.md § Files).
-        removal = await workspace_documents.remove_path(
-            settings, user_id, relative, message=f"convert {relative}"
-        )
-        adopted = False
-        try:
-            # A cache hit or a parse joined in flight hands this row the fresh copy as its
-            # original now; a parse just queued has the worker file it (§ Retention).
-            await workspace_documents.adopt_source(
-                db, settings, row, job, upload=submission.upload, locked=True
-            )
-            adopted = True
-            await db.commit()
-        except BaseException as exc:
-            readable, landed = await read_row(db, Document, row_id)
-            if readable and isinstance(landed, Document) and landed.job_id == job_id:
-                logger.warning(
-                    "the conversion of document %d was committed despite the error", row_id
-                )
-                row = landed
-            else:
-                with contextlib.suppress(Exception):
-                    await db.rollback()
-                if adopted:
-                    with contextlib.suppress(Exception):
-                        await workspace_documents.discard_adopted(
-                            settings, user_id, row_id, relative
-                        )
-                if removal is not None:
-                    try:
-                        await workspace_documents.restore_removed(
-                            settings, user_id, relative, removal
-                        )
-                    except Exception:  # noqa: BLE001 - the file waits aside, whole
-                        logger.exception(
-                            "could not bring %s back after a failed conversion", relative
-                        )
-                if isinstance(exc, ApiError):
-                    raise
-                logger.exception("document %d could not be converted", row_id)
-                raise ApiError(
-                    409, "invalid_request", "The file could not be converted; nothing was changed"
-                ) from exc
-        if removal is not None:
-            try:
-                await workspace_documents.discard_removed(settings, user_id, removal)
-            except Exception:  # noqa: BLE001 - the next reconciliation sweeps it
-                logger.exception("could not discard %s set aside by a conversion", relative)
+        row = await convert_kept_file(db, settings, user=user, row=row, model=model, view=view)
     return await read_document_payload(db, settings, row)
 
 

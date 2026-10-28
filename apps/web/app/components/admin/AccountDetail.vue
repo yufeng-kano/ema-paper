@@ -7,6 +7,7 @@
  * screen opens the dialogs.
  */
 import type { AdminUserDetail } from '~/lib/api'
+import { planLabel } from '~/lib/admin'
 import { formatBytes, formatCount, formatDate, formatShortDateTime } from '~/lib/format'
 
 const props = defineProps<{
@@ -30,7 +31,7 @@ const initial = computed(() => displayName.value.charAt(0).toUpperCase())
 const planLine = computed(() => {
   const plan = props.detail.plan
   return plan.source === 'subscription' || plan.source === 'grant'
-    ? `${plan.id} · ${t(`admin.users.paidBy.${plan.source}`)}`
+    ? `${planLabel(plan.id)} · ${t(`admin.users.paidBy.${plan.source}`)}`
     : t('admin.users.free')
 })
 
@@ -99,7 +100,7 @@ function jobLine(job: AdminUserDetail['jobs']['recent'][number]): string {
     <section class="block">
       <h3 class="block-title">{{ t('admin.users.dayBankTitle') }}</h3>
       <p class="value">
-        {{ t('admin.users.daysWaiting', { n: formatCount(banked, locale), plan: detail.day_bank?.plan_id ?? '' }, banked) }}
+        {{ t('admin.users.daysWaiting', { n: formatCount(banked, locale), plan: planLabel(detail.day_bank?.plan_id ?? '') }, banked) }}
       </p>
       <p v-if="banked > 0 && detail.plan.source === 'subscription'" class="muted">
         {{ t('admin.users.daysWaitForSubscription') }}

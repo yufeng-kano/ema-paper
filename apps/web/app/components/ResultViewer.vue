@@ -58,7 +58,6 @@ import {
   appendBlockSource,
   blockAnchor,
   blockPlain,
-  decodeBlockAnchor,
   documentOutline,
   findHeading,
   findPlace,
@@ -68,6 +67,7 @@ import {
   parseResultMarkdown,
   placeNear,
   placedBlocks,
+  readBlockAnchor,
   replaceBlockSource,
   resolveAnchor,
   sectionSource,
@@ -2996,7 +2996,7 @@ async function locateLink(target: SectionLinkTarget) {
   await nextTick()
   if (target.anchor.includes('~')) {
     // A block reference: revealed as opening its address does.
-    const at = resolveAnchor(pages.value, decodeBlockAnchor(target.anchor), outline.value)
+    const at = resolveAnchor(pages.value, readBlockAnchor(target.anchor), outline.value)
     if (at && placedIndex.value.has(blockKey(at))) {
       setWayBack()
       pressLink(target)
@@ -3214,7 +3214,9 @@ async function showHeading(entry: OutlineEntry, wash: boolean) {
 
 /**
  * An answer's section link, followed (docs/web.md § The agent panel, *Section links*): the
- * heading scrolled near the pane's top and washed for a moment, and the way back set.
+ * heading scrolled near the pane's top and washed for a moment, and the way back set. An
+ * answer's block link — a figure it used (*Links*) — reveals its block as opening its
+ * address does.
  */
 async function locateSection(target: { label: string; anchor: string }) {
   if (tab.value !== 'markdown') {
@@ -3222,6 +3224,15 @@ async function locateSection(target: { label: string; anchor: string }) {
     await nextTick()
     // After the tab's own watcher has put the reader's old place back.
     await new Promise((done) => requestAnimationFrame(done))
+  }
+  if (target.anchor.includes('~')) {
+    const at = resolveAnchor(pages.value, readBlockAnchor(target.anchor), outline.value)
+    if (at && placedIndex.value.has(blockKey(at))) {
+      setWayBack()
+      await revealBlock(at)
+      armWayBack()
+    }
+    return
   }
   const heading = findHeading(outline.value, target.label, target.anchor)
   if (!heading) {

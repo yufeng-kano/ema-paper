@@ -27,6 +27,7 @@ export type StepKind =
   | 'papers'
   | 'fetch'
   | 'download'
+  | 'convert'
   | 'tool'
 
 export interface Step {
@@ -62,6 +63,7 @@ export const SUMMARY_ORDER: readonly StepKind[] = [
   'edit',
   'create',
   'download',
+  'convert',
   'tool',
 ]
 
@@ -382,6 +384,9 @@ export function readStep(name: string, input: Record<string, unknown>): Step {
     case 'download_file':
       // The name the call asked for, else its URL: what the reader will find in Files.
       return { kind: 'download', target: text(input.name) || text(input.url) }
+    case 'convert_file':
+      // The file's name: the row in Files that becomes a document.
+      return { kind: 'convert', target: basename(text(input.path)) }
     default:
       return { kind: 'tool', target: name }
   }

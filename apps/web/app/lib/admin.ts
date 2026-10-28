@@ -284,6 +284,12 @@ export function auditAreaOf(value: unknown): AdminArea | null {
 
 // --- users and grants -----------------------------------------------------------------
 
+/** A plan's id as the console shows it (docs/admin.md § Users): its first letter upper-cased,
+ *  the way the product writes its plan names — `pro` is *Pro*. */
+export function planLabel(id: string): string {
+  return id.charAt(0).toUpperCase() + id.slice(1)
+}
+
 /** A grant's number as typed (docs/admin.md § Users and grants): a whole number from 1 to
  *  `max`, the API's cap, else null — and the dialog's button stays off. */
 export function grantNumber(text: string, max: number): number | null {

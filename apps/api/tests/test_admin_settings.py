@@ -885,7 +885,7 @@ async def test_the_worker_reads_again_for_a_turn_on_a_model_priced_since_its_cop
             await _store(sessionmaker, "MODEL_PRICES_JSON", json.dumps(prices))
         return waiting.pop(0)
 
-    async def run(maker, settings, turn_id, slots) -> None:
+    async def run(maker, settings, turn_id, slots, generation=None) -> None:
         ran.append((turn_id, "vendor/new-model" in settings.model_prices))
         if not waiting:
             stop.set()
