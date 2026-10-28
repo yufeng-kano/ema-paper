@@ -1,7 +1,7 @@
 // Nuxt control plane (docs/web.md). The app only ever uses relative URLs: in production
 // Caddy routes /api/*, /v1/* to FastAPI and everything else here; in development the
 // nitro dev proxy below reproduces that same-origin split so session cookies work.
-import { PUBLIC_PATHS } from './shared/seo'
+import { PAGE_LOCALES, PUBLIC_PATHS } from './shared/seo'
 
 // The public origin (docs/web.md § Search engines). The public pages are prerendered by this
 // build, so their absolute links are fixed here, not when they are served: the production
@@ -54,11 +54,17 @@ export default defineNuxtConfig({
 
   i18n: {
     defaultLocale: 'en',
-    strategy: 'prefix_except_default',
+    // Every locale has a prefix (docs/web.md § Search engines, *The locale in the URL*): a URL
+    // names its language, and the bare root belongs to none.
+    strategy: 'prefix',
     // Makes every canonical, hreflang and og:url link absolute; Google ignores a relative hreflang.
     baseUrl: siteUrl,
-    // Locale lives in the URL, so no cookie or Accept-Language redirect guessing.
-    detectBrowserLanguage: false,
+    // The root and any path without a locale go to the same path under the visitor's language,
+    // read from `Accept-Language` on the server and `navigator.languages` in the browser,
+    // English when no locale matches. No cookie: the root follows the browser every time, and
+    // a chosen language is a chosen URL. A prefixed path is never redirected, so a shared
+    // link, a bookmark or a search result opens in the language it names.
+    detectBrowserLanguage: { useCookie: false, redirectOn: 'no prefix', fallbackLocale: 'en' },
     locales: [
       { code: 'en', language: 'en', name: 'English', file: 'en.ts' },
       { code: 'zh-TW', language: 'zh-TW', name: '繁體中文', file: 'zh-TW.ts' },
@@ -66,26 +72,31 @@ export default defineNuxtConfig({
   },
 
   routeRules: {
-    // The public pages — the landing page, pricing and the policy pages — are prerendered HTML
-    // in both locales, from the same list the sitemap gives (shared/seo.ts).
+    // The root answers by the visitor's language (the i18n redirect above): say so to any
+    // cache between. The redirect itself is a 302, which nothing keeps.
+    '/': { headers: { vary: 'Accept-Language' } },
+    // The public pages — the sign-in page, pricing, the rates and the policy pages — are
+    // prerendered HTML under each locale, from the same list the sitemap gives (shared/seo.ts).
     ...Object.fromEntries(PUBLIC_PATHS.map((path) => [path, { prerender: true }])),
     // What crawlers read beside the pages, built from the same origin.
     '/robots.txt': { prerender: true },
     '/sitemap.xml': { prerender: true },
-    // Control-plane pages are per-user and session-authenticated: client-rendered only.
-    '/files': { ssr: false },
-    '/settings/**': { ssr: false },
-    '/zh-TW/files': { ssr: false },
-    '/zh-TW/settings/**': { ssr: false },
-    // The operator console (docs/admin.md § Pages): client-rendered like the rest of the
-    // control plane. The bare path is listed beside its subtree, which `/**` alone may not match.
-    '/admin': { ssr: false },
-    '/admin/**': { ssr: false },
-    '/zh-TW/admin': { ssr: false },
-    '/zh-TW/admin/**': { ssr: false },
+    // Control-plane pages are per-user and session-authenticated: client-rendered only, under
+    // each locale. The operator console (docs/admin.md § Pages) is client-rendered like the rest
+    // of the control plane; its bare path is listed beside its subtree, which `/**` alone may
+    // not match.
+    ...Object.fromEntries(
+      PAGE_LOCALES.flatMap(({ prefix }) => [
+        [`${prefix}/files`, { ssr: false }],
+        [`${prefix}/settings/**`, { ssr: false }],
+        [`${prefix}/admin`, { ssr: false }],
+        [`${prefix}/admin/**`, { ssr: false }],
+      ]),
+    ),
     // The four screens that became sections of the settings dialog (docs/web.md § Pages):
     // a bookmark of the old path lands on its section, through the `/settings/<section>`
-    // deep-link page.
+    // deep-link page. The unprefixed paths are English's from before every locale had a
+    // prefix; their targets are localized by the browser's language, like any bare path.
     '/agents': { redirect: '/settings/agent' },
     '/keys': { redirect: '/settings/keys' },
     '/connect': { redirect: '/settings/mcp' },

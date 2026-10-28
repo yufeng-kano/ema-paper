@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { PUBLIC_PATHS, robotsTxt, sitemapXml } from './seo'
+import { PAGE_LOCALES, PUBLIC_PATHS, robotsTxt, sitemapXml } from './seo'
 
 const ORIGIN = 'https://paper.example.com'
 
@@ -17,11 +17,28 @@ const disallowed = (text: string) =>
     .filter((line) => line.startsWith('Disallow: '))
     .map((line) => line.slice('Disallow: '.length))
 
+const underALocale = (path: string) =>
+  PAGE_LOCALES.some(({ prefix }) => path === prefix || path.startsWith(`${prefix}/`))
+
+describe('the public paths', () => {
+  it('every one carries its locale: the bare root redirects by language and is no page', () => {
+    for (const path of PUBLIC_PATHS) {
+      expect(underALocale(path)).toBe(true)
+    }
+    expect(PUBLIC_PATHS).toContain('/en')
+    expect(PUBLIC_PATHS).toContain('/zh-TW')
+    expect(PUBLIC_PATHS).not.toContain('/')
+    expect(PUBLIC_PATHS).not.toContain('/pricing')
+  })
+})
+
 describe('the sitemap', () => {
   it('lists every public page in both locales once, under the origin', () => {
     const locs = entries(sitemapXml(ORIGIN)).map(({ loc }) => loc)
     expect(locs).toHaveLength(new Set(locs).size)
     expect([...locs].sort()).toEqual(PUBLIC_PATHS.map((path) => ORIGIN + path).sort())
+    expect(locs).toContain(`${ORIGIN}/en`)
+    expect(locs).toContain(`${ORIGIN}/en/pricing`)
     expect(locs).toContain(`${ORIGIN}/zh-TW`)
     expect(locs).toContain(`${ORIGIN}/zh-TW/pricing`)
   })
@@ -31,6 +48,7 @@ describe('the sitemap', () => {
       expect(Object.keys(alternates).sort()).toEqual(['en', 'x-default', 'zh-TW'])
       expect(Object.values(alternates)).toContain(loc)
       expect(alternates['x-default']).toBe(alternates.en)
+      expect(alternates.en).toMatch(new RegExp(`^${ORIGIN}/en(/|$)`))
       expect(alternates['zh-TW']).toMatch(new RegExp(`^${ORIGIN}/zh-TW(/|$)`))
     }
   })
@@ -52,12 +70,12 @@ describe('robots.txt', () => {
   it('keeps crawlers off the authed pages, the operator console and the sign-in redirect, in both locales', () => {
     const rules = disallowed(robotsTxt(ORIGIN))
     for (const path of [
-      '/files',
-      '/settings/usage',
+      '/en/files',
+      '/en/settings/usage',
       '/zh-TW/files',
       '/zh-TW/settings/keys',
-      '/admin',
-      '/admin/groups',
+      '/en/admin',
+      '/en/admin/groups',
       '/zh-TW/admin',
       '/zh-TW/admin/audit',
       '/api/auth/login',
