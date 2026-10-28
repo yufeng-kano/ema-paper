@@ -2,12 +2,14 @@
 /**
  * Usage (docs/web.md § Pages, `/settings/usage`; the contract is docs/billing.md), laid out
  * as Claude's own usage page: the plan and its action — *Upgrade* (a checkout) or *Manage
- * subscription* (Pay's portal) and *Top up* (a pack's checkout, docs/billing.md § Top-up
- * packs) — then the usage limits, the period's credits, the top-up credits while a pack is
- * active and the workspace's storage, each a bar with *N% used*, the packs bought, one line
- * on the rates with the way to the rates page (no table here, since 2026-10-26), and the
- * sandbox the plan gives. Every figure is the API's: the section never names a price or a
- * plan the API did not.
+ * subscription* (Pay's portal) — then the usage limits, the period's credits and the
+ * workspace's storage, each a bar with *N% used*, the top-up credits on a paid plan (the
+ * packs' balance, the newest packs with every one in a dialog, and *Top up*, which opens
+ * the pack's dialog before Pay's checkout — docs/billing.md § Top-up packs), one line on
+ * the rates with the way to the rates page (no table here, since 2026-10-26), and the
+ * sandbox the plan gives. Redeemed days of a plan are said under the plan, and the plan's foot
+ * ends in the way to the redeem dialog, Free or paid (docs/billing.md § Redeem codes). Every
+ * figure is the API's: the section never names a price or a plan the API did not.
  */
 import {
   createCheckout,
@@ -17,11 +19,9 @@ import {
   getSandbox,
   resetSandbox,
   stopSandbox,
-  type BillingPack,
   type SandboxState,
 } from '~/lib/api'
 import { formatBytes, formatCount, formatDate, formatShortDateTime } from '~/lib/format'
-import type { TableColumn } from '~/lib/table'
 
 const { t, locale } = useI18n()
 const { resolve } = useApiError()
@@ -39,6 +39,13 @@ const {
 // --- the plan ----------------------------------------------------------------------------
 
 const free = computed(() => billing.value?.plan.id === 'free')
+
+/** Whether a Pay subscription pays for the current period: the period says, not the row —
+ *  a lapsed subscriber's row stands while their period is Free's or redeemed days'
+ *  (docs/billing.md § Periods). */
+const subscribed = computed(
+  () => (billing.value?.period.source ?? (billing.value?.subscription ? 'subscription' : 'free')) === 'subscription',
+)
 
 const planName = computed(() => {
   const plan = billing.value?.plan
@@ -72,42 +79,59 @@ const subscriptionLine = computed(() => {
   return subscription.cancel_at_period_end ? t('usage.cancelAtEnd', { date: end }) : t('usage.renews', { date: end })
 })
 
+/** Redeemed days under the plan (docs/billing.md § Periods, *Granted days*): the open granted
+ *  period and how many days follow it, or how many wait while a paid subscription runs. */
+const grantedLine = computed(() => {
+  const grant = billing.value?.plan_grant
+  if (!billing.value || !grant) {
+    return null
+  }
+  const more = formatCount(grant.days_banked, locale.value)
+  if (billing.value.period.source === 'grant' && grant.period_end) {
+    const runs = t('usage.grantedRuns', { plan: grant.plan_id, date: formatDate(grant.period_end, locale.value) })
+    return grant.days_banked > 0 ? `${runs} ${t('usage.grantedMore', { n: more }, grant.days_banked)}` : runs
+  }
+  return grant.days_banked > 0 ? t('usage.grantedBanked', { plan: grant.plan_id, n: more }, grant.days_banked) : null
+})
+
+const redeeming = ref(false)
+
 // --- the top-up packs --------------------------------------------------------------------
 
-/** The pack on sale, read once the view says a pack can be bought: its price and credits
- *  stand in the plan's foot line, and *Top up* starts its checkout (docs/web.md § Pages). */
+/** A paid plan's period: the one a pack can be bought in (docs/billing.md § Top-up packs). */
+const paid = computed(() => billing.value !== null && billing.value.plan.id !== 'free')
+
+/** The extra credits group stands on a paid plan's period, packs or none, and for any reader
+ *  holding one — a Free reader who redeemed credits (docs/billing.md § Redeem codes). */
+const extras = computed(() => paid.value || (billing.value?.packs.items.length ?? 0) > 0)
+
+/** The pack the catalog lists, read once the group appears — on sale or not, so the line
+ *  under the heading says what a pack is while Pay's checkout is still closed. */
 const topUp = reactive(useTopUp())
 watch(
-  () => billing.value?.pack_checkout_available,
-  (offered) => {
-    if (offered && !topUp.loaded) {
+  paid,
+  (isPaid) => {
+    if (isPaid && !topUp.loaded) {
       void topUp.load()
     }
   },
   { immediate: true },
 )
 
-/** The active packs together: what the *Top-up credits* row measures (docs/billing.md
- *  § Top-up packs); a refunded or expired pack is in the purchases table only. */
-const activePacks = computed(() => (billing.value?.packs.items ?? []).filter((pack) => pack.active))
-const packCredits = computed(() => activePacks.value.reduce((sum, pack) => sum + pack.credits, 0))
-const packSpent = computed(() => activePacks.value.reduce((sum, pack) => sum + pack.spent, 0))
-const packShare = computed(() => (packCredits.value > 0 ? Math.min(1, packSpent.value / packCredits.value) : 0))
+/** The line under the heading: the spending order, and the pack as the catalog describes it. */
+const packsLine = computed(() => {
+  const pack = topUp.listed ? t('usage.packsPack', { n: topUp.credits, validity: topUp.validity }) : ''
+  return t('usage.packsLine', { pack }).trim()
+})
 
-const purchaseColumns = computed<TableColumn<BillingPack>[]>(() => [
-  { key: 'purchased_at', header: t('usage.columnPurchased') },
-  { key: 'credits', header: t('usage.columnCredits'), numeric: true },
-  { key: 'remaining', header: t('usage.columnLeft'), numeric: true },
-  { key: 'expires_at', header: t('usage.columnExpires') },
-])
+/** The newest packs the group lists itself; the rest wait in the packs dialog, so the group
+ *  never grows with the purchases (docs/web.md § Pages). */
+const PACKS_SHOWN = 3
+const recentPacks = computed(() => (billing.value?.packs.items ?? []).slice(0, PACKS_SHOWN))
+const morePacks = computed(() => (billing.value?.packs.items.length ?? 0) > PACKS_SHOWN)
 
-/** What a pack has left — in words for one that gives nothing any more. */
-function packLeft(pack: BillingPack): string {
-  if (pack.active) {
-    return formatCount(pack.remaining, locale.value)
-  }
-  return pack.status === 'refunded' ? t('usage.refunded') : t('usage.expired')
-}
+const showingAllPacks = ref(false)
+const toppingUp = ref(false)
 
 // --- the usage limits --------------------------------------------------------------------
 
@@ -251,35 +275,24 @@ async function runSandboxAction(action: () => Promise<void>) {
             <UiButton v-if="billing.subscription" variant="secondary" :loading="acting" @click="manage">
               {{ t('usage.manage') }}
             </UiButton>
-            <!-- A pack's checkout, for a reader on a paid plan while one is on sale. -->
-            <UiButton v-if="billing.pack_checkout_available" :loading="topUp.buying" @click="topUp.buy">
-              {{ t('usage.topUp') }}
-            </UiButton>
-            <UiButton v-else-if="free && billing.checkout_available" :loading="acting" @click="upgrade">
-              {{ t('usage.upgrade') }}
+            <!-- The same checkout: *Upgrade* on Free, *Subscribe* on redeemed days, whose rest
+                 waits for the subscription to end (docs/billing.md § Periods, *Granted days*). -->
+            <UiButton v-if="!subscribed && billing.checkout_available" :loading="acting" @click="upgrade">
+              {{ free ? t('usage.upgrade') : t('usage.subscribe') }}
             </UiButton>
           </div>
         </div>
-        <template
-          v-if="
-            subscriptionLine ||
-            billing.subscription ||
-            !billing.checkout_available ||
-            billing.pay_reachable === false ||
-            actionError ||
-            topUp.error
-          "
-          #foot
-        >
+        <template #foot>
           <p v-if="subscriptionLine">{{ subscriptionLine }}</p>
+          <p v-if="grantedLine">{{ grantedLine }}</p>
           <p v-if="billing.subscription">{{ t('usage.manageNote') }}</p>
           <p v-else-if="!billing.checkout_available">{{ t('usage.notOnSale') }}</p>
-          <p v-if="billing.pack_checkout_available && topUp.pack">
-            {{ t('usage.packNote', { price: topUp.price, n: topUp.credits, validity: topUp.validity }) }}
-          </p>
           <p v-if="billing.pay_reachable === false">{{ t('usage.payBehind') }}</p>
           <UiBanner v-if="actionError" tone="error">{{ actionError }}</UiBanner>
-          <UiBanner v-if="topUp.error" tone="error">{{ topUp.error }}</UiBanner>
+          <p>
+            {{ t('usage.redeemPrompt') }}
+            <button type="button" class="redeem-link" @click="redeeming = true">{{ t('usage.redeemLink') }}</button>
+          </p>
         </template>
       </SettingsGroup>
 
@@ -301,27 +314,6 @@ async function runSandboxAction(action: () => Promise<void>) {
           </div>
           <UiUsageBar class="limit-bar" :share="creditsShare" :label="t('usage.creditsMeter')" />
           <p class="limit-used tabular">{{ t('usage.used', { n: Math.round(creditsShare * 100) }) }}</p>
-        </div>
-
-        <!-- Only while a pack is active: the packs' credits together, spent after the plan's. -->
-        <div v-if="billing.packs.remaining > 0" class="limit">
-          <div class="limit-text">
-            <p class="limit-name">{{ t('usage.packs') }}</p>
-            <p class="limit-line">
-              {{
-                t('usage.packsLeft', {
-                  remaining: formatCount(billing.packs.remaining, locale),
-                  credits: formatCount(packCredits, locale),
-                })
-              }}
-              <template v-if="billing.packs.expires_at">
-                · {{ t('usage.packsExpire', { date: formatDate(billing.packs.expires_at, locale) }) }}
-              </template>
-            </p>
-            <p class="limit-line">{{ t('usage.packsAfterPlan') }}</p>
-          </div>
-          <UiUsageBar class="limit-bar" :share="packShare" :label="t('usage.packsMeter')" />
-          <p class="limit-used tabular">{{ t('usage.used', { n: Math.round(packShare * 100) }) }}</p>
         </div>
 
         <div v-if="sandbox" class="limit">
@@ -365,22 +357,42 @@ async function runSandboxAction(action: () => Promise<void>) {
         </template>
       </SettingsGroup>
 
-      <!-- Every pack ever bought, newest first; a refunded or expired one says so in words. -->
-      <SettingsGroup v-if="billing.packs.items.length" :title="t('usage.purchases')" plain>
-        <UiDataTable
-          :columns="purchaseColumns"
-          :rows="billing.packs.items"
-          :row-key="(row) => row.id"
-          :caption="t('usage.purchasesCaption')"
-          density="tight"
-        >
-          <template #cell-purchased_at="{ row }">{{ formatDate(row.purchased_at, locale) }}</template>
-          <template #cell-credits="{ row }">{{ formatCount(row.credits, locale) }}</template>
-          <template #cell-remaining="{ row }">{{ packLeft(row) }}</template>
-          <template #cell-expires_at="{ row }">{{ formatDate(row.expires_at, locale) }}</template>
-        </UiDataTable>
+      <!-- The extra credits — packs bought and codes redeemed — on a paid plan or once there is
+           one: what they hold together, the newest few (every one in a dialog), and the way to
+           buy one — a dialog before Pay's checkout (docs/web.md § Pages). The table brings its
+           own surface; the empty row takes the box. -->
+      <SettingsGroup
+        v-if="extras"
+        :title="t('usage.packs')"
+        :description="packsLine"
+        :plain="billing.packs.items.length > 0"
+      >
+        <template #actions>
+          <span class="packs-total tabular">
+            {{ t('usage.packsTotal', { n: formatCount(billing.packs.remaining, locale) }, billing.packs.remaining) }}
+          </span>
+        </template>
+        <SettingsRow
+          v-if="!billing.packs.items.length"
+          :label="t('usage.packsNone')"
+          :description="t('usage.packsNoneNote')"
+        />
+        <template v-else>
+          <SettingsPacksTable :rows="recentPacks" />
+          <div v-if="morePacks" class="packs-more">
+            <UiButton variant="ghost" size="sm" @click="showingAllPacks = true">
+              {{ t('usage.packsAll', { n: formatCount(billing.packs.items.length, locale) }) }}
+            </UiButton>
+          </div>
+        </template>
         <template #foot>
-          <p>{{ t('usage.purchasesNote') }}</p>
+          <div class="packs-foot">
+            <p>{{ t('usage.purchasesNote') }}</p>
+            <UiButton v-if="billing.pack_checkout_available" variant="primary" @click="toppingUp = true">
+              {{ t('usage.topUp') }}
+            </UiButton>
+            <p v-else-if="paid" class="packs-closed">{{ t('usage.packsNotOnSale') }}</p>
+          </div>
         </template>
       </SettingsGroup>
 
@@ -431,6 +443,10 @@ async function runSandboxAction(action: () => Promise<void>) {
         </template>
       </SettingsGroup>
     </template>
+
+    <SettingsTopUpDialog v-if="toppingUp" @close="toppingUp = false" />
+    <SettingsRedeemDialog v-if="redeeming" @close="redeeming = false" @redeemed="reload" />
+    <SettingsPacksDialog v-if="showingAllPacks && billing" :packs="billing.packs" @close="showingAllPacks = false" />
 
     <UiConfirmDialog
       v-if="confirmingReset"
@@ -486,6 +502,21 @@ async function runSandboxAction(action: () => Promise<void>) {
   gap: var(--space-2);
 }
 
+/* The way to the redeem dialog, in the foot's own line. */
+.redeem-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+}
+
+.redeem-link:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
 /* --- The usage limits ----------------------------------------------------------- */
 
 .limit {
@@ -533,6 +564,34 @@ async function runSandboxAction(action: () => Promise<void>) {
   display: flex;
   align-items: center;
   gap: var(--space-1);
+}
+
+/* --- The top-up credits ----------------------------------------------------------- */
+
+/* The balance the packs hold, at the heading's right. */
+.packs-total {
+  color: var(--ink);
+  font-size: var(--text-base);
+  font-weight: var(--weight-semibold);
+  white-space: nowrap;
+}
+
+.packs-more {
+  display: flex;
+  justify-content: center;
+  padding: var(--space-1) 0;
+}
+
+/* The note at the left, the way to buy at the right. */
+.packs-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+
+.packs-closed {
+  white-space: nowrap;
 }
 
 /* --- The rates ------------------------------------------------------------------ */
@@ -592,7 +651,8 @@ async function runSandboxAction(action: () => Promise<void>) {
   }
 
   .plan,
-  .sandbox {
+  .sandbox,
+  .packs-foot {
     flex-wrap: wrap;
   }
 }

@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest'
 import type { ChatEvent, ChatMessage, ChatTurn, Memory } from './api'
-import { applyMemoryEvent, buildThread, memoryLineState, type MemoryLine, type ThreadItem } from './thread'
+import {
+  applyMemoryEvent,
+  buildThread,
+  compactFocus,
+  isSummary,
+  memoryLineState,
+  turnKind,
+  type MemoryLine,
+  type ThreadItem,
+} from './thread'
 
 const TURN = 'turn-1'
 
@@ -421,5 +430,91 @@ describe('applyMemoryEvent', () => {
     // The reader's pin stays theirs.
     expect(memoryLineState(updated, after)).toMatchObject({ state: 'updated', row: { pinned: true } })
     expect(applyMemoryEvent(before, frame('forgotten'), context).map((memory) => memory.id)).toEqual([3])
+  })
+})
+
+describe('a compaction turn', () => {
+  const SUMMARY = 'This conversation continues an earlier one.\n\n## Requests\n\nTables.'
+
+  function compactTurn(finished: boolean, kind = 'compact', status?: string): ChatTurn {
+    return { ...turn(finished, status), kind }
+  }
+
+  it('draws no bubble while it runs and ends in its own line, its steps shown as any turn’s', () => {
+    const messages = [message('user', [{ type: 'text', text: '/compact keep the table' }])]
+    const groups = events(
+      { event: 'turn_start', model: 'm', kind: 'compact' },
+      { event: 'tool_use', id: 'e', name: 'str_replace_based_edit_tool', input: { command: 'create', path: '/workspace/memory.md', file_text: 'x' } },
+      { event: 'tool_result', id: 'e', name: 'str_replace_based_edit_tool', is_error: false, output: 'ok' },
+      { event: 'text_delta', text: 'The summary so far' },
+    )
+    const { items, liveTurns, dimBefore } = buildThread({ turns: [compactTurn(false)], messages, groups })
+    expect(liveTurns).toEqual([TURN])
+    expect(kinds(items)).toEqual(['steps', 'compacting'])
+    expect(dimBefore).toBe(-1)
+  })
+
+  it('is known from its turn_start when the record has no kind yet', () => {
+    const messages = [message('user', [{ type: 'text', text: '/compact' }])]
+    const groups = events({ event: 'turn_start', model: 'm', kind: 'idle_compact' })
+    const { items } = buildThread({ turns: [{ ...turn(false), kind: undefined }], messages, groups })
+    expect(kinds(items)).toEqual(['compacting'])
+    expect(turnKind(undefined, groups.get(TURN))).toBe('idle_compact')
+    expect(turnKind({ ...turn(true), kind: 'compact' }, undefined)).toBe('compact')
+    expect(turnKind(turn(true), undefined)).toBe('message')
+  })
+
+  it('becomes a divider with the focus and the summary, and dims everything above it', () => {
+    const earlier: ChatTurn = { id: 'turn-0', status: 'succeeded', error: null, finished_at: '2026-10-17T00:00:00Z' }
+    const before = [
+      { ...message('user', [{ type: 'text', text: 'Hello' }]), turn_id: 'turn-0' },
+      { ...message('assistant', [{ type: 'text', text: 'Hi.' }]), turn_id: 'turn-0' },
+    ]
+    const messages = [
+      ...before,
+      message('user', [{ type: 'text', text: '/compact keep the table' }]),
+      message('assistant', [{ type: 'text', text: SUMMARY }]),
+      message('user', [{ type: 'text', text: `Prefix. ${SUMMARY}`, context: 'summary' }]),
+    ]
+    const { items, dimBefore } = buildThread({ turns: [earlier, compactTurn(true)], messages, groups: new Map() })
+    expect(kinds(items)).toEqual(['user', 'text', 'foot', 'compact'])
+    expect(items[3]).toMatchObject({ kind: 'compact', turnId: TURN, focus: 'keep the table', summary: `Prefix. ${SUMMARY}` })
+    expect(dimBefore).toBe(3)
+  })
+
+  it('has no focus when the worker ran it, and draws nothing until the summary is stored', () => {
+    const stored = [
+      message('user', [{ type: 'text', text: 'instruction', context: 'compact' }]),
+      message('assistant', [{ type: 'text', text: SUMMARY }]),
+      message('user', [{ type: 'text', text: SUMMARY, context: 'summary' }]),
+    ]
+    const { items } = buildThread({ turns: [compactTurn(true, 'idle_compact')], messages: stored, groups: new Map() })
+    expect(items).toEqual([{ kind: 'compact', key: `t${TURN}-compact`, turnId: TURN, focus: null, summary: SUMMARY }])
+    // Ended on the stream, the record not yet reloaded: no divider to draw yet.
+    const live = buildThread({
+      turns: [compactTurn(false)],
+      messages: [message('user', [{ type: 'text', text: '/compact' }])],
+      groups: events({ event: 'turn_start', model: 'm', kind: 'compact' }, { event: 'turn_done' }),
+    })
+    expect(live.items).toEqual([])
+    expect(live.liveTurns).toEqual([])
+  })
+
+  it('failed or cancelled, is the usual line and nothing changes', () => {
+    const messages = [message('user', [{ type: 'text', text: '/compact' }])]
+    const failed = buildThread({ turns: [{ ...compactTurn(true, 'compact', 'failed'), error: 'compact_empty' }], messages, groups: new Map() })
+    expect(failed.items).toEqual([{ kind: 'error', key: `t${TURN}-error`, text: 'compact_empty' }])
+    expect(failed.dimBefore).toBe(-1)
+    const cancelled = buildThread({ turns: [compactTurn(true, 'compact', 'cancelled')], messages, groups: new Map() })
+    expect(kinds(cancelled.items)).toEqual(['cancelled'])
+  })
+
+  it('reads the summary marker and the focus off the stored blocks', () => {
+    expect(isSummary([{ type: 'text', text: 's', context: 'summary' }])).toBe(true)
+    expect(isSummary([{ type: 'text', text: 's' }])).toBe(false)
+    expect(isSummary([])).toBe(false)
+    expect(compactFocus([{ type: 'text', text: '/compact  the table ' }])).toBe('the table')
+    expect(compactFocus([{ type: 'text', text: '/compact' }])).toBeNull()
+    expect(compactFocus([{ type: 'text', text: 'instruction', context: 'compact' }])).toBeNull()
   })
 })

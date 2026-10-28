@@ -824,9 +824,10 @@ async def adopt_markdown(
         upload.unlink(missing_ok=True)
 
 
-def place_file(root: Path, temp: Path, relative: Path) -> None:
+def place_file(root: Path, temp: Path, relative: Path, *, message: str = "upload") -> None:
     """An uploaded file from the temporary name it streamed to into its place in the tree,
-    `files/<folder>/<name>`, as the revision `upload <path>` — the one copy there is
+    `files/<folder>/<name>`, as the revision `upload <path>` — `download <path>` for the
+    agent's download, which is filed the same way — the one copy there is
     (docs/workspace.md § Files). The caller holds the workspace lock and inserted the row.
     Whatever sits at the destination already is a refusal, never overwritten; a move whose
     revision cannot be recorded is undone, the upload back under its temporary name for
@@ -840,12 +841,12 @@ def place_file(root: Path, temp: Path, relative: Path) -> None:
     except (safe_io.UnsafeEntry, OSError) as exc:
         raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
     try:
-        git.commit_paths(root, git.USER_AUTHOR, f"upload {relative}", [relative])
+        git.commit_paths(root, git.USER_AUTHOR, f"{message} {relative}", [relative])
     except git.GitError as exc:
         with contextlib.suppress(OSError, safe_io.UnsafeEntry):
             safe_io.rename(root, target, temp)
         raise ApiError(
-            409, "invalid_request", "The upload could not be recorded; nothing was filed"
+            409, "invalid_request", "The file could not be recorded; nothing was filed"
         ) from exc
 
 

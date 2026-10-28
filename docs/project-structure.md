@@ -6,7 +6,11 @@ agent-sightread/
     api/                      # FastAPI app + worker (one uv project, one image)
       src/sightread/
         main.py               # FastAPI wiring: /v1, /api, /oauth, /mcp, /.well-known
+                              # (/api/admin mounted only while OWNER_EMAILS names one)
         config.py             # env settings (pydantic-settings)
+        runtime_settings.py   # the twelve keys the database may override and the cached
+                              # reading layer the API, the worker and the CLI share
+                              # (docs/admin.md § Settings)
         db/                   # engine, models, session helpers
         auth/                 # oidc.py, sessions.py, api_keys.py, oauth_as.py, crypto.py
         routes/               # v1.py (data plane), control.py (/api, incl. /api/agents),
@@ -14,13 +18,28 @@ agent-sightread/
                               # chat.py (/api/conversations, /api/sandbox),
                               # attachments.py (/api/attachments), extensions.py
                               # (/api/skills, /api/subagents), memories.py
-                              # (/api/memories), oauth.py
+                              # (/api/memories), oauth.py, admin.py (/api/admin —
+                              # the operator console, docs/admin.md)
         agents/               # the agent registry (docs/agents.md); parse.py holds the
                               # parse agent's definition: default prompt, pipeline version;
                               # chat.py the chat agent's system prompt and tool definitions;
                               # skills.py and subagents.py the built-in skills and subagents;
                               # memory.py the memory block, its selection and text cleaning;
                               # check.py the check agent's prompt and tools
+        admin/                # the operator console (docs/admin.md): permissions.py
+                              # (ALL_PERMISSIONS, the areas, normalizing a group's list),
+                              # deps.py (require_console_session, require_permission),
+                              # groups.py (the built-in group, the sign-in owner join,
+                              # members, the no-escalation checks), audit.py (the one
+                              # helper that writes an audit row in the caller's transaction),
+                              # grants.py (an operator's grant of credits or days to an
+                              # account, through billing/ledger.py),
+                              # codes.py (creating and disabling redeem codes through
+                              # billing/codes.py, each with its audit row),
+                              # jobs.py (a stuck job's requeue, the overview's checks of
+                              # Kano Proxy and Kano Pay),
+                              # settings.py (the settings page: a change checked,
+                              # confirmed, stored, recorded)
         billing/              # plans, periods and credit arithmetic (docs/billing.md):
                               # credits.py prices a parse and a turn, plans.py reads the
                               # plans and decides the current period; pure, no HTTP
@@ -32,7 +51,9 @@ agent-sightread/
                               # (docs/workspace.md): layout.py, git.py, documents.py,
                               # reconcile.py, trash.py (deleting for good: Empty Trash
                               # and the Trash's expiry, one function), accounts.py (a
-                              # deleted account's marker and files)
+                              # deleted account's marker and files), filing.py (names,
+                              # the suffixed insert and the filing of a file — what the
+                              # upload route and the agent's download share)
         sandbox/              # client.py: the HTTP client of the sandbox runner
         upstream/             # anthropic.py (Messages API over Kano Proxy, streaming,
                               # tools — the chat agent's client, docs/chat.md);
@@ -45,7 +66,9 @@ agent-sightread/
                               # check.py (the check agent's loop, inside a parse's run),
                               # chat_subagent.py (a subagent's nested loop),
                               # chat_tools.py, chat_events.py (the conversation stream),
-                              # chat_memory.py (a turn's memory snapshot, the memory tool)
+                              # chat_memory.py (a turn's memory snapshot, the memory tool),
+                              # chat_web.py (the web tools: Brave search, OpenAlex, the
+                              # guarded fetch, reading a URL, downloading into Files)
         mcp/                  # server.py: thin shell over the service layer (docs/mcp.md)
         worker.py             # `python -m sightread.worker`
       migrations/             # Alembic
@@ -56,6 +79,11 @@ agent-sightread/
                               # own image; owns the Docker socket, nothing else does
     web/                      # Nuxt control plane (docs/web.md)
       app/ or src/            # Nuxt conventions; i18n/ catalog en + zh-TW
+                              # the operator console (docs/admin.md): pages/admin/,
+                              # middleware/admin.ts, composables/useAdminConsole.ts,
+                              # lib/admin.ts (pure: areas, nav, permission checks; vitest),
+                              # lib/chart.ts (the usage chart's geometry; vitest),
+                              # components/admin/
       server/routes/          # robots.txt and sitemap.xml, prerendered; no API (docs/web.md § Search engines)
       shared/                 # framework-free code nuxt.config.ts, the app and server/ all read
       package.json
@@ -80,4 +108,5 @@ agent-sightread/
 - `workspace/` is the only package that touches `WORKSPACES_DIR` and the only one that runs git; `sandbox/client.py` is the only module that calls the runner. The runner (`apps/sandbox`) is the only process with the Docker socket.
 - `agents/` defines agents and nothing else: no HTTP, no database. Runners and settings consume its definitions ([agents.md](./agents.md)).
 - `jobs/queue.py` is the only module that knows the queue is Postgres.
-- Web: pages thin, logic in composables; API access through one typed client module.
+- `admin/` is the only package that decides a console permission or writes `groups`, `group_members`, `audit_log` and `runtime_settings`; `routes/admin.py` is thin over it, and the Google callback and the dev login call `admin/groups.py` for the owner join. Every console mutation writes its audit row through `admin/audit.py` before the route's one commit. Nothing outside it compares a group's name. Whether the worker runs and what a requeue does stay in `jobs/queue.py`, the one module that knows the queue is PostgreSQL: `admin/jobs.py` calls it, and reads the worker lock only through it.
+- Web: pages thin, logic in composables; API access through one typed client module. The console's permission logic is the pure `app/lib/admin.ts`, so it is tested without a DOM; its pages read permissions from `useAdminConsole` only.

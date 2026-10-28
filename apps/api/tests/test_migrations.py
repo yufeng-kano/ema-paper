@@ -1836,3 +1836,406 @@ async def test_the_reader_views_migration_turns_converting_off_and_adds_the_view
             ).scalar()
     finally:
         await engine.dispose()
+
+
+CHAT_TOOL_CALLS = "8d1142bbd272"
+COMPACTION = "d78cf7a42eea"
+
+
+async def test_the_compaction_migration_leaves_every_row_as_a_message_turn(scratch_url) -> None:
+    """Every turn that came before is a message turn, every reader has idle compaction on,
+    every conversation has no summary, no context and no clock; the downgrade drops the
+    columns and the partial index and keeps the rows (docs/database.md)."""
+    _alembic(scratch_url, "upgrade", CHAT_TOOL_CALLS)
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.begin() as db:
+            await db.execute(
+                text(
+                    "INSERT INTO users (id, google_sub, email, created_at) "
+                    "VALUES (1, 'sub', 'r@example.com', now())"
+                )
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO agent_settings (user_id, agent, model) VALUES "
+                    "(1, 'chat', 'm'), (1, 'parse', NULL)"
+                )
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO documents (id, user_id, folder_id, job_id, name, kind, "
+                    "created_at, updated_at) VALUES (1, 1, NULL, NULL, 'notes.md', 'markdown', "
+                    "now(), now())"
+                )
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO conversations (id, user_id, document_id, title, session, "
+                    "model, created_at, updated_at) VALUES (1, 1, 1, 'Thread', 's', 'm', "
+                    "now(), now())"
+                )
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO chat_turns (id, user_id, conversation_id, message_id, status, "
+                    "locale, created_at, finished_at) VALUES "
+                    "('22222222-2222-2222-2222-222222222222', 1, 1, 1, 'succeeded', 'en', "
+                    "now(), now())"
+                )
+            )
+            # Skills named after the composer's commands, and one whose name the rename
+            # would otherwise take.
+            await db.execute(
+                text(
+                    "INSERT INTO skills (user_id, name, description, argument_hint, body, "
+                    "created_at, updated_at) VALUES "
+                    "(1, 'compact', '', '', 'x', now(), now()), "
+                    "(1, 'compact-2', '', '', 'y', now(), now()), "
+                    "(1, 'new', '', '', 'z', now(), now()), "
+                    "(1, 'mine', '', '', 'w', now(), now())"
+                )
+            )
+        _alembic(scratch_url, "upgrade", COMPACTION)
+        async with engine.begin() as db:
+            assert (await db.execute(text("SELECT kind FROM chat_turns"))).scalar() == "message"
+            names = (await db.execute(text("SELECT name, body FROM skills ORDER BY body"))).all()
+            assert names == [("mine", "w"), ("compact-3", "x"), ("compact-2", "y"), ("new-2", "z")]
+            switches = (
+                await db.execute(text("SELECT agent, idle_compact FROM agent_settings ORDER BY 1"))
+            ).all()
+            assert switches == [("chat", True), ("parse", True)]
+            assert (
+                await db.execute(
+                    text(
+                        "SELECT memory_file, compacted_message_id, context_tokens, "
+                        "cache_warm_until FROM conversations"
+                    )
+                )
+            ).one() == (None, None, None, None)
+            # A turn written without a kind is a message turn, as the model would write it.
+            await db.execute(
+                text(
+                    "INSERT INTO chat_turns (id, user_id, conversation_id, message_id, status, "
+                    "locale, created_at) VALUES "
+                    "('33333333-3333-3333-3333-333333333333', 1, 1, 2, 'queued', 'en', now())"
+                )
+            )
+            assert (
+                await db.execute(
+                    text(
+                        "SELECT kind FROM chat_turns "
+                        "WHERE id = '33333333-3333-3333-3333-333333333333'"
+                    )
+                )
+            ).scalar() == "message"
+            index = (
+                await db.execute(
+                    text(
+                        "SELECT indexdef FROM pg_indexes "
+                        "WHERE indexname = 'ix_conversations_cache_warm_until'"
+                    )
+                )
+            ).scalar()
+            assert index is not None and "cache_warm_until IS NOT NULL" in index
+            await db.execute(
+                text(
+                    "UPDATE conversations SET compacted_message_id = 7, context_tokens = 120000, "
+                    "cache_warm_until = now(), memory_file = 'notes' WHERE id = 1"
+                )
+            )
+        _alembic(scratch_url, "downgrade", CHAT_TOOL_CALLS)
+        async with engine.begin() as db:
+            columns = {
+                (table, column)
+                for table, column in (
+                    await db.execute(
+                        text(
+                            "SELECT table_name, column_name FROM information_schema.columns "
+                            "WHERE table_name IN ('conversations', 'chat_turns', 'agent_settings')"
+                        )
+                    )
+                ).all()
+            }
+            assert not columns & {
+                ("conversations", "memory_file"),
+                ("conversations", "compacted_message_id"),
+                ("conversations", "context_tokens"),
+                ("conversations", "cache_warm_until"),
+                ("chat_turns", "kind"),
+                ("agent_settings", "idle_compact"),
+            }
+            assert (
+                await db.execute(
+                    text(
+                        "SELECT count(*) FROM pg_indexes "
+                        "WHERE indexname = 'ix_conversations_cache_warm_until'"
+                    )
+                )
+            ).scalar() == 0
+            assert await _count(db, "chat_turns") == 2
+            assert await _count(db, "conversations") == 1
+    finally:
+        await engine.dispose()
+
+
+REDEEM_CODES = "fa9aedf01cfd"
+OPERATOR_CONSOLE = "52a2cf52bf36"
+CONSOLE_TABLES = ("groups", "group_members", "audit_log")
+
+
+async def test_the_operator_console_migration_seeds_the_owner_group_and_touches_nothing(
+    scratch_url,
+) -> None:
+    """Over existing users and sessions, which it leaves as they are, it creates the three
+    tables and one row, the built-in group; one built-in group only; a deleted account
+    takes its memberships and leaves its records with `actor_id` NULL; the downgrade drops
+    the three tables (docs/database.md § Rules, docs/admin.md § Acceptance)."""
+    _alembic(scratch_url, "upgrade", REDEEM_CODES)
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.begin() as db:
+            await db.execute(
+                text(
+                    "INSERT INTO users (id, google_sub, email, name, created_at) VALUES "
+                    "(1, 'sub-1', 'owner@example.com', 'Owner', now()), "
+                    "(2, 'sub-2', 'member@example.com', 'Member', now())"
+                )
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO sessions (user_id, token_hash, created_at, expires_at) "
+                    "VALUES (1, 'hash', now() - interval '1 hour', now() + interval '1 day')"
+                )
+            )
+        _alembic(scratch_url, "upgrade", OPERATOR_CONSOLE)
+        async with engine.begin() as db:
+            seeded = (
+                await db.execute(
+                    text("SELECT id, name, permissions = '[]'::jsonb, builtin FROM groups")
+                )
+            ).all()
+            assert [tuple(row)[1:] for row in seeded] == [("owner", True, True)]
+            owner_group = seeded[0][0]
+            assert await _count(db, "group_members") == 0
+            assert await _count(db, "audit_log") == 0
+            assert await _count(db, "users") == 2
+            assert await _count(db, "sessions") == 1
+            index = (
+                await db.execute(
+                    text("SELECT indexdef FROM pg_indexes WHERE indexname = 'uq_groups_builtin'")
+                )
+            ).scalar()
+            assert index is not None and "UNIQUE" in index and "WHERE builtin" in index
+            await db.execute(
+                text(
+                    "INSERT INTO group_members (group_id, user_id, added_by, added_at) VALUES "
+                    "(:group, 1, 1, now()), (:group, 2, 1, now())"
+                ),
+                {"group": owner_group},
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO audit_log (actor_id, permission, action, target_type, "
+                    "target_id, before, after, ip, created_at) VALUES (1, 'groups.write', "
+                    "'groups.add_member', 'user', '2', NULL, :after, '127.0.0.1', now())"
+                ),
+                {"after": '{"group_id": 1, "group": "owner"}'},
+            )
+            # A group is not built in unless it says so.
+            await db.execute(
+                text(
+                    "INSERT INTO groups (name, permissions, created_at, updated_at) "
+                    "VALUES ('ops', '[\"audit.read\"]', now(), now())"
+                )
+            )
+        for statement in (
+            # A second built-in group, under any name.
+            "INSERT INTO groups (name, permissions, builtin, created_at, updated_at) "
+            "VALUES ('second', '[]', true, now(), now())",
+            # A taken name.
+            "INSERT INTO groups (name, permissions, created_at, updated_at) "
+            "VALUES ('ops', '[]', now(), now())",
+        ):
+            async with engine.connect() as db:
+                with pytest.raises(IntegrityError):
+                    await db.execute(text(statement))
+        async with engine.begin() as db:
+            # The account that added a member goes: its own membership with it, the one
+            # it added kept with added_by NULL, its record kept with actor_id NULL.
+            await db.execute(text("DELETE FROM users WHERE id = 1"))
+            members = (await db.execute(text("SELECT user_id, added_by FROM group_members"))).all()
+            assert [tuple(row) for row in members] == [(2, None)]
+            record = (await db.execute(text("SELECT actor_id, target_id FROM audit_log"))).one()
+            assert tuple(record) == (None, "2")
+            # A deleted group takes its memberships.
+            await db.execute(text("DELETE FROM groups WHERE id = :group"), {"group": owner_group})
+            assert await _count(db, "group_members") == 0
+        _alembic(scratch_url, "downgrade", REDEEM_CODES)
+        async with engine.connect() as db:
+            names = {
+                row[0]
+                for row in await db.execute(
+                    text("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
+                )
+            }
+            assert await _count(db, "users") == 1
+        assert not names & set(CONSOLE_TABLES)
+        assert {"users", "sessions", "redeem_codes"} <= names
+    finally:
+        await engine.dispose()
+
+
+CONSOLE_GRANTS = "d632652e713f"
+
+
+async def test_the_console_grants_migration_widens_the_pack_source_and_keeps_every_pack(
+    scratch_url,
+) -> None:
+    """Over a bought and a redeemed pack, which it leaves as they are, the check on
+    `credit_packs.source` takes `grant` too and still nothing else; the downgrade refuses
+    while a granted pack exists, and narrows the check once none does (docs/database.md
+    § Rules, docs/admin.md § Acceptance)."""
+    _alembic(scratch_url, "upgrade", OPERATOR_CONSOLE)
+    engine = create_async_engine(scratch_url)
+    pack = (
+        "INSERT INTO credit_packs (id, user_id, pack_id, credits, spent, status, "
+        "purchased_at, expires_at, version, source, created_at, updated_at) VALUES "
+        "(:id, 1, :pack, 5, 0, 'paid', now(), now() + interval '1 year', 0, :source, "
+        "now(), now())"
+    )
+    try:
+        async with engine.begin() as db:
+            await db.execute(
+                text(
+                    "INSERT INTO users (id, google_sub, email, created_at) "
+                    "VALUES (1, 'sub-1', 'a@example.com', now())"
+                )
+            )
+            await db.execute(text(pack), {"id": "pur_1", "pack": "credits", "source": "pay"})
+            await db.execute(text(pack), {"id": "redeem-1", "pack": "code", "source": "code"})
+        # Refused before the upgrade.
+        async with engine.connect() as db:
+            with pytest.raises(IntegrityError):
+                await db.execute(text(pack), {"id": "grant-a", "pack": "grant", "source": "grant"})
+        _alembic(scratch_url, "upgrade", CONSOLE_GRANTS)
+        async with engine.begin() as db:
+            rows = (await db.execute(text("SELECT id, source FROM credit_packs ORDER BY id"))).all()
+            assert [tuple(row) for row in rows] == [("pur_1", "pay"), ("redeem-1", "code")]
+            await db.execute(text(pack), {"id": "grant-a", "pack": "grant", "source": "grant"})
+        async with engine.connect() as db:
+            with pytest.raises(IntegrityError):
+                await db.execute(text(pack), {"id": "gift-a", "pack": "gift", "source": "gift"})
+
+        with pytest.raises(subprocess.CalledProcessError) as refused:
+            _alembic(scratch_url, "downgrade", OPERATOR_CONSOLE)
+        assert b"1 credit pack(s) were granted from the operator console" in refused.value.stderr
+        async with engine.begin() as db:
+            version = (await db.execute(text("SELECT version_num FROM alembic_version"))).scalar()
+            assert version == CONSOLE_GRANTS
+            assert await _count(db, "credit_packs") == 3
+            await db.execute(text("DELETE FROM credit_packs WHERE source = 'grant'"))
+        _alembic(scratch_url, "downgrade", OPERATOR_CONSOLE)
+        async with engine.connect() as db:
+            assert await _count(db, "credit_packs") == 2
+            with pytest.raises(IntegrityError):
+                await db.execute(text(pack), {"id": "grant-b", "pack": "grant", "source": "grant"})
+        _alembic(scratch_url, "upgrade", "head")
+    finally:
+        await engine.dispose()
+
+
+RUNTIME_SETTINGS = "acaa414338bb"
+
+
+async def test_the_runtime_settings_migration_adds_an_empty_table_and_touches_nothing(
+    scratch_url,
+) -> None:
+    """Over existing users, conversations and records, which it leaves as they are, it
+    creates `runtime_settings`, empty, and the index on `conversations.model`; a stored
+    setting keeps its text, key order included; deleting the account that stored it sets
+    `updated_by` NULL; the downgrade drops both (docs/database.md § Rules, docs/admin.md
+    § Acceptance)."""
+    _alembic(scratch_url, "upgrade", CONSOLE_GRANTS)
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.begin() as db:
+            await db.execute(
+                text(
+                    "INSERT INTO users (id, google_sub, email, name, created_at) VALUES "
+                    "(1, 'sub-1', 'owner@example.com', 'Owner', now()), "
+                    "(2, 'sub-2', 'reader@example.com', 'Reader', now())"
+                )
+            )
+            document_id = (
+                await db.execute(
+                    text(
+                        "INSERT INTO documents (user_id, folder_id, job_id, kind, name, "
+                        "created_at, updated_at) VALUES (2, NULL, NULL, 'markdown', "
+                        "'notes.md', now(), now()) RETURNING id"
+                    )
+                )
+            ).scalar_one()
+            await db.execute(
+                text(
+                    "INSERT INTO conversations (user_id, document_id, title, session, model, "
+                    "created_at, updated_at) VALUES (2, :document, 'Thread', 's', 'm', "
+                    "now(), now())"
+                ),
+                {"document": document_id},
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO audit_log (actor_id, permission, action, target_type, "
+                    "target_id, before, after, ip, created_at) VALUES (1, 'users.write', "
+                    "'users.grant_credits', 'user', '2', NULL, :after, NULL, now())"
+                ),
+                {"after": '{"credits": 5}'},
+            )
+        _alembic(scratch_url, "upgrade", RUNTIME_SETTINGS)
+        async with engine.begin() as db:
+            assert await _count(db, "runtime_settings") == 0
+            assert await _count(db, "users") == 2
+            assert await _count(db, "conversations") == 1
+            assert await _count(db, "audit_log") == 1
+            index = (
+                await db.execute(
+                    text(
+                        "SELECT indexdef FROM pg_indexes WHERE indexname = 'ix_conversations_model'"
+                    )
+                )
+            ).scalar()
+            assert index is not None and "(model)" in index
+            prices = '{"z-model": {"input": 1}, "a-model": {"input": 2}}'
+            await db.execute(
+                text(
+                    "INSERT INTO runtime_settings (key, value, updated_by, updated_at) "
+                    "VALUES ('MODEL_PRICES_JSON', to_jsonb(CAST(:value AS text)), 1, now())"
+                ),
+                {"value": prices},
+            )
+            stored = (
+                await db.execute(text("SELECT value #>> '{}' FROM runtime_settings"))
+            ).scalar_one()
+            assert stored == prices
+            await db.execute(text("DELETE FROM users WHERE id = 1"))
+            row = (await db.execute(text("SELECT key, updated_by FROM runtime_settings"))).one()
+            assert tuple(row) == ("MODEL_PRICES_JSON", None)
+        _alembic(scratch_url, "downgrade", CONSOLE_GRANTS)
+        async with engine.connect() as db:
+            names = {
+                row[0]
+                for row in await db.execute(
+                    text("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
+                )
+            }
+            index = (
+                await db.execute(
+                    text("SELECT 1 FROM pg_indexes WHERE indexname = 'ix_conversations_model'")
+                )
+            ).scalar()
+            assert await _count(db, "conversations") == 1
+        assert "runtime_settings" not in names and index is None
+        _alembic(scratch_url, "upgrade", "head")
+    finally:
+        await engine.dispose()

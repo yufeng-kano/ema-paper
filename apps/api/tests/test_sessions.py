@@ -43,7 +43,10 @@ async def test_dev_login_round_trip(client: AsyncClient) -> None:
         "pack_checkout_available",
         "auto_convert",
         "default_view",
+        "console",
     }
+    # The operator console is off without OWNER_EMAILS (docs/admin.md).
+    assert body["console"] is False
 
     logout = await client.post("/api/auth/logout", headers=CSRF_HEADERS)
     assert logout.status_code == 204

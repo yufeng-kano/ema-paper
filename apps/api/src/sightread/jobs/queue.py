@@ -38,6 +38,8 @@ from ..billing import ledger
 from ..billing.plans import PAID_STATUSES
 from ..config import Settings
 from ..db.models import (
+    COMPACTION_TURNS,
+    MESSAGE_TURN,
     WORKER_GENERATION_SEQ,
     ChatTurn,
     Conversation,
@@ -71,8 +73,9 @@ UNSETTLED_REVISION_MESSAGE = "bash: recovered after an unconfirmed command"
 
 # PostgreSQL claim (docs/jobs.md). The correlated count applies the per-user running cap
 # to the same scan that picks the oldest queued job: the user's plan's parses at once —
-# their paid `subscriptions` row as it stands now, joined to `:plan_jobs` (`{plan id:
-# maxJobs}`), Free's `:free_max_jobs` otherwise — under the deployment's
+# their paid `subscriptions` row as it stands now, else the open granted period of their
+# `plan_grants` row (docs/billing.md § Periods, *Granted days*), joined to `:plan_jobs`
+# (`{plan id: maxJobs}`), Free's `:free_max_jobs` otherwise — under the deployment's
 # `:max_jobs_per_user` (docs/billing.md § Plans). The generation is the claimer's fence
 # on every later write to the row.
 CLAIM_SQL = text(
@@ -92,6 +95,10 @@ CLAIM_SQL = text(
               SELECT (CAST(:plan_jobs AS jsonb) ->> s.plan_id)::int FROM subscriptions s
               WHERE s.user_id = j.user_id AND s.status IN :paid_statuses
                 AND s.period_start <= :now AND :now < s.period_end
+            ),
+            (
+              SELECT (CAST(:plan_jobs AS jsonb) ->> g.plan_id)::int FROM plan_grants g
+              WHERE g.user_id = j.user_id AND g.period_end IS NOT NULL AND :now < g.period_end
             ),
             :free_max_jobs
           )
@@ -122,6 +129,10 @@ CLAIM_SQL_SQLITE_SELECT = text(
             SELECT json_extract(:plan_jobs, '$."' || s.plan_id || '"') FROM subscriptions s
             WHERE s.user_id = j.user_id AND s.status IN :paid_statuses
               AND s.period_start <= :now AND :now < s.period_end
+          ),
+          (
+            SELECT json_extract(:plan_jobs, '$."' || g.plan_id || '"') FROM plan_grants g
+            WHERE g.user_id = j.user_id AND g.period_end IS NOT NULL AND :now < g.period_end
           ),
           :free_max_jobs
         )
@@ -391,8 +402,9 @@ async def claim_next_job(
     free_max_jobs: int | None = None,
 ) -> uuid.UUID | None:
     """Claim the oldest queued job whose user is under their running cap, or None: the
-    plan's parses at once (`plan_jobs` by plan id for a paid period, `free_max_jobs`
-    otherwise; the ceiling alone when neither is given) under `max_jobs_per_user`. A
+    plan's parses at once (`plan_jobs` by plan id for a paid period or an open granted
+    one, `free_max_jobs` otherwise; the ceiling alone when neither is given) under
+    `max_jobs_per_user`. A
     user in `excluded_users` — one whose orphaned turn the worker could not stop yet —
     gets no parse run, since its finish writes that user's tree (docs/jobs.md § Chat
     turns). `generation` is the claimer's (`next_worker_generation`), written on the
@@ -498,6 +510,68 @@ async def release_worker_lock(connection: AsyncConnection) -> None:
         await connection.close()
 
 
+# The worker lock as `pg_locks` lists it: an advisory lock taken on one bigint shows its
+# high 32 bits as `classid`, its low 32 bits as `objid`, and `objsubid` 1 (a lock taken on
+# two int4s shows 2). The dedup lock's keys are int4 hashes widened to bigint, whose
+# `classid` is 0 or 4294967295, so the full key is what tells the two apart.
+WORKER_LOCK_CLASSID = WORKER_LOCK_KEY >> 32
+WORKER_LOCK_OBJID = WORKER_LOCK_KEY & 0xFFFF_FFFF
+
+
+@dataclass(frozen=True)
+class WorkerStatus:
+    """Whether a worker runs, as the worker lock says (docs/jobs.md § Queue): `running`
+    while a session holds it — `since` that session's start, `generation` the live
+    generation, None before any worker took one — `stopped` while none does, and
+    `unknown` off PostgreSQL, which has no lock to read."""
+
+    state: str
+    since: datetime | None = None
+    generation: int | None = None
+
+
+async def worker_status(db: AsyncSession) -> WorkerStatus:
+    """Read whether the worker runs, for the operator console: `pg_locks` and the
+    generation sequence only. Never `pg_try_advisory_lock` — a probe that found the
+    worker down would hold the lock itself, and a session lock left on a pooled API
+    connection would keep every worker from starting — and never `nextval`, which would
+    use a generation up."""
+    if db.get_bind().dialect.name != "postgresql":
+        return WorkerStatus("unknown")
+    holder = (
+        await db.execute(
+            text(
+                "SELECT a.backend_start FROM pg_locks l"
+                " LEFT JOIN pg_stat_activity a ON a.pid = l.pid"
+                " WHERE l.locktype = 'advisory' AND l.granted"
+                " AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())"
+                " AND l.classid::bigint = :classid AND l.objid::bigint = :objid"
+                " AND l.objsubid = 1"
+            ),
+            {"classid": WORKER_LOCK_CLASSID, "objid": WORKER_LOCK_OBJID},
+        )
+    ).first()
+    if holder is None:
+        return WorkerStatus("stopped")
+    # `is_called` false: the sequence has handed out nothing yet, so no worker has a
+    # generation — the one holding the lock is about to take the first.
+    last_value, is_called = (
+        await db.execute(text("SELECT last_value, is_called FROM worker_generation_seq"))
+    ).one()
+    return WorkerStatus("running", holder.backend_start, int(last_value) if is_called else None)
+
+
+def job_is_stuck(job: Job, worker: WorkerStatus) -> bool:
+    """A `running` job no live worker drives: the worker is stopped, or runs with another
+    generation than the job's — a job a dead or stale worker left, which only a worker's
+    start-up or the console puts back (docs/jobs.md § Queue). Never one the live worker
+    runs, and nothing while the worker's state is unknown."""
+    return job.status == "running" and (
+        worker.state == "stopped"
+        or (worker.state == "running" and job.worker_generation != worker.generation)
+    )
+
+
 async def requeue_orphaned_jobs(db: AsyncSession) -> list[uuid.UUID]:
     """Every job still `running` when a worker starts goes back to the queue: the
     deployment has one worker, so a job nobody is driving is one a dead worker held,
@@ -526,7 +600,9 @@ async def _keep_succeeded_pages(db: AsyncSession, job_id: uuid.UUID) -> None:
     )
 
 
-async def requeue_job(db: AsyncSession, job_id: uuid.UUID, generation: int | None = None) -> bool:
+async def requeue_job(
+    db: AsyncSession, job_id: uuid.UUID, generation: int | None = None, *, commit: bool = True
+) -> bool:
     """Put an interrupted job back on the queue, keeping the pages it finished.
 
     The next attempt transcribes only the pages without a succeeded row — a page the
@@ -536,7 +612,8 @@ async def requeue_job(db: AsyncSession, job_id: uuid.UUID, generation: int | Non
     stays as it is, its pages and crops with it; or, with `generation`, when the row no
     longer holds the caller's: a worker that lost the lock must not put back a job the
     replacement has taken (docs/jobs.md § Queue). A worker starting requeues without
-    one, since every `running` row is then a dead worker's.
+    one, since every `running` row is then a dead worker's. `commit=False` leaves the
+    commit to the caller: the console's requeue commits it with its audit row.
     """
     owned = [Job.worker_generation == generation] if generation is not None else []
     requeued = (
@@ -548,7 +625,8 @@ async def requeue_job(db: AsyncSession, job_id: uuid.UUID, generation: int | Non
     ).rowcount > 0
     if requeued:
         await _keep_succeeded_pages(db, job_id)
-    await db.commit()
+    if commit:
+        await db.commit()
     return requeued
 
 
@@ -631,23 +709,40 @@ HISTORY_FULL = (
 )
 
 
-async def history_bytes(db: AsyncSession, conversation_id: int) -> int:
-    """The stored size of a conversation's messages, in bytes as the cap is: PostgreSQL's
+async def history_bytes(
+    db: AsyncSession,
+    conversation_id: int,
+    *,
+    since: int | None = None,
+    turn_id: uuid.UUID | None = None,
+) -> int:
+    """The stored size of what a turn replays, in bytes as the cap is: PostgreSQL's
     `length` counts characters, and a history of non-ASCII text would reach four times
-    the cap before refusal (docs/chat.md § History is append-only)."""
+    the cap before refusal (docs/chat.md § History is append-only). With `since`, the
+    summary row a compaction left, only the rows from it on; and never the rows of a
+    compaction turn — a failed or cancelled attempt's instruction, answer and tool
+    results, stored but never sent — but that row and the rows of `turn_id`, the
+    compaction being loaded, as the runner replays them (docs/chat.md § Compaction)."""
     as_text = cast(Message.content, Text)
     size = (
         func.octet_length(as_text)
         if db.get_bind().dialect.name == "postgresql"
         else func.length(cast(as_text, LargeBinary))
     )
-    return (
-        await db.execute(
-            select(func.coalesce(func.sum(size), 0)).where(
-                Message.conversation_id == conversation_id
-            )
-        )
-    ).scalar_one()
+    query = select(func.coalesce(func.sum(size), 0)).where(
+        Message.conversation_id == conversation_id
+    )
+    if since is not None:
+        query = query.where(Message.id >= since)
+    compactions = select(ChatTurn.id).where(
+        ChatTurn.conversation_id == conversation_id, ChatTurn.kind.in_(COMPACTION_TURNS)
+    )
+    if turn_id is not None:
+        compactions = compactions.where(ChatTurn.id != turn_id)
+    replayed = [Message.turn_id.is_(None), Message.turn_id.notin_(compactions)]
+    if since is not None:
+        replayed.append(Message.id == since)
+    return (await db.execute(query.where(or_(*replayed)))).scalar_one()
 
 
 async def count_active_turns(db: AsyncSession, user_id: int) -> int:
@@ -669,13 +764,16 @@ async def enqueue_turn(
     conversation_id: int,
     message_id: int,
     locale: str = "en",
+    kind: str = MESSAGE_TURN,
 ) -> ChatTurn:
-    """Create the queued turn row. The caller commits, with the user message it answers."""
+    """Create the queued turn row — a user message's, or a compaction's by its `kind`
+    (docs/chat.md § Compaction). The caller commits, with the user message it answers."""
     turn = ChatTurn(
         id=uuid.uuid4(),
         user_id=user_id,
         conversation_id=conversation_id,
         message_id=message_id,
+        kind=kind,
         status="queued",
         locale=locale,
         created_at=utcnow(),

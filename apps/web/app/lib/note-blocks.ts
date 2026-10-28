@@ -11,8 +11,8 @@
 import type { Node as ProseNode } from '@tiptap/pm/model'
 import { Selection, type Transaction } from '@tiptap/pm/state'
 import type { Mappable } from '@tiptap/pm/transform'
-import { parseResultMarkdown, type ResultBlock } from './markdown'
-import { docToMarkdown } from './richdoc'
+import { parseResultMarkdown, type InlineOptions, type ResultBlock } from './markdown'
+import { convertBlock, docToMarkdown, markdownToDoc, type BlockKindName } from './richdoc'
 
 export interface NoteUnit {
   /** Where its first top-level block starts and its last one ends. */
@@ -91,6 +91,53 @@ export function unitMarkdown(doc: ProseNode, unit: NoteUnit): string {
  *  other unit's one block; null for an empty line. */
 export function unitBlock(doc: ProseNode, unit: NoteUnit): ResultBlock | null {
   return parseResultMarkdown(unitMarkdown(doc, unit)).flatMap((page) => page.blocks)[0] ?? null
+}
+
+function isHeading(block: ResultBlock | null): block is Extract<ResultBlock, { kind: 'h2' | 'h3' }> {
+  return block?.kind === 'h2' || block?.kind === 'h3'
+}
+
+/**
+ * What *Ask the agent* carries for a unit (docs/web.md § Notes, *The menu*): a heading with its
+ * section — the units under it, to the next heading of its level or a higher one, trailing
+ * empty lines left out — as the document's heading asks about its section; any other unit's
+ * own markdown.
+ */
+export function sectionMarkdown(doc: ProseNode, units: readonly NoteUnit[], index: number): string {
+  const head = unitBlock(doc, units[index]!)
+  let end = index + 1
+  if (isHeading(head)) {
+    while (end < units.length) {
+      const block = unitBlock(doc, units[end]!)
+      if (isHeading(block) && block.level <= head.level) {
+        break
+      }
+      end += 1
+    }
+    while (end > index + 1 && units[end - 1]!.bare) {
+      end -= 1
+    }
+  }
+  return docToMarkdown({ type: 'doc', content: units.slice(index, end).flatMap((unit) => unit.starts.map((start) => doc.nodeAt(start)!.toJSON())) })
+}
+
+/**
+ * Turns a unit into another kind within one transaction (docs/web.md § Notes, *The menu*): the
+ * document's conversion over the unit's markdown (`convertBlock`), read back as blocks in the
+ * unit's place. Answers where the first of them starts, or null when nothing is turned — an
+ * excerpt, whose quote and link stay paired; an image or a table; the kind the unit already is.
+ */
+export function convertUnit(tr: Transaction, units: readonly NoteUnit[], index: number, to: BlockKindName, options?: InlineOptions): number | null {
+  const unit = units[index]!
+  if (unit.excerpt) {
+    return null
+  }
+  const converted = convertBlock(unitMarkdown(tr.doc, unit), to)
+  if (converted === null) {
+    return null
+  }
+  tr.replaceWith(unit.from, unit.to, tr.doc.type.schema.nodeFromJSON(markdownToDoc(converted, options)).content)
+  return unit.from
 }
 
 // --- where the pointer is ---------------------------------------------------------------------

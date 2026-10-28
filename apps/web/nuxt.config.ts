@@ -77,6 +77,12 @@ export default defineNuxtConfig({
     '/settings/**': { ssr: false },
     '/zh-TW/files': { ssr: false },
     '/zh-TW/settings/**': { ssr: false },
+    // The operator console (docs/admin.md § Pages): client-rendered like the rest of the
+    // control plane. The bare path is listed beside its subtree, which `/**` alone may not match.
+    '/admin': { ssr: false },
+    '/admin/**': { ssr: false },
+    '/zh-TW/admin': { ssr: false },
+    '/zh-TW/admin/**': { ssr: false },
     // The four screens that became sections of the settings dialog (docs/web.md § Pages):
     // a bookmark of the old path lands on its section, through the `/settings/<section>`
     // deep-link page.

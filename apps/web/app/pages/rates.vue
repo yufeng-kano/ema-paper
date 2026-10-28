@@ -94,6 +94,12 @@ function rate(value: number): string {
               <td>{{ t('pricing.chatRow') }}</td>
               <td class="num">{{ t('rates.chatRate') }}</td>
             </tr>
+            <tr v-if="rates.web_search_per_call !== null">
+              <td>{{ t('pricing.webSearchRow') }}</td>
+              <td class="num tabular">
+                {{ t('pricing.perCall', { n: formatCount(rates.web_search_per_call, locale) }) }}
+              </td>
+            </tr>
           </tbody>
         </table>
       </section>

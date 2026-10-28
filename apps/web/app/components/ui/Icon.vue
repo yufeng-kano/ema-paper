@@ -575,6 +575,50 @@ defineProps<{ name: IconName }>()
       <path d="M14 2v4M8 10v4M16 18v4" />
     </template>
 
+    <!-- shield: the account menu's Admin console — the operator's own pages. -->
+    <template v-else-if="name === 'shield'">
+      <path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z" />
+    </template>
+
+    <!-- users-round: the console's Groups — people bound to permissions. -->
+    <template v-else-if="name === 'users-round'">
+      <path d="M18 21a8 8 0 0 0-16 0" />
+      <circle cx="10" cy="8" r="5" />
+      <path d="M22 20c0-3.37-2-6.5-4-8a5 5 0 0 0-.45-8.3" />
+    </template>
+
+    <!-- scroll-text: the console's Audit — the record of every change. -->
+    <template v-else-if="name === 'scroll-text'">
+      <path d="M15 12h-5M15 8h-5" />
+      <path d="M19 17V5a2 2 0 0 0-2-2H4" />
+      <path d="M8 21h12a2 2 0 0 0 2-2v-1a1 1 0 0 0-1-1H11a1 1 0 0 0-1 1v1a2 2 0 1 1-4 0V5a2 2 0 1 0-4 0v2a1 1 0 0 0 1 1h3" />
+    </template>
+
+    <!-- ticket: the console's Redeem codes. -->
+    <template v-else-if="name === 'ticket'">
+      <path d="M2 9a3 3 0 0 1 0 6v2a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-2a3 3 0 0 1 0-6V7a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2Z" />
+      <path d="M13 5v2" />
+      <path d="M13 17v2" />
+      <path d="M13 11v2" />
+    </template>
+
+    <!-- layout-grid: the console's Overview — the deployment at a glance. -->
+    <template v-else-if="name === 'layout-grid'">
+      <rect width="7" height="7" x="3" y="3" rx="1" />
+      <rect width="7" height="7" x="14" y="3" rx="1" />
+      <rect width="7" height="7" x="14" y="14" rx="1" />
+      <rect width="7" height="7" x="3" y="14" rx="1" />
+    </template>
+
+    <!-- list-checks: the console's Jobs — the queue, row by row. -->
+    <template v-else-if="name === 'list-checks'">
+      <path d="M13 5h8" />
+      <path d="M13 12h8" />
+      <path d="M13 19h8" />
+      <path d="m3 17 2 2 4-4" />
+      <path d="m3 7 2 2 4-4" />
+    </template>
+
     <!-- check: the confirmation a copy swaps to. -->
     <template v-else>
       <path d="M20 6 9 17l-5-5" />

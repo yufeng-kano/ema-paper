@@ -16,6 +16,10 @@ const ICONS: Record<StepKind, IconName> = {
   figure: 'crop',
   skill: 'book-open',
   subagent: 'agent',
+  web: 'globe',
+  papers: 'book-open',
+  fetch: 'link',
+  download: 'arrow-down',
   tool: 'terminal',
 }
 

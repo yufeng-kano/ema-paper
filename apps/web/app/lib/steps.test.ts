@@ -107,6 +107,20 @@ describe('readStep', () => {
   it('reads the page and figure views, skills, subagents, a restart and unknown tools', () => {
     expect(readStep('view_page', { page: 3 })).toEqual({ kind: 'page', target: '', page: 3 })
     expect(readStep('view_figure', { page: 5, bbox: [1, 2, 3, 4] })).toEqual({ kind: 'figure', target: '', page: 5 })
+    expect(readStep('web_search', { query: 'attention is all you need' })).toEqual({
+      kind: 'web',
+      target: 'attention is all you need',
+    })
+    expect(readStep('search_papers', { query: 'transformers' })).toEqual({ kind: 'papers', target: 'transformers' })
+    expect(readStep('read_url', { url: 'https://example.org/p' })).toEqual({ kind: 'fetch', target: 'https://example.org/p' })
+    expect(readStep('download_file', { url: 'https://example.org/p.pdf', folder: 'Papers', name: 'p.pdf' })).toEqual({
+      kind: 'download',
+      target: 'p.pdf',
+    })
+    expect(readStep('download_file', { url: 'https://example.org/p.pdf', folder: '', name: '' })).toEqual({
+      kind: 'download',
+      target: 'https://example.org/p.pdf',
+    })
     expect(readStep('skill', { name: 'zh-summary', arguments: '' })).toEqual({ kind: 'skill', target: 'zh-summary' })
     expect(readStep('subagent', { name: 'verifier', task: 'x' })).toEqual({ kind: 'subagent', target: 'verifier' })
     expect(readStep('bash', { restart: true })).toEqual({ kind: 'restart', target: '' })

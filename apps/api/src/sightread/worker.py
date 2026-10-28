@@ -15,10 +15,14 @@ import signal
 import time
 from pathlib import Path
 
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
 from .config import get_settings
+from .db.models import ChatTurn, Conversation
 from .db.session import create_engine, create_sessionmaker
+from .jobs import chat_web
+from .jobs.chat_compact import idle_compact_forever
 from .jobs.chat_runner import run_turn
 from .jobs.queue import (
     claim_next_job,
@@ -36,6 +40,7 @@ from .jobs.queue import (
 from .jobs.runner import fail_job, run_job
 from .jobs.sweeper import sweep_forever
 from .parsing.figures import discard_job_figures
+from .runtime_settings import RuntimeSettings
 from .sandbox.client import SandboxClient
 
 logger = logging.getLogger(__name__)
@@ -84,6 +89,10 @@ async def run_worker(stop: asyncio.Event) -> None:
         else None
     )
     sessionmaker = create_sessionmaker(engine)
+    # `.env`'s settings with the database's overrides on top, read again every
+    # RUNTIME_SETTINGS_CACHE_SECONDS: each claim takes a snapshot, and the job or turn it
+    # claims runs on it to the end (docs/admin.md § Settings).
+    runtime = RuntimeSettings(lambda: settings, lambda: sessionmaker)
     # This worker's generation, written on every job it claims and carried on every
     # write to one: the seconds between losing the lock and noticing are the
     # replacement's already, and nothing written in them may land (docs/jobs.md).
@@ -98,6 +107,9 @@ async def run_worker(stop: asyncio.Event) -> None:
     # expiry, the parse retention and the account deletions it finishes (docs/jobs.md
     # § Retention).
     sweeper = asyncio.create_task(sweep_forever(sessionmaker, settings, stop))
+    # And the idle compaction pass beside it (docs/chat.md § Compaction), on the settings
+    # in effect at each pass.
+    compactor = asyncio.create_task(idle_compact_forever(sessionmaker, runtime, stop))
     sandbox = SandboxClient(settings) if settings.sandbox_configured else None
     # Retried until it goes through: a database or runner blip at start must not leave
     # the turns a dead worker held unfinished until the next restart (docs/jobs.md).
@@ -111,13 +123,15 @@ async def run_worker(stop: asyncio.Event) -> None:
     # the cleanup has gone through, and no parse of theirs, since a parse finishing
     # writes their tree too (docs/jobs.md § Chat turns).
     orphaned_users: set[int] = set()
-    # The per-user parse cap the claim applies (docs/billing.md § Plans).
-    plan_jobs = {plan_id: plan.max_jobs for plan_id, plan in settings.plans.items()}
     logger.info("worker started; %d render slots", render_count)
     prefer_turns = False
 
     try:
         while not stop.is_set():
+            # The settings this claim and what it claims run on, and the per-user parse
+            # caps the claim applies (docs/billing.md § Plans).
+            snapshot = await runtime.current()
+            plan_jobs = {plan_id: plan.max_jobs for plan_id, plan in snapshot.plans.items()}
             if orphans_pending and time.monotonic() - orphans_tried_at >= ORPHAN_RETRY_SECONDS:
                 orphans_tried_at = time.monotonic()
                 try:
@@ -153,6 +167,7 @@ async def run_worker(stop: asyncio.Event) -> None:
                 continue
             job_id = None
             turn_id = None
+            turn_model = None
             try:
                 async with sessionmaker() as db:
                     # Two queues, one worker: a parse never starves a conversation and the
@@ -166,10 +181,16 @@ async def run_worker(stop: asyncio.Event) -> None:
                             orphaned_users,
                             generation,
                             plan_jobs=plan_jobs,
-                            free_max_jobs=settings.free_max_jobs,
+                            free_max_jobs=snapshot.free_max_jobs,
                         )
                     if job_id is None and turn_id is None and not (prefer_turns or orphans_pending):
                         turn_id = await claim_next_turn(db, settings.max_chat_turns_per_user)
+                    if turn_id is not None:
+                        turn_model = await db.scalar(
+                            select(Conversation.model)
+                            .join(ChatTurn, ChatTurn.conversation_id == Conversation.id)
+                            .where(ChatTurn.id == turn_id)
+                        )
             except SQLAlchemyError:
                 # A database blip must not end the worker; wait and ask again.
                 logger.exception("could not claim work")
@@ -181,9 +202,16 @@ async def run_worker(stop: asyncio.Event) -> None:
                 continue
 
             if turn_id is not None:
+                if turn_model and turn_model not in snapshot.model_prices:
+                    # The API offers a model priced on the Settings page at once, while this
+                    # copy may be RUNTIME_SETTINGS_CACHE_SECONDS old: read the rows again,
+                    # once, rather than fail the turn `model_unpriced` on an old copy
+                    # (docs/admin.md § Settings).
+                    runtime.invalidate()
+                    snapshot = await runtime.current()
                 logger.info("running chat turn %s", turn_id)
                 running = asyncio.create_task(
-                    run_turn(sessionmaker, settings, turn_id, render_slots)
+                    run_turn(sessionmaker, snapshot, turn_id, render_slots)
                 )
                 shutdown = asyncio.create_task(stop.wait())
                 done, _ = await asyncio.wait(
@@ -210,7 +238,7 @@ async def run_worker(stop: asyncio.Event) -> None:
 
             logger.info("running job %s", job_id)
             running = asyncio.create_task(
-                run_job(sessionmaker, settings, job_id, render_slots, generation)
+                run_job(sessionmaker, snapshot, job_id, render_slots, generation)
             )
             shutdown = asyncio.create_task(stop.wait())
             done, _ = await asyncio.wait({running, shutdown}, return_when=asyncio.FIRST_COMPLETED)
@@ -241,12 +269,13 @@ async def run_worker(stop: asyncio.Event) -> None:
                 # its user's cap. Failed, not requeued: the parse ran and billed.
                 logger.error("job %s raised past its runner", job_id, exc_info=running.exception())
                 try:
-                    await fail_job(sessionmaker, settings, job_id, "internal error", generation)
+                    await fail_job(sessionmaker, snapshot, job_id, "internal error", generation)
                 except Exception:  # noqa: BLE001 - the next start requeues what stays running
                     logger.exception("could not fail job %s", job_id)
     finally:
         sweeper.cancel()
-        await asyncio.gather(sweeper, return_exceptions=True)
+        compactor.cancel()
+        await asyncio.gather(sweeper, compactor, return_exceptions=True)
         if lock_watch is not None:
             lock_watch.cancel()
             await asyncio.gather(lock_watch, return_exceptions=True)
@@ -257,6 +286,8 @@ async def run_worker(stop: asyncio.Event) -> None:
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    # A fetched URL's query — a signature, a token — never reaches the log (docs/chat.md).
+    chat_web.redact_request_logs()
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for signal_name in (signal.SIGINT, signal.SIGTERM):

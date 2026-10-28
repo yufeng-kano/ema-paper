@@ -90,6 +90,10 @@ class User(Base):
     default_view: Mapped[str] = mapped_column(
         String(16), default=MARKDOWN_VIEW, server_default=text("'markdown'")
     )
+    # Refused redeem-code attempts in the window that `redeem_failed_at` opened
+    # (docs/billing.md § Redeem codes).
+    redeem_failures: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    redeem_failed_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
 
 
@@ -178,6 +182,9 @@ class AgentSetting(Base):
     memory_paused: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default=text("false")
     )
+    # The chat agent's idle compaction: the worker compacts the user's long conversations
+    # before their prompt cache expires (docs/chat.md § Compaction).
+    idle_compact: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
     # The parse agent's switch: a blocked page goes to `PARSE_FALLBACK_MODEL` on its own
     # (docs/parsing.md § Fallback model).
     auto_fallback: Mapped[bool] = mapped_column(
@@ -511,7 +518,19 @@ class Conversation(Base):
     """One thread of the chat agent about one document (docs/chat.md)."""
 
     __tablename__ = "conversations"
-    __table_args__ = (Index("ix_conversations_document_updated", "document_id", "updated_at"),)
+    __table_args__ = (
+        Index("ix_conversations_document_updated", "document_id", "updated_at"),
+        # What the idle compaction pass reads (docs/chat.md § Compaction).
+        Index(
+            "ix_conversations_cache_warm_until",
+            "cache_warm_until",
+            postgresql_where=text("cache_warm_until IS NOT NULL"),
+            sqlite_where=text("cache_warm_until IS NOT NULL"),
+        ),
+        # What the settings page counts when a price would be removed (docs/admin.md
+        # § Settings).
+        Index("ix_conversations_model", "model"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
@@ -525,8 +544,30 @@ class Conversation(Base):
     # The ids of the memories its first turn loaded, in the order they are rendered; NULL
     # until a turn took the snapshot (docs/chat.md § Memory).
     memory_ids: Mapped[list | None] = mapped_column(JSON_COLUMN, nullable=True)
+    # The snapshot of the agent's memory file its first turn took, taken again by a
+    # compaction; NULL until a turn took one, '' for a file that was empty or missing
+    # (docs/chat.md § Memory, *The memory file*).
+    memory_file: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The summary row the replay starts from; NULL while the conversation was never
+    # compacted. No foreign key: a message goes only with its conversation, and a key
+    # back to `messages` would close a cycle every DDL tool would have to break
+    # (docs/chat.md § Compaction).
+    compacted_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # What the last model call replayed and produced, and when the prompt cache it touched
+    # expires; NULL before the first call, after a compaction, and when the call reached
+    # no cache (docs/chat.md § Compaction).
+    context_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cache_warm_until: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
+
+
+# A turn's kinds: a user message answered, the reader's `/compact`, the worker's idle
+# compaction (docs/chat.md § Compaction).
+MESSAGE_TURN = "message"
+COMPACT_TURN = "compact"
+IDLE_COMPACT_TURN = "idle_compact"
+COMPACTION_TURNS = frozenset({COMPACT_TURN, IDLE_COMPACT_TURN})
 
 
 class ChatTurn(Base):
@@ -546,6 +587,10 @@ class ChatTurn(Base):
     # The user message this turn answers. No FK the other way: messages.turn_id names the
     # turn that produced an assistant message.
     message_id: Mapped[int] = mapped_column(Integer)
+    # message | compact | idle_compact (docs/chat.md § Compaction).
+    kind: Mapped[str] = mapped_column(
+        String(16), default=MESSAGE_TURN, server_default=text("'message'")
+    )
     status: Mapped[str] = mapped_column(String(16))  # queued|running|succeeded|failed|cancelled
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     # The web app's locale when the message was sent: the language the turn answers in.
@@ -553,6 +598,29 @@ class ChatTurn(Base):
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     started_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
+
+
+class ChatToolCall(Base):
+    """One web tool call of a turn that was answered or kept a file — `web_search`,
+    `search_papers`, `download_file` — what the per-day caps count and what a turn's web
+    searches are charged from (docs/chat.md § Tools, docs/billing.md § A chat turn). A
+    deleted turn keeps its rows for the day's count, as a purged parse keeps its entry."""
+
+    __tablename__ = "chat_tool_calls"
+    __table_args__ = (
+        # The deployment's per-day caps, a user's per-day cap, and the turn's settlement.
+        Index("ix_chat_tool_calls_tool_created", "tool", "created_at"),
+        Index("ix_chat_tool_calls_user_tool_created", "user_id", "tool", "created_at"),
+        Index("ix_chat_tool_calls_turn_id", "turn_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    turn_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("chat_turns.id", ondelete="SET NULL"), nullable=True
+    )
+    tool: Mapped[str] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
 
 
 class Message(Base):
@@ -883,8 +951,10 @@ class CreditEntry(Base):
 
 
 class CreditPack(Base):
-    """A top-up pack bought on Pro, written from Pay's canonical purchase (docs/billing.md
-    § Top-up packs): credits valid until `expires_at`, spent once the period's grant is."""
+    """A top-up pack bought on Pro, written from Pay's canonical purchase, granted by a
+    redeem code, or granted by an operator in the console (docs/billing.md § Top-up packs,
+    § Redeem codes, § Operator grants): credits valid until `expires_at`, spent once the
+    period's grant is."""
 
     __tablename__ = "credit_packs"
     __table_args__ = (
@@ -893,9 +963,11 @@ class CreditPack(Base):
         CheckConstraint("spent >= 0", name="ck_credit_packs_spent"),
         CheckConstraint("expires_at > purchased_at", name="ck_credit_packs_validity"),
         CheckConstraint("status IN ('paid', 'refunded')", name="ck_credit_packs_status"),
+        CheckConstraint("source IN ('pay', 'code', 'grant')", name="ck_credit_packs_source"),
     )
 
-    # Pay's purchaseId.
+    # Pay's purchaseId, `redeem-<redemption id>` for a code's credits, or
+    # `grant-<request id>` for an operator's grant.
     id: Mapped[str] = mapped_column(String(255), primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     pack_id: Mapped[str] = mapped_column(String(64))
@@ -906,6 +978,13 @@ class CreditPack(Base):
     expires_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ)
     # Pay's version (milliseconds): an update carrying an older one is ignored.
     version: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+    # `pay`: bought, Pay's to refund; `code`: a redeem code's grant, and `grant`: an
+    # operator's, which nothing refunds and the webhook and the refresh never touch
+    # (docs/billing.md § Redeem codes, § Operator grants).
+    source: Mapped[str] = mapped_column(String(8), default="pay", server_default=text("'pay'"))
+    redemption_id: Mapped[int | None] = mapped_column(
+        ForeignKey("redemptions.id", ondelete="SET NULL"), unique=True, nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
 
@@ -941,3 +1020,168 @@ class PackCheckout(Base):
     purchase_id: Mapped[str | None] = mapped_column(String(255), unique=True, nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
+
+
+class RedeemCode(Base):
+    """A code the operator hands out (docs/billing.md § Redeem codes): credits kept as a
+    pack once redeemed, or days of a paid plan banked on `plan_grants`. No user_id: a
+    code outlives every account that used it."""
+
+    __tablename__ = "redeem_codes"
+    __table_args__ = (
+        CheckConstraint("kind IN ('credits', 'plan')", name="ck_redeem_codes_kind"),
+        CheckConstraint("max_uses >= 1", name="ck_redeem_codes_max_uses"),
+        CheckConstraint("uses >= 0", name="ck_redeem_codes_uses"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # The random characters as printed, without the prefix; never logged.
+    code: Mapped[str] = mapped_column(String(64), unique=True)
+    kind: Mapped[str] = mapped_column(String(16))  # credits | plan
+    credits: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    valid_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    plan_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_uses: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    uses: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    redeem_by: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
+    # The operator's note, never shown to a user.
+    label: Mapped[str] = mapped_column(String(255), default="", server_default=text("''"))
+    disabled_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
+
+
+class Redemption(Base):
+    """One user's use of one code, with what it granted as the code stood then
+    (docs/billing.md § Redeem codes)."""
+
+    __tablename__ = "redemptions"
+    __table_args__ = (UniqueConstraint("code_id", "user_id", name="uq_redemptions_code_user"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    code_id: Mapped[int] = mapped_column(ForeignKey("redeem_codes.id", ondelete="CASCADE"))
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(16))
+    credits: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    plan_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    redeemed_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
+
+
+class PlanGrant(Base):
+    """The user's bank of granted days and, while one runs, the open granted period
+    (docs/billing.md § Periods, *Granted days*)."""
+
+    __tablename__ = "plan_grants"
+    __table_args__ = (CheckConstraint("days_banked >= 0", name="ck_plan_grants_days"),)
+
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    plan_id: Mapped[str] = mapped_column(String(64))
+    days_banked: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    period_start: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
+    period_end: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
+
+
+class Group(Base):
+    """A group of the operator console: binds people to permission strings (docs/admin.md
+    § Groups). Code reads `permissions` and `builtin`, never `name`. The one built-in
+    group holds every permission whatever its stored list, which is kept empty."""
+
+    __tablename__ = "groups"
+    __table_args__ = (
+        UniqueConstraint("name", name="uq_groups_name"),
+        # One built-in group: the owner group (docs/database.md).
+        Index(
+            "uq_groups_builtin",
+            "builtin",
+            unique=True,
+            postgresql_where=text("builtin"),
+            sqlite_where=text("builtin"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(32))
+    # Normalized permission strings in `ALL_PERMISSIONS` order (docs/admin.md
+    # § Permissions); a JSON column, so it is reassigned whole, never mutated in place.
+    permissions: Mapped[list] = mapped_column(JSON_COLUMN, default=list)
+    builtin: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
+
+
+class GroupMember(Base):
+    """One person in one group. A deleted group or account takes its memberships; the
+    one who added it may go and leave the row (docs/admin.md § Groups)."""
+
+    __tablename__ = "group_members"
+
+    group_id: Mapped[int] = mapped_column(
+        ForeignKey("groups.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True, index=True
+    )
+    # The member themselves for a sign-in's owner join.
+    added_by: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    added_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
+
+
+class AuditLog(Base):
+    """One change made through the operator console, written in the change's own
+    transaction and never updated or deleted (docs/admin.md § The audit log). `before` and
+    `after` hold ids, amounts, flags, permission strings and group names — never an
+    address, a person's name, content or a secret."""
+
+    __tablename__ = "audit_log"
+    __table_args__ = (
+        Index("ix_audit_log_created_at", "created_at"),
+        Index("ix_audit_log_actor_created", "actor_id", "created_at"),
+        Index("ix_audit_log_target", "target_type", "target_id"),
+    )
+
+    # BIGINT on PostgreSQL; SQLite numbers a row only through an INTEGER primary key.
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer(), "sqlite"), primary_key=True
+    )
+    # The record outlives the account that made the change.
+    actor_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    # What the route required; NULL for a sign-in's owner join.
+    permission: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    action: Mapped[str] = mapped_column(String(64))  # <area>.<verb>
+    target_type: Mapped[str] = mapped_column(String(32))  # group | user | setting
+    # No foreign key: a record outlives what it names.
+    target_id: Mapped[str] = mapped_column(String(64))
+    # A side with nothing is SQL NULL (docs/admin.md § The audit log): `none_as_null`, or a
+    # JSON column writes Python None as the JSON value `null`.
+    before: Mapped[dict | None] = mapped_column(
+        JSONB(none_as_null=True).with_variant(JSON(none_as_null=True), "sqlite"), nullable=True
+    )
+    after: Mapped[dict | None] = mapped_column(
+        JSONB(none_as_null=True).with_variant(JSON(none_as_null=True), "sqlite"), nullable=True
+    )
+    ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
+
+
+class RuntimeSetting(Base):
+    """One setting of `.env` the operator console overrides (docs/admin.md § Settings): a
+    key without a row is `.env`'s. `value` is the text `.env` would hold, kept as a JSON
+    string — never the JSON it may contain, whose key order `jsonb` would not keep."""
+
+    __tablename__ = "runtime_settings"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(JSON_COLUMN)
+    # Who stored it; NULL once that account is deleted.
+    updated_by: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)

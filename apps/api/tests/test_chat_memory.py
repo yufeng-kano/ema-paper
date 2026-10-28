@@ -747,10 +747,11 @@ async def test_the_instructions_follow_the_prompt_and_preset_verbatim(chat_clien
     assert [block.get("cache_control") for block in system] == [None] * 4 + [
         {"type": "ephemeral", "ttl": "1h"}
     ]
-    assert main[0]["tools"][-1]["name"] == "memory"
+    assert "memory" in [tool["name"] for tool in main[0]["tools"]]
     start = turn_starts(await replayed_events(client, conversation_id))[0]
     assert start == {
         "model": "claude-code/claude-opus-5-5",
+        "kind": "message",
         "instructions": True,
         "memory_ids": [],
         "turn_id": start["turn_id"],
@@ -830,7 +831,7 @@ async def test_paused_memory_loads_nothing_and_the_tool_refuses(chat_client) -> 
 
     assert main[0]["system"][-1]["text"] == memory_defs.PAUSED
     # Still declared: a changed tool list would cost the cached prefix.
-    assert main[0]["tools"][-1]["name"] == "memory"
+    assert "memory" in [tool["name"] for tool in main[0]["tools"]]
     refused = main[1]["messages"][2]["content"][0]
     assert refused["is_error"] is True and "paused" in refused["content"]
     assert await memory_ids_of(client, conversation_id) is None

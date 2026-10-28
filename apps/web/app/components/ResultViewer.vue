@@ -80,7 +80,7 @@ import {
 } from '~/lib/markdown'
 import type { MenuFact, MenuItem, Point } from '~/lib/menu'
 import type { Caret, LeaveReason, RichOptions, SectionLinkState, SectionLinkTarget, TextPoint } from '~/lib/rich-extensions'
-import { blockIndexAt, blockKindName, captionLine, convertBlock, type BlockKindName } from '~/lib/richdoc'
+import { TURN_KINDS, blockIndexAt, blockKindName, captionLine, convertBlock, type BlockKindName } from '~/lib/richdoc'
 import { SLASH_CONVERSIONS, skillIcon, type SlashSkill } from '~/lib/slash'
 
 /** The document pane never gets narrower than this to make room for a dragged column. */
@@ -138,9 +138,6 @@ const FADE_MS = 240
 
 /** A press on a handle that closed that handle's own menu: its click must not open it again. */
 const REOPEN_GUARD_MS = 300
-
-/** What *Turn into…* offers, in the submenu's order (docs/web.md § Editing). */
-const TURN_KINDS: readonly BlockKindName[] = ['paragraph', 'heading', 'subheading', 'bulleted', 'numbered', 'quote', 'formula', 'code']
 
 /** A run of visible rows, by index into the rows. */
 type RowRange = { from: number; to: number }
@@ -266,6 +263,8 @@ const emit = defineEmits<{
   view: [view: DocumentView]
   /** *Markdown* chosen on a file not yet converted: the conversion is asked for. */
   convert: []
+  /** The agent kept a file in Files: the page behind the viewer reads its library again. */
+  filed: []
 }>()
 
 const { t } = useI18n()
@@ -273,7 +272,7 @@ const { resolve } = useApiError()
 const localePath = useLocalePath()
 const { apple, label: keyLabel, matches } = useShortcuts()
 const auth = useAuth()
-const { notesOpen, agentOpen, chosenWidth, chooseWidth } = useViewerLayout()
+const { notesOpen, agentOpen, chosenWidth, chooseWidth, paperMargin } = useViewerLayout()
 
 /** The view: the document, or the original (docs/web.md § Result viewer, *Original and
  *  Markdown*) — the latter only where there is one to show, and never for a block link,
@@ -2517,6 +2516,8 @@ function endDrag() {
 // --- the selection toolbar ------------------------------------------------------------------
 
 interface ToolbarState {
+  /** The surface the selection is on: the document pane or the notes card. */
+  where: 'document' | 'notes'
   first: ToolbarRect
   last: ToolbarRect
   bounds: ToolbarRect
@@ -2525,9 +2526,11 @@ interface ToolbarState {
 
 const toolbar = ref<ToolbarState | null>(null)
 const paneEl = ref<HTMLElement | null>(null)
-/** A press in the pane is down: the toolbar waits for its release (docs/web.md § Editing,
- *  *When it shows*). */
-let paneHeld = false
+/** The notes under the card's head, which the notes' toolbar is positioned against. */
+const notesBody = ref<HTMLElement | null>(null)
+/** A press on a surface — the document pane or the notes card — is down: the toolbar waits
+ *  for its release (docs/web.md § Editing, *When it shows*). */
+let surfaceHeld = false
 let toolbarTimer: ReturnType<typeof setTimeout> | undefined
 let toolbarFrame = 0
 /** A coarse pointer: the toolbar sits under the selection, where the platform's callout is not. */
@@ -2538,27 +2541,30 @@ function onCoarseChange(change: MediaQueryListEvent) {
   coarse.value = change.matches
 }
 
-function onPanePointerDown(event: PointerEvent) {
-  if (event.target instanceof Element && event.target.closest('[role="toolbar"]')) {
+/** A primary press on a surface hides the toolbar and holds it until the release. A press on
+ *  the toolbar itself is its own, and a press with another button — a right click, for the
+ *  browser's menu — neither hides nor holds it (docs/web.md § Editing, *When it shows*). */
+function onSurfacePointerDown(event: PointerEvent) {
+  if (event.button !== 0 || (event.target instanceof Element && event.target.closest('[role="toolbar"]'))) {
     return
   }
-  paneHeld = true
+  surfaceHeld = true
   clearTimeout(toolbarTimer)
   toolbar.value = null
 }
 
 function onWindowPointerUp() {
   forgetChromePress()
-  if (!paneHeld) {
+  if (!surfaceHeld) {
     return
   }
-  paneHeld = false
+  surfaceHeld = false
   // After the release's own work: a drag over rendered blocks opens an editor on mouseup.
   void nextTick(() => requestAnimationFrame(readToolbar))
 }
 
 function onSelectionChange() {
-  if (paneHeld) {
+  if (surfaceHeld) {
     return
   }
   clearTimeout(toolbarTimer)
@@ -2581,19 +2587,22 @@ function blockOfNode(node: Node): string | null {
   return block && scroller.value?.contains(block) ? (block.dataset.block ?? null) : null
 }
 
-/** Shows the toolbar over a non-collapsed selection in the pane — in the open editor or over
- *  rendered blocks — or hides it. Files only, and only the Markdown view. */
+/** Shows the toolbar over a non-collapsed selection on one of its surfaces — the document
+ *  pane on the Markdown view, in the open editor or over rendered blocks, or the notes card on
+ *  either view (docs/web.md § Editing, *The notes have it too*) — or hides it. Files only. */
 function readToolbar() {
   const selection = window.getSelection()
-  const box = scroller.value
-  const pane = paneEl.value
-  if (!editable.value || tab.value !== 'markdown' || !selection || selection.isCollapsed || !selection.rangeCount || !box || !pane) {
+  if (!editable.value || !selection || selection.isCollapsed || !selection.rangeCount) {
     toolbar.value = null
     return
   }
   const firstRange = selection.getRangeAt(0)
   const lastRange = selection.getRangeAt(selection.rangeCount - 1)
-  if (!box.contains(firstRange.commonAncestorContainer) || !box.contains(lastRange.commonAncestorContainer)) {
+  const holds = (box: HTMLElement | null) =>
+    box !== null && box.contains(firstRange.commonAncestorContainer) && box.contains(lastRange.commonAncestorContainer)
+  const where = tab.value === 'markdown' && holds(scroller.value) ? 'document' : holds(notesBody.value) ? 'notes' : null
+  const surface = where === 'document' ? paneEl.value : where === 'notes' ? notesBody.value : null
+  if (!where || !surface) {
     toolbar.value = null
     return
   }
@@ -2604,10 +2613,11 @@ function readToolbar() {
     return
   }
   toolbar.value = {
+    where,
     first: screenRect(first),
     last: screenRect(last),
-    bounds: screenRect(pane.getBoundingClientRect()),
-    translate: translateSkill.value && selectionTranslates(selection),
+    bounds: screenRect(surface.getBoundingClientRect()),
+    translate: where === 'document' && translateSkill.value && selectionTranslates(selection),
   }
 }
 
@@ -2689,7 +2699,30 @@ function onToolbarSkill(name: string) {
   void askAgent({ selection: passage.markdown, command: name, send: true }, blockKey(passage.at))
 }
 
-/** The toolbar follows its selection as the pane scrolls. */
+/** The notes' toolbar (docs/web.md § Editing, *The notes have it too*): the notes editor's
+ *  selection as markdown, asked about or copied. Focus stays in the notes when a running turn
+ *  leaves the composer unfocused, since the toolbar took none. */
+function onNotesToolbarAction(action: 'ask' | 'copy') {
+  const markdown = notesEditor.value?.selectedMarkdown()?.markdown
+  if (!markdown) {
+    return
+  }
+  if (action === 'copy') {
+    void writeClipboard(markdown, t('viewer.note.copied'))
+    return
+  }
+  toolbar.value = null
+  void askAgent({ selection: markdown }, null)
+}
+
+/** The notes closed: a toolbar over them has nothing to stand over. */
+watch(notesOpen, (open) => {
+  if (!open && toolbar.value?.where === 'notes') {
+    toolbar.value = null
+  }
+})
+
+/** The toolbar follows its selection as its surface scrolls or is resized. */
 function repositionToolbar() {
   if (toolbar.value && !toolbarFrame) {
     toolbarFrame = requestAnimationFrame(() => {
@@ -2774,6 +2807,15 @@ async function askAgent(request: AskRequest, focusKey: string | null) {
   }
   if (outcome !== 'focused' && focus !== null) {
     focusBlock(focus)
+  }
+  return outcome
+}
+
+/** *Ask the agent* from a notes block's menu (docs/web.md § Notes, *The menu*): the unit's
+ *  markdown as the selection; the notes take focus back when the composer did not take it. */
+async function onNotesAsk(markdown: string, refocus: () => void) {
+  if ((await askAgent({ selection: markdown }, null)) !== 'focused') {
+    refocus()
   }
 }
 
@@ -3338,6 +3380,7 @@ watch(paneEl, (pane) => {
     paneObserver = new ResizeObserver(() => {
       paneHeight.value = pane.clientHeight
       measureGutter()
+      repositionToolbar()
     })
     paneObserver.observe(pane)
   }
@@ -3788,7 +3831,9 @@ function closeOverBlocks() {
   blockMenu.value = null
   menuHandleKey.value = null
   menuAfter = null
-  toolbar.value = null
+  if (toolbar.value?.where === 'document') {
+    toolbar.value = null
+  }
   endDrag()
 }
 
@@ -4030,7 +4075,7 @@ function scheduleWaitingImages() {
   }
   waitingTimer = setTimeout(() => {
     waitingTimer = undefined
-    if (!closed && !editing.value && !dragRun && !blockMenu.value && !toolbar.value) {
+    if (!closed && !editing.value && !dragRun && !blockMenu.value && toolbar.value?.where !== 'document') {
       landWaitingImages()
     }
   }, 0)
@@ -4508,6 +4553,7 @@ watch(
               class="notes card"
               :style="{ '--column-width': `${columnWidth.notes.value}px` }"
               :aria-label="t('viewer.notesLabel')"
+              @pointerdown="onSurfacePointerDown"
             >
               <header class="card-head">
                 <h3 class="card-title">{{ t('viewer.notesLabel') }}</h3>
@@ -4515,19 +4561,37 @@ watch(
                   <template #icon><UiIcon name="panel-left-close" /></template>
                 </UiButton>
               </header>
-              <div class="notes-view md-side" @click="onNotesClick">
-                <RichEditor
-                  ref="notesEditor"
-                  variant="notes"
-                  :source="notes"
-                  :placeholder="t('viewer.notesPlaceholder')"
-                  :label="t('viewer.notesLabel')"
-                  :links="notesLinks"
-                  :figures="editorFigures"
-                  :images="notesImages"
-                  blocks
-                  @change="onNotesChange"
-                  @note="showNote($event, false)"
+              <!-- The notes and, over them, their selection toolbar — positioned against this
+                   box, never laid out in the scroller (docs/web.md § Editing, *The notes have
+                   it too*). -->
+              <div ref="notesBody" class="notes-body">
+                <div class="notes-view md-side" @click="onNotesClick" @scroll.passive="repositionToolbar">
+                  <RichEditor
+                    ref="notesEditor"
+                    variant="notes"
+                    :source="notes"
+                    :placeholder="t('viewer.notesPlaceholder')"
+                    :label="t('viewer.notesLabel')"
+                    :links="notesLinks"
+                    :figures="editorFigures"
+                    :images="notesImages"
+                    blocks
+                    @change="onNotesChange"
+                    @ask="onNotesAsk"
+                    @note="showNote($event, false)"
+                  />
+                </div>
+                <ViewerToolbar
+                  v-if="toolbar?.where === 'notes'"
+                  :first="toolbar.first"
+                  :last="toolbar.last"
+                  :bounds="toolbar.bounds"
+                  :coarse="coarse"
+                  :skills="[]"
+                  :quote="false"
+                  solid
+                  @ask="onNotesToolbarAction('ask')"
+                  @copy="onNotesToolbarAction('copy')"
                 />
               </div>
             </aside>
@@ -4556,7 +4620,7 @@ watch(
             ref="paneEl"
             class="pane"
             @keydown.capture="onPaneKey"
-            @pointerdown="onPanePointerDown"
+            @pointerdown="onSurfacePointerDown"
             @dragover="onPaneDragOver"
             @drop="onPaneDrop"
           >
@@ -4573,6 +4637,7 @@ watch(
               ref="scroller"
               class="document"
               :class="{ files: documentId !== null, 'locate-fading': locateFading }"
+              :data-margin="paperMargin"
               @copy="onCopy"
               @mousedown.capture="forgetPress"
               @mouseup="editable && onBlockClick()"
@@ -4822,7 +4887,7 @@ watch(
             />
 
             <ViewerToolbar
-              v-if="toolbar && tab === 'markdown'"
+              v-if="toolbar?.where === 'document' && tab === 'markdown'"
               :first="toolbar.first"
               :last="toolbar.last"
               :bounds="toolbar.bounds"
@@ -4896,6 +4961,7 @@ watch(
               :document-pages="documentPages"
               :current-section="currentSection"
               @changed="loadContent()"
+              @filed="emit('filed')"
               @locate="locateSection"
               @to-notes="addToNotes"
               @close="agentOpen = false"
@@ -5030,12 +5096,15 @@ watch(
 
 /* One continuous scroll of the whole document: a reader comparing two pages should not have
    to click between them. The scrollbar is hidden on this region, as on the two columns
-   beside it; it still scrolls. The located passage's wash fades by this property (below). */
+   beside it; it still scrolls. The located passage's wash fades by this property (below).
+   `--page-width` is the column's share of the pane, the rest being the body margins the
+   reader chose in Settings (docs/web.md § Body margins): 70% until chosen. */
 .document {
   --block-heading: var(--display-lg);
   --block-subheading: var(--display-sm);
   --block-text: var(--text-read);
   --block-text-sm: var(--text-read-sm);
+  --page-width: 70%;
 
   min-width: 0;
   min-height: 0;
@@ -5058,11 +5127,44 @@ watch(
   --locate-fade: 1;
 }
 
+/* None: the whole pane, with the side padding the stacked layout keeps (below) — the one
+   slot a heading's chevron and handle then share, by the same rules. */
+.document[data-margin='none'] {
+  --page-width: 100%;
+  padding-inline: var(--space-8);
+}
+
+.document[data-margin='none'].files .block[data-kind='h2'] > .block-handle,
+.document[data-margin='none'].files .block[data-kind='h3'] > .block-handle {
+  left: -28px;
+}
+
+.document[data-margin='none'].files .block:is([data-kind='h2'], [data-kind='h3']):not(.open, .selected, .moving) > .block-handle:not(.on) {
+  display: none;
+}
+
+.document[data-margin='none'].files .block:is(.open, .selected, .moving) > .block-chevron,
+.document[data-margin='none'].files .block-handle.on ~ .block-chevron {
+  display: none;
+}
+
+.document[data-margin='narrow'] {
+  --page-width: 85%;
+}
+
+.document[data-margin='wide'] {
+  --page-width: 55%;
+}
+
+.document[data-margin='widest'] {
+  --page-width: 40%;
+}
+
 /* The column, centered in the pane. The page boundary carries no rule and no label: it is
    the grouping the data has, not a division the reader is asked to see, so consecutive pages
    are separated by exactly the gap the blocks inside one page already keep. */
 .page {
-  width: 70%;
+  width: var(--page-width);
   margin-inline: auto;
 }
 
@@ -5543,6 +5645,15 @@ watch(
   margin-left: var(--space-4);
 }
 
+/* The notes under the card's head, which their selection toolbar is positioned against. */
+.notes-body {
+  position: relative;
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+}
+
 /* The whole card under its head is the notes: a click below the last line still writes. The
    left padding is the gutter the blocks' handles sit in (docs/web.md § Notes). */
 .notes-view {
@@ -5606,10 +5717,10 @@ watch(
   object-fit: contain;
 }
 
-/* A percentage column needs a floor: below the shell breakpoint 70% of the pane is a
-   gutter wider than the text it frames. The side columns stack under the document there,
-   each keeping its own scroll. The gutter is the 40px padding: room for a handle or a
-   chevron, not both, so on Files a heading's two take turns in one slot. */
+/* A percentage column needs a floor: below the shell breakpoint the chosen share of the
+   pane is a gutter wider than the text it frames. The side columns stack under the document
+   there, each keeping its own scroll. The gutter is the 40px padding: room for a handle or
+   a chevron, not both, so on Files a heading's two take turns in one slot. */
 @media (max-width: 900px) {
   .page,
   .page-skeleton {

@@ -12,6 +12,9 @@ from decimal import Decimal, InvalidOperation
 
 TOKENS_PER_PRICE_UNIT = Decimal(1_000_000)
 PRICE_FIELDS = ("input", "cache_read", "cache_write", "output")
+# What an entry may carry beside the prices: the model's context window, in tokens — what
+# the chat panel's ring measures a conversation against (docs/chat.md § Compaction).
+CONTEXT_FIELD = "context"
 
 
 @dataclass(frozen=True)
@@ -22,6 +25,8 @@ class ModelPrice:
     cache_read: Decimal
     cache_write: Decimal
     output: Decimal
+    # The model's context window in tokens, when the operator named one; None otherwise.
+    context: int | None = None
 
     def usd(
         self,
@@ -50,8 +55,9 @@ class ModelPrice:
 
 def parse_model_prices(raw: str) -> dict[str, ModelPrice]:
     """`MODEL_PRICES_JSON`: `{"<model>": {"input": …, "cache_read": …, "cache_write": …,
-    "output": …}}`, every field a non-negative number. Anything else is refused whole, so
-    a typo cannot leave one model priced at nothing."""
+    "output": …, "context": …}}`, every price a non-negative number and `context` — the
+    model's context window in tokens — an optional positive integer. Anything else is
+    refused whole, so a typo cannot leave one model priced at nothing."""
     try:
         data = json.loads(raw or "{}")
     except json.JSONDecodeError as exc:
@@ -62,9 +68,17 @@ def parse_model_prices(raw: str) -> dict[str, ModelPrice]:
     for model, entry in data.items():
         if not isinstance(model, str) or not model.strip():
             raise ValueError("MODEL_PRICES_JSON: a model id must be a non-empty string")
-        if not isinstance(entry, dict) or set(entry) != set(PRICE_FIELDS):
+        if not isinstance(entry, dict) or set(entry) - {CONTEXT_FIELD} != set(PRICE_FIELDS):
             raise ValueError(
                 f"MODEL_PRICES_JSON: {model!r} must carry exactly {', '.join(PRICE_FIELDS)}"
+                f" (and may carry {CONTEXT_FIELD})"
+            )
+        context = entry.get(CONTEXT_FIELD)
+        if context is not None and (
+            isinstance(context, bool) or not isinstance(context, int) or context <= 0
+        ):
+            raise ValueError(
+                f"MODEL_PRICES_JSON: {model!r}.{CONTEXT_FIELD} must be a positive integer"
             )
         values: dict[str, Decimal] = {}
         for field in PRICE_FIELDS:
@@ -78,7 +92,7 @@ def parse_model_prices(raw: str) -> dict[str, ModelPrice]:
             if not price.is_finite() or price < 0:
                 raise ValueError(f"MODEL_PRICES_JSON: {model!r}.{field} must be >= 0")
             values[field] = price
-        prices[model.strip()] = ModelPrice(**values)
+        prices[model.strip()] = ModelPrice(**values, context=context)
     return prices
 
 

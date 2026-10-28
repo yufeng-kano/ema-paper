@@ -5,7 +5,9 @@
  * first line and centered on it, held `--space-2` inside the pane. Flipped below where it
  * would leave the pane's top; under the selection on a coarse pointer, the side the
  * platform's own selection callout leaves free. Where it is still wider than the pane its
- * buttons drop their words, which stay their names.
+ * buttons drop their words, which stay their names. The notes card has it too (*The notes
+ * have it too*), with Ask the agent and Copy only, and `solid` there: the card is a glass
+ * pane, and nothing glass sits on glass.
  *
  * A press on it never moves focus, so the selection — in the open editor or over the rendered
  * blocks — is still there for the action to read. Its buttons are not tab stops: the keyboard
@@ -32,16 +34,23 @@ export interface ToolbarSkill {
   icon: IconName
 }
 
-const props = defineProps<{
-  /** The selection's first line and last line. */
-  first: ToolbarRect
-  last: ToolbarRect
-  /** The pane the toolbar is drawn in. */
-  bounds: ToolbarRect
-  coarse: boolean
-  /** The skills the selection can be sent to; none hides the Skills button. */
-  skills: readonly ToolbarSkill[]
-}>()
+const props = withDefaults(
+  defineProps<{
+    /** The selection's first line and last line. */
+    first: ToolbarRect
+    last: ToolbarRect
+    /** The pane the toolbar is drawn in. */
+    bounds: ToolbarRect
+    coarse: boolean
+    /** The skills the selection can be sent to; none hides the Skills button. */
+    skills: readonly ToolbarSkill[]
+    /** Quote in notes is offered; false in the notes, where the selection already is. */
+    quote?: boolean
+    /** The opaque menu surface instead of glass: on a glass card. */
+    solid?: boolean
+  }>(),
+  { quote: true, solid: false },
+)
 
 const emit = defineEmits<{
   ask: []
@@ -72,7 +81,7 @@ const listPlace = ref({ left: 0, top: 0, width: LIST_WIDTH, maxHeight: 0, above:
 
 const buttons = computed((): { key: 'ask' | 'quote' | 'copy'; icon: IconName; label: string }[] => [
   { key: 'ask', icon: 'message-circle', label: t('viewer.toolbar.ask') },
-  { key: 'quote', icon: 'notebook-pen', label: t('viewer.toolbar.quote') },
+  ...(props.quote ? [{ key: 'quote' as const, icon: 'notebook-pen' as const, label: t('viewer.toolbar.quote') }] : []),
   { key: 'copy', icon: 'copy', label: t('viewer.toolbar.copy') },
 ])
 
@@ -174,7 +183,7 @@ function pick(name: string) {
   <div
     ref="box"
     class="toolbar"
-    :class="{ compact }"
+    :class="{ compact, solid }"
     role="toolbar"
     :aria-label="t('viewer.toolbar.label')"
     :style="{ left: `${place.left}px`, top: `${place.top}px` }"
@@ -269,6 +278,15 @@ function pick(name: string) {
   .toolbar {
     background: var(--paper);
   }
+}
+
+/* On a glass card: the menu's opaque surface, as the agent panel's reply toolbar is. */
+.toolbar.solid {
+  border: 1px solid var(--menu-edge);
+  background: var(--menu-surface);
+  box-shadow: var(--shadow-menu);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
 }
 
 @keyframes toolbar-in {

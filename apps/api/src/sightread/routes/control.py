@@ -19,6 +19,7 @@ from sqlalchemy import case, delete, func, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
 
+from ..admin.groups import join_owner_group, permissions_of
 from ..agents import AGENTS, CHAT, CHECK, PARSE, AgentDefinition, get_agent
 from ..agents import chat as chat_agent
 from ..agents import memory as memory_defs
@@ -63,6 +64,7 @@ from ..db.models import (
 from ..errors import ApiError
 from ..jobs import chat_memory, chat_runner
 from ..jobs.intake import PDF_MEDIA_TYPE
+from ..jobs.queue import count_active_turns
 from ..jobs.sweeper import discard_account
 from ..parsing.attachments import ATTACHMENT_EXTENSIONS
 from ..parsing.images import ACCEPTED_IMAGE_TYPES
@@ -77,6 +79,7 @@ from ..workspace.documents import (
 )
 from ..workspace.layout import user_root
 from ..workspace.locks import workspace_lock
+from ..workspace.memory_file import memory_file_text, write_memory_file
 from ..workspace.trash import lock_user
 from .billing import me_fields
 from .chat import TITLE_MAX_CHARS, owned_document, turn_note
@@ -138,6 +141,15 @@ async def callback(request: Request, db: DbSession, settings: AppSettings):
         db, claims["sub"], claims["email"], claims.get("name"), claims.get("picture")
     )
     session_token = await create_session(db, user)
+    # An `OWNER_EMAILS` address joins the console's owner group, provided Google verified
+    # it, in the same commit as the session (docs/admin.md § Groups).
+    await join_owner_group(
+        db,
+        settings,
+        user,
+        verified=claims.get("email_verified") is True,
+        ip=request.client.host if request.client else None,
+    )
     await db.commit()
 
     # A connector flow parks the authorize request that sent the user here; only a path on
@@ -167,10 +179,19 @@ async def logout(request: Request, db: DbSession) -> Response:
 
 
 @dev_router.post("/auth/dev-login", dependencies=[CsrfGuard])
-async def dev_login(db: DbSession):
-    """Local-only shortcut so the stack is demoable without Google credentials."""
+async def dev_login(request: Request, db: DbSession, settings: AppSettings):
+    """Local-only shortcut so the stack is demoable without Google credentials. Its
+    address counts as verified, so `OWNER_EMAILS=dev@localhost` makes it an owner
+    (docs/auth.md § 1)."""
     user = await upsert_user(db, DEV_USER_SUB, DEV_USER_EMAIL, "Local Developer")
     session_token = await create_session(db, user)
+    await join_owner_group(
+        db,
+        settings,
+        user,
+        verified=True,
+        ip=request.client.host if request.client else None,
+    )
     await db.commit()
     response = JSONResponse({"user": {"id": user.id, "email": user.email}})
     set_session_cookie(response, session_token)
@@ -210,6 +231,10 @@ async def me(user: SessionUser, db: DbSession, settings: AppSettings):
         # Which view a converted PDF or image opens on the first time it is read
         # (docs/web.md § Result viewer, *Original and Markdown*).
         "default_view": user.default_view,
+        # Whether the account menu offers the operator console: it is on and the account
+        # holds any of its permissions — no re-login window here (docs/admin.md § Signing
+        # in).
+        "console": settings.console_enabled and bool(await permissions_of(db, user.id)),
         # What the upload UI is allowed to send, from the server's own configuration —
         # a limit written twice is a limit that drifts (docs/api.md § Limits).
         "limits": {
@@ -246,6 +271,11 @@ async def me(user: SessionUser, db: DbSession, settings: AppSettings):
             "selection_max_chars": settings.chat_selection_max_chars,
             # A conversation's rename field (docs/chat.md § Conversations, turns, events).
             "conversation_title_max_chars": TITLE_MAX_CHARS,
+            # The Agent page's memory file editor (docs/chat.md § Memory, *The memory file*).
+            "memory_file_max_chars": settings.chat_memory_file_max_chars,
+            # When the idle pass may queue a compaction of an open conversation, for the
+            # panel to read it again then (docs/web.md § The agent panel).
+            "idle_compact_lead_seconds": settings.chat_idle_compact_lead_seconds,
             # How long the Trash keeps an item, which its tab states; 0 = never emptied by
             # itself (docs/workspace.md § The Trash).
             "trash_retention_days": settings.trash_retention_days,
@@ -643,6 +673,9 @@ def _agent_settings_payload(settings: AppSettings, agent: str, row: AgentSetting
         "translate_language": row.translate_language if row else None,
         "memory_auto": row.memory_auto if row and row.memory_auto is not None else True,
         "memory_paused": bool(row.memory_paused) if row else False,
+        # And whether the worker compacts the reader's long conversations before their
+        # cache expires (docs/chat.md § Compaction).
+        "idle_compact": row.idle_compact if row and row.idle_compact is not None else True,
         # The parse agent's own: the model a blocked page goes to — the deployment's, a
         # fact — and whether it goes there on its own (docs/parsing.md § Fallback model).
         "fallback_model": (settings.parse_fallback_model or None) if agent == PARSE.name else None,
@@ -661,10 +694,10 @@ def _bbox_payload(settings: AppSettings, agent: str, row: AgentSetting | None) -
     return {"family": convention.family, "format": convention.format}
 
 
-def _agent_tools(name: str, shell: bool) -> list[str]:
+def _agent_tools(name: str, shell: bool, settings: AppSettings) -> list[str]:
     if name != CHAT.name:
         return []
-    return [str(tool["name"]) for tool in chat_runner.turn_tools(shell)]
+    return [str(tool["name"]) for tool in chat_runner.turn_tools(shell, settings)]
 
 
 @router.get("/agents")
@@ -691,7 +724,7 @@ async def list_agents(user: SessionUser, db: DbSession, settings: AppSettings):
                 # The tools this deployment really gives this user's agent: `bash` only
                 # on a plan that grants it, with a sandbox runner configured
                 # (docs/chat.md § Tools, docs/billing.md § Plans).
-                "tools": _agent_tools(agent.name, shell),
+                "tools": _agent_tools(agent.name, shell, settings),
                 "settings": _agent_settings_payload(settings, agent.name, rows.get(agent.name)),
                 # A fact about the model, not a setting: the coordinate convention the
                 # pipeline will ask it for (docs/parsing.md § Coordinate conventions).
@@ -719,6 +752,7 @@ class AgentSettingsPut(BaseModel):
     translate_language: str | None = None
     memory_auto: bool | None = None
     memory_paused: bool | None = None
+    idle_compact: bool | None = None
     # The parse agent's own (docs/agents.md).
     auto_fallback: bool | None = None
     auto_convert: bool | None = None
@@ -734,6 +768,7 @@ SETTING_OWNERS: dict[str, tuple[str, ...]] = {
     "translate_language": (CHAT.name,),
     "memory_auto": (CHAT.name,),
     "memory_paused": (CHAT.name,),
+    "idle_compact": (CHAT.name,),
     "auto_fallback": (PARSE.name,),
     "auto_convert": (PARSE.name,),
     "auto_check": (CHECK.name,),
@@ -781,7 +816,14 @@ async def put_agent_settings(
         raise ApiError(
             400, "invalid_request", f"The {agent.name} agent takes no {', '.join(foreign)}"
         )
-    for switch in ("memory_auto", "memory_paused", "auto_fallback", "auto_convert", "auto_check"):
+    for switch in (
+        "memory_auto",
+        "memory_paused",
+        "idle_compact",
+        "auto_fallback",
+        "auto_convert",
+        "auto_check",
+    ):
         if switch in provided and getattr(body, switch) is None:
             raise ApiError(400, "invalid_request", f"{switch} is true or false")
     instructions = (
@@ -792,15 +834,16 @@ async def put_agent_settings(
     prompt: str | None = None
     if "prompt" in provided:
         prompt = (body.prompt or "").strip() or None
+        # The default stored as no prompt, so a later default reaches it — before the cap,
+        # which is the reader's own prompt's, not the default's.
+        if prompt == agent.default_prompt_template.strip():
+            prompt = None
         if prompt is not None and len(prompt) > settings.system_prompt_max_chars:
             raise ApiError(
                 400,
                 "invalid_request",
                 f"The prompt exceeds {settings.system_prompt_max_chars} characters",
             )
-        # The default stored as no prompt, so a later default reaches it.
-        if prompt == agent.default_prompt_template.strip():
-            prompt = None
     if prompt is not None and body.prompt_preset_id is not None:
         # The two exclude each other (docs/agents.md § Per-agent settings).
         raise ApiError(400, "invalid_request", "Send either prompt or prompt_preset_id")
@@ -858,6 +901,8 @@ async def put_agent_settings(
         row.memory_auto = bool(body.memory_auto)
     if "memory_paused" in provided:
         row.memory_paused = bool(body.memory_paused)
+    if "idle_compact" in provided:
+        row.idle_compact = bool(body.idle_compact)
     try:
         await db.commit()
     except IntegrityError as exc:
@@ -921,7 +966,7 @@ async def chat_agent_context(
         )
     )
     shell = ledger.sandbox_granted(settings, await ledger.plan_of(db, settings, user.id))
-    tools = [str(tool["name"]) for tool in chat_runner.turn_tools(shell)]
+    tools = [str(tool["name"]) for tool in chat_runner.turn_tools(shell, settings)]
     parts = chat_agent.system_parts(
         # Without a document the template keeps its tokens, its tool lines filtered as a
         # turn's would be.
@@ -932,6 +977,10 @@ async def chat_agent_context(
         instructions=setting.instructions if setting else None,
         catalogue=chat_runner.turn_catalogue(skills, subagents),
         memory=memory_defs.render_memory_block(loaded, auto=auto, paused=paused),
+        # The memory file as a new conversation would read it (docs/chat.md § Memory).
+        memory_file=chat_agent.render_memory_file(
+            await memory_file_text(settings, user.id), settings.chat_memory_file_max_chars
+        ),
     )
     extras = {
         "prompt": {"own": own_prompt is not None},
@@ -960,6 +1009,51 @@ async def chat_agent_context(
         "turn": {"text": turn, "chars": len(turn)},
         "facts": facts,
     }
+
+
+@router.get("/agents/chat/memory-file")
+async def read_memory_file(user: SessionUser, settings: AppSettings):
+    """The chat agent's memory file as it is now, and how much of it a turn reads
+    (docs/chat.md § Memory, *The memory file*)."""
+    return {
+        "text": await memory_file_text(settings, user.id),
+        "max_chars": settings.chat_memory_file_max_chars,
+    }
+
+
+class MemoryFilePut(BaseModel):
+    text: str
+
+
+@router.put("/agents/chat/memory-file", dependencies=[CsrfGuard])
+async def put_memory_file(
+    body: MemoryFilePut, user: SessionUser, db: DbSession, settings: AppSettings
+):
+    """The reader's own text, written as a revision of theirs under the workspace lock —
+    taken first, then the user's row, the order every workspace mutation takes — and
+    refused while any turn of the reader is unfinished, since a turn may be writing it
+    (docs/chat.md § Memory, *The memory file*)."""
+    text = memory_defs.clean_text(body.text, single_line=False)
+    if len(text) > settings.chat_memory_file_max_chars:
+        raise ApiError(
+            400,
+            "invalid_request",
+            f"The memory file exceeds {settings.chat_memory_file_max_chars} characters",
+        )
+    stored = f"{text}\n" if text else ""
+    root = user_root(settings.workspaces_dir, user.id)
+    async with workspace_lock(root):
+        # The send's lock: no turn is queued under the decision below.
+        await db.execute(select(User.id).where(User.id == user.id).with_for_update())
+        if await count_active_turns(db, user.id):
+            raise ApiError(
+                409,
+                "invalid_request",
+                "A conversation is still answering; wait for it to finish before saving",
+            )
+        await asyncio.to_thread(write_memory_file, root, stored, settings.content_max_bytes)
+        await db.commit()
+    return {"text": stored}
 
 
 @router.get("/agents/{agent_name}/models")

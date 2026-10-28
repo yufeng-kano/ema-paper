@@ -42,6 +42,7 @@ onMounted(async () => {
 
 /** Null until the catalog answers: no rate is ever assumed (docs/web.md § Rules). */
 const parsePerPage = computed(() => catalog.value?.rates.parse_per_page ?? null)
+const webSearchPerCall = computed(() => catalog.value?.rates.web_search_per_call ?? null)
 
 // --- the top-up pack ----------------------------------------------------------------------
 
@@ -263,6 +264,10 @@ const questions = computed(() => (pack.value ? ['1', '2', '3', '4', '5'] : ['1',
                 {{ t('pricing.chatRate') }}
                 <NuxtLink class="rates-link" :to="localePath('/rates')">{{ t('pricing.ratesLink') }}</NuxtLink>
               </td>
+            </tr>
+            <tr v-if="webSearchPerCall !== null">
+              <td>{{ t('pricing.webSearchRow') }}</td>
+              <td class="num tabular">{{ t('pricing.perCall', { n: formatCount(webSearchPerCall, locale) }) }}</td>
             </tr>
           </tbody>
         </table>

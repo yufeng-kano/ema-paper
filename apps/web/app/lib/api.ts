@@ -17,11 +17,22 @@ export type ApiErrorType =
   | 'rate_limit'
   | 'payment'
   | 'insufficient_credits'
+  | 'not_convertible'
   | 'checkout_unavailable'
   | 'pay_unavailable'
   | 'plan_required'
   | 'subscription_active'
   | 'checkout_open'
+  | 'code_invalid'
+  | 'code_expired'
+  | 'code_exhausted'
+  | 'code_redeemed'
+  | 'code_plan_conflict'
+  // The operator console's own (docs/admin.md § Refusals): a missing permission, a session
+  // past the console's window, and a rule of the console, which `details.reason` names.
+  | 'permission_denied'
+  | 'reauth_required'
+  | 'admin_conflict'
   | 'upstream'
   | 'internal'
 
@@ -88,6 +99,9 @@ export interface AgentSettings {
   /** `chat` only: the memory switches (docs/chat.md § Memory). */
   memory_auto?: boolean
   memory_paused?: boolean
+  /** `chat` only: whether the worker compacts a long conversation before its prompt cache
+   *  expires (docs/chat.md § Compaction, *Idle compaction*); on by default. */
+  idle_compact?: boolean
   /** `parse` only: the deployment's fallback model, a fact (null: none), and whether a
    *  blocked page goes there on its own (docs/parsing.md § Fallback model). */
   fallback_model?: string | null
@@ -173,6 +187,12 @@ export interface UploadLimits {
   /** A conversation's title, as a rename stores it (docs/chat.md § Conversations, turns,
    *  events). Optional, as above. */
   conversation_title_max_chars?: number
+  /** The chat agent's memory file, as the Agent page's editor caps it (docs/chat.md
+   *  § Memory, *The memory file*). Optional, as above. */
+  memory_file_max_chars?: number
+  /** How long before a conversation's cache expires the worker may compact it
+   *  (docs/chat.md § Compaction, *Idle compaction*). */
+  idle_compact_lead_seconds?: number
   /** How many days the Trash keeps an item before the worker deletes it for good; 0 never
    *  does (docs/workspace.md § The Trash). Optional only so a page served by an older API
    *  still renders. */
@@ -223,7 +243,7 @@ export interface MemoryFields {
 
 // --- what the chat agent receives (docs/api.md, GET /api/agents/chat/context) -------------
 
-export type AgentContextPartKind = 'prompt' | 'preset' | 'instructions' | 'catalogue' | 'memory'
+export type AgentContextPartKind = 'prompt' | 'preset' | 'instructions' | 'catalogue' | 'memory_file' | 'memory'
 
 export interface AgentContextPart {
   kind: AgentContextPartKind
@@ -344,6 +364,10 @@ export interface MeResponse {
    *  § Result viewer, *Original and Markdown*); Markdown where unset. Optional so a page
    *  served by an older API still renders. */
   default_view?: DocumentView
+  /** Whether to offer the operator console: it is on and the account holds one of its
+   *  permissions (docs/admin.md § Signing in). Optional so a page served by an older API
+   *  still renders — without it the account menu has no *Admin console*. */
+  console?: boolean
 }
 
 // --- billing (docs/billing.md § Routes) --------------------------------------------
@@ -375,10 +399,13 @@ export interface ChatRate {
 
 export interface BillingRates {
   parse_per_page: number
+  /** Credits one `web_search` call by the agent costs; null where the deployment offers none. */
+  web_search_per_call: number | null
   chat: Record<string, ChatRate>
 }
 
-/** One top-up pack the reader bought (docs/billing.md § Top-up packs): `remaining` is 0 and
+/** One top-up pack the reader bought, a redeem code's credits, or an operator's grant
+ *  (docs/billing.md § Top-up packs, § Redeem codes, § Operator grants): `remaining` is 0 and
  *  `active` false once it is refunded or expired. */
 export interface BillingPack {
   id: string
@@ -390,6 +417,10 @@ export interface BillingPack {
   active: boolean
   purchased_at: string
   expires_at: string
+  /** Bought from Pay, granted by a redeem code, or granted by an operator in the console.
+   *  Optional so a page served by an older API still renders: bought where unset. */
+  source?: 'pay' | 'code' | 'grant'
+  redemption_id?: number | null
 }
 
 export interface BillingPacks {
@@ -397,15 +428,50 @@ export interface BillingPacks {
   remaining: number
   /** The earliest expiry among the active packs with credits left; null without one. */
   expires_at: string | null
-  /** Every pack ever bought, newest first. */
+  /** Every pack ever bought or redeemed, newest first. */
   items: BillingPack[]
+}
+
+/** What a period is (docs/billing.md § Periods): a Pay subscription's, redeemed days of a
+ *  paid plan, or Free's month. */
+export type PeriodSource = 'subscription' | 'grant' | 'free'
+
+/** The bank of redeemed days and, while one runs, its open period (docs/billing.md
+ *  § Periods, *Granted days*). */
+export interface BillingPlanGrant {
+  plan_id: string
+  days_banked: number
+  period_start: string | null
+  period_end: string | null
+}
+
+/** One code the reader redeemed (docs/billing.md § Redeem codes). */
+export interface BillingRedemption {
+  id: number
+  kind: 'credits' | 'plan'
+  credits: number | null
+  plan_id: string | null
+  days: number | null
+  redeemed_at: string
 }
 
 export interface BillingResponse {
   plan: BillingPlan
   subscription: BillingSubscription | null
-  period: { start: string; end: string; granted: number; spent: number; remaining: number }
+  period: {
+    start: string
+    end: string
+    granted: number
+    spent: number
+    remaining: number
+    /** Optional so a page served by an older API still renders. */
+    source?: PeriodSource
+  }
   packs: BillingPacks
+  /** Null for a reader who never redeemed days; optional so a page served by an older API
+   *  still renders. */
+  plan_grant?: BillingPlanGrant | null
+  redemptions?: BillingRedemption[]
   /** The balance a charge is measured against: the period's, 0 when overdrawn, plus the
    *  active packs' (docs/billing.md § Top-up packs). */
   credits_available: number
@@ -523,6 +589,20 @@ export interface Conversation {
   title: string | null
   created_at: string
   updated_at: string
+  /** The model its later turns run on; null until the first turn chose one. Optional only
+   *  so a page served by an older API still renders (docs/chat.md § Conversations). */
+  model?: string | null
+  /** What the panel's context ring reads (docs/chat.md § Compaction, *The cache clock and
+   *  the context*): the summary row the replay starts from, whether there is an answer to
+   *  compact since it, the tokens the last call replayed (null after a compaction, until
+   *  the next call), the model's window, when the prompt cache expires (null when the last
+   *  call wrote none) and what a cold re-read would cost. */
+  compacted_message_id?: number | null
+  compactable?: boolean
+  context_tokens?: number | null
+  context_window?: number
+  cache_warm_until?: string | null
+  recache_credits?: number | null
 }
 
 export interface ConversationDetail extends Conversation {
@@ -600,8 +680,14 @@ export interface ChatMessage {
 
 export type TurnStatus = 'queued' | 'running' | 'done' | 'failed' | 'cancelled' | string
 
+/** A user message's turn, or a compaction the reader asked for or the worker ran on its
+ *  own (docs/chat.md § Compaction). */
+export type TurnKind = 'message' | 'compact' | 'idle_compact' | string
+
 export interface ChatTurn {
   id: string
+  /** Absent from a record served by an older API: a message turn. */
+  kind?: TurnKind
   status: TurnStatus
   error: string | null
   /** What the turn cost, once settled; null while unsettled, absent from a record served by
@@ -636,6 +722,8 @@ type ChatEventData =
   | {
       event: 'turn_start'
       model: string
+      /** The turn's kind (docs/chat.md § Compaction); absent on turns from before it. */
+      kind?: TurnKind
       /** Whether the turn had the reader's instructions, and the memories it loaded
        *  (docs/chat.md § Memory). Absent on turns from before both existed. */
       instructions?: boolean
@@ -1119,6 +1207,20 @@ export function createPortal(): Promise<{ url: string }> {
   return request('POST', '/api/billing/portal', {})
 }
 
+/** What a redeem code granted (docs/billing.md § Redeem codes): credits as a pack, valid
+ *  until `expires_at`; or days of a plan — `period_end` the open granted period's end, null
+ *  while a paid subscription runs and the days wait in the bank (`days_banked`). */
+export type RedeemResult =
+  | { kind: 'credits'; credits: number; expires_at: string }
+  | { kind: 'plan'; plan_id: string; days: number; days_banked: number; period_end: string | null }
+
+/** Redeem a code as typed; the server drops case, spaces and hyphens. 404 `code_invalid`,
+ *  409 `code_expired` / `code_exhausted` / `code_redeemed` / `code_plan_conflict`, 429
+ *  `rate_limit` (docs/billing.md § Refusals). */
+export function redeemCode(code: string): Promise<RedeemResult> {
+  return request('POST', '/api/billing/redeem', { code })
+}
+
 export function getSandbox(): Promise<SandboxStatus> {
   return request('GET', '/api/sandbox')
 }
@@ -1441,9 +1543,532 @@ export function cancelTurn(id: number): Promise<void> {
 /** The reader's title for a thread; the answer is the title as the server cleaned it, and
  *  the thread keeps its place in the list (docs/chat.md § Conversations, turns, events). */
 export function renameConversation(id: number, title: string): Promise<Conversation> {
-  return request('PUT', `/api/conversations/${id}`, { title })
+  return updateConversation(id, { title })
+}
+
+/** A rename, a move to another model for the conversation's later turns, or both: 400 for a
+ *  model the chat agent does not offer, 409 for a move while a turn of it is unfinished
+ *  (docs/api.md). The answer is the conversation as the list gives it. */
+export function updateConversation(
+  id: number,
+  body: { title?: string; model?: string },
+): Promise<Conversation> {
+  return request('PUT', `/api/conversations/${id}`, body)
+}
+
+/** The chat agent's memory file as it is now, and how much of it a turn reads (docs/chat.md
+ *  § Memory, *The memory file*). */
+export function getMemoryFile(): Promise<{ text: string; max_chars: number }> {
+  return request('GET', '/api/agents/chat/memory-file')
+}
+
+/** Saves the memory file as a revision of the reader's own: 400 past `max_chars`, 409 while
+ *  a turn of the reader is unfinished. The answer is the text as stored. */
+export function putMemoryFile(text: string): Promise<{ text: string }> {
+  return request('PUT', '/api/agents/chat/memory-file', { text })
 }
 
 export function deleteConversation(id: number): Promise<void> {
   return request<undefined>('DELETE', `/api/conversations/${id}`)
+}
+
+// --- operator console (docs/admin.md § Routes) ---------------------------------------
+
+/** Who did something, as the console names them: the account's id and name. */
+export interface AdminPerson {
+  id: number
+  name: string | null
+}
+
+/** `GET /api/admin/me`: the caller's permissions, in `ALL_PERMISSIONS` order — every one for
+ *  an owner, none for an account in no group — and whether the session is past the console's
+ *  window of `reauth_hours` (`ADMIN_REAUTH_HOURS`). Never a 403. */
+export interface AdminMe {
+  user: { id: number; email: string; name: string | null; picture: string | null }
+  permissions: string[]
+  reauth_required: boolean
+  reauth_hours: number
+}
+
+/** One area of the permission matrix and its levels: `["read", "write"]`, or `["read"]`
+ *  for `audit`, whose records are never changed. */
+export interface AdminAreaLevels {
+  key: string
+  levels: string[]
+}
+
+export interface AdminGroup {
+  id: number
+  name: string
+  builtin: boolean
+  /** What the group gives: every permission for the built-in group, whatever it stores. */
+  permissions: string[]
+  /** The row's own list — `[]` on the built-in group. */
+  stored_permissions: string[]
+  member_count: number
+  /** When it was created or its name or permissions last changed, and who did it — null for
+   *  the built-in group, which no one edits, and once that account is deleted. */
+  updated_at: string
+  updated_by: AdminPerson | null
+}
+
+export interface AdminGroupsResponse {
+  /** The built-in group first, then by name. */
+  groups: AdminGroup[]
+  /** Every permission there is, in order. */
+  permissions: string[]
+  /** The areas, in order, which the matrix is drawn from. */
+  areas: AdminAreaLevels[]
+}
+
+export interface AdminMember {
+  user_id: number
+  email: string
+  name: string | null
+  added_at: string
+  /** The member themselves for a sign-in's owner join; null once the account that added
+   *  them is deleted. */
+  added_by: AdminPerson | null
+}
+
+export interface AdminGroupDetail {
+  group: AdminGroup
+  /** In the order they joined. */
+  members: AdminMember[]
+}
+
+/** One page of a console list: `page` counts from 1, `total` counts every row. */
+export interface AdminList<T> {
+  items: T[]
+  total: number
+  page: number
+  page_size: number
+}
+
+/** One record of the audit log. `before` and `after` are JSON as stored: ids, amounts,
+ *  flags, permission strings, a group's name — never an address or a person's name. */
+export interface AuditEntry {
+  id: number
+  created_at: string
+  /** Null once that account is deleted. */
+  actor: { id: number; email: string; name: string | null } | null
+  /** Null for a sign-in's owner join, which no permission allowed. */
+  permission: string | null
+  action: string
+  target_type: string
+  target_id: string
+  /** A user target's address or a group target's name, read now; null once it is gone. */
+  target_label: string | null
+  before: unknown
+  after: unknown
+  ip: string | null
+}
+
+/** One account in the console's list (docs/admin.md § Users and grants). */
+export interface AdminUser {
+  id: number
+  email: string
+  name: string | null
+  /** `free` or a configured plan's id, and what pays for the current period. */
+  plan: { id: string; source: 'subscription' | 'grant' | 'free' }
+  /** The period's and the active packs' together: what a charge is measured against. */
+  credits_available: number
+  /** Null when the workspace cannot be measured. */
+  storage_bytes: number | null
+  /** The jobs on record. */
+  jobs: number
+  created_at: string
+}
+
+/** What the grant dialog needs to know of the deployment: `credit_usd` the model cost one
+ *  credit stands for, the default validity, and the caps. */
+export interface AdminGrantFacts {
+  credit_usd: number
+  valid_days: number
+  max_credits: number
+  max_days: number
+}
+
+export interface AdminUsersResponse extends AdminList<AdminUser> {
+  /** `free` first, then the configured plans, each with how many accounts are on it now —
+   *  whatever the search and the filter say. */
+  plans: { id: string; accounts: number }[]
+  grant: AdminGrantFacts
+}
+
+/** One account's page: what it has, never what it wrote. */
+export interface AdminUserDetail {
+  user: { id: number; email: string; name: string | null; created_at: string }
+  plan: { id: string; source: 'subscription' | 'grant' | 'free'; start: string; end: string }
+  subscription: { status: string; plan_id: string; period_end: string; cancel_at_period_end: boolean } | null
+  /** `sources` always the four, by source — not the order a charge takes them, which is the
+   *  period first, then every pack by expiry; `expires_at` null for one that holds nothing. */
+  credits: {
+    available: number
+    sources: { source: 'period' | 'pay' | 'code' | 'grant'; remaining: number; expires_at: string | null }[]
+  }
+  day_bank: { plan_id: string; days_banked: number; period_start: string | null; period_end: string | null } | null
+  storage: { bytes: number; quota_bytes: number } | null
+  jobs: {
+    total: number
+    /** The five newest: the file's name, the pages and the status — no content. */
+    recent: {
+      id: string
+      filename: string
+      status: string
+      page_count: number | null
+      pages_done: number
+      created_at: string
+      finished_at: string | null
+    }[]
+  }
+  /** Null without `groups.read`. */
+  groups: { id: number; name: string; builtin: boolean }[] | null
+}
+
+/** A grant: credits as a pack, or days of a paid plan, each with the dialog's `request_id`. */
+export type AdminGrant =
+  | { kind: 'credits'; credits: number; valid_days: number; request_id: string; reason?: string }
+  | { kind: 'days'; plan: string; days: number; request_id: string; reason?: string }
+
+export function getAdminMe(): Promise<AdminMe> {
+  return request('GET', '/api/admin/me')
+}
+
+/** Newest sign-up first. `plan` keeps the accounts on one plan; `q` an address or a name. */
+export function listAdminUsers(query: { page: number; plan?: string; q?: string }): Promise<AdminUsersResponse> {
+  const params = new URLSearchParams({ page: String(query.page) })
+  if (query.plan) {
+    params.set('plan', query.plan)
+  }
+  if (query.q) {
+    params.set('q', query.q)
+  }
+  return request('GET', `/api/admin/users?${params}`)
+}
+
+export function getAdminUser(id: number): Promise<AdminUserDetail> {
+  return request('GET', `/api/admin/users/${id}`)
+}
+
+/** 201 for the grant; 200, nothing added, for a `request_id` this account's grant already
+ *  has; 409 `admin_conflict` (`plan_conflict`) for days of another plan than its bank holds. */
+export function grantAdminUser(id: number, grant: AdminGrant): Promise<unknown> {
+  return request('POST', `/api/admin/users/${id}/grants`, grant)
+}
+
+export function listAdminGroups(): Promise<AdminGroupsResponse> {
+  return request('GET', '/api/admin/groups')
+}
+
+export function getAdminGroup(id: number): Promise<AdminGroupDetail> {
+  return request('GET', `/api/admin/groups/${id}`)
+}
+
+/** 201 with the new group; 409 `admin_conflict` (`name_taken`) for a name in use. */
+export function createAdminGroup(body: { name: string; permissions: string[] }): Promise<AdminGroup> {
+  return request('POST', '/api/admin/groups', body)
+}
+
+/**
+ * A new name, or a new permission list: `permissions` the whole new list, which the server
+ * normalizes, and `based_on` the list it was edited from — the group's `permissions` as last
+ * read — so a list changed meanwhile answers 409 `admin_conflict` (`stale`) instead of being
+ * overwritten.
+ */
+export function updateAdminGroup(
+  id: number,
+  body: { name: string } | { permissions: string[]; based_on: string[] },
+): Promise<AdminGroup> {
+  return request('PATCH', `/api/admin/groups/${id}`, body)
+}
+
+export function deleteAdminGroup(id: number): Promise<void> {
+  return request<undefined>('DELETE', `/api/admin/groups/${id}`)
+}
+
+/** By address — matched in any letter case — or by account id. 201 for a new member, 200 for
+ *  one already in the group; 404 when no account has that address. */
+export function addAdminGroupMember(id: number, who: { email: string } | { user_id: number }): Promise<AdminMember> {
+  return request('POST', `/api/admin/groups/${id}/members`, who)
+}
+
+export function removeAdminGroupMember(id: number, userId: number): Promise<void> {
+  return request<undefined>('DELETE', `/api/admin/groups/${id}/members/${userId}`)
+}
+
+/** Newest first. `area` keeps the actions of one area; `q` an actor's address or name, a
+ *  user target's address, or a target id. */
+export function listAdminAudit(query: { page: number; area?: string; q?: string }): Promise<AdminList<AuditEntry>> {
+  const params = new URLSearchParams({ page: String(query.page) })
+  if (query.area) {
+    params.set('area', query.area)
+  }
+  if (query.q) {
+    params.set('q', query.q)
+  }
+  return request('GET', `/api/admin/audit?${params}`)
+}
+
+// --- operator console: redeem codes (docs/admin.md § Redeem codes) -----------------------
+
+/** What a code is now: disabled, else expired (past `redeem_by`), else used up, else plan
+ *  missing (a plan code whose plan is no longer configured), else active. */
+export type AdminCodeStatus = 'active' | 'disabled' | 'expired' | 'used_up' | 'plan_missing'
+
+/** One redeem code as the console lists it: masked — the prefix and the first group, or
+ *  none of a short code — and never whole. The fields of the other kind are null. */
+export interface AdminCode {
+  id: number
+  masked: string
+  kind: 'credits' | 'plan'
+  credits: number | null
+  valid_days: number | null
+  plan_id: string | null
+  days: number | null
+  uses: number
+  max_uses: number
+  /** The last second, UTC, it can be redeemed; null for no end. */
+  redeem_by: string | null
+  label: string
+  status: AdminCodeStatus
+  created_at: string
+  disabled_at: string | null
+  /** Who disabled it in the console; null for one disabled with the CLI, or once that
+   *  account is deleted. */
+  disabled_by: AdminPerson | null
+}
+
+/** `GET /api/admin/codes`: a page of codes, the title's figures, and what the create dialog
+ *  is drawn from — the configured plans, `REDEEM_CODES_MAX_COUNT`, the most days a code
+ *  gives, the CLI's default validity and `CREDIT_USD` as a decimal string. */
+export interface AdminCodesList extends AdminList<AdminCode> {
+  summary: { active: number; labels: number; redeemed_this_month: number }
+  create: { plans: string[]; max_count: number; max_days: number; valid_days: number; credit_usd: string }
+}
+
+/** `python -m sightread.codes create`'s fields: `kind` for `--credits` or `--plan`,
+ *  `max_uses` for `--uses`, `redeem_by` a date, `YYYY-MM-DD`. */
+export interface AdminCodesCreate {
+  kind: 'credits' | 'plan'
+  credits?: number
+  valid_days?: number
+  plan_id?: string
+  days?: number
+  count: number
+  max_uses: number
+  redeem_by?: string
+  label: string
+}
+
+/** The one answer that holds the codes in plaintext, as printed; the batch's fields as
+ *  stored. */
+export interface AdminCodesCreated {
+  codes: { id: number; code: string }[]
+  kind: 'credits' | 'plan'
+  credits: number | null
+  valid_days: number | null
+  plan_id: string | null
+  days: number | null
+  max_uses: number
+  redeem_by: string | null
+  label: string
+}
+
+/** Newest first. `status` `all` lists every code, else only those redeemable now; `q` a
+ *  label containing it, in any letter case. */
+export function listAdminCodes(query: { page: number; status?: 'all'; q?: string }): Promise<AdminCodesList> {
+  const params = new URLSearchParams({ page: String(query.page) })
+  if (query.status) {
+    params.set('status', query.status)
+  }
+  if (query.q) {
+    params.set('q', query.q)
+  }
+  return request('GET', `/api/admin/codes?${params}`)
+}
+
+/** 201 with the codes in plaintext; 422 for a batch outside the rules the CLI shares. */
+export function createAdminCodes(body: AdminCodesCreate): Promise<AdminCodesCreated> {
+  return request('POST', '/api/admin/codes', body)
+}
+
+/** The code, disabled; one already disabled as it is. */
+export function disableAdminCode(id: number): Promise<AdminCode> {
+  return request('POST', `/api/admin/codes/${id}/disable`)
+}
+
+// --- operator console: overview, jobs and usage (docs/admin.md § Overview, jobs and usage) ---
+
+/** `usage_log` summed (docs/api.md § Usage aggregates): billed `cost`, `estimated_cost` and
+ *  the calls nobody priced kept apart, never added together. */
+export interface AdminUsageFigures {
+  calls: number
+  prompt_tokens: number
+  completion_tokens: number
+  cost: number
+  estimated_cost: number
+  estimated_calls: number
+  unpriced_calls: number
+  cache_read_tokens: number
+  cache_write_tokens: number
+}
+
+/** Whether a worker runs, as the worker lock says: `since` and `generation` only while
+ *  `running` (`generation` null also before any worker took one); `unknown` off PostgreSQL. */
+export interface AdminWorker {
+  state: 'running' | 'stopped' | 'unknown'
+  since: string | null
+  generation: number | null
+}
+
+export type AdminJobStatus = 'queued' | 'running' | 'succeeded' | 'failed'
+
+/** A job as the console shows it: never its file name, prompt or pages' text. */
+export interface AdminJob {
+  id: string
+  created_at: string
+  started_at: string | null
+  finished_at: string | null
+  user_id: number
+  /** The account's address, only for a caller who also holds `users.read`. */
+  email: string | null
+  status: AdminJobStatus
+  /** The pages it selected; null while the document's page count is unknown. */
+  pages: number | null
+  pages_done: number
+  /** The retry's model when a retry named one, else the job's. */
+  model: string
+  /** A failed job's reason, in the runner's fixed phrases. */
+  error: string | null
+  worker_generation: number | null
+  /** A running job no live worker drives: what a requeue takes. */
+  stuck: boolean
+}
+
+export interface AdminJobsResponse extends AdminList<AdminJob> {
+  /** Every job on record by status, whatever the filter. */
+  counts: Record<AdminJobStatus, number>
+  worker: AdminWorker
+}
+
+/** A connection the overview checked: `message` only when `failed`, the figures only when
+ *  `ok`. */
+export interface AdminKanoProxyStatus {
+  state: 'ok' | 'unconfigured' | 'failed'
+  message: string | null
+  models: number | null
+  priced: number | null
+  parse_model: string | null
+}
+
+export interface AdminKanoPayStatus {
+  state: 'ok' | 'unconfigured' | 'failed'
+  message: string | null
+  checkout_enabled: boolean | null
+  plans: number | null
+  packs: number | null
+}
+
+export interface AdminOverviewResponse {
+  /** Today's UTC date, the day `usage` covers so far. */
+  day: string
+  accounts: number
+  jobs: {
+    queued: number
+    running: number
+    /** Null while the worker's state is unknown. */
+    stuck: number | null
+    /** The oldest queued job's `created_at`, which a retry or a requeue keeps. */
+    oldest_queued_at: string | null
+    /** Failed in the last `failed_hours`. */
+    failed: number
+    failed_hours: number
+    last_failed_at: string | null
+  }
+  worker: AdminWorker
+  usage: {
+    models: (AdminUsageFigures & { model: string })[]
+    totals: AdminUsageFigures
+  }
+  connections: { kano_proxy: AdminKanoProxyStatus; kano_pay: AdminKanoPayStatus }
+  /** The ten newest audit records, only for a caller who also holds `audit.read`. */
+  audit?: AuditEntry[]
+}
+
+export interface AdminUsageResponse {
+  from: string
+  to: string
+  /** One per UTC day and model with a call, the newest day first, then by model. */
+  rows: (AdminUsageFigures & { date: string; model: string })[]
+  totals: AdminUsageFigures
+}
+
+export function getAdminOverview(): Promise<AdminOverviewResponse> {
+  return request('GET', '/api/admin/overview')
+}
+
+/** Newest first; `status` keeps one status. */
+export function listAdminJobs(query: { page: number; status?: AdminJobStatus }): Promise<AdminJobsResponse> {
+  const params = new URLSearchParams({ page: String(query.page) })
+  if (query.status) {
+    params.set('status', query.status)
+  }
+  return request('GET', `/api/admin/jobs?${params}`)
+}
+
+/** A stuck job back in the queue; 409 `admin_conflict` (`not_running`, `not_stuck`,
+ *  `worker_unknown`) for any other, 404 for one gone. */
+export function requeueAdminJob(id: string): Promise<AdminJob> {
+  return request('POST', `/api/admin/jobs/${encodeURIComponent(id)}/requeue`)
+}
+
+/** Per UTC day and model, `from` to `to` both included (`YYYY-MM-DD`). */
+export function getAdminUsage(range: { from: string; to: string }): Promise<AdminUsageResponse> {
+  const params = new URLSearchParams({ from: range.from, to: range.to })
+  return request('GET', `/api/admin/usage?${params}`)
+}
+
+/** One setting the database may override (docs/admin.md § Routes, `<setting>`): its text in
+ *  effect, where that comes from, `.env`'s text beside it, and who stored it when. */
+export interface AdminSetting {
+  key: string
+  value: string
+  source: 'database' | 'env'
+  env_value: string
+  updated_at: string | null
+  updated_by: AdminPerson | null
+}
+
+/** `GET /api/admin/settings`: the twelve, whether each secret is set — never its value —
+ *  the checks' message while the stored values no longer fit `.env`, how long a change takes
+ *  to reach the worker, and `.env`'s ceilings. */
+export interface AdminSettingsResponse {
+  settings: AdminSetting[]
+  secrets: { key: string; set: boolean }[]
+  ignored: string | null
+  cache_seconds: number
+  ceilings: { WORKSPACE_QUOTA_BYTES: number; MAX_JOBS_PER_USER: number }
+}
+
+/** A 409 `impact`'s `impact`: what a change removes, and of what uses it, the counts above 0
+ *  by kind. */
+export interface AdminSettingImpact {
+  removed: { models: string[]; plans: string[]; packs: string[] }
+  counts: Partial<Record<string, number>>
+}
+
+export function getAdminSettings(): Promise<AdminSettingsResponse> {
+  return request('GET', '/api/admin/settings')
+}
+
+/** Stores `value` over `.env`'s: 422 in the start checks' words, 409 `admin_conflict`
+ *  (`impact`) until `confirm` when it takes away what accounts have. */
+export function putAdminSetting(key: string, value: string, confirm = false): Promise<AdminSettingsResponse> {
+  return request('PUT', `/api/admin/settings/${encodeURIComponent(key)}`, { value, confirm })
+}
+
+/** Restores the key to `.env`, checked and confirmed as a change is. */
+export function resetAdminSetting(key: string, confirm = false): Promise<AdminSettingsResponse> {
+  return request('DELETE', `/api/admin/settings/${encodeURIComponent(key)}`, { confirm })
 }

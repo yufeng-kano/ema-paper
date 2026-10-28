@@ -18,16 +18,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings
 from ..db.models import (
+    ChatToolCall,
     CreditEntry,
     CreditPack,
     CreditPackEntry,
     CreditPeriod,
+    PlanGrant,
     Subscription,
     UsageLog,
     utcnow,
 )
 from .credits import credits_for_usd
-from .plans import Period, Plan, current_period
+from .plans import Decision, Grant, Period, Plan, resolve_period
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +37,14 @@ PARSE = "parse"
 CHAT = "chat"
 RESERVED, CONSUMED, RELEASED = "reserved", "consumed", "released"
 PACK_PAID, PACK_REFUNDED = "paid", "refunded"
+# Where a pack came from: Pay, a redeem code, or an operator's grant in the console
+# (docs/billing.md § Redeem codes, § Operator grants).
+PACK_SOURCE_PAY, PACK_SOURCE_CODE, PACK_SOURCE_GRANT = "pay", "code", "grant"
+
+
+class PlanConflict(Exception):
+    """The bank holds days of another plan, or runs another plan's period: one plan per
+    bank (docs/billing.md § Periods, *Granted days*)."""
 
 
 class InsufficientCredits(Exception):
@@ -60,6 +70,8 @@ class PackBalance:
     purchased_at: datetime
     expires_at: datetime
     active: bool
+    source: str = PACK_SOURCE_PAY
+    redemption_id: int | None = None
 
     @property
     def remaining(self) -> int:
@@ -72,8 +84,10 @@ class Balance:
     period: Period
     granted: int
     spent: int
-    # Every pack the user bought, newest first.
+    # Every pack the user bought or redeemed, newest first.
     packs: tuple[PackBalance, ...] = ()
+    # The bank of granted days, None for a user who never redeemed any.
+    grant: Grant | None = None
 
     @property
     def remaining(self) -> int:
@@ -112,7 +126,89 @@ def _pack_balance(pack: CreditPack, now: datetime) -> PackBalance:
         purchased_at=pack.purchased_at,
         expires_at=pack.expires_at,
         active=pack_active(pack, now),
+        source=pack.source,
+        redemption_id=pack.redemption_id,
     )
+
+
+def _grant_of(row: PlanGrant | None) -> Grant | None:
+    if row is None:
+        return None
+    return Grant(row.plan_id, row.days_banked, row.period_start, row.period_end)
+
+
+async def decide_period(
+    db: AsyncSession, settings: Settings, user_id: int, now: datetime | None = None
+) -> Decision:
+    """The period a read or a charge at `now` belongs to, decided from the rows as the
+    session has them, nothing written (docs/billing.md § Periods, *Granted days*): a read
+    shows what the next charge will persist, and takes no lock for it."""
+    return resolve_period(
+        await db.get(Subscription, user_id),
+        _grant_of(await db.get(PlanGrant, user_id)),
+        settings.plans,
+        settings.free_plan,
+        now or utcnow(),
+        settings.grant_period_days,
+    )
+
+
+async def settle_period(
+    db: AsyncSession, settings: Settings, user_id: int, now: datetime | None = None
+) -> Decision:
+    """The same decision, its move of the bank — a granted period opened or cut — written,
+    for a caller that holds the user's row lock: a charge or a redemption. The rows are
+    read again under the lock, so a bank another transaction just moved is not written
+    over; the caller's commit carries the move (docs/billing.md § Periods, *Granted
+    days*). Nothing locks the user here: the lock is the caller's, taken in its own order."""
+    now = now or utcnow()
+    subscription = await db.get(Subscription, user_id)
+    if subscription is not None:
+        await db.refresh(subscription)
+    row = await db.get(PlanGrant, user_id)
+    if row is not None:
+        await db.refresh(row)
+    grant = _grant_of(row)
+    decided = resolve_period(
+        subscription, grant, settings.plans, settings.free_plan, now, settings.grant_period_days
+    )
+    if row is not None and decided.grant != grant:
+        row.plan_id = decided.grant.plan_id
+        row.days_banked = decided.grant.days_banked
+        row.period_start = decided.grant.period_start
+        row.period_end = decided.grant.period_end
+        row.updated_at = now
+        await db.flush()
+    return decided
+
+
+async def bank_days(
+    db: AsyncSession, settings: Settings, user_id: int, plan_id: str, days: int, now: datetime
+) -> Decision:
+    """Add `days` of `plan_id` to the user's bank — a plan code's days or an operator's
+    grant, one rule for both (docs/billing.md § Periods, *Granted days*, § Operator
+    grants) — for a caller that holds the user's row lock and commits. The bank as it
+    stands now, a period that ran out closed first, holds one plan: days of another raise
+    `PlanConflict` before anything of them is written. Then the period is decided again,
+    which opens a granted period at once when no paid one covers `now`; under a paid
+    subscription the days wait."""
+    await settle_period(db, settings, user_id, now)
+    row = await db.get(PlanGrant, user_id)
+    if (
+        row is not None
+        and row.plan_id != plan_id
+        and (row.days_banked > 0 or row.period_start is not None)
+    ):
+        raise PlanConflict
+    if row is None:
+        row = PlanGrant(user_id=user_id, plan_id=plan_id, days_banked=0)
+        db.add(row)
+    row.plan_id = plan_id
+    row.days_banked += days
+    row.updated_at = now
+    # Written before the decision, which reads the row again under the lock.
+    await db.flush()
+    return await settle_period(db, settings, user_id, now)
 
 
 async def read_balance(
@@ -121,9 +217,8 @@ async def read_balance(
     """The current period, its balance and the packs, without writing: a period never
     used has no row and its whole grant left."""
     now = now or utcnow()
-    period = current_period(
-        await db.get(Subscription, user_id), settings.plans, settings.free_plan, now
-    )
+    decided = await decide_period(db, settings, user_id, now)
+    period = decided.period
     row = await db.get(CreditPeriod, (user_id, period.start))
     packs = tuple(
         _pack_balance(pack, now)
@@ -136,17 +231,15 @@ async def read_balance(
         ).scalars()
     )
     if row is None:
-        return Balance(period, period.plan.credits, 0, packs)
-    return Balance(period, max(row.granted, period.plan.credits), row.spent, packs)
+        return Balance(period, period.credits, 0, packs, decided.grant)
+    return Balance(period, max(row.granted, period.credits), row.spent, packs, decided.grant)
 
 
 async def plan_of(db: AsyncSession, settings: Settings, user_id: int) -> Plan:
     """The plan the user's current period belongs to, which is where their entitlements
     come from (docs/billing.md § Plans): the storage cap, the concurrency cap and
-    whether the chat agent gets `bash`."""
-    return current_period(
-        await db.get(Subscription, user_id), settings.plans, settings.free_plan, utcnow()
-    ).plan
+    whether the chat agent gets `bash`. Read, never written: no lock is taken."""
+    return (await decide_period(db, settings, user_id)).period.plan
 
 
 def storage_limit(settings: Settings, plan: Plan) -> int:
@@ -168,11 +261,10 @@ async def period_row(
     db: AsyncSession, settings: Settings, user_id: int, now: datetime | None = None
 ) -> tuple[CreditPeriod, Period]:
     """The period row a charge at `now` lands in, created on first use; a plan change
-    raises its grant and never lowers it (docs/billing.md § Periods)."""
+    raises its grant and never lowers it (docs/billing.md § Periods). The caller holds the
+    user's row lock, under which the bank's move, if any, is written (`settle_period`)."""
     now = now or utcnow()
-    period = current_period(
-        await db.get(Subscription, user_id), settings.plans, settings.free_plan, now
-    )
+    period = (await settle_period(db, settings, user_id, now)).period
     plan_id = None if period.plan.free else period.plan.id
     row = await db.get(CreditPeriod, (user_id, period.start))
     if row is None:
@@ -181,7 +273,7 @@ async def period_row(
             period_start=period.start,
             period_end=period.end,
             plan_id=plan_id,
-            granted=period.plan.credits,
+            granted=period.credits,
         )
         try:
             async with db.begin_nested():
@@ -192,8 +284,8 @@ async def period_row(
             row = await db.get(CreditPeriod, (user_id, period.start))
             if row is None:  # pragma: no cover - the conflict was that row's insert
                 raise
-    if row.granted < period.plan.credits:
-        row.granted = period.plan.credits
+    if row.granted < period.credits:
+        row.granted = period.credits
         row.plan_id = plan_id
         await db.flush()
     return row, period
@@ -441,6 +533,10 @@ async def _spill(db: AsyncSession, entry: CreditEntry, delta: int, now: datetime
     await _move_spent(db, entry, into_period + rest)
 
 
+# The web tool charged per call (docs/billing.md § A chat turn).
+WEB_SEARCH_TOOL = "web_search"
+
+
 async def settle_chat(db: AsyncSession, settings: Settings, turn_id: uuid.UUID) -> int | None:
     """Re-price a turn from every `usage_log` row it has so far — subagent calls carry its
     id and count with it — rounded up once over the whole turn, and move the difference
@@ -482,7 +578,18 @@ async def settle_chat(db: AsyncSession, settings: Settings, turn_id: uuid.UUID) 
             cache_read_tokens=int(cache_read or 0),
             cache_write_tokens=int(cache_write or 0),
         )
-    amount = credits_for_usd(usd, settings.credit_usd) if rows else 0
+    # A web search is a flat price on top of the tokens, from the turn's own rows, added
+    # after the tokens' rounding (docs/billing.md § A chat turn).
+    searches = (
+        await db.execute(
+            select(func.count())
+            .select_from(ChatToolCall)
+            .where(ChatToolCall.turn_id == turn_id, ChatToolCall.tool == WEB_SEARCH_TOOL)
+        )
+    ).scalar_one()
+    amount = (credits_for_usd(usd, settings.credit_usd) if rows else 0) + (
+        int(searches) * settings.web_search_credits
+    )
     now = utcnow()
     if entry.state == RESERVED:
         delta = amount - entry.amount

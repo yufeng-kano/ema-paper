@@ -1,4 +1,5 @@
-"""FastAPI wiring: `/api` (control plane, including `/api/library`), `/v1` (data plane),
+"""FastAPI wiring: `/api` (control plane, including `/api/library`, and `/api/admin` while
+the operator console is configured), `/v1` (data plane),
 `/oauth` plus `/.well-known/*` (authorization server) and `/mcp` (MCP shell) — one app, one
 process.
 """
@@ -19,6 +20,7 @@ from .db.session import create_engine, create_sessionmaker
 from .errors import install_error_handlers
 from .mcp import mcp_session_manager, mount_mcp
 from .routes import (
+    admin,
     attachments,
     billing,
     chat,
@@ -29,6 +31,7 @@ from .routes import (
     oauth,
     v1,
 )
+from .runtime_settings import RuntimeSettings
 
 # Signed cookie holding only the transient OIDC state/PKCE verifier during a login
 # round trip. The durable credential is the server-side session row.
@@ -55,6 +58,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="Ema Paper", lifespan=lifespan)
     app.state.settings = settings
+    # The settings requests run on: these, with the database's overrides on top, read
+    # through the sessionmaker the lifespan makes (docs/admin.md § Settings).
+    app.state.runtime_settings = RuntimeSettings(
+        lambda: app.state.settings, lambda: app.state.sessionmaker
+    )
     app.state.oauth = build_oauth(settings)
     # Pay's catalog, shared by the public route and the billing view, and when each
     # user's row was last reconciled with Pay (docs/billing.md § Kano Pay).
@@ -85,6 +93,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(billing.router)
     if settings.dev_login_enabled:
         app.include_router(control.dev_router)
+    # The operator console exists only while OWNER_EMAILS names an address; otherwise
+    # every /api/admin path is the 404 of a path that does not exist (docs/admin.md).
+    if settings.console_enabled:
+        app.include_router(admin.router)
     app.include_router(library.router)
     app.include_router(chat.router)
     app.include_router(attachments.router)

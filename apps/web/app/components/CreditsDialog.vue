@@ -5,8 +5,10 @@
  * where *Upgrade* is — or, for a reader who can buy a top-up pack (`pack_checkout_available`,
  * `GET /api/me`), the pack itself, read from the catalog when the dialog opens: *Top up N
  * credits, price* starts its checkout in this tab; *See plans* stands in while the catalog
- * has not answered or sells none (docs/billing.md § Top-up packs). Nothing was queued and
- * nothing was charged.
+ * has not answered or sells none (docs/billing.md § Top-up packs). At the left, *Redeem a
+ * code* opens the redeem dialog over this one; a code redeemed re-reads the balance and
+ * closes this dialog, so the action can be tried again (docs/billing.md § Redeem codes).
+ * Nothing was queued and nothing was charged.
  */
 import { formatCount, formatDate } from '~/lib/format'
 import type { CreditsRefusal } from '~/lib/api'
@@ -42,6 +44,15 @@ function seePlans() {
   emit('close')
   void navigateTo(localePath('/pricing'))
 }
+
+const redeeming = ref(false)
+
+/** A code redeemed: the shell's balance follows, and the refusal is over. */
+async function redeemed() {
+  await auth.refresh()
+  redeeming.value = false
+  emit('close')
+}
 </script>
 
 <template>
@@ -63,6 +74,7 @@ function seePlans() {
     </p>
     <UiBanner v-if="topUp.error" class="error" tone="error">{{ topUp.error }}</UiBanner>
     <template #footer>
+      <UiButton variant="ghost" class="redeem" @click="redeeming = true">{{ t('credits.redeem') }}</UiButton>
       <UiButton variant="ghost" @click="emit('close')">{{ t('common.cancel') }}</UiButton>
       <UiButton v-if="canTopUp && topUp.pack" :loading="topUp.buying" @click="topUp.buy">
         {{ t('credits.topUp', { n: topUp.credits, price: topUp.price }) }}
@@ -70,6 +82,7 @@ function seePlans() {
       <UiButton v-else @click="seePlans">{{ t('credits.seePlans') }}</UiButton>
     </template>
   </UiModal>
+  <SettingsRedeemDialog v-if="redeeming" @close="redeeming = false" @redeemed="redeemed" />
 </template>
 
 <style scoped>
@@ -116,5 +129,10 @@ function seePlans() {
 
 .error {
   margin-top: var(--space-3);
+}
+
+/* The way to a code at the footer's left, apart from the actions. */
+.redeem {
+  margin-right: auto;
 }
 </style>

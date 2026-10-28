@@ -43,10 +43,12 @@ export function useAuth() {
     return load()
   }
 
-  /** Drops local session state without calling the backend (used when a request 401s). */
+  /** Drops local session state without calling the backend (used when a request 401s),
+   *  the operator console's with it (docs/admin.md § Pages). */
   function clearSession(): void {
     me.value = null
     loaded.value = true
+    useAdminConsole().clear()
   }
 
   async function signOut(): Promise<void> {

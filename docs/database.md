@@ -11,10 +11,16 @@ users            id PK, google_sub UNIQUE, email, name,
                                                   -- original | markdown: the view a converted
                                                   -- PDF or image opens on the first time
                                                   -- (web.md § Result viewer)
+                 redeem_failures INT NOT NULL DEFAULT 0, redeem_failed_at NULL,
+                                                  -- refused redeem-code attempts in the
+                                                  -- window (billing.md § Redeem codes)
                  created_at
                  -- deleting the row is deleting the account (see Rules): every table
-                 -- below with a user_id cascades from it, pay_events keep theirs as NULL
+                 -- below with a user_id cascades from it; pay_events and audit_log keep
+                 -- theirs as NULL
 sessions         id PK, user_id FK, token_hash UNIQUE, created_at, expires_at
+                 -- created_at is the sign-in: the operator console's re-login window
+                 -- runs from it (admin.md § Signing in)
 api_keys         id PK, user_id FK, name, key_hash UNIQUE, prefix, created_at,
                  last_used_at, revoked_at NULL
 prompt_presets   id PK, user_id FK, agent, name, text TEXT, created_at, updated_at
@@ -28,6 +34,10 @@ agent_settings   (user_id FK, agent) PK,
                                                   -- deployment's
                  effort low|medium|high|xhigh|max NOT NULL DEFAULT 'medium',
                                                   -- the chat agent's reasoning depth
+                 idle_compact BOOLEAN NOT NULL DEFAULT true,
+                                                  -- chat: the worker compacts the user's
+                                                  -- long conversations before their cache
+                                                  -- expires (chat.md § Compaction)
                  prompt TEXT NULL,                -- the user's own template; NULL = the
                                                   -- agent's default (agents.md)
                  prompt_preset_id FK NULL,        -- prompt_presets, the legacy selection;
@@ -191,14 +201,30 @@ usage_log        id PK, user_id FK, job_id FK NULL, turn_id FK chat_turns NULL,
                  INDEX (job_id)                   -- a job delete's SET NULL reads it
                  CHECK (cost_source IN (...) AND (cost_source = 'unknown') = (cost IS NULL))
 conversations    id PK, user_id FK, document_id FK documents, title, session,
-                 model NULL, memory_ids JSONB NULL, created_at, updated_at
+                 model NULL, memory_ids JSONB NULL, memory_file TEXT NULL,
+                 compacted_message_id NULL,          -- a messages.id, no FK (below)
+                 context_tokens NULL, cache_warm_until NULL, created_at, updated_at
                  INDEX (document_id, updated_at)
+                 INDEX (cache_warm_until) WHERE cache_warm_until IS NOT NULL
+                 INDEX (model)                    -- the console's count of what a price
+                                                  -- removed would stop (admin.md § Settings)
                  -- one thread of the chat agent about one document (chat.md);
                  -- `session` names its shell in the user's sandbox; `model` is
                  -- set by the first turn and kept: the stored thinking blocks
                  -- belong to it (chat.md § History); `memory_ids` is the memory
                  -- snapshot its first turn took, in render order, NULL until a
-                 -- turn took one (chat.md § Memory)
+                 -- turn took one (chat.md § Memory); `memory_file` the snapshot of
+                 -- memory.md its first turn took, NULL until then, '' for none,
+                 -- taken again by a compaction (chat.md § Memory, *The memory
+                 -- file*); `compacted_message_id` the summary row the replay
+                 -- starts from, NULL while never compacted — no foreign key:
+                 -- a message goes only with its conversation, and a key back
+                 -- to `messages` would close a cycle every DDL tool would have
+                 -- to break; `context_tokens`
+                 -- what the last model call replayed and produced, and
+                 -- `cache_warm_until` when the prompt cache it touched expires —
+                 -- what the idle compaction pass reads through the partial
+                 -- index (chat.md § Compaction)
 messages         id PK, conversation_id FK, role user|assistant, content JSONB,
                  turn_id FK chat_turns NULL, created_at
                  INDEX (conversation_id, id)
@@ -210,6 +236,7 @@ messages         id PK, conversation_id FK, role user|assistant, content JSONB,
                  -- id — the library and the workspace keep one namespace per level
                  -- (workspace.md § Layout)
 chat_turns       id UUID PK, user_id FK, conversation_id FK, message_id FK messages,
+                 kind message|compact|idle_compact NOT NULL DEFAULT 'message',
                  status queued|running|succeeded|failed|cancelled, error NULL,
                  locale, created_at, started_at NULL, finished_at NULL
                  INDEX (status, created_at)
@@ -217,12 +244,24 @@ chat_turns       id UUID PK, user_id FK, conversation_id FK, message_id FK messa
                                                   -- the stream's "is a turn unfinished"
                                                   -- poll, sends, cancels and deletes all
                                                   -- ask by conversation
-                 -- the chat agent's queue, one row per user message, claimed like jobs
+                 -- the chat agent's queue, one row per user message — or per
+                 -- compaction, `kind` saying which (chat.md § Compaction) —
+                 -- claimed like jobs
 chat_events      id PK, conversation_id FK, turn_id FK, seq, event, data JSONB,
                  created_at
                  UNIQUE (conversation_id, seq)
                  -- what the worker streamed while the turn ran; the SSE route replays
                  -- and tails it (chat.md § Conversations, turns, events)
+chat_tool_calls  id PK, user_id FK, turn_id FK chat_turns ON DELETE SET NULL, NULL,
+                 tool, created_at
+                 INDEX (tool, created_at)                  -- the deployment's per-day caps
+                 INDEX (user_id, tool, created_at)         -- a user's per-day cap
+                 INDEX (turn_id)                           -- the turn's settlement
+                 -- one row per web tool call that was answered or kept a file —
+                 -- `web_search`, `search_papers`, `download_file` — what the per-day
+                 -- caps count and what a turn's web searches are charged from (chat.md
+                 -- § Tools, billing.md § A chat turn); a deleted turn keeps its rows
+                 -- for the day's count, as a purged parse keeps its entry
 skills           id PK, user_id FK, name, description TEXT, argument_hint, body TEXT,
                  user_invocable BOOL, model_invocable BOOL, created_at, updated_at
                  UNIQUE (user_id, name)
@@ -315,13 +354,19 @@ credit_entries   id PK, user_id FK, period_start,
                  -- deletes (jobs.md § Retention) leaves its entry with job_id NULL, and
                  -- a conversation the reader deletes takes its turns and leaves their
                  -- entries with turn_id NULL, so the balance and its record keep agreeing
-credit_packs     id PK,                           -- Pay's purchaseId
+credit_packs     id PK,                           -- Pay's purchaseId, redeem-<redemption id>,
+                                                  -- or grant-<request id> (admin.md § Users
+                                                  -- and grants)
                  user_id FK, pack_id, credits INT, spent INT,
                  status paid|refunded, purchased_at, expires_at,
                  version BIGINT,                  -- Pay's version (ms); older is ignored
+                 source pay|code|grant,           -- bought, a redeem code's, or an
+                                                  -- operator's grant
+                 redemption_id FK redemptions ON DELETE SET NULL, NULL UNIQUE,
                  created_at, updated_at
                  INDEX (user_id, expires_at)
                  CHECK (credits >= 0), CHECK (spent >= 0), CHECK (expires_at > purchased_at)
+                 CHECK (source IN ('pay', 'code', 'grant'))
                  -- a top-up pack bought on Pro (billing.md § Top-up packs): credits from
                  -- the pack's configuration when it was paid, spent as charges take from it
                  -- once the period's grant is gone; counts while paid and unexpired
@@ -333,6 +378,73 @@ pack_checkouts   user_id PK/FK, pack_id, idempotency_key UNIQUE,
                  purchase_id UNIQUE NULL, created_at, completed_at NULL
                  -- the one pack checkout a user may have open, keyed as `checkouts` is;
                  -- purchase_id is Pay's purchaseId once Pay answered
+redeem_codes     id PK, code UNIQUE,              -- the random characters, no prefix
+                 kind credits|plan, credits INT NULL, valid_days INT NULL,
+                 plan_id NULL, days INT NULL,     -- a plan code: whose days, how many
+                 max_uses INT, uses INT, redeem_by NULL, label, disabled_at NULL,
+                 created_at
+                 CHECK (kind IN ('credits', 'plan')), CHECK (max_uses >= 1),
+                 CHECK (uses >= 0)
+                 -- a code the operator hands out (billing.md § Redeem codes); no user_id:
+                 -- it outlives every account that used it
+redemptions      id PK, code_id FK redeem_codes, user_id FK, kind, credits INT NULL,
+                 plan_id NULL, days INT NULL,     -- what the code granted, as it stood then
+                 redeemed_at
+                 INDEX (user_id)
+                 UNIQUE (code_id, user_id)        -- one redemption per user per code
+plan_grants      user_id PK/FK, plan_id, days_banked INT,
+                 period_start NULL, period_end NULL,
+                                                  -- the open granted period, when one runs
+                 updated_at
+                 CHECK (days_banked >= 0)
+                 -- the bank of granted days (billing.md § Periods, Granted days)
+groups           id PK, name UNIQUE,              -- a-z 0-9 _ -, 1-32 (admin.md § Groups)
+                 permissions JSONB,               -- a list of permission strings,
+                                                  -- normalized (admin.md § Permissions);
+                                                  -- [] on the built-in group, which has all
+                 builtin BOOL NOT NULL DEFAULT false,
+                 created_at, updated_at
+                 UNIQUE (builtin) WHERE builtin   -- one built-in group: owner
+                 -- binds people to permissions; code reads the permissions and the builtin
+                 -- flag, never a name. The migration seeds the built-in row, and the code
+                 -- creates it when it finds none
+group_members    (group_id FK, user_id FK) PK,
+                 added_by FK users ON DELETE SET NULL, NULL,
+                                                  -- who added the member: the member
+                                                  -- themselves for a sign-in owner join
+                 added_at
+                 INDEX (user_id)
+                 -- group_id and user_id ON DELETE CASCADE: a deleted group or account
+                 -- takes its memberships (admin.md § Groups)
+audit_log        id BIGINT PK,
+                 actor_id FK users ON DELETE SET NULL, NULL,
+                 permission VARCHAR(32) NULL,     -- what the route required; NULL for a
+                                                  -- sign-in's owner join
+                 action VARCHAR(64),              -- <area>.<verb> (admin.md § The audit log)
+                 target_type VARCHAR(32),         -- group | user | code | job | setting
+                 target_id VARCHAR(64),           -- no FK: a record outlives its target;
+                                                  -- a job's is its UUID as text, a setting's its key
+                 before JSONB NULL, after JSONB NULL,
+                                                  -- ids, amounts, flags, ISO dates; a
+                                                  -- grant's optional reason, the one free
+                                                  -- text; never an address, a name,
+                                                  -- content or a secret
+                 ip VARCHAR(45) NULL,             -- the request's client address
+                 created_at
+                 INDEX (created_at), INDEX (actor_id, created_at),
+                 INDEX (target_type, target_id)
+                 -- one row per change made through the operator console, written in the
+                 -- change's own transaction; no route updates or deletes one, nothing sweeps
+                 -- the table; a deleted actor leaves actor_id NULL
+runtime_settings key VARCHAR(64) PK,              -- one of the twelve keys the database may
+                                                  -- override, as .env names it: CREDIT_USD
+                 value JSONB,                     -- a JSON string: the text .env would hold
+                 updated_by FK users ON DELETE SET NULL, NULL,
+                 updated_at
+                 -- the operator console's settings over .env (admin.md § Settings): a key
+                 -- without a row is .env's; a row whose key is not one of the twelve is
+                 -- ignored; written only by the settings routes, in the transaction of
+                 -- their audit record
 ```
 
 ## Rules
@@ -348,6 +460,14 @@ pack_checkouts   user_id PK/FK, pack_id, idempotency_key UNIQUE,
 - **The figure check migration** (`figure check`) added `job_pages.figures` (NULL: no check). No row is rewritten: a page kept from before it keeps no statuses, and its figures carry no `check`. Its downgrade drops the column.
 - **The ledger migration** (`credit entries outlive turns`) changed `credit_entries.turn_id` from `ON DELETE CASCADE` to `ON DELETE SET NULL` and replaced the check that a chat entry has a turn with one that a parse entry has none: a conversation deleted by its reader takes its turns and leaves their entries behind, still counted in the period and in `/api/billing/entries`. No row is rewritten. Its downgrade restores the cascade and refuses while any chat entry has no turn, naming the count — those entries would otherwise have to be deleted from the billing record.
 - **The library files migration** (`library files`) added `documents.kind` — `parse`, `markdown` or `file`; NOT NULL, default `parse` — backfilled from `job_id` (a row with a job is a `parse`, one without a `markdown`), `documents.media_type` and `documents.size_bytes` (NULL on every existing row: only a file carries them) and `agent_settings.auto_convert` (true). No row is rewritten otherwise. Its downgrade refuses while any row is a file, naming the count — without `kind` those rows would read as markdown documents whose text no route could find — and otherwise drops the four columns.
+- **The chat tool calls migration** (`chat tool calls`) created `chat_tool_calls`, empty, with its indexes; no existing row is read or rewritten, and nothing reads it until a turn makes a web tool call ([chat.md](./chat.md) § Tools). Its downgrade drops the table — the day's counts and the record behind the searches already charged are lost with it, the entries themselves not.
+- **The compaction migration** (`conversation compaction and memory file`) added `chat_turns.kind` (`message` on every row), `agent_settings.idle_compact` (`true` on every row: idle compaction is on unless the reader turns it off), and on `conversations` the nullable `memory_file`, `compacted_message_id` (a message id without a foreign key, since a message goes only with its conversation), `context_tokens` and `cache_warm_until`, NULL on every row, with the partial index the idle compaction pass reads ([chat.md](./chat.md) § Compaction, § Memory). The only rows rewritten are skills named `new` or `compact`, the composer's own commands from this version on ([chat.md](./chat.md) § Skills): each is renamed to the next free `name-2`, `name-3`… of its reader. Otherwise no row is read or rewritten: an open conversation goes on as it was, takes its memory file snapshot at its next turn, and is first measured by its next model call. Its downgrade drops the columns and the index and leaves the new names; a conversation compacted meanwhile then replays its whole history again, the summary row among it.
+- **The redeem codes migration** (`redeem codes`) created `redeem_codes`, `redemptions` and `plan_grants`, empty, added `source` (default `pay`) and `redemption_id` to `credit_packs` and `redeem_failures` (default 0) and `redeem_failed_at` to `users` ([billing.md](./billing.md) § Redeem codes). Every existing pack reads as bought and every user as never having tried a code; nothing else is read or rewritten. Its downgrade drops the three tables and the four columns — codes and their redemptions are lost with them, and a redeemed pack's row stays as a bought one's, so it is not run on a database that redeemed one.
+- **The operator console migration** (`operator console groups and audit log`, 2026-10-27) created `groups`, `group_members` and `audit_log`, with their constraints and indexes — the partial unique index that keeps one built-in group among them — and one row: the built-in group, `owner`, `builtin` true, an empty permission list (it holds every permission by the flag) and no members ([admin.md](./admin.md) § Groups). The name is copied into the migration, never imported. No existing row is read or rewritten: nobody is an owner until an `OWNER_EMAILS` address signs in. The code creates the same row when it finds none, since a database built from the models — the tests' — has no seed. Its downgrade drops the three tables — the groups, their members and the audit record go with them, so it is not run on a database whose record matters.
+- **The console's grants migration** (`credit packs from console grants`, 2026-10-27) widened the check on `credit_packs.source` from `pay` and `code` to `pay`, `code` and `grant`, so an operator's credit grant is a pack like a code's ([billing.md](./billing.md) § Operator grants, [admin.md](./admin.md) § Users and grants); `source` is `String(8)`, which `grant` fits. No row is read or rewritten. Its downgrade narrows the check back and refuses while any pack has `source = grant`, naming the count — those packs could otherwise only be deleted from the billing record or relabelled as something they are not.
+- **The runtime settings migration** (`runtime settings`, 2026-10-27) created `runtime_settings`, empty, and `ix_conversations_model` on `conversations.model`, which the settings page's confirmation counts through ([admin.md](./admin.md) § Settings). No existing row is read or rewritten: every setting stays `.env`'s until an operator stores one. Its downgrade drops the index and the table — the stored settings go with it, and `.env`'s are in effect again.
+- **A stored setting is the text, not the value it reads as.** `runtime_settings.value` is a JSON string holding exactly what `.env` would — `"0.002"`, `"[{\"planId\": \"pro\", …}]"` — never the number or the JSON it parses to: `jsonb` keeps no object key order, and `MODEL_PRICES_JSON`'s order is the chat agent's model order. The settings are parsed and checked from that text as from `.env` ([admin.md](./admin.md) § Settings).
+- **The console's tables say who may do what, and what was done; the permissions themselves are code.** `groups.permissions` is a JSON list rather than an array type (the SQLite fallback the tests run on has none), normalized before it is written and read whole — no query looks inside it — and the strings it may hold are `ALL_PERMISSIONS` ([admin.md](./admin.md) § Permissions), so a new permission needs no migration. One group carries `builtin`, which the code checks instead of a name. `audit_log` is append-only: a row is written in the transaction of the change it records and never updated or deleted, its `before` and `after` hold ids, amounts, flags, permission strings, group names, plan ids and dates as ISO 8601 strings — never an address, a person's name, content or a secret; who a row is about is joined from `users` when it is read — and `target_id` is text with no foreign key — a group's, an account's or a code's id, a job's UUID, a setting's key — the rule `jobs.connection_id` follows for history. The one free text a row holds is a grant's optional `reason` in `after`, the operator's own note, written under the same rule ([admin.md](./admin.md) § Users and grants); it stays when the account it is about is deleted, as the row does. A day grant's `after` also keeps the request's `request_id`, and that is the one query that looks inside `after`: a day grant sent again is found by `after ->> 'request_id'` among that account's `users.grant_days` rows — narrowed by the `(target_type, target_id)` index, under the account's row lock — since days have no row of their own to carry the id.
 - **The credit packs migration** (`credit packs`) created `credit_packs`, `credit_pack_entries` and `pack_checkouts`, empty, with their constraints and indexes ([billing.md](./billing.md) § The ledger). No existing row is read or rewritten: nothing changes for a user until a pack is bought. Its downgrade drops the three tables and nothing else — packs already bought are lost with them, so it is not run on a database that sold one.
 - **The reader views migration** (`reader views`) added `users.default_view` (`markdown` on every row) and `documents.view` (NULL on every row), and turned `agent_settings.auto_convert` off: its default became `false` and every existing row was set to `false` — the switch had been on for everyone as the default the library files migration gave it, and since 2026-10-26 an uploaded PDF or image is kept as it is until the reader asks for Markdown ([web.md](./web.md) § Files). Its downgrade drops the two columns and restores the default of `true`; the rows stay off.
 - **The parse retention migration** (`parse retention and account deletion`) did the same for `credit_entries.job_id`: `fk_credit_entries_job_id_jobs` went from `ON DELETE CASCADE` to `ON DELETE SET NULL`, and `ck_credit_entries_parse_job`, which held that an entry has a job exactly when it is a parse, became the check that a chat entry has no job (`kind = 'parse' OR job_id IS NULL`): a parse the retention deletes ([jobs.md](./jobs.md) § Retention) leaves its entry behind, still counted in its period and in `/api/billing/entries`. It added the indexes the purge and a job's foreign-key actions read, `ix_documents_job_id` and `ix_usage_log_job_id`, and the partial `ix_documents_trashed_at` and `ix_folders_trashed_at` (`WHERE trashed_at IS NOT NULL`) the Trash's expiry reads. No row is rewritten and none is deleted: the parses already past their time go at the first sweep after the deploy. Its downgrade drops the four indexes, restores the cascade and the old check, and refuses while any parse entry has no job, naming the count — those entries would otherwise have to be deleted from the billing record.
@@ -367,7 +487,7 @@ pack_checkouts   user_id PK/FK, pack_id, idempotency_key UNIQUE,
 - **A document is a library entry, not a second copy of the result.** `documents` names a parse and places it in a folder; the markdown lives in `results` exactly once, keyed by the job that produced it. A markdown document has no parse: `job_id` is NULL, and its baseline is the `.md` it was uploaded as, kept as its original, or nothing for one written new ([workspace.md](./workspace.md) § Markdown documents). `kind` says which it is (`parse` or `markdown`), and `job_id` agrees: a parse has one, a markdown document none. **A file** (`kind` `file`, [workspace.md](./workspace.md) § Files) is the third kind of row: no parse, no baseline, the one copy of its bytes in the tree at `files/<folder>/<name>`, its `media_type` and `size_bytes` on the row because the file itself is the only other place they could be read from; reconciliation removes the row when the file is gone from the tree — the one row it removes ([workspace.md](./workspace.md) § The tree is the truth). Deleting a document deletes the entry only; its parse then falls under the retention ([jobs.md](./jobs.md) § Retention) — kept while any document of the user names a parse of the same original or an upload ticket that has not expired names it, else deleted `PARSE_RETENTION_DAYS` after it finished — and its `usage_log` rows and its ledger entry outlive it with `job_id` NULL, because they are the billing record of something that really ran. Deleting a folder cascades to its subfolders and their documents, the way removing a directory does.
 - **The Trash is a column, not a table.** Putting a folder or a document in the Trash sets its `trashed_at` and nothing else: the row keeps its place (`parent_id`, `folder_id`) and its name, which is where *Put Back* returns it, and everything under a trashed folder is in the Trash with it without a write of its own. So *live* is computed, not stored — a folder is live when neither it nor any folder above it has `trashed_at`, a document when it has none and its folder (if any) is live — and every route of the library, the reader and the agent answers 404 for what is not live ([workspace.md](./workspace.md) § The Trash). Names are unique among the live rows only: the unique indexes carry `WHERE trashed_at IS NULL`, so a trashed `report.pdf` does not keep its folder from taking a new one, and Put Back resolves the collision the way a move does, with ` (2)`. A row inside a trashed folder still holds its name there, which nothing can contest: a trashed folder takes no new entries. That is decided again under the user's row lock, which a move to the Trash takes too: a folder or a file created while its destination goes to the Trash either lands first and goes with it, or is refused (404) — an upload whose parse is already under way lands at the top level instead, since the parse is not undone. An item trashed on its own stays its own entry in the Trash when a folder above it is trashed later. Deleting a row for good — from the Trash, or a live one deleted immediately — takes its own subtree only: an item inside it that was trashed separately is moved up to the deleted folder's parent first, so the cascade cannot take it, and it stays in the Trash. The Trash is emptied by the reader — *Delete Immediately*, *Empty Trash* — and by the worker's sweep, which deletes for good, the way *Delete Immediately* does, every item whose own `trashed_at` is older than `TRASH_RETENTION_DAYS` (30; 0 = never), reading the partial `trashed_at` indexes ([workspace.md](./workspace.md) § The Trash). An expired folder takes its whole subtree, and nothing in it outlives it: an item trashed on its own inside it was trashed earlier, nothing inside a trashed folder being trashable, so it has expired too.
 - **The root level needs its own unique index.** `folders.parent_id` and `documents.folder_id` are NULL at the root, and PostgreSQL treats NULLs as distinct in a unique constraint, so `UNIQUE (user_id, parent_id, name)` would not stop two root folders called "Invoices". The partial indexes above close that. The application checks the same thing before writing, which is what turns a collision into `report (2).pdf` instead of a 409 — and it checks across both tables: a folder and a document in one parent cannot share a name, because the workspace gives each name one directory ([workspace.md](./workspace.md) § Layout). The indexes cannot express that, so the name is chosen under a lock on the user's row.
-- **Deleting a user is deleting the account** ([auth.md](./auth.md) § Deleting the account): one `DELETE` of the `users` row, under its row lock, and every table with a `user_id` cascades from it — sessions, API keys, OAuth grants, upload tickets, agent settings, prompt presets, skills, subagents, memories, chat attachments, folders, documents, conversations with their messages, turns and events, jobs with their pages and results, `usage_log`, subscriptions, checkouts, credit periods and credit entries. `pay_events` keep their rows with `user_id` NULL — the record of an event outlives the user it was about — and `oauth_clients`, which belong to no user, stay. PostgreSQL never reuses an id, so the same Google account signing in later is a new row: a new, empty account, on Free from zero.
+- **Deleting a user is deleting the account** ([auth.md](./auth.md) § Deleting the account): one `DELETE` of the `users` row, under its row lock, and every table with a `user_id` cascades from it — sessions, API keys, OAuth grants, upload tickets, agent settings, prompt presets, skills, subagents, memories, chat attachments, folders, documents, conversations with their messages, turns and events, jobs with their pages and results, `usage_log`, subscriptions, checkouts, credit periods and credit entries, and the account's memberships of the operator console's groups (`group_members`, by `user_id`). `pay_events` keep their rows with `user_id` NULL — the record of an event outlives the user it was about — and so do the console's `audit_log` rows, with `actor_id` NULL: a row the account made keeps what was changed and loses who, and a row about the account keeps its `target_id`, a number no address resolves from any more ([admin.md](./admin.md) § The audit log); a membership the account added keeps its row with `added_by` NULL. `oauth_clients`, which belong to no user, stay. Nothing refuses for the console: deleting the last owner's account leaves the owner group empty. PostgreSQL never reuses an id, so the same Google account signing in later is a new row: a new, empty account, on Free from zero.
 - `results` holds parsed **output**, kept as long as its job (`PARSE_RETENTION_DAYS` after the parse finishes, or while a document names a parse of that original or an upload ticket that has not expired names the job, [jobs.md](./jobs.md) § Retention); the DB never stores document bytes. `jobs.source_path` points at a temp file that is deleted at terminal state unless the job belongs to a library document, in which case the worker moves it into the document's workspace directory ([workspace.md](./workspace.md)).
 - **A document's editable content is a file, not a column.** `doc.md` and `notes.md` live in the user's workspace and their history is that workspace's git log; `documents` keeps the entry, the parse behind it and its place in the tree, and the workspace is reconciled to it after every chat turn ([workspace.md](./workspace.md) § The tree is the truth).
 - `usage_log.agent` is written with the row (`parse` or `chat`) and was backfilled from `jobs.agent`; rows with no job and no turn are historical and count as `parse`. Chat rows carry `turn_id` and the cache token columns; parse rows carry `job_id` and zeros.

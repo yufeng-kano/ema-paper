@@ -50,6 +50,7 @@ MODEL_PRICES_JSON='{"<vision-model-id>": {"input": <usd>, "cache_read": <usd>, "
 - The chat agent offers the catalog's models that the table prices, in the table's order. The first is the default.
 - The API and the worker refuse to start while a model they would run has no price.
 - Credits are derived from these prices and `CREDIT_USD` ([billing.md](./billing.md) § Credits, § Models).
+- Once the console is on, the models and prices can also be changed on its Settings page, without a restart (§ The operator console).
 
 ## Run it on a server
 
@@ -96,9 +97,47 @@ The router must pass TLS through untouched (SNI passthrough). Caddy still termin
 
 ## Plans, credits and the sandbox
 
-- **Every account is on Free** until it buys a paid plan. Free grants `FREE_CREDITS_PER_PERIOD` credits each UTC month, `FREE_STORAGE_BYTES` of storage and `FREE_MAX_JOBS` parses at once. Raise them for a private deployment, within `WORKSPACE_QUOTA_BYTES` and `MAX_JOBS_PER_USER`, or the API refuses to start.
+- **Every account is on Free** until it buys a paid plan. Free grants `FREE_CREDITS_PER_PERIOD` credits each UTC month, `FREE_STORAGE_BYTES` of storage and `FREE_MAX_JOBS` parses at once. Raise them for a private deployment, within `WORKSPACE_QUOTA_BYTES` and `MAX_JOBS_PER_USER`, or the API refuses to start — in `.env`, or on the console's Settings page (§ The operator console).
 - **Paid plans go through Kano Pay**, a separate payment service ([billing.md](./billing.md) § Kano Pay). With the four `KANO_PAY_*` values empty, nobody can check out and Free keeps working.
 - **The sandbox comes with a paid plan.** It gives the chat agent `bash` in one Kata microVM per user, and needs a host with `/dev/kvm` and the Kata runtime ([sandbox.md](./sandbox.md) § Operations). A deployment without paid plans sets `SANDBOX_URL=` (empty): the agent then works without `bash`, and everything else stays.
+
+### Redeem codes
+
+A redeem code gives an account credits, or days of a paid plan, without Kano Pay ([billing.md](./billing.md) § Redeem codes) — a gift to a user, a launch campaign, or the way a private deployment hands out a paid plan's storage and sandbox with Pay left unconfigured. Codes are made on the operator console's *Redeem codes* page (§ The operator console), or on the server, in the api container, with the CLI — the same rules, the same codes:
+
+```sh
+# 100 codes of 500 credits, valid a year once redeemed, redeemable until the end of 2026
+docker compose exec api python -m sightread.codes create --credits 500 --valid-days 365 \
+    --count 100 --redeem-by 2026-12-31 --label "launch"
+# one code anyone may use 200 times, 30 days of the plan "pro" each
+docker compose exec api python -m sightread.codes create --plan pro --days 30 --uses 200 --label "beta"
+docker compose exec api python -m sightread.codes list            # live codes and their uses
+docker compose exec api python -m sightread.codes list --all      # disabled and exhausted ones too
+docker compose exec api python -m sightread.codes disable EMA-XXXX-XXXX-XXXX
+```
+
+`create` prints each code once, as a user types it (`EMA-XXXX-XXXX-XXXX`; the prefix is `REDEEM_CODE_PREFIX`); `--uses` is how many accounts may redeem one code (1 unless given), `--valid-days` and `--days` are at most 36,500, a plan must be one of `KANO_PAY_PLANS_JSON` — the console's Settings page's, when it overrides it —, `--redeem-by` cannot be a day already past (UTC), and one batch holds at most `REDEEM_CODES_MAX_COUNT` (1000) codes, or the command refuses. The console shows a code in full only once, when it creates it; `list` here prints every code whole, which is how to read back one whose dialog was closed. A plan code whose plan was taken out of `KANO_PAY_PLANS_JSON` lists as `plan missing` and is refused to users until the plan is back. A user redeems a code in the settings dialog's Usage section. Granted days are spent only while no subscription pays for the account, and a code's credits are never refunded.
+
+## The operator console
+
+The console is your own pages inside the app — today *Overview*, *Jobs* and *Usage*, to see whether the worker runs, put a stuck job back in the queue and see what the model calls cost, *Users*, to look an account up and give it credits or days, *Redeem codes*, *Groups*, to give other people access, *Settings*, to change prices, plans and allowances without a restart, and *Audit*, the record of every change made there ([admin.md](./admin.md)). It does not exist until you name its first owner. Put your Google address in `.env`:
+
+```sh
+OWNER_EMAILS=you@example.com    # comma-separated for several; empty = no console
+```
+
+Then recreate the api container so it reads the file again — `restart` would keep the old environment:
+
+```bash
+docker compose -f docker-compose.production.yaml up -d --no-deps api
+# behind a front proxy: add -f docker-compose.only-container-network.yaml, as always
+```
+
+Sign in with that Google account (or sign out and in again): the account menu now has *Admin console*. The address joins the built-in `owner` group, which holds every permission, at a sign-in whose address Google has verified; taking it out of `OWNER_EMAILS` later removes no one — an owner does that on the Groups page. The console asks for a fresh sign-in once a session is older than `ADMIN_REAUTH_HOURS` (12). Locally, `OWNER_EMAILS=dev@localhost` makes the dev login an owner.
+
+The *Redeem codes* page creates, lists and disables codes by the same rules as `python -m sightread.codes` (§ Redeem codes); the CLI needs no console and keeps working beside it.
+
+**Settings without a restart.** The console's *Settings* page changes twelve values of `.env` from the browser: the models (`PARSE_MODEL`, `CHECK_MODEL`, `PARSE_FALLBACK_MODEL`), `MODEL_PRICES_JSON`, the credits (`CREDIT_USD`, `PARSE_CREDITS_PER_PAGE`, `CHAT_MIN_CREDITS`), the Free plan (`FREE_*`), `KANO_PAY_PLANS_JSON` and `KANO_PAY_PACKS_JSON` ([admin.md](./admin.md) § Settings). A value saved there is stored in the database and overrides `.env` within `RUNTIME_SETTINGS_CACHE_SECONDS` (30), with no container recreated; *Restore to .env* hands the key back to the file. Each change is checked as a start would check it, and one that takes away what accounts have — a priced model in use, a plan or pack in use, a smaller Free plan — asks first. Secrets and connections stay in `.env`: the page shows only whether each is set.
 
 ## Connect your tools
 

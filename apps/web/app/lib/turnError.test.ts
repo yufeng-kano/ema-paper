@@ -4,6 +4,7 @@ import { turnErrorKey, turnErrorNeedsPlan } from './turnError'
 describe('turnErrorKey', () => {
   it('words the errors the worker writes', () => {
     expect(turnErrorKey('storage_full')).toBe('chat.errors.storageFull')
+    expect(turnErrorKey('compact_empty')).toBe('chat.errors.compactEmpty')
     expect(turnErrorKey('the turn timed out')).toBe('chat.errors.timedOut')
     expect(turnErrorKey('The turn made more than 40 tool calls')).toBe('chat.errors.tooManySteps')
     expect(

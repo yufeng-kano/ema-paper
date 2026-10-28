@@ -34,7 +34,9 @@ async def create_session(db: AsyncSession, user: User) -> str:
     return token
 
 
-async def resolve_session(db: AsyncSession, token: str) -> User | None:
+async def resolve_session_row(db: AsyncSession, token: str) -> tuple[UserSession, User] | None:
+    """The session row and its user. The operator console reads the row's `created_at`,
+    the sign-in its re-login window runs from (docs/admin.md § Signing in)."""
     token_hash = hash_token(token)
     row = (
         await db.execute(select(UserSession).where(UserSession.token_hash == token_hash))
@@ -45,7 +47,13 @@ async def resolve_session(db: AsyncSession, token: str) -> User | None:
         await db.delete(row)
         await db.commit()
         return None
-    return (await db.execute(select(User).where(User.id == row.user_id))).scalar_one_or_none()
+    user = (await db.execute(select(User).where(User.id == row.user_id))).scalar_one_or_none()
+    return None if user is None else (row, user)
+
+
+async def resolve_session(db: AsyncSession, token: str) -> User | None:
+    resolved = await resolve_session_row(db, token)
+    return None if resolved is None else resolved[1]
 
 
 async def delete_session(db: AsyncSession, token: str) -> None:

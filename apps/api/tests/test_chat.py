@@ -315,7 +315,9 @@ async def test_a_turn_edits_the_document_and_streams_its_events(chatting, monkey
         "skill",
         "subagent",
         "memory",
-    ]  # no sandbox configured → no bash
+        "read_url",
+        "download_file",
+    ]  # no sandbox configured → no bash; no keys → no searches (docs/chat.md § Tools)
     assert first["system"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
     assert first["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
     assert first["thinking"] == {"type": "adaptive", "display": "updates"}
@@ -1311,6 +1313,8 @@ async def test_the_agent_page_lists_only_the_tools_the_deployment_has(
         "skill",
         "subagent",
         "memory",
+        "read_url",
+        "download_file",
     ]
     bare = make_client(workspaces_dir=str(tmp_path / "ws2"), sandbox_url="")
     await bare.post("/api/auth/dev-login", headers=CSRF_HEADERS)
@@ -1326,6 +1330,8 @@ async def test_the_agent_page_lists_only_the_tools_the_deployment_has(
         "skill",
         "subagent",
         "memory",
+        "read_url",
+        "download_file",
     ]
 
 
@@ -3305,7 +3311,8 @@ async def test_a_rename_is_one_clean_line_and_keeps_the_order(chatting) -> None:
     for blank in ("", " \n\t ", "\u200b"):
         refused = await chatting.put(url, json={"title": blank}, headers=CSRF_HEADERS)
         assert refused.status_code == 400, blank
-    assert (await chatting.put(url, json={}, headers=CSRF_HEADERS)).status_code == 422
+    # Neither field: refused as the request it is (docs/api.md).
+    assert (await chatting.put(url, json={}, headers=CSRF_HEADERS)).status_code == 400
     assert (await chatting.put(url, json={"title": "Plain"})).status_code == 403
     detail = (await chatting.get(url)).json()["conversation"]
     assert detail["title"] == "x" * limit
@@ -3379,7 +3386,7 @@ async def test_a_usage_row_is_written_through_a_cancel(monkeypatch) -> None:
     release = asyncio.Event()
     recorded: list[str] = []
 
-    async def slow_record(ctx, model, usage):
+    async def slow_record(ctx, model, usage, *, conversation=False):
         started.set()
         await release.wait()
         recorded.append(usage)

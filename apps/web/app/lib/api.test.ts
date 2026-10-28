@@ -1,18 +1,28 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   ApiRequestError,
+  addAdminGroupMember,
+  createAdminCodes,
+  createAdminGroup,
   createKey,
   creditsRefusalOf,
   deleteAccount,
+  deleteAdminGroup,
+  disableAdminCode,
+  getAdminMe,
   getLibrary,
   getMe,
   isDevLoginAvailable,
+  listAdminAudit,
+  listAdminCodes,
   putAgentSettings,
   putDocumentContent,
+  removeAdminGroupMember,
   renameConversation,
   revertRevision,
   revokeKey,
   sendMessage,
+  updateAdminGroup,
   conversationEventsUrl,
 } from './api'
 
@@ -230,3 +240,125 @@ describe('isDevLoginAvailable', () => {
   })
 })
 
+
+describe('the operator console', () => {
+  it('reads its own view of the account as a plain GET', async () => {
+    const me = {
+      user: { id: 1, email: 'a@example.com', name: null, picture: null },
+      permissions: [],
+      reauth_required: false,
+      reauth_hours: 12,
+    }
+    const fetchMock = stubFetch(Response.json(me))
+
+    await expect(getAdminMe()).resolves.toEqual(me)
+    expect(fetchMock).toHaveBeenCalledWith('/api/admin/me', expect.anything())
+    expect(headersOf(fetchMock)['X-Requested-With']).toBeUndefined()
+  })
+
+  it('sends every group change as a mutation, with the CSRF header', async () => {
+    const group = {
+      id: 4,
+      name: 'support',
+      builtin: false,
+      permissions: [],
+      stored_permissions: [],
+      member_count: 0,
+      updated_at: '',
+      updated_by: null,
+    }
+    const member = { user_id: 9, email: 'b@example.com', name: null, added_at: '', added_by: null }
+    const fetchMock = stubFetch(
+      Response.json(group, { status: 201 }),
+      Response.json(group),
+      Response.json(member, { status: 201 }),
+      new Response(null, { status: 204 }),
+      new Response(null, { status: 204 }),
+    )
+
+    await createAdminGroup({ name: 'support', permissions: [] })
+    expect(fetchMock).toHaveBeenLastCalledWith('/api/admin/groups', expect.anything())
+    expect(lastInit(fetchMock).method).toBe('POST')
+    expect(lastInit(fetchMock).body).toBe(JSON.stringify({ name: 'support', permissions: [] }))
+
+    await updateAdminGroup(4, { permissions: ['codes.read'], based_on: [] })
+    expect(fetchMock).toHaveBeenLastCalledWith('/api/admin/groups/4', expect.anything())
+    expect(lastInit(fetchMock).method).toBe('PATCH')
+    expect(lastInit(fetchMock).body).toBe(JSON.stringify({ permissions: ['codes.read'], based_on: [] }))
+
+    await expect(addAdminGroupMember(4, { email: 'b@example.com' })).resolves.toEqual(member)
+    expect(fetchMock).toHaveBeenLastCalledWith('/api/admin/groups/4/members', expect.anything())
+    expect(lastInit(fetchMock).body).toBe(JSON.stringify({ email: 'b@example.com' }))
+
+    await expect(removeAdminGroupMember(4, 9)).resolves.toBeUndefined()
+    expect(fetchMock).toHaveBeenLastCalledWith('/api/admin/groups/4/members/9', expect.anything())
+    expect(lastInit(fetchMock).method).toBe('DELETE')
+
+    await expect(deleteAdminGroup(4)).resolves.toBeUndefined()
+    expect(fetchMock).toHaveBeenLastCalledWith('/api/admin/groups/4', expect.anything())
+    expect(lastInit(fetchMock).method).toBe('DELETE')
+
+    for (const [, init] of fetchMock.mock.calls) {
+      expect((init?.headers as Record<string, string>)['X-Requested-With']).toBe('fetch')
+    }
+  })
+
+  it('pages the audit log, sending only the filters that are set, encoded', async () => {
+    const page = { items: [], total: 0, page: 2, page_size: 50 }
+    const fetchMock = stubFetch(Response.json(page), Response.json(page))
+
+    await listAdminAudit({ page: 2 })
+    expect(fetchMock).toHaveBeenLastCalledWith('/api/admin/audit?page=2', expect.anything())
+
+    await listAdminAudit({ page: 1, area: 'groups', q: 'a+b@example.com' })
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      '/api/admin/audit?page=1&area=groups&q=a%2Bb%40example.com',
+      expect.anything(),
+    )
+  })
+
+  it('pages the redeem codes, sending only the filters that are set, encoded', async () => {
+    const page = { items: [], total: 0, page: 1, page_size: 50 }
+    const fetchMock = stubFetch(Response.json(page), Response.json(page))
+
+    await listAdminCodes({ page: 1 })
+    expect(fetchMock).toHaveBeenLastCalledWith('/api/admin/codes?page=1', expect.anything())
+
+    await listAdminCodes({ page: 3, status: 'all', q: 'launch & vip' })
+    expect(fetchMock).toHaveBeenLastCalledWith('/api/admin/codes?page=3&status=all&q=launch+%26+vip', expect.anything())
+    expect(headersOf(fetchMock)['X-Requested-With']).toBeUndefined()
+  })
+
+  it('creates and disables codes as mutations, with the CSRF header', async () => {
+    const body = { kind: 'credits' as const, credits: 500, valid_days: 365, count: 2, max_uses: 1, label: 'launch' }
+    const fetchMock = stubFetch(Response.json({ codes: [] }, { status: 201 }), Response.json({ id: 7 }))
+
+    await createAdminCodes(body)
+    expect(fetchMock).toHaveBeenLastCalledWith('/api/admin/codes', expect.anything())
+    expect(lastInit(fetchMock).method).toBe('POST')
+    expect(lastInit(fetchMock).body).toBe(JSON.stringify(body))
+
+    await disableAdminCode(7)
+    expect(fetchMock).toHaveBeenLastCalledWith('/api/admin/codes/7/disable', expect.anything())
+    expect(lastInit(fetchMock).method).toBe('POST')
+
+    for (const [, init] of fetchMock.mock.calls) {
+      expect((init?.headers as Record<string, string>)['X-Requested-With']).toBe('fetch')
+    }
+  })
+
+  it('keeps the reason of a console conflict beside its message', async () => {
+    stubFetch(
+      Response.json(
+        { error: { type: 'admin_conflict', message: 'The last member stays', reason: 'last_owner' } },
+        { status: 409 },
+      ),
+    )
+
+    const error = await removeAdminGroupMember(1, 2).catch((thrown: unknown) => thrown)
+
+    expect(error).toBeInstanceOf(ApiRequestError)
+    expect((error as ApiRequestError).type).toBe('admin_conflict')
+    expect((error as ApiRequestError).details).toEqual({ reason: 'last_owner' })
+  })
+})

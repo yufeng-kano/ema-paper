@@ -10,7 +10,7 @@ from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .billing.credits import ModelPrice, parse_model_prices
-from .billing.plans import FREE_PLAN_ID, Pack, Plan, parse_packs, parse_plans
+from .billing.plans import CREDITS_MAX, FREE_PLAN_ID, Pack, Plan, parse_packs, parse_plans
 
 # Only ever used when APP_ENV=local and SECRET_KEY is unset, so `uv run uvicorn` works
 # without a .env file. Production refuses to start without a real SECRET_KEY.
@@ -41,6 +41,28 @@ class Settings(BaseSettings):
 
     auth_dev_mode: bool = False
 
+    # The operator console (docs/admin.md): the Google addresses that join its built-in
+    # owner group when they sign in with the address verified, comma-separated, in any
+    # letter case — empty = no console, `/api/admin` not mounted; how many hours after a
+    # sign-in a session may still use it; and the rows one page of its lists holds.
+    owner_emails: str = ""
+    admin_reauth_hours: int = 12
+    admin_page_size: int = 50
+    # A grant from the console's Users page (docs/admin.md § Users and grants): how many
+    # days granted credits are valid unless the operator picks another number, and the most
+    # one grant may give — credits, and days of a plan or of a credit grant's validity.
+    admin_grant_valid_days: int = 365
+    admin_grant_max_credits: int = 1_000_000
+    admin_grant_max_days: int = 3650
+
+    # The console's jobs and usage (docs/admin.md § Overview, jobs and usage): how long the
+    # overview waits for each of Kano Proxy's and Kano Pay's catalogs, the most days one read
+    # of the usage may span — never under the Usage page's longest range, 90 days — and how
+    # many hours back the overview counts failed jobs, a year at most.
+    admin_probe_timeout_seconds: float = 5
+    admin_usage_max_days: int = 366
+    admin_failed_window_hours: int = 24
+
     # Kano Proxy, the only upstream (docs/auth.md § 3): the origin only — vision calls go
     # to `{origin}/openai/v1`, chat to `{origin}/anthropic/v1` — and the operator's own key,
     # presented on every upstream call. Either empty = no upstream, 503 `upstream`.
@@ -64,6 +86,9 @@ class Settings(BaseSettings):
     free_credits_per_period: int = 150
     free_storage_bytes: int = 512_000_000
     free_max_jobs: int = 1
+    # How long the API, the worker and the CLI keep the settings the database overrides
+    # before reading its rows again (docs/admin.md § Settings).
+    runtime_settings_cache_seconds: int = 30
     # What the public policy pages print (docs/web.md § Pages): the support address and
     # who operates the service, served by `GET /api/site`; empty = not printed.
     support_email: str = ""
@@ -92,6 +117,17 @@ class Settings(BaseSettings):
     # is not deleted while one of its own is that young (docs/auth.md § Deleting the
     # account).
     kano_pay_checkout_lifetime_seconds: int = 86_400
+    # Redeem codes (docs/billing.md § Redeem codes): the prefix a code is printed and typed
+    # with, how many random characters follow it, how many days one granted period of a
+    # paid plan runs, and the refused attempts a user may make in the window before 429.
+    redeem_code_prefix: str = "EMA"
+    redeem_code_chars: int = 12
+    grant_period_days: int = 30
+    redeem_max_failures: int = 10
+    redeem_failure_window_seconds: int = 3600
+    # The most codes one create makes, in the console and with the CLI, 1 to 10,000
+    # (docs/admin.md § Redeem codes).
+    redeem_codes_max_count: int = 1000
 
     upload_max_bytes: int = 134_217_728
     # A file of any other kind uploaded to the library, kept once in the tree
@@ -127,7 +163,7 @@ class Settings(BaseSettings):
     # (docs/parsing.md § Figure check).
     figure_check_rounds: int = 2
     # Cap on a user's custom system prompt (docs/api.md § Limits).
-    system_prompt_max_chars: int = 8000
+    system_prompt_max_chars: int = 12_000
     # Cap on any upstream response body — a user-controlled endpoint must not be able to
     # exhaust memory with an unbounded reply (docs/parsing.md § Upstream usage).
     upstream_response_max_bytes: int = 33_554_432
@@ -229,10 +265,50 @@ class Settings(BaseSettings):
     chat_memory_max_chars: int = 500
     chat_memories_max: int = 200
     chat_memory_block_max_chars: int = 12_000
+    # How much of the agent's memory file a conversation reads into its system prompt
+    # (docs/chat.md § Memory, *The memory file*).
+    chat_memory_file_max_chars: int = 16_000
+    # Compaction (docs/chat.md § Compaction): the context a conversation must have reached
+    # for the worker to compact it before its cache expires, how long before the expiry
+    # it is enqueued, how often the worker looks, and the tool calls a compaction turn
+    # may make (to bring memory.md up to date) before it answers.
+    chat_idle_compact_min_tokens: int = 100_000
+    chat_idle_compact_lead_seconds: int = 360
+    chat_idle_compact_sweep_seconds: float = 60.0
+    chat_compact_max_tool_calls: int = 8
+    # The context window the chat panel's ring measures a conversation against when
+    # `MODEL_PRICES_JSON` names no `context` for its model.
+    chat_context_window_tokens: int = 200_000
     # Whole sections the reader adds to one message by their heading (docs/chat.md § What
     # a user message carries); each is capped like the selection, its heading on its own.
     chat_sections_per_message: int = 4
     chat_section_heading_max_chars: int = 512
+    # The chat agent's web tools, run on the worker (docs/chat.md § Tools): the switch, the
+    # keys `web_search` (Brave) and `search_papers` (OpenAlex) run on — each tool absent
+    # while its key is empty — and what a web search costs the reader on top of the turn's
+    # tokens (docs/billing.md § A chat turn).
+    chat_web_access: bool = True
+    brave_search_api_key: str = ""
+    openalex_api_key: str = ""
+    # The endpoints the two searches call: a deployment may point them at a mirror or
+    # a proxy of its own.
+    brave_search_url: str = "https://api.search.brave.com/res/v1/web/search"
+    openalex_works_url: str = "https://api.openalex.org/works"
+    web_search_credits: int = 3
+    # Per turn, and per UTC day: the two searches for the whole deployment (the operator's
+    # bill and OpenAlex budget), downloads per user.
+    web_search_max_per_turn: int = 10
+    web_search_max_per_day: int = 2000
+    paper_search_max_per_turn: int = 10
+    paper_search_max_per_day: int = 1000
+    read_url_max_per_turn: int = 30
+    download_max_per_day: int = 20
+    # How much of a page `read_url` reads, the largest download (`file_max_bytes` caps it
+    # too), and how long a search or read, and a download, may take.
+    read_url_max_bytes: int = 5 * 1024 * 1024
+    download_max_bytes: int = 100_000_000
+    web_tool_timeout_seconds: float = 30.0
+    download_timeout_seconds: float = 120.0
 
     # The sandbox runner (docs/sandbox.md). Empty URL = no sandbox: the chat agent runs
     # without its bash tool. The token is what api and worker present to the runner.
@@ -264,21 +340,80 @@ class Settings(BaseSettings):
         # snapshot included (docs/jobs.md § Dedup).
         self.kano_proxy_base_url = self.kano_proxy_base_url.strip().rstrip("/")
         self.kano_pay_url = self.kano_pay_url.strip().rstrip("/")
+        self.brave_search_url = self.brave_search_url.strip()
+        self.openalex_works_url = self.openalex_works_url.strip()
         if self.credit_usd <= 0:
             raise ValueError("CREDIT_USD must be positive")
         for name in (
             "parse_credits_per_page",
             "chat_min_credits",
             "free_credits_per_period",
+            "free_storage_bytes",
+            "free_max_jobs",
             "trash_retention_days",
             "parse_retention_days",
+            "web_search_credits",
+            "web_search_max_per_turn",
+            "web_search_max_per_day",
+            "paper_search_max_per_turn",
+            "paper_search_max_per_day",
+            "read_url_max_per_turn",
+            "download_max_per_day",
+            "chat_idle_compact_min_tokens",
+            "chat_idle_compact_lead_seconds",
+            "chat_compact_max_tool_calls",
         ):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name.upper()} must be >= 0")
+        for name in (
+            "read_url_max_bytes",
+            "download_max_bytes",
+            "web_tool_timeout_seconds",
+            "download_timeout_seconds",
+            "chat_idle_compact_sweep_seconds",
+            "chat_memory_file_max_chars",
+            "chat_context_window_tokens",
+            "runtime_settings_cache_seconds",
+            "redeem_code_chars",
+            "grant_period_days",
+            "redeem_max_failures",
+            "redeem_failure_window_seconds",
+            "admin_reauth_hours",
+            "admin_probe_timeout_seconds",
+        ):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name.upper()} must be positive")
+        if not 1 <= self.admin_page_size <= 500:
+            raise ValueError("ADMIN_PAGE_SIZE must be between 1 and 500")
+        # A pack's `credits` is a 32-bit integer; a century of days keeps every date a grant
+        # reaches one PostgreSQL and Python can hold.
+        if not 1 <= self.admin_grant_max_credits <= 2_147_483_647:
+            raise ValueError("ADMIN_GRANT_MAX_CREDITS must be between 1 and 2147483647")
+        if not 1 <= self.admin_grant_max_days <= 36_500:
+            raise ValueError("ADMIN_GRANT_MAX_DAYS must be between 1 and 36500")
+        if not 1 <= self.admin_grant_valid_days <= self.admin_grant_max_days:
+            raise ValueError("ADMIN_GRANT_VALID_DAYS must be between 1 and ADMIN_GRANT_MAX_DAYS")
+        # One batch is checked for taken codes in one query, a parameter per code, and the
+        # PostgreSQL driver takes at most 32,767 of them.
+        if not 1 <= self.redeem_codes_max_count <= 10_000:
+            raise ValueError("REDEEM_CODES_MAX_COUNT must be between 1 and 10000")
+        # The Usage page offers 7, 30 and 90 days; a smaller cap would refuse its own presets.
+        if self.admin_usage_max_days < 90:
+            raise ValueError("ADMIN_USAGE_MAX_DAYS must be at least 90")
+        # A year at most: a far larger window starts before the first date Python can
+        # hold, and every overview read would fail computing it.
+        if not 1 <= self.admin_failed_window_hours <= 8760:
+            raise ValueError("ADMIN_FAILED_WINDOW_HOURS must be between 1 and 8760")
+        self.redeem_code_prefix = self.redeem_code_prefix.strip().upper()
+        if self.redeem_code_prefix and not self.redeem_code_prefix.isalnum():
+            raise ValueError("REDEEM_CODE_PREFIX must be letters and digits only")
         if self.free_storage_bytes > self.workspace_quota_bytes:
             raise ValueError("FREE_STORAGE_BYTES exceeds WORKSPACE_QUOTA_BYTES")
         if self.free_max_jobs > self.max_jobs_per_user:
             raise ValueError("FREE_MAX_JOBS exceeds MAX_JOBS_PER_USER")
+        for name in ("parse_credits_per_page", "chat_min_credits", "free_credits_per_period"):
+            if getattr(self, name) > CREDITS_MAX:
+                raise ValueError(f"{name.upper()} must be at most {CREDITS_MAX}")
         # Parsed once, at start: a malformed table or an offered model nobody priced
         # refuses to start rather than running a model for free (docs/billing.md § Models).
         prices = self.model_prices
@@ -337,6 +472,19 @@ class Settings(BaseSettings):
     def dev_login_enabled(self) -> bool:
         """`POST /api/auth/dev-login` exists only under both conditions (docs/auth.md)."""
         return self.app_env == "local" and self.auth_dev_mode
+
+    @property
+    def owner_email_set(self) -> frozenset[str]:
+        """`OWNER_EMAILS`, each address trimmed and lower-cased, empty items dropped."""
+        return frozenset(
+            item.strip().lower() for item in self.owner_emails.split(",") if item.strip()
+        )
+
+    @property
+    def console_enabled(self) -> bool:
+        """The operator console exists only while `OWNER_EMAILS` names an address
+        (docs/admin.md § Off until configured)."""
+        return bool(self.owner_email_set)
 
     @property
     def google_oidc_configured(self) -> bool:

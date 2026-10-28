@@ -20,6 +20,7 @@ const EXACT: Record<string, string> = {
   'internal error': 'chat.errors.internal',
   'Kano Proxy is not configured on this deployment': 'chat.errors.notConfigured',
   'No chat model is offered on this deployment': 'chat.errors.notConfigured',
+  compact_empty: 'chat.errors.compactEmpty',
 }
 
 /** The ones whose text carries a number or the upstream's own words. */

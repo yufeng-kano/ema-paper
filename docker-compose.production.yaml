@@ -54,6 +54,10 @@ services:
       UPLOAD_DIR: /data/uploads
       FIGURES_DIR: /data/figures
       WORKSPACES_DIR: /data/workspaces
+      # uvicorn takes the client's address from the X-Forwarded-For Caddy sets — what the
+      # operator console's audit log records. Safe only because nothing but the compose
+      # network reaches api (docs/deployment.md § Compose files).
+      FORWARDED_ALLOW_IPS: "*"
     depends_on:
       pg:
         condition: service_healthy

@@ -2,17 +2,24 @@ import { createPackCheckout, getBillingCatalog, type CatalogPack } from '~/lib/a
 import { formatCount, formatMinorAmount, packValidity } from '~/lib/format'
 
 /**
- * The first top-up pack on sale (docs/billing.md § Top-up packs) — read from the public
- * catalog on `load`, never assumed — and its checkout in this tab, the return landing on the
- * Usage section as a plan checkout's does. One place, so the Usage section, the credits
- * dialog and the composer's notice name the same pack the same way: its price as Pay gives
- * it, its credits and validity as this deployment configures them.
+ * The first top-up pack the public catalog lists (docs/billing.md § Top-up packs) — read on
+ * `load`, never assumed — and its checkout in this tab, the return landing on the Usage
+ * section as a plan checkout's does. One place, so the Usage section and its top-up dialog,
+ * the credits dialog and the composer's notice name the same pack the same way: its price
+ * as Pay gives it, its credits and validity as this deployment configures them.
  */
 export function useTopUp() {
   const { t, locale } = useI18n()
   const { resolve } = useApiError()
 
-  const pack = ref<CatalogPack | null>(null)
+  /** The pack as the catalog describes it, on sale or not: the Usage section says what a
+   *  pack is while Pay's checkout is still closed. */
+  const listed = ref<CatalogPack | null>(null)
+  const onSale = ref(false)
+  /** The pack a checkout can be started for: listed while Pay's checkout is open
+   *  (`available`) — with it closed the catalog still lists the packs, and a checkout
+   *  would be refused. */
+  const pack = computed(() => (onSale.value ? listed.value : null))
   /** Whether the catalog answered, a pack or none; the callers show the pack's figures only then. */
   const loaded = ref(false)
   const buying = ref(false)
@@ -20,26 +27,28 @@ export function useTopUp() {
 
   async function load(): Promise<CatalogPack | null> {
     try {
-      // A pack is for sale only while Pay's checkout is open (`available`): with it
-      // closed the catalog still lists the packs, and a checkout would be refused.
       const catalog = await getBillingCatalog()
-      pack.value = catalog.available ? (catalog.packs[0] ?? null) : null
+      listed.value = catalog.packs[0] ?? null
+      onSale.value = catalog.available
     } catch {
-      pack.value = null
+      listed.value = null
+      onSale.value = false
     } finally {
       loaded.value = true
     }
     return pack.value
   }
 
-  const price = computed(() => (pack.value ? formatMinorAmount(pack.value.amount, pack.value.currency, locale.value) : ''))
-  const credits = computed(() => (pack.value ? formatCount(pack.value.credits, locale.value) : ''))
+  const price = computed(() =>
+    listed.value ? formatMinorAmount(listed.value.amount, listed.value.currency, locale.value) : '',
+  )
+  const credits = computed(() => (listed.value ? formatCount(listed.value.credits, locale.value) : ''))
   /** `12 months`, or the days when the validity is not a whole number of months. */
   const validity = computed(() => {
-    if (!pack.value) {
+    if (!listed.value) {
       return ''
     }
-    const { unit, n } = packValidity(pack.value.valid_days)
+    const { unit, n } = packValidity(listed.value.valid_days)
     return t(`topUp.${unit}`, { n: formatCount(n, locale.value) }, n)
   })
 
@@ -65,5 +74,5 @@ export function useTopUp() {
     }
   }
 
-  return { pack, loaded, load, price, credits, validity, buy, buying, error }
+  return { listed, pack, loaded, load, price, credits, validity, buy, buying, error }
 }
