@@ -247,7 +247,7 @@ The screens follow the app's design system and its one layout ([web.md](./web.md
 
 ## Roadmap
 
-Every step of the decision of 2026-10-27 is built: the skeleton with *Groups* and *Audit*, *Users* and grants, *Redeem codes*, the *Overview*, *Jobs* and *Usage*, and *Settings*; the deploy script beside them is [deployment.md](./deployment.md) § Release flow. A page added later starts here, docs first: its permission strings in `ALL_PERMISSIONS` when it needs new ones, its place in `CONSOLE_PAGES`, and its routes, refusals and records in the sections above.
+Every step of the decision of 2026-10-27 is built: the skeleton with *Groups* and *Audit*, *Users* and grants, *Redeem codes*, the *Overview*, *Jobs* and *Usage*, and *Settings*. A page added later starts here, docs first: its permission strings in `ALL_PERMISSIONS` when it needs new ones, its place in `CONSOLE_PAGES`, and its routes, refusals and records in the sections above.
 
 ## Acceptance
 
