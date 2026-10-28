@@ -19,6 +19,7 @@ export type ApiErrorType =
   | 'insufficient_credits'
   | 'not_convertible'
   | 'checkout_unavailable'
+  | 'portal_unavailable'
   | 'pay_unavailable'
   | 'plan_required'
   | 'subscription_active'

@@ -703,6 +703,27 @@ async def test_the_portal_needs_a_subscription_of_ones_own(make_client) -> None:
     assert (await bare.post("/api/billing/portal", headers=CSRF_HEADERS)).status_code == 503
 
 
+@respx.mock
+async def test_a_subscription_pay_does_not_hold_has_no_portal(make_client) -> None:
+    """A row written by hand (version 0) has no customer at Pay: Pay's 404 is nothing to
+    manage, never a closed checkout; Pay down is still an outage."""
+    client = make_client(**PAY_SETTINGS)
+    user_id = await _signed_in(client)
+    await grant_plan(client.app.state.sessionmaker, user_id, version=0)
+    portal = respx.post(PORTAL_URL).mock(
+        return_value=httpx.Response(404, json={"error": "No subscription to manage"})
+    )
+
+    refused = await client.post("/api/billing/portal", headers=CSRF_HEADERS)
+    assert refused.status_code == 409
+    assert refused.json()["error"]["type"] == "portal_unavailable"
+
+    portal.mock(return_value=httpx.Response(502))
+    down = await client.post("/api/billing/portal", headers=CSRF_HEADERS)
+    assert down.status_code == 503
+    assert down.json()["error"]["type"] == "pay_unavailable"
+
+
 # --- entitlements -----------------------------------------------------------------------
 
 

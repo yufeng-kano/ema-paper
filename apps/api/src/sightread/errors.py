@@ -24,6 +24,7 @@ ErrorType = Literal[
     "storage_full",
     "not_convertible",
     "checkout_unavailable",
+    "portal_unavailable",
     "plan_required",
     "pay_unavailable",
     "subscription_active",

@@ -115,6 +115,10 @@ export default {
     network: '無法連線到伺服器。',
     signedOut: '登入階段已結束，請重新登入。',
     unexpected: '發生錯誤。',
+    payUnavailable: '無法連上 Kano Pay，請稍後再試。',
+    checkoutUnavailable: '目前無法結帳。',
+    portalUnavailable: 'Kano Pay 沒有這個帳號的訂閱，無法開啟客戶入口。',
+    planRequired: '加購點數只限付費方案。',
   },
   errorPage: {
     notFoundTitle: '找不到頁面',
