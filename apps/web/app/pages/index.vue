@@ -4,8 +4,10 @@
  * § Pages, `/`).
  *
  * One centered column, the way Apple introduces a product: the app icon and name, the hero
- * line and the body line, the sign-in card, then two facts — under the public bar and over
- * the public footer every public page shares (`PublicShell`).
+ * line and the body line, the sign-in card, then what it does in six features and one line
+ * on money — under the public bar and over the public footer every public page shares
+ * (`PublicShell`). No number is typed here: every figure lives in the catalog the pricing
+ * page reads.
  *
  * The Google button is the one prescribed surface: white background, `#dadce0` border, the
  * official four-color mark inlined as SVG (never a remote asset), and Google's own dark
@@ -17,9 +19,20 @@
  * Full-bleed, so the page owns its frame rather than sitting in a layout.
  */
 import { devLogin, isDevLoginAvailable } from '~/lib/api'
+import type { IconName } from '~/lib/icons'
 import { takeAfterSignIn } from '~/lib/settings'
 
 definePageMeta({ layout: false })
+
+/** The six features, in the order a reader meets them, each with its glyph; the words are the catalog's (`login.features`). */
+const FEATURES: { key: string; icon: IconName }[] = [
+  { key: 'text', icon: 'scan-text' },
+  { key: 'translate', icon: 'languages' },
+  { key: 'agent', icon: 'agent' },
+  { key: 'notes', icon: 'notebook-pen' },
+  { key: 'files', icon: 'files' },
+  { key: 'connect', icon: 'connect' },
+]
 
 const { t, locale } = useI18n()
 const localePath = useLocalePath()
@@ -133,18 +146,27 @@ async function signInAsDeveloper() {
         </UiBanner>
       </section>
 
-      <!-- Two facts, not a feature list: what you talk to it with, and whose money pays
-           for the vision calls. -->
-      <dl class="facts">
-        <div class="fact">
-          <dt>{{ t('login.factInterfaces') }}</dt>
-          <dd>{{ t('login.factInterfacesValue') }}</dd>
-        </div>
-        <div class="fact">
-          <dt>{{ t('login.factBilling') }}</dt>
-          <dd>{{ t('login.factBillingValue') }}</dd>
-        </div>
-      </dl>
+      <!-- What it does, in six: a glyph, a bold short title and one sentence each, two to a
+           row — the product page's feature grid. -->
+      <section class="features" :aria-label="t('login.featuresLabel')">
+        <article v-for="feature in FEATURES" :key="feature.key" class="feature">
+          <span class="feature-mark" aria-hidden="true">
+            <UiIcon class="feature-glyph" :name="feature.icon" />
+          </span>
+          <div class="feature-text">
+            <h2 class="feature-title">{{ t(`login.features.${feature.key}.title`) }}</h2>
+            <p class="feature-body">{{ t(`login.features.${feature.key}.body`) }}</p>
+          </div>
+        </article>
+      </section>
+
+      <!-- One line on money and the way to the plans. The figures live in the catalog the
+           pricing page reads: none is typed here. -->
+      <section class="pricing" :aria-label="t('login.pricingTitle')">
+        <h2 class="pricing-title">{{ t('login.pricingTitle') }}</h2>
+        <p class="pricing-body">{{ t('login.pricingBody') }}</p>
+        <NuxtLink class="pricing-link" :to="localePath('/pricing')">{{ t('login.pricingLink') }}</NuxtLink>
+      </section>
     </main>
   </PublicShell>
 </template>
@@ -175,6 +197,10 @@ async function signInAsDeveloper() {
   font-size: var(--display-3xl);
   line-height: 1.08;
   text-wrap: balance;
+  /* The zh-TW line breaks at its comma, not inside a word: CJK runs stay whole unless one
+     alone is wider than the column, when anywhere is better than overflowing. */
+  word-break: keep-all;
+  overflow-wrap: anywhere;
 }
 
 .hero-body {
@@ -264,29 +290,89 @@ async function signInAsDeveloper() {
   margin-top: var(--space-4);
 }
 
-.facts {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: center;
-  gap: var(--space-6) var(--space-14);
-  margin: 0;
+/* The feature grid: two to a row, read left to right, each a glyph beside its words. */
+.features {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-7) var(--space-8);
+  width: 100%;
+  text-align: left;
 }
 
-.fact {
+.feature {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-4);
+}
+
+/* The glyph on a tinted square, as the settings dialog's section marks carry theirs: the
+   accent's one decorative use on this page, and the one that tells six items apart. */
+.feature-mark {
+  display: grid;
+  flex-shrink: 0;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-md);
+  background: var(--accent-tint);
+  color: var(--accent);
+}
+
+.feature-glyph {
+  width: 18px;
+  height: 18px;
+}
+
+.feature-text {
   display: grid;
   gap: var(--space-1);
+  min-width: 0;
 }
 
-.fact dt {
-  color: var(--muted);
-  font-size: var(--text-xs);
-  font-weight: var(--weight-semibold);
-}
-
-.fact dd {
-  margin: 0;
+.feature-title {
   font-size: var(--display-xs);
   font-weight: var(--weight-semibold);
+  line-height: 1.3;
+  text-wrap: balance;
+}
+
+.feature-body {
+  color: var(--muted);
+  font-size: var(--text-base);
+  line-height: 1.5;
+  text-wrap: pretty;
+}
+
+/* One line on money, centered under the grid, with the way to the plans. */
+.pricing {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.pricing-title {
+  font-size: var(--display-sm);
+  font-weight: var(--weight-semibold);
+}
+
+.pricing-body {
+  max-width: 36em;
+  color: var(--muted);
+  font-size: var(--text-base);
+  line-height: 1.55;
+  text-wrap: pretty;
+}
+
+.pricing-link {
+  margin-top: var(--space-1);
+  color: var(--accent);
+  font-size: var(--text-base);
+  font-weight: var(--weight-medium);
+}
+
+.pricing-link:hover {
+  color: var(--accent-hover);
 }
 
 @media (max-width: 640px) {
@@ -305,6 +391,11 @@ async function signInAsDeveloper() {
 
   .card {
     padding: var(--space-6);
+  }
+
+  .features {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-6);
   }
 }
 </style>

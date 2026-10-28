@@ -1,52 +1,55 @@
 /**
  * What search engines read beside the pages (docs/web.md § Search engines): which pages are
- * public, `robots.txt` and the sitemap, the last two prerendered from the public origin the
- * build was given (`WEB_URL`, empty on a local build). Framework-free: nuxt.config.ts, the
- * server routes and a test all read it.
+ * public, where each locale's pages live, `robots.txt` and the sitemap, the last two
+ * prerendered from the public origin the build was given (`WEB_URL`, empty on a local build).
+ * Framework-free: nuxt.config.ts, the server routes and a test all read it.
  */
 
 /**
- * The public pages, as the default locale has them: the landing page (the SEO surface),
+ * The public pages, as paths under a locale's prefix: the sign-in page (the SEO surface),
  * pricing, the rates, and the policy pages Dodo's site review reads (docs/billing.md
  * § Transition, step 6).
  */
 export const PUBLIC_PAGES = ['/', '/pricing', '/rates', '/terms', '/privacy', '/refund'] as const
 
 /**
- * The locales as `hreflang` names them, with the prefix their pages live under — none for the
- * default locale (`prefix_except_default`), which comes first and is the sitemap's `x-default`.
+ * The locales as `hreflang` names them, each with the prefix its pages live under. Every
+ * locale has one (`strategy: 'prefix'`, docs/web.md § Search engines, *The locale in the
+ * URL*): the bare root and any path without a locale redirect to the visitor's language
+ * (nuxt.config.ts, `detectBrowserLanguage`). The default locale comes first — it is the
+ * sitemap's `x-default`, as it is `useLocaleHead`'s on the pages themselves.
  */
 export const PAGE_LOCALES = [
-  { hreflang: 'en', prefix: '' },
+  { hreflang: 'en', prefix: '/en' },
   { hreflang: 'zh-TW', prefix: '/zh-TW' },
 ] as const
 
-/** A public page's path in one locale; a locale's home page is its bare prefix (`/zh-TW`). */
+/** A public page's path in one locale; a locale's home page is its bare prefix (`/en`). */
 function localized(page: string, prefix: string): string {
-  return prefix && page === '/' ? prefix : prefix + page
+  return page === '/' ? prefix : prefix + page
 }
 
 /** Every public page in every locale: what the build prerenders, and what the sitemap lists. */
 export const PUBLIC_PATHS = PUBLIC_PAGES.flatMap((page) => PAGE_LOCALES.map(({ prefix }) => localized(page, prefix)))
 
 /**
- * Kept off every crawler: the authed pages in each locale, the operator console's included
- * (client-rendered shells that send a signed-out visitor to sign in), the sign-in redirect,
- * the data plane, the authorization server and the MCP endpoint. The rest of `/api/` stays
- * open: the pricing and policy pages render from `/api/billing/catalog` and `/api/site`.
+ * The authed pages, client-rendered shells that send a signed-out visitor to sign in — the
+ * operator console's among them. Under every locale: nothing is served without one.
+ */
+const AUTHED_PAGES = ['/files', '/settings', '/admin'] as const
+
+/**
+ * Kept off every crawler: the authed pages in each locale, the sign-in redirect, the data
+ * plane, the authorization server and the MCP endpoint. The rest of `/api/` stays open: the
+ * pricing and policy pages render from `/api/billing/catalog` and `/api/site`.
  */
 export const DISALLOWED_PATHS = [
-  '/files',
-  '/settings',
-  '/admin',
-  '/zh-TW/files',
-  '/zh-TW/settings',
-  '/zh-TW/admin',
+  ...PAGE_LOCALES.flatMap(({ prefix }) => AUTHED_PAGES.map((page) => prefix + page)),
   '/api/auth/',
   '/v1/',
   '/oauth/',
   '/mcp',
-] as const
+]
 
 export function robotsTxt(origin: string): string {
   const lines = ['User-agent: *', ...DISALLOWED_PATHS.map((path) => `Disallow: ${path}`)]

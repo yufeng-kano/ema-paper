@@ -92,6 +92,16 @@ def test_sign_in_returns_to_the_locale_it_started_from() -> None:
     assert settings.web_url_for_locale("ja") == "https://sightread.example/ja"
 
 
+def test_every_locale_of_the_web_app_has_a_prefix_by_default() -> None:
+    """Both of the web app's locales live under a prefix (docs/web.md § Search engines),
+    so an English sign-in returns to `/en`, never to the bare root that redirects by the
+    browser's language."""
+    settings = Settings(web_url="https://sightread.example")
+
+    assert settings.web_url_for_locale("en") == "https://sightread.example/en"
+    assert settings.web_url_for_locale("zh-TW") == "https://sightread.example/zh-TW"
+
+
 def test_an_unlisted_locale_falls_back_to_the_default_root() -> None:
     """The value arrives in a query string, so anything outside the allowlist is ignored
     rather than pasted into the destination — that is what stops it being an open

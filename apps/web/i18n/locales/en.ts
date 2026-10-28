@@ -129,16 +129,43 @@ export default {
     home: 'Back to {name}',
   },
   login: {
-    seoTitle: 'Ema Paper — parse PDFs and images into markdown with figure coordinates',
+    seoTitle: 'Ema Paper — read, translate and ask about papers and PDFs',
     seoDescription:
-      'Hosted vision document parsing. POST a PDF or image, get markdown with figure bounding boxes, then read and talk it through with an agent. Credits per page, the model included. REST API and MCP connector for Claude.',
-    pitchTitle: 'PDFs and images in, markdown with figure coordinates out.',
+      'PDFs and scans become clean text you can read, translate and ask about, with an agent that reads the pages and the web. Free to start, the model included.',
+    pitchTitle: 'Read papers as clean text, with an agent beside you.',
     pitchBody:
-      'Parse documents over REST or a hosted MCP endpoint, then read and talk them through. The model is included: a parse costs a fixed number of credits per page, Free every month, more on Pro.',
-    factInterfaces: 'Interfaces',
-    factInterfacesValue: 'REST · MCP',
-    factBilling: 'Billing',
-    factBillingValue: 'Credits, Free every month',
+      'Upload a PDF or a scan. Every page becomes text you can read, translate and ask about, with your notes beside it and an agent that sees the pages, searches the web and works in your files.',
+    featuresLabel: 'What Ema Paper does',
+    features: {
+      text: {
+        title: 'Clean text from every page',
+        body: 'Columns, tables, formulas and scans, with each figure kept in place.',
+      },
+      translate: {
+        title: 'Translation under each paragraph',
+        body: 'One command, /translate. The original stays above, your language below.',
+      },
+      agent: {
+        title: 'An agent that reads the pages and the web',
+        body: 'Ask about a sentence, a section or the whole paper. It searches the web and the literature, reads links and saves what it finds into your files. On Pro it runs code in a sandbox.',
+      },
+      notes: {
+        title: 'Notes beside the paper',
+        body: 'Excerpts and section links that jump back to the source. Drag an answer in to keep it.',
+      },
+      files: {
+        title: 'Every file, kept',
+        body: 'Upload anything, not only PDFs. Folders, a Trash, and a revision you can undo for every change.',
+      },
+      connect: {
+        title: 'Works with Claude and your scripts',
+        body: 'Add the MCP connector to Claude, or call the REST API: PDFs and images in, markdown with figure coordinates out.',
+      },
+    },
+    pricingTitle: 'Free to start',
+    pricingBody:
+      'Credits every month, the model included: no API key to bring, no card to enter. Pro adds a sandbox, more credits and storage, and top-up packs when you run out.',
+    pricingLink: 'See plans',
     signIn: 'Sign in',
     backToFiles: 'Back to Files',
     lede: 'Continue to your account.',

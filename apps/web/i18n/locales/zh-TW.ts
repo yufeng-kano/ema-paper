@@ -128,16 +128,42 @@ export default {
     home: '回到 {name}',
   },
   login: {
-    seoTitle: 'Ema Paper — 將 PDF 與圖片解析成帶圖表座標的 Markdown',
+    seoTitle: 'Ema Paper — 讀論文、翻譯、提問，PDF 變成乾淨的文字',
     seoDescription:
-      '雲端視覺文件解析服務。上傳 PDF 或圖片，取得含圖表邊界框的 Markdown，再和 agent 一起讀。解析按頁扣點，含模型費用。提供 REST API 與 Claude 可用的 MCP 連接器。',
-    pitchTitle: '送進 PDF 或圖片，取回帶圖表座標的 Markdown。',
+      'PDF 和掃描檔變成能讀、能翻譯、能提問的文字，agent 看得到頁面，也能搜尋網路。免費開始，模型費用已含。',
+    pitchTitle: '把論文讀成乾淨的文字，agent 就在旁邊。',
     pitchBody:
-      '透過 REST 或雲端 MCP 端點解析文件，再接著讀、接著問。模型費用包含在內：解析按頁扣固定點數，每月有免費點數，Pro 更多。',
-    factInterfaces: '介面',
-    factInterfacesValue: 'REST · MCP',
-    factBilling: '計費',
-    factBillingValue: '點數制，每月有免費額度',
+      '上傳 PDF 或掃描檔，每一頁都變成能讀、能翻譯、能提問的文字。筆記在旁邊，agent 看得到頁面、能搜尋網路，也能幫你整理檔案。',
+    featuresLabel: 'Ema Paper 能做什麼',
+    features: {
+      text: {
+        title: '每一頁都變成乾淨的文字',
+        body: '多欄排版、表格、公式、掃描件都行，圖留在原位。',
+      },
+      translate: {
+        title: '譯文接在每段下面',
+        body: '一個指令 /translate。原文在上，譯文在下。',
+      },
+      agent: {
+        title: 'agent 看得到頁面，也看得到網路',
+        body: '問一句、一節或整篇都行。它能搜尋網路和論文、讀連結，把找到的檔案存進你的檔案庫。Pro 還能在沙盒裡執行程式。',
+      },
+      notes: {
+        title: '筆記就在旁邊',
+        body: '摘錄和章節連結，點一下跳回原文。agent 的回答拖過來就能留下。',
+      },
+      files: {
+        title: '每個檔案都留著',
+        body: '什麼檔案都能上傳，不只 PDF。有資料夾、垃圾桶，每次修改都能復原。',
+      },
+      connect: {
+        title: '接得上 Claude 和你的程式',
+        body: '在 Claude 加入 MCP 連接器，或呼叫 REST API：送進 PDF 或圖片，取回帶圖表座標的 Markdown。',
+      },
+    },
+    pricingTitle: '免費開始',
+    pricingBody: '每月都有點數，模型費用已含：不用自備 API 金鑰，也不用綁卡。Pro 有沙盒、更多點數和空間，用完還能加購。',
+    pricingLink: '看方案',
     signIn: '登入',
     backToFiles: '回到檔案',
     lede: '繼續使用你的帳戶。',
