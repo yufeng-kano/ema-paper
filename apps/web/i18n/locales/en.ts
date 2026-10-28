@@ -116,6 +116,10 @@ export default {
     network: 'Could not reach the server.',
     signedOut: 'Your session has ended. Sign in again to continue.',
     unexpected: 'Something went wrong.',
+    payUnavailable: 'Kano Pay could not be reached. Try again in a moment.',
+    checkoutUnavailable: 'Checkout is not available right now.',
+    portalUnavailable: 'Kano Pay has no subscription for this account, so the customer portal cannot open.',
+    planRequired: 'Top-up packs are for paid plans.',
   },
   errorPage: {
     notFoundTitle: 'Page not found',

@@ -455,7 +455,14 @@ async def portal(user: SessionUser, db: DbSession, settings: AppSettings):
         raise ApiError(404, "invalid_request", "No subscription to manage")
     try:
         url = await pay.PayClient(settings).portal(str(user.id))
-    except (pay.PayUnavailable, pay.PayRefused) as exc:
+    except pay.PayRefused as exc:
+        # Pay holds no subscription or customer for the account — a plan written by hand,
+        # not bought: nothing there to manage, and no checkout was asked for.
+        logger.warning("portal of user %d failed: %s", user.id, exc)
+        raise ApiError(
+            409, "portal_unavailable", "The payment service has no subscription to manage"
+        ) from exc
+    except pay.PayUnavailable as exc:
         logger.warning("portal of user %d failed: %s", user.id, exc)
         raise _unavailable(exc) from exc
     return {"url": url}
