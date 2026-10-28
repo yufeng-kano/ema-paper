@@ -130,10 +130,10 @@ export default {
   login: {
     seoTitle: 'Ema Paper — 讀論文、翻譯、提問，PDF 變成乾淨的文字',
     seoDescription:
-      'PDF 和掃描檔變成能讀、能翻譯、能提問的文字，agent 看得到頁面，也能搜尋網路。免費開始，模型費用已含。',
-    pitchTitle: '把論文讀成乾淨的文字，agent 就在旁邊。',
+      'PDF 和掃描檔變成能讀、能翻譯、能提問的文字，Agent 看得到頁面，也能搜尋網路。免費開始，模型費用已含。',
+    pitchTitle: '把論文讀成乾淨的文字，Agent 就在旁邊。',
     pitchBody:
-      '上傳 PDF 或掃描檔，每一頁都變成能讀、能翻譯、能提問的文字。筆記在旁邊，agent 看得到頁面、能搜尋網路，也能幫你整理檔案。',
+      '上傳 PDF 或掃描檔，每一頁都變成能讀、能翻譯、能提問的文字。筆記在旁邊，Agent 看得到頁面、能搜尋網路，也能幫你整理檔案。',
     featuresLabel: 'Ema Paper 能做什麼',
     features: {
       text: {
@@ -145,12 +145,12 @@ export default {
         body: '一個指令 /translate。原文在上，譯文在下。',
       },
       agent: {
-        title: 'agent 看得到頁面，也看得到網路',
+        title: 'Agent 看得到頁面，也看得到網路',
         body: '問一句、一節或整篇都行。它能搜尋網路和論文、讀連結，把找到的檔案存進你的檔案庫。Pro 還能在沙盒裡執行程式。',
       },
       notes: {
         title: '筆記就在旁邊',
-        body: '摘錄和章節連結，點一下跳回原文。agent 的回答拖過來就能留下。',
+        body: '摘錄和章節連結，點一下跳回原文。Agent 的回答拖過來就能留下。',
       },
       files: {
         title: '每個檔案都留著',
@@ -245,7 +245,7 @@ export default {
     skillSlash: '/ 指令',
     skillAuto: '自動',
     skillSlashAria: '{name}：可用 /{name} 呼叫',
-    skillAutoAria: '{name}：agent 可自動使用',
+    skillAutoAria: '{name}：Agent 可自動使用',
     skillEdit: '編輯 {name}',
     skillDialogTitle: 'Skill · {name}',
     skillDialogNew: '新增 skill',
@@ -253,7 +253,7 @@ export default {
     skillArgumentHintPlaceholder: '例如 [頁碼]',
     skillInvocation: '呼叫方式',
     skillSlashSwitch: '可用 /{name} 呼叫',
-    skillAutoSwitch: 'agent 可自動使用',
+    skillAutoSwitch: 'Agent 可自動使用',
     skillBody: '內容',
     skillInsertArguments: '插入 $ARGUMENTS',
     skillDelete: '刪除 skill',
@@ -453,7 +453,7 @@ export default {
     convert: '轉換成文件…',
     convertDialog: {
       title: '轉換成文件',
-      note: '轉換後會成為可以閱讀、標記、對話的文件，仍留在原位置並沿用原檔名。由解析 agent 的模型轉換，每一頁都會扣方案點數，跟上傳時直接轉換一樣。',
+      note: '轉換後會成為可以閱讀、標記、對話的文件，仍留在原位置並沿用原檔名。由解析 Agent 的模型轉換，每一頁都會扣方案點數，跟上傳時直接轉換一樣。',
       submit: '轉換',
     },
     note: {
@@ -540,7 +540,7 @@ export default {
       added: '加入時間',
       location: '位置',
       noPreview: '這種檔案沒有預覽。',
-      agentReads: '在任何對話中，agent 仍然可以讀取它。',
+      agentReads: '在任何對話中，Agent 仍然可以讀取它。',
       textCut: '只顯示檔案開頭的 {size}。',
     },
     fact: {
@@ -580,8 +580,8 @@ export default {
     mathDone: '按 Enter 完成',
     mathDoneDisplay: '按 {keys} 完成',
     resizeNotes: '調整筆記欄寬度',
-    resizeAgent: '調整 agent 欄寬度',
-    changedUnderneath: '文件在另一個分頁或由 agent 修改過，已重新載入。',
+    resizeAgent: '調整 Agent 欄寬度',
+    changedUnderneath: '文件在另一個分頁或由 Agent 修改過，已重新載入。',
     notesLabel: '筆記',
     closeNotes: '關閉筆記',
     notesPlaceholder: '這份文件的筆記',
@@ -729,7 +729,7 @@ export default {
     renameFailed: '無法重新命名對話。{error}',
     moreActions: '「{title}」的更多動作',
     empty: '尚無訊息。',
-    composer: '給 agent 的訊息',
+    composer: '給 Agent 的訊息',
     placeholder: '詢問，或輸入 / 使用指令…',
     argumentsPlaceholder: '參數（可留空）',
     attach: '附加',
@@ -827,6 +827,7 @@ export default {
       papers: '搜尋論文',
       fetch: '讀取網址',
       download: '下載',
+      convert: '轉換',
       tool: '使用',
     },
     stepLines: '第 {from}–{to} 行',
@@ -854,6 +855,7 @@ export default {
       papers: '搜尋論文 {n} 次',
       fetch: '讀取 {n} 個網址',
       download: '下載 {n} 個檔案',
+      convert: '轉換 {n} 個檔案',
       run: '執行 {n} 個指令',
       restart: '重新啟動 shell {n} 次',
       edit: '編輯 {n} 次',
@@ -874,6 +876,7 @@ export default {
       papers: '正在搜尋論文：{target}',
       fetch: '正在讀取 {target}',
       download: '正在下載 {target}',
+      convert: '正在轉換 {target}',
       run: '正在執行 {target}',
       restart: '正在重新啟動 shell',
       edit: '正在編輯 {target}',
@@ -889,7 +892,7 @@ export default {
     subagentReported: '已回報',
     subagentFailed: '失敗',
     subagentInterrupted: '中斷',
-    subagentReport: '回報給主 agent',
+    subagentReport: '回報給主 Agent',
     subagentRunning: '執行中',
     subagentDone: '完成',
     context: {
@@ -1030,7 +1033,7 @@ export default {
     reset: '重設',
     resetTitle: '重設沙盒',
     resetConfirm: '要重設沙盒嗎？已安裝的套件與 shell 狀態會被清除；文件、筆記與歷史都會保留。',
-    notInPlan: '你的方案沒有沙盒：對話 agent 沒有它也能讀、答、翻譯。',
+    notInPlan: '你的方案沒有沙盒：對話 Agent 沒有它也能讀、答、翻譯。',
     unavailable: '這個部署沒有沙盒執行器。',
   },
   credits: {
@@ -1141,7 +1144,7 @@ export default {
     reconvertRow: '重新轉換整份文件',
     chatRow: '對話一輪',
     chatRate: '按 token，依模型費率',
-    webSearchRow: 'agent 搜尋網頁一次，另計於該輪之外',
+    webSearchRow: 'Agent 搜尋網頁一次，另計於該輪之外',
     perCall: '每次 {n}',
     ratesLink: '完整費率',
     ratesTitle: '對話模型',
@@ -1732,7 +1735,7 @@ export default {
       lede: '本條款規範你對 Ema Paper 的使用。登入即表示你同意本條款。',
       s1Title: '服務內容',
       s1Body:
-        '{name} 把 PDF 與圖片轉成帶圖表座標的 Markdown，提供網頁、REST API 與 MCP 連接器三種介面，並讓你用 agent 閱讀、編輯和討論結果。模型由營運者自己的帳戶向供應商取用，你不需要自備金鑰。',
+        '{name} 把 PDF 與圖片轉成帶圖表座標的 Markdown，提供網頁、REST API 與 MCP 連接器三種介面，並讓你用 Agent 閱讀、編輯和討論結果。模型由營運者自己的帳戶向供應商取用，你不需要自備金鑰。',
       s2Title: '你的帳戶',
       s2Body:
         '你以 Google 帳戶登入，一個帳戶對應一個人。帳戶下發生的事由你負責，包括你建立的每把 API 金鑰：請妥善保管，懷疑外洩就撤銷。\n\n濫用服務的帳戶，我們可能停用或關閉：超出方案允許的自動化流量、在你或我們所在地違法的內容，或試圖存取其他使用者的資料或服務背後的主機。',
@@ -1760,9 +1763,9 @@ export default {
       lede: '{name} 保存你的哪些資料、用途、誰會看到，以及如何刪除。',
       s1Title: '我們收集什麼',
       s1Body:
-        '帳戶：登入時 Google 提供的帳戶識別碼、電子郵件、名稱與頭像。\n\n內容：你上傳的檔案、從中解析出的 Markdown 與圖表裁切、你保存的文件、筆記與工作區檔案、你與 agent 的對話，以及它記住的關於你的記憶。\n\n用量：每次模型呼叫的模型、token 數與消耗的點數，連同所屬的解析或對話一起保存，以及每筆點數預扣與結算的紀錄。\n\n訂閱：方案、狀態與週期，以付款服務回報的為準。信用卡與銀行資料在 Dodo Payments 輸入，不會經過我們。\n\n技術紀錄：一個工作階段 cookie，以及記錄請求時間、路徑與結果的伺服器日誌。提示詞、文件與模型回覆一律不寫入日誌。',
+        '帳戶：登入時 Google 提供的帳戶識別碼、電子郵件、名稱與頭像。\n\n內容：你上傳的檔案、從中解析出的 Markdown 與圖表裁切、你保存的文件、筆記與工作區檔案、你與 Agent 的對話，以及它記住的關於你的記憶。\n\n用量：每次模型呼叫的模型、token 數與消耗的點數，連同所屬的解析或對話一起保存，以及每筆點數預扣與結算的紀錄。\n\n訂閱：方案、狀態與週期，以付款服務回報的為準。信用卡與銀行資料在 Dodo Payments 輸入，不會經過我們。\n\n技術紀錄：一個工作階段 cookie，以及記錄請求時間、路徑與結果的伺服器日誌。提示詞、文件與模型回覆一律不寫入日誌。',
       s2Title: '用途',
-      s2Body: '提供服務：解析、保存與顯示你的文件、執行 agent、計算點數、向付費方案收費。維護安全：偵測濫用、排查故障。回覆你的來信。僅此而已：沒有廣告，沒有行為分析，不出售資料。',
+      s2Body: '提供服務：解析、保存與顯示你的文件、執行 Agent、計算點數、向付費方案收費。維護安全：偵測濫用、排查故障。回覆你的來信。僅此而已：沒有廣告，沒有行為分析，不出售資料。',
       s3Title: '誰會收到',
       s3Body:
         '模型供應商：你解析或討論的頁面、文字與訊息，會經營運者自己的 Kano Proxy 帳戶送到執行該模型的供應商，適用該供應商的 API 使用條款。\n\nDodo Payments，經由 Kano Pay，負責結帳、發票、稅務與客戶入口：只會收到你的電子郵件與訂閱資料，不會收到你的文件。\n\nGoogle，負責登入。\n\n除非法律要求，不會提供給其他任何人。\n\n在 {name} 內部：營運者，以及營運者授權使用管理後台的人，看得到帳戶的資料——電子郵件與名稱、方案、點數餘額與來源、儲存用量，以及每次解析的檔名、頁數、狀態與失敗原因，連同模型呼叫的 token 數與費用。他們看不到你的文件、筆記、對話或記憶檔的內容，也沒有人能以你的身分登入。他們在管理後台所做的變更會記在稽核紀錄裡，連同是誰改的與來源 IP 位址；紀錄只保存編號與數量，不保存內容。帳戶刪除後紀錄仍會保留：不含該帳戶的電子郵件與名稱，但仍含它所做變更的 IP 位址。',
@@ -1772,7 +1775,7 @@ export default {
       s5Title: 'Cookie',
       s5Body: '只有一個 cookie，用來維持登入狀態。主題與語言設定存在你的瀏覽器裡。',
       s6Title: '安全',
-      s6Body: '傳輸全程加密。API 金鑰以雜湊儲存。每位使用者的檔案放在各自的目錄，agent 的 shell 在隔離的虛擬機裡執行，只能看到該使用者的檔案。提示詞與模型回覆從設計上就不進日誌。',
+      s6Body: '傳輸全程加密。API 金鑰以雜湊儲存。每位使用者的檔案放在各自的目錄，Agent 的 shell 在隔離的虛擬機裡執行，只能看到該使用者的檔案。提示詞與模型回覆從設計上就不進日誌。',
       s7Title: '你的權利',
       s7Body: '你隨時可以查看並下載你保存在這裡的內容，也可以要求我們更正或刪除。法律賦予你的其他資料權利，在這裡同樣適用；要行使任何一項，請寫信到支援信箱。',
       s8Title: '政策變更',

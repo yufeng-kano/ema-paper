@@ -73,6 +73,10 @@ function inlineContent(segments: InlineSegment[], marks: Mark[] = []): JSONConte
       case 'cite':
         content.push({ type: 'sectionLink', attrs: { src: segment.src, label: segment.label, anchor: segment.anchor } })
         break
+      // A link to the web is an answer's alone; in the notes it is its text.
+      case 'link':
+        content.push(...inlineContent(segment.segments, marks))
+        break
     }
   }
   return content

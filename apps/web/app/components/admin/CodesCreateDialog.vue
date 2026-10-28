@@ -8,7 +8,7 @@
  * request runs.
  */
 import { createAdminCodes, type AdminCodesCreated, type AdminCodesList } from '~/lib/api'
-import { formatRedeemBy } from '~/lib/admin'
+import { formatRedeemBy, planLabel } from '~/lib/admin'
 import { formatCount } from '~/lib/format'
 
 /** The largest number a code's fields hold: the database's integer. */
@@ -98,7 +98,7 @@ const batch = computed(() => {
   return t('admin.codes.batchPlan', {
     count: codesText,
     uses: usesText,
-    grant: t('admin.codes.grantPlan', { n: formatCount(each, locale.value), plan: planId.value }, each),
+    grant: t('admin.codes.grantPlan', { n: formatCount(each, locale.value), plan: planLabel(planId.value) }, each),
     total: t('admin.codes.batchDays', { n: formatCount(total, locale.value) }, total),
   })
 })
@@ -209,7 +209,7 @@ async function submit() {
       <template v-else>
         <UiField v-slot="{ id, describedBy }" :label="t('admin.codes.plan')">
           <UiSelect :id="id" v-model="planId" :described-by="describedBy" :disabled="pending">
-            <option v-for="plan in options.plans" :key="plan" :value="plan">{{ plan }}</option>
+            <option v-for="plan in options.plans" :key="plan" :value="plan">{{ planLabel(plan) }}</option>
           </UiSelect>
         </UiField>
         <UiField v-slot="{ id, describedBy, invalid }" :label="t('admin.codes.days')" :error="numberError(days, daysN, options.max_days)">

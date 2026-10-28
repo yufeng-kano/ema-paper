@@ -131,10 +131,10 @@ export default {
   login: {
     seoTitle: 'Ema Paper — read, translate and ask about papers and PDFs',
     seoDescription:
-      'PDFs and scans become clean text you can read, translate and ask about, with an agent that reads the pages and the web. Free to start, the model included.',
-    pitchTitle: 'Read papers as clean text, with an agent beside you.',
+      'PDFs and scans become clean text you can read, translate and ask about, with an Agent that reads the pages and the web. Free to start, the model included.',
+    pitchTitle: 'Read papers as clean text, with an Agent beside you.',
     pitchBody:
-      'Upload a PDF or a scan. Every page becomes text you can read, translate and ask about, with your notes beside it and an agent that sees the pages, searches the web and works in your files.',
+      'Upload a PDF or a scan. Every page becomes text you can read, translate and ask about, with your notes beside it and an Agent that sees the pages, searches the web and works in your files.',
     featuresLabel: 'What Ema Paper does',
     features: {
       text: {
@@ -146,7 +146,7 @@ export default {
         body: 'One command, /translate. The original stays above, your language below.',
       },
       agent: {
-        title: 'An agent that reads the pages and the web',
+        title: 'An Agent that reads the pages and the web',
         body: 'Ask about a sentence, a section or the whole paper. It searches the web and the literature, reads links and saves what it finds into your files. On Pro it runs code in a sandbox.',
       },
       notes: {
@@ -248,7 +248,7 @@ export default {
     skillSlash: '/ command',
     skillAuto: 'Auto',
     skillSlashAria: '{name}: can be run as /{name}',
-    skillAutoAria: '{name}: the agent may use it on its own',
+    skillAutoAria: '{name}: the Agent may use it on its own',
     skillEdit: 'Edit {name}',
     skillDialogTitle: 'Skill · {name}',
     skillDialogNew: 'New skill',
@@ -256,7 +256,7 @@ export default {
     skillArgumentHintPlaceholder: 'e.g. [pages]',
     skillInvocation: 'How it runs',
     skillSlashSwitch: 'Can be run as /{name}',
-    skillAutoSwitch: 'The agent may use it on its own',
+    skillAutoSwitch: 'The Agent may use it on its own',
     skillBody: 'Instructions',
     skillInsertArguments: 'Insert $ARGUMENTS',
     skillDelete: 'Delete skill',
@@ -279,11 +279,11 @@ export default {
     subagentDelete: 'Delete subagent',
     subagentDeleteConfirm: 'Delete the subagent “{name}”?',
     instructions: {
-      label: 'Instructions for the agent',
+      label: 'Instructions for the Agent',
       description:
         'Added after the default prompt in every conversation. Write about your background, how you want to be answered and how you translate.',
       placeholder: 'For example: conclusion first, then the details. I read machine-learning papers.',
-      receives: 'What the agent receives',
+      receives: 'What the Agent receives',
       count: '{count} / {max}',
       answerLanguage: 'Answer language',
       translateLanguage: 'Translate into',
@@ -294,7 +294,7 @@ export default {
         'A replaced prompt sends none of the default’s tool notes, document-format rules or safety rules. You answer for those yourself.',
     },
     receives: {
-      title: 'What the agent receives',
+      title: 'What the Agent receives',
       defaultPrompt: 'Default prompt',
       ownPrompt: 'Your prompt',
       preset: 'Prompt saved in an earlier version',
@@ -317,9 +317,9 @@ export default {
     },
     memory: {
       label: 'Memory',
-      auto: 'Let the agent remember on its own',
+      auto: 'Let the Agent remember on its own',
       description:
-        'The agent keeps your preferences, terms and corrections for later conversations. You can change or delete each one.',
+        'The Agent keeps your preferences, terms and corrections for later conversations. You can change or delete each one.',
       paused: 'Paused. Your memories are kept but not used.',
       filterGroup: 'Filter memories',
       filters: { all: 'All', term: 'Terms', preference: 'Preferences', about: 'About you', document: 'Documents' },
@@ -338,14 +338,14 @@ export default {
       edit: 'Edit “{text}”',
       delete: 'Delete “{text}”',
       deleteTitle: 'Delete memory',
-      deleteConfirm: 'Delete “{text}” from memory? The agent will no longer see it.',
+      deleteConfirm: 'Delete “{text}” from memory? The Agent will no longer see it.',
       textLabel: 'Memory',
       kindLabel: 'Kind',
       scopeLabel: 'Applies to',
       count: '{count} / {max}',
       translateNote: '{command} reads the terms and never changes memory.',
       referenceNote:
-        'Deleting a conversation keeps what was saved from it. Memory is a reference for the agent, not a guarantee.',
+        'Deleting a conversation keeps what was saved from it. Memory is a reference for the Agent, not a guarantee.',
       pause: 'Pause memory',
       resume: 'Resume memory',
       clear: 'Clear all memories',
@@ -354,8 +354,8 @@ export default {
     memoryFile: {
       label: 'Memory file',
       description:
-        'memory.md is the notes the agent keeps across conversations. The agent writes it on its own; a save here reaches new conversations and compacted ones.',
-      placeholder: 'Nothing yet. The agent adds notes as it works.',
+        'memory.md is the notes the Agent keeps across conversations. The Agent writes it on its own; a save here reaches new conversations and compacted ones.',
+      placeholder: 'Nothing yet. The Agent adds notes as it works.',
       count: '{count} / {max}',
     },
     idleCompact: {
@@ -464,7 +464,7 @@ export default {
     convert: 'Convert to document…',
     convertDialog: {
       title: 'Convert to document',
-      note: 'It becomes a document you can read, mark and talk to, and stays here under its name. The parse agent’s model converts it, and each page costs your plan’s credits, as an upload converted on arrival does.',
+      note: 'It becomes a document you can read, mark and talk to, and stays here under its name. The parse Agent’s model converts it, and each page costs your plan’s credits, as an upload converted on arrival does.',
       submit: 'Convert',
     },
     note: {
@@ -491,7 +491,7 @@ export default {
     reconvertDialog: {
       title: 'Re-convert',
       model: 'Model',
-      note: 'The original is converted again on this model, with the parse agent’s prompt and the format check, as an upload would be. The version you have stays open until the new one is ready, then is replaced. Edits made meanwhile are replaced too and stay in the document’s revisions; the notes stay.',
+      note: 'The original is converted again on this model, with the parse Agent’s prompt and the format check, as an upload would be. The version you have stays open until the new one is ready, then is replaced. Edits made meanwhile are replaced too and stay in the document’s revisions; the notes stay.',
       submit: 'Re-convert',
     },
     retry: {
@@ -554,7 +554,7 @@ export default {
       added: 'Date added',
       location: 'Location',
       noPreview: 'There is no preview for this kind of file.',
-      agentReads: 'The agent can still read it in any conversation.',
+      agentReads: 'The Agent can still read it in any conversation.',
       textCut: 'The first {size} of the file.',
     },
     fact: {
@@ -594,8 +594,8 @@ export default {
     mathDone: 'Enter to finish',
     mathDoneDisplay: '{keys} to finish',
     resizeNotes: 'Resize notes',
-    resizeAgent: 'Resize agent',
-    changedUnderneath: 'The document changed underneath you — another tab or the agent. Reloaded.',
+    resizeAgent: 'Resize Agent',
+    changedUnderneath: 'The document changed underneath you — another tab or the Agent. Reloaded.',
     notesLabel: 'Notes',
     closeNotes: 'Close notes',
     notesPlaceholder: 'Notes for this document',
@@ -619,12 +619,12 @@ export default {
         excerpt: 'Excerpt',
       },
       ask: {
-        paragraph: 'Ask the agent about this paragraph',
-        section: 'Ask the agent about this section',
-        formula: 'Ask the agent about this formula',
-        block: 'Ask the agent about this block',
-        blocks: 'Ask the agent about these blocks',
-        excerpt: 'Ask the agent about this excerpt',
+        paragraph: 'Ask the Agent about this paragraph',
+        section: 'Ask the Agent about this section',
+        formula: 'Ask the Agent about this formula',
+        block: 'Ask the Agent about this block',
+        blocks: 'Ask the Agent about these blocks',
+        excerpt: 'Ask the Agent about this excerpt',
       },
       translate: {
         paragraph: 'Translate this paragraph',
@@ -676,7 +676,7 @@ export default {
       title: 'Outline',
       button: 'Outline',
       translate: 'Translate this section',
-      addContext: 'Add to the agent’s context',
+      addContext: 'Add to the Agent’s context',
     },
     back: {
       heading: 'Back to “{heading}”',
@@ -707,7 +707,7 @@ export default {
     },
     toolbar: {
       label: 'Selection actions',
-      ask: 'Ask the agent',
+      ask: 'Ask the Agent',
       quote: 'Quote in notes',
       copy: 'Copy',
       skills: 'Run a skill on the selection',
@@ -725,7 +725,7 @@ export default {
   },
   chat: {
     panel: 'Agent',
-    closePanel: 'Close agent',
+    closePanel: 'Close Agent',
     block: {
       handle: 'Answer block: {name}',
       menu: 'Answer block',
@@ -743,7 +743,7 @@ export default {
     renameFailed: 'Could not rename the conversation. {error}',
     moreActions: 'More actions for “{title}”',
     empty: 'No messages yet.',
-    composer: 'Message to the agent',
+    composer: 'Message to the Agent',
     placeholder: 'Ask, or type / for a command…',
     argumentsPlaceholder: 'Arguments (optional)',
     attach: 'Attach',
@@ -842,6 +842,7 @@ export default {
       papers: 'Search papers',
       fetch: 'Read URL',
       download: 'Download',
+      convert: 'Convert',
       tool: 'Use',
     },
     stepLines: 'lines {from}–{to}',
@@ -869,6 +870,7 @@ export default {
       papers: 'searched papers once | searched papers {n} times',
       fetch: 'read a URL | read {n} URLs',
       download: 'downloaded a file | downloaded {n} files',
+      convert: 'converted a file | converted {n} files',
       run: 'ran a command | ran {n} commands',
       restart: 'restarted the shell | restarted the shell {n} times',
       edit: 'edited once | edited {n} times',
@@ -889,6 +891,7 @@ export default {
       papers: 'Searching papers for {target}',
       fetch: 'Reading {target}',
       download: 'Downloading {target}',
+      convert: 'Converting {target}',
       run: 'Running {target}',
       restart: 'Restarting the shell',
       edit: 'Editing {target}',
@@ -904,7 +907,7 @@ export default {
     subagentReported: 'reported back',
     subagentFailed: 'failed',
     subagentInterrupted: 'interrupted',
-    subagentReport: 'Report to the agent',
+    subagentReport: 'Report to the Agent',
     subagentRunning: 'Running',
     subagentDone: 'Done',
     context: {
@@ -1049,7 +1052,7 @@ export default {
     resetTitle: 'Reset the sandbox',
     resetConfirm:
       'Reset the sandbox? Installed packages and shell state are cleared. Documents, notes and history stay.',
-    notInPlan: 'Your plan has no sandbox: the chat agent reads, answers and translates without one.',
+    notInPlan: 'Your plan has no sandbox: the chat Agent reads, answers and translates without one.',
     unavailable: 'This deployment has no sandbox runner.',
   },
   credits: {
@@ -1162,7 +1165,7 @@ export default {
     reconvertRow: 'Re-converting a document',
     chatRow: 'A chat turn',
     chatRate: 'Its tokens, by the model’s rate',
-    webSearchRow: 'A web search by the agent, on top of the turn',
+    webSearchRow: 'A web search by the Agent, on top of the turn',
     perCall: '{n} per search',
     ratesLink: 'All rates',
     ratesTitle: 'Chat models',
@@ -1509,7 +1512,7 @@ export default {
         CHECK_MODEL: 'Checks each parse’s format. Empty uses the parse model.',
         PARSE_FALLBACK_MODEL: 'Where a blocked page goes. Empty means no fallback.',
         MODEL_PRICES_JSON:
-          'US$ per 1M tokens, in the order the chat agent offers the models; the first is the default.',
+          'US$ per 1M tokens, in the order the chat Agent offers the models; the first is the default.',
         CREDIT_USD: '1 credit is {usd} of model cost.',
         PARSE_CREDITS_PER_PAGE: 'Reserved when a parse is queued, given back if it fails.',
         CHAT_MIN_CREDITS: 'A chat message is refused below this balance.',
@@ -1574,7 +1577,7 @@ export default {
         conversations:
           '{n} conversation fails at its next message until it moves to another model | {n} conversations fail at their next message until they move to another model',
         chat_settings:
-          '{n} account’s chat agent is set to a removed model | {n} accounts’ chat agents are set to a removed model',
+          '{n} account’s chat Agent is set to a removed model | {n} accounts’ chat Agents are set to a removed model',
         subagents: '{n} subagent names a removed model | {n} subagents name a removed model',
         subscriptions: '{n} subscription falls to Free at once | {n} subscriptions fall to Free at once',
         day_banks:
@@ -1771,7 +1774,7 @@ export default {
       lede: 'These terms govern your use of Ema Paper. By signing in you accept them.',
       s1Title: 'The service',
       s1Body:
-        "{name} turns PDFs and images into markdown with figure coordinates, over the web app, a REST API and an MCP connector, and lets you read, edit and discuss the result with an agent. The models that do the work run on the operator's own account with its providers; you bring no key.",
+        "{name} turns PDFs and images into markdown with figure coordinates, over the web app, a REST API and an MCP connector, and lets you read, edit and discuss the result with an Agent. The models that do the work run on the operator's own account with its providers; you bring no key.",
       s2Title: 'Your account',
       s2Body:
         "You sign in with a Google account, and one account is one person. You are responsible for what happens under it, including every API key you create: keep those keys to yourself, and revoke one you think is exposed.\n\nWe may suspend or close an account that abuses the service: automated traffic beyond what its plan allows, content that is illegal where you or we are, or attempts to reach another user's data or the machines behind the service.",
@@ -1801,10 +1804,10 @@ export default {
       lede: 'What {name} keeps about you, why, who else sees it, and how to have it removed.',
       s1Title: 'What we collect',
       s1Body:
-        "Your account: the Google account's identifier, email address, name and picture, as Google gives them at sign-in.\n\nYour content: the files you upload, the markdown and figure crops parsed from them, the documents, notes and workspace files you keep, your conversations with the agent, and the memories it keeps of you.\n\nYour usage: for every model call, the model, the token counts and the credits it cost, kept with the parse or conversation it belongs to, and the record of each credit reserved and spent.\n\nYour subscription: its plan, state and period, as the payment service reports them. Card and bank details are entered at Dodo Payments and never reach us.\n\nTechnical records: one session cookie, and server logs with the time, route and outcome of requests. Prompts, documents and model answers are never written to a log.",
+        "Your account: the Google account's identifier, email address, name and picture, as Google gives them at sign-in.\n\nYour content: the files you upload, the markdown and figure crops parsed from them, the documents, notes and workspace files you keep, your conversations with the Agent, and the memories it keeps of you.\n\nYour usage: for every model call, the model, the token counts and the credits it cost, kept with the parse or conversation it belongs to, and the record of each credit reserved and spent.\n\nYour subscription: its plan, state and period, as the payment service reports them. Card and bank details are entered at Dodo Payments and never reach us.\n\nTechnical records: one session cookie, and server logs with the time, route and outcome of requests. Prompts, documents and model answers are never written to a log.",
       s2Title: 'What we use it for',
       s2Body:
-        'To run the service: parse, store and show your documents, run the agent, meter your credits and bill a paid plan. To keep the service safe: spot abuse and resolve failures. To answer you when you write to us. Nothing else: no advertising, no profiling, no sale of data.',
+        'To run the service: parse, store and show your documents, run the Agent, meter your credits and bill a paid plan. To keep the service safe: spot abuse and resolve failures. To answer you when you write to us. Nothing else: no advertising, no profiling, no sale of data.',
       s3Title: 'Who else receives it',
       s3Body:
         "The model providers: the pages, text and messages you parse or discuss are sent to the provider of the model that runs, through the operator's own Kano Proxy account, under that provider's terms for API use.\n\nDodo Payments, through Kano Pay, for checkout, invoices, tax and the customer portal: your email address and the subscription, never your documents.\n\nGoogle, for sign-in.\n\nNo one else, except where the law requires it.\n\nWithin {name}: the operator, and the people the operator gives access to its admin console, can see an account’s details — the email address and name, the plan, credit balances and where they came from, storage used, and for each parse its file name, page count, status and any failure reason, with the tokens and cost of its model calls. They cannot see what your documents, notes, conversations or memory file say, and no one can sign in as you. What they change in the console is recorded in an audit log, with who made the change and the IP address it came from; its records keep ids and amounts, never content. They stay after an account is deleted: without its email address or name, but with the IP addresses of the changes it made.",
@@ -1815,7 +1818,7 @@ export default {
       s5Body: 'One cookie, for the session that keeps you signed in. Your theme and language choices are stored in your browser.',
       s6Title: 'Security',
       s6Body:
-        "Transport is encrypted. API keys are stored hashed. Each user's files live in their own directory, and the agent's shell runs in an isolated virtual machine over that user's files only. Prompts and completions are kept out of logs by design.",
+        "Transport is encrypted. API keys are stored hashed. Each user's files live in their own directory, and the Agent's shell runs in an isolated virtual machine over that user's files only. Prompts and completions are kept out of logs by design.",
       s7Title: 'Your rights',
       s7Body:
         'You can see and download what you keep here at any time, and ask us to correct or delete it. Where the law gives you further rights over your data, you have them here too; write to the support address to exercise any of them.',

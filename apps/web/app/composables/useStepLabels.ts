@@ -20,6 +20,7 @@ const ICONS: Record<StepKind, IconName> = {
   papers: 'book-open',
   fetch: 'link',
   download: 'arrow-down',
+  convert: 'scan-text',
   tool: 'terminal',
 }
 

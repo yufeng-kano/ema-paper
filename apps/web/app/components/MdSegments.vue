@@ -11,7 +11,8 @@
  * whose click the agent panel takes from its thread; a link whose heading `cite` says the
  * document no longer has reads as the heading's plain text. Both keep the link in
  * `data-src`, so copying or replying to the answer keeps its markdown (docs/web.md § The
- * agent panel, *Section links*).
+ * agent panel, *Section links*). An answer's link to the web (read only with `links`) is an
+ * `<a>` that opens in a new tab, its markdown in `data-src` the same way (*Links*).
  *
  * Math is typeset by KaTeX; `v-html` is safe here because KaTeX escapes its input and
  * `trust` is off (app/lib/math.ts). TeX KaTeX cannot parse renders as its `$…$` source.
@@ -65,6 +66,14 @@ const rendered = computed(() =>
       segment.text
     }}</code>
     <br v-else-if="segment.kind === 'br'" :data-src="segment.src">
+    <a
+      v-else-if="segment.kind === 'link'"
+      class="md-link"
+      :href="segment.href"
+      target="_blank"
+      rel="noopener noreferrer"
+      :data-src="segment.src"
+    ><MdSegments :segments="segment.segments" /></a>
     <button
       v-else-if="segment.kind === 'cite' && cite?.(segment.label, segment.anchor)"
       type="button"
@@ -85,6 +94,23 @@ const rendered = computed(() =>
 </template>
 
 <style scoped>
+/* A link to the web in an answer: the accent, underlined, so it reads as a link in a line of
+   prose; a long address breaks wherever it must rather than widening the column (docs/web.md
+   § The agent panel, *Links*). */
+.md-link {
+  color: var(--accent);
+  text-decoration: underline;
+  text-decoration-color: var(--accent-tint);
+  text-underline-offset: 2px;
+  overflow-wrap: anywhere;
+  transition: color var(--duration-fast) var(--ease);
+}
+
+.md-link:hover {
+  color: var(--accent-hover);
+  text-decoration-color: currentColor;
+}
+
 /* A section link: a small chip in the line, on the rail surface — the heading, after a
    locate glyph (docs/web.md § The agent panel, *Section links*). */
 .md-cite {

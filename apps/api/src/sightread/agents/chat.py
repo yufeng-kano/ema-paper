@@ -15,7 +15,7 @@ from .parse import BBOX_FORMAT_YXYX
 
 # Bumped when the prompt or the tool contract changes what a conversation does. Chat has
 # no dedup cache; the number is bookkeeping for the registry (docs/agents.md).
-PIPELINE_VERSION = 9  # 8: markdown documents, which have no parse; 9: inserted images
+PIPELINE_VERSION = 10  # 9: inserted images; 10: convert_file, figures linked to their block
 
 # Anthropic-defined tools carry no schema of their own (docs/chat.md § Tools). The order
 # is part of the cache prefix and never changes. The custom tools are strict: their schemas
@@ -225,6 +225,41 @@ WEB_TOOLS: tuple[dict, ...] = (
     DOWNLOAD_FILE_TOOL,
 )
 WEB_TOOL_NAMES: tuple[str, ...] = tuple(tool["name"] for tool in WEB_TOOLS)
+# A kept PDF or image converted into a document inside the turn, as the Files page's
+# *Convert to document…* converts one (docs/chat.md § Tools, *A conversion runs inside the
+# turn*). Declared last, after the web tools, and only where the deployment names a parse
+# model; a write of the turn, never a subagent's.
+CONVERT_FILE_TOOL = {
+    "name": "convert_file",
+    "description": (
+        "Convert a PDF or an image kept in the user's files into a document — markdown "
+        "with page markers and figure placeholders, as the Files page converts one — and "
+        "wait for it. `path` is the file's place in the library: its folders, then its "
+        "name, as in 'Papers/2017/attention.pdf'. Answers the document's doc.md path, to "
+        "read with str_replace_based_edit_tool. Costs the user credits per page; nothing "
+        "when the same file was converted before. The way to read another paper: "
+        "download_file it, convert_file it, read its doc.md. Never extract a PDF's text "
+        "in the shell or with Python instead."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "The file's folders and name under the user's files",
+            }
+        },
+        "required": ["path"],
+        "additionalProperties": False,
+    },
+    "strict": True,
+}
+
+
+def convert_tools(*, parse: bool) -> tuple[dict, ...]:
+    """`convert_file`, where the deployment can parse: a tool the harness cannot run is
+    not declared (docs/chat.md § Tools)."""
+    return (CONVERT_FILE_TOOL,) if parse else ()
 
 
 def web_tools(*, enabled: bool, brave: bool, openalex: bool) -> tuple[dict, ...]:
@@ -369,7 +404,8 @@ doc.md keeps these shapes; never remove or reorder them unless asked:
 - web_search: the web, ten results with their URLs. Costs the user credits per call: search when the answer needs what the document does not hold or what is newer than it, with one well-phrased query rather than several guesses, and never for what the document itself answers. Say where each fact came from, with its URL.
 - search_papers: scholarly works by relevance, with DOI, citations and an open-access PDF URL where there is one. Free. Search by what the user is after, not by a title you guessed.
 - read_url: one page or PDF as text. Read a page before relying on a search snippet.
-- download_file: keep one URL as a file of the user's — only when the user asked for the paper or the file to be kept — into the folder they named, else the one this document sits in. Then say what was kept and where, as "your file NAME", never a path.
+- download_file: keep one URL as a file of the user's — when the user asked for the paper or the file to be kept, or for another paper to be read — into the folder they named, else the one this document sits in. Then say what was kept and where, as "your file NAME", never a path.
+- convert_file: convert a PDF or an image of the user's files into a document, as the Files page converts one: `path` is the file's folders and name, "Papers/2017/attention.pdf". It waits for the parse and answers the document's doc.md path, which you read with str_replace_based_edit_tool. It costs the user credits per page (nothing when the same file was converted before), so say so before converting a long paper, and convert only what the user asked for or clearly needs. To read another paper: download_file it, convert_file it, then read its doc.md. Never extract a PDF's text in the shell (pdftotext, Python) instead; read_url is for a quick look at a page, not for reading a paper. Afterwards the paper is "your document NAME", never a path.
 
 # How to work
 
@@ -396,7 +432,9 @@ Before the first tool call of a turn, state in one line what you are about to do
 
 The user's view of the document has no page numbers and no way to go to a page; they find a place with search. So name a place by the section heading it is under, or quote its first few words — a page number only beside one of those, never alone.
 
-When you point the user to a section, write its heading as a link: the heading's text exactly as the document has it, linked to its GitHub-style anchor, as in [3.2 Attention](#32-attention). Their view turns it into a button that scrolls the document there. Their notes draw the same link the same way: an excerpt the user quoted into notes.md is a `>` quote followed by a paragraph holding only its section's link, under `## Excerpts` or `## 摘錄`. So in notes they ask you to write, link a section the same way, and give a passage you quote there that same shape; their view then finds it in the document and marks it like their own. Link nothing else that way.
+When you point the user to a section, write its heading as a link: the heading's text exactly as the document has it, linked to its GitHub-style anchor, as in [3.2 Attention](#32-attention). Their view turns it into a button that scrolls the document there. Their notes draw the same link the same way: an excerpt the user quoted into notes.md is a `>` quote followed by a paragraph holding only its section's link, under `## Excerpts` or `## 摘錄`. So in notes they ask you to write, link a section the same way, and give a passage you quote there that same shape; their view then finds it in the document and marks it like their own.
+
+Whenever you use a figure of the document — you opened its crop with view_figure, or your answer or the notes you write rest on it — link it the same way: the caption's first words as the text, linked to the figure's block anchor — the GitHub-style anchor of the section heading it sits under, then `~`, then the caption's first words — as in [Figure 3: Overview of the method](#3-method~Figure 3: Overview of the method). Their view turns it into a button that scrolls to the figure. A figure with no caption is linked by its section alone. Link nothing else that way. A web address is an ordinary markdown link, [title](https://…), which their view draws as a link.
 
 Each message ends with a context block naming the document's current revision, the reader's locale and any language the user chose, with its rule. Answer in the reader's locale unless the block names an answer language. A revision that changed since your last look at the file means it was edited meanwhile; read it again before you rely on what you saw.
 """
@@ -418,7 +456,7 @@ _TOKEN_RE = re.compile("|".join(re.escape(token) for token in PROMPT_TOKENS))
 # of a tool it lacks.
 _TOOL_LINE_RE = re.compile(
     r"^- (bash|str_replace_based_edit_tool|view_page|view_figure|memory"
-    r"|web_search|search_papers|read_url|download_file):"
+    r"|web_search|search_papers|read_url|download_file|convert_file):"
 )
 
 

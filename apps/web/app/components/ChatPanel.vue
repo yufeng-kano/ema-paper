@@ -60,6 +60,9 @@ import {
   findHeading,
   inlinePlain,
   parseResultMarkdown,
+  placedBlocks,
+  readBlockAnchor,
+  resolveAnchor,
   sectionSource,
   type CiteResolver,
   type OutlineEntry,
@@ -104,8 +107,9 @@ const props = defineProps<{
 const emit = defineEmits<{
   /** The document's files changed on disk — an edit landed, or a revert — so reload them. */
   changed: []
-  /** The agent kept a file in Files — a `download_file` result that was not an error — so
-   *  the library behind the viewer reads itself again. */
+  /** The agent kept a file in Files, or made one a document — a `download_file` or a
+   *  `convert_file` result that was not an error — so the library behind the viewer reads
+   *  itself again. */
   filed: []
   /** An answer's section link was clicked: scroll the document to that heading. */
   locate: [target: { label: string; anchor: string }]
@@ -441,11 +445,18 @@ onMounted(loadConversations)
 // --- the document's sections ----------------------------------------------------------
 
 const outline = computed(() => documentOutline(props.documentPages()))
+/** The document's blocks in reading order, kept with the outline: what a block link's chip
+ *  is resolved against on every render (docs/web.md § The agent panel, *Links*). */
+const placed = computed(() => placedBlocks(props.documentPages()))
 
-/** Whether an answer's section link leads to a heading the document still has: one that
- *  does is a chip, one that does not reads as its plain text (docs/web.md § The agent
- *  panel, *Section links*). Read as the answer renders, so it follows the document. */
-const resolveCite: CiteResolver = (label, anchor) => findHeading(outline.value, label, anchor) !== null
+/** Whether an answer's section link leads to a heading the document still has — or its
+ *  block link, one with `~` in its anchor, to a block (docs/web.md § The agent panel,
+ *  *Section links*, *Links*): one that does is a chip, one that does not reads as its plain
+ *  text. Read as the answer renders, so it follows the document. */
+const resolveCite: CiteResolver = (label, anchor) =>
+  anchor.includes('~')
+    ? resolveAnchor(props.documentPages(), readBlockAnchor(anchor), outline.value, placed.value) !== null
+    : findHeading(outline.value, label, anchor) !== null
 
 function currentSectionEntry(): OutlineEntry | null {
   const at = props.currentSection()
@@ -648,9 +659,9 @@ let flushTimer: ReturnType<typeof setTimeout> | null = null
  *  the viewer must reload. Decided as the frame arrives — an `edit` and the `turn_done`
  *  behind it can share a batch, by which time the stream no longer counts as active. */
 let liveEdit = false
-/** A `download_file` result that kept a file arrived since the last flush: the Files page
- *  behind the viewer must read its library again. A replayed one asks for a read too —
- *  one request, never wrong. */
+/** A `download_file` result that kept a file, or a `convert_file` result that made one a
+ *  document, arrived since the last flush: the Files page behind the viewer must read its
+ *  library again. A replayed one asks for a read too — one request, never wrong. */
 let filed = false
 
 /** Forget every frame, shown or still queued: the thread they belong to is gone. */
@@ -720,7 +731,7 @@ const stream = useConversationStream(
     }
     if (
       frame.event.event === 'tool_result' &&
-      frame.event.name === 'download_file' &&
+      (frame.event.name === 'download_file' || frame.event.name === 'convert_file') &&
       !frame.event.is_error
     ) {
       filed = true
@@ -1827,12 +1838,13 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
-        <!-- An answer: its section links are chips that scroll the document there. -->
+        <!-- An answer: its section links are chips that scroll the document there, and its
+             links to the web are links. -->
         <div v-else-if="item.kind === 'text'" class="assistant md-message md-side" :class="{ dimmed: position < thread.dimBefore }">
           <template v-for="(block, index) in messageBlocks(item.text)" :key="index">
             <!-- A comment draws nothing, and takes no wrapper that would count as a block. -->
             <div v-if="block.kind !== 'comment'" class="answer-block" :data-answer-block="`${item.key}:${index}`">
-              <MdBlock :block="block" :cite="resolveCite" />
+              <MdBlock :block="block" :cite="resolveCite" links />
               <!-- After the block, so a heading stays its wrapper's first child. -->
               <div
                 v-if="handleShown(`${item.key}:${index}`)"
@@ -1955,7 +1967,7 @@ onBeforeUnmount(() => {
           </span>
           <div v-if="summaryOpen.has(item.key)" class="compact-summary md-message md-side">
             <template v-for="(block, blockIndex) in messageBlocks(item.summary)" :key="blockIndex">
-              <MdBlock v-if="block.kind !== 'comment'" :block="block" :cite="resolveCite" />
+              <MdBlock v-if="block.kind !== 'comment'" :block="block" :cite="resolveCite" links />
             </template>
           </div>
         </div>

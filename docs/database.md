@@ -254,7 +254,7 @@ chat_events      id PK, conversation_id FK, turn_id FK, seq, event, data JSONB,
                  -- and tails it (chat.md § Conversations, turns, events)
 chat_tool_calls  id PK, user_id FK, turn_id FK chat_turns ON DELETE SET NULL, NULL,
                  tool, created_at
-                 INDEX (tool, created_at)                  -- the deployment's per-day caps
+                 INDEX (tool, created_at)                  -- the deployment's per-day caps; `tool` a web tool's name, or convert_file
                  INDEX (user_id, tool, created_at)         -- a user's per-day cap
                  INDEX (turn_id)                           -- the turn's settlement
                  -- one row per web tool call that was answered or kept a file —

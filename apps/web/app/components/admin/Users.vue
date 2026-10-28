@@ -20,7 +20,7 @@ import {
   type AdminUserDetail,
   type AdminUsersResponse,
 } from '~/lib/api'
-import { adminFailure, canManageMembers, idOf, pageOf } from '~/lib/admin'
+import { adminFailure, canManageMembers, idOf, pageOf, planLabel } from '~/lib/admin'
 import { formatBytes, formatCount, formatDate } from '~/lib/format'
 import type { TableColumn } from '~/lib/table'
 
@@ -148,19 +148,19 @@ const filtered = computed(() => plan.value !== null || q.value !== '')
 const headline = computed(() => {
   const all = t('admin.users.count', { n: formatCount(accounts.value, locale.value) }, accounts.value)
   const onPlans = paidPlans.value.map((entry) =>
-    t('admin.users.onPlan', { n: formatCount(entry.accounts, locale.value), plan: entry.id }),
+    t('admin.users.onPlan', { n: formatCount(entry.accounts, locale.value), plan: planLabel(entry.id) }),
   )
   return [all, ...onPlans].join(' · ')
 })
 
 function planName(id: string): string {
-  return id === FREE_PLAN ? t('admin.users.free') : id
+  return id === FREE_PLAN ? t('admin.users.free') : planLabel(id)
 }
 
-/** The plan, and what pays for its period: *Free*, or *pro · Subscription*. */
+/** The plan, and what pays for its period: *Free*, or *Pro · Subscription*. */
 function planLine(row: { id: string; source: string }): string {
   return row.source === 'subscription' || row.source === 'grant'
-    ? `${row.id} · ${t(`admin.users.paidBy.${row.source}`)}`
+    ? `${planLabel(row.id)} · ${t(`admin.users.paidBy.${row.source}`)}`
     : planName(row.id)
 }
 
