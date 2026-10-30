@@ -782,6 +782,41 @@ async def test_a_vm_on_the_network_that_keeps_ipv6_is_never_used(tmp_path, monke
     assert sandbox.started_at is None
 
 
+# One line of /proc/net/if_inet6 as the kernel writes it: ::1 on lo.
+IF_INET6_LINE = "00000000000000000000000000000001 01 80 10 80       lo\n"
+
+
+@pytest.mark.parametrize(
+    ("content", "passes"),
+    [(None, True), ("", True), (IF_INET6_LINE, False)],
+    ids=["no-file", "empty", "an-address"],
+)
+def test_the_ipv6_check_reads_what_the_file_holds(tmp_path, content, passes) -> None:
+    import subprocess
+
+    from sightread_sandbox import backends
+
+    path = tmp_path / "if_inet6"
+    if content is not None:
+        path.write_text(content)
+    script = backends.NO_IPV6.replace("/proc/net/if_inet6", str(path))
+    result = subprocess.run(["/bin/sh", "-c", script], capture_output=True, check=False)  # noqa: S603
+    assert (result.returncode == 0) is passes
+
+
+def test_the_ipv6_check_does_not_trust_a_procfs_size() -> None:
+    import subprocess
+
+    from sightread_sandbox import backends
+
+    # procfs gives a file that reads non-empty a size of 0, /proc/net/if_inet6 with
+    # addresses in it included: a size test would pass every VM.
+    status = Path("/proc/self/status")
+    assert status.stat().st_size == 0 and status.read_text()
+    script = backends.NO_IPV6.replace("/proc/net/if_inet6", str(status))
+    assert subprocess.run(["/bin/sh", "-c", script], check=False).returncode == 1  # noqa: S603
+
+
 async def test_an_adopted_vm_on_the_network_with_ipv6_is_stopped(tmp_path, monkeypatch) -> None:
     from sightread_sandbox import backends
 

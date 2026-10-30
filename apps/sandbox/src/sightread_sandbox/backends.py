@@ -418,9 +418,16 @@ exec uv venv --quiet --allow-existing "$VIRTUAL_ENV"
 """
 
 # Whether a VM on the network holds no IPv6 address: the bridge keeps a link-local one the
-# host answers on (docs/sandbox.md § Network). `[` is the shell's own, and procfs is the
-# kernel's, so nothing the VM wrote decides it.
-NO_IPV6 = "[ ! -s /proc/net/if_inet6 ]"
+# host answers on (docs/sandbox.md § Network). The file is read, never sized: procfs files
+# report a size of 0 whatever they hold. No file is no IPv6; a file that cannot be read
+# fails, so the VM is not used. procfs is the kernel's and the programs the image's, so
+# nothing the VM wrote decides it.
+NO_IPV6 = f"""
+PATH={SAFE_PATH}
+[ -e /proc/net/if_inet6 ] || exit 0
+__sr_v6=$(cat /proc/net/if_inet6) || exit 2
+[ -z "$__sr_v6" ]
+"""
 
 
 def _remove_cache(cache: Path) -> None:
