@@ -15,7 +15,9 @@ from .parse import BBOX_FORMAT_YXYX
 
 # Bumped when the prompt or the tool contract changes what a conversation does. Chat has
 # no dedup cache; the number is bookkeeping for the registry (docs/agents.md).
-PIPELINE_VERSION = 11  # 10: convert_file, figure links; 11: fewer strict tools, thinking binding
+# 10: convert_file, figure links; 11: fewer strict tools, thinking binding; 12: search
+# before guessing an address.
+PIPELINE_VERSION = 12
 
 # Anthropic-defined tools carry no schema of their own (docs/chat.md § Tools). The order
 # is part of the cache prefix and never changes. A custom tool whose input has structure is
@@ -154,9 +156,11 @@ WEB_SEARCH_TOOL = {
     "name": "web_search",
     "description": (
         "Search the web (Brave): up to ten results, each its title, URL, snippet and age. "
-        "Costs the user credits on every call, so one well-phrased query beats several "
-        "guesses, and nothing the document itself answers is searched. Read a result's page "
-        "with read_url before relying on its snippet."
+        "Use it to find a source you do not already have: to check a fact, a date or a "
+        "number, for anything newer than the document, before reading a page whose exact "
+        "address you do not know, and when read_url fails. Never guess addresses. Each call "
+        "costs the user a few credits, so one well-phrased query beats several guesses. "
+        "Read a result's page with read_url before relying on its snippet."
     ),
     "input_schema": {
         "type": "object",
@@ -184,8 +188,10 @@ READ_URL_TOOL = {
     "name": "read_url",
     "description": (
         "Read one http(s) URL as text: an HTML page as its text, a PDF as its text layer, "
-        "a text file as it is; long content is cut in the middle. Free. Not for a file "
-        "the user wants kept: download_file is."
+        "a text file as it is; long content is cut in the middle. For a search result or an "
+        "address the user gave; when a read fails, search for another source rather than "
+        "retrying it or guessing another address. Not for a file the user wants kept: "
+        "download_file is."
     ),
     "input_schema": {
         "type": "object",
@@ -401,9 +407,9 @@ doc.md keeps these shapes; never remove or reorder them unless asked:
 - view_page: the rendered image of one page of the original. Use it before changing any number, formula, table cell or name, and whenever the transcription reads oddly. The page is the truth; doc.md is a transcription of it.
 - view_figure: one figure crop at full resolution.
 - memory: save, update or forget one of the user's memories; the Memory section at the end says when.
-- web_search: the web, ten results with their URLs. Costs the user credits per call: search when the answer needs what the document does not hold or what is newer than it, with one well-phrased query rather than several guesses, and never for what the document itself answers. Say where each fact came from, with its URL.
+- web_search: the web, ten results with their URLs. Search whenever you need a source you do not already have: to check a fact, a date or a number the document states, for what the document does not hold or what is newer than it, and before reading a page whose exact address you do not know. Never guess addresses. Each call costs the user a few credits, so phrase one good query rather than several guesses. Say where each fact came from, with its URL.
 - search_papers: scholarly works by relevance, with DOI, citations and an open-access PDF URL where there is one. Free. Search by what the user is after, not by a title you guessed.
-- read_url: one page or PDF as text. Read a page before relying on a search snippet.
+- read_url: one page or PDF as text, from a search result or an address the user gave. Read a page before relying on a search snippet. When a read fails, search for another source instead of retrying the address or guessing another.
 - download_file: keep one URL as a file of the user's — when the user asked for the paper or the file to be kept, or for another paper to be read — into the folder they named, else the one this document sits in. Then say what was kept and where, as "your file NAME", never a path.
 - convert_file: convert a PDF or an image of the user's files into a document, as the Files page converts one: `path` is the file's folders and name, "Papers/2017/attention.pdf". It waits for the parse and answers the document's doc.md path, which you read with str_replace_based_edit_tool. It costs the user credits per page (nothing when the same file was converted before), so say so before converting a long paper, and convert only what the user asked for or clearly needs. To read another paper: download_file it, convert_file it, then read its doc.md. Never extract a PDF's text in the shell (pdftotext, Python) instead; read_url is for a quick look at a page, not for reading a paper. Afterwards the paper is "your document NAME", never a path.
 

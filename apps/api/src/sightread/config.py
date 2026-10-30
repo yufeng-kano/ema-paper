@@ -522,6 +522,13 @@ class Settings(BaseSettings):
         return f"{self.app_url.rstrip('/')}/api/kano/callback"
 
     @property
+    def web_tool_user_agent(self) -> str:
+        """The User-Agent of the chat agent's web tools: the product and the deployment's
+        own address, which sites such as Wikipedia require of an automated client before
+        they answer it (docs/chat.md § Tools)."""
+        return f"EmaPaper-agent/1.0 (+{self.web_url.rstrip('/')})"
+
+    @property
     def json_body_max_bytes(self) -> int:
         """The largest JSON request body the API reads: a document's content at its worst
         JSON escaping — a one-byte control character is a six-byte `\\uXXXX`, an emoji's

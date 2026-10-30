@@ -126,7 +126,7 @@ Two routes keep a policy of their own: `GET /api/library/documents/{id}/file` an
 |-----|-------|
 | `APP_ENV` | `local` / `production` |
 | `APP_URL` | public origin, used in OAuth metadata + OIDC redirect |
-| `WEB_URL` | the web app's public origin: where sign-in returns the visitor, and — passed by `docker-compose.production.yaml` to the web image's build — the origin of the public pages' canonical, `hreflang` and `og:url` links, `robots.txt`'s `Sitemap` line and the sitemap's URLs ([web.md](./web.md) § Search engines). The pages are prerendered, so a changed value needs the web image rebuilt |
+| `WEB_URL` | the web app's public origin: where sign-in returns the visitor, and — passed by `docker-compose.production.yaml` to the web image's build — the origin of the public pages' canonical, `hreflang` and `og:url` links, `robots.txt`'s `Sitemap` line and the sitemap's URLs ([web.md](./web.md) § Search engines); and the address the chat agent's web tools name in their User-Agent, `EmaPaper-agent/1.0 (+<WEB_URL>)` ([chat.md](./chat.md) § Tools). The pages are prerendered, so a changed value needs the web image rebuilt |
 | `WEB_LOCALE_PREFIXES` | the web app's locale prefixes, comma-separated (`en,zh-TW`), mirroring `apps/web/nuxt.config.ts`: sign-in returns the visitor to `WEB_URL/<locale>`; a value outside the list sends them to `WEB_URL`, whose bare root redirects by the browser's language ([auth.md](./auth.md) § 1, [web.md](./web.md) § Search engines) |
 | `DATABASE_URL` | `postgresql+asyncpg://...` |
 | `SECRET_KEY` | sessions and the signed cookies; generate long random |
