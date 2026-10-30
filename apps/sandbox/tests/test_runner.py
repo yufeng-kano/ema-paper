@@ -782,6 +782,61 @@ async def test_a_vm_on_the_network_that_keeps_ipv6_is_never_used(tmp_path, monke
     assert sandbox.started_at is None
 
 
+async def test_a_vm_with_ipv6_that_cannot_be_removed_takes_no_command(
+    tmp_path, monkeypatch
+) -> None:
+    from sightread_sandbox import backends
+
+    calls: list[tuple[str, ...]] = []
+    vm = {"running": False, "removable": False}
+
+    async def fake_docker(*args, timeout=120.0):
+        calls.append(args)
+        if args[0] == "inspect":
+            return (0, "true\n") if vm["running"] else (1, "Error: No such object")
+        if args[0] == "run":
+            vm["running"] = True
+        if args[0] == "rm":
+            if not vm["removable"]:
+                return 1, "Error: timed out"
+            vm["running"] = False
+        if args[0] == "exec" and args[-1] == backends.NO_IPV6:
+            return 1, ""
+        return 0, ""
+
+    monkeypatch.setattr(backends, "_docker", fake_docker)
+    settings = Settings(
+        app_env="local",
+        sandbox_token=TOKEN,
+        sandbox_backend="docker",
+        sandbox_runtime="runc",
+        sandbox_network="sightread-sandbox",
+        sandbox_proxy_url="http://10.250.250.2:3128",
+        sandbox_workspaces_dir=str(tmp_path / "ws"),
+        sandbox_workspaces_mount=str(tmp_path / "ws"),
+    )
+    backend = backends.DockerBackend(settings)
+
+    def checks() -> int:
+        return len([args for args in calls if args[0] == "exec" and args[-1] == backends.NO_IPV6])
+
+    with pytest.raises(RuntimeError, match="could not be started"):
+        await backend.exec(84, "s", "true", timeout=5)
+    assert backend._user(84).unstoppable is True
+    # The VM still runs, with IPv6: the next command neither takes it as started nor
+    # opens a shell in it.
+    with pytest.raises(RuntimeError, match="no command runs there"):
+        await backend.exec(84, "s", "true", timeout=5)
+    assert checks() == 1
+    assert len([args for args in calls if args[0] == "run"]) == 1
+    # Once Docker reports it gone, the next command starts a VM, checked again.
+    vm.update(running=False, removable=True)
+    with pytest.raises(RuntimeError, match="could not be started"):
+        await backend.exec(84, "s", "true", timeout=5)
+    assert checks() == 2
+    assert backend._user(84).unstoppable is False
+
+
 # One line of /proc/net/if_inet6 as the kernel writes it: ::1 on lo.
 IF_INET6_LINE = "00000000000000000000000000000001 01 80 10 80       lo\n"
 

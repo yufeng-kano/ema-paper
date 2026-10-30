@@ -625,13 +625,17 @@ class DockerBackend(Backend):
         if settings.sandbox_network != "none":
             code, out = await _docker("exec", name, "/bin/sh", "-c", NO_IPV6, timeout=30)
             if code != 0:
-                # A VM whose kernel kept IPv6 could reach the host: never used.
+                # A VM whose kernel kept IPv6 could reach the host: never used. It goes
+                # the way a stop removes one, so a removal that fails marks the sandbox
+                # unstoppable instead of leaving a running VM the next command takes as
+                # started (docs/sandbox.md § Network).
                 logger.error(
                     "sandbox VM of user %d is not without IPv6 on the network (%s); removing it",
                     sandbox.user_id,
                     out.strip(),
                 )
-                await _docker("rm", "-f", name, timeout=settings.sandbox_docker_timeout_seconds)
+                with contextlib.suppress(RuntimeError):
+                    await self._stop_locked(sandbox)
                 raise RuntimeError("the sandbox VM could not be started")
         sandbox.started_at = time.monotonic()
         code, out = await _docker("exec", name, "/bin/sh", "-c", DEFAULT_ENV, timeout=30)
