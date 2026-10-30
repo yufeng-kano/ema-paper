@@ -227,6 +227,8 @@ describe('buildThread', () => {
     expect(kinds(items)).toEqual(['user', 'text', 'steps'])
     const user = items[0] as Extract<ThreadItem, { kind: 'user' }>
     expect(user).toMatchObject({ text: '/zh-summary 3–5', command: 'zh-summary', quote: 'an earlier line' })
+    // The turn the message belongs to, for the edit and the version pager.
+    expect(user).toMatchObject({ turnId: TURN, messageId: messages[0]?.id })
     expect(user.attachments.map((attachment) => [attachment.name, attachment.image, attachment.index])).toEqual([
       ['shot.png', true, 0],
       ['data.csv', false, 1],

@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ..agents import CHAT
@@ -89,7 +89,7 @@ from ..workspace.locks import (
 )
 from ..workspace.memory_file import memory_file_text
 from ..workspace.reconcile import reconcile_locked, reconcile_user
-from . import chat_events, chat_memory, chat_subagent, chat_tools, chat_web
+from . import chat_events, chat_memory, chat_subagent, chat_tools, chat_versions, chat_web
 from .chat_compact import SUMMARY_CONTEXT
 from .intake import convert_kept_file
 from .queue import HISTORY_FULL, claim_job, history_bytes, requeue_job
@@ -153,6 +153,10 @@ class TurnContext:
     # keeps: a block is replayed only under the prompt and tools it was made under
     # (docs/chat.md § History is append-only).
     binding: str
+    # The turns from the conversation's root to this one, oldest first: what the turn
+    # replays, whichever branch the conversation shows by the time a worker claims it
+    # (docs/chat.md § History is append-only, *An edited message starts a version*).
+    path: list[uuid.UUID]
     sandbox: SandboxClient | None
     render_slots: asyncio.Semaphore
     # The reader's skills and subagents as this turn has them (docs/chat.md § Skills,
@@ -269,9 +273,19 @@ async def _load(
         # a turn would load and serialize hundreds of megabytes in the worker before
         # the upstream could refuse the context (docs/chat.md § History). The send is
         # refused past it too; this catches a turn queued before the history crossed it.
+        path = [
+            step.id
+            for step in chat_versions.branch(
+                await chat_versions.conversation_turns(db, conversation.id), turn.id
+            )
+        ]
         if (
             await history_bytes(
-                db, conversation.id, since=conversation.compacted_message_id, turn_id=turn.id
+                db,
+                conversation.id,
+                since=conversation.compacted_message_id,
+                turn_id=turn.id,
+                path=path,
             )
             > settings.chat_history_max_bytes
         ):
@@ -365,6 +379,7 @@ async def _load(
         binding=hashlib.sha256(
             json.dumps([system, tools], sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()[:16],
+        path=path,
         sandbox=sandbox,
         render_slots=render_slots,
         generation=generation,
@@ -473,12 +488,19 @@ def repaired(messages: list[dict]) -> list[dict]:
 
 
 async def _history(ctx: TurnContext) -> list[dict]:
-    """The messages the call replays: from the summary row of the last compaction on, when
-    there was one, and without the rows of any other compaction turn — a failed or
+    """The messages the call replays: the rows of the turns on this turn's own branch and
+    the rows of no turn, which precede every turn (docs/chat.md § History is append-only,
+    *An edited message starts a version*); from the summary row of the last compaction on,
+    when there was one, and without the rows of any other compaction turn — a failed or
     cancelled attempt's instruction, tool calls and whatever summary it stored before it
     ended — but the one row the boundary names (docs/chat.md § Compaction)."""
     async with ctx.sessionmaker() as db:
-        query = select(Message).where(Message.conversation_id == ctx.conversation.id)
+        # The branch's rows alone are read: the versions edited away — their images among
+        # them — never leave the database to be dropped here.
+        query = select(Message).where(
+            Message.conversation_id == ctx.conversation.id,
+            or_(Message.turn_id.is_(None), Message.turn_id.in_(ctx.path)),
+        )
         boundary = ctx.conversation.compacted_message_id
         if boundary is not None:
             query = query.where(Message.id >= boundary)

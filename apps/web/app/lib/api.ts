@@ -697,6 +697,10 @@ export interface ChatTurn {
   /** Null while the turn is unfinished, whatever its status: a cancel marks the status
    *  first and the writer winds down after (docs/chat.md § Conversations). */
   finished_at: string | null
+  /** The turns that are versions of one message, this one among them, oldest first; null
+   *  for a message with one version, absent from a record served by an older API
+   *  (docs/chat.md § History is append-only, *An edited message starts a version*). */
+  versions?: string[] | null
 }
 
 export interface ConversationResponse {
@@ -1472,6 +1476,18 @@ export function sendMessage(id: number, body: MessageBody): Promise<{ turn_id: s
   return request('POST', `/api/conversations/${id}/messages`, body)
 }
 
+/** Sends a stored user message again with new text — the arguments, for a command — as a
+ *  version of its own: 202 with the new turn's and message's ids; 409 while a turn is
+ *  unfinished or past the history cap, 400 for a message left empty or a command whose
+ *  skill is gone, 404 for a row that is no message of the reader's (docs/api.md). */
+export function editMessage(
+  id: number,
+  messageId: number,
+  body: { text: string; locale: string },
+): Promise<{ turn_id: string; message_id: number }> {
+  return request('POST', `/api/conversations/${id}/messages/${messageId}/edit`, body)
+}
+
 /** The bytes of the image attached to a stored user message, by its block's index. */
 export function attachmentUrl(conversationId: number, messageId: number, index: number): string {
   return `/api/conversations/${conversationId}/messages/${messageId}/attachments/${index}`
@@ -1547,12 +1563,14 @@ export function renameConversation(id: number, title: string): Promise<Conversat
   return updateConversation(id, { title })
 }
 
-/** A rename, a move to another model for the conversation's later turns, or both: 400 for a
- *  model the chat agent does not offer, 409 for a move while a turn of it is unfinished
- *  (docs/api.md). The answer is the conversation as the list gives it. */
+/** A rename, a move to another model for the conversation's later turns, a switch to
+ *  another version of a message (`version`, a turn's id — the conversation then shows that
+ *  branch), or any of them together: 400 for a model the chat agent does not offer or a
+ *  version that is no message turn, 409 for a move or a switch while a turn of it is
+ *  unfinished (docs/api.md). The answer is the conversation as the list gives it. */
 export function updateConversation(
   id: number,
-  body: { title?: string; model?: string },
+  body: { title?: string; model?: string; version?: string },
 ): Promise<Conversation> {
   return request('PUT', `/api/conversations/${id}`, body)
 }

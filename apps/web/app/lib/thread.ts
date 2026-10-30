@@ -152,6 +152,9 @@ export type ThreadItem =
   | {
       kind: 'user'
       key: string
+      /** The turn that answers it: what an edit sends again, and whose `versions` the
+       *  pager reads (docs/web.md § The agent panel, *Editing a sent message*). */
+      turnId: string
       /** The stored message the attachments belong to; null before one is known. */
       messageId: number | null
       text: string
@@ -278,7 +281,7 @@ function isTerminal(turn: ChatTurn | undefined, group: ChatEvent[] | undefined, 
   return stored
 }
 
-function userItem(prefix: string, typed: ChatMessage[]): ThreadItem | null {
+function userItem(prefix: string, turnId: string, typed: ChatMessage[]): ThreadItem | null {
   const text = typed
     .map((message) => textOf(message.content))
     .filter(Boolean)
@@ -313,6 +316,7 @@ function userItem(prefix: string, typed: ChatMessage[]): ThreadItem | null {
   return {
     kind: 'user',
     key: `${prefix}-user`,
+    turnId,
     messageId: first.id,
     text,
     selection:
@@ -403,7 +407,7 @@ export function buildThread(input: ThreadInput): Thread {
     const typed = own.filter(
       (message) => message.role === 'user' && !isToolResultOnly(message.content) && !isSummary(message.content),
     )
-    const user = compaction ? null : userItem(prefix, typed)
+    const user = compaction ? null : userItem(prefix, turnId, typed)
     if (user) {
       flat.push(user)
     }

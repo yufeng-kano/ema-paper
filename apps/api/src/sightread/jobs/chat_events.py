@@ -20,6 +20,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ..db.models import ChatEvent, ChatTurn, Conversation
+from . import chat_versions
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +143,33 @@ async def _replay(
             return
 
 
+async def _shown_branch(
+    sessionmaker: async_sessionmaker[AsyncSession], conversation_id: int
+) -> tuple[set, int]:
+    """The turns on the branch the conversation shows, and the newest event's seq, read as
+    the stream opens: the replay leaves out the events of a turn on another branch, and an
+    event past that seq is a turn that started under this stream, on the shown branch by
+    construction (docs/chat.md § Conversations, turns, events). The seq is read first and
+    the head after it: a turn is enqueued and made the head in one transaction, and its
+    events are committed after that one, each under the conversation's row lock — so the
+    head read already reflects every turn with an event at or under the seq read (the turn
+    itself, or the branch the conversation moved to since), and no event lands between the
+    two reads as neither past the seq nor on the branch, which the other order allowed."""
+    async with sessionmaker() as db:
+        newest = (
+            await db.execute(
+                select(func.coalesce(func.max(ChatEvent.seq), 0)).where(
+                    ChatEvent.conversation_id == conversation_id
+                )
+            )
+        ).scalar_one()
+        head_id = (
+            await db.execute(select(Conversation.head_id).where(Conversation.id == conversation_id))
+        ).scalar_one_or_none()
+        turns = await chat_versions.conversation_turns(db, conversation_id)
+        return {turn.id for turn in chat_versions.branch(turns, head_id)}, int(newest)
+
+
 async def _turn_running(
     sessionmaker: async_sessionmaker[AsyncSession], conversation_id: int
 ) -> bool:
@@ -167,23 +195,31 @@ async def stream_conversation_events(
     conversation_id: int,
     after: int,
 ) -> AsyncIterator[str]:
-    """Replay everything after `after`, then tail. Ends once no turn is queued or running
-    and the replay is complete — the client reopens the stream when it sends again."""
+    """Replay everything after `after` on the branch the conversation shows, then tail.
+    Ends once no turn is queued or running and the replay is complete — the client reopens
+    the stream when it sends again, and when it switches versions."""
     wakeup = asyncio.Event()
     listener = await _open_listener(database_url, conversation_id, wakeup)
+    on_branch, opened_at = await _shown_branch(sessionmaker, conversation_id)
     cursor = after
     silent_for = 0.0
+
+    def shown(row: ChatEvent) -> bool:
+        return row.seq > opened_at or row.turn_id in on_branch
+
     try:
         while True:
             async for row in _replay(sessionmaker, conversation_id, cursor):
                 cursor = row.seq
                 silent_for = 0.0
-                yield render(row)
+                if shown(row):
+                    yield render(row)
             if not await _turn_running(sessionmaker, conversation_id):
                 # One more read: a turn can finish between the replay and this check.
                 async for row in _replay(sessionmaker, conversation_id, cursor):
                     cursor = row.seq
-                    yield render(row)
+                    if shown(row):
+                        yield render(row)
                 return
             wakeup.clear()
             try:

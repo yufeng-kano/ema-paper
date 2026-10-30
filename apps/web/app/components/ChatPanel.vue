@@ -26,6 +26,7 @@ import {
   cancelTurn,
   createConversation,
   deleteConversation,
+  editMessage,
   ApiRequestError,
   getMe,
   getSandbox,
@@ -36,6 +37,7 @@ import {
   renameConversation,
   revertRevision,
   sendMessage,
+  updateConversation,
   creditsRefusalOf,
   type CreditsRefusal,
   type AgentSettings,
@@ -1019,6 +1021,156 @@ function selectionPreview(text: string): string {
   return text.replace(/\s+/g, ' ').trim()
 }
 
+// --- editing a sent message (docs/web.md § The agent panel, *Editing a sent message*) ---
+
+/** The message being edited in place: which one, the text as the reader has it — a
+ *  command's arguments, for a command — and the edit's state. */
+interface Editing {
+  messageId: number
+  item: UserItem
+  text: string
+  pending: boolean
+  error: string | null
+}
+const editing = ref<Editing | null>(null)
+/** The editor's textarea; a template ref inside the thread's `v-for` is handed as a list. */
+const editorInput = ref<HTMLTextAreaElement | HTMLTextAreaElement[] | null>(null)
+
+/** Whether a message takes Copy, Edit and the pager: its turn is on record and finished,
+ *  nothing is running, and it is not the one being edited. */
+function canAct(item: UserItem): boolean {
+  return (
+    !running.value &&
+    item.messageId !== null &&
+    item.messageId > 0 &&
+    editing.value?.messageId !== item.messageId &&
+    turns.value.some((turn) => turn.id === item.turnId)
+  )
+}
+
+/** A message's versions — the ids of its turns, oldest first — and where this one stands. */
+function versionsOf(item: UserItem): { ids: string[]; index: number } {
+  const ids = turns.value.find((turn) => turn.id === item.turnId)?.versions ?? []
+  return { ids, index: ids.indexOf(item.turnId) }
+}
+
+function autosizeEditor(input: HTMLTextAreaElement) {
+  input.style.height = 'auto'
+  input.style.height = `${input.scrollHeight}px`
+}
+
+function onEditorInput(event: Event) {
+  autosizeEditor(event.target as HTMLTextAreaElement)
+}
+
+function startEdit(item: UserItem) {
+  if (!canAct(item) || item.messageId === null) {
+    return
+  }
+  editing.value = { messageId: item.messageId, item, text: userText(item), pending: false, error: null }
+  void nextTick(() => {
+    const input = Array.isArray(editorInput.value) ? editorInput.value[0] : editorInput.value
+    if (input) {
+      autosizeEditor(input)
+      input.focus()
+      input.setSelectionRange(input.value.length, input.value.length)
+    }
+  })
+}
+
+function cancelEdit() {
+  if (!editing.value?.pending) {
+    editing.value = null
+  }
+}
+
+/** Save is for a message that keeps something to send: text, its command or an attachment. */
+const canSaveEdit = computed(() => {
+  const state = editing.value
+  if (!state || state.pending) {
+    return false
+  }
+  return state.text.trim().length > 0 || state.item.command !== null || state.item.attachments.length > 0
+})
+
+/** Enter saves and Shift+Enter breaks the line, as in the composer; Escape cancels — and
+ *  stops there, as the viewer's line editor stops it: left to bubble, it would close the
+ *  viewer. */
+function onEditorKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    event.stopPropagation()
+    cancelEdit()
+  } else if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
+    event.preventDefault()
+    void saveEdit()
+  }
+}
+
+/** The thread read again on another branch — after an edit, after a version switch: the
+ *  stream from 0 and the record, as when a conversation is opened; `turnId` the turn an
+ *  edit queued, followed from here. */
+async function reloadBranch(id: number, turnId: string | null) {
+  messages.value = []
+  turns.value = []
+  discardFrames()
+  following = true
+  stream.open(id, 0)
+  if (turnId) {
+    stream.expectTurn(turnId)
+  }
+  await loadDetail(id)
+}
+
+async function saveEdit() {
+  const state = editing.value
+  const id = currentId.value
+  if (!state || !canSaveEdit.value || id === null) {
+    return
+  }
+  state.pending = true
+  state.error = null
+  try {
+    const { turn_id } = await editMessage(id, state.messageId, { text: state.text, locale: locale.value })
+    editing.value = null
+    if (currentId.value === id) {
+      await reloadBranch(id, turn_id)
+    }
+  } catch (error) {
+    const refusal = creditsRefusalOf(error)
+    if (refusal) {
+      creditsRefusal.value = refusal
+    } else if (error instanceof ApiRequestError && error.type === 'storage_full') {
+      await readStorage()
+      storageRefused.value = true
+    } else {
+      // The refusal under the editor, which stays open with the text.
+      state.error = await resolve(error)
+    }
+    state.pending = false
+  }
+}
+
+/** The pager's arrows: the conversation shows the sibling's branch, read again. */
+async function showVersion(item: UserItem, step: 1 | -1) {
+  const id = currentId.value
+  const { ids, index } = versionsOf(item)
+  const target = ids[index + step]
+  if (id === null || running.value || !target) {
+    return
+  }
+  try {
+    const row = await updateConversation(id, { version: target })
+    if (currentId.value !== id) {
+      return
+    }
+    conversations.value = conversations.value.map((entry) => (entry.id === id ? { ...entry, ...row } : entry))
+    await reloadBranch(id, null)
+  } catch (error) {
+    detailError.value = await resolve(error)
+  }
+}
+
 /** An attached image's thumbnail: its local preview until the record holds the message,
  *  then the stored block's bytes. */
 function imageSource(item: UserItem, attachment: UserAttachment): string | null {
@@ -1821,7 +1973,32 @@ onBeforeUnmount(() => {
             <UiIcon name="reply" />
             <span class="user-quote-text">{{ item.quote }}</span>
           </p>
-          <p v-if="item.text || item.command" class="user" :class="{ command: item.command }">
+          <!-- The bubble as an editor, in place: the text alone changes; a command stays, and
+               what went with the message is sent again as stored (docs/web.md § The agent
+               panel, *Editing a sent message*). -->
+          <div v-if="editing && editing.messageId === item.messageId" class="user-editor">
+            <span v-if="item.command" class="user-editor-command mono">/{{ item.command }}</span>
+            <textarea
+              ref="editorInput"
+              v-model="editing.text"
+              class="user-editor-input"
+              rows="1"
+              :aria-label="t('chat.editMessage')"
+              :disabled="editing.pending"
+              @keydown="onEditorKeydown"
+              @input="onEditorInput"
+            />
+            <p v-if="editing.error" class="user-editor-error" role="alert">{{ editing.error }}</p>
+            <div class="user-editor-actions">
+              <UiButton variant="ghost" size="sm" :disabled="editing.pending" @click="cancelEdit">
+                {{ t('common.cancel') }}
+              </UiButton>
+              <UiButton variant="primary" size="sm" :disabled="!canSaveEdit" :loading="editing.pending" @click="saveEdit">
+                {{ t('common.save') }}
+              </UiButton>
+            </div>
+          </div>
+          <p v-else-if="item.text || item.command" class="user" :class="{ command: item.command }">
             <span v-if="item.command" class="user-command mono">/{{ item.command }}</span>
             <span v-if="userText(item)" class="user-text">{{ userText(item) }}</span>
           </p>
@@ -1835,6 +2012,40 @@ onBeforeUnmount(() => {
               :text="t('chat.context.section', { heading: inlinePlain(heading) })"
               :tooltip="inlinePlain(heading)"
             />
+          </div>
+          <!-- Under the turn, as Claude's chat draws them: the version pager when the message
+               has more than one, then Copy and Edit; shown as the pointer rests on the turn,
+               hidden while a turn runs. -->
+          <div v-if="canAct(item)" class="user-actions" role="group" :aria-label="t('chat.messageActions')">
+            <span v-if="versionsOf(item).ids.length > 1" class="user-versions">
+              <UiButton
+                variant="ghost"
+                size="xs"
+                icon-only
+                :label="t('chat.previousVersion')"
+                :disabled="versionsOf(item).index <= 0"
+                @click="showVersion(item, -1)"
+              >
+                <template #icon><UiIcon name="chevron-left" /></template>
+              </UiButton>
+              <span class="user-version-count">
+                {{ t('chat.version', { index: versionsOf(item).index + 1, total: versionsOf(item).ids.length }) }}
+              </span>
+              <UiButton
+                variant="ghost"
+                size="xs"
+                icon-only
+                :label="t('chat.nextVersion')"
+                :disabled="versionsOf(item).index >= versionsOf(item).ids.length - 1"
+                @click="showVersion(item, 1)"
+              >
+                <template #icon><UiIcon name="chevron-right" /></template>
+              </UiButton>
+            </span>
+            <UiCopyButton :text="item.text" size="xs" :label="t('chat.copyMessage')" />
+            <UiButton variant="ghost" size="xs" icon-only :label="t('chat.editMessage')" @click="startEdit(item)">
+              <template #icon><UiIcon name="edit" /></template>
+            </UiButton>
           </div>
         </div>
 
@@ -2314,6 +2525,92 @@ onBeforeUnmount(() => {
   justify-content: flex-end;
   gap: 6px;
   max-width: 88%;
+}
+
+/* Under the turn, as Claude's chat draws them: the pager, Copy and Edit, shown while the
+   pointer rests on the turn or a control of it has focus, always on a touch screen
+   (docs/web.md § The agent panel, *Editing a sent message*). */
+.user-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-height: 26px;
+  opacity: 0;
+  transition: opacity var(--duration-fast) ease;
+}
+
+.user-row:hover .user-actions,
+.user-row:focus-within .user-actions {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .user-actions {
+    opacity: 1;
+  }
+}
+
+.user-versions {
+  display: inline-flex;
+  align-items: center;
+  margin-right: 4px;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.user-version-count {
+  min-width: 3.5em;
+  text-align: center;
+}
+
+/* The bubble as an editor: the message's words on the sunken surface, Cancel and Save
+   under them and nothing else. */
+.user-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  padding: 10px 14px 10px;
+  border-radius: var(--radius-xl);
+  background: var(--paper-sunken);
+}
+
+.user-editor-command {
+  align-self: flex-start;
+  padding: 1px 8px;
+  border-radius: var(--radius-full);
+  background: var(--fill);
+  color: var(--ink-soft);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+}
+
+.user-editor-input {
+  width: 100%;
+  min-height: 24px;
+  max-height: 40vh;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-size: var(--text-sm);
+  line-height: 1.5;
+  resize: none;
+  outline: none;
+}
+
+.user-editor-error {
+  margin: 0;
+  color: var(--danger);
+  font-size: var(--text-xs);
+}
+
+.user-editor-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
 }
 
 /* --- the agent's answer --------------------------------------------------------------- */
