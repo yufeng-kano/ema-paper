@@ -42,6 +42,7 @@ from .jobs.sweeper import sweep_forever
 from .parsing.figures import discard_job_figures
 from .runtime_settings import RuntimeSettings
 from .sandbox.client import SandboxClient
+from .sandbox.egress import write_hosts_forever
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,20 @@ async def run_worker(stop: asyncio.Event) -> None:
     # And the idle compaction pass beside it (docs/chat.md § Compaction), on the settings
     # in effect at each pass.
     compactor = asyncio.create_task(idle_compact_forever(sessionmaker, runtime, stop))
+    # The sandbox's sites, written for the egress proxy, on a reader of its own so the file
+    # follows the database every RUNTIME_SETTINGS_CACHE_SECONDS (docs/sandbox.md § Network).
+    egress = (
+        asyncio.create_task(
+            write_hosts_forever(
+                RuntimeSettings(lambda: settings, lambda: sessionmaker),
+                Path(settings.sandbox_egress_hosts_file),
+                settings.runtime_settings_cache_seconds,
+                stop,
+            )
+        )
+        if settings.sandbox_egress_hosts_file
+        else None
+    )
     sandbox = SandboxClient(settings) if settings.sandbox_configured else None
     # Retried until it goes through: a database or runner blip at start must not leave
     # the turns a dead worker held unfinished until the next restart (docs/jobs.md).
@@ -273,9 +288,10 @@ async def run_worker(stop: asyncio.Event) -> None:
                 except Exception:  # noqa: BLE001 - the next start requeues what stays running
                     logger.exception("could not fail job %s", job_id)
     finally:
-        sweeper.cancel()
-        compactor.cancel()
-        await asyncio.gather(sweeper, compactor, return_exceptions=True)
+        background = [task for task in (sweeper, compactor, egress) if task is not None]
+        for task in background:
+            task.cancel()
+        await asyncio.gather(*background, return_exceptions=True)
         if lock_watch is not None:
             lock_watch.cancel()
             await asyncio.gather(lock_watch, return_exceptions=True)

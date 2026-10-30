@@ -1,4 +1,4 @@
-"""The console's settings page (docs/admin.md § Settings): the twelve settings of `.env`
+"""The console's settings page (docs/admin.md § Settings): the thirteen settings of `.env`
 the database may override, read with where each comes from, and a change — a value
 stored, or a key restored to `.env` — checked as the API checks `.env` at start,
 confirmed when it takes away what accounts have, stored and recorded.
@@ -70,8 +70,9 @@ def env_text(base: Settings, key: str) -> str:
 
 async def payload(db: AsyncSession, base: Settings) -> dict:
     """The settings page: each overridable key with its text in effect once saved, where
-    it comes from, `.env`'s text and who stored it when; whether each secret is set; and
-    the checks' message while the stored values no longer fit `.env`."""
+    it comes from, `.env`'s text and who stored it when; whether each secret is set; the
+    checks' message while the stored values no longer fit `.env`; and whether the sandbox
+    has a network for its list of sites to apply to."""
     rows = (
         await db.execute(
             select(RuntimeSetting, User)
@@ -112,6 +113,7 @@ async def payload(db: AsyncSession, base: Settings) -> dict:
             "WORKSPACE_QUOTA_BYTES": base.workspace_quota_bytes,
             "MAX_JOBS_PER_USER": base.max_jobs_per_user,
         },
+        "sandbox_network": base.sandbox_network != "none",
     }
 
 

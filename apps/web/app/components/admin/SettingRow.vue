@@ -3,16 +3,29 @@
  * One setting on the console's *Settings* screen (docs/admin.md § Pages, *Settings*): its
  * words and its key, the text in effect — a table when it reads as one — and where it comes
  * from, `.env`'s text beside a database value and who stored it when, and, with
- * `settings.write`, *Edit* and *Restore to .env*. Everything shown is the API's.
+ * `settings.write`, *Edit* and *Restore to .env*. The sandbox's sites are chips, with a
+ * warning while the server gives the sandbox no network. Everything shown is the API's.
  */
 import type { AdminSetting, AdminSettingsResponse } from '~/lib/api'
-import { isJsonSetting, packRows, planRows, priceRows, type PackRow, type PlanRow, type PriceRow } from '~/lib/admin'
+import {
+  hostEntries,
+  isHostsSetting,
+  isJsonSetting,
+  packRows,
+  planRows,
+  priceRows,
+  type PackRow,
+  type PlanRow,
+  type PriceRow,
+} from '~/lib/admin'
 import { formatBytes, formatCount, formatDate } from '~/lib/format'
 import type { TableColumn } from '~/lib/table'
 
 const props = defineProps<{
   setting: AdminSetting
   ceilings: AdminSettingsResponse['ceilings']
+  /** Whether `SANDBOX_NETWORK` names a network: without one the sandbox's sites apply to nothing. */
+  sandboxNetwork: boolean
   canWrite: boolean
 }>()
 
@@ -47,6 +60,12 @@ const note = computed(() => {
 const prices = computed(() => (props.setting.key === 'MODEL_PRICES_JSON' ? priceRows(props.setting.value) : null))
 const plans = computed(() => (props.setting.key === 'KANO_PAY_PLANS_JSON' ? planRows(props.setting.value) : null))
 const packs = computed(() => (props.setting.key === 'KANO_PAY_PACKS_JSON' ? packRows(props.setting.value) : null))
+const hosts = computed(() => (isHostsSetting(props.setting.key) ? hostEntries(props.setting.value) : null))
+/** `.env`'s text beside a database value: the sandbox's sites as a list, anything else as it stands. */
+const envText = computed(() => {
+  const value = props.setting.env_value
+  return isHostsSetting(props.setting.key) ? hostEntries(value).join(', ') : value
+})
 /** A JSON setting whose text is no table the page can draw: shown as it stands. */
 const raw = computed(() => isJsonSetting(props.setting.key) && !prices.value && !plans.value && !packs.value)
 const bytes = computed(() => {
@@ -158,6 +177,10 @@ const changedBy = computed(() => {
         :caption="label"
       />
     </div>
+    <ul v-else-if="hosts && hosts.length" class="hosts" :aria-label="label">
+      <li v-for="host in hosts" :key="host" class="host mono">{{ host }}</li>
+    </ul>
+    <p v-else-if="hosts" class="value muted">{{ t('admin.settings.hosts.none') }}</p>
     <p v-else-if="plans" class="value muted">{{ t('admin.settings.plans.none') }}</p>
     <p v-else-if="packs" class="value muted">{{ t('admin.settings.packs.none') }}</p>
     <template v-else-if="raw">
@@ -172,8 +195,10 @@ const changedBy = computed(() => {
       </template>
     </p>
 
+    <p v-if="hosts && !sandboxNetwork" class="off">{{ t('admin.settings.hosts.off') }}</p>
+
     <div v-if="fromDatabase" class="origin">
-      <span class="env mono">{{ t('admin.settings.envValue', { value: setting.env_value || t('admin.settings.empty') }) }}</span>
+      <span class="env mono">{{ t('admin.settings.envValue', { value: envText || t('admin.settings.empty') }) }}</span>
       <span v-if="changedBy">{{ changedBy }}</span>
     </div>
 
@@ -265,6 +290,35 @@ const changedBy = computed(() => {
 
 .muted {
   color: var(--muted);
+}
+
+/* The sandbox's sites: one mono chip each, wrapping, the board's system fill. */
+.hosts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: var(--space-1) 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.host {
+  padding: 3px var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--fill);
+  color: var(--ink);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+}
+
+/* The list has no effect without a network: a warning in the row, the board's orange. */
+.off {
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius);
+  background: var(--caution-tint);
+  color: var(--caution-ink);
+  font-size: var(--text-xs);
+  line-height: 1.5;
 }
 
 .table {

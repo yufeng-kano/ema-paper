@@ -33,9 +33,11 @@ import {
   formatUsd,
   formatUtcDay,
   grantNumber,
+  hostEntries,
   idOf,
   impactLines,
   isGroupName,
+  isHostsSetting,
   isJsonSetting,
   jobStatusOf,
   navEntries,
@@ -515,7 +517,7 @@ describe('the settings page', () => {
   const PRICES =
     '{"vendor/zeta": {"input": 1, "cache_read": 0.1, "cache_write": 1.25, "output": "5"}, "vendor/alpha": {"input": 2, "cache_read": 0.2, "cache_write": 2.5, "output": 10}}'
 
-  it('shows the API’s twelve keys, each in one group', () => {
+  it('shows the API’s thirteen keys, each in one group', () => {
     const keys = SETTING_GROUPS.flatMap((group) => [...group.settings])
     expect(keys).toEqual([
       'PARSE_MODEL',
@@ -527,11 +529,26 @@ describe('the settings page', () => {
       'FREE_CREDITS_PER_PERIOD',
       'FREE_STORAGE_BYTES',
       'FREE_MAX_JOBS',
+      'SANDBOX_EGRESS_HOSTS',
       'MODEL_PRICES_JSON',
       'KANO_PAY_PLANS_JSON',
       'KANO_PAY_PACKS_JSON',
     ])
     expect(keys.filter(isJsonSetting)).toEqual(['MODEL_PRICES_JSON', 'KANO_PAY_PLANS_JSON', 'KANO_PAY_PACKS_JSON'])
+    expect(keys.filter(isHostsSetting)).toEqual(['SANDBOX_EGRESS_HOSTS'])
+  })
+
+  it('lists the sandbox’s sites as the API reads them', () => {
+    // Commas, spaces and line breaks all separate; case and a trailing dot do not make
+    // another site, so neither does a repeat.
+    expect(hostEntries('pypi.org,files.pythonhosted.org')).toEqual(['pypi.org', 'files.pythonhosted.org'])
+    expect(hostEntries(' PyPI.org ,\n*.GitHubUserContent.com\r\n\n pypi.org. github.com ')).toEqual([
+      'pypi.org',
+      '*.githubusercontent.com',
+      'github.com',
+    ])
+    expect(hostEntries('')).toEqual([])
+    expect(hostEntries(' , \n ')).toEqual([])
   })
 
   it('pretty-prints a table for editing with its keys in their order', () => {
@@ -606,6 +623,9 @@ describe('the settings page', () => {
       }
       for (const kind of IMPACT_KINDS) {
         expect(typeof lookup(catalog, `admin.settings.impact.${kind}`)).toBe('string')
+      }
+      for (const line of ['none', 'off', 'hint']) {
+        expect(typeof lookup(catalog, `admin.settings.hosts.${line}`)).toBe('string')
       }
       for (const action of ['update', 'reset']) {
         expect(typeof lookup(catalog, `admin.audit.actions.settings.${action}`)).toBe('string')

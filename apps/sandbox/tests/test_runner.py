@@ -648,6 +648,99 @@ async def test_a_runner_that_cannot_list_sandboxes_does_not_start(tmp_path, monk
         await backends.DockerBackend(settings).startup()
 
 
+async def test_the_runner_starts_only_on_an_internal_network(tmp_path, monkeypatch) -> None:
+    from sightread_sandbox import backends
+
+    inspected = {"sightread-sandbox": "true true"}
+
+    async def fake_docker(*args, timeout=120.0):
+        if args[:2] == ("network", "inspect"):
+            answer = inspected.get(args[-1])
+            return (0, f"{answer}\n") if answer else (1, "not found")
+        return 0, ""
+
+    monkeypatch.setattr(backends, "_docker", fake_docker)
+
+    def settings(network: str) -> Settings:
+        return Settings(
+            app_env="local",
+            sandbox_token=TOKEN,
+            sandbox_backend="docker",
+            sandbox_runtime="runc",
+            sandbox_network=network,
+            sandbox_proxy_url="http://10.250.250.2:3128",
+            sandbox_workspaces_dir=str(tmp_path / "ws"),
+            sandbox_workspaces_mount=str(tmp_path / "ws"),
+        )
+
+    # A network Docker routes off — `bridge`, or the sandbox's made without `internal` —
+    # would hand the VMs the internet past the proxy; one where the host has an address,
+    # whatever the host listens on; one Docker cannot find, nothing.
+    for answer, network in (
+        ("false <no value>", "bridge"),
+        ("false <no value>", "made-without-internal"),
+        ("true <no value>", "host-has-an-address"),
+        ("true false", "host-has-an-address-too"),
+        (None, "missing"),
+    ):
+        if answer:
+            inspected[network] = answer
+        with pytest.raises(RuntimeError, match="not an internal Docker network"):
+            await backends.DockerBackend(settings(network)).startup()
+    await backends.DockerBackend(settings("sightread-sandbox")).startup()
+    await backends.DockerBackend(settings("none")).startup()
+
+
+def test_a_network_needs_the_proxy(tmp_path) -> None:
+    with pytest.raises(ValueError, match="SANDBOX_PROXY_URL"):
+        Settings(
+            app_env="local",
+            sandbox_token=TOKEN,
+            sandbox_backend="docker",
+            sandbox_runtime="runc",
+            sandbox_network="sightread-sandbox",
+            sandbox_workspaces_dir=str(tmp_path / "ws"),
+            sandbox_workspaces_mount=str(tmp_path / "ws"),
+        )
+
+
+async def test_a_vm_on_the_network_is_pointed_at_the_proxy(tmp_path, monkeypatch) -> None:
+    from sightread_sandbox import backends
+
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_docker(*args, timeout=120.0):
+        calls.append(args)
+        if args[0] == "inspect":
+            return 1, "Error: No such object"
+        return 0, ""
+
+    monkeypatch.setattr(backends, "_docker", fake_docker)
+    for network, user_id in (("sightread-sandbox", 81), ("none", 82)):
+        settings = Settings(
+            app_env="local",
+            sandbox_token=TOKEN,
+            sandbox_backend="docker",
+            sandbox_runtime="runc",
+            sandbox_network=network,
+            sandbox_proxy_url="http://10.250.250.2:3128",
+            sandbox_workspaces_dir=str(tmp_path / "ws"),
+            sandbox_workspaces_mount=str(tmp_path / "ws"),
+        )
+        backend = backends.DockerBackend(settings)
+        await backend.ensure_running(backend._user(user_id))
+    on, off = [args for args in calls if args[0] == "run"]
+    assert on[on.index("--network") + 1] == "sightread-sandbox"
+    # The default environment is made in the VM just started, the network's as any other.
+    made = [args[1] for args in calls if args[0] == "exec" and args[-1] == backends.DEFAULT_ENV]
+    assert made == ["sightread-sandbox-81", "sightread-sandbox-82"]
+    # Both spellings of both: uv, pip, git, curl and Python's clients each read one.
+    for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        assert f"{name}=http://10.250.250.2:3128" in on
+    assert off[off.index("--network") + 1] == "none"
+    assert not [arg for arg in off if "PROXY" in arg.upper()]
+
+
 async def test_the_vm_scratch_size_comes_from_settings(tmp_path, monkeypatch) -> None:
     from sightread_sandbox import backends
 

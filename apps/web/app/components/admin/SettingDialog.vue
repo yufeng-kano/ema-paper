@@ -2,10 +2,10 @@
 /**
  * *Edit* and *Restore to .env* for one setting (docs/admin.md § Pages, *Settings*; § Settings).
  *
- * Editing opens on the text in effect — a JSON table pretty-printed, its keys in their order
- * — in a text field, or a mono text area for a table, with `.env`'s text under it; *Save* is
- * offered once the text differs from what was opened, and sends it as typed. Restoring asks
- * first, showing the text `.env` holds.
+ * Editing opens on the text in effect — a JSON table pretty-printed, its keys in their order;
+ * the sandbox's sites one a line — in a text field, or a mono text area for a table or the
+ * sites, with `.env`'s text under it; *Save* is offered once the text differs from what was
+ * opened, and sends it as typed. Restoring asks first, showing the text `.env` holds.
  *
  * A 422 stays here in the start checks' words, and the text can be changed and sent again. A
  * 409 `impact` turns the dialog into its confirmation: what the change removes and, for each
@@ -21,7 +21,7 @@ import {
   type AdminSettingImpact,
   type AdminSettingsResponse,
 } from '~/lib/api'
-import { editableText, impactLines, isJsonSetting, settingImpact } from '~/lib/admin'
+import { editableText, hostEntries, impactLines, isHostsSetting, isJsonSetting, settingImpact } from '~/lib/admin'
 import { formatCount } from '~/lib/format'
 
 /** The most a stored value may hold, in characters (docs/admin.md § Settings). */
@@ -40,7 +40,12 @@ const { explain } = useAdminFailure()
 
 const label = computed(() => t(`admin.settings.keys.${props.setting.key}`))
 const json = computed(() => isJsonSetting(props.setting.key))
-const opened = json.value ? editableText(props.setting.value) : props.setting.value
+const hosts = computed(() => isHostsSetting(props.setting.key))
+const opened = json.value
+  ? editableText(props.setting.value)
+  : hosts.value
+    ? hostEntries(props.setting.value).join('\n')
+    : props.setting.value
 const text = ref(opened)
 const pending = ref(false)
 const error = ref<string | null>(null)
@@ -52,7 +57,11 @@ const title = computed(() =>
     ? t('admin.settings.editTitle', { name: label.value })
     : t('admin.settings.restoreTitle', { name: label.value }),
 )
-const envText = computed(() => props.setting.env_value || t('admin.settings.empty'))
+const envText = computed(
+  () =>
+    (hosts.value ? hostEntries(props.setting.env_value).join(', ') : props.setting.env_value) ||
+    t('admin.settings.empty'),
+)
 const changed = computed(() => text.value !== opened)
 
 const removed = computed(() => {
@@ -145,17 +154,21 @@ function back() {
     </div>
 
     <form v-else-if="mode === 'edit'" :id="`setting-form-${setting.key}`" class="form" novalidate @submit.prevent="send(false)">
-      <template v-if="json">
+      <template v-if="json || hosts">
         <label :for="`setting-text-${setting.key}`" class="field-label">{{ t('admin.settings.value') }}</label>
         <textarea
           :id="`setting-text-${setting.key}`"
           v-model="text"
           class="text"
-          rows="16"
+          :class="{ short: hosts }"
+          :rows="hosts ? 6 : 16"
           spellcheck="false"
+          autocapitalize="off"
+          :aria-describedby="hosts ? `setting-hint-${setting.key}` : undefined"
           :maxlength="VALUE_MAX"
           :disabled="pending"
         />
+        <p v-if="hosts" :id="`setting-hint-${setting.key}`" class="hint">{{ t('admin.settings.hosts.hint') }}</p>
       </template>
       <UiField v-else v-slot="{ id, describedBy, invalid }" :label="t('admin.settings.value')">
         <UiTextInput
@@ -250,6 +263,18 @@ function back() {
   line-height: 1.6;
   resize: vertical;
   transition: border-color var(--duration-fast) var(--ease);
+}
+
+/* The sandbox's sites: a handful of lines, not a table's sixteen. */
+.text.short {
+  min-height: 9rem;
+}
+
+.hint {
+  margin-top: calc(-1 * var(--space-2));
+  color: var(--muted);
+  font-size: var(--text-xs);
+  line-height: 1.5;
 }
 
 .text:disabled {

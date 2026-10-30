@@ -2059,15 +2059,17 @@ export interface AdminSetting {
   updated_by: AdminPerson | null
 }
 
-/** `GET /api/admin/settings`: the twelve, whether each secret is set — never its value —
+/** `GET /api/admin/settings`: the thirteen, whether each secret is set — never its value —
  *  the checks' message while the stored values no longer fit `.env`, how long a change takes
- *  to reach the worker, and `.env`'s ceilings. */
+ *  to reach the worker, `.env`'s ceilings, and whether the sandbox has a network for its
+ *  list of sites to apply to. */
 export interface AdminSettingsResponse {
   settings: AdminSetting[]
   secrets: { key: string; set: boolean }[]
   ignored: string | null
   cache_seconds: number
   ceilings: { WORKSPACE_QUOTA_BYTES: number; MAX_JOBS_PER_USER: number }
+  sandbox_network: boolean
 }
 
 /** A 409 `impact`'s `impact`: what a change removes, and of what uses it, the counts above 0

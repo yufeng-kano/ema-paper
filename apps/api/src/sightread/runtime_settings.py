@@ -26,7 +26,8 @@ logger = logging.getLogger(__name__)
 
 # The keys the database may override, as `.env` names them, in the settings page's order,
 # each with the field it sets. Everything else is `.env`'s alone: every secret and
-# connection, every path, the ceilings every plan must fit under (docs/admin.md § Settings).
+# connection, every path, every other `SANDBOX_*`, the ceilings every plan must fit under
+# (docs/admin.md § Settings).
 OVERRIDABLE: dict[str, str] = {
     "PARSE_MODEL": "parse_model",
     "CHECK_MODEL": "check_model",
@@ -38,6 +39,7 @@ OVERRIDABLE: dict[str, str] = {
     "FREE_CREDITS_PER_PERIOD": "free_credits_per_period",
     "FREE_STORAGE_BYTES": "free_storage_bytes",
     "FREE_MAX_JOBS": "free_max_jobs",
+    "SANDBOX_EGRESS_HOSTS": "sandbox_egress_hosts",
     "KANO_PAY_PLANS_JSON": "kano_pay_plans_json",
     "KANO_PAY_PACKS_JSON": "kano_pay_packs_json",
 }

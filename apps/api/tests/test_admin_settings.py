@@ -25,7 +25,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from sightread import codes as codes_cli
 from sightread import runtime_settings, worker
-from sightread.config import Settings
+from sightread.config import Settings, parse_egress_hosts
 from sightread.db.models import (
     AuditLog,
     ChatTurn,
@@ -42,6 +42,7 @@ from sightread.db.session import create_sessionmaker
 from sightread.jobs import chat_compact, chat_runner
 from sightread.jobs.queue import claim_next_turn
 from sightread.runtime_settings import OVERRIDABLE, RuntimeSettings, effective
+from sightread.sandbox import egress
 from tests.conftest import (
     CSRF_HEADERS,
     KANO_API_KEY,
@@ -122,6 +123,7 @@ def test_effective_is_the_very_object_without_rows_and_a_checked_new_one_with_th
             "FREE_CREDITS_PER_PERIOD",
             "FREE_STORAGE_BYTES",
             "FREE_MAX_JOBS",
+            "SANDBOX_EGRESS_HOSTS",
             "KANO_PAY_PLANS_JSON",
             "KANO_PAY_PACKS_JSON",
         ]
@@ -423,7 +425,7 @@ async def test_with_two_values_that_no_longer_fit_env_each_is_restored_on_its_ow
 # --- the routes ------------------------------------------------------------------------
 
 
-async def test_the_page_lists_the_twelve_and_only_whether_each_secret_is_set(
+async def test_the_page_lists_the_thirteen_and_only_whether_each_secret_is_set(
     make_client,
 ) -> None:
     owner = await _owner(make_client, **PAY_SETTINGS)
@@ -441,7 +443,8 @@ async def test_the_page_lists_the_twelve_and_only_whether_each_secret_is_set(
         "updated_by": None,
     }
     assert page["settings"][3]["value"] == TEST_MODEL_PRICES
-    assert page["settings"][10]["value"] == PRO_PLANS_JSON
+    assert page["settings"][10]["value"] == "pypi.org,files.pythonhosted.org"
+    assert page["settings"][11]["value"] == PRO_PLANS_JSON
     secrets = {item["key"]: item for item in page["secrets"]}
     assert secrets["SECRET_KEY"] == {"key": "SECRET_KEY", "set": True}
     assert secrets["KANO_PROXY_API_KEY"] == {"key": "KANO_PROXY_API_KEY", "set": True}
@@ -456,6 +459,8 @@ async def test_the_page_lists_the_twelve_and_only_whether_each_secret_is_set(
         "WORKSPACE_QUOTA_BYTES": owner.app.state.settings.workspace_quota_bytes,
         "MAX_JOBS_PER_USER": owner.app.state.settings.max_jobs_per_user,
     }
+    # The tests' sandbox has no network: the page warns that the list applies to nothing.
+    assert page["sandbox_network"] is False
 
 
 async def test_a_value_stored_applies_at_once_and_is_recorded(make_client) -> None:
@@ -554,6 +559,12 @@ async def test_a_value_stored_applies_at_once_and_is_recorded(make_client) -> No
             "KANO_PAY_PACKS_JSON",
             '[{"packId": "credits", "credits": 2000, "validDays": 36501}]',
             "KANO_PAY_PACKS_JSON: 'credits'.validDays must be at most 36500",
+        ),
+        (
+            "SANDBOX_EGRESS_HOSTS",
+            "pypi.org\nhttps://github.com/astral-sh",
+            "SANDBOX_EGRESS_HOSTS: https://github.com/astral-sh is not a host name; "
+            "write a name such as github.com",
         ),
     ],
 )
@@ -925,6 +936,95 @@ async def test_idle_compaction_reads_the_settings_once_per_pass(sessionmaker, mo
     async with asyncio.timeout(10):
         await chat_compact.idle_compact_forever(sessionmaker, runtime, stop)
     assert seen == [1, 7]
+
+
+# --- the sandbox's sites ----------------------------------------------------------------
+
+
+def test_the_sandbox_sites_are_host_names_alone() -> None:
+    assert parse_egress_hosts("PyPI.org, files.pythonhosted.org\n*.GitHubUserContent.com") == (
+        "pypi.org",
+        "files.pythonhosted.org",
+        "*.githubusercontent.com",
+    )
+    # A trailing dot is the same name, a repeat nothing more, an empty list nothing at all.
+    assert parse_egress_hosts(" pypi.org.\r\n\tpypi.org ,, ") == ("pypi.org",)
+    assert parse_egress_hosts("") == ()
+    for entry in (
+        "https://github.com",
+        "github.com:443",
+        "github.com/astral-sh",
+        "10.0.0.1",
+        "[::1]",
+        "localhost",
+        "*.com",
+        "*",
+        "a..b.com",
+        "-a.com",
+        "a_b.com",
+        "user@github.com",
+        f"{'x' * 64}.com",
+    ):
+        with pytest.raises(ValueError, match="is not a host name") as refused:
+            parse_egress_hosts(f"pypi.org,{entry}")
+        assert str(refused.value) == (
+            f"SANDBOX_EGRESS_HOSTS: {entry} is not a host name; write a name such as github.com"
+        )
+    # Refused at start as on the page.
+    with pytest.raises(ValueError, match="SANDBOX_EGRESS_HOSTS: 10.0.0.1 is not a host name"):
+        _base(sandbox_egress_hosts="10.0.0.1")
+
+
+async def test_the_worker_writes_the_sites_in_effect_for_the_proxy(sessionmaker, tmp_path) -> None:
+    base = _base(sandbox_egress_hosts="pypi.org,files.pythonhosted.org")
+    runtime = RuntimeSettings(lambda: base, lambda: sessionmaker)
+    path = tmp_path / "sandbox-egress" / "hosts"
+    stop = asyncio.Event()
+
+    async def written(expected: list[str]) -> None:
+        """Until the file lists `expected`: the writer's beat, not this test, decides when."""
+        for _ in range(500):
+            if path.exists() and path.read_text().splitlines()[1:] == expected:
+                return
+            await asyncio.sleep(0.02)
+        raise AssertionError(f"the file never listed {expected}")
+
+    writer = asyncio.create_task(egress.write_hosts_forever(runtime, path, 0.05, stop))
+    try:
+        # `.env`'s list at start, one entry a line under the header the proxy skips.
+        await written(["pypi.org", "files.pythonhosted.org"])
+        assert path.read_text().startswith("#")
+        assert path.stat().st_mode & 0o777 == 0o644
+        # A list saved on the page reaches the file within a beat, read on the writer's
+        # own reader: nothing else invalidates it.
+        await _store(sessionmaker, "SANDBOX_EGRESS_HOSTS", "github.com\n*.example.com")
+        await written(["github.com", "*.example.com"])
+        # Emptied, the file lists nothing: the proxy lets nothing through.
+        await _store(sessionmaker, "SANDBOX_EGRESS_HOSTS", "")
+        await written([])
+        assert [item.name for item in path.parent.iterdir()] == ["hosts"]
+    finally:
+        stop.set()
+        async with asyncio.timeout(5):
+            await writer
+
+
+async def test_a_list_the_worker_cannot_write_is_warned_of_once(
+    sessionmaker, tmp_path, caplog
+) -> None:
+    caplog.set_level(logging.WARNING)
+    base = _base()
+    runtime = RuntimeSettings(lambda: base, lambda: sessionmaker)
+    blocked = tmp_path / "a-file"
+    blocked.write_text("")
+    stop = asyncio.Event()
+    writer = asyncio.create_task(egress.write_hosts_forever(runtime, blocked / "hosts", 0.02, stop))
+    await asyncio.sleep(0.3)
+    stop.set()
+    async with asyncio.timeout(5):
+        await writer
+    warnings = [r for r in caplog.records if "could not write the sandbox's sites" in r.message]
+    assert len(warnings) == 1
 
 
 @respx.mock

@@ -83,6 +83,11 @@
   --danger-edge: light-dark(#f2b8b5, #6b2a27);
   --danger-hover: light-dark(rgb(215 0 21 / 8%), rgb(255 105 97 / 14%));
   --danger-tint: light-dark(rgb(215 0 21 / 7%), rgb(255 105 97 / 12%));
+  /* A state that wants the operator's eye but is no error — the console's sandbox list with
+     no network to apply to: the system orange as a wash, under brown text in light and a
+     light orange in dark, both clearing AA on it. */
+  --caution-tint: light-dark(rgb(255 149 0 / 12%), rgb(255 159 10 / 16%));
+  --caution-ink: light-dark(#7a4100, #ffb340);
 
   /* --- Color: find --------------------------------------------------------
      The result viewer's search. Every hit takes the accent as a wash and the one you are

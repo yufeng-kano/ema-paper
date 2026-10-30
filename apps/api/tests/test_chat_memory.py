@@ -589,7 +589,7 @@ async def test_the_context_route_shows_what_a_turn_would_send(chat_client) -> No
         "page_count": "1",
         "bbox_format": "yxyx_norm1000",
         "parse_model": "claude-x",
-        "network": chat_agent.network_note("none", ""),
+        "network": chat_agent.network_note("none", ()),
     }
     assert f"Current document: {DOC_PATH}" in parts["prompt"]["text"]
     assert with_document["turn"]["text"].endswith(

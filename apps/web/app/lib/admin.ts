@@ -512,6 +512,7 @@ export const SETTING_GROUPS = [
   { key: 'models', column: 'start', settings: ['PARSE_MODEL', 'CHECK_MODEL', 'PARSE_FALLBACK_MODEL'] },
   { key: 'credits', column: 'start', settings: ['CREDIT_USD', 'PARSE_CREDITS_PER_PAGE', 'CHAT_MIN_CREDITS'] },
   { key: 'free', column: 'start', settings: ['FREE_CREDITS_PER_PERIOD', 'FREE_STORAGE_BYTES', 'FREE_MAX_JOBS'] },
+  { key: 'sandbox', column: 'start', settings: ['SANDBOX_EGRESS_HOSTS'] },
   { key: 'prices', column: 'end', settings: ['MODEL_PRICES_JSON'] },
   { key: 'plans', column: 'end', settings: ['KANO_PAY_PLANS_JSON'] },
   { key: 'packs', column: 'end', settings: ['KANO_PAY_PACKS_JSON'] },
@@ -520,6 +521,31 @@ export const SETTING_GROUPS = [
 /** A setting whose text is a JSON table: edited in a text area. */
 export function isJsonSetting(key: string): boolean {
   return key.endsWith('_JSON')
+}
+
+/** The setting whose text is a list of host names (docs/sandbox.md § Network): shown as
+ *  chips, edited one a line. */
+export function isHostsSetting(key: string): boolean {
+  return key === 'SANDBOX_EGRESS_HOSTS'
+}
+
+/**
+ * `SANDBOX_EGRESS_HOSTS`'s entries as they take effect, in their order: split on commas
+ * and whitespace, lower-cased, a trailing dot dropped, each once — as the API reads them.
+ * The API checks each; the page only lists them.
+ */
+export function hostEntries(value: string): string[] {
+  const hosts: string[] = []
+  for (const entry of value.split(/[\s,]+/)) {
+    let name = entry.toLowerCase()
+    if (name.endsWith('.') && !name.endsWith('..')) {
+      name = name.slice(0, -1)
+    }
+    if (name && !hosts.includes(name)) {
+      hosts.push(name)
+    }
+  }
+  return hosts
 }
 
 /** Whether a parsed JSON value has an object key JavaScript would move to the front — an

@@ -399,7 +399,7 @@ def document_facts(settings: Settings, job: Job | None, paths: DocumentPaths) ->
         "page_count": str(job.page_count or 1) if job is not None else "none",
         "bbox_format": job.bbox_format if job is not None else "none",
         "parse_model": job.model if job is not None else "not parsed (a markdown document)",
-        "network": chat_agent.network_note(settings.sandbox_network, settings.sandbox_index_url),
+        "network": chat_agent.network_note(settings.sandbox_network, settings.egress_hosts),
     }
 
 

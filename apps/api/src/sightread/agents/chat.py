@@ -7,7 +7,7 @@ headers the request needs, and which models can run it. The loop is `jobs/chat_r
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -16,8 +16,9 @@ from .parse import BBOX_FORMAT_YXYX
 # Bumped when the prompt or the tool contract changes what a conversation does. Chat has
 # no dedup cache; the number is bookkeeping for the registry (docs/agents.md).
 # 10: convert_file, figure links; 11: fewer strict tools, thinking binding; 12: search
-# before guessing an address; 13: uv's default environment, the fonts.
-PIPELINE_VERSION = 13
+# before guessing an address; 13: uv's default environment, the fonts; 14: the sites the
+# sandbox reaches.
+PIPELINE_VERSION = 14
 
 # Anthropic-defined tools carry no schema of their own (docs/chat.md § Tools). The order
 # is part of the cache prefix and never changes. A custom tool whose input has structure is
@@ -466,11 +467,16 @@ _TOOL_LINE_RE = re.compile(
 )
 
 
-# What the VM can reach, by the runner's `SANDBOX_NETWORK` (docs/sandbox.md § Isolation):
-# the prompt never promises `uv pip install` on a deployment whose VM has no route to an index.
-NETWORK_WITH_INDEX = (
-    "There is no network except the package index, so `uv pip install` works and nothing else does."
+# What the VM can reach, by the runner's `SANDBOX_NETWORK` and the sites the egress proxy
+# lets through (docs/sandbox.md § Network): the prompt never promises `uv pip install`
+# where PyPI is not among them.
+NETWORK_SITES = "The shell reaches only these sites, over HTTPS, through a proxy: {sites}."
+NETWORK_INSTALL = (
+    " `uv pip install` works; anything else that reaches out fails at once, so do not retry it."
 )
+NETWORK_OTHERS = " Anything else that reaches out fails at once, so do not retry it."
+# PyPI's index and the host its files are served from: both listed, `uv pip install` works.
+PYPI_HOSTS = ("pypi.org", "files.pythonhosted.org")
 NETWORK_NONE = (
     "There is no network at all: `uv pip install` and anything else that reaches out fails, "
     "so work with what is installed."
@@ -508,13 +514,22 @@ def render_catalogue(
     return "\n\n".join(sections) if sections else None
 
 
-def network_note(sandbox_network: str, sandbox_index_url: str) -> str:
-    """The `{network}` fact: what the shell can reach, from the runner's own settings. A
-    network alone is not an index: the VM finds a proxy only through the URL the runner
-    exports as `UV_INDEX_URL`, so both must be set for an install to be promised."""
-    if sandbox_network == "none" or not sandbox_index_url.strip():
+def network_note(sandbox_network: str, egress_hosts: Sequence[str]) -> str:
+    """The `{network}` fact: what the shell can reach — nothing without a network or with
+    an empty list, otherwise the listed sites alone (`*.example.com` covering every name
+    under it), with `uv pip install` promised only when both of PyPI's hosts are on it."""
+    if sandbox_network == "none" or not egress_hosts:
         return NETWORK_NONE
-    return NETWORK_WITH_INDEX
+    listed = [
+        name
+        for name in PYPI_HOSTS
+        if any(
+            name == host or (host.startswith("*.") and name.endswith(host[1:]))
+            for host in egress_hosts
+        )
+    ]
+    others = NETWORK_INSTALL if len(listed) == len(PYPI_HOSTS) else NETWORK_OTHERS
+    return NETWORK_SITES.format(sites=", ".join(egress_hosts)) + others
 
 
 def render_system_prompt(
