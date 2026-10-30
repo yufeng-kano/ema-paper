@@ -17,7 +17,7 @@ from sqlalchemy import select
 from sightread.agents import chat as chat_agent
 from sightread.agents import skills as skill_defs
 from sightread.agents import subagents as subagent_defs
-from sightread.db.models import Skill, UsageLog
+from sightread.db.models import Message, Skill, UsageLog
 from sightread.jobs import chat_runner, chat_subagent, chat_tools
 from sightread.jobs.queue import claim_next_job
 from sightread.jobs.runner import run_job
@@ -765,7 +765,8 @@ async def test_a_subagent_works_alone_and_hands_back_its_report(chat_client, mon
     assert subagent_defs.READ_ONLY in first["system"][0]["text"]
     assert first["system"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
     assert first["output_config"] == main[0]["output_config"]
-    assert first["thinking"] == main[0]["thinking"]
+    # Its history lives one run, under one prompt: nothing for the API to unbind.
+    assert first["thinking"] == {"type": "adaptive", "display": "updates"}
     # It reads and never writes: the editor answers `view` alone.
     page, view, refused = (sub[index]["messages"][2 * index]["content"][0] for index in (1, 2, 3))
     assert page["tool_use_id"] == "v1" and page["content"] == "Page 1 shows Greedy 3.45."
@@ -1223,4 +1224,82 @@ def test_a_subagents_tools_are_the_subagent_tools_in_their_order() -> None:
         "view_page",
         "str_replace_based_edit_tool",
         "bash",
+    )
+
+
+@respx.mock
+async def test_thinking_is_replayed_only_under_the_prompt_it_was_made_under(chat_client) -> None:
+    """docs/chat.md § History is append-only: a thinking block is stored with the prompt and
+    tools it was made under and goes back as the API sent it while they hold; once the
+    reader's instructions change the system prompt it is left out — the answers' text
+    stays — and the blocks made under the new prompt are replayed."""
+
+    def answer(note: str, said: str) -> tuple[list[dict], str]:
+        return [{"type": "thinking", "thinking": note}, {"type": "text", "text": said}], "end_turn"
+
+    main, _ = stub_messages(
+        [
+            answer("First.", "One."),
+            answer("Second.", "Two."),
+            answer("Third.", "Three."),
+            ([{"type": "text", "text": "Four."}], "end_turn"),
+        ]
+    )
+    conversation_id = await new_conversation(chat_client)
+
+    async def turn(text: str) -> None:
+        assert (await send(chat_client, conversation_id, text=text)).status_code == 202
+        await _run_queued_turn(chat_client)
+
+    def thinking(request: dict) -> list[str]:
+        return [
+            block["thinking"]
+            for message in request["messages"]
+            if message["role"] == "assistant"
+            for block in message["content"]
+            if block["type"] == "thinking"
+        ]
+
+    await turn("one")
+    await turn("two")
+    assert main[1]["messages"][1]["content"][0] == {
+        "type": "thinking",
+        "thinking": "First.",
+        "signature": "sig",
+    }
+    changed = await chat_client.put(
+        "/api/agents/chat/settings", json={"instructions": "Be brief."}, headers=CSRF_HEADERS
+    )
+    assert changed.status_code == 200, changed.text
+    await turn("three")
+    await turn("four")
+
+    assert main[2]["system"] != main[1]["system"]
+    assert thinking(main[2]) == []
+    assert [
+        message["content"] for message in main[2]["messages"] if message["role"] == "assistant"
+    ] == [[{"type": "text", "text": "One."}], [{"type": "text", "text": "Two."}]]
+    assert thinking(main[3]) == ["Third."]
+    # Stored with the prompt each was made under, never sent with it.
+    async with chat_client.app.state.sessionmaker() as db:
+        stored = (
+            await db.execute(
+                select(Message.content).where(
+                    Message.conversation_id == conversation_id, Message.role == "assistant"
+                )
+            )
+        ).scalars()
+        bindings = [
+            block["binding"]
+            for content in stored
+            for block in content
+            if block["type"] == "thinking"
+        ]
+    assert len(bindings) == 3 and bindings[0] == bindings[1] != bindings[2]
+    assert not any(
+        "binding" in block
+        for request in main
+        for message in request["messages"]
+        for block in message["content"]
+        if isinstance(block, dict)
     )

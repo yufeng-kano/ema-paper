@@ -321,7 +321,11 @@ async def test_a_turn_edits_the_document_and_streams_its_events(chatting, monkey
     ]  # no sandbox configured → no bash; no keys → no searches (docs/chat.md § Tools)
     assert first["system"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
     assert first["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
-    assert first["thinking"] == {"type": "adaptive", "display": "updates"}
+    assert first["thinking"] == {
+        "type": "adaptive",
+        "display": "updates",
+        "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+    }
     assert first["output_config"] == {"effort": "medium"}
     assert first["fallbacks"] == "default"
     assert "selected in the document" in first["messages"][0]["content"][1]["text"]
@@ -838,6 +842,60 @@ def test_an_interrupted_tool_call_is_answered_on_replay() -> None:
         }
     ]
     assert chat_runner.repaired(answered) == answered
+
+
+def test_thinking_made_under_another_prompt_is_left_out_from_the_start() -> None:
+    """docs/chat.md § History is append-only: every thinking block up to and including the
+    last one bound to another system prompt or tool list — or to none, stored before blocks
+    carried one — is left out, never one from the middle; the blocks made since are kept,
+    and an assistant message left empty goes with them."""
+
+    def thinking(text: str, binding: str | None = None) -> dict:
+        block = {"type": "thinking", "thinking": text, "signature": f"sig-{text}"}
+        return block if binding is None else {**block, "binding": binding}
+
+    def text(value: str) -> dict:
+        return {"type": "text", "text": value}
+
+    use = {"type": "tool_use", "id": "t1", "name": "view_page", "input": {"page": 1}}
+    result = {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}
+    history = [
+        {"role": "user", "content": [text("one")]},
+        {"role": "assistant", "content": [thinking("before bindings"), text("a")]},
+        {"role": "user", "content": [text("two")]},
+        # Bound to today's prompt, but before a stale block: it goes too.
+        {"role": "assistant", "content": [thinking("now", "now"), use]},
+        {"role": "user", "content": [result]},
+        {
+            "role": "assistant",
+            "content": [
+                thinking("then", "then"),
+                {"type": "redacted_thinking", "data": "x", "binding": "then"},
+            ],
+        },
+        {"role": "user", "content": [text("three")]},
+        {"role": "assistant", "content": [thinking("since", "now"), text("b")]},
+        {"role": "user", "content": [text("four")]},
+    ]
+    assert chat_runner.stale_thinking_left_out(history, "now") == [
+        history[0],
+        {"role": "assistant", "content": [text("a")]},
+        history[2],
+        {"role": "assistant", "content": [use]},
+        history[4],
+        history[6],
+        history[7],
+        history[8],
+    ]
+    # A history bound throughout to the request's prompt goes back as it is, and the key
+    # that says so never reaches the upstream.
+    current = [history[0], history[7], history[8]]
+    assert chat_runner.stale_thinking_left_out(current, "now") == current
+    assert chat_runner._api_blocks(history[7]["content"])[0] == {
+        "type": "thinking",
+        "thinking": "since",
+        "signature": "sig-since",
+    }
 
 
 async def test_a_message_belongs_to_its_turn_and_a_live_thread_cannot_be_deleted(

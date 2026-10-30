@@ -125,6 +125,63 @@ async def collect(key: Connection, body: dict) -> tuple[list[StreamEvent], Compl
 
 
 @respx.mock
+async def test_thinking_the_api_dropped_as_unbound_is_counted(key) -> None:
+    """docs/chat.md § History is append-only: `input_transformations` on message_start says
+    which thinking blocks the API dropped; only those bound to another prompt are counted —
+    a move to another model drops blocks too, and that is no fault of the replay."""
+    dropped = [
+        {
+            "type": "thinking_dropped",
+            "path": "messages.1.content.0",
+            "reason": "prefix_binding_mismatch",
+        },
+        {
+            "type": "thinking_dropped",
+            "path": "messages.3.content.0",
+            "reason": "prefix_binding_mismatch",
+        },
+        {
+            "type": "thinking_dropped",
+            "path": "messages.5.content.0",
+            "reason": "model_binding_mismatch",
+        },
+        {"type": "something_new", "path": "messages.7.content.0"},
+    ]
+    respx.post(MESSAGES_URL).mock(
+        return_value=httpx.Response(
+            200,
+            content=sse(
+                {
+                    "type": "message_start",
+                    "message": {
+                        "model": "claude-opus-5-5",
+                        "usage": {"input_tokens": 10},
+                        "input_transformations": dropped,
+                    },
+                },
+                {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}},
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "Hi."},
+                },
+                {"type": "content_block_stop", "index": 0},
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn"},
+                    "usage": {"output_tokens": 2},
+                },
+                {"type": "message_stop"},
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+    )
+    _, final = await collect(key, {"model": "claude-opus-5-5", "messages": []})
+    assert final.thinking_dropped == 2
+    assert final.content == [{"type": "text", "text": "Hi."}]
+
+
+@respx.mock
 async def test_the_stream_becomes_blocks_the_runner_replays(key) -> None:
     route = respx.post(MESSAGES_URL).mock(
         return_value=httpx.Response(

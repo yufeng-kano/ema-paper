@@ -99,6 +99,10 @@ class CompletedMessage:
     # Tool-use blocks whose input never parsed: the runner answers them with an error
     # result rather than running something half-formed.
     malformed_tool_uses: set[str] = field(default_factory=set)
+    # Thinking blocks the API dropped from the request as made under another prompt or
+    # tool list — counted from `input_transformations`, never read further (docs/chat.md
+    # § History is append-only).
+    thinking_dropped: int = 0
 
 
 @dataclass
@@ -286,6 +290,7 @@ async def stream_messages(
     stop_reason: str | None = None
     stop_details: dict | None = None
     model: str | None = None
+    thinking_dropped = 0
     finished = False
 
     try:
@@ -306,6 +311,15 @@ async def stream_messages(
                     model = message.get("model") if isinstance(message.get("model"), str) else None
                     progress.started = True
                     progress.usage = message.get("usage") or {}
+                    transformations = message.get("input_transformations")
+                    if isinstance(transformations, list):
+                        thinking_dropped = sum(
+                            1
+                            for entry in transformations
+                            if isinstance(entry, dict)
+                            and entry.get("type") == "thinking_dropped"
+                            and entry.get("reason") == "prefix_binding_mismatch"
+                        )
                 elif kind == "content_block_start":
                     index = _index(data)
                     # Blocks arrive in order, each exactly the next one; an index that
@@ -428,4 +442,5 @@ async def stream_messages(
         usage=_usage(progress.usage, output_tokens=progress.output_tokens),
         model=model,
         malformed_tool_uses=malformed,
+        thinking_dropped=thinking_dropped,
     )

@@ -83,11 +83,12 @@ async def _run(client: httpx.AsyncClient, *calls: dict) -> tuple[int, list[dict]
 
 
 def test_the_tool_is_declared_only_with_a_parse_model() -> None:
-    """docs/chat.md § Tools: after the web tools, strict; a deployment without a parse model
-    never declares it, and a history that names it is refused like a web tool's."""
+    """docs/chat.md § Tools: after the web tools, not strict — its input is one string
+    (§ Upstream); a deployment without a parse model never declares it, and a history that
+    names it is refused like a web tool's."""
     assert chat_agent.convert_tools(parse=False) == ()
     (tool,) = chat_agent.convert_tools(parse=True)
-    assert tool["name"] == "convert_file" and tool["strict"] is True
+    assert tool["name"] == "convert_file" and "strict" not in tool
     assert tool["input_schema"]["additionalProperties"] is False
     assert "convert_file" in chat_runner.UNDECLARABLE_TOOLS
     assert "convert_file" in chat_runner.MUTATING_TOOLS

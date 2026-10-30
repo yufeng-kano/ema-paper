@@ -15,11 +15,14 @@ from .parse import BBOX_FORMAT_YXYX
 
 # Bumped when the prompt or the tool contract changes what a conversation does. Chat has
 # no dedup cache; the number is bookkeeping for the registry (docs/agents.md).
-PIPELINE_VERSION = 10  # 9: inserted images; 10: convert_file, figures linked to their block
+PIPELINE_VERSION = 11  # 10: convert_file, figure links; 11: fewer strict tools, thinking binding
 
 # Anthropic-defined tools carry no schema of their own (docs/chat.md § Tools). The order
-# is part of the cache prefix and never changes. The custom tools are strict: their schemas
-# hold no numeric bounds or array lengths, which the upstream refuses; the tools check them.
+# is part of the cache prefix and never changes. A custom tool whose input has structure is
+# strict: its schema holds no numeric bounds or array lengths, which the upstream refuses;
+# the tool checks them. One whose input is a single string is not: the upstream compiles
+# every strict schema of a request into one grammar and refuses the request past a size
+# it does not publish, which ten strict tools crossed (docs/chat.md § Upstream).
 BASH_TOOL = {"type": "bash_20250124", "name": "bash"}
 EDITOR_TOOL = {"type": "text_editor_20250728", "name": "str_replace_based_edit_tool"}
 VIEW_PAGE_TOOL = {
@@ -161,7 +164,6 @@ WEB_SEARCH_TOOL = {
         "required": ["query"],
         "additionalProperties": False,
     },
-    "strict": True,
 }
 SEARCH_PAPERS_TOOL = {
     "name": "search_papers",
@@ -177,7 +179,6 @@ SEARCH_PAPERS_TOOL = {
         "required": ["query"],
         "additionalProperties": False,
     },
-    "strict": True,
 }
 READ_URL_TOOL = {
     "name": "read_url",
@@ -192,7 +193,6 @@ READ_URL_TOOL = {
         "required": ["url"],
         "additionalProperties": False,
     },
-    "strict": True,
 }
 DOWNLOAD_FILE_TOOL = {
     "name": "download_file",
@@ -252,7 +252,6 @@ CONVERT_FILE_TOOL = {
         "required": ["path"],
         "additionalProperties": False,
     },
-    "strict": True,
 }
 
 
@@ -352,6 +351,7 @@ TOOLS_WITHOUT_BASH: tuple[dict, ...] = tuple(tool for tool in TOOLS if tool is n
 BETAS: tuple[str, ...] = (
     "thinking-display-updates-2026-08-18",
     "server-side-fallback-2026-07-01",
+    "thinking-binding-controls-2026-08-01",
 )
 
 CACHE_TTL = "1h"
