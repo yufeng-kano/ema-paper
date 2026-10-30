@@ -142,7 +142,7 @@ def test_the_fullest_tool_list_keeps_its_strict_grammar_small() -> None:
     tool whose input is one string is never strict."""
     settings = Settings(**WEB_KEYS, parse_model=PARSE_MODEL, model_prices_json=TEST_MODEL_PRICES)
     tools = chat_runner.turn_tools(True, settings)
-    assert {"bash", "web_search", "search_papers", "convert_file"} <= {
+    assert {"bash", "web_search", "search_papers", "convert_file", "insert_image"} <= {
         tool["name"] for tool in tools
     }
     strict = [tool for tool in tools if tool.get("strict")]
@@ -164,12 +164,13 @@ async def test_the_agents_route_and_the_rates_say_what_the_deployment_offers(
     chat = next(
         a for a in (await client.get("/api/agents")).json()["agents"] if a["name"] == "chat"
     )
-    assert chat["tools"][-5:] == [
+    assert chat["tools"][-6:] == [
         "web_search",
         "search_papers",
         "read_url",
         "download_file",
         "convert_file",
+        "insert_image",
     ]
     assert (await client.get("/api/billing/catalog")).json()["rates"]["web_search_per_call"] == 3
     assert (await client.get("/api/billing")).json()["rates"]["web_search_per_call"] == 3
@@ -177,13 +178,19 @@ async def test_the_agents_route_and_the_rates_say_what_the_deployment_offers(
     bare = make_client(workspaces_dir=str(tmp_path / "ws2"))
     await bare.post("/api/auth/dev-login", headers=CSRF_HEADERS)
     chat = next(a for a in (await bare.get("/api/agents")).json()["agents"] if a["name"] == "chat")
-    assert chat["tools"][-4:] == ["memory", "read_url", "download_file", "convert_file"]
+    assert chat["tools"][-5:] == [
+        "memory",
+        "read_url",
+        "download_file",
+        "convert_file",
+        "insert_image",
+    ]
     assert (await bare.get("/api/billing/catalog")).json()["rates"]["web_search_per_call"] is None
 
     off = make_client(workspaces_dir=str(tmp_path / "ws3"), chat_web_access=False, **WEB_KEYS)
     await off.post("/api/auth/dev-login", headers=CSRF_HEADERS)
     chat = next(a for a in (await off.get("/api/agents")).json()["agents"] if a["name"] == "chat")
-    assert chat["tools"][-2:] == ["memory", "convert_file"]
+    assert chat["tools"][-3:] == ["memory", "convert_file", "insert_image"]
     assert (await off.get("/api/billing/catalog")).json()["rates"]["web_search_per_call"] is None
 
 

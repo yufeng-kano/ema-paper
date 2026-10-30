@@ -54,14 +54,14 @@ A file is a library entry that is neither parsed nor markdown (`documents.kind` 
 
 ### Inserted images
 
-An image the reader puts into a document — into `doc.md` or `notes.md`, from the editor's slash menu, a paste or a drop ([web.md](./web.md) § Editing, *Images*) — is a file of the document's, written as one line of markdown:
+An image the reader puts into a document — into `doc.md` or `notes.md`, from the editor's slash menu, a paste or a drop ([web.md](./web.md) § Editing, *Images*) — or the agent keeps for it with `insert_image`, from a file of the workspace such as a chart it drew ([chat.md](./chat.md) § Tools), is a file of the document's, written as one line of markdown:
 
 ```
 ![diagram](figures/img-3f9a0c1d2e4b5a6c.png)
 An optional caption, on the next line
 ```
 
-- **It is stored like an original.** `POST /api/library/images` ([api.md](./api.md)) decodes the upload, turns it upright and flattens it onto white, downscales it to `DOCUMENT_IMAGE_LONG_EDGE` (2400 px; PNG stays PNG, anything else becomes JPEG, as the composer's attachments are prepared, [chat.md](./chat.md)) and keeps it as `{WORKSPACES_DIR}/.repos/{user_id}.images/{document_id}/img-<hash>.<ext>` — the first 16 hex digits of the stored file's SHA-256, so the same picture inserted twice is one file. That directory is outside the mount, beside the originals and for the same reason: the document's text points at it, and no command can damage it. A copy goes into the document directory's `figures/`, the one directory beside `doc.md` that history already excludes and that no document may be called, so the shell sees what the text names; materialization copies each missing one again, as it does the crops. The image route serves the stored file, never the shell's copy.
+- **It is stored like an original.** `POST /api/library/images` ([api.md](./api.md)), and the agent's tool the same way, decodes the upload, turns it upright and flattens it onto white, downscales it to `DOCUMENT_IMAGE_LONG_EDGE` (2400 px; PNG stays PNG, anything else becomes JPEG, as the composer's attachments are prepared, [chat.md](./chat.md)) and keeps it as `{WORKSPACES_DIR}/.repos/{user_id}.images/{document_id}/img-<hash>.<ext>` — the first 16 hex digits of the stored file's SHA-256, so the same picture inserted twice is one file. That directory is outside the mount, beside the originals and for the same reason: the document's text points at it, and no command can damage it. A copy goes into the document directory's `figures/`, the one directory beside `doc.md` that history already excludes and that no document may be called, so the shell sees what the text names; materialization copies each missing one again, as it does the crops. The image route serves the stored file, never the shell's copy.
 - **It goes with the document.** The images are deleted with the row (and swept with the originals when a delete died before its cleanup) and count against the quota. Nothing removes an image the text no longer names: a revert or an undo can bring the line back, and the line must still show its picture.
 - **Only these names are images.** The viewer reads a line as an image only when it names `figures/img-` and sixteen hex digits with `.png` or `.jpg`: never a URL, so a document — an agent's edit included — cannot make the reader's browser fetch anything from anywhere else.
 

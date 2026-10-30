@@ -72,14 +72,16 @@ from ..workspace.documents import (
     ensure_within_quota,
     folder_names,
     is_live,
+    keep_image,
     materialize_document,
     measure_storage,
+    prepare_inserted_image,
     recover_trash,
     stage_upload,
     trashed_folder_ids,
     user_folders,
 )
-from ..workspace.layout import DOC_FILE
+from ..workspace.layout import DOC_FILE, FIGURES_DIR, NOTES_FILE
 from ..workspace.locks import (
     backup_shared,
     clear_writing,
@@ -88,7 +90,7 @@ from ..workspace.locks import (
     workspace_lock,
 )
 from ..workspace.memory_file import memory_file_text
-from ..workspace.reconcile import reconcile_locked, reconcile_user
+from ..workspace.reconcile import meta_document_id, reconcile_locked, reconcile_user
 from . import chat_events, chat_memory, chat_subagent, chat_tools, chat_versions, chat_web
 from .chat_compact import SUMMARY_CONTEXT
 from .intake import convert_kept_file
@@ -416,6 +418,7 @@ def turn_tools(shell: bool, settings: Settings) -> list[dict]:
             openalex=bool(settings.openalex_api_key),
         ),
         *chat_agent.convert_tools(parse=bool(settings.parse_model)),
+        chat_agent.INSERT_IMAGE_TOOL,
     ]
 
 
@@ -1135,6 +1138,8 @@ async def run_mutating(ctx: TurnContext, name: str, tool_input: dict) -> chat_to
         return await _run_download(ctx, tool_input)
     if name == "convert_file":
         return await _run_convert(ctx, tool_input)
+    if name == "insert_image":
+        return await _run_insert_image(ctx, tool_input)
     if name != "bash":
         return await chat_tools.run_editor(
             ctx.paths.root,
@@ -1290,7 +1295,9 @@ async def _report_tool(
     return result
 
 
-MUTATING_TOOLS = frozenset({"bash", "str_replace_based_edit_tool", "download_file", "convert_file"})
+MUTATING_TOOLS = frozenset(
+    {"bash", "str_replace_based_edit_tool", "download_file", "convert_file", "insert_image"}
+)
 # The tools a deployment may not declare — the web tools and `convert_file` — which a
 # history may still name (docs/chat.md § Tools).
 UNDECLARABLE_TOOLS = frozenset({*chat_agent.WEB_TOOL_NAMES, "convert_file"})
@@ -1901,6 +1908,100 @@ async def _await_inline_parse(ctx: TurnContext, run: asyncio.Task, deadline: flo
     run.cancel()
     await asyncio.gather(run, return_exceptions=True)
     return False
+
+
+# --- inserting an image -------------------------------------------------------------------------
+
+
+async def _run_insert_image(ctx: TurnContext, tool_input: dict) -> chat_tools.ToolOutcome:
+    """One `insert_image` call, a write of the turn: an image file of the workspace kept as
+    one of a document's inserted images, as the editor's upload keeps one, and the line that
+    shows it answered for the agent to write with the editor (docs/chat.md § Tools,
+    docs/workspace.md § Inserted images)."""
+    settings = ctx.settings
+    root = ctx.paths.root
+    try:
+        image = chat_tools.resolve_workspace_path(root, tool_input.get("image"))
+    except chat_tools.PathRefused as exc:
+        return chat_tools.ToolOutcome(f"image: {exc}", is_error=True)
+    try:
+        named = chat_tools.resolve_workspace_path(root, tool_input.get("document"))
+    except chat_tools.PathRefused as exc:
+        return chat_tools.ToolOutcome(f"document: {exc}", is_error=True)
+    shown_image = (chat_tools.VM_ROOT / image.relative_to(root).as_posix()).as_posix()
+    directory = named.relative_to(root)
+    if directory.name in (DOC_FILE, NOTES_FILE):
+        directory = directory.parent
+    shown = (chat_tools.VM_ROOT / directory.as_posix()).as_posix()
+    try:
+        # Under the lock, as the editor reads: a shell command of another conversation may
+        # be writing the file. No database session is open while the lock is waited for.
+        async with workspace_lock(root):
+            data = await asyncio.to_thread(
+                safe_io.read_bytes, root, image, settings.document_image_max_bytes
+            )
+    except safe_io.EntryTooLarge:
+        return chat_tools.ToolOutcome(
+            f"{shown_image} is larger than an inserted image may be "
+            f"({settings.document_image_max_bytes:,} bytes)",
+            is_error=True,
+        )
+    except (safe_io.UnsafeEntry, OSError):
+        return chat_tools.ToolOutcome(f"{shown_image} is not a plain file", is_error=True)
+    except ApiError as exc:  # the workspace is being recovered
+        return chat_tools.ToolOutcome(f"The image was not kept: {exc.message}", is_error=True)
+    if data is None:
+        return chat_tools.ToolOutcome(f"{shown_image} does not exist", is_error=True)
+    # The shell can write any `.meta.json`: it only names a row, whose own place must then
+    # be this directory.
+    document_id = await asyncio.to_thread(meta_document_id, root, directory)
+    upload_dir = Path(settings.upload_dir)
+    stem = uuid.uuid4().hex
+    staged = upload_dir / f"{stem}.upload"
+    async with ctx.sessionmaker() as db:
+        row = await db.get(Document, document_id) if document_id is not None else None
+        if (
+            row is None
+            or row.user_id != ctx.turn.user_id
+            or row.kind == FILE_KIND
+            or not is_live(row, await user_folders(db, row.user_id))
+            or await filing.document_relative(db, row) != directory
+        ):
+            return chat_tools.ToolOutcome(
+                f"No document at {shown}: give the doc.md or notes.md of one of the user's "
+                "documents.",
+                is_error=True,
+            )
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            await asyncio.to_thread(staged.write_bytes, data)
+            del data
+            prepared = await asyncio.to_thread(
+                prepare_inserted_image,
+                staged,
+                upload_dir,
+                stem,
+                max_pixels=settings.chat_page_image_max_pixels,
+                long_edge=settings.document_image_long_edge,
+            )
+            try:
+                name = await keep_image(db, settings, row, prepared)
+            finally:
+                prepared.unlink(missing_ok=True)
+        except ApiError as exc:
+            if exc.error_type == "storage_full":
+                return chat_tools.ToolOutcome(
+                    "The user's storage is full; the image was not kept.", is_error=True
+                )
+            return chat_tools.ToolOutcome(f"The image was not kept: {exc.message}", is_error=True)
+        finally:
+            staged.unlink(missing_ok=True)
+    return chat_tools.ToolOutcome(
+        f"Kept {shown_image} as an image of the document at {shown}. Write this line where "
+        "the image belongs in its doc.md or notes.md, with str_replace_based_edit_tool, and a "
+        "short caption on the next line; put a few words on what it shows between the "
+        f"brackets:\n![]({FIGURES_DIR}/{name})"
+    )
 
 
 # --- the loop ---------------------------------------------------------------------------------

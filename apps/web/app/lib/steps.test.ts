@@ -123,6 +123,9 @@ describe('readStep', () => {
     })
     expect(readStep('convert_file', { path: 'Papers/2017/attention.pdf' })).toEqual({ kind: 'convert', target: 'attention.pdf' })
     expect(readStep('convert_file', { path: '/workspace/files/scan.png' })).toEqual({ kind: 'convert', target: 'scan.png' })
+    expect(
+      readStep('insert_image', { image: '/workspace/.cache/loss.png', document: '/workspace/files/Papers/attention/notes.md' }),
+    ).toEqual({ kind: 'image', target: 'loss.png', file: 'notes.md' })
     expect(readStep('skill', { name: 'zh-summary', arguments: '' })).toEqual({ kind: 'skill', target: 'zh-summary' })
     expect(readStep('subagent', { name: 'verifier', task: 'x' })).toEqual({ kind: 'subagent', target: 'verifier' })
     expect(readStep('bash', { restart: true })).toEqual({ kind: 'restart', target: '' })
