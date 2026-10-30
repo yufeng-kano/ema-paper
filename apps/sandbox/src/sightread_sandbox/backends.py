@@ -417,6 +417,11 @@ PATH={SAFE_PATH}
 exec uv venv --quiet --allow-existing "$VIRTUAL_ENV"
 """
 
+# Whether a VM on the network holds no IPv6 address: the bridge keeps a link-local one the
+# host answers on (docs/sandbox.md § Network). `[` is the shell's own, and procfs is the
+# kernel's, so nothing the VM wrote decides it.
+NO_IPV6 = "[ ! -s /proc/net/if_inet6 ]"
+
 
 def _remove_cache(cache: Path) -> None:
     """Whatever sits at `.cache` goes: the directory, or the file or link a command put
@@ -499,6 +504,19 @@ class DockerBackend(Backend):
                     self.container(user_id),
                     out.strip(),
                 )
+            elif network != "none":
+                # One a runner before the IPv6 rule started on the network: it starts
+                # again without IPv6 on its next command.
+                code, out = await _docker(
+                    "exec", self.container(user_id), "/bin/sh", "-c", NO_IPV6, timeout=30
+                )
+                if code != 0:
+                    logger.warning(
+                        "adopted sandbox %s is not without IPv6 on the network (%s); stopping it",
+                        self.container(user_id),
+                        out.strip(),
+                    )
+            if code != 0:
                 async with sandbox.lock:
                     with contextlib.suppress(RuntimeError):
                         await self._stop_locked(sandbox)
@@ -587,6 +605,9 @@ class DockerBackend(Backend):
             # the other (docs/sandbox.md § Network).
             for variable in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
                 args += ["-e", f"{variable}={settings.sandbox_proxy_url}"]
+            # No IPv6: the bridge keeps a link-local address the host answers on.
+            for interfaces in ("all", "default"):
+                args += ["--sysctl", f"net.ipv6.conf.{interfaces}.disable_ipv6=1"]
         if settings.sandbox_index_url:
             args += ["-e", f"UV_INDEX_URL={settings.sandbox_index_url}"]
         args += [settings.sandbox_image, REAPER_PYTHON, "-c", REAPER]
@@ -594,6 +615,17 @@ class DockerBackend(Backend):
         if code != 0:
             logger.error("could not start sandbox for user %d: %s", sandbox.user_id, out.strip())
             raise RuntimeError("the sandbox VM could not be started")
+        if settings.sandbox_network != "none":
+            code, out = await _docker("exec", name, "/bin/sh", "-c", NO_IPV6, timeout=30)
+            if code != 0:
+                # A VM whose kernel kept IPv6 could reach the host: never used.
+                logger.error(
+                    "sandbox VM of user %d is not without IPv6 on the network (%s); removing it",
+                    sandbox.user_id,
+                    out.strip(),
+                )
+                await _docker("rm", "-f", name, timeout=settings.sandbox_docker_timeout_seconds)
+                raise RuntimeError("the sandbox VM could not be started")
         sandbox.started_at = time.monotonic()
         code, out = await _docker("exec", name, "/bin/sh", "-c", DEFAULT_ENV, timeout=30)
         if code != 0:
