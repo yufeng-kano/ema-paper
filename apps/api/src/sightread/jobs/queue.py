@@ -13,6 +13,7 @@ import json
 import logging
 import re
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -731,6 +732,7 @@ async def history_bytes(
     *,
     since: int | None = None,
     turn_id: uuid.UUID | None = None,
+    path: Iterable[uuid.UUID] | None = None,
 ) -> int:
     """The stored size of what a turn replays, in bytes as the cap is: PostgreSQL's
     `length` counts characters, and a history of non-ASCII text would reach four times
@@ -738,7 +740,10 @@ async def history_bytes(
     summary row a compaction left, only the rows from it on; and never the rows of a
     compaction turn — a failed or cancelled attempt's instruction, answer and tool
     results, stored but never sent — but that row and the rows of `turn_id`, the
-    compaction being loaded, as the runner replays them (docs/chat.md § Compaction)."""
+    compaction being loaded, as the runner replays them (docs/chat.md § Compaction). With
+    `path`, the turns of the branch being measured, only their rows and the rows of no
+    turn, which precede every turn (docs/chat.md § History is append-only, *An edited
+    message starts a version*)."""
     as_text = cast(Message.content, Text)
     size = (
         func.octet_length(as_text)
@@ -750,6 +755,8 @@ async def history_bytes(
     )
     if since is not None:
         query = query.where(Message.id >= since)
+    if path is not None:
+        query = query.where(or_(Message.turn_id.is_(None), Message.turn_id.in_(list(path))))
     compactions = select(ChatTurn.id).where(
         ChatTurn.conversation_id == conversation_id, ChatTurn.kind.in_(COMPACTION_TURNS)
     )
@@ -781,9 +788,12 @@ async def enqueue_turn(
     message_id: int,
     locale: str = "en",
     kind: str = MESSAGE_TURN,
+    parent_id: uuid.UUID | None = None,
 ) -> ChatTurn:
     """Create the queued turn row — a user message's, or a compaction's by its `kind`
-    (docs/chat.md § Compaction). The caller commits, with the user message it answers."""
+    (docs/chat.md § Compaction) — under `parent_id`, the turn before it on its branch
+    (docs/chat.md § History is append-only, *An edited message starts a version*). The
+    caller commits, with the user message it answers, and moves the conversation's head."""
     turn = ChatTurn(
         id=uuid.uuid4(),
         user_id=user_id,
@@ -793,6 +803,7 @@ async def enqueue_turn(
         status="queued",
         locale=locale,
         created_at=utcnow(),
+        parent_id=parent_id,
     )
     db.add(turn)
     await db.flush()

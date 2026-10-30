@@ -19,7 +19,7 @@ from pathlib import Path
 from fastapi import APIRouter, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, exists, select, update
+from sqlalchemy import delete, exists, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..agents import CHAT
@@ -50,7 +50,7 @@ from ..db.models import (
     utcnow,
 )
 from ..errors import ApiError
-from ..jobs import chat_compact, chat_events
+from ..jobs import chat_compact, chat_events, chat_versions
 from ..jobs.intake import insufficient_credits
 from ..jobs.queue import HISTORY_FULL, count_active_turns, enqueue_turn, history_bytes
 from ..parsing.attachments import prepared_path
@@ -262,23 +262,24 @@ async def read_conversation(
     conversation_id: int, user: SessionUser, db: DbSession, settings: AppSettings
 ):
     row = await owned_conversation(db, user.id, conversation_id)
+    # The branch the conversation shows, root to head, and the rows of no turn, which
+    # precede every turn: the rows of a version the reader edited away stay unsent until a
+    # switch brings its branch back (docs/chat.md § History is append-only, *An edited
+    # message starts a version*).
+    turns = await chat_versions.conversation_turns(db, row.id)
+    shown = chat_versions.branch(turns, row.head_id)
+    on_branch = [turn.id for turn in shown]
     messages = (
         await db.execute(
-            select(Message).where(Message.conversation_id == row.id).order_by(Message.id)
+            select(Message)
+            .where(
+                Message.conversation_id == row.id,
+                or_(Message.turn_id.is_(None), Message.turn_id.in_(on_branch)),
+            )
+            .order_by(Message.id)
         )
     ).scalars()
-    turns = (
-        (
-            await db.execute(
-                select(ChatTurn)
-                .where(ChatTurn.conversation_id == row.id)
-                .order_by(ChatTurn.created_at)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    credits = await ledger.credits_by_turn(db, [turn.id for turn in turns])
+    credits = await ledger.credits_by_turn(db, on_branch)
     return {
         "conversation": conversation_payload(
             row, settings, compactable=await chat_compact.compactable(db, row.id)
@@ -305,8 +306,16 @@ async def read_conversation(
                 "finished_at": turn.finished_at,
                 # What the turn cost, once it is settled (docs/billing.md § Routes).
                 "credits": credits.get(turn.id),
+                # The turns that are versions of one message, this one among them, oldest
+                # first — null for a message with one version (docs/chat.md § History is
+                # append-only, *An edited message starts a version*).
+                "versions": (
+                    [str(version) for version in versions]
+                    if (versions := chat_versions.versions_of(turns, turn))
+                    else None
+                ),
             }
-            for turn in turns
+            for turn in shown
         ],
     }
 
@@ -334,10 +343,14 @@ async def delete_conversation(conversation_id: int, user: SessionUser, db: DbSes
 
 
 class ConversationUpdate(BaseModel):
-    """A rename, a move to another model, or both (docs/api.md)."""
+    """A rename, a move to another model, a switch to another version of a message, or any
+    of them together (docs/api.md)."""
 
     title: str | None = None
     model: str | None = Field(default=None, max_length=255)
+    # The id of a `message` turn: the conversation then shows its branch (docs/chat.md
+    # § History is append-only, *An edited message starts a version*).
+    version: uuid.UUID | None = None
 
 
 @router.put("/conversations/{conversation_id}", dependencies=[CsrfGuard])
@@ -348,15 +361,15 @@ async def update_conversation(
     db: DbSession,
     settings: AppSettings,
 ):
-    """The reader's own title, one line like a memory's text, and the model the
-    conversation's later turns run on. Written with `updated_at` kept as it was: the list
-    orders by it, and neither is a thread continued. A running turn does not refuse the
-    title — the runner never writes it — and refuses the model (**409**): the turn in flight
-    replays and stores blocks under the model it started on (docs/chat.md § History is
-    append-only)."""
+    """The reader's own title, one line like a memory's text, the model the conversation's
+    later turns run on, and the version of a message it shows. Written with `updated_at`
+    kept as it was: the list orders by it, and none of them is a thread continued. A running
+    turn does not refuse the title — the runner never writes it — and refuses the model and
+    the version (**409**): the turn in flight replays and stores blocks under the model and
+    on the branch it started on (docs/chat.md § History is append-only)."""
     provided = body.model_fields_set
-    if "title" not in provided and "model" not in provided:
-        raise ApiError(400, "invalid_request", "Send a title or a model")
+    if not provided & {"title", "model", "version"}:
+        raise ApiError(400, "invalid_request", "Send a title, a model or a version")
     row = await owned_conversation(db, user.id, conversation_id)
     values: dict = {"updated_at": Conversation.updated_at}
     if "title" in provided:
@@ -364,12 +377,27 @@ async def update_conversation(
         if not title:
             raise ApiError(400, "invalid_request", "A conversation needs a title")
         values["title"] = title
+    model = None
     if "model" in provided:
         model = (body.model or "").strip()
         # The offered list, read live (docs/billing.md § Models).
         if model not in {entry["id"] for entry in await agent_models(settings, CHAT.name)}:
             raise ApiError(400, "invalid_request", "That model is not one the chat agent offers")
-        # Under the conversation's lock, as a send decides: no turn may start under the move.
+    version = None
+    turns: list[ChatTurn] = []
+    if "version" in provided:
+        turns = await chat_versions.conversation_turns(db, row.id)
+        version = next(
+            (turn for turn in turns if turn.id == body.version and turn.kind == MESSAGE_TURN),
+            None,
+        )
+        if version is None:
+            raise ApiError(
+                400, "invalid_request", "That is not a version of a message of this conversation"
+            )
+    if model is not None or version is not None:
+        # Under the conversation's lock, as a send decides: no turn may start under the
+        # move or the switch.
         await db.execute(select(Conversation.id).where(Conversation.id == row.id).with_for_update())
         if await _active_turn(db, row.id) is not None:
             raise ApiError(
@@ -377,10 +405,25 @@ async def update_conversation(
                 "invalid_request",
                 "This conversation is still answering; wait for it to finish",
             )
-        if model != row.model:
-            # The new model has no cache of this history (docs/chat.md § Compaction).
-            values["model"] = model
-            values["cache_warm_until"] = None
+    if model is not None and model != row.model:
+        # The new model has no cache of this history (docs/chat.md § Compaction).
+        values["model"] = model
+        values["cache_warm_until"] = None
+    if version is not None:
+        # The branch under the chosen version, down to the turn that continued it last;
+        # with it the summary row its replay starts from, and the context size and the
+        # cache clock cleared — what the next call replays only that call reports
+        # (docs/chat.md § History is append-only, *An edited message starts a version*).
+        head_id = chat_versions.newest_leaf(turns, version.id)
+        if head_id != row.head_id:
+            values.update(
+                head_id=head_id,
+                compacted_message_id=await chat_versions.branch_boundary(
+                    db, chat_versions.branch(turns, head_id)
+                ),
+                context_tokens=None,
+                cache_warm_until=None,
+            )
     await db.execute(update(Conversation).where(Conversation.id == row.id).values(**values))
     await db.commit()
     await db.refresh(row)
@@ -469,6 +512,64 @@ async def _ready_to_chat(
     return setting, picked or offered[0]
 
 
+async def _admitted(
+    db: AsyncSession, settings: AppSettings, user: SessionUser, row: Conversation
+) -> tuple:
+    """The admission a message and an edit share (docs/chat.md § Conversations, turns,
+    events): the workspace's quota, the locks, the live-document check, the model fixed on
+    a first send, the per-user cap and one turn at a time. Returns the conversation's row
+    as locked — its title, head and summary row, read under the lock — the document, the
+    chat agent's settings and the conversation's turns, read under the lock too: the branch
+    a message joins is decided where no other send can move it."""
+    # A full workspace runs no turn (docs/workspace.md § Quota): refused here, where the
+    # reader is told at once, rather than as a turn that fails after it was accepted.
+    await ensure_within_quota(db, settings, user.id, user_root(settings.workspaces_dir, user.id))
+    # Enforced where the decisions are made, under row locks held until this transaction
+    # commits (PostgreSQL; the SQLite fallback runs one request at a time): the user's row
+    # for the per-user cap, so two sends to different conversations cannot both slip under
+    # it, then the conversation's for one turn at a time — always in that order.
+    await db.execute(select(User.id).where(User.id == user.id).with_for_update())
+    # The title read under the lock too: a rename that landed after `row` was read must
+    # not be overwritten by the first line of a first message.
+    locked = (
+        await db.execute(
+            select(
+                Conversation.id,
+                Conversation.title,
+                Conversation.head_id,
+                Conversation.compacted_message_id,
+            )
+            .where(Conversation.id == row.id)
+            .with_for_update()
+        )
+    ).first()
+    if locked is None:
+        # Deleted while this send waited for the lock: a clean 404, not rows inserted
+        # for a conversation that is gone (docs/chat.md § Conversations).
+        raise ApiError(404, "invalid_request", "No such conversation")
+    # Under the user's row lock, which a move to the Trash takes before it marks the row:
+    # no turn starts on a file in the Trash, and none queued here is missed by its check
+    # for unfinished turns (docs/workspace.md § The Trash).
+    document = await db.get(Document, row.document_id)
+    if document is None or not is_live(document, await user_folders(db, user.id)):
+        raise ApiError(409, "invalid_request", "This file is in the Trash; put it back to continue")
+    setting, model = await _ready_to_chat(db, settings, user.id, needs_model=row.model is None)
+    if row.model is None and model is not None:
+        # The model the message was sent under, fixed as it is accepted: a change on the
+        # Agent page while the turn waits in the queue does not reach it (docs/chat.md).
+        row.model = model
+    if await count_active_turns(db, user.id) >= settings.max_chat_turns_per_user:
+        raise ApiError(
+            429,
+            "rate_limit",
+            "Too many running conversations; wait for one to finish",
+            headers={"Retry-After": str(settings.chat_retry_after_seconds)},
+        )
+    if await _active_turn(db, row.id) is not None:
+        raise ApiError(409, "invalid_request", "This conversation is still answering")
+    return locked, document, setting, await chat_versions.conversation_turns(db, row.id)
+
+
 @router.post(
     "/conversations/{conversation_id}/messages",
     dependencies=[CsrfGuard],
@@ -499,55 +600,18 @@ async def post_message(
     if not body.text.strip() and command is None and not attachment_ids:
         raise ApiError(400, "invalid_request", "The message needs text, a command or a file")
     row = await owned_conversation(db, user.id, conversation_id)
-    # A full workspace runs no turn (docs/workspace.md § Quota): refused here, where the
-    # reader is told at once, rather than as a turn that fails after it was accepted.
-    await ensure_within_quota(db, settings, user.id, user_root(settings.workspaces_dir, user.id))
-    # Enforced where the decisions are made, under row locks held until this transaction
-    # commits (PostgreSQL; the SQLite fallback runs one request at a time): the user's row
-    # for the per-user cap, so two sends to different conversations cannot both slip under
-    # it, then the conversation's for one turn at a time — always in that order.
-    await db.execute(select(User.id).where(User.id == user.id).with_for_update())
-    # The title read under the lock too: a rename that landed after `row` was read must
-    # not be overwritten by the first line below.
-    locked = (
-        await db.execute(
-            select(Conversation.id, Conversation.title)
-            .where(Conversation.id == row.id)
-            .with_for_update()
-        )
-    ).first()
-    if locked is None:
-        # Deleted while this send waited for the lock: a clean 404, not rows inserted
-        # for a conversation that is gone (docs/chat.md § Conversations).
-        raise ApiError(404, "invalid_request", "No such conversation")
-    # Under the user's row lock, which a move to the Trash takes before it marks the row:
-    # no turn starts on a file in the Trash, and none queued here is missed by its check
-    # for unfinished turns (docs/workspace.md § The Trash).
-    document = await db.get(Document, row.document_id)
-    if document is None or not is_live(document, await user_folders(db, user.id)):
-        raise ApiError(409, "invalid_request", "This file is in the Trash; put it back to continue")
-    setting, model = await _ready_to_chat(db, settings, user.id, needs_model=row.model is None)
-    if row.model is None and model is not None:
-        # The model the message was sent under, fixed as it is accepted: a change on the
-        # Agent page while the turn waits in the queue does not reach it (docs/chat.md).
-        row.model = model
-    if await count_active_turns(db, user.id) >= settings.max_chat_turns_per_user:
-        raise ApiError(
-            429,
-            "rate_limit",
-            "Too many running conversations; wait for one to finish",
-            headers={"Retry-After": str(settings.chat_retry_after_seconds)},
-        )
-    if await _active_turn(db, row.id) is not None:
-        raise ApiError(409, "invalid_request", "This conversation is still answering")
+    locked, document, setting, turns = await _admitted(db, settings, user, row)
+    # The message continues the branch the conversation shows, measured from that branch's
+    # summary row, both as locked (docs/chat.md § History is append-only, *An edited
+    # message starts a version*).
+    shown = chat_versions.branch(turns, locked.head_id)
+    path = [turn.id for turn in shown]
+    boundary = locked.compacted_message_id
     # Under the conversation's lock: a history past the cap takes no further message, or
     # capped-size sends would grow it without end while every turn on it failed
     # (docs/chat.md § History is append-only). What a turn replays: from the last
     # compaction's summary on (docs/chat.md § Compaction).
-    if (
-        await history_bytes(db, row.id, since=row.compacted_message_id)
-        > settings.chat_history_max_bytes
-    ):
+    if await history_bytes(db, row.id, since=boundary, path=path) > settings.chat_history_max_bytes:
         raise ApiError(409, "invalid_request", HISTORY_FULL)
 
     # The reader's `/compact`: the runner's own command, never a skill's name
@@ -561,19 +625,11 @@ async def post_message(
                 400, "nothing_to_compact", "There is nothing to compact in this conversation"
             )
 
-    skill = None
-    if command is not None and not compact:
-        rows = (await db.execute(select(Skill).where(Skill.user_id == user.id))).scalars().all()
-        skill = next(
-            (
-                candidate
-                for candidate in skill_defs.resolve_skills(rows)
-                if candidate.name == command and candidate.user_invocable
-            ),
-            None,
-        )
-        if skill is None:
-            raise ApiError(400, "invalid_request", f"No command /{command}")
+    skill = (
+        await _invocable_skill(db, user.id, command)
+        if command is not None and not compact
+        else None
+    )
 
     # The attachments first, images before files, as the Messages API advises; each was
     # prepared at its upload, and the send embeds and deletes it (docs/chat.md § What a
@@ -627,27 +683,8 @@ async def post_message(
             }
         )
     if skill is not None:
-        rendered = skill_defs.render_skill(skill.body, body.text)
-        # Sent with a selection or sections, the command runs on them alone. The range is
-        # this line's, not the body's: a body can be older than the range it is sent with
-        # (docs/chat.md § Skills, *A command keeps to what it was sent with*).
-        ranges = (["the selection above"] if selection else []) + [
-            f'the section "{heading}"' for heading, _ in sections
-        ]
-        if ranges:
-            *rest, last = ranges
-            named = f"{', '.join(rest)} and {last}" if rest else last
-            rendered += (
-                f"\n\nRun it on {named} only: the rest of the document is outside its range."
-            )
         content.append(
-            {
-                "type": "text",
-                "text": f"The user ran the skill /{skill.name}. Follow its instructions:\n\n"
-                f"{rendered}",
-                "context": "skill",
-                "skill": skill.name,
-            }
+            _skill_block(skill, body.text, bool(selection), [heading for heading, _ in sections])
         )
     # The document's revision as the message is accepted, the reader's locale and the
     # languages they chose: with the message rather than in the system prompt, so an edit
@@ -668,10 +705,7 @@ async def post_message(
     # carry a history from under the cap to past it, and the turn would then fail before
     # its first call with the attachments spent. Refused here instead, so the rollback
     # keeps them for a new conversation.
-    if (
-        await history_bytes(db, row.id, since=row.compacted_message_id)
-        > settings.chat_history_max_bytes
-    ):
+    if await history_bytes(db, row.id, since=boundary, path=path) > settings.chat_history_max_bytes:
         raise ApiError(409, "invalid_request", HISTORY_FULL)
     if not locked.title and not compact:
         named = visible.strip() or (attachments[0][0].name if attachments else "")
@@ -685,6 +719,7 @@ async def post_message(
         message_id=message.id,
         locale=body.locale,
         kind=COMPACT_TURN if compact else MESSAGE_TURN,
+        parent_id=path[-1] if path else None,
     )
     # The turn's entry, under the user's row lock taken above: a send needs the minimum
     # balance, and what the turn costs is settled on it as it runs (docs/billing.md
@@ -704,15 +739,195 @@ async def post_message(
         raise insufficient_credits(exc) from exc
     # The conversation list orders by it: the thread continued last is listed first.
     row.updated_at = utcnow()
+    # The turn continues the branch, and the conversation shows it (docs/chat.md § History
+    # is append-only, *An edited message starts a version*).
+    row.head_id = turn.id
     # The message belongs to the turn that answers it: a reloaded thread groups by turn.
     message.turn_id = turn.id
     await db.commit()
     # Embedded now: the prepared files have nothing left to wait for.
     for attachment, _ in attachments:
-        path = prepared_path(Path(settings.upload_dir), attachment.id, attachment.media_type)
+        prepared = prepared_path(Path(settings.upload_dir), attachment.id, attachment.media_type)
         with contextlib.suppress(OSError):
-            await asyncio.to_thread(path.unlink, missing_ok=True)
+            await asyncio.to_thread(prepared.unlink, missing_ok=True)
     return {"turn_id": str(turn.id), "message_id": message.id}
+
+
+class MessageEdit(BaseModel):
+    """The new text of a sent message — the arguments, for a command — and the web app's
+    locale (docs/api.md)."""
+
+    text: str = ""
+    locale: str = Field(default="en", max_length=16, pattern=r"^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$")
+
+
+@router.post(
+    "/conversations/{conversation_id}/messages/{message_id}/edit",
+    dependencies=[CsrfGuard],
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def edit_message(
+    conversation_id: int,
+    message_id: int,
+    body: MessageEdit,
+    user: SessionUser,
+    db: DbSession,
+    settings: AppSettings,
+):
+    """A sent message sent again with new text, as a version of its own (docs/chat.md
+    § History is append-only, *An edited message starts a version*): a new user message and
+    a new turn, the edited turn's sibling, which the conversation then shows. The old
+    message, its turn and its answer stay where they are, and nothing stored is rewritten:
+    the branch the new version joins is the edited turn's ancestry, whose prefix the model
+    has cached and whose thinking blocks stay valid."""
+    if len(body.text) > settings.chat_message_max_chars:
+        raise ApiError(400, "invalid_request", "The message is too long")
+    row = await owned_conversation(db, user.id, conversation_id)
+    original = await db.get(Message, message_id)
+    if original is None or original.conversation_id != row.id or original.role != "user":
+        raise ApiError(404, "invalid_request", "No such message")
+    locked, document, setting, turns = await _admitted(db, settings, user, row)
+    edited = next((turn for turn in turns if turn.id == original.turn_id), None)
+    # Only a `message` turn's own user message: not a compaction's instruction, nor the
+    # summary it left (docs/chat.md § Compaction).
+    if edited is None or edited.kind != MESSAGE_TURN or edited.message_id != original.id:
+        raise ApiError(404, "invalid_request", "That message cannot be edited")
+    # The branch the new version joins — the turns before the edited one — and its own
+    # summary row, which the history cap is measured from and the conversation keeps.
+    joined = [] if edited.parent_id is None else chat_versions.branch(turns, edited.parent_id)
+    path = [turn.id for turn in joined]
+    boundary = await chat_versions.branch_boundary(db, joined)
+    if await history_bytes(db, row.id, since=boundary, path=path) > settings.chat_history_max_bytes:
+        raise ApiError(409, "invalid_request", HISTORY_FULL)
+    # What the message carried, as stored: its attachments, its selection, sections and
+    # quote; the text is the reader's new one, the skill's body is rendered again from the
+    # skill as it is now, and the turn block is this send's (docs/chat.md § What a user
+    # message carries).
+    carried = [block for block in original.content if isinstance(block, dict)]
+    attachments = [
+        block
+        for block in carried
+        if block.get("type") == "image" or block.get("context") == "attachment"
+    ]
+    selection = [block for block in carried if block.get("context") == "selection"]
+    sections = [block for block in carried if block.get("context") == SECTION_CONTEXT]
+    quote = [block for block in carried if block.get("context") == "quote"]
+    command = next((block for block in carried if block.get("context") == "skill"), None)
+    skill = (
+        await _invocable_skill(db, user.id, str(command.get("skill") or ""))
+        if command is not None
+        else None
+    )
+    if skill is not None:
+        arguments = body.text.strip()
+        visible = f"/{skill.name}" + (f" {arguments}" if arguments else "")
+    else:
+        visible = body.text
+    if not visible.strip() and not attachments:
+        raise ApiError(400, "invalid_request", "The message needs text, a command or a file")
+    content: list[dict] = list(attachments)
+    if visible.strip():
+        content.append({"type": "text", "text": visible})
+    content += selection + sections + quote
+    if skill is not None:
+        content.append(
+            _skill_block(
+                skill,
+                body.text,
+                bool(selection),
+                [str(block.get("section") or "") for block in sections],
+            )
+        )
+    revision = await current_revision(db, settings, document)
+    note = turn_note(
+        revision,
+        body.locale,
+        setting.answer_language if setting else None,
+        setting.translate_language if setting else None,
+    )
+    content.append({"type": "text", "text": note, "context": TURN_CONTEXT})
+    message = Message(conversation_id=row.id, role="user", content=content)
+    db.add(message)
+    await db.flush()
+    # Again with the message in, measured as the worker measures it (the send does the same).
+    if await history_bytes(db, row.id, since=boundary, path=path) > settings.chat_history_max_bytes:
+        raise ApiError(409, "invalid_request", HISTORY_FULL)
+    turn = await enqueue_turn(
+        db,
+        user_id=user.id,
+        conversation_id=row.id,
+        message_id=message.id,
+        locale=body.locale,
+        parent_id=edited.parent_id,
+    )
+    try:
+        await ledger.reserve(
+            db,
+            settings,
+            user_id=user.id,
+            kind=ledger.CHAT,
+            amount=0,
+            turn_id=turn.id,
+            model=row.model,
+            minimum=settings.chat_min_credits,
+        )
+    except ledger.InsufficientCredits as exc:
+        raise insufficient_credits(exc) from exc
+    row.updated_at = utcnow()
+    # The new version is what the conversation shows and continues, with the summary row,
+    # the context size and the cache clock its branch's: what the next call replays only
+    # that call reports (docs/chat.md § History is append-only, *An edited message starts
+    # a version*).
+    row.head_id = turn.id
+    row.compacted_message_id = boundary
+    row.context_tokens = None
+    row.cache_warm_until = None
+    message.turn_id = turn.id
+    await db.commit()
+    return {"turn_id": str(turn.id), "message_id": message.id}
+
+
+async def _invocable_skill(
+    db: AsyncSession, user_id: int, command: str
+) -> skill_defs.ResolvedSkill:
+    """The skill a command names, as the caller can run it now (docs/chat.md § Skills);
+    **400** for a name that is no such skill — or no longer is."""
+    rows = (await db.execute(select(Skill).where(Skill.user_id == user_id))).scalars().all()
+    skill = next(
+        (
+            candidate
+            for candidate in skill_defs.resolve_skills(rows)
+            if candidate.name == command and candidate.user_invocable
+        ),
+        None,
+    )
+    if skill is None:
+        raise ApiError(400, "invalid_request", f"No command /{command}")
+    return skill
+
+
+def _skill_block(
+    skill: skill_defs.ResolvedSkill, arguments: str, has_selection: bool, headings: list[str]
+) -> dict:
+    """The block that carries a command's skill to the model: its body rendered with the
+    arguments, kept to the selection and the sections the message carries."""
+    rendered = skill_defs.render_skill(skill.body, arguments)
+    # Sent with a selection or sections, the command runs on them alone. The range is
+    # this line's, not the body's: a body can be older than the range it is sent with
+    # (docs/chat.md § Skills, *A command keeps to what it was sent with*).
+    ranges = (["the selection above"] if has_selection else []) + [
+        f'the section "{heading}"' for heading in headings
+    ]
+    if ranges:
+        *rest, last = ranges
+        named = f"{', '.join(rest)} and {last}" if rest else last
+        rendered += f"\n\nRun it on {named} only: the rest of the document is outside its range."
+    return {
+        "type": "text",
+        "text": f"The user ran the skill /{skill.name}. Follow its instructions:\n\n{rendered}",
+        "context": "skill",
+        "skill": skill.name,
+    }
 
 
 def _checked_sections(

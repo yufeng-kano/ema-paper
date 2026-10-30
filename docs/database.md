@@ -203,7 +203,9 @@ usage_log        id PK, user_id FK, job_id FK NULL, turn_id FK chat_turns NULL,
 conversations    id PK, user_id FK, document_id FK documents, title, session,
                  model NULL, memory_ids JSONB NULL, memory_file TEXT NULL,
                  compacted_message_id NULL,          -- a messages.id, no FK (below)
-                 context_tokens NULL, cache_warm_until NULL, created_at, updated_at
+                 context_tokens NULL, cache_warm_until NULL,
+                 head_id NULL,                       -- a chat_turns.id, no FK (below)
+                 created_at, updated_at
                  INDEX (document_id, updated_at)
                  INDEX (cache_warm_until) WHERE cache_warm_until IS NOT NULL
                  INDEX (model)                    -- the console's count of what a price
@@ -224,12 +226,18 @@ conversations    id PK, user_id FK, document_id FK documents, title, session,
                  -- what the last model call replayed and produced, and
                  -- `cache_warm_until` when the prompt cache it touched expires —
                  -- what the idle compaction pass reads through the partial
-                 -- index (chat.md § Compaction)
+                 -- index (chat.md § Compaction); `head_id` the turn whose
+                 -- branch the conversation shows, NULL until its first turn —
+                 -- no foreign key either, for the same cycle: a turn goes
+                 -- only with its conversation (chat.md § History, *An edited
+                 -- message starts a version*)
 messages         id PK, conversation_id FK, role user|assistant, content JSONB,
                  turn_id FK chat_turns NULL, created_at
                  INDEX (conversation_id, id)
                  -- content blocks exactly as sent to / received from the model;
-                 -- replayed verbatim on every later request (chat.md § History)
+                 -- replayed verbatim on every later request (chat.md § History);
+                 -- `turn_id` NULL on a row stored before turns were recorded,
+                 -- which precedes every turn and is on every branch
                  -- `normalize library names` (c8f28f7cd45e): a data migration that NFC-normalizes
                  -- every folder and document name and suffixes the later of two entries
                  -- of one parent that then share a name, folders before documents, by
@@ -238,7 +246,8 @@ messages         id PK, conversation_id FK, role user|assistant, content JSONB,
 chat_turns       id UUID PK, user_id FK, conversation_id FK, message_id FK messages,
                  kind message|compact|idle_compact NOT NULL DEFAULT 'message',
                  status queued|running|succeeded|failed|cancelled, error NULL,
-                 locale, created_at, started_at NULL, finished_at NULL
+                 locale, created_at, started_at NULL, finished_at NULL,
+                 parent_id NULL                   -- a chat_turns.id, no FK (below)
                  INDEX (status, created_at)
                  INDEX (conversation_id, finished_at)
                                                   -- the stream's "is a turn unfinished"
@@ -246,7 +255,13 @@ chat_turns       id UUID PK, user_id FK, conversation_id FK, message_id FK messa
                                                   -- ask by conversation
                  -- the chat agent's queue, one row per user message — or per
                  -- compaction, `kind` saying which (chat.md § Compaction) —
-                 -- claimed like jobs
+                 -- claimed like jobs; `parent_id` the turn before it on its
+                 -- branch, NULL for a conversation's first — a self-reference
+                 -- without a foreign key: the rows go only with their
+                 -- conversation, which takes them together. Turns with one
+                 -- parent are the versions of one message, and
+                 -- `conversations.head_id` names the branch shown (chat.md
+                 -- § History, *An edited message starts a version*)
 chat_events      id PK, conversation_id FK, turn_id FK, seq, event, data JSONB,
                  created_at
                  UNIQUE (conversation_id, seq)
@@ -466,6 +481,7 @@ runtime_settings key VARCHAR(64) PK,              -- one of the twelve keys the 
 - **The operator console migration** (`operator console groups and audit log`, 2026-10-27) created `groups`, `group_members` and `audit_log`, with their constraints and indexes — the partial unique index that keeps one built-in group among them — and one row: the built-in group, `owner`, `builtin` true, an empty permission list (it holds every permission by the flag) and no members ([admin.md](./admin.md) § Groups). The name is copied into the migration, never imported. No existing row is read or rewritten: nobody is an owner until an `OWNER_EMAILS` address signs in. The code creates the same row when it finds none, since a database built from the models — the tests' — has no seed. Its downgrade drops the three tables — the groups, their members and the audit record go with them, so it is not run on a database whose record matters.
 - **The console's grants migration** (`credit packs from console grants`, 2026-10-27) widened the check on `credit_packs.source` from `pay` and `code` to `pay`, `code` and `grant`, so an operator's credit grant is a pack like a code's ([billing.md](./billing.md) § Operator grants, [admin.md](./admin.md) § Users and grants); `source` is `String(8)`, which `grant` fits. No row is read or rewritten. Its downgrade narrows the check back and refuses while any pack has `source = grant`, naming the count — those packs could otherwise only be deleted from the billing record or relabelled as something they are not.
 - **The runtime settings migration** (`runtime settings`, 2026-10-27) created `runtime_settings`, empty, and `ix_conversations_model` on `conversations.model`, which the settings page's confirmation counts through ([admin.md](./admin.md) § Settings). No existing row is read or rewritten: every setting stays `.env`'s until an operator stores one. Its downgrade drops the index and the table — the stored settings go with it, and `.env`'s are in effect again.
+- **The versions migration** (`conversation message versions`, 2026-10-30) added `chat_turns.parent_id` and `conversations.head_id`, both nullable UUIDs without a foreign key, and backfilled them from the rows as they stood: each turn's parent is the turn of its conversation made before it — by `created_at`, then id — and each conversation's head its newest turn, so every existing conversation is one branch holding every turn, exactly what it showed before ([chat.md](./chat.md) § History is append-only, *An edited message starts a version*). No other row is read or rewritten. Its downgrade drops the two columns: a conversation that edited a message meanwhile then shows every version's turn in one thread, in the order they were made, and replays them all.
 - **A stored setting is the text, not the value it reads as.** `runtime_settings.value` is a JSON string holding exactly what `.env` would — `"0.002"`, `"[{\"planId\": \"pro\", …}]"` — never the number or the JSON it parses to: `jsonb` keeps no object key order, and `MODEL_PRICES_JSON`'s order is the chat agent's model order. The settings are parsed and checked from that text as from `.env` ([admin.md](./admin.md) § Settings).
 - **The console's tables say who may do what, and what was done; the permissions themselves are code.** `groups.permissions` is a JSON list rather than an array type (the SQLite fallback the tests run on has none), normalized before it is written and read whole — no query looks inside it — and the strings it may hold are `ALL_PERMISSIONS` ([admin.md](./admin.md) § Permissions), so a new permission needs no migration. One group carries `builtin`, which the code checks instead of a name. `audit_log` is append-only: a row is written in the transaction of the change it records and never updated or deleted, its `before` and `after` hold ids, amounts, flags, permission strings, group names, plan ids and dates as ISO 8601 strings — never an address, a person's name, content or a secret; who a row is about is joined from `users` when it is read — and `target_id` is text with no foreign key — a group's, an account's or a code's id, a job's UUID, a setting's key — the rule `jobs.connection_id` follows for history. The one free text a row holds is a grant's optional `reason` in `after`, the operator's own note, written under the same rule ([admin.md](./admin.md) § Users and grants); it stays when the account it is about is deleted, as the row does. A day grant's `after` also keeps the request's `request_id`, and that is the one query that looks inside `after`: a day grant sent again is found by `after ->> 'request_id'` among that account's `users.grant_days` rows — narrowed by the `(target_type, target_id)` index, under the account's row lock — since days have no row of their own to carry the id.
 - **The credit packs migration** (`credit packs`) created `credit_packs`, `credit_pack_entries` and `pack_checkouts`, empty, with their constraints and indexes ([billing.md](./billing.md) § The ledger). No existing row is read or rewritten: nothing changes for a user until a pack is bought. Its downgrade drops the three tables and nothing else — packs already bought are lost with them, so it is not run on a database that sold one.

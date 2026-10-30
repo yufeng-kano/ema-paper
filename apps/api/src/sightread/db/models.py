@@ -558,6 +558,12 @@ class Conversation(Base):
     # no cache (docs/chat.md § Compaction).
     context_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cache_warm_until: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
+    # The turn whose branch the conversation shows and continues: an edited message makes
+    # a sibling turn and moves it, a version switch moves it back; NULL until the first
+    # turn. No foreign key, for the same cycle as `compacted_message_id`: a turn goes only
+    # with its conversation (docs/chat.md § History is append-only, *An edited message
+    # starts a version*).
+    head_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
 
@@ -598,6 +604,12 @@ class ChatTurn(Base):
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     started_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
+    # The turn before this one on its branch, NULL for a conversation's first: turns with
+    # one parent are the versions of one message, and `conversations.head_id` names the
+    # branch shown. A self-reference without a foreign key — the rows go only with their
+    # conversation, which takes them together (docs/chat.md § History is append-only, *An
+    # edited message starts a version*).
+    parent_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
 
 
 class ChatToolCall(Base):

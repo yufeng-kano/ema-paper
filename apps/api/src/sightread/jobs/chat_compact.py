@@ -33,6 +33,7 @@ from ..errors import ApiError
 from ..runtime_settings import RuntimeSettings
 from ..workspace.documents import current_revision, ensure_within_quota, is_live, user_folders
 from ..workspace.layout import user_root
+from . import chat_versions
 from .queue import count_active_turns, enqueue_turn, history_bytes
 
 logger = logging.getLogger(__name__)
@@ -68,12 +69,13 @@ def compact_message_content(*, visible: str | None, focus: str | None, note: str
 
 async def compactable_ids(db: AsyncSession, conversation_ids: list[int]) -> set[int]:
     """The conversations among `conversation_ids` with an assistant message since their last
-    summary — something to compact (docs/chat.md § Compaction)."""
+    summary on the branch they show — something to compact (docs/chat.md § Compaction;
+    § History is append-only, *An edited message starts a version*)."""
     if not conversation_ids:
         return set()
     rows = (
         await db.execute(
-            select(Message.conversation_id)
+            select(Message.conversation_id, Message.turn_id)
             .join(Conversation, Conversation.id == Message.conversation_id)
             .where(
                 Message.conversation_id.in_(conversation_ids),
@@ -82,8 +84,42 @@ async def compactable_ids(db: AsyncSession, conversation_ids: list[int]) -> set[
             )
             .distinct()
         )
-    ).scalars()
-    return set(rows)
+    ).all()
+    answered: dict[int, set] = {}
+    for conversation_id, turn_id in rows:
+        answered.setdefault(conversation_id, set()).add(turn_id)
+    if not answered:
+        return set()
+    heads = dict(
+        (
+            await db.execute(
+                select(Conversation.id, Conversation.head_id).where(
+                    Conversation.id.in_(list(answered))
+                )
+            )
+        ).all()
+    )
+    turns: dict[int, list[ChatTurn]] = {}
+    for turn in (
+        await db.execute(
+            select(ChatTurn)
+            .where(ChatTurn.conversation_id.in_(list(answered)))
+            .order_by(ChatTurn.created_at, ChatTurn.id)
+        )
+    ).scalars():
+        turns.setdefault(turn.conversation_id, []).append(turn)
+    compactable: set[int] = set()
+    for conversation_id, turn_ids in answered.items():
+        on_branch = {
+            turn.id
+            for turn in chat_versions.branch(
+                turns.get(conversation_id, []), heads.get(conversation_id)
+            )
+        }
+        # An answer of no turn precedes every turn and is on every branch.
+        if None in turn_ids or turn_ids & on_branch:
+            compactable.add(conversation_id)
+    return compactable
 
 
 async def compactable(db: AsyncSession, conversation_id: int) -> bool:
@@ -184,8 +220,13 @@ async def _enqueue_idle_compaction(db: AsyncSession, settings: Settings, row: Co
         return False
     if await unfinished_turn(db, row.id):
         return False
+    # The branch the conversation shows is what the compaction continues (docs/chat.md
+    # § History is append-only, *An edited message starts a version*).
+    shown = chat_versions.branch(await chat_versions.conversation_turns(db, row.id), row.head_id)
     if (
-        await history_bytes(db, row.id, since=row.compacted_message_id)
+        await history_bytes(
+            db, row.id, since=row.compacted_message_id, path=[turn.id for turn in shown]
+        )
         > settings.chat_history_max_bytes
     ):
         return False
@@ -217,6 +258,7 @@ async def _enqueue_idle_compaction(db: AsyncSession, settings: Settings, row: Co
                 message_id=message.id,
                 locale=locale,
                 kind=IDLE_COMPACT_TURN,
+                parent_id=shown[-1].id if shown else None,
             )
             await ledger.reserve(
                 db,
@@ -229,6 +271,13 @@ async def _enqueue_idle_compaction(db: AsyncSession, settings: Settings, row: Co
                 minimum=settings.chat_min_credits,
             )
             message.turn_id = turn.id
+            # The compaction continues the branch, and the head follows it — written with
+            # `updated_at` kept, as every write of the idle pass is.
+            await db.execute(
+                update(Conversation)
+                .where(Conversation.id == row.id)
+                .values(head_id=turn.id, updated_at=Conversation.updated_at)
+            )
     except ledger.InsufficientCredits:
         return False
     return True
