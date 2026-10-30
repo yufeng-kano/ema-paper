@@ -1,0 +1,10 @@
+#!/bin/sh
+# `pip` in a user's VM is uv's (docs/sandbox.md § The image): what a command installs goes
+# into the default environment through uv. uv's pip has no --version of its own.
+case "$1" in
+--version | -V)
+    echo "pip here is uv pip: $(uv --version)"
+    exit 0
+    ;;
+esac
+exec uv pip "$@"

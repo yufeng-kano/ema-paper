@@ -90,7 +90,9 @@ agent-sightread/
       Dockerfile
   deploy/
     caddy/Caddyfile           # production routing + TLS
-    sandbox-image/Dockerfile  # what runs inside a user's VM: uv, poppler, rg, jq, pandoc…
+    sandbox-image/Dockerfile  # what runs inside a user's VM: uv, poppler, rg, jq, pandoc, Noto fonts…
+    sandbox-image/matplotlibrc  # matplotlib's fonts in the VM: Noto first, CJK included
+    sandbox-image/pip         # `pip` in the VM: uv's pip, into the default environment
   docs/
   docker-compose.yaml             # local full stack (pg + api + worker + web), HTTP, ports exposed
   docker-compose.production.yaml  # standalone file (-f): caddy/TLS, backups; NOT an override merge

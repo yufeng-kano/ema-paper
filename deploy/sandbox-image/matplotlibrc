@@ -1,0 +1,4 @@
+# matplotlib's fonts in a user's VM (docs/sandbox.md § The image): each glyph is drawn
+# from the first family that has it, so Latin, CJK and the rest all have one.
+font.family: sans-serif
+font.sans-serif: Noto Sans CJK TC, Noto Sans, DejaVu Sans

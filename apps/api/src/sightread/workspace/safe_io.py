@@ -496,12 +496,15 @@ def remove_empty_dir(root: Path, path: Path) -> bool:
 class Step:
     """What `walk` passes over: a directory as it is entered (`name` None) or an entry in
     it that is not a directory, with its size. `parts` are the directories from the
-    walk's top down to it, `fd` that directory's descriptor, open until the walk moves on."""
+    walk's top down to it, `fd` that directory's descriptor, open until the walk moves on.
+    `inode` is a plain file's (device, inode) when it has more than one name, so a measure
+    can count the file once; None for anything else."""
 
     parts: tuple[str, ...]
     name: str | None
     size: int
     fd: int
+    inode: tuple[int, int] | None = None
 
 
 def walk(
@@ -537,7 +540,9 @@ def walk(
             except OSError:
                 continue
             if not stat.S_ISDIR(info.st_mode):
-                yield Step(parts, name, info.st_size, current)
+                linked = stat.S_ISREG(info.st_mode) and info.st_nlink > 1
+                inode = (info.st_dev, info.st_ino) if linked else None
+                yield Step(parts, name, info.st_size, current, inode)
                 continue
             inner = (*parts, name)
             if prune is not None and prune(inner):

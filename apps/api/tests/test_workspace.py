@@ -2205,6 +2205,37 @@ def test_storage_counts_each_original_once_and_never_the_service_copies(tmp_path
     assert (shares.documents, shares.history) == (usage.documents, 0)
 
 
+def test_a_file_with_several_names_counts_once(tmp_path) -> None:
+    root = tmp_path / "ws" / "24"
+    git.ensure_repo(root)
+    # uv's way: a package's file in the cache, hard-linked into the default environment.
+    cached = root / ".cache" / "uv" / "archive-v0" / "abc" / "numpy" / "core.so"
+    cached.parent.mkdir(parents=True)
+    cached.write_bytes(b"n" * 4000)
+    installed = root / ".cache" / "venv" / "lib" / "python3.11" / "site-packages" / "core.so"
+    installed.parent.mkdir(parents=True)
+    os.link(cached, installed)
+    # A name in a document's directory, met first, carries the file; and in the Trash.
+    document = root / "files" / "paper"
+    document.mkdir(parents=True)
+    (document / ".meta.json").write_text(json.dumps({"document_id": 1}))
+    (document / "data.bin").write_bytes(b"d" * 700)
+    os.link(document / "data.bin", root / ".cache" / "data-again.bin")
+    trashed = root / ".sightread" / "trash" / "document-2"
+    trashed.mkdir(parents=True)
+    (trashed / ".meta.json").write_text(json.dumps({"document_id": 2}))
+    os.link(document / "data.bin", trashed / "data.bin")
+    # Two separate files of one size are two files.
+    (root / ".cache" / "twin-a").write_bytes(b"t" * 300)
+    (root / ".cache" / "twin-b").write_bytes(b"t" * 300)
+
+    usage = documents.storage_usage(root, tmp_path / "figures", {1: None, 2: None}, {2})
+    metas = (document / ".meta.json").stat().st_size
+    assert usage.documents[1] == metas + 700
+    assert usage.trash == (trashed / ".meta.json").stat().st_size
+    assert usage.files == metas + 700 + 4000 + 600
+
+
 async def test_a_workspace_too_deep_to_measure_is_refused_not_undercounted(
     sessionmaker, tmp_path, monkeypatch
 ) -> None:

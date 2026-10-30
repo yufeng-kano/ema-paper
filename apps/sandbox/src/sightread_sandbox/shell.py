@@ -24,6 +24,12 @@ READ_CHUNK_BYTES = 65_536
 # shells' sweeps (docs/sandbox.md § The runner). Read before any command is sent, so no
 # command can forge it.
 PID_PREFIX = "__SR_PID "
+# Where the supervisor and the runner's own scripts look programs up: the image's system
+# directories alone. The VM's PATH starts in the workspace — the default Python
+# environment, ~/.local/bin — which commands write, so a `ps`, `bash` or `pgrep` a command
+# put there must not stand in for the system's in what frames and ends the commands
+# (docs/sandbox.md § The runner). The commands themselves keep the VM's PATH.
+SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 
 @dataclass(frozen=True)
@@ -96,8 +102,11 @@ def supervisor(cleanup: str) -> str:
     a time from stdin — the per-command marker the host chose, the pids of the shells
     the cleanup must keep (`$__sr_keep_in`), the command, the marker again — runs the
     command in a fresh bash child with stdin at /dev/null, and only once that child is
-    gone runs `cleanup` and prints the marker with the status."""
+    gone runs `cleanup` and prints the marker with the status. Its own programs come
+    from `SAFE_PATH`; the child is given the PATH the supervisor was started with."""
     return f"""\
+__sr_path=$PATH
+PATH={SAFE_PATH}
 __sr_state=$(mktemp -d "${{TMPDIR:-/tmp}}/.sr-state-XXXXXX") || exit 1
 trap 'rm -rf "$__sr_state"' EXIT
 printf '{PID_PREFIX}%s\\n' "$$"
@@ -111,7 +120,7 @@ while IFS= read -r __sr_marker; do
         [ "$__sr_line" = "$__sr_marker" ] && break
         printf '%s\\n' "$__sr_line" >> "$__sr_state/cmd.sh"
     done
-    bash --norc --noprofile "$__sr_state/run.sh" "$__sr_state" </dev/null
+    PATH=$__sr_path /bin/bash --norc --noprofile "$__sr_state/run.sh" "$__sr_state" </dev/null
     __sr_status=$?
     {cleanup}
     [ "${{__sr_left:-0}}" = 0 ] || exit 5

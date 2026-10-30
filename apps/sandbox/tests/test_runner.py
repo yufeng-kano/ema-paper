@@ -429,11 +429,12 @@ async def test_a_command_cannot_forge_its_own_status_line(client, tmp_path) -> N
 
 
 def test_the_reaper_is_the_images_cmd() -> None:
-    from sightread_sandbox.backends import REAPER
+    from sightread_sandbox.backends import REAPER, REAPER_PYTHON
 
     compile(REAPER, "reaper", "exec")
     dockerfile = Path(__file__).resolve().parents[3] / "deploy" / "sandbox-image" / "Dockerfile"
-    assert json.dumps(REAPER) in dockerfile.read_text()
+    # The interpreter by its full path too: the VM's PATH starts in the workspace.
+    assert f"CMD {json.dumps([REAPER_PYTHON, '-c', REAPER])}" in dockerfile.read_text()
 
 
 async def test_a_restart_whose_in_vm_kill_fails_does_not_deadlock(tmp_path) -> None:
@@ -680,6 +681,133 @@ async def test_the_vm_scratch_size_comes_from_settings(tmp_path, monkeypatch) ->
     assert baseline in run
     assert run.index(f"{host}:/workspace") < run.index(baseline)
     assert (host / ".sightread").is_dir()
+
+
+async def test_the_default_environment_is_made_after_each_start(tmp_path, monkeypatch) -> None:
+    from sightread_sandbox import backends
+
+    calls: list[tuple[str, ...]] = []
+    env_code = 0
+
+    async def fake_docker(*args, timeout=120.0):
+        calls.append(args)
+        if args[0] == "inspect":
+            return 1, "Error: No such object"
+        if args[0] == "exec":
+            return env_code, "" if env_code == 0 else "error: no space left on device"
+        return 0, ""
+
+    monkeypatch.setattr(backends, "_docker", fake_docker)
+    settings = Settings(
+        app_env="local",
+        sandbox_token=TOKEN,
+        sandbox_backend="docker",
+        sandbox_runtime="runc",
+        sandbox_workspaces_dir=str(tmp_path / "ws"),
+        sandbox_workspaces_mount=str(tmp_path / "ws"),
+    )
+    backend = backends.DockerBackend(settings)
+    await backend.ensure_running(backend._user(71))
+    run_at = next(index for index, args in enumerate(calls) if args[0] == "run")
+    # Every program the runner starts in the VM by its full path, the reaper included.
+    assert calls[run_at][-3:] == (backends.REAPER_PYTHON, "-c", backends.REAPER)
+    assert calls[run_at + 1] == (
+        "exec",
+        "sightread-sandbox-71",
+        "/bin/sh",
+        "-c",
+        backends.DEFAULT_ENV,
+    )
+    argv, _cwd = backend.shell_argv(71)
+    assert argv[argv.index("sightread-sandbox-71") + 1 :][:4] == [
+        "/usr/bin/setsid",
+        "-w",
+        "/bin/sh",
+        "-c",
+    ]
+    # A start whose environment could not be made still gives a shell.
+    env_code = 1
+    calls.clear()
+    await backend.ensure_running(backend._user(72))
+    assert backend._user(72).started_at is not None
+
+
+def test_the_default_environment_check_only_looks(tmp_path) -> None:
+    import subprocess
+
+    from sightread_sandbox.backends import DEFAULT_ENV, SAFE_PATH
+
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    fake_uv = tmp_path / "bin" / "uv"
+    fake_uv.parent.mkdir()
+    fake_uv.write_text('#!/bin/sh\necho "uv $*" > "$VIRTUAL_ENV.made"\n')
+    fake_uv.chmod(0o755)
+    made = tmp_path / "venv.made"
+    script = DEFAULT_ENV.replace(f"PATH={SAFE_PATH}", f"PATH={fake_uv.parent}:{SAFE_PATH}")
+    env = {**os.environ, "VIRTUAL_ENV": str(venv)}
+
+    def check(environment: dict[str, str]) -> None:
+        subprocess.run(["sh", "-c", script], env=environment, check=True)  # noqa: S603, S607
+
+    # None yet: made, keeping whatever the directory holds.
+    check(env)
+    assert made.read_text() == f"uv venv --quiet --allow-existing {venv}\n"
+    made.unlink()
+    # A dangling link (the image's Python moved on) is made again, in place.
+    (venv / "bin" / "python").symlink_to(tmp_path / "gone-python3.11")
+    check(env)
+    assert made.exists()
+    made.unlink()
+    # An interpreter that is there is left as it is, and nothing of it is run.
+    (venv / "bin" / "python").unlink()
+    (venv / "bin" / "python").write_text('#!/bin/sh\ntouch "$VIRTUAL_ENV.ran"\n')
+    (venv / "bin" / "python").chmod(0o755)
+    check(env)
+    assert not made.exists() and not (tmp_path / "venv.ran").exists()
+    # An image that names no environment gets none.
+    check({key: value for key, value in env.items() if key != "VIRTUAL_ENV"})
+    assert not made.exists()
+
+
+async def test_a_program_a_command_put_first_on_the_path_does_not_run_the_cleanup(
+    tmp_path, monkeypatch
+) -> None:
+    """The VM's PATH starts in the workspace (the default environment's bin): a `pgrep`
+    a command writes there must not stand in for the system's in the cleanup that ends
+    what the command left running, nor a `bash` run the next command."""
+    from sightread_sandbox.shell import GROUP_CLEANUP, ShellSession, supervisor
+
+    planted = tmp_path / "venv" / "bin"
+    planted.mkdir(parents=True)
+    monkeypatch.setenv("PATH", f"{planted}:{os.environ['PATH']}")
+    shell = ShellSession(["sh", "-c", supervisor(GROUP_CLEANUP)], cwd=str(tmp_path), max_bytes=1000)
+    await shell.start()
+    try:
+        # The command finds its PATH as the VM gave it, and plants the fakes there.
+        outcome = await shell.run(
+            f"""case "$PATH" in {planted}:*) echo first;; esac
+printf '#!/bin/sh\nexit 1\n' > {planted}/pgrep
+printf '#!/bin/sh\necho planted\n' > {planted}/bash
+chmod 755 {planted}/pgrep {planted}/bash
+nohup sleep 30 >/dev/null 2>&1 & disown
+echo $!""",
+            timeout=10,
+        )
+        assert outcome.exit_code == 0, outcome.output
+        lines = outcome.output.split()
+        assert lines[0] == "first"
+        pid = int(lines[-1])
+        # The real pgrep ran: the job was ended (dead, or a zombie this host's init
+        # has not reaped yet).
+        status = Path(f"/proc/{pid}/status")
+        assert not status.exists() or "State:\tZ" in status.read_text()
+        after = await shell.run("echo ran; command -v pgrep", timeout=10)
+        assert after.output.split()[0] == "ran"
+        # The command itself still sees what it planted: the PATH is the VM's.
+        assert after.output.split()[1] == f"{planted}/pgrep"
+    finally:
+        await shell.close()
 
 
 def test_the_vm_sweep_repeats_until_nothing_but_the_shells_is_left(tmp_path) -> None:

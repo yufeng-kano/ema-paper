@@ -16,8 +16,8 @@ from .parse import BBOX_FORMAT_YXYX
 # Bumped when the prompt or the tool contract changes what a conversation does. Chat has
 # no dedup cache; the number is bookkeeping for the registry (docs/agents.md).
 # 10: convert_file, figure links; 11: fewer strict tools, thinking binding; 12: search
-# before guessing an address.
-PIPELINE_VERSION = 12
+# before guessing an address; 13: uv's default environment, the fonts.
+PIPELINE_VERSION = 13
 
 # Anthropic-defined tools carry no schema of their own (docs/chat.md § Tools). The order
 # is part of the cache prefix and never changes. A custom tool whose input has structure is
@@ -402,7 +402,7 @@ doc.md keeps these shapes; never remove or reorder them unless asked:
 
 # Tools
 
-- bash: a persistent shell in the VM — the working directory and exported variables carry over between commands; shell functions and unexported variables do not, and stdin is /dev/null. uv, python, poppler (pdftoppm, pdftotext), ripgrep, jq, pandoc and imagemagick are installed. {network} A command returns when it and any background jobs it started have finished, and anything still running at that point is killed — nothing survives from one command to the next. A server you need to talk to must be started, used and stopped within one command.
+- bash: a persistent shell in the VM — the working directory and exported variables carry over between commands; shell functions and unexported variables do not, and stdin is /dev/null. Python is uv's: `python` is a virtual environment kept in the workspace, `uv pip install` adds to it (`pip` is `uv pip`), and what you install stays until the user resets the sandbox. poppler (pdftoppm, pdftotext), ripgrep, jq, pandoc and imagemagick are installed, with Noto fonts for every script, CJK included, which matplotlib uses by default. {network} A command returns when it and any background jobs it started have finished, and anything still running at that point is killed — nothing survives from one command to the next. A server you need to talk to must be started, used and stopped within one command.
 - str_replace_based_edit_tool: view, str_replace, insert and create on files under /workspace. Use it for every change to doc.md and notes.md: the user sees each edit as a diff and can revert it. Do not rewrite a whole file to change one line.
 - view_page: the rendered image of one page of the original. Use it before changing any number, formula, table cell or name, and whenever the transcription reads oddly. The page is the truth; doc.md is a transcription of it.
 - view_figure: one figure crop at full resolution.
@@ -467,12 +467,12 @@ _TOOL_LINE_RE = re.compile(
 
 
 # What the VM can reach, by the runner's `SANDBOX_NETWORK` (docs/sandbox.md § Isolation):
-# the prompt never promises `uv add` on a deployment whose VM has no route to an index.
+# the prompt never promises `uv pip install` on a deployment whose VM has no route to an index.
 NETWORK_WITH_INDEX = (
-    "There is no network except the package index, so `uv add` works and nothing else does."
+    "There is no network except the package index, so `uv pip install` works and nothing else does."
 )
 NETWORK_NONE = (
-    "There is no network at all: `uv add` and anything else that reaches out fails, "
+    "There is no network at all: `uv pip install` and anything else that reaches out fails, "
     "so work with what is installed."
 )
 
@@ -511,7 +511,7 @@ def render_catalogue(
 def network_note(sandbox_network: str, sandbox_index_url: str) -> str:
     """The `{network}` fact: what the shell can reach, from the runner's own settings. A
     network alone is not an index: the VM finds a proxy only through the URL the runner
-    exports as `UV_INDEX_URL`, so both must be set for `uv add` to be promised."""
+    exports as `UV_INDEX_URL`, so both must be set for an install to be promised."""
     if sandbox_network == "none" or not sandbox_index_url.strip():
         return NETWORK_NONE
     return NETWORK_WITH_INDEX

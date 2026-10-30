@@ -2239,13 +2239,25 @@ def storage_usage(
     `figures/` the size of the document's image of that name or of its parse's crop — so
     each excuses one copy at most, wherever a shell writes `.meta.json` files.
     `.sightread/results/` (the database's result, copied for the agent) is not counted
-    either. Without `whole` only the documents' shares are wanted, and the rest of the
-    tree and the history are not walked."""
+    either. A file with several names in the tree and the Trash is one file on disk —
+    uv links a package's files from its cache into an environment — and counts once, at
+    the first name met. Without `whole` only the documents' shares are wanted, and the
+    rest of the tree and the history are not walked."""
     originals, loose_originals = _held(sources_dir(root), by_directory=False)
     images, loose_images = _held(images_dir(root), by_directory=True)
     shares: dict[int, int] = {}
     claimed: set[int] = set()
     in_trash = set(trashed)
+    linked: set[tuple[int, int]] = set()
+
+    def counted_size(step: safe_io.Step) -> int:
+        """The entry's size, or nothing for another name of a file already counted."""
+        if step.inode is None:
+            return step.size
+        if step.inode in linked:
+            return 0
+        linked.add(step.inode)
+        return step.size
 
     def crop_size(job_id: uuid.UUID | None, name: str) -> int | None:
         if job_id is None:
@@ -2288,12 +2300,13 @@ def storage_usage(
                     crop_size(jobs[owner], step.name),
                 ):
                     continue
-            counted += step.size
+            size = counted_size(step)
+            counted += size
             # What a command made inside a document's directory is the document's own.
             for depth in range(len(parts), 0, -1):
                 owner = owners.get(parts[:depth])
                 if owner is not None:
-                    shares[owner] = shares.get(owner, 0) + step.size
+                    shares[owner] = shares.get(owner, 0) + size
                     break
         return counted
 
@@ -2302,7 +2315,9 @@ def storage_usage(
     history = 0
     if whole:
         skipped = {(FILES_DIR,), (SIGHTREAD_DIR, RESULTS_DIR), (SIGHTREAD_DIR, TRASH_DIR)}
-        files += sum(step.size for step in safe_io.walk(root, root, prune=skipped.__contains__))
+        files += sum(
+            counted_size(step) for step in safe_io.walk(root, root, prune=skipped.__contains__)
+        )
         history = safe_io.tree_size(git_dir(root), git_dir(root))
     for held in (originals, images):
         for document_id, entries in held.items():

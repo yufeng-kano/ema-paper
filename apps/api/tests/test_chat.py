@@ -2788,15 +2788,15 @@ def test_the_prompt_lists_only_the_tools_the_turn_has() -> None:
     assert "- bash:" in chat_agent.render_system_prompt(chat_agent.DEFAULT_SYSTEM_PROMPT, facts)
 
 
-def test_the_prompt_promises_uv_add_only_where_the_vm_has_an_index() -> None:
+def test_the_prompt_promises_an_install_only_where_the_vm_has_an_index() -> None:
     from sightread.agents import chat as chat_agent
 
     # The runner's own settings decide: `none` is the shipped default on both examples,
     # and a network without an index URL reaches no index either.
     assert "no network at all" in chat_agent.network_note("none", "http://proxy/simple")
     assert "no network at all" in chat_agent.network_note("pypi-proxy", "")
-    assert "`uv add` works" not in chat_agent.network_note("none", "")
-    assert "`uv add` works" in chat_agent.network_note("pypi-proxy", "http://proxy/simple")
+    assert "`uv pip install` works" not in chat_agent.network_note("none", "")
+    assert "`uv pip install` works" in chat_agent.network_note("pypi-proxy", "http://proxy/simple")
     rendered = chat_agent.render_system_prompt(
         chat_agent.DEFAULT_SYSTEM_PROMPT, {"network": chat_agent.network_note("none", "")}
     )
