@@ -1528,6 +1528,7 @@ async def _run_web_read(ctx: TurnContext, name: str, tool_input: dict) -> chat_t
             url=settings.brave_search_url,
             api_key=settings.brave_search_api_key,
             timeout=settings.web_tool_timeout_seconds,
+            user_agent=settings.web_tool_user_agent,
         )
         if not outcome.is_error:
             await _record_tool_call(ctx, name, settle=True)
@@ -1544,6 +1545,7 @@ async def _run_web_read(ctx: TurnContext, name: str, tool_input: dict) -> chat_t
             url=settings.openalex_works_url,
             api_key=settings.openalex_api_key,
             timeout=settings.web_tool_timeout_seconds,
+            user_agent=settings.web_tool_user_agent,
         )
         if not outcome.is_error:
             await _record_tool_call(ctx, name, settle=False)
@@ -1556,6 +1558,7 @@ async def _run_web_read(ctx: TurnContext, name: str, tool_input: dict) -> chat_t
         max_chars=settings.chat_tool_result_max_chars,
         timeout=settings.web_tool_timeout_seconds,
         pdf_timeout=settings.chat_attachment_pdf_timeout_seconds,
+        user_agent=settings.web_tool_user_agent,
     )
 
 
@@ -1589,12 +1592,17 @@ async def _run_download(ctx: TurnContext, tool_input: dict) -> chat_tools.ToolOu
                 max_bytes=min(settings.download_max_bytes, settings.file_max_bytes),
                 room=limit - used,
                 timeout=settings.download_timeout_seconds,
+                user_agent=settings.web_tool_user_agent,
             )
         except chat_web.FetchRefused as exc:
             return chat_tools.ToolOutcome(str(exc), is_error=True)
         except (httpx.HTTPError, TimeoutError) as exc:
             logger.info("download_file could not fetch: %s", exc.__class__.__name__)
-            return chat_tools.ToolOutcome("The file could not be fetched in time.", is_error=True)
+            reason = chat_web.failure(exc, settings.download_timeout_seconds)
+            return chat_tools.ToolOutcome(
+                f"The file could not be downloaded: {reason}; {chat_web.ANOTHER_SOURCE}.",
+                is_error=True,
+            )
         if got.size == 0:
             return chat_tools.ToolOutcome(
                 "The URL answered an empty body; nothing was kept.", is_error=True

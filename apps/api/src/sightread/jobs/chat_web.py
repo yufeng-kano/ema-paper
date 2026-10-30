@@ -2,9 +2,10 @@
 scholarly search through OpenAlex, one URL read as text, and one URL downloaded into the
 user's files. All of it the worker's own HTTP — never the VM's, which stays offline
 (docs/sandbox.md § Isolation) — under one guard: only http and https, every address the
-host resolves to a global one, the connection made to the address that was checked with the
-name kept for TLS, each redirect checked again. The counting, charging and filing around a
-call belong to the runner (`chat_runner.py`); this module makes the calls."""
+host resolves to a global one, the connection made to an address that was checked with the
+name kept for TLS, each redirect checked again — and every request under the deployment's
+own User-Agent. The counting, charging and filing around a call belong to the runner
+(`chat_runner.py`); this module makes the calls."""
 
 from __future__ import annotations
 
@@ -42,7 +43,9 @@ MAX_REDIRECTS = 5
 # Read in pieces: a page or a file streams through a bounded buffer, never whole in memory
 # past its cap (docs/chat.md § Tools).
 CHUNK_BYTES = 64 * 1024
-USER_AGENT = "EmaPaper-agent/1.0"
+# What a read or a download that failed tells the model to do next: an address that refused
+# or broke off once is rarely the way to the fact (docs/chat.md § Tools).
+ANOTHER_SOURCE = "find another source rather than retrying it"
 PDF_MEDIA_TYPE = "application/pdf"
 TEXT_MEDIA_TYPES = frozenset(
     {"application/json", "application/xml", "application/x-ndjson", "application/javascript"}
@@ -89,10 +92,12 @@ def redact_request_logs() -> None:
 
 
 def resolve_host(host: str) -> list[str]:
-    """Every address the name resolves to, through the system resolver. The tests replace
-    it with a documentation address (docs/testing.md)."""
+    """Every address the name resolves to, once each, through the system resolver and in
+    its order: glibc sorts an address this host has no route to after the others — an
+    IPv6 one on a worker without IPv6 — where a sort by text would put it first. The tests
+    replace it with a documentation address (docs/testing.md)."""
     infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-    return sorted({str(info[4][0]) for info in infos})
+    return list(dict.fromkeys(str(info[4][0]) for info in infos))
 
 
 def _is_global(address: str) -> bool:
@@ -109,10 +114,10 @@ def _is_global(address: str) -> bool:
 
 @dataclass(frozen=True)
 class Target:
-    """Where a checked URL is fetched from: the URL with the checked address in place of
-    the name, and the name itself, for TLS and the `Host` header."""
+    """Where a checked URL is fetched from: the URL with each checked address in place of
+    the name, in the resolver's order, and the name itself, for TLS and the `Host` header."""
 
-    connect: httpx.URL
+    connects: tuple[httpx.URL, ...]
     host: str
     host_header: str
 
@@ -146,37 +151,48 @@ async def check_target(url: str) -> Target:
         raise FetchRefused("The URL's host could not be resolved.")
     if not all(_is_global(address) for address in addresses):
         raise FetchRefused("The URL points at a private or local network, which is not fetched.")
-    connect = parsed.copy_with(host=addresses[0])
+    connects = tuple(parsed.copy_with(host=address) for address in addresses)
     default_port = 443 if parsed.scheme == "https" else 80
     host_header = host if parsed.port in (None, default_port) else f"{host}:{parsed.port}"
-    return Target(connect=connect, host=host, host_header=host_header)
+    return Target(connects=connects, host=host, host_header=host_header)
 
 
 @contextlib.asynccontextmanager
-async def fetch(url: str, *, timeout: float) -> AsyncIterator[tuple[httpx.Response, str]]:
+async def fetch(
+    url: str, *, timeout: float, user_agent: str
+) -> AsyncIterator[tuple[httpx.Response, str]]:
     """One GET under the guard, streaming: the response (its body not read) and the URL it
-    came from after redirects, each hop checked as the first was. The whole exchange is
-    bounded by `timeout`: httpx's own is per operation, and a slow drip would otherwise
-    hold a worker for as long as it cared to."""
+    came from after redirects, each hop checked as the first was, a host's checked
+    addresses tried in turn until one connects. The whole exchange is bounded by
+    `timeout`: httpx's own is per operation, and a slow drip would otherwise hold a worker
+    for as long as it cared to."""
     async with (
         asyncio.timeout(timeout),
         httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=False,
             # Only gzip is asked for: `iter_body` inflates it a bounded piece at a time.
-            headers={"User-Agent": USER_AGENT, "Accept-Encoding": "gzip"},
+            headers={"User-Agent": user_agent, "Accept-Encoding": "gzip"},
         ) as client,
     ):
         current = url
         for _hop in range(MAX_REDIRECTS + 1):
             target = await check_target(current)
-            request = client.build_request(
-                "GET",
-                target.connect,
-                headers={"Host": target.host_header},
-                extensions={"sni_hostname": target.host},
-            )
-            response = await client.send(request, stream=True)
+            for index, connect in enumerate(target.connects):
+                request = client.build_request(
+                    "GET",
+                    connect,
+                    headers={"Host": target.host_header},
+                    extensions={"sni_hostname": target.host},
+                )
+                try:
+                    response = await client.send(request, stream=True)
+                    break
+                except httpx.ConnectError:
+                    # An address this worker cannot connect to — an IPv6 one without an
+                    # IPv6 route, a server that refuses — gives way to the next one.
+                    if index == len(target.connects) - 1:
+                        raise
             location = response.headers.get("location")
             if response.is_redirect and location:
                 await response.aclose()
@@ -188,6 +204,17 @@ async def fetch(url: str, *, timeout: float) -> AsyncIterator[tuple[httpx.Respon
                 await response.aclose()
             return
         raise FetchRefused("Too many redirects.")
+
+
+def failure(exc: Exception, timeout: float) -> str:
+    """What a call that failed on the way says happened, as it happened — never a timeout
+    for what was not one, so the model knows whether to wait, retry or look elsewhere
+    (docs/chat.md § Tools)."""
+    if isinstance(exc, (httpx.TimeoutException, TimeoutError)):
+        return f"the server did not answer within {timeout:g} seconds"
+    if isinstance(exc, httpx.ConnectError):
+        return "no connection could be made (refused, unreachable or TLS failed)"
+    return "the connection broke off before the answer was read"
 
 
 def shown(url: str) -> str:
@@ -296,11 +323,13 @@ def _upstream_failure(service: str, response: httpx.Response) -> ToolOutcome:
     )
 
 
-def _search_client(timeout: float) -> httpx.AsyncClient:
-    return httpx.AsyncClient(timeout=timeout, headers={"User-Agent": USER_AGENT})
+def _search_client(timeout: float, user_agent: str) -> httpx.AsyncClient:
+    return httpx.AsyncClient(timeout=timeout, headers={"User-Agent": user_agent})
 
 
-async def web_search(query: str, *, url: str, api_key: str, timeout: float) -> ToolOutcome:
+async def web_search(
+    query: str, *, url: str, api_key: str, timeout: float, user_agent: str
+) -> ToolOutcome:
     """The Brave Search API: ten web results as text — title, URL, snippet, age. An error
     outcome is never charged: the runner records a call only for a result (docs/chat.md
     § Tools)."""
@@ -308,7 +337,7 @@ async def web_search(query: str, *, url: str, api_key: str, timeout: float) -> T
     if not query:
         return ToolOutcome("The query is empty.", is_error=True)
     try:
-        async with asyncio.timeout(timeout), _search_client(timeout) as client:
+        async with asyncio.timeout(timeout), _search_client(timeout, user_agent) as client:
             response = await client.get(
                 url,
                 params={"q": query[:400], "count": RESULTS_PER_SEARCH},
@@ -316,7 +345,9 @@ async def web_search(query: str, *, url: str, api_key: str, timeout: float) -> T
             )
     except (httpx.HTTPError, TimeoutError) as exc:
         logger.warning("Brave did not answer: %s", exc.__class__.__name__)
-        return ToolOutcome("The web search did not answer in time; try again.", is_error=True)
+        return ToolOutcome(
+            f"The web search failed: {failure(exc, timeout)}; try again.", is_error=True
+        )
     if response.status_code != 200:
         return _upstream_failure("Brave", response)
     try:
@@ -350,7 +381,9 @@ def _authors(work: dict) -> str:
     return ", ".join(names[:3]) + (" et al." if len(names) > 3 else "")
 
 
-async def search_papers(query: str, *, url: str, api_key: str, timeout: float) -> ToolOutcome:
+async def search_papers(
+    query: str, *, url: str, api_key: str, timeout: float, user_agent: str
+) -> ToolOutcome:
     """OpenAlex works by relevance: title, year, authors, venue, DOI, citations and the
     open-access PDF's URL where OpenAlex knows one (docs/chat.md § Tools)."""
     query = query.strip()
@@ -366,13 +399,15 @@ async def search_papers(query: str, *, url: str, api_key: str, timeout: float) -
     }
     # The key as a header, never in the URL: httpx logs every request's URL at INFO.
     try:
-        async with asyncio.timeout(timeout), _search_client(timeout) as client:
+        async with asyncio.timeout(timeout), _search_client(timeout, user_agent) as client:
             response = await client.get(
                 url, params=params, headers={"Authorization": f"Bearer {api_key}"}
             )
     except (httpx.HTTPError, TimeoutError) as exc:
         logger.warning("OpenAlex did not answer: %s", exc.__class__.__name__)
-        return ToolOutcome("The paper search did not answer in time; try again.", is_error=True)
+        return ToolOutcome(
+            f"The paper search failed: {failure(exc, timeout)}; try again.", is_error=True
+        )
     if response.status_code != 200:
         return _upstream_failure("OpenAlex", response)
     try:
@@ -479,15 +514,22 @@ def _decode(data: bytes, charset: str | None) -> str:
 
 
 async def read_url(
-    url: str, *, max_bytes: int, max_chars: int, timeout: float, pdf_timeout: float
+    url: str,
+    *,
+    max_bytes: int,
+    max_chars: int,
+    timeout: float,
+    pdf_timeout: float,
+    user_agent: str,
 ) -> ToolOutcome:
     """One URL as text (docs/chat.md § Tools): the page's title and text, a PDF's text
     layer, a text file as it is; cut at `max_chars` like every tool result."""
     try:
-        async with fetch(url, timeout=timeout) as (response, final_url):
+        async with fetch(url, timeout=timeout, user_agent=user_agent) as (response, final_url):
             if response.status_code >= 400:
                 return ToolOutcome(
-                    f"{shown(final_url)} answered HTTP {response.status_code}.", is_error=True
+                    f"{shown(final_url)} answered HTTP {response.status_code}; {ANOTHER_SOURCE}.",
+                    is_error=True,
                 )
             media_type, charset = media_type_of(response)
             if media_type and not (
@@ -503,7 +545,10 @@ async def read_url(
         return ToolOutcome(str(exc), is_error=True)
     except (httpx.HTTPError, TimeoutError) as exc:
         logger.info("read_url could not fetch: %s", exc.__class__.__name__)
-        return ToolOutcome("The URL could not be fetched in time.", is_error=True)
+        return ToolOutcome(
+            f"The URL could not be read: {failure(exc, timeout)}; {ANOTHER_SOURCE}.",
+            is_error=True,
+        )
     if not media_type:
         # The server said nothing: a PDF by its magic, else text.
         media_type = PDF_MEDIA_TYPE if data.startswith(b"%PDF-") else "text/plain"
@@ -586,15 +631,18 @@ async def download(
     max_bytes: int,
     room: int,
     timeout: float,
+    user_agent: str,
 ) -> Downloaded:
     """One URL streamed into the open descriptor `fd` — the staging file the caller made
     at the top of `files/` — up to `max_bytes` and up to `room`, the storage the quota
     still allows (docs/chat.md § Tools, docs/workspace.md § Files). A body past either is
     refused: `FetchRefused` names which, and the caller removes the staging file."""
     cap = min(max_bytes, room)
-    async with fetch(url, timeout=timeout) as (response, final_url):
+    async with fetch(url, timeout=timeout, user_agent=user_agent) as (response, final_url):
         if response.status_code >= 400:
-            raise FetchRefused(f"{shown(final_url)} answered HTTP {response.status_code}.")
+            raise FetchRefused(
+                f"{shown(final_url)} answered HTTP {response.status_code}; {ANOTHER_SOURCE}."
+            )
         declared = response.headers.get("content-length")
         if declared and declared.isdigit() and int(declared) > cap:
             raise FetchRefused(_too_large(int(declared), max_bytes, room))

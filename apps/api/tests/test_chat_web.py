@@ -43,6 +43,7 @@ HOSTS = {
     "mixed.test": [PUBLIC_IP, "127.0.0.1"],
 }
 WEB_KEYS = {"brave_search_api_key": "brave-test", "openalex_api_key": "openalex-test"}
+AGENT = "EmaPaper-agent/1.0 (+https://paper.example)"
 
 
 def fake_resolver(monkeypatch) -> None:
@@ -193,8 +194,9 @@ async def test_the_agents_route_and_the_rates_say_what_the_deployment_offers(
 async def test_a_web_search_answers_results_and_is_charged_per_call(make_client, tmp_path) -> None:
     """docs/billing.md § A chat turn: an answered search adds `WEB_SEARCH_CREDITS` to the
     turn's entry on top of its tokens (two stubbed calls round up to 1), recorded as a
-    `chat_tool_calls` row; the model gets titles, URLs and plain snippets."""
-    client = await web_client(make_client, tmp_path)
+    `chat_tool_calls` row; the model gets titles, URLs and plain snippets. The call names
+    the deployment in its User-Agent, as every web tool's does (docs/chat.md § Tools)."""
+    client = await web_client(make_client, tmp_path, web_url="https://paper.example/")
     brave = respx.get(host="api.search.brave.com", path="/res/v1/web/search").mock(
         return_value=httpx.Response(200, json=brave_results("Attention", "Transformers"))
     )
@@ -210,6 +212,7 @@ async def test_a_web_search_answers_results_and_is_charged_per_call(make_client,
 
     request = brave.calls.last.request
     assert request.headers["x-subscription-token"] == "brave-test"
+    assert request.headers["user-agent"] == AGENT
     assert request.url.params["q"] == "attention is all you need"
     [result] = await tool_results(client, conversation_id)
     assert result["is_error"] is False
@@ -400,9 +403,10 @@ async def test_read_url_reads_a_page_as_text_through_the_checked_address(
     make_client, tmp_path, monkeypatch
 ) -> None:
     """docs/chat.md § Tools: the connection goes to the address the guard checked, with the
-    name kept for TLS and the Host header; the page comes back as its title and text."""
+    name kept for TLS and the Host header, under a User-Agent naming the deployment's own
+    address; the page comes back as its title and text."""
     fake_resolver(monkeypatch)
-    client = await web_client(make_client, tmp_path)
+    client = await web_client(make_client, tmp_path, web_url="https://paper.example/")
     page = respx.get(host=PUBLIC_IP, path="/paper").mock(
         return_value=httpx.Response(
             200,
@@ -426,6 +430,7 @@ async def test_read_url_reads_a_page_as_text_through_the_checked_address(
     request = page.calls.last.request
     assert request.url.host == PUBLIC_IP and request.headers["host"] == "example.org"
     assert request.extensions["sni_hostname"] == "example.org"
+    assert request.headers["user-agent"] == AGENT
     [result] = await tool_results(client, conversation_id)
     assert result["is_error"] is False
     assert result["output"] == (
@@ -449,6 +454,7 @@ async def test_read_url_reads_a_pdfs_text_layer(tmp_path, monkeypatch) -> None:
         max_chars=20_000,
         timeout=30,
         pdf_timeout=60,
+        user_agent=AGENT,
     )
     assert outcome.is_error is False
     assert outcome.content.startswith("https://example.org/paper.pdf\n\n")
@@ -474,7 +480,7 @@ async def test_read_url_refuses_what_the_guard_refuses(monkeypatch) -> None:
 
     async def read(url: str) -> chat_web.ToolOutcome:
         return await chat_web.read_url(
-            url, max_bytes=1000, max_chars=1000, timeout=5, pdf_timeout=5
+            url, max_bytes=1000, max_chars=1000, timeout=5, pdf_timeout=5, user_agent=AGENT
         )
 
     for url in (
@@ -510,7 +516,12 @@ async def test_read_url_stops_at_its_byte_cap(monkeypatch) -> None:
         )
     )
     outcome = await chat_web.read_url(
-        "https://example.org/long.txt", max_bytes=1000, max_chars=20_000, timeout=5, pdf_timeout=5
+        "https://example.org/long.txt",
+        max_bytes=1000,
+        max_chars=20_000,
+        timeout=5,
+        pdf_timeout=5,
+        user_agent=AGENT,
     )
     assert outcome.is_error is False
     assert outcome.content.split("\n\n", 1)[1].count("x") == 1000
@@ -521,9 +532,87 @@ async def test_read_url_stops_at_its_byte_cap(monkeypatch) -> None:
         )
     )
     exact = await chat_web.read_url(
-        "https://example.org/exact.txt", max_bytes=1000, max_chars=20_000, timeout=5, pdf_timeout=5
+        "https://example.org/exact.txt",
+        max_bytes=1000,
+        max_chars=20_000,
+        timeout=5,
+        pdf_timeout=5,
+        user_agent=AGENT,
     )
     assert exact.content.endswith("y" * 1000)
+
+
+@respx.mock
+async def test_read_url_tries_each_address_in_the_resolvers_order(monkeypatch) -> None:
+    """docs/chat.md § Tools: a host's checked addresses are tried in the resolver's order,
+    the next only when one cannot be connected to — a host whose IPv6 address comes first
+    is still read over IPv4 on a worker with no IPv6 route."""
+    ipv6 = "2606:4700::1111"
+
+    def getaddrinfo(host: str, port, *args, **kwargs) -> list:
+        assert host == "dual.test"
+        return [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", (ipv6, 0, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", (PUBLIC_IP, 0)),
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", (ipv6, 0, 0, 0)),
+        ]
+
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    respx.get(host=ipv6, path="/page").mock(
+        side_effect=httpx.ConnectError("[Errno 101] Network is unreachable")
+    )
+    respx.get(host=PUBLIC_IP, path="/page").mock(
+        return_value=httpx.Response(200, headers={"content-type": "text/plain"}, content=b"Words.")
+    )
+    outcome = await chat_web.read_url(
+        "https://dual.test/page",
+        max_bytes=1000,
+        max_chars=20_000,
+        timeout=5,
+        pdf_timeout=5,
+        user_agent=AGENT,
+    )
+    assert outcome.is_error is False and outcome.content == "https://dual.test/page\n\nWords."
+    assert [call.request.url.host for call in respx.calls] == [ipv6, PUBLIC_IP]
+    request = respx.calls.last.request
+    assert request.headers["host"] == "dual.test"
+    assert request.extensions["sni_hostname"] == "dual.test"
+
+
+@respx.mock
+async def test_a_failed_read_says_what_failed(monkeypatch) -> None:
+    """docs/chat.md § Tools: a read that failed says why — no connection to any of the
+    host's addresses, no answer within the time, a connection broken off — never a timeout
+    for what was not one, with the advice to find another source."""
+    fake_resolver(monkeypatch)
+    route = respx.get(host=PUBLIC_IP, path="/x")
+
+    async def read() -> str:
+        outcome = await chat_web.read_url(
+            "https://example.org/x",
+            max_bytes=1000,
+            max_chars=20_000,
+            timeout=5,
+            pdf_timeout=5,
+            user_agent=AGENT,
+        )
+        assert outcome.is_error is True
+        return outcome.content
+
+    advice = "; find another source rather than retrying it."
+    route.mock(side_effect=httpx.ConnectError("[Errno 111] Connection refused"))
+    assert await read() == (
+        "The URL could not be read: no connection could be made (refused, unreachable or TLS "
+        "failed)" + advice
+    )
+    route.mock(side_effect=httpx.ReadTimeout("timed out"))
+    assert await read() == (
+        "The URL could not be read: the server did not answer within 5 seconds" + advice
+    )
+    route.mock(side_effect=httpx.RemoteProtocolError("peer closed connection"))
+    assert await read() == (
+        "The URL could not be read: the connection broke off before the answer was read" + advice
+    )
 
 
 def test_html_to_text_and_names() -> None:
@@ -638,6 +727,9 @@ async def test_a_download_past_a_cap_or_the_quota_keeps_nothing(
         return_value=httpx.Response(200, headers={"content-type": "text/plain"}, content=b"ok")
     )
     respx.get(host=PUBLIC_IP, path="/missing").mock(return_value=httpx.Response(404))
+    respx.get(host=PUBLIC_IP, path="/refused").mock(
+        side_effect=httpx.ConnectError("[Errno 111] Connection refused")
+    )
     stub_messages(
         [
             one_call(
@@ -650,6 +742,11 @@ async def test_a_download_past_a_cap_or_the_quota_keeps_nothing(
                 "d3",
                 "download_file",
                 {"url": "https://example.org/missing", "folder": "", "name": ""},
+            ),
+            one_call(
+                "d3b",
+                "download_file",
+                {"url": "https://example.org/refused", "folder": "", "name": ""},
             ),
             one_call(
                 "d4",
@@ -667,10 +764,14 @@ async def test_a_download_past_a_cap_or_the_quota_keeps_nothing(
     conversation_id = await new_conversation(client)
     await send(client, conversation_id, text="Keep")
     await _run_queued_turn(client)
-    big, private, missing, small, capped = await tool_results(client, conversation_id)
+    big, private, missing, refused, small, capped = await tool_results(client, conversation_id)
     assert big["is_error"] and "larger than the 100 bytes" in big["output"]
     assert private["is_error"] and "private or local" in private["output"]
     assert missing["is_error"] and "HTTP 404" in missing["output"]
+    assert refused["is_error"] and refused["output"] == (
+        "The file could not be downloaded: no connection could be made (refused, unreachable "
+        "or TLS failed); find another source rather than retrying it."
+    )
     assert small["is_error"] is False and small["output"].startswith(
         "Kept a.txt (2 bytes, text/plain) in the top level"
     )
@@ -782,14 +883,24 @@ async def test_read_url_bounds_the_title_and_caps_the_whole_result(tmp_path, mon
         )
     )
     outcome = await chat_web.read_url(
-        "https://example.org/titled", max_bytes=100_000, max_chars=20_000, timeout=5, pdf_timeout=5
+        "https://example.org/titled",
+        max_bytes=100_000,
+        max_chars=20_000,
+        timeout=5,
+        pdf_timeout=5,
+        user_agent=AGENT,
     )
     assert outcome.is_error is False
     title, rest = outcome.content.split("\n", 1)
     assert title == "t" * chat_web.TITLE_MAX_CHARS
     assert rest.startswith("https://example.org/titled\n\n") and "The body is here." in rest
     small = await chat_web.read_url(
-        "https://example.org/titled", max_bytes=100_000, max_chars=100, timeout=5, pdf_timeout=5
+        "https://example.org/titled",
+        max_bytes=100_000,
+        max_chars=100,
+        timeout=5,
+        pdf_timeout=5,
+        user_agent=AGENT,
     )
     assert small.is_error is False and len(small.content) <= 100
 
@@ -797,7 +908,12 @@ async def test_read_url_bounds_the_title_and_caps_the_whole_result(tmp_path, mon
         return_value=httpx.Response(200, content=b"plain words")
     )
     untyped = await chat_web.read_url(
-        "https://example.org/untyped", max_bytes=1000, max_chars=20_000, timeout=5, pdf_timeout=5
+        "https://example.org/untyped",
+        max_bytes=1000,
+        max_chars=20_000,
+        timeout=5,
+        pdf_timeout=5,
+        user_agent=AGENT,
     )
     assert untyped.is_error is False and untyped.content.endswith("plain words")
     pdf = build_text_layer_pdf(tmp_path / "paper.pdf").read_bytes()
@@ -810,6 +926,7 @@ async def test_read_url_bounds_the_title_and_caps_the_whole_result(tmp_path, mon
         max_chars=20_000,
         timeout=5,
         pdf_timeout=5,
+        user_agent=AGENT,
     )
     assert as_pdf.is_error is False and "<html" not in as_pdf.content
     assert as_pdf.content.strip() != "https://example.org/untyped.pdf"
@@ -868,6 +985,7 @@ async def test_httpx_request_logs_carry_no_query(monkeypatch, caplog) -> None:
                 max_chars=20_000,
                 timeout=5,
                 pdf_timeout=5,
+                user_agent=AGENT,
             )
     finally:
         logging.getLogger("httpx").removeFilter(chat_web.QUERY_REDACTOR)
@@ -892,7 +1010,12 @@ async def test_a_gzipped_body_is_inflated_a_bounded_piece_at_a_time(tmp_path, mo
         )
     )
     outcome = await chat_web.read_url(
-        "https://example.org/zipped", max_bytes=100_000, max_chars=20_000, timeout=5, pdf_timeout=5
+        "https://example.org/zipped",
+        max_bytes=100_000,
+        max_chars=20_000,
+        timeout=5,
+        pdf_timeout=5,
+        user_agent=AGENT,
     )
     assert outcome.content == "Zipped\nhttps://example.org/zipped\n\nSmall words."
 
@@ -931,7 +1054,12 @@ async def test_a_gzipped_body_is_inflated_a_bounded_piece_at_a_time(tmp_path, mo
         )
     )
     bombed = await chat_web.read_url(
-        "https://example.org/bomb", max_bytes=1000, max_chars=20_000, timeout=5, pdf_timeout=5
+        "https://example.org/bomb",
+        max_bytes=1000,
+        max_chars=20_000,
+        timeout=5,
+        pdf_timeout=5,
+        user_agent=AGENT,
     )
     assert bombed.is_error is False
     assert bombed.content.endswith("[... the content goes on past what was read ...]")
@@ -957,7 +1085,12 @@ async def test_a_gzipped_body_is_inflated_a_bounded_piece_at_a_time(tmp_path, mo
         )
     )
     refused = await chat_web.read_url(
-        "https://example.org/brotli", max_bytes=1000, max_chars=20_000, timeout=5, pdf_timeout=5
+        "https://example.org/brotli",
+        max_bytes=1000,
+        max_chars=20_000,
+        timeout=5,
+        pdf_timeout=5,
+        user_agent=AGENT,
     )
     assert refused.is_error is True and "encoded as br" in refused.content
 
@@ -971,7 +1104,12 @@ async def test_a_gzipped_body_is_inflated_a_bounded_piece_at_a_time(tmp_path, mo
     fd = os.open(tmp_path / "kept", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         got = await chat_web.download(
-            "https://example.org/zipped.txt", fd, max_bytes=1_000_000, room=1_000_000, timeout=5
+            "https://example.org/zipped.txt",
+            fd,
+            max_bytes=1_000_000,
+            room=1_000_000,
+            timeout=5,
+            user_agent=AGENT,
         )
     finally:
         os.close(fd)
@@ -1003,10 +1141,19 @@ async def test_a_signed_urls_query_never_reaches_a_result(tmp_path, monkeypatch)
         max_chars=20_000,
         timeout=5,
         pdf_timeout=5,
+        user_agent=AGENT,
     )
-    assert missing.is_error and missing.content == "https://example.org/gone.txt answered HTTP 404."
+    assert missing.is_error and missing.content == (
+        "https://example.org/gone.txt answered HTTP 404; find another source rather than "
+        "retrying it."
+    )
     hopped = await chat_web.read_url(
-        "https://example.org/hop", max_bytes=1000, max_chars=20_000, timeout=5, pdf_timeout=5
+        "https://example.org/hop",
+        max_bytes=1000,
+        max_chars=20_000,
+        timeout=5,
+        pdf_timeout=5,
+        user_agent=AGENT,
     )
     assert hopped.content == "Page\nhttps://example.org/page.html\n\nWords."
     fd = os.open(tmp_path / "kept", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -1018,7 +1165,11 @@ async def test_a_signed_urls_query_never_reaches_a_result(tmp_path, monkeypatch)
                 max_bytes=1000,
                 room=1000,
                 timeout=5,
+                user_agent=AGENT,
             )
     finally:
         os.close(fd)
-    assert str(refused.value) == "https://example.org/gone.txt answered HTTP 404."
+    assert str(refused.value) == (
+        "https://example.org/gone.txt answered HTTP 404; find another source rather than "
+        "retrying it."
+    )
