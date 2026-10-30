@@ -873,15 +873,24 @@ async def edit_message(
         )
     except ledger.InsufficientCredits as exc:
         raise insufficient_credits(exc) from exc
-    row.updated_at = utcnow()
     # The new version is what the conversation shows and continues, with the summary row,
     # the context size and the cache clock its branch's: what the next call replays only
     # that call reports (docs/chat.md § History is append-only, *An edited message starts
-    # a version*).
-    row.head_id = turn.id
-    row.compacted_message_id = boundary
-    row.context_tokens = None
-    row.cache_warm_until = None
+    # a version*); `updated_at` moved as a send moves it. Written outright rather than
+    # through `row`, which was read before the lock: a switch that landed in between left
+    # another branch's summary row in the column, and a value `row` still holds — None,
+    # for a branch without one — would not be written again over it.
+    await db.execute(
+        update(Conversation)
+        .where(Conversation.id == row.id)
+        .values(
+            updated_at=utcnow(),
+            head_id=turn.id,
+            compacted_message_id=boundary,
+            context_tokens=None,
+            cache_warm_until=None,
+        )
+    )
     message.turn_id = turn.id
     await db.commit()
     return {"turn_id": str(turn.id), "message_id": message.id}

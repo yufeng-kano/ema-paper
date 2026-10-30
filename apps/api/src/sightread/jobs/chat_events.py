@@ -149,12 +149,13 @@ async def _shown_branch(
     """The turns on the branch the conversation shows, and the newest event's seq, read as
     the stream opens: the replay leaves out the events of a turn on another branch, and an
     event past that seq is a turn that started under this stream, on the shown branch by
-    construction (docs/chat.md § Conversations, turns, events)."""
+    construction (docs/chat.md § Conversations, turns, events). The seq is read first and
+    the head after it: a turn is enqueued and made the head in one transaction, and its
+    events are committed after that one, each under the conversation's row lock — so the
+    head read already reflects every turn with an event at or under the seq read (the turn
+    itself, or the branch the conversation moved to since), and no event lands between the
+    two reads as neither past the seq nor on the branch, which the other order allowed."""
     async with sessionmaker() as db:
-        head_id = (
-            await db.execute(select(Conversation.head_id).where(Conversation.id == conversation_id))
-        ).scalar_one_or_none()
-        turns = await chat_versions.conversation_turns(db, conversation_id)
         newest = (
             await db.execute(
                 select(func.coalesce(func.max(ChatEvent.seq), 0)).where(
@@ -162,6 +163,10 @@ async def _shown_branch(
                 )
             )
         ).scalar_one()
+        head_id = (
+            await db.execute(select(Conversation.head_id).where(Conversation.id == conversation_id))
+        ).scalar_one_or_none()
+        turns = await chat_versions.conversation_turns(db, conversation_id)
         return {turn.id for turn in chat_versions.branch(turns, head_id)}, int(newest)
 
 

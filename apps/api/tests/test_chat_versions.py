@@ -12,11 +12,13 @@ import httpx
 import pytest
 import respx
 from httpx import AsyncClient
+from sqlalchemy import update
 
 from sightread.agents import chat as chat_agent
-from sightread.db.models import IDLE_COMPACT_TURN, MESSAGE_TURN, Message
+from sightread.db.models import IDLE_COMPACT_TURN, MESSAGE_TURN, Conversation, Message
 from sightread.jobs import chat_compact, chat_versions
 from sightread.jobs.queue import history_bytes
+from sightread.routes import chat as chat_routes
 from sightread.routes.chat import QUOTE_PREFIX, SECTION_CONTEXT, SELECTION_PREFIX, TURN_CONTEXT
 from tests.conftest import CSRF_HEADERS
 from tests.test_chat import _run_queued_turn
@@ -348,6 +350,95 @@ async def test_an_edit_joins_its_branch_with_that_branchs_summary(chat_client) -
         compaction,
         revised,
     ]
+
+
+@respx.mock
+async def test_an_edit_writes_its_branchs_summary_row_over_a_switch_that_landed_first(
+    chat_client, monkeypatch
+) -> None:
+    """The branch fields are written outright, not through the row read before the lock:
+    a switch from another tab that lands between that read and the lock puts its branch's
+    summary row in the column, and an edit onto a branch without one — the value the stale
+    row still holds — would otherwise leave it there, and the new branch would replay from
+    another branch's summary (docs/chat.md § History is append-only, *An edited message
+    starts a version*)."""
+    client = chat_client
+    main, _ = stub_messages([DONE, SUMMARY, DONE, DONE, DONE])
+    conversation_id = await new_conversation(client)
+    await send(client, conversation_id, text="hello there")
+    await _run_queued_turn(client)
+    await send(client, conversation_id, text="", command="compact")
+    await _run_queued_turn(client)
+    boundary = (await conversation_row(client, conversation_id)).compacted_message_id
+    await send(client, conversation_id, text="after")
+    await _run_queued_turn(client)
+    shown = await detail(client, conversation_id)
+    first, _, third = (turn["id"] for turn in shown["turns"])
+    # A version of the first message: the root branch, which has no summary row.
+    edited = await edit(client, conversation_id, user_message_of(shown, first), text="hi there")
+    assert edited.status_code == 202, edited.text
+    fresh = edited.json()["turn_id"]
+    await _run_queued_turn(client)
+    assert (await conversation_row(client, conversation_id)).compacted_message_id is None
+    shown = await detail(client, conversation_id)
+
+    # The other tab goes back to the first version — its summary row with it — after this
+    # edit has read the conversation's row and before it takes the lock.
+    admitted = chat_routes._admitted
+    seen: list = []
+
+    async def admitted_after_the_switch(db, settings, user, row):
+        if not seen:
+            seen.append(row.compacted_message_id)
+            async with client.app.state.sessionmaker() as other:
+                await other.execute(
+                    update(Conversation)
+                    .where(Conversation.id == conversation_id)
+                    .values(head_id=uuid.UUID(third), compacted_message_id=boundary)
+                )
+                await other.commit()
+        return await admitted(db, settings, user, row)
+
+    monkeypatch.setattr(chat_routes, "_admitted", admitted_after_the_switch)
+    edited = await edit(client, conversation_id, user_message_of(shown, fresh), text="hi again")
+    assert edited.status_code == 202, edited.text
+    assert seen == [None]
+    row = await conversation_row(client, conversation_id)
+    assert str(row.head_id) == edited.json()["turn_id"]
+    assert row.compacted_message_id is None
+    await _run_queued_turn(client)
+    assert first_texts(main[4]["messages"]) == ["hi again"]
+
+
+@respx.mock
+async def test_the_stream_shows_the_turn_that_starts_as_it_opens(chat_client, monkeypatch) -> None:
+    """A turn sent and answered while the stream reads its snapshot is replayed whole: the
+    newest seq is read before the head, so the turn's events are past it. In the other
+    order the head read misses the turn and the seq read counts its events, which are then
+    on no branch the stream knows and not past the seq either, and are left out
+    (docs/chat.md § Conversations, turns, events)."""
+    client = chat_client
+    stub_messages([DONE, DONE])
+    conversation_id = await new_conversation(client)
+    await send(client, conversation_id, text="hello there")
+    await _run_queued_turn(client)
+
+    turns_read = chat_versions.conversation_turns
+    landed: list[str] = []
+
+    async def a_send_lands_first(db, conversation_id_read):
+        if not landed:
+            landed.append("")  # the send and its turn read the turns too: once only
+            response = await send(client, conversation_id, text="and again")
+            assert response.status_code == 202, response.text
+            landed[0] = response.json()["turn_id"]
+            await _run_queued_turn(client)
+        return await turns_read(db, conversation_id_read)
+
+    monkeypatch.setattr(chat_versions, "conversation_turns", a_send_lands_first)
+    events = await replayed_events(client, conversation_id)
+    done = [data["turn_id"] for name, data in events if name == "turn_done"]
+    assert len(done) == 2 and landed[0] == done[1]
 
 
 @respx.mock

@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ..agents import CHAT
@@ -494,9 +494,13 @@ async def _history(ctx: TurnContext) -> list[dict]:
     when there was one, and without the rows of any other compaction turn — a failed or
     cancelled attempt's instruction, tool calls and whatever summary it stored before it
     ended — but the one row the boundary names (docs/chat.md § Compaction)."""
-    on_branch = set(ctx.path)
     async with ctx.sessionmaker() as db:
-        query = select(Message).where(Message.conversation_id == ctx.conversation.id)
+        # The branch's rows alone are read: the versions edited away — their images among
+        # them — never leave the database to be dropped here.
+        query = select(Message).where(
+            Message.conversation_id == ctx.conversation.id,
+            or_(Message.turn_id.is_(None), Message.turn_id.in_(ctx.path)),
+        )
         boundary = ctx.conversation.compacted_message_id
         if boundary is not None:
             query = query.where(Message.id >= boundary)
@@ -519,8 +523,7 @@ async def _history(ctx: TurnContext) -> list[dict]:
                     [
                         {"role": row.role, "content": row.content}
                         for row in rows
-                        if (row.turn_id is None or row.turn_id in on_branch)
-                        and (row.turn_id not in compactions or row.id == boundary)
+                        if row.turn_id not in compactions or row.id == boundary
                     ],
                     ctx.binding,
                 )
