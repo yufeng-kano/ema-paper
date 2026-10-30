@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import Settings
-from .shell import GROUP_CLEANUP, ExecOutcome, ShellSession, supervisor
+from .shell import GROUP_CLEANUP, SAFE_PATH, ExecOutcome, ShellSession, supervisor
 
 logger = logging.getLogger(__name__)
 
@@ -317,7 +317,9 @@ CONTAINER_PREFIX = "sightread-sandbox-"
 # What runs as pid 1 in the VM: an init that reaps. A command's leftovers the sweep kills
 # are reparented to pid 1 and would sit there as zombies, against the VM's pid limit, if
 # pid 1 were `sleep infinity` (docs/sandbox.md § The image). The same text is the image's
-# CMD; the runner passes it so the two cannot drift.
+# CMD; the runner passes it so the two cannot drift. Named by its full path, as every
+# program the runner starts in the VM is: the VM's PATH starts in the workspace.
+REAPER_PYTHON = "/usr/bin/python3"
 REAPER = (
     "import os, time\n"
     "while True:\n"
@@ -374,6 +376,7 @@ done
 # `pgrep` from procps, which the image installs — then sweeps, keeping the shells `$2`
 # names (docs/sandbox.md § The runner).
 KILL_TREE = f"""
+PATH={SAFE_PATH}
 kill_tree() {{
     for child in $(pgrep -P "$1"); do kill_tree "$child"; done
     kill -KILL "$1" 2>/dev/null
@@ -394,10 +397,24 @@ exit 0
 # A VM a previous runner left running: its shells are gone with that process, so there is
 # nothing to keep, and whatever still runs is a command nobody will commit.
 ADOPT_SWEEP = f"""
+PATH={SAFE_PATH}
 __sr_keep_in=""
 {VM_SWEEP}
 [ "$__sr_left" = 0 ] || exit 5
 exit 0
+"""
+
+
+# The default Python environment the image names in `VIRTUAL_ENV`, made after each start
+# when its interpreter is missing — a new workspace, a reset, an image whose Python moved
+# on and left the link dangling — keeping whatever is installed in it (docs/sandbox.md
+# § The image). Nothing the VM wrote is run to decide: `-x` only looks. An image that
+# names no environment gets none.
+DEFAULT_ENV = f"""
+PATH={SAFE_PATH}
+[ -n "$VIRTUAL_ENV" ] || exit 0
+[ -x "$VIRTUAL_ENV/bin/python" ] && exit 0
+exec uv venv --quiet --allow-existing "$VIRTUAL_ENV"
 """
 
 
@@ -455,7 +472,7 @@ class DockerBackend(Backend):
             # nobody will commit what it writes. Everything in the VM but pid 1 goes
             # before the VM is taken in; a VM where that cannot be confirmed is stopped.
             code, out = await _docker(
-                "exec", self.container(user_id), "sh", "-c", ADOPT_SWEEP, timeout=30
+                "exec", self.container(user_id), "/bin/sh", "-c", ADOPT_SWEEP, timeout=30
             )
             if code != 0:
                 logger.warning(
@@ -548,12 +565,21 @@ class DockerBackend(Backend):
         ]
         if settings.sandbox_index_url:
             args += ["-e", f"UV_INDEX_URL={settings.sandbox_index_url}"]
-        args += [settings.sandbox_image, "python3", "-c", REAPER]
+        args += [settings.sandbox_image, REAPER_PYTHON, "-c", REAPER]
         code, out = await _docker(*args, timeout=settings.sandbox_start_timeout_seconds)
         if code != 0:
             logger.error("could not start sandbox for user %d: %s", sandbox.user_id, out.strip())
             raise RuntimeError("the sandbox VM could not be started")
         sandbox.started_at = time.monotonic()
+        code, out = await _docker("exec", name, "/bin/sh", "-c", DEFAULT_ENV, timeout=30)
+        if code != 0:
+            # The shell works without it, on the system's python3: the VM is used as it
+            # is (docs/sandbox.md § The image).
+            logger.warning(
+                "could not make the default Python environment for user %d: %s",
+                sandbox.user_id,
+                out.strip(),
+            )
 
     def shell_argv(self, user_id: int) -> tuple[list[str], str | None]:
         # The shell reports its pid first, so a timeout can be ended inside the VM
@@ -569,9 +595,9 @@ class DockerBackend(Backend):
                 "-w",
                 "/workspace",
                 self.container(user_id),
-                "setsid",
+                "/usr/bin/setsid",
                 "-w",
-                "sh",
+                "/bin/sh",
                 "-c",
                 supervisor(self.cleanup()),
             ],
@@ -590,7 +616,7 @@ class DockerBackend(Backend):
                 if other.alive and other.pid is not None and other.pid != pid
             )
             code, out = await _docker(
-                "exec", container, "sh", "-c", KILL_TREE, "sh", str(pid), keep, timeout=30
+                "exec", container, "/bin/sh", "-c", KILL_TREE, "sh", str(pid), keep, timeout=30
             )
             if code != 0:
                 # Fail closed: a command that cannot be confirmed dead must not go on
