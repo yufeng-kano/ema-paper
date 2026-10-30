@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import json
 import logging
 import os
 import time
@@ -104,6 +106,9 @@ CANCEL_POLL_SECONDS = 2.0
 # Retries of one upstream call on 429 / transient failures.
 MAX_ATTEMPTS = 3
 BACKOFF_BASE_SECONDS = 2.0
+# The blocks of the model's reasoning, which a replay may leave out only from the start
+# (docs/chat.md § History is append-only).
+THINKING_TYPES = frozenset({"thinking", "redacted_thinking"})
 
 
 class TurnCancelled(Exception):
@@ -144,6 +149,10 @@ class TurnContext:
     effort: str
     system: list[dict]
     tools: list[dict]
+    # A short hash of `system` and `tools`, stored with every thinking block the turn
+    # keeps: a block is replayed only under the prompt and tools it was made under
+    # (docs/chat.md § History is append-only).
+    binding: str
     sandbox: SandboxClient | None
     render_slots: asyncio.Semaphore
     # The reader's skills and subagents as this turn has them (docs/chat.md § Skills,
@@ -339,6 +348,7 @@ async def _load(
         ),
     )
 
+    system = chat_agent.system_blocks(parts)
     return TurnContext(
         settings=settings,
         sessionmaker=sessionmaker,
@@ -350,8 +360,11 @@ async def _load(
         connection=connection,
         model=model,
         effort=effort,
-        system=chat_agent.system_blocks(parts),
+        system=system,
         tools=tools,
+        binding=hashlib.sha256(
+            json.dumps([system, tools], sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()[:16],
         sandbox=sandbox,
         render_slots=render_slots,
         generation=generation,
@@ -483,18 +496,61 @@ async def _history(ctx: TurnContext) -> list[dict]:
         )
         return repaired(
             [
-                {"role": row.role, "content": _api_blocks(row.content)}
-                for row in rows
-                if row.turn_id not in compactions or row.id == boundary
+                {"role": message["role"], "content": _api_blocks(message["content"])}
+                for message in stale_thinking_left_out(
+                    [
+                        {"role": row.role, "content": row.content}
+                        for row in rows
+                        if row.turn_id not in compactions or row.id == boundary
+                    ],
+                    ctx.binding,
+                )
             ]
         )
+
+
+def stale_thinking_left_out(messages: list[dict], binding: str) -> list[dict]:
+    """The stored history without the thinking it may no longer replay: every thinking
+    block up to and including the last one made under another system prompt or tool list
+    than `binding` names — or stored before blocks carried one — or before the last answer
+    stored with a cutoff, and an assistant message left with no content. Only from the
+    start, so the blocks made since stay valid, and read from the rows alone, so every
+    replay leaves out the same blocks (docs/chat.md § History is append-only)."""
+    last = -1
+    for index, message in enumerate(messages):
+        if message["role"] != "assistant" or not isinstance(message["content"], list):
+            continue
+        blocks = [block for block in message["content"] if isinstance(block, dict)]
+        if any(
+            block.get("type") in THINKING_TYPES and block.get("binding") != binding
+            for block in blocks
+        ):
+            last = index
+        elif any(block.get("thinking_cutoff") for block in blocks):
+            last = index - 1
+    kept: list[dict] = []
+    for index, message in enumerate(messages):
+        content = message["content"]
+        if index <= last and message["role"] == "assistant" and isinstance(content, list):
+            content = [
+                block
+                for block in content
+                if not (isinstance(block, dict) and block.get("type") in THINKING_TYPES)
+            ]
+            if not content:
+                continue
+        kept.append({"role": message["role"], "content": content})
+    return kept
 
 
 # The keys a stored block carries for the web app and the API never sees: the context
 # marker (docs/chat.md § Prompt caching), a command's skill, an attachment's name, a
 # section's heading and a subagent call's record (docs/chat.md § What a user message
-# carries, § Subagents).
-PRIVATE_KEYS = frozenset({"context", "skill", "attachment", "section", "subagent"})
+# carries, § Subagents), and the prompt a thinking block was made under and the cutoff an
+# upstream's drop left (§ History is append-only).
+PRIVATE_KEYS = frozenset(
+    {"context", "skill", "attachment", "section", "subagent", "binding", "thinking_cutoff"}
+)
 
 
 def _api_blocks(content: object) -> object:
@@ -533,7 +589,13 @@ def build_request(
         "system": ctx.system,
         "tools": ctx.tools,
         "messages": replay,
-        "thinking": {"type": "adaptive", "display": "updates"},
+        # A block the replay could not tell is stale is dropped, with every thinking block
+        # after it, rather than failing the request (docs/chat.md § History is append-only).
+        "thinking": {
+            "type": "adaptive",
+            "display": "updates",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+        },
         "output_config": {"effort": ctx.effort},
         "fallbacks": "default",
         "cache_control": {"type": "ephemeral", "ttl": chat_agent.CACHE_TTL},
@@ -1835,6 +1897,19 @@ async def _loop(ctx: TurnContext) -> None:
         await _record_usage_settled(
             ctx, completed.model or ctx.model, completed.usage, conversation=True
         )
+        if completed.thinking_dropped:
+            # The replay sent a block the API no longer takes: a change the binding cannot
+            # see. The API would drop it again on every later call, with every block made
+            # since, so the rest of the turn sends none of the request's thinking — the
+            # messages as sent carry no binding, so every thinking block in them is left
+            # out — and the answer is stored with the cutoff a later replay starts its
+            # thinking from (docs/chat.md § History is append-only).
+            logger.warning(
+                "turn %s: the upstream dropped %d thinking blocks bound to another prompt",
+                ctx.turn.id,
+                completed.thinking_dropped,
+            )
+            messages = stale_thinking_left_out(messages, ctx.binding)
         if await _cancelled(ctx):
             # Billed, but not kept: a cancelled turn leaves the history as it was.
             raise TurnCancelled()
@@ -1861,7 +1936,16 @@ async def _loop(ctx: TurnContext) -> None:
             # Nor is one the last call made with no tool left to it.
             content = [block for block in content if block.get("type") != "tool_use"]
         if content:
-            await _store(ctx, "assistant", content, model=followed)
+            # Each thinking block is stored with the prompt and tools it was made under, so a
+            # later replay can tell whether it may still be sent (docs/chat.md § History is
+            # append-only); the replay of this turn sends it as the API returned it.
+            stored = [
+                {**block, "binding": ctx.binding} if block.get("type") in THINKING_TYPES else block
+                for block in content
+            ]
+            if completed.thinking_dropped:
+                stored[0] = {**stored[0], "thinking_cutoff": True}
+            await _store(ctx, "assistant", stored, model=followed)
             messages.append({"role": "assistant", "content": content})
             # Positions are content blocks, not messages (docs/chat.md § Prompt caching).
             since_marker += len(content)

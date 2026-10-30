@@ -18,12 +18,13 @@ import respx
 from sqlalchemy import select
 
 from sightread.agents import chat as chat_agent
+from sightread.config import Settings
 from sightread.db.models import ChatToolCall, Document, Folder
 from sightread.jobs import chat_runner, chat_web
 from sightread.workspace import safe_io
 from sightread.workspace.documents import measure_storage
 from sightread.workspace.layout import user_root
-from tests.conftest import CSRF_HEADERS
+from tests.conftest import CSRF_HEADERS, PARSE_MODEL, TEST_MODEL_PRICES
 from tests.fixtures.documents import build_text_layer_pdf
 from tests.test_chat import _run_queued_turn
 from tests.test_chat_extensions import (
@@ -118,7 +119,11 @@ def test_the_web_tools_are_declared_only_where_the_deployment_runs_them() -> Non
     assert chat_agent.TOOLS[-1] is chat_agent.MEMORY_TOOL
     assert not set(chat_agent.WEB_TOOL_NAMES) & set(chat_agent.SUBAGENT_TOOL_NAMES)
     for tool in chat_agent.WEB_TOOLS:
-        assert tool["strict"] is True and tool["input_schema"]["additionalProperties"] is False
+        assert tool["input_schema"]["additionalProperties"] is False
+    # Strict only where the input has structure: a search or a read takes one string.
+    assert [tool["name"] for tool in chat_agent.WEB_TOOLS if tool.get("strict")] == [
+        "download_file"
+    ]
     rendered = chat_agent.render_system_prompt(
         chat_agent.DEFAULT_SYSTEM_PROMPT, None, tools=["view_page", "read_url", "download_file"]
     )
@@ -126,6 +131,26 @@ def test_the_web_tools_are_declared_only_where_the_deployment_runs_them() -> Non
     assert "- web_search:" not in rendered and "- search_papers:" not in rendered
     everything = chat_agent.render_system_prompt(chat_agent.DEFAULT_SYSTEM_PROMPT, None)
     assert "- web_search:" in everything and "- search_papers:" in everything
+
+
+def test_the_fullest_tool_list_keeps_its_strict_grammar_small() -> None:
+    """docs/chat.md § Upstream: the upstream compiles every strict schema of a request into
+    one grammar and refuses the whole request past a size it does not publish — ten strict
+    tools crossed it and every Claude turn failed, nine never had. The fullest list a
+    deployment declares (a shell, both search keys, a parse model) stays well under, and a
+    tool whose input is one string is never strict."""
+    settings = Settings(**WEB_KEYS, parse_model=PARSE_MODEL, model_prices_json=TEST_MODEL_PRICES)
+    tools = chat_runner.turn_tools(True, settings)
+    assert {"bash", "web_search", "search_papers", "convert_file"} <= {
+        tool["name"] for tool in tools
+    }
+    strict = [tool for tool in tools if tool.get("strict")]
+    assert len(strict) <= 6, [tool["name"] for tool in strict]
+    for tool in strict:
+        properties = tool["input_schema"]["properties"]
+        assert len(properties) > 1 or any(
+            field["type"] != "string" or "enum" in field for field in properties.values()
+        ), tool["name"]
 
 
 async def test_the_agents_route_and_the_rates_say_what_the_deployment_offers(
