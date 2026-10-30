@@ -847,8 +847,9 @@ def test_an_interrupted_tool_call_is_answered_on_replay() -> None:
 def test_thinking_made_under_another_prompt_is_left_out_from_the_start() -> None:
     """docs/chat.md § History is append-only: every thinking block up to and including the
     last one bound to another system prompt or tool list — or to none, stored before blocks
-    carried one — is left out, never one from the middle; the blocks made since are kept,
-    and an assistant message left empty goes with them."""
+    carried one — or before the last answer stored with a cutoff is left out, never one
+    from the middle; the blocks made since are kept, and an assistant message left empty
+    goes with them."""
 
     def thinking(text: str, binding: str | None = None) -> dict:
         block = {"type": "thinking", "thinking": text, "signature": f"sig-{text}"}
@@ -896,6 +897,26 @@ def test_thinking_made_under_another_prompt_is_left_out_from_the_start() -> None
         "thinking": "since",
         "signature": "sig-since",
     }
+    # The answer to a call whose thinking the upstream dropped carries the cutoff: every
+    # block before it goes, though bound to today's prompt; its own and later ones stay.
+    cut = {**thinking("after", "now"), "thinking_cutoff": True}
+    dropped = [
+        history[0],
+        {"role": "assistant", "content": [thinking("old", "now"), text("a")]},
+        history[2],
+        {"role": "assistant", "content": [cut, text("b")]},
+        history[6],
+        history[7],
+    ]
+    assert chat_runner.stale_thinking_left_out(dropped, "now") == [
+        history[0],
+        {"role": "assistant", "content": [text("a")]},
+        history[2],
+        dropped[3],
+        history[6],
+        history[7],
+    ]
+    assert "thinking_cutoff" not in chat_runner._api_blocks([cut])[0]
 
 
 async def test_a_message_belongs_to_its_turn_and_a_live_thread_cannot_be_deleted(

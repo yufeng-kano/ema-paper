@@ -28,11 +28,19 @@ DOC_PATH = "/workspace/files/Papers/paper.pdf"
 SUBAGENT_PREAMBLE_START = "You are a subagent"
 
 
-def streamed(blocks: list[dict], stop_reason: str, *, model: str = "claude-opus-5-5") -> bytes:
-    """A Messages stream of text, thinking and tool_use blocks."""
-    events: list[dict] = [
-        {"type": "message_start", "message": {"model": model, "usage": {"input_tokens": 100}}}
-    ]
+def streamed(
+    blocks: list[dict],
+    stop_reason: str,
+    *,
+    model: str = "claude-opus-5-5",
+    transformations: list[dict] | None = None,
+) -> bytes:
+    """A Messages stream of text, thinking and tool_use blocks; `transformations` is the
+    `input_transformations` its `message_start` reports."""
+    message: dict = {"model": model, "usage": {"input_tokens": 100}}
+    if transformations is not None:
+        message["input_transformations"] = transformations
+    events: list[dict] = [{"type": "message_start", "message": message}]
     for index, block in enumerate(blocks):
         if block["type"] == "thinking":
             start = {"type": "thinking", "thinking": ""}
@@ -1299,6 +1307,83 @@ async def test_thinking_is_replayed_only_under_the_prompt_it_was_made_under(chat
     assert not any(
         "binding" in block
         for request in main
+        for message in request["messages"]
+        for block in message["content"]
+        if isinstance(block, dict)
+    )
+
+
+@respx.mock
+async def test_a_drop_the_upstream_reports_cuts_the_thinking_before_it(chat_client) -> None:
+    """docs/chat.md § History is append-only: a block the binding still took for valid but
+    the upstream dropped — a change the hash cannot see — is not sent again, in the turn or
+    after it, nor is any thinking before it; the blocks made since are replayed."""
+    dropped = [
+        {
+            "type": "thinking_dropped",
+            "path": "messages.1.content.0",
+            "reason": "prefix_binding_mismatch",
+        }
+    ]
+    skill_call = {
+        "type": "tool_use",
+        "id": "s1",
+        "name": "skill",
+        "input": {"name": "nobody", "arguments": ""},
+    }
+    answers = iter(
+        [
+            ([{"type": "thinking", "thinking": "First."}, {"type": "text", "text": "One."}], []),
+            ([{"type": "thinking", "thinking": "Second."}, skill_call], dropped),
+            ([{"type": "thinking", "thinking": "Third."}, {"type": "text", "text": "Two."}], []),
+            ([{"type": "text", "text": "Three."}], []),
+        ]
+    )
+    requests: list[dict] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        blocks, transformations = next(answers)
+        stop = "tool_use" if blocks[-1]["type"] == "tool_use" else "end_turn"
+        return httpx.Response(
+            200,
+            content=streamed(blocks, stop, model=body["model"], transformations=transformations),
+        )
+
+    respx.post(MESSAGES_URL).mock(side_effect=answer)
+    conversation_id = await new_conversation(chat_client)
+    for text in ("one", "two", "three"):
+        assert (await send(chat_client, conversation_id, text=text)).status_code == 202
+        await _run_queued_turn(chat_client)
+
+    def thinking(request: dict) -> list[str]:
+        return [
+            block["thinking"]
+            for message in request["messages"]
+            if message["role"] == "assistant"
+            for block in message["content"]
+            if block["type"] == "thinking"
+        ]
+
+    assert len(requests) == 4
+    # The call that dropped it carried it; the rest of its turn and the next do not.
+    assert thinking(requests[1]) == ["First."]
+    assert thinking(requests[2]) == ["Second."]
+    assert thinking(requests[3]) == ["Second.", "Third."]
+    async with chat_client.app.state.sessionmaker() as db:
+        stored = (
+            await db.execute(
+                select(Message.content)
+                .where(Message.conversation_id == conversation_id, Message.role == "assistant")
+                .order_by(Message.id)
+            )
+        ).scalars()
+        cutoffs = [any(block.get("thinking_cutoff") for block in content) for content in stored]
+    assert cutoffs == [False, True, False, False]
+    assert not any(
+        "thinking_cutoff" in block
+        for request in requests
         for message in request["messages"]
         for block in message["content"]
         if isinstance(block, dict)
