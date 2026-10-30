@@ -28,6 +28,7 @@ export type StepKind =
   | 'fetch'
   | 'download'
   | 'convert'
+  | 'image'
   | 'tool'
 
 export interface Step {
@@ -64,6 +65,7 @@ export const SUMMARY_ORDER: readonly StepKind[] = [
   'create',
   'download',
   'convert',
+  'image',
   'tool',
 ]
 
@@ -387,6 +389,9 @@ export function readStep(name: string, input: Record<string, unknown>): Step {
     case 'convert_file':
       // The file's name: the row in Files that becomes a document.
       return { kind: 'convert', target: basename(text(input.path)) }
+    case 'insert_image':
+      // The image's name, and the document or the notes it goes into.
+      return { kind: 'image', target: basename(text(input.image)), file: basename(text(input.document)) || undefined }
     default:
       return { kind: 'tool', target: name }
   }

@@ -21,13 +21,11 @@ import shutil
 import sys
 import urllib.parse
 import uuid
-import warnings
 from collections.abc import Collection, Mapping
 from pathlib import Path
 
 from fastapi import APIRouter, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
-from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
@@ -72,7 +70,6 @@ from ..jobs.intake import (
 from ..jobs.queue import parse_pages_spec, retry_job
 from ..jobs.runner import partial_result_payload, result_payload
 from ..parsing.figures import crop_chunks, open_crop, parse_bbox_path
-from ..parsing.images import ImageError, normalize_image
 from ..workspace import documents as workspace_documents
 from ..workspace import git, safe_io, trash
 from ..workspace.filing import (
@@ -1996,42 +1993,6 @@ async def dismiss_reconvert(
 IMAGE_CAP_NAME = "DOCUMENT_IMAGE_MAX_BYTES"
 
 
-def prepare_image(
-    source: Path, out_dir: Path, stem: str, *, max_pixels: int, long_edge: int
-) -> Path:
-    """The upload as it is kept: decoded only as one of the accepted formats, refused past
-    the pixel cap read from its header, then upright, flattened and downscaled as an
-    attachment is (docs/workspace.md § Inserted images)."""
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(source, formats=workspace_documents.IMAGE_FORMATS) as opened:
-                too_large = opened.width * opened.height > max_pixels
-    except (
-        UnidentifiedImageError,
-        Image.DecompressionBombError,
-        Image.DecompressionBombWarning,
-        OSError,
-        ValueError,
-    ) as exc:
-        raise ApiError(
-            400, "invalid_request", "The file is not a PNG, JPEG, WebP, GIF or HEIC image"
-        ) from exc
-    if too_large:
-        raise ApiError(400, "invalid_request", "The image has too many pixels")
-    try:
-        normalized = normalize_image(
-            source,
-            out_dir,
-            max_long_edge=long_edge,
-            stem=stem,
-            formats=workspace_documents.IMAGE_FORMATS,
-        )
-    except ImageError as exc:
-        raise ApiError(400, "invalid_request", "The image could not be read") from exc
-    return normalized.path
-
-
 @router.post("/images", dependencies=[CsrfGuard], status_code=status.HTTP_201_CREATED)
 async def upload_image(request: Request, user: SessionUser, db: DbSession, settings: AppSettings):
     """An image for a document's text: kept as the document's, its path answered for the
@@ -2067,7 +2028,7 @@ async def upload_image(request: Request, user: SessionUser, db: DbSession, setti
         try:
             await store_upload(upload_chunks(upload), staged, cap, cap_name=IMAGE_CAP_NAME)
             prepared = await asyncio.to_thread(
-                prepare_image,
+                workspace_documents.prepare_inserted_image,
                 staged,
                 upload_dir,
                 stem,

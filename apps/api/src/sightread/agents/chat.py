@@ -17,8 +17,8 @@ from .parse import BBOX_FORMAT_YXYX
 # no dedup cache; the number is bookkeeping for the registry (docs/agents.md).
 # 10: convert_file, figure links; 11: fewer strict tools, thinking binding; 12: search
 # before guessing an address; 13: uv's default environment, the fonts; 14: the sites the
-# sandbox reaches.
-PIPELINE_VERSION = 14
+# sandbox reaches; 15: insert_image.
+PIPELINE_VERSION = 15
 
 # Anthropic-defined tools carry no schema of their own (docs/chat.md § Tools). The order
 # is part of the cache prefix and never changes. A custom tool whose input has structure is
@@ -262,6 +262,36 @@ CONVERT_FILE_TOOL = {
 }
 
 
+# An image file of the workspace — a chart the agent drew, a picture the reader keeps —
+# kept as one of a document's inserted images, as the editor's upload keeps one, for the
+# line the agent then writes with the editor (docs/chat.md § Tools). Declared last, on
+# every deployment. Not strict: two paths the tool checks itself, and the strict grammar
+# keeps its size (§ Upstream). A write of the turn, never a subagent's.
+INSERT_IMAGE_TOOL = {
+    "name": "insert_image",
+    "description": (
+        "Keep an image file as one of a document's images, so its doc.md or notes.md can "
+        "show it. `image` is the file's path under /workspace: save a chart you drew as a "
+        "PNG under /workspace/.cache/ (never /tmp, which this tool cannot read), or name a "
+        "picture in the user's files. `document` is the doc.md or notes.md the image goes "
+        "into. Answers the markdown line that shows the image: write it where the image "
+        "belongs with str_replace_based_edit_tool, with a short caption on the next line."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "image": {"type": "string", "description": "The image file's path under /workspace"},
+            "document": {
+                "type": "string",
+                "description": "The doc.md or notes.md the image goes into",
+            },
+        },
+        "required": ["image", "document"],
+        "additionalProperties": False,
+    },
+}
+
+
 def convert_tools(*, parse: bool) -> tuple[dict, ...]:
     """`convert_file`, where the deployment can parse: a tool the harness cannot run is
     not declared (docs/chat.md § Tools)."""
@@ -377,7 +407,7 @@ DEFAULT_SYSTEM_PROMPT = """You are the document agent inside Ema Paper, working 
     doc.md                          the editable transcription (markdown)
     notes.md                        the user's notes on this document
     source.pdf                      the original upload, when it was kept (or source.<image ext>)
-    figures/                        figure crops, p<page>_<y1>_<x1>_<y2>_<x2>.png, and images the user inserted, img-<hash>.png or .jpg
+    figures/                        figure crops, p<page>_<y1>_<x1>_<y2>_<x2>.png, and inserted images, img-<hash>.png or .jpg
     .meta.json                      document id, job id, model, bbox format, page count
   <folder>/<file name>              a file the user keeps as it is: any kind, the one copy there is, read-write
 /workspace/memory.md                your own notes across conversations (the Memory file section below)
@@ -396,7 +426,7 @@ Pages: {page_count}   Bbox format: {bbox_format}   Parsed with: {parse_model}
 doc.md keeps these shapes; never remove or reorder them unless asked:
 - `<!-- page: N -->` marks where page N starts.
 - A figure is `![figN](sightread://pPAGE/y1,x1,y2,x2)` with its caption on the next line. Coordinates are 0-1000 of page height and width.
-- An image the user inserted is `![name](figures/img-<16 hex digits>.png)` (or `.jpg`), with an optional caption on the next line, in doc.md or notes.md. Keep the line as it is and move it with its caption when you move the text around it; never write a new one, since only the user's upload makes the file it names. view_figure cannot open it.
+- An inserted image is `![name](figures/img-<16 hex digits>.png)` (or `.jpg`), with an optional caption on the next line, in doc.md or notes.md. Keep the line as it is and move it with its caption when you move the text around it. Write a new one only with the line insert_image answers: no other name has a file behind it. view_figure cannot open it.
 - Math is `$...$` inline and `$$...$$` on its own lines, KaTeX syntax.
 - Tables are GFM pipe tables. Code is fenced.
 - A quote is `> ` before each of its lines, one level deep: the user's view reads a `>` inside a quote as text.
@@ -413,6 +443,7 @@ doc.md keeps these shapes; never remove or reorder them unless asked:
 - read_url: one page or PDF as text, from a search result or an address the user gave. Read a page before relying on a search snippet. When a read fails, search for another source instead of retrying the address or guessing another.
 - download_file: keep one URL as a file of the user's — when the user asked for the paper or the file to be kept, or for another paper to be read — into the folder they named, else the one this document sits in. Then say what was kept and where, as "your file NAME", never a path.
 - convert_file: convert a PDF or an image of the user's files into a document, as the Files page converts one: `path` is the file's folders and name, "Papers/2017/attention.pdf". It waits for the parse and answers the document's doc.md path, which you read with str_replace_based_edit_tool. It costs the user credits per page (nothing when the same file was converted before), so say so before converting a long paper, and convert only what the user asked for or clearly needs. To read another paper: download_file it, convert_file it, then read its doc.md. Never extract a PDF's text in the shell (pdftotext, Python) instead; read_url is for a quick look at a page, not for reading a paper. Afterwards the paper is "your document NAME", never a path.
+- insert_image: put a chart or a picture you made into the document or the notes, when the user asked for it there. Save it as a PNG under /workspace/.cache/ (never /tmp, which the tool cannot read), call insert_image with that path and the doc.md or notes.md it goes into, then write the line it answers where the image belongs with str_replace_based_edit_tool, a short caption on the next line. To the user it is a figure in the document or in their notes, never a file.
 
 # How to work
 
@@ -463,7 +494,7 @@ _TOKEN_RE = re.compile("|".join(re.escape(token) for token in PROMPT_TOKENS))
 # of a tool it lacks.
 _TOOL_LINE_RE = re.compile(
     r"^- (bash|str_replace_based_edit_tool|view_page|view_figure|memory"
-    r"|web_search|search_papers|read_url|download_file|convert_file):"
+    r"|web_search|search_papers|read_url|download_file|convert_file|insert_image):"
 )
 
 

@@ -178,7 +178,7 @@ def _scan(root: Path) -> tuple[list[Found], list[tuple[str, ...]], list[FoundFil
                     plain.append(FoundFile(parts, name, size))
             continue
         dirs[:] = []  # nothing beneath a document is a folder or a document
-        document_id = _meta_id(root, current)
+        document_id = meta_document_id(root, current)
         if document_id is None:
             continue
         parts = current.relative_to(FILES_DIR).parts
@@ -188,7 +188,7 @@ def _scan(root: Path) -> tuple[list[Found], list[tuple[str, ...]], list[FoundFil
     return found, folders, plain
 
 
-def _meta_id(root: Path, directory: Path) -> int | None:
+def meta_document_id(root: Path, directory: Path) -> int | None:
     """The document id a directory's `.meta.json` names, or None: a plain, small file or
     nothing — the shell can put anything under that name — and the open follows nothing
     (docs/workspace.md § Revisions)."""
@@ -228,7 +228,7 @@ def _aside_documents(root: Path) -> dict[str, list[tuple[Path, int]]]:
             if META_FILE not in files:
                 continue
             dirs[:] = []
-            document_id = _meta_id(root, current)
+            document_id = meta_document_id(root, current)
             if document_id is not None:
                 inside.append((current, document_id))
         asides[name] = inside
