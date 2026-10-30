@@ -93,6 +93,9 @@ services:
       UPLOAD_DIR: /data/uploads
       FIGURES_DIR: /data/figures
       WORKSPACES_DIR: /data/workspaces
+      # Where the worker writes the sandbox's sites for the egress proxy, which mounts the
+      # same volume read-only (docs/sandbox.md § Network).
+      SANDBOX_EGRESS_HOSTS_FILE: /data/sandbox-egress/hosts
     depends_on:
       pg:
         condition: service_healthy
@@ -105,6 +108,7 @@ services:
       - uploads:/data/uploads
       - figures:/data/figures
       - ${WORKSPACES_HOST_DIR:?WORKSPACES_HOST_DIR is required}:/data/workspaces
+      - sandbox_egress:/data/sandbox-egress
     command: ["python", "-m", "sightread.worker"]
 
   # The sandbox runner (docs/sandbox.md): alone in holding the Docker socket, it starts
@@ -125,6 +129,10 @@ services:
       APP_ENV: production
       SANDBOX_BACKEND: docker
       SANDBOX_WORKSPACES_MOUNT: /data/workspaces
+      # The egress proxy as a VM reaches it — by address, since Docker's DNS does not
+      # answer inside a Kata VM — once SANDBOX_NETWORK names its network
+      # (docs/sandbox.md § Network).
+      SANDBOX_PROXY_URL: http://${SANDBOX_EGRESS_ADDRESS:-10.250.250.2}:${SANDBOX_EGRESS_PORT:-3128}
       SANDBOX_WORKSPACES_DIR: ${WORKSPACES_HOST_DIR:?WORKSPACES_HOST_DIR is required}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -133,6 +141,42 @@ services:
       # Probes the port the runner listens on (SANDBOX_PORT, read from the container's
       # own environment), never a fixed one (docs/deployment.md).
       test: ["CMD", "python", "-c", "import os, urllib.request; urllib.request.urlopen('http://localhost:' + os.environ.get('SANDBOX_PORT', '8100') + '/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # The VMs' one way out (docs/sandbox.md § Network): a CONNECT proxy to the sites the
+  # worker writes into the volume they share. The runner's image without its socket, its
+  # `.env` or a place on the default network: nothing of the service is reachable from it.
+  sandbox-egress:
+    build:
+      context: ./apps/sandbox
+    image: sightread-sandbox-runner
+    container_name: sightread-sandbox-egress
+    restart: unless-stopped
+    command: ["python", "-m", "sightread_sandbox.egress"]
+    # tini as pid 1: as pid 1 itself, Python would ignore docker stop's SIGTERM.
+    init: true
+    user: "65534:65534"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      SANDBOX_EGRESS_PORT: ${SANDBOX_EGRESS_PORT:-3128}
+      SANDBOX_EGRESS_HOSTS_FILE: /data/sandbox-egress/hosts
+      SANDBOX_EGRESS_CONNECT_TIMEOUT_SECONDS: ${SANDBOX_EGRESS_CONNECT_TIMEOUT_SECONDS:-10}
+      SANDBOX_EGRESS_IDLE_SECONDS: ${SANDBOX_EGRESS_IDLE_SECONDS:-300}
+      SANDBOX_EGRESS_MAX_TUNNELS: ${SANDBOX_EGRESS_MAX_TUNNELS:-64}
+    volumes:
+      - sandbox_egress:/data/sandbox-egress:ro
+    networks:
+      sandbox:
+        ipv4_address: ${SANDBOX_EGRESS_ADDRESS:-10.250.250.2}
+      egress:
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, socket; socket.create_connection(('127.0.0.1', int(os.environ['SANDBOX_EGRESS_PORT'])), 3).close()"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -187,7 +231,9 @@ services:
           # temporaries and published together only when both succeeded, so the newest
           # dump always has a same-stamp figures archive to restore beside it.
           # The workspaces (every user's edits, notes and originals) are primary data
-          # from the chat agent on (docs/workspace.md § Backups) and ride the same stamp.
+          # from the chat agent on (docs/workspace.md § Backups) and ride the same stamp,
+          # all but each user's own `.cache` — packages and shell state an install makes
+          # again — matched at that one depth, never a folder of that name in the files.
           # One snapshot: the workspace backup lock is held exclusively from the dump to
           # the end of the archive, and every workspace write takes it shared, so no
           # rename, save or shell commit lands between the rows and the tree.
@@ -213,7 +259,9 @@ services:
             pg_dump --format=custom --file="'"$$staging"'/sightread.dump" &&
             tar -czf "'"$$staging"'/figures.tar.gz" -C /data figures &&
             tar -czf "'"$$staging"'/workspaces.tar.gz" -C /data \
-              --exclude="workspaces/.repos/*.lock" workspaces &&
+              --exclude="workspaces/.repos/*.lock" \
+              --anchored --no-wildcards-match-slash --exclude="workspaces/*/.cache" \
+              workspaces &&
             { ls /data/workspaces/.repos/*.writing 2>/dev/null | sed "s#.*/##" > "'"$$staging"'/unconfirmed-writes.txt";
               [ -s "'"$$staging"'/unconfirmed-writes.txt" ] || rm -f "'"$$staging"'/unconfirmed-writes.txt"; }'; then
             mv "$$staging" "/backups/$$stamp"
@@ -230,9 +278,28 @@ services:
           sleep 86400
         done
 
+networks:
+  # Where the VMs are once SANDBOX_NETWORK names it: internal, so Docker routes nothing
+  # off it; no address of the host's on it, so nothing the host listens on is reachable
+  # from a VM; the egress proxy on it at a fixed address, outside the range the VMs'
+  # addresses come from, so a VM started while the proxy restarts cannot take it
+  # (docs/sandbox.md § Network). The runner refuses a network without the first two.
+  sandbox:
+    name: sightread-sandbox
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.inhibit_ipv4: "true"
+    ipam:
+      config:
+        - subnet: ${SANDBOX_SUBNET:-10.250.250.0/24}
+          ip_range: ${SANDBOX_VM_RANGE:-10.250.250.128/25}
+  # The proxy's way out, its own.
+  egress:
+
 volumes:
   pgdata:
   uploads:
   figures:
   caddy_data:
   caddy_config:
+  sandbox_egress:

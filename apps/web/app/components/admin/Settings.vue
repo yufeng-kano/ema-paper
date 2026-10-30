@@ -1,9 +1,10 @@
 <script setup lang="ts">
 /**
- * The console's *Settings* screen (docs/admin.md § Pages, *Settings*; § Settings): the twelve
- * settings of `.env` the database may override, grouped in two columns — models, credits and
- * the Free plan at the left; prices, plans and packs at the right, then the keys of `.env`,
- * each only set or unset. A banner says when the stored values no longer fit `.env`.
+ * The console's *Settings* screen (docs/admin.md § Pages, *Settings*; § Settings): the
+ * thirteen settings of `.env` the database may override, grouped in two columns — models,
+ * credits, the Free plan and the sandbox's sites at the left; prices, plans and packs at the
+ * right, then the keys of `.env`, each only set or unset. A banner says when the stored
+ * values no longer fit `.env`.
  *
  * Each setting is changed on its own, from its dialog, and the screen then shows the settings
  * the API answered; nothing of it is kept in browser storage.
@@ -116,6 +117,7 @@ function onSaved(settings: AdminSettingsResponse) {
                 :key="setting.key"
                 :setting="setting"
                 :ceilings="data.ceilings"
+                :sandbox-network="data.sandbox_network"
                 :can-write="canWrite"
                 @edit="dialog = { setting, mode: 'edit' }"
                 @restore="dialog = { setting, mode: 'restore' }"

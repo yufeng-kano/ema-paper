@@ -26,7 +26,10 @@ class Settings(BaseSettings):
     # The same directory as this runner sees it (compose mounts the host path here): what
     # the runner itself reads and clears.
     sandbox_workspaces_mount: str = "/data/workspaces"
+    # `none`, or the internal Docker network the egress proxy is on, the VMs' one way out
+    # (docs/sandbox.md § Network); the proxy's URL is what every VM gets as HTTPS_PROXY.
     sandbox_network: str = "none"
+    sandbox_proxy_url: str = ""
     sandbox_index_url: str = ""
     sandbox_cpus: str = "2"
     sandbox_memory: str = "4g"
@@ -57,6 +60,9 @@ class Settings(BaseSettings):
             # `docker run -v` takes the host path as the daemon sees it: relative to
             # nothing this runner knows (docs/sandbox.md § Operations).
             raise ValueError("SANDBOX_WORKSPACES_DIR must be an absolute host path")
+        if self.sandbox_network != "none" and not self.sandbox_proxy_url:
+            # A VM on the network would reach nothing, under a prompt naming sites.
+            raise ValueError("SANDBOX_PROXY_URL is required when SANDBOX_NETWORK is not none")
         if self.app_env == "production":
             if not self.sandbox_token:
                 raise ValueError("SANDBOX_TOKEN is required in production")
@@ -67,6 +73,33 @@ class Settings(BaseSettings):
                     "production needs the docker backend with a VM runtime "
                     f"(SANDBOX_RUNTIME must be one of SANDBOX_VM_RUNTIMES: {sorted(allowed)})"
                 )
+        return self
+
+
+class EgressSettings(BaseSettings):
+    """The egress proxy's settings (docs/sandbox.md § Network): its port, the file the worker
+    writes the list to, and its limits — nothing else, no secret among them."""
+
+    model_config = SettingsConfigDict(env_file=None, extra="ignore", case_sensitive=False)
+
+    sandbox_egress_port: int = 3128
+    sandbox_egress_hosts_file: str = "/data/sandbox-egress/hosts"
+    # The request head, the connection and the TLS hello each within this many seconds.
+    sandbox_egress_connect_timeout_seconds: float = 10.0
+    # A tunnel quiet both ways this long is closed.
+    sandbox_egress_idle_seconds: float = 300.0
+    # Tunnels one VM (one address) holds at once.
+    sandbox_egress_max_tunnels: int = 64
+
+    @model_validator(mode="after")
+    def _check(self) -> EgressSettings:
+        for name in (
+            "sandbox_egress_connect_timeout_seconds",
+            "sandbox_egress_idle_seconds",
+            "sandbox_egress_max_tunnels",
+        ):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name.upper()} must be positive")
         return self
 
 

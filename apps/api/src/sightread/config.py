@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from decimal import Decimal
 from functools import cached_property, lru_cache
 from typing import Literal
@@ -15,6 +16,36 @@ from .billing.plans import CREDITS_MAX, FREE_PLAN_ID, Pack, Plan, parse_packs, p
 # Only ever used when APP_ENV=local and SECRET_KEY is unset, so `uv run uvicorn` works
 # without a .env file. Production refuses to start without a real SECRET_KEY.
 LOCAL_FALLBACK_SECRET_KEY = "local-development-insecure-secret-key"  # noqa: S105
+
+# One label of a host name on the sandbox's list (docs/sandbox.md § Network).
+EGRESS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+
+
+def parse_egress_hosts(text: str) -> tuple[str, ...]:
+    """`SANDBOX_EGRESS_HOSTS`'s entries, lower-cased, each once, in the order given: host
+    names separated by commas or whitespace, `*.example.com` for every name under
+    `example.com`. Two labels at least, the last not all digits, so no address passes for a
+    name; a scheme, a port or a path is refused naming the entry (docs/sandbox.md § Network)."""
+    hosts: list[str] = []
+    for entry in re.split(r"[\s,]+", text.strip()):
+        if not entry:
+            continue
+        name = entry.lower()
+        if name.endswith(".") and not name.endswith(".."):
+            name = name[:-1]
+        labels = name.removeprefix("*.").split(".")
+        if (
+            len(name) > 253
+            or len(labels) < 2
+            or not all(EGRESS_LABEL.fullmatch(label) for label in labels)
+            or labels[-1].isdigit()
+        ):
+            raise ValueError(
+                f"SANDBOX_EGRESS_HOSTS: {entry} is not a host name; write a name such as github.com"
+            )
+        if name not in hosts:
+            hosts.append(name)
+    return tuple(hosts)
 
 
 class Settings(BaseSettings):
@@ -327,10 +358,15 @@ class Settings(BaseSettings):
     # the VM's cold start on a stopped sandbox (the runner's own SANDBOX_START_TIMEOUT_SECONDS)
     # and the reply's grace past the command's deadline (docs/sandbox.md § The runner).
     sandbox_start_timeout_seconds: int = 180
-    # The runner's own `--network` and index URL; read here too, so the prompt tells the
-    # model whether the VM can reach a package index (docs/chat.md § System prompt).
+    # The runner's own `--network`: `none`, or the egress proxy's internal network. Read
+    # here too, so the prompt tells the model what the shell can reach (docs/chat.md
+    # § System prompt).
     sandbox_network: str = "none"
-    sandbox_index_url: str = ""
+    # The sites the egress proxy lets the sandbox reach, one of the settings the database
+    # may override, and where the worker writes the list in effect for the proxy; empty
+    # writes nothing (docs/sandbox.md § Network).
+    sandbox_egress_hosts: str = "pypi.org,files.pythonhosted.org"
+    sandbox_egress_hosts_file: str = ""
     sandbox_exec_grace_seconds: int = 60
 
     domain: str = ""
@@ -430,6 +466,7 @@ class Settings(BaseSettings):
             raise ValueError(f"MODEL_PRICES_JSON prices none of: {', '.join(sorted(unpriced))}")
         self.plans  # noqa: B018 - validated for its errors
         self.packs  # noqa: B018 - validated for its errors
+        self.egress_hosts  # noqa: B018 - validated for its errors
         return self
 
     @cached_property
@@ -449,6 +486,11 @@ class Settings(BaseSettings):
     def packs(self) -> dict[str, Pack]:
         """The top-up packs, by Pay's pack id (docs/billing.md § Top-up packs)."""
         return parse_packs(self.kano_pay_packs_json)
+
+    @cached_property
+    def egress_hosts(self) -> tuple[str, ...]:
+        """The sites the sandbox may reach (docs/sandbox.md § Network)."""
+        return parse_egress_hosts(self.sandbox_egress_hosts)
 
     @property
     def free_plan(self) -> Plan:

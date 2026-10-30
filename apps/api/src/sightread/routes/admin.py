@@ -1192,7 +1192,7 @@ class SettingReset(BaseModel):
 
 @router.get("/settings")
 async def list_settings(operator: SettingsReader, db: DbSession, request: Request):
-    """The twelve settings the database may override, where each comes from, and whether
+    """The thirteen settings the database may override, where each comes from, and whether
     each secret of `.env` is set — never its value."""
     return await admin_settings.payload(db, request.app.state.settings)
 

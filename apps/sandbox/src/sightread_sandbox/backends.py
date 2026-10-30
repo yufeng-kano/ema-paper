@@ -455,8 +455,27 @@ class DockerBackend(Backend):
         return f"{CONTAINER_PREFIX}{user_id}"
 
     async def startup(self) -> None:
-        """Take the VMs a previous runner left running into the table, last used now, so
-        the idle sweep stops them on schedule (docs/sandbox.md § Lifecycle)."""
+        """Refuse a network the VMs could leave by (docs/sandbox.md § Network), then take
+        the VMs a previous runner left running into the table, last used now, so the idle
+        sweep stops them on schedule (docs/sandbox.md § Lifecycle)."""
+        network = self.settings.sandbox_network
+        if network != "none":
+            code, out = await _docker(
+                "network",
+                "inspect",
+                "--format",
+                '{{.Internal}} {{index .Options "com.docker.network.bridge.inhibit_ipv4"}}',
+                network,
+                timeout=30,
+            )
+            if code != 0 or out.split() != ["true", "true"]:
+                # The egress proxy is the one way out only where Docker routes nothing off
+                # the network and the host has no address on it: any other network would
+                # hand the VMs the internet, or whatever the host listens on.
+                raise RuntimeError(
+                    f"SANDBOX_NETWORK {network} is not an internal Docker network without "
+                    f"an address of the host's: {out.strip()}"
+                )
         code, out = await _docker(
             "ps", "--filter", f"name=^{CONTAINER_PREFIX}", "--format", "{{.Names}}", timeout=30
         )
@@ -563,6 +582,11 @@ class DockerBackend(Backend):
             "-e",
             f"HOME=/workspace/{CACHE_DIR}/home",
         ]
+        if settings.sandbox_network != "none":
+            # The way out is the egress proxy; the image's clients read one spelling or
+            # the other (docs/sandbox.md § Network).
+            for variable in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+                args += ["-e", f"{variable}={settings.sandbox_proxy_url}"]
         if settings.sandbox_index_url:
             args += ["-e", f"UV_INDEX_URL={settings.sandbox_index_url}"]
         args += [settings.sandbox_image, REAPER_PYTHON, "-c", REAPER]

@@ -451,13 +451,13 @@ audit_log        id BIGINT PK,
                  -- one row per change made through the operator console, written in the
                  -- change's own transaction; no route updates or deletes one, nothing sweeps
                  -- the table; a deleted actor leaves actor_id NULL
-runtime_settings key VARCHAR(64) PK,              -- one of the twelve keys the database may
+runtime_settings key VARCHAR(64) PK,              -- one of the thirteen keys the database may
                                                   -- override, as .env names it: CREDIT_USD
                  value JSONB,                     -- a JSON string: the text .env would hold
                  updated_by FK users ON DELETE SET NULL, NULL,
                  updated_at
                  -- the operator console's settings over .env (admin.md § Settings): a key
-                 -- without a row is .env's; a row whose key is not one of the twelve is
+                 -- without a row is .env's; a row whose key is not one of the thirteen is
                  -- ignored; written only by the settings routes, in the transaction of
                  -- their audit record
 ```
