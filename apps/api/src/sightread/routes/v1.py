@@ -15,7 +15,7 @@ from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Request, Response, status
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 from sqlalchemy import select
 from starlette.datastructures import UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser
@@ -77,6 +77,18 @@ def _form_value(form, field: str) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
+def _form_flag(form, field: str) -> bool:
+    """A bool form field read as the JSON body reads it; anything else is a 400, never a
+    quiet false that would start a parse the caller did not ask for (docs/api.md)."""
+    value = _form_value(form, field)
+    if value is None:
+        return False
+    try:
+        return TypeAdapter(bool).validate_python(value)
+    except ValidationError as exc:
+        raise ApiError(400, "invalid_request", f"'{field}' must be true or false") from exc
+
+
 def _cached_response(result: Result, wants_stream: bool) -> Response:
     payload = cached_payload(result)
 
@@ -125,8 +137,8 @@ async def parse(request: Request, caller: UploaderCaller, db: DbSession, setting
         model, pages, force, retry = (
             _form_value(form, "model"),
             _form_value(form, "pages"),
-            _form_value(form, "force") in ("1", "true", "yes"),
-            _form_value(form, "retry") in ("1", "true", "yes"),
+            _form_flag(form, "force"),
+            _form_flag(form, "retry"),
         )
         chunks = upload_chunks(upload)
     else:
@@ -163,6 +175,9 @@ async def parse(request: Request, caller: UploaderCaller, db: DbSession, setting
 
     job = submission.job
     if wants_stream:
+        # The request's session is done: the stream opens its own, and one that lasts the
+        # whole parse must not hold a pool connection with it (docs/jobs.md § Progress).
+        await db.close()
         return StreamingResponse(
             events.stream_job_events(request.app.state.sessionmaker, settings.database_url, job.id),
             media_type=SSE_MEDIA_TYPE,
@@ -289,6 +304,9 @@ async def job_events(
 ):
     """Progress stream; a terminal job replays its final event at once (docs/api.md)."""
     await _owned_job(db, job_id, user)
+    # As the parse's own stream: no pool connection held for its length (docs/jobs.md
+    # § Progress).
+    await db.close()
     return StreamingResponse(
         events.stream_job_events(request.app.state.sessionmaker, settings.database_url, job_id),
         media_type=SSE_MEDIA_TYPE,

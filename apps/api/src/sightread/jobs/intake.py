@@ -352,9 +352,10 @@ async def submit_parse(
     data-plane parse alike; the check is no part of the dedup key, so a cached result or a
     parse already on its way is answered as it is (docs/parsing.md § Format check).
 
-    `retry` sends the bytes to the failed data-plane parse of the same file instead of
-    starting one: its succeeded pages kept, its failed ones run on `model` when one is
-    named, else on its own (docs/jobs.md § Retrying failed pages).
+    `retry` answers with the newest parse of the same bytes and pages instead of starting
+    one: a failed data-plane parse goes back on the queue, its succeeded pages kept and
+    its failed ones run on `model` when one is named, else on its own; one in flight or
+    succeeded is answered as it stands (docs/jobs.md § Retrying failed pages).
 
     `reconvert` is the library document this parse re-converts, with `force`: it points at
     the job in the commit that queues it, so no re-convert runs that its document would
@@ -366,17 +367,6 @@ async def submit_parse(
     # An upload is always the parse agent's input (docs/agents.md).
     target = await resolve_target(db, settings, user, PARSE, model)
     prompt_sha256 = hashlib.sha256(target.prompt.encode()).hexdigest()
-
-    # The plan's parses at once (docs/billing.md § Plans), under the deployment's cap. A
-    # retry is no upload: the claim applies the cap to it like to any queued job.
-    plan = await ledger.plan_of(db, settings, user.id)
-    if not retry and await count_running_jobs(db, user.id) >= ledger.jobs_limit(settings, plan):
-        raise ApiError(
-            429,
-            "rate_limit",
-            "Too many running jobs; retry when one finishes",
-            headers={"Retry-After": str(settings.parse_retry_after_seconds)},
-        )
 
     upload_dir = Path(settings.upload_dir)
     upload_dir.mkdir(parents=True, exist_ok=True)
@@ -394,10 +384,23 @@ async def submit_parse(
         stored.unlink(missing_ok=True)
         raise ApiError(400, "invalid_request", str(exc)) from exc
 
+    key = {
+        "user_id": user.id,
+        "agent": target.agent,
+        "sha256": sha256,
+        "model": target.model,
+        "connection_id": target.connection_id,
+        "connection_base_url": target.connection_base_url,
+        "pages_spec": pages_spec,
+        "prompt_sha256": prompt_sha256,
+    }
+
     if retry:
-        # The user's row before the job's, the one order the library's retry and every
-        # charge take (docs/billing.md § A parse); it also keeps two retries of one parse
-        # from both putting it back.
+        # The dedup key's hold a plain upload of these bytes takes, so a retry and an upload
+        # racing it never both start a parse; then the user's row before the job's, the one
+        # order the library's retry and every charge take (docs/billing.md § A parse),
+        # which also keeps two retries of one parse from both putting it back.
+        await hold_dedup_key(db, **key)
         await db.execute(select(User.id).where(User.id == user.id).with_for_update())
         found = await find_parse_to_retry(
             db,
@@ -413,7 +416,7 @@ async def submit_parse(
             else (
                 await db.execute(
                     select(Job)
-                    .where(Job.id == found.id)
+                    .where(Job.id == found[0].id)
                     .with_for_update()
                     .execution_options(populate_existing=True)
                 )
@@ -422,7 +425,18 @@ async def submit_parse(
         if job is None:
             stored.unlink(missing_ok=True)
             raise ApiError(
-                409, "invalid_request", "No failed parse of this file to retry; upload it instead"
+                409,
+                "invalid_request",
+                "No parse of this file with these pages to retry: send the pages its upload "
+                "sent, or upload the file instead",
+            )
+        if job.status == "failed" and found[1]:
+            # A Files document's parse: the library retries it, from its original.
+            stored.unlink(missing_ok=True)
+            raise ApiError(
+                409,
+                "invalid_request",
+                "The latest parse of this file is a Files document's; retry it from the Files page",
             )
         if job.status == "failed":
             retry_model = target.model if model is not None else None
@@ -463,17 +477,6 @@ async def submit_parse(
         await db.commit()
         await db.refresh(job)
         return Submission(job=job)
-
-    key = {
-        "user_id": user.id,
-        "agent": target.agent,
-        "sha256": sha256,
-        "model": target.model,
-        "connection_id": target.connection_id,
-        "connection_base_url": target.connection_base_url,
-        "pages_spec": pages_spec,
-        "prompt_sha256": prompt_sha256,
-    }
 
     if not force:
         cached = await find_cached_job(db, retention_days=settings.parse_retention_days, **key)
@@ -531,6 +534,19 @@ async def submit_parse(
                 await db.commit()
                 return Submission(job=active, upload=stored if retain_source else None)
 
+    # The plan's parses at once (docs/billing.md § Plans), under the deployment's cap,
+    # asked only of a parse about to start: a cache hit or a join starts none (docs/jobs.md
+    # § Concurrency caps). A retry is no upload: the claim applies the cap to it like to
+    # any queued job.
+    plan = await ledger.plan_of(db, settings, user.id)
+    if await count_running_jobs(db, user.id) >= ledger.jobs_limit(settings, plan):
+        stored.unlink(missing_ok=True)
+        raise ApiError(
+            429,
+            "rate_limit",
+            "Too many running jobs; retry when one finishes",
+            headers={"Retry-After": str(settings.parse_retry_after_seconds)},
+        )
     check_target = await resolve_check(db, settings, user.id, target.model) if check else None
     # The user's row lock that every charge takes (docs/billing.md § A parse), before the
     # job is inserted: the insert's foreign-key check holds a share lock on this row, and

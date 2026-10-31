@@ -33,7 +33,7 @@ The assembled markdown carries one marker line per page, immediately before that
 <!-- page: 4 -->
 ```
 
-Markers are how a caller maps any passage back to its page (citations, cross-checking figures). They are HTML comments, so ordinary markdown renderers hide them.
+Markers are how a caller maps any passage back to its page (citations, cross-checking figures). They are HTML comments, so ordinary markdown renderers hide them. In the reading copy (§ Format check) a paragraph a page break cut is joined before the next page's marker, so the whole paragraph sits under the page it starts on.
 
 ## Coordinate contract
 

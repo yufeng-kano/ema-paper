@@ -50,33 +50,37 @@ NOTES = (
     "source: paper.pdf becomes paper.md. It is the document the Ema Paper web reader "
     "opens: format-checked (paragraphs a page break cut are joined, broken markup fixed, "
     "the text unchanged) unless the user turned the check off. Read that .md; NEVER "
-    "print progress.sse — after a parse its final `done` event is the entire result JSON "
-    "on one line and will flood your context. If `upload` exits non-zero, nothing was "
-    "written to the .md: run `tail -c 600 progress.sse` to see why — a refused upload "
-    "leaves only its short JSON error there (`insufficient_credits` with the credits "
-    "needed and left, `rate_limit`, a file or model the service refuses), a failed "
-    "parse ends with an `error` event naming the failed pages — or run `status`. A "
-    "parse is every page or nothing: when it failed, call `parse` for a fresh ticket "
-    "and run `retry` with the same `f` — the pages that succeeded are kept and only the "
-    "failed ones run again. A page the model blocked needs the fallback model: add "
-    "`-F model=<id>` to `retry`, the second of `models` when there is one. Every figure is "
-    "`![figN](sightread://pPAGE/YMIN,XMIN,YMAX,XMAX)` with an `<!-- page: N -->` "
-    "marker before each page's content; coordinates are 0-1000 normalized to that page, "
-    "y before x. Run `figures` to save each figure's crop as <name>.figures/figN.png — "
-    "cropped by Ema Paper from its own render after its figure check, the picture the "
-    "web reader shows. `metadata` (<name>.meta.json) adds the figures array with "
-    "captions and each figure's `check`: `unverified` means the check could not confirm "
-    "the box (the web reader marks it 'Crop not verified'), so look at that crop. "
-    "Optional form fields on the upload: `-F model=<id>` (one of `models`; default: the "
-    "first), `-F pages=1-5,8`, `-F force=true` (parse again, bypassing the dedup cache "
-    "and a parse of the same file still running). A PDF and an image "
-    "(jpg/png/webp/heic) both go to the same endpoint. `/v1/jobs/last` resolves to this "
-    "ticket's own job; the explicit `/v1/jobs/<job_id>` routes work too (`job_id` is in "
-    "every `progress` event and in `meta.job_id`). A dedup hit ends the stream at once. "
-    "The ticket is good for one upload or one retry and then only for reading the job "
-    "it created: once it is spent or expired, call `parse` again for a fresh one. "
-    "Re-uploading the same file joins its parse while it runs and returns it once it "
-    "has succeeded, so re-running a command your shell cut off costs nothing."
+    "print <name>.progress.sse — after a parse its final `done` event is the entire "
+    "result JSON on one line and will flood your context. If `upload` exits non-zero, "
+    "nothing was written to the .md: read curl's own message, then run "
+    '`tail -c 600 "${f%.*}.progress.sse"` to see why — a refused upload leaves only its '
+    "short JSON error there (`insufficient_credits` with the credits needed and left, "
+    "`rate_limit`, a file or model the service refuses), a failed parse ends with an "
+    "`error` event naming the failed pages — or run `status`. A parse is every page or "
+    "nothing: when it failed, call `parse` for a fresh ticket and run `retry` with the "
+    "same `f` and the same `-F pages=` as the upload — the pages that succeeded are kept "
+    "and only the failed ones run again. A page the model blocked needs the fallback "
+    "model: add `-F model=<id>` to `retry`, the second of `models` when there is one. "
+    "Every figure is `![figN](sightread://pPAGE/YMIN,XMIN,YMAX,XMAX)` with an "
+    "`<!-- page: N -->` marker before each page's content (a paragraph joined across a "
+    "page break sits under the page it starts on); coordinates are 0-1000 normalized to "
+    "that page, y before x. Run `figures` with the same ticket once the .md has landed "
+    "to save each figure's crop as <name>.figures/figN.png — cropped by Ema Paper from "
+    "its own render after its figure check, the picture the web reader shows; it names "
+    "any figure that has no crop and exits non-zero if a fetch failed. `metadata` "
+    "(<name>.meta.json) adds the figures array with captions and each figure's `check`: "
+    "`unverified` means the check could not confirm the box (the web reader marks it "
+    "'Crop not verified'), so look at that crop. Optional form fields on the upload: "
+    "`-F model=<id>` (one of `models`; default: the first), `-F pages=1-5,8`, "
+    "`-F force=true` (parse again, bypassing the dedup cache and a parse of the same "
+    "file still running). A PDF and an image (jpg/png/webp/heic) both go to the same "
+    "endpoint. `/v1/jobs/last` resolves to this ticket's own job; the explicit "
+    "`/v1/jobs/<job_id>` routes work too (`job_id` is in every `progress` event and in "
+    "`meta.job_id`). A dedup hit ends the stream at once. The ticket is good for one "
+    "upload or one retry and then only for reading the job it created: once it is spent "
+    "or expired, call `parse` again for a fresh one. Re-uploading the same file joins "
+    "its parse while it runs and returns it once it has succeeded, so re-running a "
+    "command your shell cut off costs nothing."
 )
 
 # The authenticated user for the request being served. Set by the ASGI guard below and read
@@ -131,11 +135,16 @@ def build_server(app: FastAPI) -> MCPServer:
         auth = f"-H 'Authorization: Bearer {token}'"
         # `2026-08-21T15:00:00Z`, the shape docs/mcp.md shows.
         expires_at = ticket.expires_at.astimezone(UTC).replace(microsecond=0).isoformat()
-        # The upload fails loudly on a refusal (`--fail-with-body` keeps the short error in
-        # progress.sse) and every read with `-f`, which writes nothing on an error: an
-        # error envelope never lands in, or overwrites, a document (docs/mcp.md).
+        # The upload lands whatever the server answers in a progress file of its own,
+        # removed first so it is always this run's; the read after it fails loudly with
+        # `-f`, which writes nothing on an error — a refused upload's ticket is unspent
+        # (409), a failed parse has no result (404) — so an error envelope never lands in,
+        # or overwrites, a document. Options any curl has (docs/mcp.md).
         land = f'&& curl -sSf {auth} {base}/v1/jobs/last/result.md -o "${{f%.*}}.md"'
-        send = f"curl -sSN --fail-with-body {auth} -H 'Accept: text/event-stream'"
+        send = (
+            f"""s="${{f%.*}}.progress.sse"; rm -f "$s"; """
+            f"curl -sSN {auth} -H 'Accept: text/event-stream'"
+        )
         return {
             "token": token,
             "expires_at": expires_at.replace("+00:00", "Z"),
@@ -145,10 +154,9 @@ def build_server(app: FastAPI) -> MCPServer:
             "models": offered_models(settings, PARSE.name),
             # `f` names the source once; every output file is derived from it, so parsing
             # several documents into one directory never collides on a generic name.
-            "upload": f'f=doc.pdf; {send} -F file=@"$f" {base}/v1/parse -o progress.sse {land}',
+            "upload": f'f=doc.pdf; {send} -F file=@"$f" {base}/v1/parse -o "$s" {land}',
             "retry": (
-                f'f=doc.pdf; {send} -F file=@"$f" -F retry=true {base}/v1/parse '
-                f"-o progress.sse {land}"
+                f'f=doc.pdf; {send} -F file=@"$f" -F retry=true {base}/v1/parse -o "$s" {land}'
             ),
             "markdown": (
                 f'f=doc.pdf; curl -sSf {auth} {base}/v1/jobs/last/result.md -o "${{f%.*}}.md"'
@@ -156,14 +164,20 @@ def build_server(app: FastAPI) -> MCPServer:
             "metadata": (
                 f'f=doc.pdf; curl -sSf {auth} {base}/v1/jobs/last/result -o "${{f%.*}}.meta.json"'
             ),
-            # Every placeholder of the landed .md, fetched as the crop the web reader shows.
+            # Every placeholder of the landed .md, fetched as the crop the web reader shows:
+            # a 404 is a figure with no crop, any other failure the command's exit status.
             "figures": (
-                f'f=doc.pdf; d="${{f%.*}}.figures"; mkdir -p "$d" && '
+                f'f=doc.pdf; m="${{f%.*}}.md"; d="${{f%.*}}.figures"; '
+                f'[ -f "$m" ] || {{ echo "$m is missing: run upload or markdown first"; false; }} '
+                f'&& mkdir -p "$d" && '
                 r"grep -oE '!\[fig[0-9]+\]\(sightread://p[0-9]+/[0-9]+,[0-9]+,[0-9]+,[0-9]+\)' "
-                r'"${f%.*}.md" | '
+                r'"$m" | '
                 r"sed -E 's#^!\[(fig[0-9]+)\]\(sightread://p([0-9]+)/([0-9,]+)\)$#\1 \2 \3#' | "
-                f'while read -r n p b; do curl -sSf {auth} "{base}/v1/jobs/last/figures/$p/$b" '
-                f'-o "$d/$n.png" || echo "no crop stored for $n"; done'
+                f"{{ rc=0; while read -r n p b; do c=$(curl -sf {auth} "
+                f'"{base}/v1/jobs/last/figures/$p/$b" -o "$d/$n.png" -w "%{{http_code}}"); '
+                f'if [ "$c" = 404 ]; then echo "no crop stored for $n"; '
+                f'elif [ "$c" != 200 ]; then echo "$n: fetch failed (HTTP $c)"; rc=1; fi; '
+                f'done; [ "$rc" = 0 ]; }}'
             ),
             "status": f"curl -sS {auth} {base}/v1/jobs/last",
             # A connector's parse is in no library, so the retention deletes it; how soon

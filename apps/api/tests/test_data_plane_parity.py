@@ -7,6 +7,7 @@ connector reaches them with an upload ticket and `last`, so both credentials are
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import timedelta
 from pathlib import Path
@@ -102,6 +103,11 @@ async def test_an_api_parse_is_checked_and_returns_the_reading_copy(
     result = (await api.get(f"/v1/jobs/{job_id}/result")).json()
     assert result["markdown"] == READING
     assert result["meta"]["check"] == {"model": MODEL, "joins": 2, "edits": 1}
+    # The stream's final event, the one the upload command waits on, carries it too.
+    async with api.stream("GET", f"/v1/jobs/{job_id}/events") as response:
+        body = "\n".join([line async for line in response.aiter_lines()])
+    done = json.loads(body.split("event: done\ndata: ")[1].splitlines()[0])
+    assert (done["markdown"], done["meta"]["check"]["joins"]) == (READING, 2)
 
     # The connector's path: a ticket's upload of the same file is the cached parse, and its
     # `last` reads land the same reading copy.
@@ -191,7 +197,16 @@ async def test_a_failed_parse_is_retried_by_sending_its_file_again(
 
     upstream.calls.clear()
     second = await _mint(api, sessionmaker)
-    retried = await _parse(api, documents["mixed_pdf"], second, retry="true", model=FALLBACK)
+    # Another selection of pages is another parse: nothing to retry. A flag that is no
+    # bool is refused rather than read as false, which would start a full parse.
+    other = await _parse(api, documents["mixed_pdf"], second, retry="true", pages="1-2")
+    assert other.status_code == 409, other.text
+    assert "with these pages" in other.json()["error"]["message"]
+    unclear = await _parse(api, documents["mixed_pdf"], second, retry="please")
+    assert unclear.status_code == 400, unclear.text
+    assert (upstream.calls, await _spent(api), _uploads(api)) == ([], 0, [])
+    # Any case, as JSON's bool takes it.
+    retried = await _parse(api, documents["mixed_pdf"], second, retry="True", model=FALLBACK)
     assert retried.status_code == 202, retried.text
     assert retried.json() == {"job_id": job_id, "status": "queued"}
     job = await _job(sessionmaker, job_id)
@@ -232,7 +247,7 @@ async def test_a_retry_with_nothing_to_retry_is_refused_and_spends_nothing(
 
     nothing = await _parse(api, documents["mixed_pdf"], token, retry="true")
     assert nothing.status_code == 409, nothing.text
-    assert "No failed parse of this file to retry" in nothing.json()["error"]["message"]
+    assert "No parse of this file with these pages to retry" in nothing.json()["error"]["message"]
     both = await _parse(api, documents["mixed_pdf"], token, retry="true", force="true")
     assert both.status_code == 400, both.text
     async with sessionmaker() as db:
@@ -246,7 +261,38 @@ async def test_a_retry_with_nothing_to_retry_is_refused_and_spends_nothing(
     assert (await _job(sessionmaker, filed["job_id"])).status == "failed"
     refused = await _parse(api, documents["mixed_pdf"], retry="true")
     assert refused.status_code == 409, refused.text
+    assert "a Files document's" in refused.json()["error"]["message"]
     assert (await _job(sessionmaker, filed["job_id"])).status == "failed"
+
+
+@respx.mock
+async def test_a_retry_the_balance_cannot_cover_is_refused_and_changes_nothing(
+    make_client, sessionmaker, documents, tmp_path
+) -> None:
+    client = make_client(
+        workspaces_dir=str(tmp_path / "ws"),
+        parse_fallback_model=FALLBACK,
+        free_credits_per_period=3,
+    )
+    api = await _authorize(client, sessionmaker)
+    respx.post(KANO_CHAT_URL).mock(side_effect=Upstream({(MODEL, 2): lambda: httpx.Response(400)}))
+    job_id = (await _parse(api, documents["mixed_pdf"])).json()["job_id"]
+    await _drain_queue(api, sessionmaker)
+    # The failure gave its credits back; a one-page parse takes one of the three.
+    assert (await _parse(api, documents["text_pdf"])).status_code == 202
+    await _drain_queue(api, sessionmaker)
+    assert await _spent(api) == 1
+
+    token = await _mint(api, sessionmaker)
+    refused = await _parse(api, documents["mixed_pdf"], token, retry="true")
+    assert refused.status_code == 402, refused.text
+    assert (refused.json()["error"]["need"], refused.json()["error"]["remaining"]) == (3, 2)
+    assert (await _job(sessionmaker, job_id)).status == "failed"
+    assert await _spent(api) == 1
+    async with sessionmaker() as db:
+        ticket = (await db.execute(select(UploadTicket))).scalars().one()
+    assert (ticket.spent_at, ticket.job_id) == (None, None)
+    assert _uploads(api) == []
 
 
 @respx.mock
@@ -284,6 +330,36 @@ async def test_a_retry_after_the_file_parsed_again_answers_that_parse(
     assert _uploads(api) == []
 
 
+@respx.mock
+async def test_a_retry_after_the_file_parsed_in_files_answers_that_parse(
+    api, sessionmaker, documents
+) -> None:
+    upstream = Upstream({(MODEL, 2): lambda: httpx.Response(400)})
+    respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
+    failed = (await _parse(api, documents["mixed_pdf"])).json()["job_id"]
+    await _drain_queue(api, sessionmaker)
+    async with sessionmaker() as db:
+        await db.execute(
+            update(Job)
+            .where(Job.id == uuid.UUID(failed))
+            .values(finished_at=utcnow() - timedelta(minutes=5))
+        )
+        await db.commit()
+    upstream.answers.clear()
+    filed = await _library_upload(api, documents["mixed_pdf"])
+    await _drain_queue(api, sessionmaker)
+    assert (await _job(sessionmaker, filed["job_id"])).status == "succeeded"
+    assert await _spent(api) == 3
+    upstream.calls.clear()
+
+    # The Files upload is the newest parse of the file: the retry is answered with it.
+    token = await _mint(api, sessionmaker)
+    retried = await _parse(api, documents["mixed_pdf"], token, retry="true")
+    assert retried.json() == {"job_id": filed["job_id"], "status": "succeeded"}
+    assert (await _job(sessionmaker, failed)).status == "failed"
+    assert (upstream.calls, await _spent(api)) == ([], 3)
+
+
 # --- a parse in flight ------------------------------------------------------------------------
 
 
@@ -308,3 +384,19 @@ async def test_the_same_file_again_joins_the_parse_in_flight(api, sessionmaker, 
     assert forced.status_code == 202
     assert forced.json()["job_id"] != job_id
     assert await _spent(api) == 6
+
+    # At the plan's cap (Free: one running), the same file still joins a parse of it in
+    # flight: the cap refuses only an upload that would start one.
+    in_flight = {uuid.UUID(job_id), uuid.UUID(forced.json()["job_id"])}
+    async with sessionmaker() as db:
+        await db.execute(update(Job).where(Job.id.in_(in_flight)).values(status="running"))
+        await db.commit()
+    again = await _parse(api, documents["mixed_pdf"], await _mint(api, sessionmaker))
+    assert again.status_code == 202, again.text
+    assert uuid.UUID(again.json()["job_id"]) in in_flight
+    capped = await _parse(api, documents["text_pdf"])
+    assert capped.status_code == 429, capped.text
+    assert await _spent(api) == 6
+    assert sorted(name.split(".")[0] for name in _uploads(api)) == sorted(
+        [job_id, forced.json()["job_id"]]
+    )

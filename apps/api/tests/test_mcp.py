@@ -110,15 +110,18 @@ async def test_parse_mints_a_ticket_and_ready_to_run_commands(api_client, sessio
 
     auth = f"-H 'Authorization: Bearer {token}'"
     land = f'&& curl -sSf {auth} {base}/v1/jobs/last/result.md -o "${{f%.*}}.md"'
-    send = f"curl -sSN --fail-with-body {auth} -H 'Accept: text/event-stream'"
-    # A refusal stops the chain with its short error in progress.sse, and no read writes an
-    # error envelope into a document (docs/mcp.md).
-    assert payload["upload"] == (
-        f'f=doc.pdf; {send} -F file=@"$f" {base}/v1/parse -o progress.sse {land}'
+    # The stream lands in a progress file named after the source, removed first; the read
+    # after it fails with `-f`, so a refusal stops the chain and no read writes an error
+    # envelope into a document — with options every curl has (docs/mcp.md).
+    send = (
+        """s="${f%.*}.progress.sse"; rm -f "$s"; """
+        f"curl -sSN {auth} -H 'Accept: text/event-stream'"
     )
+    assert payload["upload"] == f'f=doc.pdf; {send} -F file=@"$f" {base}/v1/parse -o "$s" {land}'
     assert payload["retry"] == (
-        f'f=doc.pdf; {send} -F file=@"$f" -F retry=true {base}/v1/parse -o progress.sse {land}'
+        f'f=doc.pdf; {send} -F file=@"$f" -F retry=true {base}/v1/parse -o "$s" {land}'
     )
+    assert "--fail-with-body" not in payload["upload"]
     assert payload["markdown"] == (
         f'f=doc.pdf; curl -sSf {auth} {base}/v1/jobs/last/result.md -o "${{f%.*}}.md"'
     )
@@ -126,12 +129,17 @@ async def test_parse_mints_a_ticket_and_ready_to_run_commands(api_client, sessio
         f'f=doc.pdf; curl -sSf {auth} {base}/v1/jobs/last/result -o "${{f%.*}}.meta.json"'
     )
     assert payload["status"] == f"curl -sS {auth} {base}/v1/jobs/last"
-    # Every placeholder of the .md fetched as the crop the web reader shows.
-    assert payload["figures"].startswith('f=doc.pdf; d="${f%.*}.figures"; mkdir -p "$d" && ')
-    assert (
-        f'curl -sSf {auth} "{base}/v1/jobs/last/figures/$p/$b" -o "$d/$n.png"'
-        in (payload["figures"])
+    # Every placeholder of the .md fetched as the crop the web reader shows: a 404 named,
+    # any other failure the exit status (run in bash, dash and zsh against a stub server
+    # when this changed).
+    assert payload["figures"].startswith(
+        'f=doc.pdf; m="${f%.*}.md"; d="${f%.*}.figures"; [ -f "$m" ] || '
     )
+    assert (
+        f'c=$(curl -sf {auth} "{base}/v1/jobs/last/figures/$p/$b" -o "$d/$n.png" '
+        '-w "%{http_code}")' in payload["figures"]
+    )
+    assert payload["figures"].endswith('done; [ "$rc" = 0 ]; }')
     # The ids `-F model=` takes, since `GET /v1/models` refuses a ticket.
     assert payload["models"] == [api_client.app.state.settings.parse_model]
     # The notes are the agent's whole manual: form fields, both input kinds, markers,
@@ -145,7 +153,8 @@ async def test_parse_mints_a_ticket_and_ready_to_run_commands(api_client, sessio
         "NEVER print",
         "sightread://pPAGE/YMIN,XMIN,YMAX,XMAX",
         "format-checked",
-        "tail -c 600 progress.sse",
+        'tail -c 600 "${f%.*}.progress.sse"',
+        "the same `-F pages=` as the upload",
         "insufficient_credits",
         "run `retry`",
         "Run `figures`",
