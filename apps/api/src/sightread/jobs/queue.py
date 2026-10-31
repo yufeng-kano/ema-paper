@@ -323,6 +323,41 @@ async def find_recent_terminal_job(
     ).scalar_one_or_none()
 
 
+async def find_parse_to_retry(
+    db: AsyncSession,
+    *,
+    user_id: int,
+    agent: str,
+    sha256: str,
+    pages_spec: str,
+    retention_days: int,
+) -> Job | None:
+    """The parse a data-plane retry sends its file to (docs/jobs.md § Retrying failed
+    pages): the newest parse of these bytes and pages by this user that no library
+    document names — the library's are retried from the library — and that the retention
+    still keeps. The caller puts it back when it failed, and answers with it as it stands
+    when it is queued, running or succeeded: a newer parse of the file is never passed
+    over for an older failure, which would be billed again for nothing. The model and the
+    prompt are the parse's own and play no part, as in the library's retry. With
+    `retention_days` 0 nothing is purged, and any such parse answers."""
+    named = (
+        select(Document.id)
+        .where(or_(Document.job_id == Job.id, Document.reconvert_job_id == Job.id))
+        .exists()
+    )
+    query = select(Job).where(
+        Job.user_id == user_id,
+        Job.agent == agent,
+        Job.sha256 == sha256,
+        Job.pages_spec == pages_spec,
+        Job.status.in_(("failed", "queued", "running", "succeeded")),
+        ~named,
+    )
+    if retention_days > 0:
+        query = query.where(parse_kept(retention_days))
+    return (await db.execute(query.order_by(Job.created_at.desc()).limit(1))).scalar_one_or_none()
+
+
 @dataclass(frozen=True)
 class CheckTarget:
     """The format check a job is queued or retried with, snapshotted on its row: model,

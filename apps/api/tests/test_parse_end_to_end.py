@@ -10,6 +10,7 @@ import asyncio
 import json
 import re
 import uuid
+from datetime import timedelta
 from pathlib import Path
 
 import httpx
@@ -19,7 +20,7 @@ from httpx import AsyncClient
 from sqlalchemy import select, update
 
 from sightread.agents.parse import PIPELINE_VERSION
-from sightread.db.models import Job, JobPage, Result, UsageLog
+from sightread.db.models import Job, JobPage, Result, UsageLog, utcnow
 from sightread.jobs.queue import claim_next_job
 from sightread.jobs.runner import run_job
 from tests.conftest import CSRF_HEADERS, DATABASE_URL, KANO_API_KEY, KANO_CHAT_URL
@@ -126,6 +127,8 @@ async def test_parse_a_mixed_pdf_end_to_end(api_client, sessionmaker, documents)
         "pipeline_version": PIPELINE_VERSION,
         "sha256": result["meta"]["sha256"],
         "cached": False,
+        # Checked as a Files upload is: no page boundary here needed a join or an edit.
+        "check": {"model": MODEL, "joins": 0, "edits": 0},
         "figure_check": {"verified": 3, "adjusted": 0, "unverified": 0},
     }
     assert len(result["meta"]["sha256"]) == 64
@@ -255,12 +258,18 @@ async def test_a_degraded_result_is_never_served_from_the_cache(
     respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
     first = await _upload(api_client, documents["mixed_pdf"], pages="1,2")
     await _drain_queue(api_client, sessionmaker)
-    # A result from before a failed page failed the job: served, with a page missing.
+    # A result from before a failed page failed the job: served, with a page missing. It
+    # finished before the retry window, which would otherwise join it as the same upload.
     async with sessionmaker() as db:
         await db.execute(
             update(Result)
             .where(Result.job_id == uuid.UUID(first.json()["job_id"]))
             .values(errors=[{"page": 1, "reason": "upstream call failed"}])
+        )
+        await db.execute(
+            update(Job)
+            .where(Job.id == uuid.UUID(first.json()["job_id"]))
+            .values(finished_at=utcnow() - timedelta(minutes=5))
         )
         await db.commit()
 

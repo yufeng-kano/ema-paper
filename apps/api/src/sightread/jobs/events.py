@@ -149,7 +149,8 @@ async def iter_job_events(
 
             if job.status in TERMINAL_STATUSES:
                 if result is not None:
-                    yield DONE, result_payload(result)
+                    # The data plane's stream: the text the web reader opens.
+                    yield DONE, result_payload(result, reading_copy=True)
                 else:
                     yield (
                         ERROR,

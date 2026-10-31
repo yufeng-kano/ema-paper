@@ -69,7 +69,10 @@ async def test_initialize_and_list_tools(api_client: AsyncClient) -> None:
     tools = {tool.name: tool for tool in listing.tools}
     assert set(tools) == {"parse"}
     assert "yxyx_norm1000" in tools["parse"].description
-    assert "sightread://" in tools["parse"].description
+    # The order the placeholder is written in, y first: an agent reading "x1,y1" here
+    # would crop every figure transposed.
+    assert "sightread://pPAGE/YMIN,XMIN,YMAX,XMAX" in tools["parse"].description
+    assert "x1,y1" not in tools["parse"].description
     assert not tools["parse"].input_schema.get("required")
 
 
@@ -105,23 +108,34 @@ async def test_parse_mints_a_ticket_and_ready_to_run_commands(api_client, sessio
     assert payload["page_cap"] == api_client.app.state.settings.page_cap
     assert payload["expires_at"].endswith("Z")
 
+    auth = f"-H 'Authorization: Bearer {token}'"
+    land = f'&& curl -sSf {auth} {base}/v1/jobs/last/result.md -o "${{f%.*}}.md"'
+    send = f"curl -sSN --fail-with-body {auth} -H 'Accept: text/event-stream'"
+    # A refusal stops the chain with its short error in progress.sse, and no read writes an
+    # error envelope into a document (docs/mcp.md).
     assert payload["upload"] == (
-        f"f=doc.pdf; curl -sN -H 'Authorization: Bearer {token}' "
-        f"-H 'Accept: text/event-stream' -F file=@\"$f\" {base}/v1/parse -o progress.sse "
-        f"&& curl -s -H 'Authorization: Bearer {token}' {base}/v1/jobs/last/result.md "
-        f'-o "${{f%.*}}.md"'
+        f'f=doc.pdf; {send} -F file=@"$f" {base}/v1/parse -o progress.sse {land}'
+    )
+    assert payload["retry"] == (
+        f'f=doc.pdf; {send} -F file=@"$f" -F retry=true {base}/v1/parse -o progress.sse {land}'
     )
     assert payload["markdown"] == (
-        f"f=doc.pdf; curl -s -H 'Authorization: Bearer {token}' {base}/v1/jobs/last/result.md "
-        f'-o "${{f%.*}}.md"'
+        f'f=doc.pdf; curl -sSf {auth} {base}/v1/jobs/last/result.md -o "${{f%.*}}.md"'
     )
     assert payload["metadata"] == (
-        f"f=doc.pdf; curl -s -H 'Authorization: Bearer {token}' {base}/v1/jobs/last/result "
-        f'-o "${{f%.*}}.meta.json"'
+        f'f=doc.pdf; curl -sSf {auth} {base}/v1/jobs/last/result -o "${{f%.*}}.meta.json"'
     )
-    assert payload["status"] == (f"curl -s -H 'Authorization: Bearer {token}' {base}/v1/jobs/last")
+    assert payload["status"] == f"curl -sS {auth} {base}/v1/jobs/last"
+    # Every placeholder of the .md fetched as the crop the web reader shows.
+    assert payload["figures"].startswith('f=doc.pdf; d="${f%.*}.figures"; mkdir -p "$d" && ')
+    assert (
+        f'curl -sSf {auth} "{base}/v1/jobs/last/figures/$p/$b" -o "$d/$n.png"'
+        in (payload["figures"])
+    )
+    # The ids `-F model=` takes, since `GET /v1/models` refuses a ticket.
+    assert payload["models"] == [api_client.app.state.settings.parse_model]
     # The notes are the agent's whole manual: form fields, both input kinds, markers,
-    # recovery.
+    # failures, the retry, the figures, recovery.
     for fragment in (
         "model=",
         "pages=1-5,8",
@@ -130,9 +144,17 @@ async def test_parse_mints_a_ticket_and_ready_to_run_commands(api_client, sessio
         "<!-- page: N -->",
         "NEVER print",
         "sightread://pPAGE/YMIN,XMIN,YMAX,XMAX",
+        "format-checked",
+        "tail -c 600 progress.sse",
+        "insufficient_credits",
+        "run `retry`",
+        "Run `figures`",
+        "`unverified`",
     ):
         assert fragment in payload["notes"]
-    assert "cached result comes back instantly while the parse is kept" in payload["notes"]
+    assert "joins its parse while it runs and returns it once it has succeeded" in payload["notes"]
+    # The ticket cannot read the model list: the notes must not send the agent there.
+    assert "GET /v1/models" not in payload["notes"]
     # The parse is deleted after the retention: the landed file is what lasts.
     assert "kept 30 days after it finishes and then deleted" in payload["notes"]
     # Profiles are gone; an agent told to send one would get a silently ignored field.
@@ -200,3 +222,16 @@ async def test_an_invalid_token_never_reaches_a_tool(api_client: AsyncClient) ->
 
     assert response.status_code == 401
     assert 'error="invalid_token"' in response.headers["WWW-Authenticate"]
+
+
+async def test_the_models_listed_are_the_parse_agents_with_the_fallback_second(
+    make_client, sessionmaker
+) -> None:
+    # The connector cannot read `GET /v1/models` with its ticket, so the tool hands over
+    # the ids `-F model=` takes — the fallback a retry sends a blocked page to among them.
+    client = await _authorize(
+        make_client(parse_fallback_model="vendor/fallback-model"), sessionmaker
+    )
+    async with mcp_running(client), _mcp_session(client) as session:
+        payload = await _mint(session)
+    assert payload["models"] == [client.app.state.settings.parse_model, "vendor/fallback-model"]
