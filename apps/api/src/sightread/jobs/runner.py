@@ -203,10 +203,19 @@ class RunState:
     figures_discarded: bool = False
 
 
-def result_payload(result: Result) -> dict:
-    """The result shape both planes return (docs/api.md § GET /v1/jobs/{id}/result)."""
+def result_payload(result: Result, *, reading_copy: bool = False) -> dict:
+    """The result shape both planes return (docs/api.md § GET /v1/jobs/{id}/result).
+
+    `reading_copy`: `markdown` is the format check's reading copy when the parse has one —
+    the text the web reader opens, which the data plane hands its callers and the
+    connector (docs/parsing.md § Format check). The control plane keeps the exact
+    transcription."""
     return {
-        "markdown": result.markdown,
+        "markdown": (
+            result.reading_markdown
+            if reading_copy and result.reading_markdown is not None
+            else result.markdown
+        ),
         "pages": result.pages,
         "figures": result.figures,
         "errors": result.errors,
@@ -1267,8 +1276,9 @@ async def run_job(
             # worth knowing, what it said about the document is not.
             logger.info("job %s dropped %d unusable figure boxes", job_id, document.dropped_figures)
 
-        # A Files upload is checked before it opens, and a check that fails fails the job
-        # as a failed page does, every page kept (docs/parsing.md § Format check).
+        # A parse is checked before it opens — a Files upload and a data-plane parse alike —
+        # and a check that fails fails the job as a failed page does, every page kept
+        # (docs/parsing.md § Format check).
         reading: str | None = None
         check_meta: dict | None = None
         if job.check_model:

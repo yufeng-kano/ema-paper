@@ -614,7 +614,7 @@ async def test_the_check_takes_its_own_settings(
     assert job.check_prompt.endswith("# The reader's instructions\n\nUse $.\n")
 
 
-async def test_no_check_when_switched_off_or_through_the_api(
+async def test_no_check_when_switched_off_and_an_api_parse_checked_as_an_upload(
     library, sessionmaker, documents
 ) -> None:
     off = await library.put(
@@ -624,7 +624,8 @@ async def test_no_check_when_switched_off_or_through_the_api(
     uploaded = await _upload(library, documents["mixed_pdf"])
     assert (await _job(sessionmaker, uploaded["job_id"])).check_model is None
 
-    # An API parse is the transcription its caller asked for: never checked.
+    # An API parse — the connector's too — is checked as a Files upload is, since
+    # 2026-10-31 (docs/parsing.md § Format check); test_data_plane_parity.py reads it back.
     on = await library.put(
         "/api/agents/check/settings", json={"auto_check": True}, headers=CSRF_HEADERS
     )
@@ -636,7 +637,7 @@ async def test_no_check_when_switched_off_or_through_the_api(
         headers={"Authorization": f"Bearer {created.json()['key']}"},
     )
     assert accepted.status_code == 202, accepted.text
-    assert (await _job(sessionmaker, accepted.json()["job_id"])).check_model is None
+    assert (await _job(sessionmaker, accepted.json()["job_id"])).check_model == MODEL
 
 
 def test_checking_is_a_running_parse_past_its_last_page_with_a_check() -> None:

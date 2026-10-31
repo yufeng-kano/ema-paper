@@ -1,8 +1,9 @@
 """Single-use upload tickets for the MCP `parse` tool (docs/auth.md § 5).
 
 Format ``srt_<32 url-safe chars>``. Returned by the tool exactly once, stored as a SHA-256
-hash plus a display string. A ticket is worth one `POST /v1/parse` and then only reads of
-the job that upload created — never an API key's rights, never `/mcp`.
+hash plus a display string. A ticket is worth one `POST /v1/parse` — a parse, or the retry
+of a failed one — and then only reads of the job that upload created — never an API key's
+rights, never `/mcp`.
 """
 
 from __future__ import annotations
@@ -27,7 +28,8 @@ MINT_WINDOW = timedelta(hours=1)
 # The agent's only recovery hint, so it travels in the 401 body itself (docs/auth.md § 5).
 REJECTION_MESSAGE = (
     "Upload ticket expired or already spent — call the parse tool again for a fresh "
-    "ticket; re-uploading the same file returns the cached result instantly."
+    "ticket. Re-uploading the same file joins its parse while it runs and returns it once "
+    "it has succeeded; a failed parse is resumed with the retry command."
 )
 
 

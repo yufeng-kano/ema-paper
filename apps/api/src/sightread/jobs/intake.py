@@ -51,16 +51,19 @@ from ..workspace import documents as workspace_documents
 from ..workspace import safe_io
 from ..workspace.filing import document_relative
 from ..workspace.trash import read_row
+from . import events
 from .queue import (
     CheckTarget,
     count_running_jobs,
     enqueue_job,
     find_active_job,
     find_cached_job,
+    find_parse_to_retry,
     find_recent_terminal_job,
     hold_dedup_key,
     normalize_pages_spec,
     parse_pages_spec,
+    retry_job,
 )
 from .runner import result_payload
 
@@ -332,6 +335,7 @@ async def submit_parse(
     retain_source: bool = False,
     check: bool = False,
     reconvert: Document | None = None,
+    retry: bool = False,
 ) -> Submission:
     """Store the document, dedup it and queue the parse. Commits before it returns.
 
@@ -339,32 +343,30 @@ async def submit_parse(
     here (413, 400, 429) costs the caller its one upload (docs/auth.md § 5).
 
     `reuse_in_flight` additionally answers with a job that is still queued or running for
-    these exact bytes instead of starting a second one. Only the web library asks for it: a
-    browser cannot tell a lost response from a lost request, so its retry would otherwise
-    buy the user a second parse of a document they already paid for (docs/jobs.md § Dedup).
+    these exact bytes instead of starting a second one. The web library and the data plane
+    ask for it: a browser cannot tell a lost response from a lost request, and the
+    connector re-runs a command its shell cut off, so either would otherwise buy the user
+    a second parse of a document they already paid for (docs/jobs.md § Dedup).
 
-    `check` asks for the format check, which only a Files upload takes; the check is no
-    part of the dedup key, so a cached result or a parse already on its way is answered
-    as it is (docs/parsing.md § Format check).
+    `check` asks for the format check, which every parse takes — a Files upload and a
+    data-plane parse alike; the check is no part of the dedup key, so a cached result or a
+    parse already on its way is answered as it is (docs/parsing.md § Format check).
+
+    `retry` answers with the newest parse of the same bytes and pages instead of starting
+    one: a failed data-plane parse goes back on the queue, its succeeded pages kept and
+    its failed ones run on `model` when one is named, else on its own; one in flight or
+    succeeded is answered as it stands (docs/jobs.md § Retrying failed pages).
 
     `reconvert` is the library document this parse re-converts, with `force`: it points at
     the job in the commit that queues it, so no re-convert runs that its document would
     not take (docs/jobs.md § Re-converting a document).
     """
+    if retry and force:
+        raise ApiError(400, "invalid_request", "'retry' resumes a failed parse; 'force' starts one")
     kind, media_type = resolve_kind(filename, media_type)
     # An upload is always the parse agent's input (docs/agents.md).
     target = await resolve_target(db, settings, user, PARSE, model)
     prompt_sha256 = hashlib.sha256(target.prompt.encode()).hexdigest()
-
-    # The plan's parses at once (docs/billing.md § Plans), under the deployment's cap.
-    plan = await ledger.plan_of(db, settings, user.id)
-    if await count_running_jobs(db, user.id) >= ledger.jobs_limit(settings, plan):
-        raise ApiError(
-            429,
-            "rate_limit",
-            "Too many running jobs; retry when one finishes",
-            headers={"Retry-After": str(settings.parse_retry_after_seconds)},
-        )
 
     upload_dir = Path(settings.upload_dir)
     upload_dir.mkdir(parents=True, exist_ok=True)
@@ -393,6 +395,89 @@ async def submit_parse(
         "prompt_sha256": prompt_sha256,
     }
 
+    if retry:
+        # The dedup key's hold a plain upload of these bytes takes, so a retry and an upload
+        # racing it never both start a parse; then the user's row before the job's, the one
+        # order the library's retry and every charge take (docs/billing.md § A parse),
+        # which also keeps two retries of one parse from both putting it back.
+        await hold_dedup_key(db, **key)
+        await db.execute(select(User.id).where(User.id == user.id).with_for_update())
+        found = await find_parse_to_retry(
+            db,
+            user_id=user.id,
+            agent=target.agent,
+            sha256=sha256,
+            pages_spec=pages_spec,
+            retention_days=settings.parse_retention_days,
+        )
+        job = (
+            None
+            if found is None
+            else (
+                await db.execute(
+                    select(Job)
+                    .where(Job.id == found[0].id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+        )
+        if job is None:
+            stored.unlink(missing_ok=True)
+            raise ApiError(
+                409,
+                "invalid_request",
+                "No parse of this file with these pages to retry: send the pages its upload "
+                "sent, or upload the file instead",
+            )
+        if job.status == "failed" and found[1]:
+            # A Files document's parse: the library retries it, from its original.
+            stored.unlink(missing_ok=True)
+            raise ApiError(
+                409,
+                "invalid_request",
+                "The latest parse of this file is a Files document's; retry it from the Files page",
+            )
+        if job.status == "failed":
+            retry_model = target.model if model is not None else None
+            # The check as the settings say now, following the model this run sends the
+            # failed pages to (docs/jobs.md § Retrying failed pages).
+            check_target = (
+                await resolve_check(db, settings, user.id, retry_model or job.model)
+                if check
+                else None
+            )
+            try:
+                # The credits the failure released, taken again: the document is charged
+                # once, by the run that delivers it (docs/billing.md § A parse).
+                await ledger.reserve_again(db, settings, job.id)
+            except ledger.InsufficientCredits as exc:
+                stored.unlink(missing_ok=True)
+                raise insufficient_credits(exc) from exc
+            # Under the job's own name, so whatever removes a job's uploads by its id —
+            # the retention, deleting the account — finds it (docs/jobs.md § Retention).
+            source = stored.with_name(f"{job.id}.retry-{uuid.uuid4().hex[:12]}{stored.suffix}")
+            stored.rename(source)
+            try:
+                await retry_job(
+                    db, job.id, source_path=str(source), model=retry_model, check=check_target
+                )
+                await events.notify(db, job.id)
+            except BaseException:
+                source.unlink(missing_ok=True)
+                raise
+        else:
+            # Back on the queue already, never off it, or parsed again since the failure:
+            # that parse, answered as it stands, nothing charged.
+            stored.unlink(missing_ok=True)
+        if ticket is not None:
+            upload_tickets.spend(ticket, job.id)
+        # A commit that raises may still have landed, so the source stays: a retry that
+        # did runs on it, and the upload sweeper takes it otherwise (docs/jobs.md).
+        await db.commit()
+        await db.refresh(job)
+        return Submission(job=job)
+
     if not force:
         cached = await find_cached_job(db, retention_days=settings.parse_retention_days, **key)
         result = (
@@ -413,7 +498,7 @@ async def submit_parse(
                 stored.unlink(missing_ok=True)
             if ticket is not None:
                 upload_tickets.spend(ticket, result.job_id)
-                await db.commit()
+            await db.commit()
             return Submission(cached=result, upload=stored if retain_source else None)
 
         if reuse_in_flight:
@@ -444,9 +529,24 @@ async def submit_parse(
                     stored.unlink(missing_ok=True)
                 if ticket is not None:
                     upload_tickets.spend(ticket, active.id)
-                    await db.commit()
+                # Committed here as on every other way out, so the dedup key's hold is
+                # released before a data-plane caller streams the job's progress.
+                await db.commit()
                 return Submission(job=active, upload=stored if retain_source else None)
 
+    # The plan's parses at once (docs/billing.md § Plans), under the deployment's cap,
+    # asked only of a parse about to start: a cache hit or a join starts none (docs/jobs.md
+    # § Concurrency caps). A retry is no upload: the claim applies the cap to it like to
+    # any queued job.
+    plan = await ledger.plan_of(db, settings, user.id)
+    if await count_running_jobs(db, user.id) >= ledger.jobs_limit(settings, plan):
+        stored.unlink(missing_ok=True)
+        raise ApiError(
+            429,
+            "rate_limit",
+            "Too many running jobs; retry when one finishes",
+            headers={"Retry-After": str(settings.parse_retry_after_seconds)},
+        )
     check_target = await resolve_check(db, settings, user.id, target.model) if check else None
     # The user's row lock that every charge takes (docs/billing.md § A parse), before the
     # job is inserted: the insert's foreign-key check holds a share lock on this row, and
@@ -644,7 +744,8 @@ async def convert_kept_file(
 
 
 def cached_payload(result: Result) -> dict:
-    """The result payload of a dedup hit, flagged `meta.cached` (docs/jobs.md § Dedup)."""
-    payload = result_payload(result)
+    """The data plane's result payload of a dedup hit, flagged `meta.cached` (docs/jobs.md
+    § Dedup), with the reading copy as its `markdown` (docs/api.md)."""
+    payload = result_payload(result, reading_copy=True)
     payload["meta"] = {**payload["meta"], "cached": True}
     return payload

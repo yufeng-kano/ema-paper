@@ -845,7 +845,15 @@ async def test_the_plan_caps_the_parses_a_user_runs_at_once(make_client, documen
     async with client.app.state.sessionmaker() as db:
         rows = (await db.execute(select(Job).where(Job.user_id == user_id))).scalars().all()
         assert sum(row.status == "running" for row in rows) == 2
-    assert (await _upload(client, documents, name="more.png")).status_code == 429
+    # At the cap, the same file again joins the parse already on its way (docs/jobs.md
+    # § Concurrency caps); another file waits.
+    assert (await _upload(client, documents, name="again.png")).status_code == 201
+    another = await client.post(
+        "/api/library/documents",
+        files={"file": ("more.jpg", documents["jpg"].read_bytes(), "image/jpeg")},
+        headers=CSRF_HEADERS,
+    )
+    assert another.status_code == 429, another.text
 
 
 async def test_the_plan_sets_the_storage_the_usage_shows(make_client, tmp_path) -> None:

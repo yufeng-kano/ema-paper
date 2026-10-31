@@ -26,7 +26,8 @@ from tests.test_retention import postgres_only
 # The copy is part of the contract: it is the agent's only recovery hint (docs/auth.md § 5).
 EXPECTED_REJECTION = (
     "Upload ticket expired or already spent — call the parse tool again for a fresh "
-    "ticket; re-uploading the same file returns the cached result instantly."
+    "ticket. Re-uploading the same file joins its parse while it runs and returns it once "
+    "it has succeeded; a failed parse is resumed with the retry command."
 )
 
 
@@ -105,11 +106,16 @@ async def test_last_resolves_a_spent_ticket_to_its_own_job(
     assert refused.status_code == 400
 
 
-async def test_last_with_an_unspent_ticket_is_the_documented_401(api_client, sessionmaker) -> None:
+async def test_last_with_an_unspent_ticket_says_it_has_started_no_parse(
+    api_client, sessionmaker
+) -> None:
+    # Not the expired copy: that would send the agent to mint again for an upload that was
+    # refused, or never sent, while this ticket can still upload (docs/auth.md § 5).
     token = await _mint(api_client, sessionmaker)
-    response = await api_client.get("/v1/jobs/last", headers=_bearer(token))
-    assert response.status_code == 401
-    assert response.json()["error"]["message"] == EXPECTED_REJECTION
+    for path in ("/v1/jobs/last", "/v1/jobs/last/result.md", "/v1/jobs/last/figures/1/0,0,9,9"):
+        response = await api_client.get(path, headers=_bearer(token))
+        assert response.status_code == 409, path
+        assert "has not started a parse" in response.json()["error"]["message"]
 
 
 async def test_a_spent_ticket_cannot_upload_again(api_client, sessionmaker, documents) -> None:

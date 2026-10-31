@@ -24,15 +24,19 @@ Multipart form (preferred) or JSON with base64 `source`.
 | Field | Notes |
 |-------|-------|
 | `file` | required; PDF or image (jpg/png/webp/heic). Max **128 MB** (`UPLOAD_MAX_BYTES`), PDFs max **500 pages** (`PAGE_CAP`) |
-| `model` | optional model id on the parse agent's upstream (Kano Proxy's or the selected connection's catalog); default: the model stored in the parse agent's settings. Neither → 400 ([agents.md](./agents.md) § Enqueue rules) |
+| `model` | optional; one of the parse agent's models (`GET /v1/models`: `PARSE_MODEL`, then `PARSE_FALLBACK_MODEL`); default `PARSE_MODEL`. Any other → 400 ([agents.md](./agents.md) § Enqueue rules). With `retry`, the model the failed pages run on; default the parse's own |
 | `pages` | optional selection, e.g. `"1-5,8"`; default all |
-| `force` | optional bool; bypass dedup cache |
+| `force` | optional bool; bypass the dedup cache and the in-flight join (below) |
+| … | a bool field takes what JSON's `true`/`false` take in multipart too: `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`, any case; any other value → **400**, never read as false |
+| `retry` | optional bool; **retry a failed parse** instead of starting one: the file goes to the newest parse of the same bytes and `pages` (so a retry sends the `pages` its upload sent) that the retention still keeps, the library's included. A failed one made on the data plane goes back on the queue keeping its succeeded pages and runs the failed ones ([jobs.md](./jobs.md) § Retrying failed pages); one queued or running (a retry already sent) or succeeded (the file parsed again since, here or in Files) is answered as it stands and nothing is charged. **409** when there is none, or when the newest is a failed Files document's, which the library retries; **400** with `force`; **402** when the balance cannot cover the parse's credits again |
 
 Responses:
 
 - **200** — dedup cache hit ([jobs.md](./jobs.md) § Dedup): full result immediately.
-- **202** — `{ "job_id": "...", "status": "queued" }`.
+- **202** — `{ "job_id": "...", "status": "queued" }`. The same bytes already queued or running for this caller — or finished within `UPLOAD_RETRY_WINDOW_SECONDS` — are that job, joined rather than parsed twice, as the web library's upload is ([jobs.md](./jobs.md) § Dedup cache); `force` starts a second parse anyway.
 - With `Accept: text/event-stream` — SSE stream (below) instead; small documents feel synchronous.
+
+**A parse here is the parse a Files upload gets** (since 2026-10-31): the parse agent's settings and the format check, whenever the `check` agent's switch is on ([parsing.md](./parsing.md) § Format check), so `markdown` is the text the web reader opens; the figure check and its crops, served below; a failed parse retried with `retry`, its succeeded pages kept; and the in-flight join above. The connector's commands are this route and the reads below ([mcp.md](./mcp.md)).
 
 The upload is hashed (SHA-256) while streaming to disk; the request must never buffer the whole file in memory.
 
@@ -42,7 +46,7 @@ The JSON form is held whole by `request.json()`, so the body-limit middleware gi
 
 `{ job_id, status: queued|running|succeeded|failed, page_count, pages_done, error?, created_at, finished_at?, credits }` — `credits` is what the parse cost once it is settled, `0` for a failed one, `null` while its reservation is pending ([billing.md](./billing.md) § Routes)
 
-A parse with any failed page is `failed` as a whole ([parsing.md](./parsing.md) § Vision-only conversion): `error` counts the failed pages and names their reasons, and there is no result to fetch. A new upload, or the same one with `force`, parses it again; the pages are retried alone only from the web library ([jobs.md](./jobs.md) § Retrying failed pages).
+A parse with any failed page is `failed` as a whole ([parsing.md](./parsing.md) § Vision-only conversion): `error` counts the failed pages and names their reasons, and there is no result to fetch. `retry` (above) sends the failed pages again and keeps the rest — from the web library, its retry dialog does the same ([jobs.md](./jobs.md) § Retrying failed pages); `force` parses the whole file again.
 
 A finished parse is kept `PARSE_RETENTION_DAYS` (30) days after it finished — longer only while a file in the web library names a parse of the same original, or while an upload ticket that has not expired reads it — and then deleted with its result and crops ([jobs.md](./jobs.md) § Retention): from then on this route, `/result`, `/result.md` and `/events` answer **404** `No such job`, as for a job that never existed, and the same bytes uploaded again parse — and are charged — again. Save the result when it arrives.
 
@@ -62,12 +66,13 @@ A finished parse is kept `PARSE_RETENTION_DAYS` (30) days after it finished — 
     "pipeline_version": 2,
     "sha256": "…",
     "cached": false,
+    "check": { "model": "provider/model", "joins": 2, "edits": 1 },
     "figure_check": { "verified": 1, "adjusted": 0, "unverified": 0 }
   }
 }
 ```
 
-`markdown` carries a `<!-- page: N -->` marker line before each page's content ([parsing.md](./parsing.md) § Page markers). Figure placeholders in markdown: `![fig1](sightread://p3/120,60,480,940)` with the caption verbatim on the next line; a figure's `caption` in `figures` is that line, and empty for a figure without one ([parsing.md](./parsing.md) § Coordinate contract). Cropping is the caller's job (add ~2% margin; denormalize `x_px = x/1000 * page_width_px`).
+`markdown` is the document as the web reader opens it: the format check's reading copy when the parse was checked — `meta.check` says so, with its model and how many joins and edits it made — and otherwise the transcription page by page (a parse whose reader switched the check off, or one cached from before the data plane was checked); the exact transcription of a checked parse stays the server's, the dedup cache's record ([parsing.md](./parsing.md) § Format check). It carries a `<!-- page: N -->` marker line before each page's content ([parsing.md](./parsing.md) § Page markers). Figure placeholders in markdown: `![fig1](sightread://p3/120,60,480,940)` with the caption verbatim on the next line; a figure's `caption` in `figures` is that line, and empty for a figure without one ([parsing.md](./parsing.md) § Coordinate contract). The crop Ema Paper made of each figure — the one the web reader shows — is served below (`/figures`); a caller cropping for itself adds ~2% margin and denormalizes `x_px = x/1000 * page_width_px`.
 
 A figure's `check` is what the figure check made of its box ([parsing.md](./parsing.md) § Figure check): `verified`, `adjusted` (the box was moved to take in what it cut off, then confirmed) or `unverified` (the check could not confirm the box: crop it with a wider margin, or look at it). `meta.figure_check` counts the three. Results parsed before the check (`pipeline_version` below 10) carry neither.
 
@@ -77,11 +82,15 @@ Results stored before the Kano Proxy migration still carry `meta.profile` (the O
 
 ### GET /v1/jobs/{id}/result.md — markdown only
 
-The result's `markdown` string as `text/markdown` — nothing to unwrap, ready to save as a file. Same 404 as `/result` while the job has no result.
+The result's `markdown` string as `text/markdown` — nothing to unwrap, ready to save as a file. Same 404 as `/result` while the job has no result: `This job has no result yet` while it is queued or running, and for a failed parse `This parse failed (<its error>) and has no result`.
+
+### GET /v1/jobs/{id}/figures/{page}/{ymin},{xmin},{ymax},{xmax} — one figure's crop
+
+One stored figure crop of the job's parse as `image/png`, addressed exactly as its `sightread://` placeholder addresses it — the crop the web reader shows, made from the parse's own render after the figure check, with its margin ([parsing.md](./parsing.md) § Figure crops) — with `Cache-Control: private, no-store`. 404 when the job stored no crop for that box (a result from before crops, a crop that failed); a running parse serves the crops of the pages it has finished. The connector's **figures** command fetches every placeholder of the `.md` this way ([mcp.md](./mcp.md)).
 
 ### GET /v1/jobs/last* — the upload ticket's own job
 
-`/v1/jobs/last`, `/v1/jobs/last/result` and `/v1/jobs/last/result.md` resolve `last` to the job the presented **upload ticket** is bound to, so a ticket caller (the MCP flow) never needs to extract a job id. Only tickets: a durable credential gets 400 and uses the explicit id routes.
+`/v1/jobs/last`, `/v1/jobs/last/result`, `/v1/jobs/last/result.md` and `/v1/jobs/last/figures/…` resolve `last` to the job the presented **upload ticket** is bound to, so a ticket caller (the MCP flow) never needs to extract a job id. Only tickets: a durable credential gets 400 and uses the explicit id routes. A ticket that has not created a job yet — its upload is still arriving, was refused, or was not sent — gets **409** saying so; a refused or unsent one can still upload once ([auth.md](./auth.md) § 5).
 
 ### GET /v1/jobs/{id}/events — SSE progress
 

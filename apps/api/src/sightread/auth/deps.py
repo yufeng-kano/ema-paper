@@ -54,8 +54,8 @@ async def resolve_bearer(db: AsyncSession, credential: str) -> User | None:
     """
     if credential.startswith(TICKET_PREFIX):
         # `srt_` also starts with `sr_`, so tickets are ruled out before the API key path
-        # can look at one. A ticket authenticates only the four routes whose dependencies
-        # are below — `/mcp` and `/v1/models` included, everything else refuses it.
+        # can look at one. A ticket authenticates only the routes whose dependencies are
+        # below — the upload and its job's reads; `/mcp` and `/v1/models` refuse it.
         return None
     if credential.startswith(KEY_PREFIX):
         return await resolve_api_key(db, credential)
@@ -153,7 +153,18 @@ async def require_ticket_job(request: Request, db: DbSession) -> uuid.UUID:
             400, "invalid_request", "'last' needs an upload ticket; use /v1/jobs/{id} instead"
         )
     ticket, _ = await _live_ticket(request, db)
-    if ticket.spent_at is None or ticket.job_id is None:
+    if ticket.spent_at is None:
+        # A live ticket whose upload is still arriving, was refused (credits, the running
+        # cap, the file) or never sent: the expired copy would send the agent to mint
+        # again for an upload refused the same way (docs/auth.md § 5).
+        raise ApiError(
+            409,
+            "invalid_request",
+            "This ticket has not started a parse yet: its upload is still arriving, was "
+            "refused, or was not sent. A refused or unsent upload can be sent once more "
+            "with it",
+        )
+    if ticket.job_id is None:
         raise ApiError(401, "auth", upload_tickets.REJECTION_MESSAGE)
     return ticket.job_id
 
