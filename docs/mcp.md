@@ -1,6 +1,6 @@
 # MCP server
 
-A **thin shell over the REST service layer** — no parsing logic of its own, no separate auth store. The MCP endpoint does exactly one thing: mint a short-lived **upload ticket** and hand back copy-paste `curl` commands. The document bytes themselves never travel through MCP — base64 file content in tool arguments burns ~1.37× the file size in model tokens, so uploads go out-of-band over the existing REST data plane (same pattern as S3 presigned URLs).
+A **thin shell over the REST service layer** — no parsing logic of its own, no separate auth store. The MCP endpoint mints short-lived **tickets** and hands back copy-paste `curl` commands: an upload ticket for a parse (`parse`), a document ticket for reading a document of the library or saving its text and notes (`read_document`, `write_document`); the one answer it gives inline is the library's index (`list_library`). The document bytes themselves never travel through MCP — base64 file content in tool arguments burns ~1.37× the file size in model tokens, so uploads go out-of-band over the existing REST data plane (same pattern as S3 presigned URLs).
 
 This assumes the MCP client can run shell commands with network access to this host (Claude Code has it natively; claude.ai chat/cowork need "Allow network egress" enabled in sandbox settings). Clients without a shell are out of scope.
 
@@ -10,7 +10,7 @@ This assumes the MCP client can run shell commands with network access to this h
 - Auth: `Authorization: Bearer` with either an OAuth access token (Claude Connectors path — see [auth.md](./auth.md) § 4) or a project API key (scripts/self-hosted agents). Both resolve to a user, and that user's agent settings apply as they do to a Files upload — the `parse` agent's prompt and fallback switch, the `check` agent's switch and instructions ([agents.md](./agents.md)); the models are the deployment's ([billing.md](./billing.md) § Models).
 - Never accept tokens in query strings.
 
-## The one tool: `parse`
+## The `parse` tool
 
 Input: none.
 
@@ -52,7 +52,26 @@ The commands:
 
 The server instructions and the tool description stay short and explicit about the coordinate contract: the placeholder as `sightread://pPAGE/YMIN,XMIN,YMAX,XMAX`, `bbox_format` `yxyx_norm1000`, and the crops the **figures** command saves.
 
-There are no other tools. No base64 source, no MCP-side progress notifications, no result relay — the REST plane already does all three better (SSE, dedup, `-o` to disk).
+No base64 source, no MCP-side progress notifications, no result relay — the REST plane already does all three better (SSE, dedup, `-o` to disk).
+
+## The library tools
+
+Since 2026-11-01 (the owner's decision: papers are read and annotated in Ema Paper, then handed to Claude — a deck made in claude.ai, Claude Code's own work), the connector also reads the Files library and saves a document's text and notes back. The same rule as `parse`: the tools mint and format, the bytes go over the REST routes ([api.md](./api.md) § The library on the data plane) straight to disk, and the agent is assumed to have a shell with network access. Each tool needs the grant's `library` scope ([auth.md](./auth.md) § 4): a connector approved before it existed gets a tool error saying to remove it in Claude's settings and add it again. An API key has it.
+
+**`list_library`** — input: `folder` (optional, a folder's `path` as this tool shows it, e.g. `Papers/2024`: that folder and everything below it) and `name` (optional, part of a document's name, any case). Output, inline: `{folders: [{id, path}], documents: [{id, name, path, kind, status, page_count}], total, truncated}` — the live library (no Trash) ordered by path, at most `MCP_LIBRARY_LIST_MAX_ITEMS` (300) documents; `truncated` says more matched, with `total` how many, and the description says to narrow by `folder` or `name`. Inline because it is the index the agent picks a document from: rows, never content. A `folder` that matches no live folder is a tool error that says to call the tool without it and use a `path` under `folders`.
+
+**`read_document`** — input: `document_id`. Output: a `read` document ticket ([auth.md](./auth.md) § 7), `expires_at`, `document` (the row `GET /v1/library/documents/{id}` answers: `{id, folder_id, name, path, kind, status, media_type, page_count, size_bytes, created_at, finished_at, original}`) and the commands:
+
+- **download** — for a parse or a markdown document: `d=` names a local directory (by default the directory name the workspace gives the document — no separator, never `.`, `..` or a hidden name — behind `./` when it starts with `-`, quoted as one shell word; every name the command writes is quoted the same way), and the command lands, in that directory, `doc.md` and `notes.md` as the web reader holds them, `document.json` (the row), and under `figures/` the crop of every `sightread://` placeholder in either file as `p<page>_<ymin>_<xmin>_<ymax>_<xmax>.png` (the name the workspace gives it) and every inserted image as `img-<hash>.png|jpg` — the name its `![…](figures/img-…)` link already points at, so the markdown renders where it landed. It saves each file's ETag beside it (`.doc.md.etag`, `.notes.md.etag`) for the save. A placeholder with no stored crop is named and skipped; any other failed fetch, a missing file included, makes the command exit non-zero. Downloading again replaces `doc.md` and `notes.md` in `d`. For a file of the library, **download** lands the file itself under its name, and there is nothing to save.
+- **original** — a parse's original upload as `source.<ext>` in `d`, present only when one is kept: separate, as it can be the size of the upload.
+- `notes` spell out the layout above, that a parse still queued or running has no `doc.md` yet (409), that the placeholder's coordinates are `yxyx_norm1000`, and that saving goes through `write_document`.
+
+**`write_document`** — input: `document_id`. Output: a `write` document ticket, `expires_at`, `document`, and **save**: with `d` as **download** used it and `f` set to `doc.md` or `notes.md`, the command `PUT`s the local file with `If-Match` from its `.etag` and, on 200, stores the new ETag, so the next save follows on; anything else prints the server's short JSON error and exits non-zero, the local file untouched. `notes` spell out: edit the downloaded files in place; keep the `<!-- page: N -->` markers and the figure placeholders as they are, since the web reader draws them; a new `figures/img-…` link has no image behind it; on **409** `revision_conflict` the file changed in Ema Paper since the download (the reader or its Agent edited it) — download it again into another `d`, carry the edits over and save from there; every save is one revision of the document's history, authored `api`. A file of the library is a tool error: it has no text to save.
+
+**Annotations.** `list_library` and `read_document` are marked read-only (`readOnlyHint`), so a client may run them without asking: neither changes the library, though `read_document` records the ticket it mints and counts against its mint rate. `write_document` is not read-only and not destructive (`destructiveHint` false): the save its command makes is a revision, revertible. All three are closed-world (`openWorldHint` false): they reach this deployment only.
+
+The tools never take or return the text itself, so a document's size never reaches the model's context through MCP; the agent reads the landed files with its own tools, in the parts it needs.
+
 
 ## Claude Connectors flow (the reason the OAuth AS exists)
 
@@ -64,4 +83,5 @@ There are no other tools. No base64 source, no MCP-side progress notifications, 
 
 - **Stateless streamable HTTP.** Every request carries its own bearer and gets its own transport, so a connector never depends on session affinity and a token can never be inherited from an earlier session. The SDK's session manager runs for the app's lifetime (FastAPI lifespan).
 - **Auth is ours, not the SDK's.** A small ASGI guard in front of the transport resolves the bearer through the same code path as `/v1` and answers 401 with `WWW-Authenticate: Bearer resource_metadata="<APP_URL>/.well-known/oauth-protected-resource"` — the pointer that starts a connector's OAuth discovery (RFC 9728).
+- **The library tools** resolve the caller and its scope in the same guard, read the library through the control plane's own reads (the one snapshot, the live rows, the document's own liveness) and mint through the document ticket module ([auth.md](./auth.md) § 7). The commands use options of any `curl` the `parse` commands may meet (`--etag-save` since 7.68), are written for bash, dash and zsh, and quote every name the reader gave as one shell word.
 - **`parse`** resolves the caller to a user, mints the ticket via the shared ticket module ([auth.md](./auth.md) § 5 — TTL, mint rate limit, opportunistic cleanup live there, not in MCP), reads the parse agent's models from the settings, and formats the command strings from `APP_URL`. Nothing else: the check, the crops, the retry and the in-flight join are the data plane's ([api.md](./api.md)), so MCP still owns no parsing decision.

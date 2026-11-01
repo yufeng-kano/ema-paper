@@ -23,6 +23,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from ..auth.deps import AppSettings, DbSession
 from ..auth.oauth_as import (
     CODE_CHALLENGE_METHOD,
+    GRANTED_SCOPE,
+    LIBRARY_SCOPE,
     SCOPE,
     RegistrationError,
     exchange_code,
@@ -167,7 +169,7 @@ async def authorization_server_metadata(settings: AppSettings) -> JSONResponse:
             "authorization_endpoint": f"{issuer}/oauth/authorize",
             "token_endpoint": f"{issuer}/oauth/token",
             "registration_endpoint": f"{issuer}/oauth/register",
-            "scopes_supported": [SCOPE],
+            "scopes_supported": [SCOPE, LIBRARY_SCOPE],
             "response_types_supported": ["code"],
             "response_modes_supported": ["query"],
             "grant_types_supported": ["authorization_code", "refresh_token"],
@@ -190,7 +192,7 @@ async def protected_resource_metadata(settings: AppSettings) -> JSONResponse:
         {
             "resource": f"{issuer}{MCP_PATH}",
             "authorization_servers": [issuer],
-            "scopes_supported": [SCOPE],
+            "scopes_supported": [SCOPE, LIBRARY_SCOPE],
             "bearer_methods_supported": ["header"],
         }
     )
@@ -236,7 +238,7 @@ async def register(request: Request, db: DbSession, settings: AppSettings):
             "grant_types": ["authorization_code", "refresh_token"],
             "response_types": ["code"],
             "token_endpoint_auth_method": "none",
-            "scope": SCOPE,
+            "scope": GRANTED_SCOPE,
         },
     )
 
@@ -323,7 +325,7 @@ async def authorize(
         "redirect_uri": redirect_uri,
         "state": state,
         "code_challenge": code_challenge,
-        "scope": scope or SCOPE,
+        "scope": scope or GRANTED_SCOPE,
         "consent_token": consent_token,
     }
     hidden = "".join(
@@ -331,10 +333,11 @@ async def authorize(
         for name, value in fields.items()
     )
     body = (
-        f"<p><strong>{html.escape(client.client_name)}</strong> wants to parse documents as "
+        f"<p><strong>{html.escape(client.client_name)}</strong> wants to use Ema Paper as "
         f"<code>{html.escape(user.email)}</code>.</p>"
-        "<p class='note'>It will be able to submit documents and read their results. It "
-        "cannot reach your settings, API keys or billing.</p>"
+        "<p class='note'>It will be able to submit documents, read your Files library and "
+        "save the text and notes of its documents. It cannot reach your settings, API keys "
+        "or billing.</p>"
         "<p class='terms'>Every page it parses uses credits from your plan, the same as a "
         "parse in the app.</p>"
         f"<form method='post' action='/oauth/authorize'>{hidden}"
@@ -428,6 +431,6 @@ async def token(
             "token_type": "Bearer",
             "expires_in": issued.expires_in,
             "refresh_token": issued.refresh_token,
-            "scope": SCOPE,
+            "scope": issued.scope,
         },
     )

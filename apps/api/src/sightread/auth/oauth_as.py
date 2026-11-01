@@ -34,8 +34,13 @@ CODE_TTL = timedelta(minutes=5)
 ACCESS_TTL = timedelta(hours=1)
 REFRESH_TTL = timedelta(days=30)
 
-# One scope: a token either speaks for its user's parsing or it does not exist.
+# Two scopes (docs/auth.md § 4): `parse`, the `parse` tool and the job routes, and, since
+# 2026-11-01, `library`, reading the Files library and saving a document's text and notes.
+# A grant is made for both, the consent page saying both; one approved before `library`
+# existed keeps `parse` alone through every refresh until it is approved again.
 SCOPE = "parse"
+LIBRARY_SCOPE = "library"
+GRANTED_SCOPE = f"{SCOPE} {LIBRARY_SCOPE}"
 CODE_CHALLENGE_METHOD = "S256"
 CLIENT_ID_CHARS = 32
 
@@ -54,6 +59,7 @@ class IssuedTokens:
     access_token: str
     refresh_token: str
     expires_in: int
+    scope: str
 
 
 def valid_redirect_uri(uri: str, allow_localhost: bool) -> bool:
@@ -118,7 +124,7 @@ async def issue_code(
             token_hash=hash_token(code),
             pkce_challenge=code_challenge,
             redirect_uri=redirect_uri,
-            scope=SCOPE,
+            scope=GRANTED_SCOPE,
             expires_at=utcnow() + CODE_TTL,
         )
     )
@@ -141,7 +147,9 @@ async def _live_grant(db: AsyncSession, kind: str, presented: str) -> OAuthGrant
     return row
 
 
-async def _issue_tokens(db: AsyncSession, *, client_id: str, user_id: int) -> IssuedTokens:
+async def _issue_tokens(
+    db: AsyncSession, *, client_id: str, user_id: int, scope: str
+) -> IssuedTokens:
     access_token = secrets.token_urlsafe(32)
     refresh_token = secrets.token_urlsafe(32)
     now = utcnow()
@@ -151,7 +159,7 @@ async def _issue_tokens(db: AsyncSession, *, client_id: str, user_id: int) -> Is
             user_id=user_id,
             kind=ACCESS,
             token_hash=hash_token(access_token),
-            scope=SCOPE,
+            scope=scope,
             expires_at=now + ACCESS_TTL,
         )
     )
@@ -161,7 +169,7 @@ async def _issue_tokens(db: AsyncSession, *, client_id: str, user_id: int) -> Is
             user_id=user_id,
             kind=REFRESH,
             token_hash=hash_token(refresh_token),
-            scope=SCOPE,
+            scope=scope,
             expires_at=now + REFRESH_TTL,
         )
     )
@@ -170,6 +178,7 @@ async def _issue_tokens(db: AsyncSession, *, client_id: str, user_id: int) -> Is
         access_token=access_token,
         refresh_token=refresh_token,
         expires_in=int(ACCESS_TTL.total_seconds()),
+        scope=scope,
     )
 
 
@@ -189,7 +198,9 @@ async def exchange_code(
 
     # A code is single use; burning it before the tokens exist keeps a replay useless.
     grant.revoked_at = utcnow()
-    return await _issue_tokens(db, client_id=grant.client_id, user_id=grant.user_id)
+    return await _issue_tokens(
+        db, client_id=grant.client_id, user_id=grant.user_id, scope=grant.scope
+    )
 
 
 async def refresh_tokens(
@@ -200,12 +211,16 @@ async def refresh_tokens(
     if grant is None or grant.client_id != client_id:
         return None
     grant.revoked_at = utcnow()
-    return await _issue_tokens(db, client_id=grant.client_id, user_id=grant.user_id)
+    return await _issue_tokens(
+        db, client_id=grant.client_id, user_id=grant.user_id, scope=grant.scope
+    )
 
 
-async def resolve_access_token(db: AsyncSession, presented: str) -> User | None:
-    """The bearer path for `/v1/*` and `/mcp`: an access token resolves to its user."""
+async def resolve_access_token(db: AsyncSession, presented: str) -> tuple[User, set[str]] | None:
+    """The bearer path for `/v1/*` and `/mcp`: an access token resolves to its user and the
+    scopes its grant holds."""
     grant = await _live_grant(db, ACCESS, presented)
     if grant is None:
         return None
-    return (await db.execute(select(User).where(User.id == grant.user_id))).scalar_one_or_none()
+    user = (await db.execute(select(User).where(User.id == grant.user_id))).scalar_one_or_none()
+    return None if user is None else (user, set(grant.scope.split()))

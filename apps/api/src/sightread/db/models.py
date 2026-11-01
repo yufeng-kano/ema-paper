@@ -808,6 +808,32 @@ class UploadTicket(Base):
     spent_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
 
 
+class DocumentTicket(Base):
+    """A short-lived credential for one document, minted by the MCP library tools
+    (docs/auth.md § 7).
+
+    Not spent by use: within its lifetime it reads the document's routes under
+    `/v1/library/documents/{id}` and, with `scope` `write`, saves its `doc.md` and `notes.md`.
+    `token_hash` is the SHA-256 of the `srd_...` plaintext.
+    """
+
+    __tablename__ = "document_tickets"
+    # Mint rate limit: tickets this user created in the last hour.
+    __table_args__ = (
+        Index("ix_document_tickets_user_created", "user_id", "created_at"),
+        CheckConstraint("scope IN ('read', 'write')", name="ck_document_tickets_scope"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    document_id: Mapped[int] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"))
+    scope: Mapped[str] = mapped_column(String(8))
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    prefix: Mapped[str] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ)
+
+
 class OAuthClient(Base):
     """Dynamically registered Claude Connector clients (docs/auth.md § OAuth AS)."""
 
