@@ -200,7 +200,7 @@ export default {
     howTitle: '連接方式',
     step1: '在 Claude 的設定中新增自訂連接器，貼上上方的網址。',
     step2: '用 Google 登入並在授權畫面同意，連接器會自行完成註冊。',
-    step3: 'Claude 呼叫 parse 取得上傳票證 — 檔案內容不會經過 MCP。',
+    step3: 'Claude 之後就能解析檔案、讀取你的檔案庫，並存回文件的內文與筆記，每次都用短效票證，檔案內容不會經過 MCP。',
   },
   agents: {
     headTitle: 'Agent',

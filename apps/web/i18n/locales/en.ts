@@ -203,7 +203,8 @@ export default {
     step1: "Add a custom connector in Claude's settings and paste the URL above.",
     step2:
       'Sign in with Google and approve on the consent screen; the connector registers itself.',
-    step3: 'Claude calls parse to get an upload ticket — file bytes never pass through MCP.',
+    step3:
+      'Claude can then parse files, read your Files library and save a document’s text and notes, each over a short-lived ticket — file bytes never pass through MCP.',
   },
   agents: {
     headTitle: 'Agent',

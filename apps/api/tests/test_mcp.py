@@ -67,7 +67,13 @@ async def test_initialize_and_list_tools(api_client: AsyncClient) -> None:
         listing = await session.list_tools()
 
     tools = {tool.name: tool for tool in listing.tools}
-    assert set(tools) == {"parse"}
+    assert set(tools) == {"parse", "list_library", "read_document", "write_document"}
+    # The two that only read say so, so a client may run them without asking; the save is
+    # not marked read-only (docs/mcp.md § The library tools).
+    assert tools["list_library"].annotations.read_only_hint is True
+    assert tools["read_document"].annotations.read_only_hint is True
+    assert tools["write_document"].annotations.read_only_hint is False
+    assert tools["read_document"].input_schema["required"] == ["document_id"]
     assert "yxyx_norm1000" in tools["parse"].description
     # The order the placeholder is written in, y first: an agent reading "x1,y1" here
     # would crop every figure transposed.

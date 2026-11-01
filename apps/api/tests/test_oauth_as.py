@@ -115,7 +115,7 @@ async def test_the_connector_flow_ends_in_a_working_bearer(client: AsyncClient) 
 
     assert tokens["token_type"] == "Bearer"
     assert tokens["expires_in"] == 3600
-    assert tokens["scope"] == "parse"
+    assert tokens["scope"] == "parse library"
 
     # Same rights as a project API key: the data plane accepts either (docs/auth.md).
     # An unknown job is a 404 to an authenticated caller and a 401 to anyone else.

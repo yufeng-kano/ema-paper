@@ -12,7 +12,7 @@ agent-sightread/
                               # reading layer the API, the worker and the CLI share
                               # (docs/admin.md § Settings)
         db/                   # engine, models, session helpers
-        auth/                 # oidc.py, sessions.py, api_keys.py, oauth_as.py, crypto.py
+        auth/                 # oidc.py, sessions.py, api_keys.py, oauth_as.py, crypto.py, deps.py, upload_tickets.py, document_tickets.py
         routes/               # v1.py (data plane), control.py (/api, incl. /api/agents),
                               # library.py (/api/library — the web file library),
                               # chat.py (/api/conversations, /api/sandbox),
@@ -71,7 +71,7 @@ agent-sightread/
                               # chat_memory.py (a turn's memory snapshot, the memory tool),
                               # chat_web.py (the web tools: Brave search, OpenAlex, the
                               # guarded fetch, reading a URL, downloading into Files)
-        mcp/                  # server.py: thin shell over the service layer (docs/mcp.md)
+        mcp/                  # server.py: thin shell over the service layer — parse, list_library, read_document, write_document (docs/mcp.md)
         worker.py             # `python -m sightread.worker`
       migrations/             # Alembic
       tests/

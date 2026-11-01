@@ -6,14 +6,18 @@ work to `jobs`. It never parses a document and never talks to a model itself.
 A parse here is the parse a Files upload gets (docs/api.md § POST /v1/parse): checked, its
 reading copy returned as `markdown`, its crops served, a failed one retried and one in
 flight joined — so the connector, whose commands are these routes, behaves as the web does.
+
+The library here is the control plane's reads and its two saves on a data-plane credential
+(docs/api.md § The library on the data plane): the same functions, a different door.
 """
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import AsyncIterator
 
-from fastapi import APIRouter, Request, Response, status
+from fastapi import APIRouter, Query, Request, Response, status
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 from sqlalchemy import select
@@ -24,13 +28,16 @@ from ..agents import PARSE
 from ..auth.deps import (
     AppSettings,
     DbSession,
+    DocumentReader,
+    DocumentWriter,
     JobReader,
+    LibraryUser,
     ReaderUser,
     TicketJobId,
     UploaderCaller,
 )
 from ..billing import ledger
-from ..db.models import Job, Result, User
+from ..db.models import FILE_KIND, MARKDOWN_KIND, Document, Folder, Job, Result, User
 from ..errors import ApiError
 from ..jobs import events
 from ..jobs.intake import (
@@ -44,6 +51,10 @@ from ..jobs.intake import (
 )
 from ..jobs.runner import result_payload
 from ..upstream.client import agent_models
+from ..workspace import documents as workspace_documents
+from ..workspace import git
+from ..workspace.layout import user_root
+from . import library
 from .library import figure_crop_response
 
 router = APIRouter(prefix="/v1", tags=["data"])
@@ -312,3 +323,223 @@ async def job_events(
         media_type=SSE_MEDIA_TYPE,
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# --- the library (docs/api.md § The library on the data plane) ----------------------------
+
+
+def library_entry(row: Document, job: Job | None, path: str) -> dict:
+    """One document as the data plane lists it: what a caller picks a document by, not
+    the Files page's progress state."""
+    kind = FILE_KIND if row.kind == FILE_KIND else (MARKDOWN_KIND if job is None else job.kind)
+    return {
+        "id": row.id,
+        "folder_id": row.folder_id,
+        "name": row.name,
+        "path": path,
+        "kind": kind,
+        "status": None if job is None else job.status,
+        "media_type": row.media_type if row.kind == FILE_KIND else None,
+        "page_count": None if job is None else job.page_count,
+        "size_bytes": row.size_bytes if row.kind == FILE_KIND else (job and job.size_bytes),
+        "created_at": row.created_at,
+        "finished_at": None if job is None else job.finished_at,
+    }
+
+
+def entry_path(folders: dict[int, Folder], folder_id: int | None, name: str) -> str:
+    """The folder names and the name joined with `/`, as the Files page shows them."""
+    chain = workspace_documents.folder_chain(folders, folder_id)
+    return "/".join([*(folder.name for folder in chain), name])
+
+
+async def library_index(db, user_id: int) -> dict:
+    """The live library from one snapshot, without the Trash: `GET /v1/library`, and the
+    rows the connector's `list_library` filters (docs/mcp.md § The library tools).
+
+    One snapshot as `GET /api/library` takes it — the transaction that authenticated the
+    caller ended first, `REPEATABLE READ` asked for on the next where PostgreSQL offers it
+    — so no document is listed under a folder the same answer does not hold."""
+    await db.rollback()
+    if db.get_bind().dialect.name == "postgresql":
+        await db.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+    folders = {row.id: row for row in await library.read_folders(db, user_id)}
+    trashed = workspace_documents.trashed_folder_ids(folders.values())
+    rows = (
+        await db.execute(
+            select(Document, Job)
+            .outerjoin(Job, Job.id == Document.job_id)
+            .where(Document.user_id == user_id, Document.trashed_at.is_(None))
+        )
+    ).all()
+    live_folders = [row for row in folders.values() if row.id not in trashed]
+    documents = [
+        library_entry(row, job, entry_path(folders, row.folder_id, row.name))
+        for row, job in rows
+        if row.folder_id not in trashed
+    ]
+    return {
+        "folders": sorted(
+            (
+                {
+                    "id": row.id,
+                    "parent_id": row.parent_id,
+                    "name": row.name,
+                    "path": entry_path(folders, row.parent_id, row.name),
+                }
+                for row in live_folders
+            ),
+            key=lambda entry: entry["path"],
+        ),
+        "documents": sorted(documents, key=lambda entry: (entry["path"], entry["id"])),
+    }
+
+
+@router.get("/library")
+async def read_library(user: LibraryUser, db: DbSession):
+    return await library_index(db, user.id)
+
+
+async def document_entry(db, settings, user_id: int, document_id: int) -> dict:
+    """One live document of the caller's as the data plane lists it, plus whether its
+    original is kept: `GET /v1/library/documents/{id}`, and the `document` the connector's
+    `read_document` and `write_document` answer with (docs/mcp.md § The library tools)."""
+    row = await library.live_document(db, user_id, document_id)
+    job = await library.job_of(db, row.job_id) if row.job_id is not None else None
+    folders = await workspace_documents.user_folders(db, user_id)
+    root = user_root(settings.workspaces_dir, row.user_id)
+    original = job is not None and (
+        await asyncio.to_thread(workspace_documents.original_of, root, row.id) is not None
+    )
+    return {
+        **library_entry(row, job, entry_path(folders, row.folder_id, row.name)),
+        "original": original,
+    }
+
+
+@router.get("/library/documents/{document_id}")
+async def read_library_document(
+    document_id: int, user: DocumentReader, db: DbSession, settings: AppSettings
+):
+    return await document_entry(db, settings, user.id, document_id)
+
+
+def _text_response(text: str, revision: str) -> PlainTextResponse:
+    return PlainTextResponse(
+        text,
+        media_type="text/markdown; charset=utf-8",
+        headers={"ETag": f'"{revision}"', "Cache-Control": "private, no-store"},
+    )
+
+
+@router.get("/library/documents/{document_id}/doc.md")
+async def read_document_text(
+    document_id: int, user: DocumentReader, db: DbSession, settings: AppSettings
+):
+    content = await library.document_content(document_id, user, db, settings)
+    return _text_response(content["markdown"], content["revision"])
+
+
+@router.get("/library/documents/{document_id}/notes.md")
+async def read_document_notes(
+    document_id: int, user: DocumentReader, db: DbSession, settings: AppSettings
+):
+    content = await library.document_content(document_id, user, db, settings)
+    return _text_response(content["notes"], content["notes_revision"])
+
+
+async def _edited_text(request: Request, settings) -> tuple[str, str]:
+    """What a save sends (docs/api.md § The library on the data plane): the revision its
+    `If-Match` names — the ETag's opaque value, `W/` and quotes dropped; `*` names none,
+    since a save must say which copy it was made from — and the body as raw UTF-8 under
+    `CONTENT_MAX_BYTES`, refused as it arrives past the cap."""
+    base = request.headers.get("if-match", "").strip().removeprefix("W/").strip('"').strip()
+    if base in ("", "*"):
+        raise ApiError(
+            428,
+            "invalid_request",
+            "Send If-Match with the ETag of the copy you edited, so nothing is overwritten unseen",
+        )
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > settings.content_max_bytes:
+            raise ApiError(413, "invalid_request", "The content is too large to save")
+    try:
+        return body.decode("utf-8"), base
+    except UnicodeDecodeError as exc:
+        raise ApiError(400, "invalid_request", "The body is not UTF-8 text") from exc
+
+
+@router.put("/library/documents/{document_id}/doc.md")
+async def save_document_text(
+    document_id: int,
+    request: Request,
+    user: DocumentWriter,
+    db: DbSession,
+    settings: AppSettings,
+):
+    text, base = await _edited_text(request, settings)
+    row = await library.live_text_document(db, user.id, document_id)
+    revision = await workspace_documents.write_content(
+        db, settings, row, markdown=text, base_revision=base, author=git.API_AUTHOR
+    )
+    return JSONResponse({"revision": revision}, headers={"ETag": f'"{revision}"'})
+
+
+@router.put("/library/documents/{document_id}/notes.md")
+async def save_document_notes(
+    document_id: int,
+    request: Request,
+    user: DocumentWriter,
+    db: DbSession,
+    settings: AppSettings,
+):
+    text, base = await _edited_text(request, settings)
+    row = await library.live_text_document(db, user.id, document_id)
+    revision = await workspace_documents.write_notes(
+        db, settings, row, text=text, base_revision=base, author=git.API_AUTHOR
+    )
+    return JSONResponse({"revision": revision}, headers={"ETag": f'"{revision}"'})
+
+
+@router.get("/library/documents/{document_id}/figures/{page}/{bbox}")
+async def read_document_figure(
+    document_id: int,
+    page: int,
+    bbox: str,
+    user: DocumentReader,
+    db: DbSession,
+    settings: AppSettings,
+):
+    return await library.document_figure(document_id, page, bbox, user, db, settings)
+
+
+@router.get("/library/documents/{document_id}/images/{name}")
+async def read_document_image(
+    document_id: int, name: str, user: DocumentReader, db: DbSession, settings: AppSettings
+):
+    return await library.document_image(document_id, name, user, db, settings)
+
+
+@router.get("/library/documents/{document_id}/original")
+async def read_document_original(
+    document_id: int,
+    request: Request,
+    user: DocumentReader,
+    db: DbSession,
+    settings: AppSettings,
+):
+    return await library.document_original(document_id, request, user, db, settings)
+
+
+@router.get("/library/documents/{document_id}/file")
+async def read_document_file(
+    document_id: int,
+    request: Request,
+    user: DocumentReader,
+    db: DbSession,
+    settings: AppSettings,
+    download: bool = Query(default=False),
+):
+    return await library.document_file(document_id, request, user, db, settings, download)
