@@ -682,6 +682,7 @@ export default {
       linkCopied: '已複製連結',
       copyFailed: '無法複製',
       moved: '已搬移',
+      turned: '已轉換成{kind}',
       imagesAdded: '已插入 {n} 張圖片',
       blockAdded: '已加入區塊',
       deleted: '已刪除 {n} 個區塊',

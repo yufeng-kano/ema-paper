@@ -13,6 +13,9 @@
  * For the keyboard the ticks are one button. Focus on it opens nothing; Enter, Space or ↓
  * opens the panel with focus on the current row, Escape closes it back to the button, and
  * focus leaving the panel closes it.
+ *
+ * Where the gutter has no room for the ticks, the header's `ViewerOutlineButton` opens the same
+ * panel (`ViewerOutlinePanel`) instead; the viewer draws one or the other, never both.
  */
 import { currentTick, fitTicks } from '~/lib/blocks'
 import type { OutlineEntry } from '~/lib/markdown'
@@ -53,18 +56,15 @@ const currentAt = computed(() => (fit.value ? currentTick(fit.value, props.curre
 const open = ref(false)
 const nav = ref<HTMLElement | null>(null)
 const button = ref<HTMLButtonElement | null>(null)
-const panel = ref<HTMLElement | null>(null)
+const panel = ref<{ root: HTMLElement | null; focusCurrent: () => void } | null>(null)
 let restTimer: ReturnType<typeof setTimeout> | undefined
 let closeTimer: ReturnType<typeof setTimeout> | undefined
 
 async function show(focusRow: boolean) {
   open.value = true
   await nextTick()
-  const row = panel.value?.querySelector<HTMLElement>('[aria-current="location"]') ?? panel.value?.querySelector<HTMLElement>('.row-jump')
-  // Opened scrolled to the current row, which is where a reader looks first.
-  row?.scrollIntoView({ block: 'center' })
   if (focusRow) {
-    row?.focus()
+    panel.value?.focusCurrent()
   }
 }
 
@@ -101,7 +101,7 @@ function onLeaveRegion(event: PointerEvent) {
   clearTimeout(restTimer)
   clearTimeout(closeTimer)
   if (open.value && event.pointerType !== 'touch') {
-    closeTimer = setTimeout(() => hide(panel.value?.contains(document.activeElement) ?? false), CLOSE_MS)
+    closeTimer = setTimeout(() => hide(panel.value?.root?.contains(document.activeElement) ?? false), CLOSE_MS)
   }
 }
 
@@ -116,15 +116,6 @@ function onButtonKey(event: KeyboardEvent) {
 function onButtonClick(event: MouseEvent) {
   if (event.detail !== 0 && !open.value) {
     void show(false)
-  }
-}
-
-function onPanelKey(event: KeyboardEvent) {
-  if (event.key === 'Escape') {
-    // The panel's Escape, not the dialog's: it closes back to the button.
-    event.stopPropagation()
-    event.preventDefault()
-    hide(true)
   }
 }
 
@@ -183,54 +174,20 @@ onBeforeUnmount(() => {
       </template>
       <UiIcon v-else name="list-tree" />
     </button>
-    <div
+    <ViewerOutlinePanel
       v-if="open"
       ref="panel"
-      class="panel"
-      :style="{ maxHeight: `${panelHeight}px` }"
-      @keydown="onPanelKey"
-    >
-      <p class="panel-head">{{ t('viewer.outline.title') }}</p>
-      <ul class="rows">
-        <li
-          v-for="(entry, index) in entries"
-          :key="`${entry.page}-${entry.index}`"
-          class="row"
-          :class="{ deep: entry.level > 2, current: index === current }"
-        >
-          <button
-            type="button"
-            class="row-jump"
-            :title="entry.plain"
-            :aria-current="index === current ? 'location' : undefined"
-            @click="emit('jump', index)"
-          >
-            {{ entry.plain }}
-          </button>
-          <span v-if="actions" class="row-actions">
-            <button
-              v-if="translate"
-              type="button"
-              class="row-act"
-              :aria-label="t('viewer.outline.translate')"
-              :title="t('viewer.outline.translate')"
-              @click="emit('translate', index)"
-            >
-              <UiIcon name="languages" />
-            </button>
-            <button
-              type="button"
-              class="row-act"
-              :aria-label="t('viewer.outline.addContext')"
-              :title="t('viewer.outline.addContext')"
-              @click="emit('context', index)"
-            >
-              <UiIcon name="message-circle-plus" />
-            </button>
-          </span>
-        </li>
-      </ul>
-    </div>
+      class="rail-panel"
+      :entries="entries"
+      :current="current"
+      :max-height="panelHeight"
+      :actions="actions"
+      :translate="translate"
+      @jump="emit('jump', $event)"
+      @translate="emit('translate', $event)"
+      @context="emit('context', $event)"
+      @escape="hide(true)"
+    />
   </nav>
 </template>
 
@@ -301,143 +258,10 @@ onBeforeUnmount(() => {
   background: var(--ink);
 }
 
-/* The menu's floating surface, over the ticks at their left, its top the pane's top. */
-.panel {
+/* The panel over the ticks at their left, its top the pane's top (`ViewerOutlinePanel`). */
+.rail-panel {
   position: absolute;
   top: 0;
   left: 0;
-  pointer-events: auto;
-  width: 264px;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  padding: var(--space-1);
-  border: 1px solid var(--menu-edge);
-  border-radius: var(--radius-menu);
-  background: var(--menu-surface);
-  box-shadow: var(--shadow-menu);
-  animation: panel-in var(--duration-fast) var(--ease-enter);
-}
-
-@keyframes panel-in {
-  from {
-    opacity: 0;
-    transform: translateX(-4px);
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .panel {
-    animation: none;
-  }
-}
-
-.panel-head {
-  margin: 0;
-  padding: var(--space-2) var(--space-3) var(--space-1);
-  color: var(--faint);
-  font-size: var(--text-xs);
-}
-
-.rows {
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-/* Filled with the rail, not the accent: the row holds two more buttons, and an accent fill
-   would claim the whole row is one action. */
-.row {
-  position: relative;
-  display: flex;
-  align-items: center;
-  height: 30px;
-  border-radius: var(--radius-menu-item);
-  transition: background var(--duration-fast) var(--ease);
-}
-
-.row:hover,
-.row:focus-within {
-  background: var(--fill-weak);
-}
-
-.row.current::before {
-  content: '';
-  position: absolute;
-  top: 7px;
-  bottom: 7px;
-  left: 0;
-  width: 2px;
-  border-radius: 1px;
-  background: var(--ink);
-}
-
-.row-jump {
-  flex: 1 1 auto;
-  min-width: 0;
-  height: 100%;
-  padding: 0 var(--space-3);
-  overflow: hidden;
-  border: 0;
-  border-radius: var(--radius-menu-item);
-  background: transparent;
-  color: var(--ink);
-  font-size: var(--text-sm);
-  text-align: left;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  cursor: pointer;
-}
-
-.row.deep .row-jump {
-  padding-left: calc(var(--space-3) + 12px);
-  color: var(--muted);
-}
-
-.row.current .row-jump {
-  color: var(--ink);
-  font-weight: var(--weight-semibold);
-}
-
-.row-jump:focus-visible {
-  outline-offset: -2px;
-}
-
-.row-actions {
-  display: none;
-  flex: none;
-  gap: 2px;
-  padding-right: var(--space-1);
-}
-
-.row:hover .row-actions,
-.row:focus-within .row-actions {
-  display: inline-flex;
-}
-
-.row-act {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 24px;
-  height: 24px;
-  padding: 0;
-  border: 0;
-  border-radius: var(--radius);
-  background: transparent;
-  color: var(--faint);
-  cursor: pointer;
-  transition:
-    background var(--duration-fast) var(--ease),
-    color var(--duration-fast) var(--ease);
-}
-
-.row-act:hover {
-  background: var(--fill);
-  color: var(--ink);
-}
-
-.row-act > :deep(svg) {
-  width: 15px;
-  height: 15px;
 }
 </style>
