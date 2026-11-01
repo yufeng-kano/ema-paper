@@ -1447,6 +1447,40 @@ function focusList() {
   listEl.value?.focus({ preventScroll: true })
 }
 
+/**
+ * The list's focus ring follows the keyboard, not `:focus-visible` (docs/web.md § Files,
+ * *A menu is not mouse-only*): Tab turns it on, a pointer press anywhere turns it off. Safari
+ * and Chrome both match `:focus-visible` once a key is pressed in a list a click focused —
+ * Esc going up, Escape closing the menu, Return ending a rename — which drew the ring around
+ * the whole list in the middle of mouse work.
+ */
+const keyboardFocus = ref(false)
+
+/** Tab, ⇧Tab and Safari's ⌥Tab move focus; with ⌘ or Ctrl held, Tab switches apps or tabs. */
+function onTabPress(event: KeyboardEvent) {
+  if (event.key === 'Tab' && !event.metaKey && !event.ctrlKey) {
+    keyboardFocus.value = true
+  }
+}
+
+function onPointerPress() {
+  keyboardFocus.value = false
+}
+
+// Capture: a handler that stops the event must not leave the ring in the wrong state. The
+// keyup too: ⇧Tab from the browser's toolbar lands on the list, the page's last tab stop,
+// and only that key's release reaches the page.
+onMounted(() => {
+  window.addEventListener('keydown', onTabPress, true)
+  window.addEventListener('keyup', onTabPress, true)
+  window.addEventListener('pointerdown', onPointerPress, true)
+})
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onTabPress, true)
+  window.removeEventListener('keyup', onTabPress, true)
+  window.removeEventListener('pointerdown', onPointerPress, true)
+})
+
 function cancelRename() {
   renaming.value = null
   focusList()
@@ -1767,7 +1801,8 @@ onBeforeUnmount(() => clearTimeout(typedTimer))
  * Finder's keys, read at the window so they work after a click with nothing holding focus
  * (docs/web.md § Files, *The keyboard is Finder's*). Never from a text field, an open menu,
  * a dialog or the viewer — each owns its keys — nor from anything outside this screen's
- * region, the sidebar's links among them.
+ * region, the sidebar's links among them. The layout's `main` counts as nothing: a click on
+ * the title or a gap focuses it, and in Safari so does a click on any button.
  */
 function onKeydown(event: KeyboardEvent) {
   if (event.defaultPrevented || event.isComposing || openDocument.value || menu.value) {
@@ -1780,7 +1815,7 @@ function onKeydown(event: KeyboardEvent) {
   if (target?.isContentEditable || target?.closest('input, textarea, select')) {
     return
   }
-  if (target && target !== document.body && !region.value?.contains(target)) {
+  if (target && target !== document.body && target.id !== 'content' && !region.value?.contains(target)) {
     return
   }
   // A focused button or link answers Return and Space itself.
@@ -2582,7 +2617,7 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
         id="files-panel"
         ref="listEl"
         class="contents"
-        :class="{ 'rows-target': rowsOverList }"
+        :class="{ 'rows-target': rowsOverList, 'keyboard-focus': keyboardFocus }"
         role="tabpanel"
         :aria-labelledby="`files-tab-${view}`"
         tabindex="0"
@@ -2926,8 +2961,7 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
 }
 
 /* The drop surface: it has to be the box the panel fills, so the overlay can cover exactly
-   the list and nothing else. It is also the list's menu target and a tab stop, so it takes
-   the app's focus ring rather than the browser's. */
+   the list and nothing else. It is also the list's menu target and a tab stop. */
 .contents {
   position: relative;
   display: grid;
@@ -2937,7 +2971,14 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
   border-radius: var(--radius-lg);
 }
 
-.contents:focus-visible {
+/* Its ring is the keyboard's, set by `keyboardFocus` rather than `:focus-visible`, which a key
+   pressed after a click turns on (docs/web.md § Files), and drawn inside its edge. With the
+   ring off, the selected rows' accent fill says the list holds focus. */
+.contents:focus {
+  outline: none;
+}
+
+.contents.keyboard-focus:focus {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
 }
