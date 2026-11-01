@@ -595,6 +595,14 @@ async function signOut() {
   background: var(--paper);
 }
 
+/* The skip link's target: focused to move where the keyboard starts, a region and not a
+   control, so it draws no ring, as a dialog's panel draws none (docs/web.md § Rules). A click
+   on a title or a gap also focuses it, and in Safari a click on any button, and a key pressed
+   then would put the ring around the whole screen. */
+.content:focus {
+  outline: none;
+}
+
 /* --- Responsive ----------------------------------------------------------- */
 
 @media (max-width: 900px) {

@@ -1457,7 +1457,7 @@ function focusList() {
 const keyboardFocus = ref(false)
 
 /** Tab, ⇧Tab and Safari's ⌥Tab move focus; with ⌘ or Ctrl held, Tab switches apps or tabs. */
-function onTabKey(event: KeyboardEvent) {
+function onTabPress(event: KeyboardEvent) {
   if (event.key === 'Tab' && !event.metaKey && !event.ctrlKey) {
     keyboardFocus.value = true
   }
@@ -1467,13 +1467,17 @@ function onPointerPress() {
   keyboardFocus.value = false
 }
 
-// Capture: a handler that stops the event must not leave the ring in the wrong state.
+// Capture: a handler that stops the event must not leave the ring in the wrong state. The
+// keyup too: ⇧Tab from the browser's toolbar lands on the list, the page's last tab stop,
+// and only that key's release reaches the page.
 onMounted(() => {
-  window.addEventListener('keydown', onTabKey, true)
+  window.addEventListener('keydown', onTabPress, true)
+  window.addEventListener('keyup', onTabPress, true)
   window.addEventListener('pointerdown', onPointerPress, true)
 })
 onBeforeUnmount(() => {
-  window.removeEventListener('keydown', onTabKey, true)
+  window.removeEventListener('keydown', onTabPress, true)
+  window.removeEventListener('keyup', onTabPress, true)
   window.removeEventListener('pointerdown', onPointerPress, true)
 })
 
@@ -1797,7 +1801,8 @@ onBeforeUnmount(() => clearTimeout(typedTimer))
  * Finder's keys, read at the window so they work after a click with nothing holding focus
  * (docs/web.md § Files, *The keyboard is Finder's*). Never from a text field, an open menu,
  * a dialog or the viewer — each owns its keys — nor from anything outside this screen's
- * region, the sidebar's links among them.
+ * region, the sidebar's links among them. The layout's `main` counts as nothing: a click on
+ * the title or a gap focuses it, and in Safari so does a click on any button.
  */
 function onKeydown(event: KeyboardEvent) {
   if (event.defaultPrevented || event.isComposing || openDocument.value || menu.value) {
@@ -1810,7 +1815,7 @@ function onKeydown(event: KeyboardEvent) {
   if (target?.isContentEditable || target?.closest('input, textarea, select')) {
     return
   }
-  if (target && target !== document.body && !region.value?.contains(target)) {
+  if (target && target !== document.body && target.id !== 'content' && !region.value?.contains(target)) {
     return
   }
   // A focused button or link answers Return and Space itself.
