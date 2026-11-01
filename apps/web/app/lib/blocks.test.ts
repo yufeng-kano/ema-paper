@@ -7,9 +7,11 @@ import {
   changedBlocks,
   currentTick,
   diffSpans,
+  dockOutlinePanel,
   fitTicks,
   foldsOf,
   foldsOver,
+  outlinePlace,
   followFolds,
   hashText,
   moveTarget,
@@ -273,6 +275,38 @@ describe('fitTicks', () => {
     expect(currentTick(fit, 3)).toBe(0)
     expect(currentTick(fit, 5)).toBe(5)
     expect(currentTick(fit, null)).toBeNull()
+  })
+})
+
+describe('outlinePlace', () => {
+  it('draws the ticks where the gutter has room and the header button where it has not', () => {
+    expect(outlinePlace(5, 134, 128)).toBe('ticks')
+    expect(outlinePlace(5, 128, 128)).toBe('ticks')
+    expect(outlinePlace(5, 87, 128)).toBe('button')
+  })
+
+  it('draws neither before the gutter is measured or with fewer than two headings', () => {
+    expect(outlinePlace(5, null, 128)).toBeNull()
+    expect(outlinePlace(1, 134, 128)).toBeNull()
+    expect(outlinePlace(0, 0, 100)).toBeNull()
+  })
+})
+
+describe('dockOutlinePanel', () => {
+  const panel = { width: 264, gap: 8, foot: 16 }
+
+  it('stands under the button, right edges aligned, down to the cards\' end', () => {
+    expect(dockOutlinePanel({ right: 1300, bottom: 60 }, { width: 1493, height: 767 }, panel)).toEqual({
+      top: 68,
+      left: 1036,
+      maxHeight: 683,
+    })
+  })
+
+  it('stays inside the window on either side', () => {
+    expect(dockOutlinePanel({ right: 1490, bottom: 60 }, { width: 1493, height: 767 }, panel).left).toBe(1493 - 8 - 264)
+    expect(dockOutlinePanel({ right: 200, bottom: 60 }, { width: 240, height: 400 }, panel).left).toBe(8)
+    expect(dockOutlinePanel({ right: 200, bottom: 390 }, { width: 240, height: 400 }, panel).maxHeight).toBe(0)
   })
 })
 

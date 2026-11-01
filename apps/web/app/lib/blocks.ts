@@ -468,6 +468,38 @@ export function currentTick(fit: TickFit, current: number | null): number | null
   return found
 }
 
+/**
+ * Where the outline is drawn (docs/web.md § Result viewer, *Outline, collapse and the way
+ * back*): the ticks in the gutter while it has the `needed` pixels, the header's button while
+ * it has fewer, and nothing while the document has fewer than two headings or the gutter is
+ * not yet measured — so the two are never both drawn, nor one for a frame before the other.
+ */
+export function outlinePlace(headings: number, gutter: number | null, needed: number): 'ticks' | 'button' | null {
+  if (headings < 2 || gutter === null) {
+    return null
+  }
+  return gutter >= needed ? 'ticks' : 'button'
+}
+
+/**
+ * The box of the panel the header's *Outline* button opens: `gap` under the button, its right
+ * edge at the button's, held inside the window `gap` from either side, and running at most
+ * down to `foot` above the window's foot, where the cards end.
+ */
+export function dockOutlinePanel(
+  button: { right: number; bottom: number },
+  view: { width: number; height: number },
+  panel: { width: number; gap: number; foot: number },
+): { top: number; left: number; maxHeight: number } {
+  const top = button.bottom + panel.gap
+  const right = Math.min(button.right, view.width - panel.gap)
+  return {
+    top,
+    left: Math.max(panel.gap, right - panel.width),
+    maxHeight: Math.max(0, view.height - top - panel.foot),
+  }
+}
+
 // --- undo ---------------------------------------------------------------------------------------
 
 /** One change to a file: at `at`, `removed` was replaced by `inserted`. */

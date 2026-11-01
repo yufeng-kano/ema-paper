@@ -24,6 +24,7 @@ import {
   foldsOf,
   foldsOver,
   moveTarget,
+  outlinePlace,
   readFoldMemory,
   rememberFolds,
   rowsOf,
@@ -2015,7 +2016,7 @@ function moveRun(range: RowRange, target: number, place: 'before' | 'after'): st
     return []
   }
   openFoldsOver(offsets.map((offset) => start + offset))
-  showNote(t('viewer.note.moved'), false)
+  showNote(t('viewer.note.moved'), true)
   return rowsCovering(start, end)
 }
 
@@ -2059,6 +2060,9 @@ function turnRows(range: RowRange, kind: BlockKindName): string[] {
   const first = heads[0]!
   const last = heads[heads.length - 1]!
   applyDocument(next)
+  // With *Undo*, as a delete: Safari takes ⌘Z off a text field (docs/web.md § Editing, *Undo
+  // and the status note*).
+  showNote(t('viewer.note.turned', { kind: t(`viewer.convert.${kind}`) }), true)
   const start = placedIndex.value.get(blockKey(first))
   const end = placedIndex.value.get(blockKey({ page: last.page, index: last.index + (grown.get(last.page) ?? 0) }))
   return start === undefined || end === undefined ? [] : rowsCovering(start, end)
@@ -3367,8 +3371,10 @@ function checkWayBack() {
 // --- the outline ---------------------------------------------------------------------------
 
 const paneHeight = ref(0)
-/** The room left of the column: what the outline needs beside a heading's own controls. */
-const gutter = ref(0)
+/** The room left of the column: what the outline needs beside a heading's own controls. Null
+ *  until a page is laid out, so neither the ticks nor the header's button shows before the
+ *  test that picks one can be taken. */
+const gutter = ref<number | null>(null)
 const paneFoot = ref<{ root: HTMLElement | null } | null>(null)
 /** How far up from the pane's foot its pieces reach: their height and what they stand on,
  *  which is less under the hint bar (`PaneFoot`); 0 with none. */
@@ -3381,7 +3387,7 @@ let footObserver: ResizeObserver | null = null
 function measureGutter() {
   const pane = paneEl.value
   const page = scroller.value?.querySelector('.page')
-  gutter.value = pane && page ? page.getBoundingClientRect().left - pane.getBoundingClientRect().left : 0
+  gutter.value = pane && page ? page.getBoundingClientRect().left - pane.getBoundingClientRect().left : null
 }
 
 watch(paneEl, (pane) => {
@@ -3428,13 +3434,18 @@ watch(pages, () => {
     readCurrent()
   })
 })
+// A step of Body margins chosen in Settings over an open viewer moves the column, not the
+// pane: the outline moves between the gutter and the header with it.
+watch(paperMargin, measureGutter, { flush: 'post' })
 
-const showOutline = computed(
-  () =>
-    tab.value === 'markdown' &&
-    outline.value.length >= 2 &&
-    gutter.value >= (editable.value ? OUTLINE_GUTTER_FILES_PX : OUTLINE_GUTTER_READ_ONLY_PX),
+/** The ticks where they fit, the header's *Outline* button where they do not — never both. */
+const outlineAt = computed(() =>
+  tab.value === 'markdown'
+    ? outlinePlace(outline.value.length, gutter.value, editable.value ? OUTLINE_GUTTER_FILES_PX : OUTLINE_GUTTER_READ_ONLY_PX)
+    : null,
 )
+const showOutline = computed(() => outlineAt.value === 'ticks')
+const showOutlineButton = computed(() => outlineAt.value === 'button')
 
 /** The ticks run down to where the pieces at the pane's foot begin, never under them. */
 const outlineRoom = computed(() => {
@@ -4436,6 +4447,18 @@ watch(
           >
             <template #icon><UiIcon name="search" /></template>
           </UiButton>
+          <!-- The outline where its ticks have no room beside the text (docs/web.md § Result
+               viewer, *Outline, collapse and the way back*). -->
+          <ViewerOutlineButton
+            v-if="showOutlineButton"
+            :entries="outline"
+            :current="currentHeading"
+            :actions="editable"
+            :translate="translateSkill"
+            @jump="jumpToHeading"
+            @translate="askAboutHeading($event, true)"
+            @context="askAboutHeading($event, false)"
+          />
           <template v-if="editable">
             <UiButton
               ref="notesToggle"

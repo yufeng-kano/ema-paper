@@ -697,6 +697,7 @@ export default {
       linkCopied: 'Link copied',
       copyFailed: 'Couldn’t copy',
       moved: 'Moved',
+      turned: 'Turned into {kind}',
       imagesAdded: 'Image inserted | {n} images inserted',
       blockAdded: 'Block added',
       deleted: '{n} block deleted | {n} blocks deleted',
