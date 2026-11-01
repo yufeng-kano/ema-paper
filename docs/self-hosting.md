@@ -164,7 +164,7 @@ The *Redeem codes* page creates, lists and disables codes by the same rules as `
   }
   ```
 
-  The connector's one tool hands back an upload ticket and `curl` commands, so the client needs a shell with network access ([mcp.md](./mcp.md)).
+  The connector's tools hand back short-lived tickets and `curl` commands — `parse` an upload ticket, `read_document` and `write_document` a document ticket for one document of the library —, so the client needs a shell with network access ([mcp.md](./mcp.md)).
 
 ## Keep it running
 

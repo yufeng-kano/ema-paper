@@ -341,7 +341,9 @@ def library_entry(row: Document, job: Job | None, path: str) -> dict:
         "status": None if job is None else job.status,
         "media_type": row.media_type if row.kind == FILE_KIND else None,
         "page_count": None if job is None else job.page_count,
-        "size_bytes": row.size_bytes if row.kind == FILE_KIND else (job and job.size_bytes),
+        "size_bytes": (
+            row.size_bytes if row.kind == FILE_KIND else (None if job is None else job.size_bytes)
+        ),
         "created_at": row.created_at,
         "finished_at": None if job is None else job.finished_at,
     }

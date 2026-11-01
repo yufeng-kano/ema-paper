@@ -27,7 +27,7 @@ from sightread.db.models import (
     utcnow,
 )
 from sightread.parsing.figures import crop_path
-from sightread.workspace.layout import user_root
+from sightread.workspace.layout import sources_dir, user_root
 from tests.conftest import CSRF_HEADERS, mcp_running
 from tests.test_mcp import _mcp_session, _payload
 from tests.test_oauth_as import CHALLENGE, REDIRECT_URI, VERIFIER, _authorize, _register, _token
@@ -509,3 +509,24 @@ async def test_the_document_ticket_mint_rate_is_its_own(
     assert first.is_error is False
     assert second.is_error is True and "retry later" in second.content[0].text
     assert parse.is_error is False
+
+
+async def test_every_name_a_command_writes_is_one_plain_shell_word(reader: AsyncClient) -> None:
+    """A name the reader gave or an upload's suffix never runs as shell code, never reads
+    as an option and never lands outside `d` (docs/mcp.md § The library tools)."""
+    paper = await _seed_parse(reader, reader.user_id)
+    dots = await _new_markdown(reader, "..")
+    dash = await _new_markdown(reader, "-rf notes")
+    # A kept original whose suffix came from an upload's own name.
+    sources = sources_dir(reader.root)
+    sources.mkdir(parents=True, exist_ok=True)
+    (sources / f"{paper}.$(touch x)").write_bytes(b"%PDF")
+
+    async with mcp_running(reader), _mcp_session(reader) as session:
+        read = _payload(await session.call_tool("read_document", {"document_id": paper}))
+        up = _payload(await session.call_tool("read_document", {"document_id": dots}))
+        option = _payload(await session.call_tool("write_document", {"document_id": dash}))
+
+    assert read["original"].endswith("""-o "$d"/'source.$(touch x)'""")
+    assert up["download"].startswith("d=_..; ")
+    assert option["save"].startswith("d='./-rf notes'; ")

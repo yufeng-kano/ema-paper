@@ -1,4 +1,4 @@
-"""A parse through the data plane behaves as a Files upload does (docs/mcp.md § The one tool,
+"""A parse through the data plane behaves as a Files upload does (docs/mcp.md § The `parse` tool,
 docs/api.md § POST /v1/parse): checked, its reading copy returned as `markdown`, its crops
 served, a failed one retried with its succeeded pages kept, and one in flight joined rather
 than bought twice. The REST API and the connector's commands are the same routes; the

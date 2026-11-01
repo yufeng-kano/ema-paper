@@ -14,6 +14,7 @@ in-flight join — is the data plane's (docs/mcp.md § The `parse` tool).
 
 from __future__ import annotations
 
+import asyncio
 import shlex
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -40,7 +41,7 @@ from ..errors import ApiError, error_response
 from ..routes.v1 import document_entry, library_index
 from ..upstream.client import offered_models
 from ..workspace import documents as workspace_documents
-from ..workspace.layout import user_root
+from ..workspace.layout import path_segment, user_root
 
 MCP_PATH = "/mcp"
 PROTECTED_RESOURCE_PATH = "/.well-known/oauth-protected-resource"
@@ -53,7 +54,7 @@ COORDINATE_CONTRACT = (
     "reader shows."
 )
 
-# Everything the agent needs that is not in a command string (docs/mcp.md § The one tool).
+# Everything the agent needs that is not in a command string (docs/mcp.md § The `parse` tool).
 NOTES = (
     "Set `f=` to your file, then run `upload` — the one command uploads it, waits on "
     "the SSE stream until the parse finishes, and lands the document named after the "
@@ -148,6 +149,15 @@ PICTURE_ROUTES = (
 )
 
 
+def _local_name(name: str) -> str:
+    """The local name a command lands a document under, as one shell word: the directory
+    name the workspace gives it (`path_segment`: no separator, never `.`, `..` or a
+    hidden name), and behind `./` when it starts with `-`, so no command reads it as an
+    option or curl as stdout (docs/mcp.md § The library tools)."""
+    segment = path_segment(name)
+    return shlex.quote(f"./{segment}" if segment.startswith("-") else segment)
+
+
 def _stamp(moment: datetime) -> str:
     """`2026-08-21T15:00:00Z`, the shape docs/mcp.md shows."""
     return moment.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -182,7 +192,7 @@ async def _library_user(db: AsyncSession) -> User:
 
 
 def build_server(app: FastAPI) -> MCPServer:
-    """The MCP server and its one tool (docs/mcp.md § The one tool)."""
+    """The MCP server and its tools (docs/mcp.md § The `parse` tool, § The library tools)."""
     server = MCPServer(
         "Ema Paper",
         instructions=(
@@ -262,7 +272,7 @@ def build_server(app: FastAPI) -> MCPServer:
             ),
             "status": f"curl -sS {auth} {base}/v1/jobs/last",
             # A connector's parse is in no library, so the retention deletes it; how soon
-            # is the deployment's own setting (docs/mcp.md § The one tool, docs/jobs.md
+            # is the deployment's own setting (docs/mcp.md § The `parse` tool, docs/jobs.md
             # § Retention).
             "notes": (
                 NOTES
@@ -340,15 +350,22 @@ def build_server(app: FastAPI) -> MCPServer:
             settings = await app.state.runtime_settings.current(db)
             user = await _library_user(db)
             document = await document_entry(db, settings, user.id, document_id)
-            if document["original"]:
-                root = user_root(settings.workspaces_dir, user.id)
-                source = workspace_documents.original_of(root, document_id)
+            # The kept original's own suffix names the file the `original` command lands.
+            source = (
+                await asyncio.to_thread(
+                    workspace_documents.original_of,
+                    user_root(settings.workspaces_dir, user.id),
+                    document_id,
+                )
+                if document["original"]
+                else None
+            )
             ticket, token = await document_tickets.mint(
                 db, settings, user, document_id, document_tickets.READ
             )
         base = f"{settings.app_url.rstrip('/')}/v1/library/documents/{document_id}"
         auth = f"-H 'Authorization: Bearer {token}'"
-        local = shlex.quote(document["name"].replace("/", "-"))
+        local = _local_name(document["name"])
         answer: dict[str, Any] = {
             "token": token,
             "expires_at": _stamp(ticket.expires_at),
@@ -377,10 +394,10 @@ def build_server(app: FastAPI) -> MCPServer:
             f'elif [ "$c" != 200 ]; then echo "$n: fetch failed (HTTP $c)"; rc=1; fi; '
             f'done; [ "$rc" = 0 ]; }}'
         )
-        if document["original"] and source is not None:
+        if source is not None:
             answer["original"] = (
                 f'd={local}; mkdir -p -- "$d" && '
-                f'curl -sSf {auth} {base}/original -o "$d/source{source.suffix}"'
+                f'curl -sSf {auth} {base}/original -o "$d"/{shlex.quote("source" + source.suffix)}'
             )
         answer["notes"] = READ_NOTES
         return answer
@@ -415,7 +432,7 @@ def build_server(app: FastAPI) -> MCPServer:
             )
         base = f"{settings.app_url.rstrip('/')}/v1/library/documents/{document_id}"
         auth = f"-H 'Authorization: Bearer {token}'"
-        local = shlex.quote(document["name"].replace("/", "-"))
+        local = _local_name(document["name"])
         return {
             "token": token,
             "expires_at": _stamp(ticket.expires_at),
