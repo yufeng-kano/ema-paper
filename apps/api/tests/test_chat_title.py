@@ -6,6 +6,7 @@ call is answered by a stubbed Messages stream; no test reaches the network
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 
 import httpx
 import pytest
@@ -14,6 +15,7 @@ from httpx import AsyncClient
 from sqlalchemy import func, select, update
 
 from sightread.agents import summary as summary_defs
+from sightread.billing import ledger
 from sightread.config import Settings
 from sightread.db.models import (
     AgentSetting,
@@ -21,6 +23,7 @@ from sightread.db.models import (
     CreditEntry,
     CreditPeriod,
     UsageLog,
+    utcnow,
 )
 from tests.conftest import CSRF_HEADERS
 from tests.test_chat import MESSAGES_URL, _run_queued_turn, assistant_turn
@@ -230,6 +233,50 @@ async def test_a_failed_call_changes_nothing_and_an_empty_answer_is_still_billed
         ).scalar_one()
         assert rows == 1
     assert (await conversation_row(client, conversation_id)).title == "Hi"
+
+
+@respx.mock
+async def test_one_title_at_a_time_and_a_crash_left_entry_stops_counting(chat_client) -> None:
+    """A title reserves nothing, so a reader has one in flight at a time: another asked
+    for meanwhile is a 429 before any call, or calls made side by side would all pass the
+    balance check. An entry a crash left reserved stops counting after twice the call's
+    bound (docs/billing.md § A chat turn)."""
+    client = chat_client
+    requests = stub_calls(["Hello."], ["Greeting"])
+    conversation_id = await new_conversation(client)
+    await talk(client, conversation_id, text="Hi")
+    settings = client.app.state.settings
+    async with client.app.state.sessionmaker() as db:
+        in_flight = await ledger.reserve(
+            db,
+            settings,
+            user_id=client.user_id,
+            kind=ledger.CHAT,
+            amount=0,
+            model="claude-code/claude-opus-5-5",
+        )
+        await db.commit()
+        entry_id = in_flight.id
+
+    busy = await name_it(client, conversation_id)
+    assert busy.status_code == 429, busy.text
+    assert busy.json()["error"]["type"] == "rate_limit"
+    assert busy.headers["Retry-After"] == str(settings.chat_retry_after_seconds)
+    assert requests == []
+    assert len(await title_entries(client)) == 1
+
+    async with client.app.state.sessionmaker() as db:
+        await db.execute(
+            update(CreditEntry)
+            .where(CreditEntry.id == entry_id)
+            .values(
+                created_at=utcnow() - timedelta(seconds=2 * settings.summary_timeout_seconds + 1)
+            )
+        )
+        await db.commit()
+    named = await name_it(client, conversation_id)
+    assert named.status_code == 200, named.text
+    assert named.json()["title"] == "Greeting"
 
 
 @respx.mock

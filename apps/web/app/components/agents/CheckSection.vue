@@ -390,13 +390,17 @@ const advancedOpen = ref(settings.value.prompt !== null || settings.value.prompt
   --rich-gap: var(--space-3);
 
   min-height: 7rem;
-  max-height: min(20rem, 50vh);
-  overflow-y: auto;
-  padding: var(--space-4);
   border: 1px solid var(--edge);
   border-radius: var(--radius);
   background: var(--paper);
   cursor: text;
+}
+
+/* As that box's: the text scrolls, so the slash menu and the TeX field stay whole. */
+.editor :deep(.rich-doc) {
+  max-height: min(20rem, 50vh);
+  overflow-y: auto;
+  padding: var(--space-4);
 }
 
 .editor:focus-within {

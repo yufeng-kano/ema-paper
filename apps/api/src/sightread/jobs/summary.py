@@ -4,15 +4,16 @@
 The call is made by the API, between turns: one request on `SUMMARY_MODEL` — or the
 conversation's own model — with no tools, bounded in total by `SUMMARY_TIMEOUT_SECONDS`
 and not retried. A title is billed by its tokens on a `chat` entry of its own, reserved
-before the call and settled after it.
+before the call and settled after it; a reader has one such call in flight at a time.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+from datetime import timedelta
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..agents import CHAT
@@ -24,10 +25,12 @@ from ..db.models import (
     MESSAGE_TURN,
     AgentSetting,
     Conversation,
+    CreditEntry,
     Document,
     Message,
     UsageLog,
     User,
+    utcnow,
 )
 from ..errors import ApiError
 from ..upstream.anthropic import CompletedMessage, StreamProgress, stream_messages
@@ -131,6 +134,30 @@ async def write_title(
     # balance a send needs (docs/billing.md § A chat turn). Committed before the call, so
     # no lock is held while the model writes.
     await db.execute(select(User.id).where(User.id == conversation.user_id).with_for_update())
+    # One title in flight per reader: each reserves nothing, so calls made side by side
+    # would all pass the balance check and together run past it. An entry still reserved
+    # after twice the call's bound is one a crash left, and no longer counts.
+    in_flight = (
+        await db.execute(
+            select(func.count())
+            .select_from(CreditEntry)
+            .where(
+                CreditEntry.user_id == conversation.user_id,
+                CreditEntry.kind == ledger.CHAT,
+                CreditEntry.turn_id.is_(None),
+                CreditEntry.state == ledger.RESERVED,
+                CreditEntry.created_at
+                > utcnow() - timedelta(seconds=2 * settings.summary_timeout_seconds),
+            )
+        )
+    ).scalar_one()
+    if in_flight:
+        raise ApiError(
+            429,
+            "rate_limit",
+            "A title is already being written; wait for it to finish",
+            headers={"Retry-After": str(settings.chat_retry_after_seconds)},
+        )
     try:
         entry = await ledger.reserve(
             db,
@@ -180,6 +207,11 @@ async def write_title(
             settings.credit_usd,
         )
     await ledger.settle_call(db, entry_id, amount)
+    # The bill is committed on its own, before the title: this transaction then holds the
+    # period's lock and no conversation's, and the title's holds the conversation's alone,
+    # so neither waits on a turn that records its usage meanwhile (conversation, then
+    # period) in the opposite order.
+    await db.commit()
 
     title = ""
     if completed is not None and completed.stop_reason != "refusal":
@@ -198,7 +230,7 @@ async def write_title(
             .where(Conversation.id == conversation.id)
             .values(title=title, updated_at=Conversation.updated_at)
         )
-    await db.commit()
+        await db.commit()
     if completed is None:
         raise ApiError(502, "upstream", "The model could not be reached; try again")
     if not title:

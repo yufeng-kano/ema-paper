@@ -263,8 +263,8 @@ const advancedOpen = ref(props.agent.settings.prompt !== null || props.agent.set
 
 /* The notes' editor in a field's hairline box: the column's sizes, the headings as plain
    run-in labels — a rule above a heading would only cut the box in two. The box is as tall
-   as what it holds, with room for a few lines when it is empty, up to a cap past which it
-   scrolls inside: long instructions never push the languages and Save down the page
+   as what it holds, with room for a few lines when it is empty, up to a cap past which its
+   text scrolls inside: long instructions never push the languages and Save down the page
    (docs/web.md § Pages). */
 .editor {
   --block-heading: var(--display-2xs);
@@ -274,14 +274,19 @@ const advancedOpen = ref(props.agent.settings.prompt !== null || props.agent.set
   --rich-gap: var(--space-3);
 
   min-height: 7rem;
-  max-height: min(20rem, 50vh);
-  overflow-y: auto;
   margin-top: var(--space-1);
-  padding: var(--space-4);
   border: 1px solid var(--edge);
   border-radius: var(--radius);
   background: var(--paper);
   cursor: text;
+}
+
+/* The text scrolls, not the box: the slash menu and the TeX field, which the editor draws
+   beside its text, stay whole past the box's edge rather than cut by it. */
+.editor :deep(.rich-doc) {
+  max-height: min(20rem, 50vh);
+  overflow-y: auto;
+  padding: var(--space-4);
 }
 
 /* The editable surface draws no ring of its own, so the box carries the app's one. */

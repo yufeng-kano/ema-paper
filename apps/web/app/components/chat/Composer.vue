@@ -675,6 +675,17 @@ onBeforeUnmount(() => {
  *  title it asks the model for can be paid. */
 const renaming = computed(() => command.value?.group === 'builtin' && command.value.name === RENAME_COMMAND)
 
+// `/rename` names an open conversation: on the draft its chip goes, what was typed after it
+// staying as the draft (docs/web.md § The agent panel, *Commands*).
+watch(
+  () => props.conversationOpen,
+  (open) => {
+    if (!open && renaming.value) {
+      command.value = null
+    }
+  },
+)
+
 const canSend = computed(
   () =>
     !props.running &&
