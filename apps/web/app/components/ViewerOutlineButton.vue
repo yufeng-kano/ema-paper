@@ -8,6 +8,10 @@
  * A click opens it with focus left on the button; Enter, Space or ↓ open it with focus on the
  * current row. Escape, a press elsewhere, focus leaving the button and the panel, a jump and
  * a row action close it, focus that was in the panel going back to the button.
+ *
+ * While it is open the panel owns Escape (`data-escape-owner`), so the viewer's dialog does
+ * not close under it — Safari focuses no pressed button, so a pointer opening can leave focus
+ * on nothing and the key reaches the document.
  */
 import type { ComponentPublicInstance } from 'vue'
 import { dockOutlinePanel } from '~/lib/blocks'
@@ -123,6 +127,16 @@ function onFocusOut(event: FocusEvent) {
   }
 }
 
+/** An Escape pressed with focus outside the button and the panel — on nothing, after Safari's
+ *  pointer opening. One pressed in either never gets here. */
+function onDocumentKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape' && open.value) {
+    event.stopPropagation()
+    event.preventDefault()
+    hide(true)
+  }
+}
+
 function onPointerDownOutside(event: PointerEvent) {
   if (open.value && !within(event.target)) {
     hide(false)
@@ -165,12 +179,14 @@ onMounted(() => {
   window.addEventListener('pointerup', onPointerUp, true)
   window.addEventListener('pointercancel', onPointerUp, true)
   window.addEventListener('resize', onResize)
+  document.addEventListener('keydown', onDocumentKeydown)
 })
 onBeforeUnmount(() => {
   window.removeEventListener('pointerdown', onPointerDownOutside, true)
   window.removeEventListener('pointerup', onPointerUp, true)
   window.removeEventListener('pointercancel', onPointerUp, true)
   window.removeEventListener('resize', onResize)
+  document.removeEventListener('keydown', onDocumentKeydown)
 })
 </script>
 
@@ -195,6 +211,7 @@ onBeforeUnmount(() => {
       :id="panelId"
       ref="nav"
       class="docked"
+      data-escape-owner
       :aria-label="t('viewer.outline.nav')"
       :style="{ top: `${place.top}px`, left: `${place.left}px` }"
       @pointerdown="onPress"
