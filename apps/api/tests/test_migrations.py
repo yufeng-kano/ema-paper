@@ -2239,3 +2239,54 @@ async def test_the_runtime_settings_migration_adds_an_empty_table_and_touches_no
         _alembic(scratch_url, "upgrade", "head")
     finally:
         await engine.dispose()
+
+
+LIBRARY_ON_DATA_PLANE = "67f4dce0969f"
+RENAME_COMMAND = "62b2a3fa78bd"
+
+
+async def test_the_rename_command_migration_renames_a_skill_named_rename(scratch_url) -> None:
+    """`/rename` becomes the composer's own: a skill named `rename` takes its reader's next
+    free `rename-N`, every other skill keeps its name, and the downgrade changes nothing
+    (docs/database.md)."""
+    _alembic(scratch_url, "upgrade", LIBRARY_ON_DATA_PLANE)
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.begin() as db:
+            await db.execute(
+                text(
+                    "INSERT INTO users (id, google_sub, email, created_at) VALUES "
+                    "(1, 'sub-1', 'a@example.com', now()), (2, 'sub-2', 'b@example.com', now())"
+                )
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO skills (user_id, name, description, argument_hint, body, "
+                    "created_at, updated_at) VALUES "
+                    "(1, 'rename', '', '', 'x', now(), now()), "
+                    "(1, 'rename-2', '', '', 'y', now(), now()), "
+                    "(1, 'mine', '', '', 'w', now(), now()), "
+                    "(2, 'rename', '', '', 'z', now(), now())"
+                )
+            )
+        _alembic(scratch_url, "upgrade", RENAME_COMMAND)
+        expected = [
+            (1, "mine", "w"),
+            (1, "rename-3", "x"),
+            (1, "rename-2", "y"),
+            (2, "rename-2", "z"),
+        ]
+        async with engine.connect() as db:
+            names = (
+                await db.execute(text("SELECT user_id, name, body FROM skills ORDER BY body"))
+            ).all()
+            assert [tuple(row) for row in names] == expected
+        _alembic(scratch_url, "downgrade", LIBRARY_ON_DATA_PLANE)
+        async with engine.connect() as db:
+            names = (
+                await db.execute(text("SELECT user_id, name, body FROM skills ORDER BY body"))
+            ).all()
+            assert [tuple(row) for row in names] == expected
+        _alembic(scratch_url, "upgrade", "head")
+    finally:
+        await engine.dispose()

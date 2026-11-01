@@ -32,6 +32,7 @@ from ..agents.chat import (  # noqa: F401 - re-exported: the context route and t
     TURN_CONTEXT,
     turn_note,
 )
+from ..agents.summary import TITLE_MAX_CHARS
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
 from ..billing import ledger
 from ..billing.credits import credits_for_usd
@@ -50,7 +51,7 @@ from ..db.models import (
     utcnow,
 )
 from ..errors import ApiError
-from ..jobs import chat_compact, chat_events, chat_versions
+from ..jobs import chat_compact, chat_events, chat_versions, summary
 from ..jobs.intake import insufficient_credits
 from ..jobs.queue import HISTORY_FULL, count_active_turns, enqueue_turn, history_bytes
 from ..parsing.attachments import prepared_path
@@ -70,7 +71,6 @@ from ..workspace.layout import user_root
 router = APIRouter(prefix="/api", tags=["chat"])
 
 SSE_MEDIA_TYPE = "text/event-stream"
-TITLE_MAX_CHARS = 80
 
 
 # --- conversations -------------------------------------------------------------------------
@@ -427,6 +427,32 @@ async def update_conversation(
     await db.execute(update(Conversation).where(Conversation.id == row.id).values(**values))
     await db.commit()
     await db.refresh(row)
+    return conversation_payload(
+        row, settings, compactable=await chat_compact.compactable(db, row.id)
+    )
+
+
+class TitleRequest(BaseModel):
+    # The web app's locale: the language the title is written in unless the reader chose
+    # an answer language (docs/chat.md § Conversations, turns, events).
+    locale: str = Field(default="en", max_length=16, pattern=r"^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$")
+
+
+@router.post("/conversations/{conversation_id}/title", dependencies=[CsrfGuard])
+async def write_title(
+    conversation_id: int,
+    body: TitleRequest,
+    user: SessionUser,
+    db: DbSession,
+    settings: AppSettings,
+):
+    """`/rename` with no name: the summary model writes the conversation's title from the
+    document's name and its first and latest exchange, billed by its tokens; `updated_at`
+    kept as a rename keeps it (docs/api.md, docs/chat.md § Conversations, turns, events)."""
+    row = await owned_conversation(db, user.id, conversation_id)
+    await summary.write_title(db, settings, row, locale=body.locale)
+    # Read again: a delete that landed while the model wrote is a clean 404.
+    row = await owned_conversation(db, user.id, conversation_id)
     return conversation_payload(
         row, settings, compactable=await chat_compact.compactable(db, row.id)
     )

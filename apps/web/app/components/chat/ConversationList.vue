@@ -9,8 +9,9 @@
  * the rows scrolling inside it and *New conversation* fixed at its foot. ↑ ↓ Home End move
  * between the rows and the foot, Tab reaches a row's ⋯, Escape closes it back to the title;
  * a press outside it, focus leaving it or the window resizing closes it too. The title it
- * opened from (`anchor`) is not outside — a press there is the title's own toggle — and nor is
- * the row menu while it is open, which is drawn outside it.
+ * opened from (`anchor`) is not outside — a press there is the title's own toggle, and so is
+ * the focus that press moves, wherever it goes — and nor is the row menu while it is open,
+ * which is drawn outside it.
  *
  * A rename is a field in place of the row: Enter or a click elsewhere keeps what it holds,
  * Escape leaves the title as it was, and a field left blank changes nothing (`renamedTitle`).
@@ -101,21 +102,33 @@ function onKeydown(event: KeyboardEvent) {
   }
 }
 
+/** A press on the title is under way: the focus it moves is the title's toggle too. Safari
+ *  and Firefox on macOS give a pressed button no focus — it goes to the nearest focusable
+ *  ancestor, the viewer's dialog — so without this the press would close the popover and the
+ *  title's click open it again (docs/web.md § The agent panel, *Conversations*). Set as the
+ *  press starts, before the focus moves, and cleared as it ends, before the click. */
+let anchorPressed = false
+
 function onPointerDownOutside(event: PointerEvent) {
   const target = event.target as Node | null
+  anchorPressed = Boolean(props.anchor?.contains(target))
   // The row menu closes itself on a press outside it, and says where (`onRowMenuClose`).
-  if (rowMenu.value || root.value?.contains(target) || props.anchor?.contains(target)) {
+  if (rowMenu.value || anchorPressed || root.value?.contains(target)) {
     return
   }
   emit('close', false)
 }
 
+function onPointerUp() {
+  anchorPressed = false
+}
+
 /** Focus going anywhere outside closes it — but not to the row menu, which takes it while
  *  open and gives it back as it closes, nor to nothing, as when the window loses focus, nor
- *  to the title, whose click that is and which closes it itself. */
+ *  to the title or anywhere a press on the title sends it, since that click closes it. */
 function onFocusOut(event: FocusEvent) {
   const next = event.relatedTarget as Node | null
-  if (rowMenu.value || next === null || root.value?.contains(next) || props.anchor?.contains(next)) {
+  if (rowMenu.value || anchorPressed || next === null || root.value?.contains(next) || props.anchor?.contains(next)) {
     return
   }
   emit('close', false)
@@ -150,6 +163,8 @@ watch(
 
 onMounted(async () => {
   window.addEventListener('pointerdown', onPointerDownOutside, true)
+  window.addEventListener('pointerup', onPointerUp, true)
+  window.addEventListener('pointercancel', onPointerUp, true)
   window.addEventListener('resize', onResize)
   document.addEventListener('keydown', onDocumentKeydown)
   await nextTick()
@@ -167,6 +182,8 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   window.removeEventListener('pointerdown', onPointerDownOutside, true)
+  window.removeEventListener('pointerup', onPointerUp, true)
+  window.removeEventListener('pointercancel', onPointerUp, true)
   window.removeEventListener('resize', onResize)
   document.removeEventListener('keydown', onDocumentKeydown)
   // Closed by a press elsewhere while a name was being typed: that press keeps it.

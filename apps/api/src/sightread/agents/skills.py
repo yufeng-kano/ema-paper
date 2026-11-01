@@ -15,9 +15,10 @@ from typing import Protocol
 # A skill's name, and a subagent's: what `/name` and the tools take (docs/chat.md § Skills).
 NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 # The composer's own commands — `/new` opens a conversation, `/compact` is the runner's
-# (docs/chat.md § Compaction) — so no skill bears their names: `/compact` must never run
-# a skill in the runner's place (docs/chat.md § Skills).
-COMPOSER_COMMANDS = frozenset({"new", "compact"})
+# (docs/chat.md § Compaction), `/rename` names the conversation (docs/chat.md
+# § Conversations, turns, events) — so no skill bears their names: neither `/compact` nor
+# `/rename` may ever run a skill in their place (docs/chat.md § Skills).
+COMPOSER_COMMANDS = frozenset({"new", "compact", "rename"})
 DESCRIPTION_MAX_CHARS = 1024
 ARGUMENT_HINT_MAX_CHARS = 128
 ARGUMENTS_PLACEHOLDER = "$ARGUMENTS"

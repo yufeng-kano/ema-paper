@@ -805,6 +805,8 @@ export default {
     commandNew: '開新對話',
     commandCompact: '壓縮這段對話',
     commandCompactHint: '[重點]',
+    commandRename: '重新命名這段對話',
+    commandRenameHint: '[名稱]',
     commandNoMatch: '沒有符合的指令',
     commandKeys: '↑↓ 選擇 · Enter 使用 · Esc 關閉',
     commandRemove: '移除指令',

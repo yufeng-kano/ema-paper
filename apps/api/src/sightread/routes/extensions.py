@@ -26,7 +26,7 @@ router = APIRouter(prefix="/api", tags=["extensions"])
 
 
 COMPOSER_COMMAND_TAKEN = (
-    "That name is one of the composer's own commands (/new, /compact); choose another"
+    "That name is one of the composer's own commands (/new, /compact, /rename); choose another"
 )
 
 

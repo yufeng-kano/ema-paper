@@ -821,6 +821,8 @@ export default {
     commandNew: 'Start a new conversation',
     commandCompact: 'Compact this conversation',
     commandCompactHint: '[focus]',
+    commandRename: 'Rename this conversation',
+    commandRenameHint: '[name]',
     commandNoMatch: 'No matching command',
     commandKeys: '↑↓ to choose · Enter to use · Esc to close',
     commandRemove: 'Remove the command',
