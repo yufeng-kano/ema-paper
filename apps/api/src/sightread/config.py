@@ -106,6 +106,9 @@ class Settings(BaseSettings):
     parse_model: str = ""
     check_model: str = ""
     parse_fallback_model: str = ""
+    # The small model a title `/rename` asks for is written on; empty = the conversation's
+    # own model (docs/chat.md § Conversations, turns, events, *The summary model*).
+    summary_model: str = ""
     # `{"<model>": {"input", "cache_read", "cache_write", "output"}}`, USD per 1M tokens. The
     # chat agent offers the live catalog's models priced here, in this order.
     model_prices_json: str = "{}"
@@ -313,6 +316,12 @@ class Settings(BaseSettings):
     chat_idle_compact_lead_seconds: int = 360
     chat_idle_compact_sweep_seconds: float = 60.0
     chat_compact_max_tool_calls: int = 8
+    # The summary model's one call: the most it may write — room for a model that reasons
+    # before it answers — how long it may take, and how much of each message of the two
+    # exchanges a title is written from (docs/chat.md § Conversations, turns, events).
+    summary_max_output_tokens: int = 1024
+    summary_timeout_seconds: float = 60.0
+    title_message_max_chars: int = 1500
     # The context window the chat panel's ring measures a conversation against when
     # `MODEL_PRICES_JSON` names no `context` for its model.
     chat_context_window_tokens: int = 200_000
@@ -429,6 +438,9 @@ class Settings(BaseSettings):
             "admin_reauth_hours",
             "admin_probe_timeout_seconds",
             "convert_file_timeout_seconds",
+            "summary_max_output_tokens",
+            "summary_timeout_seconds",
+            "title_message_max_chars",
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name.upper()} must be positive")
@@ -511,7 +523,7 @@ class Settings(BaseSettings):
     def offered_models(self) -> set[str]:
         """Every model the deployment runs on its own, each of which must be priced; the
         chat models are priced by definition (docs/billing.md § Models)."""
-        fixed = (self.parse_model, self.check_model, self.parse_fallback_model)
+        fixed = (self.parse_model, self.check_model, self.parse_fallback_model, self.summary_model)
         return {m.strip() for m in fixed if m.strip()}
 
     @property

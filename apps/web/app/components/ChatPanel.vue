@@ -35,6 +35,7 @@ import {
   listConversations,
   listMemories,
   renameConversation,
+  generateTitle,
   revertRevision,
   sendMessage,
   updateConversation,
@@ -49,7 +50,15 @@ import {
   type Memory,
 } from '~/lib/api'
 import { blockName, type NameText } from '~/lib/blocks'
-import { COMPACT_COMMAND, commandArguments, formatBytes, type AskOutcome, type AskRequest, type ComposerPayload } from '~/lib/composer'
+import {
+  COMPACT_COMMAND,
+  RENAME_COMMAND,
+  commandArguments,
+  formatBytes,
+  type AskOutcome,
+  type AskRequest,
+  type ComposerPayload,
+} from '~/lib/composer'
 import { idleReloadDelay } from '~/lib/context'
 import { byRecency } from '~/lib/conversations'
 import { nodesToMarkdown } from '~/lib/copy'
@@ -1341,12 +1350,45 @@ function sentContent(payload: ComposerPayload): ContentBlock[] {
   return blocks
 }
 
+/** `/rename` from the composer: the name given, as the list's *Rename* sends it, or, with
+ *  none, a title the summary model writes. No message: the thread is left as it is, the
+ *  title and the list take the new name, and a refusal is said as a send's is (docs/web.md
+ *  § The agent panel, *Commands*). True once the title is written. */
+async function renameFromComposer(text: string): Promise<boolean> {
+  const id = currentId.value
+  if (id === null) {
+    return false
+  }
+  composerError.value = null
+  listChanged()
+  countRename(id)
+  try {
+    const saved = text ? await renameConversation(id, text) : await generateTitle(id, locale.value)
+    listChanged()
+    countRename(id)
+    conversations.value = conversations.value.map((row) => (row.id === id ? { ...row, title: saved.title } : row))
+    return true
+  } catch (error) {
+    countRename(id)
+    const refusal = creditsRefusalOf(error)
+    if (refusal) {
+      creditsRefusal.value = refusal
+      return false
+    }
+    composerError.value = await resolve(error)
+    return false
+  }
+}
+
 /** Posts the composer's message. From the draft, the conversation is made first — or is the
  *  one a refused first send made — and joins the list once its message is accepted. True once
  *  the server accepted it: the composer then clears what it sent. */
 async function submit(payload: ComposerPayload): Promise<boolean> {
   if (running.value) {
     return false
+  }
+  if (payload.command === RENAME_COMMAND) {
+    return renameFromComposer(payload.text)
   }
   composerError.value = null
   const fromDraft = currentId.value === null

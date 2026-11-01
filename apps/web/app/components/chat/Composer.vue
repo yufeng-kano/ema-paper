@@ -22,6 +22,7 @@ import {
   matchCommands,
   NEW_COMMAND,
   passageTooLong,
+  RENAME_COMMAND,
   refuseAttachment,
   sectionHeading,
   sectionText,
@@ -366,6 +367,8 @@ const matches = computed(() => {
         newDescription: t('chat.commandNew'),
         compactDescription: t('chat.commandCompact'),
         compactHint: t('chat.commandCompactHint'),
+        renameDescription: t('chat.commandRename'),
+        renameHint: t('chat.commandRenameHint'),
       }),
     ],
     query.value ?? '',
@@ -434,7 +437,7 @@ function pick(option: CommandOption) {
     emit('new-conversation')
     return
   }
-  // A skill, or `/compact`: a chip, the textarea taking its arguments.
+  // A skill, `/compact` or `/rename`: a chip, the textarea taking its arguments.
   command.value = option
   // The `/term` typed was the command; a draft the command control opened over stays as
   // its arguments.
@@ -667,13 +670,19 @@ onBeforeUnmount(() => {
 
 // --- sending ---------------------------------------------------------------------------
 
+/** `/rename` is picked: what goes is its arguments alone, so neither a passage too long to
+ *  send nor a balance that would refuse a message holds it back — the server says whether a
+ *  title it asks the model for can be paid. */
+const renaming = computed(() => command.value?.group === 'builtin' && command.value.name === RENAME_COMMAND)
+
 const canSend = computed(
   () =>
     !props.running &&
-    !props.blocked &&
     !sending.value &&
-    !selectionTooLong.value &&
-    (draft.value.trim() !== '' || command.value !== null || pending.value.some((item) => item.state !== 'refused')),
+    (renaming.value ||
+      (!props.blocked &&
+        !selectionTooLong.value &&
+        (draft.value.trim() !== '' || command.value !== null || pending.value.some((item) => item.state !== 'refused')))),
 )
 
 /** Sends what the composer holds; whether the message was taken, so an ask that sends can
@@ -685,6 +694,19 @@ async function send(): Promise<boolean> {
   sending.value = true
   localError.value = null
   try {
+    if (renaming.value) {
+      // No message: its arguments alone go, and the selection, the sections, the quote and
+      // the attachments stay for the next one (docs/web.md § The agent panel, *Commands*).
+      const text = draft.value.trim()
+      const renamed = await props.submit({ text, selection: null, sections: [], quote: null, command: RENAME_COMMAND, attachments: [] })
+      if (renamed && draft.value.trim() === text) {
+        draft.value = ''
+      }
+      if (renamed && command.value?.name === RENAME_COMMAND) {
+        command.value = null
+      }
+      return renamed
+    }
     // Send waits for the uploads in flight; one that fails stays as a refused chip.
     await Promise.allSettled([...uploads.values()].map((request) => request.promise))
     if (unmounted) {

@@ -380,7 +380,8 @@ const advancedOpen = ref(settings.value.prompt !== null || settings.value.prompt
   gap: var(--space-2);
 }
 
-/* The chat agent's instructions box: the notes' editor in a field's hairline box. */
+/* The chat agent's instructions box: the notes' editor in a field's hairline box, capped
+   and scrolling inside as that box is (docs/web.md § Pages). */
 .editor {
   --block-heading: var(--display-2xs);
   --block-subheading: var(--text-base);
@@ -389,6 +390,8 @@ const advancedOpen = ref(settings.value.prompt !== null || settings.value.prompt
   --rich-gap: var(--space-3);
 
   min-height: 7rem;
+  max-height: min(20rem, 50vh);
+  overflow-y: auto;
   padding: var(--space-4);
   border: 1px solid var(--edge);
   border-radius: var(--radius);

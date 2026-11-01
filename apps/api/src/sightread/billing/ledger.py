@@ -621,6 +621,26 @@ async def close_chat(db: AsyncSession, turn_id: uuid.UUID) -> None:
     await db.flush()
 
 
+async def settle_call(db: AsyncSession, entry_id: int, amount: int) -> None:
+    """A charge for one call made outside any turn or job — a title the summary model
+    wrote (docs/billing.md § A chat turn): the entry reserved at nothing takes the call's
+    credits, spilling into the period, the packs and past the grant as a turn's
+    settlement does, and is consumed at once; at nothing — the upstream reported no
+    usage — it is released, the reader having got nothing. Idempotent on its state."""
+    entry = (
+        await db.execute(select(CreditEntry).where(CreditEntry.id == entry_id).with_for_update())
+    ).scalar_one_or_none()
+    if entry is None or entry.state != RESERVED:
+        return
+    now = utcnow()
+    if amount > 0:
+        await _spill(db, entry, amount, now)
+    entry.amount = amount
+    entry.state = CONSUMED if amount > 0 else RELEASED
+    entry.settled_at = now
+    await db.flush()
+
+
 def shown(entry: CreditEntry | None) -> int | None:
     """What a job or turn payload shows as `credits`: the amount once settled, 0 for a
     released reservation, null while one is pending (docs/billing.md § Routes)."""

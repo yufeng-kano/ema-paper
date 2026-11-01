@@ -1563,6 +1563,14 @@ export function renameConversation(id: number, title: string): Promise<Conversat
   return updateConversation(id, { title })
 }
 
+/** `/rename` with no name: the summary model writes the thread's title, in the reader's
+ *  answer language or else `locale`, billed by its tokens — 400 `nothing_to_rename` before
+ *  the first exchange, 402 under the minimum balance, 502 when the model answers no title.
+ *  The thread keeps its place in the list (docs/chat.md § Conversations, turns, events). */
+export function generateTitle(id: number, locale: string): Promise<Conversation> {
+  return request('POST', `/api/conversations/${id}/title`, { locale })
+}
+
 /** A rename, a move to another model for the conversation's later turns, a switch to
  *  another version of a message (`version`, a turn's id — the conversation then shows that
  *  branch), or any of them together: 400 for a model the chat agent does not offer or a

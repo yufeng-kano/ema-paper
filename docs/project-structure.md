@@ -25,7 +25,8 @@ agent-sightread/
                               # chat.py the chat agent's system prompt and tool definitions;
                               # skills.py and subagents.py the built-in skills and subagents;
                               # memory.py the memory block, its selection and text cleaning;
-                              # check.py the check agent's prompt and tools
+                              # check.py the check agent's prompt and tools;
+                              # summary.py the summary model's title prompt and cleaning
         admin/                # the operator console (docs/admin.md): permissions.py
                               # (ALL_PERMISSIONS, the areas, normalizing a group's list),
                               # deps.py (require_console_session, require_permission),
@@ -70,7 +71,8 @@ agent-sightread/
                               # chat_tools.py, chat_events.py (the conversation stream),
                               # chat_memory.py (a turn's memory snapshot, the memory tool),
                               # chat_web.py (the web tools: Brave search, OpenAlex, the
-                              # guarded fetch, reading a URL, downloading into Files)
+                              # guarded fetch, reading a URL, downloading into Files),
+                              # summary.py (one summary-model call: `/rename`'s title)
         mcp/                  # server.py: thin shell over the service layer — parse, list_library, read_document, write_document (docs/mcp.md)
         worker.py             # `python -m sightread.worker`
       migrations/             # Alembic

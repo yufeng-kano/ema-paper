@@ -11,7 +11,7 @@ export interface CommandOption {
   /** What the command takes, shown at the row's end. */
   hint: string
   /** `skill` runs one of the reader's skills; `builtin` is the composer's own (`/new`,
-   *  `/compact`). */
+   *  `/compact`, `/rename`). */
   group: 'skill' | 'builtin'
 }
 
@@ -19,17 +19,27 @@ export interface CommandOption {
 export const NEW_COMMAND = 'new'
 /** Sent as `command: compact`, its arguments the focus (docs/chat.md § Compaction). */
 export const COMPACT_COMMAND = 'compact'
+/** Never sent as a message: a name renames the conversation, none asks the summary model
+ *  for a title (docs/chat.md § Conversations, turns, events). */
+export const RENAME_COMMAND = 'rename'
 
-/** The builtin rows the menu lists under *Conversation*: `/new` always, `/compact` only with
- *  a conversation open — the draft has nothing to compact. The descriptions and hints are
- *  the caller's, read from the catalog. */
+/** The builtin rows the menu lists under *Conversation*: `/new` always, `/compact` and
+ *  `/rename` only with a conversation open — the draft has nothing to compact or name. The
+ *  descriptions and hints are the caller's, read from the catalog. */
 export function builtinCommands(
   conversationOpen: boolean,
-  words: { newDescription: string; compactDescription: string; compactHint: string },
+  words: {
+    newDescription: string
+    compactDescription: string
+    compactHint: string
+    renameDescription: string
+    renameHint: string
+  },
 ): CommandOption[] {
   const rows: CommandOption[] = [{ name: NEW_COMMAND, description: words.newDescription, hint: '', group: 'builtin' }]
   if (conversationOpen) {
     rows.push({ name: COMPACT_COMMAND, description: words.compactDescription, hint: words.compactHint, group: 'builtin' })
+    rows.push({ name: RENAME_COMMAND, description: words.renameDescription, hint: words.renameHint, group: 'builtin' })
   }
   return rows
 }
