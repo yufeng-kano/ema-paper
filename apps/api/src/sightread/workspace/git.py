@@ -48,6 +48,9 @@ def _log_files_max() -> int:
 # The identities commits carry. An agent commit names its conversation in the author.
 USER_AUTHOR = "user"
 AGENT_AUTHOR_PREFIX = "agent:"
+# A save through the data plane — a script's, or Claude's through the connector (docs/api.md
+# § The library on the data plane).
+API_AUTHOR = "api"
 
 # What a revision records of a file that is not a document's own: text, and no more than
 # `REVISION_MAX_FILE_BYTES` of it (docs/workspace.md § Revisions). A document's own files

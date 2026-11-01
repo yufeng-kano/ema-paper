@@ -1,6 +1,6 @@
 # Auth
 
-Six credential kinds, strictly separated. No password login anywhere.
+Seven credential kinds, strictly separated. No password login anywhere.
 
 ## 1. Web sessions — Google OIDC only
 
@@ -33,13 +33,14 @@ Claude custom connectors assume OAuth 2.1 on remote MCP servers and attempt Dyna
 - Discovery: `/.well-known/oauth-authorization-server` (RFC 8414) and `/.well-known/oauth-protected-resource` (RFC 9728, pointing at `/mcp`).
 - `POST /oauth/register` — open DCR (RFC 7591), redirect URIs restricted to `https://` (plus `http://localhost` for local).
 - `GET /oauth/authorize` — requires a web session (redirects to Google login and back if absent), renders the consent page (server-rendered by FastAPI, not Nuxt), issues a short-lived code bound to PKCE S256. The page is one card carrying its own styles, mark and icon links inline: it may open in a stripped-down connector webview, so it makes no external request and cannot half-load while asking for account access. Its palette is a narrowed copy of the web app's tokens ([web.md](./web.md)) — duplicated deliberately, since FastAPI cannot import the Nuxt stylesheet and consent must not depend on the web app being up. English only for now; it is the one user-facing surface outside the i18n catalog.
-- `POST /oauth/token` — code + PKCE → access token (opaque random, stored hashed, 1 h) + refresh token (30 d, rotating). Access tokens authenticate `/mcp` and `/v1/*` exactly like an API key, resolved to the same user.
+- `POST /oauth/token` — code + PKCE → access token (opaque random, stored hashed, 1 h) + refresh token (30 d, rotating). Access tokens authenticate `/mcp` and `/v1/*` like an API key, resolved to the same user, within their grant's scope (below).
 
 Result: adding the connector in Claude is "paste URL → Google login → consent" — no manual key copying.
 
 Implementation notes (as built):
 
-- **Public clients only.** DCR issues no client secret and `token_endpoint_auth_method` is `none`; PKCE S256 is the only client authentication, which is what Claude does anyway and leaves no shared secret to leak. One scope, `parse`. Authlib supplies the PKCE primitives; its Flask/Django authorization-server framework is sync, so the endpoints themselves are plain FastAPI routes over `oauth_grants`.
+- **Public clients only.** DCR issues no client secret and `token_endpoint_auth_method` is `none`; PKCE S256 is the only client authentication, which is what Claude does anyway and leaves no shared secret to leak. Authlib supplies the PKCE primitives; its Flask/Django authorization-server framework is sync, so the endpoints themselves are plain FastAPI routes over `oauth_grants`.
+- **Two scopes, `parse` and `library`** (the second since 2026-11-01). `parse` is the `parse` tool and the job routes; `library` is reading the Files library and saving a document's text and notes — the library tools of the connector ([mcp.md](./mcp.md)) and `/v1/library*` ([api.md](./api.md) § The library on the data plane). A grant is made for both whatever the client asks (`scopes_supported` lists both, the token answer names what was granted), since the consent page says both: *It will be able to submit documents, read your Files library and save the text and notes of its documents. It cannot reach your settings, API keys or billing.* A refresh keeps the scope of the grant it rotates, so a connector approved before the second scope existed keeps `parse` alone until it is approved again: the library routes and tools answer it **403** `auth` with *This connector was approved before it could read your library: remove it in Claude's settings and add it again.* — never a scope widened without the consent page. An API key carries both, as the account's own.
 - **Error shapes.** `/oauth/register` and `/oauth/token` answer in RFC form (`{"error": "...", "error_description": "..."}`) because OAuth clients parse that; the app's own error envelope stays on `/v1` and `/api`. `/oauth/authorize` answers a browser, so it renders HTML or redirects.
 - **Codes** live 5 min, are single use, and are bound to client, user, PKCE challenge and the redirect URI they were issued for (`oauth_grants.redirect_uri`). A refused client or redirect URI never redirects — it renders an error page.
 - **Consent CSRF**: the consent form carries a one-time token stored in the short-lived signed cookie; a cross-site form post cannot produce it. That same cookie parks the authorize request while the user signs in with Google, and only a path under `/oauth/authorize` is resumed.
@@ -60,6 +61,17 @@ A ticket lets an agent do exactly one upload — a parse, or the retry of a fail
 ## 6. Kano Proxy connect — removed
 
 The authorization-code flow by which a user approved Ema Paper on Kano Proxy and the app received a key for them (`GET /api/kano/connect`, `GET /api/kano/callback`, `GET/DELETE /api/kano`, the `kano_proxy_keys` and `kano_connect_states` tables, `KANO_PROXY_CLIENT_ID` / `KANO_PROXY_CLIENT_SECRET` / `KANO_CONNECT_TTL_SECONDS`) was removed by step 4 of [billing.md](./billing.md) § Transition: every user runs on the operator's one Kano Proxy account (§ 3), paid for in credits. Kano Proxy's side of the contract (kano-proxy-cloud's connect endpoints) is untouched by this; Ema Paper is simply no longer a client of it.
+
+## 7. Document tickets — short-lived, one document (the MCP library tools)
+
+The connector's library tools hand the agent `curl` commands, as `parse` does, and the commands need a credential the agent can hold: a **document ticket**, minted only by the `read_document` and `write_document` tools ([mcp.md](./mcp.md) § The library tools), for one document of the caller's. So an OAuth connector still never holds a durable credential, and a leaked ticket is worth one document for an hour.
+
+- Format `srd_<32 random url-safe chars>`; stored as SHA-256 hash + display prefix (`srd_...abc4`) in `document_tickets` with the `document_id` and the `scope` ([database.md](./database.md)). Returned in the tool result exactly once.
+- **Scope.** A `read` ticket authenticates the `GET` routes under `/v1/library/documents/{id}` of its own document: the row, `doc.md`, `notes.md`, the crops, the inserted images, the original and a library file's bytes. A `write` ticket adds the two saves, `PUT …/doc.md` and `PUT …/notes.md`. Neither is spent by use: within its lifetime it serves any number of requests, so a download fetches every crop on one ticket. A ticket that expired, names another document, or is a `read` ticket on a save gets 401 *Document ticket expired or for another document — call read_document (or write_document to save) again for a fresh one.* `GET /v1/library` refuses a ticket with a 401 that says to list the library with an API key or the `list_library` tool; every other endpoint — the job routes, `/v1/parse`, `/mcp` — refuses `srd_` as any unknown bearer (401; `/v1/jobs/last*` its 400 for anything but an upload ticket).
+- The ticket only names what the account may reach: each request still resolves the document as the account's own and live, so a document put in the Trash after the mint answers 404; one deleted for good takes its tickets with its row, and the ticket then gets the 401 above.
+- Lifetime `DOCUMENT_TICKET_TTL_SECONDS` (default 3600). Recovery from an expired ticket is calling the tool again; the revision a save sends is the file's content hash, not the ticket's, so a copy downloaded on one ticket saves on another.
+- **Mint rate limit:** `DOCUMENT_TICKET_RATE_PER_HOUR` (default 120) per user, counted apart from upload tickets; exceeding it is a 429-shaped tool error. Minting also deletes that user's expired document tickets, as upload tickets tidy up.
+- Never in query strings, like every other bearer.
 
 ## Deleting the account
 
