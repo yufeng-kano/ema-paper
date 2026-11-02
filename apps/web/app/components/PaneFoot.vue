@@ -200,14 +200,6 @@ defineExpose({ root })
     height: 44px;
     padding: 0 var(--space-4);
   }
-
-  .note {
-    padding-block: 0;
-  }
-
-  .note-undo {
-    min-height: 44px;
-  }
 }
 
 .note {
@@ -243,7 +235,16 @@ defineExpose({ root })
   display: none;
 }
 
+/* After the note's own padding, which it overrides: the buttons' finger height is the note's. */
 @media (pointer: coarse) {
+  .note {
+    padding-block: 0;
+  }
+
+  .note-undo {
+    min-height: 44px;
+  }
+
   .note-undo .fine {
     display: none;
   }

@@ -866,7 +866,10 @@ function notePress(event: PointerEvent) {
   const held = blockSelection.value
   tapArmed = pressTouch && held && !held.keyboard && held.anchor === held.head && held.anchor === tapSelected ? held.anchor : null
   const native = window.getSelection()
-  tapEnds = pressTouch && native !== null && !native.isCollapsed
+  // Only a selection the reader can see: one left behind in a hidden pane ends nothing.
+  const anchor = native?.anchorNode
+  const hidden = (anchor instanceof Element ? anchor : anchor?.parentElement)?.closest('[inert]')
+  tapEnds = pressTouch && native !== null && !native.isCollapsed && !hidden
 }
 
 /** A finger's first tap: the block selected — its wash and its handle, no editor, no keyboard —
@@ -1524,6 +1527,10 @@ function followSelection(before: readonly PlacedBlock[], after: readonly PlacedB
   }
   const anchor = follow(selection.anchor)
   const head = follow(selection.head)
+  // The block a finger selected stays the one a second tap opens, wherever an edit moved it.
+  if (tapSelected !== null && tapSelected === selection.anchor) {
+    tapSelected = anchor
+  }
   blockSelection.value = anchor && head ? { ...selection, anchor, head } : null
 }
 
@@ -2223,7 +2230,9 @@ function onPaneKey(event: KeyboardEvent) {
   const undoKey = matches(event, 'mod+z')
   const redoKey = matches(event, 'mod+shift+z') || (!apple && matches(event, 'mod+y'))
   if (!undoKey && !redoKey) {
-    if (!['Shift', 'Meta', 'Control', 'Alt'].includes(event.key)) {
+    // Tab, and the keys pressed on the note's own buttons, reach the note rather than end it.
+    const onNote = event.target instanceof Element && event.target.closest('.foot .note') !== null
+    if (!onNote && !['Shift', 'Meta', 'Control', 'Alt', 'Tab'].includes(event.key)) {
       hideUndoNote()
     }
     return
@@ -2847,7 +2856,10 @@ function slashSkills(text: string): SlashSkill[] | null {
 
 /** The agent panel: the reader's view asks it (`ask`) to take a passage, a section or a
  *  command (docs/web.md § The agent panel). */
-const chatPanel = ref<{ ask: (request: AskRequest) => Promise<'sent' | 'focused' | 'kept' | 'full'> } | null>(null)
+const chatPanel = ref<{
+  ask: (request: AskRequest) => Promise<'sent' | 'focused' | 'kept' | 'full'>
+  focus: () => void
+} | null>(null)
 
 const limits = computed(() => auth.me.value?.limits ?? null)
 
@@ -2893,9 +2905,13 @@ async function askAgent(request: AskRequest, focusKey: string | null) {
     const n = limits.value?.sections_per_message ?? 0
     showNote(t('viewer.note.sectionsMax', { n }, n), false)
   }
-  // A sending ask that did not go waits in the composer, where the reader has to see it.
+  // A sending ask that did not go waits in the composer, where the reader has to see it — and
+  // type: the composer's own focus came while the pane was inert.
   if (phone.value && request.send && outcome !== 'sent') {
     await showPane('agent')
+    if (outcome === 'focused') {
+      chatPanel.value?.focus()
+    }
   }
   if (outcome !== 'focused' && focus !== null && documentShown.value) {
     focusBlock(focus)
@@ -3471,10 +3487,17 @@ async function goBack() {
   if (!back || !box) {
     return
   }
+  // Off the phone — the window widened since — the pane is a card, opened or brought forward.
   if (back.pane) {
-    void showPane(back.pane)
+    if (phone.value) {
+      void showPane(back.pane)
+    } else {
+      openColumn(back.pane)
+    }
     return
   }
+  // ⌘[ pressed on Notes or Agent: the text shows first, so the reader sees where it lands.
+  await toText()
   const key = wayBackKey(back)
   const at = key ? placedIndex.value.get(key) : undefined
   if (at !== undefined) {
@@ -3519,6 +3542,8 @@ const paneHeight = ref(0)
  *  test that picks one can be taken. */
 const gutter = ref<number | null>(null)
 const paneFoot = ref<{ root: HTMLElement | null } | null>(null)
+/** A phone's status note over Notes or Agent. */
+const noteFoot = ref<{ root: HTMLElement | null } | null>(null)
 /** How far up from the pane's foot its pieces reach: their height and what they stand on,
  *  which is less under the hint bar (`PaneFoot`); 0 with none. */
 const footReach = ref(0)
@@ -3752,7 +3777,8 @@ const pane = ref<Pane>('document')
 /** The agent was mounted on a phone: it stays mounted — its draft, its attachments — until the
  *  viewer closes or its card's close button closes it, whatever the layout does meanwhile. */
 const agentKept = ref(false)
-/** On a tablet, the card in front where both are open. */
+/** On a tablet, the card in front where both are open: the one opened or worked in last, so a
+ *  rotation from the desktop keeps the card being typed in. */
 const front = ref<Column>('agent')
 /** What the phone's switch marks: a turn running, an answer or a failure not yet seen, notes
  *  added from another pane. */
@@ -3763,9 +3789,11 @@ const uid = useId()
 
 const cardsShown = computed(() => shownCards(layout.value, { notes: notesOpen.value, agent: agentOpen.value }, front.value))
 /** The notes are mounted with the editable copy on a phone, where they are a pane; the agent the
- *  first time it is shown or asked, then kept. */
+ *  first time it is shown or asked, then kept — not because a wider screen left its card open. */
 const notesMounted = computed(() => editable.value && (notesOpen.value || phone.value))
-const agentMounted = computed(() => editable.value && props.documentId !== null && (agentOpen.value || agentKept.value))
+const agentMounted = computed(
+  () => editable.value && props.documentId !== null && ((agentOpen.value && !phone.value) || agentKept.value),
+)
 /** What shows: a phone's one pane; elsewhere the document, and each card shown beside it. */
 const documentShown = computed(() => !phone.value || pane.value === 'document')
 const notesShown = computed(() => (phone.value ? pane.value === 'notes' : cardsShown.value.notes))
@@ -3844,6 +3872,13 @@ watch(agentOpen, (open) => (front.value = open ? 'agent' : 'notes'))
  * a pane shown has nothing unseen any more.
  */
 async function showPane(next: Pane) {
+  // What the switch marked is seen — also on a pane a rotation had already put the reader on.
+  if (next === 'agent') {
+    agentKept.value = true
+    agentNew.value = false
+  } else if (next === 'notes') {
+    notesNew.value = false
+  }
   if (next === pane.value) {
     return
   }
@@ -3853,14 +3888,15 @@ async function showPane(next: Pane) {
     selection.removeAllRanges()
   }
   toolbar.value = null
-  if (next === 'agent') {
-    agentKept.value = true
-    agentNew.value = false
-  } else if (next === 'notes') {
-    notesNew.value = false
-  }
+  const leaving = document.activeElement
   pane.value = next
   await nextTick()
+  // Focus left in the pane now hidden — or on a control that went with the switch, the pill or
+  // the note's View — goes to the switch, which raises no keyboard; a jump that lands on a
+  // block moves it on from there.
+  if (leaving instanceof HTMLElement && leaving !== document.body && (!leaving.isConnected || leaving.closest('[inert]'))) {
+    document.getElementById(`${uid}-tab-${next}`)?.focus({ preventScroll: true })
+  }
 }
 
 /** A segment pressed: a switch made with the control ends a way back to another pane. */
@@ -3929,9 +3965,16 @@ watch(layout, (now, before) => {
   } else if (now === 'phone' && before !== 'phone') {
     const active = document.activeElement
     const card = active instanceof Element ? active.closest('aside.card') : null
+    // An agent open on the wider screen stays mounted, its draft with it.
+    if (agentOpen.value) {
+      agentKept.value = true
+    }
     pane.value = card?.classList.contains('notes') ? 'notes' : card?.classList.contains('agent') ? 'agent' : 'document'
     if (pane.value === 'agent') {
       agentKept.value = true
+      agentNew.value = false
+    } else if (pane.value === 'notes') {
+      notesNew.value = false
     }
   }
   toolbar.value = null
@@ -4720,10 +4763,11 @@ const awaitingContent = computed(() => contentWanted.value && !contentLoaded.val
 function onWindowPointerDown(event: PointerEvent) {
   notePress(event)
   const target = event.target instanceof Element ? event.target : null
-  if (!target || !paneFoot.value?.root?.contains(target)) {
+  const onFoot = target !== null && Boolean(paneFoot.value?.root?.contains(target) || noteFoot.value?.root?.contains(target))
+  if (!onFoot) {
     hideUndoNote()
   }
-  if (target?.closest('[data-chrome], [role="menu"]') || paneFoot.value?.root?.contains(target) || blockMenu.value) {
+  if (target?.closest('[data-chrome], [role="menu"]') || onFoot || blockMenu.value) {
     return
   }
   blockSelection.value = null
@@ -5045,6 +5089,7 @@ watch(
               :aria-label="paneTabs.length ? undefined : t('viewer.notesLabel')"
               :inert="!notesShown"
               @pointerdown="onSurfacePointerDown"
+              @focusin="front = 'notes'"
             >
               <header v-if="!phone" class="card-head">
                 <h3 class="card-title">{{ t('viewer.notesLabel') }}</h3>
@@ -5409,7 +5454,7 @@ watch(
               ref="paneFoot"
               :hint="showHint"
               :back="wayBack?.label ?? null"
-              :note="statusNote"
+              :note="documentShown ? statusNote : null"
               @back="goBack"
               @view="viewNoted"
               @undo="stepUndo('undo', false)"
@@ -5421,9 +5466,6 @@ watch(
               <UiIcon name="grip-vertical" />
               <span class="drag-card-text" />
             </div>
-
-            <!-- One polite region for the notes, the selection's count and a drag's target. -->
-            <p class="sr-only" role="status" aria-live="polite">{{ liveText }}</p>
           </div>
 
           <!-- The agent's thread about this document (docs/web.md § The agent panel). -->
@@ -5456,6 +5498,7 @@ watch(
             :aria-labelledby="paneTabs.length ? `${uid}-tab-agent` : undefined"
             :aria-label="paneTabs.length ? undefined : t('chat.panel')"
             :inert="!agentShown"
+            @focusin="front = 'agent'"
           >
             <ChatPanel
               ref="chatPanel"
@@ -5472,6 +5515,24 @@ watch(
               @running="agentRunning = $event"
             />
           </aside>
+
+          <!-- A phone's status note while Notes or Agent shows: over that pane, not under the
+               hidden text (docs/web.md § Result viewer, *On a phone and a tablet*). -->
+          <PaneFoot
+            v-if="phone && !documentShown && statusNote"
+            ref="noteFoot"
+            class="pane-note"
+            :hint="false"
+            :back="null"
+            :note="statusNote"
+            @view="viewNoted"
+            @undo="stepUndo('undo', false)"
+            @hold="holdNote"
+          />
+
+          <!-- One polite region for the notes, the selection's count and a drag's target —
+               outside every pane, none of which a phone's switch can make inert. -->
+          <p class="sr-only" role="status" aria-live="polite">{{ liveText }}</p>
         </div>
       </div>
     </div>
@@ -6289,6 +6350,13 @@ watch(
   visibility: hidden;
 }
 
+/* The status note over Notes or Agent stands under the header: the agent's composer holds the
+   pane's foot. */
+.columns > .pane-note {
+  top: var(--space-3);
+  bottom: auto;
+}
+
 .body.phone .card {
   margin: 0;
   border-radius: 0;
@@ -6318,6 +6386,19 @@ watch(
 
 .body.phone .notes-view {
   padding: var(--space-6) var(--space-8) var(--space-10);
+}
+
+/* The side column's three heading levels, scaled with its text to the reading size. */
+.body.phone .notes-view :deep(.md-h2[data-level='1']) {
+  font-size: var(--display-md);
+}
+
+.body.phone .notes-view :deep(.md-h2:not([data-level='1'])) {
+  font-size: var(--display-sm);
+}
+
+.body.phone .notes-view :deep(.md-h3) {
+  font-size: var(--text-read);
 }
 
 /* The phone's header: the filename over the switch, between the back button and More. */

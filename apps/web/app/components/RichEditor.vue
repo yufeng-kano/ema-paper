@@ -2344,8 +2344,15 @@ defineExpose({
 .rich :deep(.md-quote > p) {
   margin: 0;
   color: inherit;
-  font-size: inherit;
   line-height: inherit;
+}
+
+/* A list item and a cell set their surface's size; a quote does not, so its paragraph keeps
+   its own, as the rendered quote's does — not the editable root's, which a coarse pointer
+   raises to 16px. */
+.rich :deep(.md-list p),
+.rich :deep(.md-table p) {
+  font-size: inherit;
 }
 
 /* A table scrolls sideways in place, as the rendered one does inside its wrapper. */

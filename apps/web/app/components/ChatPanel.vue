@@ -1882,7 +1882,9 @@ function ask(request: AskRequest): Promise<AskOutcome> {
   return composer.value?.ask(request) ?? Promise.resolve('kept')
 }
 
-defineExpose({ ask })
+/** The composer, focused once its pane shows: an ask that fell back to waiting there was
+ *  focused while a phone's Agent pane was still inert. */
+defineExpose({ ask, focus: () => composer.value?.focus() })
 
 onMounted(() => {
   document.addEventListener('selectionchange', scheduleToolbar)
