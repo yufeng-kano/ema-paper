@@ -23,6 +23,12 @@ describe('keyboard frame', () => {
     expect(keyboardFrame({ height: 538 }, { offsetTop: 0, height: 538, scale: 1 })).toBeNull()
   })
 
+  it('leaves a phone held sideways to the browser’s own pan', () => {
+    const sideways = { height: 402 }
+    expect(keyboardFrame(sideways, { offsetTop: 202, height: 200, scale: 1 })).toBeNull()
+    expect(keyboardFrame({ height: 597 }, { offsetTop: 0, height: 320, scale: 1 })).toEqual({ top: 0, height: 320 })
+  })
+
   it('never fights a pinch zoom', () => {
     expect(keyboardFrame(box, { offsetTop: 200, height: 300, scale: 2 })).toBeNull()
   })

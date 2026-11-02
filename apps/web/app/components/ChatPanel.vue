@@ -990,6 +990,23 @@ async function settleFollowing() {
   }
 }
 
+/** The thread's box made shorter — the on-screen keyboard came up under the viewer — keeps
+ *  what stood at its foot there rather than what stood at its top, so the answer being
+ *  replied to stays above the composer (docs/web.md § The agent panel). */
+let threadHeight = 0
+let threadResize: ResizeObserver | null = null
+
+function keepThreadFoot() {
+  const box = scroller.value
+  if (!box) {
+    return
+  }
+  if (box.clientHeight < threadHeight) {
+    box.scrollTop += threadHeight - box.clientHeight
+  }
+  threadHeight = box.clientHeight
+}
+
 /** Keeps the end in view as the thread grows, while it is followed. */
 watch(
   () => [items.value.length, events.value.length],
@@ -1887,6 +1904,10 @@ function ask(request: AskRequest): Promise<AskOutcome> {
 defineExpose({ ask, focus: () => composer.value?.focus() })
 
 onMounted(() => {
+  if (scroller.value) {
+    threadResize = new ResizeObserver(keepThreadFoot)
+    threadResize.observe(scroller.value)
+  }
   document.addEventListener('selectionchange', scheduleToolbar)
   window.addEventListener('pointerup', onPointerUp)
   // A drag that ends anywhere — dropped elsewhere, or cancelled — takes the zone with it.
@@ -1907,6 +1928,7 @@ onBeforeUnmount(() => {
   if (toolbarFrame) {
     cancelAnimationFrame(toolbarFrame)
   }
+  threadResize?.disconnect()
   document.removeEventListener('selectionchange', scheduleToolbar)
   window.removeEventListener('pointerup', onPointerUp)
   window.removeEventListener('dragend', endDrag)

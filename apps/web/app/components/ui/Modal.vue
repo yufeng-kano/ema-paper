@@ -192,7 +192,7 @@ onBeforeUnmount(() => {
     <div
       ref="overlay"
       class="overlay"
-      :class="{ full: size === 'full' }"
+      :class="{ full: size === 'full', keyboard }"
       :data-modal-above="above ? '' : undefined"
       @click.self="busy || persistent || emit('close')"
     >
@@ -330,9 +330,14 @@ onBeforeUnmount(() => {
 }
 
 /* While the on-screen keyboard is up: at the visual viewport's top, at its height, both set
-   inline (`useKeyboardFrame`). */
+   inline (`useKeyboardFrame`). The overlay is the paper meanwhile, not the scrim: the strip a
+   keyboard still sliding up leaves under the shorter box is then not the library. */
 .panel.full.keyboard {
   align-self: start;
+}
+
+.overlay.full.keyboard {
+  background: var(--paper);
 }
 
 /*
