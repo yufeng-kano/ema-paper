@@ -74,6 +74,8 @@ const { t } = useI18n()
 const overlay = ref<HTMLElement | null>(null)
 const panel = ref<HTMLElement | null>(null)
 provide(modalPanelKey, panel)
+/** The full-screen dialog — the reader — stands where the on-screen keyboard leaves room. */
+const keyboard = useKeyboardFrame(overlay, panel, props.size === 'full')
 const insideAbove = inject(modalAboveKey, false)
 provide(modalAboveKey, insideAbove || props.above)
 
@@ -197,7 +199,8 @@ onBeforeUnmount(() => {
       <div
         ref="panel"
         class="panel"
-        :class="[size, { tall }]"
+        :class="[size, { tall, keyboard }]"
+        :style="keyboard ? { marginTop: `${keyboard.top}px`, height: `${keyboard.height}px` } : undefined"
         role="dialog"
         aria-modal="true"
         :aria-label="title"
@@ -319,8 +322,17 @@ onBeforeUnmount(() => {
 }
 
 .panel.tall.full {
-  height: 100dvh;
+  /* The overlay's box — `position: fixed; inset: 0` — not `100dvh`: since Safari 26 a fixed
+     box ends at the top edge of the floating tab bar (docs/web.md § Result viewer, *On a phone
+     and a tablet*, *Safari's bottom bar*). */
+  height: 100%;
   max-height: none;
+}
+
+/* While the on-screen keyboard is up: at the visual viewport's top, at its height, both set
+   inline (`useKeyboardFrame`). */
+.panel.full.keyboard {
+  align-self: start;
 }
 
 /*
@@ -479,8 +491,8 @@ onBeforeUnmount(() => {
   .panel.md,
   .panel.lg {
     max-width: none;
-    /* `dvh`, not `vh`: the dynamic viewport shrinks when the on-screen keyboard opens, so a
-       focused field stays above it instead of being covered by it. */
+    /* `dvh`, not `vh`: the dynamic viewport follows the browser's own bars. It does not follow
+       the on-screen keyboard on iOS, which lays it over the page. */
     max-height: 92dvh;
     border-radius: var(--radius-xl) var(--radius-xl) 0 0;
     animation: sheet var(--duration-slow) var(--ease-enter);
