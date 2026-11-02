@@ -2344,8 +2344,15 @@ defineExpose({
 .rich :deep(.md-quote > p) {
   margin: 0;
   color: inherit;
-  font-size: inherit;
   line-height: inherit;
+}
+
+/* A list item and a cell set their surface's size; a quote does not, so its paragraph keeps
+   its own, as the rendered quote's does — not the editable root's, which a coarse pointer
+   raises to 16px. */
+.rich :deep(.md-list p),
+.rich :deep(.md-table p) {
+  font-size: inherit;
 }
 
 /* A table scrolls sideways in place, as the rendered one does inside its wrapper. */
@@ -2714,5 +2721,15 @@ defineExpose({
   padding: var(--space-1) var(--space-3) var(--space-2);
   color: var(--faint);
   font-size: var(--text-xs);
+}
+
+/* Safari on iOS zooms into a field smaller than 16px and leaves the page zoomed: the editable
+   root and the formula field are at least that under a coarse pointer (docs/web.md § Result
+   viewer, *On a phone and a tablet*). The blocks inside set their own sizes. */
+@media (pointer: coarse) {
+  .rich :deep(.rich-doc),
+  .math-input {
+    font-size: 16px;
+  }
 }
 </style>

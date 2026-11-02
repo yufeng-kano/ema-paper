@@ -596,4 +596,11 @@ function onRenameBlur() {
 .foot .mark {
   color: var(--muted);
 }
+
+/* Safari on iOS zooms into a field smaller than 16px. */
+@media (pointer: coarse) {
+  .row .rename {
+    font-size: 16px;
+  }
+}
 </style>

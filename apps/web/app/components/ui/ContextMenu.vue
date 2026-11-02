@@ -43,6 +43,9 @@ const props = defineProps<{
   /** Label/value rows under the header, for the facts one line cannot hold — the result
    *  viewer's parse details. */
   facts?: MenuFact[]
+  /** How many of the items stand above the header and the facts: the phone reader's *Find*,
+   *  first in its More menu (docs/web.md § Result viewer, *On a phone and a tablet*). */
+  lead?: number
   /**
    * Open with the first item already highlighted. For a menu opened from the keyboard, where
    * the highlight *is* the cursor — a pointer-opened menu highlights nothing until the
@@ -62,6 +65,12 @@ const emit = defineEmits<{
 }>()
 
 const menu = ref<HTMLElement | null>(null)
+/** Where the header and the facts stand among the items: first, or after the `lead` ones. */
+const FACTS = '\u0000facts'
+const rows = computed<(MenuItem | typeof FACTS)[]>(() => {
+  const lead = Math.min(props.lead ?? 0, props.items.length)
+  return [...props.items.slice(0, lead), FACTS, ...props.items.slice(lead)]
+})
 const modalPanel = inject(modalPanelKey, null)
 /** The facts are the menu's description: a static list inside a menu is otherwise skipped,
  *  since arrow keys move only between the items. */
@@ -378,43 +387,45 @@ function choose(item: MenuItem, event?: MouseEvent) {
       @keydown="onKeydown"
       @contextmenu.prevent
     >
-      <p v-if="header" class="header">{{ header }}</p>
-
-      <dl v-if="facts?.length" :id="factsId" class="facts">
-        <template v-for="fact in facts" :key="fact.label">
-          <dt>{{ fact.label }}</dt>
-          <dd :class="{ mono: fact.mono }">{{ fact.value }}</dd>
-        </template>
-      </dl>
-
       <!-- A destination is a real link: it can be opened in a new tab, and the locale items
-           are URLs rather than actions. -->
-      <component
-        :is="item.to ? NuxtLinkComponent : 'button'"
-        v-for="item in items"
-        :key="item.key"
-        v-bind="item.to ? { to: item.to } : { type: 'button', disabled: item.disabled }"
-        :role="item.checked === undefined ? 'menuitem' : 'menuitemradio'"
-        :aria-checked="item.checked"
-        :aria-haspopup="item.children ? 'menu' : undefined"
-        :aria-expanded="item.children ? subKey === item.key : undefined"
-        :data-key="item.key"
-        tabindex="-1"
-        class="item"
-        :class="{ danger: item.danger, separated: item.separated, open: subKey === item.key }"
-        :title="item.description ? `${item.label}: ${item.description}` : item.label"
-        @click="choose(item, $event)"
-        @pointerenter="onRowEnter(item)"
-        @pointerleave="cancelRest"
-      >
-        <UiIcon v-if="item.checked" name="check" />
-        <UiIcon v-else-if="item.icon" :name="item.icon" />
-        <span v-else class="icon-space" />
-        <span class="label" :class="{ mono: item.labelMono, described: item.description }">{{ item.label }}</span>
-        <span v-if="item.description" class="description">{{ item.description }}</span>
-        <span v-if="item.shortcut" class="shortcut" :class="{ mono: item.shortcutMono }">{{ item.shortcut }}</span>
-        <UiIcon v-if="item.children" name="chevron-right" class="chevron" />
-      </component>
+           are URLs rather than actions. The header and the facts stand before the items, or
+           after the `lead` ones. -->
+      <template v-for="item in rows" :key="item === FACTS ? FACTS : item.key">
+        <template v-if="item === FACTS">
+          <p v-if="header" class="header">{{ header }}</p>
+          <dl v-if="facts?.length" :id="factsId" class="facts">
+            <template v-for="fact in facts" :key="fact.label">
+              <dt>{{ fact.label }}</dt>
+              <dd :class="{ mono: fact.mono }">{{ fact.value }}</dd>
+            </template>
+          </dl>
+        </template>
+        <component
+          :is="item.to ? NuxtLinkComponent : 'button'"
+          v-else
+          v-bind="item.to ? { to: item.to } : { type: 'button', disabled: item.disabled }"
+          :role="item.checked === undefined ? 'menuitem' : 'menuitemradio'"
+          :aria-checked="item.checked"
+          :aria-haspopup="item.children ? 'menu' : undefined"
+          :aria-expanded="item.children ? subKey === item.key : undefined"
+          :data-key="item.key"
+          tabindex="-1"
+          class="item"
+          :class="{ danger: item.danger, separated: item.separated, open: subKey === item.key }"
+          :title="item.description ? `${item.label}: ${item.description}` : item.label"
+          @click="choose(item, $event)"
+          @pointerenter="onRowEnter(item)"
+          @pointerleave="cancelRest"
+        >
+          <UiIcon v-if="item.checked" name="check" />
+          <UiIcon v-else-if="item.icon" :name="item.icon" />
+          <span v-else class="icon-space" />
+          <span class="label" :class="{ mono: item.labelMono, described: item.description }">{{ item.label }}</span>
+          <span v-if="item.description" class="description">{{ item.description }}</span>
+          <span v-if="item.shortcut" class="shortcut" :class="{ mono: item.shortcutMono }">{{ item.shortcut }}</span>
+          <UiIcon v-if="item.children" name="chevron-right" class="chevron" />
+        </component>
+      </template>
     </div>
 
     <div

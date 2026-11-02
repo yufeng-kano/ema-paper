@@ -18,6 +18,10 @@ const props = defineProps<{
   actions: boolean
   /** A user-invocable `translate` skill exists: the row offers it. */
   translate: boolean
+  /** The phone's panel, this wide: rows a finger's height, their actions always drawn — a
+   *  finger has no hover to reveal them (docs/web.md § Result viewer, *On a phone and a
+   *  tablet*). */
+  wide?: number
 }>()
 
 const emit = defineEmits<{
@@ -56,7 +60,13 @@ defineExpose({ root, focusCurrent })
 </script>
 
 <template>
-  <div ref="root" class="panel" :style="{ maxHeight: `${props.maxHeight}px` }" @keydown="onKey">
+  <div
+    ref="root"
+    class="panel"
+    :class="{ wide: props.wide !== undefined }"
+    :style="{ maxHeight: `${props.maxHeight}px`, width: props.wide !== undefined ? `${props.wide}px` : undefined }"
+    @keydown="onKey"
+  >
     <p class="panel-head">{{ t('viewer.outline.title') }}</p>
     <ul class="rows">
       <li
@@ -236,5 +246,41 @@ defineExpose({ root, focusCurrent })
 .row-act > :deep(svg) {
   width: 15px;
   height: 15px;
+}
+
+/* A finger has no hover to reveal a row's actions. */
+@media (hover: none) {
+  .row-actions {
+    display: inline-flex;
+  }
+}
+
+/* The phone's panel: a finger's rows, the actions always there. */
+.panel.wide .row {
+  height: 44px;
+}
+
+.panel.wide .row-jump {
+  font-size: var(--text-base);
+}
+
+.panel.wide .row.current::before {
+  top: 12px;
+  bottom: 12px;
+}
+
+.panel.wide .row-actions {
+  display: inline-flex;
+  padding-right: 0;
+}
+
+.panel.wide .row-act {
+  width: 44px;
+  height: 44px;
+}
+
+.panel.wide .row-act > :deep(svg) {
+  width: 18px;
+  height: 18px;
 }
 </style>

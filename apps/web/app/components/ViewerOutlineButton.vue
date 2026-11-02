@@ -9,6 +9,10 @@
  * current row. Escape, a press elsewhere, focus leaving the button and the panel, a jump and
  * a row action close it, focus that was in the panel going back to the button.
  *
+ * On a phone the filename is the button (`filename`): it stands over the pane switch, and the
+ * panel opens under the header across the window, its rows a finger's height (docs/web.md
+ * § Result viewer, *On a phone and a tablet*).
+ *
  * While it is open the panel owns Escape (`data-escape-owner`), so the viewer's dialog does
  * not close under it — Safari focuses no pressed button, so a pointer opening can leave focus
  * on nothing and the key reaches the document.
@@ -18,7 +22,7 @@ import { dockOutlinePanel } from '~/lib/blocks'
 import type { OutlineEntry } from '~/lib/markdown'
 import { modalPanelKey } from '~/lib/menu'
 
-defineProps<{
+const props = defineProps<{
   entries: readonly OutlineEntry[]
   /** The current section, by outline index; null above the first heading. */
   current: number | null
@@ -26,6 +30,8 @@ defineProps<{
   actions: boolean
   /** A user-invocable `translate` skill exists: the row offers it. */
   translate: boolean
+  /** The phone's header: the button is this filename, and the panel spans the window. */
+  filename?: string
 }>()
 
 const emit = defineEmits<{
@@ -49,7 +55,10 @@ const panelId = useId()
 
 const open = ref(false)
 const place = ref({ top: 0, left: 0, maxHeight: 0 })
+/** The phone's panel: the window's width less its margins. */
+const panelWidth = ref(PANEL_WIDTH_PX)
 const button = ref<ComponentPublicInstance | null>(null)
+const fnameButton = ref<HTMLElement | null>(null)
 const nav = ref<HTMLElement | null>(null)
 const panel = ref<{ root: HTMLElement | null; focusCurrent: () => void } | null>(null)
 /** The pointer is down on the button or in the panel: the focus such a press takes is not the
@@ -58,6 +67,9 @@ const panel = ref<{ root: HTMLElement | null; focusCurrent: () => void } | null>
 let pressing = false
 
 function buttonEl(): HTMLElement | null {
+  if (fnameButton.value) {
+    return fnameButton.value
+  }
   const element: unknown = button.value?.$el
   return element instanceof HTMLElement ? element : null
 }
@@ -71,11 +83,19 @@ async function show(focusRow: boolean) {
   if (!box) {
     return
   }
-  place.value = dockOutlinePanel(
-    box,
-    { width: window.innerWidth, height: window.innerHeight },
-    { width: PANEL_WIDTH_PX, gap: GAP_PX, foot: FOOT_PX },
-  )
+  const view = { width: window.innerWidth, height: window.innerHeight }
+  if (props.filename !== undefined) {
+    // Under the whole header, not under the filename, which the pane switch stands under.
+    const head = buttonEl()?.closest('header')?.getBoundingClientRect() ?? box
+    panelWidth.value = view.width - 2 * GAP_PX
+    place.value = dockOutlinePanel(
+      { right: view.width - GAP_PX, bottom: head.bottom },
+      view,
+      { width: view.width - 2 * GAP_PX, gap: GAP_PX, foot: FOOT_PX },
+    )
+  } else {
+    place.value = dockOutlinePanel(box, view, { width: PANEL_WIDTH_PX, gap: GAP_PX, foot: FOOT_PX })
+  }
   open.value = true
   await nextTick()
   if (focusRow) {
@@ -191,7 +211,25 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
+  <button
+    v-if="filename !== undefined"
+    ref="fnameButton"
+    type="button"
+    class="fname"
+    :title="filename"
+    :aria-label="t('viewer.outline.filename', { name: filename })"
+    :aria-expanded="open ? 'true' : 'false'"
+    :aria-controls="open ? panelId : undefined"
+    @pointerdown="onPress"
+    @click="onClick"
+    @keydown="onButtonKey"
+    @focusout="onFocusOut"
+  >
+    <span class="fname-text">{{ filename }}</span>
+    <UiIcon name="chevron-down" />
+  </button>
   <UiButton
+    v-else
     ref="button"
     variant="ghost"
     icon-only
@@ -224,6 +262,7 @@ onBeforeUnmount(() => {
         :max-height="place.maxHeight"
         :actions="actions"
         :translate="translate"
+        :wide="filename !== undefined ? panelWidth : undefined"
         @jump="onJump"
         @translate="onTranslate"
         @context="onContext"
@@ -238,5 +277,38 @@ onBeforeUnmount(() => {
 .docked {
   position: fixed;
   z-index: 90;
+}
+
+/* The phone's filename: one line over the pane switch, its chevron saying it opens something. */
+.fname {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  max-width: 100%;
+  min-height: 22px;
+  padding: 0 var(--space-1);
+  border: 0;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.fname-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fname > :deep(svg) {
+  flex: none;
+  width: 13px;
+  height: 13px;
+  color: var(--muted);
 }
 </style>
