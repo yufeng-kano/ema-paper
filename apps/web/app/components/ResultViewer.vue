@@ -4351,7 +4351,9 @@ onMounted(() => {
   document.addEventListener('selectionchange', onSelectionChange)
   window.addEventListener('pointerdown', onWindowPointerDown, true)
   window.addEventListener('pointerup', onWindowPointerUp)
-  window.addEventListener('pointercancel', forgetChromePress)
+  // A press the browser takes over — a touch scroll, a long press that becomes the platform's
+  // own selection — never sends pointerup; it ends the surface's hold all the same.
+  window.addEventListener('pointercancel', onWindowPointerUp)
   window.addEventListener('dragover', onWindowDragOver)
   window.addEventListener('dragend', endDrag, true)
   coarseQuery = window.matchMedia('(pointer: coarse)')
@@ -4364,7 +4366,7 @@ onBeforeUnmount(() => {
   document.removeEventListener('selectionchange', onSelectionChange)
   window.removeEventListener('pointerdown', onWindowPointerDown, true)
   window.removeEventListener('pointerup', onWindowPointerUp)
-  window.removeEventListener('pointercancel', forgetChromePress)
+  window.removeEventListener('pointercancel', onWindowPointerUp)
   window.removeEventListener('dragover', onWindowDragOver)
   window.removeEventListener('dragend', endDrag, true)
   window.removeEventListener('pointermove', endCopyDrag)
@@ -5210,6 +5212,11 @@ watch(
   display: flex;
   flex-direction: column;
   gap: 20px;
+  /* A run longer than the column — a URL, an identifier in inline code, a long word — breaks
+     where it has to: the scroller never gets a sideways overflow, which a touch screen would
+     pan with the whole column (docs/web.md § Body margins). Code, formulas and tables keep
+     their lines and scroll in their own boxes. */
+  overflow-wrap: anywhere;
 }
 
 /* A block is a click target only when there is a document to write to; the cursor says
