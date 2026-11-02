@@ -114,6 +114,10 @@ const props = defineProps<{
   documentPages: () => ResultPageBlocks[]
   /** Where the heading of the section the document is scrolled to sits, if any. */
   currentSection: () => { page: number; index: number } | null
+  /** The head's close is drawn. Not on a phone, where the agent is a pane the viewer's switch
+   *  leaves rather than a card to close (docs/web.md § Result viewer, *On a phone and a
+   *  tablet*). */
+  closable?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -129,6 +133,8 @@ const emit = defineEmits<{
   'to-notes': [markdown: string]
   /** The head's close: the viewer hides the card. */
   close: []
+  /** Whether a turn is running, as it changes: the phone's Agent segment draws it. */
+  running: [running: boolean]
 }>()
 
 const { t, locale } = useI18n()
@@ -794,6 +800,7 @@ const items = computed(() => thread.value.items)
 
 /** A turn is in flight: the composer waits, and Stop is the one control. */
 const running = computed(() => thread.value.liveTurns.length > 0 || stream.active.value)
+watch(running, (now) => emit('running', now), { immediate: true })
 
 // --- what would refuse a send (docs/web.md § The agent panel) -------------------------
 
@@ -1932,7 +1939,7 @@ onBeforeUnmount(() => {
       <UiButton class="new" variant="ghost" icon-only :label="t('chat.newConversation')" @click="newConversation()">
         <template #icon><UiIcon name="square-pen" /></template>
       </UiButton>
-      <UiButton variant="ghost" icon-only :label="t('chat.closePanel')" @click="emit('close')">
+      <UiButton v-if="closable !== false" variant="ghost" icon-only :label="t('chat.closePanel')" @click="emit('close')">
         <template #icon><UiIcon name="panel-right-close" /></template>
       </UiButton>
     </div>
@@ -2991,5 +2998,12 @@ onBeforeUnmount(() => {
 .reply-item :deep(svg) {
   width: 13px;
   height: 13px;
+}
+
+/* Safari on iOS zooms into a field smaller than 16px. */
+@media (pointer: coarse) {
+  .user-editor-input {
+    font-size: 16px;
+  }
 }
 </style>

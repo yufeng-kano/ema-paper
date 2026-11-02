@@ -45,6 +45,13 @@ const props = withDefaults(
      * (docs/web.md § Result viewer).
      */
     back?: boolean
+    /** The back button's name where it does something else than close — on a phone's reader,
+     *  going back to the text from another pane (docs/web.md § Result viewer, *On a phone and
+     *  a tablet*). */
+    backLabel?: string
+    /** The header's two lines — the reader's filename over its pane switch on a phone — in the
+     *  height of one row of controls: less padding above and below. */
+    compact?: boolean
     /**
      * No close button, and Escape and the scrim do nothing: the footer's button is the only
      * way out — for what a stray key must not lose, the console's codes shown once
@@ -58,7 +65,7 @@ const props = withDefaults(
      */
     above?: boolean
   }>(),
-  { size: 'sm' },
+  { size: 'sm', backLabel: undefined },
 )
 
 const emit = defineEmits<{ close: [] }>()
@@ -90,8 +97,9 @@ function focusables(): HTMLElement[] {
   if (!panel.value) {
     return []
   }
+  // An inert region — a pane of the phone's reader that is not shown — takes no focus.
   return [...panel.value.querySelectorAll<HTMLElement>(FOCUSABLE)].filter(
-    (el) => el.offsetParent !== null || el === document.activeElement,
+    (el) => (el.offsetParent !== null && !el.closest('[inert]')) || el === document.activeElement,
   )
 }
 
@@ -195,7 +203,7 @@ onBeforeUnmount(() => {
         :aria-label="title"
         tabindex="-1"
       >
-        <header class="panel-head" :class="{ back }">
+        <header class="panel-head" :class="{ back, compact }">
           <UiButton
             v-if="back"
             class="panel-back"
@@ -203,7 +211,7 @@ onBeforeUnmount(() => {
             size="lg"
             icon-only
             :disabled="busy"
-            :label="t('common.close')"
+            :label="backLabel ?? t('common.close')"
             @click="emit('close')"
           >
             <template #icon><UiIcon name="chevron-left" /></template>
@@ -352,6 +360,10 @@ onBeforeUnmount(() => {
 
 .panel-head.back .panel-heading {
   text-align: center;
+}
+
+.panel-head.back.compact {
+  padding: var(--space-2) var(--space-4);
 }
 
 .panel-head.back .panel-actions {

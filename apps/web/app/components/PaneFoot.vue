@@ -15,13 +15,16 @@ const props = defineProps<{
   hint: boolean
   /** The pill's text — *Back to “1 Introduction”* — or null while there is no way back. */
   back: string | null
-  /** The status note, and whether it carries *Undo*. */
-  note: { text: string; undo: boolean } | null
+  /** The status note, whether it carries *Undo*, and whether *View* — the phone's excerpt
+   *  quoted into the notes, which are another pane (docs/web.md § Result viewer, *On a phone
+   *  and a tablet*). */
+  note: { text: string; undo: boolean; view?: boolean } | null
 }>()
 
 const emit = defineEmits<{
   back: []
   undo: []
+  view: []
   /** The pointer rests on the note, which holds it past its time; false as it leaves. */
   hold: [held: boolean]
 }>()
@@ -67,10 +70,15 @@ defineExpose({ root })
       @pointerleave="emit('hold', false)"
     >
       <span>{{ props.note.text }}</span>
+      <template v-if="props.note.view">
+        <span class="hint-rule" aria-hidden="true">·</span>
+        <button type="button" class="note-undo" @click="emit('view')">{{ t('viewer.note.view') }}</button>
+      </template>
       <template v-if="props.note.undo">
         <span class="hint-rule" aria-hidden="true">·</span>
         <button type="button" class="note-undo" @click="emit('undo')">
-          {{ t('viewer.note.undo', { keys: label('mod+z') }) }}
+          <span class="fine">{{ t('viewer.note.undo', { keys: label('mod+z') }) }}</span>
+          <span class="coarse">{{ t('viewer.note.undoTouch') }}</span>
         </button>
       </template>
     </p>
@@ -182,10 +190,23 @@ defineExpose({ root })
   white-space: nowrap;
 }
 
-/* A coarse pointer has no keyboard to name a key of. */
+/* A coarse pointer has no keyboard to name a key of, and needs a finger's height to press. */
 @media (pointer: coarse) {
   .pill-key {
     display: none;
+  }
+
+  .pill {
+    height: 44px;
+    padding: 0 var(--space-4);
+  }
+
+  .note {
+    padding-block: 0;
+  }
+
+  .note-undo {
+    min-height: 44px;
   }
 }
 
@@ -216,5 +237,19 @@ defineExpose({ root })
 
 .note-undo:hover {
   text-decoration-color: currentcolor;
+}
+
+.note-undo .coarse {
+  display: none;
+}
+
+@media (pointer: coarse) {
+  .note-undo .fine {
+    display: none;
+  }
+
+  .note-undo .coarse {
+    display: inline;
+  }
 }
 </style>

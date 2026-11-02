@@ -34,7 +34,7 @@ import {
   type NameText,
   type UndoFile,
 } from '~/lib/blocks'
-import { COLUMN_WIDTHS, collapses, type Column } from '~/lib/columns'
+import { COLUMN_WIDTHS, collapses, shownCards, viewerLayout, type Column, type ViewerLayout } from '~/lib/columns'
 import { formatBytes, isImageFile, type AskRequest } from '~/lib/composer'
 import { cellGroupsToMarkdown, nodesToMarkdown, selectionText, type OrphanListContext } from '~/lib/copy'
 import { ANSWER_DRAG_TYPE, BLOCK_DRAG_TYPE, carriesFiles, claimDrag, dragClaim, droppedFiles, setDropEffect } from '~/lib/dnd'
@@ -139,6 +139,14 @@ const FADE_MS = 240
 
 /** A press on a handle that closed that handle's own menu: its click must not open it again. */
 const REOPEN_GUARD_MS = 300
+
+/** How many times a finger's first tap says a second one edits, counted in the browser
+ *  (docs/web.md § Result viewer, *On a phone and a tablet*, *Two taps to edit*). */
+const TAP_HINT_KEY = 'sightread.viewer.tapHints'
+const TAP_HINTS = 3
+
+/** A pane of the phone's reader. */
+type Pane = 'document' | 'notes' | 'agent'
 
 /** A run of visible rows, by index into the rows. */
 type RowRange = { from: number; to: number }
@@ -841,15 +849,60 @@ function onBlockPress(event: MouseEvent, pageIndex: number, blockIndex: number) 
   pressed = { page: pageIndex, index: blockIndex + shift, src: block.src, dx: event.clientX - rect.left, dy: event.clientY - rect.top }
 }
 
+/**
+ * A finger's press, read as it begins (`onWindowPointerDown`), before the press clears the block
+ * selection: whether it is a finger's at all, the block a finger's earlier tap selected — a
+ * second tap there opens it — and whether a native text selection stood, which the tap only
+ * ends (docs/web.md § Result viewer, *On a phone and a tablet*, *Two taps to edit*).
+ */
+let pressTouch = false
+let tapArmed: string | null = null
+let tapEnds = false
+/** The block a finger's tap selected, as against one a menu or the keyboard selected. */
+let tapSelected: string | null = null
+
+function notePress(event: PointerEvent) {
+  pressTouch = event.pointerType === 'touch'
+  const held = blockSelection.value
+  tapArmed = pressTouch && held && !held.keyboard && held.anchor === held.head && held.anchor === tapSelected ? held.anchor : null
+  const native = window.getSelection()
+  tapEnds = pressTouch && native !== null && !native.isCollapsed
+}
+
+/** A finger's first tap: the block selected — its wash and its handle, no editor, no keyboard —
+ *  and, the first few times, the note that a second tap edits. */
+function selectByTap(key: string) {
+  selectKeys([key], false)
+  tapSelected = key
+  scroller.value?.querySelector<HTMLElement>(`[data-block="${key}"]`)?.focus({ preventScroll: true })
+  let shown = TAP_HINTS
+  try {
+    shown = Number(localStorage.getItem(TAP_HINT_KEY) ?? 0) || 0
+    if (shown < TAP_HINTS) {
+      localStorage.setItem(TAP_HINT_KEY, String(shown + 1))
+    }
+  } catch {
+    // Storage blocked: the note is not shown rather than shown on every tap.
+  }
+  if (shown < TAP_HINTS) {
+    showNote(t('viewer.note.tapAgain'), false)
+  }
+}
+
 /** A click opens the pressed block with the caret where the press landed in it; a drag that
  *  selected text opens what it selected. Opened on the release, listened for on the whole
  *  pane: when the write-back re-renders the pressed block between press and release, the
- *  browser sends no click at all. */
+ *  browser sends no click at all. A finger reads: its first tap selects the block, its second
+ *  opens it, and a selection it made stays read-only. */
 function onBlockClick() {
   const press = pressed
   pressed = null
   const selection = window.getSelection()
-  if (selection && !selection.isCollapsed && selection.rangeCount > 0) {
+  if (pressTouch) {
+    if (tapEnds || (selection && !selection.isCollapsed)) {
+      return
+    }
+  } else if (selection && !selection.isCollapsed && selection.rangeCount > 0) {
     openSelection(selection)
     return
   }
@@ -864,6 +917,11 @@ function onBlockClick() {
     }
   }
   if (index === -1) {
+    return
+  }
+  const key = blockKey({ page: press.page, index })
+  if (pressTouch && tapArmed !== key) {
+    selectByTap(key)
     return
   }
   const element = scroller.value?.querySelector(`[data-block="${press.page}-${index}"]`)
@@ -2144,7 +2202,13 @@ function stepUndo(direction: 'undo' | 'redo', keyboard: boolean) {
     const range = step.ranges[0] ?? { start: 0, end: 0 }
     const first = blockIndexAt(step.text, range.start)
     const last = blockIndexAt(step.text, Math.max(range.start, range.end - 1))
-    void revealNotes(range.start, last - first + 1, false)
+    if (phone.value && !notesShown.value) {
+      // The notes are another pane: a quote undone from the text leaves the reader there
+      // (docs/web.md § Result viewer, *On a phone and a tablet*).
+      notesNew.value = direction === 'redo'
+    } else {
+      void revealNotes(range.start, last - first + 1, false)
+    }
   }
   showNote(t(direction === 'undo' ? 'viewer.note.undone' : 'viewer.note.redone'), false)
 }
@@ -2173,21 +2237,35 @@ function onPaneKey(event: KeyboardEvent) {
 }
 
 /** The one line at the pane's foot an action with nothing else to show confirms in. */
-const statusNote = ref<{ text: string; undo: boolean } | null>(null)
+const statusNote = ref<{ text: string; undo: boolean; view?: boolean } | null>(null)
 let noteTimer: ReturnType<typeof setTimeout> | undefined
 let noteHeld = false
+/** Where the note's *View* leads: the excerpt a phone quoted into the notes, another pane. */
+let noteView: { at: number; count: number } | null = null
 
-function showNote(text: string, undoable: boolean) {
-  statusNote.value = { text, undo: undoable }
+function showNote(text: string, undoable: boolean, view: { at: number; count: number } | null = null) {
+  noteView = view
+  statusNote.value = { text, undo: undoable, view: view !== null }
   announce(text)
   timeNote()
+}
+
+/** The note's *View*: the notes, on what the note was about. */
+function viewNoted() {
+  const view = noteView
+  clearTimeout(noteTimer)
+  statusNote.value = null
+  noteView = null
+  if (view) {
+    void revealNotes(view.at, view.count, false)
+  }
 }
 
 function timeNote() {
   clearTimeout(noteTimer)
   const note = statusNote.value
   if (note && !noteHeld) {
-    noteTimer = setTimeout(() => (statusNote.value = null), note.undo ? NOTE_UNDO_MS : NOTE_MS)
+    noteTimer = setTimeout(() => (statusNote.value = null), note.undo || note.view ? NOTE_UNDO_MS : NOTE_MS)
   }
 }
 
@@ -2201,9 +2279,9 @@ function holdNote(held: boolean) {
   }
 }
 
-/** A note carrying *Undo* stays until the reader's next action. */
+/** A note carrying *Undo* or *View* stays until the reader's next action. */
 function hideUndoNote() {
-  if (statusNote.value?.undo) {
+  if (statusNote.value?.undo || statusNote.value?.view) {
     clearTimeout(noteTimer)
     statusNote.value = null
   }
@@ -2543,6 +2621,7 @@ let coarseQuery: MediaQueryList | null = null
 
 function onCoarseChange(change: MediaQueryListEvent) {
   coarse.value = change.matches
+  layout.value = readLayout()
 }
 
 /** A primary press on a surface hides the toolbar and holds it until the release. A press on
@@ -2720,11 +2799,6 @@ function onNotesToolbarAction(action: 'ask' | 'copy') {
 }
 
 /** The notes closed: a toolbar over them has nothing to stand over. */
-watch(notesOpen, (open) => {
-  if (!open && toolbar.value?.where === 'notes') {
-    toolbar.value = null
-  }
-})
 
 /** The toolbar follows its selection as its surface scrolls or is resized. */
 function repositionToolbar() {
@@ -2798,7 +2872,17 @@ function commitOpenEditor(focusKey: string | null): string | null {
  */
 async function askAgent(request: AskRequest, focusKey: string | null) {
   const focus = commitOpenEditor(focusKey)
-  agentOpen.value = true
+  // On a phone an ask that waits in the composer shows the agent; one that sends at once leaves
+  // the reader where they asked, the switch saying the agent is at work (docs/web.md § Result
+  // viewer, *On a phone and a tablet*).
+  if (phone.value) {
+    agentKept.value = true
+    if (!request.send) {
+      await showPane('agent')
+    }
+  } else {
+    openColumn('agent')
+  }
   let next = request
   if (request.send && !(await flushSaves())) {
     next = { ...request, send: false }
@@ -2809,7 +2893,11 @@ async function askAgent(request: AskRequest, focusKey: string | null) {
     const n = limits.value?.sections_per_message ?? 0
     showNote(t('viewer.note.sectionsMax', { n }, n), false)
   }
-  if (outcome !== 'focused' && focus !== null) {
+  // A sending ask that did not go waits in the composer, where the reader has to see it.
+  if (phone.value && request.send && outcome !== 'sent') {
+    await showPane('agent')
+  }
+  if (outcome !== 'focused' && focus !== null && documentShown.value) {
     focusBlock(focus)
   }
   return outcome
@@ -2818,7 +2906,7 @@ async function askAgent(request: AskRequest, focusKey: string | null) {
 /** *Ask the agent* from a notes block's menu (docs/web.md § Notes, *The menu*): the unit's
  *  markdown as the selection; the notes take focus back when the composer did not take it. */
 async function onNotesAsk(markdown: string, refocus: () => void) {
-  if ((await askAgent({ selection: markdown }, null)) !== 'focused') {
+  if ((await askAgent({ selection: markdown }, null)) !== 'focused' && notesShown.value) {
     refocus()
   }
 }
@@ -2844,12 +2932,24 @@ function quoteInNotes(text: string, at: BlockAt) {
   const heading = sectionOf(outline.value, at)
   const excerpt = excerptMarkdown(passage, heading ? { text: heading.text, slug: heading.slug } : null, t('viewer.excerpt.beginning'))
   const appended = appendExcerpt(notes.value, passage, excerpt, `## ${t('viewer.excerpt.heading')}`)
+  // On a phone the notes are another pane: the reader stays in the text, and the note says
+  // where the excerpt went, with the way to it (docs/web.md § Result viewer, *On a phone and a
+  // tablet*).
   if (appended.duplicate) {
+    if (phone.value) {
+      showNote(t('viewer.note.alreadyInNotes'), false, { at: appended.at, count: 2 })
+      return
+    }
     void revealNotes(appended.at, 2, false)
     showNote(t('viewer.note.alreadyInNotes'), false)
     return
   }
   applyNotes(appended.notes)
+  if (phone.value) {
+    notesNew.value = true
+    showNote(t('viewer.note.addedToNotes'), true, { at: appended.at, count: 2 })
+    return
+  }
   void revealNotes(appended.at, 2, false)
 }
 
@@ -2861,13 +2961,24 @@ function addToNotes(text: string) {
     return
   }
   applyNotes(appended.notes)
+  // On a phone the reader stays with the agent; the switch says the notes have something new.
+  if (phone.value) {
+    notesNew.value = true
+    return
+  }
   void revealNotes(appended.at, appended.count, false)
 }
 
 /** Opens the notes on the blocks starting at `at`, washed once — and with `focus`, the caret
  *  at their start, so what the keyboard reached is read out. */
 async function revealNotes(at: number, count: number, focus: boolean) {
-  notesOpen.value = true
+  if (phone.value) {
+    await showPane('notes')
+    // Drawn before it is washed, so the wash is seen.
+    await new Promise((done) => requestAnimationFrame(done))
+  } else {
+    openColumn('notes')
+  }
   await nextTick()
   const index = blockIndexAt(notes.value, at)
   notesEditor.value?.wash(index, Math.max(1, count))
@@ -3002,9 +3113,11 @@ async function locateLink(target: SectionLinkTarget) {
     // A block reference: revealed as opening its address does.
     const at = resolveAnchor(pages.value, readBlockAnchor(target.anchor), outline.value)
     if (at && placedIndex.value.has(blockKey(at))) {
+      const from = await toText()
       setWayBack()
       pressLink(target)
       await revealBlock(at)
+      paneWayBack(from)
       armWayBack()
     }
     return
@@ -3015,6 +3128,7 @@ async function locateLink(target: SectionLinkTarget) {
   if (!box || (!found && !heading && target.anchor !== '')) {
     return
   }
+  const from = await toText()
   setWayBack()
   pressLink(target)
   if (found && target.passage !== null) {
@@ -3038,6 +3152,7 @@ async function locateLink(target: SectionLinkTarget) {
   } else {
     box.scrollTop = 0
   }
+  paneWayBack(from)
   armWayBack()
 }
 
@@ -3129,6 +3244,10 @@ function documentPages() {
  *  it lies outside the document pane. Read off a clone of the range, so each formula goes
  *  as its TeX rather than as KaTeX's glyphs (`selectionText`). */
 function documentSelection(): string | null {
+  // A passage left selected behind another pane is never sent unseen.
+  if (!documentShown.value) {
+    return null
+  }
   const selection = window.getSelection()
   const box = scroller.value
   if (!selection || selection.isCollapsed || !box || selection.rangeCount === 0) {
@@ -3232,8 +3351,10 @@ async function locateSection(target: { label: string; anchor: string }) {
   if (target.anchor.includes('~')) {
     const at = resolveAnchor(pages.value, readBlockAnchor(target.anchor), outline.value)
     if (at && placedIndex.value.has(blockKey(at))) {
+      const from = await toText()
       setWayBack()
       await revealBlock(at)
+      paneWayBack(from)
       armWayBack()
     }
     return
@@ -3242,8 +3363,10 @@ async function locateSection(target: { label: string; anchor: string }) {
   if (!heading) {
     return
   }
+  const from = await toText()
   setWayBack()
   await showHeading(heading, true)
+  paneWayBack(from)
   armWayBack()
 }
 
@@ -3252,7 +3375,16 @@ async function locateSection(target: { label: string; anchor: string }) {
 /** Where the reader was before the last jump: the block at the pane's top and how far into it,
  *  found again by its source — the jump may have opened a fold above it. `key` is empty for a
  *  place given as a scroll offset alone. */
-const wayBack = ref<{ key: string; src: string; offset: number; label: string } | null>(null)
+const wayBack = ref<{
+  key: string
+  src: string
+  offset: number
+  label: string
+  /** On a phone, a jump from another pane leads back to that pane, not to a place in the text;
+   *  `landing` is where the jump left the text, which the pill stays near. */
+  pane?: 'notes' | 'agent'
+  landing?: number
+} | null>(null)
 /** Set a frame after the jump's own scroll, so that scroll does not count as the reader's. */
 let wayBackArmed = false
 
@@ -3339,6 +3471,10 @@ async function goBack() {
   if (!back || !box) {
     return
   }
+  if (back.pane) {
+    void showPane(back.pane)
+    return
+  }
   const key = wayBackKey(back)
   const at = key ? placedIndex.value.get(key) : undefined
   if (at !== undefined) {
@@ -3360,6 +3496,13 @@ function checkWayBack() {
   const back = wayBack.value
   const box = scroller.value
   if (!back || !wayBackArmed || !box) {
+    return
+  }
+  // A way back to another pane goes once the reader has read on from where the link led.
+  if (back.pane) {
+    if (Math.abs(box.scrollTop - (back.landing ?? 0)) > box.clientHeight) {
+      wayBack.value = null
+    }
     return
   }
   const top = wayBackTop(back)
@@ -3467,8 +3610,10 @@ async function jumpToHeading(index: number) {
   if (!entry) {
     return
   }
+  const from = await toText()
   setWayBack()
   await showHeading(entry, false)
+  paneWayBack(from)
   armWayBack()
 }
 
@@ -3588,6 +3733,228 @@ watch(
   { flush: 'sync', immediate: true },
 )
 
+// --- the layout: phone, tablet, desktop --------------------------------------------------------
+
+/** The window's layout (docs/web.md § Result viewer, *On a phone and a tablet*): read at once —
+ *  Files renders on the client, so the first paint is already the right one — and again as the
+ *  window changes size. */
+function readLayout(): ViewerLayout {
+  if (!import.meta.client) {
+    return 'desktop'
+  }
+  return viewerLayout({ width: window.innerWidth, height: window.innerHeight }, window.matchMedia('(pointer: coarse)').matches)
+}
+
+const layout = ref<ViewerLayout>(readLayout())
+const phone = computed(() => layout.value === 'phone')
+/** The pane a phone shows. Not remembered: a phone opens on the text. */
+const pane = ref<Pane>('document')
+/** The agent was mounted on a phone: it stays mounted — its draft, its attachments — until the
+ *  viewer closes or its card's close button closes it, whatever the layout does meanwhile. */
+const agentKept = ref(false)
+/** On a tablet, the card in front where both are open. */
+const front = ref<Column>('agent')
+/** What the phone's switch marks: a turn running, an answer or a failure not yet seen, notes
+ *  added from another pane. */
+const agentRunning = ref(false)
+const agentNew = ref(false)
+const notesNew = ref(false)
+const uid = useId()
+
+const cardsShown = computed(() => shownCards(layout.value, { notes: notesOpen.value, agent: agentOpen.value }, front.value))
+/** The notes are mounted with the editable copy on a phone, where they are a pane; the agent the
+ *  first time it is shown or asked, then kept. */
+const notesMounted = computed(() => editable.value && (notesOpen.value || phone.value))
+const agentMounted = computed(() => editable.value && props.documentId !== null && (agentOpen.value || agentKept.value))
+/** What shows: a phone's one pane; elsewhere the document, and each card shown beside it. */
+const documentShown = computed(() => !phone.value || pane.value === 'document')
+const notesShown = computed(() => (phone.value ? pane.value === 'notes' : cardsShown.value.notes))
+const agentShown = computed(() => (phone.value ? pane.value === 'agent' : cardsShown.value.agent))
+
+/** The phone's switch: the text always, the notes and the agent wherever the document can
+ *  become editable — drawn from the first paint, disabled until it is. Not on the original. */
+const paneTabs = computed(() => {
+  if (!phone.value || tab.value !== 'markdown' || props.documentId === null) {
+    return []
+  }
+  return [
+    { key: 'document' as const, label: t('viewer.panes.text'), name: t('viewer.panes.text'), disabled: false, mark: false },
+    {
+      key: 'notes' as const,
+      label: t('viewer.panes.notes'),
+      name: notesNew.value ? t('viewer.panes.notesNew') : t('viewer.panes.notes'),
+      disabled: !editable.value,
+      mark: notesNew.value,
+    },
+    {
+      key: 'agent' as const,
+      label: t('viewer.panes.agent'),
+      name: agentRunning.value
+        ? t('viewer.panes.agentRunning')
+        : agentNew.value
+          ? t('viewer.panes.agentNew')
+          : t('viewer.panes.agent'),
+      disabled: !editable.value,
+      mark: agentNew.value,
+    },
+  ]
+})
+
+/** A card opened beside the document — in front of the other, on a tablet. */
+function openColumn(column: Column) {
+  if (column === 'notes') {
+    notesOpen.value = true
+  } else {
+    agentOpen.value = true
+  }
+  front.value = column
+}
+
+/** The header's Notes and Agent toggles: a card shown closes, any other opens in front. */
+function toggleColumn(column: Column) {
+  if (!cardsShown.value[column]) {
+    openColumn(column)
+  } else if (column === 'notes') {
+    notesOpen.value = false
+  } else {
+    closeAgent()
+  }
+}
+
+/** The agent card's close: the panel goes, and with it what a phone kept. */
+function closeAgent() {
+  agentOpen.value = false
+  agentKept.value = false
+}
+
+/** The notes went out of sight: a toolbar over them has nothing to stand over. */
+watch(notesShown, (open) => {
+  if (!open && toolbar.value?.where === 'notes') {
+    toolbar.value = null
+  }
+})
+
+// A card closed shows the one behind it; a card opened is in front.
+watch(notesOpen, (open) => (front.value = open ? 'notes' : 'agent'))
+watch(agentOpen, (open) => (front.value = open ? 'agent' : 'notes'))
+
+/**
+ * Shows a phone's pane. Leaving the text takes its selection and toolbar with it, so nothing
+ * reads a passage the reader can no longer see; the agent is mounted as it is first shown, and
+ * a pane shown has nothing unseen any more.
+ */
+async function showPane(next: Pane) {
+  if (next === pane.value) {
+    return
+  }
+  const box = scroller.value
+  const selection = window.getSelection()
+  if (pane.value === 'document' && box && selection?.rangeCount && box.contains(selection.anchorNode)) {
+    selection.removeAllRanges()
+  }
+  toolbar.value = null
+  if (next === 'agent') {
+    agentKept.value = true
+    agentNew.value = false
+  } else if (next === 'notes') {
+    notesNew.value = false
+  }
+  pane.value = next
+  await nextTick()
+}
+
+/** A segment pressed: a switch made with the control ends a way back to another pane. */
+function pickPane(next: Pane) {
+  if (wayBack.value?.pane) {
+    wayBack.value = null
+  }
+  void showPane(next)
+}
+
+/** ← and → move along the switch, as a tab list's keys do. */
+function onPaneTabKey(event: KeyboardEvent) {
+  if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') {
+    return
+  }
+  event.preventDefault()
+  const tabs = paneTabs.value.filter((entry) => !entry.disabled)
+  const at = tabs.findIndex((entry) => entry.key === pane.value)
+  const next = tabs[(at + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length]
+  if (next) {
+    pickPane(next.key)
+    void nextTick(() => document.getElementById(`${uid}-tab-${next.key}`)?.focus())
+  }
+}
+
+/** On a phone, a jump to the text from another pane: the text shown and drawn, so the wash that
+ *  follows is seen, and the pane the reader came from — the way back. */
+async function toText(): Promise<'notes' | 'agent' | null> {
+  if (!phone.value || pane.value === 'document') {
+    return null
+  }
+  const from = pane.value
+  await showPane('document')
+  await new Promise((done) => requestAnimationFrame(done))
+  return from
+}
+
+/** The way back to the pane a jump came from, offered once the jump has landed. */
+function paneWayBack(from: 'notes' | 'agent' | null) {
+  if (from) {
+    wayBack.value = { key: '', src: '', offset: 0, label: t(`viewer.back.${from}`), pane: from, landing: scroller.value?.scrollTop ?? 0 }
+  }
+}
+
+/** The back button and Escape: on a phone's other pane, back to the text; else the viewer
+ *  closes. */
+function onBack() {
+  if (phone.value && pane.value !== 'document' && tab.value === 'markdown') {
+    void showPane('document')
+    return
+  }
+  emit('close')
+}
+
+/**
+ * The layout changed under an open viewer — a rotation, a Split View resize. Leaving the phone,
+ * the pane that showed opens as its card, and a kept agent stays mounted behind; entering it,
+ * the pane holding focus shows, else the text.
+ */
+watch(layout, (now, before) => {
+  if (before === 'phone' && now !== 'phone') {
+    if (pane.value !== 'document') {
+      openColumn(pane.value)
+    }
+    pane.value = 'document'
+  } else if (now === 'phone' && before !== 'phone') {
+    const active = document.activeElement
+    const card = active instanceof Element ? active.closest('aside.card') : null
+    pane.value = card?.classList.contains('notes') ? 'notes' : card?.classList.contains('agent') ? 'agent' : 'document'
+    if (pane.value === 'agent') {
+      agentKept.value = true
+    }
+  }
+  toolbar.value = null
+  void nextTick(measureGutter)
+})
+
+function onWindowResize() {
+  layout.value = readLayout()
+}
+
+// The switch's marks: an answer — or a failure — that ended while the agent was not shown; and
+// no turn running once the panel is gone.
+watch(agentRunning, (now, before) => {
+  if (before && !now && phone.value && pane.value !== 'agent') {
+    agentNew.value = true
+  }
+})
+watch(agentMounted, (mounted) => {
+  if (!mounted) {
+    agentRunning.value = false
+  }
+})
+
 // --- column widths -----------------------------------------------------------------------
 
 const columnsBox = ref<HTMLElement | null>(null)
@@ -3622,7 +3989,7 @@ watch(columnsBox, (box) => {
 /** Clamped from the chosen width, never from the width the window last allowed: a card the
  *  window narrowed grows back as it widens, and a step picked in Settings shows at once. The
  *  card being dragged follows the pointer instead. */
-watch([columnsWidth, notesOpen, agentOpen, () => chosenWidth.notes, () => chosenWidth.agent], () => {
+watch([columnsWidth, cardsShown, () => chosenWidth.notes, () => chosenWidth.agent], () => {
   for (const column of ['notes', 'agent'] as const) {
     if (resizing.value?.column !== column) {
       setColumnWidth(column, chosenWidth[column])
@@ -3634,10 +4001,10 @@ watch([columnsWidth, notesOpen, agentOpen, () => chosenWidth.notes, () => chosen
  *  pane its minimum beside the other column. */
 function columnMax(column: Column): number {
   const other = column === 'notes' ? 'agent' : 'notes'
-  const otherOpen = other === 'notes' ? notesOpen.value : agentOpen.value
+  const otherOpen = cardsShown.value[other]
   const total = columnsWidth.value
-  // Each open card takes its inset from the window's edge and its grip's gap beside it.
-  const gaps = ((notesOpen.value ? 2 : 0) + (agentOpen.value ? 2 : 0)) * CARD_GAP
+  // Each card shown takes its inset from the window's edge and its grip's gap beside it.
+  const gaps = ((cardsShown.value.notes ? 2 : 0) + (cardsShown.value.agent ? 2 : 0)) * CARD_GAP
   const room = total - PANE_MIN_WIDTH - gaps - (otherOpen ? columnWidth[other].value : 0)
   return Math.max(COLUMN_WIDTHS[column].min, Math.min(COLUMN_WIDTHS[column].max, room))
 }
@@ -3749,7 +4116,7 @@ async function closeColumn(column: Column) {
   if (column === 'notes') {
     notesOpen.value = false
   } else {
-    agentOpen.value = false
+    closeAgent()
   }
   await nextTick()
   if (!document.activeElement || document.activeElement === document.body) {
@@ -3785,6 +4152,9 @@ const findOpen = ref(false)
 const find = ref<{ focus: () => void } | null>(null)
 
 async function openFind() {
+  if (phone.value) {
+    await showPane('document')
+  }
   findOpen.value = true
   await nextTick()
   find.value?.focus()
@@ -3833,6 +4203,8 @@ let documentScroll = 0
 watch(tab, async (view) => {
   if (view === 'original') {
     documentScroll = scroller.value?.scrollTop ?? 0
+    // The original is the file alone; the Markdown view comes back on the text.
+    pane.value = 'document'
     findOpen.value = false
     commitEdit()
     wayBack.value = null
@@ -3914,15 +4286,23 @@ const parseFacts = computed<MenuFact[]>(() => {
 /** The facts over the views: the parse's, or the row's while the file is not converted. */
 const moreFacts = computed<MenuFact[]>(() => (props.converted ? parseFacts.value : props.facts))
 
+/** More holds Find on a phone's Markdown view, above the facts. */
+const moreFind = computed(() => phone.value && tab.value === 'markdown')
+
 /** Whether More has what its menu is made of: the result, for a converted document — a menu
  *  that grew under the pointer when the facts arrived would no longer fit where it was
- *  placed — and, for a file not yet converted, its row's facts, which it has at once. */
-const moreReady = computed(() => (props.converted ? props.result !== null : true))
+ *  placed — and, for a file not yet converted, its row's facts, which it has at once. A
+ *  markdown document has no parse to wait for and nothing to choose, so its More stays
+ *  disabled, except on a phone, where it holds Find. */
+const moreReady = computed(() => (props.markdownDocument ? moreFind.value : props.converted ? props.result !== null : true))
 
 /** The two views, as a pair of choices (docs/web.md § Result viewer, *Original and
  *  Markdown*): Original is disabled where no original was kept, with the reason under it;
  *  Markdown, on a file not yet converted, is the conversion. */
 const moreItems = computed<MenuItem[]>(() => [
+  // On a phone Find leaves the header for More, first (docs/web.md § Result viewer, *On a
+  // phone and a tablet*).
+  ...(moreFind.value ? [{ key: 'find', label: t('viewer.findLabel'), icon: 'search' as const }] : []),
   {
     key: 'original',
     label: t('viewer.view.original'),
@@ -3941,6 +4321,10 @@ const moreItems = computed<MenuItem[]>(() => [
 ])
 
 function onMoreSelect(key: string) {
+  if (key === 'find') {
+    void openFind()
+    return
+  }
   if (key === 'markdown' && !props.converted) {
     if (props.convertible) {
       emit('convert')
@@ -4334,6 +4718,7 @@ const awaitingContent = computed(() => contentWanted.value && !contentLoaded.val
 /** A press anywhere: the reader's next action, which a note carrying *Undo* waited for — and,
  *  outside the viewer's own controls and menus, the end of a block selection. */
 function onWindowPointerDown(event: PointerEvent) {
+  notePress(event)
   const target = event.target instanceof Element ? event.target : null
   if (!target || !paneFoot.value?.root?.contains(target)) {
     hideUndoNote()
@@ -4359,6 +4744,7 @@ onMounted(() => {
   coarseQuery = window.matchMedia('(pointer: coarse)')
   coarse.value = coarseQuery.matches
   coarseQuery.addEventListener('change', onCoarseChange)
+  window.addEventListener('resize', onWindowResize)
 })
 
 onBeforeUnmount(() => {
@@ -4371,6 +4757,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('dragend', endDrag, true)
   window.removeEventListener('pointermove', endCopyDrag)
   coarseQuery?.removeEventListener('change', onCoarseChange)
+  window.removeEventListener('resize', onWindowResize)
   columnsObserver?.disconnect()
   document.documentElement.classList.remove('col-resizing')
   paneObserver?.disconnect()
@@ -4416,9 +4803,68 @@ watch(
 </script>
 
 <template>
-  <UiModal :title="title" size="full" tall flush back @close="emit('close')">
+  <UiModal
+    :title="title"
+    size="full"
+    tall
+    flush
+    back
+    :compact="phone"
+    :back-label="phone && pane !== 'document' && tab === 'markdown' ? t('viewer.backToText') : undefined"
+    @close="onBack"
+  >
     <template #title>
-      <div class="doc-head">
+      <!-- A phone's header: the filename — the outline's button — over the switch between the
+           text, the notes and the agent (docs/web.md § Result viewer, *On a phone and a
+           tablet*). -->
+      <div v-if="phone" class="phone-head">
+        <div class="phone-name">
+          <ViewerOutlineButton
+            v-if="tab === 'markdown' && outline.length >= 2"
+            :filename="title"
+            :entries="outline"
+            :current="currentHeading"
+            :actions="editable"
+            :translate="translateSkill"
+            @jump="jumpToHeading"
+            @translate="askAboutHeading($event, true)"
+            @context="askAboutHeading($event, false)"
+          />
+          <h2 v-else class="phone-title" :title="title">{{ title }}</h2>
+          <span
+            v-if="editable"
+            class="save-state"
+            :class="unsaved ? 'failed' : 'sr-only'"
+            role="status"
+            aria-live="polite"
+          >
+            {{ t(`viewer.status.${unsaved ? 'failed' : statusWord}`) }}
+          </span>
+        </div>
+        <UiSegmented v-if="paneTabs.length" glass class="panes" role="tablist" :aria-label="t('viewer.panes.label')">
+          <button
+            v-for="entry in paneTabs"
+            :id="`${uid}-tab-${entry.key}`"
+            :key="entry.key"
+            type="button"
+            role="tab"
+            class="segment"
+            :class="{ active: pane === entry.key }"
+            :aria-selected="pane === entry.key ? 'true' : 'false'"
+            :aria-controls="`${uid}-pane-${entry.key}`"
+            :aria-label="entry.name"
+            :tabindex="pane === entry.key ? 0 : -1"
+            :disabled="entry.disabled"
+            @click="pickPane(entry.key)"
+            @keydown="onPaneTabKey"
+          >
+            {{ entry.label }}
+            <UiSpinner v-if="entry.key === 'agent' && agentRunning && pane !== 'agent'" :size="12" />
+            <span v-else-if="entry.mark" class="pane-dot" aria-hidden="true" />
+          </button>
+        </UiSegmented>
+      </div>
+      <div v-else class="doc-head">
         <h2 class="doc-title" :title="title">{{ title }}</h2>
         <!-- Where the edits are, announced as they move; drawn only when a save failed,
              the one state that needs the reader (docs/web.md § Editing). -->
@@ -4439,7 +4885,7 @@ watch(
            named by its label (docs/web.md § Result viewer). None of the switches means
            anything over the original. -->
       <UiCapsule :label="t('viewer.tools')">
-        <template v-if="tab === 'markdown'">
+        <template v-if="tab === 'markdown' && !phone">
           <UiButton
             variant="ghost"
             icon-only
@@ -4467,8 +4913,8 @@ watch(
               variant="ghost"
               icon-only
               :label="t('viewer.notesLabel')"
-              :aria-pressed="notesOpen ? 'true' : 'false'"
-              @click="notesOpen = !notesOpen"
+              :aria-pressed="cardsShown.notes ? 'true' : 'false'"
+              @click="toggleColumn('notes')"
             >
               <template #icon><UiIcon name="notebook" /></template>
             </UiButton>
@@ -4477,8 +4923,8 @@ watch(
               variant="ghost"
               icon-only
               :label="t('viewer.agentLabel')"
-              :aria-pressed="agentOpen ? 'true' : 'false'"
-              @click="agentOpen = !agentOpen"
+              :aria-pressed="cardsShown.agent ? 'true' : 'false'"
+              @click="toggleColumn('agent')"
             >
               <template #icon><UiIcon name="message-circle" /></template>
             </UiButton>
@@ -4508,13 +4954,14 @@ watch(
         :label="t('viewer.more')"
         :header="moreFacts.length ? t(converted ? 'viewer.details' : 'viewer.file.details') : undefined"
         :facts="moreFacts"
+        :lead="moreFind ? 1 : 0"
         :focus-first="moreFromKey"
         @select="onMoreSelect"
         @close="closeMore"
       />
     </template>
 
-    <div class="body">
+    <div class="body" :class="layout">
       <!-- The original: the file itself, whatever the parse made of it — a PDF in the
            browser's own viewer, an image as a picture (docs/web.md § Result viewer,
            *Original and Markdown*). -->
@@ -4583,15 +5030,23 @@ watch(
                the same in-place editor over the whole file, always open (docs/web.md
                § Notes). The grip on its right edge resizes it, and a drag past half its
                minimum hides it until the drag ends. -->
-          <template v-if="editable && notesOpen">
+          <template v-if="notesMounted">
+            <!-- On a phone a pane, its head not drawn; elsewhere a card, and on a tablet one
+                 behind the agent keeps its box out of sight (docs/web.md § Result viewer, *On a
+                 phone and a tablet*). -->
             <aside
               v-show="dragHidden !== 'notes'"
+              :id="`${uid}-pane-notes`"
               class="notes card"
+              :class="{ away: !notesShown }"
               :style="{ '--column-width': `${columnWidth.notes.value}px` }"
-              :aria-label="t('viewer.notesLabel')"
+              :role="paneTabs.length ? 'tabpanel' : undefined"
+              :aria-labelledby="paneTabs.length ? `${uid}-tab-notes` : undefined"
+              :aria-label="paneTabs.length ? undefined : t('viewer.notesLabel')"
+              :inert="!notesShown"
               @pointerdown="onSurfacePointerDown"
             >
-              <header class="card-head">
+              <header v-if="!phone" class="card-head">
                 <h3 class="card-title">{{ t('viewer.notesLabel') }}</h3>
                 <UiButton variant="ghost" icon-only :label="t('viewer.closeNotes')" @click="notesOpen = false">
                   <template #icon><UiIcon name="panel-left-close" /></template>
@@ -4632,6 +5087,7 @@ watch(
               </div>
             </aside>
             <div
+              v-if="cardsShown.notes"
               class="split"
               :class="{ dragging: resizing?.column === 'notes' }"
               role="separator"
@@ -4653,8 +5109,13 @@ watch(
           <!-- What floats over the document — the find bar, the outline, the toolbar, the
                pieces at its foot — is positioned against this, never laid out in it. -->
           <div
+            :id="`${uid}-pane-document`"
             ref="paneEl"
             class="pane"
+            :class="{ away: !documentShown }"
+            :role="paneTabs.length ? 'tabpanel' : undefined"
+            :aria-labelledby="paneTabs.length ? `${uid}-tab-document` : undefined"
+            :inert="!documentShown"
             @keydown.capture="onPaneKey"
             @pointerdown="onSurfacePointerDown"
             @dragover="onPaneDragOver"
@@ -4950,6 +5411,7 @@ watch(
               :back="wayBack?.label ?? null"
               :note="statusNote"
               @back="goBack"
+              @view="viewNoted"
               @undo="stepUndo('undo', false)"
               @hold="holdNote"
             />
@@ -4966,7 +5428,7 @@ watch(
 
           <!-- The agent's thread about this document (docs/web.md § The agent panel). -->
           <div
-            v-if="editable && agentOpen && documentId !== null"
+            v-if="agentMounted && cardsShown.agent"
             class="split"
             :class="{ dragging: resizing?.column === 'agent' }"
             role="separator"
@@ -4984,11 +5446,16 @@ watch(
             @keydown="onResizeKey($event, 'agent')"
           />
           <aside
-            v-if="editable && agentOpen && documentId !== null"
+            v-if="agentMounted && documentId !== null"
             v-show="dragHidden !== 'agent'"
+            :id="`${uid}-pane-agent`"
             class="agent card"
+            :class="{ away: !agentShown }"
             :style="{ '--column-width': `${columnWidth.agent.value}px` }"
-            :aria-label="t('chat.panel')"
+            :role="paneTabs.length ? 'tabpanel' : undefined"
+            :aria-labelledby="paneTabs.length ? `${uid}-tab-agent` : undefined"
+            :aria-label="paneTabs.length ? undefined : t('chat.panel')"
+            :inert="!agentShown"
           >
             <ChatPanel
               ref="chatPanel"
@@ -4996,11 +5463,13 @@ watch(
               :document-selection="documentSelection"
               :document-pages="documentPages"
               :current-section="currentSection"
+              :closable="!phone"
               @changed="loadContent()"
               @filed="emit('filed')"
               @locate="locateSection"
               @to-notes="addToNotes"
-              @close="agentOpen = false"
+              @close="closeAgent"
+              @running="agentRunning = $event"
             />
           </aside>
         </div>
@@ -5083,6 +5552,7 @@ watch(
    from the pane and never float over it; closing one gives the width back (docs/web.md
    § Notes). */
 .columns {
+  position: relative;
   display: flex;
   min-width: 0;
   min-height: 0;
@@ -5758,71 +6228,156 @@ watch(
   object-fit: contain;
 }
 
-/* A percentage column needs a floor: below the shell breakpoint the chosen share of the
-   pane is a gutter wider than the text it frames. The side columns stack under the document
-   there, each keeping its own scroll. The gutter is the 40px padding: room for a handle or
-   a chevron, not both, so on Files a heading's two take turns in one slot. */
-@media (max-width: 900px) {
-  .page,
-  .page-skeleton {
-    width: 100%;
-  }
+/* --- Phone and tablet (docs/web.md § Result viewer, *On a phone and a tablet*) --------------- */
 
-  .columns {
-    flex-direction: column;
-  }
+/* A percentage column needs a floor: under 900px the chosen share of the pane is a gutter wider
+   than the text it frames, so the column is the whole pane. The gutter is the 40px padding:
+   room for a handle or a chevron, not both, so on Files a heading's two take turns in one
+   slot. */
+.body:is(.phone, .tablet) .page,
+.body:is(.phone, .tablet) .page-skeleton {
+  width: 100%;
+}
 
-  .pane {
-    flex: 1 1 50%;
-  }
+/* One gutter slot for a heading: its chevron, or its handle while the heading is open in its
+   editor, selected, moving or has its menu open — how a touch screen reaches a handle anyway
+   (docs/web.md § Result viewer, *Outline, collapse and the way back*). */
+.body:is(.phone, .tablet) .document.files .block[data-kind='h2'] > .block-handle,
+.body:is(.phone, .tablet) .document.files .block[data-kind='h3'] > .block-handle {
+  left: -28px;
+}
 
-  /* The cards stack under the document, the notes first, full width and inset. */
-  .card {
-    flex: 0 0 45%;
-    margin: 0 var(--space-4) var(--space-4);
-  }
+.body:is(.phone, .tablet) .document.files .block:is([data-kind='h2'], [data-kind='h3']):not(.open, .selected, .moving) > .block-handle:not(.on) {
+  display: none;
+}
 
-  .notes {
-    order: 1;
-  }
+.body:is(.phone, .tablet) .document.files .block:is(.open, .selected, .moving) > .block-chevron,
+.body:is(.phone, .tablet) .document.files .block-handle.on ~ .block-chevron {
+  display: none;
+}
 
-  .agent {
-    order: 2;
-  }
+/* A tablet's card behind the one in front, or an agent kept from a phone and not open: its box
+   kept — its scroll, its thread following an answer — out of the flow and out of sight. */
+.body:not(.phone) .card.away {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  visibility: hidden;
+}
 
-  .split {
-    display: none;
-  }
+.body:not(.phone) .notes.away {
+  left: 0;
+}
 
-  /* One gutter slot for a heading: its chevron, or its handle while the heading is open in
-     its editor, selected, moving or has its menu open — how a touch screen reaches a handle
-     anyway (docs/web.md § Result viewer, *Outline, collapse and the way back*). */
-  .document.files .block[data-kind='h2'] > .block-handle,
-  .document.files .block[data-kind='h3'] > .block-handle {
-    left: -28px;
-  }
+.body:not(.phone) .agent.away {
+  right: 0;
+}
 
-  .document.files .block:is([data-kind='h2'], [data-kind='h3']):not(.open, .selected, .moving) > .block-handle:not(.on) {
-    display: none;
-  }
+/* A phone: the three panes in one cell, one shown — the others hidden, never out of layout,
+   so everything that measures them still can. A pane is the page: no card surface. */
+.body.phone .columns {
+  display: grid;
+  grid-template: minmax(0, 1fr) / minmax(0, 1fr);
+}
 
-  .document.files .block:is(.open, .selected, .moving) > .block-chevron,
-  .document.files .block-handle.on ~ .block-chevron {
-    display: none;
+.body.phone .columns > .pane,
+.body.phone .columns > .card {
+  grid-area: 1 / 1;
+}
+
+.body.phone .away {
+  visibility: hidden;
+}
+
+.body.phone .card {
+  margin: 0;
+  border-radius: 0;
+  background: var(--paper);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  box-shadow: none;
+}
+
+/* The side padding is the gutter's room: a handle or a chevron on the left, on Files a
+   backlink marker on the right. */
+.body.phone .document {
+  padding: var(--space-7) var(--space-8) var(--space-10);
+}
+
+.body.phone .doc-find {
+  right: var(--space-4);
+  width: calc(100% - var(--space-8));
+}
+
+/* The notes as a pane are read, not glanced at beside the text: the document's sizes. */
+.body.phone .notes {
+  --block-text: var(--text-read);
+  --block-text-sm: var(--text-read-sm);
+  --rich-gap: var(--space-4);
+}
+
+.body.phone .notes-view {
+  padding: var(--space-6) var(--space-8) var(--space-10);
+}
+
+/* The phone's header: the filename over the switch, between the back button and More. */
+.phone-head {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+
+/* A phone on its side has width to spare and little height: one line. */
+@media (max-height: 500px) {
+  .phone-head {
+    flex-direction: row;
+    gap: var(--space-3);
   }
 }
 
-@media (max-width: 640px) {
-  .doc-find {
-    right: var(--space-4);
-    width: calc(100% - var(--space-8));
-  }
+.phone-name {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  max-width: 100%;
+  min-width: 0;
+  min-height: 22px;
+}
 
-  /* The side padding is the gutter's room: a handle or a chevron on the left, on Files a
-     backlink marker on the right. */
-  .document {
-    padding: var(--space-7) var(--space-8) var(--space-10);
-  }
+.phone-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+}
+
+/* The segments keep the track's whole height as what a finger presses. */
+.phone-head .panes :deep(.segment) {
+  position: relative;
+  padding: 0 var(--space-3);
+}
+
+.phone-head .panes :deep(.segment)::before {
+  content: '';
+  position: absolute;
+  inset: -4px 0;
+}
+
+.phone-head .panes :deep(.segment:disabled) {
+  color: var(--faint);
+  cursor: default;
+}
+
+.pane-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: var(--radius-full);
+  background: var(--accent);
 }
 </style>
 

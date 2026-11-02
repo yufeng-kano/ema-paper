@@ -2715,4 +2715,14 @@ defineExpose({
   color: var(--faint);
   font-size: var(--text-xs);
 }
+
+/* Safari on iOS zooms into a field smaller than 16px and leaves the page zoomed: the editable
+   root and the formula field are at least that under a coarse pointer (docs/web.md § Result
+   viewer, *On a phone and a tablet*). The blocks inside set their own sizes. */
+@media (pointer: coarse) {
+  .rich :deep(.rich-doc),
+  .math-input {
+    font-size: 16px;
+  }
+}
 </style>

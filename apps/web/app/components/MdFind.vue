@@ -396,6 +396,13 @@ defineExpose({ focus })
   font-size: var(--text-2xs);
   white-space: nowrap;
 }
+
+/* Safari on iOS zooms into a field smaller than 16px. */
+@media (pointer: coarse) {
+  .find-field {
+    font-size: 16px;
+  }
+}
 </style>
 
 <style>

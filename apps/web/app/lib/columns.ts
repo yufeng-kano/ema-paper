@@ -29,3 +29,41 @@ export function storedWidth(column: Column, width: unknown): number {
 export function collapses(column: Column, width: number): boolean {
   return width < COLUMN_WIDTHS[column].min / 2
 }
+
+/**
+ * The viewer's three layouts (docs/web.md § Result viewer, *On a phone and a tablet*): a phone
+ * shows one pane at a time, a tablet the document and one card, the desktop the document and
+ * both. A phone is a narrow window, or a touch screen no taller than a phone turned sideways —
+ * a short desktop window with a mouse stays a desktop.
+ */
+export type ViewerLayout = 'phone' | 'tablet' | 'desktop'
+
+/** Below this width, one pane at a time: the document's minimum beside the smallest card no
+ *  longer fits. */
+export const PHONE_MAX_WIDTH = 700
+/** Up to this width, one card at a time beside the document. */
+export const TABLET_MAX_WIDTH = 900
+/** A touch screen no taller than this is a phone on its side. */
+export const PHONE_MAX_HEIGHT = 500
+
+export function viewerLayout(view: { width: number; height: number }, coarse: boolean): ViewerLayout {
+  if (view.width < PHONE_MAX_WIDTH || (coarse && view.height <= PHONE_MAX_HEIGHT)) {
+    return 'phone'
+  }
+  return view.width <= TABLET_MAX_WIDTH ? 'tablet' : 'desktop'
+}
+
+/**
+ * Which cards show beside the document: every open one on the desktop; on a tablet only the
+ * one in front where both are open — the other stays mounted behind it. A phone has panes, not
+ * cards, and shows none of them as a card.
+ */
+export function shownCards(layout: ViewerLayout, open: Record<Column, boolean>, front: Column): Record<Column, boolean> {
+  if (layout === 'phone') {
+    return { notes: false, agent: false }
+  }
+  if (layout === 'tablet' && open.notes && open.agent) {
+    return { notes: front === 'notes', agent: front === 'agent' }
+  }
+  return { ...open }
+}
