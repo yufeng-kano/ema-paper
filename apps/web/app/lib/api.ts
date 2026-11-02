@@ -244,7 +244,7 @@ export interface MemoryFields {
 
 // --- what the chat agent receives (docs/api.md, GET /api/agents/chat/context) -------------
 
-export type AgentContextPartKind = 'prompt' | 'preset' | 'instructions' | 'catalogue' | 'memory_file' | 'memory'
+export type AgentContextPartKind = 'prompt' | 'preset' | 'instructions' | 'catalogue' | 'agents_file' | 'memory_file' | 'memory'
 
 export interface AgentContextPart {
   kind: AgentContextPartKind

@@ -2243,6 +2243,7 @@ async def test_the_runtime_settings_migration_adds_an_empty_table_and_touches_no
 
 LIBRARY_ON_DATA_PLANE = "67f4dce0969f"
 RENAME_COMMAND = "62b2a3fa78bd"
+AGENTS_FILES = "5684b657e66e"
 
 
 async def test_the_rename_command_migration_renames_a_skill_named_rename(scratch_url) -> None:
@@ -2287,6 +2288,83 @@ async def test_the_rename_command_migration_renames_a_skill_named_rename(scratch
                 await db.execute(text("SELECT user_id, name, body FROM skills ORDER BY body"))
             ).all()
             assert [tuple(row) for row in names] == expected
+        _alembic(scratch_url, "upgrade", "head")
+    finally:
+        await engine.dispose()
+
+
+async def test_the_agents_files_migration_adds_the_snapshot_and_reserves_init(scratch_url) -> None:
+    """`conversations.agents_file` arrives NULL on every row, and `/init` becomes the
+    composer's own: a skill named `init` takes its reader's next free `init-N`, every other
+    skill keeps its name; the downgrade drops the column and renames nothing back
+    (docs/database.md)."""
+    _alembic(scratch_url, "upgrade", RENAME_COMMAND)
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.begin() as db:
+            await db.execute(
+                text(
+                    "INSERT INTO users (id, google_sub, email, created_at) VALUES "
+                    "(1, 'sub-1', 'a@example.com', now()), (2, 'sub-2', 'b@example.com', now())"
+                )
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO skills (user_id, name, description, argument_hint, body, "
+                    "created_at, updated_at) VALUES "
+                    "(1, 'init', '', '', 'x', now(), now()), "
+                    "(1, 'init-2', '', '', 'y', now(), now()), "
+                    "(1, 'mine', '', '', 'w', now(), now()), "
+                    "(2, 'init', '', '', 'z', now(), now())"
+                )
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO documents (id, user_id, folder_id, job_id, name, created_at, "
+                    "updated_at) VALUES (1, 1, NULL, NULL, 'a.md', now(), now())"
+                )
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO conversations (id, user_id, document_id, title, session, "
+                    "memory_file, created_at, updated_at) "
+                    "VALUES (1, 1, 1, 't', 's', 'notes', now(), now())"
+                )
+            )
+        _alembic(scratch_url, "upgrade", AGENTS_FILES)
+        expected = [
+            (1, "mine", "w"),
+            (1, "init-3", "x"),
+            (1, "init-2", "y"),
+            (2, "init-2", "z"),
+        ]
+        async with engine.connect() as db:
+            names = (
+                await db.execute(text("SELECT user_id, name, body FROM skills ORDER BY body"))
+            ).all()
+            assert [tuple(row) for row in names] == expected
+            row = (
+                await db.execute(text("SELECT memory_file, agents_file FROM conversations"))
+            ).one()
+            assert tuple(row) == ("notes", None)
+        _alembic(scratch_url, "downgrade", RENAME_COMMAND)
+        async with engine.connect() as db:
+            names = (
+                await db.execute(text("SELECT user_id, name, body FROM skills ORDER BY body"))
+            ).all()
+            assert [tuple(row) for row in names] == expected
+            columns = {
+                column
+                for (column,) in (
+                    await db.execute(
+                        text(
+                            "SELECT column_name FROM information_schema.columns "
+                            "WHERE table_name = 'conversations'"
+                        )
+                    )
+                ).all()
+            }
+            assert "agents_file" not in columns and "memory_file" in columns
         _alembic(scratch_url, "upgrade", "head")
     finally:
         await engine.dispose()

@@ -66,6 +66,7 @@ from ..upstream.client import (
     kano_connection,
 )
 from ..workspace import filing, git, safe_io
+from ..workspace.agents_file import agents_file_text
 from ..workspace.documents import (
     MARKDOWN_KIND,
     DocumentPaths,
@@ -81,7 +82,7 @@ from ..workspace.documents import (
     trashed_folder_ids,
     user_folders,
 )
-from ..workspace.layout import DOC_FILE, FIGURES_DIR, NOTES_FILE
+from ..workspace.layout import DOC_FILE, FIGURES_DIR, NOTES_FILE, document_relative_dir
 from ..workspace.locks import (
     backup_shared,
     clear_writing,
@@ -129,12 +130,13 @@ class TurnOutOfCredits(Exception):
 
 @dataclass(frozen=True)
 class Compacted:
-    """What a compaction stored: its summary row, and the memory file as it read it then.
-    The boundary and the snapshot the turn's finish sets, with the terminal state
-    (docs/chat.md § Compaction)."""
+    """What a compaction stored: its summary row, and the memory file and the AGENTS.md
+    files as it read them then. The boundary and the snapshots the turn's finish sets, with
+    the terminal state (docs/chat.md § Compaction)."""
 
     message_id: int
     memory_file: str
+    agents_file: str
 
 
 @dataclass
@@ -316,6 +318,16 @@ async def _load(
         # mutation keeps (docs/workspace.md § Revisions).
         if conversation.memory_file is None:
             conversation.memory_file = await memory_file_text(settings, turn.user_id)
+        # The AGENTS.md files on the document's path, the same way (docs/chat.md
+        # § AGENTS.md): read before anything is materialized, from the path the rows name.
+        if conversation.agents_file is None:
+            conversation.agents_file = await agents_file_text(
+                settings,
+                turn.user_id,
+                document_relative_dir(
+                    await folder_names(db, turn.user_id, document.folder_id), document.name
+                ).parent,
+            )
         # The memory block: the conversation's snapshot, taken by its first turn and stored
         # with this commit, rendered from the rows as they are now (docs/chat.md § Memory).
         memory = await chat_memory.load_turn_memory(
@@ -361,6 +373,9 @@ async def _load(
         memory=memory.block,
         memory_file=chat_agent.render_memory_file(
             conversation.memory_file, settings.chat_memory_file_max_chars
+        ),
+        agents_file=chat_agent.render_agents_file(
+            conversation.agents_file, settings.chat_agents_file_max_chars
         ),
     )
 
@@ -2137,6 +2152,7 @@ async def _store_summary(ctx: TurnContext, content: list[dict]) -> None:
     if not summary:
         raise TurnFailed("compact_empty")
     memory_file = await memory_file_text(ctx.settings, ctx.turn.user_id)
+    agents_file = await agents_file_text(ctx.settings, ctx.turn.user_id, ctx.paths.relative.parent)
     async with ctx.sessionmaker() as db:
         await _still_ours(db, ctx)
         row = Message(
@@ -2155,7 +2171,7 @@ async def _store_summary(ctx: TurnContext, content: list[dict]) -> None:
         await db.flush()
         message_id = row.id
         await db.commit()
-    ctx.compacted = Compacted(message_id, memory_file)
+    ctx.compacted = Compacted(message_id, memory_file, agents_file)
 
 
 def _keep_place(kind: str) -> dict:
@@ -2214,6 +2230,7 @@ async def _finish(
                 compacted_message_id=compacted.message_id,
                 memory_ids=None,
                 memory_file=compacted.memory_file,
+                agents_file=compacted.agents_file,
                 context_tokens=None,
                 cache_warm_until=None,
             )

@@ -250,8 +250,10 @@ def display_content(content: list) -> list:
             shown.append(
                 {"type": "text", "context": "attachment", "attachment": block.get("attachment")}
             )
-        elif marker in (TURN_CONTEXT, chat_compact.COMPACT_CONTEXT):
-            continue  # the model's context and the compaction instruction: nothing the thread shows
+        elif marker in (TURN_CONTEXT, chat_compact.COMPACT_CONTEXT, chat_agent.INIT_CONTEXT):
+            # The model's context, the compaction instruction and the `/init` instruction:
+            # nothing the thread shows.
+            continue
         else:
             shown.append(block)
     return shown
@@ -650,10 +652,15 @@ async def post_message(
             raise ApiError(
                 400, "nothing_to_compact", "There is nothing to compact in this conversation"
             )
+    # The reader's `/init`: the composer's own too, carried as an instruction about the
+    # folder's AGENTS.md, never a skill (docs/chat.md § AGENTS.md).
+    init = command == chat_agent.INIT_COMMAND
+    if init and attachment_ids:
+        raise ApiError(400, "invalid_request", "/init takes no attachments")
 
     skill = (
         await _invocable_skill(db, user.id, command)
-        if command is not None and not compact
+        if command is not None and not compact and not init
         else None
     )
 
@@ -669,14 +676,19 @@ async def post_message(
     elif compact:
         focus = body.text.strip()
         visible = f"/{chat_agent.COMPACT_COMMAND}" + (f" {focus}" if focus else "")
+    elif init:
+        note = body.text.strip()
+        visible = f"/{chat_agent.INIT_COMMAND}" + (f" {note}" if note else "")
     else:
         visible = body.text
     if visible.strip():
         content.append({"type": "text", "text": visible})
     # A compaction carries the instruction and the turn block, nothing else: the selection
-    # the composer read as the command was sent is not what it is about.
-    selection = (body.selection or "").strip() if not compact else ""
-    if compact:
+    # the composer read as the command was sent is not what it is about. Nor is an
+    # `/init`'s, which is about the folder.
+    passage_free = compact or init
+    selection = (body.selection or "").strip() if not passage_free else ""
+    if passage_free:
         sections = []
     if selection:
         # Marked as ours: the runner strips the marker before the block goes upstream,
@@ -697,7 +709,7 @@ async def post_message(
                 "section": heading,
             }
         )
-    quote = (body.quote or "").strip() if not compact else ""
+    quote = (body.quote or "").strip() if not passage_free else ""
     if quote:
         content.append({"type": "text", "text": f"{QUOTE_PREFIX}{quote}", "context": "quote"})
     if compact:
@@ -706,6 +718,14 @@ async def post_message(
                 "type": "text",
                 "text": chat_agent.compact_instruction(body.text),
                 "context": chat_compact.COMPACT_CONTEXT,
+            }
+        )
+    if init:
+        content.append(
+            {
+                "type": "text",
+                "text": chat_agent.init_instruction(body.text),
+                "context": chat_agent.INIT_CONTEXT,
             }
         )
     if skill is not None:
@@ -844,9 +864,15 @@ async def edit_message(
         if command is not None
         else None
     )
+    # An `/init` edited is an `/init` again, its instruction rendered anew with the new
+    # note (docs/chat.md § AGENTS.md).
+    init = any(block.get("context") == chat_agent.INIT_CONTEXT for block in carried)
     if skill is not None:
         arguments = body.text.strip()
         visible = f"/{skill.name}" + (f" {arguments}" if arguments else "")
+    elif init:
+        note = body.text.strip()
+        visible = f"/{chat_agent.INIT_COMMAND}" + (f" {note}" if note else "")
     else:
         visible = body.text
     if not visible.strip() and not attachments:
@@ -863,6 +889,14 @@ async def edit_message(
                 bool(selection),
                 [str(block.get("section") or "") for block in sections],
             )
+        )
+    if init:
+        content.append(
+            {
+                "type": "text",
+                "text": chat_agent.init_instruction(body.text),
+                "context": chat_agent.INIT_CONTEXT,
+            }
         )
     revision = await current_revision(db, settings, document)
     note = turn_note(

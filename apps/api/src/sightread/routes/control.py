@@ -10,6 +10,7 @@ import asyncio
 import logging
 import re
 from datetime import timedelta
+from pathlib import Path
 
 from authlib.integrations.starlette_client import OAuthError
 from fastapi import APIRouter, Query, Request, Response, status
@@ -71,13 +72,14 @@ from ..parsing.images import ACCEPTED_IMAGE_TYPES
 from ..sandbox.client import SandboxClient, SandboxUnavailable
 from ..upstream.client import agent_models, offered_models
 from ..workspace import accounts
+from ..workspace.agents_file import agents_file_text
 from ..workspace.documents import (
     IMAGE_MEDIA_TYPES,
     MARKDOWN_EXTENSIONS,
     MARKDOWN_MEDIA_TYPE,
     document_paths,
 )
-from ..workspace.layout import user_root
+from ..workspace.layout import FILES_DIR, user_root
 from ..workspace.locks import workspace_lock
 from ..workspace.memory_file import memory_file_text, write_memory_file
 from ..workspace.trash import lock_user
@@ -930,14 +932,17 @@ async def chat_agent_context(
     block a message sent now in `locale` would carry, and the document's facts when one is
     named. Reads only: nothing is materialized and no snapshot is taken."""
     facts: dict[str, str] | None = None
+    # The AGENTS.md files a new conversation would read: the document's path, or the root
+    # file alone without a document (docs/chat.md § AGENTS.md).
+    folder_dir = Path(FILES_DIR)
     if document_id is not None:
         document = await owned_document(db, user.id, document_id)
+        paths = await document_paths(db, settings, document)
+        folder_dir = paths.relative.parent
         # A markdown document has no job and still has facts: it has no pages to name.
         job = await db.get(Job, document.job_id) if document.job_id is not None else None
         if document.job_id is None or job is not None:
-            facts = chat_runner.document_facts(
-                settings, job, await document_paths(db, settings, document)
-            )
+            facts = chat_runner.document_facts(settings, job, paths)
     setting = (
         await db.execute(
             select(AgentSetting).where(
@@ -980,6 +985,10 @@ async def chat_agent_context(
         # The memory file as a new conversation would read it (docs/chat.md § Memory).
         memory_file=chat_agent.render_memory_file(
             await memory_file_text(settings, user.id), settings.chat_memory_file_max_chars
+        ),
+        agents_file=chat_agent.render_agents_file(
+            await agents_file_text(settings, user.id, folder_dir),
+            settings.chat_agents_file_max_chars,
         ),
     )
     extras = {

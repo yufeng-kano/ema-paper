@@ -139,16 +139,19 @@ describe('passageTooLong', () => {
 describe('builtinCommands', () => {
   const words = {
     newDescription: 'New',
+    initDescription: 'Init',
+    initHint: '[about]',
     compactDescription: 'Compact',
     compactHint: '[focus]',
     renameDescription: 'Rename',
     renameHint: '[name]',
   }
 
-  it('offers /compact and /rename only with a conversation open, never on the draft', () => {
-    expect(builtinCommands(false, words).map((option) => option.name)).toEqual(['new'])
+  it('offers /compact and /rename only with a conversation open, /new and /init on the draft too', () => {
+    expect(builtinCommands(false, words).map((option) => option.name)).toEqual(['new', 'init'])
     expect(builtinCommands(true, words)).toEqual([
       { name: 'new', description: 'New', hint: '', group: 'builtin' },
+      { name: 'init', description: 'Init', hint: '[about]', group: 'builtin' },
       { name: 'compact', description: 'Compact', hint: '[focus]', group: 'builtin' },
       { name: 'rename', description: 'Rename', hint: '[name]', group: 'builtin' },
     ])

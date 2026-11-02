@@ -52,6 +52,7 @@ import {
 import { blockName, type NameText } from '~/lib/blocks'
 import {
   COMPACT_COMMAND,
+  INIT_COMMAND,
   RENAME_COMMAND,
   commandArguments,
   formatBytes,
@@ -1344,7 +1345,8 @@ function sentContent(payload: ComposerPayload): ContentBlock[] {
   if (payload.quote) {
     blocks.push({ type: 'text', text: payload.quote, context: 'quote' })
   }
-  if (payload.command && payload.command !== COMPACT_COMMAND) {
+  // A skill's chip; `/compact` and `/init` are the runner's own, no skill (docs/chat.md).
+  if (payload.command && payload.command !== COMPACT_COMMAND && payload.command !== INIT_COMMAND) {
     blocks.push({ type: 'text', text: '', context: 'skill', skill: payload.command })
   }
   return blocks

@@ -72,6 +72,7 @@ from ..jobs.runner import partial_result_payload, result_payload
 from ..parsing.figures import crop_chunks, open_crop, parse_bbox_path
 from ..workspace import documents as workspace_documents
 from ..workspace import git, safe_io, trash
+from ..workspace.agents_file import AGENTS_FILE
 from ..workspace.filing import (
     DOCUMENT_NAME_MAX,
     FOLDER_NAME_MAX,
@@ -1182,7 +1183,10 @@ async def upload_document(
 
     def open_sink(filename: str, content_type: str) -> Sink:
         suffix = Path(filename).suffix.lower()[:16]
-        if (
+        # An AGENTS.md is the reader's instructions to the chat agent for the folder, kept
+        # as a file where the agent reads it, never a document of its own (docs/chat.md
+        # § AGENTS.md, docs/workspace.md § Markdown documents).
+        if Path(filename).name != AGENTS_FILE and (
             content_type.split(";", 1)[0].strip() == workspace_documents.MARKDOWN_MEDIA_TYPE
             or suffix in workspace_documents.MARKDOWN_EXTENSIONS
         ):
