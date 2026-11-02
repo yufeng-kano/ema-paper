@@ -16,9 +16,10 @@ from typing import Protocol
 NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 # The composer's own commands — `/new` opens a conversation, `/compact` is the runner's
 # (docs/chat.md § Compaction), `/rename` names the conversation (docs/chat.md
-# § Conversations, turns, events) — so no skill bears their names: neither `/compact` nor
-# `/rename` may ever run a skill in their place (docs/chat.md § Skills).
-COMPOSER_COMMANDS = frozenset({"new", "compact", "rename"})
+# § Conversations, turns, events), `/init` sets up the folder's AGENTS.md (docs/chat.md
+# § AGENTS.md) — so no skill bears their names: none of them may ever run a skill in its
+# place (docs/chat.md § Skills).
+COMPOSER_COMMANDS = frozenset({"new", "compact", "rename", "init"})
 DESCRIPTION_MAX_CHARS = 1024
 ARGUMENT_HINT_MAX_CHARS = 128
 ARGUMENTS_PLACEHOLDER = "$ARGUMENTS"

@@ -76,6 +76,8 @@ function partLabel(part: AgentContextPart): string {
     case 'catalogue':
       // The skills the agent may load; the subagents the block also lists are in its text.
       return t('agents.receives.catalogue', { skills: part.skills ?? 0 })
+    case 'agents_file':
+      return t('agents.receives.agentsFile')
     case 'memory_file':
       return t('agents.receives.memoryFile')
     case 'memory':

@@ -198,7 +198,7 @@ class Settings(BaseSettings):
     # (docs/parsing.md § Figure check).
     figure_check_rounds: int = 2
     # Cap on a user's custom system prompt (docs/api.md § Limits).
-    system_prompt_max_chars: int = 12_000
+    system_prompt_max_chars: int = 16_000
     # Cap on any upstream response body — a user-controlled endpoint must not be able to
     # exhaust memory with an unbounded reply (docs/parsing.md § Upstream usage).
     upstream_response_max_bytes: int = 33_554_432
@@ -308,6 +308,9 @@ class Settings(BaseSettings):
     # How much of the agent's memory file a conversation reads into its system prompt
     # (docs/chat.md § Memory, *The memory file*).
     chat_memory_file_max_chars: int = 16_000
+    # How much of the AGENTS.md files on a document's path a conversation reads into its
+    # system prompt, all of them together (docs/chat.md § AGENTS.md).
+    chat_agents_file_max_chars: int = 16_000
     # Compaction (docs/chat.md § Compaction): the context a conversation must have reached
     # for the worker to compact it before its cache expires, how long before the expiry
     # it is enqueued, how often the worker looks, and the tool calls a compaction turn
@@ -429,6 +432,7 @@ class Settings(BaseSettings):
             "download_timeout_seconds",
             "chat_idle_compact_sweep_seconds",
             "chat_memory_file_max_chars",
+            "chat_agents_file_max_chars",
             "chat_context_window_tokens",
             "runtime_settings_cache_seconds",
             "redeem_code_chars",

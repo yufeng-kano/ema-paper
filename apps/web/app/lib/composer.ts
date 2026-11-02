@@ -11,7 +11,7 @@ export interface CommandOption {
   /** What the command takes, shown at the row's end. */
   hint: string
   /** `skill` runs one of the reader's skills; `builtin` is the composer's own (`/new`,
-   *  `/compact`, `/rename`). */
+   *  `/init`, `/compact`, `/rename`). */
   group: 'skill' | 'builtin'
 }
 
@@ -22,21 +22,29 @@ export const COMPACT_COMMAND = 'compact'
 /** Never sent as a message: a name renames the conversation, none asks the summary model
  *  for a title (docs/chat.md § Conversations, turns, events). */
 export const RENAME_COMMAND = 'rename'
+/** Sent as `command: init`, its arguments what the reader says about the folder: the agent
+ *  sets up the folder's AGENTS.md (docs/chat.md § AGENTS.md). */
+export const INIT_COMMAND = 'init'
 
-/** The builtin rows the menu lists under *Conversation*: `/new` always, `/compact` and
- *  `/rename` only with a conversation open — the draft has nothing to compact or name. The
- *  descriptions and hints are the caller's, read from the catalog. */
+/** The builtin rows the menu lists under *Conversation*: `/new` and `/init` always, `/compact`
+ *  and `/rename` only with a conversation open — the draft has nothing to compact or name.
+ *  The descriptions and hints are the caller's, read from the catalog. */
 export function builtinCommands(
   conversationOpen: boolean,
   words: {
     newDescription: string
+    initDescription: string
+    initHint: string
     compactDescription: string
     compactHint: string
     renameDescription: string
     renameHint: string
   },
 ): CommandOption[] {
-  const rows: CommandOption[] = [{ name: NEW_COMMAND, description: words.newDescription, hint: '', group: 'builtin' }]
+  const rows: CommandOption[] = [
+    { name: NEW_COMMAND, description: words.newDescription, hint: '', group: 'builtin' },
+    { name: INIT_COMMAND, description: words.initDescription, hint: words.initHint, group: 'builtin' },
+  ]
   if (conversationOpen) {
     rows.push({ name: COMPACT_COMMAND, description: words.compactDescription, hint: words.compactHint, group: 'builtin' })
     rows.push({ name: RENAME_COMMAND, description: words.renameDescription, hint: words.renameHint, group: 'builtin' })

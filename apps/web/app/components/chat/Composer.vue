@@ -22,6 +22,7 @@ import {
   matchCommands,
   NEW_COMMAND,
   passageTooLong,
+  INIT_COMMAND,
   RENAME_COMMAND,
   refuseAttachment,
   sectionHeading,
@@ -54,8 +55,8 @@ const props = defineProps<{
   /** Posts the message; true once the server accepted it. */
   submit: (payload: ComposerPayload) => Promise<boolean>
   error: string | null
-  /** A conversation is open, as against the draft: `/compact` is offered (docs/web.md
-   *  § The agent panel, *Commands*). */
+  /** A conversation is open, as against the draft: `/compact` and `/rename` are offered
+   *  (docs/web.md § The agent panel, *Commands*). */
   conversationOpen: boolean
 }>()
 
@@ -365,6 +366,8 @@ const matches = computed(() => {
       ...skills.value,
       ...builtinCommands(props.conversationOpen, {
         newDescription: t('chat.commandNew'),
+        initDescription: t('chat.commandInit'),
+        initHint: t('chat.commandInitHint'),
         compactDescription: t('chat.commandCompact'),
         compactHint: t('chat.commandCompactHint'),
         renameDescription: t('chat.commandRename'),
@@ -437,7 +440,7 @@ function pick(option: CommandOption) {
     emit('new-conversation')
     return
   }
-  // A skill, `/compact` or `/rename`: a chip, the textarea taking its arguments.
+  // A skill, `/init`, `/compact` or `/rename`: a chip, the textarea taking its arguments.
   command.value = option
   // The `/term` typed was the command; a draft the command control opened over stays as
   // its arguments.
@@ -724,20 +727,24 @@ async function send(): Promise<boolean> {
       // The panel went before the message did: the draft, its attachments with it, went too.
       return false
     }
-    const ready = pending.value.filter((item) => item.state === 'ready')
-    const text = draft.value.trim()
     const picked = command.value
+    // `/init` is about the folder, not a passage: it takes none of the selection, the
+    // sections, the quote or the attachments, which stay for the next message (docs/web.md
+    // § The agent panel, *Commands*).
+    const initializing = picked?.group === 'builtin' && picked.name === INIT_COMMAND
+    const ready = initializing ? [] : pending.value.filter((item) => item.state === 'ready')
+    const text = draft.value.trim()
     if (!text && !picked && !ready.length) {
       return false
     }
-    const sentSections = addedSections.value
+    const sentSections = initializing ? [] : addedSections.value
     const headingMax = props.limits?.section_heading_max_chars
     const payload: ComposerPayload = {
       text,
-      selection: selection.value,
+      selection: initializing ? null : selection.value,
       // Added from the menu or asked for by the reader's view, a heading goes within the cap.
       sections: sentSections.map(({ heading, text: source }) => ({ heading: sectionHeading(heading, headingMax), text: source })),
-      quote: quote.value,
+      quote: initializing ? null : quote.value,
       command: picked?.name ?? null,
       attachments: ready.map((item) => ({ id: item.id!, name: item.name, image: item.image, preview: item.preview })),
     }

@@ -548,6 +548,9 @@ class Conversation(Base):
     # compaction; NULL until a turn took one, '' for a file that was empty or missing
     # (docs/chat.md § Memory, *The memory file*).
     memory_file: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The AGENTS.md files on the document's path as the first turn found them, rendered;
+    # NULL until a turn took the snapshot, '' for none (docs/chat.md § AGENTS.md).
+    agents_file: Mapped[str | None] = mapped_column(Text, nullable=True)
     # The summary row the replay starts from; NULL while the conversation was never
     # compacted. No foreign key: a message goes only with its conversation, and a key
     # back to `messages` would close a cycle every DDL tool would have to break

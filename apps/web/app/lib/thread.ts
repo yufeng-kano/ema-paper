@@ -13,6 +13,7 @@
  * every turn, stored or live, since the panel replays a conversation's events from 0.
  */
 import type { ChatEvent, ChatMessage, ChatTurn, ContentBlock, Memory, MemorySnapshot, SubagentRecord, TurnKind } from './api'
+import { INIT_COMMAND } from './composer'
 import { addedLines, diffFromInput, groupRuns, parseDiff, readStep, resultText, type DiffLine, type Step } from './steps'
 
 /** The chat agent's editor tool and the commands of it that write (docs/chat.md § Tools). */
@@ -296,6 +297,9 @@ function userItem(prefix: string, turnId: string, typed: ChatMessage[]): ThreadI
   first.content.forEach((block, index) => {
     if (block.type === 'text' && block.context === 'skill' && block.skill) {
       command = block.skill
+    } else if (block.type === 'text' && block.context === 'init') {
+      // The runner's own command: the bare marker the route serves (docs/chat.md § AGENTS.md).
+      command = INIT_COMMAND
     } else if (block.type === 'text' && block.context === 'quote') {
       quotes.push(blockText(block))
     } else if (block.type === 'text' && block.context === 'attachment' && block.attachment) {
@@ -601,8 +605,8 @@ export function buildThread(input: ThreadInput): Thread {
       renderLive(group)
     }
 
-    // A command opens its answer's first step group with the skill it ran.
-    if (user?.kind === 'user' && user.command) {
+    // A command opens its answer's first step group with the skill it ran; `/init` runs none.
+    if (user?.kind === 'user' && user.command && user.command !== INIT_COMMAND) {
       const skillStep: Flat = { kind: 'step', item: { type: 'skill', key: `${prefix}-skill`, name: user.command } }
       const first = flat.findIndex((entry) => entry.kind === 'step')
       if (first === -1) {

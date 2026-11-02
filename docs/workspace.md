@@ -14,7 +14,9 @@ Every user owns one directory on the server, `{WORKSPACES_DIR}/{user_id}/`. It i
 │   └── trash/                         the Trash (§ The Trash): document-<id>/, folder-<id>/, as they left files/
 ├── memory.md                          the chat agent's notes across conversations, written by the agent and on the Agent page; a revision like any text (chat.md § Memory, *The memory file*)
 └── files/                             one-to-one with the Files page's folder tree
+    ├── AGENTS.md                      the reader's standing instructions to the chat agent for every document, a file of the library (chat.md § AGENTS.md)
     └── <folder>/<subfolder>/
+        ├── AGENTS.md                  the same for this folder and the folders inside it; the nearer file wins
         ├── <file name>                a file of any kind: the upload itself, the one copy there is (§ Files)
         └── <document name>/           one document = one directory
             ├── doc.md                 the editable transcription (a markdown document's own text)
@@ -38,7 +40,7 @@ A markdown document is a library entry with no parse behind it (`documents.kind`
 
 - **Its baseline is its original.** An uploaded `.md` is kept as the document's original, `{document_id}.md` in the sources directory beside the other originals, under the same rules (outside the mount, deleted with the row, counted against the quota, refused whole when the quota has no room). Materialization writes `doc.md` from it — decoded as UTF-8, a leading byte-order mark dropped and `\r\n` line ends made `\n` — where a parsed document's comes from its result. A document written new keeps no original and its baseline is empty. So a directory the shell removed comes back with the text the document started with, as a parsed one comes back with its parse.
 - **No parse artifacts.** No `.sightread/results/…`, no crops, and no `source.*` copy: the original is the document's own first text, already in `doc.md` and in history, and a second copy beside it would only drift. `.meta.json` keeps its shape — `document_id` first, so the reconciliation's lookup still matches — with `job_id`, `model`, `bbox_format` and `page_count` null and `kind` `markdown`. The content route reports `has_source` false: there are no pages to render.
-- **The upload is checked before it is filed.** The bytes stream to the upload directory under `CONTENT_MAX_BYTES`, the cap a `doc.md` is read under anyway (**413** past it), and must decode as UTF-8 (**400** otherwise); only then is the row inserted and the file kept, under the workspace lock, as a parse's upload is.
+- **The upload is checked before it is filed.** The bytes stream to the upload directory under `CONTENT_MAX_BYTES`, the cap a `doc.md` is read under anyway (**413** past it), and must decode as UTF-8 (**400** otherwise); only then is the row inserted and the file kept, under the workspace lock, as a parse's upload is. **An upload named `AGENTS.md` is not a markdown document**: it is kept as a file where it lands (§ Files), whatever its declared type, since it is the reader's standing instructions to the chat agent for that folder, read from the tree as a file ([chat.md](./chat.md) § AGENTS.md) — as a document of its own it would be read by no conversation.
 
 
 ### Files

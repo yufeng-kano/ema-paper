@@ -237,6 +237,24 @@ describe('buildThread', () => {
     expect(steps.steps[0]).toMatchObject({ type: 'skill', name: 'zh-summary' })
   })
 
+  it('reads /init as a command that ran no skill, from the marker the route serves', () => {
+    const messages = [
+      message('user', [
+        { type: 'text', text: '/init my thesis papers' },
+        { type: 'text', text: '', context: 'init' },
+      ]),
+      message('assistant', [
+        { type: 'text', text: 'Looking at the folder.' },
+        { type: 'tool_use', id: 'a', name: 'bash', input: SED },
+      ]),
+    ]
+    const { items } = buildThread({ turns: [turn(false)], messages, groups: new Map() })
+    expect(kinds(items)).toEqual(['user', 'text', 'steps'])
+    expect(items[0]).toMatchObject({ text: '/init my thesis papers', command: 'init' })
+    const steps = items[2] as Extract<ThreadItem, { kind: 'steps' }>
+    expect(steps.steps.some((step) => step.type === 'skill')).toBe(false)
+  })
+
   it('reads a cancelled turn as a cancellation, not an error', () => {
     const messages = [message('user', [{ type: 'text', text: 'Go' }])]
     const groups = events({ event: 'turn_error', status: 'cancelled', error: 'cancelled' })
