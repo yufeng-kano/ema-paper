@@ -250,10 +250,13 @@ def display_content(content: list) -> list:
             shown.append(
                 {"type": "text", "context": "attachment", "attachment": block.get("attachment")}
             )
-        elif marker in (TURN_CONTEXT, chat_compact.COMPACT_CONTEXT, chat_agent.INIT_CONTEXT):
-            # The model's context, the compaction instruction and the `/init` instruction:
-            # nothing the thread shows.
-            continue
+        elif marker == chat_agent.INIT_CONTEXT:
+            # The `/init` instruction is nothing the thread shows; the marker stays, so the
+            # thread knows the message for a command and an edit keeps its arguments
+            # apart (docs/chat.md § AGENTS.md).
+            shown.append({"type": "text", "context": chat_agent.INIT_CONTEXT})
+        elif marker in (TURN_CONTEXT, chat_compact.COMPACT_CONTEXT):
+            continue  # the model's context and the compaction instruction: nothing the thread shows
         else:
             shown.append(block)
     return shown

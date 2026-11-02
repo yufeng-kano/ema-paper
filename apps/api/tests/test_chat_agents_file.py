@@ -213,8 +213,12 @@ async def test_init_carries_the_instruction_and_nothing_of_the_passage(chat_clie
     assert len(content) == 3 and content[2]["text"].startswith("Context for this message")
     detail = (await client.get(f"/api/conversations/{conversation_id}")).json()
     assert [turn["kind"] for turn in detail["turns"]] == ["message"]
+    # The instruction is not served; its marker is, so the thread draws a command.
     shown = detail["messages"][0]["content"]
-    assert shown == [{"type": "text", "text": "/init my thesis papers"}]
+    assert shown == [
+        {"type": "text", "text": "/init my thesis papers"},
+        {"type": "text", "context": "init"},
+    ]
     assert detail["conversation"]["title"] == "/init my thesis papers"
 
     # Edited, it is an `/init` again, its instruction rendered with the new note.
