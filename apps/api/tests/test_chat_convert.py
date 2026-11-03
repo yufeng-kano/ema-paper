@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 import respx
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from sightread.agents import chat as chat_agent
 from sightread.billing import ledger
@@ -468,7 +468,7 @@ async def test_the_agent_retries_a_failed_conversion_once_told_to(
         client, {"path": "paper.pdf"}, {"path": "paper.pdf", "retry": "yes"}
     )
     assert failed["is_error"] is True
-    assert "its original is kept" in failed["output"]
+    assert "Its credits were released. Its original is kept" in failed["output"]
     assert "Call convert_file with retry: true only once the user says yes" in failed["output"]
     # Not a literal true: the failure is answered again, nothing queued.
     assert loose["output"].startswith("The conversion of paper.pdf failed earlier: ")
@@ -480,7 +480,7 @@ async def test_the_agent_retries_a_failed_conversion_once_told_to(
         reserved = (
             await db.execute(select(CreditEntry.amount).where(CreditEntry.job_id == job_id))
         ).scalar_one()
-    assert f"reserves the whole conversion's {reserved:,} credits again" in failed["output"]
+    assert f"and reserves the whole conversion's {reserved:,} credits again" in failed["output"]
     assert await recorded(client, "convert_file") == 1
 
     down = False
@@ -530,6 +530,17 @@ async def test_a_retry_the_balance_or_the_original_cannot_carry_is_not_queued(
     assert job.status == "failed"
     assert vision.call_count == calls
     assert await recorded(client, "convert_file") == 1
+
+    # A conversion queued before the ledger had nothing reserved, and its retry reserves
+    # nothing (docs/billing.md § A parse): the answer prices it so.
+    async with client.app.state.sessionmaker() as db:
+        await db.execute(delete(CreditEntry).where(CreditEntry.job_id == job.id))
+        await db.commit()
+    _, (free,) = await _run(client, {"path": "paper.pdf"})
+    assert "Its credits were released" not in free["output"]
+    assert (
+        "costs no credits: this conversion was queued before credits were kept" in (free["output"])
+    )
 
     original_of(root, kept["id"]).unlink()
     _, (gone,) = await _run(client, {"path": "paper.pdf"})

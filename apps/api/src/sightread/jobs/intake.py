@@ -781,10 +781,14 @@ async def retry_library_parse(
         raise ApiError(409, "invalid_request", "Only a failed parse can be retried")
     original = workspace_documents.original_of(root, row.id)
     if original is None:
+        # Filed by the worker just after the failure, under the lock held here, or by the
+        # sweep when that failed (docs/jobs.md § Retention); or never kept.
         raise ApiError(
             409,
             "invalid_request",
-            "This document kept no original to parse again; upload the file again",
+            "This document's original is still being filed; retry it in a moment"
+            if workspace_documents.unfiled_upload(job) is not None
+            else "This document kept no original to parse again; upload the file again",
         )
     try:
         # The credits the failure released, reserved again for this run: the document is

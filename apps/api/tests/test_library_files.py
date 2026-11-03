@@ -897,10 +897,13 @@ async def test_a_parsed_documents_original_is_served_for_the_original_view(
     assert (await signed_out.get(url)).status_code == 401
 
 
-async def test_a_finished_parse_whose_original_is_being_filed_reads_null(writer, documents) -> None:
+async def test_a_finished_parses_upload_answers_as_its_original_until_it_is_filed(
+    writer, documents
+) -> None:
     """docs/api.md § GET /api/library: between a parse's terminal commit and the filing of
-    its original, the read says `original: null` — never `false`, which would send a failed
-    parse's reader to the retry dialog — and says what it is once retention ran."""
+    its original, its upload answers `…/original` and the read says `original: true` —
+    never `false`, which would send a failed parse's reader to the retry dialog; a retry
+    waits for the filing. An upload gone with nothing filed is `false`."""
     png = documents["png"].read_bytes()
     kept = await _kept(writer, "tiny.png", png, "image/png")
     assert (await _convert(writer, kept["id"])).status_code == 200
@@ -912,26 +915,40 @@ async def test_a_finished_parse_whose_original_is_being_filed_reads_null(writer,
         job.error = "1 of 1 pages failed"
         await db.commit()
         source = Path(job.source_path)
-    assert source.is_file()
+    assert source.is_file() and original_of(writer.root, kept["id"]) is None
+    url = f"/api/library/documents/{kept['id']}/original"
     listed = {row["id"]: row for row in (await _read(writer))["documents"]}
-    assert listed[kept["id"]]["original"] is None
+    assert listed[kept["id"]]["original"] is True
+    shown = await writer.get(url)
+    assert shown.status_code == 200 and shown.content == png
+    assert shown.headers["content-security-policy"] == "sandbox"
     # A one-row answer says the same.
     renamed = await writer.put(
         f"/api/library/documents/{kept['id']}", json={"name": "tiny2.png"}, headers=CSRF_HEADERS
     )
     assert renamed.status_code == 200, renamed.text
-    assert renamed.json()["original"] is None
-    # Filed: the listing says so, whatever the job row says yet.
+    assert renamed.json()["original"] is True
+    # A retry copies the original, which is not there yet: refused, nothing changed.
+    retried = await writer.post(
+        f"/api/library/documents/{kept['id']}/retry", json={}, headers=CSRF_HEADERS
+    )
+    assert retried.status_code == 409, retried.text
+    assert "still being filed" in retried.json()["error"]["message"]
+    async with writer.app.state.sessionmaker() as db:
+        assert (await db.get(Job, job.id)).status == "failed"
+    # Filed, as retention files it: the original answers.
     directory = sources_dir(writer.root)
     directory.mkdir(parents=True, exist_ok=True)
     (directory / f"{kept['id']}.png").write_bytes(png)
-    listed = {row["id"]: row for row in (await _read(writer))["documents"]}
-    assert listed[kept["id"]]["original"] is True
-    # An upload gone with nothing filed was not kept: `false`, not a wait that never ends.
-    (directory / f"{kept['id']}.png").unlink()
     source.unlink()
     listed = {row["id"]: row for row in (await _read(writer))["documents"]}
+    assert listed[kept["id"]]["original"] is True
+    assert (await writer.get(url)).content == png
+    # Neither there: not kept.
+    (directory / f"{kept['id']}.png").unlink()
+    listed = {row["id"]: row for row in (await _read(writer))["documents"]}
     assert listed[kept["id"]]["original"] is False
+    assert (await writer.get(url)).status_code == 404
 
 
 async def test_the_default_view_is_the_readers_preference(writer) -> None:

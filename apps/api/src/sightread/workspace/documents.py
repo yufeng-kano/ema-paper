@@ -652,6 +652,40 @@ def original_of(root: Path, document_id: int) -> Path | None:
     return None
 
 
+def unfiled_upload(job: Job) -> Path | None:
+    """A finished parse's upload while its original is still being filed: the worker files
+    it after the terminal commit, the sweep when that failed (docs/jobs.md § Retention), and
+    until then it answers as the original (docs/api.md). Looked at before `original_of`:
+    the filing deletes the upload only once every original is in place, so a look at the
+    upload and then at the originals finds one of them."""
+    if (
+        job.status not in ("succeeded", "failed")
+        or not job.source_path
+        or job.source_deleted_at is not None
+    ):
+        return None
+    upload = Path(job.source_path)
+    return upload if upload.is_file() and not upload.is_symlink() else None
+
+
+def open_original(root: Path, document_id: int, job: Job) -> int | None:
+    """A descriptor on a parse's original or, while it is still being filed, on the upload
+    it is filed from (`unfiled_upload`); None when neither is there."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    upload = unfiled_upload(job)
+    original = original_of(root, document_id)
+    if original is None and upload is not None:
+        with contextlib.suppress(OSError):
+            return os.open(upload, flags)
+        # Filed between the two looks: the upload moved where `original_of` finds it.
+        original = original_of(root, document_id)
+    if original is None:
+        return None
+    with contextlib.suppress(OSError):
+        return os.open(original, flags)
+    return None
+
+
 def kept_originals(root: Path) -> set[int]:
     """The ids of the documents whose original is kept (`original_of`), from one listing
     of the originals' directory: what the library read reports as `original`

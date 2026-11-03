@@ -82,6 +82,7 @@ from ..workspace.documents import (
     recover_trash,
     stage_upload,
     trashed_folder_ids,
+    unfiled_upload,
     user_folders,
 )
 from ..workspace.layout import DOC_FILE, FIGURES_DIR, NOTES_FILE, document_relative_dir
@@ -1887,32 +1888,39 @@ async def _conversion_failed(
     earlier: bool,
 ) -> chat_tools.ToolOutcome:
     """A conversion that failed, in this call or before it: its credits were released and,
-    with its original kept, it can be retried — once the user says yes, since a retry
-    reserves the whole conversion's credits again, every page's, not only the failed ones'
-    (docs/chat.md § Tools)."""
+    with its original kept — or its upload still being filed as it — it can be retried,
+    once the user says yes, since a retry reserves the whole conversion's credits again,
+    every page's, not only the failed ones' (docs/chat.md § Tools). A conversion queued
+    before the ledger has no credits to release or reserve (docs/billing.md § A parse)."""
     failed = f"The conversion of {shown_path} failed{' earlier' if earlier else ''}: {error}."
-    if (await asyncio.to_thread(original_of, ctx.paths.root, row_id)) is None:
-        return chat_tools.ToolOutcome(
-            f"{failed} Its credits were released. Its original was not kept, so it cannot be "
-            "retried: the user can upload the file again.",
-            is_error=True,
-        )
     async with ctx.sessionmaker() as db:
+        job = await db.get(Job, job_id)
         amount = (
             await db.execute(select(CreditEntry.amount).where(CreditEntry.job_id == job_id))
         ).scalar_one_or_none()
-    charge = (
-        f"the whole conversion's {amount:,} credits"
-        if amount is not None
-        else "the whole conversion's credits"
+    # As the library read looks (docs/api.md): the upload first, then the original.
+    kept = job is not None and (
+        await asyncio.to_thread(unfiled_upload, job) is not None
+        or await asyncio.to_thread(original_of, ctx.paths.root, row_id) is not None
+    )
+    released = "" if amount is None else " Its credits were released."
+    if not kept:
+        return chat_tools.ToolOutcome(
+            f"{failed}{released} Its original was not kept, so it cannot be retried: the user "
+            "can upload the file again.",
+            is_error=True,
+        )
+    cost = (
+        "costs no credits: this conversion was queued before credits were kept"
+        if amount is None
+        else f"reserves the whole conversion's {amount:,} credits again, every page's as the "
+        "first run did, not only the failed ones', and is charged only if it succeeds"
     )
     return chat_tools.ToolOutcome(
-        f"{failed} Its credits were released, and its original is kept: the user can open "
-        "and download it in Files. Tell the user, and ask whether to retry it: a retry sends "
-        f"only the pages that failed but reserves {charge} again, every page's as the first "
-        "run did, not only the failed ones', and is charged only if it succeeds. Call "
-        "convert_file with retry: true only once the user says yes, unless they already "
-        "asked for a retry.",
+        f"{failed}{released} Its original is kept: the user can open and download it in "
+        "Files. Tell the user, and ask whether to retry it: a retry sends only the pages "
+        f"that failed and {cost}. Call convert_file with retry: true only once the user says "
+        "yes, unless they already asked for a retry.",
         is_error=True,
     )
 
