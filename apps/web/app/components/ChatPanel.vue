@@ -123,9 +123,10 @@ const props = defineProps<{
 const emit = defineEmits<{
   /** The document's files changed on disk — an edit landed, or a revert — so reload them. */
   changed: []
-  /** The agent kept a file in Files, or made one a document — a `download_file` or a
-   *  `convert_file` result that was not an error — so the library behind the viewer reads
-   *  itself again. */
+  /** The agent kept a file in Files, or made one a document — a `download_file` result
+   *  that was not an error, or any `convert_file` result: a conversion that failed, or goes
+   *  on after the turn, has made the file a parse all the same — so the library behind the
+   *  viewer reads itself again (docs/web.md § Files). */
   filed: []
   /** An answer's section link was clicked: scroll the document to that heading. */
   locate: [target: { label: string; anchor: string }]
@@ -749,8 +750,7 @@ const stream = useConversationStream(
     }
     if (
       frame.event.event === 'tool_result' &&
-      (frame.event.name === 'download_file' || frame.event.name === 'convert_file') &&
-      !frame.event.is_error
+      (frame.event.name === 'convert_file' || (frame.event.name === 'download_file' && !frame.event.is_error))
     ) {
       filed = true
     }

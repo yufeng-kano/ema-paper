@@ -1863,7 +1863,16 @@ async def _drive_parse(ctx: TurnContext, job_id: uuid.UUID) -> Job | None:
                 return None
             if job.status in ("succeeded", "failed"):
                 return job
-            claimed = job.status == "queued" and await claim_job(db, job_id, ctx.generation)
+            # Nothing is claimed once the turn is ending around this call: a run started
+            # now would only be cancelled, its first calls paid and unrecorded — and after
+            # a lost worker lock it would take back a job the replacement requeued
+            # (docs/chat.md § Tools, *A conversion runs inside the turn*).
+            claimed = (
+                job.status == "queued"
+                and not ctx.convert_stop.is_set()
+                and not await _cancelled(ctx)
+                and await claim_job(db, job_id, ctx.generation)
+            )
         if not claimed:
             # Another worker's — a stale one still holding it — or claimed and finished
             # between the two reads: looked at again, within the same bounds, and no longer
@@ -1878,6 +1887,11 @@ async def _drive_parse(ctx: TurnContext, job_id: uuid.UUID) -> Job | None:
         ctx.inline_parse = run
         try:
             finished = await _await_inline_parse(ctx, run, deadline)
+        except Exception:  # noqa: BLE001 - the run is cancelled and gathered: put it back
+            # The look for a Stop met a database error, say: the job goes back on the queue
+            # as at a Stop, and the tool answers that the conversion goes on after the turn.
+            logger.exception("the wait for job %s failed", job_id)
+            finished = False
         finally:
             ctx.inline_parse = None
         if finished and run.exception() is not None:
@@ -1905,7 +1919,9 @@ async def _await_inline_parse(ctx: TurnContext, run: asyncio.Task, deadline: flo
     """Wait for the parse the turn drives: True once it has run to its end, False when
     the deadline passed, the user pressed Stop, or the end of the turn asked for it or
     cancelled it — the run cancelled and gathered either way, so the caller can put the
-    job back."""
+    job back. A wait that fails in any other way — the look for a Stop meets a database
+    error — cancels and gathers the run too before raising: a run left going unwatched
+    could be stopped by nothing, and would run beside the worker's next claim."""
     try:
         while True:
             remaining = deadline - time.monotonic()
@@ -1916,7 +1932,7 @@ async def _await_inline_parse(ctx: TurnContext, run: asyncio.Task, deadline: flo
                 return not run.cancelled()
             if ctx.convert_stop.is_set() or await _cancelled(ctx):
                 break
-    except asyncio.CancelledError:
+    except BaseException:
         run.cancel()
         await asyncio.gather(run, return_exceptions=True)
         raise

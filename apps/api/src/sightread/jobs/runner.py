@@ -14,6 +14,7 @@ failed pages are retried alone later, the kept ones never transcribed again (doc
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import logging
 import shutil
@@ -824,29 +825,37 @@ async def fail_job(
             return
         if generation is not None and job.worker_generation != generation:
             return
-    await _finish(
-        sessionmaker,
-        job_id,
-        status="failed",
-        error=error,
-        settings=settings,
-        generation=generation,
+    await _to_the_end(
+        _finish(
+            sessionmaker,
+            job_id,
+            status="failed",
+            error=error,
+            settings=settings,
+            generation=generation,
+        )
     )
 
 
 async def _to_the_end(coro):
     """Await `coro` so that a cancel of the caller waits for it instead of interrupting
-    it; the cancel is raised once it is done. For the finalization of a committed result
-    (docs/jobs.md § Retention): the row is `succeeded`, so a shutdown's requeue would
-    not take it back, and what is half-copied under a lock that a cancel released would
-    be nobody's to finish. And for a page's image preparation in a thread, which a
-    cancelled await does not stop: the work directory is removed and the job requeued
-    only once nothing writes into it any more."""
+    it; the cancel is raised once it is done. For the finalization of a terminal state,
+    a result's or a failure's (docs/jobs.md § Retention): the row is `succeeded` or
+    `failed`, so a shutdown's requeue — or a chat turn's Stop, around a conversion it
+    drives — would not take it back, and what is half-copied under a lock that a cancel
+    released would be nobody's to finish: a converted file whose failed parse never
+    filed its original would have no copy left but the upload. And for a page's image
+    preparation in a thread, which a cancelled await does not stop: the work directory
+    is removed and the job requeued only once nothing writes into it any more. A second
+    cancel while it waits is absorbed too (a turn's end cancels the run it drives, then
+    cancels it again when it stops waiting), so the caller never returns before it."""
     task = asyncio.ensure_future(coro)
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
-        await asyncio.wait({task})
+        while not task.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait({task})
         if not task.cancelled() and task.exception() is not None:
             logger.error("work interrupted by a cancel failed", exc_info=task.exception())
         raise
@@ -1028,6 +1037,18 @@ async def _finish_held(
     return True
 
 
+async def retain_source(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    job_id: uuid.UUID,
+    source: Path,
+) -> None:
+    """The sweep's retention of a terminal parse whose worker never ran it, run to its
+    end like the worker's: a shutdown's cancel would release the workspace lock under a
+    copy still being made (docs/jobs.md § Retention)."""
+    await _to_the_end(_retain_source(sessionmaker, settings, job_id, source))
+
+
 async def _retain_source(
     sessionmaker: async_sessionmaker[AsyncSession],
     settings: Settings,
@@ -1038,11 +1059,15 @@ async def _retain_source(
     by moving it (docs/jobs.md § Retention). The user's workspace lock first, then the
     job's row — the one order every holder of both takes — and the recipients are read
     under that row lock: filing takes it before it inserts, so a row filed while this
-    runs is either here or filed afterwards, as a finished parse. Each copy is checked
-    against the quota and taken where the document is at that moment. A recipient that
-    holds an original already is left alone, and when the upload is gone — a row filed
-    between the terminal commit and this lock found no original yet and took the upload
-    as its own — the rest are copied from the original any recipient holds."""
+    runs is either here or filed afterwards, as a finished parse. Each extra copy is
+    checked against the quota and taken where the document is at that moment; the
+    upload itself, moved to the last recipient, is kept whatever the quota says — the
+    one copy that row was filed for, and for a converted file the only one. A
+    recipient that holds an original already is left alone, and when the upload is gone
+    — a row filed between the terminal commit and this lock found no original yet and
+    took the upload as its own — the rest are copied from the original any recipient
+    holds. Run by the worker after a terminal commit, and by the sweep for a terminal
+    parse whose retention never ran (docs/jobs.md § Retention)."""
     async with sessionmaker() as db:
         job = await db.get(Job, job_id)
         if job is None:
@@ -1078,23 +1103,27 @@ async def _retain_source(
             for index, row in enumerate(pending):
                 # A document in the Trash keeps its original without the shell's copy,
                 # which would make a directory under `files/` for a file that is not
-                # there (docs/workspace.md § The Trash).
+                # there (docs/workspace.md § The Trash). A live one gets it only in a
+                # directory that holds `.meta.json` (`keep_source`): a failed parse's
+                # has none until a retry succeeds and materializes it.
                 relative = None
                 if is_live(row, folders):
                     relative = document_relative_dir(
                         await folder_names(db, row.user_id, row.folder_id), row.name
                     )
-                try:
-                    # Every copy counts: a full workspace keeps no more of them.
-                    await ensure_within_quota(db, settings, job.user_id, root)
-                except ApiError:
-                    logger.warning(
-                        "workspace of user %d is at its quota; "
-                        "the source of document %d is not kept",
-                        row.user_id,
-                        row.id,
-                    )
-                    continue
+                moved = source.is_file() and index == len(pending) - 1
+                if not moved:
+                    try:
+                        # Every extra copy counts: a full workspace keeps no more of them.
+                        await ensure_within_quota(db, settings, job.user_id, root)
+                    except ApiError:
+                        logger.warning(
+                            "workspace of user %d is at its quota; "
+                            "the source of document %d is not kept",
+                            row.user_id,
+                            row.id,
+                        )
+                        continue
                 if source.is_file():
                     await asyncio.to_thread(
                         keep_source,
@@ -1103,11 +1132,10 @@ async def _retain_source(
                         source,
                         document_id=row.id,
                         kind=job.kind,
-                        copy=index < len(pending) - 1,
+                        copy=not moved,
                     )
                 else:
-                    # The shell's copy comes with the next materialization, which
-                    # `_finish_held` runs right after this.
+                    # The shell's copy comes with the next materialization.
                     await asyncio.to_thread(copy_original, root, donor, row.id)
             # Not kept anywhere (none with room): deleted, as for a parse outside the
             # library.
@@ -1175,13 +1203,15 @@ async def run_job(
         )
         # No crop thread ever started for this run; a plain discard covers leftovers.
         discard_job_figures(figures_root, job_id)
-        await _finish(
-            sessionmaker,
-            job_id,
-            status="failed",
-            error=error,
-            settings=settings,
-            generation=generation,
+        await _to_the_end(
+            _finish(
+                sessionmaker,
+                job_id,
+                status="failed",
+                error=error,
+                settings=settings,
+                generation=generation,
+            )
         )
         return
 
@@ -1211,36 +1241,42 @@ async def run_job(
                 job, state, connection, source, work_dir, render_slots, sessionmaker, kept
             )
         except JobAborted as exc:
-            await _finish(
-                sessionmaker,
-                job_id,
-                status="failed",
-                error=str(exc),
-                settings=settings,
-                generation=generation,
+            await _to_the_end(
+                _finish(
+                    sessionmaker,
+                    job_id,
+                    status="failed",
+                    error=str(exc),
+                    settings=settings,
+                    generation=generation,
+                )
             )
             return
         except (poppler.PopplerError, ImageError, ValueError):
-            await _finish(
-                sessionmaker,
-                job_id,
-                status="failed",
-                error="the document is unreadable",
-                settings=settings,
-                generation=generation,
+            await _to_the_end(
+                _finish(
+                    sessionmaker,
+                    job_id,
+                    status="failed",
+                    error="the document is unreadable",
+                    settings=settings,
+                    generation=generation,
+                )
             )
             return
         except Exception:
             # A worker must not die on one job. The traceback goes to the log; the job row
             # carries no internals and no document content.
             logger.exception("job %s failed unexpectedly", job_id)
-            await _finish(
-                sessionmaker,
-                job_id,
-                status="failed",
-                error="internal error",
-                settings=settings,
-                generation=generation,
+            await _to_the_end(
+                _finish(
+                    sessionmaker,
+                    job_id,
+                    status="failed",
+                    error="internal error",
+                    settings=settings,
+                    generation=generation,
+                )
             )
             return
         finally:
@@ -1255,13 +1291,15 @@ async def run_job(
             reasons = "; ".join(f"page {o.page}: {o.error}" for o in failed[:5])
             if len(failed) > 5:
                 reasons += "; …"
-            await _finish(
-                sessionmaker,
-                job_id,
-                status="failed",
-                error=f"{len(failed)} of {len(outcomes)} pages failed ({reasons})",
-                settings=settings,
-                generation=generation,
+            await _to_the_end(
+                _finish(
+                    sessionmaker,
+                    job_id,
+                    status="failed",
+                    error=f"{len(failed)} of {len(outcomes)} pages failed ({reasons})",
+                    settings=settings,
+                    generation=generation,
+                )
             )
             return
 
@@ -1305,13 +1343,15 @@ async def run_job(
                 checked, reason = None, "internal error"
             if checked is None:
                 logger.warning("job %s format check failed: %s", job_id, reason)
-                await _finish(
-                    sessionmaker,
-                    job_id,
-                    status="failed",
-                    error=f"the format check failed ({reason})",
-                    settings=settings,
-                    generation=generation,
+                await _to_the_end(
+                    _finish(
+                        sessionmaker,
+                        job_id,
+                        status="failed",
+                        error=f"the format check failed ({reason})",
+                        settings=settings,
+                        generation=generation,
+                    )
                 )
                 return
             reading = checked.markdown

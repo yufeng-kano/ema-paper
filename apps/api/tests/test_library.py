@@ -7,20 +7,24 @@ safety).
 
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 from pathlib import Path
 
 import httpx
 import pytest
+import respx
 from httpx import AsyncClient
 from sqlalchemy import select, update
 
 from sightread.auth.sessions import SESSION_COOKIE, create_session
 from sightread.db.models import Document, Job, JobPage, Result, User
+from sightread.jobs.queue import claim_next_job
+from sightread.jobs.runner import run_job
 from sightread.routes.library import DOCUMENT_NAME_MAX, clean_name, free_name
 from sightread.workspace.layout import user_root
-from tests.conftest import CSRF_HEADERS, DATABASE_URL, convert_on_upload
+from tests.conftest import CSRF_HEADERS, DATABASE_URL, KANO_CHAT_URL, convert_on_upload
 
 MODEL = "vendor/vision-model"
 
@@ -61,6 +65,35 @@ async def _upload(
         data={} if folder_id is None else {"folder_id": str(folder_id)},
         headers=CSRF_HEADERS,
     )
+
+
+async def _parse_next(client: AsyncClient) -> None:
+    """The worker's next claim run to its end against a stubbed vision upstream, the format
+    check off: every row of the parse gets its directory — `.meta.json`, `doc.md` and the
+    shell's `source.*` — which a row has only once its parse succeeded (docs/workspace.md
+    § Layout)."""
+    off = await client.put(
+        "/api/agents/check/settings", json={"auto_check": False}, headers=CSRF_HEADERS
+    )
+    assert off.status_code == 200, off.text
+    settings = client.app.state.settings
+    async with client.app.state.sessionmaker() as db:
+        claimed = await claim_next_job(db, settings.max_jobs_per_user)
+    assert claimed is not None
+    router = respx.mock(assert_all_called=False)
+    router.post(KANO_CHAT_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "## Page one\n\nBody text."}}],
+                "usage": {"prompt_tokens": 90, "completion_tokens": 12},
+            },
+        )
+    )
+    with router:
+        await run_job(client.app.state.sessionmaker, settings, claimed, asyncio.Semaphore(2))
+    async with client.app.state.sessionmaker() as db:
+        assert (await db.get(Job, claimed)).status == "succeeded"
 
 
 async def _upload_markdown(client: AsyncClient) -> httpx.Response:
@@ -536,9 +569,10 @@ async def test_a_move_the_tree_refuses_leaves_the_row_where_the_files_are(
     await _ready_to_parse(library)
     folder = await _folder(library, "Invoices")
     await _upload(library, documents)
-    # The second upload of the same bytes keeps its own copy, so this row has files on
-    # disk before its parse has run (docs/workspace.md § Layout).
+    # The second upload of the same bytes joins the first's parse; once it has run, this
+    # row's directory holds its files (docs/workspace.md § Layout).
     uploaded = (await _upload(library, documents)).json()
+    await _parse_next(library)
     async with sessionmaker() as db:
         row = await db.get(Document, uploaded["id"])
         root = user_root(library.app.state.settings.workspaces_dir, row.user_id)
@@ -596,6 +630,7 @@ async def test_deleting_a_document_discards_its_original(
     await _ready_to_parse(library)
     await _upload(library, documents)
     uploaded = (await _upload(library, documents)).json()
+    await _parse_next(library)
     async with sessionmaker() as db:
         row = await db.get(Document, uploaded["id"])
         root = user_root(library.app.state.settings.workspaces_dir, row.user_id)
@@ -655,6 +690,7 @@ async def test_a_move_whose_commit_landed_despite_the_error_is_not_undone(
     await _ready_to_parse(library)
     await _upload(library, documents)
     uploaded = (await _upload(library, documents)).json()
+    await _parse_next(library)
     async with sessionmaker() as db:
         row = await db.get(Document, uploaded["id"])
         root = user_root(library.app.state.settings.workspaces_dir, row.user_id)

@@ -625,15 +625,20 @@ def job_is_stuck(job: Job, worker: WorkerStatus) -> bool:
     )
 
 
-async def requeue_orphaned_jobs(db: AsyncSession) -> list[uuid.UUID]:
+async def requeue_orphaned_jobs(db: AsyncSession, generation: int | None = None) -> list[uuid.UUID]:
     """Every job still `running` when a worker starts goes back to the queue: the
     deployment has one worker, so a job nobody is driving is one a dead worker held,
     and it would otherwise stay `running` for good, against its user's cap (docs/jobs.md).
-    Returns the ids, whose crops the caller discards with the partial progress."""
-    orphans = list((await db.execute(select(Job.id).where(Job.status == "running"))).scalars())
-    for job_id in orphans:
-        await requeue_job(db, job_id)
-    return orphans
+    With `generation`, the live worker's own jobs instead, once a chat turn has ended:
+    the worker runs one thing at a time, so a parse the turn drove and could not put
+    back is driven by nobody, and fenced on the generation it is requeued only if it is
+    still this worker's (docs/jobs.md § Queue). Returns the ids that went back, whose
+    crops the caller discards with the partial progress."""
+    owned = [Job.worker_generation == generation] if generation is not None else []
+    orphans = list(
+        (await db.execute(select(Job.id).where(Job.status == "running", *owned))).scalars()
+    )
+    return [job_id for job_id in orphans if await requeue_job(db, job_id, generation)]
 
 
 async def _keep_succeeded_pages(db: AsyncSession, job_id: uuid.UUID) -> None:

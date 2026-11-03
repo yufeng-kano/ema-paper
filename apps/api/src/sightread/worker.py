@@ -249,6 +249,19 @@ async def run_worker(stop: asyncio.Event) -> None:
                     )
                     async with sessionmaker() as db:
                         await fail_turn(db, turn_id, "internal error")
+                # A parse the turn drove with `convert_file` and could not put back — its
+                # requeue raised — is still this worker's, `running` with nobody driving
+                # it: back on the queue now rather than at the next start (docs/jobs.md
+                # § Queue).
+                try:
+                    async with sessionmaker() as db:
+                        left = await requeue_orphaned_jobs(db, generation)
+                except SQLAlchemyError:
+                    logger.exception("could not look for parses turn %s left running", turn_id)
+                else:
+                    for orphan in left:
+                        discard_job_figures(Path(settings.figures_dir), orphan)
+                        logger.warning("requeued job %s that turn %s left running", orphan, turn_id)
                 continue
 
             logger.info("running job %s", job_id)
