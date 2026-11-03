@@ -46,6 +46,7 @@ READ_ONLY_NAMES = frozenset({".git", ".gitignore", SIGHTREAD_DIR, META_FILE, CAC
 VIEW_MAX_CHARS = 60_000
 # The long edge a page image is sent at: what Claude would resize to anyway.
 PAGE_IMAGE_LONG_EDGE_PX = 1568
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
 # EXIF orientation → the transpose that turns the stored raster upright, as Pillow's
@@ -508,48 +509,62 @@ async def run_editor(
     return outcome
 
 
-def _convert_input(vm_path: str, header: ImageHeader | None) -> str:
-    """The start of an ImageMagick command on the image as this tool shows it: its first
-    frame (an animated GIF or WebP would otherwise give a file per frame), turned upright
-    as Pillow turned it — by the orientation the header named, since ImageMagick 6 reads
-    none from a PNG or a WebP; `-auto-orient` when the header was never read — and with
-    its EXIF stripped, so the piece is not turned a second time when it is viewed."""
+def _convert(vm_path: str, header: ImageHeader | None, operation: str, output: str) -> str:
+    """An ImageMagick command on the image as this tool shows it (docs/chat.md § Tools).
+    The file comes in on stdin, so ImageMagick never parses its name: a `*`, `?`, `[1]` or
+    `%d` in a library name would pick other files or none. Its first frame only (an
+    animated GIF or WebP would otherwise give a file per frame), turned upright as Pillow
+    turned it — by the orientation the header named, since ImageMagick 6 reads none from
+    a PNG or a WebP; `-auto-orient` when the header was never read — then its page reset,
+    since a transpose and a PNG's stored offset leave a canvas the crop would tile against,
+    flattened onto white as the tool flattens it, and its EXIF stripped, so the piece is
+    not turned a second time when it is viewed."""
     if header is None:
         turn = " -auto-orient"
     elif header.orientation != 1:
         turn = " " + ORIENTATIONS[header.orientation][1]
     else:
         turn = ""
-    return f"convert {shlex.quote(vm_path + '[0]')}{turn} -strip"
+    return (
+        f"convert '-[0]'{turn} +repage -background white -alpha remove -alpha off -strip "
+        f"{operation} {output} < {shlex.quote(vm_path)}"
+    )
 
 
-def _piece_commands(vm_path: str, long_edge: int, header: ImageHeader | None) -> str:
+def _piece_commands(vm_path: str, long_edge: int, header: ImageHeader | None, png: bool) -> str:
     """The shell commands that cut an image into pieces this tool shows at full size, in
     the frame the tool shows it in, so the coordinates agree. A PNG's pieces are PNGs, any
     other's JPEGs, as this tool would send them (docs/chat.md § Tools)."""
-    start = _convert_input(vm_path, header)
-    suffix = "png" if header is None or header.format == "PNG" else "jpg"
+    suffix = "png" if png else "jpg"
     count = ""
     if header is not None:
         pieces = math.ceil(header.width / long_edge) * math.ceil(header.height / long_edge)
         count = f" ({pieces} pieces)"
+    every = _convert(
+        vm_path,
+        header,
+        f"-crop {long_edge}x{long_edge} +repage",
+        f"/workspace/.cache/piece-%d.{suffix}",
+    )
+    region = _convert(
+        vm_path, header, "-crop WxH+X+Y +repage", f"/workspace/.cache/region.{suffix}"
+    )
     return (
-        f"Every piece, left to right then top to bottom{count}: "
-        f"`{start} -crop {long_edge}x{long_edge} +repage /workspace/.cache/piece-%d.{suffix}`. "
-        "One region, X,Y its top-left corner in the full image: "
-        f"`{start} -crop WxH+X+Y +repage /workspace/.cache/region.{suffix}`."
+        f"Every piece, left to right then top to bottom{count}: `{every}`. "
+        f"One region, X,Y its top-left corner in the full image: `{region}`."
     )
 
 
-def _in_steps(vm_path: str, long_edge: int, header: ImageHeader | None) -> str:
+def _in_steps(vm_path: str, long_edge: int, header: ImageHeader | None, png: bool) -> str:
     """How to look at an image this tool will not open: a smaller copy for the whole, then
     pieces for the detail."""
+    small = _convert(
+        vm_path, header, f"-resize {long_edge}x{long_edge}", "/workspace/.cache/small.jpg"
+    )
     return (
-        "Look at it in steps with bash: make a smaller copy to see the whole, "
-        f"`{_convert_input(vm_path, header)} -resize {long_edge}x{long_edge} "
-        "/workspace/.cache/small.jpg`, view that, then crop the parts you need under "
-        "/workspace/.cache/ and view them one by one. "
-        + _piece_commands(vm_path, long_edge, header)
+        f"Look at it in steps with bash: make a smaller copy to see the whole, `{small}`, "
+        "view that, then crop the parts you need under /workspace/.cache/ and view them one "
+        "by one. " + _piece_commands(vm_path, long_edge, header, png)
     )
 
 
@@ -562,7 +577,9 @@ def _too_large_to_view(vm_path: str, images: ImageView | None) -> str:
     )
     if not images.shell:
         return message
-    return f"{message} If it is an image: " + _in_steps(vm_path, images.long_edge, None)
+    # Nothing of it was read: whether its pieces are PNGs goes by its name.
+    png = vm_path.lower().endswith(".png")
+    return f"{message} If it is an image: " + _in_steps(vm_path, images.long_edge, None, png)
 
 
 async def _view_image(read: _ImageRead, images: ImageView) -> ToolOutcome:
@@ -588,7 +605,9 @@ async def _view_image(read: _ImageRead, images: ImageView) -> ToolOutcome:
         stated = f"{header.width}x{header.height} pixels" if header else "too many pixels"
         message = f"{vm_path} is {stated}, more than this tool opens ({images.max_pixels:,})."
         if images.shell:
-            message += " " + _in_steps(vm_path, long_edge, header)
+            # Pillow's own bomb check stops before a header exists: the bytes say PNG.
+            png = header.format == "PNG" if header else read.data.startswith(PNG_SIGNATURE)
+            message += " " + _in_steps(vm_path, long_edge, header, png)
         return ToolOutcome(message, is_error=True)
     except UnidentifiedImageError:
         if read.over_text_cap:
@@ -613,7 +632,8 @@ async def _view_image(read: _ImageRead, images: ImageView) -> ToolOutcome:
             note += (
                 f" To read it at full size, crop it with bash into pieces of at most "
                 f"{long_edge}x{long_edge} under /workspace/.cache/ and view them one by one "
-                "with this tool. " + _piece_commands(vm_path, long_edge, source)
+                "with this tool. "
+                + _piece_commands(vm_path, long_edge, source, source.format == "PNG")
             )
     if read.ranged:
         note += " view_range does not apply to an image; this is all of it."
@@ -701,8 +721,13 @@ def _model_image(
             io.BytesIO(source) if isinstance(source, bytes) else source, formats=formats
         )
     with opened:
+        # The cap is checked before anything decodes: a PNG's own `getexif` decodes the
+        # whole raster to look for an EXIF chunk after it, so one past the cap is described
+        # by what its header gave, which the base class's `getexif` parses and nothing more.
+        over_cap = opened.width * opened.height > max_pixels
         try:
-            orientation = int(opened.getexif().get(0x0112, 1))
+            exif = Image.Image.getexif(opened) if over_cap else opened.getexif()
+            orientation = int(exif.get(0x0112, 1))
         except Exception:  # noqa: BLE001 - an unreadable EXIF block leaves the image as stored
             orientation = 1
         turned = orientation in (5, 6, 7, 8)
@@ -712,7 +737,7 @@ def _model_image(
             orientation=orientation if orientation in ORIENTATIONS else 1,
             format=opened.format or "",
         )
-        if opened.width * opened.height > max_pixels:
+        if over_cap:
             raise ImageTooLarge(header)
         keep_png = png_only or header.format == "PNG"
         image: Image.Image = opened
@@ -722,7 +747,8 @@ def _model_image(
             # 16-bit grey (a microscope's, a depth map's): to 8 bits by its top byte. A
             # plain conversion to RGB clips everything past 255 to white.
             image = image.convert("I").point(lambda value: value / 256).convert("L")
-        if image.mode in ("RGBA", "LA", "P"):
+        # A grey or RGB PNG keeps its transparency as one key colour, not a channel.
+        if image.mode in ("RGBA", "LA", "P") or "transparency" in image.info:
             image = image.convert("RGBA")
             background = Image.new("RGBA", image.size, (255, 255, 255, 255))
             image = Image.alpha_composite(background, image).convert("RGB")

@@ -19,7 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 import respx
-from PIL import Image
+from PIL import Image, ImageFile
 
 from sightread.jobs import chat_runner, chat_tools
 from sightread.workspace.layout import user_root
@@ -36,6 +36,8 @@ from tests.test_chat_extensions import (
 
 # The crop the reader's screenshot showed failing as "not a text file".
 CROP = "files/DL/DIO/DINO Paper Presentation.pdf/figures/p11_330_115_785_880.png"
+# What every command does to the image read from stdin before its own step.
+FLAT = "+repage -background white -alpha remove -alpha off -strip"
 
 
 def _encoded(image: Image.Image, fmt: str, **save) -> bytes:
@@ -130,6 +132,11 @@ async def test_an_image_is_shown_upright(tmp_path) -> None:
     _media, image, line = _shown(await _view(root, "files/turned.jpg", _images()))
     assert image.size == (20, 40)
     assert "20x40 pixels" in line
+    # Turned once: the bytes sent carry no orientation that would turn them again, nor
+    # does the PNG a page preview gets from the same photo.
+    assert image.getexif().get(0x0112) is None
+    page = chat_tools._model_image(_encoded(photo, "JPEG", exif=exif), 40_000_000)
+    assert Image.open(io.BytesIO(page.data)).getexif().get(0x0112) is None
 
 
 async def test_a_malformed_exif_block_shows_the_image_rather_than_failing(tmp_path) -> None:
@@ -169,13 +176,18 @@ async def test_a_large_image_is_shrunk_and_says_how_to_read_it_in_pieces(tmp_pat
     media, image, line = _shown(await _view(root, path, _images()))
     assert media == "image/png" and image.size == (1568, 627)
     assert "4000x1600 pixels, shown shrunk to 1568x627" in line
-    # Pieces of the long edge are shown at full size: three across, two down.
-    quoted = shlex.quote(f"/workspace/{path}[0]")
+    # Pieces of the long edge are shown at full size: three across, two down. The file
+    # comes in on stdin, its name never an argument ImageMagick would parse.
+    quoted = shlex.quote(f"/workspace/{path}")
     assert (
-        f"`convert {quoted} -strip -crop 1568x1568 +repage /workspace/.cache/piece-%d.png`" in line
+        f"`convert '-[0]' {FLAT} -crop 1568x1568 +repage /workspace/.cache/piece-%d.png "
+        f"< {quoted}`" in line
     )
     assert "(6 pieces)" in line
-    assert f"`convert {quoted} -strip -crop WxH+X+Y +repage /workspace/.cache/region.png`" in line
+    assert (
+        f"`convert '-[0]' {FLAT} -crop WxH+X+Y +repage /workspace/.cache/region.png "
+        f"< {quoted}`" in line
+    )
 
     # An animation's pieces are of its first frame; a GIF's, like a photo's, are JPEGs.
     frames = [Image.new("P", (4000, 1600), 1), Image.new("P", (4000, 1600), 2)]
@@ -184,8 +196,8 @@ async def test_a_large_image_is_shrunk_and_says_how_to_read_it_in_pieces(tmp_pat
     _place(root, "files/anim.gif", gif.getvalue())
     _media, _image, line = _shown(await _view(root, "files/anim.gif", _images()))
     assert (
-        "`convert '/workspace/files/anim.gif[0]' -strip -crop 1568x1568 +repage "
-        "/workspace/.cache/piece-%d.jpg`" in line
+        f"`convert '-[0]' {FLAT} -crop 1568x1568 +repage /workspace/.cache/piece-%d.jpg "
+        "< /workspace/files/anim.gif`" in line
     )
 
     # Without a shell the commands are not offered: the turn could not run them.
@@ -214,28 +226,90 @@ async def test_an_image_past_the_pixel_cap_says_how_to_look_at_it_in_steps(tmp_p
     turned = await _view(root, "files/portrait.jpg", _images())
     assert "is 6000x8000 pixels" in turned.content
     assert (
-        "'/workspace/files/portrait.jpg[0]' -rotate 90 -strip -resize 1568x1568" in turned.content
+        f"`convert '-[0]' -rotate 90 {FLAT} -resize 1568x1568 /workspace/.cache/small.jpg "
+        "< /workspace/files/portrait.jpg`" in turned.content
     )
     assert "(24 pieces)" in turned.content and "piece-%d.jpg" in turned.content
 
 
+async def test_an_image_past_the_pixel_cap_is_refused_before_it_is_decoded(
+    tmp_path, monkeypatch
+) -> None:
+    """A PNG's own EXIF read decodes the raster to look for a chunk after it: past the cap
+    nothing may decode, so its size comes from the header alone."""
+    root = tmp_path / "ws" / "1"
+    _place(root, "files/huge.png", _encoded(Image.new("1", (7000, 7000)), "PNG"))
+    decoded: list[tuple[int, int]] = []
+    load = ImageFile.ImageFile.load
+
+    def recording_load(image):
+        decoded.append(image.size)
+        return load(image)
+
+    monkeypatch.setattr(ImageFile.ImageFile, "load", recording_load)
+    refused = await _view(root, "files/huge.png", _images())
+    assert refused.is_error and "is 7000x7000 pixels" in refused.content
+    assert decoded == []
+    # Within the cap the same read finds the image and decodes it once.
+    _place(root, "files/fits.png", _encoded(Image.new("1", (700, 700)), "PNG"))
+    _shown(await _view(root, "files/fits.png", _images()))
+    assert (700, 700) in decoded
+
+
+async def test_pieces_without_a_header_are_named_by_what_is_known(tmp_path, monkeypatch) -> None:
+    """Where no header was read, the pieces are PNGs only for a PNG: by its bytes past
+    Pillow's own bomb check, by its name past the byte cap."""
+    root = tmp_path / "ws" / "1"
+    plot_data = _encoded(Image.new("RGB", (100, 100)), "PNG")
+    photo_data = _encoded(Image.new("RGB", (100, 100)), "JPEG")
+    _place(root, "files/plot.png", plot_data)
+    _place(root, "files/photo", photo_data)
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1000)
+    plot = await _view(root, "files/plot.png", _images())
+    assert "is too many pixels" in plot.content and "-auto-orient" in plot.content
+    assert "piece-%d.png" in plot.content
+    photo = await _view(root, "files/photo", _images())
+    assert "is too many pixels" in photo.content and "piece-%d.jpg" in photo.content
+    monkeypatch.undo()
+
+    cap = min(len(plot_data), len(photo_data)) // 2
+    tight = _images(max_bytes=cap)
+    by_name = await _view(root, "files/plot.png", tight, max_bytes=cap)
+    assert "is larger than this tool reads" in by_name.content
+    assert "piece-%d.png" in by_name.content
+    unnamed = await _view(root, "files/photo", tight, max_bytes=cap)
+    assert "piece-%d.jpg" in unnamed.content
+
+
+async def test_a_transparent_key_colour_is_shown_on_white(tmp_path) -> None:
+    """A grey or RGB PNG keeps its transparency as one key colour (tRNS), not a channel."""
+    root = tmp_path / "ws" / "1"
+    for mode, key, ink in (("L", 0, 128), ("RGB", (0, 0, 0), (128, 0, 0))):
+        keyed = Image.new(mode, (10, 10), key)
+        keyed.putpixel((0, 0), ink)
+        _place(root, f"files/{mode}.png", _encoded(keyed, "PNG", transparency=key))
+        _media, image, _line = _shown(await _view(root, f"files/{mode}.png", _images()))
+        rgb = image.convert("RGB")
+        assert rgb.getpixel((5, 5)) == (255, 255, 255), mode
+        assert rgb.getpixel((0, 0)) != (255, 255, 255), mode
+
+
+async def _run_in_shell(command: str, root: Path) -> None:
+    """A command the note gave, run as the VM's bash would, /workspace being `root`."""
+    argv = ["/bin/bash", "-c", command.replace("/workspace/", f"{root}/")]
+    await asyncio.to_thread(subprocess.run, argv, check=True, cwd=root)  # noqa: S603
+
+
 @pytest.mark.skipif(shutil.which("convert") is None, reason="ImageMagick is not installed here")
 async def test_the_pieces_are_cut_from_the_image_the_tool_showed(tmp_path) -> None:
-    """The commands run as given (the VM's ImageMagick) cut the stated number of pieces,
-    upright as the tool showed the image — for a PNG and a WebP too, whose orientation
-    ImageMagick 6 does not read — and a piece viewed is not turned a second time."""
+    """The commands run as given (the VM's ImageMagick 6) cut the stated pieces, upright as
+    the tool showed the image for every EXIF orientation — a PNG's and a WebP's too, which
+    ImageMagick 6 does not read, and a transposed one, whose canvas it leaves stale — from
+    the named file alone, whatever its name holds, flattened onto white as the tool shows
+    it, and a piece viewed is not turned a second time."""
     root = tmp_path / "ws" / "1"
-    upright = Image.new("RGB", (200, 400), (0, 0, 255))
-    upright.paste((255, 0, 0), (0, 0, 100, 200))  # the top-left quarter is red
-    stored = upright.transpose(Image.Transpose.ROTATE_90)
-    exif = Image.Exif()
-    exif[0x0112] = 6
-    for name, fmt in (("rot.jpg", "JPEG"), ("rot.png", "PNG"), ("rot.webp", "WEBP")):
-        _place(root, f"files/{name}", _encoded(stored, fmt, exif=exif))
-    frames = [upright.convert("P"), Image.new("P", upright.size, 3)]
-    gif = io.BytesIO()
-    frames[0].save(gif, format="GIF", save_all=True, append_images=frames[1:])
-    _place(root, "files/anim.gif", gif.getvalue())
+    cache = root / ".cache"
+    cache.mkdir(parents=True)
     small = chat_tools.ImageView(  # noqa: S604 - shell means the agent has bash
         max_bytes=1 << 25,
         max_pixels=40_000_000,
@@ -243,21 +317,65 @@ async def test_the_pieces_are_cut_from_the_image_the_tool_showed(tmp_path) -> No
         decode_slot=asyncio.Semaphore(1),
         shell=True,
     )
-    cache = root / ".cache"
-    cache.mkdir()
-    for name in ("rot.jpg", "rot.png", "rot.webp", "anim.gif"):
+    upright = Image.new("RGB", (150, 300), (0, 0, 255))
+    upright.paste((255, 0, 0), (0, 0, 75, 150))  # the top-left quarter is red
+    stored_as = {1: None, **{o: turn for o, (turn, _option) in chat_tools.ORIENTATIONS.items()}}
+
+    async def cut(name: str) -> tuple[str, list[Image.Image]]:
         for old in cache.iterdir():
             old.unlink()
-        _media, image, line = _shown(await _view(root, f"files/{name}", small))
-        assert image.size == (50, 100) and "200x400 pixels" in line, name
-        command = re.search(r"Every piece[^`]*`([^`]*)`", line).group(1)
-        argv = shlex.split(command.replace("/workspace/", f"{root}/"))
-        await asyncio.to_thread(subprocess.run, argv, check=True)
-        pieces = sorted(cache.iterdir())
-        assert len(pieces) == 8 and "(8 pieces)" in line, name
-        red = _shown(await _view(root, f".cache/{pieces[0].name}", small))[1].convert("RGB")
-        assert red.size == (100, 100)
-        assert red.getpixel((50, 50))[0] > 200 and red.getpixel((50, 50))[2] < 60, name
+        _media, _image, line = _shown(await _view(root, f"files/{name}", small))
+        await _run_in_shell(re.search(r"Every piece[^`]*`([^`]*)`", line).group(1), root)
+        named = sorted(cache.iterdir(), key=lambda p: int(re.search(r"(\d+)\.", p.name)[1]))
+        return line, [Image.open(piece).convert("RGB") for piece in named]
+
+    for orientation, turn in stored_as.items():
+        # The raster as a camera would store it: turned the other way, to be turned back.
+        stored = upright
+        if turn is not None:
+            stored = upright.transpose(
+                {
+                    Image.Transpose.ROTATE_90: Image.Transpose.ROTATE_270,
+                    Image.Transpose.ROTATE_270: Image.Transpose.ROTATE_90,
+                }.get(turn, turn)
+            )
+        exif = Image.Exif()
+        exif[0x0112] = orientation
+        for fmt, suffix in (("JPEG", "jpg"), ("PNG", "png"), ("WEBP", "webp")):
+            name = f"scan *[1] %d {orientation}.{suffix}"
+            data = _encoded(stored, fmt, exif=exif)
+            _place(root, f"files/{name}", data)
+            # What a glob or a frame range in the name would also have picked up.
+            _place(root, f"files/scan X1 0 {orientation}.{suffix}", data)
+            line, pieces = await cut(name)
+            label = f"{fmt} orientation {orientation}"
+            assert "150x300 pixels" in line and "(6 pieces)" in line, label
+            assert [piece.size for piece in pieces] == [(100, 100), (50, 100)] * 3, label
+            assert pieces[0].getpixel((50, 50))[0] > 200, label
+            assert pieces[0].getpixel((50, 50))[2] < 60, label
+    # The last cut was a WebP's, into JPEGs: one viewed is shown as cut, not turned again.
+    _media, piece, _line = _shown(await _view(root, ".cache/piece-0.jpg", small))
+    assert piece.size == (100, 100) and piece.convert("RGB").getpixel((50, 50))[0] > 200
+
+    # Transparent: white where the tool shows white, the ink kept.
+    clear = Image.new("RGBA", (200, 100), (0, 0, 0, 0))
+    clear.paste((0, 0, 0, 255), (0, 0, 20, 20))
+    _place(root, "files/clear.webp", _encoded(clear, "WEBP", lossless=True))
+    _line, pieces = await cut("clear.webp")
+    assert pieces[0].getpixel((60, 60)) == (255, 255, 255)
+    assert max(pieces[0].getpixel((5, 5))) < 40
+
+    # A PNG ImageMagick cropped earlier keeps an offset on a larger canvas.
+    whole = root / "whole.png"
+    upright.resize((300, 300)).save(whole)
+    await asyncio.to_thread(
+        subprocess.run,  # noqa: S603 - fixed argv
+        ["convert", str(whole), "-crop", "150x100+50+50", str(root / "files/offset.png")],
+        check=True,
+    )
+    line, pieces = await cut("offset.png")
+    assert "(2 pieces)" in line
+    assert [piece.size for piece in pieces] == [(100, 100), (50, 100)]
 
 
 async def test_the_image_cap_is_not_the_text_cap(tmp_path) -> None:
