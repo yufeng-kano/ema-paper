@@ -10,6 +10,17 @@ RUN apt-get update \
         fontconfig fonts-noto-core fonts-noto-cjk fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
 
+# Debian caps ImageMagick at 16K pixels on an edge, which refuses a full-page screenshot
+# the editor tells the agent to cut into pieces (docs/sandbox.md § The image). Only the
+# edge goes up: the area, memory and disk limits stay Debian's. The check fails the
+# build if a Debian update ever words these lines differently.
+RUN sed -i \
+        -e 's|<policy domain="resource" name="width" value="16KP"/>|<policy domain="resource" name="width" value="64KP"/>|' \
+        -e 's|<policy domain="resource" name="height" value="16KP"/>|<policy domain="resource" name="height" value="64KP"/>|' \
+        /etc/ImageMagick-6/policy.xml \
+    && grep -q '<policy domain="resource" name="width" value="64KP"/>' /etc/ImageMagick-6/policy.xml \
+    && grep -q '<policy domain="resource" name="height" value="64KP"/>' /etc/ImageMagick-6/policy.xml
+
 # uv manages Python environments inside the workspace; its cache lives there too, so a
 # package installed once is there on the next boot (docs/sandbox.md § Lifecycle).
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/

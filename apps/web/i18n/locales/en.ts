@@ -781,7 +781,7 @@ export default {
     errors: {
       outOfCredits: 'The credits ran out during this turn. What was written stays.',
       storageFull: 'Your storage is full, so this turn could not start. Delete files or empty the Trash, or get more storage.',
-      modelUnavailable: 'This model is not available right now. Choose another one in Settings → Agent.',
+      modelUnavailable: 'This model is no longer available. Pick another one from the model menu under the message box, then send again.',
       timedOut: 'This turn took too long and was stopped. Try asking for a smaller piece at a time.',
       serviceUnavailable: 'The model service is unavailable right now. Try again in a little while.',
       busy: 'The model service is busy right now. Wait a moment and send it again.',

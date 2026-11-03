@@ -1518,13 +1518,13 @@ def test_an_image_past_the_pixel_cap_is_refused_before_it_is_decoded() -> None:
     Image.new("1", (7000, 7000)).save(buffer, format="PNG")
     assert len(buffer.getvalue()) < 100_000
     with pytest.raises(chat_tools.ImageTooLarge):
-        chat_tools._as_png(buffer.getvalue(), 40_000_000)
+        chat_tools._model_image(buffer.getvalue(), 40_000_000)
     small = io.BytesIO()
     Image.new("RGB", (20, 10), (255, 0, 0)).save(small, format="PNG")
-    assert chat_tools._as_png(small.getvalue(), 40_000_000).startswith(b"\x89PNG")
+    assert chat_tools._model_image(small.getvalue(), 40_000_000).data.startswith(b"\x89PNG")
     # The cap is the deployment's (`CHAT_PAGE_IMAGE_MAX_PIXELS`), not a constant.
     with pytest.raises(chat_tools.ImageTooLarge):
-        chat_tools._as_png(small.getvalue(), 100)
+        chat_tools._model_image(small.getvalue(), 100)
 
 
 @respx.mock
@@ -1741,10 +1741,10 @@ async def test_a_cancelled_decode_is_waited_for_before_the_slot_is_released(monk
         finished.append(True)
         return b"\x89PNG"
 
-    monkeypatch.setattr(chat_tools, "_as_png", slow_decode)
+    monkeypatch.setattr(chat_tools, "_model_image", slow_decode)
     slot = asyncio.Semaphore(1)
     decoding = asyncio.ensure_future(
-        chat_tools._settled(asyncio.to_thread(chat_tools._as_png, b"raw"))
+        chat_tools._settled(asyncio.to_thread(chat_tools._model_image, b"raw"))
     )
     await asyncio.to_thread(started.wait, 5)
     decoding.cancel()
