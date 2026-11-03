@@ -874,6 +874,10 @@ async def test_a_parsed_documents_original_is_served_for_the_original_view(
     assert shown.headers["content-disposition"].startswith("inline;")
     assert shown.headers["content-security-policy"] == "sandbox"
     assert shown.headers["cache-control"] == "private, no-store"
+    # *Download original* (docs/web.md § Files): the same bytes, as an attachment.
+    saved = await writer.get(url, params={"download": "1"})
+    assert saved.status_code == 200 and saved.content == png
+    assert saved.headers["content-disposition"].startswith("attachment;")
     part = await writer.get(url, headers={"Range": "bytes=0-3"})
     assert part.status_code == 206 and part.content == png[:4]
     assert part.headers["content-range"] == f"bytes 0-3/{len(png)}"

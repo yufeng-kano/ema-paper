@@ -17,8 +17,9 @@ from .parse import BBOX_FORMAT_YXYX
 # no dedup cache; the number is bookkeeping for the registry (docs/agents.md).
 # 10: convert_file, figure links; 11: fewer strict tools, thinking binding; 12: search
 # before guessing an address; 13: uv's default environment, the fonts; 14: the sites the
-# sandbox reaches; 15: insert_image; 16: the editor's view shows images.
-PIPELINE_VERSION = 16
+# sandbox reaches; 15: insert_image; 16: the editor's view shows images; 17: convert_file
+# retries a failed conversion.
+PIPELINE_VERSION = 17
 
 # Anthropic-defined tools carry no schema of their own (docs/chat.md § Tools). The order
 # is part of the cache prefix and never changes. A custom tool whose input has structure is
@@ -235,7 +236,8 @@ WEB_TOOL_NAMES: tuple[str, ...] = tuple(tool["name"] for tool in WEB_TOOLS)
 # A kept PDF or image converted into a document inside the turn, as the Files page's
 # *Convert to document…* converts one (docs/chat.md § Tools, *A conversion runs inside the
 # turn*). Declared last, after the web tools, and only where the deployment names a parse
-# model; a write of the turn, never a subagent's.
+# model; a write of the turn, never a subagent's. Not strict: a path and a flag the tool
+# checks itself, and the strict grammar keeps its size (§ Upstream).
 CONVERT_FILE_TOOL = {
     "name": "convert_file",
     "description": (
@@ -246,7 +248,9 @@ CONVERT_FILE_TOOL = {
         "read with str_replace_based_edit_tool. Costs the user credits per page; nothing "
         "when the same file was converted before. The way to read another paper: "
         "download_file it, convert_file it, read its doc.md. Never extract a PDF's text "
-        "in the shell or with Python instead."
+        "in the shell or with Python instead. A conversion that failed keeps the file: "
+        "tell the user and ask before retrying it with `retry: true`, which sends only the "
+        "pages that failed and costs credits again if it succeeds."
     ),
     "input_schema": {
         "type": "object",
@@ -254,7 +258,14 @@ CONVERT_FILE_TOOL = {
             "path": {
                 "type": "string",
                 "description": "The file's folders and name under the user's files",
-            }
+            },
+            "retry": {
+                "type": "boolean",
+                "description": (
+                    "Retry a conversion that failed. Only after the user said yes, unless "
+                    "they asked for the retry"
+                ),
+            },
         },
         "required": ["path"],
         "additionalProperties": False,

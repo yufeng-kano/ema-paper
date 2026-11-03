@@ -531,8 +531,9 @@ async def read_document_original(
     user: DocumentReader,
     db: DbSession,
     settings: AppSettings,
+    download: bool = Query(default=False),
 ):
-    return await library.document_original(document_id, request, user, db, settings)
+    return await library.document_original(document_id, request, user, db, settings, download)
 
 
 @router.get("/library/documents/{document_id}/file")
