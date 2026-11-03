@@ -13,20 +13,23 @@ import base64
 import contextlib
 import difflib
 import io
+import math
 import os
+import shlex
 import stat
 import tempfile
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
-from PIL import Image, ImageOps
+from PIL import Image, UnidentifiedImageError
 
 from ..parsing import poppler
 from ..parsing.figures import parse_bbox_path
+from ..parsing.images import JPEG_QUALITY
 from ..sandbox.client import SandboxClient, SandboxRejected, SandboxUnavailable
 from ..workspace import git, safe_io
-from ..workspace.documents import MARKDOWN_KIND, DocumentPaths, original_of
+from ..workspace.documents import IMAGE_FORMATS, MARKDOWN_KIND, DocumentPaths, original_of
 from ..workspace.layout import (
     CACHE_DIR,
     FIGURES_DIR,
@@ -45,8 +48,77 @@ VIEW_MAX_CHARS = 60_000
 PAGE_IMAGE_LONG_EDGE_PX = 1568
 
 
+# EXIF orientation → the transpose that turns the stored raster upright, as Pillow's
+# `exif_transpose` would — applied by hand, since that call rewrites the EXIF block and
+# raises on a malformed one (docs/chat.md § Tools) — and the ImageMagick option that does
+# the same in the shell, so a crop the agent asks for is cut from the image it was shown.
+ORIENTATIONS: dict[int, tuple[Image.Transpose, str]] = {
+    2: (Image.Transpose.FLIP_LEFT_RIGHT, "-flop"),
+    3: (Image.Transpose.ROTATE_180, "-rotate 180"),
+    4: (Image.Transpose.FLIP_TOP_BOTTOM, "-flip"),
+    5: (Image.Transpose.TRANSPOSE, "-transpose"),
+    6: (Image.Transpose.ROTATE_270, "-rotate 90"),
+    7: (Image.Transpose.TRANSVERSE, "-transverse"),
+    8: (Image.Transpose.ROTATE_90, "-rotate 270"),
+}
+
+
+@dataclass(frozen=True)
+class ImageHeader:
+    """What an image's header says, before any pixel is decoded: its upright size, its
+    EXIF orientation (1 when it has none) and Pillow's name for its format."""
+
+    width: int
+    height: int
+    orientation: int
+    format: str
+
+
 class ImageTooLarge(Exception):
     """The file would decode to more pixels than the worker will hold."""
+
+    def __init__(self, header: ImageHeader) -> None:
+        super().__init__(f"{header.width}x{header.height} exceeds the pixel cap")
+        self.header = header
+
+
+@dataclass(frozen=True)
+class ModelImage:
+    """An image as the model is sent it, with the header of what it was made from."""
+
+    data: bytes
+    media_type: str
+    source: ImageHeader
+    # The size sent, after the shrink to the long edge.
+    shown_width: int
+    shown_height: int
+
+
+@dataclass(frozen=True)
+class ImageView:
+    """What an editor `view` of an image may take, from the turn (docs/chat.md § Tools):
+    the bytes it reads (`CHAT_IMAGE_ROUND_MAX_BYTES`), the pixels it decodes
+    (`CHAT_PAGE_IMAGE_MAX_PIXELS`), the long edge it is sent at
+    (`CHAT_ATTACHMENT_IMAGE_LONG_EDGE`), the turn's one decode at a time, and whether the
+    caller has a shell to crop with — the commands are named only then."""
+
+    max_bytes: int
+    max_pixels: int
+    long_edge: int
+    decode_slot: asyncio.Semaphore
+    shell: bool
+
+
+@dataclass(frozen=True)
+class _ImageRead:
+    """A `view` of a file that is not text: its bytes, read under the workspace lock and
+    decoded after it is released."""
+
+    vm_path: str
+    data: bytes
+    # Over the text cap: if it is no image either, it is a file too large to view.
+    over_text_cap: bool
+    ranged: bool
 
 
 @dataclass
@@ -218,8 +290,14 @@ def _diff(before: str, after: str, label: str) -> str:
 
 
 def _edit_sync(
-    root: Path, tool_input: dict, author: str, *, max_chars: int, max_bytes: int
-) -> ToolOutcome:
+    root: Path,
+    tool_input: dict,
+    author: str,
+    *,
+    max_chars: int,
+    max_bytes: int,
+    images: ImageView | None = None,
+) -> ToolOutcome | _ImageRead:
     command = tool_input.get("command")
     try:
         path = resolve_workspace_path(root, tool_input.get("path"))
@@ -238,17 +316,32 @@ def _edit_sync(
                 return ToolOutcome(f"{vm_path} is not a plain directory", is_error=True)
         if kind == "none":
             return ToolOutcome(f"{vm_path} does not exist", is_error=True)
+        # A file that is not text may be an image, read up to the image cap rather than
+        # the text one (docs/chat.md § Tools); it is decoded once the lock is released.
         try:
-            text = safe_io.read_text(root, path, max_bytes)
+            data = safe_io.read_bytes(root, path, max(max_bytes, images.max_bytes if images else 0))
         except safe_io.EntryTooLarge:
-            return ToolOutcome(f"{vm_path} is too large to view; use bash", is_error=True)
+            return ToolOutcome(_too_large_to_view(vm_path, images), is_error=True)
         except (safe_io.UnsafeEntry, OSError):
             return ToolOutcome(f"{vm_path} is not a plain file", is_error=True)
-        except UnicodeDecodeError:
-            return ToolOutcome(f"{vm_path} is not a text file", is_error=True)
-        if text is None:
+        if data is None:
             return ToolOutcome(f"{vm_path} does not exist", is_error=True)
-        return ToolOutcome(truncate(_numbered(text, tool_input.get("view_range")), max_chars))
+        text = None
+        if len(data) <= max_bytes:
+            try:
+                text = data.decode()
+            except UnicodeDecodeError:
+                text = None
+        if text is not None:
+            return ToolOutcome(truncate(_numbered(text, tool_input.get("view_range")), max_chars))
+        if images is None:
+            return ToolOutcome(f"{vm_path} is not a text file", is_error=True)
+        return _ImageRead(
+            vm_path,
+            data,
+            over_text_cap=len(data) > max_bytes,
+            ranged=tool_input.get("view_range") is not None,
+        )
 
     if command not in ("str_replace", "insert", "create"):
         return ToolOutcome(f"unknown editor command {command!r}", is_error=True)
@@ -367,26 +460,164 @@ def _edit_sync(
 
 
 def _edit_guarded(
-    root: Path, tool_input: dict, author: str, *, max_chars: int, max_bytes: int
-) -> ToolOutcome:
+    root: Path,
+    tool_input: dict,
+    author: str,
+    *,
+    max_chars: int,
+    max_bytes: int,
+    images: ImageView | None = None,
+) -> ToolOutcome | _ImageRead:
     """A path that is well-formed but unusable — a directory where a file was expected, a
     parent that is a file, a vanished file — is the model's mistake to correct, not the
     turn's end."""
     try:
-        return _edit_sync(root, tool_input, author, max_chars=max_chars, max_bytes=max_bytes)
+        return _edit_sync(
+            root, tool_input, author, max_chars=max_chars, max_bytes=max_bytes, images=images
+        )
     except (OSError, git.GitError) as exc:
         return ToolOutcome(f"The file operation failed: {type(exc).__name__}", is_error=True)
 
 
 async def run_editor(
-    root: Path, tool_input: dict, author: str, *, max_chars: int, max_bytes: int
+    root: Path,
+    tool_input: dict,
+    author: str,
+    *,
+    max_chars: int,
+    max_bytes: int,
+    images: ImageView | None = None,
 ) -> ToolOutcome:
+    """The editor. With `images`, a `view` of an image file answers the image; without,
+    such a file is not text and is refused (docs/chat.md § Tools)."""
     # A view under the lock too: a shell command of another conversation may be
     # rewriting the file, and a read of it half-written would feed the model a mix.
     async with workspace_lock(root):
-        return await asyncio.to_thread(
-            _edit_guarded, root, tool_input, author, max_chars=max_chars, max_bytes=max_bytes
+        outcome = await asyncio.to_thread(
+            _edit_guarded,
+            root,
+            tool_input,
+            author,
+            max_chars=max_chars,
+            max_bytes=max_bytes,
+            images=images,
         )
+    # The bytes were read under the lock; the decode waits for nobody's write.
+    if isinstance(outcome, _ImageRead) and images is not None:
+        return await _view_image(outcome, images)
+    return outcome
+
+
+def _convert_input(vm_path: str, header: ImageHeader | None) -> str:
+    """The start of an ImageMagick command on the image as this tool shows it: its first
+    frame (an animated GIF or WebP would otherwise give a file per frame), turned upright
+    as Pillow turned it — by the orientation the header named, since ImageMagick 6 reads
+    none from a PNG or a WebP; `-auto-orient` when the header was never read — and with
+    its EXIF stripped, so the piece is not turned a second time when it is viewed."""
+    if header is None:
+        turn = " -auto-orient"
+    elif header.orientation != 1:
+        turn = " " + ORIENTATIONS[header.orientation][1]
+    else:
+        turn = ""
+    return f"convert {shlex.quote(vm_path + '[0]')}{turn} -strip"
+
+
+def _piece_commands(vm_path: str, long_edge: int, header: ImageHeader | None) -> str:
+    """The shell commands that cut an image into pieces this tool shows at full size, in
+    the frame the tool shows it in, so the coordinates agree. A PNG's pieces are PNGs, any
+    other's JPEGs, as this tool would send them (docs/chat.md § Tools)."""
+    start = _convert_input(vm_path, header)
+    suffix = "png" if header is None or header.format == "PNG" else "jpg"
+    count = ""
+    if header is not None:
+        pieces = math.ceil(header.width / long_edge) * math.ceil(header.height / long_edge)
+        count = f" ({pieces} pieces)"
+    return (
+        f"Every piece, left to right then top to bottom{count}: "
+        f"`{start} -crop {long_edge}x{long_edge} +repage /workspace/.cache/piece-%d.{suffix}`. "
+        "One region, X,Y its top-left corner in the full image: "
+        f"`{start} -crop WxH+X+Y +repage /workspace/.cache/region.{suffix}`."
+    )
+
+
+def _in_steps(vm_path: str, long_edge: int, header: ImageHeader | None) -> str:
+    """How to look at an image this tool will not open: a smaller copy for the whole, then
+    pieces for the detail."""
+    return (
+        "Look at it in steps with bash: make a smaller copy to see the whole, "
+        f"`{_convert_input(vm_path, header)} -resize {long_edge}x{long_edge} "
+        "/workspace/.cache/small.jpg`, view that, then crop the parts you need under "
+        "/workspace/.cache/ and view them one by one. "
+        + _piece_commands(vm_path, long_edge, header)
+    )
+
+
+def _too_large_to_view(vm_path: str, images: ImageView | None) -> str:
+    if images is None:
+        return f"{vm_path} is too large to view; use bash"
+    message = (
+        f"{vm_path} is larger than this tool reads ({images.max_bytes // (1024 * 1024)} MiB); "
+        "use bash."
+    )
+    if not images.shell:
+        return message
+    return f"{message} If it is an image: " + _in_steps(vm_path, images.long_edge, None)
+
+
+async def _view_image(read: _ImageRead, images: ImageView) -> ToolOutcome:
+    """An image a `view` read: decoded one at a time per turn with the pages, by the
+    decoders an inserted image is offered and no other, and shrunk to the long edge an
+    attached image is kept at; one too large to read in one look says how to read it in
+    pieces (docs/chat.md § Tools)."""
+    vm_path, long_edge = read.vm_path, images.long_edge
+    try:
+        async with images.decode_slot:
+            image = await _settled(
+                asyncio.to_thread(
+                    _model_image,
+                    read.data,
+                    images.max_pixels,
+                    long_edge,
+                    formats=IMAGE_FORMATS,
+                    png_only=False,
+                )
+            )
+    except (ImageTooLarge, Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+        header = exc.header if isinstance(exc, ImageTooLarge) else None
+        stated = f"{header.width}x{header.height} pixels" if header else "too many pixels"
+        message = f"{vm_path} is {stated}, more than this tool opens ({images.max_pixels:,})."
+        if images.shell:
+            message += " " + _in_steps(vm_path, long_edge, header)
+        return ToolOutcome(message, is_error=True)
+    except UnidentifiedImageError:
+        if read.over_text_cap:
+            return ToolOutcome(f"{vm_path} is too large to view; use bash", is_error=True)
+        return ToolOutcome(
+            f"{vm_path} is not a text file or an image this tool shows (PNG, JPEG, WebP, GIF, "
+            "HEIC); use bash",
+            is_error=True,
+        )
+    except (OSError, ValueError, SyntaxError, EOFError, RuntimeError):
+        # A known format by its header whose data then failed: truncated or damaged, or a
+        # HEIC whose coded size is not the one its header gave (pillow_heif's RuntimeError).
+        return ToolOutcome(f"{vm_path} could not be decoded as an image", is_error=True)
+    source = image.source
+    note = f"The image {vm_path}, {source.width}x{source.height} pixels."
+    if (image.shown_width, image.shown_height) != (source.width, source.height):
+        note = (
+            f"The image {vm_path}, {source.width}x{source.height} pixels, shown shrunk to "
+            f"{image.shown_width}x{image.shown_height}: small text and fine detail may be lost."
+        )
+        if images.shell:
+            note += (
+                f" To read it at full size, crop it with bash into pieces of at most "
+                f"{long_edge}x{long_edge} under /workspace/.cache/ and view them one by one "
+                "with this tool. " + _piece_commands(vm_path, long_edge, source)
+            )
+    if read.ranged:
+        note += " view_range does not apply to an image; this is all of it."
+    return ToolOutcome([_image_block(image.data, image.media_type), {"type": "text", "text": note}])
 
 
 def _commit_shell_sync(root: Path, command: str, author: str, *, max_chars: int) -> dict | None:
@@ -439,31 +670,58 @@ async def commit_shell_changes(
 # --- pages and figures --------------------------------------------------------------------
 
 
-def _png_block(data: bytes) -> dict:
+def _image_block(data: bytes, media_type: str) -> dict:
     return {
         "type": "image",
         "source": {
             "type": "base64",
-            "media_type": "image/png",
+            "media_type": media_type,
             "data": base64.b64encode(data).decode("ascii"),
         },
     }
 
 
-def _as_png(
-    source: Path | bytes, max_pixels: int, long_edge_px: int = PAGE_IMAGE_LONG_EDGE_PX
-) -> bytes:
-    """A PNG no longer than `long_edge_px` — what the model would keep, or what a preview
-    shows — oriented, flattened onto white. The size comes from the header: a file that
-    would decode past `max_pixels` (`CHAT_PAGE_IMAGE_MAX_PIXELS`) is refused before a
-    raster exists, and Pillow's own bomb check is an error, never a warning."""
+def _model_image(
+    source: Path | bytes,
+    max_pixels: int,
+    long_edge_px: int = PAGE_IMAGE_LONG_EDGE_PX,
+    *,
+    formats: tuple[str, ...] | None = None,
+    png_only: bool = True,
+) -> ModelImage:
+    """An image no longer than `long_edge_px` — what the model would keep, or what a
+    preview shows — oriented, flattened onto white: a PNG, or with `png_only` off a PNG
+    only when the source was one and a JPEG otherwise, so a photo is not sent at a PNG's
+    size. `formats` limits the decoders Pillow may try. The size comes from the header: a
+    file that would decode past `max_pixels` (`CHAT_PAGE_IMAGE_MAX_PIXELS`) is refused
+    before a raster exists, and Pillow's own bomb check is an error, never a warning."""
     with warnings.catch_warnings():
         warnings.simplefilter("error", Image.DecompressionBombWarning)
-        opened = Image.open(io.BytesIO(source) if isinstance(source, bytes) else source)
+        opened = Image.open(
+            io.BytesIO(source) if isinstance(source, bytes) else source, formats=formats
+        )
     with opened:
+        try:
+            orientation = int(opened.getexif().get(0x0112, 1))
+        except Exception:  # noqa: BLE001 - an unreadable EXIF block leaves the image as stored
+            orientation = 1
+        turned = orientation in (5, 6, 7, 8)
+        header = ImageHeader(
+            width=opened.height if turned else opened.width,
+            height=opened.width if turned else opened.height,
+            orientation=orientation if orientation in ORIENTATIONS else 1,
+            format=opened.format or "",
+        )
         if opened.width * opened.height > max_pixels:
-            raise ImageTooLarge(f"{opened.width}x{opened.height} exceeds the pixel cap")
-        image = ImageOps.exif_transpose(opened) or opened
+            raise ImageTooLarge(header)
+        keep_png = png_only or header.format == "PNG"
+        image: Image.Image = opened
+        if header.orientation != 1:
+            image = opened.transpose(ORIENTATIONS[header.orientation][0])
+        if image.mode in ("I;16", "I;16B", "I;16L", "I"):
+            # 16-bit grey (a microscope's, a depth map's): to 8 bits by its top byte. A
+            # plain conversion to RGB clips everything past 255 to white.
+            image = image.convert("I").point(lambda value: value / 256).convert("L")
         if image.mode in ("RGBA", "LA", "P"):
             image = image.convert("RGBA")
             background = Image.new("RGBA", image.size, (255, 255, 255, 255))
@@ -478,8 +736,17 @@ def _as_png(
                 Image.LANCZOS,
             )
         buffer = io.BytesIO()
-        image.save(buffer, format="PNG", optimize=True)
-        return buffer.getvalue()
+        if keep_png:
+            image.save(buffer, format="PNG", optimize=True)
+        else:
+            image.save(buffer, format="JPEG", quality=JPEG_QUALITY)
+        return ModelImage(
+            data=buffer.getvalue(),
+            media_type="image/png" if keep_png else "image/jpeg",
+            source=header,
+            shown_width=image.width,
+            shown_height=image.height,
+        )
 
 
 async def _settled(coro):
@@ -566,7 +833,7 @@ async def view_page(
         )
     except PageUnavailable as exc:
         return ToolOutcome(str(exc), is_error=True)
-    return ToolOutcome([_png_block(data), {"type": "text", "text": f"Page {page}."}])
+    return ToolOutcome([_image_block(data, "image/png"), {"type": "text", "text": f"Page {page}."}])
 
 
 class PageUnavailable(Exception):
@@ -611,16 +878,20 @@ async def original_page_png(
                     # The raster, one at a time per turn: a round of four reads must
                     # not hold four decoded pages before the budget sees any of them.
                     async with decode_slot:
-                        return await _settled(
-                            asyncio.to_thread(_as_png, rendered, max_pixels, long_edge_px)
+                        page_image = await _settled(
+                            asyncio.to_thread(_model_image, rendered, max_pixels, long_edge_px)
                         )
+                    return page_image.data
                 except poppler.PopplerError:
                     raise PageUnavailable(f"page {page} could not be rendered") from None
         try:
             with os.fdopen(os.dup(fd), "rb") as reader:
                 raw = await asyncio.to_thread(reader.read, max_bytes + 1)
             async with decode_slot:
-                return await _settled(asyncio.to_thread(_as_png, raw, max_pixels, long_edge_px))
+                page_image = await _settled(
+                    asyncio.to_thread(_model_image, raw, max_pixels, long_edge_px)
+                )
+            return page_image.data
         except OSError:
             raise PageUnavailable("the original image could not be read") from None
         except (ImageTooLarge, Image.DecompressionBombError, Image.DecompressionBombWarning):
@@ -648,4 +919,6 @@ async def view_figure(paths: DocumentPaths, tool_input: dict, *, max_bytes: int)
         data = None
     if data is None:
         return ToolOutcome("no crop is stored for that figure", is_error=True)
-    return ToolOutcome([_png_block(data), {"type": "text", "text": f"Figure at p{page}."}])
+    return ToolOutcome(
+        [_image_block(data, "image/png"), {"type": "text", "text": f"Figure at p{page}."}]
+    )

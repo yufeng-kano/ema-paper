@@ -135,12 +135,16 @@ async def _run_one(
     # § Subagents).
     if tool_input.get("command") != "view":
         return chat_tools.ToolOutcome(READ_ONLY, is_error=True)
+    # An image it views is the run's to budget (`_ImageBudget`); the crop commands only to
+    # one with a shell (docs/chat.md § Subagents).
+    shell = definition.writes and "bash" in definition.tools and ctx.sandbox is not None
     return await chat_tools.run_editor(
         ctx.paths.root,
         tool_input,
         f"{git.AGENT_AUTHOR_PREFIX}{ctx.conversation.id}",
         max_chars=ctx.settings.chat_tool_result_max_chars,
         max_bytes=ctx.settings.content_max_bytes,
+        images=chat_runner.editor_images(ctx, shell=shell),
     )
 
 

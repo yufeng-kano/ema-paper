@@ -1143,6 +1143,20 @@ async def _run_memory(
     return await asyncio.shield(task)
 
 
+def editor_images(ctx: TurnContext, *, shell: bool) -> chat_tools.ImageView:
+    """What an editor `view` of an image may take on this turn: the bytes `view_figure`
+    reads, the pixels `view_page` decodes, the long edge an attached image is kept at, the
+    turn's one decode at a time; `shell` when the caller has bash to crop with
+    (docs/chat.md § Tools)."""
+    return chat_tools.ImageView(
+        max_bytes=ctx.settings.chat_image_round_max_bytes,
+        max_pixels=ctx.settings.chat_page_image_max_pixels,
+        long_edge=ctx.settings.chat_attachment_image_long_edge,
+        decode_slot=ctx.decode_slot,
+        shell=shell,
+    )
+
+
 async def run_mutating(ctx: TurnContext, name: str, tool_input: dict) -> chat_tools.ToolOutcome:
     """A `bash` command or an editor call, the agent's own or a subagent's that may change
     files: the shell under the user's shell and workspace locks with its writing marker, the
@@ -1162,6 +1176,7 @@ async def run_mutating(ctx: TurnContext, name: str, tool_input: dict) -> chat_to
             author,
             max_chars=max_chars,
             max_bytes=ctx.settings.content_max_bytes,
+            images=editor_images(ctx, shell=ctx.sandbox is not None),
         )
     if ctx.sandbox is None:
         return chat_tools.ToolOutcome("No sandbox on this deployment.", is_error=True)
@@ -1322,7 +1337,9 @@ WEB_READ_TOOLS = frozenset({"web_search", "search_papers", "read_url"})
 NO_IMAGE_TOOLS = frozenset({"memory", *WEB_READ_TOOLS})
 # Read-only tools of one round in flight together.
 READ_CONCURRENCY = 4
-IMAGE_BUDGET_SPENT = "This round's image budget is spent; ask for fewer pages or figures at a time."
+IMAGE_BUDGET_SPENT = (
+    "This round's image budget is spent; ask for fewer pages, figures or images at a time."
+)
 IMAGE_TURN_BUDGET_SPENT = (
     "This turn's image budget is spent; finish with what you have seen, or answer and let "
     "the user ask again."
@@ -1370,37 +1387,40 @@ async def _run_tools(
             return NOT_RUN_COMPACT_ALLOWANCE
         return None if may_run(index) else NOT_RUN_OUT_OF_CREDITS
 
+    # One image budget for the round, the reads' and the editor's together: fifty page
+    # renders at once would hold their PNGs in memory together and store them all in the
+    # history.
+    budget = ctx.settings.chat_image_round_max_bytes
+    # The turn's budget too: the round's alone would let fifty rounds store fifty rounds'
+    # worth of pages in the history every later request replays.
+    turn_budget = ctx.settings.chat_image_turn_max_bytes
+    spent = 0
+
+    def exhausted() -> chat_tools.ToolOutcome | None:
+        if ctx.image_spent >= turn_budget:
+            return chat_tools.ToolOutcome(IMAGE_TURN_BUDGET_SPENT, is_error=True)
+        if spent >= budget:
+            return chat_tools.ToolOutcome(IMAGE_BUDGET_SPENT, is_error=True)
+        return None
+
+    def admit(outcome: chat_tools.ToolOutcome) -> chat_tools.ToolOutcome:
+        # One result at a time, as each completes (no await in between): an image that
+        # would cross a budget is replaced before it is reported or stored, so neither
+        # the round nor the turn exceeds it however many reads ran together. A result
+        # without an image — every write's but an editor view's — passes unchanged.
+        nonlocal spent
+        size = _image_bytes({"content": outcome.content})
+        if size and ctx.image_spent + size > turn_budget:
+            return chat_tools.ToolOutcome(IMAGE_TURN_BUDGET_SPENT, is_error=True)
+        if size and spent + size > budget:
+            return chat_tools.ToolOutcome(IMAGE_BUDGET_SPENT, is_error=True)
+        spent += size
+        ctx.image_spent += size
+        return outcome
+
     async def reads() -> None:
-        # A few at a time, against one image budget for the round: fifty page renders at
-        # once would hold their PNGs in memory together and store them all in the history.
+        # A few at a time, against the round's image budget.
         slots = asyncio.Semaphore(READ_CONCURRENCY)
-        budget = ctx.settings.chat_image_round_max_bytes
-        # The turn's budget too: the round's alone would let fifty rounds store fifty
-        # rounds' worth of pages in the history every later request replays.
-        turn_budget = ctx.settings.chat_image_turn_max_bytes
-        spent = 0
-
-        def exhausted() -> chat_tools.ToolOutcome | None:
-            if ctx.image_spent >= turn_budget:
-                return chat_tools.ToolOutcome(IMAGE_TURN_BUDGET_SPENT, is_error=True)
-            if spent >= budget:
-                return chat_tools.ToolOutcome(IMAGE_BUDGET_SPENT, is_error=True)
-            return None
-
-        def admit(outcome: chat_tools.ToolOutcome) -> chat_tools.ToolOutcome:
-            # One result at a time, as each completes (no await in between): an image
-            # that would cross a budget is replaced before it is reported or stored,
-            # so neither the round nor the turn exceeds it however many reads ran
-            # together.
-            nonlocal spent
-            size = _image_bytes({"content": outcome.content})
-            if size and ctx.image_spent + size > turn_budget:
-                return chat_tools.ToolOutcome(IMAGE_TURN_BUDGET_SPENT, is_error=True)
-            if size and spent + size > budget:
-                return chat_tools.ToolOutcome(IMAGE_BUDGET_SPENT, is_error=True)
-            spent += size
-            ctx.image_spent += size
-            return outcome
 
         async def one(index: int, block: dict) -> None:
             async with slots:
@@ -1459,7 +1479,10 @@ async def _run_tools(
                 block.get("name"),
                 chat_tools.ToolOutcome(why, is_error=True),
             )
-        return await _run_tool(ctx, block, malformed)
+        # Admitted like a read: an editor `view` of an image counts against the round's
+        # and the turn's image budgets. Never refused ahead for a spent budget, since a
+        # write returns no image and a view cannot be known to before it runs.
+        return await _run_tool(ctx, block, malformed, admit)
 
     async def writes() -> None:
         for index, block in enumerate(tool_uses):

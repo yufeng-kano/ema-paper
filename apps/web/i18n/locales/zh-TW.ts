@@ -766,7 +766,7 @@ export default {
     errors: {
       outOfCredits: '這一輪進行中點數用完了。已寫出的內容保留。',
       storageFull: '儲存空間已滿，這一輪沒有開始。刪除檔案或清空垃圾桶，或升級取得更多空間。',
-      modelUnavailable: '這個模型目前無法使用。請到「設定 → Agent」換一個模型。',
+      modelUnavailable: '這個模型已經無法使用。請從輸入框下方的模型選單換一個，再重新送出。',
       timedOut: '這一輪花太久，已經停止。可以把問題拆小一點再問。',
       serviceUnavailable: '模型服務暫時無法使用。請稍後再試。',
       busy: '模型服務目前忙碌。請稍等一下再送一次。',

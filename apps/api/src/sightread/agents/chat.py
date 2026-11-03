@@ -17,8 +17,8 @@ from .parse import BBOX_FORMAT_YXYX
 # no dedup cache; the number is bookkeeping for the registry (docs/agents.md).
 # 10: convert_file, figure links; 11: fewer strict tools, thinking binding; 12: search
 # before guessing an address; 13: uv's default environment, the fonts; 14: the sites the
-# sandbox reaches; 15: insert_image.
-PIPELINE_VERSION = 15
+# sandbox reaches; 15: insert_image; 16: the editor's view shows images.
+PIPELINE_VERSION = 16
 
 # Anthropic-defined tools carry no schema of their own (docs/chat.md § Tools). The order
 # is part of the cache prefix and never changes. A custom tool whose input has structure is
@@ -332,7 +332,8 @@ SUBAGENT_EDITOR_TOOL = {
     "description": (
         "View and edit files under /workspace. `view` shows a file with line numbers — "
         "`view_range` [start, end] for part of it, end -1 for the rest — or lists a "
-        "directory. `str_replace` replaces `old_str`, which must occur exactly once in the "
+        "directory; a PNG, JPEG, WebP, GIF or HEIC file it shows as the image itself, a "
+        "large one shrunk. `str_replace` replaces `old_str`, which must occur exactly once in the "
         "file, with `new_str`. `insert` puts `insert_text` after line `insert_line` (0 for "
         "the top). `create` writes a new file with `file_text`."
     ),
@@ -428,15 +429,15 @@ Pages: {page_count}   Bbox format: {bbox_format}   Parsed with: {parse_model}
 doc.md keeps these shapes; never remove or reorder them unless asked:
 - `<!-- page: N -->` marks where page N starts.
 - A figure is `![figN](sightread://pPAGE/y1,x1,y2,x2)` with its caption on the next line. Coordinates are 0-1000 of page height and width.
-- An inserted image is `![name](figures/img-<16 hex digits>.png)` (or `.jpg`), with an optional caption on the next line, in doc.md or notes.md. Keep the line as it is and move it with its caption when you move the text around it. Write a new one only with the line insert_image answers: no other name has a file behind it. view_figure cannot open it.
+- An inserted image is `![name](figures/img-<16 hex digits>.png)` (or `.jpg`), with an optional caption on the next line, in doc.md or notes.md. Keep the line as it is and move it with its caption when you move the text around it. Write a new one only with the line insert_image answers: no other name has a file behind it. view_figure cannot open it; str_replace_based_edit_tool's view shows it.
 - Math is `$...$` inline and `$$...$$` on its own lines, KaTeX syntax.
 - Tables are GFM pipe tables. Code is fenced.
 - A quote is `> ` before each of its lines, one level deep: the user's view reads a `>` inside a quote as text.
 
 # Tools
 
-- bash: a persistent shell in the VM — the working directory and exported variables carry over between commands; shell functions and unexported variables do not, and stdin is /dev/null. Python is uv's: `python` is a virtual environment kept in the workspace, `uv pip install` adds to it (`pip` is `uv pip`), and what you install stays until the user resets the sandbox. poppler (pdftoppm, pdftotext), ripgrep, jq, pandoc and imagemagick are installed, with Noto fonts for every script, CJK included, which matplotlib uses by default. {network} A command returns when it and any background jobs it started have finished, and anything still running at that point is killed — nothing survives from one command to the next. A server you need to talk to must be started, used and stopped within one command.
-- str_replace_based_edit_tool: view, str_replace, insert and create on files under /workspace. Use it for every change to doc.md and notes.md: the user sees each edit as a diff and can revert it. Do not rewrite a whole file to change one line.
+- bash: a persistent shell in the VM — the working directory and exported variables carry over between commands; shell functions and unexported variables do not, and stdin is /dev/null. Python is uv's: `python` is a virtual environment kept in the workspace, `uv pip install` adds to it (`pip` is `uv pip`), and what you install stays until the user resets the sandbox. poppler (pdftoppm, pdftotext), ripgrep, jq, pandoc and imagemagick are installed, with Noto fonts for every script, CJK included, which matplotlib uses by default. To read a large image at full size, cut it into pieces with imagemagick under /workspace/.cache/ and view them one by one: the editor's view of a shrunk image gives the commands. {network} A command returns when it and any background jobs it started have finished, and anything still running at that point is killed — nothing survives from one command to the next. A server you need to talk to must be started, used and stopped within one command.
+- str_replace_based_edit_tool: view, str_replace, insert and create on files under /workspace. `view` of a PNG, JPEG, WebP, GIF or HEIC file shows you the image itself: a figure crop under figures/, an inserted image, a picture in the user's files, a chart you saved. A large image is shown shrunk. Use it for every change to doc.md and notes.md: the user sees each edit as a diff and can revert it. Do not rewrite a whole file to change one line.
 - view_page: the rendered image of one page of the original. Use it before changing any number, formula, table cell or name, and whenever the transcription reads oddly. The page is the truth; doc.md is a transcription of it.
 - view_figure: one figure crop at full resolution.
 - memory: save, update or forget one of the user's memories; the Memory section at the end says when.
