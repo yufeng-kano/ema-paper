@@ -15,6 +15,7 @@ import {
   folderPath,
   imageFormat,
   failedWithOriginal,
+  awaitingOriginal,
   initialView,
   isMarkdownUpload,
   isPending,
@@ -420,10 +421,19 @@ describe('originalKind and initialView', () => {
   it('opens a failed parse on its original only where one was kept', () => {
     expect(failedWithOriginal(document(1, 'a.pdf', null, { status: 'failed', original: true }))).toBe(true)
     expect(failedWithOriginal(document(1, 'a.png', null, { kind: 'image', status: 'failed', original: true }))).toBe(true)
-    // None kept, or a read that did not look: the retry dialog, as before.
+    // None kept: the retry dialog, as before; still being filed: not yet either way.
     expect(failedWithOriginal(document(1, 'a.pdf', null, { status: 'failed', original: false }))).toBe(false)
     expect(failedWithOriginal(document(1, 'a.pdf', null, { status: 'failed', original: null }))).toBe(false)
     expect(failedWithOriginal(document(1, 'a.pdf', null, { status: 'succeeded', original: true }))).toBe(false)
     expect(failedWithOriginal(document(1, 'a.pdf', null, { status: 'running', original: true }))).toBe(false)
+  })
+
+  it('waits on a failed parse whose original is still being filed', () => {
+    expect(awaitingOriginal(document(1, 'a.pdf', null, { status: 'failed', original: null }))).toBe(true)
+    expect(awaitingOriginal(document(1, 'a.pdf', null, { status: 'failed', original: true }))).toBe(false)
+    expect(awaitingOriginal(document(1, 'a.pdf', null, { status: 'failed', original: false }))).toBe(false)
+    // A finished parse opens on its result; one on its way is pending already.
+    expect(awaitingOriginal(document(1, 'a.pdf', null, { status: 'succeeded', original: null }))).toBe(false)
+    expect(awaitingOriginal(document(1, 'a.pdf', null, { status: 'running', original: null }))).toBe(false)
   })
 })
