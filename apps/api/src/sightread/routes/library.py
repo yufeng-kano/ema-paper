@@ -332,6 +332,7 @@ def document_payload(
     credits: dict[uuid.UUID, int | None] | None = None,
     storage: dict[int, int] | None = None,
     originals: Collection[int] | None = None,
+    filing: Collection[int] = (),
 ) -> dict:
     """The row the file list draws: the entry, plus the live state of its parse and of
     its re-convert, the view it was last read in and whether its original is kept.
@@ -345,7 +346,9 @@ def document_payload(
     (`ledger.credits_by_job`, docs/billing.md § Routes); `storage` each document's share
     of the storage (`StorageUsage.documents`), None where the workspace was not measured;
     `originals` the ids whose original upload is kept (`kept_originals`), None where it
-    was not looked up — a parse's `original` is then null (docs/api.md).
+    was not looked up — a parse's `original` is then null (docs/api.md); `filing` the
+    ids of finished parses whose upload still waits to be filed as their original, null
+    too until it is.
     """
     failed = failed or {}
     credits = credits or {}
@@ -421,8 +424,9 @@ def document_payload(
         "credits": credits.get(job.id),
         "view": row.view,
         # Whether `…/original` answers: known from one listing on the library read, not
-        # looked up by the one-row answers (docs/api.md).
-        "original": (row.id in originals) if originals is not None else None,
+        # looked up by the one-row answers, and not yet while it is being filed
+        # (docs/api.md).
+        "original": (None if originals is None or row.id in filing else row.id in originals),
         "reconvert": (
             None
             if reconvert is None
@@ -482,10 +486,21 @@ async def read_document_payload(db: DbSession, settings: AppSettings, row: Docum
     reconvert = await job_of(db, row.reconvert_job_id) if row.reconvert_job_id is not None else None
     jobs = [job, reconvert]
     originals: set[int] = set()
+    filing: set[int] = set()
     if job is not None:
         root = user_root(settings.workspaces_dir, row.user_id)
+        # As the library read tells a finished parse's original being filed: its upload
+        # looked at before the original (`read_library`).
+        unfiled = (
+            job.status in ("succeeded", "failed")
+            and job.source_path is not None
+            and job.source_deleted_at is None
+            and await asyncio.to_thread(Path(job.source_path).is_file)
+        )
         if await asyncio.to_thread(workspace_documents.original_of, root, row.id) is not None:
             originals.add(row.id)
+        elif unfiled:
+            filing.add(row.id)
     return document_payload(
         row,
         job,
@@ -493,6 +508,7 @@ async def read_document_payload(db: DbSession, settings: AppSettings, row: Docum
         reconvert,
         await ledger.credits_by_job(db, [one.id for one in jobs if one is not None]),
         originals=originals,
+        filing=filing,
     )
 
 
@@ -579,10 +595,26 @@ async def read_library(user: SessionUser, db: DbSession, settings: AppSettings):
     except OSError:
         # A directory nested too deep to measure: the sizes are unknown, not the library.
         storage = None
+    # Which finished parses still wait for their original to be filed: the worker files
+    # it after the terminal commit, so `source_deleted_at` is unset meanwhile and the
+    # upload still in the upload directory (docs/jobs.md § Retention). Looked at before
+    # the listing: an original filed in between is in the listing, never read as lost.
+    unfiled = {
+        row.id: Path(job.source_path)
+        for row, job in documents
+        if job is not None
+        and job.status in ("succeeded", "failed")
+        and job.source_path
+        and job.source_deleted_at is None
+    }
+    waiting = await asyncio.to_thread(
+        lambda: {row_id for row_id, source in unfiled.items() if source.is_file()}
+    )
     # Which parses can be read on their original (docs/api.md).
     originals = await asyncio.to_thread(
         workspace_documents.kept_originals, user_root(settings.workspaces_dir, user_id)
     )
+    filing = waiting - originals
 
     def origin(parent_id: int | None) -> list[str]:
         place = nearest_live(by_id, parent_id)
@@ -602,6 +634,7 @@ async def read_library(user: SessionUser, db: DbSession, settings: AppSettings):
                 credits,
                 storage,
                 originals,
+                filing,
             )
             for row, job in documents
             if row.trashed_at is None and row.folder_id not in trashed
@@ -626,6 +659,7 @@ async def read_library(user: SessionUser, db: DbSession, settings: AppSettings):
                         credits,
                         storage,
                         originals,
+                        filing,
                     ),
                     "trashed_at": row.trashed_at,
                     "origin": origin(row.folder_id),

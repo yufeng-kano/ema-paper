@@ -20,7 +20,7 @@ from sqlalchemy import select
 
 from sightread.agents import chat as chat_agent
 from sightread.billing import ledger
-from sightread.db.models import Document, Job, utcnow
+from sightread.db.models import CreditEntry, Document, Job, utcnow
 from sightread.errors import ApiError
 from sightread.jobs import chat_runner, runner, sweeper
 from sightread.jobs.queue import claim_next_job
@@ -475,6 +475,12 @@ async def test_the_agent_retries_a_failed_conversion_once_told_to(
     _, job, _ = await _settled(client, kept["id"])
     assert job.status == "failed"
     job_id = job.id
+    # The price of a retry is the whole conversion's, said in credits.
+    async with client.app.state.sessionmaker() as db:
+        reserved = (
+            await db.execute(select(CreditEntry.amount).where(CreditEntry.job_id == job_id))
+        ).scalar_one()
+    assert f"reserves the whole conversion's {reserved:,} credits again" in failed["output"]
     assert await recorded(client, "convert_file") == 1
 
     down = False
@@ -528,8 +534,7 @@ async def test_a_retry_the_balance_or_the_original_cannot_carry_is_not_queued(
     original_of(root, kept["id"]).unlink()
     _, (gone,) = await _run(client, {"path": "paper.pdf"})
     assert gone["output"].endswith(
-        "Its original was not kept, so it cannot be retried: the user can upload the file "
-        "again."
+        "Its original was not kept, so it cannot be retried: the user can upload the file again."
     )
 
 

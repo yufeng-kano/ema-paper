@@ -744,7 +744,6 @@ async def convert_kept_file(
     return row
 
 
-
 async def retry_library_parse(
     db: AsyncSession,
     settings: Settings,
@@ -833,6 +832,7 @@ async def retry_library_parse(
             "reload the library before trying again",
         ) from exc
     return job_id
+
 
 def cached_payload(result: Result) -> dict:
     """The data plane's result payload of a dedup hit, flagged `meta.cached` (docs/jobs.md

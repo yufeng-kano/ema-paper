@@ -39,6 +39,7 @@ from ..db.models import (
     ChatToolCall,
     ChatTurn,
     Conversation,
+    CreditEntry,
     Document,
     Job,
     Message,
@@ -1822,7 +1823,9 @@ async def _run_convert(ctx: TurnContext, tool_input: dict) -> chat_tools.ToolOut
             is_error=True,
         )
     if failed_earlier is not None and not retried:
-        return await _conversion_failed(ctx, row_id, shown_path, failed_earlier, earlier=True)
+        return await _conversion_failed(
+            ctx, row_id, job_id, shown_path, failed_earlier, earlier=True
+        )
     if converted_here or retried:
         await _record_tool_call(ctx, "convert_file", settle=False)
     job = await _drive_parse(ctx, job_id)
@@ -1842,7 +1845,7 @@ async def _run_convert(ctx: TurnContext, tool_input: dict) -> chat_tools.ToolOut
         )
     if job.status != "succeeded":
         return await _conversion_failed(
-            ctx, row_id, shown_path, job.error or "the parse failed", earlier=False
+            ctx, row_id, job_id, shown_path, job.error or "the parse failed", earlier=False
         )
     async with ctx.sessionmaker() as db:
         row = await db.get(Document, row_id)
@@ -1875,11 +1878,18 @@ async def _run_convert(ctx: TurnContext, tool_input: dict) -> chat_tools.ToolOut
 
 
 async def _conversion_failed(
-    ctx: TurnContext, row_id: int, shown_path: str, error: str, *, earlier: bool
+    ctx: TurnContext,
+    row_id: int,
+    job_id: uuid.UUID,
+    shown_path: str,
+    error: str,
+    *,
+    earlier: bool,
 ) -> chat_tools.ToolOutcome:
     """A conversion that failed, in this call or before it: its credits were released and,
-    with its original kept, it can be retried — once the user says yes, since a retry is
-    charged again (docs/chat.md § Tools)."""
+    with its original kept, it can be retried — once the user says yes, since a retry
+    reserves the whole conversion's credits again, every page's, not only the failed ones'
+    (docs/chat.md § Tools)."""
     failed = f"The conversion of {shown_path} failed{' earlier' if earlier else ''}: {error}."
     if (await asyncio.to_thread(original_of, ctx.paths.root, row_id)) is None:
         return chat_tools.ToolOutcome(
@@ -1887,12 +1897,22 @@ async def _conversion_failed(
             "retried: the user can upload the file again.",
             is_error=True,
         )
+    async with ctx.sessionmaker() as db:
+        amount = (
+            await db.execute(select(CreditEntry.amount).where(CreditEntry.job_id == job_id))
+        ).scalar_one_or_none()
+    charge = (
+        f"the whole conversion's {amount:,} credits"
+        if amount is not None
+        else "the whole conversion's credits"
+    )
     return chat_tools.ToolOutcome(
         f"{failed} Its credits were released, and its original is kept: the user can open "
         "and download it in Files. Tell the user, and ask whether to retry it: a retry sends "
-        "only the pages that failed, reserves their credits again and is charged only if it "
-        "succeeds. Call convert_file with retry: true only once the user says yes, unless "
-        "they already asked for a retry.",
+        f"only the pages that failed but reserves {charge} again, every page's as the first "
+        "run did, not only the failed ones', and is charged only if it succeeds. Call "
+        "convert_file with retry: true only once the user says yes, unless they already "
+        "asked for a retry.",
         is_error=True,
     )
 

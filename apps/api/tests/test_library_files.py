@@ -897,6 +897,43 @@ async def test_a_parsed_documents_original_is_served_for_the_original_view(
     assert (await signed_out.get(url)).status_code == 401
 
 
+async def test_a_finished_parse_whose_original_is_being_filed_reads_null(writer, documents) -> None:
+    """docs/api.md § GET /api/library: between a parse's terminal commit and the filing of
+    its original, the read says `original: null` — never `false`, which would send a failed
+    parse's reader to the retry dialog — and says what it is once retention ran."""
+    png = documents["png"].read_bytes()
+    kept = await _kept(writer, "tiny.png", png, "image/png")
+    assert (await _convert(writer, kept["id"])).status_code == 200
+    async with writer.app.state.sessionmaker() as db:
+        row = await db.get(Document, kept["id"])
+        job = await db.get(Job, row.job_id)
+        # The worker's terminal commit, the upload not filed yet.
+        job.status = "failed"
+        job.error = "1 of 1 pages failed"
+        await db.commit()
+        source = Path(job.source_path)
+    assert source.is_file()
+    listed = {row["id"]: row for row in (await _read(writer))["documents"]}
+    assert listed[kept["id"]]["original"] is None
+    # A one-row answer says the same.
+    renamed = await writer.put(
+        f"/api/library/documents/{kept['id']}", json={"name": "tiny2.png"}, headers=CSRF_HEADERS
+    )
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["original"] is None
+    # Filed: the listing says so, whatever the job row says yet.
+    directory = sources_dir(writer.root)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"{kept['id']}.png").write_bytes(png)
+    listed = {row["id"]: row for row in (await _read(writer))["documents"]}
+    assert listed[kept["id"]]["original"] is True
+    # An upload gone with nothing filed was not kept: `false`, not a wait that never ends.
+    (directory / f"{kept['id']}.png").unlink()
+    source.unlink()
+    listed = {row["id"]: row for row in (await _read(writer))["documents"]}
+    assert listed[kept["id"]]["original"] is False
+
+
 async def test_the_default_view_is_the_readers_preference(writer) -> None:
     """Which view a converted document opens on the first time: Markdown unless the reader
     changes it (docs/api.md § PUT /api/me/preferences)."""

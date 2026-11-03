@@ -250,7 +250,7 @@ CONVERT_FILE_TOOL = {
         "download_file it, convert_file it, read its doc.md. Never extract a PDF's text "
         "in the shell or with Python instead. A conversion that failed keeps the file: "
         "tell the user and ask before retrying it with `retry: true`, which sends only the "
-        "pages that failed and costs credits again if it succeeds."
+        "pages that failed but is charged the whole conversion's credits if it succeeds."
     ),
     "input_schema": {
         "type": "object",
