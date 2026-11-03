@@ -71,18 +71,17 @@ from ..workspace.agents_file import agents_file_text
 from ..workspace.documents import (
     MARKDOWN_KIND,
     DocumentPaths,
+    answering_original,
     ensure_within_quota,
     folder_names,
     is_live,
     keep_image,
     materialize_document,
     measure_storage,
-    original_of,
     prepare_inserted_image,
     recover_trash,
     stage_upload,
     trashed_folder_ids,
-    unfiled_upload,
     user_folders,
 )
 from ..workspace.layout import DOC_FILE, FIGURES_DIR, NOTES_FILE, document_relative_dir
@@ -1898,11 +1897,11 @@ async def _conversion_failed(
         amount = (
             await db.execute(select(CreditEntry.amount).where(CreditEntry.job_id == job_id))
         ).scalar_one_or_none()
-    # As the library read looks (docs/api.md): the upload first, then the original.
-    kept = job is not None and (
-        await asyncio.to_thread(unfiled_upload, job) is not None
-        or await asyncio.to_thread(original_of, ctx.paths.root, row_id) is not None
-    )
+        # What the library reads as `original` (docs/api.md).
+        kept = (
+            job is not None
+            and await answering_original(db, ctx.paths.root, row_id, job) is not None
+        )
     released = "" if amount is None else " Its credits were released."
     if not kept:
         return chat_tools.ToolOutcome(

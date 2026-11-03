@@ -951,6 +951,39 @@ async def test_a_finished_parses_upload_answers_as_its_original_until_it_is_file
     assert (await writer.get(url)).status_code == 404
 
 
+async def test_an_unfiled_upload_answers_only_for_the_row_it_is_filed_for(
+    writer, documents
+) -> None:
+    """docs/jobs.md § Retention: retention moves the upload to the last row naming the parse
+    that holds no original, whatever the quota, and copies it to the others only while the
+    quota lets it — so until the filing, the upload answers for that row alone."""
+    png = documents["png"].read_bytes()
+    kept = await _kept(writer, "tiny.png", png, "image/png")
+    assert (await _convert(writer, kept["id"])).status_code == 200
+    # A copy made while the parse runs names the same parse, with no original yet.
+    copied = await writer.post(
+        f"/api/library/documents/{kept['id']}/copy", json={"folder_id": None}, headers=CSRF_HEADERS
+    )
+    assert copied.status_code == 201, copied.text
+    twin = copied.json()
+    async with writer.app.state.sessionmaker() as db:
+        job = await db.get(Job, (await db.get(Document, kept["id"])).job_id)
+        assert (await db.get(Document, twin["id"])).job_id == job.id
+        job.status = "failed"
+        job.error = "1 of 1 pages failed"
+        await db.commit()
+    heir, other = max(kept["id"], twin["id"]), min(kept["id"], twin["id"])
+    listed = {row["id"]: row for row in (await _read(writer))["documents"]}
+    assert (listed[heir]["original"], listed[other]["original"]) == (True, False)
+    shown = await writer.get(f"/api/library/documents/{heir}/original")
+    assert shown.status_code == 200 and shown.content == png
+    assert (await writer.get(f"/api/library/documents/{other}/original")).status_code == 404
+    one = await writer.put(
+        f"/api/library/documents/{other}", json={"name": "other.png"}, headers=CSRF_HEADERS
+    )
+    assert one.status_code == 200 and one.json()["original"] is False
+
+
 async def test_the_default_view_is_the_readers_preference(writer) -> None:
     """Which view a converted document opens on the first time: Markdown unless the reader
     changes it (docs/api.md § PUT /api/me/preferences)."""

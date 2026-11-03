@@ -654,10 +654,9 @@ def original_of(root: Path, document_id: int) -> Path | None:
 
 def unfiled_upload(job: Job) -> Path | None:
     """A finished parse's upload while its original is still being filed: the worker files
-    it after the terminal commit, the sweep when that failed (docs/jobs.md § Retention), and
-    until then it answers as the original (docs/api.md). Looked at before `original_of`:
-    the filing deletes the upload only once every original is in place, so a look at the
-    upload and then at the originals finds one of them."""
+    it after the terminal commit, the sweep when that failed (docs/jobs.md § Retention).
+    Looked at before the originals: the filing deletes the upload only once every original
+    is in place, so a look at the upload and then at the originals finds one of them."""
     if (
         job.status not in ("succeeded", "failed")
         or not job.source_path
@@ -668,17 +667,39 @@ def unfiled_upload(job: Job) -> Path | None:
     return upload if upload.is_file() and not upload.is_symlink() else None
 
 
-def open_original(root: Path, document_id: int, job: Job) -> int | None:
-    """A descriptor on a parse's original or, while it is still being filed, on the upload
-    it is filed from (`unfiled_upload`); None when neither is there."""
+def upload_heir(job_rows: Iterable[int], held: Collection[int]) -> int | None:
+    """Which row naming a parse its unfiled upload is filed for: the last one holding no
+    original, which retention moves it to whatever the quota — the others take a copy only
+    while the quota lets them (docs/jobs.md § Retention)."""
+    return max((row_id for row_id in job_rows if row_id not in held), default=None)
+
+
+async def answering_original(
+    db: AsyncSession, root: Path, document_id: int, job: Job
+) -> Path | None:
+    """What `…/original` answers with for a parse's row (docs/api.md): its kept original
+    or, until it is filed, the upload it will be — for the row the upload is filed for
+    (`upload_heir`); None when neither."""
+    upload = await asyncio.to_thread(unfiled_upload, job)
+    kept = await asyncio.to_thread(original_of, root, document_id)
+    if kept is not None or upload is None:
+        return kept
+    job_rows = (
+        await db.execute(
+            select(Document.id).where(Document.job_id == job.id, Document.user_id == job.user_id)
+        )
+    ).scalars()
+    held = await asyncio.to_thread(kept_originals, root)
+    return upload if upload_heir(job_rows, held) == document_id else None
+
+
+def open_original(root: Path, document_id: int, source: Path) -> int | None:
+    """A descriptor on what `answering_original` found or, when that was the upload and the
+    filing moved it in between, on the original it became; None when neither opens."""
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
-    upload = unfiled_upload(job)
+    with contextlib.suppress(OSError):
+        return os.open(source, flags)
     original = original_of(root, document_id)
-    if original is None and upload is not None:
-        with contextlib.suppress(OSError):
-            return os.open(upload, flags)
-        # Filed between the two looks: the upload moved where `original_of` finds it.
-        original = original_of(root, document_id)
     if original is None:
         return None
     with contextlib.suppress(OSError):

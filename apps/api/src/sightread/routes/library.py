@@ -344,9 +344,8 @@ def document_payload(
     the row points at as its re-convert (docs/api.md); `credits` what each parse cost
     (`ledger.credits_by_job`, docs/billing.md § Routes); `storage` each document's share
     of the storage (`StorageUsage.documents`), None where the workspace was not measured;
-    `originals` the ids whose original upload is kept (`kept_originals`) or answers in its
-    place while it is being filed (`unfiled_upload`), None where it was not looked up — a
-    parse's `original` is then null (docs/api.md).
+    `originals` the ids whose `…/original` answers (`answering_original`), None where it
+    was not looked up — a parse's `original` is then null (docs/api.md).
     """
     failed = failed or {}
     credits = credits or {}
@@ -485,11 +484,7 @@ async def read_document_payload(db: DbSession, settings: AppSettings, row: Docum
     originals: set[int] = set()
     if job is not None:
         root = user_root(settings.workspaces_dir, row.user_id)
-        # As the library read looks: the upload of an original still being filed first.
-        if (
-            await asyncio.to_thread(workspace_documents.unfiled_upload, job) is not None
-            or await asyncio.to_thread(workspace_documents.original_of, root, row.id) is not None
-        ):
+        if await workspace_documents.answering_original(db, root, row.id, job) is not None:
             originals.add(row.id)
     return document_payload(
         row,
@@ -584,19 +579,27 @@ async def read_library(user: SessionUser, db: DbSession, settings: AppSettings):
     except OSError:
         # A directory nested too deep to measure: the sizes are unknown, not the library.
         storage = None
-    # Which parses can be read on their original (docs/api.md): the kept ones, and those
-    # whose original is still being filed, read from their upload meanwhile — looked
-    # at before the listing, so an original filed in between is in the listing.
+    # Which parses can be read on their original (docs/api.md): the kept ones, and, until a
+    # finished parse's original is filed, the row its upload is filed for, read from the
+    # upload meanwhile (`answering_original`) — looked at before the listing, so an
+    # original filed in between is in the listing.
     unfiled = await asyncio.to_thread(
         lambda: {
-            row.id
-            for row, job in documents
+            job.id
+            for _row, job in documents
             if job is not None and workspace_documents.unfiled_upload(job) is not None
         }
     )
-    originals = unfiled | await asyncio.to_thread(
+    originals = await asyncio.to_thread(
         workspace_documents.kept_originals, user_root(settings.workspaces_dir, user_id)
     )
+    for job_id in unfiled:
+        heir = workspace_documents.upload_heir(
+            (row.id for row, job in documents if job is not None and job.id == job_id),
+            originals,
+        )
+        if heir is not None:
+            originals.add(heir)
 
     def origin(parent_id: int | None) -> list[str]:
         place = nearest_live(by_id, parent_id)
@@ -1898,10 +1901,14 @@ async def reconvert_document(
             raise ApiError(409, "invalid_request", "The document is already being re-converted")
         original = workspace_documents.original_of(root, row.id)
         if original is None:
+            # Filed by the worker just after the parse ended, under the lock held here, or
+            # by the sweep when that failed (docs/jobs.md § Retention); or never kept.
             raise ApiError(
                 409,
                 "invalid_request",
-                "This document kept no original to parse again; upload the file again",
+                "This document's original is still being filed; re-convert it in a moment"
+                if workspace_documents.unfiled_upload(job) is not None
+                else "This document kept no original to parse again; upload the file again",
             )
         submission = await submit_parse(
             db,
@@ -2174,7 +2181,12 @@ async def document_original(
         raise ApiError(404, "invalid_request", "No such original")
     job = await job_of(db, row.job_id)
     root = user_root(settings.workspaces_dir, row.user_id)
-    entry = await asyncio.to_thread(workspace_documents.open_original, root, row.id, job)
+    source = await workspace_documents.answering_original(db, root, row.id, job)
+    entry = (
+        None
+        if source is None
+        else await asyncio.to_thread(workspace_documents.open_original, root, row.id, source)
+    )
     if entry is None:
         raise ApiError(404, "invalid_request", "This document kept no original")
     return file_response(
