@@ -72,6 +72,18 @@ NOT_UTF8 = "The document file is not UTF-8 text"
 # upload is recognised as one by (its kind, `MARKDOWN_KIND`, is the row's).
 MARKDOWN_MEDIA_TYPE = "text/markdown"
 MARKDOWN_EXTENSIONS = (".md", ".markdown")
+
+
+def markdown_name(name: str, limit: int) -> str:
+    """A markdown document's name ends in `.md` — or `.markdown`, kept when the name has
+    it — whether written new, uploaded or renamed (docs/workspace.md § Markdown documents).
+    The stem gives up the room the extension needs at the limit, as it does for a suffix."""
+    if name.lower().endswith(MARKDOWN_EXTENSIONS):
+        return name
+    extension = MARKDOWN_EXTENSIONS[0]
+    return f"{name[: limit - len(extension)].rstrip()}{extension}"
+
+
 # An inserted image's file name: the first 16 hex digits of its bytes' SHA-256, as it is
 # kept (docs/workspace.md § Inserted images). Never a name from the request.
 IMAGE_NAME = re.compile(r"img-[0-9a-f]{16}\.(?:png|jpg)")

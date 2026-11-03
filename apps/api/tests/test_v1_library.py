@@ -138,8 +138,8 @@ async def test_the_library_lists_live_rows_with_their_paths(reader: AsyncClient)
     assert by_id[draft] | {"created_at": None} == {
         "id": draft,
         "folder_id": None,
-        "name": "Draft",
-        "path": "Draft",
+        "name": "Draft.md",
+        "path": "Draft.md",
         "kind": "markdown",
         "status": None,
         "media_type": None,
@@ -219,7 +219,7 @@ async def test_a_save_needs_the_etag_it_was_edited_from(reader: AsyncClient) -> 
 
     history = (await reader.get(f"/api/library/documents/{draft}/revisions")).json()["revisions"]
     assert [entry["author"] for entry in history[:2]] == ["api", "api"]
-    assert history[0]["message"] == "edit files/Draft/doc.md"
+    assert history[0]["message"] == "edit files/Draft.md/doc.md"
 
 
 async def test_notes_save_the_same_way(reader: AsyncClient) -> None:
@@ -528,5 +528,5 @@ async def test_every_name_a_command_writes_is_one_plain_shell_word(reader: Async
         option = _payload(await session.call_tool("write_document", {"document_id": dash}))
 
     assert read["original"].endswith("""-o "$d"/'source.$(touch x)'""")
-    assert up["download"].startswith("d=_..; ")
-    assert option["save"].startswith("d='./-rf notes'; ")
+    assert up["download"].startswith("d=_...md; ")
+    assert option["save"].startswith("d='./-rf notes.md'; ")

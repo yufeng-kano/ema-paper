@@ -17,6 +17,7 @@ from httpx import AsyncClient
 from sqlalchemy import func, select
 
 from sightread.db.models import Document, Job
+from sightread.routes.library import DOCUMENT_NAME_MAX
 from sightread.workspace.documents import original_of
 from sightread.workspace.layout import user_root
 from tests.conftest import CSRF_HEADERS
@@ -131,7 +132,7 @@ async def test_a_markdown_type_alone_is_enough(writer) -> None:
     uploaded = await _upload_markdown(writer, b"# Hi\n", name="readme", media_type="text/markdown")
     assert uploaded.status_code == 201, uploaded.text
     assert uploaded.json()["kind"] == "markdown"
-    assert uploaded.json()["name"] == "readme"
+    assert uploaded.json()["name"] == "readme.md"
 
 
 async def test_a_markdown_upload_must_be_utf8_text_under_the_content_cap(
@@ -176,7 +177,8 @@ async def test_a_new_document_starts_empty_and_takes_a_free_name(writer) -> None
     assert created.status_code == 201, created.text
     document = created.json()
     assert {key: document[key] for key in NO_PARSE} == NO_PARSE
-    assert (await _new(writer, "Draft")).json()["name"] == "Draft (2)"
+    assert document["name"] == "Draft.md"
+    assert (await _new(writer, "Draft")).json()["name"] == "Draft (2).md"
     assert (await _new(writer, "Draft", folder_id=999_999)).status_code == 404
     assert original_of(writer.root, document["id"]) is None
 
@@ -192,8 +194,8 @@ async def test_a_new_document_starts_empty_and_takes_a_free_name(writer) -> None
     assert again["markdown"] == "# Written here\n"
     revisions = (await writer.get(f"/api/library/documents/{document['id']}/revisions")).json()
     assert [entry["message"] for entry in revisions["revisions"]] == [
-        "edit files/Draft/doc.md",
-        "materialize files/Draft",
+        "edit files/Draft.md/doc.md",
+        "materialize files/Draft.md",
     ]
 
 
@@ -258,7 +260,7 @@ async def test_the_agent_page_renders_a_markdown_documents_facts(writer) -> None
     facts = context.json()["facts"]
     assert facts["page_count"] == "none" and facts["bbox_format"] == "none"
     assert facts["parse_model"] == "not parsed (a markdown document)"
-    assert facts["document_path"] == "/workspace/files/Draft"
+    assert facts["document_path"] == "/workspace/files/Draft.md"
 
 
 @respx.mock
@@ -327,3 +329,47 @@ async def test_a_turn_on_a_markdown_document_edits_it_and_has_no_pages(writer) -
         assert row is not None and row.job_id is None
     content = (await writer.get(f"/api/library/documents/{document['id']}/content")).json()
     assert content["markdown"] == "# Plan\n\nShip it today.\n"
+
+
+async def test_a_markdown_document_is_named_with_its_extension(writer) -> None:
+    """Written new, uploaded or renamed, the name ends in `.md` — `.markdown` kept — so every
+    markdown document looks like the `.md` files beside it (docs/workspace.md § Markdown
+    documents)."""
+    kept = await _new(writer, "plan.markdown")
+    assert kept.json()["name"] == "plan.markdown"
+    assert (await _new(writer, "Notes.MD")).json()["name"] == "Notes.MD"
+    at_limit = "x" * DOCUMENT_NAME_MAX
+    long = await _new(writer, at_limit)
+    assert long.json()["name"] == f"{'x' * (DOCUMENT_NAME_MAX - 3)}.md"
+
+    renamed = await writer.put(
+        f"/api/library/documents/{kept.json()['id']}",
+        json={"name": "summary"},
+        headers=CSRF_HEADERS,
+    )
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["name"] == "summary.md"
+    await writer.get(f"/api/library/documents/{kept.json()['id']}/content")
+    assert (writer.root / "files" / "summary.md" / "doc.md").exists()
+    # A rename to a name the folder holds with its extension is the clash it looks like.
+    twin = await _new(writer, "Other")
+    clash = await writer.put(
+        f"/api/library/documents/{twin.json()['id']}",
+        json={"name": "summary"},
+        headers=CSRF_HEADERS,
+    )
+    assert clash.status_code == 409
+
+    # A file keeps whatever name it has: the rule is a markdown document's alone.
+    plain = await writer.post(
+        "/api/library/documents",
+        files={"file": ("data.csv", b"a,b\n", "text/csv")},
+        headers=CSRF_HEADERS,
+    )
+    assert plain.status_code == 201, plain.text
+    moved = await writer.put(
+        f"/api/library/documents/{plain.json()['id']}",
+        json={"name": "table"},
+        headers=CSRF_HEADERS,
+    )
+    assert moved.json()["name"] == "table"

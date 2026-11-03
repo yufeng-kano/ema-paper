@@ -73,6 +73,7 @@ from ..parsing.figures import crop_chunks, open_crop, parse_bbox_path
 from ..workspace import documents as workspace_documents
 from ..workspace import git, safe_io, trash
 from ..workspace.agents_file import AGENTS_FILE
+from ..workspace.documents import markdown_name
 from ..workspace.filing import (
     DOCUMENT_NAME_MAX,
     FOLDER_NAME_MAX,
@@ -1410,6 +1411,7 @@ async def file_markdown(
         wanted = clean_name(filename, DOCUMENT_NAME_MAX)
     except ApiError:
         wanted = "upload"
+    wanted = markdown_name(wanted, DOCUMENT_NAME_MAX)
     if not await asyncio.to_thread(workspace_documents.is_utf8_file, staged):
         raise ApiError(400, "invalid_request", "A markdown file must be UTF-8 text")
     root = user_root(settings.workspaces_dir, user_id)
@@ -1506,7 +1508,7 @@ async def create_document(body: DocumentCreate, user: SessionUser, db: DbSession
                 user_id=user_id, folder_id=folder_id, job_id=None, kind=MARKDOWN_KIND, name=name
             ),
             taken=lambda: sibling_names(db, user_id, folder_id),
-            wanted=clean_name(body.name, DOCUMENT_NAME_MAX),
+            wanted=markdown_name(clean_name(body.name, DOCUMENT_NAME_MAX), DOCUMENT_NAME_MAX),
             limit=DOCUMENT_NAME_MAX,
             message="A file with this name already exists here",
         )
@@ -1550,6 +1552,8 @@ async def _update_document_locked(
             await live_folder(db, user.id, folder_id)
 
         wanted = clean_name(body.name, DOCUMENT_NAME_MAX) if renaming else row.name
+        if renaming and row.kind == MARKDOWN_KIND:
+            wanted = markdown_name(wanted, DOCUMENT_NAME_MAX)
         await lock_user(db, user.id)
         taken = await sibling_names(db, user.id, folder_id, exclude_document=row.id)
         if renaming and wanted in taken:

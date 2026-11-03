@@ -76,7 +76,7 @@ async def test_an_inserted_image_is_kept_copied_and_served(writer) -> None:
     kept = images_dir(writer.root) / str(document_id) / name
     assert kept.is_file()
     # The shell sees what the text will name, in the directory history excludes.
-    assert (writer.root / "files" / "Draft" / "figures" / name).read_bytes() == kept.read_bytes()
+    assert (writer.root / "files" / "Draft.md" / "figures" / name).read_bytes() == kept.read_bytes()
     # Nothing staged is left behind.
     assert list(Path(writer.app.state.settings.upload_dir).iterdir()) == []
     # The route writes no text: the line is the caller's.
@@ -234,7 +234,7 @@ async def test_an_image_counts_towards_the_workspace_once(writer) -> None:
     name = inserted.json()["path"].removeprefix("figures/")
     stored = (images_dir(writer.root) / str(document_id) / name).stat().st_size
     # The stored image counts, and its copy in the document's figures/ is the service's.
-    assert (writer.root / "files" / "Draft" / "figures" / name).is_file()
+    assert (writer.root / "files" / "Draft.md" / "figures" / name).is_file()
     assert await measured() == (files + stored, share + stored)
 
 
