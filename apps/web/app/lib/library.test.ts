@@ -219,6 +219,7 @@ describe('renameSelectionEnd', () => {
     expect(renameSelectionEnd('DINO.pdf', false)).toBe(4)
     expect(renameSelectionEnd('archive.tar.gz', false)).toBe(11)
     expect(renameSelectionEnd('Untitled', false)).toBe(8)
+    expect(renameSelectionEnd('Untitled.md', false)).toBe(8)
     expect(renameSelectionEnd('v1.2 drafts', true)).toBe(11)
   })
 
