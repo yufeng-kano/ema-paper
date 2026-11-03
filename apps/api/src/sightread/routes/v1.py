@@ -13,7 +13,6 @@ The library here is the control plane's reads and its two saves on a data-plane 
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 from collections.abc import AsyncIterator
 
@@ -404,14 +403,15 @@ async def read_library(user: LibraryUser, db: DbSession):
 
 async def document_entry(db, settings, user_id: int, document_id: int) -> dict:
     """One live document of the caller's as the data plane lists it, plus whether its
-    original is kept: `GET /v1/library/documents/{id}`, and the `document` the connector's
-    `read_document` and `write_document` answer with (docs/mcp.md § The library tools)."""
+    `…/original` answers (`answering_original`): `GET /v1/library/documents/{id}`, and the
+    `document` the connector's `read_document` and `write_document` answer with
+    (docs/mcp.md § The library tools)."""
     row = await library.live_document(db, user_id, document_id)
     job = await library.job_of(db, row.job_id) if row.job_id is not None else None
     folders = await workspace_documents.user_folders(db, user_id)
     root = user_root(settings.workspaces_dir, row.user_id)
     original = job is not None and (
-        await asyncio.to_thread(workspace_documents.original_of, root, row.id) is not None
+        await workspace_documents.answering_original(db, root, row.id, job) is not None
     )
     return {
         **library_entry(row, job, entry_path(folders, row.folder_id, row.name)),
@@ -531,8 +531,9 @@ async def read_document_original(
     user: DocumentReader,
     db: DbSession,
     settings: AppSettings,
+    download: bool = Query(default=False),
 ):
-    return await library.document_original(document_id, request, user, db, settings)
+    return await library.document_original(document_id, request, user, db, settings, download)
 
 
 @router.get("/library/documents/{document_id}/file")

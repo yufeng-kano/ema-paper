@@ -123,6 +123,9 @@ describe('readStep', () => {
     })
     expect(readStep('convert_file', { path: 'Papers/2017/attention.pdf' })).toEqual({ kind: 'convert', target: 'attention.pdf' })
     expect(readStep('convert_file', { path: '/workspace/files/scan.png' })).toEqual({ kind: 'convert', target: 'scan.png' })
+    // A retry sends the failed pages again: its own step, and only on a literal true.
+    expect(readStep('convert_file', { path: 'Papers/paper.pdf', retry: true })).toEqual({ kind: 'retry', target: 'paper.pdf' })
+    expect(readStep('convert_file', { path: 'Papers/paper.pdf', retry: 'yes' })).toEqual({ kind: 'convert', target: 'paper.pdf' })
     expect(
       readStep('insert_image', { image: '/workspace/.cache/loss.png', document: '/workspace/files/Papers/attention/notes.md' }),
     ).toEqual({ kind: 'image', target: 'loss.png', file: 'notes.md' })

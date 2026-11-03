@@ -175,7 +175,9 @@ type Slot = { element: Element | null; atom: boolean }
  * The dialog is what opening a document on Files opens: what a reader actually wants to
  * check is whether the markdown came back right, against the original where it matters. A
  * PDF or an image not yet converted opens here too, on its original alone, and is converted
- * when the reader asks for Markdown (docs/web.md § Result viewer, *Original and Markdown*).
+ * when the reader asks for Markdown (docs/web.md § Result viewer, *Original and Markdown*);
+ * so does a failed parse, with the failure said over its original and the retry there
+ * (docs/web.md § Files, *A failed parse opens on its original*).
  *
  * It takes a title and a job error rather than the library's row, which is not this
  * component's business — it renders a result. Files also hands it the document's id, which
@@ -248,6 +250,12 @@ const props = withDefaults(
      *  WebP and HEIC images (`accepted_media_types`); false leaves *Markdown* disabled with
      *  the reason under it. */
     convertible?: boolean
+    /** A failed parse (docs/web.md § Files, *A failed parse opens on its original*): how many
+     *  pages a retry sends — 0 when none is missing, as after a failed format check — and
+     *  where its original downloads from. The original shows alone, the failure is said over
+     *  it with the retry, and *Markdown* is disabled with the reason under it. Null for
+     *  anything else. */
+    failure?: { pages: number; download: string } | null
   }>(),
   {
     error: null,
@@ -263,6 +271,7 @@ const props = withDefaults(
     converted: true,
     facts: () => [],
     convertible: true,
+    failure: null,
   },
 )
 
@@ -274,6 +283,8 @@ const emit = defineEmits<{
   convert: []
   /** The agent kept a file in Files: the page behind the viewer reads its library again. */
   filed: []
+  /** *Retry* on a failed parse: the retry dialog, over the viewer. */
+  retry: []
 }>()
 
 const { t } = useI18n()
@@ -287,7 +298,7 @@ const { notesOpen, agentOpen, chosenWidth, chooseWidth, paperMargin } = useViewe
  *  Markdown*) — the latter only where there is one to show, and never for a block link,
  *  which names a place in the document. */
 const tab = ref<DocumentView>(
-  props.initialView === 'original' && props.original && !props.initialBlock ? 'original' : 'markdown',
+  props.original && (props.failure || (props.initialView === 'original' && !props.initialBlock)) ? 'original' : 'markdown',
 )
 
 /** A running job's snapshot: pages keep arriving under this one (docs/api.md § Partial). */
@@ -4359,9 +4370,26 @@ const moreItems = computed<MenuItem[]>(() => [
     label: t('viewer.view.markdown'),
     checked: tab.value === 'markdown',
     disabled: !props.converted && !props.convertible,
-    description: props.converted || props.convertible ? undefined : t('viewer.notConvertible'),
+    // A failed parse has no document until a retry succeeds; any other file not converted
+    // is one the parse agent does not accept.
+    description:
+      props.converted || props.convertible
+        ? undefined
+        : t(props.failure ? 'viewer.failed.noMarkdown' : 'viewer.notConvertible'),
   },
 ])
+
+/** A failed parse's original, saved. A button rather than a link: the dialog gives its first
+ *  link the focus on open, and Enter must not start a download. */
+function downloadOriginal() {
+  if (!props.failure) {
+    return
+  }
+  const anchor = document.createElement('a')
+  anchor.href = props.failure.download
+  anchor.download = ''
+  anchor.click()
+}
 
 function onMoreSelect(key: string) {
   if (key === 'find') {
@@ -4976,6 +5004,17 @@ watch(
           <span class="capsule-rule" aria-hidden="true" />
         </template>
 
+        <!-- A failed parse's original, saved: the file the reader still has (docs/web.md
+             § Files, *A failed parse opens on its original*). -->
+        <UiButton
+          v-if="failure"
+          variant="ghost"
+          icon-only
+          :label="t('viewer.failed.download')"
+          @click="downloadOriginal"
+        >
+          <template #icon><UiIcon name="download" /></template>
+        </UiButton>
         <!-- What the parse was, and the two views: read now and then, so one press away
              rather than on the header for good. The facts are the result, so More waits for
              it — a file not yet converted has its facts from its row, and waits for nothing. -->
@@ -5009,9 +5048,30 @@ watch(
       <!-- The original: the file itself, whatever the parse made of it — a PDF in the
            browser's own viewer, an image as a picture (docs/web.md § Result viewer,
            *Original and Markdown*). -->
-      <div v-if="tab === 'original' && original" class="original" :class="original.kind">
-        <iframe v-if="original.kind === 'pdf'" class="original-frame" :src="original.url" :title="title" />
-        <img v-else class="original-image" :src="original.url" :alt="title">
+      <div v-if="tab === 'original' && original" class="original-view">
+        <!-- A failed parse: that the conversion did not finish, what the reader still has,
+             and the retry (docs/web.md § Files, *A failed parse opens on its original*).
+             Always rendered, as the document's notes are: grid auto-placement would
+             otherwise put the original in this row. -->
+        <div class="doc-notes">
+          <UiBanner v-if="failure" class="degraded-note" tone="error">
+            <strong>{{
+              failure.pages ? t('viewer.failed.pages', { n: failure.pages }, failure.pages) : t('viewer.failed.whole')
+            }}</strong>
+            {{ t('viewer.failed.body') }}
+            <template #actions>
+              <UiButton size="sm" @click="emit('retry')">
+                {{
+                  failure.pages ? t('viewer.failed.retry', { n: failure.pages }, failure.pages) : t('viewer.failed.retryWhole')
+                }}
+              </UiButton>
+            </template>
+          </UiBanner>
+        </div>
+        <div class="original" :class="original.kind">
+          <iframe v-if="original.kind === 'pdf'" class="original-frame" :src="original.url" :title="title" />
+          <img v-else class="original-image" :src="original.url" :alt="title">
+        </div>
       </div>
 
       <UiBanner v-else-if="error" class="state" tone="error">{{ error }}</UiBanner>
@@ -6257,6 +6317,15 @@ watch(
 }
 
 /* --- Original view -------------------------------------------------------- */
+
+/* The original fills what the notes over it leave: a failed parse's failure, nothing
+   otherwise. */
+.original-view {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100%;
+  min-height: 0;
+}
 
 /* The file itself: a PDF's frame fills the body, since the browser's viewer brings its own
    chrome; a picture is centred, scrolling where it is taller than the window. */

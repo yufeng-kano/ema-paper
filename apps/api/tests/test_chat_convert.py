@@ -16,11 +16,11 @@ from types import SimpleNamespace
 import httpx
 import pytest
 import respx
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from sightread.agents import chat as chat_agent
 from sightread.billing import ledger
-from sightread.db.models import Document, Job
+from sightread.db.models import CreditEntry, Document, Job, utcnow
 from sightread.errors import ApiError
 from sightread.jobs import chat_runner, runner, sweeper
 from sightread.jobs.queue import claim_next_job
@@ -90,13 +90,15 @@ async def _run(client: httpx.AsyncClient, *calls: dict) -> tuple[int, list[dict]
 
 
 def test_the_tool_is_declared_only_with_a_parse_model() -> None:
-    """docs/chat.md § Tools: after the web tools, not strict — its input is one string
-    (§ Upstream); a deployment without a parse model never declares it, and a history that
-    names it is refused like a web tool's."""
+    """docs/chat.md § Tools: after the web tools, not strict — a path and a flag the tool
+    checks itself (§ Upstream); a deployment without a parse model never declares it, and a
+    history that names it is refused like a web tool's."""
     assert chat_agent.convert_tools(parse=False) == ()
     (tool,) = chat_agent.convert_tools(parse=True)
     assert tool["name"] == "convert_file" and "strict" not in tool
     assert tool["input_schema"]["additionalProperties"] is False
+    assert tool["input_schema"]["required"] == ["path"]
+    assert tool["input_schema"]["properties"]["retry"]["type"] == "boolean"
     assert "convert_file" in chat_runner.UNDECLARABLE_TOOLS
     assert "convert_file" in chat_runner.MUTATING_TOOLS
     rendered = chat_agent.render_system_prompt(
@@ -438,6 +440,113 @@ async def test_a_failed_conversion_keeps_the_file_to_retry(
     names = {entry.name for entry in (root / "files" / "paper.pdf").iterdir()}
     assert {"doc.md", ".meta.json", "source.pdf"} <= names
     assert "_source.pdf" not in names
+
+
+@respx.mock
+async def test_the_agent_retries_a_failed_conversion_once_told_to(
+    make_client, tmp_path, documents, monkeypatch
+) -> None:
+    """docs/chat.md § Tools: a failed conversion answers that the original is kept and that
+    a retry needs the user's yes; `retry` — a literal true only — puts the parse back
+    through the Files page's own retry and drives it inside the turn, on the same job, and
+    the document is charged once, by the run that delivers it. A document that stands is
+    not retried."""
+    monkeypatch.setattr(runner, "VISION_BACKOFF_BASE_SECONDS", 0.0)
+    down = True
+
+    def vision(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "down"}) if down else _completion(VISION_MARKDOWN)
+
+    respx.post(KANO_CHAT_URL).mock(side_effect=vision)
+    client = await _ready(make_client, tmp_path)
+    settings = client.app.state.settings
+    root = user_root(settings.workspaces_dir, client.user_id)
+    kept = await _keep(
+        client, "paper.pdf", documents["text_pdf"].read_bytes(), "application/pdf", None
+    )
+    _, (failed, loose) = await _run(
+        client, {"path": "paper.pdf"}, {"path": "paper.pdf", "retry": "yes"}
+    )
+    assert failed["is_error"] is True
+    assert "Its credits were released. Its original is kept" in failed["output"]
+    assert "Call convert_file with retry: true only once the user says yes" in failed["output"]
+    # Not a literal true: the failure is answered again, nothing queued.
+    assert loose["output"].startswith("The conversion of paper.pdf failed earlier: ")
+    _, job, _ = await _settled(client, kept["id"])
+    assert job.status == "failed"
+    job_id = job.id
+    # The price of a retry is the whole conversion's, said in credits.
+    async with client.app.state.sessionmaker() as db:
+        reserved = (
+            await db.execute(select(CreditEntry.amount).where(CreditEntry.job_id == job_id))
+        ).scalar_one()
+    assert f"and reserves the whole conversion's {reserved:,} credits again" in failed["output"]
+    assert await recorded(client, "convert_file") == 1
+
+    down = False
+    _, (retried,) = await _run(client, {"path": "paper.pdf", "retry": True})
+    assert retried["is_error"] is False, retried["output"]
+    assert retried["output"].startswith("Converted paper.pdf (")
+    row, job, shown = await _settled(client, kept["id"])
+    assert (row.job_id, job.status, shown["status"]) == (job_id, "succeeded", "succeeded")
+    assert "Body text." in (root / "files" / "paper.pdf" / "doc.md").read_text()
+    async with client.app.state.sessionmaker() as db:
+        charged = await ledger.credits_by_job(db, [job_id])
+    assert charged[job_id] == settings.parse_credits_per_page * job.page_count
+    assert await recorded(client, "convert_file") == 2
+
+    _, (again,) = await _run(client, {"path": "paper.pdf", "retry": True})
+    assert again["output"] == (
+        "paper.pdf is a document already: read /workspace/files/paper.pdf/doc.md."
+    )
+    assert await recorded(client, "convert_file") == 2
+
+
+@respx.mock
+async def test_a_retry_the_balance_or_the_original_cannot_carry_is_not_queued(
+    make_client, tmp_path, documents, monkeypatch
+) -> None:
+    """docs/billing.md § A chat turn: the agent's retry is refused as the Files page's is
+    when the balance cannot cover it, the job left failed and nothing recorded; a document
+    whose original is gone answers that it cannot be retried."""
+    monkeypatch.setattr(runner, "VISION_BACKOFF_BASE_SECONDS", 0.0)
+    vision = respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(503, json={}))
+    client = await _ready(make_client, tmp_path)
+    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
+    kept = await _keep(
+        client, "paper.pdf", documents["text_pdf"].read_bytes(), "application/pdf", None
+    )
+    await _run(client, {"path": "paper.pdf"})
+    calls = vision.call_count
+
+    async def broke(db, settings, job_id):
+        raise ledger.InsufficientCredits(need=10, remaining=0, period_end=utcnow())
+
+    monkeypatch.setattr(ledger, "reserve_again", broke)
+    _, (refused,) = await _run(client, {"path": "paper.pdf", "retry": True})
+    assert refused["is_error"] is True
+    assert refused["output"].startswith("paper.pdf was not retried: Not enough credits")
+    _, job, _ = await _settled(client, kept["id"])
+    assert job.status == "failed"
+    assert vision.call_count == calls
+    assert await recorded(client, "convert_file") == 1
+
+    # A conversion queued before the ledger had nothing reserved, and its retry reserves
+    # nothing (docs/billing.md § A parse): the answer prices it so.
+    async with client.app.state.sessionmaker() as db:
+        await db.execute(delete(CreditEntry).where(CreditEntry.job_id == job.id))
+        await db.commit()
+    _, (free,) = await _run(client, {"path": "paper.pdf"})
+    assert "Its credits were released" not in free["output"]
+    assert (
+        "costs no credits: this conversion was queued before credits were kept" in (free["output"])
+    )
+
+    original_of(root, kept["id"]).unlink()
+    _, (gone,) = await _run(client, {"path": "paper.pdf"})
+    assert gone["output"].endswith(
+        "Its original was not kept, so it cannot be retried: the user can upload the file again."
+    )
 
 
 @respx.mock

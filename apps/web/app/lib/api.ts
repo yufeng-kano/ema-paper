@@ -1388,10 +1388,11 @@ export function documentFileUrl(id: number, download = false): string {
   return `/api/library/documents/${id}/file${download ? '?download=1' : ''}`
 }
 
-/** A parsed document's original, inline, for the Original view (docs/api.md
+/** A parsed document's original, inline, for the Original view — as a save with
+ *  `download`, a failed parse's *Download original* (docs/api.md
  *  § `GET /api/library/documents/{id}/original`). */
-export function documentOriginalUrl(id: number): string {
-  return `/api/library/documents/${id}/original`
+export function documentOriginalUrl(id: number, download = false): string {
+  return `/api/library/documents/${id}/original${download ? '?download=1' : ''}`
 }
 
 /** The view the reader switched a document to, remembered for its next opening

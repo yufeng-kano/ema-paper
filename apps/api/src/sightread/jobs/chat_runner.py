@@ -39,6 +39,7 @@ from ..db.models import (
     ChatToolCall,
     ChatTurn,
     Conversation,
+    CreditEntry,
     Document,
     Job,
     Message,
@@ -70,6 +71,7 @@ from ..workspace.agents_file import agents_file_text
 from ..workspace.documents import (
     MARKDOWN_KIND,
     DocumentPaths,
+    answering_original,
     ensure_within_quota,
     folder_names,
     is_live,
@@ -94,7 +96,7 @@ from ..workspace.memory_file import memory_file_text
 from ..workspace.reconcile import meta_document_id, reconcile_locked, reconcile_user
 from . import chat_events, chat_memory, chat_subagent, chat_tools, chat_versions, chat_web
 from .chat_compact import SUMMARY_CONTEXT
-from .intake import convert_kept_file
+from .intake import convert_kept_file, retry_library_parse
 from .queue import HISTORY_FULL, claim_job, history_bytes, requeue_job
 from .runner import fail_job, run_job
 
@@ -1763,6 +1765,10 @@ async def _run_convert(ctx: TurnContext, tool_input: dict) -> chat_tools.ToolOut
     *folders, name = segments
     shown_path = "/".join(segments)
     shown_doc = (VM_FILES / shown_path / DOC_FILE).as_posix()
+    # Only a literal true: a retry is charged again, and the agent sends it once the user
+    # said yes (docs/chat.md § Tools).
+    retry = tool_input.get("retry") is True
+    retried = False
     try:
         async with backup_shared(root), workspace_lock(root), ctx.sessionmaker() as db:
             await recover_trash(db, settings, user_id)
@@ -1800,23 +1806,27 @@ async def _run_convert(ctx: TurnContext, tool_input: dict) -> chat_tools.ToolOut
                 return chat_tools.ToolOutcome(
                     f"{shown_path} is a document already: read {shown_doc}.", is_error=True
                 )
-            if job.status == "failed":
-                return chat_tools.ToolOutcome(
-                    f"The conversion of {shown_path} failed earlier: "
-                    f"{job.error or 'the parse failed'}. The user can retry it from the Files "
-                    "page.",
-                    is_error=True,
-                )
             # A document whose parse still waits — an upload converting on arrival, queued
             # behind this turn — is driven below as this call's own conversion would be; a
             # job already at its end answered from the cache: this call charged nothing.
             job_id = job.id
             converted_earlier = converted_here and job.status == "succeeded"
+            failed_earlier = (job.error or "the parse failed") if job.status == "failed" else None
+            if failed_earlier is not None and retry:
+                # The Files page's retry, through the route's own function: the failed pages
+                # only, its credits reserved again (docs/jobs.md § Retrying failed pages).
+                retried = True
+                await retry_library_parse(db, settings, user_id=user_id, row=row)
     except ApiError as exc:
         return chat_tools.ToolOutcome(
-            f"{shown_path} was not converted: {exc.message}", is_error=True
+            f"{shown_path} was not {'retried' if retried else 'converted'}: {exc.message}",
+            is_error=True,
         )
-    if converted_here:
+    if failed_earlier is not None and not retried:
+        return await _conversion_failed(
+            ctx, row_id, job_id, shown_path, failed_earlier, earlier=True
+        )
+    if converted_here or retried:
         await _record_tool_call(ctx, "convert_file", settle=False)
     job = await _drive_parse(ctx, job_id)
     if job is None:
@@ -1834,10 +1844,8 @@ async def _run_convert(ctx: TurnContext, tool_input: dict) -> chat_tools.ToolOut
             is_error=True,
         )
     if job.status != "succeeded":
-        return chat_tools.ToolOutcome(
-            f"The conversion of {shown_path} failed: {job.error or 'the parse failed'}. Its "
-            "credits were released; the user can retry it from the Files page.",
-            is_error=True,
+        return await _conversion_failed(
+            ctx, row_id, job_id, shown_path, job.error or "the parse failed", earlier=False
         )
     async with ctx.sessionmaker() as db:
         row = await db.get(Document, row_id)
@@ -1866,6 +1874,53 @@ async def _run_convert(ctx: TurnContext, tool_input: dict) -> chat_tools.ToolOut
         f"Converted {row.name} ({pages} page{'s' if pages != 1 else ''}, {cost}) into a "
         f"document at {doc_path}; read it with str_replace_based_edit_tool. Tell the user "
         f"it is their document {row.name}."
+    )
+
+
+async def _conversion_failed(
+    ctx: TurnContext,
+    row_id: int,
+    job_id: uuid.UUID,
+    shown_path: str,
+    error: str,
+    *,
+    earlier: bool,
+) -> chat_tools.ToolOutcome:
+    """A conversion that failed, in this call or before it: its credits were released and,
+    with its original kept — or its upload still being filed as it — it can be retried,
+    once the user says yes, since a retry reserves the whole conversion's credits again,
+    every page's, not only the failed ones' (docs/chat.md § Tools). A conversion queued
+    before the ledger has no credits to release or reserve (docs/billing.md § A parse)."""
+    failed = f"The conversion of {shown_path} failed{' earlier' if earlier else ''}: {error}."
+    async with ctx.sessionmaker() as db:
+        job = await db.get(Job, job_id)
+        amount = (
+            await db.execute(select(CreditEntry.amount).where(CreditEntry.job_id == job_id))
+        ).scalar_one_or_none()
+        # What the library reads as `original` (docs/api.md).
+        kept = (
+            job is not None
+            and await answering_original(db, ctx.paths.root, row_id, job) is not None
+        )
+    released = "" if amount is None else " Its credits were released."
+    if not kept:
+        return chat_tools.ToolOutcome(
+            f"{failed}{released} Its original was not kept, so it cannot be retried: the user "
+            "can upload the file again.",
+            is_error=True,
+        )
+    cost = (
+        "costs no credits: this conversion was queued before credits were kept"
+        if amount is None
+        else f"reserves the whole conversion's {amount:,} credits again, every page's as the "
+        "first run did, not only the failed ones', and is charged only if it succeeds"
+    )
+    return chat_tools.ToolOutcome(
+        f"{failed}{released} Its original is kept: the user can open and download it in "
+        "Files. Tell the user, and ask whether to retry it: a retry sends only the pages "
+        f"that failed and {cost}. Call convert_file with retry: true only once the user says "
+        "yes, unless they already asked for a retry.",
+        is_error=True,
     )
 
 

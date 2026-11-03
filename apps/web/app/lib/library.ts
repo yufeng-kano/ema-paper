@@ -413,6 +413,18 @@ export function originalKind(document: { kind: string; media_type?: string | nul
   return document.kind === 'pdf' || document.kind === 'image' ? document.kind : null
 }
 
+/** A failed parse that opens on its original — one whose original was kept, so there is
+ *  something to show; one with none kept opens its retry dialog (docs/web.md § Files, *A
+ *  failed parse opens on its original*). */
+export function failedWithOriginal(document: {
+  kind: string
+  status: string | null
+  original?: boolean | null
+  media_type?: string | null
+}): boolean {
+  return document.status === 'failed' && document.original === true && originalKind(document) !== null
+}
+
 /**
  * The view a row's viewer opens on (docs/web.md § Result viewer, *Original and Markdown*): a
  * file kept as it is has its original alone; a converted document opens on the view it was

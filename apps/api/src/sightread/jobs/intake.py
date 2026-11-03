@@ -16,6 +16,7 @@ import contextlib
 import hashlib
 import logging
 import os
+import shutil
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -741,6 +742,100 @@ async def convert_kept_file(
         except Exception:  # noqa: BLE001 - the next reconciliation sweeps it
             logger.exception("could not discard %s set aside by a conversion", relative)
     return row
+
+
+async def retry_library_parse(
+    db: AsyncSession,
+    settings: Settings,
+    *,
+    user_id: int,
+    row: Document,
+    model: str | None = None,
+) -> uuid.UUID:
+    """Put the failed parse behind a library document back on the queue, its succeeded
+    pages kept (docs/jobs.md § Retrying failed pages) — or its failed re-convert, when the
+    document's own parse stands (§ Re-converting a document) — the route's retry and the
+    chat agent's `convert_file` with `retry` alike. Its upload went with the failure, so it
+    runs on a copy of the document's original. The caller holds the workspace lock — the
+    original cannot go while it is copied, nor the file to the Trash — and `row` is a live
+    document of the user's; the user's row lock and then the job's are taken here, and the
+    job is put back from `failed` only, so two retries cannot both put it back. `model` is
+    one the caller checked (`checked_parse_model`); None is the job's own. A commit that
+    raises is read back on a connection of its own, as a filing's is: the copy goes only
+    with a retry that did not land. Answers the job's id; raises `ApiError` as the route
+    answers it (404, 409, 402) with nothing changed."""
+    root = workspace_documents.user_root(settings.workspaces_dir, user_id)
+    # The user's row before the job's, the one order (docs/workspace.md § Revisions): the
+    # retry takes the job's credits back under it (docs/billing.md § A parse).
+    await db.execute(select(User.id).where(User.id == user_id).with_for_update())
+    if row.job_id is None:
+        raise ApiError(404, "invalid_request", "A markdown document has no parse to retry")
+    # Locked and read in one, fresh: the caller may have read the job before the lock.
+    locked = select(Job).with_for_update().execution_options(populate_existing=True)
+    job = (await db.execute(locked.where(Job.id == row.job_id))).scalar_one_or_none()
+    if job is not None and job.status != "failed" and row.reconvert_job_id is not None:
+        job = (await db.execute(locked.where(Job.id == row.reconvert_job_id))).scalar_one_or_none()
+    if job is None:
+        raise ApiError(404, "invalid_request", "No such job")
+    if job.agent != PARSE.name or job.status != "failed":
+        raise ApiError(409, "invalid_request", "Only a failed parse can be retried")
+    original = workspace_documents.original_of(root, row.id)
+    if original is None:
+        # Filed by the worker just after the failure, under the lock held here, or by the
+        # sweep when that failed (docs/jobs.md § Retention); or never kept.
+        raise ApiError(
+            409,
+            "invalid_request",
+            "This document's original is still being filed; retry it in a moment"
+            if workspace_documents.unfiled_upload(job) is not None
+            else "This document kept no original to parse again; upload the file again",
+        )
+    try:
+        # The credits the failure released, reserved again for this run: the document is
+        # charged once, by the run that delivers it (docs/billing.md § A parse). Taken
+        # before the copy, so a refusal costs no copy either.
+        await ledger.reserve_again(db, settings, job.id)
+    except ledger.InsufficientCredits as exc:
+        raise insufficient_credits(exc) from exc
+    upload_dir = Path(settings.upload_dir)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    copy = upload_dir / f"{job.id}.retry-{uuid.uuid4().hex[:12]}{original.suffix}"
+    await asyncio.to_thread(shutil.copyfile, original, copy)
+    # Read before the commit: a rollback expires the row.
+    job_id = job.id
+    try:
+        # The check as the settings say now: a check that failed may have failed on its
+        # model. One with no model of its own follows this run's parse model, the one the
+        # retry named (docs/jobs.md § Retrying failed pages).
+        check = await resolve_check(db, settings, user_id, model or job.model)
+        await retry_job(db, job_id, source_path=str(copy), model=model, check=check)
+        await events.notify(db, job_id)
+    except BaseException:
+        copy.unlink(missing_ok=True)
+        raise
+    try:
+        await db.commit()
+    except Exception as exc:  # noqa: BLE001 - verified below, whatever raised
+        readable, landed = await read_row(db, Job, job_id)
+        with contextlib.suppress(Exception):
+            await db.rollback()
+        if readable and landed is not None and landed.source_path == str(copy):
+            logger.warning("the retry of job %s was committed despite the error", job_id)
+            return job_id
+        if readable:
+            copy.unlink(missing_ok=True)
+            raise ApiError(
+                409, "invalid_request", "The retry could not be queued; nothing changed"
+            ) from exc
+        # The copy stays: a retry that landed runs on it, and the upload sweeper takes it
+        # otherwise (docs/jobs.md § Retrying failed pages).
+        raise ApiError(
+            409,
+            "invalid_request",
+            "The retry may have been queued, but the database could not confirm it; "
+            "reload the library before trying again",
+        ) from exc
+    return job_id
 
 
 def cached_payload(result: Result) -> dict:

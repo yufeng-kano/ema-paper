@@ -14,7 +14,6 @@ in-flight join — is the data plane's (docs/mcp.md § The `parse` tool).
 
 from __future__ import annotations
 
-import asyncio
 import shlex
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -36,7 +35,7 @@ from ..agents import PARSE
 from ..auth import document_tickets, upload_tickets
 from ..auth.deps import LIBRARY_SCOPE_MESSAGE, bearer_credential, resolve_bearer_identity
 from ..auth.oauth_as import LIBRARY_SCOPE
-from ..db.models import FILE_KIND, User
+from ..db.models import FILE_KIND, Document, Job, User
 from ..errors import ApiError, error_response
 from ..routes.v1 import document_entry, library_index
 from ..upstream.client import offered_models
@@ -350,16 +349,15 @@ def build_server(app: FastAPI) -> MCPServer:
             settings = await app.state.runtime_settings.current(db)
             user = await _library_user(db)
             document = await document_entry(db, settings, user.id, document_id)
-            # The kept original's own suffix names the file the `original` command lands.
-            source = (
-                await asyncio.to_thread(
-                    workspace_documents.original_of,
-                    user_root(settings.workspaces_dir, user.id),
-                    document_id,
+            # The suffix of what `…/original` answers with — the kept original, or the
+            # upload until it is filed — names the file the `original` command lands.
+            source = None
+            if document["original"]:
+                row = await db.get(Document, document_id)
+                job = await db.get(Job, row.job_id)
+                source = await workspace_documents.answering_original(
+                    db, user_root(settings.workspaces_dir, user.id), document_id, job
                 )
-                if document["original"]
-                else None
-            )
             ticket, token = await document_tickets.mint(
                 db, settings, user, document_id, document_tickets.READ
             )

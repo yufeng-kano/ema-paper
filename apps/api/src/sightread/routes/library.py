@@ -17,7 +17,6 @@ import contextlib
 import logging
 import os
 import re
-import shutil
 import sys
 import urllib.parse
 import uuid
@@ -52,7 +51,6 @@ from ..db.models import (
     utcnow,
 )
 from ..errors import ApiError
-from ..jobs import events
 from ..jobs.chat_tools import PageUnavailable, original_page_png
 from ..jobs.intake import (
     MULTIPART_ENVELOPE_BYTES,
@@ -60,14 +58,13 @@ from ..jobs.intake import (
     checked_parse_model,
     convert_kept_file,
     file_chunks,
-    insufficient_credits,
-    resolve_check,
     resolve_kind,
+    retry_library_parse,
     store_upload,
     submit_parse,
     upload_chunks,
 )
-from ..jobs.queue import parse_pages_spec, retry_job
+from ..jobs.queue import parse_pages_spec
 from ..jobs.runner import partial_result_payload, result_payload
 from ..parsing.figures import crop_chunks, open_crop, parse_bbox_path
 from ..workspace import documents as workspace_documents
@@ -347,7 +344,7 @@ def document_payload(
     the row points at as its re-convert (docs/api.md); `credits` what each parse cost
     (`ledger.credits_by_job`, docs/billing.md § Routes); `storage` each document's share
     of the storage (`StorageUsage.documents`), None where the workspace was not measured;
-    `originals` the ids whose original upload is kept (`kept_originals`), None where it
+    `originals` the ids whose `…/original` answers (`answering_original`), None where it
     was not looked up — a parse's `original` is then null (docs/api.md).
     """
     failed = failed or {}
@@ -423,8 +420,8 @@ def document_payload(
         "checking": is_checking(job),
         "credits": credits.get(job.id),
         "view": row.view,
-        # Whether `…/original` answers: known from one listing on the library read, not
-        # looked up by the one-row answers (docs/api.md).
+        # Whether `…/original` answers: known from one listing on the library read
+        # (docs/api.md).
         "original": (row.id in originals) if originals is not None else None,
         "reconvert": (
             None
@@ -487,7 +484,7 @@ async def read_document_payload(db: DbSession, settings: AppSettings, row: Docum
     originals: set[int] = set()
     if job is not None:
         root = user_root(settings.workspaces_dir, row.user_id)
-        if await asyncio.to_thread(workspace_documents.original_of, root, row.id) is not None:
+        if await workspace_documents.answering_original(db, root, row.id, job) is not None:
             originals.add(row.id)
     return document_payload(
         row,
@@ -582,10 +579,27 @@ async def read_library(user: SessionUser, db: DbSession, settings: AppSettings):
     except OSError:
         # A directory nested too deep to measure: the sizes are unknown, not the library.
         storage = None
-    # Which parses can be read on their original (docs/api.md).
+    # Which parses can be read on their original (docs/api.md): the kept ones, and, until a
+    # finished parse's original is filed, the row its upload is filed for, read from the
+    # upload meanwhile (`answering_original`) — looked at before the listing, so an
+    # original filed in between is in the listing.
+    unfiled = await asyncio.to_thread(
+        lambda: {
+            job.id
+            for _row, job in documents
+            if job is not None and workspace_documents.unfiled_upload(job) is not None
+        }
+    )
     originals = await asyncio.to_thread(
         workspace_documents.kept_originals, user_root(settings.workspaces_dir, user_id)
     )
+    for job_id in unfiled:
+        heir = workspace_documents.upload_heir(
+            (row.id for row, job in documents if job is not None and job.id == job_id),
+            originals,
+        )
+        if heir is not None:
+            originals.add(heir)
 
     def origin(parent_id: int | None) -> list[str]:
         place = nearest_live(by_id, parent_id)
@@ -1827,84 +1841,18 @@ async def retry_document(
 ):
     """Put the failed parse behind the document back on the queue, its succeeded pages
     kept (docs/jobs.md § Retrying failed pages) — or its failed re-convert, when the
-    document's own parse stands (§ Re-converting a document). Its upload went with the
-    failure, so it runs on a copy of the document's original. Decided under the workspace
-    lock — the original cannot go while it is copied, nor the file to the Trash — and the
-    job's row lock, from `failed` only: two retries cannot both put it back. A commit that
-    raises is read back on a connection of its own, as a filing's is: the copy goes only
-    with a retry that did not land."""
+    document's own parse stands (§ Re-converting a document) — under the workspace lock,
+    through the function the chat agent's `convert_file` retries with
+    (`retry_library_parse`)."""
     model = (body.model or "").strip() or None
     if model is not None:
         # One of the parse agent's two, as at enqueue (docs/agents.md § Enqueue rules).
         model = checked_parse_model(settings, model)
     root = user_root(settings.workspaces_dir, user.id)
     async with workspace_lock(root):
-        # The user's row before the job's, the one order (docs/workspace.md § Revisions):
-        # the retry takes the job's credits back under it (docs/billing.md § A parse).
-        await db.execute(select(User.id).where(User.id == user.id).with_for_update())
         row = await live_text_document(db, user.id, document_id)
-        if row.job_id is None:
-            raise ApiError(404, "invalid_request", "A markdown document has no parse to retry")
-        await lock_job(db, row.job_id)
-        job = await job_of(db, row.job_id)
-        if job.status != "failed" and row.reconvert_job_id is not None:
-            await lock_job(db, row.reconvert_job_id)
-            job = await job_of(db, row.reconvert_job_id)
-        if job.agent != PARSE.name or job.status != "failed":
-            raise ApiError(409, "invalid_request", "Only a failed parse can be retried")
-        original = workspace_documents.original_of(root, row.id)
-        if original is None:
-            raise ApiError(
-                409,
-                "invalid_request",
-                "This document kept no original to parse again; upload the file again",
-            )
-        try:
-            # The credits the failure released, reserved again for this run: the
-            # document is charged once, by the run that delivers it (docs/billing.md
-            # § A parse). Taken before the copy, so a refusal costs no copy either.
-            await ledger.reserve_again(db, settings, job.id)
-        except ledger.InsufficientCredits as exc:
-            raise insufficient_credits(exc) from exc
-        upload_dir = Path(settings.upload_dir)
-        upload_dir.mkdir(parents=True, exist_ok=True)
-        copy = upload_dir / f"{job.id}.retry-{uuid.uuid4().hex[:12]}{original.suffix}"
-        await asyncio.to_thread(shutil.copyfile, original, copy)
-        try:
-            # The check as the settings say now: a check that failed may have failed on
-            # its model. One with no model of its own follows this run's parse model, the
-            # one the retry named (docs/jobs.md § Retrying failed pages).
-            check = await resolve_check(db, settings, user.id, model or job.model)
-            await retry_job(db, job.id, source_path=str(copy), model=model, check=check)
-            await events.notify(db, job.id)
-        except BaseException:
-            copy.unlink(missing_ok=True)
-            raise
-        # Read before the commit: a rollback expires the row.
-        job_id = job.id
-        try:
-            await db.commit()
-        except Exception as exc:  # noqa: BLE001 - verified below, whatever raised
-            readable, landed = await read_row(db, Job, job_id)
-            with contextlib.suppress(Exception):
-                await db.rollback()
-            if readable and landed is not None and landed.source_path == str(copy):
-                logger.warning("the retry of job %s was committed despite the error", job_id)
-                return {"job_id": str(job_id), "status": "queued"}
-            if readable:
-                copy.unlink(missing_ok=True)
-                raise ApiError(
-                    409, "invalid_request", "The retry could not be queued; nothing changed"
-                ) from exc
-            # The copy stays: a retry that landed runs on it, and the upload sweeper
-            # takes it otherwise (docs/jobs.md § Retrying failed pages).
-            raise ApiError(
-                409,
-                "invalid_request",
-                "The retry may have been queued, but the database could not confirm it; "
-                "reload the library before trying again",
-            ) from exc
-    return {"job_id": str(job.id), "status": "queued"}
+        job_id = await retry_library_parse(db, settings, user_id=user.id, row=row, model=model)
+    return {"job_id": str(job_id), "status": "queued"}
 
 
 class DocumentReconvert(BaseModel):
@@ -1953,10 +1901,14 @@ async def reconvert_document(
             raise ApiError(409, "invalid_request", "The document is already being re-converted")
         original = workspace_documents.original_of(root, row.id)
         if original is None:
+            # Filed by the worker just after the parse ended, under the lock held here, or
+            # by the sweep when that failed (docs/jobs.md § Retention); or never kept.
             raise ApiError(
                 409,
                 "invalid_request",
-                "This document kept no original to parse again; upload the file again",
+                "This document's original is still being filed; re-convert it in a moment"
+                if workspace_documents.unfiled_upload(job) is not None
+                else "This document kept no original to parse again; upload the file again",
             )
         submission = await submit_parse(
             db,
@@ -2216,29 +2168,33 @@ async def document_original(
     user: SessionUser,
     db: DbSession,
     settings: AppSettings,
+    download: bool = Query(default=False),
 ):
     """A parsed document's original upload, kept beside the git directory, served as a
     file is — inline, one `Range` answered, the same security headers, never cached — for
-    the result viewer's Original view (docs/api.md). 404 for a markdown document, for a
-    file, whose bytes are `…/file`, and for a parse whose original was not kept."""
+    the result viewer's Original view, and as an attachment on `?download=1`, for a failed
+    parse's *Download original* (docs/api.md). Until a finished parse's original is filed,
+    its upload answers in its place. 404 for a markdown document, for a file, whose bytes
+    are `…/file`, and for a parse whose original was not kept."""
     row = await live_document(db, user.id, document_id)
     if row.job_id is None:
         raise ApiError(404, "invalid_request", "No such original")
     job = await job_of(db, row.job_id)
     root = user_root(settings.workspaces_dir, row.user_id)
-    source = await asyncio.to_thread(workspace_documents.original_of, root, row.id)
-    if source is None:
+    source = await workspace_documents.answering_original(db, root, row.id, job)
+    entry = (
+        None
+        if source is None
+        else await asyncio.to_thread(workspace_documents.open_original, root, row.id, source)
+    )
+    if entry is None:
         raise ApiError(404, "invalid_request", "This document kept no original")
-    try:
-        entry = await asyncio.to_thread(os.open, source, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    except OSError as exc:
-        raise ApiError(404, "invalid_request", "This document kept no original") from exc
     return file_response(
         entry,
         request,
         name=row.name,
         media_type=job.media_type,
-        inline=workspace_documents.served_inline(job.media_type),
+        inline=workspace_documents.served_inline(job.media_type) and not download,
     )
 
 

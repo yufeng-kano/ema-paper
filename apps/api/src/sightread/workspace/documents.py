@@ -652,6 +652,64 @@ def original_of(root: Path, document_id: int) -> Path | None:
     return None
 
 
+def unfiled_upload(job: Job) -> Path | None:
+    """A finished parse's upload while its original is still being filed: the worker files
+    it after the terminal commit, the sweep when that failed (docs/jobs.md § Retention).
+    Looked at before the originals: the filing deletes the upload only once every original
+    is in place, so a look at the upload and then at the originals finds one of them."""
+    if (
+        job.status not in ("succeeded", "failed")
+        or not job.source_path
+        or job.source_deleted_at is not None
+    ):
+        return None
+    upload = Path(job.source_path)
+    return upload if upload.is_file() and not upload.is_symlink() else None
+
+
+def upload_heir(job_rows: Iterable[int], held: Collection[int]) -> int | None:
+    """Which row naming a parse its unfiled upload is filed for: the last one holding no
+    original, which retention moves it to whatever the quota — the others take a copy only
+    while the quota lets them (docs/jobs.md § Retention)."""
+    return max((row_id for row_id in job_rows if row_id not in held), default=None)
+
+
+async def answering_original(
+    db: AsyncSession, root: Path, document_id: int, job: Job
+) -> Path | None:
+    """What `…/original` answers with for a parse's row (docs/api.md): its kept original
+    or, until it is filed, the upload it will be — for the row the upload is filed for
+    (`upload_heir`); None when neither."""
+    upload = await asyncio.to_thread(unfiled_upload, job)
+    kept = await asyncio.to_thread(original_of, root, document_id)
+    if kept is not None or upload is None:
+        return kept
+    job_rows = (
+        await db.execute(
+            select(Document.id).where(Document.job_id == job.id, Document.user_id == job.user_id)
+        )
+    ).scalars()
+    held = await asyncio.to_thread(kept_originals, root)
+    if document_id in held:
+        # Filed between the first look and the listing: the original it became.
+        return await asyncio.to_thread(original_of, root, document_id)
+    return upload if upload_heir(job_rows, held) == document_id else None
+
+
+def open_original(root: Path, document_id: int, source: Path) -> int | None:
+    """A descriptor on what `answering_original` found or, when that was the upload and the
+    filing moved it in between, on the original it became; None when neither opens."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    with contextlib.suppress(OSError):
+        return os.open(source, flags)
+    original = original_of(root, document_id)
+    if original is None:
+        return None
+    with contextlib.suppress(OSError):
+        return os.open(original, flags)
+    return None
+
+
 def kept_originals(root: Path) -> set[int]:
     """The ids of the documents whose original is kept (`original_of`), from one listing
     of the originals' directory: what the library read reports as `original`

@@ -21,6 +21,7 @@ const ICONS: Record<StepKind, IconName> = {
   fetch: 'link',
   download: 'arrow-down',
   convert: 'scan-text',
+  retry: 'rotate-ccw',
   image: 'image',
   tool: 'terminal',
 }
