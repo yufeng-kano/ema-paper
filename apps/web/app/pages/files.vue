@@ -75,6 +75,7 @@ import {
   FOLDER_NAME_MAX,
   documentGlyph,
   documentsIn,
+  failedWithOriginal,
   folderPath,
   initialView,
   isMarkdownUpload,
@@ -850,15 +851,22 @@ async function showResult(document: LibraryDocument) {
   // Reading something by hand settles what the screen is for; a queued auto-preview must
   // not take it away when it finishes.
   autoPreviewFor = null
-  // A failed parse has no result to read, ever: opening it is its retry (docs/web.md § Files).
-  if (document.status === 'failed') {
+  // A failed parse has no result to read until a retry succeeds: it opens on its original,
+  // the retry there — or, with no original kept, nothing to show, in the retry dialog
+  // (docs/web.md § Files, *A failed parse opens on its original*).
+  if (document.status === 'failed' && !failedWithOriginal(document)) {
     retrying.value = document
     return
   }
   openDocument.value = document
   // A markdown document has no result: the viewer reads its copy; nor has a file kept as
-  // it is: its viewer shows the file itself (docs/web.md § Files).
-  if (document.kind === 'markdown' || document.kind === 'file' || results.has(document.id)) {
+  // it is, or a failed parse: its viewer shows the original (docs/web.md § Files).
+  if (
+    document.kind === 'markdown' ||
+    document.kind === 'file' ||
+    document.status === 'failed' ||
+    results.has(document.id)
+  ) {
     return
   }
   await fetchResult(document)
@@ -937,9 +945,10 @@ onMounted(() => void openDocQuery())
  *  more of it to read, but its name and folder can still change — and a re-convert that
  *  lands makes the document another parse, whose result is read again and whose viewer
  *  starts over on the new version. A file the agent converted while it was open is a parse
- *  on the page's next read of the library: the viewer closes as it does for *Markdown* chosen in it, and the document opens
- *  by itself when its parse succeeds — the retry dialog, when it failed (docs/web.md
- *  § Files). */
+ *  on the page's next read of the library, and a failed parse the agent retried is queued
+ *  again: the viewer closes as it does for *Markdown* or *Retry* chosen in it, and the
+ *  document opens by itself when its parse succeeds — on its original again, when it failed
+ *  (docs/web.md § Files). */
 watch(documents, (list, previous) => {
   const before = new Map((previous ?? []).map((row) => [row.id, row.job_id]))
   for (const row of list) {
@@ -955,7 +964,9 @@ watch(documents, (list, previous) => {
   if (!fresh) {
     return
   }
-  if (open.kind === 'file' && fresh.kind !== 'file') {
+  // A failed parse queued again — retried by the Agent, or in another tab — or since
+  // converted: the same, since it now has a document, or soon will.
+  if ((open.kind === 'file' && fresh.kind !== 'file') || (open.status === 'failed' && fresh.status !== 'failed')) {
     openDocument.value = null
     if (isPending(fresh)) {
       autoPreviewFor = fresh.id
@@ -1006,6 +1017,11 @@ async function onRetried() {
   const retried = retrying.value
   autoPreviewFor = retried && retried.reconvert?.status !== 'failed' ? retried.id : null
   retrying.value = null
+  // Retried from its viewer: the row says *Queued* now, and the document opens by itself.
+  const open = openDocument.value
+  if (retried && open?.id === retried.id && open.status === 'failed') {
+    openDocument.value = null
+  }
   await refresh()
 }
 
@@ -1065,8 +1081,17 @@ const openOriginal = computed(() => {
   return { url: open.kind === 'file' ? documentFileUrl(open.id) : documentOriginalUrl(open.id), kind }
 })
 
-/** The open file's facts for the viewer's More menu while it is not converted: what the
- *  file viewer's menu says of any file. */
+/** The open failed parse, for the viewer: what a retry sends and where its original
+ *  downloads from (docs/web.md § Files, *A failed parse opens on its original*). */
+const openFailure = computed(() => {
+  const open = openDocument.value
+  return open?.status === 'failed'
+    ? { pages: open.failed_pages ?? 0, download: documentOriginalUrl(open.id, true) }
+    : null
+})
+
+/** The open file's facts for the viewer's More menu while it is not converted, or its
+ *  parse failed: what the file viewer's menu says of any file. */
 const openFileFacts = computed<MenuFact[]>(() => {
   const open = openDocument.value
   if (!open) {
@@ -1102,9 +1127,9 @@ const openLocation = computed(() => {
 })
 
 /** The file's bytes, saved: the browser takes `?download=1` to the disk (docs/api.md). */
-function downloadEntry(id: number) {
+function downloadEntry(url: string) {
   const anchor = window.document.createElement('a')
-  anchor.href = documentFileUrl(id, true)
+  anchor.href = url
   anchor.download = ''
   anchor.click()
 }
@@ -2028,7 +2053,8 @@ const menuItems = computed<MenuItem[]>(() => {
       ? [
           {
             key: 'open',
-            label: t('files.open'),
+            // A failed parse opens on its original (docs/web.md § Files).
+            label: t(parse && failedWithOriginal(parse) ? 'files.openOriginal' : 'files.open'),
             icon: one.kind === 'folder' ? ('folder-open' as const) : ('file-text' as const),
             shortcut: label(apple ? 'mod+down' : 'enter'),
             // A parse opens only once every page has succeeded (docs/web.md § Files).
@@ -2038,7 +2064,8 @@ const menuItems = computed<MenuItem[]>(() => {
           ...(parse?.kind === 'file'
             ? [{ key: 'download', label: t('files.download'), icon: 'download' as const }]
             : []),
-          // With no page missing (its format check failed), the retry is of the whole document.
+          // With no page missing (its format check failed), the retry is of the whole document;
+          // the original, kept, is the reader's to save all the same.
           ...(parse?.status === 'failed'
             ? [
                 {
@@ -2046,6 +2073,9 @@ const menuItems = computed<MenuItem[]>(() => {
                   label: t(parse.failed_pages ? 'files.retryFailed' : 'files.retryWhole'),
                   icon: 'rotate-ccw' as const,
                 },
+                ...(failedWithOriginal(parse)
+                  ? [{ key: 'downloadOriginal', label: t('files.downloadOriginal'), icon: 'download' as const }]
+                  : []),
               ]
             : []),
           // A failed re-convert is retried or let go; a new one replaces it as well.
@@ -2100,14 +2130,22 @@ const menuLabel = computed(() => {
 function runMenu(action: string) {
   const items = selection.value
   switch (action) {
-    // Retry is what Open does for a failed parse, named in its menu so it can be found.
     case 'open':
-    case 'retry':
       return items[0] && openEntry(items[0].key)
+    // The retry dialog straight away, without the viewer a failed parse opens on.
+    case 'retry': {
+      const document = items[0] && documents.value.find((row) => row.id === items[0]!.id)
+      if (document) {
+        retrying.value = document
+      }
+      return
+    }
     case 'rename':
       return items[0] && startRename(items[0].key)
     case 'download':
-      return items[0] && downloadEntry(items[0].id)
+      return items[0] && downloadEntry(documentFileUrl(items[0].id, true))
+    case 'downloadOriginal':
+      return items[0] && downloadEntry(documentOriginalUrl(items[0].id, true))
     case 'convert': {
       const document = items[0] && documents.value.find((row) => row.id === items[0]!.id)
       if (document) {
@@ -2940,17 +2978,19 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
       :error-message="resultErrors.get(openDocument.id) ?? null"
       :figure-base="openDocument.kind === 'markdown' ? null : `/api/library/documents/${openDocument.id}/figures`"
       :image-base="`/api/library/documents/${openDocument.id}/images`"
-      :document-id="openDocument.kind === 'file' ? null : openDocument.id"
+      :document-id="openDocument.kind === 'file' || openDocument.status === 'failed' ? null : openDocument.id"
       :markdown-document="openDocument.kind === 'markdown'"
       :initial-block="linkedBlock?.id === openDocument.id ? linkedBlock.anchor : null"
       :reconvert-note="reconvertNote"
       :initial-view="initialView(openDocument, defaultView)"
       :original="openOriginal"
-      :converted="openDocument.kind !== 'file'"
-      :convertible="openDocument.kind !== 'file' || convertible(openDocument)"
-      :facts="openDocument.kind === 'file' ? openFileFacts : []"
+      :converted="openDocument.kind !== 'file' && openDocument.status !== 'failed'"
+      :convertible="openDocument.kind === 'file' ? convertible(openDocument) : openDocument.status !== 'failed'"
+      :facts="openDocument.kind === 'file' || openDocument.status === 'failed' ? openFileFacts : []"
+      :failure="openFailure"
       @view="recordView(openDocument, $event)"
       @convert="convertOpen"
+      @retry="retrying = openDocument"
       @filed="refresh()"
       @close="openDocument = null"
     />

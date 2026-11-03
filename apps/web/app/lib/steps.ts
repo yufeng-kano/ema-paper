@@ -28,6 +28,7 @@ export type StepKind =
   | 'fetch'
   | 'download'
   | 'convert'
+  | 'retry'
   | 'image'
   | 'tool'
 
@@ -65,6 +66,7 @@ export const SUMMARY_ORDER: readonly StepKind[] = [
   'create',
   'download',
   'convert',
+  'retry',
   'image',
   'tool',
 ]
@@ -387,8 +389,9 @@ export function readStep(name: string, input: Record<string, unknown>): Step {
       // The name the call asked for, else its URL: what the reader will find in Files.
       return { kind: 'download', target: text(input.name) || text(input.url) }
     case 'convert_file':
-      // The file's name: the row in Files that becomes a document.
-      return { kind: 'convert', target: basename(text(input.path)) }
+      // The file's name: the row in Files that becomes a document — or, with `retry`, whose
+      // failed pages are sent again (docs/web.md § The agent panel).
+      return { kind: input.retry === true ? 'retry' : 'convert', target: basename(text(input.path)) }
     case 'insert_image':
       // The image's name, and the document or the notes it goes into.
       return { kind: 'image', target: basename(text(input.image)), file: basename(text(input.document)) || undefined }

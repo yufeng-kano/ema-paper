@@ -14,6 +14,7 @@ import {
   filePreview,
   folderPath,
   imageFormat,
+  failedWithOriginal,
   initialView,
   isMarkdownUpload,
   isPending,
@@ -414,5 +415,15 @@ describe('originalKind and initialView', () => {
   it('opens on Markdown whatever was remembered where the original was not kept, and always for markdown', () => {
     expect(initialView(document(1, 'a.pdf', null, { view: 'original', original: false }), 'original')).toBe('markdown')
     expect(initialView(document(1, 'a.md', null, { kind: 'markdown', view: 'original' }), 'original')).toBe('markdown')
+  })
+
+  it('opens a failed parse on its original only where one was kept', () => {
+    expect(failedWithOriginal(document(1, 'a.pdf', null, { status: 'failed', original: true }))).toBe(true)
+    expect(failedWithOriginal(document(1, 'a.png', null, { kind: 'image', status: 'failed', original: true }))).toBe(true)
+    // None kept, or a read that did not look: the retry dialog, as before.
+    expect(failedWithOriginal(document(1, 'a.pdf', null, { status: 'failed', original: false }))).toBe(false)
+    expect(failedWithOriginal(document(1, 'a.pdf', null, { status: 'failed', original: null }))).toBe(false)
+    expect(failedWithOriginal(document(1, 'a.pdf', null, { status: 'succeeded', original: true }))).toBe(false)
+    expect(failedWithOriginal(document(1, 'a.pdf', null, { status: 'running', original: true }))).toBe(false)
   })
 })
