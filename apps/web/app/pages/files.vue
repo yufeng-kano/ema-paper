@@ -907,6 +907,18 @@ async function openDocQuery() {
   }
 }
 
+/** Whatever closes the viewer — its own button, Escape, Back, a move to the Trash — the
+ *  library is read again: a file the agent converted while it was open, whose answer the
+ *  page never saw, shows its true state on its row (docs/web.md § Files). */
+watch(
+  () => openDocument.value?.id ?? null,
+  (id, before) => {
+    if (id === null && before !== null) {
+      void refresh()
+    }
+  },
+)
+
 /** Back taking `doc` away closes the viewer; Forward bringing one opens it. */
 watch(
   () => route.query.doc,
@@ -924,7 +936,10 @@ onMounted(() => void openDocQuery())
 /** The open viewer follows its own row: a parse only opens finished, so there is nothing
  *  more of it to read, but its name and folder can still change — and a re-convert that
  *  lands makes the document another parse, whose result is read again and whose viewer
- *  starts over on the new version (docs/web.md § Files). */
+ *  starts over on the new version. A file the agent converted while it was open is a parse
+ *  on the page's next read of the library: the viewer closes as it does for *Markdown* chosen in it, and the document opens
+ *  by itself when its parse succeeds — the retry dialog, when it failed (docs/web.md
+ *  § Files). */
 watch(documents, (list, previous) => {
   const before = new Map((previous ?? []).map((row) => [row.id, row.job_id]))
   for (const row of list) {
@@ -937,12 +952,22 @@ watch(documents, (list, previous) => {
   }
   const open = openDocument.value
   const fresh = open && list.find((row) => row.id === open.id)
-  if (fresh) {
-    openDocument.value = fresh
-    if (fresh.job_id !== open.job_id) {
-      showNote(t('files.note.reconverted'), false)
-      void fetchResult(fresh)
+  if (!fresh) {
+    return
+  }
+  if (open.kind === 'file' && fresh.kind !== 'file') {
+    openDocument.value = null
+    if (isPending(fresh)) {
+      autoPreviewFor = fresh.id
+    } else {
+      void showResult(fresh)
     }
+    return
+  }
+  openDocument.value = fresh
+  if (fresh.job_id !== open.job_id) {
+    showNote(t('files.note.reconverted'), false)
+    void fetchResult(fresh)
   }
 })
 

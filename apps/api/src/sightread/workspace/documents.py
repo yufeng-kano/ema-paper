@@ -703,7 +703,10 @@ def keep_source(
     The original lands first and whole: a copy the tree refuses is made again on the
     next materialization. `relative` None makes no shell copy: the document is in the
     Trash, and its directory is not under `files/` (docs/workspace.md § The Trash).
-    Returns the original's path."""
+    Nor does a directory without `.meta.json` get one — a failed parse's, a parse still
+    on its way, or one nothing materialized yet: a lone `source.<ext>` there would read
+    as a folder's file, and the materialization that writes `.meta.json` makes the copy
+    from the original anyway (docs/workspace.md § Layout). Returns the original's path."""
     git.ensure_repo(root)
     canonical = sources_dir(root) / f"{document_id}{_source_suffix(source, kind)}"
     canonical.parent.mkdir(parents=True, exist_ok=True)
@@ -711,7 +714,7 @@ def keep_source(
     staging = canonical.with_name(f".tmp-{canonical.name}")
     shutil.copyfile(source, staging)
     os.replace(staging, canonical)
-    if relative is not None:
+    if relative is not None and safe_io.entry_kind(root, root / relative / META_FILE) == "file":
         _copy_source(root, root / relative, canonical)
     if not copy:
         source.unlink(missing_ok=True)

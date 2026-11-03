@@ -18,6 +18,7 @@ from sqlalchemy import select
 from sightread.agents import PARSE
 from sightread.db.models import Document, Job, JobPage, User, utcnow
 from sightread.jobs.queue import (
+    claim_job,
     claim_next_job,
     count_running_jobs,
     enqueue_job,
@@ -330,6 +331,50 @@ async def test_a_worker_starting_requeues_the_jobs_a_dead_one_left(sessionmaker)
         assert await requeue_orphaned_jobs(db) == []
 
 
+async def test_after_a_turn_the_worker_requeues_only_its_own_jobs_left_running(
+    sessionmaker,
+) -> None:
+    """docs/jobs.md § Queue: a parse a chat turn drove and could not put back is still the
+    live worker's once the turn is over, and nobody drives it; the worker puts it back
+    right after the turn, keeping its succeeded pages. A job running under another
+    generation is not this worker's to take."""
+    from sightread.db.models import JobPage
+    from sightread.jobs.queue import next_worker_generation, requeue_orphaned_jobs
+
+    async with sessionmaker() as db:
+        user = await _user(db)
+        left = await enqueue_job(
+            db, user_id=user.id, sha256="8" * 64, source_path="unused-8.pdf", **JOB_DEFAULTS
+        )
+        foreign = await enqueue_job(
+            db, user_id=user.id, sha256="9" * 64, source_path="unused-9.pdf", **JOB_DEFAULTS
+        )
+        await db.commit()
+        left_id, foreign_id = left.id, foreign.id
+    async with sessionmaker() as db:
+        # Each taken after the last claim: the SQLite fallback counts from the highest
+        # generation on record (docs/jobs.md § Queue).
+        other = await next_worker_generation(db)
+        assert await claim_job(db, foreign_id, other)
+        live = await next_worker_generation(db)
+        assert live != other
+        assert await claim_job(db, left_id, live)
+        db.add(JobPage(job_id=left_id, page_no=1, status="succeeded", markdown="kept"))
+        db.add(JobPage(job_id=left_id, page_no=2, status="failed", error="upstream call failed"))
+        await db.commit()
+    async with sessionmaker() as db:
+        assert await requeue_orphaned_jobs(db, live) == [left_id]
+        assert await requeue_orphaned_jobs(db, live) == []
+    async with sessionmaker() as db:
+        requeued = await db.get(Job, left_id)
+        assert (requeued.status, requeued.worker_generation) == ("queued", None)
+        pages = (
+            await db.execute(select(JobPage.page_no).where(JobPage.job_id == left_id))
+        ).scalars()
+        assert list(pages) == [1]
+        assert (await db.get(Job, foreign_id)).status == "running"
+
+
 async def test_a_job_whose_task_raised_is_failed_unless_already_done(
     sessionmaker, tmp_path
 ) -> None:
@@ -409,6 +454,29 @@ def test_sweeper_removes_only_stale_entries(tmp_path) -> None:
     assert fresh.exists()
     assert not stale.exists()
     assert not stale_dir.exists()
+
+
+def test_sweeper_keeps_a_live_jobs_source_however_old(tmp_path) -> None:
+    """docs/jobs.md § Retention: what is named for a job still queued or running — its
+    source, a retry copy, a render directory — is the job's own, a converted file's only
+    copy, and stays however long the parse waits; a finished job's leftovers go."""
+    live, done = str(uuid.uuid4()), str(uuid.uuid4())
+    entries = [
+        tmp_path / f"{live}.pdf",
+        tmp_path / f"{live}.retry-0123456789ab.pdf",
+        tmp_path / f"{live}.attempt",
+        tmp_path / f"{done}.pdf",
+    ]
+    old = time.time() - 7200
+    for entry in entries:
+        if entry.suffix == ".attempt":
+            entry.mkdir()
+        else:
+            entry.write_bytes(b"x")
+        os.utime(entry, (old, old))
+
+    assert sweep_uploads(tmp_path, max_age=3600, keep={live}) == 1
+    assert [entry.exists() for entry in entries] == [True, True, True, False]
 
 
 def test_a_discarded_jobs_figures_cannot_be_written_back(tmp_path) -> None:

@@ -20,6 +20,7 @@ from sightread.errors import ApiError
 from sightread.jobs import sweeper
 from sightread.workspace import documents, git, reconcile, safe_io
 from sightread.workspace.layout import (
+    META_FILE,
     git_dir,
     images_dir,
     inside,
@@ -163,17 +164,26 @@ async def test_reconcile_follows_a_directory_the_shell_moved(sessionmaker, tmp_p
 
 
 async def test_keep_source_moves_the_upload_into_the_document_directory(tmp_path) -> None:
+    """docs/workspace.md § Layout: the original outside the mount, and the shell's copy only
+    in a directory a materialization made a document's, one holding `.meta.json` — a lone
+    `source.*` anywhere else would read as a folder's file."""
     root = tmp_path / "ws" / "7"
     upload = tmp_path / "upload.pdf"
     upload.write_bytes(b"%PDF-1.4")
     kept = documents.keep_source(root, Path("files/paper.pdf"), upload, document_id=31)
-    # The original outside the mount, named by the document; the shell's copy in the tree.
+    # The original named by the document; no directory made in the tree for the copy.
     assert kept == tmp_path / "ws" / ".repos" / "7.sources" / "31.pdf"
     assert kept.read_bytes() == b"%PDF-1.4"
-    assert (root / "files" / "paper.pdf" / "source.pdf").read_bytes() == b"%PDF-1.4"
+    assert not (root / "files" / "paper.pdf").exists()
     assert documents.original_of(root, 31) == kept
     assert documents.original_of(root, 32) is None
     assert not upload.exists()
+    # Materialized: the shell's copy lands beside `.meta.json`.
+    (root / "files" / "paper.pdf").mkdir(parents=True)
+    (root / "files" / "paper.pdf" / META_FILE).write_text("{}")
+    upload.write_bytes(b"%PDF-1.4")
+    documents.keep_source(root, Path("files/paper.pdf"), upload, document_id=31)
+    assert (root / "files" / "paper.pdf" / "source.pdf").read_bytes() == b"%PDF-1.4"
     # Ignored by git: the binary never enters history.
     assert git.commit_all(root, "user", "x") is None or "source" not in git.log(root)[0].files
 
@@ -479,6 +489,10 @@ async def test_a_late_library_row_adopts_the_finished_upload(sessionmaker, tmp_p
         await db.commit()
         await documents.adopt_source(db, settings, document, job)
         paths = await documents.document_paths(db, settings, document)
+        # Never materialized: no `.meta.json`, so no shell copy yet — the first
+        # materialization makes it from the original (docs/workspace.md § Layout).
+        assert not paths.directory.exists()
+        await documents.materialize_document(db, settings, document)
         assert (paths.directory / "source.pdf").read_bytes() == b"%PDF-1.4"
         original = documents.original_of(paths.root, document.id)
         assert original is not None and original.read_bytes() == b"%PDF-1.4"
@@ -722,8 +736,11 @@ async def test_a_cached_library_upload_keeps_its_fresh_file(sessionmaker, tmp_pa
         fresh.write_bytes(b"%PDF-1.4 fresh")
         await documents.adopt_source(db, settings, document, job, upload=fresh)
         paths = await documents.document_paths(db, settings, document)
-        assert (paths.directory / "source.pdf").read_bytes() == b"%PDF-1.4 fresh"
+        original = documents.original_of(paths.root, document.id)
+        assert original is not None and original.read_bytes() == b"%PDF-1.4 fresh"
         assert not fresh.exists()
+        await documents.materialize_document(db, settings, document)
+        assert (paths.directory / "source.pdf").read_bytes() == b"%PDF-1.4 fresh"
 
 
 async def test_a_revert_that_cannot_complete_touches_nothing(sessionmaker, tmp_path) -> None:
@@ -765,6 +782,9 @@ async def test_deleting_through_a_linked_ancestor_is_refused(sessionmaker, tmp_p
 
 def test_the_kept_source_is_named_by_the_parse_kind(tmp_path) -> None:
     root = tmp_path / "ws" / "8"
+    for name in ("paper", "photo"):
+        (root / "files" / name).mkdir(parents=True)
+        (root / "files" / name / META_FILE).write_text("{}")
     upload = tmp_path / "upload.bin"
     upload.write_bytes(b"%PDF-1.4")
     kept = documents.keep_source(root, Path("files/paper"), upload, document_id=1, kind="pdf")

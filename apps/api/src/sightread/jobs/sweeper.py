@@ -1,14 +1,16 @@
 """The worker's sweep (docs/jobs.md § Retention).
 
 Deleting the source at terminal state is the optimisation; this sweep is the guarantee.
-Every 15 minutes, inside the worker, it trashes anything under the upload directory older
-than `UPLOAD_MAX_AGE_SECONDS` (a day), whatever left it there — a crashed job, an
-abandoned upload, or a bug — packs the workspaces' git histories (docs/workspace.md
-§ Revisions) and removes from each workspace the staging file of a file upload the API
-process died in (§ Files). It deletes for good what has been in the Trash longer than
-`TRASH_RETENTION_DAYS` (§ The Trash), deletes the finished parses the retention no longer
-keeps once they are `PARSE_RETENTION_DAYS` old, and finishes the account deletions a
-request left half done, from their markers (docs/auth.md § Deleting the account).
+Every 15 minutes, inside the worker, it first finishes the retention of a finished library
+parse whose original was never filed, then trashes anything under the upload directory
+older than `UPLOAD_MAX_AGE_SECONDS` (a day), whatever left it there — a crashed job, an
+abandoned upload, or a bug — but a queued or running job's source. It packs the
+workspaces' git histories (docs/workspace.md § Revisions) and removes from each workspace
+the staging file of a file upload the API process died in (§ Files). It deletes for good
+what has been in the Trash longer than `TRASH_RETENTION_DAYS` (§ The Trash), deletes the
+finished parses the retention no longer keeps once they are `PARSE_RETENTION_DAYS` old,
+and finishes the account deletions a request left half done, from their markers
+(docs/auth.md § Deleting the account).
 
 The Trash's and the parses' passes go user by user, each under the user's workspace
 lock: a user whose pass is refused, or fails, is logged and tried again at the next
@@ -27,7 +29,7 @@ from collections.abc import Collection
 from datetime import timedelta
 from pathlib import Path
 
-from sqlalchemy import delete, not_, select
+from sqlalchemy import and_, delete, not_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ..config import Settings
@@ -40,15 +42,25 @@ from ..workspace import documents as workspace_documents
 from ..workspace.layout import user_root
 from ..workspace.locks import workspace_lock
 from .queue import parse_kept
+from .runner import retain_source
 
 logger = logging.getLogger(__name__)
 
 SWEEP_INTERVAL_SECONDS = 900.0
 
 
-def sweep_uploads(upload_dir: Path, *, max_age: float, now: float | None = None) -> int:
-    """Delete upload-directory entries older than `max_age` seconds; returns how many were
-    removed."""
+def sweep_uploads(
+    upload_dir: Path,
+    *,
+    max_age: float,
+    keep: Collection[str] = (),
+    now: float | None = None,
+) -> int:
+    """Delete upload-directory entries older than `max_age` seconds, but none named for one
+    of `keep` — the ids of the jobs still queued or running, or finished with their
+    retention still to run, whose source, retry copies and render directories are named
+    `{job_id}.…`: a converted file's only copy is its job's source until its original is
+    filed (docs/jobs.md § Retention). Returns how many were removed."""
     now = time.time() if now is None else now
     if not upload_dir.is_dir():
         return 0
@@ -56,6 +68,8 @@ def sweep_uploads(upload_dir: Path, *, max_age: float, now: float | None = None)
     removed = 0
     for entry in upload_dir.iterdir():
         try:
+            if entry.name.partition(".")[0] in keep:
+                continue
             if now - entry.stat().st_mtime < max_age:
                 continue
             if entry.is_dir():
@@ -286,11 +300,70 @@ async def finish_deletions(
     return finished
 
 
+async def finish_retention(
+    sessionmaker: async_sessionmaker[AsyncSession], settings: Settings
+) -> int:
+    """File the originals a finished library parse never filed: its worker died between the
+    terminal commit and the copies, or a copy raised. A `succeeded` or `failed` job that a
+    document names, whose source is still in the upload directory with `source_deleted_at`
+    NULL, has its retention run now, as the worker would have run it — before the upload
+    ages out, since for a converted file it is the only copy (docs/jobs.md § Retention).
+    Returns how many were finished; one that fails is logged and tried at the next sweep."""
+    async with sessionmaker() as db:
+        pending = (
+            await db.execute(
+                select(Job.id, Job.source_path).where(
+                    Job.status.in_(("succeeded", "failed")),
+                    Job.source_path.is_not(None),
+                    Job.source_deleted_at.is_(None),
+                    select(Document.id).where(Document.job_id == Job.id).exists(),
+                )
+            )
+        ).all()
+    finished = 0
+    for job_id, source_path in pending:
+        source = Path(source_path)
+        if not source.is_file():
+            continue
+        try:
+            await retain_source(sessionmaker, settings, job_id, source)
+        except Exception:  # noqa: BLE001 - one job's retention never ends the sweep
+            logger.exception("sweeper could not keep the source of job %s", job_id)
+            continue
+        finished += 1
+    return finished
+
+
 async def sweep_once(sessionmaker: async_sessionmaker[AsyncSession], settings: Settings) -> None:
     """One pass of every sweep, each logged by what it did."""
     upload_dir = Path(settings.upload_dir)
+    retained = await finish_retention(sessionmaker, settings)
+    if retained:
+        logger.info("sweeper filed the originals of %d finished parses", retained)
+    async with sessionmaker() as db:
+        # Read before the listing: a job queued after it has an upload younger than a day.
+        # A finished library parse whose retention has not run yet keeps its source too —
+        # one whose retention failed above, or that finished since its query — so the
+        # next sweep still has it to file (docs/jobs.md § Retention).
+        keep = {
+            str(job_id)
+            for job_id in (
+                await db.execute(
+                    select(Job.id).where(
+                        or_(
+                            Job.status.in_(("queued", "running")),
+                            and_(
+                                Job.status.in_(("succeeded", "failed")),
+                                Job.source_deleted_at.is_(None),
+                                select(Document.id).where(Document.job_id == Job.id).exists(),
+                            ),
+                        )
+                    )
+                )
+            ).scalars()
+        }
     removed = await asyncio.to_thread(
-        sweep_uploads, upload_dir, max_age=settings.upload_max_age_seconds
+        sweep_uploads, upload_dir, max_age=settings.upload_max_age_seconds, keep=keep
     )
     if removed:
         logger.info("sweeper removed %d stale upload entries", removed)

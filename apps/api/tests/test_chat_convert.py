@@ -7,6 +7,11 @@ reaches the network (docs/testing.md § Cost safety)."""
 from __future__ import annotations
 
 import asyncio
+import os
+import time
+import uuid
+from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -16,9 +21,11 @@ from sqlalchemy import select
 from sightread.agents import chat as chat_agent
 from sightread.billing import ledger
 from sightread.db.models import Document, Job
-from sightread.jobs import chat_runner
+from sightread.errors import ApiError
+from sightread.jobs import chat_runner, runner, sweeper
 from sightread.jobs.queue import claim_next_job
 from sightread.jobs.runner import run_job
+from sightread.workspace.documents import original_of
 from sightread.workspace.layout import user_root
 from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, convert_on_upload
 from tests.test_chat import _run_queued_turn
@@ -363,3 +370,339 @@ async def test_a_conversion_past_its_time_goes_back_on_the_queue(
 )
 def test_the_path_is_read_as_the_files_page_shows_it(raw: str, segments: list[str] | None) -> None:
     assert chat_runner._library_segments(raw) == segments
+
+
+async def _settled(client: httpx.AsyncClient, document_id: int) -> tuple[Document, Job, dict]:
+    """The row, its job and what the library says of it."""
+    async with client.app.state.sessionmaker() as db:
+        row = await db.get(Document, document_id)
+        job = await db.get(Job, row.job_id)
+    listed = (await client.get("/api/library")).json()["documents"]
+    return row, job, next(shown for shown in listed if shown["id"] == document_id)
+
+
+async def _worker_runs_next(client: httpx.AsyncClient) -> Job:
+    """The worker's next claim, run to its end."""
+    settings = client.app.state.settings
+    async with client.app.state.sessionmaker() as db:
+        claimed = await claim_next_job(db, settings.max_jobs_per_user)
+    assert claimed is not None
+    await run_job(client.app.state.sessionmaker, settings, claimed, asyncio.Semaphore(2))
+    async with client.app.state.sessionmaker() as db:
+        return await db.get(Job, claimed)
+
+
+@respx.mock
+async def test_a_failed_conversion_keeps_the_file_to_retry(
+    make_client, tmp_path, documents, monkeypatch
+) -> None:
+    """docs/jobs.md § Converting a file: a parse the upstream fails inside the turn fails
+    whole, and the file is never lost to the error — kept as the failed document's original
+    outside the tree, with no `source.*` left in a directory that has no `.meta.json` (the
+    reconciliation would rename it and the quota count it twice) — and the Files page's
+    retry makes it the document once the upstream is back, its shell copy in place."""
+    monkeypatch.setattr(runner, "VISION_BACKOFF_BASE_SECONDS", 0.0)
+    down = True
+
+    def vision(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "down"}) if down else _completion(VISION_MARKDOWN)
+
+    respx.post(KANO_CHAT_URL).mock(side_effect=vision)
+    client = await _ready(make_client, tmp_path)
+    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
+    kept = await _keep(
+        client, "paper.pdf", documents["text_pdf"].read_bytes(), "application/pdf", None
+    )
+    _, (first, second) = await _run(client, {"path": "paper.pdf"}, {"path": "paper.pdf"})
+    assert first["is_error"] is True
+    assert first["output"].startswith("The conversion of paper.pdf failed: ")
+    assert second["output"].startswith("The conversion of paper.pdf failed earlier: ")
+    row, job, shown = await _settled(client, kept["id"])
+    assert (row.kind, job.status, shown["status"], shown["original"]) == (
+        "parse",
+        "failed",
+        "failed",
+        True,
+    )
+    assert job.source_deleted_at is not None
+    assert original_of(root, kept["id"]) is not None
+    # Reconciled at the turn's end: nothing of the failed parse stands in the tree.
+    assert not (root / "files" / "paper.pdf").exists()
+
+    down = False
+    retried = await client.post(
+        f"/api/library/documents/{kept['id']}/retry", json={}, headers=CSRF_HEADERS
+    )
+    assert retried.status_code == 202, retried.text
+    assert (await _worker_runs_next(client)).status == "succeeded"
+    names = {entry.name for entry in (root / "files" / "paper.pdf").iterdir()}
+    assert {"doc.md", ".meta.json", "source.pdf"} <= names
+    assert "_source.pdf" not in names
+
+
+@respx.mock
+async def test_a_stop_during_a_failed_finish_still_keeps_the_original(
+    make_client, tmp_path, documents, monkeypatch
+) -> None:
+    """docs/jobs.md § Retention: the finalization of a failed parse runs to its end like a
+    result's. The reader's Stop lands while the failure files the original — a wait on the
+    workspace lock, a large copy — and the file is still kept, so the retry works."""
+    monkeypatch.setattr(chat_runner, "CONVERT_POLL_SECONDS", 0.05)
+    respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(400, json={"error": "bad"}))
+    filing = asyncio.Event()
+    real_retain, real_cancelled = runner._retain_source, chat_runner._cancelled
+
+    async def slow(*args, **kwargs) -> None:
+        filing.set()
+        await asyncio.sleep(0.5)
+        await real_retain(*args, **kwargs)
+
+    async def stopped(ctx) -> bool:
+        # The Stop, as the turn's poll sees it, the moment the original is being filed.
+        return filing.is_set() or await real_cancelled(ctx)
+
+    monkeypatch.setattr(runner, "_retain_source", slow)
+    monkeypatch.setattr(chat_runner, "_cancelled", stopped)
+    client = await _ready(make_client, tmp_path)
+    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
+    kept = await _keep(
+        client, "paper.pdf", documents["text_pdf"].read_bytes(), "application/pdf", None
+    )
+    _, (result,) = await _run(client, {"path": "paper.pdf"})
+    assert result["output"].startswith("The conversion of paper.pdf failed: "), result["output"]
+    _, job, shown = await _settled(client, kept["id"])
+    assert (job.status, shown["original"]) == ("failed", True)
+    assert original_of(root, kept["id"]) is not None
+    retried = await client.post(
+        f"/api/library/documents/{kept['id']}/retry", json={}, headers=CSRF_HEADERS
+    )
+    assert retried.status_code == 202, retried.text
+
+
+@respx.mock
+async def test_a_full_workspace_still_keeps_a_converted_files_original(
+    make_client, tmp_path, documents, monkeypatch
+) -> None:
+    """docs/workspace.md § Layout: the upload moved into place as the row's original is
+    kept whatever the quota says — a converted file was counted in the tree, and the
+    upload is the only copy there is."""
+    monkeypatch.setattr(runner, "VISION_BACKOFF_BASE_SECONDS", 0.0)
+    respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(503))
+    client = await _ready(make_client, tmp_path)
+    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
+    kept = await _keep(
+        client, "paper.pdf", documents["text_pdf"].read_bytes(), "application/pdf", None
+    )
+
+    async def full(*args, **kwargs) -> None:
+        raise ApiError(409, "storage_full", "The workspace is at its quota")
+
+    monkeypatch.setattr(runner, "ensure_within_quota", full)
+    _, (result,) = await _run(client, {"path": "paper.pdf"})
+    assert result["output"].startswith("The conversion of paper.pdf failed: ")
+    assert original_of(root, kept["id"]) is not None
+
+
+@respx.mock
+async def test_the_sweep_files_an_original_the_worker_never_did(
+    make_client, tmp_path, documents, monkeypatch
+) -> None:
+    """docs/jobs.md § Retention: a worker that dies between a failed parse's terminal
+    commit and its copies leaves the converted file in the upload directory alone; the
+    sweep files it as the document's original instead of letting it age out — and its
+    age sweep never takes the upload first, even when the filing fails again."""
+    monkeypatch.setattr(runner, "VISION_BACKOFF_BASE_SECONDS", 0.0)
+    respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(503))
+    real = runner._retain_source
+
+    async def died(*args, **kwargs) -> None:
+        raise RuntimeError("the worker died here")
+
+    monkeypatch.setattr(runner, "_retain_source", died)
+    client = await _ready(make_client, tmp_path)
+    settings = client.app.state.settings
+    root = user_root(settings.workspaces_dir, client.user_id)
+    kept = await _keep(
+        client, "paper.pdf", documents["text_pdf"].read_bytes(), "application/pdf", None
+    )
+    await _run(client, {"path": "paper.pdf"})
+    _, job, _ = await _settled(client, kept["id"])
+    assert job.status == "failed" and job.source_deleted_at is None
+    assert original_of(root, kept["id"]) is None
+
+    # Two days on, the age sweep still keeps the upload of a retention still to run — one
+    # that failed again in this very pass.
+    upload = Path(job.source_path)
+    os.utime(upload, (time.time() - 2 * settings.upload_max_age_seconds,) * 2)
+    await sweeper.sweep_once(client.app.state.sessionmaker, settings)
+    assert upload.is_file() and original_of(root, kept["id"]) is None
+
+    monkeypatch.setattr(runner, "_retain_source", real)
+    assert await sweeper.finish_retention(client.app.state.sessionmaker, settings) == 1
+    _, job, shown = await _settled(client, kept["id"])
+    assert job.source_deleted_at is not None and shown["original"] is True
+    assert original_of(root, kept["id"]) is not None
+    assert await sweeper.finish_retention(client.app.state.sessionmaker, settings) == 0
+
+
+@respx.mock
+async def test_the_sweeps_filing_leaves_no_lone_copy_in_the_tree(
+    make_client, tmp_path, documents, monkeypatch
+) -> None:
+    """docs/workspace.md § Layout: the sweep files the original of a succeeded parse whose
+    worker died before its copies and its materialization, and puts no `source.*` in the
+    tree — the directory has no `.meta.json`, and a lone copy there would turn into a
+    folder's `_source.*`, counted twice; the document's first materialization makes it."""
+    respx.post(KANO_CHAT_URL).mock(return_value=_completion(VISION_MARKDOWN))
+    real = runner._retain_source
+
+    async def died(*args, **kwargs) -> None:
+        raise RuntimeError("the worker died here")
+
+    monkeypatch.setattr(runner, "_retain_source", died)
+    monkeypatch.setattr(runner, "materialize_document", died)
+    client = await _ready(make_client, tmp_path)
+    settings = client.app.state.settings
+    root = user_root(settings.workspaces_dir, client.user_id)
+    kept = await _keep(client, "tiny.png", documents["png"].read_bytes(), "image/png", None)
+    converted = await client.post(
+        f"/api/library/documents/{kept['id']}/convert", json={}, headers=CSRF_HEADERS
+    )
+    assert converted.status_code == 200, converted.text
+    job = await _worker_runs_next(client)
+    assert job.status == "succeeded" and job.source_deleted_at is None
+
+    monkeypatch.setattr(runner, "_retain_source", real)
+    assert await sweeper.finish_retention(client.app.state.sessionmaker, settings) == 1
+    assert original_of(root, kept["id"]) is not None
+    assert not (root / "files" / "tiny.png").exists()
+    opened = await client.post(
+        f"/api/library/documents/{kept['id']}/conversations", json={}, headers=CSRF_HEADERS
+    )
+    assert opened.status_code == 201, opened.text
+    names = {entry.name for entry in (root / "files" / "tiny.png").iterdir()}
+    assert {".meta.json", "source.png"} <= names and "_source.png" not in names
+
+
+@respx.mock
+async def test_a_stop_before_the_claim_starts_no_run(
+    make_client, tmp_path, documents, monkeypatch
+) -> None:
+    """docs/chat.md § Tools, *A conversion runs inside the turn*: no job is claimed once a
+    Stop or the turn's end has come — a run started then would only be cancelled, its
+    first page calls paid — and the job waits on the queue for the worker."""
+    vision = respx.post(KANO_CHAT_URL).mock(return_value=_completion(VISION_MARKDOWN))
+    client = await _ready(make_client, tmp_path)
+    kept = await _keep(client, "tiny.png", documents["png"].read_bytes(), "image/png", None)
+    converted = await client.post(
+        f"/api/library/documents/{kept['id']}/convert", json={}, headers=CSRF_HEADERS
+    )
+    assert converted.status_code == 200, converted.text
+    row, job, _ = await _settled(client, kept["id"])
+    claims: list[uuid.UUID] = []
+
+    async def spy(db, job_id, generation) -> bool:
+        claims.append(job_id)
+        return False
+
+    monkeypatch.setattr(chat_runner, "claim_job", spy)
+    ctx = SimpleNamespace(
+        settings=client.app.state.settings,
+        sessionmaker=client.app.state.sessionmaker,
+        convert_stop=asyncio.Event(),
+        turn=SimpleNamespace(id=uuid.uuid4()),
+        generation=None,
+        render_slots=asyncio.Semaphore(1),
+        inline_parse=None,
+    )
+    ctx.convert_stop.set()
+    assert await chat_runner._drive_parse(ctx, job.id) is None
+    assert claims == [] and vision.call_count == 0
+    _, job, _ = await _settled(client, row.id)
+    assert job.status == "queued"
+
+
+async def test_a_failing_look_for_a_stop_cancels_the_run(monkeypatch) -> None:
+    """docs/chat.md § Tools: a wait that fails in any other way than a cancel — the look for
+    a Stop meets a database error — cancels the run as a Stop does, rather than leave it
+    going unwatched beside the worker's next claim."""
+    monkeypatch.setattr(chat_runner, "CONVERT_POLL_SECONDS", 0.01)
+
+    async def broken(ctx) -> bool:
+        raise RuntimeError("the database went away")
+
+    monkeypatch.setattr(chat_runner, "_cancelled", broken)
+    run = asyncio.create_task(asyncio.sleep(30))
+    ctx = SimpleNamespace(convert_stop=asyncio.Event())
+    with pytest.raises(RuntimeError):
+        await chat_runner._await_inline_parse(ctx, run, time.monotonic() + 30)
+    assert run.cancelled()
+
+
+async def test_a_failed_finish_outlasts_every_cancel_of_its_caller() -> None:
+    """docs/jobs.md § Retention: a terminal state's finalization runs to its end whatever
+    cancels its caller — a turn's end cancels the run it drives, then cancels it again as
+    it stops waiting — and the caller ends only after it, so no requeue or answer comes
+    before the original is filed."""
+    started, release = asyncio.Event(), asyncio.Event()
+    finished: list[bool] = []
+
+    async def finish() -> None:
+        started.set()
+        await release.wait()
+        finished.append(True)
+
+    caller = asyncio.create_task(runner._to_the_end(finish()))
+    await started.wait()
+    for _ in range(2):
+        caller.cancel()
+        await asyncio.sleep(0)
+    assert not caller.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    assert finished == [True]
+
+
+@respx.mock
+async def test_a_failing_wait_puts_the_conversion_back_on_the_queue(
+    make_client, tmp_path, documents, monkeypatch
+) -> None:
+    """docs/chat.md § Tools: a wait that fails otherwise than by a cancel — the look for a
+    Stop meets a database error — puts the job back on the queue as a Stop does, so the
+    tool answers that the conversion goes on after the turn and the worker takes it."""
+    monkeypatch.setattr(chat_runner, "CONVERT_POLL_SECONDS", 0.01)
+    started = asyncio.Event()
+
+    async def slow(request: httpx.Request) -> httpx.Response:
+        started.set()
+        await asyncio.sleep(30)
+        return _completion(VISION_MARKDOWN)
+
+    respx.post(KANO_CHAT_URL).mock(side_effect=slow)
+    client = await _ready(make_client, tmp_path)
+    kept = await _keep(client, "tiny.png", documents["png"].read_bytes(), "image/png", None)
+    converted = await client.post(
+        f"/api/library/documents/{kept['id']}/convert", json={}, headers=CSRF_HEADERS
+    )
+    assert converted.status_code == 200, converted.text
+    row, job, _ = await _settled(client, kept["id"])
+
+    async def broken(ctx) -> bool:
+        if started.is_set():
+            raise RuntimeError("the database went away")
+        return False
+
+    monkeypatch.setattr(chat_runner, "_cancelled", broken)
+    ctx = SimpleNamespace(
+        settings=client.app.state.settings,
+        sessionmaker=client.app.state.sessionmaker,
+        convert_stop=asyncio.Event(),
+        turn=SimpleNamespace(id=uuid.uuid4()),
+        generation=None,
+        render_slots=asyncio.Semaphore(1),
+        inline_parse=None,
+    )
+    assert await asyncio.wait_for(chat_runner._drive_parse(ctx, job.id), 10) is None
+    _, job, _ = await _settled(client, row.id)
+    assert job.status == "queued"
