@@ -690,6 +690,9 @@ async def answering_original(
         )
     ).scalars()
     held = await asyncio.to_thread(kept_originals, root)
+    if document_id in held:
+        # Filed between the first look and the listing: the original it became.
+        return await asyncio.to_thread(original_of, root, document_id)
     return upload if upload_heir(job_rows, held) == document_id else None
 
 

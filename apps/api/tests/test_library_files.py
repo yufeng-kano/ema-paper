@@ -984,6 +984,35 @@ async def test_an_unfiled_upload_answers_only_for_the_row_it_is_filed_for(
     assert one.status_code == 200 and one.json()["original"] is False
 
 
+async def test_an_original_filed_between_the_looks_still_answers(
+    writer, documents, monkeypatch
+) -> None:
+    """docs/api.md: the filing can land between the look for a row's original and the
+    listing that picks the upload's row; the original it became answers, never a 404."""
+    png = documents["png"].read_bytes()
+    kept = await _kept(writer, "tiny.png", png, "image/png")
+    assert (await _convert(writer, kept["id"])).status_code == 200
+    async with writer.app.state.sessionmaker() as db:
+        job = await db.get(Job, (await db.get(Document, kept["id"])).job_id)
+        job.status = "failed"
+        await db.commit()
+        source = Path(job.source_path)
+    real = workspace_documents.kept_originals
+
+    def filed_first(root):
+        # Retention moves the upload into place just before the listing.
+        directory = sources_dir(root)
+        directory.mkdir(parents=True, exist_ok=True)
+        if source.is_file():
+            os.replace(source, directory / f"{kept['id']}.png")
+        return real(root)
+
+    monkeypatch.setattr(workspace_documents, "kept_originals", filed_first)
+    shown = await writer.get(f"/api/library/documents/{kept['id']}/original")
+    assert shown.status_code == 200, shown.text
+    assert shown.content == png
+
+
 async def test_the_default_view_is_the_readers_preference(writer) -> None:
     """Which view a converted document opens on the first time: Markdown unless the reader
     changes it (docs/api.md § PUT /api/me/preferences)."""
