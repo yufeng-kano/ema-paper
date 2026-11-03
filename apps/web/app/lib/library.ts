@@ -425,14 +425,6 @@ export function failedWithOriginal(document: {
   return document.status === 'failed' && document.original === true && originalKind(document) !== null
 }
 
-/** A failed parse whose original is still being filed, a moment after the failure: the
- *  library says `original: null` until it is (docs/api.md), so the list keeps reading and
- *  the opening waits for it rather than taking it for one with none kept (docs/web.md
- *  § Files, *Convert to document…*). */
-export function awaitingOriginal(document: { status: string | null; original?: boolean | null }): boolean {
-  return document.status === 'failed' && document.original === null
-}
-
 /**
  * The view a row's viewer opens on (docs/web.md § Result viewer, *Original and Markdown*): a
  * file kept as it is has its original alone; a converted document opens on the view it was

@@ -70,7 +70,6 @@ import type { IconName } from '~/lib/icons'
 import type { MenuFact, MenuItem, Point } from '~/lib/menu'
 import {
   acceptsUpload,
-  awaitingOriginal,
   childFolders,
   DOCUMENT_NAME_MAX,
   FOLDER_NAME_MAX,
@@ -762,11 +761,8 @@ async function drain() {
 // --- live progress ---------------------------------------------------------
 
 // A re-convert on its way polls too: its row shows its progress, and its document takes it
-// when it succeeds; and a failed parse until the read says whether its original was kept
-// (docs/web.md § Files).
-const anyPending = computed(() =>
-  documents.value.some((row) => isPending(row) || isReconverting(row) || awaitingOriginal(row)),
-)
+// when it succeeds (docs/web.md § Files).
+const anyPending = computed(() => documents.value.some((row) => isPending(row) || isReconverting(row)))
 let poller: ReturnType<typeof setInterval> | undefined
 
 function stopPolling() {
@@ -850,12 +846,6 @@ async function showResult(document: LibraryDocument) {
   // progress are what there is to see (docs/web.md § Files).
   if (isPending(document)) {
     showNote(t(document.checking ? 'files.note.checking' : 'files.note.parsing'), false)
-    return
-  }
-  // Failed a moment ago, its original still being filed: it opens by itself once the next
-  // read says whether it was kept, on it or in the retry dialog.
-  if (awaitingOriginal(document)) {
-    autoPreviewFor = document.id
     return
   }
   // Reading something by hand settles what the screen is for; a queued auto-preview must
@@ -1002,14 +992,13 @@ const reconvertNote = computed(() => {
 
 /** The upload that just finished parsing opens itself — on its original, if it failed —
  *  unless the reader is already reading something, in which case taking the screen away
- *  would be rude. A retried document waits here the same way, and a failed one whose
- *  original is still being filed. */
+ *  would be rude. A retried document waits here the same way. */
 watch(documents, (list) => {
   if (autoPreviewFor === null || autoPreviewFor < 0 || openDocument.value || retrying.value) {
     return
   }
   const target = list.find((row) => row.id === autoPreviewFor)
-  if (!target || isPending(target) || awaitingOriginal(target)) {
+  if (!target || isPending(target)) {
     return
   }
   if (target.folder_id !== currentFolder.value || view.value !== 'files') {
