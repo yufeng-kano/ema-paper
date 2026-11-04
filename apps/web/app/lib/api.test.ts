@@ -10,6 +10,7 @@ import {
   deleteAdminGroup,
   disableAdminCode,
   getAdminMe,
+  getDocumentText,
   getLibrary,
   getMe,
   isDevLoginAvailable,
@@ -17,6 +18,7 @@ import {
   listAdminCodes,
   putAgentSettings,
   putDocumentContent,
+  putDocumentText,
   removeAdminGroupMember,
   renameConversation,
   revertRevision,
@@ -173,6 +175,35 @@ describe('workspace and chat routes', () => {
     )) as ApiRequestError
 
     expect(error.status).toBe(409)
+  })
+
+  it('reads a markdown file from its own route, editable or not', async () => {
+    const fetchMock = stubFetch(Response.json({ markdown: '# Rules\r\n', revision: 'a', editable: false }))
+
+    await expect(getDocumentText(9)).resolves.toEqual({ markdown: '# Rules\r\n', revision: 'a', editable: false })
+    expect(fetchMock).toHaveBeenCalledWith('/api/library/documents/9/text', expect.anything())
+    expect(lastInit(fetchMock).method).toBe('GET')
+  })
+
+  it('saves a markdown file to its own route, never to the content route', async () => {
+    const fetchMock = stubFetch(Response.json({ revision: 'b' }))
+
+    await expect(putDocumentText(9, { markdown: '# Rules', base_revision: 'a' })).resolves.toEqual({ revision: 'b' })
+    expect(fetchMock).toHaveBeenCalledWith('/api/library/documents/9/text', expect.anything())
+    expect(lastInit(fetchMock).method).toBe('PUT')
+    expect(lastInit(fetchMock).body).toBe(JSON.stringify({ markdown: '# Rules', base_revision: 'a' }))
+    expect(headersOf(fetchMock)['X-Requested-With']).toBe('fetch')
+  })
+
+  it('surfaces a markdown file changed underneath as a revision conflict', async () => {
+    stubFetch(Response.json({ error: { type: 'revision_conflict', message: 'Stale' } }, { status: 409 }))
+
+    const error = (await putDocumentText(9, { markdown: '', base_revision: 'old' }).catch(
+      (thrown: unknown) => thrown,
+    )) as ApiRequestError
+
+    expect(error.status).toBe(409)
+    expect(error.type).toBe('revision_conflict')
   })
 
   it('posts a message with its selection and reads the queued turn', async () => {

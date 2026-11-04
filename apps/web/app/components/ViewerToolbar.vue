@@ -7,7 +7,8 @@
  * platform's own selection callout leaves free. Where it is still wider than the pane its
  * buttons drop their words, which stay their names. The notes card has it too (*The notes
  * have it too*), with Ask the agent and Copy only, and `solid` there: the card is a glass
- * pane, and nothing glass sits on glass.
+ * pane, and nothing glass sits on glass. A markdown file has no agent and no notes: Copy alone
+ * (docs/web.md § Result viewer, *A markdown file opens on its text*).
  *
  * A press on it never moves focus, so the selection — in the open editor or over the rendered
  * blocks — is still there for the action to read. Its buttons are not tab stops: the keyboard
@@ -44,12 +45,14 @@ const props = withDefaults(
     coarse: boolean
     /** The skills the selection can be sent to; none hides the Skills button. */
     skills: readonly ToolbarSkill[]
+    /** Ask the agent is offered; false where there is no agent — a markdown file. */
+    ask?: boolean
     /** Quote in notes is offered; false in the notes, where the selection already is. */
     quote?: boolean
     /** The opaque menu surface instead of glass: on a glass card. */
     solid?: boolean
   }>(),
-  { quote: true, solid: false },
+  { ask: true, quote: true, solid: false },
 )
 
 const emit = defineEmits<{
@@ -80,7 +83,7 @@ const shown = ref<readonly ToolbarSkill[]>([])
 const listPlace = ref({ left: 0, top: 0, width: LIST_WIDTH, maxHeight: 0, above: false })
 
 const buttons = computed((): { key: 'ask' | 'quote' | 'copy'; icon: IconName; label: string }[] => [
-  { key: 'ask', icon: 'message-circle', label: t('viewer.toolbar.ask') },
+  ...(props.ask ? [{ key: 'ask' as const, icon: 'message-circle' as const, label: t('viewer.toolbar.ask') }] : []),
   ...(props.quote ? [{ key: 'quote' as const, icon: 'notebook-pen' as const, label: t('viewer.toolbar.quote') }] : []),
   { key: 'copy', icon: 'copy', label: t('viewer.toolbar.copy') },
 ])

@@ -283,6 +283,10 @@ async def me(user: SessionUser, db: DbSession, settings: AppSettings):
             "trash_retention_days": settings.trash_retention_days,
             # The most a file of any other kind may be (docs/workspace.md § Files).
             "file_max_bytes": settings.file_max_bytes,
+            # The largest markdown file the result viewer edits, which its read-only note
+            # names: a larger one has no revision, and a save there would be none
+            # (docs/workspace.md § Files).
+            "revision_max_bytes": settings.revision_max_file_bytes,
         },
     }
 

@@ -18,8 +18,8 @@ from .parse import BBOX_FORMAT_YXYX
 # 10: convert_file, figure links; 11: fewer strict tools, thinking binding; 12: search
 # before guessing an address; 13: uv's default environment, the fonts; 14: the sites the
 # sandbox reaches; 15: insert_image; 16: the editor's view shows images; 17: convert_file
-# retries a failed conversion.
-PIPELINE_VERSION = 17
+# retries a failed conversion; 18: markdown documents' directories end in .md.
+PIPELINE_VERSION = 18
 
 # Anthropic-defined tools carry no schema of their own (docs/chat.md § Tools). The order
 # is part of the cache prefix and never changes. A custom tool whose input has structure is
@@ -428,7 +428,7 @@ DEFAULT_SYSTEM_PROMPT = """You are the document agent inside Ema Paper, working 
 /workspace/.sightread/results/<job_id>/result.md   the untouched parse output, read-only
 /workspace/.sightread/trash/        what the user moved to the Trash on the Files page, read-only and outside the library
 
-A markdown document (.meta.json kind markdown, job id null) was never parsed: doc.md is the user's own text, uploaded or written in Ema Paper, and it has no pages, no figure crops, no source.* and no parse output. view_page has nothing to show for it.
+A markdown document (.meta.json kind markdown, job id null) was never parsed: doc.md is the user's own text, uploaded or written in Ema Paper, and it has no pages, no figure crops, no source.* and no parse output. view_page has nothing to show for it. Its directory's name ends in .md (Notes/summary.md/doc.md) and is still a directory; a plain .md directly in a folder, AGENTS.md among them, is a file of the library.
 
 A file of the library is any plain file directly in a folder, outside the document directories: the user's own bytes, the only copy there is. Read it with your tools (pandoc for a Word file, Python for a spreadsheet) and change it when the user asks. A binary or a large file has no revision to undo a change, so rewrite one only when the user asks for exactly that, and never delete one. In your replies it is "your file <name>", never a path.
 

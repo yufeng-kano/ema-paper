@@ -554,6 +554,7 @@ export default {
       noPreview: '這種檔案沒有預覽。',
       agentReads: '在任何對話中，Agent 仍然可以讀取它。',
       textCut: '只顯示檔案開頭的 {size}。',
+      readOnly: '這個檔案超過 {size}，在這裡只能閱讀，不能修改。',
     },
     fact: {
       model: '模型',

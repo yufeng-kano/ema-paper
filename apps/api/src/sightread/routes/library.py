@@ -85,6 +85,7 @@ from ..workspace.filing import (
     insert_named,
     keep_file,
     make_folder,
+    move_then_commit,
     sibling_names,
 )
 from ..workspace.layout import (
@@ -161,6 +162,16 @@ async def live_text_document(db: DbSession, user_id: int, document_id: int) -> D
     § Files); 404 for one, as for nothing."""
     row = await live_document(db, user_id, document_id)
     if row.kind == FILE_KIND:
+        raise ApiError(404, "invalid_request", "No such document")
+    return row
+
+
+async def live_markdown_file(db: DbSession, user_id: int, document_id: int) -> Document:
+    """A live file of the caller's that is a markdown file: what `…/text` takes; 404 for
+    anything else — a markdown document, whose text is `…/content`, a parse, any other
+    file — as for nothing (docs/api.md, docs/workspace.md § Files)."""
+    row = await live_document(db, user_id, document_id)
+    if not workspace_documents.is_markdown_file(row):
         raise ApiError(404, "invalid_request", "No such document")
     return row
 
@@ -250,55 +261,6 @@ async def flush_or_retry(db: DbSession, retries_left: int, message: str) -> bool
         if retries_left <= 0:
             raise ApiError(409, "invalid_request", message) from exc
         return False
-
-
-async def move_then_commit(
-    db: DbSession, settings, user_id: int, before, after, *, landed: tuple[type, int, dict]
-) -> None:
-    """The row is flushed; now the directory, then the commit. A refusal from the tree
-    rolls the row back to where the files still are; a commit that fails after the move
-    puts the directory back where the row stayed — unless the row shows the commit
-    landed after all (the connection dropped after PostgreSQL made it durable), which
-    `landed` (the model, the id, the values the committed row holds) is read for on a
-    fresh connection: then the files stay where the row points (docs/workspace.md)."""
-    try:
-        moved = await workspace_documents.move_path(settings, user_id, before, after)
-    except BaseException:
-        await db.rollback()
-        raise
-    try:
-        await db.commit()
-    except BaseException:
-        if moved is not None:
-            model, row_id, expected = landed
-            readable, row = await read_row(db, model, row_id)
-            if not readable:
-                # Indeterminate is not a rollback: the files stay where they are rather
-                # than being moved away from a row that may now name them; the next
-                # reconciliation follows the directory (docs/workspace.md § Revisions).
-                logger.error(
-                    "the move of %s to %s raised and cannot be verified; the files stay",
-                    before,
-                    after,
-                )
-            elif row is not None and all(
-                getattr(row, key) == value for key, value in expected.items()
-            ):
-                logger.warning(
-                    "the move of %s to %s was committed despite the error; the files stay",
-                    before,
-                    after,
-                )
-            else:
-                try:
-                    # The whole move undone: the directory back, and the squatter the
-                    # move displaced back under its name (docs/workspace.md § Layout).
-                    await workspace_documents.undo_move(
-                        settings, user_id, before, after, moved.displaced
-                    )
-                except Exception:  # noqa: BLE001 - the move revision stays revertible
-                    logger.exception("could not move %s back after a failed commit", after)
-        raise
 
 
 # --- payloads ---------------------------------------------------------------------------
@@ -1027,7 +989,7 @@ async def restore_document(
             if row.trashed_at is None:
                 raise ApiError(404, "invalid_request", "No such document in the Trash")
             place = nearest_live(await workspace_documents.user_folders(db, user_id), row.folder_id)
-            taken = await sibling_names(db, user_id, place)
+            taken = await sibling_names(db, user_id, place, markdown=row.kind == MARKDOWN_KIND)
             row.folder_id = place
             row.name = free_name(taken, row.name, DOCUMENT_NAME_MAX)
             row.trashed_at = None
@@ -1440,7 +1402,7 @@ async def file_markdown(
                 build=lambda name: Document(
                     user_id=user_id, folder_id=folder_id, job_id=None, kind=MARKDOWN_KIND, name=name
                 ),
-                taken=lambda: sibling_names(db, user_id, folder_id),
+                taken=lambda: sibling_names(db, user_id, folder_id, markdown=True),
                 wanted=wanted,
                 limit=DOCUMENT_NAME_MAX,
                 message="A file with this name already exists here",
@@ -1509,8 +1471,13 @@ async def file_upload(
 async def create_document(body: DocumentCreate, user: SessionUser, db: DbSession):
     """A new, empty markdown document: a row with no job and no original — its baseline is
     empty (docs/workspace.md § Markdown documents). Its directory is made the first time it
-    is read, like any document's. A taken name is suffixed, as a new folder's is."""
+    is read, like any document's. A taken name is suffixed, as a new folder's is; `AGENTS.md`,
+    typed or made by the `.md` rule, is refused, since it is a folder's instructions file
+    (docs/workspace.md § Markdown documents)."""
     user_id, folder_id = user.id, body.folder_id
+    wanted = markdown_name(clean_name(body.name, DOCUMENT_NAME_MAX), DOCUMENT_NAME_MAX)
+    if wanted == AGENTS_FILE:
+        raise ApiError(409, "invalid_request", workspace_documents.RESERVED_NAME)
     if folder_id is not None:
         await live_folder(db, user_id, folder_id)
     try:
@@ -1522,7 +1489,7 @@ async def create_document(body: DocumentCreate, user: SessionUser, db: DbSession
                 user_id=user_id, folder_id=folder_id, job_id=None, kind=MARKDOWN_KIND, name=name
             ),
             taken=lambda: sibling_names(db, user_id, folder_id),
-            wanted=markdown_name(clean_name(body.name, DOCUMENT_NAME_MAX), DOCUMENT_NAME_MAX),
+            wanted=wanted,
             limit=DOCUMENT_NAME_MAX,
             message="A file with this name already exists here",
         )
@@ -1566,10 +1533,17 @@ async def _update_document_locked(
             await live_folder(db, user.id, folder_id)
 
         wanted = clean_name(body.name, DOCUMENT_NAME_MAX) if renaming else row.name
-        if renaming and row.kind == MARKDOWN_KIND:
+        markdown = row.kind == MARKDOWN_KIND
+        # A markdown file's rename keeps `.md` as a markdown document's does
+        # (docs/workspace.md § Files); only the document is refused `AGENTS.md`.
+        if renaming and (markdown or workspace_documents.is_markdown_file(row)):
             wanted = markdown_name(wanted, DOCUMENT_NAME_MAX)
+        if renaming and markdown and wanted == AGENTS_FILE:
+            raise ApiError(409, "invalid_request", workspace_documents.RESERVED_NAME)
         await lock_user(db, user.id)
-        taken = await sibling_names(db, user.id, folder_id, exclude_document=row.id)
+        taken = await sibling_names(
+            db, user.id, folder_id, exclude_document=row.id, markdown=markdown
+        )
         if renaming and wanted in taken:
             raise ApiError(409, "invalid_request", clash)
 
@@ -2416,7 +2390,7 @@ async def copy_document(
         job = await job_of(db, source.job_id) if source.job_id is not None else None
         if job is not None:
             await keep_parses(db, [job])
-        taken = await sibling_names(db, user_id, folder_id)
+        taken = await sibling_names(db, user_id, folder_id, markdown=source.kind == MARKDOWN_KIND)
         row = Document(
             user_id=user_id,
             folder_id=folder_id,
@@ -2607,6 +2581,26 @@ async def put_document_notes(
     row = await live_text_document(db, user.id, document_id)
     revision = await workspace_documents.write_notes(
         db, settings, row, text=body.text, base_revision=body.base_revision
+    )
+    return {"revision": revision}
+
+
+@router.get("/documents/{document_id}/text")
+async def document_text(document_id: int, user: SessionUser, db: DbSession, settings: AppSettings):
+    """A markdown file's text as stored, for the result viewer to read and edit in place;
+    `editable` false when history would not record a save of it (docs/api.md)."""
+    row = await live_markdown_file(db, user.id, document_id)
+    text = await workspace_documents.read_file_text(db, settings, row)
+    return {"markdown": text.markdown, "revision": text.revision, "editable": text.editable}
+
+
+@router.put("/documents/{document_id}/text", dependencies=[CsrfGuard])
+async def put_document_text(
+    document_id: int, body: ContentPut, user: SessionUser, db: DbSession, settings: AppSettings
+):
+    row = await live_markdown_file(db, user.id, document_id)
+    revision = await workspace_documents.write_file_text(
+        db, settings, row, markdown=body.markdown, base_revision=body.base_revision
     )
     return {"revision": revision}
 

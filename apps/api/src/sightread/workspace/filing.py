@@ -24,6 +24,7 @@ from ..db.models import FILE_KIND, Document, Folder
 from ..errors import ApiError
 from . import documents as workspace_documents
 from . import safe_io
+from .agents_file import AGENTS_FILE
 from .layout import FILES_DIR, document_relative_dir, path_segment, segment_name, user_root
 from .trash import lock_user, read_row
 
@@ -96,11 +97,14 @@ async def sibling_names(
     *,
     exclude_folder: int | None = None,
     exclude_document: int | None = None,
+    markdown: bool = False,
 ) -> set[str]:
     """Every name taken in one folder — the folders and the documents in it alike. The
     workspace gives each name one directory, so a folder and a file cannot share one
     (docs/workspace.md § Layout); the caller holds the user's row so the set is current.
-    What is in the Trash takes no name (docs/database.md § Rules)."""
+    What is in the Trash takes no name (docs/database.md § Rules). For a markdown document,
+    `AGENTS.md` too, which is a folder's instructions file and never one's name
+    (docs/workspace.md § Markdown documents)."""
     folders = select(Folder.name).where(
         Folder.user_id == user_id,
         placed_in(Folder.parent_id, place),
@@ -117,6 +121,8 @@ async def sibling_names(
         documents = documents.where(Document.id != exclude_document)
     taken = set((await db.execute(folders)).scalars().all())
     taken.update((await db.execute(documents)).scalars().all())
+    if markdown:
+        taken.add(AGENTS_FILE)
     return taken
 
 
@@ -244,6 +250,63 @@ async def commit_filing(
             f"{what} may have been filed, but the database could not confirm it; "
             "reload the library before trying again",
         ) from exc
+
+
+async def move_then_commit(
+    db: AsyncSession,
+    settings: Settings,
+    user_id: int,
+    before: Path,
+    after: Path,
+    *,
+    landed: tuple[type, int, dict],
+) -> None:
+    """The row is flushed; now the directory, then the commit. A refusal from the tree
+    rolls the row back to where the files still are; a commit that fails after the move
+    puts the directory back where the row stayed — unless the row shows the commit
+    landed after all (the connection dropped after PostgreSQL made it durable), which
+    `landed` (the model, the id, the values the committed row holds) is read for on a
+    fresh connection: then the files stay where the row points (docs/workspace.md). Here,
+    not in the route: the one-time `markdown_names` command renames through it too, and
+    nothing imports a route (docs/project-structure.md)."""
+    try:
+        moved = await workspace_documents.move_path(settings, user_id, before, after)
+    except BaseException:
+        await db.rollback()
+        raise
+    try:
+        await db.commit()
+    except BaseException:
+        if moved is not None:
+            model, row_id, expected = landed
+            readable, row = await read_row(db, model, row_id)
+            if not readable:
+                # Indeterminate is not a rollback: the files stay where they are rather
+                # than being moved away from a row that may now name them; the next
+                # reconciliation follows the directory (docs/workspace.md § Revisions).
+                logger.error(
+                    "the move of %s to %s raised and cannot be verified; the files stay",
+                    before,
+                    after,
+                )
+            elif row is not None and all(
+                getattr(row, key) == value for key, value in expected.items()
+            ):
+                logger.warning(
+                    "the move of %s to %s was committed despite the error; the files stay",
+                    before,
+                    after,
+                )
+            else:
+                try:
+                    # The whole move undone: the directory back, and the squatter the
+                    # move displaced back under its name (docs/workspace.md § Layout).
+                    await workspace_documents.undo_move(
+                        settings, user_id, before, after, moved.displaced
+                    )
+                except Exception:  # noqa: BLE001 - the move revision stays revertible
+                    logger.exception("could not move %s back after a failed commit", after)
+        raise
 
 
 # --- folders and files ------------------------------------------------------------------
