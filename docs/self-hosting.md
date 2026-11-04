@@ -118,6 +118,19 @@ docker compose exec api python -m sightread.codes disable EMA-XXXX-XXXX-XXXX
 
 `create` prints each code once, as a user types it (`EMA-XXXX-XXXX-XXXX`; the prefix is `REDEEM_CODE_PREFIX`); `--uses` is how many accounts may redeem one code (1 unless given), `--valid-days` and `--days` are at most 36,500, a plan must be one of `KANO_PAY_PLANS_JSON` — the console's Settings page's, when it overrides it —, `--redeem-by` cannot be a day already past (UTC), and one batch holds at most `REDEEM_CODES_MAX_COUNT` (1000) codes, or the command refuses. The console shows a code in full only once, when it creates it; `list` here prints every code whole, which is how to read back one whose dialog was closed. A plan code whose plan was taken out of `KANO_PAY_PLANS_JSON` lists as `plan missing` and is refused to users until the plan is back. A user redeems a code in the settings dialog's Usage section. Granted days are spent only while no subscription pays for the account, and a code's credits are never refunded.
 
+## One-time commands after an update
+
+An update that needs something done once to existing data comes with a command for it, run in the api container like the codes CLI, by you, after the deploy — never by the update itself.
+
+**Markdown documents' names** (the update of 2026-11-04). A markdown document's name ends in `.md` since 2026-11-03; the ones written before then — *summary*, *Untitled* — get it from this command, once ([workspace.md](./workspace.md) § Markdown documents). Look at the plan first: `--dry-run` prints it and writes nothing.
+
+```sh
+docker compose exec api python -m sightread.markdown_names --dry-run
+docker compose exec api python -m sightread.markdown_names
+```
+
+It prints one line per markdown document named without the extension, tab-separated — the user id, the document id and `old name → new name`, or the old name and `skipped: <reason>`: a conversation about the document still answering, a document inside a folder in the Trash, or a workspace recovering from a shell command a worker died in. A rename that fails prints `failed: <reason>` and the run goes on. Each is renamed as a rename on the Files page renames it — its directory with it, as one revision — with ` (2)` where the folder already holds the new name; nothing else changes, since conversations, memories and tickets name a document by its id. It exits 0 unless something unexpected failed. Running it again renames nothing already renamed, so a run after the skipped conversations have answered — or the trashed folders were put back — picks up what was skipped.
+
 ## The operator console
 
 The console is your own pages inside the app — today *Overview*, *Jobs* and *Usage*, to see whether the worker runs, put a stuck job back in the queue and see what the model calls cost, *Users*, to look an account up and give it credits or days, *Redeem codes*, *Groups*, to give other people access, *Settings*, to change prices, plans and allowances without a restart, and *Audit*, the record of every change made there ([admin.md](./admin.md)). It does not exist until you name its first owner. Put your Google address in `.env`:
@@ -168,7 +181,7 @@ The *Redeem codes* page creates, lists and disables codes by the same rules as `
 
 ## Keep it running
 
-- **Update:** `git pull`, then the same `docker compose -f … up -d --build` you started with. A changed Caddyfile also needs `docker compose -f … restart caddy` ([deployment.md](./deployment.md) § Release flow).
+- **Update:** `git pull`, then the same `docker compose -f … up -d --build` you started with. A changed Caddyfile also needs `docker compose -f … restart caddy` ([deployment.md](./deployment.md) § Release flow), and an update that needs a one-time command says so in § One-time commands after an update.
 - **Back up:** the `backup` service writes the database dump, the figure crops and every workspace into `./backups/<stamp>/` once a day and keeps the newest seven. Copy them off the server, and test a restore before you rely on it ([deployment.md](./deployment.md) § Compose files).
 - **Logs:** `docker logs -f sightread-api`, and likewise `sightread-worker`, `sightread-web` and `sightread-caddy`.
 

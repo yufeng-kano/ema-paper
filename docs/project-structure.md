@@ -54,7 +54,10 @@ agent-sightread/
                               # and the Trash's expiry, one function), accounts.py (a
                               # deleted account's marker and files), filing.py (names,
                               # the suffixed insert and the filing of a file — what the
-                              # upload route and the agent's download share)
+                              # upload route and the agent's download share — and
+                              # move_then_commit: a row's directory moved, the row
+                              # committed, the move undone when the commit fails, what
+                              # the rename route and markdown_names.py share)
         sandbox/              # client.py: the HTTP client of the sandbox runner;
                               # egress.py: the list of sites the worker writes for the
                               # egress proxy (docs/sandbox.md § Network)
@@ -75,6 +78,11 @@ agent-sightread/
                               # summary.py (one summary-model call: `/rename`'s title)
         mcp/                  # server.py: thin shell over the service layer — parse, list_library, read_document, write_document (docs/mcp.md)
         worker.py             # `python -m sightread.worker`
+        codes.py              # `python -m sightread.codes`: the operator's redeem codes
+        markdown_names.py     # `python -m sightread.markdown_names`: the one-time `.md`
+                              # for markdown documents named before 2026-11-03, through
+                              # the rename `workspace/` shares with routes/library.py
+                              # (docs/self-hosting.md § One-time commands after an update)
       migrations/             # Alembic
       tests/
       pyproject.toml          # uv-managed
