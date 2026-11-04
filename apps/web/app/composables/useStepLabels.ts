@@ -1,6 +1,10 @@
+import type { InjectionKey } from 'vue'
 import type { IconName } from '~/lib/icons'
-import { basename, countKinds, splitDuration, type Step, type StepKind } from '~/lib/steps'
+import { basename, countKinds, ownFileDocument, splitDuration, type Step, type StepKind } from '~/lib/steps'
 import type { StepItem } from '~/lib/thread'
+
+/** Provided by the agent panel in the Files page's card: its steps are about many documents. */
+export const libraryStepsKey: InjectionKey<boolean> = Symbol('library-steps')
 
 /** The glyph each kind of step is drawn with. */
 const ICONS: Record<StepKind, IconName> = {
@@ -23,6 +27,14 @@ const ICONS: Record<StepKind, IconName> = {
   convert: 'scan-text',
   retry: 'rotate-ccw',
   image: 'image',
+  browse: 'folder-open',
+  folder: 'folder-plus',
+  move: 'folder-input',
+  rename: 'edit',
+  duplicate: 'copy-plus',
+  trash: 'trash',
+  putBack: 'undo-2',
+  newDocument: 'file-plus',
   tool: 'terminal',
 }
 
@@ -36,6 +48,18 @@ const OWN_FILES: Record<string, string> = {
 /** The kinds whose target is a file. */
 const FILE_KINDS: ReadonlySet<StepKind> = new Set(['read', 'count', 'edit', 'create'])
 
+/** The library tools' kinds: their targets are Files paths, the reader's own names. */
+const LIBRARY_KINDS: ReadonlySet<StepKind> = new Set([
+  'browse',
+  'folder',
+  'move',
+  'rename',
+  'duplicate',
+  'trash',
+  'putBack',
+  'newDocument',
+])
+
 /**
  * A step's words, through the catalog (docs/web.md § The agent panel): its verb, the detail
  * after its target, a group's summary and the line a live group shows for the step in
@@ -43,20 +67,36 @@ const FILE_KINDS: ReadonlySet<StepKind> = new Set(['read', 'count', 'edit', 'cre
  */
 export function useStepLabels() {
   const { t } = useI18n()
+  const library = inject(libraryStepsKey, false)
 
   function icon(kind: StepKind): IconName {
     return ICONS[kind]
   }
 
-  /** The reader's word for one of the document's own files; null for any other file. */
-  function ownFile(path: string): string | null {
+  /** The reader's word for one of the document's own files; null for any other file. In the
+   *  Files page's card, where every document has a `doc.md`, the file is named by its
+   *  document's Files path (`document`, read off a whole path), the word only when no path
+   *  said which. */
+  function ownFile(path: string, document = ownFileDocument(path)): string | null {
     const key = OWN_FILES[basename(path)]
-    return key ? t(key) : null
+    if (!key) {
+      return null
+    }
+    if (library && document) {
+      return key === 'chat.files.document' ? document : t('chat.files.notesOf', { document })
+    }
+    return t(key)
   }
 
   /** A step's target as the line draws it; `own` is a word, not a name, so not in mono. */
   function target(step: Step): { text: string; own: boolean } {
-    const own = FILE_KINDS.has(step.kind) ? ownFile(step.target) : null
+    if (LIBRARY_KINDS.has(step.kind)) {
+      if (step.items !== undefined) {
+        return { text: t('chat.stepItems', { n: step.items }, step.items), own: true }
+      }
+      return { text: step.trash ? t('files.tabTrash') : step.target || t('files.allFiles'), own: true }
+    }
+    const own = FILE_KINDS.has(step.kind) ? ownFile(step.target, step.document) : null
     return { text: own ?? step.target, own: own !== null }
   }
 
@@ -68,6 +108,12 @@ export function useStepLabels() {
   }
 
   function detail(step: Step): string {
+    if (step.place !== undefined) {
+      return t('chat.stepTo', { place: step.place || t('files.allFiles') })
+    }
+    if (step.name) {
+      return t('chat.stepRenameTo', { name: step.name })
+    }
     if (step.lines) {
       const { from, to } = step.lines
       if (to === null) {
@@ -79,7 +125,7 @@ export function useStepLabels() {
       return t('chat.stepLastLines', { n: step.last })
     }
     if (step.file) {
-      return t('chat.stepInFile', { file: ownFile(step.file) ?? step.file })
+      return t('chat.stepInFile', { file: ownFile(step.file, step.document) ?? step.file })
     }
     return ''
   }

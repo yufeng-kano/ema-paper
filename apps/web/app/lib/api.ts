@@ -7,6 +7,8 @@
  * (docs/api.md).
  */
 
+import type { LibraryStep } from './steps'
+
 // --- error envelope --------------------------------------------------------
 
 export type ApiErrorType =
@@ -301,6 +303,9 @@ export interface Skill extends SkillFields {
   modified: boolean
   /** A built-in's shipped fields; null for a skill of the reader's own. */
   default: SkillFields | null
+  /** It works on a document: a library conversation neither offers nor runs it. Optional
+   *  only so a page served by an older API still renders (docs/chat.md § Skills). */
+  document_only?: boolean
 }
 
 /** The tools a subagent may hold: the editor answers `view` only to one that cannot change
@@ -325,6 +330,8 @@ export interface Subagent extends SubagentFields {
   builtin: boolean
   modified: boolean
   default: SubagentFields | null
+  /** It works on a document: a library conversation does not offer it. */
+  document_only?: boolean
 }
 
 // --- attachments (docs/chat.md § What a user message carries) -------------------------
@@ -607,7 +614,8 @@ export interface Conversation {
 }
 
 export interface ConversationDetail extends Conversation {
-  document_id: number
+  /** Null for a library conversation, the Files page's (docs/chat.md § Library conversations). */
+  document_id: number | null
 }
 
 /** What the thread knows of an attached file: its name, never its text or bytes. */
@@ -650,6 +658,9 @@ export type ContentBlock =
       section?: string
       /** The file a `context: attachment` block holds. */
       attachment?: AttachmentMeta
+      /** The Files page a `context: library` block carried: the open folder and the selected
+       *  items as Files paths, `''` the top (docs/chat.md § Library conversations). */
+      library?: { folder: string; items: string[] }
     }
   | { type: 'thinking'; thinking: string }
   | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
@@ -660,6 +671,8 @@ export type ContentBlock =
       is_error?: boolean
       /** A `subagent` call's record of what the subagent did. */
       subagent?: SubagentRecord
+      /** A library tool's undo record of what it changed. */
+      library?: LibraryStep
     }
   /**
    * An image: a page or figure a tool returned (kept, not drawn), or one the reader
@@ -746,6 +759,8 @@ type ChatEventData =
       parent?: string
       /** On a `subagent` call's result: what the subagent did. */
       subagent?: SubagentRecord
+      /** On a library tool's result that changed something: its undo record. */
+      library?: LibraryStep
     }
   | {
       event: 'edit'
@@ -1449,6 +1464,16 @@ export function createConversation(documentId: number): Promise<Conversation> {
   return request('POST', `/api/library/documents/${documentId}/conversations`, {})
 }
 
+/** The Files page's conversations, about the whole library (docs/chat.md § Library
+ *  conversations): those holding a message, the one continued last first. */
+export function listLibraryConversations(): Promise<{ conversations: Conversation[] }> {
+  return request('GET', '/api/library/conversations')
+}
+
+export function createLibraryConversation(): Promise<Conversation> {
+  return request('POST', '/api/library/conversations', {})
+}
+
 export function getConversation(id: number): Promise<ConversationResponse> {
   return request('GET', `/api/conversations/${id}`)
 }
@@ -1467,7 +1492,23 @@ export interface MessageBody {
   command?: string
   /** Ids from `POST /api/attachments`. */
   attachments?: string[]
+  /** A library conversation's only: the folder open on the Files page and the rows selected
+   *  there (docs/chat.md § Library conversations). */
+  library?: LibraryBody
   locale: string
+}
+
+/** What a library conversation's message carries from the Files page: the open folder (null
+ *  the top) and the selected rows. */
+export interface LibraryBody {
+  folder_id: number | null
+  items: LibraryBodyItem[]
+}
+
+/** A selected row: a folder, or a `documents` row — a document or a file. */
+export interface LibraryBodyItem {
+  kind: 'folder' | 'document'
+  id: number
 }
 
 /** Stores the user message and queues a turn: 202 with the turn's id. 429 when too many

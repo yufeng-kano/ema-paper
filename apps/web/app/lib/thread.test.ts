@@ -281,6 +281,45 @@ describe('buildThread', () => {
   })
 })
 
+describe('a library conversation', () => {
+  const MOVE = { paths: ['DL/iBOT.pdf'], to: 'DL/DINO' }
+  const RECORD = {
+    type: 'move' as const,
+    moves: [{ item: { kind: 'file' as const, id: 34 }, from: 3, to: 12, fromName: 'iBOT.pdf', toName: 'iBOT.pdf' }],
+  }
+
+  it('keeps the Files paths a message carried, and each step’s undo record from the record', () => {
+    const messages = [
+      message('user', [
+        { type: 'text', text: 'Put these with DINO' },
+        { type: 'text', text: '', context: 'library', library: { folder: 'DL', items: ['DL/iBOT.pdf', 'DL/old'] } },
+      ]),
+      message('assistant', [{ type: 'tool_use', id: 'm', name: 'move', input: MOVE }]),
+      message('user', [{ type: 'tool_result', tool_use_id: 'm', content: 'Moved DL/iBOT.pdf.', library: RECORD }]),
+      message('assistant', [{ type: 'text', text: 'Done.' }]),
+    ]
+    const { items } = buildThread({ turns: [turn(true)], messages, groups: new Map() })
+    expect(items[0]).toMatchObject({ kind: 'user', text: 'Put these with DINO', picked: ['DL/iBOT.pdf', 'DL/old'] })
+    const steps = items[1] as Extract<ThreadItem, { kind: 'steps' }>
+    expect(steps.steps[0]).toMatchObject({ type: 'tool', status: 'ok', step: { kind: 'move' }, library: RECORD })
+  })
+
+  it('takes the record from the stream while the turn runs, and none from a call that changed nothing', () => {
+    const messages = [message('user', [{ type: 'text', text: 'Tidy up' }])]
+    const groups = events(
+      { event: 'turn_start', model: 'm' },
+      { event: 'tool_use', id: 'l', name: 'list_files', input: {} },
+      { event: 'tool_result', id: 'l', name: 'list_files', is_error: false, output: 'folder DL' },
+      { event: 'tool_use', id: 'm', name: 'move', input: MOVE },
+      { event: 'tool_result', id: 'm', name: 'move', is_error: false, output: 'Moved.', library: RECORD },
+    )
+    const { items } = buildThread({ turns: [turn(false)], messages, groups })
+    expect(items[0]).toMatchObject({ kind: 'user', picked: [] })
+    const steps = items[1] as Extract<ThreadItem, { kind: 'steps' }>
+    expect(steps.steps.map((step) => (step.type === 'tool' ? step.library : undefined))).toEqual([null, RECORD])
+  })
+})
+
 const SAVED = { id: 12, kind: 'term', text: 'query → 查詢', document_id: null, pinned: false }
 const REMEMBER = { kind: 'term', text: 'query → 查詢', scope: 'all', action: 'save', id: '' }
 

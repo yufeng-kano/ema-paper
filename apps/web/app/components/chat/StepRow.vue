@@ -2,21 +2,31 @@
 /**
  * One tool step of a group or a subagent's card (docs/web.md § The agent panel): its line,
  * a control that opens its detail — a shell step's whole command, its output and its exit;
- * a write's diff card with **Revert**.
+ * a write's diff card with **Revert**. A library step with an undo record has **Undo** at
+ * the line's end, and the server's refusal under it (docs/web.md § The Files page's Agent
+ * card).
  */
-import type { CardState, EditCard, ToolStep } from '~/lib/thread'
+import type { CardState, EditCard, ToolStep, UndoState } from '~/lib/thread'
 
-const props = defineProps<{
-  step: ToolStep
-  open: boolean
-  cardState: (card: EditCard) => CardState
-  /** A turn is unfinished: the revisions route refuses a revert under one. */
-  locked: boolean
-}>()
+const props = withDefaults(
+  defineProps<{
+    step: ToolStep
+    open: boolean
+    cardState: (card: EditCard) => CardState
+    /** A turn is unfinished: the revisions route refuses a revert under one, and a library
+     *  step's Undo waits for it too. */
+    locked: boolean
+    revertable?: boolean
+    /** The step's Undo, when it has one: a library step whose result carried an undo record. */
+    undo?: UndoState | null
+  }>(),
+  { revertable: true, undo: null },
+)
 
 const emit = defineEmits<{
   toggle: []
   'toggle-edit': [card: EditCard]
+  undo: []
 }>()
 
 const { t } = useI18n()
@@ -39,16 +49,28 @@ const meta = computed(() => {
 
 <template>
   <div class="step">
-    <button
-      type="button"
-      class="row"
-      :class="{ open }"
-      :aria-expanded="open"
-      :title="step.command ?? undefined"
-      @click="emit('toggle')"
-    >
-      <ChatStepLine :step="step" :state="step.card ? cardState(step.card) : null" />
-    </button>
+    <div class="line">
+      <button
+        type="button"
+        class="row"
+        :class="{ open }"
+        :aria-expanded="open"
+        :title="step.command ?? undefined"
+        @click="emit('toggle')"
+      >
+        <ChatStepLine :step="step" :state="step.card ? cardState(step.card) : null" :undone="undo?.undone" />
+      </button>
+      <button
+        v-if="undo && !undo.undone && !undo.error"
+        type="button"
+        class="undo"
+        :disabled="undo.pending || locked"
+        @click="emit('undo')"
+      >
+        {{ t('chat.undo') }}
+      </button>
+    </div>
+    <p v-if="undo?.error" class="undo-error" role="alert">{{ undo.error }}</p>
 
     <div v-if="open" class="detail">
       <ChatDiffCard
@@ -56,6 +78,7 @@ const meta = computed(() => {
         :card="step.card"
         :state="cardState(step.card)"
         :locked="locked"
+        :revertable="revertable"
         @toggle="emit('toggle-edit', step.card)"
       />
       <div v-else class="box">
@@ -77,8 +100,15 @@ const meta = computed(() => {
   flex-direction: column;
 }
 
+.line {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
 .row {
   display: flex;
+  flex: 1 1 auto;
   align-items: center;
   gap: var(--space-2);
   width: 100%;
@@ -102,6 +132,44 @@ const meta = computed(() => {
 
 .detail {
   margin: 2px 0 6px 30px;
+}
+
+/* A library step's Undo: a small pill at the line's end, on the fill a capsule's control
+   sits on — larger under a finger. */
+.undo {
+  flex: none;
+  height: 24px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: var(--radius-full);
+  background: var(--fill);
+  color: var(--ink);
+  font: inherit;
+  font-size: var(--text-xs);
+  cursor: pointer;
+  transition: background var(--duration-fast) var(--ease);
+}
+
+.undo:hover:not(:disabled) {
+  background: var(--fill-strong);
+}
+
+.undo:disabled {
+  color: var(--faint);
+  cursor: default;
+}
+
+@media (pointer: coarse) {
+  .undo {
+    height: 32px;
+    font-size: 13px;
+  }
+}
+
+.undo-error {
+  margin: 2px 0 6px 30px;
+  color: var(--danger);
+  font-size: var(--text-2xs);
 }
 
 /* A shell step's detail on the sunken surface: the command, what it printed, how it ended. */

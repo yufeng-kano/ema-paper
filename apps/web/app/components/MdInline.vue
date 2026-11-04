@@ -4,14 +4,20 @@
  * and `**96.5**` reads bold, not as source characters (docs/web.md § Result viewer).
  * The split lives in `parseInline`; the rendering, including the `data-tex`/`data-src`
  * sources copy-as-markdown reads back, lives in `MdSegments`. With `cite`, the line is an
- * answer's and its section links are read too; with `links`, its links to the web.
+ * answer's and its section links are read too; with `links`, its links to the web; with
+ * `files`, its links to the Files page's folders and documents.
  */
 import { parseInline, type CiteResolver } from '~/lib/markdown'
 
-const props = defineProps<{ text: string; cite?: CiteResolver; links?: boolean }>()
+const props = defineProps<{ text: string; cite?: CiteResolver; links?: boolean; files?: boolean }>()
 
 const segments = computed(() =>
-  parseInline(props.text, props.cite || props.links ? { cites: props.cite !== undefined, links: props.links === true } : undefined),
+  parseInline(
+    props.text,
+    props.cite || props.links || props.files
+      ? { cites: props.cite !== undefined, links: props.links === true, files: props.files === true }
+      : undefined,
+  ),
 )
 </script>
 

@@ -20,6 +20,7 @@ import {
   isPending,
   isReconverting,
   keyRange,
+  libraryMessage,
   originalKind,
   renameSelectionEnd,
   subtreeIds,
@@ -425,5 +426,44 @@ describe('originalKind and initialView', () => {
     expect(failedWithOriginal(document(1, 'a.pdf', null, { status: 'failed', original: null }))).toBe(false)
     expect(failedWithOriginal(document(1, 'a.pdf', null, { status: 'succeeded', original: true }))).toBe(false)
     expect(failedWithOriginal(document(1, 'a.pdf', null, { status: 'running', original: true }))).toBe(false)
+  })
+})
+
+describe('libraryMessage', () => {
+  const place = {
+    folder: 12,
+    name: 'DINO',
+    path: 'DL/DINO',
+    selection: [
+      { kind: 'file' as const, id: 34, path: 'DL/DINO/iBOT.pdf' },
+      { kind: 'folder' as const, id: 15, path: 'DL/DINO/old' },
+    ],
+  }
+
+  it('sends the open folder and the selection, a file row as the document it is to the API', () => {
+    expect(libraryMessage(place, true)).toEqual({
+      body: {
+        folder_id: 12,
+        items: [
+          { kind: 'document', id: 34 },
+          { kind: 'folder', id: 15 },
+        ],
+      },
+      shown: { folder: 'DL/DINO', items: ['DL/DINO/iBOT.pdf', 'DL/DINO/old'] },
+    })
+  })
+
+  it('sends the folder alone once the selection is dropped, or for /init', () => {
+    expect(libraryMessage(place, false)).toEqual({
+      body: { folder_id: 12, items: [] },
+      shown: { folder: 'DL/DINO', items: [] },
+    })
+  })
+
+  it('names the top of the library as null, with nothing selected', () => {
+    expect(libraryMessage({ folder: null, name: '', path: '', selection: [] }, true)).toEqual({
+      body: { folder_id: null, items: [] },
+      shown: { folder: '', items: [] },
+    })
   })
 })

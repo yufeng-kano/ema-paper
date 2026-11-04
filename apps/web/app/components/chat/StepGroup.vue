@@ -8,22 +8,30 @@
  * What is open is the panel's to keep — it outlives the items, which are rebuilt on every
  * frame — so this only draws it and says what was clicked.
  */
-import type { CardState, EditCard, StepItem } from '~/lib/thread'
+import type { CardState, EditCard, StepItem, ToolStep, UndoState } from '~/lib/thread'
 
-const props = defineProps<{
-  steps: StepItem[]
-  live: boolean
-  open: boolean
-  openSteps: ReadonlySet<string>
-  cardState: (card: EditCard) => CardState
-  /** A turn is unfinished: the revisions route refuses a revert under one. */
-  locked: boolean
-}>()
+const props = withDefaults(
+  defineProps<{
+    steps: StepItem[]
+    live: boolean
+    open: boolean
+    openSteps: ReadonlySet<string>
+    cardState: (card: EditCard) => CardState
+    /** A turn is unfinished: the revisions route refuses a revert under one. */
+    locked: boolean
+    /** A diff card offers *Revert* (not in the Files page's card). */
+    revertable?: boolean
+    /** A library step's Undo state; null for a step without one. */
+    undoState?: (step: ToolStep) => UndoState | null
+  }>(),
+  { revertable: true, undoState: () => null },
+)
 
 const emit = defineEmits<{
   toggle: []
   'toggle-step': [key: string]
   'toggle-edit': [card: EditCard]
+  undo: [step: ToolStep]
 }>()
 
 const { t } = useI18n()
@@ -64,8 +72,11 @@ const label = computed(() => {
           :open="openSteps.has(step.key)"
           :card-state="cardState"
           :locked="locked"
+          :revertable="revertable"
+          :undo="undoState(step)"
           @toggle="emit('toggle-step', step.key)"
           @toggle-edit="emit('toggle-edit', $event)"
+          @undo="emit('undo', step)"
         />
       </template>
     </div>

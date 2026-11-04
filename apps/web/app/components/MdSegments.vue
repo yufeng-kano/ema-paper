@@ -12,7 +12,10 @@
  * document no longer has reads as the heading's plain text. Both keep the link in
  * `data-src`, so copying or replying to the answer keeps its markdown (docs/web.md § The
  * agent panel, *Section links*). An answer's link to the web (read only with `links`) is an
- * `<a>` that opens in a new tab, its markdown in `data-src` the same way (*Links*).
+ * `<a>` that opens in a new tab, its markdown in `data-src` the same way (*Links*). A link to
+ * the Files page (read only with `files`) opens in the same tab: its `data-files-kind` and
+ * `data-files-id` are what the Files page's Agent card takes its click by (docs/web.md § The
+ * Files page's Agent card, *Links to the library*).
  *
  * Math is typeset by KaTeX; `v-html` is safe here because KaTeX escapes its input and
  * `trust` is off (app/lib/math.ts). TeX KaTeX cannot parse renders as its `$…$` source.
@@ -23,6 +26,7 @@ import { renderTexHtml } from '~/lib/math'
 const props = defineProps<{ segments: InlineSegment[]; cite?: CiteResolver }>()
 
 const { t } = useI18n()
+const localePath = useLocalePath()
 
 /** Each segment with its KaTeX HTML rendered once; `html: null` is the parse-failure
  *  fallback to source characters. A link is resolved as it renders, so one whose heading
@@ -66,6 +70,14 @@ const rendered = computed(() =>
       segment.text
     }}</code>
     <br v-else-if="segment.kind === 'br'" :data-src="segment.src">
+    <a
+      v-else-if="segment.kind === 'link' && segment.files"
+      class="md-link"
+      :href="localePath({ path: '/files', query: { [segment.files.kind]: segment.files.id } })"
+      :data-files-kind="segment.files.kind"
+      :data-files-id="segment.files.id"
+      :data-src="segment.src"
+    ><MdSegments :segments="segment.segments" /></a>
     <a
       v-else-if="segment.kind === 'link'"
       class="md-link"

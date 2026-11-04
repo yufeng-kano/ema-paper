@@ -53,6 +53,10 @@ export type DragClaim =
   /** The open document or its notes are under image files being dragged — where they would
    *  be inserted (docs/web.md § Editing, *Images*). */
   | 'image'
+  /** An agent panel is under files being dragged — where they would be attached — or, the
+   *  Files page's card, under the page's rows, which it takes as the selection (docs/web.md
+   *  § The Files page's Agent card). */
+  | 'attach'
 
 const claims = new WeakMap<DragEvent, DragClaim>()
 

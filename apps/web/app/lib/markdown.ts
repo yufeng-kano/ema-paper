@@ -625,8 +625,17 @@ export type InlineSegment =
   /** An answer's link to the web — `[MoCo](https://arxiv.org/abs/1911.05722)`, a bare
    *  `https://…` in its text, or one in angle brackets — read only when the caller asks for
    *  it (`links`, docs/web.md § The agent panel, *Links*). `href` is the target, `http` or
-   *  `https` only; `segments` is its text as drawn. */
-  | { kind: 'link'; segments: InlineSegment[]; href: string; src: string }
+   *  `https` only; `segments` is its text as drawn. A link to the Files page —
+   *  `[DINO](/files?folder=12)`, `[iBOT.pdf](/files?document=34)`, read only when the caller
+   *  asks for it (`files`, docs/web.md § The Files page's Agent card) — carries `files`, the
+   *  folder or document it opens, and its relative `href`. */
+  | {
+      kind: 'link'
+      segments: InlineSegment[]
+      href: string
+      src: string
+      files?: { kind: 'folder' | 'document'; id: number }
+    }
 
 /** Whether a section link's heading is still in the document: a link that answers yes is
  *  drawn as a chip, one that answers no as its plain text. */
@@ -640,6 +649,9 @@ export interface InlineOptions {
   /** Links to the web — `[text](https://…)` and bare addresses — which the agent panel's
    *  answers alone draw as links (docs/web.md § The agent panel, *Links*). */
   links?: boolean
+  /** Links to a folder or a document of the Files page, which the Files page's Agent card
+   *  alone draws (docs/web.md § The Files page's Agent card, *Links to the library*). */
+  files?: boolean
 }
 
 /**
@@ -775,6 +787,10 @@ function citeAt(text: string, index: number): { segment: InlineSegment; length: 
  * a relative path) is not one and stays the text it was.
  */
 const LINK_AT = /^\[((?:\\[\s\S]|[^[\]\\\n])+)\]\((https?:\/\/(?:[^\s()<>]|\([^\s()<>]*\))+)(?:\s+"[^"\n]*")?\)/
+/** A link to the Files page: a non-blank text in brackets, as a section link's, then
+ *  `(/files?folder=<id>)` or `(/files?document=<id>)` — the two forms the library prompt
+ *  writes; any other relative target is not one. */
+const FILES_LINK_AT = /^\[((?:\\[\s\S]|[^[\]\\\n])+)\]\(\/files\?(folder|document)=([1-9]\d*)\)/
 /** A bare address in the text, as far as the next space or angle bracket; `autolinkAt` cuts
  *  what trails it. */
 const URL_AT = /^https?:\/\/[^\s<>]+/
@@ -793,6 +809,21 @@ function linkAt(text: string, index: number): { segment: InlineSegment; length: 
   }
   return {
     segment: { kind: 'link', segments: parseInline(label), href: match[2] ?? '', src: match[0] },
+    length: match[0].length,
+  }
+}
+
+/** The link to the Files page opening at `index`, or null; its text is read as a link's. */
+function filesLinkAt(text: string, index: number): { segment: InlineSegment; length: number } | null {
+  const match = FILES_LINK_AT.exec(text.slice(index))
+  const label = match?.[1] ?? ''
+  if (!match || !label.trim()) {
+    return null
+  }
+  const kind = match[2] === 'folder' ? 'folder' : 'document'
+  const id = Number(match[3])
+  return {
+    segment: { kind: 'link', segments: parseInline(label), href: `/files?${kind}=${id}`, src: match[0], files: { kind, id } },
     length: match[0].length,
   }
 }
@@ -843,6 +874,7 @@ function autolinkAt(text: string, index: number): { segment: InlineSegment; leng
 function parseStyled(text: string, options?: InlineOptions): InlineSegment[] {
   const cites = options?.cites === true
   const links = options?.links === true
+  const files = options?.files === true
   const segments: InlineSegment[] = []
   let cursor = 0
   let scan = 0
@@ -883,7 +915,7 @@ function parseStyled(text: string, options?: InlineOptions): InlineSegment[] {
       char !== '`' &&
       char !== '<' &&
       char !== '\\' &&
-      !((cites || links) && char === '[') &&
+      !((cites || links || files) && char === '[') &&
       !(links && char === 'h')
     ) {
       scan += 1
@@ -908,7 +940,10 @@ function parseStyled(text: string, options?: InlineOptions): InlineSegment[] {
     if (char === '[') {
       // An image's bracket (`![alt](https://…)`) opens no link: the line stays as written.
       const image = scan > 0 && text[scan - 1] === '!' && !isEscaped(text, scan - 1)
-      const link = (cites ? citeAt(text, scan) : null) ?? (links && !image ? linkAt(text, scan) : null)
+      const link =
+        (cites ? citeAt(text, scan) : null) ??
+        (files && !image ? filesLinkAt(text, scan) : null) ??
+        (links && !image ? linkAt(text, scan) : null)
       if (link) {
         push(link.segment, link.length)
         continue
@@ -1120,13 +1155,15 @@ export function parseInline(text: string, options?: InlineOptions): InlineSegmen
     // A section link — or a link to the web — before the next dollar is stepped over whole
     // too: its text may hold math of its own (`[3.1 The $\epsilon$-greedy policy](#…)`),
     // which parseStyled reads with the link rather than splitting the link around it.
-    const bracket = (options?.cites || options?.links) && open !== -1 ? text.indexOf('[', scan) : -1
+    const bracket = (options?.cites || options?.links || options?.files) && open !== -1 ? text.indexOf('[', scan) : -1
     if (bracket !== -1 && bracket < open && (tick === -1 || bracket < tick)) {
       // An image's bracket opens no link here either, so its alt text's math is collected.
       const image = bracket > 0 && text[bracket - 1] === '!' && !isEscaped(text, bracket - 1)
       const link = isEscaped(text, bracket)
         ? null
-        : ((options?.cites ? citeAt(text, bracket) : null) ?? (options?.links && !image ? linkAt(text, bracket) : null))
+        : ((options?.cites ? citeAt(text, bracket) : null) ??
+          (options?.files && !image ? filesLinkAt(text, bracket) : null) ??
+          (options?.links && !image ? linkAt(text, bracket) : null))
       scan = bracket + (link ? link.length : 1)
       continue
     }

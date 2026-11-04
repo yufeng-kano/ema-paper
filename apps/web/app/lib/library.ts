@@ -10,8 +10,9 @@
  * `null` is the root everywhere. It is not a folder row, it is the absence of a parent, and
  * treating it as an id would mean inventing a folder the server does not have.
  */
-import type { DocumentView, LibraryDocument, LibraryFolder, UploadLimits } from '~/lib/api'
+import type { DocumentView, LibraryBody, LibraryBodyItem, LibraryDocument, LibraryFolder, UploadLimits } from '~/lib/api'
 import type { IconName } from '~/lib/icons'
+import type { LibraryItem } from '~/lib/steps'
 
 export type FolderId = number | null
 
@@ -467,4 +468,47 @@ export function filePreview(mediaType: string | null | undefined): FilePreview {
     return 'text'
   }
   return 'none'
+}
+
+// --- the Agent card (docs/web.md § The Files page's Agent card) ----------------------------------
+
+/** Where the reader is on the Files page: what the Agent card's composer draws as its chips
+ *  and sends with each message. */
+export interface LibraryPlace {
+  /** The folder open on the Files tab, null the top; its name, and its Files path (`''` the
+   *  top). */
+  folder: FolderId
+  name: string
+  path: string
+  /** The rows selected on the Files tab, rows still uploading left out; none on the Trash tab. */
+  selection: LibraryRow[]
+}
+
+/** A selected row: the item, as the page's undo names it, and its Files path. */
+export interface LibraryRow extends LibraryItem {
+  path: string
+}
+
+/** What one message carries from the Files page: `body`, sent as `library` (docs/api.md),
+ *  and `shown`, the Files paths the stored block will hold, which the thread draws until the
+ *  record does (docs/chat.md § Library conversations). */
+export interface LibraryMessage {
+  body: LibraryBody
+  shown: { folder: string; items: string[] }
+}
+
+/**
+ * The open folder, and the selection when it goes with the message — not once the reader
+ * dropped its chip, nor with `/init`, which sends the folder alone. A row the page calls a
+ * file is a `documents` row, which the API calls a document whatever it holds.
+ */
+export function libraryMessage(place: LibraryPlace, withSelection: boolean): LibraryMessage {
+  const rows = withSelection ? place.selection : []
+  return {
+    body: {
+      folder_id: place.folder,
+      items: rows.map((row): LibraryBodyItem => ({ kind: row.kind === 'folder' ? 'folder' : 'document', id: row.id })),
+    },
+    shown: { folder: place.path, items: rows.map((row) => row.path) },
+  }
 }
