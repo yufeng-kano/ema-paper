@@ -164,6 +164,45 @@ export function isMarkdownUpload(file: { name: string; type: string }, limits: U
   return extension !== '' && (limits?.markdown_extensions?.includes(extension) ?? false)
 }
 
+/** What makes a file of the library a markdown file, as the server tells one
+ *  (`is_markdown_file`, docs/workspace.md § Files): a name ending in `.md` or `.markdown`, in
+ *  any case, or the type `text/markdown`. Either alone, since a `.md` the shell wrote may
+ *  carry no type but `application/octet-stream` (docs/web.md § Files). */
+const MARKDOWN_SUFFIXES = ['.md', '.markdown']
+const MARKDOWN_TYPE = 'text/markdown'
+
+function isMarkdownText(file: { name: string; media_type?: string | null }): boolean {
+  const name = file.name.toLowerCase()
+  return (file.media_type ?? '').toLowerCase() === MARKDOWN_TYPE || MARKDOWN_SUFFIXES.some((suffix) => name.endsWith(suffix))
+}
+
+/**
+ * A markdown file — `AGENTS.md`, a `.md` the agent wrote or downloaded: a row of kind `file`,
+ * stored as it is, that reads as a markdown document and opens on its text in the result
+ * viewer (docs/web.md § Files, *Four columns*; § Result viewer, *A markdown file opens on its
+ * text*). A markdown document is a `markdown` row, never one of these.
+ */
+export function isMarkdownFile(document: { kind: string; name: string; media_type?: string | null }): boolean {
+  return document.kind === 'file' && isMarkdownText(document)
+}
+
+/**
+ * Whether *Convert to document…* is offered: a file kept as it is that intake would parse — a
+ * PDF or an image, by the server's own lists (`acceptsUpload`). Never a markdown file, which is
+ * text already: the lists hold markdown too, and read alone they offered the item on every
+ * `.md`, which the server refused with 409 (docs/web.md § Files).
+ */
+export function isConvertible(
+  document: { kind: string; name: string; media_type?: string | null },
+  limits: UploadLimits | null,
+): boolean {
+  return (
+    document.kind === 'file' &&
+    !isMarkdownText(document) &&
+    acceptsUpload({ name: document.name, type: document.media_type ?? '' }, limits)
+  )
+}
+
 /**
  * How much of a name a rename selects when it opens: a document's name up to its extension
  * (`DINO` of `DINO.pdf`), a folder's whole name — Finder's choice, since the extension is the
@@ -228,10 +267,11 @@ export type FileGlyph = 'file' | 'file-text' | 'image' | 'film' | 'music' | 'she
 /**
  * What a file is, in the terms the Kind column and the glyph use: the catalog key that
  * names its kind (`files.kinds.<key>`) and the format's name for the key's `{format}` —
- * *JPEG image*, *Excel spreadsheet*, *ZIP archive*, else *<EXT> file*.
+ * *JPEG image*, *Excel spreadsheet*, *ZIP archive*, else *<EXT> file*. A markdown file reads
+ * *Markdown document*, as a markdown document does.
  */
 export interface FileKind {
-  key: 'pdf' | 'image' | 'video' | 'audio' | 'spreadsheet' | 'presentation' | 'word' | 'archive' | 'file' | 'plain'
+  key: 'markdown' | 'pdf' | 'image' | 'video' | 'audio' | 'spreadsheet' | 'presentation' | 'word' | 'archive' | 'file' | 'plain'
   format: string
   glyph: FileGlyph
 }
@@ -332,6 +372,7 @@ const ARCHIVES = new Map<string, string>([
 ])
 
 const GLYPHS: Readonly<Record<FileKind['key'], FileGlyph>> = {
+  markdown: 'file-text',
   pdf: 'file-text',
   image: 'image',
   video: 'film',
@@ -352,7 +393,9 @@ function extensionOf(name: string): string {
 
 /**
  * What a file kept as it is is — by its media type first, as intake stored it, then by its
- * extension, since a browser types what it has no association for as nothing at all.
+ * extension, since a browser types what it has no association for as nothing at all. A
+ * markdown file first, by either, as the server tells one (`isMarkdownFile`): every markdown
+ * text reads the same, whichever way it is stored (docs/web.md § Files, *Four columns*).
  */
 export function fileKind(file: { name: string; media_type?: string | null }): FileKind {
   const type = (file.media_type ?? '').toLowerCase()
@@ -360,6 +403,9 @@ export function fileKind(file: { name: string; media_type?: string | null }): Fi
   const top = slash === -1 ? '' : type.slice(0, slash)
   const subtype = slash === -1 ? '' : type.slice(slash + 1)
   const extension = extensionOf(file.name)
+  if (isMarkdownText(file)) {
+    return { key: 'markdown', format: 'Markdown', glyph: GLYPHS.markdown }
+  }
   if (type === 'application/pdf' || extension === 'pdf') {
     return { key: 'pdf', format: 'PDF', glyph: GLYPHS.pdf }
   }
@@ -430,14 +476,14 @@ export function failedWithOriginal(document: {
  * file kept as it is has its original alone; a converted document opens on the view it was
  * last read in, or on the reader's default until it was switched once — and on Markdown
  * whatever was remembered where its original was not kept. A markdown document has
- * Markdown alone.
+ * Markdown alone, and so has a markdown file: its text.
  */
 export function initialView(
-  document: { kind: string; view?: DocumentView | null; original?: boolean | null },
+  document: { kind: string; name: string; media_type?: string | null; view?: DocumentView | null; original?: boolean | null },
   defaultView: DocumentView,
 ): DocumentView {
   if (document.kind === 'file') {
-    return 'original'
+    return isMarkdownText(document) ? 'markdown' : 'original'
   }
   if (document.kind === 'markdown' || document.original === false) {
     return 'markdown'
@@ -446,8 +492,11 @@ export function initialView(
 }
 
 /** What the file viewer shows of a file by itself: what a browser renders safely on its own
- *  and the file route serves inline (docs/api.md § `GET /api/library/documents/{id}/file`).
- *  An SVG is served as a download, so it has none. */
+ *  and the file route serves inline (docs/api.md § `GET /api/library/documents/{id}/file`) —
+ *  and text, which the pane reads with `fetch` whatever the route's disposition, so a
+ *  markdown file too large for the result viewer reads as text there (docs/web.md § Files);
+ *  one typed `application/octet-stream` is text by its name (`isMarkdownFile`). An SVG is
+ *  served as a download, so it has none. */
 export type FilePreview = 'image' | 'video' | 'audio' | 'pdf' | 'text' | 'none'
 
 export function filePreview(mediaType: string | null | undefined): FilePreview {
@@ -463,8 +512,34 @@ export function filePreview(mediaType: string | null | undefined): FilePreview {
   if (type === 'application/pdf') {
     return 'pdf'
   }
-  if (type === 'text/plain') {
+  if (type === 'text/plain' || type === MARKDOWN_TYPE) {
     return 'text'
   }
   return 'none'
+}
+
+/**
+ * Where a row opens (docs/web.md § Files, *A PDF or an image opens in the result viewer, and
+ * so does a markdown file*) — one answer for every way in: a double click, ⌘↓, the menu's
+ * *Open*, `?doc=` in the URL, a single upload opening itself. `result`: the result viewer, for
+ * a document, and for a PDF or an image on its original; `text`: the result viewer on a
+ * markdown file's text (§ Result viewer, *A markdown file opens on its text*); `file`: the file
+ * viewer, for any other file — and for a markdown file larger than `markdown_max_bytes`, which
+ * the text route does not read, shown there as text. While the limits have not arrived a
+ * markdown file opens on its text, and the server is the authority on its size.
+ */
+export type RowViewer = 'result' | 'text' | 'file'
+
+export function rowViewer(
+  document: { kind: string; name: string; media_type?: string | null; size_bytes: number | null },
+  limits: UploadLimits | null,
+): RowViewer {
+  if (document.kind !== 'file') {
+    return 'result'
+  }
+  if (isMarkdownText(document)) {
+    const cap = limits?.markdown_max_bytes
+    return cap !== undefined && (document.size_bytes ?? 0) > cap ? 'file' : 'text'
+  }
+  return originalKind(document) ? 'result' : 'file'
 }

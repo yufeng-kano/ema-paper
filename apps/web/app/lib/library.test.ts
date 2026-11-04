@@ -16,12 +16,15 @@ import {
   imageFormat,
   failedWithOriginal,
   initialView,
+  isConvertible,
+  isMarkdownFile,
   isMarkdownUpload,
   isPending,
   isReconverting,
   keyRange,
   originalKind,
   renameSelectionEnd,
+  rowViewer,
   subtreeIds,
   typeAheadMatch,
   uploadCap,
@@ -215,6 +218,85 @@ describe('isMarkdownUpload', () => {
   })
 })
 
+describe('isMarkdownFile and isConvertible', () => {
+  const limits: UploadLimits = {
+    upload_max_bytes: 1000,
+    page_cap: 500,
+    // The server's lists hold markdown too: what intake files as text rather than parses.
+    accepted_media_types: ['application/pdf', 'image/jpeg', 'text/markdown'],
+    accepted_extensions: ['.pdf', '.jpg', '.md', '.markdown'],
+    markdown_media_types: ['text/markdown'],
+    markdown_extensions: ['.md', '.markdown'],
+    markdown_max_bytes: 100,
+    prompt_max_chars: 8000,
+  }
+  const file = (name: string, media_type: string | null) => document(1, name, null, { kind: 'file', media_type })
+
+  it('knows a markdown file by its name in any case, or by its type alone', () => {
+    expect(isMarkdownFile(file('AGENTS.md', 'text/markdown'))).toBe(true)
+    // What the shell writes: Python's own table has no `.md`.
+    expect(isMarkdownFile(file('notes.md', 'application/octet-stream'))).toBe(true)
+    expect(isMarkdownFile(file('PLAN.MARKDOWN', null))).toBe(true)
+    expect(isMarkdownFile(file('README', 'text/markdown'))).toBe(true)
+  })
+
+  it('leaves any other file plain, and a markdown document a document', () => {
+    expect(isMarkdownFile(file('notes.txt', 'text/plain'))).toBe(false)
+    expect(isMarkdownFile(file('notes.md.txt', 'text/plain'))).toBe(false)
+    expect(isMarkdownFile(document(1, 'summary.md', null, { kind: 'markdown' }))).toBe(false)
+  })
+
+  it('offers Convert for a PDF or an image intake would parse, never for a markdown file', () => {
+    expect(isConvertible(file('paper.pdf', 'application/pdf'), limits)).toBe(true)
+    expect(isConvertible(file('scan.JPG', 'application/octet-stream'), limits)).toBe(true)
+    expect(isConvertible(file('AGENTS.md', 'text/markdown'), limits)).toBe(false)
+    expect(isConvertible(file('notes.markdown', ''), limits)).toBe(false)
+    expect(isConvertible(file('README', 'text/markdown'), limits)).toBe(false)
+    expect(isConvertible(file('notes.txt', 'text/plain'), limits)).toBe(false)
+    // A document is converted already.
+    expect(isConvertible(document(1, 'paper.pdf'), limits)).toBe(false)
+  })
+
+  it('never offers Convert for a markdown file, even before the limits arrive', () => {
+    expect(isConvertible(file('AGENTS.md', 'text/markdown'), null)).toBe(false)
+  })
+})
+
+describe('rowViewer', () => {
+  const limits: UploadLimits = {
+    upload_max_bytes: 1000,
+    page_cap: 500,
+    accepted_media_types: ['application/pdf'],
+    accepted_extensions: ['.pdf'],
+    markdown_max_bytes: 100,
+    prompt_max_chars: 8000,
+  }
+  const file = (name: string, media_type: string | null, size_bytes: number | null = 10) =>
+    document(1, name, null, { kind: 'file', media_type, size_bytes })
+
+  it('opens a document, and a PDF or an image kept as it is, in the result viewer', () => {
+    expect(rowViewer(document(1, 'paper.pdf'), limits)).toBe('result')
+    expect(rowViewer(document(1, 'summary.md', null, { kind: 'markdown', size_bytes: null }), limits)).toBe('result')
+    expect(rowViewer(file('paper.pdf', 'application/pdf', 5000), limits)).toBe('result')
+    expect(rowViewer(file('photo.jpg', 'image/jpeg'), limits)).toBe('result')
+  })
+
+  it('opens a markdown file on its text up to the cap the text route reads', () => {
+    expect(rowViewer(file('AGENTS.md', 'text/markdown', 100), limits)).toBe('text')
+    expect(rowViewer(file('notes.MD', 'application/octet-stream'), limits)).toBe('text')
+    expect(rowViewer(file('README', 'text/markdown'), limits)).toBe('text')
+    expect(rowViewer(file('AGENTS.md', 'text/markdown', 101), limits)).toBe('file')
+    // The limits not yet arrived: the server says whether it is too large.
+    expect(rowViewer(file('AGENTS.md', 'text/markdown', 101), null)).toBe('text')
+  })
+
+  it('opens any other file in the file viewer', () => {
+    expect(rowViewer(file('notes.txt', 'text/plain'), limits)).toBe('file')
+    expect(rowViewer(file('demo.mov', 'video/quicktime'), limits)).toBe('file')
+    expect(rowViewer(file('logo.svg', 'image/svg+xml'), limits)).toBe('file')
+  })
+})
+
 describe('renameSelectionEnd', () => {
   it('selects a document up to its extension and a folder whole', () => {
     expect(renameSelectionEnd('DINO.pdf', false)).toBe(4)
@@ -348,6 +430,16 @@ describe('fileKind', () => {
     })
   })
 
+  it('names a markdown file as a markdown document, by its name or its type', () => {
+    const markdown = { key: 'markdown', format: 'Markdown', glyph: 'file-text' }
+    expect(fileKind({ name: 'AGENTS.md', media_type: 'text/markdown' })).toEqual(markdown)
+    expect(fileKind({ name: 'notes.md', media_type: 'application/octet-stream' })).toEqual(markdown)
+    expect(fileKind({ name: 'PLAN.MARKDOWN', media_type: null })).toEqual(markdown)
+    expect(fileKind({ name: 'README', media_type: 'text/markdown' })).toEqual(markdown)
+    // A text file stays a file.
+    expect(fileKind({ name: 'notes.txt', media_type: 'text/plain' })).toEqual({ key: 'file', format: 'TXT', glyph: 'file' })
+  })
+
   it('falls back to the extension, and to a plain file without one', () => {
     expect(fileKind({ name: 'data.csv', media_type: 'text/csv' })).toEqual({ key: 'file', format: 'CSV', glyph: 'file' })
     expect(fileKind({ name: 'Makefile', media_type: 'application/octet-stream' })).toEqual({ key: 'plain', format: '', glyph: 'file' })
@@ -380,6 +472,12 @@ describe('documentGlyph and filePreview', () => {
     expect(documentGlyph(document(1, 'a.mov', null, { kind: 'file', media_type: 'video/quicktime' }))).toBe('film')
   })
 
+  it('draws a markdown file as a markdown document is drawn', () => {
+    expect(documentGlyph(document(1, 'AGENTS.md', null, { kind: 'file', media_type: 'text/markdown' }))).toBe('file-text')
+    expect(documentGlyph(document(1, 'notes.MD', null, { kind: 'file', media_type: '' }))).toBe('file-text')
+    expect(documentGlyph(document(1, 'notes.txt', null, { kind: 'file', media_type: 'text/plain' }))).toBe('file')
+  })
+
   it('previews only what a browser shows safely, and never an SVG', () => {
     expect(filePreview('image/png')).toBe('image')
     expect(filePreview('image/svg+xml')).toBe('none')
@@ -387,6 +485,7 @@ describe('documentGlyph and filePreview', () => {
     expect(filePreview('audio/mpeg')).toBe('audio')
     expect(filePreview('application/pdf')).toBe('pdf')
     expect(filePreview('text/plain')).toBe('text')
+    expect(filePreview('text/markdown')).toBe('text')
     expect(filePreview('application/zip')).toBe('none')
     expect(filePreview(null)).toBe('none')
   })
@@ -415,6 +514,7 @@ describe('originalKind and initialView', () => {
   it('opens on Markdown whatever was remembered where the original was not kept, and always for markdown', () => {
     expect(initialView(document(1, 'a.pdf', null, { view: 'original', original: false }), 'original')).toBe('markdown')
     expect(initialView(document(1, 'a.md', null, { kind: 'markdown', view: 'original' }), 'original')).toBe('markdown')
+    expect(initialView(document(1, 'AGENTS.md', null, { kind: 'file', media_type: 'text/markdown' }), 'original')).toBe('markdown')
   })
 
   it('opens a failed parse on its original only where one was kept', () => {

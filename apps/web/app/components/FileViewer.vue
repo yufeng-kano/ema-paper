@@ -2,19 +2,20 @@
 /**
  * The file viewer (docs/web.md § Files): the result viewer's shell with the document's
  * panes left out, for every file that is neither a PDF nor an image — those open in the
- * result viewer on their original. The way back and the name, with its kind and size, at
- * the left; at the right Download and More, whose menu opens on the file's facts over
- * Rename, Duplicate, Show in Files and Move to Trash. The body is what a browser shows
- * safely on its own, from `…/file` (docs/api.md): a video or audio file with the browser's
- * controls, plain text in a monospace pane; for anything else a sheet with the file's
- * glyph, name, kind and size, that there is no preview, that the agent can still read it,
- * and Download.
+ * result viewer on their original — nor a markdown file, which opens there on its text
+ * unless it is larger than the text route reads (`rowViewer`). The way back and the name,
+ * with its kind and size, at the left; at the right Download and More, whose menu opens on
+ * the file's facts over Rename, Duplicate, Show in Files and Move to Trash. The body is what
+ * a browser shows safely on its own, from `…/file` (docs/api.md): a video or audio file with
+ * the browser's controls, plain text — such a markdown file among it — in a monospace pane;
+ * for anything else a sheet with the file's glyph, name, kind and size, that there is no
+ * preview, that the agent can still read it, and Download.
  */
 import type { ComponentPublicInstance } from 'vue'
 import { documentFileUrl, type LibraryDocument } from '~/lib/api'
 import { formatBytes, formatShortDateTime } from '~/lib/format'
-import { documentGlyph, filePreview } from '~/lib/library'
-import type { MenuFact, MenuItem, Point } from '~/lib/menu'
+import { documentGlyph, filePreview, isMarkdownFile } from '~/lib/library'
+import type { MenuFact, Point } from '~/lib/menu'
 
 /** How much of a text file the pane reads: the head of a log is what a reader opens it for. */
 const TEXT_PREVIEW_MAX = 262_144
@@ -42,7 +43,9 @@ const size = computed(() =>
   props.document.size_bytes === null ? null : formatBytes(props.document.size_bytes, locale.value),
 )
 const facts = computed(() => (size.value ? `${kind.value} · ${size.value}` : kind.value))
-const preview = computed(() => filePreview(props.document.media_type))
+// A markdown file is text by its name as well as by its type: the shell's `.md` may be typed
+// `application/octet-stream` (docs/web.md § Files).
+const preview = computed(() => (isMarkdownFile(props.document) ? 'text' : filePreview(props.document.media_type)))
 const url = computed(() => documentFileUrl(props.document.id))
 const downloadUrl = computed(() => documentFileUrl(props.document.id, true))
 const glyph = computed(() => documentGlyph(props.document))
@@ -87,12 +90,7 @@ const moreFacts = computed<MenuFact[]>(() => [
   { label: t('viewer.file.location'), value: props.location },
 ])
 
-const moreItems = computed<MenuItem[]>(() => [
-  { key: 'rename', label: t('files.rename'), icon: 'edit', separated: true },
-  { key: 'duplicate', label: t('files.duplicate'), icon: 'copy-plus' },
-  { key: 'show', label: t('viewer.file.showInFiles'), icon: 'folder-open' },
-  { key: 'trash', label: t('files.moveToTrash'), icon: 'trash', danger: true, separated: true },
-])
+const moreItems = useFileMenu()
 
 /** The menu under the button's right edge; flipped by the menu itself where it does not fit. */
 function toggleMore() {

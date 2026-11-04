@@ -569,6 +569,8 @@ export default {
       noPreview: 'There is no preview for this kind of file.',
       agentReads: 'The Agent can still read it in any conversation.',
       textCut: 'The first {size} of the file.',
+      readOnly: 'This file is over {size}: it can be read here, not edited.',
+      readOnlyOther: 'This file can be read here, not edited.',
     },
     fact: {
       model: 'Model',

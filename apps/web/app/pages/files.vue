@@ -78,12 +78,14 @@ import {
   failedWithOriginal,
   folderPath,
   initialView,
+  isConvertible,
   isMarkdownUpload,
   isPending,
   isReconverting,
   keyRange,
   originalKind,
   renameSelectionEnd,
+  rowViewer,
   subtreeIds,
   typeAheadMatch,
   uploadCap,
@@ -626,15 +628,6 @@ function uploadGlyph(upload: PendingUpload): IconName {
   return documentGlyph({ kind: 'file', name: upload.name, media_type: upload.file.type })
 }
 
-/** Whether Convert to document is offered: a file kept as it is that intake would parse —
- *  a PDF or an image (docs/web.md § Files). */
-function convertible(document: LibraryDocument): boolean {
-  return (
-    document.kind === 'file' &&
-    acceptsUpload({ name: document.name, type: document.media_type ?? '' }, limits.value)
-  )
-}
-
 let nextLocalId = 1
 let draining = false
 /** Set on unmount: a queue retrying against the job cap must not outlive the screen. */
@@ -791,6 +784,9 @@ onBeforeUnmount(() => {
 // --- the result viewer -----------------------------------------------------
 
 const openDocument = ref<LibraryDocument | null>(null)
+/** Which viewer the open row is in — whatever opened it, a double click, ⌘↓, the menu's
+ *  *Open*, `?doc=`, a single upload opening itself (`rowViewer`, docs/web.md § Files). */
+const openViewer = computed(() => (openDocument.value ? rowViewer(openDocument.value, limits.value) : null))
 /** The failed parse whose retry dialog is open: opening a failed document opens this. A
  *  failed re-convert's comes as its document with the re-convert's state (`reconvertRetry`). */
 const retrying = ref<LibraryDocument | null>(null)
@@ -860,7 +856,8 @@ async function showResult(document: LibraryDocument) {
   }
   openDocument.value = document
   // A markdown document has no result: the viewer reads its copy; nor has a file kept as
-  // it is, or a failed parse: its viewer shows the original (docs/web.md § Files).
+  // it is, or a failed parse: its viewer shows the original — or a markdown file's text
+  // (docs/web.md § Files).
   if (
     document.kind === 'markdown' ||
     document.kind === 'file' ||
@@ -1091,7 +1088,7 @@ const openFailure = computed(() => {
 })
 
 /** The open file's facts for the viewer's More menu while it is not converted, or its
- *  parse failed: what the file viewer's menu says of any file. */
+ *  parse failed, and a markdown file's: what the file viewer's menu says of any file. */
 const openFileFacts = computed<MenuFact[]>(() => {
   const open = openDocument.value
   if (!open) {
@@ -2094,7 +2091,7 @@ const menuItems = computed<MenuItem[]>(() => {
             : []),
           { key: 'rename', label: t('files.rename'), icon: 'edit' as const, shortcut: label(apple ? 'enter' : 'f2') },
           // A PDF or an image kept as a file becomes a document from here (docs/web.md § Files).
-          ...(parse && convertible(parse)
+          ...(parse && isConvertible(parse, limits.value)
             ? [{ key: 'convert', label: t('files.convert'), icon: 'scan-text' as const, separated: true }]
             : []),
         ]
@@ -2951,14 +2948,16 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
       @close="creditsRefusal = null"
     />
 
-    <!-- A file that is neither a PDF nor an image opens in its own viewer: the file itself,
-         no result to read (docs/web.md § Files). A PDF or an image opens in the result
-         viewer whether it is converted or not — on its original alone until it is. A
-         document's is keyed per document, and per parse: reopening on another file, or a
-         re-convert taken in, resets scroll and page state and reads the copy again. Only a
-         finished parse opens, so `pending` is its one read of the result. -->
+    <!-- A file that is neither a PDF nor an image nor a markdown file opens in its own viewer:
+         the file itself, no result to read (docs/web.md § Files). A PDF or an image opens in
+         the result viewer whether it is converted or not — on its original alone until it is;
+         a markdown file opens there on its text, and in the file viewer only when it is larger
+         than the text route reads (`openViewer`). A document's is keyed per document, and per
+         parse: reopening on another file, or a re-convert taken in, resets scroll and page
+         state and reads the copy again. Only a finished parse opens, so `pending` is its one
+         read of the result. -->
     <FileViewer
-      v-if="openDocument && openDocument.kind === 'file' && !originalKind(openDocument)"
+      v-if="openDocument && openViewer === 'file'"
       :key="openDocument.id"
       :document="openDocument"
       :location="openLocation"
@@ -2976,16 +2975,17 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
       :result="results.get(openDocument.id) ?? null"
       :pending="!results.has(openDocument.id) && loadingResults.has(openDocument.id)"
       :error-message="resultErrors.get(openDocument.id) ?? null"
-      :figure-base="openDocument.kind === 'markdown' ? null : `/api/library/documents/${openDocument.id}/figures`"
-      :image-base="`/api/library/documents/${openDocument.id}/images`"
-      :document-id="openDocument.kind === 'file' || openDocument.status === 'failed' ? null : openDocument.id"
+      :figure-base="openDocument.kind === 'markdown' || openViewer === 'text' ? null : `/api/library/documents/${openDocument.id}/figures`"
+      :image-base="openViewer === 'text' ? null : `/api/library/documents/${openDocument.id}/images`"
+      :document-id="openViewer === 'text' || (openDocument.kind !== 'file' && openDocument.status !== 'failed') ? openDocument.id : null"
       :markdown-document="openDocument.kind === 'markdown'"
+      :markdown-file="openViewer === 'text'"
       :initial-block="linkedBlock?.id === openDocument.id ? linkedBlock.anchor : null"
       :reconvert-note="reconvertNote"
       :initial-view="initialView(openDocument, defaultView)"
       :original="openOriginal"
       :converted="openDocument.kind !== 'file' && openDocument.status !== 'failed'"
-      :convertible="openDocument.kind === 'file' ? convertible(openDocument) : openDocument.status !== 'failed'"
+      :convertible="openDocument.kind === 'file' ? isConvertible(openDocument, limits) : openDocument.status !== 'failed'"
       :facts="openDocument.kind === 'file' || openDocument.status === 'failed' ? openFileFacts : []"
       :failure="openFailure"
       @view="recordView(openDocument, $event)"
@@ -2993,6 +2993,10 @@ useBuildHold(() => queue.value.length > 0 || renaming.value !== null || openDocu
       @retry="retrying = openDocument"
       @filed="refresh()"
       @close="openDocument = null"
+      @rename="renameOpen"
+      @duplicate="duplicateOpen"
+      @show="showOpenInFiles"
+      @trash="trashOpen"
     />
   </div>
 </template>

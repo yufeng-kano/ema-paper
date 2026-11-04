@@ -34,10 +34,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..billing import ledger
 from ..config import Settings
-from ..db.models import MARKDOWN_KIND, Document, Folder, Job, Result, utcnow
+from ..db.models import FILE_KIND, MARKDOWN_KIND, Document, Folder, Job, Result, utcnow
 from ..errors import ApiError
 from ..parsing.images import ImageError, normalize_image
 from . import git, safe_io
+from .agents_file import AGENTS_FILE
 from .layout import (
     DOC_FILE,
     FIGURES_DIR,
@@ -82,6 +83,26 @@ def markdown_name(name: str, limit: int) -> str:
         return name
     extension = MARKDOWN_EXTENSIONS[0]
     return f"{name[: limit - len(extension)].rstrip()}{extension}"
+
+
+# A folder's instructions file (docs/chat.md § AGENTS.md) is a file, and no markdown
+# document takes its name: the document's directory would stand where the file belongs,
+# never read by the AGENTS.md chain, and look exactly like it on the Files page
+# (docs/workspace.md § Markdown documents).
+RESERVED_NAME = (
+    f"{AGENTS_FILE} is a folder's instructions file, which is a file; "
+    "a markdown document cannot have that name"
+)
+
+
+def is_markdown_file(row: Document) -> bool:
+    """A file of the library that is markdown — a name ending in `.md` or `.markdown`, any
+    case, or the type `text/markdown`: `AGENTS.md`, a `.md` the agent wrote. Its row stays
+    a file; the reader reads and saves its text in place (`…/text`), and a rename keeps its
+    extension (docs/workspace.md § Files). The one test every route takes."""
+    return row.kind == FILE_KIND and (
+        row.name.lower().endswith(MARKDOWN_EXTENSIONS) or row.media_type == MARKDOWN_MEDIA_TYPE
+    )
 
 
 # An inserted image's file name: the first 16 hex digits of its bytes' SHA-256, as it is
@@ -1110,17 +1131,22 @@ def _write_file(
     if revision_of(current) != base_revision:
         raise ApiError(409, "revision_conflict", "The file changed since it was loaded")
     if text != current:
-        _write_text(paths.root, path, text)
-        try:
-            git.commit_paths(paths.root, author, message, [path.relative_to(paths.root)])
-        except git.GitError as exc:
-            # The file as it was: a save with no revision is not a save
-            # (docs/workspace.md § Revisions).
-            _write_text(paths.root, path, current)
-            raise ApiError(
-                409, "invalid_request", "The save could not be recorded; the file is as it was"
-            ) from exc
+        _save(paths.root, path.relative_to(paths.root), text, current, author, message)
     return revision_of(text)
+
+
+def _save(root: Path, relative: Path, text: str, current: str, author: str, message: str) -> None:
+    """`text` in place of `current`, replaced atomically and committed as one revision; the
+    file as it was when that revision cannot be recorded: a save with no revision is not a
+    save (docs/workspace.md § Revisions)."""
+    _write_text(root, root / relative, text)
+    try:
+        git.commit_paths(root, author, message, [relative])
+    except git.GitError as exc:
+        _write_text(root, root / relative, current)
+        raise ApiError(
+            409, "invalid_request", "The save could not be recorded; the file is as it was"
+        ) from exc
 
 
 async def write_content(
@@ -1169,6 +1195,117 @@ async def write_notes(
             f"notes {paths.notes_relative}",
             settings.content_max_bytes,
         )
+
+
+# --- a markdown file's text ---------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FileText:
+    markdown: str
+    revision: str
+    editable: bool
+
+
+NOT_RECORDED = "The file is binary or too large for a revision to record; it is not edited here"
+
+
+def _recorded(relative: Path, data: bytes) -> bool:
+    """Whether a revision records `data` at `relative` — `git.recordable` for bytes in hand:
+    text no larger than `REVISION_MAX_FILE_BYTES`, or a name history always takes."""
+    return relative.name in git.RECORDED_NAMES or (
+        len(data) <= git.revision_max_file_bytes() and git.is_text(data)
+    )
+
+
+def _read_file_text(root: Path, relative: Path, max_bytes: int) -> FileText:
+    """The file as stored — a byte-order mark and CRLF kept, so its revision is its bytes'
+    hash — and whether a save of it would be recorded (docs/workspace.md § Files)."""
+    try:
+        data = safe_io.read_bytes(root, root / relative, max_bytes)
+    except safe_io.EntryTooLarge as exc:
+        raise ApiError(413, "invalid_request", TOO_LARGE) from exc
+    except (safe_io.UnsafeEntry, OSError) as exc:
+        raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
+    if data is None:
+        raise ApiError(404, "invalid_request", "The file is missing from the workspace")
+    try:
+        text = data.decode()
+    except UnicodeDecodeError as exc:
+        raise ApiError(400, "invalid_request", NOT_UTF8) from exc
+    return FileText(markdown=text, revision=revision_of(text), editable=_recorded(relative, data))
+
+
+def _write_file_text(
+    root: Path, relative: Path, text: str, base_revision: str, max_bytes: int
+) -> int | None:
+    """The file's new length, or None when the text is what it holds and nothing was
+    written. A file history does not record is not saved, nor a text it would not record:
+    with no revision the save has no undo, and is no save (docs/workspace.md § Revisions)."""
+    current = _read_file_text(root, relative, max_bytes)
+    if current.revision != base_revision:
+        raise ApiError(409, "revision_conflict", "The file changed since it was loaded")
+    if not current.editable:
+        raise ApiError(409, "invalid_request", NOT_RECORDED)
+    if text == current.markdown:
+        return None
+    data = text.encode()
+    if len(data) > max_bytes or not _recorded(relative, data):
+        raise ApiError(409, "invalid_request", NOT_RECORDED)
+    _save(root, relative, text, current.markdown, git.USER_AUTHOR, f"edit {relative}")
+    return len(data)
+
+
+async def _markdown_file_path(db: AsyncSession, document: Document) -> Path:
+    """The file's path, decided under the workspace lock after the row is re-read, as a
+    document's is: a rename or a move to the Trash holds that lock across its row write and
+    its move, so the text is never read from or written to a place the file has left."""
+    try:
+        await db.refresh(document)
+    except InvalidRequestError as exc:
+        raise ApiError(404, "invalid_request", "No such document") from exc
+    folders = await user_folders(db, document.user_id)
+    if not is_live(document, folders) or not is_markdown_file(document):
+        raise ApiError(404, "invalid_request", "No such document")
+    names = [row.name for row in folder_chain(folders, document.folder_id)]
+    return document_relative_dir(names, document.name)
+
+
+async def read_file_text(db: AsyncSession, settings: Settings, document: Document) -> FileText:
+    """A markdown file's text, read under the workspace lock as `doc.md` is: a shell command
+    holds that lock while it writes (docs/workspace.md § Files)."""
+    root = user_root(settings.workspaces_dir, document.user_id)
+    async with workspace_lock(root):
+        relative = await _markdown_file_path(db, document)
+        return await asyncio.to_thread(_read_file_text, root, relative, settings.content_max_bytes)
+
+
+async def write_file_text(
+    db: AsyncSession,
+    settings: Settings,
+    document: Document,
+    *,
+    markdown: str,
+    base_revision: str,
+) -> str:
+    """The reader's save of a markdown file, as a save of `doc.md` is — one revision, the
+    file put back when it cannot be recorded — with the row's size following the file
+    (docs/workspace.md § Files)."""
+    root = user_root(settings.workspaces_dir, document.user_id)
+    async with workspace_lock(root):
+        relative = await _markdown_file_path(db, document)
+        size = await asyncio.to_thread(
+            _write_file_text,
+            root,
+            relative,
+            markdown,
+            base_revision,
+            settings.content_max_bytes,
+        )
+        if size is not None:
+            document.size_bytes = size
+            await db.commit()
+    return revision_of(markdown)
 
 
 # --- re-convert ---------------------------------------------------------------------------
