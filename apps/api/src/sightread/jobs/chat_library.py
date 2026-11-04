@@ -13,6 +13,7 @@ shows it (`DL/DINO/iBOT.pdf`), or by its path under `/workspace/files/`.
 from __future__ import annotations
 
 import logging
+import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
@@ -48,7 +49,10 @@ def library_segments(raw: str) -> list[str] | None:
     prefix = f"{VM_FILES.as_posix()}/"
     if text.startswith(prefix):
         text = text[len(prefix) :]
-    segments = [part.strip() for part in text.split("/") if part.strip()]
+    # Names are stored NFC (`clean_name`): a decomposed é from a macOS name still names them.
+    segments = [
+        unicodedata.normalize("NFC", part.strip()) for part in text.split("/") if part.strip()
+    ]
     if any(part in (".", "..") for part in segments):
         return None
     return segments
@@ -87,11 +91,15 @@ class Found:
     document: Document | None = None
 
 
-async def resolve(db: AsyncSession, user_id: int, segments: list[str]) -> Found | None:
+async def resolve(
+    db: AsyncSession, user_id: int, segments: list[str], folders: dict[int, Folder] | None = None
+) -> Found | None:
     """The live item a path of names leads to, folder by folder; None for nothing live
     there. A document's directory and its `doc.md` both name the document (docs/chat.md
-    § Library conversations, *The library tools*)."""
-    folders = await workspace_documents.user_folders(db, user_id)
+    § Library conversations, *The library tools*). `folders`: the user's, when the caller
+    resolves many paths against one reading."""
+    if folders is None:
+        folders = await workspace_documents.user_folders(db, user_id)
     trashed = workspace_documents.trashed_folder_ids(folders.values())
     place: Folder | None = None
     for index, segment in enumerate(segments):
@@ -225,10 +233,10 @@ async def list_files(
     author: str,
     tool_input: dict,
 ) -> ToolOutcome:
-    """`list_files`: a folder as the Files page lists it, or the Trash. A read of the turn;
-    under the workspace lock, since a ready document never written yet is materialized on
-    the way, so the `doc.md` it names is there to read (docs/chat.md § Library
-    conversations, *The library tools*)."""
+    """`list_files`: a folder as the Files page lists it, or the Trash. In order with the
+    turn's writes and under the workspace lock: it lists what the round's earlier calls left,
+    and a ready document never written yet is materialized on the way, so the `doc.md` it
+    names is there to read (docs/chat.md § Library conversations, *The library tools*)."""
     raw = tool_input.get("path") or ""
     if not isinstance(raw, str):
         return ToolOutcome("`path` is a folder's place as a string, '' for the top.", is_error=True)
@@ -241,7 +249,8 @@ async def list_files(
         async with workspace_lock(root), sessionmaker() as db:
             if tool_input.get("trash") is True:
                 return ToolOutcome(await _list_trash(db, user_id, limit))
-            found = await resolve(db, user_id, segments)
+            folders = await workspace_documents.user_folders(db, user_id)
+            found = await resolve(db, user_id, segments, folders)
             if found is None or found.document is not None:
                 return ToolOutcome(f"{raw} names no folder of the library.", is_error=True)
             return ToolOutcome(
@@ -249,6 +258,7 @@ async def list_files(
                     db,
                     settings,
                     user_id,
+                    folders,
                     found.folder,
                     recursive=tool_input.get("recursive") is True,
                     limit=limit,
@@ -263,13 +273,13 @@ async def _list_folder(
     db: AsyncSession,
     settings: Settings,
     user_id: int,
+    folders: dict[int, Folder],
     folder: Folder | None,
     *,
     recursive: bool,
     limit: int,
     author: str,
 ) -> str:
-    folders = await workspace_documents.user_folders(db, user_id)
     trashed = workspace_documents.trashed_folder_ids(folders.values())
     live_folders = [row for row in folders.values() if row.id not in trashed]
     documents = list(
@@ -294,10 +304,18 @@ async def _list_folder(
     def order(rows):
         return sorted(rows, key=lambda row: (row.name.casefold(), row.name))
 
+    # Indexed once: a listing of hundreds of folders counts each one's items.
+    folders_in: dict[int | None, list[Folder]] = {}
+    for row in live_folders:
+        folders_in.setdefault(row.parent_id, []).append(row)
+    documents_in: dict[int | None, list[Document]] = {}
+    for row in documents:
+        documents_in.setdefault(row.folder_id, []).append(row)
+
     def held(folder_id: int | None) -> tuple[list[Folder], list[Document]]:
         return (
-            order(row for row in live_folders if row.parent_id == folder_id),
-            order(row for row in documents if row.folder_id == folder_id),
+            order(folders_in.get(folder_id, [])),
+            order(documents_in.get(folder_id, [])),
         )
 
     # The entries in the page's order — the folder's AGENTS.md, its folders, then its
@@ -344,7 +362,7 @@ async def _list_folder(
             job = jobs.get(row.job_id) if row.job_id is not None else None
             state = _state(job)
             if state == "ready":
-                await _materialized(db, settings, row, author=author)
+                await _materialized(db, settings, folders, row, author=author)
             lines.append(
                 f"document {path} (document {row.id}, {kind_label(row)}, {state}) "
                 f"text: {at}/{DOC_FILE}"
@@ -361,14 +379,15 @@ async def _list_folder(
 
 
 async def _materialized(
-    db: AsyncSession, settings: Settings, row: Document, *, author: str
+    db: AsyncSession, settings: Settings, folders: dict[int, Folder], row: Document, *, author: str
 ) -> None:
     """A ready document's directory, written now when it never was — a markdown document
     never opened, a copy — as a read of its content writes it (docs/workspace.md § Layout).
     One that cannot be written is listed all the same: reading it says why."""
     root = user_root(settings.workspaces_dir, row.user_id)
     relative = document_relative_dir(
-        await workspace_documents.folder_names(db, row.user_id, row.folder_id), row.name
+        [folder.name for folder in workspace_documents.folder_chain(folders, row.folder_id)],
+        row.name,
     )
     if safe_io.entry_kind(root, root / relative / DOC_FILE) == "file":
         return
@@ -498,10 +517,11 @@ async def _resolved_items(
     works on, whatever an earlier one moves. A path that names nothing live is that item's
     error."""
     named = []
+    folders = await workspace_documents.user_folders(db, user_id)
     for raw in paths:
         what = action.format(raw.strip() or "/")
         segments = library_segments(raw)
-        found = await resolve(db, user_id, segments) if segments else None
+        found = await resolve(db, user_id, segments, folders) if segments else None
         if found is None:
             batch.failed += 1
             reason = "the top of the library is no item" if segments == [] else "nothing is there"
@@ -569,6 +589,8 @@ async def _make_folders(
     a name on the way is a refusal. Every name is cleaned before the first folder is made,
     so a name refused leaves nothing made; a folder refused after others were made leaves
     them, and the refusal says why, for the caller to report with them."""
+    if len(names) > filing.FOLDER_PATH_DEPTH_MAX:
+        return [], None, f"a folder path is at most {filing.FOLDER_PATH_DEPTH_MAX} folders deep"
     wanted = [filing.clean_name(raw, filing.FOLDER_NAME_MAX) for raw in names]
     folders = await workspace_documents.user_folders(db, user_id)
     trashed = workspace_documents.trashed_folder_ids(folders.values())

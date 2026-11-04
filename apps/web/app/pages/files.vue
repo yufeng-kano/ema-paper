@@ -1659,12 +1659,20 @@ async function stepHistory(direction: 'undo' | 'redo') {
 
 /** An Agent step's Undo, from its card (docs/web.md § The Files page's Agent card): the inverse,
  *  run by the code ⌘Z runs for a step of its type, and kept off the page's own stacks, which
- *  stay the reader's. A refusal goes back to the card, which shows it under the step. */
-async function undoAgentStep(step: Step) {
+ *  stay the reader's. A refusal goes back to the card, which shows it under the step. Held by
+ *  the page's one-request-at-a-time rule like ⌘Z: false when another action is running,
+ *  which leaves the step's Undo to press again. */
+async function undoAgentStep(step: Step): Promise<boolean> {
+  if (busy.value) {
+    return false
+  }
+  busy.value = true
   try {
     await replay(step, 'undo')
+    return true
   } finally {
     await refresh()
+    busy.value = false
   }
 }
 

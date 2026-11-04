@@ -141,7 +141,7 @@ const props = defineProps<{
   library?: LibraryPlace
   /** Library mode: takes a library step back through the Files page's own operations; a
    *  refusal rejects, and the step shows it. */
-  undoLibrary?: (step: LibraryStep) => Promise<void>
+  undoLibrary?: (step: LibraryStep) => Promise<boolean>
 }>()
 
 const emit = defineEmits<{
@@ -1456,8 +1456,9 @@ async function undoStep(step: ToolStep) {
   }
   undos.set(step.id, { pending: true, undone: false, error: null })
   try {
-    await props.undoLibrary(step.library)
-    undos.set(step.id, { pending: false, undone: true, error: null })
+    // False: the page was busy with another action, and nothing was undone yet.
+    const undone = await props.undoLibrary(step.library)
+    undos.set(step.id, { pending: false, undone, error: null })
   } catch (error) {
     undos.set(step.id, { pending: false, undone: false, error: await resolve(error) })
   }

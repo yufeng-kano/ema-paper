@@ -308,7 +308,7 @@ INSERT_IMAGE_TOOL = {
 # tools*): the Files page's operations, declared after `insert_image` in this order. None is
 # strict — the upstream compiles every strict schema of a request into one grammar and
 # refuses it past a size it does not publish (§ Upstream); each tool checks its input.
-# `list_files` is a read; the other seven are writes of the turn, never a subagent's.
+# All eight run in order with the writes of the turn, `list_files` too; never a subagent's.
 _ITEM_PATH = (
     "an item's place as the Files page shows it, its folders then its name "
     "('DL/DINO/iBOT.pdf'), or its path under /workspace/files"

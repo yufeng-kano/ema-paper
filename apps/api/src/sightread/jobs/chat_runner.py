@@ -1138,14 +1138,6 @@ async def _run_tool_unguarded(
         outcome = chat_tools.ToolOutcome(f"{name!r} is not one of this turn's tools", is_error=True)
     elif name in MUTATING_TOOLS:
         outcome = await run_mutating(ctx, name, tool_input)
-    elif name == "list_files":
-        outcome = await chat_library.list_files(
-            ctx.sessionmaker,
-            ctx.settings,
-            user_id=ctx.turn.user_id,
-            author=f"{git.AGENT_AUTHOR_PREFIX}{ctx.conversation.id}",
-            tool_input=tool_input,
-        )
     elif name == "view_page":
         outcome = await chat_tools.view_page(
             ctx.paths,
@@ -1250,6 +1242,14 @@ async def run_mutating(ctx: TurnContext, name: str, tool_input: dict) -> chat_to
         return await _run_convert(ctx, tool_input)
     if name == "insert_image":
         return await _run_insert_image(ctx, tool_input)
+    if name == "list_files":
+        return await chat_library.list_files(
+            ctx.sessionmaker,
+            ctx.settings,
+            user_id=ctx.turn.user_id,
+            author=author,
+            tool_input=tool_input,
+        )
     if name in chat_library.WRITE_TOOL_NAMES:
         return await chat_library.run_tool(
             ctx.sessionmaker,
@@ -1428,6 +1428,10 @@ MUTATING_TOOLS = frozenset(
         "download_file",
         "convert_file",
         "insert_image",
+        # A listing runs in order with the writes: it sees what the round's earlier calls
+        # changed, and it may write a document never written yet (docs/chat.md § Library
+        # conversations, *The library tools*).
+        "list_files",
         *chat_library.WRITE_TOOL_NAMES,
     }
 )

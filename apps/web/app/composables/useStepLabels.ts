@@ -6,6 +6,9 @@ import type { StepItem } from '~/lib/thread'
 /** Provided by the agent panel in the Files page's card: its steps are about many documents. */
 export const libraryStepsKey: InjectionKey<boolean> = Symbol('library-steps')
 
+/** The library batch kinds, whose summary counts the items a call took. */
+const ITEM_COUNTED: ReadonlySet<StepKind> = new Set(['move', 'duplicate', 'trash', 'putBack'])
+
 /** The glyph each kind of step is drawn with. */
 const ICONS: Record<StepKind, IconName> = {
   read: 'file-text',
@@ -130,11 +133,19 @@ export function useStepLabels() {
     return ''
   }
 
-  /** What a group did, counted by kind: "Read 5 times, searched once, edited 7 times". */
+  /** What a group did, counted by kind: "Read 5 times, searched once, edited 7 times". A
+   *  library batch counts its items: "moved 3 items", not "moved once". */
   function summary(steps: readonly StepItem[]): string {
-    const kinds = steps.flatMap((step): StepKind[] =>
-      step.type === 'tool' ? [step.step.kind] : step.type === 'skill' ? ['skill'] : [],
-    )
+    const kinds = steps.flatMap((step): StepKind[] => {
+      if (step.type === 'skill') {
+        return ['skill']
+      }
+      if (step.type !== 'tool') {
+        return []
+      }
+      const count = ITEM_COUNTED.has(step.step.kind) ? Math.max(1, step.step.items ?? 1) : 1
+      return Array<StepKind>(count).fill(step.step.kind)
+    })
     const parts = countKinds(kinds).map(({ kind, count }) => t(`chat.summary.${kind}`, { n: count }, count))
     const text = parts.join(t('chat.summarySeparator'))
     return text.charAt(0).toUpperCase() + text.slice(1)

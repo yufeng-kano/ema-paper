@@ -27,7 +27,7 @@ const SHEET_QUERY = '(max-width: 900px)'
 
 defineProps<{
   library: LibraryPlace
-  undoLibrary: (step: LibraryStep) => Promise<void>
+  undoLibrary: (step: LibraryStep) => Promise<boolean>
   /** A document is open in a viewer over the page, whose own Agent card is the one in use. */
   covered: boolean
 }>()

@@ -627,6 +627,58 @@ async def test_a_folder_named_by_its_directory_is_found_not_made_again(chat_clie
     assert sorted(row.name for row in folders.values()) == ["Papers", "_inbox"]
 
 
+async def test_a_name_typed_decomposed_names_the_folder_and_a_path_too_deep_is_refused(
+    chat_client,
+) -> None:
+    """Names are kept NFC: an é typed decomposed, as a macOS file name gives it, still names
+    the folder. A folder path deeper than a filing's is refused with nothing made
+    (docs/chat.md § Library conversations, *The library tools*)."""
+    client = chat_client
+    await _tool(client, "new_folder", {"path": "R\u00e9sum\u00e9s"})
+    folders, _ = await _rows(client)
+    resumes = next(row.id for row in folders.values() if row.name == "R\u00e9sum\u00e9s")
+
+    again = await _tool(client, "new_folder", {"path": "Re\u0301sume\u0301s"})
+    assert again.content == f"The folder R\u00e9sum\u00e9s (folder {resumes}) already exists."
+    deep = await _tool(client, "new_folder", {"path": "/".join(["d"] * 65)})
+    assert deep.is_error
+    assert deep.content == "No folder was made: a folder path is at most 64 folders deep."
+    folders, _ = await _rows(client)
+    assert sorted(row.name for row in folders.values()) == ["Papers", "R\u00e9sum\u00e9s"]
+
+
+@respx.mock
+async def test_a_listing_sees_what_the_calls_before_it_in_the_round_changed(chat_client) -> None:
+    """`list_files` takes its turn with the writes: sent after a change in the same round,
+    it lists the library as that change left it (docs/chat.md § Library conversations)."""
+    client = chat_client
+    stub_messages(
+        [
+            (
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "f",
+                        "name": "new_folder",
+                        "input": {"path": "Later"},
+                    },
+                    {"type": "tool_use", "id": "l", "name": "list_files", "input": {}},
+                ],
+                "tool_use",
+            ),
+            DONE,
+        ]
+    )
+    conversation_id = await new_library_conversation(client)
+    await send(client, conversation_id, text="Make Later and show me")
+    await _run_queued_turn(client)
+
+    results = {result["id"]: result for result in await tool_results(client, conversation_id)}
+    folders, _ = await _rows(client)
+    later = next(row.id for row in folders.values() if row.name == "Later")
+    assert f"folder Later (folder {later}, 0 items)" in results["l"]["output"]
+
+
 async def test_what_was_made_before_a_refusal_is_said_with_its_undo(
     chat_client, monkeypatch
 ) -> None:
@@ -715,7 +767,7 @@ async def test_init_in_a_library_conversation_names_the_open_folders_agents_md(
     chat_client,
 ) -> None:
     client = chat_client
-    main, _ = stub_messages([DONE, DONE])
+    main, _ = stub_messages([DONE, DONE, DONE])
     papers = await _papers(client)
     conversation_id = await new_library_conversation(client)
     await send(client, conversation_id, command="init", library={"folder_id": papers})
@@ -730,6 +782,16 @@ async def test_init_in_a_library_conversation_names_the_open_folders_agents_md(
     second = main[1]["messages"][-1]["content"]
     assert second[-2]["text"] == chat_agent.library_init_instruction(
         "", "/workspace/files/AGENTS.md", "short"
+    )
+
+    # Edited after its folder was renamed, the first finds the folder where it is now.
+    await _tool(client, "rename", {"path": "Papers", "name": "Reading"})
+    first_id = (await detail(client, conversation_id))["messages"][0]["id"]
+    edited = await edit(client, conversation_id, first_id, text="")
+    assert edited.status_code == 202, edited.text
+    await _run_queued_turn(client)
+    assert main[2]["messages"][0]["content"][-2]["text"] == chat_agent.library_init_instruction(
+        "Reading", "/workspace/files/Reading/AGENTS.md", ""
     )
 
 

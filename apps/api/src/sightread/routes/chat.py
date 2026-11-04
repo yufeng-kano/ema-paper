@@ -63,6 +63,7 @@ from ..workspace.documents import (
     StorageUsage,
     current_revision,
     ensure_within_quota,
+    folder_chain,
     is_live,
     make_folder_dir,
     materialize_document,
@@ -304,8 +305,16 @@ def display_content(content: list) -> list:
             )
         elif marker == LIBRARY_CONTEXT:
             # The Files paths the thread draws above the bubble, never the model's text.
+            stored = block.get("library") if isinstance(block.get("library"), dict) else {}
             shown.append(
-                {"type": "text", "context": LIBRARY_CONTEXT, "library": block.get("library")}
+                {
+                    "type": "text",
+                    "context": LIBRARY_CONTEXT,
+                    "library": {
+                        "folder": stored.get("folder") or "",
+                        "items": stored.get("items") or [],
+                    },
+                }
             )
         elif marker == chat_agent.INIT_CONTEXT:
             # The `/init` instruction is nothing the thread shows; the marker stays, so the
@@ -816,7 +825,9 @@ async def post_message(
             }
         )
     if init:
-        content.append(_init_block(in_library, [library] if library else [], body.text))
+        content.append(
+            await _init_block(db, user.id, in_library, [library] if library else [], body.text)
+        )
     if skill is not None:
         content.append(
             _skill_block(skill, body.text, bool(selection), [heading for heading, _ in sections])
@@ -992,7 +1003,7 @@ async def edit_message(
             )
         )
     if init:
-        content.append(_init_block(in_library, library, body.text))
+        content.append(await _init_block(db, user.id, in_library, library, body.text))
     revision = await current_revision(db, settings, document) if document is not None else None
     note = turn_note(
         revision,
@@ -1146,22 +1157,34 @@ async def _library_block(db: AsyncSession, user_id: int, library: LibraryIn) -> 
         "type": "text",
         "text": "\n".join(lines),
         "context": LIBRARY_CONTEXT,
-        "library": {"folder": folder, "items": [path for path, _, _ in picked]},
+        # `folder_id` for an `/init` edited later, whose folder may have moved since.
+        "library": {
+            "folder": folder,
+            "folder_id": opened,
+            "items": [path for path, _, _ in picked],
+        },
     }
 
 
-def _init_block(in_library: bool, library: list[dict], note: str) -> dict:
+async def _init_block(
+    db: AsyncSession, user_id: int, in_library: bool, library: list[dict], note: str
+) -> dict:
     """The `/init` instruction: about the folder the document is in, or in a library
-    conversation the open folder its Files-page block names — the top without one
-    (docs/chat.md § AGENTS.md)."""
+    conversation the open folder its Files-page block names, where it is now — the top
+    without one, or once it is gone or in the Trash (docs/chat.md § AGENTS.md)."""
     if not in_library:
         text = chat_agent.init_instruction(note)
     else:
         shown = library[0].get("library") if library else None
-        folder = str(shown.get("folder") or "") if isinstance(shown, dict) else ""
-        names = [path_segment(name) for name in folder.split("/") if name]
-        agents_file = VM_ROOT.joinpath(FILES_DIR, *names, AGENTS_FILE).as_posix()
-        text = chat_agent.library_init_instruction(folder, agents_file, note)
+        folder_id = shown.get("folder_id") if isinstance(shown, dict) else None
+        folders = await user_folders(db, user_id)
+        if folder_id not in folders or folder_id in trashed_folder_ids(folders.values()):
+            folder_id = None
+        names = [row.name for row in folder_chain(folders, folder_id)]
+        agents_file = VM_ROOT.joinpath(
+            FILES_DIR, *(path_segment(name) for name in names), AGENTS_FILE
+        ).as_posix()
+        text = chat_agent.library_init_instruction("/".join(names), agents_file, note)
     return {"type": "text", "text": text, "context": chat_agent.INIT_CONTEXT}
 
 
