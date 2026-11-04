@@ -113,7 +113,12 @@ async def write_title(
         raise ApiError(
             503, "upstream", "The model that writes titles is not priced on this deployment"
         )
-    document = await db.get(Document, conversation.document_id)
+    # A library conversation has none (docs/chat.md § Library conversations).
+    document = (
+        await db.get(Document, conversation.document_id)
+        if conversation.document_id is not None
+        else None
+    )
     setting = (
         await db.execute(
             select(AgentSetting).where(

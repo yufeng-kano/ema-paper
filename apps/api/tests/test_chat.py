@@ -1044,6 +1044,7 @@ def _round_ctx(image_budget: int = 32 << 20) -> SimpleNamespace:
         round_admission=lambda calls: lambda index: True,
         writers={},
         write_gate=asyncio.Lock(),
+        tools=[{"name": "view_page"}, {"name": "view_figure"}],
     )
 
 
@@ -1085,6 +1086,7 @@ async def test_a_rounds_images_never_exceed_the_budget(monkeypatch) -> None:
         image_spent=0,
         credits_exhausted=False,
         round_admission=lambda calls: lambda index: True,
+        tools=[{"name": "view_page"}],
     )
     tool_uses = [
         {"type": "tool_use", "id": str(index), "name": "view_page", "input": {"page": index + 1}}
@@ -2201,6 +2203,7 @@ async def test_a_turns_images_never_exceed_the_turn_budget(monkeypatch) -> None:
         image_spent=0,
         credits_exhausted=False,
         round_admission=lambda calls: lambda index: True,
+        tools=[{"name": "view_page"}],
     )
     one_round = [
         {"type": "tool_use", "id": str(index), "name": "view_page", "input": {"page": index + 1}}
@@ -3073,6 +3076,7 @@ async def test_a_figure_read_is_bounded_by_the_image_budget_not_the_text_cap(
         paths=paths,
         turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
         conversation=SimpleNamespace(id=1, session="s"),
+        tools=[{"name": "view_figure"}],
     )
     result = await chat_runner._run_tool_unguarded(
         ctx,

@@ -292,6 +292,113 @@ def is_live(document: Document, by_id: dict[int, Folder]) -> bool:
     )
 
 
+async def owned_folder(db: AsyncSession, user_id: int, folder_id: int) -> Folder:
+    row = (
+        await db.execute(select(Folder).where(Folder.id == folder_id, Folder.user_id == user_id))
+    ).scalar_one_or_none()
+    if row is None:
+        raise ApiError(404, "invalid_request", "No such folder")
+    return row
+
+
+async def owned_document(db: AsyncSession, user_id: int, document_id: int) -> Document:
+    row = (
+        await db.execute(
+            select(Document).where(Document.id == document_id, Document.user_id == user_id)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise ApiError(404, "invalid_request", "No such document")
+    return row
+
+
+async def live_folder(db: AsyncSession, user_id: int, folder_id: int) -> Folder:
+    """A folder of the caller's that is not in the Trash, nor inside one that is — the
+    only kind anything can be filed into, moved into or opened (docs/database.md § Rules)."""
+    folders = await user_folders(db, user_id)
+    row = folders.get(folder_id)
+    if row is None or folder_id in trashed_folder_ids(folders.values()):
+        raise ApiError(404, "invalid_request", "No such folder")
+    return row
+
+
+async def live_document(db: AsyncSession, user_id: int, document_id: int) -> Document:
+    """A document of the caller's that is not in the Trash: what every route that reads,
+    writes or moves one takes (docs/api.md)."""
+    row = await owned_document(db, user_id, document_id)
+    if not is_live(row, await user_folders(db, user_id)):
+        raise ApiError(404, "invalid_request", "No such document")
+    return row
+
+
+def nearest_live(folders: dict[int, Folder], folder_id: int | None) -> int | None:
+    """Where Put Back returns an item: the folder it was trashed from when that is live,
+    else the nearest live folder above it, else the top level (docs/api.md)."""
+    trashed = trashed_folder_ids(folders.values())
+    seen: set[int] = set()
+    while folder_id is not None:
+        row = folders.get(folder_id)
+        if row is None or folder_id in seen:
+            return None
+        if folder_id not in trashed:
+            return folder_id
+        seen.add(folder_id)
+        folder_id = row.parent_id
+    return None
+
+
+def own_subtree(folders: dict[int, Folder], root_id: int) -> set[int]:
+    """`root_id` and the folders that go with it: everything under it but a folder
+    trashed on its own, and what is under that — the Trash's own entry, which neither a
+    move to the Trash nor a delete takes along (docs/database.md § Rules)."""
+    children: dict[int, list[Folder]] = {}
+    for row in folders.values():
+        if row.parent_id is not None:
+            children.setdefault(row.parent_id, []).append(row)
+    found = {root_id}
+    frontier = [root_id]
+    while frontier:
+        for child in children.get(frontier.pop(), []):
+            if child.trashed_at is None and child.id not in found:
+                found.add(child.id)
+                frontier.append(child.id)
+    return found
+
+
+async def subtree_ids(
+    db: AsyncSession, user_id: int, root_id: int, for_update: bool = False
+) -> set[int]:
+    """`root_id` and every folder under it.
+
+    Walked in Python over the account's own (id, parent_id) pairs rather than with a
+    recursive CTE: a library is a handful of rows, and this is the same walk on PostgreSQL
+    and on the SQLite test fallback.
+
+    `for_update` locks those rows for the rest of the transaction (a PostgreSQL row lock;
+    compiled away on the SQLite fallback). A move needs it: two tabs moving A into B and B
+    into A can each pass the "not inside itself" check against a tree the other has not
+    committed yet, and the pair of updates then commits a cycle — a subtree with no root,
+    so every folder and file in it vanishes from the library.
+    """
+    query = select(Folder.id, Folder.parent_id).where(Folder.user_id == user_id)
+    if for_update:
+        query = query.with_for_update()
+    pairs = (await db.execute(query)).all()
+    children: dict[int | None, list[int]] = {}
+    for folder_id, parent_id in pairs:
+        children.setdefault(parent_id, []).append(folder_id)
+
+    found = {root_id}
+    frontier = [root_id]
+    while frontier:
+        current = frontier.pop()
+        for child in children.get(current, []):
+            if child not in found:
+                found.add(child)
+                frontier.append(child)
+    return found
+
+
 async def document_paths(db: AsyncSession, settings: Settings, document: Document) -> DocumentPaths:
     root = user_root(settings.workspaces_dir, document.user_id)
     names = await folder_names(db, document.user_id, document.folder_id)
@@ -464,13 +571,21 @@ def _copy_images(paths: DocumentPaths, document_id: int) -> None:
 
 
 async def materialize_document(
-    db: AsyncSession, settings: Settings, document: Document, *, locked: bool = False
+    db: AsyncSession,
+    settings: Settings,
+    document: Document,
+    *,
+    locked: bool = False,
+    author: str = git.USER_AUTHOR,
 ) -> DocumentPaths:
     """Make sure the document's directory exists with its files; idempotent. The path is
     resolved under the workspace lock, after the row is re-read: a rename on the Files
     page holds the same lock across its row write and its move (docs/workspace.md).
     `locked`: the caller already holds that lock (it is not reentrant). A markdown
-    document (no job) has no result to wait for: its baseline is its original."""
+    document (no job) has no result to wait for: its baseline is its original. `author`
+    names who the commit of what it wrote is by: the agent's library tools write a
+    document's first files as its own (docs/workspace.md § The page's operations are the
+    agent's)."""
     job = result = None
     if document.job_id is not None:
         job = (await db.execute(select(Job).where(Job.id == document.job_id))).scalar_one_or_none()
@@ -554,7 +669,7 @@ async def materialize_document(
                 await asyncio.to_thread(
                     git.commit_paths,
                     paths.root,
-                    git.USER_AUTHOR,
+                    author,
                     f"materialize {paths.relative}",
                     [paths.relative],
                 )
@@ -1613,7 +1728,7 @@ class Move:
     displaced: Path | None
 
 
-def _move_tree(root: Path, source: Path, target: Path, message: str) -> Move | None:
+def _move_tree(root: Path, source: Path, target: Path, message: str, author: str) -> Move | None:
     git.ensure_repo(root)
     if safe_io.entry_kind(root, root / source) == "none" or source == target:
         return None
@@ -1639,7 +1754,7 @@ def _move_tree(root: Path, source: Path, target: Path, message: str) -> Move | N
         message = NOT_PLAIN if plain else "The move failed; nothing was changed"
         raise ApiError(409, "invalid_request", message) from exc
     try:
-        return Move(git.commit_paths(root, git.USER_AUTHOR, message, touched), aside)
+        return Move(git.commit_paths(root, author, message, touched), aside)
     except git.GitError as exc:
         # Back where the row will point once the caller rolls back: the directory to its
         # old place, the squatter to the place it had. Plain renames, no git — the index
@@ -1652,34 +1767,49 @@ def _move_tree(root: Path, source: Path, target: Path, message: str) -> Move | N
         ) from exc
 
 
-async def move_path(settings: Settings, user_id: int, source: Path, target: Path) -> Move | None:
+async def move_path(
+    settings: Settings,
+    user_id: int,
+    source: Path,
+    target: Path,
+    *,
+    author: str = git.USER_AUTHOR,
+) -> Move | None:
     """Rename or move a document or folder directory after the database did. The caller
     holds the user's workspace lock across its database write and this move, so nothing
     can materialize at the new path in between (docs/workspace.md § Revisions). Returns
     the move — its revision, and the squatter it displaced — or None when there was
     nothing to move."""
     root = user_root(settings.workspaces_dir, user_id)
-    return await asyncio.to_thread(_move_tree, root, source, target, f"move {source} -> {target}")
+    return await asyncio.to_thread(
+        _move_tree, root, source, target, f"move {source} -> {target}", author
+    )
 
 
-def _undo_move(root: Path, source: Path, target: Path, displaced: Path | None) -> None:
+def _undo_move(root: Path, source: Path, target: Path, displaced: Path | None, author: str) -> None:
     touched = [target, source]
     git.move(root, root / target, root / source)
     if displaced is not None and safe_io.entry_kind(root, root / displaced) != "none":
         # The squatter back under the name it had, not left at its suffixed one.
         git.move(root, root / displaced, root / target)
         touched.append(displaced)
-    git.commit_paths(root, git.USER_AUTHOR, f"restore {source}", touched)
+    git.commit_paths(root, author, f"restore {source}", touched)
 
 
 async def undo_move(
-    settings: Settings, user_id: int, source: Path, target: Path, displaced: Path | None
+    settings: Settings,
+    user_id: int,
+    source: Path,
+    target: Path,
+    displaced: Path | None,
+    *,
+    author: str = git.USER_AUTHOR,
 ) -> None:
     """A move whose row did not commit: the whole of it undone — the directory back to
     `source`, and the squatter the move displaced back to `target` — as one revision, so
     a failed request renames nothing (docs/workspace.md § Layout)."""
     root = user_root(settings.workspaces_dir, user_id)
-    await asyncio.to_thread(_undo_move, root, source, target, displaced)
+    await asyncio.to_thread(_undo_move, root, source, target, displaced, author)
 
 
 @dataclass(frozen=True)
@@ -1909,7 +2039,7 @@ def sweep_staged_uploads(root: Path) -> int:
 TRASH_ENTRY = re.compile(r"(document|folder)-([0-9]+)")
 
 
-def _stash_tree(root: Path, relative: Path, entry: str) -> bool:
+def _stash_tree(root: Path, relative: Path, entry: str, author: str) -> bool:
     git.ensure_repo(root)
     if safe_io.entry_kind(root, root / relative) == "none":
         return False  # never materialized (a parse still running): nothing to move
@@ -1929,7 +2059,7 @@ def _stash_tree(root: Path, relative: Path, entry: str) -> bool:
             409, "invalid_request", "The move to the Trash failed; nothing was changed"
         ) from exc
     try:
-        git.commit_paths(root, git.USER_AUTHOR, f"trash {relative}", [relative])
+        git.commit_paths(root, author, f"trash {relative}", [relative])
     except git.GitError as exc:
         # Back where it was before the refusal: nothing waits in the Trash for a row
         # that will not say so.
@@ -1942,15 +2072,22 @@ def _stash_tree(root: Path, relative: Path, entry: str) -> bool:
     return True
 
 
-async def stash_path(settings: Settings, user_id: int, relative: Path, entry: str) -> bool:
+async def stash_path(
+    settings: Settings,
+    user_id: int,
+    relative: Path,
+    entry: str,
+    *,
+    author: str = git.USER_AUTHOR,
+) -> bool:
     """Move a folder's or a document's directory into the Trash after the database
     marked it, as the revision `trash <path>`; False when there was no directory. The
     caller holds the workspace lock (docs/workspace.md § The Trash)."""
     root = user_root(settings.workspaces_dir, user_id)
-    return await asyncio.to_thread(_stash_tree, root, relative, entry)
+    return await asyncio.to_thread(_stash_tree, root, relative, entry, author)
 
 
-def _unstash_tree(root: Path, entry: str, relative: Path, message: str) -> bool:
+def _unstash_tree(root: Path, entry: str, relative: Path, message: str, author: str) -> bool:
     git.ensure_repo(root)
     source = trash_root(root) / entry
     if safe_io.entry_kind(root, source) == "none":
@@ -1971,7 +2108,7 @@ def _unstash_tree(root: Path, entry: str, relative: Path, message: str) -> bool:
                 safe_io.rename(root, root / aside, root / relative)
         raise
     try:
-        git.commit_paths(root, git.USER_AUTHOR, message, touched)
+        git.commit_paths(root, author, message, touched)
     except git.GitError:
         safe_io.rename(root, root / relative, source)
         if aside is not None:
@@ -1981,7 +2118,13 @@ def _unstash_tree(root: Path, entry: str, relative: Path, message: str) -> bool:
 
 
 async def unstash_path(
-    settings: Settings, user_id: int, entry: str, relative: Path, message: str
+    settings: Settings,
+    user_id: int,
+    entry: str,
+    relative: Path,
+    message: str,
+    *,
+    author: str = git.USER_AUTHOR,
 ) -> bool:
     """Bring an entry of the Trash back to `relative` under `files/` as one revision:
     Put Back once its rows are committed, or a move to the Trash whose rows did not
@@ -1989,7 +2132,7 @@ async def unstash_path(
     entry then still in the Trash for the repair rule. The caller holds the workspace
     lock."""
     root = user_root(settings.workspaces_dir, user_id)
-    return await asyncio.to_thread(_unstash_tree, root, entry, relative, message)
+    return await asyncio.to_thread(_unstash_tree, root, entry, relative, message, author)
 
 
 def trash_home(row: Folder | Document, by_id: dict[int, Folder]) -> Path:
@@ -2187,7 +2330,13 @@ def _undo_copy(root: Path, target: Path, displaced: Path | None, target_ids: lis
 
 
 def _copy_files(
-    root: Path, source: Path, target: Path, documents: list[CopiedDocument], *, folder: bool
+    root: Path,
+    source: Path,
+    target: Path,
+    documents: list[CopiedDocument],
+    *,
+    folder: bool,
+    author: str,
 ) -> Copy:
     git.ensure_repo(root)
     aside: Path | None = None
@@ -2241,7 +2390,7 @@ def _copy_files(
                     break
             _copy_stored_images(root, document.source_id, document.target_id)
         touched = [target] if aside is None else [target, aside]
-        commit = git.commit_paths(root, git.USER_AUTHOR, f"copy {source} -> {target}", touched)
+        commit = git.commit_paths(root, author, f"copy {source} -> {target}", touched)
     except BaseException as exc:
         # Whole or not at all: what the copy made goes, and the squatter comes back.
         try:
@@ -2270,32 +2419,41 @@ async def copy_path(
     documents: list[CopiedDocument],
     *,
     folder: bool,
+    author: str = git.USER_AUTHOR,
 ) -> Copy:
     """Copy a document's or a folder's directory to `target` after the database made
     the rows, with the originals and inserted images under the new ids, as the revision
     `copy <from> -> <to>`; whole or nothing (409). The caller holds the workspace lock
     and checked the quota (docs/workspace.md § Copies)."""
     root = user_root(settings.workspaces_dir, user_id)
-    return await asyncio.to_thread(_copy_files, root, source, target, documents, folder=folder)
+    return await asyncio.to_thread(
+        _copy_files, root, source, target, documents, folder=folder, author=author
+    )
 
 
-def _remove_copy(root: Path, target: Path, made: Copy, target_ids: list[int]) -> None:
+def _remove_copy(root: Path, target: Path, made: Copy, target_ids: list[int], author: str) -> None:
     safe_io.remove_tree(root, root / target)
     touched = [target]
     if made.displaced is not None and safe_io.entry_kind(root, root / made.displaced) != "none":
         git.move(root, root / made.displaced, root / target)
         touched.append(made.displaced)
     _discard_originals(root, target_ids)
-    git.commit_paths(root, git.USER_AUTHOR, f"remove {target}", touched)
+    git.commit_paths(root, author, f"remove {target}", touched)
 
 
 async def remove_copy(
-    settings: Settings, user_id: int, target: Path, made: Copy, target_ids: list[int]
+    settings: Settings,
+    user_id: int,
+    target: Path,
+    made: Copy,
+    target_ids: list[int],
+    *,
+    author: str = git.USER_AUTHOR,
 ) -> None:
     """A copy whose rows did not commit: its directory, originals and images go, the
     squatter it displaced comes back, as a revision of its own."""
     root = user_root(settings.workspaces_dir, user_id)
-    await asyncio.to_thread(_remove_copy, root, target, made, target_ids)
+    await asyncio.to_thread(_remove_copy, root, target, made, target_ids, author)
 
 
 @dataclass(frozen=True)

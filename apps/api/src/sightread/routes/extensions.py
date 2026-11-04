@@ -94,6 +94,8 @@ def skill_payload(skill: skill_defs.ResolvedSkill) -> dict:
         "builtin": skill.builtin,
         "modified": skill.modified,
         "default": _skill_values(skill.default) if skill.default is not None else None,
+        # Left out of a library conversation's composer (docs/chat.md § Skills).
+        "document_only": skill.document_only,
     }
 
 
@@ -268,6 +270,7 @@ def subagent_payload(subagent: subagent_defs.ResolvedSubagent) -> dict:
         "builtin": subagent.builtin,
         "modified": subagent.modified,
         "default": _subagent_values(subagent.default) if subagent.default is not None else None,
+        "document_only": subagent.document_only,
     }
 
 

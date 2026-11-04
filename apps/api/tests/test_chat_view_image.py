@@ -487,6 +487,7 @@ def _editor_round_ctx(root: Path, *, round_budget: int, turn_budget: int) -> Sim
         round_admission=lambda calls: lambda index: True,
         writers={},
         write_gate=asyncio.Lock(),
+        tools=[{"name": "view_page"}],
     )
 
 

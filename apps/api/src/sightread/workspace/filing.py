@@ -1,8 +1,12 @@
 """Filing into the library: names, the suffixed insert that re-reads a taken name, the
 commit that verifies itself, a folder with its directory, and a file kept as it is — what
-the upload routes and the chat agent's download share (docs/workspace.md § Files). Nothing
-here is a route: the worker files a download through the same steps, so this lives beside
-the tree it writes (docs/project-structure.md)."""
+the upload routes and the chat agent's download share (docs/workspace.md § Files) — and
+the Files page's operations, which the library routes and the chat agent's library tools
+both run: a new folder or markdown document, a move or a rename, a copy, Move to Trash and
+Put Back (docs/workspace.md § The page's operations are the agent's). Nothing here is a
+route: the worker runs the same steps, so this lives beside the tree it writes
+(docs/project-structure.md). Each operation runs under the workspace lock its caller
+holds, commits on the session it is given, and names its tree commits' `author`."""
 
 from __future__ import annotations
 
@@ -11,6 +15,7 @@ import contextlib
 import logging
 import re
 import unicodedata
+import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -20,13 +25,30 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..billing import ledger
 from ..config import Settings
-from ..db.models import FILE_KIND, Document, Folder
+from ..db.models import FILE_KIND, MARKDOWN_KIND, Document, Folder, Job, utcnow
 from ..errors import ApiError
 from . import documents as workspace_documents
 from . import safe_io
-from .layout import FILES_DIR, document_relative_dir, path_segment, segment_name, user_root
+from .documents import (
+    live_document,
+    live_folder,
+    markdown_name,
+    nearest_live,
+    own_subtree,
+    owned_document,
+    owned_folder,
+    subtree_ids,
+)
+from .layout import (
+    FILES_DIR,
+    document_relative_dir,
+    path_segment,
+    segment_name,
+    trash_entry,
+    user_root,
+)
 from .locks import workspace_lock
-from .trash import lock_user, read_row
+from .trash import lock_user, read_row, refuse_while_answering
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +62,11 @@ NAME_ATTEMPTS = 500
 # An insert can lose a name race with another tab; the retry re-reads the folder's names.
 INSERT_ATTEMPTS = 3
 STORAGE_FULL = "The workspace is at its quota; free some space first"
+# A copy of an item whose files the Trash's repair rule could not bring back is refused,
+# not made from the baseline as if the item had never been read (docs/workspace.md § Copies).
+STRANDED = "The item's files could not be brought back from the Trash; nothing was copied"
+FILE_CLASH = "A file with this name already exists here"
+FOLDER_CLASH = "A folder with this name already exists here"
 
 # A name is a label in a tree, never a path. Separators would make a breadcrumb lie about
 # where a file is, and control characters would make two different names look identical.
@@ -464,3 +491,754 @@ async def keep_file(
         what=what,
         undo=lambda: workspace_documents.discard_file(settings, user_id, relative),
     )
+
+
+# --- the Files page's operations (docs/workspace.md § The page's operations are the agent's)
+
+
+async def lock_job(db: AsyncSession, job_id) -> None:
+    """Order filing against the worker's finalization of the parse: the worker reads the
+    rows that keep the original under this lock (docs/jobs.md § Retention)."""
+    await db.execute(select(Job.id).where(Job.id == job_id).with_for_update())
+
+
+async def job_of(db: AsyncSession, job_id) -> Job:
+    job = (await db.execute(select(Job).where(Job.id == job_id))).scalar_one_or_none()
+    if job is None:
+        raise ApiError(404, "invalid_request", "No such job")
+    return job
+
+
+async def flush_or_retry(db: AsyncSession, retries_left: int, message: str) -> bool:
+    """Flush; answer False when a lost name race means the caller should choose again.
+
+    A rename passes `0`: the name is what the user just typed, so a collision is theirs to
+    resolve. A move passes what is left of its attempts, because a collision there is
+    resolved with a suffix rather than refused (docs/web.md § Files). The flush, not a
+    commit: the directory moves before the transaction ends, so a move the tree refuses
+    rolls the row back (docs/workspace.md § Revisions).
+    """
+    try:
+        await db.flush()
+        return True
+    except IntegrityError as exc:
+        await db.rollback()
+        if retries_left <= 0:
+            raise ApiError(409, "invalid_request", message) from exc
+        return False
+
+
+async def move_then_commit(
+    db: AsyncSession,
+    settings: Settings,
+    user_id: int,
+    before: Path,
+    after: Path,
+    *,
+    landed: tuple[type, int, dict],
+    author: str,
+) -> None:
+    """The row is flushed; now the directory, then the commit. A refusal from the tree
+    rolls the row back to where the files still are; a commit that fails after the move
+    puts the directory back where the row stayed — unless the row shows the commit
+    landed after all (the connection dropped after PostgreSQL made it durable), which
+    `landed` (the model, the id, the values the committed row holds) is read for on a
+    fresh connection: then the files stay where the row points (docs/workspace.md)."""
+    try:
+        moved = await workspace_documents.move_path(settings, user_id, before, after, author=author)
+    except BaseException:
+        await db.rollback()
+        raise
+    try:
+        await db.commit()
+    except BaseException:
+        if moved is not None:
+            model, row_id, expected = landed
+            readable, row = await read_row(db, model, row_id)
+            if not readable:
+                # Indeterminate is not a rollback: the files stay where they are rather
+                # than being moved away from a row that may now name them; the next
+                # reconciliation follows the directory (docs/workspace.md § Revisions).
+                logger.error(
+                    "the move of %s to %s raised and cannot be verified; the files stay",
+                    before,
+                    after,
+                )
+            elif row is not None and all(
+                getattr(row, key) == value for key, value in expected.items()
+            ):
+                logger.warning(
+                    "the move of %s to %s was committed despite the error; the files stay",
+                    before,
+                    after,
+                )
+            else:
+                try:
+                    # The whole move undone: the directory back, and the squatter the
+                    # move displaced back under its name (docs/workspace.md § Layout).
+                    await workspace_documents.undo_move(
+                        settings, user_id, before, after, moved.displaced, author=author
+                    )
+                except Exception:  # noqa: BLE001 - the move revision stays revertible
+                    logger.exception("could not move %s back after a failed commit", after)
+        raise
+
+
+async def new_document(
+    db: AsyncSession,
+    settings: Settings,
+    user_id: int,
+    folder_id: int | None,
+    name: str,
+    *,
+    text: str | None = None,
+) -> Document:
+    """A new markdown document, its name given `.md` and suffixed where the folder holds it
+    (docs/workspace.md § Markdown documents). Without `text`, the page's *New document*: a
+    row with no original, its baseline empty and its directory made at its first read — it
+    writes nothing to the tree, so it needs no lock. With `text`, the text is kept as its
+    original as an uploaded `.md` is: the caller holds the backup lock shared and the
+    workspace lock, as for a filing. Either way the committed row is all it makes: the
+    agent's `new_document` writes the directory next, as its own step, so a directory that
+    cannot be written is told apart from no document made."""
+    if folder_id is not None:
+        await live_folder(db, user_id, folder_id)
+    wanted = markdown_name(clean_name(name, DOCUMENT_NAME_MAX), DOCUMENT_NAME_MAX)
+    try:
+        row = await insert_named(
+            db,
+            user_id=user_id,
+            into=folder_id,
+            build=lambda name: Document(
+                user_id=user_id, folder_id=folder_id, job_id=None, kind=MARKDOWN_KIND, name=name
+            ),
+            taken=lambda: sibling_names(db, user_id, folder_id),
+            wanted=wanted,
+            limit=DOCUMENT_NAME_MAX,
+            message=FILE_CLASH,
+            commit=text is None,
+        )
+    except ApiError:
+        if folder_id is None or await folder_exists(db, user_id, folder_id):
+            raise
+        raise ApiError(404, "invalid_request", "No such folder") from None
+    if text is None:
+        return row
+    row_id = row.id
+    upload_dir = Path(settings.upload_dir)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    staged = upload_dir / f"{uuid.uuid4().hex}.md"
+    try:
+        await asyncio.to_thread(staged.write_text, text, encoding="utf-8")
+        # The quota, the copy and their undo, as for a `.md` upload; the staged file goes
+        # either way.
+        await workspace_documents.adopt_markdown(db, settings, row, staged)
+    except ApiError:
+        await db.rollback()
+        raise
+    except Exception as exc:
+        logger.exception("could not keep the text of document %d", row_id)
+        await db.rollback()
+        raise ApiError(
+            409, "invalid_request", "The document could not be kept; nothing was made"
+        ) from exc
+    finally:
+        staged.unlink(missing_ok=True)
+    relative = await document_relative(db, row)
+    return await commit_filing(
+        db,
+        row,
+        what="The document",
+        undo=lambda: workspace_documents.discard_adopted(settings, user_id, row_id, relative),
+    )
+
+
+async def move_folder(
+    db: AsyncSession,
+    settings: Settings,
+    user_id: int,
+    folder_id: int,
+    *,
+    name: str | None,
+    parent_id: int | None,
+    move: bool,
+    author: str,
+) -> Folder:
+    """Rename a folder (`name`), move it into `parent_id` (`move`), or both, its directory
+    with it. A rename that collides is refused: the name is what the user just typed, and
+    quietly turning it into "Invoices (2)" would be a lie. A move that collides is
+    suffixed, the way dropping a file into a folder that already holds one behaves. Refused
+    while a conversation about a document under it is answering: a turn holds its
+    document's path for its whole run (docs/chat.md § Conversations, turns, events)."""
+    doomed = await subtree_ids(db, user_id, folder_id)
+    await refuse_while_answering(
+        db,
+        user_id,
+        select(Document.id).where(Document.user_id == user_id, Document.folder_id.in_(doomed)),
+    )
+    renaming = name is not None
+    # The whole decision sits inside the retry: a rollback releases the lock the move was
+    # validated under, so a second attempt has to establish both facts again.
+    for attempt in range(INSERT_ATTEMPTS):
+        row = await live_folder(db, user_id, folder_id)
+        place = parent_id if move else row.parent_id
+
+        if place != row.parent_id and place is not None:
+            await live_folder(db, user_id, place)
+            if place in await subtree_ids(db, user_id, row.id, for_update=True):
+                raise ApiError(400, "invalid_request", "A folder cannot be moved inside itself")
+
+        wanted = clean_name(name, FOLDER_NAME_MAX) if renaming else row.name
+        await lock_user(db, user_id)
+        taken = await sibling_names(db, user_id, place, exclude_folder=row.id)
+        if renaming and wanted in taken:
+            raise ApiError(409, "invalid_request", FOLDER_CLASH)
+
+        before = await folder_relative_dir(db, user_id, row.id)
+        row.parent_id = place
+        row.name = free_name(taken, wanted, FOLDER_NAME_MAX)
+        retries = 0 if renaming else INSERT_ATTEMPTS - 1 - attempt
+        if await flush_or_retry(db, retries, FOLDER_CLASH):
+            break
+    # The tree follows the rows (docs/workspace.md): the directory moves, then the commit.
+    after = await folder_relative_dir(db, user_id, row.id)
+    landed = (Folder, row.id, {"parent_id": row.parent_id, "name": row.name})
+    await move_then_commit(db, settings, user_id, before, after, landed=landed, author=author)
+    return row
+
+
+async def move_document(
+    db: AsyncSession,
+    settings: Settings,
+    user_id: int,
+    document_id: int,
+    *,
+    name: str | None,
+    folder_id: int | None,
+    move: bool,
+    author: str,
+) -> Document:
+    """Rename a document or a file (`name`), move it into `folder_id` (`move`), or both,
+    its directory with it. Same rule as a folder: a rename refuses, a move suffixes; a
+    markdown document keeps `.md`; refused while a conversation about it is answering."""
+    # A turn holds the document's path for its whole run (docs/chat.md § Tools).
+    await refuse_while_answering(db, user_id, select(Document.id).where(Document.id == document_id))
+    renaming = name is not None
+    for attempt in range(INSERT_ATTEMPTS):
+        row = await live_document(db, user_id, document_id)
+        place = folder_id if move else row.folder_id
+        if place != row.folder_id and place is not None:
+            await live_folder(db, user_id, place)
+
+        wanted = clean_name(name, DOCUMENT_NAME_MAX) if renaming else row.name
+        if renaming and row.kind == MARKDOWN_KIND:
+            wanted = markdown_name(wanted, DOCUMENT_NAME_MAX)
+        await lock_user(db, user_id)
+        taken = await sibling_names(db, user_id, place, exclude_document=row.id)
+        if renaming and wanted in taken:
+            raise ApiError(409, "invalid_request", FILE_CLASH)
+
+        before = await document_relative(db, row)
+        row.folder_id = place
+        row.name = free_name(taken, wanted, DOCUMENT_NAME_MAX)
+        # Two tabs moving same-named files into one folder is the same race a create
+        # loses, and it has the same answer: take the next name, not a conflict.
+        retries = 0 if renaming else INSERT_ATTEMPTS - 1 - attempt
+        if await flush_or_retry(db, retries, FILE_CLASH):
+            break
+    after = await document_relative(db, row)
+    landed = (Document, row.id, {"folder_id": row.folder_id, "name": row.name})
+    await move_then_commit(db, settings, user_id, before, after, landed=landed, author=author)
+    return row
+
+
+# --- the Trash ----------------------------------------------------------------------------
+
+
+async def stash_then_commit(
+    db: AsyncSession,
+    settings: Settings,
+    user_id: int,
+    relative: Path,
+    entry: str,
+    *,
+    landed: tuple[type, int],
+    author: str,
+) -> None:
+    """The row is flushed with `trashed_at`; now the directory into the Trash, then the
+    commit. A refusal from the tree rolls the row back to where the files still are; a
+    commit that fails after the move brings the directory back — unless the row `landed`
+    names is found trashed on a fresh connection, the commit having landed after all. A
+    row that cannot be read leaves the entry where it is: the repair rule returns it
+    should the row turn out live (docs/workspace.md § The Trash)."""
+    try:
+        moved = await workspace_documents.stash_path(
+            settings, user_id, relative, entry, author=author
+        )
+    except BaseException:
+        await db.rollback()
+        raise
+    try:
+        await db.commit()
+    except BaseException:
+        if moved:
+            readable, row = await read_row(db, *landed)
+            if not readable:
+                logger.error("the move of %s to the Trash raised and cannot be verified", relative)
+            elif row is not None and row.trashed_at is not None:
+                logger.warning(
+                    "the move of %s to the Trash was committed despite the error", relative
+                )
+            else:
+                try:
+                    await workspace_documents.unstash_path(
+                        settings, user_id, entry, relative, f"restore {relative}", author=author
+                    )
+                except Exception:  # noqa: BLE001 - the repair rule returns it
+                    logger.exception("could not bring %s back from the Trash", relative)
+        raise
+
+
+async def put_back_then_move(
+    db: AsyncSession,
+    settings: Settings,
+    user_id: int,
+    entry: str,
+    relative: Path,
+    *,
+    landed: tuple[type, int],
+    what: str,
+    author: str,
+):
+    """Put Back: the rows are flushed live at their new place; they commit first — a
+    commit that raises is checked on a fresh connection, as a filing's is — and then the
+    directory comes back from the Trash. A move that fails leaves the rows back and the
+    files in the Trash for the repair rule, which returns them at the next read of the
+    document or the next reconciliation (docs/workspace.md § The Trash). Returns the row
+    as committed when the commit raised and landed (the request's session rolled back),
+    else None."""
+    answer = None
+    try:
+        await db.commit()
+    except Exception as exc:  # noqa: BLE001 - verified below, whatever raised
+        readable, row = await read_row(db, *landed)
+        with contextlib.suppress(Exception):
+            await db.rollback()
+        if readable and row is not None and row.trashed_at is None:
+            logger.warning("the put back of %s was committed despite the error", relative)
+            answer = row
+        elif readable:
+            raise ApiError(
+                409, "invalid_request", f"{what} could not be put back; nothing was changed"
+            ) from exc
+        else:
+            raise ApiError(
+                409,
+                "invalid_request",
+                f"{what} may have been put back, but the database could not confirm it; "
+                "reload the library before trying again",
+            ) from exc
+    try:
+        await workspace_documents.unstash_path(
+            settings, user_id, entry, relative, f"put back {relative}", author=author
+        )
+    except Exception:  # noqa: BLE001 - the rows stand; the repair rule brings the files
+        logger.exception("the files of %s stay in the Trash for now", relative)
+    return answer
+
+
+async def trash_document(
+    db: AsyncSession, settings: Settings, user_id: int, document_id: int, *, author: str
+) -> Document:
+    """Move to Trash: the row marked, its directory out of `files/` into the Trash, as one
+    revision (docs/workspace.md § The Trash)."""
+    # What an interrupted move left goes back first: an entry under this item's name
+    # would refuse the move below.
+    await workspace_documents.recover_trash(db, settings, user_id)
+    await lock_user(db, user_id)
+    row = await live_document(db, user_id, document_id)
+    # A turn holds the document's path for its whole run (docs/chat.md § Tools).
+    await refuse_while_answering(db, user_id, [row.id])
+    relative = await document_relative(db, row)
+    row.trashed_at = utcnow()
+    await db.flush()
+    await stash_then_commit(
+        db,
+        settings,
+        user_id,
+        relative,
+        trash_entry("document", row.id),
+        landed=(Document, row.id),
+        author=author,
+    )
+    return row
+
+
+async def trash_folder(
+    db: AsyncSession, settings: Settings, user_id: int, folder_id: int, *, author: str
+) -> Folder:
+    """Move to Trash, a folder with everything in it (docs/workspace.md § The Trash)."""
+    await workspace_documents.recover_trash(db, settings, user_id)
+    await lock_user(db, user_id)
+    row = await live_folder(db, user_id, folder_id)
+    inside = own_subtree(await workspace_documents.user_folders(db, user_id), row.id)
+    await refuse_while_answering(
+        db,
+        user_id,
+        select(Document.id).where(Document.user_id == user_id, Document.folder_id.in_(inside)),
+    )
+    relative = await folder_relative_dir(db, user_id, row.id)
+    row.trashed_at = utcnow()
+    await db.flush()
+    await stash_then_commit(
+        db,
+        settings,
+        user_id,
+        relative,
+        trash_entry("folder", row.id),
+        landed=(Folder, row.id),
+        author=author,
+    )
+    return row
+
+
+async def put_back_document(
+    db: AsyncSession, settings: Settings, user_id: int, document_id: int, *, author: str
+) -> Document:
+    """Put Back: to the folder it was trashed from, or the nearest live one above it, a
+    taken name suffixed as a move's is (docs/api.md)."""
+    await workspace_documents.recover_trash(db, settings, user_id)
+    for attempt in range(INSERT_ATTEMPTS):
+        await lock_user(db, user_id)
+        row = await owned_document(db, user_id, document_id)
+        if row.trashed_at is None:
+            raise ApiError(404, "invalid_request", "No such document in the Trash")
+        place = nearest_live(await workspace_documents.user_folders(db, user_id), row.folder_id)
+        taken = await sibling_names(db, user_id, place)
+        row.folder_id = place
+        row.name = free_name(taken, row.name, DOCUMENT_NAME_MAX)
+        row.trashed_at = None
+        if await flush_or_retry(db, INSERT_ATTEMPTS - 1 - attempt, FILE_CLASH):
+            break
+    relative = await document_relative(db, row)
+    landed = await put_back_then_move(
+        db,
+        settings,
+        user_id,
+        trash_entry("document", row.id),
+        relative,
+        landed=(Document, row.id),
+        what="The file",
+        author=author,
+    )
+    return landed or row
+
+
+async def put_back_folder(
+    db: AsyncSession, settings: Settings, user_id: int, folder_id: int, *, author: str
+) -> Folder:
+    """Put Back a folder, with everything that went to the Trash with it (docs/api.md)."""
+    await workspace_documents.recover_trash(db, settings, user_id)
+    for attempt in range(INSERT_ATTEMPTS):
+        await lock_user(db, user_id)
+        row = await owned_folder(db, user_id, folder_id)
+        if row.trashed_at is None:
+            raise ApiError(404, "invalid_request", "No such folder in the Trash")
+        place = nearest_live(await workspace_documents.user_folders(db, user_id), row.parent_id)
+        taken = await sibling_names(db, user_id, place)
+        row.parent_id = place
+        row.name = free_name(taken, row.name, FOLDER_NAME_MAX)
+        row.trashed_at = None
+        if await flush_or_retry(db, INSERT_ATTEMPTS - 1 - attempt, FOLDER_CLASH):
+            break
+    relative = await folder_relative_dir(db, user_id, row.id)
+    landed = await put_back_then_move(
+        db,
+        settings,
+        user_id,
+        trash_entry("folder", row.id),
+        relative,
+        landed=(Folder, row.id),
+        what="The folder",
+        author=author,
+    )
+    return landed or row
+
+
+# --- copies -------------------------------------------------------------------------------
+
+
+async def keep_parses(db: AsyncSession, jobs: list[Job]) -> None:
+    """The job rows behind the documents a copy files, locked in one order, read again
+    under the lock and marked for retention while they run, as the Files page's upload
+    marks its own: the worker finishing one meanwhile sees the new rows among its
+    recipients or leaves the upload for them (docs/jobs.md § Retention)."""
+    for job in sorted(jobs, key=lambda job: str(job.id)):
+        await lock_job(db, job.id)
+        await db.refresh(job)
+        if job.status in ("queued", "running"):
+            job.retain_source = True
+    await db.flush()
+
+
+async def donors_of(db: AsyncSession, documents: list[Document]) -> dict:
+    """Every document of each parse behind `documents`: whose original a copy may take
+    when its source holds none (docs/workspace.md § Copies)."""
+    job_ids = {document.job_id for document in documents if document.job_id is not None}
+    donors: dict = {}
+    if job_ids:
+        rows = await db.execute(
+            select(Document.id, Document.job_id)
+            .where(Document.job_id.in_(job_ids))
+            .order_by(Document.id)
+        )
+        for document_id, job_id in rows.all():
+            donors.setdefault(job_id, []).append(document_id)
+    return donors
+
+
+def copied(
+    source: Document, target: Document, job: Job | None, inner: Path, donors: dict
+) -> workspace_documents.CopiedDocument:
+    others = donors.get(source.job_id, []) if source.job_id is not None else []
+    return workspace_documents.CopiedDocument(
+        source_id=source.id,
+        target_id=target.id,
+        job=job,
+        inner=inner,
+        donors=(source.id, *(other for other in others if other not in (source.id, target.id))),
+        parsing=job is not None and job.status in ("queued", "running"),
+        file=source.kind == FILE_KIND,
+    )
+
+
+async def copy_then_commit(
+    db: AsyncSession,
+    settings: Settings,
+    user_id: int,
+    source: Path,
+    target: Path,
+    documents: list[workspace_documents.CopiedDocument],
+    *,
+    folder: bool,
+    landed: tuple[type, int],
+    author: str,
+):
+    """The rows are flushed; now the files, then the commit. A copy the tree refuses rolls
+    the rows back; a commit that raises is checked on a fresh connection — landed, the
+    copy stands and its row is answered; rolled back, the copy is removed as a revision of
+    its own; unknown, answered as unconfirmed (docs/workspace.md § Copies)."""
+    try:
+        made = await workspace_documents.copy_path(
+            settings, user_id, source, target, documents, folder=folder, author=author
+        )
+    except BaseException:
+        await db.rollback()
+        raise
+    try:
+        await db.commit()
+    except Exception as exc:  # noqa: BLE001 - verified below, whatever raised
+        readable, row = await read_row(db, *landed)
+        with contextlib.suppress(Exception):
+            await db.rollback()
+        if readable and row is not None:
+            logger.warning("the copy to %s was committed despite the error", target)
+            return row
+        if readable:
+            try:
+                await workspace_documents.remove_copy(
+                    settings,
+                    user_id,
+                    target,
+                    made,
+                    [document.target_id for document in documents],
+                    author=author,
+                )
+            except Exception:  # noqa: BLE001 - the refusal stands; the leftovers are logged
+                logger.exception("could not take back the copy at %s", target)
+            raise ApiError(
+                409, "invalid_request", "The copy could not be made; nothing was copied"
+            ) from exc
+        raise ApiError(
+            409,
+            "invalid_request",
+            "The copy may have been made, but the database could not confirm it; "
+            "reload the library before trying again",
+        ) from exc
+    return None
+
+
+async def copy_document(
+    db: AsyncSession,
+    settings: Settings,
+    user_id: int,
+    document_id: int,
+    folder_id: int | None,
+    *,
+    author: str,
+) -> Document:
+    """A copy of a document — its text, notes, original and images as they are now — into
+    a folder, or beside it as a duplicate (docs/workspace.md § Copies). The caller holds
+    the backup lock shared and the workspace lock, as for a filing: no row without its
+    original, in the database or in a snapshot (docs/workspace.md § Backups)."""
+    root = user_root(settings.workspaces_dir, user_id)
+    # What an interrupted move to or from the Trash left goes back first: the copy reads
+    # the source's directory, and the edits may be waiting there.
+    await workspace_documents.recover_trash(db, settings, user_id)
+    await lock_user(db, user_id)
+    source = await live_document(db, user_id, document_id)
+    if folder_id is not None:
+        await live_folder(db, user_id, folder_id)
+    above = workspace_documents.folder_chain(
+        await workspace_documents.user_folders(db, user_id), source.folder_id
+    )
+    if await workspace_documents.held_in_trash(
+        settings, user_id, folders=[row.id for row in above], documents=[source.id]
+    ):
+        raise ApiError(409, "invalid_request", STRANDED)
+    await workspace_documents.ensure_within_quota(db, settings, user_id, root)
+    job = await job_of(db, source.job_id) if source.job_id is not None else None
+    if job is not None:
+        await keep_parses(db, [job])
+    taken = await sibling_names(db, user_id, folder_id)
+    row = Document(
+        user_id=user_id,
+        folder_id=folder_id,
+        job_id=source.job_id,
+        kind=source.kind,
+        media_type=source.media_type,
+        size_bytes=source.size_bytes,
+        name=free_name(taken, source.name, DOCUMENT_NAME_MAX),
+    )
+    db.add(row)
+    await flush_or_retry(db, 0, FILE_CLASH)
+    documents = [copied(source, row, job, Path(), await donors_of(db, [source]))]
+    landed = await copy_then_commit(
+        db,
+        settings,
+        user_id,
+        await document_relative(db, source),
+        await document_relative(db, row),
+        documents,
+        folder=False,
+        landed=(Document, row.id),
+        author=author,
+    )
+    # A commit that raised and landed answers with the row as committed: the session
+    # rolled back.
+    return landed or row
+
+
+async def copy_folder(
+    db: AsyncSession,
+    settings: Settings,
+    user_id: int,
+    folder_id: int,
+    parent_id: int | None,
+    *,
+    author: str,
+) -> Folder:
+    """A copy of a folder with every live folder and document under it, in the same shape
+    (docs/workspace.md § Copies). The caller holds the backup lock shared and the
+    workspace lock."""
+    root = user_root(settings.workspaces_dir, user_id)
+    await workspace_documents.recover_trash(db, settings, user_id)
+    await lock_user(db, user_id)
+    source = await live_folder(db, user_id, folder_id)
+    folders = await workspace_documents.user_folders(db, user_id)
+    inside = own_subtree(folders, source.id)
+    if parent_id is not None:
+        await live_folder(db, user_id, parent_id)
+        if parent_id in inside:
+            raise ApiError(400, "invalid_request", "A folder cannot be copied inside itself")
+    await workspace_documents.ensure_within_quota(db, settings, user_id, root)
+    sources = (
+        (
+            await db.execute(
+                select(Document)
+                .where(
+                    Document.user_id == user_id,
+                    Document.folder_id.in_(inside),
+                    Document.trashed_at.is_(None),
+                )
+                .order_by(Document.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    above = workspace_documents.folder_chain(folders, source.parent_id)
+    if await workspace_documents.held_in_trash(
+        settings,
+        user_id,
+        folders=[*inside, *(row.id for row in above)],
+        documents=[document.id for document in sources],
+    ):
+        raise ApiError(409, "invalid_request", STRANDED)
+    job_ids = {document.job_id for document in sources if document.job_id is not None}
+    jobs = {
+        job.id: job for job in (await db.execute(select(Job).where(Job.id.in_(job_ids)))).scalars()
+    }
+    await keep_parses(db, list(jobs.values()))
+    taken = await sibling_names(db, user_id, parent_id)
+    top = Folder(
+        user_id=user_id,
+        parent_id=parent_id,
+        name=free_name(taken, source.name, FOLDER_NAME_MAX),
+    )
+    db.add(top)
+    await flush_or_retry(db, 0, FOLDER_CLASH)
+    # The folders under it parent by parent, so each new row has its new parent's id;
+    # their names were unique where they were, and are where they land.
+    mapping = {source.id: top.id}
+    pending = [source.id]
+    while pending:
+        parent = pending.pop(0)
+        for child in sorted(folders.values(), key=lambda row: row.id):
+            if child.parent_id == parent and child.id in inside and child.id not in mapping:
+                made = Folder(user_id=user_id, parent_id=mapping[parent], name=child.name)
+                db.add(made)
+                await db.flush()
+                mapping[child.id] = made.id
+                pending.append(child.id)
+    targets = []
+    for document in sources:
+        made = Document(
+            user_id=user_id,
+            folder_id=mapping[document.folder_id],
+            job_id=document.job_id,
+            kind=document.kind,
+            media_type=document.media_type,
+            size_bytes=document.size_bytes,
+            name=document.name,
+        )
+        db.add(made)
+        targets.append(made)
+    await db.flush()
+    donors = await donors_of(db, list(sources))
+    documents = []
+    for document, made in zip(sources, targets, strict=True):
+        chain = workspace_documents.folder_chain(folders, document.folder_id)
+        below = chain[[row.id for row in chain].index(source.id) + 1 :]
+        inner = Path(*(path_segment(row.name) for row in below), path_segment(document.name))
+        documents.append(
+            copied(
+                document,
+                made,
+                jobs.get(document.job_id) if document.job_id is not None else None,
+                inner,
+                donors,
+            )
+        )
+    landed = await copy_then_commit(
+        db,
+        settings,
+        user_id,
+        await folder_relative_dir(db, user_id, source.id),
+        await folder_relative_dir(db, user_id, top.id),
+        documents,
+        folder=True,
+        landed=(Folder, top.id),
+        author=author,
+    )
+    return landed or top

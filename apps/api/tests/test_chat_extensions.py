@@ -192,6 +192,7 @@ async def test_the_skills_are_the_builtins_then_the_readers_own(signed_in) -> No
         "builtin": False,
         "modified": False,
         "default": None,
+        "document_only": False,
     }
     # A name taken, or a built-in's, is never free (docs/chat.md § Skills).
     for taken in ("zh-summary", "fix-math"):
