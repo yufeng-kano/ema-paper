@@ -1,9 +1,10 @@
 """`python -m sightread.markdown_names [--dry-run]`: the one-time `.md` for the markdown
-documents named before 2026-11-03 (docs/self-hosting.md § One-time commands after an
-update, docs/workspace.md § Markdown documents). The operator runs it in the api container
-after the deploy; nothing runs it by itself. Each document is renamed as a rename on the
-Files page renames it — under the workspace lock, its directory moved and committed by
-the same `move_then_commit` — so a second run finds nothing left to rename.
+documents named before 2026-11-03, and a new name for any called `AGENTS.md`
+(docs/self-hosting.md § One-time commands after an update, docs/workspace.md § Markdown
+documents). The operator runs it in the api container after the deploy; nothing runs it
+by itself. Each document is renamed as a rename on the Files page renames it — under the
+workspace lock, its directory moved and committed by the same `move_then_commit` — so a
+second run finds nothing left to rename.
 """
 
 from __future__ import annotations
@@ -15,11 +16,11 @@ import logging
 import sys
 from itertools import groupby
 
-from sqlalchemy import select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import Settings, get_settings
-from .db.models import MARKDOWN_KIND, Document
+from .db.models import MARKDOWN_KIND, Document, Folder
 from .db.session import create_engine, create_sessionmaker
 from .errors import ApiError
 from .workspace import documents as workspace_documents
@@ -50,11 +51,25 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def _rename(db: AsyncSession, settings: Settings, row: Document, *, dry_run: bool) -> str:
+def needs_rename(name: str) -> bool:
+    """A name the rule does not allow a markdown document: one without the extension, and
+    `AGENTS.md`, which is the folder's instructions file (docs/workspace.md § Markdown
+    documents)."""
+    return name == AGENTS_FILE or not name.lower().endswith(MARKDOWN_EXTENSIONS)
+
+
+async def _rename(
+    db: AsyncSession,
+    settings: Settings,
+    row: Document,
+    folders: dict[int, Folder],
+    *,
+    dry_run: bool,
+) -> str:
     """What becomes of one document, as its line says it after the ids. The new name is
-    flushed, so the next document of the folder sees it taken, in a dry run too."""
+    flushed, so the next document of the folder sees it taken, in a dry run too. `folders`
+    is the user's, read once: the command renames documents, never a folder."""
     user_id, old = row.user_id, row.name
-    folders = await workspace_documents.user_folders(db, user_id)
     trashed = row.trashed_at is not None
     if not trashed and not workspace_documents.is_live(row, folders):
         # Its directory waits in the folder's Trash entry under its old name, where Put
@@ -88,14 +103,20 @@ async def _rename(db: AsyncSession, settings: Settings, row: Document, *, dry_ru
 
 
 async def run(args: argparse.Namespace, settings: Settings, db: AsyncSession) -> int:
-    rows = (
+    lowered = func.lower(Document.name)
+    planned = (
         await db.execute(
             select(Document.user_id, Document.id, Document.name)
-            .where(Document.kind == MARKDOWN_KIND)
+            .where(
+                Document.kind == MARKDOWN_KIND,
+                or_(
+                    and_(*(lowered.notlike(f"%{extension}") for extension in MARKDOWN_EXTENSIONS)),
+                    Document.name == AGENTS_FILE,
+                ),
+            )
             .order_by(Document.user_id, Document.id)
         )
     ).all()
-    planned = [row for row in rows if not row.name.lower().endswith(MARKDOWN_EXTENSIONS)]
     failed = False
     for user_id, group in groupby(planned, key=lambda row: row.user_id):
         named = [(row.id, row.name) for row in group]
@@ -106,12 +127,13 @@ async def run(args: argparse.Namespace, settings: Settings, db: AsyncSession) ->
         )
         try:
             async with lock:
+                folders = await workspace_documents.user_folders(db, user_id)
                 for document_id, name in named:
                     row = await db.get(Document, document_id, populate_existing=True)
-                    if row is None or row.name.lower().endswith(MARKDOWN_EXTENSIONS):
+                    if row is None or not needs_rename(row.name):
                         continue  # deleted or renamed since it was listed
                     try:
-                        said = await _rename(db, settings, row, dry_run=args.dry_run)
+                        said = await _rename(db, settings, row, folders, dry_run=args.dry_run)
                     except Exception as exc:  # noqa: BLE001 - reported, and the run goes on
                         logger.exception("could not rename document %d", document_id)
                         await db.rollback()

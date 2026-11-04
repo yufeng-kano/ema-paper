@@ -122,14 +122,14 @@ docker compose exec api python -m sightread.codes disable EMA-XXXX-XXXX-XXXX
 
 An update that needs something done once to existing data comes with a command for it, run in the api container like the codes CLI, by you, after the deploy — never by the update itself.
 
-**Markdown documents' names** (the update of 2026-11-04). A markdown document's name ends in `.md` since 2026-11-03; the ones written before then — *summary*, *Untitled* — get it from this command, once ([workspace.md](./workspace.md) § Markdown documents). Look at the plan first: `--dry-run` prints it and writes nothing.
+**Markdown documents' names** (the update of 2026-11-04). A markdown document's name ends in `.md` since 2026-11-03; the ones written before then — *summary*, *Untitled* — get it from this command, once, and one already called `AGENTS.md`, the name of a folder's instructions file, becomes `AGENTS (2).md` ([workspace.md](./workspace.md) § Markdown documents). Look at the plan first: `--dry-run` prints it and writes nothing.
 
 ```sh
 docker compose exec api python -m sightread.markdown_names --dry-run
 docker compose exec api python -m sightread.markdown_names
 ```
 
-It prints one line per markdown document named without the extension, tab-separated — the user id, the document id and `old name → new name`, or the old name and `skipped: <reason>`: a conversation about the document still answering, a document inside a folder in the Trash, or a workspace recovering from a shell command a worker died in. A rename that fails prints `failed: <reason>` and the run goes on. Each is renamed as a rename on the Files page renames it — its directory with it, as one revision — with ` (2)` where the folder already holds the new name; nothing else changes, since conversations, memories and tickets name a document by its id. It exits 0 unless something unexpected failed. Running it again renames nothing already renamed, so a run after the skipped conversations have answered — or the trashed folders were put back — picks up what was skipped.
+It prints one line per markdown document it renames or skips, tab-separated — the user id, the document id and `old name → new name`, or the old name and `skipped: <reason>`: a conversation about the document still answering, a document inside a folder in the Trash, or a workspace recovering from a shell command a worker died in. A rename that fails prints `failed: <reason>` and the run goes on. Each is renamed as a rename on the Files page renames it — its directory with it, as one revision — with ` (2)` where the folder already holds the new name; nothing else changes, since conversations, memories and tickets name a document by its id. It exits 0 unless something unexpected failed. Running it again renames nothing already renamed, so a run after the skipped conversations have answered — or the trashed folders were put back — picks up what was skipped.
 
 ## The operator console
 

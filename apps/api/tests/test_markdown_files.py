@@ -390,6 +390,8 @@ async def test_the_command_gives_old_markdown_documents_their_extension(
     await _folder(writer, "ideas.md")
     ideas = await _legacy(writer, "ideas")
     agents = await _legacy(writer, "AGENTS")
+    # Called AGENTS.md before the rule refused it: the folder's instructions file's name.
+    named = await _legacy(writer, "AGENTS.md", notes["id"])
     busy = await _legacy(writer, "busy")
     shelved = await _folder(writer, "Shelved")
     inner = await _legacy(writer, "inner", shelved["id"])
@@ -429,6 +431,7 @@ async def test_the_command_gives_old_markdown_documents_their_extension(
         f"{uid}\t{plan}\tplan → plan (2).md",
         f"{uid}\t{ideas}\tideas → ideas (2).md",
         f"{uid}\t{agents}\tAGENTS → AGENTS (2).md",
+        f"{uid}\t{named}\tAGENTS.md → AGENTS (2).md",
     ]
     skipped = [
         f"{uid}\t{busy}\tbusy\tskipped: {markdown_names.ANSWERING}",
@@ -455,8 +458,9 @@ async def test_the_command_gives_old_markdown_documents_their_extension(
         "old.md",
         "plan (2).md",
     )
-    assert (after[ideas], after[agents], after[theirs_id]) == (
+    assert (after[ideas], after[agents], after[named], after[theirs_id]) == (
         "ideas (2).md",
+        "AGENTS (2).md",
         "AGENTS (2).md",
         "theirs.md",
     )

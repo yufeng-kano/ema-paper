@@ -353,6 +353,8 @@ const notice = ref<string | null>(null)
 const writable = ref(true)
 /** Whether the markdown file ended with a newline as it was last read: a save keeps it. */
 let fileEndsWithNewline = false
+/** The markdown file's size as last read, for the read-only note's reason. */
+const loadedBytes = ref(0)
 
 /** The viewer edits when it has a document, that document's copy has been read, and it can be
  *  saved. */
@@ -416,13 +418,18 @@ async function loadContent(replaceDirty: Replace = false) {
         joined.value = false
         draft.value = ''
       }
-      if (content.markdown !== markdown.value) {
+      // A markdown file's final newline is held apart, as the blocks' serialization drops
+      // it: the working text then matches what a save of it sends back, and a reload of
+      // unchanged text is not taken for a change made elsewhere.
+      const loaded = props.markdownFile ? content.markdown.replace(/\r?\n$/, '') : content.markdown
+      if (loaded !== markdown.value) {
         undo.clear('document')
         closeOverBlocks()
       }
-      markdown.value = content.markdown
+      markdown.value = loaded
       revision.value = content.revision
-      fileEndsWithNewline = props.markdownFile && content.markdown.endsWith('\n')
+      fileEndsWithNewline = loaded !== content.markdown
+      loadedBytes.value = props.markdownFile ? new TextEncoder().encode(content.markdown).length : 0
       saveState.value = 'saved'
     } else if (saveState.value === 'saving') {
       // The save in flight was made against an older revision than what was just read:
@@ -4465,11 +4472,23 @@ function download(url: string) {
   anchor.click()
 }
 
-function onMoreSelect(key: string) {
+/**
+ * A markdown file's action from More: what the reader typed is saved first, so a copy
+ * carries it and a move to the Trash does not leave its save with no live file to land on.
+ * A save that failed, or did not settle, keeps the file where it is: the reader sees why,
+ * and the edit stays theirs to retry.
+ */
+async function fileAction(key: 'rename' | 'duplicate' | 'show' | 'trash') {
+  commitEdit()
+  // A save that settles with another asked for meanwhile sends that one next; a few
+  // rounds at most, as a save that keeps finding new text is a reader still typing.
+  for (let round = 0; round < 3 && saveState.value !== 'saved' && saveState.value !== 'failed'; round++) {
+    await saveContent()
+  }
+  if (saveState.value !== 'saved') {
+    return
+  }
   switch (key) {
-    case 'find':
-      void openFind()
-      return
     case 'rename':
       return emit('rename')
     case 'duplicate':
@@ -4478,6 +4497,20 @@ function onMoreSelect(key: string) {
       return emit('show')
     case 'trash':
       return emit('trash')
+  }
+}
+
+function onMoreSelect(key: string) {
+  switch (key) {
+    case 'find':
+      void openFind()
+      return
+    case 'rename':
+    case 'duplicate':
+    case 'show':
+    case 'trash':
+      void fileAction(key)
+      return
   }
   if (key === 'markdown' && !props.converted) {
     if (props.convertible) {
@@ -4874,8 +4907,12 @@ const readOnlyNote = computed(() => {
   if (!props.markdownFile || !contentLoaded.value || writable.value) {
     return null
   }
+  // Over the cap is the usual reason; the server refuses a file history would not record
+  // for a NUL byte too, at any size, and that one is not said to be too large.
   const cap = limits.value?.revision_max_bytes
-  return t('viewer.file.readOnly', { size: cap === undefined ? '' : formatBytes(cap) })
+  return cap !== undefined && loadedBytes.value > cap
+    ? t('viewer.file.readOnly', { size: formatBytes(cap) })
+    : t('viewer.file.readOnlyOther')
 })
 
 // --- the viewer's lifetime ----------------------------------------------------------------

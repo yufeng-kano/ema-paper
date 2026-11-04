@@ -1488,7 +1488,7 @@ async def create_document(body: DocumentCreate, user: SessionUser, db: DbSession
             build=lambda name: Document(
                 user_id=user_id, folder_id=folder_id, job_id=None, kind=MARKDOWN_KIND, name=name
             ),
-            taken=lambda: sibling_names(db, user_id, folder_id),
+            taken=lambda: sibling_names(db, user_id, folder_id, markdown=True),
             wanted=wanted,
             limit=DOCUMENT_NAME_MAX,
             message="A file with this name already exists here",
