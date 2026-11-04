@@ -200,7 +200,7 @@ usage_log        id PK, user_id FK, job_id FK NULL, turn_id FK chat_turns NULL,
                  INDEX (user_id, created_at)
                  INDEX (job_id)                   -- a job delete's SET NULL reads it
                  CHECK (cost_source IN (...) AND (cost_source = 'unknown') = (cost IS NULL))
-conversations    id PK, user_id FK, document_id FK documents, title, session,
+conversations    id PK, user_id FK, document_id FK documents NULL, title, session,
                  model NULL, memory_ids JSONB NULL, memory_file TEXT NULL,
                  agents_file TEXT NULL,
                  compacted_message_id NULL,          -- a messages.id, no FK (below)
@@ -208,10 +208,17 @@ conversations    id PK, user_id FK, document_id FK documents, title, session,
                  head_id NULL,                       -- a chat_turns.id, no FK (below)
                  created_at, updated_at
                  INDEX (document_id, updated_at)
+                 INDEX ix_conversations_library (user_id, updated_at)
+                       WHERE document_id IS NULL  -- the Files page's list
                  INDEX (cache_warm_until) WHERE cache_warm_until IS NOT NULL
                  INDEX (model)                    -- the console's count of what a price
                                                   -- removed would stop (admin.md § Settings)
-                 -- one thread of the chat agent about one document (chat.md);
+                 -- one thread of the chat agent about one document (chat.md), or,
+                 -- with `document_id` NULL, a library conversation: the Files
+                 -- page's thread about the whole library (chat.md § Library
+                 -- conversations); the key stays ON DELETE CASCADE, so deleting a
+                 -- document takes its own threads and never a library one, which
+                 -- goes only by its own delete or with the user;
                  -- `session` names its shell in the user's sandbox; `model` is
                  -- set by the first turn and kept: the stored thinking blocks
                  -- belong to it (chat.md § History); `memory_ids` is the memory
@@ -220,7 +227,8 @@ conversations    id PK, user_id FK, document_id FK documents, title, session,
                  -- memory.md its first turn took, NULL until then, '' for none,
                  -- taken again by a compaction (chat.md § Memory, *The memory
                  -- file*); `agents_file` the snapshot of the AGENTS.md files on
-                 -- the document's path, rendered, NULL until then, '' for none,
+                 -- the document's path — `files/AGENTS.md` alone for a library
+                 -- conversation — rendered, NULL until then, '' for none,
                  -- taken again by a compaction too (chat.md § AGENTS.md);
                  -- `compacted_message_id` the summary row the replay
                  -- starts from, NULL while never compacted — no foreign key:
@@ -503,6 +511,7 @@ runtime_settings key VARCHAR(64) PK,              -- one of the thirteen keys th
 - **The rename command migration** (`reserve the rename command`, 2026-11-01) changed no table: `/rename` became the composer's own command ([chat.md](./chat.md) § Skills), so a skill named `rename` was renamed to its reader's next free `rename-2`, `rename-3`…, as the compaction migration did for `new` and `compact`. Its downgrade changes nothing: the renamed skills keep their new names.
 - **The AGENTS.md migration** (`agents files and the init command`, 2026-11-02) added `conversations.agents_file`, nullable text, NULL on every row — a conversation already open takes its snapshot at its next compaction, a new one at its first turn ([chat.md](./chat.md) § AGENTS.md) — and reserved `init` as the composer's own command the way the rename command migration reserved `rename`: a skill named `init` was renamed to its reader's next free `init-2`, `init-3`…. Its downgrade drops the column and leaves the renamed skills their new names.
 - **The ticket filing migration** (`upload tickets file into the library`, 2026-11-04) added `upload_tickets.library_access` and `into_library`, NOT NULL with a server default of `false`, and `folder_id`, nullable, with its foreign key to `folders.id` `ON DELETE SET NULL` ([auth.md](./auth.md) § 5). Every existing ticket reads as one that files nothing and cannot retry a Files document, which is what it was minted as; they expire within the hour. Its downgrade drops the three columns.
+- **The library conversations migration** (`library conversations`, 2026-11-04, after `cfeffbf0a598`) dropped NOT NULL from `conversations.document_id` — the foreign key to `documents` stays `ON DELETE CASCADE` — and added `ix_conversations_library`, the partial index on `(user_id, updated_at)` `WHERE document_id IS NULL` (the same condition for PostgreSQL and the SQLite fallback) that the Files page's conversation list reads ([chat.md](./chat.md) § Library conversations). No row is read or rewritten: every existing conversation keeps its document. Its downgrade refuses while any conversation has no document, naming the count — restoring NOT NULL would otherwise have to delete the reader's library conversations with their messages, the way the markdown documents migration's downgrade refuses rather than delete markdown documents — and otherwise drops the index and restores NOT NULL. Delete the library conversations first, deliberately, if the downgrade is really wanted.
 - **A stored setting is the text, not the value it reads as.** `runtime_settings.value` is a JSON string holding exactly what `.env` would — `"0.002"`, `"[{\"planId\": \"pro\", …}]"` — never the number or the JSON it parses to: `jsonb` keeps no object key order, and `MODEL_PRICES_JSON`'s order is the chat agent's model order. The settings are parsed and checked from that text as from `.env` ([admin.md](./admin.md) § Settings).
 - **The console's tables say who may do what, and what was done; the permissions themselves are code.** `groups.permissions` is a JSON list rather than an array type (the SQLite fallback the tests run on has none), normalized before it is written and read whole — no query looks inside it — and the strings it may hold are `ALL_PERMISSIONS` ([admin.md](./admin.md) § Permissions), so a new permission needs no migration. One group carries `builtin`, which the code checks instead of a name. `audit_log` is append-only: a row is written in the transaction of the change it records and never updated or deleted, its `before` and `after` hold ids, amounts, flags, permission strings, group names, plan ids and dates as ISO 8601 strings — never an address, a person's name, content or a secret; who a row is about is joined from `users` when it is read — and `target_id` is text with no foreign key — a group's, an account's or a code's id, a job's UUID, a setting's key — the rule `jobs.connection_id` follows for history. The one free text a row holds is a grant's optional `reason` in `after`, the operator's own note, written under the same rule ([admin.md](./admin.md) § Users and grants); it stays when the account it is about is deleted, as the row does. A day grant's `after` also keeps the request's `request_id`, and that is the one query that looks inside `after`: a day grant sent again is found by `after ->> 'request_id'` among that account's `users.grant_days` rows — narrowed by the `(target_type, target_id)` index, under the account's row lock — since days have no row of their own to carry the id.
 - **The credit packs migration** (`credit packs`) created `credit_packs`, `credit_pack_entries` and `pack_checkouts`, empty, with their constraints and indexes ([billing.md](./billing.md) § The ledger). No existing row is read or rewritten: nothing changes for a user until a pack is bought. Its downgrade drops the three tables and nothing else — packs already bought are lost with them, so it is not run on a database that sold one.

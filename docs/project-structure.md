@@ -15,15 +15,20 @@ agent-sightread/
         auth/                 # oidc.py, sessions.py, api_keys.py, oauth_as.py, crypto.py, deps.py, upload_tickets.py, document_tickets.py
         routes/               # v1.py (data plane), control.py (/api, incl. /api/agents),
                               # library.py (/api/library — the web file library),
-                              # chat.py (/api/conversations, /api/sandbox),
+                              # chat.py (/api/conversations, a document's and the
+                              # library's conversation lists — /api/library/conversations
+                              # — and /api/sandbox),
                               # attachments.py (/api/attachments), extensions.py
                               # (/api/skills, /api/subagents), memories.py
                               # (/api/memories), oauth.py, admin.py (/api/admin —
                               # the operator console, docs/admin.md)
         agents/               # the agent registry (docs/agents.md); parse.py holds the
                               # parse agent's definition: default prompt, pipeline version;
-                              # chat.py the chat agent's system prompt and tool definitions;
-                              # skills.py and subagents.py the built-in skills and subagents;
+                              # chat.py the chat agent's system prompts — DEFAULT_SYSTEM_PROMPT
+                              # and a library conversation's LIBRARY_SYSTEM_PROMPT — and tool
+                              # definitions, the eight library tools among them;
+                              # skills.py and subagents.py the built-in skills and subagents,
+                              # each with its `document_only` flag;
                               # memory.py the memory block, its selection and text cleaning;
                               # check.py the check agent's prompt and tools;
                               # summary.py the summary model's title prompt and cleaning
@@ -49,13 +54,24 @@ agent-sightread/
                               # joins.py (the format check's program rules),
                               # attachments.py (the chat composer's files, prepared)
         workspace/            # the per-user file tree and its git revisions
-                              # (docs/workspace.md): layout.py, git.py, documents.py,
-                              # reconcile.py, trash.py (deleting for good: Empty Trash
-                              # and the Trash's expiry, one function), accounts.py (a
-                              # deleted account's marker and files), filing.py (names,
-                              # the suffixed insert, the folders a path names and the
-                              # filing of a file — what the upload route, the agent's
-                              # download and the connector's filing share)
+                              # (docs/workspace.md): layout.py, git.py, documents.py
+                              # (with the row lookups beside is_live: owned_folder,
+                              # owned_document, live_folder, live_document,
+                              # nearest_live, own_subtree, subtree_ids), reconcile.py,
+                              # trash.py (deleting for good: Empty Trash and the Trash's
+                              # expiry, one function; lock_user, refuse_while_answering,
+                              # read_row), accounts.py (a deleted account's marker and
+                              # files), filing.py (names, the suffixed insert, the
+                              # folders a path names and the filing of a file — what
+                              # the upload route, the agent's download and the
+                              # connector's filing share — and the Files page's
+                              # operations the library routes and the agent's library
+                              # tools share: make_folder, ensure_folders, new_document,
+                              # move_folder, move_document, copy_document, copy_folder,
+                              # trash_document, trash_folder, put_back_document,
+                              # put_back_folder, each run under the workspace lock its
+                              # caller holds and taking the commits' `author`;
+                              # docs/workspace.md § The page's operations are the agent's)
         sandbox/              # client.py: the HTTP client of the sandbox runner;
                               # egress.py: the list of sites the worker writes for the
                               # egress proxy (docs/sandbox.md § Network)
@@ -71,6 +87,11 @@ agent-sightread/
                               # chat_subagent.py (a subagent's nested loop),
                               # chat_tools.py, chat_events.py (the conversation stream),
                               # chat_memory.py (a turn's memory snapshot, the memory tool),
+                              # chat_library.py (a library conversation's eight library
+                              # tools: the path resolver convert_file shares, list_files'
+                              # listing, each tool's call into workspace/filing.py, its
+                              # sentences and its undo record — docs/chat.md § Library
+                              # conversations),
                               # chat_web.py (the web tools: Brave search, OpenAlex, the
                               # guarded fetch, reading a URL, downloading into Files),
                               # summary.py (one summary-model call: `/rename`'s title)
@@ -91,6 +112,12 @@ agent-sightread/
                               # lib/admin.ts (pure: areas, nav, permission checks; vitest),
                               # lib/chart.ts (the usage chart's geometry; vitest),
                               # components/admin/
+                              # the Files page's Agent card (docs/web.md § The Files
+                              # page's Agent card): components/FilesAgent.vue — the card,
+                              # its grip and the phone sheet around ChatPanel in library
+                              # mode; the library body in lib/library.ts, the library
+                              # tools' steps in lib/steps.ts, the Files links in
+                              # lib/markdown.ts (pure; vitest)
       server/routes/          # robots.txt and sitemap.xml, prerendered; no API (docs/web.md § Search engines)
       shared/                 # framework-free code nuxt.config.ts, the app and server/ all read
       package.json
@@ -113,7 +140,7 @@ agent-sightread/
 - `routes/*` and `mcp/*` are thin: validation + auth + calls into `jobs`/`parsing` services. MCP owns zero business logic. `jobs/intake.py` is the shared sequence **all three** entry points run (store → hash → probe → dedup → enqueue), so REST, MCP and the web library's upload cannot drift apart — `routes/library.py` adds a name and a folder to the job that sequence returns, nothing more.
 - `parsing/poppler.py` is the **only** place that spawns Poppler; everything else consumes its typed results. No PDF library imports anywhere (AGPL ban, [parsing.md](./parsing.md)).
 - `upstream/` is the only package that talks to the upstream, Kano Proxy on the operator's key: `client.py` for vision calls and the catalog, `anthropic.py` for the chat and check agents' Messages API calls — the only modules that ever read `KANO_PROXY_API_KEY`.
-- Nothing in `jobs/` or `workspace/` imports from `routes/`: what a route and the worker both run — *Empty Trash* and the Trash's expiry, the locks and the commit-then-discard they share — lives in `workspace/`, and the routes import it from there.
+- Nothing in `jobs/` or `workspace/` imports from `routes/`: what a route and the worker both run — *Empty Trash* and the Trash's expiry, the locks and the commit-then-discard they share, and the Files page's operations the agent's library tools run (a new folder or document, a move or a rename, a copy, Move to Trash and Put Back, in `workspace/filing.py`) — lives in `workspace/`, and the routes import it from there. They sit in `filing.py` rather than `trash.py` because `filing.py` already imports `trash.py`'s locks, and the Trash's half needs `filing.py`'s names: one module, no cycle. The routes keep what is theirs: the payloads, the bodies' validation, *Delete Immediately*, and the workspace lock taken around each call.
 - `workspace/` is the only package that touches `WORKSPACES_DIR` and the only one that runs git; `sandbox/client.py` is the only module that calls the runner. The runner (`apps/sandbox`) is the only process with the Docker socket; the egress proxy beside it reads one file the worker writes (`sandbox/egress.py`) and talks to nothing of the service.
 - `agents/` defines agents and nothing else: no HTTP, no database. Runners and settings consume its definitions ([agents.md](./agents.md)).
 - `jobs/queue.py` is the only module that knows the queue is Postgres.
