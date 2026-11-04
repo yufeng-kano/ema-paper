@@ -255,14 +255,19 @@ async def test_a_retry_with_nothing_to_retry_is_refused_and_spends_nothing(
     assert (ticket.spent_at, ticket.job_id) == (None, None)
     assert _uploads(api) == []
 
-    # A failed parse behind a library document is the library's to retry, not the API's.
+    # A failed parse behind a library document is the library's to retry: a ticket minted
+    # under a grant that does not reach the library is refused, and spends nothing (the
+    # retry through one that does is in test_data_plane_filing.py).
     filed = await _library_upload(api, documents["mixed_pdf"])
     await _drain_queue(api, sessionmaker)
     assert (await _job(sessionmaker, filed["job_id"])).status == "failed"
-    refused = await _parse(api, documents["mixed_pdf"], retry="true")
+    refused = await _parse(api, documents["mixed_pdf"], token, retry="true")
     assert refused.status_code == 409, refused.text
     assert "a Files document's" in refused.json()["error"]["message"]
     assert (await _job(sessionmaker, filed["job_id"])).status == "failed"
+    async with sessionmaker() as db:
+        ticket = (await db.execute(select(UploadTicket))).scalars().one()
+    assert (ticket.spent_at, ticket.job_id) == (None, None)
 
 
 @respx.mock

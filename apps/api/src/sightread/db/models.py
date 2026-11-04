@@ -793,6 +793,9 @@ class UploadTicket(Base):
 
     Unspent it authenticates one `POST /v1/parse`; spending it binds `job_id`, after which
     it only reads that one job. `token_hash` is the SHA-256 of the `srt_...` plaintext.
+    `library_access` says the minting grant reached the library; `into_library` that the
+    upload is filed into Files, in `folder_id` — NULL the top level (docs/mcp.md § Filing
+    into Files).
     """
 
     __tablename__ = "upload_tickets"
@@ -809,6 +812,14 @@ class UploadTicket(Base):
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     expires_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ)
     spent_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
+    library_access: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false")
+    )
+    into_library: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    folder_id: Mapped[int | None] = mapped_column(
+        ForeignKey("folders.id", name="fk_upload_tickets_folder_id_folders", ondelete="SET NULL"),
+        nullable=True,
+    )
 
 
 class DocumentTicket(Base):
