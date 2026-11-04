@@ -9,7 +9,9 @@ text back over `/v1/library/documents/{id}` (docs/mcp.md § The library tools). 
 decision, no model choice, no queue knowledge and no workspace write lives here, so an MCP
 spec change touches this file alone (docs/project-structure.md § Boundaries). What makes a
 connector parse behave as a Files upload does — the check, the crops, the retry, the
-in-flight join — is the data plane's (docs/mcp.md § The `parse` tool).
+in-flight join — is the data plane's (docs/mcp.md § The `parse` tool), and so is filing
+one into Files: `parse` with `folder` finds or makes the folder through the data plane's
+own function and mints a ticket that files there (docs/mcp.md § Filing into Files).
 """
 
 from __future__ import annotations
@@ -34,12 +36,12 @@ from starlette.types import Receive, Scope, Send
 from ..agents import PARSE
 from ..auth import document_tickets, upload_tickets
 from ..auth.deps import LIBRARY_SCOPE_MESSAGE, bearer_credential, resolve_bearer_identity
-from ..auth.oauth_as import LIBRARY_SCOPE
 from ..db.models import FILE_KIND, Document, Job, User
 from ..errors import ApiError, error_response
-from ..routes.v1 import document_entry, library_index
+from ..routes.v1 import FOLDER_PATH_MAX, document_entry, library_index
 from ..upstream.client import offered_models
 from ..workspace import documents as workspace_documents
+from ..workspace import filing
 from ..workspace.layout import path_segment, user_root
 
 MCP_PATH = "/mcp"
@@ -91,6 +93,39 @@ NOTES = (
     "or expired, call `parse` again for a fresh one. Re-uploading the same file joins "
     "its parse while it runs and returns it once it has succeeded, so re-running a "
     "command your shell cut off costs nothing."
+)
+
+# A filing ticket's notes, after NOTES (docs/mcp.md § Filing into Files). A file parsed before
+# is filed free only as the same parse, which the dedup cache answers; `{age}` is how recent.
+FILED_NOTES = (
+    "This ticket files the parse into the reader's Ema Paper Files library, in {where}. "
+    "Once `upload` succeeds, the document is in that folder under the uploaded file's "
+    "name; a name already taken there gets a ` (2)` suffix. For a readable entry, copy the "
+    "file under a readable name (e.g. `cp 2508.10104v1.pdf DINOv3.pdf`) and set `f` to the "
+    "copy; never rename the reader's own file. It is filed as if the reader had uploaded "
+    "it on the Files page: its original kept, shown at once, opening when the parse "
+    "succeeds, kept until the reader deletes it. If that folder already holds this same "
+    "parse (an earlier run of the command, or the reader's own upload), the upload answers "
+    "with that document and adds no second copy. A filed parse covers every page, so "
+    "`-F pages=` is refused. A file you parsed before is filed from that parse, not parsed "
+    "or charged again, only when the earlier upload sent no `-F pages=`, this upload sends "
+    "the same `-F model=` (none if it sent none), and that parse succeeded{age}; otherwise "
+    "every page is parsed and charged, so tell the reader before you run it. A refused "
+    "filing (`storage_full`: the reader's storage is full) files nothing and makes "
+    "`upload` exit non-zero. If the parse fails, the document shows as failed in Files: "
+    "call `parse` without `folder` for a fresh ticket and run `retry`, which retries the "
+    "document where it is. The .md you land is a copy: to change the document in Ema "
+    "Paper, find its id with list_library and use read_document and write_document."
+)
+# An unfiled ticket's way into Files, for a caller that reaches the library.
+UNFILED_NOTES = (
+    " An `upload` on this ticket adds nothing to the reader's Files library. To keep a "
+    "paper in Ema Paper, call `parse` with `folder` and run `upload` again with the same "
+    "file: it is filed from this parse, not parsed or charged again, only when this "
+    "ticket's upload sent no `-F pages=` and its parse succeeded, and the filing upload "
+    "sends the same `-F model=` (none if this one sent none){age}; otherwise every page is "
+    "parsed and charged. A `retry` on this ticket resumes a failed parse where it is, a "
+    "Files document's in Files."
 )
 
 # The library tools' own notes (docs/mcp.md § The library tools).
@@ -196,13 +231,22 @@ def build_server(app: FastAPI) -> MCPServer:
         "Ema Paper",
         instructions=(
             "Parse PDFs and images into the markdown document the Ema Paper web reader "
-            "opens, with its figures. Call `parse` for a single-use upload ticket and "
-            "ready-to-run curl commands, then run them in your shell: the file goes "
-            "straight to the REST endpoint and the result lands on disk, never through "
-            "this connection. " + COORDINATE_CONTRACT + " The library tools read the "
-            "reader's Files library the same way: `list_library` finds a document, "
-            "`read_document` gives the commands that land its text, notes and figures on "
-            "disk, `write_document` the command that saves edited text or notes back."
+            "opens, with its figures, and keep them in the reader's Files library when "
+            "asked. Call `parse` for a single-use upload ticket and ready-to-run curl "
+            "commands, then run them in your shell: the file goes straight to the REST "
+            "endpoint and the result lands on disk, never through this connection. To keep "
+            "a paper in Ema Paper (the reader asks to save, keep or file it there, or "
+            "names a folder of their Ema Paper Files library, not a directory on disk), "
+            "pass `parse` a `folder`: a folder path exactly as `list_library` lists it, or "
+            "`/` for the top level. The parsed document then appears in that Files folder "
+            "as if the reader had uploaded it there. A paper parsed earlier without a "
+            "folder is filed from that parse, without being parsed or charged again, when "
+            "it is the same parse (the notes say when). Without `folder`, nothing is added "
+            "to Files. " + COORDINATE_CONTRACT + " "
+            "The library tools read the reader's Files library the same way: "
+            "`list_library` finds a document or a folder path, `read_document` gives the "
+            "commands that land its text, notes and figures on disk, `write_document` the "
+            "command that saves edited text or notes back."
         ),
     )
 
@@ -211,17 +255,105 @@ def build_server(app: FastAPI) -> MCPServer:
             "Start a parse, or the retry of a failed one: returns a single-use upload "
             "ticket and the exact curl commands that upload a PDF or image and land the "
             "parsed document as a markdown file named after it (page markers included), "
-            "and its figures. Takes no arguments — do not send file content here; set "
-            "`f=` to your file and run the returned `upload` command in your shell. "
-            + COORDINATE_CONTRACT
-        )
+            "and its figures. Do not send file content here; set `f=` to your file and run "
+            "the returned `upload` command in your shell. One ticket per file. "
+            "`folder` also files the parsed document into the reader's Ema Paper Files "
+            "library, as an upload on the Files page does: pass it when the reader wants "
+            "the paper kept in Ema Paper or names a folder of their Files library (not a "
+            "directory on disk), and leave it out otherwise. Take the path from "
+            "list_library exactly as listed, since names are case-sensitive and a path "
+            "that matches no folder creates the missing ones: only name a new folder when "
+            "the reader asked for one. To file a paper you parsed without a folder, call "
+            "parse with the folder and run upload again with the same file: it is filed "
+            "from the earlier parse, not charged again, when it is the same parse (the "
+            "notes say when). To retry a failed parse, filed or not, call parse without "
+            "`folder`. " + COORDINATE_CONTRACT
+        ),
+        # It may make folders and file a document; it never removes or overwrites one.
+        annotations=ToolAnnotations(
+            read_only_hint=False, destructive_hint=False, open_world_hint=False
+        ),
     )
-    async def parse() -> dict[str, Any]:
+    async def parse(
+        folder: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Optional. A folder path in the reader's Files library exactly as "
+                    "list_library lists it (e.g. Papers/2024), or / for the top level. The "
+                    "parsed document is filed there; folders on the path that do not exist "
+                    "are created. Leave it out to keep the parse out of Files."
+                ),
+                max_length=FOLDER_PATH_MAX,
+            ),
+        ] = None,
+    ) -> dict[str, Any]:
         async with app.state.sessionmaker() as db:
             # The settings in effect, the database's overrides on `.env`'s, as every route
             # reads them — the parse models among them (docs/admin.md § Settings).
             settings = await app.state.runtime_settings.current(db)
-            ticket, token = await upload_tickets.mint(db, settings, await _current_user(db))
+            user = await _current_user(db)
+            user_id = user.id
+            library_access = _current_library.get()
+            destination = None
+            if folder is not None:
+                if not library_access:
+                    raise PermissionError(LIBRARY_SCOPE_MESSAGE)
+                if not folder.strip():
+                    raise ValueError(
+                        "`folder` is empty: give a folder path from list_library, or / for "
+                        "the top level of Files"
+                    )
+                # The rate first, so a call it refuses makes no folder nobody is told of.
+                await upload_tickets.check_mint_rate(db, settings, user_id)
+                # Found or made by the data plane's own function (docs/mcp.md § Filing
+                # into Files), before the ticket that carries it is minted.
+                destination = await filing.find_or_make_folder_path(db, settings, user_id, folder)
+                user = await _current_user(db)
+            ticket, token = await upload_tickets.mint(
+                db,
+                settings,
+                user,
+                library_access=library_access,
+                into_library=destination is not None,
+                folder_id=None if destination is None else destination["id"],
+            )
+
+        # How recent a parse must be to be filed free: the dedup cache keeps a day's margin
+        # before the retention (docs/mcp.md § Filing into Files, *Already parsed*), so with
+        # a one-day retention none is, and with none any is.
+        retention = settings.parse_retention_days
+        never = " (never on this service, which keeps a parse 1 day)" if retention == 1 else None
+        if destination is not None:
+            where = (
+                "the top level of Files"
+                if destination["id"] is None
+                else f"Files › {destination['path']}"
+            )
+            age = never or ("" if retention == 0 else f" less than {retention - 1} days ago")
+            notes = f"{NOTES} {FILED_NOTES.format(where=where, age=age)}"
+            if destination["created"]:
+                notes += (
+                    " This call created the folder(s) "
+                    + ", ".join(destination["created"])
+                    + ": tell the reader."
+                )
+        else:
+            # A connector's parse is in no library, so the retention deletes it; how soon
+            # is the deployment's own setting (docs/mcp.md § The `parse` tool, docs/jobs.md
+            # § Retention).
+            notes = (
+                NOTES
+                if settings.parse_retention_days == 0
+                else f"{NOTES} A parse an `upload` on this ticket makes is kept "
+                f"{settings.parse_retention_days} days after it finishes and then deleted: "
+                "the .md you landed is the copy that lasts."
+            )
+            if library_access:
+                notes += UNFILED_NOTES.format(
+                    age=never
+                    or ("" if retention == 0 else f", within {retention - 1} days of its end")
+                )
 
         base = settings.app_url.rstrip("/")
         auth = f"-H 'Authorization: Bearer {token}'"
@@ -235,7 +367,7 @@ def build_server(app: FastAPI) -> MCPServer:
             f"""s="${{f%.*}}.progress.sse"; rm -f "$s"; """
             f"curl -sSN {auth} -H 'Accept: text/event-stream'"
         )
-        return {
+        answer: dict[str, Any] = {
             "token": token,
             "expires_at": _stamp(ticket.expires_at),
             "max_upload_bytes": settings.upload_max_bytes,
@@ -270,22 +402,18 @@ def build_server(app: FastAPI) -> MCPServer:
                 f'done; [ "$rc" = 0 ]; }}'
             ),
             "status": f"curl -sS {auth} {base}/v1/jobs/last",
-            # A connector's parse is in no library, so the retention deletes it; how soon
-            # is the deployment's own setting (docs/mcp.md § The `parse` tool, docs/jobs.md
-            # § Retention).
-            "notes": (
-                NOTES
-                if settings.parse_retention_days == 0
-                else f"{NOTES} A parse is kept {settings.parse_retention_days} days after it "
-                "finishes and then deleted: the .md you landed is the copy that lasts."
-            ),
+            "notes": notes,
         }
+        if destination is not None:
+            answer["folder"] = destination
+        return answer
 
     @server.tool(
         description=(
             "List the reader's Ema Paper Files library: folders and documents (parsed "
             "PDFs and images, markdown documents, kept files) with their ids and paths. "
-            "Use it to find the `document_id` for read_document or write_document. "
+            "Use it to find the `document_id` for read_document or write_document, and a "
+            "folder `path` for parse's `folder`. "
             "Optional: `folder`, a folder's path as listed (that folder and everything "
             "below it), and `name`, part of a document's name. When `truncated` is true, "
             "narrow by folder or name."
@@ -492,9 +620,7 @@ class BearerGuard:
             return
 
         user_token = _current_user_id.set(identity.user.id)
-        library_token = _current_library.set(
-            identity.scopes is None or LIBRARY_SCOPE in identity.scopes
-        )
+        library_token = _current_library.set(identity.library)
         try:
             await self._transport(scope, receive, send)
         finally:

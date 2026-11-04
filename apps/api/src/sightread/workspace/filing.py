@@ -26,11 +26,15 @@ from . import documents as workspace_documents
 from . import safe_io
 from .agents_file import AGENTS_FILE
 from .layout import FILES_DIR, document_relative_dir, path_segment, segment_name, user_root
+from .locks import workspace_lock
 from .trash import lock_user, read_row
 
 logger = logging.getLogger(__name__)
 
 FOLDER_NAME_MAX = 255
+# A path of folders made in one call: far past any reader's nesting, and far short of the
+# depth a storage walk stops measuring at (`safe_io.DEPTH_MAX`).
+FOLDER_PATH_DEPTH_MAX = 64
 DOCUMENT_NAME_MAX = 512
 # How many " (2)" attempts a colliding name gets before the folder is simply too crowded.
 NAME_ATTEMPTS = 500
@@ -348,32 +352,89 @@ async def make_folder(
     return row
 
 
+def live_child(folders: dict[int, Folder], parent_id: int | None, name: str) -> Folder | None:
+    """The live folder of that cleaned name directly under `parent_id` (None: the top
+    level), among the user's folders as `user_folders` reads them."""
+    trashed = workspace_documents.trashed_folder_ids(folders.values())
+    return next(
+        (
+            folder
+            for folder in folders.values()
+            if folder.parent_id == parent_id and folder.name == name and folder.id not in trashed
+        ),
+        None,
+    )
+
+
 async def ensure_folders(
     db: AsyncSession, settings: Settings, user_id: int, names: list[str]
 ) -> int | None:
     """The folder at the end of a path of names — `Papers`, then `2024` inside it — each
     found among the user's live folders by its cleaned name or made where it is missing
-    (docs/chat.md § Tools, `download_file`). None for an empty path: the top level. The
-    caller holds the workspace lock."""
-    parent_id: int | None = None
-    for raw in names:
-        wanted = clean_name(raw, FOLDER_NAME_MAX)
-        folders = await workspace_documents.user_folders(db, user_id)
-        trashed = workspace_documents.trashed_folder_ids(folders.values())
-        found = next(
-            (
-                folder
-                for folder in folders.values()
-                if folder.parent_id == parent_id
-                and folder.name == wanted
-                and folder.id not in trashed
-            ),
-            None,
+    (docs/chat.md § Tools, `download_file`; docs/mcp.md § Filing into Files). None for an
+    empty path: the top level. A name a live document holds where a folder would be made
+    is refused (409): made under a suffixed name, the folder would be made again at every
+    call that names it. Every name is checked before the first is made, and a path past
+    `FOLDER_PATH_DEPTH_MAX` names is refused (400). The caller holds the workspace lock."""
+    if len(names) > FOLDER_PATH_DEPTH_MAX:
+        raise ApiError(
+            400, "invalid_request", f"A folder path is at most {FOLDER_PATH_DEPTH_MAX} folders deep"
         )
+    cleaned = [clean_name(raw, FOLDER_NAME_MAX) for raw in names]
+    parent_id: int | None = None
+    for wanted in cleaned:
+        folders = await workspace_documents.user_folders(db, user_id)
+        found = live_child(folders, parent_id, wanted)
         if found is None:
+            # No live folder holds the name here, so a name still taken is a document's.
+            if wanted in await sibling_names(db, user_id, parent_id):
+                raise ApiError(
+                    409,
+                    "invalid_request",
+                    f"'{wanted}' is a document here, not a folder; name another folder",
+                )
             found = await make_folder(db, settings, user_id, parent_id, wanted)
         parent_id = found.id
     return parent_id
+
+
+async def find_or_make_folder_path(
+    db: AsyncSession, settings: Settings, user_id: int, path: str
+) -> dict:
+    """The folder a data-plane parse is filed into (docs/mcp.md § Filing into Files): a
+    path as `list_library` shows it — `Papers/2024`, or `/` for the top level — each name
+    found among the live folders under the one before it and the missing ones made by
+    `ensure_folders`, under the workspace lock. The parse tool's `folder` and
+    `POST /v1/parse`'s. Every name is checked before anything is made, and a path whose
+    folders all exist is answered without the lock, which a shell command in a conversation
+    holds for its whole run. Answers `{id, path, created}`: the folder (None at the top
+    level), its path as the library shows it, and the paths this call made."""
+    names = [clean_name(part, FOLDER_NAME_MAX) for part in path.split("/") if part.strip()]
+    if any(name in (".", "..") for name in names):
+        raise ApiError(400, "invalid_request", "A folder path has no '.' or '..' in it")
+    folders = await workspace_documents.user_folders(db, user_id)
+    found: Folder | None = None
+    for name in names:
+        found = live_child(folders, None if found is None else found.id, name)
+        if found is None:
+            break
+    folder_id = None if found is None else found.id
+    made: list[Folder] = []
+    if found is None and names:
+        async with workspace_lock(user_root(settings.workspaces_dir, user_id)):
+            before = set(await workspace_documents.user_folders(db, user_id))
+            folder_id = await ensure_folders(db, settings, user_id, names)
+            folders = await workspace_documents.user_folders(db, user_id)
+        made = [folder for key, folder in folders.items() if key not in before]
+
+    def shown(folder_id: int) -> str:
+        return "/".join(row.name for row in workspace_documents.folder_chain(folders, folder_id))
+
+    return {
+        "id": folder_id,
+        "path": "/" if folder_id is None else shown(folder_id),
+        "created": sorted(shown(row.id) for row in made),
+    }
 
 
 async def keep_file(

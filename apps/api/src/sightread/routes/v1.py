@@ -8,7 +8,9 @@ reading copy returned as `markdown`, its crops served, a failed one retried and 
 flight joined — so the connector, whose commands are these routes, behaves as the web does.
 
 The library here is the control plane's reads and its two saves on a data-plane credential
-(docs/api.md § The library on the data plane): the same functions, a different door.
+(docs/api.md § The library on the data plane): the same functions, a different door. A parse
+filed into Files is the library's own upload filing, `library.file_parse` (docs/mcp.md
+§ Filing into Files).
 """
 
 from __future__ import annotations
@@ -19,12 +21,13 @@ from collections.abc import AsyncIterator
 from fastapi import APIRouter, Query, Request, Response, status
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
-from sqlalchemy import select
+from sqlalchemy import inspect, select
 from starlette.datastructures import UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser
 
 from ..agents import PARSE
 from ..auth.deps import (
+    LIBRARY_SCOPE_MESSAGE,
     AppSettings,
     DbSession,
     DocumentReader,
@@ -45,13 +48,14 @@ from ..jobs.intake import (
     base64_chunks,
     cached_payload,
     capped_stream,
+    retry_filed_parse,
     submit_parse,
     upload_chunks,
 )
 from ..jobs.runner import result_payload
 from ..upstream.client import agent_models
 from ..workspace import documents as workspace_documents
-from ..workspace import git
+from ..workspace import filing, git
 from ..workspace.layout import user_root
 from . import library
 from .library import figure_crop_response
@@ -59,6 +63,8 @@ from .library import figure_crop_response
 router = APIRouter(prefix="/v1", tags=["data"])
 
 SSE_MEDIA_TYPE = "text/event-stream"
+# A folder path's own bound, as a name has one: room for a deep tree of long names.
+FOLDER_PATH_MAX = 2048
 
 
 class ParseJson(BaseModel):
@@ -71,6 +77,7 @@ class ParseJson(BaseModel):
     pages: str | None = Field(default=None, max_length=255)
     force: bool = False
     retry: bool = False
+    folder: str | None = Field(default=None, max_length=FOLDER_PATH_MAX)
 
 
 @router.get("/models")
@@ -99,7 +106,7 @@ def _form_flag(form, field: str) -> bool:
         raise ApiError(400, "invalid_request", f"'{field}' must be true or false") from exc
 
 
-def _cached_response(result: Result, wants_stream: bool) -> Response:
+def _cached_response(result: Result, wants_stream: bool, document_id: int | None) -> Response:
     payload = cached_payload(result)
 
     async def single_event() -> AsyncIterator[str]:
@@ -107,6 +114,10 @@ def _cached_response(result: Result, wants_stream: bool) -> Response:
 
     if wants_stream:
         return StreamingResponse(single_event(), media_type=SSE_MEDIA_TYPE)
+    # A filed parse names its Files document in the JSON answers, never in the stream,
+    # whose `done` event is the result as every parse's is (docs/api.md § POST /v1/parse).
+    if document_id is not None:
+        payload["document_id"] = document_id
     return JSONResponse(payload)
 
 
@@ -116,7 +127,9 @@ async def parse(request: Request, caller: UploaderCaller, db: DbSession, setting
 
     Transport only: reading the body is this route's job, the intake sequence behind it is
     `jobs.intake` (docs/project-structure.md). An upload ticket is spent by that same
-    intake transaction, so a request refused before a job exists keeps it usable.
+    intake transaction, so a request refused before a job exists keeps it usable; a filing
+    refused after it gives the ticket back (`library.file_parse`), and a Files document's
+    retry spends it in the commit that requeues the parse (`intake.retry_filed_parse`).
     """
     content_type = request.headers.get("content-type", "")
     wants_stream = SSE_MEDIA_TYPE in request.headers.get("accept", "")
@@ -144,12 +157,15 @@ async def parse(request: Request, caller: UploaderCaller, db: DbSession, setting
             raise ApiError(400, "invalid_request", "Multipart requests need a 'file' part")
         filename = upload.filename or "upload"
         media_type = upload.content_type or ""
-        model, pages, force, retry = (
+        model, pages, force, retry, folder = (
             _form_value(form, "model"),
             _form_value(form, "pages"),
             _form_flag(form, "force"),
             _form_flag(form, "retry"),
+            _form_value(form, "folder"),
         )
+        if folder is not None and len(folder) > FOLDER_PATH_MAX:
+            raise ApiError(400, "invalid_request", "'folder' is too long")
         chunks = upload_chunks(upload)
     else:
         try:
@@ -160,28 +176,125 @@ async def parse(request: Request, caller: UploaderCaller, db: DbSession, setting
             ) from exc
         filename, media_type = body.filename, body.media_type
         model, pages, force, retry = body.model, body.pages, body.force, body.retry
+        folder = body.folder.strip() if body.folder and body.folder.strip() else None
         chunks = base64_chunks(body.source)
 
-    submission = await submit_parse(
-        db,
-        settings,
-        user=caller.user,
-        chunks=chunks,
-        media_type=media_type,
-        filename=filename,
-        model=model,
-        pages=pages,
-        force=force,
-        ticket=caller.ticket,
-        # As the web library's upload: the same bytes in flight are joined, never bought
-        # twice, and the parse is checked (docs/jobs.md § Dedup cache, docs/parsing.md
-        # § Format check).
-        reuse_in_flight=True,
-        check=True,
-        retry=retry,
-    )
+    # Primitives first: an intake that rolls back expires the rows the request resolved.
+    user_id = caller.user.id
+    ticket = caller.ticket
+    ticket_id = None if ticket is None else ticket.id
+    # Where the parse goes (docs/mcp.md § Filing into Files): a ticket's destination was
+    # chosen when the parse tool minted it, under the library's scope; a durable
+    # credential names one with `folder`, which needs the library too.
+    filed, folder_id = False, None
+    if ticket is not None:
+        if folder is not None:
+            raise ApiError(
+                400,
+                "invalid_request",
+                "An upload ticket files where the parse tool's `folder` said: call parse with "
+                "`folder` for a ticket that files there, and send no 'folder' field",
+            )
+        filed, folder_id = ticket.into_library, ticket.folder_id
+        if filed and retry:
+            raise ApiError(
+                400,
+                "invalid_request",
+                "'retry' resumes a parse where it is, Files included, and files nothing: call "
+                "parse without `folder` for the retry's ticket",
+            )
+    elif folder is not None:
+        if not caller.library:
+            raise ApiError(403, "auth", LIBRARY_SCOPE_MESSAGE)
+        if retry:
+            raise ApiError(
+                400,
+                "invalid_request",
+                "'retry' resumes a parse where it is; send it without 'folder'",
+            )
+        filed = True
+
+    document_id = None
+    if filed:
+        if pages is not None:
+            raise ApiError(
+                400,
+                "invalid_request",
+                "A parse filed into Files covers every page: without 'pages' every page is "
+                "parsed and charged, unless that whole document was parsed before; or parse "
+                "it without a folder",
+            )
+        if folder is not None:
+            folder_id = (await filing.find_or_make_folder_path(db, settings, user_id, folder))["id"]
+            # Read again: a folder insert that retried rolled back, expiring the caller's row.
+            await db.refresh(caller.user)
+        elif folder_id is not None and not await filing.folder_exists(db, user_id, folder_id):
+            raise ApiError(
+                404,
+                "invalid_request",
+                "The folder this ticket files into is in the Trash: call parse again with "
+                "another folder",
+            )
+        # The library's own filing, as a Files upload with converting on: the original
+        # kept, the row named after the file — and the same parse already in the folder
+        # is answered as it is, so a command run again files no twin.
+        submission, row = await library.file_parse(
+            chunks,
+            filename,
+            media_type,
+            user=caller.user,
+            folder_id=folder_id,
+            db=db,
+            settings=settings,
+            model=model,
+            force=force,
+            ticket=ticket,
+            reuse_filed=True,
+        )
+        document_id = row.id
+        # A filing that retried its insert rolled back, which expires what intake answered.
+        for answered in (submission.job, submission.cached):
+            if answered is not None and inspect(answered).expired:
+                await db.refresh(answered)
+    else:
+        submission = await submit_parse(
+            db,
+            settings,
+            user=caller.user,
+            chunks=chunks,
+            media_type=media_type,
+            filename=filename,
+            model=model,
+            pages=pages,
+            force=force,
+            ticket=ticket,
+            # As the web library's upload: the same bytes in flight are joined, never
+            # bought twice, and the parse is checked (docs/jobs.md § Dedup cache,
+            # docs/parsing.md § Format check).
+            reuse_in_flight=True,
+            check=True,
+            retry=retry,
+            # A Files document's failed parse is retried as the library retries it, by a
+            # caller whose rights reach the library (docs/jobs.md § Retrying failed pages).
+            library_retry=caller.library,
+        )
+    if submission.library_retry is not None:
+        retried = await retry_filed_parse(
+            db,
+            settings,
+            user_id=user_id,
+            ticket_id=ticket_id,
+            job_id=submission.library_retry,
+            model=model,
+        )
+        # Read as the requeue left it: the session still holds the row as it failed.
+        submission.job = (
+            await db.execute(
+                select(Job).where(Job.id == retried).execution_options(populate_existing=True)
+            )
+        ).scalar_one()
     if submission.cached is not None:
-        return _cached_response(submission.cached, wants_stream)
+        return _cached_response(submission.cached, wants_stream, document_id)
 
     job = submission.job
     if wants_stream:
@@ -193,9 +306,10 @@ async def parse(request: Request, caller: UploaderCaller, db: DbSession, setting
             media_type=SSE_MEDIA_TYPE,
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
-    return JSONResponse(
-        {"job_id": str(job.id), "status": job.status}, status_code=status.HTTP_202_ACCEPTED
-    )
+    accepted = {"job_id": str(job.id), "status": job.status}
+    if document_id is not None:
+        accepted["document_id"] = document_id
+    return JSONResponse(accepted, status_code=status.HTTP_202_ACCEPTED)
 
 
 # --- job reads ------------------------------------------------------------------------

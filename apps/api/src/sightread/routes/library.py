@@ -20,13 +20,13 @@ import re
 import sys
 import urllib.parse
 import uuid
-from collections.abc import Collection, Mapping
+from collections.abc import AsyncIterator, Collection, Mapping
 from pathlib import Path
 
 from fastapi import APIRouter, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from starlette.concurrency import iterate_in_threadpool
 from starlette.datastructures import UploadFile
@@ -47,6 +47,7 @@ from ..db.models import (
     Job,
     JobPage,
     Result,
+    UploadTicket,
     User,
     utcnow,
 )
@@ -54,6 +55,7 @@ from ..errors import ApiError
 from ..jobs.chat_tools import PageUnavailable, original_page_png
 from ..jobs.intake import (
     MULTIPART_ENVELOPE_BYTES,
+    Submission,
     capped_stream,
     checked_parse_model,
     convert_kept_file,
@@ -86,6 +88,7 @@ from ..workspace.filing import (
     keep_file,
     make_folder,
     move_then_commit,
+    placed_in,
     sibling_names,
 )
 from ..workspace.layout import (
@@ -1205,8 +1208,8 @@ async def upload_document(
                 settings=settings,
             )
         if part.sink.kind == UPLOAD_PARSE:
-            return await file_parse(
-                part.sink.path,
+            _, row = await file_parse(
+                file_chunks(part.sink.path),
                 filename,
                 part.content_type,
                 user=user,
@@ -1214,6 +1217,7 @@ async def upload_document(
                 db=db,
                 settings=settings,
             )
+            return await read_document_payload(db, settings, row)
         return await file_upload(
             part.sink.path,
             filename,
@@ -1235,7 +1239,7 @@ async def upload_document(
 
 
 async def file_parse(
-    path: Path,
+    chunks: AsyncIterator[bytes],
     filename: str,
     media_type: str,
     *,
@@ -1243,11 +1247,25 @@ async def file_parse(
     folder_id: int | None,
     db: DbSession,
     settings: AppSettings,
-) -> dict:
+    model: str | None = None,
+    force: bool = False,
+    ticket: UploadTicket | None = None,
+    reuse_filed: bool = False,
+) -> tuple[Submission, Document]:
     """A PDF or an image the parse agent converts on arrival: the parse queued from the
-    staged upload by the same `jobs.intake` sequence `POST /v1/parse` runs, then the row
-    naming it (docs/api.md § Why the web upload is a control-plane route)."""
+    upload by the same `jobs.intake` sequence `POST /v1/parse` runs, then the row naming
+    it (docs/api.md § Why the web upload is a control-plane route) — the Files page's
+    upload, and a data-plane parse filed into Files with its `model`, `force` and upload
+    ticket (docs/mcp.md § Filing into Files).
+
+    With `reuse_filed`, a live document of the same parse already in the folder answers
+    instead of a new row, its fresh upload discarded: a command the connector runs again
+    files no twin. An upload ticket the intake spent goes back when the filing is refused
+    after it, so the connector's read after the upload fails rather than land a parse
+    nothing filed (docs/mcp.md § Filing into Files). Answers the submission and the
+    document."""
     user_id = user.id
+    ticket_id = None if ticket is None else ticket.id
     # The library name is decided before the parse is queued: a name that cleans to
     # nothing is filed as `upload`, never a 400 after a billed parse is already on its
     # way (docs/api.md).
@@ -1259,9 +1277,12 @@ async def file_parse(
         db,
         settings,
         user=user,
-        chunks=file_chunks(path),
+        chunks=chunks,
         media_type=media_type,
         filename=filename,
+        model=model,
+        force=force,
+        ticket=ticket,
         # The browser cannot tell a lost response from a lost request, so its retry of an
         # upload that in fact landed must not buy a second parse (docs/jobs.md § Dedup).
         reuse_in_flight=True,
@@ -1275,99 +1296,137 @@ async def file_parse(
     # that already produced it (docs/jobs.md § Dedup).
     job_id = submission.job.id if submission.job is not None else submission.cached.job_id
 
-    # The folder can be deleted while the document is being stored and probed. The parse is
-    # committed and will bill by now, so the file lands at the root rather than being lost
-    # behind a foreign-key failure dressed up as a name conflict.
-    if folder_id is not None and not await folder_exists(db, user_id, folder_id):
-        folder_id = None
+    try:
+        # The folder can be deleted while the document is being stored and probed. The parse is
+        # committed and will bill by now, so the file lands at the root rather than being lost
+        # behind a foreign-key failure dressed up as a name conflict.
+        if folder_id is not None and not await folder_exists(db, user_id, folder_id):
+            folder_id = None
 
-    # The job is committed and running by now, so the file has to land: `insert_named`
-    # re-reads and retries rather than answering a conflict.
-    async def land(place: int | None) -> Document:
-        async def taken() -> set[str]:
-            await lock_job(db, job_id)
-            return await sibling_names(db, user_id, place)
+        # The job is committed and running by now, so the file has to land: `insert_named`
+        # re-reads and retries rather than answering a conflict.
+        async def land(place: int | None) -> Document:
+            async def taken() -> set[str]:
+                await lock_job(db, job_id)
+                return await sibling_names(db, user_id, place)
 
-        return await insert_named(
-            db,
-            user_id=user_id,
-            into=place,
-            build=lambda name: Document(
-                user_id=user_id, folder_id=place, job_id=job_id, kind=PARSE_KIND, name=name
-            ),
-            taken=taken,
-            wanted=wanted,
-            limit=DOCUMENT_NAME_MAX,
-            message="A file with this name already exists here",
-            commit=False,
-        )
-
-    # The row, its original and their commit under one hold of the workspace lock (then
-    # the user's row and the job's: the one order every holder takes): a process that
-    # dies between the insert and the copy leaves no row without the original it was
-    # promised, and the backup lock held shared around it keeps a snapshot from seeing
-    # one without the other (docs/workspace.md § Revisions, § Backups).
-    root = user_root(settings.workspaces_dir, user_id)
-    async with backup_shared(root), workspace_lock(root):
-        # A cache hit that only a file kept can have been purged since the lookup, that
-        # file deleted for good meanwhile (docs/jobs.md § Dedup margin); under this lock
-        # the purge waits. Said plainly, not as the name conflict the insert would make of
-        # a missing job.
-        if (
-            submission.cached is not None
-            and await db.scalar(select(Job.id).where(Job.id == job_id)) is None
-        ):
-            if submission.upload is not None:
-                submission.upload.unlink(missing_ok=True)
-            raise ApiError(
-                409,
-                "invalid_request",
-                "The earlier parse of this file was just deleted; upload it again",
+            return await insert_named(
+                db,
+                user_id=user_id,
+                into=place,
+                build=lambda name: Document(
+                    user_id=user_id, folder_id=place, job_id=job_id, kind=PARSE_KIND, name=name
+                ),
+                taken=taken,
+                wanted=wanted,
+                limit=DOCUMENT_NAME_MAX,
+                message="A file with this name already exists here",
+                commit=False,
             )
-        try:
-            row = await land(folder_id)
-        except ApiError as exc:
-            # The remaining sliver of that same race: deleted or moved to the Trash between
-            # the check above and this insert — the 404 of the check under the user's row
-            # lock, or a foreign-key failure rather than a name one.
-            if folder_id is None or (
-                exc.status_code != 404 and await folder_exists(db, user_id, folder_id)
+
+        # The row, its original and their commit under one hold of the workspace lock (then
+        # the user's row and the job's: the one order every holder takes): a process that
+        # dies between the insert and the copy leaves no row without the original it was
+        # promised, and the backup lock held shared around it keeps a snapshot from seeing
+        # one without the other (docs/workspace.md § Revisions, § Backups).
+        root = user_root(settings.workspaces_dir, user_id)
+        async with backup_shared(root), workspace_lock(root):
+            # A cache hit that only a file kept can have been purged since the lookup, that
+            # file deleted for good meanwhile (docs/jobs.md § Dedup margin); under this lock
+            # the purge waits. Said plainly, not as the name conflict the insert would make of
+            # a missing job.
+            if (
+                submission.cached is not None
+                and await db.scalar(select(Job.id).where(Job.id == job_id)) is None
             ):
-                raise
-            row = await land(None)
-        row_id = row.id
+                if submission.upload is not None:
+                    submission.upload.unlink(missing_ok=True)
+                raise ApiError(
+                    409,
+                    "invalid_request",
+                    "The earlier parse of this file was just deleted; upload it again",
+                )
+            if reuse_filed:
+                filed = await db.scalar(
+                    select(Document)
+                    .where(
+                        Document.user_id == user_id,
+                        placed_in(Document.folder_id, folder_id),
+                        Document.job_id == job_id,
+                        Document.trashed_at.is_(None),
+                    )
+                    .order_by(Document.id)
+                    .limit(1)
+                )
+                if filed is not None:
+                    # The same parse is here already: that document is the answer, and the
+                    # fresh copy kept for a new row has no row to be the original of.
+                    if submission.upload is not None:
+                        submission.upload.unlink(missing_ok=True)
+                    return submission, filed
+            try:
+                row = await land(folder_id)
+            except ApiError as exc:
+                # The remaining sliver of that same race: deleted or moved to the Trash between
+                # the check above and this insert — the 404 of the check under the user's row
+                # lock, or a foreign-key failure rather than a name one.
+                if folder_id is None or (
+                    exc.status_code != 404 and await folder_exists(db, user_id, folder_id)
+                ):
+                    raise
+                row = await land(None)
+            row_id = row.id
 
-        job = await job_of(db, job_id)
-        # The parse may already be done (the worker then left the upload for this row),
-        # or answered from the cache or joined in flight (the fresh upload is this row's
-        # to keep). A copy that fails, or that the quota refuses, takes the row with it:
-        # the transaction rolls back, so no entry stands without the original it was
-        # promised, and no suffixed twin comes of the browser's retry.
-        try:
-            await workspace_documents.adopt_source(
-                db, settings, row, job, upload=submission.upload, locked=True
+            job = await job_of(db, job_id)
+            # The parse may already be done (the worker then left the upload for this row),
+            # or answered from the cache or joined in flight (the fresh upload is this row's
+            # to keep). A copy that fails, or that the quota refuses, takes the row with it:
+            # the transaction rolls back, so no entry stands without the original it was
+            # promised, and no suffixed twin comes of the browser's retry.
+            try:
+                await workspace_documents.adopt_source(
+                    db, settings, row, job, upload=submission.upload, locked=True
+                )
+            except ApiError:
+                await db.rollback()
+                raise
+            except Exception as exc:
+                logger.exception("could not keep the upload for document %d", row_id)
+                await db.rollback()
+                raise ApiError(
+                    409, "invalid_request", "The upload could not be kept; nothing was filed"
+                ) from exc
+            # A commit that raises is verified before it is reported, and a rollback takes
+            # the original and the shell's copy back with it (docs/workspace.md).
+            relative = document_relative_dir(
+                await workspace_documents.folder_names(db, user_id, row.folder_id), row.name
             )
-        except ApiError:
-            await db.rollback()
-            raise
-        except Exception as exc:
-            logger.exception("could not keep the upload for document %d", row_id)
-            await db.rollback()
-            raise ApiError(
-                409, "invalid_request", "The upload could not be kept; nothing was filed"
-            ) from exc
-        # A commit that raises is verified before it is reported, and a rollback takes
-        # the original and the shell's copy back with it (docs/workspace.md).
-        relative = document_relative_dir(
-            await workspace_documents.folder_names(db, user_id, row.folder_id), row.name
-        )
-        row = await commit_filing(
-            db,
-            row,
-            what="The upload",
-            undo=lambda: workspace_documents.discard_adopted(settings, user_id, row_id, relative),
-        )
-    return await read_document_payload(db, settings, row)
+            row = await commit_filing(
+                db,
+                row,
+                what="The upload",
+                undo=lambda: workspace_documents.discard_adopted(
+                    settings, user_id, row_id, relative
+                ),
+            )
+        return submission, row
+    except Exception:
+        # Nothing was filed: the ticket the intake spent on the job goes back, so the
+        # connector's read after the upload fails rather than land a parse nothing
+        # filed (docs/mcp.md § Filing into Files). One spent on another job since is
+        # another upload's.
+        if ticket_id is not None:
+            try:
+                await db.rollback()
+                await db.execute(
+                    update(UploadTicket)
+                    .where(UploadTicket.id == ticket_id, UploadTicket.job_id == job_id)
+                    .values(spent_at=None, job_id=None)
+                )
+                await db.commit()
+            except Exception:  # noqa: BLE001 - the filing's own error is the answer
+                logger.warning("upload ticket %d could not be given back", ticket_id)
+        raise
 
 
 async def file_markdown(

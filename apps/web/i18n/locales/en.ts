@@ -204,7 +204,7 @@ export default {
     step2:
       'Sign in with Google and approve on the consent screen; the connector registers itself.',
     step3:
-      'Claude can then parse files, read your Files library and save a document’s text and notes, each over a short-lived ticket — file bytes never pass through MCP.',
+      'Claude can then parse files into the folders you name, read your Files library and save a document’s text and notes, each over a short-lived ticket — file bytes never pass through MCP.',
   },
   agents: {
     headTitle: 'Agent',

@@ -35,7 +35,8 @@ ACCESS_TTL = timedelta(hours=1)
 REFRESH_TTL = timedelta(days=30)
 
 # Two scopes (docs/auth.md § 4): `parse`, the `parse` tool and the job routes, and, since
-# 2026-11-01, `library`, reading the Files library and saving a document's text and notes.
+# 2026-11-01, `library`, reading the Files library and saving a document's text and notes —
+# and since 2026-11-04 filing a parse into its folders (docs/mcp.md § Filing into Files).
 # A grant is made for both, the consent page saying both; one approved before `library`
 # existed keeps `parse` alone through every refresh until it is approved again.
 SCOPE = "parse"
