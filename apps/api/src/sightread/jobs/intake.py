@@ -51,6 +51,7 @@ from ..upstream.client import offered_models
 from ..workspace import documents as workspace_documents
 from ..workspace import safe_io
 from ..workspace.filing import document_relative
+from ..workspace.locks import workspace_lock
 from ..workspace.trash import read_row
 from . import events
 from .queue import (
@@ -84,11 +85,14 @@ BASE64_CHUNK_CHARS = 4 * 256 * 1024
 class Submission:
     """The outcome of an intake: either a queued job or a cached result, never both.
     `upload` is the fresh file, kept for a caller that retains sources when the answer
-    came from the cache (docs/jobs.md § Retention)."""
+    came from the cache (docs/jobs.md § Retention). `library_retry` is, instead of either,
+    the failed parse of a Files document a data-plane retry found, for the caller to retry
+    as the library does (docs/jobs.md § Retrying failed pages)."""
 
     job: Job | None = None
     cached: Result | None = None
     upload: Path | None = None
+    library_retry: uuid.UUID | None = None
 
 
 class ChunkReader(Protocol):
@@ -337,6 +341,7 @@ async def submit_parse(
     check: bool = False,
     reconvert: Document | None = None,
     retry: bool = False,
+    library_retry: bool = False,
 ) -> Submission:
     """Store the document, dedup it and queue the parse. Commits before it returns.
 
@@ -357,6 +362,12 @@ async def submit_parse(
     one: a failed data-plane parse goes back on the queue, its succeeded pages kept and
     its failed ones run on `model` when one is named, else on its own; one in flight or
     succeeded is answered as it stands (docs/jobs.md § Retrying failed pages).
+
+    With `library_retry`, a retry whose newest parse is a failed one a Files document
+    names is answered with that job as `Submission.library_retry`, nothing changed and a
+    ticket unspent: the library's retry runs from the document's original under the
+    workspace lock, which is taken before the user's row and so cannot be taken under the
+    holds of this transaction. Without it, that retry is the 409 below.
 
     `reconvert` is the library document this parse re-converts, with `force`: it points at
     the job in the commit that queues it, so no re-convert runs that its document would
@@ -434,6 +445,11 @@ async def submit_parse(
         if job.status == "failed" and found[1]:
             # A Files document's parse: the library retries it, from its original.
             stored.unlink(missing_ok=True)
+            if library_retry:
+                failed_id = job.id
+                # The holds go with the transaction; the caller takes the workspace lock.
+                await db.rollback()
+                return Submission(library_retry=failed_id)
             raise ApiError(
                 409,
                 "invalid_request",
@@ -836,6 +852,82 @@ async def retry_library_parse(
             "reload the library before trying again",
         ) from exc
     return job_id
+
+
+async def retry_filed_parse(
+    db: AsyncSession,
+    settings: Settings,
+    *,
+    user_id: int,
+    ticket_id: int | None,
+    job_id: uuid.UUID,
+    model: str | None,
+) -> uuid.UUID:
+    """A data-plane retry of a Files document's failed parse — `Submission.library_retry`
+    — run as the library's retry (docs/jobs.md § Retrying failed pages): under the
+    workspace lock, then the dedup key's hold a plain upload of these bytes takes, so the
+    two never both start a parse; on the live document whose own parse it is, from its
+    original, the ticket spent on the job in the commit that requeues it. A parse put back
+    by another retry since the intake read it is answered as it stands, as a data-plane
+    retry is. Answers the job's id."""
+    async with workspace_lock(workspace_documents.user_root(settings.workspaces_dir, user_id)):
+        job = (
+            await db.execute(
+                select(Job).where(Job.id == job_id).execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if job is None:
+            raise ApiError(404, "invalid_request", "No such job")
+        await hold_dedup_key(
+            db,
+            user_id=job.user_id,
+            agent=job.agent,
+            sha256=job.sha256,
+            model=job.model,
+            connection_id=job.connection_id,
+            connection_base_url=job.connection_base_url,
+            pages_spec=job.pages_spec,
+            prompt_sha256=job.prompt_sha256,
+        )
+        folders = await workspace_documents.user_folders(db, user_id)
+        rows = (
+            await db.execute(
+                select(Document)
+                .where(Document.user_id == user_id, Document.job_id == job_id)
+                .order_by(Document.id)
+            )
+        ).scalars()
+        row = next((row for row in rows if workspace_documents.is_live(row, folders)), None)
+        if row is None:
+            # A failed re-convert, or a parse only the Trash names: the reader's.
+            raise ApiError(
+                409,
+                "invalid_request",
+                "The latest parse of this file is a Files document's; retry it from the Files page",
+            )
+        ticket = (
+            None
+            if ticket_id is None
+            # Read again: the intake's rollback expired the row the request resolved.
+            else await db.get(UploadTicket, ticket_id, populate_existing=True)
+        )
+        if ticket_id is not None and (ticket is None or ticket.spent_at is not None):
+            raise ApiError(401, "auth", upload_tickets.REJECTION_MESSAGE)
+        if job.status != "failed":
+            # Put back by another retry since the intake read it: that one, as it stands.
+            if ticket is not None:
+                upload_tickets.spend(ticket, job_id)
+            await db.commit()
+            return job_id
+        if ticket is not None:
+            upload_tickets.spend(ticket, job_id)
+        return await retry_library_parse(
+            db,
+            settings,
+            user_id=user_id,
+            row=row,
+            model=None if model is None else checked_parse_model(settings, model),
+        )
 
 
 def cached_payload(result: Result) -> dict:

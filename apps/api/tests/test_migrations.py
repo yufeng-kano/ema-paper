@@ -2368,3 +2368,82 @@ async def test_the_agents_files_migration_adds_the_snapshot_and_reserves_init(sc
         _alembic(scratch_url, "upgrade", "head")
     finally:
         await engine.dispose()
+
+
+TICKET_FILING = "cfeffbf0a598"
+
+
+async def test_the_ticket_filing_migration_reads_every_ticket_as_one_that_files_nothing(
+    scratch_url,
+) -> None:
+    """An existing ticket files nothing and reaches no Files document; a folder deleted
+    for good leaves a ticket aimed at it filing at the top level (docs/database.md
+    § Rules, the ticket filing migration)."""
+    _alembic(scratch_url, "upgrade", AGENTS_FILES)
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.begin() as db:
+            user_id = (
+                await db.execute(
+                    text(
+                        "INSERT INTO users (google_sub, email, created_at) "
+                        "VALUES ('sub', 'a@example.com', now()) RETURNING id"
+                    )
+                )
+            ).scalar_one()
+            await db.execute(
+                text(
+                    "INSERT INTO upload_tickets (user_id, token_hash, prefix, created_at, "
+                    "expires_at) VALUES (:user, 'h', 'srt_...abcd', now(), now())"
+                ),
+                {"user": user_id},
+            )
+        _alembic(scratch_url, "upgrade", TICKET_FILING)
+        async with engine.begin() as db:
+            row = (
+                await db.execute(
+                    text("SELECT library_access, into_library, folder_id FROM upload_tickets")
+                )
+            ).one()
+            assert tuple(row) == (False, False, None)
+            folder_id = (
+                await db.execute(
+                    text(
+                        "INSERT INTO folders (user_id, name, created_at, updated_at) "
+                        "VALUES (:user, 'Papers', now(), now()) RETURNING id"
+                    ),
+                    {"user": user_id},
+                )
+            ).scalar_one()
+            await db.execute(
+                text(
+                    "UPDATE upload_tickets SET library_access = true, into_library = true, "
+                    "folder_id = :folder"
+                ),
+                {"folder": folder_id},
+            )
+        async with engine.begin() as db:
+            await db.execute(text("DELETE FROM folders"))
+        async with engine.connect() as db:
+            row = (
+                await db.execute(text("SELECT into_library, folder_id FROM upload_tickets"))
+            ).one()
+            assert tuple(row) == (True, None)
+        _alembic(scratch_url, "downgrade", AGENTS_FILES)
+        async with engine.connect() as db:
+            columns = {
+                column
+                for (column,) in (
+                    await db.execute(
+                        text(
+                            "SELECT column_name FROM information_schema.columns "
+                            "WHERE table_name = 'upload_tickets'"
+                        )
+                    )
+                ).all()
+            }
+            assert columns.isdisjoint({"library_access", "into_library", "folder_id"})
+            assert (await db.execute(text("SELECT count(*) FROM upload_tickets"))).scalar_one() == 1
+        _alembic(scratch_url, "upgrade", "head")
+    finally:
+        await engine.dispose()

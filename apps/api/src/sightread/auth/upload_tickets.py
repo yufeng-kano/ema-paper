@@ -43,20 +43,40 @@ def display_prefix(token: str) -> str:
     return f"{TICKET_PREFIX}...{token[-4:]}"
 
 
-async def mint(db: AsyncSession, settings: Settings, user: User) -> tuple[UploadTicket, str]:
+async def check_mint_rate(db: AsyncSession, settings: Settings, user_id: int) -> None:
+    """429 once the user minted `UPLOAD_TICKET_RATE_PER_HOUR` tickets in the last hour:
+    `mint`'s own check, and the parse tool's before it makes a folder for the ticket."""
+    minted = await db.scalar(
+        select(func.count())
+        .select_from(UploadTicket)
+        .where(UploadTicket.user_id == user_id, UploadTicket.created_at > utcnow() - MINT_WINDOW)
+    )
+    if minted >= settings.upload_ticket_rate_per_hour:
+        raise ApiError(429, "rate_limit", "Too many upload tickets minted; retry later")
+
+
+async def mint(
+    db: AsyncSession,
+    settings: Settings,
+    user: User,
+    *,
+    library_access: bool = False,
+    into_library: bool = False,
+    folder_id: int | None = None,
+) -> tuple[UploadTicket, str]:
     """Issue a ticket for this user, tidying up their dead ones on the way.
 
     The rate limit counts tickets *minted* in the last hour, before cleanup, so a short TTL
     cannot dilute it. Commits, and returns the row plus the plaintext shown exactly once.
+
+    `library_access` records that the minting grant reaches the library; `into_library`
+    and `folder_id` where the upload is filed, decided here and never by the upload's own
+    form (docs/auth.md § 5, docs/mcp.md § Filing into Files).
     """
+    if into_library and not library_access:
+        raise ValueError("A ticket that files into the library needs the library's access")
     now = utcnow()
-    minted = await db.scalar(
-        select(func.count())
-        .select_from(UploadTicket)
-        .where(UploadTicket.user_id == user.id, UploadTicket.created_at > now - MINT_WINDOW)
-    )
-    if minted >= settings.upload_ticket_rate_per_hour:
-        raise ApiError(429, "rate_limit", "Too many upload tickets minted; retry later")
+    await check_mint_rate(db, settings, user.id)
 
     # Opportunistic cleanup in the same transaction: every mint tidies up, so the table
     # stays small without a sweeper (docs/auth.md § 5).
@@ -70,6 +90,9 @@ async def mint(db: AsyncSession, settings: Settings, user: User) -> tuple[Upload
         prefix=display_prefix(token),
         created_at=now,
         expires_at=now + timedelta(seconds=settings.upload_ticket_ttl_seconds),
+        library_access=library_access,
+        into_library=into_library,
+        folder_id=folder_id if into_library else None,
     )
     db.add(row)
     await db.commit()

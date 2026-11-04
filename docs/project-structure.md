@@ -53,8 +53,9 @@ agent-sightread/
                               # reconcile.py, trash.py (deleting for good: Empty Trash
                               # and the Trash's expiry, one function), accounts.py (a
                               # deleted account's marker and files), filing.py (names,
-                              # the suffixed insert and the filing of a file — what the
-                              # upload route and the agent's download share)
+                              # the suffixed insert, the folders a path names and the
+                              # filing of a file — what the upload route, the agent's
+                              # download and the connector's filing share)
         sandbox/              # client.py: the HTTP client of the sandbox runner;
                               # egress.py: the list of sites the worker writes for the
                               # egress proxy (docs/sandbox.md § Network)
@@ -73,7 +74,7 @@ agent-sightread/
                               # chat_web.py (the web tools: Brave search, OpenAlex, the
                               # guarded fetch, reading a URL, downloading into Files),
                               # summary.py (one summary-model call: `/rename`'s title)
-        mcp/                  # server.py: thin shell over the service layer — parse, list_library, read_document, write_document (docs/mcp.md)
+        mcp/                  # server.py: thin shell over the service layer — parse (and its Files folder), list_library, read_document, write_document (docs/mcp.md)
         worker.py             # `python -m sightread.worker`
       migrations/             # Alembic
       tests/

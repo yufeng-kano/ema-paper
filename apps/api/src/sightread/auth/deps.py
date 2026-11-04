@@ -60,6 +60,12 @@ class Bearer:
     user: User
     scopes: set[str] | None
 
+    @property
+    def library(self) -> bool:
+        """Whether it reaches the library: an API key, or a grant holding `library`
+        (docs/auth.md § 4)."""
+        return self.scopes is None or LIBRARY_SCOPE in self.scopes
+
 
 async def resolve_bearer_identity(db: AsyncSession, credential: str) -> Bearer | None:
     """A bearer credential is either a project API key or an OAuth access token.
@@ -81,12 +87,6 @@ async def resolve_bearer_identity(db: AsyncSession, credential: str) -> Bearer |
     return None if resolved is None else Bearer(user=resolved[0], scopes=resolved[1])
 
 
-async def resolve_bearer(db: AsyncSession, credential: str) -> User | None:
-    """The user a durable bearer credential speaks for, whatever its scopes."""
-    identity = await resolve_bearer_identity(db, credential)
-    return None if identity is None else identity.user
-
-
 def bearer_credential(request: Request) -> str | None:
     header = request.headers.get("authorization", "")
     scheme, _, credential = header.partition(" ")
@@ -95,8 +95,9 @@ def bearer_credential(request: Request) -> str | None:
     return credential.strip()
 
 
-async def require_bearer_user(request: Request, db: DbSession) -> User:
-    """Data plane auth: `Authorization: Bearer <API key | OAuth access token>`."""
+async def require_bearer_identity(request: Request, db: AsyncSession) -> Bearer:
+    """Data plane auth: `Authorization: Bearer <API key | OAuth access token>`, with the
+    grant's scopes."""
     credential = bearer_credential(request)
     if credential is None:
         raise ApiError(
@@ -105,18 +106,27 @@ async def require_bearer_user(request: Request, db: DbSession) -> User:
             "Missing bearer token",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    user = await resolve_bearer(db, credential)
-    if user is None:
+    identity = await resolve_bearer_identity(db, credential)
+    if identity is None:
         raise ApiError(401, "auth", "Invalid, expired or revoked credential")
-    return user
+    return identity
+
+
+async def require_bearer_user(request: Request, db: DbSession) -> User:
+    """Data plane auth: `Authorization: Bearer <API key | OAuth access token>`."""
+    return (await require_bearer_identity(request, db)).user
 
 
 @dataclass
 class Uploader:
-    """Who is posting to `/v1/parse`: a durable credential, or one upload ticket."""
+    """Who is posting to `/v1/parse`: a durable credential, or one upload ticket. `library`
+    says whether its rights reach the library — an API key, an OAuth token whose grant
+    holds `library`, or a ticket minted under one — for the filing and the retry of a Files
+    document (docs/mcp.md § Filing into Files)."""
 
     user: User
     ticket: UploadTicket | None = None
+    library: bool = False
 
 
 async def _live_ticket(request: Request, db: AsyncSession) -> tuple[UploadTicket, User]:
@@ -135,11 +145,12 @@ def _presents_ticket(request: Request) -> bool:
 async def require_uploader(request: Request, db: DbSession) -> Uploader:
     """`POST /v1/parse` auth: the data plane bearer, or an unspent upload ticket."""
     if not _presents_ticket(request):
-        return Uploader(user=await require_bearer_user(request, db))
+        identity = await require_bearer_identity(request, db)
+        return Uploader(user=identity.user, library=identity.library)
     ticket, user = await _live_ticket(request, db)
     if ticket.spent_at is not None:
         raise ApiError(401, "auth", upload_tickets.REJECTION_MESSAGE)
-    return Uploader(user=user, ticket=ticket)
+    return Uploader(user=user, ticket=ticket, library=ticket.library_access)
 
 
 UploaderCaller = Annotated[Uploader, Depends(require_uploader)]
@@ -214,7 +225,7 @@ async def _library_bearer(request: Request, db: AsyncSession) -> User:
     identity = await resolve_bearer_identity(db, credential)
     if identity is None:
         raise ApiError(401, "auth", "Invalid, expired or revoked credential")
-    if identity.scopes is not None and LIBRARY_SCOPE not in identity.scopes:
+    if not identity.library:
         raise ApiError(403, "auth", LIBRARY_SCOPE_MESSAGE)
     return identity.user
 

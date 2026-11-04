@@ -335,9 +335,9 @@ async def authorize(
     body = (
         f"<p><strong>{html.escape(client.client_name)}</strong> wants to use Ema Paper as "
         f"<code>{html.escape(user.email)}</code>.</p>"
-        "<p class='note'>It will be able to submit documents, read your Files library and "
-        "save the text and notes of its documents. It cannot reach your settings, API keys "
-        "or billing.</p>"
+        "<p class='note'>It will be able to submit documents and file them into your Files "
+        "folders, read your Files library and save the text and notes of its documents. It "
+        "cannot reach your settings, API keys or billing.</p>"
         "<p class='terms'>Every page it parses uses credits from your plan, the same as a "
         "parse in the app.</p>"
         f"<form method='post' action='/oauth/authorize'>{hidden}"
