@@ -332,6 +332,12 @@ class Settings(BaseSettings):
     # a user message carries); each is capped like the selection, its heading on its own.
     chat_sections_per_message: int = 4
     chat_section_heading_max_chars: int = 512
+    # A library conversation's limits (docs/chat.md § Library conversations): the Files-page
+    # items one message carries, the paths one library tool call names, and the lines one
+    # `list_files` answers before it says how many it left out.
+    chat_library_items_per_message: int = 200
+    chat_library_max_paths: int = 100
+    chat_list_files_max_entries: int = 500
     # The chat agent's web tools, run on the worker (docs/chat.md § Tools): the switch, the
     # keys `web_search` (Brave) and `search_papers` (OpenAlex) run on — each tool absent
     # while its key is empty — and what a web search costs the reader on top of the turn's

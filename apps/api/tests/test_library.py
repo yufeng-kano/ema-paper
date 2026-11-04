@@ -22,7 +22,7 @@ from sightread.auth.sessions import SESSION_COOKIE, create_session
 from sightread.db.models import Document, Job, JobPage, Result, User
 from sightread.jobs.queue import claim_next_job
 from sightread.jobs.runner import run_job
-from sightread.routes.library import DOCUMENT_NAME_MAX, clean_name, free_name
+from sightread.workspace.filing import DOCUMENT_NAME_MAX, clean_name, free_name
 from sightread.workspace.layout import user_root
 from tests.conftest import CSRF_HEADERS, DATABASE_URL, KANO_CHAT_URL, convert_on_upload
 

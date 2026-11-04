@@ -4010,6 +4010,8 @@ watch(agentMounted, (mounted) => {
 })
 
 // --- column widths -----------------------------------------------------------------------
+// The Files page's Agent card (FilesAgent.vue) keeps a copy of the grip's behaviour and of its
+// `.split` and `.card` styles, for one card beside the list: the two change together.
 
 const columnsBox = ref<HTMLElement | null>(null)
 /** The width the document and its columns share, kept current so the columns are clamped

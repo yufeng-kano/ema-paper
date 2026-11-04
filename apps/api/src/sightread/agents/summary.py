@@ -20,10 +20,11 @@ from .memory import clean_text
 TITLE_MAX_CHARS = 80
 
 TITLE_SYSTEM = (
-    "You name conversations. A reader is reading a document in a reading app and talking "
-    "about it with an AI agent. Write a title for their conversation.\n\n"
-    "Name its subject: what the document is, and what the reader is doing with it or asking "
-    "about it. Never name the command the reader typed (such as /translate or /compact), and "
+    "You name conversations. A reader of a reading app is talking with an AI agent about "
+    "a document they read, or about their library of documents as a whole. Write a title "
+    "for their conversation.\n\n"
+    "Name its subject: what the conversation is about, and what the reader is doing or "
+    "asking. Never name the command the reader typed (such as /translate or /compact), and "
     "never a greeting.\n\n"
     "- At most eight words; in Chinese or Japanese, at most twenty characters.\n"
     "- Write it in the language whose tag is {language}.\n"
@@ -125,8 +126,9 @@ def title_request(
     language: str,
     max_tokens: int,
 ) -> dict:
-    """The one Messages request a title is asked with: no tools, no thinking asked for."""
-    parts = [f"<document>{document_name}</document>"]
+    """The one Messages request a title is asked with: no tools, no thinking asked for. A
+    library conversation has no document to name (docs/chat.md § Library conversations)."""
+    parts = [f"<document>{document_name}</document>"] if document_name else []
     for exchange in exchanges:
         parts.append(
             f"<exchange>\n<reader>{exchange.reader}</reader>\n<agent>{exchange.agent}</agent>\n</exchange>"

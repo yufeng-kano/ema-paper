@@ -25,6 +25,7 @@ from .chat_tools import ToolOutcome
 PAUSED = "Memory is paused: the user turned it off. Nothing was saved or changed; go on without it."
 ACTIONS = {"save": "saved", "update": "updated", "forget": "forgotten"}
 SCOPES = ("all", "document")
+NO_DOCUMENT = "There is no document in this conversation: save it for all documents"
 # How the block names a memory, and what the tool takes back: `m12`, or the bare number.
 _ID = re.compile(r"^\[?m?(\d{1,18})\]?$", re.IGNORECASE)
 
@@ -53,7 +54,7 @@ def first_turn_selection(rows: Sequence[Memory], settings: Settings) -> list[Mem
 
 
 async def snapshot_rows(
-    db: AsyncSession, user_id: int, document_id: int, ids: Sequence[object]
+    db: AsyncSession, user_id: int, document_id: int | None, ids: Sequence[object]
 ) -> list[Memory]:
     """The snapshot's memories as they are now, in its order: one the reader deleted is
     gone, and one whose scope no longer takes in this document is dropped."""
@@ -142,13 +143,14 @@ async def run_memory_tool(
     *,
     user_id: int,
     conversation_id: int,
-    document_id: int,
+    document_id: int | None,
     tool_use_id: str,
     tool_input: dict,
 ) -> ToolOutcome:
     """One `memory` call: save, update or forget one of the reader's memories (docs/chat.md
     § Memory). Every refusal is an error result the model can correct; a success carries
-    what its `memory` event reports, and a save of what is already saved carries nothing."""
+    what its `memory` event reports, and a save of what is already saved carries nothing.
+    `document_id` None: a library conversation, which has no document to scope one to."""
     action = _field(tool_input, "action")
     if action not in ACTIONS:
         return _error("`action` is save, update or forget.")
@@ -158,6 +160,9 @@ async def run_memory_tool(
     scope = _field(tool_input, "scope")
     if scope and scope not in SCOPES:
         return _error("`scope` is all or document.")
+    if scope == "document" and document_id is None:
+        # Never widened to every document unseen (docs/chat.md § Library conversations).
+        return _error(NO_DOCUMENT)
     raw_text = tool_input.get("text")
     text = memory_defs.clean_text(raw_text, single_line=True) if isinstance(raw_text, str) else ""
     if len(text) > settings.chat_memory_max_chars:

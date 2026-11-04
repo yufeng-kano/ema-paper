@@ -515,11 +515,21 @@ class UsageLog(Base):
 
 
 class Conversation(Base):
-    """One thread of the chat agent about one document (docs/chat.md)."""
+    """One thread of the chat agent about one document — or, `document_id` NULL, a library
+    conversation: the Files page's thread about the whole library (docs/chat.md § Library
+    conversations)."""
 
     __tablename__ = "conversations"
     __table_args__ = (
         Index("ix_conversations_document_updated", "document_id", "updated_at"),
+        # The Files page's list of library conversations.
+        Index(
+            "ix_conversations_library",
+            "user_id",
+            "updated_at",
+            postgresql_where=text("document_id IS NULL"),
+            sqlite_where=text("document_id IS NULL"),
+        ),
         # What the idle compaction pass reads (docs/chat.md § Compaction).
         Index(
             "ix_conversations_cache_warm_until",
@@ -534,7 +544,10 @@ class Conversation(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    document_id: Mapped[int] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"))
+    # NULL for a library conversation; deleting a document never takes one.
+    document_id: Mapped[int | None] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), nullable=True
+    )
     title: Mapped[str] = mapped_column(String(255), default="")
     # The shell this thread holds in the user's sandbox (docs/sandbox.md).
     session: Mapped[str] = mapped_column(String(64))
@@ -548,8 +561,9 @@ class Conversation(Base):
     # compaction; NULL until a turn took one, '' for a file that was empty or missing
     # (docs/chat.md § Memory, *The memory file*).
     memory_file: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # The AGENTS.md files on the document's path as the first turn found them, rendered;
-    # NULL until a turn took the snapshot, '' for none (docs/chat.md § AGENTS.md).
+    # The AGENTS.md files on the document's path as the first turn found them, rendered —
+    # `files/AGENTS.md` alone for a library conversation; NULL until a turn took the
+    # snapshot, '' for none (docs/chat.md § AGENTS.md).
     agents_file: Mapped[str | None] = mapped_column(Text, nullable=True)
     # The summary row the replay starts from; NULL while the conversation was never
     # compacted. No foreign key: a message goes only with its conversation, and a key

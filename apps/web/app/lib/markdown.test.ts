@@ -1206,6 +1206,74 @@ describe('links to the web', () => {
   })
 })
 
+describe('links to the Files page', () => {
+  const folder = '[DINO](/files?folder=12)'
+  const document = '[iBOT.pdf](/files?document=34)'
+  const answer = { cites: false, links: true, files: true }
+
+  it('reads a folder link and a document link only when asked to', () => {
+    expect(parseInline(`In ${folder}.`, { links: true })).toEqual([{ kind: 'text', text: `In ${folder}.` }])
+    expect(parseInline(`In ${folder}, see ${document}.`, answer)).toEqual([
+      { kind: 'text', text: 'In ' },
+      {
+        kind: 'link',
+        segments: [{ kind: 'text', text: 'DINO' }],
+        href: '/files?folder=12',
+        src: folder,
+        files: { kind: 'folder', id: 12 },
+      },
+      { kind: 'text', text: ', see ' },
+      {
+        kind: 'link',
+        segments: [{ kind: 'text', text: 'iBOT.pdf' }],
+        href: '/files?document=34',
+        src: document,
+        files: { kind: 'document', id: 34 },
+      },
+      { kind: 'text', text: '.' },
+    ])
+    expect(inlinePlain(`See ${document}.`, answer)).toBe('See iBOT.pdf.')
+  })
+
+  it('reads markdown and math in its text, and one inside emphasis', () => {
+    expect(parseInline('[**DINO** $v_2$](/files?folder=7)', answer)).toMatchObject([
+      {
+        kind: 'link',
+        files: { kind: 'folder', id: 7 },
+        segments: [{ kind: 'strong' }, { kind: 'text', text: ' ' }, { kind: 'math', tex: 'v_2' }],
+      },
+    ])
+    expect(parseInline(`**${document}**`, answer)).toMatchObject([
+      { kind: 'strong', segments: [{ kind: 'link', files: { kind: 'document', id: 34 } }] },
+    ])
+  })
+
+  it('leaves every other relative link, an image and an escaped bracket the text they were', () => {
+    for (const text of [
+      '[x](/files)',
+      '[x](/files?folder=)',
+      '[x](/files?folder=0)',
+      '[x](/files?folder=12&document=3)',
+      '[x](/files?trash=1)',
+      '[x](files?folder=12)',
+      '[x](/settings)',
+      '[ ](/files?folder=12)',
+      '![x](/files?document=34)',
+      `\\${folder}`,
+      '`[x](/files?folder=12)`',
+    ]) {
+      expect(parseInline(text, answer).some((segment) => segment.kind === 'link')).toBe(false)
+    }
+  })
+
+  it('leaves a section link its text where no document reads it, beside a web link', () => {
+    expect(parseInline('[3.2 Attention](#32-attention) and [site](https://example.org)', answer)).toMatchObject([
+      { kind: 'text', text: '[3.2 Attention](#32-attention) and ' },
+      { kind: 'link', href: 'https://example.org' },
+    ])
+  })
+})
+
 describe('documentOutline and findHeading', () => {
   const pages = parseResultMarkdown(
     [

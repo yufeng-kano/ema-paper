@@ -6,6 +6,10 @@
  * attachments, a picked command — then the textarea, and a foot of the attach and command
  * controls with the send button at the right.
  *
+ * In the Files page's card (`library`) the chips are the page's place instead: the open
+ * folder, and the rows selected there until the reader drops them (docs/web.md § The Files
+ * page's Agent card).
+ *
  * It owns the draft and everything attached to it; the panel owns the conversation, so
  * sending is the panel's `submit`, which says whether the server took the message. Only
  * what was sent is cleared then: whatever the reader changed while it was in flight is the
@@ -16,6 +20,7 @@ import {
   acceptList,
   builtinCommands,
   commandQuery,
+  COMPACT_COMMAND,
   extensionOf,
   formatBytes,
   isImageFile,
@@ -34,6 +39,7 @@ import {
   type ComposerPayload,
   type SentSection,
 } from '~/lib/composer'
+import { libraryMessage, type LibraryPlace } from '~/lib/library'
 import { inlinePlain, type OutlineEntry } from '~/lib/markdown'
 import type { MenuItem, Point } from '~/lib/menu'
 
@@ -58,12 +64,20 @@ const props = defineProps<{
   /** A conversation is open, as against the draft: `/compact` and `/rename` are offered
    *  (docs/web.md § The agent panel, *Commands*). */
   conversationOpen: boolean
+  /** The Files page's card: where the reader is there, drawn as the chips and sent with each
+   *  message in place of the document's context. */
+  library?: LibraryPlace
 }>()
 
 const emit = defineEmits<{ stop: []; 'new-conversation': [] }>()
 
 const { t } = useI18n()
 const { resolve } = useApiError()
+/** Two panels can be mounted at once — the Files page's under a viewer's — so the ids the
+ *  field and its menu refer to each other by are this composer's own. */
+const uid = useId()
+const fieldId = `${uid}-composer`
+const commandsId = `${uid}-commands`
 
 const form = ref<HTMLFormElement | null>(null)
 const textarea = ref<HTMLTextAreaElement | null>(null)
@@ -208,7 +222,7 @@ async function refocusAfterRemove(index: number) {
     // A click that never focused the control (Safari's) left focus where it was.
     return
   }
-  const next = removeControls()[index] ?? addButton.value
+  const next = removeControls()[index] ?? addButton.value ?? textarea.value
   if (next) {
     expectFocusReturn()
     next.focus()
@@ -226,6 +240,27 @@ function removeSection(key: string) {
   const index = addedSections.value.findIndex((section) => section.key === key) + (selection.value ? 1 : 0)
   addedSections.value = addedSections.value.filter((section) => section.key !== key)
   void refocusAfterRemove(index)
+}
+
+// --- the Files page's selection (library mode) ----------------------------------------------
+
+/** Which rows are selected: a dropped chip stays dropped until this changes, and a re-read
+ *  of the library that leaves the same rows selected changes nothing. */
+const pickedKey = computed(() => props.library?.selection.map((item) => `${item.kind}-${item.id}`).join(' ') ?? '')
+const pickedDropped = ref(false)
+watch(pickedKey, () => {
+  pickedDropped.value = false
+})
+const pickedShown = computed(() => !!props.library?.selection.length && !pickedDropped.value)
+
+function removePicked() {
+  pickedDropped.value = true
+  void refocusAfterRemove(0)
+}
+
+/** Rows dragged onto the card: they are the selection already, so its chip comes back. */
+function showPicked() {
+  pickedDropped.value = false
 }
 
 // --- *Add context*: the current section, then every heading --------------------------------
@@ -338,8 +373,9 @@ async function loadSkills() {
   const request = ++skillsRequest
   skillsLoading.value = true
   try {
+    // The Files page's card has no document for a document-only built-in to work on.
     const listed: CommandOption[] = (await listSkills()).skills
-      .filter((skill) => skill.user_invocable)
+      .filter((skill) => skill.user_invocable && !(props.library && skill.document_only))
       .map((skill) => ({ name: skill.name, description: skill.description, hint: skill.argument_hint, group: 'skill' }))
     if (request === skillsRequest) {
       skills.value = listed
@@ -392,7 +428,7 @@ const sections = computed(() =>
 )
 
 function optionId(option: CommandOption): string {
-  return `chat-command-${option.group}-${option.name}`
+  return `${uid}-command-${option.group}-${option.name}`
 }
 
 const activeId = computed(() => {
@@ -732,6 +768,7 @@ async function send(): Promise<boolean> {
     // sections, the quote or the attachments, which stay for the next message (docs/web.md
     // § The agent panel, *Commands*).
     const initializing = picked?.group === 'builtin' && picked.name === INIT_COMMAND
+    const compacting = picked?.group === 'builtin' && picked.name === COMPACT_COMMAND
     const ready = initializing ? [] : pending.value.filter((item) => item.state === 'ready')
     const text = draft.value.trim()
     if (!text && !picked && !ready.length) {
@@ -747,6 +784,10 @@ async function send(): Promise<boolean> {
       quote: initializing ? null : quote.value,
       command: picked?.name ?? null,
       attachments: ready.map((item) => ({ id: item.id!, name: item.name, image: item.image, preview: item.preview })),
+      // `/init` sends the folder alone: the selection stays for the next message. `/compact`
+      // sends neither, the server keeping none of it for a compaction.
+      library:
+        props.library && !compacting ? libraryMessage(props.library, pickedShown.value && !initializing) : undefined,
     }
     for (const item of ready) {
       item.claimed = true
@@ -865,7 +906,12 @@ async function ask(request: AskRequest): Promise<AskOutcome> {
   return 'focused'
 }
 
-defineExpose({ addFiles, setQuote, focus, ask })
+/** What a reload would lose: the draft, a picked command, the quote, the attachments. */
+const holds = computed(
+  () => draft.value.trim() !== '' || command.value !== null || quote.value !== null || pending.value.length > 0,
+)
+
+defineExpose({ addFiles, setQuote, focus, ask, showPicked, holds })
 </script>
 
 <template>
@@ -882,15 +928,15 @@ defineExpose({ addFiles, setQuote, focus, ask })
          first row. -->
     <div v-if="menuOpen" class="menu" @mousedown.prevent>
       <p v-if="!skillsLoaded" class="menu-empty" role="status">{{ t('common.loading') }}</p>
-      <div v-else id="chat-commands" class="menu-list" role="listbox" :aria-label="t('chat.commands')">
+      <div v-else :id="commandsId" class="menu-list" role="listbox" :aria-label="t('chat.commands')">
         <div
           v-for="section in sections"
           :key="section.group"
           class="menu-group"
           role="group"
-          :aria-labelledby="`chat-commands-${section.group}`"
+          :aria-labelledby="`${commandsId}-${section.group}`"
         >
-          <p :id="`chat-commands-${section.group}`" class="menu-label">{{ section.label }}</p>
+          <p :id="`${commandsId}-${section.group}`" class="menu-label">{{ section.label }}</p>
           <button
             v-for="option in section.options"
             :id="optionId(option)"
@@ -920,9 +966,28 @@ defineExpose({ addFiles, setQuote, focus, ask })
     <div class="field" :class="{ disabled: running }">
       <!-- What goes with the message besides its text (docs/web.md § The agent panel,
            *Context chips*): the control that adds a section, the document the
-           conversation is about, the selection read on the way in, the sections added. -->
+           conversation is about, the selection read on the way in, the sections added —
+           or, in the Files page's card, the open folder and the rows selected there. -->
       <div ref="contextRow" class="context" role="group" :aria-label="t('chat.context.label')">
+        <template v-if="library">
+          <!-- Until the library is read a folder opened by its address has no name yet: no
+               chip rather than an empty one. -->
+          <ChatContextChip
+            v-if="library.folder === null || library.name"
+            icon="folder"
+            :text="library.folder === null ? t('files.allFiles') : library.name"
+          />
+          <ChatContextChip
+            v-if="pickedShown"
+            icon="files"
+            :text="t('chat.context.selected', { n: library.selection.length })"
+            :remove-label="t('chat.context.removeSelected')"
+            accent
+            @remove="removePicked"
+          />
+        </template>
         <button
+          v-else
           ref="addButton"
           type="button"
           class="context-add"
@@ -936,7 +1001,7 @@ defineExpose({ addFiles, setQuote, focus, ask })
         >
           <UiIcon name="plus" />
         </button>
-        <ChatContextChip icon="file-text" :text="t('chat.context.document')" faint />
+        <ChatContextChip v-if="!library" icon="file-text" :text="t('chat.context.document')" faint />
         <ChatContextChip
           v-if="selection"
           icon="text-quote"
@@ -1057,16 +1122,16 @@ defineExpose({ addFiles, setQuote, focus, ask })
         <span class="command-description">{{ command.description }}</span>
       </div>
 
-      <label for="chat-composer" class="sr-only">{{ t('chat.composer') }}</label>
+      <label :for="fieldId" class="sr-only">{{ t('chat.composer') }}</label>
       <textarea
-        id="chat-composer"
+        :id="fieldId"
         ref="textarea"
         v-model="draft"
         class="input"
         rows="2"
         :placeholder="placeholder"
         :disabled="running"
-        aria-controls="chat-commands"
+        :aria-controls="commandsId"
         :aria-activedescendant="activeId"
         @focus="focused = true"
         @blur="onBlur"

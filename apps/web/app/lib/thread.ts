@@ -14,7 +14,17 @@
  */
 import type { ChatEvent, ChatMessage, ChatTurn, ContentBlock, Memory, MemorySnapshot, SubagentRecord, TurnKind } from './api'
 import { INIT_COMMAND } from './composer'
-import { addedLines, diffFromInput, groupRuns, parseDiff, readStep, resultText, type DiffLine, type Step } from './steps'
+import {
+  addedLines,
+  diffFromInput,
+  groupRuns,
+  parseDiff,
+  readStep,
+  resultText,
+  type DiffLine,
+  type LibraryStep,
+  type Step,
+} from './steps'
 
 /** The chat agent's editor tool and the commands of it that write (docs/chat.md § Tools). */
 export const EDITOR_TOOL = 'str_replace_based_edit_tool'
@@ -69,6 +79,15 @@ export interface CardState {
   pending: boolean
 }
 
+/** A library step after the reader pressed its *Undo* (docs/web.md § The Files page's Agent
+ *  card): running, done, or refused with the server's message. Kept per tool call, as a
+ *  card's state is. */
+export interface UndoState {
+  pending: boolean
+  undone: boolean
+  error: string | null
+}
+
 /** `none`: the turn ended without a result for it (a cancel) — no mark to draw. */
 export type StepStatus = 'pending' | 'ok' | 'error' | 'none'
 
@@ -86,6 +105,9 @@ export interface ToolStep {
   card: EditCard | null
   /** The lines the step's edit added. */
   added: number | null
+  /** A library tool's undo record of what it changed: what the step's *Undo* replays
+   *  (docs/web.md § The Files page's Agent card). */
+  library: LibraryStep | null
 }
 
 export interface NoteStep {
@@ -166,6 +188,9 @@ export type ThreadItem =
       quote: string | null
       command: string | null
       attachments: UserAttachment[]
+      /** The Files paths of the items selected on the Files page when it was sent (a library
+       *  conversation's); empty when none went. */
+      picked: string[]
     }
   | { kind: 'text'; key: string; text: string }
   | { kind: 'memory'; key: string; turnId: string; line: MemoryLine }
@@ -294,6 +319,7 @@ function userItem(prefix: string, turnId: string, typed: ChatMessage[]): ThreadI
   let command: string | null = null
   const quotes: string[] = []
   const attachments: UserAttachment[] = []
+  let picked: string[] = []
   first.content.forEach((block, index) => {
     if (block.type === 'text' && block.context === 'skill' && block.skill) {
       command = block.skill
@@ -302,6 +328,8 @@ function userItem(prefix: string, turnId: string, typed: ChatMessage[]): ThreadI
       command = INIT_COMMAND
     } else if (block.type === 'text' && block.context === 'quote') {
       quotes.push(blockText(block))
+    } else if (block.type === 'text' && block.context === 'library' && block.library) {
+      picked = block.library.items
     } else if (block.type === 'text' && block.context === 'attachment' && block.attachment) {
       attachments.push({ key: `${prefix}-file-${index}`, name: block.attachment.name, image: false, index, preview: null })
     } else if (block.type === 'image' && block.attachment) {
@@ -332,6 +360,7 @@ function userItem(prefix: string, turnId: string, typed: ChatMessage[]): ThreadI
     quote: quotes.filter(Boolean).join('\n') || null,
     command,
     attachments,
+    picked,
   }
 }
 
@@ -339,6 +368,7 @@ interface Outcome {
   isError: boolean
   output: string
   subagent?: SubagentRecord
+  library?: LibraryStep
 }
 
 /** One flat entry of a turn before its steps are grouped. */
@@ -425,6 +455,7 @@ export function buildThread(input: ThreadInput): Thread {
             isError: block.is_error === true,
             output: resultText(block.content),
             subagent: block.subagent,
+            library: block.library,
           })
         }
       }
@@ -438,6 +469,7 @@ export function buildThread(input: ThreadInput): Thread {
           // The record's text is the whole result; the event's is what the stream carried.
           output: known?.output || event.output || '',
           subagent: event.subagent ?? known?.subagent,
+          library: event.library ?? known?.library,
         })
       } else if (event.event === 'edit') {
         edits.set(event.tool_use_id, event)
@@ -485,6 +517,7 @@ export function buildThread(input: ThreadInput): Thread {
         command: name === 'bash' && !input.restart ? lineOf(input.command) : null,
         card,
         added: card ? addedLines(card.lines) : null,
+        library: results.get(id)?.library ?? null,
       }
     }
 

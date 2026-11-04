@@ -15,6 +15,7 @@ import contextlib
 import secrets
 import uuid
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
@@ -51,22 +52,27 @@ from ..db.models import (
     utcnow,
 )
 from ..errors import ApiError
-from ..jobs import chat_compact, chat_events, chat_versions, summary
+from ..jobs import chat_compact, chat_events, chat_library, chat_versions, summary
 from ..jobs.intake import insufficient_credits
 from ..jobs.queue import HISTORY_FULL, count_active_turns, enqueue_turn, history_bytes
 from ..parsing.attachments import prepared_path
 from ..sandbox.client import SandboxClient, SandboxUnavailable
 from ..upstream.client import agent_models
+from ..workspace.agents_file import AGENTS_FILE, VM_ROOT
 from ..workspace.documents import (
     StorageUsage,
     current_revision,
     ensure_within_quota,
+    folder_chain,
     is_live,
+    make_folder_dir,
     materialize_document,
     measure_storage,
+    trashed_folder_ids,
     user_folders,
 )
-from ..workspace.layout import user_root
+from ..workspace.layout import FILES_DIR, path_segment, user_root
+from ..workspace.locks import workspace_lock
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
@@ -192,6 +198,48 @@ async def create_conversation(
     return conversation_payload(row, settings, compactable=False)
 
 
+@router.get("/library/conversations")
+async def list_library_conversations(user: SessionUser, db: DbSession, settings: AppSettings):
+    """The Files page's threads: the caller's library conversations, apart from every
+    document's, only those holding a message, the one continued last first (docs/chat.md
+    § Library conversations)."""
+    rows = (
+        (
+            await db.execute(
+                select(Conversation)
+                .where(
+                    Conversation.user_id == user.id,
+                    Conversation.document_id.is_(None),
+                    exists().where(Message.conversation_id == Conversation.id),
+                )
+                .order_by(Conversation.updated_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    compactable = await chat_compact.compactable_ids(db, [row.id for row in rows])
+    return {
+        "conversations": [
+            conversation_payload(row, settings, compactable=row.id in compactable) for row in rows
+        ]
+    }
+
+
+@router.post(
+    "/library/conversations", dependencies=[CsrfGuard], status_code=status.HTTP_201_CREATED
+)
+async def create_library_conversation(user: SessionUser, db: DbSession, settings: AppSettings):
+    """A library conversation, about no document: the workspace is made sure of first, since
+    there is no document to materialize (docs/chat.md § Library conversations)."""
+    async with workspace_lock(user_root(settings.workspaces_dir, user.id)):
+        await make_folder_dir(settings, user.id, Path(FILES_DIR))
+    row = Conversation(user_id=user.id, document_id=None, title="", session=secrets.token_hex(8))
+    db.add(row)
+    await db.commit()
+    return conversation_payload(row, settings, compactable=False)
+
+
 # What the stored selection block says before the passage (docs/chat.md § Prompt caching).
 SELECTION_PREFIX = "The passage selected in the document:\n\n"
 # And the reply's quote before its passage (docs/chat.md § What a user message carries).
@@ -200,6 +248,11 @@ ATTACHMENT_EXPIRED = "An attachment is no longer available; attach it again"
 
 
 SECTION_CONTEXT = "section"
+# The Files page as a library conversation's message carries it (docs/chat.md § Library
+# conversations): the block's marker, and what the model reads before the folder.
+LIBRARY_CONTEXT = "library"
+LIBRARY_PREFIX = "The Files page as the user sent this message:"
+NO_PASSAGE = "A library conversation has no document passage"
 
 
 def section_text(heading: str, text: str | None) -> str:
@@ -249,6 +302,19 @@ def display_content(content: list) -> list:
         elif marker == "attachment":
             shown.append(
                 {"type": "text", "context": "attachment", "attachment": block.get("attachment")}
+            )
+        elif marker == LIBRARY_CONTEXT:
+            # The Files paths the thread draws above the bubble, never the model's text.
+            stored = block.get("library") if isinstance(block.get("library"), dict) else {}
+            shown.append(
+                {
+                    "type": "text",
+                    "context": LIBRARY_CONTEXT,
+                    "library": {
+                        "folder": stored.get("folder") or "",
+                        "items": stored.get("items") or [],
+                    },
+                }
             )
         elif marker == chat_agent.INIT_CONTEXT:
             # The `/init` instruction is nothing the thread shows; the marker stays, so the
@@ -471,6 +537,21 @@ class SectionIn(BaseModel):
     text: str | None = None
 
 
+class LibraryItemIn(BaseModel):
+    kind: Literal["folder", "document"]
+    id: int
+
+
+class LibraryIn(BaseModel):
+    """The Files page as the reader sent a library conversation's message: the folder open
+    in the list (None: the top) and the rows selected on the Files tab (docs/chat.md
+    § Library conversations). At most `CHAT_LIBRARY_ITEMS_PER_MESSAGE` items, checked in
+    the route."""
+
+    folder_id: int | None = None
+    items: list[LibraryItemIn] = Field(default_factory=list)
+
+
 class MessageCreate(BaseModel):
     # The caps are the deployment's (`CHAT_MESSAGE_MAX_CHARS`, `CHAT_SELECTION_MAX_CHARS`,
     # `CHAT_SECTIONS_PER_MESSAGE`, `CHAT_ATTACHMENTS_PER_MESSAGE`), checked in the route
@@ -489,6 +570,8 @@ class MessageCreate(BaseModel):
     command: str | None = Field(default=None, max_length=64)
     # Ids `POST /api/attachments` returned.
     attachments: list[uuid.UUID] = Field(default_factory=list)
+    # A library conversation's only: the Files page as the message was sent.
+    library: LibraryIn | None = None
     # The web app's locale: the language the turn answers in (docs/chat.md § System prompt).
     locale: str = Field(default="en", max_length=16, pattern=r"^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$")
 
@@ -549,9 +632,10 @@ async def _admitted(
     """The admission a message and an edit share (docs/chat.md § Conversations, turns,
     events): the workspace's quota, the locks, the live-document check, the model fixed on
     a first send, the per-user cap and one turn at a time. Returns the conversation's row
-    as locked — its title, head and summary row, read under the lock — the document, the
-    chat agent's settings and the conversation's turns, read under the lock too: the branch
-    a message joins is decided where no other send can move it."""
+    as locked — its title, head and summary row, read under the lock — the document (None
+    for a library conversation), the chat agent's settings and the conversation's turns,
+    read under the lock too: the branch a message joins is decided where no other send can
+    move it."""
     # A full workspace runs no turn (docs/workspace.md § Quota): refused here, where the
     # reader is told at once, rather than as a turn that fails after it was accepted.
     await ensure_within_quota(db, settings, user.id, user_root(settings.workspaces_dir, user.id))
@@ -580,10 +664,15 @@ async def _admitted(
         raise ApiError(404, "invalid_request", "No such conversation")
     # Under the user's row lock, which a move to the Trash takes before it marks the row:
     # no turn starts on a file in the Trash, and none queued here is missed by its check
-    # for unfinished turns (docs/workspace.md § The Trash).
-    document = await db.get(Document, row.document_id)
-    if document is None or not is_live(document, await user_folders(db, user.id)):
-        raise ApiError(409, "invalid_request", "This file is in the Trash; put it back to continue")
+    # for unfinished turns (docs/workspace.md § The Trash). A library conversation has no
+    # document to check (docs/chat.md § Library conversations).
+    document = None
+    if row.document_id is not None:
+        document = await db.get(Document, row.document_id)
+        if document is None or not is_live(document, await user_folders(db, user.id)):
+            raise ApiError(
+                409, "invalid_request", "This file is in the Trash; put it back to continue"
+            )
     setting, model = await _ready_to_chat(db, settings, user.id, needs_model=row.model is None)
     if row.model is None and model is not None:
         # The model the message was sent under, fixed as it is accepted: a change on the
@@ -627,10 +716,13 @@ async def post_message(
             "invalid_request",
             f"At most {settings.chat_attachments_per_message} attachments go with one message",
         )
+    _check_library_size(body.library, settings)
     command = (body.command or "").strip() or None
     if not body.text.strip() and command is None and not attachment_ids:
         raise ApiError(400, "invalid_request", "The message needs text, a command or a file")
     row = await owned_conversation(db, user.id, conversation_id)
+    in_library = row.document_id is None
+    _check_kind(in_library, body.library, (body.selection or "").strip() or sections)
     locked, document, setting, turns = await _admitted(db, settings, user, row)
     # The message continues the branch the conversation shows, measured from that branch's
     # summary row, both as locked (docs/chat.md § History is append-only, *An edited
@@ -662,7 +754,7 @@ async def post_message(
         raise ApiError(400, "invalid_request", "/init takes no attachments")
 
     skill = (
-        await _invocable_skill(db, user.id, command)
+        await _invocable_skill(db, user.id, command, library=in_library)
         if command is not None and not compact and not init
         else None
     )
@@ -715,6 +807,15 @@ async def post_message(
     quote = (body.quote or "").strip() if not passage_free else ""
     if quote:
         content.append({"type": "text", "text": f"{QUOTE_PREFIX}{quote}", "context": "quote"})
+    # The Files page, after the quote (docs/chat.md § What a user message carries) — with an
+    # `/init` too, whose open folder it names; a compaction carries none.
+    library = (
+        await _library_block(db, user.id, body.library)
+        if body.library is not None and not compact
+        else None
+    )
+    if library is not None:
+        content.append(library)
     if compact:
         content.append(
             {
@@ -725,11 +826,7 @@ async def post_message(
         )
     if init:
         content.append(
-            {
-                "type": "text",
-                "text": chat_agent.init_instruction(body.text),
-                "context": chat_agent.INIT_CONTEXT,
-            }
+            await _init_block(db, user.id, in_library, [library] if library else [], body.text)
         )
     if skill is not None:
         content.append(
@@ -738,13 +835,14 @@ async def post_message(
     # The document's revision as the message is accepted, the reader's locale and the
     # languages they chose: with the message rather than in the system prompt, so an edit
     # made meanwhile reaches the model and a change of language costs no cache (docs/chat.md
-    # § Prompt caching, § Instructions).
-    revision = await current_revision(db, settings, document)
+    # § Prompt caching, § Instructions). A library conversation has no revision.
+    revision = await current_revision(db, settings, document) if document is not None else None
     note = turn_note(
         revision,
         body.locale,
         setting.answer_language if setting else None,
         setting.translate_language if setting else None,
+        document=document is not None,
     )
     content.append({"type": "text", "text": note, "context": TURN_CONTEXT})
     message = Message(conversation_id=row.id, role="user", content=content)
@@ -807,6 +905,9 @@ class MessageEdit(BaseModel):
     locale (docs/api.md)."""
 
     text: str = ""
+    # A library conversation's Files page as the edit was sent: given, it replaces the
+    # message's `context: library` block; absent, the block is carried as stored.
+    library: LibraryIn | None = None
     locale: str = Field(default="en", max_length=16, pattern=r"^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$")
 
 
@@ -831,7 +932,10 @@ async def edit_message(
     has cached and whose thinking blocks stay valid."""
     if len(body.text) > settings.chat_message_max_chars:
         raise ApiError(400, "invalid_request", "The message is too long")
+    _check_library_size(body.library, settings)
     row = await owned_conversation(db, user.id, conversation_id)
+    in_library = row.document_id is None
+    _check_kind(in_library, body.library, None)
     original = await db.get(Message, message_id)
     if original is None or original.conversation_id != row.id or original.role != "user":
         raise ApiError(404, "invalid_request", "No such message")
@@ -861,9 +965,14 @@ async def edit_message(
     selection = [block for block in carried if block.get("context") == "selection"]
     sections = [block for block in carried if block.get("context") == SECTION_CONTEXT]
     quote = [block for block in carried if block.get("context") == "quote"]
+    library = (
+        [await _library_block(db, user.id, body.library)]
+        if body.library is not None
+        else [block for block in carried if block.get("context") == LIBRARY_CONTEXT]
+    )
     command = next((block for block in carried if block.get("context") == "skill"), None)
     skill = (
-        await _invocable_skill(db, user.id, str(command.get("skill") or ""))
+        await _invocable_skill(db, user.id, str(command.get("skill") or ""), library=in_library)
         if command is not None
         else None
     )
@@ -883,7 +992,7 @@ async def edit_message(
     content: list[dict] = list(attachments)
     if visible.strip():
         content.append({"type": "text", "text": visible})
-    content += selection + sections + quote
+    content += selection + sections + quote + library
     if skill is not None:
         content.append(
             _skill_block(
@@ -894,19 +1003,14 @@ async def edit_message(
             )
         )
     if init:
-        content.append(
-            {
-                "type": "text",
-                "text": chat_agent.init_instruction(body.text),
-                "context": chat_agent.INIT_CONTEXT,
-            }
-        )
-    revision = await current_revision(db, settings, document)
+        content.append(await _init_block(db, user.id, in_library, library, body.text))
+    revision = await current_revision(db, settings, document) if document is not None else None
     note = turn_note(
         revision,
         body.locale,
         setting.answer_language if setting else None,
         setting.translate_language if setting else None,
+        document=document is not None,
     )
     content.append({"type": "text", "text": note, "context": TURN_CONTEXT})
     message = Message(conversation_id=row.id, role="user", content=content)
@@ -960,10 +1064,11 @@ async def edit_message(
 
 
 async def _invocable_skill(
-    db: AsyncSession, user_id: int, command: str
+    db: AsyncSession, user_id: int, command: str, *, library: bool
 ) -> skill_defs.ResolvedSkill:
     """The skill a command names, as the caller can run it now (docs/chat.md § Skills);
-    **400** for a name that is no such skill — or no longer is."""
+    **400** for a name that is no such skill — or no longer is — and, in a library
+    conversation (`library`), for one that works on a document."""
     rows = (await db.execute(select(Skill).where(Skill.user_id == user_id))).scalars().all()
     skill = next(
         (
@@ -975,7 +1080,112 @@ async def _invocable_skill(
     )
     if skill is None:
         raise ApiError(400, "invalid_request", f"No command /{command}")
+    if library and skill.document_only:
+        raise ApiError(400, "invalid_request", "This skill works on a document: open one to use it")
     return skill
+
+
+def _check_library_size(library: LibraryIn | None, settings: AppSettings) -> None:
+    """The Files page's items past `CHAT_LIBRARY_ITEMS_PER_MESSAGE` are refused (docs/api.md)."""
+    if library is not None and len(library.items) > settings.chat_library_items_per_message:
+        raise ApiError(
+            400,
+            "invalid_request",
+            f"At most {settings.chat_library_items_per_message} items go with one message",
+        )
+
+
+def _check_kind(in_library: bool, library: LibraryIn | None, passage: object) -> None:
+    """What each kind of conversation takes (docs/chat.md § Library conversations): a
+    library conversation no passage of a document, a document's no Files page."""
+    if in_library and passage:
+        raise ApiError(400, "invalid_request", NO_PASSAGE)
+    if not in_library and library is not None:
+        raise ApiError(
+            400, "invalid_request", "Only a conversation from the Files page carries `library`"
+        )
+
+
+async def _library_block(db: AsyncSession, user_id: int, library: LibraryIn) -> dict:
+    """The Files page as the message carries it: the open folder and the selected items by
+    their Files paths, for the model, and the paths alone for the thread. An id that is not
+    the caller's, is in the Trash or is gone is left out; such a folder open reads as the
+    top (docs/chat.md § Library conversations)."""
+    folders = await user_folders(db, user_id)
+    trashed = trashed_folder_ids(folders.values())
+
+    def live_folder(folder_id: int | None) -> bool:
+        return folder_id in folders and folder_id not in trashed
+
+    wanted = [item.id for item in library.items if item.kind == "document"]
+    documents = (
+        {
+            row.id: row
+            for row in (
+                await db.execute(
+                    select(Document).where(Document.user_id == user_id, Document.id.in_(wanted))
+                )
+            ).scalars()
+        }
+        if wanted
+        else {}
+    )
+    picked: list[tuple[str, str, int]] = []
+    for item in library.items:
+        if any(kind == item.kind and row_id == item.id for _, kind, row_id in picked):
+            continue
+        if item.kind == "folder":
+            if live_folder(item.id):
+                picked.append((chat_library.folder_path(folders, item.id), "folder", item.id))
+            continue
+        document = documents.get(item.id)
+        if document is not None and is_live(document, folders):
+            path = chat_library.item_path(folders, document.folder_id, document.name)
+            picked.append((path, "document", item.id))
+    opened = library.folder_id if live_folder(library.folder_id) else None
+    folder = chat_library.folder_path(folders, opened)
+    lines = [
+        LIBRARY_PREFIX,
+        f"- open folder: {folder} (folder {opened})"
+        if opened is not None
+        else "- open folder: the top of the library",
+    ]
+    if picked:
+        lines.append(f"- selected ({len(picked)}):")
+        lines += [f"  - {path} ({kind} {row_id})" for path, kind, row_id in picked]
+    return {
+        "type": "text",
+        "text": "\n".join(lines),
+        "context": LIBRARY_CONTEXT,
+        # `folder_id` for an `/init` edited later, whose folder may have moved since.
+        "library": {
+            "folder": folder,
+            "folder_id": opened,
+            "items": [path for path, _, _ in picked],
+        },
+    }
+
+
+async def _init_block(
+    db: AsyncSession, user_id: int, in_library: bool, library: list[dict], note: str
+) -> dict:
+    """The `/init` instruction: about the folder the document is in, or in a library
+    conversation the open folder its Files-page block names, where it is now — the top
+    without one, or once it is gone or in the Trash (docs/chat.md § AGENTS.md)."""
+    if not in_library:
+        text = chat_agent.init_instruction(note)
+    else:
+        shown = library[0].get("library") if library else None
+        folder_id = shown.get("folder_id") if isinstance(shown, dict) else None
+        folders = await user_folders(db, user_id)
+        if folder_id not in folders or folder_id in trashed_folder_ids(folders.values()):
+            folder_id = None
+        names = [row.name for row in folder_chain(folders, folder_id)]
+        agents_file = VM_ROOT.joinpath(
+            FILES_DIR, *(path_segment(name) for name in names), AGENTS_FILE
+        ).as_posix()
+        text = chat_agent.library_init_instruction("/".join(names), agents_file, note)
+    return {"type": "text", "text": text, "context": chat_agent.INIT_CONTEXT}
 
 
 def _skill_block(

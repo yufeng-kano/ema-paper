@@ -3,6 +3,7 @@
  * draft is a command being typed and which commands it matches, and whether a file may be
  * attached at all before a byte of it is sent.
  */
+import type { LibraryMessage } from './library'
 
 /** One row of the `/` menu. */
 export interface CommandOption {
@@ -179,6 +180,9 @@ export interface ComposerPayload {
   quote: string | null
   command: string | null
   attachments: SentAttachment[]
+  /** A library conversation's: the Files page's folder and selection (docs/web.md § The Files
+   *  page's Agent card). */
+  library?: LibraryMessage
 }
 
 /**

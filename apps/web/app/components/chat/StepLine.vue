@@ -13,6 +13,8 @@ const props = defineProps<{
   step: ToolStep | SkillRunStep
   /** An edit the reader reverted says so in place of its check. */
   state?: CardState | null
+  /** A library step the reader undid says so too. */
+  undone?: boolean
 }>()
 
 const { t } = useI18n()
@@ -32,10 +34,11 @@ const added = computed(() => (props.step.type === 'tool' ? props.step.added : nu
   <UiIcon :name="labels.icon(view.kind)" class="glyph" />
   <span class="verb">{{ labels.verb(view) }}</span>
   <span v-if="target.text" class="target" :class="{ mono: !target.own }">{{ target.text }}</span>
-  <span v-if="detail" class="detail">{{ detail }}</span>
+  <span v-if="detail" class="detail" :class="{ place: view.place !== undefined }">{{ detail }}</span>
   <span v-if="added" class="added mono tabular">+{{ added }}</span>
   <span class="spacer" />
   <span v-if="state?.reverted" class="reverted">{{ t('chat.reverted') }}</span>
+  <span v-else-if="undone" class="reverted">{{ t('chat.undone') }}</span>
   <template v-else>
     <UiSpinner v-if="status === 'pending'" class="mark running" :size="12" />
     <UiIcon v-else-if="status === 'ok'" name="check" class="mark ok" />
@@ -69,6 +72,15 @@ const added = computed(() => (props.step.type === 'tool' ? props.step.added : nu
 .detail {
   flex-shrink: 0;
   color: var(--faint);
+}
+
+/* A move's or a copy's destination is a path as long as the target: cut like it. */
+.detail.place {
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .added {

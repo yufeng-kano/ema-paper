@@ -734,6 +734,7 @@ async def test_a_destination_trashed_after_the_check_takes_no_new_entry(
     from sqlalchemy import select, update
 
     from sightread.routes import library as routes
+    from sightread.workspace import filing
 
     inbox = await _folder(writer, "Inbox")
     checked = routes.live_folder
@@ -747,7 +748,10 @@ async def test_a_destination_trashed_after_the_check_takes_no_new_entry(
             await other.commit()
         return row
 
+    # The folder route checks before it takes the lock; a new document's check is the
+    # filing's own, shared with the chat agent's `new_document` (docs/workspace.md).
     monkeypatch.setattr(routes, "live_folder", check_then_trash)
+    monkeypatch.setattr(filing, "live_folder", check_then_trash)
     key = "folder_id" if "documents" in path else "parent_id"
     response = await writer.post(path, json={**body, key: inbox["id"]}, headers=CSRF_HEADERS)
     assert response.status_code == 404, response.text

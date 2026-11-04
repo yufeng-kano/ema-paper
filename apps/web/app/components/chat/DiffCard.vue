@@ -7,12 +7,18 @@
 import { basename } from '~/lib/steps'
 import type { CardState, EditCard } from '~/lib/thread'
 
-const props = defineProps<{
-  card: EditCard
-  state: CardState
-  /** A turn is unfinished: the revisions route refuses a revert under one. */
-  locked: boolean
-}>()
+const props = withDefaults(
+  defineProps<{
+    card: EditCard
+    state: CardState
+    /** A turn is unfinished: the revisions route refuses a revert under one. */
+    locked: boolean
+    /** *Revert* is offered: not in the Files page's card, where the revisions route — a
+     *  document's — has no document behind it (docs/web.md § The Files page's Agent card). */
+    revertable?: boolean
+  }>(),
+  { revertable: true },
+)
 
 const emit = defineEmits<{ toggle: [] }>()
 
@@ -39,7 +45,7 @@ const ownFile = computed(() => labels.ownFile(props.card.path))
         <span v-else class="mono card-path">· {{ basename(card.path) }}</span>
       </span>
       <button
-        v-if="card.commit"
+        v-if="card.commit && revertable"
         type="button"
         class="text-link"
         :disabled="state.pending || locked"

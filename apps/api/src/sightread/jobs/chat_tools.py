@@ -139,6 +139,10 @@ class ToolOutcome:
     # What a `memory` call changed, for its `memory` event: `{action, memory, previous}`
     # (docs/chat.md § Memory). Set on success only.
     memory: dict | None = field(default=None)
+    # What a library tool changed, as the Files page's undo keeps its steps: carried on the
+    # `tool_result` event and the stored block, stripped before the history goes upstream
+    # (docs/chat.md § Library conversations, *The library tools*). None when nothing changed.
+    library: dict | None = field(default=None)
 
 
 def truncate(text: str, max_chars: int) -> str:

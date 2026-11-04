@@ -1,10 +1,15 @@
 import { describe, expect, it } from 'vitest'
+import en from '../../i18n/locales/en'
+import zhTW from '../../i18n/locales/zh-TW'
 import {
+  SUMMARY_ORDER,
   addedLines,
   countKinds,
   diffFromInput,
+  filesPath,
   firstCommand,
   groupRuns,
+  ownFileDocument,
   parseDiff,
   readShell,
   readStep,
@@ -93,15 +98,34 @@ describe('readStep', () => {
       kind: 'read',
       target: 'doc.md',
       lines: { from: 10, to: null },
+      document: 'a',
     })
     expect(readStep('str_replace_based_edit_tool', { command: 'str_replace', path: '/workspace/files/a/doc.md' })).toEqual({
       kind: 'edit',
       target: 'doc.md',
+      document: 'a',
     })
     expect(readStep('str_replace_based_edit_tool', { command: 'create', path: 'x/notes.md' })).toEqual({
       kind: 'create',
       target: 'notes.md',
     })
+  })
+
+  it('says which document a doc.md or notes.md is, when the path says', () => {
+    expect(ownFileDocument('/workspace/files/DL/iBOT.pdf/doc.md')).toBe('DL/iBOT.pdf')
+    expect(ownFileDocument('/workspace/files/ML/MoCo.pdf/notes.md')).toBe('ML/MoCo.pdf')
+    // Not a document's own file, or a path that does not say whose.
+    expect(ownFileDocument('/workspace/files/DL/iBOT.pdf/figures/fig1.png')).toBeUndefined()
+    expect(ownFileDocument('/workspace/files/doc.md')).toBeUndefined()
+    expect(ownFileDocument('doc.md')).toBeUndefined()
+    // A shell step's file, whole or relative to where it `cd`'d; a run names a program.
+    expect(readStep('bash', { command: 'cat /workspace/files/DL/iBOT.pdf/doc.md' }).document).toBe('DL/iBOT.pdf')
+    expect(readStep('bash', { command: 'cd "/workspace/files/ML/MoCo.pdf" && sed -n 1,40p notes.md' }).document).toBe(
+      'ML/MoCo.pdf',
+    )
+    expect(readStep('bash', { command: 'grep -n loss /workspace/files/DL/iBOT.pdf/doc.md' }).document).toBe('DL/iBOT.pdf')
+    expect(readStep('bash', { command: 'sed -n 1,40p doc.md' }).document).toBeUndefined()
+    expect(readStep('bash', { command: 'cd /workspace/files/a && python3 /workspace/files/b/doc.md' }).document).toBeUndefined()
   })
 
   it('reads the page and figure views, skills, subagents, a restart and unknown tools', () => {
@@ -128,11 +152,98 @@ describe('readStep', () => {
     expect(readStep('convert_file', { path: 'Papers/paper.pdf', retry: 'yes' })).toEqual({ kind: 'convert', target: 'paper.pdf' })
     expect(
       readStep('insert_image', { image: '/workspace/.cache/loss.png', document: '/workspace/files/Papers/attention/notes.md' }),
-    ).toEqual({ kind: 'image', target: 'loss.png', file: 'notes.md' })
+    ).toEqual({ kind: 'image', target: 'loss.png', file: 'notes.md', document: 'Papers/attention' })
     expect(readStep('skill', { name: 'zh-summary', arguments: '' })).toEqual({ kind: 'skill', target: 'zh-summary' })
     expect(readStep('subagent', { name: 'verifier', task: 'x' })).toEqual({ kind: 'subagent', target: 'verifier' })
     expect(readStep('bash', { restart: true })).toEqual({ kind: 'restart', target: '' })
     expect(readStep('mystery', {})).toEqual({ kind: 'tool', target: 'mystery' })
+  })
+})
+
+describe('the library tools', () => {
+  it('names an item by its Files path, whichever form the call used', () => {
+    expect(filesPath('DL/DINO/iBOT.pdf')).toBe('DL/DINO/iBOT.pdf')
+    expect(filesPath('/DL/DINO/')).toBe('DL/DINO')
+    // A document's directory and its doc.md both name the document.
+    expect(filesPath('/workspace/files/DL/DINO/iBOT.pdf/doc.md')).toBe('DL/DINO/iBOT.pdf')
+    expect(filesPath('/workspace/files/DL/DINO/iBOT.pdf/')).toBe('DL/DINO/iBOT.pdf')
+    // Only the workspace form drops a doc.md: a Files path ending in one is a file of that name.
+    expect(filesPath('DL/doc.md')).toBe('DL/doc.md')
+    expect(filesPath('/workspace/files/doc.md')).toBe('doc.md')
+    expect(filesPath('/workspace/filesystem/a')).toBe('workspace/filesystem/a')
+    for (const top of ['', '/', '/workspace/files', '/workspace/files/', undefined, 7]) {
+      expect(filesPath(top)).toBe('')
+    }
+  })
+
+  it('reads each tool as its own kind, never the tool’s name', () => {
+    expect(readStep('list_files', { path: 'DL' })).toEqual({ kind: 'browse', target: 'DL' })
+    expect(readStep('list_files', {})).toEqual({ kind: 'browse', target: '' })
+    expect(readStep('list_files', { path: 'DL', recursive: true, trash: true })).toEqual({
+      kind: 'browse',
+      target: '',
+      trash: true,
+    })
+    expect(readStep('new_folder', { path: 'DL/Transformer/' })).toEqual({ kind: 'folder', target: 'DL/Transformer' })
+    expect(readStep('new_document', { path: '/workspace/files/DL/Reading list', text: '# x' })).toEqual({
+      kind: 'newDocument',
+      target: 'DL/Reading list',
+    })
+    expect(readStep('rename', { path: 'DL/scan_0412.pdf', name: 'ViT.pdf' })).toEqual({
+      kind: 'rename',
+      target: 'DL/scan_0412.pdf',
+      name: 'ViT.pdf',
+    })
+  })
+
+  it('names a batch of one by its path and a larger one by its count, with the destination', () => {
+    expect(readStep('move', { paths: ['DL/iBOT.pdf'], to: 'DL/DINO' })).toEqual({
+      kind: 'move',
+      target: 'DL/iBOT.pdf',
+      place: 'DL/DINO',
+    })
+    expect(readStep('move', { paths: ['a.pdf', '/workspace/files/b.pdf/doc.md'], to: '/' })).toEqual({
+      kind: 'move',
+      target: '',
+      items: 2,
+      place: '',
+    })
+    expect(readStep('copy', { paths: ['a.pdf', 'b.pdf', 'c.pdf'], to: 'Archive' })).toEqual({
+      kind: 'duplicate',
+      target: '',
+      items: 3,
+      place: 'Archive',
+    })
+    expect(readStep('trash', { paths: ['DL/old'] })).toEqual({ kind: 'trash', target: 'DL/old' })
+    expect(readStep('put_back', { paths: ['DL/old', 'DL/x.pdf'] })).toEqual({ kind: 'putBack', target: '', items: 2 })
+    // A call missing its list is a batch of nothing, not a crash.
+    expect(readStep('trash', {})).toEqual({ kind: 'trash', target: '', items: 0 })
+  })
+
+  it('has every kind’s words in both catalogs, the Files page’s own in zh-TW', () => {
+    for (const catalog of [en, zhTW]) {
+      for (const kind of SUMMARY_ORDER) {
+        expect(catalog.chat.steps).toHaveProperty(kind)
+        expect(catalog.chat.summary).toHaveProperty(kind)
+        expect(catalog.chat.doing).toHaveProperty(kind)
+      }
+    }
+    expect(zhTW.chat.steps).toMatchObject({
+      browse: '列出',
+      folder: '新增資料夾',
+      move: '移動',
+      rename: '重新命名',
+      duplicate: '建立副本',
+      trash: '丟到垃圾桶',
+      putBack: '放回原處',
+      newDocument: '新增文件',
+    })
+    expect(zhTW.chat.steps.trash).toBe(zhTW.files.moveToTrash)
+    expect(zhTW.chat.steps.putBack).toBe(zhTW.files.putBack)
+    expect(zhTW.chat.steps.duplicate).toBe(zhTW.files.duplicate)
+    expect(en.chat.steps.trash).toBe(en.files.moveToTrash)
+    expect(en.chat.steps.putBack).toBe(en.files.putBack)
+    expect(en.chat.steps.duplicate).toBe(en.files.duplicate)
   })
 })
 
@@ -154,6 +265,15 @@ describe('countKinds', () => {
       { kind: 'read', count: 3 },
       { kind: 'search', count: 1 },
       { kind: 'edit', count: 2 },
+    ])
+  })
+
+  it('names what the library tools looked at before what they changed', () => {
+    expect(countKinds(['move', 'read', 'folder', 'browse', 'move'])).toEqual([
+      { kind: 'read', count: 1 },
+      { kind: 'browse', count: 1 },
+      { kind: 'folder', count: 1 },
+      { kind: 'move', count: 2 },
     ])
   })
 })

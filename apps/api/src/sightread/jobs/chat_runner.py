@@ -1,6 +1,7 @@
 """The chat agent's runner: one turn, one tool loop (docs/chat.md).
 
-Shape of a turn: load the conversation and its document, render the system prompt, replay
+Shape of a turn: load the conversation and its document (none for a library conversation,
+docs/chat.md § Library conversations), render the system prompt, replay
 the stored messages verbatim, stream the model's answer into events, run the tools it
 asked for, append the results, and go again until it stops. Everything the model produced
 is stored as it came, because the next turn replays it (docs/chat.md § History).
@@ -81,10 +82,16 @@ from ..workspace.documents import (
     prepare_inserted_image,
     recover_trash,
     stage_upload,
-    trashed_folder_ids,
     user_folders,
 )
-from ..workspace.layout import DOC_FILE, FIGURES_DIR, NOTES_FILE, document_relative_dir
+from ..workspace.layout import (
+    DOC_FILE,
+    FIGURES_DIR,
+    FILES_DIR,
+    NOTES_FILE,
+    document_relative_dir,
+    user_root,
+)
 from ..workspace.locks import (
     backup_shared,
     clear_writing,
@@ -94,7 +101,15 @@ from ..workspace.locks import (
 )
 from ..workspace.memory_file import memory_file_text
 from ..workspace.reconcile import meta_document_id, reconcile_locked, reconcile_user
-from . import chat_events, chat_memory, chat_subagent, chat_tools, chat_versions, chat_web
+from . import (
+    chat_events,
+    chat_library,
+    chat_memory,
+    chat_subagent,
+    chat_tools,
+    chat_versions,
+    chat_web,
+)
 from .chat_compact import SUMMARY_CONTEXT
 from .intake import convert_kept_file, retry_library_parse
 from .queue import HISTORY_FULL, claim_job, history_bytes, requeue_job
@@ -147,8 +162,11 @@ class TurnContext:
     sessionmaker: async_sessionmaker[AsyncSession]
     turn: ChatTurn
     conversation: Conversation
-    document: Document
+    # None: a library conversation, about the reader's whole library (docs/chat.md
+    # § Library conversations).
+    document: Document | None
     job: Job | None  # None: a markdown document, which has no parse (docs/workspace.md)
+    # A library conversation's: the user's root, with `files` as its relative path.
     paths: DocumentPaths
     connection: Connection
     model: str
@@ -253,11 +271,20 @@ async def _load(
         if turn is None or turn.status != "running":
             raise TurnFailed("the turn is no longer running")
         conversation = await db.get(Conversation, turn.conversation_id)
-        document = await db.get(Document, conversation.document_id) if conversation else None
-        if conversation is None or document is None:
+        library = conversation is not None and conversation.document_id is None
+        document = (
+            await db.get(Document, conversation.document_id)
+            if conversation is not None and not library
+            else None
+        )
+        if conversation is None or (document is None and not library):
             raise TurnFailed("the conversation's document no longer exists")
-        job = await db.get(Job, document.job_id) if document.job_id is not None else None
-        if document.job_id is not None and job is None:
+        job = (
+            await db.get(Job, document.job_id)
+            if document is not None and document.job_id is not None
+            else None
+        )
+        if document is not None and document.job_id is not None and job is None:
             raise TurnFailed("the document's parse no longer exists")
         setting = (
             await db.execute(
@@ -301,6 +328,8 @@ async def _load(
             raise TurnFailed("Kano Proxy is not configured on this deployment")
         # The reader's own prompt replaces the default whole; a legacy preset is appended
         # to it as before, and never stands beside a prompt (docs/chat.md § System prompt).
+        # A library conversation always renders its own: the reader's is written for a
+        # document and its tokens (docs/chat.md § Library conversations).
         own_prompt = setting.prompt if setting and setting.prompt else None
         preset = setting.prompt_preset if setting and own_prompt is None else None
         # Appended after the prompt, whichever is in force (docs/chat.md § Instructions).
@@ -312,6 +341,11 @@ async def _load(
         subagents = subagent_defs.resolve_subagents(
             (await db.execute(select(Subagent).where(Subagent.user_id == turn.user_id))).scalars()
         )
+        if library:
+            # What works on a document is not offered where there is none (docs/chat.md
+            # § Skills, § Subagents).
+            skills = [skill for skill in skills if not skill.document_only]
+            subagents = [subagent for subagent in subagents if not subagent.document_only]
         # The memory file as the conversation's first turn finds it, stored with this
         # commit like the memory snapshot and read from there by every later turn, so the
         # agent's own writes never cost the conversation its cache (docs/chat.md § Memory,
@@ -322,13 +356,16 @@ async def _load(
             conversation.memory_file = await memory_file_text(settings, turn.user_id)
         # The AGENTS.md files on the document's path, the same way (docs/chat.md
         # § AGENTS.md): read before anything is materialized, from the path the rows name.
+        # A library conversation's is the root's alone.
         if conversation.agents_file is None:
             conversation.agents_file = await agents_file_text(
                 settings,
                 turn.user_id,
                 document_relative_dir(
                     await folder_names(db, turn.user_id, document.folder_id), document.name
-                ).parent,
+                ).parent
+                if document is not None
+                else Path(FILES_DIR),
             )
         # The memory block: the conversation's snapshot, taken by its first turn and stored
         # with this commit, rendered from the rows as they are now (docs/chat.md § Memory).
@@ -343,7 +380,16 @@ async def _load(
         plan = await ledger.plan_of(db, settings, turn.user_id)
         await db.commit()
         try:
-            paths = await materialize_document(db, settings, document)
+            # A library conversation has no document to materialize: its paths are the
+            # user's root, the library its relative path.
+            paths = (
+                await materialize_document(db, settings, document)
+                if document is not None
+                else DocumentPaths(
+                    root=user_root(settings.workspaces_dir, turn.user_id),
+                    relative=Path(FILES_DIR),
+                )
+            )
             # A full workspace runs no shell: what the turn writes has nowhere to go
             # (docs/workspace.md § Quota).
             await ensure_within_quota(db, settings, turn.user_id, paths.root)
@@ -354,18 +400,24 @@ async def _load(
                 "storage_full" if exc.error_type == "storage_full" else exc.message
             ) from exc
 
-    facts = document_facts(settings, job, paths)
+    facts = (
+        document_facts(settings, job, paths)
+        if document is not None
+        else {"network": chat_agent.network_note(settings.sandbox_network, settings.egress_hosts)}
+    )
     # `bash` only on a plan that grants it, and only with a runner (docs/billing.md).
     shell = ledger.sandbox_granted(settings, plan)
     sandbox = SandboxClient(settings) if shell else None
-    tools = turn_tools(shell, settings)
+    tools = turn_tools(shell, settings, library=library)
     # The prompt, then a legacy preset, the reader's instructions, the catalogue — read
     # per turn like the prompt, so an edit on the Agent page misses the cache once — and
     # the memory block last (docs/chat.md § Prompt caching).
     parts = chat_agent.system_parts(
         # The tool list as the turn has it: no `bash` line without a runner.
         chat_agent.render_system_prompt(
-            own_prompt or CHAT.default_prompt_template,
+            chat_agent.LIBRARY_SYSTEM_PROMPT
+            if library
+            else own_prompt or CHAT.default_prompt_template,
             facts,
             tools=[tool["name"] for tool in tools],
         ),
@@ -377,7 +429,7 @@ async def _load(
             conversation.memory_file, settings.chat_memory_file_max_chars
         ),
         agents_file=chat_agent.render_agents_file(
-            conversation.agents_file, settings.chat_agents_file_max_chars
+            conversation.agents_file, settings.chat_agents_file_max_chars, library=library
         ),
     )
 
@@ -422,13 +474,21 @@ def document_facts(settings: Settings, job: Job | None, paths: DocumentPaths) ->
     }
 
 
-def turn_tools(shell: bool, settings: Settings) -> list[dict]:
+def turn_tools(shell: bool, settings: Settings, *, library: bool = False) -> list[dict]:
     """The tools a turn declares: every one, in its fixed order, but `bash` only where the
     plan grants a shell and a sandbox runner exists, and the web tools only where the
     deployment can run them — a tool the harness cannot run is not offered
-    (docs/sandbox.md, docs/billing.md § Plans, docs/chat.md § Tools)."""
+    (docs/sandbox.md, docs/billing.md § Plans, docs/chat.md § Tools). A library
+    conversation (`library`) has no `view_page` or `view_figure`, there being no document
+    for them to read, and has the library tools last (docs/chat.md § Library
+    conversations)."""
+    base = chat_agent.TOOLS if shell else chat_agent.TOOLS_WITHOUT_BASH
     return [
-        *(chat_agent.TOOLS if shell else chat_agent.TOOLS_WITHOUT_BASH),
+        *(
+            (tool for tool in base if tool["name"] not in chat_agent.DOCUMENT_TOOL_NAMES)
+            if library
+            else base
+        ),
         *chat_agent.web_tools(
             enabled=settings.chat_web_access,
             brave=bool(settings.brave_search_api_key),
@@ -436,6 +496,7 @@ def turn_tools(shell: bool, settings: Settings) -> list[dict]:
         ),
         *chat_agent.convert_tools(parse=bool(settings.parse_model)),
         chat_agent.INSERT_IMAGE_TOOL,
+        *(chat_agent.LIBRARY_TOOLS if library else ()),
     ]
 
 
@@ -587,11 +648,21 @@ def stale_thinking_left_out(messages: list[dict], binding: str) -> list[dict]:
 
 # The keys a stored block carries for the web app and the API never sees: the context
 # marker (docs/chat.md § Prompt caching), a command's skill, an attachment's name, a
-# section's heading and a subagent call's record (docs/chat.md § What a user message
-# carries, § Subagents), and the prompt a thinking block was made under and the cutoff an
+# section's heading, a subagent call's record and the Files page's paths and a library tool's
+# undo record (docs/chat.md § What a user message carries, § Subagents, § Library
+# conversations), and the prompt a thinking block was made under and the cutoff an
 # upstream's drop left (§ History is append-only).
 PRIVATE_KEYS = frozenset(
-    {"context", "skill", "attachment", "section", "subagent", "binding", "thinking_cutoff"}
+    {
+        "context",
+        "skill",
+        "attachment",
+        "section",
+        "subagent",
+        "library",
+        "binding",
+        "thinking_cutoff",
+    }
 )
 
 
@@ -1118,7 +1189,7 @@ async def _run_memory(
                 ctx.settings,
                 user_id=ctx.turn.user_id,
                 conversation_id=ctx.conversation.id,
-                document_id=ctx.document.id,
+                document_id=ctx.document.id if ctx.document is not None else None,
                 tool_use_id=tool_use_id,
                 tool_input=tool_input,
             )
@@ -1171,6 +1242,23 @@ async def run_mutating(ctx: TurnContext, name: str, tool_input: dict) -> chat_to
         return await _run_convert(ctx, tool_input)
     if name == "insert_image":
         return await _run_insert_image(ctx, tool_input)
+    if name == "list_files":
+        return await chat_library.list_files(
+            ctx.sessionmaker,
+            ctx.settings,
+            user_id=ctx.turn.user_id,
+            author=author,
+            tool_input=tool_input,
+        )
+    if name in chat_library.WRITE_TOOL_NAMES:
+        return await chat_library.run_tool(
+            ctx.sessionmaker,
+            ctx.settings,
+            user_id=ctx.turn.user_id,
+            author=author,
+            name=name,
+            tool_input=tool_input,
+        )
     if name != "bash":
         return await chat_tools.run_editor(
             ctx.paths.root,
@@ -1311,6 +1399,9 @@ async def _report_tool(
     data = {"id": tool_use_id, "name": name, "is_error": outcome.is_error, "output": summary}
     if outcome.subagent is not None:
         data["subagent"] = outcome.subagent
+    if outcome.library is not None:
+        # The card's Undo (docs/chat.md § Library conversations, *The library tools*).
+        data["library"] = outcome.library
     await _emit(ctx, chat_events.TOOL_RESULT, data)
     if outcome.edit is not None:
         await _emit(ctx, chat_events.EDIT, {**outcome.edit, "tool_use_id": tool_use_id})
@@ -1324,19 +1415,42 @@ async def _report_tool(
     if outcome.subagent is not None:
         # Kept for the panel, stripped before the history goes upstream (PRIVATE_KEYS).
         result["subagent"] = outcome.subagent
+    if outcome.library is not None:
+        # The same: a reloaded thread offers the step's Undo too.
+        result["library"] = outcome.library
     return result
 
 
 MUTATING_TOOLS = frozenset(
-    {"bash", "str_replace_based_edit_tool", "download_file", "convert_file", "insert_image"}
+    {
+        "bash",
+        "str_replace_based_edit_tool",
+        "download_file",
+        "convert_file",
+        "insert_image",
+        # A listing runs in order with the writes: it sees what the round's earlier calls
+        # changed, and it may write a document never written yet (docs/chat.md § Library
+        # conversations, *The library tools*).
+        "list_files",
+        *chat_library.WRITE_TOOL_NAMES,
+    }
 )
-# The tools a deployment may not declare — the web tools and `convert_file` — which a
-# history may still name (docs/chat.md § Tools).
-UNDECLARABLE_TOOLS = frozenset({*chat_agent.WEB_TOOL_NAMES, "convert_file"})
+# The tools a turn may not declare — the web tools and `convert_file` on a deployment
+# without them, `view_page` and `view_figure` in a library conversation, the library tools
+# in a document's — which a history or a model's guess may still name (docs/chat.md
+# § Tools, § Library conversations).
+UNDECLARABLE_TOOLS = frozenset(
+    {
+        *chat_agent.WEB_TOOL_NAMES,
+        "convert_file",
+        *chat_agent.DOCUMENT_TOOL_NAMES,
+        *chat_agent.LIBRARY_TOOL_NAMES,
+    }
+)
 # The web tools that run with the reads (docs/chat.md § Tools).
 WEB_READ_TOOLS = frozenset({"web_search", "search_papers", "read_url"})
 # Tools that return no image: a spent image budget is no reason to refuse them.
-NO_IMAGE_TOOLS = frozenset({"memory", *WEB_READ_TOOLS})
+NO_IMAGE_TOOLS = frozenset({"memory", "list_files", *WEB_READ_TOOLS})
 # Read-only tools of one round in flight together.
 READ_CONCURRENCY = 4
 IMAGE_BUDGET_SPENT = (
@@ -1702,46 +1816,6 @@ NO_CREDITS_FOR_CONVERSION = (
 )
 # How often a turn driving a parse looks for a Stop (docs/chat.md § Tools).
 CONVERT_POLL_SECONDS = 2.0
-VM_FILES = chat_tools.VM_ROOT / "files"
-
-
-def _library_segments(raw: str) -> list[str] | None:
-    """The folders and the name a `convert_file` path names, as the Files page shows them
-    (`Papers/2017/attention.pdf`) or under `/workspace/files/`; None for a path that names
-    nothing, or one with a `.` or `..` component."""
-    text = raw.strip().replace("\\", "/")
-    prefix = f"{VM_FILES.as_posix()}/"
-    if text.startswith(prefix):
-        text = text[len(prefix) :]
-    segments = [part.strip() for part in text.split("/") if part.strip()]
-    if not segments or any(part in (".", "..") for part in segments):
-        return None
-    return segments
-
-
-async def _folder_by_path(
-    db: AsyncSession, user_id: int, names: list[str]
-) -> tuple[bool, int | None]:
-    """The live folder a path of names leads to, as `filing.ensure_folders` finds one but
-    making none: `(found, folder id)`, the id None for the top level."""
-    folders = await user_folders(db, user_id)
-    trashed = trashed_folder_ids(folders.values())
-    parent_id: int | None = None
-    for name in names:
-        found = next(
-            (
-                folder
-                for folder in folders.values()
-                if folder.parent_id == parent_id
-                and folder.name == name
-                and folder.id not in trashed
-            ),
-            None,
-        )
-        if found is None:
-            return False, None
-        parent_id = found.id
-    return True, parent_id
 
 
 async def _run_convert(ctx: TurnContext, tool_input: dict) -> chat_tools.ToolOutcome:
@@ -1751,8 +1825,9 @@ async def _run_convert(ctx: TurnContext, tool_input: dict) -> chat_tools.ToolOut
     settings = ctx.settings
     user_id = ctx.turn.user_id
     root = ctx.paths.root
-    segments = _library_segments(_string_input(tool_input, "path"))
-    if segments is None:
+    # Resolved as the library tools resolve an item (docs/chat.md § Library conversations).
+    segments = chat_library.library_segments(_string_input(tool_input, "path"))
+    if not segments:
         return chat_tools.ToolOutcome(
             "The path names no file: give the file's folders and name under the user's "
             "files, as in 'Papers/2017/attention.pdf'.",
@@ -1762,9 +1837,8 @@ async def _run_convert(ctx: TurnContext, tool_input: dict) -> chat_tools.ToolOut
         return chat_tools.ToolOutcome(NO_CREDITS_FOR_CONVERSION, is_error=True)
     if not _turn_cap(ctx, "convert_file", settings.convert_file_max_per_turn):
         return _turn_cap_reached("convert_file", settings.convert_file_max_per_turn)
-    *folders, name = segments
     shown_path = "/".join(segments)
-    shown_doc = (VM_FILES / shown_path / DOC_FILE).as_posix()
+    shown_doc = (chat_library.VM_FILES / shown_path / DOC_FILE).as_posix()
     # Only a literal true: a retry is charged again, and the agent sends it once the user
     # said yes (docs/chat.md § Tools).
     retry = tool_input.get("retry") is True
@@ -1772,27 +1846,18 @@ async def _run_convert(ctx: TurnContext, tool_input: dict) -> chat_tools.ToolOut
     try:
         async with backup_shared(root), workspace_lock(root), ctx.sessionmaker() as db:
             await recover_trash(db, settings, user_id)
-            found, folder_id = await _folder_by_path(db, user_id, folders)
-            row = None
-            if found:
-                # What is in the Trash takes no name (docs/workspace.md § Files): a trashed
-                # row of the same name and place is not the file named.
-                row = (
-                    await db.execute(
-                        select(Document).where(
-                            Document.user_id == user_id,
-                            Document.name == name,
-                            Document.trashed_at.is_(None),
-                            Document.folder_id == folder_id
-                            if folder_id is not None
-                            else Document.folder_id.is_(None),
-                        )
-                    )
-                ).scalar_one_or_none()
-            if row is None or not is_live(row, await user_folders(db, user_id)):
+            # What is in the Trash takes no name (docs/workspace.md § Files): a trashed row
+            # of the same name and place is not the file named.
+            found = await chat_library.resolve(db, user_id, segments)
+            row = found.document if found is not None else None
+            if row is None:
                 return chat_tools.ToolOutcome(
                     f"No file at {shown_path} in the user's files.", is_error=True
                 )
+            # Named as the Files page names it, whichever way the path was given.
+            folders = await user_folders(db, user_id)
+            shown_path = chat_library.item_path(folders, row.folder_id, row.name)
+            shown_doc = f"{chat_library.vm_path(folders, row.folder_id, row.name)}/{DOC_FILE}"
             row_id = row.id
             converted_here = row.kind == FILE_KIND
             if converted_here:
@@ -2246,7 +2311,13 @@ async def _store_summary(ctx: TurnContext, content: list[dict]) -> None:
     if not summary:
         raise TurnFailed("compact_empty")
     memory_file = await memory_file_text(ctx.settings, ctx.turn.user_id)
-    agents_file = await agents_file_text(ctx.settings, ctx.turn.user_id, ctx.paths.relative.parent)
+    # As the conversation's first turn read them: the root's alone in a library
+    # conversation (docs/chat.md § AGENTS.md).
+    agents_file = await agents_file_text(
+        ctx.settings,
+        ctx.turn.user_id,
+        ctx.paths.relative.parent if ctx.document is not None else Path(FILES_DIR),
+    )
     async with ctx.sessionmaker() as db:
         await _still_ours(db, ctx)
         row = Message(

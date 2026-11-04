@@ -20,11 +20,19 @@
  * The document is the viewer's: the panel reads its headings to offer whole sections and
  * to tell which of an answer's section links still lead somewhere, and asks the viewer to
  * scroll to one (`locate`).
+ *
+ * With no document (`documentId` null) it is the Files page's card, in **library mode**
+ * (docs/web.md § The Files page's Agent card): the library's conversations, the page's place
+ * (`library`) as the composer's chips, rows dragged in bringing the selection back, the
+ * library tools' steps with an Undo the page runs (`undoLibrary`), the page told to read its
+ * library again (`library`, the event), and links to its folders and documents (`open-files`).
+ * A diff card there has no Revert and an answer block no *Add to notes*.
  */
 import {
   attachmentUrl,
   cancelTurn,
   createConversation,
+  createLibraryConversation,
   deleteConversation,
   editMessage,
   ApiRequestError,
@@ -33,6 +41,7 @@ import {
   getConversation,
   listAgents,
   listConversations,
+  listLibraryConversations,
   listMemories,
   renameConversation,
   generateTitle,
@@ -65,7 +74,9 @@ import { byRecency } from '~/lib/conversations'
 import { nodesToMarkdown } from '~/lib/copy'
 import { formatCount, formatDate } from '~/lib/format'
 import { turnErrorKey, turnErrorNeedsPlan } from '~/lib/turnError'
-import { ANSWER_DRAG_TYPE, BLOCK_DRAG_TYPE } from '~/lib/dnd'
+import { ANSWER_DRAG_TYPE, BLOCK_DRAG_TYPE, ROWS_DRAG_TYPE, claimDrag } from '~/lib/dnd'
+import type { LibraryPlace } from '~/lib/library'
+import { basename, type LibraryStep } from '~/lib/steps'
 import {
   blockPlain,
   documentOutline,
@@ -90,9 +101,12 @@ import {
   type ContextCardView,
   type EditCard,
   type ThreadItem,
+  type ToolStep,
+  type UndoState,
   type UserAttachment,
 } from '~/lib/thread'
 import type { StreamedEvent } from '~/composables/useConversationStream'
+import { libraryStepsKey } from '~/composables/useStepLabels'
 
 /** How long to wait before following a still-live turn again after the stream gave up. */
 const RESUME_AFTER_MS = 10_000
@@ -105,8 +119,12 @@ const FOLLOW_SLACK_PX = 24
  *  (the document handle's guard, ResultViewer). */
 const REOPEN_GUARD_MS = 300
 
+/** How many names of a sent selection the line above its bubble shows before an ellipsis. */
+const PICKED_NAMES_MAX = 3
+
 const props = defineProps<{
-  documentId: number
+  /** The document the thread is about; null in the Files page's card, about the library. */
+  documentId: number | null
   /** The document pane's current selection, read at the moment a message is composed. */
   documentSelection: () => string | null
   /** The document as the viewer renders it: its headings are what sections are added by
@@ -118,6 +136,12 @@ const props = defineProps<{
    *  leaves rather than a card to close (docs/web.md § Result viewer, *On a phone and a
    *  tablet*). */
   closable?: boolean
+  /** Library mode: where the reader is on the Files page — the composer's chips, and what
+   *  each message carries. */
+  library?: LibraryPlace
+  /** Library mode: takes a library step back through the Files page's own operations; a
+   *  refusal rejects, and the step shows it. */
+  undoLibrary?: (step: LibraryStep) => Promise<boolean>
 }>()
 
 const emit = defineEmits<{
@@ -136,11 +160,22 @@ const emit = defineEmits<{
   close: []
   /** Whether a turn is running, as it changes: the phone's Agent segment draws it. */
   running: [running: boolean]
+  /** Library mode: a running turn's library tools changed the library — their undo records,
+   *  as many as one batch of frames brought — or the turn ended (none): the Files page reads
+   *  its library again. */
+  library: [records: LibraryStep[]]
+  /** Library mode: an answer's link to a folder or a document of the Files page. */
+  'open-files': [target: { kind: 'folder' | 'document'; id: number }]
+  /** Library mode: the page's rows were dropped on the panel. */
+  'rows-dropped': []
 }>()
 
 const { t, locale } = useI18n()
 const { resolve } = useApiError()
 const auth = useAuth()
+// The steps and diff cards inside: in the Files page's card a document's own file is named
+// by the document, there being many.
+provide(libraryStepsKey, props.documentId === null)
 
 /** The server's own numbers: the composer checks attachments and sections against them. */
 const limits = computed(() => auth.me.value?.limits ?? null)
@@ -152,6 +187,8 @@ interface ComposerControls {
   setQuote: (text: string) => Promise<void>
   focus: () => void
   ask: (request: AskRequest) => Promise<AskOutcome>
+  showPicked: () => void
+  holds: boolean
 }
 
 const composer = ref<ComposerControls | null>(null)
@@ -180,7 +217,8 @@ async function readConversations() {
   const request = ++listRequest
   listPending.value = true
   try {
-    const { conversations: rows } = await listConversations(props.documentId)
+    const { conversations: rows } =
+      props.documentId === null ? await listLibraryConversations() : await listConversations(props.documentId)
     if (request === listRequest) {
       conversations.value = byRecency(rows)
       listError.value = null
@@ -476,6 +514,9 @@ const resolveCite: CiteResolver = (label, anchor) =>
   anchor.includes('~')
     ? resolveAnchor(props.documentPages(), readBlockAnchor(anchor), outline.value, placed.value) !== null
     : findHeading(outline.value, label, anchor) !== null
+/** With no document, a section or block link is still read, so it is drawn as its label
+ *  rather than its source, but leads nowhere: its plain text, as a heading that is gone. */
+const answerCite = computed<CiteResolver>(() => (props.documentId === null ? () => false : resolveCite))
 
 function currentSectionEntry(): OutlineEntry | null {
   const at = props.currentSection()
@@ -487,9 +528,18 @@ function sectionSourceOf(entry: OutlineEntry): string | null {
 }
 
 /** A click on a section link in an answer: the viewer scrolls there. Taken here, from the
- *  whole thread, since the links are drawn deep inside the answers' markdown. */
+ *  whole thread, since the links are drawn deep inside the answers' markdown. So is a click
+ *  on a link to the Files page, which the page follows without a load — unless a modifier
+ *  asks the browser for a new tab or window, which the link's address serves. */
 function onThreadClick(event: MouseEvent) {
-  const link = event.target instanceof Element ? event.target.closest<HTMLElement>('.md-cite') : null
+  const target = event.target instanceof Element ? event.target : null
+  const files = target?.closest<HTMLElement>('a[data-files-kind]')
+  if (files && !(event.metaKey || event.ctrlKey || event.shiftKey || event.altKey)) {
+    event.preventDefault()
+    emit('open-files', { kind: files.dataset.filesKind === 'folder' ? 'folder' : 'document', id: Number(files.dataset.filesId) })
+    return
+  }
+  const link = target?.closest<HTMLElement>('.md-cite')
   if (link && answerOf(link)) {
     emit('locate', { label: link.dataset.citeLabel ?? '', anchor: link.dataset.citeAnchor ?? '' })
   }
@@ -705,11 +755,21 @@ function flushFrames() {
   const batch = pendingFrames
   pendingFrames = []
   const memoryFrames = batch.filter((frame) => frame.event.event === 'memory')
+  // The library's changes, and the ends of turns that may have made them (library mode).
+  const libraryFrames =
+    props.documentId === null
+      ? batch.filter(
+          (frame) =>
+            (frame.event.event === 'tool_result' && frame.event.library) ||
+            frame.event.event === 'turn_done' ||
+            frame.event.event === 'turn_error',
+        )
+      : []
   // Which turns were running is read before this batch joins the thread: a turn's terminal
   // frame follows its memory frames, often in the same batch (a Stop during a save), and must
   // not make that save read as a replay. A turn the panel does not know yet — a replay racing
   // the record — counts as running only while this batch does not end it.
-  const endedBefore = memoryFrames.length ? endedTurns() : null
+  const endedBefore = memoryFrames.length || libraryFrames.length ? endedTurns() : null
   const liveBefore = new Set(turns.value.filter(isLive).map((turn) => turn.id))
   events.value = events.value.concat(batch)
   // A replayed edit of a finished turn changed nothing since the viewer loaded; one of a
@@ -725,11 +785,27 @@ function flushFrames() {
   // A memory saved, changed or forgotten: its line's state is read from the list.
   if (endedBefore) {
     const endedNow = endedTurns()
-    applyMemoryFrames(
-      memoryFrames,
-      (turnId) => !endedBefore.has(turnId) && (liveBefore.has(turnId) || !endedNow.has(turnId)),
-    )
-    void memoriesChanged()
+    const live = (turnId: string) => !endedBefore.has(turnId) && (liveBefore.has(turnId) || !endedNow.has(turnId))
+    if (memoryFrames.length) {
+      applyMemoryFrames(memoryFrames, live)
+      void memoriesChanged()
+    }
+    // The Files page follows the agent: the changes a running turn made, and its end, told
+    // once for the batch, so a replay of many changes is one read of the library
+    // (docs/web.md § The Files page's Agent card, *The list follows the agent*). A replayed
+    // frame of a turn long over changed nothing since the page read its library.
+    const records: LibraryStep[] = []
+    let turnEnded = false
+    for (const { event } of libraryFrames) {
+      if (event.event === 'tool_result' && event.library && live(event.turn_id)) {
+        records.push(event.library)
+      } else if (event.event !== 'tool_result' && !endedBefore.has(event.turn_id)) {
+        turnEnded = true
+      }
+    }
+    if (records.length || turnEnded) {
+      emit('library', records)
+    }
   }
   const ended = batch.some(
     (frame) => frame.event.event === 'turn_done' || frame.event.event === 'turn_error',
@@ -1055,6 +1131,22 @@ function selectionPreview(text: string): string {
   return text.replace(/\s+/g, ' ').trim()
 }
 
+/** The line above a library message's bubble: how many rows went, and the first names. */
+function pickedLine(paths: string[]): string {
+  const names = paths.slice(0, PICKED_NAMES_MAX).map(basename).join(t('chat.summarySeparator'))
+  return t('chat.context.sentSelection', {
+    n: paths.length,
+    names: paths.length > PICKED_NAMES_MAX ? `${names}…` : names,
+  })
+}
+
+/** A turn error in the reader's words; the Files page's card speaks of the library where the
+ *  reader's card speaks of the document. */
+function turnErrorLine(text: string): string {
+  const key = turnErrorKey(text)
+  return t(props.documentId === null && key === 'chat.errors.historyFull' ? 'chat.errors.historyFullLibrary' : key)
+}
+
 // --- editing a sent message (docs/web.md § The agent panel, *Editing a sent message*) ---
 
 /** The message being edited in place: which one, the text as the reader has it — a
@@ -1317,7 +1409,9 @@ const cardError = ref<string | null>(null)
 async function toggleEdit(card: EditCard) {
   const state = cardState(card)
   const target = state.reverted ? state.undoCommit : (state.redoCommit ?? card.commit)
-  if (!target || state.pending) {
+  // The revisions route is a document's: the Files page's card offers no Revert.
+  const documentId = props.documentId
+  if (!target || state.pending || documentId === null) {
     return false
   }
   cards.set(card.toolUseId, { ...state, pending: true })
@@ -1325,7 +1419,7 @@ async function toggleEdit(card: EditCard) {
   try {
     // The commit the revert made, from the response: the newest revision could by now
     // be someone else's.
-    const { commit: made } = await revertRevision(props.documentId, target)
+    const { commit: made } = await revertRevision(documentId, target)
     cards.set(card.toolUseId, {
       reverted: !state.reverted,
       undoCommit: state.reverted ? state.undoCommit : made,
@@ -1336,6 +1430,37 @@ async function toggleEdit(card: EditCard) {
   } catch (error) {
     cardError.value = await resolve(error)
     cards.set(card.toolUseId, { ...state, pending: false })
+  }
+}
+
+// --- library steps: Undo (docs/web.md § The Files page's Agent card) -------------------------
+
+/** Each library step's Undo once pressed, by its tool call, for as long as the page is open:
+ *  a step undone is not offered again, and switching conversations keeps it so. Nor is one
+ *  refused: the library changed since, the part it did undo stays undone, and pressing again
+ *  would fail on that part first — as the page drops a ⌘Z step that fails. */
+const undos = reactive(new Map<string, UndoState>())
+
+/** The step's Undo: library mode only, on a step whose result carried an undo record. */
+function undoState(step: ToolStep): UndoState | null {
+  if (!props.undoLibrary || !step.library) {
+    return null
+  }
+  return undos.get(step.id) ?? { pending: false, undone: false, error: null }
+}
+
+async function undoStep(step: ToolStep) {
+  const state = undoState(step)
+  if (!state || state.pending || state.undone || state.error || !step.library || !props.undoLibrary || running.value) {
+    return
+  }
+  undos.set(step.id, { pending: true, undone: false, error: null })
+  try {
+    // False: the page was busy with another action, and nothing was undone yet.
+    const undone = await props.undoLibrary(step.library)
+    undos.set(step.id, { pending: false, undone, error: null })
+  } catch (error) {
+    undos.set(step.id, { pending: false, undone: false, error: await resolve(error) })
   }
 }
 
@@ -1368,6 +1493,9 @@ function sentContent(payload: ComposerPayload): ContentBlock[] {
   }
   if (payload.quote) {
     blocks.push({ type: 'text', text: payload.quote, context: 'quote' })
+  }
+  if (payload.library) {
+    blocks.push({ type: 'text', text: '', context: 'library', library: payload.library.shown })
   }
   // A skill's chip; `/compact` and `/init` are the runner's own, no skill — `/init` keeps
   // the marker the route serves, so the item reads as a command (docs/chat.md § AGENTS.md).
@@ -1429,7 +1557,9 @@ async function submit(payload: ComposerPayload): Promise<boolean> {
   }
   try {
     if (id === null) {
-      made = draft ?? (await createConversation(props.documentId))
+      made =
+        draft ??
+        (props.documentId === null ? await createLibraryConversation() : await createConversation(props.documentId))
       draft = made
       id = made.id
     }
@@ -1440,6 +1570,7 @@ async function submit(payload: ComposerPayload): Promise<boolean> {
       ...(payload.quote ? { quote: payload.quote } : {}),
       ...(payload.command ? { command: payload.command } : {}),
       ...(payload.attachments.length ? { attachments: payload.attachments.map((entry) => entry.id) } : {}),
+      ...(payload.library ? { library: payload.library.body } : {}),
       locale: locale.value,
     })
     if (made) {
@@ -1810,8 +1941,9 @@ watch(items, () => {
   }
 })
 
+/** *Add to notes* needs a document's notes: the Files page's card has Copy alone. */
 const blockMenuItems = computed<MenuItem[]>(() => [
-  { key: 'notes', label: t('chat.block.toNotes'), icon: 'notebook-pen' },
+  ...(props.documentId === null ? [] : [{ key: 'notes', label: t('chat.block.toNotes'), icon: 'notebook-pen' } as const]),
   { key: 'copy', label: t('chat.block.copy'), icon: 'copy' },
 ])
 
@@ -1833,7 +1965,7 @@ async function onBlockMenuSelect(key: string) {
 
 // --- attachments dropped anywhere on the panel -------------------------------------------
 
-const dragging = ref(false)
+const dragging = ref<'files' | 'rows' | null>(null)
 /** Enter and leave fire for every child the drag crosses: the zone stays while any holds it. */
 let dragDepth = 0
 
@@ -1841,50 +1973,75 @@ function carriesFiles(event: DragEvent): boolean {
   return Array.from(event.dataTransfer?.types ?? []).includes('Files')
 }
 
+/** What a drag over the panel brings: files to attach, or — in the Files page's card — the
+ *  page's own rows, which attach no bytes and bring the selection chip back (docs/web.md
+ *  § The Files page's Agent card). */
+function dragKind(event: DragEvent): 'files' | 'rows' | null {
+  if (carriesFiles(event)) {
+    return 'files'
+  }
+  return props.documentId === null && Array.from(event.dataTransfer?.types ?? []).includes(ROWS_DRAG_TYPE)
+    ? 'rows'
+    : null
+}
+
 function onDragEnter(event: DragEvent) {
-  if (!carriesFiles(event)) {
+  const kind = dragKind(event)
+  if (!kind) {
     return
   }
   event.preventDefault()
   dragDepth += 1
   // The composer takes nothing while a turn runs, so neither does the panel.
-  dragging.value = !running.value
+  dragging.value = running.value ? null : kind
 }
 
 function onDragOver(event: DragEvent) {
-  if (!carriesFiles(event)) {
+  if (!dragKind(event)) {
     return
   }
-  // Taken here, never handed to the browser — which would open the file in the tab.
+  // Taken here, never handed to the browser — which would open the file in the tab — and
+  // claimed, so the page behind does not refuse it as a drop nothing wants.
   event.preventDefault()
+  claimDrag(event, 'attach')
   if (event.dataTransfer) {
     event.dataTransfer.dropEffect = running.value ? 'none' : 'copy'
   }
 }
 
 function onDragLeave(event: DragEvent) {
-  if (!carriesFiles(event)) {
+  if (!dragKind(event)) {
     return
   }
   dragDepth = Math.max(0, dragDepth - 1)
   if (!dragDepth) {
-    dragging.value = false
+    dragging.value = null
   }
 }
 
 function endDrag() {
   dragDepth = 0
-  dragging.value = false
+  dragging.value = null
 }
 
 function onDrop(event: DragEvent) {
-  if (!carriesFiles(event)) {
+  const kind = dragKind(event)
+  if (!kind) {
     return
   }
   event.preventDefault()
   endDrag()
-  if (!running.value) {
+  if (running.value) {
+    return
+  }
+  if (kind === 'files') {
     composer.value?.addFiles(Array.from(event.dataTransfer?.files ?? []))
+  } else {
+    // The page makes the rows the selection again, in the folder they came from — a folder
+    // the drag sprang open on its way had cleared it — and the chip comes back.
+    emit('rows-dropped')
+    composer.value?.showPicked()
+    composer.value?.focus()
   }
 }
 
@@ -1901,7 +2058,13 @@ function ask(request: AskRequest): Promise<AskOutcome> {
 
 /** The composer, focused once its pane shows: an ask that fell back to waiting there was
  *  focused while a phone's Agent pane was still inert. */
-defineExpose({ ask, focus: () => composer.value?.focus() })
+defineExpose({
+  ask,
+  focus: () => composer.value?.focus(),
+  /** A reload now would cost the reader something: what the composer holds, or a turn they
+   *  are watching (the Files page's build hold, docs/web.md § Rules). */
+  holds: computed(() => running.value || !!composer.value?.holds),
+})
 
 onMounted(() => {
   if (scroller.value) {
@@ -1948,6 +2111,8 @@ onBeforeUnmount(() => {
     <!-- The conversation's name opens the document's list of them; at the right a new
          conversation and the close (docs/web.md § The agent panel). -->
     <div class="head">
+      <!-- The phone's sheet puts its way back here (the Files page's card). -->
+      <slot name="head-start" />
       <button
         ref="titleButton"
         type="button"
@@ -2051,6 +2216,11 @@ onBeforeUnmount(() => {
             <UiIcon name="reply" />
             <span class="user-quote-text">{{ item.quote }}</span>
           </p>
+          <!-- The rows selected on the Files page when it was sent (the Files page's card). -->
+          <p v-if="item.picked.length" class="user-quote">
+            <UiIcon name="files" />
+            <span class="user-quote-text">{{ pickedLine(item.picked) }}</span>
+          </p>
           <!-- The bubble as an editor, in place: the text alone changes; a command stays, and
                what went with the message is sent again as stored (docs/web.md § The agent
                panel, *Editing a sent message*). -->
@@ -2133,7 +2303,7 @@ onBeforeUnmount(() => {
           <template v-for="(block, index) in messageBlocks(item.text)" :key="index">
             <!-- A comment draws nothing, and takes no wrapper that would count as a block. -->
             <div v-if="block.kind !== 'comment'" class="answer-block" :data-answer-block="`${item.key}:${index}`">
-              <MdBlock :block="block" :cite="resolveCite" links />
+              <MdBlock :block="block" :cite="answerCite" links :files="documentId === null" />
               <!-- After the block, so a heading stays its wrapper's first child. -->
               <div
                 v-if="handleShown(`${item.key}:${index}`)"
@@ -2195,9 +2365,12 @@ onBeforeUnmount(() => {
           :open-steps="openSteps"
           :card-state="cardState"
           :locked="running"
+          :revertable="documentId !== null"
+          :undo-state="undoState"
           @toggle="toggleGroup(item)"
           @toggle-step="toggleStep"
           @toggle-edit="toggleEdit"
+          @undo="undoStep"
         />
 
         <ChatSubagentCard
@@ -2210,6 +2383,8 @@ onBeforeUnmount(() => {
           :open-steps="openSteps"
           :card-state="cardState"
           :locked="running"
+          :revertable="documentId !== null"
+          :files="documentId === null"
           @toggle="toggleCard(item)"
           @toggle-step="toggleStep"
           @toggle-edit="toggleEdit"
@@ -2218,7 +2393,7 @@ onBeforeUnmount(() => {
         <!-- The worker's text is for the log: the line says it in the reader's words and
              keeps the original in the tooltip (docs/web.md § The agent panel). -->
         <div v-else-if="item.kind === 'error'" class="turn-error-row" :class="{ dimmed: position < thread.dimBefore }">
-          <p class="turn-error" role="alert" :title="item.text">{{ t(turnErrorKey(item.text)) }}</p>
+          <p class="turn-error" role="alert" :title="item.text">{{ turnErrorLine(item.text) }}</p>
           <UiButton v-if="errorNeedsPlan(item.text)" size="sm" variant="secondary" @click="seePlans">
             {{ t('credits.seePlans') }}
           </UiButton>
@@ -2256,7 +2431,7 @@ onBeforeUnmount(() => {
           </span>
           <div v-if="summaryOpen.has(item.key)" class="compact-summary md-message md-side">
             <template v-for="(block, blockIndex) in messageBlocks(item.summary)" :key="blockIndex">
-              <MdBlock v-if="block.kind !== 'comment'" :block="block" :cite="resolveCite" links />
+              <MdBlock v-if="block.kind !== 'comment'" :block="block" :cite="answerCite" links :files="documentId === null" />
             </template>
           </div>
         </div>
@@ -2282,6 +2457,7 @@ onBeforeUnmount(() => {
 
     <ChatComposer
       ref="composer"
+      :library="documentId === null ? library : undefined"
       :blocked="sendBlock !== null"
       :running="running"
       :stopping="stopping"
@@ -2334,8 +2510,8 @@ onBeforeUnmount(() => {
 
     <!-- A file dragged over the panel: the whole column is the target. -->
     <div v-if="dragging" class="drop-zone" aria-hidden="true">
-      <p class="drop-title">{{ t('chat.dropToAttach') }}</p>
-      <p v-if="maxAttachmentBytes" class="drop-kinds">
+      <p class="drop-title">{{ dragging === 'rows' ? t('chat.dropRows') : t('chat.dropToAttach') }}</p>
+      <p v-if="dragging === 'files' && maxAttachmentBytes" class="drop-kinds">
         {{ t('chat.dropKinds', { size: formatBytes(maxAttachmentBytes) }) }}
       </p>
     </div>
@@ -2364,7 +2540,11 @@ onBeforeUnmount(() => {
     <UiConfirmDialog
       v-if="deleting"
       :title="t('chat.deleteConversation')"
-      :message="t('chat.deleteConfirm', { title: deleting.title || t('chat.untitled') })"
+      :message="
+        t(documentId === null ? 'chat.deleteConfirmLibrary' : 'chat.deleteConfirm', {
+          title: deleting.title || t('chat.untitled'),
+        })
+      "
       :confirm-label="t('common.delete')"
       :pending="deletePending"
       :error="deleteError"

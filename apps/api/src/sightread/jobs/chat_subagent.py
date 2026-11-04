@@ -108,7 +108,11 @@ async def _run_one(
         return chat_tools.ToolOutcome(
             "The tool input was not valid JSON; send it again.", is_error=True
         )
-    if name not in definition.tools:
+    # A library conversation has no document for `view_page` and `view_figure` to read:
+    # taken out of every subagent's tools there (docs/chat.md § Library conversations).
+    if name not in definition.tools or (
+        ctx.document is None and name in chat_agent.DOCUMENT_TOOL_NAMES
+    ):
         return chat_tools.ToolOutcome(
             f"{name!r} is not one of this subagent's tools", is_error=True
         )
@@ -319,7 +323,11 @@ async def run_subagent(
         {
             "type": "text",
             "text": subagent_defs.render_system(
-                definition.prompt, ctx.facts, writes=definition.writes, shell=shell
+                definition.prompt,
+                ctx.facts,
+                writes=definition.writes,
+                shell=shell,
+                library=ctx.document is None,
             ),
             "cache_control": {"type": "ephemeral", "ttl": chat_agent.CACHE_TTL},
         }
@@ -327,7 +335,9 @@ async def run_subagent(
     tools = [
         tool
         for tool in chat_agent.SUBAGENT_TOOLS
-        if tool["name"] in definition.tools and (tool["name"] != "bash" or shell)
+        if tool["name"] in definition.tools
+        and (tool["name"] != "bash" or shell)
+        and (ctx.document is not None or tool["name"] not in chat_agent.DOCUMENT_TOOL_NAMES)
     ]
     messages: list[dict] = [{"role": "user", "content": [{"type": "text", "text": task.strip()}]}]
     steps: list[dict] = []

@@ -207,9 +207,13 @@ async def _enqueue_idle_compaction(db: AsyncSession, settings: Settings, row: Co
     ).scalar_one_or_none()
     if setting is not None and not setting.idle_compact:
         return False
-    document = await db.get(Document, row.document_id)
-    if document is None or not is_live(document, await user_folders(db, row.user_id)):
-        return False
+    # A library conversation has no document to check (docs/chat.md § Library
+    # conversations); a document's must be live.
+    document = None
+    if row.document_id is not None:
+        document = await db.get(Document, row.document_id)
+        if document is None or not is_live(document, await user_folders(db, row.user_id)):
+            return False
     try:
         await ensure_within_quota(
             db, settings, row.user_id, user_root(settings.workspaces_dir, row.user_id)
@@ -233,12 +237,13 @@ async def _enqueue_idle_compaction(db: AsyncSession, settings: Settings, row: Co
     if not await compactable(db, row.id):
         return False
     locale = await _last_locale(db, row.id)
-    revision = await current_revision(db, settings, document)
+    revision = await current_revision(db, settings, document) if document is not None else None
     note = chat_agent.turn_note(
         revision,
         locale,
         setting.answer_language if setting else None,
         setting.translate_language if setting else None,
+        document=document is not None,
     )
     # The message, the turn and its credit entry, or none of them: the balance is read as
     # the entry is reserved, and a refusal leaves only the cleared clock behind.

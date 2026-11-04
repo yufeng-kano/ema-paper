@@ -22,7 +22,7 @@ from sightread.agents import chat as chat_agent
 from sightread.billing import ledger
 from sightread.db.models import CreditEntry, Document, Job, utcnow
 from sightread.errors import ApiError
-from sightread.jobs import chat_runner, runner, sweeper
+from sightread.jobs import chat_library, chat_runner, runner, sweeper
 from sightread.jobs.queue import claim_next_job
 from sightread.jobs.runner import run_job
 from sightread.workspace.documents import original_of
@@ -364,14 +364,15 @@ async def test_a_conversion_past_its_time_goes_back_on_the_queue(
         ("files/a.pdf", ["files", "a.pdf"]),
         (" Papers\\2017\\a.pdf ", ["Papers", "2017", "a.pdf"]),
         ("Papers//a.pdf/", ["Papers", "a.pdf"]),
-        ("", None),
-        ("/workspace/files/", None),
+        # The top: what `list_files` lists, and `convert_file` refuses as no file.
+        ("", []),
+        ("/workspace/files/", []),
         ("../a.pdf", None),
         ("Papers/./a.pdf", None),
     ],
 )
 def test_the_path_is_read_as_the_files_page_shows_it(raw: str, segments: list[str] | None) -> None:
-    assert chat_runner._library_segments(raw) == segments
+    assert chat_library.library_segments(raw) == segments
 
 
 async def _settled(client: httpx.AsyncClient, document_id: int) -> tuple[Document, Job, dict]:

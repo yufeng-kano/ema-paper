@@ -30,6 +30,9 @@ class SubagentDefinition:
     prompt: str
     # May change files: the editor writes, and `bash` may be among its tools.
     writes: bool = False
+    # Works on a document, so a library conversation does not offer it (docs/chat.md
+    # § Subagents); an edited built-in keeps the flag, one of the reader's own never has it.
+    document_only: bool = False
 
 
 # What `/translate` starts (docs/chat.md § Translation): translators read doc.md and write
@@ -40,6 +43,7 @@ TRANSLATOR = SubagentDefinition(
     model=None,
     tools=("str_replace_based_edit_tool", "bash"),
     writes=True,
+    document_only=True,
     prompt="""You translate part of a document — the pages the task names, the passage it quotes or the section it names — into the language the task names, writing each translation into doc.md right under the block it translates.
 
 Read your part of doc.md with the editor's view, going through it in pieces with view_range; a page starts at its `<!-- page: N -->` marker. A passage quoted by its first and last words covers the blocks from the one holding the first words to the one holding the last. A section named by its heading runs from that heading to the next heading of the same or a higher level; find it with grep on the heading line.
@@ -62,6 +66,13 @@ BUILTIN_SUBAGENT_NAMES = frozenset(subagent.name for subagent in BUILTIN_SUBAGEN
 PREAMBLE_HEAD = """You are a subagent of the document agent inside Ema Paper. The agent gave you one task; you work on it alone, then report.
 
 The document: {document_path} — its editable transcription is {document_path}/doc.md, and the pages are its original. Pages: {page_count}   Bbox format: {bbox_format}   Parsed with: {parse_model}
+
+"""
+# A library conversation's subagent: no document is open, so no document's facts
+# (docs/chat.md § Library conversations).
+LIBRARY_PREAMBLE_HEAD = """You are a subagent of the agent inside Ema Paper. The agent gave you one task; you work on it alone, then report.
+
+You work on the user's library from their Files page: /workspace/files/ is the same tree, each document a directory whose editable text is its doc.md. No document is open. Only the agent reorganizes the library, with tools the Files page follows and the user can undo: never mv, rm, cp or mkdir inside /workspace/files in the shell — the shell's rm cannot be undone, and the Files page cannot follow what the shell moves. When your task needs the library reorganized, say in your report what should go where.
 
 """
 READ_ONLY = "You can read but not change anything: the editor answers `view` only."
@@ -109,6 +120,7 @@ class ResolvedSubagent:
     builtin: bool
     modified: bool
     default: SubagentDefinition | None
+    document_only: bool = False
 
 
 def canonical_tools(tools: Iterable[str]) -> tuple[str, ...]:
@@ -128,6 +140,7 @@ def _resolved(source, *, builtin: bool, modified: bool, default) -> ResolvedSuba
         builtin=builtin,
         modified=modified,
         default=default,
+        document_only=default is not None and default.document_only,
     )
 
 
@@ -162,9 +175,13 @@ def same_as_default(values: dict, default: SubagentDefinition) -> bool:
     )
 
 
-def render_system(prompt: str, facts: dict[str, str], *, writes: bool, shell: bool) -> str:
-    """A subagent's system prompt: the preamble with the document's facts and what this
-    subagent may change — the shell's rules when it has one — then its own instructions as
-    written, which substitute nothing."""
+def render_system(
+    prompt: str, facts: dict[str, str], *, writes: bool, shell: bool, library: bool = False
+) -> str:
+    """A subagent's system prompt: the preamble with the document's facts — the library's
+    wording in a library conversation, which has no document — and what this subagent may
+    change — the shell's rules when it has one — then its own instructions as written,
+    which substitute nothing."""
     may = WRITES + (" " + SHELL if shell else "") if writes else READ_ONLY
-    return render_system_prompt(PREAMBLE_HEAD + may + PREAMBLE_TAIL, facts) + prompt.strip()
+    head = LIBRARY_PREAMBLE_HEAD if library else PREAMBLE_HEAD
+    return render_system_prompt(head + may + PREAMBLE_TAIL, facts) + prompt.strip()

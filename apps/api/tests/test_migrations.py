@@ -2447,3 +2447,63 @@ async def test_the_ticket_filing_migration_reads_every_ticket_as_one_that_files_
         _alembic(scratch_url, "upgrade", "head")
     finally:
         await engine.dispose()
+
+
+LIBRARY_CONVERSATIONS = "4449f68533c0"
+
+
+async def test_the_library_conversations_migration_keeps_every_document_and_refuses_to_downgrade(
+    scratch_url,
+) -> None:
+    """Every existing conversation keeps its document; after the upgrade a conversation may
+    have none — a library conversation — and the downgrade refuses while one exists rather
+    than delete it with its messages (docs/database.md § Rules)."""
+    _alembic(scratch_url, "upgrade", TICKET_FILING)
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.begin() as db:
+            await db.execute(
+                text(
+                    "INSERT INTO users (id, google_sub, email, created_at) "
+                    "VALUES (1, 'sub', 't@example.com', now())"
+                )
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO documents (id, user_id, folder_id, job_id, name, created_at, "
+                    "updated_at) VALUES (1, 1, NULL, NULL, 'a.md', now(), now())"
+                )
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO conversations (id, user_id, document_id, title, session, "
+                    "created_at, updated_at) VALUES (1, 1, 1, 't', 's', now(), now())"
+                )
+            )
+        _alembic(scratch_url, "upgrade", LIBRARY_CONVERSATIONS)
+        async with engine.begin() as db:
+            kept = (await db.execute(text("SELECT document_id FROM conversations"))).scalars()
+            assert list(kept) == [1]
+            await db.execute(
+                text(
+                    "INSERT INTO conversations (id, user_id, document_id, title, session, "
+                    "created_at, updated_at) VALUES (2, 1, NULL, '', 'l', now(), now())"
+                )
+            )
+            # Deleting the document takes its own conversation, never the library's.
+            await db.execute(text("DELETE FROM documents"))
+            left = (await db.execute(text("SELECT id FROM conversations"))).scalars()
+            assert list(left) == [2]
+
+        with pytest.raises(subprocess.CalledProcessError) as refused:
+            _alembic(scratch_url, "downgrade", TICKET_FILING)
+        assert b"1 library conversation(s) have no document" in refused.value.stderr
+        async with engine.begin() as db:
+            version = (await db.execute(text("SELECT version_num FROM alembic_version"))).scalar()
+            assert version == LIBRARY_CONVERSATIONS
+            await db.execute(text("DELETE FROM conversations"))
+
+        _alembic(scratch_url, "downgrade", TICKET_FILING)
+        _alembic(scratch_url, "upgrade", "head")
+    finally:
+        await engine.dispose()
