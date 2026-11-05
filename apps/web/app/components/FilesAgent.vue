@@ -377,7 +377,8 @@ defineExpose({
 .split {
   position: relative;
   z-index: 1;
-  flex: 0 0 var(--space-4);
+  flex: none;
+  width: var(--space-4);
   border-radius: var(--radius-full);
   cursor: col-resize;
   touch-action: none;
@@ -412,9 +413,13 @@ defineExpose({
   }
 }
 
+/* Widths, not flex-bases, here and on the grip: this box sizes itself from what it holds, and
+   Safari leaves a flex-basis out of that size, so a basis alone let the card run past the
+   window's edge. */
 .card {
   display: flex;
-  flex: 0 0 var(--column-width);
+  flex: none;
+  width: var(--column-width);
   flex-direction: column;
   min-width: 0;
   min-height: 0;
@@ -470,6 +475,7 @@ defineExpose({
 
 .files-agent.sheet .card {
   flex: 1 1 auto;
+  width: auto;
   border-radius: 0;
   background: var(--paper);
   -webkit-backdrop-filter: none;
