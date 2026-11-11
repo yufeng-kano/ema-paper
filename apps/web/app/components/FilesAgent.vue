@@ -3,8 +3,8 @@
  * The Files page's Agent card (docs/web.md § The Files page's Agent card): the agent panel in
  * library mode at the page's right, as the reader's Agent card sits at the document's — the
  * light-glass card inset from the window's edges, resized by the grip on its left edge as
- * the reader's cards are (§ Column widths) — or, below 900px, a full-screen sheet over the
- * page with a way back.
+ * the reader's cards are (§ Column widths) — or, below 900px or where the page has no room
+ * for the list's minimum beside the card's, a full-screen sheet over the page with a way back.
  *
  * Whether it is open and how wide it is are the page's own, remembered in the browser apart
  * from the reader's cards (`useViewerLayout`). It mounts the first time it opens and then
@@ -88,16 +88,16 @@ watch(open, (value) => {
 
 // --- the phone's sheet -------------------------------------------------------------------
 
-const sheet = ref(import.meta.client && window.matchMedia(SHEET_QUERY).matches)
+const narrowWindow = ref(import.meta.client && window.matchMedia(SHEET_QUERY).matches)
 let sheetQuery: MediaQueryList | null = null
 
 function onSheetChange(event: MediaQueryListEvent) {
-  sheet.value = event.matches
+  narrowWindow.value = event.matches
 }
 
 onMounted(() => {
   sheetQuery = window.matchMedia(SHEET_QUERY)
-  sheet.value = sheetQuery.matches
+  narrowWindow.value = sheetQuery.matches
   sheetQuery.addEventListener('change', onSheetChange)
 })
 
@@ -121,6 +121,16 @@ function openFiles(target: { kind: 'folder' | 'document'; id: number }) {
 
 /** The page's width, which the list and the card share: what the card is clamped against. */
 const pageWidth = ref(Number.POSITIVE_INFINITY)
+/** A sheet on a phone or a tablet, and also on a window just past the breakpoint where the
+ *  sidebar leaves the page too little for the list's minimum beside the card's: there the
+ *  list would be squeezed under its minimum and its toolbar under the card. That sheet covers
+ *  the page alone (`fill`), the sidebar beside it as reachable as ever. Either sheet is out of
+ *  the page's flow, so turning into one never changes the width this reads. */
+const sheet = computed(
+  () =>
+    narrowWindow.value
+    || pageWidth.value < LIST_MIN_WIDTH + COLUMN_WIDTHS.agent.min + 2 * CARD_GAP,
+)
 /** The card's width as drawn: the width the reader chose, as far as the window allows. */
 const width = ref(stored.width)
 /** The grip being dragged: where the drag started, and the card's width then. */
@@ -135,6 +145,8 @@ watch(root, (element) => {
   pageObserver = null
   const page = element?.parentElement
   if (page) {
+    // Read now as well: whether the card is a sheet must hold from its first frame.
+    pageWidth.value = page.clientWidth
     pageObserver = new ResizeObserver(() => {
       pageWidth.value = page.clientWidth
     })
@@ -302,7 +314,7 @@ defineExpose({
     v-show="open"
     ref="root"
     class="files-agent"
-    :class="{ sheet, keyboard: sheet && keyboard }"
+    :class="{ sheet, fill: sheet && !narrowWindow, keyboard: sheet && keyboard }"
     :inert="!open || covered"
   >
     <div
@@ -463,14 +475,19 @@ defineExpose({
   height: 20px;
 }
 
-/* Below 900px the card is a sheet over the whole page, the paper rather than glass. Its box
-   is the window's, `inset: 0`, which the keyboard never moves. */
+/* Below 900px, or with no room beside the list, the card is a sheet over the whole page, the
+   paper rather than glass. Its box is the window's, `inset: 0`, which the keyboard never moves. */
 .files-agent.sheet {
   position: fixed;
   inset: 0;
   z-index: 30;
   padding: 0;
   background: var(--paper);
+}
+
+/* Past 900px the sidebar is beside the page, not a drawer: the sheet covers the page alone. */
+.files-agent.sheet.fill {
+  position: absolute;
 }
 
 .files-agent.sheet .card {

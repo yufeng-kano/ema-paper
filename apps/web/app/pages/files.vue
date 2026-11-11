@@ -1701,15 +1701,78 @@ const agentPlace = computed<LibraryPlace>(() => {
 })
 
 /** Closed from the card — its close, its grip, the sheet's way back: the toggle takes the
- *  focus the card had. */
+ *  focus the card had, or the More button where the toolbar is folded into it. */
 async function closeAgent() {
   agentOpen.value = false
   await nextTick()
-  if (!document.activeElement || document.activeElement === document.body) {
-    const toggle = agentToggle.value?.$el
-    if (toggle instanceof HTMLElement) {
-      toggle.focus()
+  // Chrome keeps a focused element that has just been hidden as the active one until its next
+  // frame, so focus still inside the card has gone too.
+  const active = document.activeElement
+  if (!active || active === document.body || agentCard.value?.contains(active)) {
+    for (const button of [agentToggle.value?.$el, toolbarMoreButton.value?.$el]) {
+      if (button instanceof HTMLElement && button.getClientRects().length) {
+        button.focus()
+        return
+      }
     }
+  }
+}
+
+// --- the toolbar folded into More ------------------------------------------------------------
+// Too narrow for the capsule and Upload beside the tabs, the toolbar is one More button whose
+// menu holds the same actions (docs/web.md § Files, *The toolbar folds on a narrow screen*).
+
+const toolbarMoreButton = ref<ComponentPublicInstance | null>(null)
+const toolbarMore = ref<Point | null>(null)
+const toolbarMoreFromKey = ref(false)
+/** When the menu last closed itself. The press on More that closes it (a press outside the
+ *  menu) is followed by that button's click, which must not open it again. */
+let toolbarMoreClosedAt = 0
+
+const toolbarMoreItems = computed<MenuItem[]>(() => [
+  { key: 'upload', label: t('files.upload'), icon: 'upload' },
+  { key: 'file', label: t('files.newDocument'), icon: 'file-plus', disabled: busy.value, separated: true },
+  { key: 'folder', label: t('files.newFolder'), icon: 'folder-plus', disabled: busy.value },
+  { key: 'refresh', label: t('common.refresh'), icon: 'refresh', disabled: pending.value },
+  // The toggle's on and off, as its `aria-pressed` says it in the capsule.
+  { key: 'agent', label: t('viewer.agentLabel'), icon: 'message-circle', checked: agentOpen.value, separated: true },
+])
+
+/** The menu under the button's right edge; flipped by the menu itself where it does not fit. */
+function toggleToolbarMore(event: MouseEvent) {
+  if (toolbarMore.value || performance.now() - toolbarMoreClosedAt < 200) {
+    toolbarMore.value = null
+    return
+  }
+  const box = (event.currentTarget as HTMLElement).getBoundingClientRect()
+  // A click the keyboard made carries no pointer detail.
+  toolbarMoreFromKey.value = event.detail === 0
+  toolbarMore.value = { x: box.right, y: box.bottom + 4 }
+}
+
+function closeToolbarMore() {
+  toolbarMore.value = null
+  toolbarMoreClosedAt = performance.now()
+}
+
+// The menu belongs to the Files tab's toolbar: the Trash's has no More.
+watch(view, () => {
+  toolbarMore.value = null
+})
+
+function onToolbarMoreSelect(key: string) {
+  toolbarMore.value = null
+  switch (key) {
+    case 'upload':
+      return pickFiles(currentFolder.value)
+    case 'file':
+      return createEntry('file')
+    case 'folder':
+      return createEntry('folder')
+    case 'refresh':
+      return refresh()
+    case 'agent':
+      agentOpen.value = !agentOpen.value
   }
 }
 
@@ -2700,7 +2763,7 @@ useBuildHold(
       <!-- The list menu's commonest items, one press away (docs/web.md § Files). -->
       <template #toolbar>
         <template v-if="view === 'files'">
-          <UiCapsule :label="t('files.actions')">
+          <UiCapsule class="toolbar-actions" :label="t('files.actions')">
             <UiButton
               variant="ghost"
               icon-only
@@ -2746,6 +2809,29 @@ useBuildHold(
             <template #icon><UiIcon name="upload" /></template>
             <span class="upload-label">{{ t('files.upload') }}</span>
           </UiButton>
+          <!-- Drawn instead of the two above where they do not fit beside the tabs. -->
+          <UiCapsule class="toolbar-more" :label="t('files.actions')">
+            <UiButton
+              ref="toolbarMoreButton"
+              variant="ghost"
+              icon-only
+              :label="t('viewer.more')"
+              aria-haspopup="menu"
+              :aria-expanded="toolbarMore ? 'true' : 'false'"
+              @click="toggleToolbarMore"
+            >
+              <template #icon><UiIcon name="ellipsis" /></template>
+            </UiButton>
+          </UiCapsule>
+          <UiContextMenu
+            v-if="toolbarMore"
+            :at="toolbarMore"
+            :items="toolbarMoreItems"
+            :label="t('viewer.more')"
+            :focus-first="toolbarMoreFromKey"
+            @select="onToolbarMoreSelect"
+            @close="closeToolbarMore"
+          />
         </template>
         <UiButton v-else variant="danger" size="lg" :disabled="!trashTotal || busy" @click="askEmpty">
           {{ t('files.emptyTrash') }}
@@ -2862,6 +2948,7 @@ useBuildHold(
 
             <UiDataTable
               v-else
+              class="files-table"
               role="grid"
               aria-multiselectable="true"
               :columns="columns"
@@ -2970,6 +3057,7 @@ useBuildHold(
 
             <UiDataTable
               v-else
+              class="trash-table"
               role="grid"
               aria-multiselectable="true"
               :columns="trashColumns"
@@ -3140,6 +3228,7 @@ useBuildHold(
 /* The page's one box: the screen fills it, and it is the region the keys belong to. */
 /* The list's screen, then the Agent card beside it when it is open. */
 .library {
+  position: relative;
   display: flex;
   min-width: 0;
   min-height: 0;
@@ -3265,6 +3354,9 @@ useBuildHold(
   max-width: 100%;
   min-width: 0;
   color: var(--ink);
+  /* No intrinsic width of its own: a long name would otherwise widen its column past the list,
+     which never scrolls sideways (*A narrow list drops columns*, below). */
+  contain: inline-size;
 }
 
 .entry.pendingup {
@@ -3403,8 +3495,18 @@ useBuildHold(
   color: var(--accent);
 }
 
-/* The label goes before anything else does: under 800px the upload button is its glyph. */
-@media (max-width: 800px) {
+/* The screen's own width decides, not the window's: the Agent card beside the list narrows
+   the screen as much as a small window does. The upload label goes first; narrower still, the
+   capsule and Upload fold into one More button beside the tabs. */
+.list-screen {
+  container: files-screen / inline-size;
+}
+
+.list-screen .toolbar-more {
+  display: none;
+}
+
+@container files-screen (max-width: 560px) {
   .upload-label {
     display: none;
   }
@@ -3412,6 +3514,66 @@ useBuildHold(
   .btn.upload {
     width: var(--control-height-lg);
     padding: 0;
+  }
+}
+
+@container files-screen (max-width: 470px) {
+  .list-screen .toolbar-actions,
+  .btn.upload {
+    display: none;
+  }
+
+  .list-screen .toolbar-more {
+    display: inline-flex;
+  }
+}
+
+/* The list never scrolls sideways. The name takes whatever the other columns leave and is cut
+   with an ellipsis (its full text is the row's tooltip); as the list narrows, the columns that
+   matter least go first — Kind, then Size in Files; Size, then Original location in the Trash — and
+   the date last (docs/web.md § Files, *A narrow list drops columns*). */
+.contents {
+  container: files-list / inline-size;
+}
+
+.contents :deep(.table) {
+  --table-min: 0px;
+}
+
+@container files-list (max-width: 640px) {
+  .files-table :deep(.column-kind) {
+    display: none;
+  }
+}
+
+@container files-list (max-width: 440px) {
+  .files-table :deep(.column-size) {
+    display: none;
+  }
+}
+
+@container files-list (max-width: 700px) {
+  .trash-table :deep(.column-size) {
+    display: none;
+  }
+}
+
+@container files-list (max-width: 590px) {
+  .trash-table :deep(.column-origin) {
+    display: none;
+  }
+}
+
+/* Narrower still, the name is all a row has room for. */
+@container files-list (max-width: 340px) {
+  .files-table :deep(.column-added),
+  .trash-table :deep(.column-trashed) {
+    display: none;
+  }
+
+  /* The hidden date is still the row's last cell, so the name takes the row's both ends. */
+  .contents :deep(.table td.column-name) {
+    border-radius: var(--radius-md);
   }
 }
 
