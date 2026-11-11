@@ -67,11 +67,6 @@
   --accent-tint: light-dark(rgb(0 113 227 / 12%), rgb(10 132 255 / 22%));
   /* The faint top highlight a filled system button carries. */
   --accent-highlight: rgb(255 255 255 / 18%);
-  /* The brand mark's two blues, top and bottom: the light accent's, in both appearances,
-     because the mark is a logo, not a control — the same as public/favicon.svg and the
-     consent page draw it, so the tab and the page show one icon. */
-  --mark-top: #4799eb;
-  --mark-bottom: #0071e3;
 
   /* --- Color: status ------------------------------------------------------
      Apple's status hues, each a dot beside a word, never the only signal. The danger red is
@@ -193,8 +188,6 @@
   --radius-xl: 20px;
   --radius-card: 28px;
   --radius-full: 999px;
-  /* The brand mark, an app icon's squircle at the sidebar's size. */
-  --radius-mark: 8px;
   --radius-menu: 12px;
   --radius-menu-item: 7px;
   /* The agent panel's composer field. */

@@ -30,7 +30,7 @@ defineProps<{ name: IconName }>()
     aria-hidden="true"
     focusable="false"
   >
-    <!-- scan-text: the brand mark's glyph — a page being read inside scan corners. Also
+    <!-- scan-text: a page being read inside scan corners — converting a file to text, and
          the figure placeholder's mark in the result viewer. -->
     <template v-if="name === 'scan-text'">
       <path d="M3 7V5a2 2 0 0 1 2-2h2" />

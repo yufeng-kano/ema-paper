@@ -43,11 +43,15 @@ export default defineNuxtConfig({
       // `?v=` is the mark's version. Browsers keep a site's icon in a store of their own,
       // apart from the HTTP cache, and fetch it again only when its URL changes; without it
       // a tab went on showing the old mark beside the new one on the page. Raise it whenever
-      // the icons change, with the consent page's links (apps/api routes/oauth.py).
+      // the icons change, with the consent page's links (apps/api routes/oauth.py), AppBrand's
+      // image and the manifest's icons.
+      // The manifest only names the app and lists its home-screen icons (docs/web.md § Design
+      // system): no `display`, so an icon added to a home screen still opens the browser.
       link: [
-        { rel: 'icon', href: '/favicon.svg?v=2', type: 'image/svg+xml' },
-        { rel: 'icon', href: '/favicon.ico?v=2', sizes: '48x48' },
-        { rel: 'apple-touch-icon', href: '/apple-touch-icon.png?v=2' },
+        { rel: 'icon', href: '/favicon.svg?v=3', type: 'image/svg+xml' },
+        { rel: 'icon', href: '/favicon.ico?v=3', sizes: '48x48' },
+        { rel: 'apple-touch-icon', href: '/apple-touch-icon.png?v=3' },
+        { rel: 'manifest', href: '/manifest.webmanifest?v=3' },
       ],
     },
   },

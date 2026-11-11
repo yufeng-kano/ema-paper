@@ -59,22 +59,33 @@ def _oauth_error(status_code: int, error: str, description: str) -> JSONResponse
 
 # The product mark, inlined rather than linked: this page is the one surface a user meets
 # before they trust us with an account, and a mark that arrives one request later (or not at
-# all, behind a strict connector CSP) is worse than no mark.
+# all, behind a strict connector CSP) is worse than no mark. A copy of
+# apps/web/public/favicon.svg; replace it with that file whenever the icons change.
 MARK = (
-    "<svg class='mark' viewBox='0 0 32 32' width='32' height='32' aria-hidden='true'>"
-    "<defs><linearGradient id='mark-fill' x1='0' y1='0' x2='0' y2='1'>"
-    "<stop offset='0' stop-color='#4799eb'/><stop offset='1' stop-color='#0071e3'/>"
-    "</linearGradient></defs>"
-    "<rect width='32' height='32' rx='9' fill='url(#mark-fill)'/>"
-    "<g fill='none' stroke='#ffffff' stroke-width='2.2' stroke-linecap='round'"
-    " stroke-linejoin='round'>"
-    "<path d='M8 11V9.5A1.5 1.5 0 0 1 9.5 8H11'/>"
-    "<path d='M21 8h1.5A1.5 1.5 0 0 1 24 9.5V11'/>"
-    "<path d='M24 21v1.5a1.5 1.5 0 0 1-1.5 1.5H21'/>"
-    "<path d='M11 24H9.5A1.5 1.5 0 0 1 8 22.5V21'/>"
-    "<path d='M11.5 12.5h6M11.5 16h9M11.5 19.5h4.5'/>"
-    "</g>"
-    "</svg>"
+    "<svg class='mark' viewBox='0 0 64 64' width='32' height='32' aria-hidden='true'>"
+    "<rect width='64' height='64' rx='14' fill='#1d3461'/>"
+    "<g transform='translate(32 32) scale(1.0) translate(-33.85 -31.55)'>"
+    "<g transform='rotate(-6 32 32)'>"
+    "<rect x='15' y='7' width='34' height='50' rx='3' fill='#fbf7ef'/>"
+    "<path d='M21 16h14M21 22h9' stroke='#c9c2b4' stroke-width='2.6' stroke-linecap='round'/>"
+    "</g><g transform='translate(43 30) rotate(20)'>"
+    "<path d='M0 -26C8 -22 11 -13 10.5 -7L5.5 -5.4L9.6 -3C8.6 2 5.2 7.6 1.4 11L0 12L-1.4 11"
+    "C-5 7 -7.2 2.4 -7.4 -2L-4.6 -3.6L-7.8 -5.6C-8 -14 -4.6 -22 0 -26Z' fill='#ffffff'"
+    " stroke='#1d3461' stroke-width='1.6' stroke-linejoin='round'/>"
+    "<path d='M0 -21V11.5' stroke='#1d3461' stroke-width='1.6' stroke-linecap='round'/>"
+    "<path d='M0 12V23' stroke='#1d3461' stroke-width='2.8' stroke-linecap='round'/></g>"
+    "<g transform='translate(20 48) rotate(-12) scale(0.95)'><g fill='#f5a3b7'>"
+    "<path d='M0 -1C-4.5 -3 -5.6 -8 -3 -10.2C-2 -10.8 -0.8 -10.2 0 -9"
+    "C0.8 -10.2 2 -10.8 3 -10.2C5.6 -8 4.5 -3 0 -1Z' transform='rotate(0)'/>"
+    "<path d='M0 -1C-4.5 -3 -5.6 -8 -3 -10.2C-2 -10.8 -0.8 -10.2 0 -9"
+    "C0.8 -10.2 2 -10.8 3 -10.2C5.6 -8 4.5 -3 0 -1Z' transform='rotate(72)'/>"
+    "<path d='M0 -1C-4.5 -3 -5.6 -8 -3 -10.2C-2 -10.8 -0.8 -10.2 0 -9"
+    "C0.8 -10.2 2 -10.8 3 -10.2C5.6 -8 4.5 -3 0 -1Z' transform='rotate(144)'/>"
+    "<path d='M0 -1C-4.5 -3 -5.6 -8 -3 -10.2C-2 -10.8 -0.8 -10.2 0 -9"
+    "C0.8 -10.2 2 -10.8 3 -10.2C5.6 -8 4.5 -3 0 -1Z' transform='rotate(216)'/>"
+    "<path d='M0 -1C-4.5 -3 -5.6 -8 -3 -10.2C-2 -10.8 -0.8 -10.2 0 -9"
+    "C0.8 -10.2 2 -10.8 3 -10.2C5.6 -8 4.5 -3 0 -1Z' transform='rotate(288)'/>"
+    "</g><circle r='1.7' fill='#d9577a'/></g></g></svg>"
 )
 
 # The web app's tokens (apps/web/app/assets/css/main.css), narrowed to what one card needs.
@@ -144,9 +155,9 @@ def _page(title: str, body: str, status_code: int = 200) -> HTMLResponse:
             # head. Without these the client falls back to /favicon.ico and shows whatever
             # icon it already associates with the parent domain. `?v=` is the mark's
             # version, kept in step with the web app's (apps/web/nuxt.config.ts).
-            "<link rel='icon' href='/favicon.svg?v=2' type='image/svg+xml'>"
-            "<link rel='icon' href='/favicon.ico?v=2' sizes='48x48'>"
-            "<link rel='apple-touch-icon' href='/apple-touch-icon.png?v=2'>"
+            "<link rel='icon' href='/favicon.svg?v=3' type='image/svg+xml'>"
+            "<link rel='icon' href='/favicon.ico?v=3' sizes='48x48'>"
+            "<link rel='apple-touch-icon' href='/apple-touch-icon.png?v=3'>"
             f"<title>{html.escape(title)}</title>"
             f"<style>{PAGE_STYLE}</style></head>"
             f"<body><main class='card'>"
