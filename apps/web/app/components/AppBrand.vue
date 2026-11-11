@@ -52,11 +52,9 @@ const { t } = useI18n()
   font-size: var(--display-sm);
 }
 
-/* The rounded square is drawn in the SVG (rx 14 of 64); the radius only shapes the shadow. */
 .brand-mark {
   display: block;
   flex-shrink: 0;
-  border-radius: 22%;
 }
 
 .brand.md .brand-mark {
@@ -64,9 +62,11 @@ const { t } = useI18n()
   height: 28px;
 }
 
+/* The rounded square is drawn in the SVG (rx 14 of 64); the radius only shapes the shadow. */
 .brand.lg .brand-mark {
   width: 80px;
   height: 80px;
+  border-radius: 22%;
   box-shadow: 0 8px 24px var(--glass-shadow);
 }
 
