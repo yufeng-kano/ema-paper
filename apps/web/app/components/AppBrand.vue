@@ -2,12 +2,9 @@
 /**
  * The product mark and name, linking home — the same in both shells.
  *
- * The mark is the `scan-text` glyph white on an app icon's rounded square, the accent lit
- * from the top as the system's own icons are: the brand is the one place besides data and
- * controls where the accent appears, and a monogram at this size was reading as a stray pair
- * of letters rather than as a mark (docs/web.md § Design system). Its blues are the light
- * accent's in both appearances (`--mark-top`, `--mark-bottom`), the favicon's own, so the
- * page and the browser tab show one icon.
+ * The mark is the app icon itself, `public/favicon.svg`, so the page and the browser tab show
+ * one icon. It is a logo with its own colors, never the accent, in both appearances
+ * (docs/web.md § Design system). `?v=` is the icons' version, raised with nuxt.config.ts's.
  *
  * `lg` is the sign-in page's app icon: the mark large over the name, as a product page
  * introduces an app. Everything else takes the sidebar's cut. Without `to` — the sign-in
@@ -24,15 +21,11 @@ const { t } = useI18n()
 
 <template>
   <NuxtLink v-if="to" class="brand" :class="size" :to="to">
-    <span class="brand-mark" aria-hidden="true">
-      <UiIcon name="scan-text" />
-    </span>
+    <img class="brand-mark" src="/favicon.svg?v=3" alt="">
     <span class="brand-name">{{ t('app.name') }}</span>
   </NuxtLink>
   <div v-else class="brand" :class="size">
-    <span class="brand-mark" aria-hidden="true">
-      <UiIcon name="scan-text" />
-    </span>
+    <img class="brand-mark" src="/favicon.svg?v=3" alt="">
     <span class="brand-name">{{ t('app.name') }}</span>
   </div>
 </template>
@@ -60,37 +53,21 @@ const { t } = useI18n()
 }
 
 .brand-mark {
-  display: inline-grid;
-  place-items: center;
+  display: block;
   flex-shrink: 0;
-  background: linear-gradient(180deg, var(--mark-top), var(--mark-bottom));
-  box-shadow: inset 0 1px 0 var(--accent-highlight);
-  color: var(--accent-fg);
 }
 
 .brand.md .brand-mark {
   width: 28px;
   height: 28px;
-  border-radius: var(--radius-mark);
 }
 
+/* The rounded square is drawn in the SVG (rx 14 of 64); the radius only shapes the shadow. */
 .brand.lg .brand-mark {
   width: 80px;
   height: 80px;
-  border-radius: var(--radius-xl);
-  box-shadow:
-    inset 0 1px 0 var(--accent-highlight),
-    0 8px 24px var(--glass-shadow);
-}
-
-.brand.md .brand-mark :deep(svg) {
-  width: 17px;
-  height: 17px;
-}
-
-.brand.lg .brand-mark :deep(svg) {
-  width: 46px;
-  height: 46px;
+  border-radius: 22%;
+  box-shadow: 0 8px 24px var(--glass-shadow);
 }
 
 /* The wordmark never wraps — it is a name, and a two-line one reads as two words. */

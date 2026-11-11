@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 import uuid
 from datetime import timedelta
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import httpx
@@ -19,6 +20,7 @@ from sqlalchemy import select
 
 from sightread.auth.crypto import hash_token
 from sightread.db.models import OAuthGrant, utcnow
+from sightread.routes.oauth import MARK
 from tests.conftest import CSRF_HEADERS, mcp_running
 
 REDIRECT_URI = "https://claude.ai/api/mcp/auth_callback"
@@ -330,3 +332,14 @@ async def test_authorize_without_a_session_asks_for_sign_in(make_client) -> None
     redirected = await google.get("/oauth/authorize", params={**params, "client_id": client_id})
     assert redirected.status_code == 302
     assert redirected.headers["location"] == "/api/auth/login"
+
+
+def test_the_consent_page_mark_is_the_favicon() -> None:
+    # The consent card inlines the mark rather than linking it, so the copy has to be replaced
+    # by hand whenever the icons change; a stale one shows the old mark beside the new tab icon.
+    favicon = Path(__file__).parents[2] / "web" / "public" / "favicon.svg"
+
+    def shapes(svg: str) -> str:
+        return re.sub(r"^<svg[^>]*>", "", svg.strip()).replace('"', "'")
+
+    assert shapes(MARK) == shapes(favicon.read_text())
