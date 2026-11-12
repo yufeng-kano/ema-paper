@@ -530,7 +530,7 @@ const questions = computed(() => (pack.value ? ['1', '2', '3', '4', '5'] : ['1',
   font-size: var(--text-base);
 }
 
-/* A table on the desk sits on a paper sheet with the plans' lift, at the grouped list's
+/* A table on the desk sits on a paper sheet with the plans' edge, at the grouped list's
    radius. */
 .sheet {
   overflow: hidden;
