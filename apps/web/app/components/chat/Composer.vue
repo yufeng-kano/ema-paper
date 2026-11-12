@@ -1303,8 +1303,8 @@ defineExpose({ addFiles, setQuote, focus, ask, showPicked, holds })
 
 /* --- the field ------------------------------------------------------------------- */
 
-/* Paper on the agent's glass card, as the system's message field: a hairline, a faint
-   lift, the accent's ring while it has the caret. */
+/* Paper on the agent's glass card, as the system's message field: a hairline, no shadow,
+   the accent's ring while it has the caret. */
 .field {
   display: flex;
   flex-direction: column;
@@ -1313,7 +1313,6 @@ defineExpose({ addFiles, setQuote, focus, ask, showPicked, holds })
   border: 1px solid var(--line-strong);
   border-radius: var(--radius-composer);
   background: var(--paper);
-  box-shadow: 0 1px 2px var(--glass-shadow);
   transition:
     border-color var(--duration-fast) var(--ease),
     box-shadow var(--duration-fast) var(--ease);

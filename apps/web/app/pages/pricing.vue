@@ -536,9 +536,7 @@ const questions = computed(() => (pack.value ? ['1', '2', '3', '4', '5'] : ['1',
   overflow: hidden;
   border-radius: var(--radius-lg);
   background: var(--paper);
-  box-shadow:
-    0 0 0 0.5px var(--pane-edge),
-    0 4px 14px var(--glass-shadow);
+  box-shadow: 0 0 0 0.5px var(--pane-edge);
 }
 
 .rates-sheet {

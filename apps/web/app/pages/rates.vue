@@ -189,9 +189,7 @@ function rate(value: number): string {
   overflow: hidden;
   border-radius: var(--radius-lg);
   background: var(--paper);
-  box-shadow:
-    0 0 0 0.5px var(--pane-edge),
-    0 4px 14px var(--glass-shadow);
+  box-shadow: 0 0 0 0.5px var(--pane-edge);
 }
 
 /* Narrower than the page tables: five short columns of figures, inside the reading column. */
