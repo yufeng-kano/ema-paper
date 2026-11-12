@@ -62,12 +62,10 @@ const { t } = useI18n()
   height: 28px;
 }
 
-/* The rounded square is drawn in the SVG (rx 14 of 64); the radius only shapes the shadow. */
+/* The rounded square is drawn in the SVG (rx 14 of 64). */
 .brand.lg .brand-mark {
   width: 80px;
   height: 80px;
-  border-radius: 22%;
-  box-shadow: 0 8px 24px var(--glass-shadow);
 }
 
 /* The wordmark never wraps — it is a name, and a two-line one reads as two words. */

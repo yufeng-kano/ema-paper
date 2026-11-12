@@ -211,7 +211,7 @@ async function signInAsDeveloper() {
   text-wrap: pretty;
 }
 
-/* The sign-in card: paper on the desk, the reader's cards' radius and lift. */
+/* The sign-in card: paper on the desk, the reader's cards' radius and edge. */
 .card {
   display: flex;
   flex-direction: column;

@@ -142,13 +142,9 @@
   --glass-blur: blur(24px) saturate(180%);
   --glass-highlight: light-dark(rgb(255 255 255 / 85%), rgb(255 255 255 / 10%));
   --glass-edge: light-dark(rgb(0 0 0 / 12%), rgb(255 255 255 / 14%));
-  --glass-shadow: light-dark(rgb(0 0 0 / 8%), rgb(0 0 0 / 40%));
   --pane-edge: light-dark(rgb(0 0 0 / 8%), rgb(255 255 255 / 10%));
-  --pane-shadow: light-dark(rgb(0 0 0 / 10%), rgb(0 0 0 / 45%));
-  --shadow-glass:
-    inset 0 1px 0 var(--glass-highlight), 0 0 0 0.5px var(--glass-edge), 0 4px 14px var(--glass-shadow);
-  --shadow-pane:
-    inset 0 1px 0 var(--glass-highlight), 0 0 0 0.5px var(--pane-edge), 0 14px 40px var(--pane-shadow);
+  --shadow-glass: inset 0 1px 0 var(--glass-highlight), 0 0 0 0.5px var(--glass-edge);
+  --shadow-pane: inset 0 1px 0 var(--glass-highlight), 0 0 0 0.5px var(--pane-edge);
 
   /* --- The context menu ---------------------------------------------------
      The platform's menu: opaque, so nothing under it reads through its rows; hairlined and

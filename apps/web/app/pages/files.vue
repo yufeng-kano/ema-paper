@@ -2805,9 +2805,8 @@ useBuildHold(
               <template #icon><UiIcon name="message-circle" /></template>
             </UiButton>
           </UiCapsule>
-          <UiButton class="upload" variant="primary" size="lg" :label="t('files.upload')" @click="pickFiles(currentFolder)">
+          <UiButton class="upload" variant="primary" size="lg" icon-only :label="t('files.upload')" @click="pickFiles(currentFolder)">
             <template #icon><UiIcon name="upload" /></template>
-            <span class="upload-label">{{ t('files.upload') }}</span>
           </UiButton>
           <!-- Drawn instead of the two above where they do not fit beside the tabs. -->
           <UiCapsule class="toolbar-more" :label="t('files.actions')">
@@ -3496,25 +3495,14 @@ useBuildHold(
 }
 
 /* The screen's own width decides, not the window's: the Agent card beside the list narrows
-   the screen as much as a small window does. The upload label goes first; narrower still, the
-   capsule and Upload fold into one More button beside the tabs. */
+   the screen as much as a small window does. Too narrow, the capsule and Upload fold into one
+   More button beside the tabs. */
 .list-screen {
   container: files-screen / inline-size;
 }
 
 .list-screen .toolbar-more {
   display: none;
-}
-
-@container files-screen (max-width: 560px) {
-  .upload-label {
-    display: none;
-  }
-
-  .btn.upload {
-    width: var(--control-height-lg);
-    padding: 0;
-  }
 }
 
 @container files-screen (max-width: 470px) {
