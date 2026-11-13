@@ -21,7 +21,7 @@ services:
         # Prefixed on purpose: a bare `caddy` alias collides with every other stack
         # sharing this network.
         aliases:
-          - sightread-caddy
+          - ema-paper-caddy
 
 networks:
   proxy:

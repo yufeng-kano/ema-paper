@@ -1,14 +1,19 @@
 # Local full stack (docs/deployment.md). Plain HTTP, ports exposed on localhost.
 #
 # Containers are named rather than left to compose's generated `<project>-<service>-1`, so
-# `docker logs -f sightread-worker` is the same command here as in production. The names are
+# `docker logs -f ema-paper-worker` is the same command here as in production. The names are
 # the same in both stacks, which is also why only one of them can be up at a time
 # (docs/deployment.md § Compose files).
+
+# The project name is pinned: compose would otherwise take it from the checkout directory,
+# and with it the names of the volumes (`ema-paper_pgdata`, ...) and the default network —
+# a renamed checkout would then come up beside its own data instead of on it.
+name: ema-paper
 
 services:
   pg:
     image: postgres:16
-    container_name: sightread-pg
+    container_name: ema-paper-pg
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-sightread}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sightread}
@@ -27,7 +32,7 @@ services:
   api:
     build:
       context: ./apps/api
-    container_name: sightread-api
+    container_name: ema-paper-api
     env_file:
       - path: .env
         required: false
@@ -66,7 +71,7 @@ services:
     # Same image as the api; only the command differs (docs/project-structure.md).
     build:
       context: ./apps/api
-    container_name: sightread-worker
+    container_name: ema-paper-worker
     env_file:
       - path: .env
         required: false
@@ -95,15 +100,15 @@ services:
 
   # The sandbox runner (docs/sandbox.md): the one container with the Docker socket. It
   # starts a container per user from the sandbox image, so build that image first:
-  # `docker build -t sightread-sandbox deploy/sandbox-image`. SANDBOX_RUNTIME=runc works
+  # `docker build -t ema-paper-sandbox deploy/sandbox-image`. SANDBOX_RUNTIME=runc works
   # on a laptop without KVM and isolates nothing; production requires a VM runtime.
   sandbox:
     build:
       context: ./apps/sandbox
-    # Named explicitly: compose would otherwise tag this build `sightread-sandbox`, the
+    # Named explicitly: compose would otherwise tag this build `ema-paper-sandbox`, the
     # tag the VM image (deploy/sandbox-image, SANDBOX_IMAGE) is documented to carry.
-    image: sightread-sandbox-runner
-    container_name: sightread-sandbox
+    image: ema-paper-sandbox-runner
+    container_name: ema-paper-sandbox
     env_file:
       - path: .env
         required: false
@@ -135,8 +140,8 @@ services:
   sandbox-egress:
     build:
       context: ./apps/sandbox
-    image: sightread-sandbox-runner
-    container_name: sightread-sandbox-egress
+    image: ema-paper-sandbox-runner
+    container_name: ema-paper-sandbox-egress
     command: ["python", "-m", "sightread_sandbox.egress"]
     # tini as pid 1: as pid 1 itself, Python would ignore docker stop's SIGTERM.
     init: true
@@ -167,7 +172,7 @@ services:
   web:
     build:
       context: ./apps/web
-    container_name: sightread-web
+    container_name: ema-paper-web
     depends_on:
       - api
     ports:
@@ -177,7 +182,7 @@ services:
   # locally exactly like production does — use http://localhost:8080 for the full stack.
   caddy:
     image: caddy:2
-    container_name: sightread-caddy
+    container_name: ema-paper-caddy
     depends_on:
       - api
       - web
@@ -193,7 +198,7 @@ networks:
   # addresses come from, so a VM started while the proxy restarts cannot take it
   # (docs/sandbox.md § Network). The runner refuses a network without the first two.
   sandbox:
-    name: sightread-sandbox
+    name: ema-paper-sandbox
     internal: true
     driver_opts:
       com.docker.network.bridge.inhibit_ipv4: "true"

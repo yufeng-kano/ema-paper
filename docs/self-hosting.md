@@ -170,7 +170,7 @@ The *Redeem codes* page creates, lists and disables codes by the same rules as `
 
 - **Update:** `git pull`, then the same `docker compose -f … up -d --build` you started with. A changed Caddyfile also needs `docker compose -f … restart caddy` ([deployment.md](./deployment.md) § Release flow).
 - **Back up:** the `backup` service writes the database dump, the figure crops and every workspace into `./backups/<stamp>/` once a day and keeps the newest seven. Copy them off the server, and test a restore before you rely on it ([deployment.md](./deployment.md) § Compose files).
-- **Logs:** `docker logs -f sightread-api`, and likewise `sightread-worker`, `sightread-web` and `sightread-caddy`.
+- **Logs:** `docker logs -f ema-paper-api`, and likewise `ema-paper-worker`, `ema-paper-web` and `ema-paper-caddy`.
 
 ## Develop
 

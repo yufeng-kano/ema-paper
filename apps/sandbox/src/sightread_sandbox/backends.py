@@ -312,7 +312,7 @@ async def _docker(*args: str, timeout: float = 120.0) -> tuple[int, str]:
     return process.returncode or 0, out.decode("utf-8", errors="replace")
 
 
-CONTAINER_PREFIX = "sightread-sandbox-"
+CONTAINER_PREFIX = "ema-paper-sandbox-"
 
 # What runs as pid 1 in the VM: an init that reaps. A command's leftovers the sweep kills
 # are reparented to pid 1 and would sit there as zombies, against the VM's pid limit, if

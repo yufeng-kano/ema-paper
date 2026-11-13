@@ -5,10 +5,15 @@
 # Caddy is the only service with published ports; api, worker, web and pg are reachable
 # on the compose network alone. Secrets come from `.env` next to this file.
 
+# The project name is pinned: compose would otherwise take it from the checkout directory,
+# and with it the names of the volumes (`ema-paper_pgdata`, ...) and the default network —
+# a renamed checkout would then come up beside its own data instead of on it.
+name: ema-paper
+
 services:
   caddy:
     image: caddy:2-alpine
-    container_name: sightread-caddy
+    container_name: ema-paper-caddy
     restart: unless-stopped
     ports:
       - "80:80"
@@ -28,7 +33,7 @@ services:
 
   pg:
     image: postgres:16
-    container_name: sightread-pg
+    container_name: ema-paper-pg
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-sightread}
@@ -45,7 +50,7 @@ services:
   api:
     build:
       context: ./apps/api
-    container_name: sightread-api
+    container_name: ema-paper-api
     restart: unless-stopped
     env_file:
       - .env
@@ -84,7 +89,7 @@ services:
   worker:
     build:
       context: ./apps/api
-    container_name: sightread-worker
+    container_name: ema-paper-worker
     restart: unless-stopped
     env_file:
       - .env
@@ -112,16 +117,16 @@ services:
     command: ["python", "-m", "sightread.worker"]
 
   # The sandbox runner (docs/sandbox.md): alone in holding the Docker socket, it starts
-  # one Kata microVM per user from the sandbox image (`docker build -t sightread-sandbox
+  # one Kata microVM per user from the sandbox image (`docker build -t ema-paper-sandbox
   # deploy/sandbox-image`). The host needs /dev/kvm and the `kata` runtime registered with
   # Docker; the runner refuses to start in production with `runc`.
   sandbox:
     build:
       context: ./apps/sandbox
-    # Named explicitly: compose would otherwise tag this build `sightread-sandbox`, the
+    # Named explicitly: compose would otherwise tag this build `ema-paper-sandbox`, the
     # tag the VM image (deploy/sandbox-image, SANDBOX_IMAGE) is documented to carry.
-    image: sightread-sandbox-runner
-    container_name: sightread-sandbox
+    image: ema-paper-sandbox-runner
+    container_name: ema-paper-sandbox
     restart: unless-stopped
     env_file:
       - .env
@@ -151,8 +156,8 @@ services:
   sandbox-egress:
     build:
       context: ./apps/sandbox
-    image: sightread-sandbox-runner
-    container_name: sightread-sandbox-egress
+    image: ema-paper-sandbox-runner
+    container_name: ema-paper-sandbox-egress
     restart: unless-stopped
     command: ["python", "-m", "sightread_sandbox.egress"]
     # tini as pid 1: as pid 1 itself, Python would ignore docker stop's SIGTERM.
@@ -189,7 +194,7 @@ services:
         # and the sitemap take the origin here (docs/web.md § Search engines). A changed
         # WEB_URL needs the image rebuilt.
         WEB_URL: ${WEB_URL:?WEB_URL is required}
-    container_name: sightread-web
+    container_name: ema-paper-web
     restart: unless-stopped
     depends_on:
       - api
@@ -201,7 +206,7 @@ services:
     # newest seven of each. Deliberately a visible shell loop: a cron container would hide
     # the schedule and the rotation in two more places.
     image: postgres:16
-    container_name: sightread-backup
+    container_name: ema-paper-backup
     restart: unless-stopped
     environment:
       PGUSER: ${POSTGRES_USER:-sightread}
@@ -285,7 +290,7 @@ networks:
   # addresses come from, so a VM started while the proxy restarts cannot take it
   # (docs/sandbox.md § Network). The runner refuses a network without the first two.
   sandbox:
-    name: sightread-sandbox
+    name: ema-paper-sandbox
     internal: true
     driver_opts:
       com.docker.network.bridge.inhibit_ipv4: "true"

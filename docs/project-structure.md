@@ -1,7 +1,7 @@
 # Project structure
 
 ```text
-agent-sightread/
+ema-paper/
   apps/
     api/                      # FastAPI app + worker (one uv project, one image)
       src/sightread/

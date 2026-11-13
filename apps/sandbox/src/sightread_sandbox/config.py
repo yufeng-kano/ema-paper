@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     sandbox_backend: Literal["docker", "local"] = "docker"
     # The Docker runtime: `kata` is a VM per container; `runc` is for local development.
     sandbox_runtime: str = "kata"
-    sandbox_image: str = "sightread-sandbox"
+    sandbox_image: str = "ema-paper-sandbox"
     # Host path of the per-user workspaces as the Docker daemon sees it: what `docker run`
     # bind-mounts into a user's VM.
     sandbox_workspaces_dir: str = "/data/workspaces"

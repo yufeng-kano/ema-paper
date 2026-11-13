@@ -2800,17 +2800,17 @@ def test_the_prompt_names_the_sites_and_promises_an_install_only_with_pypi() -> 
     pypi = ("pypi.org", "files.pythonhosted.org")
     # No network — the shipped default on both examples — or an empty list reaches nothing.
     assert chat_agent.network_note("none", pypi) == chat_agent.NETWORK_NONE
-    assert chat_agent.network_note("sightread-sandbox", ()) == chat_agent.NETWORK_NONE
-    note = chat_agent.network_note("sightread-sandbox", (*pypi, "github.com"))
+    assert chat_agent.network_note("ema-paper-sandbox", ()) == chat_agent.NETWORK_NONE
+    note = chat_agent.network_note("ema-paper-sandbox", (*pypi, "github.com"))
     assert "pypi.org, files.pythonhosted.org, github.com" in note
     assert "`uv pip install` works" in note
     # The index without the host its files come from installs nothing; a wildcard covers
     # the names under it, never the name itself.
     for hosts in (("pypi.org", "github.com"), ("*.pypi.org", "files.pythonhosted.org")):
-        other = chat_agent.network_note("sightread-sandbox", hosts)
+        other = chat_agent.network_note("ema-paper-sandbox", hosts)
         assert "`uv pip install`" not in other and "fails at once" in other
     assert "`uv pip install` works" in chat_agent.network_note(
-        "sightread-sandbox", ("pypi.org", "*.pythonhosted.org")
+        "ema-paper-sandbox", ("pypi.org", "*.pythonhosted.org")
     )
     rendered = chat_agent.render_system_prompt(chat_agent.DEFAULT_SYSTEM_PROMPT, {"network": note})
     assert "through a proxy: pypi.org" in rendered and "{network}" not in rendered

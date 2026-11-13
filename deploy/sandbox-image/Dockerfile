@@ -1,5 +1,5 @@
 # What runs inside a user's VM (docs/sandbox.md § The image). Built and tagged by the
-# operator: `docker build -t sightread-sandbox deploy/sandbox-image`.
+# operator: `docker build -t ema-paper-sandbox deploy/sandbox-image`.
 FROM debian:bookworm-slim
 
 RUN apt-get update \

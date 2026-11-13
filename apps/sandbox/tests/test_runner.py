@@ -153,7 +153,7 @@ async def test_the_shell_cap_closes_the_longest_idle_shell(tmp_path) -> None:
 
 
 def test_running_sandboxes_are_recognised_by_name() -> None:
-    listing = "sightread-sandbox-12\nsightread-sandbox-runner\nother\nsightread-sandbox-7\n"
+    listing = "ema-paper-sandbox-12\nema-paper-sandbox-runner\nother\nema-paper-sandbox-7\n"
     assert adopted_user_ids(listing) == [12, 7]
 
 
@@ -651,7 +651,7 @@ async def test_a_runner_that_cannot_list_sandboxes_does_not_start(tmp_path, monk
 async def test_the_runner_starts_only_on_an_internal_network(tmp_path, monkeypatch) -> None:
     from sightread_sandbox import backends
 
-    inspected = {"sightread-sandbox": "true true"}
+    inspected = {"ema-paper-sandbox": "true true"}
 
     async def fake_docker(*args, timeout=120.0):
         if args[:2] == ("network", "inspect"):
@@ -687,7 +687,7 @@ async def test_the_runner_starts_only_on_an_internal_network(tmp_path, monkeypat
             inspected[network] = answer
         with pytest.raises(RuntimeError, match="not an internal Docker network"):
             await backends.DockerBackend(settings(network)).startup()
-    await backends.DockerBackend(settings("sightread-sandbox")).startup()
+    await backends.DockerBackend(settings("ema-paper-sandbox")).startup()
     await backends.DockerBackend(settings("none")).startup()
 
 
@@ -698,7 +698,7 @@ def test_a_network_needs_the_proxy(tmp_path) -> None:
             sandbox_token=TOKEN,
             sandbox_backend="docker",
             sandbox_runtime="runc",
-            sandbox_network="sightread-sandbox",
+            sandbox_network="ema-paper-sandbox",
             sandbox_workspaces_dir=str(tmp_path / "ws"),
             sandbox_workspaces_mount=str(tmp_path / "ws"),
         )
@@ -716,7 +716,7 @@ async def test_a_vm_on_the_network_is_pointed_at_the_proxy(tmp_path, monkeypatch
         return 0, ""
 
     monkeypatch.setattr(backends, "_docker", fake_docker)
-    for network, user_id in (("sightread-sandbox", 81), ("none", 82)):
+    for network, user_id in (("ema-paper-sandbox", 81), ("none", 82)):
         settings = Settings(
             app_env="local",
             sandbox_token=TOKEN,
@@ -730,10 +730,10 @@ async def test_a_vm_on_the_network_is_pointed_at_the_proxy(tmp_path, monkeypatch
         backend = backends.DockerBackend(settings)
         await backend.ensure_running(backend._user(user_id))
     on, off = [args for args in calls if args[0] == "run"]
-    assert on[on.index("--network") + 1] == "sightread-sandbox"
+    assert on[on.index("--network") + 1] == "ema-paper-sandbox"
     # The default environment is made in the VM just started, the network's as any other.
     made = [args[1] for args in calls if args[0] == "exec" and args[-1] == backends.DEFAULT_ENV]
-    assert made == ["sightread-sandbox-81", "sightread-sandbox-82"]
+    assert made == ["ema-paper-sandbox-81", "ema-paper-sandbox-82"]
     # Both spellings of both: uv, pip, git, curl and Python's clients each read one.
     for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
         assert f"{name}=http://10.250.250.2:3128" in on
@@ -745,7 +745,7 @@ async def test_a_vm_on_the_network_is_pointed_at_the_proxy(tmp_path, monkeypatch
     assert "net.ipv6.conf.default.disable_ipv6=1" in on
     assert not [arg for arg in off if "ipv6" in arg]
     checked = [args[1] for args in calls if args[0] == "exec" and args[-1] == backends.NO_IPV6]
-    assert checked == ["sightread-sandbox-81"]
+    assert checked == ["ema-paper-sandbox-81"]
 
 
 async def test_a_vm_on_the_network_that_keeps_ipv6_is_never_used(tmp_path, monkeypatch) -> None:
@@ -767,7 +767,7 @@ async def test_a_vm_on_the_network_that_keeps_ipv6_is_never_used(tmp_path, monke
         sandbox_token=TOKEN,
         sandbox_backend="docker",
         sandbox_runtime="runc",
-        sandbox_network="sightread-sandbox",
+        sandbox_network="ema-paper-sandbox",
         sandbox_proxy_url="http://10.250.250.2:3128",
         sandbox_workspaces_dir=str(tmp_path / "ws"),
         sandbox_workspaces_mount=str(tmp_path / "ws"),
@@ -777,7 +777,7 @@ async def test_a_vm_on_the_network_that_keeps_ipv6_is_never_used(tmp_path, monke
     with pytest.raises(RuntimeError, match="could not be started"):
         await backend.ensure_running(sandbox)
     # Removed before anything ran in it, and not counted as started.
-    assert calls[-1] == ("rm", "-f", "sightread-sandbox-83")
+    assert calls[-1] == ("rm", "-f", "ema-paper-sandbox-83")
     assert not [args for args in calls if args[0] == "exec" and args[-1] == backends.DEFAULT_ENV]
     assert sandbox.started_at is None
 
@@ -810,7 +810,7 @@ async def test_a_vm_with_ipv6_that_cannot_be_removed_takes_no_command(
         sandbox_token=TOKEN,
         sandbox_backend="docker",
         sandbox_runtime="runc",
-        sandbox_network="sightread-sandbox",
+        sandbox_network="ema-paper-sandbox",
         sandbox_proxy_url="http://10.250.250.2:3128",
         sandbox_workspaces_dir=str(tmp_path / "ws"),
         sandbox_workspaces_mount=str(tmp_path / "ws"),
@@ -882,14 +882,14 @@ async def test_an_adopted_vm_on_the_network_with_ipv6_is_stopped(tmp_path, monke
         if args[:2] == ("network", "inspect"):
             return 0, "true true\n"
         if args[0] == "ps":
-            return 0, "sightread-sandbox-91\nsightread-sandbox-92\n"
+            return 0, "ema-paper-sandbox-91\nema-paper-sandbox-92\n"
         # A runner before the IPv6 rule started 91; 92 has none.
         if args[0] == "exec" and args[-1] == backends.NO_IPV6:
-            return (1, "") if args[1] == "sightread-sandbox-91" else (0, "")
+            return (1, "") if args[1] == "ema-paper-sandbox-91" else (0, "")
         return 0, ""
 
     monkeypatch.setattr(backends, "_docker", fake_docker)
-    for network in ("sightread-sandbox", "none"):
+    for network in ("ema-paper-sandbox", "none"):
         calls.clear()
         settings = Settings(
             app_env="local",
@@ -904,7 +904,7 @@ async def test_an_adopted_vm_on_the_network_with_ipv6_is_stopped(tmp_path, monke
         await backends.DockerBackend(settings).startup()
         removed = [args[-1] for args in calls if args[0] == "rm"]
         # Off the network an adopted VM's IPv6 reaches nothing, so it is not looked at.
-        assert removed == (["sightread-sandbox-91"] if network != "none" else [])
+        assert removed == (["ema-paper-sandbox-91"] if network != "none" else [])
 
 
 async def test_the_vm_scratch_size_comes_from_settings(tmp_path, monkeypatch) -> None:
@@ -972,13 +972,13 @@ async def test_the_default_environment_is_made_after_each_start(tmp_path, monkey
     assert calls[run_at][-3:] == (backends.REAPER_PYTHON, "-c", backends.REAPER)
     assert calls[run_at + 1] == (
         "exec",
-        "sightread-sandbox-71",
+        "ema-paper-sandbox-71",
         "/bin/sh",
         "-c",
         backends.DEFAULT_ENV,
     )
     argv, _cwd = backend.shell_argv(71)
-    assert argv[argv.index("sightread-sandbox-71") + 1 :][:4] == [
+    assert argv[argv.index("ema-paper-sandbox-71") + 1 :][:4] == [
         "/usr/bin/setsid",
         "-w",
         "/bin/sh",
@@ -1332,7 +1332,7 @@ async def test_a_vm_docker_cannot_inspect_is_unavailable_not_stopped(tmp_path, m
         http.headers["Authorization"] = f"Bearer {TOKEN}"
         assert (await http.get("/sandboxes/7")).status_code == 503
         # Docker's own "no such" is a positive absence: stopped.
-        answer["out"] = (1, "Error: No such object: sightread-sandbox-7")
+        answer["out"] = (1, "Error: No such object: ema-paper-sandbox-7")
         assert (await http.get("/sandboxes/7")).json()["state"] == "stopped"
     # The idle sweep skips what it cannot ask about and goes on.
     answer["out"] = (1, "docker timed out")
