@@ -7,6 +7,7 @@
  * instructions for the check, edited in place and saved with Save, as the chat agent's are;
  * and, as their advanced option, the whole prompt.
  */
+import { charLength } from '~/lib/agents'
 import {
   AGENT_EFFORTS,
   putAgentSettings,
@@ -27,14 +28,13 @@ const emit = defineEmits<{
   saved: [agent: string, settings: SavedAgentSettings]
 }>()
 
-const { t, locale } = useI18n()
+const { t } = useI18n()
 const { resolve } = useApiError()
 const auth = useAuth()
 
 const labelId = useId()
 const noteId = useId()
 const countId = useId()
-const advancedId = useId()
 
 const title = computed(() => t('agents.names.check'))
 const settings = computed(() => props.agent.settings)
@@ -46,12 +46,11 @@ const error = ref<string | null>(null)
 const autoChoice = ref<boolean | null>(null)
 const autoOn = computed(() => autoChoice.value ?? settings.value.auto_check)
 
-async function toggleAuto() {
+async function toggleAuto(next: boolean) {
   if (autoChoice.value !== null) {
     return
   }
   const name = props.agent.name
-  const next = !autoOn.value
   autoChoice.value = next
   error.value = null
   try {
@@ -87,22 +86,12 @@ async function applyEffort(value: string) {
 const maxChars = computed(() => auth.me.value?.limits.instructions_max_chars ?? null)
 const savedInstructions = computed(() => settings.value.instructions ?? '')
 const text = ref(savedInstructions.value)
-/** Bumped to remount the editor on Cancel: it follows its `source` only when that changes. */
-const editorKey = ref(0)
-const editor = ref<{ focus: () => void } | null>(null)
+const editor = ref<{ reset: () => void } | null>(null)
 const instructionsPending = ref(false)
 
-/** Counted as the server counts: the trimmed text, in code points. */
-const length = computed(() => [...text.value.trim()].length)
+const length = computed(() => charLength(text.value))
 const overCap = computed(() => maxChars.value !== null && length.value > maxChars.value)
 const dirty = computed(() => text.value.trim() !== savedInstructions.value.trim())
-
-/** A click on the box below the last line still writes, as in the notes column. */
-function onEditorClick(event: MouseEvent) {
-  if (!(event.target instanceof Element) || !event.target.closest('.rich')) {
-    editor.value?.focus()
-  }
-}
 
 async function saveInstructions() {
   if (instructionsPending.value || !dirty.value || overCap.value) {
@@ -126,31 +115,26 @@ async function saveInstructions() {
 function cancelInstructions() {
   text.value = savedInstructions.value
   error.value = null
-  editorKey.value += 1
+  editor.value?.reset()
 }
-
-// --- advanced: the whole prompt -------------------------------------------------------
-
-/** Closed unless the prompt is not the default. */
-const advancedOpen = ref(settings.value.prompt !== null)
 </script>
 
 <template>
   <section class="section" :aria-labelledby="labelId" :aria-describedby="noteId">
     <div class="intro">
       <div class="head">
-        <h3 :id="labelId" class="section-label">{{ t('agents.check.label') }}</h3>
+        <h3 :id="labelId" class="agents-label">{{ t('agents.check.label') }}</h3>
         <UiSwitch :model-value="autoOn" :busy="autoChoice !== null" @update:model-value="toggleAuto">
           {{ t('agents.check.auto') }}
         </UiSwitch>
       </div>
-      <p :id="noteId" class="note">{{ t('agents.check.note') }}</p>
+      <p :id="noteId" class="agents-note">{{ t('agents.check.note') }}</p>
     </div>
 
     <div class="controls">
       <!-- The check's model is the deployment's: a fact under its label, not a control. -->
       <div class="model fact">
-        <span class="fact-label">{{ t('agents.modelLabel') }}</span>
+        <span class="agents-label">{{ t('agents.modelLabel') }}</span>
         <span v-if="settings.model" class="mono fact-value">{{ settings.model }}</span>
         <span v-else class="fact-value muted">{{ t('agents.modelNone') }}</span>
       </div>
@@ -167,31 +151,18 @@ const advancedOpen = ref(settings.value.prompt !== null)
     </div>
 
     <div class="instructions">
-      <span class="field-label">{{ t('agents.check.instructions') }}</span>
-      <div class="editor md-side" @click="onEditorClick">
-        <RichEditor
-          :key="editorKey"
-          ref="editor"
-          variant="notes"
-          :source="savedInstructions"
-          :placeholder="t('agents.check.placeholder')"
-          :label="t('agents.check.instructions')"
-          :described-by="countId"
-          :editable="!instructionsPending"
-          @change="text = $event"
-        />
-      </div>
+      <span class="agents-label">{{ t('agents.check.instructions') }}</span>
+      <AgentsInstructionsEditor
+        ref="editor"
+        :source="savedInstructions"
+        :placeholder="t('agents.check.placeholder')"
+        :label="t('agents.check.instructions')"
+        :described-by="countId"
+        :editable="!instructionsPending"
+        @change="text = $event"
+      />
       <div class="commit">
-        <span :id="countId" class="count tabular" :class="{ over: overCap }">
-          {{
-            maxChars === null
-              ? length.toLocaleString(locale)
-              : t('agents.instructions.count', {
-                count: length.toLocaleString(locale),
-                max: maxChars.toLocaleString(locale),
-              })
-          }}
-        </span>
+        <AgentsCharCount :id="countId" :count="length" :max="maxChars" />
         <div class="commit-buttons">
           <UiButton variant="secondary" :disabled="!dirty || instructionsPending" @click="cancelInstructions">
             {{ t('common.cancel') }}
@@ -204,27 +175,13 @@ const advancedOpen = ref(settings.value.prompt !== null)
     </div>
     <UiBanner v-if="error" tone="error">{{ error }}</UiBanner>
 
-    <div class="advanced">
-      <button
-        type="button"
-        class="disclosure"
-        :aria-expanded="advancedOpen"
-        :aria-controls="advancedId"
-        @click="advancedOpen = !advancedOpen"
-      >
-        <UiIcon :name="advancedOpen ? 'chevron-down' : 'chevron-right'" class="disclosure-glyph" />
-        {{ t('agents.instructions.advanced') }}
-      </button>
-      <div v-show="advancedOpen" :id="advancedId" class="advanced-body">
-        <p class="advanced-note">{{ t('agents.check.advancedNote') }}</p>
-        <AgentsPromptField
-          :agent="agent"
-          :title="title"
-          :max-chars="promptMaxChars"
-          @saved="emit('saved', agent.name, $event)"
-        />
-      </div>
-    </div>
+    <AgentsAdvancedPrompt
+      :agent="agent"
+      :title="title"
+      :max-chars="promptMaxChars"
+      :note="t('agents.check.advancedNote')"
+      @saved="emit('saved', agent.name, $event)"
+    />
   </section>
 </template>
 
@@ -248,25 +205,6 @@ const advancedOpen = ref(settings.value.prompt !== null)
   align-items: center;
   justify-content: space-between;
   gap: var(--space-2);
-}
-
-/* The field label's treatment: a section of the panel, not a heading of the page. */
-.section-label,
-.field-label,
-.fact-label {
-  margin: 0;
-  font-family: inherit;
-  font-size: var(--text-xs);
-  font-weight: var(--weight-semibold);
-  color: var(--muted);
-}
-
-/* A consequence the controls cannot show, in the cache line's voice. */
-.note {
-  margin: 0;
-  color: var(--muted);
-  font-size: var(--text-xs);
-  line-height: 1.5;
 }
 
 /* Model and effort on one row, wrapping on a narrow window. */
@@ -314,44 +252,6 @@ const advancedOpen = ref(settings.value.prompt !== null)
   gap: var(--space-2);
 }
 
-/* The chat agent's instructions box: the notes' editor in a field's hairline box, capped
-   and scrolling inside as that box is (docs/web.md § Pages). */
-.editor {
-  --block-heading: var(--display-2xs);
-  --block-subheading: var(--text-base);
-  --block-text: var(--text-sm);
-  --block-text-sm: var(--text-xs);
-  --rich-gap: var(--space-3);
-
-  min-height: 7rem;
-  border: 1px solid var(--edge);
-  border-radius: var(--radius);
-  background: var(--paper);
-  cursor: text;
-}
-
-/* As that box's: the text scrolls, so the slash menu and the TeX field stay whole. */
-.editor :deep(.rich-doc) {
-  max-height: min(20rem, 50vh);
-  overflow-y: auto;
-  padding: var(--space-4);
-}
-
-.editor:focus-within {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-
-.editor :deep(.md-h2:not([data-level='1'])) {
-  padding-top: 0;
-  border-top: none;
-}
-
-.editor :deep(.md-p),
-.editor :deep(.md-list) {
-  line-height: 1.7;
-}
-
 .commit {
   display: flex;
   flex-wrap: wrap;
@@ -363,73 +263,5 @@ const advancedOpen = ref(settings.value.prompt !== null)
 .commit-buttons {
   display: flex;
   gap: var(--space-2);
-}
-
-.count {
-  color: var(--faint);
-  font-size: var(--text-xs);
-}
-
-/* Over the cap is the one state the count exists to show. */
-.count.over {
-  color: var(--danger);
-}
-
-.advanced {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-}
-
-/* A disclosure is a quiet row, not a button box: it opens a part of this section. */
-.disclosure {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  align-self: flex-start;
-  height: var(--control-height-sm);
-  margin-left: calc(-1 * var(--space-2));
-  padding: 0 var(--space-2);
-  border: 0;
-  border-radius: var(--radius);
-  background: transparent;
-  color: var(--muted);
-  font-size: var(--text-sm);
-  cursor: pointer;
-  transition:
-    background var(--duration-fast) var(--ease),
-    color var(--duration-fast) var(--ease);
-}
-
-.disclosure:hover {
-  background: var(--rail);
-  color: var(--ink);
-}
-
-.disclosure-glyph {
-  flex-shrink: 0;
-  width: 14px;
-  height: 14px;
-  color: var(--faint);
-}
-
-.advanced-body {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-end;
-  gap: var(--space-3) var(--space-4);
-}
-
-/* What replacing the prompt gives up: bounded like a banner, neutral like one. */
-.advanced-note {
-  flex: 1 1 20rem;
-  min-width: 0;
-  margin: 0;
-  padding: var(--space-3) var(--space-4);
-  border: 1px solid var(--hair);
-  background: var(--paper);
-  color: var(--muted);
-  font-size: var(--text-sm);
-  line-height: 1.6;
 }
 </style>

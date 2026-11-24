@@ -405,7 +405,6 @@ async def test_memories_are_listed_edited_and_deleted(chat_client) -> None:
 
     listed = (await client.get("/api/memories")).json()
     assert [memory["id"] for memory in listed["memories"]] == [second["id"], first["id"]]
-    assert listed["max"] == client.app.state.settings.chat_memories_max
 
     widened = await client.put(
         f"/api/memories/{first['id']}",

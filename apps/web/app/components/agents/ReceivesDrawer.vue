@@ -81,8 +81,6 @@ function partLabel(part: AgentContextPart): string {
     case 'memory':
       return part.paused ? t('agents.receives.memoryPaused') : t('agents.receives.memory', { count: part.count ?? 0 })
   }
-  // A block a newer API sends that this page does not know yet: listed by its kind.
-  return String((part as { kind: string }).kind)
 }
 
 const rows = computed(() =>

@@ -6,10 +6,10 @@
  * workspace's storage, each a bar with *N% used*, the top-up credits on a paid plan (the
  * packs' balance, the newest packs with every one in a dialog, and *Top up*, which opens
  * the pack's dialog before Pay's checkout — docs/billing.md § Top-up packs), one line on
- * the rates with the way to the rates page (no table here, since 2026-10-26), and the
- * sandbox the plan gives. Redeemed days of a plan are said under the plan, and the plan's foot
- * ends in the way to the redeem dialog, Free or paid (docs/billing.md § Redeem codes). Every
- * figure is the API's: the section never names a price or a plan the API did not.
+ * the rates with the way to the rates page, and the sandbox the plan gives. Redeemed days
+ * of a plan are said under the plan, and the plan's foot ends in the way to the redeem
+ * dialog, Free or paid (docs/billing.md § Redeem codes). Every figure is the API's: the
+ * section never names a price or a plan the API did not.
  */
 import {
   createCheckout,

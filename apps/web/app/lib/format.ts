@@ -9,7 +9,7 @@ export function formatDateTime(iso: string, locale: string): string {
 /**
  * `MMM d, h:mm AM` — the compact stamp both list screens use in a column of rows.
  *
- * The year is dropped for anything from this year: it is redundant there and was the widest
+ * The year is dropped for anything from this year: it is redundant there and the widest
  * thing in the column. It comes back for older rows, because a list is a count and not a
  * window — two rows a year apart must not read as the same day.
  */
@@ -35,8 +35,8 @@ export function formatDate(iso: string, locale: string): string {
 }
 
 /**
- * Pay's amount is in the currency's minor unit (`"1500"` of `USD` is $15.00), as Dodo and
- * Paddle both report it; `Intl` wants major units and knows each currency's exponent.
+ * Pay's amount is in the currency's minor unit (`"1500"` of `USD` is $15.00); `Intl` wants
+ * major units and knows each currency's exponent.
  */
 export function formatMinorAmount(amount: string, currency: string, locale: string): string {
   const format = new Intl.NumberFormat(locale, { style: 'currency', currency })

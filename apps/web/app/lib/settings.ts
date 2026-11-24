@@ -51,8 +51,8 @@ export function takeAfterSignIn(): string | null {
 /**
  * The section a route's `settings` query names: `null` when the dialog is closed, *general*
  * when it is open on a section that does not exist, as the account menu would open it.
- * `billing` is *usage*: the section's name until 2026-10-24, and still where Kano Pay's
- * checkout and portal send the reader back to (docs/billing.md § Kano Pay).
+ * `billing` opens *usage*: it is the return URL Kano Pay's App is registered with, where
+ * checkout and the portal send the reader back (docs/billing.md § Kano Pay).
  */
 export function settingsSectionOf(value: unknown): SettingsSection | null {
   if (value === undefined) {

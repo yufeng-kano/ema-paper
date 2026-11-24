@@ -6,6 +6,7 @@
  * and **Delete subagent** on one of the reader's own. The model list is the chat agent's live
  * catalog, after *Follows the conversation*.
  */
+import { DESCRIPTION_MAX, NAME_RULE, charLength } from '~/lib/agents'
 import {
   createSubagent,
   deleteSubagent,
@@ -34,9 +35,6 @@ const emit = defineEmits<{
 
 const { t } = useI18n()
 const { resolve } = useApiError()
-
-const NAME_RULE = /^[a-z0-9][a-z0-9-]{0,63}$/
-const DESCRIPTION_MAX = 1024
 
 function fieldsOf(subagent: Subagent | null): SubagentFields {
   return subagent
@@ -74,13 +72,12 @@ const name = ref(initialName)
 const fields = reactive<SubagentFields>(fieldsOf(props.subagent))
 const pending = ref(false)
 const error = ref<string | null>(null)
-const confirming = ref(false)
 
 const builtin = computed(() => props.subagent?.builtin === true)
 const nameInvalid = computed(() => name.value !== '' && !NAME_RULE.test(name.value))
 const isDefault = computed(() => props.subagent?.default != null && sameFields(fields, props.subagent.default))
 const changed = computed(() => name.value !== initialName || !sameFields(fields, initial))
-const length = computed(() => [...fields.prompt.trim()].length)
+const length = computed(() => charLength(fields.prompt))
 const overCap = computed(() => props.maxChars !== null && length.value > props.maxChars)
 const saveDisabled = computed(
   () =>
@@ -170,199 +167,108 @@ async function remove() {
 </script>
 
 <template>
-  <!-- The confirmation stands in for the dialog rather than over it: two dialogs would
-       both answer Escape and both trap Tab. The fields keep their state behind it. -->
-  <UiConfirmDialog
-    v-if="confirming && subagent"
-    :title="t('agents.subagentDelete')"
-    :message="t('agents.subagentDeleteConfirm', { name: subagent.name })"
-    :confirm-label="t('common.delete')"
+  <AgentsDefinitionDialog
+    :heading="heading"
+    :state="state"
+    :form-id="`subagent-form-${subagent?.name ?? 'new'}`"
+    :builtin="builtin"
+    :is-default="isDefault"
+    :deletable="subagent !== null && !builtin"
+    :delete-label="t('agents.subagentDelete')"
+    :delete-confirm="subagent ? t('agents.subagentDeleteConfirm', { name: subagent.name }) : ''"
     :pending="pending"
     :error="error"
-    @confirm="remove"
-    @cancel="confirming = false; error = null"
-  />
-  <UiModal v-else size="wide" :title="heading" :busy="pending" @close="emit('close')">
-    <template #title>
-      <div class="heading">
-        <h2 class="heading-title">{{ heading }}</h2>
-        <span v-if="state" class="heading-state">{{ state }}</span>
-      </div>
-    </template>
-
-    <form :id="`subagent-form-${subagent?.name ?? 'new'}`" class="form" @submit.prevent="save">
-      <div class="pair">
-        <UiField v-slot="{ id, describedBy }" :label="t('agents.nameLabel')" :error="nameInvalid ? t('agents.nameRule') : undefined">
-          <UiTextInput
-            :id="id"
-            v-model="name"
-            mono
-            required
-            :maxlength="64"
-            :described-by="describedBy"
-            :invalid="nameInvalid"
-            :disabled="pending || builtin"
-          />
-        </UiField>
-        <UiField v-slot="{ id }" :label="t('agents.subagentModel')">
-          <UiSelect
-            :id="id"
-            :model-value="fields.model ?? ''"
-            :disabled="pending"
-            @update:model-value="fields.model = $event || null"
-          >
-            <option value="">{{ t('agents.followsConversation') }}</option>
-            <ModelOptions :models="models" :current="fields.model" />
-          </UiSelect>
-        </UiField>
-      </div>
-
-      <UiField v-slot="{ id }" :label="t('agents.whenLabel')">
-        <textarea
+    :save-disabled="saveDisabled"
+    @close="emit('close')"
+    @save="save"
+    @restore="restoreDefault"
+    @delete="remove"
+    @clear-error="error = null"
+  >
+    <div class="pair">
+      <UiField v-slot="{ id, describedBy }" :label="t('agents.nameLabel')" :error="nameInvalid ? t('agents.nameRule') : undefined">
+        <UiTextInput
           :id="id"
-          v-model="fields.description"
-          class="area"
-          rows="2"
-          :maxlength="DESCRIPTION_MAX"
-          :disabled="pending"
+          v-model="name"
+          mono
+          required
+          :maxlength="64"
+          :described-by="describedBy"
+          :invalid="nameInvalid"
+          :disabled="pending || builtin"
         />
       </UiField>
+      <UiField v-slot="{ id }" :label="t('agents.subagentModel')">
+        <UiSelect
+          :id="id"
+          :model-value="fields.model ?? ''"
+          :disabled="pending"
+          @update:model-value="fields.model = $event || null"
+        >
+          <option value="">{{ t('agents.followsConversation') }}</option>
+          <ModelOptions :models="models" :current="fields.model" />
+        </UiSelect>
+      </UiField>
+    </div>
 
-      <fieldset class="tools">
-        <legend class="legend">{{ t('agents.subagentTools') }}</legend>
-        <label class="writes">
+    <UiField v-slot="{ id }" :label="t('agents.whenLabel')">
+      <textarea
+        :id="id"
+        v-model="fields.description"
+        class="area"
+        rows="2"
+        :maxlength="DESCRIPTION_MAX"
+        :disabled="pending"
+      />
+    </UiField>
+
+    <fieldset class="tools">
+      <legend class="legend">{{ t('agents.subagentTools') }}</legend>
+      <label class="writes">
+        <input
+          type="checkbox"
+          :checked="fields.writes"
+          :disabled="pending"
+          @change="toggleWrites(($event.target as HTMLInputElement).checked)"
+        >
+        <span>{{ t('agents.subagentWrites') }}</span>
+      </label>
+      <div class="tool-row">
+        <label
+          v-for="tool in SUBAGENT_TOOLS"
+          :key="tool"
+          class="tool"
+          :class="{ off: WRITING_TOOLS.includes(tool) && !fields.writes }"
+        >
           <input
             type="checkbox"
-            :checked="fields.writes"
-            :disabled="pending"
-            @change="toggleWrites(($event.target as HTMLInputElement).checked)"
+            :checked="fields.tools.includes(tool)"
+            :disabled="pending || (WRITING_TOOLS.includes(tool) && !fields.writes)"
+            @change="toggleTool(tool, ($event.target as HTMLInputElement).checked)"
           >
-          <span>{{ t('agents.subagentWrites') }}</span>
+          <span class="mono">{{ tool }}</span>
+          <span v-if="tool === EDITOR_TOOL && !fields.writes" class="tool-note">{{ t('agents.viewOnly') }}</span>
+          <span v-else-if="WRITING_TOOLS.includes(tool) && !fields.writes" class="tool-note">{{ t('agents.needsWrites') }}</span>
         </label>
-        <div class="tool-row">
-          <label
-            v-for="tool in SUBAGENT_TOOLS"
-            :key="tool"
-            class="tool"
-            :class="{ off: WRITING_TOOLS.includes(tool) && !fields.writes }"
-          >
-            <input
-              type="checkbox"
-              :checked="fields.tools.includes(tool)"
-              :disabled="pending || (WRITING_TOOLS.includes(tool) && !fields.writes)"
-              @change="toggleTool(tool, ($event.target as HTMLInputElement).checked)"
-            >
-            <span class="mono">{{ tool }}</span>
-            <span v-if="tool === EDITOR_TOOL && !fields.writes" class="tool-note">{{ t('agents.viewOnly') }}</span>
-            <span v-else-if="WRITING_TOOLS.includes(tool) && !fields.writes" class="tool-note">{{ t('agents.needsWrites') }}</span>
-          </label>
-        </div>
-      </fieldset>
-
-      <div class="prompt-field">
-        <label :for="`subagent-prompt-${subagent?.name ?? 'new'}`" class="legend">{{ t('agents.subagentPrompt') }}</label>
-        <textarea
-          :id="`subagent-prompt-${subagent?.name ?? 'new'}`"
-          v-model="fields.prompt"
-          class="area mono-area"
-          rows="10"
-          spellcheck="false"
-          :disabled="pending"
-        />
-        <p v-if="maxChars !== null" class="count mono tabular" :class="{ over: overCap }">
-          {{ t('agents.promptCount', { count: length.toLocaleString(), max: maxChars.toLocaleString() }) }}
-        </p>
       </div>
+    </fieldset>
 
-      <UiBanner v-if="error" tone="error">{{ error }}</UiBanner>
-    </form>
-
-    <template #footer>
-      <UiButton
-        v-if="subagent?.builtin"
-        variant="ghost"
-        class="foot-start"
-        :disabled="pending || isDefault"
-        @click="restoreDefault"
-      >
-        <template #icon><UiIcon name="rotate-ccw" /></template>
-        {{ t('agents.promptRestore') }}
-      </UiButton>
-      <UiButton
-        v-else-if="subagent"
-        variant="ghost"
-        class="foot-start danger"
+    <div class="prompt-field">
+      <label :for="`subagent-prompt-${subagent?.name ?? 'new'}`" class="legend">{{ t('agents.subagentPrompt') }}</label>
+      <textarea
+        :id="`subagent-prompt-${subagent?.name ?? 'new'}`"
+        v-model="fields.prompt"
+        class="area mono-area"
+        rows="10"
+        spellcheck="false"
         :disabled="pending"
-        @click="confirming = true; error = null"
-      >
-        <template #icon><UiIcon name="trash" /></template>
-        {{ t('agents.subagentDelete') }}
-      </UiButton>
-      <UiButton variant="secondary" :disabled="pending" @click="emit('close')">
-        {{ t('common.cancel') }}
-      </UiButton>
-      <UiButton
-        variant="primary"
-        type="submit"
-        :form="`subagent-form-${subagent?.name ?? 'new'}`"
-        :loading="pending"
-        :disabled="saveDisabled"
-      >
-        {{ t('common.save') }}
-      </UiButton>
-    </template>
-  </UiModal>
+      />
+      <AgentsCharCount v-if="maxChars !== null" class="end-count mono" :count="length" :max="maxChars" />
+    </div>
+  </AgentsDefinitionDialog>
 </template>
 
 <style scoped>
-.heading {
-  display: flex;
-  align-items: baseline;
-  gap: var(--space-3);
-  min-width: 0;
-}
-
-.heading-title {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: var(--display-sm);
-  letter-spacing: normal;
-}
-
-.heading-state {
-  flex-shrink: 0;
-  color: var(--muted);
-  font-size: var(--text-xs);
-}
-
-.form {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-5);
-}
-
-.pair {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: var(--space-4);
-}
-
-@media (max-width: 560px) {
-  .pair {
-    grid-template-columns: minmax(0, 1fr);
-  }
-}
-
-/* The field label's treatment, for a legend and a label outside `UiField`. */
-.legend {
-  padding: 0;
-  font-size: var(--text-xs);
-  font-weight: var(--weight-semibold);
-  color: var(--muted);
-}
-
 .tools {
   display: grid;
   gap: var(--space-2);
@@ -437,58 +343,5 @@ async function remove() {
 .prompt-field {
   display: grid;
   gap: var(--space-2);
-}
-
-/* Same skin as UiTextInput's `.control`, for a text of several lines. */
-.area {
-  width: 100%;
-  min-width: 0;
-  padding: var(--space-2) 10px;
-  border: 1px solid var(--edge);
-  border-radius: var(--radius);
-  background: var(--paper);
-  color: var(--ink);
-  font-size: var(--text-sm);
-  line-height: 1.5;
-  resize: vertical;
-  transition: border-color var(--duration-fast) var(--ease);
-}
-
-.mono-area {
-  padding: 10px var(--space-3);
-  font-family: var(--mono);
-  font-size: var(--text-xs);
-  line-height: 1.6;
-}
-
-.area:disabled {
-  background: var(--paper-sunken);
-  color: var(--muted);
-  cursor: not-allowed;
-}
-
-@media (pointer: coarse) {
-  .area {
-    font-size: 16px;
-  }
-}
-
-.count {
-  margin: 0;
-  color: var(--muted);
-  font-size: var(--text-2xs);
-  text-align: right;
-}
-
-.count.over {
-  color: var(--danger);
-}
-
-.foot-start {
-  margin-right: auto;
-}
-
-.foot-start.danger {
-  color: var(--danger);
 }
 </style>

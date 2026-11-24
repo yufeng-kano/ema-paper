@@ -6,7 +6,9 @@
  * to write; one of the reader's own offers **Delete skill** behind a confirmation. Opened
  * with no skill, it is a new one of the reader's own.
  */
+import { DESCRIPTION_MAX, NAME_RULE, charLength } from '~/lib/agents'
 import { createSkill, deleteSkill, updateSkill, type Skill, type SkillFields } from '~/lib/api'
+import { insertAtCaret } from '~/lib/caret'
 
 const props = defineProps<{
   /** Null for a new skill. */
@@ -24,8 +26,7 @@ const emit = defineEmits<{
 const { t } = useI18n()
 const { resolve } = useApiError()
 
-const NAME_RULE = /^[a-z0-9][a-z0-9-]{0,63}$/
-const DESCRIPTION_MAX = 1024
+/** The API's `ARGUMENT_HINT_MAX_CHARS`. */
 const HINT_MAX = 128
 
 const EMPTY: SkillFields = { description: '', argument_hint: '', body: '', user_invocable: true, model_invocable: true }
@@ -49,7 +50,6 @@ const fields = reactive<SkillFields>({ ...initial })
 const body = ref<HTMLTextAreaElement | null>(null)
 const pending = ref(false)
 const error = ref<string | null>(null)
-const confirming = ref(false)
 
 const builtin = computed(() => props.skill?.builtin === true)
 const same = (left: SkillFields, right: SkillFields) =>
@@ -58,7 +58,7 @@ const same = (left: SkillFields, right: SkillFields) =>
 const nameInvalid = computed(() => name.value !== '' && !NAME_RULE.test(name.value))
 const isDefault = computed(() => props.skill?.default != null && same(fields, props.skill.default))
 const changed = computed(() => name.value !== initialName || !same(fields, initial))
-const length = computed(() => [...fields.body.trim()].length)
+const length = computed(() => charLength(fields.body))
 const overCap = computed(() => props.maxChars !== null && length.value > props.maxChars)
 const saveDisabled = computed(
   () =>
@@ -90,12 +90,11 @@ async function insertArguments() {
     fields.body += token
     return
   }
-  const start = el.selectionStart
-  const end = el.selectionEnd
-  fields.body = fields.body.slice(0, start) + token + fields.body.slice(end)
+  const { text, caret } = insertAtCaret(fields.body, el.selectionStart, el.selectionEnd, token)
+  fields.body = text
   await nextTick()
   el.focus()
-  el.setSelectionRange(start + token.length, start + token.length)
+  el.setSelectionRange(caret, caret)
 }
 
 function restoreDefault() {
@@ -153,194 +152,103 @@ async function remove() {
 </script>
 
 <template>
-  <!-- The confirmation stands in for the dialog rather than over it: two dialogs would
-       both answer Escape and both trap Tab. The fields keep their state behind it. -->
-  <UiConfirmDialog
-    v-if="confirming && skill"
-    :title="t('agents.skillDelete')"
-    :message="t('agents.skillDeleteConfirm', { name: skill.name })"
-    :confirm-label="t('common.delete')"
+  <AgentsDefinitionDialog
+    :heading="heading"
+    :state="state"
+    :form-id="`skill-form-${skill?.name ?? 'new'}`"
+    :builtin="builtin"
+    :is-default="isDefault"
+    :deletable="skill !== null && !builtin"
+    :delete-label="t('agents.skillDelete')"
+    :delete-confirm="skill ? t('agents.skillDeleteConfirm', { name: skill.name }) : ''"
     :pending="pending"
     :error="error"
-    @confirm="remove"
-    @cancel="confirming = false; error = null"
-  />
-  <UiModal v-else size="wide" :title="heading" :busy="pending" @close="emit('close')">
-    <template #title>
-      <div class="heading">
-        <h2 class="heading-title">{{ heading }}</h2>
-        <span v-if="state" class="heading-state">{{ state }}</span>
-      </div>
-    </template>
-
-    <form :id="`skill-form-${skill?.name ?? 'new'}`" class="form" @submit.prevent="save">
-      <div class="pair">
-        <UiField v-slot="{ id, describedBy }" :label="t('agents.nameLabel')" :error="nameInvalid ? t('agents.nameRule') : undefined">
-          <UiTextInput
-            :id="id"
-            v-model="name"
-            mono
-            required
-            :maxlength="64"
-            :described-by="describedBy"
-            :invalid="nameInvalid"
-            :disabled="pending || builtin"
-          />
-        </UiField>
-        <UiField v-slot="{ id }" :label="t('agents.skillArgumentHint')">
-          <UiTextInput
-            :id="id"
-            v-model="fields.argument_hint"
-            mono
-            :maxlength="HINT_MAX"
-            :placeholder="t('agents.skillArgumentHintPlaceholder')"
-            :disabled="pending"
-          />
-        </UiField>
-      </div>
-
-      <UiField v-slot="{ id }" :label="t('agents.whenLabel')">
-        <textarea
+    :save-disabled="saveDisabled"
+    @close="emit('close')"
+    @save="save"
+    @restore="restoreDefault"
+    @delete="remove"
+    @clear-error="error = null"
+  >
+    <div class="pair">
+      <UiField v-slot="{ id, describedBy }" :label="t('agents.nameLabel')" :error="nameInvalid ? t('agents.nameRule') : undefined">
+        <UiTextInput
           :id="id"
-          v-model="fields.description"
-          class="area"
-          rows="2"
-          :maxlength="DESCRIPTION_MAX"
+          v-model="name"
+          mono
+          required
+          :maxlength="64"
+          :described-by="describedBy"
+          :invalid="nameInvalid"
+          :disabled="pending || builtin"
+        />
+      </UiField>
+      <UiField v-slot="{ id }" :label="t('agents.skillArgumentHint')">
+        <UiTextInput
+          :id="id"
+          v-model="fields.argument_hint"
+          mono
+          :maxlength="HINT_MAX"
+          :placeholder="t('agents.skillArgumentHintPlaceholder')"
           :disabled="pending"
         />
       </UiField>
+    </div>
 
-      <fieldset class="switches">
-        <legend class="legend">{{ t('agents.skillInvocation') }}</legend>
-        <div class="switch-row">
-          <label class="switch">
-            <input v-model="fields.user_invocable" type="checkbox" :disabled="pending" >
-            <span>{{ t('agents.skillSlashSwitch', { name: name || '…' }) }}</span>
-          </label>
-          <label class="switch">
-            <input v-model="fields.model_invocable" type="checkbox" :disabled="pending" >
-            <span>{{ t('agents.skillAutoSwitch') }}</span>
-          </label>
-        </div>
-      </fieldset>
-
-      <div class="body-field">
-        <div class="body-head">
-          <label :for="`skill-body-${skill?.name ?? 'new'}`" class="legend">{{ t('agents.skillBody') }}</label>
-          <button
-            type="button"
-            class="token mono"
-            :aria-label="t('agents.skillInsertArguments')"
-            :title="t('agents.skillInsertArguments')"
-            :disabled="pending"
-            @click="insertArguments"
-          >
-            $ARGUMENTS
-          </button>
-        </div>
-        <textarea
-          :id="`skill-body-${skill?.name ?? 'new'}`"
-          ref="body"
-          v-model="fields.body"
-          class="area mono-area"
-          rows="10"
-          spellcheck="false"
-          :disabled="pending"
-        />
-        <p v-if="maxChars !== null" class="count mono tabular" :class="{ over: overCap }">
-          {{ t('agents.promptCount', { count: length.toLocaleString(), max: maxChars.toLocaleString() }) }}
-        </p>
-      </div>
-
-      <UiBanner v-if="error" tone="error">{{ error }}</UiBanner>
-    </form>
-
-    <template #footer>
-      <UiButton
-        v-if="skill?.builtin"
-        variant="ghost"
-        class="foot-start"
-        :disabled="pending || isDefault"
-        @click="restoreDefault"
-      >
-        <template #icon><UiIcon name="rotate-ccw" /></template>
-        {{ t('agents.promptRestore') }}
-      </UiButton>
-      <UiButton
-        v-else-if="skill"
-        variant="ghost"
-        class="foot-start danger"
+    <UiField v-slot="{ id }" :label="t('agents.whenLabel')">
+      <textarea
+        :id="id"
+        v-model="fields.description"
+        class="area"
+        rows="2"
+        :maxlength="DESCRIPTION_MAX"
         :disabled="pending"
-        @click="confirming = true; error = null"
-      >
-        <template #icon><UiIcon name="trash" /></template>
-        {{ t('agents.skillDelete') }}
-      </UiButton>
-      <UiButton variant="secondary" :disabled="pending" @click="emit('close')">
-        {{ t('common.cancel') }}
-      </UiButton>
-      <UiButton
-        variant="primary"
-        type="submit"
-        :form="`skill-form-${skill?.name ?? 'new'}`"
-        :loading="pending"
-        :disabled="saveDisabled"
-      >
-        {{ t('common.save') }}
-      </UiButton>
-    </template>
-  </UiModal>
+      />
+    </UiField>
+
+    <fieldset class="switches">
+      <legend class="legend">{{ t('agents.skillInvocation') }}</legend>
+      <div class="switch-row">
+        <label class="switch">
+          <input v-model="fields.user_invocable" type="checkbox" :disabled="pending" >
+          <span>{{ t('agents.skillSlashSwitch', { name: name || '…' }) }}</span>
+        </label>
+        <label class="switch">
+          <input v-model="fields.model_invocable" type="checkbox" :disabled="pending" >
+          <span>{{ t('agents.skillAutoSwitch') }}</span>
+        </label>
+      </div>
+    </fieldset>
+
+    <div class="body-field">
+      <div class="body-head">
+        <label :for="`skill-body-${skill?.name ?? 'new'}`" class="legend">{{ t('agents.skillBody') }}</label>
+        <button
+          type="button"
+          class="token mono"
+          :aria-label="t('agents.skillInsertArguments')"
+          :title="t('agents.skillInsertArguments')"
+          :disabled="pending"
+          @click="insertArguments"
+        >
+          $ARGUMENTS
+        </button>
+      </div>
+      <textarea
+        :id="`skill-body-${skill?.name ?? 'new'}`"
+        ref="body"
+        v-model="fields.body"
+        class="area mono-area"
+        rows="10"
+        spellcheck="false"
+        :disabled="pending"
+      />
+      <AgentsCharCount v-if="maxChars !== null" class="end-count mono" :count="length" :max="maxChars" />
+    </div>
+  </AgentsDefinitionDialog>
 </template>
 
 <style scoped>
-.heading {
-  display: flex;
-  align-items: baseline;
-  gap: var(--space-3);
-  min-width: 0;
-}
-
-.heading-title {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: var(--display-sm);
-  letter-spacing: normal;
-}
-
-.heading-state {
-  flex-shrink: 0;
-  color: var(--muted);
-  font-size: var(--text-xs);
-}
-
-.form {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-5);
-}
-
-.pair {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: var(--space-4);
-}
-
-@media (max-width: 560px) {
-  .pair {
-    grid-template-columns: minmax(0, 1fr);
-  }
-}
-
-/* The field label's treatment, for a legend and a label outside `UiField`. */
-.legend {
-  padding: 0;
-  font-size: var(--text-xs);
-  font-weight: var(--weight-semibold);
-  color: var(--muted);
-}
-
 .switches {
   display: grid;
   gap: var(--space-2);
@@ -389,40 +297,6 @@ async function remove() {
   gap: var(--space-2);
 }
 
-/* Same skin as UiTextInput's `.control`, for a text of several lines. */
-.area {
-  width: 100%;
-  min-width: 0;
-  padding: var(--space-2) 10px;
-  border: 1px solid var(--edge);
-  border-radius: var(--radius);
-  background: var(--paper);
-  color: var(--ink);
-  font-size: var(--text-sm);
-  line-height: 1.5;
-  resize: vertical;
-  transition: border-color var(--duration-fast) var(--ease);
-}
-
-.mono-area {
-  padding: 10px var(--space-3);
-  font-family: var(--mono);
-  font-size: var(--text-xs);
-  line-height: 1.6;
-}
-
-.area:disabled {
-  background: var(--paper-sunken);
-  color: var(--muted);
-  cursor: not-allowed;
-}
-
-@media (pointer: coarse) {
-  .area {
-    font-size: 16px;
-  }
-}
-
 .token {
   height: var(--control-height-xs);
   padding: 0 var(--space-2);
@@ -442,24 +316,5 @@ async function remove() {
 .token:disabled {
   cursor: not-allowed;
   opacity: 0.5;
-}
-
-.count {
-  margin: 0;
-  color: var(--muted);
-  font-size: var(--text-2xs);
-  text-align: right;
-}
-
-.count.over {
-  color: var(--danger);
-}
-
-.foot-start {
-  margin-right: auto;
-}
-
-.foot-start.danger {
-  color: var(--danger);
 }
 </style>

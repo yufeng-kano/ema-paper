@@ -23,9 +23,3 @@ export function redeemErrorKey(error: unknown): string | null {
   }
   return REFUSALS[error.type] ?? null
 }
-
-/** What the input shows as the reader types: uppercase, so the code reads as printed; the
- *  server does the real reading (hyphens and spaces are its to drop). */
-export function presentCode(typed: string): string {
-  return typed.toUpperCase()
-}

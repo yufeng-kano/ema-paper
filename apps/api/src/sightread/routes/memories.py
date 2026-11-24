@@ -124,7 +124,7 @@ async def _commit(db: DbSession) -> None:
 
 
 @router.get("/memories")
-async def list_memories(user: SessionUser, db: DbSession, settings: AppSettings):
+async def list_memories(user: SessionUser, db: DbSession):
     rows = (
         await db.execute(
             _listed()
@@ -132,7 +132,7 @@ async def list_memories(user: SessionUser, db: DbSession, settings: AppSettings)
             .order_by(Memory.updated_at.desc(), Memory.id.desc())
         )
     ).all()
-    return {"memories": [_payload(*row) for row in rows], "max": settings.chat_memories_max}
+    return {"memories": [_payload(*row) for row in rows]}
 
 
 @router.post("/memories", dependencies=[CsrfGuard], status_code=status.HTTP_201_CREATED)

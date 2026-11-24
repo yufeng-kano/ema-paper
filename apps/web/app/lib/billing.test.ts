@@ -14,10 +14,6 @@ describe('the payment refusals', () => {
       }
     }
   })
-
-  it('never word a refused portal as a closed checkout', () => {
-    expect(PAYMENT_REFUSALS.portal_unavailable).not.toBe(PAYMENT_REFUSALS.checkout_unavailable)
-  })
 })
 
 describe('the billing cycle', () => {

@@ -6,7 +6,9 @@
  * cursor; **Restore default** puts the default back. A text equal to the default is saved
  * as no prompt, so a later default reaches it.
  */
+import { charLength } from '~/lib/agents'
 import { putAgentSettings, type AgentEntry, type SavedAgentSettings } from '~/lib/api'
+import { insertAtCaret } from '~/lib/caret'
 
 const props = defineProps<{
   agent: AgentEntry
@@ -28,8 +30,7 @@ const pending = ref(false)
 const error = ref<string | null>(null)
 
 const isDefault = computed(() => text.value.trim() === props.agent.default_prompt.trim())
-/** Counted as the server counts: the trimmed text, in code points rather than UTF-16 units. */
-const length = computed(() => [...text.value.trim()].length)
+const length = computed(() => charLength(text.value))
 const overCap = computed(() => props.maxChars !== null && length.value > props.maxChars)
 const saveDisabled = computed(() => text.value === initial || !text.value.trim() || overCap.value)
 
@@ -40,12 +41,11 @@ async function insertToken(token: string) {
     text.value += token
     return
   }
-  const start = el.selectionStart
-  const end = el.selectionEnd
-  text.value = text.value.slice(0, start) + token + text.value.slice(end)
+  const inserted = insertAtCaret(text.value, el.selectionStart, el.selectionEnd, token)
+  text.value = inserted.text
   await nextTick()
   el.focus()
-  el.setSelectionRange(start + token.length, start + token.length)
+  el.setSelectionRange(inserted.caret, inserted.caret)
 }
 
 async function save() {
@@ -105,9 +105,7 @@ async function save() {
         spellcheck="false"
         :disabled="pending"
       />
-      <p v-if="maxChars !== null" class="count mono tabular" :class="{ over: overCap }">
-        {{ t('agents.promptCount', { count: length.toLocaleString(), max: maxChars.toLocaleString() }) }}
-      </p>
+      <AgentsCharCount v-if="maxChars !== null" class="end-count mono" :count="length" :max="maxChars" />
       <UiBanner v-if="error" tone="error">{{ error }}</UiBanner>
     </form>
 
@@ -221,16 +219,8 @@ async function save() {
   }
 }
 
-.count {
-  margin: 0;
-  color: var(--muted);
-  font-size: var(--text-2xs);
+.end-count {
   text-align: right;
-}
-
-/* Over the cap is the one state the count exists to show. */
-.count.over {
-  color: var(--danger);
 }
 
 /* The footer's left action stands apart from Cancel and Save. */

@@ -1071,7 +1071,7 @@ export function getAgentContext(locale: string): Promise<AgentContext> {
 
 // --- memory (docs/chat.md § Memory) ----------------------------------------------------
 
-export function listMemories(): Promise<{ memories: Memory[]; max: number }> {
+export function listMemories(): Promise<{ memories: Memory[] }> {
   return request('GET', '/api/memories')
 }
 

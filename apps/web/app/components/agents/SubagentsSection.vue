@@ -67,7 +67,7 @@ function onDeleted(name: string) {
 <template>
   <section class="section" aria-labelledby="agents-subagents">
     <div class="section-head">
-      <h3 id="agents-subagents" class="section-label">{{ t('agents.subagentsLabel') }}</h3>
+      <h3 id="agents-subagents" class="agents-label">{{ t('agents.subagentsLabel') }}</h3>
       <UiButton variant="ghost" size="sm" @click="editing = 'new'">
         <template #icon><UiIcon name="plus" /></template>
         {{ t('agents.subagentNew') }}
@@ -133,15 +133,6 @@ function onDeleted(name: string) {
   align-items: center;
   justify-content: space-between;
   gap: var(--space-2);
-}
-
-/* The field label's treatment: a section of the panel, not a heading of the page. */
-.section-label {
-  margin: 0;
-  font-family: inherit;
-  font-size: var(--text-xs);
-  font-weight: var(--weight-semibold);
-  color: var(--muted);
 }
 
 .table-scroll {

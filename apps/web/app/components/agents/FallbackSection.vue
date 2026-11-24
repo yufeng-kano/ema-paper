@@ -30,12 +30,11 @@ const autoOn = computed(
 )
 const error = ref<string | null>(null)
 
-async function toggleAuto() {
+async function toggleAuto(next: boolean) {
   if (autoChoice.value !== null) {
     return
   }
   const name = props.agent.name
-  const next = !autoOn.value
   autoChoice.value = next
   error.value = null
   try {
@@ -50,11 +49,11 @@ async function toggleAuto() {
 
 <template>
   <section class="section" :aria-labelledby="labelId">
-    <h3 :id="labelId" class="section-label">{{ t('agents.fallback.label') }}</h3>
+    <h3 :id="labelId" class="agents-label">{{ t('agents.fallback.label') }}</h3>
     <div class="controls">
       <!-- The deployment's fallback: a fact under its label, not a control. -->
       <div class="model fact">
-        <span class="fact-label">{{ t('agents.fallback.model') }}</span>
+        <span class="agents-label">{{ t('agents.fallback.model') }}</span>
         <span v-if="fallback" class="mono fact-value">{{ fallback }}</span>
         <span v-else class="fact-value muted">{{ t('agents.fallback.none') }}</span>
       </div>
@@ -67,7 +66,7 @@ async function toggleAuto() {
         {{ t('agents.fallback.auto') }}
       </UiSwitch>
     </div>
-    <p class="note">{{ t('agents.fallback.note') }}</p>
+    <p class="agents-note">{{ t('agents.fallback.note') }}</p>
     <UiBanner v-if="error" tone="error">{{ error }}</UiBanner>
   </section>
 </template>
@@ -77,15 +76,6 @@ async function toggleAuto() {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
-}
-
-/* The field label's treatment: a section of the panel, not a heading of the page. */
-.section-label {
-  margin: 0;
-  font-family: inherit;
-  font-size: var(--text-xs);
-  font-weight: var(--weight-semibold);
-  color: var(--muted);
 }
 
 /* The picker and its switch on one row, wrapping on a narrow window. */
@@ -108,12 +98,6 @@ async function toggleAuto() {
   gap: var(--space-1);
 }
 
-.fact-label {
-  font-size: var(--text-xs);
-  font-weight: var(--weight-semibold);
-  color: var(--muted);
-}
-
 .fact-value {
   display: flex;
   align-items: center;
@@ -126,12 +110,5 @@ async function toggleAuto() {
 
 .fact-value.muted {
   color: var(--muted);
-}
-
-.note {
-  margin: 0;
-  color: var(--muted);
-  font-size: var(--text-xs);
-  line-height: 1.5;
 }
 </style>
