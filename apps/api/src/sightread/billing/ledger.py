@@ -161,12 +161,8 @@ async def settle_period(
     over; the caller's commit carries the move (docs/billing.md § Periods, *Granted
     days*). Nothing locks the user here: the lock is the caller's, taken in its own order."""
     now = now or utcnow()
-    subscription = await db.get(Subscription, user_id)
-    if subscription is not None:
-        await db.refresh(subscription)
-    row = await db.get(PlanGrant, user_id)
-    if row is not None:
-        await db.refresh(row)
+    subscription = await db.get(Subscription, user_id, populate_existing=True)
+    row = await db.get(PlanGrant, user_id, populate_existing=True)
     grant = _grant_of(row)
     decided = resolve_period(
         subscription, grant, settings.plans, settings.free_plan, now, settings.grant_period_days

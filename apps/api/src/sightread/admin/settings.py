@@ -13,11 +13,12 @@ from datetime import timedelta
 from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, select
 from sqlalchemy import text as sql
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..agents import CHAT
+from ..billing import codes
 from ..billing.plans import FREE_PLAN_ID
 from ..config import LOCAL_FALLBACK_SECRET_KEY, Settings
 from ..db.models import (
@@ -145,12 +146,7 @@ async def impact(db: AsyncSession, before: Settings, after: Settings) -> dict | 
             db, PlanGrant, PlanGrant.plan_id.in_(plans), *holding_days(now)
         )
         counts["plan_codes"] = await _count(
-            db,
-            RedeemCode,
-            RedeemCode.plan_id.in_(plans),
-            RedeemCode.disabled_at.is_(None),
-            or_(RedeemCode.redeem_by.is_(None), RedeemCode.redeem_by >= now),
-            RedeemCode.uses < RedeemCode.max_uses,
+            db, RedeemCode, RedeemCode.plan_id.in_(plans), codes.is_active(now, before.plans)
         )
         counts["plan_checkouts"] = await _count(
             db,

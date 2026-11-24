@@ -20,8 +20,7 @@ ENDED_STATUSES = frozenset({"canceled", "expired", "failed"})
 CREDITS_MAX = 2_147_483_647
 # The most days a pack lasts, a code gives or a grant gives: a century keeps every date they
 # reach — a pack's `expires_at`, a granted period's end — one PostgreSQL and Python can hold
-# (a Python date ends in the year 9999). `ADMIN_GRANT_MAX_DAYS` is checked against the same
-# century in config.py.
+# (a Python date ends in the year 9999). config.py checks `ADMIN_GRANT_MAX_DAYS` against it.
 DAYS_MAX = 36_500
 
 

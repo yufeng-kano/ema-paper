@@ -411,7 +411,7 @@ async def test_granted_credits_are_a_pack_the_ledger_spends_by_expiry(make_clien
         "grant",
         0,
     )
-    assert (stored[pack_id].redemption_id, stored[pack_id].status) == (None, "paid")
+    assert stored[pack_id].status == "paid"
 
     # One record, its two sides numbers and dates only; the reason trimmed.
     [record] = await audit_rows(owner, start)

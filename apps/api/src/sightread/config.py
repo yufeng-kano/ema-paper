@@ -11,7 +11,7 @@ from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .billing.credits import ModelPrice, parse_model_prices
-from .billing.plans import CREDITS_MAX, FREE_PLAN_ID, Pack, Plan, parse_packs, parse_plans
+from .billing.plans import CREDITS_MAX, DAYS_MAX, FREE_PLAN_ID, Pack, Plan, parse_packs, parse_plans
 
 # Only ever used when APP_ENV=local and SECRET_KEY is unset, so `uv run uvicorn` works
 # without a .env file. Production refuses to start without a real SECRET_KEY.
@@ -450,11 +450,11 @@ class Settings(BaseSettings):
         if not 1 <= self.admin_page_size <= 500:
             raise ValueError("ADMIN_PAGE_SIZE must be between 1 and 500")
         # A pack's `credits` is a 32-bit integer; a century of days keeps every date a grant
-        # reaches one PostgreSQL and Python can hold.
-        if not 1 <= self.admin_grant_max_credits <= 2_147_483_647:
-            raise ValueError("ADMIN_GRANT_MAX_CREDITS must be between 1 and 2147483647")
-        if not 1 <= self.admin_grant_max_days <= 36_500:
-            raise ValueError("ADMIN_GRANT_MAX_DAYS must be between 1 and 36500")
+        # reaches one PostgreSQL and Python can hold (billing/plans.py).
+        if not 1 <= self.admin_grant_max_credits <= CREDITS_MAX:
+            raise ValueError(f"ADMIN_GRANT_MAX_CREDITS must be between 1 and {CREDITS_MAX}")
+        if not 1 <= self.admin_grant_max_days <= DAYS_MAX:
+            raise ValueError(f"ADMIN_GRANT_MAX_DAYS must be between 1 and {DAYS_MAX}")
         if not 1 <= self.admin_grant_valid_days <= self.admin_grant_max_days:
             raise ValueError("ADMIN_GRANT_VALID_DAYS must be between 1 and ADMIN_GRANT_MAX_DAYS")
         # One batch is checked for taken codes in one query, a parameter per code, and the

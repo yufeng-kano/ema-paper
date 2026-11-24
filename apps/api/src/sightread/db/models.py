@@ -808,8 +808,25 @@ class UploadTicket(Base):
     """
 
     __tablename__ = "upload_tickets"
-    # Mint rate limit: tickets this user created in the last hour.
-    __table_args__ = (Index("ix_upload_tickets_user_created", "user_id", "created_at"),)
+    __table_args__ = (
+        # Mint rate limit: tickets this user created in the last hour.
+        Index("ix_upload_tickets_user_created", "user_id", "created_at"),
+        # A job delete's SET NULL and the parse retention's ticket rule read it
+        # (docs/jobs.md § Retention).
+        Index(
+            "ix_upload_tickets_job_id",
+            "job_id",
+            postgresql_where=text("job_id IS NOT NULL"),
+            sqlite_where=text("job_id IS NOT NULL"),
+        ),
+        # What a folder delete's SET NULL reads (docs/database.md).
+        Index(
+            "ix_upload_tickets_folder_id",
+            "folder_id",
+            postgresql_where=text("folder_id IS NOT NULL"),
+            sqlite_where=text("folder_id IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
@@ -837,9 +854,11 @@ class DocumentTicket(Base):
     """
 
     __tablename__ = "document_tickets"
-    # Mint rate limit: tickets this user created in the last hour.
     __table_args__ = (
+        # Mint rate limit: tickets this user created in the last hour.
         Index("ix_document_tickets_user_created", "user_id", "created_at"),
+        # What a document delete's cascade reads (docs/database.md).
+        Index("ix_document_tickets_document_id", "document_id"),
         CheckConstraint("scope IN ('read', 'write')", name="ck_document_tickets_scope"),
     )
 
@@ -1027,7 +1046,6 @@ class CreditPack(Base):
         CheckConstraint("expires_at > purchased_at", name="ck_credit_packs_validity"),
         CheckConstraint("status IN ('paid', 'refunded')", name="ck_credit_packs_status"),
         CheckConstraint("source IN ('pay', 'code', 'grant')", name="ck_credit_packs_source"),
-        UniqueConstraint("redemption_id", name="uq_credit_packs_redemption_id"),
     )
 
     # Pay's purchaseId, `redeem-<redemption id>` for a code's credits, or
@@ -1046,10 +1064,6 @@ class CreditPack(Base):
     # operator's, which nothing refunds and the webhook and the refresh never touch
     # (docs/billing.md § Redeem codes, § Operator grants).
     source: Mapped[str] = mapped_column(String(8), default="pay", server_default=text("'pay'"))
-    redemption_id: Mapped[int | None] = mapped_column(
-        ForeignKey("redemptions.id", name="fk_credit_packs_redemption_id", ondelete="SET NULL"),
-        nullable=True,
-    )
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
 

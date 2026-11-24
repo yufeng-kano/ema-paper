@@ -198,10 +198,10 @@ async def test_a_credits_code_becomes_a_pack_that_is_not_pays(make_client, sessi
             await db.execute(select(Redemption).where(Redemption.user_id == user_id))
         ).scalar_one()
         pack_row = await db.get(CreditPack, pack["id"])
-    assert (redemption.kind, redemption.credits, pack_row.redemption_id) == (
+    assert (redemption.kind, redemption.credits, pack_row.id) == (
         "credits",
         500,
-        redemption.id,
+        f"redeem-{redemption.id}",
     )
     assert billing["plan_grant"] is None
     assert (await client.get("/api/me")).json()["credits_remaining"] == 600

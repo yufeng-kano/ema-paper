@@ -331,6 +331,11 @@ upload_tickets   id PK, user_id FK, token_hash UNIQUE, job_id FK NULL,
                  created_at, expires_at, spent_at NULL,
                  into_library BOOL (false), folder_id FK NULL
                  INDEX (user_id, created_at)                                 -- mint rate limit
+                 INDEX (job_id) WHERE job_id IS NOT NULL
+                                                  -- a job delete's SET NULL and the
+                                                  -- retention's ticket rule read it
+                 INDEX (folder_id) WHERE folder_id IS NOT NULL
+                                                  -- a folder delete's SET NULL reads it
                  -- single-use upload credential minted by the MCP `parse` tool
                  -- (auth.md § 5); job_id set when the upload spends the ticket,
                  -- ON DELETE SET NULL; a ticket not yet expired keeps its job from
@@ -340,6 +345,8 @@ upload_tickets   id PK, user_id FK, token_hash UNIQUE, job_id FK NULL,
 document_tickets id PK, user_id FK, document_id FK, scope read|write,
                  token_hash UNIQUE, created_at, expires_at
                  INDEX (user_id, created_at)                                 -- mint rate limit
+                 INDEX (document_id)              -- a document delete's cascade reads it
+                 CHECK (scope IN ('read', 'write'))
                  -- a short-lived credential for one document, minted by the MCP
                  -- library tools (auth.md § 7); not spent by use; both foreign keys
                  -- ON DELETE CASCADE, so a document deleted for good takes its tickets
@@ -381,7 +388,9 @@ credit_entries   id PK, user_id FK, period_start,
                  created_at, settled_at NULL
                  INDEX (user_id, created_at)
                  CHECK (amount >= 0), CHECK (kind = 'parse' OR job_id IS NULL),
-                 CHECK (kind = 'chat' OR turn_id IS NULL)
+                 CHECK (kind = 'chat' OR turn_id IS NULL),
+                 CHECK (kind IN ('parse', 'chat')),
+                 CHECK (state IN ('reserved', 'consumed', 'released'))
                  -- what a parse or a turn cost (billing.md § The ledger): one entry per
                  -- job, reserved at enqueue and settled at the terminal state; one per
                  -- turn, its amount raised as the turn runs. A parse the retention
@@ -398,11 +407,10 @@ credit_packs     id PK,                           -- Pay's purchaseId, redeem-<r
                  version BIGINT,                  -- Pay's version (ms); older is ignored
                  source pay|code|grant,           -- bought, a redeem code's, or an
                                                   -- operator's grant
-                 redemption_id FK redemptions ON DELETE SET NULL, NULL UNIQUE,
                  created_at, updated_at
                  INDEX (user_id, expires_at)
                  CHECK (credits >= 0), CHECK (spent >= 0), CHECK (expires_at > purchased_at)
-                 CHECK (source IN ('pay', 'code', 'grant'))
+                 CHECK (status IN ('paid', 'refunded')), CHECK (source IN ('pay', 'code', 'grant'))
                  -- a top-up pack bought on Pro (billing.md § Top-up packs): credits from
                  -- the pack's configuration when it was paid, spent as charges take from it
                  -- once the period's grant is gone; counts while paid and unexpired

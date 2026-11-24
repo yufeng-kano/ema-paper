@@ -695,3 +695,100 @@ async def test_the_upgrade_revokes_every_grant_without_the_library(scratch_url) 
         assert set(restored) == {("spent-parse-only", True), ("unspent-library", True)}
     finally:
         await engine.dispose()
+
+
+async def test_a_code_pack_keeps_its_redemption_through_its_id(scratch_url) -> None:
+    """49f93a27d36f: `credit_packs.redemption_id` goes and every pack stays; the downgrade
+    gives each code pack `redeem-<n>` whose redemption still exists `redemption_id` n back,
+    and every other pack NULL, under the unique and the foreign key it had."""
+    _alembic(scratch_url, "upgrade", "8ca4f1915c14")
+    pack = (
+        "INSERT INTO credit_packs (id, user_id, pack_id, credits, status, purchased_at, "
+        "expires_at, source, redemption_id, created_at, updated_at) VALUES (:id, :user, "
+        ":pack, 10, 'paid', now(), now() + interval '1 day', :source, :redemption, now(), now())"
+    )
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.begin() as db:
+            user = await _user(db, 1)
+            redemptions = {}
+            for code in ("KEPT", "GONE"):
+                code_id = (
+                    await db.execute(
+                        text(
+                            "INSERT INTO redeem_codes (code, kind, credits, valid_days, "
+                            "created_at) VALUES (:code, 'credits', 10, 30, now()) RETURNING id"
+                        ),
+                        {"code": code},
+                    )
+                ).scalar_one()
+                redemptions[code] = (
+                    await db.execute(
+                        text(
+                            "INSERT INTO redemptions (code_id, user_id, kind, credits, "
+                            "redeemed_at) VALUES (:code, :user, 'credits', 10, now()) "
+                            "RETURNING id"
+                        ),
+                        {"code": code_id, "user": user},
+                    )
+                ).scalar_one()
+            for redemption in redemptions.values():
+                await db.execute(
+                    text(pack),
+                    {
+                        "id": f"redeem-{redemption}",
+                        "user": user,
+                        "pack": "code",
+                        "source": "code",
+                        "redemption": redemption,
+                    },
+                )
+            await db.execute(
+                text(pack),
+                {"id": "pur_1", "user": user, "pack": "p", "source": "pay", "redemption": None},
+            )
+            # A code deleted by hand takes its redemption with it; its pack keeps NULL.
+            await db.execute(text("DELETE FROM redeem_codes WHERE code = 'GONE'"))
+    finally:
+        await engine.dispose()
+
+    column = (
+        "SELECT count(*) FROM information_schema.columns "
+        "WHERE table_name = 'credit_packs' AND column_name = 'redemption_id'"
+    )
+    _alembic(scratch_url, "upgrade", "head")
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.connect() as db:
+            assert (await db.execute(text(column))).scalar_one() == 0
+            ids = set((await db.execute(text("SELECT id FROM credit_packs"))).scalars())
+            assert ids == {f"redeem-{n}" for n in redemptions.values()} | {"pur_1"}
+    finally:
+        await engine.dispose()
+
+    _alembic(scratch_url, "downgrade", "8ca4f1915c14")
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.connect() as db:
+            rows = await db.execute(text("SELECT id, redemption_id FROM credit_packs"))
+            assert dict(rows.all()) == {
+                f"redeem-{redemptions['KEPT']}": redemptions["KEPT"],
+                f"redeem-{redemptions['GONE']}": None,
+                "pur_1": None,
+            }
+            constraints = await db.execute(
+                text(
+                    "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint "
+                    "WHERE conrelid = 'credit_packs'::regclass AND conname IN "
+                    "('uq_credit_packs_redemption_id', 'fk_credit_packs_redemption_id')"
+                )
+            )
+            assert dict(constraints.all()) == {
+                "uq_credit_packs_redemption_id": "UNIQUE (redemption_id)",
+                "fk_credit_packs_redemption_id": (
+                    "FOREIGN KEY (redemption_id) REFERENCES redemptions(id) ON DELETE SET NULL"
+                ),
+            }
+    finally:
+        await engine.dispose()
+    _alembic(scratch_url, "upgrade", "head")

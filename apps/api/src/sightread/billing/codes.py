@@ -237,7 +237,6 @@ async def redeem(
             purchased_at=now,
             expires_at=now + timedelta(days=row.valid_days),
             source=ledger.PACK_SOURCE_CODE,
-            redemption_id=redemption.id,
         )
         db.add(pack)
         await db.commit()
