@@ -17,7 +17,7 @@ ema-paper/
         stopping.py               # pause(): the wait a shutdown cuts short, for the worker's periodic tasks
         db/
           models.py               # SQLAlchemy models (docs/database.md)
-          session.py              # engine and request-scoped sessions
+          session.py              # engine, request-scoped sessions, commit-or-409 on a constraint race
         auth/                     # credentials (docs/auth.md)
           oidc.py                 # Google sign-in
           sessions.py             # server-side web sessions
@@ -32,7 +32,7 @@ ema-paper/
           v1.py                   # /v1: the data plane (docs/api.md)
           control.py              # /api: sign-in, the account, keys, agent settings
           library.py              # /api/library: the Files library (docs/web.md § Files)
-          multipart.py            # the streaming multipart reader of the library's upload
+          multipart.py            # multipart bodies under a cap: the small uploads' form, and the library's streaming reader
           chat.py                 # /api/conversations and /api/sandbox
           attachments.py          # /api/attachments: the chat composer's files
           extensions.py           # /api/skills and /api/subagents

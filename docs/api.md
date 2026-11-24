@@ -170,7 +170,7 @@ A finished parse is kept `PARSE_RETENTION_DAYS` (30) days after it finished ([jo
 - A checked parse gives the format check's reading copy. `meta.check` says so, with its model and how many joins and edits it made.
 - A parse with no reading copy (its reader switched the check off) gives the transcription page by page.
 
-The exact transcription of a checked parse stays the server's: it is the dedup cache's record ([parsing.md](./parsing.md) § Format check).
+The exact transcription of a checked parse is the dedup cache's record; the data plane never returns it, the control plane's `…/result` does ([parsing.md](./parsing.md) § Format check).
 
 `markdown` carries a `<!-- page: N -->` marker line before each page's content ([parsing.md](./parsing.md) § Page markers).
 
@@ -452,7 +452,7 @@ What the chat agent's model picker, the subagent dialog and the retry dialog lis
 - `{kind, text, document_id?, pinned?, conversation_id?, source_ref?}` → 201 the memory.
 - It is how the thread's Undo puts back what the agent forgot and saves again what Undo removed.
 - `text` is cleaned and capped like the tool's: `CHAT_MEMORY_MAX_CHARS`, 400 past it, and 400 for an empty one.
-- `document_id` and `conversation_id` must be the caller's (404).
+- `document_id` must be a live parse or markdown document of the caller's, and `conversation_id` one of the caller's conversations (404 otherwise).
 - **409** at `CHAT_MEMORIES_MAX`, counted under a lock on the caller's user row.
 
 **`PUT /api/memories/{id}`**
@@ -897,7 +897,7 @@ A `.md` or `.markdown` file, or one sent as `text/markdown`, other than an `AGEN
 
 **`GET /api/library/documents/{id}/result`**
 
-- The same payload as the data plane's `/result`, plus partial results (below).
+- The data plane's `/result` shape, except that `markdown` is the exact transcription (`results.markdown`), not the reading copy ([parsing.md](./parsing.md) § Format check); plus partial results (below).
 - 404 for a markdown document, which has none (its text is `content`), and for a file, whose bytes are `…/file`.
 - Every other route of a document's own (the revert, conversations, pages, figures, images, retry, re-convert) answers a file with 404 the same way ([workspace.md](./workspace.md) § Files).
 

@@ -460,6 +460,7 @@ async def library_index(db, user_id: int) -> dict:
             select(Document, Job)
             .outerjoin(Job, Job.id == Document.job_id)
             .where(Document.user_id == user_id, Document.trashed_at.is_(None))
+            .options(*library.UNREAD_JOB_TEXT)
         )
     ).all()
     live_folders = [row for row in folders.values() if row.id not in trashed]

@@ -281,8 +281,9 @@ async def library_snapshot(db: DbSession) -> None:
         await db.connection(execution_options={"isolation_level": "REPEATABLE READ"})
 
 
-# A job's prompt and check prompt, which no library row shows: left in the database by
-# the reads the Files page polls, and refused loudly if anything reaches for them.
+# A job's prompt and check prompt, which no library listing shows: left in the database
+# by GET /api/library, GET /v1/library and the connector's list_library, and refused
+# loudly if anything reaches for them.
 UNREAD_JOB_TEXT = (defer(Job.prompt, raiseload=True), defer(Job.check_prompt, raiseload=True))
 
 
