@@ -250,6 +250,17 @@ def folder_chain(by_id: dict[int, Folder], folder_id: int | None) -> list[Folder
     return chain
 
 
+def folder_path(folders: dict[int, Folder], folder_id: int | None) -> str:
+    """A folder's place as the Files page shows it: its names from the top, '' for the top."""
+    return "/".join(row.name for row in folder_chain(folders, folder_id))
+
+
+def item_path(folders: dict[int, Folder], folder_id: int | None, name: str) -> str:
+    """An item's place as the Files page shows it: its folder's names, then its own."""
+    above = folder_path(folders, folder_id)
+    return f"{above}/{name}" if above else name
+
+
 async def folder_names(db: AsyncSession, user_id: int, folder_id: int | None) -> list[str]:
     """The folder chain from the root down to `folder_id`, as names."""
     if folder_id is None:
@@ -512,7 +523,7 @@ def _materialize_files(
     *,
     document_id: int,
     job: Job | None,
-    result: Result | None,
+    result: Result | Row | None,
     figures_dir: Path,
     max_bytes: int,
 ) -> list[Path]:
@@ -623,9 +634,14 @@ async def materialize_document(
         job = (await db.execute(select(Job).where(Job.id == document.job_id))).scalar_one_or_none()
         if job is None:
             raise ApiError(404, "invalid_request", "No such job")
+        # Only the two texts materialization reads, never the per-page output beside them.
         result = (
-            await db.execute(select(Result).where(Result.job_id == document.job_id))
-        ).scalar_one_or_none()
+            await db.execute(
+                select(Result.markdown, Result.reading_markdown).where(
+                    Result.job_id == document.job_id
+                )
+            )
+        ).one_or_none()
         if result is None:
             # An empty doc.md written now would never be replaced by the parse result
             # (materialization writes only what is missing), so there is nothing to edit yet.
@@ -1109,16 +1125,9 @@ def _keep_image(paths: DocumentPaths, document_id: int, prepared: Path) -> str:
         while chunk := reader.read(safe_io.READ_CHUNK):
             digest.update(chunk)
     name = f"img-{digest.hexdigest()[:16]}{prepared.suffix}"
-    store = images_dir(paths.root) / str(document_id)
-    store.mkdir(parents=True, exist_ok=True)
-    kept = store / name
+    kept = images_dir(paths.root) / str(document_id) / name
     if not kept.is_file():
-        staging = store / f".tmp-{uuid.uuid4().hex}"
-        try:
-            shutil.copyfile(prepared, staging)
-            os.replace(staging, kept)
-        finally:
-            staging.unlink(missing_ok=True)
+        _install_original(prepared, kept)
     target = paths.figures / name
     if safe_io.entry_kind(paths.root, target) == "none":
         with kept.open("rb") as reader:
@@ -1162,8 +1171,8 @@ def _discard_adopted(root: Path, document_id: int, directory: Path) -> None:
         if not is_dir and name.startswith(f"{SOURCE_STEM}."):
             with contextlib.suppress(OSError, safe_io.UnsafeEntry):
                 safe_io.remove_file(root, directory / name)
-    with contextlib.suppress(OSError):
-        directory.rmdir()  # only when the copy was all it held
+    with contextlib.suppress(OSError, safe_io.UnsafeEntry):
+        safe_io.remove_empty_dir(root, directory)  # only when the copy was all it held
 
 
 async def discard_adopted(
@@ -1299,7 +1308,7 @@ async def write_notes(
 
 
 def _take_parse(
-    paths: DocumentPaths, *, document_id: int, job: Job, result: Result, max_bytes: int
+    paths: DocumentPaths, *, document_id: int, job: Job, result: Result | Row, max_bytes: int
 ) -> None:
     """`doc.md` and `.meta.json` from a re-convert's parse, as one revision; both as they
     were when it cannot be recorded (docs/workspace.md § Revisions)."""
@@ -1360,7 +1369,11 @@ async def take_reconvert(db: AsyncSession, settings: Settings, document: Documen
                 document.reconvert_job_id = None
                 await db.commit()
                 return False
-            result = (await db.execute(select(Result).where(Result.job_id == job.id))).scalar_one()
+            result = (
+                await db.execute(
+                    select(Result.markdown, Result.reading_markdown).where(Result.job_id == job.id)
+                )
+            ).one()
             earlier = document.job_id
             # The version it has, recorded, so the revision below is the change from it.
             paths = await materialize_document(db, settings, document, locked=True)

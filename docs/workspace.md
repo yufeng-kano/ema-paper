@@ -16,6 +16,9 @@ The workspace is deleted with the account and never otherwise:
 
 ```text
 {WORKSPACES_DIR}/.repos/{user_id}/     the user's git directory: outside the VM's mount
+{WORKSPACES_DIR}/.repos/{user_id}.sources/{document_id}.<ext>   the originals: outside the mount (below)
+{WORKSPACES_DIR}/.repos/{user_id}.lock, {user_id}.shell.lock, {user_id}.writing   the workspace and shell locks and the writing marker (§ Locks and the writing marker)
+{WORKSPACES_DIR}/.repos/backup.lock    the backup lock, taken shared by every workspace write (§ Backups)
 {WORKSPACES_DIR}/.repos/{user_id}.images/{document_id}/   the images inserted into a document's doc.md or notes.md: outside the mount too
 {WORKSPACES_DIR}/.repos/{user_id}.deleted   a deleted account's marker, JSON: the user's job ids, standing until the account's files are gone (below)
 {WORKSPACES_DIR}/{user_id}/            host side; the VM mounts it as /workspace

@@ -76,6 +76,7 @@ from ..workspace.documents import (
     ensure_within_quota,
     folder_names,
     is_live,
+    item_path,
     keep_image,
     materialize_document,
     measure_storage,
@@ -1865,7 +1866,7 @@ async def _run_convert(ctx: TurnContext, tool_input: dict) -> chat_tools.ToolOut
                 )
             # Named as the Files page names it, whichever way the path was given.
             folders = await user_folders(db, user_id)
-            shown_path = chat_library.item_path(folders, row.folder_id, row.name)
+            shown_path = item_path(folders, row.folder_id, row.name)
             shown_doc = f"{chat_library.vm_path(folders, row.folder_id, row.name)}/{DOC_FILE}"
             row_id = row.id
             converted_here = row.kind == FILE_KIND

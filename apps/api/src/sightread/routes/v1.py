@@ -37,7 +37,7 @@ from ..auth.deps import (
     UploaderCaller,
 )
 from ..billing import ledger
-from ..db.models import FILE_KIND, MARKDOWN_KIND, Document, Folder, Job, Result, User
+from ..db.models import FILE_KIND, MARKDOWN_KIND, Document, Job, Result, User
 from ..errors import ApiError
 from ..jobs import events
 from ..jobs.intake import (
@@ -440,12 +440,6 @@ def library_entry(row: Document, job: Job | None, path: str) -> dict:
     }
 
 
-def entry_path(folders: dict[int, Folder], folder_id: int | None, name: str) -> str:
-    """The folder names and the name joined with `/`, as the Files page shows them."""
-    chain = workspace_documents.folder_chain(folders, folder_id)
-    return "/".join([*(folder.name for folder in chain), name])
-
-
 async def library_index(db, user_id: int) -> dict:
     """The live library from one snapshot, without the Trash: `GET /v1/library`, and the
     rows the connector's `list_library` filters (docs/mcp.md § The library tools).
@@ -465,7 +459,7 @@ async def library_index(db, user_id: int) -> dict:
     ).all()
     live_folders = [row for row in folders.values() if row.id not in trashed]
     documents = [
-        library_entry(row, job, entry_path(folders, row.folder_id, row.name))
+        library_entry(row, job, workspace_documents.item_path(folders, row.folder_id, row.name))
         for row, job in rows
         if row.folder_id not in trashed
     ]
@@ -476,7 +470,7 @@ async def library_index(db, user_id: int) -> dict:
                     "id": row.id,
                     "parent_id": row.parent_id,
                     "name": row.name,
-                    "path": entry_path(folders, row.parent_id, row.name),
+                    "path": workspace_documents.item_path(folders, row.parent_id, row.name),
                 }
                 for row in live_folders
             ),
@@ -507,7 +501,7 @@ async def document_entry(db, settings, user_id: int, document_id: int) -> tuple[
         root = user_root(settings.workspaces_dir, row.user_id)
         source = await workspace_documents.answering_original(db, root, row.id, job)
     entry = {
-        **library_entry(row, job, entry_path(folders, row.folder_id, row.name)),
+        **library_entry(row, job, workspace_documents.item_path(folders, row.folder_id, row.name)),
         "original": source is not None,
     }
     return entry, source

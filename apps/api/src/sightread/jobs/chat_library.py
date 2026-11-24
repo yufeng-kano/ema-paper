@@ -28,6 +28,7 @@ from ..errors import ApiError
 from ..workspace import documents as workspace_documents
 from ..workspace import filing, safe_io
 from ..workspace.agents_file import AGENTS_FILE
+from ..workspace.documents import folder_path, item_path
 from ..workspace.layout import DOC_FILE, FILES_DIR, document_relative_dir, path_segment, user_root
 from ..workspace.locks import backup_shared, workspace_lock
 from .chat_tools import VM_ROOT, ToolOutcome
@@ -120,17 +121,6 @@ async def resolve(
             return None
         return Found(document=document)
     return Found(folder=place)
-
-
-def folder_path(folders: dict[int, Folder], folder_id: int | None) -> str:
-    """A folder's place as the Files page shows it: its names from the top, '' for the top."""
-    return "/".join(row.name for row in workspace_documents.folder_chain(folders, folder_id))
-
-
-def item_path(folders: dict[int, Folder], folder_id: int | None, name: str) -> str:
-    """An item's place as the Files page shows it: its folder's names, then its own."""
-    above = folder_path(folders, folder_id)
-    return f"{above}/{name}" if above else name
 
 
 def vm_path(folders: dict[int, Folder], folder_id: int | None, name: str) -> str:

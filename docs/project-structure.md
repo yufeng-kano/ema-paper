@@ -77,7 +77,7 @@ ema-paper/
           chat_events.py          # the conversation's event stream
           summary.py              # the summary model's one call: `/rename`'s title
         workspace/                # every user's file tree and its git revisions (docs/workspace.md)
-          layout.py               # where things live in a workspace: pure path arithmetic
+          layout.py               # where things live in a workspace: path arithmetic and the listings of WORKSPACES_DIR
           safe_io.py              # opening workspace files without following a link
           locks.py                # the workspace, shell and backup locks and the writing marker
           git.py                  # git as the revision store

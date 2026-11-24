@@ -416,13 +416,10 @@ async def find_or_make_folder_path(
             # and the rows a retried insert expired are fresh.
             folders = await workspace_documents.user_folders(db, user_id)
 
-    def shown(folder_id: int) -> str:
-        return "/".join(row.name for row in workspace_documents.folder_chain(folders, folder_id))
-
     return {
         "id": folder_id,
-        "path": "/" if folder_id is None else shown(folder_id),
-        "created": sorted(shown(made_id) for made_id in made),
+        "path": "/" if folder_id is None else workspace_documents.folder_path(folders, folder_id),
+        "created": sorted(workspace_documents.folder_path(folders, made_id) for made_id in made),
     }
 
 

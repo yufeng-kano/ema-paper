@@ -2228,3 +2228,25 @@ async def test_a_workspace_too_deep_to_measure_is_refused_not_undercounted(
         with pytest.raises(ApiError) as refused:
             await documents.measure_storage(db, settings, user.id, paths.root)
         assert refused.value.status_code == 409
+
+
+def test_discarding_an_adoption_never_removes_a_directory_through_a_swapped_link(
+    tmp_path, monkeypatch
+) -> None:
+    root = tmp_path / "ws" / "25"
+    directory = root / "files" / "Papers" / "paper.pdf"
+    directory.mkdir(parents=True)
+    (directory / "source.pdf").write_bytes(b"%PDF-1.4\n")
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "paper.pdf").mkdir(parents=True)
+    real_remove = safe_io.remove_file
+
+    def remove_then_swap(at_root: Path, path: Path) -> None:
+        real_remove(at_root, path)
+        # The shell swaps the folder for a link between the copy's unlink and the rmdir.
+        shutil.rmtree(root / "files" / "Papers")
+        (root / "files" / "Papers").symlink_to(elsewhere)
+
+    monkeypatch.setattr(safe_io, "remove_file", remove_then_swap)
+    documents._discard_adopted(root, 7, directory)
+    assert (elsewhere / "paper.pdf").is_dir()

@@ -46,7 +46,7 @@ from ..db.models import (
     utcnow,
 )
 from ..errors import ApiError
-from ..jobs import chat_compact, chat_events, chat_library, chat_versions, summary
+from ..jobs import chat_compact, chat_events, chat_versions, summary
 from ..jobs.intake import insufficient_credits
 from ..jobs.queue import HISTORY_FULL, count_active_turns, enqueue_turn, history_bytes
 from ..parsing.attachments import prepared_path
@@ -57,7 +57,9 @@ from ..workspace.documents import (
     StorageUsage,
     ensure_within_quota,
     folder_chain,
+    folder_path,
     is_live,
+    item_path,
     live_text_document,
     make_folder_dir,
     materialize_document,
@@ -1100,14 +1102,14 @@ async def _library_block(db: AsyncSession, user_id: int, library: LibraryIn) -> 
             continue
         if item.kind == "folder":
             if live_folder(item.id):
-                picked.append((chat_library.folder_path(folders, item.id), "folder", item.id))
+                picked.append((folder_path(folders, item.id), "folder", item.id))
             continue
         document = documents.get(item.id)
         if document is not None and is_live(document, folders):
-            path = chat_library.item_path(folders, document.folder_id, document.name)
+            path = item_path(folders, document.folder_id, document.name)
             picked.append((path, "document", item.id))
     opened = library.folder_id if live_folder(library.folder_id) else None
-    folder = chat_library.folder_path(folders, opened)
+    folder = folder_path(folders, opened)
     lines = [
         LIBRARY_PREFIX,
         f"- open folder: {folder} (folder {opened})"
@@ -1148,7 +1150,9 @@ async def _init_block(
         agents_file = VM_ROOT.joinpath(
             FILES_DIR, *(path_segment(name) for name in names), AGENTS_FILE
         ).as_posix()
-        text = chat_agent.library_init_instruction("/".join(names), agents_file, note)
+        text = chat_agent.library_init_instruction(
+            folder_path(folders, folder_id), agents_file, note
+        )
     return {"type": "text", "text": text, "context": chat_agent.INIT_CONTEXT}
 
 
