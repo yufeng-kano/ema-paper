@@ -14,7 +14,7 @@ import hmac
 import logging
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit
 
@@ -60,7 +60,6 @@ class PayRefused(Exception):
 
     def __init__(self, status: int) -> None:
         super().__init__(f"Kano Pay refused with {status}")
-        self.status = status
 
 
 @dataclass(frozen=True)
@@ -84,14 +83,11 @@ class PayPurchase:
     status: str
     paid_at: datetime
     version: int
-    amount: str | None
-    currency: str | None
 
 
 @dataclass(frozen=True)
 class CatalogPlan:
     plan_id: str
-    product_id: str
     name: str
     amount: str
     currency: str
@@ -101,7 +97,6 @@ class CatalogPlan:
 @dataclass(frozen=True)
 class CatalogPack:
     pack_id: str
-    product_id: str
     name: str
     amount: str
     currency: str
@@ -111,7 +106,12 @@ class CatalogPack:
 class Catalog:
     checkout_enabled: bool
     plans: dict[str, CatalogPlan]
-    packs: dict[str, CatalogPack] = field(default_factory=dict)
+    packs: dict[str, CatalogPack]
+
+
+def valid_id(value: object) -> bool:
+    """Whether `value` has the shape of an id Pay hands out (a plan, a purchase, an event)."""
+    return isinstance(value, str) and _ID.match(value) is not None
 
 
 def _str(data: dict, key: str, *, pattern: re.Pattern[str] | None = _ID) -> str:
@@ -183,15 +183,12 @@ def parse_purchase(data: object, app_id: str, subject: str) -> PayPurchase:
     pack_id = data.get("packId")
     if not isinstance(pack_id, str) or not 0 < len(pack_id) <= 64:
         raise PayUnavailable("Kano Pay's purchase carries no valid packId")
-    amount, currency = data.get("amount"), data.get("currency")
     return PayPurchase(
         purchase_id=_str(data, "purchaseId"),
         pack_id=pack_id,
         status=status,
         paid_at=_millis(data, "paidAt"),
         version=version,
-        amount=amount if isinstance(amount, str) and _AMOUNT.match(amount) else None,
-        currency=currency if isinstance(currency, str) and _CURRENCY.match(currency) else None,
     )
 
 
@@ -314,10 +311,9 @@ class PayClient:
             try:
                 plan = CatalogPlan(
                     plan_id=_str(entry, "planId"),
-                    product_id=_str(entry, "productId"),
                     name=_str(entry, "name", pattern=None),
-                    amount=_str(entry, "amount", pattern=re.compile(r"^\d{1,12}$")),
-                    currency=_str(entry, "currency", pattern=re.compile(r"^[A-Z]{3}$")),
+                    amount=_str(entry, "amount", pattern=_AMOUNT),
+                    currency=_str(entry, "currency", pattern=_CURRENCY),
                     cycle={
                         "interval": _str(cycle, "interval"),
                         "frequency": int(cycle.get("frequency") or 1),
@@ -334,7 +330,6 @@ class PayClient:
             try:
                 pack = CatalogPack(
                     pack_id=_str(entry, "packId"),
-                    product_id=_str(entry, "productId"),
                     name=_str(entry, "name", pattern=None),
                     amount=_str(entry, "amount", pattern=_AMOUNT),
                     currency=_str(entry, "currency", pattern=_CURRENCY),
@@ -363,10 +358,6 @@ class CatalogCache:
         self._until = now + client.catalog_ttl
         return self._value
 
-    def clear(self) -> None:
-        self._value = None
-        self._until = 0.0
-
 
 def on_sale(settings: Settings, catalog: Catalog) -> dict[str, CatalogPlan]:
     """The plans both configured here and priced at Pay: only that intersection is on
@@ -377,12 +368,6 @@ def on_sale(settings: Settings, catalog: Catalog) -> dict[str, CatalogPlan]:
 def packs_on_sale(settings: Settings, catalog: Catalog) -> dict[str, CatalogPack]:
     """The packs both configured here and priced at Pay (docs/billing.md § Top-up packs)."""
     return {pack_id: pack for pack_id, pack in catalog.packs.items() if pack_id in settings.packs}
-
-
-def sign(secret: str, timestamp: int, raw: bytes) -> str:
-    """`Kano-Pay-Signature` as Pay writes it, for tests and for the docs' example."""
-    digest = hmac.new(secret.encode(), f"{timestamp}.".encode() + raw, hashlib.sha256)
-    return f"ts={timestamp};h1={digest.hexdigest()}"
 
 
 def verify_signature(
@@ -401,13 +386,13 @@ def verify_signature(
     return hmac.compare_digest(expected.hexdigest(), match.group(2))
 
 
-async def write_subscription(db: AsyncSession, user_id: int, canonical: PaySubscription) -> bool:
+async def write_subscription(db: AsyncSession, user_id: int, canonical: PaySubscription) -> None:
     """Upsert the user's row from Pay's canonical answer, only when its version is newer
     than the stored one: an out-of-order notification never rolls access backwards.
-    Returns whether anything was written. The caller commits."""
+    The caller commits."""
     row = await db.get(Subscription, user_id, with_for_update=True)
     if row is not None and row.version >= canonical.version:
-        return False
+        return
     if row is None:
         row = Subscription(user_id=user_id, subscription_id=canonical.subscription_id)
         db.add(row)
@@ -420,16 +405,15 @@ async def write_subscription(db: AsyncSession, user_id: int, canonical: PaySubsc
     row.version = canonical.version
     row.updated_at = utcnow()
     await db.flush()
-    return True
 
 
-async def apply_canonical(db: AsyncSession, user_id: int, canonical: PaySubscription) -> bool:
+async def apply_canonical(db: AsyncSession, user_id: int, canonical: PaySubscription) -> None:
     """What Pay's canonical answer changes here, whichever way it arrived — the webhook
     or a refresh: the subscription row (`write_subscription`), and the user's open
     checkout marked completed when the answer is a paid subscription updated after the
     checkout was opened — the purchase that checkout started. The caller holds the
-    user's row lock and commits. Returns whether the subscription row changed."""
-    written = await write_subscription(db, user_id, canonical)
+    user's row lock and commits."""
+    await write_subscription(db, user_id, canonical)
     checkout = await db.get(Checkout, user_id)
     if (
         checkout is not None
@@ -439,12 +423,11 @@ async def apply_canonical(db: AsyncSession, user_id: int, canonical: PaySubscrip
     ):
         checkout.completed_at = utcnow()
         await db.flush()
-    return written
 
 
 async def apply_purchases(
     db: AsyncSession, settings: Settings, user_id: int, purchases: list[PayPurchase]
-) -> bool:
+) -> None:
     """What Pay's canonical purchases change here, whichever way they arrived — the
     webhook or a refresh (docs/billing.md § Kano Pay, *Purchase notifications*): a
     `credit_packs` row created for a purchase not yet known, with the credits and the
@@ -452,7 +435,7 @@ async def apply_purchases(
     only when Pay's version is newer, never backwards, its credits never lowered; the
     pack checkout the purchase came from marked completed. A pack this deployment does
     not configure is logged and skipped. The caller holds the user's row lock and
-    commits. Returns whether anything was written."""
+    commits."""
     written = False
     checkout = await db.get(PackCheckout, user_id)
     # The user's packs, locked in the ledger's order before any is written (docs/billing.md
@@ -505,4 +488,3 @@ async def apply_purchases(
             written = True
     if written:
         await db.flush()
-    return written

@@ -288,7 +288,7 @@ async def test_the_billing_route_and_me_show_the_plan_and_the_balance(make_clien
         "remaining": 150,
         "source": "free",
     }
-    assert (billing["plan_grant"], billing["redemptions"]) == (None, [])
+    assert billing["plan_grant"] is None
     assert billing["rates"]["parse_per_page"] == 1
     # Every priced model, in the price table's order. US$1 per million tokens at US$0.002
     # a credit: half a credit per 1K tokens.
@@ -300,8 +300,6 @@ async def test_the_billing_route_and_me_show_the_plan_and_the_balance(make_clien
         "output": 0.5,
     }
     assert billing["checkout_available"] is False
-    empty = (await client.get("/api/billing/entries")).json()
-    assert empty == {"days": 30, "per_day": [], "per_agent": []}
 
 
 async def test_an_upload_the_balance_cannot_cover_is_refused_and_not_stored(
@@ -333,11 +331,10 @@ async def test_an_upload_reserves_its_pages_and_the_payloads_show_the_settled_co
     assert (await client.get("/api/me")).json()["credits_remaining"] == 4
     job_id = created.json()["job_id"]
     assert (await _read(client))["documents"][0]["credits"] is None
-    entries = (await client.get("/api/billing/entries")).json()
-    assert entries["per_agent"] == [{"agent": "parse", "credits": 1}]
-    assert entries["per_day"][0]["parse"] == 1
 
     async with client.app.state.sessionmaker() as db:
+        (entry,) = (await db.execute(select(CreditEntry))).scalars().all()
+        assert (entry.kind, entry.amount, entry.state) == (ledger.PARSE, 1, ledger.RESERVED)
         await ledger.settle_parse(db, __import__("uuid").UUID(job_id), "succeeded")
         await db.commit()
     assert (await _read(client))["documents"][0]["credits"] == 1

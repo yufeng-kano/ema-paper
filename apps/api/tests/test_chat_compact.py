@@ -295,6 +295,8 @@ async def test_the_composers_commands_are_no_skill_names(chat_client) -> None:
         )
         assert refused.status_code == 400, refused.text
         assert "composer" in refused.text
+        # The refusal names every reserved command, so the reader knows what else to avoid.
+        assert all(f"/{command}" in refused.text for command in skill_defs.COMPOSER_COMMANDS)
     created = await chat_client.post(
         "/api/skills",
         json={"name": "squash", "description": "x", "body": "x"},

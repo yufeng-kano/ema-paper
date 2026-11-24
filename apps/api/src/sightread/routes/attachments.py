@@ -23,7 +23,7 @@ from starlette.datastructures import UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser
 
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
-from ..db.models import ChatAttachment, User, utcnow
+from ..db.models import ChatAttachment, utcnow
 from ..errors import ApiError
 from ..jobs.intake import MULTIPART_ENVELOPE_BYTES, capped_stream, store_upload, upload_chunks
 from ..parsing.attachments import (
@@ -32,6 +32,7 @@ from ..parsing.attachments import (
     prepare_attachment,
     prepared_path,
 )
+from ..workspace.trash import lock_user
 
 router = APIRouter(prefix="/api", tags=["attachments"])
 
@@ -133,7 +134,7 @@ async def upload_attachment(
 
     # Under the user's row, held until the insert commits: two uploads at the cap must not
     # both count below it (PostgreSQL; the SQLite fallback runs one request at a time).
-    await db.execute(select(User.id).where(User.id == user_id).with_for_update())
+    await lock_user(db, user_id)
     # The caller's rows the sweeper has taken the files of are no attachments any more:
     # they go with this upload, so the never-sent ones do not pile up (docs/jobs.md
     # § Retention).

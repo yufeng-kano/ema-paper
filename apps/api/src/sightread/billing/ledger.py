@@ -11,6 +11,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
@@ -36,7 +37,7 @@ logger = logging.getLogger(__name__)
 PARSE = "parse"
 CHAT = "chat"
 RESERVED, CONSUMED, RELEASED = "reserved", "consumed", "released"
-PACK_PAID, PACK_REFUNDED = "paid", "refunded"
+PACK_PAID = "paid"
 # Where a pack came from: Pay, a redeem code, or an operator's grant in the console
 # (docs/billing.md § Redeem codes, § Operator grants).
 PACK_SOURCE_PAY, PACK_SOURCE_CODE, PACK_SOURCE_GRANT = "pay", "code", "grant"
@@ -70,8 +71,7 @@ class PackBalance:
     purchased_at: datetime
     expires_at: datetime
     active: bool
-    source: str = PACK_SOURCE_PAY
-    redemption_id: int | None = None
+    source: str
 
     @property
     def remaining(self) -> int:
@@ -85,9 +85,9 @@ class Balance:
     granted: int
     spent: int
     # Every pack the user bought or redeemed, newest first.
-    packs: tuple[PackBalance, ...] = ()
+    packs: tuple[PackBalance, ...]
     # The bank of granted days, None for a user who never redeemed any.
-    grant: Grant | None = None
+    grant: Grant | None
 
     @property
     def remaining(self) -> int:
@@ -127,7 +127,6 @@ def _pack_balance(pack: CreditPack, now: datetime) -> PackBalance:
         expires_at=pack.expires_at,
         active=pack_active(pack, now),
         source=pack.source,
-        redemption_id=pack.redemption_id,
     )
 
 
@@ -335,13 +334,12 @@ async def _take(
     user_id: int,
     amount: int,
     need: int,
-    now: datetime | None,
+    now: datetime,
 ) -> tuple[Period, list[tuple[str, int]]]:
     """Take `amount` from the current period first and the active packs after, in the
     order they expire, refusing when what is available is under `need`. Conditional
     UPDATEs are the guards; returns the period and each pack's share (docs/billing.md
     § The ledger, § Top-up packs)."""
-    now = now or utcnow()
     row, period = await period_row(db, settings, user_id, now)
     # The period row's lock before the packs', as every path takes them (docs/billing.md
     # § The ledger): a settlement running beside this charge waits here or is waited for,
@@ -402,12 +400,11 @@ async def reserve(
     job_id: uuid.UUID | None = None,
     turn_id: uuid.UUID | None = None,
     minimum: int = 0,
-    now: datetime | None = None,
 ) -> CreditEntry:
     """Reserve `amount` credits of the current period — and the packs after it — for a
     job or a turn, refusing when the balance is under `max(amount, minimum)`; the entry
     and the packs' shares are inserted in the same transaction."""
-    period, shares = await _take(db, settings, user_id, amount, max(amount, minimum), now)
+    period, shares = await _take(db, settings, user_id, amount, max(amount, minimum), utcnow())
     entry = CreditEntry(
         user_id=user_id,
         period_start=period.start,
@@ -423,9 +420,7 @@ async def reserve(
     return entry
 
 
-async def reserve_again(
-    db: AsyncSession, settings: Settings, job_id: uuid.UUID, now: datetime | None = None
-) -> None:
+async def reserve_again(db: AsyncSession, settings: Settings, job_id: uuid.UUID) -> None:
     """A retry takes back the credits its job's failure released, from the current period
     and the packs as they stand now, dated now, so a document is charged once, by the run
     that delivers it (docs/billing.md § A parse). A job with no entry — queued before the
@@ -435,7 +430,7 @@ async def reserve_again(
     ).scalar_one_or_none()
     if entry is None or entry.state != RELEASED:
         return
-    now = now or utcnow()
+    now = utcnow()
     period, shares = await _take(db, settings, entry.user_id, entry.amount, entry.amount, now)
     entry.period_start = period.start
     entry.state = RESERVED
@@ -558,7 +553,7 @@ async def settle_chat(db: AsyncSession, settings: Settings, turn_id: uuid.UUID) 
             .group_by(UsageLog.model)
         )
     ).all()
-    usd = settings.credit_usd * 0
+    usd = Decimal(0)
     for model, prompt, completion, cache_read, cache_write in rows:
         price = settings.model_prices.get(model)
         if price is None:

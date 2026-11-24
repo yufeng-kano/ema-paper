@@ -4,6 +4,8 @@ portal, and the entitlements a bought plan grants. Pay exists only inside respx.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import time
 from datetime import UTC, datetime, timedelta
@@ -107,6 +109,12 @@ def _event(user_id: int, event_id: str = "evt_1", **subscription) -> bytes:
     return json.dumps(body).encode()
 
 
+def _sign(secret: str, timestamp: int, raw: bytes) -> str:
+    """`Kano-Pay-Signature` as Pay writes it, independent of the code that verifies it."""
+    digest = hmac.new(secret.encode(), f"{timestamp}.".encode() + raw, hashlib.sha256)
+    return f"ts={timestamp};h1={digest.hexdigest()}"
+
+
 async def _notify(
     client: AsyncClient,
     raw: bytes,
@@ -119,7 +127,7 @@ async def _notify(
         "/api/billing/pay-webhook",
         content=raw,
         headers={
-            "Kano-Pay-Signature": pay.sign(secret, ts, raw),
+            "Kano-Pay-Signature": _sign(secret, ts, raw),
             "Content-Type": "application/json",
         },
     )
@@ -145,7 +153,7 @@ async def _plan_shown(client: AsyncClient) -> str:
 def test_the_signature_covers_the_timestamp_and_the_exact_bytes() -> None:
     raw = b'{"id":"evt"}'
     now = 1_700_000_000
-    header = pay.sign("secret", now, raw)
+    header = _sign("secret", now, raw)
     assert pay.verify_signature(header, raw, "secret", now + 100, 300)
     assert pay.verify_signature(header, raw, "secret", now - 300, 300)
     # One byte more and the signature no longer covers the body; another key, another
@@ -580,7 +588,7 @@ async def test_the_public_catalog_is_cached_and_lists_what_is_on_sale(make_clien
     again = await client.get("/api/billing/catalog")
     assert again.json() == first.json()
     assert listing.call_count == 1
-    client.app.state.pay_catalog.clear()
+    client.app.state.pay_catalog = pay.CatalogCache()
     await client.get("/api/billing/catalog")
     assert listing.call_count == 2
 

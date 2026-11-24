@@ -103,11 +103,11 @@ def parse_credits(pages: int, per_page: int) -> int:
     return pages * per_page
 
 
-def credits_for_usd(usd: Decimal, credit_usd: Decimal, *, minimum: int = 1) -> int:
+def credits_for_usd(usd: Decimal, credit_usd: Decimal) -> int:
     """Whole credits for a cost, rounded up — once, over whatever the caller summed — and
-    never under `minimum` (docs/billing.md § A chat turn)."""
+    never under 1 (docs/billing.md § A chat turn)."""
     if credit_usd <= 0:
         raise ValueError("a credit must be worth something")
     if usd < 0:
         raise ValueError("a cost is not negative")
-    return max(minimum, math.ceil(usd / credit_usd))
+    return max(1, math.ceil(usd / credit_usd))

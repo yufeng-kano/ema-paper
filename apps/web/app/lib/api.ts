@@ -408,7 +408,6 @@ export interface BillingPack {
   expires_at: string
   /** Bought from Pay, granted by a redeem code, or granted by an operator in the console. */
   source: 'pay' | 'code' | 'grant'
-  redemption_id: number | null
 }
 
 export interface BillingPacks {
@@ -433,16 +432,6 @@ interface BillingPlanGrant {
   period_end: string | null
 }
 
-/** One code the reader redeemed (docs/billing.md § Redeem codes). */
-interface BillingRedemption {
-  id: number
-  kind: 'credits' | 'plan'
-  credits: number | null
-  plan_id: string | null
-  days: number | null
-  redeemed_at: string
-}
-
 interface BillingResponse {
   plan: BillingPlan
   subscription: BillingSubscription | null
@@ -457,7 +446,6 @@ interface BillingResponse {
   packs: BillingPacks
   /** Null for a reader who never redeemed days. */
   plan_grant: BillingPlanGrant | null
-  redemptions: BillingRedemption[]
   /** The balance a charge is measured against: the period's, 0 when overdrawn, plus the
    *  active packs' (docs/billing.md § Top-up packs). */
   credits_available: number

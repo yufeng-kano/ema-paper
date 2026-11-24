@@ -32,6 +32,7 @@ from sightread.db.models import (
     Job,
     PlanGrant,
     RedeemCode,
+    Redemption,
     Subscription,
     User,
 )
@@ -213,11 +214,15 @@ async def test_a_credits_code_becomes_a_pack_that_is_not_pays(make_client, sessi
         500,
         "paid",
     )
-    (redemption,) = billing["redemptions"]
-    assert (redemption["kind"], redemption["credits"], pack["redemption_id"]) == (
+    async with sessionmaker() as db:
+        redemption = (
+            await db.execute(select(Redemption).where(Redemption.user_id == user_id))
+        ).scalar_one()
+        pack_row = await db.get(CreditPack, pack["id"])
+    assert (redemption.kind, redemption.credits, pack_row.redemption_id) == (
         "credits",
         500,
-        redemption["id"],
+        redemption.id,
     )
     assert billing["plan_grant"] is None
     assert (await client.get("/api/me")).json()["credits_remaining"] == 600
@@ -237,7 +242,7 @@ async def test_a_credits_code_becomes_a_pack_that_is_not_pays(make_client, sessi
     async with sessionmaker() as db:
         entry = await ledger.reserve(db, settings, user_id=user_id, kind=ledger.PARSE, amount=130)
         await db.commit()
-        pack_row = await db.get(CreditPack, f"redeem-{redemption['id']}")
+        pack_row = await db.get(CreditPack, f"redeem-{redemption.id}")
         assert (entry.amount, pack_row.spent) == (130, 30)
     assert (await client.get("/api/billing")).json()["credits_available"] == 470
 
@@ -279,8 +284,9 @@ async def test_a_code_that_is_unknown_disabled_or_past_its_date_is_refused(
     answer = await _redeem(client, expired)
     assert (answer.status_code, answer.json()["error"]["type"]) == (409, "code_expired")
     # Nothing was granted or recorded.
-    billing = (await client.get("/api/billing")).json()
-    assert billing["packs"]["items"] == [] and billing["redemptions"] == []
+    assert (await client.get("/api/billing")).json()["packs"]["items"] == []
+    async with sessionmaker() as db:
+        assert (await db.execute(select(Redemption))).scalars().all() == []
 
 
 async def test_refused_attempts_are_capped_per_window(sessionmaker) -> None:
@@ -349,7 +355,11 @@ async def test_a_plan_code_starts_at_once_when_nothing_else_pays(make_client, se
         "period_start": billing["period"]["start"],
         "period_end": billing["period"]["end"],
     }
-    assert billing["redemptions"][0]["days"] == 30
+    async with sessionmaker() as db:
+        redemption = (
+            await db.execute(select(Redemption).where(Redemption.user_id == user_id))
+        ).scalar_one()
+    assert redemption.days == 30
     # Another code stacks: its days wait in the bank, the open period is unchanged.
     more = await _code(sessionmaker, settings, plan_id="pro", days=45)
     stacked = (await _redeem(client, more)).json()

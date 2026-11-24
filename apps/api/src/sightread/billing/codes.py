@@ -134,15 +134,14 @@ class Redeemed:
     period_end: datetime | None = None
 
 
-def _refusal(code: RedeemCode | None, now: datetime) -> ApiError | None:
-    """Why the code cannot be redeemed, before this user's own history is read."""
-    if code is None or code.disabled_at is not None:
-        return ApiError(404, "code_invalid", "This code does not exist")
-    if code.redeem_by is not None and now > code.redeem_by:
-        return ApiError(409, "code_expired", "This code has expired")
-    if code.uses >= code.max_uses:
-        return ApiError(409, "code_exhausted", "This code has been used up")
-    return None
+# Why a code `status` does not call active is refused, before this user's own history is
+# read: a disabled code and one whose plan is gone read as no code at all.
+_REFUSALS = {
+    DISABLED: (404, "code_invalid", "This code does not exist"),
+    EXPIRED: (409, "code_expired", "This code has expired"),
+    USED_UP: (409, "code_exhausted", "This code has been used up"),
+    PLAN_MISSING: (404, "code_invalid", "This code does not exist"),
+}
 
 
 async def redeem(
@@ -183,14 +182,15 @@ async def redeem(
         if 0 < len(code) <= 64
         else None
     )
-    refusal = _refusal(row, now)
+    # An unknown code is refused as a disabled one is.
+    state = DISABLED if row is None else status(row, now, settings.plans)
+    if state == PLAN_MISSING:
+        # Created for a plan the deployment no longer configures: inert, so not given.
+        logger.warning("redeem code %d names a plan not configured: %s", row.id, row.plan_id)
+    refusal = None if state == ACTIVE else ApiError(*_REFUSALS[state])
     decided: Decision | None = None
     if refusal is None:
-        if row.kind == PLAN and row.plan_id not in settings.plans:
-            # Created for a plan the deployment no longer configures: inert, so not given.
-            logger.warning("redeem code %d names a plan not configured: %s", row.id, row.plan_id)
-            refusal = ApiError(404, "code_invalid", "This code does not exist")
-        elif (
+        if (
             await db.execute(
                 select(Redemption.id).where(
                     Redemption.code_id == row.id, Redemption.user_id == user_id

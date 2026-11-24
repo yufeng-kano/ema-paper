@@ -17,7 +17,7 @@ import respx
 from httpx import AsyncClient
 from sqlalchemy import select
 
-from sightread.billing import ledger
+from sightread.billing import ledger, pay
 from sightread.billing.plans import Pack, parse_packs
 from sightread.db.models import (
     ChatTurn,
@@ -386,7 +386,7 @@ async def test_an_expired_or_refunded_pack_counts_nothing(sessionmaker) -> None:
     settings = settings_with(free_credits_per_period=0)
     user_id = await _user(sessionmaker)
     expired = await _pack(sessionmaker, user_id, credits=5, days_left=-1)
-    refunded = await _pack(sessionmaker, user_id, credits=5, status=ledger.PACK_REFUNDED)
+    refunded = await _pack(sessionmaker, user_id, credits=5, status="refunded")
     active = await _pack(sessionmaker, user_id, credits=2)
 
     async with sessionmaker() as db:
@@ -522,11 +522,11 @@ async def test_a_pack_checkout_is_for_a_paid_plan_and_a_pack_on_sale(make_client
     assert (await client.get("/api/me")).json()["pack_checkout_available"] is True
     other = await _buy(client, "other")
     assert (other.status_code, other.json()["error"]["type"]) == (409, "checkout_unavailable")
-    client.app.state.pay_catalog.clear()
+    client.app.state.pay_catalog = pay.CatalogCache()
     respx.get(CATALOG_URL).mock(return_value=httpx.Response(200, json=_catalog(enabled=False)))
     closed = await _buy(client)
     assert (closed.status_code, closed.json()["error"]["type"]) == (409, "checkout_unavailable")
-    client.app.state.pay_catalog.clear()
+    client.app.state.pay_catalog = pay.CatalogCache()
     respx.get(CATALOG_URL).mock(side_effect=httpx.ConnectError("down"))
     down = await _buy(client)
     assert (down.status_code, down.json()["error"]["type"]) == (503, "pay_unavailable")
@@ -536,7 +536,7 @@ async def test_a_pack_checkout_is_for_a_paid_plan_and_a_pack_on_sale(make_client
     # A deployment that configures no pack sells none, whatever Pay prices.
     bare = make_client(**PAY_SETTINGS)
     await _signed_in(bare)  # the same user, on Pro already
-    bare.app.state.pay_catalog.clear()
+    bare.app.state.pay_catalog = pay.CatalogCache()
     respx.get(CATALOG_URL).mock(return_value=httpx.Response(200, json=_catalog()))
     none = await _buy(bare)
     assert (none.status_code, none.json()["error"]["type"]) == (409, "checkout_unavailable")

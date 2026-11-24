@@ -15,11 +15,13 @@ from sightread.billing.credits import (
     parse_model_prices,
 )
 from sightread.billing.plans import (
+    FREE,
     FREE_PLAN_ID,
+    SUBSCRIPTION,
     Plan,
-    current_period,
     month_bounds,
     parse_plans,
+    resolve_period,
 )
 from sightread.config import Settings
 from sightread.db.models import Subscription
@@ -57,7 +59,6 @@ def test_a_turn_is_priced_from_its_tokens_and_rounded_up_once() -> None:
     assert credits_for_usd(Decimal("0.004"), CREDIT) == 2
     # Never under the floor, even for a free call.
     assert credits_for_usd(Decimal(0), CREDIT) == 1
-    assert credits_for_usd(Decimal(0), CREDIT, minimum=0) == 0
     with pytest.raises(ValueError):
         credits_for_usd(Decimal(1), Decimal(0))
 
@@ -182,16 +183,18 @@ def test_the_current_period_is_the_paid_one_only_while_it_holds() -> None:
     free = Plan(FREE_PLAN_ID, 150, 1, False, 1)
     plans = {"pro": Plan("pro", 5000, 2, True, 2)}
     now = datetime(2026, 10, 23, tzinfo=UTC)
-    paid = current_period(_subscription(), plans, free, now)
-    assert (paid.start, paid.end, paid.plan.id) == (
+    decision = resolve_period(_subscription(), None, plans, free, now, 30)
+    paid = decision.period
+    assert (paid.start, paid.end, paid.plan.id, paid.source) == (
         datetime(2026, 10, 15, tzinfo=UTC),
         datetime(2026, 11, 15, tzinfo=UTC),
         "pro",
+        SUBSCRIPTION,
     )
+    assert decision.grant is None
     # A scheduled cancellation changes nothing until the period ends.
-    assert (
-        current_period(_subscription(cancel_at_period_end=True), plans, free, now).plan.id == "pro"
-    )
+    cancelling = _subscription(cancel_at_period_end=True)
+    assert resolve_period(cancelling, None, plans, free, now, 30).period.plan.id == "pro"
     month = (datetime(2026, 10, 1, tzinfo=UTC), datetime(2026, 11, 1, tzinfo=UTC))
     for lapsed in (
         None,
@@ -201,5 +204,9 @@ def test_the_current_period_is_the_paid_one_only_while_it_holds() -> None:
         _subscription(period_end=datetime(2026, 10, 23, tzinfo=UTC)),  # ended at `now`
         _subscription(period_start=datetime(2026, 10, 24, tzinfo=UTC)),  # not yet
     ):
-        period = current_period(lapsed, plans, free, now)
-        assert (period.start, period.end, period.plan.id) == (*month, FREE_PLAN_ID)
+        period = resolve_period(lapsed, None, plans, free, now, 30).period
+        assert (period.start, period.end, period.plan.id, period.source) == (
+            *month,
+            FREE_PLAN_ID,
+            FREE,
+        )

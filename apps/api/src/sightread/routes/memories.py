@@ -4,6 +4,11 @@
 The Agent page lists, edits, pins and deletes them; a thread's Undo puts back what the
 agent's `memory` tool changed through the same routes. A text is cleaned and capped like
 the tool's, and the count is decided under the reader's row lock, as the tool decides it.
+
+Every write takes that lock (`lock_user`) first and holds it until the commit — the lock
+the `memory` tool takes before it reads whether memory is paused — so the writes apply in
+one order: an edit or a delete lands after an agent call already deciding, never under it
+(docs/chat.md § Memory).
 """
 
 from __future__ import annotations
@@ -15,8 +20,9 @@ from sqlalchemy.exc import IntegrityError
 
 from ..agents import memory as memory_defs
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
-from ..db.models import Conversation, Document, Memory, User, utcnow
+from ..db.models import Conversation, Document, Memory, utcnow
 from ..errors import ApiError
+from ..workspace.trash import lock_user
 from .chat import owned_conversation, owned_document
 
 router = APIRouter(prefix="/api", tags=["memories"])
@@ -103,14 +109,6 @@ async def _owned_memory(db: DbSession, user_id: int, memory_id: int) -> Memory:
     return row
 
 
-async def _lock_reader(db: DbSession, user_id: int) -> None:
-    """The reader's row, held until the commit — the lock the `memory` tool takes before it
-    reads whether memory is paused. Every write to the reader's memories takes it first, so
-    they apply in one order: an edit or a delete lands after an agent call already deciding,
-    never under it (docs/chat.md § Memory)."""
-    await db.execute(select(User.id).where(User.id == user_id).with_for_update())
-
-
 async def _commit(db: DbSession) -> None:
     try:
         await db.commit()
@@ -146,7 +144,7 @@ async def create_memory(
     if body.conversation_id is not None:
         await owned_conversation(db, user.id, body.conversation_id)
     # Two saves near the cap — this and the agent's tool — must not both count below it.
-    await _lock_reader(db, user.id)
+    await lock_user(db, user.id)
     count = (
         await db.execute(select(func.count()).select_from(Memory).where(Memory.user_id == user.id))
     ).scalar_one()
@@ -174,7 +172,7 @@ async def create_memory(
 async def update_memory(
     memory_id: int, body: MemoryUpdate, user: SessionUser, db: DbSession, settings: AppSettings
 ):
-    await _lock_reader(db, user.id)
+    await lock_user(db, user.id)
     row = await _owned_memory(db, user.id, memory_id)
     provided = body.model_fields_set
     for field in ("kind", "text", "pinned"):
@@ -199,7 +197,7 @@ async def update_memory(
     "/memories/{memory_id}", dependencies=[CsrfGuard], status_code=status.HTTP_204_NO_CONTENT
 )
 async def delete_memory(memory_id: int, user: SessionUser, db: DbSession) -> Response:
-    await _lock_reader(db, user.id)
+    await lock_user(db, user.id)
     row = await _owned_memory(db, user.id, memory_id)
     await db.delete(row)
     await db.commit()
@@ -209,7 +207,7 @@ async def delete_memory(memory_id: int, user: SessionUser, db: DbSession) -> Res
 @router.delete("/memories", dependencies=[CsrfGuard], status_code=status.HTTP_204_NO_CONTENT)
 async def clear_memories(user: SessionUser, db: DbSession) -> Response:
     """*Clear all memories*: every row goes; the switches on the agent's settings stay."""
-    await _lock_reader(db, user.id)
+    await lock_user(db, user.id)
     await db.execute(delete(Memory).where(Memory.user_id == user.id))
     await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

@@ -167,7 +167,7 @@ class Period:
     # What the period grants: the plan's credits, pro-rated for a granted period shorter
     # than `GRANT_PERIOD_DAYS` (docs/billing.md § Periods, *Granted days*).
     credits: int
-    source: str = SUBSCRIPTION
+    source: str
 
 
 @dataclass(frozen=True)
@@ -265,13 +265,3 @@ def resolve_period(
             )
     start, end = month_bounds(now)
     return Decision(Period(start, end, free, free.credits, FREE), grant)
-
-
-def current_period(
-    subscription: Subscription | None,
-    plans: dict[str, Plan],
-    free: Plan,
-    now: datetime,
-) -> Period:
-    """The period of a user with no granted days: the paid one or Free's month."""
-    return resolve_period(subscription, None, plans, free, now, 1).period
