@@ -744,7 +744,7 @@ export const CHAT_EVENT_NAMES: readonly ChatEvent['event'][] = [
 
 // --- sandbox (docs/sandbox.md) --------------------------------------------------
 
-export type SandboxState = 'stopped' | 'starting' | 'running' | 'unavailable'
+export type SandboxState = 'stopped' | 'running' | 'unavailable'
 
 interface SandboxStatus {
   state: SandboxState
@@ -1882,10 +1882,7 @@ interface AdminUsageFigures {
   completion_tokens: number
   cost: number
   estimated_cost: number
-  estimated_calls: number
   unpriced_calls: number
-  cache_read_tokens: number
-  cache_write_tokens: number
 }
 
 /** Whether a worker runs, as the worker lock says: `since` and `generation` only while

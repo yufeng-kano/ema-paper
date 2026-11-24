@@ -1411,7 +1411,7 @@ const cardError = ref<string | null>(null)
 /**
  * Revert writes the file as it was before the edit's commit, as a new commit; that new
  * commit is what *Apply again* reverts in turn, and so on — undo is itself a revision
- * (docs/workspace.md § Revisions). The revision list, newest first, names each one.
+ * (docs/workspace.md § Revisions).
  */
 async function toggleEdit(card: EditCard) {
   const state = cardState(card)
