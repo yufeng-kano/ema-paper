@@ -213,7 +213,6 @@ async def me(user: SessionUser, db: DbSession, settings: AppSettings):
             "email": user.email,
             "name": user.name,
             "picture": user.picture,
-            "created_at": user.created_at,
         },
         # The plan and the balance, so the shell shows them without a second request
         # (docs/billing.md § Routes).
@@ -509,27 +508,27 @@ def _agent_settings_payload(settings: AppSettings, agent: str, row: AgentSetting
         "model": _effective_model(settings, agent, row),
         # The user's own template; null for the agent's default (docs/agents.md).
         "prompt": row.prompt if row else None,
-        "effort": (row.effort if row and row.effort else EFFORT_DEFAULT),
+        "effort": row.effort if row else EFFORT_DEFAULT,
         # The chat agent's own: instructions appended after the prompt, the languages it
         # answers and translates into, and the memory switches (docs/agents.md).
         "instructions": row.instructions if row else None,
         "answer_language": row.answer_language if row else None,
         "translate_language": row.translate_language if row else None,
-        "memory_auto": row.memory_auto if row and row.memory_auto is not None else True,
-        "memory_paused": bool(row.memory_paused) if row else False,
+        "memory_auto": row.memory_auto if row else True,
+        "memory_paused": row.memory_paused if row else False,
         # And whether the worker compacts the reader's long conversations before their
         # cache expires (docs/chat.md § Compaction).
-        "idle_compact": row.idle_compact if row and row.idle_compact is not None else True,
+        "idle_compact": row.idle_compact if row else True,
         # The parse agent's own: the model a blocked page goes to — the deployment's, a
         # fact — and whether it goes there on its own (docs/parsing.md § Fallback model).
         "fallback_model": (settings.parse_fallback_model or None) if agent == PARSE.name else None,
-        "auto_fallback": bool(row.auto_fallback) if row else False,
+        "auto_fallback": row.auto_fallback if row else False,
         # And whether a PDF or an image uploaded on the Files page is converted on arrival:
         # off unless the reader turned it on (docs/workspace.md § Files).
-        "auto_convert": bool(row.auto_convert) if row else False,
+        "auto_convert": row.auto_convert if row else False,
         # The check agent's own: whether a Files upload is checked before it opens
         # (docs/parsing.md § Format check).
-        "auto_check": row.auto_check if row and row.auto_check is not None else True,
+        "auto_check": row.auto_check if row else True,
     }
 
 
@@ -886,9 +885,7 @@ async def put_memory_file(
 
 
 @router.get("/agents/{agent_name}/models")
-async def list_agent_models(
-    agent_name: str, user: SessionUser, db: DbSession, settings: AppSettings
-):
+async def list_agent_models(agent_name: str, user: SessionUser, settings: AppSettings):
     """The models the agent may run — the Agent page's model picker (docs/api.md)."""
     agent = _known_agent(agent_name)
     return {"data": await agent_models(settings, agent.name)}

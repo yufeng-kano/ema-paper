@@ -28,12 +28,12 @@ from starlette.formparsers import MultiPartException, MultiPartParser
 from ..agents import PARSE
 from ..auth.deps import (
     AppSettings,
+    BearerUser,
     DbSession,
     DocumentReader,
     DocumentWriter,
     JobReader,
     LibraryUser,
-    ReaderUser,
     TicketJobId,
     UploaderCaller,
 )
@@ -80,7 +80,7 @@ class ParseJson(BaseModel):
 
 
 @router.get("/models")
-async def list_models(user: ReaderUser, db: DbSession, settings: AppSettings):
+async def list_models(user: BearerUser, settings: AppSettings):
     """The models a parse may run (docs/api.md § GET /v1/models)."""
     return {"data": await agent_models(settings, PARSE.name)}
 

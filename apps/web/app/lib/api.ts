@@ -73,7 +73,6 @@ interface User {
   name: string | null
   /** Google avatar URL, refreshed on each sign-in; null for dev sign-in. */
   picture: string | null
-  created_at: string
 }
 
 /** The `chat` agent's reasoning effort — `output_config.effort` upstream (docs/chat.md). */

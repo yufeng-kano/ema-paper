@@ -8,22 +8,17 @@ rights, never `/mcp`.
 
 from __future__ import annotations
 
-import hmac
-import secrets
 import uuid
 from datetime import timedelta
 
-from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings
 from ..db.models import UploadTicket, User, utcnow
-from ..errors import ApiError
-from .crypto import hash_token
+from .crypto import hash_token, new_token
+from .tickets import check_rate, delete_expired, resolve_ticket
 
 TICKET_PREFIX = "srt_"
-TICKET_RANDOM_CHARS = 32
-MINT_WINDOW = timedelta(hours=1)
 
 # The agent's only recovery hint, so it travels in the 401 body itself (docs/auth.md § 5).
 REJECTION_MESSAGE = (
@@ -33,21 +28,16 @@ REJECTION_MESSAGE = (
 )
 
 
-def generate_ticket() -> str:
-    # token_urlsafe(24) is exactly 32 url-safe characters.
-    return TICKET_PREFIX + secrets.token_urlsafe(24)[:TICKET_RANDOM_CHARS]
-
-
 async def check_mint_rate(db: AsyncSession, settings: Settings, user_id: int) -> None:
     """429 once the user minted `UPLOAD_TICKET_RATE_PER_HOUR` tickets in the last hour:
     `mint`'s own check, and the parse tool's before it makes a folder for the ticket."""
-    minted = await db.scalar(
-        select(func.count())
-        .select_from(UploadTicket)
-        .where(UploadTicket.user_id == user_id, UploadTicket.created_at > utcnow() - MINT_WINDOW)
+    await check_rate(
+        db,
+        UploadTicket,
+        user_id,
+        settings.upload_ticket_rate_per_hour,
+        "Too many upload tickets minted; retry later",
     )
-    if minted >= settings.upload_ticket_rate_per_hour:
-        raise ApiError(429, "rate_limit", "Too many upload tickets minted; retry later")
 
 
 async def mint(
@@ -60,21 +50,16 @@ async def mint(
 ) -> tuple[UploadTicket, str]:
     """Issue a ticket for this user, tidying up their dead ones on the way.
 
-    The rate limit counts tickets *minted* in the last hour, before cleanup, so a short TTL
-    cannot dilute it. Commits, and returns the row plus the plaintext shown exactly once.
+    The rate limit counts tickets minted in the last hour, before cleanup. Commits, and
+    returns the row plus the plaintext shown exactly once.
 
     `into_library` and `folder_id` say where the upload is filed, decided here and never by
     the upload's own form (docs/auth.md § 5, docs/mcp.md § Filing into Files).
     """
     now = utcnow()
     await check_mint_rate(db, settings, user.id)
-
-    # Opportunistic cleanup in the same transaction: every mint tidies up, so the table
-    # stays small without a sweeper (docs/auth.md § 5).
-    await db.execute(
-        delete(UploadTicket).where(UploadTicket.user_id == user.id, UploadTicket.expires_at <= now)
-    )
-    token = generate_ticket()
+    await delete_expired(db, UploadTicket, user.id, now)
+    token, _ = new_token(TICKET_PREFIX)
     row = UploadTicket(
         user_id=user.id,
         token_hash=hash_token(token),
@@ -89,19 +74,8 @@ async def mint(
 
 
 async def resolve(db: AsyncSession, presented: str) -> tuple[UploadTicket, User] | None:
-    """Look a ticket up by hash and compare in constant time; None means "not a live ticket"."""
-    if not presented.startswith(TICKET_PREFIX):
-        return None
-    token_hash = hash_token(presented)
-    row = (
-        await db.execute(select(UploadTicket).where(UploadTicket.token_hash == token_hash))
-    ).scalar_one_or_none()
-    if row is None or not hmac.compare_digest(row.token_hash, token_hash):
-        return None
-    if row.expires_at <= utcnow():
-        return None
-    user = (await db.execute(select(User).where(User.id == row.user_id))).scalar_one_or_none()
-    return None if user is None else (row, user)
+    """Look a ticket up by its hash; None means "not a live ticket"."""
+    return await resolve_ticket(db, UploadTicket, TICKET_PREFIX, presented)
 
 
 def spend(ticket: UploadTicket, job_id: uuid.UUID) -> None:

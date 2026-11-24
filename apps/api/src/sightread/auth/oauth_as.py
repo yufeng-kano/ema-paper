@@ -140,9 +140,7 @@ async def _live_grant(db: AsyncSession, kind: str, presented: str) -> OAuthGrant
             select(OAuthGrant).where(OAuthGrant.kind == kind, OAuthGrant.token_hash == token_hash)
         )
     ).scalar_one_or_none()
-    if row is None or not hmac.compare_digest(row.token_hash, token_hash):
-        return None
-    if row.revoked_at is not None or row.expires_at <= utcnow():
+    if row is None or row.revoked_at is not None or row.expires_at <= utcnow():
         return None
     return row
 

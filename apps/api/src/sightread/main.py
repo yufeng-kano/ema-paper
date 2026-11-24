@@ -46,7 +46,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         # `create_engine` does not connect, so startup succeeds without a live database.
         engine = create_engine(settings.database_url)
-        app.state.engine = engine
         app.state.sessionmaker = create_sessionmaker(engine)
         try:
             # The MCP session manager owns the task group every streamable-HTTP request

@@ -9,21 +9,16 @@ lifetime does.
 
 from __future__ import annotations
 
-import hmac
-import secrets
 from datetime import timedelta
 
-from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings
 from ..db.models import DocumentTicket, User, utcnow
-from ..errors import ApiError
-from .crypto import hash_token
+from .crypto import hash_token, new_token
+from .tickets import check_rate, delete_expired, resolve_ticket
 
 TICKET_PREFIX = "srd_"
-TICKET_RANDOM_CHARS = 32
-MINT_WINDOW = timedelta(hours=1)
 READ = "read"
 WRITE = "write"
 
@@ -43,21 +38,15 @@ async def mint(
     tickets count theirs. Commits, and returns the row plus the plaintext shown once.
     """
     now = utcnow()
-    minted = await db.scalar(
-        select(func.count())
-        .select_from(DocumentTicket)
-        .where(DocumentTicket.user_id == user.id, DocumentTicket.created_at > now - MINT_WINDOW)
+    await check_rate(
+        db,
+        DocumentTicket,
+        user.id,
+        settings.document_ticket_rate_per_hour,
+        "Too many document tickets minted; retry later",
     )
-    if minted >= settings.document_ticket_rate_per_hour:
-        raise ApiError(429, "rate_limit", "Too many document tickets minted; retry later")
-
-    await db.execute(
-        delete(DocumentTicket).where(
-            DocumentTicket.user_id == user.id, DocumentTicket.expires_at <= now
-        )
-    )
-    # token_urlsafe(24) is exactly 32 url-safe characters.
-    token = TICKET_PREFIX + secrets.token_urlsafe(24)[:TICKET_RANDOM_CHARS]
+    await delete_expired(db, DocumentTicket, user.id, now)
+    token, _ = new_token(TICKET_PREFIX)
     row = DocumentTicket(
         user_id=user.id,
         document_id=document_id,
@@ -72,16 +61,5 @@ async def mint(
 
 
 async def resolve(db: AsyncSession, presented: str) -> tuple[DocumentTicket, User] | None:
-    """Look a ticket up by hash and compare in constant time; None means "not a live ticket"."""
-    if not presented.startswith(TICKET_PREFIX):
-        return None
-    token_hash = hash_token(presented)
-    row = (
-        await db.execute(select(DocumentTicket).where(DocumentTicket.token_hash == token_hash))
-    ).scalar_one_or_none()
-    if row is None or not hmac.compare_digest(row.token_hash, token_hash):
-        return None
-    if row.expires_at <= utcnow():
-        return None
-    user = (await db.execute(select(User).where(User.id == row.user_id))).scalar_one_or_none()
-    return None if user is None else (row, user)
+    """Look a ticket up by its hash; None means "not a live ticket"."""
+    return await resolve_ticket(db, DocumentTicket, TICKET_PREFIX, presented)

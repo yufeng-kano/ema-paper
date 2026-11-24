@@ -74,6 +74,24 @@ async def test_the_parse_and_check_models_are_the_deployments(signed_in, make_cl
     assert (await _settings_of(none, "parse"))["settings"]["model"] is None
 
 
+async def test_v1_models_takes_a_bearer_never_the_session_cookie(signed_in) -> None:
+    """The data plane is bearer-only (docs/api.md): a signed-in browser lists the parse
+    models with GET /api/agents/parse/models instead."""
+    refused = await signed_in.get("/v1/models")
+
+    assert refused.status_code == 401
+    assert refused.json()["error"]["message"] == "Missing bearer token"
+    assert refused.headers["WWW-Authenticate"] == "Bearer"
+
+    key = await signed_in.post("/api/keys", json={"name": "script"}, headers=CSRF_HEADERS)
+    listed = await signed_in.get(
+        "/v1/models", headers={"Authorization": f"Bearer {key.json()['key']}"}
+    )
+
+    assert listed.status_code == 200, listed.text
+    assert listed.json() == {"data": [{"id": PARSE_MODEL, "name": None}]}
+
+
 @pytest.mark.own_catalog
 @respx.mock
 async def test_the_chat_models_are_the_offered_ones_the_catalog_still_lists(signed_in) -> None:

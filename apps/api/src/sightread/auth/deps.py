@@ -86,6 +86,9 @@ async def require_bearer_user(request: Request, db: DbSession) -> User:
     return user
 
 
+BearerUser = Annotated[User, Depends(require_bearer_user)]
+
+
 @dataclass
 class Uploader:
     """Who is posting to `/v1/parse`: a durable credential, or one upload ticket."""
@@ -172,28 +175,18 @@ async def require_ticket_job(request: Request, db: DbSession) -> uuid.UUID:
 TicketJobId = Annotated[uuid.UUID, Depends(require_ticket_job)]
 
 
-async def _library_bearer(request: Request, db: AsyncSession) -> User:
+async def require_library_user(request: Request, db: DbSession) -> User:
     """The library on the data plane takes a durable credential: an API key or an OAuth
-    token (docs/api.md § The library on the data plane)."""
+    token, never a ticket (docs/api.md § The library on the data plane)."""
     credential = bearer_credential(request)
-    if credential is None:
-        raise ApiError(401, "auth", "Missing bearer token", headers={"WWW-Authenticate": "Bearer"})
-    if credential.startswith(document_tickets.TICKET_PREFIX):
+    if credential is not None and credential.startswith(document_tickets.TICKET_PREFIX):
         raise ApiError(
             401,
             "auth",
             "A document ticket reads only its own document; list the library with an API "
             "key, or with the connector's list_library tool",
         )
-    user = await resolve_bearer_identity(db, credential)
-    if user is None:
-        raise ApiError(401, "auth", "Invalid, expired or revoked credential")
-    return user
-
-
-async def require_library_user(request: Request, db: DbSession) -> User:
-    """`GET /v1/library`: a durable credential, never a ticket."""
-    return await _library_bearer(request, db)
+    return await require_bearer_user(request, db)
 
 
 LibraryUser = Annotated[User, Depends(require_library_user)]
@@ -205,7 +198,7 @@ async def _document_caller(request: Request, db: AsyncSession, scope: str) -> Us
     way the route still resolves the document as the caller's own and live."""
     credential = bearer_credential(request)
     if credential is None or not credential.startswith(document_tickets.TICKET_PREFIX):
-        return await _library_bearer(request, db)
+        return await require_bearer_user(request, db)
     resolved = await document_tickets.resolve(db, credential)
     if resolved is None:
         raise ApiError(401, "auth", document_tickets.REJECTION_MESSAGE)
@@ -228,17 +221,6 @@ async def require_document_writer(request: Request, db: DbSession) -> User:
 
 DocumentReader = Annotated[User, Depends(require_document_reader)]
 DocumentWriter = Annotated[User, Depends(require_document_writer)]
-
-
-async def require_reader_user(request: Request, db: DbSession) -> User:
-    """`GET /v1/models` is a safe read, so it accepts either a session cookie or a bearer
-    credential (docs/api.md)."""
-    if request.headers.get("authorization"):
-        return await require_bearer_user(request, db)
-    return await require_session_user(request, db)
-
-
-ReaderUser = Annotated[User, Depends(require_reader_user)]
 
 
 async def require_csrf_header(request: Request) -> None:

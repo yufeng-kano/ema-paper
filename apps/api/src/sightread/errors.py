@@ -10,7 +10,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .body_limit import BodyTooLarge
+from .body_limit import TOO_LARGE_MESSAGE, BodyTooLarge
 
 # `revision_conflict`: a save whose `base_revision` is not the file's current one — the
 # one 409 a client answers by reloading, apart from every other 409 (docs/api.md).
@@ -124,10 +124,7 @@ def install_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(BodyTooLarge)
     async def _body_too_large(_: Request, exc: BodyTooLarge) -> JSONResponse:
-        return JSONResponse(
-            {"error": {"type": "invalid_request", "message": "The request body is too large"}},
-            status_code=413,
-        )
+        return error_response(413, "invalid_request", TOO_LARGE_MESSAGE)
 
     @app.exception_handler(Exception)
     async def _unhandled(request: Request, exc: Exception) -> JSONResponse:
