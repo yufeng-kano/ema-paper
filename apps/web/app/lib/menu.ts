@@ -170,19 +170,17 @@ export function placeSubmenu(row: Rect, menu: Rect, sub: Size, viewport: Size): 
 /** How far a floating card keeps from the control it hangs from. */
 const CARD_GAP = 6
 
-export interface CardPlaceOptions {
+interface CardPlaceOptions {
   /** The side of the control the card opens on wherever it fits there. */
   prefer: 'above' | 'below'
-  gap?: number
-  margin?: number
 }
 
 /**
  * Where a floating card opens beside the control that opened it — the context ring's card
- * and the context card (docs/web.md § The agent panel): `gap` from the control, on the side
+ * and the context card (docs/web.md § The agent panel): `CARD_GAP` from the control, on the side
  * it prefers when it fits there, else on the other side when it fits there, else under.
  * Under, it is moved up as far as it must to end inside the window's margin, never past the
- * top one; over, it ends `gap` above the control. Its left edge is the control's, kept
+ * top one; over, it ends `CARD_GAP` above the control. Its left edge is the control's, kept
  * inside the window.
  */
 export function placeCard(
@@ -191,15 +189,13 @@ export function placeCard(
   viewport: Size,
   options: CardPlaceOptions,
 ): Point {
-  const gap = options.gap ?? CARD_GAP
-  const margin = options.margin ?? MARGIN
-  const fitsAbove = card.height <= anchor.top - gap - margin
-  const fitsBelow = card.height <= viewport.height - margin - (anchor.bottom + gap)
+  const fitsAbove = card.height <= anchor.top - CARD_GAP - MARGIN
+  const fitsBelow = card.height <= viewport.height - MARGIN - (anchor.bottom + CARD_GAP)
   const over = options.prefer === 'above' ? fitsAbove : fitsAbove && !fitsBelow
   return {
-    x: Math.max(margin, Math.min(anchor.left, viewport.width - margin - card.width)),
+    x: Math.max(MARGIN, Math.min(anchor.left, viewport.width - MARGIN - card.width)),
     y: over
-      ? anchor.top - gap - card.height
-      : Math.min(anchor.bottom + gap, Math.max(margin, viewport.height - margin - card.height)),
+      ? anchor.top - CARD_GAP - card.height
+      : Math.min(anchor.bottom + CARD_GAP, Math.max(MARGIN, viewport.height - MARGIN - card.height)),
   }
 }
