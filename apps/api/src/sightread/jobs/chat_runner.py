@@ -2059,7 +2059,7 @@ async def _drive_parse(ctx: TurnContext, job_id: uuid.UUID) -> Job | None:
             requeued = await requeue_job(db, job_id, ctx.generation)
         if requeued:
             # This attempt's crops go with it, as on a worker's shutdown (docs/jobs.md).
-            discard_job_figures(Path(settings.figures_dir), job_id)
+            await asyncio.to_thread(discard_job_figures, Path(settings.figures_dir), job_id)
             logger.info("job %s put back on the queue by the turn that drove it", job_id)
             return None
         # Finished before the cancel landed: its state is read on the next pass.

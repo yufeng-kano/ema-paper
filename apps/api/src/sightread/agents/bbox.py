@@ -17,7 +17,7 @@ from pathlib import Path
 from PIL import Image
 
 from ..parsing.images import JPEG_QUALITY
-from ..parsing.markdown import BBOX_MAX, PLACEHOLDER_RE
+from ..parsing.markdown import BBOX_MAX, PLACEHOLDER_RE, placeholder
 
 # The coordinate contract every result declares: [ymin, xmin, ymax, xmax], normalized
 # 0-1000, origin top-left.
@@ -229,15 +229,16 @@ def canonicalize(markdown: str, convention: BboxConvention, width_px: int, heigh
     def rewrite(match) -> str:
         # The pattern names its groups for the stored order; a pixel answer fills them in
         # the order it was asked for: x1, y1, x2, y2.
-        y_min, x_min, y_max, x_max = to_canonical(
-            tuple(int(match.group(name)) for name in ("ymin", "xmin", "ymax", "xmax")),
-            convention,
-            width_px,
-            height_px,
-        )
-        return (
-            f"![{match.group('alt')}](sightread://p{match.group('page')}/"
-            f"{y_min},{x_min},{y_max},{x_max})"
+        # The page stays the digits the model wrote: the group is an unbounded `\d+`.
+        return placeholder(
+            match.group("alt"),
+            match.group("page"),
+            to_canonical(
+                tuple(int(match.group(name)) for name in ("ymin", "xmin", "ymax", "xmax")),
+                convention,
+                width_px,
+                height_px,
+            ),
         )
 
     return PLACEHOLDER_RE.sub(rewrite, markdown)
