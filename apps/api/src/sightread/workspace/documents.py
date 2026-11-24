@@ -24,11 +24,11 @@ import stat
 import uuid
 import warnings
 from collections.abc import Collection, Iterable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 
 from PIL import Image, UnidentifiedImageError
-from sqlalchemy import Row, select
+from sqlalchemy import Row, func, select
 from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -330,10 +330,14 @@ async def live_document(db: AsyncSession, user_id: int, document_id: int) -> Doc
     return row
 
 
-def nearest_live(folders: dict[int, Folder], folder_id: int | None) -> int | None:
+def nearest_live(
+    folders: dict[int, Folder], folder_id: int | None, *, trashed: set[int] | None = None
+) -> int | None:
     """Where Put Back returns an item: the folder it was trashed from when that is live,
-    else the nearest live folder above it, else the top level (docs/api.md)."""
-    trashed = trashed_folder_ids(folders.values())
+    else the nearest live folder above it, else the top level (docs/api.md). `trashed` is
+    `trashed_folder_ids(folders)` when the caller has it already, as a listing does."""
+    if trashed is None:
+        trashed = trashed_folder_ids(folders.values())
     seen: set[int] = set()
     while folder_id is not None:
         row = folders.get(folder_id)
@@ -723,14 +727,17 @@ async def current_revision(db: AsyncSession, settings: Settings, document: Docum
         except (ApiError, OSError):
             return None
         return revision_of(baseline)
+    # The reading copy when there is one, else the result: one column sent, not both.
     row = (
         await db.execute(
-            select(Result.reading_markdown, Result.markdown).where(Result.job_id == document.job_id)
+            select(func.coalesce(Result.reading_markdown, Result.markdown)).where(
+                Result.job_id == document.job_id
+            )
         )
     ).one_or_none()
     if row is None:
         return None
-    return revision_of(row.reading_markdown if row.reading_markdown is not None else row.markdown)
+    return revision_of(row[0])
 
 
 async def ensure_within_quota(
@@ -1381,33 +1388,6 @@ async def take_reconvert(
 
 
 # --- revisions ----------------------------------------------------------------------------
-
-
-def _history(paths: DocumentPaths, limit: int = 100) -> list[git.Revision]:
-    """The directory's own log, merged with each fixed file's log followed through the
-    renames git detects: a document moved since keeps the revisions made before the move
-    (docs/workspace.md § Revisions). Newest first, one entry per commit."""
-    seen: dict[str, git.Revision] = {}
-    for relative, follow in (
-        (paths.relative, False),
-        (paths.doc_relative, True),
-        (paths.notes_relative, True),
-    ):
-        for revision in git.log(paths.root, relative, limit, follow=follow):
-            known = seen.get(revision.commit)
-            if known is None:
-                seen[revision.commit] = revision
-            elif set(revision.files) - set(known.files):
-                seen[revision.commit] = replace(
-                    known, files=known.files + tuple(set(revision.files) - set(known.files))
-                )
-    merged = sorted(seen.values(), key=lambda revision: revision.created_at, reverse=True)
-    return merged[:limit]
-
-
-async def revisions(db: AsyncSession, settings: Settings, document: Document) -> list[git.Revision]:
-    paths = await materialize_document(db, settings, document)
-    return await asyncio.to_thread(_history, paths)
 
 
 def _prune_empty(root: Path, directory: Path) -> None:

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 from fastapi import APIRouter, Query, Request, Response, status
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
@@ -57,7 +58,6 @@ from ..workspace import documents as workspace_documents
 from ..workspace import filing, git
 from ..workspace.layout import user_root
 from . import library
-from .library import figure_crop_response
 
 router = APIRouter(prefix="/v1", tags=["data"])
 
@@ -291,14 +291,7 @@ async def parse(request: Request, caller: UploaderCaller, db: DbSession, setting
 
     job = submission.job
     if wants_stream:
-        # The request's session is done: the stream opens its own, and one that lasts the
-        # whole parse must not hold a pool connection with it (docs/jobs.md § Progress).
-        await db.close()
-        return StreamingResponse(
-            events.stream_job_events(request.app.state.sessionmaker, settings.database_url, job.id),
-            media_type=SSE_MEDIA_TYPE,
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
+        return await _job_stream(request, db, settings, job.id)
     accepted = {"job_id": str(job.id), "status": job.status}
     if document_id is not None:
         accepted["document_id"] = document_id
@@ -306,6 +299,20 @@ async def parse(request: Request, caller: UploaderCaller, db: DbSession, setting
 
 
 # --- job reads ------------------------------------------------------------------------
+
+
+async def _job_stream(
+    request: Request, db: DbSession, settings: AppSettings, job_id: uuid.UUID
+) -> StreamingResponse:
+    """A job's progress stream. The request's session is done: the stream opens its own,
+    and one that lasts the whole parse must not hold a pool connection with it
+    (docs/jobs.md § Progress)."""
+    await db.close()
+    return StreamingResponse(
+        events.stream_job_events(request.app.state.sessionmaker, settings.database_url, job_id),
+        media_type=SSE_MEDIA_TYPE,
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 async def _owned_job(db: DbSession, job_id: uuid.UUID, user: User) -> Job:
@@ -334,7 +341,8 @@ async def _status_payload(db: DbSession, job: Job) -> dict:
 async def _stored_result(db: DbSession, job_id: uuid.UUID) -> Result:
     result = (await db.execute(select(Result).where(Result.job_id == job_id))).scalar_one_or_none()
     if result is None:
-        job = (await db.execute(select(Job).where(Job.id == job_id))).scalar_one_or_none()
+        # From the session where the route loaded it to check its owner; read otherwise.
+        job = await db.get(Job, job_id)
         if job is not None and job.status == "failed":
             # Final, not pending: "yet" would have an agent wait on a parse that is over.
             raise ApiError(
@@ -358,10 +366,7 @@ def _markdown_response(result: Result) -> PlainTextResponse:
 
 @router.get("/jobs/last")
 async def last_job_status(job_id: TicketJobId, db: DbSession):
-    job = (await db.execute(select(Job).where(Job.id == job_id))).scalar_one_or_none()
-    if job is None:
-        raise ApiError(404, "invalid_request", "No such job")
-    return await _status_payload(db, job)
+    return await _status_payload(db, await filing.job_of(db, job_id))
 
 
 @router.get("/jobs/last/result")
@@ -378,10 +383,7 @@ async def last_job_markdown(job_id: TicketJobId, db: DbSession):
 async def last_job_figure(
     page: int, bbox: str, job_id: TicketJobId, db: DbSession, settings: AppSettings
 ):
-    job = (await db.execute(select(Job).where(Job.id == job_id))).scalar_one_or_none()
-    if job is None:
-        raise ApiError(404, "invalid_request", "No such job")
-    return await figure_crop_response(settings, job, page, bbox)
+    return await library.figure_crop_response(settings, await filing.job_of(db, job_id), page, bbox)
 
 
 @router.get("/jobs/{job_id}")
@@ -412,7 +414,9 @@ async def job_figure(
 ):
     """One figure's crop, the one the web reader shows (docs/api.md § GET
     /v1/jobs/{id}/figures/…): the job's own, never another parse's."""
-    return await figure_crop_response(settings, await _owned_job(db, job_id, user), page, bbox)
+    return await library.figure_crop_response(
+        settings, await _owned_job(db, job_id, user), page, bbox
+    )
 
 
 @router.get("/jobs/{job_id}/events")
@@ -421,14 +425,7 @@ async def job_events(
 ):
     """Progress stream; a terminal job replays its final event at once (docs/api.md)."""
     await _owned_job(db, job_id, user)
-    # As the parse's own stream: no pool connection held for its length (docs/jobs.md
-    # § Progress).
-    await db.close()
-    return StreamingResponse(
-        events.stream_job_events(request.app.state.sessionmaker, settings.database_url, job_id),
-        media_type=SSE_MEDIA_TYPE,
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    return await _job_stream(request, db, settings, job_id)
 
 
 # --- the library (docs/api.md § The library on the data plane) ----------------------------
@@ -465,13 +462,10 @@ async def library_index(db, user_id: int) -> dict:
     """The live library from one snapshot, without the Trash: `GET /v1/library`, and the
     rows the connector's `list_library` filters (docs/mcp.md § The library tools).
 
-    One snapshot as `GET /api/library` takes it — the transaction that authenticated the
-    caller ended first, `REPEATABLE READ` asked for on the next where PostgreSQL offers it
-    — so no document is listed under a folder the same answer does not hold."""
-    await db.rollback()
-    if db.get_bind().dialect.name == "postgresql":
-        await db.connection(execution_options={"isolation_level": "REPEATABLE READ"})
-    folders = {row.id: row for row in await library.read_folders(db, user_id)}
+    One snapshot as `GET /api/library` takes it (`library.library_snapshot`), so no
+    document is listed under a folder the same answer does not hold."""
+    await library.library_snapshot(db)
+    folders = await workspace_documents.user_folders(db, user_id)
     trashed = workspace_documents.trashed_folder_ids(folders.values())
     rows = (
         await db.execute(
@@ -508,29 +502,34 @@ async def read_library(user: LibraryUser, db: DbSession):
     return await library_index(db, user.id)
 
 
-async def document_entry(db, settings, user_id: int, document_id: int) -> dict:
+async def document_entry(db, settings, user_id: int, document_id: int) -> tuple[dict, Path | None]:
     """One live document of the caller's as the data plane lists it, plus whether its
-    `…/original` answers (`answering_original`): `GET /v1/library/documents/{id}`, and the
-    `document` the connector's `read_document` and `write_document` answer with
-    (docs/mcp.md § The library tools)."""
-    row = await library.live_document(db, user_id, document_id)
-    job = await library.job_of(db, row.job_id) if row.job_id is not None else None
+    `…/original` answers: `GET /v1/library/documents/{id}`, and the `document` the
+    connector's `read_document` and `write_document` answer with (docs/mcp.md § The
+    library tools). Also returns what `…/original` answers with (`answering_original`),
+    whose suffix names the file `read_document`'s `original` command lands."""
+    row = await workspace_documents.owned_document(db, user_id, document_id)
     folders = await workspace_documents.user_folders(db, user_id)
-    root = user_root(settings.workspaces_dir, row.user_id)
-    original = job is not None and (
-        await workspace_documents.answering_original(db, root, row.id, job) is not None
-    )
-    return {
+    if not workspace_documents.is_live(row, folders):
+        raise ApiError(404, "invalid_request", "No such document")
+    job = await filing.job_of(db, row.job_id) if row.job_id is not None else None
+    source = None
+    if job is not None:
+        root = user_root(settings.workspaces_dir, row.user_id)
+        source = await workspace_documents.answering_original(db, root, row.id, job)
+    entry = {
         **library_entry(row, job, entry_path(folders, row.folder_id, row.name)),
-        "original": original,
+        "original": source is not None,
     }
+    return entry, source
 
 
 @router.get("/library/documents/{document_id}")
 async def read_library_document(
     document_id: int, user: DocumentReader, db: DbSession, settings: AppSettings
 ):
-    return await document_entry(db, settings, user.id, document_id)
+    entry, _ = await document_entry(db, settings, user.id, document_id)
+    return entry
 
 
 def _text_response(text: str, revision: str) -> PlainTextResponse:

@@ -21,6 +21,7 @@ from PIL import Image
 from sqlalchemy import select, update
 
 from sightread.auth.sessions import SESSION_COOKIE, create_session
+from sightread.billing import ledger
 from sightread.db.models import CreditPeriod, Document, Job, JobPage, UsageLog, User
 from sightread.workspace.documents import original_of
 from sightread.workspace.layout import user_root
@@ -217,8 +218,10 @@ async def test_a_retry_takes_the_credits_back_and_the_document_is_charged_once(
     await spend(0)
     assert (await _retry(client, uploaded["id"], model=FALLBACK)).status_code == 202
     await _drain_queue(client, sessionmaker)
-    row = await _row(client, uploaded["id"])
-    assert (row["status"], row["credits"]) == ("succeeded", 3)
+    assert (await _row(client, uploaded["id"]))["status"] == "succeeded"
+    job_id = uuid.UUID(uploaded["job_id"])
+    async with sessionmaker() as db:
+        assert await ledger.credits_by_job(db, [job_id]) == {job_id: 3}
     assert await spent() == 3
 
 

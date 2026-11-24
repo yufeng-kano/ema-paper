@@ -819,7 +819,6 @@ export interface LibraryFolder {
   parent_id: number | null
   name: string
   created_at: string
-  updated_at: string
 }
 
 /** The two views of a PDF or an image (docs/web.md § Result viewer, *Original and Markdown*). */
@@ -852,7 +851,6 @@ export interface LibraryDocument {
   storage_bytes: number | null
   error: string | null
   created_at: string
-  finished_at: string | null
   /** A failed parse's pages with no result — what a retry would send; null for any other
    *  (docs/api.md). */
   failed_pages: number | null
@@ -861,15 +859,12 @@ export interface LibraryDocument {
   checking: boolean
   /** The re-convert queued, running or failed — null when there is none. */
   reconvert: DocumentReconvert | null
-  /** What the parse cost once settled; null while its reservation is pending, which is
-   *  the whole of a queued or running parse (docs/billing.md § Routes). */
-  credits: number | null
   /** The view the document was last read in (`PUT …/view`); null until it was switched
    *  once, when the reader's `default_view` decides (docs/web.md § Result viewer, *Original
    *  and Markdown*). */
   view: DocumentView | null
   /** A parsed document: whether its original is kept, for the Original view (`…/original`);
-   *  null for a file or a markdown document, and where the library read did not look. */
+   *  null for a file or a markdown document. */
   original: boolean | null
 }
 
@@ -879,7 +874,6 @@ export interface LibraryDocument {
  * § Re-converting a document). The same fields as the row's own parse.
  */
 export interface DocumentReconvert {
-  job_id: string
   status: JobStatus
   model: string | null
   page_count: number | null
@@ -887,8 +881,6 @@ export interface DocumentReconvert {
   error: string | null
   failed_pages: number | null
   checking: boolean
-  created_at: string
-  finished_at: string | null
 }
 
 /** One page of a parse's selection, as the retry dialog lists it (docs/api.md). */

@@ -18,6 +18,7 @@ from sqlalchemy import select
 from sightread.db.models import Document, Job, Result
 from sightread.parsing.figures import crop_path
 from sightread.workspace import documents as workspace_documents
+from sightread.workspace import git
 from sightread.workspace.documents import original_of
 from sightread.workspace.layout import user_root
 from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL
@@ -92,6 +93,12 @@ def _directory(client: AsyncClient) -> Path:
     return user_root(client.app.state.settings.workspaces_dir, client.user_id) / "files/mixed.pdf"
 
 
+def _history(client: AsyncClient) -> list[git.Revision]:
+    """The commits that touched the uploaded PDF's directory, newest first."""
+    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
+    return git.log(root, Path("files/mixed.pdf"))
+
+
 async def _not_taken(*args, **kwargs) -> bool:
     """The worker stopped between the parse's terminal commit and the swap."""
     return False
@@ -129,11 +136,12 @@ async def test_the_document_keeps_its_version_until_the_new_parse_succeeds(
     # beside it on the row.
     row = await _row(library, uploaded["id"])
     assert (row["job_id"], row["status"]) == (uploaded["job_id"], "succeeded")
-    assert {key: row["reconvert"][key] for key in ("job_id", "status", "model")} == {
-        "job_id": new_job,
+    assert {key: row["reconvert"][key] for key in ("status", "model")} == {
         "status": "queued",
         "model": FALLBACK,
     }
+    async with sessionmaker() as db:
+        assert str((await db.get(Document, uploaded["id"])).reconvert_job_id) == new_job
     assert (await _content(library, uploaded["id"]))["markdown"].endswith("My edit.")
     # One at a time.
     assert (await _reconvert(library, uploaded["id"])).status_code == 409
@@ -161,15 +169,13 @@ async def test_the_document_keeps_its_version_until_the_new_parse_succeeds(
         FALLBACK,
     )
     # The swap is one revision, and the edit it replaced stays in the history before it.
-    revisions = (await library.get(f"/api/library/documents/{uploaded['id']}/revisions")).json()[
-        "revisions"
-    ]
-    assert revisions[0]["message"] == "reconvert files/mixed.pdf"
-    assert sorted(revisions[0]["files"]) == [
+    revisions = _history(library)
+    assert revisions[0].message == "reconvert files/mixed.pdf"
+    assert sorted(revisions[0].files) == [
         "files/mixed.pdf/.meta.json",
         "files/mixed.pdf/doc.md",
     ]
-    assert any(entry["message"] == "edit files/mixed.pdf/doc.md" for entry in revisions[1:])
+    assert any(entry.message == "edit files/mixed.pdf/doc.md" for entry in revisions[1:])
     # The new crops are in the shell's view, the earlier parse is still kept — the
     # retention's to delete (docs/jobs.md § Retention) — and the copy of the original the
     # run took is gone with it.
@@ -197,11 +203,12 @@ async def test_a_failed_reconvert_leaves_the_document_and_is_retried_or_dismisse
     # The document keeps its version, and the row says the re-convert failed.
     row = await _row(library, uploaded["id"])
     assert (row["job_id"], row["status"]) == (uploaded["job_id"], "succeeded")
-    assert {key: row["reconvert"][key] for key in ("job_id", "status", "failed_pages")} == {
-        "job_id": new_job,
+    assert {key: row["reconvert"][key] for key in ("status", "failed_pages")} == {
         "status": "failed",
         "failed_pages": 1,
     }
+    async with sessionmaker() as db:
+        assert str((await db.get(Document, uploaded["id"])).reconvert_job_id) == new_job
     assert (await _content(library, uploaded["id"]))["markdown"] == before["markdown"]
     # The pages a retry would send are the re-convert's.
     pages = (await library.get(f"/api/library/documents/{uploaded['id']}/pages")).json()
@@ -245,8 +252,10 @@ async def test_a_failed_reconvert_gives_way_to_a_new_one(library, sessionmaker, 
 
     again = await _reconvert(library, uploaded["id"], model=MODEL)
     assert again.status_code == 202, again.text
-    row = await _row(library, uploaded["id"])
-    assert row["reconvert"]["job_id"] == again.json()["job_id"] != failed
+    assert (await _row(library, uploaded["id"]))["reconvert"] is not None
+    async with sessionmaker() as db:
+        row = await db.get(Document, uploaded["id"])
+    assert str(row.reconvert_job_id) == again.json()["job_id"] != failed
 
 
 @respx.mock
@@ -363,10 +372,8 @@ async def test_a_swap_whose_commit_fails_leaves_the_files_ahead_for_the_next_tak
     assert (await _content(library, uploaded["id"]))["markdown"] == doc.read_text()
     row = await _row(library, uploaded["id"])
     assert (row["job_id"], row["reconvert"]) == (new_job, None)
-    revisions = (await library.get(f"/api/library/documents/{uploaded['id']}/revisions")).json()[
-        "revisions"
-    ]
-    assert [entry["message"] for entry in revisions].count("reconvert files/mixed.pdf") == 1
+    revisions = _history(library)
+    assert [entry.message for entry in revisions].count("reconvert files/mixed.pdf") == 1
 
 
 @respx.mock
@@ -400,10 +407,8 @@ async def test_a_swap_that_cannot_be_written_leaves_the_document_as_it_was_and_r
     assert (await _content(library, uploaded["id"]))["markdown"] == before["markdown"]
     assert (directory / "doc.md").read_text() == before["markdown"]
     assert (directory / ".meta.json").read_text() == meta
-    revisions = (await library.get(f"/api/library/documents/{uploaded['id']}/revisions")).json()[
-        "revisions"
-    ]
-    assert "reconvert files/mixed.pdf" not in [entry["message"] for entry in revisions]
+    revisions = _history(library)
+    assert "reconvert files/mixed.pdf" not in [entry.message for entry in revisions]
     row = await _row(library, uploaded["id"])
     assert (row["job_id"], row["reconvert"]["status"]) == (uploaded["job_id"], "succeeded")
     monkeypatch.undo()

@@ -136,11 +136,14 @@ async def test_a_file_of_any_kind_is_kept_once_in_the_tree(writer) -> None:
     assert [(row["id"], row["kind"], row["media_type"], row["size_bytes"]) for row in listed] == [
         (body["id"], "file", DOCX, len(data))
     ]
-    # A document's routes are not a file's.
+    # A document's routes are not a file's. A binary file is no revision, so the revert
+    # names a real one: a text file's upload.
+    await _kept(writer, "notes.txt", b"alpha\n", "text/plain")
+    head = git.log(writer.root)[0].commit
     base = f"/api/library/documents/{body['id']}"
     refused = [
         await writer.get(f"{base}/content"),
-        await writer.get(f"{base}/revisions"),
+        await writer.post(f"{base}/revisions/{head}/revert", headers=CSRF_HEADERS),
         await writer.get(f"{base}/result"),
         await writer.get(f"{base}/conversations"),
         await writer.post(f"{base}/conversations", headers=CSRF_HEADERS),

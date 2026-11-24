@@ -26,6 +26,7 @@ from sightread.db.models import (
     utcnow,
 )
 from sightread.parsing.figures import crop_path
+from sightread.workspace import git
 from sightread.workspace.layout import sources_dir, user_root
 from tests.conftest import CSRF_HEADERS, mcp_running
 from tests.test_mcp import _mcp_session, _payload
@@ -217,9 +218,9 @@ async def test_a_save_needs_the_etag_it_was_edited_from(reader: AsyncClient) -> 
     )
     assert again.status_code == 200, again.text
 
-    history = (await reader.get(f"/api/library/documents/{draft}/revisions")).json()["revisions"]
-    assert [entry["author"] for entry in history[:2]] == ["api", "api"]
-    assert history[0]["message"] == "edit files/Draft.md/doc.md"
+    history = git.log(reader.root, Path("files/Draft.md"))
+    assert [entry.author for entry in history[:2]] == ["api", "api"]
+    assert history[0].message == "edit files/Draft.md/doc.md"
 
 
 async def test_notes_save_the_same_way(reader: AsyncClient) -> None:

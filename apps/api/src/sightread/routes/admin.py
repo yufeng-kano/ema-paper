@@ -19,7 +19,7 @@ from fastapi import APIRouter, Body, Depends, Path, Query, Request, Response, st
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import String, and_, case, cast, distinct, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import aliased
+from sqlalchemy.orm import aliased, defer
 
 from ..admin import codes as admin_codes
 from ..admin import grants, groups
@@ -766,6 +766,7 @@ async def list_jobs(
             select(Job, User.email)
             .join(User, User.id == Job.user_id)
             .where(*filters)
+            .options(defer(Job.prompt, raiseload=True), defer(Job.check_prompt, raiseload=True))
             .order_by(Job.created_at.desc(), Job.id.desc())
             .limit(size)
             .offset((page - 1) * size)

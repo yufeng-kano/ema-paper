@@ -36,13 +36,12 @@ from starlette.types import Receive, Scope, Send
 from ..agents import PARSE
 from ..auth import document_tickets, upload_tickets
 from ..auth.deps import bearer_credential, resolve_bearer_identity
-from ..db.models import FILE_KIND, Document, Job, User
+from ..db.models import FILE_KIND, User
 from ..errors import ApiError, error_response
 from ..routes.v1 import FOLDER_PATH_MAX, document_entry, library_index
 from ..upstream.client import offered_models
-from ..workspace import documents as workspace_documents
 from ..workspace import filing
-from ..workspace.layout import path_segment, user_root
+from ..workspace.layout import path_segment
 
 MCP_PATH = "/mcp"
 PROTECTED_RESOURCE_PATH = "/.well-known/oauth-protected-resource"
@@ -460,16 +459,9 @@ def build_server(app: FastAPI) -> MCPServer:
         async with app.state.sessionmaker() as db:
             settings = await app.state.runtime_settings.current(db)
             user = await _current_user(db)
-            document = await document_entry(db, settings, user.id, document_id)
             # The suffix of what `…/original` answers with — the kept original, or the
             # upload until it is filed — names the file the `original` command lands.
-            source = None
-            if document["original"]:
-                row = await db.get(Document, document_id)
-                job = await db.get(Job, row.job_id)
-                source = await workspace_documents.answering_original(
-                    db, user_root(settings.workspaces_dir, user.id), document_id, job
-                )
+            document, source = await document_entry(db, settings, user.id, document_id)
             ticket, token = await document_tickets.mint(
                 db, settings, user, document_id, document_tickets.READ
             )
@@ -530,7 +522,7 @@ def build_server(app: FastAPI) -> MCPServer:
         async with app.state.sessionmaker() as db:
             settings = await app.state.runtime_settings.current(db)
             user = await _current_user(db)
-            document = await document_entry(db, settings, user.id, document_id)
+            document, _ = await document_entry(db, settings, user.id, document_id)
             if document["kind"] == FILE_KIND:
                 raise ApiError(
                     400,

@@ -162,10 +162,11 @@ async def test_a_trashed_document_leaves_the_tree_and_comes_back_whole(writer) -
     assert listed["trashed_at"] is not None
 
     # Nothing opens, edits, moves, copies or talks about it until it is put back.
+    head = git.log(writer.root)[0].commit
     base = f"/api/library/documents/{document['id']}"
     refused = [
         await writer.get(f"{base}/content"),
-        await writer.get(f"{base}/revisions"),
+        await writer.post(f"{base}/revisions/{head}/revert", headers=CSRF_HEADERS),
         await writer.get(f"{base}/conversations"),
         await writer.post(f"{base}/conversations", headers=CSRF_HEADERS),
         await writer.put(base, json={"name": "other.md"}, headers=CSRF_HEADERS),

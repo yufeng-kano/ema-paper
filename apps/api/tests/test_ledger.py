@@ -382,24 +382,24 @@ async def test_an_upload_the_balance_cannot_cover_is_refused_and_not_stored(
         assert (await db.execute(select(CreditEntry))).scalars().all() == []
 
 
-async def test_an_upload_reserves_its_pages_and_the_payloads_show_the_settled_cost(
+async def test_an_upload_reserves_its_pages_and_its_entry_shows_the_settled_cost(
     make_client, documents
 ) -> None:
     client = make_client(free_credits_per_period=5)
     await _ready_to_parse(client)
     created = await _upload(client, documents)
     assert created.status_code == 201, created.text
-    assert created.json()["credits"] is None  # reserved, not settled
     assert (await client.get("/api/me")).json()["credits_remaining"] == 4
-    job_id = created.json()["job_id"]
-    assert (await _read(client))["documents"][0]["credits"] is None
-
+    job_id = uuid.UUID(created.json()["job_id"])
     async with client.app.state.sessionmaker() as db:
+        # Reserved, not settled.
+        assert await ledger.credits_by_job(db, [job_id]) == {job_id: None}
         (entry,) = (await db.execute(select(CreditEntry))).scalars().all()
         assert (entry.kind, entry.amount, entry.state) == (ledger.PARSE, 1, ledger.RESERVED)
-        await ledger.settle_parse(db, __import__("uuid").UUID(job_id), "succeeded")
+        await ledger.settle_parse(db, job_id, "succeeded")
         await db.commit()
-    assert (await _read(client))["documents"][0]["credits"] == 1
+    async with client.app.state.sessionmaker() as db:
+        assert await ledger.credits_by_job(db, [job_id]) == {job_id: 1}
 
 
 async def test_a_send_without_the_minimum_balance_is_refused(make_client, tmp_path) -> None:

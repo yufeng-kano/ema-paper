@@ -128,7 +128,7 @@ async def test_materialize_writes_once_and_edits_commit_revisions(sessionmaker, 
         await documents.materialize_document(db, settings, document)
         assert paths.doc.read_text() == "# Title\n\nEdited\n"
 
-        history = await documents.revisions(db, settings, document)
+        history = git.log(paths.root, paths.relative)
         assert [entry.message for entry in history][:2] == [
             "edit files/Papers/paper.pdf/doc.md",
             "materialize files/Papers/paper.pdf",
@@ -138,7 +138,7 @@ async def test_materialize_writes_once_and_edits_commit_revisions(sessionmaker, 
         restored = (await documents.revert(db, settings, document, history[0].commit)).revision
         assert restored == content.revision
         assert paths.doc.read_text() == "# Title\n\nBody\n"
-        assert (await documents.revisions(db, settings, document))[0].message.startswith("revert")
+        assert git.log(paths.root, paths.relative)[0].message.startswith("revert")
 
 
 async def test_reconcile_follows_a_directory_the_shell_moved(sessionmaker, tmp_path) -> None:
@@ -197,8 +197,8 @@ async def test_revert_follows_a_rename(sessionmaker, tmp_path) -> None:
         await documents.write_content(
             db, settings, document, markdown="# Title\n\nEdited\n", base_revision=content.revision
         )
-        edit = (await documents.revisions(db, settings, document))[0]
         before = await documents.document_paths(db, settings, document)
+        edit = git.log(before.root, before.relative)[0]
         document.name = "renamed.pdf"
         await db.commit()
         after = await documents.document_paths(db, settings, document)
@@ -863,29 +863,6 @@ async def test_figure_crops_are_copied_file_by_file_and_never_through_a_link(
         assert not list(elsewhere.iterdir())
 
 
-async def test_the_history_follows_a_rename(sessionmaker, tmp_path) -> None:
-    settings = _settings(tmp_path)
-    async with sessionmaker() as db:
-        user, document = await _seed(db)
-        content = await documents.read_content(db, settings, document)
-        await documents.write_content(
-            db, settings, document, markdown="# Title\n\nEdited\n", base_revision=content.revision
-        )
-        edit = (await documents.revisions(db, settings, document))[0]
-        before = await documents.document_paths(db, settings, document)
-        document.name = "renamed.pdf"
-        await db.commit()
-        after = await documents.document_paths(db, settings, document)
-        await documents.move_path(settings, user.id, before.relative, after.relative)
-        history = await documents.revisions(db, settings, document)
-        # The move is the newest; the edit made under the old name is still listed.
-        assert history[0].commit != edit.commit
-        assert edit.commit in {revision.commit for revision in history}
-        assert "doc.md" in "".join(
-            next(revision for revision in history if revision.commit == edit.commit).files
-        )
-
-
 def test_missing_parents_are_made_through_descriptors(tmp_path) -> None:
     root = tmp_path / "ws" / "2"
     root.mkdir(parents=True)
@@ -916,7 +893,7 @@ async def test_a_revert_never_writes_over_what_sits_at_the_old_place(
         await db.commit()
         after = await documents.document_paths(db, settings, document)
         await documents.move_path(settings, user.id, before.relative, after.relative)
-        rename = (await documents.revisions(db, settings, document))[0]
+        rename = git.log(after.root, after.relative)[0]
         # The shell wrote a new file where the document's used to be.
         before.directory.mkdir()
         before.doc.write_text("newer")
@@ -980,7 +957,7 @@ async def test_a_revert_of_a_rename_that_also_edited_restores_the_bytes(
         (after_dir / "doc.md").write_text(original + "And a line the shell added\n")
         git.commit_all(before.root, "agent:1", "mv and edit from the shell")
         await reconcile.reconcile_user(db, settings, user.id)
-        shell = (await documents.revisions(db, settings, document))[0]
+        shell = git.log(before.root, after_dir.relative_to(before.root))[0]
         assert any(status == "R" for status, _, _ in git.changed_paths(before.root, shell.commit))
         await documents.revert(db, settings, document, shell.commit)
         # Back at the old path, with the bytes from before the commit.
@@ -1036,19 +1013,6 @@ def test_tree_sizes_never_follow_a_link(tmp_path) -> None:
     assert safe_io.tree_size(root, root / "link-dir") == 0
 
 
-def test_the_revision_log_is_bounded(tmp_path) -> None:
-    root = tmp_path / "ws" / "5"
-    root.mkdir(parents=True)
-    git.ensure_repo(root)
-    for index in range(git._log_files_max() + 50):
-        safe_io.write_text(root, root / "files" / f"f{index:04d}.txt", "x")
-    git.commit_all(root, "agent:1", "a flood of files")
-    (revision,) = git.log(root)
-    # The first LOG_FILES_MAX paths and a count of the rest, never the whole list.
-    assert len(revision.files) == git._log_files_max() + 1
-    assert revision.files[-1] == "... and 50 more"
-
-
 def test_a_revert_past_the_total_bound_is_refused_before_anything_moves(tmp_path) -> None:
     root = tmp_path / "ws" / "6"
     root.mkdir(parents=True)
@@ -1068,20 +1032,6 @@ def test_a_revert_past_the_total_bound_is_refused_before_anything_moves(tmp_path
     # Within the bound, the same revert goes through.
     documents._revert(paths, shell, max_bytes=10_000, total_max_bytes=10_000, max_paths=100)
     assert (root / "files" / "d" / "f0.txt").read_text() == "x" * 1000
-
-
-def test_a_revision_whose_list_reaches_the_bound_is_still_listed(tmp_path, monkeypatch) -> None:
-    root = tmp_path / "ws" / "7"
-    root.mkdir(parents=True)
-    git.ensure_repo(root)
-    for index in range(60):
-        safe_io.write_text(root, root / "files" / f"a-rather-long-file-name-{index:04d}.txt", "x")
-    git.commit_all(root, "agent:1", "many names")
-    monkeypatch.setattr(git, "_log_max_bytes", lambda: 600)
-    (revision,) = git.log(root)
-    assert revision.message == "many names"
-    assert revision.files[-1] == "... (list cut)"
-    assert 0 < len(revision.files) < 60
 
 
 def test_tree_sizes_survive_a_very_deep_tree(tmp_path) -> None:

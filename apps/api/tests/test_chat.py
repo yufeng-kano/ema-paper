@@ -158,6 +158,12 @@ async def chatting(make_client, tmp_path) -> AsyncClient:
     return client
 
 
+def _paper_history(client: AsyncClient) -> list[git.Revision]:
+    """The commits that touched the seeded document's directory, newest first."""
+    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
+    return git.log(root, Path("files/Papers/paper.pdf"))
+
+
 async def _run_queued_turn(client: AsyncClient) -> None:
     settings = client.app.state.settings
     async with client.app.state.sessionmaker() as db:
@@ -347,8 +353,8 @@ async def test_a_turn_edits_the_document_and_streams_its_events(chatting, monkey
     # The document changed on disk, as a revision.
     content = (await chatting.get(f"/api/library/documents/{document_id}/content")).json()
     assert "| Greedy | 3.45 |" in content["markdown"]
-    history = (await chatting.get(f"/api/library/documents/{document_id}/revisions")).json()
-    assert history["revisions"][0]["author"] == f"agent:{conversation_id}"
+    history = _paper_history(chatting)
+    assert history[0].author == f"agent:{conversation_id}"
 
     # The thread: user, assistant, tool results, assistant, tool results, assistant.
     thread = (await chatting.get(f"/api/conversations/{conversation_id}")).json()
@@ -387,7 +393,7 @@ async def test_a_turn_edits_the_document_and_streams_its_events(chatting, monkey
 
     # Revert the agent's edit from the thread.
     reverted = await chatting.post(
-        f"/api/library/documents/{document_id}/revisions/{history['revisions'][0]['commit']}/revert",
+        f"/api/library/documents/{document_id}/revisions/{history[0].commit}/revert",
         headers=CSRF_HEADERS,
     )
     assert reverted.status_code == 200
@@ -1837,8 +1843,7 @@ async def test_a_worker_starting_records_what_an_orphaned_turn_left_unrecorded(
     assert set(head.files) == {"files/Papers/paper.pdf/helper.py", "files/Papers/paper.pdf/doc.md"}
     # The tree is clean: a later tool's revision carries only its own changes.
     assert git.commit_all(paths.root, "user", "anything left?") is None
-    revisions = (await chatting.get(f"/api/library/documents/{document_id}/revisions")).json()
-    assert revisions["revisions"][0]["message"] == ORPHAN_REVISION_MESSAGE
+    assert _paper_history(chatting)[0].message == ORPHAN_REVISION_MESSAGE
 
 
 async def test_a_worker_starting_finishes_the_turns_a_dead_one_left(chatting) -> None:
@@ -2090,8 +2095,7 @@ async def test_a_delete_whose_commit_fails_keeps_the_edited_files(chatting, monk
     assert [row["id"] for row in listed] == [document_id]
     after = (await chatting.get(f"/api/library/documents/{document_id}/content")).json()
     assert after["markdown"] == "# Edited\n"
-    history = (await chatting.get(f"/api/library/documents/{document_id}/revisions")).json()
-    assert history["revisions"][0]["message"].startswith("restore ")
+    assert _paper_history(chatting)[0].message.startswith("restore ")
 
 
 async def test_a_shell_revision_beyond_the_document_waits_for_every_turn(chatting) -> None:
@@ -2835,9 +2839,7 @@ async def test_a_revert_is_refused_before_it_materializes(chatting) -> None:
         headers=CSRF_HEADERS,
     )
     assert saved.status_code == 200
-    commit = (await chatting.get(f"/api/library/documents/{document_id}/revisions")).json()[
-        "revisions"
-    ][0]["commit"]
+    commit = _paper_history(chatting)[0].commit
     conversation_id = (
         await chatting.post(
             f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS

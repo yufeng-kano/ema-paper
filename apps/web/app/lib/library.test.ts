@@ -28,7 +28,7 @@ import {
 } from './library'
 
 function folder(id: number, name: string, parent_id: number | null = null): LibraryFolder {
-  return { id, name, parent_id, created_at: '2026-08-01T00:00:00Z', updated_at: '2026-08-01T00:00:00Z' }
+  return { id, name, parent_id, created_at: '2026-08-01T00:00:00Z' }
 }
 
 function document(
@@ -50,13 +50,11 @@ function document(
     size_bytes: 2048,
     error: null,
     created_at: '2026-08-01T00:00:00Z',
-    finished_at: '2026-08-01T00:01:00Z',
     failed_pages: null,
     media_type: null,
     storage_bytes: null,
     checking: false,
     reconvert: null,
-    credits: null,
     view: null,
     original: null,
     ...overrides,
@@ -156,7 +154,6 @@ describe('parse state', () => {
 describe('re-convert state', () => {
   function reconvert(overrides: Partial<DocumentReconvert> = {}): DocumentReconvert {
     return {
-      job_id: 'job-new',
       status: 'running',
       model: 'vendor/other',
       page_count: 8,
@@ -164,8 +161,6 @@ describe('re-convert state', () => {
       error: null,
       failed_pages: null,
       checking: false,
-      created_at: '2026-08-02T00:00:00Z',
-      finished_at: null,
       ...overrides,
     }
   }

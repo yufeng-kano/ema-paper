@@ -36,13 +36,8 @@ def _timeout() -> float:
 
 def _log_max_bytes() -> int:
     """The most of a log, a rename list or a path list read into memory
-    (`WORKSPACE__log_max_bytes()`)."""
+    (`WORKSPACE_LOG_MAX_BYTES`)."""
     return int(get_settings().workspace_log_max_bytes)
-
-
-def _log_files_max() -> int:
-    """The paths a listed revision keeps (`WORKSPACE__log_files_max()`)."""
-    return int(get_settings().workspace_log_files_max)
 
 
 # The identities commits carry. An agent commit names its conversation in the author.
@@ -395,11 +390,11 @@ def move(root: Path, source: Path, target: Path) -> None:
     safe_io.rename(root, source, target)
 
 
-def log(
-    root: Path, relative: Path | None = None, limit: int = 100, *, follow: bool = False
-) -> list[Revision]:
-    """Newest first. `relative` narrows to commits touching that path; `follow` (one file
-    only) keeps going through the renames git detects."""
+def log(root: Path, relative: Path | None = None, limit: int = 100) -> list[Revision]:
+    """The commits newest first, each with the paths it touched; `relative` narrows them to
+    the commits touching that path. Nothing the service serves lists history: the tests
+    read a workspace's commits through this. Read up to `WORKSPACE_LOG_MAX_BYTES`, never
+    buffered whole; a record the bound cuts is dropped, the ones before it are complete."""
     if head(root) is None:
         return []
     args = [
@@ -408,43 +403,27 @@ def log(
         "--name-only",
         "--format=%x1e%H%x1f%an%x1f%aI%x1f%s",
     ]
-    if follow:
-        args.append("--follow")
     if relative is not None:
         args += ["--", _literal(relative)]
-    # Read up to a bound, never buffered whole: a shell revision can name any number of
-    # files, and the API must not hold them all to list a few commits. A cut-off record
-    # is dropped; the ones before it are complete.
     code, raw, truncated = _git_bounded(root, *args, max_bytes=_log_max_bytes())
     if code != 0 and not truncated:
         raise GitError("git log failed")
     records = raw.decode(errors="replace").split("\x1e")
-    cut = records[-1] if truncated else None
     if truncated:
         records = records[:-1]
     revisions: list[Revision] = []
-    for record in records + ([cut] if cut and "\n" in cut else []):
+    for record in records:
         if not record.strip():
             continue
         header, _, body = record.partition("\n")
-        commit, author, when, subject = (header.split("\x1f") + ["", "", "", ""])[:4]
-        if len(commit) != 40:
-            continue  # the cut fell inside the header: nothing reliable to list
-        names = [line for line in body.splitlines() if line.strip()]
-        if record is cut:
-            # The bound fell inside this revision's list: what fit, and a marker, rather
-            # than no revision at all (its last line may be half a name).
-            names = names[:-1] + ["... (list cut)"]
-        if len(names) > _log_files_max():
-            names = names[: _log_files_max()] + [f"... and {len(names) - _log_files_max()} more"]
-        files = tuple(names)
+        commit, author, when, subject = header.split("\x1f", 3)
         revisions.append(
             Revision(
                 commit=commit,
                 author=author,
                 message=subject,
                 created_at=datetime.fromisoformat(when).astimezone(UTC),
-                files=files,
+                files=tuple(line for line in body.splitlines() if line.strip()),
             )
         )
     return revisions
@@ -509,7 +488,7 @@ def show(root: Path, commit: str, relative: Path, max_bytes: int) -> str | None:
 
 def renames_since(root: Path, commit: str) -> dict[Path, Path]:
     """Where each path renamed after `commit` lives now: old path → current path, with
-    chains of renames followed in order. Read under `WORKSPACE__log_max_bytes()` like the log: a
+    chains of renames followed in order. Read under `WORKSPACE_LOG_MAX_BYTES` like the log: a
     history of renames past it raises rather than being held whole."""
     code, raw, truncated = _git_bounded(
         root,
@@ -549,7 +528,7 @@ def renames_since(root: Path, commit: str) -> dict[Path, Path]:
 def changed_paths(root: Path, commit: str) -> list[tuple[str, Path, Path | None]]:
     """What the commit did to each path: `A`dded, `M`odified, `D`eleted, `T`ype-changed
     or `R`enamed — for a rename, the old path and the new one. Read under
-    `WORKSPACE__log_max_bytes()`: a commit whose path list is larger raises."""
+    `WORKSPACE_LOG_MAX_BYTES`: a commit whose path list is larger raises."""
     code, raw, truncated = _git_bounded(
         root,
         "diff-tree",

@@ -408,13 +408,14 @@ async def _trash_entries(db: AsyncSession, user_id: int) -> list[tuple[str, Fold
             select(Document).where(Document.user_id == user_id, Document.trashed_at.is_not(None))
         )
     ).scalars()
+    trashed = workspace_documents.trashed_folder_ids(folders.values())
     entries: list[tuple[str, Folder | Document]] = []
     for row in folders.values():
         if row.trashed_at is not None:
-            home = workspace_documents.nearest_live(folders, row.parent_id)
+            home = workspace_documents.nearest_live(folders, row.parent_id, trashed=trashed)
             entries.append((item_path(folders, home, row.name), row))
     for row in documents:
-        home = workspace_documents.nearest_live(folders, row.folder_id)
+        home = workspace_documents.nearest_live(folders, row.folder_id, trashed=trashed)
         entries.append((item_path(folders, home, row.name), row))
     entries.sort(key=lambda entry: entry[1].trashed_at, reverse=True)
     return entries

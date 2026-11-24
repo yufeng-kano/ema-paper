@@ -18,6 +18,7 @@ from sqlalchemy import func, select
 
 from sightread.db.models import Document, Job
 from sightread.routes.library import DOCUMENT_NAME_MAX
+from sightread.workspace import git
 from sightread.workspace.documents import original_of
 from sightread.workspace.layout import user_root
 from tests.conftest import CSRF_HEADERS
@@ -72,7 +73,6 @@ NO_PARSE = {
     "pages_done": None,
     "size_bytes": None,
     "error": None,
-    "finished_at": None,
 }
 
 
@@ -190,8 +190,7 @@ async def test_a_new_document_starts_empty_and_takes_a_free_name(writer) -> None
     assert saved.status_code == 200, saved.text
     again = (await writer.get(f"/api/library/documents/{document['id']}/content")).json()
     assert again["markdown"] == "# Written here\n"
-    revisions = (await writer.get(f"/api/library/documents/{document['id']}/revisions")).json()
-    assert [entry["message"] for entry in revisions["revisions"]] == [
+    assert [entry.message for entry in git.log(writer.root, Path("files/Draft.md"))] == [
         "edit files/Draft.md/doc.md",
         "materialize files/Draft.md",
     ]
