@@ -50,9 +50,6 @@ const { t } = useI18n()
 
 function readStored(): { open: boolean; width: number } {
   const initial = { open: false, width: COLUMN_WIDTHS.agent.initial }
-  if (!import.meta.client) {
-    return initial
-  }
   try {
     const stored: unknown = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? 'null')
     if (!stored || typeof stored !== 'object') {
@@ -91,7 +88,7 @@ watch(open, (value) => {
 
 // --- the phone's sheet -------------------------------------------------------------------
 
-const narrowWindow = ref(import.meta.client && window.matchMedia(SHEET_QUERY).matches)
+const narrowWindow = ref(window.matchMedia(SHEET_QUERY).matches)
 let sheetQuery: MediaQueryList | null = null
 
 function onSheetChange(event: MediaQueryListEvent) {
@@ -351,7 +348,7 @@ defineExpose({
       "
       :aria-label="t('chat.panel')"
     >
-      <ChatPanel
+      <LazyChatPanel
         ref="chat"
         :document-id="null"
         :document-selection="() => null"
@@ -372,7 +369,7 @@ defineExpose({
             <span>{{ t('files.agentBack') }}</span>
           </button>
         </template>
-      </ChatPanel>
+      </LazyChatPanel>
     </aside>
   </div>
 </template>

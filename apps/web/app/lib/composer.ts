@@ -87,7 +87,7 @@ export function commandArguments(text: string, command: string): string {
 /** The extension a file is judged by: lower case, no dot, empty when it has none. */
 export function extensionOf(name: string): string {
   const dot = name.lastIndexOf('.')
-  return dot <= 0 || dot === name.length - 1 ? '' : name.slice(dot + 1).toLowerCase()
+  return dot <= 0 ? '' : name.slice(dot + 1).toLowerCase()
 }
 
 function bare(extension: string): string {

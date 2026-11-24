@@ -89,7 +89,7 @@ async function start() {
   letter-spacing: normal;
 }
 
-/* The file, under the verb — its name, then its kind and size, as in the re-convert dialog. */
+/* The file, under the verb: its name, then its kind and size. */
 .subject {
   margin-top: var(--space-1);
   overflow: hidden;

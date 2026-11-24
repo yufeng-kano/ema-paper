@@ -206,7 +206,7 @@ async function retry() {
   letter-spacing: normal;
 }
 
-/* The document, under the verb — a fact, as in the move dialog. */
+/* The document, under the verb, as a fact. */
 .subject {
   margin-top: var(--space-1);
   overflow: hidden;
@@ -228,8 +228,7 @@ async function retry() {
   font-size: var(--text-sm);
 }
 
-/* Bounded and scrolling, like the move dialog's tree: twelve pages must not push the
-   buttons off the screen. */
+/* Bounded and scrolling: twelve pages must not push the buttons off the screen. */
 .tiles {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(7.5rem, 1fr));

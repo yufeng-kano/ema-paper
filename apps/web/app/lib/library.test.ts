@@ -5,7 +5,6 @@ import type { DocumentReconvert, LibraryDocument, LibraryFolder, UploadLimits } 
 import {
   PAGE_FAILURE_REASONS,
   acceptsUpload,
-  canMoveFolder,
   checkFailureReason,
   childFolders,
   documentGlyph,
@@ -94,23 +93,10 @@ describe('folderPath', () => {
   })
 })
 
-describe('subtreeIds and canMoveFolder', () => {
+describe('subtreeIds', () => {
   it('collects a folder and everything under it', () => {
     expect([...subtreeIds(TREE, 1)].sort()).toEqual([1, 2, 3])
     expect([...subtreeIds(TREE, 4)]).toEqual([4])
-  })
-
-  it('refuses a move into the folder itself or its own subtree', () => {
-    const invoices = TREE[0]!
-    expect(canMoveFolder(TREE, invoices, 1)).toBe(false)
-    expect(canMoveFolder(TREE, invoices, 3)).toBe(false)
-    expect(canMoveFolder(TREE, invoices, 4)).toBe(true)
-  })
-
-  it('refuses a move that changes nothing', () => {
-    const q1 = TREE[2]!
-    expect(canMoveFolder(TREE, q1, 2)).toBe(false)
-    expect(canMoveFolder(TREE, q1, null)).toBe(true)
   })
 })
 
@@ -187,6 +173,10 @@ describe('acceptsUpload', () => {
     expect(acceptsUpload({ name: 'notes', type: '' }, limits)).toBe(false)
   })
 
+  it('reads a leading dot as part of the name, as the server does', () => {
+    expect(acceptsUpload({ name: '.pdf', type: '' }, limits)).toBe(false)
+  })
+
   it('defers to the server while the limits are still loading', () => {
     expect(acceptsUpload({ name: 'notes.txt', type: 'text/plain' }, null)).toBe(true)
   })
@@ -213,6 +203,10 @@ describe('isMarkdownUpload', () => {
   it('takes anything else for a parse', () => {
     expect(isMarkdownUpload({ name: 'report.pdf', type: 'application/pdf' }, limits)).toBe(false)
     expect(isMarkdownUpload({ name: 'notes.md', type: '' }, null)).toBe(false)
+  })
+
+  it('reads a leading dot as part of the name, as the server does', () => {
+    expect(isMarkdownUpload({ name: '.md', type: '' }, limits)).toBe(false)
   })
 })
 
@@ -297,18 +291,18 @@ describe('uploadCap', () => {
   }
 
   it('applies the cap intake applies: markdown, a parse, or a file kept as it is', () => {
-    expect(uploadCap({ name: 'notes.md', type: '' }, limits, true)).toBe(100)
-    expect(uploadCap({ name: 'paper.pdf', type: 'application/pdf' }, limits, true)).toBe(1000)
-    expect(uploadCap({ name: 'demo.mov', type: 'video/quicktime' }, limits, true)).toBe(5000)
-    expect(uploadCap({ name: 'mystery', type: '' }, limits, true)).toBe(5000)
+    expect(uploadCap({ name: 'notes.md', type: '' }, limits, true)).toEqual({ bytes: 100, as: 'markdown' })
+    expect(uploadCap({ name: 'paper.pdf', type: 'application/pdf' }, limits, true)).toEqual({ bytes: 1000, as: 'parse' })
+    expect(uploadCap({ name: 'demo.mov', type: 'video/quicktime' }, limits, true)).toEqual({ bytes: 5000, as: 'file' })
+    expect(uploadCap({ name: 'mystery', type: '' }, limits, true)).toEqual({ bytes: 5000, as: 'file' })
   })
 
   it('caps a PDF or an image as a file while the parse agent keeps them, which it does unless asked', () => {
-    expect(uploadCap({ name: 'paper.pdf', type: 'application/pdf' }, limits, false)).toBe(5000)
-    expect(uploadCap({ name: 'scan.jpg', type: 'image/jpeg' }, limits, false)).toBe(5000)
-    expect(uploadCap({ name: 'paper.pdf', type: 'application/pdf' }, limits)).toBe(5000)
+    expect(uploadCap({ name: 'paper.pdf', type: 'application/pdf' }, limits, false)).toEqual({ bytes: 5000, as: 'file' })
+    expect(uploadCap({ name: 'scan.jpg', type: 'image/jpeg' }, limits, false)).toEqual({ bytes: 5000, as: 'file' })
+    expect(uploadCap({ name: 'paper.pdf', type: 'application/pdf' }, limits)).toEqual({ bytes: 5000, as: 'file' })
     // Markdown is never parsed: the switch changes nothing for it.
-    expect(uploadCap({ name: 'notes.md', type: '' }, limits, false)).toBe(100)
+    expect(uploadCap({ name: 'notes.md', type: '' }, limits, false)).toEqual({ bytes: 100, as: 'markdown' })
   })
 
   it('names no cap while the limits are loading, or where an older API has none', () => {
@@ -421,7 +415,7 @@ describe('originalKind and initialView', () => {
   it('opens a failed parse on its original only where one was kept', () => {
     expect(failedWithOriginal(document(1, 'a.pdf', null, { status: 'failed', original: true }))).toBe(true)
     expect(failedWithOriginal(document(1, 'a.png', null, { kind: 'image', status: 'failed', original: true }))).toBe(true)
-    // None kept, or a read that did not look: the retry dialog, as before.
+    // None kept, or a read that did not look: the retry dialog.
     expect(failedWithOriginal(document(1, 'a.pdf', null, { status: 'failed', original: false }))).toBe(false)
     expect(failedWithOriginal(document(1, 'a.pdf', null, { status: 'failed', original: null }))).toBe(false)
     expect(failedWithOriginal(document(1, 'a.pdf', null, { status: 'succeeded', original: true }))).toBe(false)

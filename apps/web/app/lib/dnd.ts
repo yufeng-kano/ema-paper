@@ -42,7 +42,7 @@ export const NOTES_BLOCK_DRAG_TYPE = 'application/x-sightread-notes-block'
 export const ROWS_DRAG_TYPE = 'application/x-sightread-rows'
 
 /** What a handler claimed a drag event for. */
-export type DragClaim =
+type DragClaim =
   /** A folder is the destination under the pointer, and it is drawn as the target. */
   | 'target'
   /** The open folder's list is under the pointer — where dropped files land, and rows a
