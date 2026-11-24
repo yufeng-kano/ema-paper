@@ -71,7 +71,7 @@ function download() {
       <div class="bar">
         <span class="muted">{{ t('admin.codes.createdCount', { n: formatCount(count, locale) }, count) }}</span>
         <span class="actions">
-          <UiCopyButton :text="lines" labelled :label="t('admin.codes.copyAll')" variant="secondary" size="sm" />
+          <UiCopyButton :text="lines" labelled :label="t('admin.codes.copyAll')" size="sm" />
           <UiButton variant="secondary" size="sm" @click="download">
             <template #icon><UiIcon name="download" /></template>
             {{ t('admin.codes.downloadCsv') }}

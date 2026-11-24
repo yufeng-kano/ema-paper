@@ -634,7 +634,6 @@ async def convert_kept_file(
     *,
     user: User,
     row: Document,
-    model: str | None = None,
     view: str | None = None,
 ) -> Document:
     """A PDF or an image kept as a file becomes a document (docs/jobs.md § Converting a
@@ -676,7 +675,6 @@ async def convert_kept_file(
             chunks=fd_chunks(entry),
             media_type=media_type,
             filename=row.name,
-            model=model,
             reuse_in_flight=True,
             retain_source=True,
             check=True,

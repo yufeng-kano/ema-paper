@@ -68,11 +68,11 @@ The one exception is the operator console (`/admin`, [admin.md](./admin.md)): an
 
 The plans, from `GET /api/billing/catalog` read when the page opens ([billing.md](./billing.md) § Kano Pay).
 
-- **The public bar** every public page shares: the mark, *Pricing*, *Sign in*. A signed-in reader sees *Back to Files* in place of *Sign in*, on every public page: the session is read once the page loads (`GET /api/me`).
+- **The public bar** (§ Design system): the mark, the page's name (*Pricing* here, marked current), *Sign in*. A signed-in reader sees *Back to Files* in place of *Sign in*, on every public page that names itself: the session is read once the page loads (`GET /api/me`).
 - **The hero line**, centered and large (a flat credit per page, the model included).
 - **Two rounded plan cards** side by side, stacking on a phone:
-  - **Free**, from the catalog's `free` — its credits per month, its storage, its parses at once, whether it has the sandbox, files kept — with *Start free* (the sign-in page).
-  - One card per plan on sale, with Pay's price and cycle as the catalog gives them, its credits, storage, parses at once and sandbox — and, when the catalog sells a pack (`packs`), that credits can be topped up without waiting for the next period — with *Upgrade*.
+  - **Free**, from the catalog's `free` — its credits per month, its storage, its parses at once, whether it has the sandbox, files kept, the REST API and the MCP connector — with *Start free* (the sign-in page).
+  - One card per plan on sale, with Pay's price and cycle as the catalog gives them, its credits, storage, parses at once, sandbox, the REST API and the MCP connector — and, when the catalog sells a pack (`packs`), that credits can be topped up without waiting for the next period — with *Upgrade*.
 - **For a signed-in reader the cards follow their plan** (`plan` from `GET /api/me`):
   - The card of the plan they are on says *Current plan* in place of its action. The paid one adds *Manage*, the Usage section (`/files?settings=usage`).
   - *Upgrade* on a paid card starts Pay's checkout for that plan in this tab (`POST /api/billing/checkout`, the return landing on `/files?settings=billing`, which opens the Usage section, as that section's own *Upgrade*). Its refusal is said under the card.
@@ -130,12 +130,14 @@ The plans, from `GET /api/billing/catalog` read when the page opens ([billing.md
   - **Cookies.**
   - **Security.**
   - **The user's rights.**
+  - **Changes to this policy.**
 - **Refund**:
   - Dodo is the merchant of record.
   - A first subscription is refunded in full on request within 14 days of the purchase, and so is a top-up pack none of whose credits were spent.
   - A renewal is not, nor a pack once any of it was; cancelling in the portal before it is the way, the plan running to the end of its period.
   - A failed parse costs nothing, and an outage is credited or refunded pro rata on request.
   - How to ask, and where the money goes.
+  - Changes to this policy.
 - **The support address and the operator's name** are the deployment's (`GET /api/site`, [deployment.md](./deployment.md)), read when the page opens. The contact line and the operator line are printed only when the API gives them: nothing is typed into the page.
 
 ### The rates page
@@ -538,8 +540,8 @@ Apple's own look, held back: solid white content, the system font, continuous ro
   - `min-width: 0` on the grid tracks and the flex children is load-bearing: without it a table forces the region wider than the viewport instead of scrolling inside its panel.
   - The operator console's pages use the same layout: under `/admin` the sidebar's nav is the console's (§ Pages, [admin.md](./admin.md) § Pages) and everything else in the frame stays. There is no second layout, so the account menu, the drawer and the dialogs it opens are the same code.
 - Below 900px the sidebar goes behind a focus-trapped drawer — the same glass pane, sliding in from the left — opened from a menu button in a slim top bar, and a screen is one scroll.
-- The public pages — sign-in, pricing, the policies — are full-bleed and own their frame (`layout: false`, `PublicShell`):
-  - the public bar, a translucent glass bar that stays at the top as the page scrolls under it: the mark and name; at the right the page's name and *Sign in* as the bar's one small accent capsule;
+- The public pages — sign-in, pricing, the rates, the policies, Nuxt's error page — are full-bleed and own their frame (`layout: false`, `PublicShell`):
+  - the public bar, a translucent glass bar that stays at the top as the page scrolls under it: the mark and name; at the right, on a page that names itself, the page's name (marked current) and *Sign in* (*Back to Files* for a signed-in reader) as the bar's one small accent capsule; on the sign-in page and the error page, *Pricing* alone;
   - the page on `--desk` with its cards on `--paper`;
   - the public footer.
 - **Primitives** in `app/components/ui/`:
@@ -547,7 +549,7 @@ Apple's own look, held back: solid white content, the system font, continuous ro
   - `PageHeader`: the large title and what is beside it.
   - `Panel`: a scrolling body under an optional header, no border or shadow.
   - `Capsule`: a glass capsule of a toolbar's icon buttons — the screens' toolbars, the reader's header. A toggle that is on is in the accent tint; a button whose menu is open is filled.
-  - `Segmented`: the system's segmented control. Inline: a `--fill` track with the chosen segment raised on `--segment`. Or `glass`: the toolbar's 44px capsule — *Files · Trash*, *Theme*, the Agent section's tabs.
+  - `Segmented`: the system's segmented control. Inline: a `--fill` track with the chosen segment raised on `--segment`. Inline it is *Theme*, *Body margins*, *Open on*, the Agent section's tabs and the grant and code dialogs' kind. Or `glass`: the toolbar's 44px capsule — *Files · Trash*, the console's filters and ranges, the reader's pane switch.
   - `DataTable`: the only table markup, drawn as Finder's list.
     - Sentence-case 12px column headers in `--muted` over a hairline; `--row-height` rows with `--radius-md` ends and no stripes.
     - A row fills with `--fill-weak` only under a pointer that hovers, and otherwise only in a state its caller draws, such as Files' selection.
@@ -560,7 +562,7 @@ Apple's own look, held back: solid white content, the system font, continuous ro
   - `Button`: capsules — accent / secondary on `--fill` / ghost / danger, `icon-only` round, four sizes, `lg` being the toolbar's 44px.
   - `TextInput`: `text`, `email`, and — for the console's create dialog — `date` with `min`, and `inputmode="numeric"` for a whole number. A whole number is still a text field, with the numeric keypad, because a browser's `number` field hands over an empty string for what it cannot parse — `-`, `1e`, `abc` — and the field could then not say what is wrong.
   - `Select`.
-  - `Field`: label-less with an `aria-label` where the design has no visible label.
+  - `Field`: with `labelHidden` its `<label>` stays in the DOM, visually hidden (`sr-only`), for a control the design draws bare.
   - `CopyButton`: with `labelled`, its word is `label` when one is given — *Copy all* on the console's created codes — and *Copy* otherwise.
   - `UsageBar`: a 6px rounded accent bar on `--fill`.
   - `StatusDot`, `EmptyState`, `Banner`, `Skeleton`, `Spinner`, `ConfirmDialog`.

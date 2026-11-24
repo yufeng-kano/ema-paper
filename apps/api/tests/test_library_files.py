@@ -325,18 +325,6 @@ async def test_only_a_pdf_or_an_image_converts(writer) -> None:
     assert (await _convert(writer, zipped["id"])).status_code == 404
 
 
-async def test_a_conversion_names_only_the_parse_agents_models(writer, documents) -> None:
-    kept = await _kept(writer, "tiny.png", documents["png"].read_bytes(), "image/png")
-    refused = await _convert(writer, kept["id"], model="vendor/chat-model")
-    assert refused.status_code == 400, refused.text
-    # Refused whole: the file is where it was, the row still a file.
-    assert (writer.root / "files" / "tiny.png").is_file()
-    assert (await writer.get(f"/api/library/documents/{kept['id']}/file")).status_code == 200
-    async with writer.app.state.sessionmaker() as db:
-        assert (await db.get(Document, kept["id"])).kind == "file"
-        assert (await db.execute(select(Job))).scalars().all() == []
-
-
 # --- the caps -----------------------------------------------------------------------------
 
 

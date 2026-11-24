@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import en from '../../i18n/locales/en'
 import zhTW from '../../i18n/locales/zh-TW'
-import type { DocumentReconvert, LibraryDocument, LibraryFolder, UploadLimits } from './api'
+import type { LibraryDocument, LibraryFolder, UploadLimits } from './api'
 import {
   PAGE_FAILURE_REASONS,
   acceptsUpload,
@@ -152,6 +152,8 @@ describe('parse state', () => {
 })
 
 describe('re-convert state', () => {
+  type DocumentReconvert = NonNullable<LibraryDocument['reconvert']>
+
   function reconvert(overrides: Partial<DocumentReconvert> = {}): DocumentReconvert {
     return {
       status: 'running',

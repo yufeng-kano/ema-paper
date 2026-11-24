@@ -9,7 +9,7 @@ import { formatCount, formatMinorAmount, packValidity } from '~/lib/format'
  * as Pay gives it, its credits and validity as this deployment configures them.
  */
 export function useTopUp() {
-  const { t, locale } = useI18n()
+  const { t } = useI18n()
   const { resolve } = useApiError()
 
   /** The pack as the catalog describes it, on sale or not: the Usage section says what a
@@ -39,18 +39,7 @@ export function useTopUp() {
     return pack.value
   }
 
-  const price = computed(() =>
-    listed.value ? formatMinorAmount(listed.value.amount, listed.value.currency, locale.value) : '',
-  )
-  const credits = computed(() => (listed.value ? formatCount(listed.value.credits, locale.value) : ''))
-  /** `12 months`, or the days when the validity is not a whole number of months. */
-  const validity = computed(() => {
-    if (!listed.value) {
-      return ''
-    }
-    const { unit, n } = packValidity(listed.value.valid_days)
-    return t(`topUp.${unit}`, { n: formatCount(n, locale.value) }, n)
-  })
+  const { price, credits, validity } = usePackWords(listed)
 
   /** Pay's checkout for the pack; the catalog is read first where it was not yet. */
   async function buy() {
@@ -75,4 +64,27 @@ export function useTopUp() {
   }
 
   return { listed, pack, loaded, load, price, credits, validity, buy, buying, error }
+}
+
+/**
+ * A pack's words, empty while there is none: its price as Pay gives it, its credits, and
+ * its validity — `12 months`, or the days when the validity is not a whole number of
+ * months. The pricing page names the pack it reads as the top-up flow does.
+ */
+export function usePackWords(pack: Ref<CatalogPack | null>) {
+  const { t, locale } = useI18n()
+
+  const price = computed(() =>
+    pack.value ? formatMinorAmount(pack.value.amount, pack.value.currency, locale.value) : '',
+  )
+  const credits = computed(() => (pack.value ? formatCount(pack.value.credits, locale.value) : ''))
+  const validity = computed(() => {
+    if (!pack.value) {
+      return ''
+    }
+    const { unit, n } = packValidity(pack.value.valid_days)
+    return t(`topUp.${unit}`, { n: formatCount(n, locale.value) }, n)
+  })
+
+  return { price, credits, validity }
 }

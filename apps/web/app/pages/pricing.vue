@@ -11,7 +11,7 @@
  */
 import { createCheckout, getBillingCatalog, type CatalogPlan, type CatalogResponse } from '~/lib/api'
 import { CYCLE_INTERVALS } from '~/lib/billing'
-import { formatBytes, formatCount, formatMinorAmount, packValidity } from '~/lib/format'
+import { formatBytes, formatCount, formatMinorAmount } from '~/lib/format'
 import { SETTINGS_QUERY, keepAfterSignIn } from '~/lib/settings'
 
 definePageMeta({ layout: false })
@@ -51,15 +51,7 @@ const hasChatRates = computed(() => Object.keys(catalog.value?.rates.chat ?? {})
  *  question stand only then (docs/billing.md § Top-up packs). No button here: a pack is
  *  bought where the reader is signed in, the Usage section or the credits dialog. */
 const pack = computed(() => catalog.value?.packs[0] ?? null)
-const packPrice = computed(() => (pack.value ? formatMinorAmount(pack.value.amount, pack.value.currency, locale.value) : ''))
-/** `12 months`, or the days when the validity is not a whole number of months. */
-const validity = computed(() => {
-  if (!pack.value) {
-    return ''
-  }
-  const { unit, n } = packValidity(pack.value.valid_days)
-  return t(`topUp.${unit}`, { n: formatCount(n, locale.value) }, n)
-})
+const { price: packPrice, validity } = usePackWords(pack)
 
 /** `month`, `3 months`, `week` — as Pay reports the cycle, worded and pluralized by the
  *  catalog for every interval it knows; an interval it does not know is printed as Pay

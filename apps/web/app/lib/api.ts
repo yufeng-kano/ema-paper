@@ -44,8 +44,8 @@ export type ApiErrorType =
 export class ApiRequestError extends Error {
   readonly status: number
   readonly type: ApiErrorType
-  /** The envelope's other fields — a 402's `need`, `remaining`, `period_end`
-   *  (docs/api.md § Errors); empty for every other error. */
+  /** The envelope's other fields — a 402's `need`, `remaining`, `period_end`, a console
+   *  409's `reason` (and `impact`) (docs/api.md § Errors); empty when the envelope has none. */
   readonly details: Record<string, unknown>
 
   constructor(status: number, type: ApiErrorType, message: string, details: Record<string, unknown> = {}) {
@@ -878,7 +878,7 @@ export interface LibraryDocument {
  * succeeds and until then only points at — the version it has opens as before (docs/jobs.md
  * § Re-converting a document). The same fields as the row's own parse.
  */
-export interface DocumentReconvert {
+interface DocumentReconvert {
   status: JobStatus
   model: string | null
   page_count: number | null
@@ -1640,7 +1640,7 @@ export interface AdminGroupDetail {
 }
 
 /** One page of a console list: `page` counts from 1, `total` counts every row. */
-export interface AdminList<T> {
+interface AdminList<T> {
   items: T[]
   total: number
   page: number
@@ -1691,7 +1691,7 @@ export interface AdminGrantFacts {
   max_days: number
 }
 
-export interface AdminUsersResponse extends AdminList<AdminUser> {
+interface AdminUsersResponse extends AdminList<AdminUser> {
   /** `free` first, then the configured plans, each with how many accounts are on it now —
    *  whatever the search and the filter say. */
   plans: { id: string; accounts: number }[]
@@ -1920,7 +1920,7 @@ export interface AdminJob {
   stuck: boolean
 }
 
-export interface AdminJobsResponse extends AdminList<AdminJob> {
+interface AdminJobsResponse extends AdminList<AdminJob> {
   /** Every job on record by status, whatever the filter. */
   counts: Record<JobStatus, number>
   worker: AdminWorker

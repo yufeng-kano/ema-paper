@@ -264,7 +264,7 @@ It is an upload's parse run late:
 
 - **The file becomes the job's source.** Under the workspace lock the route:
   1. reads the file in place and copies it into the upload directory, hashed on the way as an upload is and named `{job_id}.<ext>`; a file over `UPLOAD_MAX_BYTES` answers 413 and nothing is queued;
-  2. queues the parse with the parse agent's settings of its moment: the model the reader named, else the agent's own; its prompt; its fallback; the format check ([agents.md](./agents.md) § Enqueue rules);
+  2. queues the parse with the parse agent's settings of its moment: its model; its prompt; its fallback; the format check ([agents.md](./agents.md) § Enqueue rules);
   3. moves the file out of the tree, aside as a delete moves a directory;
   4. turns the row into a parse naming the job: `kind` `parse`, `job_id` set, `media_type` and `size_bytes` cleared, `view` set to the one the request named, if any (the result viewer names `markdown`, [api.md](./api.md)).
   - The parse is committed as an upload's is, and the row in a commit of its own. A row that does not commit brings the file back from aside; once it has committed, the copy aside is discarded.

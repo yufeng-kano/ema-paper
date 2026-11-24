@@ -1389,8 +1389,8 @@ async def document_page_image(
 
 class ModelChoice(BaseModel):
     """The model a parse runs on, its padding stripped. None or a blank name is the
-    default: a retry sends the failed pages to the job's own model, a re-convert or a
-    convert runs on the parse agent's."""
+    default: a retry sends the failed pages to the job's own model, a re-convert runs on
+    the parse agent's."""
 
     model: str | None = Field(default=None, max_length=255)
 
@@ -1788,7 +1788,7 @@ async def put_document_view(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-class DocumentConvert(ModelChoice):
+class DocumentConvert(BaseModel):
     # The view the document opens on once converted: the result viewer names `markdown`
     # when the reader asked for it there (docs/api.md).
     view: str | None = Field(default=None, max_length=16)
@@ -1818,7 +1818,7 @@ async def convert_document(
         row = await live_document(db, user_id, document_id)
         if row.kind != FILE_KIND:
             raise ApiError(404, "invalid_request", "No such file")
-        row = await convert_kept_file(db, settings, user=user, row=row, model=body.model, view=view)
+        row = await convert_kept_file(db, settings, user=user, row=row, view=view)
     return await read_document_payload(db, settings, row)
 
 

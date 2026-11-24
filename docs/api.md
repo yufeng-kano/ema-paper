@@ -859,7 +859,7 @@ A `.md` or `.markdown` file, or one sent as `text/markdown`, other than an `AGEN
 
 **`POST /api/library/documents/{id}/convert`**
 
-- JSON `{model?, view?}`. `model` is as for `…/reconvert`.
+- JSON `{view?}`.
 - `view` (`original` or `markdown`, **400** otherwise, absent or `null` for none) is written to the row as the view the document opens on. That is how *Markdown* chosen in the result viewer makes the document open on Markdown once it is converted ([web.md](./web.md) § Result viewer, *Original and Markdown*).
 - Only a file intake would parse — a PDF or an image — converts: **409** `not_convertible` otherwise; 404 for a document.
 - Under the workspace lock, the file is read in place and copied into the upload directory as the job's source, hashed on the way as an upload is, so a file over `UPLOAD_MAX_BYTES` answers **413** before anything is queued.
