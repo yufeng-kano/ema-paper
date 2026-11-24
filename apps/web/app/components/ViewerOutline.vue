@@ -56,7 +56,7 @@ const currentAt = computed(() => (fit.value ? currentTick(fit.value, props.curre
 const open = ref(false)
 const nav = ref<HTMLElement | null>(null)
 const button = ref<HTMLButtonElement | null>(null)
-const panel = ref<{ root: HTMLElement | null; focusCurrent: () => void } | null>(null)
+const panel = ref<{ focusCurrent: () => void } | null>(null)
 let restTimer: ReturnType<typeof setTimeout> | undefined
 let closeTimer: ReturnType<typeof setTimeout> | undefined
 
@@ -101,7 +101,7 @@ function onLeaveRegion(event: PointerEvent) {
   clearTimeout(restTimer)
   clearTimeout(closeTimer)
   if (open.value && event.pointerType !== 'touch') {
-    closeTimer = setTimeout(() => hide(panel.value?.root?.contains(document.activeElement) ?? false), CLOSE_MS)
+    closeTimer = setTimeout(() => hide(nav.value?.contains(document.activeElement) ?? false), CLOSE_MS)
   }
 }
 
@@ -227,7 +227,6 @@ onBeforeUnmount(() => {
 }
 
 .ticks.glyph {
-  align-items: center;
   height: 24px;
   padding: 0;
   color: var(--faint);

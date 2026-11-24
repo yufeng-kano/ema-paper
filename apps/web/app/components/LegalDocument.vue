@@ -10,7 +10,7 @@
  */
 import { getSite, type SiteInfo } from '~/lib/api'
 import { formatDate } from '~/lib/format'
-import { LEGAL_UPDATED, type LegalDoc } from '~/lib/legal'
+import { LEGAL_UPDATED, legalSections, type LegalDoc } from '~/lib/legal'
 
 const props = defineProps<{ doc: LegalDoc }>()
 
@@ -43,14 +43,10 @@ interface Section {
 /** The catalog's numbered sections, `s1Title`/`s1Body` on; a body's blank line is a break. */
 const sections = computed<Section[]>(() => {
   const named = { name: t('app.name') }
-  const found: Section[] = []
-  for (let n = 1; te(`legal.${props.doc}.s${n}Title`, locale.value); n += 1) {
-    found.push({
-      title: t(`legal.${props.doc}.s${n}Title`),
-      paragraphs: t(`legal.${props.doc}.s${n}Body`, named).split('\n\n'),
-    })
-  }
-  return found
+  return legalSections((key) => te(`legal.${props.doc}.${key}`, locale.value)).map((n) => ({
+    title: t(`legal.${props.doc}.s${n}Title`),
+    paragraphs: t(`legal.${props.doc}.s${n}Body`, named).split('\n\n'),
+  }))
 })
 </script>
 

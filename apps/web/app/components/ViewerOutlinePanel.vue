@@ -56,7 +56,7 @@ function onKey(event: KeyboardEvent) {
 // Opened scrolled to the current row, which is where a reader looks first.
 onMounted(() => currentRow()?.scrollIntoView({ block: 'center' }))
 
-defineExpose({ root, focusCurrent })
+defineExpose({ focusCurrent })
 </script>
 
 <template>
@@ -113,7 +113,6 @@ defineExpose({ root, focusCurrent })
 <style scoped>
 /* The menu's floating surface; where it stands is its opener's to say. */
 .panel {
-  pointer-events: auto;
   width: 264px;
   overflow-y: auto;
   overscroll-behavior: contain;

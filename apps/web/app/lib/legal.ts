@@ -13,10 +13,12 @@ export const LEGAL_UPDATED: Record<LegalDoc, string> = {
   refund: '2026-10-26',
 }
 
-/** The numbered section keys a catalog holds for a document, in order. */
-export function legalSections(catalog: Record<string, unknown>): number[] {
+/** The numbered sections a document's catalog holds, in order, read through `has`, which says
+ *  whether a key (`s1Title`, `s1Body`, …) is there: the walk stops at the first number
+ *  missing its title or its body. */
+export function legalSections(has: (key: string) => boolean): number[] {
   const found: number[] = []
-  for (let n = 1; `s${n}Title` in catalog && `s${n}Body` in catalog; n += 1) {
+  for (let n = 1; has(`s${n}Title`) && has(`s${n}Body`); n += 1) {
     found.push(n)
   }
   return found

@@ -2384,47 +2384,14 @@ defineExpose({
   color: var(--faint);
 }
 
-/* A figure or an image in the editor, drawn as `MdBlock` draws one (its styles are scoped
-   there): centered, the picture at the column's width and never more, the caption faint. */
+/* A figure or an image in the editor is styled as the document draws one (markdown.css
+   `.md-figure`), with no block gap above it and a shorter frame for a picture not loaded. */
 .rich :deep(.rich-figure) {
   margin: 0;
-  text-align: center;
-}
-
-.rich :deep(.rich-figure .figure-image) {
-  display: block;
-  margin-inline: auto;
-  max-width: 100%;
-  border: 1px solid var(--line-soft);
-  background: var(--paper);
 }
 
 .rich :deep(.rich-figure .figure-frame) {
-  display: flex;
-  align-items: center;
-  justify-content: center;
   height: 120px;
-  border: 1px dashed var(--edge);
-  background: var(--rail);
-  color: var(--faint);
-  font-size: var(--text-xs);
-}
-
-.rich :deep(.rich-figure .figure-note) {
-  display: inline-block;
-  margin: var(--space-2) 0 0;
-  padding: 0 var(--space-2);
-  background: var(--rail-active);
-  color: var(--ink-soft);
-  font-size: var(--text-xs);
-  line-height: 1.6;
-}
-
-.rich :deep(.rich-figure .figure-caption) {
-  margin-top: var(--space-2);
-  font-size: var(--text-xs);
-  line-height: 1.6;
-  color: var(--faint);
 }
 
 /* Selected as one atom: the surface a selected formula gets. */

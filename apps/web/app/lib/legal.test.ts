@@ -6,9 +6,9 @@ import { LEGAL_DOCS, LEGAL_UPDATED, legalSections } from './legal'
 describe('the policy pages', () => {
   it('have the same numbered sections in both catalogs, each with a title and a body', () => {
     for (const doc of LEGAL_DOCS) {
-      const ours = legalSections(en.legal[doc])
+      const ours = legalSections((key) => key in en.legal[doc])
       expect(ours.length).toBeGreaterThan(0)
-      expect(legalSections(zhTW.legal[doc])).toEqual(ours)
+      expect(legalSections((key) => key in zhTW.legal[doc])).toEqual(ours)
       // A section past the last contiguous number would never be shown.
       const highest = Math.max(...Object.keys(en.legal[doc]).map((key) => Number(/^s(\d+)Title$/.exec(key)?.[1] ?? 0)))
       expect(highest).toBe(ours.length)

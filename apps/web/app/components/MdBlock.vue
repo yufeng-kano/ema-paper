@@ -6,7 +6,7 @@
  * Every structural element keeps the class and `data-*` attribute copy-as-markdown and
  * find-in-document read: `md-h2`/`md-h3` with `data-level`, `md-p`, `md-list`, `md-table`,
  * `md-toc` with the leader's `data-src`, `md-figure` with its `data-md`, and the
- * KaTeX-typeset `MdMath` with its own. Moving the markup here changed none of that.
+ * KaTeX-typeset `MdMath` with its own.
  *
  * A figure's crop is the caller's: `figureUrl` is the image to load, or null for the
  * dashed placeholder (no figure route, or a crop that already failed), and a load failure
@@ -199,62 +199,5 @@ const figureSource = computed(() => {
 .md-toc-page {
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
-}
-
-/* A figure is centered in the column, caption and all: a crop is narrower than the measure
-   far more often than not, and left-aligning it hangs it off an edge the text does not
-   share. */
-.md-figure {
-  margin: 0;
-  text-align: center;
-}
-
-/* The stored crop, at the width the prose gives it and never more. */
-.figure-image {
-  display: block;
-  margin-inline: auto;
-  max-width: 100%;
-  border: 1px solid var(--line-soft);
-  background: var(--paper);
-}
-
-/* Dashed, because it is a frame around something that is not there yet. */
-.figure-frame {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: var(--space-2);
-  height: 210px;
-  border: 1px dashed var(--edge);
-  background: var(--rail);
-  color: var(--faint);
-  font-size: var(--text-xs);
-}
-
-.figure-frame :deep(svg) {
-  width: 22px;
-  height: 22px;
-}
-
-/* A label on the picture, not the document's text: filled rather than outlined, so it
-   reads as a tag and not as a button, and set apart from the faint caption under it. */
-.figure-note {
-  display: inline-block;
-  margin: var(--space-2) 0 0;
-  padding: 0 var(--space-2);
-  background: var(--rail-active);
-  color: var(--ink-soft);
-  font-size: var(--text-xs);
-  line-height: 1.6;
-}
-
-/* Prose now that the coordinates have gone from beside it: it wraps to as many lines as
-   the caption needs instead of being truncated to fit next to a readout. */
-.figure-caption {
-  margin-top: var(--space-2);
-  font-size: var(--text-xs);
-  line-height: 1.6;
-  color: var(--faint);
 }
 </style>

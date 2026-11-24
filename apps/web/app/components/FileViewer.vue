@@ -159,15 +159,13 @@ function onMoreSelect(key: string) {
     </template>
 
     <div class="file" :class="preview">
-      <img v-if="preview === 'image'" class="media" :src="url" :alt="document.name">
-      <video v-else-if="preview === 'video'" class="media" :src="url" controls preload="metadata" />
+      <video v-if="preview === 'video'" class="media" :src="url" controls preload="metadata" />
       <div v-else-if="preview === 'audio'" class="sheet">
         <UiIcon :name="glyph" class="sheet-glyph" />
         <p class="sheet-name">{{ document.name }}</p>
         <p class="sheet-facts">{{ facts }}</p>
         <audio class="audio" :src="url" controls preload="metadata" />
       </div>
-      <iframe v-else-if="preview === 'pdf'" class="frame" :src="url" :title="document.name" />
       <template v-else-if="preview === 'text'">
         <UiBanner v-if="textError" tone="error">{{ textError }}</UiBanner>
         <UiSkeleton v-else-if="text === null" class="text-wait" :rows="8" />
@@ -235,12 +233,6 @@ function onMoreSelect(key: string) {
   overflow: auto;
 }
 
-.file.pdf {
-  display: block;
-  padding: 0;
-  overflow: hidden;
-}
-
 .file.text {
   place-items: start center;
 }
@@ -250,13 +242,6 @@ function onMoreSelect(key: string) {
   max-height: 100%;
   border-radius: var(--radius-card);
   object-fit: contain;
-}
-
-.frame {
-  display: block;
-  width: 100%;
-  height: 100%;
-  border: 0;
 }
 
 .text-pane,

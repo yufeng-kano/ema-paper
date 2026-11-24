@@ -2,8 +2,8 @@
  * Markdown typography, shared by the two things that draw a document's blocks: the rendered
  * block (`MdBlock`, `MdInline`) and the rich editor that replaces it while it is being
  * edited (`RichEditor`, docs/web.md § Editing). One set of rules, so a block does not move
- * when it becomes editable. Figures and contents rows stay in `MdBlock` — the editor never
- * draws them.
+ * when it becomes editable. Figures are drawn by both and styled here; contents rows stay in
+ * `MdBlock` — the editor never draws them.
  */
 
 /*
@@ -160,6 +160,62 @@
   border-bottom: none;
 }
 
+/* A figure is centered in the column, caption and all: a crop is narrower than the measure
+   far more often than not, and left-aligning it hangs it off an edge the text does not
+   share. */
+.md-figure {
+  margin: 0;
+  text-align: center;
+}
+
+/* The stored crop, at the width the prose gives it and never more. */
+.md-figure .figure-image {
+  display: block;
+  margin-inline: auto;
+  max-width: 100%;
+  border: 1px solid var(--line-soft);
+  background: var(--paper);
+}
+
+/* Dashed, because it is a frame around something that is not there yet. */
+.md-figure .figure-frame {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  height: 210px;
+  border: 1px dashed var(--edge);
+  background: var(--rail);
+  color: var(--faint);
+  font-size: var(--text-xs);
+}
+
+.md-figure .figure-frame svg {
+  width: 22px;
+  height: 22px;
+}
+
+/* A label on the picture, not the document's text: filled rather than outlined, so it
+   reads as a tag and not as a button, and set apart from the faint caption under it. */
+.md-figure .figure-note {
+  display: inline-block;
+  margin: var(--space-2) 0 0;
+  padding: 0 var(--space-2);
+  background: var(--rail-active);
+  color: var(--ink-soft);
+  font-size: var(--text-xs);
+  line-height: 1.6;
+}
+
+/* A caption is prose: it wraps to as many lines as it needs. */
+.md-figure .figure-caption {
+  margin-top: var(--space-2);
+  font-size: var(--text-xs);
+  line-height: 1.6;
+  color: var(--faint);
+}
+
 /* KaTeX brings its own faces and sizing; the span only needs to not fight the line. */
 .md-inline-math .katex {
   font-size: 1.06em;
@@ -195,7 +251,11 @@
   white-space: pre-wrap;
 }
 
-/* A display formula in the editor or the chat: MdMath scopes its own copy of this rule. */
+/* A display formula, wherever it is drawn — the rendered block (`MdMath`), the editor, the
+   chat. Keeps the body's colour; wider than the measure, it scrolls in place like a table.
+   Sideways only: `overflow-y` is hidden so a tall `\begin{cases}` expands to its height
+   instead of getting a vertical scrollbar, and the vertical padding is slack for the
+   fraction bars and accents KaTeX draws a pixel or two outside its own box. */
 .md-math-block {
   overflow-x: auto;
   overflow-y: hidden;

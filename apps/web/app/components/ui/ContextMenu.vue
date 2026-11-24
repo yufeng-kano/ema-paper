@@ -306,7 +306,7 @@ async function place() {
       props.at,
       { width: element.offsetWidth, height: element.offsetHeight },
       { width: window.innerWidth, height: window.innerHeight },
-      { above: props.above },
+      props.above,
     )
     position.value = at
     origin.value = `${at.x < props.at.x ? 'right' : 'left'} ${at.y < props.at.y ? 'bottom' : 'top'}`

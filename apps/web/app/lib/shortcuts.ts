@@ -106,7 +106,7 @@ export function hasMod(event: KeyEventLike, apple: boolean): boolean {
 }
 
 /** The `KeyboardEvent.code` a character key sits on, so a shortcut is read on any layout. */
-const CODES: Record<string, string> = { '/': 'Slash', '[': 'BracketLeft', ']': 'BracketRight' }
+const CODES: Record<string, string> = { '/': 'Slash', '[': 'BracketLeft' }
 
 /** Whether a key event is the shortcut: its modifiers exactly, and its key by name or by the
  *  physical key — `⌘⇧C` arrives as `C`, and `⌘/` as `?` where Shift is part of the slash. */

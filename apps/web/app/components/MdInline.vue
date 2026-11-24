@@ -12,12 +12,7 @@ import { parseInline, type CiteResolver } from '~/lib/markdown'
 const props = defineProps<{ text: string; cite?: CiteResolver; links?: boolean; files?: boolean }>()
 
 const segments = computed(() =>
-  parseInline(
-    props.text,
-    props.cite || props.links || props.files
-      ? { cites: props.cite !== undefined, links: props.links === true, files: props.files === true }
-      : undefined,
-  ),
+  parseInline(props.text, { cites: props.cite !== undefined, links: props.links === true, files: props.files === true }),
 )
 </script>
 

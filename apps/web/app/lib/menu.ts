@@ -29,10 +29,8 @@ export interface MenuItem {
   key: string
   label: string
   icon?: IconName
-  /**
-   * A destination rather than an action: the item is a real link. The locale items are why
-   * — the locale lives in the URL, so switching it is navigation and must be an `<a>`.
-   */
+  /** A destination rather than an action: the item is drawn as a real link — the account
+   *  menu's Admin row. */
   to?: string
   /**
    * Present when the item is one of a set of choices, and `true` on the chosen one — drawn
@@ -70,20 +68,15 @@ export interface Point {
   y: number
 }
 
-export interface Size {
+interface Size {
   width: number
   height: number
 }
 
 /** How close to the viewport edge a menu is allowed to sit. */
 const MARGIN = 8
-
-export interface PlaceOptions {
-  margin?: number
-  /** Open over the point rather than under it, wherever there is room there: a menu asked
-   *  for at the top of a control low in the window, which it must not cover. */
-  above?: boolean
-}
+/** How far down and in from its row's lower left a submenu opens over its parent. */
+const INSET = 8
 
 /** Below this much room over the point, a menu asked to open above it opens as any other. */
 const ROOM_ABOVE_MIN = 120
@@ -93,16 +86,18 @@ const ROOM_ABOVE_MIN = 120
  * window's top margin, so a long list scrolls inside that room rather than being pushed
  * down over the control it opened from. Null when there is too little room to be worth it.
  */
-export function heightAbove(at: Point, margin = MARGIN): number | null {
-  const room = at.y - margin
+export function heightAbove(at: Point): number | null {
+  const room = at.y - MARGIN
   return room >= ROOM_ABOVE_MIN ? room : null
 }
 
-export function placeMenu(at: Point, menu: Size, viewport: Size, options: PlaceOptions = {}): Point {
-  const margin = options.margin ?? MARGIN
+/** Where a menu asked for at `at` opens. `above` opens it over the point rather than under
+ *  it, wherever there is room there: a menu asked for at the top of a control low in the
+ *  window, which it must not cover. */
+export function placeMenu(at: Point, menu: Size, viewport: Size, above = false): Point {
   return {
-    x: fit(at.x, menu.width, viewport.width, margin),
-    y: options.above ? fitAbove(at.y, menu.height, viewport.height, margin) : fit(at.y, menu.height, viewport.height, margin),
+    x: fit(at.x, menu.width, viewport.width),
+    y: above ? fitAbove(at.y, menu.height, viewport.height) : fit(at.y, menu.height, viewport.height),
   }
 }
 
@@ -111,24 +106,24 @@ export function placeMenu(at: Point, menu: Size, viewport: Size, options: PlaceO
  * the point. A menu taller or wider than the viewport itself fits nowhere, and then the near
  * edge wins — clipping the far end is better than starting off-screen.
  */
-function fit(at: number, size: number, viewport: number, margin: number): number {
-  if (at + size <= viewport - margin) {
-    return Math.max(margin, at)
+function fit(at: number, size: number, viewport: number): number {
+  if (at + size <= viewport - MARGIN) {
+    return Math.max(MARGIN, at)
   }
-  return Math.max(margin, Math.min(at - size, viewport - margin - size))
+  return Math.max(MARGIN, Math.min(at - size, viewport - MARGIN - size))
 }
 
 /** The same axis the other way first: ending at the point when the menu fits before it, and
  *  only otherwise placed as `fit` places it. */
-function fitAbove(at: number, size: number, viewport: number, margin: number): number {
-  if (at - size >= margin) {
-    return Math.min(at - size, viewport - margin - size)
+function fitAbove(at: number, size: number, viewport: number): number {
+  if (at - size >= MARGIN) {
+    return Math.min(at - size, viewport - MARGIN - size)
   }
-  return fit(at, size, viewport, margin)
+  return fit(at, size, viewport)
 }
 
 /** A box in viewport coordinates. */
-export interface Rect {
+interface Rect {
   left: number
   top: number
   right: number
@@ -155,19 +150,19 @@ export function openSide(
 /**
  * Where a submenu opens (docs/web.md § Design system, *Primitives*): beside its parent menu,
  * top-aligned with the row it came from — to the right, or to the left where the viewport has
- * no room — and, where neither side has room (a phone), over the parent, `inset` down and in
+ * no room — and, where neither side has room (a phone), over the parent, `INSET` down and in
  * from the row's lower left, so the row stays in sight. Kept inside the viewport vertically.
  */
-export function placeSubmenu(row: Rect, menu: Rect, sub: Size, viewport: Size, margin = MARGIN, inset = 8): Point {
-  const y = (top: number) => Math.max(margin, Math.min(top, viewport.height - margin - sub.height))
-  if (menu.right + sub.width <= viewport.width - margin) {
+export function placeSubmenu(row: Rect, menu: Rect, sub: Size, viewport: Size): Point {
+  const y = (top: number) => Math.max(MARGIN, Math.min(top, viewport.height - MARGIN - sub.height))
+  if (menu.right + sub.width <= viewport.width - MARGIN) {
     return { x: menu.right, y: y(row.top) }
   }
-  if (menu.left - sub.width >= margin) {
+  if (menu.left - sub.width >= MARGIN) {
     return { x: menu.left - sub.width, y: y(row.top) }
   }
   return {
-    x: Math.max(margin, Math.min(row.left + inset, viewport.width - margin - sub.width)),
-    y: y(row.bottom + inset),
+    x: Math.max(MARGIN, Math.min(row.left + INSET, viewport.width - MARGIN - sub.width)),
+    y: y(row.bottom + INSET),
   }
 }
