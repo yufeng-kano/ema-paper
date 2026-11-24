@@ -68,10 +68,10 @@ async def call(
 
 async def write_title(
     db: AsyncSession, settings: Settings, conversation: Conversation, *, locale: str
-) -> str:
+) -> None:
     """Ask the summary model for the conversation's title, bill the call and write the
-    title, `updated_at` kept as it was. Returns the title; raises `ApiError` for every
-    refusal and failure of docs/api.md, the title then unchanged."""
+    title, `updated_at` kept as it was. Raises `ApiError` for every refusal and failure of
+    docs/api.md, the title then unchanged."""
     connection = kano_connection(settings, anthropic=True)
     if connection is None:
         raise ApiError(503, "upstream", "Kano Proxy is not configured on this deployment")
@@ -239,4 +239,3 @@ async def write_title(
         raise ApiError(502, "upstream", "The model could not be reached; try again")
     if not title:
         raise ApiError(502, "upstream", "The model wrote no title; try again")
-    return title

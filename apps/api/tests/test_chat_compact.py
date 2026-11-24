@@ -442,7 +442,7 @@ async def test_a_cancel_after_the_summary_is_stored_sets_no_boundary(
             .scalars()
             .all()
         )
-    assert chat_compact.is_summary(stored[-1])
+    assert stored[-1][0]["context"] == chat_compact.SUMMARY_CONTEXT
 
     monkeypatch.setattr(chat_runner, "_store_summary", store)
     await send(chat_client, conversation_id, text="go on")
@@ -1026,6 +1026,3 @@ def test_the_compaction_message_is_the_instruction_and_the_note() -> None:
         chat_compact.COMPACT_CONTEXT,
         chat_agent.TURN_CONTEXT,
     ]
-    assert chat_compact.is_summary([{"type": "text", "text": "s", "context": "summary"}])
-    assert not chat_compact.is_summary([{"type": "text", "text": "s"}])
-    assert not chat_compact.is_summary("text")

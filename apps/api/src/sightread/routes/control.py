@@ -76,7 +76,7 @@ from ..workspace.locks import workspace_lock
 from ..workspace.memory_file import memory_file_text, write_memory_file
 from ..workspace.trash import lock_user
 from .billing import me_fields
-from .chat import TITLE_MAX_CHARS, turn_note
+from .chat import TITLE_MAX_CHARS
 from .library import parse_auto_convert
 
 logger = logging.getLogger(__name__)
@@ -819,7 +819,7 @@ async def chat_agent_context(
         },
         "memory": {"count": len(loaded), "paused": paused},
     }
-    turn = turn_note(
+    turn = chat_agent.turn_note(
         "<revision>",
         locale,
         setting.answer_language if setting else None,

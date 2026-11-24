@@ -2050,6 +2050,42 @@ async def test_the_event_replay_is_read_in_batches(chatting, monkeypatch) -> Non
     assert names == ["text_delta"] * 7 + ["turn_error"]
 
 
+async def test_the_conversation_is_read_in_batches(chatting, monkeypatch) -> None:
+    from sightread.jobs import chat_events
+
+    conversation_id = (
+        await chatting.post(
+            f"/api/library/documents/{chatting.document_id}/conversations", headers=CSRF_HEADERS
+        )
+    ).json()["id"]
+    sent = await chatting.post(
+        f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
+    )
+    turn_id = uuid.UUID(sent.json()["turn_id"])
+    async with chatting.app.state.sessionmaker() as db:
+        for index in range(5):
+            db.add(
+                Message(
+                    conversation_id=conversation_id,
+                    role="assistant",
+                    content=[{"type": "text", "text": str(index)}],
+                    turn_id=turn_id,
+                )
+            )
+        await fail_turn(db, turn_id, "over")
+        await db.commit()
+    # Six rows in batches of three: the last batch is full, and an empty one ends the read.
+    monkeypatch.setattr(chat_events, "REPLAY_BATCH_SIZE", 3)
+    body = (await chatting.get(f"/api/conversations/{conversation_id}")).json()
+    assert [message["role"] for message in body["messages"]] == ["user"] + ["assistant"] * 5
+    assert [message["content"][0]["text"] for message in body["messages"][1:]] == [
+        str(index) for index in range(5)
+    ]
+    ids = [message["id"] for message in body["messages"]]
+    assert ids == sorted(ids) and len(set(ids)) == 6
+    assert body["conversation"]["compactable"] is True
+
+
 async def test_a_delete_whose_commit_fails_keeps_the_edited_files(chatting, monkeypatch) -> None:
     import contextlib
 

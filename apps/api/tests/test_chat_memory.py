@@ -19,6 +19,7 @@ from sqlalchemy import select
 from sightread.agents import CHAT
 from sightread.agents import chat as chat_agent
 from sightread.agents import memory as memory_defs
+from sightread.agents.chat import TURN_CONTEXT, turn_note
 from sightread.db.models import (
     Conversation,
     Document,
@@ -30,7 +31,6 @@ from sightread.db.models import (
     User,
 )
 from sightread.jobs import chat_events, chat_memory, chat_runner, chat_tools
-from sightread.routes.chat import TURN_CONTEXT, turn_note
 from sightread.workspace.layout import user_root
 from tests.conftest import CSRF_HEADERS, DATABASE_URL
 from tests.test_chat import _run_queued_turn

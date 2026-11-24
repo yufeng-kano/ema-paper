@@ -22,14 +22,7 @@ from sightread.workspace.layout import user_root
 from tests.conftest import CSRF_HEADERS, DATABASE_URL
 from tests.test_chat import _run_queued_turn
 from tests.test_chat_agents_file import _agents_part, _write
-from tests.test_chat_compact import (
-    DONE,
-    SUMMARY,
-    conversation_row,
-    detail,
-    set_clock,
-    turns_of,
-)
+from tests.test_chat_compact import DONE, SUMMARY, conversation_row, detail, set_clock, turns_of
 from tests.test_chat_extensions import (
     chatting_client,
     new_conversation,
@@ -198,11 +191,9 @@ async def test_a_message_carries_the_files_page_and_no_passage(chat_client) -> N
 
 
 @respx.mock
-async def test_an_edit_keeps_the_files_page_it_was_sent_with_unless_it_sends_its_own(
-    chat_client,
-) -> None:
+async def test_an_edit_keeps_the_files_page_it_was_sent_with(chat_client) -> None:
     client = chat_client
-    main, _ = stub_messages([DONE, DONE, DONE])
+    main, _ = stub_messages([DONE, DONE])
     papers = await _papers(client)
     conversation_id = await new_library_conversation(client)
     await send(client, conversation_id, text="one", library={"folder_id": papers})
@@ -215,14 +206,29 @@ async def test_an_edit_keeps_the_files_page_it_was_sent_with_unless_it_sends_its
     assert main[1]["messages"][0]["content"][1]["text"] == (
         f"The Files page as the user sent this message:\n- open folder: Papers (folder {papers})"
     )
-    message_id = (await detail(client, conversation_id))["messages"][0]["id"]
-    replaced = await edit(
-        client, conversation_id, message_id, text="three", library={"folder_id": None}
-    )
-    assert replaced.status_code == 202, replaced.text
-    await _run_queued_turn(client)
-    assert main[2]["messages"][0]["content"][1]["text"] == (
-        "The Files page as the user sent this message:\n- open folder: the top of the library"
+
+
+@respx.mock
+async def test_a_message_from_the_top_of_files_names_the_top(chat_client) -> None:
+    """No open folder, or one that is not the caller's live folder, reads as the top of the
+    library, for the model and for the thread (docs/chat.md § Library conversations)."""
+    client = chat_client
+    main, _ = stub_messages([DONE, DONE])
+    conversation_id = await new_library_conversation(client)
+    for turn, folder_id in enumerate((None, 999_999)):
+        sent = await send(client, conversation_id, text="hi", library={"folder_id": folder_id})
+        assert sent.status_code == 202, sent.text
+        await _run_queued_turn(client)
+        assert main[turn]["messages"][-1]["content"][1] == {
+            "type": "text",
+            "text": "The Files page as the user sent this message:\n"
+            "- open folder: the top of the library",
+        }
+    messages = (await detail(client, conversation_id))["messages"]
+    shown = [message["content"][1] for message in messages if message["role"] == "user"]
+    assert (
+        shown
+        == [{"type": "text", "context": "library", "library": {"folder": "", "items": []}}] * 2
     )
 
 

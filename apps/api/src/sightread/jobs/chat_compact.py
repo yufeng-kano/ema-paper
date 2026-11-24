@@ -1,8 +1,8 @@
 """Compaction (docs/chat.md § Compaction): the message a compaction turn carries, what makes
 a conversation compactable, and the worker's idle pass that compacts a conversation before
-its prompt cache expires.
+its prompt cache expires; with them the turn block's text, which every user message carries.
 
-The reader's `/compact` goes through the send route, which builds the same message; the
+The reader's `/compact` goes through the send route, which builds its message here too; the
 idle pass takes the send's checks and locks itself, since no request stands behind it.
 """
 
@@ -44,13 +44,25 @@ COMPACT_CONTEXT = "compact"
 SUMMARY_CONTEXT = "summary"
 
 
-def is_summary(content: object) -> bool:
-    """Whether a stored message is the summary row a compaction left."""
-    return (
-        isinstance(content, list)
-        and len(content) > 0
-        and isinstance(content[0], dict)
-        and content[0].get("context") == SUMMARY_CONTEXT
+async def turn_note_for(
+    db: AsyncSession,
+    settings: Settings,
+    document: Document | None,
+    setting: AgentSetting | None,
+    locale: str,
+) -> str:
+    """The turn block's text a user message carries — a send's, an edit's, a compaction's:
+    the document's revision as the message is accepted, the reader's locale and the
+    languages they chose. With the message rather than in the system prompt, so an edit made
+    meanwhile reaches the model and a change of language costs no cache (docs/chat.md
+    § Prompt caching, § Instructions). A library conversation has no revision."""
+    revision = await current_revision(db, settings, document) if document is not None else None
+    return chat_agent.turn_note(
+        revision,
+        locale,
+        setting.answer_language if setting else None,
+        setting.translate_language if setting else None,
+        document=document is not None,
     )
 
 
@@ -124,17 +136,6 @@ async def compactable_ids(db: AsyncSession, conversation_ids: list[int]) -> set[
 
 async def compactable(db: AsyncSession, conversation_id: int) -> bool:
     return conversation_id in await compactable_ids(db, [conversation_id])
-
-
-async def unfinished_turn(db: AsyncSession, conversation_id: int) -> bool:
-    """A turn the worker may still be driving: anything without `finished_at`."""
-    return (
-        await db.execute(
-            select(ChatTurn.id).where(
-                ChatTurn.conversation_id == conversation_id, ChatTurn.finished_at.is_(None)
-            )
-        )
-    ).first() is not None
 
 
 async def _last_locale(db: AsyncSession, conversation_id: int) -> str:
@@ -222,7 +223,7 @@ async def _enqueue_idle_compaction(db: AsyncSession, settings: Settings, row: Co
         return False
     if await count_active_turns(db, row.user_id) >= settings.max_chat_turns_per_user:
         return False
-    if await unfinished_turn(db, row.id):
+    if await chat_versions.unfinished_turn(db, row.id):
         return False
     # The branch the conversation shows is what the compaction continues (docs/chat.md
     # § History is append-only, *An edited message starts a version*).
@@ -237,14 +238,7 @@ async def _enqueue_idle_compaction(db: AsyncSession, settings: Settings, row: Co
     if not await compactable(db, row.id):
         return False
     locale = await _last_locale(db, row.id)
-    revision = await current_revision(db, settings, document) if document is not None else None
-    note = chat_agent.turn_note(
-        revision,
-        locale,
-        setting.answer_language if setting else None,
-        setting.translate_language if setting else None,
-        document=document is not None,
-    )
+    note = await turn_note_for(db, settings, document, setting, locale)
     # The message, the turn and its credit entry, or none of them: the balance is read as
     # the entry is reserved, and a refusal leaves only the cleared clock behind.
     try:

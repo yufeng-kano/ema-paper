@@ -19,7 +19,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from ..db.models import ChatEvent, ChatTurn, Conversation
+from ..db.models import ChatEvent, Conversation
 from . import chat_versions
 
 logger = logging.getLogger(__name__)
@@ -80,8 +80,7 @@ async def append(db: AsyncSession, conversation_id: int, turn_id, event: str, da
 
 
 async def emit(db: AsyncSession, conversation_id: int, turn_id, event: str, data: dict) -> int:
-    """Append one event and wake the streams. The turn is the only writer of its
-    conversation, so `max(seq) + 1` cannot race itself. Commits."""
+    """Append one event and commit, so the streams wake now."""
     seq = await append(db, conversation_id, turn_id, event, data)
     await db.commit()
     return seq
@@ -173,20 +172,10 @@ async def _shown_branch(
 async def _turn_running(
     sessionmaker: async_sessionmaker[AsyncSession], conversation_id: int
 ) -> bool:
+    # A cancelled turn is still the worker's until it winds down and writes the terminal
+    # event; the stream waits for that.
     async with sessionmaker() as db:
-        count = (
-            await db.execute(
-                select(func.count())
-                .select_from(ChatTurn)
-                .where(
-                    ChatTurn.conversation_id == conversation_id,
-                    # A cancelled turn is still the worker's until it winds down and
-                    # writes the terminal event; the stream waits for that.
-                    ChatTurn.finished_at.is_(None),
-                )
-            )
-        ).scalar_one()
-        return int(count) > 0
+        return await chat_versions.unfinished_turn(db, conversation_id)
 
 
 async def stream_conversation_events(

@@ -520,7 +520,8 @@ async def test_the_idle_compaction_continues_the_shown_branch(chat_client) -> No
 
 def test_the_branch_helpers_walk_the_tree() -> None:
     """The ancestry of a turn, the newest leaf under one, and a message's versions, read
-    from the turns of one conversation; a conversation without a head is one branch."""
+    from the turns of one conversation; a head that is None or not among them gives no
+    branch."""
 
     def turn(turn_id: uuid.UUID, parent_id: uuid.UUID | None, kind: str = MESSAGE_TURN):
         return SimpleNamespace(id=turn_id, parent_id=parent_id, kind=kind, status="succeeded")
@@ -529,8 +530,8 @@ def test_the_branch_helpers_walk_the_tree() -> None:
     turns = [turn(a, None), turn(b, a), turn(c, a), turn(d, c, IDLE_COMPACT_TURN), turn(e, d)]
     assert [step.id for step in chat_versions.branch(turns, e)] == [a, c, d, e]
     assert [step.id for step in chat_versions.branch(turns, b)] == [a, b]
-    assert [step.id for step in chat_versions.branch(turns, None)] == [a, b, c, d, e]
-    assert [step.id for step in chat_versions.branch(turns, uuid.uuid4())] == [a, b, c, d, e]
+    assert chat_versions.branch(turns, None) == []
+    assert chat_versions.branch(turns, uuid.uuid4()) == []
     assert chat_versions.branch([], None) == []
     assert chat_versions.newest_leaf(turns, a) == e
     assert chat_versions.newest_leaf(turns, b) == b
