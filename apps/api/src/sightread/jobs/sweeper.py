@@ -37,6 +37,7 @@ from ..db.models import Document, Folder, Job, User, utcnow
 from ..errors import ApiError
 from ..parsing.attachments import FILE_PREFIX
 from ..parsing.figures import discard_job_figures
+from ..stopping import pause
 from ..workspace import accounts, git, safe_io, trash
 from ..workspace import documents as workspace_documents
 from ..workspace.layout import user_root
@@ -48,20 +49,21 @@ logger = logging.getLogger(__name__)
 
 SWEEP_INTERVAL_SECONDS = 900.0
 
+# A finished library parse whose retention has not run yet (docs/jobs.md § Retention).
+_RETENTION_PENDING = and_(
+    Job.status.in_(("succeeded", "failed")),
+    Job.source_deleted_at.is_(None),
+    select(Document.id).where(Document.job_id == Job.id).exists(),
+)
 
-def sweep_uploads(
-    upload_dir: Path,
-    *,
-    max_age: float,
-    keep: Collection[str] = (),
-    now: float | None = None,
-) -> int:
+
+def sweep_uploads(upload_dir: Path, *, max_age: float, keep: Collection[str] = ()) -> int:
     """Delete upload-directory entries older than `max_age` seconds, but none named for one
     of `keep` — the ids of the jobs still queued or running, or finished with their
     retention still to run, whose source, retry copies and render directories are named
     `{job_id}.…`: a converted file's only copy is its job's source until its original is
     filed (docs/jobs.md § Retention). Returns how many were removed."""
-    now = time.time() if now is None else now
+    now = time.time()
     if not upload_dir.is_dir():
         return 0
 
@@ -313,10 +315,7 @@ async def finish_retention(
         pending = (
             await db.execute(
                 select(Job.id, Job.source_path).where(
-                    Job.status.in_(("succeeded", "failed")),
-                    Job.source_path.is_not(None),
-                    Job.source_deleted_at.is_(None),
-                    select(Document.id).where(Document.job_id == Job.id).exists(),
+                    _RETENTION_PENDING, Job.source_path.is_not(None)
                 )
             )
         ).all()
@@ -350,14 +349,7 @@ async def sweep_once(sessionmaker: async_sessionmaker[AsyncSession], settings: S
             for job_id in (
                 await db.execute(
                     select(Job.id).where(
-                        or_(
-                            Job.status.in_(("queued", "running")),
-                            and_(
-                                Job.status.in_(("succeeded", "failed")),
-                                Job.source_deleted_at.is_(None),
-                                select(Document.id).where(Document.job_id == Job.id).exists(),
-                            ),
-                        )
+                        or_(Job.status.in_(("queued", "running")), _RETENTION_PENDING)
                     )
                 )
             ).scalars()
@@ -397,7 +389,4 @@ async def sweep_forever(
             await sweep_once(sessionmaker, settings)
         except Exception:  # the next pass tries again
             logger.exception("the sweep failed; the next one runs on schedule")
-        try:
-            await asyncio.wait_for(stop.wait(), timeout=SWEEP_INTERVAL_SECONDS)
-        except TimeoutError:
-            continue
+        await pause(stop, SWEEP_INTERVAL_SECONDS)

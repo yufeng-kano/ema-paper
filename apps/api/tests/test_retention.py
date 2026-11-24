@@ -297,8 +297,6 @@ async def test_a_parse_no_file_keeps_is_deleted_after_its_retention(
         # account's file holds — the rule never looks across accounts.
         orphan = await _parse(db, uid)
         failed = await _parse(db, uid, status="failed")
-        # A row from before `finished_at` was always written counts from its creation.
-        unstamped = await _parse(db, uid, finished_days=None)
         foreign = await _parse(db, uid, sha256="e" * 64)
         theirs = await _parse(db, stranger.user_id, sha256="e" * 64)
         db.add(Document(user_id=stranger.user_id, job_id=theirs, name="c.pdf"))
@@ -347,11 +345,11 @@ async def test_a_parse_no_file_keeps_is_deleted_after_its_retention(
 
     purged = await purge_parses(writer.app.state.sessionmaker, settings)
 
-    assert purged == 4
+    assert purged == 3
     async with writer.app.state.sessionmaker() as db:
         left = set((await db.execute(select(Job.id))).scalars())
         assert left == {filed, trashed, reconverted, earlier, young, queued, running, theirs}
-        assert not left & {orphan, failed, unstamped, foreign}
+        assert not left & {orphan, failed, foreign}
         assert (await db.execute(select(Result.job_id).where(Result.job_id == orphan))).all() == []
         # The cost stays where it was counted: the entry without its job, the period's
         # spent unchanged, the usage row too.

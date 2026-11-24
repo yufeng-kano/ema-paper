@@ -52,6 +52,7 @@ from ..db.models import (
     utcnow,
 )
 from ..sandbox.client import SandboxClient, SandboxUnavailable
+from ..stopping import pause
 from ..workspace import git
 from ..workspace.layout import REPOS_DIR, git_dir, user_root
 from ..workspace.locks import (
@@ -214,11 +215,10 @@ def dedup_key(
 
 def parse_kept(retention_days: int, margin: timedelta = timedelta(0)) -> ColumnElement[bool]:
     """The parse retention's rule, written once (docs/jobs.md § Retention): a job is kept
-    while it is queued or running, while it finished less than `retention_days` days ago
-    (a row from before `finished_at` was always written counts from its creation), while
-    any document of its user — live or in the Trash — names a parse (its `job_id` or its
-    `reconvert_job_id`) of the same original, or while an upload ticket that has not
-    expired names it. The document clause keeps a document's own parse, its re-convert,
+    while it is queued or running, while it finished less than `retention_days` days ago,
+    while any document of its user — live or in the Trash — names a parse (its `job_id`
+    or its `reconvert_job_id`) of the same original, or while an upload ticket that has
+    not expired names it. The document clause keeps a document's own parse, its re-convert,
     and the earlier parses of its original the figure route falls back on; the ticket
     clause keeps the job a spent ticket still reads, a cache hit's included.
 
@@ -229,8 +229,7 @@ def parse_kept(retention_days: int, margin: timedelta = timedelta(0)) -> ColumnE
     now = utcnow()
     return or_(
         Job.status.in_(("queued", "running")),
-        func.coalesce(Job.finished_at, Job.created_at)
-        > now - timedelta(days=retention_days) + margin,
+        Job.finished_at > now - timedelta(days=retention_days) + margin,
         select(Document.id)
         .join(named, or_(named.id == Document.job_id, named.id == Document.reconvert_job_id))
         .where(Document.user_id == Job.user_id, named.sha256 == Job.sha256)
@@ -307,7 +306,6 @@ async def find_recent_terminal_job(
             .where(
                 *dedup_key(**key),
                 Job.status.in_(("succeeded", "failed")),
-                Job.finished_at.is_not(None),
                 Job.finished_at >= finished_since,
             )
             .order_by(Job.finished_at.desc())
@@ -344,7 +342,6 @@ async def find_parse_to_retry(
         Job.agent == agent,
         Job.sha256 == sha256,
         Job.pages_spec == pages_spec,
-        Job.status.in_(("failed", "queued", "running", "succeeded")),
     )
     if retention_days > 0:
         query = query.where(parse_kept(retention_days))
@@ -534,11 +531,7 @@ async def watch_worker_lock(
     connection hands it to a waiting worker, which then requeues every `running` job,
     so this one must stop and cancel its work the moment its session is gone, rather
     than finish a parse beside the worker that took it (docs/jobs.md)."""
-    while not stop.is_set():
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(stop.wait(), timeout=interval_seconds)
-        if stop.is_set():
-            return
+    while not await pause(stop, interval_seconds):
         try:
             (await connection.execute(text("SELECT 1"))).scalar_one()
         except Exception:  # noqa: BLE001 - any failure means the session is not ours to trust
@@ -867,7 +860,7 @@ async def claim_next_turn(db: AsyncSession, max_turns_per_user: int) -> uuid.UUI
 
 
 async def fail_orphaned_turns(
-    db: AsyncSession, sandbox: SandboxClient | None = None, settings: Settings | None = None
+    db: AsyncSession, sandbox: SandboxClient | None, settings: Settings
 ) -> tuple[int, set[int]]:
     """Finish every turn a worker that died left behind: `running`, or cancelled and not
     yet wound down. Run when a worker starts, and again until it goes through — the
@@ -879,7 +872,8 @@ async def fail_orphaned_turns(
     recorded — the worker died between a tool's write and its commit — becomes a revision
     of its own, under the same locks the tool held, so the next revision carries only
     its own changes; a tree that cannot be committed leaves the turn for the next pass
-    too. Returns (finished, the users whose turns are left for later)."""
+    too. `sandbox` None means no runner is configured. Returns (finished, the users whose
+    turns are left for later)."""
     orphans = (
         await db.execute(
             select(ChatTurn.id, ChatTurn.user_id, Conversation.id, Conversation.session)
@@ -895,16 +889,13 @@ async def fail_orphaned_turns(
     for turn_id, user_id, conversation_id, session in orphans:
         if user_id in left:
             continue
-        if sandbox is not None and sandbox.configured:
+        if sandbox is not None:
             try:
                 await sandbox.restart(user_id, session)
             except SandboxUnavailable:
                 left.add(user_id)
                 continue
-        elif (
-            settings is not None
-            and writing_marker(user_root(settings.workspaces_dir, user_id)).exists()
-        ):
+        elif writing_marker(user_root(settings.workspaces_dir, user_id)).exists():
             # A shell command was writing when the worker died, and this worker has no
             # runner to stop it with (SANDBOX_URL gone from its environment): the VM may
             # still be running the command, so the tree is not declared safe here. The
@@ -916,9 +907,7 @@ async def fail_orphaned_turns(
             )
             left.add(user_id)
             continue
-        if settings is not None and not await _record_orphaned_changes(
-            db, settings, user_id, conversation_id
-        ):
+        if not await _record_orphaned_changes(db, settings, user_id, conversation_id):
             left.add(user_id)
             continue
         await fail_turn(db, turn_id, "worker restarted")
@@ -932,7 +921,8 @@ async def recover_unsettled_commands(settings: Settings, sandbox: SandboxClient 
     turn that then ended. Its shell is restarted on the runner, which answers only once
     the command is dead, and the tree is recorded in the conversation's name; a runner
     that does not answer leaves the marker, and the user's host writes refused, for the
-    next pass. Returns the users left for later (docs/workspace.md § Revisions)."""
+    next pass. `sandbox` None means no runner is configured. Returns the users left for
+    later (docs/workspace.md § Revisions)."""
     left: set[int] = set()
     repos = Path(settings.workspaces_dir) / REPOS_DIR
     for marker in sorted(repos.glob(f"*{WRITING_SUFFIX}")) if repos.is_dir() else []:
@@ -942,7 +932,7 @@ async def recover_unsettled_commands(settings: Settings, sandbox: SandboxClient 
             continue
         root = user_root(settings.workspaces_dir, user_id)
         named = read_writing(root)
-        if sandbox is None or not sandbox.configured:
+        if sandbox is None:
             # Nothing to stop the shell with: unconfirmed, as a restart that failed.
             logger.warning(
                 "an unconfirmed shell command of user %d cannot be stopped: no sandbox "

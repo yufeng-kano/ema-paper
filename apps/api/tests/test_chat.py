@@ -1804,7 +1804,6 @@ async def test_a_worker_starting_records_what_an_orphaned_turn_left_unrecorded(
         raise git.GitError("index.lock exists")
 
     class Runner:
-        configured = True
         restarted: list[tuple[int, str]] = []
 
         async def restart(self, user_id: int, session: str) -> None:
@@ -1844,6 +1843,7 @@ async def test_a_worker_starting_records_what_an_orphaned_turn_left_unrecorded(
 async def test_a_worker_starting_finishes_the_turns_a_dead_one_left(chatting) -> None:
     from sightread.jobs.queue import fail_orphaned_turns
 
+    settings = chatting.app.state.settings
     document_id = chatting.document_id
     conversation_id = (
         await chatting.post(
@@ -1861,7 +1861,6 @@ async def test_a_worker_starting_finishes_the_turns_a_dead_one_left(chatting) ->
     from sightread.sandbox.client import SandboxUnavailable
 
     class Runner:
-        configured = True
         restarted: list[tuple[int, str]] = []
         away = True
 
@@ -1874,12 +1873,12 @@ async def test_a_worker_starting_finishes_the_turns_a_dead_one_left(chatting) ->
     async with chatting.app.state.sessionmaker() as db:
         # The runner does not answer: the turn is left for the next pass, since the
         # command the dead worker had running may still be writing.
-        assert await fail_orphaned_turns(db, runner) == (0, {chatting.user_id})
+        assert await fail_orphaned_turns(db, runner, settings) == (0, {chatting.user_id})
         await db.commit()
     async with chatting.app.state.sessionmaker() as db:
         assert (await db.get(ChatTurn, turn_id)).finished_at is None
         runner.away = False
-        assert await fail_orphaned_turns(db, runner) == (1, set())
+        assert await fail_orphaned_turns(db, runner, settings) == (1, set())
         turn = await db.get(ChatTurn, turn_id)
         session = (await db.get(Conversation, turn.conversation_id)).session
         assert runner.restarted == [(chatting.user_id, session)]
@@ -1891,7 +1890,7 @@ async def test_a_worker_starting_finishes_the_turns_a_dead_one_left(chatting) ->
             .all()
         )
         assert [event.event for event in events] == ["turn_error"]
-        assert await fail_orphaned_turns(db) == (0, set())
+        assert await fail_orphaned_turns(db, None, settings) == (0, set())
     # The conversation takes messages again.
     again = await chatting.post(
         f"/api/conversations/{conversation_id}/messages",
@@ -2994,7 +2993,6 @@ async def test_a_command_the_runner_could_not_confirm_over_keeps_the_marker_unti
         paths = await workspace_documents.materialize_document(db, settings, document)
 
     class Shell:
-        configured = True
         restart_ok = False
         restarted: list[str] = []
         stopped: list[int] = []

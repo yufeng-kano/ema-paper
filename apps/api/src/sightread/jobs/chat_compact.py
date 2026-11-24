@@ -31,6 +31,7 @@ from ..db.models import (
 )
 from ..errors import ApiError
 from ..runtime_settings import RuntimeSettings
+from ..stopping import pause
 from ..workspace.documents import current_revision, ensure_within_quota, is_live, user_folders
 from ..workspace.layout import user_root
 from . import chat_versions
@@ -330,7 +331,4 @@ async def idle_compact_forever(
                 logger.info("enqueued %d idle compaction(s)", enqueued)
         except Exception:  # the next pass tries again
             logger.exception("the idle compaction pass failed; the next one runs on schedule")
-        try:
-            await asyncio.wait_for(stop.wait(), timeout=settings.chat_idle_compact_sweep_seconds)
-        except TimeoutError:
-            continue
+        await pause(stop, settings.chat_idle_compact_sweep_seconds)

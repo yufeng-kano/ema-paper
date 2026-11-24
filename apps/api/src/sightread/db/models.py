@@ -138,9 +138,9 @@ class AgentSetting(Base):
         ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
     )
     agent: Mapped[str] = mapped_column(String(32), primary_key=True)
-    # The chat agent's pick among `CHAT_MODELS`; NULL means the first offered. The parse
-    # and check agents' models are the deployment's, never stored here (docs/billing.md
-    # § Models).
+    # The chat agent's pick among the offered chat models; NULL means the first offered.
+    # The parse and check agents' models are the deployment's, never stored here
+    # (docs/billing.md § Models).
     model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # The user's own template for the agent; NULL means the agent's default. It replaces
     # the default whole (docs/agents.md).
