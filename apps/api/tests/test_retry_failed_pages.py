@@ -27,9 +27,9 @@ from sightread.jobs.intake import retry_library_parse
 from sightread.workspace.documents import original_of
 from sightread.workspace.layout import user_root
 from sightread.workspace.locks import workspace_lock
-from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, PARSE_MODEL, convert_on_upload, sign_in
+from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, PARSE_MODEL
 from tests.factories import user_row
-from tests.test_library_trash import _fail_next_commit
+from tests.library_helpers import fail_next_commit, ready_to_parse
 from tests.test_parse_end_to_end import VISION_MARKDOWN, _completion, _drain_queue
 
 FALLBACK = "vendor/fallback-model"
@@ -55,8 +55,8 @@ class Upstream:
 async def _library(make_client, **overrides) -> AsyncClient:
     """A signed-in client whose Files uploads are parsed, on a deployment that names
     `FALLBACK`, the model a retry may send failed pages to."""
-    client = await sign_in(make_client(**{"parse_fallback_model": FALLBACK, **overrides}))
-    await convert_on_upload(client)
+    client = make_client(**{"parse_fallback_model": FALLBACK, **overrides})
+    await ready_to_parse(client)
     return client
 
 
@@ -304,7 +304,7 @@ async def test_a_retry_whose_commit_raised_keeps_its_copy_only_if_it_landed(
     uploaded = await _upload(library, documents["mixed_pdf"])
     await _drain_queue(library, sessionmaker)
 
-    _fail_next_commit(monkeypatch, landed=landed)
+    fail_next_commit(monkeypatch, landed=landed)
     response = await _retry(library, uploaded["id"])
     async with sessionmaker() as db:
         job = await db.get(Job, uuid.UUID(uploaded["job_id"]))

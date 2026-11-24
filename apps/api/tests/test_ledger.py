@@ -55,7 +55,7 @@ from tests.conftest import (
 )
 from tests.factories import user_row
 from tests.helpers import read_library
-from tests.test_library import _ready_to_parse, _upload
+from tests.library_helpers import ready_to_parse, upload_png
 
 
 async def test_two_parses_racing_for_the_last_credits(sessionmaker) -> None:
@@ -296,8 +296,8 @@ async def test_an_upload_the_balance_cannot_cover_is_refused_and_not_stored(
     make_client, documents, tmp_path
 ) -> None:
     client = make_client(free_credits_per_period=0)
-    await _ready_to_parse(client)
-    refused = await _upload(client, documents)
+    await ready_to_parse(client)
+    refused = await upload_png(client, documents)
     assert refused.status_code == 402, refused.text
     error = refused.json()["error"]
     assert error["type"] == "insufficient_credits"
@@ -314,8 +314,8 @@ async def test_an_upload_reserves_its_pages_and_its_entry_shows_the_settled_cost
     make_client, documents
 ) -> None:
     client = make_client(free_credits_per_period=5)
-    await _ready_to_parse(client)
-    created = await _upload(client, documents)
+    await ready_to_parse(client)
+    created = await upload_png(client, documents)
     assert created.status_code == 201, created.text
     assert (await client.get("/api/me")).json()["credits_remaining"] == 4
     job_id = uuid.UUID(created.json()["job_id"])

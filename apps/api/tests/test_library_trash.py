@@ -17,8 +17,6 @@ from pathlib import Path
 import httpx
 import pytest
 from httpx import AsyncClient
-from sqlalchemy.exc import OperationalError
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from sightread.db.models import Document, Folder, utcnow
 from sightread.jobs import runner
@@ -30,8 +28,14 @@ from sightread.workspace.reconcile import reconcile_user
 from tests.conftest import CSRF_HEADERS
 from tests.factories import job_row
 from tests.helpers import post_folder, read_library
+from tests.library_helpers import (
+    fail_next_commit,
+    new_document,
+    upload,
+    write_content,
+    written_document,
+)
 from tests.test_document_images import _image, _insert
-from tests.test_markdown_documents import _new, _upload_markdown
 
 RESULT = {
     "markdown": "# Paper\n",
@@ -41,24 +45,6 @@ RESULT = {
     "meta": {},
     "reading_markdown": None,
 }
-
-
-async def _document(client: AsyncClient, name: str, folder_id: int | None, text: str) -> dict:
-    """A markdown document written with `text`, so its directory exists."""
-    created = await _new(client, name, folder_id)
-    assert created.status_code == 201, created.text
-    await _write(client, created.json()["id"], text)
-    return created.json()
-
-
-async def _write(client: AsyncClient, document_id: int, markdown: str) -> None:
-    content = (await client.get(f"/api/library/documents/{document_id}/content")).json()
-    saved = await client.put(
-        f"/api/library/documents/{document_id}/content",
-        json={"markdown": markdown, "base_revision": content["revision"]},
-        headers=CSRF_HEADERS,
-    )
-    assert saved.status_code == 200, saved.text
 
 
 async def _trash(client: AsyncClient, kind: str, row_id: int) -> httpx.Response:
@@ -76,16 +62,16 @@ async def _copy(client: AsyncClient, kind: str, row_id: int, place: int | None) 
     )
 
 
-async def _running_parse(client: AsyncClient, upload: Path) -> tuple[int, uuid.UUID]:
+async def _running_parse(client: AsyncClient, staged: Path) -> tuple[int, uuid.UUID]:
     """A library document whose parse is still running, its upload waiting for retention."""
-    upload.write_bytes(b"%PDF-1.4")
+    staged.write_bytes(b"%PDF-1.4")
     async with client.app.state.sessionmaker() as db:
         job = job_row(
             client.user_id,
             size_bytes=8,
             sha256="c" * 64,
             status="running",
-            source_path=str(upload),
+            source_path=str(staged),
             retain_source=True,
         )
         db.add(job)
@@ -96,31 +82,12 @@ async def _running_parse(client: AsyncClient, upload: Path) -> tuple[int, uuid.U
         return document.id, job.id
 
 
-def _fail_next_commit(monkeypatch, *, landed: bool) -> None:
-    """The next commit raises: after it went through (`landed`, the acknowledgement lost
-    with the connection) or instead of it (rolled back)."""
-    original = AsyncSession.commit
-    failing = {"on": True}
-
-    async def commit(self):
-        if failing["on"]:
-            failing["on"] = False
-            if landed:
-                await original(self)
-            else:
-                await self.rollback()
-            raise OperationalError("COMMIT", {}, Exception("the connection dropped"))
-        await original(self)
-
-    monkeypatch.setattr(AsyncSession, "commit", commit)
-
-
 # --- the Trash ------------------------------------------------------------------------------
 
 
 async def test_a_trashed_document_leaves_the_tree_and_comes_back_whole(writer) -> None:
     drafts = await post_folder(writer, "Drafts")
-    document = await _document(writer, "plan.md", drafts["id"], "# Plan\n")
+    document = await written_document(writer, "plan.md", drafts["id"], "# Plan\n")
     directory = writer.root / "files" / "Drafts" / "plan.md"
 
     trashed = await _trash(writer, "documents", document["id"])
@@ -154,7 +121,7 @@ async def test_a_trashed_document_leaves_the_tree_and_comes_back_whole(writer) -
     assert not directory.exists()
 
     # Its name is free meanwhile, and Put Back takes the next one.
-    assert (await _new(writer, "plan.md", drafts["id"])).json()["name"] == "plan.md"
+    assert (await new_document(writer, "plan.md", drafts["id"])).json()["name"] == "plan.md"
     restored = await _restore(writer, "documents", document["id"])
     assert restored.status_code == 200, restored.text
     assert (restored.json()["folder_id"], restored.json()["name"]) == (drafts["id"], "plan (2).md")
@@ -171,8 +138,8 @@ async def test_a_trashed_document_leaves_the_tree_and_comes_back_whole(writer) -
 async def test_a_trashed_folder_goes_with_everything_in_it(writer) -> None:
     papers = await post_folder(writer, "Papers")
     year = await post_folder(writer, "2026", papers["id"])
-    deep = await _document(writer, "deep.md", year["id"], "# Deep\n")
-    alone = await _document(writer, "alone.md", papers["id"], "# Alone\n")
+    deep = await written_document(writer, "deep.md", year["id"], "# Deep\n")
+    alone = await written_document(writer, "alone.md", papers["id"], "# Alone\n")
     # Trashed on its own first: an entry of its own, which the folder's move leaves be.
     assert (await _trash(writer, "documents", alone["id"])).status_code == 200
     assert (await _trash(writer, "folders", papers["id"])).status_code == 200
@@ -195,7 +162,7 @@ async def test_a_trashed_folder_goes_with_everything_in_it(writer) -> None:
         await writer.delete(f"/api/library/documents/{deep['id']}", headers=CSRF_HEADERS),
         await _restore(writer, "documents", deep["id"]),
         await _trash(writer, "folders", year["id"]),
-        await _new(writer, "more.md", year["id"]),
+        await new_document(writer, "more.md", year["id"]),
         await writer.post(
             "/api/library/folders",
             json={"name": "More", "parent_id": papers["id"]},
@@ -220,7 +187,7 @@ async def test_a_trashed_folder_goes_with_everything_in_it(writer) -> None:
 async def test_put_back_finds_the_nearest_live_folder(writer) -> None:
     top = await post_folder(writer, "Top")
     middle = await post_folder(writer, "Middle", top["id"])
-    note = await _document(writer, "note.md", middle["id"], "# Note\n")
+    note = await written_document(writer, "note.md", middle["id"], "# Note\n")
     assert (await _trash(writer, "documents", note["id"])).status_code == 200
     assert (await _trash(writer, "folders", middle["id"])).status_code == 200
 
@@ -242,8 +209,8 @@ def test_an_entry_inside_a_trashed_folder_belongs_in_that_folders_entry() -> Non
 
 
 async def test_a_trashed_file_is_deleted_for_good_with_its_entry(writer) -> None:
-    document = (await _upload_markdown(writer, b"# Old\n", name="old.md")).json()
-    await _write(writer, document["id"], "# Old, edited\n")
+    document = (await upload(writer, "old.md", b"# Old\n")).json()
+    await write_content(writer, document["id"], "# Old, edited\n")
     assert (await _trash(writer, "documents", document["id"])).status_code == 200
     entry = trash_root(writer.root) / f"document-{document['id']}"
     assert entry.is_dir()
@@ -258,10 +225,8 @@ async def test_a_trashed_file_is_deleted_for_good_with_its_entry(writer) -> None
 async def test_deleting_a_trashed_folder_leaves_what_was_trashed_on_its_own(writer) -> None:
     archive = await post_folder(writer, "Archive")
     kept = await post_folder(writer, "Kept", archive["id"])
-    await _document(writer, "inside.md", kept["id"], "# Inside\n")
-    gone = (
-        await _upload_markdown(writer, b"# Gone\n", name="gone.md", folder_id=archive["id"])
-    ).json()
+    await written_document(writer, "inside.md", kept["id"], "# Inside\n")
+    gone = (await upload(writer, "gone.md", b"# Gone\n", folder_id=archive["id"])).json()
     assert original_of(writer.root, gone["id"]) is not None
     assert (await _trash(writer, "folders", kept["id"])).status_code == 200
     assert (await _trash(writer, "folders", archive["id"])).status_code == 200
@@ -281,12 +246,10 @@ async def test_deleting_a_trashed_folder_leaves_what_was_trashed_on_its_own(writ
 
 
 async def test_empty_trash_deletes_everything_in_it_for_good(writer) -> None:
-    loose = (await _upload_markdown(writer, b"# Loose\n", name="loose.md")).json()
+    loose = (await upload(writer, "loose.md", b"# Loose\n")).json()
     box = await post_folder(writer, "Box")
-    boxed = (
-        await _upload_markdown(writer, b"# Boxed\n", name="boxed.md", folder_id=box["id"])
-    ).json()
-    stays = await _document(writer, "stays.md", None, "# Stays\n")
+    boxed = (await upload(writer, "boxed.md", b"# Boxed\n", folder_id=box["id"])).json()
+    stays = await written_document(writer, "stays.md", None, "# Stays\n")
     assert (await _trash(writer, "documents", loose["id"])).status_code == 200
     assert (await _trash(writer, "folders", box["id"])).status_code == 200
 
@@ -312,7 +275,7 @@ async def test_an_entry_an_interrupted_move_left_goes_back_before_anything_is_wr
     """The process died between the move into the Trash, recorded, and the row's commit:
     the row is live and its directory waits in the Trash. The next read brings it back
     rather than writing a fresh copy beside the edits (docs/workspace.md § The Trash)."""
-    document = await _document(writer, "draft.md", None, "# Edited\n")
+    document = await written_document(writer, "draft.md", None, "# Edited\n")
     entry = trash_root(writer.root) / f"document-{document['id']}"
     entry.parent.mkdir(parents=True)
     (writer.root / "files" / "draft.md").rename(entry)
@@ -326,7 +289,7 @@ async def test_an_entry_an_interrupted_move_left_goes_back_before_anything_is_wr
 
 
 async def test_no_fresh_copy_stands_while_the_trash_keeps_the_files(writer, monkeypatch) -> None:
-    document = await _document(writer, "draft.md", None, "# Edited\n")
+    document = await written_document(writer, "draft.md", None, "# Edited\n")
     directory = writer.root / "files" / "draft.md"
     entry = trash_root(writer.root) / f"document-{document['id']}"
     entry.parent.mkdir(parents=True)
@@ -355,7 +318,7 @@ async def test_an_entry_whose_row_is_gone_is_removed(writer) -> None:
 
 
 async def test_reconciliation_leaves_trashed_rows_in_the_trash(writer) -> None:
-    document = await _document(writer, "kept.md", None, "# Kept\n")
+    document = await written_document(writer, "kept.md", None, "# Kept\n")
     old = await post_folder(writer, "Old")
     assert (await _trash(writer, "documents", document["id"])).status_code == 200
     assert (await _trash(writer, "folders", old["id"])).status_code == 200
@@ -382,8 +345,8 @@ async def test_reconciliation_leaves_trashed_rows_in_the_trash(writer) -> None:
 
 
 async def test_a_move_to_the_trash_whose_commit_rolled_back_comes_back(writer, monkeypatch) -> None:
-    document = await _document(writer, "draft.md", None, "# Draft\n")
-    _fail_next_commit(monkeypatch, landed=False)
+    document = await written_document(writer, "draft.md", None, "# Draft\n")
+    fail_next_commit(monkeypatch, landed=False)
     with contextlib.suppress(Exception):
         await _trash(writer, "documents", document["id"])
 
@@ -396,8 +359,8 @@ async def test_a_move_to_the_trash_whose_commit_rolled_back_comes_back(writer, m
 
 
 async def test_a_move_to_the_trash_whose_commit_landed_stays_there(writer, monkeypatch) -> None:
-    document = await _document(writer, "draft.md", None, "# Draft\n")
-    _fail_next_commit(monkeypatch, landed=True)
+    document = await written_document(writer, "draft.md", None, "# Draft\n")
+    fail_next_commit(monkeypatch, landed=True)
     with contextlib.suppress(Exception):
         await _trash(writer, "documents", document["id"])
 
@@ -410,9 +373,9 @@ async def test_a_move_to_the_trash_whose_commit_landed_stays_there(writer, monke
 
 
 async def test_a_put_back_whose_commit_rolled_back_changes_nothing(writer, monkeypatch) -> None:
-    document = await _document(writer, "draft.md", None, "# Draft\n")
+    document = await written_document(writer, "draft.md", None, "# Draft\n")
     assert (await _trash(writer, "documents", document["id"])).status_code == 200
-    _fail_next_commit(monkeypatch, landed=False)
+    fail_next_commit(monkeypatch, landed=False)
 
     refused = await _restore(writer, "documents", document["id"])
     assert refused.status_code == 409
@@ -426,9 +389,9 @@ async def test_a_put_back_whose_commit_rolled_back_changes_nothing(writer, monke
 
 
 async def test_a_put_back_whose_commit_landed_brings_the_files(writer, monkeypatch) -> None:
-    document = await _document(writer, "draft.md", None, "# Draft\n")
+    document = await written_document(writer, "draft.md", None, "# Draft\n")
     assert (await _trash(writer, "documents", document["id"])).status_code == 200
-    _fail_next_commit(monkeypatch, landed=True)
+    fail_next_commit(monkeypatch, landed=True)
 
     restored = await _restore(writer, "documents", document["id"])
     assert restored.status_code == 200, restored.text
@@ -464,7 +427,7 @@ async def test_a_trashed_files_conversation_takes_no_message(writer) -> None:
         "/api/agents/chat/settings", json={"model": "vendor/chat-model"}, headers=CSRF_HEADERS
     )
     assert chosen.status_code == 200, chosen.text
-    document = await _document(writer, "draft.md", None, "# Draft\n")
+    document = await written_document(writer, "draft.md", None, "# Draft\n")
     conversation = await writer.post(
         f"/api/library/documents/{document['id']}/conversations", headers=CSRF_HEADERS
     )
@@ -490,9 +453,9 @@ async def test_a_copied_document_has_files_of_its_own(writer) -> None:
     assert chosen.status_code == 200, chosen.text
     papers = await post_folder(writer, "Papers")
     other = await post_folder(writer, "Other")
-    uploaded = await _upload_markdown(writer, b"# Draft\n", name="draft.md", folder_id=papers["id"])
+    uploaded = await upload(writer, "draft.md", b"# Draft\n", folder_id=papers["id"])
     source = uploaded.json()
-    await _write(writer, source["id"], "# Draft, edited\n")
+    await write_content(writer, source["id"], "# Draft, edited\n")
     content = (await writer.get(f"/api/library/documents/{source['id']}/content")).json()
     noted = await writer.put(
         f"/api/library/documents/{source['id']}/notes",
@@ -535,7 +498,7 @@ async def test_a_copied_document_has_files_of_its_own(writer) -> None:
 
     # Its own from here: an edit to the copy leaves the source as it was, the images come
     # into its `figures/` at its first read, and the conversations stay with the source.
-    await _write(writer, made["id"], "# Copy\n")
+    await write_content(writer, made["id"], "# Copy\n")
     assert (directory / "figures" / image).is_file()
     source_content = await writer.get(f"/api/library/documents/{source['id']}/content")
     assert source_content.json()["markdown"] == "# Draft, edited\n"
@@ -556,10 +519,10 @@ async def test_a_copied_folder_mirrors_its_live_tree(writer) -> None:
     papers = await post_folder(writer, "Papers")
     year = await post_folder(writer, "2026", papers["id"])
     gone = await post_folder(writer, "Gone", papers["id"])
-    await _document(writer, "top.md", papers["id"], "# Top\n")
-    await _document(writer, "deep.md", year["id"], "# Deep\n")
-    await _document(writer, "hidden.md", gone["id"], "# Hidden\n")
-    trashed = await _document(writer, "trashed.md", papers["id"], "# Trashed\n")
+    await written_document(writer, "top.md", papers["id"], "# Top\n")
+    await written_document(writer, "deep.md", year["id"], "# Deep\n")
+    await written_document(writer, "hidden.md", gone["id"], "# Hidden\n")
+    trashed = await written_document(writer, "trashed.md", papers["id"], "# Trashed\n")
     (writer.root / "files" / "Papers" / "2026" / "stray.txt").write_text("from the shell")
     assert (await _trash(writer, "folders", gone["id"])).status_code == 200
     assert (await _trash(writer, "documents", trashed["id"])).status_code == 200
@@ -596,8 +559,8 @@ async def test_a_copied_folder_mirrors_its_live_tree(writer) -> None:
 async def test_a_copy_of_a_running_parse_gets_its_files_when_the_parse_ends(
     writer, tmp_path
 ) -> None:
-    upload = tmp_path / "upload.pdf"
-    source_id, job_id = await _running_parse(writer, upload)
+    staged = tmp_path / "upload.pdf"
+    source_id, job_id = await _running_parse(writer, staged)
 
     copied = await _copy(writer, "documents", source_id, None)
     assert copied.status_code == 201, copied.text
@@ -622,13 +585,13 @@ async def test_a_copy_of_a_running_parse_gets_its_files_when_the_parse_ends(
         directory = writer.root / "files" / name
         assert (directory / "doc.md").read_text() == "# Paper\n"
         assert json.loads((directory / ".meta.json").read_text())["document_id"] == document_id
-    assert not upload.exists()
+    assert not staged.exists()
 
 
 async def test_a_copy_whose_commit_rolled_back_leaves_nothing_behind(writer, monkeypatch) -> None:
-    source = (await _upload_markdown(writer, b"# Draft\n", name="draft.md")).json()
-    await _write(writer, source["id"], "# Draft, edited\n")
-    _fail_next_commit(monkeypatch, landed=False)
+    source = (await upload(writer, "draft.md", b"# Draft\n")).json()
+    await write_content(writer, source["id"], "# Draft, edited\n")
+    fail_next_commit(monkeypatch, landed=False)
 
     refused = await _copy(writer, "documents", source["id"], None)
     assert refused.status_code == 409
@@ -645,8 +608,8 @@ async def test_a_copy_whose_commit_rolled_back_leaves_nothing_behind(writer, mon
 async def test_a_copy_whose_commit_landed_despite_the_error_is_answered_as_made(
     writer, monkeypatch
 ) -> None:
-    source = await _document(writer, "draft.md", None, "# Draft\n")
-    _fail_next_commit(monkeypatch, landed=True)
+    source = await written_document(writer, "draft.md", None, "# Draft\n")
+    fail_next_commit(monkeypatch, landed=True)
 
     copied = await _copy(writer, "documents", source["id"], None)
     assert copied.status_code == 201, copied.text
@@ -658,7 +621,7 @@ async def test_a_copy_brings_back_files_an_interrupted_move_left_in_the_trash(wr
     """The process died between the move into the Trash and the row's commit: the row is
     live and its edits wait in the Trash. A copy runs the repair rule first, so it copies
     the edits, not a baseline (docs/workspace.md § Copies)."""
-    document = await _document(writer, "draft.md", None, "# Edited\n")
+    document = await written_document(writer, "draft.md", None, "# Edited\n")
     entry = trash_root(writer.root) / f"document-{document['id']}"
     entry.parent.mkdir(parents=True)
     (writer.root / "files" / "draft.md").rename(entry)
@@ -676,7 +639,7 @@ async def test_no_copy_is_made_while_the_trash_keeps_the_files(writer, monkeypat
     above it, or an entry of anything inside a copied folder."""
     papers = await post_folder(writer, "Papers")
     year = await post_folder(writer, "2026", papers["id"])
-    deep = await _document(writer, "deep.md", year["id"], "# Deep\n")
+    deep = await written_document(writer, "deep.md", year["id"], "# Deep\n")
     monkeypatch.setattr(workspace_documents, "_return_entry", lambda root, name, home: False)
     entry = trash_root(writer.root) / f"document-{deep['id']}"
     entry.parent.mkdir(parents=True)
@@ -745,7 +708,7 @@ async def test_a_destination_trashed_after_the_check_takes_no_new_entry(
 
 
 async def test_the_status_route_counts_the_trash_on_its_own_line(writer) -> None:
-    document = await _document(writer, "draft.md", None, "# Draft\n")
+    document = await written_document(writer, "draft.md", None, "# Draft\n")
     before = (await writer.get("/api/sandbox")).json()["workspace"]
     (live,) = (await writer.get("/api/library")).json()["documents"]
     assert before["trash_bytes"] == 0 and live["storage_bytes"] > 0
@@ -761,7 +724,7 @@ async def test_the_status_route_counts_the_trash_on_its_own_line(writer) -> None
 async def test_a_workspace_too_deep_to_measure_lists_its_documents_without_sizes(
     writer, monkeypatch
 ) -> None:
-    await _document(writer, "draft.md", None, "# Draft\n")
+    await written_document(writer, "draft.md", None, "# Draft\n")
     (writer.root / "files" / "a" / "b" / "c" / "d").mkdir(parents=True)
     monkeypatch.setattr(safe_io, "DEPTH_MAX", 3)
     (row,) = (await writer.get("/api/library")).json()["documents"]

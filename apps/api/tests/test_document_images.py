@@ -18,7 +18,8 @@ from PIL import Image
 from sightread.workspace.documents import sweep_orphaned_images
 from sightread.workspace.layout import images_dir
 from tests.chat_helpers import seed_document
-from tests.conftest import CSRF_HEADERS
+from tests.conftest import CSRF_HEADERS, sign_in
+from tests.library_helpers import new_document
 
 IMAGE_PATH = re.compile(r"figures/img-[0-9a-f]{16}\.(png|jpg)")
 
@@ -31,10 +32,9 @@ def _image(image_format: str, size: tuple[int, int] = (40, 30), mode: str = "RGB
     return buffer.getvalue()
 
 
-async def _document(client: AsyncClient, name: str = "Draft") -> int:
-    created = await client.post(
-        "/api/library/documents/new", json={"name": name}, headers=CSRF_HEADERS
-    )
+async def _document(client: AsyncClient) -> int:
+    """A new markdown document, `Draft.md`; its id."""
+    created = await new_document(client, "Draft")
     assert created.status_code == 201, created.text
     return created.json()["id"]
 
@@ -88,8 +88,7 @@ async def test_an_inserted_image_is_kept_copied_and_served(writer) -> None:
 
 
 async def test_an_image_is_kept_as_png_or_jpeg_within_the_long_edge(make_client) -> None:
-    client = make_client(document_image_long_edge=50)
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    client = await sign_in(make_client(document_image_long_edge=50))
     document_id = await _document(client)
     jpeg = await _insert(client, document_id, _image("JPEG", (200, 100)), "photo.jpg", "image/jpeg")
     assert jpeg.json()["path"].endswith(".jpg")
@@ -119,11 +118,9 @@ async def test_only_the_accepted_formats_are_decoded(writer) -> None:
 
 
 async def test_an_image_past_its_caps_is_refused(make_client) -> None:
-    client = make_client(
-        document_image_max_bytes=2048,
-        chat_page_image_max_pixels=1000,
+    client = await sign_in(
+        make_client(document_image_max_bytes=2048, chat_page_image_max_pixels=1000)
     )
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
     document_id = await _document(client)
     large = await _insert(client, document_id, b"\x89PNG" + b"\0" * 4096)
     assert large.status_code == 413
@@ -199,10 +196,7 @@ async def test_the_images_of_rows_that_are_gone_are_swept(writer) -> None:
 async def test_an_image_the_quota_has_no_room_for_is_refused(writer) -> None:
     document_id = await _document(writer)
     writer.app.state.settings.workspace_quota_bytes = 1
-    try:
-        refused = await _insert(writer, document_id, _image("PNG"))
-    finally:
-        writer.app.state.settings.workspace_quota_bytes = 10 * 1024 * 1024 * 1024
+    refused = await _insert(writer, document_id, _image("PNG"))
     assert refused.status_code == 409
     assert not (images_dir(writer.root) / str(document_id)).exists()
 

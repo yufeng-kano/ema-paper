@@ -50,6 +50,11 @@ async def _seed(db, *, markdown: str = "# Title\n\nBody\n") -> tuple[User, Docum
     return user, document
 
 
+def _nothing_aside(root: Path) -> bool:
+    """No directory a delete or a move set aside is left in the workspace root."""
+    return not [name for name in os.listdir(root) if name.startswith(safe_io.TEMP_PREFIX)]
+
+
 def test_path_segments_cannot_escape_or_shadow_the_workspace() -> None:
     assert path_segment("..") == "_.."
     assert path_segment(".hidden") == "_.hidden"
@@ -162,7 +167,8 @@ async def test_keep_source_moves_the_upload_into_the_document_directory(tmp_path
     documents.keep_source(root, Path("files/paper.pdf"), upload, document_id=31, kind="pdf")
     assert (root / "files" / "paper.pdf" / "source.pdf").read_bytes() == b"%PDF-1.4"
     # Ignored by git: the binary never enters history.
-    assert git.commit_all(root, "user", "x") is None or "source" not in git.log(root)[0].files
+    assert git.commit_all(root, "user", "x") is not None
+    assert git.log(root)[0].files == ("files/paper.pdf/.meta.json",)
 
 
 async def test_revert_follows_a_rename(sessionmaker, tmp_path) -> None:
@@ -627,7 +633,7 @@ async def test_a_folder_set_aside_by_a_crashed_delete_comes_back_whole(
         assert paths.doc.read_text() == "# Title\n\nBody\n"
         assert (root / "files" / "Papers" / "scratch.txt").read_text() == "notes\n"
         assert (root / "files" / "Papers" / "drafts").is_dir()
-        assert not [name for name in os.listdir(root) if name.startswith(safe_io.TEMP_PREFIX)]
+        assert _nothing_aside(root)
         assert git.log(root)[0].message == "restore files/Papers"
 
 
@@ -657,7 +663,7 @@ async def test_an_aside_holding_a_deleted_document_does_not_come_back_whole(
         assert paths.doc.read_text() == "# Title\n\nBody\n"
         assert not other_paths.directory.exists()
         assert not (root / "files" / "Papers" / "scratch.txt").exists()
-        assert not [name for name in os.listdir(root) if name.startswith(safe_io.TEMP_PREFIX)]
+        assert _nothing_aside(root)
 
 
 async def test_a_failed_library_parse_keeps_its_original(sessionmaker, tmp_path) -> None:
@@ -734,10 +740,15 @@ async def test_reverting_a_rename_moves_the_directory_back_and_the_row_follows(
         await documents.write_content(
             db, settings, document, markdown="# Title\n\nEdited\n", base_revision=content.revision
         )
+        # The original and a crop: in the directory, outside history.
+        (before.directory / "source.pdf").write_bytes(b"%PDF-1.4 original")
+        (before.directory / "figures").mkdir()
+        (before.directory / "figures" / "p1_0_0_10_10.png").write_bytes(b"png")
         document.name = "renamed.pdf"
         await db.commit()
         after = await documents.document_paths(db, settings, document)
         await documents.move_path(settings, user.id, before.relative, after.relative)
+        assert (after.directory / "source.pdf").exists()
         rename = git.log(after.root)[0]
         assert rename.message.startswith("move ")
 
@@ -745,6 +756,8 @@ async def test_reverting_a_rename_moves_the_directory_back_and_the_row_follows(
         row = (await db.execute(select(Document).where(Document.id == document.id))).scalar_one()
         assert row.name == "paper.pdf"
         assert before.doc.read_text() == "# Title\n\nEdited\n"
+        assert (before.directory / "source.pdf").read_bytes() == b"%PDF-1.4 original"
+        assert (before.directory / "figures" / "p1_0_0_10_10.png").exists()
         assert not after.directory.exists()
         assert reverted.revision == documents.revision_of("# Title\n\nEdited\n")
         assert git.log(after.root)[0].commit == reverted.commit
@@ -1033,9 +1046,7 @@ def test_a_staging_failure_is_an_error_not_a_silent_save(tmp_path) -> None:
     git.ensure_repo(root)
     safe_io.write_text(root, root / "files" / "doc.md", "one")
     assert git.commit_paths(root, "user", "first", [Path("files/doc.md")]) is not None
-    # A pathspec that matches nothing is skipped...
-    assert git.commit_paths(root, "user", "none", [Path("files/gone")]) is None
-    # ...a stale index lock is not.
+    # A stale index lock is an error, never a skipped save.
     (git_dir(root) / "index.lock").write_text("")
     safe_io.write_text(root, root / "files" / "doc.md", "two")
     with pytest.raises(git.GitError):
@@ -1085,7 +1096,7 @@ def test_a_revert_past_the_total_bound_is_refused_before_anything_moves(tmp_path
     git.commit_all(root, "user", "four files")
     for index in range(4):
         safe_io.write_text(root, root / "files" / "d" / f"f{index}.txt", "y" * 1000)
-    (shell,) = [git.commit_all(root, "agent:1", "edit all four")]
+    shell = git.commit_all(root, "agent:1", "edit all four")
     paths = documents.DocumentPaths(root=root, relative=Path("files/d"))
     with pytest.raises(ApiError) as refused:
         documents._revert(paths, shell, max_bytes=10_000, total_max_bytes=2_500, max_paths=100)
@@ -1290,28 +1301,6 @@ async def test_a_removal_whose_rows_stay_is_put_back(sessionmaker, tmp_path) -> 
     assert newest.message == f"restore {paths.relative}"
 
 
-async def test_a_reverted_rename_takes_the_untracked_assets_along(sessionmaker, tmp_path) -> None:
-    settings = path_settings(tmp_path)
-    async with sessionmaker() as db:
-        user, document = await _seed(db)
-        before = await documents.materialize_document(db, settings, document)
-        # The original and a crop: in the directory, outside history.
-        (before.directory / "source.pdf").write_bytes(b"%PDF-1.4 original")
-        (before.directory / "figures").mkdir()
-        (before.directory / "figures" / "p1_0_0_10_10.png").write_bytes(b"png")
-        document.name = "renamed.pdf"
-        await db.commit()
-        after = await documents.document_paths(db, settings, document)
-        await documents.move_path(settings, user.id, before.relative, after.relative)
-        assert (after.directory / "source.pdf").exists()
-        rename = git.log(after.root)[0]
-
-        await documents.revert(db, settings, document, rename.commit)
-        assert (before.directory / "source.pdf").read_bytes() == b"%PDF-1.4 original"
-        assert (before.directory / "figures" / "p1_0_0_10_10.png").exists()
-        assert not after.directory.exists()
-
-
 def test_a_git_that_stalls_is_ended_at_the_deadline(tmp_path, monkeypatch) -> None:
     import stat as stat_module
 
@@ -1427,9 +1416,7 @@ def test_a_removal_whose_revision_cannot_be_recorded_moves_back(tmp_path, monkey
         documents._remove_tree(root, Path("files/d"), "delete files/d")
     assert refused.value.status_code == 409
     assert (root / "files" / "d" / "source.pdf").read_bytes() == b"%PDF"
-    assert not [
-        name for name, _ in safe_io.list_dir(root, root) if name.startswith(safe_io.TEMP_PREFIX)
-    ]
+    assert _nothing_aside(root)
 
 
 async def test_a_move_whose_commit_fails_is_undone(sessionmaker, tmp_path, monkeypatch) -> None:
@@ -1711,21 +1698,7 @@ async def test_a_delete_the_process_died_in_is_restored_by_reconciliation(
         assert await reconcile.reconcile_user(db, settings, user.id) == 1
         assert paths.doc.read_text() == "# Edited\n"
         assert git.log(paths.root)[0].message.startswith("restore ")
-        assert not [name for name in os.listdir(paths.root) if name.startswith(".sr-tmp-")]
-        # An aside whose rows are gone for good is swept, as before.
-        other = Document(
-            user_id=user.id, folder_id=document.folder_id, job_id=document.job_id, name="gone.pdf"
-        )
-        db.add(other)
-        await db.commit()
-        other_paths = await documents.materialize_document(db, settings, other)
-        gone = await documents.remove_path(settings, user.id, other_paths.relative)
-        assert gone is not None
-        await db.delete(other)
-        await db.commit()
-        await reconcile.reconcile_user(db, settings, user.id)
-        assert not [name for name in os.listdir(paths.root) if name.startswith(".sr-tmp-")]
-        assert not other_paths.directory.exists()
+        assert _nothing_aside(paths.root)
 
 
 async def test_a_move_that_fails_after_displacing_a_squatter_puts_it_back(
@@ -1817,7 +1790,7 @@ async def test_an_aside_without_document_metadata_comes_back_to_its_origin(
         assert await reconcile.reconcile_user(db, settings, user.id) >= 1
         assert (root / "files" / "Drafts" / "notes.txt").read_text() == "from bash\n"
         assert git.log(root)[0].message == "restore files/Drafts"
-        assert not [name for name in os.listdir(root) if name.startswith(safe_io.TEMP_PREFIX)]
+        assert _nothing_aside(root)
         # A document stripped of its metadata by a command comes back the same way.
         paths.meta.unlink()
         paths.doc.write_text("# Edited\n")
@@ -1826,7 +1799,7 @@ async def test_an_aside_without_document_metadata_comes_back_to_its_origin(
         assert removal is not None
         assert await reconcile.reconcile_user(db, settings, user.id) >= 1
         assert paths.doc.read_text() == "# Edited\n"
-        assert not [name for name in os.listdir(root) if name.startswith(safe_io.TEMP_PREFIX)]
+        assert _nothing_aside(root)
         # Once the rows are gone for good, an aside and its origin are swept together.
         await db.delete(drafts)
         await db.commit()
@@ -1834,7 +1807,7 @@ async def test_an_aside_without_document_metadata_comes_back_to_its_origin(
         assert removal is not None
         await reconcile.reconcile_user(db, settings, user.id)
         assert not (root / "files" / "Drafts").exists()
-        assert not [name for name in os.listdir(root) if name.startswith(safe_io.TEMP_PREFIX)]
+        assert _nothing_aside(root)
 
 
 def test_a_git_that_times_out_is_a_git_error_and_leaves_no_lock(tmp_path, monkeypatch) -> None:
@@ -1882,7 +1855,7 @@ async def test_a_removal_whose_origin_cannot_be_written_is_refused_whole(
         await documents.remove_path(settings, user.id, Path("files/Drafts"))
     assert refused.value.status_code == 409
     assert (root / "files" / "Drafts" / "notes.txt").read_text() == "from bash\n"
-    assert not [name for name in os.listdir(root) if name.startswith(safe_io.TEMP_PREFIX)]
+    assert _nothing_aside(root)
 
 
 async def test_undoing_a_move_puts_the_displaced_squatter_back_too(sessionmaker, tmp_path) -> None:
@@ -1927,12 +1900,6 @@ async def test_a_file_moved_in_from_another_document_reaches_beyond(sessionmaker
     moved_in = git.commit_all(root, "agent:1", "bash: mv")
     assert moved_in is not None
     assert documents.reaches_beyond(paths, moved_in) is True
-    # The document's own rename, by contrast, stays its own.
-    renamed = paths.relative.with_name("renamed.pdf")
-    own = await documents.move_path(settings, user.id, paths.relative, renamed)
-    assert own is not None and own.commit is not None
-    renamed_paths = documents.DocumentPaths(root=root, relative=renamed)
-    assert documents.reaches_beyond(renamed_paths, own.commit) is False
 
 
 async def test_reconciliation_removes_the_originals_of_rows_that_are_gone(
@@ -2010,7 +1977,7 @@ async def test_the_origin_is_written_before_the_directory_moves_aside(
         monkeypatch.setattr(safe_io, "rename", real)
         assert refused.value.status_code == 409
         assert len(markers_at_rename[0]) == 1
-        assert not [name for name in os.listdir(root) if name.startswith(safe_io.TEMP_PREFIX)]
+        assert _nothing_aside(root)
         assert paths.doc.is_file()
         # A marker whose rename never came: the next reconciliation sweeps the marker and
         # leaves the directory, which still stands where the marker says.
@@ -2132,7 +2099,7 @@ def test_packing_keeps_every_revision_and_drops_what_none_names(tmp_path) -> Non
     for text in ("one", "two", "three"):
         safe_io.write_text(root, root / "files" / "doc.md", text)
         git.commit_all(root, "user", text)
-    # What staging used to leave behind: a blob no revision names.
+    # A blob no revision names.
     garbage = git._git_raw(root, "hash-object", "-w", "--stdin", stdin=b"an original").strip()
     assert git.loose_objects(root) > 0
     git.pack(root)

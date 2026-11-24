@@ -45,7 +45,7 @@ from tests.conftest import (
     grant_plan,
     sign_in,
 )
-from tests.test_library import _upload
+from tests.library_helpers import ready_to_parse, upload_png
 
 
 async def _row(client: AsyncClient, user_id: int) -> Subscription | None:
@@ -697,18 +697,19 @@ async def test_a_turn_on_a_paid_plan_offers_the_shell_to_the_model(make_client) 
 
 async def test_the_plan_caps_the_parses_a_user_runs_at_once(make_client, documents) -> None:
     client = make_client(**PAY_SETTINGS)
-    user_id = (await sign_in(client)).user_id
+    await ready_to_parse(client)
+    user_id = client.user_id
     sessionmaker = client.app.state.sessionmaker
 
     # Free runs one parse at a time: with one running, the next upload waits.
     await add_parses(sessionmaker, user_id, 1, status="running", started_at=utcnow())
-    refused = await _upload(client, documents)
+    refused = await upload_png(client, documents)
     assert refused.status_code == 429, refused.text
     assert refused.headers["Retry-After"] == "30"
 
     # Pro runs two (the plan's `maxJobs`, under the deployment's ceiling).
     await grant_plan(sessionmaker, user_id)
-    accepted = await _upload(client, documents)
+    accepted = await upload_png(client, documents)
     assert accepted.status_code == 201, accepted.text
     await add_parses(sessionmaker, user_id, 1, status="running", started_at=utcnow())
     async with sessionmaker() as db:
@@ -716,7 +717,7 @@ async def test_the_plan_caps_the_parses_a_user_runs_at_once(make_client, documen
         assert sum(row.status == "running" for row in rows) == 2
     # At the cap, the same file again joins the parse already on its way (docs/jobs.md
     # § Concurrency caps); another file waits.
-    assert (await _upload(client, documents, name="again.png")).status_code == 201
+    assert (await upload_png(client, documents, name="again.png")).status_code == 201
     another = await client.post(
         "/api/library/documents",
         files={"file": ("more.jpg", documents["jpg"].read_bytes(), "image/jpeg")},

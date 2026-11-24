@@ -20,30 +20,9 @@ from sightread.routes.library import DOCUMENT_NAME_MAX
 from sightread.workspace import git
 from sightread.workspace.documents import original_of
 from tests.chat_helpers import MESSAGES_URL, assistant_turn, run_queued_turn
-from tests.conftest import CSRF_HEADERS
-
-
-async def _upload_markdown(
-    client: AsyncClient,
-    data: bytes,
-    name: str = "notes.md",
-    media_type: str = "application/octet-stream",
-    folder_id: int | None = None,
-) -> httpx.Response:
-    return await client.post(
-        "/api/library/documents",
-        files={"file": (name, data, media_type)},
-        data={} if folder_id is None else {"folder_id": str(folder_id)},
-        headers=CSRF_HEADERS,
-    )
-
-
-async def _new(client: AsyncClient, name: str, folder_id: int | None = None) -> httpx.Response:
-    return await client.post(
-        "/api/library/documents/new",
-        json={"name": name, "folder_id": folder_id},
-        headers=CSRF_HEADERS,
-    )
+from tests.conftest import CSRF_HEADERS, sign_in
+from tests.helpers import post_folder
+from tests.library_helpers import new_document, upload
 
 
 async def _jobs(client: AsyncClient) -> int:
@@ -66,11 +45,9 @@ NO_PARSE = {
 async def test_an_uploaded_md_is_a_document_with_no_parse(writer) -> None:
     """The upload is filed as it is — no job, no model needed — and its text, a BOM and
     CRLF line ends normalised, is the document; the original stays byte for byte."""
-    folder = (
-        await writer.post("/api/library/folders", json={"name": "Drafts"}, headers=CSRF_HEADERS)
-    ).json()
+    folder = await post_folder(writer, "Drafts")
     raw = "﻿# Plan\r\n\r\nShip it.\r\n".encode()
-    uploaded = await _upload_markdown(writer, raw, folder_id=folder["id"])
+    uploaded = await upload(writer, "notes.md", raw, folder_id=folder["id"])
     assert uploaded.status_code == 201, uploaded.text
     document = uploaded.json()
     assert {key: document[key] for key in NO_PARSE} == NO_PARSE
@@ -114,37 +91,33 @@ async def test_an_uploaded_md_is_a_document_with_no_parse(writer) -> None:
 
 
 async def test_a_markdown_type_alone_is_enough(writer) -> None:
-    uploaded = await _upload_markdown(writer, b"# Hi\n", name="readme", media_type="text/markdown")
+    uploaded = await upload(writer, "readme", b"# Hi\n", "text/markdown")
     assert uploaded.status_code == 201, uploaded.text
     assert uploaded.json()["kind"] == "markdown"
     assert uploaded.json()["name"] == "readme.md"
 
 
 async def test_a_markdown_upload_must_be_utf8_text_under_the_content_cap(make_client) -> None:
-    client = make_client(content_max_bytes=64)
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+    client = await sign_in(make_client(content_max_bytes=64))
     uploads = Path(client.app.state.settings.upload_dir)
 
-    latin1 = await _upload_markdown(client, "café\n".encode("latin-1"))
+    latin1 = await upload(client, "notes.md", "café\n".encode("latin-1"))
     assert latin1.status_code == 400, latin1.text
-    too_large = await _upload_markdown(client, b"x" * 65)
+    too_large = await upload(client, "notes.md", b"x" * 65)
     assert too_large.status_code == 413, too_large.text
     assert "CONTENT_MAX_BYTES" in too_large.json()["error"]["message"]
 
     assert (await client.get("/api/library")).json()["documents"] == []
     assert list(uploads.iterdir()) == []
     # A character split across the reader's slices is still UTF-8.
-    assert (await _upload_markdown(client, "é" * 32)).status_code == 201
+    assert (await upload(client, "notes.md", "é" * 32)).status_code == 201
 
 
 async def test_an_upload_the_quota_refuses_files_nothing(writer) -> None:
-    first = await _upload_markdown(writer, b"# One\n")
+    first = await upload(writer, "notes.md", b"# One\n")
     assert first.status_code == 201
     writer.app.state.settings.workspace_quota_bytes = 1
-    try:
-        refused = await _upload_markdown(writer, b"# Two\n")
-    finally:
-        writer.app.state.settings.workspace_quota_bytes = 10 * 1024 * 1024 * 1024
+    refused = await upload(writer, "notes.md", b"# Two\n")
     assert refused.status_code == 409, refused.text
     assert [row["name"] for row in (await writer.get("/api/library")).json()["documents"]] == [
         "notes.md"
@@ -156,13 +129,13 @@ async def test_an_upload_the_quota_refuses_files_nothing(writer) -> None:
 
 
 async def test_a_new_document_starts_empty_and_takes_a_free_name(writer) -> None:
-    created = await _new(writer, "Draft")
+    created = await new_document(writer, "Draft")
     assert created.status_code == 201, created.text
     document = created.json()
     assert {key: document[key] for key in NO_PARSE} == NO_PARSE
     assert document["name"] == "Draft.md"
-    assert (await _new(writer, "Draft")).json()["name"] == "Draft (2).md"
-    assert (await _new(writer, "Draft", folder_id=999_999)).status_code == 404
+    assert (await new_document(writer, "Draft")).json()["name"] == "Draft (2).md"
+    assert (await new_document(writer, "Draft", folder_id=999_999)).status_code == 404
     assert original_of(writer.root, document["id"]) is None
 
     content = (await writer.get(f"/api/library/documents/{document['id']}/content")).json()
@@ -182,7 +155,7 @@ async def test_a_new_document_starts_empty_and_takes_a_free_name(writer) -> None
 
 
 async def test_a_new_document_needs_a_name_and_the_csrf_header(writer) -> None:
-    assert (await _new(writer, "")).status_code == 422
+    assert (await new_document(writer, "")).status_code == 422
     refused = await writer.post("/api/library/documents/new", json={"name": "Draft"})
     assert refused.status_code == 403
 
@@ -190,7 +163,7 @@ async def test_a_new_document_needs_a_name_and_the_csrf_header(writer) -> None:
 async def test_a_removed_directory_comes_back_from_the_original(writer) -> None:
     """The baseline is the upload, as a parsed document's is its parse — so a directory
     the shell removed reads again as the text the document started with."""
-    document = (await _upload_markdown(writer, b"# Start\n")).json()
+    document = (await upload(writer, "notes.md", b"# Start\n")).json()
     content = (await writer.get(f"/api/library/documents/{document['id']}/content")).json()
     await writer.put(
         f"/api/library/documents/{document['id']}/content",
@@ -206,10 +179,8 @@ async def test_a_removed_directory_comes_back_from_the_original(writer) -> None:
 
 
 async def test_a_markdown_document_is_renamed_moved_and_deleted(writer) -> None:
-    document = (await _upload_markdown(writer, b"# Doc\n")).json()
-    folder = (
-        await writer.post("/api/library/folders", json={"name": "Kept"}, headers=CSRF_HEADERS)
-    ).json()
+    document = (await upload(writer, "notes.md", b"# Doc\n")).json()
+    folder = await post_folder(writer, "Kept")
     await writer.get(f"/api/library/documents/{document['id']}/content")
     moved = await writer.put(
         f"/api/library/documents/{document['id']}",
@@ -243,7 +214,7 @@ async def test_a_turn_on_a_markdown_document_edits_it_and_has_no_pages(writer) -
         headers=CSRF_HEADERS,
     )
     assert chosen.status_code == 200, chosen.text
-    document = (await _upload_markdown(writer, b"# Plan\n\nShip it.\n")).json()
+    document = (await upload(writer, "notes.md", b"# Plan\n\nShip it.\n")).json()
     created = await writer.post(
         f"/api/library/documents/{document['id']}/conversations", headers=CSRF_HEADERS
     )
@@ -307,11 +278,11 @@ async def test_a_markdown_document_is_named_with_its_extension(writer) -> None:
     """Written new, uploaded or renamed, the name ends in `.md` — `.markdown` kept — so every
     markdown document looks like the `.md` files beside it (docs/workspace.md § Markdown
     documents)."""
-    kept = await _new(writer, "plan.markdown")
+    kept = await new_document(writer, "plan.markdown")
     assert kept.json()["name"] == "plan.markdown"
-    assert (await _new(writer, "Notes.MD")).json()["name"] == "Notes.MD"
+    assert (await new_document(writer, "Notes.MD")).json()["name"] == "Notes.MD"
     at_limit = "x" * DOCUMENT_NAME_MAX
-    long = await _new(writer, at_limit)
+    long = await new_document(writer, at_limit)
     assert long.json()["name"] == f"{'x' * (DOCUMENT_NAME_MAX - 3)}.md"
 
     renamed = await writer.put(
@@ -324,7 +295,7 @@ async def test_a_markdown_document_is_named_with_its_extension(writer) -> None:
     await writer.get(f"/api/library/documents/{kept.json()['id']}/content")
     assert (writer.root / "files" / "summary.md" / "doc.md").exists()
     # A rename to a name the folder holds with its extension is the clash it looks like.
-    twin = await _new(writer, "Other")
+    twin = await new_document(writer, "Other")
     clash = await writer.put(
         f"/api/library/documents/{twin.json()['id']}",
         json={"name": "summary"},

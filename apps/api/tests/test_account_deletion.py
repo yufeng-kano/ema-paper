@@ -64,9 +64,8 @@ from tests.conftest import (
     sign_in,
 )
 from tests.factories import job_row
+from tests.library_helpers import upload, write_content
 from tests.test_document_images import _image, _insert
-from tests.test_library_trash import _write
-from tests.test_markdown_documents import _upload_markdown
 from tests.test_retention import _stranger
 
 SANDBOX_URL = "http://sandbox.test"
@@ -119,8 +118,8 @@ async def _footprint(client: AsyncClient) -> dict:
     assert (
         await client.post("/api/keys", json={"name": "laptop"}, headers=CSRF_HEADERS)
     ).status_code == 201
-    note = (await _upload_markdown(client, b"# Note\n", name="note.md")).json()
-    await _write(client, note["id"], "# Note, edited\n")
+    note = (await upload(client, "note.md", b"# Note\n")).json()
+    await write_content(client, note["id"], "# Note, edited\n")
     assert (await _insert(client, note["id"], _image("PNG"))).status_code == 201
     period_start = utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     async with client.app.state.sessionmaker() as db:
@@ -242,8 +241,8 @@ async def _owned_rows(client: AsyncClient, user_id: int) -> dict[str, int]:
 async def test_deleting_the_account_removes_every_row_and_file_of_it(make_client) -> None:
     account = await _account(make_client)
     stranger = await _stranger(make_client)
-    theirs = (await _upload_markdown(stranger, b"# Theirs\n", name="theirs.md")).json()
-    await _write(stranger, theirs["id"], "# Theirs, edited\n")
+    theirs = (await upload(stranger, "theirs.md", b"# Theirs\n")).json()
+    await write_content(stranger, theirs["id"], "# Theirs, edited\n")
     owned = await _footprint(account)
     token = account.cookies.get(SESSION_COOKIE)
     assert all((await _owned_rows(account, account.user_id)).values())
@@ -411,7 +410,7 @@ async def test_without_pay_the_stored_subscription_decides(make_client) -> None:
 async def test_running_work_refuses_and_queued_work_goes_with_the_account(make_client) -> None:
     account = await _account(make_client)
     uid = account.user_id
-    note = (await _upload_markdown(account, b"# Note\n", name="note.md")).json()
+    note = (await upload(account, "note.md", b"# Note\n")).json()
     async with account.app.state.sessionmaker() as db:
         running = await _job(db, uid, status="running")
         conversation = Conversation(user_id=uid, document_id=note["id"], session="s")
@@ -503,7 +502,7 @@ async def test_the_sweep_finishes_a_deletion_whose_files_the_request_left(
     owned = await _footprint(account)
     settings = account.app.state.settings
     stranger = await _stranger(make_client)
-    (await _upload_markdown(stranger, b"# Theirs\n", name="theirs.md")).json()
+    (await upload(stranger, "theirs.md", b"# Theirs\n")).json()
 
     async def failing(*args, **kwargs):
         raise OSError("disk unwell")
@@ -539,7 +538,7 @@ async def test_an_unreadable_marker_still_finishes_the_directories(
     from sightread.routes import control
 
     account = await _account(make_client)
-    await _upload_markdown(account, b"# Note\n", name="note.md")
+    await upload(account, "note.md", b"# Note\n")
     settings = account.app.state.settings
 
     async def failing(*args, **kwargs):

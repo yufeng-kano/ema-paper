@@ -21,7 +21,7 @@ from sightread.workspace import documents as workspace_documents
 from sightread.workspace import git
 from sightread.workspace.documents import original_of
 from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, PARSE_MODEL
-from tests.test_library_trash import _fail_next_commit
+from tests.library_helpers import fail_next_commit
 from tests.test_parse_end_to_end import _completion, _drain_queue
 from tests.test_retry_failed_pages import FALLBACK, Upstream, _library, _retry, _row, _upload
 
@@ -346,7 +346,7 @@ async def test_a_swap_whose_commit_fails_leaves_the_files_ahead_for_the_next_tak
     monkeypatch.undo()
 
     settings = library.app.state.settings
-    _fail_next_commit(monkeypatch, landed=False)
+    fail_next_commit(monkeypatch, landed=False)
     async with sessionmaker() as db:
         row = await db.get(Document, uploaded["id"])
         with pytest.raises(Exception, match="the connection dropped"):
