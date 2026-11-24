@@ -6,6 +6,7 @@ fixed public address and `respx` answers the connection to it."""
 
 from __future__ import annotations
 
+import asyncio
 import gzip
 import logging
 import os
@@ -32,7 +33,7 @@ from tests.chat_helpers import (
     send,
     stub_messages,
 )
-from tests.conftest import CSRF_HEADERS, PARSE_MODEL, TEST_MODEL_PRICES
+from tests.conftest import CSRF_HEADERS, PARSE_MODEL, TEST_MODEL_PRICES, postgres_only
 
 PUBLIC_IP = "1.2.3.4"
 HOSTS = {
@@ -1138,3 +1139,48 @@ async def test_a_signed_urls_query_never_reaches_a_result(tmp_path, monkeypatch)
         "https://example.org/gone.txt answered HTTP 404; find another source rather than "
         "retrying it."
     )
+
+
+# The round's results land together, which the SQLite fallback cannot sequence (`one_call`).
+@postgres_only
+@respx.mock
+@pytest.mark.parametrize("granted", [4, 100])
+async def test_the_searches_of_one_round_never_run_on_the_overdraft(make_client, granted) -> None:
+    """docs/chat.md § Tools: the searches of one round run together, each holding its price
+    against the balance from its start to its settlement. On a balance one search spends
+    (3 credits a call, 4 granted: 1 left), one runs and the rest are refused, as one at a
+    time would be; on a larger balance all of them run, side by side."""
+    client = await web_client(make_client, free_credits_per_period=granted, credit_usd="0.00005")
+    running = peak = 0
+
+    async def answer(request: httpx.Request) -> httpx.Response:
+        nonlocal running, peak
+        running += 1
+        peak = max(peak, running)
+        await asyncio.sleep(0.2)
+        running -= 1
+        return httpx.Response(200, json=brave_results("One"))
+
+    brave = respx.get(host="api.search.brave.com", path="/res/v1/web/search").mock(
+        side_effect=answer
+    )
+    searches = [
+        {"type": "tool_use", "id": f"s{index}", "name": "web_search", "input": {"query": "q"}}
+        for index in range(4)
+    ]
+    stub_messages(
+        [(searches, "tool_use"), ([{"type": "text", "text": "Here is what I have."}], "end_turn")]
+    )
+    conversation_id = await new_conversation(client)
+    await send(client, conversation_id, text="Search")
+    await run_queued_turn(client)
+    refused = [
+        result for result in await tool_results(client, conversation_id) if result["is_error"]
+    ]
+    if granted == 4:
+        assert brave.call_count == 1
+        assert [result["output"] for result in refused] == [chat_runner.NO_CREDITS_FOR_SEARCH] * 3
+    else:
+        assert (brave.call_count, refused) == (4, [])
+        assert peak > 1
+    assert await recorded(client, "web_search") == brave.call_count

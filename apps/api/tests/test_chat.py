@@ -869,7 +869,7 @@ async def test_a_rounds_images_never_exceed_the_budget(monkeypatch) -> None:
 async def test_a_stop_drops_a_round_of_reads(monkeypatch) -> None:
     rendered: list[str] = []
 
-    async def fake_run_tool(ctx, block, malformed, admit=None):
+    async def fake_run_tool(ctx, block, malformed):
         rendered.append(block["id"])
         return {"type": "tool_result", "tool_use_id": block["id"], "content": "ok"}
 
@@ -895,7 +895,7 @@ async def test_writing_tools_run_in_order_while_reads_run_together(monkeypatch) 
     reads_overlapped = False
     reads_running: set[str] = set()
 
-    async def fake_run_tool(ctx, block, malformed, admit=None):
+    async def fake_run_tool(ctx, block, malformed):
         nonlocal writer_overlap, reads_overlapped
         tool_id = block["id"]
         started.append(tool_id)
@@ -1051,7 +1051,7 @@ async def test_a_stop_ends_the_round_before_the_next_write(monkeypatch) -> None:
     calls: list[str] = []
     cancelled = {"value": False}
 
-    async def fake_run_tool(ctx, block, malformed, admit=None):
+    async def fake_run_tool(ctx, block, malformed):
         calls.append(block["id"])
         cancelled["value"] = True  # the user pressed Stop while the first write ran
         return {"type": "tool_result", "tool_use_id": block["id"], "content": "ok"}
@@ -1126,7 +1126,7 @@ async def test_a_stop_seen_by_the_reads_lets_the_running_write_finish(monkeypatc
 
     stopped = {"value": False}
 
-    async def fake_run_tool(ctx, block, malformed, admit=None):
+    async def fake_run_tool(ctx, block, malformed):
         if block["name"] == "bash":
             stopped["value"] = True  # the Stop lands while the shell command runs
             await asyncio.sleep(0.05)
@@ -1167,7 +1167,7 @@ async def test_a_stop_during_backoff_and_a_running_read_are_both_cut(monkeypatch
     flags["cancelled"] = False
     read_cancelled = asyncio.Event()
 
-    async def fake_run_tool(ctx, block, malformed, admit=None):
+    async def fake_run_tool(ctx, block, malformed):
         if block["name"] == "view_page":
             try:
                 await asyncio.sleep(30)
@@ -2239,11 +2239,12 @@ async def test_a_command_the_runner_could_not_confirm_over_keeps_the_marker_unti
         paths=paths,
         turn=SimpleNamespace(id=uuid.uuid4(), user_id=user.id),
         conversation=SimpleNamespace(id=3, session="s"),
+        images=SimpleNamespace(admit=lambda outcome: outcome),
     )
     block = {"id": "t1", "name": "bash", "input": {"command": "python write.py"}}
     # Neither the command nor the restart could be confirmed over: nothing is committed
     # and the marker stays, naming the shell, so host writes are refused.
-    result = await chat_runner._run_tool_unguarded(ctx, block, set(), lambda outcome: outcome)
+    result = await chat_runner._run_tool_unguarded(ctx, block, set())
     assert result["is_error"] and "takes no other write" in result["content"]
     assert shell.restarted == ["s"]
     assert read_writing(paths.root) == (3, "s")
@@ -2265,7 +2266,7 @@ async def test_a_command_the_runner_could_not_confirm_over_keeps_the_marker_unti
     assert "files/Papers/paper.pdf/half.txt" in head.files
 
     # Within a turn, a restart that confirms the kill records the tree right away.
-    result = await chat_runner._run_tool_unguarded(ctx, block, set(), lambda outcome: outcome)
+    result = await chat_runner._run_tool_unguarded(ctx, block, set())
     assert result["is_error"] and "restarted" in result["content"]
     assert not writing_marker(paths.root).exists()
     assert git.log(paths.root)[0].message == "bash: python write.py"
@@ -2306,12 +2307,12 @@ async def test_a_figure_read_is_bounded_by_the_image_budget_not_the_text_cap(
         turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
         conversation=SimpleNamespace(id=1, session="s"),
         tools=[{"name": "view_figure"}],
+        images=SimpleNamespace(admit=lambda outcome: outcome),
     )
     result = await chat_runner._run_tool_unguarded(
         ctx,
         {"id": "f1", "name": "view_figure", "input": {"page": 1, "bbox": [0, 0, 1000, 1000]}},
         set(),
-        lambda outcome: outcome,
     )
     assert "is_error" not in result
     assert result["content"][0]["type"] == "image"
@@ -2341,12 +2342,12 @@ async def test_a_shell_command_stands_marked_as_writing_for_its_whole_run(
         paths=paths,
         turn=SimpleNamespace(id=uuid.uuid4(), user_id=user.id),
         conversation=SimpleNamespace(id=3, session="s"),
+        images=SimpleNamespace(admit=lambda outcome: outcome),
     )
     result = await chat_runner._run_tool_unguarded(
         ctx,
         {"id": "t1", "name": "bash", "input": {"command": "touch made.txt"}},
         set(),
-        lambda outcome: outcome,
     )
     assert seen == [True]
     assert not writing_marker(paths.root).exists()  # the command is over and recorded

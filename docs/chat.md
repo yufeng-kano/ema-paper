@@ -42,7 +42,7 @@ Request shape, fixed by the runner:
 | `model` | the conversation's model: the agent's saved model when the conversation started, or the one the reader moved it to since (§ History is append-only) |
 | `max_tokens` | `CHAT_MAX_OUTPUT_TOKENS` (64 000) |
 | `system` | up to six text blocks, in the order below, each present only when it has something to say; the last block carries `cache_control: {type: ephemeral, ttl: 1h}` |
-| `tools` | `bash_20250124`, `text_editor_20250728` (`str_replace_based_edit_tool`), `view_page`, `view_figure`, `skill`, `subagent`, `memory` — the seven, always in this order; see below |
+| `tools` | `bash_20250124`, `text_editor_20250728` (`str_replace_based_edit_tool`), `view_page`, `view_figure`, `skill`, `subagent`, `memory`, in this order; then the web tools the deployment enables, `convert_file` (with a `PARSE_MODEL`), `insert_image`, and in a library conversation the eight library tools. `bash` only with a shell, and no `view_page` or `view_figure` in a library conversation (§ Tools, § Library conversations); see below |
 | `thinking` | `{type: adaptive, display: updates, block_binding: {prefix_mismatch_behavior: drop_block}}` with betas `thinking-display-updates-2026-08-18` and `thinking-binding-controls-2026-08-01`; see below |
 | `output_config.effort` | the agent's `effort` setting (`low` … `max`, default `medium`) |
 | `fallbacks` | `"default"` with beta `server-side-fallback-2026-07-01`; see below |
@@ -222,7 +222,7 @@ A long conversation is cut back to a summary, as Claude Code's `/compact` does. 
   - A round that asks for more than the allowance leaves runs the first of them, in the order they were made, and answers the rest with an error result saying the allowance is used, as a round past the credits is answered ([billing.md](./billing.md) § A chat turn).
   - The call after the allowance takes no tool.
 - It must end in text: an answer with none fails the turn (`compact_empty`) and changes nothing.
-- It is billed as a turn (§ Conversations, turns, events; [billing.md](./billing.md) § A chat turn). It needs the balance a send needs, and ends `out_of_credits` like one when the balance goes.
+- It is billed as a turn (§ Conversations, turns, events; [billing.md](./billing.md) § A chat turn). It needs the balance a send needs and, like a send's turn, finishes within the overdraft allowance when the balance goes. Its last call writes the summary, and it ends `out_of_credits` only if that call still stops on a tool call.
 
 #### What it leaves
 
@@ -400,11 +400,12 @@ The worker compacts a conversation before its cache expires, when the context is
 - Answered as up to ten results, each its title, URL, snippet and age.
 - **Charged `WEB_SEARCH_CREDITS` (3) per answered call** on top of the turn's tokens ([billing.md](./billing.md) § A chat turn):
   - the call is recorded as a `chat_tool_calls` row and the turn settled in the same transaction, so a turn that ends right after it is charged for it;
-  - a call Brave did not answer (a timeout, a 5xx, a refused key) costs nothing and counts toward nothing.
+  - a call Brave did not answer (a timeout, a 5xx, a refused key) costs nothing and is not counted toward the day's cap; it still counts toward the turn's.
 - Limits, each refusal an error result naming the limit:
   - at most `WEB_SEARCH_MAX_PER_TURN` (10) per turn;
   - at most `WEB_SEARCH_MAX_PER_DAY` (2000) per UTC day for the whole deployment — the operator's bill, bounded.
 - Refused once the turn's credits are exhausted, since the charge would have no balance (never in the overdraft tail).
+- Refused too when the searches of the turn still running would spend what is left: each holds its `WEB_SEARCH_CREDITS` against the last settled balance from its start to its settlement, so searches run together spend no more than the same searches made one at a time.
 - Not offered without the key. Runs with the reads. Never a subagent's.
 
 **`search_papers`**
@@ -413,6 +414,7 @@ The worker compacts a conversation before its cache expires, when the context is
 - Answers ten works by relevance, each its title, year, first authors, venue, DOI, citation count and — where OpenAlex knows one — the open-access PDF's URL, which `download_file` can take.
 - Costs no credits.
 - At most `PAPER_SEARCH_MAX_PER_TURN` (10) per turn and `PAPER_SEARCH_MAX_PER_DAY` (1000) per UTC day for the deployment, OpenAlex's own budget being the operator's.
+- A call OpenAlex did not answer is not counted toward the day's cap; it still counts toward the turn's.
 - Not offered without the key. Runs with the reads. Never a subagent's.
 
 **`read_url`**
@@ -1198,7 +1200,7 @@ The stored message is the record: an attached image is replayed like a page a to
 - **The estimate** counts only what streamed, so thinking the stream's short summaries leave out is not in it.
 - **Credits.** A turn is charged in credits as it runs, re-priced from its `usage_log` rows after every call ([billing.md](./billing.md) § A chat turn).
   - Each `web_search` call the turn made adds `WEB_SEARCH_CREDITS`, from its `chat_tool_calls` rows, settled as the call is answered (§ Tools).
-  - When the period's balance is gone, the loop ends after the call that spent it with a `turn_error` whose `error` is `out_of_credits`, the answer so far kept.
+  - When the period's balance is gone, the turn gets at most `CHAT_OVERDRAFT_MAX_TOOL_CALLS` more tool calls. Then its next model call is its last: it goes with no tools, and the turn ends `succeeded` when it answers. Only if that call still stops on a tool call are its tool calls dropped, its text kept, and the turn ends with a `turn_error` whose `error` is `out_of_credits` ([billing.md](./billing.md) § A chat turn).
   - A turn whose model has no price fails `model_unpriced` before its first call.
 - **A full workspace.** A turn that finds the workspace at its storage fails `storage_full` before its first call ([workspace.md](./workspace.md) § Quota). The send refuses it first, so this is a turn queued just before the workspace filled.
 

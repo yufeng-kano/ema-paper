@@ -907,7 +907,7 @@ def turn_note(
 ) -> str:
     """The turn block: the document's revision, the reader's locale and the languages the
     reader chose on the Agent page, each line only when chosen and stating its own rule, so
-    it holds under a replaced or migrated prompt and an edited `translate` (docs/chat.md
+    it holds under a replaced prompt and an edited `translate` (docs/chat.md
     § Instructions). A library conversation (`document` False) has no revision line
     (docs/chat.md § Library conversations)."""
     lines = ["Context for this message:"]

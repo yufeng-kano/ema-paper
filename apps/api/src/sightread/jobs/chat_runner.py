@@ -214,6 +214,12 @@ class TurnContext:
     # (docs/billing.md § A chat turn).
     credits_exhausted: bool = False
     overdraft_tool_calls: int = 0
+    # What the last settlement left the turn, and the web searches started and not yet
+    # settled: a search starts only while what is left, less the price of those, is above
+    # zero, so the searches of a round spend what they would one at a time
+    # (docs/chat.md § Tools).
+    remaining: int | None = None
+    searches_in_flight: int = 0
     # How many calls of each web tool the turn has started, against its per-turn caps
     # (docs/chat.md § Tools).
     web_calls: dict[str, int] = field(default_factory=dict)
@@ -835,29 +841,43 @@ async def _record_usage(
             # ledger agree by construction (docs/billing.md § A chat turn).
             remaining = await ledger.settle_chat(db, ctx.settings, ctx.turn.id)
             await db.commit()
-        if remaining is not None and remaining <= 0:
-            # The turn finishes within the overdraft allowance (docs/billing.md § A chat
-            # turn).
-            ctx.credits_exhausted = True
+        if remaining is not None:
+            ctx.remaining = remaining
+            if remaining <= 0:
+                # The turn finishes within the overdraft allowance (docs/billing.md § A chat
+                # turn).
+                ctx.credits_exhausted = True
 
     await to_the_end(record())
 
 
-async def _record_tool_call(ctx: TurnContext, tool: str, *, settle: bool) -> None:
+async def _record_tool_call(
+    ctx: TurnContext, tool: str, *, settle: bool, reserved: bool = False
+) -> None:
     """A web tool call that was answered or kept a file, as a `chat_tool_calls` row — what
     the per-day caps count — and, for a web search, the turn re-priced in the same commit
     so the search is charged the moment it is answered (docs/chat.md § Tools,
     docs/billing.md § A chat turn). Shielded like a usage row: a Stop right after the
-    search does not make it free."""
+    search does not make it free. `reserved`: the search held its price in
+    `searches_in_flight`, released as the settled balance takes it, with no await
+    between."""
 
     async def record() -> None:
-        async with ctx.sessionmaker() as db:
-            db.add(ChatToolCall(user_id=ctx.turn.user_id, turn_id=ctx.turn.id, tool=tool))
-            await db.flush()
-            remaining = await ledger.settle_chat(db, ctx.settings, ctx.turn.id) if settle else None
-            await db.commit()
-        if remaining is not None and remaining <= 0:
-            ctx.credits_exhausted = True
+        try:
+            async with ctx.sessionmaker() as db:
+                db.add(ChatToolCall(user_id=ctx.turn.user_id, turn_id=ctx.turn.id, tool=tool))
+                await db.flush()
+                remaining = (
+                    await ledger.settle_chat(db, ctx.settings, ctx.turn.id) if settle else None
+                )
+                await db.commit()
+            if remaining is not None:
+                ctx.remaining = remaining
+                if remaining <= 0:
+                    ctx.credits_exhausted = True
+        finally:
+            if reserved:
+                ctx.searches_in_flight -= 1
 
     await to_the_end(record())
 
@@ -907,6 +927,7 @@ async def _stream_once(
             )
             thinking_buffer.clear()
 
+    asked = str(body["model"])
     completed: CompletedMessage | None = None
     last_cancel_check = time.monotonic()
     progress = StreamProgress()
@@ -955,6 +976,27 @@ async def _stream_once(
                 raise item
             if isinstance(item, CompletedMessage):
                 completed = item
+                # Kano Proxy names a model `provider/model`; the upstream answers with the
+                # bare id. Read with the requested provider, the same model is not a
+                # fallback, and a real fallback is followed under a name Kano Proxy can
+                # route (docs/chat.md § Request).
+                provider = asked.rpartition("/")[0]
+                if provider and completed.model and "/" not in completed.model:
+                    completed.model = f"{provider}/{completed.model}"
+                if completed.model and completed.model not in ctx.settings.model_prices:
+                    # A name this deployment does not price — a group alias the upstream
+                    # answers under the target's own id, or a fallback nobody priced — is
+                    # not one to follow or bill as: the conversation would sit on a name no
+                    # later turn may run, and the call would be charged nothing. It is the
+                    # model asked for (docs/chat.md § Request).
+                    logger.warning(
+                        "turn %s: %s answered as %s, which is unpriced; kept as %s",
+                        ctx.turn.id,
+                        asked,
+                        completed.model,
+                        asked,
+                    )
+                    completed.model = asked
                 break
             event: StreamEvent = item
             if event.kind == "text_delta":
@@ -981,44 +1023,37 @@ async def _stream_once(
                         ),
                     )
     finally:
-        if not reader.done():
-            reader.cancel()
-        await asyncio.gather(reader, return_exceptions=True)
-        await stream.aclose()
-        usage = progress.usage_so_far()
-        if completed is None and usage is not None:
-            # The call ended before its message_stop — a Stop, the turn's timeout, a stream
-            # that broke — and is billed for what it streamed, as the model it asked for
-            # (docs/chat.md § Conversations, turns, events). A write that fails is logged
-            # rather than raised over what ended the call.
-            try:
-                await _record_usage(ctx, str(body["model"]), usage, conversation=parent is None)
-            except Exception:
-                logger.exception("turn %s: the usage of a call cut short was lost", ctx.turn.id)
+        closed = False
+        try:
+            if not reader.done():
+                reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
+            await stream.aclose()
+            closed = True
+        finally:
+            # Every call is billed here, as its stream closes and before anything else of
+            # it is awaited, so a cancel — the turn's timeout, a worker stopping — that
+            # lands while the stream closes or after never skips the row (docs/chat.md
+            # § Usage and credits). A call that ended before its message_stop — a Stop, the
+            # timeout, a stream that broke — is billed for what it streamed, as the model it
+            # asked for.
+            usage = completed.usage if completed is not None else progress.usage_so_far()
+            if usage is not None:
+                model = (completed is not None and completed.model) or asked
+                if completed is not None and closed:
+                    await _record_usage(ctx, model, usage, conversation=parent is None)
+                else:
+                    # A write that fails while something else ends the call is logged
+                    # rather than raised over it: the caller sees the cancel, the timeout or
+                    # the stream's failure.
+                    try:
+                        await _record_usage(ctx, model, usage, conversation=parent is None)
+                    except Exception:
+                        logger.exception("turn %s: the usage of a call was lost", ctx.turn.id)
     await flush_text()
     await flush_thinking()
     if completed is None:
         raise UpstreamError("The upstream closed the stream early", transient=True)
-    # Kano Proxy names a model `provider/model`; the upstream answers with the bare id. Read
-    # with the requested provider, the same model is not a fallback, and a real fallback is
-    # followed under a name Kano Proxy can route (docs/chat.md § Request).
-    asked = str(body["model"])
-    provider = asked.rpartition("/")[0]
-    if provider and completed.model and "/" not in completed.model:
-        completed.model = f"{provider}/{completed.model}"
-    if completed.model and completed.model not in ctx.settings.model_prices:
-        # A name this deployment does not price — a group alias the upstream answers under
-        # the target's own id, or a fallback nobody priced — is not one to follow or bill
-        # as: the conversation would sit on a name no later turn may run, and the call
-        # would be charged nothing. It is the model asked for (docs/chat.md § Request).
-        logger.warning(
-            "turn %s: %s answered as %s, which is unpriced; kept as %s",
-            ctx.turn.id,
-            asked,
-            completed.model,
-            asked,
-        )
-        completed.model = asked
     return completed
 
 
@@ -1065,19 +1100,17 @@ async def _call_model(
 # --- tools -------------------------------------------------------------------------------------
 
 
-Admit = Callable[[chat_tools.ToolOutcome], chat_tools.ToolOutcome]
-
 MALFORMED_INPUT = "The tool input was not valid JSON; send it again."
 TOOL_FAILED = "The tool failed unexpectedly; try another way."
 
 
-async def _run_tool(ctx: TurnContext, block: dict, malformed: set[str], admit: Admit) -> dict:
+async def _run_tool(ctx: TurnContext, block: dict, malformed: set[str]) -> dict:
     """One tool_use block → its tool_result block (plus the events along the way). A tool
-    that raises answers an error result: the model corrects itself, the turn goes on.
-    `admit` sees the outcome before it is reported and may replace it."""
+    that raises answers an error result: the model corrects itself, the turn goes on. The
+    outcome passes the turn's image budget (`ctx.images`) before it is reported."""
     try:
-        return await _run_tool_unguarded(ctx, block, malformed, admit)
-    except (asyncio.CancelledError, TurnCancelled):
+        return await _run_tool_unguarded(ctx, block, malformed)
+    except TurnCancelled:
         # A Stop a subagent saw inside its run is the turn's, not a failed tool.
         raise
     except Exception:  # any failure is this tool's, never the turn's
@@ -1090,9 +1123,7 @@ async def _run_tool(ctx: TurnContext, block: dict, malformed: set[str], admit: A
         )
 
 
-async def _run_tool_unguarded(
-    ctx: TurnContext, block: dict, malformed: set[str], admit: Admit
-) -> dict:
+async def _run_tool_unguarded(ctx: TurnContext, block: dict, malformed: set[str]) -> dict:
     name = block.get("name")
     tool_use_id = str(block.get("id"))
     tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
@@ -1120,7 +1151,7 @@ async def _run_tool_unguarded(
         outcome = await _run_web_read(ctx, name, tool_input)
     else:
         outcome = chat_tools.ToolOutcome(f"unknown tool {name!r}", is_error=True)
-    return await report_tool(ctx, tool_use_id, name, admit(outcome))
+    return await report_tool(ctx, tool_use_id, name, ctx.images.admit(outcome))
 
 
 async def view_page(ctx: TurnContext, tool_input: dict) -> chat_tools.ToolOutcome:
@@ -1516,15 +1547,15 @@ async def run_round(
     tool_uses: list[dict],
     *,
     is_write: Callable[[dict], bool],
-    read: Callable[[int, dict], Awaitable[dict]],
-    write: Callable[[int, dict], Awaitable[dict]],
+    run: Callable[[int, dict], Awaitable[dict]],
 ) -> list[dict]:
     """The results of one round — the turn's or a subagent's — in the order the calls were
     made. Reads run together, a few at a time, each looking for a Stop before it starts;
     the calls that write (`is_write`) run one after another, because each commits whatever
     is dirty and two in flight would file one's changes under the other, each waiting its
     turn with every other write of the turn and started only if no Stop came (docs/chat.md
-    § Tools). `read` and `write` run one call (by its index) and report it."""
+    § Tools). `run` runs one call (by its index) and reports it; a write's runs inside the
+    shielded writer."""
     results: dict[int, dict] = {}
     stopped = asyncio.Event()
     slots = asyncio.Semaphore(READ_CONCURRENCY)
@@ -1539,7 +1570,7 @@ async def run_round(
                 stopped.set()
                 return
             try:
-                results[index] = await read(index, block)
+                results[index] = await run(index, block)
             except TurnCancelled:
                 # A subagent that saw the Stop inside its run ends quietly like any other
                 # read, so a write still running finishes (docs/chat.md § Subagents) and
@@ -1559,7 +1590,7 @@ async def run_round(
                 results[index] = await run_writer(
                     ctx,
                     str(block.get("name")),
-                    lambda index=index, block=block: write(index, block),
+                    lambda index=index, block=block: run(index, block),
                 )
 
     # A task group: when the writes stop on a cancel, the reads still running are
@@ -1597,36 +1628,24 @@ async def _run_tools(
 
     ctx.images.start_round()
 
-    async def read(index: int, block: dict) -> dict:
-        # Only a page or a figure is refused ahead for a spent budget: every other read
+    async def run(index: int, block: dict) -> dict:
+        # Only a page or a figure is refused ahead for a spent budget: every other call
         # returns no image before it runs, so a reader's "remember this" late in a
-        # page-by-page check still lands, and a skill or a subagent still runs. A read
-        # not yet started is not started past the credits or the compaction's allowance.
+        # page-by-page check still lands, and a skill or a subagent still runs. An editor
+        # `view` of an image still counts against the round's and the turn's budgets as
+        # it is reported. A call not yet started is not started past the credits or the
+        # compaction's allowance; a write is admitted when its turn at the gate has come,
+        # not while it waited, and one already running finishes and commits as it would
+        # (docs/billing.md § A chat turn).
         refusal = ctx.images.refusal() if block.get("name") in IMAGE_READ_TOOLS else None
         if refusal is None:
             refusal = refused(index)
         if refusal is not None:
             return await report_tool(ctx, str(block.get("id")), block.get("name"), refusal)
-        return await _run_tool(ctx, block, malformed, ctx.images.admit)
-
-    async def write(index: int, block: dict) -> dict:
-        # Admitted when its turn at the gate has come, not while it waited: a write still
-        # waiting once the calls allowed after the credits ran out are used does not start;
-        # one already running finishes and commits as it would (docs/billing.md § A chat
-        # turn).
-        if (refusal := refused(index)) is not None:
-            return await report_tool(ctx, str(block.get("id")), block.get("name"), refusal)
-        # Admitted like a read: an editor `view` of an image counts against the round's
-        # and the turn's image budgets. Never refused ahead for a spent budget, since a
-        # write returns no image and a view cannot be known to before it runs.
-        return await _run_tool(ctx, block, malformed, ctx.images.admit)
+        return await _run_tool(ctx, block, malformed)
 
     return await run_round(
-        ctx,
-        tool_uses,
-        is_write=lambda block: block.get("name") in MUTATING_TOOLS,
-        read=read,
-        write=write,
+        ctx, tool_uses, is_write=lambda block: block.get("name") in MUTATING_TOOLS, run=run
     )
 
 
@@ -1682,21 +1701,35 @@ async def _run_web_read(ctx: TurnContext, name: str, tool_input: dict) -> chat_t
     § Tools)."""
     settings = ctx.settings
     if name == "web_search":
-        if ctx.credits_exhausted:
-            return chat_tools.ToolOutcome(NO_CREDITS_FOR_SEARCH, is_error=True)
         if await _calls_today(ctx, name) >= settings.web_search_max_per_day:
             return _day_cap_reached(name, per_user=False)
+        # No await from the check to the reservation: a search of the round sees every one
+        # started before it, settled or not, so together they start only as many as one at
+        # a time would (docs/billing.md § A chat turn).
+        if ctx.credits_exhausted or (
+            ctx.remaining is not None
+            and ctx.remaining - ctx.searches_in_flight * settings.web_search_credits <= 0
+        ):
+            return chat_tools.ToolOutcome(NO_CREDITS_FOR_SEARCH, is_error=True)
         if not _turn_cap(ctx, name, settings.web_search_max_per_turn):
             return _turn_cap_reached(name, settings.web_search_max_per_turn)
-        outcome = await chat_web.web_search(
-            _string_input(tool_input, "query"),
-            url=settings.brave_search_url,
-            api_key=settings.brave_search_api_key,
-            timeout=settings.web_tool_timeout_seconds,
-            user_agent=settings.web_tool_user_agent,
-        )
-        if not outcome.is_error:
-            await _record_tool_call(ctx, name, settle=True)
+        ctx.searches_in_flight += 1
+        try:
+            outcome = await chat_web.web_search(
+                _string_input(tool_input, "query"),
+                url=settings.brave_search_url,
+                api_key=settings.brave_search_api_key,
+                timeout=settings.web_tool_timeout_seconds,
+                user_agent=settings.web_tool_user_agent,
+            )
+        except BaseException:
+            ctx.searches_in_flight -= 1
+            raise
+        if outcome.is_error:
+            ctx.searches_in_flight -= 1
+        else:
+            # Released by the record, in the step that settles the search.
+            await _record_tool_call(ctx, name, settle=True, reserved=True)
         return outcome
     if name == "search_papers":
         if await _calls_today(ctx, name) >= settings.paper_search_max_per_day:
@@ -2206,8 +2239,8 @@ async def _loop(ctx: TurnContext) -> None:
         body = build_request(ctx, messages, since_marker=since_marker, final=final)
         if since_marker >= CACHE_GUARD_EVERY:
             since_marker = 0
+        # Billed as its stream closed (`_stream_once`).
         completed = await _call_model(ctx, body)
-        await _record_usage(ctx, completed.model or ctx.model, completed.usage, conversation=True)
         if completed.thinking_dropped:
             # The replay sent a block the API no longer takes: a change the binding cannot
             # see. The API would drop it again on every later call, with every block made

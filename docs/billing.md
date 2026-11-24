@@ -313,7 +313,7 @@ Each period has one `credit_periods` row per user. It is created on first use wi
 | A parse whose pages cost more than the current balance | **402** `insufficient_credits`, body `{need, remaining, period_end}`. The upload is not stored and an upload ticket is not spent |
 | A retry of a failed parse whose credits are more than the current balance | **402** `insufficient_credits`, same body; the retry is not queued |
 | A chat send with a balance under `CHAT_MIN_CREDITS` | **402** `insufficient_credits`, same body (`need` is the minimum) |
-| A turn whose balance runs out mid-way | the turn ends with `turn_error` `out_of_credits` (§ A chat turn) |
+| A turn whose balance runs out mid-way | the turn finishes within `CHAT_OVERDRAFT_MAX_TOOL_CALLS` more tool calls and ends `succeeded`; `turn_error` `out_of_credits` only when its last call still stops on a tool call (§ A chat turn) |
 | A checkout for a plan not on sale, or while Pay says checkout is closed | **409** `checkout_unavailable` |
 | A pack checkout for a pack not on sale, or while Pay says checkout is closed | **409** `checkout_unavailable` |
 | A pack checkout by a user whose current period is Free | **409** `plan_required` (§ Top-up packs) |

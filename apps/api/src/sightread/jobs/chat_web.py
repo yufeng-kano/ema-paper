@@ -593,7 +593,7 @@ async def _pdf_text(data: bytes, *, max_chars: int, timeout: float) -> tuple[str
     (docs/parsing.md); four bytes a character at most, so the cap always holds."""
     with tempfile.TemporaryDirectory(prefix="sr-read-url-") as work:
         path = Path(work) / "page.pdf"
-        path.write_bytes(data)
+        await asyncio.to_thread(path.write_bytes, data)
         text_bytes, goes_on = await poppler.pdf_text(
             path, cwd=Path(work), timeout=timeout, max_bytes=4 * max_chars
         )

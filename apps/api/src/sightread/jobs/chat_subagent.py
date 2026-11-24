@@ -12,7 +12,6 @@ paths, one write of the turn at a time (`chat_runner.run_writer`).
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import time
@@ -131,7 +130,7 @@ async def _run_one_guarded(
     """A tool that raises answers an error result, as the turn's own do."""
     try:
         return await _run_one(ctx, definition, block, malformed)
-    except (asyncio.CancelledError, chat_runner.TurnCancelled):
+    except chat_runner.TurnCancelled:
         raise
     except Exception:  # any failure is this tool's, never the run's
         logger.exception("a subagent's %s failed in turn %s", block.get("name"), ctx.turn.id)
@@ -162,9 +161,12 @@ async def _run_tools(
             steps_by_id[tool_use_id]["is_error"] = outcome.is_error
         return result
 
-    async def read(index: int, block: dict) -> dict:
+    async def run(index: int, block: dict) -> dict:
         # Only a page or a figure is refused ahead for a spent budget, as in the turn's own
-        # reads: an editor `view` of a text file still runs.
+        # round: an editor `view` of a text file still runs. A write is admitted when its
+        # turn at the gate has come, as the turn's own writes are, and reported inside the
+        # shielded writer: an `edit` the deadline interrupted is still announced before the
+        # terminal event.
         refusal = images.refusal() if block.get("name") in chat_runner.IMAGE_READ_TOOLS else None
         if refusal is None and not may_run(index):
             # Past the turn's allowance once the credits ran out (docs/billing.md § A chat
@@ -173,23 +175,8 @@ async def _run_tools(
         outcome = refusal or await _run_one_guarded(ctx, definition, block, malformed)
         return await report(block, images.admit(outcome))
 
-    async def write(index: int, block: dict) -> dict:
-        # Admitted when its turn at the gate has come, as the turn's own writes are
-        # (docs/billing.md § A chat turn). Reported inside the shielded writer: an `edit`
-        # the deadline interrupted is still announced before the terminal event.
-        if not may_run(index):
-            return await report(
-                block,
-                chat_tools.ToolOutcome(chat_runner.NOT_RUN_OUT_OF_CREDITS, is_error=True),
-            )
-        return await report(block, await _run_one_guarded(ctx, definition, block, malformed))
-
     return await chat_runner.run_round(
-        ctx,
-        tool_uses,
-        is_write=lambda block: _writes(definition, block),
-        read=read,
-        write=write,
+        ctx, tool_uses, is_write=lambda block: _writes(definition, block), run=run
     )
 
 
@@ -294,11 +281,11 @@ async def run_subagent(
             return chat_tools.ToolOutcome(
                 f"The subagent's model call failed: {reason}", is_error=True, subagent=record()
             )
-        # Billed whether or not anything of it is used, under the model it ran on, not the
-        # conversation's (docs/chat.md § Subagents).
+        # Billed as its stream closed (`chat_runner._stream_once`), whether or not anything
+        # of it is used, under the model it ran on, not the conversation's (docs/chat.md
+        # § Subagents). A reply that named no model is the one asked for.
         if not completed.model:
             completed.model = model
-        await chat_runner._record_usage(ctx, completed.model, completed.usage)
         if await chat_runner._cancelled(ctx):
             raise chat_runner.TurnCancelled()
         if completed.model != model:

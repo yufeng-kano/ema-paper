@@ -549,3 +549,98 @@ async def test_a_deleted_conversation_leaves_its_entries_in_the_ledger(sessionma
         [entry] = (await db.execute(select(CreditEntry))).scalars().all()
     assert (entry.kind, entry.state, entry.amount, entry.turn_id) == ("chat", "consumed", 2, None)
     assert (await credit_period(sessionmaker, user_id)).spent == 2
+
+
+def close_slowly(monkeypatch, *, cancel: bool) -> list[str]:
+    """Every stream of the runner closes slowly once it has ended: its `aclose` waits, and
+    with `cancel` the task closing it is cancelled there, as a worker's shutdown would. The
+    list says where the wait was interrupted."""
+    interrupted: list[str] = []
+    real = chat_runner.stream_messages
+
+    class SlowToClose:
+        def __init__(self, stream) -> None:
+            self.stream = stream
+
+        def __aiter__(self):
+            return self.stream.__aiter__()
+
+        async def aclose(self) -> None:
+            await self.stream.aclose()
+            if cancel:
+                asyncio.current_task().cancel()
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                interrupted.append("aclose")
+                raise
+
+    monkeypatch.setattr(
+        chat_runner, "stream_messages", lambda *args, **kwargs: SlowToClose(real(*args, **kwargs))
+    )
+    return interrupted
+
+
+@respx.mock
+@pytest.mark.parametrize("ending", ["timeout", "shutdown"])
+async def test_a_call_that_completed_is_charged_whatever_cancels_its_cleanup(
+    make_client, monkeypatch, ending
+) -> None:
+    """docs/chat.md § Usage and credits: a call whose message_stop arrived gets its usage
+    row and its settlement even when the turn's timeout, or a worker's shutdown, lands
+    while its stream is still being closed — once, as every call does."""
+    client = await chatting_client(make_client(credit_usd="0.0001", chat_turn_timeout_seconds=2))
+    interrupted = close_slowly(monkeypatch, cancel=ending == "shutdown")
+    respx.post(MESSAGES_URL).mock(
+        return_value=httpx.Response(
+            200, content=assistant_turn([{"type": "text", "text": "Done."}], "end_turn")
+        )
+    )
+    conversation_id = await new_conversation(client)
+    sent = await send(client, conversation_id, text="hi")
+    assert sent.status_code == 202, sent.text
+    if ending == "timeout":
+        await run_queued_turn(client)
+    else:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.create_task(run_queued_turn(client))
+    assert interrupted == ["aclose"]
+    async with client.app.state.sessionmaker() as db:
+        [row] = (await db.execute(select(UsageLog))).scalars().all()
+    assert (row.prompt_tokens, row.cache_read_tokens, row.completion_tokens) == (300, 200, 10)
+    assert row.model == "claude-code/claude-opus-5-5"
+    # 510 tokens at US$1 per million and US$0.0001 a credit, settled as the row was written.
+    assert (await client.get("/api/billing")).json()["period"]["spent"] == 6
+    if ending == "timeout":
+        [turn] = (await client.get(f"/api/conversations/{conversation_id}")).json()["turns"]
+        assert (turn["status"], turn["error"], turn["credits"]) == (
+            "failed",
+            "the turn timed out",
+            6,
+        )
+
+
+@respx.mock
+async def test_a_lost_usage_write_does_not_hide_the_timeout_that_cut_its_cleanup(
+    make_client, monkeypatch
+) -> None:
+    """A completed call's usage write that fails while the turn's timeout is unwinding its
+    cleanup is logged: the turn ends on its timeout, not on the database's error."""
+    client = await chatting_client(make_client(chat_turn_timeout_seconds=2))
+    interrupted = close_slowly(monkeypatch, cancel=False)
+
+    async def lost(*args, **kwargs) -> None:
+        raise RuntimeError("the database went away")
+
+    monkeypatch.setattr(chat_runner, "_record_usage", lost)
+    respx.post(MESSAGES_URL).mock(
+        return_value=httpx.Response(
+            200, content=assistant_turn([{"type": "text", "text": "Done."}], "end_turn")
+        )
+    )
+    conversation_id = await new_conversation(client)
+    await send(client, conversation_id, text="hi")
+    await run_queued_turn(client)
+    assert interrupted == ["aclose"]
+    [turn] = (await client.get(f"/api/conversations/{conversation_id}")).json()["turns"]
+    assert (turn["status"], turn["error"]) == ("failed", "the turn timed out")
