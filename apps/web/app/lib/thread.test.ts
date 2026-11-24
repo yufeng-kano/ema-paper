@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { ChatEvent, ChatMessage, ChatTurn, Memory } from './api'
 import {
+  appendFrames,
   applyMemoryEvent,
   buildThread,
   compactFocus,
@@ -67,7 +68,7 @@ describe('buildThread', () => {
     expect(edit.type === 'tool' && edit.card?.commit).toBe('c1')
     expect(edit.type === 'tool' && edit.added).toBe(1)
     // The last answer of a finished turn is the one its foot copies.
-    expect(items[4]).toMatchObject({ kind: 'foot', text: 'Done.', used: null })
+    expect(items[4]).toMatchObject({ kind: 'foot', text: 'Done.', used: null, credits: null })
   })
 
   it('shows a live turn from its events, the trailing group in flight', () => {
@@ -510,8 +511,8 @@ describe('a compaction turn', () => {
     expect(turnKind(turn(true), undefined)).toBe('message')
   })
 
-  it('becomes a divider with the focus and the summary, and dims everything above it', () => {
-    const earlier: ChatTurn = { id: 'turn-0', status: 'succeeded', error: null, finished_at: '2026-10-17T00:00:00Z' }
+  it('becomes a divider with the focus, the summary and its cost, and dims everything above it', () => {
+    const earlier: ChatTurn = { id: 'turn-0', status: 'succeeded', error: null, finished_at: '2026-10-17T00:00:00Z', credits: 3 }
     const before = [
       { ...message('user', [{ type: 'text', text: 'Hello' }]), turn_id: 'turn-0' },
       { ...message('assistant', [{ type: 'text', text: 'Hi.' }]), turn_id: 'turn-0' },
@@ -522,9 +523,20 @@ describe('a compaction turn', () => {
       message('assistant', [{ type: 'text', text: SUMMARY }]),
       message('user', [{ type: 'text', text: `Prefix. ${SUMMARY}`, context: 'summary' }]),
     ]
-    const { items, dimBefore } = buildThread({ turns: [earlier, compactTurn(true)], messages, groups: new Map() })
+    const { items, dimBefore } = buildThread({
+      turns: [earlier, { ...compactTurn(true), credits: 2 }],
+      messages,
+      groups: new Map(),
+    })
     expect(kinds(items)).toEqual(['user', 'text', 'foot', 'compact'])
-    expect(items[3]).toMatchObject({ kind: 'compact', turnId: TURN, focus: 'keep the table', summary: `Prefix. ${SUMMARY}` })
+    expect(items[2]).toMatchObject({ kind: 'foot', turnId: 'turn-0', credits: 3 })
+    expect(items[3]).toMatchObject({
+      kind: 'compact',
+      turnId: TURN,
+      focus: 'keep the table',
+      summary: `Prefix. ${SUMMARY}`,
+      credits: 2,
+    })
     expect(dimBefore).toBe(3)
   })
 
@@ -535,7 +547,9 @@ describe('a compaction turn', () => {
       message('user', [{ type: 'text', text: SUMMARY, context: 'summary' }]),
     ]
     const { items } = buildThread({ turns: [compactTurn(true, 'idle_compact')], messages: stored, groups: new Map() })
-    expect(items).toEqual([{ kind: 'compact', key: `t${TURN}-compact`, turnId: TURN, focus: null, summary: SUMMARY }])
+    expect(items).toEqual([
+      { kind: 'compact', key: `t${TURN}-compact`, turnId: TURN, focus: null, summary: SUMMARY, credits: null },
+    ])
     // Ended on the stream, the record not yet reloaded: no divider to draw yet.
     const live = buildThread({
       turns: [compactTurn(false)],
@@ -562,5 +576,28 @@ describe('a compaction turn', () => {
     expect(compactFocus([{ type: 'text', text: '/compact  the table ' }])).toBe('the table')
     expect(compactFocus([{ type: 'text', text: '/compact' }])).toBeNull()
     expect(compactFocus([])).toBeNull()
+  })
+})
+
+describe('appendFrames', () => {
+  const frame = (turnId: string, text: string) => ({ event: 'text_delta', turn_id: turnId, text }) as ChatEvent
+
+  it('joins a batch to the turns it touches and leaves the others’ arrays as they were', () => {
+    const first = [frame('a', 'one')]
+    const second = [frame('b', 'two')]
+    const groups = new Map([
+      ['a', first],
+      ['b', second],
+    ])
+    const next = appendFrames(groups, [frame('a', 'three'), frame('c', 'four'), frame('a', 'five')])
+    expect(next).not.toBe(groups)
+    expect([...next.keys()]).toEqual(['a', 'b', 'c'])
+    expect(next.get('a')?.map((event) => (event as { text: string }).text)).toEqual(['one', 'three', 'five'])
+    expect(next.get('a')).not.toBe(first)
+    expect(next.get('b')).toBe(second)
+    expect(next.get('c')?.map((event) => (event as { text: string }).text)).toEqual(['four'])
+    // The map it was given is not changed.
+    expect(groups.get('a')).toEqual([frame('a', 'one')])
+    expect(groups.has('c')).toBe(false)
   })
 })

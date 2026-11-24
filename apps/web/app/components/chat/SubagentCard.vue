@@ -4,30 +4,23 @@
  * subagent's name in mono, its task, then how many steps it has taken, how long it has run
  * and what it does now — or, once done, that it reported back. Opening it shows its own
  * steps (from its `parent` events while it runs, from the result's record once stored) —
- * a write's diff card with **Revert** among them, as in a group — and the report it handed
- * the agent.
+ * a write's diff card among them, with **Revert** outside library mode as in a group — and
+ * the report it handed the agent.
  */
 import { parseResultMarkdown } from '~/lib/markdown'
 import type { CardState, EditCard, SubagentView } from '~/lib/thread'
 
-const props = withDefaults(
-  defineProps<{
-    card: SubagentView
-    open: boolean
-    /** When the panel first saw it running; with `now`, how long it has run so far. */
-    startedAt: number | null
-    now: number
-    openSteps: ReadonlySet<string>
-    cardState: (card: EditCard) => CardState
-    /** A turn is unfinished: the revisions route refuses a revert under one. */
-    locked: boolean
-    /** A diff card offers *Revert* (not in the Files page's card). */
-    revertable?: boolean
-    /** The report's links to the Files page are drawn (the Files page's card). */
-    files?: boolean
-  }>(),
-  { revertable: true },
-)
+const props = defineProps<{
+  card: SubagentView
+  open: boolean
+  /** When the panel first saw it running; with `now`, how long it has run so far. */
+  startedAt: number | null
+  now: number
+  openSteps: ReadonlySet<string>
+  cardState: (card: EditCard) => CardState
+  /** A turn is unfinished: the revisions route refuses a revert under one. */
+  locked: boolean
+}>()
 
 const emit = defineEmits<{
   toggle: []
@@ -101,7 +94,6 @@ const reportBlocks = computed(() =>
           :open="openSteps.has(step.key)"
           :card-state="cardState"
           :locked="locked"
-          :revertable="revertable"
           @toggle="emit('toggle-step', step.key)"
           @toggle-edit="emit('toggle-edit', $event)"
         />
@@ -109,7 +101,7 @@ const reportBlocks = computed(() =>
       <div v-if="card.report" class="report" :class="{ failed: card.status === 'error' }">
         <span class="report-label">{{ t('chat.subagentReport') }}</span>
         <div class="report-body">
-          <MdBlock v-for="(block, index) in reportBlocks" :key="index" :block="block" links :files="files" />
+          <MdBlock v-for="(block, index) in reportBlocks" :key="index" :block="block" links :files="labels.library" />
         </div>
       </div>
     </div>

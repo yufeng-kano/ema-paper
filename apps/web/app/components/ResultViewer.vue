@@ -3,6 +3,8 @@
 // first — the whole component reads them, `<script setup>` included.
 import type { ComponentPublicInstance } from 'vue'
 import type { BlockHandleState } from '~/components/ViewerBlockHandle.vue'
+import type { DocumentIndex } from '~/components/ChatPanel.vue'
+import type { DragCardControls } from '~/components/DragCard.vue'
 import type { ToolbarRect, ToolbarSkill } from '~/components/ViewerToolbar.vue'
 import {
   ApiRequestError,
@@ -40,7 +42,16 @@ import {
 import { COLUMN_WIDTHS, collapses, shownCards, viewerLayout, type Column, type ViewerLayout } from '~/lib/columns'
 import { isImageFile, type AskRequest } from '~/lib/composer'
 import { cellGroupsToMarkdown, nodesToMarkdown, selectionText, type OrphanListContext } from '~/lib/copy'
-import { ANSWER_DRAG_TYPE, BLOCK_DRAG_TYPE, carriesFiles, claimDrag, dragClaim, droppedFiles, setDropEffect } from '~/lib/dnd'
+import {
+  ANSWER_DRAG_TYPE,
+  BLOCK_DRAG_TYPE,
+  carries,
+  carriesFiles,
+  claimDrag,
+  dragClaim,
+  droppedFiles,
+  setDropEffect,
+} from '~/lib/dnd'
 import {
   appendBlocks,
   appendExcerpt,
@@ -2150,7 +2161,7 @@ let dragRun: RowRange | null = null
 let dropAt: { target: number; place: 'before' | 'after' } | null = null
 const dropLine = ref<{ top: number; left: number; width: number } | null>(null)
 let dropSaid = ''
-const dragCard = ref<HTMLElement | null>(null)
+const dragCard = ref<DragCardControls | null>(null)
 
 /** What each block's handle reads to know whether it is drawn (docs/web.md § Editing, *The
  *  block handle and its menu*): read by the handle itself, so a hover or focus move
@@ -2191,14 +2202,9 @@ function onHandleDragStart(event: DragEvent, key: string) {
   transfer.setData('text/plain', rowsMarkdown(range))
   // A small card rather than the browser's picture of the block: written here, since the
   // drag image is taken before the next render.
-  const card = dragCard.value
   const head = rowHeads(range)[0]
-  if (card && head) {
-    const text = card.querySelector('.drag-card-text')
-    if (text) {
-      text.textContent = blockPlain(head.block) || blockName(head.block, nameText.value)
-    }
-    transfer.setDragImage(card, 12, 14)
+  if (head) {
+    dragCard.value?.paint(transfer, blockPlain(head.block) || blockName(head.block, nameText.value))
   }
 }
 
@@ -2211,7 +2217,7 @@ function carriesImageFiles(event: DragEvent): boolean {
 /** Blocks dragged from an answer in the agent panel: a copy to land on the drop line, with no
  *  run of the document's to move (docs/web.md § The agent panel, *An answer is blocks*). */
 function carriesAnswerBlocks(event: DragEvent): boolean {
-  return !dragRun && editable.value && [...(event.dataTransfer?.types ?? [])].includes(ANSWER_DRAG_TYPE)
+  return !dragRun && editable.value && carries(event.dataTransfer, ANSWER_DRAG_TYPE)
 }
 
 /** The last `dragover` the pane took a copy for — image files or an answer's blocks: any
@@ -2224,7 +2230,7 @@ let paneCopyEvent: DragEvent | null = null
 function onPaneDragOver(event: DragEvent) {
   const images = carriesImageFiles(event)
   const copy = images || carriesAnswerBlocks(event)
-  if (!copy && (!dragRun || ![...(event.dataTransfer?.types ?? [])].includes(BLOCK_DRAG_TYPE))) {
+  if (!copy && (!dragRun || !carries(event.dataTransfer, BLOCK_DRAG_TYPE))) {
     return
   }
   claimDrag(event, images ? 'image' : 'block')
@@ -2329,7 +2335,7 @@ function onPaneDrop(event: DragEvent) {
     }
     return
   }
-  if (!dragRun || ![...(event.dataTransfer?.types ?? [])].includes(BLOCK_DRAG_TYPE)) {
+  if (!dragRun || !carries(event.dataTransfer, BLOCK_DRAG_TYPE)) {
     return
   }
   event.preventDefault()
@@ -3101,9 +3107,10 @@ function highlightPassage(range: Range): boolean {
 
 // --- the agent panel's view of the document ---------------------------------------
 
-/** The document as rendered, read when the panel needs it rather than handed over whole. */
-function documentPages() {
-  return pages.value
+/** The document as rendered, with its outline and its blocks in reading order, read when
+ *  the panel needs it rather than handed over whole. */
+function documentIndex(): DocumentIndex {
+  return { pages: pages.value, outline: outline.value, placed: placed.value }
 }
 
 /** The document's current selection as text, for the agent — null when there is none or
@@ -5285,12 +5292,7 @@ watch(
             />
 
             <!-- Where a dragged block would land. -->
-            <div
-              v-if="dropLine"
-              class="drop-line"
-              aria-hidden="true"
-              :style="{ top: `${dropLine.top}px`, left: `${dropLine.left}px`, width: `${dropLine.width}px` }"
-            />
+            <DropLine v-if="dropLine" :line="dropLine" />
 
             <PaneFoot
               v-if="tab === 'markdown'"
@@ -5305,10 +5307,7 @@ watch(
             />
 
             <!-- The drag's picture, written as the drag starts; never seen in place. -->
-            <div ref="dragCard" class="drag-card" aria-hidden="true">
-              <UiIcon name="grip-vertical" />
-              <span class="drag-card-text" />
-            </div>
+            <DragCard ref="dragCard" />
           </div>
 
           <!-- The agent's thread about this document (docs/web.md § The agent panel). -->
@@ -5347,7 +5346,7 @@ watch(
               ref="chatPanel"
               :document-id="documentId"
               :document-selection="documentSelection"
-              :document-pages="documentPages"
+              :document-index="documentIndex"
               :current-section="currentSection"
               :closable="!phone"
               @changed="loadContent()"
@@ -5801,64 +5800,6 @@ watch(
 .block-marker > :deep(svg) {
   width: 14px;
   height: 14px;
-}
-
-/* Where a dragged block would land: a 2px accent line across the column, with an 8px ring —
-   a 2px accent border on paper — at its left end. */
-.drop-line {
-  position: absolute;
-  z-index: 4;
-  height: 2px;
-  margin-top: -1px;
-  background: var(--accent);
-  pointer-events: none;
-}
-
-.drop-line::before {
-  content: '';
-  position: absolute;
-  top: -3px;
-  left: -8px;
-  box-sizing: border-box;
-  width: 8px;
-  height: 8px;
-  border: 2px solid var(--accent);
-  border-radius: 50%;
-  background: var(--paper);
-}
-
-/* The drag's picture: the grip and the block's first line on paper, never wider than 280px.
-   Off-screen: the browser takes its picture of it as the drag starts. */
-.drag-card {
-  position: fixed;
-  top: -1000px;
-  left: -1000px;
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  max-width: 280px;
-  padding: var(--space-1) var(--space-3) var(--space-1) var(--space-2);
-  border: 1px solid var(--edge);
-  border-radius: var(--radius);
-  background: var(--paper);
-  box-shadow: var(--shadow-menu);
-  color: var(--ink);
-  font-size: var(--text-sm);
-  white-space: nowrap;
-  pointer-events: none;
-}
-
-.drag-card > :deep(svg) {
-  flex: none;
-  width: 16px;
-  height: 16px;
-  color: var(--faint);
-}
-
-.drag-card-text {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 /* The way back into an emptied document: a quiet text control in the measure a block had. */

@@ -1,14 +1,16 @@
 <script setup lang="ts">
 /**
- * The selected agent's panel on `/agents` (docs/web.md § Pages, docs/agents.md): one row of
- * controls — the model it runs (the deployment's parse model as a fact; for the chat agent a
- * dropdown of the offered models), then for the chat agent its effort, for the parse agent
- * its prompt — then, for the parse agent, its fallback for failed pages and the format check
- * (the `check` agent's settings, which have no tab of their own);
+ * The selected agent's panel in the settings dialog's Agent section (`/settings/agent`;
+ * docs/web.md § Pages, docs/agents.md): one row of controls — the model it runs (the
+ * deployment's parse model as a fact; for the chat agent a dropdown of the offered models),
+ * then for the chat agent its effort, for the parse agent its prompt — then, for the parse
+ * agent, its fallback for failed pages and the format check (the `check` agent's settings,
+ * which have no tab of their own);
  * for the chat agent, its instructions (with the whole prompt as their advanced option), its
  * memory, its tools, skills and subagents.
- * Every save hands the server's answer back through `saved`, so the page's tab list reads
- * the same state these controls write.
+ * Every save hands the server's answer back through `saved`, so the section's tab row reads
+ * the same state these controls write. The section keys the panel by agent name, so each
+ * agent's panel is its own instance.
  *
  * Nothing on this panel explains itself beyond the few lines that state a consequence the
  * controls cannot show: labels, states and errors only (docs/web.md).
@@ -28,8 +30,9 @@ const DEFAULT_EFFORT: AgentEffort = 'medium'
 
 const props = defineProps<{
   agent: AgentEntry
-  /** The `check` agent, whose settings the parse panel shows; null while the registry has
-   *  none (an older API). */
+  /** The agent's display name, the section's heading over the panel. */
+  title: string
+  /** The registry's `check` entry, whose settings the parse panel shows. */
   check: AgentEntry | null
   /** `limits.prompt_max_chars` from `GET /api/me`; null until the session has loaded. */
   promptMaxChars: number | null
@@ -41,12 +44,9 @@ const emit = defineEmits<{
   saved: [agent: string, settings: SavedAgentSettings]
 }>()
 
-const { t, te } = useI18n()
+const { t } = useI18n()
 const { resolve } = useApiError()
 
-const title = computed(() =>
-  te(`agents.names.${props.agent.name}`) ? t(`agents.names.${props.agent.name}`) : props.agent.name,
-)
 const settings = computed(() => props.agent.settings)
 
 /** The chat agent has the effort, instructions, memory, tools, skills and subagents; parse
@@ -60,45 +60,20 @@ const isChat = computed(() => props.agent.name === CHAT_AGENT)
 const models = ref<ConnectionModel[] | null>(null)
 const modelsError = ref<string | null>(null)
 const modelPending = ref(false)
-/** Request generation: only the newest load may fill the picker. */
-let modelsSeq = 0
 
-/** The list loads when the panel opens; opening it again is what reloads it. */
+/** The list loads when the panel mounts; opening the panel again mounts it again, which is
+    what reloads it. */
 async function loadModels() {
-  const seq = ++modelsSeq
-  models.value = null
-  modelsError.value = null
   try {
-    const data = (await listAgentModels(props.agent.name)).data
-    if (seq === modelsSeq) {
-      models.value = data
-    }
+    models.value = (await listAgentModels(props.agent.name)).data
   } catch (error) {
-    if (seq === modelsSeq) {
-      modelsError.value = await resolve(error)
-    }
+    modelsError.value = await resolve(error)
   }
 }
 
-watch(
-  () => props.agent.name,
-  () => {
-    if (isChat.value) {
-      void loadModels()
-    }
-  },
-  { immediate: true },
-)
-
-/** A stored model the list does not carry (delisted, or not loaded) is still the current
-    choice, so the picker shows it rather than silently blanking it. */
-const modelInjected = computed(() => {
-  const current = settings.value.model
-  if (!current) {
-    return null
-  }
-  return (models.value ?? []).some((model) => model.id === current) ? null : current
-})
+if (isChat.value) {
+  void loadModels()
+}
 
 /** The chat agent's current model: the reader's pick, or with none the list's first —
     the default only the live list can name (docs/billing.md § Models). */
@@ -190,10 +165,7 @@ function onSectionSaved(agent: string, saved: SavedAgentSettings) {
             @update:model-value="applyModel"
           >
             <option v-if="!modelChoice" value="">{{ t('agents.modelNone') }}</option>
-            <option v-if="modelInjected" :value="modelInjected">{{ modelInjected }}</option>
-            <option v-for="model in models ?? []" :key="model.id" :value="model.id">
-              {{ model.name ? `${model.name} · ${model.id}` : model.id }}
-            </option>
+            <ModelOptions :models="models" :current="settings.model" />
           </UiSelect>
         </UiField>
         <!-- The parse model is the deployment's: a fact under the label, not a control. -->

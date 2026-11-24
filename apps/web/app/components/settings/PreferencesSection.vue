@@ -10,6 +10,7 @@
  * the Files page and the viewer follow a save at once.
  */
 import { listAgents, putAgentSettings, putPreferences, type AgentEntry, type DocumentView } from '~/lib/api'
+import { PARSE_AGENT } from '~/lib/models'
 
 const { t } = useI18n()
 const { resolve } = useApiError()
@@ -19,7 +20,6 @@ const VIEWS: readonly DocumentView[] = ['original', 'markdown']
 
 // --- convert on upload ------------------------------------------------------------------
 
-const PARSE_AGENT = 'parse'
 const { data: agentsData, errorMessage: agentsError } = useAuthedData(() => listAgents())
 /** The parse agent's entry, as read, then as each save answers it. */
 const parseAgent = ref<AgentEntry | null>(null)

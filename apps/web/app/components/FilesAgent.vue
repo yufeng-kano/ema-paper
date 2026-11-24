@@ -11,6 +11,7 @@
  * stays, hidden and inert while closed, so a close keeps the conversation, the draft and the
  * attachments, and a reader who never opens it costs no conversation read.
  */
+import type { DocumentIndex } from '~/components/ChatPanel.vue'
 import { COLUMN_WIDTHS, clampWidth, collapses, storedWidth } from '~/lib/columns'
 import type { LibraryPlace } from '~/lib/library'
 import type { LibraryStep } from '~/lib/steps'
@@ -24,6 +25,8 @@ const LIST_MIN_WIDTH = 360
 const CARD_GAP = 16
 /** Matches the 900px breakpoint of this component's stylesheet and the layout's drawer. */
 const SHEET_QUERY = '(max-width: 900px)'
+/** The panel's document here: none, the card being about the library. */
+const NO_DOCUMENT: DocumentIndex = { pages: [], outline: [], placed: [] }
 
 defineProps<{
   library: LibraryPlace
@@ -352,7 +355,7 @@ defineExpose({
         ref="chat"
         :document-id="null"
         :document-selection="() => null"
-        :document-pages="() => []"
+        :document-index="() => NO_DOCUMENT"
         :current-section="() => null"
         :closable="!sheet"
         :library="library"

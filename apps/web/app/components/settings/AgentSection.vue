@@ -99,6 +99,7 @@ function onTabKeydown(event: KeyboardEvent, index: number) {
         <AgentPanel
           :key="selected.name"
           :agent="selected"
+          :title="agentTitle(selected)"
           :check="checkAgent"
           :prompt-max-chars="promptMaxChars"
           @saved="setAgentSettings"

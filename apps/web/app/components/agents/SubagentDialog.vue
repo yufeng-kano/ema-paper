@@ -92,13 +92,6 @@ const saveDisabled = computed(
     overCap.value,
 )
 
-/** A stored model the catalog does not list is still the current choice, so the picker
- *  shows it rather than silently blanking it. */
-const modelInjected = computed(() => {
-  const current = fields.model
-  return current && !(props.models ?? []).some((model) => model.id === current) ? current : null
-})
-
 const heading = computed(() =>
   props.subagent ? t('agents.subagentDialogTitle', { name: props.subagent.name }) : t('agents.subagentDialogNew'),
 )
@@ -219,10 +212,7 @@ async function remove() {
             @update:model-value="fields.model = $event || null"
           >
             <option value="">{{ t('agents.followsConversation') }}</option>
-            <option v-if="modelInjected" :value="modelInjected">{{ modelInjected }}</option>
-            <option v-for="model in models ?? []" :key="model.id" :value="model.id">
-              {{ model.name ? `${model.name} · ${model.id}` : model.id }}
-            </option>
+            <ModelOptions :models="models" :current="fields.model" />
           </UiSelect>
         </UiField>
       </div>

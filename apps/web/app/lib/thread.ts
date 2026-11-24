@@ -38,6 +38,14 @@ const MEMORY_TOOL = 'memory'
  *  down a tool call — `finished_at` says, not the status (docs/chat.md § Conversations). */
 export const isLive = (turn: ChatTurn): boolean => turn.finished_at === null
 
+/** The events that end a turn, by name: its outcome is then on record. */
+export const TURN_END_EVENTS: ReadonlySet<string> = new Set(['turn_done', 'turn_error'])
+
+/** An event that ends its turn — `turn_done` or `turn_error`. */
+export function isTurnEnd(event: ChatEvent): event is Extract<ChatEvent, { event: 'turn_done' | 'turn_error' }> {
+  return TURN_END_EVENTS.has(event.event)
+}
+
 /** The turns that compact the conversation rather than answer a message (docs/chat.md
  *  § Compaction): the reader's `/compact` and the worker's idle pass. */
 const COMPACTION_KINDS: ReadonlySet<TurnKind> = new Set(['compact', 'idle_compact'])
@@ -175,8 +183,8 @@ export type ThreadItem =
       /** The turn that answers it: what an edit sends again, and whose `versions` the
        *  pager reads (docs/web.md § The agent panel, *Editing a sent message*). */
       turnId: string
-      /** The stored message the attachments belong to; null before one is known. */
-      messageId: number | null
+      /** The stored message the attachments belong to. */
+      messageId: number
       text: string
       /** The passage of the document that went with it. */
       selection: string | null
@@ -191,9 +199,11 @@ export type ThreadItem =
     }
   | { kind: 'text'; key: string; text: string }
   | { kind: 'memory'; key: string; line: MemoryLine }
-  /** Under a finished turn's last answer, after its memory lines: what the turn used and
-   *  the control that copies the answer, as its markdown. */
-  | { kind: 'foot'; key: string; turnId: string; text: string; used: UsedContext | null }
+  /** Under a finished turn's last answer, after its memory lines: what the turn used, what
+   *  it cost and the control that copies the answer, as its markdown. `credits` is the
+   *  record's, settled once the turn ends and the record is read again; null until then
+   *  (docs/billing.md § Routes). */
+  | { kind: 'foot'; key: string; turnId: string; text: string; used: UsedContext | null; credits: number | null }
   | { kind: 'steps'; key: string; steps: StepItem[]; live: boolean }
   | { kind: 'subagent'; key: string; card: SubagentView }
   | { kind: 'error'; key: string; text: string }
@@ -203,8 +213,9 @@ export type ThreadItem =
    *  steps shown above as any turn's (docs/web.md § The agent panel). */
   | { kind: 'compacting'; key: string }
   /** A compaction done: the divider everything above is dimmed under, with the focus the
-   *  reader gave and the summary the turn stored behind *View summary*. */
-  | { kind: 'compact'; key: string; turnId: string; focus: string | null; summary: string }
+   *  reader gave, the summary the turn stored behind *View summary* and what the turn cost,
+   *  as the foot's. */
+  | { kind: 'compact'; key: string; turnId: string; focus: string | null; summary: string; credits: number | null }
 
 interface ThreadInput {
   turns: readonly ChatTurn[]
@@ -299,8 +310,28 @@ function turnOrder(input: ThreadInput): string[] {
   return ids
 }
 
+/** `groups` with a batch of frames joined, as a new map: each turn the batch touches gets a
+ *  new array, every other turn keeps its own, and a turn first seen comes last. */
+export function appendFrames(
+  groups: ReadonlyMap<string, ChatEvent[]>,
+  batch: readonly ChatEvent[],
+): Map<string, ChatEvent[]> {
+  const next = new Map(groups)
+  const touched = new Map<string, ChatEvent[]>()
+  for (const event of batch) {
+    let list = touched.get(event.turn_id)
+    if (!list) {
+      list = [...(groups.get(event.turn_id) ?? [])]
+      touched.set(event.turn_id, list)
+      next.set(event.turn_id, list)
+    }
+    list.push(event)
+  }
+  return next
+}
+
 function isTerminal(turn: ChatTurn | undefined, group: ChatEvent[] | undefined, stored: boolean): boolean {
-  if (group?.some((event) => event.event === 'turn_done' || event.event === 'turn_error')) {
+  if (group?.some(isTurnEnd)) {
     return true
   }
   if (turn) {
@@ -677,7 +708,14 @@ export function buildThread(input: ThreadInput): Thread {
     }))
     const answer = flat[lastText]
     if (done && answer?.kind === 'text') {
-      under.push({ kind: 'foot', key: `${prefix}-foot`, turnId, text: answer.text, used: usedContext(group) })
+      under.push({
+        kind: 'foot',
+        key: `${prefix}-foot`,
+        turnId,
+        text: answer.text,
+        used: usedContext(group),
+        credits: turn?.credits ?? null,
+      })
     }
     flat.splice(lastText === -1 ? flat.length : lastText + 1, 0, ...under)
 
@@ -703,6 +741,7 @@ export function buildThread(input: ThreadInput): Thread {
           turnId,
           focus: typed.length ? compactFocus(typed[0]!.content) : null,
           summary: summary.content.map(blockText).filter(Boolean).join('\n').trim(),
+          credits: turn?.credits ?? null,
         })
       }
     }

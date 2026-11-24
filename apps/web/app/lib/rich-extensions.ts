@@ -20,7 +20,7 @@ import { Superscript } from '@tiptap/extension-superscript'
 import { Table, TableCell, TableHeader, TableRow } from '@tiptap/extension-table'
 import { Placeholder } from '@tiptap/extensions'
 import StarterKit from '@tiptap/starter-kit'
-import { BLOCK_DRAG_TYPE, NOTES_BLOCK_DRAG_TYPE } from './dnd'
+import { BLOCK_DRAG_TYPE, NOTES_BLOCK_DRAG_TYPE, carries } from './dnd'
 import { inlinePlain, parseBlocks, parseInline, type InlineSegment, type ResultBlock } from './markdown'
 import { renderTexHtml } from './math'
 import type { Point } from './menu'
@@ -116,10 +116,8 @@ const SourceAttributes = Extension.create({
   // the text, is not drawn for it.
   extendNodeSchema() {
     return {
-      disableDropCursor: (_view: unknown, _pos: unknown, event: DragEvent) => {
-        const types = [...(event.dataTransfer?.types ?? [])]
-        return types.includes(BLOCK_DRAG_TYPE) || types.includes(NOTES_BLOCK_DRAG_TYPE)
-      },
+      disableDropCursor: (_view: unknown, _pos: unknown, event: DragEvent) =>
+        carries(event.dataTransfer, BLOCK_DRAG_TYPE) || carries(event.dataTransfer, NOTES_BLOCK_DRAG_TYPE),
     }
   },
   addGlobalAttributes() {

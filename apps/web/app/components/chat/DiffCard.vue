@@ -2,23 +2,19 @@
 /**
  * One edit as a diff card: applied as made, undone from its footer (docs/web.md § The agent
  * panel). Removed lines on the danger wash, added ones on the accent wash, wrapped rather
- * than scrolled sideways — a panel this narrow has no room for a second scrollbar.
+ * than scrolled sideways — a panel this narrow has no room for a second scrollbar. *Revert*
+ * is left out in library mode (`useStepLabels().library`, the Files page's card): the
+ * revisions route is a document's (docs/web.md § The Files page's Agent card).
  */
 import { basename } from '~/lib/steps'
 import type { CardState, EditCard } from '~/lib/thread'
 
-const props = withDefaults(
-  defineProps<{
-    card: EditCard
-    state: CardState
-    /** A turn is unfinished: the revisions route refuses a revert under one. */
-    locked: boolean
-    /** *Revert* is offered: not in the Files page's card, where the revisions route — a
-     *  document's — has no document behind it (docs/web.md § The Files page's Agent card). */
-    revertable?: boolean
-  }>(),
-  { revertable: true },
-)
+const props = defineProps<{
+  card: EditCard
+  state: CardState
+  /** A turn is unfinished: the revisions route refuses a revert under one. */
+  locked: boolean
+}>()
 
 const emit = defineEmits<{ toggle: [] }>()
 
@@ -45,7 +41,7 @@ const ownFile = computed(() => labels.ownFile(props.card.path))
         <span v-else class="mono card-path">· {{ basename(card.path) }}</span>
       </span>
       <button
-        v-if="card.commit && revertable"
+        v-if="card.commit && !labels.library"
         type="button"
         class="text-link"
         :disabled="state.pending || locked"

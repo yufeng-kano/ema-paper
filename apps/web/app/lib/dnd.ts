@@ -71,9 +71,14 @@ export function dragClaim(event: DragEvent): DragClaim | undefined {
   return claims.get(event)
 }
 
+/** A drag carrying `type` among its types — readable throughout the drag. */
+export function carries(transfer: DataTransfer | null, type: string): boolean {
+  return [...(transfer?.types ?? [])].includes(type)
+}
+
 /** A drag carrying files from outside the browser, rather than a row of this page. */
 export function carriesFiles(transfer: DataTransfer | null): boolean {
-  return [...(transfer?.types ?? [])].includes('Files')
+  return carries(transfer, 'Files')
 }
 
 /**

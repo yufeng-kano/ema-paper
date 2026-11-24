@@ -16,8 +16,6 @@
 import {
   creditsRefusalOf,
   getDocumentPages,
-  listAgentModels,
-  listAgents,
   retryDocument,
   type ConnectionModel,
   type CreditsRefusal,
@@ -25,8 +23,8 @@ import {
   type LibraryDocument,
 } from '~/lib/api'
 import { PAGE_FAILURE_REASONS, RETRY_TILES_MAX, checkFailureReason } from '~/lib/library'
+import { loadParseModels, PARSE_AGENT } from '~/lib/models'
 
-const PARSE_AGENT = 'parse'
 const CHECK_AGENT = 'check'
 
 const props = defineProps<{ document: LibraryDocument }>()
@@ -79,10 +77,6 @@ const model = computed(
     chosen.value ??
     (fallback.value || missing.value.find((page) => page.model)?.model || props.document.model || ''),
 )
-/** A model the catalog does not list (delisted, or not loaded) is still the choice shown. */
-const modelInjected = computed(() =>
-  model.value && !(models.value ?? []).some((entry) => entry.id === model.value) ? model.value : null,
-)
 
 const submitLabel = computed(() => {
   const [only, ...rest] = missing.value
@@ -111,10 +105,10 @@ async function loadPages() {
 /** The picker's catalog and the fallback: without them the default model still retries. */
 async function loadModels() {
   try {
-    const [agents, catalog] = await Promise.all([listAgents(), listAgentModels(PARSE_AGENT)])
-    fallback.value = agents.agents.find((agent) => agent.name === PARSE_AGENT)?.settings.fallback_model ?? null
-    checkOn.value = agents.agents.find((agent) => agent.name === CHECK_AGENT)?.settings.auto_check ?? false
-    models.value = [...catalog.data].sort((left, right) => left.id.localeCompare(right.id))
+    const loaded = await loadParseModels()
+    fallback.value = loaded.agents.find((agent) => agent.name === PARSE_AGENT)?.settings.fallback_model ?? null
+    checkOn.value = loaded.agents.find((agent) => agent.name === CHECK_AGENT)?.settings.auto_check ?? false
+    models.value = loaded.models
   } catch (error) {
     modelsError.value = await resolve(error)
   }
@@ -180,10 +174,7 @@ async function retry() {
       <template v-if="missing.length">
         <UiField v-slot="{ id }" :label="t('files.retry.model')">
           <UiSelect :id="id" :model-value="model" :disabled="busy" @update:model-value="chosen = $event">
-            <option v-if="modelInjected" :value="modelInjected">{{ modelInjected }}</option>
-            <option v-for="entry in models ?? []" :key="entry.id" :value="entry.id">
-              {{ entry.name ? `${entry.name} · ${entry.id}` : entry.id }}
-            </option>
+            <ModelOptions :models="models" :current="model" />
           </UiSelect>
         </UiField>
         <p class="note">{{ t(replacing ? 'files.retry.noteReconvert' : 'files.retry.note') }}</p>

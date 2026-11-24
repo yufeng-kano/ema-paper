@@ -58,6 +58,7 @@ import {
   type TrashedFolder,
 } from '~/lib/api'
 import {
+  carries,
   carriesFiles,
   claimDrag,
   dragClaim,
@@ -2405,7 +2406,7 @@ let springTimer: ReturnType<typeof setTimeout> | undefined
 
 /** The rows this drag carries, when it is a drag of this page's rows. */
 function rowsOf(event: DragEvent): Entry[] {
-  return [...(event.dataTransfer?.types ?? [])].includes(ROWS_DRAG_TYPE) ? draggedRows : []
+  return carries(event.dataTransfer, ROWS_DRAG_TYPE) ? draggedRows : []
 }
 
 /** ⌥ as it drops copies, as in Finder — Ctrl off Apple platforms, as in Explorer. */
