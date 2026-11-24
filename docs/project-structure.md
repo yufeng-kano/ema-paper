@@ -11,8 +11,16 @@ ema-paper/
         runtime_settings.py   # the thirteen keys the database may override and the cached
                               # reading layer the API, the worker and the CLI share
                               # (docs/admin.md § Settings)
+        errors.py             # the one error shape both planes answer with, and its handlers
+                              # (docs/api.md)
+        body_limit.py         # the ceiling on request bodies the API would otherwise buffer
+                              # whole; uploads stream under their own caps (docs/api.md)
+        codes.py              # `python -m sightread.codes`: the operator's redeem codes —
+                              # create, list, disable (docs/self-hosting.md § Redeem codes)
         db/                   # engine, models, session helpers
-        auth/                 # oidc.py, sessions.py, api_keys.py, oauth_as.py, crypto.py, deps.py, upload_tickets.py, document_tickets.py
+        auth/                 # oidc.py, sessions.py, api_keys.py, oauth_as.py, crypto.py, deps.py, tickets.py, upload_tickets.py, document_tickets.py
+                              # (tickets.py: what upload and document tickets share — the
+                              # per-user mint rate, the expired-row cleanup, the lookup by hash)
         routes/               # v1.py (data plane), control.py (/api, incl. /api/agents),
                               # library.py (/api/library — the web file library),
                               # chat.py (/api/conversations, a document's and the
@@ -21,7 +29,11 @@ ema-paper/
                               # attachments.py (/api/attachments), extensions.py
                               # (/api/skills, /api/subagents), memories.py
                               # (/api/memories), oauth.py, admin.py (/api/admin —
-                              # the operator console, docs/admin.md)
+                              # the operator console, docs/admin.md), billing.py
+                              # (/api/billing: the plan and balance, checkout, redeem,
+                              # portal and the Kano Pay webhook, /api/billing/pay-webhook),
+                              # multipart.py (the streaming multipart reader of
+                              # POST /api/library/documents)
         agents/               # the agent registry (docs/agents.md); parse.py holds the
                               # parse agent's definition: default prompt, pipeline version;
                               # chat.py the chat agent's system prompts — DEFAULT_SYSTEM_PROMPT
@@ -39,7 +51,9 @@ ema-paper/
                               # members, the no-escalation checks), audit.py (the one
                               # helper that writes an audit row in the caller's transaction),
                               # grants.py (an operator's grant of credits or days to an
-                              # account, through billing/ledger.py),
+                              # account, through billing/ledger.py, and on_plan, which
+                              # accounts a period decision puts on a plan, as SQL, for the
+                              # users list and the settings impact),
                               # codes.py (creating and disabling redeem codes through
                               # billing/codes.py, each with its audit row),
                               # jobs.py (a stuck job's requeue, the overview's checks of
@@ -48,13 +62,23 @@ ema-paper/
                               # confirmed, stored, recorded)
         billing/              # plans, periods and credit arithmetic (docs/billing.md):
                               # credits.py prices a parse and a turn, plans.py reads the
-                              # plans and decides the current period; pure, no HTTP
+                              # plans and decides the current period, both pure, no HTTP;
+                              # ledger.py the credit ledger (reservations, settlements,
+                              # the period row and the packs); codes.py redeem codes;
+                              # pay.py the Kano Pay adapter (its App API client, the
+                              # signed notifications, the one writer of `subscriptions`)
         parsing/              # poppler.py (subprocess wrappers),
                               # images.py (heic/exif/downscale), markdown.py, figures.py,
                               # joins.py (the format check's program rules),
                               # attachments.py (the chat composer's files, prepared)
         workspace/            # the per-user file tree and its git revisions
-                              # (docs/workspace.md): layout.py, git.py, documents.py
+                              # (docs/workspace.md): layout.py, git.py, locks.py (the
+                              # workspace, shell and backup locks and the writing marker),
+                              # safe_io.py (opening workspace files from the user root one
+                              # component at a time with O_NOFOLLOW: no link is followed),
+                              # memory_file.py (the chat agent's memory.md),
+                              # agents_file.py (the AGENTS.md files on a document's path),
+                              # documents.py
                               # (with the row lookups beside is_live: owned_folder,
                               # owned_document, live_folder, live_document,
                               # nearest_live, own_subtree, subtree_ids), reconcile.py,
@@ -81,7 +105,8 @@ ema-paper/
                               # route: vision calls, the model catalog, usage capture,
                               # backoff)
         jobs/                 # queue.py (claim/enqueue), intake.py (store/dedup/enqueue),
-                              # runner.py, sweeper.py, events.py (SSE + event pairs),
+                              # runner.py, sweeper.py, events.py (SSE + event pairs, the LISTEN/NOTIFY
+                              # plumbing both streams share),
                               # chat_runner.py (the chat agent's tool loop),
                               # check.py (the check agent's loop, inside a parse's run),
                               # chat_subagent.py (a subagent's nested loop),
@@ -97,6 +122,8 @@ ema-paper/
                               # summary.py (one summary-model call: `/rename`'s title)
         mcp/                  # server.py: thin shell over the service layer — parse (and its Files folder), list_library, read_document, write_document (docs/mcp.md)
         worker.py             # `python -m sightread.worker`
+        stopping.py           # pause(): the stop-or-timeout wait the worker's periodic
+                              # tasks share (top level: sandbox/egress.py uses it too)
       migrations/             # Alembic
       tests/
       pyproject.toml          # uv-managed
@@ -108,14 +135,23 @@ ema-paper/
     web/                      # Nuxt control plane (docs/web.md)
       app/ or src/            # Nuxt conventions; i18n/ catalog en + zh-TW
                               # the operator console (docs/admin.md): pages/admin/,
-                              # middleware/admin.ts, composables/useAdminConsole.ts,
+                              # middleware/admin.ts, types/page-meta.d.ts (the
+                              # `adminArea` page meta), composables/useAdminConsole.ts,
                               # lib/admin.ts (pure: areas, nav, permission checks; vitest),
                               # lib/chart.ts (the usage chart's geometry; vitest),
                               # components/admin/
+                              # the settings dialog's Agent section (docs/web.md § Pages):
+                              # lib/agents.ts (pure: the skill and subagent name rule and
+                              # description cap, mirroring agents/skills.py; charLength,
+                              # a text's length as the server counts it — trimmed, in
+                              # code points; the instructions section's Save body; vitest),
+                              # lib/caret.ts (pure: a token inserted at a textarea's caret,
+                              # replacing a selection; vitest)
                               # the Files page's Agent card (docs/web.md § The Files
-                              # page's Agent card): components/FilesAgent.vue — the card,
-                              # its grip and the phone sheet around ChatPanel in library
-                              # mode; the library body in lib/library.ts, the library
+                              # page's Agent card): components/FilesAgent.vue — the card
+                              # and the phone sheet around ChatPanel in library mode, its
+                              # grip composables/useColumnGrip.ts (shared with the
+                              # reader's cards); the library body in lib/library.ts, the library
                               # tools' steps in lib/steps.ts, the Files links in
                               # lib/markdown.ts (pure; vitest)
       server/routes/          # robots.txt and sitemap.xml, prerendered; no API (docs/web.md § Search engines)

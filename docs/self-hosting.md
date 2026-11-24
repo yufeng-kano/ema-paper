@@ -28,7 +28,7 @@ Paid plans and the chat agent's sandbox are optional, and neither is needed to r
    | `KANO_PROXY_BASE_URL`, `KANO_PROXY_API_KEY` | your Kano Proxy's origin and key; leave both empty to run without models |
    | `PARSE_MODEL`, `MODEL_PRICES_JSON` | the parse model and the price table (§ Models and prices) |
 
-3. Start the stack:
+3. Start the stack from the checkout's root (or set `WORKSPACES_HOST_DIR` to an absolute path first):
 
    ```bash
    docker compose up --build
