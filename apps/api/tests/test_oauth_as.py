@@ -12,9 +12,7 @@ from datetime import timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-import httpx
 import pytest
-from authlib.oauth2.rfc7636 import create_s256_code_challenge
 from httpx import AsyncClient
 from sqlalchemy import select
 
@@ -22,76 +20,17 @@ from sightread.auth.crypto import hash_token
 from sightread.db.models import OAuthGrant, utcnow
 from sightread.routes.oauth import MARK
 from tests.conftest import CSRF_HEADERS, mcp_running
-
-REDIRECT_URI = "https://claude.ai/api/mcp/auth_callback"
-VERIFIER = "verifier-that-is-long-enough-for-pkce-1234567890"
-CHALLENGE = create_s256_code_challenge(VERIFIER)
-STATE = "opaque-client-state"
-
-CONSENT_TOKEN_RE = re.compile(r"name='consent_token' value='([^']+)'")
-
-
-async def _register(client: AsyncClient, redirect_uri: str = REDIRECT_URI) -> httpx.Response:
-    return await client.post(
-        "/oauth/register",
-        json={"client_name": "Claude", "redirect_uris": [redirect_uri]},
-    )
-
-
-async def _authorize(client: AsyncClient, client_id: str) -> str:
-    """Run the browser half of the flow and return the issued authorization code."""
-    consent = await client.get(
-        "/oauth/authorize",
-        params={
-            "response_type": "code",
-            "client_id": client_id,
-            "redirect_uri": REDIRECT_URI,
-            "code_challenge": CHALLENGE,
-            "code_challenge_method": "S256",
-            "state": STATE,
-        },
-    )
-    assert consent.status_code == 200, consent.text
-    match = CONSENT_TOKEN_RE.search(consent.text)
-    assert match is not None
-
-    granted = await client.post(
-        "/oauth/authorize",
-        data={
-            "consent_token": match.group(1),
-            "decision": "approve",
-            "client_id": client_id,
-            "redirect_uri": REDIRECT_URI,
-            "code_challenge": CHALLENGE,
-            "state": STATE,
-        },
-    )
-    assert granted.status_code == 302
-    location = urlparse(granted.headers["location"])
-    query = parse_qs(location.query)
-    assert query["state"] == [STATE]
-    return query["code"][0]
-
-
-async def _token(client: AsyncClient, **form) -> httpx.Response:
-    return await client.post("/oauth/token", data=form)
-
-
-async def _connected(client: AsyncClient) -> tuple[str, dict]:
-    """A signed-in browser all the way to a token pair; returns (client_id, token body)."""
-    assert (await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)).status_code == 200
-    client_id = (await _register(client)).json()["client_id"]
-    code = await _authorize(client, client_id)
-    tokens = await _token(
-        client,
-        grant_type="authorization_code",
-        code=code,
-        code_verifier=VERIFIER,
-        client_id=client_id,
-        redirect_uri=REDIRECT_URI,
-    )
-    assert tokens.status_code == 200, tokens.text
-    return client_id, tokens.json()
+from tests.connector_helpers import (
+    CHALLENGE,
+    CONSENT_TOKEN_RE,
+    REDIRECT_URI,
+    STATE,
+    VERIFIER,
+    authorize_code,
+    oauth_connected,
+    register_client,
+    token_request,
+)
 
 
 async def test_discovery_documents_point_at_this_deployment(client: AsyncClient) -> None:
@@ -113,7 +52,7 @@ async def test_discovery_documents_point_at_this_deployment(client: AsyncClient)
 
 
 async def test_the_connector_flow_ends_in_a_working_bearer(client: AsyncClient) -> None:
-    _, tokens = await _connected(client)
+    _, tokens = await oauth_connected(client)
 
     assert tokens["token_type"] == "Bearer"
     assert tokens["expires_in"] == 3600
@@ -140,9 +79,9 @@ async def test_the_connector_flow_ends_in_a_working_bearer(client: AsyncClient) 
 
 
 async def test_refresh_rotates_and_burns_the_old_token(client: AsyncClient) -> None:
-    client_id, tokens = await _connected(client)
+    client_id, tokens = await oauth_connected(client)
 
-    refreshed = await _token(
+    refreshed = await token_request(
         client,
         grant_type="refresh_token",
         refresh_token=tokens["refresh_token"],
@@ -155,7 +94,7 @@ async def test_refresh_rotates_and_burns_the_old_token(client: AsyncClient) -> N
     # A refresh keeps the scope of the grant it rotates (docs/auth.md § 4).
     assert rotated["scope"] == tokens["scope"] == "parse library"
 
-    replayed = await _token(
+    replayed = await token_request(
         client,
         grant_type="refresh_token",
         refresh_token=tokens["refresh_token"],
@@ -167,17 +106,17 @@ async def test_refresh_rotates_and_burns_the_old_token(client: AsyncClient) -> N
 
 async def test_registration_refuses_a_redirect_uri_that_is_not_https(client: AsyncClient) -> None:
     for uri in ("http://evil.example.com/callback", "not-a-url", ""):
-        response = await _register(client, uri)
+        response = await register_client(client, uri)
         assert response.status_code == 400, uri
         assert response.json()["error"] == "invalid_redirect_uri"
 
     # Local deployments may point a connector at a loopback listener.
-    assert (await _register(client, "http://localhost:6274/callback")).status_code == 201
+    assert (await register_client(client, "http://localhost:6274/callback")).status_code == 201
 
 
 async def test_authorize_refuses_an_unregistered_redirect_uri(client: AsyncClient) -> None:
     await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    client_id = (await _register(client)).json()["client_id"]
+    client_id = (await register_client(client)).json()["client_id"]
 
     response = await client.get(
         "/oauth/authorize",
@@ -196,10 +135,10 @@ async def test_authorize_refuses_an_unregistered_redirect_uri(client: AsyncClien
 
 async def test_a_wrong_pkce_verifier_is_refused(client: AsyncClient) -> None:
     await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    client_id = (await _register(client)).json()["client_id"]
-    code = await _authorize(client, client_id)
+    client_id = (await register_client(client)).json()["client_id"]
+    code = await authorize_code(client, client_id)
 
-    wrong = await _token(
+    wrong = await token_request(
         client,
         grant_type="authorization_code",
         code=code,
@@ -211,7 +150,7 @@ async def test_a_wrong_pkce_verifier_is_refused(client: AsyncClient) -> None:
     assert wrong.json()["error"] == "invalid_grant"
 
     # The code survived the failed attempt, and the right verifier still works.
-    right = await _token(
+    right = await token_request(
         client,
         grant_type="authorization_code",
         code=code,
@@ -224,8 +163,8 @@ async def test_a_wrong_pkce_verifier_is_refused(client: AsyncClient) -> None:
 
 async def test_a_code_cannot_be_exchanged_twice(client: AsyncClient) -> None:
     await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    client_id = (await _register(client)).json()["client_id"]
-    code = await _authorize(client, client_id)
+    client_id = (await register_client(client)).json()["client_id"]
+    code = await authorize_code(client, client_id)
     form = {
         "grant_type": "authorization_code",
         "code": code,
@@ -234,15 +173,15 @@ async def test_a_code_cannot_be_exchanged_twice(client: AsyncClient) -> None:
         "redirect_uri": REDIRECT_URI,
     }
 
-    assert (await _token(client, **form)).status_code == 200
-    replayed = await _token(client, **form)
+    assert (await token_request(client, **form)).status_code == 200
+    replayed = await token_request(client, **form)
     assert replayed.status_code == 400
     assert replayed.json()["error"] == "invalid_grant"
 
 
 @pytest.mark.parametrize("kill", ["expire", "revoke"])
 async def test_a_dead_access_token_is_a_401(client: AsyncClient, sessionmaker, kill: str) -> None:
-    _, tokens = await _connected(client)
+    _, tokens = await oauth_connected(client)
     headers = {"Authorization": f"Bearer {tokens['access_token']}"}
     probe = f"/v1/jobs/{uuid.uuid4()}"
     assert (await client.get(probe, headers=headers)).status_code == 404
@@ -266,7 +205,7 @@ async def test_a_dead_access_token_is_a_401(client: AsyncClient, sessionmaker, k
 
 async def test_consent_needs_the_form_token_from_this_session(client: AsyncClient) -> None:
     await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    client_id = (await _register(client)).json()["client_id"]
+    client_id = (await register_client(client)).json()["client_id"]
 
     forged = await client.post(
         "/oauth/authorize",
@@ -284,7 +223,7 @@ async def test_consent_needs_the_form_token_from_this_session(client: AsyncClien
 
 async def test_denying_consent_redirects_with_access_denied(client: AsyncClient) -> None:
     await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    client_id = (await _register(client)).json()["client_id"]
+    client_id = (await register_client(client)).json()["client_id"]
     consent = await client.get(
         "/oauth/authorize",
         params={
@@ -315,7 +254,7 @@ async def test_denying_consent_redirects_with_access_denied(client: AsyncClient)
 
 async def test_authorize_without_a_session_asks_for_sign_in(make_client) -> None:
     local = make_client()
-    client_id = (await _register(local)).json()["client_id"]
+    client_id = (await register_client(local)).json()["client_id"]
     params = {
         "response_type": "code",
         "client_id": client_id,
@@ -330,7 +269,7 @@ async def test_authorize_without_a_session_asks_for_sign_in(make_client) -> None
     assert "dev login" in unconfigured.text
 
     google = make_client(google_client_id="id", google_client_secret="secret")
-    client_id = (await _register(google)).json()["client_id"]
+    client_id = (await register_client(google)).json()["client_id"]
     redirected = await google.get("/oauth/authorize", params={**params, "client_id": client_id})
     assert redirected.status_code == 302
     assert redirected.headers["location"] == "/api/auth/login"

@@ -23,13 +23,11 @@ from sightread.errors import ApiError
 from sightread.jobs.intake import retry_filed_parse
 from sightread.workspace import documents as workspace_documents
 from sightread.workspace.layout import user_root
-from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, api_key_client, mcp_running
+from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, PARSE_MODEL, api_key_client, mcp_running
+from tests.connector_helpers import mcp_session, tool_payload
 from tests.helpers import bearer, credits_spent, staged_uploads, v1_parse
-from tests.test_mcp import _mcp_session, _payload
 from tests.test_parse_end_to_end import _drain_queue, _vision_stub
 from tests.test_retry_failed_pages import FALLBACK, Upstream
-
-MODEL = "vendor/vision-model"
 
 
 @pytest.fixture
@@ -100,12 +98,12 @@ async def test_the_parse_tool_files_into_a_folder_as_listed_or_made(api, session
     )
     assert made.status_code == 201, made.text
 
-    async with mcp_running(api), _mcp_session(api) as session:
+    async with mcp_running(api), mcp_session(api) as session:
         tool = next(tool for tool in (await session.list_tools()).tools if tool.name == "parse")
-        found = _payload(await session.call_tool("parse", {"folder": "DL/DINO"}))
-        deeper = _payload(await session.call_tool("parse", {"folder": "/DL/DINO/SSL/2026/"}))
-        top = _payload(await session.call_tool("parse", {"folder": "/"}))
-        unfiled = _payload(await session.call_tool("parse", {}))
+        found = tool_payload(await session.call_tool("parse", {"folder": "DL/DINO"}))
+        deeper = tool_payload(await session.call_tool("parse", {"folder": "/DL/DINO/SSL/2026/"}))
+        top = tool_payload(await session.call_tool("parse", {"folder": "/"}))
+        unfiled = tool_payload(await session.call_tool("parse", {}))
         document = await session.call_tool("parse", {"folder": "Reading list.md/Papers"})
         dots = await session.call_tool("parse", {"folder": "DL/../Papers"})
         empty = await session.call_tool("parse", {"folder": "  "})
@@ -159,7 +157,7 @@ async def test_the_parse_tool_files_into_a_folder_as_listed_or_made(api, session
 
 async def test_a_parse_the_mint_rate_refuses_makes_no_folder(make_client) -> None:
     client = await api_key_client(make_client(upload_ticket_rate_per_hour=1))
-    async with mcp_running(client), _mcp_session(client) as session:
+    async with mcp_running(client), mcp_session(client) as session:
         first = await session.call_tool("parse", {})
         refused = await session.call_tool("parse", {"folder": "New/Sub"})
     assert first.is_error is False
@@ -332,7 +330,7 @@ async def test_an_api_key_files_with_the_folder_field(api, sessionmaker, documen
 async def test_a_filed_parse_that_failed_is_retried_where_it_is(
     api, sessionmaker, documents
 ) -> None:
-    upstream = Upstream({(MODEL, 2): lambda: httpx.Response(400)})
+    upstream = Upstream({(PARSE_MODEL, 2): lambda: httpx.Response(400)})
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
     filing = await _mint(api, sessionmaker, into_library=True)
     accepted = await v1_parse(api, documents["mixed_pdf"], filing)

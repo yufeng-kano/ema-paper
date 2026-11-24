@@ -451,7 +451,6 @@ async def test_a_library_cache_hit_purged_before_it_is_filed_is_refused_plainly(
     assert (await upload()).status_code == 201
 
 
-@postgres_only
 async def test_a_parse_whose_crops_will_not_go_stays_for_the_next_sweep(
     writer, monkeypatch
 ) -> None:

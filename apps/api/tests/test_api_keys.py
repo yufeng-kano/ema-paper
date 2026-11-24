@@ -48,8 +48,11 @@ async def test_bearer_key_authenticates_the_data_plane(signed_in: AsyncClient) -
     assert rejected.status_code == 401
     assert rejected.json()["error"]["type"] == "auth"
 
+    # A session cookie is no data-plane credential.
     missing = await signed_in.post("/v1/parse")
     assert missing.status_code == 401
+    assert missing.json()["error"]["type"] == "auth"
+    assert missing.headers["www-authenticate"] == "Bearer"
 
 
 async def test_revoked_key_stops_working(signed_in: AsyncClient) -> None:

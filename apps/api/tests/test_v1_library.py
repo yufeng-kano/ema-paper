@@ -28,10 +28,16 @@ from sightread.parsing.figures import crop_path
 from sightread.workspace import git
 from sightread.workspace.layout import sources_dir, user_root
 from tests.conftest import CSRF_HEADERS, api_key_client, mcp_running
+from tests.connector_helpers import (
+    CHALLENGE,
+    REDIRECT_URI,
+    mcp_session,
+    oauth_connected,
+    register_client,
+    tool_payload,
+)
 from tests.factories import job_row, user_row
 from tests.helpers import bearer
-from tests.test_mcp import _mcp_session, _payload
-from tests.test_oauth_as import CHALLENGE, REDIRECT_URI, _connected, _register
 
 FIGURE = "![fig1](sightread://p1/100,200,300,400)"
 MARKDOWN = f"<!-- page: 1 -->\n# Attention\n\nBody text.\n\n{FIGURE}\nFigure 1: the model.\n"
@@ -324,7 +330,7 @@ async def test_an_expired_ticket_and_a_trashed_document_are_refused(reader: Asyn
 
 async def test_a_new_grant_reaches_the_library(make_client) -> None:
     client = make_client()
-    _, tokens = await _connected(client)
+    _, tokens = await oauth_connected(client)
     assert tokens["scope"] == "parse library"
     listed = await client.get("/v1/library", headers=bearer(tokens["access_token"]))
     assert listed.status_code == 200, listed.text
@@ -333,7 +339,7 @@ async def test_a_new_grant_reaches_the_library(make_client) -> None:
         "/oauth/authorize",
         params={
             "response_type": "code",
-            "client_id": (await _register(client)).json()["client_id"],
+            "client_id": (await register_client(client)).json()["client_id"],
             "redirect_uri": REDIRECT_URI,
             "code_challenge": CHALLENGE,
             "code_challenge_method": "S256",
@@ -354,9 +360,9 @@ async def test_list_library_filters_by_folder_and_name(make_client) -> None:
     await _new_markdown(client, "Draft")
     await _new_markdown(client, "Another draft")
 
-    async with mcp_running(client), _mcp_session(client) as session:
-        everything = _payload(await session.call_tool("list_library", {}))
-        papers = _payload(await session.call_tool("list_library", {"folder": "Papers"}))
+    async with mcp_running(client), mcp_session(client) as session:
+        everything = tool_payload(await session.call_tool("list_library", {}))
+        papers = tool_payload(await session.call_tool("list_library", {"folder": "Papers"}))
         drafts = await session.call_tool("list_library", {"name": "DRAFT"})
         missing = await session.call_tool("list_library", {"folder": "Nowhere"})
 
@@ -373,7 +379,7 @@ async def test_list_library_filters_by_folder_and_name(make_client) -> None:
         }
     ]
     assert [entry["path"] for entry in papers["folders"]] == ["Papers", "Papers/2024"]
-    assert _payload(drafts)["total"] == 2
+    assert tool_payload(drafts)["total"] == 2
     assert missing.is_error is True
     assert "call list_library without `folder`" in missing.content[0].text
 
@@ -387,10 +393,10 @@ async def test_read_and_write_document_mint_tickets_for_their_commands(reader: A
     )
     file_id = kept.json()["id"]
 
-    async with mcp_running(reader), _mcp_session(reader) as session:
-        read = _payload(await session.call_tool("read_document", {"document_id": paper}))
-        write = _payload(await session.call_tool("write_document", {"document_id": paper}))
-        file_read = _payload(await session.call_tool("read_document", {"document_id": file_id}))
+    async with mcp_running(reader), mcp_session(reader) as session:
+        read = tool_payload(await session.call_tool("read_document", {"document_id": paper}))
+        write = tool_payload(await session.call_tool("write_document", {"document_id": paper}))
+        file_read = tool_payload(await session.call_tool("read_document", {"document_id": file_id}))
         file_write = await session.call_tool("write_document", {"document_id": file_id})
         unknown = await session.call_tool("read_document", {"document_id": 999_999})
 
@@ -420,7 +426,7 @@ async def test_read_and_write_document_mint_tickets_for_their_commands(reader: A
 async def test_the_document_ticket_mint_rate_is_its_own(make_client) -> None:
     client = await api_key_client(make_client(document_ticket_rate_per_hour=1))
     draft = await _new_markdown(client, "Draft")
-    async with mcp_running(client), _mcp_session(client) as session:
+    async with mcp_running(client), mcp_session(client) as session:
         first = await session.call_tool("read_document", {"document_id": draft})
         second = await session.call_tool("read_document", {"document_id": draft})
         parse = await session.call_tool("parse", {})
@@ -440,10 +446,10 @@ async def test_every_name_a_command_writes_is_one_plain_shell_word(reader: Async
     sources.mkdir(parents=True, exist_ok=True)
     (sources / f"{paper}.$(touch x)").write_bytes(b"%PDF")
 
-    async with mcp_running(reader), _mcp_session(reader) as session:
-        read = _payload(await session.call_tool("read_document", {"document_id": paper}))
-        up = _payload(await session.call_tool("read_document", {"document_id": dots}))
-        option = _payload(await session.call_tool("write_document", {"document_id": dash}))
+    async with mcp_running(reader), mcp_session(reader) as session:
+        read = tool_payload(await session.call_tool("read_document", {"document_id": paper}))
+        up = tool_payload(await session.call_tool("read_document", {"document_id": dots}))
+        option = tool_payload(await session.call_tool("write_document", {"document_id": dash}))
 
     assert read["original"].endswith("""-o "$d"/'source.$(touch x)'""")
     assert up["download"].startswith("d=_...md; ")

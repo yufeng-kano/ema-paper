@@ -37,7 +37,7 @@ from tests.admin_helpers import (
     owner_client,
 )
 from tests.conftest import CSRF_HEADERS, postgres_only
-from tests.test_oauth_as import _connected
+from tests.connector_helpers import oauth_connected
 
 
 async def _builtin_id(client: AsyncClient) -> int:
@@ -147,7 +147,7 @@ async def _api_key(owner: AsyncClient) -> str:
 
 
 async def _access_token(owner: AsyncClient) -> str:
-    _, tokens = await _connected(owner)
+    _, tokens = await oauth_connected(owner)
     return tokens["access_token"]
 
 

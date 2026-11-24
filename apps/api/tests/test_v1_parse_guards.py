@@ -16,17 +16,9 @@ from PIL import Image
 from sqlalchemy import select
 
 from sightread.db.models import Job, utcnow
-from tests.conftest import CSRF_HEADERS, api_key_client
+from tests.conftest import CSRF_HEADERS, PARSE_MODEL, api_key_client
 from tests.factories import job_row, user_row
 from tests.helpers import v1_upload
-
-MODEL = "vendor/vision-model"
-
-
-async def test_parse_requires_an_api_key(client: AsyncClient, documents) -> None:
-    response = await v1_upload(client, documents["text_pdf"])
-    assert response.status_code == 401
-    assert response.json()["error"]["type"] == "auth"
 
 
 async def test_a_corrupt_pdf_is_rejected_before_a_job_exists(
@@ -78,7 +70,7 @@ async def test_an_unsupported_media_type_is_rejected(client: AsyncClient, tmp_pa
     response = await client.post(
         "/v1/parse",
         files={"file": (document.name, document.read_bytes(), "text/plain")},
-        data={"model": MODEL},
+        data={"model": PARSE_MODEL},
     )
     assert response.status_code == 400
 
@@ -122,7 +114,7 @@ async def test_an_image_that_does_not_decode_as_an_accepted_one_is_refused(
     response = await client.post(
         "/v1/parse",
         files={"file": ("scan.png", data, "image/png")},
-        data={"model": MODEL},
+        data={"model": PARSE_MODEL},
     )
 
     assert response.status_code == 400
@@ -154,7 +146,7 @@ async def test_the_per_user_running_cap_returns_429(
                     size_bytes=10,
                     sha256=str(index) * 64,
                     pages_spec="",
-                    model=MODEL,
+                    model=PARSE_MODEL,
                     pipeline_version=1,
                     status="running",
                     started_at=utcnow(),
@@ -181,7 +173,7 @@ async def test_the_json_base64_fallback_creates_the_same_job(
             "source": encoded,
             "filename": "text.pdf",
             "media_type": "application/pdf",
-            "model": MODEL,
+            "model": PARSE_MODEL,
         },
     )
 
@@ -196,7 +188,7 @@ async def test_the_json_base64_fallback_creates_the_same_job(
 async def test_broken_base64_is_rejected(client: AsyncClient, documents) -> None:
     await api_key_client(client)
     response = await client.post(
-        "/v1/parse", json={"source": "not base64 at all!!", "model": MODEL}
+        "/v1/parse", json={"source": "not base64 at all!!", "model": PARSE_MODEL}
     )
     assert response.status_code == 400
 
@@ -215,7 +207,7 @@ async def test_a_job_runs_on_the_deployments_parse_model(
     assert response.status_code == 202, response.text
     async with sessionmaker() as db:
         job = await db.get(Job, uuid.UUID(response.json()["job_id"]))
-    assert (job.model, job.agent) == (MODEL, "parse")
+    assert (job.model, job.agent) == (PARSE_MODEL, "parse")
 
 
 async def test_a_deployment_without_a_parse_model_refuses_every_parse(

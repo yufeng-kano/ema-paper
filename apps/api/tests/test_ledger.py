@@ -58,6 +58,9 @@ from tests.helpers import read_library
 from tests.library_helpers import ready_to_parse, upload_png
 
 
+# Row locks only block on PostgreSQL; on SQLite the database-wide write lock
+# serializes the two transactions with or without them.
+@postgres_only
 async def test_two_parses_racing_for_the_last_credits(sessionmaker) -> None:
     settings = settings_with(free_credits_per_period=3)
     user_id = await make_user(sessionmaker)

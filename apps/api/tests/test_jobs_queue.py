@@ -265,8 +265,8 @@ async def test_requeue_keeps_the_pages_that_succeeded(sessionmaker, tmp_path) ->
     async with sessionmaker() as db:
         requeued = await db.get(Job, job_id)
         assert (requeued.status, requeued.pages_done, requeued.started_at) == ("queued", 1, None)
-        # The page the key paid for stays for the next attempt; the failed one is
-        # forgotten, to be sent again (docs/jobs.md § Queue).
+        # The page already transcribed and billed stays for the next attempt; the failed
+        # one is forgotten, to be sent again (docs/jobs.md § Queue).
         kept = (await db.execute(select(JobPage.page_no).where(JobPage.job_id == job_id))).all()
         assert kept == [(1,)]
         # A job whose result was committed before the shutdown's cancel landed is not
@@ -323,7 +323,6 @@ async def test_a_worker_stops_when_its_lock_session_is_gone() -> None:
     assert stop.is_set()
 
 
-@postgres_only
 async def test_a_worker_starting_requeues_the_jobs_a_dead_one_left(sessionmaker, tmp_path) -> None:
     from sightread.jobs.queue import requeue_orphaned_jobs
 
@@ -434,7 +433,7 @@ async def test_a_job_whose_task_raised_is_failed_unless_already_done(
         done.status = "succeeded"
         await db.commit()
         job_id, done_id = job.id, done.id
-    settings = path_settings(tmp_path)
+    settings = path_settings(tmp_path, upload_dir=str(tmp_path / "uploads"))
     await fail_job(sessionmaker, settings, job_id, "internal error")
     await fail_job(sessionmaker, settings, done_id, "internal error")
     async with sessionmaker() as db:
@@ -611,7 +610,7 @@ async def test_a_stale_workers_writes_are_fenced_by_its_generation(sessionmaker,
             )
         ],
     )
-    settings = path_settings(tmp_path)
+    settings = path_settings(tmp_path, upload_dir=str(tmp_path / "uploads"))
 
     async def counts(db) -> tuple[int, int]:
         pages = select(func.count()).select_from(JobPage).where(JobPage.job_id == job_id)
@@ -769,7 +768,7 @@ async def test_the_crops_are_published_under_the_backup_lock(
     async with sessionmaker() as db:
         db.add(Document(user_id=user.id, folder_id=None, job_id=job_id, name="e.pdf"))
         await db.commit()
-    settings = path_settings(tmp_path)
+    settings = path_settings(tmp_path, upload_dir=str(tmp_path / "uploads"))
     assert await runner._finish(
         sessionmaker, job_id, status="succeeded", settings=settings, publish=publish
     )

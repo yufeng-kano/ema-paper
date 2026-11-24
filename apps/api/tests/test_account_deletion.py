@@ -87,12 +87,6 @@ USER_TABLES = (
 )
 
 
-async def _account(make_client, **overrides) -> AsyncClient:
-    """Signed in, with a workspace of its own."""
-    client = make_client(**overrides)
-    return await sign_in(client)
-
-
 async def _delete(client: AsyncClient) -> httpx.Response:
     return await client.delete("/api/account", headers=CSRF_HEADERS)
 
@@ -239,7 +233,7 @@ async def _owned_rows(client: AsyncClient, user_id: int) -> dict[str, int]:
 
 @postgres_only
 async def test_deleting_the_account_removes_every_row_and_file_of_it(make_client) -> None:
-    account = await _account(make_client)
+    account = await sign_in(make_client())
     stranger = await _stranger(make_client)
     theirs = (await upload(stranger, "theirs.md", b"# Theirs\n")).json()
     await write_content(stranger, theirs["id"], "# Theirs, edited\n")
@@ -281,7 +275,7 @@ async def test_deleting_the_account_removes_every_row_and_file_of_it(make_client
 
 @respx.mock
 async def test_a_subscription_that_still_renews_refuses_until_it_is_set_to_end(make_client) -> None:
-    account = await _account(make_client, **PAY_SETTINGS)
+    account = await sign_in(make_client(**PAY_SETTINGS))
     uid = account.user_id
     fetch = respx.get(f"{SUBSCRIPTIONS_URL}{uid}").mock(
         return_value=httpx.Response(200, json=canonical(uid))
@@ -317,7 +311,7 @@ async def test_a_subscription_that_still_renews_refuses_until_it_is_set_to_end(m
 async def test_pay_unreachable_refuses_only_an_account_with_a_subscription_on_record(
     make_client,
 ) -> None:
-    account = await _account(make_client, **PAY_SETTINGS)
+    account = await sign_in(make_client(**PAY_SETTINGS))
     stranger = await _stranger(make_client, **PAY_SETTINGS)
     await grant_plan(account.app.state.sessionmaker, account.user_id)
     respx.get(url__startswith=SUBSCRIPTIONS_URL).mock(side_effect=httpx.ConnectError("down"))
@@ -332,7 +326,7 @@ async def test_pay_unreachable_refuses_only_an_account_with_a_subscription_on_re
 
 @respx.mock
 async def test_a_renewal_written_while_the_request_waited_still_refuses(make_client) -> None:
-    account = await _account(make_client, **PAY_SETTINGS)
+    account = await sign_in(make_client(**PAY_SETTINGS))
     uid = account.user_id
     # Pay answered before the locks were taken; a notification wrote a newer version
     # since. The write keeps the newer one, and the newer one decides.
@@ -355,7 +349,7 @@ async def test_a_renewal_written_while_the_request_waited_still_refuses(make_cli
 
 @respx.mock
 async def test_a_checkout_that_can_still_be_paid_refuses_until_it_cannot(make_client) -> None:
-    account = await _account(make_client, **PAY_SETTINGS)
+    account = await sign_in(make_client(**PAY_SETTINGS))
     lapsed = await _stranger(make_client, **PAY_SETTINGS)
     lifetime = account.app.state.settings.kano_pay_checkout_lifetime_seconds
     fetch = respx.get(url__startswith=SUBSCRIPTIONS_URL).mock(
@@ -390,7 +384,7 @@ async def test_a_checkout_that_can_still_be_paid_refuses_until_it_cannot(make_cl
 
 
 async def test_without_pay_the_stored_subscription_decides(make_client) -> None:
-    account = await _account(make_client)
+    account = await sign_in(make_client())
     await grant_plan(account.app.state.sessionmaker, account.user_id)
 
     refused = await _delete(account)
@@ -408,7 +402,7 @@ async def test_without_pay_the_stored_subscription_decides(make_client) -> None:
 
 @postgres_only
 async def test_running_work_refuses_and_queued_work_goes_with_the_account(make_client) -> None:
-    account = await _account(make_client)
+    account = await sign_in(make_client())
     uid = account.user_id
     note = (await upload(account, "note.md", b"# Note\n")).json()
     async with account.app.state.sessionmaker() as db:
@@ -464,7 +458,7 @@ async def test_running_work_refuses_and_queued_work_goes_with_the_account(make_c
 
 @postgres_only
 async def test_a_queued_parse_takes_its_upload_with_the_account(make_client, documents) -> None:
-    account = await _account(make_client)
+    account = await sign_in(make_client())
     await convert_on_upload(account)
     uploaded = await account.post(
         "/api/library/documents",
@@ -485,7 +479,7 @@ async def test_a_queued_parse_takes_its_upload_with_the_account(make_client, doc
 
 @respx.mock
 async def test_a_sandbox_that_cannot_be_stopped_does_not_hold_the_deletion_up(make_client) -> None:
-    account = await _account(make_client, sandbox_url=SANDBOX_URL, sandbox_token="t")
+    account = await sign_in(make_client(sandbox_url=SANDBOX_URL, sandbox_token="t"))
     stop = respx.post(f"{SANDBOX_URL}/sandboxes/{account.user_id}/stop").mock(
         side_effect=httpx.ConnectError("down")
     )
@@ -498,7 +492,7 @@ async def test_the_sweep_finishes_a_deletion_whose_files_the_request_left(
 ) -> None:
     from sightread.routes import control
 
-    account = await _account(make_client)
+    account = await sign_in(make_client())
     owned = await _footprint(account)
     settings = account.app.state.settings
     stranger = await _stranger(make_client)
@@ -537,7 +531,7 @@ async def test_an_unreadable_marker_still_finishes_the_directories(
 ) -> None:
     from sightread.routes import control
 
-    account = await _account(make_client)
+    account = await sign_in(make_client())
     await upload(account, "note.md", b"# Note\n")
     settings = account.app.state.settings
 

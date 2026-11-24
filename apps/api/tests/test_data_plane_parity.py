@@ -20,7 +20,13 @@ from sqlalchemy import select, update
 
 from sightread.db.models import Job, UploadTicket, utcnow
 from tests.chat_helpers import MESSAGES_URL
-from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, api_key_client, convert_on_upload
+from tests.conftest import (
+    CSRF_HEADERS,
+    KANO_CHAT_URL,
+    PARSE_MODEL,
+    api_key_client,
+    convert_on_upload,
+)
 from tests.helpers import bearer, credits_spent, job_by_id, staged_uploads, v1_parse
 from tests.test_format_check import READING, TRANSCRIPTION, _done, _tool, _turn, _vision
 from tests.test_parse_end_to_end import _drain_queue, _vision_stub
@@ -28,7 +34,6 @@ from tests.test_retry_failed_pages import FALLBACK, Upstream
 from tests.test_retry_failed_pages import _upload as _library_upload
 from tests.test_upload_tickets import _mint
 
-MODEL = "vendor/vision-model"
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 
@@ -66,7 +71,7 @@ async def test_an_api_parse_is_checked_and_returns_the_reading_copy(
     accepted = await v1_parse(api, documents["mixed_pdf"])
     assert accepted.status_code == 202, accepted.text
     job_id = accepted.json()["job_id"]
-    assert (await job_by_id(sessionmaker, job_id)).check_model == MODEL
+    assert (await job_by_id(sessionmaker, job_id)).check_model == PARSE_MODEL
     await _drain_queue(api, sessionmaker)
     assert len(agent.calls) == 2
 
@@ -76,7 +81,7 @@ async def test_an_api_parse_is_checked_and_returns_the_reading_copy(
     assert markdown.text == READING
     result = (await api.get(f"/v1/jobs/{job_id}/result")).json()
     assert result["markdown"] == READING
-    assert result["meta"]["check"] == {"model": MODEL, "joins": 2, "edits": 1}
+    assert result["meta"]["check"] == {"model": PARSE_MODEL, "joins": 2, "edits": 1}
     # The stream's final event, the one the upload command waits on, carries it too.
     async with api.stream("GET", f"/v1/jobs/{job_id}/events") as response:
         body = "\n".join([line async for line in response.aiter_lines()])
@@ -155,7 +160,7 @@ async def test_a_figure_is_served_as_the_crop_the_web_reader_shows(
 async def test_a_failed_parse_is_retried_by_sending_its_file_again(
     api, sessionmaker, documents
 ) -> None:
-    upstream = Upstream({(MODEL, 2): lambda: httpx.Response(400)})
+    upstream = Upstream({(PARSE_MODEL, 2): lambda: httpx.Response(400)})
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
     first = await _mint(api, sessionmaker)
     job_id = (await v1_parse(api, documents["mixed_pdf"], first)).json()["job_id"]
@@ -205,7 +210,7 @@ async def test_a_failed_parse_is_retried_by_sending_its_file_again(
     # Only the failed page went upstream, to the model the retry named.
     assert upstream.calls == [(FALLBACK, 2)]
     result = (await api.get("/v1/jobs/last/result", headers=bearer(second))).json()
-    assert [page["model"] for page in result["pages"]] == [MODEL, FALLBACK, MODEL]
+    assert [page["model"] for page in result["pages"]] == [PARSE_MODEL, FALLBACK, PARSE_MODEL]
     assert result["markdown"].count("<!-- page:") == 3
     assert (await api.get(f"/v1/jobs/{job_id}")).json()["credits"] == 3
     assert await credits_spent(api) == 3
@@ -216,7 +221,9 @@ async def test_a_failed_parse_is_retried_by_sending_its_file_again(
 async def test_a_retry_with_nothing_to_retry_is_refused_and_spends_nothing(
     api, sessionmaker, documents
 ) -> None:
-    respx.post(KANO_CHAT_URL).mock(side_effect=Upstream({(MODEL, 2): lambda: httpx.Response(400)}))
+    respx.post(KANO_CHAT_URL).mock(
+        side_effect=Upstream({(PARSE_MODEL, 2): lambda: httpx.Response(400)})
+    )
     token = await _mint(api, sessionmaker)
 
     nothing = await v1_parse(api, documents["mixed_pdf"], token, retry="true")
@@ -239,7 +246,9 @@ async def test_a_retry_the_balance_cannot_cover_is_refused_and_changes_nothing(
         free_credits_per_period=3,
     )
     api = await api_key_client(client)
-    respx.post(KANO_CHAT_URL).mock(side_effect=Upstream({(MODEL, 2): lambda: httpx.Response(400)}))
+    respx.post(KANO_CHAT_URL).mock(
+        side_effect=Upstream({(PARSE_MODEL, 2): lambda: httpx.Response(400)})
+    )
     job_id = (await v1_parse(api, documents["mixed_pdf"])).json()["job_id"]
     await _drain_queue(api, sessionmaker)
     # The failure gave its credits back; a one-page parse takes one of the three.
@@ -263,7 +272,7 @@ async def test_a_retry_the_balance_cannot_cover_is_refused_and_changes_nothing(
 async def test_a_retry_after_the_file_parsed_again_answers_that_parse(
     api, sessionmaker, documents
 ) -> None:
-    upstream = Upstream({(MODEL, 2): lambda: httpx.Response(400)})
+    upstream = Upstream({(PARSE_MODEL, 2): lambda: httpx.Response(400)})
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
     failed = (await v1_parse(api, documents["mixed_pdf"])).json()["job_id"]
     await _drain_queue(api, sessionmaker)
@@ -298,7 +307,7 @@ async def test_a_retry_after_the_file_parsed_again_answers_that_parse(
 async def test_a_retry_after_the_file_parsed_in_files_answers_that_parse(
     api, sessionmaker, documents
 ) -> None:
-    upstream = Upstream({(MODEL, 2): lambda: httpx.Response(400)})
+    upstream = Upstream({(PARSE_MODEL, 2): lambda: httpx.Response(400)})
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
     failed = (await v1_parse(api, documents["mixed_pdf"])).json()["job_id"]
     await _drain_queue(api, sessionmaker)
@@ -379,7 +388,7 @@ async def test_a_retry_naming_no_model_never_runs_one_the_deployment_withdrew(
     parse whose model and fallback the deployment no longer offers, runs the failed pages
     on `PARSE_MODEL` — a data-plane parse put back as it is, and a Files document's retried
     through the library's retry alike."""
-    upstream = Upstream({(MODEL, 2): lambda: httpx.Response(400)})
+    upstream = Upstream({(PARSE_MODEL, 2): lambda: httpx.Response(400)})
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
     if filed:
         await convert_on_upload(api)
@@ -403,10 +412,10 @@ async def test_a_retry_naming_no_model_never_runs_one_the_deployment_withdrew(
     job = await job_by_id(sessionmaker, job_id)
     assert (job.model, job.retry_model, job.fallback_model, job.check_model) == (
         "vendor/retired-model",
-        MODEL,
+        PARSE_MODEL,
         None,
-        MODEL,
+        PARSE_MODEL,
     )
     await _drain_queue(api, sessionmaker)
-    assert upstream.calls == [(MODEL, 2)]
+    assert upstream.calls == [(PARSE_MODEL, 2)]
     assert (await job_by_id(sessionmaker, job_id)).status == "succeeded"

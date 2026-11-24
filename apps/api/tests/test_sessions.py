@@ -69,7 +69,7 @@ async def test_session_cookie_is_not_reusable_after_logout(client: AsyncClient) 
 async def test_anonymous_control_plane_is_rejected(client: AsyncClient) -> None:
     response = await client.get("/api/keys")
     assert response.status_code == 401
-    assert response.json()["error"]["type"] == "auth"
+    assert response.json() == {"error": {"type": "auth", "message": "Not signed in"}}
 
 
 @pytest.mark.parametrize(

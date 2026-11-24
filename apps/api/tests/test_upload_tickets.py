@@ -18,9 +18,9 @@ from sqlalchemy import delete, select, update
 from sightread.auth import upload_tickets
 from sightread.db.models import Document, Job, UploadTicket, User, utcnow
 from sightread.jobs.sweeper import purge_parses
-from tests.conftest import KANO_CHAT_URL, mcp_running, postgres_only
+from tests.conftest import KANO_CHAT_URL, PARSE_MODEL, mcp_running, postgres_only
 from tests.helpers import bearer
-from tests.test_parse_end_to_end import MODEL, _drain_queue, _vision_stub
+from tests.test_parse_end_to_end import _drain_queue, _vision_stub
 
 # The copy is part of the contract: it is the agent's only recovery hint (docs/auth.md § 5).
 EXPECTED_REJECTION = (
@@ -45,7 +45,7 @@ async def _upload(client: AsyncClient, token: str, path: Path, **fields) -> http
     return await client.post(
         "/v1/parse",
         files={"file": (path.name, path.read_bytes(), "application/pdf")},
-        data={"model": MODEL, **fields},
+        data={"model": PARSE_MODEL, **fields},
         headers={"Authorization": f"Bearer {token}"},
     )
 
@@ -151,7 +151,7 @@ async def test_a_spent_ticket_reads_its_own_job_and_nothing_else(
         await api_client.post(
             "/v1/parse",
             files={"file": ("mixed.pdf", documents["mixed_pdf"].read_bytes(), "application/pdf")},
-            data={"model": MODEL},
+            data={"model": PARSE_MODEL},
         )
     ).json()["job_id"]
     stranger_read = await api_client.get(f"/v1/jobs/{other}", headers=bearer(token))
@@ -163,7 +163,7 @@ async def test_an_unspent_ticket_cannot_read_a_job(api_client, sessionmaker, doc
     accepted = await api_client.post(
         "/v1/parse",
         files={"file": ("text.pdf", documents["text_pdf"].read_bytes(), "application/pdf")},
-        data={"model": MODEL},
+        data={"model": PARSE_MODEL},
     )
     token = await _mint(api_client, sessionmaker)
 
@@ -178,7 +178,7 @@ async def test_an_expired_ticket_is_refused_everywhere(api_client, sessionmaker,
     accepted = await api_client.post(
         "/v1/parse",
         files={"file": ("text.pdf", documents["text_pdf"].read_bytes(), "application/pdf")},
-        data={"model": MODEL},
+        data={"model": PARSE_MODEL},
     )
 
     upload = await _upload(api_client, expired, documents["mixed_pdf"])
@@ -239,7 +239,7 @@ async def test_a_dedup_hit_binds_the_ticket_to_the_cached_job(
     first = await api_client.post(
         "/v1/parse",
         files={"file": ("text.pdf", documents["text_pdf"].read_bytes(), "application/pdf")},
-        data={"model": MODEL},
+        data={"model": PARSE_MODEL},
     )
     job_id = first.json()["job_id"]
     await _drain_queue(api_client, sessionmaker)
@@ -272,7 +272,7 @@ async def test_a_cache_hit_outlives_the_file_that_kept_it_while_its_ticket_reads
     first = await api_client.post(
         "/v1/parse",
         files={"file": ("text.pdf", documents["text_pdf"].read_bytes(), "application/pdf")},
-        data={"model": MODEL},
+        data={"model": PARSE_MODEL},
     )
     job_id = uuid.UUID(first.json()["job_id"])
     await _drain_queue(api_client, sessionmaker)
