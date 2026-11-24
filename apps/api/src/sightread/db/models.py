@@ -619,10 +619,9 @@ class ChatTurn(Base):
 
 class ChatToolCall(Base):
     """One web tool call of a turn that was answered or kept a file — `web_search`,
-    `search_papers`, `download_file` — or one `convert_file` call that made a document or
-    queued a retry: what the per-day caps count and what a turn's web searches are charged
-    from (docs/chat.md § Tools, docs/billing.md § A chat turn). A deleted turn keeps its
-    rows for the day's count, as a purged parse keeps its entry."""
+    `search_papers`, `download_file`: what the per-day caps count and what a turn's web
+    searches are charged from (docs/chat.md § Tools, docs/billing.md § A chat turn). A
+    deleted turn keeps its rows for the day's count, as a purged parse keeps its entry."""
 
     __tablename__ = "chat_tool_calls"
     __table_args__ = (
