@@ -10,6 +10,7 @@ it left.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import subprocess
 import sys
@@ -35,6 +36,16 @@ pytestmark = pytest.mark.skipif(
 
 API_DIR = Path(__file__).resolve().parents[1]
 ALEMBIC_TIMEOUT_SECONDS = 300
+
+
+def _revision_module(revision: str):
+    """A revision file loaded as a module, for the data it writes out — the constants a
+    migration freezes, which the app's own may since have moved past."""
+    (path,) = (API_DIR / "migrations" / "versions").glob(f"{revision}_*.py")
+    spec = importlib.util.spec_from_file_location(f"revision_{revision}", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _alembic(url: str, *args: str) -> None:
@@ -215,9 +226,9 @@ async def _job(db, user_id: int) -> uuid.UUID:
     await db.execute(
         text(
             "INSERT INTO jobs (id, user_id, agent, kind, filename, media_type, size_bytes, "
-            "sha256, pages_spec, model, pipeline_version, bbox_format, status, pages_done, "
-            "created_at) VALUES (:id, :user, 'parse', 'pdf', 'a.pdf', 'application/pdf', 1, "
-            "'x', '', 'm', 0, 'yxyx_norm1000', 'succeeded', 1, now())"
+            "sha256, pages_spec, model, pipeline_version, bbox_format, prompt, status, "
+            "pages_done, created_at) VALUES (:id, :user, 'parse', 'pdf', 'a.pdf', "
+            "'application/pdf', 1, 'x', '', 'm', 0, 'yxyx_norm1000', 'p', 'succeeded', 1, now())"
         ),
         {"id": job_id, "user": user_id},
     )
@@ -501,6 +512,100 @@ async def test_the_presets_in_force_move_into_prompts_and_instructions(scratch_u
             )
             assert selected.scalar_one() == 0
             assert await _count(db, "agent_settings") == len(expected)
+    finally:
+        await engine.dispose()
+    _alembic(scratch_url, "upgrade", "head")
+
+
+async def test_jobs_lose_the_provider_connection_and_always_hold_a_prompt(scratch_url) -> None:
+    """185b2581586c: a provider connection's job loses its endpoint snapshot — so it never
+    answers a dedup lookup and the worker fails it — and keeps its status, a queued one's
+    included, for the worker to fail through its finish; a job with no prompt takes the
+    parse agent's default template, verbatim; `connection_id` and `source_job_id` go, and
+    the dedup index with the first. The downgrade restores both columns, empty."""
+    _alembic(scratch_url, "upgrade", "774fee25f32b")
+    jobs = {
+        # name: (connection_id, connection_base_url, status, prompt)
+        "provider, succeeded": (7, "https://kano.test", "succeeded", "Mine {page}."),
+        "provider, queued": (8, "https://llm.example/v1", "queued", None),
+        "kano": (None, "https://kano.test", "succeeded", None),
+        "openrouter": (None, None, "failed", "Old {page}."),
+    }
+    ids = {name: uuid.uuid4() for name in jobs}
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.begin() as db:
+            user = await _user(db, 1)
+            for name, (connection_id, base_url, status, prompt) in jobs.items():
+                await db.execute(
+                    text(
+                        "INSERT INTO jobs (id, user_id, agent, kind, filename, media_type, "
+                        "size_bytes, sha256, pages_spec, model, pipeline_version, "
+                        "bbox_format, connection_id, connection_base_url, prompt, status, "
+                        "pages_done, created_at) VALUES (:id, :user, 'parse', 'pdf', 'a.pdf', "
+                        "'application/pdf', 1, 'x', '', 'm', 10, 'yxyx_norm1000', "
+                        ":connection, :base_url, :prompt, :status, 0, now())"
+                    ),
+                    {
+                        "id": ids[name],
+                        "user": user,
+                        "connection": connection_id,
+                        "base_url": base_url,
+                        "prompt": prompt,
+                        "status": status,
+                    },
+                )
+    finally:
+        await engine.dispose()
+
+    _alembic(scratch_url, "upgrade", "head")
+    default = _revision_module("185b2581586c").PARSE_DEFAULT_PROMPT
+    expected = {
+        "provider, succeeded": (None, "succeeded", "Mine {page}."),
+        "provider, queued": (None, "queued", default),
+        "kano": ("https://kano.test", "succeeded", default),
+        "openrouter": (None, "failed", "Old {page}."),
+    }
+    gone = (
+        "SELECT count(*) FROM information_schema.columns WHERE table_name = 'jobs' "
+        "AND column_name IN ('connection_id', 'source_job_id')"
+    )
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.connect() as db:
+            rows = await db.execute(
+                text("SELECT id, connection_base_url, status, prompt FROM jobs")
+            )
+            names = {job_id: name for name, job_id in ids.items()}
+            assert {names[row[0]]: tuple(row[1:]) for row in rows} == expected
+            assert (await db.execute(text(gone))).scalar_one() == 0
+            nullable = await db.execute(
+                text(
+                    "SELECT is_nullable FROM information_schema.columns "
+                    "WHERE table_name = 'jobs' AND column_name = 'prompt'"
+                )
+            )
+            assert nullable.scalar_one() == "NO"
+            index = await db.execute(
+                text("SELECT indexdef FROM pg_indexes WHERE indexname = 'ix_jobs_dedup'")
+            )
+            assert "connection_id" not in index.scalar_one()
+    finally:
+        await engine.dispose()
+
+    _alembic(scratch_url, "downgrade", "774fee25f32b")
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.connect() as db:
+            assert (await db.execute(text(gone))).scalar_one() == 2
+            left = await db.execute(
+                text(
+                    "SELECT count(*) FROM jobs "
+                    "WHERE connection_id IS NOT NULL OR source_job_id IS NOT NULL"
+                )
+            )
+            assert left.scalar_one() == 0
+            assert await _count(db, "jobs") == len(jobs)
     finally:
         await engine.dispose()
     _alembic(scratch_url, "upgrade", "head")

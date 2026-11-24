@@ -61,6 +61,7 @@ async def _seed(db, *, markdown: str = "# Title\n\nBody\n") -> tuple[User, Docum
         sha256="a" * 64,
         model="claude-x",
         bbox_format="yxyx_norm1000",
+        prompt="Transcribe page {page}.",
         status="succeeded",
         page_count=2,
     )

@@ -86,6 +86,7 @@ async def test_two_parses_racing_for_the_last_credits(sessionmaker) -> None:
                 status="queued",
                 model="m",
                 bbox_format="yxyx_norm1000",
+                prompt="Transcribe page {page}.",
                 page_count=1,
                 pages_done=0,
             )
@@ -123,6 +124,7 @@ async def test_settlement_is_idempotent_and_a_release_restores_the_balance(sessi
             status="running",
             model="m",
             bbox_format="yxyx_norm1000",
+            prompt="Transcribe page {page}.",
             page_count=3,
             pages_done=0,
         )
@@ -137,6 +139,7 @@ async def test_settlement_is_idempotent_and_a_release_restores_the_balance(sessi
             status="running",
             model="m",
             bbox_format="yxyx_norm1000",
+            prompt="Transcribe page {page}.",
             page_count=4,
             pages_done=0,
         )

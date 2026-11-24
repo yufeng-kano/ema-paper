@@ -30,7 +30,6 @@ def key() -> Connection:
     return Connection(
         api_key="sk-kano-proxy-test",
         base_url=f"{KANO_BASE}/anthropic/v1",
-        snapshot=KANO_BASE,
     )
 
 

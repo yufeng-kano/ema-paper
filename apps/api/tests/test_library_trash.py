@@ -106,6 +106,7 @@ async def _running_parse(client: AsyncClient, upload: Path) -> tuple[int, uuid.U
             sha256="c" * 64,
             model="vendor/vision-model",
             bbox_format="yxyx_norm1000",
+            prompt="Transcribe page {page}.",
             status="running",
             page_count=1,
             source_path=str(upload),

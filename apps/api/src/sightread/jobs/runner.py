@@ -28,7 +28,7 @@ from pathlib import Path
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from ..agents import CHECK, get_agent
+from ..agents import CHECK
 from ..agents.bbox import convention_for_job, prepare_image
 from ..agents.parse import FIGURE_CHECK_SINCE_PIPELINE
 from ..billing import ledger
@@ -266,15 +266,6 @@ def partial_result_payload(job: Job, rows: list[JobPage]) -> dict:
     }
 
 
-def job_prompt(job: Job) -> str:
-    """The transcription prompt template this job runs.
-
-    The effective template is stored on the row at enqueue time (docs/parsing.md §
-    Prompts); jobs from before that column exist fall back to the agent's default.
-    """
-    return job.prompt or get_agent(job.agent).default_prompt_template
-
-
 async def _call_upstream(state: RunState, call):
     """Run one upstream call under the job's budget, backing off on 429 and on transient
     failures.
@@ -388,7 +379,7 @@ async def _transcribe(
                     transcribe_page,
                     connection,
                     model,
-                    job_prompt(job),
+                    job.prompt,
                     sent.path,
                     page_no,
                     convention=convention,
@@ -1160,24 +1151,35 @@ async def run_job(
             return
         if generation is not None and job.worker_generation != generation:
             return
-        # A job queued for a provider connection — history, from before the operator's
-        # upstream — has no upstream to run on (docs/database.md § Rules).
-        connection = None if job.connection_id is not None else kano_connection(settings)
-        if connection is not None and job.connection_base_url != connection.snapshot:
-            # KANO_PROXY_BASE_URL changed while the job sat queued. The dedup key must
-            # name the endpoint that actually produced the result, not the one
-            # snapshotted at submission (docs/jobs.md § Dedup). Fenced
-            # like every write to the row: a replacement that took the job meanwhile
-            # keeps its own snapshot, and this run ends here (docs/jobs.md § Queue).
-            moved = await db.execute(
-                update(Job)
-                .where(Job.id == job_id, Job.status == "running", *_owned(generation))
-                .values(connection_base_url=connection.snapshot)
+        connection = kano_connection(settings)
+        if job.connection_base_url is None:
+            # A job of an upstream the deployment no longer has — OpenRouter, a provider
+            # connection: on Kano Proxy it would transcribe only the pages that upstream
+            # failed, and the mixed result would answer Kano Proxy dedup lookups
+            # (docs/database.md § Rules). It fails through the finish, which releases
+            # its credits.
+            error = (
+                "this parse ran on an upstream this deployment no longer has; upload the file again"
             )
-            if moved.rowcount != 1:
-                return
-            job.connection_base_url = connection.snapshot
-            await db.commit()
+        elif connection is None:
+            error = "Kano Proxy is not configured on this deployment"
+        else:
+            error = None
+            if job.connection_base_url != settings.kano_proxy_base_url:
+                # KANO_PROXY_BASE_URL changed while the job sat queued. The dedup key must
+                # name the endpoint that actually produced the result, not the one
+                # snapshotted at submission (docs/jobs.md § Dedup). Fenced like every
+                # write to the row: a replacement that took the job meanwhile keeps its
+                # own snapshot, and this run ends here (docs/jobs.md § Queue).
+                moved = await db.execute(
+                    update(Job)
+                    .where(Job.id == job_id, Job.status == "running", *_owned(generation))
+                    .values(connection_base_url=settings.kano_proxy_base_url)
+                )
+                if moved.rowcount != 1:
+                    return
+                job.connection_base_url = settings.kano_proxy_base_url
+                await db.commit()
         # What an earlier attempt finished — before a requeue, or before the failure a
         # retry follows — is kept, never transcribed again (docs/jobs.md § Retrying
         # failed pages). A row with markdown is a page that succeeded; a failed one has
@@ -1195,12 +1197,7 @@ async def run_job(
 
     figures_root = Path(settings.figures_dir)
 
-    if connection is None:
-        error = (
-            "Kano Proxy is not configured on this deployment"
-            if job.connection_id is None
-            else "the provider connection for this job no longer exists"
-        )
+    if error is not None or connection is None:
         # No crop thread ever started for this run; a plain discard covers leftovers.
         discard_job_figures(figures_root, job_id)
         await _to_the_end(

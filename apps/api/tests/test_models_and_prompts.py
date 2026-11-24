@@ -13,7 +13,7 @@ import respx
 from httpx import AsyncClient
 from sqlalchemy import select
 
-from sightread.db.models import Job
+from sightread.db.models import CreditEntry, Job
 from sightread.errors import ApiError
 from sightread.jobs.queue import claim_next_job
 from sightread.jobs.runner import run_job
@@ -161,7 +161,6 @@ async def test_only_the_chat_agent_takes_a_model_and_only_an_offered_one(signed_
         )
         assert refused.status_code == 400, agent
         assert refused.json()["error"]["message"] == f"The {agent} agent takes no model"
-        assert "connection_id" not in (await _settings_of(signed_in, agent))["settings"]
 
 
 async def test_unknown_agents_are_refused(signed_in) -> None:
@@ -206,11 +205,7 @@ async def test_a_request_model_must_be_one_of_the_parse_agents(
     async with sessionmaker() as db:
         first = await db.get(Job, uuid.UUID(default.json()["job_id"]))
         second = await db.get(Job, uuid.UUID(named.json()["job_id"]))
-        assert (first.model, first.connection_id, first.connection_base_url) == (
-            PARSE_MODEL,
-            None,
-            KANO_BASE,
-        )
+        assert (first.model, first.connection_base_url) == (PARSE_MODEL, KANO_BASE)
         assert second.model == FALLBACK
         assert sorted((await db.execute(select(Job.id))).scalars()) == sorted([first.id, second.id])
 
@@ -228,11 +223,16 @@ async def test_no_parse_model_or_no_kano_proxy_refuses_every_parse(
         assert (await db.execute(select(Job.id))).all() == []
 
 
-async def test_a_queued_job_on_a_provider_connection_fails_cleanly(
+@respx.mock
+async def test_a_job_with_no_endpoint_snapshot_never_runs_on_kano_proxy(
     make_client, sessionmaker, documents
 ) -> None:
-    """A job from before the operator's upstream keeps its connection id as history and
-    never runs on the operator's key (docs/database.md § Rules)."""
+    """A job of an upstream the deployment no longer has — OpenRouter, a provider
+    connection — has no endpoint snapshot. The worker fails it when it takes it, a retry's
+    included, through the finish that releases its credits, and Kano Proxy is never
+    called: it would transcribe only the pages the other upstream failed, under a Kano
+    Proxy dedup key (docs/database.md § Rules)."""
+    gone = "this parse ran on an upstream this deployment no longer has; upload the file again"
     client = make_client()
     await _keyed(client)
     accepted = await _parse(client, documents)
@@ -240,17 +240,27 @@ async def test_a_queued_job_on_a_provider_connection_fails_cleanly(
     job_id = uuid.UUID(accepted.json()["job_id"])
     async with sessionmaker() as db:
         job = await db.get(Job, job_id)
-        job.connection_id, job.connection_base_url = 7, "https://llm.example/v1"
+        job.connection_base_url = None
         await db.commit()
 
     settings = client.app.state.settings
-    async with sessionmaker() as db:
-        assert await claim_next_job(db, settings.max_jobs_per_user) == job_id
-    await run_job(sessionmaker, settings, job_id, asyncio.Semaphore(2))
+    for attempt in ("queued", "retried"):
+        async with sessionmaker() as db:
+            assert await claim_next_job(db, settings.max_jobs_per_user) == job_id, attempt
+        await run_job(sessionmaker, settings, job_id, asyncio.Semaphore(2))
 
-    status = (await client.get(f"/v1/jobs/{job_id}")).json()
-    assert status["status"] == "failed"
-    assert status["error"] == "the provider connection for this job no longer exists"
+        status = (await client.get(f"/v1/jobs/{job_id}")).json()
+        assert (status["status"], status["error"]) == ("failed", gone), attempt
+        async with sessionmaker() as db:
+            job = await db.get(Job, job_id)
+            assert job.connection_base_url is None, attempt
+            entry = await db.execute(select(CreditEntry.state).where(CreditEntry.job_id == job_id))
+            assert entry.scalar_one() == "released", attempt
+        if attempt == "queued":
+            retried = await _parse(client, documents, retry="true")
+            assert retried.status_code == 202, retried.text
+            assert retried.json()["job_id"] == str(job_id)
+    assert respx.calls.call_count == 0
 
 
 @respx.mock

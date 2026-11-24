@@ -113,6 +113,7 @@ async def _job(db, user_id: int, status: str = "succeeded") -> uuid.UUID:
         model=PARSE_MODEL,
         pipeline_version=PARSE.pipeline_version,
         bbox_format="yxyx_norm1000",
+        prompt="Transcribe page {page}.",
         status=status,
         page_count=1,
         finished_at=utcnow() if status in ("succeeded", "failed") else None,

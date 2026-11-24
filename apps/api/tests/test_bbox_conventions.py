@@ -121,7 +121,6 @@ def _key() -> Connection:
     return Connection(
         api_key="sk-kano-proxy-test",
         base_url=f"{KANO_BASE}/openai/v1",
-        snapshot=KANO_BASE,
     )
 
 

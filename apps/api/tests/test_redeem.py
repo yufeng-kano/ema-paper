@@ -511,6 +511,7 @@ async def test_the_claim_counts_an_open_granted_period_as_the_plan(
                     agent="parse",
                     pipeline_version=1,
                     bbox_format="yxyx_norm1000",
+                    prompt="Transcribe page {page}.",
                     status="queued",
                     page_count=1,
                 )

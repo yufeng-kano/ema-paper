@@ -189,30 +189,23 @@ def dedup_key(
     agent: str,
     sha256: str,
     model: str,
-    connection_id: int | None,
-    connection_base_url: str | None,
+    connection_base_url: str,
     pages_spec: str,
     prompt_sha256: str,
 ) -> list:
     """Everything that has to match for two uploads to be the same parse.
 
-    Same user, agent, bytes, model, upstream (id *and* endpoint snapshot — editing a
-    connection's URL repoints what its id means, and the built-in upstream's snapshot is
-    KANO_PROXY_BASE_URL, which no historical OpenRouter row has), pages, prompt, and the
-    agent's pipeline version (docs/jobs.md § Dedup). Status is the caller's: a finished
-    parse answers the cache, an unfinished one answers a retry.
+    Same user, agent, bytes, model, endpoint snapshot (KANO_PROXY_BASE_URL: a job of an
+    upstream the deployment no longer has holds NULL, which never matches), pages, prompt,
+    and the agent's pipeline version (docs/jobs.md § Dedup). Status is the caller's: a
+    finished parse answers the cache, an unfinished one answers a retry.
     """
     return [
         Job.user_id == user_id,
         Job.agent == agent,
         Job.sha256 == sha256,
         Job.model == model,
-        Job.connection_id.is_(None)
-        if connection_id is None
-        else Job.connection_id == connection_id,
-        Job.connection_base_url.is_(None)
-        if connection_base_url is None
-        else Job.connection_base_url == connection_base_url,
+        Job.connection_base_url == connection_base_url,
         Job.pages_spec == pages_spec,
         Job.prompt_sha256 == prompt_sha256,
         Job.pipeline_version == get_agent(agent).pipeline_version,
@@ -382,8 +375,7 @@ async def enqueue_job(
     sha256: str,
     pages_spec: str,
     model: str,
-    connection_id: int | None,
-    connection_base_url: str | None,
+    connection_base_url: str,
     bbox_format: str,
     prompt: str,
     prompt_sha256: str,
@@ -407,7 +399,6 @@ async def enqueue_job(
         sha256=sha256,
         pages_spec=pages_spec,
         model=model,
-        connection_id=connection_id,
         connection_base_url=connection_base_url,
         pipeline_version=get_agent(agent).pipeline_version,
         bbox_format=bbox_format,

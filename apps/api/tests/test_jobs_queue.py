@@ -43,7 +43,6 @@ JOB_DEFAULTS = {
     "pages_spec": "",
     "agent": "parse",
     "model": "vendor/model",
-    "connection_id": None,
     # The built-in upstream's snapshot is the Kano Proxy origin (docs/jobs.md § Dedup).
     "connection_base_url": "https://kano.test",
     "bbox_format": "yxyx_norm1000",
@@ -90,7 +89,6 @@ async def test_dedup_lookup_matches_the_full_key(sessionmaker, tmp_path) -> None
             "agent": "parse",
             "sha256": "a" * 64,
             "model": "vendor/model",
-            "connection_id": None,
             "connection_base_url": "https://kano.test",
             "pages_spec": "",
             "prompt_sha256": "p" * 64,
@@ -105,11 +103,7 @@ async def test_dedup_lookup_matches_the_full_key(sessionmaker, tmp_path) -> None
             await find_cached_job(db, retention_days=30, **{**key, "prompt_sha256": "q" * 64})
             is None
         )
-        # A different upstream is a different parse, even for the same model id — and an
-        # edited endpoint URL repoints what a connection id means, so it misses too.
-        assert (
-            await find_cached_job(db, retention_days=30, **{**key, "connection_id": 12345}) is None
-        )
+        # Another endpoint is a different parse, even for the same model id.
         assert (
             await find_cached_job(
                 db, retention_days=30, **{**key, "connection_base_url": "https://new.example/v1"}
@@ -126,8 +120,9 @@ async def test_dedup_never_crosses_agents_or_answers_from_openrouter_history(
     sessionmaker,
 ) -> None:
     """Two succeeded results for the same bytes, model and prompt that must never answer
-    a new parse upload: another agent's, and one OpenRouter produced before the Kano Proxy
-    migration (connection_id and connection_base_url both NULL, docs/jobs.md § Dedup)."""
+    a new parse upload: another agent's, and one of an upstream the deployment no longer
+    has — OpenRouter, a provider connection — whose endpoint snapshot is NULL
+    (docs/jobs.md § Dedup)."""
     async with sessionmaker() as db:
         user = await _user(db)
         shared = {
@@ -142,7 +137,8 @@ async def test_dedup_never_crosses_agents_or_answers_from_openrouter_history(
             "finished_at": utcnow(),
         }
         db.add(Job(**{**shared, "agent": "summarize"}))
-        db.add(Job(**{**shared, "connection_base_url": None}))
+        historical = Job(**{**shared, "connection_base_url": None})
+        db.add(historical)
         await db.commit()
 
         key = {
@@ -150,18 +146,17 @@ async def test_dedup_never_crosses_agents_or_answers_from_openrouter_history(
             "agent": "parse",
             "sha256": "d" * 64,
             "model": "vendor/model",
-            "connection_id": None,
             "connection_base_url": "https://kano.test",
             "pages_spec": "",
             "prompt_sha256": "p" * 64,
         }
         assert await find_cached_job(db, retention_days=30, **key) is None
-        # The historical row is there and would match an OpenRouter-era key: the snapshot
-        # is exactly what keeps it out.
-        historical = await find_cached_job(
-            db, retention_days=30, **{**key, "connection_base_url": None}
-        )
-        assert historical is not None and historical.agent == "parse"
+        # The historical row matches the key in everything else: the NULL snapshot is
+        # exactly what keeps it out.
+        historical.connection_base_url = "https://kano.test"
+        await db.commit()
+        found = await find_cached_job(db, retention_days=30, **key)
+        assert found is not None and found.id == historical.id and found.agent == "parse"
 
 
 async def test_dedup_ignores_unfinished_jobs(sessionmaker, tmp_path) -> None:
@@ -184,7 +179,6 @@ async def test_dedup_ignores_unfinished_jobs(sessionmaker, tmp_path) -> None:
                 agent="parse",
                 sha256="c" * 64,
                 model="vendor/model",
-                connection_id=None,
                 connection_base_url="https://kano.test",
                 pages_spec="",
                 prompt_sha256="p" * 64,
@@ -680,21 +674,17 @@ def test_an_attempts_crops_are_its_own_until_published(tmp_path) -> None:
     assert list(figures.iterdir()) == []
 
 
-async def test_a_run_whose_snapshot_update_is_fenced_out_ends_there(
-    sessionmaker, tmp_path, monkeypatch
-) -> None:
+async def test_a_run_whose_snapshot_update_is_fenced_out_ends_there(sessionmaker, tmp_path) -> None:
     """The endpoint snapshot a run writes at its start is fenced like every other write:
     a replacement that claimed the job between the read and the update keeps its own,
     and the stale run starts nothing (docs/jobs.md § Queue)."""
-    from types import SimpleNamespace
-
     from sqlalchemy import Update
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     from sightread.config import Settings
     from sightread.jobs import runner
     from sightread.jobs.queue import next_worker_generation
-    from tests.conftest import KANO_BASE, TEST_SECRET_KEY
+    from tests.conftest import KANO_API_KEY, TEST_SECRET_KEY
 
     async with sessionmaker() as db:
         user = await _user(db)
@@ -710,10 +700,6 @@ async def test_a_run_whose_snapshot_update_is_fenced_out_ends_there(
     async with sessionmaker() as db:
         stale = await next_worker_generation(db)
         assert await claim_next_job(db, 2, None, stale) == job_id
-
-    monkeypatch.setattr(
-        runner, "kano_connection", lambda settings: SimpleNamespace(snapshot="https://moved.test")
-    )
 
     class Interposed(AsyncSession):
         """The replacement requeues and claims the job between this run's read of the row
@@ -738,7 +724,9 @@ async def test_a_run_whose_snapshot_update_is_fenced_out_ends_there(
         upload_dir=str(tmp_path / "uploads"),
         workspaces_dir=str(tmp_path / "workspaces"),
         figures_dir=str(tmp_path / "figures"),
-        kano_proxy_base_url=KANO_BASE,
+        # The worker restarted on another origin: the run's first write is the reconcile.
+        kano_proxy_base_url="https://moved.test",
+        kano_proxy_api_key=KANO_API_KEY,
     )
     await runner.run_job(interposed, settings, job_id, asyncio.Semaphore(1), stale)
     assert replaced

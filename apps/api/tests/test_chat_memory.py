@@ -76,6 +76,7 @@ async def another_document(client: AsyncClient, user_id: int, name: str) -> int:
             sha256="c" * 64,
             model="claude-x",
             bbox_format="yxyx_norm1000",
+            prompt="Transcribe page {page}.",
             status="succeeded",
             page_count=2,
         )
@@ -108,6 +109,7 @@ async def stranger_rows(client: AsyncClient) -> SimpleNamespace:
             sha256="d" * 64,
             model="m",
             bbox_format="yxyx_norm1000",
+            prompt="Transcribe page {page}.",
             status="succeeded",
             page_count=1,
         )

@@ -67,6 +67,7 @@ async def _seed_parse(client: AsyncClient, user_id: int, name: str = "paper.pdf"
             sha256="c" * 64,
             model="vendor/vision-model",
             bbox_format="yxyx_norm1000",
+            prompt="Transcribe page {page}.",
             status="succeeded",
             page_count=1,
             finished_at=utcnow(),

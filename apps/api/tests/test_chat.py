@@ -130,6 +130,7 @@ async def _seed_document(client: AsyncClient, user_id: int) -> int:
             sha256="b" * 64,
             model="claude-x",
             bbox_format="yxyx_norm1000",
+            prompt="Transcribe page {page}.",
             status="succeeded",
             page_count=1,
         )

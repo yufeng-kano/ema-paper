@@ -223,12 +223,10 @@ class PaymentRequired(UpstreamError):
 @dataclass(frozen=True)
 class Connection:
     """The upstream to call: where, and the operator's key (docs/auth.md § 3). The key
-    lives in this value for the request it authorises and in no log line; `snapshot` is
-    what the job's dedup key stores for the upstream (docs/jobs.md § Dedup)."""
+    lives in this value for the request it authorises and in no log line."""
 
     api_key: str
     base_url: str
-    snapshot: str
 
     def __repr__(self) -> str:  # never let key material reach a log line
         return "Connection(...)"
@@ -258,7 +256,6 @@ def kano_connection(settings: Settings, *, anthropic: bool = False) -> Connectio
     return Connection(
         api_key=settings.kano_proxy_api_key,
         base_url=settings.kano_proxy_anthropic_base if anthropic else settings.kano_proxy_api_base,
-        snapshot=settings.kano_proxy_base_url,
     )
 
 

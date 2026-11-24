@@ -191,7 +191,6 @@ class Job(Base):
             "agent",
             "sha256",
             "model",
-            "connection_id",
             "pages_spec",
             "prompt_sha256",
             "pipeline_version",
@@ -213,23 +212,13 @@ class Job(Base):
     model: Mapped[str] = mapped_column(String(255))
     pipeline_version: Mapped[int] = mapped_column(Integer, default=0)
     bbox_format: Mapped[str] = mapped_column(String(32))
-    # The job whose output this job took as input; NULL when the input was an upload.
-    # No foreign key, for the same reason as `connection_id` (docs/database.md).
-    source_job_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
-    # The upstream this job ran on; NULL means the built-in upstream — Kano Proxy, or
-    # OpenRouter on historical rows (docs/api.md § Upstreams). Deliberately NOT a foreign
-    # key: provider identity is immutable job history. A FK with SET NULL would relabel a
-    # deleted connection's jobs as Kano Proxy jobs — a queued one would then run on the
-    # wrong key, and a succeeded one would satisfy Kano Proxy dedup lookups with another
-    # upstream's output (docs/database.md).
-    connection_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    # Endpoint snapshot at enqueue — the connection's base_url, or KANO_PROXY_BASE_URL for
-    # the built-in upstream; part of the dedup key so editing a connection's URL
-    # invalidates results parsed through the old endpoint, and historical OpenRouter rows
-    # (NULL) never answer a new upload (docs/jobs.md § Dedup).
+    # Endpoint snapshot at enqueue: KANO_PROXY_BASE_URL, part of the dedup key, so results
+    # parsed through another origin never answer (docs/jobs.md § Dedup). NULL on a job of
+    # an upstream the deployment no longer has — OpenRouter, a provider connection — which
+    # never answers a lookup and never runs (docs/database.md § Rules).
     connection_base_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     # The effective prompt template, verbatim; its hash is part of the dedup key.
-    prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    prompt: Mapped[str] = mapped_column(Text)
     prompt_sha256: Mapped[str] = mapped_column(String(64), default="", server_default="")
     # The fallback a blocked page goes to, snapshotted at enqueue while the agent's
     # `auto_fallback` was on; NULL otherwise (docs/parsing.md § Fallback model).

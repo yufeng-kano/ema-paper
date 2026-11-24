@@ -167,17 +167,15 @@ def resolve_kind(filename: str, media_type: str) -> tuple[str, str]:
 class Target:
     """What a job will run: agent, model, prompt and the upstream it calls.
 
-    `connection_id` is always NULL now — every job runs on the operator's Kano Proxy —
-    and `connection_base_url` snapshots `KANO_PROXY_BASE_URL` at enqueue: part of the
-    dedup key, so historical OpenRouter and provider-connection results never answer
-    (docs/jobs.md § Dedup).
+    Every job runs on the operator's Kano Proxy, and `connection_base_url` snapshots
+    `KANO_PROXY_BASE_URL` at enqueue: part of the dedup key, so a result parsed through
+    another endpoint never answers (docs/jobs.md § Dedup).
     """
 
     agent: str
     model: str
     bbox_format: str
     prompt: str
-    connection_id: int | None
     connection_base_url: str
     # The fallback a blocked page goes to, only while the agent's switch is on
     # (docs/agents.md § Enqueue rules); not part of the dedup key.
@@ -230,7 +228,6 @@ async def resolve_target(
         model,
         agent.bbox_format,
         prompt,
-        None,
         settings.kano_proxy_base_url,
         fallback,
     )
@@ -388,7 +385,6 @@ async def submit_parse(
         "agent": target.agent,
         "sha256": sha256,
         "model": target.model,
-        "connection_id": target.connection_id,
         "connection_base_url": target.connection_base_url,
         "pages_spec": pages_spec,
         "prompt_sha256": prompt_sha256,
@@ -568,7 +564,6 @@ async def submit_parse(
         sha256=sha256,
         pages_spec=pages_spec,
         model=target.model,
-        connection_id=target.connection_id,
         connection_base_url=target.connection_base_url,
         bbox_format=target.bbox_format,
         prompt=target.prompt,
@@ -871,7 +866,6 @@ async def retry_filed_parse(
             agent=job.agent,
             sha256=job.sha256,
             model=job.model,
-            connection_id=job.connection_id,
             connection_base_url=job.connection_base_url,
             pages_spec=job.pages_spec,
             prompt_sha256=job.prompt_sha256,

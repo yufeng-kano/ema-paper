@@ -120,6 +120,7 @@ def _job(user_id: int) -> Job:
         status="queued",
         model="m",
         bbox_format="yxyx_norm1000",
+        prompt="Transcribe page {page}.",
         page_count=1,
         pages_done=0,
     )

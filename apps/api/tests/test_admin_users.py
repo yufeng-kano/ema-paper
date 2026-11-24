@@ -50,6 +50,7 @@ def _job(user_id: int, **fields) -> Job:
             "status": "succeeded",
             "model": "m",
             "bbox_format": "yxyx_norm1000",
+            "prompt": "Transcribe page {page}.",
             "page_count": 3,
             "pages_done": 3,
             **fields,

@@ -150,7 +150,7 @@ async def test_parse_a_mixed_pdf_end_to_end(api_client, sessionmaker, documents)
     # The upstream is Kano Proxy's OpenAI base, called with the operator's key, and the
     # job's dedup snapshot is the Kano Proxy origin (docs/jobs.md § Dedup).
     assert route.calls[0].request.headers["authorization"] == f"Bearer {KANO_API_KEY}"
-    assert (job.connection_id, job.connection_base_url) == (None, "https://kano.test")
+    assert job.connection_base_url == "https://kano.test"
     assert job.agent == "parse"
 
     # Each page's figure crop was persisted before its render was deleted, addressed by

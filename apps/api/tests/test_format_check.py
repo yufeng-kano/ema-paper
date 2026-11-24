@@ -76,7 +76,6 @@ def _connection() -> Connection:
     return Connection(
         api_key=KANO_API_KEY,
         base_url=f"{KANO_BASE}/anthropic/v1",
-        snapshot=KANO_BASE,
     )
 
 

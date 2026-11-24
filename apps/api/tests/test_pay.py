@@ -824,6 +824,7 @@ async def test_the_plan_caps_the_parses_a_user_runs_at_once(make_client, documen
                         agent="parse",
                         pipeline_version=1,
                         bbox_format="yxyx_norm1000",
+                        prompt="Transcribe page {page}.",
                         status="running",
                         page_count=1,
                         started_at=utcnow(),
@@ -897,6 +898,7 @@ async def test_the_claim_applies_the_users_plan_cap_as_it_stands(make_client, se
                     agent="parse",
                     pipeline_version=1,
                     bbox_format="yxyx_norm1000",
+                    prompt="Transcribe page {page}.",
                     status="queued",
                     page_count=1,
                 )
