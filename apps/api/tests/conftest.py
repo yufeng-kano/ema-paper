@@ -121,6 +121,7 @@ async def make_client(sessionmaker, tmp_path) -> AsyncIterator[Callable[..., Asy
                 "database_url": "sqlite+aiosqlite://",
                 "upload_dir": str(tmp_path / "uploads"),
                 "figures_dir": str(tmp_path / "figures"),
+                "workspaces_dir": str(tmp_path / "workspaces"),
                 "kano_proxy_base_url": KANO_BASE,
                 "kano_proxy_api_key": KANO_API_KEY,
                 "parse_model": PARSE_MODEL,

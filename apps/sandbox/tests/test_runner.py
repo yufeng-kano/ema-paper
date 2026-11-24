@@ -1057,10 +1057,13 @@ echo $!""",
         lines = outcome.output.split()
         assert lines[0] == "first"
         pid = int(lines[-1])
-        # The real pgrep ran: the job was ended (dead, or a zombie this host's init
-        # has not reaped yet).
-        status = Path(f"/proc/{pid}/status")
-        assert not status.exists() or "State:\tZ" in status.read_text()
+        # The real pgrep ran: the job was ended (gone, a zombie this host's init has not
+        # reaped yet, or one being reaped this moment, which shows as dead).
+        try:
+            state = Path(f"/proc/{pid}/status").read_text()
+        except (FileNotFoundError, ProcessLookupError):
+            state = None
+        assert state is None or "State:\tZ" in state or "State:\tX" in state
         after = await shell.run("echo ran; command -v pgrep", timeout=10)
         assert after.output.split()[0] == "ran"
         # The command itself still sees what it planted: the PATH is the VM's.

@@ -71,11 +71,15 @@ def test_parse_pages_spec() -> None:
             parse_pages_spec(bad, 8)
 
 
-async def test_dedup_lookup_matches_the_full_key(sessionmaker) -> None:
+async def test_dedup_lookup_matches_the_full_key(sessionmaker, tmp_path) -> None:
     async with sessionmaker() as db:
         user = await _user(db)
         job = await enqueue_job(
-            db, user_id=user.id, sha256="a" * 64, source_path="unused-a.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="a" * 64,
+            source_path=str(tmp_path / "unused-a.pdf"),
+            **JOB_DEFAULTS,
         )
         job.status = "succeeded"
         job.finished_at = utcnow()
@@ -160,11 +164,15 @@ async def test_dedup_never_crosses_agents_or_answers_from_openrouter_history(
         assert historical is not None and historical.agent == "parse"
 
 
-async def test_dedup_ignores_unfinished_jobs(sessionmaker) -> None:
+async def test_dedup_ignores_unfinished_jobs(sessionmaker, tmp_path) -> None:
     async with sessionmaker() as db:
         user = await _user(db)
         await enqueue_job(
-            db, user_id=user.id, sha256="c" * 64, source_path="unused-c.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="c" * 64,
+            source_path=str(tmp_path / "unused-c.pdf"),
+            **JOB_DEFAULTS,
         )
         await db.commit()
 
@@ -185,14 +193,22 @@ async def test_dedup_ignores_unfinished_jobs(sessionmaker) -> None:
         )
 
 
-async def test_claim_is_fifo_and_marks_the_job_running(sessionmaker) -> None:
+async def test_claim_is_fifo_and_marks_the_job_running(sessionmaker, tmp_path) -> None:
     async with sessionmaker() as db:
         user = await _user(db)
         first = await enqueue_job(
-            db, user_id=user.id, sha256="1" * 64, source_path="unused-1.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="1" * 64,
+            source_path=str(tmp_path / "unused-1.pdf"),
+            **JOB_DEFAULTS,
         )
         second = await enqueue_job(
-            db, user_id=user.id, sha256="2" * 64, source_path="unused-2.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="2" * 64,
+            source_path=str(tmp_path / "unused-2.pdf"),
+            **JOB_DEFAULTS,
         )
         second.created_at = first.created_at + timedelta(seconds=5)
         await db.commit()
@@ -206,15 +222,23 @@ async def test_claim_is_fifo_and_marks_the_job_running(sessionmaker) -> None:
         assert await count_running_jobs(db, first.user_id) == 1
 
 
-async def test_claim_honours_the_per_user_cap(sessionmaker) -> None:
+async def test_claim_honours_the_per_user_cap(sessionmaker, tmp_path) -> None:
     async with sessionmaker() as db:
         user = await _user(db)
         running = await enqueue_job(
-            db, user_id=user.id, sha256="3" * 64, source_path="unused-3.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="3" * 64,
+            source_path=str(tmp_path / "unused-3.pdf"),
+            **JOB_DEFAULTS,
         )
         running.status = "running"
         await enqueue_job(
-            db, user_id=user.id, sha256="4" * 64, source_path="unused-4.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="4" * 64,
+            source_path=str(tmp_path / "unused-4.pdf"),
+            **JOB_DEFAULTS,
         )
         await db.commit()
 
@@ -224,11 +248,15 @@ async def test_claim_honours_the_per_user_cap(sessionmaker) -> None:
         assert await claim_next_job(db, max_jobs_per_user=2) is not None
 
 
-async def test_requeue_keeps_the_pages_that_succeeded(sessionmaker) -> None:
+async def test_requeue_keeps_the_pages_that_succeeded(sessionmaker, tmp_path) -> None:
     async with sessionmaker() as db:
         user = await _user(db)
         job = await enqueue_job(
-            db, user_id=user.id, sha256="5" * 64, source_path="unused-5.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="5" * 64,
+            source_path=str(tmp_path / "unused-5.pdf"),
+            **JOB_DEFAULTS,
         )
         job.status = "running"
         job.pages_done = 2
@@ -306,18 +334,26 @@ async def test_a_worker_stops_when_its_lock_session_is_gone() -> None:
 
 
 @postgres_only
-async def test_a_worker_starting_requeues_the_jobs_a_dead_one_left(sessionmaker) -> None:
+async def test_a_worker_starting_requeues_the_jobs_a_dead_one_left(sessionmaker, tmp_path) -> None:
     from sightread.jobs.queue import requeue_orphaned_jobs
 
     async with sessionmaker() as db:
         user = await _user(db)
         held = await enqueue_job(
-            db, user_id=user.id, sha256="6" * 64, source_path="unused-6.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="6" * 64,
+            source_path=str(tmp_path / "unused-6.pdf"),
+            **JOB_DEFAULTS,
         )
         held.status = "running"
         held.started_at = utcnow()
         queued = await enqueue_job(
-            db, user_id=user.id, sha256="7" * 64, source_path="unused-7.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="7" * 64,
+            source_path=str(tmp_path / "unused-7.pdf"),
+            **JOB_DEFAULTS,
         )
         await db.commit()
         held_id, queued_id = held.id, queued.id
@@ -332,7 +368,7 @@ async def test_a_worker_starting_requeues_the_jobs_a_dead_one_left(sessionmaker)
 
 
 async def test_after_a_turn_the_worker_requeues_only_its_own_jobs_left_running(
-    sessionmaker,
+    sessionmaker, tmp_path
 ) -> None:
     """docs/jobs.md § Queue: a parse a chat turn drove and could not put back is still the
     live worker's once the turn is over, and nobody drives it; the worker puts it back
@@ -344,10 +380,18 @@ async def test_after_a_turn_the_worker_requeues_only_its_own_jobs_left_running(
     async with sessionmaker() as db:
         user = await _user(db)
         left = await enqueue_job(
-            db, user_id=user.id, sha256="8" * 64, source_path="unused-8.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="8" * 64,
+            source_path=str(tmp_path / "unused-8.pdf"),
+            **JOB_DEFAULTS,
         )
         foreign = await enqueue_job(
-            db, user_id=user.id, sha256="9" * 64, source_path="unused-9.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="9" * 64,
+            source_path=str(tmp_path / "unused-9.pdf"),
+            **JOB_DEFAULTS,
         )
         await db.commit()
         left_id, foreign_id = left.id, foreign.id
@@ -383,11 +427,19 @@ async def test_a_job_whose_task_raised_is_failed_unless_already_done(
     async with sessionmaker() as db:
         user = await _user(db)
         job = await enqueue_job(
-            db, user_id=user.id, sha256="8" * 64, source_path="unused-8.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="8" * 64,
+            source_path=str(tmp_path / "unused-8.pdf"),
+            **JOB_DEFAULTS,
         )
         job.status = "running"
         done = await enqueue_job(
-            db, user_id=user.id, sha256="9" * 64, source_path="unused-9.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="9" * 64,
+            source_path=str(tmp_path / "unused-9.pdf"),
+            **JOB_DEFAULTS,
         )
         done.status = "succeeded"
         await db.commit()
@@ -413,7 +465,7 @@ async def test_a_job_whose_task_raised_is_failed_unless_already_done(
 
 
 @postgres_only
-async def test_two_claimers_never_take_the_same_job(sessionmaker) -> None:
+async def test_two_claimers_never_take_the_same_job(sessionmaker, tmp_path) -> None:
     async with sessionmaker() as db:
         user = await _user(db)
         for index in range(2):
@@ -421,7 +473,7 @@ async def test_two_claimers_never_take_the_same_job(sessionmaker) -> None:
                 db,
                 user_id=user.id,
                 sha256=str(index) * 64,
-                source_path=f"unused-{index}.pdf",
+                source_path=str(tmp_path / f"unused-{index}.pdf"),
                 **JOB_DEFAULTS,
             )
         await db.commit()
@@ -500,11 +552,15 @@ def test_a_discarded_jobs_figures_cannot_be_written_back(tmp_path) -> None:
     assert not (tmp_path / "job").exists()
 
 
-async def test_a_job_of_a_user_with_an_orphaned_turn_is_not_claimed(sessionmaker) -> None:
+async def test_a_job_of_a_user_with_an_orphaned_turn_is_not_claimed(sessionmaker, tmp_path) -> None:
     async with sessionmaker() as db:
         user = await _user(db)
         job = await enqueue_job(
-            db, user_id=user.id, sha256="3" * 64, source_path="unused-3.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="3" * 64,
+            source_path=str(tmp_path / "unused-3.pdf"),
+            **JOB_DEFAULTS,
         )
         await db.commit()
     async with sessionmaker() as db:
@@ -514,6 +570,7 @@ async def test_a_job_of_a_user_with_an_orphaned_turn_is_not_claimed(sessionmaker
         assert await claim_next_job(db, 2, {user.id + 1000}) == job.id
 
 
+@postgres_only
 async def test_a_stale_workers_writes_are_fenced_by_its_generation(sessionmaker, tmp_path) -> None:
     """A worker that lost the worker lock goes on for seconds; the replacement has
     requeued and claimed its job by then, and nothing the stale one writes may land —
@@ -530,7 +587,11 @@ async def test_a_stale_workers_writes_are_fenced_by_its_generation(sessionmaker,
     async with sessionmaker() as db:
         user = await _user(db)
         job = await enqueue_job(
-            db, user_id=user.id, sha256="c" * 64, source_path="unused-c.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="c" * 64,
+            source_path=str(tmp_path / "unused-c.pdf"),
+            **JOB_DEFAULTS,
         )
         await db.commit()
         job_id = job.id
@@ -638,7 +699,11 @@ async def test_a_run_whose_snapshot_update_is_fenced_out_ends_there(
     async with sessionmaker() as db:
         user = await _user(db)
         job = await enqueue_job(
-            db, user_id=user.id, sha256="d" * 64, source_path="unused-d.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="d" * 64,
+            source_path=str(tmp_path / "unused-d.pdf"),
+            **JOB_DEFAULTS,
         )
         await db.commit()
         job_id = job.id
@@ -698,7 +763,11 @@ async def test_the_crops_are_published_under_the_backup_lock(
     async with sessionmaker() as db:
         user = await _user(db)
         job = await enqueue_job(
-            db, user_id=user.id, sha256="e" * 64, source_path="unused-e.pdf", **JOB_DEFAULTS
+            db,
+            user_id=user.id,
+            sha256="e" * 64,
+            source_path=str(tmp_path / "unused-e.pdf"),
+            **JOB_DEFAULTS,
         )
         job.status = "running"
         await db.commit()

@@ -40,6 +40,7 @@ from sightread.workspace import documents as workspace_documents
 from sightread.workspace import git
 from sightread.workspace.layout import user_root
 from tests.conftest import CSRF_HEADERS, KANO_BASE
+from tests.test_jobs_queue import postgres_only
 
 MESSAGES_URL = f"{KANO_BASE}/anthropic/v1/messages"
 MODELS_URL = f"{KANO_BASE}/openai/v1/models"
@@ -621,6 +622,7 @@ def test_truncate_keeps_head_and_tail() -> None:
     assert "omitted" in cut
 
 
+@postgres_only
 async def test_a_finished_library_parse_keeps_its_source(chatting, tmp_path) -> None:
     """The retention exception (docs/jobs.md): the upload moves into the document dir."""
     settings = chatting.app.state.settings
@@ -3517,7 +3519,11 @@ def test_a_directory_view_is_bounded_like_every_tool_result(tmp_path) -> None:
     # the result is cut like a long file view.
     cut = chat_tools._listing(root, crowded, 200)
     assert len(cut) <= 200 and "omitted" in cut and "more entries" in cut
-    assert cut.startswith("entry-000.txt")
+    # Which entries are read first is the filesystem's order; what was read is sorted. The
+    # head's last line may be cut mid-name.
+    names = {f"entry-{index:03d}.txt" for index in range(250)}
+    head = cut.split("\n\n[...", 1)[0].split("\n")[:-1]
+    assert head and all(line in names for line in head) and head == sorted(head)
 
 
 async def test_a_subagents_retry_is_not_made_once_the_allowance_is_used(monkeypatch) -> None:

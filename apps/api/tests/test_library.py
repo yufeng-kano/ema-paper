@@ -270,6 +270,8 @@ async def test_a_retried_upload_does_not_buy_a_second_parse(
     # The browser cannot tell a lost response from a lost request, so it retries an upload
     # that may already have landed. The same bytes, still queued, must not become a second
     # parse — that is the user's own key being spent twice for one document.
+    from sightread.workspace.documents import original_of
+
     first = (await _upload(library, documents)).json()
     second = (await _upload(library, documents)).json()
 
@@ -277,10 +279,11 @@ async def test_a_retried_upload_does_not_buy_a_second_parse(
     assert second["id"] != first["id"]
     async with sessionmaker() as db:
         (job,) = (await db.execute(select(Job))).scalars().all()
-        # The second row keeps its own fresh upload: the worker may hand the job's to the
-        # rows that existed when it finished, and this one was not among them.
+        # The second row keeps its own fresh upload as its original: the worker may hand
+        # the job's to the rows that existed when it finished, and this one was not among
+        # them (docs/workspace.md § Layout).
         root = user_root(library.app.state.settings.workspaces_dir, job.user_id)
-        assert list((root / "files" / "tiny (2).png").glob("source.*"))
+        assert original_of(root, second["id"]) is not None
         assert Path(job.source_path).is_file()
 
 

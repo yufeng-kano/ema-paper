@@ -14,7 +14,7 @@ import httpx
 import pytest
 import respx
 from httpx import AsyncClient
-from sqlalchemy import Text, cast, func, select, update
+from sqlalchemy import Text, cast, select, update
 
 from sightread.agents import chat as chat_agent
 from sightread.agents import skills as skill_defs
@@ -249,11 +249,12 @@ async def test_an_abandoned_compaction_fills_no_history_cap(chat_client) -> None
     async with client.app.state.sessionmaker() as db:
         summary_alone = await history_bytes(db, conversation_id, since=boundary)
         # The summary row's own bytes: the compaction's other rows come before the boundary.
-        summary_row = (
-            await db.execute(
-                select(func.octet_length(cast(Message.content, Text))).where(Message.id == boundary)
-            )
-        ).scalar_one()
+        # Its stored text measured in UTF-8, as the cap measures it on either database.
+        summary_row = len(
+            (await db.execute(select(cast(Message.content, Text)).where(Message.id == boundary)))
+            .scalar_one()
+            .encode()
+        )
     assert summary_alone == summary_row > 0
 
     await send(client, conversation_id, text="go on")

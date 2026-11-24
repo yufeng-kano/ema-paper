@@ -274,7 +274,7 @@ async def test_a_request_model_must_be_one_of_the_parse_agents(
             KANO_BASE,
         )
         assert second.model == FALLBACK
-        assert (await db.execute(select(Job.id))).all() == [(first.id,), (second.id,)]
+        assert sorted((await db.execute(select(Job.id))).scalars()) == sorted([first.id, second.id])
 
 
 async def test_no_parse_model_or_no_kano_proxy_refuses_every_parse(

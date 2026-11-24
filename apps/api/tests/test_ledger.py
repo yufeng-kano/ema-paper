@@ -30,6 +30,7 @@ from sightread.jobs.queue import claim_next_turn, fail_turn
 from sightread.workspace.layout import user_root
 from tests.conftest import CSRF_HEADERS, TEST_MODEL_PRICES
 from tests.test_chat import MESSAGES_URL, _seed_document, assistant_turn, sse
+from tests.test_jobs_queue import postgres_only
 from tests.test_library import _read, _ready_to_parse, _upload
 
 pytestmark = pytest.mark.usefixtures("documents")
@@ -383,6 +384,7 @@ async def test_a_send_into_a_full_workspace_is_refused(make_client, tmp_path) ->
     assert (await client.get("/api/billing")).json()["period"]["spent"] == 0
 
 
+@postgres_only
 @respx.mock
 @pytest.mark.parametrize("granted", [1, 6])
 @pytest.mark.parametrize("last_stop", ["end_turn", "tool_use"])
@@ -644,6 +646,7 @@ async def test_a_turn_the_worker_fails_closes_its_entry(sessionmaker) -> None:
     assert (await _period(sessionmaker, user_id)).spent == 2
 
 
+@postgres_only
 async def test_a_deleted_conversation_leaves_its_entries_in_the_ledger(sessionmaker) -> None:
     """docs/billing.md § The ledger: the record outlives the thread it was charged for;
     the period's `spent` and the entries keep agreeing."""
