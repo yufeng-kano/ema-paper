@@ -9,7 +9,8 @@
   - the model catalog;
   - every Kano Pay call ([billing.md](./billing.md) § Kano Pay);
   - the chat agent's web tools — Brave, OpenAlex, every URL it reads or downloads ([chat.md](./chat.md) § Tools). The tests resolve a host to a fixed public address and stub the connection to it.
-- The sandbox runner is stubbed the same way from the API's side. It is tested on its own with the `local` backend (a bash process in a temp dir), never with Docker.
+- The sandbox runner is stubbed the same way from the API's side. It is tested on its own with a local bash stand-in for its Docker backend (`apps/sandbox/tests/local_backend.py`, a bash process in a temp dir, injected into the app by the tests), never with Docker.
+  - The runner's tests remove every `SANDBOX_*` variable and `APP_ENV` from the environment before each test (`apps/sandbox/tests/conftest.py`).
 - The suite must pass with no network.
 - A live smoke test requires the operator's explicit per-instance approval: one tiny document, one cheap model, never a loop or sweep.
 
@@ -18,8 +19,16 @@
 ### The suite
 
 - `uv run pytest`. pytest + pytest-asyncio.
-- The database is `TEST_DATABASE_URL`, else `DATABASE_URL`, else a throwaway SQLite file in the test's temp dir.
-- Every test drops and recreates the whole schema (`Base.metadata.drop_all`/`create_all`) in that database before it runs, and drops it after. So point either variable only at a throwaway PostgreSQL such as compose `pg`, never at one holding data.
+- Without `TEST_DATABASE_URL` the suite runs on a throwaway SQLite file per test, with no services and no network: each test makes the schema in a new file under its `tmp_path`.
+- `TEST_DATABASE_URL` (a `postgresql+asyncpg://` URL) runs it on PostgreSQL instead. It is the only variable the suite reads to choose a database; the app's `DATABASE_URL` is never read.
+- On PostgreSQL a run makes the schema once, from a clean database (`Base.metadata.drop_all` then `create_all`), in the database `TEST_DATABASE_URL` names, and drops it at the run's end.
+- Before each test on PostgreSQL every table is truncated (`TRUNCATE ... RESTART IDENTITY CASCADE`) and `worker_generation_seq` restarted, so every test starts on empty tables with ids counting from 1.
+- So `TEST_DATABASE_URL` names a dedicated test database, never the app's own (its tables are dropped): e.g. `sightread_test` on the compose `pg` server, made once with `docker compose exec pg createdb -U sightread sightread_test`.
+- The test engine is built with the app's own `sightread.db.session.create_engine`, so a PostgreSQL run has production's session settings (the UTC pin day buckets rely on, `hide_parameters`).
+- The test `Settings` put uploads, figures and workspaces under the test's `tmp_path`; no test touches `/data`.
+- No test reads a setting from the developer's environment. An autouse fixture in `tests/conftest.py` (`hermetic_settings`) removes every environment variable that names a `Settings` field (matched without regard to case) before each test and clears the `get_settings()` cache.
+- So a shell that exported `.env`, or the compose api container's `env_file`, changes no result; each test passes the settings it needs.
+- `TEST_DATABASE_URL` is not a `Settings` field; it is read once, at import, before that fixture runs.
 - Tests of PostgreSQL-only behavior (foreign-key actions, row locks, SKIP LOCKED, `pg_locks`, the migrations) skip on the SQLite fallback, so run with `TEST_DATABASE_URL` set before shipping a change they cover.
 - Fixture documents in `tests/fixtures/`: a small text-layer PDF, a scanned-style PDF (rendered-only), a multi-page mix, one corrupt file, tiny jpg/png/webp/heic images. Generate or vendor tiny files — keep fixtures under a few hundred KB each.
 - Poppler is a real dependency of the test environment. Subprocess wrappers are tested against real fixtures, not mocked.
@@ -120,7 +129,7 @@
 ### Must-cover: parsing, the queue, OAuth and MCP
 
 - The operator's key on every upstream call, and never in a response.
-- A model outside the deployment's list refused at enqueue and at a send.
+- A model outside the deployment's list refused at enqueue and at a send, and never run by a retry (a retry naming none runs on `PARSE_MODEL` when the job's model was withdrawn, and drops a withdrawn fallback).
 - Dedup never crossing agents.
 - Dedup never answering from a row with no endpoint snapshot (`connection_base_url` NULL: OpenRouter and provider-connection history), and such a row failing at claim rather than running on Kano Proxy.
 - An unconfigured Kano Proxy or parse model refused at enqueue.

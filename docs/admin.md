@@ -479,11 +479,10 @@ The figures — `<figures>` (§ Routes), of a usage row, of an overview model an
 | `calls` | `usage_log` rows (one per upstream call) |
 | `prompt_tokens`, `completion_tokens` | summed over every call, priced or not |
 | `cost` | **billed**: the sum of OpenRouter's own cost (`cost_source = openrouter`). No call is recorded with `openrouter`, so a range without such rows reads 0 with no billed calls behind it |
-| `estimated_cost`, `estimated_calls` | the sum and count of costs Kano Proxy reported (`cost_source = estimated`, always recorded) — an estimate, never added into `cost` |
+| `estimated_cost` | the sum of costs Kano Proxy reported (`cost_source = estimated`, always recorded) — an estimate, never added into `cost` |
 | `unpriced_calls` | calls whose cost is unknown (`cost_source = unknown`); counted, never priced as 0 |
-| `cache_read_tokens`, `cache_write_tokens` | prompt-cache reads and writes, chat and check rows only ([chat.md](./chat.md) § Prompt caching) |
 
-`calls - estimated_calls - unpriced_calls` is the number of billed calls, so a client can tell "OpenRouter billed $0" from "nothing here went through OpenRouter". The per-model grouping is by model id alone; one id used on two upstreams lands in one entry with its figures still separated by source.
+The per-model grouping is by model id alone; one id used on two upstreams lands in one entry with its figures still separated by source.
 
 ## Settings
 
@@ -776,7 +775,7 @@ The settings an operator changes most — the models, their prices, the credit r
   - `since`: the lock holder's connection start.
   - `generation`: the live generation.
   - `since` and `generation` are both null unless `running`; `generation` is also null before any worker took one.
-- `<figures>` = `{calls, prompt_tokens, completion_tokens, cost, estimated_cost, estimated_calls, unpriced_calls, cache_read_tokens, cache_write_tokens}`, as § Overview, jobs and usage defines them.
+- `<figures>` = `{calls, prompt_tokens, completion_tokens, cost, estimated_cost, unpriced_calls}`, as § Overview, jobs and usage defines them.
 - `<entry>` = `{id, created_at, actor: {id, email, name} | null, permission, action, target_type, target_id, target_label, before, after, ip}`
   - `actor`: null once that account is deleted.
   - `target_label`: what the page prints for the target, read now — a user target's address or a group target's name. Null for any other target and for one since deleted; the page then prints the type and the id (a setting's id is its key).

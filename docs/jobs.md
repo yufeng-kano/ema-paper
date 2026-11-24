@@ -144,7 +144,11 @@ A parse with a failed page fails whole ([parsing.md](./parsing.md) § Vision-onl
 
 The run that claims it:
 
-- **transcribes only the pages without a succeeded row** (`job_pages`), on the model the retry named (`jobs.retry_model`; NULL is the job's own `model`) — and sends a page that model blocks to the job's fallback, if it has one ([parsing.md](./parsing.md) § Fallback model);
+- **transcribes only the pages without a succeeded row** (`job_pages`), on the model the retry runs:
+  - the model the retry named (`jobs.retry_model`);
+  - else the job's own `model` while the deployment still offers it, one of the parse agent's two (`jobs.retry_model` NULL);
+  - else `PARSE_MODEL`, written as `jobs.retry_model`;
+- **sends a page that model blocks to the job's fallback**, if it has one the deployment still offers ([parsing.md](./parsing.md) § Fallback model). A fallback it no longer offers is cleared from the job (`jobs.fallback_model` NULL) by the retry, so the page fails instead;
 - **renders the kept pages that carry figures again**, to crop them from their stored markdown: a render is ours to pay for, a transcription is the user's, and an attempt's crops come from that attempt alone ([parsing.md](./parsing.md) § Figure crops). Their boxes were checked when they were transcribed, and their statuses come with them: a kept page is not checked again ([parsing.md](./parsing.md) § Figure check);
 - **assembles every page, kept and new,** and checks the document when the job carries a check, then commits the result like any result. A page that fails again, or a check that fails again, fails the job again, with nothing lost.
 
@@ -157,7 +161,7 @@ The run that claims it:
 **The retry takes the format check again from the settings of its moment**, as an upload would ([agents.md](./agents.md) § Enqueue rules):
 
 - A check that failed may have failed on its model, and a reader who turned the switch off retries without one.
-- A check with no model of its own follows the parse's, which on a retry is the model the retry named, else the job's own. So a retry that moves a blocked page to another model does not send its text back to the first one in the check.
+- A check with no model of its own follows the parse's, which on a retry is the model the retry runs (the one it named, else the job's own while offered, else `PARSE_MODEL`). So a retry that moves a blocked page to another model does not send its text back to the first one in the check.
 - A parse that failed only its check has every page kept, so its retry sends no page to a model at all.
 
 **A retry runs on the document's original** ([workspace.md](./workspace.md)), because the upload was deleted when the job failed:
@@ -180,7 +184,7 @@ The run that claims it:
 - No per-user cap refuses it. The claim applies the cap to it like to any queued job.
 - It changes nothing of the dedup key: the job keeps its model, prompt and endpoint snapshot, and a result it finishes answers that key like any other.
 
-**The chat agent retries a library parse as the route does.** `convert_file` with `retry` ([chat.md](./chat.md) § Tools) calls the function the route calls (`intake.retry_library_parse`): the same locks, a copy of the same original, the credits reserved again, the check from the settings of the moment. It runs on the job's own model, the route's default with no `model`. It then claims the job and drives it inside the turn as a conversion is driven (§ Converting a file). It retries only a document's own failed parse: a failed re-convert is the reader's, retried or dismissed from Files.
+**The chat agent retries a library parse as the route does.** `convert_file` with `retry` ([chat.md](./chat.md) § Tools) calls the function the route calls (`intake.retry_library_parse`): the same locks, a copy of the same original, the credits reserved again, the check from the settings of the moment. It runs on the route's default with no `model`: the job's own model while the deployment offers it, else `PARSE_MODEL`. It then claims the job and drives it inside the turn as a conversion is driven (§ Converting a file). It retries only a document's own failed parse: a failed re-convert is the reader's, retried or dismissed from Files.
 
 **A data-plane parse is retried by sending its file again** (so the connector gets the web's retry, [mcp.md](./mcp.md)): `POST /v1/parse` with `retry` ([api.md](./api.md)).
 
@@ -201,7 +205,7 @@ The run that claims it:
      - from `failed` only;
      - its credits reserved again (**402** otherwise, nothing requeued);
      - the check taken from the settings of the moment;
-     - the failed pages run on the `model` the upload names — one of the parse agent's two, the fallback for a page the first one blocked — or else the job's own;
+     - the failed pages run on the `model` the upload names — one of the parse agent's two, the fallback for a page the first one blocked — or else the job's own while the deployment offers it, else `PARSE_MODEL`;
      - the upload becomes the job's source under the job's own name (`{job_id}.retry-<random>.<ext>`, so whatever removes a job's uploads by its id finds it), and the run's retention deletes it as any data-plane source;
      - a requeue that raises before its commit removes it; one whose commit raises leaves it — a retry that landed runs on it, and the upload sweeper takes it otherwise;
      - a ticket is spent on the job, so `last` reads it.

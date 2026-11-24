@@ -462,7 +462,7 @@ The worker compacts a conversation before its cache expires, when the context is
   - the original is kept, which the reader opens and downloads in Files ([web.md](./web.md) § Files, *A failed parse opens on its original*);
   - the answer tells the agent to ask the user before a retry, since a retry is charged the whole conversion's credits again.
 - **`retry: true` retries a failed conversion.** On a document whose own parse failed, the parse is put back exactly as the Files page's retry puts it back, through the function the route calls ([jobs.md](./jobs.md) § Retrying failed pages):
-  - only the pages that failed are sent, on the job's own model; a page it blocks goes to the job's fallback, if it has one ([parsing.md](./parsing.md) § Fallback model);
+  - only the pages that failed are sent, on the job's own model while the deployment offers it, else `PARSE_MODEL`; a page it blocks goes to the job's fallback, if it has one the deployment still offers ([parsing.md](./parsing.md) § Fallback model);
   - the format check is taken from the settings of the moment;
   - the whole conversion's credits are reserved again — every page's, as the first run's were, not only the failed ones'; refused with nothing changed when the balance cannot cover them, and once the turn's own credits are exhausted; none for a conversion queued before the ledger ([billing.md](./billing.md) § A parse);
   - it is charged only if it succeeds;

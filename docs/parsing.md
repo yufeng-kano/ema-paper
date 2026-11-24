@@ -221,10 +221,11 @@ A page can be finished by a model other than the job's own, in two ways. The pag
 - **Automatically, for a blocked page.**
   - Conditions: the deployment names a fallback model (`PARSE_FALLBACK_MODEL`, [billing.md](./billing.md) § Models and the operator's upstream), and the reader's switch *retry blocked pages on it* is on (`auto_fallback`, **off** by default) ([agents.md](./agents.md)).
   - With both, the job snapshots the fallback at enqueue (`jobs.fallback_model`).
+  - A retry clears it once the deployment no longer offers it, so a page blocked on that retry fails instead.
   - A page its model blocked (§ Upstream usage) is sent once more, to the fallback, unless the fallback is the model that just blocked it. The render is prepared again for the fallback's convention (§ Coordinate conventions).
   - The page keeps the last answer it got: a second failure is the page's failure.
   - No other failure moves a page to another model: a 402 or a rejected key is the account's, a transient failure was already retried, and a render failure is ours.
-- **By hand, for any failed page.** A retry names the model it sends the failed pages to — one of the parse agent's two ([jobs.md](./jobs.md) § Retrying failed pages). The reader picks it in the retry dialog, which offers the fallback first ([web.md](./web.md) § Files — the library).
+- **By hand, for any failed page.** A retry may name the model it sends the failed pages to — one of the parse agent's two ([jobs.md](./jobs.md) § Retrying failed pages). A retry that names none sends them to the job's own model while the deployment offers it, else to `PARSE_MODEL`. The reader picks it in the retry dialog, which offers the fallback first ([web.md](./web.md) § Files — the library).
 
 Billing and logging:
 

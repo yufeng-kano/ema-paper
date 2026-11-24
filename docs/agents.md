@@ -87,12 +87,14 @@ Resolved at enqueue from the agent's settings, then snapshotted on the job like 
 
 1. The model is `PARSE_MODEL`. No `PARSE_MODEL` configured → **503** saying so.
 2. A per-request `model` must be one of the parse agent's models (`PARSE_MODEL`, `PARSE_FALLBACK_MODEL`) → **400** otherwise.
+   - A retry is held to the same list: one that names a model is refused the same way.
+   - A retry that names none runs the job's own model only while it is on the list, else `PARSE_MODEL` ([jobs.md](./jobs.md) § Retrying failed pages).
 3. Kano Proxy not configured on this deployment (`KANO_PROXY_BASE_URL` or `KANO_PROXY_API_KEY` empty) → **503** saying so.
 4. The prompt is the user's own prompt, else the agent's default template.
-5. The fallback model goes on the job (`jobs.fallback_model`) only when `auto_fallback` is on and the deployment names a `PARSE_FALLBACK_MODEL`. A job queued with the switch off never changes model on its own, whatever the settings say by the time it runs.
+5. The fallback model goes on the job (`jobs.fallback_model`) only when `auto_fallback` is on and the deployment names a `PARSE_FALLBACK_MODEL`; a retry drops one the deployment no longer offers (rule 2). A job queued with the switch off never changes model on its own, whatever the settings say by the time it runs.
 6. A parse takes the format check with it when the `check` agent's `auto_check` is on and Kano Proxy is configured.
    - A parse here is a Files upload, a conversion, a re-convert, or an upload to `/v1/parse` from the REST API or the connector.
-   - `jobs.check_model`: `CHECK_MODEL`, else the parse's model. On a retry, the parse's model is the model the retry named, else the job's own.
+   - `jobs.check_model`: `CHECK_MODEL`, else the parse's model. On a retry, the parse's model is the model the retry runs: the one it named, else the job's own while offered, else `PARSE_MODEL`.
    - `jobs.check_effort`: the `check` agent's effort.
    - `jobs.check_prompt`: its prompt (the user's own, else the default), with the instructions appended after it.
    - A queued job keeps what it was given; a retry takes the settings of its own moment ([jobs.md](./jobs.md) § Retrying failed pages).

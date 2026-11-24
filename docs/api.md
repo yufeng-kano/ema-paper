@@ -64,7 +64,7 @@ Multipart form (preferred) or JSON with base64 `source`.
 
 - One of the parse agent's models (`GET /v1/models`: `PARSE_MODEL`, then `PARSE_FALLBACK_MODEL`); default `PARSE_MODEL`.
 - Any other → **400** ([agents.md](./agents.md) § Enqueue rules).
-- With `retry`: the model the failed pages run on; default the parse's own.
+- With `retry`: the model the failed pages run on; default the parse's own while it is one of the parse agent's models, else `PARSE_MODEL`.
 
 **`pages`**
 
@@ -926,7 +926,7 @@ A `.md` or `.markdown` file, or one sent as `text/markdown`, other than an `AGEN
 
 **`POST /api/library/documents/{id}/retry`**
 
-- JSON `{model?}`: `model` a model id of at most 255 characters, one the parse agent runs (**400** otherwise, [agents.md](./agents.md) § Enqueue rules); default: the job's own.
+- JSON `{model?}`: `model` a model id of at most 255 characters, one the parse agent runs (**400** otherwise, [agents.md](./agents.md) § Enqueue rules); default: the job's own while it is one of the parse agent's models, else `PARSE_MODEL` (**503** with no `PARSE_MODEL`).
 - The job behind the document — or its failed re-convert, when the document's own parse succeeded — goes back on the queue keeping its succeeded pages, and runs the rest on that model ([jobs.md](./jobs.md) § Retrying failed pages) → 202 `{job_id, status: "queued"}`.
 - 404 for a markdown document.
 - **402** `insufficient_credits` when the balance cannot cover the job's credits, which the retry reserves again ([billing.md](./billing.md) § A parse).

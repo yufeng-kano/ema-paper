@@ -210,20 +210,18 @@ Two routes keep a policy of their own: `GET /api/library/documents/{id}/file` an
 | Var | Notes |
 |-----|-------|
 | `APP_ENV` | `local` / `production` |
-| `APP_URL` | public origin, used in OAuth metadata + OIDC redirect |
-| `WEB_URL` | the web app's public origin (below) |
-| `WEB_LOCALE_PREFIXES` | the web app's locale prefixes, comma-separated (`en,zh-TW`), mirroring `apps/web/nuxt.config.ts` |
-| `SECRET_KEY` | signs the short-lived state cookie for Google sign-in and a connector's consent form (OIDC state, CSRF); generate a long random value per environment |
+| `APP_URL` | public origin, used in OAuth metadata + OIDC redirect; a trailing slash is ignored |
+| `WEB_URL` | the web app's public origin; a trailing slash is ignored, by the API and by the web build (below) |
+| `SECRET_KEY` | signs the short-lived `sr_oidc` cookie (10 minutes): the Google sign-in state (OIDC state and PKCE verifier), the page a sign-in returns to and a connector's consent token; generate a long random value per environment (`openssl rand -hex 32`) |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | OIDC |
 | `AUTH_DEV_MODE` | local only; absent from `.env.production.example` |
 | `SUPPORT_EMAIL`, `OPERATOR_NAME` | the address the public Terms, Privacy and Refund pages name, and the name of who operates the service (below) |
 
 - **`WEB_URL`** is:
-  - where sign-in returns the visitor;
+  - where sign-in returns the visitor: `WEB_URL/<locale>` for one of the web app's locales (`en`, `zh-TW`, mirroring `PAGE_LOCALES` in `apps/web/shared/seo.ts`), `WEB_URL` itself for any other value, whose bare root redirects by the browser's language ([auth.md](./auth.md) § 1, [web.md](./web.md) § Search engines);
   - the origin of the public pages' canonical, `hreflang` and `og:url` links, `robots.txt`'s `Sitemap` line and the sitemap's URLs ([web.md](./web.md) § Search engines), passed by `docker-compose.production.yaml` to the web image's build; the pages are prerendered, so a changed value needs the web image rebuilt;
   - the address the chat agent's web tools name in their User-Agent, `EmaPaper-agent/1.0 (+<WEB_URL>)` ([chat.md](./chat.md) § Tools).
-- **`WEB_LOCALE_PREFIXES`**: sign-in returns the visitor to `WEB_URL/<locale>`. A value outside the list sends them to `WEB_URL`, whose bare root redirects by the browser's language ([auth.md](./auth.md) § 1, [web.md](./web.md) § Search engines).
-- **`SECRET_KEY`**: rotating it only fails a sign-in or a connector authorization in progress.
+- **`SECRET_KEY`**: sessions are random tokens stored hashed (SHA-256, no key), so rotating it signs nobody out and makes nothing unreadable: it only fails a sign-in or a connector authorization in progress.
 - **`SUPPORT_EMAIL`, `OPERATOR_NAME`**:
   - The address is the one named for questions, deletion requests and refund requests.
   - An account is deleted by its reader ([auth.md](./auth.md) § Deleting the account).
@@ -319,7 +317,7 @@ Two routes keep a policy of their own: `GET /api/library/documents/{id}/file` an
 | `UPLOAD_MAX_BYTES`, `PAGE_CAP`, `MAX_JOBS_PER_USER`, `UPLOAD_RETRY_WINDOW_SECONDS`, `VISION_CONCURRENCY_PER_JOB`, `VISION_MAX_OUTPUT_TOKENS`, `RENDER_WORKERS` | defaults in [api.md](./api.md) / [jobs.md](./jobs.md) |
 | `FILE_MAX_BYTES` | the most a file of any kind may be when uploaded to the library (2000000000, 2 GB) (below) |
 | `REVISION_MAX_FILE_BYTES` | the largest file a workspace revision records (1048576, 1 MiB); a larger one, or a binary one, is kept in the tree and left out of the history ([workspace.md](./workspace.md) § Revisions) |
-| `UPLOAD_DIR` | `/data/uploads` in containers |
+| `UPLOAD_DIR`, `FIGURES_DIR` | the uploads (`/data/uploads`) and the stored figure crops (`/data/figures`): set by compose on api and worker; a value in `.env` is ignored |
 | `WORKSPACES_HOST_DIR` / `WORKSPACES_DIR` | the per-user workspaces: the host directory compose bind-mounts, and where the containers see it (`/data/workspaces`) (below) |
 | `WORKSPACE_QUOTA_BYTES` | the ceiling every plan's storage, Free's included, must fit under (default 10 GiB); the UI shows and the API enforces the user's plan's cap ([billing.md](./billing.md) § Plans) |
 | `UPLOAD_MAX_AGE_SECONDS` | how old an upload-directory entry may grow before the worker's sweeper takes it, an unsent chat attachment's included (86400) ([jobs.md](./jobs.md) § Retention) |
@@ -333,6 +331,7 @@ Two routes keep a policy of their own: `GET /api/library/documents/{id}/file` an
   - The runner is given the host path (`SANDBOX_WORKSPACES_DIR`) because it hands it to `docker run` ([workspace.md](./workspace.md), [sandbox.md](./sandbox.md)).
   - Compose gives the runner `SANDBOX_WORKSPACES_DIR` from `WORKSPACES_HOST_DIR` in both stacks, so the two cannot differ.
   - Empty locally means `./workspaces`, correct only when compose runs from the checkout's root.
+  - `WORKSPACES_HOST_DIR` is the one `.env` sets. Compose sets `WORKSPACES_DIR` (`/data/workspaces`) and the runner's `SANDBOX_WORKSPACES_MOUNT` (`/data/workspaces`) and `SANDBOX_WORKSPACES_DIR`; a value of theirs in `.env` is ignored.
 - **`TRASH_RETENTION_DAYS`**: must be ≥ 0, and 0 = the Trash is never emptied automatically ([workspace.md](./workspace.md) § The Trash). `GET /api/me` passes it to the web app as `limits.trash_retention_days`, for the Trash tab's line.
 
 ### The sandbox
@@ -345,7 +344,7 @@ Two routes keep a policy of their own: `GET /api/library/documents/{id}/file` an
 | `SANDBOX_EGRESS_HOSTS` | the sites the sandbox may reach over HTTPS (`pypi.org,files.pythonhosted.org`), one of the settings the database may override (§ Settings in the database; [sandbox.md](./sandbox.md) § Network) |
 | `SANDBOX_SUBNET`, `SANDBOX_VM_RANGE`, `SANDBOX_EGRESS_ADDRESS`, `SANDBOX_EGRESS_PORT` | compose's own: the internal network's subnet, the VMs' part of it, the egress proxy's fixed address on it and its port (below) |
 | `SANDBOX_EGRESS_CONNECT_TIMEOUT_SECONDS`, `SANDBOX_EGRESS_IDLE_SECONDS`, `SANDBOX_EGRESS_MAX_TUNNELS` | the egress proxy's limits (below) |
-| `SANDBOX_EGRESS_HOSTS_FILE` | where the worker writes the list in effect and the proxy reads it: set by compose on a volume of their own (`/data/sandbox-egress/hosts`); empty, the worker writes nothing |
+| `SANDBOX_EGRESS_HOSTS_FILE` | where the worker writes the list in effect and the proxy reads it: set by compose on a volume of their own (`/data/sandbox-egress/hosts`); a value in `.env` is ignored; empty, the worker writes nothing |
 | `SANDBOX_CONTROL_TIMEOUT_SECONDS` | how long api and worker give the runner's stop, reset, restart and status calls (180) (below) |
 | `SANDBOX_START_TIMEOUT_SECONDS`, `SANDBOX_EXEC_GRACE_SECONDS` | what a shell command may take beyond its own timeout before api and worker give up on it (below) |
 

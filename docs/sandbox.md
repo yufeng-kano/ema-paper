@@ -102,16 +102,16 @@ A `ps`, a `bash` or a `pgrep` a command put first on the PATH would otherwise st
 
 ### Backends
 
-Two backends implement the same interface:
+The runner has one backend, Docker:
 
-- `docker` (production):
-  - `docker run` with `--runtime {SANDBOX_RUNTIME}`.
-  - The user directory bind-mounted at `/workspace`.
-  - Over it, the user's `.sightread/` bind-mounted **read-only** at `/workspace/.sightread`: the parse baseline the agent compares against is presented as untouched, and the root shell must not be able to edit or delete it. The runner makes the directory before the start, so the nested mount always has its target.
-  - `--network {SANDBOX_NETWORK}`, with the egress proxy in `HTTPS_PROXY` and `HTTP_PROXY` when that is a network (§ Network).
-  - cpu/memory/pids limits, a read-only root filesystem and a tmpfs `/tmp`.
-  - Then, inside the started VM, the default Python environment when it is missing (§ The image).
-- `local` (tests only): a bash process in a temporary directory, no isolation — never deployed.
+- `docker run` with `--runtime {SANDBOX_RUNTIME}`.
+- The user directory bind-mounted at `/workspace`.
+- Over it, the user's `.sightread/` bind-mounted **read-only** at `/workspace/.sightread`: the parse baseline the agent compares against is presented as untouched, and the root shell must not be able to edit or delete it. The runner makes the directory before the start, so the nested mount always has its target.
+- `--network {SANDBOX_NETWORK}`, with the egress proxy in `HTTPS_PROXY` and `HTTP_PROXY` when that is a network (§ Network).
+- cpu/memory/pids limits, a read-only root filesystem and a tmpfs `/tmp`.
+- Then, inside the started VM, the default Python environment when it is missing (§ The image).
+
+The tests drive the shared backend and shell logic with a local bash stand-in (`apps/sandbox/tests/local_backend.py`: a bash process in a temporary directory, no isolation) that lives in the test suite alone: no setting selects it, and the runner cannot be configured to use it.
 
 ## Isolation
 

@@ -9,7 +9,7 @@ Six credential kinds, strictly separated. No password login anywhere.
   - The cookie is `HttpOnly; Secure; SameSite=Lax`. Its value is a random token stored **hashed** in `sessions`.
 - **The locale rides along.** `?locale=` is parked in the transient signed cookie, and the callback returns the visitor to `WEB_URL/<locale>` — `/en` or `/zh-TW`, every locale having a prefix ([web.md](./web.md) § Search engines, *The locale in the URL*).
   - The web app's locale otherwise lives in its URL; Google is the one leg that drops it.
-  - The locale is honoured only when it is in `WEB_LOCALE_PREFIXES` (`en,zh-TW`). That is an allowlist, not a path fragment, so a crafted `?locale=` cannot become an open redirect.
+  - The locale is honoured only when it is one of the web app's locales, `en` or `zh-TW` (`WEB_LOCALES` in `apps/api/src/sightread/config.py`, mirroring `PAGE_LOCALES` in `apps/web/shared/seo.ts`). That is an allowlist, not a path fragment, so a crafted `?locale=` cannot become an open redirect.
   - Anything else returns the visitor to `WEB_URL` itself, whose bare root picks the language from the browser.
   - A connector flow's parked `/oauth/authorize` still wins over it.
 - Logout deletes the session row.

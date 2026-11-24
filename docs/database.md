@@ -72,9 +72,13 @@ jobs             id UUID PK, user_id FK, agent, kind pdf|image, filename, media_
                  prompt TEXT,                     -- effective prompt template, verbatim
                  prompt_sha256,                   -- its hash; part of the dedup key
                  fallback_model NULL,             -- snapshot at enqueue: the fallback when
-                                                  -- auto_fallback was on, else NULL
+                                                  -- auto_fallback was on, else NULL;
+                                                  -- cleared by a retry when the deployment
+                                                  -- no longer offers it
                  retry_model NULL,                -- the model a retry runs the remaining
-                                                  -- pages on; NULL = `model` (jobs.md
+                                                  -- pages on; NULL = `model`, which the
+                                                  -- retry left NULL only while the
+                                                  -- deployment offered it (jobs.md
                                                   -- § Retrying failed pages)
                  check_model NULL, check_effort NULL,
                  check_prompt TEXT NULL,          -- the format check, snapshotted when the
