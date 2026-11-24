@@ -20,9 +20,17 @@ from sightread.db.models import CreditPack, Job, PlanGrant, Redemption, Subscrip
 from sightread.errors import ApiError
 from sightread.routes import admin as admin_routes
 from sightread.workspace.layout import user_root
+from tests.admin_helpers import (
+    account_client,
+    add_member,
+    audit_rows,
+    create_group,
+    error_of,
+    last_audit_id,
+    owner_client,
+)
 from tests.conftest import CSRF_HEADERS, grant_plan
 from tests.factories import job_row
-from tests.test_admin import _account, _add, _audit, _error, _group, _last_audit_id, _owner
 from tests.test_ledger import settings_with
 from tests.test_redeem import TWO_PLANS_JSON
 
@@ -70,12 +78,12 @@ async def _bank(client, user_id: int) -> PlanGrant | None:
 
 
 async def test_the_list_searches_filters_by_plan_and_pages(make_client) -> None:
-    owner = await _owner(make_client, **PLANS)
-    alice = await _account(make_client, "alice@example.test", "Alice Example", **PLANS)
-    bob = await _account(make_client, "bob@example.test", "bob_smith", **PLANS)
-    carol = await _account(make_client, "carol@example.test", "Carol 100%", **PLANS)
-    dave = await _account(make_client, "dave@example.test", "Dave", **PLANS)
-    erin = await _account(make_client, "erin@example.test", None, **PLANS)
+    owner = await owner_client(make_client, **PLANS)
+    alice = await account_client(make_client, "alice@example.test", "Alice Example", **PLANS)
+    bob = await account_client(make_client, "bob@example.test", "bob_smith", **PLANS)
+    carol = await account_client(make_client, "carol@example.test", "Carol 100%", **PLANS)
+    dave = await account_client(make_client, "dave@example.test", "Dave", **PLANS)
+    erin = await account_client(make_client, "erin@example.test", None, **PLANS)
     sessionmaker = owner.app.state.sessionmaker
     now = utcnow()
     # bob pays for pro; erin pays for pro with team days waiting, which wait; carol has
@@ -169,7 +177,7 @@ async def test_the_list_searches_filters_by_plan_and_pages(make_client) -> None:
     assert filtered.json()["plans"] == page["plans"]
 
     # Pages of ADMIN_PAGE_SIZE, empty past the end.
-    small = await _owner(make_client, admin_page_size=4, **PLANS)
+    small = await owner_client(make_client, admin_page_size=4, **PLANS)
     second = (await small.get(f"{USERS}?page=2")).json()
     assert [row["id"] for row in second["items"]] == [alice.user_id, owner.user_id]
     assert (second["total"], second["page"], second["page_size"]) == (6, 2, 4)
@@ -178,12 +186,12 @@ async def test_the_list_searches_filters_by_plan_and_pages(make_client) -> None:
     for query in ("page=0", f"page={2**31}", "plan=gone", "plan=FREE"):
         refused = await owner.get(f"{USERS}?{query}")
         assert refused.status_code == 422, query
-        assert _error(refused)["type"] == "invalid_request"
+        assert error_of(refused)["type"] == "invalid_request"
 
 
 async def test_a_workspace_that_cannot_be_measured_reads_unknown(make_client, monkeypatch) -> None:
-    owner = await _owner(make_client)
-    deep = await _account(make_client, "deep@example.test")
+    owner = await owner_client(make_client)
+    deep = await account_client(make_client, "deep@example.test")
     measure = admin_routes.measure_storage
 
     async def refusing(db, settings, user_id, root):
@@ -208,28 +216,28 @@ async def test_a_workspace_that_cannot_be_measured_reads_unknown(make_client, mo
 
 
 async def test_the_users_routes_need_their_permissions(make_client) -> None:
-    owner = await _owner(make_client)
-    reader = await _account(make_client, "reader@example.test")
-    writer = await _account(make_client, "writer@example.test")
-    nobody = await _account(make_client, "nobody@example.test")
-    readers = await _group(owner, "readers", ["users.read"])
-    writers = await _group(owner, "writers", ["users.write"])
-    await _add(owner, readers["id"], user_id=reader.user_id)
-    await _add(owner, writers["id"], user_id=writer.user_id)
+    owner = await owner_client(make_client)
+    reader = await account_client(make_client, "reader@example.test")
+    writer = await account_client(make_client, "writer@example.test")
+    nobody = await account_client(make_client, "nobody@example.test")
+    readers = await create_group(owner, "readers", ["users.read"])
+    writers = await create_group(owner, "writers", ["users.write"])
+    await add_member(owner, readers["id"], user_id=reader.user_id)
+    await add_member(owner, writers["id"], user_id=writer.user_id)
     body = {"kind": "credits", "credits": 5, "request_id": str(uuid.uuid4())}
-    start = await _last_audit_id(owner)
+    start = await last_audit_id(owner)
 
     for path in (USERS, f"{USERS}/{nobody.user_id}"):
         refused = await nobody.get(path)
         assert refused.status_code == 403
-        assert _error(refused)["type"] == "permission_denied"
+        assert error_of(refused)["type"] == "permission_denied"
         assert (await reader.get(path)).status_code == 200
     for client in (nobody, reader):
         refused = await client.post(_grants(nobody.user_id), json=body, headers=CSRF_HEADERS)
         assert refused.status_code == 403
-        assert _error(refused)["type"] == "permission_denied"
+        assert error_of(refused)["type"] == "permission_denied"
     assert await _packs(owner, nobody.user_id) == []
-    assert await _audit(owner, start) == []
+    assert await audit_rows(owner, start) == []
 
     # `users.write` brings `users.read`; who an account's groups are takes `groups.read`.
     granted = await writer.post(_grants(nobody.user_id), json=body, headers=CSRF_HEADERS)
@@ -244,8 +252,8 @@ async def test_the_users_routes_need_their_permissions(make_client) -> None:
 
 
 async def test_an_accounts_page_shows_what_it_has_and_none_of_its_content(make_client) -> None:
-    owner = await _owner(make_client, **PLANS, free_credits_per_period=3)
-    account = await _account(make_client, "ann@example.test", "Ann", **PLANS)
+    owner = await owner_client(make_client, **PLANS, free_credits_per_period=3)
+    account = await account_client(make_client, "ann@example.test", "Ann", **PLANS)
     now = utcnow()
     async with owner.app.state.sessionmaker() as db:
         # Six jobs, a minute apart; the newest failed with an error naming the content.
@@ -349,15 +357,17 @@ async def test_an_accounts_page_shows_what_it_has_and_none_of_its_content(make_c
     assert [group["builtin"] for group in mine["groups"]] == [True]
     missing = await owner.get(f"{USERS}/{account.user_id + 1000}")
     assert missing.status_code == 404
-    assert _error(missing)["type"] == "invalid_request"
+    assert error_of(missing)["type"] == "invalid_request"
 
 
 # --- credits --------------------------------------------------------------------------
 
 
 async def test_granted_credits_are_a_pack_the_ledger_spends_by_expiry(make_client) -> None:
-    owner = await _owner(make_client, free_credits_per_period=3)
-    account = await _account(make_client, "ann@example.test", "Ann", free_credits_per_period=3)
+    owner = await owner_client(make_client, free_credits_per_period=3)
+    account = await account_client(
+        make_client, "ann@example.test", "Ann", free_credits_per_period=3
+    )
     now = utcnow()
     async with owner.app.state.sessionmaker() as db:
         db.add(
@@ -374,7 +384,7 @@ async def test_granted_credits_are_a_pack_the_ledger_spends_by_expiry(make_clien
         )
         await db.commit()
     request_id = uuid.uuid4()
-    start = await _last_audit_id(owner)
+    start = await last_audit_id(owner)
 
     granted = await owner.post(
         _grants(account.user_id),
@@ -405,7 +415,7 @@ async def test_granted_credits_are_a_pack_the_ledger_spends_by_expiry(make_clien
     assert (stored[pack_id].redemption_id, stored[pack_id].status) == (None, "paid")
 
     # One record, its two sides numbers and dates only; the reason trimmed.
-    [record] = await _audit(owner, start)
+    [record] = await audit_rows(owner, start)
     assert (record.actor_id, record.permission, record.action) == (
         owner.user_id,
         "users.write",
@@ -454,15 +464,15 @@ async def test_granted_credits_are_a_pack_the_ledger_spends_by_expiry(make_clien
     assert default.status_code == 201, default.text
     lasts = _when(default.json()["pack"]["expires_at"]) - utcnow()
     assert timedelta(days=364, hours=23) < lasts <= timedelta(days=365)
-    assert (await _audit(owner, start))[-1].after["reason"] is None
+    assert (await audit_rows(owner, start))[-1].after["reason"] is None
 
 
 async def test_a_credit_grant_sent_again_writes_nothing(make_client) -> None:
-    owner = await _owner(make_client)
-    account = await _account(make_client, "ann@example.test")
-    other = await _account(make_client, "ben@example.test")
+    owner = await owner_client(make_client)
+    account = await account_client(make_client, "ann@example.test")
+    other = await account_client(make_client, "ben@example.test")
     body = {"kind": "credits", "credits": 5, "request_id": str(uuid.uuid4())}
-    start = await _last_audit_id(owner)
+    start = await last_audit_id(owner)
 
     first = await owner.post(_grants(account.user_id), json=body, headers=CSRF_HEADERS)
     assert first.status_code == 201, first.text
@@ -473,27 +483,27 @@ async def test_a_credit_grant_sent_again_writes_nothing(make_client) -> None:
     assert again.status_code == 200, again.text
     assert again.json() == first.json()
     assert [pack.credits for pack in await _packs(owner, account.user_id)] == [5]
-    assert len(await _audit(owner, start)) == 1
+    assert len(await audit_rows(owner, start)) == 1
 
     # The same id for another account is refused, nothing written.
     reused = await owner.post(_grants(other.user_id), json=body, headers=CSRF_HEADERS)
     assert reused.status_code == 409
-    assert _error(reused) == {
+    assert error_of(reused) == {
         "type": "admin_conflict",
         "message": "This request id was already used for another account's grant",
         "reason": "request_reused",
     }
     assert await _packs(owner, other.user_id) == []
-    assert len(await _audit(owner, start)) == 1
+    assert len(await audit_rows(owner, start)) == 1
 
 
 # --- days -----------------------------------------------------------------------------
 
 
 async def test_granted_days_open_a_period_when_nothing_pays(make_client) -> None:
-    owner = await _owner(make_client, **PLANS)
-    account = await _account(make_client, "ann@example.test", **PLANS)
-    start = await _last_audit_id(owner)
+    owner = await owner_client(make_client, **PLANS)
+    account = await account_client(make_client, "ann@example.test", **PLANS)
+    start = await last_audit_id(owner)
     month_end = (await owner.get(f"{USERS}/{account.user_id}")).json()["plan"]["end"]
     request_id = str(uuid.uuid4())
 
@@ -532,7 +542,7 @@ async def test_granted_days_open_a_period_when_nothing_pays(make_client) -> None
     async with owner.app.state.sessionmaker() as db:
         assert await db.scalar(select(func.count()).select_from(Redemption)) == 0
 
-    [record] = await _audit(owner, start)
+    [record] = await audit_rows(owner, start)
     assert (record.permission, record.action, record.target_id) == (
         "users.write",
         "users.grant_days",
@@ -558,8 +568,8 @@ async def test_granted_days_open_a_period_when_nothing_pays(make_client) -> None
 
 
 async def test_granted_days_wait_under_a_paid_subscription(make_client) -> None:
-    owner = await _owner(make_client, **PLANS)
-    account = await _account(make_client, "ann@example.test", **PLANS)
+    owner = await owner_client(make_client, **PLANS)
+    account = await account_client(make_client, "ann@example.test", **PLANS)
     await grant_plan(owner.app.state.sessionmaker, account.user_id, "pro")
     async with owner.app.state.sessionmaker() as db:
         paid_until = (await db.get(Subscription, account.user_id)).period_end
@@ -613,11 +623,11 @@ async def test_granted_days_wait_under_a_paid_subscription(make_client) -> None:
 
 
 async def test_a_day_grant_sent_again_writes_nothing(make_client) -> None:
-    owner = await _owner(make_client, **PLANS)
-    account = await _account(make_client, "ann@example.test", **PLANS)
-    other = await _account(make_client, "ben@example.test", **PLANS)
+    owner = await owner_client(make_client, **PLANS)
+    account = await account_client(make_client, "ann@example.test", **PLANS)
+    other = await account_client(make_client, "ben@example.test", **PLANS)
     body = {"kind": "days", "plan": "pro", "days": 40, "request_id": str(uuid.uuid4())}
-    start = await _last_audit_id(owner)
+    start = await last_audit_id(owner)
 
     first = await owner.post(_grants(account.user_id), json=body, headers=CSRF_HEADERS)
     assert first.status_code == 201, first.text
@@ -630,18 +640,18 @@ async def test_a_day_grant_sent_again_writes_nothing(make_client) -> None:
     assert again.json() == first.json()
     bank = await _bank(owner, account.user_id)
     assert (bank.plan_id, bank.days_banked) == ("pro", 10)
-    assert len(await _audit(owner, start)) == 1
+    assert len(await audit_rows(owner, start)) == 1
 
     # The id is looked for among this account's day grants: another account's is its own.
     elsewhere = await owner.post(_grants(other.user_id), json=body, headers=CSRF_HEADERS)
     assert elsewhere.status_code == 201, elsewhere.text
     assert (await _bank(owner, other.user_id)).days_banked == 10
-    assert len(await _audit(owner, start)) == 2
+    assert len(await audit_rows(owner, start)) == 2
 
 
 async def test_days_of_another_plan_than_the_bank_holds_are_refused(make_client) -> None:
-    owner = await _owner(make_client, **PLANS)
-    account = await _account(make_client, "ann@example.test", **PLANS)
+    owner = await owner_client(make_client, **PLANS)
+    account = await account_client(make_client, "ann@example.test", **PLANS)
     first = await owner.post(
         _grants(account.user_id),
         json={"kind": "days", "plan": "team", "days": 5, "request_id": str(uuid.uuid4())},
@@ -649,7 +659,7 @@ async def test_days_of_another_plan_than_the_bank_holds_are_refused(make_client)
     )
     assert first.status_code == 201, first.text
     bank = await _bank(owner, account.user_id)
-    start = await _last_audit_id(owner)
+    start = await last_audit_id(owner)
 
     refused = await owner.post(
         _grants(account.user_id),
@@ -657,8 +667,8 @@ async def test_days_of_another_plan_than_the_bank_holds_are_refused(make_client)
         headers=CSRF_HEADERS,
     )
     assert refused.status_code == 409
-    assert _error(refused)["type"] == "admin_conflict"
-    assert _error(refused)["reason"] == "plan_conflict"
+    assert error_of(refused)["type"] == "admin_conflict"
+    assert error_of(refused)["reason"] == "plan_conflict"
     after = await _bank(owner, account.user_id)
     assert (after.plan_id, after.days_banked, after.period_start, after.period_end) == (
         bank.plan_id,
@@ -666,7 +676,7 @@ async def test_days_of_another_plan_than_the_bank_holds_are_refused(make_client)
         bank.period_start,
         bank.period_end,
     )
-    assert await _audit(owner, start) == []
+    assert await audit_rows(owner, start) == []
 
 
 # --- refusals -------------------------------------------------------------------------
@@ -674,11 +684,11 @@ async def test_days_of_another_plan_than_the_bank_holds_are_refused(make_client)
 
 async def test_a_grant_outside_its_rules_is_refused(make_client) -> None:
     caps = {"admin_grant_max_credits": 100, "admin_grant_max_days": 50}
-    owner = await _owner(make_client, **PLANS, **caps, admin_grant_valid_days=30)
-    account = await _account(make_client, "ann@example.test")
+    owner = await owner_client(make_client, **PLANS, **caps, admin_grant_valid_days=30)
+    account = await account_client(make_client, "ann@example.test")
     credits = {"kind": "credits", "credits": 5, "request_id": str(uuid.uuid4())}
     days = {"kind": "days", "plan": "pro", "days": 5, "request_id": str(uuid.uuid4())}
-    start = await _last_audit_id(owner)
+    start = await last_audit_id(owner)
 
     for body in (
         {**credits, "credits": 0},
@@ -700,14 +710,14 @@ async def test_a_grant_outside_its_rules_is_refused(make_client) -> None:
     ):
         refused = await owner.post(_grants(account.user_id), json=body, headers=CSRF_HEADERS)
         assert refused.status_code == 422, body
-        assert _error(refused)["type"] == "invalid_request"
+        assert error_of(refused)["type"] == "invalid_request"
     # A body wrong twice names its kind's own field before the note.
     for body, field in (
         ({**credits, "credits": 0, "reason": "r" * 201}, "body.credits.credits:"),
         ({**days, "days": 0, "reason": "r" * 201}, "body.days.days:"),
     ):
         refused = await owner.post(_grants(account.user_id), json=body, headers=CSRF_HEADERS)
-        assert _error(refused)["message"].startswith(field), refused.text
+        assert error_of(refused)["message"].startswith(field), refused.text
     # The body is read before the account is looked up.
     assert (
         await owner.post(_grants(10**6), json={**credits, "credits": 0}, headers=CSRF_HEADERS)
@@ -716,12 +726,12 @@ async def test_a_grant_outside_its_rules_is_refused(make_client) -> None:
     for user_id in (0, 2**31):
         refused = await owner.post(_grants(user_id), json=credits, headers=CSRF_HEADERS)
         assert refused.status_code == 422, user_id
-        assert _error(refused)["type"] == "invalid_request"
+        assert error_of(refused)["type"] == "invalid_request"
         assert (await owner.get(f"{USERS}/{user_id}")).status_code == 422
     assert (await owner.get(f"{USERS}/{2**31 - 1}")).status_code == 404
     assert await _packs(owner, account.user_id) == []
     assert await _bank(owner, account.user_id) is None
-    assert await _audit(owner, start) == []
+    assert await audit_rows(owner, start) == []
 
     # The caps themselves are allowed; the default validity is ADMIN_GRANT_VALID_DAYS.
     edge = await owner.post(
@@ -741,10 +751,10 @@ async def test_a_grant_outside_its_rules_is_refused(make_client) -> None:
         headers=CSRF_HEADERS,
     )
     assert missing.status_code == 404
-    assert _error(missing)["type"] == "invalid_request"
+    assert error_of(missing)["type"] == "invalid_request"
 
     # With no paid plan configured, there are no days to give.
-    bare = await _owner(make_client)
+    bare = await owner_client(make_client)
     refused = await bare.post(_grants(account.user_id), json=days, headers=CSRF_HEADERS)
     assert refused.status_code == 422
 
@@ -760,25 +770,3 @@ def test_the_grant_limits_are_validated() -> None:
     ):
         with pytest.raises(ValueError, match="ADMIN_GRANT_"):
             settings_with(**overrides)
-    settings = settings_with()
-    assert (
-        settings.admin_grant_valid_days,
-        settings.admin_grant_max_credits,
-        settings.admin_grant_max_days,
-    ) == (365, 1_000_000, 3650)
-
-
-async def test_a_grant_record_is_read_on_the_audit_page(make_client) -> None:
-    owner = await _owner(make_client)
-    account = await _account(make_client, "ann@example.test")
-    await owner.post(
-        _grants(account.user_id),
-        json={"kind": "credits", "credits": 5, "request_id": str(uuid.uuid4())},
-        headers=CSRF_HEADERS,
-    )
-    entries = (await owner.get("/api/admin/audit?area=users")).json()["items"]
-    # The address is read now, from `users`, for the page: the record holds none.
-    assert [(entry["action"], entry["target_label"]) for entry in entries] == [
-        ("users.grant_credits", "ann@example.test")
-    ]
-    assert "ann@" not in json.dumps([entries[0]["before"], entries[0]["after"]])
