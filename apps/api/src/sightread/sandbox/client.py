@@ -40,7 +40,7 @@ class ExecResult:
 
 @dataclass(frozen=True)
 class SandboxStatus:
-    state: str  # stopped | starting | running | unavailable
+    state: str  # stopped | running | unavailable
     last_used_at: str | None
 
 

@@ -234,8 +234,8 @@ const sandboxAvailable = computed(
   () => sandbox.value !== null && sandbox.value.state !== 'unavailable' && sandbox.value.granted,
 )
 
-function stateTone(state: SandboxState): 'ok' | 'info' | 'neutral' {
-  return state === 'running' ? 'ok' : state === 'starting' ? 'info' : 'neutral'
+function stateTone(state: SandboxState): 'ok' | 'neutral' {
+  return state === 'running' ? 'ok' : 'neutral'
 }
 
 const sandboxActionPending = ref(false)
