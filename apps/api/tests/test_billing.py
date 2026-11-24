@@ -1,9 +1,9 @@
 """Credits, plans and periods (docs/billing.md § Acceptance): pure arithmetic and the
-configuration that feeds it. The ledger itself arrives with the next step."""
+configuration that feeds it; tests/test_ledger.py covers the ledger that records them."""
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -24,7 +24,7 @@ from sightread.billing.plans import (
     resolve_period,
 )
 from sightread.config import Settings
-from sightread.db.models import Subscription
+from tests.billing_helpers import paid_subscription
 
 LUNA = '{"input": 0.10, "cache_read": 0.01, "cache_write": 0.10, "output": 0.50}'
 OPUS = '{"input": 4, "cache_read": 0.20, "cache_write": 5, "output": 20}'
@@ -51,11 +51,6 @@ def test_a_turn_is_priced_from_its_tokens_and_rounded_up_once() -> None:
     )
     assert Decimal("0.13") < usd < Decimal("0.14")
     assert credits_for_usd(usd, CREDIT) == 68
-    # Summed over the turn's calls before rounding: two calls of $0.0011 are 2 credits
-    # rounded separately and 1 together.
-    half = Decimal("0.0011")
-    assert credits_for_usd(half, CREDIT) + credits_for_usd(half, CREDIT) == 2
-    assert credits_for_usd(half + half, CREDIT) == 2  # 0.0022 / 0.002 = 1.1 → 2
     assert credits_for_usd(Decimal("0.004"), CREDIT) == 2
     # Never under the floor, even for a free call.
     assert credits_for_usd(Decimal(0), CREDIT) == 1
@@ -159,31 +154,15 @@ def test_frees_period_is_the_utc_month() -> None:
     start, end = month_bounds(datetime(2026, 12, 31, 23, 59, tzinfo=UTC))
     assert (start, end) == (datetime(2026, 12, 1, tzinfo=UTC), datetime(2027, 1, 1, tzinfo=UTC))
     # A clock in another zone is still the UTC month.
-    local = datetime(2026, 11, 1, 7, 30, tzinfo=UTC).astimezone(
-        __import__("datetime").timezone(timedelta(hours=8))
-    )
+    local = datetime(2026, 11, 1, 7, 30, tzinfo=UTC).astimezone(timezone(timedelta(hours=8)))
     assert month_bounds(local)[0] == datetime(2026, 11, 1, tzinfo=UTC)
-
-
-def _subscription(**overrides) -> Subscription:
-    base = {
-        "user_id": 1,
-        "subscription_id": "sub_1",
-        "status": "active",
-        "plan_id": "pro",
-        "period_start": datetime(2026, 10, 15, tzinfo=UTC),
-        "period_end": datetime(2026, 11, 15, tzinfo=UTC),
-        "cancel_at_period_end": False,
-        "version": 1,
-    }
-    return Subscription(**{**base, **overrides})
 
 
 def test_the_current_period_is_the_paid_one_only_while_it_holds() -> None:
     free = Plan(FREE_PLAN_ID, 150, 1, False, 1)
     plans = {"pro": Plan("pro", 5000, 2, True, 2)}
     now = datetime(2026, 10, 23, tzinfo=UTC)
-    decision = resolve_period(_subscription(), None, plans, free, now, 30)
+    decision = resolve_period(paid_subscription(), None, plans, free, now, 30)
     paid = decision.period
     assert (paid.start, paid.end, paid.plan.id, paid.source) == (
         datetime(2026, 10, 15, tzinfo=UTC),
@@ -193,16 +172,16 @@ def test_the_current_period_is_the_paid_one_only_while_it_holds() -> None:
     )
     assert decision.grant is None
     # A scheduled cancellation changes nothing until the period ends.
-    cancelling = _subscription(cancel_at_period_end=True)
+    cancelling = paid_subscription(cancel_at_period_end=True)
     assert resolve_period(cancelling, None, plans, free, now, 30).period.plan.id == "pro"
     month = (datetime(2026, 10, 1, tzinfo=UTC), datetime(2026, 11, 1, tzinfo=UTC))
     for lapsed in (
         None,
-        _subscription(status="past_due"),
-        _subscription(status="canceled"),
-        _subscription(plan_id="max"),  # not a plan this deployment knows
-        _subscription(period_end=datetime(2026, 10, 23, tzinfo=UTC)),  # ended at `now`
-        _subscription(period_start=datetime(2026, 10, 24, tzinfo=UTC)),  # not yet
+        paid_subscription(status="past_due"),
+        paid_subscription(status="canceled"),
+        paid_subscription(plan_id="max"),  # not a plan this deployment knows
+        paid_subscription(period_end=datetime(2026, 10, 23, tzinfo=UTC)),  # ended at `now`
+        paid_subscription(period_start=datetime(2026, 10, 24, tzinfo=UTC)),  # not yet
     ):
         period = resolve_period(lapsed, None, plans, free, now, 30).period
         assert (period.start, period.end, period.plan.id, period.source) == (

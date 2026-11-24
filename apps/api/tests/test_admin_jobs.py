@@ -31,6 +31,7 @@ from tests.admin_helpers import (
     last_audit_id,
     owner_client,
 )
+from tests.billing_helpers import CATALOG_URL, catalog
 from tests.conftest import (
     CSRF_HEADERS,
     KANO_API_KEY,
@@ -39,7 +40,6 @@ from tests.conftest import (
     postgres_only,
 )
 from tests.factories import job_row
-from tests.test_pay import CATALOG_URL, catalog
 
 JOB_FIELDS = {
     "filename": "confidential-thesis.pdf",

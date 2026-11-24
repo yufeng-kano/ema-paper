@@ -4,140 +4,53 @@ portal, and the entitlements a bought plan grants. Pay exists only inside respx.
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import time
 from datetime import UTC, datetime, timedelta
 
 import httpx
-import pytest
 import respx
 from httpx import AsyncClient
 from sqlalchemy import select
 
 from sightread.billing import pay
-from sightread.db.models import Checkout, Job, PayEvent, Subscription, utcnow
-from tests.chat_helpers import MESSAGES_URL, assistant_turn, seed_document
+from sightread.db.models import Checkout, Job, Subscription, utcnow
+from tests.billing_helpers import (
+    CATALOG_URL,
+    CHECKOUTS_URL,
+    PORTAL_URL,
+    SUBSCRIPTIONS_URL,
+    add_parses,
+    canonical,
+    catalog,
+    notify,
+    pay_events,
+    sign,
+    subscription_event,
+)
+from tests.chat_helpers import (
+    MESSAGES_URL,
+    assistant_turn,
+    chatting_client,
+    new_conversation,
+    run_queued_turn,
+    send,
+)
 from tests.conftest import (
     CSRF_HEADERS,
     PAY_APP_ID,
     PAY_SETTINGS,
     PAY_URL,
-    PAY_WEBHOOK_SECRET,
     TEST_MODEL_PRICES,
     grant_plan,
     sign_in,
 )
-from tests.factories import job_row
-from tests.test_library import MODEL, _ready_to_parse, _upload
-
-SUBSCRIPTIONS_URL = f"{PAY_URL}/v1/subscriptions/"
-CATALOG_URL = f"{PAY_URL}/v1/catalog"
-CHECKOUTS_URL = f"{PAY_URL}/v1/checkouts"
-PORTAL_URL = f"{PAY_URL}/v1/portal"
-
-
-def _ms(when: datetime) -> int:
-    return int(when.timestamp() * 1000)
-
-
-# Pay's `version` is the subscription's last update in milliseconds. A test's `version`
-# is a step of this many from a minute ahead of now, so an answer completes the checkout
-# opened moments before it, versions keep their order across one test, and a negative
-# step lands before anything the test opened.
-VERSION_STEP = 1_000_000
-
-
-def _version(step: int) -> int:
-    return _ms(datetime.now(UTC)) + 60_000 + step * VERSION_STEP
-
-
-def canonical(
-    user_id: int,
-    *,
-    version: int = 1,
-    plan_id: str | None = "pro",
-    status: str = "active",
-    app_id: str = PAY_APP_ID,
-    cancel: bool = False,
-) -> dict:
-    """`GET /v1/subscriptions/:subjectId` as Pay answers it."""
-    now = datetime.now(UTC)
-    return {
-        "subscription": {
-            "appId": app_id,
-            "subjectId": str(user_id),
-            "subscriptionId": "sub_canonical",
-            "status": status,
-            "planId": plan_id,
-            "periodStart": _ms(now - timedelta(days=1)),
-            "periodEnd": _ms(now + timedelta(days=29)),
-            "cancelAtPeriodEnd": cancel,
-            "version": _version(version),
-            "active": status == "active",
-        }
-    }
-
-
-def catalog(*, enabled: bool = True, plans: tuple[str, ...] = ("pro",)) -> dict:
-    return {
-        "checkoutEnabled": enabled,
-        "plans": [
-            {
-                "planId": plan,
-                "productId": f"prod_{plan}",
-                "name": plan.title(),
-                "amount": "1500",
-                "currency": "USD",
-                "cycle": {"interval": "month", "frequency": 1},
-            }
-            for plan in plans
-        ],
-    }
-
-
-def _event(user_id: int, event_id: str = "evt_1", **subscription) -> bytes:
-    body = {
-        "id": event_id,
-        "type": "subscription.updated",
-        "subscription": {"appId": PAY_APP_ID, "subjectId": str(user_id), **subscription},
-    }
-    return json.dumps(body).encode()
-
-
-def _sign(secret: str, timestamp: int, raw: bytes) -> str:
-    """`Kano-Pay-Signature` as Pay writes it, independent of the code that verifies it."""
-    digest = hmac.new(secret.encode(), f"{timestamp}.".encode() + raw, hashlib.sha256)
-    return f"ts={timestamp};h1={digest.hexdigest()}"
-
-
-async def _notify(
-    client: AsyncClient,
-    raw: bytes,
-    *,
-    timestamp: int | None = None,
-    secret: str = PAY_WEBHOOK_SECRET,
-) -> httpx.Response:
-    ts = int(time.time()) if timestamp is None else timestamp
-    return await client.post(
-        "/api/billing/pay-webhook",
-        content=raw,
-        headers={
-            "Kano-Pay-Signature": _sign(secret, ts, raw),
-            "Content-Type": "application/json",
-        },
-    )
+from tests.test_library import _upload
 
 
 async def _row(client: AsyncClient, user_id: int) -> Subscription | None:
     async with client.app.state.sessionmaker() as db:
         return await db.get(Subscription, user_id)
-
-
-async def _events(client: AsyncClient) -> list[str]:
-    async with client.app.state.sessionmaker() as db:
-        return list((await db.execute(select(PayEvent.id).order_by(PayEvent.id))).scalars())
 
 
 async def _plan_shown(client: AsyncClient) -> str:
@@ -150,7 +63,7 @@ async def _plan_shown(client: AsyncClient) -> str:
 def test_the_signature_covers_the_timestamp_and_the_exact_bytes() -> None:
     raw = b'{"id":"evt"}'
     now = 1_700_000_000
-    header = _sign("secret", now, raw)
+    header = sign("secret", now, raw)
     assert pay.verify_signature(header, raw, "secret", now + 100, 300)
     assert pay.verify_signature(header, raw, "secret", now - 300, 300)
     # One byte more and the signature no longer covers the body; another key, another
@@ -183,8 +96,8 @@ async def test_a_notification_is_written_from_the_canonical_fetch_not_its_body(
     )
 
     # The body claims a plan and a status of its own; neither is read.
-    received = await _notify(
-        client, _event(user_id, planId="enterprise", status="active", version=99)
+    received = await notify(
+        client, subscription_event(user_id, planId="enterprise", status="active", version=99)
     )
 
     assert received.status_code == 200, received.text
@@ -198,7 +111,7 @@ async def test_a_notification_is_written_from_the_canonical_fetch_not_its_body(
         answer["subscription"]["version"],
         "sub_canonical",
     )
-    assert await _events(client) == ["evt_1"]
+    assert await pay_events(client) == ["evt_1"]
     assert await _plan_shown(client) == "pro"
     respx.get(CATALOG_URL).mock(return_value=httpx.Response(200, json=catalog()))
     assert (await client.get("/api/billing")).json()["period"]["granted"] == 5000
@@ -213,17 +126,17 @@ async def test_a_wrong_or_stale_signature_is_refused_before_anything_is_read(
     fetch = respx.get(f"{SUBSCRIPTIONS_URL}{user_id}").mock(
         return_value=httpx.Response(200, json=canonical(user_id))
     )
-    raw = _event(user_id)
+    raw = subscription_event(user_id)
 
-    wrong = await _notify(client, raw, secret="another-secret-not-a-real-one")
-    stale = await _notify(client, raw, timestamp=int(time.time()) - 600)
-    ahead = await _notify(client, raw, timestamp=int(time.time()) + 600)
+    wrong = await notify(client, raw, secret="another-secret-not-a-real-one")
+    stale = await notify(client, raw, timestamp=int(time.time()) - 600)
+    ahead = await notify(client, raw, timestamp=int(time.time()) + 600)
     unsigned = await client.post("/api/billing/pay-webhook", content=raw)
 
     assert [r.status_code for r in (wrong, stale, ahead, unsigned)] == [401, 401, 401, 401]
     assert fetch.call_count == 0
     assert await _row(client, user_id) is None
-    assert await _events(client) == []
+    assert await pay_events(client) == []
 
 
 @respx.mock
@@ -236,16 +149,16 @@ async def test_a_duplicate_event_id_is_answered_without_a_second_write(make_clie
         side_effect=lambda request: httpx.Response(200, json=next(answers))
     )
 
-    assert (await _notify(client, _event(user_id, "evt_1"))).status_code == 200
+    assert (await notify(client, subscription_event(user_id, "evt_1"))).status_code == 200
     # The same delivery again: 200, and Pay is not asked a second time.
-    assert (await _notify(client, _event(user_id, "evt_1"))).status_code == 200
+    assert (await notify(client, subscription_event(user_id, "evt_1"))).status_code == 200
     assert fetch.call_count == 1
     assert (await _row(client, user_id)).version == first["subscription"]["version"]
     # A new event id is a new fetch.
-    assert (await _notify(client, _event(user_id, "evt_2"))).status_code == 200
+    assert (await notify(client, subscription_event(user_id, "evt_2"))).status_code == 200
     row = await _row(client, user_id)
     assert (row.version, row.cancel_at_period_end) == (second["subscription"]["version"], True)
-    assert await _events(client) == ["evt_1", "evt_2"]
+    assert await pay_events(client) == ["evt_1", "evt_2"]
 
 
 @respx.mock
@@ -258,12 +171,12 @@ async def test_a_stale_version_never_rolls_access_backwards(make_client) -> None
         side_effect=lambda request: httpx.Response(200, json=next(answers))
     )
 
-    assert (await _notify(client, _event(user_id, "evt_5"))).status_code == 200
-    assert (await _notify(client, _event(user_id, "evt_3"))).status_code == 200
+    assert (await notify(client, subscription_event(user_id, "evt_5"))).status_code == 200
+    assert (await notify(client, subscription_event(user_id, "evt_3"))).status_code == 200
 
     row = await _row(client, user_id)
     assert (row.version, row.status) == (newer["subscription"]["version"], "active")
-    assert await _events(client) == ["evt_3", "evt_5"]
+    assert await pay_events(client) == ["evt_3", "evt_5"]
     assert await _plan_shown(client) == "pro"
 
 
@@ -275,7 +188,7 @@ async def test_an_unknown_plan_is_stored_and_grants_free(make_client) -> None:
         return_value=httpx.Response(200, json=canonical(user_id, plan_id="legacy"))
     )
 
-    assert (await _notify(client, _event(user_id))).status_code == 200
+    assert (await notify(client, subscription_event(user_id))).status_code == 200
 
     assert (await _row(client, user_id)).plan_id == "legacy"
     assert await _plan_shown(client) == "free"
@@ -292,21 +205,21 @@ async def test_a_notification_pay_cannot_confirm_is_left_for_its_retry(make_clie
     fetch = respx.get(f"{SUBSCRIPTIONS_URL}{user_id}")
 
     fetch.mock(return_value=httpx.Response(500))
-    down = await _notify(client, _event(user_id))
+    down = await notify(client, subscription_event(user_id))
     fetch.mock(side_effect=httpx.ConnectError("down"))
-    unreachable = await _notify(client, _event(user_id))
+    unreachable = await notify(client, subscription_event(user_id))
     fetch.mock(return_value=httpx.Response(200, json={"subscription": None}))
-    nothing_yet = await _notify(client, _event(user_id))
+    nothing_yet = await notify(client, subscription_event(user_id))
     # An answer naming another subject or App is not Pay's answer about this user.
     fetch.mock(return_value=httpx.Response(200, json=canonical(user_id, app_id="other")))
-    foreign = await _notify(client, _event(user_id))
+    foreign = await notify(client, subscription_event(user_id))
 
     assert [r.status_code for r in (down, unreachable, nothing_yet, foreign)] == [503] * 4
     assert await _row(client, user_id) is None
     # Nothing recorded: the retry of the same id is applied once Pay answers.
-    assert await _events(client) == []
+    assert await pay_events(client) == []
     fetch.mock(return_value=httpx.Response(200, json=canonical(user_id)))
-    assert (await _notify(client, _event(user_id))).status_code == 200
+    assert (await notify(client, subscription_event(user_id))).status_code == 200
     assert (await _row(client, user_id)).plan_id == "pro"
 
 
@@ -320,7 +233,7 @@ async def test_a_notification_that_is_not_about_a_user_of_this_app_records_nothi
         return_value=httpx.Response(200, json=canonical(user_id))
     )
 
-    other_app = await _notify(
+    other_app = await notify(
         client,
         json.dumps(
             {
@@ -330,8 +243,8 @@ async def test_a_notification_that_is_not_about_a_user_of_this_app_records_nothi
             }
         ).encode(),
     )
-    unknown_subject = await _notify(client, _event(user_id + 1000))
-    not_a_subject = await _notify(
+    unknown_subject = await notify(client, subscription_event(user_id + 1000))
+    not_a_subject = await notify(
         client,
         json.dumps(
             {
@@ -341,12 +254,12 @@ async def test_a_notification_that_is_not_about_a_user_of_this_app_records_nothi
             }
         ).encode(),
     )
-    not_json = await _notify(client, b"{not json")
-    no_id = await _notify(
+    not_json = await notify(client, b"{not json")
+    no_id = await notify(
         client,
         json.dumps({"type": "subscription.updated", "subscription": {}}).encode(),
     )
-    too_big = await _notify(client, b" " * (client.app.state.settings.kano_pay_event_max_bytes + 1))
+    too_big = await notify(client, b" " * (client.app.state.settings.kano_pay_event_max_bytes + 1))
 
     assert other_app.status_code == 400
     # A subject with no account — a deleted one's subscription still sends its ending
@@ -354,15 +267,14 @@ async def test_a_notification_that_is_not_about_a_user_of_this_app_records_nothi
     # the account); nothing is fetched or recorded.
     assert (unknown_subject.status_code, unknown_subject.json()) == (200, {})
     assert (not_a_subject.status_code, not_a_subject.json()) == (200, {})
-    assert await _events(client) == []
+    assert await pay_events(client) == []
     assert not_json.status_code == 400
     assert no_id.status_code == 400
     assert too_big.status_code == 413
     assert fetch.call_count == 0
-    assert await _events(client) == []
 
     unconfigured = make_client()
-    assert (await _notify(unconfigured, _event(user_id))).status_code == 503
+    assert (await notify(unconfigured, subscription_event(user_id))).status_code == 503
 
 
 # --- checkout ---------------------------------------------------------------------------
@@ -412,7 +324,7 @@ async def test_a_checkout_keeps_its_idempotency_key_across_a_retry(make_client) 
     respx.get(f"{SUBSCRIPTIONS_URL}{user_id}").mock(
         return_value=httpx.Response(200, json=canonical(user_id))
     )
-    assert (await _notify(client, _event(user_id))).status_code == 200
+    assert (await notify(client, subscription_event(user_id))).status_code == 200
     assert (await _checkout_row(client, user_id)).completed_at is not None
     third = await client.post(
         "/api/billing/checkout", json={"plan_id": "pro"}, headers=CSRF_HEADERS
@@ -756,23 +668,14 @@ async def test_the_plan_decides_whether_the_agent_gets_a_shell(make_client) -> N
 
 @respx.mock
 async def test_a_turn_on_a_paid_plan_offers_the_shell_to_the_model(make_client) -> None:
-    from sightread.jobs import chat_runner
-    from sightread.jobs.queue import claim_next_turn
-
-    client = make_client(
-        sandbox_url="http://sandbox:8100",
-        sandbox_token="runner-token-not-a-real-one",
-        **PAY_SETTINGS,
+    client = await chatting_client(
+        make_client(
+            sandbox_url="http://sandbox:8100",
+            sandbox_token="runner-token-not-a-real-one",
+            **PAY_SETTINGS,
+        )
     )
-    user_id = (await sign_in(client)).user_id
-    chosen = await client.put(
-        "/api/agents/chat/settings",
-        json={"model": "claude-code/claude-opus-5-5"},
-        headers=CSRF_HEADERS,
-    )
-    assert chosen.status_code == 200, chosen.text
-    document_id = await seed_document(client, user_id)
-    await grant_plan(client.app.state.sessionmaker, user_id)
+    await grant_plan(client.app.state.sessionmaker, client.user_id)
     requests: list[dict] = []
 
     def answer(request: httpx.Request) -> httpx.Response:
@@ -782,66 +685,33 @@ async def test_a_turn_on_a_paid_plan_offers_the_shell_to_the_model(make_client) 
         )
 
     respx.post(MESSAGES_URL).mock(side_effect=answer)
-    conversation_id = (
-        await client.post(
-            f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
-        )
-    ).json()["id"]
-    sent = await client.post(
-        f"/api/conversations/{conversation_id}/messages", json={"text": "hi"}, headers=CSRF_HEADERS
-    )
+    conversation_id = await new_conversation(client)
+    sent = await send(client, conversation_id, text="hi")
     assert sent.status_code == 202, sent.text
-    settings = client.app.state.settings
-    async with client.app.state.sessionmaker() as db:
-        turn_id = await claim_next_turn(db, settings.max_chat_turns_per_user)
-    import asyncio
-
-    await chat_runner.run_turn(
-        client.app.state.sessionmaker, settings, turn_id, asyncio.Semaphore(2)
-    )
+    await run_queued_turn(client)
 
     assert [tool["name"] for tool in requests[0]["tools"]][0] == "bash"
-    assert "bash" in requests[0]["system"][0]["text"] or any(
-        "bash" in block["text"] for block in requests[0]["system"]
-    )
+    # The prompt's tool line, which the prompt drops for a tool the turn does not have.
+    assert any("\n- bash:" in block["text"] for block in requests[0]["system"])
 
 
-@pytest.mark.usefixtures("documents")
 async def test_the_plan_caps_the_parses_a_user_runs_at_once(make_client, documents) -> None:
     client = make_client(**PAY_SETTINGS)
-    await _ready_to_parse(client)
-    user_id = (await client.get("/api/me")).json()["user"]["id"]
-
-    async def running(count: int) -> None:
-        async with client.app.state.sessionmaker() as db:
-            for index in range(count):
-                db.add(
-                    job_row(
-                        user_id,
-                        filename="busy.pdf",
-                        size_bytes=10,
-                        sha256=str(index) * 64,
-                        pages_spec="",
-                        model=MODEL,
-                        pipeline_version=1,
-                        status="running",
-                        started_at=utcnow(),
-                    )
-                )
-            await db.commit()
+    user_id = (await sign_in(client)).user_id
+    sessionmaker = client.app.state.sessionmaker
 
     # Free runs one parse at a time: with one running, the next upload waits.
-    await running(1)
+    await add_parses(sessionmaker, user_id, 1, status="running", started_at=utcnow())
     refused = await _upload(client, documents)
     assert refused.status_code == 429, refused.text
     assert refused.headers["Retry-After"] == "30"
 
     # Pro runs two (the plan's `maxJobs`, under the deployment's ceiling).
-    await grant_plan(client.app.state.sessionmaker, user_id)
+    await grant_plan(sessionmaker, user_id)
     accepted = await _upload(client, documents)
     assert accepted.status_code == 201, accepted.text
-    await running(1)
-    async with client.app.state.sessionmaker() as db:
+    await add_parses(sessionmaker, user_id, 1, status="running", started_at=utcnow())
+    async with sessionmaker() as db:
         rows = (await db.execute(select(Job).where(Job.user_id == user_id))).scalars().all()
         assert sum(row.status == "running" for row in rows) == 2
     # At the cap, the same file again joins the parse already on its way (docs/jobs.md
@@ -881,21 +751,7 @@ async def test_the_claim_applies_the_users_plan_cap_as_it_stands(make_client, se
 
     client = make_client(**PAY_SETTINGS)
     user_id = (await sign_in(client)).user_id
-    async with sessionmaker() as db:
-        for index in range(3):
-            db.add(
-                job_row(
-                    user_id,
-                    filename=f"queued-{index}.pdf",
-                    size_bytes=10,
-                    sha256=str(index) * 64,
-                    pages_spec="",
-                    model=MODEL,
-                    pipeline_version=1,
-                    status="queued",
-                )
-            )
-        await db.commit()
+    await add_parses(sessionmaker, user_id, 3, status="queued")
     plan_jobs = {"pro": 2}
 
     async def claim():

@@ -47,6 +47,13 @@ from sightread.workspace.layout import (
     images_dir,
     sources_dir,
 )
+from tests.billing_helpers import (
+    SUBSCRIPTIONS_URL,
+    canonical,
+    notify,
+    pay_version,
+    subscription_event,
+)
 from tests.conftest import (
     CSRF_HEADERS,
     PARSE_MODEL,
@@ -60,7 +67,6 @@ from tests.factories import job_row
 from tests.test_document_images import _image, _insert
 from tests.test_library_trash import _write
 from tests.test_markdown_documents import _upload_markdown
-from tests.test_pay import SUBSCRIPTIONS_URL, _event, _notify, _version, canonical
 from tests.test_retention import _stranger
 
 SANDBOX_URL = "http://sandbox.test"
@@ -303,7 +309,7 @@ async def test_a_subscription_that_still_renews_refuses_until_it_is_set_to_end(m
     assert fetch.call_count == 2
 
     # The subscription's ending events still come: acknowledged, nothing fetched.
-    notified = await _notify(account, _event(uid, "evt_after"))
+    notified = await notify(account, subscription_event(uid, "evt_after"))
     assert (notified.status_code, notified.json()) == (200, {})
     assert fetch.call_count == 2
 
@@ -331,7 +337,7 @@ async def test_a_renewal_written_while_the_request_waited_still_refuses(make_cli
     uid = account.user_id
     # Pay answered before the locks were taken; a notification wrote a newer version
     # since. The write keeps the newer one, and the newer one decides.
-    await grant_plan(account.app.state.sessionmaker, uid, version=_version(5))
+    await grant_plan(account.app.state.sessionmaker, uid, version=pay_version(5))
     fetch = respx.get(f"{SUBSCRIPTIONS_URL}{uid}").mock(
         return_value=httpx.Response(200, json=canonical(uid, version=2, cancel=True))
     )

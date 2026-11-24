@@ -20,33 +20,35 @@ from sqlalchemy import select
 from sightread.billing import ledger, pay
 from sightread.billing.plans import Pack, parse_packs
 from sightread.db.models import (
-    ChatTurn,
-    Conversation,
     CreditEntry,
     CreditPack,
     CreditPackEntry,
-    Document,
-    Job,
     PackCheckout,
     UsageLog,
 )
-from tests.conftest import CSRF_HEADERS, PAY_APP_ID, PAY_SETTINGS, PAY_URL, grant_plan, sign_in
-from tests.factories import job_row
-from tests.test_ledger import _period, _user, settings_with
-from tests.test_pay import (
+from tests.billing_helpers import (
     CATALOG_URL,
+    PURCHASES_URL,
     SUBSCRIPTIONS_URL,
-    _events,
-    _ms,
-    _notify,
     canonical,
     catalog,
+    credit_period,
+    image_job,
+    make_user,
+    ms,
+    notify,
+    pay_events,
+    purchase_event,
+    running_turns,
+    settings_with,
 )
+from tests.conftest import CSRF_HEADERS, PAY_APP_ID, PAY_SETTINGS, PAY_URL, grant_plan, sign_in
 
-PURCHASES_URL = f"{PAY_URL}/v1/purchases"
 PACKS_JSON = json.dumps([{"packId": "credits", "credits": 2000, "validDays": 365}])
 PACK_SETTINGS = {**PAY_SETTINGS, "kano_pay_packs_json": PACKS_JSON}
 CHECKOUT = "/api/billing/packs/checkout"
+# Pay pricing the plan and the pack this deployment configures.
+PACK_CATALOG = catalog(packs=("credits",))
 
 
 # --- configuration ----------------------------------------------------------------------
@@ -87,8 +89,10 @@ async def _pack(
     credits: int,
     days_left: int = 365,
     status: str = ledger.PACK_PAID,
+    source: str = ledger.PACK_SOURCE_PAY,
 ) -> str:
-    """A `credit_packs` row as the webhook writes it, valid a year from its purchase."""
+    """A `credit_packs` row as the webhook writes it, valid a year from its purchase; with
+    `source`, a code's or a grant's pack instead."""
     expires_at = datetime.now(UTC) + timedelta(days=days_left)
     purchase_id = f"pur_{uuid.uuid4().hex[:8]}"
     async with sessionmaker() as db:
@@ -102,23 +106,11 @@ async def _pack(
                 purchased_at=expires_at - timedelta(days=365),
                 expires_at=expires_at,
                 version=1,
+                source=source,
             )
         )
         await db.commit()
     return purchase_id
-
-
-def _job(user_id: int) -> Job:
-    return job_row(
-        user_id,
-        kind="image",
-        filename="a.png",
-        media_type="image/png",
-        sha256="x",
-        status="queued",
-        model="m",
-        pages_done=0,
-    )
 
 
 async def _spent(sessionmaker, purchase_id: str) -> int:
@@ -138,12 +130,12 @@ async def _shares(sessionmaker, entry_id: int) -> dict[str, int]:
 
 async def test_a_charge_takes_the_period_first_and_the_packs_by_expiry(sessionmaker) -> None:
     settings = settings_with(free_credits_per_period=3)
-    user_id = await _user(sessionmaker)
+    user_id = await make_user(sessionmaker)
     later = await _pack(sessionmaker, user_id, credits=5, days_left=30)
     sooner = await _pack(sessionmaker, user_id, credits=5, days_left=10)
 
     async with sessionmaker() as db:
-        job = _job(user_id)
+        job = image_job(user_id)
         db.add(job)
         await db.flush()
         entry = await ledger.reserve(
@@ -153,7 +145,7 @@ async def test_a_charge_takes_the_period_first_and_the_packs_by_expiry(sessionma
         entry_id, job_id = entry.id, job.id
 
     # 3 from the period, then the pack that expires first, then the other.
-    assert (await _period(sessionmaker, user_id)).spent == 3
+    assert (await credit_period(sessionmaker, user_id)).spent == 3
     assert (await _spent(sessionmaker, sooner), await _spent(sessionmaker, later)) == (5, 2)
     assert await _shares(sessionmaker, entry_id) == {sooner: 5, later: 2}
     async with sessionmaker() as db:
@@ -161,9 +153,8 @@ async def test_a_charge_takes_the_period_first_and_the_packs_by_expiry(sessionma
         # Null while the reservation is pending its settlement, as a parse's always is.
         assert await ledger.credits_by_job(db, [job_id]) == {job_id: None}
     assert (balance.remaining, balance.packs_remaining, balance.available) == (0, 3, 3)
-    assert [pack.remaining for pack in balance.packs] == [0, 3] or [
-        pack.remaining for pack in balance.packs
-    ] == [3, 0]
+    # Newest purchase first: `later` was bought after `sooner`.
+    assert [(pack.id, pack.remaining) for pack in balance.packs] == [(later, 3), (sooner, 0)]
     # The earliest expiry among the packs with credits left: `sooner` has none.
     async with sessionmaker() as db:
         assert balance.packs_expire_at == (await db.get(CreditPack, later)).expires_at
@@ -179,10 +170,10 @@ async def test_a_charge_takes_the_period_first_and_the_packs_by_expiry(sessionma
 
 async def test_a_release_restores_each_share_and_a_retry_takes_again(sessionmaker) -> None:
     settings = settings_with(free_credits_per_period=2)
-    user_id = await _user(sessionmaker)
+    user_id = await make_user(sessionmaker)
     first = await _pack(sessionmaker, user_id, credits=5, days_left=300)
     async with sessionmaker() as db:
-        job = _job(user_id)
+        job = image_job(user_id)
         db.add(job)
         await db.flush()
         entry = await ledger.reserve(
@@ -190,14 +181,14 @@ async def test_a_release_restores_each_share_and_a_retry_takes_again(sessionmake
         )
         await db.commit()
         entry_id, job_id = entry.id, job.id
-    assert (await _period(sessionmaker, user_id)).spent == 2
+    assert (await credit_period(sessionmaker, user_id)).spent == 2
     assert await _spent(sessionmaker, first) == 4
 
     # The parse fails: the period gets its 2 back, the pack its 4.
     async with sessionmaker() as db:
         await ledger.settle_parse(db, job_id, "failed")
         await db.commit()
-    assert (await _period(sessionmaker, user_id)).spent == 0
+    assert (await credit_period(sessionmaker, user_id)).spent == 0
     assert await _spent(sessionmaker, first) == 0
     assert await _shares(sessionmaker, entry_id) == {}
 
@@ -207,7 +198,7 @@ async def test_a_release_restores_each_share_and_a_retry_takes_again(sessionmake
     async with sessionmaker() as db:
         await ledger.reserve_again(db, settings, job_id)
         await db.commit()
-    assert (await _period(sessionmaker, user_id)).spent == 2
+    assert (await credit_period(sessionmaker, user_id)).spent == 2
     assert (await _spent(sessionmaker, second), await _spent(sessionmaker, first)) == (4, 0)
     assert await _shares(sessionmaker, entry_id) == {second: 4}
     # Succeeding consumes it: every share stays where it was taken.
@@ -220,31 +211,9 @@ async def test_a_release_restores_each_share_and_a_retry_takes_again(sessionmake
 
 async def test_a_turn_spills_into_the_packs_before_the_overdraft(sessionmaker) -> None:
     settings = settings_with(free_credits_per_period=1, credit_usd="0.001")
-    user_id = await _user(sessionmaker)
+    user_id = await make_user(sessionmaker)
     pack = await _pack(sessionmaker, user_id, credits=4)
-    async with sessionmaker() as db:
-        document = Document(user_id=user_id, name="d.md")
-        db.add(document)
-        await db.flush()
-        conversation = Conversation(user_id=user_id, document_id=document.id, session="s")
-        db.add(conversation)
-        await db.flush()
-        turn = ChatTurn(
-            user_id=user_id, conversation_id=conversation.id, message_id=1, status="running"
-        )
-        db.add(turn)
-        await db.flush()
-        entry = await ledger.reserve(
-            db,
-            settings,
-            user_id=user_id,
-            kind=ledger.CHAT,
-            amount=0,
-            turn_id=turn.id,
-            minimum=settings.chat_min_credits,
-        )
-        await db.commit()
-        turn_id, entry_id = turn.id, entry.id
+    _, [turn_id], [entry_id] = await running_turns(sessionmaker, settings, user_id, settle=False)
 
     async def call() -> int | None:
         # 3,000 tokens at US$1 per million = US$0.003: 3 credits per call.
@@ -269,12 +238,12 @@ async def test_a_turn_spills_into_the_packs_before_the_overdraft(sessionmaker) -
 
     # 3 credits: the period's 1, then 2 of the pack; 2 are left to the turn.
     assert await call() == 2
-    assert (await _period(sessionmaker, user_id)).spent == 1
+    assert (await credit_period(sessionmaker, user_id)).spent == 1
     assert await _spent(sessionmaker, pack) == 2
     assert await _shares(sessionmaker, entry_id) == {pack: 2}
     # 3 more: the pack's last 2, and only then 1 into the period past its grant.
     assert await call() == 0
-    assert (await _period(sessionmaker, user_id)).spent == 2
+    assert (await credit_period(sessionmaker, user_id)).spent == 2
     assert await _spent(sessionmaker, pack) == 4
     assert await _shares(sessionmaker, entry_id) == {pack: 4}
     async with sessionmaker() as db:
@@ -296,36 +265,9 @@ async def test_two_turns_settling_at_once_share_the_period_before_the_pack(sessi
     rest into the pack, instead of both charging the period from the same stale remainder
     (docs/billing.md § The ledger)."""
     settings = settings_with(free_credits_per_period=10, credit_usd="0.001")
-    user_id = await _user(sessionmaker)
+    user_id = await make_user(sessionmaker)
     pack = await _pack(sessionmaker, user_id, credits=20)
-    async with sessionmaker() as db:
-        document = Document(user_id=user_id, name="d.md")
-        db.add(document)
-        await db.flush()
-        conversation = Conversation(user_id=user_id, document_id=document.id, session="s")
-        db.add(conversation)
-        await db.flush()
-        turn_ids = []
-        for message_id in (1, 2):
-            turn = ChatTurn(
-                user_id=user_id,
-                conversation_id=conversation.id,
-                message_id=message_id,
-                status="running",
-            )
-            db.add(turn)
-            await db.flush()
-            await ledger.reserve(
-                db,
-                settings,
-                user_id=user_id,
-                kind=ledger.CHAT,
-                amount=0,
-                turn_id=turn.id,
-                minimum=1,
-            )
-            turn_ids.append(turn.id)
-        await db.commit()
+    _, turn_ids, _ = await running_turns(sessionmaker, settings, user_id, 2, settle=False)
 
     async def settle(db, turn_id: uuid.UUID) -> int | None:
         # 8,000 tokens at US$1 per million = US$0.008: 8 credits a turn.
@@ -359,7 +301,7 @@ async def test_two_turns_settling_at_once_share_the_period_before_the_pack(sessi
         assert not waiting.done()
         await first.commit()
     assert await waiting == 14
-    assert (await _period(sessionmaker, user_id)).spent == 10
+    assert (await credit_period(sessionmaker, user_id)).spent == 10
     assert await _spent(sessionmaker, pack) == 6
     async with sessionmaker() as db:
         entries = (
@@ -379,7 +321,7 @@ async def test_two_turns_settling_at_once_share_the_period_before_the_pack(sessi
 
 async def test_an_expired_or_refunded_pack_counts_nothing(sessionmaker) -> None:
     settings = settings_with(free_credits_per_period=0)
-    user_id = await _user(sessionmaker)
+    user_id = await make_user(sessionmaker)
     expired = await _pack(sessionmaker, user_id, credits=5, days_left=-1)
     refunded = await _pack(sessionmaker, user_id, credits=5, status="refunded")
     active = await _pack(sessionmaker, user_id, credits=2)
@@ -407,22 +349,6 @@ async def test_an_expired_or_refunded_pack_counts_nothing(sessionmaker) -> None:
 # --- Pay --------------------------------------------------------------------------------
 
 
-def _catalog(*, enabled: bool = True, packs: tuple[str, ...] = ("credits",)) -> dict:
-    return {
-        **catalog(enabled=enabled),
-        "packs": [
-            {
-                "packId": pack,
-                "productId": f"prod_{pack}",
-                "name": "Credits",
-                "amount": "500",
-                "currency": "USD",
-            }
-            for pack in packs
-        ],
-    }
-
-
 def _purchase(
     user_id: int,
     purchase_id: str = "pur_1",
@@ -443,26 +369,10 @@ def _purchase(
         "status": status,
         "amount": "500",
         "currency": "USD",
-        "createdAt": _ms(paid),
-        "paidAt": _ms(paid),
+        "createdAt": ms(paid),
+        "paidAt": ms(paid),
         "version": version,
     }
-
-
-def _purchase_event(user_id: int, event_id: str = "evt_p1", purchase_id: str = "pur_1") -> bytes:
-    body = {
-        "id": event_id,
-        "type": "purchase.updated",
-        "purchase": {
-            "appId": PAY_APP_ID,
-            "subjectId": str(user_id),
-            "purchaseId": purchase_id,
-            # The body's own claims, never read.
-            "packId": "mystery",
-            "status": "refunded",
-        },
-    }
-    return json.dumps(body).encode()
 
 
 def _created(purchase_id: str = "pur_1") -> httpx.Response:
@@ -503,7 +413,7 @@ async def _buy(client: AsyncClient, pack_id: str = "credits") -> httpx.Response:
 async def test_a_pack_checkout_is_for_a_paid_plan_and_a_pack_on_sale(make_client) -> None:
     client = make_client(**PACK_SETTINGS)
     user_id = (await sign_in(client)).user_id
-    respx.get(CATALOG_URL).mock(return_value=httpx.Response(200, json=_catalog()))
+    respx.get(CATALOG_URL).mock(return_value=httpx.Response(200, json=PACK_CATALOG))
     create = respx.post(PURCHASES_URL).mock(return_value=_created())
 
     # Free: the plan comes first, whatever is on sale.
@@ -518,7 +428,9 @@ async def test_a_pack_checkout_is_for_a_paid_plan_and_a_pack_on_sale(make_client
     other = await _buy(client, "other")
     assert (other.status_code, other.json()["error"]["type"]) == (409, "checkout_unavailable")
     client.app.state.pay_catalog = pay.CatalogCache()
-    respx.get(CATALOG_URL).mock(return_value=httpx.Response(200, json=_catalog(enabled=False)))
+    respx.get(CATALOG_URL).mock(
+        return_value=httpx.Response(200, json=catalog(enabled=False, packs=("credits",)))
+    )
     closed = await _buy(client)
     assert (closed.status_code, closed.json()["error"]["type"]) == (409, "checkout_unavailable")
     client.app.state.pay_catalog = pay.CatalogCache()
@@ -532,7 +444,7 @@ async def test_a_pack_checkout_is_for_a_paid_plan_and_a_pack_on_sale(make_client
     bare = make_client(**PAY_SETTINGS)
     await sign_in(bare)  # the same user, on Pro already
     bare.app.state.pay_catalog = pay.CatalogCache()
-    respx.get(CATALOG_URL).mock(return_value=httpx.Response(200, json=_catalog()))
+    respx.get(CATALOG_URL).mock(return_value=httpx.Response(200, json=PACK_CATALOG))
     none = await _buy(bare)
     assert (none.status_code, none.json()["error"]["type"]) == (409, "checkout_unavailable")
     assert (await bare.get("/api/me")).json()["pack_checkout_available"] is False
@@ -543,7 +455,7 @@ async def test_a_pack_checkout_is_for_a_paid_plan_and_a_pack_on_sale(make_client
 async def test_a_pack_checkout_keeps_its_key_across_a_retry(make_client) -> None:
     client = make_client(**PACK_SETTINGS)
     user_id = await _pro(client)
-    respx.get(CATALOG_URL).mock(return_value=httpx.Response(200, json=_catalog()))
+    respx.get(CATALOG_URL).mock(return_value=httpx.Response(200, json=PACK_CATALOG))
     create = respx.post(PURCHASES_URL)
 
     create.mock(return_value=httpx.Response(502))
@@ -571,7 +483,7 @@ async def test_a_pack_checkout_keeps_its_key_across_a_retry(make_client) -> None
     respx.get(f"{PURCHASES_URL}/{user_id}").mock(
         return_value=httpx.Response(200, json={"purchases": [_purchase(user_id)]})
     )
-    assert (await _notify(client, _purchase_event(user_id))).status_code == 200
+    assert (await notify(client, purchase_event(user_id))).status_code == 200
     assert (await _checkout_row(client, user_id)).completed_at is not None
     create.mock(return_value=_created("pur_2"))
     assert (await _buy(client)).status_code == 200
@@ -591,7 +503,7 @@ async def test_a_purchase_notification_is_written_from_the_canonical_purchases(
         return_value=httpx.Response(200, json=answer)
     )
 
-    received = await _notify(client, _purchase_event(user_id))
+    received = await notify(client, purchase_event(user_id))
 
     assert received.status_code == 200, received.text
     assert fetch.call_count == 1
@@ -606,11 +518,11 @@ async def test_a_purchase_notification_is_written_from_the_canonical_purchases(
     )
     assert row.expires_at - row.purchased_at == timedelta(days=365)
     assert abs(row.purchased_at - paid_at) < timedelta(seconds=1)
-    assert await _events(client) == ["evt_p1"]
+    assert await pay_events(client) == ["evt_p1"]
     me = (await client.get("/api/me")).json()
     assert (me["credits_remaining"], me["pack_checkout_available"]) == (7000, True)
 
-    respx.get(CATALOG_URL).mock(return_value=httpx.Response(200, json=_catalog()))
+    respx.get(CATALOG_URL).mock(return_value=httpx.Response(200, json=PACK_CATALOG))
     respx.get(f"{SUBSCRIPTIONS_URL}{user_id}").mock(
         return_value=httpx.Response(200, json=canonical(user_id))
     )
@@ -643,7 +555,7 @@ async def test_a_purchase_notification_is_written_from_the_canonical_purchases(
     ]
 
     # The same delivery again: nothing fetched, nothing written.
-    assert (await _notify(client, _purchase_event(user_id))).status_code == 200
+    assert (await notify(client, purchase_event(user_id))).status_code == 200
     assert fetch.call_count == 1
     # A refund: applied once, and a stale answer never brings the pack back.
     fetch.mock(
@@ -652,9 +564,9 @@ async def test_a_purchase_notification_is_written_from_the_canonical_purchases(
             json={"purchases": [_purchase(user_id, status="refunded", version=2, paid_at=paid_at)]},
         )
     )
-    assert (await _notify(client, _purchase_event(user_id, "evt_p2"))).status_code == 200
+    assert (await notify(client, purchase_event(user_id, "evt_p2"))).status_code == 200
     fetch.mock(return_value=httpx.Response(200, json=answer))
-    assert (await _notify(client, _purchase_event(user_id, "evt_p3"))).status_code == 200
+    assert (await notify(client, purchase_event(user_id, "evt_p3"))).status_code == 200
     (row,) = await _pack_rows(client, user_id)
     assert (row.status, row.version, row.credits) == ("refunded", 2, 2000)
     assert (await client.get("/api/me")).json()["credits_remaining"] == 5000
@@ -665,7 +577,7 @@ async def test_a_purchase_notification_is_written_from_the_canonical_purchases(
         0,
         False,
     )
-    assert await _events(client) == ["evt_p1", "evt_p2", "evt_p3"]
+    assert await pay_events(client) == ["evt_p1", "evt_p2", "evt_p3"]
 
 
 @respx.mock
@@ -675,17 +587,17 @@ async def test_a_purchase_pay_cannot_confirm_or_does_not_configure(make_client) 
     fetch = respx.get(f"{PURCHASES_URL}/{user_id}")
 
     fetch.mock(return_value=httpx.Response(500))
-    down = await _notify(client, _purchase_event(user_id))
+    down = await notify(client, purchase_event(user_id))
     fetch.mock(return_value=httpx.Response(200, json={"purchases": []}))
-    not_yet = await _notify(client, _purchase_event(user_id))
+    not_yet = await notify(client, purchase_event(user_id))
     fetch.mock(return_value=httpx.Response(200, json={"purchases": [_purchase(user_id, "pur_2")]}))
-    another = await _notify(client, _purchase_event(user_id, purchase_id="pur_1"))
+    another = await notify(client, purchase_event(user_id, purchase_id="pur_1"))
     assert [r.status_code for r in (down, not_yet, another)] == [503, 503, 503]
     assert await _pack_rows(client, user_id) == []
-    assert await _events(client) == []
+    assert await pay_events(client) == []
 
     # Malformed: no purchase id, or a subscription and a purchase in one event.
-    no_id = await _notify(
+    no_id = await notify(
         client,
         json.dumps(
             {
@@ -695,7 +607,7 @@ async def test_a_purchase_pay_cannot_confirm_or_does_not_configure(make_client) 
             }
         ).encode(),
     )
-    both = await _notify(
+    both = await notify(
         client,
         json.dumps(
             {
@@ -715,9 +627,9 @@ async def test_a_purchase_pay_cannot_confirm_or_does_not_configure(make_client) 
             200, json={"purchases": [_purchase(user_id, "pur_9", pack_id="mystery")]}
         )
     )
-    assert (await _notify(client, _purchase_event(user_id, "evt_9", "pur_9"))).status_code == 200
+    assert (await notify(client, purchase_event(user_id, "evt_9", "pur_9"))).status_code == 200
     assert await _pack_rows(client, user_id) == []
-    assert await _events(client) == ["evt_9"]
+    assert await pay_events(client) == ["evt_9"]
     assert (await client.get("/api/me")).json()["credits_remaining"] == 5000
 
 
@@ -725,7 +637,7 @@ async def test_a_purchase_pay_cannot_confirm_or_does_not_configure(make_client) 
 async def test_a_refresh_recovers_a_missed_purchase(make_client) -> None:
     client = make_client(**PACK_SETTINGS)
     user_id = await _pro(client)
-    respx.get(CATALOG_URL).mock(return_value=httpx.Response(200, json=_catalog()))
+    respx.get(CATALOG_URL).mock(return_value=httpx.Response(200, json=PACK_CATALOG))
     respx.get(f"{SUBSCRIPTIONS_URL}{user_id}").mock(
         return_value=httpx.Response(200, json=canonical(user_id))
     )
@@ -769,3 +681,31 @@ async def test_a_refresh_recovers_a_missed_purchase(make_client) -> None:
     outage = (await client.get("/api/billing")).json()
     assert (outage["pay_reachable"], outage["pack_checkout_available"]) == (False, False)
     assert outage["packs"]["items"][0]["status"] == "refunded"
+
+
+@respx.mock
+async def test_a_code_or_granted_pack_never_makes_the_refresh_ask_for_purchases(
+    make_client,
+) -> None:
+    """Only Pay's packs are Pay's to refund (docs/billing.md § Redeem codes): a user whose
+    paid packs all came from a code or a grant costs the refresh no purchases call."""
+    client = make_client(**PACK_SETTINGS)
+    user_id = await _pro(client)
+    sessionmaker = client.app.state.sessionmaker
+    await _pack(sessionmaker, user_id, credits=500, source=ledger.PACK_SOURCE_CODE)
+    await _pack(sessionmaker, user_id, credits=300, source=ledger.PACK_SOURCE_GRANT)
+    respx.get(CATALOG_URL).mock(return_value=httpx.Response(200, json=PACK_CATALOG))
+    subscription = respx.get(f"{SUBSCRIPTIONS_URL}{user_id}").mock(
+        return_value=httpx.Response(200, json=canonical(user_id))
+    )
+    fetch = respx.get(f"{PURCHASES_URL}/{user_id}").mock(
+        return_value=httpx.Response(200, json={"purchases": []})
+    )
+
+    client.app.state.pay_refreshed.clear()
+    billing = (await client.get("/api/billing")).json()
+
+    assert billing["pay_reachable"] is True
+    assert subscription.call_count == 1
+    assert fetch.call_count == 0
+    assert billing["packs"]["remaining"] == 800

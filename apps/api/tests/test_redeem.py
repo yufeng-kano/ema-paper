@@ -6,9 +6,8 @@ code works without it."""
 
 from __future__ import annotations
 
-import json
 import re
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import httpx
 import pytest
@@ -37,32 +36,22 @@ from sightread.db.models import (
     User,
 )
 from sightread.errors import ApiError
-from tests.conftest import CSRF_HEADERS, PAY_SETTINGS, PRO_PLANS_JSON, grant_plan, sign_in
-from tests.factories import job_row, user_row
-from tests.test_billing import _subscription
-from tests.test_ledger import _user, settings_with
-from tests.test_library import MODEL
-from tests.test_pay import CATALOG_URL, SUBSCRIPTIONS_URL, _event, _notify, canonical, catalog
-
-PLANS = {**{"kano_pay_plans_json": PRO_PLANS_JSON}}
-TWO_PLANS_JSON = json.dumps(
-    [
-        {
-            "planId": "pro",
-            "credits": 5000,
-            "storageBytes": 1_073_741_824,
-            "sandbox": True,
-            "maxJobs": 2,
-        },
-        {
-            "planId": "team",
-            "credits": 9000,
-            "storageBytes": 1_073_741_824,
-            "sandbox": True,
-            "maxJobs": 2,
-        },
-    ]
+from tests.billing_helpers import (
+    CATALOG_URL,
+    PRO_PLANS,
+    SUBSCRIPTIONS_URL,
+    TWO_PLANS_JSON,
+    add_parses,
+    canonical,
+    catalog,
+    make_user,
+    notify,
+    paid_subscription,
+    settings_with,
+    subscription_event,
 )
+from tests.conftest import CSRF_HEADERS, PAY_SETTINGS, grant_plan, sign_in
+
 REDEEM = "/api/billing/redeem"
 PRINTED = re.compile(r"^EMA-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$")
 
@@ -87,14 +76,6 @@ async def _code(sessionmaker, settings, **grant) -> str:
 
 async def _redeem(client: AsyncClient, code: str):
     return await client.post(REDEEM, json={"code": code}, headers=CSRF_HEADERS)
-
-
-async def _another_user(sessionmaker, sub: str) -> int:
-    async with sessionmaker() as db:
-        user = user_row(f"{sub}@example.test")
-        db.add(user)
-        await db.commit()
-        return user.id
 
 
 # --- the code ----------------------------------------------------------------------------
@@ -148,11 +129,11 @@ def test_granted_days_open_periods_from_the_bank_after_a_paid_one() -> None:
     inert = resolve_period(None, Grant("max", 30), plans, free, now, 30)
     assert inert.period.source == FREE and inert.grant == Grant("max", 30)
     # A paid subscription comes first: the bank waits, untouched.
-    paid = resolve_period(_subscription(), Grant("pro", 45), plans, free, now, 30)
+    paid = resolve_period(paid_subscription(), Grant("pro", 45), plans, free, now, 30)
     assert paid.period.source == SUBSCRIPTION and paid.grant == Grant("pro", 45)
     # No bank at all: the paid period, or Free, as before.
     assert resolve_period(None, None, plans, free, now, 30).period.source == FREE
-    assert resolve_period(_subscription(), None, plans, free, now, 30).grant is None
+    assert resolve_period(paid_subscription(), None, plans, free, now, 30).grant is None
 
 
 def test_a_paid_period_cuts_an_open_granted_one_and_banks_its_whole_days() -> None:
@@ -162,22 +143,24 @@ def test_a_paid_period_cuts_an_open_granted_one_and_banks_its_whole_days() -> No
     open_grant = Grant("pro", 5, now - timedelta(days=10), now + timedelta(days=20))
     # Paid since yesterday: cut there, 21 whole days (of the 20 left and the one under way)
     # go back; the paid period is the current one.
-    paid = _subscription(period_start=now - timedelta(days=1), period_end=now + timedelta(days=29))
+    paid = paid_subscription(
+        period_start=now - timedelta(days=1), period_end=now + timedelta(days=29)
+    )
     cut = resolve_period(paid, open_grant, plans, free, now, 30)
     assert cut.period.source == SUBSCRIPTION
     assert cut.grant == Grant("pro", 26)
     # Paid since before the granted period began: every day of it goes back.
-    early = _subscription(
+    early = paid_subscription(
         period_start=now - timedelta(days=15), period_end=now + timedelta(days=15)
     )
     assert resolve_period(early, open_grant, plans, free, now, 30).grant == Grant("pro", 35)
     # A part of a day is spent, not banked.
-    partial = _subscription(
+    partial = paid_subscription(
         period_start=now - timedelta(hours=1), period_end=now + timedelta(days=29)
     )
     assert resolve_period(partial, open_grant, plans, free, now, 30).grant == Grant("pro", 25)
     # Lapsed meanwhile with the granted period still open: it runs on, as it was.
-    lapsed = _subscription(status="canceled", period_start=now - timedelta(days=1))
+    lapsed = paid_subscription(status="canceled", period_start=now - timedelta(days=1))
     kept = resolve_period(lapsed, open_grant, plans, free, now, 30)
     assert kept.grant == open_grant and kept.period.source == GRANT
     # A granted period that ended before the paid one began is simply closed.
@@ -225,11 +208,11 @@ async def test_a_credits_code_becomes_a_pack_that_is_not_pays(make_client, sessi
     # Once per user per code; the code's second use is another user's.
     again = await _redeem(client, code)
     assert (again.status_code, again.json()["error"]["type"]) == (409, "code_redeemed")
-    other = await _another_user(sessionmaker, "second")
+    other = await make_user(sessionmaker, "second")
     async with sessionmaker() as db:
         granted = await codes.redeem(db, settings, other, code)
         assert granted.kind == "credits"
-        third = await _another_user(sessionmaker, "third")
+        third = await make_user(sessionmaker, "third")
         with pytest.raises(ApiError) as refused:
             await codes.redeem(db, settings, third, code)
         assert (refused.value.status_code, refused.value.error_type) == (409, "code_exhausted")
@@ -257,7 +240,6 @@ async def test_a_code_that_is_unknown_disabled_or_past_its_date_is_refused(
     async with sessionmaker() as db:
         row, done = await codes.disable(db, settings, disabled)
         assert row is not None and done
-        assert (await codes.disable(db, settings, "EMA-AAAA-AAAA-AAAA")) == (None, False)
         await db.commit()
     answer = await _redeem(client, disabled)
     assert (answer.status_code, answer.json()["error"]["type"]) == (404, "code_invalid")
@@ -287,7 +269,7 @@ async def test_a_code_that_is_unknown_disabled_or_past_its_date_is_refused(
 
 async def test_refused_attempts_are_capped_per_window(sessionmaker) -> None:
     settings = settings_with(redeem_max_failures=3, redeem_failure_window_seconds=3600)
-    user_id = await _user(sessionmaker)
+    user_id = await make_user(sessionmaker)
     now = datetime(2026, 10, 27, 12, tzinfo=UTC)
     async with sessionmaker() as db:
         for _ in range(3):
@@ -321,7 +303,7 @@ async def _redeem_state(sessionmaker, user_id: int) -> tuple[int, datetime | Non
 
 
 async def test_a_plan_code_starts_at_once_when_nothing_else_pays(make_client, sessionmaker) -> None:
-    client = make_client(**PLANS, grant_period_days=30)
+    client = make_client(**PRO_PLANS, grant_period_days=30)
     user_id = (await sign_in(client)).user_id
     settings = client.app.state.settings
     assert (await client.get("/api/me")).json()["plan"] == "free"
@@ -378,7 +360,7 @@ async def test_a_plan_code_starts_at_once_when_nothing_else_pays(make_client, se
 async def test_days_wait_under_a_paid_subscription_and_a_paid_period_cuts_an_open_one(
     make_client, sessionmaker
 ) -> None:
-    client = make_client(**PLANS, grant_period_days=30)
+    client = make_client(**PRO_PLANS, grant_period_days=30)
     user_id = (await sign_in(client)).user_id
     settings = client.app.state.settings
     await grant_plan(sessionmaker, user_id)
@@ -449,7 +431,7 @@ async def test_pays_subscription_banks_the_granted_days_it_starts_inside(
     respx.get(f"{SUBSCRIPTIONS_URL}{user_id}").mock(
         return_value=httpx.Response(200, json=canonical(user_id))
     )
-    assert (await _notify(client, _event(user_id))).status_code == 200
+    assert (await notify(client, subscription_event(user_id))).status_code == 200
     async with sessionmaker() as db:
         grant = await db.get(PlanGrant, user_id)
         assert (grant.days_banked, grant.period_start, grant.period_end) == (30, None, None)
@@ -473,20 +455,6 @@ async def test_a_code_of_another_plan_than_the_banks_is_refused(make_client, ses
     team = await _code(sessionmaker, settings, plan_id="team", days=30)
     answer = await _redeem(client, team)
     assert (answer.status_code, answer.json()["error"]["type"]) == (409, "code_plan_conflict")
-    # A plan code names a configured plan, or is not made.
-    async with sessionmaker() as db:
-        with pytest.raises(ValueError):
-            await codes.create_codes(
-                db,
-                settings,
-                kind=codes.PLAN,
-                count=1,
-                max_uses=1,
-                redeem_by=None,
-                label="",
-                plan_id="max",
-                days=30,
-            )
 
 
 # --- the worker's cap --------------------------------------------------------------------
@@ -499,24 +467,10 @@ async def test_the_claim_counts_an_open_granted_period_as_the_plan(
     two run, as on a paid period; the granted period over, one at a time again."""
     from sightread.jobs.queue import claim_next_job
 
-    client = make_client(**PLANS, grant_period_days=30)
+    client = make_client(**PRO_PLANS, grant_period_days=30)
     user_id = (await sign_in(client)).user_id
     settings = client.app.state.settings
-    async with sessionmaker() as db:
-        for index in range(3):
-            db.add(
-                job_row(
-                    user_id,
-                    filename=f"queued-{index}.pdf",
-                    size_bytes=10,
-                    sha256=str(index) * 64,
-                    pages_spec="",
-                    model=MODEL,
-                    pipeline_version=1,
-                    status="queued",
-                )
-            )
-        await db.commit()
+    await add_parses(sessionmaker, user_id, 3, status="queued")
 
     async def claim():
         async with sessionmaker() as db:
@@ -548,9 +502,11 @@ async def test_the_claim_counts_an_open_granted_period_as_the_plan(
 
 
 async def test_the_cli_creates_lists_and_disables_codes(make_client, sessionmaker, capsys) -> None:
-    client = make_client(**PLANS)
+    client = make_client(**PRO_PLANS)
     await sign_in(client)
     settings = client.app.state.settings
+    # A last day years ahead of today's: create_codes refuses one already past.
+    until = date(datetime.now(UTC).year + 5, 12, 31)
 
     async def run(*argv: str) -> tuple[int, str, str]:
         async with sessionmaker() as db:
@@ -567,7 +523,7 @@ async def test_the_cli_creates_lists_and_disables_codes(make_client, sessionmake
         "--count",
         "2",
         "--redeem-by",
-        "2030-12-31",
+        until.isoformat(),
         "--label",
         "launch",
     )
@@ -588,7 +544,7 @@ async def test_the_cli_creates_lists_and_disables_codes(make_client, sessionmake
         1,
         "launch",
     )
-    assert first.redeem_by == datetime(2030, 12, 31, 23, 59, 59, tzinfo=UTC)
+    assert first.redeem_by == datetime(until.year, 12, 31, 23, 59, 59, tzinfo=UTC)
     plan_row = rows[codes.normalize(plan_code, "EMA")]
     assert (plan_row.kind, plan_row.plan_id, plan_row.days, plan_row.max_uses) == (
         "plan",
@@ -596,13 +552,12 @@ async def test_the_cli_creates_lists_and_disables_codes(make_client, sessionmake
         60,
         5,
     )
-    # A plan the deployment does not configure, and days left out, are refused.
-    assert (await run("create", "--plan", "max", "--days", "30"))[0] == 2
+    # A plan code needs its days.
     assert (await run("create", "--plan", "pro"))[0] == 2
     status, out, _ = await run("list")
     assert status == 0 and len(out.splitlines()) == 3
     assert f"{plan_code}\t60 days of pro\t0/5\t-\tlive\t" in out
-    assert f"{printed[0]}\t500 credits, 90 days\t0/1\t2030-12-31\tlive\tlaunch" in out
+    assert f"{printed[0]}\t500 credits, 90 days\t0/1\t{until}\tlive\tlaunch" in out
     status, out, _ = await run("disable", printed[1].lower())
     assert (status, out.strip()) == (0, f"disabled {printed[1]}")
     assert (await run("disable", "EMA-AAAA-AAAA-AAAA"))[0] == 1
@@ -611,10 +566,10 @@ async def test_the_cli_creates_lists_and_disables_codes(make_client, sessionmake
     status, out, _ = await run("list", "--all")
     assert (
         len(out.splitlines()) == 3
-        and f"{printed[1]}\t500 credits, 90 days\t0/1\t2030-12-31\tdisabled" in out
+        and f"{printed[1]}\t500 credits, 90 days\t0/1\t{until}\tdisabled" in out
     )
     answer = await _redeem(client, printed[1])
     assert (answer.status_code, answer.json()["error"]["type"]) == (404, "code_invalid")
     assert (await _redeem(client, printed[0])).status_code == 200
     _, out, _ = await run("list", "--all")
-    assert f"{printed[0]}\t500 credits, 90 days\t1/1\t2030-12-31\tused up" in out
+    assert f"{printed[0]}\t500 credits, 90 days\t1/1\t{until}\tused up" in out

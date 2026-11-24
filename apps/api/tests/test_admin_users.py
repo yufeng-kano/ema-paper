@@ -29,10 +29,9 @@ from tests.admin_helpers import (
     last_audit_id,
     owner_client,
 )
+from tests.billing_helpers import TWO_PLANS_JSON, settings_with
 from tests.conftest import CSRF_HEADERS, grant_plan
 from tests.factories import job_row
-from tests.test_ledger import settings_with
-from tests.test_redeem import TWO_PLANS_JSON
 
 PLANS = {"kano_pay_plans_json": TWO_PLANS_JSON}
 USERS = "/api/admin/users"
