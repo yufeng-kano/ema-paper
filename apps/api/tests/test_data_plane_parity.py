@@ -20,7 +20,7 @@ from sqlalchemy import select, update
 
 from sightread.db.models import Job, UploadTicket, utcnow
 from tests.chat_helpers import MESSAGES_URL
-from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, api_key_client
+from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, api_key_client, convert_on_upload
 from tests.helpers import bearer, credits_spent, job_by_id, staged_uploads, v1_parse
 from tests.test_format_check import READING, TRANSCRIPTION, _done, _tool, _turn, _vision
 from tests.test_parse_end_to_end import _drain_queue, _vision_stub
@@ -310,6 +310,7 @@ async def test_a_retry_after_the_file_parsed_in_files_answers_that_parse(
         )
         await db.commit()
     upstream.answers.clear()
+    await convert_on_upload(api)
     filed = await _library_upload(api, documents["mixed_pdf"])
     await _drain_queue(api, sessionmaker)
     assert (await job_by_id(sessionmaker, filed["job_id"])).status == "succeeded"
@@ -381,6 +382,7 @@ async def test_a_retry_naming_no_model_never_runs_one_the_deployment_withdrew(
     upstream = Upstream({(MODEL, 2): lambda: httpx.Response(400)})
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
     if filed:
+        await convert_on_upload(api)
         job_id = (await _library_upload(api, documents["mixed_pdf"]))["job_id"]
     else:
         job_id = (await v1_parse(api, documents["mixed_pdf"])).json()["job_id"]

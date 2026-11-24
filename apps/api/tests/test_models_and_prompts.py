@@ -4,7 +4,6 @@ safety, docs/billing.md § Models)."""
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 
 import httpx
@@ -15,9 +14,7 @@ from sqlalchemy import select
 
 from sightread.db.models import CreditEntry, Job
 from sightread.errors import ApiError
-from sightread.jobs.queue import claim_next_job
-from sightread.jobs.runner import run_job
-from sightread.upstream.client import Connection, fetch_models
+from sightread.upstream.client import fetch_models
 from tests.conftest import (
     CSRF_HEADERS,
     KANO_API_KEY,
@@ -26,6 +23,8 @@ from tests.conftest import (
     PARSE_MODEL,
     api_key_client,
 )
+from tests.helpers import stub_connection
+from tests.test_parse_end_to_end import _drain_queue
 
 FALLBACK = "vendor/fallback-model"
 
@@ -150,9 +149,7 @@ async def test_an_oversized_model_list_is_an_upstream_error() -> None:
         )
     )
     with pytest.raises(ApiError) as raised:
-        await fetch_models(
-            Connection(api_key=KANO_API_KEY, base_url=f"{KANO_BASE}/openai/v1"), max_bytes=64
-        )
+        await fetch_models(stub_connection(api_key=KANO_API_KEY), max_bytes=64)
     assert raised.value.status_code == 502
 
 
@@ -261,11 +258,8 @@ async def test_a_job_with_no_endpoint_snapshot_never_runs_on_kano_proxy(
         job.connection_base_url = None
         await db.commit()
 
-    settings = client.app.state.settings
     for attempt in ("queued", "retried"):
-        async with sessionmaker() as db:
-            assert await claim_next_job(db, settings.max_jobs_per_user) == job_id, attempt
-        await run_job(sessionmaker, settings, job_id, asyncio.Semaphore(2))
+        assert await _drain_queue(client, sessionmaker) == job_id, attempt
 
         status = (await client.get(f"/v1/jobs/{job_id}")).json()
         assert (status["status"], status["error"]) == ("failed", gone), attempt
@@ -306,10 +300,7 @@ async def test_a_queued_job_reconciles_its_endpoint_snapshot_at_claim_time(
 
     # The worker restarted on the moved origin.
     worker = make_client(kano_proxy_base_url=moved_base)
-    settings = worker.app.state.settings
-    async with sessionmaker() as db:
-        assert await claim_next_job(db, settings.max_jobs_per_user) == job_id
-    await run_job(sessionmaker, settings, job_id, asyncio.Semaphore(2))
+    assert await _drain_queue(worker, sessionmaker) == job_id
 
     assert moved_chat.called
     assert moved_chat.calls[0].request.headers["authorization"] == f"Bearer {KANO_API_KEY}"

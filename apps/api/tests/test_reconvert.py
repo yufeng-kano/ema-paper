@@ -20,12 +20,10 @@ from sightread.parsing.figures import crop_path
 from sightread.workspace import documents as workspace_documents
 from sightread.workspace import git
 from sightread.workspace.documents import original_of
-from sightread.workspace.layout import user_root
-from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL
-from tests.test_library import MODEL, _ready_to_parse
+from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, PARSE_MODEL
 from tests.test_library_trash import _fail_next_commit
-from tests.test_parse_end_to_end import _drain_queue
-from tests.test_retry_failed_pages import FALLBACK, Upstream, _answer, _retry, _row, _upload
+from tests.test_parse_end_to_end import _completion, _drain_queue
+from tests.test_retry_failed_pages import FALLBACK, Upstream, _library, _retry, _row, _upload
 
 # What the re-convert's model answers for every page. Its figure takes the whole page, as
 # the first parse's does, so the figure check asks no model (docs/parsing.md § Figure check).
@@ -39,17 +37,13 @@ RECONVERTED = (
 
 @pytest.fixture
 async def library(make_client) -> AsyncClient:
-    """A signed-in client that can parse, whose library keeps originals under tmp_path."""
-    client = make_client(parse_fallback_model=FALLBACK)
-    await _ready_to_parse(client)
-    client.user_id = (await client.get("/api/me")).json()["user"]["id"]
-    return client
+    return await _library(make_client)
 
 
 def _upstream(**failing: int) -> Upstream:
-    """The first parse on MODEL, the re-convert on FALLBACK; `fallback_fails=N` makes
+    """The first parse on PARSE_MODEL, the re-convert on FALLBACK; `fallback_fails=N` makes
     FALLBACK refuse page N."""
-    answers = {(FALLBACK, page): (lambda: _answer(RECONVERTED)) for page in (1, 2, 3)}
+    answers = {(FALLBACK, page): (lambda: _completion(RECONVERTED)) for page in (1, 2, 3)}
     if "fallback_fails" in failing:
         answers[(FALLBACK, failing["fallback_fails"])] = lambda: httpx.Response(400)
     return Upstream(answers)
@@ -90,13 +84,12 @@ async def _parsed(client: AsyncClient, sessionmaker, documents) -> dict:
 
 def _directory(client: AsyncClient) -> Path:
     """The uploaded PDF's directory in the workspace."""
-    return user_root(client.app.state.settings.workspaces_dir, client.user_id) / "files/mixed.pdf"
+    return client.root / "files/mixed.pdf"
 
 
 def _history(client: AsyncClient) -> list[git.Revision]:
     """The commits that touched the uploaded PDF's directory, newest first."""
-    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    return git.log(root, Path("files/mixed.pdf"))
+    return git.log(client.root, Path("files/mixed.pdf"))
 
 
 async def _not_taken(*args, **kwargs) -> bool:
@@ -220,7 +213,7 @@ async def test_a_failed_reconvert_leaves_the_document_and_is_retried_or_dismisse
 
     # Retried on a model that answers: only the failed page runs, and the document takes it.
     respx.post(KANO_CHAT_URL).mock(side_effect=_upstream())
-    retried = await _retry(library, uploaded["id"], model=MODEL)
+    retried = await _retry(library, uploaded["id"], model=PARSE_MODEL)
     assert retried.status_code == 202, retried.text
     assert retried.json()["job_id"] == new_job
     await _drain_queue(library, sessionmaker)
@@ -250,7 +243,7 @@ async def test_a_failed_reconvert_gives_way_to_a_new_one(library, sessionmaker, 
     failed = (await _reconvert(library, uploaded["id"], model=FALLBACK)).json()["job_id"]
     await _drain_queue(library, sessionmaker)
 
-    again = await _reconvert(library, uploaded["id"], model=MODEL)
+    again = await _reconvert(library, uploaded["id"], model=PARSE_MODEL)
     assert again.status_code == 202, again.text
     assert (await _row(library, uploaded["id"]))["reconvert"] is not None
     async with sessionmaker() as db:
@@ -262,7 +255,7 @@ async def test_a_failed_reconvert_gives_way_to_a_new_one(library, sessionmaker, 
 async def test_only_a_parsed_document_with_its_original_is_reconverted(
     library, sessionmaker, documents
 ) -> None:
-    upstream = Upstream({(MODEL, 2): lambda: httpx.Response(400)})
+    upstream = Upstream({(PARSE_MODEL, 2): lambda: httpx.Response(400)})
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
 
     # A markdown document has no parse.
@@ -282,8 +275,7 @@ async def test_only_a_parsed_document_with_its_original_is_reconverted(
     respx.post(KANO_CHAT_URL).mock(side_effect=_upstream())
     assert (await _retry(library, uploaded["id"])).status_code == 202
     await _drain_queue(library, sessionmaker)
-    root = user_root(library.app.state.settings.workspaces_dir, library.user_id)
-    original_of(root, uploaded["id"]).unlink()
+    original_of(library.root, uploaded["id"]).unlink()
     refused = await _reconvert(library, uploaded["id"])
     assert refused.status_code == 409
     assert "kept no original" in refused.json()["error"]["message"]

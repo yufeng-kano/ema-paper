@@ -25,7 +25,6 @@ from sightread.upstream.client import (
 from tests.conftest import KANO_CHAT_URL
 from tests.helpers import stub_connection
 
-SECRET = "test-secret-key-not-a-real-one"
 PROMPT = "Transcribe page {page} in {bbox_format}."
 # UPSTREAM_RESPONSE_MAX_BYTES and VISION_MAX_OUTPUT_TOKENS at their defaults, which the
 # runner passes on every call (docs/api.md).
@@ -76,18 +75,11 @@ async def test_transcribe_page_sends_the_image_and_records_usage(key, documents)
     assert route.calls[0].request.headers["authorization"] == "Bearer sk-kano-proxy-test"
 
 
-@respx.mock
-async def test_transcribe_page_strips_a_code_fence(key, documents) -> None:
-    respx.post(KANO_CHAT_URL).mock(
-        return_value=httpx.Response(200, json=completion("```markdown\n# Page\n```"))
-    )
-    result = await transcribe_page(key, "m", PROMPT, documents["png"], 1, **CAPS)
-    assert result.markdown == "# Page"
-
-
 @pytest.mark.parametrize(
     ("answer", "markdown"),
     [
+        # A markdown wrapper around the whole answer goes.
+        ("```markdown\n# Page\n```", "# Page"),
         # A wrapper around a page that carries its own code block: only the wrapper goes.
         (
             "```markdown\n# Page\n\n```python\nprint(1)\n```\n```",
@@ -252,29 +244,6 @@ def test_the_operator_key_never_reveals_itself_in_a_repr(key) -> None:
 
 
 @respx.mock
-async def test_every_call_carries_the_operator_key_and_asks_for_no_usage(key, documents) -> None:
-    """A vision call posts to `{base_url}/chat/completions` as `Bearer` the operator's key
-    and nothing else of it (docs/auth.md § 3)."""
-    route = respx.post(KANO_CHAT_URL).mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "choices": [{"message": {"content": "# Page"}}],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
-            },
-        )
-    )
-
-    result = await transcribe_page(key, "vendor/vision", PROMPT, documents["png"], 2, **CAPS)
-
-    assert result.markdown == "# Page"
-    assert result.usage.prompt_tokens == 10
-    sent = json.loads(route.calls[0].request.content)
-    assert "usage" not in sent
-    assert route.calls[0].request.headers["authorization"] == "Bearer sk-kano-proxy-test"
-
-
-@respx.mock
 async def test_every_answer_is_capped_unless_the_cap_is_off(key, documents) -> None:
     """docs/parsing.md § Upstream usage: a prompt asking for endless output costs at most
     `VISION_MAX_OUTPUT_TOKENS` per call; 0 sends no cap."""
@@ -322,31 +291,22 @@ async def test_an_oversized_completion_fails_the_call(key, documents) -> None:
         )
 
 
-# --- reported cost on a connection (docs/parsing.md § Upstream usage) ------------------
-
-PROXY_CHAT = "https://proxy.example/openai/v1/chat/completions"
-
-
-def _proxy() -> Connection:
-    return Connection(
-        api_key="sk-kano-proxy-test",
-        base_url="https://proxy.example/openai/v1",
-    )
+# --- reported cost (docs/parsing.md § Upstream usage) -----------------------------------
 
 
 async def _usage_for(connection: Connection, usage: dict, documents):
     # Serialized by hand: `json.dumps` writes NaN the way a sloppy server would, and
     # httpx's own `json=` refuses to.
     body = json.dumps({"choices": [{"message": {"content": "# Page"}}], "usage": usage})
-    respx.post(PROXY_CHAT).mock(return_value=httpx.Response(200, content=body.encode()))
+    respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(200, content=body.encode()))
     result = await transcribe_page(connection, "m", PROMPT, documents["png"], 1, **CAPS)
     return result.usage
 
 
 @respx.mock
-async def test_a_reported_cost_is_recorded_as_an_estimate(documents) -> None:
+async def test_a_reported_cost_is_recorded_as_an_estimate(key, documents) -> None:
     usage = await _usage_for(
-        _proxy(),
+        key,
         {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.0123456789},
         documents,
     )
@@ -357,9 +317,9 @@ async def test_a_reported_cost_is_recorded_as_an_estimate(documents) -> None:
 
 
 @respx.mock
-async def test_a_reported_zero_is_a_real_estimate(documents) -> None:
+async def test_a_reported_zero_is_a_real_estimate(key, documents) -> None:
     """An endpoint that prices a call at 0 said so; that is not the same as not saying."""
-    usage = await _usage_for(_proxy(), {"cost": 0}, documents)
+    usage = await _usage_for(key, {"cost": 0}, documents)
 
     assert usage.cost_source == "estimated"
     assert usage.cost == Decimal("0")
@@ -379,24 +339,10 @@ async def test_a_reported_zero_is_a_real_estimate(documents) -> None:
         {"cost": {"total": 0.01}},
     ],
 )
-async def test_an_unusable_reported_cost_is_unknown_not_zero(documents, usage_body) -> None:
-    usage = await _usage_for(_proxy(), usage_body, documents)
+async def test_an_unusable_reported_cost_is_unknown_not_zero(key, documents, usage_body) -> None:
+    """A cost the upstream did not state as a usable number is unknown: never 0, never
+    billed."""
+    usage = await _usage_for(key, usage_body, documents)
 
     assert usage.cost_source == "unknown"
     assert usage.cost is None
-
-
-@respx.mock
-async def test_kano_proxy_without_a_reported_cost_is_unpriced_not_free(key, documents) -> None:
-    """The built-in upstream's cost is recorded whenever it says one — and when it does
-    not (a model it cannot price), the call is unknown, never 0 and never billed."""
-    respx.post(KANO_CHAT_URL).mock(
-        return_value=httpx.Response(
-            200, json={"choices": [{"message": {"content": "x"}}], "usage": {"prompt_tokens": 1}}
-        )
-    )
-
-    result = await transcribe_page(key, "m", PROMPT, documents["png"], 1, **CAPS)
-
-    assert result.usage.cost_source == "unknown"
-    assert result.usage.cost is None

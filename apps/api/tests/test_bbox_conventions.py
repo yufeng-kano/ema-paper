@@ -27,8 +27,6 @@ from sightread.upstream.client import transcribe_page
 from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL
 from tests.helpers import stub_connection
 
-SECRET = "test-secret-key-not-a-real-one"
-
 
 @pytest.mark.parametrize(
     ("model", "expected"),
@@ -90,7 +88,7 @@ def test_pixel_boxes_are_rewritten_into_the_stored_contract() -> None:
     )
 
 
-def test_only_claude_gets_a_pre_resized_image(documents) -> None:
+def test_only_claude_gets_a_pre_resized_image(documents, tmp_path) -> None:
     wide = documents["wide_png"]  # 3000x1000, over every Claude limit
     as_is = prepare_image(wide, bbox.GPT)
     assert (as_is.path, as_is.derived) == (wide, False)
@@ -107,7 +105,7 @@ def test_only_claude_gets_a_pre_resized_image(documents) -> None:
     assert not small.derived
 
     # A JPEG is re-encoded at the normalizer's quality, not Pillow's default.
-    wide_jpg = wide.with_name("wide.jpg")
+    wide_jpg = tmp_path / "wide.jpg"
     Image.open(wide).convert("RGB").save(wide_jpg, format="JPEG", quality=JPEG_QUALITY)
     sent_jpg = prepare_image(wide_jpg, bbox.CLAUDE)
     with Image.open(sent_jpg.path) as reencoded:
@@ -115,7 +113,6 @@ def test_only_claude_gets_a_pre_resized_image(documents) -> None:
         # Pillow's quality-75 tables start at 8; the quality-92 ones start at 3.
         assert reencoded.quantization[0][0] <= 3
     sent_jpg.cleanup()
-    wide_jpg.unlink()
 
 
 @respx.mock

@@ -1,7 +1,7 @@
 """`POST /v1/parse` through the worker to the result, with Kano Proxy stubbed.
 
-This is the phase's integration test: a real PDF, real Poppler subprocesses, a real claim
-cycle, and not one byte of live upstream traffic (docs/testing.md § Cost safety).
+A real PDF, real Poppler subprocesses, a real claim cycle, and not one byte of live
+upstream traffic (docs/testing.md § Cost safety).
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from sqlalchemy import select
 from sightread.agents.parse import PIPELINE_VERSION
 from sightread.db.models import Job, JobPage, UsageLog
 from sightread.jobs.queue import claim_next_job
-from sightread.jobs.runner import run_job
+from sightread.jobs.runner import VisionBudget, run_job
 from tests.conftest import (
     CSRF_HEADERS,
     KANO_API_KEY,
@@ -43,11 +43,12 @@ VISION_MARKDOWN = (
 )
 
 
-def _completion(content: str) -> httpx.Response:
+def _completion(content: str = VISION_MARKDOWN, finish_reason: str = "stop") -> httpx.Response:
+    """A chat completion that answers `content`, billed at a fixed usage."""
     return httpx.Response(
         200,
         json={
-            "choices": [{"message": {"content": content}}],
+            "choices": [{"message": {"content": content}, "finish_reason": finish_reason}],
             "usage": {"prompt_tokens": 900, "completion_tokens": 120, "cost": 0.0015},
         },
     )
@@ -55,7 +56,20 @@ def _completion(content: str) -> httpx.Response:
 
 def _vision_stub(request: httpx.Request) -> httpx.Response:
     """Every page is a vision transcription (docs/parsing.md § Vision-only conversion)."""
-    return _completion(VISION_MARKDOWN)
+    return _completion()
+
+
+def _spy_on_halving(monkeypatch) -> list[int]:
+    """Record the job budget's limit each time a rate limit halves it."""
+    halved: list[int] = []
+    original = VisionBudget.halve
+
+    async def spy(self: VisionBudget) -> None:
+        halved.append(self.limit)
+        await original(self)
+
+    monkeypatch.setattr(VisionBudget, "halve", spy)
+    return halved
 
 
 async def _drain_queue(client: AsyncClient, sessionmaker) -> uuid.UUID | None:
@@ -206,7 +220,8 @@ async def test_second_identical_upload_is_served_from_the_cache(
 
     forced = await v1_upload(api_client, documents["text_pdf"], force="true")
     assert forced.status_code == 202
-    assert forced.json()["job_id"] != cached.json().get("job_id")
+    assert forced.json()["status"] == "queued"
+    assert forced.json()["job_id"] != cached.json()["meta"]["job_id"]
 
 
 @respx.mock
@@ -214,7 +229,7 @@ async def test_a_page_that_cannot_be_transcribed_fails_the_job(
     api_client, sessionmaker, documents
 ) -> None:
     # A 400 is not retried, so the second response is the other page's.
-    responses = [httpx.Response(400), _completion(VISION_MARKDOWN)]
+    responses = [httpx.Response(400), _completion()]
     respx.post(KANO_CHAT_URL).mock(side_effect=responses)
 
     accepted = await v1_upload(api_client, documents["mixed_pdf"], pages="1,2")
@@ -237,7 +252,7 @@ async def test_a_page_that_cannot_be_transcribed_fails_the_job(
 
 
 @respx.mock
-async def test_a_wholly_failed_job_names_the_page_reasons(
+async def test_a_failure_that_would_repeat_fails_the_page_after_one_call(
     api_client, sessionmaker, documents
 ) -> None:
     respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(400))
@@ -246,9 +261,11 @@ async def test_a_wholly_failed_job_names_the_page_reasons(
     job_id = accepted.json()["job_id"]
     await _drain_queue(api_client, sessionmaker)
 
+    # A wholly failed job names each page's reason.
     status = (await api_client.get(f"/v1/jobs/{job_id}")).json()
     assert status["status"] == "failed"
     assert status["error"] == "1 of 1 pages failed (page 1: upstream call failed)"
+    assert respx.calls.call_count == 1
 
 
 @respx.mock
@@ -313,10 +330,11 @@ async def test_rate_limits_back_off_and_shrink_the_job_budget(
     api_client, sessionmaker, documents, monkeypatch
 ) -> None:
     monkeypatch.setattr("sightread.upstream.client.VISION_BACKOFF_BASE_SECONDS", 0.001)
+    halved = _spy_on_halving(monkeypatch)
     respx.post(KANO_CHAT_URL).mock(
         side_effect=[
             httpx.Response(429, headers={"Retry-After": "0"}),
-            _completion(VISION_MARKDOWN),
+            _completion(),
         ]
     )
 
@@ -327,6 +345,8 @@ async def test_rate_limits_back_off_and_shrink_the_job_budget(
     status = (await api_client.get(f"/v1/jobs/{job_id}")).json()
     assert status["status"] == "succeeded"
     assert respx.calls.call_count == 2
+    # The one rate limit halved the job's concurrency once (docs/parsing.md § Upstream usage).
+    assert len(halved) == 1
 
 
 @respx.mock
@@ -334,11 +354,12 @@ async def test_a_transient_failure_is_retried_before_the_page_is_given_up(
     api_client, sessionmaker, documents, monkeypatch
 ) -> None:
     monkeypatch.setattr("sightread.upstream.client.VISION_BACKOFF_BASE_SECONDS", 0.001)
+    halved = _spy_on_halving(monkeypatch)
     respx.post(KANO_CHAT_URL).mock(
         side_effect=[
             httpx.Response(503),
             httpx.ConnectError("reset"),
-            _completion(VISION_MARKDOWN),
+            _completion(),
         ]
     )
 
@@ -350,6 +371,8 @@ async def test_a_transient_failure_is_retried_before_the_page_is_given_up(
     assert result["errors"] == []
     assert result["markdown"]
     assert respx.calls.call_count == 3
+    # A transient failure is retried at the same concurrency.
+    assert halved == []
 
 
 @respx.mock
@@ -370,18 +393,6 @@ async def test_a_failure_that_stays_transient_fails_the_page_after_the_last_atte
 
 
 @respx.mock
-async def test_a_failure_that_would_repeat_is_not_retried(
-    api_client, sessionmaker, documents
-) -> None:
-    respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(400))
-
-    await v1_upload(api_client, documents["text_pdf"])
-    await _drain_queue(api_client, sessionmaker)
-
-    assert respx.calls.call_count == 1
-
-
-@respx.mock
 async def test_a_page_the_model_has_nothing_to_say_about_is_blank_not_failed(
     api_client, sessionmaker, documents, monkeypatch
 ) -> None:
@@ -391,7 +402,7 @@ async def test_a_page_the_model_has_nothing_to_say_about_is_blank_not_failed(
     blank = httpx.Response(
         200, json={"choices": [{"message": {"content": None}, "finish_reason": "stop"}]}
     )
-    respx.post(KANO_CHAT_URL).mock(side_effect=[blank, _completion(VISION_MARKDOWN)])
+    respx.post(KANO_CHAT_URL).mock(side_effect=[blank, _completion()])
 
     accepted = await v1_upload(api_client, documents["mixed_pdf"], pages="1,2")
     job_id = accepted.json()["job_id"]
@@ -446,7 +457,7 @@ async def test_an_answer_that_ended_early_is_billed_on_every_attempt(
             "usage": {"prompt_tokens": 700, "completion_tokens": 0},
         },
     )
-    respx.post(KANO_CHAT_URL).mock(side_effect=[ended, _completion(VISION_MARKDOWN)])
+    respx.post(KANO_CHAT_URL).mock(side_effect=[ended, _completion()])
 
     accepted = await v1_upload(api_client, documents["text_pdf"])
     job_id = accepted.json()["job_id"]

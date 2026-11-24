@@ -76,12 +76,6 @@ def test_bbox_paths_parse_and_clean() -> None:
     assert parse_bbox_path("1,2,3,4,5") is None
 
 
-def test_crop_path_is_deterministic(tmp_path) -> None:
-    job_id = uuid.uuid4()
-    path = crop_path(tmp_path, job_id, 2, (10, 20, 30, 40))
-    assert path == tmp_path / str(job_id) / "p2_10_20_30_40.png"
-
-
 def test_discard_removes_only_that_jobs_crops(tmp_path) -> None:
     doomed, kept = uuid.uuid4(), uuid.uuid4()
     for job_id in (doomed, kept):

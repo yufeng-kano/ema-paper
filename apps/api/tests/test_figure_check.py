@@ -33,8 +33,9 @@ from sightread.parsing.figure_check import (
     read_verdicts,
 )
 from sightread.parsing.figures import CROP_MARGIN, crop_rect
-from tests.conftest import KANO_CHAT_URL
-from tests.test_parse_end_to_end import MODEL, _completion, _drain_queue
+from tests.conftest import KANO_CHAT_URL, PARSE_MODEL
+from tests.helpers import v1_upload
+from tests.test_parse_end_to_end import _completion, _drain_queue
 
 # A chart's plotted area on a 1000 x 1000 page, and the box a model that boxes only that
 # area draws around it: its crop runs from 292 to 708 on both axes.
@@ -266,7 +267,7 @@ async def _parse_image(client: AsyncClient, sessionmaker, path: Path) -> str:
     accepted = await client.post(
         "/v1/parse",
         files={"file": (path.name, path.read_bytes(), "image/png")},
-        data={"model": MODEL},
+        data={"model": PARSE_MODEL},
     )
     assert accepted.status_code == 202, accepted.text
     await _drain_queue(client, sessionmaker)
@@ -312,7 +313,7 @@ async def test_a_box_the_rules_moved_is_confirmed_by_the_model(
     # The page's own model was shown the page with the moved box's crop drawn on it, clear
     # of the title, and the crop in its convention.
     [asked] = upstream.checks
-    assert asked["model"] == MODEL
+    assert asked["model"] == PARSE_MODEL
     prompt, image = _sent(asked)
     assert "1: [292, 268, 708, 708]" in prompt
     assert image.getpixel((267, 500)) == MARK
@@ -435,7 +436,7 @@ async def test_a_job_queued_before_the_check_runs_without_it(
     accepted = await api_client.post(
         "/v1/parse",
         files={"file": (path.name, path.read_bytes(), "image/png")},
-        data={"model": MODEL},
+        data={"model": PARSE_MODEL},
     )
     job_id = accepted.json()["job_id"]
     async with sessionmaker() as db:
@@ -474,11 +475,7 @@ async def test_a_rendered_pdf_page_is_checked_too(api_client, sessionmaker, tmp_
     upstream = Upstream(CHART, (OK,))
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
 
-    accepted = await api_client.post(
-        "/v1/parse",
-        files={"file": (path.name, path.read_bytes(), "application/pdf")},
-        data={"model": MODEL},
-    )
+    accepted = await v1_upload(api_client, path)
     job_id = accepted.json()["job_id"]
     await _drain_queue(api_client, sessionmaker)
 
@@ -503,11 +500,7 @@ async def test_a_kept_page_keeps_its_statuses_and_is_not_checked_again(
     margin = "![fig](sightread://p{page}/900,100,980,900)\nFigure: a margin"
     upstream = Upstream(margin.format(page=2))
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
-    accepted = await api_client.post(
-        "/v1/parse",
-        files={"file": ("mixed.pdf", documents["mixed_pdf"].read_bytes(), "application/pdf")},
-        data={"model": MODEL},
-    )
+    accepted = await v1_upload(api_client, documents["mixed_pdf"])
     job_id = uuid.UUID(accepted.json()["job_id"])
     async with sessionmaker() as db:
         db.add_all(
@@ -518,7 +511,7 @@ async def test_a_kept_page_keeps_its_statuses_and_is_not_checked_again(
                     method="vision",
                     status="succeeded",
                     markdown=margin.format(page=page_no),
-                    model=MODEL,
+                    model=PARSE_MODEL,
                     figures=figures,
                 )
                 for page_no, figures in ((1, {"900,100,980,900": "unverified"}), (3, None))
@@ -540,14 +533,14 @@ async def test_a_kept_page_keeps_its_statuses_and_is_not_checked_again(
 
 
 def test_a_running_jobs_snapshot_carries_its_finished_pages_statuses() -> None:
-    job = Job(id=uuid.uuid4(), agent="parse", model=MODEL, bbox_format="yxyx_norm1000")
+    job = Job(id=uuid.uuid4(), agent="parse", model=PARSE_MODEL, bbox_format="yxyx_norm1000")
     rows = [
         JobPage(
             page_no=1,
             method="vision",
             status="succeeded",
             markdown="![fig](sightread://p1/10,10,20,20)\n",
-            model=MODEL,
+            model=PARSE_MODEL,
             figures={"10,10,20,20": "adjusted"},
         )
     ]

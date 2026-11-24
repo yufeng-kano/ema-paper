@@ -22,13 +22,11 @@ from sightread.jobs.check import CheckFailed, run_check
 from sightread.parsing import joins
 from sightread.routes.library import document_payload
 from sightread.upstream.anthropic import ChatUsage
-from sightread.workspace.layout import user_root
 from tests.chat_helpers import MESSAGES_URL, assistant_turn, sse
-from tests.conftest import CSRF_HEADERS, KANO_API_KEY, KANO_CHAT_URL, TEST_SECRET_KEY
-from tests.helpers import job_by_id, stub_connection
-from tests.test_library import MODEL, _ready_to_parse
-from tests.test_parse_end_to_end import _drain_queue
-from tests.test_retry_failed_pages import FALLBACK, Upstream, _answer, _retry, _row, _upload
+from tests.conftest import CSRF_HEADERS, KANO_API_KEY, KANO_CHAT_URL, PARSE_MODEL, TEST_SECRET_KEY
+from tests.helpers import job_by_id, stub_connection, v1_parse
+from tests.test_parse_end_to_end import _completion, _drain_queue
+from tests.test_retry_failed_pages import FALLBACK, Upstream, _library, _retry, _row, _upload
 
 # Three pages a vision model might send back for a paper: a sentence the first page break
 # cuts before a capital, a bold run left open, and a word the second break hyphenates.
@@ -447,18 +445,12 @@ async def test_the_spots_past_the_cap_stay_as_they_are() -> None:
 
 @pytest.fixture
 async def library(make_client) -> AsyncClient:
-    from tests.test_library import _ready_to_parse
-
-    # The deployment names a fallback, the model a retry may send failed pages to.
-    client = make_client(parse_fallback_model=FALLBACK)
-    await _ready_to_parse(client)
-    client.user_id = (await client.get("/api/me")).json()["user"]["id"]
-    return client
+    return await _library(make_client)
 
 
 def _vision() -> Upstream:
     return Upstream(
-        {(MODEL, page): (lambda text=text: _answer(text)) for page, text in PAGES.items()}
+        {(PARSE_MODEL, page): (lambda text=text: _completion(text)) for page, text in PAGES.items()}
     )
 
 
@@ -485,7 +477,7 @@ async def test_a_files_upload_opens_checked(library, sessionmaker, documents) ->
     job = await job_by_id(sessionmaker, uploaded["job_id"])
     # Snapshotted at the upload: no model of its own is the parse's, and the default prompt.
     assert (job.check_model, job.check_effort, job.check_prompt) == (
-        MODEL,
+        PARSE_MODEL,
         "medium",
         CHECK.default_prompt_template,
     )
@@ -499,15 +491,14 @@ async def test_a_files_upload_opens_checked(library, sessionmaker, documents) ->
         )
     # The transcription is kept exactly; the reading copy is what the document opens on.
     assert (result.markdown, result.reading_markdown) == (TRANSCRIPTION, READING)
-    assert result.meta["check"] == {"model": MODEL, "joins": 2, "edits": 1}
+    assert result.meta["check"] == {"model": PARSE_MODEL, "joins": 2, "edits": 1}
     assert len(agent.calls) == 2
-    assert [(row.job_id, row.model) for row in usage] == [(job.id, MODEL)] * 2
+    assert [(row.job_id, row.model) for row in usage] == [(job.id, PARSE_MODEL)] * 2
 
     content = await library.get(f"/api/library/documents/{uploaded['id']}/content")
     assert content.status_code == 200, content.text
     assert content.json()["markdown"] == READING
-    root = user_root(library.app.state.settings.workspaces_dir, library.user_id)
-    baseline = root / ".sightread" / "results" / uploaded["job_id"] / "result.md"
+    baseline = library.root / ".sightread" / "results" / uploaded["job_id"] / "result.md"
     assert baseline.read_text() == TRANSCRIPTION
     # The result route reads the transcription.
     api_result = await library.get(f"/api/library/documents/{uploaded['id']}/result")
@@ -584,10 +575,10 @@ async def test_a_retry_checks_on_the_model_it_names_when_the_check_has_none(
     respx.post(KANO_CHAT_URL).mock(
         side_effect=Upstream(
             {
-                (MODEL, 1): lambda: _answer(PAGES[1]),
-                (MODEL, 2): lambda: _answer("", "content_filter"),
-                (MODEL, 3): lambda: _answer(PAGES[3]),
-                (FALLBACK, 2): lambda: _answer(PAGES[2]),
+                (PARSE_MODEL, 1): lambda: _completion(PAGES[1]),
+                (PARSE_MODEL, 2): lambda: _completion("", "content_filter"),
+                (PARSE_MODEL, 3): lambda: _completion(PAGES[3]),
+                (FALLBACK, 2): lambda: _completion(PAGES[2]),
             }
         )
     )
@@ -610,8 +601,7 @@ async def test_a_retry_checks_on_the_model_it_names_when_the_check_has_none(
 async def test_the_check_takes_its_own_settings(make_client, sessionmaker, documents) -> None:
     """Its model is the deployment's `CHECK_MODEL`; the effort and the instructions are
     the reader's (docs/agents.md § Enqueue rules)."""
-    library = make_client(check_model="claude-code/claude-haiku-5-5")
-    await _ready_to_parse(library)
+    library = await _library(make_client, check_model="claude-code/claude-haiku-5-5")
     saved = await library.put(
         "/api/agents/check/settings",
         json={"effort": "low", "instructions": "Use $."},
@@ -637,25 +627,21 @@ async def test_no_check_when_switched_off_and_an_api_parse_checked_as_an_upload(
     uploaded = await _upload(library, documents["mixed_pdf"])
     assert (await job_by_id(sessionmaker, uploaded["job_id"])).check_model is None
 
-    # An API parse — the connector's too — is checked as a Files upload is, since
-    # 2026-10-31 (docs/parsing.md § Format check); test_data_plane_parity.py reads it back.
+    # An API parse — the connector's too — is checked as a Files upload is (docs/parsing.md
+    # § Format check); test_data_plane_parity.py reads it back.
     on = await library.put(
         "/api/agents/check/settings", json={"auto_check": True}, headers=CSRF_HEADERS
     )
     assert on.status_code == 200, on.text
     created = await library.post("/api/keys", json={"name": "api"}, headers=CSRF_HEADERS)
-    accepted = await library.post(
-        "/v1/parse",
-        files={"file": ("doc.pdf", documents["text_pdf"].read_bytes(), "application/pdf")},
-        headers={"Authorization": f"Bearer {created.json()['key']}"},
-    )
+    accepted = await v1_parse(library, documents["text_pdf"], created.json()["key"])
     assert accepted.status_code == 202, accepted.text
-    assert (await job_by_id(sessionmaker, accepted.json()["job_id"])).check_model == MODEL
+    assert (await job_by_id(sessionmaker, accepted.json()["job_id"])).check_model == PARSE_MODEL
 
 
 def test_checking_is_a_running_parse_past_its_last_page_with_a_check() -> None:
     def payload(**fields) -> dict:
-        state = {"status": "running", "pages_done": 3, "check_model": MODEL, **fields}
+        state = {"status": "running", "pages_done": 3, "check_model": PARSE_MODEL, **fields}
         job = Job(id=uuid.uuid4(), kind="pdf", pages_spec=None, page_count=3, **state)
         return document_payload(Document(id=1, name="a.pdf", job_id=job.id), job)
 
@@ -683,7 +669,7 @@ async def test_each_agent_takes_only_its_own_settings(library) -> None:
         ("chat", {"auto_check": False}),
         ("parse", {"instructions": "x"}),
         ("check", {"auto_fallback": True}),
-        ("check", {"model": MODEL}),
+        ("check", {"model": PARSE_MODEL}),
         ("check", {"answer_language": "en"}),
         ("check", {"memory_auto": False}),
         ("check", {"auto_check": None}),
