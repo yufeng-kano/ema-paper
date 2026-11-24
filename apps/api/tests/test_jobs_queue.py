@@ -525,6 +525,15 @@ def test_sweeper_keeps_a_live_jobs_source_however_old(tmp_path) -> None:
     assert [entry.exists() for entry in entries] == [True, True, True, False]
 
 
+# The limits a run carries from the settings, at their defaults (docs/api.md).
+RUN_LIMITS = {
+    "max_response_bytes": 33_554_432,
+    "max_output_tokens": 16_000,
+    "figures_per_page": 40,
+    "figure_check_rounds": 2,
+}
+
+
 def test_a_discarded_jobs_figures_cannot_be_written_back(tmp_path) -> None:
     """The crop guard: after `_discard_figures`, a late crop thread writes nothing
     (docs/parsing.md § Figure crops)."""
@@ -534,7 +543,7 @@ def test_a_discarded_jobs_figures_cannot_be_written_back(tmp_path) -> None:
 
     image = tmp_path / "page.png"
     Image.new("RGB", (100, 100), (10, 10, 10)).save(image, format="PNG")
-    state = RunState(budget=VisionBudget(1), figures_dir=tmp_path / "job")
+    state = RunState(budget=VisionBudget(1), figures_dir=tmp_path / "job", **RUN_LIMITS)
 
     _locked_save_figures(state, "![fig](sightread://p1/0,0,500,500)", image, 1)
     assert (tmp_path / "job" / "p1_0_0_500_500.png").is_file()
@@ -658,8 +667,8 @@ def test_an_attempts_crops_are_its_own_until_published(tmp_path) -> None:
 
     job_id = uuid.uuid4()
     figures = tmp_path / "figures"
-    stale = RunState(budget=VisionBudget(1), figures_dir=figures / f"{job_id}.stale")
-    fresh = RunState(budget=VisionBudget(1), figures_dir=figures / f"{job_id}.fresh")
+    stale = RunState(budget=VisionBudget(1), figures_dir=figures / f"{job_id}.stale", **RUN_LIMITS)
+    fresh = RunState(budget=VisionBudget(1), figures_dir=figures / f"{job_id}.fresh", **RUN_LIMITS)
     for state in (stale, fresh):
         state.figures_dir.mkdir(parents=True)
         (state.figures_dir / "p1_0_0_10_10.png").write_bytes(b"png")

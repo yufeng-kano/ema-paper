@@ -51,7 +51,14 @@ def clean_bbox(values: tuple[int, int, int, int]) -> tuple[int, int, int, int] |
     return y_min, x_min, y_max, x_max
 
 
-def placeholder(figure_id: str, page: int, bbox: tuple[int, int, int, int]) -> str:
+def match_bbox(match: re.Match[str]) -> tuple[int, int, int, int] | None:
+    """A `PLACEHOLDER_RE` match's box, cleaned (`clean_bbox`)."""
+    return clean_bbox(tuple(int(match.group(name)) for name in ("ymin", "xmin", "ymax", "xmax")))
+
+
+def placeholder(figure_id: str, page: int | str, bbox: tuple[int, int, int, int]) -> str:
+    """The placeholder of one figure. `page` may be the digits a model wrote, kept as
+    they were."""
     y_min, x_min, y_max, x_max = bbox
     return f"![{figure_id}](sightread://p{page}/{y_min},{x_min},{y_max},{x_max})"
 
@@ -91,14 +98,7 @@ def assemble(pages: list[PageMarkdown]) -> AssembledDocument:
         for match in PLACEHOLDER_RE.finditer(page.markdown):
             parts.append(page.markdown[cursor : match.start()])
             cursor = match.end()
-            bbox = clean_bbox(
-                (
-                    int(match.group("ymin")),
-                    int(match.group("xmin")),
-                    int(match.group("ymax")),
-                    int(match.group("xmax")),
-                )
-            )
+            bbox = match_bbox(match)
             if bbox is None:
                 dropped += 1
                 continue

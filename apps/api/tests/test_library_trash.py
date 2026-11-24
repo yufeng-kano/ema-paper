@@ -31,7 +31,14 @@ from tests.conftest import CSRF_HEADERS
 from tests.test_document_images import _image, _insert
 from tests.test_markdown_documents import _new, _upload_markdown
 
-RESULT = {"markdown": "# Paper\n", "pages": [], "figures": [], "errors": [], "meta": {}}
+RESULT = {
+    "markdown": "# Paper\n",
+    "pages": [],
+    "figures": [],
+    "errors": [],
+    "meta": {},
+    "reading_markdown": None,
+}
 
 
 @pytest.fixture

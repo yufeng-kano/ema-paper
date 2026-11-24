@@ -14,6 +14,9 @@ from sightread.parsing.figures import (
     save_page_figures,
 )
 
+# FIGURES_PER_PAGE_MAX at its default (docs/api.md).
+LIMIT = 40
+
 
 def _page_image(path, size=(1000, 500), color=(200, 10, 10)):
     Image.new("RGB", size, color).save(path, format="PNG")
@@ -28,7 +31,7 @@ def test_placeholders_are_cropped_under_our_page_number(tmp_path) -> None:
         "![fig](sightread://p9/700,0,900,1000)\n"
     )
 
-    saved = save_page_figures(markdown, image, 3, tmp_path / "job")
+    saved = save_page_figures(markdown, image, 3, tmp_path / "job", limit=LIMIT)
 
     assert saved == 2
     # Named by OUR page number and the cleaned bbox — what the placeholder will carry.
@@ -46,15 +49,19 @@ def test_placeholders_are_cropped_under_our_page_number(tmp_path) -> None:
 
 def test_degenerate_and_absent_boxes_save_nothing(tmp_path) -> None:
     image = _page_image(tmp_path / "page.png")
-    assert save_page_figures("no figures here", image, 1, tmp_path / "job") == 0
+    assert save_page_figures("no figures here", image, 1, tmp_path / "job", limit=LIMIT) == 0
     degenerate = "![fig](sightread://p1/500,500,100,100)"
-    assert save_page_figures(degenerate, image, 1, tmp_path / "job") == 0
+    assert save_page_figures(degenerate, image, 1, tmp_path / "job", limit=LIMIT) == 0
     assert not (tmp_path / "job").exists()
 
 
 def test_a_missing_image_is_swallowed(tmp_path) -> None:
     saved = save_page_figures(
-        "![fig](sightread://p1/0,0,500,500)", tmp_path / "gone.png", 1, tmp_path / "job"
+        "![fig](sightread://p1/0,0,500,500)",
+        tmp_path / "gone.png",
+        1,
+        tmp_path / "job",
+        limit=LIMIT,
     )
     assert saved == 0
 

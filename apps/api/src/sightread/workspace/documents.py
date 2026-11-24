@@ -22,12 +22,10 @@ import secrets
 import shutil
 import stat
 import uuid
-import warnings
 from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from PIL import Image, UnidentifiedImageError
 from sqlalchemy import Row, func, select
 from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -36,7 +34,7 @@ from ..billing import ledger
 from ..config import Settings
 from ..db.models import MARKDOWN_KIND, Document, Folder, Job, Result, utcnow
 from ..errors import ApiError
-from ..parsing.images import ImageError, normalize_image
+from ..parsing.images import ImageError, check_pixels, normalize_image
 from . import git, safe_io
 from .layout import (
     DOC_FILE,
@@ -1066,22 +1064,13 @@ def prepare_inserted_image(
     the pixel cap read from its header, then upright, flattened and downscaled as an
     attachment is (docs/workspace.md § Inserted images)."""
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(source, formats=IMAGE_FORMATS) as opened:
-                too_large = opened.width * opened.height > max_pixels
-    except (
-        UnidentifiedImageError,
-        Image.DecompressionBombError,
-        Image.DecompressionBombWarning,
-        OSError,
-        ValueError,
-    ) as exc:
+        check_pixels(source, max_pixels, IMAGE_FORMATS)
+    except ImageError as exc:
+        if exc.too_large:
+            raise ApiError(400, "invalid_request", "The image has too many pixels") from exc
         raise ApiError(
             400, "invalid_request", "The file is not a PNG, JPEG, WebP, GIF or HEIC image"
         ) from exc
-    if too_large:
-        raise ApiError(400, "invalid_request", "The image has too many pixels")
     try:
         normalized = normalize_image(
             source,

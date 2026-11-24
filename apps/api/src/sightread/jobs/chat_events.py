@@ -1,31 +1,23 @@
 """The conversation's event stream (docs/chat.md § Conversations, turns, events).
 
 The worker appends `chat_events` rows while a turn runs; the SSE route replays what a
-client missed and tails what comes next. Same shape as `events.py`: the database is the
-truth, `NOTIFY` only wakes a stream up, and a stream that never hears one still progresses
-by polling.
+client missed and tails what comes next, on `events.py`'s LISTEN/NOTIFY plumbing: the
+database is the truth, `NOTIFY` only wakes a stream up, and a stream that never hears one
+still progresses by polling.
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
-import logging
 from collections.abc import AsyncIterator
 
-import asyncpg
-from sqlalchemy import func, select, text
-from sqlalchemy.engine import make_url
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ..db.models import ChatEvent, Conversation
 from . import chat_versions
-
-logger = logging.getLogger(__name__)
-
-KEEPALIVE_SECONDS = 10.0
-POLL_INTERVAL_SECONDS = 1.0
+from .events import KEEPALIVE_SECONDS, POLL_INTERVAL_SECONDS, notify_channel, open_listener
 
 TURN_START = "turn_start"
 TEXT_DELTA = "text_delta"
@@ -72,10 +64,7 @@ async def append(db: AsyncSession, conversation_id: int, turn_id, event: str, da
     db.add(
         ChatEvent(conversation_id=conversation_id, turn_id=turn_id, seq=seq, event=event, data=data)
     )
-    if db.get_bind().dialect.name == "postgresql":
-        await db.execute(
-            text("SELECT pg_notify(:channel, '')"), {"channel": channel_for(conversation_id)}
-        )
+    await notify_channel(db, channel_for(conversation_id))
     return seq
 
 
@@ -84,27 +73,6 @@ async def emit(db: AsyncSession, conversation_id: int, turn_id, event: str, data
     seq = await append(db, conversation_id, turn_id, event, data)
     await db.commit()
     return seq
-
-
-async def _open_listener(database_url: str, conversation_id: int, wakeup: asyncio.Event):
-    url = make_url(database_url)
-    if url.get_backend_name() != "postgresql":
-        return None
-    connection = None
-    try:
-        connection = await asyncpg.connect(
-            url.set(drivername="postgresql").render_as_string(hide_password=False)
-        )
-        await connection.add_listener(channel_for(conversation_id), lambda *_: wakeup.set())
-    except (OSError, asyncpg.PostgresError):
-        logger.warning("conversation event listener unavailable; falling back to polling")
-        if connection is not None:
-            # Opened, then refused LISTEN (a proxy in between): closed, or every stream
-            # opened under that condition would hold one connection for nothing.
-            with contextlib.suppress(Exception):
-                await connection.close()
-        return None
-    return connection
 
 
 # Rows read per query when replaying a conversation's events: a long thread is streamed
@@ -188,7 +156,9 @@ async def stream_conversation_events(
     Ends once no turn is queued or running and the replay is complete — the client reopens
     the stream when it sends again, and when it switches versions."""
     wakeup = asyncio.Event()
-    listener = await _open_listener(database_url, conversation_id, wakeup)
+    listener = await open_listener(
+        database_url, channel_for(conversation_id), wakeup, "conversation"
+    )
     on_branch, opened_at = await _shown_branch(sessionmaker, conversation_id)
     cursor = after
     silent_for = 0.0

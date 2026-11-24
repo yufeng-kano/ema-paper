@@ -22,7 +22,7 @@ from typing import BinaryIO
 
 from PIL import Image
 
-from .markdown import BBOX_MAX, PLACEHOLDER_RE, clean_bbox
+from .markdown import BBOX_MAX, PLACEHOLDER_RE, clean_bbox, match_bbox
 
 logger = logging.getLogger(__name__)
 
@@ -45,10 +45,16 @@ def parse_bbox_path(raw: str) -> Bbox | None:
     return clean_bbox(tuple(int(group) for group in match.groups()))
 
 
+def crop_name(page: int, bbox: Bbox) -> str:
+    """The file name of one figure's crop: the page and the cleaned box, as a job's figures
+    directory and a document's `figures/` both name it (docs/parsing.md § Figure crops)."""
+    y_min, x_min, y_max, x_max = bbox
+    return f"p{page}_{y_min}_{x_min}_{y_max}_{x_max}.png"
+
+
 def crop_path(figures_dir: Path, job_id: uuid.UUID, page: int, bbox: Bbox) -> Path:
     """Where one figure's crop lives. Deterministic from the placeholder alone."""
-    y_min, x_min, y_max, x_max = bbox
-    return figures_dir / str(job_id) / f"p{page}_{y_min}_{x_min}_{y_max}_{x_max}.png"
+    return figures_dir / str(job_id) / crop_name(page, bbox)
 
 
 def find_crop(figures_dir: Path, job_id: uuid.UUID, page: int, bbox: Bbox) -> Path | None:
@@ -136,27 +142,17 @@ def publish_job_figures(figures_dir: Path, job_id: uuid.UUID, attempt: Path) -> 
         attempt.rename(final)
 
 
-DEFAULT_FIGURES_PER_PAGE = 40
-
-
-def page_boxes(markdown: str, limit: int = DEFAULT_FIGURES_PER_PAGE) -> tuple[list[Bbox], bool]:
+def page_boxes(markdown: str, *, limit: int) -> tuple[list[Bbox], bool]:
     """The page's distinct usable boxes in reading order, at most `limit` of them, and
     whether there were more (FIGURES_PER_PAGE_MAX): the boxes a page's crops and its figure
     check take (docs/parsing.md § Figure check).
 
-    The upstream response body is capped, but a malicious user-defined endpoint could
+    The upstream response body is capped, but a broken upstream or a prompt could
     otherwise turn one response into unbounded PNG encodes and durable disk."""
     boxes: list[Bbox] = []
     seen: set[Bbox] = set()
     for match in PLACEHOLDER_RE.finditer(markdown):
-        bbox = clean_bbox(
-            (
-                int(match.group("ymin")),
-                int(match.group("xmin")),
-                int(match.group("ymax")),
-                int(match.group("xmax")),
-            )
-        )
+        bbox = match_bbox(match)
         if bbox is None or bbox in seen:
             continue
         if len(boxes) >= max(0, limit):
@@ -184,7 +180,8 @@ def save_page_figures(
     image_path: Path,
     page: int,
     job_dir: Path,
-    limit: int = DEFAULT_FIGURES_PER_PAGE,
+    *,
+    limit: int,
 ) -> int:
     """Crop every placeholder on one transcribed page from its rendered image.
 
@@ -194,7 +191,7 @@ def save_page_figures(
 
     At most `limit` distinct boxes, in reading order (`page_boxes`).
     """
-    boxes, truncated = page_boxes(markdown, limit)
+    boxes, truncated = page_boxes(markdown, limit=limit)
     if truncated:
         logger.warning("page %d exceeded the per-page figure crop cap (%d)", page, limit)
     if not boxes:
@@ -209,8 +206,7 @@ def save_page_figures(
                 left, top, right, bottom = crop_rect(bbox, width, height)
                 if right <= left or bottom <= top:
                     continue
-                y_min, x_min, y_max, x_max = bbox
-                destination = job_dir / f"p{page}_{y_min}_{x_min}_{y_max}_{x_max}.png"
+                destination = job_dir / crop_name(page, bbox)
                 # Encode to a temporary name and rename: a partial result can point the
                 # viewer at this crop while it is still being written, and a name that
                 # exists must never stream as a truncated PNG.

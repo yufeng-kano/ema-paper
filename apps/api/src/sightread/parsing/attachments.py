@@ -12,14 +12,11 @@ import asyncio
 import codecs
 import tempfile
 import uuid
-import warnings
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 
-from PIL import Image, UnidentifiedImageError
-
 from . import poppler
-from .images import ImageError, normalize_image
+from .images import ImageError, check_pixels, normalize_image
 
 # By extension first: a browser reports `application/octet-stream` for whatever it has no
 # association for, which is most of what a reader drags in.
@@ -118,12 +115,11 @@ def prepared_path(upload_dir: Path, attachment_id: uuid.UUID, media_type: str) -
     return upload_dir / f"{FILE_PREFIX}{attachment_id}{suffix}"
 
 
-def _read_bounded(path: Path, max_chars: int, *, strict: bool) -> str:
+def _read_bounded(path: Path, max_chars: int) -> str:
     """The file's UTF-8 text kept to `max_chars`: the head and the tail with what went
-    missing between them said, read in slices so a long file is never held whole. With
-    `strict`, text that is not UTF-8 raises; otherwise it is replaced. NUL characters are
-    dropped: a JSONB column refuses them."""
-    decoder = codecs.getincrementaldecoder("utf-8-sig")("strict" if strict else "replace")
+    missing between them said, read in slices so a long file is never held whole. Text
+    that is not UTF-8 raises. NUL characters are dropped: a JSONB column refuses them."""
+    decoder = codecs.getincrementaldecoder("utf-8-sig")("strict")
     keep = max(max_chars // 2 - 40, 0)
     head = ""
     tail = ""
@@ -151,22 +147,14 @@ def _prepare_image(
     source: Path, out_dir: Path, stem: str, max_pixels: int, long_edge: int
 ) -> PreparedAttachment:
     # The size from the header first: a small file that would decode past the cap is
-    # refused before a raster exists, and Pillow's own bomb check is an error here.
+    # refused before a raster exists.
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(source) as opened:
-                too_large = opened.width * opened.height > max_pixels
-    except (
-        UnidentifiedImageError,
-        Image.DecompressionBombError,
-        Image.DecompressionBombWarning,
-        OSError,
-        ValueError,
-    ) as exc:
-        raise AttachmentRefused(400, "The image could not be read") from exc
-    if too_large:
-        raise AttachmentRefused(400, "The image is too large to attach")
+        check_pixels(source, max_pixels)
+    except ImageError as exc:
+        message = (
+            "The image is too large to attach" if exc.too_large else "The image could not be read"
+        )
+        raise AttachmentRefused(400, message) from exc
     try:
         normalized = normalize_image(source, out_dir, max_long_edge=long_edge, stem=stem)
     except ImageError as exc:
@@ -233,7 +221,7 @@ async def prepare_attachment(
             text = text[:text_max_chars] + PDF_TEXT_CUT
     else:
         try:
-            text = await asyncio.to_thread(_read_bounded, source, text_max_chars, strict=True)
+            text = await asyncio.to_thread(_read_bounded, source, text_max_chars)
         except UnicodeDecodeError as exc:
             raise AttachmentRefused(400, "The file is not UTF-8 text") from exc
         if not text.strip():

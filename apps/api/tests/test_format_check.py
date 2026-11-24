@@ -21,10 +21,11 @@ from sightread.db.models import Document, Job, Result, UsageLog
 from sightread.jobs.check import CheckFailed, run_check
 from sightread.parsing import joins
 from sightread.routes.library import document_payload
+from sightread.upstream.anthropic import ChatUsage
 from sightread.upstream.client import Connection
 from sightread.workspace.layout import user_root
 from tests.conftest import CSRF_HEADERS, KANO_API_KEY, KANO_BASE, KANO_CHAT_URL, TEST_SECRET_KEY
-from tests.test_chat import MESSAGES_URL, assistant_turn
+from tests.test_chat import MESSAGES_URL, assistant_turn, sse
 from tests.test_library import MODEL, _ready_to_parse
 from tests.test_parse_end_to_end import _drain_queue
 from tests.test_retry_failed_pages import FALLBACK, Upstream, _answer, _retry, _row, _upload
@@ -83,14 +84,14 @@ def _settings(**overrides) -> Settings:
     return Settings(secret_key=TEST_SECRET_KEY, **overrides)
 
 
-async def _check(markdown: str, connection: Connection | None = None, **overrides):
-    billed: list = []
+async def _check(markdown: str, billed: list[ChatUsage] | None = None, **overrides):
+    billed = [] if billed is None else billed
 
-    async def bill(completed) -> None:
-        billed.append(completed)
+    async def bill(usage: ChatUsage) -> None:
+        billed.append(usage)
 
     outcome = await run_check(
-        connection,
+        _connection(),
         _settings(**overrides),
         model="claude-code/claude-opus-5-5",
         effort="medium",
@@ -317,7 +318,7 @@ def test_a_replacement_may_change_markup_and_never_the_text() -> None:
 
 
 async def test_a_document_with_no_spot_costs_nothing() -> None:
-    # Joined by the rules alone; no connection is needed, and none is made.
+    # Joined by the rules alone; no upstream call is needed, and none is made.
     outcome, billed = await _check(
         "<!-- page: 1 -->\nWe study agents that\n\n<!-- page: 2 -->\nlearn. The end."
     )
@@ -348,7 +349,7 @@ async def test_the_agent_joins_and_fixes_through_its_tools() -> None:
             _done(),
         ]
     )
-    outcome, billed = await _check(TRANSCRIPTION, _connection())
+    outcome, billed = await _check(TRANSCRIPTION)
 
     assert outcome.markdown == READING
     # The rules' join of the hyphenated word, and the agent's.
@@ -389,8 +390,43 @@ async def test_the_agent_joins_and_fixes_through_its_tools() -> None:
 async def test_a_check_that_cannot_finish_fails(answer, reason) -> None:
     respx.post(MESSAGES_URL).mock(side_effect=lambda request: answer())
     with pytest.raises(CheckFailed) as failed:
-        await _check(TRANSCRIPTION, _connection())
+        await _check(TRANSCRIPTION)
     assert str(failed.value) == reason
+
+
+def _cut(error: str) -> httpx.Response:
+    """A stream that started, sent some text, and broke off with an `error` event."""
+    body = sse(
+        {
+            "type": "message_start",
+            "message": {"model": "claude-opus-5-5", "usage": {"input_tokens": 300}},
+        },
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hm"}},
+        {"type": "error", "error": {"type": error}},
+    )
+    return httpx.Response(200, content=body, headers={"content-type": "text/event-stream"})
+
+
+@respx.mock
+async def test_a_call_cut_short_is_billed_and_retried(monkeypatch) -> None:
+    monkeypatch.setattr("sightread.upstream.client.VISION_BACKOFF_BASE_SECONDS", 0.0)
+    respx.post(MESSAGES_URL).mock(side_effect=[_cut("overloaded_error"), _done()])
+    _, billed = await _check(TRANSCRIPTION)
+    # The broken attempt with what it reported, its cost unknown; then the finished call.
+    assert len(billed) == 2
+    assert (billed[0].input_tokens, billed[0].cost) == (300, None)
+    assert billed[0].output_tokens > 0
+
+
+@respx.mock
+async def test_a_call_that_breaks_for_good_is_billed_before_the_check_fails() -> None:
+    respx.post(MESSAGES_URL).mock(side_effect=lambda request: _cut("api_error"))
+    billed: list[ChatUsage] = []
+    with pytest.raises(CheckFailed) as failed:
+        await _check(TRANSCRIPTION, billed)
+    assert str(failed.value) == "upstream call failed"
+    assert [usage.input_tokens for usage in billed] == [300]
 
 
 @respx.mock
@@ -399,21 +435,15 @@ async def test_an_agent_still_working_at_the_cap_fails() -> None:
         side_effect=lambda request: _turn([_tool("t1", "read_page", page=1)])
     )
     with pytest.raises(CheckFailed) as failed:
-        await _check(TRANSCRIPTION, _connection(), check_max_calls=3)
+        await _check(TRANSCRIPTION, check_max_calls=3)
     assert str(failed.value) == "not finished"
     assert route.call_count == 3
-
-
-async def test_spots_without_kano_proxy_fail() -> None:
-    with pytest.raises(CheckFailed) as failed:
-        await _check(TRANSCRIPTION, None)
-    assert str(failed.value) == "Kano Proxy is not configured on this deployment"
 
 
 @respx.mock
 async def test_the_spots_past_the_cap_stay_as_they_are() -> None:
     route = respx.post(MESSAGES_URL).mock(side_effect=lambda request: _done())
-    await _check(TRANSCRIPTION, _connection(), check_spots_max=1)
+    await _check(TRANSCRIPTION, check_spots_max=1)
     spots = json.loads(route.calls[0].request.content)["messages"][0]["content"]
     assert spots.startswith("1 places need a decision")
     assert 'kind="emphasis"' not in spots

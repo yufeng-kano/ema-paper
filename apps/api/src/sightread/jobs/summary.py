@@ -193,12 +193,7 @@ async def write_title(
                 user_id=conversation.user_id,
                 agent=CHAT.name,
                 model=model,
-                prompt_tokens=usage.input_tokens,
-                completion_tokens=usage.output_tokens,
-                cache_read_tokens=usage.cache_read_tokens,
-                cache_write_tokens=usage.cache_write_tokens,
-                cost=usage.cost,
-                cost_source=usage.cost_source,
+                **usage.log_fields(),
             )
         )
         amount = credits_for_usd(

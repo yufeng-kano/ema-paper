@@ -150,6 +150,8 @@ async def test_a_pixel_model_is_asked_in_pixels_and_answers_in_the_contract(docu
         documents["png"],
         2,
         convention=convention_for_model("openai/gpt-6"),
+        max_response_bytes=33_554_432,
+        max_output_tokens=16_000,
     )
 
     sent = json.loads(route.calls[0].request.content)["messages"][0]["content"][0]["text"]
@@ -179,6 +181,8 @@ async def test_a_normalized_model_keeps_the_original_contract_wording(documents)
         documents["png"],
         1,
         convention=convention_for_model("google/gemini-2.5-flash"),
+        max_response_bytes=33_554_432,
+        max_output_tokens=16_000,
     )
     sent = json.loads(route.calls[0].request.content)["messages"][0]["content"][0]["text"]
     assert "sightread://p1/YMIN,XMIN,YMAX,XMAX" in sent and sent.endswith("Id: yxyx_norm1000.")

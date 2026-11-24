@@ -398,7 +398,7 @@ async def test_a_failed_conversion_keeps_the_file_to_retry(
     outside the tree, with no `source.*` left in a directory that has no `.meta.json` (the
     reconciliation would rename it and the quota count it twice) — and the Files page's
     retry makes it the document once the upstream is back, its shell copy in place."""
-    monkeypatch.setattr(runner, "VISION_BACKOFF_BASE_SECONDS", 0.0)
+    monkeypatch.setattr("sightread.upstream.client.VISION_BACKOFF_BASE_SECONDS", 0.0)
     down = True
 
     def vision(request: httpx.Request) -> httpx.Response:
@@ -446,7 +446,7 @@ async def test_the_agent_retries_a_failed_conversion_once_told_to(
     through the Files page's own retry and drives it inside the turn, on the same job, and
     the document is charged once, by the run that delivers it. A document that stands is
     not retried."""
-    monkeypatch.setattr(runner, "VISION_BACKOFF_BASE_SECONDS", 0.0)
+    monkeypatch.setattr("sightread.upstream.client.VISION_BACKOFF_BASE_SECONDS", 0.0)
     down = True
 
     def vision(request: httpx.Request) -> httpx.Response:
@@ -501,7 +501,7 @@ async def test_a_retry_the_balance_or_the_original_cannot_carry_is_not_queued(
     """docs/billing.md § A chat turn: the agent's retry is refused as the Files page's is
     when the balance cannot cover it, the job left failed; a document
     whose original is gone answers that it cannot be retried."""
-    monkeypatch.setattr(runner, "VISION_BACKOFF_BASE_SECONDS", 0.0)
+    monkeypatch.setattr("sightread.upstream.client.VISION_BACKOFF_BASE_SECONDS", 0.0)
     vision = respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(503, json={}))
     client = await _ready(make_client, tmp_path)
     root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
@@ -586,7 +586,7 @@ async def test_a_full_workspace_still_keeps_a_converted_files_original(
     """docs/workspace.md § Layout: the upload moved into place as the row's original is
     kept whatever the quota says — a converted file was counted in the tree, and the
     upload is the only copy there is."""
-    monkeypatch.setattr(runner, "VISION_BACKOFF_BASE_SECONDS", 0.0)
+    monkeypatch.setattr("sightread.upstream.client.VISION_BACKOFF_BASE_SECONDS", 0.0)
     respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(503))
     client = await _ready(make_client, tmp_path)
     root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
@@ -611,7 +611,7 @@ async def test_the_sweep_files_an_original_the_worker_never_did(
     commit and its copies leaves the converted file in the upload directory alone; the
     sweep files it as the document's original instead of letting it age out — and its
     age sweep never takes the upload first, even when the filing fails again."""
-    monkeypatch.setattr(runner, "VISION_BACKOFF_BASE_SECONDS", 0.0)
+    monkeypatch.setattr("sightread.upstream.client.VISION_BACKOFF_BASE_SECONDS", 0.0)
     respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(503))
     real = runner._retain_source
 
@@ -752,7 +752,7 @@ async def test_a_failed_finish_outlasts_every_cancel_of_its_caller() -> None:
         await release.wait()
         finished.append(True)
 
-    caller = asyncio.create_task(runner._to_the_end(finish()))
+    caller = asyncio.create_task(runner.to_the_end(finish()))
     await started.wait()
     for _ in range(2):
         caller.cancel()

@@ -9,6 +9,7 @@ problem rather than a correctness one.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import uuid
@@ -44,48 +45,62 @@ def sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, default=str)}\n\n"
 
 
-async def notify(db: AsyncSession, job_id: uuid.UUID) -> None:
-    """Wake every stream watching this job, when the backend can do it."""
+async def notify_channel(db: AsyncSession, channel: str) -> None:
+    """Wake every stream listening on `channel`, when the backend can do it. Sent in the
+    caller's transaction, so it is delivered when that commits."""
     if db.get_bind().dialect.name != "postgresql":
         return
-    await db.execute(text("SELECT pg_notify(:channel, '')"), {"channel": channel_for(job_id)})
+    await db.execute(text("SELECT pg_notify(:channel, '')"), {"channel": channel})
 
 
-async def _open_listener(database_url: str, job_id: uuid.UUID, wakeup: asyncio.Event):
-    """A dedicated PostgreSQL connection listening for this job, or None.
+async def notify(db: AsyncSession, job_id: uuid.UUID) -> None:
+    """Wake every stream watching this job."""
+    await notify_channel(db, channel_for(job_id))
 
-    Deliberately outside the SQLAlchemy pool: an SSE stream lives as long as its client,
-    and long-lived listeners must not eat the connections the API needs to answer requests.
+
+async def open_listener(database_url: str, channel: str, wakeup: asyncio.Event, what: str):
+    """A dedicated PostgreSQL connection that sets `wakeup` on each NOTIFY of `channel`,
+    or None, and the stream polls. `what` names the stream in the log line.
+
+    Deliberately outside the SQLAlchemy pool: a stream lives as long as its client, and
+    long-lived listeners must not eat the connections the API needs to answer requests.
+    Shared by the job streams and the conversation streams (`chat_events`).
     """
     url = make_url(database_url)
     if url.get_backend_name() != "postgresql":
         return None
+    connection = None
     try:
         connection = await asyncpg.connect(
             url.set(drivername="postgresql").render_as_string(hide_password=False)
         )
-        await connection.add_listener(channel_for(job_id), lambda *_: wakeup.set())
+        await connection.add_listener(channel, lambda *_: wakeup.set())
     except (OSError, asyncpg.PostgresError):
-        logger.warning("job event listener unavailable; falling back to polling")
+        logger.warning("%s event listener unavailable; falling back to polling", what)
+        if connection is not None:
+            # Opened, then refused LISTEN (a proxy in between): closed, or every stream
+            # opened under that condition would hold one connection for nothing.
+            with contextlib.suppress(Exception):
+                await connection.close()
         return None
     return connection
 
 
 async def _snapshot(sessionmaker: async_sessionmaker[AsyncSession], job_id: uuid.UUID):
-    """Job row plus the pages that have finished so far."""
+    """Job row plus the number and method of each page finished so far — never a page's
+    markdown or figures, which the stream does not send and a long parse would re-read on
+    every wake-up."""
     async with sessionmaker() as db:
         job = (await db.execute(select(Job).where(Job.id == job_id))).scalar_one_or_none()
         if job is None:
             return None, [], None
         pages = (
-            (
-                await db.execute(
-                    select(JobPage).where(JobPage.job_id == job_id).order_by(JobPage.page_no)
-                )
+            await db.execute(
+                select(JobPage.page_no, JobPage.method)
+                .where(JobPage.job_id == job_id)
+                .order_by(JobPage.page_no)
             )
-            .scalars()
-            .all()
-        )
+        ).all()
         result = None
         if job.status in TERMINAL_STATUSES:
             result = (
@@ -120,12 +135,15 @@ async def iter_job_events(
     from .runner import result_payload
 
     wakeup = asyncio.Event()
-    listener = await _open_listener(database_url, job_id, wakeup)
+    listener = await open_listener(database_url, channel_for(job_id), wakeup, "job")
     emitted: set[int] = set()
     silent_for = 0.0
 
     try:
         while True:
+            # Cleared before the read, so a NOTIFY that lands during it or while the pairs
+            # below are consumed wakes the next wait at once.
+            wakeup.clear()
             job, pages, result = await _snapshot(sessionmaker, job_id)
             if job is None:
                 yield ERROR, {"error": {"type": "invalid_request", "message": "No such job"}}
@@ -158,7 +176,6 @@ async def iter_job_events(
                     )
                 return
 
-            wakeup.clear()
             try:
                 await asyncio.wait_for(wakeup.wait(), timeout=POLL_INTERVAL_SECONDS)
                 silent_for = 0.0

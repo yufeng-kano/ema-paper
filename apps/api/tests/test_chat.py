@@ -35,6 +35,7 @@ from sightread.errors import ApiError
 from sightread.jobs import chat_runner, chat_tools
 from sightread.jobs.queue import claim_next_turn, fail_turn
 from sightread.sandbox.client import ExecResult, SandboxClient
+from sightread.upstream.anthropic import ChatUsage
 from sightread.upstream.client import RateLimited
 from sightread.workspace import documents as workspace_documents
 from sightread.workspace import git
@@ -1740,36 +1741,6 @@ async def test_a_conversation_past_the_history_cap_is_refused(chatting) -> None:
     settings.chat_history_max_bytes = 256 * 1024 * 1024
 
 
-async def test_a_cancelled_decode_is_waited_for_before_the_slot_is_released(monkeypatch) -> None:
-    import threading
-
-    started = threading.Event()
-    release = threading.Event()
-    finished: list[bool] = []
-
-    def slow_decode(raw):
-        started.set()
-        release.wait(5)
-        finished.append(True)
-        return b"\x89PNG"
-
-    monkeypatch.setattr(chat_tools, "_model_image", slow_decode)
-    slot = asyncio.Semaphore(1)
-    decoding = asyncio.ensure_future(
-        chat_tools._settled(asyncio.to_thread(chat_tools._model_image, b"raw"))
-    )
-    await asyncio.to_thread(started.wait, 5)
-    decoding.cancel()
-    # The cancel is not acknowledged while the thread still holds the raster.
-    await asyncio.sleep(0.1)
-    assert not decoding.done()
-    release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await decoding
-    assert finished == [True]
-    assert slot._value == 1
-
-
 async def test_a_command_the_runner_could_not_settle_commits_no_tree(tmp_path) -> None:
     from sightread.sandbox.client import SandboxUnavailable
 
@@ -3343,7 +3314,7 @@ async def test_a_listener_refused_listen_is_closed(monkeypatch) -> None:
     way to polling, or every stream opened under that condition would leak one."""
     import asyncpg
 
-    from sightread.jobs import chat_events
+    from sightread.jobs import events
 
     closed: list[bool] = []
 
@@ -3357,9 +3328,9 @@ async def test_a_listener_refused_listen_is_closed(monkeypatch) -> None:
     async def connect(dsn):
         return Refusing()
 
-    monkeypatch.setattr(chat_events.asyncpg, "connect", connect)
-    listener = await chat_events._open_listener(
-        "postgresql+asyncpg://u:p@db/sightread", 7, asyncio.Event()
+    monkeypatch.setattr(events.asyncpg, "connect", connect)
+    listener = await events.open_listener(
+        "postgresql+asyncpg://u:p@db/sightread", "sr_conv_7", asyncio.Event(), "conversation"
     )
     assert listener is None and closed == [True]
 
@@ -3564,7 +3535,7 @@ async def test_a_usage_row_is_written_through_a_cancel(monkeypatch) -> None:
         turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
         credits_exhausted=False,
     )
-    usage = SimpleNamespace(
+    usage = ChatUsage(
         input_tokens=10,
         output_tokens=5,
         cache_read_tokens=0,

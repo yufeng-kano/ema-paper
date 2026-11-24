@@ -27,7 +27,7 @@ from typing import Protocol
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..agents import CHECK, PARSE, AgentDefinition
+from ..agents import CHECK, PARSE
 from ..agents import check as check_agent
 from ..agents.bbox import CANONICAL_FORMAT
 from ..auth import upload_tickets
@@ -196,36 +196,35 @@ def checked_parse_model(settings: Settings, model: str | None) -> str:
     return model
 
 
+async def _agent_setting(db: AsyncSession, user_id: int, agent: str) -> AgentSetting | None:
+    """The user's settings row for `agent`; None while they have changed nothing."""
+    return (
+        await db.execute(
+            select(AgentSetting).where(AgentSetting.user_id == user_id, AgentSetting.agent == agent)
+        )
+    ).scalar_one_or_none()
+
+
 async def resolve_target(
-    db: AsyncSession,
-    settings: Settings,
-    user: User,
-    agent: AgentDefinition,
-    model: str | None,
+    db: AsyncSession, settings: Settings, user: User, model: str | None
 ) -> Target:
-    """Upstream, model and prompt for a job of `agent` (docs/agents.md § Enqueue rules):
-    the operator's Kano Proxy, the deployment's parse model — a per-request `model` must
-    be one of the parse agent's — and the user's own prompt, else the agent's default
+    """Upstream, model and prompt for a parse (docs/agents.md § Enqueue rules): the
+    operator's Kano Proxy, the deployment's parse model — a per-request `model` must be
+    one of the parse agent's — and the user's own prompt, else the agent's default
     template (docs/parsing.md § Prompts)."""
     model = checked_parse_model(settings, model)
     if not settings.kano_proxy_configured:
         raise ApiError(503, "upstream", "Kano Proxy is not configured on this deployment")
-    row = (
-        await db.execute(
-            select(AgentSetting).where(
-                AgentSetting.user_id == user.id, AgentSetting.agent == agent.name
-            )
-        )
-    ).scalar_one_or_none()
+    row = await _agent_setting(db, user.id, PARSE.name)
     # The user's own prompt replaces the default template whole (docs/parsing.md § Prompts).
-    prompt = (row.prompt if row else None) or agent.default_prompt_template
+    prompt = (row.prompt if row else None) or PARSE.default_prompt_template
     fallback = (
         settings.parse_fallback_model
         if row is not None and row.auto_fallback and settings.parse_fallback_model
         else None
     )
     return Target(
-        agent.name,
+        PARSE.name,
         model,
         CANONICAL_FORMAT,
         prompt,
@@ -241,26 +240,20 @@ async def resolve_check(
     are now; None while its switch is off or Kano Proxy is not configured, the one
     upstream it speaks (docs/parsing.md § Format check). Its model is `CHECK_MODEL`, else
     the parse's."""
-    row = (
-        await db.execute(
-            select(AgentSetting).where(
-                AgentSetting.user_id == user_id, AgentSetting.agent == CHECK.name
-            )
-        )
-    ).scalar_one_or_none()
+    row = await _agent_setting(db, user_id, CHECK.name)
     if row is not None and not row.auto_check:
         return None
     if not settings.kano_proxy_configured:
         return None
-    model = settings.check_model or parse_model
-    if row is None:
-        return CheckTarget(model, EFFORT_DEFAULT, CHECK.default_prompt_template)
     # The user's own prompt, else the default, as for the parse agent (docs/agents.md
     # § Enqueue rules).
     return CheckTarget(
-        model,
-        row.effort or EFFORT_DEFAULT,
-        check_agent.system_prompt(row.prompt or CHECK.default_prompt_template, row.instructions),
+        settings.check_model or parse_model,
+        (row.effort if row else None) or EFFORT_DEFAULT,
+        check_agent.system_prompt(
+            (row.prompt if row else None) or CHECK.default_prompt_template,
+            row.instructions if row else None,
+        ),
     )
 
 
@@ -271,17 +264,19 @@ async def store_upload(
     *,
     cap_name: str = "UPLOAD_MAX_BYTES",
 ) -> tuple[int, str]:
-    """Stream an upload to disk, hashing as it goes; the whole file never sits in memory."""
+    """Stream an upload to disk, hashing as it goes; the whole file never sits in memory.
+    The disk writes run in a thread, as the reads that feed them do: a slow disk must not
+    stall the event loop every other request shares."""
     digest = hashlib.sha256()
     size = 0
     try:
-        with destination.open("wb") as handle:
+        with await asyncio.to_thread(destination.open, "wb") as handle:
             async for chunk in chunks:
                 size += len(chunk)
                 if size > max_bytes:
                     raise ApiError(413, "invalid_request", f"The upload exceeds {cap_name}")
                 digest.update(chunk)
-                handle.write(chunk)
+                await asyncio.to_thread(handle.write, chunk)
     except BaseException:
         destination.unlink(missing_ok=True)
         raise
@@ -292,7 +287,8 @@ async def count_pages(kind: str, path: Path, upload_dir: Path, page_cap: int) ->
     """Page count for a stored upload, rejecting documents we cannot read or must not run."""
     if kind == "image":
         try:
-            probe_image(path)
+            # A full decode: off the event loop, which serves every other request.
+            await asyncio.to_thread(probe_image, path)
         except ImageError as exc:
             path.unlink(missing_ok=True)
             raise ApiError(400, "invalid_request", "The image could not be decoded") from exc
@@ -360,7 +356,7 @@ async def submit_parse(
         raise ApiError(400, "invalid_request", "'retry' resumes a failed parse; 'force' starts one")
     kind, media_type = resolve_kind(filename, media_type)
     # An upload is always the parse agent's input (docs/agents.md).
-    target = await resolve_target(db, settings, user, PARSE, model)
+    target = await resolve_target(db, settings, user, model)
     prompt_sha256 = hashlib.sha256(target.prompt.encode()).hexdigest()
 
     upload_dir = Path(settings.upload_dir)
@@ -374,7 +370,7 @@ async def submit_parse(
     page_count = await count_pages(kind, stored, upload_dir, settings.page_cap)
     pages_spec = normalize_pages_spec(pages)
     try:
-        parse_pages_spec(pages_spec, page_count)
+        selected = parse_pages_spec(pages_spec, page_count)
     except ValueError as exc:
         stored.unlink(missing_ok=True)
         raise ApiError(400, "invalid_request", str(exc)) from exc
@@ -480,10 +476,6 @@ async def submit_parse(
                 await db.execute(select(Result).where(Result.job_id == cached.id))
             ).scalar_one_or_none()
         )
-        if result is not None and result.errors:
-            # A degraded result (failed pages) answers its own job, never a new upload —
-            # a transient upstream failure must not be replayed forever (docs/jobs.md).
-            result = None
         if result is not None:
             # The cache already holds this exact parse; the fresh copy is dead weight —
             # unless the caller keeps originals, whose row has nothing else to keep.
@@ -500,9 +492,9 @@ async def submit_parse(
             await hold_dedup_key(db, **key)
             active = await find_active_job(db, **key)
             if active is None:
-                # The first request's job may have finished already — with page errors,
-                # which the cache never answers, or failed: within the retry window the
-                # same bytes are still one upload, not a second parse to bill.
+                # The first request's job may have finished already — failed, or past
+                # the cache's retention: within the retry window the same bytes are
+                # still one upload, not a second parse to bill.
                 active = await find_recent_terminal_job(
                     db,
                     finished_since=utcnow()
@@ -576,9 +568,7 @@ async def submit_parse(
             settings,
             user_id=user.id,
             kind=ledger.PARSE,
-            amount=parse_credits(
-                len(parse_pages_spec(pages_spec, page_count)), settings.parse_credits_per_page
-            ),
+            amount=parse_credits(len(selected), settings.parse_credits_per_page),
             job_id=job.id,
         )
     except ledger.InsufficientCredits as exc:

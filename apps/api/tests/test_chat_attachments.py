@@ -170,7 +170,7 @@ async def test_a_long_text_keeps_its_head_and_tail(make_client, tmp_path) -> Non
     # The bound holds at a chunk's edge too, and NULs never reach a JSONB column.
     source = tmp_path / "chunked.txt"
     source.write_bytes(b"\x00" + "é".encode() * attachment_prep.READ_CHUNK_BYTES)
-    bounded = attachment_prep._read_bounded(source, 100, strict=True)
+    bounded = attachment_prep._read_bounded(source, 100)
     assert "\x00" not in bounded and len(bounded) <= 100 and bounded.startswith("é")
 
 

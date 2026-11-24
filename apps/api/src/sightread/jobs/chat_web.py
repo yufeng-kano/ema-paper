@@ -95,7 +95,7 @@ def resolve_host(host: str) -> list[str]:
     """Every address the name resolves to, once each, through the system resolver and in
     its order: glibc sorts an address this host has no route to after the others — an
     IPv6 one on a worker without IPv6 — where a sort by text would put it first. The tests
-    replace it with a documentation address (docs/testing.md)."""
+    replace it with a fixed public address (docs/testing.md)."""
     infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
     return list(dict.fromkeys(str(info[4][0]) for info in infos))
 

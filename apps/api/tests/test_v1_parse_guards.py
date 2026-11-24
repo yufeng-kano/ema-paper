@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
+import struct
 import uuid
+import zlib
 from pathlib import Path
 
 import httpx
+import pytest
 from httpx import AsyncClient
+from PIL import Image
 from sqlalchemy import select
 
 from sightread.db.models import Job, utcnow
@@ -91,6 +96,54 @@ async def test_an_unsupported_media_type_is_rejected(client: AsyncClient, tmp_pa
         data={"model": MODEL},
     )
     assert response.status_code == 400
+
+
+def _png_claiming(width: int, height: int) -> bytes:
+    """A tiny PNG whose header claims `width` x `height` 1-bit pixels."""
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+        )
+
+    header = struct.pack(">IIBBBBB", width, height, 1, 0, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(b""))
+        + chunk(b"IEND", b"")
+    )
+
+
+def _bmp() -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", (4, 4), (255, 0, 0)).save(buffer, format="BMP")
+    return buffer.getvalue()
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        # Past Pillow's decompression-bomb bound, from a file of a few dozen bytes.
+        pytest.param(_png_claiming(20000, 10000), id="bomb"),
+        # Decoded only as one of the accepted formats, whatever the name says.
+        pytest.param(_bmp(), id="bmp-named-png"),
+    ],
+)
+async def test_an_image_that_does_not_decode_as_an_accepted_one_is_refused(
+    client: AsyncClient, data: bytes
+) -> None:
+    await _keyed_client(client)
+    response = await client.post(
+        "/v1/parse",
+        files={"file": ("scan.png", data, "image/png")},
+        data={"model": MODEL},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == "The image could not be decoded"
+    upload_dir = Path(client.app.state.settings.upload_dir)
+    assert list(upload_dir.iterdir()) == []
 
 
 async def test_an_invalid_page_selection_is_rejected(client: AsyncClient, documents) -> None:

@@ -113,7 +113,7 @@ from . import (
 from .chat_compact import SUMMARY_CONTEXT
 from .intake import convert_kept_file, retry_library_parse
 from .queue import HISTORY_FULL, claim_job, history_bytes, requeue_job
-from .runner import fail_job, run_job
+from .runner import fail_job, run_job, to_the_end
 
 logger = logging.getLogger(__name__)
 
@@ -809,12 +809,7 @@ async def _record_usage(
                     turn_id=ctx.turn.id,
                     agent=CHAT.name,
                     model=model,
-                    prompt_tokens=usage.input_tokens,
-                    completion_tokens=usage.output_tokens,
-                    cache_read_tokens=usage.cache_read_tokens,
-                    cache_write_tokens=usage.cache_write_tokens,
-                    cost=usage.cost,
-                    cost_source=usage.cost_source,
+                    **usage.log_fields(),
                 )
             )
             await db.flush()
@@ -844,18 +839,7 @@ async def _record_usage(
             # turn).
             ctx.credits_exhausted = True
 
-    await _settled(record())
-
-
-async def _settled(recording: Awaitable[None]) -> None:
-    """Run a record to its end whatever cancels the caller meanwhile."""
-    task = asyncio.ensure_future(recording)
-    try:
-        await asyncio.shield(task)
-    except asyncio.CancelledError:
-        with contextlib.suppress(Exception):
-            await asyncio.shield(task)
-        raise
+    await to_the_end(record())
 
 
 async def _record_tool_call(ctx: TurnContext, tool: str, *, settle: bool) -> None:
@@ -874,7 +858,7 @@ async def _record_tool_call(ctx: TurnContext, tool: str, *, settle: bool) -> Non
         if remaining is not None and remaining <= 0:
             ctx.credits_exhausted = True
 
-    await _settled(record())
+    await to_the_end(record())
 
 
 async def _calls_today(ctx: TurnContext, tool: str, *, user_id: int | None = None) -> int:

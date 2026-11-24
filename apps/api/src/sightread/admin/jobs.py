@@ -24,7 +24,7 @@ from ..db.models import Job
 from ..errors import ApiError
 from ..jobs import queue
 from ..parsing.figures import discard_job_figures
-from ..upstream.client import fetch_models
+from ..upstream.client import fetch_models, kano_connection
 from . import audit
 
 if TYPE_CHECKING:
@@ -126,16 +126,13 @@ async def kano_proxy_status(settings: Settings) -> dict:
     never holds the key or the URL; one the client does not expect answers `UNEXPECTED` and
     is logged, never raised into the overview."""
     status = {"state": "ok", "message": None, "models": None, "priced": None, "parse_model": None}
-    if not settings.kano_proxy_configured:
+    connection = kano_connection(settings)
+    if connection is None:
         return {**status, "state": "unconfigured"}
     catalog, failure = await _probe(
         settings,
         "Kano Proxy",
-        fetch_models(
-            settings.kano_proxy_api_base,
-            settings.kano_proxy_api_key,
-            max_bytes=settings.upstream_response_max_bytes,
-        ),
+        fetch_models(connection, max_bytes=settings.upstream_response_max_bytes),
         (ApiError,),
         lambda exc: exc.message,
     )

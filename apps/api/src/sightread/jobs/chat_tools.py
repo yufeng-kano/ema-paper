@@ -25,7 +25,8 @@ from PIL import Image, UnidentifiedImageError
 
 from ..agents.bbox import CLAUDE_MAX_EDGE_PX
 from ..parsing import poppler
-from ..parsing.images import JPEG_QUALITY
+from ..parsing.figures import crop_name
+from ..parsing.images import JPEG_QUALITY, flatten_rgb
 from ..parsing.markdown import clean_bbox
 from ..sandbox.client import SandboxClient, SandboxRejected, SandboxUnavailable
 from ..workspace import git, safe_io
@@ -39,6 +40,7 @@ from ..workspace.layout import (
     inside,
 )
 from ..workspace.locks import workspace_lock
+from .runner import to_the_end
 
 VM_ROOT = PurePosixPath("/workspace")
 # Where the editor tool may not write: history, the workspace's own records, the cache.
@@ -589,7 +591,7 @@ async def _view_image(read: _ImageRead, images: ImageView) -> ToolOutcome:
     vm_path, long_edge = read.vm_path, images.long_edge
     try:
         async with images.decode_slot:
-            image = await _settled(
+            image = await to_the_end(
                 asyncio.to_thread(
                     _model_image,
                     read.data,
@@ -740,17 +742,7 @@ def _model_image(
         image: Image.Image = opened
         if header.orientation != 1:
             image = opened.transpose(ORIENTATIONS[header.orientation][0])
-        if image.mode in ("I;16", "I;16B", "I;16L", "I"):
-            # 16-bit grey (a microscope's, a depth map's): to 8 bits by its top byte. A
-            # plain conversion to RGB clips everything past 255 to white.
-            image = image.convert("I").point(lambda value: value / 256).convert("L")
-        # A grey or RGB PNG keeps its transparency as one key colour, not a channel.
-        if image.mode in ("RGBA", "LA", "P") or "transparency" in image.info:
-            image = image.convert("RGBA")
-            background = Image.new("RGBA", image.size, (255, 255, 255, 255))
-            image = Image.alpha_composite(background, image).convert("RGB")
-        elif image.mode != "RGB":
-            image = image.convert("RGB")
+        image = flatten_rgb(image)
         long_edge = max(image.width, image.height)
         if long_edge > long_edge_px:
             scale = long_edge_px / long_edge
@@ -770,20 +762,6 @@ def _model_image(
             shown_width=image.width,
             shown_height=image.height,
         )
-
-
-async def _settled(coro):
-    """Await `coro` so that a cancel waits for it rather than leaving it running: a
-    decode in a thread is not stopped by cancelling its await, and the slot it holds
-    would be released under a raster still in memory (docs/chat.md § Tools)."""
-    task = asyncio.ensure_future(coro)
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        await asyncio.wait({task})
-        if not task.cancelled():
-            task.exception()  # retrieved: a decode that failed under a cancel is the cancel's
-        raise
 
 
 def _open_source(source: Path, max_bytes: int) -> int | None:
@@ -895,7 +873,7 @@ async def original_page_png(
                     # The raster, one at a time per turn: a round of four reads must
                     # not hold four decoded pages before the budget sees any of them.
                     async with decode_slot:
-                        page_image = await _settled(
+                        page_image = await to_the_end(
                             asyncio.to_thread(_model_image, rendered, max_pixels, long_edge_px)
                         )
                     return page_image.data
@@ -905,7 +883,7 @@ async def original_page_png(
             with os.fdopen(os.dup(fd), "rb") as reader:
                 raw = await asyncio.to_thread(reader.read, max_bytes + 1)
             async with decode_slot:
-                page_image = await _settled(
+                page_image = await to_the_end(
                     asyncio.to_thread(_model_image, raw, max_pixels, long_edge_px)
                 )
             return page_image.data
@@ -930,8 +908,7 @@ async def view_figure(paths: DocumentPaths, tool_input: dict, *, max_bytes: int)
         return ToolOutcome("that bbox is not a usable box", is_error=True)
     # The crops live in the document directory under the same name the figures dir uses
     # (docs/parsing.md § Figure crops): the page and the cleaned box.
-    y_min, x_min, y_max, x_max = bbox
-    crop = paths.figures / f"p{page}_{y_min}_{x_min}_{y_max}_{x_max}.png"
+    crop = paths.figures / crop_name(page, bbox)
     try:
         data = await asyncio.to_thread(safe_io.read_bytes, paths.root, crop, max_bytes)
     except (safe_io.UnsafeEntry, safe_io.EntryTooLarge, OSError):

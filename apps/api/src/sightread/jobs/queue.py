@@ -297,10 +297,10 @@ async def find_active_job(db: AsyncSession, **key) -> Job | None:
 async def find_recent_terminal_job(
     db: AsyncSession, *, finished_since: datetime, **key
 ) -> Job | None:
-    """The same parse, finished since `finished_since` — succeeded with page errors, which
-    the cache never answers, or failed. For the web library's retry of an upload whose
-    answer was lost, and nothing else: within the window the same bytes are one upload,
-    whatever became of it (docs/jobs.md § Dedup)."""
+    """The same parse, finished since `finished_since` — failed, or succeeded past what the
+    cache answers. For the web library's retry of an upload whose answer was lost, and
+    nothing else: within the window the same bytes are one upload, whatever became of it
+    (docs/jobs.md § Dedup)."""
     return (
         await db.execute(
             select(Job)

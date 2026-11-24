@@ -17,7 +17,7 @@ from sightread.db.models import CreditEntry, Job
 from sightread.errors import ApiError
 from sightread.jobs.queue import claim_next_job
 from sightread.jobs.runner import run_job
-from sightread.upstream.client import fetch_models
+from sightread.upstream.client import Connection, fetch_models
 from tests.conftest import CSRF_HEADERS, KANO_API_KEY, KANO_BASE, KANO_MODELS_URL, PARSE_MODEL
 
 FALLBACK = "vendor/fallback-model"
@@ -143,7 +143,9 @@ async def test_an_oversized_model_list_is_an_upstream_error() -> None:
         )
     )
     with pytest.raises(ApiError) as raised:
-        await fetch_models(f"{KANO_BASE}/openai/v1", KANO_API_KEY, max_bytes=64)
+        await fetch_models(
+            Connection(api_key=KANO_API_KEY, base_url=f"{KANO_BASE}/openai/v1"), max_bytes=64
+        )
     assert raised.value.status_code == 502
 
 

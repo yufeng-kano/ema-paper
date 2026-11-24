@@ -10,17 +10,16 @@ import asyncio
 import json
 import re
 import uuid
-from datetime import timedelta
 from pathlib import Path
 
 import httpx
 import pytest
 import respx
 from httpx import AsyncClient
-from sqlalchemy import select, update
+from sqlalchemy import select
 
 from sightread.agents.parse import PIPELINE_VERSION
-from sightread.db.models import Job, JobPage, Result, UsageLog, utcnow
+from sightread.db.models import Job, JobPage, UsageLog
 from sightread.jobs.queue import claim_next_job
 from sightread.jobs.runner import run_job
 from tests.conftest import CSRF_HEADERS, DATABASE_URL, KANO_API_KEY, KANO_CHAT_URL
@@ -252,42 +251,6 @@ async def test_a_page_that_cannot_be_transcribed_fails_the_job(
 
 
 @respx.mock
-async def test_a_degraded_result_is_never_served_from_the_cache(
-    api_client, sessionmaker, documents
-) -> None:
-    respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
-    first = await _upload(api_client, documents["mixed_pdf"], pages="1,2")
-    await _drain_queue(api_client, sessionmaker)
-    # A result from before a failed page failed the job: served, with a page missing. It
-    # finished before the retry window, which would otherwise join it as the same upload.
-    async with sessionmaker() as db:
-        await db.execute(
-            update(Result)
-            .where(Result.job_id == uuid.UUID(first.json()["job_id"]))
-            .values(errors=[{"page": 1, "reason": "upstream call failed"}])
-        )
-        await db.execute(
-            update(Job)
-            .where(Job.id == uuid.UUID(first.json()["job_id"]))
-            .values(finished_at=utcnow() - timedelta(minutes=5))
-        )
-        await db.commit()
-
-    # The same upload again: the stored result carries a failed page, so no cache hit.
-    retried = await _upload(api_client, documents["mixed_pdf"], pages="1,2")
-    assert retried.status_code == 202
-    await _drain_queue(api_client, sessionmaker)
-
-    complete = (await api_client.get(f"/v1/jobs/{retried.json()['job_id']}/result")).json()
-    assert complete["errors"] == []
-
-    # Now that a complete result exists, the cache answers.
-    cached = await _upload(api_client, documents["mixed_pdf"], pages="1,2")
-    assert cached.status_code == 200
-    assert cached.json()["meta"]["cached"] is True
-
-
-@respx.mock
 async def test_a_wholly_failed_job_names_the_page_reasons(
     api_client, sessionmaker, documents
 ) -> None:
@@ -363,7 +326,7 @@ async def test_a_second_402_aborts_the_job(api_client, sessionmaker, documents) 
 async def test_rate_limits_back_off_and_shrink_the_job_budget(
     api_client, sessionmaker, documents, monkeypatch
 ) -> None:
-    monkeypatch.setattr("sightread.jobs.runner.VISION_BACKOFF_BASE_SECONDS", 0.001)
+    monkeypatch.setattr("sightread.upstream.client.VISION_BACKOFF_BASE_SECONDS", 0.001)
     respx.post(KANO_CHAT_URL).mock(
         side_effect=[
             httpx.Response(429, headers={"Retry-After": "0"}),
@@ -384,7 +347,7 @@ async def test_rate_limits_back_off_and_shrink_the_job_budget(
 async def test_a_transient_failure_is_retried_before_the_page_is_given_up(
     api_client, sessionmaker, documents, monkeypatch
 ) -> None:
-    monkeypatch.setattr("sightread.jobs.runner.VISION_BACKOFF_BASE_SECONDS", 0.001)
+    monkeypatch.setattr("sightread.upstream.client.VISION_BACKOFF_BASE_SECONDS", 0.001)
     respx.post(KANO_CHAT_URL).mock(
         side_effect=[
             httpx.Response(503),
@@ -407,7 +370,7 @@ async def test_a_transient_failure_is_retried_before_the_page_is_given_up(
 async def test_a_failure_that_stays_transient_fails_the_page_after_the_last_attempt(
     api_client, sessionmaker, documents, monkeypatch
 ) -> None:
-    monkeypatch.setattr("sightread.jobs.runner.VISION_BACKOFF_BASE_SECONDS", 0.001)
+    monkeypatch.setattr("sightread.upstream.client.VISION_BACKOFF_BASE_SECONDS", 0.001)
     respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(500))
 
     accepted = await _upload(api_client, documents["text_pdf"])
@@ -438,7 +401,7 @@ async def test_a_page_the_model_has_nothing_to_say_about_is_blank_not_failed(
 ) -> None:
     """The blank verso before a book chapter: the prompt drops its page number, and some
     servers say "nothing" as a null content rather than an empty string."""
-    monkeypatch.setattr("sightread.jobs.runner.VISION_BACKOFF_BASE_SECONDS", 0.001)
+    monkeypatch.setattr("sightread.upstream.client.VISION_BACKOFF_BASE_SECONDS", 0.001)
     blank = httpx.Response(
         200, json={"choices": [{"message": {"content": None}, "finish_reason": "stop"}]}
     )
@@ -459,8 +422,12 @@ async def test_a_page_the_model_has_nothing_to_say_about_is_blank_not_failed(
 async def test_an_ambiguous_empty_completion_is_blank_only_after_every_attempt(
     api_client, sessionmaker, documents, monkeypatch
 ) -> None:
-    monkeypatch.setattr("sightread.jobs.runner.VISION_BACKOFF_BASE_SECONDS", 0.001)
-    respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(200, json={"choices": []}))
+    monkeypatch.setattr("sightread.upstream.client.VISION_BACKOFF_BASE_SECONDS", 0.001)
+    respx.post(KANO_CHAT_URL).mock(
+        return_value=httpx.Response(
+            200, json={"choices": [], "usage": {"prompt_tokens": 900, "completion_tokens": 1}}
+        )
+    )
 
     accepted = await _upload(api_client, documents["mixed_pdf"], pages="1")
     job_id = accepted.json()["job_id"]
@@ -471,6 +438,70 @@ async def test_an_ambiguous_empty_completion_is_blank_only_after_every_attempt(
     result = (await api_client.get(f"/v1/jobs/{job_id}/result")).json()
     assert result["errors"] == []
     assert respx.calls.call_count == 4
+    # Every empty answer was an answered call, the retried ones too.
+    async with sessionmaker() as db:
+        rows = (
+            (await db.execute(select(UsageLog).where(UsageLog.job_id == uuid.UUID(job_id))))
+            .scalars()
+            .all()
+        )
+    assert [row.prompt_tokens for row in rows] == [900] * 4
+
+
+@respx.mock
+async def test_an_answer_that_ended_early_is_billed_on_every_attempt(
+    api_client, sessionmaker, documents, monkeypatch
+) -> None:
+    monkeypatch.setattr("sightread.upstream.client.VISION_BACKOFF_BASE_SECONDS", 0.001)
+    ended = httpx.Response(
+        200,
+        json={
+            "choices": [{"message": {"content": None}, "finish_reason": "error"}],
+            "usage": {"prompt_tokens": 700, "completion_tokens": 0},
+        },
+    )
+    respx.post(KANO_CHAT_URL).mock(side_effect=[ended, _completion(VISION_MARKDOWN)])
+
+    accepted = await _upload(api_client, documents["text_pdf"])
+    job_id = accepted.json()["job_id"]
+    await _drain_queue(api_client, sessionmaker)
+
+    assert (await api_client.get(f"/v1/jobs/{job_id}")).json()["status"] == "succeeded"
+    async with sessionmaker() as db:
+        rows = (
+            (await db.execute(select(UsageLog).where(UsageLog.job_id == uuid.UUID(job_id))))
+            .scalars()
+            .all()
+        )
+    assert sorted(row.prompt_tokens for row in rows) == [700, 900]
+
+
+@respx.mock
+async def test_a_retried_answer_is_billed_when_a_later_attempt_aborts_the_job(
+    api_client, sessionmaker, documents, monkeypatch
+) -> None:
+    monkeypatch.setattr("sightread.upstream.client.VISION_BACKOFF_BASE_SECONDS", 0.001)
+    empty = httpx.Response(
+        200, json={"choices": [], "usage": {"prompt_tokens": 900, "completion_tokens": 1}}
+    )
+    respx.post(KANO_CHAT_URL).mock(side_effect=[empty, httpx.Response(401)])
+
+    accepted = await _upload(api_client, documents["text_pdf"])
+    job_id = accepted.json()["job_id"]
+    await _drain_queue(api_client, sessionmaker)
+
+    status = (await api_client.get(f"/v1/jobs/{job_id}")).json()
+    assert status["status"] == "failed"
+    assert status["error"] == "the upstream rejected the operator's key"
+    assert respx.calls.call_count == 2
+    # The page never reached its record; the empty answer the 401 followed was billed anyway.
+    async with sessionmaker() as db:
+        rows = (
+            (await db.execute(select(UsageLog).where(UsageLog.job_id == uuid.UUID(job_id))))
+            .scalars()
+            .all()
+        )
+    assert [row.prompt_tokens for row in rows] == [900]
 
 
 @respx.mock
