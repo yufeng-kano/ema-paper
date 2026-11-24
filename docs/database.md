@@ -316,15 +316,14 @@ chat_attachments id UUID PK, user_id FK, name, kind image|text, media_type, size
                  -- in the message and deletes both (chat.md § What a user message carries)
 upload_tickets   id PK, user_id FK, token_hash UNIQUE, prefix, job_id FK NULL,
                  created_at, expires_at, spent_at NULL,
-                 library_access BOOL (false), into_library BOOL (false), folder_id FK NULL
+                 into_library BOOL (false), folder_id FK NULL
                  INDEX (user_id, created_at)                                 -- mint rate limit
                  -- single-use upload credential minted by the MCP `parse` tool
                  -- (auth.md § 5); job_id set when the upload spends the ticket,
                  -- ON DELETE SET NULL; a ticket not yet expired keeps its job from
-                 -- the parse retention (jobs.md § Retention); library_access: the
-                 -- minting grant reached the library; into_library: the upload is filed
-                 -- into Files, in folder_id (NULL the top level), ON DELETE SET NULL
-                 -- (mcp.md § Filing into Files)
+                 -- the parse retention (jobs.md § Retention); into_library: the upload
+                 -- is filed into Files, in folder_id (NULL the top level), ON DELETE
+                 -- SET NULL (mcp.md § Filing into Files)
 document_tickets id PK, user_id FK, document_id FK, scope read|write,
                  token_hash UNIQUE, prefix, created_at, expires_at
                  INDEX (user_id, created_at)                                 -- mint rate limit
@@ -335,8 +334,8 @@ oauth_clients    client_id PK, client_name, redirect_uris JSONB, created_at
 oauth_grants     id PK, client_id FK, user_id FK, kind code|access|refresh,
                  token_hash UNIQUE, pkce_challenge NULL, redirect_uri NULL,
                  scope, expires_at, revoked_at NULL, created_at
-                 -- scope is space-separated: `parse library` since 2026-11-01, `parse`
-                 -- alone on a grant approved before; a refresh carries it over (auth.md § 4)
+                 -- scope is space-separated, `parse library` on every live grant; a
+                 -- refresh carries it over (auth.md § 4)
                  -- redirect_uri is set on `code` rows only: the token endpoint
                  -- checks a code came back from the URI it was issued for
 subscriptions    user_id PK/FK, subscription_id UNIQUE, status, plan_id,

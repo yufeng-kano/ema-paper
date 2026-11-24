@@ -1,10 +1,9 @@
 """A data-plane parse filed into Files (docs/mcp.md § Filing into Files, docs/api.md § POST
-/v1/parse): the parse tool's `folder` found as listed or made, refused without the library
-or by the mint rate before anything is made; the ticket filing there as a Files upload
-does, the original kept, spent only by the filing; a file parsed without a folder filed
-from that parse with nothing charged; no twin; every page; a filed parse that failed
-retried where it is, on a ticket that files nothing. The vision upstream is stubbed
-(docs/testing.md § Cost safety).
+/v1/parse): the parse tool's `folder` found as listed or made, refused by the mint rate
+before anything is made; the ticket filing there as a Files upload does, the original
+kept, spent only by the filing; a file parsed without a folder filed from that parse with
+nothing charged; no twin; every page; a filed parse that failed retried where it is, on a
+ticket that files nothing. The vision upstream is stubbed (docs/testing.md § Cost safety).
 """
 
 from __future__ import annotations
@@ -16,10 +15,10 @@ import httpx
 import pytest
 import respx
 from httpx import AsyncClient
-from sqlalchemy import select, update
+from sqlalchemy import select
 
 from sightread.auth import upload_tickets
-from sightread.db.models import Document, Job, OAuthGrant, UploadTicket, User
+from sightread.db.models import Document, Job, UploadTicket, User
 from sightread.errors import ApiError
 from sightread.jobs.intake import retry_filed_parse
 from sightread.workspace import documents as workspace_documents
@@ -29,7 +28,6 @@ from tests.test_mcp import _mcp_session, _payload
 from tests.test_parse_end_to_end import _authorize, _drain_queue, _vision_stub
 from tests.test_retry_failed_pages import FALLBACK, Upstream
 from tests.test_upload_tickets import _bearer
-from tests.test_v1_library import _connected
 
 MODEL = "vendor/vision-model"
 
@@ -65,7 +63,6 @@ async def _mint(
     client: AsyncClient,
     sessionmaker,
     *,
-    library_access: bool = True,
     into_library: bool = False,
     folder_id: int | None = None,
 ) -> str:
@@ -75,7 +72,6 @@ async def _mint(
             db,
             client.app.state.settings,
             user,
-            library_access=library_access,
             into_library=into_library,
             folder_id=folder_id,
         )
@@ -150,7 +146,7 @@ async def test_the_parse_tool_files_into_a_folder_as_listed_or_made(api, session
     assert "Files › DL/DINO" in found["notes"]
     assert "created the folder" not in found["notes"]
     ticket = await _ticket(sessionmaker, found["token"])
-    assert (ticket.library_access, ticket.into_library, ticket.folder_id) == (True, True, dino)
+    assert (ticket.into_library, ticket.folder_id) == (True, dino)
 
     # The missing names are made, in order, and the notes ask the agent to say so.
     assert deeper["folder"]["path"] == "DL/DINO/SSL/2026"
@@ -174,7 +170,7 @@ async def test_the_parse_tool_files_into_a_folder_as_listed_or_made(api, session
     assert "folder" not in unfiled
     assert "call `parse` with `folder` and run `upload` again" in unfiled["notes"]
     plain = await _ticket(sessionmaker, unfiled["token"])
-    assert (plain.library_access, plain.into_library) == (True, False)
+    assert plain.into_library is False
 
     # A document's name is no folder to make a suffixed twin of; nothing was made for it.
     assert document.is_error is True
@@ -201,32 +197,6 @@ async def test_a_parse_the_mint_rate_refuses_makes_no_folder(
     assert "retry later" in refused.content[0].text
     # Refused before the folders were made, so there is none the reader was not told of.
     assert (await client.get("/v1/library")).json()["folders"] == []
-
-
-async def test_a_grant_without_the_library_files_nothing(make_client, documents, tmp_path) -> None:
-    client = make_client(workspaces_dir=str(tmp_path / "ws"))
-    _, tokens = await _connected(client)
-    async with client.app.state.sessionmaker() as db:
-        await db.execute(update(OAuthGrant).values(scope="parse"))
-        await db.commit()
-
-    async with mcp_running(client), _mcp_session(client, tokens["access_token"]) as session:
-        refused = await session.call_tool("parse", {"folder": "/"})
-        plain = await session.call_tool("parse", {})
-    assert refused.is_error is True
-    assert "add it again" in refused.content[0].text
-    # Its own parse stands, and is not pointed at a filing it cannot make.
-    assert plain.is_error is False
-    assert "with `folder`" not in _payload(plain)["notes"]
-
-    rest = await client.post(
-        "/v1/parse",
-        files={"file": ("a.pdf", documents["text_pdf"].read_bytes(), "application/pdf")},
-        data={"folder": "/"},
-        headers=_bearer(tokens["access_token"]),
-    )
-    assert rest.status_code == 403, rest.text
-    assert "add it again" in rest.json()["error"]["message"]
 
 
 # --- a filing ticket's upload ------------------------------------------------------------------

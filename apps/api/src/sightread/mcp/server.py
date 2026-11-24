@@ -35,7 +35,7 @@ from starlette.types import Receive, Scope, Send
 
 from ..agents import PARSE
 from ..auth import document_tickets, upload_tickets
-from ..auth.deps import LIBRARY_SCOPE_MESSAGE, bearer_credential, resolve_bearer_identity
+from ..auth.deps import bearer_credential, resolve_bearer_identity
 from ..db.models import FILE_KIND, Document, Job, User
 from ..errors import ApiError, error_response
 from ..routes.v1 import FOLDER_PATH_MAX, document_entry, library_index
@@ -117,7 +117,7 @@ FILED_NOTES = (
     "document where it is. The .md you land is a copy: to change the document in Ema "
     "Paper, find its id with list_library and use read_document and write_document."
 )
-# An unfiled ticket's way into Files, for a caller that reaches the library.
+# An unfiled ticket's way into Files.
 UNFILED_NOTES = (
     " An `upload` on this ticket adds nothing to the reader's Files library. To keep a "
     "paper in Ema Paper, call `parse` with `folder` and run `upload` again with the same "
@@ -201,9 +201,6 @@ def _stamp(moment: datetime) -> str:
 # by the tool; the streamable-HTTP transport runs each request's handler in a task spawned
 # from that request, so the value a tool sees is the one its own caller presented.
 _current_user_id: ContextVar[int | None] = ContextVar("sightread_mcp_user_id", default=None)
-# Whether that caller's credential reaches the library: an API key, or an OAuth grant holding
-# the `library` scope (docs/auth.md § 4).
-_current_library: ContextVar[bool] = ContextVar("sightread_mcp_library", default=False)
 
 
 async def _current_user(db: AsyncSession) -> User:
@@ -215,13 +212,6 @@ async def _current_user(db: AsyncSession) -> User:
     )
     if user is None:
         raise PermissionError("This MCP session is not authenticated")
-    return user
-
-
-async def _library_user(db: AsyncSession) -> User:
-    user = await _current_user(db)
-    if not _current_library.get():
-        raise PermissionError(LIBRARY_SCOPE_MESSAGE)
     return user
 
 
@@ -294,11 +284,8 @@ def build_server(app: FastAPI) -> MCPServer:
             settings = await app.state.runtime_settings.current(db)
             user = await _current_user(db)
             user_id = user.id
-            library_access = _current_library.get()
             destination = None
             if folder is not None:
-                if not library_access:
-                    raise PermissionError(LIBRARY_SCOPE_MESSAGE)
                 if not folder.strip():
                     raise ValueError(
                         "`folder` is empty: give a folder path from list_library, or / for "
@@ -314,7 +301,6 @@ def build_server(app: FastAPI) -> MCPServer:
                 db,
                 settings,
                 user,
-                library_access=library_access,
                 into_library=destination is not None,
                 folder_id=None if destination is None else destination["id"],
             )
@@ -349,11 +335,9 @@ def build_server(app: FastAPI) -> MCPServer:
                 f"{settings.parse_retention_days} days after it finishes and then deleted: "
                 "the .md you landed is the copy that lasts."
             )
-            if library_access:
-                notes += UNFILED_NOTES.format(
-                    age=never
-                    or ("" if retention == 0 else f", within {retention - 1} days of its end")
-                )
+            notes += UNFILED_NOTES.format(
+                age=never or ("" if retention == 0 else f", within {retention - 1} days of its end")
+            )
 
         base = settings.app_url.rstrip("/")
         auth = f"-H 'Authorization: Bearer {token}'"
@@ -430,7 +414,7 @@ def build_server(app: FastAPI) -> MCPServer:
     ) -> dict[str, Any]:
         async with app.state.sessionmaker() as db:
             settings = await app.state.runtime_settings.current(db)
-            user = await _library_user(db)
+            user = await _current_user(db)
             index = await library_index(db, user.id)
         folders, documents = index["folders"], index["documents"]
         if folder and folder.strip("/"):
@@ -475,7 +459,7 @@ def build_server(app: FastAPI) -> MCPServer:
     ) -> dict[str, Any]:
         async with app.state.sessionmaker() as db:
             settings = await app.state.runtime_settings.current(db)
-            user = await _library_user(db)
+            user = await _current_user(db)
             document = await document_entry(db, settings, user.id, document_id)
             # The suffix of what `…/original` answers with — the kept original, or the
             # upload until it is filed — names the file the `original` command lands.
@@ -545,7 +529,7 @@ def build_server(app: FastAPI) -> MCPServer:
     ) -> dict[str, Any]:
         async with app.state.sessionmaker() as db:
             settings = await app.state.runtime_settings.current(db)
-            user = await _library_user(db)
+            user = await _current_user(db)
             document = await document_entry(db, settings, user.id, document_id)
             if document["kind"] == FILE_KIND:
                 raise ApiError(
@@ -605,11 +589,11 @@ class BearerGuard:
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         credential = bearer_credential(Request(scope))
-        identity = None
+        user = None
         if credential is not None:
             async with self._app.state.sessionmaker() as db:
-                identity = await resolve_bearer_identity(db, credential)
-        if identity is None:
+                user = await resolve_bearer_identity(db, credential)
+        if user is None:
             response = error_response(
                 401,
                 "auth",
@@ -619,12 +603,10 @@ class BearerGuard:
             await response(scope, receive, send)
             return
 
-        user_token = _current_user_id.set(identity.user.id)
-        library_token = _current_library.set(identity.library)
+        user_token = _current_user_id.set(user.id)
         try:
             await self._transport(scope, receive, send)
         finally:
-            _current_library.reset(library_token)
             _current_user_id.reset(user_token)
 
 

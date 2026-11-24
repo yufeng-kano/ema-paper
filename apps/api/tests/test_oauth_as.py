@@ -152,6 +152,8 @@ async def test_refresh_rotates_and_burns_the_old_token(client: AsyncClient) -> N
     rotated = refreshed.json()
     assert rotated["refresh_token"] != tokens["refresh_token"]
     assert rotated["access_token"] != tokens["access_token"]
+    # A refresh keeps the scope of the grant it rotates (docs/auth.md § 4).
+    assert rotated["scope"] == tokens["scope"] == "parse library"
 
     replayed = await _token(
         client,

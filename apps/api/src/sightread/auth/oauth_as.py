@@ -34,11 +34,10 @@ CODE_TTL = timedelta(minutes=5)
 ACCESS_TTL = timedelta(hours=1)
 REFRESH_TTL = timedelta(days=30)
 
-# Two scopes (docs/auth.md § 4): `parse`, the `parse` tool and the job routes, and, since
-# 2026-11-01, `library`, reading the Files library and saving a document's text and notes —
-# and since 2026-11-04 filing a parse into its folders (docs/mcp.md § Filing into Files).
-# A grant is made for both, the consent page saying both; one approved before `library`
-# existed keeps `parse` alone through every refresh until it is approved again.
+# Two scopes (docs/auth.md § 4): `parse`, the `parse` tool and the job routes, and
+# `library`, reading the Files library, saving a document's text and notes and filing a
+# parse into its folders (docs/mcp.md § Filing into Files). A grant is made for both, the
+# consent page saying both, and a refresh keeps the scope of the grant it rotates.
 SCOPE = "parse"
 LIBRARY_SCOPE = "library"
 GRANTED_SCOPE = f"{SCOPE} {LIBRARY_SCOPE}"
@@ -217,11 +216,9 @@ async def refresh_tokens(
     )
 
 
-async def resolve_access_token(db: AsyncSession, presented: str) -> tuple[User, set[str]] | None:
-    """The bearer path for `/v1/*` and `/mcp`: an access token resolves to its user and the
-    scopes its grant holds."""
+async def resolve_access_token(db: AsyncSession, presented: str) -> User | None:
+    """The bearer path for `/v1/*` and `/mcp`: an access token resolves to its user."""
     grant = await _live_grant(db, ACCESS, presented)
     if grant is None:
         return None
-    user = (await db.execute(select(User).where(User.id == grant.user_id))).scalar_one_or_none()
-    return None if user is None else (user, set(grant.scope.split()))
+    return (await db.execute(select(User).where(User.id == grant.user_id))).scalar_one_or_none()

@@ -325,7 +325,6 @@ async def submit_parse(
     check: bool = False,
     reconvert: Document | None = None,
     retry: bool = False,
-    library_retry: bool = False,
 ) -> Submission:
     """Store the document, dedup it and queue the parse. Commits before it returns.
 
@@ -347,11 +346,10 @@ async def submit_parse(
     its failed ones run on `model` when one is named, else on its own; one in flight or
     succeeded is answered as it stands (docs/jobs.md § Retrying failed pages).
 
-    With `library_retry`, a retry whose newest parse is a failed one a Files document
-    names is answered with that job as `Submission.library_retry`, nothing changed and a
-    ticket unspent: the library's retry runs from the document's original under the
-    workspace lock, which is taken before the user's row and so cannot be taken under the
-    holds of this transaction. Without it, that retry is the 409 below.
+    A retry whose newest parse is a failed one a Files document names is answered with that
+    job as `Submission.library_retry`, nothing changed and a ticket unspent: the library's
+    retry runs from the document's original under the workspace lock, which is taken before
+    the user's row and so cannot be taken under the holds of this transaction.
 
     `reconvert` is the library document this parse re-converts, with `force`: it points at
     the job in the commit that queues it, so no re-convert runs that its document would
@@ -428,16 +426,10 @@ async def submit_parse(
         if job.status == "failed" and found[1]:
             # A Files document's parse: the library retries it, from its original.
             stored.unlink(missing_ok=True)
-            if library_retry:
-                failed_id = job.id
-                # The holds go with the transaction; the caller takes the workspace lock.
-                await db.rollback()
-                return Submission(library_retry=failed_id)
-            raise ApiError(
-                409,
-                "invalid_request",
-                "The latest parse of this file is a Files document's; retry it from the Files page",
-            )
+            failed_id = job.id
+            # The holds go with the transaction; the caller takes the workspace lock.
+            await db.rollback()
+            return Submission(library_retry=failed_id)
         if job.status == "failed":
             retry_model = target.model if model is not None else None
             # The check as the settings say now, following the model this run sends the

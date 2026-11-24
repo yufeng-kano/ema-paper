@@ -27,7 +27,6 @@ from starlette.formparsers import MultiPartException, MultiPartParser
 
 from ..agents import PARSE
 from ..auth.deps import (
-    LIBRARY_SCOPE_MESSAGE,
     AppSettings,
     DbSession,
     DocumentReader,
@@ -184,8 +183,7 @@ async def parse(request: Request, caller: UploaderCaller, db: DbSession, setting
     ticket = caller.ticket
     ticket_id = None if ticket is None else ticket.id
     # Where the parse goes (docs/mcp.md § Filing into Files): a ticket's destination was
-    # chosen when the parse tool minted it, under the library's scope; a durable
-    # credential names one with `folder`, which needs the library too.
+    # chosen when the parse tool minted it; a durable credential names one with `folder`.
     filed, folder_id = False, None
     if ticket is not None:
         if folder is not None:
@@ -204,8 +202,6 @@ async def parse(request: Request, caller: UploaderCaller, db: DbSession, setting
                 "parse without `folder` for the retry's ticket",
             )
     elif folder is not None:
-        if not caller.library:
-            raise ApiError(403, "auth", LIBRARY_SCOPE_MESSAGE)
         if retry:
             raise ApiError(
                 400,
@@ -274,9 +270,6 @@ async def parse(request: Request, caller: UploaderCaller, db: DbSession, setting
             reuse_in_flight=True,
             check=True,
             retry=retry,
-            # A Files document's failed parse is retried as the library retries it, by a
-            # caller whose rights reach the library (docs/jobs.md § Retrying failed pages).
-            library_retry=caller.library,
         )
     if submission.library_retry is not None:
         retried = await retry_filed_parse(

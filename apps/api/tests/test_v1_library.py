@@ -21,7 +21,6 @@ from sightread.db.models import (
     DocumentTicket,
     Folder,
     Job,
-    OAuthGrant,
     Result,
     User,
     utcnow,
@@ -381,42 +380,6 @@ async def test_a_new_grant_reaches_the_library(make_client, tmp_path) -> None:
     assert "read your Files library" in consent.text
     metadata = (await client.get("/.well-known/oauth-authorization-server")).json()
     assert metadata["scopes_supported"] == ["parse", "library"]
-
-
-async def test_a_grant_from_before_the_library_scope_is_told_to_reconnect(
-    make_client, tmp_path
-) -> None:
-    client = make_client(workspaces_dir=str(tmp_path / "ws"))
-    client_id, tokens = await _connected(client)
-    async with client.app.state.sessionmaker() as db:
-        await db.execute(update(OAuthGrant).values(scope="parse"))
-        await db.commit()
-
-    refused = await client.get("/v1/library", headers=_bearer(tokens["access_token"]))
-    assert refused.status_code == 403
-    assert "remove it in Claude's settings and add it again" in refused.json()["error"]["message"]
-    # Its parse rights stand: an unknown job is still a 404 to it, not a 401.
-    job = await client.get(f"/v1/jobs/{uuid.uuid4()}", headers=_bearer(tokens["access_token"]))
-    assert job.status_code == 404
-
-    async with mcp_running(client), _mcp_session(client, tokens["access_token"]) as session:
-        result = await session.call_tool("list_library", {})
-        parse = await session.call_tool("parse", {})
-    assert result.is_error is True
-    assert "add it again" in result.content[0].text
-    assert parse.is_error is False
-
-    # A refresh keeps the scope of the grant it rotates: never widened without consent.
-    refreshed = await _token(
-        client,
-        grant_type="refresh_token",
-        refresh_token=tokens["refresh_token"],
-        client_id=client_id,
-    )
-    assert refreshed.status_code == 200, refreshed.text
-    assert refreshed.json()["scope"] == "parse"
-    still = await client.get("/v1/library", headers=_bearer(refreshed.json()["access_token"]))
-    assert still.status_code == 403
 
 
 # --- the connector's tools --------------------------------------------------------------------

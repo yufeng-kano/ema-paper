@@ -609,3 +609,92 @@ async def test_jobs_lose_the_provider_connection_and_always_hold_a_prompt(scratc
     finally:
         await engine.dispose()
     _alembic(scratch_url, "upgrade", "head")
+
+
+async def test_the_upgrade_revokes_every_grant_without_the_library(scratch_url) -> None:
+    """d10760d56782: a grant whose scope lacks `library` is revoked, and an unspent ticket
+    minted under one deleted, so nothing reaches the library it was not granted; a spent
+    ticket keeps reading its job, and the downgrade gives every ticket left the library
+    (docs/auth.md § 4, § 5)."""
+    _alembic(scratch_url, "upgrade", "185b2581586c")
+    engine = create_async_engine(scratch_url)
+    revoked_before = datetime(2026, 11, 2, tzinfo=UTC)
+    grant = (
+        "INSERT INTO oauth_grants (client_id, user_id, kind, token_hash, scope, expires_at, "
+        "revoked_at, created_at) VALUES ('c', :user, :kind, :hash, :scope, "
+        "now() + interval '1 day', :revoked, now())"
+    )
+    ticket = (
+        "INSERT INTO upload_tickets (user_id, token_hash, prefix, job_id, created_at, "
+        "expires_at, spent_at, library_access) VALUES (:user, :hash, 'srt_...x', :job, "
+        "now(), now() + interval '1 hour', :spent, :library)"
+    )
+    try:
+        async with engine.begin() as db:
+            user = await _user(db, 1)
+            job_id = await _job(db, user)
+            await db.execute(
+                text(
+                    "INSERT INTO oauth_clients (client_id, client_name, redirect_uris, "
+                    "created_at) VALUES ('c', 'Claude', '[]'::jsonb, now())"
+                )
+            )
+            for kind, scope, revoked in (
+                ("access", "parse", None),
+                ("refresh", "parse", None),
+                ("code", "", None),
+                ("refresh", "parse", revoked_before),
+                ("access", "parse library", None),
+                ("refresh", "parse library", None),
+                ("code", "library parse", None),
+            ):
+                await db.execute(
+                    text(grant),
+                    {
+                        "user": user,
+                        "kind": kind,
+                        "hash": f"{kind}-{scope}-{revoked}",
+                        "scope": scope,
+                        "revoked": revoked,
+                    },
+                )
+            for name, job, spent, library in (
+                ("unspent-parse-only", None, None, False),
+                ("spent-parse-only", job_id, revoked_before, False),
+                ("unspent-library", None, None, True),
+            ):
+                await db.execute(
+                    text(ticket),
+                    {"user": user, "hash": name, "job": job, "spent": spent, "library": library},
+                )
+
+        _alembic(scratch_url, "upgrade", "head")
+        async with engine.connect() as db:
+            grants = {
+                (kind, scope, revoked_at is None, revoked_at == revoked_before)
+                for kind, scope, revoked_at in await db.execute(
+                    text("SELECT kind, scope, revoked_at FROM oauth_grants")
+                )
+            }
+            tickets = set(
+                (await db.execute(text("SELECT token_hash FROM upload_tickets"))).scalars()
+            )
+        assert grants == {
+            ("access", "parse", False, False),
+            ("refresh", "parse", False, False),
+            ("code", "", False, False),
+            ("refresh", "parse", False, True),
+            ("access", "parse library", True, False),
+            ("refresh", "parse library", True, False),
+            ("code", "library parse", True, False),
+        }
+        assert tickets == {"spent-parse-only", "unspent-library"}
+
+        _alembic(scratch_url, "downgrade", "-1")
+        async with engine.connect() as db:
+            restored = (
+                await db.execute(text("SELECT token_hash, library_access FROM upload_tickets"))
+            ).all()
+        assert set(restored) == {("spent-parse-only", True), ("unspent-library", True)}
+    finally:
+        await engine.dispose()

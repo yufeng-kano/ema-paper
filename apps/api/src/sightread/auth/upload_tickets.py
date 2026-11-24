@@ -60,7 +60,6 @@ async def mint(
     settings: Settings,
     user: User,
     *,
-    library_access: bool = False,
     into_library: bool = False,
     folder_id: int | None = None,
 ) -> tuple[UploadTicket, str]:
@@ -69,12 +68,9 @@ async def mint(
     The rate limit counts tickets *minted* in the last hour, before cleanup, so a short TTL
     cannot dilute it. Commits, and returns the row plus the plaintext shown exactly once.
 
-    `library_access` records that the minting grant reaches the library; `into_library`
-    and `folder_id` where the upload is filed, decided here and never by the upload's own
-    form (docs/auth.md § 5, docs/mcp.md § Filing into Files).
+    `into_library` and `folder_id` say where the upload is filed, decided here and never by
+    the upload's own form (docs/auth.md § 5, docs/mcp.md § Filing into Files).
     """
-    if into_library and not library_access:
-        raise ValueError("A ticket that files into the library needs the library's access")
     now = utcnow()
     await check_mint_rate(db, settings, user.id)
 
@@ -90,7 +86,6 @@ async def mint(
         prefix=display_prefix(token),
         created_at=now,
         expires_at=now + timedelta(seconds=settings.upload_ticket_ttl_seconds),
-        library_access=library_access,
         into_library=into_library,
         folder_id=folder_id if into_library else None,
     )
