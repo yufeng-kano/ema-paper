@@ -472,7 +472,7 @@ async function select(id: number) {
   card.value = null
   // The cards' state stays: keyed by tool-call id, it belongs to the card, not to the
   // conversation now open, and a thread switched away from and back must not offer to
-  // revert a commit the reader already reverted (docs/web.md § Agent panel).
+  // revert a commit the reader already reverted (docs/web.md § The agent panel, *Revert*).
   await reloadBranch(id, null)
 }
 

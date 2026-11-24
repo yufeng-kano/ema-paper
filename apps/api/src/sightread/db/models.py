@@ -853,7 +853,7 @@ class DocumentTicket(Base):
 
 
 class OAuthClient(Base):
-    """Dynamically registered Claude Connector clients (docs/auth.md § OAuth AS)."""
+    """Dynamically registered Claude Connector clients (docs/auth.md § 4)."""
 
     __tablename__ = "oauth_clients"
 

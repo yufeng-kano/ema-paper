@@ -239,7 +239,8 @@ def display_content(content: list) -> list:
     selection and the quote are sent as the passage alone, without the line that
     introduces it to the model, so the note the panel shows counts the passage and
     nothing else; a command's skill, an attached file and a whole section are sent as what
-    they name, not the text the model reads (docs/api.md § Chat)."""
+    they name, not the text the model reads
+    (docs/api.md § Chat, `GET /api/conversations/{id}`)."""
     shown = []
     for block in content:
         if not isinstance(block, dict):

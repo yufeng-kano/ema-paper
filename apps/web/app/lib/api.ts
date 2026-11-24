@@ -45,7 +45,8 @@ export class ApiRequestError extends Error {
   readonly status: number
   readonly type: ApiErrorType
   /** The envelope's other fields — a 402's `need`, `remaining`, `period_end`, a console
-   *  409's `reason` (and `impact`) (docs/api.md § Errors); empty when the envelope has none. */
+   *  409's `reason` (and `impact`) (docs/api.md § Errors, docs/billing.md § Refusals,
+   *  docs/admin.md § Answer shapes); empty when the envelope has none. */
   readonly details: Record<string, unknown>
 
   constructor(status: number, type: ApiErrorType, message: string, details: Record<string, unknown> = {}) {

@@ -76,7 +76,7 @@ def _authors(client: AsyncClient) -> set[str]:
 async def test_the_files_page_lists_its_own_threads_and_no_one_elses(chat_client) -> None:
     """The list holds the caller's library conversations that hold a message, the one
     continued last first: never a document's, never another reader's, never an empty one
-    (docs/api.md § Chat)."""
+    (docs/api.md § Chat, `GET/POST /api/library/conversations`)."""
     client = chat_client
     stub_messages([DONE, DONE, DONE])
     assert (await client.get("/api/library/conversations")).json() == {"conversations": []}

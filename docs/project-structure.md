@@ -179,7 +179,8 @@ ema-paper/
 ### PDFs and the upstream
 
 - `parsing/poppler.py` is the only module that spawns Poppler; everything else consumes its typed results.
-- No PDF library is imported anywhere, because PyMuPDF is AGPL and the only PDF engine is Poppler as a separate program ([parsing.md](./parsing.md)).
+- The application imports no PDF library, because PyMuPDF is AGPL and the only PDF engine is Poppler as a separate program ([parsing.md](./parsing.md)).
+- The tests' fixture PDFs are built with `reportlab`, a dev dependency (BSD) the application never imports ([testing.md](./testing.md) § The suite).
 - `upstream/` is the only package that calls the model upstream, Kano Proxy on the operator's key: `client.py` for vision calls and the catalog, `anthropic.py` for every Messages API call.
 - `kano_connection` in `upstream/client.py` is the only code that reads the value of `KANO_PROXY_API_KEY`; its callers hold the `Connection` it returns and hand it back to `upstream/`.
 - Elsewhere only whether the key is set is checked: `config.py`, and the console's settings page, which shows a secret as set or unset.

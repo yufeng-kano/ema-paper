@@ -19,6 +19,8 @@ Why subprocess, not a linked library:
 - Free multi-core parallelism.
 - Licensing: Poppler is GPL — fine to invoke as a separate program; PyMuPDF is AGPL and banned here.
 
+The rule binds the application, which imports no PDF library. The tests build their fixture PDFs with a dev dependency ([testing.md](./testing.md) § The suite).
+
 Every subprocess gets a timeout (default 60 s/page) and runs against the job's temp directory only.
 
 ## Vision-only conversion

@@ -19,7 +19,7 @@ In the order a newcomer should meet them. Each entry says what the doc is the ho
   - Read: first, for any task.
 - **[product.md](./product.md)** — what Ema Paper is and is not: its scope, its name, where it departs from the origin spec, and the trust model between readers, operators and documents.
   - Read: a feature that changes the product's scope, or who can see what.
-- **[project-structure.md](./project-structure.md)** — where the code lives: the monorepo's layout, each module's job, and the boundaries that say which module alone may do what.
+- **[project-structure.md](./project-structure.md)** — where the code lives: the monorepo's layout, each module's job, and the boundaries that say which module alone may do what and what the code never imports.
   - Read: adding or moving a module, or deciding where a change belongs.
 
 ### The API and auth
@@ -111,7 +111,7 @@ Sign in with Google and upload a PDF or a scan — or `POST /v1/parse` it with a
 
 For whoever edits them next.
 
-- **The present tense.** A doc states the system as it is. No history, no dates of changes, no "since" or "no longer": git has the history.
+- **The present tense.** A doc states the system as it is. No history, no dates of changes, no "since" or "no longer" about what the system was: git has the history.
 - **One fact per sentence.** Independent rules are a list. A table's cells stay short, and the detail sits beneath the table.
 - **One home per fact.** Each fact is stated in the doc the map names as its home; every other doc links to it instead of restating it.
 - **Sections are cited by heading**, as `[chat.md](./chat.md) § Tools`, or by the section sign and the heading alone within one doc; a bold lead-in is cited in italics after the heading. So a heading is a stable name: renaming one means updating every citation of it.

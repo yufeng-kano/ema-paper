@@ -314,7 +314,8 @@ async def test_only_a_pdf_or_an_image_converts(writer) -> None:
     assert (writer.root / "files" / "archive.zip").is_file()
     markdown = (await upload(writer, "notes.md", b"# Notes\n", "text/markdown")).json()
     assert (await _convert(writer, markdown["id"])).status_code == 404
-    # Neither has a second view to remember (docs/api.md § PUT …/view).
+    # Neither has a second view to remember
+    # (docs/api.md § `PUT /api/library/documents/{id}/view`).
     for document_id in (zipped["id"], markdown["id"]):
         assert (await _view(writer, document_id, "original")).status_code == 400
     # A file in the Trash is not there to convert.

@@ -31,6 +31,7 @@
 - `TEST_DATABASE_URL` is not a `Settings` field; it is read once, at import, before that fixture runs.
 - Tests of PostgreSQL-only behavior (foreign-key actions, row locks, SKIP LOCKED, `pg_locks`, the migrations) skip on the SQLite fallback, so run with `TEST_DATABASE_URL` set before shipping a change they cover.
 - Fixture documents in `tests/fixtures/`: a small text-layer PDF, a scanned-style PDF (rendered-only), a multi-page mix, one corrupt file, tiny jpg/png/webp/heic images. Generate or vendor tiny files — keep fixtures under a few hundred KB each.
+- The fixture PDFs are built with `reportlab`, a dev dependency (BSD). The application imports no PDF library ([parsing.md](./parsing.md) § PDF engine: Poppler via subprocess — this is a hard rule).
 - Poppler is a real dependency of the test environment. Subprocess wrappers are tested against real fixtures, not mocked.
 - The reference environment is a Linux container: `ghcr.io/astral-sh/uv:python3.12-bookworm` with `poppler-utils` and `git` installed. Linux because the suite needs `os.O_PATH` and `/proc/self/fd`. Every run is bounded by `timeout`.
 

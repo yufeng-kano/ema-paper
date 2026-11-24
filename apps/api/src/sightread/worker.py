@@ -289,7 +289,8 @@ async def run_worker(stop: asyncio.Event) -> None:
             )
             if ran is None:
                 # Shutting down mid-run: hand the job back to the queue rather than
-                # leaving it stuck in `running` (docs/jobs.md § Retention covers the file).
+                # leaving it stuck in `running`
+                # (docs/jobs.md § Interrupted and failed jobs, *Shutdown*).
                 async with sessionmaker() as db:
                     requeued = await requeue_job(db, job_id, generation)
                 if requeued:

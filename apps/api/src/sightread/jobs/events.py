@@ -1,4 +1,4 @@
-"""SSE progress streams (docs/api.md § events, docs/jobs.md § Progress).
+"""SSE progress streams (docs/api.md § GET /v1/jobs/{id}/events, docs/jobs.md § Progress).
 
 The database is the only source of truth: `NOTIFY` merely wakes a stream up, and a stream
 that never hears a notification still makes progress by polling. That keeps the contract
@@ -114,7 +114,7 @@ async def stream_job_events(
     database_url: str,
     job_id: uuid.UUID,
 ) -> AsyncIterator[str]:
-    """The SSE rendering of `iter_job_events` (docs/api.md § events)."""
+    """The SSE rendering of `iter_job_events` (docs/api.md § GET /v1/jobs/{id}/events)."""
     async for event, data in iter_job_events(sessionmaker, database_url, job_id):
         yield ": keepalive\n\n" if event == KEEPALIVE else sse(event, data)
 

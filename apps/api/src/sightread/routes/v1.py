@@ -399,8 +399,9 @@ async def job_figure(
     db: DbSession,
     settings: AppSettings,
 ):
-    """One figure's crop, the one the web reader shows (docs/api.md § GET
-    /v1/jobs/{id}/figures/…): the job's own, never another parse's."""
+    """One figure's crop, the one the web reader shows
+    (docs/api.md § GET /v1/jobs/{id}/figures/{page}/{ymin},{xmin},{ymax},{xmax}): the job's
+    own, never another parse's."""
     return await library.figure_crop_response(
         settings, await _owned_job(db, job_id, user), page, bbox
     )

@@ -49,7 +49,7 @@ interface ConsolePage {
 
 /**
  * The console's pages in nav order — the order the sidebar lists them and `/admin` picks the
- * first readable one from. A page added later takes its place here (docs/admin.md § Roadmap).
+ * first readable one from. A page added later takes its place here (docs/admin.md § Pages).
  */
 export const CONSOLE_PAGES: readonly ConsolePage[] = [
   // `/admin` itself is the Overview, `jobs.read`'s like Jobs and Usage (docs/admin.md § Pages).
