@@ -1,9 +1,8 @@
 """Single-use upload tickets for the MCP `parse` tool (docs/auth.md § 5).
 
 Format ``srt_<32 url-safe chars>``. Returned by the tool exactly once, stored as a SHA-256
-hash. A ticket is worth one `POST /v1/parse` — a parse, or the retry
-of a failed one — and then only reads of the job that upload created — never an API key's
-rights, never `/mcp`.
+hash. A ticket is worth one `POST /v1/parse` — a parse, or the retry of a failed one — and
+then only reads of the job that upload created — never an API key's rights, never `/mcp`.
 """
 
 from __future__ import annotations
@@ -50,8 +49,9 @@ async def mint(
 ) -> tuple[UploadTicket, str]:
     """Issue a ticket for this user, tidying up their dead ones on the way.
 
-    The rate limit counts tickets minted in the last hour, before cleanup. Commits, and
-    returns the row plus the plaintext shown exactly once.
+    The rate limit counts tickets minted in the last hour, expired ones included: the
+    cleanup leaves those the hour still counts. Commits, and returns the row plus the
+    plaintext shown exactly once.
 
     `into_library` and `folder_id` say where the upload is filed, decided here and never by
     the upload's own form (docs/auth.md § 5, docs/mcp.md § Filing into Files).
@@ -59,7 +59,7 @@ async def mint(
     now = utcnow()
     await check_mint_rate(db, settings, user.id)
     await delete_expired(db, UploadTicket, user.id, now)
-    token, _ = new_token(TICKET_PREFIX)
+    token = new_token(TICKET_PREFIX)
     row = UploadTicket(
         user_id=user.id,
         token_hash=hash_token(token),

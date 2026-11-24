@@ -49,7 +49,7 @@ Every upstream call runs on the operator's own Kano Proxy key, `KANO_PROXY_API_K
 - Users hold no upstream credential of their own.
 - `auth/crypto.py` holds only two things:
   - the token hashing every stored credential uses (sessions, API keys, OAuth grant tokens, upload and document tickets);
-  - the minting of the prefixed `sr_` / `srt_` / `srd_` tokens with their `prefix...last4` display form.
+  - the minting of the prefixed `sr_` / `srt_` / `srd_` tokens.
 
 ## 4. OAuth 2.1 authorization server — for Claude Connectors
 
@@ -84,6 +84,7 @@ Implementation notes:
   - The app's own error envelope stays on `/v1` and `/api`.
   - `/oauth/authorize` answers a browser, so it renders HTML or redirects.
 - **Codes** live 5 min and are single use.
+  - Redeeming a code or a refresh token locks its row, so two requests racing with one get one token pair; the other is answered `invalid_grant`.
   - A code is bound to client, user, PKCE challenge and the redirect URI it was issued for (`oauth_grants.redirect_uri`). A token request that sends `redirect_uri` must send that one; one that omits it is not checked against it.
   - A refused client or redirect URI never redirects — it renders an error page.
 - **Consent CSRF**: the consent form carries a one-time token stored in the short-lived signed cookie; a cross-site form post cannot produce it.
@@ -109,7 +110,7 @@ A ticket lets an agent do exactly one upload — a parse, or the retry of a fail
   - `last` on an unspent ticket answers **409**: the ticket has created no parse yet (its upload still arriving, refused, or never sent), and a refused or unsent one can still upload. It does not answer with the expired copy below, which would send the agent to mint again for an upload that is still refused.
   - Every other endpoint — `/mcp` included — refuses `srt_` tokens.
 - **Rejection copy is part of the contract.** A spent/expired/unknown ticket gets 401 with: `Upload ticket expired or already spent — call the parse tool again for a fresh ticket. Re-uploading the same file joins its parse while it runs and returns it once it has succeeded; a failed parse is resumed with the retry command.` That message is the agent's only recovery hint, so it lives in the response, not just here.
-- **Mint rate limit:** `UPLOAD_TICKET_RATE_PER_HOUR` (default 30) per user; exceeding it is a 429-shaped tool error. Minting also deletes that user's expired tickets: opportunistic cleanup, no sweeper involvement — the table stays small because every mint tidies up.
+- **Mint rate limit:** `UPLOAD_TICKET_RATE_PER_HOUR` (default 30) per user; exceeding it is a 429-shaped tool error. Minting also deletes that user's expired tickets older than the rate window, so an expired ticket still counts for its hour: opportunistic cleanup, no sweeper involvement — the table stays small because every mint tidies up.
 - **Where the upload goes.**
   - When the `parse` tool was given a `folder`, the ticket records that the upload is filed into Files (`into_library`) and where (`folder_id`, NULL the top level).
   - The destination is chosen at the mint, so the upload's own form cannot widen it: `folder` sent with a ticket is **400**.
@@ -119,7 +120,7 @@ A ticket lets an agent do exactly one upload — a parse, or the retry of a fail
   - The folder is a foreign key `ON DELETE SET NULL`. A folder deleted for good before the upload leaves the ticket filing at the top level. A folder in the Trash refuses the upload with **404**, the ticket unspent.
 - Never in query strings, like every other bearer.
 
-## 7. Document tickets — short-lived, one document (the MCP library tools)
+## 6. Document tickets — short-lived, one document (the MCP library tools)
 
 The connector's library tools hand the agent `curl` commands, as `parse` does, and the commands need a credential the agent can hold: a **document ticket**, for one document of the caller's. Only the `read_document` and `write_document` tools mint one ([mcp.md](./mcp.md) § The library tools). So an OAuth connector still never holds a durable credential, and a leaked ticket is worth one document for an hour.
 
@@ -133,7 +134,7 @@ The connector's library tools hand the agent `curl` commands, as `parse` does, a
   - Every other endpoint — the job routes, `/v1/parse`, `/mcp` — refuses `srd_` as any unknown bearer (401; `/v1/jobs/last*` its 400 for anything but an upload ticket).
 - **The ticket only names what the account may reach.** Each request still resolves the document as the account's own and live. A document put in the Trash after the mint answers 404. A document deleted for good takes its tickets with its row, and the ticket then gets the 401 above.
 - **Lifetime** `DOCUMENT_TICKET_TTL_SECONDS` (default 3600). Recovery from an expired ticket is calling the tool again. The revision a save sends is the file's content hash, not the ticket's, so a copy downloaded on one ticket saves on another.
-- **Mint rate limit:** `DOCUMENT_TICKET_RATE_PER_HOUR` (default 120) per user, counted apart from upload tickets; exceeding it is a 429-shaped tool error. Minting also deletes that user's expired document tickets, as upload tickets tidy up.
+- **Mint rate limit:** `DOCUMENT_TICKET_RATE_PER_HOUR` (default 120) per user, counted apart from upload tickets; exceeding it is a 429-shaped tool error. Minting also deletes that user's expired document tickets older than the rate window, as upload tickets tidy up.
 - Never in query strings, like every other bearer.
 
 ## Deleting the account

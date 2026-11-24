@@ -1,10 +1,9 @@
-"""Short-lived document tickets for the MCP library tools (docs/auth.md § 7).
+"""Short-lived document tickets for the MCP library tools (docs/auth.md § 6).
 
 Format ``srd_<32 url-safe chars>``. Returned by `read_document` or `write_document` exactly
-once, stored as a SHA-256 hash. A ticket names one document of one
-account and a scope: `read` serves that document's `GET` routes under
-`/v1/library/documents/{id}`, `write` its two saves as well. Use never spends it; its
-lifetime does.
+once, stored as a SHA-256 hash. A ticket names one document of one account and a scope:
+`read` serves that document's `GET` routes under `/v1/library/documents/{id}`, `write` its
+two saves as well. Use never spends it; its lifetime does.
 """
 
 from __future__ import annotations
@@ -22,7 +21,7 @@ TICKET_PREFIX = "srd_"
 READ = "read"
 WRITE = "write"
 
-# The agent's only recovery hint, so it travels in the 401 body itself (docs/auth.md § 7).
+# The agent's only recovery hint, so it travels in the 401 body itself (docs/auth.md § 6).
 REJECTION_MESSAGE = (
     "Document ticket expired or for another document — call read_document (or "
     "write_document to save) again for a fresh one."
@@ -34,7 +33,7 @@ async def mint(
 ) -> tuple[DocumentTicket, str]:
     """Issue a ticket for one document of this user, tidying up their dead ones on the way.
 
-    The rate limit counts tickets minted in the last hour, before cleanup, as upload
+    The rate limit counts tickets minted in the last hour, expired ones included, as upload
     tickets count theirs. Commits, and returns the row plus the plaintext shown once.
     """
     now = utcnow()
@@ -46,7 +45,7 @@ async def mint(
         "Too many document tickets minted; retry later",
     )
     await delete_expired(db, DocumentTicket, user.id, now)
-    token, _ = new_token(TICKET_PREFIX)
+    token = new_token(TICKET_PREFIX)
     row = DocumentTicket(
         user_id=user.id,
         document_id=document_id,

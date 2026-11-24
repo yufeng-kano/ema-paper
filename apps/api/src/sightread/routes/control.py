@@ -783,7 +783,7 @@ async def chat_agent_context(
         )
     )
     shell = ledger.sandbox_granted(settings, await ledger.plan_of(db, settings, user.id))
-    tools = [str(tool["name"]) for tool in chat_runner.turn_tools(shell, settings)]
+    tools = _agent_tools(CHAT.name, shell, settings)
     parts = chat_agent.system_parts(
         # Without a document the template keeps its tokens, its tool lines filtered as a
         # turn's would be.

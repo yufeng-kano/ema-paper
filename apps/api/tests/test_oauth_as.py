@@ -6,6 +6,7 @@ session, exchange the code, then use the token where a project API key would go.
 
 from __future__ import annotations
 
+import asyncio
 import re
 import uuid
 from datetime import timedelta
@@ -14,12 +15,12 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from sightread.auth.crypto import hash_token
 from sightread.db.models import OAuthGrant, utcnow
 from sightread.routes.oauth import MARK
-from tests.conftest import CSRF_HEADERS, mcp_running
+from tests.conftest import CSRF_HEADERS, mcp_running, postgres_only
 from tests.connector_helpers import (
     CHALLENGE,
     CONSENT_TOKEN_RE,
@@ -284,3 +285,58 @@ def test_the_consent_page_mark_is_the_favicon() -> None:
         return re.sub(r"^<svg[^>]*>", "", svg.strip()).replace('"', "'")
 
     assert shapes(MARK) == shapes(favicon.read_text())
+
+
+async def _until_two_requests_wait_on_a_lock(sessionmaker) -> None:
+    """Until two other connections of this database wait on a lock (PostgreSQL)."""
+    for _ in range(250):
+        async with sessionmaker() as probe:
+            waiting = await probe.scalar(
+                text(
+                    "SELECT count(*) FROM pg_stat_activity"
+                    " WHERE wait_event_type = 'Lock' AND datname = current_database()"
+                )
+            )
+        if waiting >= 2:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("the two requests never waited on the lock")
+
+
+@postgres_only
+@pytest.mark.parametrize("grant", ["code", "refresh"])
+async def test_two_redemptions_at_once_issue_one_token_pair(
+    client: AsyncClient, sessionmaker, grant: str
+) -> None:
+    """Both requests read the grant while a third transaction holds its row; once it lets
+    go, the first spends the grant and the second finds it spent."""
+    if grant == "code":
+        await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+        client_id = (await register_client(client)).json()["client_id"]
+        presented = await authorize_code(client, client_id)
+        form = {
+            "grant_type": "authorization_code",
+            "code": presented,
+            "code_verifier": VERIFIER,
+            "client_id": client_id,
+            "redirect_uri": REDIRECT_URI,
+        }
+    else:
+        client_id, tokens = await oauth_connected(client)
+        presented = tokens["refresh_token"]
+        form = {"grant_type": "refresh_token", "refresh_token": presented, "client_id": client_id}
+
+    async with sessionmaker() as holder:
+        await holder.execute(
+            select(OAuthGrant)
+            .where(OAuthGrant.token_hash == hash_token(presented))
+            .with_for_update()
+        )
+        requests = [asyncio.create_task(token_request(client, **form)) for _ in range(2)]
+        await _until_two_requests_wait_on_a_lock(sessionmaker)
+        await holder.commit()
+    answers = await asyncio.gather(*requests)
+
+    assert sorted(answer.status_code for answer in answers) == [200, 400]
+    [refused] = [answer for answer in answers if answer.status_code == 400]
+    assert refused.json()["error"] == "invalid_grant"

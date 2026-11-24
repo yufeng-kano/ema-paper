@@ -348,7 +348,7 @@ document_tickets id PK, user_id FK, document_id FK, scope read|write,
                  INDEX (document_id)              -- a document delete's cascade reads it
                  CHECK (scope IN ('read', 'write'))
                  -- a short-lived credential for one document, minted by the MCP
-                 -- library tools (auth.md § 7); not spent by use; both foreign keys
+                 -- library tools (auth.md § 6); not spent by use; both foreign keys
                  -- ON DELETE CASCADE, so a document deleted for good takes its tickets
 oauth_clients    client_id PK, client_name, redirect_uris JSONB, created_at
 oauth_grants     id PK, client_id FK, user_id FK, kind code|access|refresh,

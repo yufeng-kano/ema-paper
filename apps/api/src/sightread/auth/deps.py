@@ -194,7 +194,7 @@ LibraryUser = Annotated[User, Depends(require_library_user)]
 
 async def _document_caller(request: Request, db: AsyncSession, scope: str) -> User:
     """A `/v1/library/documents/{document_id}*` route: a durable credential, or a document
-    ticket for that one document whose scope covers the route (docs/auth.md § 7). Either
+    ticket for that one document whose scope covers the route (docs/auth.md § 6). Either
     way the route still resolves the document as the caller's own and live."""
     credential = bearer_credential(request)
     if credential is None or not credential.startswith(document_tickets.TICKET_PREFIX):

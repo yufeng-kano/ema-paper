@@ -163,7 +163,7 @@ The connector also reads the Files library and saves a document's text and notes
 
 ### `read_document`
 
-Input: `document_id`. Output: a `read` document ticket ([auth.md](./auth.md) § 7), `expires_at`, `document` (the row `GET /v1/library/documents/{id}` answers: `{id, folder_id, name, path, kind, status, media_type, page_count, size_bytes, created_at, finished_at, original}`) and the commands:
+Input: `document_id`. Output: a `read` document ticket ([auth.md](./auth.md) § 6), `expires_at`, `document` (the row `GET /v1/library/documents/{id}` answers: `{id, folder_id, name, path, kind, status, media_type, page_count, size_bytes, created_at, finished_at, original}`) and the commands:
 
 - **download**, for a parse or a markdown document:
   - `d=` names a local directory. By default it is the directory name the workspace gives the document — no separator, never `.`, `..` or a hidden name — behind `./` when it starts with `-`, quoted as one shell word. Every name the command writes is quoted the same way.
@@ -224,7 +224,7 @@ Input: `document_id`. Output: a `write` document ticket, `expires_at`, `document
   - When a bearer was presented and resolves to no one, the challenge also carries `error="invalid_token"`: `Bearer error="invalid_token", resource_metadata="…"`.
 - **The library tools** resolve the caller in the same guard.
   - They read the library through the control plane's own reads (the one snapshot, the live rows, the document's own liveness).
-  - They mint through the document ticket module ([auth.md](./auth.md) § 7).
+  - They mint through the document ticket module ([auth.md](./auth.md) § 6).
   - The commands use options of any `curl` the `parse` commands may meet (`--etag-save` since 7.68), are written for bash, dash and zsh, and quote every name the reader gave as one shell word.
 - **`parse`** does these things and nothing else:
   - resolves the caller to a user;

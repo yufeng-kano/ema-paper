@@ -56,10 +56,6 @@ class Sale(NamedTuple):
     packs: dict[str, pay.CatalogPack]
 
 
-def _catalog_cache(request: Request) -> pay.CatalogCache:
-    return request.app.state.pay_catalog
-
-
 async def _may_have_purchases(db: DbSession, user_id: int) -> bool:
     """Whether Pay may list purchases worth fetching for the user: a pack checkout still
     open here, or a paid pack whose refund would arrive the same way. A user with neither
@@ -126,7 +122,7 @@ async def _on_sale(request: Request, settings: AppSettings) -> Sale | None:
     if not settings.kano_pay_configured:
         return None
     try:
-        catalog = await _catalog_cache(request).get(pay.PayClient(settings))
+        catalog = await request.app.state.pay_catalog.get(pay.PayClient(settings))
     except (pay.PayUnavailable, pay.PayRefused) as exc:
         logger.warning("Kano Pay catalog unavailable: %s", exc)
         return None

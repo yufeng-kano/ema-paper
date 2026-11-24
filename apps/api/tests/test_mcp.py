@@ -183,6 +183,32 @@ async def test_minting_cleans_up_this_users_expired_tickets(api_client, sessionm
     assert len(hashes) == 1
 
 
+async def test_a_ticket_that_expired_within_the_hour_still_counts_toward_the_rate(
+    make_client, sessionmaker
+) -> None:
+    """A TTL shorter than the hour cannot dilute the rate: the cleanup keeps an expired
+    ticket until the rate window no longer counts it."""
+    client = await api_key_client(make_client(upload_ticket_rate_per_hour=2))
+    async with sessionmaker() as db:
+        user = (await db.execute(select(User))).scalars().one()
+        db.add(
+            UploadTicket(
+                user_id=user.id,
+                token_hash="dead" * 16,
+                created_at=utcnow() - timedelta(minutes=10),
+                expires_at=utcnow() - timedelta(minutes=5),
+            )
+        )
+        await db.commit()
+
+    async with mcp_running(client), mcp_session(client) as session:
+        await _mint(session)
+        refused = await session.call_tool("parse", {})
+
+    assert refused.is_error is True
+    assert "retry later" in refused.content[0].text
+
+
 async def test_an_invalid_token_never_reaches_a_tool(api_client: AsyncClient) -> None:
     async with mcp_running(api_client):
         response = await api_client.post(

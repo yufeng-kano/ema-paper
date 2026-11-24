@@ -16,8 +16,10 @@ KEY_PREFIX = "sr_"
 
 
 async def create_api_key(db: AsyncSession, user: User, name: str) -> tuple[ApiKey, str]:
-    key, display = new_token(KEY_PREFIX)
-    row = ApiKey(user_id=user.id, name=name, key_hash=hash_token(key), prefix=display)
+    key = new_token(KEY_PREFIX)
+    row = ApiKey(
+        user_id=user.id, name=name, key_hash=hash_token(key), prefix=f"{KEY_PREFIX}...{key[-4:]}"
+    )
     db.add(row)
     await db.flush()
     return row, key

@@ -10,6 +10,7 @@ import uuid
 import zlib
 from pathlib import Path
 
+import httpx
 import pytest
 from httpx import AsyncClient
 from PIL import Image
@@ -281,3 +282,90 @@ async def test_a_chunked_json_body_is_counted_against_the_parse_cap(make_client)
     small = base64.b64encode(b"%PDF-1.4 " + b"x" * 200).decode()
     over = await client.post("/v1/parse", json={"source": small, "filename": "a.pdf"})
     assert over.status_code == 413
+
+
+def _multipart(content: bytes) -> tuple[bytes, str]:
+    """A `/v1/parse` form carrying `content` as its PDF: the body and its Content-Type."""
+    request = httpx.Request(
+        "POST",
+        "https://testserver/v1/parse",
+        files={"file": ("text.pdf", content, "application/pdf")},
+        data={"model": PARSE_MODEL},
+    )
+    return request.read(), request.headers["content-type"]
+
+
+async def test_a_multipart_label_in_any_letter_case_is_read_as_the_form(
+    client: AsyncClient, documents
+) -> None:
+    """MIME types ignore case, as the body-limit middleware does: the route reads such a
+    body as the form, never as JSON it would hold whole."""
+    await api_key_client(client)
+    body, content_type = _multipart(documents["text_pdf"].read_bytes())
+
+    answers = [
+        await client.post("/v1/parse", content=body, headers={"Content-Type": label})
+        for label in (
+            content_type,
+            content_type.replace("multipart/form-data", "Multipart/Form-Data"),
+        )
+    ]
+
+    assert [answer.status_code for answer in answers] == [202, 202], answers[1].text
+    assert answers[0].json()["job_id"] == answers[1].json()["job_id"]
+
+
+async def test_an_oversized_multipart_body_in_another_letter_case_stops_at_the_cap(
+    make_client,
+) -> None:
+    client = await api_key_client(make_client(upload_max_bytes=64))
+    body, content_type = _multipart(b"%PDF-1.4 " + b"x" * (512 * 1024))
+    chunks = [body[start : start + 4096] for start in range(0, len(body), 4096)]
+    sent = 0
+
+    async def undeclared():
+        # No Content-Length: only the capped reader can stop this body.
+        nonlocal sent
+        for chunk in chunks:
+            sent += 1
+            yield chunk
+
+    response = await client.post(
+        "/v1/parse",
+        content=undeclared(),
+        headers={
+            "Content-Type": content_type.replace("multipart/form-data", "MULTIPART/FORM-DATA")
+        },
+    )
+
+    assert response.status_code == 413
+    assert sent < len(chunks)
+
+
+async def test_a_repeated_content_type_is_read_as_the_route_reads_it(make_client) -> None:
+    """The middleware decides multipart on the Content-Type the route reads, the first of
+    repeated ones: a JSON body that also claims to be a form is counted at the JSON cap."""
+    client = await api_key_client(make_client(upload_max_bytes=64))
+    cap = client.app.state.settings.parse_json_body_max_bytes
+    payload = json.dumps({"source": "A" * (cap * 4), "filename": "big.pdf"}).encode()
+    chunks = [payload[start : start + 4096] for start in range(0, len(payload), 4096)]
+    sent = 0
+
+    async def undeclared():
+        # No Content-Length: only the middleware's count can stop this body.
+        nonlocal sent
+        for chunk in chunks:
+            sent += 1
+            yield chunk
+
+    response = await client.post(
+        "/v1/parse",
+        content=undeclared(),
+        headers=[
+            ("Content-Type", "application/json"),
+            ("Content-Type", "multipart/form-data; boundary=x"),
+        ],
+    )
+
+    assert response.status_code == 413
+    assert sent < len(chunks)

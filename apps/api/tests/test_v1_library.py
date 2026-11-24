@@ -1,5 +1,5 @@
 """The library on the data plane and the connector's library tools (docs/api.md § The library
-on the data plane, docs/mcp.md § The library tools, docs/auth.md § 4 and § 7).
+on the data plane, docs/mcp.md § The library tools, docs/auth.md § 4 and § 6).
 
 No upstream traffic: every document is seeded in the database and its workspace, so nothing
 here parses (docs/testing.md § Cost safety).

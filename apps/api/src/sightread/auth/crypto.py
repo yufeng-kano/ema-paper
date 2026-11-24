@@ -20,7 +20,6 @@ def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-def new_token(prefix: str) -> tuple[str, str]:
-    """A fresh `<prefix><32 url-safe chars>` token and its `<prefix>...abc4` display form."""
-    token = prefix + secrets.token_urlsafe(_TOKEN_BYTES)
-    return token, f"{prefix}...{token[-4:]}"
+def new_token(prefix: str) -> str:
+    """A fresh `<prefix><32 url-safe chars>` token."""
+    return prefix + secrets.token_urlsafe(_TOKEN_BYTES)

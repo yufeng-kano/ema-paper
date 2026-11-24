@@ -4,7 +4,7 @@ Two planes, one FastAPI app.
 
 - **Data plane `/v1/*`** — authenticated by API key (`Authorization: Bearer sr_...`) or an OAuth access token ([auth.md](./auth.md)). This is the product.
   - `POST /v1/parse`, the `GET /v1/jobs/{id}*` routes (status, `/result`, `/result.md`, `/figures/…`, `/events`) and the `last` forms of all but `/events` additionally accept a single-use upload ticket (`srt_...`, [auth.md](./auth.md) § 5): one upload, then reads of the job that upload created, nothing else.
-  - The routes under `/v1/library/documents/{id}` additionally accept a document ticket (`srd_...`, [auth.md](./auth.md) § 7) for that one document.
+  - The routes under `/v1/library/documents/{id}` additionally accept a document ticket (`srd_...`, [auth.md](./auth.md) § 6) for that one document.
   - An OAuth access token reaches `/v1/library*` too: every live grant holds `library` ([auth.md](./auth.md) § 4).
 - **Control plane `/api/*`** — session cookie (Google OIDC), consumed only by the Nuxt web app.
 
@@ -87,6 +87,7 @@ Multipart form (preferred) or JSON with base64 `source`.
 - The newest is a failed re-convert: **409** saying the library retries it.
 - Two library retries of one document that overlap are one: the later finds it queued and is answered with it, as a data-plane retry is.
 - Not on an upload ticket that files (**400**, the ticket unspent): a retry resumes a parse where it is, so its ticket comes from `parse` without `folder`.
+- Not with `folder` either (**400**, nothing made): a retry files nothing.
 - **409** when there is none; **400** with `force`; **402** when the balance cannot cover the parse's credits again.
 
 Responses:
@@ -238,7 +239,7 @@ Papers are read and annotated in Ema Paper, then handed to Claude — a deck mad
 
 These are the control plane's library reads and its two saves on a data-plane credential, and nothing more: no rename, move, Trash, copy, upload into the library or revert here. The connector's library tools are commands over these routes ([mcp.md](./mcp.md) § The library tools).
 
-Credentials: an API key, an OAuth access token, or — on the routes of its own document only — a document ticket ([auth.md](./auth.md) § 7).
+Credentials: an API key, an OAuth access token, or — on the routes of its own document only — a document ticket ([auth.md](./auth.md) § 6).
 
 Every route answers for the caller's live rows only: a document in the Trash, or in a folder that is, is **404** as on the control plane.
 
@@ -1110,6 +1111,7 @@ Request bodies are capped at six times `CONTENT_MAX_BYTES` plus 64 KiB: **413** 
   - `POST /api/attachments` under `CHAT_ATTACHMENT_MAX_BYTES`.
   - `POST /api/library/images` under `DOCUMENT_IMAGE_MAX_BYTES`.
 - A multipart label on any other route buys no exemption.
+- The label is read in any letter case, and of a repeated `Content-Type` the first one counts, as the route reads it.
 - A JSON body on those four routes is counted too: on `POST /v1/parse` against a ceiling of its own (§ POST /v1/parse), on the others against the cap above.
 
 ### Refusals

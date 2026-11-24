@@ -4,7 +4,7 @@ A shell and nothing more. `parse` mints a single-use upload ticket (docs/auth.md
 formats the `curl` commands that carry it; the document bytes go out-of-band through
 `/v1/parse`, because base64 in tool arguments would burn the file size over again in model
 tokens. The library tools list the Files library inline and, for one document, mint a
-document ticket (docs/auth.md § 7) and format the commands that land it on disk or save its
+document ticket (docs/auth.md § 6) and format the commands that land it on disk or save its
 text back over `/v1/library/documents/{id}` (docs/mcp.md § The library tools). No parsing
 decision, no model choice, no queue knowledge and no workspace write lives here, so an MCP
 spec change touches this file alone (docs/project-structure.md § Boundaries). What makes a

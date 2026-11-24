@@ -1,4 +1,4 @@
-"""What upload tickets and document tickets share (docs/auth.md § 5, § 7): the mint rate,
+"""What upload tickets and document tickets share (docs/auth.md § 5, § 6): the mint rate,
 the cleanup of expired rows, and the lookup of a presented token.
 """
 
@@ -41,8 +41,15 @@ async def delete_expired(
     now: datetime,
 ) -> None:
     """Opportunistic cleanup in the mint's transaction: every mint tidies up the user's
-    dead tickets, so the table stays small without a sweeper."""
-    await db.execute(delete(model).where(model.user_id == user_id, model.expires_at <= now))
+    dead tickets, so the table stays small without a sweeper. An expired ticket stays until
+    it leaves the rate window, so `check_rate` still counts it."""
+    await db.execute(
+        delete(model).where(
+            model.user_id == user_id,
+            model.expires_at <= now,
+            model.created_at <= now - MINT_WINDOW,
+        )
+    )
 
 
 async def resolve_ticket[T: (UploadTicket, DocumentTicket)](

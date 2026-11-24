@@ -71,7 +71,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # (docs/api.md § Limits).
     app.state.preview_slots = asyncio.Semaphore(max(1, settings.page_preview_renders))
 
-    # Before the session layer, so an oversized body is refused before anything reads it.
+    # Inside the session layer, which reads no body: an oversized body is refused before
+    # any route reads it.
     app.add_middleware(
         BodyLimitMiddleware,
         max_bytes=settings.json_body_max_bytes,

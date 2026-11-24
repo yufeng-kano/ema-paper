@@ -132,14 +132,19 @@ async def issue_code(
     return code
 
 
-async def _live_grant(db: AsyncSession, kind: str, presented: str) -> OAuthGrant | None:
-    """Look a grant up by hash and reject anything expired or already spent."""
+async def _live_grant(
+    db: AsyncSession, kind: str, presented: str, *, lock: bool = False
+) -> OAuthGrant | None:
+    """Look a grant up by hash and reject anything expired or already spent.
+
+    `lock` takes the row `FOR UPDATE` for a grant about to be spent: a second redemption
+    waits for the first to commit and then reads the grant spent (docs/auth.md § 4).
+    """
     token_hash = hash_token(presented)
-    row = (
-        await db.execute(
-            select(OAuthGrant).where(OAuthGrant.kind == kind, OAuthGrant.token_hash == token_hash)
-        )
-    ).scalar_one_or_none()
+    query = select(OAuthGrant).where(OAuthGrant.kind == kind, OAuthGrant.token_hash == token_hash)
+    if lock:
+        query = query.with_for_update()
+    row = (await db.execute(query)).scalar_one_or_none()
     if row is None or row.revoked_at is not None or row.expires_at <= utcnow():
         return None
     return row
@@ -184,7 +189,7 @@ async def exchange_code(
     db: AsyncSession, *, code: str, code_verifier: str, client_id: str, redirect_uri: str | None
 ) -> IssuedTokens | None:
     """Authorization code + PKCE verifier → tokens. None means "invalid_grant"."""
-    grant = await _live_grant(db, CODE, code)
+    grant = await _live_grant(db, CODE, code, lock=True)
     if grant is None or grant.client_id != client_id:
         return None
     if redirect_uri is not None and grant.redirect_uri != redirect_uri:
@@ -205,7 +210,7 @@ async def refresh_tokens(
     db: AsyncSession, *, refresh_token: str, client_id: str
 ) -> IssuedTokens | None:
     """Rotate a refresh token: the presented one dies, a new pair is issued."""
-    grant = await _live_grant(db, REFRESH, refresh_token)
+    grant = await _live_grant(db, REFRESH, refresh_token, lock=True)
     if grant is None or grant.client_id != client_id:
         return None
     grant.revoked_at = utcnow()
