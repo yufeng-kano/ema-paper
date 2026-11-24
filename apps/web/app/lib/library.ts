@@ -419,9 +419,10 @@ export function initialView(
   return document.view ?? defaultView
 }
 
-/** What the file viewer shows of a file by itself: what a browser renders safely on its own
- *  and the file route serves inline (docs/api.md § `GET /api/library/documents/{id}/file`).
- *  An SVG is served as a download, so it has none. */
+/** What a browser renders of a file safely on its own, as the file route serves it inline
+ *  (docs/api.md § `GET /api/library/documents/{id}/file`); an SVG is served as a download, so
+ *  it has none. The file viewer shows 'video', 'audio' and 'text'; 'pdf' and 'image' send the
+ *  file to the result viewer's Original view (`originalKind`). */
 type FilePreview = 'image' | 'video' | 'audio' | 'pdf' | 'text' | 'none'
 
 export function filePreview(mediaType: string | null | undefined): FilePreview {

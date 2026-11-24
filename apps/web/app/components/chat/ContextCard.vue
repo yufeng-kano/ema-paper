@@ -15,7 +15,7 @@
  */
 import { CHAT_AGENT, listAgents, type Memory, type MemoryKind } from '~/lib/api'
 import { formatShortDateTime } from '~/lib/format'
-import { parseResultMarkdown, type ResultBlock } from '~/lib/markdown'
+import { parseBlocks, type ResultBlock } from '~/lib/markdown'
 import { modalPanelKey, placeCard } from '~/lib/menu'
 import { SETTINGS_QUERY } from '~/lib/settings'
 import { memoryLineState, type ContextCardView } from '~/lib/thread'
@@ -134,7 +134,7 @@ async function loadInstructions() {
   try {
     const { agents } = await listAgents()
     const text = agents.find((agent) => agent.name === CHAT_AGENT)?.settings.instructions?.trim() ?? ''
-    instructions.value = text ? parseResultMarkdown(text).flatMap((page) => page.blocks) : []
+    instructions.value = text ? parseBlocks(text) : []
   } catch (error) {
     instructionsError.value = await resolve(error)
   } finally {

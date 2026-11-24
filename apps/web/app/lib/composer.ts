@@ -3,6 +3,7 @@
  * draft is a command being typed and which commands it matches, and whether a file may be
  * attached at all before a byte of it is sent.
  */
+import type { UploadLimits } from './api'
 import type { LibraryMessage } from './library'
 
 /** One row of the `/` menu. */
@@ -114,33 +115,30 @@ export type AttachmentRefusal =
   | { reason: 'size'; max: number }
   | { reason: 'count'; max: number }
 
-interface AttachmentLimits {
-  attachment_max_bytes?: number
-  attachments_per_message?: number
-  attachment_extensions?: string[]
-}
+type AttachmentLimits = Pick<UploadLimits, 'attachment_max_bytes' | 'attachments_per_message' | 'attachment_extensions'>
 
 /**
  * Why a file cannot be attached, or null when it can — checked against the server's own
- * numbers before it is uploaded. `attached` is how many the message already carries. A
- * limit the server did not send is not checked here; the upload's answer decides.
+ * numbers before it is uploaded. `attached` is how many the message already carries. While
+ * the limits have not arrived nothing is checked here; the upload's answer decides.
  */
 export function refuseAttachment(
   file: { name: string; size: number },
-  limits: AttachmentLimits | null | undefined,
+  limits: AttachmentLimits | null,
   attached: number,
 ): AttachmentRefusal | null {
-  const perMessage = limits?.attachments_per_message
-  if (perMessage !== undefined && attached >= perMessage) {
-    return { reason: 'count', max: perMessage }
+  if (!limits) {
+    return null
   }
-  const extensions = limits?.attachment_extensions
-  if (extensions?.length && !extensions.map(bare).includes(extensionOf(file.name))) {
+  if (attached >= limits.attachments_per_message) {
+    return { reason: 'count', max: limits.attachments_per_message }
+  }
+  const extensions = limits.attachment_extensions
+  if (extensions.length && !extensions.map(bare).includes(extensionOf(file.name))) {
     return { reason: 'type' }
   }
-  const max = limits?.attachment_max_bytes
-  if (max !== undefined && file.size > max) {
-    return { reason: 'size', max }
+  if (file.size > limits.attachment_max_bytes) {
+    return { reason: 'size', max: limits.attachment_max_bytes }
   }
   return null
 }

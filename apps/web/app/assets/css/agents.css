@@ -1,5 +1,5 @@
-/* The Agent section's sections (app/components/agents/) share their label and note here
-   rather than in a scoped copy each. Prefixed: the settings dialog's nav has a scoped
+/* The Agent section (AgentPanel.vue and its sections in app/components/agents/) shares its
+   label and note here rather than in a scoped copy each. Prefixed: the settings dialog's nav has a scoped
    `.section-label` of its own, which a global one would restyle. */
 
 /* The field label's treatment: a section of the panel, not a heading of the page — also a

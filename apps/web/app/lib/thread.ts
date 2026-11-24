@@ -57,7 +57,7 @@ const COMPACT_LINE = '/compact'
 /** A turn's kind: the record's, else what its `turn_start` said for a turn only the stream
  *  has named so far, else a message turn. */
 export function turnKind(turn: ChatTurn | undefined, group: readonly ChatEvent[] | undefined): TurnKind {
-  if (turn?.kind) {
+  if (turn) {
     return turn.kind
   }
   for (const event of group ?? []) {

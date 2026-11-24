@@ -83,8 +83,7 @@ describe('attachments', () => {
     expect(refuseAttachment({ name: 'a.txt', size: 10 }, limits, 1)).toBeNull()
   })
 
-  it('leaves a limit the server did not send to the server', () => {
-    expect(refuseAttachment({ name: 'a.mov', size: 1e12 }, {}, 99)).toBeNull()
+  it('checks nothing while the limits are loading', () => {
     expect(refuseAttachment({ name: 'a.mov', size: 1e12 }, null, 99)).toBeNull()
   })
 })

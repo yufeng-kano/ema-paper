@@ -39,7 +39,7 @@ import {
   type NameText,
   type UndoFile,
 } from '~/lib/blocks'
-import { COLUMN_WIDTHS, collapses, shownCards, viewerLayout, type Column, type ViewerLayout } from '~/lib/columns'
+import { COLUMN_WIDTHS, shownCards, viewerLayout, type Column, type ViewerLayout } from '~/lib/columns'
 import { isImageFile, type AskRequest } from '~/lib/composer'
 import { cellGroupsToMarkdown, nodesToMarkdown, selectionText, type OrphanListContext } from '~/lib/copy'
 import {
@@ -3836,8 +3836,6 @@ watch(agentMounted, (mounted) => {
 })
 
 // --- column widths -----------------------------------------------------------------------
-// The Files page's Agent card (FilesAgent.vue) keeps a copy of the grip's behaviour and of its
-// `.split` and `.card` styles, for one card beside the list: the two change together.
 
 const columnsBox = ref<HTMLElement | null>(null)
 /** The width the document and its columns share, kept current so the columns are clamped
@@ -3848,11 +3846,6 @@ const columnWidth = {
   notes: ref<number>(chosenWidth.notes),
   agent: ref<number>(chosenWidth.agent),
 }
-/** The grip being dragged: its card, where the drag started and the card's width then. */
-const resizing = ref<{ column: Column; x: number; width: number } | null>(null)
-/** The card a drag took below half its minimum: hidden while the drag lasts, closed if it
- *  ends there (docs/web.md § Column widths). */
-const dragHidden = ref<Column | null>(null)
 const notesToggle = ref<ComponentPublicInstance | null>(null)
 const agentToggle = ref<ComponentPublicInstance | null>(null)
 let columnsObserver: ResizeObserver | null = null
@@ -3865,17 +3858,6 @@ watch(columnsBox, (box) => {
       columnsWidth.value = box.clientWidth
     })
     columnsObserver.observe(box)
-  }
-})
-
-/** Clamped from the chosen width, never from the width the window last allowed: a card the
- *  window narrowed grows back as it widens, and a step picked in Settings shows at once. The
- *  card being dragged follows the pointer instead. */
-watch([columnsWidth, cardsShown, () => chosenWidth.notes, () => chosenWidth.agent], () => {
-  for (const column of ['notes', 'agent'] as const) {
-    if (resizing.value?.column !== column) {
-      setColumnWidth(column, chosenWidth[column])
-    }
   }
 })
 
@@ -3895,102 +3877,35 @@ function setColumnWidth(column: Column, width: number) {
   columnWidth[column].value = Math.round(Math.min(columnMax(column), Math.max(COLUMN_WIDTHS[column].min, width)))
 }
 
-function startResize(event: PointerEvent, column: Column) {
-  if (event.button !== 0 || !(event.currentTarget instanceof HTMLElement)) {
-    return
-  }
-  event.preventDefault()
-  event.currentTarget.setPointerCapture(event.pointerId)
-  resizing.value = { column, x: event.clientX, width: columnWidth[column].value }
-  // The column-resize cursor holds over the whole page while the drag lasts.
-  document.documentElement.classList.add('col-resizing')
+/** The grip on each card's inner edge: the notes card is left of its grip and the agent card
+ *  right of its own, so a drag away from the document widens either. A card released hidden
+ *  closes as its close button closes it: the toggle takes the focus (`closeColumn`). Hiding a
+ *  card drops its focus to the page, where the next Escape would close the viewer, so the grip
+ *  gives it back as the card returns. */
+function columnGrip(column: Column, side: 'left' | 'right') {
+  return useColumnGrip({
+    column,
+    side,
+    width: columnWidth[column],
+    setWidth: (value) => setColumnWidth(column, value),
+    choose: (value) => chooseWidth(column, value),
+    card: () => columnsBox.value?.querySelector<HTMLElement>(`aside.${column}`) ?? null,
+    close: () => void closeColumn(column),
+  })
 }
 
-function onResize(event: PointerEvent) {
-  const drag = resizing.value
-  if (!drag) {
-    return
-  }
-  // The notes card is left of its grip and the agent card right of its own: a drag away
-  // from the document widens either.
-  const moved = event.clientX - drag.x
-  const width = drag.width + (drag.column === 'notes' ? moved : -moved)
-  // Below half its minimum the card goes, live, and the document takes its room; dragged
-  // back past that line it returns at its minimum.
-  const hidden = collapses(drag.column, width) ? drag.column : null
-  if (hidden !== dragHidden.value) {
-    if (hidden) {
-      holdFocus(hidden)
-    }
-    dragHidden.value = hidden
-    if (!hidden) {
-      // After the change, so its wait is for the render that shows the card again.
-      void giveFocusBack()
+const grips = { notes: columnGrip('notes', 'left'), agent: columnGrip('agent', 'right') }
+
+/** Clamped from the chosen width, never from the width the window last allowed: a card the
+ *  window narrowed grows back as it widens, and a step picked in Settings shows at once. The
+ *  card being dragged follows the pointer instead. */
+watch([columnsWidth, cardsShown, () => chosenWidth.notes, () => chosenWidth.agent], () => {
+  for (const column of ['notes', 'agent'] as const) {
+    if (!grips[column].dragging.value) {
+      setColumnWidth(column, chosenWidth[column])
     }
   }
-  if (!hidden) {
-    setColumnWidth(drag.column, width)
-  }
-}
-
-/** What held focus in the card a drag hid: hiding a card drops its focus to the page, where
- *  the next Escape would close the viewer, so it is given back as the card returns. */
-let heldFocus: HTMLElement | null = null
-
-function holdFocus(column: Column) {
-  const card = columnsBox.value?.querySelector(`aside.${column}`)
-  const active = document.activeElement
-  heldFocus = card && active instanceof HTMLElement && card.contains(active) ? active : null
-}
-
-/** Called once the card is shown again in state: the wait is for the render that shows it,
- *  since a card still hidden takes no focus. */
-async function giveFocusBack() {
-  const held = heldFocus
-  heldFocus = null
-  await nextTick()
-  if (held?.isConnected && (!document.activeElement || document.activeElement === document.body)) {
-    held.focus({ preventScroll: true })
-  }
-}
-
-function stopResize() {
-  resizing.value = null
-  dragHidden.value = null
-  document.documentElement.classList.remove('col-resizing')
-}
-
-/** The drag's release. A card released hidden closes as its close button closes it, its
- *  chosen width the one it had before the drag; otherwise the width as it now stands is the
- *  reader's choice — unless the press moved nothing, which chooses nothing. */
-function endResize() {
-  const drag = resizing.value
-  if (!drag) {
-    return
-  }
-  const hidden = dragHidden.value === drag.column
-  stopResize()
-  if (hidden) {
-    // Closed, as its close button closes it: the toggle takes the focus (`closeColumn`).
-    heldFocus = null
-    void closeColumn(drag.column)
-  } else if (columnWidth[drag.column].value !== drag.width) {
-    chooseWidth(drag.column, columnWidth[drag.column].value)
-  }
-}
-
-/** A cancelled drag puts the width back and never closes the card. */
-function cancelResize() {
-  const drag = resizing.value
-  if (drag) {
-    const hidden = dragHidden.value === drag.column
-    stopResize()
-    columnWidth[drag.column].value = drag.width
-    if (hidden) {
-      void giveFocusBack()
-    }
-  }
-}
+})
 
 /** The grip goes with its card: focus that went with them moves to the header's toggle for
  *  that card, not to the page, where the next Escape would close the viewer. */
@@ -4005,23 +3920,6 @@ async function closeColumn(column: Column) {
     const toggle = (column === 'notes' ? notesToggle : agentToggle).value?.$el
     if (toggle instanceof HTMLElement) {
       toggle.focus()
-    }
-  }
-}
-
-function onResizeKey(event: KeyboardEvent, column: Column) {
-  const step = event.shiftKey ? 64 : 16
-  if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
-    event.preventDefault()
-    // The arrow moves the edge: away from the document widens the card. It stops at the
-    // card's minimum: only a drag puts a card away.
-    const outward = event.key === (column === 'notes' ? 'ArrowRight' : 'ArrowLeft')
-    const before = columnWidth[column].value
-    setColumnWidth(column, before + (outward ? step : -step))
-    // A key that moves nothing — the edge already at a bound, its own or the window's —
-    // chooses nothing, as a press that drags nothing does not.
-    if (columnWidth[column].value !== before) {
-      chooseWidth(column, columnWidth[column].value)
     }
   }
 }
@@ -4659,7 +4557,6 @@ onBeforeUnmount(() => {
   coarseQuery?.removeEventListener('change', onCoarseChange)
   window.removeEventListener('resize', onWindowResize)
   columnsObserver?.disconnect()
-  document.documentElement.classList.remove('col-resizing')
   paneObserver?.disconnect()
   footObserver?.disconnect()
   cancelAnimationFrame(hoverFrame)
@@ -4964,7 +4861,7 @@ watch(
                  behind the agent keeps its box out of sight (docs/web.md § Result viewer, *On a
                  phone and a tablet*). -->
             <aside
-              v-show="dragHidden !== 'notes'"
+              v-show="!grips.notes.hidden.value"
               :id="`${uid}-pane-notes`"
               class="notes card"
               :class="{ away: !notesShown }"
@@ -5018,8 +4915,8 @@ watch(
             </aside>
             <div
               v-if="cardsShown.notes"
-              class="split"
-              :class="{ dragging: resizing?.column === 'notes' }"
+              class="column-grip"
+              :class="{ dragging: grips.notes.dragging.value }"
               role="separator"
               tabindex="0"
               aria-orientation="vertical"
@@ -5027,12 +4924,7 @@ watch(
               :aria-valuenow="columnWidth.notes.value"
               :aria-valuemin="COLUMN_WIDTHS.notes.min"
               :aria-valuemax="columnMax('notes')"
-              @pointerdown="startResize($event, 'notes')"
-              @pointermove="onResize"
-              @pointerup="endResize"
-              @pointercancel="cancelResize"
-              @dblclick="chooseWidth('notes', COLUMN_WIDTHS.notes.initial)"
-              @keydown="onResizeKey($event, 'notes')"
+              v-bind="grips.notes.handlers"
             />
           </template>
 
@@ -5313,8 +5205,8 @@ watch(
           <!-- The agent's thread about this document (docs/web.md § The agent panel). -->
           <div
             v-if="agentMounted && cardsShown.agent"
-            class="split"
-            :class="{ dragging: resizing?.column === 'agent' }"
+            class="column-grip"
+            :class="{ dragging: grips.agent.dragging.value }"
             role="separator"
             tabindex="0"
             aria-orientation="vertical"
@@ -5322,16 +5214,11 @@ watch(
             :aria-valuenow="columnWidth.agent.value"
             :aria-valuemin="COLUMN_WIDTHS.agent.min"
             :aria-valuemax="columnMax('agent')"
-            @pointerdown="startResize($event, 'agent')"
-            @pointermove="onResize"
-            @pointerup="endResize"
-            @pointercancel="cancelResize"
-            @dblclick="chooseWidth('agent', COLUMN_WIDTHS.agent.initial)"
-            @keydown="onResizeKey($event, 'agent')"
+            v-bind="grips.agent.handlers"
           />
           <aside
             v-if="agentMounted && documentId !== null"
-            v-show="dragHidden !== 'agent'"
+            v-show="!grips.agent.hidden.value"
             :id="`${uid}-pane-agent`"
             class="agent card"
             :class="{ away: !agentShown }"
@@ -5868,47 +5755,10 @@ watch(
 /* --- The cards and their grips ----------------------------------------------- */
 
 /* The grip between a card and the document, which resizes the card (docs/web.md § Column
-   widths): the whole 16px gap is the hit area and, hovered, shows only the cursor. The pill
-   in its middle is drawn while it is dragged or holds keyboard focus — with the focus ring
-   every control has — and always on a touch screen, which has no cursor to tell it by. It
-   stops where the card does. */
-.split {
-  position: relative;
-  z-index: 1;
+   widths): the whole 16px gap is the hit area. It stops where the card does. */
+.column-grip {
   flex: 0 0 var(--space-4);
   margin-bottom: var(--space-4);
-  border-radius: var(--radius-full);
-  cursor: col-resize;
-  touch-action: none;
-}
-
-.split::after {
-  content: '';
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  width: 5px;
-  height: 40px;
-  border-radius: var(--radius-full);
-  background: var(--grip);
-  opacity: 0;
-  transform: translate(-50%, -50%);
-  transition:
-    background var(--duration-fast) var(--ease),
-    height var(--duration-fast) var(--ease);
-}
-
-.split.dragging::after,
-.split:focus-visible::after {
-  height: 56px;
-  background: var(--grip-active);
-  opacity: 1;
-}
-
-@media (hover: none) {
-  .split::after {
-    opacity: 1;
-  }
 }
 
 /* A card floats beside the document, inset from the window's edges as the sidebar is: the
@@ -6240,13 +6090,5 @@ watch(
 
 ::highlight(sightread-locate) {
   background-color: color-mix(in srgb, var(--find) calc((1 - var(--locate-fade)) * 100%), transparent);
-}
-
-/* A grip's drag (docs/web.md § Column widths): the column-resize cursor wherever the pointer
-   goes until it is released, over a link, the text or the other card alike. Global: the class
-   is on <html>, outside this component. */
-:root.col-resizing,
-:root.col-resizing * {
-  cursor: col-resize !important;
 }
 </style>

@@ -76,7 +76,7 @@ export function cacheState(
     const left = until - now
     return left > 0
       ? { kind: 'warm', minutesLeft: Math.max(1, Math.ceil(left / 60_000)) }
-      : { kind: 'expired', recacheCredits: conversation.recache_credits ?? null }
+      : { kind: 'expired', recacheCredits: conversation.recache_credits }
   }
   return conversation.context_tokens == null ? null : { kind: 'none' }
 }

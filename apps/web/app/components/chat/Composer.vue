@@ -16,6 +16,7 @@
  * next draft.
  */
 import { deleteAttachment, listSkills, uploadAttachment, type AttachmentUpload, type UploadLimits } from '~/lib/api'
+import { blockKey } from '~/lib/blocks'
 import {
   acceptList,
   builtinCommands,
@@ -173,10 +174,6 @@ interface AddedSection extends SentSection {
 
 const addedSections = ref<AddedSection[]>([])
 
-function entryKey(entry: OutlineEntry): string {
-  return `${entry.page}-${entry.index}`
-}
-
 /** `limits.sections_per_message` reached: no further section is offered. */
 const sectionsFull = computed(() => {
   const cap = props.limits?.sections_per_message
@@ -198,7 +195,7 @@ function addEntry(entry: OutlineEntry) {
     return
   }
   addSection({
-    key: entryKey(entry),
+    key: blockKey(entry),
     heading: entry.text,
     plain: entry.plain,
     text: sectionText(source, props.limits?.selection_max_chars),
@@ -296,20 +293,20 @@ const addMenuItems = computed<MenuItem[]>(() => {
       key: 'current',
       label: current ? t('chat.context.currentSectionNamed', { heading: current.plain }) : t('chat.context.currentSection'),
       icon: 'locate' as const,
-      disabled: !current || (sectionsFull.value && !added.has(entryKey(current))),
+      disabled: !current || (sectionsFull.value && !added.has(blockKey(current))),
     },
     ...props.outline.map((entry, index) => ({
-      key: entryKey(entry),
+      key: blockKey(entry),
       label: `${entry.level >= 3 ? SUBSECTION_INDENT : ''}${entry.plain}`,
-      checked: added.has(entryKey(entry)),
-      disabled: sectionsFull.value && !added.has(entryKey(entry)),
+      checked: added.has(blockKey(entry)),
+      disabled: sectionsFull.value && !added.has(blockKey(entry)),
       separated: index === 0,
     })),
   ]
 })
 
 function onAddSelect(key: string) {
-  const entry = key === 'current' ? menuCurrent.value : props.outline.find((candidate) => entryKey(candidate) === key)
+  const entry = key === 'current' ? menuCurrent.value : props.outline.find((candidate) => blockKey(candidate) === key)
   if (entry) {
     addEntry(entry)
   }
@@ -854,7 +851,7 @@ async function ask(request: AskRequest): Promise<AskOutcome> {
   if (request.section) {
     const { heading, text } = request.section
     const entry = props.outline.find((candidate) => candidate.text === heading)
-    const key = entry ? entryKey(entry) : `heading:${heading}`
+    const key = entry ? blockKey(entry) : `heading:${heading}`
     if (!addedSections.value.some((added) => added.key === key)) {
       if (sectionsFull.value) {
         return 'full'

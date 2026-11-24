@@ -7,7 +7,7 @@
  * a write's diff card among them, with **Revert** outside library mode as in a group — and
  * the report it handed the agent.
  */
-import { parseResultMarkdown } from '~/lib/markdown'
+import { parseBlocks } from '~/lib/markdown'
 import type { CardState, EditCard, SubagentView } from '~/lib/thread'
 
 const props = defineProps<{
@@ -56,7 +56,7 @@ const meta = computed(() => {
 
 /** The report is the subagent's last answer: markdown, drawn like the agent's own. */
 const reportBlocks = computed(() =>
-  props.open && props.card.report ? parseResultMarkdown(props.card.report).flatMap((page) => page.blocks) : [],
+  props.open && props.card.report ? parseBlocks(props.card.report) : [],
 )
 </script>
 

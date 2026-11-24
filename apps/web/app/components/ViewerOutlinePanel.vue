@@ -6,6 +6,7 @@
  * (`ViewerOutline`) and, where they do not fit, the header's button (`ViewerOutlineButton`).
  * Each places it; this draws it, opens scrolled to the current row, and hands Escape back.
  */
+import { blockKey } from '~/lib/blocks'
 import type { OutlineEntry } from '~/lib/markdown'
 
 const props = defineProps<{
@@ -71,7 +72,7 @@ defineExpose({ focusCurrent })
     <ul class="rows">
       <li
         v-for="(entry, index) in entries"
-        :key="`${entry.page}-${entry.index}`"
+        :key="blockKey(entry)"
         class="row"
         :class="{ deep: entry.level > 2, current: index === current }"
       >

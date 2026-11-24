@@ -89,7 +89,7 @@ import {
   blockPlain,
   findHeading,
   inlinePlain,
-  parseResultMarkdown,
+  parseBlocks,
   passageKeys,
   readBlockAnchor,
   resolveAnchor,
@@ -1114,7 +1114,7 @@ function messageBlocks(text: string): ResultBlock[] {
   if (blocks) {
     parsedMessages.delete(text)
   } else {
-    blocks = parseResultMarkdown(text).flatMap((page) => page.blocks)
+    blocks = parseBlocks(text)
     if (parsedMessages.size >= PARSED_MESSAGES_MAX) {
       parsedMessages.delete(parsedMessages.keys().next().value!)
     }

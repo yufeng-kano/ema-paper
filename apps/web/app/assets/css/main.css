@@ -370,6 +370,57 @@ a {
   background-clip: content-box;
 }
 
+/* --- Column grip ----------------------------------------------------------
+   The grip that resizes a card (docs/web.md § Column widths; `useColumnGrip`), the result
+   viewer's and the Files page's Agent card's alike; each host sets the grip's own box in its
+   layout. Hovered, it shows only the cursor. The pill in its middle is drawn while it is
+   dragged or holds keyboard focus — with the focus ring every control has — and always on a
+   touch screen, which has no cursor to tell it by. */
+
+.column-grip {
+  position: relative;
+  z-index: 1;
+  border-radius: var(--radius-full);
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.column-grip::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 5px;
+  height: 40px;
+  border-radius: var(--radius-full);
+  background: var(--grip);
+  opacity: 0;
+  transform: translate(-50%, -50%);
+  transition:
+    background var(--duration-fast) var(--ease),
+    height var(--duration-fast) var(--ease);
+}
+
+.column-grip.dragging::after,
+.column-grip:focus-visible::after {
+  height: 56px;
+  background: var(--grip-active);
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .column-grip::after {
+    opacity: 1;
+  }
+}
+
+/* A grip's drag: the column-resize cursor wherever the pointer goes until it is released, over
+   a link, the text or the other card alike. The class is on <html>. */
+:root.col-resizing,
+:root.col-resizing * {
+  cursor: col-resize !important;
+}
+
 /* --- Global utilities -----------------------------------------------------
    The three that earn a global: `.sr-only` is needed by components with no stylesheet of
    their own, `.mono` is the app's typographic mode switch, and `.tabular` keeps a column

@@ -68,8 +68,9 @@ interface TocEntry {
 }
 
 export interface ResultPageBlocks {
-  /** The marker's number, written back by `serializeDocument` and keying the page's render;
-   *  the viewer never prints it, and a figure's crop is addressed by the figure's own page. */
+  /** The marker's number, written back by `serializeDocument`. A document can repeat it, so
+   *  the viewer keys a page by its position and never prints the number; a figure's crop is
+   *  addressed by the figure's own page. */
   page: number
   blocks: ResultBlock[]
   /** Text ahead of any marker, written back without one: a markdown document never gains

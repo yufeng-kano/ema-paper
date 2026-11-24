@@ -168,7 +168,7 @@ function onSectionSaved(agent: string, saved: SavedAgentSettings) {
         </UiField>
         <!-- The parse model is the deployment's: a fact under the label, not a control. -->
         <div v-else class="model fact">
-          <span class="fact-label">{{ t('agents.modelLabel') }}</span>
+          <span class="agents-label">{{ t('agents.modelLabel') }}</span>
           <span v-if="settings.model" class="mono fact-value">{{ settings.model }}</span>
           <span v-else class="fact-value muted">{{ t('agents.modelNone') }}</span>
         </div>
@@ -187,13 +187,13 @@ function onSectionSaved(agent: string, saved: SavedAgentSettings) {
         />
       </div>
       <p v-if="convention" class="convention mono reveal">{{ convention }}</p>
-      <p v-if="isChat" class="note">{{ t('agents.cacheNote') }}</p>
+      <p v-if="isChat" class="agents-note">{{ t('agents.cacheNote') }}</p>
       <!-- The idle-compaction switch, after the cache line (docs/web.md § Pages). -->
       <template v-if="isChat">
         <UiSwitch class="idle-switch" :model-value="idleOn" :busy="idlePending" @update:model-value="applyIdleCompact">
           {{ t('agents.idleCompact.label') }}
         </UiSwitch>
-        <p class="note">{{ t('agents.idleCompact.note') }}</p>
+        <p class="agents-note">{{ t('agents.idleCompact.note') }}</p>
       </template>
       <UiBanner v-if="modelsError" class="row-banner" tone="error">{{ modelsError }}</UiBanner>
       <UiBanner v-if="effortError" class="row-banner" tone="error">{{ effortError }}</UiBanner>
@@ -222,7 +222,7 @@ function onSectionSaved(agent: string, saved: SavedAgentSettings) {
 
       <!-- Tools: read-only facts. The sandbox's state is on the Usage page. ---------- -->
       <div class="row">
-        <p class="tools-label">{{ t('agents.toolsLabel') }}</p>
+        <p class="agents-label">{{ t('agents.toolsLabel') }}</p>
         <ul class="tools" :aria-label="t('agents.toolsLabel')">
           <li v-for="tool in agent.tools" :key="tool" class="chip mono">{{ tool }}</li>
         </ul>
@@ -273,12 +273,6 @@ function onSectionSaved(agent: string, saved: SavedAgentSettings) {
   gap: var(--space-1);
 }
 
-.fact-label {
-  font-size: var(--text-xs);
-  font-weight: var(--weight-semibold);
-  color: var(--muted);
-}
-
 .fact-value {
   display: flex;
   align-items: center;
@@ -327,26 +321,11 @@ function onSectionSaved(agent: string, saved: SavedAgentSettings) {
   max-width: 72ch;
 }
 
-/* The one line under the row: a consequence of changing it, not an explanation of it. */
-.note {
-  margin: 0;
-  color: var(--muted);
-  font-size: var(--text-xs);
-}
-
 /* The switch and its words under the cache line, the words on the column's text edge. */
 .idle-switch {
   align-self: flex-start;
   margin-top: var(--space-2);
   margin-left: calc(-1 * var(--space-3));
-}
-
-/* The tools row has the field label's treatment with no control under it. */
-.tools-label {
-  margin: 0;
-  font-size: var(--text-xs);
-  font-weight: var(--weight-semibold);
-  color: var(--muted);
 }
 
 .tools {
