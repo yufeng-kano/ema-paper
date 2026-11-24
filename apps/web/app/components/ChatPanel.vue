@@ -83,6 +83,7 @@ import {
   findHeading,
   inlinePlain,
   parseResultMarkdown,
+  passageKeys,
   placedBlocks,
   readBlockAnchor,
   resolveAnchor,
@@ -505,6 +506,9 @@ const outline = computed(() => documentOutline(props.documentPages()))
 /** The document's blocks in reading order, kept with the outline: what a block link's chip
  *  is resolved against on every render (docs/web.md § The agent panel, *Links*). */
 const placed = computed(() => placedBlocks(props.documentPages()))
+/** The placed blocks' passage keys, apart from `placed` so that only a block link reads
+ *  them: a document whose answers hold none never reads every block's text. */
+const placedKeys = computed(() => passageKeys(placed.value))
 
 /** Whether an answer's section link leads to a heading the document still has — or its
  *  block link, one with `~` in its anchor, to a block (docs/web.md § The agent panel,
@@ -512,7 +516,7 @@ const placed = computed(() => placedBlocks(props.documentPages()))
  *  text. Read as the answer renders, so it follows the document. */
 const resolveCite: CiteResolver = (label, anchor) =>
   anchor.includes('~')
-    ? resolveAnchor(props.documentPages(), readBlockAnchor(anchor), outline.value, placed.value) !== null
+    ? resolveAnchor(props.documentPages(), readBlockAnchor(anchor), outline.value, placed.value, placedKeys.value) !== null
     : findHeading(outline.value, label, anchor) !== null
 /** With no document, a section or block link is still read, so it is drawn as its label
  *  rather than its source, but leads nowhere: its plain text, as a heading that is gone. */

@@ -64,12 +64,13 @@ import {
   findPlace,
   imageLine,
   insertBlocks,
+  isHeading,
   moveBlocks,
   parseResultMarkdown,
   placeNear,
   placedBlocks,
   readBlockAnchor,
-  replaceBlockSource,
+  replaceBlockSources,
   resolveAnchor,
   sectionSource,
   serializeDocument,
@@ -1141,12 +1142,12 @@ function documentWithDraft(): string {
   if (draft.value === openBlockSource()) {
     return markdown.value
   }
-  // The later blocks first, so the open one's index still holds.
-  let next = markdown.value
-  for (let index = open.index + span.value - 1; index > open.index; index -= 1) {
-    next = replaceBlockSource(next, open.page, index, '')
+  // The draft holds every block the editor spans: it replaces the first, the rest go.
+  const edits = [{ page: open.page, index: open.index, src: draft.value }]
+  for (let index = open.index + 1; index < open.index + span.value; index += 1) {
+    edits.push({ page: open.page, index, src: '' })
   }
-  return replaceBlockSource(next, open.page, open.index, draft.value)
+  return replaceBlockSources(markdown.value, edits)
 }
 
 /** Renders the block again, and if its source changed, writes it into the document. Typing
@@ -1753,10 +1754,6 @@ const nameText = computed<NameText>(() => ({
   imageBare: t('viewer.names.imageBare'),
 }))
 
-function isHeading(block: ResultBlock): boolean {
-  return block.kind === 'h2' || block.kind === 'h3'
-}
-
 /** Each block stays one tab stop once the copy is editable; while it is read-only a block
  *  takes focus only from the viewer, when the way back hands it over. */
 function blockTabindex(block: ResultBlock, pageIndex: number, index: number): number | undefined {
@@ -2053,8 +2050,7 @@ function onBlockMenuClose(cause?: Event) {
 function askAbout(heads: readonly PlacedBlock[]): AskRequest {
   const only = heads.length === 1 ? heads[0]! : null
   if (only && isHeading(only.block)) {
-    const text = only.block.kind === 'h2' || only.block.kind === 'h3' ? only.block.text : ''
-    return { section: { heading: text, text: sectionSource(pages.value, only.page, only.index) } }
+    return { section: { heading: only.block.text, text: sectionSource(pages.value, only.page, only.index) } }
   }
   return { selection: heads.map((entry) => entry.block.src).join('\n\n') }
 }
@@ -2100,11 +2096,10 @@ function moveRun(range: RowRange, target: number, place: 'before' | 'after'): st
  *  many, with *Undo*. The key of the row now standing in their place, or none. */
 function deleteRows(range: RowRange): string[] {
   const heads = rowHeads(range)
-  let next = markdown.value
-  // The last first, so the earlier ones' indices still hold.
-  for (const at of [...heads].reverse()) {
-    next = replaceBlockSource(next, at.page, at.index, '')
-  }
+  const next = replaceBlockSources(
+    markdown.value,
+    heads.map((at) => ({ page: at.page, index: at.index, src: '' })),
+  )
   if (next === markdown.value) {
     return []
   }
@@ -2118,18 +2113,19 @@ function deleteRows(range: RowRange): string[] {
  *  the converted run now covers, or none when nothing changed. */
 function turnRows(range: RowRange, kind: BlockKindName): string[] {
   const heads = rowHeads(range)
-  let next = markdown.value
+  const edits: (BlockAt & { src: string })[] = []
   /** Blocks a conversion added on each page: what the run's last block moved by. */
   const grown = new Map<number, number>()
-  for (const at of [...heads].reverse()) {
+  for (const at of heads) {
     const converted = convertBlock(at.block.src, kind)
     if (converted === null || converted === at.block.src) {
       continue
     }
-    next = replaceBlockSource(next, at.page, at.index, converted)
+    edits.push({ page: at.page, index: at.index, src: converted })
     const count = parseResultMarkdown(converted).reduce((total, page) => total + page.blocks.length, 0)
     grown.set(at.page, (grown.get(at.page) ?? 0) + count - 1)
   }
+  const next = replaceBlockSources(markdown.value, edits)
   if (next === markdown.value) {
     return []
   }

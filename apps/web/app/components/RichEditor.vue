@@ -1009,7 +1009,7 @@ async function insertImages(files: File[], slot: ImageSlot) {
         if (!slot.near || !strayed?.(line, slot.near)) {
           return
         }
-        slot.near = { after: line, before: slot.near.before, gap: (slot.near.gap ?? 0) + 1 }
+        slot.near = { after: line, before: slot.near.before, gap: slot.near.gap + 1 }
         continue
       }
       const { state } = editor
@@ -1934,7 +1934,7 @@ onBeforeUnmount(() => {
       slot.near = {
         after: after ?? outer?.after ?? null,
         before: before ?? outer?.before ?? null,
-        gap: (outer?.gap ?? 0) + (gap ?? 0),
+        gap: (outer?.gap ?? 0) + gap,
         // Beside a block of its own editor's, that block first: the editor's text is on its
         // page, a neighbour from around the editor may not be.
         prefer: after !== null ? 'after' : before !== null ? 'before' : (outer?.prefer ?? 'after'),

@@ -16,10 +16,12 @@ import {
   headingKey,
   inlinePlain,
   isBefore,
+  isHeading,
   nearestBlock,
   parseInline,
   parseResultMarkdown,
   passageKey,
+  passageKeys,
   placedBlocks,
   readBlockAnchor,
   resolveAnchor,
@@ -234,7 +236,7 @@ export function appendExcerpt(notes: string, passage: string, excerpt: string, h
     let last = section
     while (last + 1 < blocks.length) {
       const next = blocks[last + 1]!.block
-      if ((next.kind === 'h2' || next.kind === 'h3') && next.level <= 2) {
+      if (isHeading(next) && next.level <= 2) {
         break
       }
       last += 1
@@ -330,7 +332,7 @@ interface PassageIndex {
 
 function passageIndex(pages: readonly ResultPageBlocks[]): PassageIndex {
   const placed = placedBlocks(pages)
-  return { placed, keys: placed.map((entry) => (entry.block.kind === 'comment' ? '' : passageKey(blockPlain(entry.block)))) }
+  return { placed, keys: passageKeys(placed) }
 }
 
 function locateIn(index: PassageIndex, passage: string, heading: OutlineEntry | null): { start: BlockAt; end: BlockAt } | null {

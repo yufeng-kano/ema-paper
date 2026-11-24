@@ -4,9 +4,9 @@
  * it is, not as source code (docs/web.md § Result viewer).
  *
  * `data-md` carries the block's `$$…$$` source, which is what copy-as-markdown hands
- * back. TeX KaTeX cannot parse falls back to the verbatim <pre> this block always was —
- * a wrong formula is worse than a visible one — and the <pre> path is what copy already
- * serializes as `$$…$$` (app/lib/copy.ts).
+ * back. TeX KaTeX cannot parse falls back to a verbatim <pre> — a wrong formula is worse
+ * than a visible one — and the <pre> path is what copy already serializes as `$$…$$`
+ * (app/lib/copy.ts).
  */
 import { renderTexHtml } from '~/lib/math'
 

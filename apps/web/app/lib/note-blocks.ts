@@ -11,7 +11,7 @@
 import type { Node as ProseNode } from '@tiptap/pm/model'
 import { Selection, type Transaction } from '@tiptap/pm/state'
 import type { Mappable } from '@tiptap/pm/transform'
-import { parseResultMarkdown, type InlineOptions, type ResultBlock } from './markdown'
+import { isHeading, parseResultMarkdown, type InlineOptions, type ResultBlock } from './markdown'
 import { convertBlock, docToMarkdown, markdownToDoc, type BlockKindName } from './richdoc'
 
 export interface NoteUnit {
@@ -91,10 +91,6 @@ export function unitMarkdown(doc: ProseNode, unit: NoteUnit): string {
  *  other unit's one block; null for an empty line. */
 export function unitBlock(doc: ProseNode, unit: NoteUnit): ResultBlock | null {
   return parseResultMarkdown(unitMarkdown(doc, unit)).flatMap((page) => page.blocks)[0] ?? null
-}
-
-function isHeading(block: ResultBlock | null): block is Extract<ResultBlock, { kind: 'h2' | 'h3' }> {
-  return block?.kind === 'h2' || block?.kind === 'h3'
 }
 
 /**

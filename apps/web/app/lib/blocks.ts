@@ -10,6 +10,7 @@ import {
   blockPlain,
   firstWords,
   inlinePlain,
+  isHeading,
   sectionExtent,
   type InlineOptions,
   type OutlineEntry,
@@ -78,7 +79,7 @@ export function blockName(block: ResultBlock, text: NameText, options?: InlineOp
     return caption ? text.image(cutWords(firstWords(caption), NAME_CHARS)) : text.imageBare
   }
   const words = blockPlain(block, options)
-  if (block.kind === 'h2' || block.kind === 'h3') {
+  if (isHeading(block)) {
     return text.quoted(cutWords(words, HEADING_NAME_CHARS))
   }
   return text.quoted(cutWords(firstWords(words), NAME_CHARS))
@@ -146,10 +147,6 @@ export function foldsOf(placed: readonly PlacedBlock[], outline: readonly Outlin
   return folds
 }
 
-function isHeading(entry: PlacedBlock): boolean {
-  return entry.block.kind === 'h2' || entry.block.kind === 'h3'
-}
-
 /** How many shared blocks a move's rotation may take back from either side. */
 const TWIN_REACH = 4
 
@@ -210,13 +207,13 @@ export function followBlocks(before: readonly PlacedBlock[], after: readonly Pla
   }
   const went: number[] = []
   for (let index = head; index < fromEnd; index += 1) {
-    if (isHeading(before[index]!)) {
+    if (isHeading(before[index]!.block)) {
       went.push(index)
     }
   }
   const came: number[] = []
   for (let index = head; index < toEnd; index += 1) {
-    if (isHeading(after[index]!)) {
+    if (isHeading(after[index]!.block)) {
       came.push(index)
     }
   }

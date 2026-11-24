@@ -141,27 +141,24 @@
 .md-table th,
 .md-table td {
   max-width: 36ch;
+  padding: var(--cell-y-tight) var(--space-4) var(--cell-y-tight) 0;
+  border-bottom: 1px solid var(--line-soft);
 }
 
 .md-table th {
-  padding: var(--cell-y-tight) var(--space-4) var(--cell-y-tight) 0;
   text-align: left;
   font-size: var(--text-2xs);
   font-weight: var(--weight-semibold);
   color: var(--faint);
-  border-bottom: 1px solid var(--line-soft);
 }
 
 .md-table td {
-  padding: var(--cell-y-tight) var(--space-4) var(--cell-y-tight) 0;
-  border-bottom: 1px solid var(--line-soft);
   color: var(--ink-soft);
 }
 
 .md-table tbody tr:last-child td {
   border-bottom: none;
 }
-
 
 /* KaTeX brings its own faces and sizing; the span only needs to not fight the line. */
 .md-inline-math .katex {
