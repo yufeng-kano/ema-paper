@@ -23,8 +23,6 @@ from fastapi import APIRouter, Query, Request, Response, status
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 from sqlalchemy import inspect, select
-from starlette.datastructures import UploadFile
-from starlette.formparsers import MultiPartException, MultiPartParser
 
 from ..agents import PARSE
 from ..auth.deps import (
@@ -43,11 +41,9 @@ from ..db.models import FILE_KIND, MARKDOWN_KIND, Document, Folder, Job, Result,
 from ..errors import ApiError
 from ..jobs import events
 from ..jobs.intake import (
-    MULTIPART_ENVELOPE_BYTES,
     PDF_MEDIA_TYPE,
     base64_chunks,
     cached_payload,
-    capped_stream,
     retry_filed_parse,
     submit_parse,
     upload_chunks,
@@ -58,6 +54,7 @@ from ..workspace import documents as workspace_documents
 from ..workspace import filing, git
 from ..workspace.layout import user_root
 from . import library
+from .multipart import capped_form, form_file
 
 router = APIRouter(prefix="/v1", tags=["data"])
 
@@ -142,18 +139,8 @@ async def parse(request: Request, caller: UploaderCaller, db: DbSession, setting
         # A bounded stream, not `request.form()`'s: the parser spools each file part to
         # disk as it arrives, so a request that declares no length would otherwise be
         # written out in full before `store_upload` could refuse it.
-        try:
-            form = await MultiPartParser(
-                request.headers,
-                capped_stream(
-                    request.stream(), settings.upload_max_bytes + MULTIPART_ENVELOPE_BYTES
-                ),
-            ).parse()
-        except MultiPartException as exc:
-            raise ApiError(400, "invalid_request", "The multipart body could not be read") from exc
-        upload = form.get("file")
-        if not isinstance(upload, UploadFile):
-            raise ApiError(400, "invalid_request", "Multipart requests need a 'file' part")
+        form = await capped_form(request, settings.upload_max_bytes)
+        upload = form_file(form)
         filename = upload.filename or "upload"
         media_type = upload.content_type or ""
         model, pages, force, retry, folder = (
@@ -588,7 +575,7 @@ async def save_document_text(
     settings: AppSettings,
 ):
     text, base = await _edited_text(request, settings)
-    row = await library.live_text_document(db, user.id, document_id)
+    row = await workspace_documents.live_text_document(db, user.id, document_id)
     revision = await workspace_documents.write_content(
         db, settings, row, markdown=text, base_revision=base, author=git.API_AUTHOR
     )
@@ -604,7 +591,7 @@ async def save_document_notes(
     settings: AppSettings,
 ):
     text, base = await _edited_text(request, settings)
-    row = await library.live_text_document(db, user.id, document_id)
+    row = await workspace_documents.live_text_document(db, user.id, document_id)
     revision = await workspace_documents.write_notes(
         db, settings, row, text=text, base_revision=base, author=git.API_AUTHOR
     )

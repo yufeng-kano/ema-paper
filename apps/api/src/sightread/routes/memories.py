@@ -16,14 +16,15 @@ from __future__ import annotations
 from fastapi import APIRouter, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
-from sqlalchemy.exc import IntegrityError
 
 from ..agents import memory as memory_defs
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
 from ..db.models import Conversation, Document, Memory, utcnow
+from ..db.session import commit_or_conflict
 from ..errors import ApiError
+from ..workspace.documents import live_text_document
 from ..workspace.trash import lock_user
-from .chat import owned_conversation, owned_document
+from .chat import owned_conversation
 
 router = APIRouter(prefix="/api", tags=["memories"])
 
@@ -109,16 +110,9 @@ async def _owned_memory(db: DbSession, user_id: int, memory_id: int) -> Memory:
     return row
 
 
-async def _commit(db: DbSession) -> None:
-    try:
-        await db.commit()
-    except IntegrityError as exc:
-        # The document or the conversation was deleted between the ownership check and
-        # this commit: an ordinary race, not a 500.
-        await db.rollback()
-        raise ApiError(
-            409, "invalid_request", "The document or conversation was just deleted"
-        ) from exc
+# The document or the conversation was deleted between the ownership check and the commit:
+# an ordinary race, not a 500.
+DELETED_UNDERNEATH = "The document or conversation was just deleted"
 
 
 @router.get("/memories")
@@ -140,7 +134,7 @@ async def create_memory(
     kind = _checked_kind(body.kind)
     text = _checked_text(body.text, settings)
     if body.document_id is not None:
-        await owned_document(db, user.id, body.document_id)
+        await live_text_document(db, user.id, body.document_id)
     if body.conversation_id is not None:
         await owned_conversation(db, user.id, body.conversation_id)
     # Two saves near the cap — this and the agent's tool — must not both count below it.
@@ -164,7 +158,7 @@ async def create_memory(
         source_ref=(body.source_ref or "").strip() or None,
     )
     db.add(row)
-    await _commit(db)
+    await commit_or_conflict(db, DELETED_UNDERNEATH)
     return await _memory_payload(db, row.id)
 
 
@@ -184,12 +178,12 @@ async def update_memory(
         row.text = _checked_text(body.text, settings)
     if "document_id" in provided:
         if body.document_id is not None:
-            await owned_document(db, user.id, body.document_id)
+            await live_text_document(db, user.id, body.document_id)
         row.document_id = body.document_id
     if "pinned" in provided:
         row.pinned = bool(body.pinned)
     row.updated_at = utcnow()
-    await _commit(db)
+    await commit_or_conflict(db, DELETED_UNDERNEATH)
     return await _memory_payload(db, row.id)
 
 

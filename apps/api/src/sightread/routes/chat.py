@@ -12,6 +12,7 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import re
 import secrets
 import uuid
 from pathlib import Path
@@ -34,7 +35,6 @@ from ..billing import ledger
 from ..billing.credits import credits_for_usd
 from ..db.models import (
     COMPACT_TURN,
-    FILE_KIND,
     MESSAGE_TURN,
     AgentSetting,
     ChatAttachment,
@@ -43,7 +43,6 @@ from ..db.models import (
     Document,
     Message,
     Skill,
-    User,
     utcnow,
 )
 from ..errors import ApiError
@@ -59,6 +58,7 @@ from ..workspace.documents import (
     ensure_within_quota,
     folder_chain,
     is_live,
+    live_text_document,
     make_folder_dir,
     materialize_document,
     measure_storage,
@@ -67,6 +67,7 @@ from ..workspace.documents import (
 )
 from ..workspace.layout import FILES_DIR, path_segment, user_root
 from ..workspace.locks import workspace_lock
+from ..workspace.trash import lock_user
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
@@ -118,20 +119,6 @@ async def owned_conversation(db: AsyncSession, user_id: int, conversation_id: in
     return row
 
 
-async def owned_document(db: AsyncSession, user_id: int, document_id: int) -> Document:
-    """A document of the caller's that is not in the Trash: a trashed file is not talked
-    about until it is put back (docs/api.md)."""
-    row = (
-        await db.execute(
-            select(Document).where(Document.id == document_id, Document.user_id == user_id)
-        )
-    ).scalar_one_or_none()
-    # A file of the library has no conversations (docs/workspace.md § Files).
-    if row is None or row.kind == FILE_KIND or not is_live(row, await user_folders(db, user_id)):
-        raise ApiError(404, "invalid_request", "No such document")
-    return row
-
-
 async def _listed(db: AsyncSession, settings: AppSettings, *where: ColumnElement[bool]) -> dict:
     """The conversations `where` picks, the one continued last first, as a list route
     answers with them."""
@@ -160,7 +147,7 @@ async def _listed(db: AsyncSession, settings: AppSettings, *where: ColumnElement
 async def list_conversations(
     document_id: int, user: SessionUser, db: DbSession, settings: AppSettings
 ):
-    document = await owned_document(db, user.id, document_id)
+    document = await live_text_document(db, user.id, document_id)
     return await _listed(db, settings, Conversation.document_id == document.id)
 
 
@@ -172,15 +159,15 @@ async def list_conversations(
 async def create_conversation(
     document_id: int, user: SessionUser, db: DbSession, settings: AppSettings
 ):
-    document = await owned_document(db, user.id, document_id)
+    document = await live_text_document(db, user.id, document_id)
     # The document's directory exists from here on: the thread is about its files.
     await materialize_document(db, settings, document)
     # The user's row, the lock a delete takes before it decides, then the document
     # again under it: a delete racing this ends with a clean 404 here, or with a thread
     # the delete then takes along with the document — never a 500 (docs/api.md).
-    await db.execute(select(User.id).where(User.id == user.id).with_for_update())
+    await lock_user(db, user.id)
     # The same lock a move to the Trash takes: one meanwhile is a 404 here too.
-    await owned_document(db, user.id, document.id)
+    await live_text_document(db, user.id, document.id)
     row = Conversation(
         user_id=user.id,
         document_id=document.id,
@@ -498,8 +485,10 @@ async def update_conversation(
     )
 
 
-# The web app's locale, a language tag (docs/api.md).
-Locale = Annotated[str, Field(max_length=16, pattern=r"^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$")]
+# A language tag, as the web app's locale is one (docs/api.md).
+LANGUAGE_TAG = re.compile(r"^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$")
+LANGUAGE_TAG_MAX_CHARS = 16
+Locale = Annotated[str, Field(max_length=LANGUAGE_TAG_MAX_CHARS, pattern=LANGUAGE_TAG.pattern)]
 
 
 class TitleRequest(BaseModel):
@@ -626,7 +615,7 @@ async def _admitted(
     # commits (PostgreSQL; the SQLite fallback runs one request at a time): the user's row
     # for the per-user cap, so two sends to different conversations cannot both slip under
     # it, then the conversation's for one turn at a time — always in that order.
-    await db.execute(select(User.id).where(User.id == user.id).with_for_update())
+    await lock_user(db, user.id)
     # The title read under the lock too: a rename that landed after `row` was read must
     # not be overwritten by the first line of a first message.
     locked = (

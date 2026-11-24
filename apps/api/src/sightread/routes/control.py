@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from datetime import timedelta
 from pathlib import Path
 
@@ -18,7 +17,6 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 from sqlalchemy import update as sa_update
-from sqlalchemy.exc import IntegrityError
 
 from ..admin.groups import join_owner_group, permissions_of
 from ..agents import AGENTS, CHAT, CHECK, PARSE, AgentDefinition, get_agent
@@ -27,6 +25,7 @@ from ..agents import memory as memory_defs
 from ..agents import skills as skill_defs
 from ..agents import subagents as subagent_defs
 from ..agents.bbox import convention_for_model
+from ..agents.summary import TITLE_MAX_CHARS
 from ..auth.api_keys import create_api_key
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
 from ..auth.oidc import (
@@ -55,6 +54,7 @@ from ..db.models import (
     User,
     utcnow,
 )
+from ..db.session import commit_or_conflict
 from ..errors import ApiError
 from ..jobs import chat_memory, chat_runner
 from ..jobs.intake import PDF_MEDIA_TYPE
@@ -76,7 +76,7 @@ from ..workspace.locks import workspace_lock
 from ..workspace.memory_file import memory_file_text, write_memory_file
 from ..workspace.trash import lock_user
 from .billing import me_fields
-from .chat import TITLE_MAX_CHARS
+from .chat import LANGUAGE_TAG, LANGUAGE_TAG_MAX_CHARS
 from .library import parse_auto_convert
 
 logger = logging.getLogger(__name__)
@@ -614,9 +614,6 @@ SETTING_OWNERS: dict[str, tuple[str, ...]] = {
     "auto_convert": (PARSE.name,),
     "auto_check": (CHECK.name,),
 }
-# A language tag, as the composer's locale is one (docs/api.md).
-LANGUAGE_TAG = re.compile(r"^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$")
-LANGUAGE_TAG_MAX_CHARS = 16
 
 
 def _checked_language(value: str | None, label: str) -> str | None:
@@ -700,7 +697,7 @@ async def put_agent_settings(
         # The reader's row, held until the commit: the `memory` tool reads the switch under
         # it, so a Pause waits for a call already deciding and every later call sees it
         # (docs/chat.md § Memory).
-        await db.execute(select(User.id).where(User.id == user.id).with_for_update())
+        await lock_user(db, user.id)
     row = (
         await db.execute(
             select(AgentSetting).where(
@@ -735,15 +732,9 @@ async def put_agent_settings(
         row.memory_paused = bool(body.memory_paused)
     if "idle_compact" in provided:
         row.idle_compact = bool(body.idle_compact)
-    try:
-        await db.commit()
-    except IntegrityError as exc:
-        # Another request created this agent's row between the lookup and this commit —
-        # two first saves racing, not a 500.
-        await db.rollback()
-        raise ApiError(
-            409, "invalid_request", "The settings were saved elsewhere at the same time"
-        ) from exc
+    # Another request created this agent's row between the lookup and this commit — two
+    # first saves racing, not a 500.
+    await commit_or_conflict(db, "The settings were saved elsewhere at the same time")
     # The convention follows the model, so a write answers the new one along with the row.
     return {
         **_agent_settings_payload(settings, agent.name, row),
@@ -756,7 +747,9 @@ async def chat_agent_context(
     user: SessionUser,
     db: DbSession,
     settings: AppSettings,
-    locale: str = Query(default="en", max_length=16, pattern=LANGUAGE_TAG.pattern),
+    locale: str = Query(
+        default="en", max_length=LANGUAGE_TAG_MAX_CHARS, pattern=LANGUAGE_TAG.pattern
+    ),
 ):
     """What the chat agent receives, rendered by the code the runner uses, for the Agent
     page's drawer (docs/api.md): the system blocks in the order a turn sends them and the
@@ -872,7 +865,7 @@ async def put_memory_file(
     root = user_root(settings.workspaces_dir, user.id)
     async with workspace_lock(root):
         # The send's lock: no turn is queued under the decision below.
-        await db.execute(select(User.id).where(User.id == user.id).with_for_update())
+        await lock_user(db, user.id)
         if await count_active_turns(db, user.id):
             raise ApiError(
                 409,

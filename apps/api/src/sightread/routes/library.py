@@ -29,8 +29,6 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import defer
 from starlette.concurrency import iterate_in_threadpool
-from starlette.datastructures import UploadFile
-from starlette.formparsers import MultiPartException, MultiPartParser
 
 from ..agents import PARSE
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
@@ -75,6 +73,7 @@ from ..workspace.documents import (
     STORAGE_FULL,
     live_document,
     live_folder,
+    live_text_document,
     markdown_name,
     nearest_live,
     own_subtree,
@@ -104,24 +103,11 @@ from ..workspace.layout import (
 )
 from ..workspace.locks import backup_shared, workspace_lock
 from ..workspace.trash import commit_then_discard, lock_user, read_row, refuse_while_answering
-from .multipart import Sink, read_upload_form
+from .multipart import NEEDS_FILE, Sink, capped_form, form_file, read_upload_form
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/library", tags=["library"])
-
-# --- names and places -------------------------------------------------------------------
-
-
-async def live_text_document(db: DbSession, user_id: int, document_id: int) -> Document:
-    """A live document that is a parse or a markdown document: what the routes of a
-    document's own take — its content, result, revert, pages, figures, images, retry
-    and re-convert — since a file of the library has none of those (docs/workspace.md
-    § Files); 404 for one, as for nothing."""
-    row = await live_document(db, user_id, document_id)
-    if row.kind == FILE_KIND:
-        raise ApiError(404, "invalid_request", "No such document")
-    return row
 
 
 # --- payloads ---------------------------------------------------------------------------
@@ -816,7 +802,7 @@ async def upload_document(
         open_sink,
     )
     if part is None:
-        raise ApiError(400, "invalid_request", "Multipart requests need a 'file' part")
+        raise ApiError(400, "invalid_request", NEEDS_FILE)
     try:
         folder_id = form_folder_id(fields)
         if folder_id is not None:
@@ -1335,9 +1321,16 @@ async def document_pages(document_id: int, user: SessionUser, db: DbSession):
         reconvert = await job_of(db, row.reconvert_job_id)
         if reconvert.status == "failed":
             job = reconvert
+    # The four columns the dialog reads, never a page's markdown or figures.
     rows = {
         page.page_no: page
-        for page in (await db.execute(select(JobPage).where(JobPage.job_id == job.id))).scalars()
+        for page in (
+            await db.execute(
+                select(JobPage.page_no, JobPage.status, JobPage.error, JobPage.model).where(
+                    JobPage.job_id == job.id
+                )
+            )
+        ).all()
     }
     return {
         "pages": [
@@ -1529,23 +1522,10 @@ async def upload_image(request: Request, user: SessionUser, db: DbSession, setti
     if not request.headers.get("content-type", "").startswith("multipart/form-data"):
         raise ApiError(400, "invalid_request", "The upload must be multipart/form-data")
     cap = settings.document_image_max_bytes
-    declared = request.headers.get("content-length", "")
-    if declared.isdigit() and int(declared) > cap + MULTIPART_ENVELOPE_BYTES:
-        raise ApiError(413, "invalid_request", f"The upload exceeds {IMAGE_CAP_NAME}")
     # Bounded before the parser spools a byte, as an attachment's body is.
+    form = await capped_form(request, cap, IMAGE_CAP_NAME)
     try:
-        form = await MultiPartParser(
-            request.headers,
-            capped_stream(
-                request.stream(), cap + MULTIPART_ENVELOPE_BYTES, cap_name=IMAGE_CAP_NAME
-            ),
-        ).parse()
-    except MultiPartException as exc:
-        raise ApiError(400, "invalid_request", "The multipart body could not be read") from exc
-    try:
-        upload = form.get("file")
-        if not isinstance(upload, UploadFile):
-            raise ApiError(400, "invalid_request", "Multipart requests need a 'file' part")
+        upload = form_file(form)
         document_id = form.get("document_id")
         if not isinstance(document_id, str) or not document_id.isdigit():
             raise ApiError(400, "invalid_request", "Multipart requests need a 'document_id' part")

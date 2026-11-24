@@ -32,7 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..billing import ledger
 from ..config import Settings
-from ..db.models import MARKDOWN_KIND, Document, Folder, Job, Result, utcnow
+from ..db.models import FILE_KIND, MARKDOWN_KIND, Document, Folder, Job, Result, utcnow
 from ..errors import ApiError
 from ..parsing.images import ImageError, check_pixels, normalize_image
 from . import git, safe_io
@@ -325,6 +325,17 @@ async def live_document(db: AsyncSession, user_id: int, document_id: int) -> Doc
     writes or moves one takes (docs/api.md)."""
     row = await owned_document(db, user_id, document_id)
     if not is_live(row, await user_folders(db, user_id)):
+        raise ApiError(404, "invalid_request", "No such document")
+    return row
+
+
+async def live_text_document(db: AsyncSession, user_id: int, document_id: int) -> Document:
+    """A live document that is a parse or a markdown document: what the routes of a
+    document's own take — its content, result, revert, pages, figures, images, retry,
+    re-convert, its conversations and the memories tied to it — since a file of the
+    library has none of those (docs/workspace.md § Files); 404 for one, as for nothing."""
+    row = await live_document(db, user_id, document_id)
+    if row.kind == FILE_KIND:
         raise ApiError(404, "invalid_request", "No such document")
     return row
 

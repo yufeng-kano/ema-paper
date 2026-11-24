@@ -1,11 +1,17 @@
-"""The library's upload, read as it arrives (docs/api.md § `POST /api/library/documents`).
+"""Multipart bodies, read under a cap (docs/api.md).
 
-Starlette's form parser spools every file part to a temporary file of its own before a route
-sees it. A file of the library is streamed into the user's tree instead, under the cap of its
-kind, so a two-gigabyte upload is written once, where it will live, and never into the
-system's temporary directory (docs/workspace.md § Files). The parser is python-multipart's —
-the one Starlette drives — driven here with callbacks that write the one file part through a
-descriptor the route opened for it and keep the small fields in memory.
+The small uploads — a chat attachment, an image for a document, a `/v1/parse` file — go
+through Starlette's form parser, which spools every file part to a temporary file of its
+own: `capped_form` bounds the body it reads, so a request that declares no length is
+refused at its cap rather than written out in full first.
+
+The library's upload is read as it arrives instead (docs/api.md § `POST
+/api/library/documents`). A file of the library is streamed into the user's tree, under the
+cap of its kind, so a two-gigabyte upload is written once, where it will live, and never
+into the system's temporary directory (docs/workspace.md § Files). The parser is
+python-multipart's — the one Starlette drives — driven here with callbacks that write the
+one file part through a descriptor the route opened for it and keep the small fields in
+memory.
 """
 
 from __future__ import annotations
@@ -19,8 +25,12 @@ from pathlib import Path
 
 from python_multipart.exceptions import FormParserError
 from python_multipart.multipart import MultipartParser, parse_options_header
+from starlette.datastructures import FormData, UploadFile
+from starlette.formparsers import MultiPartException, MultiPartParser
+from starlette.requests import Request
 
 from ..errors import ApiError
+from ..jobs.intake import MULTIPART_ENVELOPE_BYTES, capped_stream
 
 # A field of the form (`folder_id`) is a few characters; anything longer is not a field.
 FIELD_MAX_BYTES = 1024
@@ -30,6 +40,33 @@ FIELDS_MAX = 16
 # before a part's bytes have a place is never held whole in memory.
 HEADERS_MAX_BYTES = 16 * 1024
 UNREADABLE = "The multipart body could not be read"
+NEEDS_FILE = "Multipart requests need a 'file' part"
+
+
+async def capped_form(request: Request, cap: int, cap_name: str = "UPLOAD_MAX_BYTES") -> FormData:
+    """The request's `multipart/form-data` body, parsed by Starlette under `cap` (plus the
+    envelope of the form): a declared length above it is refused before a byte is read, and
+    the stream stops at it for a request that declares none or an untrue one (413, naming
+    `cap_name`; jobs/intake.capped_stream). A body the parser cannot read is a 400. The
+    form is the caller's to close."""
+    limit = cap + MULTIPART_ENVELOPE_BYTES
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > limit:
+        raise ApiError(413, "invalid_request", f"The upload exceeds {cap_name}")
+    try:
+        return await MultiPartParser(
+            request.headers, capped_stream(request.stream(), limit, cap_name=cap_name)
+        ).parse()
+    except MultiPartException as exc:
+        raise ApiError(400, "invalid_request", UNREADABLE) from exc
+
+
+def form_file(form: FormData) -> UploadFile:
+    """The form's `file` part; a 400 when it has none."""
+    upload = form.get("file")
+    if not isinstance(upload, UploadFile):
+        raise ApiError(400, "invalid_request", NEEDS_FILE)
+    return upload
 
 
 @dataclass(frozen=True)
@@ -113,7 +150,7 @@ class _Form:
             self._field_name = name
             return
         if name != "file":
-            raise ApiError(400, "invalid_request", "Multipart requests need a 'file' part")
+            raise ApiError(400, "invalid_request", NEEDS_FILE)
         if self.part is not None:
             raise ApiError(400, "invalid_request", "An upload carries one file")
         decoded = filename.decode(self.charset, "replace")

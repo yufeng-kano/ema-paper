@@ -2407,7 +2407,7 @@ async def test_a_thread_for_a_document_deleted_underneath_is_a_404(chatting, mon
     from sightread.routes import chat as chat_routes
 
     document_id = chatting.document_id
-    original = chat_routes.owned_document
+    original = chat_routes.live_text_document
 
     async def deleted_underneath(db, user_id, did):
         row = await original(db, user_id, did)
@@ -2416,7 +2416,7 @@ async def test_a_thread_for_a_document_deleted_underneath_is_a_404(chatting, mon
             await other.commit()
         return row
 
-    monkeypatch.setattr(chat_routes, "owned_document", deleted_underneath)
+    monkeypatch.setattr(chat_routes, "live_text_document", deleted_underneath)
     created = await chatting.post(
         f"/api/library/documents/{document_id}/conversations", headers=CSRF_HEADERS
     )

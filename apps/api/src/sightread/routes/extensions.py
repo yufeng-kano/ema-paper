@@ -18,7 +18,6 @@ from typing import Any
 from fastapi import APIRouter, Response, status
 from pydantic import BaseModel
 from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
 
 from ..agents import skills as skill_defs
 from ..agents import subagents as subagent_defs
@@ -26,6 +25,7 @@ from ..agents.chat import SUBAGENT_TOOL_NAMES
 from ..auth.deps import AppSettings, CsrfGuard, DbSession, SessionUser
 from ..config import Settings
 from ..db.models import Skill, Subagent, utcnow
+from ..db.session import commit_or_conflict
 from ..errors import ApiError
 from ..workspace.trash import lock_user
 
@@ -58,15 +58,6 @@ def _checked_text(value: str, limit: int, label: str, *, required: bool = False)
     if len(text) > limit:
         raise ApiError(400, "invalid_request", f"The {label} exceeds {limit} characters")
     return text
-
-
-async def _commit_or_taken(db: DbSession, message: str) -> None:
-    try:
-        await db.commit()
-    except IntegrityError as exc:
-        # Two requests creating or renaming to one name at once: the constraint decides.
-        await db.rollback()
-        raise ApiError(409, "invalid_request", message) from exc
 
 
 # --- skills -----------------------------------------------------------------------------
@@ -320,7 +311,8 @@ async def _create(
         raise ApiError(400, "invalid_request", f"You can keep at most {cap} {kind.noun}s")
     values = kind.checked(sent, settings)
     db.add(kind.model(user_id=user.id, name=name, **values))
-    await _commit_or_taken(db, taken)
+    # Two requests creating one name at once: the constraint decides.
+    await commit_or_conflict(db, taken)
     return await _resolved(kind, db, user.id, name)
 
 
@@ -354,7 +346,8 @@ async def _update(
             for field, value in values.items():
                 setattr(row, field, value)
             row.updated_at = utcnow()
-        await _commit_or_taken(db, f"The {kind.noun} was just edited elsewhere; try again")
+        # Two first edits of one built-in at once: the constraint decides.
+        await commit_or_conflict(db, f"The {kind.noun} was just edited elsewhere; try again")
         return await _resolved(kind, db, user.id, name)
 
     if row is None:
@@ -372,7 +365,8 @@ async def _update(
     for field, value in values.items():
         setattr(row, field, value)
     row.updated_at = utcnow()
-    await _commit_or_taken(db, taken)
+    # Two requests renaming to one name at once: the constraint decides.
+    await commit_or_conflict(db, taken)
     return await _resolved(kind, db, user.id, new_name)
 
 
