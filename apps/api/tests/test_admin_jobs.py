@@ -564,20 +564,19 @@ async def test_usage_is_summed_per_utc_day_and_model_across_midnight(make_client
             row["completion_tokens"],
             row["cost"],
             row["estimated_cost"],
-            row["estimated_calls"],
             row["unpriced_calls"],
         )
         for row in body["rows"]
     ]
     assert rows == [
-        ("2026-03-15", "vendor/a", 2, 500, 50, 1.0, 0.25, 1, 0),
-        ("2026-03-15", "vendor/b", 1, 5, 0, 0.0, 0.0, 0, 1),
-        ("2026-03-14", "vendor/a", 1, 100, 10, 0.0, 0.5, 1, 0),
+        ("2026-03-15", "vendor/a", 2, 500, 50, 1.0, 0.25, 0),
+        ("2026-03-15", "vendor/b", 1, 5, 0, 0.0, 0.0, 1),
+        ("2026-03-14", "vendor/a", 1, 100, 10, 0.0, 0.5, 0),
     ]
     totals = body["totals"]
     assert (totals["calls"], totals["prompt_tokens"], totals["completion_tokens"]) == (4, 605, 60)
     assert (totals["cost"], totals["estimated_cost"]) == (1.0, 0.75)
-    assert (totals["estimated_calls"], totals["unpriced_calls"]) == (2, 1)
+    assert totals["unpriced_calls"] == 1
 
     one_day = (await owner.get("/api/admin/usage?from=2026-03-14&to=2026-03-14")).json()
     assert [(row["date"], row["calls"]) for row in one_day["rows"]] == [("2026-03-14", 1)]

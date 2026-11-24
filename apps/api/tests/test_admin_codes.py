@@ -17,6 +17,7 @@ from sqlalchemy import func, select, update
 
 from sightread import codes as cli
 from sightread.billing import codes
+from sightread.billing.plans import DAYS_MAX
 from sightread.config import Settings
 from sightread.db.models import RedeemCode, utcnow
 from tests.conftest import CSRF_HEADERS, PRO_PLANS_JSON, postgres_only
@@ -416,24 +417,22 @@ async def test_a_plan_code_whose_plan_is_gone_is_not_active(make_client, capsys)
 
 async def test_a_code_at_the_most_days_redeems(make_client) -> None:
     owner = await _owner(make_client, **PLANS)
-    [credits] = (await _create(owner, kind="credits", credits=5, valid_days=codes.MAX_DAYS))[
-        "codes"
-    ]
-    [plan] = (await _create(owner, kind="plan", plan_id="pro", days=codes.MAX_DAYS))["codes"]
+    [credits] = (await _create(owner, kind="credits", credits=5, valid_days=DAYS_MAX))["codes"]
+    [plan] = (await _create(owner, kind="plan", plan_id="pro", days=DAYS_MAX))["codes"]
     before = utcnow()
     redeemed = await owner.post(
         "/api/billing/redeem", json={"code": credits["code"]}, headers=CSRF_HEADERS
     )
     assert redeemed.status_code == 200, redeemed.text
     lasts = datetime.fromisoformat(redeemed.json()["expires_at"]) - before
-    assert timedelta(days=codes.MAX_DAYS) <= lasts < timedelta(days=codes.MAX_DAYS, minutes=1)
+    assert timedelta(days=DAYS_MAX) <= lasts < timedelta(days=DAYS_MAX, minutes=1)
     redeemed = await owner.post(
         "/api/billing/redeem", json={"code": plan["code"]}, headers=CSRF_HEADERS
     )
     assert redeemed.status_code == 200, redeemed.text
     # Nothing pays for the account: the first granted period opens from the bank at once.
     period_days = owner.app.state.settings.grant_period_days
-    assert redeemed.json()["days_banked"] == codes.MAX_DAYS - period_days
+    assert redeemed.json()["days_banked"] == DAYS_MAX - period_days
 
 
 async def test_disabling_records_once_and_the_code_stops_working(make_client) -> None:

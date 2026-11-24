@@ -24,7 +24,7 @@ from ..config import Settings
 from ..db.models import CreditPack, RedeemCode, Redemption, User, utcnow
 from ..errors import ApiError
 from . import ledger
-from .plans import GRANT, Decision
+from .plans import DAYS_MAX, GRANT, Decision
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +43,6 @@ DEFAULT_VALID_DAYS = 365
 # What the integer columns hold: a count, a use or credits past it are refused before the
 # insert would fail on it.
 INT_MAX = 2**31 - 1
-# The most `valid_days` and `days` a code gives: a hundred years. Redeeming works dates out
-# of them — `now + valid_days` for a pack, a granted period's end — which a Python date
-# holds only to the year 9999, and banks days in a 32-bit column.
-MAX_DAYS = 36_500
 # A masked code keeps at least this many characters hidden: 32⁸ ≈ 10¹² possibilities, past
 # guessing under the attempt cap, whatever `REDEEM_CODE_CHARS` is.
 MASK_HIDDEN_CHARS = 8
@@ -275,7 +271,7 @@ async def create_codes(
 
     The batch is checked first, for the CLI and the console alike, and refused with a
     `ValueError` naming the rule: a known kind; `count`, `max_uses` and the kind's amounts
-    present, from 1 — and up to the integer columns, the days up to `MAX_DAYS`; a plan of
+    present, from 1 — and up to the integer columns, the days up to `DAYS_MAX`; a plan of
     `KANO_PAY_PLANS_JSON`; a label the column holds; a `redeem_by` not already past; at
     most `REDEEM_CODES_MAX_COUNT` codes. The other kind's fields are ignored."""
     if kind not in (CREDITS, PLAN):
@@ -286,9 +282,9 @@ async def create_codes(
         )
     # Each field with the most it takes.
     if kind == CREDITS:
-        amounts = {"credits": (credits, INT_MAX), "valid_days": (valid_days, MAX_DAYS)}
+        amounts = {"credits": (credits, INT_MAX), "valid_days": (valid_days, DAYS_MAX)}
     else:
-        amounts = {"days": (days, MAX_DAYS)}
+        amounts = {"days": (days, DAYS_MAX)}
     for name, (value, most) in {"max_uses": (max_uses, INT_MAX), **amounts}.items():
         if value is None or not 1 <= value <= most:
             raise ValueError(f"{name} must be a whole number from 1 to {most}")

@@ -35,7 +35,7 @@ from ..admin.deps import (
 from ..admin.permissions import ALL_PERMISSIONS, AREAS, normalize
 from ..auth.deps import AppSettings, CsrfGuard, DbSession
 from ..billing import codes, ledger
-from ..billing.plans import FREE_PLAN_ID
+from ..billing.plans import DAYS_MAX, FREE_PLAN_ID
 from ..config import Settings
 from ..db.models import (
     COST_SOURCE_ESTIMATED,
@@ -530,7 +530,7 @@ async def list_codes(
         "create": {
             "plans": list(settings.plans),
             "max_count": settings.redeem_codes_max_count,
-            "max_days": codes.MAX_DAYS,
+            "max_days": DAYS_MAX,
             "valid_days": codes.DEFAULT_VALID_DAYS,
             "credit_usd": str(settings.credit_usd),
         },
@@ -615,26 +615,20 @@ USAGE_FIGURES = (
     func.sum(UsageLog.completion_tokens),
     func.sum(case((UsageLog.cost_source == COST_SOURCE_OPENROUTER, UsageLog.cost))),
     func.sum(case((UsageLog.cost_source == COST_SOURCE_ESTIMATED, UsageLog.cost))),
-    func.count(case((UsageLog.cost_source == COST_SOURCE_ESTIMATED, 1))),
     func.count(case((UsageLog.cost_source == COST_SOURCE_UNKNOWN, 1))),
-    func.sum(UsageLog.cache_read_tokens),
-    func.sum(UsageLog.cache_write_tokens),
 )
 
 
 def usage_totals(row) -> dict:
     """`<figures>` from one row of `USAGE_FIGURES`."""
-    calls, prompt, completion, cost, estimated, estimated_calls, unpriced, cached, written = row
+    calls, prompt, completion, cost, estimated, unpriced = row
     return {
         "calls": int(calls),
         "prompt_tokens": int(prompt or 0),
         "completion_tokens": int(completion or 0),
         "cost": float(cost or 0),
         "estimated_cost": float(estimated or 0),
-        "estimated_calls": int(estimated_calls),
         "unpriced_calls": int(unpriced),
-        "cache_read_tokens": int(cached or 0),
-        "cache_write_tokens": int(written or 0),
     }
 
 
