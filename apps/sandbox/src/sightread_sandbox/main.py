@@ -13,6 +13,7 @@ import secrets
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .backends import Backend, build_backend
@@ -23,15 +24,14 @@ logger = logging.getLogger(__name__)
 IDLE_SWEEP_SECONDS = 60.0
 
 
-class ExecBody(BaseModel):
+class SessionBody(BaseModel):
     session: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+
+
+class ExecBody(SessionBody):
     # The length cap is the runner's setting, checked in the handler (docs/sandbox.md).
     command: str = Field(min_length=1)
     timeout_seconds: int = Field(default=120, ge=1)
-
-
-class SessionBody(BaseModel):
-    session: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
 
 
 def create_app(settings: Settings | None = None, backend: Backend | None = None) -> FastAPI:
@@ -60,8 +60,12 @@ def create_app(settings: Settings | None = None, backend: Backend | None = None)
                 await task
 
     app = FastAPI(title="sightread-sandbox", lifespan=lifespan)
-    app.state.backend = backend
-    app.state.settings = settings
+
+    @app.exception_handler(RuntimeError)
+    async def unavailable(request: Request, exc: RuntimeError) -> JSONResponse:
+        # What a backend could not do or Docker could not say: unavailable, never a
+        # stopped VM nothing can start.
+        return JSONResponse({"detail": str(exc)}, status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
 
     async def require_token(request: Request) -> None:
         header = request.headers.get("authorization", "")
@@ -79,11 +83,7 @@ def create_app(settings: Settings | None = None, backend: Backend | None = None)
 
     @app.get("/sandboxes/{user_id}", dependencies=guard)
     async def sandbox_status(user_id: int) -> dict:
-        try:
-            return await backend.status(user_id)
-        except RuntimeError as exc:
-            # Docker could not say: unavailable, never a stopped VM nothing can start.
-            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+        return await backend.status(user_id)
 
     @app.post("/sandboxes/{user_id}/exec", dependencies=guard)
     async def sandbox_exec(user_id: int, body: ExecBody) -> dict:
@@ -93,10 +93,7 @@ def create_app(settings: Settings | None = None, backend: Backend | None = None)
                 f"the command is longer than {settings.sandbox_command_max_chars} characters",
             )
         timeout = min(body.timeout_seconds, settings.sandbox_command_timeout_max)
-        try:
-            outcome = await backend.exec(user_id, body.session, body.command, timeout=timeout)
-        except RuntimeError as exc:
-            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+        outcome = await backend.exec(user_id, body.session, body.command, timeout=timeout)
         return {
             "output": outcome.output,
             "exit_code": outcome.exit_code,
@@ -106,26 +103,17 @@ def create_app(settings: Settings | None = None, backend: Backend | None = None)
 
     @app.post("/sandboxes/{user_id}/restart", dependencies=guard)
     async def sandbox_restart(user_id: int, body: SessionBody) -> dict:
-        try:
-            await backend.restart(user_id, body.session)
-        except RuntimeError as exc:
-            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+        await backend.restart(user_id, body.session)
         return {"ok": True}
 
     @app.post("/sandboxes/{user_id}/stop", dependencies=guard)
     async def sandbox_stop(user_id: int) -> Response:
-        try:
-            await backend.stop(user_id)
-        except RuntimeError as exc:
-            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+        await backend.stop(user_id)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.post("/sandboxes/{user_id}/reset", dependencies=guard)
     async def sandbox_reset(user_id: int) -> Response:
-        try:
-            await backend.reset(user_id)
-        except RuntimeError as exc:
-            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+        await backend.reset(user_id)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     return app

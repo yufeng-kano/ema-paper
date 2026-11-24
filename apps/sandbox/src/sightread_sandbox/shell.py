@@ -14,7 +14,6 @@ import asyncio
 import contextlib
 import os
 import secrets
-from asyncio import LimitOverrunError
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 
@@ -181,7 +180,8 @@ class ShellSession:
             if not text.startswith(PID_PREFIX):
                 raise ValueError(text)
             self.pid = int(text[len(PID_PREFIX) :])
-        except (TimeoutError, ValueError, LimitOverrunError) as exc:
+        # `readline` reports a line past the stream's limit as a ValueError too.
+        except (TimeoutError, ValueError) as exc:
             await self.close()
             raise RuntimeError("the shell did not report its pid") from exc
 
@@ -223,7 +223,7 @@ class ShellSession:
             # command's own stdin is /dev/null, and the marker is read before the command
             # starts — so the status line that follows is the supervisor's, never the
             # command's (docs/sandbox.md § The runner). A marker that happens to appear
-            # in the command (it cannot, at this length, but still) is drawn again.
+            # in the command is drawn again.
             while True:
                 marker = f"__SR_DONE_{secrets.token_hex(8)}__"
                 if marker not in command:
@@ -272,10 +272,9 @@ class ShellSession:
                             collected.add(line)
                         if found:
                             break
-                        # A partial line past the cap is output too; keep only the tail
-                        # where a marker could still begin. The marker always starts a
-                        # line, and a line this long is not the marker's, whatever its
-                        # first byte — so the head goes, every time.
+                        # A partial line past the cap is output too: the marker always
+                        # starts a line, and a line this long cannot be the marker's, so
+                        # all but the tail goes.
                         if len(pending) > self._max_bytes:
                             collected.add(pending[: -len(marker_bytes)])
                             pending = pending[-len(marker_bytes) :]
