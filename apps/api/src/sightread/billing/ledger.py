@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -215,23 +215,69 @@ async def read_balance(
 ) -> Balance:
     """The current period, its balance and the packs, without writing: a period never
     used has no row and its whole grant left."""
+    return (await read_balances(db, settings, [user_id], now))[user_id]
+
+
+async def read_balances(
+    db: AsyncSession, settings: Settings, user_ids: list[int], now: datetime | None = None
+) -> dict[int, Balance]:
+    """`read_balance` for every one of `user_ids` at once, in four queries whatever their
+    number: a page of the console's accounts."""
+    if not user_ids:
+        return {}
     now = now or utcnow()
-    decided = await decide_period(db, settings, user_id, now)
-    period = decided.period
-    row = await db.get(CreditPeriod, (user_id, period.start))
-    packs = tuple(
-        _pack_balance(pack, now)
-        for pack in (
-            await db.execute(
-                select(CreditPack)
-                .where(CreditPack.user_id == user_id)
-                .order_by(CreditPack.purchased_at.desc(), CreditPack.id)
+    subscriptions = {
+        row.user_id: row
+        for row in await db.scalars(select(Subscription).where(Subscription.user_id.in_(user_ids)))
+    }
+    banks = {
+        row.user_id: row
+        for row in await db.scalars(select(PlanGrant).where(PlanGrant.user_id.in_(user_ids)))
+    }
+    decided = {
+        user_id: resolve_period(
+            subscriptions.get(user_id),
+            _grant_of(banks.get(user_id)),
+            settings.plans,
+            settings.free_plan,
+            now,
+            settings.grant_period_days,
+        )
+        for user_id in user_ids
+    }
+    # Keyed by the user alone, never by `period_start`: SQLite answers it naive, and the
+    # primary key holds one row per user and period.
+    periods = {
+        row.user_id: row
+        for row in await db.scalars(
+            select(CreditPeriod).where(
+                or_(
+                    *(
+                        and_(
+                            CreditPeriod.user_id == user_id,
+                            CreditPeriod.period_start == decision.period.start,
+                        )
+                        for user_id, decision in decided.items()
+                    )
+                )
             )
-        ).scalars()
-    )
-    if row is None:
-        return Balance(period, period.credits, 0, packs, decided.grant)
-    return Balance(period, max(row.granted, period.credits), row.spent, packs, decided.grant)
+        )
+    }
+    packs: dict[int, list[PackBalance]] = {user_id: [] for user_id in user_ids}
+    for pack in await db.scalars(
+        select(CreditPack)
+        .where(CreditPack.user_id.in_(user_ids))
+        .order_by(CreditPack.user_id, CreditPack.purchased_at.desc(), CreditPack.id)
+    ):
+        packs[pack.user_id].append(_pack_balance(pack, now))
+    balances = {}
+    for user_id, decision in decided.items():
+        period, row = decision.period, periods.get(user_id)
+        granted, spent = (period.credits, 0) if row is None else (row.granted, row.spent)
+        balances[user_id] = Balance(
+            period, max(granted, period.credits), spent, tuple(packs[user_id]), decision.grant
+        )
+    return balances
 
 
 async def plan_of(db: AsyncSession, settings: Settings, user_id: int) -> Plan:

@@ -86,8 +86,9 @@ class RuntimeSettings:
     one under the lock could wait out its timeout with all of them. The worker and the CLI
     pass none and read on a session of their own. It never raises: a database it cannot
     read keeps the settings last read (`.env`'s before any), and rows that no longer fit
-    `.env` leave `.env` alone in effect, with the checks' message in `ignored` for the
-    settings page."""
+    `.env` leave `.env` alone in effect, the checks' message logged once until it changes.
+    The settings page works its message out from the rows it reads itself, never from
+    this cached copy."""
 
     def __init__(
         self,
@@ -103,7 +104,9 @@ class RuntimeSettings:
         # Moved on by every `invalidate()`: a read that began before it keeps nothing.
         self._generation = 0
         self._read_failed = False
-        self.ignored: str | None = None
+        # The checks' message last logged for rows that no longer fit `.env`: each message
+        # is logged once, not at every read.
+        self._ignored: str | None = None
 
     async def current(self, db: AsyncSession | None = None) -> Settings:
         base = self._base()
@@ -159,15 +162,15 @@ class RuntimeSettings:
                 value = effective(base, dict(rows))
             except ValidationError as exc:
                 message = validation_message(exc)
-                if message != self.ignored:
+                if message != self._ignored:
                     logger.error(
                         "the database's settings no longer fit .env, which alone is in effect: %s",
                         message,
                     )
-                self.ignored = message
+                self._ignored = message
                 value = base
             else:
-                self.ignored = None
+                self._ignored = None
             self._built_on, self._value = base, value
         # Kept from the end of the read, never its start: whoever asks while it runs waits
         # for its answer rather than take the copy it replaces, and a read cut short (its

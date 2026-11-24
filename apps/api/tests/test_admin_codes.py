@@ -368,12 +368,12 @@ async def test_the_list_keeps_the_active_codes_or_all_searches_labels_and_pages(
     assert ids(await owner.get(f"{CODES}?status=all&q=%25")) == []
     # The code itself is never searched, not even its shown group.
     assert ids(await owner.get(f"{CODES}?q={beta['code'][4:8]}")) == []
-    paged = (await owner.get(f"{CODES}?status=all&page_size=4&page=2")).json()
+    small = await _owner(make_client, admin_page_size=4, **PLANS)
+    paged = (await small.get(f"{CODES}?status=all&page=2")).json()
     assert (paged["total"], paged["page"], paged["page_size"]) == (6, 2, 4)
     assert [item["id"] for item in paged["items"]] == [used_up, expired]
-    assert (await owner.get(f"{CODES}?status=all&page_size=4&page=3")).json()["items"] == []
-    assert (await owner.get(f"{CODES}?page_size=1000")).json()["page_size"] == 50
-    for query in ("status=used", "page=0", "page_size=0"):
+    assert (await small.get(f"{CODES}?status=all&page=3")).json()["items"] == []
+    for query in ("status=used", "page=0"):
         assert (await owner.get(f"{CODES}?{query}")).status_code == 422
 
 

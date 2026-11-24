@@ -206,12 +206,8 @@ async def test_a_stuck_job_goes_back_with_its_finished_pages_and_one_audit_row(
 
     async with owner.app.state.sessionmaker() as db:
         stored = await db.get(Job, job.id)
-        assert (stored.status, stored.pages_done, stored.worker_generation, stored.started_at) == (
-            "queued",
-            1,
-            None,
-            None,
-        )
+        assert (stored.status, stored.pages_done, stored.worker_generation) == ("queued", 1, None)
+        assert stored.started_at is None
         assert list(await db.scalars(select(JobPage.page_no).where(JobPage.job_id == job.id))) == [
             1
         ]
@@ -469,8 +465,6 @@ async def test_the_jobs_list_pages_filters_and_shows_no_content(make_client) -> 
 
     only = (await owner.get("/api/admin/jobs?status=failed")).json()
     assert ([item["id"] for item in only["items"]], only["total"]) == ([str(jobs[1].id)], 1)
-    # The page size is capped by ADMIN_PAGE_SIZE.
-    assert (await owner.get("/api/admin/jobs?page_size=50")).json()["page_size"] == 2
 
     bad = await owner.get("/api/admin/jobs?status=cancelled")
     assert bad.status_code == 422
@@ -708,7 +702,7 @@ async def test_every_database_read_comes_before_the_catalogs(make_client, monkey
     async def broken(*args, **kwargs) -> dict:
         raise RuntimeError("the connection dropped")
 
-    monkeypatch.setattr(admin_routes, "list_audit", broken)
+    monkeypatch.setattr(admin_routes, "_audit_page", broken)
     held.clear()
     with pytest.raises(RuntimeError, match="the connection dropped"):
         await owner.get("/api/admin/overview")

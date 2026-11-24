@@ -35,7 +35,7 @@ from ..admin.deps import (
 from ..admin.permissions import ALL_PERMISSIONS, AREAS, normalize
 from ..auth.deps import AppSettings, CsrfGuard, DbSession
 from ..billing import codes, ledger
-from ..billing.plans import FREE_PLAN_ID, PAID_STATUSES
+from ..billing.plans import FREE_PLAN_ID
 from ..config import Settings
 from ..db.models import (
     COST_SOURCE_ESTIMATED,
@@ -45,7 +45,6 @@ from ..db.models import (
     Group,
     GroupMember,
     Job,
-    PlanGrant,
     RedeemCode,
     Redemption,
     Subscription,
@@ -67,29 +66,64 @@ UsersWriter = Annotated[Operator, Depends(require_permission("users.write"))]
 GroupsReader = Annotated[Operator, Depends(require_permission("groups.read"))]
 GroupsWriter = Annotated[Operator, Depends(require_permission("groups.write"))]
 AuditReader = Annotated[Operator, Depends(require_permission("audit.read"))]
+CodesReader = Annotated[Operator, Depends(require_permission("codes.read"))]
+CodesWriter = Annotated[Operator, Depends(require_permission("codes.write"))]
+JobsReader = Annotated[Operator, Depends(require_permission("jobs.read"))]
+JobsWriter = Annotated[Operator, Depends(require_permission("jobs.write"))]
+SettingsReader = Annotated[Operator, Depends(require_permission("settings.read"))]
+SettingsWriter = Annotated[Operator, Depends(require_permission("settings.write"))]
 
 # A group's name (docs/admin.md § Groups); the web app checks the same rule as it is typed.
 GROUP_NAME_PATTERN = r"^[a-z0-9][a-z0-9_-]*$"
 GROUP_NAME_MAX_CHARS = 32
-# The highest `?page=` a list takes (docs/admin.md § Routes): its offset, at the largest
-# page size, stays well inside the 64-bit integer PostgreSQL's OFFSET takes.
-PAGE_MAX = 2**31 - 1
-# The highest account id a users route takes: `users.id` is a 32-bit integer, and a larger
-# id would fail in the database instead of finding no account (docs/admin.md § Routes).
-USER_ID_MAX = 2**31 - 1
+# An account's or a group's id in a path: `users.id` and `groups.id` are 32-bit integers,
+# and a larger id would fail in the database instead of finding nothing (docs/admin.md
+# § Routes).
+DbId = Annotated[int, Path(ge=1, le=codes.INT_MAX)]
+# A list's `?page=`, bounded the same: its offset, at the largest page size, stays well
+# inside the 64-bit integer PostgreSQL's OFFSET takes.
+Page = Annotated[int, Query(ge=1, le=codes.INT_MAX)]
 # How many of an account's newest jobs its page lists (docs/admin.md § Users and grants).
 RECENT_JOBS = 5
 # A grant's `reason`, the operator's note (docs/admin.md § Users and grants).
 GRANT_REASON_MAX_CHARS = 200
 
 
+async def _latest_actors(
+    db: AsyncSession, target_type: str, ids: list[int], actions: tuple[str, ...]
+) -> dict[int, dict]:
+    """`{id: {id, name}}`: for each target of `target_type` among `ids`, the account that
+    wrote its newest record of one of `actions`. A target with no such record, or whose
+    actor's account is deleted, is left out."""
+    newest = (
+        select(AuditLog.target_id, func.max(AuditLog.id).label("id"))
+        .where(
+            AuditLog.target_type == target_type,
+            AuditLog.target_id.in_([str(target) for target in ids]),
+            AuditLog.action.in_(actions),
+        )
+        .group_by(AuditLog.target_id)
+        .subquery()
+    )
+    return {
+        int(target_id): {"id": user_id, "name": name}
+        for target_id, user_id, name in (
+            await db.execute(
+                select(newest.c.target_id, User.id, User.name)
+                .select_from(newest)
+                .join(AuditLog, AuditLog.id == newest.c.id)
+                .join(User, User.id == AuditLog.actor_id)
+            )
+        ).all()
+    }
+
+
 @router.get("/me")
 async def console_me(operator: ConsoleSession, settings: AppSettings):
     """How the pages learn what the account holds and whether the session is past the
     window: refused on neither (docs/admin.md § Signing in)."""
-    user = operator.user
     return {
-        "user": {"id": user.id, "email": user.email, "name": user.name, "picture": user.picture},
+        "user": {"id": operator.user.id},
         "permissions": list(operator.permissions),
         "reauth_required": reauth_due(operator, settings),
         "reauth_hours": settings.admin_reauth_hours,
@@ -99,48 +133,23 @@ async def console_me(operator: ConsoleSession, settings: AppSettings):
 # --- users and grants -----------------------------------------------------------------
 
 
-def _on_plan(settings: Settings, plan_id: str, now: datetime):
-    """The accounts whose current period at `now` is `plan_id`'s, as SQL — the period
-    decision (`plans.resolve_period`) read over every account at once: a paid
-    subscription running now on a configured plan, else the granted days of a configured
-    plan, running or waiting in the bank, else Free."""
-    configured = list(settings.plans)
-    paid = select(Subscription.user_id).where(
-        Subscription.status.in_(PAID_STATUSES),
-        Subscription.period_start <= now,
-        Subscription.period_end > now,
-        Subscription.plan_id.in_(configured),
-    )
-    granted = select(PlanGrant.user_id).where(
-        PlanGrant.plan_id.in_(configured),
-        or_(PlanGrant.period_end > now, PlanGrant.days_banked > 0),
-    )
-    if plan_id == FREE_PLAN_ID:
-        return and_(User.id.not_in(paid), User.id.not_in(granted))
-    return or_(
-        User.id.in_(paid.where(Subscription.plan_id == plan_id)),
-        and_(User.id.not_in(paid), User.id.in_(granted.where(PlanGrant.plan_id == plan_id))),
-    )
-
-
 @router.get("/users")
 async def list_users(
     operator: UsersReader,
     db: DbSession,
     settings: AppSettings,
-    page: int = Query(default=1, ge=1, le=PAGE_MAX),
-    page_size: int | None = Query(default=None, ge=1),
+    page: Page = 1,
     q: str = "",
     plan: str | None = None,
 ):
-    """Newest sign-up first, `ADMIN_PAGE_SIZE` a page unless the query asks for fewer.
-    `q` keeps the accounts whose address or name contains it in any letter case; `plan`
-    those whose current period is that plan's. Each row's storage is measured now, one
-    after another; one that cannot be measured reads null."""
+    """Newest sign-up first, `ADMIN_PAGE_SIZE` a page. `q` keeps the accounts whose
+    address or name contains it in any letter case; `plan` those whose current period is
+    that plan's. Each row's storage is measured now, one after another; one that cannot be
+    measured reads null."""
     plan_ids = [FREE_PLAN_ID, *settings.plans]
     if plan is not None and plan not in plan_ids:
         raise ApiError(422, "invalid_request", f"plan: one of {', '.join(plan_ids)}")
-    size = min(page_size or settings.admin_page_size, settings.admin_page_size)
+    size = settings.admin_page_size
     now = utcnow()
     filters = []
     needle = q.strip()
@@ -152,7 +161,7 @@ async def list_users(
             )
         )
     if plan is not None:
-        filters.append(_on_plan(settings, plan, now))
+        filters.append(grants.on_plan(settings, plan, now))
     total = await db.scalar(select(func.count()).select_from(User).where(*filters))
     rows = list(
         await db.scalars(
@@ -172,9 +181,10 @@ async def list_users(
             )
         ).all()
     )
+    balances = await ledger.read_balances(db, settings, [user.id for user in rows], now)
     items = []
     for user in rows:
-        balance = await ledger.read_balance(db, settings, user.id, now)
+        balance = balances[user.id]
         try:
             usage = await measure_storage(
                 db, settings, user.id, user_root(settings.workspaces_dir, user.id)
@@ -203,7 +213,9 @@ async def list_users(
             {
                 "id": plan_id,
                 "accounts": await db.scalar(
-                    select(func.count()).select_from(User).where(_on_plan(settings, plan_id, now))
+                    select(func.count())
+                    .select_from(User)
+                    .where(grants.on_plan(settings, plan_id, now))
                 ),
             }
             for plan_id in plan_ids
@@ -219,7 +231,7 @@ async def list_users(
 
 @router.get("/users/{user_id}")
 async def get_user(
-    user_id: Annotated[int, Path(ge=1, le=USER_ID_MAX)],
+    user_id: DbId,
     operator: UsersReader,
     db: DbSession,
     settings: AppSettings,
@@ -273,7 +285,6 @@ async def get_user(
                 Job.filename,
                 Job.status,
                 Job.page_count,
-                Job.pages_done,
                 Job.created_at,
                 Job.finished_at,
             )
@@ -296,24 +307,12 @@ async def get_user(
             ).all()
         ]
     return {
-        "user": {
-            "id": user.id,
-            "email": user.email,
-            "name": user.name,
-            "created_at": user.created_at,
-        },
-        "plan": {
-            "id": period.plan.id,
-            "source": period.source,
-            "start": period.start,
-            "end": period.end,
-        },
+        "user": {"id": user.id, "email": user.email, "name": user.name},
+        "plan": {"id": period.plan.id, "source": period.source, "end": period.end},
         "subscription": None
         if subscription is None
         else {
             "status": subscription.status,
-            "plan_id": subscription.plan_id,
-            "period_end": subscription.period_end,
             "cancel_at_period_end": subscription.cancel_at_period_end,
         },
         "credits": {"available": balance.available, "sources": sources},
@@ -329,7 +328,6 @@ async def get_user(
                     "filename": job.filename,
                     "status": job.status,
                     "page_count": job.page_count,
-                    "pages_done": job.pages_done,
                     "created_at": job.created_at,
                     "finished_at": job.finished_at,
                 }
@@ -340,41 +338,43 @@ async def get_user(
     }
 
 
-class CreditGrant(BaseModel):
+class _GrantBody(BaseModel):
+    """What every grant carries, declared last in each kind so a 422 names the kind's own
+    fields first: `request_id`, the key that makes sending it again harmless, and
+    `reason`, the operator's note, a blank one stored as none."""
+
     model_config = ConfigDict(str_strip_whitespace=True)
 
+    @field_validator("reason", check_fields=False)
+    @classmethod
+    def _none_when_empty(cls, value: str | None) -> str | None:
+        return value or None
+
+
+_GrantReason = Annotated[str | None, Field(max_length=GRANT_REASON_MAX_CHARS)]
+
+
+class CreditGrant(_GrantBody):
     kind: Literal["credits"]
     credits: int = Field(ge=1)
     valid_days: int | None = Field(default=None, ge=1)
     request_id: uuid.UUID
-    reason: str | None = Field(default=None, max_length=GRANT_REASON_MAX_CHARS)
-
-    @field_validator("reason")
-    @classmethod
-    def _none_when_empty(cls, value: str | None) -> str | None:
-        return value or None
+    reason: _GrantReason = None
 
 
-class DayGrant(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
-
+class DayGrant(_GrantBody):
     kind: Literal["days"]
     plan: str = Field(min_length=1)
     days: int = Field(ge=1)
     request_id: uuid.UUID
-    reason: str | None = Field(default=None, max_length=GRANT_REASON_MAX_CHARS)
-
-    @field_validator("reason")
-    @classmethod
-    def _none_when_empty(cls, value: str | None) -> str | None:
-        return value or None
+    reason: _GrantReason = None
 
 
 @router.post(
     "/users/{user_id}/grants", dependencies=[CsrfGuard], status_code=status.HTTP_201_CREATED
 )
 async def grant_to_user(
-    user_id: Annotated[int, Path(ge=1, le=USER_ID_MAX)],
+    user_id: DbId,
     body: Annotated[CreditGrant | DayGrant, Body(discriminator="kind")],
     operator: UsersWriter,
     db: DbSession,
@@ -443,11 +443,6 @@ async def grant_to_user(
 
 # --- redeem codes ---------------------------------------------------------------------
 
-CodesReader = Annotated[Operator, Depends(require_permission("codes.read"))]
-CodesWriter = Annotated[Operator, Depends(require_permission("codes.write"))]
-JobsReader = Annotated[Operator, Depends(require_permission("jobs.read"))]
-JobsWriter = Annotated[Operator, Depends(require_permission("jobs.write"))]
-
 
 async def _code_payloads(
     db: AsyncSession, settings: Settings, rows: list[RedeemCode]
@@ -456,28 +451,9 @@ async def _code_payloads(
     and who disabled it, the actor of its newest `codes.disable` record (null for a code
     disabled with the CLI, which records nothing, and for a deleted account)."""
     now = utcnow()
-    disabled = [str(row.id) for row in rows if row.disabled_at is not None]
-    newest = (
-        select(AuditLog.target_id, func.max(AuditLog.id).label("id"))
-        .where(
-            AuditLog.target_type == "code",
-            AuditLog.target_id.in_(disabled),
-            AuditLog.action == "codes.disable",
-        )
-        .group_by(AuditLog.target_id)
-        .subquery()
+    disablers = await _latest_actors(
+        db, "code", [row.id for row in rows if row.disabled_at is not None], ("codes.disable",)
     )
-    disablers = {
-        int(target_id): {"id": user_id, "name": name}
-        for target_id, user_id, name in (
-            await db.execute(
-                select(newest.c.target_id, User.id, User.name)
-                .select_from(newest)
-                .join(AuditLog, AuditLog.id == newest.c.id)
-                .join(User, User.id == AuditLog.actor_id)
-            )
-        ).all()
-    }
     return [
         {
             "id": row.id,
@@ -505,18 +481,17 @@ async def list_codes(
     operator: CodesReader,
     db: DbSession,
     settings: AppSettings,
-    page: int = Query(default=1, ge=1, le=PAGE_MAX),
-    page_size: int | None = Query(default=None, ge=1),
+    page: Page = 1,
     status_filter: str = Query(default="active", alias="status"),
     q: str = "",
 ):
-    """Newest first, `ADMIN_PAGE_SIZE` a page unless the query asks for fewer. `status`
-    `active` keeps the codes redeemable now, `all` every one; `q` a label containing it in
-    any letter case — never the code, which a search would give away a character at a
-    time. Beside the page, the title's figures and what the create dialog is drawn from."""
+    """Newest first, `ADMIN_PAGE_SIZE` a page. `status` `active` keeps the codes
+    redeemable now, `all` every one; `q` a label containing it in any letter case — never
+    the code, which a search would give away a character at a time. Beside the page, the
+    title's figures and what the create dialog is drawn from."""
     if status_filter not in ("active", "all"):
         raise ApiError(422, "invalid_request", "status: one of active, all")
-    size = min(page_size or settings.admin_page_size, settings.admin_page_size)
+    size = settings.admin_page_size
     now = utcnow()
     active = codes.is_active(now, settings.plans)
     filters = []
@@ -625,12 +600,9 @@ async def disable_code(code_id: int, operator: CodesWriter, db: DbSession, setti
 
 # --- overview, jobs and usage --------------------------------------------------------
 
-JobsReader = Annotated[Operator, Depends(require_permission("jobs.read"))]
-JobsWriter = Annotated[Operator, Depends(require_permission("jobs.write"))]
-
 JOB_STATUSES = ("queued", "running", "succeeded", "failed")
 # The newest audit records the overview shows, to a caller who holds `audit.read`: the audit
-# list's first page, so `ADMIN_PAGE_SIZE` caps them as it caps every console read.
+# list's first page, capped by `ADMIN_PAGE_SIZE` as every console read is.
 OVERVIEW_AUDIT_RECORDS = 10
 
 # `usage_log` summed into `<figures>` (docs/admin.md § Overview, jobs and usage), in the
@@ -734,14 +706,8 @@ async def overview(operator: JobsReader, db: DbSession, settings: AppSettings):
     accounts = await db.scalar(select(func.count()).select_from(User))
     newest = None
     if "audit.read" in operator.permissions:
-        newest = await list_audit(
-            operator,
-            db,
-            settings,
-            page=1,
-            page_size=OVERVIEW_AUDIT_RECORDS,
-            area=None,
-            q="",
+        newest = await _audit_page(
+            db, page=1, size=min(OVERVIEW_AUDIT_RECORDS, settings.admin_page_size), area=None, q=""
         )
     # Unknown off PostgreSQL, where no lock says whether a worker runs.
     stuck = None
@@ -784,16 +750,15 @@ async def list_jobs(
     operator: JobsReader,
     db: DbSession,
     settings: AppSettings,
-    page: int = Query(default=1, ge=1, le=PAGE_MAX),
-    page_size: int | None = Query(default=None, ge=1),
+    page: Page = 1,
     status_filter: str | None = Query(default=None, alias="status"),
 ):
-    """The jobs on record, newest first, `ADMIN_PAGE_SIZE` a page unless the query asks for
-    fewer; `status` keeps one status. Beside the page, every status's count and the
-    worker's state. The account's address only to a caller who also holds `users.read`."""
+    """The jobs on record, newest first, `ADMIN_PAGE_SIZE` a page; `status` keeps one
+    status. Beside the page, every status's count and the worker's state. The account's
+    address only to a caller who also holds `users.read`."""
     if status_filter is not None and status_filter not in JOB_STATUSES:
         raise ApiError(422, "invalid_request", f"status: one of {', '.join(JOB_STATUSES)}")
-    size = min(page_size or settings.admin_page_size, settings.admin_page_size)
+    size = settings.admin_page_size
     filters = [] if status_filter is None else [Job.status == status_filter]
     total = await db.scalar(select(func.count()).select_from(Job).where(*filters))
     rows = (
@@ -826,14 +791,14 @@ async def requeue_stuck_job(
 ):
     """A stuck job back in the queue, with its audit row in the same commit; anything
     else 404 or 409 `admin_conflict` (docs/admin.md § Overview, jobs and usage)."""
-    job = await admin_jobs.requeue(db, settings, operator, job_id)
+    job, worker = await admin_jobs.requeue(db, settings, operator, job_id)
     await db.commit()
     email = (
         await db.scalar(select(User.email).where(User.id == job.user_id))
         if "users.read" in operator.permissions
         else None
     )
-    return _job_payload(job, email, await queue.worker_status(db))
+    return _job_payload(job, email, worker)
 
 
 @router.get("/usage")
@@ -885,9 +850,9 @@ async def usage(
 
 
 async def _group_payloads(db: AsyncSession, rows: list[Group]) -> list[dict]:
-    """`<group>`: the effective and the stored permissions, the member count, and who
-    last created or changed it — the actor of its newest `groups.create` or
-    `groups.update` record, null for the built-in group and for a deleted account."""
+    """`<group>`: the effective permissions, the member count, and who last created or
+    changed it — the actor of its newest `groups.create` or `groups.update` record, null
+    for the built-in group and for a deleted account."""
     ids = [group.id for group in rows]
     counts = dict(
         (
@@ -898,27 +863,7 @@ async def _group_payloads(db: AsyncSession, rows: list[Group]) -> list[dict]:
             )
         ).all()
     )
-    newest = (
-        select(AuditLog.target_id, func.max(AuditLog.id).label("id"))
-        .where(
-            AuditLog.target_type == "group",
-            AuditLog.target_id.in_([str(group_id) for group_id in ids]),
-            AuditLog.action.in_(("groups.create", "groups.update")),
-        )
-        .group_by(AuditLog.target_id)
-        .subquery()
-    )
-    editors = {
-        int(target_id): {"id": user_id, "name": name}
-        for target_id, user_id, name in (
-            await db.execute(
-                select(newest.c.target_id, User.id, User.name)
-                .select_from(newest)
-                .join(AuditLog, AuditLog.id == newest.c.id)
-                .join(User, User.id == AuditLog.actor_id)
-            )
-        ).all()
-    }
+    editors = await _latest_actors(db, "group", ids, ("groups.create", "groups.update"))
     return [
         {
             "id": group.id,
@@ -969,7 +914,7 @@ async def list_groups(operator: GroupsReader, db: DbSession):
 
 
 @router.get("/groups/{group_id}")
-async def get_group(group_id: int, operator: GroupsReader, db: DbSession):
+async def get_group(group_id: DbId, operator: GroupsReader, db: DbSession):
     group = await db.get(Group, group_id)
     if group is None:
         raise ApiError(404, "invalid_request", "No such group")
@@ -1019,7 +964,7 @@ async def create_group(body: GroupCreate, operator: GroupsWriter, db: DbSession)
 
 
 @router.patch("/groups/{group_id}", dependencies=[CsrfGuard])
-async def update_group(group_id: int, body: GroupPatch, operator: GroupsWriter, db: DbSession):
+async def update_group(group_id: DbId, body: GroupPatch, operator: GroupsWriter, db: DbSession):
     group = await groups.update_group(
         db,
         operator,
@@ -1035,7 +980,7 @@ async def update_group(group_id: int, body: GroupPatch, operator: GroupsWriter, 
 @router.delete(
     "/groups/{group_id}", dependencies=[CsrfGuard], status_code=status.HTTP_204_NO_CONTENT
 )
-async def delete_group(group_id: int, operator: GroupsWriter, db: DbSession) -> Response:
+async def delete_group(group_id: DbId, operator: GroupsWriter, db: DbSession) -> Response:
     await groups.delete_group(db, operator, group_id)
     await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -1047,7 +992,7 @@ class MemberAdd(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     email: str | None = Field(default=None, min_length=1, max_length=320)
-    user_id: int | None = None
+    user_id: int | None = Field(default=None, ge=1, le=codes.INT_MAX)
 
     @model_validator(mode="after")
     def _exactly_one(self) -> MemberAdd:
@@ -1060,7 +1005,7 @@ class MemberAdd(BaseModel):
     "/groups/{group_id}/members", dependencies=[CsrfGuard], status_code=status.HTTP_201_CREATED
 )
 async def add_group_member(
-    group_id: int, body: MemberAdd, operator: GroupsWriter, db: DbSession, response: Response
+    group_id: DbId, body: MemberAdd, operator: GroupsWriter, db: DbSession, response: Response
 ):
     """201 for a new member; 200, and nothing recorded, for someone already in the group."""
     member_id, joined = await groups.add_member(
@@ -1081,7 +1026,7 @@ async def add_group_member(
     status_code=status.HTTP_204_NO_CONTENT,
 )
 async def remove_group_member(
-    group_id: int, user_id: int, operator: GroupsWriter, db: DbSession
+    group_id: DbId, user_id: DbId, operator: GroupsWriter, db: DbSession
 ) -> Response:
     await groups.remove_member(db, operator, group_id, user_id)
     await db.commit()
@@ -1096,19 +1041,21 @@ async def list_audit(
     operator: AuditReader,
     db: DbSession,
     settings: AppSettings,
-    page: int = Query(default=1, ge=1, le=PAGE_MAX),
-    page_size: int | None = Query(default=None, ge=1),
+    page: Page = 1,
     area: str | None = None,
     q: str = "",
 ):
-    """Newest first, `ADMIN_PAGE_SIZE` a page unless the query asks for fewer. `area`
-    keeps one area's actions; `q` an actor's address or name, a user target's address or
-    a group target's name, containing it in any letter case, or a `target_id` equal to
-    it. Who a row
-    names is read now, from `users` and `groups`."""
+    """Newest first, `ADMIN_PAGE_SIZE` a page. `area` keeps one area's actions; `q` an
+    actor's address or name, a user target's address or a group target's name, containing
+    it in any letter case, or a `target_id` equal to it."""
     if area is not None and area not in {key for key, _ in AREAS}:
         raise ApiError(422, "invalid_request", f"area: one of {', '.join(k for k, _ in AREAS)}")
-    size = min(page_size or settings.admin_page_size, settings.admin_page_size)
+    return await _audit_page(db, page=page, size=settings.admin_page_size, area=area, q=q)
+
+
+async def _audit_page(db: AsyncSession, *, page: int, size: int, area: str | None, q: str) -> dict:
+    """One page of `size` audit records, filtered as `list_audit` says. Who a row names is
+    read now, from `users` and `groups`."""
     actor = aliased(User)
     target_user = aliased(User)
     target_group = aliased(Group)
@@ -1186,9 +1133,6 @@ async def list_audit(
 
 # --- settings ---------------------------------------------------------------------------
 
-SettingsReader = Annotated[Operator, Depends(require_permission("settings.read"))]
-SettingsWriter = Annotated[Operator, Depends(require_permission("settings.write"))]
-
 
 class SettingChange(BaseModel):
     """A value for one key, the text `.env` would hold, trimmed; `confirm` once the
@@ -1222,20 +1166,7 @@ async def put_setting(
     """Store a value over `.env`'s, checked as at start: 422 in the checks' words, 409
     `impact` until confirmed when it takes away what accounts have. A value the key
     already holds writes nothing."""
-    base = request.app.state.settings
-    changed = await admin_settings.change(
-        db,
-        base,
-        operator,
-        key,
-        body.value,
-        confirm=body.confirm,
-        free_accounts=lambda effective: _on_plan(effective, FREE_PLAN_ID, utcnow()),
-    )
-    if changed:
-        await db.commit()
-        request.app.state.runtime_settings.invalidate()
-    return await admin_settings.payload(db, base)
+    return await _apply_setting(request, db, operator, key, body.value, confirm=body.confirm)
 
 
 @router.delete("/settings/{key}", dependencies=[CsrfGuard])
@@ -1248,17 +1179,24 @@ async def reset_setting(
 ):
     """Restore a key to `.env`: its row deleted, checked and confirmed as a change is. A
     key the database does not override writes nothing."""
+    confirm = body is not None and body.confirm
+    return await _apply_setting(request, db, operator, key, None, confirm=confirm)
+
+
+async def _apply_setting(
+    request: Request,
+    db: AsyncSession,
+    operator: Operator,
+    key: str,
+    value: str | None,
+    *,
+    confirm: bool,
+) -> dict:
+    """`value` stored for `key`, or the key restored to `.env` when it is None; once a
+    change is committed, the API's cached settings emptied. The settings page as it
+    stands after."""
     base = request.app.state.settings
-    changed = await admin_settings.change(
-        db,
-        base,
-        operator,
-        key,
-        None,
-        confirm=body is not None and body.confirm,
-        free_accounts=lambda effective: _on_plan(effective, FREE_PLAN_ID, utcnow()),
-    )
-    if changed:
+    if await admin_settings.change(db, base, operator, key, value, confirm=confirm):
         await db.commit()
         request.app.state.runtime_settings.invalidate()
     return await admin_settings.payload(db, base)

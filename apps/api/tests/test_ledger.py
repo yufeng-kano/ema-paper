@@ -19,16 +19,19 @@ from sightread.db.models import (
     ChatTurn,
     Conversation,
     CreditEntry,
+    CreditPack,
     CreditPeriod,
     Document,
     Job,
+    PlanGrant,
     UsageLog,
     User,
+    utcnow,
 )
 from sightread.jobs import chat_runner, chat_tools
 from sightread.jobs.queue import claim_next_turn, fail_turn
 from sightread.workspace.layout import user_root
-from tests.conftest import CSRF_HEADERS, TEST_MODEL_PRICES
+from tests.conftest import CSRF_HEADERS, PRO_PLANS_JSON, TEST_MODEL_PRICES, grant_plan
 from tests.test_chat import MESSAGES_URL, _seed_document, assistant_turn, sse
 from tests.test_jobs_queue import postgres_only
 from tests.test_library import _read, _ready_to_parse, _upload
@@ -260,6 +263,65 @@ async def test_a_plan_change_raises_the_grant_and_never_lowers_it(sessionmaker) 
     async with sessionmaker() as db:
         balance = await ledger.read_balance(db, settings_with(free_credits_per_period=100), user_id)
     assert balance.granted == 200
+
+
+async def test_the_balances_of_many_accounts_read_as_each_account_alone(sessionmaker) -> None:
+    """One read for a page of accounts — no rows, a period in use, a subscription, granted
+    days, packs — gives what each account's own read gives, the used period's row found
+    whatever time zone the database answers its start in."""
+    settings = settings_with(kano_pay_plans_json=PRO_PLANS_JSON)
+    now = utcnow()
+    async with sessionmaker() as db:
+        users = [User(google_sub=f"many-{n}", email=f"many-{n}@example.test") for n in range(4)]
+        db.add_all(users)
+        await db.commit()
+    fresh, used, paid, banked = ids = [user.id for user in users]
+    await grant_plan(sessionmaker, paid, "pro")
+    async with sessionmaker() as db:
+        db.add(PlanGrant(user_id=banked, plan_id="pro", days_banked=3))
+        period = (await ledger.decide_period(db, settings, used, now)).period
+        db.add(
+            CreditPeriod(
+                user_id=used,
+                period_start=period.start,
+                period_end=period.end,
+                granted=period.credits,
+                spent=7,
+            )
+        )
+        for n, user_id in enumerate((used, used, banked)):
+            db.add(
+                CreditPack(
+                    id=f"pack-{n}",
+                    user_id=user_id,
+                    pack_id="credits",
+                    credits=10 + n,
+                    status=ledger.PACK_PAID,
+                    purchased_at=now - timedelta(days=n),
+                    expires_at=now + timedelta(days=30),
+                )
+            )
+        await db.commit()
+
+    async with sessionmaker() as db:
+        together = await ledger.read_balances(db, settings, ids, now)
+        assert await ledger.read_balances(db, settings, [], now) == {}
+    assert sorted(together) == sorted(ids)
+    assert (together[fresh].period.source, together[fresh].spent, together[fresh].packs) == (
+        "free",
+        0,
+        (),
+    )
+    assert together[used].remaining == period.credits - 7
+    assert [pack.id for pack in together[used].packs] == ["pack-0", "pack-1"]
+    assert (together[paid].period.source, together[paid].period.plan.id) == ("subscription", "pro")
+    assert together[banked].period.source == "grant"
+    assert [pack.id for pack in together[banked].packs] == ["pack-2"]
+    for user_id in ids:
+        async with sessionmaker() as db:
+            alone = await ledger.decide_period(db, settings, user_id, now)
+            assert together[user_id].period == alone.period
+            assert together[user_id].grant == alone.grant
 
 
 # --- routes --------------------------------------------------------------------------------

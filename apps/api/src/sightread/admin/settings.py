@@ -18,7 +18,7 @@ from sqlalchemy import text as sql
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..agents import CHAT
-from ..billing.plans import PAID_STATUSES
+from ..billing.plans import FREE_PLAN_ID
 from ..config import LOCAL_FALLBACK_SECRET_KEY, Settings
 from ..db.models import (
     AgentSetting,
@@ -36,12 +36,9 @@ from ..db.models import (
 from ..errors import ApiError
 from ..runtime_settings import OVERRIDABLE, effective, validation_message
 from . import audit
+from .grants import holding_days, on_plan, paying
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
-    from sqlalchemy.sql import ColumnElement
-
     from .deps import Operator
 
 # The secrets of `.env`, shown only as set or unset — never a value, a length or any of
@@ -121,13 +118,12 @@ async def _count(db: AsyncSession, model, *where) -> int:
     return await db.scalar(select(func.count()).select_from(model).where(*where))
 
 
-async def impact(
-    db: AsyncSession, before: Settings, after: Settings, free_accounts: ColumnElement[bool]
-) -> dict | None:
+async def impact(db: AsyncSession, before: Settings, after: Settings) -> dict | None:
     """What going from `before` to `after` takes away from accounts, counted; None when it
     takes nothing that is in use (docs/admin.md § Settings, *Confirmed when it takes away*).
     Each count is one query: conversations through `ix_conversations_model`, the rest over
-    tables of a row or a few per account, and the operator's codes."""
+    tables of a row or a few per account, and the operator's codes. The accounts on Free
+    are those `before` puts there, the settings in effect."""
     now = utcnow()
     # A checkout Pay opened before this can no longer be paid.
     open_since = now - timedelta(seconds=before.kano_pay_checkout_lifetime_seconds)
@@ -143,18 +139,10 @@ async def impact(
         counts["subagents"] = await _count(db, Subagent, Subagent.model.in_(models))
     if plans:
         counts["subscriptions"] = await _count(
-            db,
-            Subscription,
-            Subscription.plan_id.in_(plans),
-            Subscription.status.in_(PAID_STATUSES),
-            Subscription.period_start <= now,
-            Subscription.period_end > now,
+            db, Subscription, Subscription.plan_id.in_(plans), *paying(now)
         )
         counts["day_banks"] = await _count(
-            db,
-            PlanGrant,
-            PlanGrant.plan_id.in_(plans),
-            or_(PlanGrant.period_end > now, PlanGrant.days_banked > 0),
+            db, PlanGrant, PlanGrant.plan_id.in_(plans), *holding_days(now)
         )
         counts["plan_codes"] = await _count(
             db,
@@ -184,7 +172,7 @@ async def impact(
         or after.free_storage_bytes < before.free_storage_bytes
         or after.free_max_jobs < before.free_max_jobs
     ):
-        counts["free_accounts"] = await _count(db, User, free_accounts)
+        counts["free_accounts"] = await _count(db, User, on_plan(before, FREE_PLAN_ID, now))
     counts = {kind: count for kind, count in counts.items() if count}
     if not counts:
         return None
@@ -199,16 +187,14 @@ async def change(
     value: str | None,
     *,
     confirm: bool,
-    free_accounts: Callable[[Settings], ColumnElement[bool]],
 ) -> bool:
     """Store `value` for `key`, or restore the key to `.env` when `value` is None, with its
     record, in the caller's transaction. False, and nothing written, when it changes
     nothing. 422 when the settings it makes fail the start checks — in the checks' words,
     never the settings' — except a restore while the stored values already fail them, and
-    409 `impact` when it takes away what accounts have and
-    `confirm` is not set. `free_accounts` says which accounts are on Free under the
-    settings it is given: it is asked with what is in effect once the rows are read under
-    the lock, never with a copy taken before."""
+    409 `impact` when it takes away what accounts have and `confirm` is not set. What it
+    takes away is counted under what is in effect once the rows are read under the lock,
+    never a copy taken before."""
     if key not in OVERRIDABLE:
         raise ApiError(422, "invalid_request", f"key: one of {', '.join(OVERRIDABLE)}")
     if db.get_bind().dialect.name == "postgresql":
@@ -247,7 +233,7 @@ async def change(
         if value is not None or not ignored:
             raise ApiError(422, "invalid_request", validation_message(exc)) from None
         after = base
-    taken = await impact(db, before, after, free_accounts(before))
+    taken = await impact(db, before, after)
     if taken is not None and not confirm:
         raise ApiError(
             409,

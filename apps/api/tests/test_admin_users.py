@@ -175,14 +175,14 @@ async def test_the_list_searches_filters_by_plan_and_pages(make_client, tmp_path
     assert filtered.json()["total"] == 1
     assert filtered.json()["plans"] == page["plans"]
 
-    # Pages: fewer on request, never more than ADMIN_PAGE_SIZE, empty past the end.
-    second = (await owner.get(f"{USERS}?page=2&page_size=4")).json()
+    # Pages of ADMIN_PAGE_SIZE, empty past the end.
+    small = await _owner(make_client, admin_page_size=4, **settings)
+    second = (await small.get(f"{USERS}?page=2")).json()
     assert [row["id"] for row in second["items"]] == [alice.user_id, owner.user_id]
     assert (second["total"], second["page"], second["page_size"]) == (6, 2, 4)
-    past = (await owner.get(f"{USERS}?page=3&page_size=4")).json()
+    past = (await small.get(f"{USERS}?page=3")).json()
     assert (past["items"], past["total"]) == ([], 6)
-    assert (await owner.get(f"{USERS}?page_size=999")).json()["page_size"] == 50
-    for query in ("page=0", "page_size=0", f"page={2**31}", "plan=gone", "plan=FREE"):
+    for query in ("page=0", f"page={2**31}", "plan=gone", "plan=FREE"):
         refused = await owner.get(f"{USERS}?{query}")
         assert refused.status_code == 422, query
         assert _error(refused)["type"] == "invalid_request"
@@ -317,7 +317,7 @@ async def test_an_accounts_page_shows_what_it_has_and_none_of_its_content(make_c
         "jobs",
         "groups",
     }
-    assert set(detail["user"]) == {"id", "email", "name", "created_at"}
+    assert set(detail["user"]) == {"id", "email", "name"}
     assert detail["plan"]["id"] == "free"
     assert detail["plan"]["source"] == "free"
     assert (detail["subscription"], detail["day_bank"], detail["groups"]) == (None, None, [])
@@ -347,15 +347,10 @@ async def test_an_accounts_page_shows_what_it_has_and_none_of_its_content(make_c
         "filename",
         "status",
         "page_count",
-        "pages_done",
         "created_at",
         "finished_at",
     }
-    assert (recent[0]["status"], recent[0]["page_count"], recent[0]["pages_done"]) == (
-        "failed",
-        4,
-        1,
-    )
+    assert (recent[0]["status"], recent[0]["page_count"]) == ("failed", 4)
     assert recent[0]["finished_at"] is None
 
     # The owner's own page: the built-in group, read with `groups.read`.
@@ -715,6 +710,13 @@ async def test_a_grant_outside_its_rules_is_refused(make_client) -> None:
         refused = await owner.post(_grants(account.user_id), json=body, headers=CSRF_HEADERS)
         assert refused.status_code == 422, body
         assert _error(refused)["type"] == "invalid_request"
+    # A body wrong twice names its kind's own field before the note.
+    for body, field in (
+        ({**credits, "credits": 0, "reason": "r" * 201}, "body.credits.credits:"),
+        ({**days, "days": 0, "reason": "r" * 201}, "body.days.days:"),
+    ):
+        refused = await owner.post(_grants(account.user_id), json=body, headers=CSRF_HEADERS)
+        assert _error(refused)["message"].startswith(field), refused.text
     # The body is read before the account is looked up.
     assert (
         await owner.post(_grants(10**6), json={**credits, "credits": 0}, headers=CSRF_HEADERS)

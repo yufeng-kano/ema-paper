@@ -1592,7 +1592,7 @@ export interface AdminPerson {
  *  an owner, none for an account in no group — and whether the session is past the console's
  *  window of `reauth_hours` (`ADMIN_REAUTH_HOURS`). Never a 403. */
 export interface AdminMe {
-  user: { id: number; email: string; name: string | null; picture: string | null }
+  user: { id: number }
   permissions: string[]
   reauth_required: boolean
   reauth_hours: number
@@ -1704,9 +1704,9 @@ export interface AdminUsersResponse extends AdminList<AdminUser> {
 
 /** One account's page: what it has, never what it wrote. */
 export interface AdminUserDetail {
-  user: { id: number; email: string; name: string | null; created_at: string }
-  plan: { id: string; source: PeriodSource; start: string; end: string }
-  subscription: { status: string; plan_id: string; period_end: string; cancel_at_period_end: boolean } | null
+  user: { id: number; email: string; name: string | null }
+  plan: { id: string; source: PeriodSource; end: string }
+  subscription: { status: string; cancel_at_period_end: boolean } | null
   /** `sources` always the four, by source — not the order a charge takes them, which is the
    *  period first, then every pack by expiry; `expires_at` null for one that holds nothing. */
   credits: {
@@ -1723,7 +1723,6 @@ export interface AdminUserDetail {
       filename: string
       status: JobStatus
       page_count: number | null
-      pages_done: number
       created_at: string
       finished_at: string | null
     }[]

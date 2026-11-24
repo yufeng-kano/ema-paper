@@ -368,7 +368,6 @@ async def test_rows_that_no_longer_fit_env_leave_env_alone_in_effect(
         assert await runtime.current() is owner.app.state.settings
         runtime.invalidate()
         assert await runtime.current() is owner.app.state.settings
-    assert runtime.ignored == "FREE_MAX_JOBS exceeds MAX_JOBS_PER_USER"
     assert [r.getMessage() for r in caplog.records if r.name == runtime_settings.logger.name] == [
         "the database's settings no longer fit .env, which alone is in effect: "
         "FREE_MAX_JOBS exceeds MAX_JOBS_PER_USER"
@@ -383,7 +382,6 @@ async def test_rows_that_no_longer_fit_env_leave_env_alone_in_effect(
     assert restored.status_code == 200, restored.text
     assert restored.json()["ignored"] is None
     assert (await owner.get("/api/admin/users")).json()["grant"]["credit_usd"] == 0.004
-    assert runtime.ignored is None
 
 
 async def test_with_two_values_that_no_longer_fit_env_each_is_restored_on_its_own(

@@ -28,6 +28,8 @@ from ..upstream.client import fetch_models
 from . import audit
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from .deps import Operator
 
 logger = logging.getLogger(__name__)
@@ -43,12 +45,13 @@ def _refused(reason: str, message: str) -> ApiError:
 
 async def requeue(
     db: AsyncSession, settings: Settings, operator: Operator, job_id: uuid.UUID
-) -> Job:
+) -> tuple[Job, queue.WorkerStatus]:
     """Put a stuck job back in the queue, as a worker's start-up puts back an orphan
     (docs/jobs.md § Queue): under the job's row lock, its crops discarded before the
     commit — a worker claiming it a moment later must not lose a new attempt's — and its
     succeeded pages kept. Only a `running` job no live worker drives; anything else is
-    refused with nothing changed and nothing recorded."""
+    refused with nothing changed and nothing recorded. Returns the job, queued, and the
+    worker's state it was judged stuck by."""
     job = (
         await db.execute(select(Job).where(Job.id == job_id).with_for_update())
     ).scalar_one_or_none()
@@ -87,10 +90,33 @@ async def requeue(
         },
         ip=operator.ip,
     )
-    return job
+    return job, worker
 
 
 # --- the connections ------------------------------------------------------------------
+
+
+async def _probe[T](
+    settings: Settings,
+    name: str,
+    call: Awaitable[T],
+    known: tuple[type[Exception], ...],
+    message_of: Callable[[Exception], str],
+) -> tuple[T | None, str | None]:
+    """`call`'s answer given `ADMIN_PROBE_TIMEOUT_SECONDS`, or why there is none: a
+    `known` error's own message, the timeout, or `UNEXPECTED` for anything else, which is
+    logged under `name` — never raised into the overview."""
+    timeout = settings.admin_probe_timeout_seconds
+    try:
+        async with asyncio.timeout(timeout):
+            return await call, None
+    except known as exc:
+        return None, message_of(exc)
+    except TimeoutError:
+        return None, f"No answer within {timeout:g} seconds"
+    except Exception:  # one connection's failure never fails the overview
+        logger.exception("the overview's %s check failed unexpectedly", name)
+        return None, UNEXPECTED
 
 
 async def kano_proxy_status(settings: Settings) -> dict:
@@ -102,21 +128,19 @@ async def kano_proxy_status(settings: Settings) -> dict:
     status = {"state": "ok", "message": None, "models": None, "priced": None, "parse_model": None}
     if not settings.kano_proxy_configured:
         return {**status, "state": "unconfigured"}
-    try:
-        async with asyncio.timeout(settings.admin_probe_timeout_seconds):
-            catalog = await fetch_models(
-                settings.kano_proxy_api_base,
-                settings.kano_proxy_api_key,
-                max_bytes=settings.upstream_response_max_bytes,
-            )
-    except ApiError as exc:
-        return {**status, "state": "failed", "message": exc.message}
-    except TimeoutError:
-        timeout = settings.admin_probe_timeout_seconds
-        return {**status, "state": "failed", "message": f"No answer within {timeout:g} seconds"}
-    except Exception:  # one connection's failure never fails the overview
-        logger.exception("the overview's Kano Proxy check failed unexpectedly")
-        return {**status, "state": "failed", "message": UNEXPECTED}
+    catalog, failure = await _probe(
+        settings,
+        "Kano Proxy",
+        fetch_models(
+            settings.kano_proxy_api_base,
+            settings.kano_proxy_api_key,
+            max_bytes=settings.upstream_response_max_bytes,
+        ),
+        (ApiError,),
+        lambda exc: exc.message,
+    )
+    if failure is not None:
+        return {**status, "state": "failed", "message": failure}
     listed = {entry["id"] for entry in catalog}
     return {
         **status,
@@ -143,19 +167,14 @@ async def kano_pay_status(settings: Settings) -> dict:
     if not settings.kano_pay_configured:
         return {**status, "state": "unconfigured"}
     client = pay.PayClient(settings)
+    # Pay's own per-call timeout, which would otherwise cut a longer probe short.
     client.timeout = settings.admin_probe_timeout_seconds
-    try:
-        async with asyncio.timeout(settings.admin_probe_timeout_seconds):
-            catalog = await client.catalog()
-    except (pay.PayRefused, pay.PayUnavailable) as exc:
-        # Their messages name the status or the path, never the URL or the key.
-        return {**status, "state": "failed", "message": str(exc)}
-    except TimeoutError:
-        timeout = settings.admin_probe_timeout_seconds
-        return {**status, "state": "failed", "message": f"No answer within {timeout:g} seconds"}
-    except Exception:  # one connection's failure never fails the overview
-        logger.exception("the overview's Kano Pay check failed unexpectedly")
-        return {**status, "state": "failed", "message": UNEXPECTED}
+    # Their messages name the status or the path, never the URL or the key.
+    catalog, failure = await _probe(
+        settings, "Kano Pay", client.catalog(), (pay.PayRefused, pay.PayUnavailable), str
+    )
+    if failure is not None:
+        return {**status, "state": "failed", "message": failure}
     return {
         **status,
         "checkout_enabled": catalog.checkout_enabled,

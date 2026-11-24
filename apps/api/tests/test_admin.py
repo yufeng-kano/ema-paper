@@ -263,12 +263,7 @@ async def test_an_account_in_no_group_reads_its_empty_list_and_nothing_else(make
     me = await reader.get("/api/admin/me")
     assert me.status_code == 200
     assert me.json() == {
-        "user": {
-            "id": reader.user_id,
-            "email": "reader@example.test",
-            "name": "Reader",
-            "picture": None,
-        },
+        "user": {"id": reader.user_id},
         "permissions": [],
         "reauth_required": False,
         "reauth_hours": 12,
@@ -734,8 +729,7 @@ async def test_the_builtin_group_is_never_renamed_edited_or_deleted(make_client)
         assert _error(response)["reason"] == "builtin"
     assert await _audit(owner, start) == []
     group = (await owner.get(path)).json()["group"]
-    assert (group["name"], group["builtin"]) == ("owner", True)
-    assert group["updated_by"] is None
+    assert (group["name"], group["builtin"], group["updated_by"]) == ("owner", True, None)
     async with owner.app.state.sessionmaker() as db:
         assert (await db.get(Group, builtin)).permissions == []
 
@@ -869,6 +863,29 @@ async def test_who_cannot_be_added(make_client) -> None:
     unknown_group = await _add(owner, group["id"] + 100, user_id=owner.user_id)
     assert unknown_group.status_code == 404
     assert await _audit(owner, start) == []
+
+
+async def test_a_group_or_member_id_past_the_columns_is_refused_before_the_database(
+    make_client,
+) -> None:
+    """`groups.id` and `users.id` are 32-bit: an id outside 1 to 2,147,483,647 is a 422,
+    never a query PostgreSQL's driver refuses to send."""
+    owner = await _owner(make_client)
+    group = await _group(owner, "ops", [])
+    groups = "/api/admin/groups"
+    for bad in (0, 2**31):
+        for response in (
+            await owner.get(f"{groups}/{bad}"),
+            await owner.patch(f"{groups}/{bad}", json={"name": "x"}, headers=CSRF_HEADERS),
+            await owner.delete(f"{groups}/{bad}", headers=CSRF_HEADERS),
+            await _add(owner, bad, user_id=owner.user_id),
+            await _add(owner, group["id"], user_id=bad),
+            await owner.delete(f"{groups}/{bad}/members/{owner.user_id}", headers=CSRF_HEADERS),
+            await owner.delete(f"{groups}/{group['id']}/members/{bad}", headers=CSRF_HEADERS),
+        ):
+            assert response.status_code == 422, (bad, response.request.url)
+            assert _error(response)["type"] == "invalid_request"
+    assert (await owner.get(f"{groups}/{2**31 - 1}")).status_code == 404
 
 
 async def test_the_builtin_group_keeps_its_last_member(make_client) -> None:
@@ -1168,15 +1185,10 @@ async def test_the_log_is_newest_first_paged_and_filtered(make_client) -> None:
     assert second["items"][-1]["permission"] is None
     past = (await owner.get("/api/admin/audit", params={"page": 3})).json()
     assert (past["items"], past["total"]) == ([], 6)
-    # A page size may ask for fewer, never more.
-    assert len((await owner.get("/api/admin/audit", params={"page_size": 2})).json()["items"]) == 2
-    capped = (await owner.get("/api/admin/audit", params={"page_size": 500})).json()
-    assert capped["page_size"] == 3 and len(capped["items"]) == 3
     for params in (
         {"page": 0},
         {"page": 2**31},
         {"page": 10**19},
-        {"page_size": 0},
         {"area": "billing"},
         {"area": ""},
     ):
