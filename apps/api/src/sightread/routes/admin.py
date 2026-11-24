@@ -57,7 +57,6 @@ from ..errors import ApiError
 from ..jobs import queue
 from ..workspace.documents import measure_storage
 from ..workspace.layout import user_root
-from .control import usage_totals
 
 router = APIRouter(
     prefix="/api/admin", tags=["admin"], dependencies=[Depends(require_console_session)]
@@ -634,9 +633,10 @@ JOB_STATUSES = ("queued", "running", "succeeded", "failed")
 # list's first page, so `ADMIN_PAGE_SIZE` caps them as it caps every console read.
 OVERVIEW_AUDIT_RECORDS = 10
 
-# `usage_log` summed as `usage_totals` reads it (docs/api.md § Usage aggregates): billed,
-# estimated and unpriced cost kept apart — an estimate is never added to a billed amount,
-# and a call nobody priced is counted, never priced at 0.
+# `usage_log` summed into `<figures>` (docs/admin.md § Overview, jobs and usage), in the
+# order `usage_totals` reads them: billed, estimated and unpriced cost kept apart — an
+# estimate is never added to a billed amount, and a call nobody priced is counted, never
+# priced at 0.
 USAGE_FIGURES = (
     func.count(),
     func.sum(UsageLog.prompt_tokens),
@@ -648,6 +648,22 @@ USAGE_FIGURES = (
     func.sum(UsageLog.cache_read_tokens),
     func.sum(UsageLog.cache_write_tokens),
 )
+
+
+def usage_totals(row) -> dict:
+    """`<figures>` from one row of `USAGE_FIGURES`."""
+    calls, prompt, completion, cost, estimated, estimated_calls, unpriced, cached, written = row
+    return {
+        "calls": int(calls),
+        "prompt_tokens": int(prompt or 0),
+        "completion_tokens": int(completion or 0),
+        "cost": float(cost or 0),
+        "estimated_cost": float(estimated or 0),
+        "estimated_calls": int(estimated_calls),
+        "unpriced_calls": int(unpriced),
+        "cache_read_tokens": int(cached or 0),
+        "cache_write_tokens": int(written or 0),
+    }
 
 
 def _job_payload(job: Job, email: str | None, worker: queue.WorkerStatus) -> dict:

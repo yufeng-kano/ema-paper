@@ -16,7 +16,7 @@ from authlib.integrations.starlette_client import OAuthError
 from fastapi import APIRouter, Query, Request, Response, status
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import case, delete, func, select
+from sqlalchemy import delete, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
 
@@ -40,9 +40,6 @@ from ..auth.sessions import SESSION_COOKIE, SESSION_TTL, create_session, delete_
 from ..billing import ledger, pay
 from ..billing.plans import ENDED_STATUSES
 from ..db.models import (
-    COST_SOURCE_ESTIMATED,
-    COST_SOURCE_OPENROUTER,
-    COST_SOURCE_UNKNOWN,
     DOCUMENT_VIEWS,
     EFFORT_DEFAULT,
     EFFORT_LEVELS,
@@ -51,13 +48,10 @@ from ..db.models import (
     ChatAttachment,
     ChatTurn,
     Checkout,
-    Conversation,
-    Document,
     Job,
     Skill,
     Subagent,
     Subscription,
-    UsageLog,
     User,
     utcnow,
 )
@@ -914,141 +908,3 @@ async def list_agent_models(
     """The models the agent may run — the Agent page's model picker (docs/api.md)."""
     agent = _known_agent(agent_name)
     return {"data": await agent_models(settings, agent.name)}
-
-
-# --- usage ----------------------------------------------------------------------------
-
-
-@router.get("/usage")
-async def usage(user: SessionUser, db: DbSession, days: int = Query(default=30, ge=1, le=365)):
-    """Usage aggregates with billed, estimated and unpriced cost kept apart (docs/api.md
-    § Usage aggregates): an estimate is never summed into billing, and a call nobody
-    priced is counted rather than priced at 0."""
-    since = utcnow() - timedelta(days=days)
-    day = func.date(UsageLog.created_at)  # UTC day bucket on both PostgreSQL and SQLite
-
-    def of_source(source: str, value):
-        return case((UsageLog.cost_source == source, value))
-
-    figures = (
-        func.count(),
-        func.sum(UsageLog.prompt_tokens),
-        func.sum(UsageLog.completion_tokens),
-        func.sum(of_source(COST_SOURCE_OPENROUTER, UsageLog.cost)),
-        func.sum(of_source(COST_SOURCE_ESTIMATED, UsageLog.cost)),
-        func.count(of_source(COST_SOURCE_ESTIMATED, 1)),
-        func.count(of_source(COST_SOURCE_UNKNOWN, 1)),
-        func.sum(UsageLog.cache_read_tokens),
-        func.sum(UsageLog.cache_write_tokens),
-    )
-    in_window = (UsageLog.user_id == user.id, UsageLog.created_at >= since)
-    per_day = (
-        await db.execute(select(day, *figures).where(*in_window).group_by(day).order_by(day))
-    ).all()
-    per_model = (
-        await db.execute(
-            select(UsageLog.model, *figures)
-            .where(*in_window)
-            .group_by(UsageLog.model)
-            .order_by(UsageLog.model)
-        )
-    ).all()
-    per_agent = (
-        await db.execute(
-            select(UsageLog.agent, *figures)
-            .where(*in_window)
-            .group_by(UsageLog.agent)
-            .order_by(UsageLog.agent)
-        )
-    ).all()
-    agents_by_day = (
-        await db.execute(
-            select(day, UsageLog.agent).where(*in_window).group_by(day, UsageLog.agent)
-        )
-    ).all()
-    day_agents: dict[str, list[str]] = {}
-    for bucket, agent in agents_by_day:
-        day_agents.setdefault(str(bucket)[:10], []).append(agent)
-
-    return {
-        "days": days,
-        "per_day": [
-            {
-                "date": str(row[0])[:10],
-                "agents": sorted(day_agents.get(str(row[0])[:10], [])),
-                **usage_totals(row[1:]),
-            }
-            for row in per_day
-        ],
-        "per_model": [{"model": row[0], **usage_totals(row[1:])} for row in per_model],
-        "per_agent": [{"agent": row[0], **usage_totals(row[1:])} for row in per_agent],
-    }
-
-
-def usage_totals(row) -> dict:
-    calls, prompt, completion, cost, estimated, estimated_calls, unpriced, cached, written = row
-    return {
-        "calls": int(calls),
-        "prompt_tokens": int(prompt or 0),
-        "completion_tokens": int(completion or 0),
-        "cost": float(cost or 0),
-        "estimated_cost": float(estimated or 0),
-        "estimated_calls": int(estimated_calls),
-        "unpriced_calls": int(unpriced),
-        "cache_read_tokens": int(cached or 0),
-        "cache_write_tokens": int(written or 0),
-    }
-
-
-@router.get("/usage/conversations")
-async def usage_per_conversation(
-    user: SessionUser, db: DbSession, days: int = Query(default=30, ge=1, le=365)
-):
-    """What each conversation cost over the period, through its turns
-    (docs/api.md § Usage aggregates)."""
-    since = utcnow() - timedelta(days=days)
-    rows = (
-        await db.execute(
-            select(
-                Conversation.id,
-                Conversation.title,
-                Conversation.document_id,
-                Document.name,
-                func.count(func.distinct(ChatTurn.id)),
-                func.sum(UsageLog.prompt_tokens),
-                func.sum(UsageLog.cache_read_tokens),
-                func.sum(UsageLog.completion_tokens),
-                func.sum(case((UsageLog.cost_source == COST_SOURCE_ESTIMATED, UsageLog.cost))),
-                func.count(case((UsageLog.cost_source == COST_SOURCE_UNKNOWN, 1))),
-                func.sum(UsageLog.cache_write_tokens),
-                # What tells an estimate of exactly $0 from no estimate (docs/api.md).
-                func.count(case((UsageLog.cost_source == COST_SOURCE_ESTIMATED, 1))),
-            )
-            .select_from(UsageLog)
-            .join(ChatTurn, ChatTurn.id == UsageLog.turn_id)
-            .join(Conversation, Conversation.id == ChatTurn.conversation_id)
-            .outerjoin(Document, Document.id == Conversation.document_id)
-            .where(UsageLog.user_id == user.id, UsageLog.created_at >= since)
-            .group_by(Conversation.id, Conversation.title, Conversation.document_id, Document.name)
-            .order_by(func.sum(UsageLog.prompt_tokens).desc())
-        )
-    ).all()
-    return {
-        "conversations": [
-            {
-                "id": row[0],
-                "title": row[1],
-                "document_id": row[2],
-                "document_name": row[3],
-                "turns": int(row[4]),
-                "prompt_tokens": int(row[5] or 0),
-                "cache_read_tokens": int(row[6] or 0),
-                "completion_tokens": int(row[7] or 0),
-                "estimated_cost": float(row[8] or 0),
-                "unpriced_calls": int(row[9]),
-                "cache_write_tokens": int(row[10] or 0),
-                "estimated_calls": int(row[11]),
-            }
-            for row in rows
-        ]
-    }

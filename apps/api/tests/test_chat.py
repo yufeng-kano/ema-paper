@@ -384,19 +384,6 @@ async def test_a_turn_edits_the_document_and_streams_its_events(chatting, monkey
         rows = (await db.execute(select(UsageLog).where(UsageLog.agent == "chat"))).scalars().all()
     assert len(rows) == 3
     assert all(row.turn_id is not None and row.cache_read_tokens == 200 for row in rows)
-    usage = (await chatting.get("/api/usage")).json()
-    assert usage["per_agent"][0]["agent"] == "chat"
-    assert usage["per_day"][0]["agents"] == ["chat"]
-    per_conversation = (await chatting.get("/api/usage/conversations")).json()["conversations"]
-    assert per_conversation[0]["turns"] == 1 and per_conversation[0]["cache_read_tokens"] == 600
-    # The estimated-call count is what tells a $0 estimate from no estimate (docs/api.md
-    # § Usage aggregates): the calls whose cost Kano Proxy reported, none here.
-    assert per_conversation[0]["estimated_calls"] == sum(
-        1 for row in rows if row.cost_source == "estimated"
-    )
-    assert per_conversation[0]["unpriced_calls"] == sum(
-        1 for row in rows if row.cost_source == "unknown"
-    )
 
     # Revert the agent's edit from the thread.
     reverted = await chatting.post(
