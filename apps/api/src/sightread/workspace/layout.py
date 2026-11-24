@@ -1,13 +1,15 @@
 """Where things live inside a user's workspace (docs/workspace.md § Layout).
 
-Pure path arithmetic: nothing here reads or writes a file. The names the library keeps
-are labels in a tree; this module is what turns a label into a path segment that cannot
-escape the tree or collide with the names the workspace reserves for itself.
+Path arithmetic, and the listings of WORKSPACES_DIR that say which users have an entry
+there: nothing here reads or writes a file. The names the library keeps are labels in a tree;
+this module is what turns a label into a path segment that cannot escape the tree or
+collide with the names the workspace reserves for itself.
 """
 
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import unicodedata
 from pathlib import Path
@@ -67,6 +69,34 @@ EXCLUDE_RULES = "\n".join(
 def user_root(workspaces_dir: str | Path, user_id: int) -> Path:
     """`{WORKSPACES_DIR}/{user_id}` — what the user's VM mounts as /workspace."""
     return Path(workspaces_dir) / str(user_id)
+
+
+def _is_user_id(name: str) -> bool:
+    """Whether a name is what `str(user_id)` writes: ASCII digits only, so `int()` reads it
+    back as the id it names (`'²'` is a digit `int()` refuses, `'١'` one it reads as 1)."""
+    return name.isascii() and name.isdecimal()
+
+
+def workspace_roots(workspaces_dir: str | Path) -> list[Path]:
+    """Every user's workspace root under `workspaces_dir`, by user id; none when it cannot
+    be listed."""
+    base = Path(workspaces_dir)
+    try:
+        names = sorted((name for name in os.listdir(base) if _is_user_id(name)), key=int)
+    except OSError:
+        return []
+    return [base / name for name in names]
+
+
+def users_with_suffix(workspaces_dir: str | Path, suffix: str) -> list[int]:
+    """The users with an entry `{WORKSPACES_DIR}/.repos/{user_id}{suffix}` — a marker
+    beside their git directory — by id."""
+    try:
+        names = os.listdir(Path(workspaces_dir) / REPOS_DIR)
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    stems = (name.removesuffix(suffix) for name in names if name.endswith(suffix))
+    return sorted(int(stem) for stem in stems if _is_user_id(stem))
 
 
 def git_dir(root: Path) -> Path:

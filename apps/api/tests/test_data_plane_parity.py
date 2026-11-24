@@ -364,3 +364,47 @@ async def test_the_same_file_again_joins_the_parse_in_flight(api, sessionmaker, 
     assert sorted(name.split(".")[0] for name in staged_uploads(api)) == sorted(
         [job_id, forced.json()["job_id"]]
     )
+
+
+# --- a retry runs only a model the deployment offers -----------------------------------------
+
+
+@respx.mock
+@pytest.mark.parametrize("filed", [False, True])
+async def test_a_retry_naming_no_model_never_runs_one_the_deployment_withdrew(
+    api, sessionmaker, documents, filed
+) -> None:
+    """docs/agents.md § Enqueue rules: a `/v1/parse` retry with no `model`, of a failed
+    parse whose model and fallback the deployment no longer offers, runs the failed pages
+    on `PARSE_MODEL` — a data-plane parse put back as it is, and a Files document's retried
+    through the library's retry alike."""
+    upstream = Upstream({(MODEL, 2): lambda: httpx.Response(400)})
+    respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
+    if filed:
+        job_id = (await _library_upload(api, documents["mixed_pdf"]))["job_id"]
+    else:
+        job_id = (await _parse(api, documents["mixed_pdf"])).json()["job_id"]
+    await _drain_queue(api, sessionmaker)
+    async with sessionmaker() as db:
+        await db.execute(
+            update(Job)
+            .where(Job.id == uuid.UUID(job_id))
+            .values(model="vendor/retired-model", fallback_model="vendor/retired-fallback")
+        )
+        await db.commit()
+
+    upstream.calls.clear()
+    upstream.answers.clear()
+    retried = await _parse(api, documents["mixed_pdf"], retry="true")
+    assert retried.status_code == 202, retried.text
+    assert retried.json() == {"job_id": job_id, "status": "queued"}
+    job = await _job(sessionmaker, job_id)
+    assert (job.model, job.retry_model, job.fallback_model, job.check_model) == (
+        "vendor/retired-model",
+        MODEL,
+        None,
+        MODEL,
+    )
+    await _drain_queue(api, sessionmaker)
+    assert upstream.calls == [(MODEL, 2)]
+    assert (await _job(sessionmaker, job_id)).status == "succeeded"

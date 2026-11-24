@@ -16,7 +16,6 @@ import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from pathlib import Path
 
 from sqlalchemy import (
     ColumnElement,
@@ -54,14 +53,14 @@ from ..db.models import (
 from ..sandbox.client import SandboxClient, SandboxUnavailable
 from ..stopping import pause
 from ..workspace import git
-from ..workspace.layout import REPOS_DIR, git_dir, user_root
+from ..workspace.layout import git_dir, user_root
 from ..workspace.locks import (
-    WRITING_SUFFIX,
     clear_writing,
     read_writing,
     shell_lock,
     workspace_lock,
     writing_marker,
+    writing_users,
 )
 from ..workspace.reconcile import reconcile_locked
 from . import chat_events
@@ -211,6 +210,20 @@ def dedup_key(
         Job.prompt_sha256 == prompt_sha256,
         Job.pipeline_version == PIPELINE_VERSION,
     ]
+
+
+def dedup_fields(job: Job) -> dict:
+    """The fields `dedup_key` takes, as a job row holds them, so a hold taken from a row
+    and one taken from an upload fingerprint alike (`hold_dedup_key`)."""
+    return {
+        "user_id": job.user_id,
+        "agent": job.agent,
+        "sha256": job.sha256,
+        "model": job.model,
+        "connection_base_url": job.connection_base_url,
+        "pages_spec": job.pages_spec,
+        "prompt_sha256": job.prompt_sha256,
+    }
 
 
 def parse_kept(retention_days: int, margin: timedelta = timedelta(0)) -> ColumnElement[bool]:
@@ -678,10 +691,12 @@ async def retry_job(
     *,
     source_path: str,
     model: str | None,
+    fallback_model: str | None,
     check: CheckTarget | None,
 ) -> bool:
     """Put a failed parse back on the queue to run its failed pages, on `model` (None: the
-    job's own), from `source_path` — a copy of its document's original — and checked as
+    job's own) with `fallback_model` written as the fallback a blocked page goes to (None:
+    none), from `source_path` — a copy of its document's original — and checked as
     `check` says, the settings of this moment (None: unchecked). The caller holds the job's
     row lock and commits. False when the job is no longer `failed` (docs/jobs.md
     § Retrying failed pages)."""
@@ -696,6 +711,7 @@ async def retry_job(
                 finished_at=None,
                 worker_generation=None,
                 retry_model=model,
+                fallback_model=fallback_model,
                 check_model=check.model if check is not None else None,
                 check_effort=check.effort if check is not None else None,
                 check_prompt=check.prompt if check is not None else None,
@@ -924,12 +940,7 @@ async def recover_unsettled_commands(settings: Settings, sandbox: SandboxClient 
     next pass. `sandbox` None means no runner is configured. Returns the users left for
     later (docs/workspace.md § Revisions)."""
     left: set[int] = set()
-    repos = Path(settings.workspaces_dir) / REPOS_DIR
-    for marker in sorted(repos.glob(f"*{WRITING_SUFFIX}")) if repos.is_dir() else []:
-        try:
-            user_id = int(marker.name.removesuffix(WRITING_SUFFIX))
-        except ValueError:
-            continue
+    for user_id in writing_users(settings.workspaces_dir):
         root = user_root(settings.workspaces_dir, user_id)
         named = read_writing(root)
         if sandbox is None:

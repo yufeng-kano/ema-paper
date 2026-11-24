@@ -26,7 +26,6 @@ from ..db.models import (
     Conversation,
     Document,
     Message,
-    User,
     utcnow,
 )
 from ..errors import ApiError
@@ -34,6 +33,7 @@ from ..runtime_settings import RuntimeSettings
 from ..stopping import pause
 from ..workspace.documents import current_revision, ensure_within_quota, is_live, user_folders
 from ..workspace.layout import user_root
+from ..workspace.trash import lock_user
 from . import chat_versions
 from .queue import count_active_turns, enqueue_turn, history_bytes
 
@@ -163,7 +163,7 @@ async def try_idle_compaction(
     if row is None:
         return False
     # The user's row, then the conversation's: the send's order (docs/chat.md).
-    await db.execute(select(User.id).where(User.id == row.user_id).with_for_update())
+    await lock_user(db, row.user_id)
     # Read again under the lock, the row's columns included (`populate_existing`: the
     # session would otherwise hand back the identity it loaded above, as it was): a turn
     # or a move to another model may have cleared the clock meanwhile.

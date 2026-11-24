@@ -53,11 +53,12 @@ from ..workspace import documents as workspace_documents
 from ..workspace import safe_io
 from ..workspace.filing import document_relative
 from ..workspace.locks import workspace_lock
-from ..workspace.trash import read_row
+from ..workspace.trash import lock_user, read_row
 from . import events
 from .queue import (
     CheckTarget,
     count_running_jobs,
+    dedup_fields,
     enqueue_job,
     find_active_job,
     find_cached_job,
@@ -194,6 +195,22 @@ def checked_parse_model(settings: Settings, model: str | None) -> str:
     if model not in offered_models(settings, PARSE.name):
         raise ApiError(400, "invalid_request", "That model is not one the parse agent runs")
     return model
+
+
+def retry_models(settings: Settings, job: Job, model: str | None) -> tuple[str | None, str | None]:
+    """The model a retry runs the failed pages on and the fallback it keeps. A retry is an
+    enqueue, so it runs nothing the deployment does not offer (docs/agents.md § Enqueue
+    rules). `model` is the caller's, already checked, or None: then the job's own (None)
+    while it is one of the parse agent's models, else `PARSE_MODEL` (503 with none). The
+    job's fallback is kept while it is None or offered, else dropped: a page the retry
+    model blocks then fails instead of going to a model the deployment withdrew."""
+    offered = offered_models(settings, PARSE.name)
+    if model is None and job.model not in offered:
+        model = checked_parse_model(settings, None)
+    fallback = job.fallback_model
+    if fallback is not None and fallback not in offered:
+        fallback = None
+    return model, fallback
 
 
 async def _agent_setting(db: AsyncSession, user_id: int, agent: str) -> AgentSetting | None:
@@ -340,8 +357,9 @@ async def submit_parse(
 
     `retry` answers with the newest parse of the same bytes and pages instead of starting
     one: a failed data-plane parse goes back on the queue, its succeeded pages kept and
-    its failed ones run on `model` when one is named, else on its own; one in flight or
-    succeeded is answered as it stands (docs/jobs.md § Retrying failed pages).
+    its failed ones run on `model` when one is named, else on its own while the deployment
+    offers it, else on `PARSE_MODEL` (`retry_models`); one in flight or succeeded is
+    answered as it stands (docs/jobs.md § Retrying failed pages).
 
     A retry whose newest parse is a failed one a Files document names is answered with that
     job as `Submission.library_retry`, nothing changed and a ticket unspent: the library's
@@ -391,7 +409,7 @@ async def submit_parse(
         # order the library's retry and every charge take (docs/billing.md § A parse),
         # which also keeps two retries of one parse from both putting it back.
         await hold_dedup_key(db, **key)
-        await db.execute(select(User.id).where(User.id == user.id).with_for_update())
+        await lock_user(db, user.id)
         found = await find_parse_to_retry(
             db,
             user_id=user.id,
@@ -428,7 +446,9 @@ async def submit_parse(
             await db.rollback()
             return Submission(library_retry=failed_id)
         if job.status == "failed":
-            retry_model = target.model if model is not None else None
+            retry_model, fallback = retry_models(
+                settings, job, target.model if model is not None else None
+            )
             # The check as the settings say now, following the model this run sends the
             # failed pages to (docs/jobs.md § Retrying failed pages).
             check_target = (
@@ -449,7 +469,12 @@ async def submit_parse(
             stored.rename(source)
             try:
                 await retry_job(
-                    db, job.id, source_path=str(source), model=retry_model, check=check_target
+                    db,
+                    job.id,
+                    source_path=str(source),
+                    model=retry_model,
+                    fallback_model=fallback,
+                    check=check_target,
                 )
                 await events.notify(db, job.id)
             except BaseException:
@@ -537,7 +562,7 @@ async def submit_parse(
     # job is inserted: the insert's foreign-key check holds a share lock on this row, and
     # two uploads taking the exclusive lock after it would deadlock (docs/jobs.md
     # § Credits).
-    await db.execute(select(User.id).where(User.id == user.id).with_for_update())
+    await lock_user(db, user.id)
     job = await enqueue_job(
         db,
         user_id=user.id,
@@ -740,14 +765,15 @@ async def retry_library_parse(
     original cannot go while it is copied, nor the file to the Trash — and `row` is a live
     document of the user's; the user's row lock and then the job's are taken here, and the
     job is put back from `failed` only, so two retries cannot both put it back. `model` is
-    one the caller checked (`checked_parse_model`); None is the job's own. A commit that
+    one the caller checked (`checked_parse_model`); None is the job's own while the
+    deployment offers it, else `PARSE_MODEL` (`retry_models`). A commit that
     raises is read back on a connection of its own, as a filing's is: the copy goes only
     with a retry that did not land. Answers the job's id; raises `ApiError` as the route
-    answers it (404, 409, 402) with nothing changed."""
+    answers it (404, 409, 402, 503) with nothing changed."""
     root = workspace_documents.user_root(settings.workspaces_dir, user_id)
     # The user's row before the job's, the one order (docs/workspace.md § Revisions): the
     # retry takes the job's credits back under it (docs/billing.md § A parse).
-    await db.execute(select(User.id).where(User.id == user_id).with_for_update())
+    await lock_user(db, user_id)
     if row.job_id is None:
         raise ApiError(404, "invalid_request", "A markdown document has no parse to retry")
     # Locked and read in one, fresh: the caller may have read the job before the lock.
@@ -759,6 +785,8 @@ async def retry_library_parse(
         raise ApiError(404, "invalid_request", "No such job")
     if job.agent != PARSE.name or job.status != "failed":
         raise ApiError(409, "invalid_request", "Only a failed parse can be retried")
+    # Before anything is reserved or copied: a deployment with no parse model refuses here.
+    model, fallback = retry_models(settings, job, model)
     original = workspace_documents.original_of(root, row.id)
     if original is None:
         # Filed by the worker just after the failure, under the lock held here, or by the
@@ -785,10 +813,17 @@ async def retry_library_parse(
     job_id = job.id
     try:
         # The check as the settings say now: a check that failed may have failed on its
-        # model. One with no model of its own follows this run's parse model, the one the
-        # retry named (docs/jobs.md § Retrying failed pages).
+        # model. One with no model of its own follows this run's parse model (docs/jobs.md
+        # § Retrying failed pages).
         check = await resolve_check(db, settings, user_id, model or job.model)
-        await retry_job(db, job_id, source_path=str(copy), model=model, check=check)
+        await retry_job(
+            db,
+            job_id,
+            source_path=str(copy),
+            model=model,
+            fallback_model=fallback,
+            check=check,
+        )
         await events.notify(db, job_id)
     except BaseException:
         copy.unlink(missing_ok=True)
@@ -842,16 +877,7 @@ async def retry_filed_parse(
         ).scalar_one_or_none()
         if job is None:
             raise ApiError(404, "invalid_request", "No such job")
-        await hold_dedup_key(
-            db,
-            user_id=job.user_id,
-            agent=job.agent,
-            sha256=job.sha256,
-            model=job.model,
-            connection_base_url=job.connection_base_url,
-            pages_spec=job.pages_spec,
-            prompt_sha256=job.prompt_sha256,
-        )
+        await hold_dedup_key(db, **dedup_fields(job))
         folders = await workspace_documents.user_folders(db, user_id)
         rows = (
             await db.execute(

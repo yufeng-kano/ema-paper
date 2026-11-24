@@ -19,7 +19,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from ..agents import CHAT
 from ..agents import memory as memory_defs
 from ..config import Settings
-from ..db.models import AgentSetting, Conversation, Memory, User, utcnow
+from ..db.models import AgentSetting, Conversation, Memory, utcnow
+from ..workspace.trash import lock_user
 from .chat_tools import ToolOutcome
 
 PAUSED = "Memory is paused: the user turned it off. Nothing was saved or changed; go on without it."
@@ -183,7 +184,7 @@ async def run_memory_tool(
     async with sessionmaker() as db:
         # The reader's row, held until the commit: the count below must not race another
         # conversation's save past the cap (docs/chat.md § Memory).
-        await db.execute(select(User.id).where(User.id == user_id).with_for_update())
+        await lock_user(db, user_id)
         paused = (
             await db.execute(
                 select(AgentSetting.memory_paused).where(

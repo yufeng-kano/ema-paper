@@ -40,7 +40,7 @@ from ..parsing.figures import discard_job_figures
 from ..stopping import pause
 from ..workspace import accounts, git, safe_io, trash
 from ..workspace import documents as workspace_documents
-from ..workspace.layout import user_root
+from ..workspace.layout import user_root, workspace_roots
 from ..workspace.locks import workspace_lock
 from .queue import parse_kept
 from .runner import retain_source
@@ -104,15 +104,6 @@ def discard_uploads(upload_dir: Path, stems: Collection[str]) -> bool:
             logger.exception("sweeper could not remove the upload entry %s", name)
             removed = False
     return removed
-
-
-def workspace_roots(workspaces_dir: Path) -> list[Path]:
-    """Every user's workspace root under `workspaces_dir`, by user id."""
-    try:
-        names = sorted((name for name in os.listdir(workspaces_dir) if name.isdigit()), key=int)
-    except OSError:
-        return []
-    return [workspaces_dir / name for name in names]
 
 
 async def sweep_staged_uploads(workspaces_dir: Path) -> int:

@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import IO
 
 from ..errors import ApiError
-from .layout import git_dir
+from .layout import git_dir, users_with_suffix
 
 _process_locks: dict[Path, asyncio.Lock] = defaultdict(asyncio.Lock)
 
@@ -74,6 +74,11 @@ def read_writing(root: Path) -> tuple[int, str] | None:
 
 def clear_writing(root: Path) -> None:
     writing_marker(root).unlink(missing_ok=True)
+
+
+def writing_users(workspaces_dir: str | Path) -> list[int]:
+    """The users whose writing marker stands, by id (a staged `.writing.tmp` is none)."""
+    return users_with_suffix(workspaces_dir, WRITING_SUFFIX)
 
 
 def _lock_path(root: Path, suffix: str) -> Path:

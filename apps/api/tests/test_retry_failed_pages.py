@@ -23,8 +23,10 @@ from sqlalchemy import select, update
 from sightread.auth.sessions import SESSION_COOKIE, create_session
 from sightread.billing import ledger
 from sightread.db.models import CreditPeriod, Document, Job, JobPage, UsageLog
+from sightread.jobs.intake import retry_library_parse
 from sightread.workspace.documents import original_of
 from sightread.workspace.layout import user_root
+from sightread.workspace.locks import workspace_lock
 from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, convert_on_upload
 from tests.factories import user_row
 from tests.test_library import MODEL, _ready_to_parse
@@ -499,3 +501,97 @@ async def test_a_page_of_the_original_is_drawn_small_for_the_retry_dialog(
     for page in (0, 4):
         missing = await library.get(f"/api/library/documents/{uploaded['id']}/pages/{page}/image")
         assert missing.status_code == 404
+
+
+# --- a retry runs only a model the deployment offers -----------------------------------------
+
+
+@respx.mock
+@pytest.mark.parametrize("door", ["route", "agent"])
+async def test_a_retry_naming_no_model_never_runs_one_the_deployment_withdrew(
+    library, sessionmaker, documents, door
+) -> None:
+    """A retry is an enqueue (docs/agents.md § Enqueue rules): one that names no model, of
+    a job whose model and fallback the deployment no longer offers, runs on `PARSE_MODEL`
+    with no fallback, so a page it blocks fails rather than go to a withdrawn model. The
+    Files route and the chat agent's `convert_file`, which calls `retry_library_parse`
+    with no model, alike."""
+    upstream = Upstream({(MODEL, 2): lambda: httpx.Response(400)})
+    respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
+    uploaded = await _upload(library, documents["mixed_pdf"])
+    await _drain_queue(library, sessionmaker)
+    job_id = uuid.UUID(uploaded["job_id"])
+    async with sessionmaker() as db:
+        await db.execute(
+            update(Job)
+            .where(Job.id == job_id)
+            .values(model="vendor/retired-model", fallback_model="vendor/retired-fallback")
+        )
+        await db.commit()
+
+    upstream.calls.clear()
+    upstream.answers[(MODEL, 2)] = lambda: _answer("", "content_filter")
+    if door == "route":
+        retried = await _retry(library, uploaded["id"])
+        assert retried.status_code == 202, retried.text
+    else:
+        settings = library.app.state.settings
+        async with sessionmaker() as db:
+            row = await db.get(Document, uploaded["id"])
+            async with workspace_lock(user_root(settings.workspaces_dir, row.user_id)):
+                await retry_library_parse(db, settings, user_id=row.user_id, row=row)
+    async with sessionmaker() as db:
+        job = await db.get(Job, job_id)
+    # The dedup key keeps the job's own model; the run is the deployment's.
+    assert (job.model, job.retry_model, job.fallback_model) == ("vendor/retired-model", MODEL, None)
+    assert job.check_model in (None, MODEL)
+    await _drain_queue(library, sessionmaker)
+
+    assert upstream.calls == [(MODEL, 2)]
+    row = await _row(library, uploaded["id"])
+    assert (row["status"], row["error"]) == ("failed", "1 of 3 pages failed (page 2: blocked)")
+
+
+@respx.mock
+async def test_a_retry_naming_no_model_keeps_the_jobs_own_while_it_is_offered(
+    make_client, tmp_path, sessionmaker, documents
+) -> None:
+    library = await _with_fallback(make_client, tmp_path, FALLBACK, True)
+    upstream = Upstream({(MODEL, 2): lambda: httpx.Response(400)})
+    respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
+    uploaded = await _upload(library, documents["mixed_pdf"])
+    await _drain_queue(library, sessionmaker)
+
+    upstream.calls.clear()
+    upstream.answers.clear()
+    assert (await _retry(library, uploaded["id"])).status_code == 202
+    async with sessionmaker() as db:
+        job = await db.get(Job, uuid.UUID(uploaded["job_id"]))
+    assert (job.model, job.retry_model, job.fallback_model) == (MODEL, None, FALLBACK)
+    await _drain_queue(library, sessionmaker)
+    assert upstream.calls == [(MODEL, 2)]
+    assert (await _row(library, uploaded["id"]))["status"] == "succeeded"
+
+
+@respx.mock
+async def test_a_retry_on_a_deployment_with_no_parse_model_is_refused_and_reserves_nothing(
+    library, make_client, sessionmaker, documents
+) -> None:
+    respx.post(KANO_CHAT_URL).mock(side_effect=Upstream({(MODEL, 2): lambda: httpx.Response(400)}))
+    uploaded = await _upload(library, documents["mixed_pdf"])
+    await _drain_queue(library, sessionmaker)
+    assert (await library.get("/api/billing")).json()["period"]["spent"] == 0
+
+    # The same account, on the deployment once it names no parse model.
+    bare = make_client(
+        workspaces_dir=library.app.state.settings.workspaces_dir,
+        parse_model="",
+        parse_fallback_model="",
+    )
+    bare.cookies.set(SESSION_COOKIE, library.cookies.get(SESSION_COOKIE))
+    refused = await _retry(bare, uploaded["id"])
+    assert refused.status_code == 503, refused.text
+    assert refused.json()["error"]["message"] == "No parse model is configured on this deployment"
+    assert (await _row(library, uploaded["id"]))["status"] == "failed"
+    assert (await library.get("/api/billing")).json()["period"]["spent"] == 0
+    assert list(Path(library.app.state.settings.upload_dir).iterdir()) == []
