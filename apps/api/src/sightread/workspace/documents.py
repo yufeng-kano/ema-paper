@@ -400,10 +400,16 @@ async def subtree_ids(
     return found
 
 
+def paths_from(root: Path, folders: dict[int, Folder], document: Document) -> DocumentPaths:
+    """Where the document lives, from its user's folders already loaded."""
+    names = [row.name for row in folder_chain(folders, document.folder_id)]
+    return DocumentPaths(root=root, relative=document_relative_dir(names, document.name))
+
+
 async def document_paths(db: AsyncSession, settings: Settings, document: Document) -> DocumentPaths:
     root = user_root(settings.workspaces_dir, document.user_id)
-    names = await folder_names(db, document.user_id, document.folder_id)
-    return DocumentPaths(root=root, relative=document_relative_dir(names, document.name))
+    folders = {} if document.folder_id is None else await user_folders(db, document.user_id)
+    return paths_from(root, folders, document)
 
 
 # --- materialization ----------------------------------------------------------------------
@@ -448,6 +454,16 @@ def is_utf8_file(path: Path) -> bool:
     return True
 
 
+def meta_id(data: bytes | None) -> int | None:
+    """The document id the bytes of a `.meta.json` name, or None when they name none: the
+    shell can write anything there — an id of 1e400, arrays nested deeper than the decoder
+    goes."""
+    try:
+        return int(json.loads(data or b"")["document_id"])
+    except (ValueError, KeyError, TypeError, OverflowError, RecursionError):
+        return None
+
+
 def meta_text(document_id: int, job: Job | None) -> str:
     """A document directory's `.meta.json`. `document_id` first, whatever follows: the
     lookup for a directory the tree moved matches `"document_id": N,`
@@ -473,6 +489,12 @@ def meta_text(document_id: int, job: Job | None) -> str:
     return json.dumps(meta, indent=2) + "\n"
 
 
+def _parse_baseline(result: Result | Row) -> str:
+    """The `doc.md` a parse makes: its reading copy when the parse was checked, else the
+    transcription (docs/workspace.md § Layout)."""
+    return result.reading_markdown if result.reading_markdown is not None else result.markdown
+
+
 def _materialize_files(
     paths: DocumentPaths,
     *,
@@ -494,11 +516,8 @@ def _materialize_files(
     written: list[Path] = []
     if safe_io.entry_kind(paths.root, paths.doc) == "none":
         if result is not None:
-            # The reading copy when the parse was checked, else the transcription
-            # (docs/workspace.md § Layout); `result.md` below is always the transcription.
-            baseline = (
-                result.reading_markdown if result.reading_markdown is not None else result.markdown
-            )
+            # `result.md` below is always the transcription.
+            baseline = _parse_baseline(result)
         else:
             baseline = markdown_baseline(paths.root, document_id, max_bytes)
         if _write_if_missing(paths.root, paths.doc, baseline):
@@ -611,7 +630,7 @@ async def materialize_document(
         folders = await user_folders(db, document.user_id)
         if not is_live(document, folders):
             raise ApiError(404, "invalid_request", "No such document")
-        paths = await document_paths(db, settings, document)
+        paths = paths_from(root, folders, document)
         if safe_io.entry_kind(root, paths.directory) == "none":
             # An interrupted move to or from the Trash may have left the directory there:
             # it goes back where the row says before anything fresh is written, and a
@@ -711,8 +730,6 @@ async def current_revision(db: AsyncSession, settings: Settings, document: Docum
         text = await asyncio.to_thread(
             safe_io.read_text, paths.root, paths.doc, settings.content_max_bytes
         )
-    except FileNotFoundError:
-        text = None
     except (safe_io.UnsafeEntry, safe_io.EntryTooLarge, OSError, UnicodeDecodeError):
         return None
     if text is not None:
@@ -864,13 +881,30 @@ def _copy_source(root: Path, directory: Path, original: Path) -> Path:
     return target
 
 
+# The staging copy of an original: a name `original_of` never picks, since its stem is
+# not the id, and one the reconciliation's sweep removes when a writer died with it.
+STAGING_PREFIX = ".tmp-"
+
+
+def _install_original(source: Path, canonical: Path) -> None:
+    """`canonical` as a copy of `source`, whole or not at all: copied to its staging name
+    and renamed into place. A copy that fails leaves no staging file behind."""
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    staging = canonical.with_name(f"{STAGING_PREFIX}{canonical.name}")
+    try:
+        shutil.copyfile(source, staging)
+        os.replace(staging, canonical)
+    finally:
+        staging.unlink(missing_ok=True)
+
+
 def keep_source(
     root: Path,
     relative: Path | None,
     source: Path,
     *,
     document_id: int,
-    kind: str = "pdf",
+    kind: str,
     copy: bool = False,
 ) -> Path:
     """File a finished parse's upload as the document's original — `{document_id}.pdf`
@@ -886,11 +920,7 @@ def keep_source(
     from the original anyway (docs/workspace.md § Layout). Returns the original's path."""
     git.ensure_repo(root)
     canonical = sources_dir(root) / f"{document_id}{_source_suffix(source, kind)}"
-    canonical.parent.mkdir(parents=True, exist_ok=True)
-    # A name `original_of` never picks: its stem is not the id.
-    staging = canonical.with_name(f".tmp-{canonical.name}")
-    shutil.copyfile(source, staging)
-    os.replace(staging, canonical)
+    _install_original(source, canonical)
     if relative is not None and safe_io.entry_kind(root, root / relative / META_FILE) == "file":
         _copy_source(root, root / relative, canonical)
     if not copy:
@@ -905,10 +935,7 @@ def copy_original(root: Path, source_id: int, target_id: int) -> bool:
     original = original_of(root, source_id)
     if original is None:
         return False
-    canonical = original.with_name(f"{target_id}{original.suffix}")
-    staging = canonical.with_name(f".tmp-{canonical.name}")
-    shutil.copyfile(original, staging)
-    os.replace(staging, canonical)
+    _install_original(original, original.with_name(f"{target_id}{original.suffix}"))
     return True
 
 
@@ -943,17 +970,10 @@ async def adopt_source(
     quota refuses (`ApiError`, 409), leaves nothing behind — the original and the shell's
     copy go — since the caller rolls the row back and no file may stay for a row that is
     gone (docs/workspace.md § Layout). `locked`: the caller holds the workspace lock."""
-    if upload is not None:
-        source = upload
-    else:
-        # Any terminal state: a failed parse's upload is kept for its row too (docs/jobs.md).
-        if (
-            job.status not in ("succeeded", "failed")
-            or not job.source_path
-            or job.source_deleted_at is not None
-        ):
-            return
-        source = Path(job.source_path)
+    # Any terminal state: a failed parse's upload is kept for its row too (docs/jobs.md).
+    source = upload if upload is not None else unfiled_upload(job)
+    if source is None:
+        return
     root = user_root(settings.workspaces_dir, document.user_id)
     async with contextlib.nullcontext() if locked else workspace_lock(root):
         if not source.is_file():
@@ -979,25 +999,11 @@ async def adopt_source(
                 keep_source, root, relative, source, document_id=document.id, kind=job.kind
             )
         except Exception:
-            await asyncio.to_thread(
-                _undo_adoption,
-                root,
-                document.id,
-                root / relative,
-                _source_suffix(source, job.kind),
-            )
+            await asyncio.to_thread(_discard_adopted, root, document.id, root / relative)
             raise
     if upload is None:
         job.source_deleted_at = utcnow()
         await db.commit()
-
-
-def _keep_markdown(root: Path, upload: Path, document_id: int) -> None:
-    canonical = sources_dir(root) / f"{document_id}.md"
-    canonical.parent.mkdir(parents=True, exist_ok=True)
-    staging = canonical.with_name(f".tmp-{canonical.name}")
-    shutil.copyfile(upload, staging)
-    os.replace(staging, canonical)
 
 
 async def adopt_markdown(
@@ -1011,7 +1017,7 @@ async def adopt_markdown(
     root = user_root(settings.workspaces_dir, document.user_id)
     try:
         await ensure_within_quota(db, settings, document.user_id, root)
-        await asyncio.to_thread(_keep_markdown, root, upload, document.id)
+        await asyncio.to_thread(_install_original, upload, sources_dir(root) / f"{document.id}.md")
     except BaseException:
         await asyncio.to_thread(_discard_originals, root, [document.id])
         raise
@@ -1019,7 +1025,7 @@ async def adopt_markdown(
         upload.unlink(missing_ok=True)
 
 
-def place_file(root: Path, temp: Path, relative: Path, *, message: str = "upload") -> None:
+def place_file(root: Path, temp: Path, relative: Path, *, message: str) -> None:
     """An uploaded file from the temporary name it streamed to into its place in the tree,
     `files/<folder>/<name>`, as the revision `upload <path>` — `download <path>` for the
     agent's download, which is filed the same way — the one copy there is
@@ -1134,14 +1140,6 @@ def image_of(root: Path, document_id: int, name: str) -> Path | None:
     return image if image.is_file() and not image.is_symlink() else None
 
 
-def _undo_adoption(root: Path, document_id: int, directory: Path, suffix: str) -> None:
-    _discard_originals(root, [document_id])
-    with contextlib.suppress(OSError, safe_io.UnsafeEntry):
-        safe_io.remove_file(root, directory / f"{SOURCE_STEM}{suffix}")
-    with contextlib.suppress(OSError):
-        directory.rmdir()  # only when the copy was all it held
-
-
 def _discard_adopted(root: Path, document_id: int, directory: Path) -> None:
     _discard_originals(root, [document_id])
     try:
@@ -1224,6 +1222,33 @@ def _write_file(
     return revision_of(text)
 
 
+async def _save(
+    db: AsyncSession,
+    settings: Settings,
+    document: Document,
+    *,
+    notes: bool,
+    text: str,
+    base_revision: str,
+    author: str,
+) -> str:
+    """`doc.md`, or `notes.md` with `notes`, saved against `base_revision` as one revision."""
+    # The path is resolved under the same lock as the write: a rename landing in between
+    # must not send the text to a place the document has left (docs/workspace.md).
+    async with workspace_lock(user_root(settings.workspaces_dir, document.user_id)):
+        paths = await materialize_document(db, settings, document, locked=True)
+        return await asyncio.to_thread(
+            _write_file,
+            paths,
+            paths.notes if notes else paths.doc,
+            text,
+            base_revision,
+            author,
+            f"notes {paths.notes_relative}" if notes else f"edit {paths.doc_relative}",
+            settings.content_max_bytes,
+        )
+
+
 async def write_content(
     db: AsyncSession,
     settings: Settings,
@@ -1233,20 +1258,15 @@ async def write_content(
     base_revision: str,
     author: str = git.USER_AUTHOR,
 ) -> str:
-    # The path is resolved under the same lock as the write: a rename landing in between
-    # must not send the text to a place the document has left (docs/workspace.md).
-    async with workspace_lock(user_root(settings.workspaces_dir, document.user_id)):
-        paths = await materialize_document(db, settings, document, locked=True)
-        return await asyncio.to_thread(
-            _write_file,
-            paths,
-            paths.doc,
-            markdown,
-            base_revision,
-            author,
-            f"edit {paths.doc_relative}",
-            settings.content_max_bytes,
-        )
+    return await _save(
+        db,
+        settings,
+        document,
+        notes=False,
+        text=markdown,
+        base_revision=base_revision,
+        author=author,
+    )
 
 
 async def write_notes(
@@ -1258,18 +1278,9 @@ async def write_notes(
     base_revision: str,
     author: str = git.USER_AUTHOR,
 ) -> str:
-    async with workspace_lock(user_root(settings.workspaces_dir, document.user_id)):
-        paths = await materialize_document(db, settings, document, locked=True)
-        return await asyncio.to_thread(
-            _write_file,
-            paths,
-            paths.notes,
-            text,
-            base_revision,
-            author,
-            f"notes {paths.notes_relative}",
-            settings.content_max_bytes,
-        )
+    return await _save(
+        db, settings, document, notes=True, text=text, base_revision=base_revision, author=author
+    )
 
 
 # --- re-convert ---------------------------------------------------------------------------
@@ -1291,12 +1302,7 @@ def _take_parse(
     except (safe_io.UnsafeEntry, OSError) as exc:
         raise ApiError(409, "invalid_request", NOT_PLAIN) from exc
     try:
-        # The baseline materialization writes: the reading copy when the parse was checked.
-        _write_text(
-            paths.root,
-            paths.doc,
-            result.reading_markdown if result.reading_markdown is not None else result.markdown,
-        )
+        _write_text(paths.root, paths.doc, _parse_baseline(result))
         _write_text(paths.root, paths.meta, meta_text(document_id, job))
         git.commit_paths(
             paths.root,
@@ -1318,19 +1324,17 @@ def _take_parse(
         ) from exc
 
 
-async def take_reconvert(
-    db: AsyncSession, settings: Settings, document: Document, *, locked: bool = False
-) -> bool:
+async def take_reconvert(db: AsyncSession, settings: Settings, document: Document) -> bool:
     """The document takes its re-convert once that parse has succeeded (docs/jobs.md
     § Re-converting a document): its directory as it stands is recorded first, then
     `doc.md` and `.meta.json` take the new parse as one revision, then the row names the
     new job and the pointer clears — files before the row, so a commit that fails leaves
     the pointer standing over files already in place, for the next reader to finish. A
     document in the Trash keeps its version: only the pointer clears. True when the
-    document's parse changed. `locked`: the caller holds the workspace lock."""
+    document's parse changed."""
     document_id, user_id = document.id, document.user_id
     root = user_root(settings.workspaces_dir, user_id)
-    async with contextlib.nullcontext() if locked else workspace_lock(root):
+    async with workspace_lock(root):
         try:
             # Read again under the lock: a delete, a dismissal and another taker hold it.
             if await db.get(Document, document_id, populate_existing=True) is None:
@@ -1679,15 +1683,21 @@ async def revert(
 
 
 @dataclass(frozen=True)
-class Move:
-    """A directory move: the revision it made, and where a squatter that sat at the
-    destination was moved to, so a rollback can put it back (docs/workspace.md § Layout)."""
+class Placed:
+    """A directory moved or copied: the revision it made, and where a squatter that sat at
+    the destination was moved to, so a rollback can put it back (docs/workspace.md § Layout,
+    § Copies)."""
 
     commit: str | None
     displaced: Path | None
 
 
-def _move_tree(root: Path, source: Path, target: Path, message: str, author: str) -> Move | None:
+def _aside_name(path: Path) -> Path:
+    """Where a squatter at `path` moves aside: its name with a short random suffix."""
+    return path.with_name(f"{path.name} ({uuid.uuid4().hex[:6]})")
+
+
+def _move_tree(root: Path, source: Path, target: Path, message: str, author: str) -> Placed | None:
     git.ensure_repo(root)
     if safe_io.entry_kind(root, root / source) == "none" or source == target:
         return None
@@ -1698,7 +1708,7 @@ def _move_tree(root: Path, source: Path, target: Path, message: str, author: str
             # Something else sits where the row now points — a directory the shell made
             # under that name. It moves aside, so the document lands where the database
             # says and the squatter keeps what it holds (docs/workspace.md § Layout).
-            aside = target.with_name(f"{target.name} ({uuid.uuid4().hex[:6]})")
+            aside = _aside_name(target)
             git.move(root, root / target, root / aside)
             touched.append(aside)
         git.move(root, root / source, root / target)
@@ -1713,14 +1723,14 @@ def _move_tree(root: Path, source: Path, target: Path, message: str, author: str
         message = NOT_PLAIN if plain else "The move failed; nothing was changed"
         raise ApiError(409, "invalid_request", message) from exc
     try:
-        return Move(git.commit_paths(root, author, message, touched), aside)
+        return Placed(git.commit_paths(root, author, message, touched), aside)
     except git.GitError as exc:
         # Back where the row will point once the caller rolls back: the directory to its
         # old place, the squatter to the place it had. Plain renames, no git — the index
         # was reset by the failed commit and the next commit sees the tree as it is.
         safe_io.rename(root, root / target, root / source)
-        if len(touched) == 3:
-            safe_io.rename(root, root / touched[2], root / target)
+        if aside is not None:
+            safe_io.rename(root, root / aside, root / target)
         raise ApiError(
             409, "invalid_request", "The move could not be recorded; nothing was changed"
         ) from exc
@@ -1733,7 +1743,7 @@ async def move_path(
     target: Path,
     *,
     author: str = git.USER_AUTHOR,
-) -> Move | None:
+) -> Placed | None:
     """Rename or move a document or folder directory after the database did. The caller
     holds the user's workspace lock across its database write and this move, so nothing
     can materialize at the new path in between (docs/workspace.md § Revisions). Returns
@@ -1885,17 +1895,23 @@ async def restore_removed(
 def sweep_orphaned_originals(root: Path, live_ids: Collection[int]) -> int:
     """Remove the originals beside the git directory whose document row is gone: what a
     delete the process died in, after its rows' commit and before its cleanup, leaves
-    behind (docs/workspace.md § Revisions). Under the workspace lock, which every writer
-    of an original holds, so none on its way to a row about to commit is taken."""
+    behind (docs/workspace.md § Revisions). A staging copy (`.tmp-<id>.<ext>`) a writer
+    died with before its rename goes too. Under the workspace lock, which every writer of
+    an original holds, so none on its way to a row about to commit is taken, and no
+    staging copy is still being written."""
     directory = sources_dir(root)
     if not directory.is_dir():
         return 0
     swept = 0
     for original in directory.iterdir():
+        if original.name.startswith(STAGING_PREFIX):
+            original.unlink(missing_ok=True)
+            swept += 1
+            continue
         try:
             document_id = int(original.stem)
         except ValueError:
-            continue  # a staging file, named so `original_of` never picks it
+            continue  # not an original's name
         if document_id in live_ids:
             continue
         original.unlink(missing_ok=True)
@@ -2056,7 +2072,7 @@ def _unstash_tree(root: Path, entry: str, relative: Path, message: str, author: 
     if safe_io.entry_kind(root, root / relative) != "none":
         # Something the shell made under that name meanwhile moves aside, as a move moves
         # a squatter, so the item lands where its row says (docs/workspace.md § Layout).
-        aside = relative.with_name(f"{relative.name} ({uuid.uuid4().hex[:6]})")
+        aside = _aside_name(relative)
         git.move(root, root / relative, root / aside)
         touched.append(aside)
     try:
@@ -2261,15 +2277,6 @@ class CopiedDocument:
     file: bool = False
 
 
-@dataclass(frozen=True)
-class Copy:
-    """A copy on disk: the revision it made, and where a squatter that sat at the
-    destination was moved to (docs/workspace.md § Copies)."""
-
-    commit: str | None
-    displaced: Path | None
-
-
 def _copy_stored_images(root: Path, source_id: int, target_id: int) -> None:
     store = images_dir(root) / str(source_id)
     if not store.is_dir() or store.is_symlink():
@@ -2296,12 +2303,12 @@ def _copy_files(
     *,
     folder: bool,
     author: str,
-) -> Copy:
+) -> Placed:
     git.ensure_repo(root)
     aside: Path | None = None
     if safe_io.entry_kind(root, root / target) != "none":
         # A directory the shell made under the copy's name: aside, as a move's squatter.
-        aside = target.with_name(f"{target.name} ({uuid.uuid4().hex[:6]})")
+        aside = _aside_name(target)
         try:
             git.move(root, root / target, root / aside)
         except (safe_io.UnsafeEntry, OSError) as exc:
@@ -2367,7 +2374,7 @@ def _copy_files(
                 409, "invalid_request", "The copy could not be made; nothing was copied"
             ) from exc
         raise
-    return Copy(commit, aside)
+    return Placed(commit, aside)
 
 
 async def copy_path(
@@ -2379,7 +2386,7 @@ async def copy_path(
     *,
     folder: bool,
     author: str = git.USER_AUTHOR,
-) -> Copy:
+) -> Placed:
     """Copy a document's or a folder's directory to `target` after the database made
     the rows, with the originals and inserted images under the new ids, as the revision
     `copy <from> -> <to>`; whole or nothing (409). The caller holds the workspace lock
@@ -2390,13 +2397,13 @@ async def copy_path(
     )
 
 
-def _remove_copy(root: Path, target: Path, made: Copy, target_ids: list[int], author: str) -> None:
-    safe_io.remove_tree(root, root / target)
+def _remove_copy(
+    root: Path, target: Path, made: Placed, target_ids: list[int], author: str
+) -> None:
     touched = [target]
     if made.displaced is not None and safe_io.entry_kind(root, root / made.displaced) != "none":
-        git.move(root, root / made.displaced, root / target)
         touched.append(made.displaced)
-    _discard_originals(root, target_ids)
+    _undo_copy(root, target, made.displaced, target_ids)
     git.commit_paths(root, author, f"remove {target}", touched)
 
 
@@ -2404,7 +2411,7 @@ async def remove_copy(
     settings: Settings,
     user_id: int,
     target: Path,
-    made: Copy,
+    made: Placed,
     target_ids: list[int],
     *,
     author: str = git.USER_AUTHOR,
@@ -2503,12 +2510,8 @@ def storage_usage(
         for step in safe_io.walk(root, base):
             parts = step.parts
             if step.name is None:
-                try:
-                    meta = json.loads(safe_io.read_at(step.fd, META_FILE, META_MAX_BYTES) or b"")
-                    document_id = int(meta["document_id"])
-                except (ValueError, KeyError, TypeError, OverflowError, RecursionError):
-                    # Not a document's metadata: a command can write an id of 1e400, or
-                    # nest arrays deeper than the decoder goes.
+                document_id = meta_id(safe_io.read_at(step.fd, META_FILE, META_MAX_BYTES))
+                if document_id is None:
                     continue
                 if parts and document_id in jobs and document_id not in claimed:
                     claimed.add(document_id)

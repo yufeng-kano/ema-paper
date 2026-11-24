@@ -697,6 +697,10 @@ async def test_a_finished_library_parse_keeps_its_source(chatting, tmp_path) -> 
     )
     assert kept.read_bytes() == b"%PDF-1.4 test"
     assert not upload.exists()
+    original = workspace_documents.original_of(
+        user_root(settings.workspaces_dir, chatting.user_id), chatting.document_id
+    )
+    assert original is not None and original.read_bytes() == b"%PDF-1.4 test"
     async with sessionmaker() as db:
         assert (await db.execute(select(Message))).scalars().all() == []
 
@@ -709,6 +713,7 @@ async def test_view_page_and_view_figure_read_the_documents_own_files(tmp_path, 
     root = tmp_path / "ws" / "1"
     paths = DocumentPaths(root=root, relative=Path("files/paper"))
     paths.directory.mkdir(parents=True)
+    # Only the shell's copy: the shell can plant one, and it is never what renders.
     shutil.copy(documents["text_pdf"], paths.directory / "source.pdf")
     paths.figures.mkdir()
     Image.new("RGB", (40, 30), "white").save(paths.figures / "p1_100_100_400_600.png")

@@ -171,7 +171,7 @@ async def test_keep_source_moves_the_upload_into_the_document_directory(tmp_path
     root = tmp_path / "ws" / "7"
     upload = tmp_path / "upload.pdf"
     upload.write_bytes(b"%PDF-1.4")
-    kept = documents.keep_source(root, Path("files/paper.pdf"), upload, document_id=31)
+    kept = documents.keep_source(root, Path("files/paper.pdf"), upload, document_id=31, kind="pdf")
     # The original named by the document; no directory made in the tree for the copy.
     assert kept == tmp_path / "ws" / ".repos" / "7.sources" / "31.pdf"
     assert kept.read_bytes() == b"%PDF-1.4"
@@ -183,7 +183,7 @@ async def test_keep_source_moves_the_upload_into_the_document_directory(tmp_path
     (root / "files" / "paper.pdf").mkdir(parents=True)
     (root / "files" / "paper.pdf" / META_FILE).write_text("{}")
     upload.write_bytes(b"%PDF-1.4")
-    documents.keep_source(root, Path("files/paper.pdf"), upload, document_id=31)
+    documents.keep_source(root, Path("files/paper.pdf"), upload, document_id=31, kind="pdf")
     assert (root / "files" / "paper.pdf" / "source.pdf").read_bytes() == b"%PDF-1.4"
     # Ignored by git: the binary never enters history.
     assert git.commit_all(root, "user", "x") is None or "source" not in git.log(root)[0].files
@@ -942,6 +942,35 @@ async def test_reconcile_records_no_folder_under_a_documents_name(sessionmaker, 
         assert row.folder_id == document.folder_id
 
 
+async def test_reconcile_follows_a_document_into_a_directory_that_replaced_a_file(
+    sessionmaker, tmp_path
+) -> None:
+    settings = _settings(tmp_path)
+    async with sessionmaker() as db:
+        user, document = await _seed(db)
+        paths = await documents.materialize_document(db, settings, document)
+        root = paths.root
+        (root / "files" / "Notes").write_bytes(b"kept")
+        git.commit_all(root, "agent:1", "a file from the shell")
+        assert await reconcile.reconcile_user(db, settings, user.id) == 1
+        # The shell replaced the file with a directory of its name and moved the document
+        # into it: one reconciliation removes the file's row, records the folder and
+        # follows the document there.
+        (root / "files" / "Notes").unlink()
+        target = root / "files" / "Notes" / "paper.pdf"
+        target.parent.mkdir()
+        paths.directory.rename(target)
+        git.commit_all(root, "agent:1", "mv from the shell")
+        assert await reconcile.reconcile_user(db, settings, user.id) == 3
+        row = (await db.execute(select(Document).where(Document.id == document.id))).scalar_one()
+        folder = await db.get(Folder, row.folder_id)
+        assert (folder.name, folder.parent_id) == ("Notes", None)
+        names = set(
+            (await db.execute(select(Document.name).where(Document.user_id == user.id))).scalars()
+        )
+        assert names == {"paper.pdf"}
+
+
 async def test_a_revert_of_a_rename_that_also_edited_restores_the_bytes(
     sessionmaker, tmp_path
 ) -> None:
@@ -1579,6 +1608,28 @@ async def test_a_canonicalization_whose_commit_fails_is_undone(
         assert shell_named.with_name("_.report").is_dir()
 
 
+def test_a_directory_the_disk_refuses_to_move_stays_and_the_others_are_recorded(
+    tmp_path, monkeypatch
+) -> None:
+    root = user_root(tmp_path / "workspaces", 1)
+    git.ensure_repo(root)
+    for name in (".a", ".b"):
+        (root / "files" / name).mkdir(parents=True)
+        (root / "files" / name / "note.txt").write_text(name)
+    real = git.move
+
+    def refusing(root_: Path, source: Path, target: Path) -> None:
+        if source.name == ".b":
+            raise PermissionError("read-only parent")
+        real(root_, source, target)
+
+    monkeypatch.setattr(git, "move", refusing)
+    assert reconcile._canonicalize(root) == 1
+    assert (root / "files" / "_.a" / "note.txt").is_file()
+    assert (root / "files" / ".b" / "note.txt").is_file()
+    assert git.log(root)[0].message.startswith("canonicalize")
+
+
 async def test_the_documents_own_rename_revision_does_not_reach_beyond_it(
     sessionmaker, tmp_path
 ) -> None:
@@ -1855,7 +1906,8 @@ async def test_reconciliation_removes_the_originals_of_rows_that_are_gone(
     sessionmaker, tmp_path
 ) -> None:
     """A delete the process died in after its rows' commit leaves the originals beside the
-    git directory; the next reconciliation takes them, and only them."""
+    git directory, a writer that died between its copy and its rename a staging copy; the
+    next reconciliation takes them, and only them."""
     settings = _settings(tmp_path)
     async with sessionmaker() as db:
         user, document = await _seed(db)
@@ -1869,7 +1921,7 @@ async def test_reconciliation_removes_the_originals_of_rows_that_are_gone(
         await reconcile.reconcile_user(db, settings, user.id)
     assert (originals / f"{document.id}.pdf").is_file()
     assert not (originals / "999.pdf").exists()
-    assert (originals / ".tmp-1000.pdf").is_file()
+    assert not (originals / ".tmp-1000.pdf").exists()
 
 
 async def test_materialized_files_left_uncommitted_are_committed_next_time(

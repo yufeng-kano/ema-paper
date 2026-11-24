@@ -37,18 +37,17 @@ IMAGES_SUFFIX = ".images"
 # A deleted account's marker, standing until the account's files are gone
 # (docs/auth.md § Deleting the account).
 DELETED_SUFFIX = ".deleted"
-LOCK_FILE = "lock"
 
-# What a document directory may not be called: the workspace's own names, git's, and
-# the names history excludes wherever they appear (`figures`, `source.*`) — a document
-# or folder so named would be a directory git ignores whole, its revisions never made.
-RESERVED_SEGMENTS = frozenset(
-    {SIGHTREAD_DIR, META_FILE, CACHE_DIR, FIGURES_DIR, ".git", ".gitignore"}
-)
+# What a document directory may not be called besides a dot name: the names history
+# excludes wherever they appear (`figures`, `source.*`) — a document or folder so named
+# would be a directory git ignores whole, its revisions never made. The workspace's own
+# names and git's all start with a dot, which `path_segment` prefixes already.
+RESERVED_SEGMENTS = frozenset({FIGURES_DIR})
 
-# Separators and control characters never reach a path; the library already strips the
-# separators (routes/library.py), this is the belt to that brace.
-_UNSAFE = re.compile(r"[\x00-\x1f\x7f/\\]")
+# Separators and control characters: never in a library name (`filing.clean_name`) nor in
+# a path segment — a separator would make a breadcrumb lie about where a file is, and a
+# control character would make two different names look identical.
+UNSAFE_CHARS = re.compile(r"[\x00-\x1f\x7f/\\]")
 
 # The repository's `info/exclude`: kept in the git directory, out of the shell's reach.
 EXCLUDE_RULES = "\n".join(
@@ -107,21 +106,6 @@ def is_canonical_segment(segment: str) -> bool:
     return path_segment(segment_name(segment)) == segment
 
 
-def no_symlinks(root: Path, path: Path) -> bool:
-    """Whether no component of `path` below `root` is a symlink — the check every fixed
-    workspace file passes before the host reads or writes it (docs/workspace.md)."""
-    try:
-        relative = path.relative_to(root)
-    except ValueError:
-        return False
-    cursor = root
-    for part in relative.parts:
-        cursor = cursor / part
-        if cursor.is_symlink():
-            return False
-    return True
-
-
 def path_segment(name: str) -> str:
     """A library name as one path component.
 
@@ -133,7 +117,7 @@ def path_segment(name: str) -> str:
     `report` are `_.report` and `report`, never both `report`).
     """
     segment = unicodedata.normalize("NFC", name)
-    segment = _UNSAFE.sub(" ", segment).strip()
+    segment = UNSAFE_CHARS.sub(" ", segment).strip()
     if (
         not segment
         or segment.startswith((".", "_", f"{SOURCE_STEM}."))

@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import re
 import unicodedata
 import uuid
 from collections.abc import Awaitable, Callable
@@ -41,6 +40,7 @@ from .documents import (
 )
 from .layout import (
     FILES_DIR,
+    UNSAFE_CHARS,
     document_relative_dir,
     path_segment,
     segment_name,
@@ -68,10 +68,6 @@ STRANDED = "The item's files could not be brought back from the Trash; nothing w
 FILE_CLASH = "A file with this name already exists here"
 FOLDER_CLASH = "A folder with this name already exists here"
 
-# A name is a label in a tree, never a path. Separators would make a breadcrumb lie about
-# where a file is, and control characters would make two different names look identical.
-UNSAFE_IN_NAME = re.compile(r"[\x00-\x1f\x7f/\\]")
-
 
 # --- names and places -------------------------------------------------------------------
 
@@ -80,7 +76,7 @@ def clean_name(raw: str, limit: int) -> str:
     """A display name: NFC, no separators, no control characters, trimmed and capped.
     Normalized here, before uniqueness is decided, so two spellings of one name are one
     name in the library as they are one directory in the workspace (docs/workspace.md)."""
-    name = UNSAFE_IN_NAME.sub(" ", unicodedata.normalize("NFC", raw)).strip()
+    name = UNSAFE_CHARS.sub(" ", unicodedata.normalize("NFC", raw)).strip()
     if not name:
         raise ApiError(400, "invalid_request", "A name is required")
     return name[:limit].strip()

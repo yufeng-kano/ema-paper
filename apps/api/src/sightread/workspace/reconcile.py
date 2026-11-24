@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
 import uuid
+from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,7 +29,8 @@ from .documents import (
     ORIGIN_SUFFIX,
     aside_origin,
     file_media_type,
-    folder_names,
+    folder_chain,
+    meta_id,
     recover_trash,
     sweep_aside,
     sweep_orphaned_images,
@@ -115,7 +117,7 @@ def _canonicalize(root: Path) -> int:
                 continue  # left alone, and not descended into: its rows stay as they were
             try:
                 git.move(root, root / source, root / target)
-            except safe_io.UnsafeEntry:
+            except (safe_io.UnsafeEntry, OSError):
                 logger.warning("reconcile: %s could not be moved; left alone", source)
                 continue
             moved += [source, target]
@@ -194,18 +196,9 @@ def meta_document_id(root: Path, directory: Path) -> int | None:
     (docs/workspace.md § Revisions)."""
     try:
         data = safe_io.read_bytes(root, root / directory / META_FILE, META_MAX_BYTES)
-        return int(json.loads(data or b"")["document_id"])
-    except (
-        safe_io.UnsafeEntry,
-        safe_io.EntryTooLarge,
-        OSError,
-        ValueError,
-        KeyError,
-        TypeError,
-        OverflowError,  # an id of 1e400
-        RecursionError,  # arrays nested deeper than the decoder goes
-    ):
+    except (safe_io.UnsafeEntry, safe_io.EntryTooLarge, OSError):
         return None
+    return meta_id(data)
 
 
 def _aside_documents(root: Path) -> dict[str, list[tuple[Path, int]]]:
@@ -258,7 +251,47 @@ def _restore_aside(root: Path, aside_dir: Path, target: Path) -> bool:
     return True
 
 
-async def _row_names(db: AsyncSession, user_id: int, origin: Path, *, file: bool) -> bool:
+class _Names:
+    """The names the user's live rows hold at each parent, as segments: folders by the id
+    they name, documents counted by segment and by whether they are files. Built from the
+    rows loaded under the user's row lock and kept current with every row reconciliation
+    makes, adds or deletes before it decides a name, so no decision reads the database
+    again. A parent a path reaches from the root through live folders is live itself, so
+    the live rows at it are exactly these."""
+
+    def __init__(self, folders: Iterable[Folder], documents: Iterable[Document]) -> None:
+        self._folders: dict[tuple[int | None, str], int] = {}
+        self._documents: Counter[tuple[int | None, str, bool]] = Counter()
+        for folder in folders:
+            if folder.trashed_at is None:
+                self.add_folder(folder)
+        for row in documents:
+            self.add_document(row)
+
+    def add_folder(self, folder: Folder) -> None:
+        self._folders.setdefault((folder.parent_id, path_segment(folder.name)), folder.id)
+
+    def add_document(self, row: Document) -> None:
+        self._documents[_document_key(row)] += 1
+
+    def remove_document(self, row: Document) -> None:
+        self._documents[_document_key(row)] -= 1
+
+    def folder(self, parent: int | None, segment: str) -> int | None:
+        return self._folders.get((parent, segment))
+
+    def document(self, parent: int | None, segment: str, *, file: bool | None = None) -> bool:
+        """Whether a document row takes `segment` at `parent`: of either kind, only a file
+        row (`file`), or only another (`not file`)."""
+        kinds = (True, False) if file is None else (file,)
+        return any(self._documents[(parent, segment, kind)] > 0 for kind in kinds)
+
+
+def _document_key(row: Document) -> tuple[int | None, str, bool]:
+    return (row.folder_id, path_segment(row.name), row.kind == FILE_KIND)
+
+
+def _row_names(names: _Names, origin: Path, *, file: bool) -> bool:
     """Whether a live row still places itself at `origin` (`files/…`) — a folder or a
     document for a directory aside, a file row for a plain file aside (`file`): what decides
     that an aside holding no document metadata goes back there rather than being swept
@@ -270,15 +303,7 @@ async def _row_names(db: AsyncSession, user_id: int, origin: Path, *, file: bool
         return False
     parent: int | None = None
     for index, segment in enumerate(segments):
-        at_parent = Folder.parent_id.is_(None) if parent is None else Folder.parent_id == parent
-        folders = (
-            await db.execute(
-                select(Folder.id, Folder.name).where(
-                    Folder.user_id == user_id, at_parent, Folder.trashed_at.is_(None)
-                )
-            )
-        ).all()
-        match = next((row.id for row in folders if path_segment(row.name) == segment), None)
+        match = names.folder(parent, segment)
         if match is not None:
             if file and index == len(segments) - 1:
                 return False  # a folder stands where the file did
@@ -286,17 +311,7 @@ async def _row_names(db: AsyncSession, user_id: int, origin: Path, *, file: bool
             continue
         if index != len(segments) - 1:
             return False
-        in_folder = Document.folder_id.is_(None) if parent is None else Document.folder_id == parent
-        rows = (
-            await db.execute(
-                select(Document.name, Document.kind).where(
-                    Document.user_id == user_id, in_folder, Document.trashed_at.is_(None)
-                )
-            )
-        ).all()
-        return any(
-            path_segment(row.name) == segment and (row.kind == FILE_KIND) == file for row in rows
-        )
+        return names.document(parent, segment, file=file)
     return not file
 
 
@@ -328,7 +343,7 @@ class NestedInDocument(Exception):
 
 
 async def _folder_for(
-    db: AsyncSession, user_id: int, segments: tuple[str, ...], cache: dict, created: list[int]
+    db: AsyncSession, user_id: int, names: _Names, segments: tuple[str, ...], created: list[int]
 ) -> int | None:
     """The folder row at this path, created when the shell made the directory — unless
     a segment is a document's: a folder under a document's name would share its
@@ -337,50 +352,17 @@ async def _folder_for(
     row of its own (§ The Trash). `created` collects the ids of the rows made here."""
     parent: int | None = None
     for segment in segments:
-        key = (parent, segment)
-        if key in cache:
-            parent = cache[key]
-            continue
-        taken = (
-            (
-                await db.execute(
-                    select(Document.name).where(
-                        Document.user_id == user_id,
-                        Document.folder_id.is_(None)
-                        if parent is None
-                        else Document.folder_id == parent,
-                        Document.trashed_at.is_(None),
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        if any(path_segment(name) == segment for name in taken):
+        if names.document(parent, segment):
             raise NestedInDocument(segment)
-        rows = (
-            (
-                await db.execute(
-                    select(Folder).where(
-                        Folder.user_id == user_id,
-                        Folder.parent_id.is_(None)
-                        if parent is None
-                        else Folder.parent_id == parent,
-                        Folder.trashed_at.is_(None),
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        match = next((row for row in rows if path_segment(row.name) == segment), None)
+        match = names.folder(parent, segment)
         if match is None:
-            match = Folder(user_id=user_id, parent_id=parent, name=segment_name(segment))
-            db.add(match)
+            folder = Folder(user_id=user_id, parent_id=parent, name=segment_name(segment))
+            db.add(folder)
             await db.flush()
-            created.append(match.id)
-        cache[key] = match.id
-        parent = match.id
+            names.add_folder(folder)
+            created.append(folder.id)
+            match = folder.id
+        parent = match
     return parent
 
 
@@ -463,6 +445,7 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
         for row in (await db.execute(select(Document).where(Document.user_id == user_id))).scalars()
         if row.trashed_at is None and (row.folder_id is None or row.folder_id not in trashed)
     }
+    names = _Names(by_id.values(), documents.values())
     # A document set aside by a delete whose rows survived (the process died between the
     # removal's revision and the rows' commit) goes back where its row says; an aside
     # that still holds one that could not go back is kept, the rest are swept.
@@ -474,7 +457,7 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
             row = documents.get(document_id)
             if row is not None:
                 targets[aside_dir] = document_relative_dir(
-                    await folder_names(db, user_id, row.folder_id), row.name
+                    [folder.name for folder in folder_chain(by_id, row.folder_id)], row.name
                 )
         if not targets:
             # No document metadata inside — a folder of shell-made files, a document whose
@@ -483,7 +466,7 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
             # (docs/workspace.md § Revisions). Without one, the sweep takes it.
             origin = await asyncio.to_thread(aside_origin, root, name)
             is_file = await asyncio.to_thread(safe_io.entry_kind, root, root / name) == "file"
-            if origin is not None and await _row_names(db, user_id, origin, file=is_file):
+            if origin is not None and _row_names(names, origin, file=is_file):
                 if await asyncio.to_thread(_restore_aside, root, Path(name), origin):
                     restored += 1
                 else:
@@ -515,29 +498,12 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
     seen: dict[int, int] = {}
     for entry in found:
         seen[entry.document_id] = seen.get(entry.document_id, 0) + 1
-    cache: dict = {}
     created: list[int] = []
-    # The names the folder rows hold at each parent, as segments: a document may not
-    # take a sibling folder's name, as on disk the two would be one directory.
-    folder_segments: dict[int | None, set[str]] = {}
-
-    async def taken_by_folders(parent: int | None) -> set[str]:
-        if parent not in folder_segments:
-            rows = await db.execute(
-                select(Folder.name).where(
-                    Folder.user_id == user_id,
-                    Folder.parent_id.is_(None) if parent is None else Folder.parent_id == parent,
-                    Folder.trashed_at.is_(None),
-                )
-            )
-            folder_segments[parent] = {path_segment(name) for name in rows.scalars()}
-        return folder_segments[parent]
-
     # Every directory that is not a document gets its row, a document in it or not: a
     # `mkdir` from the shell shows on the Files page (docs/workspace.md).
     for segments in folders:
         try:
-            await _folder_for(db, user_id, segments, cache, created)
+            await _folder_for(db, user_id, names, segments, created)
         except NestedInDocument as nested:
             logger.warning(
                 "reconcile for user %d: directory %s sits under document directory %s; "
@@ -546,26 +512,6 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
                 "/".join(segments),
                 nested,
             )
-    # The names the live document rows hold at each parent, as segments: a plain file
-    # under a document's name sits where its directory belongs, and is not a file of the
-    # library (docs/workspace.md § Files).
-    document_segments: dict[int | None, set[str]] = {}
-
-    async def taken_by_documents(parent: int | None) -> set[str]:
-        if parent not in document_segments:
-            rows = await db.execute(
-                select(Document.name).where(
-                    Document.user_id == user_id,
-                    Document.folder_id.is_(None)
-                    if parent is None
-                    else Document.folder_id == parent,
-                    Document.trashed_at.is_(None),
-                    Document.kind != FILE_KIND,
-                )
-            )
-            document_segments[parent] = {path_segment(name) for name in rows.scalars()}
-        return document_segments[parent]
-
     # A plain file directly in a folder is a file of the library (docs/workspace.md
     # § Files): its row is found by its place and name — a file carries no metadata with
     # an id — made when there is none, its size refreshed when there is one, and removed
@@ -576,7 +522,7 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
     for plain_file in plain:
         where = "/".join((*plain_file.folder_segments, plain_file.name))
         try:
-            folder_id = await _folder_for(db, user_id, plain_file.folder_segments, cache, created)
+            folder_id = await _folder_for(db, user_id, names, plain_file.folder_segments, created)
         except NestedInDocument as nested:
             logger.warning(
                 "reconcile for user %d: file %s sits under document directory %s; not recorded",
@@ -592,8 +538,10 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
                 row.size_bytes = plain_file.size
                 file_changes += 1
             continue
-        if plain_file.name in await taken_by_folders(folder_id) or plain_file.name in (
-            await taken_by_documents(folder_id)
+        # A plain file under a folder's or a document's name sits where that directory
+        # belongs, and is not a file of the library (docs/workspace.md § Files).
+        if names.folder(folder_id, plain_file.name) is not None or names.document(
+            folder_id, plain_file.name, file=False
         ):
             logger.warning(
                 "reconcile for user %d: file %s took a name a row holds there; not recorded",
@@ -601,17 +549,17 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
                 where,
             )
             continue
-        db.add(
-            Document(
-                user_id=user_id,
-                folder_id=folder_id,
-                job_id=None,
-                kind=FILE_KIND,
-                name=segment_name(plain_file.name)[:512],
-                media_type=file_media_type(plain_file.name),
-                size_bytes=plain_file.size,
-            )
+        added = Document(
+            user_id=user_id,
+            folder_id=folder_id,
+            job_id=None,
+            kind=FILE_KIND,
+            name=segment_name(plain_file.name)[:512],
+            media_type=file_media_type(plain_file.name),
+            size_bytes=plain_file.size,
         )
+        db.add(added)
+        names.add_document(added)
         file_changes += 1
     missing = [row for row in live_files.values() if row.id not in present]
     # A file whose bytes wait in the Trash — an entry of its own, or of a folder above
@@ -622,6 +570,7 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
     for row in missing:
         if row.id not in held:
             await db.delete(row)
+            names.remove_document(row)
             file_changes += 1
     updates: list[tuple[Document, int | None, str]] = []
     for entry in found:
@@ -637,7 +586,7 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
             )
             continue
         try:
-            folder_id = await _folder_for(db, user_id, entry.folder_segments, cache, created)
+            folder_id = await _folder_for(db, user_id, names, entry.folder_segments, created)
         except NestedInDocument as nested:
             logger.warning(
                 "reconcile for user %d: document %d sits under document directory %s; "
@@ -652,7 +601,9 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
         name = row.name if path_segment(row.name) == entry.name else segment_name(entry.name)
         if row.folder_id == folder_id and row.name == name:
             continue
-        if entry.name in await taken_by_folders(folder_id):
+        # A document may not take a sibling folder's name: on disk the two would be one
+        # directory.
+        if names.folder(folder_id, entry.name) is not None:
             logger.warning(
                 "reconcile for user %d: document %d took a folder's name %s; row unchanged",
                 user_id,
