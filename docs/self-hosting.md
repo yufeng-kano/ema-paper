@@ -231,10 +231,40 @@ How a saved value behaves:
 
 ## Keep it running
 
-- **Update:** `git pull`, then the same `docker compose -f … up -d --build` you started with. A changed Caddyfile also needs `docker compose -f … restart caddy` ([deployment.md](./deployment.md) § Release flow).
-- **An install, or a restored backup, from before the migration baseline** — its database on any revision other than `4449f68533c0` or a later one (`docker compose -f … exec api alembic current`) — updates twice:
+- **Update:** `git pull`, then the same `docker compose -f … up -d --build` you started with. A changed Caddyfile also needs `docker compose -f … restart caddy`. [deployment.md](./deployment.md) § Release flow has the rest:
+  - before the pull, the commit and the database revision to note and the dump to take;
+  - how to tell the update finished, the worker included;
+  - how to go back.
+- **An install whose containers are named `sightread-*`** runs compose files that name the project after the checkout directory, and its containers, its sandbox network and its VMs `sightread-*`. The current files name all of them `ema-paper` ([deployment.md](./deployment.md) § Compose files). Before its first update:
+  1. Read the old project's name, which prefixes its volumes: `docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' sightread-api`. Compose made it from the checkout directory's name, lowercased and stripped of every character other than `a-z`, `0-9`, `-` and `_`, so it can differ from what the directory is called.
+  2. Bring the old stack down, which keeps its volumes and stops the old runner, so no new VM starts: before the pull, `docker compose -f … down` with the files it was started with; after it, `docker compose -p <project> -f … down`. While VMs are attached to `sightread-sandbox`, `down` reports that network still in use.
+  3. Remove the VMs the old runner started, which the current runner never lists, then the old network if it is left: `docker ps -aq --filter 'name=^sightread-sandbox-[0-9]' | xargs -r docker rm -f`, then `docker network rm sightread-sandbox`.
+  4. If the project is not named `ema-paper`, the data is in the volumes `<project>_pgdata` and so on, and the current files mount `ema-paper_*`. Copy each into the volume of the same suffix:
+
+     ```bash
+     for v in pgdata uploads figures caddy_data caddy_config sandbox_egress; do
+       docker run --rm -v "<project>_$v:/from" -v "ema-paper_$v:/to" postgres:16 cp -a /from/. /to/
+     done
+     ```
+
+     - The `ema-paper_*` volumes must not exist yet (`docker volume ls`). One an `up` on the current files already made holds a new, empty database, and a copy into it mixes the two.
+     - Docker refuses to remove a volume a container still uses: first `docker compose -f … down` with the current files, which removes the `ema-paper-*` containers and keeps the volumes, then `docker volume rm` each `ema-paper_*` volume.
+     - Compose then warns that these volumes already exist and were not created by it, and uses them as they are.
+     - Restoring the newest backup stamp into the new stack instead brings back the database, the figures and the workspaces as of that stamp ([deployment.md](./deployment.md) § Backups).
+  5. The VM image and `.env`:
+     - Build the VM image under its current tag: `docker build -t ema-paper-sandbox deploy/sandbox-image`. An `.env` without a `SANDBOX_IMAGE` line takes that tag as its default, which an old host does not have, and every VM start fails until it is built.
+     - `SANDBOX_IMAGE=sightread-sandbox` keeps working, since that image stays on the host. Set `SANDBOX_IMAGE=ema-paper-sandbox`, so that a later rebuild, which these pages tag `ema-paper-sandbox`, takes effect.
+     - `SANDBOX_NETWORK=sightread-sandbox` becomes `SANDBOX_NETWORK=ema-paper-sandbox`.
+  6. Run the update: twice for a database from before the migration baseline (below).
+  7. With the sandbox network on, the new network has a new bridge: write its line into `/etc/sysctl.d/90-ema-paper-sandbox.conf` and delete `/etc/sysctl.d/90-sightread-sandbox.conf` ([sandbox.md](./sandbox.md) § Operations, *Turning the network on*).
+  8. Behind a front proxy, point the router at the alias `ema-paper-caddy`.
+- **An install, or a restored backup, from before the migration baseline** — its database on any revision other than `4449f68533c0` or a later one — updates twice:
   1. Once to commit `945b2e9`, the last release that carries the earlier migrations: `git checkout 945b2e9`, then the same `up -d --build`.
   2. Then back to the current release: `git checkout main && git pull`, then the same `up -d --build`.
+
+  Before `git pull`, `docker compose -f … exec api alembic current` prints the running database's revision. After it, the api restarts over and over and `exec` refuses it; `docker compose -f … run --rm --no-deps api alembic current` asks the new image instead, which answers *Can't locate revision* for such a database.
+
+  `--no-deps` starts no `pg`: the check reads a `pg` already running on the install's own volumes. An install whose containers are named `sightread-*` takes the revision noted before the pull ([deployment.md](./deployment.md) § Release flow), or finishes steps 1–5 above and starts `pg` alone first, `docker compose -f … up -d pg`.
 
   Started directly on the current release, the api stops at *Can't locate revision* and does not come up; nothing in the database is changed ([database.md](./database.md) § Migrations).
 - **Back up:** the `backup` service writes the database dump, the figure crops and every workspace into `./backups/<stamp>/` once a day and keeps the newest seven. Copy them off the server, and test a restore before you rely on it ([deployment.md](./deployment.md) § Compose files).

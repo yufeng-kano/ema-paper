@@ -424,6 +424,31 @@ On the server: `git pull && docker compose -f docker-compose.production.yaml up 
 
 - On hosts with a front proxy, append `-f docker-compose.only-container-network.yaml`, and keep appending it, since leaving it off republishes 80/443 and collides with whatever owns them.
 
+Before the pull:
+
+- Note what a rollback returns to: the commit, `git rev-parse HEAD`, and the database's revision, `docker compose -f docker-compose.production.yaml exec api alembic current` (same `-f` list). After the pull an api that cannot migrate restarts over and over, and `exec` refuses a restarting container.
+- Take a dump: `docker compose -f … exec -T backup sh -c 'pg_dump --format=custom --file=/backups/pre-$(date -u +%Y%m%dT%H%M%SZ).dump'`. The `backup` service's environment names the database, and its `/backups` is `./backups`. Rotation deletes only the `backups/[0-9]*/` stamp directories, so the file stays until it is removed by hand.
+- Start no update while a backup pass is dumping, which `docker compose -f … top backup` shows by listing a `pg_dump` process: the dump holds a lock on every table, and the migrations wait behind it.
+- A `backups/.tmp-<stamp>` directory is the staging directory of a pass that is running or of one a stop cut short. Nothing removes one left by a stopped pass: delete it by hand while `top backup` lists neither `pg_dump` nor `tar`.
+- An install whose containers are named `sightread-*` first moves its data to the current names ([self-hosting.md](./self-hosting.md) § Keep it running).
+
+The api runs `alembic upgrade head` as it starts (§ Compose files). `migrations/env.py` runs every revision of one upgrade in one transaction, so they commit together or not at all.
+
+The update has finished when `docker compose -f … ps -a` shows `api` *healthy* and `worker` *Up*.
+
+- The api's health check has a budget: an api still migrating about 210 s after its start (`start_period` 60 s, then 30 probes 5 s apart) turns unhealthy. `up` then exits with *dependency failed to start* and leaves the new worker created but not started, and no restart policy starts it.
+- Wait until `docker compose -f … ps api` shows the api *healthy*, then run the same `up -d` again, which starts the worker.
+
+Going back:
+
+- An `up` that failed inside the migration changed nothing in the database: check out the noted commit and run the same `up -d --build`.
+- After a migration that finished:
+  1. `docker compose -f … stop worker api`.
+  2. While the new checkout and its images are still in place, `docker compose -f … run --rm --no-deps api alembic downgrade <the noted revision>`.
+  3. `git checkout <the noted commit>`, then the same `up -d --build`. The next update starts with `git checkout main`.
+- A downgrade restores the structure only: a dropped column comes back empty, and a deleted row does not come back. A downgrade that could undo its change only by deleting rows a user made refuses while they exist ([database.md](./database.md) § Migrations).
+- The dump restores the data as it was before the update, without what was written since. In place of step 2, with `worker` and `api` stopped: `docker compose -f … exec -T backup sh -c 'dropdb "$PGDATABASE" && createdb "$PGDATABASE" && pg_restore -d "$PGDATABASE" /backups/pre-<stamp>.dump'`. The dump is at the noted revision, so no downgrade follows.
+
 The migration chain starts at the baseline `4449f68533c0` ([database.md](./database.md) § Migrations).
 
 - A database on an older revision — a server not updated since before the baseline, or a backup of one restored — is first updated once with commit `945b2e9`, the last release that carries the earlier revisions, and then with the current one.
