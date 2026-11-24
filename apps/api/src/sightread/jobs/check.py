@@ -152,7 +152,7 @@ async def run_check(
             raise CheckFailed("rate limited") from None
         except UpstreamError as exc:
             if exc.fatal:
-                raise CheckFailed("the upstream rejected the stored key") from None
+                raise CheckFailed("the upstream rejected the operator's key") from None
             raise CheckFailed("upstream call failed") from exc
         # Billed whatever comes of it.
         await on_usage(completed)

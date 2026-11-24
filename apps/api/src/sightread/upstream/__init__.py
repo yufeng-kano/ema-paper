@@ -1,2 +1,3 @@
-"""Upstreams: `client.py` calls models (Kano Proxy or a provider connection), `kano.py`
-runs the Kano Proxy connect flow's calls (docs/project-structure.md)."""
+"""Upstreams: `client.py` makes the vision calls and reads the catalog, `anthropic.py` the
+chat and check agents' Messages API calls, both on the operator's Kano Proxy key
+(docs/project-structure.md)."""

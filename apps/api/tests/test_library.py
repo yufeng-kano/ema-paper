@@ -269,7 +269,7 @@ async def test_a_retried_upload_does_not_buy_a_second_parse(
 ) -> None:
     # The browser cannot tell a lost response from a lost request, so it retries an upload
     # that may already have landed. The same bytes, still queued, must not become a second
-    # parse — that is the user's own key being spent twice for one document.
+    # parse — that is the user's credits being spent twice for one document.
     from sightread.workspace.documents import original_of
 
     first = (await _upload(library, documents)).json()

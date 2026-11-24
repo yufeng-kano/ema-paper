@@ -438,7 +438,7 @@ async def test_a_blocked_call_stays_billed_when_its_fallback_aborts_the_job(
 
     assert upstream.calls == [(MODEL, 1), (FALLBACK, 1)]
     row = await _row(library, uploaded["id"])
-    assert (row["status"], row["error"]) == ("failed", "the upstream rejected the stored key")
+    assert (row["status"], row["error"]) == ("failed", "the upstream rejected the operator's key")
     async with sessionmaker() as db:
         billed = (
             await db.execute(

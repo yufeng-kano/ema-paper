@@ -381,7 +381,7 @@ async def test_the_agent_joins_and_fixes_through_its_tools() -> None:
         (lambda: _turn([{"type": "text", "text": "I can't."}], "refusal"), "blocked"),
         (lambda: _turn([{"type": "text", "text": "Half an"}], "max_tokens"), "cut off"),
         (lambda: httpx.Response(402), "payment"),
-        (lambda: httpx.Response(401), "the upstream rejected the stored key"),
+        (lambda: httpx.Response(401), "the upstream rejected the operator's key"),
         (lambda: httpx.Response(400), "upstream call failed"),
     ],
 )

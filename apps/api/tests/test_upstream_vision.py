@@ -70,7 +70,7 @@ async def test_transcribe_page_sends_the_image_and_records_usage(key, documents)
     parts = sent["messages"][0]["content"]
     assert parts[0]["text"] == "Transcribe page 7 in yxyx_norm1000."
     assert parts[1]["image_url"]["url"].startswith("data:image/png;base64,")
-    # The decrypted key only ever appears in the Authorization header.
+    # The operator's key only ever appears in the Authorization header.
     assert route.calls[0].request.headers["authorization"] == "Bearer sk-kano-proxy-test"
 
 

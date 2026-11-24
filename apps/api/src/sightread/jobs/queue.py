@@ -259,7 +259,7 @@ async def hold_dedup_key(db: AsyncSession, **key) -> None:
     """Serialize everything that would enqueue this exact parse, until this commit.
 
     Reading for an in-flight duplicate is not enough on its own: two uploads of the same
-    bytes can both find nothing and both enqueue, which is the user's key charged twice for
+    bytes can both find nothing and both enqueue, which charges the user's credits twice for
     one document. A transaction-level advisory lock closes that — the second request waits
     and then sees the first's committed job.
 
@@ -655,7 +655,7 @@ async def requeue_job(
     """Put an interrupted job back on the queue, keeping the pages it finished.
 
     The next attempt transcribes only the pages without a succeeded row — a page the
-    user's key already paid for is not transcribed again — and crops every page anew,
+    user's credits already paid for is not transcribed again — and crops every page anew,
     so the caller discards this attempt's crops (docs/jobs.md § Queue). False when the
     job was no longer `running` — its result committed before the cancel landed — and so
     stays as it is, its pages and crops with it; or, with `generation`, when the row no

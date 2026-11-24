@@ -95,7 +95,7 @@ def free_name(taken: set[str], name: str, limit: int) -> str:
     The stem gives up whatever room the suffix needs. A name already at the column's limit
     would otherwise grow past it, and PostgreSQL answers that with a truncation error — on
     an upload, after `submit_parse` has committed, so the parse would run and bill the
-    user's key while their request failed.
+    user's credits while their request failed.
     """
     if name not in taken:
         return name

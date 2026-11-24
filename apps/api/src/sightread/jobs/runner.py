@@ -1,7 +1,7 @@
 """Job execution: one document, page by page (docs/jobs.md, docs/parsing.md).
 
 This is the `parse` agent's runner (docs/agents.md). Shape of a run: read the job, resolve
-the user's key, work out the pages, then fan the pages out. Poppler work is bounded by the
+the upstream, work out the pages, then fan the pages out. Poppler work is bounded by the
 worker-wide render semaphore; upstream calls are bounded by this job's own vision budget,
 which halves itself when the upstream says 429.
 
@@ -327,7 +327,7 @@ async def _guarded_call(state: RunState, outcome: PageOutcome, model: str, call)
         return None
     except UpstreamError as exc:
         if exc.fatal:
-            raise JobAborted("the upstream rejected the stored key") from None
+            raise JobAborted("the upstream rejected the operator's key") from None
         # The message is a status code or a fixed phrase — never credentials or content.
         logger.warning("job %s page %d upstream call failed: %s", state.job_id, outcome.page, exc)
         outcome.error = "upstream call failed"
@@ -360,7 +360,7 @@ async def _transcribe(
         if index:
             # The blocked call is logged before the fallback is sent: a fallback that
             # aborts the job, or a cancel while it runs, ends the page before it is
-            # recorded, and must not take a call the user's key paid for with it.
+            # recorded, and must not take a call the user's credits paid for with it.
             await _to_the_end(_log_usage(sessionmaker, job, outcome.usage))
             outcome.usage.clear()
         outcome.error = None
@@ -413,7 +413,7 @@ async def _check_figures(
         outcome.figures = {}
         return
     # The transcription is billed before the raster work: a cancel landing in it ends the
-    # page before it is recorded, and must not take a call the user's key paid for.
+    # page before it is recorded, and must not take a call the user's credits paid for.
     await _to_the_end(_log_usage(sessionmaker, job, outcome.usage))
     outcome.usage.clear()
     ink = await asyncio.to_thread(PageInk, image)
@@ -711,7 +711,7 @@ async def _record_page(
     """Persist one finished page: its row, the job's progress and the calls it billed.
     The progress goes first, fenced on the generation: a row another worker has taken
     (this one lost the worker lock) gets no page from here — the other's pages are its
-    own — but the calls are logged whatever happened, since the user's key paid for
+    own — but the calls are logged whatever happened, since the user's credits paid for
     them (docs/jobs.md § Queue)."""
     async with sessionmaker() as db:
         owned = (
@@ -806,7 +806,7 @@ async def fail_job(
 ) -> None:
     """A job whose task raised past `run_job` (a database error while the terminal state
     was being written, say): failed, never requeued — the parse ran and billed the user's
-    key, and a fault of ours is no reason to run it again. A job no longer `running` (its
+    credits, and a fault of ours is no reason to run it again. A job no longer `running` (its
     result committed before what raised), or no longer this worker's (docs/jobs.md
     § Queue), is left as it is. With settings, like every other terminal path: a library
     row keeps its original here too."""

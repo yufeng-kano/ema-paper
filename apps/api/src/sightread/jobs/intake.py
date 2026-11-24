@@ -510,7 +510,7 @@ async def submit_parse(
                 )
             if active is not None:
                 # The same parse is already on its way, or just finished. Starting
-                # another would spend the user's key twice over for one document. A
+                # another would spend the user's credits twice over for one document. A
                 # caller that keeps originals keeps this fresh copy for its own row: the
                 # worker may finish and hand the job's upload to the rows that exist
                 # before this one does.

@@ -385,7 +385,7 @@ async def _chat_with_image(
             if response.status_code == 402:
                 raise PaymentRequired()
             if response.status_code in (401, 403):
-                raise UpstreamError("The upstream rejected the stored key", fatal=True)
+                raise UpstreamError("The upstream rejected the operator's key", fatal=True)
             if response.status_code >= 400:
                 raise UpstreamError(
                     f"The upstream returned {response.status_code}",

@@ -1,6 +1,6 @@
 """Credit arithmetic (docs/billing.md § Credits): what a parse and a turn cost, from the
 operator's list prices and the worth of one credit. Pure functions; the ledger that
-records the results is `billing.ledger` (a later step of docs/billing.md § Transition).
+records the results is `billing.ledger`.
 """
 
 from __future__ import annotations

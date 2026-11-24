@@ -2,8 +2,8 @@
 
 Streams `POST {base}/messages` over Kano Proxy's Anthropic-format route and turns the SSE
 events into content blocks the runner can act on and store verbatim. Like `client.py`, it
-is one of the two modules that ever decrypt a stored user key, and the plaintext never
-leaves the request it authorises. Errors map onto the same classes the vision client
+presents the operator's Kano Proxy key, and the key never leaves the request it
+authorises. Errors map onto the same classes the vision client
 raises so the runner's failure policy has one vocabulary.
 """
 
@@ -178,7 +178,7 @@ def _raise_for_status(response: httpx.Response) -> None:
     if response.status_code == 402:
         raise PaymentRequired()
     if response.status_code in (401, 403):
-        raise UpstreamError("The upstream rejected the stored key", fatal=True)
+        raise UpstreamError("The upstream rejected the operator's key", fatal=True)
     if response.status_code >= 400:
         raise UpstreamError(
             f"The upstream returned {response.status_code}",

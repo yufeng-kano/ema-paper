@@ -30,7 +30,7 @@ BASE_URL = "https://testserver"
 
 @pytest.fixture
 async def api_client(make_client, sessionmaker) -> AsyncClient:
-    """A client holding an API key and a connected Kano Proxy, exactly like REST tests."""
+    """A client holding an API key, exactly like REST tests."""
     return await _authorize(make_client(), sessionmaker)
 
 

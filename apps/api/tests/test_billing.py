@@ -102,7 +102,7 @@ def test_an_offered_model_without_a_price_refuses_to_start() -> None:
     assert settings.model_prices["gpt-6-luna"] == ModelPrice(
         Decimal("0.10"), Decimal("0.01"), Decimal("0.10"), Decimal("0.50")
     )
-    # Nothing offered, nothing required: the pre-transition deployment starts as before.
+    # Nothing offered, nothing required: a deployment that prices no model still starts.
     assert Settings().offered_models == set()
 
 
