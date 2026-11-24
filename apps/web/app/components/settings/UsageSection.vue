@@ -21,7 +21,7 @@ import {
   stopSandbox,
   type SandboxState,
 } from '~/lib/api'
-import { formatBytes, formatCount, formatDate, formatShortDateTime } from '~/lib/format'
+import { formatBytes, formatCount, formatDate, formatShortDateTime, formatTime } from '~/lib/format'
 
 const { t, locale } = useI18n()
 const { resolve } = useApiError()
@@ -172,7 +172,7 @@ watch([billing, sandbox], () => {
 })
 
 const updatedLabel = computed(() =>
-  updatedAt.value ? new Intl.DateTimeFormat(locale.value, { timeStyle: 'short' }).format(updatedAt.value) : '',
+  updatedAt.value ? formatTime(updatedAt.value, locale.value) : '',
 )
 
 /** The shell's balance follows the section's read, so the two never disagree. */

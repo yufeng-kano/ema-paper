@@ -29,7 +29,6 @@ type UsageRow = AdminUsageResponse['rows'][number]
 const { t, locale } = useI18n()
 const route = useRoute()
 const router = useRouter()
-const { explain } = useAdminFailure()
 
 /** Today's UTC day, read again with every read, so a page left open past midnight moves on. */
 const today = ref(utcDay(new Date()))
@@ -45,35 +44,12 @@ function choosePreset(days: number) {
 
 // --- the figures ---------------------------------------------------------------------------
 
-const data = shallowRef<AdminUsageResponse | null>(null)
-const pending = ref(false)
-const error = ref<string | null>(null)
-/** Only the newest read may write. */
-let seq = 0
+// A range the API refuses — backwards, too long — says why above the figures, in their place.
+const { data, pending, error, load: read } = useAdminRead(() => getAdminUsage(range.value), { clearOnError: true })
 
-async function load(): Promise<void> {
-  const mine = ++seq
+function load(): Promise<void> {
   today.value = utcDay(new Date())
-  pending.value = true
-  try {
-    const loaded = await getAdminUsage(range.value)
-    if (mine !== seq) {
-      return
-    }
-    data.value = loaded
-    error.value = null
-  } catch (failure) {
-    // A range the API refuses — backwards, too long — says why above the figures.
-    const message = await explain(failure)
-    if (mine === seq) {
-      data.value = null
-      error.value = message
-    }
-  } finally {
-    if (mine === seq) {
-      pending.value = false
-    }
-  }
+  return read()
 }
 
 onMounted(load)

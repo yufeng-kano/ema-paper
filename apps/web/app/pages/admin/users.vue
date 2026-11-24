@@ -4,7 +4,7 @@ definePageMeta({ middleware: ['authed', 'admin'], adminArea: 'users' })
 </script>
 
 <template>
-  <AdminPage area="users">
+  <AdminPage>
     <AdminUsers />
   </AdminPage>
 </template>

@@ -15,8 +15,8 @@ const props = withDefaults(defineProps<{ group?: AdminGroup | null }>(), { group
 const emit = defineEmits<{ close: []; saved: [group: AdminGroup]; gone: [] }>()
 
 const { t } = useI18n()
-const router = useRouter()
 const { explain } = useAdminFailure()
+const hold = useHeldRequest()
 
 const name = ref(props.group?.name ?? '')
 const pending = ref(false)
@@ -38,24 +38,18 @@ async function submit() {
   }
   pending.value = true
   error.value = null
-  // Back would close the dialog while the request runs, and its answer would land unseen.
-  const release = router.beforeEach(() => false)
-  let saved: AdminGroup | null = null
-  let failure: unknown = null
-  try {
-    saved = props.group
-      ? await updateAdminGroup(props.group.id, { name: trimmed.value })
-      : await createAdminGroup({ name: trimmed.value, permissions: [] })
-  } catch (caught) {
-    failure = caught
-  } finally {
-    release()
-  }
-  if (saved) {
+  const group = props.group
+  const result = await hold(() =>
+    group
+      ? updateAdminGroup(group.id, { name: trimmed.value })
+      : createAdminGroup({ name: trimmed.value, permissions: [] }),
+  )
+  if ('value' in result) {
     pending.value = false
-    emit('saved', saved)
+    emit('saved', result.value)
     return
   }
+  const { failure } = result
   const refusal = adminFailure(failure)
   if (refusal.kind === 'notFound' && props.group) {
     pending.value = false

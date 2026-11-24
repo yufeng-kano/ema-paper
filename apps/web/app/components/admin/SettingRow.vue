@@ -32,6 +32,7 @@ const props = defineProps<{
 const emit = defineEmits<{ edit: []; restore: [] }>()
 
 const { t, locale } = useI18n()
+const { personName } = useAdminLabels()
 
 const label = computed(() => t(`admin.settings.keys.${props.setting.key}`))
 const fromDatabase = computed(() => props.setting.source === 'database')
@@ -132,7 +133,7 @@ const changedBy = computed(() => {
     return null
   }
   return t('admin.settings.changedBy', {
-    name: by ? by.name?.trim() || t('admin.accountId', { id: by.id }) : t('admin.deletedAccount'),
+    name: by ? personName(by) : t('admin.deletedAccount'),
     date: formatDate(at, locale.value),
   })
 })

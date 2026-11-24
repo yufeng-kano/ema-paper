@@ -8,14 +8,13 @@
  * The filter and the page live in the route query (`?status=&page=`), so Back and a reload
  * return to them; nothing of the list is kept in browser storage.
  */
-import { listAdminJobs, requeueAdminJob, type AdminJob, type AdminJobsResponse } from '~/lib/api'
+import { listAdminJobs, requeueAdminJob, type AdminJob } from '~/lib/api'
 import {
   JOB_STATUSES,
-  adminFailure,
+  JOB_TONES,
   formatElapsed,
   jobStatusOf,
   pageOf,
-  requeueRefusalKey,
   type JobStatus,
 } from '~/lib/admin'
 import { formatCount, formatShortDateTime } from '~/lib/format'
@@ -23,19 +22,13 @@ import type { TableColumn } from '~/lib/table'
 
 const { t, locale } = useI18n()
 const route = useRoute()
-const router = useRouter()
 const { explain } = useAdminFailure()
 const adminConsole = useAdminConsole()
+const { setQuery, goToPage, withinPages } = useAdminQuery()
 
 const status = computed(() => jobStatusOf(route.query.status))
 const page = computed(() => pageOf(route.query.page))
 const canRequeue = computed(() => adminConsole.can('jobs', 'write'))
-
-/** Moves the query; a filter starts again at the first page. */
-function setQuery(patch: Record<string, string | null>, replace = false) {
-  const query = Object.fromEntries(Object.entries({ ...route.query, ...patch }).filter(([, value]) => value !== null))
-  void (replace ? router.replace({ query }) : router.push({ query }))
-}
 
 function chooseStatus(value: JobStatus | null) {
   if (value !== status.value) {
@@ -43,48 +36,20 @@ function chooseStatus(value: JobStatus | null) {
   }
 }
 
-function goToPage(next: number) {
-  setQuery({ page: next > 1 ? String(next) : null })
-}
-
 // --- the list ------------------------------------------------------------------------------
 
-const data = shallowRef<AdminJobsResponse | null>(null)
-const pending = ref(false)
-const error = ref<string | null>(null)
 /** When the list was read: what *created {duration} ago* counts to. */
 const readAt = ref(Date.now())
-/** Only the newest read may write. */
-let seq = 0
 
-async function load(): Promise<void> {
-  const mine = ++seq
-  pending.value = true
-  try {
-    const loaded = await listAdminJobs({ page: page.value, status: status.value ?? undefined })
-    if (mine !== seq) {
-      return
-    }
-    const last = Math.max(1, Math.ceil(loaded.total / loaded.page_size))
-    if (!loaded.items.length && page.value > last) {
-      // A page past the end — a link from a longer list: its last page instead.
-      setQuery({ page: last > 1 ? String(last) : null }, true)
-      return
-    }
-    data.value = loaded
-    readAt.value = Date.now()
-    error.value = null
-  } catch (failure) {
-    const message = await explain(failure)
-    if (mine === seq) {
-      error.value = message
-    }
-  } finally {
-    if (mine === seq) {
-      pending.value = false
-    }
-  }
-}
+const { data, pending, error, load } = useAdminRead(
+  () => listAdminJobs({ page: page.value, status: status.value ?? undefined }),
+  {
+    accept: (loaded) => withinPages(loaded, page.value),
+    onLoaded: () => {
+      readAt.value = Date.now()
+    },
+  },
+)
 
 onMounted(load)
 watch([status, page], () => void load())
@@ -128,13 +93,6 @@ const columns = computed<TableColumn<AdminJob>[]>(() => [
     ? [{ key: 'requeue', header: '', srHeader: t('admin.jobs.requeue'), align: 'end' as const, width: '7.5rem' }]
     : []),
 ])
-
-const TONES: Record<JobStatus, 'ok' | 'danger' | 'info' | 'neutral'> = {
-  queued: 'neutral',
-  running: 'info',
-  succeeded: 'ok',
-  failed: 'danger',
-}
 
 /** What follows a row's status: a queued job's age — from `created_at`, which a retry or
  *  a requeue keeps, so not how long it has waited — a running one's generation, or that it
@@ -188,9 +146,7 @@ async function confirmRequeue(): Promise<void> {
   } catch (failure) {
     // A refusal is said in the dialog; the list is read again behind it, so the row shows
     // what the job is now.
-    const refused = adminFailure(failure)
-    const key = refused.kind === 'conflict' ? requeueRefusalKey(refused.reason) : null
-    requeueError.value = key ? t(key) : await explain(failure, t('admin.jobs.gone'))
+    requeueError.value = await explain(failure, t('admin.jobs.gone'))
   } finally {
     requeuePending.value = false
   }
@@ -283,7 +239,7 @@ async function confirmRequeue(): Promise<void> {
         </template>
         <template #cell-status="{ row }">
           <span class="status">
-            <UiStatusDot :tone="TONES[row.status]" :label="t(`admin.jobs.statuses.${row.status}`)" />
+            <UiStatusDot :tone="JOB_TONES[row.status]" :label="t(`admin.jobs.statuses.${row.status}`)" />
             <span v-if="statusNote(row)" class="note" :class="{ stuck: row.stuck }">{{ statusNote(row) }}</span>
           </span>
         </template>
@@ -298,16 +254,7 @@ async function confirmRequeue(): Promise<void> {
         </template>
       </UiDataTable>
 
-      <footer v-if="data" class="foot">
-        <span>{{ t('admin.jobs.hint') }}</span>
-        <UiPager
-          v-if="data.total"
-          :page="data.page"
-          :page-size="data.page_size"
-          :total="data.total"
-          @update:page="goToPage"
-        />
-      </footer>
+      <AdminListFoot v-if="data" :hint="t('admin.jobs.hint')" :list="data" @page="goToPage" />
     </UiPanel>
 
     <!-- Asked first: a requeued job's failed and unfinished pages are paid for again. -->
@@ -377,17 +324,6 @@ async function confirmRequeue(): Promise<void> {
 
 .failure {
   max-width: 32ch;
-}
-
-.foot {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-2) var(--space-4);
-  padding: var(--space-3) var(--cell-x) 0;
-  color: var(--muted);
-  font-size: var(--text-xs);
 }
 
 .message {

@@ -18,14 +18,11 @@ import {
   type AdminGroup,
   type AdminUser,
   type AdminUserDetail,
-  type AdminUsersResponse,
 } from '~/lib/api'
-import { adminFailure, canManageMembers, idOf, pageOf, planLabel } from '~/lib/admin'
+import { adminFailure, canManageMembers, idOf, nameOrEmail, pageOf, planLabel } from '~/lib/admin'
 import { formatBytes, formatCount, formatDate } from '~/lib/format'
 import type { TableColumn } from '~/lib/table'
 
-/** How long typing rests before the search runs. */
-const SEARCH_DELAY_MS = 300
 /** The longest search the field takes: an address is at most 320 characters. */
 const SEARCH_MAX = 320
 /** Free's id, the API's own plan: every other is a `planId` of `KANO_PAY_PLANS_JSON`. */
@@ -33,9 +30,10 @@ const FREE_PLAN = 'free'
 
 const { t, locale } = useI18n()
 const route = useRoute()
-const router = useRouter()
 const adminConsole = useAdminConsole()
 const { explain } = useAdminFailure()
+const { planLine } = useAdminLabels()
+const { setQuery, goToPage, withinPages } = useAdminQuery()
 
 const held = adminConsole.permissions
 const canWrite = computed(() => adminConsole.can('users', 'write'))
@@ -46,20 +44,10 @@ const q = computed(() => (typeof route.query.q === 'string' ? route.query.q.trim
 const page = computed(() => pageOf(route.query.page))
 const chosenId = computed(() => idOf(route.query.user))
 
-/** Moves the query; a filter or a search starts again at the first page. */
-function setQuery(patch: Record<string, string | null>, replace = false) {
-  const query = Object.fromEntries(Object.entries({ ...route.query, ...patch }).filter(([, value]) => value !== null))
-  void (replace ? router.replace({ query }) : router.push({ query }))
-}
-
 function choosePlan(value: string | null) {
   if (value !== plan.value) {
     setQuery({ plan: value, page: null })
   }
-}
-
-function goToPage(next: number) {
-  setQuery({ page: next > 1 ? String(next) : null })
 }
 
 function choose(id: number) {
@@ -68,73 +56,26 @@ function choose(id: number) {
   }
 }
 
-// --- the search, typed ahead of the query ------------------------------------------------
-
-const search = ref(q.value)
-let searchTimer: ReturnType<typeof setTimeout> | undefined
-
-watch(search, (value) => {
-  clearTimeout(searchTimer)
-  searchTimer = setTimeout(() => {
-    const next = value.trim()
-    if (next !== q.value) {
-      setQuery({ q: next || null, page: null }, true)
-    }
-  }, SEARCH_DELAY_MS)
-})
-
-// Back and Forward move the query under the field: the field follows.
-watch(q, (value) => {
-  if (value !== search.value.trim()) {
-    search.value = value
-  }
-})
-
-onBeforeUnmount(() => clearTimeout(searchTimer))
+const search = useQuerySearch(q, setQuery)
 
 // --- the list ----------------------------------------------------------------------------
 
-const list = shallowRef<AdminUsersResponse | null>(null)
-const listPending = ref(false)
-const listError = ref<string | null>(null)
-/** Only the newest read may write. */
-let listSeq = 0
-
-async function loadList(): Promise<void> {
-  const mine = ++listSeq
-  listPending.value = true
-  try {
-    const loaded = await listAdminUsers({ page: page.value, plan: plan.value ?? undefined, q: q.value || undefined })
-    if (mine !== listSeq) {
-      return
+const {
+  data: list,
+  pending: listPending,
+  error: listError,
+  load: loadList,
+} = useAdminRead(() => listAdminUsers({ page: page.value, plan: plan.value ?? undefined, q: q.value || undefined }), {
+  accept: (loaded) => withinPages(loaded, page.value),
+  onError: (failure) => {
+    if (!(failure instanceof ApiRequestError && failure.status === 422 && plan.value !== null)) {
+      return false
     }
-    const last = Math.max(1, Math.ceil(loaded.total / loaded.page_size))
-    if (!loaded.items.length && page.value > last) {
-      // A page past the end — a link from a longer list: its last page instead, which the
-      // query's change reads.
-      setQuery({ page: last > 1 ? String(last) : null }, true)
-      return
-    }
-    list.value = loaded
-    listError.value = null
-  } catch (failure) {
-    if (failure instanceof ApiRequestError && failure.status === 422 && plan.value !== null) {
-      // A plan no longer configured — a link from before: every plan instead.
-      if (mine === listSeq) {
-        setQuery({ plan: null, page: null }, true)
-      }
-      return
-    }
-    const message = await explain(failure)
-    if (mine === listSeq) {
-      listError.value = message
-    }
-  } finally {
-    if (mine === listSeq) {
-      listPending.value = false
-    }
-  }
-}
+    // A plan no longer configured — a link from before: every plan instead.
+    setQuery({ plan: null, page: null }, true)
+    return true
+  },
+})
 
 watch([plan, q, page], () => {
   void loadList()
@@ -155,13 +96,6 @@ const headline = computed(() => {
 
 function planName(id: string): string {
   return id === FREE_PLAN ? t('admin.users.free') : planLabel(id)
-}
-
-/** The plan, and what pays for its period: *Free*, or *Pro · Subscription*. */
-function planLine(row: { id: string; source: string }): string {
-  return row.source === 'subscription' || row.source === 'grant'
-    ? `${planLabel(row.id)} · ${t(`admin.users.paidBy.${row.source}`)}`
-    : planName(row.id)
 }
 
 const columns = computed<TableColumn<AdminUser>[]>(() => [
@@ -375,10 +309,7 @@ async function onAdded() {
             :caption="t('admin.users.title')"
           >
             <template #cell-user="{ row }">
-              <span class="person">
-                <span class="person-name cell-block">{{ row.name?.trim() || row.email }}</span>
-                <span v-if="row.name?.trim()" class="person-email cell-block">{{ row.email }}</span>
-              </span>
+              <AdminPersonCell :name="row.name" :email="row.email" />
             </template>
             <template #cell-plan="{ row }">{{ planLine(row.plan) }}</template>
             <template #cell-credits="{ row }">{{ formatCount(row.credits_available, locale) }}</template>
@@ -396,7 +327,7 @@ async function onAdded() {
           </footer>
         </div>
 
-        <aside class="chosen" :aria-label="shown ? (shown.user.name?.trim() || shown.user.email) : undefined">
+        <aside class="chosen" :aria-label="shown ? nameOrEmail(shown.user) : undefined">
           <UiBanner v-if="detailError" tone="error">
             {{ detailError }}
             <template #actions>
@@ -471,22 +402,6 @@ async function onAdded() {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   min-width: 0;
-}
-
-.person {
-  display: grid;
-  min-width: 0;
-  padding: 6px 0;
-  line-height: 1.35;
-}
-
-.person-name {
-  font-weight: var(--weight-medium);
-}
-
-.person-email {
-  color: var(--muted);
-  font-size: var(--text-xs);
 }
 
 /* A row chooses its account: the pointer says so, the keyboard reaches it, and the chosen

@@ -25,6 +25,8 @@ const props = withDefaults(
   defineProps<{
     /** The dialog's accessible name. Also the visible title unless the `title` slot fills it. */
     title: string
+    /** One muted line under the visible title — whom or what the dialog is about. */
+    subtitle?: string
     /** `wide` is a form around one long text — a prompt, a skill's body. */
     size?: 'sm' | 'md' | 'wide' | 'lg' | 'full'
     /** Fixed-height grid body — for a dialog whose content owns its own scroll regions. */
@@ -65,7 +67,7 @@ const props = withDefaults(
      */
     above?: boolean
   }>(),
-  { size: 'sm', backLabel: undefined },
+  { size: 'sm', subtitle: undefined, backLabel: undefined },
 )
 
 const emit = defineEmits<{ close: [] }>()
@@ -222,6 +224,7 @@ onBeforeUnmount(() => {
           <div class="panel-heading">
             <slot name="title">
               <h2 class="panel-title">{{ title }}</h2>
+              <p v-if="subtitle" class="panel-subtitle">{{ subtitle }}</p>
             </slot>
           </div>
           <div class="panel-actions">
@@ -427,6 +430,14 @@ onBeforeUnmount(() => {
   font-size: var(--display-xs);
   font-weight: var(--weight-semibold);
   letter-spacing: var(--tracking-heading);
+}
+
+/* Wraps anywhere: it can be an address or a batch's long label. */
+.panel-subtitle {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
 }
 
 .panel-actions {

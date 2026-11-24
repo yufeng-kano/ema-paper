@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { formatBytes, formatDate, formatMinorAmount, packValidity } from './format'
+import { formatBytes, formatDate, formatMinorAmount, formatTime, packValidity } from './format'
 
 describe('formatBytes', () => {
   it('steps by 1000, as the unit names Intl prints do', () => {
@@ -23,6 +23,15 @@ describe('formatMinorAmount', () => {
 describe('formatDate', () => {
   it('is the day alone, in the locale', () => {
     expect(formatDate('2026-11-01T12:00:00Z', 'en')).toMatch(/Nov 1, 2026/)
+  })
+})
+
+describe('formatTime', () => {
+  it('is the time of day alone, in the locale, from a date, a timestamp or an ISO string', () => {
+    const at = new Date(2026, 10, 1, 14, 5)
+    expect(formatTime(at, 'en')).toMatch(/^2:05\sPM$/)
+    expect(formatTime(at.getTime(), 'en')).toBe(formatTime(at, 'en'))
+    expect(formatTime(at.toISOString(), 'en')).toBe(formatTime(at, 'en'))
   })
 })
 

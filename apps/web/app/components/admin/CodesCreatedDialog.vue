@@ -15,14 +15,13 @@ const props = defineProps<{ created: AdminCodesCreated }>()
 const emit = defineEmits<{ close: [] }>()
 
 const { t, locale } = useI18n()
+const { grantLabel } = useAdminLabels()
 const router = useRouter()
 
 // A reload or a closed tab would take the codes away: the browser asks first. Registered
 // before the build hold, so it is gone by the time that hold's release reloads after Done.
 function warnBeforeUnload(event: BeforeUnloadEvent) {
   event.preventDefault()
-  // What older browsers read instead of `preventDefault`.
-  event.returnValue = ''
 }
 onMounted(() => window.addEventListener('beforeunload', warnBeforeUnload))
 onBeforeUnmount(() => window.removeEventListener('beforeunload', warnBeforeUnload))
@@ -38,17 +37,9 @@ const lines = computed(() => props.created.codes.map((item) => item.code).join('
 /** The batch in a line: its label, what each code grants, its uses and its last day. */
 const subtitle = computed(() => {
   const created = props.created
-  const grant =
-    created.kind === 'credits'
-      ? t(
-          'admin.codes.grantCredits',
-          { credits: formatCount(created.credits ?? 0, locale.value), n: formatCount(created.valid_days ?? 0, locale.value) },
-          created.valid_days ?? 0,
-        )
-      : t('admin.codes.grantPlan', { n: formatCount(created.days ?? 0, locale.value), plan: created.plan_id ?? '' }, created.days ?? 0)
   return [
     created.label,
-    grant,
+    grantLabel(created),
     t('admin.codes.usesEach', { n: formatCount(created.max_uses, locale.value) }, created.max_uses),
     created.redeem_by ? `${t('admin.codes.redeemBy')} ${formatRedeemBy(created.redeem_by, locale.value)}` : '',
   ]
@@ -69,14 +60,12 @@ function download() {
 </script>
 
 <template>
-  <UiModal :title="t('admin.codes.createdTitle', { n: formatCount(count, locale) }, count)" size="md" persistent>
-    <template #title>
-      <div class="heading">
-        <h2 class="heading-title">{{ t('admin.codes.createdTitle', { n: formatCount(count, locale) }, count) }}</h2>
-        <p class="heading-sub">{{ subtitle }}</p>
-      </div>
-    </template>
-
+  <UiModal
+    :title="t('admin.codes.createdTitle', { n: formatCount(count, locale) }, count)"
+    :subtitle="subtitle"
+    size="md"
+    persistent
+  >
     <div class="body">
       <UiBanner tone="error">{{ t('admin.codes.createdWarning') }}</UiBanner>
       <div class="bar">
@@ -102,28 +91,6 @@ function download() {
 </template>
 
 <style scoped>
-.heading {
-  display: grid;
-  gap: 2px;
-  min-width: 0;
-}
-
-.heading-title {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: var(--display-xs);
-  font-weight: var(--weight-semibold);
-  letter-spacing: var(--tracking-heading);
-}
-
-.heading-sub {
-  color: var(--muted);
-  font-size: var(--text-xs);
-  overflow-wrap: anywhere;
-}
-
 .body {
   display: grid;
   gap: var(--space-3);

@@ -1,15 +1,14 @@
 import { describe, expect, it } from 'vitest'
 import en from '../../i18n/locales/en'
-import zhTW from '../../i18n/locales/zh-TW'
 import {
   ADMIN_AREAS,
   AUDIT_FILTER_AREAS,
+  CONFLICT_KEYS,
   CONSOLE_PAGES,
   IMPACT_KINDS,
   SETTING_GROUPS,
   addDays,
   adminFailure,
-  areaOf,
   auditAreaOf,
   can,
   canDeleteGroup,
@@ -21,45 +20,50 @@ import {
   CODES_CSV_COLUMNS,
   codesCsv,
   conflictKey,
-  consoleDestination,
   editableText,
   costDays,
   dayOf,
   daysOf,
   daysUntil,
-  firstReadableArea,
+  firstReadablePath,
   formatElapsed,
   formatRedeemBy,
   formatUsd,
   formatUtcDay,
-  grantNumber,
   hostEntries,
   idOf,
   impactLines,
+  INT32_MAX,
   isGroupName,
   isHostsSetting,
   isJsonSetting,
+  JOB_STATUSES,
   jobStatusOf,
+  nameOrEmail,
   navEntries,
   packRows,
   pageOf,
-  PAGE_MAX,
+  pastLastPage,
   planLabel,
   planRows,
   priceRows,
   settingImpact,
   presetOf,
   presetRange,
-  requeueRefusalKey,
   toggledPermissions,
   usageRangeOf,
   utcDay,
-  visibleAreas,
+  wholeNumberOf,
 } from './admin'
 import { ApiRequestError } from './api'
 
 /** The API's `ALL_PERMISSIONS`, as `GET /api/admin/groups` sends it. */
 const ALL = ADMIN_AREAS.flatMap((area) => area.levels.map((level) => `${area.key}.${level}`))
+
+/** The English catalog's entry at a dotted path. The catalogs hold the same keys, every one a
+ *  string (catalog.test.ts), so an English word is a Traditional Chinese one too. */
+const word = (path: string): unknown =>
+  path.split('.').reduce<unknown>((node, key) => (node as Record<string, unknown> | undefined)?.[key], en)
 
 describe('the areas', () => {
   it("list the API's permissions in its order, audit with a read only", () => {
@@ -91,11 +95,6 @@ describe('what a permission list shows', () => {
     expect(can([], 'audit', 'read')).toBe(false)
   })
 
-  it('shows the areas it can read, in area order', () => {
-    expect(visibleAreas(['audit.read', 'codes.read', 'codes.write'])).toEqual(['codes', 'audit'])
-    expect(visibleAreas(['users.write'])).toEqual([])
-  })
-
   it("lists only the console pages whose area it can read, in nav order", () => {
     expect(navEntries(ALL).map((page) => page.path)).toEqual([
       '/admin',
@@ -112,41 +111,23 @@ describe('what a permission list shows', () => {
     expect(navEntries(['codes.read']).map((page) => page.path)).toEqual(['/admin/codes'])
   })
 
-  it('sends /admin to the first page it can read', () => {
-    expect(firstReadableArea(ALL)?.path).toBe('/admin')
-    expect(firstReadableArea(['audit.read'])?.path).toBe('/admin/audit')
-    expect(consoleDestination(['audit.read', 'groups.read'], null)).toBe('/admin/groups')
-  })
-
-  it('keeps a readable page, replaces an unreadable one, and finds nothing for no page', () => {
-    expect(consoleDestination(['audit.read', 'groups.read'], 'audit')).toBe('/admin/audit')
-    expect(consoleDestination(['audit.read'], 'groups')).toBe('/admin/audit')
-    // An account in no group, and one holding a write alone (the API always adds its read).
-    expect(consoleDestination([], null)).toBeNull()
-    expect(consoleDestination(['users.write'], 'groups')).toBeNull()
-    expect(consoleDestination(['users.write', 'settings.read'], 'groups')).toBe('/admin/settings')
-    expect(consoleDestination(['codes.read', 'users.write'], 'groups')).toBe('/admin/codes')
-  })
-
-  it('opens /admin as the Overview with jobs.read, and sends anyone else on from it', () => {
-    // `/admin` is a `jobs` page: the middleware leaves it while `jobs.read` is held.
-    expect(consoleDestination(['jobs.read'], 'jobs')).toBe('/admin')
-    expect(consoleDestination(['jobs.read', 'groups.read'], 'groups')).toBe('/admin/groups')
-    // Without it, to the first page that can be read — never back to `/admin`.
-    expect(consoleDestination(['groups.read', 'audit.read'], 'jobs')).toBe('/admin/groups')
-    expect(consoleDestination(['jobs.write'], 'jobs')).toBeNull()
+  it('sends an unreadable page to the first page it can read, and finds nothing for no page', () => {
+    // `/admin` is the Overview, a `jobs` page: first with `jobs.read`, never without it.
+    expect(firstReadablePath(ALL)).toBe('/admin')
+    expect(firstReadablePath(['jobs.read', 'groups.read'])).toBe('/admin')
+    expect(firstReadablePath(['audit.read'])).toBe('/admin/audit')
+    expect(firstReadablePath(['groups.read', 'audit.read'])).toBe('/admin/groups')
+    expect(firstReadablePath(['codes.read', 'users.write'])).toBe('/admin/codes')
+    // An account in no group, and ones holding a write alone (the API always adds its read).
+    expect(firstReadablePath([])).toBeNull()
+    expect(firstReadablePath(['users.write'])).toBeNull()
+    expect(firstReadablePath(['jobs.write'])).toBeNull()
     // Overview, Jobs and Usage come before Groups, `jobs.read` alone showing all three.
     expect(navEntries(['jobs.read']).map((page) => [page.path, page.icon])).toEqual([
       ['/admin', 'layout-grid'],
       ['/admin/jobs', 'list-checks'],
       ['/admin/usage', 'dashboard'],
     ])
-  })
-
-  it("reads a page's area meta, and nothing else", () => {
-    expect(areaOf('groups')).toBe('groups')
-    expect(areaOf('owner')).toBeNull()
-    expect(areaOf(undefined)).toBeNull()
   })
 })
 
@@ -238,10 +219,20 @@ describe('the route query', () => {
   it('reads a page from 1, anything else as 1', () => {
     expect(pageOf('3')).toBe(3)
     // Past the API's bound: the bound, which the list then replaces with its last page.
-    expect(pageOf('3000000000')).toBe(PAGE_MAX)
+    expect(pageOf('3000000000')).toBe(INT32_MAX)
     for (const value of [undefined, '', '0', '-2', '1.5', 'x', ['2']]) {
       expect(pageOf(value)).toBe(1)
     }
+  })
+
+  it('names the last page of a list read past its end, and nothing for one within it', () => {
+    const empty = { items: [], total: 120, page_size: 50 }
+    expect(pastLastPage(empty, 7)).toBe(3)
+    expect(pastLastPage({ items: [], total: 0, page_size: 50 }, 2)).toBe(1)
+    // The last page itself, an empty list on its first page, and a page that has rows.
+    expect(pastLastPage(empty, 3)).toBeNull()
+    expect(pastLastPage({ items: [], total: 0, page_size: 50 }, 1)).toBeNull()
+    expect(pastLastPage({ items: [{}], total: 120, page_size: 50 }, 7)).toBeNull()
   })
 
   it('reads a group id, or none', () => {
@@ -258,16 +249,16 @@ describe('the route query', () => {
   })
 })
 
-describe("a grant's numbers", () => {
+describe("a dialog's whole numbers", () => {
   it('takes a whole number from 1 to the cap, typed with spaces around it', () => {
-    expect(grantNumber('500', 1000)).toBe(500)
-    expect(grantNumber(' 1000 ', 1000)).toBe(1000)
-    expect(grantNumber('1', 1)).toBe(1)
+    expect(wholeNumberOf('500', 1000)).toBe(500)
+    expect(wholeNumberOf(' 1000 ', 1000)).toBe(1000)
+    expect(wholeNumberOf('1', 1)).toBe(1)
   })
 
   it('refuses nothing, zero, a fraction, a sign, an exponent and anything past the cap', () => {
     for (const typed of ['', ' ', '0', '1.5', '-3', '+3', '1e3', '12a', '1001', '99999999999999999999']) {
-      expect(grantNumber(typed, 1000)).toBeNull()
+      expect(wholeNumberOf(typed, 1000)).toBeNull()
     }
   })
 })
@@ -294,7 +285,10 @@ describe('a failed console request', () => {
 
   it("words the reasons it knows and leaves the rest to the server's message", () => {
     expect(conflictKey('name_taken')).toBe('admin.conflicts.name_taken')
+    expect(conflictKey('not_stuck')).toBe('admin.jobs.refusals.not_stuck')
+    expect(conflictKey('plan_conflict')).toBe('admin.users.grant.planConflict')
     expect(conflictKey('something_new')).toBeNull()
+    expect(conflictKey('toString')).toBeNull()
     expect(conflictKey(null)).toBeNull()
   })
 })
@@ -304,6 +298,14 @@ describe('planLabel', () => {
     expect(planLabel('pro')).toBe('Pro')
     expect(planLabel('free')).toBe('Free')
     expect(planLabel('')).toBe('')
+  })
+})
+
+describe('nameOrEmail', () => {
+  it('names an account by its name, else by its address', () => {
+    expect(nameOrEmail({ name: ' Ada ', email: 'ada@example.com' })).toBe('Ada')
+    expect(nameOrEmail({ name: '  ', email: 'ada@example.com' })).toBe('ada@example.com')
+    expect(nameOrEmail({ name: null, email: 'ada@example.com' })).toBe('ada@example.com')
   })
 })
 
@@ -366,44 +368,20 @@ describe("a code's last day", () => {
 })
 
 describe('the console catalog', () => {
-  /** Every leaf key under an object, dotted. */
-  const keys = (node: unknown, prefix = ''): string[] =>
-    node && typeof node === 'object'
-      ? Object.entries(node).flatMap(([key, value]) => keys(value, prefix ? `${prefix}.${key}` : key))
-      : [prefix]
-
-  const lookup = (catalog: unknown, path: string): unknown =>
-    path.split('.').reduce<unknown>((node, key) => (node as Record<string, unknown> | undefined)?.[key], catalog)
-
-  it('has the same keys in English and Traditional Chinese', () => {
-    expect(keys(zhTW.admin).sort()).toEqual(keys(en.admin).sort())
-    expect(typeof zhTW.nav.admin).toBe('string')
-    expect(typeof en.nav.admin).toBe('string')
-  })
-
-  it("words every area, every level of it, every console page and every known conflict, in both", () => {
-    for (const catalog of [en, zhTW]) {
-      for (const area of ADMIN_AREAS) {
-        expect(typeof lookup(catalog, `admin.areas.${area.key}`)).toBe('string')
-        for (const level of area.levels) {
-          expect(typeof lookup(catalog, `admin.permissions.${area.key}.${level}`)).toBe('string')
-        }
-      }
-      for (const page of CONSOLE_PAGES) {
-        expect(typeof lookup(catalog, page.label)).toBe('string')
-      }
-      for (const reason of ['name_taken', 'builtin', 'last_owner', 'email_ambiguous', 'stale']) {
-        expect(typeof lookup(catalog, conflictKey(reason)!)).toBe('string')
+  it('words the nav entry, every area, every level of it, every console page and every known conflict', () => {
+    expect(typeof word('nav.admin')).toBe('string')
+    for (const area of ADMIN_AREAS) {
+      expect(typeof word(`admin.areas.${area.key}`)).toBe('string')
+      for (const level of area.levels) {
+        expect(typeof word(`admin.permissions.${area.key}.${level}`)).toBe('string')
       }
     }
-  })
-
-  it('writes no Simplified-only character in the Traditional Chinese console copy', () => {
-    const text = keys(zhTW.admin)
-      .map((key) => String(lookup(zhTW.admin, key)))
-      .join('')
-    // Simplified forms of characters this copy uses: 后台组权限录删设户证 …
-    expect(text).not.toMatch(/[后组权录删设户证们这个时为对应开关们]/)
+    for (const page of CONSOLE_PAGES) {
+      expect(typeof word(page.label)).toBe('string')
+    }
+    for (const key of CONFLICT_KEYS.values()) {
+      expect(typeof word(key)).toBe('string')
+    }
   })
 })
 
@@ -414,12 +392,6 @@ describe('jobs and usage', () => {
     for (const value of ['cancelled', '', undefined, ['failed']]) {
       expect(jobStatusOf(value)).toBeNull()
     }
-  })
-
-  it("words a requeue's refusals it knows, and leaves the rest to the server", () => {
-    expect(requeueRefusalKey('not_stuck')).toBe('admin.jobs.refusals.not_stuck')
-    expect(requeueRefusalKey('name_taken')).toBeNull()
-    expect(requeueRefusalKey(null)).toBeNull()
   })
 
   it('says how long in its largest whole unit', () => {
@@ -497,19 +469,12 @@ describe('jobs and usage', () => {
     ])
   })
 
-  it('words every job status and every requeue refusal, in both catalogs', () => {
-    const lookup = (catalog: unknown, path: string): unknown =>
-      path.split('.').reduce<unknown>((node, key) => (node as Record<string, unknown> | undefined)?.[key], catalog)
-    for (const catalog of [en, zhTW]) {
-      for (const status of ['queued', 'running', 'failed', 'succeeded']) {
-        expect(typeof lookup(catalog, `admin.jobs.statuses.${status}`)).toBe('string')
-      }
-      for (const reason of ['not_running', 'not_stuck', 'worker_unknown']) {
-        expect(typeof lookup(catalog, requeueRefusalKey(reason)!)).toBe('string')
-      }
-      expect(typeof lookup(catalog, 'admin.audit.actions.jobs.requeue')).toBe('string')
-      expect(typeof lookup(catalog, 'admin.audit.targets.job')).toBe('string')
+  it('words every job status', () => {
+    for (const status of JOB_STATUSES) {
+      expect(typeof word(`admin.jobs.statuses.${status}`)).toBe('string')
     }
+    expect(typeof word('admin.audit.actions.jobs.requeue')).toBe('string')
+    expect(typeof word('admin.audit.targets.job')).toBe('string')
   })
 })
 
@@ -610,27 +575,23 @@ describe('the settings page', () => {
     expect(settingImpact(new Error('offline'))).toBeNull()
   })
 
-  it('words every group, key, note and impact in both catalogs', () => {
-    const lookup = (catalog: unknown, path: string): unknown =>
-      path.split('.').reduce<unknown>((node, key) => (node as Record<string, unknown> | undefined)?.[key], catalog)
-    for (const catalog of [en, zhTW]) {
-      for (const group of SETTING_GROUPS) {
-        expect(typeof lookup(catalog, `admin.settings.groups.${group.key}`)).toBe('string')
-        for (const key of group.settings) {
-          expect(typeof lookup(catalog, `admin.settings.keys.${key}`)).toBe('string')
-          expect(typeof lookup(catalog, `admin.settings.notes.${key}`)).toBe('string')
-        }
+  it('words every group, key, note and impact', () => {
+    for (const group of SETTING_GROUPS) {
+      expect(typeof word(`admin.settings.groups.${group.key}`)).toBe('string')
+      for (const key of group.settings) {
+        expect(typeof word(`admin.settings.keys.${key}`)).toBe('string')
+        expect(typeof word(`admin.settings.notes.${key}`)).toBe('string')
       }
-      for (const kind of IMPACT_KINDS) {
-        expect(typeof lookup(catalog, `admin.settings.impact.${kind}`)).toBe('string')
-      }
-      for (const line of ['none', 'off', 'hint']) {
-        expect(typeof lookup(catalog, `admin.settings.hosts.${line}`)).toBe('string')
-      }
-      for (const action of ['update', 'reset']) {
-        expect(typeof lookup(catalog, `admin.audit.actions.settings.${action}`)).toBe('string')
-      }
-      expect(typeof lookup(catalog, 'admin.audit.targets.setting')).toBe('string')
     }
+    for (const kind of IMPACT_KINDS) {
+      expect(typeof word(`admin.settings.impact.${kind}`)).toBe('string')
+    }
+    for (const line of ['none', 'off', 'hint']) {
+      expect(typeof word(`admin.settings.hosts.${line}`)).toBe('string')
+    }
+    for (const action of ['update', 'reset']) {
+      expect(typeof word(`admin.audit.actions.settings.${action}`)).toBe('string')
+    }
+    expect(typeof word('admin.audit.targets.setting')).toBe('string')
   })
 })

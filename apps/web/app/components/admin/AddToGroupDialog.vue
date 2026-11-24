@@ -6,6 +6,7 @@
  * A refusal stays in the dialog, which cannot be dismissed, nor left by Back, while it sends.
  */
 import { addAdminGroupMember, type AdminGroup, type AdminUserDetail } from '~/lib/api'
+import { nameOrEmail } from '~/lib/admin'
 
 const props = defineProps<{
   user: AdminUserDetail['user']
@@ -15,8 +16,8 @@ const props = defineProps<{
 const emit = defineEmits<{ close: []; added: [] }>()
 
 const { t } = useI18n()
-const router = useRouter()
 const { explain } = useAdminFailure()
+const hold = useHeldRequest()
 
 const groupId = ref(String(props.groups[0]?.id ?? ''))
 const pending = ref(false)
@@ -32,28 +33,20 @@ async function submit() {
   }
   pending.value = true
   error.value = null
-  const release = router.beforeEach(() => false)
-  let failure: unknown = null
-  try {
-    await addAdminGroupMember(Number(groupId.value), { user_id: props.user.id })
-  } catch (caught) {
-    failure = caught
-  } finally {
-    release()
-  }
-  if (!failure) {
+  const result = await hold(() => addAdminGroupMember(Number(groupId.value), { user_id: props.user.id }))
+  if ('value' in result) {
     pending.value = false
     emit('added')
     return
   }
-  error.value = await explain(failure, t('admin.users.addGroup.notFound'))
+  error.value = await explain(result.failure, t('admin.users.addGroup.notFound'))
   pending.value = false
 }
 </script>
 
 <template>
   <UiModal
-    :title="t('admin.users.addGroup.title', { name: user.name?.trim() || user.email })"
+    :title="t('admin.users.addGroup.title', { name: nameOrEmail(user) })"
     :busy="pending"
     @close="emit('close')"
   >

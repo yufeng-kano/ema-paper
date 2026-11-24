@@ -24,6 +24,11 @@ export function formatShortDateTime(iso: string, locale: string): string {
   }).format(at)
 }
 
+/** A time of day alone — when figures on screen were read — in the reader's own timezone. */
+export function formatTime(at: Date | string | number, locale: string): string {
+  return new Intl.DateTimeFormat(locale, { timeStyle: 'short' }).format(new Date(at))
+}
+
 /** A date alone — the day a period resets — in the reader's own timezone. */
 export function formatDate(iso: string, locale: string): string {
   return new Intl.DateTimeFormat(locale, { dateStyle: 'medium' }).format(new Date(iso))

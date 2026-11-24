@@ -11,20 +11,20 @@
  * 403 `permission_denied`) says the page's area is no longer readable, the page gives way to
  * the first one that is, or to the Not Found page when none is.
  */
-import { consoleDestination, type AdminArea } from '~/lib/admin'
+import { firstReadablePath } from '~/lib/admin'
 
-const props = defineProps<{ area: AdminArea }>()
-
+// The page's area is its `adminArea` meta, the one the `admin` middleware let it open on.
+const area = useRoute().meta.adminArea
 const localePath = useLocalePath()
 const adminConsole = useAdminConsole()
 const { reauthRequired, unavailable } = adminConsole
 
 watch(adminConsole.permissions, (held) => {
   // No answer at all is a sign-out on its way, not a loss of permissions.
-  if (!adminConsole.me.value || adminConsole.can(props.area, 'read')) {
+  if (!adminConsole.me.value || (area !== undefined && adminConsole.can(area, 'read'))) {
     return
   }
-  const destination = consoleDestination(held, props.area)
+  const destination = firstReadablePath(held)
   if (destination === null) {
     showError(createError({ status: 404, statusText: 'Page Not Found', fatal: true }))
   } else {

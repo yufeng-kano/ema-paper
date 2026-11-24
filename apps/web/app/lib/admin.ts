@@ -49,7 +49,7 @@ export interface ConsolePage {
 
 /**
  * The console's pages in nav order — the order the sidebar lists them and `/admin` picks the
- * first readable one from. Later steps add theirs in their places (docs/admin.md § Roadmap).
+ * first readable one from. A page added later takes its place here (docs/admin.md § Roadmap).
  */
 export const CONSOLE_PAGES: readonly ConsolePage[] = [
   // `/admin` itself is the Overview, `jobs.read`'s like Jobs and Usage (docs/admin.md § Pages).
@@ -68,41 +68,16 @@ export function can(permissions: readonly string[], area: AdminArea, level: Admi
   return permissions.includes(`${area}.${level}`)
 }
 
-/** The areas whose `read` the list holds, in area order. */
-export function visibleAreas(permissions: readonly string[]): AdminArea[] {
-  return ADMIN_AREAS.filter((area) => can(permissions, area.key, 'read')).map((area) => area.key)
-}
-
 /** The sidebar's console entries: the pages whose area the list can read. */
 export function navEntries(permissions: readonly string[]): ConsolePage[] {
   return CONSOLE_PAGES.filter((page) => can(permissions, page.area, 'read'))
 }
 
-/** The first console page, in nav order, whose area the list can read; null when it reads
- *  none — an account in no group, or only in groups that grant no `.read`. */
-export function firstReadableArea(permissions: readonly string[]): ConsolePage | null {
-  return navEntries(permissions)[0] ?? null
-}
-
-/** The area a page's `adminArea` meta names; null for anything else (`/admin` itself). */
-export function areaOf(value: unknown): AdminArea | null {
-  return ADMIN_AREAS.find((area) => area.key === value)?.key ?? null
-}
-
-/**
- * Where a visit to a console page lands (docs/admin.md § Pages): the area's first page when
- * its area is readable — the `admin` middleware then leaves the page where it is — else the
- * first readable page, and null — the Not Found page — when the account can read none. `/admin`
- * is the Overview, a `jobs` page, so an account without `jobs.read` is sent on from it; a page
- * with no area always is.
- */
-export function consoleDestination(permissions: readonly string[], area: AdminArea | null): string | null {
-  const first = firstReadableArea(permissions)
-  if (!first) {
-    return null
-  }
-  const own = area ? CONSOLE_PAGES.find((page) => page.area === area) : undefined
-  return own && can(permissions, own.area, 'read') ? own.path : first.path
+/** Where a console page the account cannot read sends it (docs/admin.md § Pages): the first
+ *  page, in nav order, whose area the list can read; null — the Not Found page — when it
+ *  reads none, an account in no group or only in groups that grant no `.read`. */
+export function firstReadablePath(permissions: readonly string[]): string | null {
+  return navEntries(permissions)[0]?.path ?? null
 }
 
 // --- groups ---------------------------------------------------------------------------
@@ -259,8 +234,9 @@ export function daysUntil(iso: string, now: Date): number {
 
 // --- the route query ------------------------------------------------------------------
 
-/** The highest `?page=` the API takes (docs/admin.md § Routes). */
-export const PAGE_MAX = 2 ** 31 - 1
+/** The database's integer: the highest `?page=` the API takes (docs/admin.md § Routes) and
+ *  the most a redeem code's numbers hold. */
+export const INT32_MAX = 2 ** 31 - 1
 
 /** A page number from the query: a whole number from 1, else 1. */
 export function pageOf(value: unknown): number {
@@ -268,7 +244,13 @@ export function pageOf(value: unknown): number {
   if (!Number.isSafeInteger(page) || page < 1) return 1
   // A page past the API's bound asks for the bound, which the list then replaces with its
   // last page, as for any page past the end.
-  return Math.min(page, PAGE_MAX)
+  return Math.min(page, INT32_MAX)
+}
+
+/** The last page of a list read past its end — a link from a longer list — else null. */
+export function pastLastPage(list: { items: readonly unknown[]; total: number; page_size: number }, page: number): number | null {
+  const last = Math.max(1, Math.ceil(list.total / list.page_size))
+  return !list.items.length && page > last ? last : null
 }
 
 /** A row id from the query (`?group=`): a positive whole number, else null. */
@@ -284,15 +266,22 @@ export function auditAreaOf(value: unknown): AdminArea | null {
 
 // --- users and grants -----------------------------------------------------------------
 
+/** An account as the console names it where its address is known: its name, else the
+ *  address. */
+export function nameOrEmail(account: { name: string | null; email: string }): string {
+  return account.name?.trim() || account.email
+}
+
 /** A plan's id as the console shows it (docs/admin.md § Users): its first letter upper-cased,
  *  the way the product writes its plan names — `pro` is *Pro*. */
 export function planLabel(id: string): string {
   return id.charAt(0).toUpperCase() + id.slice(1)
 }
 
-/** A grant's number as typed (docs/admin.md § Users and grants): a whole number from 1 to
- *  `max`, the API's cap, else null — and the dialog's button stays off. */
-export function grantNumber(text: string, max: number): number | null {
+/** A number field's value as typed — a grant's, a redeem code's (docs/admin.md § Users and
+ *  grants, § Redeem codes): a whole number from 1 to `max`, the API's cap, else null — and
+ *  the dialog's button stays off. */
+export function wholeNumberOf(text: string, max: number): number | null {
   const typed = text.trim()
   const value = /^\d+$/.test(typed) ? Number(typed) : NaN
   return Number.isSafeInteger(value) && value >= 1 && value <= max ? value : null
@@ -338,13 +327,23 @@ export function adminFailure(error: unknown): AdminFailure {
   return { kind: 'other' }
 }
 
-/** The reasons this step's `admin_conflict` names; a page says any other in the server's
- *  words (docs/admin.md § Refusals). */
-const CONFLICT_REASONS = ['name_taken', 'builtin', 'last_owner', 'email_ambiguous', 'stale'] as const
+/** The catalog key of each `admin_conflict` reason the catalog words; a page says any other
+ *  in the server's words (docs/admin.md § Refusals). */
+export const CONFLICT_KEYS: ReadonlyMap<string, string> = new Map([
+  ['name_taken', 'admin.conflicts.name_taken'],
+  ['builtin', 'admin.conflicts.builtin'],
+  ['last_owner', 'admin.conflicts.last_owner'],
+  ['email_ambiguous', 'admin.conflicts.email_ambiguous'],
+  ['stale', 'admin.conflicts.stale'],
+  ['plan_conflict', 'admin.users.grant.planConflict'],
+  ['not_running', 'admin.jobs.refusals.not_running'],
+  ['not_stuck', 'admin.jobs.refusals.not_stuck'],
+  ['worker_unknown', 'admin.jobs.refusals.worker_unknown'],
+])
 
 /** The catalog key for a conflict's reason, or null for one the catalog does not word. */
 export function conflictKey(reason: string | null): string | null {
-  return CONFLICT_REASONS.find((known) => known === reason) ? `admin.conflicts.${reason}` : null
+  return reason === null ? null : (CONFLICT_KEYS.get(reason) ?? null)
 }
 
 // --- jobs and usage -------------------------------------------------------------------
@@ -354,17 +353,17 @@ export const JOB_STATUSES = ['queued', 'running', 'failed', 'succeeded'] as cons
 
 export type JobStatus = (typeof JOB_STATUSES)[number]
 
+/** A job status's dot, wherever the console lists jobs. */
+export const JOB_TONES: Record<JobStatus, 'ok' | 'danger' | 'info' | 'neutral'> = {
+  queued: 'neutral',
+  running: 'info',
+  succeeded: 'ok',
+  failed: 'danger',
+}
+
 /** The Jobs filter's status from the query (`?status=`): one of the four, else null (all). */
 export function jobStatusOf(value: unknown): JobStatus | null {
   return JOB_STATUSES.find((status) => status === value) ?? null
-}
-
-/** The reasons a requeue's `admin_conflict` names (docs/admin.md § Refusals). */
-const REQUEUE_REASONS = ['not_running', 'not_stuck', 'worker_unknown'] as const
-
-/** The catalog key for a requeue refusal's reason, or null for one the catalog does not word. */
-export function requeueRefusalKey(reason: string | null): string | null {
-  return REQUEUE_REASONS.find((known) => known === reason) ? `admin.jobs.refusals.${reason}` : null
 }
 
 /**
