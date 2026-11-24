@@ -383,7 +383,7 @@ async def test_a_retry_naming_no_model_never_runs_one_the_deployment_withdrew(
     if filed:
         job_id = (await _library_upload(api, documents["mixed_pdf"]))["job_id"]
     else:
-        job_id = (await _parse(api, documents["mixed_pdf"])).json()["job_id"]
+        job_id = (await v1_parse(api, documents["mixed_pdf"])).json()["job_id"]
     await _drain_queue(api, sessionmaker)
     async with sessionmaker() as db:
         await db.execute(
@@ -395,10 +395,10 @@ async def test_a_retry_naming_no_model_never_runs_one_the_deployment_withdrew(
 
     upstream.calls.clear()
     upstream.answers.clear()
-    retried = await _parse(api, documents["mixed_pdf"], retry="true")
+    retried = await v1_parse(api, documents["mixed_pdf"], retry="true")
     assert retried.status_code == 202, retried.text
     assert retried.json() == {"job_id": job_id, "status": "queued"}
-    job = await _job(sessionmaker, job_id)
+    job = await job_by_id(sessionmaker, job_id)
     assert (job.model, job.retry_model, job.fallback_model, job.check_model) == (
         "vendor/retired-model",
         MODEL,
@@ -407,4 +407,4 @@ async def test_a_retry_naming_no_model_never_runs_one_the_deployment_withdrew(
     )
     await _drain_queue(api, sessionmaker)
     assert upstream.calls == [(MODEL, 2)]
-    assert (await _job(sessionmaker, job_id)).status == "succeeded"
+    assert (await job_by_id(sessionmaker, job_id)).status == "succeeded"

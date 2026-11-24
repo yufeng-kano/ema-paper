@@ -554,9 +554,9 @@ async def test_a_retry_naming_no_model_never_runs_one_the_deployment_withdrew(
 
 @respx.mock
 async def test_a_retry_naming_no_model_keeps_the_jobs_own_while_it_is_offered(
-    make_client, tmp_path, sessionmaker, documents
+    make_client, sessionmaker, documents
 ) -> None:
-    library = await _with_fallback(make_client, tmp_path, FALLBACK, True)
+    library = await _with_fallback(make_client, FALLBACK, True)
     upstream = Upstream({(MODEL, 2): lambda: httpx.Response(400)})
     respx.post(KANO_CHAT_URL).mock(side_effect=upstream)
     uploaded = await _upload(library, documents["mixed_pdf"])
