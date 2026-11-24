@@ -1038,6 +1038,7 @@ A **subagent** is a helper the agent starts on one task — check pages 1–12 a
 - **What is kept.** None of its messages enter the conversation's history: what the agent's next request replays is the `subagent` call and its result.
   - The result is the subagent's final text. One that ends on the output limit or the call cap answers what it has with a note saying so; one that fails answers an error result.
   - The stored `tool_result` block also carries a `subagent` record the runner strips before the block goes upstream — `{name, model, steps: [{type: tool, id, name, input, is_error} | {type: note, text}], tool_calls, elapsed_ms}` — so a reloaded thread can draw what the subagent did.
+  - `steps` keeps at most the first 200 steps (`STEPS_MAX`, notes included); `tool_calls` is the run's true number of calls.
   - The `edit` events of its writes are replayed with the stream like the agent's own, and a step's `id` is what joins one to its diff card and the commit **Revert** undoes.
 
 ## Translation
@@ -1171,6 +1172,7 @@ The stored message is the record: an attached image is replayed like a page a to
 ### The event stream
 
 - The worker streams the turn into `chat_events`: `turn_start` (`{kind, instructions, memory_ids}`, § Memory, § Compaction), `text_delta`, `thinking`, `tool_use`, `tool_result`, `edit`, `memory` (§ Memory), `retry`, `turn_done`, `turn_error`.
+  - An `edit` event's data is `{path, commit, diff, tool_use_id}` (§ Edits and reverts); a shell revision's `path` is empty.
   - Events are numbered per conversation, and every frame's data also carries its `turn_id`.
   - Event sequence numbers are taken under the conversation's row lock, so two tools finishing together never collide.
   - Each event is announced with `pg_notify`.
@@ -1179,9 +1181,9 @@ The stored message is the record: an attached image is replayed like a page a to
   - A turn that starts while the stream is open is on that branch by construction.
 - **When the stream ends.** The events stream ends only once no turn of the conversation is unfinished (`finished_at` null), so a cancelled turn still winding down a tool call keeps the stream open until its terminal event. The conversation payload carries `finished_at` for the same reason, and the panel treats a turn as live by it, not by its status.
 - **No pooled connection while streaming.** The events route checks ownership and then releases its database connection before the response starts streaming: a tab holding a stream open for a whole turn must not hold one of the pool's connections with it.
-- **A subagent's events.** A subagent's own `thinking`, `tool_use`, `tool_result` and `retry` events carry `parent`, the id of the `subagent` call that started it.
+- **A subagent's events.** A subagent's own `thinking`, `tool_use`, `tool_result`, `edit` and `retry` events carry `parent`, the id of the `subagent` call that started it.
   - It streams no `text_delta`: its report arrives as that call's `tool_result`, whose data then also holds the `subagent` record (§ Subagents).
-  - A `retry` with a `parent` restarts that subagent's steps, never the turn's text.
+  - A `retry` with a `parent` restarts that subagent's current call, never the turn's text.
 - **A library tool's result.** A library tool's `tool_result` carries `library`, the undo record of what the call changed, when it changed something (§ Library conversations, *The library tools*).
 
 ### Usage and credits
@@ -1210,7 +1212,7 @@ The stored message is the record: an attached image is replayed like a page a to
 - The refusal is decided under the workspace lock first, then the rows, the order every mutation takes: a shell revision may have moved the document, and undoing that under a running turn would pull the path out from under it.
 - The thread's revert buttons wait for the turn to end.
 - **Reconciling before `edit`.** After a shell command that changed the tree, the runner reconciles the library *before* publishing the `edit` event, and before releasing the workspace lock it held across the command. So a read or a save waiting on that lock cannot materialize a fresh copy at the old path in between; it finds the document where the shell left it.
-- **Whether an `edit` is live.** The web app decides whether an `edit` is live — one the viewer must reload for — as the frame arrives, by whether the record still lists its turn as unfinished, not by the stream's state when the batch is folded in: an `edit` and the `turn_done` that follows it can land in one batch.
+- **Reloading for an `edit`.** Every `edit` frame, replayed ones included, makes the viewer reload its files, once per batch of frames ([web.md](./web.md) § The agent panel).
 
 ### Cancel, sends and deletion
 
@@ -1236,7 +1238,7 @@ The stored message is the record: an attached image is replayed like a page a to
 ### Stream failures
 
 - **An early close.** A streamed response that ends without its `message_stop` — the connection closed after a `stop_reason` arrived but before the message was complete — is an early close, retried as transient, never stored or acted on.
-- **A retry.** A model call that fails transiently is retried. The deltas of the abandoned attempt are already in the stream, so a `retry` event marks the restart and the thread shows only what came after it. The stored history never holds the abandoned attempt.
+- **A retry.** A model call that fails transiently is retried. The deltas of the abandoned attempt are already in the stream, so a `retry` event marks the restart. The thread drops what the abandoned attempt streamed — everything since that round's last tool result — and keeps the rounds before it. The stored history never holds the abandoned attempt.
 - **A line past the cap.** A stream line is refused the moment its end is found past `UPSTREAM_SSE_LINE_MAX_BYTES`, or when it outgrows the cap without an end, never held or yielded first.
 - **A broken stream.** A stream whose blocks arrive out of order, or whose deltas or stops name a block that never started, is refused as broken and the call fails, rather than an answer with pieces missing being stored as complete.
 - **An upstream error.** An error the upstream reports is stored on the turn by its type alone (`The upstream reported an error (rate_limit_error)`); the provider's message text, which may echo request content, is never kept or shown.

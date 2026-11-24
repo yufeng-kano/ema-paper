@@ -452,7 +452,6 @@ def _edit_sync(
         f"{command} applied to {vm_path}",
         edit={
             "path": vm_path,
-            "command": command,
             "commit": commit,
             "diff": truncate(diff, max_chars),
         },
@@ -644,7 +643,7 @@ def _commit_shell_sync(root: Path, command: str, author: str, *, max_chars: int)
     if commit is None:
         return None
     diff = git.show_commit(root, commit, max_chars * 4)
-    return {"path": "", "command": "bash", "commit": commit, "diff": truncate(diff, max_chars)}
+    return {"path": "", "commit": commit, "diff": truncate(diff, max_chars)}
 
 
 async def commit_shell_changes(

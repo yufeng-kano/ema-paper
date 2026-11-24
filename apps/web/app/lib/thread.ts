@@ -141,6 +141,8 @@ export interface SubagentView {
   report: string | null
   /** From the stored record; null while it runs. */
   elapsedMs: number | null
+  /** From the stored record: the run's true call count; null while it runs. */
+  toolCalls: number | null
 }
 
 export interface UserAttachment {
@@ -407,16 +409,24 @@ interface Outcome {
 /** One flat entry of a turn before its steps are grouped. */
 type Flat = ThreadItem | { kind: 'step'; item: StepItem }
 
-/** The events of a stream past its last restart: a retried call starts over, so what the
- *  abandoned attempt streamed is noise. A subagent's retry restarts only that subagent. */
+/** The events of one scope's stream past what an abandoned attempt streamed: a retried call
+ *  starts over, so its earlier output is noise. A call starts after its scope's last
+ *  `tool_result`, so a retry cuts back to there and keeps the rounds before it. A subagent's
+ *  retry restarts only that subagent's call. */
 function sinceRestart(events: ChatEvent[], parent: string | undefined): ChatEvent[] {
-  let restart = -1
-  events.forEach((event, index) => {
+  const kept: ChatEvent[] = []
+  let attempt = 0
+  for (const event of events) {
     if (event.event === 'retry' && event.parent === parent) {
-      restart = index
+      kept.length = attempt
+      continue
     }
-  })
-  return restart === -1 ? events : events.slice(restart + 1)
+    kept.push(event)
+    if (event.event === 'tool_result') {
+      attempt = kept.length
+    }
+  }
+  return kept
 }
 
 function parentOf(event: ChatEvent): string | undefined {
@@ -601,6 +611,7 @@ export function buildThread(input: ThreadInput): Thread {
         steps,
         report: outcome ? outcome.output : null,
         elapsedMs: record?.elapsed_ms ?? null,
+        toolCalls: record?.tool_calls ?? null,
       }
     }
 

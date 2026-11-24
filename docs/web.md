@@ -2086,7 +2086,7 @@ The agent panel is the `chat` agent's thread about this document ([chat.md](./ch
 
 **Subagent cards.** A `subagent` call is a **subagent card** rather than a step.
 
-- It has the card's border and shows the subagent's name in mono, its task, then how many steps it has taken, how long it has run and what it does now (live) or what it reported (done).
+- It has the card's border and shows the subagent's name in mono, its task, then how many steps it has taken (once stored, the record's `tool_calls`), how long it has run and what it does now (live) or what it reported (done).
 - How long it has run is live, counted from when the panel first saw it start, since events carry no time; once stored, it is the record's `elapsed_ms`.
 - It starts closed, running or not: a turn of thirteen translators is thirteen lines, not thirteen step lists.
 - A click opens its own steps — from the `parent` events while it runs, from the result's `subagent` record once stored — and the report it returned.

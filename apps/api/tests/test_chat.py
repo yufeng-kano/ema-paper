@@ -585,7 +585,7 @@ async def test_a_shell_change_becomes_its_own_revision(tmp_path) -> None:
         max_chars=2000,
     )
     assert committed.edit is not None
-    assert committed.edit["command"] == "bash"
+    assert committed.edit["path"] == "" and committed.edit["commit"]
     assert "+from the shell" in committed.edit["diff"]
     assert git.log(root)[0].message == "bash: echo 'from the shell' > files/made-by-bash.md"
     # A command that changed nothing adds no revision.
@@ -2749,3 +2749,28 @@ async def test_a_subagents_retry_is_not_made_once_the_allowance_is_used(monkeypa
     spent, attempts = False, 0
     assert await chat_runner._call_model(ctx, {}) == "answered"
     assert attempts == 2
+
+
+async def test_the_event_stream_closes_its_listener_when_its_first_read_fails(monkeypatch) -> None:
+    """The conversation stream's LISTEN connection lives outside the pool: a first read that
+    fails, or a client gone before the first frame, still closes it."""
+    from sightread.jobs import chat_events
+
+    closed: list[bool] = []
+
+    class Listener:
+        async def close(self) -> None:
+            closed.append(True)
+
+    async def open_listener(*args, **kwargs):
+        return Listener()
+
+    async def shown_branch(sessionmaker, conversation_id):
+        raise RuntimeError("the database went away")
+
+    monkeypatch.setattr(chat_events, "open_listener", open_listener)
+    monkeypatch.setattr(chat_events, "_shown_branch", shown_branch)
+    stream = chat_events.stream_conversation_events(None, "postgresql://unused", 1, 0)
+    with pytest.raises(RuntimeError):
+        await anext(stream)
+    assert closed == [True]

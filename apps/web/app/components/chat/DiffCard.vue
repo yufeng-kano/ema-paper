@@ -38,7 +38,7 @@ const ownFile = computed(() => labels.ownFile(props.card.path))
       <span class="card-state">
         {{ state.reverted ? t('chat.reverted') : t('chat.applied') }}
         <span v-if="ownFile" class="card-file">· {{ ownFile }}</span>
-        <span v-else class="mono card-path">· {{ basename(card.path) }}</span>
+        <span v-else-if="card.path" class="mono card-path">· {{ basename(card.path) }}</span>
       </span>
       <button
         v-if="card.commit && !labels.library"

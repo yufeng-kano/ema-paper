@@ -1049,9 +1049,9 @@ async def _call_model(
             if attempt == MAX_ATTEMPTS - 1:
                 raise
             await _backoff(ctx, exc.retry_after or BACKOFF_BASE_SECONDS * (2**attempt))
-            # What the failed attempt streamed is already out: the thread starts over
-            # from here — a subagent's steps only, for a call of one (docs/chat.md
-            # § Conversations, turns, events).
+            # What the failed attempt streamed is already out: the thread drops it and
+            # keeps the rounds before it — a subagent's only, for a call of one
+            # (docs/chat.md § Conversations, turns, events).
             await _emit(ctx, chat_events.RETRY, _with_parent({}, parent))
         except UpstreamError as exc:
             if attempt == MAX_ATTEMPTS - 1 or not exc.transient:

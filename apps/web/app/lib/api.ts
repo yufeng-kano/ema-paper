@@ -641,7 +641,7 @@ export interface ChatMessage {
   created_at: string
 }
 
-type TurnStatus = 'queued' | 'running' | 'done' | 'failed' | 'cancelled' | string
+type TurnStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | string
 
 /** A user message's turn, or a compaction the reader asked for or the worker ran on its
  *  own (docs/chat.md § Compaction). */
@@ -710,11 +710,12 @@ type ChatEventData =
     }
   | {
       event: 'edit'
+      /** The workspace path of the file the write changed; empty for a shell revision. */
       path: string
-      command: string
       commit: string
       diff: string
       tool_use_id: string
+      parent?: string
     }
   | {
       event: 'memory'

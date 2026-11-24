@@ -139,8 +139,8 @@ export function useConversationStream(
     connect()
   }
 
-  /** Come back from the last seen sequence after the stream gave up and the record said
-   *  the turn is still going: the retry budget starts over. */
+  /** Come back from the last seen sequence after the stream gave up and the record could
+   *  not be read, while the last one read lists a live turn: the retry budget starts over. */
   function resume() {
     if (conversationId === null) {
       return

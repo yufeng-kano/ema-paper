@@ -118,7 +118,8 @@ import {
 import type { DragCardControls } from '~/components/DragCard.vue'
 import { libraryStepsKey } from '~/composables/useStepLabels'
 
-/** How long to wait before following a still-live turn again after the stream gave up. */
+/** How long to wait before trying the stream again after it gave up and the record could
+ *  not be read, while the last record read lists a live turn. */
 const RESUME_AFTER_MS = 10_000
 
 /** How close to the thread's end counts as at it: the thread follows a live turn only
@@ -853,16 +854,18 @@ const stream = useConversationStream(
     }
   },
   () => {
-    // Six silent drops: the record decides. A turn it still lists as live is waited on
-    // again — a fresh retry budget after a pause, until the record says it ended.
+    // Six silent drops: the record decides. A turn it still lists as live is followed
+    // again at once by the read itself (expectTurn reconnects with a fresh retry budget).
+    // Only a read that failed leaves the stream down: then, unless something else has
+    // reopened it meanwhile, the panel tries again after a pause.
     const id = currentId.value
     if (id === null) {
       return
     }
     void loadDetail(id).then(() => {
-      if (currentId.value === id && turns.value.some(isLive)) {
+      if (currentId.value === id && !stream.active.value && turns.value.some(isLive)) {
         setTimeout(() => {
-          if (currentId.value === id) {
+          if (currentId.value === id && !stream.active.value && turns.value.some(isLive)) {
             stream.resume()
           }
         }, RESUME_AFTER_MS)

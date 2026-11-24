@@ -159,14 +159,14 @@ async def stream_conversation_events(
     listener = await open_listener(
         database_url, channel_for(conversation_id), wakeup, "conversation"
     )
-    on_branch, opened_at = await _shown_branch(sessionmaker, conversation_id)
-    cursor = after
-    silent_for = 0.0
-
-    def shown(row: ChatEvent) -> bool:
-        return row.seq > opened_at or row.turn_id in on_branch
-
     try:
+        on_branch, opened_at = await _shown_branch(sessionmaker, conversation_id)
+        cursor = after
+        silent_for = 0.0
+
+        def shown(row: ChatEvent) -> bool:
+            return row.seq > opened_at or row.turn_id in on_branch
+
         while True:
             async for row in _replay(sessionmaker, conversation_id, cursor):
                 cursor = row.seq

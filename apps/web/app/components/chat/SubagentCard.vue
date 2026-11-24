@@ -33,7 +33,7 @@ const labels = useStepLabels()
 
 const meta = computed(() => {
   const { card } = props
-  const count = card.steps.filter((step) => step.type === 'tool').length
+  const count = card.toolCalls ?? card.steps.filter((step) => step.type === 'tool').length
   const parts = [t('chat.subagentSteps', { n: count }, count)]
   const elapsed =
     card.elapsedMs ?? (card.status === 'running' && props.startedAt !== null ? props.now - props.startedAt : null)
