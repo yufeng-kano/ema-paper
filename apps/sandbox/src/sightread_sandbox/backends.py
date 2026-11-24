@@ -571,11 +571,13 @@ class DockerBackend(Backend):
 
     async def ensure_running(self, sandbox: UserSandbox) -> None:
         sandbox.known_stopped = False
+        name = self.container(sandbox.user_id)
         if await self.is_running(sandbox.user_id):
             if sandbox.started_at is None:
-                sandbox.started_at = time.monotonic()
+                # Running, yet neither started to completion nor adopted here: a start
+                # whose `docker run` timed out and that the daemon finished after it.
+                await self._after_start(sandbox, name)
             return
-        name = self.container(sandbox.user_id)
         # A stopped container of a previous run is removed rather than restarted: the
         # image may have moved on, and nothing of value lives outside /workspace.
         settings = self.settings
@@ -639,7 +641,14 @@ class DockerBackend(Backend):
         if code != 0:
             logger.error("could not start sandbox for user %d: %s", sandbox.user_id, out.strip())
             raise RuntimeError("the sandbox VM could not be started")
-        if settings.sandbox_network != "none":
+        await self._after_start(sandbox, name)
+
+    async def _after_start(self, sandbox: UserSandbox, name: str) -> None:
+        """Check a VM just come up and make it usable: on the network, one that holds an
+        IPv6 address is removed and the start fails; then the VM counts as started and
+        gets its default environment (docs/sandbox.md § Network, § The image). Under the
+        sandbox lock, which `exec` holds around `ensure_running`."""
+        if self.settings.sandbox_network != "none":
             code, out = await _docker("exec", name, "/bin/sh", "-c", NO_IPV6, timeout=30)
             if code != 0:
                 # A VM whose kernel kept IPv6 could reach the host: never used. It goes

@@ -281,6 +281,56 @@ async def test_a_vm_whose_start_timed_out_is_swept_once_it_comes_up(tmp_path, do
     assert vm["state"] == "absent"
 
 
+async def test_a_vm_whose_start_timed_out_is_checked_once_it_comes_up(tmp_path, docker) -> None:
+    # The `docker run` CLI timed out, and the daemon brought the VM up after it: the next
+    # command finds it running, a VM this runner neither finished starting nor adopted.
+    vms: dict[str, dict[str, Any]] = {}
+
+    def answer(args: tuple[str, ...]) -> tuple[int, str] | None:
+        if args[0] == "run":
+            vms[args[args.index("--name") + 1]]["state"] = "running"
+            return 1, "docker timed out"
+        name = args[-1] if args[0] in ("rm", "inspect") else args[1]
+        vm = vms[name]
+        if args[0] == "rm":
+            vm["state"] = "absent"
+        if args[0] == "inspect" and vm["state"] != "absent":
+            return 0, "true\n"
+        if args[0] == "exec" and args[-1] == backends.NO_IPV6 and vm["ipv6"]:
+            return 1, ""
+        return None
+
+    docker.answer = answer
+    backend = DockerBackend(
+        docker_settings(tmp_path, sandbox_network="ema-paper-sandbox", sandbox_proxy_url=PROXY_URL)
+    )
+
+    def scripts(name: str) -> list[str]:
+        return [args[-1] for args in docker.args("exec") if args[1] == name]
+
+    for user_id, ipv6 in ((85, False), (86, True)):
+        name = f"ema-paper-sandbox-{user_id}"
+        vms[name] = {"state": "absent", "ipv6": ipv6}
+        sandbox = backend._user(user_id)
+        with pytest.raises(RuntimeError, match="could not be started"):
+            await backend.ensure_running(sandbox)
+        assert vms[name]["state"] == "running"
+        if not ipv6:
+            await backend.ensure_running(sandbox)
+            assert scripts(name) == [backends.NO_IPV6, DEFAULT_ENV]
+            assert sandbox.started_at is not None
+            # Checked once: the next command takes the VM as started.
+            await backend.ensure_running(sandbox)
+            assert scripts(name) == [backends.NO_IPV6, DEFAULT_ENV]
+        else:
+            # One that holds an IPv6 address is removed, never taken as started.
+            with pytest.raises(RuntimeError, match="could not be started"):
+                await backend.ensure_running(sandbox)
+            assert scripts(name) == [backends.NO_IPV6]
+            assert vms[name]["state"] == "absent"
+            assert sandbox.started_at is None
+
+
 async def test_an_underscore_flood_is_bounded_too(client) -> None:
     flood = await client.post(
         "/sandboxes/9/exec",
@@ -333,22 +383,6 @@ async def test_a_command_returns_only_once_its_background_jobs_are_done(client, 
     assert done.json()["exit_code"] == 0
     # The job the command left behind finished before the command returned.
     assert (tmp_path / "ws" / "3" / "late.txt").read_text().strip() == "late"
-
-
-async def test_nothing_a_command_started_outlives_it(client) -> None:
-    started = time.monotonic()
-    disowned = await client.post(
-        "/sandboxes/10/exec",
-        json={
-            "session": "s",
-            "command": "nohup sleep 30 >/dev/null 2>&1 & disown; echo $!",
-            "timeout_seconds": 10,
-        },
-    )
-    assert disowned.status_code == 200, disowned.text
-    assert time.monotonic() - started < 5  # not waited for: killed
-    # The local backend's pids are this host's.
-    assert await wait_ended(int(disowned.json()["output"].strip()))
 
 
 async def test_a_vm_that_cannot_be_removed_refuses_commands_and_keeps_its_cache(tmp_path) -> None:

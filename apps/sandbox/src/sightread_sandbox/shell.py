@@ -1,11 +1,11 @@
 """A persistent shell session (docs/sandbox.md § The runner).
 
-The bash tool's contract is a shell whose working directory, environment and background
-processes carry from one command to the next, with `restart` as the only reset. One
-`ShellSession` is one such shell: a long-lived `bash` child whose stdin we write commands
-to and whose combined output we read back up to a sentinel line that carries the exit
-code. The backend decides what the child is — `docker exec` into the user's VM — and the
-cleanup that runs after each command.
+The bash tool's contract is a shell whose working directory and exported environment
+carry from one command to the next, with `restart` as the only reset. `ShellSession` is
+one such shell: a long-lived POSIX-sh supervisor whose stdin we write commands to. It runs
+each one in a fresh `bash` and ends the command's combined output with a sentinel line
+that carries the exit code. The backend decides where the supervisor runs (`docker exec`
+into the user's VM) and the cleanup that runs after each command.
 """
 
 from __future__ import annotations

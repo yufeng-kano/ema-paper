@@ -118,7 +118,7 @@ ema-paper/
       src/sightread_sandbox/
         main.py                   # the runner's HTTP contract
         __main__.py               # `python -m sightread_sandbox`: starts the runner
-        backends.py               # where a shell runs: a Docker container per user, or a local directory for tests
+        backends.py               # where a shell runs: one Docker container per user
         shell.py                  # a persistent shell session
         config.py                 # the SANDBOX_* settings
         egress.py                 # the egress proxy: the VMs' one way out

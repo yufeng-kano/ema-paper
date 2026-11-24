@@ -1,10 +1,10 @@
 """The settings in effect: `.env`'s, with the database's overrides on top
 (docs/admin.md § Settings).
 
-The API and the worker start from `.env` alone and check it as they always have; the rows
-of `runtime_settings` are applied after start, through `RuntimeSettings`, one reading layer
-the API, the worker and the CLI share. A key without a row is `.env`'s, and with no row at
-all the settings in effect are the very object the process started with.
+The API and the worker start from `.env` alone and check it at start; the rows of
+`runtime_settings` are applied after start, through `RuntimeSettings`, one reading layer the
+API, the worker and the CLI share. A key without a row is `.env`'s, and with no row at all
+the settings in effect are the very object the process started with.
 """
 
 from __future__ import annotations

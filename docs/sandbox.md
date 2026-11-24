@@ -153,6 +153,7 @@ The operator lists the sites the sandbox may reach, on the console's Settings pa
 - **No IPv6 on the network.** The bridge keeps an IPv6 link-local address whatever `inhibit_ipv4` says, and a VM that holds one too reaches the host there, on whatever listens on `[::]` and the host's firewall lets through. Two layers close it:
   - **The VM's own setting.** The runner starts every VM on the network with IPv6 off (`net.ipv6.conf.all.disable_ipv6` and `net.ipv6.conf.default.disable_ipv6`). Kata applies both inside the guest, and root in the VM cannot set them back, `/proc/sys` being read-only there and the capability dropped.
     - After each start the runner checks that the VM holds no IPv6 address (`/proc/net/if_inet6` empty). A VM that does is removed the way `stop` removes one, and marked unstoppable when the removal fails (§ The runner), so the next command never takes it as started; the command fails.
+    - A VM whose `docker run` timed out but came up later is checked, and given the default environment (§ The image), when a command first finds it running.
     - A VM a restarted runner adopts that holds one is stopped instead of adopted.
     - The loopback loses IPv6 too: in such a VM `localhost` is `127.0.0.1` alone, and a program that binds `::1` alone fails.
   - **The bridge.** The host turns IPv6 off on the bridge itself (§ Operations), so a VM kernel that ignored the setting would still find nothing there.
@@ -248,6 +249,7 @@ The image is built and tagged by the operator like the service images. `SANDBOX_
 
 ## Operations
 
+- **The image.** Build it with `docker build -t ema-paper-sandbox deploy/sandbox-image`, the name `SANDBOX_IMAGE` holds, and build it again when `deploy/sandbox-image/` changes (§ The image). A running VM keeps its image until it stops.
 - **The Kata runtime.** Install it and register it with Docker as `kata`. The runtime binary, the guest kernel and the rootfs image are Kata's packages; Docker's `daemon.json` gets `"runtimes": {"kata": {"path": "/usr/bin/containerd-shim-kata-v2"...}}` per Kata's Docker guide. Verify with `docker run --runtime kata --rm hello-world` before enabling the sandbox.
 - **The workspaces directory.** `WORKSPACES_HOST_DIR` is the host directory bind-mounted at `{WORKSPACES_DIR}` into `api`, `worker` and `sandbox`. The runner holds it twice:
   - `SANDBOX_WORKSPACES_DIR` is the host path it hands to `docker run -v`.

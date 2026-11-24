@@ -111,6 +111,8 @@ docker compose -f docker-compose.production.yaml -f docker-compose.only-containe
 - **The sandbox comes with a paid plan.**
   - It gives the chat agent `bash` in one Kata microVM per user.
   - It needs a host with `/dev/kvm` and the Kata runtime ([sandbox.md](./sandbox.md) § Operations).
+  - Build its VM image once, and again whenever `deploy/sandbox-image/` changes: `docker build -t ema-paper-sandbox deploy/sandbox-image` ([deployment.md](./deployment.md) § Compose files).
+  - Without the image every command fails: the agent's `bash` answers "The sandbox is unavailable: the sandbox runner returned 503", and the runner's log says "could not start sandbox for user N" with Docker's error.
   - A deployment without paid plans sets `SANDBOX_URL=` (empty): the agent then works without `bash`, and everything else stays.
 
 ### Redeem codes

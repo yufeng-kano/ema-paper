@@ -218,7 +218,7 @@ Two routes keep a policy of their own: `GET /api/library/documents/{id}/file` an
 | `SUPPORT_EMAIL`, `OPERATOR_NAME` | the address the public Terms, Privacy and Refund pages name, and the name of who operates the service (below) |
 
 - **`WEB_URL`** is:
-  - where sign-in returns the visitor: `WEB_URL/<locale>` for one of the web app's locales (`en`, `zh-TW`, mirroring `PAGE_LOCALES` in `apps/web/shared/seo.ts`), `WEB_URL` itself for any other value, whose bare root redirects by the browser's language ([auth.md](./auth.md) § 1, [web.md](./web.md) § Search engines);
+  - where sign-in returns the visitor: `WEB_URL/<locale>` for one of the web app's locales (`en`, `zh-TW`: `WEB_LOCALES` in `apps/api/src/sightread/config.py`, mirroring `PAGE_LOCALES` in `apps/web/shared/seo.ts`), `WEB_URL` itself for any other value, whose bare root redirects by the browser's language ([auth.md](./auth.md) § 1, [web.md](./web.md) § Search engines);
   - the origin of the public pages' canonical, `hreflang` and `og:url` links, `robots.txt`'s `Sitemap` line and the sitemap's URLs ([web.md](./web.md) § Search engines), passed by `docker-compose.production.yaml` to the web image's build; the pages are prerendered, so a changed value needs the web image rebuilt;
   - the address the chat agent's web tools name in their User-Agent, `EmaPaper-agent/1.0 (+<WEB_URL>)` ([chat.md](./chat.md) § Tools).
 - **`SECRET_KEY`**: sessions are random tokens stored hashed (SHA-256, no key), so rotating it signs nobody out and makes nothing unreadable: it only fails a sign-in or a connector authorization in progress.
