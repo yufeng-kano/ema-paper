@@ -23,6 +23,7 @@ from sightread.jobs.queue import claim_next_job
 from sightread.jobs.runner import run_job
 from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL
 from tests.test_chat import MESSAGES_URL, _run_queued_turn, _seed_document, sse
+from tests.test_jobs_queue import postgres_only
 
 DOC_PATH = "/workspace/files/Papers/paper.pdf"
 SUBAGENT_PREAMBLE_START = "You are a subagent"
@@ -1064,6 +1065,9 @@ async def test_a_subagent_that_spends_the_balance_stops_and_the_turn_answers(
     assert (billing["period"]["spent"], billing["period"]["remaining"]) == (7, -3)
 
 
+# Two calls of one round emit events at the same moment; only PostgreSQL's row lock
+# serializes their sequence numbers (jobs/chat_events.py).
+@postgres_only
 @respx.mock
 async def test_a_write_waiting_when_a_subagent_spends_the_balance_is_not_started(
     make_client, tmp_path, monkeypatch
