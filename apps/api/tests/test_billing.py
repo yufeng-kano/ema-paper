@@ -3,6 +3,7 @@ configuration that feeds it; tests/test_ledger.py covers the ledger that records
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -86,9 +87,50 @@ def test_a_malformed_price_table_is_refused_whole(raw: str) -> None:
         parse_model_prices(raw)
 
 
-def test_an_offered_model_without_a_price_refuses_to_start() -> None:
-    with pytest.raises(ValueError, match="MODEL_PRICES_JSON prices none of: gpt-6-luna"):
-        Settings(parse_model="gpt-6-luna", model_prices_json="{}")
+def test_a_price_may_carry_the_models_context_window() -> None:
+    prices = parse_model_prices(
+        json.dumps(
+            {
+                "m": {
+                    "input": 1,
+                    "cache_read": 1,
+                    "cache_write": 1,
+                    "output": 1,
+                    "context": 1000000,
+                },
+                "n": {"input": 1, "cache_read": 1, "cache_write": 1, "output": 1},
+            }
+        )
+    )
+    assert prices["m"].context == 1_000_000
+    assert prices["n"].context is None
+    for context in (0, -1, "big", 1.5, True):
+        with pytest.raises(ValueError, match="context"):
+            parse_model_prices(
+                json.dumps(
+                    {
+                        "m": {
+                            "input": 1,
+                            "cache_read": 1,
+                            "cache_write": 1,
+                            "output": 1,
+                            "context": context,
+                        }
+                    }
+                )
+            )
+
+
+@pytest.mark.parametrize(
+    "field", ["parse_model", "check_model", "parse_fallback_model", "summary_model"]
+)
+def test_an_offered_model_without_a_price_refuses_to_start(field: str) -> None:
+    """A model the deployment runs on its own is priced, or it does not start."""
+    with pytest.raises(ValueError, match="MODEL_PRICES_JSON prices none of: vendor/small"):
+        Settings(**{field: "vendor/small"}, model_prices_json="{}")
+
+
+def test_the_offered_models_are_the_priced_pipeline_models() -> None:
     settings = Settings(
         parse_model="gpt-6-luna",
         model_prices_json=f'{{"gpt-6-luna": {LUNA}, "claude-opus-5-5": {OPUS}}}',

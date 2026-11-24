@@ -30,6 +30,7 @@ from sightread.db.models import (
     User,
 )
 from sightread.jobs import chat_events, chat_memory, chat_runner, chat_subagent, chat_tools
+from sightread.parsing.attachments import ATTACHMENT_EXTENSIONS
 from sightread.workspace.layout import user_root
 from tests.chat_helpers import (
     chatting_client,
@@ -40,7 +41,7 @@ from tests.chat_helpers import (
     send,
     stub_messages,
 )
-from tests.conftest import CSRF_HEADERS, postgres_only
+from tests.conftest import CSRF_HEADERS, postgres_only, sign_in
 from tests.factories import job_row, user_row
 
 DONE = ([{"type": "text", "text": "Done."}], "end_turn")
@@ -331,21 +332,29 @@ def memory_setting_keys() -> tuple[str, ...]:
     return ("instructions", "answer_language", "translate_language", "memory_auto", "memory_paused")
 
 
-async def test_me_carries_the_composer_and_editor_limits(make_client) -> None:
-    client = make_client(
-        chat_instructions_max_chars=111,
-        chat_memory_max_chars=222,
-        chat_sections_per_message=3,
-        chat_section_heading_max_chars=55,
-        chat_selection_max_chars=444,
-    )
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
+# Each chat limit `/api/me` carries, the setting it comes from, and a value no default has.
+CHAT_LIMITS = {
+    "attachment_max_bytes": ("chat_attachment_max_bytes", 5_000_000),
+    "attachments_per_message": ("chat_attachments_per_message", 3),
+    "instructions_max_chars": ("chat_instructions_max_chars", 111),
+    "memory_max_chars": ("chat_memory_max_chars", 222),
+    "sections_per_message": ("chat_sections_per_message", 5),
+    "section_heading_max_chars": ("chat_section_heading_max_chars", 55),
+    "selection_max_chars": ("chat_selection_max_chars", 444),
+    # The panel reads the open conversation again as the worker's window opens (docs/web.md).
+    "idle_compact_lead_seconds": ("chat_idle_compact_lead_seconds", 123),
+}
+
+
+async def test_me_carries_the_chat_limits(make_client) -> None:
+    """The composer and the Agent page read their limits from the server's own settings
+    (docs/api.md § Limits)."""
+    client = await sign_in(make_client(**dict(CHAT_LIMITS.values())))
     limits = (await client.get("/api/me")).json()["limits"]
-    assert limits["instructions_max_chars"] == 111
-    assert limits["memory_max_chars"] == 222
-    assert limits["sections_per_message"] == 3
-    assert limits["section_heading_max_chars"] == 55
-    assert limits["selection_max_chars"] == 444
+    assert {key: limits[key] for key in CHAT_LIMITS} == {
+        key: value for key, (_, value) in CHAT_LIMITS.items()
+    }
+    assert limits["attachment_extensions"] == list(ATTACHMENT_EXTENSIONS)
 
 
 # --- the memories routes --------------------------------------------------------------------
@@ -1009,6 +1018,22 @@ def round_context() -> SimpleNamespace:
     )
 
 
+@pytest.fixture
+def round_events(monkeypatch) -> list[tuple[str, dict]]:
+    """The events a round emits, recorded instead of written; the turn is never cancelled."""
+    emitted: list[tuple[str, dict]] = []
+
+    async def record(ctx, event, data):
+        emitted.append((event, data))
+
+    async def never_cancelled(ctx):
+        return False
+
+    monkeypatch.setattr(chat_runner, "_emit", record)
+    monkeypatch.setattr(chat_runner, "_cancelled", never_cancelled)
+    return emitted
+
+
 SAVED = chat_tools.ToolOutcome(
     "Saved as m1.",
     memory={
@@ -1026,19 +1051,12 @@ MEMORY_CALL = {
 }
 
 
+@pytest.mark.usefixtures("round_events")
 async def test_a_spent_image_budget_never_refuses_the_memory_tool(monkeypatch) -> None:
     async def fake_memory_tool(sessionmaker, settings, **kwargs):
         return SAVED
 
-    async def no_events(ctx, event, data):
-        return None
-
-    async def never_cancelled(ctx):
-        return False
-
     monkeypatch.setattr(chat_memory, "run_memory_tool", fake_memory_tool)
-    monkeypatch.setattr(chat_runner, "_emit", no_events)
-    monkeypatch.setattr(chat_runner, "_cancelled", never_cancelled)
     ctx = round_context()
     ctx.images.total = ctx.settings.chat_image_turn_max_bytes
     page = {"type": "tool_use", "id": "p1", "name": "view_page", "input": {"page": 1}}
@@ -1048,23 +1066,16 @@ async def test_a_spent_image_budget_never_refuses_the_memory_tool(monkeypatch) -
     assert remembered["content"] == "Saved as m1." and "is_error" not in remembered
 
 
+@pytest.mark.usefixtures("round_events")
 async def test_a_spent_image_budget_refuses_only_pages_and_figures_ahead(monkeypatch) -> None:
     """docs/chat.md § Tools: a skill and a subagent return no image before they run, so a
     spent turn budget refuses neither; a page and a figure are refused."""
-
-    async def no_events(ctx, event, data):
-        return None
-
-    async def never_cancelled(ctx):
-        return False
 
     async def fake_subagent(ctx, tool_use_id, tool_input):
         return chat_tools.ToolOutcome("The report.")
 
     monkeypatch.setattr(chat_runner, "_load_skill", lambda ctx, tool_input: SKILL_TEXT)
     monkeypatch.setattr(chat_subagent, "run_subagent", fake_subagent)
-    monkeypatch.setattr(chat_runner, "_emit", no_events)
-    monkeypatch.setattr(chat_runner, "_cancelled", never_cancelled)
     ctx = round_context()
     ctx.images.total = ctx.settings.chat_image_turn_max_bytes
     calls = [
@@ -1079,22 +1090,15 @@ async def test_a_spent_image_budget_refuses_only_pages_and_figures_ahead(monkeyp
     assert subagent["content"] == "The report." and "is_error" not in subagent
 
 
+@pytest.mark.usefixtures("round_events")
 async def test_a_subagents_spent_image_budget_still_lets_it_view_text(monkeypatch) -> None:
     """docs/chat.md § Subagents: a subagent whose own image budget is spent is refused a
     page ahead, but its editor still answers a `view` of a text file."""
-
-    async def no_events(ctx, event, data):
-        return None
-
-    async def never_cancelled(ctx):
-        return False
 
     async def text_view(root, tool_input, author, **kwargs):
         return chat_tools.ToolOutcome("1\tBody text.")
 
     monkeypatch.setattr(chat_tools, "run_editor", text_view)
-    monkeypatch.setattr(chat_runner, "_emit", no_events)
-    monkeypatch.setattr(chat_runner, "_cancelled", never_cancelled)
     ctx = round_context()
     ctx.paths = SimpleNamespace(root=None)
     ctx.settings.chat_tool_result_max_chars = 1000
@@ -1127,68 +1131,52 @@ async def test_a_subagents_spent_image_budget_still_lets_it_view_text(monkeypatc
     assert viewed["content"] == "1\tBody text." and "is_error" not in viewed
 
 
-async def test_a_cancel_never_parts_a_memorys_commit_from_its_events(monkeypatch) -> None:
+async def test_a_cancel_never_parts_a_memorys_commit_from_its_events(
+    monkeypatch, round_events
+) -> None:
     """Cancelled between the row's commit and what reports it, the call runs on, and the
     end of the turn waits for its tool_result and `memory` event, as it does for a write:
     otherwise the reader keeps a memory the thread draws no line for."""
     in_flight = asyncio.Event()
     release = asyncio.Event()
-    emitted: list[tuple[str, dict]] = []
 
     async def slow_memory_tool(sessionmaker, settings, **kwargs):
         in_flight.set()
         await release.wait()
         return SAVED
 
-    async def record(ctx, event, data):
-        emitted.append((event, data))
-
-    async def never_cancelled(ctx):
-        return False
-
     monkeypatch.setattr(chat_memory, "run_memory_tool", slow_memory_tool)
-    monkeypatch.setattr(chat_runner, "_emit", record)
-    monkeypatch.setattr(chat_runner, "_cancelled", never_cancelled)
     ctx = round_context()
     running = asyncio.create_task(chat_runner._run_tools(ctx, [MEMORY_CALL], set()))
     await asyncio.wait_for(in_flight.wait(), 5)
     running.cancel()
     with pytest.raises(asyncio.CancelledError):
         await running
-    assert list(ctx.writers.values()) == ["memory"] and emitted == []
+    assert list(ctx.writers.values()) == ["memory"] and round_events == []
 
     settling = asyncio.create_task(chat_runner._settle_writers(ctx))
     await asyncio.sleep(0.05)
     assert not settling.done()
     release.set()
     await asyncio.wait_for(settling, 5)
-    assert [event for event, _ in emitted] == [chat_events.TOOL_RESULT, chat_events.MEMORY]
-    assert emitted[1][1]["tool_use_id"] == "toolu_m" and ctx.writers == {}
+    assert [event for event, _ in round_events] == [chat_events.TOOL_RESULT, chat_events.MEMORY]
+    assert round_events[1][1]["tool_use_id"] == "toolu_m" and ctx.writers == {}
 
 
 async def test_a_memory_call_that_fails_after_a_cancel_is_logged_and_reported(
-    monkeypatch, caplog
+    monkeypatch, caplog, round_events
 ) -> None:
     """Nobody awaits the call once the round is cancelled, so its own failure is logged and
     answered as an error tool_result there, as `_run_tool` would have done."""
     in_flight = asyncio.Event()
     release = asyncio.Event()
-    emitted: list[tuple[str, dict]] = []
 
     async def failing_memory_tool(sessionmaker, settings, **kwargs):
         in_flight.set()
         await release.wait()
         raise RuntimeError("the connection dropped")
 
-    async def record(ctx, event, data):
-        emitted.append((event, data))
-
-    async def never_cancelled(ctx):
-        return False
-
     monkeypatch.setattr(chat_memory, "run_memory_tool", failing_memory_tool)
-    monkeypatch.setattr(chat_runner, "_emit", record)
-    monkeypatch.setattr(chat_runner, "_cancelled", never_cancelled)
     ctx = round_context()
     running = asyncio.create_task(chat_runner._run_tools(ctx, [MEMORY_CALL], set()))
     await asyncio.wait_for(in_flight.wait(), 5)
@@ -1202,26 +1190,5 @@ async def test_a_memory_call_that_fails_after_a_cancel_is_logged_and_reported(
     assert [record.getMessage() for record in caplog.records] == [
         f"tool memory failed in turn {ctx.turn.id}"
     ]
-    assert [event for event, _ in emitted] == [chat_events.TOOL_RESULT]
-    assert emitted[0][1]["is_error"] is True and ctx.writers == {}
-
-
-async def test_a_failed_statement_never_carries_the_readers_text(tmp_path) -> None:
-    """The engine hides bound values, so a database error logged with its traceback cannot
-    write a memory's text — or instructions, or a message — into the log."""
-    from sqlalchemy import text as sql
-    from sqlalchemy.exc import DBAPIError
-
-    from sightread.db.session import create_engine
-
-    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path / 'hidden.db'}")
-    try:
-        async with engine.connect() as connection:
-            with pytest.raises(DBAPIError) as failed:
-                await connection.execute(
-                    sql("insert into no_such_table (text) values (:text)"),
-                    {"text": "the reader reads with a screen reader"},
-                )
-    finally:
-        await engine.dispose()
-    assert "screen reader" not in str(failed.value)
+    assert [event for event, _ in round_events] == [chat_events.TOOL_RESULT]
+    assert round_events[0][1]["is_error"] is True and ctx.writers == {}

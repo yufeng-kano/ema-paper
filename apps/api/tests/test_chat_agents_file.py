@@ -224,13 +224,6 @@ async def test_init_carries_the_instruction_and_nothing_of_the_passage(chat_clie
     assert content[1]["text"] == chat_agent.INIT_INSTRUCTION
 
 
-async def test_init_is_no_skill_name(chat_client) -> None:
-    refused = await chat_client.post(
-        "/api/skills", json={"name": "init", "description": "x", "body": "x"}, headers=CSRF_HEADERS
-    )
-    assert refused.status_code == 400, refused.text
-
-
 # --- an upload named AGENTS.md -------------------------------------------------------------
 
 

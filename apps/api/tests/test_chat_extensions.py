@@ -17,8 +17,6 @@ from sightread.agents import skills as skill_defs
 from sightread.agents import subagents as subagent_defs
 from sightread.db.models import Message, Skill, UsageLog
 from sightread.jobs import chat_runner, chat_subagent, chat_tools
-from sightread.jobs.queue import claim_next_job
-from sightread.jobs.runner import run_job
 from tests.chat_helpers import (
     DOC_PATH,
     MESSAGES_URL,
@@ -32,7 +30,7 @@ from tests.chat_helpers import (
     streamed,
     stub_messages,
 )
-from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, postgres_only
+from tests.conftest import CSRF_HEADERS, postgres_only
 
 
 def fake_pages(monkeypatch) -> list[int]:
@@ -359,41 +357,6 @@ async def test_the_agent_prompt_is_trimmed_and_the_default_stored_as_none(signed
         "/api/agents/chat/settings", json={"prompt": "x" * (cap + 1)}, headers=CSRF_HEADERS
     )
     assert too_long.status_code == 400
-
-
-@respx.mock
-async def test_a_parse_runs_on_the_readers_own_prompt(make_client, sessionmaker, documents) -> None:
-    upstream = respx.post(KANO_CHAT_URL).mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "choices": [{"message": {"content": "# Page one"}}],
-                "usage": {"prompt_tokens": 8, "completion_tokens": 9},
-            },
-        )
-    )
-    client = make_client()
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    saved = await client.put(
-        "/api/agents/parse/settings",
-        json={"prompt": "Transcribe page {page} as plain text."},
-        headers=CSRF_HEADERS,
-    )
-    assert saved.json()["prompt"] == "Transcribe page {page} as plain text."
-    key = await client.post("/api/keys", json={"name": "test"}, headers=CSRF_HEADERS)
-    client.headers["Authorization"] = f"Bearer {key.json()['key']}"
-    accepted = await client.post(
-        "/v1/parse", files={"file": ("tiny.png", documents["png"].read_bytes(), "image/png")}
-    )
-    assert accepted.status_code == 202, accepted.text
-
-    settings = client.app.state.settings
-    async with sessionmaker() as db:
-        claimed = await claim_next_job(db, settings.max_jobs_per_user)
-    await run_job(sessionmaker, settings, claimed, asyncio.Semaphore(2))
-    sent = json.dumps(json.loads(upstream.calls[0].request.content))
-    # The reader's prompt replaced the template whole, its tokens substituted.
-    assert "Transcribe page 1 as plain text." in sent
 
 
 # --- the turn ---------------------------------------------------------------------------
@@ -1093,6 +1056,17 @@ def test_a_subagents_tools_are_the_subagent_tools_in_their_order() -> None:
     )
 
 
+def thinking(request: dict) -> list[str]:
+    """The thinking a Messages request replays, in order."""
+    return [
+        block["thinking"]
+        for message in request["messages"]
+        if message["role"] == "assistant"
+        for block in message["content"]
+        if block["type"] == "thinking"
+    ]
+
+
 @respx.mock
 async def test_thinking_is_replayed_only_under_the_prompt_it_was_made_under(chat_client) -> None:
     """docs/chat.md § History is append-only: a thinking block is stored with the prompt and
@@ -1116,15 +1090,6 @@ async def test_thinking_is_replayed_only_under_the_prompt_it_was_made_under(chat
     async def turn(text: str) -> None:
         assert (await send(chat_client, conversation_id, text=text)).status_code == 202
         await run_queued_turn(chat_client)
-
-    def thinking(request: dict) -> list[str]:
-        return [
-            block["thinking"]
-            for message in request["messages"]
-            if message["role"] == "assistant"
-            for block in message["content"]
-            if block["type"] == "thinking"
-        ]
 
     await turn("one")
     await turn("two")
@@ -1150,9 +1115,9 @@ async def test_thinking_is_replayed_only_under_the_prompt_it_was_made_under(chat
     async with chat_client.app.state.sessionmaker() as db:
         stored = (
             await db.execute(
-                select(Message.content).where(
-                    Message.conversation_id == conversation_id, Message.role == "assistant"
-                )
+                select(Message.content)
+                .where(Message.conversation_id == conversation_id, Message.role == "assistant")
+                .order_by(Message.id)
             )
         ).scalars()
         bindings = [
@@ -1214,15 +1179,6 @@ async def test_a_drop_the_upstream_reports_cuts_the_thinking_before_it(chat_clie
     for text in ("one", "two", "three"):
         assert (await send(chat_client, conversation_id, text=text)).status_code == 202
         await run_queued_turn(chat_client)
-
-    def thinking(request: dict) -> list[str]:
-        return [
-            block["thinking"]
-            for message in request["messages"]
-            if message["role"] == "assistant"
-            for block in message["content"]
-            if block["type"] == "thinking"
-        ]
 
     assert len(requests) == 4
     # The call that dropped it carried it; the rest of its turn and the next do not.

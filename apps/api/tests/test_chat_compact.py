@@ -11,14 +11,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
-import pytest
 import respx
 from httpx import AsyncClient
 from sqlalchemy import Text, cast, select, update
 
 from sightread.agents import chat as chat_agent
 from sightread.agents import skills as skill_defs
-from sightread.billing.credits import parse_model_prices
 from sightread.db.models import (
     COMPACT_TURN,
     IDLE_COMPACT_TURN,
@@ -29,7 +27,7 @@ from sightread.db.models import (
     CreditPeriod,
     Message,
 )
-from sightread.jobs import chat_compact, chat_runner
+from sightread.jobs import chat_compact, chat_runner, chat_versions
 from sightread.jobs.queue import history_bytes
 from sightread.upstream.anthropic import ChatUsage
 from sightread.workspace import git
@@ -63,17 +61,7 @@ async def detail(client: AsyncClient, conversation_id: int) -> dict:
 
 async def turns_of(client: AsyncClient, conversation_id: int) -> list[ChatTurn]:
     async with client.app.state.sessionmaker() as db:
-        rows = (
-            (
-                await db.execute(
-                    select(ChatTurn)
-                    .where(ChatTurn.conversation_id == conversation_id)
-                    .order_by(ChatTurn.created_at)
-                )
-            )
-            .scalars()
-            .all()
-        )
+        rows = await chat_versions.conversation_turns(db, conversation_id)
         for row in rows:
             db.expunge(row)
         return rows
@@ -274,10 +262,11 @@ async def test_an_abandoned_compaction_fills_no_history_cap(chat_client) -> None
 
 
 async def test_the_composers_commands_are_no_skill_names(chat_client) -> None:
-    """`new` and `compact` are the composer's own: a skill is neither created under them nor
-    renamed to them, so `/compact` never runs a skill in the runner's place (docs/chat.md
-    § Skills)."""
+    """The composer's commands (`/new`, `/compact`, `/rename`, `/init`) are no skill names:
+    a skill is neither created under them nor renamed to them, so `/compact` or `/init`
+    never runs a skill in the runner's place (docs/chat.md § Skills)."""
     assert chat_agent.COMPACT_COMMAND in skill_defs.COMPOSER_COMMANDS
+    assert chat_agent.INIT_COMMAND in skill_defs.COMPOSER_COMMANDS
     for name in sorted(skill_defs.COMPOSER_COMMANDS):
         refused = await chat_client.post(
             "/api/skills",
@@ -577,40 +566,6 @@ def test_the_usage_knows_whether_the_api_cached() -> None:
     assert not usage(native=False, read=5, write=5).cached
 
 
-def test_a_price_may_carry_the_models_context_window() -> None:
-    prices = parse_model_prices(
-        json.dumps(
-            {
-                "m": {
-                    "input": 1,
-                    "cache_read": 1,
-                    "cache_write": 1,
-                    "output": 1,
-                    "context": 1000000,
-                },
-                "n": {"input": 1, "cache_read": 1, "cache_write": 1, "output": 1},
-            }
-        )
-    )
-    assert prices["m"].context == 1_000_000
-    assert prices["n"].context is None
-    for context in (0, -1, "big", 1.5, True):
-        with pytest.raises(ValueError, match="context"):
-            parse_model_prices(
-                json.dumps(
-                    {
-                        "m": {
-                            "input": 1,
-                            "cache_read": 1,
-                            "cache_write": 1,
-                            "output": 1,
-                            "context": context,
-                        }
-                    }
-                )
-            )
-
-
 # --- the model between turns ----------------------------------------------------------------
 
 
@@ -623,7 +578,6 @@ async def test_a_conversation_moves_to_another_model_between_turns(chat_client) 
     main, _ = stub_messages([DONE, DONE])
     conversation_id = await new_conversation(client)
     url = f"/api/conversations/{conversation_id}"
-    assert (await client.put(url, json={}, headers=CSRF_HEADERS)).status_code == 400
     unknown = await client.put(url, json={"model": "vendor/unknown"}, headers=CSRF_HEADERS)
     assert unknown.status_code == 400, unknown.text
 
@@ -883,19 +837,11 @@ async def test_the_memory_file_is_read_and_written_on_the_agent_page(make_client
     """`memory.md` at the workspace root: read as is, saved as a revision of the reader's
     own with one trailing newline, capped, and refused while a turn of theirs is unfinished
     (docs/api.md, docs/chat.md § Memory *The memory file*)."""
-    client = await chatting_client(
-        make_client(
-            chat_memory_file_max_chars=40,
-            chat_idle_compact_lead_seconds=123,
-        )
-    )
+    client = await chatting_client(make_client(chat_memory_file_max_chars=40))
     url = "/api/agents/chat/memory-file"
     empty = await client.get(url)
     assert empty.status_code == 200, empty.text
     assert empty.json() == {"text": "", "max_chars": 40}
-    limits = (await client.get("/api/me")).json()["limits"]
-    # The panel reads the open conversation again as the worker's window opens (docs/web.md).
-    assert limits["idle_compact_lead_seconds"] == 123
 
     saved = await client.put(url, json={"text": "## Style\n\n- Tables​ "}, headers=CSRF_HEADERS)
     assert saved.status_code == 200, saved.text

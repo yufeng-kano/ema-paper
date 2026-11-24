@@ -16,7 +16,6 @@ from sqlalchemy import func, select, update
 
 from sightread.agents import summary as summary_defs
 from sightread.billing import ledger
-from sightread.config import Settings
 from sightread.db.models import (
     AgentSetting,
     Conversation,
@@ -293,12 +292,6 @@ async def test_a_conversation_model_nobody_prices_is_never_run_for_a_title(chat_
     assert refused.status_code == 503, refused.text
     assert requests == []
     assert await title_entries(client) == []
-
-
-def test_a_summary_model_must_be_priced() -> None:
-    """A model the deployment runs on its own is priced, or it does not start."""
-    with pytest.raises(ValueError, match="MODEL_PRICES_JSON prices none of: vendor/small"):
-        Settings(summary_model="vendor/small", model_prices_json="{}")
 
 
 @pytest.mark.parametrize(

@@ -332,14 +332,4 @@ def test_an_attachment_is_classified_by_extension_then_by_media_type() -> None:
     assert attachment_prep.classify("clipboard", "image/png") == "image"
     assert attachment_prep.classify("notes", "text/plain; charset=utf-8") == "text"
     assert attachment_prep.classify("archive.zip", "application/zip") is None
-    assert ".heic" in attachment_prep.ATTACHMENT_EXTENSIONS
-
-
-async def test_the_composer_learns_the_attachment_limits(make_client) -> None:
-    client = make_client(chat_attachment_max_bytes=5_000_000, chat_attachments_per_message=3)
-    await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)
-    limits = (await client.get("/api/me")).json()["limits"]
-    assert limits["attachment_max_bytes"] == 5_000_000
-    assert limits["attachments_per_message"] == 3
-    assert limits["attachment_extensions"] == list(attachment_prep.ATTACHMENT_EXTENSIONS)
-    assert {".png", ".pdf", ".md", ".txt"} <= set(limits["attachment_extensions"])
+    assert {".heic", ".png", ".pdf", ".md", ".txt"} <= set(attachment_prep.ATTACHMENT_EXTENSIONS)
