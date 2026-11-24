@@ -6,8 +6,6 @@ Turns run against a stubbed Messages stream; no test reaches the network (docs/t
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
-
 import pytest
 import respx
 from httpx import AsyncClient
@@ -454,7 +452,6 @@ async def test_a_document_that_is_answering_stays_where_it_is(chat_client) -> No
                 conversation_id=answering,
                 message_id=0,
                 status="running",
-                started_at=datetime.now(UTC),
             )
         )
         await db.commit()

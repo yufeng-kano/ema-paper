@@ -272,7 +272,6 @@ async def _enqueue_idle_compaction(db: AsyncSession, settings: Settings, row: Co
                 kind=ledger.CHAT,
                 amount=0,
                 turn_id=turn.id,
-                model=row.model,
                 minimum=settings.chat_min_credits,
             )
             message.turn_id = turn.id

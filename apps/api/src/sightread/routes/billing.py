@@ -503,6 +503,7 @@ async def pay_webhook(request: Request, db: DbSession, settings: AppSettings):
         isinstance(subscription, dict) == isinstance(purchase, dict)
         or not isinstance(event_id, str)
         or not pay._ID.match(event_id)
+        # A notification must name its type; nothing is decided or stored by it.
         or not isinstance(event_type, str)
         or not 0 < len(event_type) <= 64
     ):
@@ -547,7 +548,7 @@ async def pay_webhook(request: Request, db: DbSession, settings: AppSettings):
     if await db.get(PayEvent, event_id) is not None:
         await db.rollback()
         return {}
-    db.add(PayEvent(id=event_id, type=event_type, user_id=user_id))
+    db.add(PayEvent(id=event_id, user_id=user_id))
     if canonical is not None:
         await pay.apply_canonical(db, user_id, canonical)
         # The cut of a granted period the subscription began inside, as the refresh

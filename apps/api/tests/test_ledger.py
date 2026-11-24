@@ -251,7 +251,7 @@ async def test_a_plan_change_raises_the_grant_and_never_lowers_it(sessionmaker) 
     user_id = await _user(sessionmaker)
     async with sessionmaker() as db:
         row, _ = await ledger.period_row(db, settings_with(free_credits_per_period=150), user_id)
-        assert (row.granted, row.plan_id) == (150, None)
+        assert row.granted == 150
         row, _ = await ledger.period_row(db, settings_with(free_credits_per_period=200), user_id)
         assert row.granted == 200
         row, _ = await ledger.period_row(db, settings_with(free_credits_per_period=100), user_id)

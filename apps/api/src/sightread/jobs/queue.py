@@ -720,7 +720,7 @@ async def retry_job(
 
 CLAIM_TURN_SQL = text(
     """
-    UPDATE chat_turns SET status = 'running', started_at = now()
+    UPDATE chat_turns SET status = 'running'
     WHERE id = (
       SELECT t.id FROM chat_turns t
       WHERE t.status = 'queued'
@@ -860,7 +860,7 @@ async def claim_next_turn(db: AsyncSession, max_turns_per_user: int) -> uuid.UUI
     updated = await db.execute(
         update(ChatTurn)
         .where(ChatTurn.id == turn_id, ChatTurn.status == "queued")
-        .values(status="running", started_at=utcnow())
+        .values(status="running")
     )
     await db.commit()
     return turn_id if updated.rowcount == 1 else None

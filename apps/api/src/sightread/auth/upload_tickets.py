@@ -1,7 +1,7 @@
 """Single-use upload tickets for the MCP `parse` tool (docs/auth.md § 5).
 
 Format ``srt_<32 url-safe chars>``. Returned by the tool exactly once, stored as a SHA-256
-hash plus a display string. A ticket is worth one `POST /v1/parse` — a parse, or the retry
+hash. A ticket is worth one `POST /v1/parse` — a parse, or the retry
 of a failed one — and then only reads of the job that upload created — never an API key's
 rights, never `/mcp`.
 """
@@ -36,11 +36,6 @@ REJECTION_MESSAGE = (
 def generate_ticket() -> str:
     # token_urlsafe(24) is exactly 32 url-safe characters.
     return TICKET_PREFIX + secrets.token_urlsafe(24)[:TICKET_RANDOM_CHARS]
-
-
-def display_prefix(token: str) -> str:
-    """The `srt_...abc4` form stored alongside the hash."""
-    return f"{TICKET_PREFIX}...{token[-4:]}"
 
 
 async def check_mint_rate(db: AsyncSession, settings: Settings, user_id: int) -> None:
@@ -83,7 +78,6 @@ async def mint(
     row = UploadTicket(
         user_id=user.id,
         token_hash=hash_token(token),
-        prefix=display_prefix(token),
         created_at=now,
         expires_at=now + timedelta(seconds=settings.upload_ticket_ttl_seconds),
         into_library=into_library,

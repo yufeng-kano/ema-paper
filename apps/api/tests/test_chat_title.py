@@ -136,7 +136,7 @@ async def test_a_title_is_written_from_the_first_and_the_latest_exchange(chat_cl
     assert "MIDDLE" not in message["content"]
 
     [entry] = await title_entries(client)
-    assert (entry.state, entry.model) == ("consumed", "claude-code/claude-opus-5-5")
+    assert entry.state == "consumed"
     assert entry.amount >= 1
     async with client.app.state.sessionmaker() as db:
         rows = (
@@ -173,8 +173,12 @@ async def test_the_summary_model_and_the_chosen_answer_language_are_used(
     assert request["model"] == SUMMARY_MODEL
     assert "whose tag is ja" in request["system"]
     assert request["messages"][0]["content"].count("<exchange>") == 1
-    [entry] = await title_entries(client)
-    assert entry.model == SUMMARY_MODEL
+    assert len(await title_entries(client)) == 1
+    async with client.app.state.sessionmaker() as db:
+        billed = (
+            await db.execute(select(UsageLog.model).where(UsageLog.turn_id.is_(None)))
+        ).scalars()
+        assert list(billed) == [SUMMARY_MODEL]
 
 
 @respx.mock
@@ -253,7 +257,6 @@ async def test_one_title_at_a_time_and_a_crash_left_entry_stops_counting(chat_cl
             user_id=client.user_id,
             kind=ledger.CHAT,
             amount=0,
-            model="claude-code/claude-opus-5-5",
         )
         await db.commit()
         entry_id = in_flight.id

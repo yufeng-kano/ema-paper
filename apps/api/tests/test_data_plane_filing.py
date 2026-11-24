@@ -18,6 +18,7 @@ from httpx import AsyncClient
 from sqlalchemy import select
 
 from sightread.auth import upload_tickets
+from sightread.auth.crypto import hash_token
 from sightread.db.models import Document, Job, UploadTicket, User
 from sightread.errors import ApiError
 from sightread.jobs.intake import retry_filed_parse
@@ -98,9 +99,7 @@ async def _ticket(sessionmaker, token: str) -> UploadTicket:
     async with sessionmaker() as db:
         return (
             await db.execute(
-                select(UploadTicket).where(
-                    UploadTicket.prefix == upload_tickets.display_prefix(token)
-                )
+                select(UploadTicket).where(UploadTicket.token_hash == hash_token(token))
             )
         ).scalar_one()
 

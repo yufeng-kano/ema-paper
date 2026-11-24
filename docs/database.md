@@ -133,6 +133,8 @@ folders          id PK, user_id FK, parent_id FK folders NULL, name,
                  INDEX (trashed_at) WHERE trashed_at IS NOT NULL
                                                   -- what the Trash's expiry reads
                                                   -- (workspace.md § The Trash)
+                 INDEX (parent_id) WHERE parent_id IS NOT NULL
+                                                  -- a folder delete's cascade reads it
                  -- the web file library's directories; parent_id NULL = root,
                  -- ON DELETE CASCADE on the self-reference, so deleting a folder
                  -- takes its subtree with it. A folder in the Trash keeps its
@@ -160,6 +162,8 @@ documents        id PK, user_id FK, folder_id FK folders NULL, job_id FK jobs NU
                  UNIQUE (user_id, folder_id, name) WHERE trashed_at IS NULL
                  UNIQUE (user_id, name) WHERE folder_id IS NULL AND trashed_at IS NULL
                  INDEX (user_id, created_at)
+                 INDEX (folder_id) WHERE folder_id IS NOT NULL
+                                                  -- a folder delete's cascade reads it
                  INDEX (job_id)                   -- the retention's keep rule and a job
                                                   -- delete's foreign-key action read it
                  INDEX (reconvert_job_id) WHERE reconvert_job_id IS NOT NULL
@@ -185,6 +189,9 @@ usage_log        id PK, user_id FK, job_id FK NULL, turn_id FK chat_turns NULL,
                  created_at
                  INDEX (user_id, created_at)
                  INDEX (job_id)                   -- a job delete's SET NULL reads it
+                 INDEX (turn_id) WHERE turn_id IS NOT NULL
+                                                  -- the turn's settlement and a turn
+                                                  -- delete's SET NULL read it
                  CHECK (cost_source IN (...) AND (cost_source = 'unknown') = (cost IS NULL))
 conversations    id PK, user_id FK, document_id FK documents NULL, title, session,
                  model NULL, memory_ids JSONB NULL, memory_file TEXT NULL,
@@ -232,6 +239,8 @@ conversations    id PK, user_id FK, document_id FK documents NULL, title, sessio
 messages         id PK, conversation_id FK, role user|assistant, content JSONB,
                  turn_id FK chat_turns NULL, created_at
                  INDEX (conversation_id, id)
+                 INDEX (turn_id) WHERE turn_id IS NOT NULL
+                                                  -- a turn delete's SET NULL reads it
                  -- content blocks exactly as sent to / received from the model;
                  -- replayed verbatim on every later request (chat.md § History);
                  -- `turn_id` NULL on a row stored before turns were recorded,
@@ -241,7 +250,7 @@ chat_turns       id UUID PK, user_id FK, conversation_id FK,
                                                   -- the turn answers
                  kind message|compact|idle_compact NOT NULL DEFAULT 'message',
                  status queued|running|succeeded|failed|cancelled, error NULL,
-                 locale, created_at, started_at NULL, finished_at NULL,
+                 locale, created_at, finished_at NULL,
                  parent_id NULL                   -- a chat_turns.id, no FK (below)
                  INDEX (status, created_at)
                  INDEX (conversation_id, finished_at)
@@ -260,6 +269,7 @@ chat_turns       id UUID PK, user_id FK, conversation_id FK,
 chat_events      id PK, conversation_id FK, turn_id FK, seq, event, data JSONB,
                  created_at
                  UNIQUE (conversation_id, seq)
+                 INDEX (turn_id)                  -- a turn delete's cascade reads it
                  -- what the worker streamed while the turn ran; the SSE route replays
                  -- and tails it (chat.md § Conversations, turns, events)
 chat_tool_calls  id PK, user_id FK, turn_id FK chat_turns ON DELETE SET NULL, NULL,
@@ -314,7 +324,7 @@ chat_attachments id UUID PK, user_id FK, name, kind image|text, media_type, size
                  -- a prepared upload waiting for its message: the file is
                  -- {UPLOAD_DIR}/chat-attachment-{id}.{png|jpg|txt}; the send embeds it
                  -- in the message and deletes both (chat.md § What a user message carries)
-upload_tickets   id PK, user_id FK, token_hash UNIQUE, prefix, job_id FK NULL,
+upload_tickets   id PK, user_id FK, token_hash UNIQUE, job_id FK NULL,
                  created_at, expires_at, spent_at NULL,
                  into_library BOOL (false), folder_id FK NULL
                  INDEX (user_id, created_at)                                 -- mint rate limit
@@ -325,7 +335,7 @@ upload_tickets   id PK, user_id FK, token_hash UNIQUE, prefix, job_id FK NULL,
                  -- is filed into Files, in folder_id (NULL the top level), ON DELETE
                  -- SET NULL (mcp.md § Filing into Files)
 document_tickets id PK, user_id FK, document_id FK, scope read|write,
-                 token_hash UNIQUE, prefix, created_at, expires_at
+                 token_hash UNIQUE, created_at, expires_at
                  INDEX (user_id, created_at)                                 -- mint rate limit
                  -- a short-lived credential for one document, minted by the MCP
                  -- library tools (auth.md § 7); not spent by use; both foreign keys
@@ -352,21 +362,20 @@ checkouts        user_id PK/FK, plan_id, idempotency_key UNIQUE,
                  -- the one checkout a user may have open: the key is written before
                  -- Pay is called, so a retry repeats the same request
 pay_events       id PK,                           -- Pay's event id
-                 type, user_id FK NULL, received_at
+                 user_id FK NULL
                  -- processed notifications; a duplicate id is answered and not applied
-credit_periods   (user_id FK, period_start) PK, period_end, plan_id NULL,
+credit_periods   (user_id FK, period_start) PK, period_end,
                  granted INT, spent INT,          -- the balance's fast path:
                                                   -- remaining = granted - spent
                  created_at, updated_at
                  CHECK (period_end > period_start), CHECK (granted >= 0)
                  -- one row per user per allowance period (Free's UTC month, or a paid
-                 -- period), created on first use (billing.md § Periods); plan_id NULL
-                 -- = Free
+                 -- period), created on first use (billing.md § Periods)
 credit_entries   id PK, user_id FK, period_start,
                  kind parse|chat, state reserved|consumed|released,
                  amount INT, job_id FK jobs ON DELETE SET NULL, NULL UNIQUE,
                  turn_id FK chat_turns ON DELETE SET NULL, NULL UNIQUE,
-                 model NULL, created_at, settled_at NULL
+                 created_at, settled_at NULL
                  INDEX (user_id, created_at)
                  CHECK (amount >= 0), CHECK (kind = 'parse' OR job_id IS NULL),
                  CHECK (kind = 'chat' OR turn_id IS NULL)

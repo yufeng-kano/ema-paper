@@ -362,7 +362,7 @@ async def test_a_plan_code_starts_at_once_when_nothing_else_pays(make_client, se
         entry = await ledger.reserve(db, settings, user_id=user_id, kind=ledger.PARSE, amount=7)
         await db.commit()
         row = await db.get(CreditPeriod, (user_id, entry.period_start))
-        assert (row.plan_id, row.granted, row.spent, row.period_end) == ("pro", 5000, 7, period_end)
+        assert (row.granted, row.spent, row.period_end) == (5000, 7, period_end)
     # The entitlements are the plan's.
     async with sessionmaker() as db:
         plan = await ledger.plan_of(db, settings, user_id)
@@ -425,7 +425,7 @@ async def test_days_wait_under_a_paid_subscription_and_a_paid_period_cuts_an_ope
         subscription = await db.get(Subscription, user_id)
         assert entry.period_start == subscription.period_start
         cut = await db.get(CreditPeriod, (user_id, opened_start))
-        assert (cut.plan_id, cut.granted, cut.spent) == ("pro", 5000, 1)
+        assert (cut.granted, cut.spent) == (5000, 1)
 
 
 @respx.mock

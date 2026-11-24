@@ -1,7 +1,7 @@
 """Short-lived document tickets for the MCP library tools (docs/auth.md § 7).
 
 Format ``srd_<32 url-safe chars>``. Returned by `read_document` or `write_document` exactly
-once, stored as a SHA-256 hash plus a display string. A ticket names one document of one
+once, stored as a SHA-256 hash. A ticket names one document of one
 account and a scope: `read` serves that document's `GET` routes under
 `/v1/library/documents/{id}`, `write` its two saves as well. Use never spends it; its
 lifetime does.
@@ -63,7 +63,6 @@ async def mint(
         document_id=document_id,
         scope=scope,
         token_hash=hash_token(token),
-        prefix=f"{TICKET_PREFIX}...{token[-4:]}",
         created_at=now,
         expires_at=now + timedelta(seconds=settings.document_ticket_ttl_seconds),
     )

@@ -82,7 +82,11 @@ async def branch_boundary(db: AsyncSession, path: list[ChatTurn]) -> int | None:
         if turn.kind not in COMPACTION_TURNS or turn.status != "succeeded":
             continue
         summary_id = (
-            await db.execute(select(func.max(Message.id)).where(Message.turn_id == turn.id))
+            await db.execute(
+                select(func.max(Message.id)).where(
+                    Message.conversation_id == turn.conversation_id, Message.turn_id == turn.id
+                )
+            )
         ).scalar_one_or_none()
         if summary_id is not None:
             return summary_id

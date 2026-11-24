@@ -337,6 +337,14 @@ class Folder(Base):
             postgresql_where=text("trashed_at IS NOT NULL"),
             sqlite_where=text("trashed_at IS NOT NULL"),
         ),
+        # What a folder delete's cascade to its subfolders reads: the unique indexes above
+        # lead with user_id and skip the Trash, so they cannot serve it (docs/database.md).
+        Index(
+            "ix_folders_parent_id",
+            "parent_id",
+            postgresql_where=text("parent_id IS NOT NULL"),
+            sqlite_where=text("parent_id IS NOT NULL"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -387,6 +395,13 @@ class Document(Base):
             sqlite_where=text("folder_id IS NULL AND trashed_at IS NULL"),
         ),
         Index("ix_documents_user_created", "user_id", "created_at"),
+        # What a folder delete's cascade to its documents reads (docs/database.md).
+        Index(
+            "ix_documents_folder_id",
+            "folder_id",
+            postgresql_where=text("folder_id IS NOT NULL"),
+            sqlite_where=text("folder_id IS NOT NULL"),
+        ),
         # The parse retention's keep rule and a job delete's cascade read it
         # (docs/jobs.md § Retention).
         Index("ix_documents_job_id", "job_id"),
@@ -405,7 +420,7 @@ class Document(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     folder_id: Mapped[int | None] = mapped_column(
         ForeignKey("folders.id", ondelete="CASCADE"), nullable=True
     )
@@ -448,6 +463,14 @@ class UsageLog(Base):
         Index("ix_usage_log_user_created", "user_id", "created_at"),
         # A job delete's SET NULL reads it (docs/jobs.md § Retention).
         Index("ix_usage_log_job_id", "job_id"),
+        # A turn's settlement sums its rows, and a turn delete's SET NULL reads it
+        # (docs/billing.md § A chat turn).
+        Index(
+            "ix_usage_log_turn_id",
+            "turn_id",
+            postgresql_where=text("turn_id IS NOT NULL"),
+            sqlite_where=text("turn_id IS NOT NULL"),
+        ),
         # An unknown cost is NULL and only an unknown cost is: a call nobody priced must
         # never be summed as a free one (docs/database.md).
         CheckConstraint(
@@ -585,7 +608,6 @@ class ChatTurn(Base):
     # The web app's locale when the message was sent: the language the turn answers in.
     locale: Mapped[str] = mapped_column(String(16), default="en", server_default="en")
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
-    started_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
     # The turn before this one on its branch, NULL for a conversation's first: turns with
     # one parent are the versions of one message, and `conversations.head_id` names the
@@ -624,7 +646,16 @@ class Message(Base):
     every later request replays them verbatim (docs/chat.md § History is append-only)."""
 
     __tablename__ = "messages"
-    __table_args__ = (Index("ix_messages_conversation_id", "conversation_id", "id"),)
+    __table_args__ = (
+        Index("ix_messages_conversation_id", "conversation_id", "id"),
+        # A turn delete's SET NULL reads it (docs/database.md).
+        Index(
+            "ix_messages_turn_id",
+            "turn_id",
+            postgresql_where=text("turn_id IS NOT NULL"),
+            sqlite_where=text("turn_id IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     conversation_id: Mapped[int] = mapped_column(ForeignKey("conversations.id", ondelete="CASCADE"))
@@ -642,6 +673,8 @@ class ChatEvent(Base):
     __tablename__ = "chat_events"
     __table_args__ = (
         UniqueConstraint("conversation_id", "seq", name="uq_chat_events_conversation_seq"),
+        # A turn delete's cascade reads it (docs/database.md).
+        Index("ix_chat_events_turn_id", "turn_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -661,7 +694,7 @@ class Skill(Base):
     __table_args__ = (UniqueConstraint("user_id", "name", name="uq_skills_user_name"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     name: Mapped[str] = mapped_column(String(64))
     description: Mapped[str] = mapped_column(Text, default="")
     argument_hint: Mapped[str] = mapped_column(String(128), default="")
@@ -683,7 +716,7 @@ class Subagent(Base):
     __table_args__ = (UniqueConstraint("user_id", "name", name="uq_subagents_user_name"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     name: Mapped[str] = mapped_column(String(64))
     description: Mapped[str] = mapped_column(Text, default="")
     # NULL: the conversation's model.
@@ -696,9 +729,6 @@ class Subagent(Base):
     prompt: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
-
-
-MEMORY_KINDS = ("term", "preference", "about", "document")
 
 
 class Memory(Base):
@@ -785,7 +815,6 @@ class UploadTicket(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     token_hash: Mapped[str] = mapped_column(String(64), unique=True)
-    prefix: Mapped[str] = mapped_column(String(32))
     job_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True
     )
@@ -820,7 +849,6 @@ class DocumentTicket(Base):
     document_id: Mapped[int] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"))
     scope: Mapped[str] = mapped_column(String(8))
     token_hash: Mapped[str] = mapped_column(String(64), unique=True)
-    prefix: Mapped[str] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     expires_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ)
 
@@ -909,13 +937,11 @@ class PayEvent(Base):
     __tablename__ = "pay_events"
 
     id: Mapped[str] = mapped_column(String(255), primary_key=True)
-    type: Mapped[str] = mapped_column(String(64))
     # The record of the event outlives the user it was about.
     user_id: Mapped[int | None] = mapped_column(
         ForeignKey("users.id", name="fk_pay_events_user_id_users", ondelete="SET NULL"),
         nullable=True,
     )
-    received_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
 
 
 class CreditPeriod(Base):
@@ -934,8 +960,6 @@ class CreditPeriod(Base):
     )
     period_start: Mapped[datetime] = mapped_column(TIMESTAMPTZ, primary_key=True)
     period_end: Mapped[datetime] = mapped_column(TIMESTAMPTZ)
-    # NULL = Free.
-    plan_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     granted: Mapped[int] = mapped_column(Integer)
     # Reserved and consumed entries of the period; a release subtracts. May exceed
     # `granted` only through a chat turn's overdraft.
@@ -986,7 +1010,6 @@ class CreditEntry(Base):
         unique=True,
         nullable=True,
     )
-    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
     settled_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
 

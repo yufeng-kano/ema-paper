@@ -170,7 +170,6 @@ async def write_title(
             user_id=conversation.user_id,
             kind=ledger.CHAT,
             amount=0,
-            model=model,
             minimum=settings.chat_min_credits,
         )
     except ledger.InsufficientCredits as exc:

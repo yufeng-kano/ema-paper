@@ -579,7 +579,6 @@ async def submit_parse(
                 len(parse_pages_spec(pages_spec, page_count)), settings.parse_credits_per_page
             ),
             job_id=job.id,
-            model=target.model,
         )
     except ledger.InsufficientCredits as exc:
         stored.unlink(missing_ok=True)

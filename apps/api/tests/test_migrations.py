@@ -668,7 +668,7 @@ async def test_the_upgrade_revokes_every_grant_without_the_library(scratch_url) 
                     {"user": user, "hash": name, "job": job, "spent": spent, "library": library},
                 )
 
-        _alembic(scratch_url, "upgrade", "head")
+        _alembic(scratch_url, "upgrade", "d10760d56782")
         async with engine.connect() as db:
             grants = {
                 (kind, scope, revoked_at is None, revoked_at == revoked_before)

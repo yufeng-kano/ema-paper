@@ -202,7 +202,7 @@ async def _footprint(client: AsyncClient) -> dict:
                 period_end=utcnow() - timedelta(days=10),
             )
         )
-        db.add(PayEvent(id=f"evt_{uid}", type="subscription.canceled", user_id=uid))
+        db.add(PayEvent(id=f"evt_{uid}", user_id=uid))
         await db.commit()
         attachment_id = attachment.id
     figures, uploads = Path(settings.figures_dir), Path(settings.upload_dir)

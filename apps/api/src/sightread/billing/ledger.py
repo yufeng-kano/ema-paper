@@ -265,14 +265,12 @@ async def period_row(
     user's row lock, under which the bank's move, if any, is written (`settle_period`)."""
     now = now or utcnow()
     period = (await settle_period(db, settings, user_id, now)).period
-    plan_id = None if period.plan.free else period.plan.id
     row = await db.get(CreditPeriod, (user_id, period.start))
     if row is None:
         row = CreditPeriod(
             user_id=user_id,
             period_start=period.start,
             period_end=period.end,
-            plan_id=plan_id,
             granted=period.credits,
         )
         try:
@@ -286,7 +284,6 @@ async def period_row(
                 raise
     if row.granted < period.credits:
         row.granted = period.credits
-        row.plan_id = plan_id
         await db.flush()
     return row, period
 
@@ -404,7 +401,6 @@ async def reserve(
     amount: int,
     job_id: uuid.UUID | None = None,
     turn_id: uuid.UUID | None = None,
-    model: str | None = None,
     minimum: int = 0,
     now: datetime | None = None,
 ) -> CreditEntry:
@@ -420,7 +416,6 @@ async def reserve(
         amount=amount,
         job_id=job_id,
         turn_id=turn_id,
-        model=model,
     )
     db.add(entry)
     await db.flush()

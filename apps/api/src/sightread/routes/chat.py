@@ -879,7 +879,6 @@ async def post_message(
             kind=ledger.CHAT,
             amount=0,
             turn_id=turn.id,
-            model=row.model,
             minimum=settings.chat_min_credits,
         )
     except ledger.InsufficientCredits as exc:
@@ -1035,7 +1034,6 @@ async def edit_message(
             kind=ledger.CHAT,
             amount=0,
             turn_id=turn.id,
-            model=row.model,
             minimum=settings.chat_min_credits,
         )
     except ledger.InsufficientCredits as exc:

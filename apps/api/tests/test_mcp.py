@@ -19,6 +19,7 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from sqlalchemy import select
 
+from sightread.auth.crypto import hash_token
 from sightread.auth.upload_tickets import TICKET_PREFIX
 from sightread.db.models import UploadTicket, User, utcnow
 from tests.conftest import mcp_running
@@ -179,7 +180,7 @@ async def test_parse_mints_a_ticket_and_ready_to_run_commands(api_client, sessio
     async with sessionmaker() as db:
         rows = (await db.execute(select(UploadTicket))).scalars().all()
     assert len(rows) == 1
-    assert rows[0].prefix == f"{TICKET_PREFIX}...{token[-4:]}"
+    assert rows[0].token_hash == hash_token(token)
     assert token not in rows[0].token_hash
     assert (rows[0].spent_at, rows[0].job_id) == (None, None)
 
@@ -208,7 +209,6 @@ async def test_minting_cleans_up_this_users_expired_tickets(api_client, sessionm
             UploadTicket(
                 user_id=user.id,
                 token_hash="dead" * 16,
-                prefix=f"{TICKET_PREFIX}...dead",
                 created_at=utcnow() - timedelta(hours=2),
                 expires_at=utcnow() - timedelta(hours=1),
             )
@@ -219,9 +219,9 @@ async def test_minting_cleans_up_this_users_expired_tickets(api_client, sessionm
         await _mint(session)
 
     async with sessionmaker() as db:
-        prefixes = {row.prefix for row in (await db.execute(select(UploadTicket))).scalars()}
-    assert f"{TICKET_PREFIX}...dead" not in prefixes
-    assert len(prefixes) == 1
+        hashes = set((await db.execute(select(UploadTicket.token_hash))).scalars())
+    assert "dead" * 16 not in hashes
+    assert len(hashes) == 1
 
 
 async def test_an_invalid_token_never_reaches_a_tool(api_client: AsyncClient) -> None:
