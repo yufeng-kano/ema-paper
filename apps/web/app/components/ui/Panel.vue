@@ -16,10 +16,6 @@ defineProps<{
 
 defineSlots<{
   default: () => unknown
-  /**
-   * Replaces the `<h2>`. For a heading that is more than a string.
-   */
-  title?: () => unknown
   /** Right of the heading: this dataset's own metadata ("34 days recorded") or one small button. */
   meta?: () => unknown
 }>()
@@ -49,10 +45,8 @@ defineExpose({ scrollToTop })
 
 <template>
   <section class="panel">
-    <header v-if="title || $slots.title || $slots.meta" class="panel-head">
-      <slot name="title">
-        <h2 v-if="title" class="panel-title">{{ title }}</h2>
-      </slot>
+    <header v-if="title || $slots.meta" class="panel-head">
+      <h2 v-if="title" class="panel-title">{{ title }}</h2>
       <div v-if="$slots.meta" class="panel-meta">
         <slot name="meta" />
       </div>

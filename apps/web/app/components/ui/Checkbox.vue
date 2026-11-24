@@ -6,22 +6,17 @@
  * The box is drawn; the control is a native `<input type="checkbox">` laid over it, so focus,
  * Space, the form's semantics and assistive tech are the browser's own, and the app's one
  * focus ring is drawn around the box while the input has keyboard focus. Its name is the
- * visible text in the default slot, or `label` where there is none.
+ * visible text in the default slot.
  *
  * `locked` is unavailable for a moment rather than for good — a box waiting on the save it
  * started: drawn and announced as disabled (`aria-disabled`) and deaf to a change, but still
  * focusable, since a natively disabled input drops the keyboard's focus to the page.
  */
-const props = withDefaults(
-  defineProps<{
-    modelValue: boolean
-    /** The accessible name where no visible text names the box. */
-    label?: string
-    disabled?: boolean
-    locked?: boolean
-  }>(),
-  { label: undefined },
-)
+const props = defineProps<{
+  modelValue: boolean
+  disabled?: boolean
+  locked?: boolean
+}>()
 
 const emit = defineEmits<{ 'update:modelValue': [value: boolean] }>()
 
@@ -47,7 +42,6 @@ function onChange(event: Event) {
         :checked="modelValue"
         :disabled="disabled"
         :aria-disabled="locked && !disabled ? 'true' : undefined"
-        :aria-label="label"
         @change="onChange"
       >
       <span class="box" :class="{ on: modelValue }" aria-hidden="true">

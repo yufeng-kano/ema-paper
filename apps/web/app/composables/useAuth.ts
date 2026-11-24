@@ -61,7 +61,6 @@ export function useAuth() {
 
   return {
     me,
-    loaded,
     signedIn: computed(() => me.value !== null),
     ensureLoaded,
     refresh,

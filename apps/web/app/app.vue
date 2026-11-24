@@ -3,8 +3,8 @@ const localeHead = useLocaleHead({ seo: true })
 const { t } = useI18n()
 
 useHead(() => ({
-  // One tab title for the whole app — pages do not set their own, so switching
-  // tabs never renames the tab. The sign-in page's SEO meta is the one override.
+  // One tab title for the whole app, so moving between signed-in screens never renames
+  // the tab. The public pages set their own title with their SEO meta.
   title: t('app.name'),
   htmlAttrs: { lang: localeHead.value.htmlAttrs?.lang },
   link: [...(localeHead.value.link || [])],

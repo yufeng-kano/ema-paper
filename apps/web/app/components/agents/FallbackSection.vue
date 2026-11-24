@@ -58,18 +58,14 @@ async function toggleAuto() {
         <span v-if="fallback" class="mono fact-value">{{ fallback }}</span>
         <span v-else class="fact-value muted">{{ t('agents.fallback.none') }}</span>
       </div>
-      <button
-        type="button"
-        role="switch"
-        class="switch"
-        :aria-checked="autoOn"
-        :aria-busy="autoChoice !== null || undefined"
+      <UiSwitch
+        :model-value="autoOn"
+        :busy="autoChoice !== null"
         :disabled="fallback === null"
-        @click="toggleAuto"
+        @update:model-value="toggleAuto"
       >
         {{ t('agents.fallback.auto') }}
-        <span class="track" aria-hidden="true"><span class="knob" /></span>
-      </button>
+      </UiSwitch>
     </div>
     <p class="note">{{ t('agents.fallback.note') }}</p>
     <UiBanner v-if="error" tone="error">{{ error }}</UiBanner>
@@ -130,67 +126,6 @@ async function toggleAuto() {
 
 .fact-value.muted {
   color: var(--muted);
-}
-
-/* The memory section's switch: the words, then the system's capsule switch. */
-.switch {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
-  height: var(--control-height-sm);
-  padding: 0 var(--space-1) 0 var(--space-3);
-  border: 0;
-  border-radius: var(--radius-full);
-  background: transparent;
-  color: var(--ink);
-  font-size: var(--text-sm);
-  cursor: pointer;
-  transition: background var(--duration-fast) var(--ease);
-}
-
-.switch:hover:not(:disabled) {
-  background: var(--fill-weak);
-}
-
-/* Not disabled while it saves — a disabled button drops the keyboard's focus — only busy. */
-.switch[aria-busy='true'] {
-  cursor: progress;
-}
-
-.switch:disabled {
-  color: var(--faint);
-  cursor: not-allowed;
-}
-
-.track {
-  position: relative;
-  display: inline-block;
-  flex-shrink: 0;
-  width: 36px;
-  height: 22px;
-  border-radius: var(--radius-full);
-  background: var(--fill-strong);
-  transition: background var(--duration-fast) var(--ease);
-}
-
-.knob {
-  position: absolute;
-  top: 2px;
-  left: 2px;
-  width: 18px;
-  height: 18px;
-  border-radius: var(--radius-full);
-  background: var(--accent-fg);
-  box-shadow: var(--shadow-segment);
-  transition: left var(--duration-fast) var(--ease);
-}
-
-.switch[aria-checked='true'] .track {
-  background: var(--accent);
-}
-
-.switch[aria-checked='true'] .knob {
-  left: 16px;
 }
 
 .note {

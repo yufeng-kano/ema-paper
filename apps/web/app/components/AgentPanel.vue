@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * The selected agent's panel in the settings dialog's Agent section (`/settings/agent`;
+ * The selected agent's panel in the settings dialog's Agent section (`?settings=agent`;
  * docs/web.md § Pages, docs/agents.md): one row of controls — the model it runs (the
  * deployment's parse model as a fact; for the chat agent a dropdown of the offered models),
  * then for the chat agent its effort, for the parse agent its prompt — then, for the parse
@@ -192,15 +192,9 @@ function onSectionSaved(agent: string, saved: SavedAgentSettings) {
       <p v-if="isChat" class="note">{{ t('agents.cacheNote') }}</p>
       <!-- The idle-compaction switch, after the cache line (docs/web.md § Pages). -->
       <template v-if="isChat">
-        <div class="switch-line">
-          <UiSwitch
-            :model-value="idleOn"
-            :label="t('agents.idleCompact.label')"
-            :busy="idlePending"
-            @update:model-value="applyIdleCompact"
-          />
-          <span class="switch-words">{{ t('agents.idleCompact.label') }}</span>
-        </div>
+        <UiSwitch class="idle-switch" :model-value="idleOn" :busy="idlePending" @update:model-value="applyIdleCompact">
+          {{ t('agents.idleCompact.label') }}
+        </UiSwitch>
         <p class="note">{{ t('agents.idleCompact.note') }}</p>
       </template>
       <UiBanner v-if="modelsError" class="row-banner" tone="error">{{ modelsError }}</UiBanner>
@@ -342,16 +336,11 @@ function onSectionSaved(agent: string, saved: SavedAgentSettings) {
   font-size: var(--text-xs);
 }
 
-/* A switch beside its words, under the cache line. */
-.switch-line {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
+/* The switch and its words under the cache line, the words on the column's text edge. */
+.idle-switch {
+  align-self: flex-start;
   margin-top: var(--space-2);
-}
-
-.switch-words {
-  font-size: var(--text-sm);
+  margin-left: calc(-1 * var(--space-3));
 }
 
 /* The tools row has the field label's treatment with no control under it. */

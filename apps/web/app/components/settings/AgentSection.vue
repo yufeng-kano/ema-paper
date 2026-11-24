@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * Agent (docs/web.md § Pages, `/settings/agent`): every agent runs on the operator's Kano
+ * Agent (docs/web.md § Pages, `?settings=agent`): every agent runs on the operator's Kano
  * Proxy, so there is nothing to connect — the section is a tab row over the selected
  * agent's panel (`AgentPanel`) and nothing else. The `check` agent is no tab: its settings
  * are the parse panel's *Format check*.

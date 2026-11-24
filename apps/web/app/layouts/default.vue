@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import type { ComponentPublicInstance } from 'vue'
 import { navEntries } from '~/lib/admin'
+import { focusablesIn, wrapTab } from '~/lib/focus'
 import type { MenuItem, Point } from '~/lib/menu'
 import { SETTINGS_QUERY, settingsSectionOf } from '~/lib/settings'
 
@@ -136,29 +137,22 @@ function onAccountAction(action: string) {
   }
 }
 
-// Following a menu item navigates; the route change is what closes the menu. The full
-// path, since Settings navigates by query alone.
-watch(() => route.fullPath, () => {
-  accountMenu.value = null
-})
-
 const sidebar = ref<HTMLElement | null>(null)
 /** A ref on a component yields its instance; `UiButton` with neither `to` nor `href` roots
  *  a real `<button>`, which is the element focus has to return to. */
 const menuButton = ref<ComponentPublicInstance | null>(null)
 const drawerOpen = ref(false)
 
-const FOCUSABLE = 'a[href], button:not([disabled]), [tabindex]:not([tabindex="-1"])'
-
 /** Matches the 900px breakpoint in this component's own stylesheet. */
 function isDrawerLayout(): boolean {
   return typeof matchMedia !== 'undefined' && matchMedia('(max-width: 900px)').matches
 }
 
-// A destination the user just picked is behind the drawer they picked it from — the
-// settings dialog too, which opens by query from the drawer's account menu and is teleported
-// outside the drawer, where the drawer's focus trap would otherwise hold Tab.
+// A navigation closes the menu and the drawer it was picked from. The full path, since
+// Settings navigates by query alone — and the settings dialog is teleported outside the
+// drawer, where the drawer's focus trap would otherwise hold Tab.
 watch(() => route.fullPath, () => {
+  accountMenu.value = null
   drawerOpen.value = false
 })
 
@@ -174,7 +168,7 @@ watch(drawerOpen, async (open) => {
     return
   }
   await nextTick()
-  sidebar.value?.querySelector<HTMLElement>(FOCUSABLE)?.focus()
+  focusablesIn(sidebar.value)[0]?.focus()
 })
 
 function onKeydown(event: KeyboardEvent) {
@@ -189,25 +183,33 @@ function onKeydown(event: KeyboardEvent) {
   }
   if (event.key !== 'Tab' || !sidebar.value) return
 
-  const items = [...sidebar.value.querySelectorAll<HTMLElement>(FOCUSABLE)]
+  const items = focusablesIn(sidebar.value)
   if (!items.length) return
-  const first = items[0]!
-  const last = items[items.length - 1]!
-  const active = document.activeElement
-
-  // Also catches focus already outside the drawer — a click on the scrim, say — pulling it
-  // back rather than letting Tab continue through the page behind.
-  if (event.shiftKey && (active === first || !sidebar.value.contains(active))) {
-    event.preventDefault()
-    last.focus()
-  } else if (!event.shiftKey && (active === last || !sidebar.value.contains(active))) {
-    event.preventDefault()
-    first.focus()
-  }
+  wrapTab(event, sidebar.value, items)
 }
 
 onMounted(() => window.addEventListener('keydown', onKeydown))
 onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
+
+/**
+ * The settings dialog's Agent section is its own chunk — it carries the rich editor, which
+ * nothing else in this frame needs — fetched once the page is idle, so the section opens at
+ * once later: the specifier is the module `LazySettingsAgentSection` loads. Nuxt reloads
+ * only for a chunk that fails during a navigation, and opening Settings is a query push, so
+ * a warm-up that fails (a deploy landed since this page loaded) asks the build check, which
+ * reloads onto the new build under the page's holds (docs/web.md § Rules).
+ */
+const nuxtApp = useNuxtApp()
+onMounted(() => {
+  const warm = () => {
+    void import('~/components/settings/AgentSection.vue').catch(() => nuxtApp.$buildUpdate.check())
+  }
+  if ('requestIdleCallback' in window) {
+    requestIdleCallback(warm, { timeout: 3000 })
+  } else {
+    setTimeout(warm, 1500)
+  }
+})
 
 async function signOut() {
   await auth.signOut()
@@ -498,8 +500,7 @@ async function signOut() {
   white-space: nowrap;
 }
 
-/* Pinned to the bottom: the session's own row. The popover anchors to it, so it owns a
-   positioning context. */
+/* Pinned to the bottom: the session's own row. */
 .sidebar-foot {
   display: flex;
   align-items: center;

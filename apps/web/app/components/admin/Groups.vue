@@ -511,7 +511,6 @@ async function confirmDelete() {
                     :id="id"
                     v-model="email"
                     type="email"
-                    autocomplete="off"
                     :placeholder="t('admin.groups.addByEmail')"
                     :described-by="describedBy"
                     :invalid="invalid"

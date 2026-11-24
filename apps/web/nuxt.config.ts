@@ -12,9 +12,7 @@ export default defineNuxtConfig({
   modules: ['@nuxtjs/i18n', '@nuxt/eslint'],
   compatibilityDate: '2025-08-20',
   devtools: { enabled: false },
-  // KaTeX's stylesheet ships with the package (fonts bundled by the build) — the result
-  // viewer's math depends on nothing remote (docs/web.md § Result viewer).
-  css: ['~/assets/css/main.css', '~/assets/css/markdown.css', 'katex/dist/katex.min.css'],
+  css: ['~/assets/css/main.css', '~/assets/css/markdown.css'],
   // This file reads WEB_URL from the build's environment, so its own type check needs Node's types.
   typescript: {
     nodeTsConfig: { compilerOptions: { types: ['node'] } },
@@ -27,7 +25,6 @@ export default defineNuxtConfig({
   app: {
     head: {
       htmlAttrs: { lang: 'en' },
-      meta: [{ name: 'viewport', content: 'width=device-width, initial-scale=1' }],
       // The pinned theme, applied before first paint so a reader who chose dark never sees
       // the light tokens flash. The same key `useTheme` writes (docs/web.md § Design system).
       script: [
@@ -92,30 +89,15 @@ export default defineNuxtConfig({
     ...Object.fromEntries(
       PAGE_LOCALES.flatMap(({ prefix }) => [
         [`${prefix}/files`, { ssr: false }],
-        [`${prefix}/settings/**`, { ssr: false }],
         [`${prefix}/admin`, { ssr: false }],
         [`${prefix}/admin/**`, { ssr: false }],
       ]),
     ),
-    // The four screens that became sections of the settings dialog (docs/web.md § Pages):
-    // a bookmark of the old path lands on its section, through the `/settings/<section>`
-    // deep-link page. The unprefixed paths are English's from before every locale had a
-    // prefix; their targets are localized by the browser's language, like any bare path.
-    '/agents': { redirect: '/settings/agent' },
-    '/keys': { redirect: '/settings/keys' },
-    '/connect': { redirect: '/settings/mcp' },
-    '/dashboard': { redirect: '/settings/usage' },
-    '/zh-TW/agents': { redirect: '/zh-TW/settings/agent' },
-    '/zh-TW/keys': { redirect: '/zh-TW/settings/keys' },
-    '/zh-TW/connect': { redirect: '/zh-TW/settings/mcp' },
-    '/zh-TW/dashboard': { redirect: '/zh-TW/settings/usage' },
-    // History, the list of every parse, was removed (docs/web.md § Pages): a bookmark of it
-    // lands on Files.
-    '/history': { redirect: '/files' },
-    '/zh-TW/history': { redirect: '/zh-TW/files' },
   },
 
   nitro: {
+    // `nuxt dev` only: `/api` and `/v1` go to the API's native uvicorn port, fixed on purpose —
+    // no build carries this, and the root `.env` never reaches `nuxt dev` (docs/web.md § Rules).
     devProxy: {
       '/api': { target: 'http://localhost:8000/api', changeOrigin: false },
       '/v1': { target: 'http://localhost:8000/v1', changeOrigin: false },

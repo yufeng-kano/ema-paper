@@ -200,10 +200,9 @@ onBeforeUnmount(close)
         {{ t('chat.ring.window', { window: formatTokens(conversation.context_window) }) }}
       </p>
       <p v-if="cacheText" class="card-line" :class="{ danger: cache?.kind === 'expired' }">{{ cacheText }}</p>
-      <div class="card-switch">
-        <UiSwitch :model-value="idleOn" :label="t('agents.idleCompact.label')" :busy="idlePending" @update:model-value="toggleIdle" />
-        <span class="card-switch-words">{{ t('agents.idleCompact.label') }}</span>
-      </div>
+      <UiSwitch class="card-switch" :model-value="idleOn" :busy="idlePending" @update:model-value="toggleIdle">
+        {{ t('agents.idleCompact.label') }}
+      </UiSwitch>
       <p class="card-note">{{ t('agents.idleCompact.note') }}</p>
       <UiButton size="sm" variant="secondary" :disabled="!canCompact" @click="emit('compact')">
         {{ t('chat.ring.compactNow') }}
@@ -317,15 +316,11 @@ onBeforeUnmount(close)
   color: var(--muted);
 }
 
+/* The capsule's words line up with the card's text. */
 .card-switch {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
+  align-self: flex-start;
   margin-top: var(--space-1);
-}
-
-.card-switch-words {
-  color: var(--ink);
+  margin-left: calc(-1 * var(--space-3));
 }
 
 .card > :last-child {

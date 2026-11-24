@@ -117,7 +117,7 @@ export function translatable(block: ResultBlock): boolean {
 
 // --- collapsed sections -------------------------------------------------------------------------
 
-export interface Folds {
+interface Folds {
   /** Blocks a collapsed section hides, by `blockKey`. */
   hidden: Set<string>
   /** Each drawn fold's hidden blocks, comments not counted, by its heading's `blockKey`. */
@@ -382,7 +382,7 @@ export function rememberFolds(memory: FoldMemory, id: string, slugs: Iterable<st
  * heading is one row reaching to its section's last hidden block — what a move carries.
  * `first` and `last` index `placedBlocks`.
  */
-export interface Row {
+interface Row {
   key: string
   first: number
   last: number
@@ -427,7 +427,7 @@ const TICK = 2
 const GAP_MAX = 8
 const GAP_MIN = 2
 
-export interface TickFit {
+interface TickFit {
   gap: number
   /** The headings drawn, by outline index, and whether each is a long (`#`/`##`) tick. */
   ticks: { index: number; long: boolean }[]
@@ -508,7 +508,7 @@ export function dockOutlinePanel(
 // --- undo ---------------------------------------------------------------------------------------
 
 /** One change to a file: at `at`, `removed` was replaced by `inserted`. */
-export interface Span {
+interface Span {
   at: number
   removed: string
   inserted: string
@@ -518,7 +518,7 @@ export type UndoFile = 'document' | 'notes'
 
 /** A block action as the stack keeps it: the spans it changed, and hashes of the text before
  *  and after — which is what *exactly what the action left* is checked against. */
-export interface UndoStep {
+interface UndoStep {
   file: UndoFile
   spans: Span[]
   before: string
@@ -669,7 +669,7 @@ export function blocksInRanges(
 }
 
 /** What undo or redo hands back: the file, its text as it now is, and what was put back. */
-export interface UndoResult {
+interface UndoResult {
   file: UndoFile
   text: string
   ranges: { start: number; end: number }[]

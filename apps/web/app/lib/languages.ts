@@ -11,7 +11,7 @@
 
 export const LANGUAGE_TAGS = ['zh-TW', 'zh-CN', 'en', 'ja', 'ko', 'fr', 'de', 'es'] as const
 
-export type LanguageTag = (typeof LANGUAGE_TAGS)[number]
+type LanguageTag = (typeof LANGUAGE_TAGS)[number]
 
 export function isListedLanguage(tag: string): tag is LanguageTag {
   return (LANGUAGE_TAGS as readonly string[]).includes(tag)

@@ -1,11 +1,13 @@
 <script setup lang="ts">
 /**
  * The footer of the public pages (docs/web.md § Pages): the copyright, the links to the
- * pricing page, the rates page and the three policy pages, and the locale links. Each locale option is
+ * other public pages (`PUBLIC_PAGES`), and the locale links. Each locale option is
  * written in its own language, so it is legible whichever catalog is loaded, and every link
  * is real — the locale lives in the URL, so a choice is bookmarkable and works without
  * JavaScript on a prerendered page.
  */
+import { PUBLIC_PAGES } from '#shared/seo'
+
 const { t, locale, locales } = useI18n()
 const localePath = useLocalePath()
 const switchLocalePath = useSwitchLocalePath()
@@ -13,7 +15,8 @@ const switchLocalePath = useSwitchLocalePath()
 /** A string, not a number: the interpolator runs numbers through `Intl.NumberFormat`, which
  *  would print the year with a thousands separator. */
 const year = String(new Date().getFullYear())
-const pages = ['pricing', 'rates', 'terms', 'privacy', 'refund'] as const
+/** Every public page but the sign-in page, without its leading slash. */
+const pages = PUBLIC_PAGES.filter((page) => page !== '/').map((page) => page.slice(1))
 </script>
 
 <template>

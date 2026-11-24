@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * Preferences (docs/web.md § Pages, `/settings/<section>`): what a PDF or an image becomes,
+ * Preferences (docs/web.md § Pages, `?settings=<section>`): what a PDF or an image becomes,
  * and how it opens. *Convert on upload* is the parse agent's `auto_convert`, read with the
  * agents and saved on change (docs/agents.md) — off, an upload is kept as it is and
  * converted when the reader asks for Markdown in its viewer. *Open on* is the reader's

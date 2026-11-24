@@ -9,7 +9,7 @@
  * suite (docs/testing.md).
  */
 
-export interface BuildUpdateDeps {
+interface BuildUpdateDeps {
   /** The build this tab is running. */
   currentId: string
   /** The newest build's id, or null when it could not be read — which is not an error. */
@@ -18,7 +18,7 @@ export interface BuildUpdateDeps {
   reload: (path?: string) => void
 }
 
-export interface BuildUpdate {
+interface BuildUpdate {
   /** Asks the server which build is newest, and reloads if this is not it and nothing holds. */
   check: () => Promise<void>
   /** Something else (Nuxt's own periodic check) already knows a newer build exists. */
@@ -28,7 +28,6 @@ export interface BuildUpdate {
   /** A route navigation to `path`: true when it was turned into a full load of that path —
    *  never while something holds. */
   navigate: (path: string) => boolean
-  isOutdated: () => boolean
 }
 
 export function createBuildUpdate(deps: BuildUpdateDeps): BuildUpdate {
@@ -94,6 +93,5 @@ export function createBuildUpdate(deps: BuildUpdateDeps): BuildUpdate {
       reload(path)
       return true
     },
-    isOutdated: () => outdated,
   }
 }

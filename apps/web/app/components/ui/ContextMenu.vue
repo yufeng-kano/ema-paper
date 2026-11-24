@@ -175,14 +175,9 @@ function inside(event: Event): boolean {
   return Boolean(menu.value?.contains(target) || sub.value?.contains(target))
 }
 
-function onPointerdownOutside(event: PointerEvent) {
-  if (!inside(event)) {
-    emit('close', event)
-  }
-}
-
-/** A second right-click closes this menu; the page opens the next one from its own handler. */
-function onContextmenuOutside(event: MouseEvent) {
+/** A press or a right-click outside closes this menu; on a second right-click the page
+ *  opens the next one from its own handler. */
+function closeIfOutside(event: Event) {
   if (!inside(event)) {
     emit('close', event)
   }
@@ -339,8 +334,8 @@ watch(
 onMounted(() => {
   previouslyFocused = document.activeElement as HTMLElement | null
   void place()
-  window.addEventListener('pointerdown', onPointerdownOutside, true)
-  window.addEventListener('contextmenu', onContextmenuOutside, true)
+  window.addEventListener('pointerdown', closeIfOutside, true)
+  window.addEventListener('contextmenu', closeIfOutside, true)
   window.addEventListener('resize', close)
   // Capture, because the scroll that matters happens inside a panel, not on the window.
   window.addEventListener('scroll', onScrollOutside, true)
@@ -348,8 +343,8 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   clearTimeout(restTimer)
-  window.removeEventListener('pointerdown', onPointerdownOutside, true)
-  window.removeEventListener('contextmenu', onContextmenuOutside, true)
+  window.removeEventListener('pointerdown', closeIfOutside, true)
+  window.removeEventListener('contextmenu', closeIfOutside, true)
   window.removeEventListener('resize', close)
   window.removeEventListener('scroll', onScrollOutside, true)
   previouslyFocused?.focus?.()

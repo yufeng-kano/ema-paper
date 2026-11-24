@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * A redeem code, typed and redeemed (docs/web.md § Pages, `/settings/usage`; the contract
+ * A redeem code, typed and redeemed (docs/web.md § Pages, `?settings=usage`; the contract
  * is docs/billing.md § Redeem codes): one field, one line on what a code gives, *Redeem*.
  * A refusal is worded under the field from the error's type, in the reader's language; a
  * success turns the dialog into a receipt — the credits added and their expiry, or the days

@@ -1,5 +1,5 @@
 /**
- * The Agent settings section's signal (`/settings/agent`) that what the chat agent receives
+ * The Agent settings section's signal (`?settings=agent`) that what the chat agent receives
  * may have changed (docs/web.md § Pages): bumped after every save that feeds the system
  * blocks — the agent's settings, a memory row, a skill or a subagent — and watched by
  * *What the agent receives*, which reloads while it is open rather than showing the parts

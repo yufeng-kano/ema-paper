@@ -37,7 +37,7 @@ export const AUDIT_FILTER_AREAS: readonly AdminArea[] = ADMIN_AREAS.filter((area
   (area.levels as readonly AdminLevel[]).includes('write'),
 ).map((area) => area.key)
 
-export interface ConsolePage {
+interface ConsolePage {
   /** The area whose `read` shows the page. */
   area: AdminArea
   /** Without the locale prefix: callers pass it through `localePath`. */
@@ -297,7 +297,7 @@ export function wholeNumberOf(text: string, max: number): number | null {
  * `notFound` — what the path or the address named does not exist, or the console is off;
  * `other` — the backend's own message.
  */
-export type AdminFailure =
+type AdminFailure =
   | { kind: 'signedOut' }
   | { kind: 'reauth' }
   | { kind: 'denied' }
@@ -403,9 +403,9 @@ export function formatUsd(value: number, locale: string): string {
  * a range over `ADMIN_USAGE_MAX_DAYS`, which it never lets under 90, so each one fits.
  */
 export const USAGE_PRESETS = [7, 30, 90] as const
-export const USAGE_DEFAULT_DAYS = 30
+const USAGE_DEFAULT_DAYS = 30
 
-export interface DayRange {
+interface DayRange {
   /** `YYYY-MM-DD`, UTC, both included. */
   from: string
   to: string

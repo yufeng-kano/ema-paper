@@ -356,17 +356,9 @@ async function confirmClear() {
   <section class="section" :aria-labelledby="labelId">
     <div class="section-head">
       <h3 :id="labelId" class="section-label">{{ t('agents.memory.label') }}</h3>
-      <button
-        type="button"
-        role="switch"
-        class="switch"
-        :aria-checked="autoOn"
-        :aria-busy="autoChoice !== null || undefined"
-        @click="toggleAuto"
-      >
+      <UiSwitch :model-value="autoOn" :busy="autoChoice !== null" @update:model-value="toggleAuto">
         {{ t('agents.memory.auto') }}
-        <span class="track" aria-hidden="true"><span class="knob" /></span>
-      </button>
+      </UiSwitch>
     </div>
     <p class="note">{{ t('agents.memory.description') }}</p>
     <p v-if="paused" class="paused-line" role="status">
@@ -601,63 +593,6 @@ async function confirmClear() {
   font-size: var(--text-xs);
   font-weight: var(--weight-semibold);
   color: var(--muted);
-}
-
-/* A switch is a labelled button: the words, then the system's capsule switch — a gray track
-   off, the accent on, the white knob sliding across. */
-.switch {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
-  height: var(--control-height-sm);
-  padding: 0 var(--space-1) 0 var(--space-3);
-  border: 0;
-  border-radius: var(--radius-full);
-  background: transparent;
-  color: var(--ink);
-  font-size: var(--text-sm);
-  cursor: pointer;
-  transition: background var(--duration-fast) var(--ease);
-}
-
-.switch:hover {
-  background: var(--fill-weak);
-}
-
-/* Not disabled while it saves — a disabled button drops the keyboard's focus — only busy. */
-.switch[aria-busy='true'] {
-  cursor: progress;
-}
-
-.track {
-  position: relative;
-  display: inline-block;
-  flex-shrink: 0;
-  width: 36px;
-  height: 22px;
-  border-radius: var(--radius-full);
-  background: var(--fill-strong);
-  transition: background var(--duration-fast) var(--ease);
-}
-
-.knob {
-  position: absolute;
-  top: 2px;
-  left: 2px;
-  width: 18px;
-  height: 18px;
-  border-radius: var(--radius-full);
-  background: var(--accent-fg);
-  box-shadow: var(--shadow-segment);
-  transition: left var(--duration-fast) var(--ease);
-}
-
-.switch[aria-checked='true'] .track {
-  background: var(--accent);
-}
-
-.switch[aria-checked='true'] .knob {
-  left: 16px;
 }
 
 .note {

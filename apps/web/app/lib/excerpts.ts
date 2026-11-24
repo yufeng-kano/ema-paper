@@ -167,7 +167,7 @@ export function rewriteBlockLinks(markdown: string, anchorOf: (address: string) 
 }
 
 /** The section a passage is in, as its excerpt's link names it; null before the first heading. */
-export interface ExcerptSection {
+interface ExcerptSection {
   /** The heading's markdown as the document has it. */
   text: string
   slug: string
@@ -201,7 +201,7 @@ function isExcerptHeading(block: ResultBlock): boolean {
 
 /** Where an excerpt went: the notes it made, and where in them it starts. `duplicate` says it
  *  was there already and nothing was added — `at` is then that one. */
-export interface AppendedExcerpt {
+interface AppendedExcerpt {
   notes: string
   at: number
   duplicate: boolean
@@ -235,7 +235,7 @@ export function appendExcerpt(notes: string, passage: string, excerpt: string, h
 // --- finding a passage ------------------------------------------------------------------------
 
 /** A run of text in the order the reader reads it — a text node's, or a formula's TeX. */
-export interface PassageHit {
+interface PassageHit {
   /** Indices into the parts, and offsets into those parts' text; `end` is exclusive. */
   start: { part: number; offset: number }
   end: { part: number; offset: number }

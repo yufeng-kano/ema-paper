@@ -26,7 +26,6 @@ describe('createBuildUpdate', () => {
   it('leaves the page alone on the build it is already running', async () => {
     const { update, reload } = setup('old')
     await update.check()
-    expect(update.isOutdated()).toBe(false)
     expect(reload).not.toHaveBeenCalled()
   })
 
@@ -34,7 +33,6 @@ describe('createBuildUpdate', () => {
     for (const latest of [null, new Error('offline')]) {
       const { update, reload } = setup(latest)
       await update.check()
-      expect(update.isOutdated()).toBe(false)
       expect(reload).not.toHaveBeenCalled()
     }
   })
@@ -56,7 +54,7 @@ describe('createBuildUpdate', () => {
 
   it('leaves a navigation on the current build alone', () => {
     const { update, reload } = setup()
-    expect(update.navigate('/keys')).toBe(false)
+    expect(update.navigate('/files')).toBe(false)
     expect(reload).not.toHaveBeenCalled()
   })
 
@@ -72,7 +70,7 @@ describe('createBuildUpdate', () => {
     shown()
     expect(reload).toHaveBeenCalledExactlyOnceWith(undefined)
     // The load is under way: a navigation now is dropped for it, not a second load.
-    expect(update.navigate('/keys')).toBe(true)
+    expect(update.navigate('/files')).toBe(true)
     expect(reload).toHaveBeenCalledOnce()
   })
 
@@ -80,7 +78,7 @@ describe('createBuildUpdate', () => {
     const { update, reload } = setup()
     update.markOutdated()
     await update.check()
-    update.navigate('/keys')
+    update.navigate('/files')
     expect(reload).toHaveBeenCalledOnce()
   })
 })

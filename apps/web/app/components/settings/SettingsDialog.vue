@@ -55,7 +55,9 @@ function close() {
         <SettingsPreferencesSection v-else-if="section === 'preferences'" />
         <SettingsAccountSection v-else-if="section === 'account'" />
         <SettingsUsageSection v-else-if="section === 'usage'" />
-        <SettingsAgentSection v-else-if="section === 'agent'" />
+        <!-- Its own chunk: the only section with the rich editor, warmed at idle by the
+             layout so it opens at once. -->
+        <LazySettingsAgentSection v-else-if="section === 'agent'" />
         <SettingsKeysSection v-else-if="section === 'keys'" />
         <SettingsMcpSection v-else-if="section === 'mcp'" />
       </div>

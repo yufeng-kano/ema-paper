@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * Usage (docs/web.md § Pages, `/settings/usage`; the contract is docs/billing.md), laid out
+ * Usage (docs/web.md § Pages, `?settings=usage`; the contract is docs/billing.md), laid out
  * as Claude's own usage page: the plan and its action — *Upgrade* (a checkout) or *Manage
  * subscription* (Pay's portal) — then the usage limits, the period's credits and the
  * workspace's storage, each a bar with *N% used*, the top-up credits on a paid plan (the
