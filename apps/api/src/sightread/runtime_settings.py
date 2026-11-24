@@ -142,7 +142,7 @@ class RuntimeSettings:
             else:
                 async with self._sessionmaker()() as own:
                     rows = (await own.execute(statement)).all()
-        except Exception:  # noqa: BLE001 - a settings read never fails a request
+        except Exception:  # a settings read never fails a request
             if not self._read_failed:
                 logger.warning(
                     "could not read the runtime settings; keeping the settings last read",

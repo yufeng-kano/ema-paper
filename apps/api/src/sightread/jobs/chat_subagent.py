@@ -174,7 +174,7 @@ async def _run_one_guarded(
         return await _run_one(ctx, definition, block, malformed)
     except (asyncio.CancelledError, chat_runner.TurnCancelled):
         raise
-    except Exception:  # noqa: BLE001 - any failure is this tool's, never the run's
+    except Exception:  # any failure is this tool's, never the run's
         logger.exception("a subagent's %s failed in turn %s", block.get("name"), ctx.turn.id)
         return chat_tools.ToolOutcome(
             "The tool failed unexpectedly; try another way.", is_error=True

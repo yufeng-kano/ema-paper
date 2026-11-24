@@ -24,4 +24,7 @@ COPY src ./src
 RUN uv sync --locked --no-dev
 
 EXPOSE 8000
-CMD ["uvicorn", "sightread.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# The api's start: migrations run once, from the api container, before it serves
+# (docs/database.md); `exec` makes uvicorn pid 1, so docker stop's SIGTERM reaches it.
+# The worker overrides this with its own command.
+CMD ["sh", "-c", "alembic upgrade head && exec uvicorn sightread.main:app --host 0.0.0.0 --port 8000"]

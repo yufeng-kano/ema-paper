@@ -20,9 +20,9 @@ services:
       - "443:443"
       - "443:443/udp"
     environment:
-      # Both are read by the Caddyfile; see the production block of .env.example.
-      DOMAIN: ${DOMAIN}
-      ACME_EMAIL: ${ACME_EMAIL}
+      # Both are read by the Caddyfile; see .env.production.example.
+      DOMAIN: ${DOMAIN:?DOMAIN is required}
+      ACME_EMAIL: ${ACME_EMAIL:?ACME_EMAIL is required}
     volumes:
       - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
@@ -72,13 +72,10 @@ services:
       # Every user's files and revisions — primary data, bind-mounted at the same host
       # path the sandbox runner hands to `docker run` (docs/workspace.md).
       - ${WORKSPACES_HOST_DIR:?WORKSPACES_HOST_DIR is required}:/data/workspaces
-    # Migrations run once, from the api container, before it serves (docs/database.md).
-    command: >
-      sh -c "alembic upgrade head &&
-      uvicorn sightread.main:app --host 0.0.0.0 --port 8000"
-    # Healthy only once /healthz answers — which is only after `alembic upgrade head`
-    # finished and uvicorn is serving. The worker gates on this, so it can never claim a
-    # queued job against a schema the migration has not written yet.
+    # Healthy only once /healthz answers — which is only after the image's start command
+    # (apps/api/Dockerfile) finished `alembic upgrade head` and uvicorn is serving. The
+    # worker gates on this, so it can never claim a queued job against a schema the
+    # migration has not written yet.
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=3)"]
       interval: 5s

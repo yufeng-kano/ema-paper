@@ -1385,7 +1385,7 @@ async def take_reconvert(
                 await asyncio.to_thread(
                     _drop_crops, paths, Path(settings.figures_dir), earlier, job.id
                 )
-        except Exception:  # noqa: BLE001 - the document took its parse; the copies can wait
+        except Exception:  # the document took its parse; the copies can wait
             logger.exception("could not materialize document %d after its re-convert", document_id)
     return True
 
@@ -1655,7 +1655,7 @@ def _revert(
 def _rollback_quietly(rollback, root: Path) -> None:
     try:
         rollback()
-    except Exception:  # noqa: BLE001 - the refusal stands; the state is logged
+    except Exception:  # the refusal stands; the state is logged
         logger.exception("could not roll back a failed revert in %s", root)
 
 
@@ -1694,7 +1694,7 @@ async def revert(
             content = await read_content(db, settings, document, locked=True)
         except ApiError:
             raise
-        except Exception as exc:  # noqa: BLE001 - the revert stands; what failed is reported
+        except Exception as exc:  # the revert stands; what failed is reported
             # The revert is a revision now; what failed is bringing the rows in line with
             # it (the database away at that moment). Said so, rather than reported as a
             # revert that did not happen: the rows follow at the next read of the
@@ -2395,7 +2395,7 @@ def _copy_files(
         # Whole or not at all: what the copy made goes, and the squatter comes back.
         try:
             _undo_copy(root, target, aside, [document.target_id for document in documents])
-        except Exception:  # noqa: BLE001 - the refusal stands; the leftovers are logged
+        except Exception:  # the refusal stands; the leftovers are logged
             logger.exception("could not take back the copy at %s", target)
         if isinstance(exc, safe_io.TreeTooDeep):
             raise ApiError(

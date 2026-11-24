@@ -438,7 +438,7 @@ async def test_reset_removes_whatever_sits_at_the_cache(client, tmp_path) -> Non
 
 def test_the_vm_scripts_are_valid_sh_and_the_docker_backend_sweeps_the_vm(tmp_path) -> None:
     for script in (KILL_TREE, ADOPT_SWEEP):
-        subprocess.run(["sh", "-n"], input=script, text=True, check=True)  # noqa: S603, S607
+        subprocess.run(["sh", "-n"], input=script, text=True, check=True)  # noqa: S607
     # The supervisor a VM's shell runs ends every command with the VM-wide sweep.
     argv, _cwd = DockerBackend(docker_settings(tmp_path)).shell_argv(1)
     assert VM_SWEEP in argv[-1]

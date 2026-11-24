@@ -168,7 +168,7 @@ async def expire_trash(sessionmaker: async_sessionmaker[AsyncSession], settings:
             # A conversation about a file it would delete still answering, or the
             # workspace recovering from an unconfirmed shell command: the next sweep.
             logger.warning("the Trash of user %d waits for the next sweep: %s", user_id, exc)
-        except Exception:  # noqa: BLE001 - one user's failure never stops the others'
+        except Exception:  # one user's failure never stops the others'
             logger.exception("could not empty the expired Trash of user %d", user_id)
     return deleted
 
@@ -234,7 +234,7 @@ async def purge_parses(sessionmaker: async_sessionmaker[AsyncSession], settings:
         except ApiError as exc:
             # The workspace recovering from an unconfirmed shell command.
             logger.warning("the parses of user %d wait for the next sweep: %s", user_id, exc)
-        except Exception:  # noqa: BLE001 - one user's failure never stops the others'
+        except Exception:  # one user's failure never stops the others'
             logger.exception("could not delete the expired parses of user %d", user_id)
     return purged
 
@@ -295,7 +295,7 @@ async def finish_deletions(
                     continue
                 if await discard_account(settings, user_id, job_ids):
                     finished += 1
-        except Exception:  # noqa: BLE001 - one account's failure never stops the others'
+        except Exception:  # one account's failure never stops the others'
             logger.exception("could not finish the deletion of user %d", user_id)
     return finished
 
@@ -327,7 +327,7 @@ async def finish_retention(
             continue
         try:
             await retain_source(sessionmaker, settings, job_id, source)
-        except Exception:  # noqa: BLE001 - one job's retention never ends the sweep
+        except Exception:  # one job's retention never ends the sweep
             logger.exception("sweeper could not keep the source of job %s", job_id)
             continue
         finished += 1
@@ -395,7 +395,7 @@ async def sweep_forever(
     while not stop.is_set():
         try:
             await sweep_once(sessionmaker, settings)
-        except Exception:  # noqa: BLE001 - the next pass tries again
+        except Exception:  # the next pass tries again
             logger.exception("the sweep failed; the next one runs on schedule")
         try:
             await asyncio.wait_for(stop.wait(), timeout=SWEEP_INTERVAL_SECONDS)

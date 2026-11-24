@@ -298,7 +298,7 @@ async def run_worker(stop: asyncio.Event) -> None:
                 logger.error("job %s raised past its runner", job_id, exc_info=running.exception())
                 try:
                     await fail_job(sessionmaker, snapshot, job_id, "internal error", generation)
-                except Exception:  # noqa: BLE001 - the next start requeues what stays running
+                except Exception:  # the next start requeues what stays running
                     logger.exception("could not fail job %s", job_id)
     finally:
         background = [task for task in (sweeper, compactor, egress) if task is not None]

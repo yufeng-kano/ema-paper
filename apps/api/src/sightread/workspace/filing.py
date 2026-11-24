@@ -252,7 +252,7 @@ async def commit_filing(
     try:
         await db.commit()
         return row
-    except Exception as exc:  # noqa: BLE001 - verified below, whatever raised
+    except Exception as exc:  # verified below, whatever raised
         readable, landed = await read_row(db, Document, row.id)
         if readable and isinstance(landed, Document):
             logger.warning("the filing of document %d was committed despite the error", row.id)
@@ -264,7 +264,7 @@ async def commit_filing(
             if undo is not None:
                 try:
                     await undo()
-                except Exception:  # noqa: BLE001 - the refusal stands; the leftovers are logged
+                except Exception:  # the refusal stands; the leftovers are logged
                     logger.exception("could not take back the files of document %d", row.id)
             raise ApiError(
                 409, "invalid_request", f"{what} could not be filed; nothing was filed"
@@ -579,7 +579,7 @@ async def move_then_commit(
                     await workspace_documents.undo_move(
                         settings, user_id, before, after, moved.displaced, author=author
                     )
-                except Exception:  # noqa: BLE001 - the move revision stays revertible
+                except Exception:  # the move revision stays revertible
                     logger.exception("could not move %s back after a failed commit", after)
         raise
 
@@ -794,7 +794,7 @@ async def stash_then_commit(
                     await workspace_documents.unstash_path(
                         settings, user_id, entry, relative, f"restore {relative}", author=author
                     )
-                except Exception:  # noqa: BLE001 - the repair rule returns it
+                except Exception:  # the repair rule returns it
                     logger.exception("could not bring %s back from the Trash", relative)
         raise
 
@@ -820,7 +820,7 @@ async def put_back_then_move(
     answer = None
     try:
         await db.commit()
-    except Exception as exc:  # noqa: BLE001 - verified below, whatever raised
+    except Exception as exc:  # verified below, whatever raised
         readable, row = await read_row(db, *landed)
         with contextlib.suppress(Exception):
             await db.rollback()
@@ -842,7 +842,7 @@ async def put_back_then_move(
         await workspace_documents.unstash_path(
             settings, user_id, entry, relative, f"put back {relative}", author=author
         )
-    except Exception:  # noqa: BLE001 - the rows stand; the repair rule brings the files
+    except Exception:  # the rows stand; the repair rule brings the files
         logger.exception("the files of %s stay in the Trash for now", relative)
     return answer
 
@@ -1037,7 +1037,7 @@ async def copy_then_commit(
         raise
     try:
         await db.commit()
-    except Exception as exc:  # noqa: BLE001 - verified below, whatever raised
+    except Exception as exc:  # verified below, whatever raised
         readable, row = await read_row(db, *landed)
         with contextlib.suppress(Exception):
             await db.rollback()
@@ -1054,7 +1054,7 @@ async def copy_then_commit(
                     [document.target_id for document in documents],
                     author=author,
                 )
-            except Exception:  # noqa: BLE001 - the refusal stands; the leftovers are logged
+            except Exception:  # the refusal stands; the leftovers are logged
                 logger.exception("could not take back the copy at %s", target)
             raise ApiError(
                 409, "invalid_request", "The copy could not be made; nothing was copied"

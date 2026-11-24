@@ -315,7 +315,7 @@ async def idle_compact_once(
             async with sessionmaker() as db:
                 if await try_idle_compaction(db, settings, conversation_id, now=now):
                     enqueued += 1
-        except Exception:  # noqa: BLE001 - the next conversation still goes
+        except Exception:  # the next conversation still goes
             logger.exception("idle compaction of conversation %d failed", conversation_id)
     return enqueued
 
@@ -334,7 +334,7 @@ async def idle_compact_forever(
             enqueued = await idle_compact_once(sessionmaker, settings)
             if enqueued:
                 logger.info("enqueued %d idle compaction(s)", enqueued)
-        except Exception:  # noqa: BLE001 - the next pass tries again
+        except Exception:  # the next pass tries again
             logger.exception("the idle compaction pass failed; the next one runs on schedule")
         try:
             await asyncio.wait_for(stop.wait(), timeout=settings.chat_idle_compact_sweep_seconds)

@@ -114,7 +114,7 @@ async def kano_proxy_status(settings: Settings) -> dict:
     except TimeoutError:
         timeout = settings.admin_probe_timeout_seconds
         return {**status, "state": "failed", "message": f"No answer within {timeout:g} seconds"}
-    except Exception:  # noqa: BLE001 - one connection's failure never fails the overview
+    except Exception:  # one connection's failure never fails the overview
         logger.exception("the overview's Kano Proxy check failed unexpectedly")
         return {**status, "state": "failed", "message": UNEXPECTED}
     listed = {entry["id"] for entry in catalog}
@@ -153,7 +153,7 @@ async def kano_pay_status(settings: Settings) -> dict:
     except TimeoutError:
         timeout = settings.admin_probe_timeout_seconds
         return {**status, "state": "failed", "message": f"No answer within {timeout:g} seconds"}
-    except Exception:  # noqa: BLE001 - one connection's failure never fails the overview
+    except Exception:  # one connection's failure never fails the overview
         logger.exception("the overview's Kano Pay check failed unexpectedly")
         return {**status, "state": "failed", "message": UNEXPECTED}
     return {

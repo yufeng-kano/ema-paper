@@ -637,7 +637,7 @@ async def remove_then_commit(
             # beside no row is a nuisance, files gone with a row that stayed is a loss.
             try:
                 await workspace_documents.restore_removed(settings, user_id, relative, removal)
-            except Exception:  # noqa: BLE001 - the directory waits aside, whole
+            except Exception:  # the directory waits aside, whole
                 logger.exception("could not restore %s after a failed delete", relative)
         raise
     await _finish_delete(settings, user_id, relative, removal, document_ids)
@@ -649,11 +649,11 @@ async def _finish_delete(
     if removal is not None:
         try:
             await workspace_documents.discard_removed(settings, user_id, removal)
-        except Exception:  # noqa: BLE001 - the next reconciliation sweeps it
+        except Exception:  # the next reconciliation sweeps it
             logger.exception("could not discard %s set aside by a delete", relative)
     try:
         await workspace_documents.discard_originals(settings, user_id, document_ids)
-    except Exception:  # noqa: BLE001 - an original with no row is dead weight, not a leak
+    except Exception:  # an original with no row is dead weight, not a leak
         logger.exception("could not discard the originals of %s", relative)
 
 
@@ -1265,7 +1265,7 @@ async def take_pending_reconvert(db: DbSession, settings: AppSettings, row: Docu
     document_id, user_id = row.id, row.user_id
     try:
         await workspace_documents.take_reconvert(db, settings, row)
-    except Exception:  # noqa: BLE001 - the document opens as it is; the next read tries again
+    except Exception:  # the document opens as it is; the next read tries again
         logger.exception("document %d could not take its re-convert", document_id)
     return await live_document(db, user_id, document_id)
 

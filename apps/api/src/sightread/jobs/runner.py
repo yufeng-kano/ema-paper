@@ -987,7 +987,7 @@ async def _finish_held(
         # retention then copies from that one for the recipients found above.
         try:
             await _retain_source(sessionmaker, settings, job_id, source)
-        except Exception:  # noqa: BLE001 - retention must not undo a finished parse
+        except Exception:  # retention must not undo a finished parse
             logger.exception("could not keep the source of job %s", job_id)
     if settings is not None and documents and status == "succeeded":
         # The result is committed: the document directories can take their copies now.
@@ -1001,7 +1001,7 @@ async def _finish_held(
                     # (docs/workspace.md § The Trash); materialization refuses it anyway.
                     if row is not None and is_live(row, await user_folders(db, row.user_id)):
                         await materialize_document(db, settings, row)
-                except Exception:  # noqa: BLE001 - the parse succeeded; the copy can wait
+                except Exception:  # the parse succeeded; the copy can wait
                     logger.exception("could not materialize document %d", document.id)
     if settings is not None and status == "succeeded":
         # A document re-converted onto this parse takes it now (docs/jobs.md
@@ -1023,7 +1023,7 @@ async def _finish_held(
                     row = await db.get(Document, document_id)
                     if row is not None:
                         await take_reconvert(db, settings, row)
-                except Exception:  # noqa: BLE001 - the document's next read takes it
+                except Exception:  # the document's next read takes it
                     logger.exception("document %d could not take its re-convert", document_id)
     return True
 

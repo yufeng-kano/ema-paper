@@ -717,7 +717,7 @@ async def convert_kept_file(
             if removal is not None:
                 try:
                     await workspace_documents.restore_removed(settings, user_id, relative, removal)
-                except Exception:  # noqa: BLE001 - the file waits aside, whole
+                except Exception:  # the file waits aside, whole
                     logger.exception("could not bring %s back after a failed conversion", relative)
             if isinstance(exc, ApiError):
                 raise
@@ -728,7 +728,7 @@ async def convert_kept_file(
     if removal is not None:
         try:
             await workspace_documents.discard_removed(settings, user_id, removal)
-        except Exception:  # noqa: BLE001 - the next reconciliation sweeps it
+        except Exception:  # the next reconciliation sweeps it
             logger.exception("could not discard %s set aside by a conversion", relative)
     return row
 
@@ -804,7 +804,7 @@ async def retry_library_parse(
         raise
     try:
         await db.commit()
-    except Exception as exc:  # noqa: BLE001 - verified below, whatever raised
+    except Exception as exc:  # verified below, whatever raised
         readable, landed = await read_row(db, Job, job_id)
         with contextlib.suppress(Exception):
             await db.rollback()

@@ -419,7 +419,7 @@ async def delete_account(
         # The rows are gone: a file that will not go is logged, and the sweep finishes it.
         try:
             await discard_account(settings, user_id, job_ids, attachment_ids)
-        except Exception:  # noqa: BLE001 - the account is deleted either way
+        except Exception:  # the account is deleted either way
             logger.exception("account %d: its files wait for the sweep", user_id)
 
     request.app.state.pay_refreshed.pop(user_id, None)

@@ -1107,7 +1107,7 @@ async def _run_tool(
     except (asyncio.CancelledError, TurnCancelled):
         # A Stop a subagent saw inside its run is the turn's, not a failed tool.
         raise
-    except Exception:  # noqa: BLE001 - any failure is this tool's, never the turn's
+    except Exception:  # any failure is this tool's, never the turn's
         logger.exception("tool %s failed in turn %s", block.get("name"), ctx.turn.id)
         return await _report_tool(
             ctx,
@@ -1190,7 +1190,7 @@ async def _run_memory(
                 tool_use_id=tool_use_id,
                 tool_input=tool_input,
             )
-        except Exception:  # noqa: BLE001 - any failure is this call's, never the turn's
+        except Exception:  # any failure is this call's, never the turn's
             logger.exception("tool memory failed in turn %s", ctx.turn.id)
             outcome = chat_tools.ToolOutcome(
                 "The tool failed unexpectedly; try another way.", is_error=True
@@ -1199,7 +1199,7 @@ async def _run_memory(
             outcome = admit(outcome)
         try:
             return await _report_tool(ctx, tool_use_id, "memory", outcome)
-        except Exception:  # noqa: BLE001 - the events are lost, the model's answer is not
+        except Exception:  # the events are lost, the model's answer is not
             logger.exception("tool memory's events were not recorded in turn %s", ctx.turn.id)
             result = {"type": "tool_result", "tool_use_id": tool_use_id, "content": outcome.content}
             if outcome.is_error:
@@ -1381,7 +1381,7 @@ async def _run_shell_command(
         try:
             async with ctx.sessionmaker() as db:
                 await reconcile_locked(db, ctx.settings, ctx.turn.user_id)
-        except Exception:  # noqa: BLE001 - the revision is made; this can wait
+        except Exception:  # the revision is made; this can wait
             logger.exception(
                 "could not reconcile the library after a command in turn %s", ctx.turn.id
             )
@@ -2027,7 +2027,7 @@ async def _drive_parse(ctx: TurnContext, job_id: uuid.UUID) -> Job | None:
         ctx.inline_parse = run
         try:
             finished = await _await_inline_parse(ctx, run, deadline)
-        except Exception:  # noqa: BLE001 - the run is cancelled and gathered: put it back
+        except Exception:  # the run is cancelled and gathered: put it back
             # The look for a Stop met a database error, say: the job goes back on the queue
             # as at a Stop, and the tool answers that the conversion goes on after the turn.
             logger.exception("the wait for job %s failed", job_id)
@@ -2040,7 +2040,7 @@ async def _drive_parse(ctx: TurnContext, job_id: uuid.UUID) -> Job | None:
             logger.error("job %s raised past its runner", job_id, exc_info=run.exception())
             try:
                 await fail_job(ctx.sessionmaker, settings, job_id, "internal error", ctx.generation)
-            except Exception:  # noqa: BLE001 - the next worker start requeues what stays running
+            except Exception:  # the next worker start requeues what stays running
                 logger.exception("could not fail job %s", job_id)
             continue
         if finished:
@@ -2536,7 +2536,7 @@ async def run_turn(
         try:
             async with sessionmaker() as db:
                 await reconcile_user(db, settings, ctx.turn.user_id)
-        except Exception:  # noqa: BLE001 - reconciliation is best effort after a turn
+        except Exception:  # reconciliation is best effort after a turn
             logger.exception("reconcile after turn %s failed", turn_id)
 
 

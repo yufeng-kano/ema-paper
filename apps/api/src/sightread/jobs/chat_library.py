@@ -499,7 +499,7 @@ async def _each(
         batch.failed += 1
         batch.lines.append(f"Could not {what}: {_reason(exc)}.")
         return
-    except Exception:  # noqa: BLE001 - this item's failure, never the others'
+    except Exception:  # this item's failure, never the others'
         logger.exception("a library tool failed to %s", what)
         await db.rollback()
         batch.failed += 1

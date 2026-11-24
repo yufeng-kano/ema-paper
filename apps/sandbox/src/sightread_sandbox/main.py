@@ -47,7 +47,7 @@ def create_app(settings: Settings | None = None, backend: Backend | None = None)
                     stopped = await backend.stop_idle()
                     if stopped:
                         logger.info("stopped %d idle sandboxes", stopped)
-                except Exception:  # noqa: BLE001 - the sweep must outlive one failure
+                except Exception:  # the sweep must outlive one failure
                     logger.exception("idle sweep failed")
 
         await backend.startup()

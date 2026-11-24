@@ -297,7 +297,7 @@ async def test_a_transparent_key_colour_is_shown_on_white(tmp_path) -> None:
 async def _run_in_shell(command: str, root: Path) -> None:
     """A command the note gave, run as the VM's bash would, /workspace being `root`."""
     argv = ["/bin/bash", "-c", command.replace("/workspace/", f"{root}/")]
-    await asyncio.to_thread(subprocess.run, argv, check=True, cwd=root)  # noqa: S603
+    await asyncio.to_thread(subprocess.run, argv, check=True, cwd=root)
 
 
 @pytest.mark.skipif(shutil.which("convert") is None, reason="ImageMagick is not installed here")
@@ -369,7 +369,7 @@ async def test_the_pieces_are_cut_from_the_image_the_tool_showed(tmp_path) -> No
     whole = root / "whole.png"
     upright.resize((300, 300)).save(whole)
     await asyncio.to_thread(
-        subprocess.run,  # noqa: S603 - fixed argv
+        subprocess.run,  # fixed argv
         ["convert", str(whole), "-crop", "150x100+50+50", str(root / "files/offset.png")],
         check=True,
     )
