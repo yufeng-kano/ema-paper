@@ -415,7 +415,7 @@ function choose(item: MenuItem, event?: MouseEvent) {
           <UiIcon v-if="item.checked" name="check" />
           <UiIcon v-else-if="item.icon" :name="item.icon" />
           <span v-else class="icon-space" />
-          <span class="label" :class="{ mono: item.labelMono, described: item.description }">{{ item.label }}</span>
+          <span class="label" :class="{ described: item.description }">{{ item.label }}</span>
           <span v-if="item.description" class="description">{{ item.description }}</span>
           <span v-if="item.shortcut" class="shortcut" :class="{ mono: item.shortcutMono }">{{ item.shortcut }}</span>
           <UiIcon v-if="item.children" name="chevron-right" class="chevron" />
@@ -451,7 +451,7 @@ function choose(item: MenuItem, event?: MouseEvent) {
         <UiIcon v-if="child.checked" name="check" />
         <UiIcon v-else-if="child.icon" :name="child.icon" />
         <span v-else class="icon-space" />
-        <span class="label" :class="{ mono: child.labelMono, described: child.description }">{{ child.label }}</span>
+        <span class="label" :class="{ described: child.description }">{{ child.label }}</span>
         <span v-if="child.description" class="description">{{ child.description }}</span>
         <span v-if="child.shortcut" class="shortcut" :class="{ mono: child.shortcutMono }">{{ child.shortcut }}</span>
       </button>
@@ -631,9 +631,9 @@ function choose(item: MenuItem, event?: MouseEvent) {
   text-overflow: ellipsis;
 }
 
-/* A skill's name and what it does on one line: the name keeps its width, up to most of the
+/* A label and its description on one line: the label keeps its width, up to most of the
    row, and the description takes the rest, cut with an ellipsis — shrunk in proportion to
-   their widths, a long description would cut the name to a letter. */
+   their widths, a long description would cut the label to a letter. */
 .label.described {
   flex: 0 0 auto;
   max-width: 70%;

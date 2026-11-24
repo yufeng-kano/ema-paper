@@ -917,17 +917,15 @@ describe('serializeDocument', () => {
 })
 
 describe('appendBlockSource', () => {
-  it('gives an emptied page its text back as a new block', () => {
-    const emptied = ['<!-- page: 1 -->', '', '<!-- page: 2 -->', 'Second page.'].join('\n')
-    expect(appendBlockSource(emptied, 0, 'Back again.')).toBe(
-      ['<!-- page: 1 -->', 'Back again.', '', '<!-- page: 2 -->', 'Second page.'].join('\n'),
-    )
+  it('appends the text to the last page as a new block', () => {
+    const emptied = ['<!-- page: 1 -->', 'First.', '', '<!-- page: 2 -->'].join('\n')
+    expect(appendBlockSource(emptied, 'Back again.')).toBe(['<!-- page: 1 -->', 'First.', '', '<!-- page: 2 -->', 'Back again.'].join('\n'))
   })
 
   it('starts a document with no page at all without a marker', () => {
-    expect(appendBlockSource('', 0, 'First words.')).toBe('First words.')
-    expect(appendBlockSource('First words.', 0, 'More.')).toBe('First words.\n\nMore.')
-    expect(parseResultMarkdown(appendBlockSource('', 0, 'First words.'))[0]?.blocks[0]?.kind).toBe('p')
+    expect(appendBlockSource('', 'First words.')).toBe('First words.')
+    expect(appendBlockSource('First words.', 'More.')).toBe('First words.\n\nMore.')
+    expect(parseResultMarkdown(appendBlockSource('', 'First words.'))[0]?.blocks[0]?.kind).toBe('p')
   })
 })
 

@@ -13,7 +13,7 @@ import {
   rewriteBlockLinks,
   sectionOf,
 } from './excerpts'
-import { documentOutline, parseResultMarkdown } from './markdown'
+import { documentOutline, parseResultMarkdown, passageKeys, placedBlocks } from './markdown'
 
 const document = [
   '<!-- page: 1 -->',
@@ -168,6 +168,15 @@ describe('block references in the notes', () => {
     expect(linkResolves(pages, outline, { label: 'x', anchor: '321-scaled-dot-product-attention~We%20suspect%20that', passage: null })).toBe(true)
     expect(linkResolves(pages, outline, { label: 'x', anchor: '~A+preface+before', passage: null })).toBe(true)
     expect(linkResolves(pages, outline, { label: 'x', anchor: 'gone~Words+no+block+has', passage: null })).toBe(false)
+  })
+
+  it('resolves a block reference the same from the placed blocks and passage keys a caller keeps', () => {
+    const placed = placedBlocks(pages)
+    const keys = passageKeys(placed)
+    const resolves = (anchor: string) => linkResolves(pages, outline, { label: 'x', anchor, passage: null }, placed, keys)
+    expect(resolves('321-scaled-dot-product-attention~We%20suspect%20that')).toBe(true)
+    expect(resolves('~A+preface+before')).toBe(true)
+    expect(resolves('gone~Words+no+block+has')).toBe(false)
   })
 })
 

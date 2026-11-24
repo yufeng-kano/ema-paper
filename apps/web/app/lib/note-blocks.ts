@@ -11,7 +11,7 @@
 import type { Node as ProseNode } from '@tiptap/pm/model'
 import { Selection, type Transaction } from '@tiptap/pm/state'
 import type { Mappable } from '@tiptap/pm/transform'
-import { isHeading, parseBlocks, type InlineOptions, type ResultBlock } from './markdown'
+import { isHeading, parseBlocks, sectionExtent, type InlineOptions, type ResultBlock } from './markdown'
 import { convertBlock, docToMarkdown, markdownToDoc, type BlockKindName } from './richdoc'
 
 export interface NoteUnit {
@@ -103,13 +103,7 @@ export function sectionMarkdown(doc: ProseNode, units: readonly NoteUnit[], inde
   const head = unitBlock(doc, units[index]!)
   let end = index + 1
   if (isHeading(head)) {
-    while (end < units.length) {
-      const block = unitBlock(doc, units[end]!)
-      if (isHeading(block) && block.level <= head.level) {
-        break
-      }
-      end += 1
-    }
+    end = index + sectionExtent(units.slice(index).map((unit) => ({ block: unitBlock(doc, unit) })), 0).end
     while (end > index + 1 && units[end - 1]!.bare) {
       end -= 1
     }

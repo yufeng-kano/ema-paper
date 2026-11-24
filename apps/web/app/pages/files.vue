@@ -105,10 +105,6 @@ const REVEAL_MS = 2400
 const SPRING_MS = 800
 /** How long typed letters keep adding to the name being looked for. */
 const TYPE_AHEAD_MS = 1000
-/** How long the status note shows, and how long one carrying *Undo* waits for the reader
- *  (docs/web.md § Editing, *Undo and the status note*). */
-const NOTE_MS = 1600
-const NOTE_UNDO_MS = 8000
 /** How many file operations ⌘Z can take back. */
 const UNDO_MAX = 50
 
@@ -1939,52 +1935,9 @@ async function confirmDelete() {
 
 // --- the status note -------------------------------------------------------
 
-/** The one line at the list's foot an action with nothing else to show confirms in. */
-const note = ref<{ text: string; undo: boolean } | null>(null)
-let noteTimer: ReturnType<typeof setTimeout> | undefined
-let noteHeld = false
-
-function showNote(text: string, undoable: boolean) {
-  note.value = { text, undo: undoable }
-  announce(text)
-  timeNote()
-}
-
-function timeNote() {
-  clearTimeout(noteTimer)
-  const shown = note.value
-  if (shown && !noteHeld) {
-    noteTimer = setTimeout(() => (note.value = null), shown.undo ? NOTE_UNDO_MS : NOTE_MS)
-  }
-}
-
-/** The pointer resting on the note holds it; leaving starts its time again. */
-function holdNote(held: boolean) {
-  noteHeld = held
-  if (held) {
-    clearTimeout(noteTimer)
-  } else {
-    timeNote()
-  }
-}
-
-/** A note carrying *Undo* stays until the reader's next action. */
-function hideUndoNote() {
-  if (note.value?.undo) {
-    clearTimeout(noteTimer)
-    note.value = null
-  }
-}
-
-onBeforeUnmount(() => clearTimeout(noteTimer))
-
-/** The page's one polite live region, for what its notes and the keys' selection say. */
-const liveText = ref('')
-
-function announce(text: string) {
-  liveText.value = ''
-  void nextTick(() => (liveText.value = text))
-}
+/** The one line at the list's foot an action with nothing else to show confirms in, and the
+ *  page's one polite live region, for what its notes and the keys' selection say. */
+const { note, show: showNote, hold: holdNote, hideSticky: hideUndoNote, liveText, announce } = useStatusNote()
 
 /** A selection the keys made is said: the row's name, or how many rows. */
 function announceSelection() {

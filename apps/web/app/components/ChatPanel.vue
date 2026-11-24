@@ -58,7 +58,7 @@ import {
   type Conversation,
   type Memory,
 } from '~/lib/api'
-import { blockName, type NameText } from '~/lib/blocks'
+import { blockName } from '~/lib/blocks'
 import {
   COMPACT_COMMAND,
   INIT_COMMAND,
@@ -1793,15 +1793,7 @@ let blockMenuClosedBy: EventTarget | null = null
 let blockMenuClosedKey: string | null = null
 
 /** What a handle calls its block, as the document's handles do. */
-const nameText = computed<NameText>(() => ({
-  formula: t('viewer.names.formula'),
-  formulaTag: (tag) => t('viewer.names.formulaTag', { tag }),
-  quoted: (words) => t('viewer.names.quoted', { words }),
-  figure: (words) => t('viewer.names.figure', { name: t('viewer.names.quoted', { words }) }),
-  figureBare: t('viewer.names.figureBare'),
-  image: (words) => t('viewer.names.image', { name: t('viewer.names.quoted', { words }) }),
-  imageBare: t('viewer.names.imageBare'),
-}))
+const { nameText } = useBlockNames()
 
 function handleShown(key: string): boolean {
   return (

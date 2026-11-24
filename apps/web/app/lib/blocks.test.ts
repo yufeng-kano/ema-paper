@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   UndoHistory,
   applySpans,
+  askKind,
   blockKey,
   blockName,
   blocksInRanges,
@@ -92,6 +93,13 @@ describe('blockName', () => {
   it('cuts words without spaces by length', () => {
     const [block] = parseBlocks('注意力函數可以描述為將一個查詢和一組鍵值對映射到輸出')
     expect(blockName(block!, { ...en, quoted: (words) => `「${words}」` })).toBe('「注意力函數可以描述為將一個查詢和一組鍵值對映射到…」')
+  })
+})
+
+describe('askKind', () => {
+  it('asks about a paragraph, a section, a formula, or a block', () => {
+    const kinds = parseBlocks(['Prose.', '', '## Two', '', '### Three', '', '$$x$$', '', '- item'].join('\n')).map(askKind)
+    expect(kinds).toEqual(['paragraph', 'section', 'section', 'formula', 'block'])
   })
 })
 

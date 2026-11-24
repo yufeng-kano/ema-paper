@@ -401,18 +401,21 @@ export function excerptMarkers(matches: readonly ExcerptMatch[]): Map<string, Ex
 
 /** Whether a section link in the notes leads anywhere: an excerpt's while its passage or its
  *  heading is found, a block reference's while its anchor resolves, any other while its
- *  heading is found, and `#` — the whole document — always. */
+ *  heading is found, and `#` — the whole document — always. A caller that keeps the placed
+ *  blocks and their `passageKeys` hands them in for a block reference (`resolveAnchor`). */
 export function linkResolves(
   pages: readonly ResultPageBlocks[],
   outline: readonly OutlineEntry[],
   link: { label: string; anchor: string; passage: string | null },
+  placed?: readonly PlacedBlock[],
+  keys?: readonly string[],
 ): boolean {
   if (link.anchor === '') {
     return true
   }
   if (link.anchor.includes('~')) {
     // A block reference: it leads wherever its anchor resolves to.
-    return resolveAnchor(pages, readBlockAnchor(link.anchor), outline) !== null
+    return resolveAnchor(pages, readBlockAnchor(link.anchor), outline, placed, keys) !== null
   }
   const heading = findHeading(outline, link.label, link.anchor)
   return heading !== null || (link.passage !== null && locatePassage(pages, link.passage, null) !== null)

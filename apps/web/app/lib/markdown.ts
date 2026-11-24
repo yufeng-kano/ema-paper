@@ -609,14 +609,13 @@ export function replaceBlockSources(markdown: string, edits: readonly (BlockAt &
 }
 
 /**
- * `markdown` with a new block appended to one page — how text comes back to a page whose
- * last block was emptied, and to a document with no block at all: a document without a
- * page gets an unmarked page 1. Only the source matters to the stored string; the block
- * parses into its kind on the next render.
+ * `markdown` with a new block appended to its last page — how text comes back to a document
+ * with no block left to draw: a document without a page gets an unmarked page 1. Only the
+ * source matters to the stored string; the block parses into its kind on the next render.
  */
-export function appendBlockSource(markdown: string, pageIndex: number, src: string): string {
+export function appendBlockSource(markdown: string, src: string): string {
   const pages = parseResultMarkdown(markdown)
-  const page = pages[pageIndex] ?? pages[pages.length - 1]
+  const page = pages[pages.length - 1]
   if (page) {
     page.blocks.push({ kind: 'p', text: src, src })
   } else {
@@ -1496,11 +1495,12 @@ export function isHeading(block: ResultBlock | null | undefined): block is Extra
 }
 
 /**
- * The blocks a heading's section holds, by their positions in `placedBlocks`: from the block
- * after the heading up to the last before the next heading of the same or a higher level —
- * the extent `sectionSource` reads and a collapsed heading hides. `[start, end)`.
+ * The blocks a heading's section holds, by their positions in `placedBlocks` or in any run of
+ * blocks in reading order: from the block after the heading up to the last before the next
+ * heading of the same or a higher level — the extent `sectionSource` reads, a collapsed
+ * heading hides and a heading in the notes asks about. `[start, end)`.
  */
-export function sectionExtent(placed: readonly { block: ResultBlock }[], heading: number): { start: number; end: number } {
+export function sectionExtent(placed: readonly { block: ResultBlock | null | undefined }[], heading: number): { start: number; end: number } {
   const block = placed[heading]?.block
   const level = isHeading(block) ? block.level : 0
   let end = heading + 1
@@ -1746,8 +1746,8 @@ export function readBlockAnchor(anchor: string): string {
  * else such a block anywhere, else the section's heading, else null — the top of the document.
  * Compared as a located passage is, spacing ignored; a link survives edits above it and a
  * block moved to another section. A caller that keeps the outline, the placed blocks and
- * their `passageKeys` — the agent panel, resolving a chip on every render — hands them in;
- * without the keys, each block's is read as the search reaches it.
+ * their `passageKeys` — the agent panel and the notes, resolving a chip on every draw — hands
+ * them in; without the keys, each block's is read as the search reaches it.
  */
 export function resolveAnchor(
   pages: readonly ResultPageBlocks[],

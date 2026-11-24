@@ -39,12 +39,12 @@ import { Slice, type Node as ProseNode } from '@tiptap/pm/model'
 import { NodeSelection, Selection, TextSelection, type Transaction } from '@tiptap/pm/state'
 import type { EditorView } from '@tiptap/pm/view'
 import type { DragCardControls } from '~/components/DragCard.vue'
-import { blockName, type NameText } from '~/lib/blocks'
+import { askKind, blockName } from '~/lib/blocks'
 import { isImageFile, matchCommands } from '~/lib/composer'
 import { BLOCK_DRAG_TYPE, NOTES_BLOCK_DRAG_TYPE, carries, carriesFiles, claimDrag, droppedFiles, setDropEffect } from '~/lib/dnd'
 import { droppedBlocksMarkdown } from '~/lib/excerpts'
 import type { IconName } from '~/lib/icons'
-import { blockPlain, isHeading, nearestBlock, type PlaceNear, type ResultBlock } from '~/lib/markdown'
+import { blockPlain, nearestBlock, type PlaceNear, type ResultBlock } from '~/lib/markdown'
 import { openSide, type MenuItem, type Point } from '~/lib/menu'
 import {
   UnitSelection,
@@ -171,6 +171,7 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const { nameText, kindLabel } = useBlockNames()
 
 const root = ref<HTMLElement | null>(null)
 const mount = ref<HTMLElement | null>(null)
@@ -1204,17 +1205,6 @@ const unitDragCard = ref<DragCardControls | null>(null)
 let unitDragSlot: number | null = null
 const unitLive = ref('')
 
-/** What a handle calls its unit, as the document's handles do. */
-const nameText = computed<NameText>(() => ({
-  formula: t('viewer.names.formula'),
-  formulaTag: (tag) => t('viewer.names.formulaTag', { tag }),
-  quoted: (words) => t('viewer.names.quoted', { words }),
-  figure: (words) => t('viewer.names.figure', { name: t('viewer.names.quoted', { words }) }),
-  figureBare: t('viewer.names.figureBare'),
-  image: (words) => t('viewer.names.image', { name: t('viewer.names.quoted', { words }) }),
-  imageBare: t('viewer.names.imageBare'),
-}))
-
 /** One handle at a time. An empty line and a comment have none. */
 const shownUnit = computed<number | null>(() => {
   if (!props.blocks) {
@@ -1238,11 +1228,6 @@ function unitName(index: number): string {
 }
 
 const handleName = computed(() => (shownUnit.value === null ? '' : unitName(shownUnit.value)))
-
-/** Block kinds as the document's menu header names them. */
-function kindLabel(block: ResultBlock): string {
-  return t(`viewer.block.kinds.${isHeading(block) ? 'h' : block.kind}`)
-}
 
 /** Each unit's extent on screen, its first block's top to its last block's bottom. */
 function unitBoxes(): UnitBox[] {
@@ -1428,17 +1413,7 @@ function askWhich(unit: NoteUnit, block: ResultBlock | null): string {
   if (unit.excerpt) {
     return 'excerpt'
   }
-  switch (block?.kind) {
-    case 'p':
-      return 'paragraph'
-    case 'h2':
-    case 'h3':
-      return 'section'
-    case 'math':
-      return 'formula'
-    default:
-      return 'block'
-  }
+  return block ? askKind(block) : 'block'
 }
 
 /**

@@ -571,7 +571,9 @@ Apple's own look, held back: solid white content, the system font, continuous ro
     - Its callers: the library's right-click, the sidebar's account row (§ The account menu), a conversation's **⋯** in the agent panel's list (§ The agent panel — the list itself is a popover, since its rows carry a second button), the result viewer's More button (§ Result viewer), the result viewer's block menu (§ Editing), the file viewer's More button (§ Files), the notes' block menu (§ Notes), and in the agent panel an answer block's menu, the composer's *Add context* menu and the model pill (§ The agent panel).
     - `facts`: besides `header`, a menu about one thing can carry label/value rows under the header, values in `.mono` where they are identifiers, wrapping rather than ellipsized — for the facts a single header line cannot hold. Like the header, they take no focus and do nothing. They are the menu's `aria-describedby`, so a screen reader reads them when the menu opens rather than skipping them on the way to the items.
     - `shortcut`: text drawn right-aligned in `--faint`, in the mono face (`shortcutMono`) when it is markdown or a command rather than a key. A key is not drawn at all on a coarse pointer, which has no keyboard to press it on.
-    - `labelMono` with `description`: the label in the mono face, followed on the same line by a second text in `--muted`, cut with an ellipsis and whole in the row's tooltip — a skill's name and what it does, as the composer's command menu, the slash menu and the selection toolbar's skill list draw them.
+    - `description`: a second text in `--muted` after the label on the same line, cut with an ellipsis and whole in the row's tooltip.
+      - It is a disabled choice's reason, as the result viewer's More menu gives *Original* and *Markdown* (§ Result viewer, *Original and Markdown*).
+      - It is a model's id beside its catalog name, on every model row of the model pill's menu (§ The agent panel).
     - `children`, a submenu: a second surface flown out beside its row.
       - It flies out to the right, or to the left where the viewport has no room (`placeSubmenu` in `app/lib/menu.ts`), top-aligned with the row. Where neither side has room, as on a phone, it opens over its parent, `--space-2` down and in, so the row it came from stays in sight.
       - The row carries `aria-haspopup="menu"` and `aria-expanded`.
@@ -1430,7 +1432,7 @@ Saves are automatic and **silent while they succeed**:
 
 #### The block handle and its menu
 
-**Every rendered block but a comment has a handle**, on Files.
+**Every rendered block but a comment has a handle**, once the copy is editable (§ Editing).
 
 - It is a 24×24 button with the six-dot `grip-vertical` glyph (16px, `--faint`), in the gutter left of the block's first line, 4px from the text, with `--radius` and a grab cursor.
 - The viewer draws it inside the block's `div.block`, positioned against the block and beside its rendering rather than in it, with `data-chrome`, so copy and find pass over it (§ Result viewer).
@@ -2173,7 +2175,7 @@ Each built-in command:
 **The model pill and the context ring.** In the composer's foot, after the attach and command controls, a pill names the conversation's model and effort, and the context ring stands beside it. The pill is `app/components/chat/ModelPill.vue`, the ring and its card `ContextRing.vue`.
 
 - **The pill** says the catalog name of `conversation.model` — or of the agent's saved model on the draft — and the effort's label.
-- **Its menu** is a context menu (`UiContextMenu`): the offered models (`GET /api/agents/chat/models`, read when the menu opens, with the agent's settings), the current one checked; then, under a separator, *Effort* with a submenu of the five levels, the current one checked.
+- **Its menu** is a context menu (`UiContextMenu`): the offered models (`GET /api/agents/chat/models`, read when the menu opens, with the agent's settings), each by its catalog name with its id after it, the current one checked; then, under a separator, *Effort* with a submenu of the five levels, the current one checked.
 - **Picking a model** saves it as the agent's model (`PUT /api/agents/chat/settings`), so new conversations start on it.
   - With a conversation open and no turn in flight, it moves the open conversation to it too (`PUT /api/conversations/{id}` with `model`, [chat.md](./chat.md) § History is append-only) — the conversation the pick was made in, whatever is open once the save answers.
   - The pill says the new name once the saves are answered, and the old one again when one is refused, with the reason under the composer.

@@ -93,6 +93,18 @@ export function blockName(block: ResultBlock, text: NameText, options?: InlineOp
   return text.quoted(cutWords(firstWords(words), NAME_CHARS))
 }
 
+/** What *Ask* and *Translate* say they ask about when they act on one block: a paragraph, a
+ *  heading's section, a formula, or any other block. */
+export function askKind(block: ResultBlock): 'paragraph' | 'section' | 'formula' | 'block' {
+  if (block.kind === 'p') {
+    return 'paragraph'
+  }
+  if (isHeading(block)) {
+    return 'section'
+  }
+  return block.kind === 'math' ? 'formula' : 'block'
+}
+
 /**
  * Whether `/translate` has something to translate in a block: prose — a paragraph, a heading,
  * a list, a quote, a figure's or an image's caption. A formula, code, a table, a contents run

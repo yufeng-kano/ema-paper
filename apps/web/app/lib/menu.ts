@@ -46,9 +46,8 @@ export interface MenuItem {
    *  markdown or command it stands for (`##`, `/translate`). */
   shortcut?: string
   shortcutMono?: boolean
-  /** The label in the mono face, followed on the same line by `description` in `--muted`: a
-   *  skill's name and what it does (docs/web.md § Design system, *Primitives*). */
-  labelMono?: boolean
+  /** Drawn after the label on the same line in `--muted`: a disabled choice's reason, or a
+   *  model's id beside its name (docs/web.md § Design system, *Primitives*). */
   description?: string
   /** A submenu, flown out beside this row: a short list of parallel choices under one action. */
   children?: MenuItem[]

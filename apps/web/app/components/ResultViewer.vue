@@ -19,6 +19,7 @@ import {
 } from '~/lib/api'
 import { Autosave, type SaveState } from '~/lib/autosave'
 import {
+  askKind,
   blockKey,
   blockName,
   blocksInRanges,
@@ -36,7 +37,6 @@ import {
   translatable,
   UndoHistory,
   type FoldMemory,
-  type NameText,
   type UndoFile,
 } from '~/lib/blocks'
 import { COLUMN_WIDTHS, shownCards, viewerLayout, type Column, type ViewerLayout } from '~/lib/columns'
@@ -81,7 +81,9 @@ import {
   insertBlocks,
   isHeading,
   moveBlocks,
+  parseBlocks,
   parseResultMarkdown,
+  passageKeys,
   placeNear,
   placedBlocks,
   readBlockAnchor,
@@ -117,11 +119,6 @@ const SAVE_DEBOUNCE_MS = 1200
  *  § Result viewer, *Outline, collapse and the way back*). */
 const FOLDS_KEY = 'sightread.viewer.folds'
 
-/** How long the status note shows, and how long one carrying *Undo* waits for the reader
- *  (docs/web.md § Editing, *Undo and the status note*). */
-const NOTE_MS = 1600
-const NOTE_UNDO_MS = 8000
-
 /** How long a keyboard selection rests before the selection toolbar shows. */
 const TOOLBAR_SETTLE_MS = 300
 
@@ -136,7 +133,7 @@ const EXCERPTS_DEBOUNCE_MS = 300
 /** The gutter the outline needs left of the column: its ticks and about 40px past a heading's
  *  own controls — the chevron and the handle once the copy is editable, the chevron alone
  *  while it loads. */
-const OUTLINE_GUTTER_FILES_PX = 128
+const OUTLINE_GUTTER_EDITABLE_PX = 128
 const OUTLINE_GUTTER_READ_ONLY_PX = 100
 /** The outline's room (`ViewerOutline`): its ticks run from this far under the pane's top
  *  down to this far above the pane's foot, or to 8px above the pieces at the foot wherever they
@@ -181,7 +178,7 @@ type Slot = { element: Element | null; atom: boolean }
 
 <script setup lang="ts">
 /**
- * A finished parse, as a document — and, on Files, the document's editable copy with its
+ * A finished parse, as a document — and, once converted, the document's editable copy with its
  * notes and the agent's thread beside it, and the file it was made from as the *Original*
  * view.
  *
@@ -279,6 +276,7 @@ const emit = defineEmits<{
 }>()
 
 const { t, locale } = useI18n()
+const { nameText, kindLabel } = useBlockNames()
 const { resolve } = useApiError()
 const localePath = useLocalePath()
 const { apple, label: keyLabel, matches } = useShortcuts()
@@ -425,6 +423,8 @@ const outline = computed(() => documentOutline(pages.value))
 /** The document in reading order, page markers crossed, and where each block sits in it. */
 const placed = computed(() => placedBlocks(pages.value))
 const placedIndex = computed(() => new Map(placed.value.map((entry, index) => [blockKey(entry), index])))
+/** The placed blocks' passage keys, read only when a block reference in the notes is drawn. */
+const placedKeys = computed(() => passageKeys(placed.value))
 /** Each heading's outline entry, by its block's key. */
 const headingAt = computed(() => new Map(outline.value.map((entry) => [blockKey(entry), entry])))
 
@@ -668,12 +668,13 @@ async function startEdit(pageIndex: number, blockIndex: number, caret: Caret = '
 }
 
 /** A document with no drawable block: text comes back through an editor opened past the
- *  page's last block — index `blocks.length`, which no block holds. */
-function startNewBlock(pageIndex: number) {
+ *  last page's last block — index `blocks.length`, which no block holds. */
+function startNewBlock() {
   if (!editable.value) {
     return
   }
   commitEdit()
+  const pageIndex = Math.max(0, pages.value.length - 1)
   editing.value = { page: pageIndex, index: pages.value[pageIndex]?.blocks.length ?? 0 }
   span.value = 1
   joined.value = false
@@ -984,7 +985,7 @@ function documentWithDraft(): string {
   if (!block) {
     // The editor past the last block (`startNewBlock`): text typed there is a new block,
     // nothing typed is nothing.
-    return draft.value.trim() !== '' ? appendBlockSource(markdown.value, open.page, draft.value) : markdown.value
+    return draft.value.trim() !== '' ? appendBlockSource(markdown.value, draft.value) : markdown.value
   }
   if (draft.value === openBlockSource()) {
     return markdown.value
@@ -1042,7 +1043,7 @@ function draftBlockCount(): number {
   if (draft.value === openBlockSource()) {
     return span.value
   }
-  return parseResultMarkdown(draft.value).reduce((total, page) => total + page.blocks.length, 0)
+  return parseBlocks(draft.value).length
 }
 
 /** Where a block will be once the open editor is written back: one after it on its page
@@ -1564,22 +1565,6 @@ function forgetChromePress() {
   }
 }
 
-/** Block kinds as the menu's header and the handle's name say them. */
-function kindLabel(block: ResultBlock): string {
-  return t(`viewer.block.kinds.${isHeading(block) ? 'h' : block.kind}`)
-}
-
-/** The words a block's name is built from (`blockName`), in the reader's language. */
-const nameText = computed<NameText>(() => ({
-  formula: t('viewer.names.formula'),
-  formulaTag: (tag) => t('viewer.names.formulaTag', { tag }),
-  quoted: (words) => t('viewer.names.quoted', { words }),
-  figure: (words) => t('viewer.names.figure', { name: t('viewer.names.quoted', { words }) }),
-  figureBare: t('viewer.names.figureBare'),
-  image: (words) => t('viewer.names.image', { name: t('viewer.names.quoted', { words }) }),
-  imageBare: t('viewer.names.imageBare'),
-}))
-
 /** Each block stays one tab stop once the copy is editable; while it is read-only a block
  *  takes focus only from the viewer, when the way back hands it over. */
 function blockTabindex(block: ResultBlock, pageIndex: number, index: number): number | undefined {
@@ -1695,10 +1680,7 @@ function menuHeader(keys: readonly string[]): string {
 /** What *Ask* and *Translate* say they ask about. */
 function askWhich(blocks: readonly ResultBlock[]): 'paragraph' | 'section' | 'formula' | 'block' | 'blocks' {
   const only = blocks.length === 1 ? blocks[0]! : null
-  if (!only) {
-    return 'blocks'
-  }
-  return only.kind === 'p' ? 'paragraph' : isHeading(only) ? 'section' : only.kind === 'math' ? 'formula' : 'block'
+  return only ? askKind(only) : 'blocks'
 }
 
 /** The heads of a run's rows: a collapsed heading stands for itself alone, to everything but
@@ -1954,7 +1936,7 @@ function turnRows(range: RowRange, kind: BlockKindName): string[] {
       continue
     }
     edits.push({ page: at.page, index: at.index, src: converted })
-    const count = parseResultMarkdown(converted).reduce((total, page) => total + page.blocks.length, 0)
+    const count = parseBlocks(converted).length
     grown.set(at.page, (grown.get(at.page) ?? 0) + count - 1)
   }
   const next = replaceBlockSources(markdown.value, edits)
@@ -2084,63 +2066,25 @@ function onPaneKey(event: KeyboardEvent) {
   stepUndo(undoKey ? 'undo' : 'redo', true)
 }
 
-/** The one line at the pane's foot an action with nothing else to show confirms in. */
-const statusNote = ref<{ text: string; undo: boolean; view?: boolean } | null>(null)
-let noteTimer: ReturnType<typeof setTimeout> | undefined
-let noteHeld = false
+/** The one line at the pane's foot an action with nothing else to show confirms in, and the
+ *  viewer's one polite live region for what its notes, the selection and a drag say. */
+const { note: statusNote, show, hold: holdNote, hide: hideNote, hideSticky: hideUndoNote, liveText, announce } = useStatusNote()
 /** Where the note's *View* leads: the excerpt a phone quoted into the notes, another pane. */
 let noteView: { at: number; count: number } | null = null
 
 function showNote(text: string, undoable: boolean, view: { at: number; count: number } | null = null) {
   noteView = view
-  statusNote.value = { text, undo: undoable, view: view !== null }
-  announce(text)
-  timeNote()
+  show(text, undoable, view !== null)
 }
 
 /** The note's *View*: the notes, on what the note was about. */
 function viewNoted() {
   const view = noteView
-  clearTimeout(noteTimer)
-  statusNote.value = null
+  hideNote()
   noteView = null
   if (view) {
     void revealNotes(view.at, view.count, false)
   }
-}
-
-function timeNote() {
-  clearTimeout(noteTimer)
-  const note = statusNote.value
-  if (note && !noteHeld) {
-    noteTimer = setTimeout(() => (statusNote.value = null), note.undo || note.view ? NOTE_UNDO_MS : NOTE_MS)
-  }
-}
-
-/** The pointer resting on the note holds it; leaving starts its time again. */
-function holdNote(held: boolean) {
-  noteHeld = held
-  if (held) {
-    clearTimeout(noteTimer)
-  } else {
-    timeNote()
-  }
-}
-
-/** A note carrying *Undo* or *View* stays until the reader's next action. */
-function hideUndoNote() {
-  if (statusNote.value?.undo || statusNote.value?.view) {
-    clearTimeout(noteTimer)
-    statusNote.value = null
-  }
-}
-
-/** The viewer's one polite live region for what its notes, the selection and a drag say. */
-const liveText = ref('')
-
-function announce(text: string) {
-  liveText.value = ''
-  void nextTick(() => (liveText.value = text))
 }
 
 watch(
@@ -2518,7 +2462,8 @@ function blockOfNode(node: Node): string | null {
 
 /** Shows the toolbar over a non-collapsed selection on one of its surfaces — the document
  *  pane on the Markdown view, in the open editor or over rendered blocks, or the notes card on
- *  either view (docs/web.md § Editing, *The notes have it too*) — or hides it. Files only. */
+ *  either view (docs/web.md § Editing, *The notes have it too*) — or hides it. Only once the
+ *  copy is editable. */
 function readToolbar() {
   const selection = window.getSelection()
   if (!editable.value || !selection || selection.isCollapsed || !selection.rangeCount) {
@@ -2556,7 +2501,7 @@ function selectionTranslates(selection: Selection): boolean {
   const start = blockOfNode(selection.getRangeAt(0).startContainer)
   if (open && start === blockKey(open)) {
     const picked = blockEditor?.selectedMarkdown()
-    return picked !== null && picked !== undefined && parseResultMarkdown(picked.markdown).some((page) => page.blocks.some(translatable))
+    return picked !== null && picked !== undefined && parseBlocks(picked.markdown).some(translatable)
   }
   const end = blockOfNode(selection.getRangeAt(selection.rangeCount - 1).endContainer)
   const from = start === null ? undefined : placedIndex.value.get(start)
@@ -2581,7 +2526,7 @@ function toolbarPassage(): { markdown: string; at: BlockAt } | null {
     }
     // Counted on their own, the blocks before can come to one more than the whole draft holds
     // there — a list right before a list reads as one — so the index stays within the draft.
-    const before = parseResultMarkdown(picked.before).reduce((total, page) => total + page.blocks.length, 0)
+    const before = parseBlocks(picked.before).length
     return { markdown: picked.markdown, at: { page: open.page, index: open.index + Math.min(before, draftBlockCount() - 1) } }
   }
   const text = selectionMarkdown(selection)
@@ -2683,7 +2628,7 @@ function slashSkills(text: string): SlashSkill[] | null {
   if (!skillsLoaded.value) {
     return null
   }
-  const translates = parseResultMarkdown(text).some((page) => page.blocks.some(translatable))
+  const translates = parseBlocks(text).some(translatable)
   return skills.value
     .filter((skill) => skill.name !== 'translate' || translates)
     .map((skill) => ({ name: skill.name, description: skill.description }))
@@ -2912,7 +2857,9 @@ const notesLinks = {
         return match.found || match.heading ? 'chip' : 'text'
       }
     }
-    return linkResolves(pages.value, outline.value, target) ? 'chip' : 'text'
+    // Only a block reference (`~` in its anchor) reads the passage keys.
+    const keys = target.anchor.includes('~') ? placedKeys.value : undefined
+    return linkResolves(pages.value, outline.value, target, placed.value, keys) ? 'chip' : 'text'
   },
   locate: (target: SectionLinkTarget) => void locateLink(target),
   rewrite: (markdown: string) => rewriteBlockLinks(markdown, blockLinkAnchor),
@@ -3453,7 +3400,7 @@ watch(paperMargin, measureGutter, { flush: 'post' })
 /** The ticks where they fit, the header's *Outline* button where they do not — never both. */
 const outlineAt = computed(() =>
   tab.value === 'markdown'
-    ? outlinePlace(outline.value.length, gutter.value, editable.value ? OUTLINE_GUTTER_FILES_PX : OUTLINE_GUTTER_READ_ONLY_PX)
+    ? outlinePlace(outline.value.length, gutter.value, editable.value ? OUTLINE_GUTTER_EDITABLE_PX : OUTLINE_GUTTER_READ_ONLY_PX)
     : null,
 )
 const showOutline = computed(() => outlineAt.value === 'ticks')
@@ -4562,7 +4509,7 @@ onBeforeUnmount(() => {
   cancelAnimationFrame(hoverFrame)
   cancelAnimationFrame(scrollFrame)
   cancelAnimationFrame(toolbarFrame)
-  for (const timer of [noteTimer, toolbarTimer, excerptsTimer, pressTimer, locateTimer]) {
+  for (const timer of [toolbarTimer, excerptsTimer, pressTimer, locateTimer]) {
     clearTimeout(timer)
   }
   if (flashTimer !== null) {
@@ -4581,7 +4528,7 @@ watch(
       matchNow()
       // A markdown document opened empty — just made — is opened to be written in.
       if (props.markdownDocument && !markdown.value.trim()) {
-        startNewBlock(0)
+        startNewBlock()
       }
     }
   },
@@ -4970,7 +4917,7 @@ watch(
               <!-- Keyed by position: a document can repeat a page number (a marker the reader
                    typed is a page like any parsed one). -->
               <section
-                v-for="(page, pageIndex) in pages"
+                v-for="(blocks, pageIndex) in pageBlocks"
                 :key="pageIndex"
                 class="page"
               >
@@ -4982,7 +4929,7 @@ watch(
                        fold note, a backlink marker — are `data-chrome`: copy, find and the
                        agent's selection pass over them. -->
                   <div
-                    v-for="({ block, key }, index) in pageBlocks[pageIndex]"
+                    v-for="({ block, key }, index) in blocks"
                     :key="index"
                     class="block"
                     :class="{
@@ -5145,7 +5092,7 @@ watch(
                     @slash-open="loadSkills"
                     @run-skill="runSkill"
                   />
-                  <button v-else type="button" class="block-add" @click="startNewBlock(Math.max(0, pages.length - 1))">
+                  <button v-else type="button" class="block-add" @click="startNewBlock()">
                     {{ t('viewer.blockAdd') }}
                   </button>
                 </article>
