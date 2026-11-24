@@ -9,7 +9,7 @@ Canonical project rules (`.rule`; AGENTS.md / CLAUDE.md symlink here). This file
 
 ## Cost safety — users' upstream keys are real money
 
-- Never debug, reproduce, or benchmark against Kano Proxy, a user's provider connection, or any paid upstream. Verification is tests with stubbed HTTP (`docs/testing.md`). A live smoke test needs explicit per-instance approval: one tiny document, one cheap model, never a loop.
+- Never debug, reproduce, or benchmark against Kano Proxy or any paid upstream. Verification is tests with stubbed HTTP (`docs/testing.md`). A live smoke test needs explicit per-instance approval: one tiny document, one cheap model, never a loop.
 
 ## Secrets
 
@@ -29,9 +29,9 @@ Canonical project rules (`.rule`; AGENTS.md / CLAUDE.md symlink here). This file
 ## Workflow
 
 - Check existing files and `git status` before editing; never overwrite changes you didn't make.
-- Before delivering: `uv run ruff check` + `uv run pytest` (api), `pnpm typecheck` + `pnpm lint` + `pnpm test` (web), `docker compose config` when compose files changed.
+- Before delivering: `uv run ruff check` + `uv run ruff format --check` + `uv run pytest` (api), `pnpm typecheck` + `pnpm lint` + `pnpm test` (web), `docker compose config` when compose files changed.
 - The api tests need Linux (`os.O_PATH`, `/proc/self/fd`): on macOS run them in a Linux container (`ghcr.io/astral-sh/uv:python3.12-bookworm` with `poppler-utils` and `git`). Bound every test run with `timeout` and keep its output in view; a hung test otherwise runs unseen for hours.
 
 ## Real data only
 
-- Frontend renders only what the backend returns; empty is a real state. Models come from the live catalog of the agent's upstream (Kano Proxy or a provider connection), usage from `usage_log` — never hard-coded as if live. Exceptions: test fixtures, docs examples with placeholders.
+- Frontend renders only what the backend returns; empty is a real state. Models come from the live catalog of the agent's upstream (Kano Proxy), usage from `usage_log` — never hard-coded as if live. Exceptions: test fixtures, docs examples with placeholders.
