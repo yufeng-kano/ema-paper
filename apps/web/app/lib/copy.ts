@@ -158,10 +158,6 @@ function rowsToMarkdown(rows: MarkdownNode[]): string {
   return lines.join('\n')
 }
 
-function tableToMarkdown(node: MarkdownNode): string {
-  return rowsToMarkdown(tableRows(node))
-}
-
 /**
  * One pipe table from cells the caller has already grouped into rows — Firefox reports a
  * table-region selection as one range per cell, and serializing each range alone would
@@ -174,16 +170,20 @@ export function cellGroupsToMarkdown(rows: MarkdownNode[][]): string {
   )
 }
 
-function listToMarkdown(node: MarkdownNode): string {
-  const ordered = tag(node) === 'ol'
-  const start = Number.parseInt(attribute(node, 'start') ?? '1', 10) || 1
-  const items = children(node).filter((child) => tag(child) === 'li')
+/** List items as markdown lines: numbered from `start` when ordered, bullets otherwise. */
+function itemsToMarkdown(items: MarkdownNode[], ordered: boolean, start: number): string {
   return items
     .map((item, index) => {
       const marker = ordered ? `${start + index}.` : '-'
       return `${marker} ${collapseWhitespace(inlineText(item))}`
     })
     .join('\n')
+}
+
+function listToMarkdown(node: MarkdownNode): string {
+  const start = Number.parseInt(attribute(node, 'start') ?? '1', 10) || 1
+  const items = children(node).filter((child) => tag(child) === 'li')
+  return itemsToMarkdown(items, tag(node) === 'ol', start)
 }
 
 function codeToMarkdown(node: MarkdownNode): string {
@@ -259,7 +259,7 @@ function blockToMarkdown(node: MarkdownNode, partialBlocks?: ReadonlySet<string>
       return quoteLines(inner.blocks.join('\n\n'))
     }
     case 'table':
-      return tableToMarkdown(node)
+      return rowsToMarkdown(tableRows(node))
     case 'ul':
     case 'ol':
       return listToMarkdown(node)
@@ -289,7 +289,7 @@ function isInline(node: MarkdownNode): boolean {
 interface Walk {
   blocks: string[]
   inline: string[]
-  /** `data-md` sources of display-math blocks a live selection boundary cut through. */
+  /** `data-md-id`s of display-math blocks a live selection boundary cut through. */
   partialBlocks?: ReadonlySet<string>
 }
 
@@ -350,12 +350,7 @@ function orphansToMarkdown(
   }
   // Items with no list: the live selection's context says what the ancestor was — an
   // ordered run keeps its numbering. Without context, bullets.
-  return group
-    .map((item, index) => {
-      const marker = list?.ordered ? `${list.start + index}.` : '-'
-      return `${marker} ${collapseWhitespace(inlineText(item))}`
-    })
-    .join('\n')
+  return itemsToMarkdown(group, list?.ordered ?? false, list?.start ?? 1)
 }
 
 function walkNodes(nodes: MarkdownNode[], walk: Walk, list?: OrphanListContext): void {

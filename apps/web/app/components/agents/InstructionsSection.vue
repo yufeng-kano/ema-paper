@@ -53,7 +53,7 @@ const translateLanguage = ref(saved.value.translate)
 /** Bumped to remount the editor on Cancel: it follows its `source` only when that changes,
  *  and Cancel is often a return to the same saved text. */
 const editorKey = ref(0)
-const editor = ref<{ focus: (where?: 'start' | 'end') => void } | null>(null)
+const editor = ref<{ focus: () => void } | null>(null)
 const pending = ref(false)
 const error = ref<string | null>(null)
 
@@ -76,7 +76,7 @@ function languageName(tag: string): string {
 /** A click on the box below the last line still writes, as in the notes column. */
 function onEditorClick(event: MouseEvent) {
   if (!(event.target instanceof Element) || !event.target.closest('.rich')) {
-    editor.value?.focus('end')
+    editor.value?.focus()
   }
 }
 

@@ -11,7 +11,7 @@
 import type { Node as ProseNode } from '@tiptap/pm/model'
 import { Selection, type Transaction } from '@tiptap/pm/state'
 import type { Mappable } from '@tiptap/pm/transform'
-import { isHeading, parseResultMarkdown, type InlineOptions, type ResultBlock } from './markdown'
+import { isHeading, parseBlocks, type InlineOptions, type ResultBlock } from './markdown'
 import { convertBlock, docToMarkdown, markdownToDoc, type BlockKindName } from './richdoc'
 
 export interface NoteUnit {
@@ -50,7 +50,7 @@ function isBare(node: ProseNode): boolean {
   if (node.type.name !== 'rawBlock') {
     return false
   }
-  const blocks = parseResultMarkdown(String(node.attrs.source)).flatMap((page) => page.blocks)
+  const blocks = parseBlocks(String(node.attrs.source))
   return !blocks.length || blocks[0]!.kind === 'comment'
 }
 
@@ -90,7 +90,7 @@ export function unitMarkdown(doc: ProseNode, unit: NoteUnit): string {
 /** The unit as the viewer's parser reads it, for its kind and its name: an excerpt's quote, any
  *  other unit's one block; null for an empty line. */
 export function unitBlock(doc: ProseNode, unit: NoteUnit): ResultBlock | null {
-  return parseResultMarkdown(unitMarkdown(doc, unit)).flatMap((page) => page.blocks)[0] ?? null
+  return parseBlocks(unitMarkdown(doc, unit))[0] ?? null
 }
 
 /**

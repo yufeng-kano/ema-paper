@@ -91,7 +91,7 @@ const savedInstructions = computed(() => settings.value.instructions ?? '')
 const text = ref(savedInstructions.value)
 /** Bumped to remount the editor on Cancel: it follows its `source` only when that changes. */
 const editorKey = ref(0)
-const editor = ref<{ focus: (where?: 'start' | 'end') => void } | null>(null)
+const editor = ref<{ focus: () => void } | null>(null)
 const instructionsPending = ref(false)
 
 /** Counted as the server counts: the trimmed text, in code points. */
@@ -102,7 +102,7 @@ const dirty = computed(() => text.value.trim() !== savedInstructions.value.trim(
 /** A click on the box below the last line still writes, as in the notes column. */
 function onEditorClick(event: MouseEvent) {
   if (!(event.target instanceof Element) || !event.target.closest('.rich')) {
-    editor.value?.focus('end')
+    editor.value?.focus()
   }
 }
 

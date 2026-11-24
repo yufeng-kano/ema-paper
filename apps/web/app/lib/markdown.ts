@@ -230,6 +230,36 @@ export function parseResultMarkdown(markdown: string): ResultPageBlocks[] {
   return parsePages(markdown, false)
 }
 
+/** Every block of a markdown string in reading order, page markers crossed. */
+export function parseBlocks(markdown: string): ResultBlock[] {
+  return parseResultMarkdown(markdown).flatMap((page) => page.blocks)
+}
+
+/**
+ * Where each of `blocks` — parsed from `markdown`, in order — has its source in `markdown`, as
+ * offsets into that same string; null for a block not found there. A block's source is whole
+ * lines, found only where whole lines are: a paragraph that is only `1` is not the `1` in
+ * `<!-- page: 1 -->`. A line ends at `\n` or `\r`, so a one-line block is found in CRLF text
+ * too; a block of several lines is not, its source being joined with `\n`. Each block is looked
+ * for after the last one found, comments included, so no later block is found inside one.
+ */
+export function locateSources(markdown: string, blocks: readonly ResultBlock[]): ({ start: number; end: number } | null)[] {
+  const lineBreak = (at: number) => markdown[at] === '\n' || markdown[at] === '\r'
+  const wholeLines = (start: number, end: number) => (start === 0 || lineBreak(start - 1)) && (end === markdown.length || lineBreak(end))
+  let cursor = 0
+  return blocks.map(({ src }) => {
+    let start = markdown.indexOf(src, cursor)
+    while (start !== -1 && !wholeLines(start, start + src.length)) {
+      start = markdown.indexOf(src, start + 1)
+    }
+    if (start === -1) {
+      return null
+    }
+    cursor = start + src.length
+    return { start, end: cursor }
+  })
+}
+
 /** A quote's content as blocks: no page of its own, and a `>` in it stays text. */
 function parseQuoted(content: string): ResultBlock[] {
   return parsePages(content, true).flatMap((page) => page.blocks)
@@ -1469,7 +1499,7 @@ export function isHeading(block: ResultBlock | null | undefined): block is Extra
  * after the heading up to the last before the next heading of the same or a higher level —
  * the extent `sectionSource` reads and a collapsed heading hides. `[start, end)`.
  */
-export function sectionExtent(placed: readonly PlacedBlock[], heading: number): { start: number; end: number } {
+export function sectionExtent(placed: readonly { block: ResultBlock }[], heading: number): { start: number; end: number } {
   const block = placed[heading]?.block
   const level = isHeading(block) ? block.level : 0
   let end = heading + 1
@@ -1560,7 +1590,7 @@ export function moveBlocks(
  * left out: what lands belongs to the page it lands on. Null when `src` holds no block.
  */
 export function insertBlocks(markdown: string, target: BlockAt | null, place: 'before' | 'after', src: string): MovedBlocks | null {
-  const adding = parseResultMarkdown(src).flatMap((page) => page.blocks)
+  const adding = parseBlocks(src)
   if (!adding.length) {
     return null
   }

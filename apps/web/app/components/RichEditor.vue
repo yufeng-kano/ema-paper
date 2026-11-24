@@ -43,7 +43,7 @@ import { isImageFile, matchCommands } from '~/lib/composer'
 import { BLOCK_DRAG_TYPE, NOTES_BLOCK_DRAG_TYPE, carriesFiles, claimDrag, droppedFiles, setDropEffect } from '~/lib/dnd'
 import { droppedBlocksMarkdown } from '~/lib/excerpts'
 import type { IconName } from '~/lib/icons'
-import { blockPlain, nearestBlock, type PlaceNear, type ResultBlock } from '~/lib/markdown'
+import { blockPlain, isHeading, nearestBlock, type PlaceNear, type ResultBlock } from '~/lib/markdown'
 import { openSide, type MenuItem, type Point } from '~/lib/menu'
 import {
   UnitSelection,
@@ -402,7 +402,7 @@ const { label: keyLabel, matches } = useShortcuts()
 
 // --- the slash menu --------------------------------------------------------------------
 
-/** The menu's widest and tallest, and the gap between it and the slash's line. */
+/** The menu's tallest, and the gap between it and the slash's line. */
 const SLASH_MAX_HEIGHT = 432
 const SLASH_GAP = 4
 
@@ -1027,25 +1027,29 @@ async function insertImages(files: File[], slot: ImageSlot) {
   }
 }
 
+/** The editor's top-level blocks as markdown, each with where it starts and ends; empty
+ *  paragraphs are passed over. */
+function topBlocks(doc: ProseNode): { markdown: string; from: number; to: number }[] {
+  const blocks: { markdown: string; from: number; to: number }[] = []
+  doc.forEach((node, offset) => {
+    const markdown = docToMarkdown({ type: 'doc', content: [node.toJSON()] }).trim()
+    if (markdown) {
+      blocks.push({ markdown, from: offset, to: offset + node.nodeSize })
+    }
+  })
+  return blocks
+}
+
 /** A place in the editor by the top-level blocks around it, empty paragraphs passed over: the
  *  last before it, the first from it on, and how many come before it. */
 function placeIn(doc: ProseNode, pos: number): PlaceNear {
-  let after: string | null = null
-  let before: string | null = null
-  let gap = 0
-  doc.forEach((node, offset) => {
-    const markdown = docToMarkdown({ type: 'doc', content: [node.toJSON()] }).trim()
-    if (!markdown) {
-      return
-    }
-    if (offset < pos) {
-      after = markdown
-      gap += 1
-    } else if (before === null) {
-      before = markdown
-    }
-  })
-  return { after, before, gap }
+  const blocks = topBlocks(doc)
+  const ahead = blocks.filter((block) => block.from < pos)
+  return {
+    after: ahead.at(-1)?.markdown ?? null,
+    before: blocks.find((block) => block.from >= pos)?.markdown ?? null,
+    gap: ahead.length,
+  }
 }
 
 function imagesOf(transfer: DataTransfer | null): File[] {
@@ -1236,7 +1240,7 @@ const handleName = computed(() => (shownUnit.value === null ? '' : unitName(show
 
 /** Block kinds as the document's menu header names them. */
 function kindLabel(block: ResultBlock): string {
-  return t(`viewer.block.kinds.${block.kind === 'h2' || block.kind === 'h3' ? 'h' : block.kind}`)
+  return t(`viewer.block.kinds.${isHeading(block) ? 'h' : block.kind}`)
 }
 
 /** Each unit's extent on screen, its first block's top to its last block's bottom. */
@@ -1855,13 +1859,7 @@ watch(
     const places = [...landing].map((slot) => ({ slot, near: placeIn(editor!.state.doc, slot.pos) }))
     editor.chain().setMeta('addToHistory', false).setContent(markdownToDoc(source, inlineOptions), { emitUpdate: false }).run()
     const { doc } = editor.state
-    const blocks: { markdown: string; from: number; to: number }[] = []
-    doc.forEach((node, offset) => {
-      const markdown = docToMarkdown({ type: 'doc', content: [node.toJSON()] }).trim()
-      if (markdown) {
-        blocks.push({ markdown, from: offset, to: offset + node.nodeSize })
-      }
-    })
+    const blocks = topBlocks(doc)
     for (const { slot, near } of places) {
       // After the block it followed, else before the one it preceded, else at the end.
       const found = nearestBlock(blocks.map((block) => block.markdown), near)
@@ -1950,9 +1948,10 @@ onBeforeUnmount(() => {
 })
 
 defineExpose({
-  focus: (where: 'start' | 'end' = 'end') => {
+  /** The caret at the end of the text. */
+  focus: () => {
     if (editor) {
-      focusAt(where === 'start' ? Selection.atStart(editor.state.doc) : Selection.atEnd(editor.state.doc))
+      focusAt(Selection.atEnd(editor.state.doc))
     }
   },
   wash,
@@ -2249,14 +2248,6 @@ defineExpose({
   height: 16px;
 }
 
-/* The layers drawn behind blocks — a unit's selection, the wash — belong to the editor's own
-   stacking context, not the block's: there they sit behind the whole block, its quote bar and
-   its heading's rule included, as the document's sit behind a block's wrapper. In the block's
-   own context they would paint over its border. */
-.rich :deep(.rich-doc) {
-  isolation: isolate;
-}
-
 /* A unit selected whole, or the one its menu holds: the document's selection, a layer behind
    its blocks that moves no text — an excerpt's two blocks joined into one layer. */
 .rich :deep(.rich-unit-selected) {
@@ -2333,6 +2324,11 @@ defineExpose({
      rendered block: they stay on, as they are there. */
   font-variant-ligatures: normal;
   font-feature-settings: normal;
+  /* The layers drawn behind blocks — a unit's selection, the wash — belong to the editor's
+     own stacking context, not the block's: there they sit behind the whole block, its quote
+     bar and its heading's rule included, as the document's sit behind a block's wrapper. In
+     the block's own context they would paint over its border. */
+  isolation: isolate;
 }
 
 .rich :deep(.rich-doc > * + *) {
@@ -2360,9 +2356,6 @@ defineExpose({
   display: block;
   max-width: 100%;
   overflow-x: auto;
-}
-
-.rich :deep(.md-table th p) {
 }
 
 /* A formula is one object: it highlights as a whole and opens on a click. */
@@ -2621,7 +2614,7 @@ defineExpose({
   }
 }
 
-/* The rows scroll; the legend under them stays. */
+/* The rows scroll inside the menu's max height. */
 .slash-list {
   flex: 1 1 auto;
   min-height: 0;

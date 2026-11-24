@@ -69,6 +69,13 @@ describe('appendExcerpt', () => {
     expect(added.notes.slice(added.at)).toMatch(/^> New\./)
   })
 
+  it('ends the section at its last block, not at the same text inside a page marker', () => {
+    const notes = '## Excerpts\n\n<!-- page: 2 -->\n2'
+    const added = appendExcerpt(notes, 'New.', excerpt('New.'), '## Excerpts')
+    expect(added.notes).toBe(`${notes}\n\n> New.\n\n[Intro](#intro)`)
+    expect(added.notes.slice(added.at)).toMatch(/^> New\./)
+  })
+
   it('never adds a passage twice, comparing whole text and not containment', () => {
     const notes = '## Excerpts\n\n> Some   words $x$.\n\n[Intro](#intro)'
     const again = appendExcerpt(notes, 'Some words $x$.', excerpt('Some words $x$.'), '## Excerpts')
@@ -226,6 +233,15 @@ describe('insertNoteBlocks', () => {
     const notes = ['> First passage.', link, '> Second passage.', link, 'Tail.'].join('\n\n')
     expect(insertNoteBlocks(notes, { after: link, before: 'Tail.', gap: 4 }, line)).toBe(
       ['> First passage.', link, '> Second passage.', link, line, 'Tail.'].join('\n\n'),
+    )
+  })
+
+  it('finds a block by its own line, never inside a page marker', () => {
+    const notes = '<!-- page: 1 -->\n1\n\nNext'
+    expect(insertNoteBlocks(notes, { after: '1', before: 'Next', gap: 1 }, line)).toBe(`<!-- page: 1 -->\n1\n\n${line}\n\nNext`)
+    // A line ends at a carriage return too.
+    expect(insertNoteBlocks('First.\r\n\r\nSecond.\r\n', { after: 'First.', before: 'Second.', gap: 1 }, line)).toBe(
+      `First.\n\n${line}\n\nSecond.\r\n`,
     )
   })
 

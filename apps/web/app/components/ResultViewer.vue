@@ -154,7 +154,7 @@ type RowRange = { from: number; to: number }
 
 /** What an open rich editor exposes to the viewer. */
 interface EditorControls {
-  focus: (where?: 'start' | 'end') => void
+  focus: () => void
   wash: (first: number, count: number) => void
   focusBlock: (index: number) => void
   refreshLinks: () => void
@@ -685,7 +685,7 @@ const notesEditor = ref<EditorControls | null>(null)
  *  editor, its TeX field included, is the editor's own. */
 function onNotesClick(event: MouseEvent) {
   if (!(event.target instanceof Element) || !event.target.closest('.rich')) {
-    notesEditor.value?.focus('end')
+    notesEditor.value?.focus()
   }
 }
 
@@ -1740,7 +1740,7 @@ function forgetChromePress() {
 
 /** Block kinds as the menu's header and the handle's name say them. */
 function kindLabel(block: ResultBlock): string {
-  return t(`viewer.block.kinds.${block.kind === 'h2' || block.kind === 'h3' ? 'h' : block.kind}`)
+  return t(`viewer.block.kinds.${isHeading(block) ? 'h' : block.kind}`)
 }
 
 /** The words a block's name is built from (`blockName`), in the reader's language. */

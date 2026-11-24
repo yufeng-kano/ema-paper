@@ -11,6 +11,7 @@ import {
   firstWords,
   inlinePlain,
   isHeading,
+  locateSources,
   sectionExtent,
   type InlineOptions,
   type OutlineEntry,
@@ -330,7 +331,7 @@ export function changedBlocks(before: readonly PlacedBlock[], after: readonly Pl
 }
 
 /** The most documents whose folds the browser keeps: `localStorage` is small, and shared. */
-export const FOLD_MEMORY_LIMIT = 100
+const FOLD_MEMORY_LIMIT = 100
 
 /** The folds remembered per document — `doc:<id>` — with when each was last set, so the
  *  oldest are the ones let go. */
@@ -638,24 +639,11 @@ export function blocksInRanges(
   ranges: readonly { start: number; end: number }[],
 ): number[] {
   const found = new Set<number>()
-  // A block's source is whole lines, found only where whole lines are: a paragraph that is only
-  // `1` is not the `1` in `<!-- page: 1 -->`.
-  const wholeLines = (start: number, length: number) =>
-    (start === 0 || markdown[start - 1] === '\n') && (start + length === markdown.length || markdown[start + length] === '\n')
-  let cursor = 0
-  const spans = placed.map((entry) => {
-    const { src } = entry.block
-    let start = markdown.indexOf(src, cursor)
-    while (start !== -1 && !wholeLines(start, src.length)) {
-      start = markdown.indexOf(src, start + 1)
-    }
-    if (start === -1) {
-      return null
-    }
-    // A comment is stepped over, so no later block is found inside it, but never selected.
-    cursor = start + src.length
-    return entry.block.kind === 'comment' ? null : { start, end: cursor }
-  })
+  // A comment is stepped over, so no later block is found inside it, but never selected.
+  const spans = locateSources(
+    markdown,
+    placed.map((entry) => entry.block),
+  ).map((span, index) => (placed[index]!.block.kind === 'comment' ? null : span))
   for (const range of ranges) {
     const held = spans.flatMap((span, index) => {
       if (!span) {
@@ -691,14 +679,6 @@ export class UndoHistory {
   private undone: UndoStep[] = []
 
   constructor(private readonly limit = 50) {}
-
-  get canUndo(): boolean {
-    return this.done.length > 0
-  }
-
-  get canRedo(): boolean {
-    return this.undone.length > 0
-  }
 
   /** A block action: `before` became `after`. A new action ends every redo. */
   record(file: UndoFile, before: string, after: string): void {
