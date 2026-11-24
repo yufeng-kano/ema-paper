@@ -23,7 +23,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings
-from ..db.models import FILE_KIND, Document, Folder, User
+from ..db.models import FILE_KIND, Document, Folder
 from . import git, safe_io
 from .documents import (
     ORIGIN_SUFFIX,
@@ -52,6 +52,7 @@ from .layout import (
     user_root,
 )
 from .locks import workspace_lock
+from .trash import lock_user
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +117,7 @@ def _canonicalize(root: Path) -> int:
                 logger.warning("reconcile: %s stays, %s is taken", source, target)
                 continue  # left alone, and not descended into: its rows stay as they were
             try:
-                git.move(root, root / source, root / target)
+                safe_io.rename(root, root / source, root / target)
             except (safe_io.UnsafeEntry, OSError):
                 logger.warning("reconcile: %s could not be moved; left alone", source)
                 continue
@@ -135,7 +136,7 @@ def _canonicalize(root: Path) -> int:
                 logger.warning("reconcile: %s stays, %s is taken", source, target)
                 continue
             try:
-                git.move(root, root / source, root / target)
+                safe_io.rename(root, root / source, root / target)
             except (safe_io.UnsafeEntry, OSError):
                 logger.warning("reconcile: %s could not be moved; left alone", source)
                 continue
@@ -434,7 +435,7 @@ async def _reconcile_locked(db: AsyncSession, user_id: int, root: Path) -> int:
     # The user's row, under the workspace lock — the order every mutation takes: a
     # folder row added here shares the namespace the Files page's name decisions lock
     # (docs/workspace.md § Revisions).
-    await db.execute(select(User.id).where(User.id == user_id).with_for_update())
+    await lock_user(db, user_id)
     # Live rows only: a `.meta.json` under `files/` that names a document in the Trash —
     # copied out of the read-only Trash, brought back by a revert — is not that document,
     # and its row stays in the Trash (docs/workspace.md § The Trash).

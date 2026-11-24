@@ -396,8 +396,8 @@ def test_shell_diffs_and_revisions_are_read_within_a_bound(tmp_path) -> None:
     diff = git.show_commit(root, commit, 2_000)
     assert len(diff) < 2_100 and diff.rstrip().endswith("[... diff cut by the workspace ...]")
     with pytest.raises(git.GitError):
-        git.show(root, commit, Path("files/big.txt"), 1_000)
-    assert git.show(root, commit, Path("files/big.txt"), 1_000_000) == "line\n" * 20_000
+        git.show_bytes(root, commit, Path("files/big.txt"), 1_000)
+    assert git.show_bytes(root, commit, Path("files/big.txt"), 1_000_000) == b"line\n" * 20_000
 
 
 async def test_reconcile_ignores_oversized_metadata(sessionmaker, tmp_path) -> None:
@@ -571,6 +571,63 @@ def test_path_scoped_commits_name_their_paths_literally(tmp_path) -> None:
     assert [entry.message for entry in git.log(root, Path("files/a*"))] == ["save a*"]
     # A pathspec that matches nothing is still skipped, not an error.
     assert git.commit_paths(root, "user", "nothing", [Path("files/zzz")]) is None
+
+
+def test_a_path_scoped_commit_stages_paths_past_one_argv_chunk(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "ws" / "1"
+    for name in ("a", "b", "c"):
+        (root / "files" / name).mkdir(parents=True)
+        (root / "files" / name / "doc.md").write_text(f"{name}\n")
+    git.ensure_repo(root)
+    # One pathspec per `ls-files` call, one of them matching nothing.
+    monkeypatch.setattr(git, "_PATHSPEC_CHUNK_BYTES", 24)
+    paths = [Path("files/a"), Path("files/zzz"), Path("files/b"), Path("files/c")]
+    assert git.commit_paths(root, "user", "three", paths) is not None
+    assert sorted(git.log(root)[0].files) == ["files/a/doc.md", "files/b/doc.md", "files/c/doc.md"]
+
+
+def test_missing_at_head_reads_a_name_as_a_name(tmp_path) -> None:
+    """A shell can begin a top-level name with `:`, which git would otherwise read as
+    pathspec magic: an exclusion, a glob, or nothing at all."""
+    root = tmp_path / "ws" / "1"
+    root.mkdir(parents=True)
+    git.ensure_repo(root)
+    held = [Path(":!x"), Path(":(glob)y"), Path("x")]
+    for name in held:
+        (root / name).write_text(f"{name}\n")
+    git.commit_all(root, "user", "names")
+    assert git.missing_at_head(root, held) == []
+    assert git.missing_at_head(root, [Path(":x"), Path("x")]) == [Path(":x")]
+
+
+def test_renames_since_follows_chains_and_paths_that_meet(tmp_path) -> None:
+    root = tmp_path / "ws" / "1"
+    root.mkdir(parents=True)
+    git.ensure_repo(root)
+    for name in ("a", "c", "e"):
+        (root / name).write_text(f"{name} line\n" * 50)
+    base = git.commit_all(root, "user", "base")
+    assert base is not None
+
+    def move(source: str, target: str) -> None:
+        (root / source).rename(root / target)
+        assert git.commit_all(root, "user", f"{source} -> {target}") is not None
+
+    move("a", "b")
+    (root / "b").unlink()
+    git.commit_all(root, "user", "remove b")
+    # `c` takes the name `a` once moved to, and both move on together.
+    move("c", "b")
+    move("b", "d")
+    # A rename back to the origin's name, then on.
+    move("e", "f")
+    move("f", "e")
+    move("e", "g")
+    assert git.renames_since(root, base) == {
+        Path("a"): Path("d"),
+        Path("c"): Path("d"),
+        Path("e"): Path("g"),
+    }
 
 
 async def test_a_folder_set_aside_by_a_crashed_delete_comes_back_whole(
@@ -1177,7 +1234,7 @@ def test_the_backup_hold_waits_for_the_backup_lock(tmp_path) -> None:
     entered = threading.Event()
 
     def writer() -> None:
-        shared = locks._acquire_shared(backup)
+        shared = locks._flock(backup, fcntl.LOCK_SH)
         # The workspace lock inside the hold takes the backup lock shared again.
         handle, inner = locks._acquire(locks._lock_path(root, locks.WORKSPACE_SUFFIX), backup)
         entered.set()
@@ -1234,7 +1291,7 @@ def test_reaches_beyond_tells_a_documents_own_revision_from_a_shells(tmp_path) -
     assert documents.reaches_beyond(paths, own) is False
     assert documents.reaches_beyond(paths, both) is True
     # The document moved since: its own older revision is still its own.
-    git.move(root, root / "files" / "a", root / "files" / "moved")
+    safe_io.rename(root, root / "files" / "a", root / "files" / "moved")
     git.commit_paths(root, "user", "rename a", [Path("files/a"), Path("files/moved")])
     moved = documents.DocumentPaths(root=root, relative=Path("files/moved"))
     assert documents.reaches_beyond(moved, own) is False
@@ -1616,14 +1673,14 @@ def test_a_directory_the_disk_refuses_to_move_stays_and_the_others_are_recorded(
     for name in (".a", ".b"):
         (root / "files" / name).mkdir(parents=True)
         (root / "files" / name / "note.txt").write_text(name)
-    real = git.move
+    real = safe_io.rename
 
     def refusing(root_: Path, source: Path, target: Path) -> None:
         if source.name == ".b":
             raise PermissionError("read-only parent")
         real(root_, source, target)
 
-    monkeypatch.setattr(git, "move", refusing)
+    monkeypatch.setattr(safe_io, "rename", refusing)
     assert reconcile._canonicalize(root) == 1
     assert (root / "files" / "_.a" / "note.txt").is_file()
     assert (root / "files" / ".b" / "note.txt").is_file()
@@ -1706,7 +1763,7 @@ async def test_a_move_that_fails_after_displacing_a_squatter_puts_it_back(
         target = before.relative.with_name("renamed.pdf")
         (root / target).mkdir()
         (root / target / "scratch.txt").write_text("the shell's")
-        real = git.move
+        real = safe_io.rename
         calls = {"n": 0}
 
         def flaky(root_, source, dest):
@@ -1715,7 +1772,7 @@ async def test_a_move_that_fails_after_displacing_a_squatter_puts_it_back(
                 raise OSError(5, "Input/output error")
             return real(root_, source, dest)
 
-        monkeypatch.setattr(git, "move", flaky)
+        monkeypatch.setattr(safe_io, "rename", flaky)
         with pytest.raises(ApiError) as refused:
             await documents.move_path(settings, user.id, before.relative, target)
         assert refused.value.status_code == 409
@@ -1890,7 +1947,7 @@ async def test_a_file_moved_in_from_another_document_reaches_beyond(sessionmaker
         paths = await documents.materialize_document(db, settings, document)
         other_paths = await documents.materialize_document(db, settings, other)
     root = paths.root
-    git.move(root, other_paths.notes, paths.directory / "extra.md")
+    safe_io.rename(root, other_paths.notes, paths.directory / "extra.md")
     moved_in = git.commit_all(root, "agent:1", "bash: mv")
     assert moved_in is not None
     assert documents.reaches_beyond(paths, moved_in) is True
@@ -1939,10 +1996,10 @@ async def test_materialized_files_left_uncommitted_are_committed_next_time(
         paths = await documents.materialize_document(db, settings, document)
         monkeypatch.setattr(git, "commit_paths", real)
         assert paths.doc.is_file()
-        assert not git.tracked_at_head(paths.root, paths.relative / "doc.md")
+        doc, meta = paths.relative / "doc.md", paths.relative / ".meta.json"
+        assert git.missing_at_head(paths.root, [doc]) == [doc]
         await documents.materialize_document(db, settings, document)
-        assert git.tracked_at_head(paths.root, paths.relative / "doc.md")
-        assert git.tracked_at_head(paths.root, paths.relative / ".meta.json")
+        assert git.missing_at_head(paths.root, [doc, meta]) == []
         head = git.log(paths.root)[0]
         assert head.message == f"materialize {paths.relative}"
         # Committed, nothing is asked of the next one.

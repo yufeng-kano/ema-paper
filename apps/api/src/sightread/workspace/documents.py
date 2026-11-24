@@ -65,6 +65,7 @@ logger = logging.getLogger(__name__)
 NOT_PLAIN = "The document's files are not regular files"
 TOO_LARGE = "The document file is too large to open"
 NOT_UTF8 = "The document file is not UTF-8 text"
+STORAGE_FULL = "The workspace is at its quota; free some space first"
 
 # A document with no parse behind it (docs/workspace.md § Markdown documents): what an
 # upload is recognised as one by (its kind, `MARKDOWN_KIND`, is the row's).
@@ -764,7 +765,7 @@ async def ensure_within_quota(
     limit = ledger.storage_limit(settings, await ledger.plan_of(db, settings, user_id))
     used = (await measure_storage(db, settings, user_id, root)).total
     if used >= limit:
-        raise ApiError(409, "storage_full", "The workspace is at its quota; free some space first")
+        raise ApiError(409, "storage_full", STORAGE_FULL)
 
 
 def _source_suffix(source: Path, kind: str) -> str:
@@ -1565,7 +1566,8 @@ def _revert(
                         _prune_empty(root, (root / now).parent)
                 else:
                     safe_io.write_bytes(root, root / now, data)
-        tracked = [now for now in unheld if git.tracked_at_head(root, now)]
+        missing = set(git.missing_at_head(root, sorted(unheld))) if unheld else set()
+        tracked = [now for now in unheld if now not in missing]
         if tracked:
             git.restore_paths(root, tracked)
         for now in unheld - set(tracked):
@@ -1581,7 +1583,7 @@ def _revert(
         # not record — goes the same way (docs/workspace.md § Revisions).
         vacated: dict[Path, Path] = {}
         for current, then in moves:
-            git.move(root, root / current, root / then)
+            safe_io.rename(root, root / current, root / then)
             done_moves.append((current, then))
             if current.parent != then.parent:
                 vacated.setdefault(current.parent, then.parent)
@@ -1709,10 +1711,10 @@ def _move_tree(root: Path, source: Path, target: Path, message: str, author: str
             # under that name. It moves aside, so the document lands where the database
             # says and the squatter keeps what it holds (docs/workspace.md § Layout).
             aside = _aside_name(target)
-            git.move(root, root / target, root / aside)
+            safe_io.rename(root, root / target, root / aside)
             touched.append(aside)
-        git.move(root, root / source, root / target)
-    except (safe_io.UnsafeEntry, OSError, git.GitError) as exc:
+        safe_io.rename(root, root / source, root / target)
+    except (safe_io.UnsafeEntry, OSError) as exc:
         # An ancestor the shell swapped for a link, or the disk refusing: refused, the
         # squatter back where it sat, and the caller's row rolls back to where the
         # files still are.
@@ -1757,10 +1759,10 @@ async def move_path(
 
 def _undo_move(root: Path, source: Path, target: Path, displaced: Path | None, author: str) -> None:
     touched = [target, source]
-    git.move(root, root / target, root / source)
+    safe_io.rename(root, root / target, root / source)
     if displaced is not None and safe_io.entry_kind(root, root / displaced) != "none":
         # The squatter back under the name it had, not left at its suffixed one.
-        git.move(root, root / displaced, root / target)
+        safe_io.rename(root, root / displaced, root / target)
         touched.append(displaced)
     git.commit_paths(root, author, f"restore {source}", touched)
 
@@ -2073,7 +2075,7 @@ def _unstash_tree(root: Path, entry: str, relative: Path, message: str, author: 
         # Something the shell made under that name meanwhile moves aside, as a move moves
         # a squatter, so the item lands where its row says (docs/workspace.md § Layout).
         aside = _aside_name(relative)
-        git.move(root, root / relative, root / aside)
+        safe_io.rename(root, root / relative, root / aside)
         touched.append(aside)
     try:
         safe_io.rename(root, source, root / relative)
@@ -2310,7 +2312,7 @@ def _copy_files(
         # A directory the shell made under the copy's name: aside, as a move's squatter.
         aside = _aside_name(target)
         try:
-            git.move(root, root / target, root / aside)
+            safe_io.rename(root, root / target, root / aside)
         except (safe_io.UnsafeEntry, OSError) as exc:
             raise ApiError(
                 409, "invalid_request", "The copy could not be made; nothing was copied"

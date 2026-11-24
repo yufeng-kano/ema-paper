@@ -50,11 +50,11 @@ API_AUTHOR = "api"
 # What a revision records of a file that is not a document's own: text, and no more than
 # `REVISION_MAX_FILE_BYTES` of it (docs/workspace.md § Revisions). A document's own files
 # are recorded whatever they hold.
-RECORDED_NAMES = frozenset({DOC_FILE, NOTES_FILE, META_FILE})
+_RECORDED_NAMES = frozenset({DOC_FILE, NOTES_FILE, META_FILE})
 _TEXT_PROBE_BYTES = 8192
 
 
-def is_text(data: bytes) -> bool:
+def _is_text(data: bytes) -> bool:
     """Git's own test of a text file, on bytes in hand: no NUL byte in the first 8 KiB."""
     return b"\0" not in data[:_TEXT_PROBE_BYTES]
 
@@ -64,14 +64,20 @@ def revision_max_file_bytes() -> int:
     return int(get_settings().revision_max_file_bytes)
 
 
+def records(name: str, data: bytes) -> bool:
+    """Whether history would take a file called `name` holding `data`: `recordable`'s
+    rule on bytes in hand rather than a file on disk."""
+    return name in _RECORDED_NAMES or (len(data) <= revision_max_file_bytes() and _is_text(data))
+
+
 def recordable(root: Path, relative: Path, max_bytes: int) -> bool:
     """Whether history takes the file at `relative`: a document's own file always; any
     other only when it is text — no NUL byte in its first 8 KiB — and no larger than
     `REVISION_MAX_FILE_BYTES`, so a video or an archive kept in the library never lands in
     the object store, and a change to one has no revision (docs/workspace.md § Revisions,
     § Files). A path with nothing plain at it — a deletion to record, a link, a gitlink —
-    is git's to judge, as before."""
-    if relative.name in RECORDED_NAMES:
+    is git's to judge."""
+    if relative.name in _RECORDED_NAMES:
         return True
     try:
         entry = safe_io.open_for_read(root, root / relative, max_bytes)
@@ -82,7 +88,7 @@ def recordable(root: Path, relative: Path, max_bytes: int) -> bool:
     if entry is None:
         return True
     try:
-        return is_text(os.read(entry, _TEXT_PROBE_BYTES))
+        return _is_text(os.read(entry, _TEXT_PROBE_BYTES))
     finally:
         os.close(entry)
 
@@ -202,24 +208,58 @@ def _commit_staged(root: Path, author: str, message: str) -> str | None:
     return head(root)
 
 
-def _stage(root: Path, pathspec: str) -> None:
-    """Stage what `pathspec` matches by the workspace's own exclusions and no other ignore
-    rule (docs/workspace.md § Revisions): `ls-files` lists the changes and reads no
-    `.gitignore` unless asked, so one a shell command writes into the tree hides nothing
-    from history; and an excluded file is never hashed, so no copy of an original or a
-    crop lands in the object store. Tracked files first, their edits and deletions
-    through `add -u`, which takes up no untracked file, not even one under a file that
-    became a directory; then the untracked files outside the exclusions through
-    `update-index`, which skips a name the shell removed meanwhile rather than failing
-    the commit, and with `--replace` lets a file take a directory's place and back."""
-    listed = _git_raw(root, "ls-files", "-z", "--modified", "--deleted", "--", pathspec)
+# The most argv bytes one `ls-files` call carries of pathspecs, well under any ARG_MAX: a
+# path the shell made can be as long as PATH_MAX, so a count of them bounds nothing.
+_PATHSPEC_CHUNK_BYTES = 128 * 1024
+
+
+def _chunks(pathspecs: list[str]) -> list[list[str]]:
+    """`pathspecs` in runs whose argv bytes stay within `_PATHSPEC_CHUNK_BYTES`."""
+    chunks: list[list[str]] = []
+    chunk: list[str] = []
+    size = 0
+    for pathspec in pathspecs:
+        length = len(os.fsencode(pathspec)) + 1
+        if chunk and size + length > _PATHSPEC_CHUNK_BYTES:
+            chunks.append(chunk)
+            chunk, size = [], 0
+        chunk.append(pathspec)
+        size += length
+    if chunk:
+        chunks.append(chunk)
+    return chunks
+
+
+def _listed(root: Path, chunks: list[list[str]], *flags: str) -> list[bytes]:
+    """What `ls-files -z <flags>` lists for every chunk of pathspecs, in order."""
+    return [
+        name
+        for chunk in chunks
+        for name in _git_raw(root, "ls-files", "-z", *flags, "--", *chunk).split(b"\0")
+        if name
+    ]
+
+
+def _stage(root: Path, pathspecs: list[str]) -> None:
+    """Stage what `pathspecs` match by the workspace's own exclusions and no other ignore
+    rule (docs/workspace.md § Revisions), in one pass over them all: a pathspec that
+    matches nothing adds nothing, and any git failure raises. `ls-files` lists the
+    changes and reads no `.gitignore` unless asked, so one a shell command writes into the
+    tree hides nothing from history; and an excluded file is never hashed, so no copy of
+    an original or a crop lands in the object store. Tracked files first, their edits and
+    deletions through `add -u`, which takes up no untracked file, not even one under a
+    file that became a directory; then the untracked files outside the exclusions through
+    `update-index`, which skips a name the shell removed meanwhile rather than failing the
+    commit, and with `--replace` lets a file take a directory's place and back. Both read
+    the names on stdin, which no argv limit bounds."""
+    chunks = _chunks(pathspecs)
     # A deleted file is listed as modified too. A file history does not record — binary,
     # or past `REVISION_MAX_FILE_BYTES` — is left out of both lists (`recordable`).
     cap = revision_max_file_bytes()
     names = dict.fromkeys(
         name
-        for name in listed.split(b"\0")
-        if name and recordable(root, Path(os.fsdecode(name)), cap)
+        for name in _listed(root, chunks, "--modified", "--deleted")
+        if recordable(root, Path(os.fsdecode(name)), cap)
     )
     if names:
         _git_raw(
@@ -230,12 +270,11 @@ def _stage(root: Path, pathspec: str) -> None:
             "--pathspec-file-nul",
             stdin=b"".join(b":(literal)" + name + b"\0" for name in names),
         )
-    listed = _git_raw(root, "ls-files", "-z", "--others", *_EXCLUDES, "--", pathspec)
     # A repository a shell command made inside the tree is listed as `dir/`: a gitlink.
     names = dict.fromkeys(
         name.rstrip(b"/")
-        for name in listed.split(b"\0")
-        if name and recordable(root, Path(os.fsdecode(name.rstrip(b"/"))), cap)
+        for name in _listed(root, chunks, "--others", *_EXCLUDES)
+        if recordable(root, Path(os.fsdecode(name.rstrip(b"/"))), cap)
     )
     if names:
         _git_raw(
@@ -250,36 +289,34 @@ def _stage(root: Path, pathspec: str) -> None:
         )
 
 
-def commit_all(root: Path, author: str, message: str) -> str | None:
-    """Stage everything and commit; None when the tree was clean. For the shell, whose
-    changes nobody can name in advance — under the shell lock, so the dirt is all its.
-    A failure anywhere leaves the index reset, never half-staged."""
+def _commit(root: Path, author: str, message: str, pathspecs: list[str]) -> str | None:
+    """Stage what `pathspecs` match and commit; None when nothing changed. On any failure
+    the index is reset, so what was staged does not ride into the next commit, which
+    commits the whole index — never a write reported done without its revision
+    (docs/workspace.md § Revisions)."""
     try:
-        _stage(root, ".")
+        _stage(root, pathspecs)
         return _commit_staged(root, author, message)
     except GitError:
         reset_index(root)
         raise
+
+
+def commit_all(root: Path, author: str, message: str) -> str | None:
+    """Stage everything and commit; None when the tree was clean. For the shell, whose
+    changes nobody can name in advance — under the shell lock, so the dirt is all its.
+    A failure anywhere leaves the index reset, never half-staged."""
+    return _commit(root, author, message, ["."])
 
 
 def commit_paths(root: Path, author: str, message: str, paths: list[Path]) -> str | None:
     """Stage only `paths` (relative; files or directories) and commit; None when none of
     them changed. What a host write commits, so a shell's half-written files elsewhere in
-    the tree never ride along (docs/workspace.md § Revisions)."""
+    the tree never ride along (docs/workspace.md § Revisions). A path that matches nothing
+    — a moved-away directory that was never tracked — stages nothing."""
     if not paths:
         return None
-    # One staging per path: a path that matches nothing (a moved-away directory that was
-    # never tracked) stages nothing; any failure to stage is an error, never a write
-    # reported done without its revision (docs/workspace.md § Revisions). On any failure
-    # the index is reset, so what was staged does not ride into the next commit, which
-    # commits the whole index.
-    try:
-        for path in paths:
-            _stage(root, _literal(path))
-        return _commit_staged(root, author, message)
-    except GitError:
-        reset_index(root)
-        raise
+    return _commit(root, author, message, [_literal(path) for path in paths])
 
 
 def _literal(path: Path) -> str:
@@ -322,11 +359,6 @@ def restore_paths(root: Path, paths: list[Path]) -> None:
     _git(root, "checkout", "-q", "HEAD", "--", *(_literal(path) for path in paths))
 
 
-def tracked_at_head(root: Path, relative: Path) -> bool:
-    proc = _git(root, "cat-file", "-e", f"HEAD:{relative.as_posix()}", check=False)
-    return proc.returncode == 0
-
-
 def path_at_head_containing(root: Path, needle: str, pathspec: str) -> Path | None:
     """The first path under `pathspec` whose content at `HEAD` holds `needle` as a fixed
     string, or None: one `git grep` over the committed tree, so a row whose directory is
@@ -354,7 +386,8 @@ def path_at_head_containing(root: Path, needle: str, pathspec: str) -> Path | No
 def missing_at_head(root: Path, relatives: list[Path]) -> list[Path]:
     """Those of `relatives` that `HEAD` does not hold — all of them when there is no
     `HEAD` yet. One `ls-tree` for the lot: what a materialization asks of every
-    document it is asked for (docs/workspace.md § Layout)."""
+    document it is asked for (docs/workspace.md § Layout). Each path is a literal
+    pathspec, so a name the shell began with `:` is a name, not pathspec magic."""
     proc = _git(
         root,
         "ls-tree",
@@ -362,7 +395,7 @@ def missing_at_head(root: Path, relatives: list[Path]) -> list[Path]:
         "-z",
         "HEAD",
         "--",
-        *(relative.as_posix() for relative in relatives),
+        *(_literal(relative) for relative in relatives),
         check=False,
     )
     if proc.returncode != 0:
@@ -371,23 +404,9 @@ def missing_at_head(root: Path, relatives: list[Path]) -> list[Path]:
     return [relative for relative in relatives if relative.as_posix() not in held]
 
 
-def restore_from(root: Path, commit: str, author: str, message: str, relative: Path) -> str | None:
-    """Write `relative` back as it was at `commit` and commit that: how a removal is undone
-    when the rows it was made for did not go (docs/workspace.md § Revisions)."""
-    _git(root, "checkout", "-q", commit, "--", _literal(relative))
-    return commit_paths(root, author, message, [relative])
-
-
 def head(root: Path) -> str | None:
     proc = _git(root, "rev-parse", "--verify", "-q", "HEAD", check=False)
     return proc.stdout.strip() or None
-
-
-def move(root: Path, source: Path, target: Path) -> None:
-    """Rename through directory descriptors opened without following (`safe_io.rename`);
-    the caller's commit stages the old path and the new. Never `git mv`: it follows a
-    link in an ancestor of either path (docs/workspace.md § Revisions)."""
-    safe_io.rename(root, source, target)
 
 
 def log(root: Path, relative: Path | None = None, limit: int = 100) -> list[Revision]:
@@ -481,11 +500,6 @@ def show_bytes(root: Path, commit: str, relative: Path, max_bytes: int) -> bytes
     return out if code == 0 else None
 
 
-def show(root: Path, commit: str, relative: Path, max_bytes: int) -> str | None:
-    data = show_bytes(root, commit, relative, max_bytes)
-    return None if data is None else data.decode(errors="replace")
-
-
 def renames_since(root: Path, commit: str) -> dict[Path, Path]:
     """Where each path renamed after `commit` lives now: old path → current path, with
     chains of renames followed in order. Read under `WORKSPACE_LOG_MAX_BYTES` like the log: a
@@ -508,17 +522,23 @@ def renames_since(root: Path, commit: str) -> dict[Path, Path]:
         return {}
     fields = [field for field in raw.decode(errors="replace").split("\0") if field]
     forward: dict[Path, Path] = {}
+    # Each current path's origins, so a rename finds the paths it carries on in one step
+    # rather than a scan of every rename read so far.
+    back: dict[Path, list[Path]] = {}
     index = 0
     while index < len(fields):
         status = fields[index]
         if status.startswith("R") and index + 2 < len(fields):
             old, new = Path(fields[index + 1]), Path(fields[index + 2])
             # A path that had already moved once moves on from where it was.
-            origins = [origin for origin, current in forward.items() if current == old]
-            for origin in origins:
-                forward[origin] = new
-            if old not in forward and not origins:
+            origins = back.pop(old, [])
+            if origins:
+                for origin in origins:
+                    forward[origin] = new
+                back.setdefault(new, []).extend(origins)
+            elif old not in forward:
                 forward[old] = new
+                back.setdefault(new, []).append(old)
             index += 3
         else:
             index += 2

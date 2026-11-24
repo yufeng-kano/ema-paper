@@ -125,13 +125,13 @@ def entry_kind(root: Path, path: Path) -> str:
     return "other"
 
 
-def _open_file(root: Path, path: Path, flags: int, mode: int = 0o644) -> int:
-    """A descriptor on the plain file at `path`, opened beneath `root` without following
-    anything. `O_NONBLOCK` keeps a FIFO from blocking the open; the fstat after it is
-    what refuses the FIFO."""
+def _open_file(root: Path, path: Path) -> int:
+    """A read descriptor on the plain file at `path`, opened beneath `root` without
+    following anything. `O_NONBLOCK` keeps a FIFO from blocking the open; the fstat after
+    it is what refuses the FIFO."""
     fd, name = _descend(root, path)
     try:
-        entry = os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, mode, dir_fd=fd)
+        entry = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=fd)
     except OSError as exc:
         if isinstance(exc, FileNotFoundError):
             raise
@@ -151,7 +151,7 @@ def _open_file(root: Path, path: Path, flags: int, mode: int = 0o644) -> int:
 def open_for_read(root: Path, path: Path, max_bytes: int) -> int | None:
     """A descriptor on `path` for reading, or None when there is nothing there."""
     try:
-        entry = _open_file(root, path, os.O_RDONLY)
+        entry = _open_file(root, path)
     except FileNotFoundError:
         return None
     try:
@@ -229,37 +229,33 @@ def _write_atomic(root: Path, path: Path, fill, *, exist_ok: bool) -> None:
         os.close(fd)
 
 
+def _write_all(fd: int, data: bytes) -> None:
+    """Every byte of `data` to `fd`: one `os.write` may take only part of it."""
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view) :]
+
+
 def write_bytes(root: Path, path: Path, data: bytes, *, exist_ok: bool = True) -> None:
     """Write `data` to the plain file at `path`, created if missing (parents too)."""
-
-    def fill(entry: int) -> None:
-        view = memoryview(data)
-        while view:
-            view = view[os.write(entry, view) :]
-
-    _write_atomic(root, path, fill, exist_ok=exist_ok)
+    _write_atomic(root, path, lambda entry: _write_all(entry, data), exist_ok=exist_ok)
 
 
 def write_text(root: Path, path: Path, text: str, *, exist_ok: bool = True) -> None:
     write_bytes(root, path, text.encode(), exist_ok=exist_ok)
 
 
-def write_from(root: Path, path: Path, reader, *, chunk: int = READ_CHUNK) -> None:
+def write_from(root: Path, path: Path, reader) -> None:
     """Stream `reader` (any object with `read(n)`) into the plain file at `path`."""
 
     def fill(entry: int) -> None:
-        while True:
-            data = reader.read(chunk)
-            if not data:
-                return
-            view = memoryview(data)
-            while view:
-                view = view[os.write(entry, view) :]
+        while data := reader.read(READ_CHUNK):
+            _write_all(entry, data)
 
     _write_atomic(root, path, fill, exist_ok=True)
 
 
-def create_file(root: Path, path: Path, mode: int = 0o644) -> int:
+def create_file(root: Path, path: Path) -> int:
     """A descriptor on a new plain file at `path`, created beneath `root` through the
     directory descriptors above it (made on the way when missing) and never over anything
     that is there: what an upload streams into as it arrives (docs/workspace.md § Files)."""
@@ -268,7 +264,7 @@ def create_file(root: Path, path: Path, mode: int = 0o644) -> int:
         return os.open(
             name,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-            mode,
+            0o644,
             dir_fd=fd,
         )
     finally:
@@ -278,7 +274,7 @@ def create_file(root: Path, path: Path, mode: int = 0o644) -> int:
 def copy_file(root: Path, source: Path, target: Path) -> None:
     """Copy the plain file at `source` to `target`, both beneath `root`, through descriptors
     that follow nothing; the target lands whole or not at all."""
-    entry = _open_file(root, source, os.O_RDONLY)
+    entry = _open_file(root, source)
     with os.fdopen(entry, "rb") as reader:
         write_from(root, target, reader)
 
@@ -321,7 +317,7 @@ def remove_unlocked_file(root: Path, path: Path) -> bool:
     when a holder has it or nothing plain is there. The lock is taken on a descriptor
     opened without following anything and let go with it, after the unlink."""
     try:
-        entry = _open_file(root, path, os.O_RDONLY)
+        entry = _open_file(root, path)
     except FileNotFoundError:
         return False
     try:
@@ -425,9 +421,7 @@ def remove_tree(root: Path, path: Path) -> bool:
         if not stat.S_ISDIR(mode):
             os.unlink(name, dir_fd=fd)
             return True
-        child = os.open(
-            name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd
-        )
+        child = os.open(name, _OPEN_DIR_FLAGS, dir_fd=fd)
         try:
             _remove_contents(child)
         finally:
@@ -439,7 +433,10 @@ def remove_tree(root: Path, path: Path) -> bool:
 
 
 def rename(root: Path, source: Path, target: Path) -> None:
-    """Move `source` to `target`, both beneath `root`, resolving neither through a link."""
+    """Move `source` to `target`, both beneath `root`, resolving neither through a link;
+    the caller's commit stages the old path and the new. Every workspace move is this one,
+    never `git mv`, which follows a link in an ancestor of either path
+    (docs/workspace.md § Revisions)."""
     src_fd, src_name = _descend(root, source)
     try:
         dst_fd, dst_name = _descend(root, target, create=True)
@@ -472,7 +469,7 @@ def copy_tree(root: Path, source: Path, target: Path, *, skip=None) -> None:
                 pending.append(child)
                 continue
             try:
-                entry = _open_file(root, source / child, os.O_RDONLY)
+                entry = _open_file(root, source / child)
             except (UnsafeEntry, FileNotFoundError):
                 continue  # a link or a special file, or gone: not part of the copy
             with os.fdopen(entry, "rb") as reader:

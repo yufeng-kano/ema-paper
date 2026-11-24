@@ -25,9 +25,10 @@ logger = logging.getLogger(__name__)
 
 
 async def lock_user(db: AsyncSession, user_id: int) -> None:
-    """Serialize this user's name decisions: the unique indexes cannot see across the
-    two tables, so two requests choosing a name for a folder and a file at once are
-    ordered here (docs/database.md)."""
+    """The user's row lock, held to the end of the transaction. It orders that user's
+    name decisions — the unique indexes cannot see across folders and documents, so two
+    requests choosing a name for a folder and a file at once are ordered here
+    (docs/database.md) — and every per-user cap and ordering decision taken under it."""
     await db.execute(select(User.id).where(User.id == user_id).with_for_update())
 
 
@@ -137,6 +138,7 @@ async def empty_trash(
             for document in documents
             if expired(document) or document.folder_id in doomed_folders
         ]
+        doomed_ids = set(doomed)
         # Every deleted row put in the Trash itself has an entry there.
         roots: list[tuple[type, int]] = [
             (Folder, folder_id)
@@ -145,7 +147,7 @@ async def empty_trash(
         ] + [
             (Document, row.id)
             for row in documents
-            if row.id in doomed and row.trashed_at is not None
+            if row.id in doomed_ids and row.trashed_at is not None
         ]
         if not roots:
             return 0

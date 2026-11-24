@@ -72,6 +72,7 @@ from ..workspace import documents as workspace_documents
 from ..workspace import filing, git, safe_io, trash
 from ..workspace.agents_file import AGENTS_FILE
 from ..workspace.documents import (
+    STORAGE_FULL,
     live_document,
     live_folder,
     markdown_name,
@@ -83,7 +84,6 @@ from ..workspace.filing import (
     DOCUMENT_NAME_MAX,
     FILE_CLASH,
     FOLDER_NAME_MAX,
-    STORAGE_FULL,
     clean_name,
     commit_filing,
     document_relative,
@@ -1084,24 +1084,19 @@ async def file_markdown(
     # The row, its original and their commit under one hold of the workspace lock, the
     # backup lock shared around it, as for a parse's upload (docs/workspace.md § Backups).
     async with backup_shared(root), workspace_lock(root):
-        try:
-            row = await insert_named(
-                db,
-                user_id=user_id,
-                into=folder_id,
-                build=lambda name: Document(
-                    user_id=user_id, folder_id=folder_id, job_id=None, kind=MARKDOWN_KIND, name=name
-                ),
-                taken=lambda: sibling_names(db, user_id, folder_id),
-                wanted=wanted,
-                limit=DOCUMENT_NAME_MAX,
-                message=FILE_CLASH,
-                commit=False,
-            )
-        except ApiError:
-            if folder_id is None or await folder_exists(db, user_id, folder_id):
-                raise
-            raise ApiError(404, "invalid_request", "No such folder") from None
+        row = await insert_named(
+            db,
+            user_id=user_id,
+            into=folder_id,
+            build=lambda name: Document(
+                user_id=user_id, folder_id=folder_id, job_id=None, kind=MARKDOWN_KIND, name=name
+            ),
+            taken=lambda: sibling_names(db, user_id, folder_id),
+            wanted=wanted,
+            limit=DOCUMENT_NAME_MAX,
+            message=FILE_CLASH,
+            commit=False,
+        )
         row_id = row.id
         try:
             await workspace_documents.adopt_markdown(db, settings, row, staged)
