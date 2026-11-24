@@ -1,6 +1,7 @@
 /* The Agent section (AgentPanel.vue and its sections in app/components/agents/) shares its
-   label and note here rather than in a scoped copy each. Prefixed: the settings dialog's nav has a scoped
-   `.section-label` of its own, which a global one would restyle. */
+   label, note, row of controls and facts here rather than in a scoped copy each. Prefixed:
+   the settings dialog's nav has a scoped `.section-label` of its own, which a global one
+   would restyle. */
 
 /* The field label's treatment: a section of the panel, not a heading of the page — also a
    fact's or a field's label inside one. */
@@ -18,4 +19,41 @@
   color: var(--muted);
   font-size: var(--text-xs);
   line-height: 1.5;
+}
+
+/* One row of same-height controls, aligned on their bottom edge under the field labels,
+   wrapping on a narrow window. */
+.agents-controls {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+/* The model's place in that row, a control or a fact. */
+.agents-model {
+  flex: 1 1 14rem;
+  min-width: 0;
+}
+
+/* A fact drawn as a field — its label, then the value where a control would be — so a row
+   reads the same whether its model is picked or the deployment's. */
+.agents-fact {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.agents-fact-value {
+  display: flex;
+  align-items: center;
+  min-height: var(--control-height);
+  overflow: hidden;
+  font-size: var(--text-sm);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agents-fact-value.muted {
+  color: var(--muted);
 }

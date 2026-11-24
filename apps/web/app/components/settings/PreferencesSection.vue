@@ -9,8 +9,7 @@
  * § Result viewer, *Original and Markdown*). The session carries both (`GET /api/me`), so
  * the Files page and the viewer follow a save at once.
  */
-import { listAgents, putAgentSettings, putPreferences, type AgentEntry, type DocumentView } from '~/lib/api'
-import { PARSE_AGENT } from '~/lib/models'
+import { listAgents, PARSE_AGENT, putAgentSettings, putPreferences, type AgentEntry, type DocumentView } from '~/lib/api'
 
 const { t } = useI18n()
 const { resolve } = useApiError()

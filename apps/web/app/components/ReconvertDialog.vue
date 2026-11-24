@@ -6,8 +6,8 @@
  * made meanwhile are replaced too and stay in its revisions, and the notes stay
  * (docs/jobs.md § Re-converting a document).
  */
-import { reconvertDocument, type AgentModel, type LibraryDocument } from '~/lib/api'
-import { loadParseModels, PARSE_AGENT } from '~/lib/models'
+import { PARSE_AGENT, reconvertDocument, type AgentModel, type LibraryDocument } from '~/lib/api'
+import { loadParseModels } from '~/lib/models'
 
 const props = defineProps<{ document: LibraryDocument }>()
 

@@ -2,9 +2,9 @@
 /**
  * The **Prompt** control (docs/web.md § Pages): a field label over a button saying the
  * prompt's state — *Default* or *Edited* — that opens the prompt dialog. The parse agent
- * has it in its row of controls; the chat agent only inside the advanced disclosure under
- * its instructions, since replacing the whole prompt is what the instructions spare a
- * reader from doing.
+ * has it in its row of controls; the chat and check agents only inside the advanced
+ * disclosure under their instructions, since replacing the whole prompt is what the
+ * instructions spare a reader from doing.
  */
 import type { AgentEntry, SavedAgentSettings } from '~/lib/api'
 

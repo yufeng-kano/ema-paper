@@ -5,7 +5,7 @@
  * agent's panel (`AgentPanel`) and nothing else. The `check` agent is no tab: its settings
  * are the parse panel's *Format check*.
  */
-import { listAgents, type AgentEntry, type SavedAgentSettings } from '~/lib/api'
+import { CHECK_AGENT, listAgents, type AgentEntry, type SavedAgentSettings } from '~/lib/api'
 
 const { t, te } = useI18n()
 const auth = useAuth()
@@ -17,7 +17,7 @@ const {
   errorMessage: agentsError,
 } = useAuthedData(() => listAgents())
 /** Saved settings land here from the server's answer, so the tabs follow every pick. */
-const agents = ref<AgentEntry[]>(agentsData.value?.agents ?? [])
+const agents = ref<AgentEntry[]>([])
 watch(agentsData, (data) => {
   agents.value = data?.agents ?? []
 })
@@ -36,7 +36,6 @@ function setAgentSettings(name: string, saved: SavedAgentSettings) {
 
 const promptMaxChars = computed(() => auth.me.value?.limits.prompt_max_chars ?? null)
 
-const CHECK_AGENT = 'check'
 /** The agents that are tabs; the check agent's settings are a section of the parse panel. */
 const tabs = computed(() => agents.value.filter((agent) => agent.name !== CHECK_AGENT))
 const checkAgent = computed(() => agents.value.find((agent) => agent.name === CHECK_AGENT) ?? null)

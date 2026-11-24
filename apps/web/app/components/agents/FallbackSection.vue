@@ -50,12 +50,12 @@ async function toggleAuto(next: boolean) {
 <template>
   <section class="section" :aria-labelledby="labelId">
     <h3 :id="labelId" class="agents-label">{{ t('agents.fallback.label') }}</h3>
-    <div class="controls">
+    <div class="agents-controls">
       <!-- The deployment's fallback: a fact under its label, not a control. -->
-      <div class="model fact">
+      <div class="agents-model agents-fact">
         <span class="agents-label">{{ t('agents.fallback.model') }}</span>
-        <span v-if="fallback" class="mono fact-value">{{ fallback }}</span>
-        <span v-else class="fact-value muted">{{ t('agents.fallback.none') }}</span>
+        <span v-if="fallback" class="mono agents-fact-value">{{ fallback }}</span>
+        <span v-else class="agents-fact-value muted">{{ t('agents.fallback.none') }}</span>
       </div>
       <UiSwitch
         :model-value="autoOn"
@@ -78,37 +78,8 @@ async function toggleAuto(next: boolean) {
   gap: var(--space-2);
 }
 
-/* The picker and its switch on one row, wrapping on a narrow window. */
-.controls {
-  display: flex;
-  align-items: flex-end;
-  flex-wrap: wrap;
-  gap: var(--space-2);
-}
-
-.model {
-  flex: 1 1 14rem;
-  min-width: 0;
-}
-
-/* The panel's fact treatment: the label, then the value where a control would be. */
-.fact {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-}
-
-.fact-value {
-  display: flex;
-  align-items: center;
+/* The fact is as tall as the switch beside it, not a full control. */
+.agents-fact-value {
   min-height: var(--control-height-sm);
-  overflow: hidden;
-  font-size: var(--text-sm);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.fact-value.muted {
-  color: var(--muted);
 }
 </style>

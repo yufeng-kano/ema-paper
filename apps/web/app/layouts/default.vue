@@ -191,25 +191,10 @@ function onKeydown(event: KeyboardEvent) {
 onMounted(() => window.addEventListener('keydown', onKeydown))
 onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 
-/**
- * The settings dialog's Agent section is its own chunk — it carries the rich editor, which
- * nothing else in this frame needs — fetched once the page is idle, so the section opens at
- * once later: the specifier is the module `LazySettingsAgentSection` loads. Nuxt reloads
- * only for a chunk that fails during a navigation, and opening Settings is a query push, so
- * a warm-up that fails (a deploy landed since this page loaded) asks the build check, which
- * reloads onto the new build under the page's holds (docs/web.md § Rules).
- */
-const nuxtApp = useNuxtApp()
-onMounted(() => {
-  const warm = () => {
-    void import('~/components/settings/AgentSection.vue').catch(() => nuxtApp.$buildUpdate.check())
-  }
-  if ('requestIdleCallback' in window) {
-    requestIdleCallback(warm, { timeout: 3000 })
-  } else {
-    setTimeout(warm, 1500)
-  }
-})
+/** The settings dialog's Agent section is its own chunk — it carries the rich editor, which
+ *  nothing else in this frame needs — fetched at idle: the specifier is the module
+ *  `LazySettingsAgentSection` loads. */
+useIdleWarmUp(() => import('~/components/settings/AgentSection.vue'))
 
 async function signOut() {
   await auth.signOut()

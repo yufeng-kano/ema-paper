@@ -1,30 +1,30 @@
 <script setup lang="ts">
 /**
- * The shell the skill and subagent dialogs share (docs/web.md § Pages): the heading with
- * the item's state beside it, the form the caller's fields fill, the last failure, and the
- * footer — **Restore default** on a built-in, **Delete** on an existing one of the reader's
- * own, then Cancel and Save. Delete asks first, in a confirmation that stands in for the
- * dialog rather than over it: two dialogs would both answer Escape and both trap Tab. The
- * fields keep their state behind it, since the caller holds them.
+ * The shell the skill, subagent and prompt dialogs share (docs/web.md § Pages): the heading
+ * with the item's state beside it, the form the caller's fields fill, the last failure, and
+ * the footer — **Restore default** on a built-in (the prompt dialog's case, which has no
+ * Delete), **Delete** on an existing one of the reader's own, then Cancel and Save. Delete
+ * asks first, in a confirmation that stands in for the dialog rather than over it: two
+ * dialogs would both answer Escape and both trap Tab. The fields keep their state behind
+ * it, since the caller holds them.
  *
  * The caller owns the request and its `pending` and `error`; this asks for them by event.
  */
 const props = defineProps<{
   heading: string
-  /** *Built-in* or *Custom*, and whether edited; empty for a new item. */
-  state: string
+  /** The item being edited; null for a new one. A built-in offers Restore default and never
+   *  Delete; an existing one of the reader's own offers Delete. */
+  item: { builtin: boolean; modified: boolean } | null
+  /** The state beside the heading, in place of *Built-in* or *Custom* and whether edited. */
+  state?: string
   /** The form's id, which Save submits. */
   formId: string
-  /** A built-in: Restore default, never Delete. */
-  builtin: boolean
   /** Every field is the built-in's default: Restore has nothing to put back. */
   isDefault: boolean
-  /** An existing item of the reader's own, which Delete removes. */
-  deletable: boolean
-  /** Delete's words, the confirmation's title too. */
-  deleteLabel: string
+  /** Delete's words, the confirmation's title too; needed only where Delete is offered. */
+  deleteLabel?: string
   /** The confirmation's question, naming the item. */
-  deleteConfirm: string
+  deleteConfirm?: string
   pending: boolean
   error: string | null
   saveDisabled: boolean
@@ -42,6 +42,19 @@ const emit = defineEmits<{
 
 const { t } = useI18n()
 
+const builtin = computed(() => props.item?.builtin === true)
+const deletable = computed(() => props.item !== null && !props.item.builtin)
+const shownState = computed(() => {
+  if (props.state !== undefined) {
+    return props.state
+  }
+  if (!props.item) {
+    return ''
+  }
+  const kind = props.item.builtin ? t('agents.builtIn') : t('agents.custom')
+  return props.item.modified ? `${kind} ${t('agents.editedSuffix')}` : kind
+})
+
 const confirming = ref(false)
 
 function askDelete() {
@@ -57,9 +70,9 @@ function cancelDelete() {
 
 <template>
   <UiConfirmDialog
-    v-if="confirming && props.deletable"
-    :title="deleteLabel"
-    :message="deleteConfirm"
+    v-if="confirming && deletable"
+    :title="deleteLabel ?? ''"
+    :message="deleteConfirm ?? ''"
     :confirm-label="t('common.delete')"
     :pending="pending"
     :error="error"
@@ -70,7 +83,7 @@ function cancelDelete() {
     <template #title>
       <div class="heading">
         <h2 class="heading-title">{{ heading }}</h2>
-        <span v-if="state" class="heading-state">{{ state }}</span>
+        <span v-if="shownState" class="heading-state" role="status">{{ shownState }}</span>
       </div>
     </template>
 
@@ -127,7 +140,7 @@ function cancelDelete() {
   gap: var(--space-5);
 }
 
-/* The fields both dialogs lay out the same way. They are the caller's elements, some inside
+/* The fields the dialogs lay out the same way. They are the caller's elements, some inside
    a `UiField` of its own, so they are styled as descendants of the form: a plain scoped rule
    would not reach them, and a `:slotted` one stops at the first component in between. */
 .form :deep(.pair) {
@@ -187,6 +200,31 @@ function cancelDelete() {
 /* The count under the long text, at its right. */
 .form :deep(.end-count) {
   text-align: right;
+}
+
+/* A chip is a button that types for you: a hairline and the mono of the text it goes into. */
+.form :deep(.token) {
+  height: var(--control-height-xs);
+  padding: 0 var(--space-2);
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--ink-soft);
+  font-size: var(--text-2xs);
+  cursor: pointer;
+  transition:
+    background var(--duration-fast) var(--ease),
+    color var(--duration-fast) var(--ease);
+}
+
+.form :deep(.token:hover) {
+  background: var(--rail);
+  color: var(--ink);
+}
+
+.form :deep(.token:disabled) {
+  cursor: not-allowed;
+  opacity: 0.5;
 }
 
 /* The footer's left action stands apart from Cancel and Save. */

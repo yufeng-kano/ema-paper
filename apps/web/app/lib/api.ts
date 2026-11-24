@@ -86,6 +86,12 @@ export const DEFAULT_EFFORT: AgentEffort = 'medium'
 /** The registry's chat agent, the one the panel talks to (docs/agents.md). */
 export const CHAT_AGENT = 'chat'
 
+/** The registry's parse agent, which turns a file into a document (docs/agents.md). */
+export const PARSE_AGENT = 'parse'
+
+/** The registry's check agent, whose settings are the parse agent's Format check (docs/agents.md). */
+export const CHECK_AGENT = 'check'
+
 /** One agent's settings (docs/agents.md); every null is that field's default; `effort` is
  *  never null. */
 export interface AgentSettings {
@@ -250,9 +256,8 @@ export interface AgentContextPart {
   chars: number
   /** `prompt`: the reader's own prompt rather than the default. */
   own?: boolean
-  /** `catalogue`: how many skills and subagents it lists. */
+  /** `catalogue`: how many skills the agent may load on its own. */
   skills?: number
-  subagents?: number
   /** `memory`: how many memories a new conversation would load, and whether memory is paused. */
   count?: number
   paused?: boolean

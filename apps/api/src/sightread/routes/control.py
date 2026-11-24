@@ -806,10 +806,7 @@ async def chat_agent_context(
     )
     extras = {
         "prompt": {"own": own_prompt is not None},
-        "catalogue": {
-            "skills": sum(1 for skill in skills if skill.model_invocable),
-            "subagents": len(subagents),
-        },
+        "catalogue": {"skills": sum(1 for skill in skills if skill.model_invocable)},
         "memory": {"count": len(loaded), "paused": paused},
     }
     turn = chat_agent.turn_note(

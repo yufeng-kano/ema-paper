@@ -4,9 +4,7 @@
  * catalog the Retry and Re-convert dialogs offer. The chat catalog stays in the order the
  * server sends, whose first entry is the default (docs/billing.md § Models).
  */
-import { listAgentModels, listAgents, type AgentEntry, type AgentModel } from './api'
-
-export const PARSE_AGENT = 'parse'
+import { listAgentModels, listAgents, PARSE_AGENT, type AgentEntry, type AgentModel } from './api'
 
 /** A model as a picker lists it: its catalog name and id, or the id alone. */
 export function modelLabel(model: AgentModel): string {

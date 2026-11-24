@@ -92,13 +92,6 @@ const saveDisabled = computed(
 const heading = computed(() =>
   props.subagent ? t('agents.subagentDialogTitle', { name: props.subagent.name }) : t('agents.subagentDialogNew'),
 )
-const state = computed(() => {
-  if (!props.subagent) {
-    return ''
-  }
-  const kind = props.subagent.builtin ? t('agents.builtIn') : t('agents.custom')
-  return props.subagent.modified ? `${kind} ${t('agents.editedSuffix')}` : kind
-})
 
 function toggleTool(tool: string, on: boolean) {
   fields.tools = on ? [...fields.tools.filter((entry) => entry !== tool), tool] : fields.tools.filter((entry) => entry !== tool)
@@ -169,11 +162,9 @@ async function remove() {
 <template>
   <AgentsDefinitionDialog
     :heading="heading"
-    :state="state"
+    :item="subagent"
     :form-id="`subagent-form-${subagent?.name ?? 'new'}`"
-    :builtin="builtin"
     :is-default="isDefault"
-    :deletable="subagent !== null && !builtin"
     :delete-label="t('agents.subagentDelete')"
     :delete-confirm="subagent ? t('agents.subagentDeleteConfirm', { name: subagent.name }) : ''"
     :pending="pending"

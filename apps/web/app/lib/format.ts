@@ -25,7 +25,7 @@ export function formatShortDateTime(iso: string, locale: string): string {
 }
 
 /** A time of day alone — when figures on screen were read — in the reader's own timezone. */
-export function formatTime(at: Date | string | number, locale: string): string {
+export function formatTime(at: Date | number, locale: string): string {
   return new Intl.DateTimeFormat(locale, { timeStyle: 'short' }).format(new Date(at))
 }
 

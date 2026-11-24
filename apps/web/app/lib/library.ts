@@ -141,12 +141,12 @@ export function acceptsUpload(
 
 /** Whether the upload endpoint would file this as a markdown document rather than parse it —
  *  by type or by extension, as the server decides (docs/workspace.md § Markdown documents). */
-export function isMarkdownUpload(file: { name: string; type: string }, limits: UploadLimits | null): boolean {
-  if (file.type && limits?.markdown_media_types.includes(file.type)) {
+export function isMarkdownUpload(file: { name: string; type: string }, limits: UploadLimits): boolean {
+  if (file.type && limits.markdown_media_types.includes(file.type)) {
     return true
   }
   const extension = extensionOf(file.name)
-  return extension !== '' && (limits?.markdown_extensions.includes(`.${extension}`) ?? false)
+  return extension !== '' && limits.markdown_extensions.includes(`.${extension}`)
 }
 
 /**

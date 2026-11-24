@@ -517,7 +517,8 @@ async def test_the_context_route_shows_what_a_turn_would_send(chat_client) -> No
     # No document: the template with its tokens, its tool lines as a turn has them.
     assert prompt["own"] is False and "{document_path}" in prompt["text"]
     assert "\n- bash:" not in prompt["text"] and "\n- memory:" in prompt["text"]
-    assert (catalogue["skills"], catalogue["subagents"]) == (1, 1)  # fix-math, translator
+    assert catalogue["skills"] == 1  # fix-math
+    assert "\n- translator" in catalogue["text"]
     assert (memory["count"], memory["paused"]) == (1, False)
     assert f"[m{everywhere['id']}]" in memory["text"] and "d is 512" not in memory["text"]
     assert "facts" not in context

@@ -4,7 +4,7 @@ import { FACT_NAMES, escapeClosesDrawer, receivesRows } from './receives'
 
 const PROMPT: AgentContextPart = { kind: 'prompt', text: 'You are the reader’s agent.', chars: 27, own: false }
 const INSTRUCTIONS: AgentContextPart = { kind: 'instructions', text: '## How to answer', chars: 16 }
-const CATALOGUE: AgentContextPart = { kind: 'catalogue', text: '# Skills\n- fix-math', chars: 19, skills: 1, subagents: 1 }
+const CATALOGUE: AgentContextPart = { kind: 'catalogue', text: '# Skills\n- fix-math', chars: 19, skills: 1 }
 const MEMORY: AgentContextPart = { kind: 'memory', text: '# Memory', chars: 8, count: 2, paused: false }
 
 function context(parts: AgentContextPart[]): AgentContext {

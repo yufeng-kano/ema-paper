@@ -8,9 +8,11 @@ The web app also *renders* a finished result, because reading what came back is 
 
 - Nuxt (latest stable) + TypeScript + `@nuxtjs/i18n` (en, zh-TW; en is the source catalog), pnpm.
 - No UI framework and no CSS framework: hand-rolled primitives over the design tokens in `app/assets/css/main.css`, styled in each SFC's own scoped block. There is no Tailwind, no utility layer, and no second component library.
-- The one exception to scoped styles is the Agent section's two shared classes in `app/assets/css/agents.css`:
+- The one exception to scoped styles is the Agent section's shared classes in `app/assets/css/agents.css`:
   - `.agents-label`, a section's label in the field label's treatment;
-  - `.agents-note`, the muted line under it.
+  - `.agents-note`, the muted line under it;
+  - `.agents-controls`, a row of same-height controls that wraps, and `.agents-model`, the model's place in it;
+  - `.agents-fact` and `.agents-fact-value`, a fact drawn as a field: its label, then the value where a control would be.
   - The file is global beside `main.css` and `markdown.css` (`nuxt.config.ts` `css`), and the classes are prefixed so they collide with no component's scoped class (the settings dialog's nav has its own `.section-label`).
 - Two libraries do one job each:
   - KaTeX typesets math.
@@ -153,6 +155,7 @@ The plans, from `GET /api/billing/catalog` read when the page opens ([billing.md
 - **The file library** (§ Files).
 - **A toolbar row**: the *Files · Trash* segmented control at the left; at the right a glass capsule of *New document*, *New folder* and *Refresh* — and, past a thin separator, the Agent toggle (§ The Files page's Agent card) — then the accent *Upload…* button, its glyph alone with the name as its tooltip. On Trash, *Empty Trash* takes the place of the capsule and *Upload…*.
 - **Under the toolbar**, the open folder's breadcrumb as the screen's large title with its item count beside it, over the list: subfolders then documents, or on Trash what was moved there.
+  - While more than one row is selected, the count reads *3 of 12 selected* (*已選取 3 個，共 12 個項目*).
 - **A click selects a row** and a double click opens it (a tap, on touch). Every action is also in the context menu and on Finder's keys (§ Files).
 
 ### The settings dialog
@@ -277,7 +280,7 @@ A Free reader who was sent back from a checkout sees the plan the webhook or the
   - for *Chat*, **Effort**: a dropdown of the five levels, labelled through the catalog (`agents.effort.*`, the enum value kept as the option's value), default `medium`, saved on change;
   - for *Parse*, then **Prompt** (below).
 - For *Chat*, one line under the row (the cache line): a change of effort, prompt, instructions or memory rebuilds the next turn's cache. It is a summary: which changes of memory do, and that a save or a pin does not, is [chat.md](./chat.md) § Prompt caching.
-- For *Chat*, after the cache line, one more switch in the row of controls: **Compact idle conversations** (`idle_compact`, on by default, saved on change and put back when the save fails), with one line saying that a long conversation is summarized before its cache expires so the next message does not re-read the whole history ([chat.md](./chat.md) § Compaction).
+- For *Chat*, after the cache line, a switch: **Compact idle conversations** (`idle_compact`, on by default, saved on change and put back when the save fails), with one line saying that a long conversation is summarized before its cache expires so the next message does not re-read the whole history ([chat.md](./chat.md) § Compaction).
 - For *Parse*, then the **Failed pages** and **Format check** sections (below).
 - For *Chat*, then:
   - the **Instructions** and **Memory** sections (below), with **Memory file** under them;
@@ -371,7 +374,7 @@ A Free reader who was sent back from a checkout sees the plan the webhook or the
 - A live `n / max` count of the trimmed text in code points, as the server counts it, against the file's `max_chars` (from `GET /api/agents/chat/memory-file`), red past the cap.
 - **Cancel** and **Save** as the instructions have them (`PUT`). A save refused while a turn runs says so in a line under the textarea.
 
-**Skills** and **Subagents** (*Chat* only) — two tables under uppercase labels, each with a ghost *New skill* / *New subagent* at its label's right (`GET /api/skills`, `GET /api/subagents`, [chat.md](./chat.md) § Skills, § Subagents):
+**Skills** and **Subagents** (*Chat* only) — two tables, each under its label with a ghost *New skill* / *New subagent* at the label's right (`GET /api/skills`, `GET /api/subagents`, [chat.md](./chat.md) § Skills, § Subagents):
 
 - **A skill row**: its mono name — a built-in's followed by *Built-in* in muted text — its description, two checkboxes **/ command** and **Auto** (`user_invocable`, `model_invocable`, saved on change, each with an `aria-label` naming the skill) and an icon-only edit, always visible.
 - **A subagent row**: name (with *Built-in*), description, model (mono, or *Follows the conversation* when null), its tools' count with *read-only* or *can edit* (`writes`), edit.
@@ -399,7 +402,7 @@ A Free reader who was sent back from a checkout sees the plan the webhook or the
 
 - The selected agent's panel is `app/components/AgentPanel.vue`: the row of controls and the cache line.
 - Its sections are in `app/components/agents/`:
-  - `PromptField.vue` — the **Prompt** button, which opens the prompt dialog, `PromptDialog.vue`;
+  - `PromptField.vue` — the **Prompt** button, which opens the prompt dialog, `PromptDialog.vue`, drawn through `DefinitionDialog.vue` with Restore default and no Delete;
   - `InstructionsSection.vue`, with the drawer, `ReceivesDrawer.vue`;
   - `InstructionsEditor.vue` — the instructions box, the notes' editor in its hairline box, which `InstructionsSection.vue` and `CheckSection.vue` both use;
   - `AdvancedPrompt.vue` — the **Advanced: replace the whole system prompt** disclosure over the Prompt button, used by the same two;
@@ -408,7 +411,7 @@ A Free reader who was sent back from a checkout sees the plan the webhook or the
   - `MemoryFileSection.vue` — the **Memory file** textarea;
   - `FallbackSection.vue` — *Parse*'s **Failed pages**;
   - `CheckSection.vue` — *Parse*'s **Format check**;
-  - `SkillsSection.vue` and `SubagentsSection.vue`, with their dialogs, which share `DefinitionDialog.vue` (the heading with its state, the Delete confirmation that takes the dialog's place, and the footer of Restore default / Delete, Cancel, Save).
+  - `SkillsSection.vue` and `SubagentsSection.vue`, with their dialogs, which share `DefinitionDialog.vue` with the prompt dialog (the heading with its state, the Delete confirmation that takes the dialog's place, and the footer of Restore default / Delete, Cancel, Save).
 - The tab row stays in the section (`app/components/settings/AgentSection.vue`).
 
 ### The operator console
@@ -713,6 +716,7 @@ A file manager over everything the reader keeps — parse results, markdown docu
   - **On a touch screen a tap opens.** A coarse pointer has no double click and no modifier keys, and selecting first would put a second tap between the reader and every file. A long press opens the row's menu for that row.
 - **The keyboard is Finder's.** The keys are read at the window, so they work after a click without anything holding focus. They are never read from a text field, an open menu, a dialog, the result viewer or the Agent card, which own their keys (§ The Files page's Agent card, *The page's keys stay the page's*). The layout's `main` holding focus counts as nothing holding it: a click on the title or a gap focuses it, and in Safari a click on any button does, since Safari does not focus a button it clicks. On Files:
   - ↑ and ↓ move the selection, ⇧↑ and ⇧↓ extend it, Home and End go to the first and the last row, and ⌘A selects every row. Typing the first letters of a name selects the first row starting with them — case-insensitive, begun again after a one-second pause.
+  - A selection these keys make is said in the page's polite live region: the row's name for one row, *3 items selected.* (*已選取 3 個項目。*) for more. A click's selection is not said.
   - ⌘↓ opens the selection when it is one row, and so does Return off Apple platforms. Esc and ⌘↑ open the folder above, with the folder just left selected, so Esc pressed again climbs to the top and ↓ goes back down. Esc at the top level does nothing.
   - Return renames a selection of one row on Apple platforms, Finder's key, and F2 does everywhere, Explorer's.
   - ⌥⌘N makes a new folder. ⇧⌘N, Finder's own, opens the browser's private window and never reaches the page.
@@ -811,6 +815,7 @@ A file manager over everything the reader keeps — parse results, markdown docu
   - A file's size is its own (`size_bytes`), which is also its share of the storage.
 - **The Trash.** Its tab lists each item trashed itself — a folder counts once, with everything inside it.
   - Its title is *Trash* with its item count and, beside the count, *Deleted after 30 days* (「30 天後永久刪除」). The number is `limits.trash_retention_days` from `GET /api/me`; at 0 there is no line.
+  - While more than one row is selected, the count reads *N of M selected*, M the Trash's total, as on Files.
   - The worker deletes an item for good once it has been in the Trash that long ([workspace.md](./workspace.md) § The Trash). An undo step pointing at an item so deleted fails as any step whose item is gone (*Undo*, above).
   - An empty Trash still just says it is empty.
   - **Empty Trash** sits in the toolbar: a danger text button, disabled while the Trash is empty.

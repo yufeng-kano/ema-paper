@@ -154,8 +154,8 @@ function onSectionSaved(agent: string, saved: SavedAgentSettings) {
   <div class="rows">
     <!-- Model, then effort (chat) or prompt (parse): one row that wraps on a narrow window. -->
     <div class="row reveal-on-hover">
-      <div class="controls">
-        <UiField v-if="isChat" v-slot="{ id }" class="model" :label="t('agents.modelLabel')">
+      <div class="agents-controls">
+        <UiField v-if="isChat" v-slot="{ id }" class="agents-model" :label="t('agents.modelLabel')">
           <UiSelect
             :id="id"
             :model-value="modelChoice"
@@ -167,10 +167,10 @@ function onSectionSaved(agent: string, saved: SavedAgentSettings) {
           </UiSelect>
         </UiField>
         <!-- The parse model is the deployment's: a fact under the label, not a control. -->
-        <div v-else class="model fact">
+        <div v-else class="agents-model agents-fact">
           <span class="agents-label">{{ t('agents.modelLabel') }}</span>
-          <span v-if="settings.model" class="mono fact-value">{{ settings.model }}</span>
-          <span v-else class="fact-value muted">{{ t('agents.modelNone') }}</span>
+          <span v-if="settings.model" class="mono agents-fact-value">{{ settings.model }}</span>
+          <span v-else class="agents-fact-value muted">{{ t('agents.modelNone') }}</span>
         </div>
         <UiField v-if="isChat" v-slot="{ id }" class="effort" :label="t('agents.effortLabel')">
           <UiSelect :id="id" :model-value="effortChoice" :disabled="effortPending" @update:model-value="applyEffort">
@@ -250,41 +250,6 @@ function onSectionSaved(agent: string, saved: SavedAgentSettings) {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
-}
-
-/* One row of same-height controls, aligned on their bottom edge under the field labels. */
-.controls {
-  display: flex;
-  align-items: flex-end;
-  flex-wrap: wrap;
-  gap: var(--space-2);
-}
-
-.model {
-  flex: 1 1 14rem;
-  min-width: 0;
-}
-
-/* The parse model, drawn as a field — its label, then the value where a control would be —
-   so the row reads the same whichever agent is open. */
-.fact {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-}
-
-.fact-value {
-  display: flex;
-  align-items: center;
-  min-height: var(--control-height);
-  overflow: hidden;
-  font-size: var(--text-sm);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.fact-value.muted {
-  color: var(--muted);
 }
 
 /* An effort picker is five short words; it does not need the model picker's width. */

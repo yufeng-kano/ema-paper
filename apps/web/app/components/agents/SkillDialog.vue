@@ -74,13 +74,6 @@ const saveDisabled = computed(
 const heading = computed(() =>
   props.skill ? t('agents.skillDialogTitle', { name: props.skill.name }) : t('agents.skillDialogNew'),
 )
-const state = computed(() => {
-  if (!props.skill) {
-    return ''
-  }
-  const kind = props.skill.builtin ? t('agents.builtIn') : t('agents.custom')
-  return props.skill.modified ? `${kind} ${t('agents.editedSuffix')}` : kind
-})
 
 /** `$ARGUMENTS` at the caret, replacing a selection: where the command's arguments go. */
 async function insertArguments() {
@@ -154,11 +147,9 @@ async function remove() {
 <template>
   <AgentsDefinitionDialog
     :heading="heading"
-    :state="state"
+    :item="skill"
     :form-id="`skill-form-${skill?.name ?? 'new'}`"
-    :builtin="builtin"
     :is-default="isDefault"
-    :deletable="skill !== null && !builtin"
     :delete-label="t('agents.skillDelete')"
     :delete-confirm="skill ? t('agents.skillDeleteConfirm', { name: skill.name }) : ''"
     :pending="pending"
@@ -295,26 +286,5 @@ async function remove() {
   align-items: center;
   justify-content: space-between;
   gap: var(--space-2);
-}
-
-.token {
-  height: var(--control-height-xs);
-  padding: 0 var(--space-2);
-  border: 1px solid var(--edge);
-  border-radius: var(--radius);
-  background: transparent;
-  color: var(--ink-soft);
-  font-size: var(--text-2xs);
-  cursor: pointer;
-  transition: background var(--duration-fast) var(--ease);
-}
-
-.token:hover {
-  background: var(--rail);
-}
-
-.token:disabled {
-  cursor: not-allowed;
-  opacity: 0.5;
 }
 </style>

@@ -819,26 +819,12 @@ onBeforeUnmount(() => {
 
 // --- the result viewer -----------------------------------------------------
 
-/**
- * The viewer and the Agent card's chat load as chunks of their own, so the list paints
- * without them, and are fetched at idle once it has, so the first open finds them ready. A
- * part whose chunk a deploy has since replaced would render nothing when it opens, since Nuxt
- * reloads only for a chunk that fails during a navigation: a failed fetch here runs the build
- * check instead, which moves the tab to the new build under the page's holds (docs/web.md
- * § Rules).
- */
-const { $buildUpdate } = useNuxtApp()
-onMounted(() => {
-  const warm = () =>
-    Promise.all([import('~/components/ResultViewer.vue'), import('~/components/ChatPanel.vue')]).catch(() =>
-      $buildUpdate.check(),
-    )
-  if ('requestIdleCallback' in window) {
-    requestIdleCallback(warm, { timeout: 3000 })
-  } else {
-    setTimeout(warm, 1500)
-  }
-})
+/** The viewer and the Agent card's chat load as chunks of their own, so the list paints
+ *  without them, and are fetched at idle once it has, so the first open finds them ready. */
+useIdleWarmUp(
+  () => import('~/components/ResultViewer.vue'),
+  () => import('~/components/ChatPanel.vue'),
+)
 
 const openDocument = ref<LibraryDocument | null>(null)
 /** The failed parse whose retry dialog is open: opening a failed document opens this. A
@@ -3205,7 +3191,7 @@ useBuildHold(
       :reconvert-note="reconvertNote"
       :initial-view="initialView(openDocument, defaultView)"
       :original="openOriginal"
-      :convertible="openDocument.kind === 'file' && convertible(openDocument)"
+      :convertible="convertible(openDocument)"
       :facts="openFileFacts"
       :failure="openFailure"
       @view="recordView(openDocument, $event)"

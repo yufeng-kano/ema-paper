@@ -131,12 +131,12 @@ function cancelInstructions() {
       <p :id="noteId" class="agents-note">{{ t('agents.check.note') }}</p>
     </div>
 
-    <div class="controls">
+    <div class="agents-controls">
       <!-- The check's model is the deployment's: a fact under its label, not a control. -->
-      <div class="model fact">
+      <div class="agents-model agents-fact">
         <span class="agents-label">{{ t('agents.modelLabel') }}</span>
-        <span v-if="settings.model" class="mono fact-value">{{ settings.model }}</span>
-        <span v-else class="fact-value muted">{{ t('agents.modelNone') }}</span>
+        <span v-if="settings.model" class="mono agents-fact-value">{{ settings.model }}</span>
+        <span v-else class="agents-fact-value muted">{{ t('agents.modelNone') }}</span>
       </div>
       <UiField v-slot="{ id }" class="effort" :label="t('agents.effortLabel')">
         <UiSelect
@@ -205,40 +205,6 @@ function cancelInstructions() {
   align-items: center;
   justify-content: space-between;
   gap: var(--space-2);
-}
-
-/* Model and effort on one row, wrapping on a narrow window. */
-.controls {
-  display: flex;
-  align-items: flex-end;
-  flex-wrap: wrap;
-  gap: var(--space-2);
-}
-
-.model {
-  flex: 1 1 14rem;
-  min-width: 0;
-}
-
-/* The panel's fact treatment: the label, then the value where a control would be. */
-.fact {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-}
-
-.fact-value {
-  display: flex;
-  align-items: center;
-  min-height: var(--control-height);
-  overflow: hidden;
-  font-size: var(--text-sm);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.fact-value.muted {
-  color: var(--muted);
 }
 
 .effort {

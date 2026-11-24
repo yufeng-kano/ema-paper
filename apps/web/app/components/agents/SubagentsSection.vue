@@ -2,8 +2,8 @@
 /**
  * The chat agent's subagents on the Agent page (docs/web.md § Pages, docs/chat.md
  * § Subagents): one table, the built-ins marked, each row's model (or *Follows the
- * conversation*) and how many read-only tools it holds, an edit control on every row. No
- * row has a delete: deleting is the edit dialog's.
+ * conversation*) and how many tools it holds, read-only or able to edit, and an edit
+ * control on every row. No row has a delete: deleting is the edit dialog's.
  */
 import { listSubagents, type AgentModel, type Subagent } from '~/lib/api'
 import type { TableColumn } from '~/lib/table'

@@ -374,11 +374,11 @@ What the chat agent's model picker, the subagent dialog and the retry dialog lis
 
 **`GET /api/agents/chat/context?locale=`**
 
-`{parts: [{kind: prompt|instructions|catalogue|agents_file|memory_file|memory, text, chars, own?, skills?, subagents?, count?, paused?}], turn: {text, chars}}`, rendered by the code the runner uses.
+`{parts: [{kind: prompt|instructions|catalogue|agents_file|memory_file|memory, text, chars, own?, skills?, count?, paused?}], turn: {text, chars}}`, rendered by the code the runner uses.
 
 - `parts` are the system blocks in the order they are sent, each with its text and its length in characters. No token count: counting tokens is an upstream call.
 - `prompt` carries `own` (the reader's prompt or the default). The prompt is shown with its tokens unreplaced.
-- `catalogue` carries how many skills and subagents it lists.
+- `catalogue` carries how many skills the agent may load on its own (`model_invocable`); the subagents it lists are in its text.
 - `agents_file` is the root AGENTS.md (`files/AGENTS.md`) alone, as no document is named; absent when there is none ([chat.md](./chat.md) § AGENTS.md).
 - `memory_file` is the memory file as a new conversation would read it; absent while the file is empty ([chat.md](./chat.md) § Memory, *The memory file*).
 - `memory` carries how many memories a new conversation would load — every document's, none of one document's own — and whether memory is `paused`.

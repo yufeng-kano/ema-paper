@@ -97,7 +97,6 @@ function onSheetChange(event: MediaQueryListEvent) {
 
 onMounted(() => {
   sheetQuery = window.matchMedia(SHEET_QUERY)
-  narrowWindow.value = sheetQuery.matches
   sheetQuery.addEventListener('change', onSheetChange)
 })
 

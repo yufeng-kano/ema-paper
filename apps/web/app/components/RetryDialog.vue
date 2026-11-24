@@ -14,8 +14,10 @@
  * (docs/jobs.md § Re-converting a document).
  */
 import {
+  CHECK_AGENT,
   creditsRefusalOf,
   getDocumentPages,
+  PARSE_AGENT,
   retryDocument,
   type AgentModel,
   type CreditsRefusal,
@@ -23,9 +25,7 @@ import {
   type LibraryDocument,
 } from '~/lib/api'
 import { PAGE_FAILURE_REASONS, RETRY_TILES_MAX, checkFailureReason } from '~/lib/library'
-import { loadParseModels, PARSE_AGENT } from '~/lib/models'
-
-const CHECK_AGENT = 'check'
+import { loadParseModels } from '~/lib/models'
 
 const props = defineProps<{ document: LibraryDocument }>()
 

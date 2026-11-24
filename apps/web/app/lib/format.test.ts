@@ -27,11 +27,10 @@ describe('formatDate', () => {
 })
 
 describe('formatTime', () => {
-  it('is the time of day alone, in the locale, from a date, a timestamp or an ISO string', () => {
+  it('is the time of day alone, in the locale, from a date or a timestamp', () => {
     const at = new Date(2026, 10, 1, 14, 5)
     expect(formatTime(at, 'en')).toMatch(/^2:05\sPM$/)
     expect(formatTime(at.getTime(), 'en')).toBe(formatTime(at, 'en'))
-    expect(formatTime(at.toISOString(), 'en')).toBe(formatTime(at, 'en'))
   })
 })
 

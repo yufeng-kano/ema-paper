@@ -65,22 +65,21 @@ async function save() {
 </script>
 
 <template>
-  <UiModal
-    size="wide"
-    :title="t('agents.promptDialogTitle', { agent: title })"
-    :busy="pending"
+  <AgentsDefinitionDialog
+    :heading="t('agents.promptDialogTitle', { agent: title })"
+    :item="{ builtin: true, modified: !isDefault }"
+    :state="isDefault ? t('agents.promptDefault') : t('agents.promptEdited')"
+    :form-id="`prompt-form-${agent.name}`"
+    :is-default="isDefault"
+    :pending="pending"
+    :error="error"
+    :save-disabled="saveDisabled"
     @close="emit('close')"
+    @save="save"
+    @restore="text = agent.default_prompt"
+    @clear-error="error = null"
   >
-    <template #title>
-      <div class="heading">
-        <h2 class="heading-title">{{ t('agents.promptDialogTitle', { agent: title }) }}</h2>
-        <span class="heading-state" role="status">
-          {{ isDefault ? t('agents.promptDefault') : t('agents.promptEdited') }}
-        </span>
-      </div>
-    </template>
-
-    <form :id="`prompt-form-${agent.name}`" class="form" @submit.prevent="save">
+    <div class="prompt-field">
       <div v-if="agent.prompt_tokens.length" class="tokens">
         <button
           v-for="token in agent.prompt_tokens"
@@ -100,60 +99,19 @@ async function save() {
         :id="`prompt-text-${agent.name}`"
         ref="textarea"
         v-model="text"
-        class="text"
+        class="area mono-area prompt-text"
         rows="18"
         spellcheck="false"
         :disabled="pending"
       />
       <AgentsCharCount v-if="maxChars !== null" class="end-count mono" :count="length" :max="maxChars" />
-      <UiBanner v-if="error" tone="error">{{ error }}</UiBanner>
-    </form>
-
-    <template #footer>
-      <UiButton variant="ghost" class="foot-start" :disabled="pending || isDefault" @click="text = agent.default_prompt">
-        <template #icon><UiIcon name="rotate-ccw" /></template>
-        {{ t('agents.promptRestore') }}
-      </UiButton>
-      <UiButton variant="secondary" :disabled="pending" @click="emit('close')">
-        {{ t('common.cancel') }}
-      </UiButton>
-      <UiButton
-        variant="primary"
-        type="submit"
-        :form="`prompt-form-${agent.name}`"
-        :loading="pending"
-        :disabled="saveDisabled"
-      >
-        {{ t('common.save') }}
-      </UiButton>
-    </template>
-  </UiModal>
+    </div>
+  </AgentsDefinitionDialog>
 </template>
 
 <style scoped>
-.heading {
-  display: flex;
-  align-items: baseline;
-  gap: var(--space-3);
-  min-width: 0;
-}
-
-.heading-title {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: var(--display-sm);
-  letter-spacing: normal;
-}
-
-.heading-state {
-  flex-shrink: 0;
-  color: var(--muted);
-  font-size: var(--text-xs);
-}
-
-.form {
+/* The tokens, the prompt and its count sit closer together than the shell's fields do. */
+.prompt-field {
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -165,66 +123,7 @@ async function save() {
   gap: 6px;
 }
 
-/* A chip is a button that types for you: a hairline and the mono of the text it goes into. */
-.token {
-  height: var(--control-height-xs);
-  padding: 0 var(--space-2);
-  border: 1px solid var(--edge);
-  border-radius: var(--radius);
-  background: transparent;
-  color: var(--ink-soft);
-  font-size: var(--text-2xs);
-  cursor: pointer;
-  transition:
-    background var(--duration-fast) var(--ease),
-    color var(--duration-fast) var(--ease);
-}
-
-.token:hover {
-  background: var(--rail);
-  color: var(--ink);
-}
-
-.token:disabled {
-  cursor: not-allowed;
-  opacity: 0.5;
-}
-
-/* Same skin as UiTextInput's `.control`, sized for a prompt instead of one line. */
-.text {
-  width: 100%;
-  min-width: 0;
+.prompt-text {
   min-height: 16rem;
-  padding: var(--space-3) 14px;
-  border: 1px solid var(--edge);
-  border-radius: var(--radius);
-  background: var(--paper);
-  color: var(--ink);
-  font-family: var(--mono);
-  font-size: var(--text-xs);
-  line-height: 1.6;
-  resize: vertical;
-  transition: border-color var(--duration-fast) var(--ease);
-}
-
-.text:disabled {
-  background: var(--paper-sunken);
-  color: var(--muted);
-  cursor: not-allowed;
-}
-
-@media (pointer: coarse) {
-  .text {
-    font-size: 16px;
-  }
-}
-
-.end-count {
-  text-align: right;
-}
-
-/* The footer's left action stands apart from Cancel and Save. */
-.foot-start {
-  margin-right: auto;
 }
 </style>

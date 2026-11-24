@@ -208,7 +208,6 @@ describe('isMarkdownUpload', () => {
 
   it('takes anything else for a parse', () => {
     expect(isMarkdownUpload({ name: 'report.pdf', type: 'application/pdf' }, LIMITS)).toBe(false)
-    expect(isMarkdownUpload({ name: 'notes.md', type: '' }, null)).toBe(false)
   })
 
   it('reads a leading dot as part of the name, as the server does', () => {
