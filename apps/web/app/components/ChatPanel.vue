@@ -64,7 +64,6 @@ import {
   INIT_COMMAND,
   RENAME_COMMAND,
   commandArguments,
-  formatBytes,
   type AskOutcome,
   type AskRequest,
   type ComposerPayload,
@@ -72,7 +71,7 @@ import {
 import { idleReloadDelay } from '~/lib/context'
 import { byRecency } from '~/lib/conversations'
 import { nodesToMarkdown } from '~/lib/copy'
-import { formatCount, formatDate } from '~/lib/format'
+import { formatBytes, formatCount, formatDate } from '~/lib/format'
 import { turnErrorKey, turnErrorNeedsPlan } from '~/lib/turnError'
 import { ANSWER_DRAG_TYPE, BLOCK_DRAG_TYPE, ROWS_DRAG_TYPE, claimDrag } from '~/lib/dnd'
 import type { LibraryPlace } from '~/lib/library'
@@ -2448,7 +2447,10 @@ onBeforeUnmount(() => {
           sendBlock === 'credits'
             ? creditsNotice
             : storage
-              ? t('chat.blockedStorage', { used: formatBytes(storage.bytes), quota: formatBytes(storage.quota) })
+              ? t('chat.blockedStorage', {
+                  used: formatBytes(storage.bytes, locale),
+                  quota: formatBytes(storage.quota, locale),
+                })
               : t('chat.blockedStorageBare')
         }}
         <template v-if="topUp.error"> {{ topUp.error }}</template>
@@ -2516,7 +2518,7 @@ onBeforeUnmount(() => {
     <div v-if="dragging" class="drop-zone" aria-hidden="true">
       <p class="drop-title">{{ dragging === 'rows' ? t('chat.dropRows') : t('chat.dropToAttach') }}</p>
       <p v-if="dragging === 'files' && maxAttachmentBytes" class="drop-kinds">
-        {{ t('chat.dropKinds', { size: formatBytes(maxAttachmentBytes) }) }}
+        {{ t('chat.dropKinds', { size: formatBytes(maxAttachmentBytes, locale) }) }}
       </p>
     </div>
 

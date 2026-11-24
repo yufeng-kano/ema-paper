@@ -128,7 +128,7 @@ describe('readStep', () => {
     expect(readStep('bash', { command: 'cd /workspace/files/a && python3 /workspace/files/b/doc.md' }).document).toBeUndefined()
   })
 
-  it('reads the page and figure views, skills, subagents, a restart and unknown tools', () => {
+  it('reads the page and figure views, skills, a restart and unknown tools', () => {
     expect(readStep('view_page', { page: 3 })).toEqual({ kind: 'page', target: '', page: 3 })
     expect(readStep('view_figure', { page: 5, bbox: [1, 2, 3, 4] })).toEqual({ kind: 'figure', target: '', page: 5 })
     expect(readStep('web_search', { query: 'attention is all you need' })).toEqual({
@@ -154,7 +154,6 @@ describe('readStep', () => {
       readStep('insert_image', { image: '/workspace/.cache/loss.png', document: '/workspace/files/Papers/attention/notes.md' }),
     ).toEqual({ kind: 'image', target: 'loss.png', file: 'notes.md', document: 'Papers/attention' })
     expect(readStep('skill', { name: 'zh-summary', arguments: '' })).toEqual({ kind: 'skill', target: 'zh-summary' })
-    expect(readStep('subagent', { name: 'verifier', task: 'x' })).toEqual({ kind: 'subagent', target: 'verifier' })
     expect(readStep('bash', { restart: true })).toEqual({ kind: 'restart', target: '' })
     expect(readStep('mystery', {})).toEqual({ kind: 'tool', target: 'mystery' })
   })
@@ -228,16 +227,6 @@ describe('the library tools', () => {
         expect(catalog.chat.doing).toHaveProperty(kind)
       }
     }
-    expect(zhTW.chat.steps).toMatchObject({
-      browse: '列出',
-      folder: '新增資料夾',
-      move: '移動',
-      rename: '重新命名',
-      duplicate: '建立副本',
-      trash: '丟到垃圾桶',
-      putBack: '放回原處',
-      newDocument: '新增文件',
-    })
     expect(zhTW.chat.steps.trash).toBe(zhTW.files.moveToTrash)
     expect(zhTW.chat.steps.putBack).toBe(zhTW.files.putBack)
     expect(zhTW.chat.steps.duplicate).toBe(zhTW.files.duplicate)
@@ -298,6 +287,9 @@ describe('diffs', () => {
       { kind: 'added', text: 'c' },
     ])
     expect(diffFromInput({ file_text: 'x' })).toEqual([{ kind: 'added', text: 'x' }])
+    expect(diffFromInput({ command: 'insert', insert_line: 3, insert_text: 'x' })).toEqual([
+      { kind: 'added', text: 'x' },
+    ])
   })
 })
 

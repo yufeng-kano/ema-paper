@@ -114,7 +114,7 @@ export type AttachmentRefusal =
   | { reason: 'size'; max: number }
   | { reason: 'count'; max: number }
 
-export interface AttachmentLimits {
+interface AttachmentLimits {
   attachment_max_bytes?: number
   attachments_per_message?: number
   attachment_extensions?: string[]
@@ -145,18 +145,9 @@ export function refuseAttachment(
   return null
 }
 
-/** Bytes in the unit a person reads a file's size in: KB under a megabyte, else MB. */
-export function formatBytes(bytes: number): string {
-  if (bytes >= 1024 * 1024) {
-    const megabytes = bytes / 1024 / 1024
-    return `${Number.isInteger(megabytes) ? megabytes : megabytes.toFixed(1)} MB`
-  }
-  return `${Math.max(1, Math.round(bytes / 1024))} KB`
-}
-
 /** An attachment as the message carries it: the id the upload returned, and what the
  *  thread draws for it until the record holds the message. */
-export interface SentAttachment {
+interface SentAttachment {
   id: string
   name: string
   image: boolean

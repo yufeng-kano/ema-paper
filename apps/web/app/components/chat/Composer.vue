@@ -22,7 +22,6 @@ import {
   commandQuery,
   COMPACT_COMMAND,
   extensionOf,
-  formatBytes,
   isImageFile,
   matchCommands,
   NEW_COMMAND,
@@ -39,6 +38,7 @@ import {
   type ComposerPayload,
   type SentSection,
 } from '~/lib/composer'
+import { formatBytes } from '~/lib/format'
 import { libraryMessage, type LibraryPlace } from '~/lib/library'
 import { inlinePlain, type OutlineEntry } from '~/lib/markdown'
 import type { MenuItem, Point } from '~/lib/menu'
@@ -71,7 +71,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{ stop: []; 'new-conversation': [] }>()
 
-const { t } = useI18n()
+const { t, locale } = useI18n()
 const { resolve } = useApiError()
 /** Two panels can be mounted at once — the Files page's under a viewer's — so the ids the
  *  field and its menu refer to each other by are this composer's own. */
@@ -577,7 +577,7 @@ function refusalText(refusal: AttachmentRefusal): string {
     case 'type':
       return t('chat.attachmentUnsupported')
     case 'size':
-      return t('chat.attachmentTooLarge', { size: formatBytes(refusal.max) })
+      return t('chat.attachmentTooLarge', { size: formatBytes(refusal.max, locale.value) })
     case 'count':
       return t('chat.attachmentTooMany', { count: refusal.max })
   }
@@ -688,7 +688,9 @@ function fileMeta(item: PendingAttachment): string {
   const extension = extensionOf(item.name).toUpperCase()
   const kind = extension.length <= 4 ? extension : ''
   const detail =
-    item.state === 'uploading' ? t('chat.attachmentUploading', { percent: item.progress }) : formatBytes(item.size)
+    item.state === 'uploading'
+      ? t('chat.attachmentUploading', { percent: item.progress })
+      : formatBytes(item.size, locale.value)
   return kind ? `${kind} · ${detail}` : detail
 }
 

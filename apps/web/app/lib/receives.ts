@@ -15,7 +15,7 @@ export const FACT_NAMES: readonly (keyof AgentContextFacts)[] = [
   'network',
 ]
 
-export interface ReceivesFact {
+interface ReceivesFact {
   name: keyof AgentContextFacts
   value: string
 }
@@ -28,15 +28,10 @@ interface RowBase {
   chars: number
 }
 
-export type ReceivesRow =
+type ReceivesRow =
   | (RowBase & { kind: 'part'; part: AgentContextPart; text: string })
   | (RowBase & { kind: 'turn'; text: string })
   | (RowBase & { kind: 'facts'; facts: ReceivesFact[] })
-
-/** A fact's value, or — on the Agent page, where no document is open — its token. */
-export function factValue(facts: AgentContextFacts | null, name: keyof AgentContextFacts): string {
-  return facts?.[name] ?? `{${name}}`
-}
 
 /** A part that is not sent is not in the answer, so it is not listed. */
 export function receivesRows(context: AgentContext): ReceivesRow[] {
@@ -46,7 +41,8 @@ export function receivesRows(context: AgentContext): ReceivesRow[] {
     seen.set(part.kind, nth + 1)
     return { key: `${part.kind}-${nth}`, kind: 'part', part, text: part.text, chars: part.chars }
   })
-  const facts = FACT_NAMES.map((name) => ({ name, value: factValue(context.facts, name) }))
+  // A fact's value, or — on the Agent page, where no document is open — its token.
+  const facts = FACT_NAMES.map((name) => ({ name, value: context.facts?.[name] ?? `{${name}}` }))
   return [
     ...parts,
     { key: 'turn', kind: 'turn', text: context.turn.text, chars: context.turn.chars },

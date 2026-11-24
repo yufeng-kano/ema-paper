@@ -38,7 +38,7 @@ import {
   type UndoFile,
 } from '~/lib/blocks'
 import { COLUMN_WIDTHS, collapses, shownCards, viewerLayout, type Column, type ViewerLayout } from '~/lib/columns'
-import { formatBytes, isImageFile, type AskRequest } from '~/lib/composer'
+import { isImageFile, type AskRequest } from '~/lib/composer'
 import { cellGroupsToMarkdown, nodesToMarkdown, selectionText, type OrphanListContext } from '~/lib/copy'
 import { ANSWER_DRAG_TYPE, BLOCK_DRAG_TYPE, carriesFiles, claimDrag, dragClaim, droppedFiles, setDropEffect } from '~/lib/dnd'
 import {
@@ -58,6 +58,7 @@ import {
   sectionOf,
   type ExcerptMatch,
 } from '~/lib/excerpts'
+import { formatBytes } from '~/lib/format'
 import {
   appendBlockSource,
   blockAnchor,
@@ -266,7 +267,7 @@ const emit = defineEmits<{
   retry: []
 }>()
 
-const { t } = useI18n()
+const { t, locale } = useI18n()
 const { resolve } = useApiError()
 const localePath = useLocalePath()
 const { apple, label: keyLabel, matches } = useShortcuts()
@@ -4323,7 +4324,7 @@ async function uploadImage(file: File): Promise<string | null> {
     return null
   }
   if (cap !== undefined && file.size > cap) {
-    showNote(t('viewer.imageTooLarge', { size: formatBytes(cap) }), false)
+    showNote(t('viewer.imageTooLarge', { size: formatBytes(cap, locale.value) }), false)
     return null
   }
   try {

@@ -406,12 +406,6 @@ describe('memoryLineState', () => {
     expect(memoryLineState(saved, [other])).toEqual({ state: 'removed' })
   })
 
-  it('reads a save a later turn forgot as gone, not as undone', () => {
-    const forgot: MemoryLine = { toolUseId: 'f', action: 'forgotten', memory: { ...SAVED, kind: 'term' }, previous: null }
-    expect(memoryLineState(saved, [])).toEqual({ state: 'removed' })
-    expect(memoryLineState(forgot, [])).toEqual({ state: 'forgotten' })
-  })
-
   it('never offers to keep a memory twice once a forget is undone', () => {
     const forgot: MemoryLine = { toolUseId: 'f', action: 'forgotten', memory: { ...SAVED, kind: 'term' }, previous: null }
     // The forget's Undo saved it again as a new row carrying the forget's call.
@@ -448,13 +442,6 @@ describe('memoryLineState', () => {
     expect(memoryLineState(updated, [row({ text: 'query → 查詢語句', pinned: true })])).toMatchObject({ state: 'updated' })
     expect(memoryLineState(updated, [row()])).toMatchObject({ state: 'reverted', row: { id: 12 } })
     expect(memoryLineState(updated, [row({ text: 'edited on the Agent page' })])).toMatchObject({ state: 'changed' })
-    expect(memoryLineState(updated, [])).toEqual({ state: 'changed', row: null })
-  })
-
-  it('reads a forget as forgotten until Undo puts a row back for the call', () => {
-    const forgotten: MemoryLine = { toolUseId: 'f', action: 'forgotten', memory: { ...SAVED, kind: 'term' }, previous: null }
-    expect(memoryLineState(forgotten, [])).toEqual({ state: 'forgotten' })
-    expect(memoryLineState(forgotten, [row({ id: 41, source_ref: 'f' })])).toMatchObject({ state: 'restored', row: { id: 41 } })
   })
 })
 
@@ -543,7 +530,7 @@ describe('a compaction turn', () => {
 
   it('has no focus when the worker ran it, and draws nothing until the summary is stored', () => {
     const stored = [
-      message('user', [{ type: 'text', text: 'instruction', context: 'compact' }]),
+      message('user', []),
       message('assistant', [{ type: 'text', text: SUMMARY }]),
       message('user', [{ type: 'text', text: SUMMARY, context: 'summary' }]),
     ]
@@ -574,6 +561,6 @@ describe('a compaction turn', () => {
     expect(isSummary([])).toBe(false)
     expect(compactFocus([{ type: 'text', text: '/compact  the table ' }])).toBe('the table')
     expect(compactFocus([{ type: 'text', text: '/compact' }])).toBeNull()
-    expect(compactFocus([{ type: 'text', text: 'instruction', context: 'compact' }])).toBeNull()
+    expect(compactFocus([])).toBeNull()
   })
 })

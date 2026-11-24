@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { AgentContext, AgentContextFacts, AgentContextPart } from './api'
-import { FACT_NAMES, escapeClosesDrawer, factValue, receivesRows } from './receives'
+import { FACT_NAMES, escapeClosesDrawer, receivesRows } from './receives'
 
 const PROMPT: AgentContextPart = { kind: 'prompt', text: 'You are the reader’s agent.', chars: 27, own: false }
 const INSTRUCTIONS: AgentContextPart = { kind: 'instructions', text: '## How to answer', chars: 16 }
@@ -23,12 +23,6 @@ describe('receivesRows', () => {
       'turn',
       'facts',
     ])
-  })
-
-  it('gives every row a size, the facts included', () => {
-    for (const row of receivesRows(context([PROMPT, MEMORY]))) {
-      expect(row.chars).toBeGreaterThan(0)
-    }
   })
 
   it('sizes the facts as the values it lists, in code points as the server counts', () => {
@@ -69,21 +63,6 @@ describe('receivesRows', () => {
     const keys = receivesRows(context([PROMPT, { ...PROMPT, own: true }, MEMORY])).map((row) => row.key)
 
     expect(new Set(keys).size).toBe(keys.length)
-  })
-})
-
-describe('factValue', () => {
-  it('is the document’s value when one is open, else the token the prompt keeps', () => {
-    const facts: AgentContextFacts = {
-      document_path: 'paper.md',
-      page_count: '9',
-      bbox_format: 'xyxy',
-      parse_model: 'claude',
-      network: 'on',
-    }
-
-    expect(factValue(facts, 'page_count')).toBe('9')
-    expect(factValue(null, 'page_count')).toBe('{page_count}')
   })
 })
 

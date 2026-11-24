@@ -16,6 +16,7 @@ import {
   type Subagent,
   type SubagentFields,
 } from '~/lib/api'
+import { EDITOR_TOOL } from '~/lib/steps'
 
 const props = defineProps<{
   /** Null for a new subagent. */
@@ -36,7 +37,6 @@ const { resolve } = useApiError()
 
 const NAME_RULE = /^[a-z0-9][a-z0-9-]{0,63}$/
 const DESCRIPTION_MAX = 1024
-const EDITOR_TOOL = 'str_replace_based_edit_tool'
 
 function fieldsOf(subagent: Subagent | null): SubagentFields {
   return subagent
