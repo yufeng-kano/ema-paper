@@ -20,7 +20,7 @@ from sightread.agents import chat as chat_agent
 from sightread.config import Settings
 from sightread.jobs import chat_runner
 from sightread.workspace.documents import measure_storage
-from sightread.workspace.layout import images_dir, user_root
+from sightread.workspace.layout import images_dir
 from tests.chat_helpers import (
     chatting_client,
     new_conversation,
@@ -30,12 +30,12 @@ from tests.chat_helpers import (
     stub_messages,
 )
 from tests.conftest import PARSE_MODEL, TEST_MODEL_PRICES
+from tests.test_chat_compact import DONE
 from tests.test_chat_convert import _keep, _papers
 from tests.test_chat_web import tool_results, turn_credits
 from tests.test_document_images import _image
 
 DOCUMENT = "/workspace/files/Papers/paper.pdf"
-DONE = ([{"type": "text", "text": "Done."}], "end_turn")
 LINE = re.compile(r"!\[\]\(figures/(img-[0-9a-f]{16}\.(?:png|jpg))\)")
 NO_DOCUMENT = "give the doc.md or notes.md of one of the user's documents."
 
@@ -47,10 +47,6 @@ def _noise(size: tuple[int, int] = (64, 64)) -> bytes:
     return buffer.getvalue()
 
 
-async def _client(make_client, **overrides) -> httpx.AsyncClient:
-    return await chatting_client(make_client(**overrides))
-
-
 async def _markdown(client: httpx.AsyncClient) -> str:
     """The seeded document's text; reading it writes its directory, as a turn finds it."""
     content = await client.get(f"/api/library/documents/{client.document_id}/content")
@@ -60,7 +56,7 @@ async def _markdown(client: httpx.AsyncClient) -> str:
 
 async def _workspace(client: httpx.AsyncClient) -> Path:
     await _markdown(client)
-    return user_root(client.app.state.settings.workspaces_dir, client.user_id)
+    return client.root
 
 
 async def _turn(client: httpx.AsyncClient, conversation_id: int, *calls: dict) -> list[dict]:
@@ -100,12 +96,12 @@ def test_the_tool_is_declared_last_on_every_deployment() -> None:
 
 
 @respx.mock
-async def test_a_chart_and_a_kept_picture_become_images_of_the_document(make_client) -> None:
+async def test_a_chart_and_a_kept_picture_become_images_of_the_document(chat_client) -> None:
     """docs/chat.md § Tools: a PNG the shell saved under `.cache` and a JPEG in Files are
     stored under their hash and copied into the document's `figures/`, as the upload keeps
     them; each call answers the line to write. The tool writes no text, leaves the agent's
     file where it was, and costs nothing beyond the turn's tokens."""
-    client = await _client(make_client)
+    client = chat_client
     settings = client.app.state.settings
     root = await _workspace(client)
     before = await _markdown(client)
@@ -146,12 +142,12 @@ async def test_a_chart_and_a_kept_picture_become_images_of_the_document(make_cli
 
 
 @respx.mock
-async def test_insert_image_refuses_what_it_cannot_keep(make_client) -> None:
+async def test_insert_image_refuses_what_it_cannot_keep(chat_client) -> None:
     """docs/chat.md § Tools: a path outside /workspace, a missing file, a link, a file that
     is no image, and a document that is not one of the reader's — a folder, or a directory
     whose `.meta.json` the shell wrote to name a real document — each answer an error, and
     nothing is stored."""
-    client = await _client(make_client)
+    client = chat_client
     settings = client.app.state.settings
     root = await _workspace(client)
     cache = root / ".cache"
@@ -194,7 +190,7 @@ async def test_an_image_past_its_cap_or_the_quota_is_refused(make_client) -> Non
     """docs/chat.md § Tools: the file is read at most `DOCUMENT_IMAGE_MAX_BYTES`, and the
     quota is checked on each image, as the upload checks it: the first kept image fills the
     room the plan left, and the next is refused as storage full."""
-    client = await _client(make_client, document_image_max_bytes=64 * 1024)
+    client = await chatting_client(make_client(document_image_max_bytes=64 * 1024))
     root = await _workspace(client)
     cache = root / ".cache"
     cache.mkdir(exist_ok=True)

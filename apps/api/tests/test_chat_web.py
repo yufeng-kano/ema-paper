@@ -23,7 +23,6 @@ from sightread.db.models import ChatToolCall, Document, Folder
 from sightread.jobs import chat_runner, chat_web
 from sightread.workspace import safe_io
 from sightread.workspace.documents import measure_storage
-from sightread.workspace.layout import user_root
 from tests.chat_helpers import (
     chatting_client,
     new_conversation,
@@ -34,7 +33,6 @@ from tests.chat_helpers import (
     stub_messages,
 )
 from tests.conftest import CSRF_HEADERS, PARSE_MODEL, TEST_MODEL_PRICES
-from tests.fixtures.documents import build_pdf, text_layer_page
 
 PUBLIC_IP = "1.2.3.4"
 HOSTS = {
@@ -73,6 +71,25 @@ def brave_results(*titles: str) -> dict:
             ]
         }
     }
+
+
+async def fetch(
+    url: str,
+    *,
+    max_bytes: int = 1000,
+    max_chars: int = 20_000,
+    timeout: float = 5,
+    pdf_timeout: float = 5,
+) -> chat_web.ToolOutcome:
+    """`read_url` as a turn calls it, under the test's User-Agent."""
+    return await chat_web.read_url(
+        url,
+        max_bytes=max_bytes,
+        max_chars=max_chars,
+        timeout=timeout,
+        pdf_timeout=pdf_timeout,
+        user_agent=AGENT,
+    )
 
 
 async def tool_results(client, conversation_id: int) -> list[dict]:
@@ -134,10 +151,9 @@ def test_the_web_tools_are_declared_only_where_the_deployment_runs_them() -> Non
 
 def test_the_fullest_tool_list_keeps_its_strict_grammar_small() -> None:
     """docs/chat.md § Upstream: the upstream compiles every strict schema of a request into
-    one grammar and refuses the whole request past a size it does not publish — ten strict
-    tools crossed it and every Claude turn failed, nine never had. The fullest list a
-    deployment declares (a shell, both search keys, a parse model) stays well under, and a
-    tool whose input is one string is never strict."""
+    one grammar and refuses the whole request past a size it does not publish. The fullest
+    list a deployment declares (a shell, both search keys, a parse model) keeps at most six
+    strict tools, and a tool whose input is one string is never strict."""
     settings = Settings(**WEB_KEYS, parse_model=PARSE_MODEL, model_prices_json=TEST_MODEL_PRICES)
     tools = chat_runner.turn_tools(True, settings)
     assert {"bash", "web_search", "search_papers", "convert_file", "insert_image"} <= {
@@ -443,19 +459,14 @@ async def test_read_url_reads_a_page_as_text_through_the_checked_address(
 
 
 @respx.mock
-async def test_read_url_reads_a_pdfs_text_layer(tmp_path, monkeypatch) -> None:
+async def test_read_url_reads_a_pdfs_text_layer(documents, monkeypatch) -> None:
     fake_resolver(monkeypatch)
-    pdf = build_pdf(tmp_path / "paper.pdf", text_layer_page).read_bytes()
+    pdf = documents["text_pdf"].read_bytes()
     respx.get(host=PUBLIC_IP, path="/paper.pdf").mock(
         return_value=httpx.Response(200, headers={"content-type": "application/pdf"}, content=pdf)
     )
-    outcome = await chat_web.read_url(
-        "https://example.org/paper.pdf",
-        max_bytes=10_000_000,
-        max_chars=20_000,
-        timeout=30,
-        pdf_timeout=60,
-        user_agent=AGENT,
+    outcome = await fetch(
+        "https://example.org/paper.pdf", max_bytes=10_000_000, timeout=30, pdf_timeout=60
     )
     assert outcome.is_error is False
     assert outcome.content.startswith("https://example.org/paper.pdf\n\n")
@@ -479,11 +490,6 @@ async def test_read_url_refuses_what_the_guard_refuses(monkeypatch) -> None:
         return_value=httpx.Response(200, headers={"content-type": "application/zip"}, content=b"PK")
     )
 
-    async def read(url: str) -> chat_web.ToolOutcome:
-        return await chat_web.read_url(
-            url, max_bytes=1000, max_chars=1000, timeout=5, pdf_timeout=5, user_agent=AGENT
-        )
-
     for url in (
         "ftp://example.org/x",
         "http://localhost/x",
@@ -495,7 +501,7 @@ async def test_read_url_refuses_what_the_guard_refuses(monkeypatch) -> None:
         "http://user:pw@example.org/x",
         "https://example.org/bounce",
     ):
-        outcome = await read(url)
+        outcome = await fetch(url)
         assert outcome.is_error is True, url
         assert (
             "private or local" in outcome.content
@@ -503,9 +509,11 @@ async def test_read_url_refuses_what_the_guard_refuses(monkeypatch) -> None:
             or "credentials" in outcome.content
         ), (url, outcome.content)
     assert private.call_count == 0
-    assert (await read("https://example.org/loop")).content == "Too many redirects."
-    assert (await read("https://nowhere.test/x")).content == "The URL's host could not be resolved."
-    assert "not text" in (await read("https://example.org/binary")).content
+    assert (await fetch("https://example.org/loop")).content == "Too many redirects."
+    assert (
+        await fetch("https://nowhere.test/x")
+    ).content == "The URL's host could not be resolved."
+    assert "not text" in (await fetch("https://example.org/binary")).content
 
 
 @respx.mock
@@ -516,14 +524,7 @@ async def test_read_url_stops_at_its_byte_cap(monkeypatch) -> None:
             200, headers={"content-type": "text/plain"}, content=b"x" * 5000
         )
     )
-    outcome = await chat_web.read_url(
-        "https://example.org/long.txt",
-        max_bytes=1000,
-        max_chars=20_000,
-        timeout=5,
-        pdf_timeout=5,
-        user_agent=AGENT,
-    )
+    outcome = await fetch("https://example.org/long.txt")
     assert outcome.is_error is False
     assert outcome.content.split("\n\n", 1)[1].count("x") == 1000
     assert outcome.content.endswith("[... the content goes on past what was read ...]")
@@ -532,14 +533,7 @@ async def test_read_url_stops_at_its_byte_cap(monkeypatch) -> None:
             200, headers={"content-type": "text/plain"}, content=b"y" * 1000
         )
     )
-    exact = await chat_web.read_url(
-        "https://example.org/exact.txt",
-        max_bytes=1000,
-        max_chars=20_000,
-        timeout=5,
-        pdf_timeout=5,
-        user_agent=AGENT,
-    )
+    exact = await fetch("https://example.org/exact.txt")
     assert exact.content.endswith("y" * 1000)
 
 
@@ -565,14 +559,7 @@ async def test_read_url_tries_each_address_in_the_resolvers_order(monkeypatch) -
     respx.get(host=PUBLIC_IP, path="/page").mock(
         return_value=httpx.Response(200, headers={"content-type": "text/plain"}, content=b"Words.")
     )
-    outcome = await chat_web.read_url(
-        "https://dual.test/page",
-        max_bytes=1000,
-        max_chars=20_000,
-        timeout=5,
-        pdf_timeout=5,
-        user_agent=AGENT,
-    )
+    outcome = await fetch("https://dual.test/page")
     assert outcome.is_error is False and outcome.content == "https://dual.test/page\n\nWords."
     assert [call.request.url.host for call in respx.calls] == [ipv6, PUBLIC_IP]
     request = respx.calls.last.request
@@ -598,30 +585,23 @@ async def test_a_failed_read_says_what_failed(monkeypatch) -> None:
     fake_resolver(monkeypatch)
     route = respx.get(host=PUBLIC_IP, path="/x")
 
-    async def read() -> str:
-        outcome = await chat_web.read_url(
-            "https://example.org/x",
-            max_bytes=1000,
-            max_chars=20_000,
-            timeout=5,
-            pdf_timeout=5,
-            user_agent=AGENT,
-        )
+    async def failed() -> str:
+        outcome = await fetch("https://example.org/x")
         assert outcome.is_error is True
         return outcome.content
 
     advice = "; find another source rather than retrying it."
     route.mock(side_effect=httpx.ConnectError("[Errno 111] Connection refused"))
-    assert await read() == (
+    assert await failed() == (
         "The URL could not be read: no connection could be made (refused, unreachable or TLS "
         "failed)" + advice
     )
     route.mock(side_effect=httpx.ReadTimeout("timed out"))
-    assert await read() == (
+    assert await failed() == (
         "The URL could not be read: the server did not answer within 5 seconds" + advice
     )
     route.mock(side_effect=httpx.RemoteProtocolError("peer closed connection"))
-    assert await read() == (
+    assert await failed() == (
         "The URL could not be read: the connection broke off before the answer was read" + advice
     )
 
@@ -651,14 +631,14 @@ def test_html_to_text_and_names() -> None:
 
 @respx.mock
 async def test_download_file_files_the_bytes_like_an_upload(
-    make_client, tmp_path, monkeypatch
+    make_client, documents, monkeypatch
 ) -> None:
     """docs/workspace.md § Files, *A download is an upload*: the file lands at
     `files/<folder>/<name>` with its row, the folders made where missing, a taken name
     suffixed, the staging name gone, and the call recorded."""
     fake_resolver(monkeypatch)
     client = await web_client(make_client)
-    pdf = build_pdf(tmp_path / "paper.pdf", text_layer_page).read_bytes()
+    pdf = documents["text_pdf"].read_bytes()
     respx.get(host=PUBLIC_IP, path="/dl").mock(
         return_value=httpx.Response(
             200,
@@ -710,11 +690,12 @@ async def test_download_file_files_the_bytes_like_an_upload(
         ("attention.pdf", year.id, "application/pdf", len(pdf)),
         ("attention (2).pdf", year.id, "application/pdf", len(pdf)),
     ]
-    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    assert (root / "files" / "Papers" / "2017" / "attention.pdf").read_bytes() == pdf
-    assert (root / "files" / "Papers" / "2017" / "attention (2).pdf").read_bytes() == pdf
+    assert (client.root / "files" / "Papers" / "2017" / "attention.pdf").read_bytes() == pdf
+    assert (client.root / "files" / "Papers" / "2017" / "attention (2).pdf").read_bytes() == pdf
     assert not [
-        name for name, _ in safe_io.list_dir(root, root / "files") if name.startswith(".sr-tmp")
+        name
+        for name, _ in safe_io.list_dir(client.root, client.root / "files")
+        if name.startswith(".sr-tmp")
     ]
     assert await recorded(client, "download_file") == 2
     assert await turn_credits(client, conversation_id) == ("succeeded", 1)
@@ -767,15 +748,16 @@ async def test_a_download_names_its_folder_as_the_library_tools_do(
     async with client.app.state.sessionmaker() as db:
         folders = (await db.execute(select(Folder.name))).scalars().all()
     assert sorted(folders) == ["2017", "Papers"]
-    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    assert (root / "files" / "Papers" / "2017" / "b.txt").read_bytes() == b"ok"
+    assert (client.root / "files" / "Papers" / "2017" / "b.txt").read_bytes() == b"ok"
     assert await recorded(client, "download_file") == 1
 
 
 @respx.mock
-async def test_a_download_past_a_cap_or_the_quota_keeps_nothing(make_client, monkeypatch) -> None:
-    """docs/chat.md § Tools: a body past `DOWNLOAD_MAX_BYTES`, past the storage the quota
-    leaves, or past the user's day cap is refused, nothing filed and nothing staged."""
+async def test_a_download_past_a_cap_or_refused_keeps_nothing(make_client, monkeypatch) -> None:
+    """docs/chat.md § Tools: a body past `DOWNLOAD_MAX_BYTES`, a private address the guard
+    refuses, an HTTP error, a refused connection and a call past the user's day cap are
+    each refused, nothing filed and nothing staged; the one within every cap is kept and
+    recorded."""
     fake_resolver(monkeypatch)
     client = await web_client(make_client, download_max_bytes=100, download_max_per_day=1)
     respx.get(host=PUBLIC_IP, path="/big").mock(
@@ -834,8 +816,7 @@ async def test_a_download_past_a_cap_or_the_quota_keeps_nothing(make_client, mon
         "Kept a.txt (2 bytes, text/plain) in the top level"
     )
     assert capped["is_error"] and "Today's limit on downloads (the user's)" in capped["output"]
-    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    names = {name for name, _ in safe_io.list_dir(root, root / "files")}
+    names = {name for name, _ in safe_io.list_dir(client.root, client.root / "files")}
     assert "a.txt" in names and not [name for name in names if name.startswith(".sr-tmp")]
     assert "big.txt" not in names and "b.txt" not in names
     assert await recorded(client, "download_file") == 1
@@ -847,10 +828,11 @@ async def test_a_download_the_quota_cannot_hold_is_refused(make_client, monkeypa
     so a file that does not fit is never written, let alone filed."""
     fake_resolver(monkeypatch)
     client = await web_client(make_client)
-    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
     conversation_id = await new_conversation(client)
     async with client.app.state.sessionmaker() as db:
-        used = (await measure_storage(db, client.app.state.settings, client.user_id, root)).total
+        used = (
+            await measure_storage(db, client.app.state.settings, client.user_id, client.root)
+        ).total
     # The same workspace and user, on a plan with just enough room for a few bytes more.
     tight = make_client(free_storage_bytes=used + 50, **WEB_KEYS)
     respx.get(host=PUBLIC_IP, path="/f").mock(
@@ -870,7 +852,7 @@ async def test_a_download_the_quota_cannot_hold_is_refused(make_client, monkeypa
     await run_queued_turn(tight)
     [result] = await tool_results(client, conversation_id)
     assert result["is_error"] and "storage is full" in result["output"]
-    names = {name for name, _ in safe_io.list_dir(root, root / "files")}
+    names = {name for name, _ in safe_io.list_dir(client.root, client.root / "files")}
     assert "f.txt" not in names and not [name for name in names if name.startswith(".sr-tmp")]
     assert await recorded(client, "download_file") == 0
 
@@ -914,13 +896,12 @@ async def test_a_web_tool_the_turn_does_not_declare_is_never_run(make_client, mo
     assert page.call_count == 0 and brave.call_count == 0
     assert await recorded(client, "web_search") == 0
     assert await recorded(client, "download_file") == 0
-    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    assert "p.txt" not in {name for name, _ in safe_io.list_dir(root, root / "files")}
+    assert "p.txt" not in {name for name, _ in safe_io.list_dir(client.root, client.root / "files")}
     assert await turn_credits(client, conversation_id) == ("succeeded", 1)
 
 
 @respx.mock
-async def test_read_url_bounds_the_title_and_caps_the_whole_result(tmp_path, monkeypatch) -> None:
+async def test_read_url_bounds_the_title_and_caps_the_whole_result(documents, monkeypatch) -> None:
     """The title is one line at most and the cap holds for the whole result, so a page
     whose title alone would fill it still answers its text; a response without a type is
     read as text, or as a PDF by its magic."""
@@ -934,65 +915,37 @@ async def test_read_url_bounds_the_title_and_caps_the_whole_result(tmp_path, mon
             200, headers={"content-type": "text/html"}, content=page.encode()
         )
     )
-    outcome = await chat_web.read_url(
-        "https://example.org/titled",
-        max_bytes=100_000,
-        max_chars=20_000,
-        timeout=5,
-        pdf_timeout=5,
-        user_agent=AGENT,
-    )
+    outcome = await fetch("https://example.org/titled", max_bytes=100_000)
     assert outcome.is_error is False
     title, rest = outcome.content.split("\n", 1)
     assert title == "t" * chat_web.TITLE_MAX_CHARS
     assert rest.startswith("https://example.org/titled\n\n") and "The body is here." in rest
-    small = await chat_web.read_url(
-        "https://example.org/titled",
-        max_bytes=100_000,
-        max_chars=100,
-        timeout=5,
-        pdf_timeout=5,
-        user_agent=AGENT,
-    )
+    small = await fetch("https://example.org/titled", max_bytes=100_000, max_chars=100)
     assert small.is_error is False and len(small.content) <= 100
 
     respx.get(host=PUBLIC_IP, path="/untyped").mock(
         return_value=httpx.Response(200, content=b"plain words")
     )
-    untyped = await chat_web.read_url(
-        "https://example.org/untyped",
-        max_bytes=1000,
-        max_chars=20_000,
-        timeout=5,
-        pdf_timeout=5,
-        user_agent=AGENT,
-    )
+    untyped = await fetch("https://example.org/untyped")
     assert untyped.is_error is False and untyped.content.endswith("plain words")
-    pdf = build_pdf(tmp_path / "paper.pdf", text_layer_page).read_bytes()
+    pdf = documents["text_pdf"].read_bytes()
     respx.get(host=PUBLIC_IP, path="/untyped.pdf").mock(
         return_value=httpx.Response(200, content=pdf)
     )
-    as_pdf = await chat_web.read_url(
-        "https://example.org/untyped.pdf",
-        max_bytes=100_000,
-        max_chars=20_000,
-        timeout=5,
-        pdf_timeout=5,
-        user_agent=AGENT,
-    )
+    as_pdf = await fetch("https://example.org/untyped.pdf", max_bytes=100_000)
     assert as_pdf.is_error is False and "<html" not in as_pdf.content
     assert as_pdf.content.strip() != "https://example.org/untyped.pdf"
 
 
 @respx.mock
 async def test_a_download_without_a_content_type_takes_the_names_type(
-    make_client, tmp_path, monkeypatch
+    make_client, documents, monkeypatch
 ) -> None:
     """docs/workspace.md § Files: a server that says nothing about the type leaves it to the
     name's extension, as a browser's shrug on an upload does — never `text/plain`."""
     fake_resolver(monkeypatch)
     client = await web_client(make_client)
-    pdf = build_pdf(tmp_path / "paper.pdf", text_layer_page).read_bytes()
+    pdf = documents["text_pdf"].read_bytes()
     assert chat_web.media_type_of(httpx.Response(200, content=pdf)) == ("", None)
     respx.get(host=PUBLIC_IP, path="/paper.pdf").mock(return_value=httpx.Response(200, content=pdf))
     stub_messages(
@@ -1031,13 +984,8 @@ async def test_httpx_request_logs_carry_no_query(monkeypatch, caplog) -> None:
     chat_web.redact_request_logs()
     try:
         with caplog.at_level(logging.INFO, logger="httpx"):
-            outcome = await chat_web.read_url(
-                "https://example.org/signed.txt?X-Amz-Signature=secret-signature#frag",
-                max_bytes=1000,
-                max_chars=20_000,
-                timeout=5,
-                pdf_timeout=5,
-                user_agent=AGENT,
+            outcome = await fetch(
+                "https://example.org/signed.txt?X-Amz-Signature=secret-signature#frag"
             )
     finally:
         logging.getLogger("httpx").removeFilter(chat_web.QUERY_REDACTOR)
@@ -1061,14 +1009,7 @@ async def test_a_gzipped_body_is_inflated_a_bounded_piece_at_a_time(tmp_path, mo
             content=gzip.compress(page),
         )
     )
-    outcome = await chat_web.read_url(
-        "https://example.org/zipped",
-        max_bytes=100_000,
-        max_chars=20_000,
-        timeout=5,
-        pdf_timeout=5,
-        user_agent=AGENT,
-    )
+    outcome = await fetch("https://example.org/zipped", max_bytes=100_000)
     assert outcome.content == "Zipped\nhttps://example.org/zipped\n\nSmall words."
 
     bomb = gzip.compress(b"a" * 20_000_000)  # about twenty kilobytes on the wire
@@ -1105,14 +1046,7 @@ async def test_a_gzipped_body_is_inflated_a_bounded_piece_at_a_time(tmp_path, mo
             200, headers={"content-type": "text/plain", "content-encoding": "gzip"}, content=bomb
         )
     )
-    bombed = await chat_web.read_url(
-        "https://example.org/bomb",
-        max_bytes=1000,
-        max_chars=20_000,
-        timeout=5,
-        pdf_timeout=5,
-        user_agent=AGENT,
-    )
+    bombed = await fetch("https://example.org/bomb")
     assert bombed.is_error is False
     assert bombed.content.endswith("[... the content goes on past what was read ...]")
 
@@ -1136,14 +1070,7 @@ async def test_a_gzipped_body_is_inflated_a_bounded_piece_at_a_time(tmp_path, mo
             200, headers={"content-type": "text/plain", "content-encoding": "br"}, content=b"x"
         )
     )
-    refused = await chat_web.read_url(
-        "https://example.org/brotli",
-        max_bytes=1000,
-        max_chars=20_000,
-        timeout=5,
-        pdf_timeout=5,
-        user_agent=AGENT,
-    )
+    refused = await fetch("https://example.org/brotli")
     assert refused.is_error is True and "encoded as br" in refused.content
 
     respx.get(host=PUBLIC_IP, path="/zipped.txt").mock(
@@ -1187,26 +1114,12 @@ async def test_a_signed_urls_query_never_reaches_a_result(tmp_path, monkeypatch)
             content=b"<html><head><title>Page</title></head><body>Words.</body></html>",
         )
     )
-    missing = await chat_web.read_url(
-        "https://example.org/gone.txt?X-Amz-Signature=secret-signature",
-        max_bytes=1000,
-        max_chars=20_000,
-        timeout=5,
-        pdf_timeout=5,
-        user_agent=AGENT,
-    )
+    missing = await fetch("https://example.org/gone.txt?X-Amz-Signature=secret-signature")
     assert missing.is_error and missing.content == (
         "https://example.org/gone.txt answered HTTP 404; find another source rather than "
         "retrying it."
     )
-    hopped = await chat_web.read_url(
-        "https://example.org/hop",
-        max_bytes=1000,
-        max_chars=20_000,
-        timeout=5,
-        pdf_timeout=5,
-        user_agent=AGENT,
-    )
+    hopped = await fetch("https://example.org/hop")
     assert hopped.content == "Page\nhttps://example.org/page.html\n\nWords."
     fd = os.open(tmp_path / "kept", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:

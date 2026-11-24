@@ -17,7 +17,6 @@ from sightread.jobs import chat_compact, chat_library, chat_memory
 from sightread.jobs.chat_tools import ToolOutcome
 from sightread.workspace import documents as workspace_documents
 from sightread.workspace import filing, git
-from sightread.workspace.layout import user_root
 from tests.chat_helpers import (
     conversation_row,
     new_conversation,
@@ -30,6 +29,7 @@ from tests.conftest import CSRF_HEADERS, postgres_only
 from tests.factories import user_row
 from tests.test_chat_agents_file import _agents_part, _write
 from tests.test_chat_compact import DONE, SUMMARY, detail, set_clock, turns_of
+from tests.test_chat_convert import _papers
 from tests.test_chat_versions import edit
 from tests.test_chat_web import tool_results
 
@@ -42,11 +42,6 @@ async def new_library_conversation(client: AsyncClient) -> int:
     conversation_id = created.json()["id"]
     assert (await conversation_row(client, conversation_id)).document_id is None
     return conversation_id
-
-
-async def _papers(client: AsyncClient) -> int:
-    library = (await client.get("/api/library")).json()
-    return next(folder["id"] for folder in library["folders"] if folder["name"] == "Papers")
 
 
 async def _rows(client: AsyncClient) -> tuple[dict[int, Folder], dict[int, Document]]:
@@ -71,8 +66,7 @@ async def _tool(client: AsyncClient, name: str, tool_input: dict) -> ToolOutcome
 
 
 def _authors(client: AsyncClient) -> set[str]:
-    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    return set(git._git(root, "log", "--format=%an").stdout.split())
+    return set(git._git(client.root, "log", "--format=%an").stdout.split())
 
 
 # --- the routes ------------------------------------------------------------------------------
@@ -236,9 +230,8 @@ async def test_a_library_turn_runs_on_the_library_prompt_and_tools(chat_client) 
     alone, and no skill or subagent that works on a document: a call naming one, or a page
     tool, answers an error without running (docs/chat.md § Library conversations)."""
     client = chat_client
-    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    _write(root, "files/AGENTS.md", "- Notes in English\n")
-    _write(root, "files/Papers/AGENTS.md", "- Cite with the DOI\n")
+    _write(client.root, "files/AGENTS.md", "- Notes in English\n")
+    _write(client.root, "files/Papers/AGENTS.md", "- Cite with the DOI\n")
     main, _ = stub_messages(
         [
             one_call("v", "view_page", {"page": 1}),
@@ -423,11 +416,10 @@ async def test_the_library_tools_change_the_library_and_say_how_to_undo_it(chat_
         None,
     )
     assert folders[year].parent_id == reading and plan.folder_id == notes
-    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    assert (root / "files/Reading/2017/attention.pdf/doc.md").is_file()
-    assert (root / "files/Reading/2017/attention (2).pdf/doc.md").is_file()
-    assert (root / "files/Notes/Plan.md/doc.md").read_text() == "# Plan\n\nRead it."
-    assert not (root / "files/Papers/paper.pdf").exists()
+    assert (client.root / "files/Reading/2017/attention.pdf/doc.md").is_file()
+    assert (client.root / "files/Reading/2017/attention (2).pdf/doc.md").is_file()
+    assert (client.root / "files/Notes/Plan.md/doc.md").read_text() == "# Plan\n\nRead it."
+    assert not (client.root / "files/Papers/paper.pdf").exists()
     assert _authors(client) == {f"agent:{conversation_id}"}
 
     # The record stays on the stored result for a reloaded thread, never sent upstream.
@@ -452,10 +444,8 @@ async def test_a_document_that_is_answering_stays_where_it_is(chat_client) -> No
     """A document whose own conversation has an unfinished turn is refused as the Files page
     refuses it, as an error result that says why (docs/chat.md § Library conversations)."""
     client = chat_client
-    settings = client.app.state.settings
-    sessionmaker = client.app.state.sessionmaker
     answering = await new_conversation(client)
-    async with sessionmaker() as db:
+    async with client.app.state.sessionmaker() as db:
         db.add(
             ChatTurn(
                 user_id=client.user_id,
@@ -472,14 +462,7 @@ async def test_a_document_that_is_answering_stays_where_it_is(chat_client) -> No
         ("rename", {"path": "Papers/paper.pdf", "name": "b.pdf"}, "rename Papers/paper.pdf"),
         ("trash", {"paths": ["Papers"]}, "move Papers to the Trash"),
     ):
-        outcome = await chat_library.run_tool(
-            sessionmaker,
-            settings,
-            user_id=client.user_id,
-            author="agent:1",
-            name=name,
-            tool_input=tool_input,
-        )
+        outcome = await _tool(client, name, tool_input)
         assert outcome.is_error is True and outcome.library is None, name
         assert outcome.content == (
             f"Could not {action}: a conversation about this file is still answering."
@@ -489,14 +472,8 @@ async def test_a_document_that_is_answering_stays_where_it_is(chat_client) -> No
     assert (row.name, row.trashed_at) == ("paper.pdf", None)
 
     # Past the cap of paths, nothing is done at all.
-    capped = await chat_library.run_tool(
-        sessionmaker,
-        settings,
-        user_id=client.user_id,
-        author="agent:1",
-        name="trash",
-        tool_input={"paths": ["x"] * (settings.chat_library_max_paths + 1)},
-    )
+    settings = client.app.state.settings
+    capped = await _tool(client, "trash", {"paths": ["x"] * (settings.chat_library_max_paths + 1)})
     assert capped.is_error is True and capped.content.startswith("At most 100 paths")
 
 
@@ -589,8 +566,7 @@ async def test_put_back_finds_its_items_in_the_trash_as_it_was_listed(chat_clien
     folders, _ = await _rows(client)
     assert (folders[a].parent_id, folders[a].trashed_at) == (None, None)
     assert (folders[c].parent_id, folders[c].trashed_at) == (a, None)
-    root = user_root(settings.workspaces_dir, client.user_id)
-    assert (root / "files/A/C").is_dir()
+    assert (client.root / "files/A/C").is_dir()
 
     for _ in range(2):
         await _tool(client, "new_document", {"path": "Notes/Plan"})

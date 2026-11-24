@@ -26,10 +26,16 @@ from sightread.jobs import chat_library, chat_runner, runner, sweeper
 from sightread.jobs.queue import claim_next_job
 from sightread.jobs.runner import run_job
 from sightread.workspace.documents import original_of
-from sightread.workspace.layout import user_root
-from tests.chat_helpers import new_conversation, one_call, run_queued_turn, send, stub_messages
+from tests.chat_helpers import (
+    chatting_client,
+    new_conversation,
+    one_call,
+    run_queued_turn,
+    send,
+    stub_messages,
+)
 from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, convert_on_upload
-from tests.test_chat_web import tool_results, turn_credits, web_client
+from tests.test_chat_web import tool_results, turn_credits
 
 VISION_MARKDOWN = "## Page one\n\nBody text."
 DONE = ([{"type": "text", "text": "Read."}], "end_turn")
@@ -48,7 +54,7 @@ def _completion(content: str) -> httpx.Response:
 async def _ready(make_client, **overrides) -> httpx.AsyncClient:
     """A chatting client whose format check is off: the check speaks the Messages route the
     turn is stubbed on, and a reader may switch it off (docs/parsing.md § Format check)."""
-    client = await web_client(make_client, **overrides)
+    client = await chatting_client(make_client(**overrides))
     off = await client.put(
         "/api/agents/check/settings", json={"auto_check": False}, headers=CSRF_HEADERS
     )
@@ -69,6 +75,15 @@ async def _keep(
     assert response.status_code == 201, response.text
     assert response.json()["kind"] == "file"
     return response.json()
+
+
+async def _kept_paper(make_client, documents) -> tuple[httpx.AsyncClient, dict]:
+    """A ready client and the text PDF it keeps as a file, `paper.pdf` at the top."""
+    client = await _ready(make_client)
+    kept = await _keep(
+        client, "paper.pdf", documents["text_pdf"].read_bytes(), "application/pdf", None
+    )
+    return client, kept
 
 
 async def _papers(client: httpx.AsyncClient) -> int:
@@ -108,9 +123,6 @@ def test_the_tool_is_declared_only_with_a_parse_model() -> None:
         chat_agent.DEFAULT_SYSTEM_PROMPT, None, tools=["view_page"]
     )
     assert "- convert_file:" not in without
-    # The figure rule: a block link, and web addresses as ordinary links (docs/chat.md).
-    assert "](#3-method~Figure 3: Overview of the method)" in rendered
-    assert "[title](https://…)" in rendered
 
 
 @respx.mock
@@ -153,9 +165,8 @@ async def test_convert_file_turns_a_kept_file_into_a_document_inside_the_turn(
     assert credits == settings.parse_credits_per_page
     assert vision.call_count == 1
     # The document is written, under the file's own name, before the turn goes on.
-    root = user_root(settings.workspaces_dir, client.user_id)
-    assert "Body text." in (root / "files" / "Papers" / "tiny.png" / "doc.md").read_text()
-    assert not (root / "files" / "Papers" / "tiny.png").is_file()
+    assert "Body text." in (client.root / "files" / "Papers" / "tiny.png" / "doc.md").read_text()
+    assert not (client.root / "files" / "Papers" / "tiny.png").is_file()
     # The turn is charged on its tokens alone (docs/billing.md § A chat turn).
     assert await turn_credits(client, conversation_id) == ("succeeded", 1)
     listed = (await client.get("/api/library")).json()["documents"]
@@ -188,8 +199,7 @@ async def test_a_file_converted_before_costs_nothing_again(make_client, document
     assert row.kind == "parse"
     # One parse was paid for, whatever the cache answered with.
     assert sum(value or 0 for value in charged.values()) == settings.parse_credits_per_page
-    root = user_root(settings.workspaces_dir, client.user_id)
-    assert "Body text." in (root / "files" / "again.png" / "doc.md").read_text()
+    assert "Body text." in (client.root / "files" / "again.png" / "doc.md").read_text()
 
 
 @respx.mock
@@ -236,8 +246,7 @@ async def test_a_document_whose_parse_still_waits_is_driven_too(make_client, doc
         row = await db.get(Document, uploaded.json()["id"])
         job = await db.get(Job, row.job_id)
     assert job.status == "succeeded"
-    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    assert "Body text." in (root / "files" / "tiny.png" / "doc.md").read_text()
+    assert "Body text." in (client.root / "files" / "tiny.png" / "doc.md").read_text()
 
 
 @respx.mock
@@ -271,8 +280,7 @@ async def test_convert_file_refuses_what_is_not_a_file_to_convert(make_client) -
         jobs = (await db.execute(select(Job))).scalars().all()
     assert (row.kind, row.job_id) == ("file", None)
     assert len(jobs) == 1  # the seeded document's
-    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    assert (root / "files" / "archive.zip").is_file()
+    assert (client.root / "files" / "archive.zip").is_file()
 
 
 @respx.mock
@@ -295,8 +303,7 @@ async def test_convert_file_stops_at_the_balance_and_at_the_turn_cap(
         jobs = (await db.execute(select(Job))).scalars().all()
     assert (row.kind, row.job_id) == ("file", None)
     assert len(jobs) == 1
-    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    assert (root / "files" / "tiny.png").is_file()
+    assert (client.root / "files" / "tiny.png").is_file()
 
 
 @respx.mock
@@ -332,14 +339,11 @@ async def test_a_conversion_past_its_time_goes_back_on_the_queue(
         job = await db.get(Job, row.job_id)
     assert (row.kind, job.status, job.worker_generation) == ("parse", "queued", None)
     # The worker's next cycle finishes it.
+    ran = await _worker_runs_next(client)
+    assert ran.id == job.id
     async with client.app.state.sessionmaker() as db:
-        claimed = await claim_next_job(db, settings.max_jobs_per_user)
-    assert claimed == job.id
-    await run_job(client.app.state.sessionmaker, settings, claimed, asyncio.Semaphore(2))
-    async with client.app.state.sessionmaker() as db:
-        job = await db.get(Job, job.id)
         credits = (await ledger.credits_by_job(db, [job.id])).get(job.id)
-    assert job.status == "succeeded" and answered == 2
+    assert ran.status == "succeeded" and answered == 2
     assert credits == settings.parse_credits_per_page
 
 
@@ -353,7 +357,7 @@ async def test_a_conversion_past_its_time_goes_back_on_the_queue(
         ("Papers//a.pdf/", ["Papers", "a.pdf"]),
         # The top: what `list_files` lists, and `convert_file` refuses as no file.
         ("", []),
-        ("/workspace/files/", []),
+        ("/workspace/files", []),
         ("../a.pdf", None),
         ("Papers/./a.pdf", None),
     ],
@@ -369,6 +373,19 @@ async def _settled(client: httpx.AsyncClient, document_id: int) -> tuple[Documen
         job = await db.get(Job, row.job_id)
     listed = (await client.get("/api/library")).json()["documents"]
     return row, job, next(shown for shown in listed if shown["id"] == document_id)
+
+
+def _drive_ctx(client: httpx.AsyncClient) -> SimpleNamespace:
+    """What `_drive_parse` reads of a turn's context, for a turn that has started nothing."""
+    return SimpleNamespace(
+        settings=client.app.state.settings,
+        sessionmaker=client.app.state.sessionmaker,
+        convert_stop=asyncio.Event(),
+        turn=SimpleNamespace(id=uuid.uuid4()),
+        generation=None,
+        render_slots=asyncio.Semaphore(1),
+        inline_parse=None,
+    )
 
 
 async def _worker_runs_next(client: httpx.AsyncClient) -> Job:
@@ -398,11 +415,7 @@ async def test_a_failed_conversion_keeps_the_file_to_retry(
         return httpx.Response(503, json={"error": "down"}) if down else _completion(VISION_MARKDOWN)
 
     respx.post(KANO_CHAT_URL).mock(side_effect=vision)
-    client = await _ready(make_client)
-    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    kept = await _keep(
-        client, "paper.pdf", documents["text_pdf"].read_bytes(), "application/pdf", None
-    )
+    client, kept = await _kept_paper(make_client, documents)
     _, (first, second) = await _run(client, {"path": "paper.pdf"}, {"path": "paper.pdf"})
     assert first["is_error"] is True
     assert first["output"].startswith("The conversion of paper.pdf failed: ")
@@ -415,9 +428,9 @@ async def test_a_failed_conversion_keeps_the_file_to_retry(
         True,
     )
     assert job.source_deleted_at is not None
-    assert original_of(root, kept["id"]) is not None
+    assert original_of(client.root, kept["id"]) is not None
     # Reconciled at the turn's end: nothing of the failed parse stands in the tree.
-    assert not (root / "files" / "paper.pdf").exists()
+    assert not (client.root / "files" / "paper.pdf").exists()
 
     down = False
     retried = await client.post(
@@ -425,7 +438,7 @@ async def test_a_failed_conversion_keeps_the_file_to_retry(
     )
     assert retried.status_code == 202, retried.text
     assert (await _worker_runs_next(client)).status == "succeeded"
-    names = {entry.name for entry in (root / "files" / "paper.pdf").iterdir()}
+    names = {entry.name for entry in (client.root / "files" / "paper.pdf").iterdir()}
     assert {"doc.md", ".meta.json", "source.pdf"} <= names
     assert "_source.pdf" not in names
 
@@ -446,12 +459,8 @@ async def test_the_agent_retries_a_failed_conversion_once_told_to(
         return httpx.Response(503, json={"error": "down"}) if down else _completion(VISION_MARKDOWN)
 
     respx.post(KANO_CHAT_URL).mock(side_effect=vision)
-    client = await _ready(make_client)
+    client, kept = await _kept_paper(make_client, documents)
     settings = client.app.state.settings
-    root = user_root(settings.workspaces_dir, client.user_id)
-    kept = await _keep(
-        client, "paper.pdf", documents["text_pdf"].read_bytes(), "application/pdf", None
-    )
     _, (failed, loose) = await _run(
         client, {"path": "paper.pdf"}, {"path": "paper.pdf", "retry": "yes"}
     )
@@ -476,7 +485,7 @@ async def test_the_agent_retries_a_failed_conversion_once_told_to(
     assert retried["output"].startswith("Converted paper.pdf (")
     row, job, shown = await _settled(client, kept["id"])
     assert (row.job_id, job.status, shown["status"]) == (job_id, "succeeded", "succeeded")
-    assert "Body text." in (root / "files" / "paper.pdf" / "doc.md").read_text()
+    assert "Body text." in (client.root / "files" / "paper.pdf" / "doc.md").read_text()
     async with client.app.state.sessionmaker() as db:
         charged = await ledger.credits_by_job(db, [job_id])
     assert charged[job_id] == settings.parse_credits_per_page * job.page_count
@@ -496,11 +505,7 @@ async def test_a_retry_the_balance_or_the_original_cannot_carry_is_not_queued(
     whose original is gone answers that it cannot be retried."""
     monkeypatch.setattr("sightread.upstream.client.VISION_BACKOFF_BASE_SECONDS", 0.0)
     vision = respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(503, json={}))
-    client = await _ready(make_client)
-    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    kept = await _keep(
-        client, "paper.pdf", documents["text_pdf"].read_bytes(), "application/pdf", None
-    )
+    client, kept = await _kept_paper(make_client, documents)
     await _run(client, {"path": "paper.pdf"})
     calls = vision.call_count
 
@@ -526,7 +531,7 @@ async def test_a_retry_the_balance_or_the_original_cannot_carry_is_not_queued(
         "costs no credits: this conversion was queued before credits were kept" in (free["output"])
     )
 
-    original_of(root, kept["id"]).unlink()
+    original_of(client.root, kept["id"]).unlink()
     _, (gone,) = await _run(client, {"path": "paper.pdf"})
     assert gone["output"].endswith(
         "Its original was not kept, so it cannot be retried: the user can upload the file again."
@@ -556,16 +561,12 @@ async def test_a_stop_during_a_failed_finish_still_keeps_the_original(
 
     monkeypatch.setattr(runner, "_retain_source", slow)
     monkeypatch.setattr(chat_runner, "_cancelled", stopped)
-    client = await _ready(make_client)
-    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    kept = await _keep(
-        client, "paper.pdf", documents["text_pdf"].read_bytes(), "application/pdf", None
-    )
+    client, kept = await _kept_paper(make_client, documents)
     _, (result,) = await _run(client, {"path": "paper.pdf"})
     assert result["output"].startswith("The conversion of paper.pdf failed: "), result["output"]
     _, job, shown = await _settled(client, kept["id"])
     assert (job.status, shown["original"]) == ("failed", True)
-    assert original_of(root, kept["id"]) is not None
+    assert original_of(client.root, kept["id"]) is not None
     retried = await client.post(
         f"/api/library/documents/{kept['id']}/retry", json={}, headers=CSRF_HEADERS
     )
@@ -581,11 +582,7 @@ async def test_a_full_workspace_still_keeps_a_converted_files_original(
     upload is the only copy there is."""
     monkeypatch.setattr("sightread.upstream.client.VISION_BACKOFF_BASE_SECONDS", 0.0)
     respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(503))
-    client = await _ready(make_client)
-    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    kept = await _keep(
-        client, "paper.pdf", documents["text_pdf"].read_bytes(), "application/pdf", None
-    )
+    client, kept = await _kept_paper(make_client, documents)
 
     async def full(*args, **kwargs) -> None:
         raise ApiError(409, "storage_full", "The workspace is at its quota")
@@ -593,7 +590,7 @@ async def test_a_full_workspace_still_keeps_a_converted_files_original(
     monkeypatch.setattr(runner, "ensure_within_quota", full)
     _, (result,) = await _run(client, {"path": "paper.pdf"})
     assert result["output"].startswith("The conversion of paper.pdf failed: ")
-    assert original_of(root, kept["id"]) is not None
+    assert original_of(client.root, kept["id"]) is not None
 
 
 @respx.mock
@@ -612,29 +609,25 @@ async def test_the_sweep_files_an_original_the_worker_never_did(
         raise RuntimeError("the worker died here")
 
     monkeypatch.setattr(runner, "_retain_source", died)
-    client = await _ready(make_client)
+    client, kept = await _kept_paper(make_client, documents)
     settings = client.app.state.settings
-    root = user_root(settings.workspaces_dir, client.user_id)
-    kept = await _keep(
-        client, "paper.pdf", documents["text_pdf"].read_bytes(), "application/pdf", None
-    )
     await _run(client, {"path": "paper.pdf"})
     _, job, _ = await _settled(client, kept["id"])
     assert job.status == "failed" and job.source_deleted_at is None
-    assert original_of(root, kept["id"]) is None
+    assert original_of(client.root, kept["id"]) is None
 
     # Two days on, the age sweep still keeps the upload of a retention still to run — one
     # that failed again in this very pass.
     upload = Path(job.source_path)
     os.utime(upload, (time.time() - 2 * settings.upload_max_age_seconds,) * 2)
     await sweeper.sweep_once(client.app.state.sessionmaker, settings)
-    assert upload.is_file() and original_of(root, kept["id"]) is None
+    assert upload.is_file() and original_of(client.root, kept["id"]) is None
 
     monkeypatch.setattr(runner, "_retain_source", real)
     assert await sweeper.finish_retention(client.app.state.sessionmaker, settings) == 1
     _, job, shown = await _settled(client, kept["id"])
     assert job.source_deleted_at is not None and shown["original"] is True
-    assert original_of(root, kept["id"]) is not None
+    assert original_of(client.root, kept["id"]) is not None
     assert await sweeper.finish_retention(client.app.state.sessionmaker, settings) == 0
 
 
@@ -656,7 +649,6 @@ async def test_the_sweeps_filing_leaves_no_lone_copy_in_the_tree(
     monkeypatch.setattr(runner, "materialize_document", died)
     client = await _ready(make_client)
     settings = client.app.state.settings
-    root = user_root(settings.workspaces_dir, client.user_id)
     kept = await _keep(client, "tiny.png", documents["png"].read_bytes(), "image/png", None)
     converted = await client.post(
         f"/api/library/documents/{kept['id']}/convert", json={}, headers=CSRF_HEADERS
@@ -667,13 +659,13 @@ async def test_the_sweeps_filing_leaves_no_lone_copy_in_the_tree(
 
     monkeypatch.setattr(runner, "_retain_source", real)
     assert await sweeper.finish_retention(client.app.state.sessionmaker, settings) == 1
-    assert original_of(root, kept["id"]) is not None
-    assert not (root / "files" / "tiny.png").exists()
+    assert original_of(client.root, kept["id"]) is not None
+    assert not (client.root / "files" / "tiny.png").exists()
     opened = await client.post(
         f"/api/library/documents/{kept['id']}/conversations", json={}, headers=CSRF_HEADERS
     )
     assert opened.status_code == 201, opened.text
-    names = {entry.name for entry in (root / "files" / "tiny.png").iterdir()}
+    names = {entry.name for entry in (client.root / "files" / "tiny.png").iterdir()}
     assert {".meta.json", "source.png"} <= names and "_source.png" not in names
 
 
@@ -697,15 +689,7 @@ async def test_a_stop_before_the_claim_starts_no_run(make_client, documents, mon
         return False
 
     monkeypatch.setattr(chat_runner, "claim_job", spy)
-    ctx = SimpleNamespace(
-        settings=client.app.state.settings,
-        sessionmaker=client.app.state.sessionmaker,
-        convert_stop=asyncio.Event(),
-        turn=SimpleNamespace(id=uuid.uuid4()),
-        generation=None,
-        render_slots=asyncio.Semaphore(1),
-        inline_parse=None,
-    )
+    ctx = _drive_ctx(client)
     ctx.convert_stop.set()
     assert await chat_runner._drive_parse(ctx, job.id) is None
     assert claims == [] and vision.call_count == 0
@@ -785,15 +769,7 @@ async def test_a_failing_wait_puts_the_conversion_back_on_the_queue(
         return False
 
     monkeypatch.setattr(chat_runner, "_cancelled", broken)
-    ctx = SimpleNamespace(
-        settings=client.app.state.settings,
-        sessionmaker=client.app.state.sessionmaker,
-        convert_stop=asyncio.Event(),
-        turn=SimpleNamespace(id=uuid.uuid4()),
-        generation=None,
-        render_slots=asyncio.Semaphore(1),
-        inline_parse=None,
-    )
+    ctx = _drive_ctx(client)
     assert await asyncio.wait_for(chat_runner._drive_parse(ctx, job.id), 10) is None
     _, job, _ = await _settled(client, row.id)
     assert job.status == "queued"

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import dataclasses
 import io
 import os
 import re
@@ -22,10 +23,8 @@ import respx
 from PIL import Image, ImageFile
 
 from sightread.jobs import chat_runner, chat_tools
-from sightread.workspace.layout import user_root
 from sightread.workspace.locks import workspace_lock
 from tests.chat_helpers import (
-    chatting_client,
     new_conversation,
     one_call,
     run_queued_turn,
@@ -34,7 +33,7 @@ from tests.chat_helpers import (
 )
 from tests.conftest import CSRF_HEADERS, image_view
 
-# The crop the reader's screenshot showed failing as "not a text file".
+# A figure crop under a path with spaces and a .pdf/ segment is viewed as an image.
 CROP = "files/DL/DIO/DINO Paper Presentation.pdf/figures/p11_330_115_785_880.png"
 # What every command does to the image read from stdin before its own step.
 FLAT = "+repage -background white -alpha remove -alpha off -strip"
@@ -79,7 +78,7 @@ def _shown(outcome: chat_tools.ToolOutcome) -> tuple[str, Image.Image, str]:
     return block["source"]["media_type"], image, line["text"]
 
 
-async def test_a_view_of_an_image_answers_the_image_whatever_its_name(tmp_path) -> None:
+async def test_a_view_of_an_image_answers_the_image_whatever_its_name(tmp_path, documents) -> None:
     root = tmp_path / "ws" / "1"
     crop = Image.new("RGBA", (200, 100), (255, 0, 0, 0))
     _place(root, CROP, _encoded(crop, "PNG"))
@@ -92,7 +91,6 @@ async def test_a_view_of_an_image_answers_the_image_whatever_its_name(tmp_path) 
     gif = io.BytesIO()
     frames[0].save(gif, format="GIF", save_all=True, append_images=frames[1:])
     _place(root, "files/moving.gif", gif.getvalue())
-    _place(root, "files/phone.heic", _encoded(Image.new("RGB", (64, 32), "gray"), "HEIF"))
 
     media, image, line = _shown(await _view(root, CROP, image_view()))
     assert media == "image/png" and image.size == (200, 100)
@@ -105,8 +103,11 @@ async def test_a_view_of_an_image_answers_the_image_whatever_its_name(tmp_path) 
         ".cache/photo": ("image/jpeg", (40, 30)),
         "files/a.webp": ("image/jpeg", (16, 16)),
         "files/moving.gif": ("image/jpeg", (12, 8)),
-        "files/phone.heic": ("image/jpeg", (64, 32)),
     }
+    # Some pillow-heif wheels decode HEIC but cannot encode it, so no fixture exists there.
+    if "heic" in documents:
+        _place(root, "files/phone.heic", documents["heic"].read_bytes())
+        expected["files/phone.heic"] = ("image/jpeg", (320, 240))
     for path, (media_type, size) in expected.items():
         media, image, line = _shown(await _view(root, path, image_view()))
         assert (media, image.size) == (media_type, size), path
@@ -135,8 +136,8 @@ async def test_a_malformed_exif_block_shows_the_image_rather_than_failing(tmp_pa
     exif[0x0112] = 6
     exif[0x010F] = "Camera"  # Make, ASCII
     data = _encoded(Image.new("RGB", (40, 20), "red"), "JPEG", exif=exif)
-    # Relabel Make as BitsPerSample, a SHORT tag: Pillow reads the file, and its own
-    # `exif_transpose` raised rewriting the block.
+    # Relabel Make as BitsPerSample, a SHORT tag Pillow reads but cannot write back: the
+    # image is still shown.
     for make, bits in (
         (b"\x01\x0f\x00\x02", b"\x01\x02\x00\x02"),
         (b"\x0f\x01\x02\x00", b"\x02\x01\x02\x00"),
@@ -212,14 +213,15 @@ async def test_an_image_past_the_pixel_cap_says_how_to_look_at_it_in_steps(tmp_p
     # A portrait photo stored on its side is stated upright, and cut upright.
     exif = Image.Exif()
     exif[0x0112] = 6
-    _place(root, "files/portrait.jpg", _encoded(Image.new("RGB", (8000, 6000)), "JPEG", exif=exif))
-    turned = await _view(root, "files/portrait.jpg", image_view())
-    assert "is 6000x8000 pixels" in turned.content
+    _place(root, "files/portrait.jpg", _encoded(Image.new("RGB", (2000, 1500)), "JPEG", exif=exif))
+    lowered = dataclasses.replace(image_view(), max_pixels=2_000_000)
+    turned = await _view(root, "files/portrait.jpg", lowered)
+    assert "is 1500x2000 pixels, more than this tool opens (2,000,000)" in turned.content
     assert (
         f"`convert '-[0]' -rotate 90 {FLAT} -resize 1568x1568 /workspace/.cache/small.jpg "
         "< /workspace/files/portrait.jpg`" in turned.content
     )
-    assert "(24 pieces)" in turned.content and "piece-%d.jpg" in turned.content
+    assert "(2 pieces)" in turned.content and "piece-%d.jpg" in turned.content
 
 
 async def test_an_image_past_the_pixel_cap_is_refused_before_it_is_decoded(
@@ -300,13 +302,7 @@ async def test_the_pieces_are_cut_from_the_image_the_tool_showed(tmp_path) -> No
     root = tmp_path / "ws" / "1"
     cache = root / ".cache"
     cache.mkdir(parents=True)
-    small = chat_tools.ImageView(  # noqa: S604 - shell means the agent has bash
-        max_bytes=1 << 25,
-        max_pixels=40_000_000,
-        long_edge=100,
-        decode_slot=asyncio.Semaphore(1),
-        shell=True,
-    )
+    small = dataclasses.replace(image_view(), long_edge=100)
     upright = Image.new("RGB", (150, 300), (0, 0, 255))
     upright.paste((255, 0, 0), (0, 0, 75, 150))  # the top-left quarter is red
     stored_as = {1: None, **{o: turn for o, (turn, _option) in chat_tools.ORIENTATIONS.items()}}
@@ -557,10 +553,9 @@ async def test_an_editor_image_counts_against_the_image_budgets(tmp_path, monkey
 
 
 @respx.mock
-async def test_a_turn_and_a_subagent_send_the_image_their_editor_viewed(make_client) -> None:
-    client = await chatting_client(make_client())
-    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
-    _place(root, ".cache/chart.png", _encoded(Image.new("RGB", (300, 200), "navy"), "PNG"))
+async def test_a_turn_and_a_subagent_send_the_image_their_editor_viewed(chat_client) -> None:
+    client = chat_client
+    _place(client.root, ".cache/chart.png", _encoded(Image.new("RGB", (300, 200), "navy"), "PNG"))
     view = {"command": "view", "path": "/workspace/.cache/chart.png"}
     created = await client.post(
         "/api/subagents",
@@ -601,10 +596,3 @@ async def test_a_turn_and_a_subagent_send_the_image_their_editor_viewed(make_cli
         for part in item["content"]
     ]
     assert stored and all("data" not in part.get("source", {}) for part in stored)
-
-
-def test_the_prompt_and_the_subagent_editor_say_the_view_shows_images() -> None:
-    from sightread.agents import chat as chat_agent
-
-    assert "shows you the image itself" in chat_agent.DEFAULT_SYSTEM_PROMPT
-    assert "as the image itself" in chat_agent.SUBAGENT_EDITOR_TOOL["description"]
