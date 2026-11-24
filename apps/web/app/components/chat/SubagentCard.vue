@@ -48,8 +48,7 @@ const meta = computed(() => {
     parts.push(labels.duration(elapsed))
   }
   if (card.status === 'running') {
-    const last = card.steps[card.steps.length - 1]
-    parts.push(last?.type === 'tool' && last.status === 'pending' ? labels.doing(last.step) : t('chat.thinkingNow'))
+    parts.push(labels.inFlight(card.steps))
   } else {
     parts.push(
       card.status === 'ok'

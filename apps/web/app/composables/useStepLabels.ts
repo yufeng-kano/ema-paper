@@ -150,8 +150,14 @@ export function useStepLabels() {
     return text.charAt(0).toUpperCase() + text.slice(1)
   }
 
-  /** The step in flight, as the live group's summary says it. */
-  function doing(step: Step): string {
+  /** What a live run is doing now, as its group's or subagent card's summary says it: the
+   *  step in flight when its last is a tool call still pending, else thinking. */
+  function inFlight(steps: readonly StepItem[]): string {
+    const last = steps[steps.length - 1]
+    if (last?.type !== 'tool' || last.status !== 'pending') {
+      return t('chat.thinkingNow')
+    }
+    const step = last.step
     return t(`chat.doing.${step.kind}`, { target: target(step).text, page: step.page ?? '?' })
   }
 
@@ -160,5 +166,5 @@ export function useStepLabels() {
     return minutes ? t('chat.durationMinutes', { m: minutes, s: seconds }) : t('chat.durationSeconds', { s: seconds })
   }
 
-  return { icon, ownFile, target, verb, detail, summary, doing, duration }
+  return { icon, ownFile, target, verb, detail, summary, inFlight, duration }
 }

@@ -16,7 +16,7 @@
 import { listAgents, type Memory, type MemoryKind } from '~/lib/api'
 import { formatShortDateTime } from '~/lib/format'
 import { parseResultMarkdown, type ResultBlock } from '~/lib/markdown'
-import { modalPanelKey } from '~/lib/menu'
+import { modalPanelKey, placeCard } from '~/lib/menu'
 import { SETTINGS_QUERY } from '~/lib/settings'
 import { memoryLineState, type ContextCardView } from '~/lib/thread'
 
@@ -154,10 +154,6 @@ watch(
 
 // --- floating ----------------------------------------------------------------------------
 
-/** How far it keeps from the control and from the window's edges. */
-const GAP = 6
-const MARGIN = 8
-
 /** The nearest box that scrolls the control: the thread. */
 function scrollerOf(element: HTMLElement): HTMLElement | null {
   for (let node = element.parentElement; node; node = node.parentElement) {
@@ -188,14 +184,12 @@ function place() {
   }
   // The layout box, not the drawn one: the opening animation's scale would shrink it, and
   // the card would be placed by a size it does not have.
-  const size = { width: element.offsetWidth, height: element.offsetHeight }
-  const roomBelow = window.innerHeight - MARGIN - (at.bottom + GAP)
-  const y =
-    size.height <= roomBelow || at.top - GAP - size.height < MARGIN
-      ? Math.min(at.bottom + GAP, Math.max(MARGIN, window.innerHeight - MARGIN - size.height))
-      : at.top - GAP - size.height
-  const x = Math.max(MARGIN, Math.min(at.left, window.innerWidth - MARGIN - size.width))
-  position.value = { x, y }
+  position.value = placeCard(
+    at,
+    { width: element.offsetWidth, height: element.offsetHeight },
+    { width: window.innerWidth, height: window.innerHeight },
+    { prefer: 'below' },
+  )
 }
 
 /** Opened from another control while open: the panel swaps the view, not the card. */
@@ -220,24 +214,8 @@ function onKeydown(event: KeyboardEvent) {
   }
 }
 
-/** The control that opened it is left alone: its own click closes the card. */
-function outside(target: EventTarget | null): boolean {
-  return target instanceof Node && !card.value?.contains(target) && !props.anchor.contains(target)
-}
+const floating = useFloatingCard({ card, anchor: () => props.anchor, place, close })
 
-function onPointerdown(event: PointerEvent) {
-  if (outside(event.target)) {
-    close()
-  }
-}
-
-function onFocusout(event: FocusEvent) {
-  if (outside(event.relatedTarget)) {
-    close()
-  }
-}
-
-let observer: ResizeObserver | null = null
 /** Where the control stood when the card was last placed, and the frame that checks again. */
 let anchorAt = ''
 let frame = 0
@@ -259,20 +237,13 @@ onMounted(() => {
   place()
   card.value?.focus()
   // The instructions arrive after it opens, and the memories may be read again under it.
-  observer = new ResizeObserver(() => place())
-  if (card.value) {
-    observer.observe(card.value)
-  }
+  floating.start()
   frame = requestAnimationFrame(follow)
-  window.addEventListener('pointerdown', onPointerdown, true)
-  window.addEventListener('resize', place)
 })
 
 onBeforeUnmount(() => {
-  observer?.disconnect()
+  floating.stop()
   cancelAnimationFrame(frame)
-  window.removeEventListener('pointerdown', onPointerdown, true)
-  window.removeEventListener('resize', place)
   // Back to the control, unless the reader has already put focus somewhere else — without
   // scrolling the thread back to a control the reader scrolled away from.
   const active = document.activeElement
@@ -292,7 +263,7 @@ onBeforeUnmount(() => {
       :aria-labelledby="titleId"
       :style="{ left: `${position.x}px`, top: `${position.y}px` }"
       @keydown="onKeydown"
-      @focusout="onFocusout"
+      @focusout="floating.onFocusout"
     >
       <p :id="titleId" class="card-title">{{ title }}</p>
 

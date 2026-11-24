@@ -40,9 +40,7 @@ const labels = useStepLabels()
 const label = computed(() => {
   const counted = props.steps.filter((step) => step.type !== 'note').length
   if (props.live) {
-    const last = props.steps[props.steps.length - 1]
-    const action =
-      last?.type === 'tool' && last.status === 'pending' ? labels.doing(last.step) : t('chat.thinkingNow')
+    const action = labels.inFlight(props.steps)
     return counted ? t('chat.liveStep', { action, n: counted }) : action
   }
   // A group of notes alone is the model thinking before it answered.

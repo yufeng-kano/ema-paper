@@ -41,7 +41,7 @@ import {
 import { formatBytes } from '~/lib/format'
 import { libraryMessage, type LibraryPlace } from '~/lib/library'
 import { inlinePlain, type OutlineEntry } from '~/lib/markdown'
-import type { MenuItem, Point } from '~/lib/menu'
+import type { MenuItem } from '~/lib/menu'
 
 const props = defineProps<{
   /** A turn is in flight: the composer waits, and Stop is the one control. */
@@ -266,49 +266,27 @@ function showPicked() {
 // --- *Add context*: the current section, then every heading --------------------------------
 
 const addButton = ref<HTMLButtonElement | null>(null)
-const addMenu = ref<Point | null>(null)
-const addMenuFromKey = ref(false)
 /** The section the document was at when the menu opened: scrolling with the menu open
  *  closes it, so this is the one the menu offers. */
 const menuCurrent = ref<OutlineEntry | null>(null)
-/** The event that last closed the menu, if one did. */
-let addMenuClosedBy: Event | null = null
-/** The press now on **+** is the one that closed the menu (a press outside it, caught
- *  first): that press's click must not open it again. A pick, Escape or a press elsewhere
- *  leaves the next press free. */
-let addPressClosedMenu = false
+const {
+  at: addMenu,
+  fromKey: addMenuFromKey,
+  onPointerdown: onAddPointerdown,
+  toggle: toggleAddMenu,
+  close: closeAddMenu,
+} = useMenuButton(addButton, {
+  onOpen: () => {
+    menuCurrent.value = props.currentSection()
+  },
+  // The menu gives focus back to what had it, inside the field.
+  onClose: expectFocusReturn,
+})
 
 /** A subsection is set in by a space as wide as the type, so the outline reads as one. A
  *  heading longer than the menu is cut by the menu, with an ellipsis; the row's title and
  *  the chip it adds say it whole. */
 const SUBSECTION_INDENT = ' '
-
-function onAddPointerdown(event: PointerEvent) {
-  addPressClosedMenu = addMenuClosedBy === event
-}
-
-function toggleAddMenu(event: MouseEvent) {
-  // A click the keyboard made carries no pointer detail, and no press came before it.
-  const fromKey = event.detail === 0
-  if (addMenu.value || (addPressClosedMenu && !fromKey)) {
-    addPressClosedMenu = false
-    addMenu.value = null
-    return
-  }
-  const box = addButton.value?.getBoundingClientRect()
-  addMenuFromKey.value = fromKey
-  menuCurrent.value = props.currentSection()
-  // Over the button, ending just above it: the composer sits at the foot of the column, and
-  // a menu opened down would cover the control and the draft.
-  addMenu.value = box ? { x: box.left, y: box.top - 4 } : { x: 0, y: 0 }
-}
-
-function closeAddMenu(cause?: Event) {
-  addMenu.value = null
-  addMenuClosedBy = cause ?? null
-  // The menu gives focus back to what had it, inside the field.
-  expectFocusReturn()
-}
 
 const addMenuItems = computed<MenuItem[]>(() => {
   const added = new Set(addedSections.value.map((section) => section.key))

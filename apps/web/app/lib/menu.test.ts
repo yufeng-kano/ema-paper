@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { heightAbove, openSide, placeMenu, placeSubmenu } from './menu'
+import { heightAbove, openSide, placeCard, placeMenu, placeSubmenu } from './menu'
 
 const viewport = { width: 1000, height: 800 }
 const menu = { width: 200, height: 300 }
@@ -93,5 +93,47 @@ describe('placeSubmenu', () => {
 
   it('stays inside the viewport vertically', () => {
     expect(placeSubmenu({ ...row, top: 700, bottom: 730 }, parent, sub, viewport)).toEqual({ x: 304, y: 532 })
+  })
+})
+
+describe('placeCard', () => {
+  const card = { width: 300, height: 200 }
+  const above = { prefer: 'above' } as const
+  const below = { prefer: 'below' } as const
+
+  it('opens over a control where it prefers that side and fits', () => {
+    expect(placeCard({ left: 100, top: 500, bottom: 520 }, card, viewport, above)).toEqual({ x: 100, y: 294 })
+    // Exactly the room: 214 - 6 - 8 = 200.
+    expect(placeCard({ left: 100, top: 214, bottom: 234 }, card, viewport, above)).toEqual({ x: 100, y: 8 })
+  })
+
+  it('opens under a control it prefers to stand over when there is no room over it', () => {
+    expect(placeCard({ left: 100, top: 150, bottom: 170 }, card, viewport, above)).toEqual({ x: 100, y: 176 })
+  })
+
+  it('opens under a control where it prefers that side and fits', () => {
+    // Room over it too: the preferred side wins.
+    expect(placeCard({ left: 100, top: 400, bottom: 420 }, card, viewport, below)).toEqual({ x: 100, y: 426 })
+  })
+
+  it('opens over a control it prefers to hang under when only the room over it is enough', () => {
+    expect(placeCard({ left: 100, top: 700, bottom: 720 }, card, viewport, below)).toEqual({ x: 100, y: 494 })
+  })
+
+  it('opens under, moved up inside the window, when neither side has room', () => {
+    const short = { width: 1000, height: 300 }
+    // 300 - 8 - 200 = 92: up from 126, as far as the window's bottom margin needs.
+    expect(placeCard({ left: 100, top: 100, bottom: 120 }, card, short, above)).toEqual({ x: 100, y: 92 })
+    expect(placeCard({ left: 100, top: 100, bottom: 120 }, card, short, below)).toEqual({ x: 100, y: 92 })
+    // A window shorter than the card: the top margin wins.
+    expect(placeCard({ left: 100, top: 50, bottom: 70 }, card, { width: 1000, height: 150 }, below)).toEqual({
+      x: 100,
+      y: 8,
+    })
+  })
+
+  it('keeps its left edge inside the window', () => {
+    expect(placeCard({ left: 900, top: 500, bottom: 520 }, card, viewport, above)).toEqual({ x: 692, y: 294 })
+    expect(placeCard({ left: 2, top: 100, bottom: 120 }, card, viewport, below)).toEqual({ x: 8, y: 126 })
   })
 })
