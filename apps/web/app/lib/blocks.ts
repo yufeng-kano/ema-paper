@@ -13,6 +13,7 @@ import {
   isHeading,
   locateSources,
   sectionExtent,
+  type BlockAt,
   type InlineOptions,
   type OutlineEntry,
   type PlacedBlock,
@@ -22,6 +23,12 @@ import {
 /** A block's place as the rendered document addresses it: `page-index`. */
 export function blockKey(at: { page: number; index: number }): string {
   return `${at.page}-${at.index}`
+}
+
+/** The place a key names; null for a string `blockKey` never makes. */
+export function parseBlockKey(key: string): BlockAt | null {
+  const match = /^(\d+)-(\d+)$/.exec(key)
+  return match ? { page: Number(match[1]), index: Number(match[2]) } : null
 }
 
 // --- names ------------------------------------------------------------------------------------

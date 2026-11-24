@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   UndoHistory,
   applySpans,
+  blockKey,
   blockName,
   blocksInRanges,
   changedBlocks,
@@ -15,6 +16,7 @@ import {
   followFolds,
   hashText,
   moveTarget,
+  parseBlockKey,
   readFoldMemory,
   rememberFolds,
   restoredRanges,
@@ -205,10 +207,23 @@ describe('followFolds', () => {
   })
 })
 
+describe('parseBlockKey', () => {
+  it('reads back the place blockKey wrote', () => {
+    expect(parseBlockKey(blockKey({ page: 3, index: 12 }))).toEqual({ page: 3, index: 12 })
+    expect(parseBlockKey(blockKey({ page: 0, index: 0 }))).toEqual({ page: 0, index: 0 })
+  })
+
+  it('is null for a string blockKey never makes', () => {
+    for (const key of ['', 'a-b', '1', '1-2-3', '-1-2', '1.5-2', '1-']) {
+      expect(parseBlockKey(key)).toBeNull()
+    }
+  })
+})
+
 describe('foldsOver', () => {
   it('names every collapsed section holding a block, not the heading’s own', () => {
     const collapsed = new Set(['1-intro', '11-sub'])
-    const at = (key: string) => placed.findIndex((entry) => `${entry.page}-${entry.index}` === key)
+    const at = (key: string) => placed.findIndex((entry) => blockKey(entry) === key)
     expect(foldsOver(placed, outline, collapsed, [at('0-4')])).toEqual(['1-intro', '11-sub'])
     expect(foldsOver(placed, outline, collapsed, [at('0-3')])).toEqual(['1-intro'])
     expect(foldsOver(placed, outline, collapsed, [at('1-1'), at('0-0')])).toEqual([])

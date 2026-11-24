@@ -2,6 +2,7 @@
 // Both script blocks compile into one module, so the imports belong to the block that comes
 // first — the whole component reads them, `<script setup>` included.
 import type { ComponentPublicInstance } from 'vue'
+import type { BlockHandleState } from '~/components/ViewerBlockHandle.vue'
 import type { ToolbarRect, ToolbarSkill } from '~/components/ViewerToolbar.vue'
 import {
   ApiRequestError,
@@ -14,6 +15,7 @@ import {
   type JobResult,
   type Skill,
 } from '~/lib/api'
+import { Autosave, type SaveState } from '~/lib/autosave'
 import {
   blockKey,
   blockName,
@@ -25,6 +27,7 @@ import {
   foldsOver,
   moveTarget,
   outlinePlace,
+  parseBlockKey,
   readFoldMemory,
   rememberFolds,
   rowsOf,
@@ -98,8 +101,6 @@ const JOINABLE = new Set<ResultBlock['kind']>(['p', 'h2', 'h3'])
 /** How long after the last change a save is sent (docs/web.md § Editing). */
 const SAVE_DEBOUNCE_MS = 1200
 
-type SaveState = 'saved' | 'editing' | 'saving' | 'failed'
-
 /** Where the collapsed headings are remembered in the browser, per document (docs/web.md
  *  § Result viewer, *Outline, collapse and the way back*). */
 const FOLDS_KEY = 'sightread.viewer.folds'
@@ -112,7 +113,6 @@ const NOTE_UNDO_MS = 8000
 /** How long a keyboard selection rests before the selection toolbar shows. */
 const TOOLBAR_SETTLE_MS = 300
 
-/** A block drag's own type: what tells it from text or files dragged over the pane. */
 /** How near the pane's top or bottom a drag scrolls it, and how far each step goes. */
 const AUTOSCROLL_EDGE_PX = 48
 const AUTOSCROLL_STEP_PX = 16
@@ -180,13 +180,13 @@ type Slot = { element: Element | null; atom: boolean }
  * so does a failed parse, with the failure said over its original and the retry there
  * (docs/web.md § Files, *A failed parse opens on its original*).
  *
- * It takes a title and a job error rather than the library's row, which is not this
- * component's business — it renders a result. Files also hands it the document's id, which
- * is what turns the viewer into an editor: the markdown tab then shows the workspace copy
- * (`GET …/content`, docs/web.md § Editing) rather than the parse result, every block opens
- * as its source on a click, saves are automatic, and the notes and agent columns become
- * available. Until that copy has loaded, or when it cannot be read, the viewer is read-only,
- * with the reading aids alone.
+ * It takes a title rather than the library's row, which is not this component's business —
+ * it renders a result. Files also hands it the document's id, which is what turns the viewer
+ * into an editor: the markdown tab then shows the workspace copy (`GET …/content`,
+ * docs/web.md § Editing) rather than the parse result, every block opens as its source on a
+ * click, saves are automatic, and the notes and agent columns become available. Until that
+ * copy has loaded, or when it cannot be read, the viewer is read-only, with the reading aids
+ * alone.
  *
  * The markdown tab is one continuous scroll, and **the document carries no page labels and
  * the viewer no page navigation**: what a reader checks is the transcription, and which page
@@ -204,77 +204,55 @@ type Slot = { element: Element | null; atom: boolean }
  * whatever room they leave.
  *
  * Every rule here that can be pure is in `app/lib` — the blocks' names, folds, rows, moves,
- * undo (`blocks.ts`), excerpts (`excerpts.ts`), conversions (`richdoc.ts`) — and this
- * component measures, draws and routes events (docs/web.md § Result viewer).
+ * undo (`blocks.ts`), excerpts (`excerpts.ts`), conversions (`richdoc.ts`), the autosave
+ * (`autosave.ts`) — and this component measures, draws and routes events (docs/web.md
+ * § Result viewer).
  */
-const props = withDefaults(
-  defineProps<{
-    /** The document's name — the dialog's heading and its accessible name. */
-    title: string
-    result: JobResult | null
-    /** Why the parse itself failed, from the job. Outranks everything below it. */
-    error?: string | null
-    /** The result is still in flight, or failed — the body says so instead of the document. */
-    pending?: boolean
-    /** Why fetching the result failed, from the client. */
-    errorMessage?: string | null
-    /** Where this caller's figure crops live (`…/figures`); null hides images entirely. */
-    figureBase?: string | null
-    /** Where the document's inserted images live (`…/images`), on Files: what lets a picture
-     *  be drawn and inserted (docs/web.md § Editing, *Images*). */
-    imageBase?: string | null
-    /** The library document, when there is one: what makes the viewer editable. */
-    documentId?: number | null
-    /** A block link's anchor (`/files?document=…&block=…`): followed once the copy loads. */
-    initialBlock?: string | null
-    /** A markdown document: no parse result to wait for, its copy is the document
-     *  (docs/web.md § Result viewer). */
-    markdownDocument?: boolean
-    /** Said under the header while the document is being re-converted: what happens to the
-     *  version open now (docs/web.md § Files). */
-    reconvertNote?: string | null
-    /** The view the viewer opens on (docs/web.md § Result viewer, *Original and Markdown*):
-     *  what the row remembers, or the reader's default — Files decides (`initialView`). */
-    initialView?: DocumentView
-    /** The original, for the Original view: where its bytes are read from and what it is —
-     *  a PDF in a frame, an image as a picture. Null where none is kept: *Original* in the
-     *  menu is then disabled, with the reason under it. */
-    original?: { url: string; kind: 'pdf' | 'image' } | null
-    /** False for a PDF or an image not yet converted: the viewer has its original alone,
-     *  the More menu holds `facts` instead of the parse's, and *Markdown* there asks for the
-     *  conversion (`convert`) rather than switching. */
-    converted?: boolean
-    /** The row's facts for the More menu while the file is not converted: kind, size, date
-     *  added, location. */
-    facts?: MenuFact[]
-    /** Whether a file not yet converted can be — the parse agent accepts PDFs and JPEG, PNG,
-     *  WebP and HEIC images (`accepted_media_types`); false leaves *Markdown* disabled with
-     *  the reason under it. */
-    convertible?: boolean
-    /** A failed parse (docs/web.md § Files, *A failed parse opens on its original*): how many
-     *  pages a retry sends — 0 when none is missing, as after a failed format check — and
-     *  where its original downloads from. The original shows alone, the failure is said over
-     *  it with the retry, and *Markdown* is disabled with the reason under it. Null for
-     *  anything else. */
-    failure?: { pages: number; download: string } | null
-  }>(),
-  {
-    error: null,
-    errorMessage: null,
-    figureBase: null,
-    imageBase: null,
-    documentId: null,
-    initialBlock: null,
-    markdownDocument: false,
-    reconvertNote: null,
-    initialView: 'markdown',
-    original: null,
-    converted: true,
-    facts: () => [],
-    convertible: true,
-    failure: null,
-  },
-)
+const props = defineProps<{
+  /** The document's name — the dialog's heading and its accessible name. */
+  title: string
+  result: JobResult | null
+  /** The result is still in flight, or failed — the body says so instead of the document. */
+  pending: boolean
+  /** Why fetching the result failed, from the client. */
+  errorMessage: string | null
+  /** Where the document's figure crops live (`…/figures`); null hides images entirely. */
+  figureBase: string | null
+  /** Where the document's inserted images live (`…/images`): what lets a picture be drawn
+   *  and inserted (docs/web.md § Editing, *Images*). */
+  imageBase: string
+  /** The library document, null for a file not yet converted and a failed parse: what
+   *  makes the viewer editable. */
+  documentId: number | null
+  /** A block link's anchor (`/files?document=…&block=…`): followed once the copy loads. */
+  initialBlock: string | null
+  /** A markdown document: no parse result to wait for, its copy is the document
+   *  (docs/web.md § Result viewer). */
+  markdownDocument: boolean
+  /** Said under the header while the document is being re-converted: what happens to the
+   *  version open now (docs/web.md § Files). */
+  reconvertNote: string | null
+  /** The view the viewer opens on (docs/web.md § Result viewer, *Original and Markdown*):
+   *  what the row remembers, or the reader's default — Files decides (`initialView`). */
+  initialView: DocumentView
+  /** The original, for the Original view: where its bytes are read from and what it is —
+   *  a PDF in a frame, an image as a picture. Null where none is kept: *Original* in the
+   *  menu is then disabled, with the reason under it. */
+  original: { url: string; kind: 'pdf' | 'image' } | null
+  /** The row's facts for the More menu while the file is not converted: kind, size, date
+   *  added, location. */
+  facts: MenuFact[]
+  /** Whether a file not yet converted can be — the parse agent accepts PDFs and JPEG, PNG,
+   *  WebP and HEIC images (`accepted_media_types`); false leaves *Markdown* disabled with
+   *  the reason under it. */
+  convertible: boolean
+  /** A failed parse (docs/web.md § Files, *A failed parse opens on its original*): how many
+   *  pages a retry sends — 0 when none is missing, as after a failed format check — and
+   *  where its original downloads from. The original shows alone, the failure is said over
+   *  it with the retry, and *Markdown* is disabled with the reason under it. Null for
+   *  anything else. */
+  failure: { pages: number; download: string } | null
+}>()
 
 const emit = defineEmits<{
   close: []
@@ -295,11 +273,20 @@ const { apple, label: keyLabel, matches } = useShortcuts()
 const auth = useAuth()
 const { notesOpen, agentOpen, chosenWidth, chooseWidth, paperMargin } = useViewerLayout()
 
+/** False for a PDF or an image not yet converted and for a failed parse — the rows Files
+ *  hands no document id: the viewer has the original alone, the More menu holds `facts`
+ *  instead of the parse's, and *Markdown* there asks for the conversion (`convert`) rather
+ *  than switching. */
+const converted = computed(() => props.documentId !== null)
+
 /** The view: the document, or the original (docs/web.md § Result viewer, *Original and
- *  Markdown*) — the latter only where there is one to show, and never for a block link,
- *  which names a place in the document. */
+ *  Markdown*) — the latter only where there is one to show. A file not converted has its
+ *  original alone; a converted document opens on Markdown for a block link, which names a
+ *  place in it. */
 const tab = ref<DocumentView>(
-  props.original && (props.failure || (props.initialView === 'original' && !props.initialBlock)) ? 'original' : 'markdown',
+  props.original && (!converted.value || (props.initialView === 'original' && !props.initialBlock))
+    ? 'original'
+    : 'markdown',
 )
 
 /** A running job's snapshot: pages keep arriving under this one (docs/api.md § Partial). */
@@ -326,7 +313,7 @@ const editable = computed(() => props.documentId !== null && contentLoaded.value
 const contentWanted = computed(
   () =>
     props.documentId !== null &&
-    (props.markdownDocument || (props.result !== null && !partial.value && !props.error)),
+    (props.markdownDocument || (props.result !== null && !partial.value)),
 )
 
 let contentSeq = 0
@@ -368,7 +355,7 @@ async function loadContent(replaceDirty: Replace = false) {
     // `failed` is unsaved work too: the text is still the reader's and its next save
     // retries it, so only an explicit replacement may overwrite it.
     if (takeMarkdown || (saveState.value === 'saved' && !dirtyEditor)) {
-      reloadAfterSave = false
+      contentSaves.reloadAfterSave = false
       // A block editor open across a forced replacement is closed, its draft dropped:
       // the block it was editing may no longer sit at those indices, and a commit
       // against the fresh text would land on whatever does now.
@@ -389,10 +376,10 @@ async function loadContent(replaceDirty: Replace = false) {
       // The save in flight was made against an older revision than what was just read:
       // its answer settles the viewer on a revision the disk has moved past, and nothing
       // after it reloads. So this reload is repeated once the save has settled.
-      reloadAfterSave = true
+      contentSaves.reloadAfterSave = true
     }
     if (takeNotes || notesState.value === 'saved') {
-      reloadNotesAfterSave = false
+      notesSaves.reloadAfterSave = false
       if (content.notes !== notes.value) {
         undo.clear('notes')
       }
@@ -400,7 +387,7 @@ async function loadContent(replaceDirty: Replace = false) {
       notesRevision.value = content.notes_revision
       notesState.value = 'saved'
     } else if (notesState.value === 'saving') {
-      reloadNotesAfterSave = true
+      notesSaves.reloadAfterSave = true
     }
     contentLoaded.value = true
   } catch (error) {
@@ -438,107 +425,56 @@ const pageBlocks = computed(() =>
 
 const saveState = ref<SaveState>('saved')
 const saveError = ref<string | null>(null)
-let saveTimer: ReturnType<typeof setTimeout> | null = null
-/** The save in flight, if any: one at a time. */
-let saving: Promise<void> | null = null
-/** A save asked for while one was in flight, sent once it settles. */
-let saveAgain = false
-/** How many saves met a 409: a sending ask goes only when none did while it waited. */
-let contentConflicts = 0
-/** A reload that arrived while a save was in flight, to be made again after it. */
-let reloadAfterSave = false
+const notesState = ref<SaveState>('saved')
+const notesError = ref<string | null>(null)
 
-function scheduleSave() {
-  saveState.value = 'editing'
-  if (saveTimer !== null) {
-    clearTimeout(saveTimer)
-  }
-  saveTimer = setTimeout(() => void saveContent(), SAVE_DEBOUNCE_MS)
+/** Only a `revision_conflict` 409 reloads: one for a workspace that is recovering, or a
+ *  revision that could not be recorded, leaves the draft unsaved, the reader's to retry. */
+function isRevisionConflict(error: unknown): boolean {
+  return error instanceof ApiRequestError && error.type === 'revision_conflict'
 }
 
-/**
- * One save at a time. A change made while one is in flight is sent after it, from the
- * revision that save produced — never from the one it was made against, which is stale
- * the moment the first save lands. The promise settles with the save in flight.
- */
-function saveContent(): Promise<void> {
-  const id = props.documentId
-  if (id === null) {
-    return Promise.resolve()
-  }
-  if (saving) {
-    saveAgain = true
-    return saving
-  }
-  if (saveTimer !== null) {
-    clearTimeout(saveTimer)
-    saveTimer = null
-  }
-  saving = writeContent(id)
-  return saving
-}
-
-async function writeContent(id: number) {
-  saveState.value = 'saving'
-  saveError.value = null
+/** The document's saves (`app/lib/autosave.ts`). */
+const contentSaves = new Autosave({
+  state: saveState,
+  error: saveError,
+  revision,
+  documentId: () => props.documentId,
   // The open block's draft goes too: a reader can type in one block for minutes without
   // leaving it, and a reload in that time must not lose it.
-  const snapshot = documentWithDraft()
-  try {
-    const saved = await putDocumentContent(id, { markdown: snapshot, base_revision: revision.value })
-    revision.value = saved.revision
-    if (documentWithDraft() === snapshot) {
-      saveState.value = 'saved'
-    } else if (saveAgain) {
-      saveState.value = 'editing'
-    } else {
-      scheduleSave()
-    }
-  } catch (error) {
-    if (error instanceof ApiRequestError && error.type === 'revision_conflict') {
-      // Another tab, or the agent: what is on disk wins, and the reader is told. Only
-      // this 409: one for a workspace that is recovering, or a revision that could not
-      // be recorded, left the draft unsaved, and it stays the reader's to retry.
-      contentConflicts += 1
-      saveState.value = 'saved'
-      notice.value = t('viewer.changedUnderneath')
-      // Only the file that conflicted; an unsaved notes draft is still the reader's.
-      await loadContent('markdown')
-    } else {
-      saveState.value = 'failed'
-      saveError.value = await resolve(error)
-      retryAfterClose('markdown', () => saveContent())
-    }
-  } finally {
-    saving = null
-    if (reloadAfterSave) {
-      reloadAfterSave = false
-      void loadContent()
-    }
-    if (saveAgain) {
-      saveAgain = false
-      if (saveState.value === 'editing') {
-        void saveContent()
-      }
-    }
-  }
-}
+  snapshot: documentWithDraft,
+  put: (id, text, base) => putDocumentContent(id, { markdown: text, base_revision: base }),
+  isConflict: isRevisionConflict,
+  // Another tab, or the agent: what is on disk wins, and the reader is told — only the file
+  // that conflicted reloads; an unsaved notes draft is still the reader's.
+  onConflict: async () => {
+    notice.value = t('viewer.changedUnderneath')
+    await loadContent('markdown')
+  },
+  describe: resolve,
+  onFailure: () => retryAfterClose('markdown', () => contentSaves.save()),
+  reload: () => void loadContent(),
+  delay: SAVE_DEBOUNCE_MS,
+})
 
-/** Waits for the document's saves to settle: true once what the reader sees is saved and no
- *  save met a 409 meanwhile. */
-async function settleContent(): Promise<boolean> {
-  const conflicts = contentConflicts
-  for (let round = 0; round < 5; round += 1) {
-    if (saveState.value === 'saved' && !saving) {
-      return contentConflicts === conflicts
-    }
-    if (saveState.value === 'failed') {
-      return false
-    }
-    await saveContent()
-  }
-  return false
-}
+/** The notes' saves, the same machine over the other file. */
+const notesSaves = new Autosave({
+  state: notesState,
+  error: notesError,
+  revision: notesRevision,
+  documentId: () => props.documentId,
+  snapshot: () => notes.value,
+  put: (id, text, base) => putDocumentNotes(id, { text, base_revision: base }),
+  isConflict: isRevisionConflict,
+  onConflict: async () => {
+    notice.value = t('viewer.notesChanged')
+    await loadContent('notes')
+  },
+  describe: resolve,
+  onFailure: () => retryAfterClose('notes', () => notesSaves.save()),
+  reload: () => void loadContent(),
+  delay: SAVE_DEBOUNCE_MS,
+})
 
 let closed = false
 const retriedAfterClose = { markdown: false, notes: false }
@@ -560,115 +496,30 @@ function retryAfterClose(file: 'markdown' | 'notes', save: () => Promise<void>) 
 function applyDocument(next: string) {
   // From the file as the action writes it: a copy spaced otherwise would make the first
   // step span the whole file, and its undo select every block (docs/web.md § Editing).
-  undo.record('document', serializeDocument(parseResultMarkdown(markdown.value)), next)
+  // `pages` is that file parsed whenever a block action can run: the copy is editable.
+  undo.record('document', serializeDocument(pages.value), next)
   markdown.value = next
   saveState.value = 'editing'
-  void saveContent()
-}
-
-// --- notes ---------------------------------------------------------------------------
-
-const notesState = ref<SaveState>('saved')
-const notesError = ref<string | null>(null)
-let notesTimer: ReturnType<typeof setTimeout> | null = null
-let savingNotes: Promise<void> | null = null
-let saveNotesAgain = false
-let notesConflicts = 0
-let reloadNotesAfterSave = false
-
-function scheduleNotesSave() {
-  notesState.value = 'editing'
-  if (notesTimer !== null) {
-    clearTimeout(notesTimer)
-  }
-  notesTimer = setTimeout(() => void saveNotes(), SAVE_DEBOUNCE_MS)
-}
-
-function saveNotes(): Promise<void> {
-  const id = props.documentId
-  if (id === null) {
-    return Promise.resolve()
-  }
-  if (savingNotes) {
-    saveNotesAgain = true
-    return savingNotes
-  }
-  if (notesTimer !== null) {
-    clearTimeout(notesTimer)
-    notesTimer = null
-  }
-  savingNotes = writeNotes(id)
-  return savingNotes
-}
-
-async function writeNotes(id: number) {
-  notesState.value = 'saving'
-  notesError.value = null
-  const snapshot = notes.value
-  try {
-    const saved = await putDocumentNotes(id, { text: snapshot, base_revision: notesRevision.value })
-    notesRevision.value = saved.revision
-    if (notes.value === snapshot) {
-      notesState.value = 'saved'
-    } else if (saveNotesAgain) {
-      notesState.value = 'editing'
-    } else {
-      scheduleNotesSave()
-    }
-  } catch (error) {
-    if (error instanceof ApiRequestError && error.type === 'revision_conflict') {
-      notesConflicts += 1
-      notesState.value = 'saved'
-      notice.value = t('viewer.notesChanged')
-      await loadContent('notes')
-    } else {
-      notesState.value = 'failed'
-      notesError.value = await resolve(error)
-      retryAfterClose('notes', () => saveNotes())
-    }
-  } finally {
-    savingNotes = null
-    if (reloadNotesAfterSave) {
-      reloadNotesAfterSave = false
-      void loadContent()
-    }
-    if (saveNotesAgain) {
-      saveNotesAgain = false
-      if (notesState.value === 'editing') {
-        void saveNotes()
-      }
-    }
-  }
-}
-
-async function settleNotes(): Promise<boolean> {
-  const conflicts = notesConflicts
-  for (let round = 0; round < 5; round += 1) {
-    if (notesState.value === 'saved' && !savingNotes) {
-      return notesConflicts === conflicts
-    }
-    if (notesState.value === 'failed') {
-      return false
-    }
-    await saveNotes()
-  }
-  return false
+  void contentSaves.save()
 }
 
 /** What an ask that sends waits for: the open editor written back, and both files saved
- *  (docs/web.md § The agent panel, *An ask that sends waits for the save*). */
+ *  with no 409 meanwhile (docs/web.md § The agent panel, *An ask that sends waits for the
+ *  save*). */
 async function flushSaves(): Promise<boolean> {
   commitEdit()
-  const [content, notesSaved] = await Promise.all([settleContent(), settleNotes()])
+  const [content, notesSaved] = await Promise.all([contentSaves.settle(), notesSaves.settle()])
   return content && notesSaved
 }
+
+// --- notes ---------------------------------------------------------------------------
 
 /** The notes editor's change: the file's new markdown, saved on the debounce. Typing is not
  *  a block action, so every undo step on the notes is stale. */
 function onNotesChange(markdown: string) {
   notes.value = markdown
   undo.clear('notes')
-  scheduleNotesSave()
+  notesSaves.schedule()
 }
 
 /** A block action's notes — an excerpt quoted — recorded for undo and saved at once. */
@@ -676,7 +527,7 @@ function applyNotes(next: string) {
   undo.record('notes', notes.value, next)
   notes.value = next
   notesState.value = 'editing'
-  void saveNotes()
+  void notesSaves.save()
 }
 
 const notesEditor = ref<EditorControls | null>(null)
@@ -689,20 +540,18 @@ function onNotesClick(event: MouseEvent) {
   }
 }
 
-/** The header's one word: the busier of the two files' states. */
+/** The header's one word over the two files' states. A failed save comes first: its text is
+ *  unsaved work, and it is the one state drawn; then the busier of the rest, which are
+ *  announced, not shown (docs/web.md § Editing). */
 const statusWord = computed<SaveState>(() => {
   const states = [saveState.value, notesState.value]
-  for (const state of ['saving', 'editing', 'failed'] as const) {
+  for (const state of ['failed', 'saving', 'editing'] as const) {
     if (states.includes(state)) {
       return state
     }
   }
   return 'saved'
 })
-
-/** The one state the header draws: either file's save failed and its text is unsaved work.
- *  Every other state is announced, not shown (docs/web.md § Editing). */
-const unsaved = computed(() => saveState.value === 'failed' || notesState.value === 'failed')
 
 /** Closing with an edit still in the debounce — or still in an open block — sends it now
  *  rather than losing it. */
@@ -711,19 +560,8 @@ onBeforeUnmount(() => {
   commitEdit()
   // Images already uploaded and waiting on that editor go in with it.
   landWaitingImages()
-  // A failed save left its text unsaved with no timer: it gets one more try too.
-  if (saveTimer !== null || saveState.value === 'failed') {
-    if (saveTimer !== null) {
-      clearTimeout(saveTimer)
-    }
-    void saveContent()
-  }
-  if (notesTimer !== null || notesState.value === 'failed') {
-    if (notesTimer !== null) {
-      clearTimeout(notesTimer)
-    }
-    void saveNotes()
-  }
+  contentSaves.flush()
+  notesSaves.flush()
 })
 
 // --- block editing -------------------------------------------------------------------
@@ -817,8 +655,8 @@ async function startEdit(pageIndex: number, blockIndex: number, caret: Caret = '
   }
 }
 
-/** A page emptied of its blocks, or a document with none: text comes back through an
- *  editor opened past the last block — index `blocks.length`, which no block holds. */
+/** A document with no drawable block: text comes back through an editor opened past the
+ *  page's last block — index `blocks.length`, which no block holds. */
 function startNewBlock(pageIndex: number) {
   if (!editable.value) {
     return
@@ -939,7 +777,7 @@ function onBlockClick() {
     selectByTap(key)
     return
   }
-  const element = scroller.value?.querySelector(`[data-block="${press.page}-${index}"]`)
+  const element = scroller.value?.querySelector(`[data-block="${key}"]`)
   const rect = element?.getBoundingClientRect()
   void startEdit(press.page, index, rect ? { x: rect.left + press.dx, y: rect.top + press.dy } : 'end')
 }
@@ -971,7 +809,7 @@ function openSelection(selection: Selection) {
   // The end's slot counts from the run's first block: the editor holds them all as one.
   let before = 0
   for (let index = from.index; index < to.index; index += 1) {
-    const element = scroller.value?.querySelector(`[data-block="${from.page}-${index}"]`)
+    const element = scroller.value?.querySelector(`[data-block="${blockKey({ page: from.page, index })}"]`)
     before += element ? blockSlots(element).length : 0
   }
   const end: TextPoint = { slot: to.point.slot + before, offset: to.point.offset }
@@ -986,11 +824,8 @@ function selectionEdge(node: Node, offset: number): { page: number; index: numbe
   if (!block || !scroller.value?.contains(block) || block.classList.contains('open')) {
     return null
   }
-  const [page, index] = (block.dataset.block ?? '').split('-').map(Number)
-  if (page === undefined || index === undefined || !Number.isInteger(page) || !Number.isInteger(index)) {
-    return null
-  }
-  return { page, index, point: textPoint(blockSlots(block), node, offset) }
+  const at = parseBlockKey(block.dataset.block ?? '')
+  return at ? { ...at, point: textPoint(blockSlots(block), node, offset) } : null
 }
 
 /** A block's slots: its rendering's, the viewer's controls among them passed over. */
@@ -1112,7 +947,7 @@ function onEditorChange(markdown: string) {
   } else {
     draft.value = markdown
   }
-  scheduleSave()
+  contentSaves.schedule()
 }
 
 /** The source of the blocks under the open editor, or null when none is open. Never the
@@ -1163,7 +998,7 @@ function commitEdit() {
   if (next !== markdown.value) {
     undo.clear('document')
     markdown.value = next
-    scheduleSave()
+    contentSaves.schedule()
   }
 }
 
@@ -1346,9 +1181,6 @@ const lineEditorRows = computed(() => Math.max(2, draft.value.split('\n').length
 const foldId = computed(() => (props.documentId !== null ? `doc:${props.documentId}` : null))
 
 function readFolds(): FoldMemory {
-  if (!import.meta.client) {
-    return {}
-  }
   try {
     return readFoldMemory(localStorage.getItem(FOLDS_KEY))
   } catch {
@@ -1430,11 +1262,6 @@ function rowIndexNear(page: number, index: number): number | null {
   return rows.value.length ? rows.value.length - 1 : null
 }
 
-/** The document loaded whole: a partial result lacks pages still to come. */
-const wholeDocument = computed(
-  () => (props.result !== null || props.markdownDocument) && !partial.value && editable.value,
-)
-
 function onFindExpand(key: string) {
   const index = placedIndex.value.get(key)
   if (index !== undefined) {
@@ -1469,9 +1296,9 @@ function expandFromNote(key: string) {
   })
 }
 
+/** The place of a key the viewer made itself, which always names one. */
 function parseKey(key: string): BlockAt {
-  const [page = 0, index = 0] = key.split('-').map(Number)
-  return { page, index }
+  return parseBlockKey(key) ?? { page: 0, index: 0 }
 }
 
 // --- keyboard block selection ----------------------------------------------------------------
@@ -1658,19 +1485,6 @@ const focusedKey = ref<string | null>(null)
 /** The handle whose menu is open: drawn pressed while it is. */
 const menuHandleKey = ref<string | null>(null)
 
-/** A handle exists only where it can be used now (docs/web.md § Editing, *The block handle
- *  and its menu*). */
-function handleShown(key: string): boolean {
-  return (
-    editable.value &&
-    (key === hoveredKey.value ||
-      key === focusedKey.value ||
-      key === menuHandleKey.value ||
-      selectedKeys.value.has(key) ||
-      dragKeys.value.has(key))
-  )
-}
-
 let hoverFrame = 0
 let hoverAt: { x: number; y: number; target: EventTarget | null } | null = null
 
@@ -1798,22 +1612,28 @@ function onHandleClick(event: MouseEvent, key: string) {
   ) {
     return
   }
+  const target = handleTarget(key)
+  void openBlockMenu(target.keys, target.at, false, target.keyboard)
+}
+
+/** The blocks a handle acts on, an open editor written back first: those the editor holding
+ *  its block became; else the whole selection its block is in, or the block alone. `at` is the
+ *  block focus returns to, `keyboard` whether the keyboard made the selection. */
+function handleTarget(key: string): { keys: string[]; at: string; keyboard: boolean } {
   const open = editing.value
   if (open && key === blockKey(open)) {
     const count = draftBlockCount()
     commitEdit()
     const keys = rowKeysIn(open.page, open.index, count)
-    void openBlockMenu(keys, keys[0] ?? key, false, false)
-    return
+    return { keys, at: keys[0] ?? key, keyboard: false }
   }
+  // Where the block stands once the editor is written back, read before it is.
   const at = blockKey(afterCommit(parseKey(key)))
   commitEdit()
-  const selection = blockSelection.value
-  if (selection && selectedKeys.value.has(at)) {
-    void openBlockMenu([...selectedKeys.value], at, false, selection.keyboard)
-  } else {
-    void openBlockMenu([at], at, false, false)
+  if (selectedKeys.value.has(at)) {
+    return { keys: [...selectedKeys.value], at, keyboard: blockSelection.value?.keyboard ?? false }
   }
+  return { keys: [at], at, keyboard: false }
 }
 
 /**
@@ -2199,7 +2019,7 @@ function stepUndo(direction: 'undo' | 'redo', keyboard: boolean) {
   if (step.file === 'document') {
     markdown.value = step.text
     saveState.value = 'editing'
-    void saveContent()
+    void contentSaves.save()
     const restored = blocksInRanges(step.text, placed.value, step.ranges)
     openFoldsOver(restored)
     const keys = restored.length ? rowsCovering(Math.min(...restored), Math.max(...restored)) : []
@@ -2212,7 +2032,7 @@ function stepUndo(direction: 'undo' | 'redo', keyboard: boolean) {
   } else {
     notes.value = step.text
     notesState.value = 'editing'
-    void saveNotes()
+    void notesSaves.save()
     const range = step.ranges[0] ?? { start: 0, end: 0 }
     const first = blockIndexAt(step.text, range.start)
     const last = blockIndexAt(step.text, Math.max(range.start, range.end - 1))
@@ -2331,6 +2151,20 @@ const dropLine = ref<{ top: number; left: number; width: number } | null>(null)
 let dropSaid = ''
 const dragCard = ref<HTMLElement | null>(null)
 
+/** What each block's handle reads to know whether it is drawn (docs/web.md § Editing, *The
+ *  block handle and its menu*): read by the handle itself, so a hover or focus move
+ *  re-renders handles, not the document. */
+const handleState: BlockHandleState = {
+  editable,
+  hovered: hoveredKey,
+  focused: focusedKey,
+  menuKey: menuHandleKey,
+  menuOpen: computed(() => blockMenu.value !== null),
+  selected: selectedKeys,
+  moving: dragKeys,
+  label: (block) => t('viewer.block.handle', { name: blockName(block, nameText.value) }),
+}
+
 /**
  * The handle's drag carries its block, or the whole selection when its block is in one
  * (docs/web.md § Editing, *Moving blocks*). An open editor is written back first, so the run
@@ -2344,18 +2178,7 @@ function onHandleDragStart(event: DragEvent, key: string) {
     return
   }
   chromePressed = false
-  let keys: string[]
-  const open = editing.value
-  if (open && key === blockKey(open)) {
-    const count = draftBlockCount()
-    commitEdit()
-    keys = rowKeysIn(open.page, open.index, count)
-  } else {
-    const at = blockKey(afterCommit(parseKey(key)))
-    commitEdit()
-    keys = selectedKeys.value.has(at) ? [...selectedKeys.value] : [at]
-  }
-  const range = rangeOf(keys)
+  const range = rangeOf(handleTarget(key).keys)
   if (!range) {
     event.preventDefault()
     return
@@ -2378,10 +2201,10 @@ function onHandleDragStart(event: DragEvent, key: string) {
   }
 }
 
-/** Image files dragged over the document, where it can hold them: theirs to land between
- *  blocks on the dragged block's drop line (docs/web.md § Editing, *Images*). */
+/** Image files dragged over the editable document, where it can hold them: theirs to land
+ *  between blocks on the dragged block's drop line (docs/web.md § Editing, *Images*). */
 function carriesImageFiles(event: DragEvent): boolean {
-  return !dragRun && Boolean(editorImages.value) && carriesFiles(event.dataTransfer)
+  return !dragRun && editable.value && carriesFiles(event.dataTransfer)
 }
 
 /** Blocks dragged from an answer in the agent panel: a copy to land on the drop line, with no
@@ -2814,8 +2637,6 @@ function onNotesToolbarAction(action: 'ask' | 'copy') {
   void askAgent({ selection: markdown }, null)
 }
 
-/** The notes closed: a toolbar over them has nothing to stand over. */
-
 /** The toolbar follows its selection as its surface scrolls or is resized. */
 function repositionToolbar() {
   if (toolbar.value && !toolbarFrame) {
@@ -3122,27 +2943,12 @@ function blockLinkAnchor(address: string): string | null {
  * way back.
  */
 async function locateLink(target: SectionLinkTarget) {
-  if (!editable.value) {
-    return
-  }
-  if (tab.value !== 'markdown') {
-    tab.value = 'markdown'
-    await nextTick()
-    await new Promise((done) => requestAnimationFrame(done))
-  }
+  await toMarkdownView()
   commitEdit()
   await nextTick()
   if (target.anchor.includes('~')) {
     // A block reference: revealed as opening its address does.
-    const at = resolveAnchor(pages.value, readBlockAnchor(target.anchor), outline.value)
-    if (at && placedIndex.value.has(blockKey(at))) {
-      const from = await toText()
-      setWayBack()
-      pressLink(target)
-      await revealBlock(at)
-      paneWayBack(from)
-      armWayBack()
-    }
+    await revealAnchor(target.anchor, () => pressLink(target))
     return
   }
   const heading = target.anchor === '' ? null : findHeading(outline.value, target.label, target.anchor)
@@ -3151,32 +2957,68 @@ async function locateLink(target: SectionLinkTarget) {
   if (!box || (!found && !heading && target.anchor !== '')) {
     return
   }
+  await jump(async () => {
+    pressLink(target)
+    if (found && target.passage !== null) {
+      const start = placedIndex.value.get(blockKey(found.start))
+      const end = placedIndex.value.get(blockKey(found.end))
+      if (start !== undefined && end !== undefined) {
+        openFoldsOver(Array.from({ length: end - start + 1 }, (_, offset) => start + offset))
+      }
+      await nextTick()
+      const range = passageRange(found, target.passage)
+      const element = box.querySelector(`[data-block="${blockKey(found.start)}"]`)
+      const rect = range?.getBoundingClientRect() ?? element?.getBoundingClientRect()
+      if (rect) {
+        scrollNearTop(box, rect)
+      }
+      if (!range || !highlightPassage(range)) {
+        flashBlock(blockKey(found.start))
+      }
+    } else if (heading) {
+      await showHeading(heading, true)
+    } else {
+      box.scrollTop = 0
+    }
+  })
+}
+
+/** The Markdown tab shown and drawn before a jump into it, after the tab's own watcher has put
+ *  the reader's old place back. */
+async function toMarkdownView() {
+  if (tab.value !== 'markdown') {
+    tab.value = 'markdown'
+    await nextTick()
+    await new Promise((done) => requestAnimationFrame(done))
+  }
+}
+
+/** A jump within the text: from another pane on a phone, the text shown first; the way back set
+ *  before `go` moves the pane and armed once it has landed. */
+async function jump(go: () => Promise<void>) {
   const from = await toText()
   setWayBack()
-  pressLink(target)
-  if (found && target.passage !== null) {
-    const start = placedIndex.value.get(blockKey(found.start))
-    const end = placedIndex.value.get(blockKey(found.end))
-    if (start !== undefined && end !== undefined) {
-      openFoldsOver(Array.from({ length: end - start + 1 }, (_, offset) => start + offset))
-    }
-    await nextTick()
-    const range = passageRange(found, target.passage)
-    const element = box.querySelector(`[data-block="${blockKey(found.start)}"]`)
-    const rect = range?.getBoundingClientRect() ?? element?.getBoundingClientRect()
-    if (rect) {
-      box.scrollTop += rect.top - box.getBoundingClientRect().top - LOCATE_MARGIN_PX
-    }
-    if (!range || !highlightPassage(range)) {
-      flashBlock(blockKey(found.start))
-    }
-  } else if (heading) {
-    await showHeading(heading, true)
-  } else {
-    box.scrollTop = 0
-  }
+  await go()
   paneWayBack(from)
   armWayBack()
+}
+
+/** A block reference followed — revealed as opening its address does, `before` run as the jump
+ *  starts; a block the document no longer has leads nowhere. */
+async function revealAnchor(anchor: string, before?: () => void) {
+  const at = resolveAnchor(pages.value, readBlockAnchor(anchor), outline.value)
+  if (!at || !placedIndex.value.has(blockKey(at))) {
+    return
+  }
+  await jump(async () => {
+    before?.()
+    await revealBlock(at)
+  })
+}
+
+/** The pane scrolled so that `rect` stands just below its top. */
+function scrollNearTop(box: HTMLElement, rect: DOMRect) {
+  box.scrollTop += rect.top - box.getBoundingClientRect().top - LOCATE_MARGIN_PX
 }
 
 /** The located passage in the rendered blocks: the text walk find makes, each formula read as
@@ -3284,26 +3126,29 @@ function documentSelection(): string | null {
   return text || null
 }
 
-/** The heading of the section in view: the last one above a third of the way down the pane,
- *  where a reader's eye is. Null above the first heading. */
+/** The heading of the section in view: the last one drawn above a third of the way down the
+ *  pane, where a reader's eye is. Null above the first heading. Read off the heading blocks in
+ *  one query, once a scroll frame; a key the outline does not have yet — the DOM a render behind
+ *  an edit — names no heading. */
 function currentSection(): { page: number; index: number } | null {
   const box = scroller.value
   if (!box || tab.value !== 'markdown') {
     return null
   }
   const line = box.getBoundingClientRect().top + box.clientHeight / 3
-  let found: { page: number; index: number } | null = null
-  for (const entry of outline.value) {
-    const element = box.querySelector(`[data-block="${entry.page}-${entry.index}"]`)
-    if (!element?.getClientRects().length) {
+  let found: string | undefined
+  for (const element of box.querySelectorAll<HTMLElement>('.block[data-kind="h2"], .block[data-kind="h3"]')) {
+    // A folded heading, or one an open editor holds, is hidden and has no box.
+    if (!element.getClientRects().length) {
       continue
     }
     if (element.getBoundingClientRect().top > line) {
       break
     }
-    found = { page: entry.page, index: entry.index }
+    found = element.dataset.block
   }
-  return found
+  const entry = found === undefined ? undefined : headingAt.value.get(found)
+  return entry ? { page: entry.page, index: entry.index } : null
 }
 
 /** The block a section link just led to, by `page-index`, washed for a moment; then the one
@@ -3352,7 +3197,7 @@ async function showHeading(entry: OutlineEntry, wash: boolean) {
   if (!box || !element) {
     return
   }
-  box.scrollTop += element.getBoundingClientRect().top - box.getBoundingClientRect().top - LOCATE_MARGIN_PX
+  scrollNearTop(box, element.getBoundingClientRect())
   if (wash) {
     flashBlock(blockKey(heading))
   }
@@ -3365,32 +3210,16 @@ async function showHeading(entry: OutlineEntry, wash: boolean) {
  * address does.
  */
 async function locateSection(target: { label: string; anchor: string }) {
-  if (tab.value !== 'markdown') {
-    tab.value = 'markdown'
-    await nextTick()
-    // After the tab's own watcher has put the reader's old place back.
-    await new Promise((done) => requestAnimationFrame(done))
-  }
+  await toMarkdownView()
   if (target.anchor.includes('~')) {
-    const at = resolveAnchor(pages.value, readBlockAnchor(target.anchor), outline.value)
-    if (at && placedIndex.value.has(blockKey(at))) {
-      const from = await toText()
-      setWayBack()
-      await revealBlock(at)
-      paneWayBack(from)
-      armWayBack()
-    }
+    await revealAnchor(target.anchor)
     return
   }
   const heading = findHeading(outline.value, target.label, target.anchor)
   if (!heading) {
     return
   }
-  const from = await toText()
-  setWayBack()
-  await showHeading(heading, true)
-  paneWayBack(from)
-  armWayBack()
+  await jump(() => showHeading(heading, true))
 }
 
 // --- the way back --------------------------------------------------------------------------
@@ -3642,11 +3471,7 @@ async function jumpToHeading(index: number) {
   if (!entry) {
     return
   }
-  const from = await toText()
-  setWayBack()
-  await showHeading(entry, false)
-  paneWayBack(from)
-  armWayBack()
+  await jump(() => showHeading(entry, false))
 }
 
 /** An outline row's ask. An open editor is written back first — Safari gives a pressed button
@@ -3724,7 +3549,7 @@ async function revealBlock(at: BlockAt) {
   const box = scroller.value
   const element = box?.querySelector(`[data-block="${blockKey(at)}"]`)
   if (box && element) {
-    box.scrollTop += element.getBoundingClientRect().top - box.getBoundingClientRect().top - LOCATE_MARGIN_PX
+    scrollNearTop(box, element.getBoundingClientRect())
     flashBlock(blockKey(at))
   }
 }
@@ -3736,7 +3561,8 @@ async function revealBlock(at: BlockAt) {
  * the folds, remembered and shown alike, follow their headings, a fold an edit landed in
  * opens, and the block selection follows its blocks (docs/web.md § Result viewer, *A fold
  * follows its heading through an edit*). Synchronous, so nothing reads the new document with
- * the old folds. Slugs the document no longer has are forgotten once it has loaded whole.
+ * the old folds. Slugs the document no longer has are forgotten once its copy has loaded: a copy
+ * is the whole document, never a partial result.
  */
 let shown: { placed: PlacedBlock[]; outline: OutlineEntry[]; editable: boolean } | null = null
 
@@ -3754,7 +3580,7 @@ watch(
       }
       followSelection(before.placed, nextPlaced)
     }
-    if (wholeDocument.value) {
+    if (editable.value) {
       const slugs = new Set(nextOutline.map((entry) => entry.slug))
       if ([...collapsed.value].some((slug) => !slugs.has(slug))) {
         collapsed.value = new Set([...collapsed.value].filter((slug) => slugs.has(slug)))
@@ -3771,9 +3597,6 @@ watch(
  *  Files renders on the client, so the first paint is already the right one — and again as the
  *  window changes size. */
 function readLayout(): ViewerLayout {
-  if (!import.meta.client) {
-    return 'desktop'
-  }
   return viewerLayout({ width: window.innerWidth, height: window.innerHeight }, window.matchMedia('(pointer: coarse)').matches)
 }
 
@@ -3798,9 +3621,7 @@ const cardsShown = computed(() => shownCards(layout.value, { notes: notesOpen.va
 /** The notes are mounted with the editable copy on a phone, where they are a pane; the agent the
  *  first time it is shown or asked, then kept — not because a wider screen left its card open. */
 const notesMounted = computed(() => editable.value && (notesOpen.value || phone.value))
-const agentMounted = computed(
-  () => editable.value && props.documentId !== null && ((agentOpen.value && !phone.value) || agentKept.value),
-)
+const agentMounted = computed(() => editable.value && ((agentOpen.value && !phone.value) || agentKept.value))
 /** What shows: a phone's one pane; elsewhere the document, and each card shown beside it. */
 const documentShown = computed(() => !phone.value || pane.value === 'document')
 const notesShown = computed(() => (phone.value ? pane.value === 'notes' : cardsShown.value.notes))
@@ -3880,12 +3701,7 @@ watch(agentOpen, (open) => (front.value = open ? 'agent' : 'notes'))
  */
 async function showPane(next: Pane) {
   // What the switch marked is seen — also on a pane a rotation had already put the reader on.
-  if (next === 'agent') {
-    agentKept.value = true
-    agentNew.value = false
-  } else if (next === 'notes') {
-    notesNew.value = false
-  }
+  markSeen(next)
   if (next === pane.value) {
     return
   }
@@ -3903,6 +3719,17 @@ async function showPane(next: Pane) {
   // block moves it on from there.
   if (leaving instanceof HTMLElement && leaving !== document.body && (!leaving.isConnected || leaving.closest('[inert]'))) {
     document.getElementById(`${uid}-tab-${next}`)?.focus({ preventScroll: true })
+  }
+}
+
+/** A phone's pane shown: what the switch marked on it is seen, and an agent shown is kept
+ *  mounted. */
+function markSeen(next: Pane) {
+  if (next === 'agent') {
+    agentKept.value = true
+    agentNew.value = false
+  } else if (next === 'notes') {
+    notesNew.value = false
   }
 }
 
@@ -3977,12 +3804,7 @@ watch(layout, (now, before) => {
       agentKept.value = true
     }
     pane.value = card?.classList.contains('notes') ? 'notes' : card?.classList.contains('agent') ? 'agent' : 'document'
-    if (pane.value === 'agent') {
-      agentKept.value = true
-      agentNew.value = false
-    } else if (pane.value === 'notes') {
-      notesNew.value = false
-    }
+    markSeen(pane.value)
   }
   toolbar.value = null
   void nextTick(measureGutter)
@@ -4336,7 +4158,7 @@ const parseFacts = computed<MenuFact[]>(() => {
 })
 
 /** The facts over the views: the parse's, or the row's while the file is not converted. */
-const moreFacts = computed<MenuFact[]>(() => (props.converted ? parseFacts.value : props.facts))
+const moreFacts = computed<MenuFact[]>(() => (converted.value ? parseFacts.value : props.facts))
 
 /** More holds Find on a phone's Markdown view, above the facts. */
 const moreFind = computed(() => phone.value && tab.value === 'markdown')
@@ -4346,7 +4168,7 @@ const moreFind = computed(() => phone.value && tab.value === 'markdown')
  *  placed — and, for a file not yet converted, its row's facts, which it has at once. A
  *  markdown document has no parse to wait for and nothing to choose, so its More stays
  *  disabled, except on a phone, where it holds Find. */
-const moreReady = computed(() => (props.markdownDocument ? moreFind.value : props.converted ? props.result !== null : true))
+const moreReady = computed(() => (props.markdownDocument ? moreFind.value : converted.value ? props.result !== null : true))
 
 /** The two views, as a pair of choices (docs/web.md § Result viewer, *Original and
  *  Markdown*): Original is disabled where no original was kept, with the reason under it;
@@ -4367,11 +4189,11 @@ const moreItems = computed<MenuItem[]>(() => [
     key: 'markdown',
     label: t('viewer.view.markdown'),
     checked: tab.value === 'markdown',
-    disabled: !props.converted && !props.convertible,
+    disabled: !converted.value && !props.convertible,
     // A failed parse has no document until a retry succeeds; any other file not converted
     // is one the parse agent does not accept.
     description:
-      props.converted || props.convertible
+      converted.value || props.convertible
         ? undefined
         : t(props.failure ? 'viewer.failed.noMarkdown' : 'viewer.notConvertible'),
   },
@@ -4394,7 +4216,7 @@ function onMoreSelect(key: string) {
     void openFind()
     return
   }
-  if (key === 'markdown' && !props.converted) {
+  if (key === 'markdown' && !converted.value) {
     if (props.convertible) {
       emit('convert')
     }
@@ -4405,7 +4227,7 @@ function onMoreSelect(key: string) {
   }
   tab.value = key
   // The view the reader switched to is the one the document opens on next time.
-  if (props.converted) {
+  if (converted.value) {
     emit('view', key)
   }
 }
@@ -4445,7 +4267,7 @@ function pictureAddress(block: ResultBlock): string | null {
     return props.figureBase ? `${props.figureBase}/${block.page}/${block.bbox.join(',')}` : null
   }
   if (block.kind === 'img') {
-    return props.imageBase ? `${props.imageBase}/${block.name}` : null
+    return `${props.imageBase}/${block.name}`
   }
   return null
 }
@@ -4584,10 +4406,10 @@ function landWaitingImages() {
 
 watch([editing, blockMenu, toolbar], scheduleWaitingImages)
 
-/** What the editors insert images with: only on Files, where the document has an images route. */
+/** What the editors insert images with: only for a library document, which has an images route. */
 const editorImages = computed(() => {
   const id = props.documentId
-  return props.imageBase && id !== null
+  return id !== null
     ? {
         upload: uploadImage,
         accept: (limits.value?.image_media_types ?? ['image/*']).join(','),
@@ -4904,11 +4726,11 @@ watch(
           <span
             v-if="editable"
             class="save-state"
-            :class="unsaved ? 'failed' : 'sr-only'"
+            :class="statusWord === 'failed' ? 'failed' : 'sr-only'"
             role="status"
             aria-live="polite"
           >
-            {{ t(`viewer.status.${unsaved ? 'failed' : statusWord}`) }}
+            {{ t(`viewer.status.${statusWord}`) }}
           </span>
         </div>
         <UiSegmented v-if="paneTabs.length" glass class="panes" role="tablist" :aria-label="t('viewer.panes.label')">
@@ -4941,11 +4763,11 @@ watch(
         <span
           v-if="editable"
           class="save-state"
-          :class="unsaved ? 'failed' : 'sr-only'"
+          :class="statusWord === 'failed' ? 'failed' : 'sr-only'"
           role="status"
           aria-live="polite"
         >
-          {{ t(`viewer.status.${unsaved ? 'failed' : statusWord}`) }}
+          {{ t(`viewer.status.${statusWord}`) }}
         </span>
       </div>
     </template>
@@ -5052,7 +4874,7 @@ watch(
              Always rendered, as the document's notes are: grid auto-placement would
              otherwise put the original in this row. -->
         <div class="doc-notes">
-          <UiBanner v-if="failure" class="degraded-note" tone="error">
+          <UiBanner v-if="failure" tone="error">
             <strong>{{
               failure.pages ? t('viewer.failed.pages', { n: failure.pages }, failure.pages) : t('viewer.failed.whole')
             }}</strong>
@@ -5072,11 +4894,8 @@ watch(
         </div>
       </div>
 
-      <UiBanner v-else-if="error" class="state" tone="error">{{ error }}</UiBanner>
       <UiBanner v-else-if="errorMessage" class="state" tone="error">{{ errorMessage }}</UiBanner>
-      <UiSkeleton v-else-if="pending" class="state" :rows="5" />
-
-      <UiSkeleton v-else-if="awaitingContent" class="state" :rows="5" />
+      <UiSkeleton v-else-if="pending || awaitingContent" class="state" :rows="5" />
       <!-- A markdown document is its copy alone: one that cannot be read has nothing
            else to show. -->
       <UiBanner v-else-if="markdownDocument && !editable && contentError" class="state" tone="error">
@@ -5098,8 +4917,8 @@ watch(
              Banner and progress can hold at once — a page can fail while the rest is still
              parsing, and the failure must not silence the live progress. -->
         <div class="doc-notes">
-          <UiBanner v-if="reconvertNote" class="degraded-note">{{ reconvertNote }}</UiBanner>
-          <UiBanner v-if="failedPages.length" class="degraded-note" tone="error">
+          <UiBanner v-if="reconvertNote">{{ reconvertNote }}</UiBanner>
+          <UiBanner v-if="failedPages.length" tone="error">
             {{
               t('viewer.degraded', {
                 count: failedPages.length,
@@ -5107,10 +4926,10 @@ watch(
               })
             }}
           </UiBanner>
-          <UiBanner v-if="contentError" class="degraded-note" tone="error">{{ contentError }}</UiBanner>
-          <UiBanner v-if="saveError" class="degraded-note" tone="error">{{ saveError }}</UiBanner>
-          <UiBanner v-if="notesError" class="degraded-note" tone="error">{{ notesError }}</UiBanner>
-          <UiBanner v-if="notice" class="degraded-note" tone="warn">
+          <UiBanner v-if="contentError" tone="error">{{ contentError }}</UiBanner>
+          <UiBanner v-if="saveError" tone="error">{{ saveError }}</UiBanner>
+          <UiBanner v-if="notesError" tone="error">{{ notesError }}</UiBanner>
+          <UiBanner v-if="notice" tone="warn">
             {{ notice }}
             <template #actions>
               <UiButton variant="ghost" size="xs" icon-only :label="t('common.close')" @click="notice = null">
@@ -5236,7 +5055,7 @@ watch(
             <div
               ref="scroller"
               class="document"
-              :class="{ files: documentId !== null, 'locate-fading': locateFading }"
+              :class="{ 'locate-fading': locateFading }"
               :data-margin="paperMargin"
               @copy="onCopy"
               @mousedown.capture="forgetPress"
@@ -5248,39 +5067,17 @@ watch(
               @focusout="onDocumentFocusOut"
               @scroll="onDocumentScroll"
             >
-              <!-- A document with no page at all: one editor, which makes page 1. -->
-              <section v-if="editable && !pages.length" class="page">
-                <article class="prose">
-                  <RichEditor
-                    v-if="isEditing(0, 0)"
-                    :ref="setBlockEditor"
-                    :key="editorKey"
-                    :source="editorSource"
-                    :caret="editorCaret"
-                    :placeholder="t('viewer.blockPlaceholder')"
-                    :label="t('viewer.blockSource')"
-                    :skills="slashSkills"
-                    :figures="editorFigures"
-                    :images="blockImages"
-                    @change="onEditorChange"
-                    @leave="leaveEditor"
-                    @slash-open="loadSkills"
-                    @run-skill="runSkill"
-                  />
-                  <button v-else type="button" class="block-add" @click="startNewBlock(0)">
-                    {{ t('viewer.blockAdd') }}
-                  </button>
-                </article>
-              </section>
+              <!-- Keyed by position: a document can repeat a page number (a marker the reader
+                   typed is a page like any parsed one). -->
               <section
                 v-for="(page, pageIndex) in pages"
-                :key="page.page"
+                :key="pageIndex"
                 class="page"
               >
                 <article class="prose">
                   <!-- Every block is edited in place: clicked, it becomes a rich editor drawn
                        exactly as it was read, caret where the click landed; left, it renders
-                       again (docs/web.md § Editing). Read-only without a document. The
+                       again (docs/web.md § Editing). Read-only until the copy has loaded. The
                        viewer's own controls among the blocks — the handle, the chevron, the
                        fold note, a backlink marker — are `data-chrome`: copy, find and the
                        agent's selection pass over them. -->
@@ -5304,27 +5101,15 @@ watch(
                     @mousedown="editable && onBlockPress($event, pageIndex, index)"
                     @keydown="onBlockKey"
                   >
-                    <!-- A div, not a button: Firefox starts no drag from a button. -->
-                    <div
-                      v-if="block.kind !== 'comment' && handleShown(key)"
-                      role="button"
-                      class="block-handle"
-                      :class="{ on: menuHandleKey === key }"
-                      data-chrome
-                      tabindex="-1"
-                      draggable="true"
-                      :aria-label="t('viewer.block.handle', { name: blockName(block, nameText) })"
-                      aria-haspopup="menu"
-                      :aria-expanded="menuHandleKey === key && blockMenu ? 'true' : 'false'"
-                      @pointerdown.stop
-                      @mousedown.stop
-                      @mouseup.stop
-                      @click.stop="onHandleClick($event, key)"
-                      @dragstart="onHandleDragStart($event, key)"
-                      @dragend="endDrag"
-                    >
-                      <UiIcon name="grip-vertical" />
-                    </div>
+                    <ViewerBlockHandle
+                      v-if="block.kind !== 'comment'"
+                      :block-key="key"
+                      :block="block"
+                      :state="handleState"
+                      @press="onHandleClick"
+                      @drag-start="onHandleDragStart"
+                      @drag-end="endDrag"
+                    />
                     <button
                       v-if="isHeading(block)"
                       type="button"
@@ -5434,36 +5219,35 @@ watch(
                       <UiIcon name="quote" />
                     </button>
                   </div>
-                  <!-- A document emptied of its blocks keeps a way back in (docs/web.md
-                       § Editing): an editor past the last block, or the control that opens
-                       one. A page a move or a delete emptied draws nothing — the blocks
-                       around it are the way in. -->
-                  <template v-if="editable && !page.blocks.length && !placed.length">
-                    <RichEditor
-                      v-if="isEditing(pageIndex, 0)"
-                      :ref="setBlockEditor"
-                      :key="editorKey"
-                      :source="editorSource"
-                      :caret="editorCaret"
-                      :placeholder="t('viewer.blockPlaceholder')"
-                      :label="t('viewer.blockSource')"
-                      :skills="slashSkills"
-                      :figures="editorFigures"
-                      :images="blockImages"
-                      @change="onEditorChange"
-                      @leave="leaveEditor"
-                      @slash-open="loadSkills"
-                      @run-skill="runSkill"
-                    />
-                    <button
-                      v-else
-                      type="button"
-                      class="block-add"
-                      @click="startNewBlock(pageIndex)"
-                    >
-                      {{ t('viewer.blockAdd') }}
-                    </button>
-                  </template>
+                </article>
+              </section>
+
+              <!-- A document with no block left to draw — none at all, or only comments, which
+                   draw as nothing — keeps one way back in (docs/web.md § Editing): an editor
+                   past the last page's last block, or the control that opens one. With nothing
+                   drawn, any open editor is that one. A page a move or a delete emptied draws
+                   nothing — the blocks around it are the way in. -->
+              <section v-if="editable && !rows.length" class="page">
+                <article class="prose">
+                  <RichEditor
+                    v-if="editing"
+                    :ref="setBlockEditor"
+                    :key="editorKey"
+                    :source="editorSource"
+                    :caret="editorCaret"
+                    :placeholder="t('viewer.blockPlaceholder')"
+                    :label="t('viewer.blockSource')"
+                    :skills="slashSkills"
+                    :figures="editorFigures"
+                    :images="blockImages"
+                    @change="onEditorChange"
+                    @leave="leaveEditor"
+                    @slash-open="loadSkills"
+                    @run-skill="runSkill"
+                  />
+                  <button v-else type="button" class="block-add" @click="startNewBlock(Math.max(0, pages.length - 1))">
+                    {{ t('viewer.blockAdd') }}
+                  </button>
                 </article>
               </section>
 
@@ -5752,25 +5536,11 @@ watch(
   --locate-fade: 1;
 }
 
-/* None: the whole pane, with the side padding the stacked layout keeps (below) — the one
-   slot a heading's chevron and handle then share, by the same rules. */
+/* None: the whole pane, with the side padding the stacked layout keeps — and its one gutter
+   slot for a heading's chevron and handle (Phone and tablet, below). */
 .document[data-margin='none'] {
   --page-width: 100%;
   padding-inline: var(--space-8);
-}
-
-.document[data-margin='none'].files .block[data-kind='h2'] > .block-handle,
-.document[data-margin='none'].files .block[data-kind='h3'] > .block-handle {
-  left: -28px;
-}
-
-.document[data-margin='none'].files .block:is([data-kind='h2'], [data-kind='h3']):not(.open, .selected, .moving) > .block-handle:not(.on) {
-  display: none;
-}
-
-.document[data-margin='none'].files .block:is(.open, .selected, .moving) > .block-chevron,
-.document[data-margin='none'].files .block-handle.on ~ .block-chevron {
-  display: none;
 }
 
 .document[data-margin='narrow'] {
@@ -5902,12 +5672,12 @@ watch(
   outline-offset: 6px;
 }
 
-/* The handle: in the gutter left of the block's first line, 4px from the text (docs/web.md
-   § Editing, *The block handle and its menu*). Drawn only where it can be used now. */
-.block-handle {
+/* A block's gutter controls — the handle, a heading's chevron, a backlink marker: one 24px
+   square each, over the block's text. */
+.block-handle,
+.block-chevron,
+.block-marker {
   position: absolute;
-  top: calc((var(--first-line) - 24px) / 2);
-  left: -28px;
   z-index: 1;
   display: inline-flex;
   align-items: center;
@@ -5916,10 +5686,17 @@ watch(
   height: 24px;
   border-radius: var(--radius);
   color: var(--faint);
-  cursor: grab;
   transition:
     background var(--duration-fast) var(--ease),
     color var(--duration-fast) var(--ease);
+}
+
+/* The handle: in the gutter left of the block's first line, 4px from the text (docs/web.md
+   § Editing, *The block handle and its menu*). Drawn only where it can be used now. */
+.block-handle {
+  top: calc((var(--first-line) - 24px) / 2);
+  left: -28px;
+  cursor: grab;
 }
 
 .block-handle:hover {
@@ -5940,9 +5717,9 @@ watch(
   height: 16px;
 }
 
-/* A heading's handle sits beyond its chevron, on Files. */
-.document.files .block[data-kind='h2'] > .block-handle,
-.document.files .block[data-kind='h3'] > .block-handle {
+/* A heading's handle sits beyond its chevron. */
+.document .block[data-kind='h2'] > .block-handle,
+.document .block[data-kind='h3'] > .block-handle {
   left: -56px;
 }
 
@@ -5951,20 +5728,11 @@ watch(
    invisible. Hidden by opacity, so it keeps its place in the tab order while the copy is
    read-only. */
 .block-chevron {
-  position: absolute;
   top: calc((var(--first-line) - 24px) / 2);
   left: -28px;
-  z-index: 1;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 24px;
-  height: 24px;
   padding: 0;
   border: 0;
-  border-radius: var(--radius);
   background: transparent;
-  color: var(--faint);
   opacity: 0;
   cursor: pointer;
   transition:
@@ -6016,24 +5784,12 @@ watch(
 
 /* A backlink marker, in the right gutter beside the block's last line. */
 .block-marker {
-  position: absolute;
   right: -28px;
   bottom: calc((var(--first-line) - 24px) / 2);
-  z-index: 1;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 24px;
-  height: 24px;
   padding: 0;
   border: 0;
-  border-radius: var(--radius);
   background: transparent;
-  color: var(--faint);
   cursor: pointer;
-  transition:
-    background var(--duration-fast) var(--ease),
-    color var(--duration-fast) var(--ease);
 }
 
 .block-marker:hover {
@@ -6360,27 +6116,27 @@ watch(
 
 /* A percentage column needs a floor: under 900px the chosen share of the pane is a gutter wider
    than the text it frames, so the column is the whole pane. The gutter is the 40px padding:
-   room for a handle or a chevron, not both, so on Files a heading's two take turns in one
-   slot. */
+   room for a handle or a chevron, not both, so a heading's two take turns in one slot. */
 .body:is(.phone, .tablet) .page,
 .body:is(.phone, .tablet) .page-skeleton {
   width: 100%;
 }
 
-/* One gutter slot for a heading: its chevron, or its handle while the heading is open in its
-   editor, selected, moving or has its menu open — how a touch screen reaches a handle anyway
-   (docs/web.md § Result viewer, *Outline, collapse and the way back*). */
-.body:is(.phone, .tablet) .document.files .block[data-kind='h2'] > .block-handle,
-.body:is(.phone, .tablet) .document.files .block[data-kind='h3'] > .block-handle {
+/* One gutter slot for a heading, here and under the None margin: its chevron, or its handle
+   while the heading is open in its editor, selected, moving or has its menu open — how a touch
+   screen reaches a handle anyway (docs/web.md § Result viewer, *Outline, collapse and the way
+   back*). */
+:is(.body:is(.phone, .tablet) .document, .document[data-margin='none']) .block[data-kind='h2'] > .block-handle,
+:is(.body:is(.phone, .tablet) .document, .document[data-margin='none']) .block[data-kind='h3'] > .block-handle {
   left: -28px;
 }
 
-.body:is(.phone, .tablet) .document.files .block:is([data-kind='h2'], [data-kind='h3']):not(.open, .selected, .moving) > .block-handle:not(.on) {
+:is(.body:is(.phone, .tablet) .document, .document[data-margin='none']) .block:is([data-kind='h2'], [data-kind='h3']):not(.open, .selected, .moving) > .block-handle:not(.on) {
   display: none;
 }
 
-.body:is(.phone, .tablet) .document.files .block:is(.open, .selected, .moving) > .block-chevron,
-.body:is(.phone, .tablet) .document.files .block-handle.on ~ .block-chevron {
+:is(.body:is(.phone, .tablet) .document, .document[data-margin='none']) .block:is(.open, .selected, .moving) > .block-chevron,
+:is(.body:is(.phone, .tablet) .document, .document[data-margin='none']) .block-handle.on ~ .block-chevron {
   display: none;
 }
 
@@ -6433,8 +6189,8 @@ watch(
   box-shadow: none;
 }
 
-/* The side padding is the gutter's room: a handle or a chevron on the left, on Files a
-   backlink marker on the right. */
+/* The side padding is the gutter's room: a handle or a chevron on the left, a backlink marker
+   on the right. */
 .body.phone .document {
   padding: var(--space-7) var(--space-8) var(--space-10);
 }
