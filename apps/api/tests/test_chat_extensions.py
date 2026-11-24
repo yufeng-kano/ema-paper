@@ -438,7 +438,7 @@ async def test_subagents_follow_the_skills_contract(signed_in) -> None:
 # --- the agent's own prompt -------------------------------------------------------------
 
 
-async def test_the_agent_prompt_replaces_the_default_and_excludes_a_preset(signed_in) -> None:
+async def test_the_agent_prompt_is_trimmed_and_the_default_stored_as_none(signed_in) -> None:
     agents = (await signed_in.get("/api/agents")).json()["agents"]
     chat = next(agent for agent in agents if agent["name"] == "chat")
     parse = next(agent for agent in agents if agent["name"] == "parse")
@@ -452,20 +452,6 @@ async def test_the_agent_prompt_replaces_the_default_and_excludes_a_preset(signe
     assert parse["prompt_tokens"] == ["{page}", "{bbox_format}", "{bbox_instructions}"]
     assert chat["settings"]["prompt"] is None
 
-    preset = (
-        await signed_in.post(
-            "/api/prompts",
-            json={"agent": "chat", "name": "Terse", "text": "Be terse."},
-            headers=CSRF_HEADERS,
-        )
-    ).json()
-    selected = await signed_in.put(
-        "/api/agents/chat/settings", json={"prompt_preset_id": preset["id"]}, headers=CSRF_HEADERS
-    )
-    assert selected.json()["prompt_preset_id"] == preset["id"]
-
-    # Saving a prompt clears the preset, and selecting a preset clears the prompt: one of
-    # the two is ever in force (docs/chat.md § System prompt).
     own = await signed_in.put(
         "/api/agents/chat/settings",
         json={"prompt": "  My agent for {document_path}.  "},
@@ -473,23 +459,6 @@ async def test_the_agent_prompt_replaces_the_default_and_excludes_a_preset(signe
     )
     assert own.status_code == 200, own.text
     assert own.json()["prompt"] == "My agent for {document_path}."
-    assert own.json()["prompt_preset_id"] is None
-    back = await signed_in.put(
-        "/api/agents/chat/settings", json={"prompt_preset_id": preset["id"]}, headers=CSRF_HEADERS
-    )
-    assert back.json()["prompt"] is None and back.json()["prompt_preset_id"] == preset["id"]
-    both = await signed_in.put(
-        "/api/agents/chat/settings",
-        json={"prompt": "Mine", "prompt_preset_id": preset["id"]},
-        headers=CSRF_HEADERS,
-    )
-    assert both.status_code == 400
-    together = await signed_in.put(
-        "/api/agents/chat/settings",
-        json={"prompt": "Mine", "prompt_preset_id": None},
-        headers=CSRF_HEADERS,
-    )
-    assert together.json()["prompt"] == "Mine" and together.json()["prompt_preset_id"] is None
     # The default, or nothing, is stored as no prompt, so a later default reaches it.
     for text in (chat["default_prompt"], "   "):
         reset = await signed_in.put(

@@ -54,7 +54,6 @@ from ..db.models import (
     Conversation,
     Document,
     Job,
-    PromptPreset,
     Skill,
     Subagent,
     Subscription,
@@ -495,152 +494,6 @@ async def revoke_key(key_id: int, user: SessionUser, db: DbSession) -> Response:
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-# --- prompt presets ---------------------------------------------------------------------
-
-
-async def _commit_or_name_conflict(db: DbSession, message: str) -> None:
-    """Commit, mapping a unique-name race to the same 400 the pre-check gives.
-
-    Two concurrent creates can both pass the duplicate pre-check before either commits;
-    the loser's constraint violation is an ordinary name conflict, not a 500.
-    """
-    try:
-        await db.commit()
-    except IntegrityError as exc:
-        await db.rollback()
-        raise ApiError(400, "invalid_request", message) from exc
-
-
-class PromptCreate(BaseModel):
-    # The agent this prompt is for; fixed once created (docs/agents.md).
-    agent: str = Field(default="parse", max_length=32)
-    name: str = Field(min_length=1, max_length=255)
-    text: str = Field(min_length=1)
-
-
-class PromptUpdate(BaseModel):
-    name: str | None = Field(default=None, min_length=1, max_length=255)
-    text: str | None = Field(default=None, min_length=1)
-
-
-def _prompt_payload(row: PromptPreset) -> dict:
-    return {
-        "id": row.id,
-        "agent": row.agent,
-        "name": row.name,
-        "text": row.text,
-        "created_at": row.created_at,
-        "updated_at": row.updated_at,
-    }
-
-
-def _checked_prompt_text(text: str, settings) -> str:
-    trimmed = text.strip()
-    if not trimmed:
-        raise ApiError(400, "invalid_request", "The prompt needs text")
-    if len(trimmed) > settings.system_prompt_max_chars:
-        raise ApiError(
-            400,
-            "invalid_request",
-            f"The prompt exceeds {settings.system_prompt_max_chars} characters",
-        )
-    return trimmed
-
-
-async def _owned_prompt(db: DbSession, user_id: int, prompt_id: int) -> PromptPreset:
-    row = (
-        await db.execute(
-            select(PromptPreset).where(
-                PromptPreset.id == prompt_id, PromptPreset.user_id == user_id
-            )
-        )
-    ).scalar_one_or_none()
-    if row is None:
-        raise ApiError(404, "invalid_request", "No such prompt")
-    return row
-
-
-async def _refuse_duplicate_prompt_name(
-    db: DbSession, user_id: int, name: str, exclude_id: int | None = None
-) -> None:
-    query = select(PromptPreset.id).where(
-        PromptPreset.user_id == user_id, PromptPreset.name == name
-    )
-    if exclude_id is not None:
-        query = query.where(PromptPreset.id != exclude_id)
-    if (await db.execute(query)).first() is not None:
-        raise ApiError(400, "invalid_request", "A prompt with this name already exists")
-
-
-@router.get("/prompts")
-async def list_prompts(user: SessionUser, db: DbSession):
-    rows = (
-        (
-            await db.execute(
-                select(PromptPreset)
-                .where(PromptPreset.user_id == user.id)
-                .order_by(PromptPreset.created_at)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    return {"prompts": [_prompt_payload(row) for row in rows]}
-
-
-@router.post("/prompts", dependencies=[CsrfGuard], status_code=status.HTTP_201_CREATED)
-async def create_prompt(
-    body: PromptCreate, user: SessionUser, db: DbSession, settings: AppSettings
-):
-    agent = get_agent(body.agent)
-    if agent is None:
-        raise ApiError(400, "invalid_request", f"No such agent '{body.agent}'")
-    name = body.name.strip()
-    if not name:
-        raise ApiError(400, "invalid_request", "The prompt needs a name")
-    text = _checked_prompt_text(body.text, settings)
-    await _refuse_duplicate_prompt_name(db, user.id, name)
-    row = PromptPreset(user_id=user.id, agent=agent.name, name=name, text=text)
-    db.add(row)
-    await _commit_or_name_conflict(db, "A prompt with this name already exists")
-    return _prompt_payload(row)
-
-
-@router.put("/prompts/{prompt_id}", dependencies=[CsrfGuard])
-async def update_prompt(
-    prompt_id: int, body: PromptUpdate, user: SessionUser, db: DbSession, settings: AppSettings
-):
-    row = await _owned_prompt(db, user.id, prompt_id)
-    provided = body.model_fields_set
-    if "name" in provided and body.name:
-        name = body.name.strip()
-        if not name:
-            raise ApiError(400, "invalid_request", "The prompt needs a name")
-        await _refuse_duplicate_prompt_name(db, user.id, name, exclude_id=row.id)
-        row.name = name
-    if "text" in provided and body.text:
-        row.text = _checked_prompt_text(body.text, settings)
-    row.updated_at = utcnow()
-    await _commit_or_name_conflict(db, "A prompt with this name already exists")
-    return _prompt_payload(row)
-
-
-@router.delete(
-    "/prompts/{prompt_id}", dependencies=[CsrfGuard], status_code=status.HTTP_204_NO_CONTENT
-)
-async def delete_prompt(prompt_id: int, user: SessionUser, db: DbSession) -> Response:
-    row = await _owned_prompt(db, user.id, prompt_id)
-    # Explicit fallback to the agent's default prompt, not just the FK's SET NULL.
-    await db.execute(
-        sa_update(AgentSetting)
-        .where(AgentSetting.user_id == user.id, AgentSetting.prompt_preset_id == row.id)
-        .values(prompt_preset_id=None)
-    )
-    await db.delete(row)
-    await db.commit()
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-
 # --- agents ---------------------------------------------------------------------------
 
 
@@ -666,7 +519,6 @@ def _agent_settings_payload(settings: AppSettings, agent: str, row: AgentSetting
         "model": _effective_model(settings, agent, row),
         # The user's own template; null for the agent's default (docs/agents.md).
         "prompt": row.prompt if row else None,
-        "prompt_preset_id": row.prompt_preset_id if row else None,
         "effort": (row.effort if row and row.effort else EFFORT_DEFAULT),
         # The chat agent's own: instructions appended after the prompt, the languages it
         # answers and translates into, and the memory switches (docs/agents.md).
@@ -744,7 +596,6 @@ class AgentSettingsPut(BaseModel):
     model: str | None = Field(default=None, max_length=255)
     # Capped in the route, where the settings are (`SYSTEM_PROMPT_MAX_CHARS`).
     prompt: str | None = None
-    prompt_preset_id: int | None = None
     effort: str | None = Field(default=None, max_length=8)
     # The chat agent's own, the instructions the check agent's too (docs/agents.md);
     # checked in the route, which answers 400 for each — capped where the settings are
@@ -846,9 +697,6 @@ async def put_agent_settings(
                 "invalid_request",
                 f"The prompt exceeds {settings.system_prompt_max_chars} characters",
             )
-    if prompt is not None and body.prompt_preset_id is not None:
-        # The two exclude each other (docs/agents.md § Per-agent settings).
-        raise ApiError(400, "invalid_request", "Send either prompt or prompt_preset_id")
     model: str | None = None
     if "model" in provided:
         model = (body.model or "").strip() or None
@@ -859,10 +707,6 @@ async def put_agent_settings(
             raise ApiError(400, "invalid_request", "That model is not one the chat agent offers")
     if body.effort is not None and body.effort not in EFFORT_LEVELS:
         raise ApiError(400, "invalid_request", "effort must be one of " + ", ".join(EFFORT_LEVELS))
-    if body.prompt_preset_id is not None:
-        preset = await _owned_prompt(db, user.id, body.prompt_preset_id)
-        if preset.agent != agent.name:
-            raise ApiError(400, "invalid_request", f"That prompt is for the {preset.agent} agent")
 
     if "memory_paused" in provided:
         # The reader's row, held until the commit: the `memory` tool reads the switch under
@@ -887,10 +731,8 @@ async def put_agent_settings(
         row.auto_convert = bool(body.auto_convert)
     if "auto_check" in provided:
         row.auto_check = bool(body.auto_check)
-    if "prompt" in provided or "prompt_preset_id" in provided:
-        # Writing either clears the other: one of the two is ever in force.
+    if "prompt" in provided:
         row.prompt = prompt
-        row.prompt_preset_id = body.prompt_preset_id
     if "effort" in provided:
         row.effort = body.effort or EFFORT_DEFAULT
     if "instructions" in provided:
@@ -908,10 +750,12 @@ async def put_agent_settings(
     try:
         await db.commit()
     except IntegrityError as exc:
-        # Another tab deleted the selected prompt between the ownership pre-check and
-        # this commit — an ordinary selection race, not a 500.
+        # Another request created this agent's row between the lookup and this commit —
+        # two first saves racing, not a 500.
         await db.rollback()
-        raise ApiError(409, "invalid_request", "The selected prompt was just deleted") from exc
+        raise ApiError(
+            409, "invalid_request", "The settings were saved elsewhere at the same time"
+        ) from exc
     # The convention follows the model, so a write answers the new one along with the row.
     return {
         **_agent_settings_payload(settings, agent.name, row),
@@ -951,7 +795,6 @@ async def chat_agent_context(
         )
     ).scalar_one_or_none()
     own_prompt = setting.prompt if setting and setting.prompt else None
-    preset = setting.prompt_preset if setting and own_prompt is None else None
     skills = skill_defs.resolve_skills(
         (await db.execute(select(Skill).where(Skill.user_id == user.id))).scalars()
     )
@@ -978,7 +821,6 @@ async def chat_agent_context(
         chat_agent.render_system_prompt(
             own_prompt or CHAT.default_prompt_template, facts, tools=tools
         ),
-        preset=preset.text if preset is not None else None,
         instructions=setting.instructions if setting else None,
         catalogue=chat_runner.turn_catalogue(skills, subagents),
         memory=memory_defs.render_memory_block(loaded, auto=auto, paused=paused),

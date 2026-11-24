@@ -29,7 +29,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import TypeDecorator
 
 JSON_COLUMN = JSONB().with_variant(JSON(), "sqlite")
@@ -122,22 +122,6 @@ class ApiKey(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
 
 
-class PromptPreset(Base):
-    """A named prompt for one agent; selecting one replaces that agent's template entirely
-    (docs/parsing.md § Prompts)."""
-
-    __tablename__ = "prompt_presets"
-    __table_args__ = (UniqueConstraint("user_id", "name", name="uq_prompt_presets_user_name"),)
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    agent: Mapped[str] = mapped_column(String(32))
-    name: Mapped[str] = mapped_column(String(255))
-    text: Mapped[str] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow)
-    updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=utcnow, onupdate=utcnow)
-
-
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 EFFORT_DEFAULT = "medium"
 
@@ -159,12 +143,8 @@ class AgentSetting(Base):
     # § Models).
     model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # The user's own template for the agent; NULL means the agent's default. It replaces
-    # the default whole and is never set together with a preset (docs/agents.md).
+    # the default whole (docs/agents.md).
     prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # The legacy selection of a prompt preset; NULL means none (docs/parsing.md § Prompts).
-    prompt_preset_id: Mapped[int | None] = mapped_column(
-        ForeignKey("prompt_presets.id", ondelete="SET NULL"), nullable=True
-    )
     # The chat agent's reasoning depth (docs/chat.md); parse ignores it.
     effort: Mapped[str] = mapped_column(
         String(8), default=EFFORT_DEFAULT, server_default=text("'medium'")
@@ -197,10 +177,6 @@ class AgentSetting(Base):
     # arrival; off — the default — it is kept as a file until the reader asks for Markdown
     # (docs/workspace.md § Files).
     auto_convert: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
-
-    prompt_preset: Mapped[PromptPreset | None] = relationship(
-        foreign_keys=[prompt_preset_id], lazy="selectin"
-    )
 
 
 class Job(Base):

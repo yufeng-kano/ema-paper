@@ -990,7 +990,7 @@ def render_summary(summary: str) -> str:
 
 @dataclass(frozen=True)
 class SystemPart:
-    """One system block and what it is: `prompt`, `preset`, `instructions`, `catalogue`,
+    """One system block and what it is: `prompt`, `instructions`, `catalogue`,
     `agents_file`, `memory_file` or `memory` — what the runner sends and the Agent page's
     drawer lists."""
 
@@ -1001,7 +1001,6 @@ class SystemPart:
 def system_parts(
     prompt: str,
     *,
-    preset: str | None,
     instructions: str | None,
     catalogue: str | None,
     memory: str | None,
@@ -1009,13 +1008,11 @@ def system_parts(
     agents_file: str | None = None,
 ) -> list[SystemPart]:
     """The system blocks in the order a turn sends them (docs/chat.md § Upstream): the
-    rendered prompt, a legacy preset verbatim, the reader's instructions (raw; rendered
-    here), the rendered catalogue, the rendered AGENTS.md block, the rendered memory-file
-    block, the rendered memory block — each only when it has something to say. The last
-    three are the conversation's own snapshots."""
+    rendered prompt, the reader's instructions (raw; rendered here), the rendered
+    catalogue, the rendered AGENTS.md block, the rendered memory-file block, the rendered
+    memory block — each only when it has something to say. The last three are the
+    conversation's own snapshots."""
     parts = [SystemPart("prompt", prompt)]
-    if preset is not None and preset.strip():
-        parts.append(SystemPart("preset", preset))
     rendered_instructions = render_instructions(instructions)
     if rendered_instructions is not None:
         parts.append(SystemPart("instructions", rendered_instructions))

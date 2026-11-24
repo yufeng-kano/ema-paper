@@ -399,3 +399,108 @@ async def test_the_head_refuses_what_its_constraints_forbid(head_engine) -> None
         for table in ("group_members", "credit_entries", "credit_periods", "credit_packs"):
             assert await _count(db, table) == 0, table
         assert await _count(db, "groups") == 1
+
+
+async def _preset(db, user: int, agent: str, name: str, body: str) -> int:
+    return (
+        await db.execute(
+            text(
+                "INSERT INTO prompt_presets (user_id, agent, name, text, created_at, updated_at) "
+                "VALUES (:user, :agent, :name, :text, now(), now()) RETURNING id"
+            ),
+            {"user": user, "agent": agent, "name": name, "text": body},
+        )
+    ).scalar_one()
+
+
+async def _selected(db, user: int, agent: str, preset: int, **columns: str | None) -> None:
+    await db.execute(
+        text(
+            "INSERT INTO agent_settings (user_id, agent, prompt, prompt_preset_id, instructions) "
+            "VALUES (:user, :agent, :prompt, :preset, :instructions)"
+        ),
+        {
+            "user": user,
+            "agent": agent,
+            "preset": preset,
+            "prompt": columns.get("prompt"),
+            "instructions": columns.get("instructions"),
+        },
+    )
+
+
+async def test_the_presets_in_force_move_into_prompts_and_instructions(scratch_url) -> None:
+    """774fee25f32b: a preset still in force moves to where its agent keeps reading it —
+    `parse` and `check` into `prompt` verbatim, `chat` to the head of `instructions`,
+    uncapped — and nothing else moves; the downgrade restores the table and the column,
+    empty."""
+    _alembic(scratch_url, "upgrade", "4449f68533c0")
+    long_preset = "Answer as {document_path} says.\n" + "x" * 9000
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.begin() as db:
+            one, two, three, four = [await _user(db, n) for n in range(1, 5)]
+            # In force: the row has no prompt of its own.
+            parse = await _preset(db, one, "parse", "p", "Tables of page {page}.\n")
+            await _selected(db, one, "parse", parse)
+            check = await _preset(db, one, "check", "c", "Check it.")
+            await _selected(db, one, "check", check, prompt="")
+            chat = await _preset(db, one, "chat", "t", "Use {document_path} as is.")
+            await _selected(db, one, "chat", chat, instructions="Be brief.")
+            long = await _preset(db, two, "chat", "long", long_preset)
+            await _selected(db, two, "chat", long)
+            terse = await _preset(db, three, "chat", "t", "Terse.")
+            await _selected(db, three, "chat", terse, instructions=" ")
+            # Not in force: a prompt of its own, a blank chat preset, an unselected preset.
+            never = await _preset(db, two, "parse", "p", "Never ran.")
+            await _selected(db, two, "parse", never, prompt="Mine {page}.")
+            never = await _preset(db, three, "check", "c", "Never ran.")
+            await _selected(db, three, "check", never, prompt="Own check.", instructions="Kept.")
+            blank = await _preset(db, four, "chat", "blank", " \n ")
+            await _selected(db, four, "chat", blank, instructions="Kept as is.")
+            await _preset(db, four, "parse", "unselected", "Nowhere.")
+    finally:
+        await engine.dispose()
+
+    _alembic(scratch_url, "upgrade", "head")
+    expected = {
+        (one, "parse"): ("Tables of page {page}.\n", None),
+        (one, "check"): ("Check it.", None),
+        (one, "chat"): (None, "Use {document_path} as is.\n\nBe brief."),
+        (two, "chat"): (None, long_preset),
+        (three, "chat"): (None, "Terse."),
+        (two, "parse"): ("Mine {page}.", None),
+        (three, "check"): ("Own check.", "Kept."),
+        (four, "chat"): (None, "Kept as is."),
+    }
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.connect() as db:
+            rows = await db.execute(
+                text("SELECT user_id, agent, prompt, instructions FROM agent_settings")
+            )
+            assert {(row[0], row[1]): (row[2], row[3]) for row in rows} == expected
+            left = await db.execute(
+                text(
+                    "SELECT to_regclass('prompt_presets'), count(*) "
+                    "FROM information_schema.columns WHERE table_name = 'agent_settings' "
+                    "AND column_name = 'prompt_preset_id'"
+                )
+            )
+            assert tuple(left.one()) == (None, 0)
+    finally:
+        await engine.dispose()
+
+    _alembic(scratch_url, "downgrade", "4449f68533c0")
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.connect() as db:
+            assert await _count(db, "prompt_presets") == 0
+            selected = await db.execute(
+                text("SELECT count(*) FROM agent_settings WHERE prompt_preset_id IS NOT NULL")
+            )
+            assert selected.scalar_one() == 0
+            assert await _count(db, "agent_settings") == len(expected)
+    finally:
+        await engine.dispose()
+    _alembic(scratch_url, "upgrade", "head")

@@ -316,21 +316,16 @@ async def test_result_md_serves_the_markdown_as_a_file(api_client, sessionmaker,
 
 
 @respx.mock
-async def test_a_selected_prompt_preset_is_sent_and_keyed_into_the_cache(
+async def test_the_parse_prompt_is_sent_and_keyed_into_the_cache(
     api_client, sessionmaker, documents
 ) -> None:
     route = respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
-    created = await api_client.post(
-        "/api/prompts",
-        json={"name": "Tables only", "text": "Only tables from page {page}."},
+    saved = await api_client.put(
+        "/api/agents/parse/settings",
+        json={"prompt": "Only tables from page {page}."},
         headers=CSRF_HEADERS,
     )
-    assert created.status_code == 201
-    preset_id = created.json()["id"]
-    selected = await api_client.put(
-        "/api/agents/parse/settings", json={"prompt_preset_id": preset_id}, headers=CSRF_HEADERS
-    )
-    assert selected.json()["prompt_preset_id"] == preset_id
+    assert saved.json()["prompt"] == "Only tables from page {page}."
 
     await _upload(api_client, documents["text_pdf"])
     await _drain_queue(api_client, sessionmaker)
@@ -339,8 +334,8 @@ async def test_a_selected_prompt_preset_is_sent_and_keyed_into_the_cache(
 
     # Same bytes, same model — but a different prompt is a different parse.
     await api_client.put(
-        f"/api/prompts/{preset_id}",
-        json={"text": "Verbatim, everything."},
+        "/api/agents/parse/settings",
+        json={"prompt": "Verbatim, everything."},
         headers=CSRF_HEADERS,
     )
     again = await _upload(api_client, documents["text_pdf"])

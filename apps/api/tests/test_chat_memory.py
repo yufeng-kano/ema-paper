@@ -233,12 +233,10 @@ def test_the_selected_block_never_passes_its_cap() -> None:
 
 
 def test_the_system_parts_keep_their_order_and_the_cache_on_the_last() -> None:
+    parts = chat_agent.system_parts("prompt", instructions="  ", catalogue=None, memory="memory")
+    assert [part.kind for part in parts] == ["prompt", "memory"]
     parts = chat_agent.system_parts(
-        "prompt", preset="preset", instructions="  ", catalogue=None, memory="memory"
-    )
-    assert [part.kind for part in parts] == ["prompt", "preset", "memory"]
-    parts = chat_agent.system_parts(
-        "prompt", preset=" ", instructions="Mine {page_count}", catalogue="cat", memory="mem"
+        "prompt", instructions="Mine {page_count}", catalogue="cat", memory="mem"
     )
     assert [part.kind for part in parts] == ["prompt", "instructions", "catalogue", "memory"]
     # Appended verbatim: a token in the reader's words is theirs, not substituted.
@@ -290,8 +288,8 @@ def test_the_turn_block_names_the_languages_only_when_chosen() -> None:
     assert turn_note("abc", "en", None, None) == (
         "Context for this message:\n- document revision: abc\n- reader locale: en"
     )
-    # Each line carries its own rule: a prompt the reader replaced, or the one a migration
-    # moved their preset into, knows nothing of these lines (docs/chat.md § Instructions).
+    # Each line carries its own rule: a prompt the reader replaced knows nothing of these
+    # lines (docs/chat.md § Instructions).
     assert turn_note(None, "zh-TW", "ja", "zh-TW").endswith(
         f"- reader locale: zh-TW\n{ANSWER_JA}\n{translation_line('zh-TW')}"
     )
@@ -563,13 +561,7 @@ async def test_the_context_route_shows_what_a_turn_would_send(chat_client) -> No
         ),
     }
 
-    # The reader's prompt, a legacy preset, instructions and languages, with a document.
-    preset = await client.post(
-        "/api/prompts",
-        json={"agent": "chat", "name": "Legacy", "text": "Legacy words."},
-        headers=CSRF_HEADERS,
-    )
-    await put_chat(client, prompt_preset_id=preset.json()["id"])
+    # Instructions and languages, with a document.
     await put_chat(client, instructions="Be brief.", answer_language="ja", translate_language="en")
     with_document = (
         await client.get(
@@ -578,9 +570,8 @@ async def test_the_context_route_shows_what_a_turn_would_send(chat_client) -> No
         )
     ).json()
     kinds = [part["kind"] for part in with_document["parts"]]
-    assert kinds == ["prompt", "preset", "instructions", "catalogue", "memory"]
+    assert kinds == ["prompt", "instructions", "catalogue", "memory"]
     parts = {part["kind"]: part for part in with_document["parts"]}
-    assert parts["preset"]["text"] == "Legacy words."
     assert parts["instructions"]["text"] == chat_agent.INSTRUCTIONS_INTRO + "Be brief."
     assert parts["memory"]["count"] == 2 and "d is 512 (this document)" in parts["memory"]["text"]
     assert "elsewhere" not in parts["memory"]["text"]
@@ -723,14 +714,8 @@ async def test_the_turn_block_carries_the_readers_languages(chat_client) -> None
 
 
 @respx.mock
-async def test_the_instructions_follow_the_prompt_and_preset_verbatim(chat_client) -> None:
+async def test_the_instructions_follow_the_prompt_verbatim(chat_client) -> None:
     client = chat_client
-    preset = await client.post(
-        "/api/prompts",
-        json={"agent": "chat", "name": "Legacy", "text": "Legacy words."},
-        headers=CSRF_HEADERS,
-    )
-    await put_chat(client, prompt_preset_id=preset.json()["id"])
     instructions = "I study {page_count} things.\n\n- Answer in tables"
     await put_chat(client, instructions=instructions)
     main, _ = stub_messages([DONE])
@@ -739,12 +724,11 @@ async def test_the_instructions_follow_the_prompt_and_preset_verbatim(chat_clien
     await _run_queued_turn(client)
 
     system = main[0]["system"]
-    assert len(system) == 5
-    assert system[1]["text"] == "Legacy words."
-    assert system[2]["text"] == chat_agent.INSTRUCTIONS_INTRO + instructions
-    assert "# Skills" in system[3]["text"]
-    assert system[4]["text"].startswith("# Memory\n")
-    assert [block.get("cache_control") for block in system] == [None] * 4 + [
+    assert len(system) == 4
+    assert system[1]["text"] == chat_agent.INSTRUCTIONS_INTRO + instructions
+    assert "# Skills" in system[2]["text"]
+    assert system[3]["text"].startswith("# Memory\n")
+    assert [block.get("cache_control") for block in system] == [None] * 3 + [
         {"type": "ephemeral", "ttl": "1h"}
     ]
     assert "memory" in [tool["name"] for tool in main[0]["tools"]]

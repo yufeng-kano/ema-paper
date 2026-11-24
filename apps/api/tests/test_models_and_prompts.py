@@ -1,6 +1,6 @@
-"""The models the deployment offers, the agents' model settings and prompt presets: the
-operator's key on every upstream call and never in a response, everything stubbed
-(docs/testing.md § Cost safety, docs/billing.md § Models)."""
+"""The models the deployment offers and the agents' model settings: the operator's key on
+every upstream call and never in a response, everything stubbed (docs/testing.md § Cost
+safety, docs/billing.md § Models)."""
 
 from __future__ import annotations
 
@@ -169,68 +169,6 @@ async def test_unknown_agents_are_refused(signed_in) -> None:
         "/api/agents/summarize/settings", json={"model": "x"}, headers=CSRF_HEADERS
     )
     assert put.status_code == 404
-    prompt = await signed_in.post(
-        "/api/prompts",
-        json={"agent": "summarize", "name": "x", "text": "y"},
-        headers=CSRF_HEADERS,
-    )
-    assert prompt.status_code == 400
-
-
-# --- prompt presets -------------------------------------------------------------------
-
-
-async def test_prompt_preset_crud_and_selection(signed_in) -> None:
-    created = await signed_in.post(
-        "/api/prompts",
-        json={"name": "Tables only", "text": "Only tables from page {page}."},
-        headers=CSRF_HEADERS,
-    )
-    assert created.status_code == 201
-    preset = created.json()
-
-    listed = (await signed_in.get("/api/prompts")).json()["prompts"]
-    assert [row["name"] for row in listed] == ["Tables only"]
-
-    # Existing callers that never name an agent get the parse agent's prompts.
-    assert preset["agent"] == "parse"
-
-    selected = await signed_in.put(
-        "/api/agents/parse/settings",
-        json={"prompt_preset_id": preset["id"]},
-        headers=CSRF_HEADERS,
-    )
-    assert selected.json()["prompt_preset_id"] == preset["id"]
-    assert (await _settings_of(signed_in, "parse"))["settings"]["prompt_preset_id"] == preset["id"]
-
-    renamed = await signed_in.put(
-        f"/api/prompts/{preset['id']}", json={"name": "Tables"}, headers=CSRF_HEADERS
-    )
-    assert renamed.json()["name"] == "Tables"
-
-    assert (
-        await signed_in.delete(f"/api/prompts/{preset['id']}", headers=CSRF_HEADERS)
-    ).status_code == 204
-    # Deleting the selected preset falls back to the default prompt.
-    assert (await _settings_of(signed_in, "parse"))["settings"]["prompt_preset_id"] is None
-
-
-async def test_prompt_text_is_capped(signed_in, make_client) -> None:
-    client = make_client(system_prompt_max_chars=10)
-    assert (await client.post("/api/auth/dev-login", headers=CSRF_HEADERS)).status_code == 200
-    response = await client.post(
-        "/api/prompts",
-        json={"name": "Long", "text": "x" * 11},
-        headers=CSRF_HEADERS,
-    )
-    assert response.status_code == 400
-
-
-async def test_a_foreign_preset_cannot_be_selected(signed_in) -> None:
-    response = await signed_in.put(
-        "/api/agents/parse/settings", json={"prompt_preset_id": 999}, headers=CSRF_HEADERS
-    )
-    assert response.status_code == 404
 
 
 # --- the parse model at enqueue ---------------------------------------------------------

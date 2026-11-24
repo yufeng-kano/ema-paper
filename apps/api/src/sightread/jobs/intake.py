@@ -206,8 +206,8 @@ async def resolve_target(
 ) -> Target:
     """Upstream, model and prompt for a job of `agent` (docs/agents.md § Enqueue rules):
     the operator's Kano Proxy, the deployment's parse model — a per-request `model` must
-    be one of the parse agent's — and the user's own prompt, else a legacy preset, else
-    the agent's default template (docs/parsing.md § Prompts)."""
+    be one of the parse agent's — and the user's own prompt, else the agent's default
+    template (docs/parsing.md § Prompts)."""
     model = checked_parse_model(settings, model)
     if not settings.kano_proxy_configured:
         raise ApiError(503, "upstream", "Kano Proxy is not configured on this deployment")
@@ -218,15 +218,8 @@ async def resolve_target(
             )
         )
     ).scalar_one_or_none()
-    # The user's own prompt, else a legacy preset, else the default — each replacing the
-    # template whole (docs/parsing.md § Prompts).
-    preset = row.prompt_preset if row else None
-    if row is not None and row.prompt:
-        prompt = row.prompt
-    elif preset is not None:
-        prompt = preset.text
-    else:
-        prompt = agent.default_prompt_template
+    # The user's own prompt replaces the default template whole (docs/parsing.md § Prompts).
+    prompt = (row.prompt if row else None) or agent.default_prompt_template
     fallback = (
         settings.parse_fallback_model
         if row is not None and row.auto_fallback and settings.parse_fallback_model
@@ -264,18 +257,12 @@ async def resolve_check(
     model = settings.check_model or parse_model
     if row is None:
         return CheckTarget(model, EFFORT_DEFAULT, CHECK.default_prompt_template)
-    # The user's own prompt, else a legacy preset, else the default, as for the parse
-    # agent (docs/agents.md § Enqueue rules).
-    if row.prompt:
-        prompt = row.prompt
-    elif row.prompt_preset is not None:
-        prompt = row.prompt_preset.text
-    else:
-        prompt = CHECK.default_prompt_template
+    # The user's own prompt, else the default, as for the parse agent (docs/agents.md
+    # § Enqueue rules).
     return CheckTarget(
         model,
         row.effort or EFFORT_DEFAULT,
-        check_agent.system_prompt(prompt, row.instructions),
+        check_agent.system_prompt(row.prompt or CHECK.default_prompt_template, row.instructions),
     )
 
 

@@ -326,12 +326,10 @@ async def _load(
         connection = kano_connection(settings, anthropic=True)
         if connection is None:
             raise TurnFailed("Kano Proxy is not configured on this deployment")
-        # The reader's own prompt replaces the default whole; a legacy preset is appended
-        # to it as before, and never stands beside a prompt (docs/chat.md § System prompt).
-        # A library conversation always renders its own: the reader's is written for a
-        # document and its tokens (docs/chat.md § Library conversations).
+        # The reader's own prompt replaces the default whole (docs/chat.md § System
+        # prompt). A library conversation always renders its own: the reader's is written
+        # for a document and its tokens (docs/chat.md § Library conversations).
         own_prompt = setting.prompt if setting and setting.prompt else None
-        preset = setting.prompt_preset if setting and own_prompt is None else None
         # Appended after the prompt, whichever is in force (docs/chat.md § Instructions).
         instructions = setting.instructions if setting else None
         effort = setting.effort if setting and setting.effort else EFFORT_DEFAULT
@@ -409,9 +407,9 @@ async def _load(
     shell = ledger.sandbox_granted(settings, plan)
     sandbox = SandboxClient(settings) if shell else None
     tools = turn_tools(shell, settings, library=library)
-    # The prompt, then a legacy preset, the reader's instructions, the catalogue — read
-    # per turn like the prompt, so an edit on the Agent page misses the cache once — and
-    # the memory block last (docs/chat.md § Prompt caching).
+    # The prompt, then the reader's instructions, the catalogue — read per turn like the
+    # prompt, so an edit on the Agent page misses the cache once — and the memory block
+    # last (docs/chat.md § Prompt caching).
     parts = chat_agent.system_parts(
         # The tool list as the turn has it: no `bash` line without a runner.
         chat_agent.render_system_prompt(
@@ -421,7 +419,6 @@ async def _load(
             facts,
             tools=[tool["name"] for tool in tools],
         ),
-        preset=preset.text if preset is not None else None,
         instructions=instructions,
         catalogue=turn_catalogue(skills, subagents),
         memory=memory.block,
