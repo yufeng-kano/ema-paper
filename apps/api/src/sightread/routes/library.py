@@ -901,14 +901,9 @@ async def file_parse(
         model=model,
         force=force,
         ticket=ticket,
-        # The browser cannot tell a lost response from a lost request, so its retry of an
-        # upload that in fact landed must not buy a second parse (docs/jobs.md § Dedup).
-        reuse_in_flight=True,
         # A library upload keeps its original even if the worker finishes before the
         # document row below exists (docs/jobs.md § Retention).
         retain_source=True,
-        # Checked before it opens (docs/parsing.md § Format check).
-        check=True,
     )
     # A dedup hit is a finished parse rather than a new one, so the file points at the job
     # that already produced it (docs/jobs.md § Dedup).
@@ -1482,7 +1477,6 @@ async def reconvert_document(
             filename=job.filename,
             model=body.model,
             force=True,
-            check=True,
             reconvert=row,
         )
     return {"job_id": str(submission.job.id), "status": "queued"}

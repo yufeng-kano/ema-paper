@@ -10,10 +10,12 @@ from __future__ import annotations
 import uuid
 from datetime import timedelta
 
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings
 from ..db.models import UploadTicket, User, utcnow
+from ..errors import ApiError
 from .crypto import hash_token, new_token
 from .tickets import check_rate, delete_expired, resolve_ticket
 
@@ -78,7 +80,15 @@ async def resolve(db: AsyncSession, presented: str) -> tuple[UploadTicket, User]
     return await resolve_ticket(db, UploadTicket, TICKET_PREFIX, presented)
 
 
-def spend(ticket: UploadTicket, job_id: uuid.UUID) -> None:
-    """Bind a ticket to the job its upload produced and burn it (docs/auth.md § 5)."""
-    ticket.job_id = job_id
-    ticket.spent_at = utcnow()
+async def spend(db: AsyncSession, ticket: UploadTicket, job_id: uuid.UUID) -> None:
+    """Bind a ticket to the job its upload produced and burn it, in the caller's
+    transaction (docs/auth.md § 5). Conditional on the ticket still being unspent: the
+    request that authenticated on it may have raced another, and the loser's update waits
+    on the winner's row lock, then matches nothing and is the 401."""
+    spent = await db.execute(
+        update(UploadTicket)
+        .where(UploadTicket.id == ticket.id, UploadTicket.spent_at.is_(None))
+        .values(job_id=job_id, spent_at=utcnow())
+    )
+    if spent.rowcount != 1:
+        raise ApiError(401, "auth", REJECTION_MESSAGE)

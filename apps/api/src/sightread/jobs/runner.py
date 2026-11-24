@@ -89,7 +89,7 @@ from ..workspace.layout import document_relative_dir, user_root
 from ..workspace.locks import backup_shared, workspace_lock
 from . import events
 from .check import CheckFailed, run_check
-from .queue import parse_pages_spec
+from .queue import owned_by, parse_pages_spec
 
 logger = logging.getLogger(__name__)
 
@@ -183,9 +183,8 @@ class RunState:
     # VISION_MAX_OUTPUT_TOKENS, likewise (docs/parsing.md § Upstream usage).
     max_output_tokens: int
     payment_failures: int = 0
-    # This job's own directory under FIGURES_DIR; None turns crop persistence off
-    # (docs/parsing.md § Figure crops).
-    figures_dir: Path | None = None
+    # This job's own directory under FIGURES_DIR (docs/parsing.md § Figure crops).
+    figures_dir: Path
     # The worker's generation, the fence on every write to the job's row; None when the
     # caller claimed without one (docs/jobs.md § Queue).
     generation: int | None = None
@@ -436,10 +435,6 @@ async def _check_figures(
         while asking and calls < max(1, state.figure_check_rounds):
             if sent is None:
                 sent = await to_the_end(asyncio.to_thread(prepare_image, image, convention))
-            if calls:
-                # The previous round's call is billed before this one is sent.
-                await to_the_end(_log_usage(sessionmaker, job, outcome.usage))
-                outcome.usage.clear()
             marked = sent.path.with_name(f"{sent.path.stem}-check.png")
             await to_the_end(asyncio.to_thread(mark_boxes, sent.path, boxes, marked))
             try:
@@ -461,6 +456,10 @@ async def _check_figures(
                 )
             finally:
                 marked.unlink(missing_ok=True)
+            # Billed as soon as it is answered: a cancel in the raster work below, or the
+            # next call aborting the job, ends the page before it is recorded.
+            await to_the_end(_log_usage(sessionmaker, job, outcome.usage))
+            outcome.usage.clear()
             calls += 1
             if answer is None:
                 return  # the page failed; the outcome says why
@@ -528,8 +527,10 @@ async def _run_page(
             outcome.markdown = transcription.markdown
             await _check_figures(job, state, connection, outcome, image, sessionmaker)
         # Billing before the optional raster work: a SIGTERM landing mid-crop cancels this
-        # task, and the calls that already ran must be in `usage_log` first.
-        await _record_page(sessionmaker, job, outcome, state.generation)
+        # task, and the calls that already ran must be in `usage_log` first. A cancel
+        # landing in the record itself waits it out: its calls are logged, and a succeeded
+        # page is kept, never paid twice.
+        await to_the_end(_record_page(sessionmaker, job, outcome, state.generation))
         if not outcome.error:
             await _save_figures(state, outcome.markdown, image, outcome.page)
     finally:
@@ -596,7 +597,7 @@ async def _restore_pdf_page(
     fails costs the page its crops, never the page."""
     size = info.page_size(page_no)
     outcome = _kept_outcome(job, kept, page_no, size.width_pt, size.height_pt)
-    if state.figures_dir is None or not PLACEHOLDER_RE.search(kept.markdown):
+    if not PLACEHOLDER_RE.search(kept.markdown):
         return outcome
     try:
         async with render_slots:
@@ -664,7 +665,7 @@ async def _restore_image(
 def _locked_save_figures(state: RunState, markdown: str, image: Path, page_no: int) -> None:
     """Thread body: crop under the guard, unless this job's figures were discarded."""
     with state.figures_guard:
-        if state.figures_discarded or state.figures_dir is None:
+        if state.figures_discarded:
             return
         save_page_figures(markdown, image, page_no, state.figures_dir, limit=state.figures_per_page)
 
@@ -675,8 +676,6 @@ async def _save_figures(state: RunState, markdown: str, image: Path, page_no: in
     Pillow work runs off the event loop; the fan-out must not stall behind an image
     decode. The guard it runs under is what lets `_discard_figures` wait it out.
     """
-    if state.figures_dir is None:
-        return
     await asyncio.to_thread(_locked_save_figures, state, markdown, image, page_no)
 
 
@@ -684,8 +683,6 @@ def _publish_figures(state: RunState, figures_root: Path, job_id: uuid.UUID) -> 
     """The attempt's crops under the job's name, once its result is committed. Under the
     guard, so no crop thread writes into a directory being moved; the flag then turns
     away one that has not started (docs/parsing.md § Figure crops)."""
-    if state.figures_dir is None:
-        return
     with state.figures_guard:
         state.figures_discarded = True
         publish_job_figures(figures_root, job_id, state.figures_dir)
@@ -699,16 +696,9 @@ def _discard_figures(state: RunState) -> None:
     guard means a crop thread mid-write finishes first, and the discard flag means one
     that has not started yet writes nothing (docs/parsing.md § Figure crops).
     """
-    if state.figures_dir is None:
-        return
     with state.figures_guard:
         state.figures_discarded = True
         shutil.rmtree(state.figures_dir, ignore_errors=True)
-
-
-def _owned(generation: int | None) -> list:
-    """The fence: the row still holds the caller's generation (docs/jobs.md § Queue)."""
-    return [Job.worker_generation == generation] if generation is not None else []
 
 
 async def _record_page(
@@ -726,7 +716,7 @@ async def _record_page(
         owned = (
             await db.execute(
                 update(Job)
-                .where(Job.id == job.id, *_owned(generation))
+                .where(Job.id == job.id, *owned_by(generation))
                 .values(pages_done=Job.pages_done + 1)
             )
         ).rowcount == 1
@@ -877,8 +867,9 @@ async def _finish(
     result, so no snapshot carries one without them, and before the document copies are
     made, which take their crops from there (docs/workspace.md § Layout).
 
-    A succeeded parse behind a library document keeps its original instead: the source
-    moves into the document's workspace directory (docs/workspace.md). A failed job's crop
+    A parse behind a library document, whatever its terminal state, keeps its original
+    instead: filed as the document's original, with a copy in a directory already
+    materialized (`_retain_source`, docs/jobs.md § Retention). A failed job's crop
     directory goes too — `run_job`'s outermost finally discards it (through the crop
     guard), so a late crop thread cannot write it back.
     """
@@ -1169,7 +1160,7 @@ async def run_job(
                 # own snapshot, and this run ends here (docs/jobs.md § Queue).
                 moved = await db.execute(
                     update(Job)
-                    .where(Job.id == job_id, Job.status == "running", *_owned(generation))
+                    .where(Job.id == job_id, Job.status == "running", *owned_by(generation))
                     .values(connection_base_url=settings.kano_proxy_base_url)
                 )
                 if moved.rowcount != 1:

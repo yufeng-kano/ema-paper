@@ -2,7 +2,7 @@
 
 A job row *is* its queue entry, so creating a job and enqueueing it are one transaction —
 there is no broker and no dual write. Claiming is `FOR UPDATE SKIP LOCKED`, FIFO, with the
-per-user cap applied at claim time so one user cannot monopolise the workers.
+per-user cap applied at claim time so one user cannot monopolise the worker.
 """
 
 from __future__ import annotations
@@ -341,10 +341,11 @@ async def find_parse_to_retry(
     and whether a library document names it. The newest decides, a Files upload's
     included: a newer parse of the file is never passed over for an older failure, which
     would be billed again for nothing. The caller puts back a failed one no document
-    names, refuses a failed one a document names — the library retries it from its
-    original — and answers with one queued, running or succeeded as it stands. The model
-    and the prompt are the parse's own and play no part, as in the library's retry. With
-    `retention_days` 0 nothing is purged, and any such parse answers."""
+    names, hands a failed one a document names to the library's retry, from its original
+    (`Submission.library_retry`), and answers with one queued, running or succeeded as it
+    stands. The model and the prompt are the parse's own and play no part, as in the
+    library's retry. With `retention_days` 0 nothing is purged, and any such parse
+    answers."""
     named = (
         select(Document.id)
         .where(or_(Document.job_id == Job.id, Document.reconvert_job_id == Job.id))
@@ -505,6 +506,11 @@ async def next_worker_generation(db: AsyncSession) -> int:
     return int(highest or 0) + 1
 
 
+def owned_by(generation: int | None) -> list[ColumnElement[bool]]:
+    """The fence: the row still holds the caller's generation (docs/jobs.md § Queue)."""
+    return [Job.worker_generation == generation] if generation is not None else []
+
+
 # The advisory lock one worker holds for its lifetime: any fixed bigint (docs/jobs.md).
 WORKER_LOCK_KEY = 7_312_024_001
 
@@ -631,10 +637,8 @@ async def requeue_orphaned_jobs(db: AsyncSession, generation: int | None = None)
     back is driven by nobody, and fenced on the generation it is requeued only if it is
     still this worker's (docs/jobs.md § Queue). Returns the ids that went back, whose
     crops the caller discards with the partial progress."""
-    owned = [Job.worker_generation == generation] if generation is not None else []
-    orphans = list(
-        (await db.execute(select(Job.id).where(Job.status == "running", *owned))).scalars()
-    )
+    running = select(Job.id).where(Job.status == "running", *owned_by(generation))
+    orphans = list((await db.execute(running)).scalars())
     return [job_id for job_id in orphans if await requeue_job(db, job_id, generation)]
 
 
@@ -670,11 +674,10 @@ async def requeue_job(
     one, since every `running` row is then a dead worker's. `commit=False` leaves the
     commit to the caller: the console's requeue commits it with its audit row.
     """
-    owned = [Job.worker_generation == generation] if generation is not None else []
     requeued = (
         await db.execute(
             update(Job)
-            .where(Job.id == job_id, Job.status == "running", *owned)
+            .where(Job.id == job_id, Job.status == "running", *owned_by(generation))
             .values(status="queued", started_at=None, worker_generation=None)
         )
     ).rowcount > 0

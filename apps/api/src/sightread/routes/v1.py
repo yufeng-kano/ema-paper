@@ -257,11 +257,6 @@ async def parse(request: Request, caller: UploaderCaller, db: DbSession, setting
                 pages=pages,
                 force=force,
                 ticket=ticket,
-                # As the web library's upload: the same bytes in flight are joined, never
-                # bought twice, and the parse is checked (docs/jobs.md § Dedup cache,
-                # docs/parsing.md § Format check).
-                reuse_in_flight=True,
-                check=True,
                 retry=retry,
             )
         if submission.library_retry is not None:

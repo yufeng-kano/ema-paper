@@ -28,12 +28,10 @@ KEEPALIVE_SECONDS = 10.0
 POLL_INTERVAL_SECONDS = 1.0
 TERMINAL_STATUSES = ("succeeded", "failed")
 
-# Event names. `keepalive` carries no data and exists only to hold an idle HTTP connection
-# open; consumers that are not SSE (the MCP tools) ignore it.
+# Event names.
 PROGRESS = "progress"
 DONE = "done"
 ERROR = "error"
-KEEPALIVE = "keepalive"
 
 
 def channel_for(job_id: uuid.UUID) -> str:
@@ -114,21 +112,11 @@ async def stream_job_events(
     database_url: str,
     job_id: uuid.UUID,
 ) -> AsyncIterator[str]:
-    """The SSE rendering of `iter_job_events` (docs/api.md § GET /v1/jobs/{id}/events)."""
-    async for event, data in iter_job_events(sessionmaker, database_url, job_id):
-        yield ": keepalive\n\n" if event == KEEPALIVE else sse(event, data)
-
-
-async def iter_job_events(
-    sessionmaker: async_sessionmaker[AsyncSession],
-    database_url: str,
-    job_id: uuid.UUID,
-) -> AsyncIterator[tuple[str, dict]]:
-    """Yield `(event, data)` pairs until the job reaches a terminal state.
+    """The SSE frames of one job until it reaches a terminal state (docs/api.md § GET
+    /v1/jobs/{id}/events): that route's stream, and a streamed `POST /v1/parse`'s.
 
     A job that is already terminal replays its final event immediately, so a client that
-    reconnects late still gets its result. Two consumers: the SSE routes and the MCP tools,
-    which turn `progress` into MCP progress notifications (docs/mcp.md).
+    reconnects late still gets its result.
     """
     # Imported here: the runner imports this module for `notify`, and the result shape
     # belongs to the runner that writes it.
@@ -141,12 +129,12 @@ async def iter_job_events(
 
     try:
         while True:
-            # Cleared before the read, so a NOTIFY that lands during it or while the pairs
+            # Cleared before the read, so a NOTIFY that lands during it or while the frames
             # below are consumed wakes the next wait at once.
             wakeup.clear()
             job, pages, result = await _snapshot(sessionmaker, job_id)
             if job is None:
-                yield ERROR, {"error": {"type": "invalid_request", "message": "No such job"}}
+                yield sse(ERROR, {"error": {"type": "invalid_request", "message": "No such job"}})
                 return
 
             for page in pages:
@@ -154,7 +142,7 @@ async def iter_job_events(
                     continue
                 emitted.add(page.page_no)
                 silent_for = 0.0
-                yield (
+                yield sse(
                     PROGRESS,
                     {
                         "job_id": str(job.id),
@@ -168,9 +156,9 @@ async def iter_job_events(
             if job.status in TERMINAL_STATUSES:
                 if result is not None:
                     # The data plane's stream: the text the web reader opens.
-                    yield DONE, result_payload(result, reading_copy=True)
+                    yield sse(DONE, result_payload(result, reading_copy=True))
                 else:
-                    yield (
+                    yield sse(
                         ERROR,
                         {"error": {"type": "internal", "message": job.error or "Job failed"}},
                     )
@@ -183,7 +171,8 @@ async def iter_job_events(
                 silent_for += POLL_INTERVAL_SECONDS
                 if silent_for >= KEEPALIVE_SECONDS:
                     silent_for = 0.0
-                    yield KEEPALIVE, {}
+                    # A comment frame, no event: it only holds an idle connection open.
+                    yield ": keepalive\n\n"
     finally:
         if listener is not None:
             await listener.close()

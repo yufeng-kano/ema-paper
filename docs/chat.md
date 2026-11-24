@@ -549,7 +549,7 @@ The caps' counts:
 
 - It claims the job it queued as the worker's claim would (`queue.claim_job`: `queued` to `running`, carrying the worker's generation, which the worker hands every turn it runs).
 - It drives the job to its end with the parse runner's own `run_job`, on the settings snapshot the turn runs on and with the turn's render slots, so the pages, the figure check, the format check, the original kept and the document materialized are exactly a worker's ([jobs.md](./jobs.md) § Converting a file).
-- A job the dedup reuse found already queued for the same bytes (`reuse_in_flight`) is claimed and run the same way.
+- A job the in-flight join found already queued for the same bytes ([jobs.md](./jobs.md) § Dedup cache) is claimed and run the same way.
 - A job already running — a stale worker's — is waited for.
 
 The wait is bounded by `CONVERT_FILE_TIMEOUT_SECONDS` (900) and looks for a Stop every few seconds:

@@ -154,7 +154,7 @@ A model's answer gives no verdict for a box when:
 
 A box without a verdict is not asked about again.
 
-A check call is billed like the page's own calls (`usage_log`, under the model it went to), and every call before it is logged first, as before a fallback (§ Fallback model). A call that fails — past its retries, rate limited, refused for payment, or stopped by the model — fails the page with the same reason a transcription would (§ Vision-only conversion), and the retry transcribes the page again.
+A check call is billed like the page's own calls (`usage_log`, under the model it went to), and each one is logged as soon as it is answered, before the boxes it corrected are worked on: a cancel in that raster work ends the page before it is recorded, as before a fallback (§ Fallback model). A call that fails — past its retries, rate limited, refused for payment, or stopped by the model — fails the page with the same reason a transcription would (§ Vision-only conversion), and the retry transcribes the page again.
 
 The rules flag; the model judges. A box whose crop cuts nothing can still leave out a part set apart by white space, a legend or an axis title, and the rules do not see it. The trade is deliberate: a call for every page with figures would cost about as much as transcribing them again. On the DINO paper the rules flagged every one of GPT-6 Luna's 8 cut figures, the 4 that also left a part outside across white space included, and none of its 6 whole ones. Pages with figures there: 11; flagged: 5, so 5 to 10 calls against 21 transcriptions.
 
@@ -350,7 +350,7 @@ An image is a single page. Its `width_pt`/`height_pt` are the pixel dimensions o
 Vision calls run against Kano Proxy's `{KANO_PROXY_BASE_URL}/openai/v1/chat/completions` with the operator's key ([api.md](./api.md) § Upstream). One wire format: OpenAI Chat Completions with an `image_url` data-URI part, no extension fields. A job with no endpoint snapshot (`connection_base_url` NULL: it ran on OpenRouter or a provider connection) fails when the worker takes it ([jobs.md](./jobs.md) § Retrying failed pages).
 
 - **One request per page**, fanned out under a per-job concurrency limit that can shrink while the job runs (`VISION_CONCURRENCY_PER_JOB`, default 8).
-- **429** → exponential backoff, and that job's concurrency is halved (never below 1).
+- **429** → after the upstream's own `Retry-After` when it sends one in whole seconds (followed as sent, not capped), else exponential backoff; and that job's concurrency is halved (never below 1).
 - **A transient failure is retried before the page is given up.**
   - One upstream call gets up to `VISION_MAX_ATTEMPTS` (4) tries with exponential backoff.
   - Transient means the same request may well succeed a moment later:

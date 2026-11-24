@@ -13,10 +13,10 @@ import uuid
 from datetime import timedelta
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from sightread.agents.parse import PIPELINE_VERSION
-from sightread.db.models import Document, Job, JobPage, User, utcnow
+from sightread.db.models import Document, Job, JobPage, UsageLog, User, utcnow
 from sightread.jobs.queue import (
     claim_job,
     claim_next_job,
@@ -28,6 +28,7 @@ from sightread.jobs.queue import (
     requeue_job,
 )
 from sightread.jobs.sweeper import sweep_uploads
+from sightread.upstream.client import PageTranscription, Usage
 from tests.conftest import path_settings, postgres_only
 from tests.factories import user_row
 
@@ -564,12 +565,8 @@ async def test_a_stale_workers_writes_are_fenced_by_its_generation(sessionmaker,
     """A worker that lost the worker lock goes on for seconds; the replacement has
     requeued and claimed its job by then, and nothing the stale one writes may land —
     except the usage its calls billed (docs/jobs.md § Queue)."""
-    from sqlalchemy import func, select
-
-    from sightread.db.models import JobPage, UsageLog
     from sightread.jobs.queue import next_worker_generation, requeue_orphaned_jobs
     from sightread.jobs.runner import PageOutcome, _record_page, fail_job
-    from sightread.upstream.client import Usage
 
     async with sessionmaker() as db:
         user = await _user(db)
@@ -779,3 +776,148 @@ async def test_the_crops_are_published_under_the_backup_lock(
         sessionmaker, job_id, status="succeeded", settings=settings, generation=99, publish=publish
     )
     assert published_while_held == [True]
+
+
+PAGE_USAGE = Usage(prompt_tokens=1, completion_tokens=1, cost=None, cost_source="unknown")
+
+
+async def _running_job(sessionmaker, tmp_path, sha256: str) -> Job:
+    async with sessionmaker() as db:
+        user = await _user(db)
+        job = await enqueue_job(
+            db,
+            user_id=user.id,
+            sha256=sha256,
+            source_path=str(tmp_path / f"unused-{sha256[0]}.pdf"),
+            **JOB_DEFAULTS,
+        )
+        job.status = "running"
+        await db.commit()
+    return job
+
+
+async def _usage_rows(sessionmaker, job_id: uuid.UUID) -> int:
+    async with sessionmaker() as db:
+        return (
+            await db.execute(
+                select(func.count()).select_from(UsageLog).where(UsageLog.job_id == job_id)
+            )
+        ).scalar_one()
+
+
+async def test_a_page_cancelled_while_it_is_recorded_keeps_its_usage(
+    sessionmaker, tmp_path, monkeypatch
+) -> None:
+    """A sibling's abort or a shutdown cancels the page while its record commits: the
+    record is waited out, its answered call in `usage_log`, and the cancel still ends the
+    page (docs/parsing.md § Upstream usage)."""
+    from sqlalchemy import Update
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from sightread.jobs import runner
+
+    job = await _running_job(sessionmaker, tmp_path, "f" * 64)
+
+    async def transcribed(job, state, connection, outcome, image, page_no, sessionmaker):
+        outcome.model = job.model
+        outcome.usage.append((job.model, PAGE_USAGE))
+        return PageTranscription(markdown="text", usage=PAGE_USAGE)
+
+    monkeypatch.setattr(runner, "_transcribe", transcribed)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class Held(AsyncSession):
+        """Holds the page's record at its first write until the test lets it go."""
+
+        async def execute(self, statement, *args, **kwargs):
+            if isinstance(statement, Update):
+                entered.set()
+                await release.wait()
+            return await super().execute(statement, *args, **kwargs)
+
+    held = async_sessionmaker(
+        sessionmaker.kw["bind"], class_=Held, expire_on_commit=False, autoflush=False
+    )
+    state = runner.RunState(
+        budget=runner.VisionBudget(1), figures_dir=tmp_path / "job", **RUN_LIMITS
+    )
+    outcome = runner.PageOutcome(page=1, width_pt=1.0, height_pt=1.0, method="vision")
+    image = tmp_path / "page.png"
+    image.write_bytes(b"png")
+
+    page = asyncio.create_task(runner._run_page(job, state, None, outcome, image, held))
+    await entered.wait()
+    page.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await page
+
+    assert await _usage_rows(sessionmaker, job.id) == 1
+    async with sessionmaker() as db:
+        assert (await db.get(Job, job.id)).pages_done == 1
+    assert not image.exists()
+
+
+async def test_a_figure_check_call_is_billed_before_its_raster_work(
+    sessionmaker, tmp_path, monkeypatch
+) -> None:
+    """A cancel while the boxes a check call corrected are pushed out in a thread ends the
+    page before its record: the call that answered is in `usage_log` already
+    (docs/parsing.md § Figure check)."""
+    import threading
+
+    from PIL import Image
+
+    from sightread.jobs import runner
+
+    job = await _running_job(sessionmaker, tmp_path, "9" * 64)
+    loop = asyncio.get_running_loop()
+    entered, release = asyncio.Event(), threading.Event()
+
+    class Ink:
+        """The rules flag the page's box; the push after the model's correction blocks."""
+
+        def __init__(self, image) -> None:
+            self.pushes = 0
+
+        def push_out(self, boxes, indices):
+            self.pushes += 1
+            if self.pushes > 1:
+                loop.call_soon_threadsafe(entered.set)
+                release.wait(10)
+            return list(boxes), True
+
+    async def answered(job, state, outcome, model, call, sessionmaker):
+        outcome.usage.append((model, PAGE_USAGE))
+        return PageTranscription(markdown="verdicts", usage=PAGE_USAGE)
+
+    monkeypatch.setattr(runner, "PageInk", Ink)
+    monkeypatch.setattr(runner, "_guarded_call", answered)
+    monkeypatch.setattr(runner, "read_verdicts", lambda *args: {0: (110, 110, 510, 510)})
+    state = runner.RunState(
+        budget=runner.VisionBudget(1), figures_dir=tmp_path / "job", **RUN_LIMITS
+    )
+    outcome = runner.PageOutcome(
+        page=1,
+        width_pt=1.0,
+        height_pt=1.0,
+        method="vision",
+        markdown="![fig](sightread://p1/100,100,500,500)",
+        model=job.model,
+        usage=[(job.model, PAGE_USAGE)],
+    )
+    image = tmp_path / "page.png"
+    Image.new("RGB", (200, 200), (255, 255, 255)).save(image, format="PNG")
+
+    check = asyncio.create_task(
+        runner._check_figures(job, state, None, outcome, image, sessionmaker)
+    )
+    await entered.wait()
+    check.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await check
+
+    # The transcription and the check call.
+    assert await _usage_rows(sessionmaker, job.id) == 2

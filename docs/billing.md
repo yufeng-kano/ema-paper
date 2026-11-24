@@ -62,7 +62,7 @@ Two plans. Free is a platform policy, never a product at the payment provider. A
   - A user without enough credits never queues a parse; the refusal names the pages' cost and the balance (`402 insufficient_credits`, § Refusals).
   - A reservation becomes consumed when the job ends `succeeded`.
   - It is **released** when the job ends `failed` — the user got nothing.
-- **A dedup hit costs nothing** — no model ran ([jobs.md](./jobs.md) § Dedup) — and neither does a second upload of bytes already on their way (`reuse_in_flight`).
+- **A dedup hit costs nothing** — no model ran ([jobs.md](./jobs.md) § Dedup) — and neither does a second upload of bytes already on their way (the in-flight join, [jobs.md](./jobs.md) § Dedup cache).
 - **A retry reserves the job's credits again** ([jobs.md](./jobs.md) § Retrying failed pages).
   - The job keeps its one entry, and the retry takes it back from the current period, dated then.
   - When the balance cannot cover it, the retry is refused with `402 insufficient_credits` and nothing is requeued.

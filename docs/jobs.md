@@ -63,7 +63,7 @@ A chat turn is fenced by its terminal state instead of a generation:
 
 ### Interrupted and failed jobs
 
-- **Shutdown.** On `SIGTERM` the worker stops claiming. A job caught mid-run goes back to `queued` keeping the pages it finished and nothing else of the attempt — its failed pages' rows and its crops go — so the next attempt transcribes only what is missing (§ Retrying failed pages). A page already paid for is never transcribed twice for its job.
+- **Shutdown.** On `SIGTERM` the worker stops claiming. A job caught mid-run goes back to `queued` keeping the pages it finished and nothing else of the attempt — its failed pages' rows and its crops go — so the next attempt transcribes only what is missing (§ Retrying failed pages). A page already paid for is never transcribed twice for its job. A page whose record is being written when the cancel lands is recorded first, its calls in `usage_log`; a succeeded one is kept.
 - **A task that raised.** A job whose task raised past the runner's own handling (a database error while the terminal state was being written) is marked `failed` with `internal error` by the worker loop, as a chat turn is. It is never requeued, since the parse ran and billed. So no row stays `running` with nobody driving it, against its user's cap.
 - **A parse a chat turn drove.** A parse a chat turn drove itself ([chat.md](./chat.md) § Tools) that is still `running` under the worker's generation once the turn has ended — its requeue raised on a database error, say — is put back on the queue by the worker right after the turn, keeping its succeeded pages, as on a shutdown. The worker runs one thing at a time, so once the turn is over nothing drives it. Left `running` under the live generation it would wait for the next restart, which the console cannot hasten (it requeues only a stuck job).
 
@@ -326,7 +326,7 @@ The rules:
 - **Per-user only.** Never dedup across users: it would hand one user's paid output to another and leak that a document was parsed before.
 - `force: true` always reparses: a new job, with a result row of its own.
 - **A retry must not buy a second parse.** The cache answers with *finished* work only, which leaves one gap: a browser cannot tell a lost response from a lost request, so it retries an upload that may already have landed, and the same bytes become a second job that charges the user's credits twice for one document.
-  - `submit_parse(reuse_in_flight=True)` — asked for by the web library and by `/v1/parse` — answers such a retry with the job already queued or running for that exact key instead of starting another.
+  - Every upload that is not `force` (the web library, `/v1/parse`, a chat conversion) answers such a retry with the job already queued or running for that exact key instead of starting another: the in-flight join.
   - The lookup is serialized by a transaction-level advisory lock on the dedup key (`hold_dedup_key`, PostgreSQL only), because reading before inserting protects a retry that arrives *after* the first upload committed, but not two that overlap: both would find nothing and both would enqueue.
   - A retry that arrives after the first request's job has already finished — failed, or succeeded outside the cache's retention — is answered with that job too, when it finished within `UPLOAD_RETRY_WINDOW_SECONDS` (60) of the retry. The browser retries within seconds, and the same bytes filed twice in that window are one upload whatever became of it.
   - Past the window the normal rule holds, and the same bytes parse again.

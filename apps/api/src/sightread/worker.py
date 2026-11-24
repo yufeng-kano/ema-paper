@@ -1,8 +1,9 @@
 """`python -m sightread.worker` — the process that drains the job queue (docs/jobs.md).
 
-Same codebase and same image as the API, run as its own process. One job at a time per
-worker: concurrency inside a job comes from the page fan-out, and concurrency across jobs
-comes from running more workers, which the FIFO `SKIP LOCKED` claim already supports.
+Same codebase and same image as the API, run as its own process. One worker per
+deployment, holding the worker lock for its life (`jobs.queue.try_worker_lock`); it runs
+one job or turn at a time, and concurrency inside a job comes from the page fan-out
+(docs/jobs.md § One worker per deployment).
 """
 
 from __future__ import annotations

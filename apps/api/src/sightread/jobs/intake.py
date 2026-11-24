@@ -167,16 +167,15 @@ def resolve_kind(filename: str, media_type: str) -> tuple[str, str]:
 
 @dataclass(frozen=True)
 class Target:
-    """What a job will run: agent, model, prompt and the upstream it calls.
+    """What a parse will run: model, prompt and the upstream it calls (always the parse
+    agent, in the canonical bbox format).
 
     Every job runs on the operator's Kano Proxy, and `connection_base_url` snapshots
     `KANO_PROXY_BASE_URL` at enqueue: part of the dedup key, so a result parsed through
     another endpoint never answers (docs/jobs.md § Dedup).
     """
 
-    agent: str
     model: str
-    bbox_format: str
     prompt: str
     connection_base_url: str
     # The fallback a blocked page goes to, only while the agent's switch is on
@@ -240,14 +239,7 @@ async def resolve_target(
         if row is not None and row.auto_fallback and settings.parse_fallback_model
         else None
     )
-    return Target(
-        PARSE.name,
-        model,
-        CANONICAL_FORMAT,
-        prompt,
-        settings.kano_proxy_base_url,
-        fallback,
-    )
+    return Target(model, prompt, settings.kano_proxy_base_url, fallback)
 
 
 async def resolve_check(
@@ -334,26 +326,25 @@ async def submit_parse(
     pages: str | None = None,
     force: bool = False,
     ticket: UploadTicket | None = None,
-    reuse_in_flight: bool = False,
     retain_source: bool = False,
-    check: bool = False,
     reconvert: Document | None = None,
     retry: bool = False,
 ) -> Submission:
     """Store the document, dedup it and queue the parse. Commits before it returns.
 
     An upload ticket is bound and spent by that same commit, so nothing rejected on the way
-    here (413, 400, 429) costs the caller its one upload (docs/auth.md § 5).
+    here (413, 400, 429) costs the caller its one upload, and refused with the 401 if
+    another upload spent it first (docs/auth.md § 5).
 
-    `reuse_in_flight` additionally answers with a job that is still queued or running for
-    these exact bytes instead of starting a second one. The web library and the data plane
-    ask for it: a browser cannot tell a lost response from a lost request, and the
-    connector re-runs a command its shell cut off, so either would otherwise buy the user
-    a second parse of a document they already paid for (docs/jobs.md § Dedup).
+    Unless `force`, a job still queued or running for these exact bytes answers instead of
+    a second one (the in-flight join): a browser cannot tell a lost response from a lost
+    request, and the connector re-runs a command its shell cut off, so either would
+    otherwise buy the user a second parse of a document they already paid for
+    (docs/jobs.md § Dedup cache).
 
-    `check` asks for the format check, which every parse takes — a Files upload and a
-    data-plane parse alike; the check is no part of the dedup key, so a cached result or a
-    parse already on its way is answered as it is (docs/parsing.md § Format check).
+    Every parse takes the format check, a Files upload and a data-plane parse alike; the
+    check is no part of the dedup key, so a cached result or a parse already on its way is
+    answered as it is (docs/parsing.md § Format check).
 
     `retry` answers with the newest parse of the same bytes and pages instead of starting
     one: a failed data-plane parse goes back on the queue, its succeeded pages kept and
@@ -395,7 +386,7 @@ async def submit_parse(
 
     key = {
         "user_id": user.id,
-        "agent": target.agent,
+        "agent": PARSE.name,
         "sha256": sha256,
         "model": target.model,
         "connection_base_url": target.connection_base_url,
@@ -413,7 +404,7 @@ async def submit_parse(
         found = await find_parse_to_retry(
             db,
             user_id=user.id,
-            agent=target.agent,
+            agent=PARSE.name,
             sha256=sha256,
             pages_spec=pages_spec,
             retention_days=settings.parse_retention_days,
@@ -445,17 +436,15 @@ async def submit_parse(
             # The holds go with the transaction; the caller takes the workspace lock.
             await db.rollback()
             return Submission(library_retry=failed_id)
+        # The upload under the job's name, once a failed parse is put back on it.
+        source = None
         if job.status == "failed":
             retry_model, fallback = retry_models(
                 settings, job, target.model if model is not None else None
             )
             # The check as the settings say now, following the model this run sends the
             # failed pages to (docs/jobs.md § Retrying failed pages).
-            check_target = (
-                await resolve_check(db, settings, user.id, retry_model or job.model)
-                if check
-                else None
-            )
+            check_target = await resolve_check(db, settings, user.id, retry_model or job.model)
             try:
                 # The credits the failure released, taken again: the document is charged
                 # once, by the run that delivers it (docs/billing.md § A parse).
@@ -485,7 +474,12 @@ async def submit_parse(
             # that parse, answered as it stands, nothing charged.
             stored.unlink(missing_ok=True)
         if ticket is not None:
-            upload_tickets.spend(ticket, job.id)
+            try:
+                await upload_tickets.spend(db, ticket, job.id)
+            except ApiError:
+                if source is not None:
+                    source.unlink(missing_ok=True)
+                raise
         # A commit that raises may still have landed, so the source stays: a retry that
         # did runs on it, and the upload sweeper takes it otherwise (docs/jobs.md).
         await db.commit()
@@ -507,42 +501,48 @@ async def submit_parse(
             if not retain_source:
                 stored.unlink(missing_ok=True)
             if ticket is not None:
-                upload_tickets.spend(ticket, result.job_id)
+                try:
+                    await upload_tickets.spend(db, ticket, result.job_id)
+                except ApiError:
+                    stored.unlink(missing_ok=True)
+                    raise
             await db.commit()
             return Submission(cached=result, upload=stored if retain_source else None)
 
-        if reuse_in_flight:
-            # Held until this transaction commits, so a second upload of the same bytes
-            # waits here rather than racing past the check below into its own parse.
-            await hold_dedup_key(db, **key)
-            active = await find_active_job(db, **key)
-            if active is None:
-                # The first request's job may have finished already — failed, or past
-                # the cache's retention: within the retry window the same bytes are
-                # still one upload, not a second parse to bill.
-                active = await find_recent_terminal_job(
-                    db,
-                    finished_since=utcnow()
-                    - timedelta(seconds=settings.upload_retry_window_seconds),
-                    **key,
-                )
-            if active is not None:
-                # The same parse is already on its way, or just finished. Starting
-                # another would spend the user's credits twice over for one document. A
-                # caller that keeps originals keeps this fresh copy for its own row: the
-                # worker may finish and hand the job's upload to the rows that exist
-                # before this one does.
-                if retain_source:
-                    if not active.retain_source:
-                        active.retain_source = True
-                else:
+        # Held until this transaction commits, so a second upload of the same bytes
+        # waits here rather than racing past the check below into its own parse.
+        await hold_dedup_key(db, **key)
+        active = await find_active_job(db, **key)
+        if active is None:
+            # The first request's job may have finished already — failed, or past
+            # the cache's retention: within the retry window the same bytes are
+            # still one upload, not a second parse to bill.
+            active = await find_recent_terminal_job(
+                db,
+                finished_since=utcnow() - timedelta(seconds=settings.upload_retry_window_seconds),
+                **key,
+            )
+        if active is not None:
+            # The same parse is already on its way, or just finished. Starting
+            # another would spend the user's credits twice over for one document. A
+            # caller that keeps originals keeps this fresh copy for its own row: the
+            # worker may finish and hand the job's upload to the rows that exist
+            # before this one does.
+            if retain_source:
+                if not active.retain_source:
+                    active.retain_source = True
+            else:
+                stored.unlink(missing_ok=True)
+            if ticket is not None:
+                try:
+                    await upload_tickets.spend(db, ticket, active.id)
+                except ApiError:
                     stored.unlink(missing_ok=True)
-                if ticket is not None:
-                    upload_tickets.spend(ticket, active.id)
-                # Committed here as on every other way out, so the dedup key's hold is
-                # released before a data-plane caller streams the job's progress.
-                await db.commit()
-                return Submission(job=active, upload=stored if retain_source else None)
+                    raise
+            # Committed here as on every other way out, so the dedup key's hold is
+            # released before a data-plane caller streams the job's progress.
+            await db.commit()
+            return Submission(job=active, upload=stored if retain_source else None)
 
     # The plan's parses at once (docs/billing.md § Plans), under the deployment's cap,
     # asked only of a parse about to start: a cache hit or a join starts none (docs/jobs.md
@@ -557,7 +557,7 @@ async def submit_parse(
             "Too many running jobs; retry when one finishes",
             headers={"Retry-After": str(settings.parse_retry_after_seconds)},
         )
-    check_target = await resolve_check(db, settings, user.id, target.model) if check else None
+    check_target = await resolve_check(db, settings, user.id, target.model)
     # The user's row lock that every charge takes (docs/billing.md § A parse), before the
     # job is inserted: the insert's foreign-key check holds a share lock on this row, and
     # two uploads taking the exclusive lock after it would deadlock (docs/jobs.md
@@ -566,7 +566,7 @@ async def submit_parse(
     job = await enqueue_job(
         db,
         user_id=user.id,
-        agent=target.agent,
+        agent=PARSE.name,
         kind=kind,
         filename=filename,
         media_type=media_type,
@@ -575,7 +575,7 @@ async def submit_parse(
         pages_spec=pages_spec,
         model=target.model,
         connection_base_url=target.connection_base_url,
-        bbox_format=target.bbox_format,
+        bbox_format=CANONICAL_FORMAT,
         prompt=target.prompt,
         prompt_sha256=prompt_sha256,
         page_count=page_count,
@@ -600,7 +600,11 @@ async def submit_parse(
         stored.unlink(missing_ok=True)
         raise insufficient_credits(exc) from exc
     if ticket is not None:
-        upload_tickets.spend(ticket, job.id)
+        try:
+            await upload_tickets.spend(db, ticket, job.id)
+        except ApiError:
+            stored.unlink(missing_ok=True)
+            raise
     if reconvert is not None:
         reconvert.reconvert_job_id = job.id
     await db.commit()
@@ -675,9 +679,7 @@ async def convert_kept_file(
             chunks=fd_chunks(entry),
             media_type=media_type,
             filename=row.name,
-            reuse_in_flight=True,
             retain_source=True,
-            check=True,
         )
     finally:
         os.close(entry)
@@ -876,6 +878,9 @@ async def retry_filed_parse(
         if job is None:
             raise ApiError(404, "invalid_request", "No such job")
         await hold_dedup_key(db, **dedup_fields(job))
+        # The user's row before the ticket's, the order a plain upload spending this
+        # ticket takes; the library retry below takes it again, a no-op.
+        await lock_user(db, user_id)
         folders = await workspace_documents.user_folders(db, user_id)
         rows = (
             await db.execute(
@@ -903,11 +908,11 @@ async def retry_filed_parse(
         if job.status != "failed":
             # Put back by another retry since the intake read it: that one, as it stands.
             if ticket is not None:
-                upload_tickets.spend(ticket, job_id)
+                await upload_tickets.spend(db, ticket, job_id)
             await db.commit()
             return job_id
         if ticket is not None:
-            upload_tickets.spend(ticket, job_id)
+            await upload_tickets.spend(db, ticket, job_id)
         return await retry_library_parse(
             db,
             settings,

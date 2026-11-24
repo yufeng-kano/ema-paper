@@ -14,11 +14,6 @@ import httpx
 
 from ..config import Settings
 
-# `exec` waits for the command itself plus the VM's boot; the runner enforces the
-# command's own timeout and answers within it. The control calls (stop, reset, restart,
-# status) get `SANDBOX_CONTROL_TIMEOUT_SECONDS`, which covers the runner's own Docker
-# timeout, the inspection after it and a reset's deletion (docs/sandbox.md).
-
 
 class SandboxUnavailable(Exception):
     """No runner, or the runner did not answer. Never carries command output."""
@@ -48,6 +43,11 @@ class SandboxClient:
     def __init__(self, settings: Settings) -> None:
         self._base = settings.sandbox_url.rstrip("/")
         self._token = settings.sandbox_token
+        # `exec` waits for the command itself plus the VM's boot; the runner enforces the
+        # command's own timeout and answers within it. The control calls (stop, reset,
+        # restart, status) get `SANDBOX_CONTROL_TIMEOUT_SECONDS`, which covers the
+        # runner's own Docker timeout, the inspection after it and a reset's deletion
+        # (docs/sandbox.md).
         self._control_timeout = float(settings.sandbox_control_timeout_seconds)
         self._start_timeout = float(settings.sandbox_start_timeout_seconds)
         self._exec_grace = float(settings.sandbox_exec_grace_seconds)

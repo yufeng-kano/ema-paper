@@ -105,6 +105,7 @@ A ticket lets an agent do exactly one upload — a parse, or the retry of a fail
 - **Scope.**
   - An unspent ticket authenticates `POST /v1/parse` once.
   - When the upload creates a job (or hits the dedup cache, joins a parse in flight, or retries a failed one), the ticket binds to that `job_id` and is marked spent.
+  - Two uploads racing on one ticket: the first to spend it gets its parse; the other gets the 401 below, with nothing queued, charged or kept.
   - From then on it authenticates only `GET /v1/jobs/{id}`, `/result`, `/result.md`, `/events` and `/figures/…` for that one job, and the `last` forms of all but `/events` (`/v1/jobs/last`, `…/result`, `…/result.md`, `…/figures/…`).
   - A request that fails before a job exists (413, 400, 402, 409, 429) does **not** spend the ticket.
   - `last` on an unspent ticket answers **409**: the ticket has created no parse yet (its upload still arriving, refused, or never sent), and a refused or unsent one can still upload. It does not answer with the expired copy below, which would send the agent to mint again for an upload that is still refused.

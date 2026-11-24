@@ -114,9 +114,10 @@ def discard_job_figures(figures_dir: Path, job_id: uuid.UUID) -> bool:
     keeps it then, so the next sweep tries again (docs/jobs.md § Retention).
 
     Crops live exactly as long as something references them (docs/jobs.md § Retention): a
-    job that fails wrote no result, and a requeued job reparses from scratch — either way
-    the crops of the abandoned attempt must go with it, or a reparse whose transcription
-    emits different boxes would leave the first attempt's files answering figure routes.
+    job that fails wrote no result, and a requeued job crops every page again, its kept
+    ones from their stored markdown — either way the crops of the abandoned attempt must go
+    with it, or a reparse whose transcription emits different boxes would leave the first
+    attempt's files answering figure routes.
     """
     failed = False
 

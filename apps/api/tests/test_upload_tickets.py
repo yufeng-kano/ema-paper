@@ -6,21 +6,29 @@ No upstream traffic here either — the worker runs against the stubbed Kano Pro
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import timedelta
 from pathlib import Path
 
 import httpx
+import pytest
 import respx
 from httpx import AsyncClient
 from sqlalchemy import delete, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from sightread.auth import upload_tickets
-from sightread.db.models import Document, Job, UploadTicket, User, utcnow
+from sightread.billing import ledger
+from sightread.config import Settings
+from sightread.db.models import CreditEntry, Document, Job, UploadTicket, User, utcnow
+from sightread.errors import ApiError
+from sightread.jobs.intake import Submission, file_chunks, submit_parse
 from sightread.jobs.sweeper import purge_parses
 from tests.conftest import KANO_CHAT_URL, PARSE_MODEL, mcp_running, postgres_only
-from tests.helpers import bearer
+from tests.helpers import bearer, credits_spent, staged_uploads
 from tests.test_parse_end_to_end import _drain_queue, _vision_stub
+from tests.test_retry_failed_pages import Upstream
 
 # The copy is part of the contract: it is the agent's only recovery hint (docs/auth.md § 5).
 EXPECTED_REJECTION = (
@@ -48,6 +56,51 @@ async def _upload(client: AsyncClient, token: str, path: Path, **fields) -> http
         data={"model": PARSE_MODEL, **fields},
         headers={"Authorization": f"Bearer {token}"},
     )
+
+
+async def _submit(
+    db: AsyncSession, settings: Settings, ticket: UploadTicket, user: User, path: Path, **fields
+) -> Submission:
+    """An upload of `path` on a ticket resolved in `db`, as `/v1/parse` submits it."""
+    return await submit_parse(
+        db,
+        settings,
+        user=user,
+        chunks=file_chunks(path),
+        media_type="application/pdf",
+        filename=path.name,
+        ticket=ticket,
+        **fields,
+    )
+
+
+def _one_refused(answers: list[Submission | BaseException]) -> Submission:
+    """The one upload that spent the ticket, once the other was the 401."""
+    submissions = [answer for answer in answers if isinstance(answer, Submission)]
+    refusals = [answer for answer in answers if isinstance(answer, ApiError)]
+    assert len(submissions) == 1 and len(refusals) == 1, answers
+    assert refusals[0].status_code == 401
+    assert refusals[0].message == EXPECTED_REJECTION
+    return submissions[0]
+
+
+async def _failed_parse(client: AsyncClient, sessionmaker, path: Path) -> uuid.UUID:
+    """A data-plane parse of `path` whose page 2 the stubbed upstream refuses: failed, its
+    credits released, its upload gone."""
+    respx.post(KANO_CHAT_URL).mock(
+        side_effect=Upstream({(PARSE_MODEL, 2): lambda: httpx.Response(400)})
+    )
+    queued = await client.post(
+        "/v1/parse",
+        files={"file": (path.name, path.read_bytes(), "application/pdf")},
+        data={"model": PARSE_MODEL},
+    )
+    job_id = uuid.UUID(queued.json()["job_id"])
+    await _drain_queue(client, sessionmaker)
+    async with sessionmaker() as db:
+        assert (await db.get(Job, job_id)).status == "failed"
+    assert staged_uploads(client) == []
+    return job_id
 
 
 async def _stored_ticket(sessionmaker) -> UploadTicket:
@@ -306,3 +359,171 @@ async def test_a_cache_hit_outlives_the_file_that_kept_it_while_its_ticket_reads
     assert await purge_parses(sessionmaker, settings) == 1
     async with sessionmaker() as db:
         assert await db.get(Job, job_id) is None
+
+
+@postgres_only
+async def test_two_uploads_racing_on_one_ticket_start_one_parse(
+    api_client, sessionmaker, documents
+) -> None:
+    """Both requests passed auth on the unspent ticket before either committed: one starts
+    a parse, the other is the 401 and leaves nothing behind (docs/auth.md § 5)."""
+    settings = api_client.app.state.settings
+    token = await _mint(api_client, sessionmaker)
+    authenticated = asyncio.Barrier(2)
+
+    async def upload(path: Path) -> Submission:
+        async with sessionmaker() as db:
+            ticket, user = await upload_tickets.resolve(db, token)
+            assert ticket.spent_at is None
+            await authenticated.wait()
+            return await _submit(db, settings, ticket, user, path)
+
+    answers = await asyncio.gather(
+        upload(documents["text_pdf"]), upload(documents["scanned_pdf"]), return_exceptions=True
+    )
+
+    job = _one_refused(answers).job
+    async with sessionmaker() as db:
+        assert (await db.execute(select(Job.id))).scalars().all() == [job.id]
+        reserved = (await db.execute(select(CreditEntry.job_id))).scalars().all()
+        assert reserved == [job.id]
+        ticket = (await db.execute(select(UploadTicket))).scalars().one()
+        assert ticket.job_id == job.id
+    assert staged_uploads(api_client) == [Path(job.source_path).name]
+
+
+@postgres_only
+@respx.mock
+async def test_two_kept_uploads_of_a_cached_parse_racing_on_one_ticket_keep_one_copy(
+    api_client, sessionmaker, documents
+) -> None:
+    """A cache hit that keeps originals keeps its fresh copy for its own row; the 401 takes
+    the loser's copy with it."""
+    respx.post(KANO_CHAT_URL).mock(side_effect=_vision_stub)
+    settings = api_client.app.state.settings
+    first = await api_client.post(
+        "/v1/parse",
+        files={"file": ("text.pdf", documents["text_pdf"].read_bytes(), "application/pdf")},
+        data={"model": PARSE_MODEL},
+    )
+    assert first.status_code == 202, first.text
+    await _drain_queue(api_client, sessionmaker)
+    before = staged_uploads(api_client)
+    token = await _mint(api_client, sessionmaker)
+    authenticated = asyncio.Barrier(2)
+
+    async def upload() -> Submission:
+        async with sessionmaker() as db:
+            ticket, user = await upload_tickets.resolve(db, token)
+            await authenticated.wait()
+            return await _submit(
+                db,
+                settings,
+                ticket,
+                user,
+                documents["text_pdf"],
+                model=PARSE_MODEL,
+                retain_source=True,
+            )
+
+    kept = _one_refused(await asyncio.gather(upload(), upload(), return_exceptions=True))
+    assert kept.cached is not None and kept.upload is not None
+    assert staged_uploads(api_client) == sorted([*before, kept.upload.name])
+
+
+@postgres_only
+async def test_a_kept_upload_joining_a_parse_on_a_ticket_spent_meanwhile_changes_nothing(
+    api_client, sessionmaker, documents
+) -> None:
+    """Both requests authenticated on the unspent ticket; a plain upload joins the parse in
+    flight and spends it first. The kept upload's join is the 401: its copy goes and the
+    job is not marked as keeping its original."""
+    settings = api_client.app.state.settings
+    queued = await api_client.post(
+        "/v1/parse",
+        files={"file": ("text.pdf", documents["text_pdf"].read_bytes(), "application/pdf")},
+        data={"model": PARSE_MODEL},
+    )
+    job_id = uuid.UUID(queued.json()["job_id"])
+    token = await _mint(api_client, sessionmaker)
+    async with sessionmaker() as late, sessionmaker() as early:
+        stale, user = await upload_tickets.resolve(late, token)
+        ticket, owner = await upload_tickets.resolve(early, token)
+        joined = await _submit(
+            early, settings, ticket, owner, documents["text_pdf"], model=PARSE_MODEL
+        )
+        assert joined.job.id == job_id
+        with pytest.raises(ApiError) as refused:
+            await _submit(
+                late,
+                settings,
+                stale,
+                user,
+                documents["text_pdf"],
+                model=PARSE_MODEL,
+                retain_source=True,
+            )
+    assert (refused.value.status_code, refused.value.message) == (401, EXPECTED_REJECTION)
+    async with sessionmaker() as db:
+        job = await db.get(Job, job_id)
+        assert job.retain_source is False
+        assert (await db.execute(select(Job.id))).scalars().all() == [job_id]
+    assert staged_uploads(api_client) == [Path(job.source_path).name]
+
+
+@postgres_only
+@respx.mock
+async def test_two_retries_racing_on_one_ticket_put_the_parse_back_once(
+    api_client, sessionmaker, documents
+) -> None:
+    """The second retry waits on the first's holds, finds the parse queued again and is the
+    401: one requeue, its credits taken back once, one copy under the job's name."""
+    settings = api_client.app.state.settings
+    job_id = await _failed_parse(api_client, sessionmaker, documents["mixed_pdf"])
+    token = await _mint(api_client, sessionmaker)
+    authenticated = asyncio.Barrier(2)
+
+    async def retry() -> Submission:
+        async with sessionmaker() as db:
+            ticket, user = await upload_tickets.resolve(db, token)
+            await authenticated.wait()
+            return await _submit(db, settings, ticket, user, documents["mixed_pdf"], retry=True)
+
+    retried = _one_refused(await asyncio.gather(retry(), retry(), return_exceptions=True))
+    assert (retried.job.id, retried.job.status) == (job_id, "queued")
+    async with sessionmaker() as db:
+        entry = (
+            await db.execute(select(CreditEntry).where(CreditEntry.job_id == job_id))
+        ).scalar_one()
+        assert entry.state == ledger.RESERVED
+    assert await credits_spent(api_client) == 3
+    assert [name.split(".retry-")[0] for name in staged_uploads(api_client)] == [str(job_id)]
+
+
+@postgres_only
+@respx.mock
+async def test_a_retry_on_a_ticket_spent_meanwhile_leaves_the_parse_failed(
+    api_client, sessionmaker, documents
+) -> None:
+    """Both requests authenticated on the unspent ticket; another file's upload spends it
+    first. The retry got as far as its copy under the job's name and its credits taken
+    back: the 401 removes the copy and the parse stays failed, its credits released."""
+    settings = api_client.app.state.settings
+    job_id = await _failed_parse(api_client, sessionmaker, documents["mixed_pdf"])
+    token = await _mint(api_client, sessionmaker)
+    async with sessionmaker() as late, sessionmaker() as early:
+        stale, user = await upload_tickets.resolve(late, token)
+        ticket, owner = await upload_tickets.resolve(early, token)
+        other = await _submit(
+            early, settings, ticket, owner, documents["text_pdf"], model=PARSE_MODEL
+        )
+        with pytest.raises(ApiError) as refused:
+            await _submit(late, settings, stale, user, documents["mixed_pdf"], retry=True)
+    assert (refused.value.status_code, refused.value.message) == (401, EXPECTED_REJECTION)
+    async with sessionmaker() as db:
+        assert (await db.get(Job, job_id)).status == "failed"
+        entry = (
+            await db.execute(select(CreditEntry).where(CreditEntry.job_id == job_id))
+        ).scalar_one()
+        assert entry.state == ledger.RELEASED
+    assert staged_uploads(api_client) == [Path(other.job.source_path).name]
