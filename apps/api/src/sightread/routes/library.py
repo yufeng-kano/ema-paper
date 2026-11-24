@@ -1383,7 +1383,6 @@ async def document_page_image(
     slots = request.app.state.preview_slots
     try:
         data = await original_page_png(
-            root,
             source,
             kind=job.kind,
             page=page,

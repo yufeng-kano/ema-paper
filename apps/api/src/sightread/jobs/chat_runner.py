@@ -1370,7 +1370,6 @@ async def _run_shell_command(
         tool_input,
         author,
         max_chars=max_chars,
-        locked=True,
     )
     if outcome.edit is not None:
         # The library follows the tree before the viewer is told to reload, and before

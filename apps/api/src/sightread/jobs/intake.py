@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..agents import CHECK, PARSE, AgentDefinition
 from ..agents import check as check_agent
+from ..agents.bbox import CANONICAL_FORMAT
 from ..auth import upload_tickets
 from ..billing import ledger
 from ..billing.credits import parse_credits
@@ -226,7 +227,7 @@ async def resolve_target(
     return Target(
         agent.name,
         model,
-        agent.bbox_format,
+        CANONICAL_FORMAT,
         prompt,
         settings.kano_proxy_base_url,
         fallback,

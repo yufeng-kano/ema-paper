@@ -13,8 +13,8 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from .chat import SUBAGENT_TOOL_NAMES, render_system_prompt
+from .skills import overlay
 
-SUBAGENT_FIELDS = ("description", "model", "writes", "tools", "prompt")
 # What a new subagent of the reader's own is given: the tools that read.
 DEFAULT_TOOLS: tuple[str, ...] = ("view_page", "view_figure", "str_replace_based_edit_tool")
 
@@ -145,23 +145,8 @@ def _resolved(source, *, builtin: bool, modified: bool, default) -> ResolvedSuba
 
 
 def resolve_subagents(rows: Iterable[SubagentRow]) -> list[ResolvedSubagent]:
-    """The built-ins in their code order, each as the user's edit when there is one, then
-    the user's own by name (docs/api.md)."""
-    by_name = {row.name: row for row in rows}
-    resolved = []
-    for builtin in BUILTIN_SUBAGENTS:
-        row = by_name.pop(builtin.name, None)
-        resolved.append(
-            _resolved(
-                row if row is not None else builtin,
-                builtin=True,
-                modified=row is not None,
-                default=builtin,
-            )
-        )
-    for name in sorted(by_name):
-        resolved.append(_resolved(by_name[name], builtin=False, modified=False, default=None))
-    return resolved
+    """The built-in subagents overlaid with the user's rows (see `skills.overlay`)."""
+    return overlay(BUILTIN_SUBAGENTS, rows, _resolved)
 
 
 def same_as_default(values: dict, default: SubagentDefinition) -> bool:

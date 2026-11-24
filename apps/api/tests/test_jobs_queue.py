@@ -15,7 +15,7 @@ from datetime import timedelta
 import pytest
 from sqlalchemy import select
 
-from sightread.agents import PARSE
+from sightread.agents.parse import PIPELINE_VERSION
 from sightread.db.models import Document, Job, JobPage, User, utcnow
 from sightread.jobs.queue import (
     claim_job,
@@ -131,7 +131,7 @@ async def test_dedup_never_crosses_agents_or_answers_from_openrouter_history(
             "sha256": "d" * 64,
             "source_path": None,
             "status": "succeeded",
-            "pipeline_version": PARSE.pipeline_version,
+            "pipeline_version": PIPELINE_VERSION,
             "pages_done": 2,
             "created_at": utcnow(),
             "finished_at": utcnow(),

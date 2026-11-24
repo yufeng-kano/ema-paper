@@ -25,7 +25,7 @@ from sightread.workspace import git, safe_io
 from sightread.workspace.documents import original_of
 from sightread.workspace.layout import sources_dir, trash_root, user_root
 from sightread.workspace.reconcile import reconcile_user
-from tests.conftest import CSRF_HEADERS
+from tests.conftest import CSRF_HEADERS, image_view
 from tests.test_library import _upload_markdown
 
 DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -775,6 +775,7 @@ async def test_the_editor_writes_nothing_a_revision_could_not_record(tmp_path, m
             "agent:1",
             max_chars=1000,
             max_bytes=1_000_000,
+            images=image_view(),
         )
 
     refused = await run("create", "files/big.txt", file_text="x" * 65)

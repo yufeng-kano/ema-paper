@@ -34,7 +34,7 @@ from sqlalchemy import (
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 from sqlalchemy.orm import aliased
 
-from ..agents import get_agent
+from ..agents.parse import PIPELINE_VERSION
 from ..billing import ledger
 from ..billing.plans import PAID_STATUSES
 from ..config import Settings
@@ -197,7 +197,7 @@ def dedup_key(
 
     Same user, agent, bytes, model, endpoint snapshot (KANO_PROXY_BASE_URL: a job of an
     upstream the deployment no longer has holds NULL, which never matches), pages, prompt,
-    and the agent's pipeline version (docs/jobs.md § Dedup). Status is the caller's: a
+    and the parse pipeline's version (docs/jobs.md § Dedup). Status is the caller's: a
     finished parse answers the cache, an unfinished one answers a retry.
     """
     return [
@@ -208,7 +208,7 @@ def dedup_key(
         Job.connection_base_url == connection_base_url,
         Job.pages_spec == pages_spec,
         Job.prompt_sha256 == prompt_sha256,
-        Job.pipeline_version == get_agent(agent).pipeline_version,
+        Job.pipeline_version == PIPELINE_VERSION,
     ]
 
 
@@ -400,7 +400,7 @@ async def enqueue_job(
         pages_spec=pages_spec,
         model=model,
         connection_base_url=connection_base_url,
-        pipeline_version=get_agent(agent).pipeline_version,
+        pipeline_version=PIPELINE_VERSION,
         bbox_format=bbox_format,
         prompt=prompt,
         prompt_sha256=prompt_sha256,

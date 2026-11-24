@@ -586,6 +586,16 @@ async def test_read_url_tries_each_address_in_the_resolvers_order(monkeypatch) -
     assert request.extensions["sni_hostname"] == "dual.test"
 
 
+async def test_an_ipv6_literal_is_bracketed_in_the_host_header() -> None:
+    """RFC 3986: an IPv6 literal in a `Host` header is bracketed, or its port could not be
+    told from its last group; the TLS name is the bare address."""
+    ported = await chat_web.check_target("https://[2606:4700::1111]:8443/x")
+    assert ported.host_header == "[2606:4700::1111]:8443"
+    assert ported.host == "2606:4700::1111"
+    default = await chat_web.check_target("https://[2606:4700::1111]/x")
+    assert default.host_header == "[2606:4700::1111]"
+
+
 @respx.mock
 async def test_a_failed_read_says_what_failed(monkeypatch) -> None:
     """docs/chat.md § Tools: a read that failed says why — no connection to any of the

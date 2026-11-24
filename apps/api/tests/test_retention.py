@@ -17,7 +17,7 @@ import respx
 from httpx import AsyncClient
 from sqlalchemy import delete, select, update
 
-from sightread.agents import PARSE
+from sightread.agents.parse import PIPELINE_VERSION
 from sightread.auth.api_keys import create_api_key
 from sightread.auth.sessions import SESSION_COOKIE, create_session
 from sightread.db.models import (
@@ -232,7 +232,7 @@ async def _parse(
         sha256=sha256 or uuid.uuid4().hex * 2,
         model=PARSE_MODEL,
         connection_base_url=KANO_BASE,
-        pipeline_version=PARSE.pipeline_version,
+        pipeline_version=PIPELINE_VERSION,
         bbox_format="yxyx_norm1000",
         prompt="Transcribe page {page}.",
         status=status,

@@ -39,7 +39,7 @@ from sightread.upstream.client import RateLimited
 from sightread.workspace import documents as workspace_documents
 from sightread.workspace import git
 from sightread.workspace.layout import user_root
-from tests.conftest import CSRF_HEADERS, KANO_BASE
+from tests.conftest import CSRF_HEADERS, KANO_BASE, image_view
 from tests.test_jobs_queue import postgres_only
 
 MESSAGES_URL = f"{KANO_BASE}/anthropic/v1/messages"
@@ -530,6 +530,7 @@ async def test_the_editor_tool_stays_inside_the_workspace(tmp_path) -> None:
         "agent:1",
         max_chars=1000,
         max_bytes=1_000_000,
+        images=image_view(),
     )
     assert escape.is_error
     absolute = await chat_tools.run_editor(
@@ -538,6 +539,7 @@ async def test_the_editor_tool_stays_inside_the_workspace(tmp_path) -> None:
         "agent:1",
         max_chars=1000,
         max_bytes=1_000_000,
+        images=image_view(),
     )
     assert absolute.is_error
     meta = await chat_tools.run_editor(
@@ -546,6 +548,7 @@ async def test_the_editor_tool_stays_inside_the_workspace(tmp_path) -> None:
         "agent:1",
         max_chars=1000,
         max_bytes=1_000_000,
+        images=image_view(),
     )
     assert meta.is_error and "read-only" in meta.content
 
@@ -560,6 +563,7 @@ async def test_the_editor_tool_stays_inside_the_workspace(tmp_path) -> None:
         "agent:1",
         max_chars=1000,
         max_bytes=1_000_000,
+        images=image_view(),
     )
     assert twice.is_error and "times" in twice.content
     inserted = await chat_tools.run_editor(
@@ -573,6 +577,7 @@ async def test_the_editor_tool_stays_inside_the_workspace(tmp_path) -> None:
         "agent:1",
         max_chars=1000,
         max_bytes=1_000_000,
+        images=image_view(),
     )
     assert not inserted.is_error
     assert (root / "files" / "d" / "doc.md").read_text() == "alpha\ngamma\nbeta\n"
@@ -583,6 +588,7 @@ async def test_the_editor_tool_stays_inside_the_workspace(tmp_path) -> None:
         "agent:1",
         max_chars=1000,
         max_bytes=1_000_000,
+        images=image_view(),
     )
     assert listing.content == "d/"
 
@@ -706,7 +712,8 @@ async def test_view_page_and_view_figure_read_the_documents_own_files(tmp_path, 
     paths.figures.mkdir()
     Image.new("RGB", (40, 30), "white").save(paths.figures / "p1_100_100_400_600.png")
 
-    page = await chat_tools.view_page(
+    # The shell's `source.*` is never rendered: without the original, there is no page.
+    unkept = await chat_tools.view_page(
         paths,
         {"page": 1},
         document_id=5,
@@ -717,10 +724,7 @@ async def test_view_page_and_view_figure_read_the_documents_own_files(tmp_path, 
         max_pixels=40_000_000,
         kind="pdf",
     )
-    assert not page.is_error
-    assert page.content[0]["type"] == "image"
-    assert page.content[0]["source"]["media_type"] == "image/png"
-    assert page.content[1]["text"] == "Page 1."
+    assert unkept.is_error and "kept no original" in unkept.content
     # The original kept outside the mount is what renders, even with the shell's copy gone.
     (paths.directory / "source.pdf").unlink()
     outside = tmp_path / "ws" / ".repos" / "1.sources"
@@ -737,7 +741,10 @@ async def test_view_page_and_view_figure_read_the_documents_own_files(tmp_path, 
         max_pixels=40_000_000,
         kind="pdf",
     )
-    assert not from_original.is_error and from_original.content[1]["text"] == "Page 1."
+    assert not from_original.is_error
+    assert from_original.content[0]["type"] == "image"
+    assert from_original.content[0]["source"]["media_type"] == "image/png"
+    assert from_original.content[1]["text"] == "Page 1."
     too_far = await chat_tools.view_page(
         paths,
         {"page": 9},
@@ -765,6 +772,13 @@ async def test_view_page_and_view_figure_read_the_documents_own_files(tmp_path, 
     )
     assert huge.is_error
     assert missing.is_error
+    # A coordinate past five digits is no box, though clamping it would name a stored crop.
+    (paths.figures / "p1_0_0_1000_1000.png").write_bytes(b"png")
+    oversized = await chat_tools.view_figure(
+        paths, {"page": 1, "bbox": [0, 0, 100_000, 1000]}, max_bytes=1_000_000
+    )
+    assert oversized.is_error
+    assert oversized.content == "that bbox is not a usable box"
 
 
 async def test_a_shell_change_becomes_its_own_revision(tmp_path) -> None:
@@ -800,6 +814,7 @@ async def test_an_editor_filesystem_failure_is_a_tool_result(tmp_path) -> None:
         "agent:1",
         max_chars=1000,
         max_bytes=1_000_000,
+        images=image_view(),
     )
     assert outcome.is_error
 
@@ -1303,6 +1318,7 @@ async def test_the_editor_never_follows_a_link_planted_in_the_tree(tmp_path) -> 
         "agent:1",
         max_chars=1000,
         max_bytes=1_000_000,
+        images=image_view(),
     )
     assert viewed.is_error and "sk-not-for-you" not in str(viewed.content)
     written = await chat_tools.run_editor(
@@ -1316,6 +1332,7 @@ async def test_the_editor_never_follows_a_link_planted_in_the_tree(tmp_path) -> 
         "agent:1",
         max_chars=1000,
         max_bytes=1_000_000,
+        images=image_view(),
     )
     assert written.is_error
     assert secret.read_text() == "sk-not-for-you"
@@ -1957,6 +1974,7 @@ async def test_the_editor_refuses_what_history_excludes(tmp_path) -> None:
             "agent:1",
             max_chars=1000,
             max_bytes=10_000,
+            images=image_view(),
         )
         assert refused.is_error, nested
     git.ensure_repo(root)
@@ -1967,6 +1985,7 @@ async def test_the_editor_refuses_what_history_excludes(tmp_path) -> None:
             "agent:1",
             max_chars=1000,
             max_bytes=10_000,
+            images=image_view(),
         )
         assert refused.is_error, path
         assert not (root / path).exists()
@@ -2422,7 +2441,7 @@ async def test_a_shell_move_is_reconciled_before_the_lock_is_released(
     async def fake_run_bash(client, user_id, session, tool_input, *, max_chars, timeout_seconds):
         return chat_tools.ToolOutcome("moved")
 
-    async def fake_commit(root_, outcome, tool_input, author, *, max_chars, locked=False):
+    async def fake_commit(root_, outcome, tool_input, author, *, max_chars):
         return chat_tools.ToolOutcome(outcome.content, edit={"path": "", "commit": "c", "diff": ""})
 
     async def fake_reconcile(db, settings, user_id):
@@ -2775,6 +2794,7 @@ async def test_an_editor_write_whose_commit_fails_is_undone(tmp_path, monkeypatc
         "agent:1",
         max_chars=1000,
         max_bytes=1_000_000,
+        images=image_view(),
     )
     assert replaced.is_error
     assert (root / "files" / "d" / "doc.md").read_text() == "alpha\nbeta\n"
@@ -2784,6 +2804,7 @@ async def test_an_editor_write_whose_commit_fails_is_undone(tmp_path, monkeypatc
         "agent:1",
         max_chars=1000,
         max_bytes=1_000_000,
+        images=image_view(),
     )
     assert created.is_error
     assert not (root / "files" / "d" / "new.md").exists()
@@ -3260,6 +3281,7 @@ async def test_a_failed_create_leaves_no_directory_behind(tmp_path, monkeypatch)
         "agent:1",
         max_chars=1000,
         max_bytes=1_000_000,
+        images=image_view(),
     )
     assert outcome.is_error
     assert not (root / "files" / "kept" / "New").exists()

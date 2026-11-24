@@ -16,7 +16,6 @@ import respx
 from httpx import AsyncClient
 from sqlalchemy import select
 
-from sightread.agents import CHAT
 from sightread.agents import chat as chat_agent
 from sightread.agents import memory as memory_defs
 from sightread.agents.chat import TURN_CONTEXT, turn_note
@@ -260,8 +259,6 @@ def test_the_memory_tool_is_the_last_tool_and_never_a_subagents() -> None:
     assert schema["required"] == ["action", "id", "kind", "text", "scope"]
     assert schema["properties"]["kind"]["enum"] == ["term", "preference", "about", "document", ""]
     assert schema["properties"]["scope"]["enum"] == ["all", "document", ""]
-    # Bumped with the memory tool (7), and only ever forward since.
-    assert CHAT.pipeline_version >= 7
 
 
 def test_the_prompt_says_how_to_link_a_section_and_which_language_to_answer_in() -> None:

@@ -13,6 +13,7 @@ types (JSONB and timestamptz) precisely so this fallback stays honest.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import os
@@ -29,6 +30,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sightread.config import Settings
 from sightread.db.models import Base
 from sightread.db.session import create_sessionmaker
+from sightread.jobs.chat_tools import ImageView
 from sightread.main import create_app
 from sightread.mcp import mcp_session_manager
 from tests.fixtures.documents import (
@@ -256,3 +258,15 @@ async def grant_plan(sessionmaker, user_id: int, plan_id: str = "pro", *, versio
             )
         )
         await db.commit()
+
+
+def image_view(*, max_bytes: int = 32 << 20, shell: bool = True) -> ImageView:
+    """What the editor may show of an image, made fresh per call: its semaphore binds to
+    the event loop of the test that first waits on it."""
+    return ImageView(
+        max_bytes=max_bytes,
+        max_pixels=40_000_000,
+        long_edge=1568,
+        decode_slot=asyncio.Semaphore(1),
+        shell=shell,
+    )

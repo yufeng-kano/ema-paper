@@ -17,7 +17,7 @@ import respx
 from httpx import AsyncClient
 from sqlalchemy import func, select, update
 
-from sightread.agents import PARSE
+from sightread.agents.parse import PIPELINE_VERSION
 from sightread.auth.sessions import SESSION_COOKIE
 from sightread.db.models import (
     AgentSetting,
@@ -111,7 +111,7 @@ async def _job(db, user_id: int, status: str = "succeeded") -> uuid.UUID:
         size_bytes=8,
         sha256=uuid.uuid4().hex * 2,
         model=PARSE_MODEL,
-        pipeline_version=PARSE.pipeline_version,
+        pipeline_version=PIPELINE_VERSION,
         bbox_format="yxyx_norm1000",
         prompt="Transcribe page {page}.",
         status=status,

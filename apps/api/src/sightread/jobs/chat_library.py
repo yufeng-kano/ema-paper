@@ -1,10 +1,10 @@
 """A library conversation's library tools (docs/chat.md § Library conversations, *The
 library tools*): the library listed as the Files page lists it, and changed by the Files
 page's own operations — `workspace/filing.py`, the functions the library routes call — each
-call under the backup lock taken shared, the workspace lock and a database session of its
-own, as `convert_file` runs. Every answer says what was done, a sentence per item, and a
-call that changed something carries its undo record, in the shapes the Files page's undo
-keeps its steps in (docs/web.md § Files, *Undo*).
+call under the workspace lock and a database session of its own, and the seven that change
+the library also under the backup lock taken shared, as `convert_file` runs. Every answer
+says what was done, a sentence per item, and a call that changed something carries its undo
+record, in the shapes the Files page's undo keeps its steps in (docs/web.md § Files, *Undo*).
 
 Also the path resolver `convert_file` shares: an item named by its place as the Files page
 shows it (`DL/DINO/iBOT.pdf`), or by its path under `/workspace/files/`.
@@ -14,12 +14,14 @@ from __future__ import annotations
 
 import logging
 import unicodedata
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from ..agents.chat import LIBRARY_INIT_TOP
 from ..config import Settings
 from ..db.models import FILE_KIND, MARKDOWN_KIND, Document, Folder, Job
 from ..errors import ApiError
@@ -33,7 +35,6 @@ from .chat_tools import VM_ROOT, ToolOutcome
 logger = logging.getLogger(__name__)
 
 VM_FILES = VM_ROOT / FILES_DIR
-TOP = "the top of the library"
 
 
 # --- naming an item ---------------------------------------------------------------------
@@ -211,13 +212,14 @@ def _size(count: int | None) -> str:
     return f"{count / 1024**3:.1f} GB"
 
 
-def _state(job: Job | None) -> str:
-    """A document's state as its row shows it: `ready`, `converting`, `queued` or `failed`."""
-    if job is None or job.status == "succeeded":
+def _state(status: str | None) -> str:
+    """A document's state as its row shows it, from its job's status (None: no job):
+    `ready`, `converting`, `queued` or `failed`."""
+    if status is None or status == "succeeded":
         return "ready"
-    if job.status == "queued":
+    if status == "queued":
         return "queued"
-    if job.status == "running":
+    if status == "running":
         return "converting"
     return "failed"
 
@@ -291,15 +293,6 @@ async def _list_folder(
         .scalars()
         .all()
     )
-    job_ids = {row.job_id for row in documents if row.job_id is not None}
-    jobs = (
-        {
-            job.id: job
-            for job in (await db.execute(select(Job).where(Job.id.in_(job_ids)))).scalars()
-        }
-        if job_ids
-        else {}
-    )
 
     def order(rows):
         return sorted(rows, key=lambda row: (row.name.casefold(), row.name))
@@ -336,6 +329,13 @@ async def _list_folder(
     folder_id = folder.id if folder is not None else None
     walk(folder_id)
     shown = entries[:limit]
+    # Only the statuses of the documents listed: a library holds far more than a page shows.
+    job_ids = {row.job_id for row in shown if isinstance(row, Document) and row.job_id is not None}
+    statuses: dict[uuid.UUID, str] = (
+        dict((await db.execute(select(Job.id, Job.status).where(Job.id.in_(job_ids)))).all())
+        if job_ids
+        else {}
+    )
     lines = []
     for row in shown:
         if isinstance(row, Folder):
@@ -348,7 +348,7 @@ async def _list_folder(
         path = item_path(folders, row.folder_id, row.name)
         at = vm_path(folders, row.folder_id, row.name)
         if row.kind == FILE_KIND and row.name == AGENTS_FILE:
-            place = folder_path(folders, row.folder_id) or TOP
+            place = folder_path(folders, row.folder_id) or LIBRARY_INIT_TOP
             lines.append(
                 f"AGENTS.md of {place} (document {row.id}): the standing instructions for "
                 f"this folder and the folders inside it, at {at}"
@@ -359,8 +359,7 @@ async def _list_folder(
                 f"at {at}"
             )
         else:
-            job = jobs.get(row.job_id) if row.job_id is not None else None
-            state = _state(job)
+            state = _state(statuses.get(row.job_id) if row.job_id is not None else None)
             if state == "ready":
                 await _materialized(db, settings, folders, row, author=author)
             lines.append(
@@ -610,7 +609,7 @@ async def _make_folders(
                 continue
             document = _named(await _documents_in(db, user_id, parent_id), name)
             if document is not None:
-                place = folder_path(folders, parent_id) or TOP
+                place = folder_path(folders, parent_id) or LIBRARY_INIT_TOP
                 return [], None, f"{place} holds a file named {document.name}"
         try:
             row = await filing.make_folder(db, settings, user_id, parent_id, name)
