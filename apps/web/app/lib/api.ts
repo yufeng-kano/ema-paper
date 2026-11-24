@@ -686,7 +686,6 @@ export type ChatEvent = ChatEventData & {
 type ChatEventData =
   | {
       event: 'turn_start'
-      model: string
       /** The turn's kind (docs/chat.md § Compaction); absent on turns from before it. */
       kind?: TurnKind
       /** Whether the turn had the reader's instructions, and the memories it loaded
@@ -726,7 +725,7 @@ type ChatEventData =
       /** The row before an `updated`, else null. */
       previous: MemorySnapshot | null
     }
-  | { event: 'retry'; attempt: number; parent?: string }
+  | { event: 'retry'; parent?: string }
   | { event: 'turn_done' }
   | { event: 'turn_error'; status: string; error: string }
 

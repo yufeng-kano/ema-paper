@@ -664,12 +664,6 @@ async def test_a_conversation_moves_to_another_model_between_turns(chat_client) 
     await send(client, conversation_id, text="two")
     await _run_queued_turn(client)
     assert main[1]["model"] == OTHER_MODEL
-    starts = [
-        data
-        for name, data in await replayed_events(client, conversation_id)
-        if name == "turn_start"
-    ]
-    assert [start["model"] for start in starts] == [MODEL, OTHER_MODEL]
 
 
 # --- the idle pass --------------------------------------------------------------------------

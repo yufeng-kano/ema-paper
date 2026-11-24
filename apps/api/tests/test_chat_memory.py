@@ -18,6 +18,7 @@ from sqlalchemy import select
 
 from sightread.agents import chat as chat_agent
 from sightread.agents import memory as memory_defs
+from sightread.agents import subagents as subagent_defs
 from sightread.agents.chat import TURN_CONTEXT, turn_note
 from sightread.db.models import (
     Conversation,
@@ -29,7 +30,7 @@ from sightread.db.models import (
     Result,
     User,
 )
-from sightread.jobs import chat_events, chat_memory, chat_runner, chat_tools
+from sightread.jobs import chat_events, chat_memory, chat_runner, chat_subagent, chat_tools
 from sightread.workspace.layout import user_root
 from tests.conftest import CSRF_HEADERS, DATABASE_URL
 from tests.test_chat import _run_queued_turn
@@ -709,7 +710,6 @@ async def test_the_instructions_follow_the_prompt_verbatim(chat_client) -> None:
     assert "memory" in [tool["name"] for tool in main[0]["tools"]]
     start = turn_starts(await replayed_events(client, conversation_id))[0]
     assert start == {
-        "model": "claude-code/claude-opus-5-5",
         "kind": "message",
         "instructions": True,
         "memory_ids": [],
@@ -1040,7 +1040,7 @@ def round_context() -> SimpleNamespace:
         render_slots=None,
         sandbox=None,
         turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
-        image_spent=0,
+        images=chat_runner.ImageBudget(1000, 1000, chat_runner.IMAGE_TURN_BUDGET_SPENT),
         credits_exhausted=False,
         round_admission=lambda calls: lambda index: True,
         writers={},
@@ -1056,6 +1056,7 @@ SAVED = chat_tools.ToolOutcome(
         "previous": None,
     },
 )
+SKILL_TEXT = chat_tools.ToolOutcome("The skill's instructions.")
 MEMORY_CALL = {
     "type": "tool_use",
     "id": "toolu_m",
@@ -1078,12 +1079,91 @@ async def test_a_spent_image_budget_never_refuses_the_memory_tool(monkeypatch) -
     monkeypatch.setattr(chat_runner, "_emit", no_events)
     monkeypatch.setattr(chat_runner, "_cancelled", never_cancelled)
     ctx = round_context()
-    ctx.image_spent = ctx.settings.chat_image_turn_max_bytes
+    ctx.images.total = ctx.settings.chat_image_turn_max_bytes
     page = {"type": "tool_use", "id": "p1", "name": "view_page", "input": {"page": 1}}
     viewed, remembered = await chat_runner._run_tools(ctx, [page, MEMORY_CALL], set())
     # The page is refused; the memory, which returns no image, is saved all the same.
     assert viewed["content"] == chat_runner.IMAGE_TURN_BUDGET_SPENT
     assert remembered["content"] == "Saved as m1." and "is_error" not in remembered
+
+
+async def test_a_spent_image_budget_refuses_only_pages_and_figures_ahead(monkeypatch) -> None:
+    """docs/chat.md § Tools: a skill and a subagent return no image before they run, so a
+    spent turn budget refuses neither; a page and a figure are refused."""
+
+    async def no_events(ctx, event, data):
+        return None
+
+    async def never_cancelled(ctx):
+        return False
+
+    async def fake_subagent(ctx, tool_use_id, tool_input):
+        return chat_tools.ToolOutcome("The report.")
+
+    monkeypatch.setattr(chat_runner, "_load_skill", lambda ctx, tool_input: SKILL_TEXT)
+    monkeypatch.setattr(chat_subagent, "run_subagent", fake_subagent)
+    monkeypatch.setattr(chat_runner, "_emit", no_events)
+    monkeypatch.setattr(chat_runner, "_cancelled", never_cancelled)
+    ctx = round_context()
+    ctx.images.total = ctx.settings.chat_image_turn_max_bytes
+    calls = [
+        {"type": "tool_use", "id": "p1", "name": "view_page", "input": {"page": 1}},
+        {"type": "tool_use", "id": "f1", "name": "view_figure", "input": {"page": 1}},
+        {"type": "tool_use", "id": "k1", "name": "skill", "input": {"name": "translate"}},
+        {"type": "tool_use", "id": "s1", "name": "subagent", "input": {"name": "x", "task": "y"}},
+    ]
+    page, figure, skill, subagent = await chat_runner._run_tools(ctx, calls, set())
+    assert page["content"] == figure["content"] == chat_runner.IMAGE_TURN_BUDGET_SPENT
+    assert skill["content"] == SKILL_TEXT.content and "is_error" not in skill
+    assert subagent["content"] == "The report." and "is_error" not in subagent
+
+
+async def test_a_subagents_spent_image_budget_still_lets_it_view_text(monkeypatch) -> None:
+    """docs/chat.md § Subagents: a subagent whose own image budget is spent is refused a
+    page ahead, but its editor still answers a `view` of a text file."""
+
+    async def no_events(ctx, event, data):
+        return None
+
+    async def never_cancelled(ctx):
+        return False
+
+    async def text_view(root, tool_input, author, **kwargs):
+        return chat_tools.ToolOutcome("1\tBody text.")
+
+    monkeypatch.setattr(chat_tools, "run_editor", text_view)
+    monkeypatch.setattr(chat_runner, "_emit", no_events)
+    monkeypatch.setattr(chat_runner, "_cancelled", never_cancelled)
+    ctx = round_context()
+    ctx.paths = SimpleNamespace(root=None)
+    ctx.settings.chat_tool_result_max_chars = 1000
+    ctx.settings.content_max_bytes = 1000
+    ctx.settings.chat_attachment_image_long_edge = 1
+    reader = subagent_defs.ResolvedSubagent(
+        name="reader",
+        description="",
+        model=None,
+        writes=False,
+        tools=("view_page", "str_replace_based_edit_tool"),
+        prompt="",
+        builtin=False,
+        modified=False,
+        default=None,
+    )
+    budget = chat_runner.ImageBudget(1000, 1000, chat_subagent.IMAGE_RUN_BUDGET_SPENT)
+    budget.total = 1000
+    calls = [
+        {"type": "tool_use", "id": "p1", "name": "view_page", "input": {"page": 1}},
+        {
+            "type": "tool_use",
+            "id": "e1",
+            "name": "str_replace_based_edit_tool",
+            "input": {"command": "view", "path": "/workspace/files/a/doc.md"},
+        },
+    ]
+    page, viewed = await chat_subagent._run_tools(ctx, "toolu_s", reader, calls, set(), {}, budget)
+    assert page["content"] == chat_subagent.IMAGE_RUN_BUDGET_SPENT
+    assert viewed["content"] == "1\tBody text." and "is_error" not in viewed
 
 
 async def test_a_cancel_never_parts_a_memorys_commit_from_its_events(monkeypatch) -> None:

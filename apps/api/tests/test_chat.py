@@ -1045,7 +1045,9 @@ def _round_ctx(image_budget: int = 32 << 20) -> SimpleNamespace:
             chat_image_turn_max_bytes=image_budget * 4,
             chat_page_image_max_pixels=1,
         ),
-        image_spent=0,
+        images=chat_runner.ImageBudget(
+            image_budget, image_budget * 4, chat_runner.IMAGE_TURN_BUDGET_SPENT
+        ),
         credits_exhausted=False,
         round_admission=lambda calls: lambda index: True,
         writers={},
@@ -1089,7 +1091,7 @@ async def test_a_rounds_images_never_exceed_the_budget(monkeypatch) -> None:
         render_slots=None,
         sandbox=None,
         turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
-        image_spent=0,
+        images=chat_runner.ImageBudget(250, 1 << 30, chat_runner.IMAGE_TURN_BUDGET_SPENT),
         credits_exhausted=False,
         round_admission=lambda calls: lambda index: True,
         tools=[{"name": "view_page"}],
@@ -1105,7 +1107,7 @@ async def test_a_rounds_images_never_exceed_the_budget(monkeypatch) -> None:
     # Admitted one at a time as each completes: two images fit, the third would cross
     # the budget and is replaced, however many rendered together.
     assert len(kept) == 2
-    assert sum(chat_runner._image_bytes(result) for result in kept) <= 250
+    assert sum(chat_runner._image_bytes(result["content"]) for result in kept) <= 250
     assert len(refused) == 10
     assert all(result["content"] == chat_runner.IMAGE_BUDGET_SPENT for result in refused)
 
@@ -2244,7 +2246,7 @@ async def test_a_turns_images_never_exceed_the_turn_budget(monkeypatch) -> None:
         render_slots=None,
         sandbox=None,
         turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
-        image_spent=0,
+        images=chat_runner.ImageBudget(1000, 250, chat_runner.IMAGE_TURN_BUDGET_SPENT),
         credits_exhausted=False,
         round_admission=lambda calls: lambda index: True,
         tools=[{"name": "view_page"}],
@@ -2256,11 +2258,11 @@ async def test_a_turns_images_never_exceed_the_turn_budget(monkeypatch) -> None:
     # The round's budget would take all three; the turn's takes two across every round.
     first = await chat_runner._run_tools(ctx, one_round, set())
     assert len([r for r in first if not r.get("is_error")]) == 2
-    assert ctx.image_spent == 200
+    assert ctx.images.total == 200
     second = await chat_runner._run_tools(ctx, one_round, set())
     assert all(r.get("is_error") for r in second)
     assert all(r["content"] == chat_runner.IMAGE_TURN_BUDGET_SPENT for r in second)
-    assert ctx.image_spent == 200
+    assert ctx.images.total == 200
 
 
 async def test_a_lost_shell_status_is_an_error(monkeypatch) -> None:
@@ -2315,7 +2317,7 @@ async def test_a_shell_command_holds_the_workspace_lock(tmp_path, monkeypatch) -
         paths=SimpleNamespace(root=root),
         sandbox=object(),
         turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
-        image_spent=0,
+        images=chat_runner.ImageBudget(1000, 1000, chat_runner.IMAGE_TURN_BUDGET_SPENT),
         credits_exhausted=False,
         round_admission=lambda calls: lambda index: True,
         writers={},
@@ -2491,7 +2493,7 @@ async def test_a_shell_move_is_reconciled_before_the_lock_is_released(
         sandbox=object(),
         sessionmaker=Sessions(),
         turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
-        image_spent=0,
+        images=chat_runner.ImageBudget(1000, 1000, chat_runner.IMAGE_TURN_BUDGET_SPENT),
         credits_exhausted=False,
         round_admission=lambda calls: lambda index: True,
         writers={},
@@ -3051,7 +3053,7 @@ async def test_a_command_the_runner_could_not_confirm_over_keeps_the_marker_unti
     block = {"id": "t1", "name": "bash", "input": {"command": "python write.py"}}
     # Neither the command nor the restart could be confirmed over: nothing is committed
     # and the marker stays, naming the shell, so host writes are refused.
-    result = await chat_runner._run_tool_unguarded(ctx, block, set(), None)
+    result = await chat_runner._run_tool_unguarded(ctx, block, set(), lambda outcome: outcome)
     assert result["is_error"] and "takes no other write" in result["content"]
     assert shell.restarted == ["s"]
     assert read_writing(paths.root) == (3, "s")
@@ -3073,7 +3075,7 @@ async def test_a_command_the_runner_could_not_confirm_over_keeps_the_marker_unti
     assert "files/Papers/paper.pdf/half.txt" in head.files
 
     # Within a turn, a restart that confirms the kill records the tree right away.
-    result = await chat_runner._run_tool_unguarded(ctx, block, set(), None)
+    result = await chat_runner._run_tool_unguarded(ctx, block, set(), lambda outcome: outcome)
     assert result["is_error"] and "restarted" in result["content"]
     assert not writing_marker(paths.root).exists()
     assert git.log(paths.root)[0].message == "bash: python write.py"
@@ -3126,7 +3128,7 @@ async def test_a_figure_read_is_bounded_by_the_image_budget_not_the_text_cap(
         ctx,
         {"id": "f1", "name": "view_figure", "input": {"page": 1, "bbox": [0, 0, 1000, 1000]}},
         set(),
-        None,
+        lambda outcome: outcome,
     )
     assert "is_error" not in result
     assert result["content"][0]["type"] == "image"
@@ -3172,7 +3174,10 @@ async def test_a_shell_command_stands_marked_as_writing_for_its_whole_run(
         conversation=SimpleNamespace(id=3, session="s"),
     )
     result = await chat_runner._run_tool_unguarded(
-        ctx, {"id": "t1", "name": "bash", "input": {"command": "touch made.txt"}}, set(), None
+        ctx,
+        {"id": "t1", "name": "bash", "input": {"command": "touch made.txt"}},
+        set(),
+        lambda outcome: outcome,
     )
     assert seen == [True]
     assert not writing_marker(paths.root).exists()  # the command is over and recorded
@@ -3521,28 +3526,62 @@ async def test_a_usage_row_is_written_through_a_cancel(monkeypatch) -> None:
     """A cancel that lands while a call's usage row is being written waits for the write:
     the paid call reaches usage_log whether or not the turn survives it (docs/chat.md
     § Conversations, turns, events)."""
-    from sightread.jobs import chat_runner
-
     started = asyncio.Event()
     release = asyncio.Event()
-    recorded: list[str] = []
+    added: list = []
+    committed: list = []
 
-    async def slow_record(ctx, model, usage, *, conversation=False):
-        started.set()
-        await release.wait()
-        recorded.append(usage)
+    class Session:
+        """A session whose commit waits until the test releases it."""
 
-    monkeypatch.setattr(chat_runner, "_record_usage", slow_record)
-    task = asyncio.create_task(chat_runner._record_usage_settled(None, "claude-x", "the call"))
-    await started.wait()
+        def __call__(self):
+            return self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def add(self, row) -> None:
+            added.append(row)
+
+        async def flush(self) -> None:
+            return None
+
+        async def commit(self) -> None:
+            started.set()
+            await release.wait()
+            committed.extend(added)
+
+    async def no_settlement(db, settings, turn_id):
+        return None
+
+    monkeypatch.setattr(chat_runner.ledger, "settle_chat", no_settlement)
+    ctx = SimpleNamespace(
+        sessionmaker=Session(),
+        settings=None,
+        turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
+        credits_exhausted=False,
+    )
+    usage = SimpleNamespace(
+        input_tokens=10,
+        output_tokens=5,
+        cache_read_tokens=0,
+        cache_write_tokens=0,
+        cost=None,
+        cost_source="unknown",
+    )
+    task = asyncio.create_task(chat_runner._record_usage(ctx, "claude-x", usage))
+    await asyncio.wait_for(started.wait(), 5)
     task.cancel()
     await asyncio.sleep(0)
     # The cancel is in, the write is not: the task waits rather than ending over it.
-    assert not task.done() and not recorded
+    assert not task.done() and not committed
     release.set()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert recorded == ["the call"]
+    assert [(row.model, row.prompt_tokens) for row in committed] == [("claude-x", 10)]
 
 
 def test_a_directory_view_is_bounded_like_every_tool_result(tmp_path) -> None:

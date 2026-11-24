@@ -469,7 +469,9 @@ def _editor_round_ctx(root: Path, *, round_budget: int, turn_budget: int) -> Sim
         render_slots=None,
         sandbox=None,
         turn=SimpleNamespace(id=uuid.uuid4(), user_id=1),
-        image_spent=0,
+        images=chat_runner.ImageBudget(
+            round_budget, turn_budget, chat_runner.IMAGE_TURN_BUDGET_SPENT
+        ),
         credits_exhausted=False,
         round_admission=lambda calls: lambda index: True,
         writers={},
@@ -528,7 +530,7 @@ async def test_an_editor_image_counts_against_the_image_budgets(tmp_path, monkey
         for result in results
         if result.get("is_error")
     )
-    assert ctx.image_spent == 200
+    assert ctx.images.total == 200
     # The editor offers the image view, without crop commands on a turn with no shell.
     assert viewed[0]["images"].max_bytes == 250 and viewed[0]["images"].shell is False
 
@@ -538,7 +540,7 @@ async def test_an_editor_image_counts_against_the_image_budgets(tmp_path, monkey
     assert [bool(result.get("is_error")) for result in first] == [False, False, True]
     assert first[2]["content"] == chat_runner.IMAGE_TURN_BUDGET_SPENT
     # The turn's budget is spent to the byte: the next round's edit must still run.
-    assert ctx.image_spent == 200
+    assert ctx.images.total == 200
     edit = {
         "type": "tool_use",
         "id": "e",

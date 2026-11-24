@@ -730,6 +730,55 @@ async def test_download_file_files_the_bytes_like_an_upload(
 
 
 @respx.mock
+async def test_a_download_names_its_folder_as_the_library_tools_do(
+    make_client, tmp_path, monkeypatch
+) -> None:
+    """docs/chat.md § Tools: `folder` reads as the library tools read a folder — the same
+    path under `/workspace/files/` names the same folder, and a path with `..` names none
+    and is refused before anything is fetched."""
+    fake_resolver(monkeypatch)
+    client = await web_client(make_client, tmp_path)
+    fetched = respx.get(host=PUBLIC_IP, path="/dl").mock(
+        return_value=httpx.Response(200, headers={"content-type": "text/plain"}, content=b"ok")
+    )
+    stub_messages(
+        [
+            one_call(
+                "d1",
+                "download_file",
+                {"url": "https://example.org/dl", "folder": "Papers/../..", "name": "a.txt"},
+            ),
+            one_call(
+                "d2",
+                "download_file",
+                {
+                    "url": "https://example.org/dl",
+                    "folder": "/workspace/files/Papers/2017",
+                    "name": "b.txt",
+                },
+            ),
+            ([{"type": "text", "text": "Kept."}], "end_turn"),
+        ]
+    )
+    conversation_id = await new_conversation(client)
+    await send(client, conversation_id, text="Keep")
+    await _run_queued_turn(client)
+    refused, kept = await tool_results(client, conversation_id)
+    assert refused["is_error"] is True
+    assert refused["output"].startswith("Papers/../.. names no folder of the library")
+    assert fetched.call_count == 1
+    assert kept["is_error"] is False and kept["output"].startswith(
+        "Kept b.txt (2 bytes, text/plain) in Papers/2017."
+    )
+    async with client.app.state.sessionmaker() as db:
+        folders = (await db.execute(select(Folder.name))).scalars().all()
+    assert sorted(folders) == ["2017", "Papers"]
+    root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
+    assert (root / "files" / "Papers" / "2017" / "b.txt").read_bytes() == b"ok"
+    assert await recorded(client, "download_file") == 1
+
+
+@respx.mock
 async def test_a_download_past_a_cap_or_the_quota_keeps_nothing(
     make_client, tmp_path, monkeypatch
 ) -> None:

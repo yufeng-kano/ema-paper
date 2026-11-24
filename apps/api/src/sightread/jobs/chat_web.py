@@ -660,12 +660,12 @@ async def download(
             )
         declared = response.headers.get("content-length")
         if declared and declared.isdigit() and int(declared) > cap:
-            raise FetchRefused(_too_large(int(declared), max_bytes, room))
+            raise FetchRefused(_too_large(int(declared), max_bytes))
         size = 0
         async for chunk in iter_body(response):
             size += len(chunk)
             if size > cap:
-                raise FetchRefused(_too_large(size, max_bytes, room))
+                raise FetchRefused(_too_large(size, max_bytes))
             await asyncio.to_thread(_write_all, fd, chunk)
         media_type, _charset = media_type_of(response)
         return Downloaded(
@@ -679,7 +679,7 @@ async def download(
         )
 
 
-def _too_large(size: int, max_bytes: int, room: int) -> str:
+def _too_large(size: int, max_bytes: int) -> str:
     if size > max_bytes:
         return f"The file is larger than the {max_bytes:,} bytes a download may be."
     return "The user's storage is full; the file does not fit."

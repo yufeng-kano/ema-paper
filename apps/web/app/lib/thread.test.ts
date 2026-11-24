@@ -82,7 +82,7 @@ describe('buildThread', () => {
   it('shows a live turn from its events, the trailing group in flight', () => {
     const messages = [message('user', [{ type: 'text', text: 'Check page 3' }])]
     const groups = events(
-      { event: 'turn_start', model: 'm' },
+      { event: 'turn_start' },
       { event: 'text_delta', text: 'Looking.' },
       { event: 'tool_use', id: 'p', name: 'view_page', input: { page: 3 } },
     )
@@ -118,7 +118,7 @@ describe('buildThread', () => {
     const groups = events(
       { event: 'tool_use', id: 's', name: 'subagent', input: { name: 'verifier', task: 'pages 1-2' } },
       { event: 'tool_use', id: 'x', name: 'view_page', input: { page: 9 }, parent: 's' },
-      { event: 'retry', attempt: 2, parent: 's' },
+      { event: 'retry', parent: 's' },
       { event: 'thinking', text: 'Page 1 first.', parent: 's' },
       { event: 'tool_use', id: 'y', name: 'view_page', input: { page: 1 }, parent: 's' },
       { event: 'tool_result', id: 'y', name: 'view_page', is_error: false, output: '(image)', parent: 's' },
@@ -316,7 +316,7 @@ describe('a library conversation', () => {
   it('takes the record from the stream while the turn runs, and none from a call that changed nothing', () => {
     const messages = [message('user', [{ type: 'text', text: 'Tidy up' }])]
     const groups = events(
-      { event: 'turn_start', model: 'm' },
+      { event: 'turn_start' },
       { event: 'tool_use', id: 'l', name: 'list_files', input: {} },
       { event: 'tool_result', id: 'l', name: 'list_files', is_error: false, output: 'folder DL' },
       { event: 'tool_use', id: 'm', name: 'move', input: MOVE },
@@ -344,7 +344,7 @@ describe('memory lines and what an answer used', () => {
       message('assistant', [{ type: 'text', text: 'I will use 查詢.' }]),
     ]
     const groups = events(
-      { event: 'turn_start', model: 'm', instructions: true, memory_ids: [3, 4] },
+      { event: 'turn_start', instructions: true, memory_ids: [3, 4] },
       { event: 'tool_use', id: 'm', name: 'memory', input: REMEMBER },
       { event: 'memory', tool_use_id: 'm', action: 'saved', memory: SAVED, previous: null },
       { event: 'tool_result', id: 'm', name: 'memory', is_error: false, output: 'Saved as m12.' },
@@ -359,7 +359,7 @@ describe('memory lines and what an answer used', () => {
   it('hides a live memory call too, the line following the newest text', () => {
     const messages = [message('user', [{ type: 'text', text: 'Remember this' }])]
     const groups = events(
-      { event: 'turn_start', model: 'm', instructions: false, memory_ids: [] },
+      { event: 'turn_start', instructions: false, memory_ids: [] },
       { event: 'text_delta', text: 'Saving it.' },
       { event: 'tool_use', id: 'm', name: 'memory', input: REMEMBER },
       { event: 'memory', tool_use_id: 'm', action: 'saved', memory: SAVED, previous: null },
@@ -370,7 +370,7 @@ describe('memory lines and what an answer used', () => {
 
   it('says nothing of what a turn used when it had neither instructions nor memories', () => {
     const messages = [message('user', [{ type: 'text', text: 'Hi' }]), message('assistant', [{ type: 'text', text: 'Hello.' }])]
-    for (const start of [{ model: 'm' }, { model: 'm', instructions: false, memory_ids: [] }]) {
+    for (const start of [{}, { instructions: false, memory_ids: [] }]) {
       const { items } = buildThread({ turns: [turn(true)], messages, groups: events({ event: 'turn_start', ...start }) })
       expect(items.at(-1)).toMatchObject({ kind: 'foot', used: null })
     }
@@ -498,7 +498,7 @@ describe('a compaction turn', () => {
   it('draws no bubble while it runs and ends in its own line, its steps shown as any turn’s', () => {
     const messages = [message('user', [{ type: 'text', text: '/compact keep the table' }])]
     const groups = events(
-      { event: 'turn_start', model: 'm', kind: 'compact' },
+      { event: 'turn_start', kind: 'compact' },
       { event: 'tool_use', id: 'e', name: 'str_replace_based_edit_tool', input: { command: 'create', path: '/workspace/memory.md', file_text: 'x' } },
       { event: 'tool_result', id: 'e', name: 'str_replace_based_edit_tool', is_error: false, output: 'ok' },
       { event: 'text_delta', text: 'The summary so far' },
@@ -511,7 +511,7 @@ describe('a compaction turn', () => {
 
   it('is known from its turn_start when the record does not list the turn yet', () => {
     const messages = [message('user', [{ type: 'text', text: '/compact' }])]
-    const groups = events({ event: 'turn_start', model: 'm', kind: 'idle_compact' })
+    const groups = events({ event: 'turn_start', kind: 'idle_compact' })
     const { items } = buildThread({ turns: [], messages, groups })
     expect(kinds(items)).toEqual(['compacting'])
     expect(turnKind(undefined, groups.get(TURN))).toBe('idle_compact')
@@ -562,7 +562,7 @@ describe('a compaction turn', () => {
     const live = buildThread({
       turns: [compactTurn(false)],
       messages: [message('user', [{ type: 'text', text: '/compact' }])],
-      groups: events({ event: 'turn_start', model: 'm', kind: 'compact' }, { event: 'turn_done' }),
+      groups: events({ event: 'turn_start', kind: 'compact' }, { event: 'turn_done' }),
     })
     expect(live.items).toEqual([])
     expect(live.liveTurns).toEqual([])

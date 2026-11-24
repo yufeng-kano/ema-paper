@@ -30,7 +30,7 @@ from sightread.workspace.layout import user_root
 from tests.conftest import CSRF_HEADERS, KANO_CHAT_URL, convert_on_upload
 from tests.test_chat import _run_queued_turn
 from tests.test_chat_extensions import new_conversation, one_call, send, stub_messages
-from tests.test_chat_web import recorded, tool_results, turn_credits, web_client
+from tests.test_chat_web import tool_results, turn_credits, web_client
 
 VISION_MARKDOWN = "## Page one\n\nBody text."
 DONE = ([{"type": "text", "text": "Read."}], "end_turn")
@@ -157,7 +157,6 @@ async def test_convert_file_turns_a_kept_file_into_a_document_inside_the_turn(
     root = user_root(settings.workspaces_dir, client.user_id)
     assert "Body text." in (root / "files" / "Papers" / "tiny.png" / "doc.md").read_text()
     assert not (root / "files" / "Papers" / "tiny.png").is_file()
-    assert await recorded(client, "convert_file") == 1
     # The turn is charged on its tokens alone (docs/billing.md § A chat turn).
     assert await turn_credits(client, conversation_id) == ("succeeded", 1)
     listed = (await client.get("/api/library")).json()["documents"]
@@ -194,7 +193,6 @@ async def test_a_file_converted_before_costs_nothing_again(
     assert sum(value or 0 for value in charged.values()) == settings.parse_credits_per_page
     root = user_root(settings.workspaces_dir, client.user_id)
     assert "Body text." in (root / "files" / "again.png" / "doc.md").read_text()
-    assert await recorded(client, "convert_file") == 2
 
 
 @respx.mock
@@ -224,7 +222,7 @@ async def test_a_document_whose_parse_still_waits_is_driven_too(
 ) -> None:
     """docs/chat.md § Tools: an upload converting on arrival sits queued behind the turn;
     named to `convert_file`, its parse is driven inside the turn the same way and read —
-    neither charged nor recorded again, since the upload's conversion is the one that runs."""
+    not charged again, since the upload's conversion is the one that runs."""
     vision = respx.post(KANO_CHAT_URL).mock(return_value=_completion(VISION_MARKDOWN))
     client = await _ready(make_client, tmp_path)
     await convert_on_upload(client)
@@ -239,7 +237,6 @@ async def test_a_document_whose_parse_still_waits_is_driven_too(
     assert result["is_error"] is False, result["output"]
     assert result["output"].startswith("Converted tiny.png (1 page, ")
     assert vision.call_count == 1
-    assert await recorded(client, "convert_file") == 0
     async with client.app.state.sessionmaker() as db:
         row = await db.get(Document, uploaded.json()["id"])
         job = await db.get(Job, row.job_id)
@@ -252,7 +249,7 @@ async def test_a_document_whose_parse_still_waits_is_driven_too(
 async def test_convert_file_refuses_what_is_not_a_file_to_convert(make_client, tmp_path) -> None:
     """docs/chat.md § Tools: a path that names nothing, a file that is not there, a kind
     the parse agent does not take and a document already are each refused with nothing
-    changed, and none counts as a call."""
+    changed."""
     client = await _ready(make_client, tmp_path)
     zipped = await _keep(client, "archive.zip", b"PK\x05\x06" + b"\0" * 18, "application/zip", None)
     _, results = await _run(
@@ -281,7 +278,6 @@ async def test_convert_file_refuses_what_is_not_a_file_to_convert(make_client, t
     assert len(jobs) == 1  # the seeded document's
     root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
     assert (root / "files" / "archive.zip").is_file()
-    assert await recorded(client, "convert_file") == 0
 
 
 @respx.mock
@@ -308,7 +304,6 @@ async def test_convert_file_stops_at_the_balance_and_at_the_turn_cap(
     assert len(jobs) == 1
     root = user_root(client.app.state.settings.workspaces_dir, client.user_id)
     assert (root / "files" / "tiny.png").is_file()
-    assert await recorded(client, "convert_file") == 0
 
 
 @respx.mock
@@ -343,7 +338,6 @@ async def test_a_conversion_past_its_time_goes_back_on_the_queue(
         row = await db.get(Document, kept["id"])
         job = await db.get(Job, row.job_id)
     assert (row.kind, job.status, job.worker_generation) == ("parse", "queued", None)
-    assert await recorded(client, "convert_file") == 1
     # The worker's next cycle finishes it.
     async with client.app.state.sessionmaker() as db:
         claimed = await claim_next_job(db, settings.max_jobs_per_user)
@@ -482,7 +476,6 @@ async def test_the_agent_retries_a_failed_conversion_once_told_to(
             await db.execute(select(CreditEntry.amount).where(CreditEntry.job_id == job_id))
         ).scalar_one()
     assert f"and reserves the whole conversion's {reserved:,} credits again" in failed["output"]
-    assert await recorded(client, "convert_file") == 1
 
     down = False
     _, (retried,) = await _run(client, {"path": "paper.pdf", "retry": True})
@@ -494,13 +487,11 @@ async def test_the_agent_retries_a_failed_conversion_once_told_to(
     async with client.app.state.sessionmaker() as db:
         charged = await ledger.credits_by_job(db, [job_id])
     assert charged[job_id] == settings.parse_credits_per_page * job.page_count
-    assert await recorded(client, "convert_file") == 2
 
     _, (again,) = await _run(client, {"path": "paper.pdf", "retry": True})
     assert again["output"] == (
         "paper.pdf is a document already: read /workspace/files/paper.pdf/doc.md."
     )
-    assert await recorded(client, "convert_file") == 2
 
 
 @respx.mock
@@ -508,7 +499,7 @@ async def test_a_retry_the_balance_or_the_original_cannot_carry_is_not_queued(
     make_client, tmp_path, documents, monkeypatch
 ) -> None:
     """docs/billing.md § A chat turn: the agent's retry is refused as the Files page's is
-    when the balance cannot cover it, the job left failed and nothing recorded; a document
+    when the balance cannot cover it, the job left failed; a document
     whose original is gone answers that it cannot be retried."""
     monkeypatch.setattr(runner, "VISION_BACKOFF_BASE_SECONDS", 0.0)
     vision = respx.post(KANO_CHAT_URL).mock(return_value=httpx.Response(503, json={}))
@@ -530,7 +521,6 @@ async def test_a_retry_the_balance_or_the_original_cannot_carry_is_not_queued(
     _, job, _ = await _settled(client, kept["id"])
     assert job.status == "failed"
     assert vision.call_count == calls
-    assert await recorded(client, "convert_file") == 1
 
     # A conversion queued before the ledger had nothing reserved, and its retry reserves
     # nothing (docs/billing.md § A parse): the answer prices it so.
