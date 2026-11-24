@@ -4,8 +4,8 @@ The bash tool's contract is a shell whose working directory, environment and bac
 processes carry from one command to the next, with `restart` as the only reset. One
 `ShellSession` is one such shell: a long-lived `bash` child whose stdin we write commands
 to and whose combined output we read back up to a sentinel line that carries the exit
-code. The backend decides what the child is — `bash` in a directory, or `docker exec` into
-the user's VM — and nothing else differs.
+code. The backend decides what the child is — `docker exec` into the user's VM — and the
+cleanup that runs after each command.
 """
 
 from __future__ import annotations
@@ -69,14 +69,6 @@ class BoundedOutput:
             return head + tail, False
         return f"{head}\n[... {self.omitted} bytes omitted by the sandbox ...]\n{tail}", True
 
-
-# The default end-of-command cleanup: everything in the shell's process group but the
-# shell. What the local backend uses — on a host, nothing wider would be safe. The VM
-# backend sweeps the whole VM instead (backends.VM_SWEEP).
-GROUP_CLEANUP = (
-    "for __sr_pid in $(pgrep -g $$); do"
-    ' [ "$__sr_pid" != "$$" ] && kill -KILL "$__sr_pid" 2>/dev/null; done'
-)
 
 # What the child bash runs for each command: the session's saved working directory and
 # exported variables restored, the command sourced (so its `cd` and `export` land in

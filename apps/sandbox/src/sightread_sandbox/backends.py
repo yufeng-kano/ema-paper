@@ -1,8 +1,9 @@
 """Where a user's shell runs (docs/sandbox.md).
 
 `DockerBackend` keeps one container per user — a Kata microVM in production — with the
-user's workspace at `/workspace`, and opens shells in it with `docker exec`. `LocalBackend`
-runs bash in a directory and exists for the test suite alone: it isolates nothing.
+user's workspace at `/workspace`, and opens shells in it with `docker exec`. `Backend`
+holds what does not depend on Docker, which the test suite drives with a bash stand-in of
+its own (tests/local_backend.py) that no setting selects.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import Settings
-from .shell import GROUP_CLEANUP, SAFE_PATH, ExecOutcome, ShellSession, supervisor
+from .shell import SAFE_PATH, ExecOutcome, ShellSession, supervisor
 
 logger = logging.getLogger(__name__)
 
@@ -88,14 +89,14 @@ class Backend:
 
     def on_timeout(self, user_id: int) -> Callable[..., Awaitable[None]] | None:
         """What kills a timed-out command where it runs; None when closing the host-side
-        process is enough (the local backend). Called with the supervisor's `pid` as the
-        VM numbers it, and `locked=True` when the caller already holds the sandbox lock."""
+        process is enough. Called with the supervisor's `pid` as the VM numbers it, and
+        `locked=True` when the caller already holds the sandbox lock."""
         return None
 
     def cleanup(self) -> str:
         """What the supervisor runs after every command to end what the command left
-        running (docs/sandbox.md § The runner): the shell's process group, by default."""
-        return GROUP_CLEANUP
+        running (docs/sandbox.md § The runner)."""
+        raise NotImplementedError
 
     async def stop_vm(self, sandbox: UserSandbox) -> bool:
         """Remove the VM; True when the removal itself succeeded."""
@@ -734,38 +735,3 @@ class DockerBackend(Backend):
         if code != 0:
             logger.warning("could not remove sandbox of user %d: %s", sandbox.user_id, out.strip())
         return code == 0
-
-
-# --- local (tests only) ---------------------------------------------------------------------
-
-
-class LocalBackend(Backend):
-    """bash in the workspace directory. No isolation whatsoever — never deployed."""
-
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(settings)
-        self._running: set[int] = set()
-
-    async def is_running(self, user_id: int) -> bool:
-        return user_id in self._running
-
-    async def ensure_running(self, sandbox: UserSandbox) -> None:
-        sandbox.known_stopped = False
-        workspace = self.workspace(sandbox.user_id)
-        await asyncio.to_thread(lambda: (workspace / CACHE_DIR).mkdir(parents=True, exist_ok=True))
-        if sandbox.user_id not in self._running:
-            self._running.add(sandbox.user_id)
-            sandbox.started_at = time.monotonic()
-
-    def shell_argv(self, user_id: int) -> tuple[list[str], str | None]:
-        return ["sh", "-c", supervisor(self.cleanup())], str(self.workspace(user_id))
-
-    async def stop_vm(self, sandbox: UserSandbox) -> bool:
-        self._running.discard(sandbox.user_id)
-        return True
-
-
-def build_backend(settings: Settings) -> Backend:
-    if settings.sandbox_backend == "local":
-        return LocalBackend(settings)
-    return DockerBackend(settings)

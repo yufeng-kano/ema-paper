@@ -338,7 +338,7 @@ def build_server(app: FastAPI) -> MCPServer:
                 age=never or ("" if retention == 0 else f", within {retention - 1} days of its end")
             )
 
-        base = settings.app_url.rstrip("/")
+        base = settings.app_url
         auth = f"-H 'Authorization: Bearer {token}'"
         # The upload lands whatever the server answers in a progress file of its own,
         # removed first so it is always this run's; the read after it fails loudly with
@@ -465,7 +465,7 @@ def build_server(app: FastAPI) -> MCPServer:
             ticket, token = await document_tickets.mint(
                 db, settings, user, document_id, document_tickets.READ
             )
-        base = f"{settings.app_url.rstrip('/')}/v1/library/documents/{document_id}"
+        base = f"{settings.app_url}/v1/library/documents/{document_id}"
         auth = f"-H 'Authorization: Bearer {token}'"
         local = _local_name(document["name"])
         answer: dict[str, Any] = {
@@ -532,7 +532,7 @@ def build_server(app: FastAPI) -> MCPServer:
             ticket, token = await document_tickets.mint(
                 db, settings, user, document_id, document_tickets.WRITE
             )
-        base = f"{settings.app_url.rstrip('/')}/v1/library/documents/{document_id}"
+        base = f"{settings.app_url}/v1/library/documents/{document_id}"
         auth = f"-H 'Authorization: Bearer {token}'"
         local = _local_name(document["name"])
         return {
@@ -573,7 +573,7 @@ class BearerGuard:
         self._transport = transport
 
     def _challenge(self, invalid: bool) -> dict[str, str]:
-        issuer = self._app.state.settings.app_url.rstrip("/")
+        issuer = self._app.state.settings.app_url
         parts = [f'resource_metadata="{issuer}{PROTECTED_RESOURCE_PATH}"']
         if invalid:
             parts.insert(0, 'error="invalid_token"')

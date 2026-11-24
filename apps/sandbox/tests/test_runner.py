@@ -1,4 +1,4 @@
-"""The runner over the local backend: a bash process, no Docker, no network."""
+"""The runner over a local bash stand-in for its backend: no Docker, no network."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from local_backend import GROUP_CLEANUP, LocalBackend
 from sightread_sandbox import backends
 from sightread_sandbox.backends import (
     ADOPT_SWEEP,
@@ -27,24 +28,23 @@ from sightread_sandbox.backends import (
     REAPER_PYTHON,
     VM_SWEEP,
     DockerBackend,
-    LocalBackend,
     UserSandbox,
     adopted_user_ids,
 )
 from sightread_sandbox.config import Settings
 from sightread_sandbox.main import create_app
-from sightread_sandbox.shell import GROUP_CLEANUP, SAFE_PATH, ShellSession, supervisor
+from sightread_sandbox.shell import SAFE_PATH, ShellSession, supervisor
 
 TOKEN = "runner-token-not-a-real-one"
 PROXY_URL = "http://10.250.250.2:3128"
 
 
-def _settings(tmp_path: Path, backend: str, **overrides: Any) -> Settings:
+def local_settings(tmp_path: Path, **overrides: Any) -> Settings:
+    """The runner's settings for the tests, the workspaces under the test's own directory."""
     return Settings(
         **{
             "app_env": "local",
             "sandbox_token": TOKEN,
-            "sandbox_backend": backend,
             "sandbox_workspaces_dir": str(tmp_path / "ws"),
             "sandbox_workspaces_mount": str(tmp_path / "ws"),
             **overrides,
@@ -52,14 +52,9 @@ def _settings(tmp_path: Path, backend: str, **overrides: Any) -> Settings:
     )
 
 
-def local_settings(tmp_path: Path, **overrides: Any) -> Settings:
-    """The local backend's settings, the workspaces under the test's own directory."""
-    return _settings(tmp_path, "local", **overrides)
-
-
 def docker_settings(tmp_path: Path, **overrides: Any) -> Settings:
-    """The Docker backend's settings on `runc`, a runtime only `local` accepts."""
-    return _settings(tmp_path, "docker", **{"sandbox_runtime": "runc", **overrides})
+    """The Docker backend's settings on `runc`, a runtime only `APP_ENV=local` accepts."""
+    return local_settings(tmp_path, **{"sandbox_runtime": "runc", **overrides})
 
 
 @contextlib.asynccontextmanager
@@ -1120,8 +1115,6 @@ async def test_a_reset_whose_cache_cannot_be_removed_reports_it(
 def test_the_runner_refuses_a_relative_workspace_host_path(tmp_path) -> None:
     with pytest.raises(ValueError, match="absolute"):
         docker_settings(tmp_path, sandbox_workspaces_dir="./workspaces")
-    # The local backend runs no `docker run` and takes any path.
-    local_settings(tmp_path, sandbox_workspaces_dir="./workspaces")
 
 
 async def test_an_eviction_that_left_the_vm_unstoppable_starts_no_shell(tmp_path) -> None:

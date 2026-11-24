@@ -102,7 +102,6 @@ services:
       - path: .env
         required: false
     environment:
-      SANDBOX_BACKEND: docker
       SANDBOX_WORKSPACES_MOUNT: /data/workspaces
       # The egress proxy as a VM reaches it — by address, since Docker's DNS does not
       # answer inside a Kata VM — once SANDBOX_NETWORK names its network

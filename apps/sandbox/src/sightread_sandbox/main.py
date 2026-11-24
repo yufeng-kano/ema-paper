@@ -16,7 +16,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from .backends import Backend, build_backend
+from .backends import Backend, DockerBackend
 from .config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
@@ -36,7 +36,7 @@ class ExecBody(SessionBody):
 
 def create_app(settings: Settings | None = None, backend: Backend | None = None) -> FastAPI:
     settings = settings or get_settings()
-    backend = backend or build_backend(settings)
+    backend = backend or DockerBackend(settings)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):

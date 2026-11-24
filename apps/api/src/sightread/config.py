@@ -17,6 +17,11 @@ from .billing.plans import CREDITS_MAX, FREE_PLAN_ID, Pack, Plan, parse_packs, p
 # without a .env file. Production refuses to start without a real SECRET_KEY.
 LOCAL_FALLBACK_SECRET_KEY = "local-development-insecure-secret-key"  # noqa: S105
 
+# The web app's locales, each the prefix its pages live under: the build's, mirrored from
+# apps/web/shared/seo.ts `PAGE_LOCALES` (and nuxt.config.ts's i18n `locales`). Sign-in
+# returns the visitor to `WEB_URL/<locale>` only for one of these (docs/auth.md § 1).
+WEB_LOCALES = ("en", "zh-TW")
+
 # One label of a host name on the sandbox's list (docs/sandbox.md § Network).
 EGRESS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 
@@ -54,17 +59,8 @@ class Settings(BaseSettings):
     app_env: Literal["local", "production"] = "local"
     app_url: str = "http://localhost:8000"
     web_url: str = "http://localhost:3000"
-    # The web app's locale prefixes, comma-separated, mirroring its i18n config
-    # (apps/web/nuxt.config.ts uses `prefix`: every locale has one, and the bare root sends
-    # the visitor to the browser's language). Sign-in returns the visitor to
-    # `WEB_URL/<locale>`; a value outside this list is ignored and lands on `WEB_URL`, which
-    # is what keeps the return destination un-forgeable.
-    web_locale_prefixes: str = "en,zh-TW"
 
     database_url: str = "postgresql+asyncpg://sightread:sightread@localhost:5432/sightread"
-    postgres_user: str = "sightread"
-    postgres_password: str = "sightread"  # noqa: S105 - compose default, not a secret
-    postgres_db: str = "sightread"
 
     secret_key: str = ""
 
@@ -191,7 +187,7 @@ class Settings(BaseSettings):
     # Stored figure crops, kept with the result — outside the upload dir on purpose, so the
     # sweeper never touches them (docs/parsing.md § Figure crops).
     figures_dir: str = "/data/figures"
-    # Cap on crops per page: a malicious user-defined upstream must not turn one response
+    # Cap on crops per page: a broken upstream, or a prompt, must not turn one response
     # into unbounded PNG encodes and durable disk (docs/parsing.md § Figure crops).
     figures_per_page_max: int = 40
     # Model rounds one page's figure check may take, one call each; at least 1
@@ -199,8 +195,8 @@ class Settings(BaseSettings):
     figure_check_rounds: int = 2
     # Cap on a user's custom system prompt (docs/api.md § Limits).
     system_prompt_max_chars: int = 16_000
-    # Cap on any upstream response body — a user-controlled endpoint must not be able to
-    # exhaust memory with an unbounded reply (docs/parsing.md § Upstream usage).
+    # Cap on any upstream response body — a broken upstream must not be able to exhaust
+    # memory with an unbounded reply (docs/parsing.md § Upstream usage).
     upstream_response_max_bytes: int = 33_554_432
     # The chat agent's event stream: one SSE line past this is a broken upstream, not a
     # long answer, and more content blocks than this is refused rather than allocated
@@ -266,11 +262,9 @@ class Settings(BaseSettings):
     # How many days an item stays in the Trash before the worker's sweep deletes it for
     # good; 0 = never (docs/workspace.md § The Trash).
     trash_retention_days: int = 30
-    # The most of a git log the API reads to list revisions, and the paths it keeps per
-    # revision; the rename and path lists a revert reads share the byte bound
-    # (docs/workspace.md § Revisions).
+    # The most of a git log, a rename list or a path list read into memory — the last two
+    # are what a revert reads (docs/workspace.md § Revisions).
     workspace_log_max_bytes: int = 4 * 1024 * 1024
-    workspace_log_files_max: int = 200
     chat_image_round_max_bytes: int = 32 * 1024 * 1024
     chat_image_turn_max_bytes: int = 128 * 1024 * 1024
     # The most an image document may decode to for `view_page`, read from its header
@@ -392,17 +386,16 @@ class Settings(BaseSettings):
     sandbox_egress_hosts_file: str = ""
     sandbox_exec_grace_seconds: int = 60
 
-    domain: str = ""
-    acme_email: str = ""
-
     @model_validator(mode="after")
     def _check_secrets(self) -> Settings:
         if not self.secret_key:
             if self.app_env != "local":
                 raise ValueError("SECRET_KEY is required when APP_ENV is not 'local'")
             self.secret_key = LOCAL_FALLBACK_SECRET_KEY
-        # One spelling of the origin everywhere it is joined or compared — the dedup
-        # snapshot included (docs/jobs.md § Dedup).
+        # One spelling of each origin everywhere it is joined or compared — the Google
+        # redirect URI and the dedup snapshot included (docs/jobs.md § Dedup).
+        self.app_url = self.app_url.strip().rstrip("/")
+        self.web_url = self.web_url.strip().rstrip("/")
         self.kano_proxy_base_url = self.kano_proxy_base_url.strip().rstrip("/")
         self.kano_pay_url = self.kano_pay_url.strip().rstrip("/")
         self.brave_search_url = self.brave_search_url.strip()
@@ -586,16 +579,11 @@ class Settings(BaseSettings):
         return bool(self.sandbox_url and self.sandbox_token)
 
     @property
-    def kano_redirect_uri(self) -> str:
-        """Exactly what the authorize request and the token exchange both send."""
-        return f"{self.app_url.rstrip('/')}/api/kano/callback"
-
-    @property
     def web_tool_user_agent(self) -> str:
         """The User-Agent of the chat agent's web tools: the product and the deployment's
         own address, which sites such as Wikipedia require of an automated client before
         they answer it (docs/chat.md § Tools)."""
-        return f"EmaPaper-agent/1.0 (+{self.web_url.rstrip('/')})"
+        return f"EmaPaper-agent/1.0 (+{self.web_url})"
 
     @property
     def json_body_max_bytes(self) -> int:
@@ -613,15 +601,14 @@ class Settings(BaseSettings):
         return (self.upload_max_bytes + 2) // 3 * 4 + 65_536
 
     def web_url_for_locale(self, prefix: str) -> str:
-        """`WEB_URL/<locale>` for a listed locale, `WEB_URL` itself for anything else.
+        """`WEB_URL/<locale>` for one of `WEB_LOCALES`, `WEB_URL` itself for anything else.
 
         An unknown value is not an error, it is simply the bare root — whose page picks the
         language from the browser: the value reaches us from a query string, so treating it
         as an allowlist rather than as a path fragment is what stops it becoming an open
         redirect (docs/auth.md § 1).
         """
-        allowed = {item.strip() for item in self.web_locale_prefixes.split(",") if item.strip()}
-        return f"{self.web_url}/{prefix}" if prefix in allowed else self.web_url
+        return f"{self.web_url}/{prefix}" if prefix in WEB_LOCALES else self.web_url
 
 
 @lru_cache

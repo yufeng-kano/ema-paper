@@ -173,7 +173,7 @@ def _page(title: str, body: str, status_code: int = 200) -> HTMLResponse:
 @router.get("/.well-known/oauth-authorization-server")
 async def authorization_server_metadata(settings: AppSettings) -> JSONResponse:
     """RFC 8414 metadata; the issuer is this API's public origin."""
-    issuer = settings.app_url.rstrip("/")
+    issuer = settings.app_url
     return JSONResponse(
         {
             "issuer": issuer,
@@ -198,7 +198,7 @@ async def protected_resource_metadata(settings: AppSettings) -> JSONResponse:
     Also served under the path-suffixed form, which is where a client that starts from
     `<origin>/mcp` looks first.
     """
-    issuer = settings.app_url.rstrip("/")
+    issuer = settings.app_url
     return JSONResponse(
         {
             "resource": f"{issuer}{MCP_PATH}",
